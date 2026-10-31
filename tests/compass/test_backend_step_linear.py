@@ -341,15 +341,64 @@ def test_a_run_file_with_a_renamed_key_is_refused_naming_its_name_now(
         _installed(monkeypatch, tmp_path, **{old: {}})
 
 
-def test_a_run_file_step_linear_is_refused_above_tensor_parallel_width_one(monkeypatch):
+def _installed_at(monkeypatch, tmp_path, tp, fitted_tp):
+    """The backend `run.runner` installs at tensor-parallel width `tp` from a
+    law whose engine config is this deployment's at width `fitted_tp`."""
+    from atom.compass.run.step_grid import keyed
+
+    published = test_run_graph_pool.with_readings
+
+    def at_width(r, *args):
+        r.config.tensor_parallel_size = tp
+        return published(r, *args)
+
+    def fitted(config):
+        return keyed(config) | {"tensor_parallel_size": fitted_tp}
+
+    monkeypatch.setattr(test_run_graph_pool, "with_readings", at_width)
+    monkeypatch.setattr(test_run_graph_pool, "keyed", fitted)
+    return _installed(monkeypatch, tmp_path, step_linear=law())
+
+
+def test_a_run_file_step_linear_fitted_at_tensor_parallel_width_four_installs_there(
+    monkeypatch, tmp_path
+):
+    installed = _installed_at(monkeypatch, tmp_path, tp=4, fitted_tp=4)
+
+    assert isinstance(installed, StepLinearBackend)
+    assert installed.price(view((40, 40, False))).seconds == (
+        StepStubBackend(STAGE1).price(view((40, 40, False))).seconds
+    )
+
+
+@pytest.mark.parametrize("tp,fitted_tp", [(4, 1), (1, 4)])
+def test_a_run_file_step_linear_is_refused_at_another_tensor_parallel_width(
+    monkeypatch, tmp_path, tp, fitted_tp
+):
+    with pytest.raises(
+        ValueError,
+        match=f"tensor_parallel_size {fitted_tp} in the law and {tp} here",
+    ):
+        _installed_at(monkeypatch, tmp_path, tp=tp, fitted_tp=fitted_tp)
+
+
+def test_a_run_file_step_linear_stating_no_engine_config_is_refused_at_tp_four(
+    monkeypatch,
+):
     from types import SimpleNamespace
 
     from atom.compass import run
 
     monkeypatch.setattr(run, "spec", lambda: {"step_linear": law()})
-    tp2 = SimpleNamespace(config=SimpleNamespace(tensor_parallel_size=2))
-    with pytest.raises(ValueError, match="tensor_parallel_size 2"):
-        run.runner(tp2, META_8B)
+    tp4 = SimpleNamespace(
+        config=SimpleNamespace(
+            tensor_parallel_size=4,
+            enable_dp_attention=False,
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+        )
+    )
+    with pytest.raises(ValueError, match="the step linear law states no engine_config"):
+        run.runner(tp4, META_8B)
 
 
 def test_a_run_file_step_linear_stating_no_engine_config_is_refused(monkeypatch):
