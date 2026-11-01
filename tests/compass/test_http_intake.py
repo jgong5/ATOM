@@ -408,7 +408,9 @@ def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
             {"t_out_put_ns": put, "t_out_sent_ns": put + 50, "rows": 2},
             {"t_out_put_ns": put + 10, "t_out_sent_ns": got[2] + 20, "rows": 1},
         ]
-        handoff.append({"t_recv_ns": s + 200_000 + h, "t_in_put_ns": 0})
+        # Request 0 finds the engine idle, and its receipt waits.
+        idle = 5 * 10**6 if s == sent[0] else 0
+        handoff.append({"t_recv_ns": s + 200_000 + h + idle, "t_in_put_ns": 0})
     # An output before the first request.
     handoff.append({"t_out_put_ns": 0, "t_out_sent_ns": sent[0] - 10**9, "rows": 1})
     admitted = [s + 7 + 400_000 + h for s, h in zip(sent, hop)]
@@ -417,18 +419,18 @@ def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
     paths[1].write_text("".join(json.dumps(line) + "\n" for line in handoff))
     paths[2].write_text(json.dumps({"sent_ns": sent, "admitted_ns": admitted}))
     got = probe.hops(*map(str, paths))
-    for name, median in (("request", 245e-6), ("output", 145e-6), ("stream", 445e-6)):
+    for name, median in (("request", 250e-6), ("output", 145e-6), ("stream", 445e-6)):
         assert got[name]["median_s"] == pytest.approx(median), name
     assert (got["request"]["p10_s"], got["request"]["p90_s"]) == pytest.approx(
-        (209e-6, 281e-6)
+        (218e-6, 282e-6)
     )
-    assert [got[k]["messages"] for k in ("request", "output", "stream")] == [10, 20, 10]
+    assert [got[k]["messages"] for k in ("request", "output", "stream")] == [9, 20, 10]
     # A request the engine never received pairs nothing.
     paths[1].write_text(
         "".join(json.dumps(line) + "\n" for line in handoff[:2] + handoff[3:])
     )
     with pytest.raises(
-        SystemExit, match="request: 9 arrivals, not one after each of 10"
+        SystemExit, match="request: 8 arrivals, not one after each of 9"
     ):
         probe.hops(*map(str, paths))
     # Nor does a message with a row the server never took in.

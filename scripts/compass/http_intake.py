@@ -26,10 +26,11 @@ any request. Prints the median, p10 and p90 in seconds, N and both sha256s as JS
 from each ASGI app call to its pool job's start and from the job's end to its
 engine send, less PER_BYTE_S (default 0) per body byte. Prints the
 median as `idle_s`, p10, p90, PER_BYTE_S, N and the sha256 as JSON.
-`hops` reads three hops off the same run, the server run with
+`hops` reads three hops off a parity workload run, the server run with
 ``ATOM_COMPASS_PARITY_RECORD`` set so its engine writes HANDOFF
 (``dp0.handoff.jsonl``): ``request``, each engine send's return to the engine
-input thread's receipt; ``output``, each engine output's put on the engine's
+input thread's receipt, from request 1 on, as request 0 (sent alone, or the
+long one) finds the engine idle; ``output``, each engine output's put on the engine's
 output queue to the server's output thread taking it in; ``stream``, each SSE
 head sent to the client reading it (ARRIVALS' ``admitted_ns``). Prints each hop's median, p10,
 p90 and N, and the three inputs' sha256, as JSON.
@@ -279,7 +280,7 @@ def hops(stamps: str, handoff: str, arrivals: str) -> dict:
     got = [outs[i] for i in starts[:-1]]
     admitted = json.loads(sent_data)["admitted_ns"]
     return {
-        "request": _hop(sends, recvs, "request"),
+        "request": _hop(sorted(sends)[1:], sorted(recvs)[1:], "request"),
         "output": _hop([t for t, _ in put], got, "output", alone=False),
         "stream": _hop(heads, admitted, "stream"),
         "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
