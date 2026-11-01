@@ -718,7 +718,8 @@ holds the readings the simulated KV pool was sized from.
 Against the server log of the paired real run, with the same deployment flags,
 `PYTHONPATH=$T python -m atom.compass.memory.check OUT_DIR/lp-engine.json REAL_SERVER_LOG`
 prints the per-term comparison of the non-KV memory and the graph pool. It takes
-the log of one rank. In place of that log it takes the `--out` of a `compass
+the log of one rank; with `--tp N`, of one DP rank at TP width N, a table per TP
+rank's line. In place of that log it takes the `--out` of a `compass
 measure memory` start of the deployment, and then also compares the `weights`
 and `buffers` terms of `peak_torch` with the storage bytes the start loaded.
 
