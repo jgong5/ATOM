@@ -299,10 +299,10 @@ class HostDeviceRecurrence:
     for nothing. With `mtp`, a forward's device work is its target's and then
     its draft's, and a single-stage output forward waits before launch, for
     the previous output forward's target and then `MTP_COPY`; `MTP_SEGMENT`
-    runs after that wait, before the launch. The device work an MTP
-    forward's prepare queues ahead of its launch is not charged: its device
-    starts at the later of `ends[-1]` and the prepare end, early by that work
-    when the device is still busy. With `sync`, every forward leaves no earlier than its
+    runs after that wait, before the launch. A batch's `compass_queued_s`,
+    the device work its prepare queued ahead of its launch, runs after
+    `ends[-1]`; a run sets none, so there a busy launch starts its device
+    early by that work. With `sync`, every forward leaves no earlier than its
     own device end, as one that synchronizes its stream before it returns
     does. `ends[-1]` is the last forward's device end. `laws[kind][segment]` are coefficients on `(1,
     tokens, seqs)`; `charge` says what an absent one costs. `now` reads the engine LP's clock.
@@ -334,7 +334,8 @@ class HostDeviceRecurrence:
     ) -> float:
         """The end of the forward's device work, launch included, for `device_s`
         of target device time and then `draft_s` of draft, starting no earlier
-        than the batch's `compass_pp_release`; `target_end` is the target's
+        than the batch's `compass_pp_release` or `compass_queued_s` after
+        `ends[-1]`; `target_end` is the target's
         end, and `release` follows. A batch's
         `compass_pp_host = (called, meta)` runs the host from `called` in place
         of `now`; its launch posts the receive after `PP_RECV_SEGMENT` and
@@ -370,7 +371,8 @@ class HostDeviceRecurrence:
         output = batch.produces_output()
         launch_end = max(prepared, meta - self.segments[PP_RECV_SEGMENT]) + launch
         release = getattr(batch, "compass_pp_release", -math.inf)
-        self.target_end = max(self.ends[-1], host, release) + device_s
+        queued_end = self.ends[-1] + getattr(batch, "compass_queued_s", 0.0)
+        self.target_end = max(queued_end, host, release) + device_s
         self._held = now, launch_end, output, post
         return max(self.target_end + draft_s, launch_end)
 

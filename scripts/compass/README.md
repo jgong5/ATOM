@@ -784,9 +784,11 @@ experts sharded across TP and DSpark with 5 speculative tokens, on one MI455 A0 
 `history` form with host laws, keyed by `machines/mi455-a0.json`, fitted by `compass fit
 steps` and `compass fit host` on `calibrate.sh` records at ATOM 9653adb6a, taken in the image
 and aiter that spec pins ([#2462](https://github.com/jgong5/ATOM/issues/2462)). The records
-are concurrency 1, 4, 16 and 64, then 8 and 12 from each trajectory's first turn for rungs 7,
-8 and 12; its decode vectors stop at rung 48, and a c=256 record for rungs 56 and 64 is
-[#2544](https://github.com/jgong5/ATOM/issues/2544). Each server ran with `ENABLE_CK=0
+are concurrency 1, 4, 16, 64 and 256, then 8, 12 and 56 from each trajectory's first turn
+for rungs 7, 8, 12 and 56: at c=256 every decode step runs at rung 64. The c=256 and
+first-turn c=56 records were taken later, for
+[#2544](https://github.com/jgong5/ATOM/issues/2544), each by `calibrate.sh`'s record step
+alone, and both fits were run again on every record. Each server ran with `ENABLE_CK=0
 GPU_ARCHS=gfx1250 ATOM_ENGRAM_UVA=0 AITER_LOG_LEVEL=WARNING OMP_NUM_THREADS=4
 ATOM_DISABLE_MMAP=true AITER_REUSE_IDENTICAL_COMM_GROUPS=1`, `NCCL_MIN_NCHANNELS` unset, and
 `SERVER_ARGS` of `--trust-remote-code -tp 4 --kv_cache_dtype bf16 --index-cache-dtype fp8
@@ -795,10 +797,20 @@ ATOM_DISABLE_MMAP=true AITER_REUSE_IDENTICAL_COMM_GROUPS=1`, `NCCL_MIN_NCHANNELS
 --max-num-seqs 64 --cudagraph-capture-sizes [1,2,3,4,5,6,7,8,12,16,24,32,40,48,56,64]
 --max-model-len 262144`; the law's engine config holds `AITER_LOG_LEVEL` and
 `OMP_NUM_THREADS`, so a run sets them too. A fresh container compiles Triton variants of
-`_unit_table_kernel` and `_indices` record after record, so unscored records at each
+`_unit_table_kernel`, `_indices`, `_swa_write_kernel` and
+`_gemm_a16w16_bandwidth_bound_kernel` record after record, so unscored records at each
 concurrency, and a call of `atom/model_ops/deepseek_v41/unit_table.py::unit_table` per
 variant on tile buffers as `ScoreWorkspace` sizes them, came first; a record that still
 built one was taken again.
+
+`scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json` is the same law for
+cell A, TP4 with whole-expert EP4: fitted alike on `calibrate.sh` records at ATOM bb161b906
+in the same image, at the same concurrencies, under the same environment and `SERVER_ARGS`
+with `--enable-expert-parallel` added. Its first-turn records served under expert parallel
+here with no [#2538](https://github.com/jgong5/ATOM/issues/2538) fault. Its decode vectors
+stop at rung 48, and a c=256 record for rungs 56 and 64 is
+[#2582](https://github.com/jgong5/ATOM/issues/2582). An unscored record at each concurrency
+came first; a record that still built a Triton variant was taken again.
 
 ## Cost accuracy on a real run's own steps — `validate.cost`
 
