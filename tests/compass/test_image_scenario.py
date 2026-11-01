@@ -11,7 +11,8 @@ prompt.
 The runs need a driver, as in `test_vertical_slice`, and
 `ATOM_COMPASS_IMAGE_MODEL`, a multimodal model directory ATOM serves; its
 memory readings are measured first on the GPU ``HIP_VISIBLE_DEVICES`` names,
-under the machine spec `test_lmcache_mp_engine` reads.
+under the machine spec `test_lmcache_mp_engine` reads, with an assumed entry
+for the model's tokenizer where that spec probed none.
 """
 
 import json
@@ -39,6 +40,7 @@ from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
 from atom.compass.detect.scenario import check_run
 from atom.compass.parity.traffic import bodies
+from atom.compass.spec.machine import entry_label
 from tests.compass.held_ports import held_ports
 
 MODEL = os.environ.get("ATOM_COMPASS_IMAGE_MODEL")
@@ -51,6 +53,9 @@ REQUESTS = 3
 IMAGE_S = 2.0**-5
 ARGS = ["--model", MODEL, "--enforce-eager", "--max-model-len", "2048"]
 ARGS += ["--no-enable_prefix_caching"]
+#: The spec whose tokenizer entry for the image model's architecture a run
+#: assumes where `MACHINE` probed none.
+PROBED = TREE / "scripts/compass/machines/mi308x-hjbog39.json"
 
 
 class Workload(Traffic):
@@ -71,7 +76,24 @@ class Workload(Traffic):
         rt.close()
 
 
-def run_images(out: Path, seed: str) -> dict:
+def _machine(out: Path) -> Path:
+    """`MACHINE`, with `PROBED`'s tokenizer entry for the image model's
+    architecture, its origin assumed, where `MACHINE` probed none."""
+    machine = json.loads(MACHINE.read_text())
+    config = json.loads((Path(MODEL) / "config.json").read_text())
+    [architecture] = config["architectures"]
+    tokenizers = machine["host"]["tokenizers"]
+    if not any(architecture in t["applies_to"] for t in tokenizers):
+        probed = json.loads(PROBED.read_text())["host"]["tokenizers"]
+        [entry] = [t for t in probed if architecture in t["applies_to"]]
+        tokenizers.append(entry)
+        label = entry_label(entry["id"], entry["backend"])
+        machine["provenance"]["origins"][label] = {"origin": "assumed"}
+    (out / "machine.json").write_text(json.dumps(machine))
+    return out / "machine.json"
+
+
+def run_images(out: Path, seed: str, machine: Path) -> dict:
     """One run in its own process tree, reading the readings in its parent's store."""
     out.mkdir()
     with held_ports(2) as (clock_port, port):
@@ -80,7 +102,7 @@ def run_images(out: Path, seed: str) -> dict:
             clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
             step_stub=CONSTANT,
             image_preprocess_s=IMAGE_S,
-            machine=json.loads(MACHINE.read_text()),
+            machine=json.loads(machine.read_text()),
             store=str(out.parent / "store"),
         )
         env = dict(
@@ -128,15 +150,16 @@ def runs(tmp_path_factory):
     from atom.compass import cli
 
     root = tmp_path_factory.mktemp("images")
+    machine = _machine(root)
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("AITER_LOG_LEVEL", "WARNING")  # the readings are keyed by it
         cli.main(
-            ["measure", "memory", "--machine", str(MACHINE)]
+            ["measure", "memory", "--machine", str(machine)]
             + ["--gpu", os.environ.get("HIP_VISIBLE_DEVICES", "0")]
             + ["--store", str(root / "store"), "--out", str(root / "measure")]
             + ["--", *ARGS]
         )
-    return [run_images(root / f"seed{seed}", seed) for seed in ("1", "2")]
+    return [run_images(root / f"seed{seed}", seed, machine) for seed in ("1", "2")]
 
 
 @NEEDS_AN_IMAGE_RUN
