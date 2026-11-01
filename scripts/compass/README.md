@@ -815,9 +815,8 @@ A simulated run prices by a checked-in law when the law file stands in for both 
 holds the configuration's `memory_readings`. The run takes the step law at the machine spec
 and engine config the file states, and its `host` at the host key the file states, the
 `atom` digest it was last re-keyed at, so a law re-keyed to this tree runs here though its
-records ran at another; each refuses where a store entry's would. `run.json` states the
-law's digest and no fit provenance: a law file names no traces, so grading checks none of
-them against the cell's.
+records ran at another; each refuses where a store entry's would. A law file names no fit
+inputs, so grading cannot check its fitted traces against the cell's and refuses its run.
 
 ## Cost accuracy on a real run's own steps — `validate.cost`
 

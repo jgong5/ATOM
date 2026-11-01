@@ -6,7 +6,8 @@ config the file states, its host laws at the host key the file states.
 A law re-keyed to this tree's `atom` digest runs here, where the `host_laws`
 entry its records' fit published, keyed by their digest, refuses at engine
 start. The run file is read back through `run.spec` and installed by
-`run.runner`, as `test_drive_runfile` installs a store entry's.
+`run.runner`, as `test_drive_runfile` installs a store entry's. A law file
+names no fit inputs, so grading refuses its run.
 """
 
 import hashlib
@@ -21,7 +22,10 @@ from test_run_step_grid import SPEC_DIGEST, deployment, host_laws_key
 from atom.compass import run as compass_run
 from atom.compass.artifacts import Kind
 from atom.compass.backends import StepLinearBackend
+from atom.compass.drive import run as drive_run
+from atom.compass.drive import serve
 from atom.compass.run.step_grid import keyed
+from atom.compass.validate import runs
 
 #: The `atom` digest of the tree a law's records ran at, before its re-key.
 RECORDS = "829f117e" * 8
@@ -100,3 +104,30 @@ def test_two_law_files_install_each_at_its_own_engine_config(monkeypatch, tmp_pa
         install(tmp_path, monkeypatch, run, r)
         assert r.compass_backend.law.fitted_on == f"law {i}"
         assert r.compass_host.laws == LAWS
+
+
+@pytest.mark.parametrize(
+    "given, why",
+    [
+        ("token", []),
+        (
+            "file",
+            ["its step law names no fit inputs, so its fitted traces are unknown"],
+        ),
+    ],
+)
+def test_grading_refuses_a_law_files_run_for_its_unnamed_fit_inputs(
+    tmp_path, given, why
+):
+    r = deployment(tmp_path)
+    path, _ = law_file(tmp_path, r)
+    step = {"token": step_linear(tmp_path, r).key.token(), "file": path}[given]
+    run = build(tmp_path, "--step-linear", step, "--host-laws", path)
+    (tmp_path / serve.RUN_FILE).write_text(json.dumps(run))
+    (tmp_path / serve.RUN_JSON).write_text("{}")
+
+    drive_run.write_grading(tmp_path, None)
+
+    written = json.loads((tmp_path / serve.RUN_JSON).read_text())
+    written["refusals"] = {"count": 0, "steps": 1}
+    assert runs._not_graded(written, ["trace-z"]) == why

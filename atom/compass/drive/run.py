@@ -10,10 +10,9 @@ reach it until it is stopped, with run.json recording what grading reads.
 
 `runfile` builds the run file from the flags, the backend exactly one with no
 default, and `serve` starts the server simulated from it with the step record
-on. `--step-linear` and `--host-laws` name a law by its store token or by a
-law file, a checked-in one among them, at the keys the file states. `--out`
-holds what `serve` writes and what the run writes there: each DP rank's step
-record and cost lines, the step table, the run summary and each LP's hand-in.
+on. `--out` holds what `serve` writes and what the run writes there: each DP
+rank's step record and cost lines, the step table, the run summary and each
+LP's hand-in.
 
 `--join` names a deployment's run file in place of every flag but `--out`: the
 server joins the clock authority its ``clock_endpoint`` names, which writes the

@@ -12,17 +12,15 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   ``--op-graph``, ``true``, and as ``price_list`` the fields of the
   `price_list` key this run's model, parallel layout, machine spec and ATOM
   tree name, when ``--store`` holds one there.
-  A KEY is the token `Key.token` prints, resolved under ``--store``.
-  ``--step-linear`` also takes a law file, as `step_linear_fit` writes one
-  and `scripts/compass/laws/` holds them: the law less its host laws, at the
-  machine spec and engine config it states.
+  A KEY is the token `Key.token` prints, resolved under ``--store``; for
+  ``--step-linear`` and ``--host-laws`` a law file `step_linear_fit` writes
+  may stand in: its law less ``host`` and ``host_fit``, or its ``host``, each
+  at the keys it states, and its ``backend`` stated as a stub's is.
   ``backend`` holds the backend's ``digest`` and, for a store entry, its
-  ``provenance``, with its report's as ``inputs``; a stub's, a law file's,
-  and an op graph's with no price list, is None, its digest over what the run
-  file states.
-- ``--host-laws KEY``, a `host_laws` entry's params, as ``host``; or a law
-  file, its ``host``, at the host key it states, so a law re-keyed to this
-  tree runs here; without it the run charges no host time.
+  ``provenance``, with its report's as ``inputs``; a stub's, and an op graph's
+  with no price list, is None, its digest over what the run file states.
+- ``--host-laws KEY``, a `host_laws` entry's params, as ``host``; without it
+  the run charges no host time.
 - ``--step-linear`` and ``--host-laws`` repeat, one entry per engine config:
   the key then holds a list, each process installing its own config's entry,
   and ``backend``'s digest is over every law's in any order, their provenance
@@ -79,10 +77,7 @@ def add_arguments(parser) -> None:
         backend.add_argument(flag, dest=key, metavar="FILE" if stub else "KEY", **many)
     backend.add_argument("--op-graph", dest=run.OP_GRAPH, action="store_true")
     parser.add_argument(
-        "--host-laws",
-        metavar="KEY",
-        action="append",
-        help="a host_laws token, or a law file",
+        "--host-laws", metavar="KEY", action="append", help="a token or law file"
     )
     parser.add_argument("--machine", required=True, help="the machine spec")
     parser.add_argument("--store", required=True, help="the artifact store's root")
