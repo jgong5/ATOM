@@ -276,7 +276,8 @@ elif [ -d "$ROOT/tests/compass" ]; then
 else
     printf 'tests/compass: absent on this tree, so it contributes no tests.\n'
 fi
-# A file that stalls on one GPU keeps the suite from ever printing a summary.
+# A file that stalls on one GPU keeps the suite from ever printing a summary,
+# and one that passes and fails at random there cannot be named in a baseline.
 # gpu_gate_skip.txt names such files per GPU; on a matching first card each is
 # left out of the suite and its collected tests come off the expectation.
 DEVICE=$(HIP_VISIBLE_DEVICES=${GPUS%%,*} python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null)
