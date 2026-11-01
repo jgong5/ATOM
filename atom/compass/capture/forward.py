@@ -1115,7 +1115,8 @@ def _v41(recorder, hf):
     `index_candidates`, the most entries it scores where an earlier layer
     chose its candidates, else None: read off the layer `layer_name` names
     and the model's config `hf`. Its mono decode's K2 (`V41_LAYER_POST`),
-    which runs both, states all four, read off the layer its runner passes.
+    which runs both, states them all, read off the layer its runner passes,
+    and its routed experts' `expert_width`, their unpadded width on this rank.
     """
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
@@ -1145,7 +1146,9 @@ def _v41(recorder, hf):
             return attend(hidden, layer_name, *args, **kwargs)
 
     def layer_post(runner, spec, block, *args):
-        with patch.object(recorder, "stated", {V41_LAYER_POST: geometry(block.attn)}):
+        width = ("expert_width", runner.moe_dims.inter_real)
+        stated = {V41_LAYER_POST: (*geometry(block.attn), width)}
+        with patch.object(recorder, "stated", stated):
             return post(runner, spec, block, *args)
 
     bodies["v41_attention"] = attention

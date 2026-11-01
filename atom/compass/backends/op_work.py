@@ -929,8 +929,10 @@ K2_PRODUCTS |= {"sgu": "fp8", "sw2": "fp8"}
 #: and the drafter's tap.
 BY_INDEX = ("scratch", "ring", "pool", "cos", "sin", "table", "itab", "ilog")
 BY_INDEX += ("ibmax", "plane", "pscale", "iplan", "aux")
-#: K2's routed experts' weights and scales.
-ROUTED = ("w13", "w13_s", "w2", "w2_s")
+#: K2's routed experts' weights and scales the kernel reads over their real
+#: width, skipping the loader's zero padding past it; it reads the down
+#: projection's scales, `w2_s`, whole.
+ROUTED = ("w13", "w13_s", "w2")
 
 
 def _mono_key(op) -> dict:
@@ -981,28 +983,34 @@ def _layer_post(op, view, tp, kv) -> Work:
     which only lowers M. Each row's sparse attention at the window, ratio and
     top k the leaf states, at `q`'s heads and width. The build's `tokens` rows
     through each dense product (`K2_PRODUCTS`), and its routes, as `_routing`
-    deals them, each through one expert's MXFP4 weights at MXFP8, each expert
-    they reach read once. The attention's and the MoE's all-reduces over the
-    build's `tp` ranks, and every other tensor argument read once but
-    `BY_INDEX`'s."""
+    deals them, each through one expert's MXFP4 weights at MXFP8 over the
+    width the leaf states (`expert_width`), each expert they reach read once
+    (`ROUTED`). The attention's and the MoE's all-reduces over the build's
+    `tp` ranks, and every other tensor argument read once but `BY_INDEX`'s."""
     key, args, rows, q = _mono_key(op), op["args"], view.requests, op["args"]["q"]
     geometry = ("window_size", "compress_ratio", "index_topk", "index_candidates")
-    window, ratio, top, cap = _stated(op, *geometry)
+    window, ratio, top, cap, width = _stated(op, *geometry, "expert_width")
     *_, heads, dim = q["shape"]
     work = _sparse_products(rows, heads, dim, _fmt(q["dtype"]), kv, window, ratio, top)
     if args["iact"]:
         fmt, iq = "fp4" if key["index_fp4"] else "fp8", args["iq"]
         *_, ih, packed = iq["shape"]
-        width = int(packed * _size(iq["dtype"]) / ELEMENT_BYTES[fmt])
-        work += _index_scores(rows, ratio, ih, width, fmt, cap)
-    tokens, experts, out = key["tokens"], key["experts"], args["out"]
+        scored = int(packed * _size(iq["dtype"]) / ELEMENT_BYTES[fmt])
+        work += _index_scores(rows, ratio, ih, scored, fmt, cap)
+    tokens, experts, out, w2 = key["tokens"], key["experts"], args["out"], args["w2"]
     routes, reached = _routing(view, tokens, key["topk"], experts, 1)
-    routed = _through(op, routes / experts, dict.fromkeys(("w13", "w2"), "fp8"))
-    held = sum(_bytes(t) for s in ROUTED for t in _tensors(args[s]))
+    # w2 holds each expert's hidden rows over the loader's padded width
+    padded = _bytes(w2) / ELEMENT_BYTES[_fmt(w2["dtype"])] / math.prod(w2["shape"][:-1])
+    real = width / padded
+    routed = _through(op, routes / experts * real, dict.fromkeys(("w13", "w2"), "fp8"))
+    held = real * sum(_bytes(t) for s in ROUTED for t in _tensors(args[s]))
+    held += _bytes(args["w2_s"])
     reduced = allreduce(key["tp"], tokens * out["shape"][-1] * _size(out["dtype"]))
     work += _through(op, tokens, K2_PRODUCTS) + routed + reduced + reduced
     return (
-        work + Work({}, held * reached / experts) + _read_once(op, *BY_INDEX, *ROUTED)
+        work
+        + Work({}, held * reached / experts)
+        + _read_once(op, *BY_INDEX, *ROUTED, "w2_s")
     )
 
 
