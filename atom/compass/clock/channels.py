@@ -410,9 +410,7 @@ def prefill_decode_table(
         else:
             width = dp_p if s in ps else dp_d
             engines[s] = (f"engine-{s}",)
-            more = _frontend_engine(
-                f"frontend-{s}", f"engine-{s}", ipc_s, out_s, width
-            )
+            more = _frontend_engine(f"frontend-{s}", f"engine-{s}", ipc_s, out_s, width)
         rows += more
     lps = ("traffic", *(lp for s in ps + ds for lp in (f"frontend-{s}", *engines[s])))
     if router_in_s is None:
