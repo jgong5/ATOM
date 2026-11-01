@@ -236,7 +236,7 @@ from atom.compass.clock import (
     single_engine_table,
 )
 from atom.compass.clock.channels import add_lmcache
-from atom.compass.clock_transport import connect, serve
+from atom.compass.clock_transport import connect, connect_here, serve
 from atom.compass.detect.determinism import StepTable
 from atom.compass.runner import COMPASS_RAPIDSERVE_QUALNAME, COMPASS_RUNNER_QUALNAME
 from atom.utils import clock
@@ -1020,8 +1020,12 @@ class _StoppingClock(clock.LPRuntime):
         super().end_run()
 
 
-def _runtime(lp: LpId, run: dict, member=None, cls=clock.LPRuntime) -> clock.LPRuntime:
-    rt = cls(lp, channel_table(run), connect(lp, run["clock_endpoint"], member))
+def _runtime(
+    lp: LpId, run: dict, member=None, cls=clock.LPRuntime, here=False
+) -> clock.LPRuntime:
+    """`lp`'s runtime on the run's clock; `here` when this process serves it."""
+    reach = connect_here if here else connect
+    rt = cls(lp, channel_table(run), reach(lp, run["clock_endpoint"], member))
     clock.install(rt)
     return rt
 
@@ -1140,7 +1144,8 @@ def frontend(config):
         )
         _early_end.start()
     _launch_lmcache(config, run, side)
-    rt = _runtime(lp, run, cls=_StoppingClock)
+    # A co-hosting frontend reaches the authority in-process, with no socket.
+    rt = _runtime(lp, run, cls=_StoppingClock, here=authority is not None)
     rt.client_run_ended = lambda k: _frontend_hand_in(run, rt, k)
     return _start_on_leaving(rt, authority)
 
