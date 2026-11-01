@@ -5,9 +5,14 @@ when a diff touching atom/mesh would leave them skipped.
 Each case runs the real script over the throwaway tree of
 ``test_gate_cpu_verdict_through_pipe.py`` plus an ``atom/mesh/Cargo.toml``, with
 a stand-in ``cargo`` first on PATH that logs its environment and arguments and
-exits as told. Nothing needs cargo or a network.
+exits as told. Nothing needs cargo or a network. The shard case's stand-in logs
+when each of its runs starts and ends instead. The last case builds a small
+real crate, so it needs cargo, offline, and skips without it.
 """
 
+import shutil
+
+import pytest
 from test_gate_cpu_verdict_through_pipe import BLIND, _run, _tree
 
 CARGO = """#!/bin/sh
@@ -73,3 +78,88 @@ def test_a_failing_cargo_test_fails_the_gate_after_pytest(tmp_path):
     assert out.returncode == 101, out.stdout + out.stderr
     assert "pytest: rc=0" in out.stdout, out.stdout
     assert "cargo test failed in atom/mesh" in verdict, verdict
+
+
+TIMED = """#!/bin/sh
+echo "$(date +%s%N) start $$ $(pwd -P) $*" >> "$0.log"
+[ "$1" = build ] && sleep 1
+echo "$(date +%s%N) end $$" >> "$0.log"
+"""
+BUILD = """import subprocess
+def test_{name}():
+    subprocess.run(["cargo", "build", "{name}"], cwd={cwd!r}, check=True)
+"""
+
+
+def test_two_shards_never_run_cargo_in_atom_mesh_at_once(tmp_path):
+    # test_a.py and test_b.py start in two shards at once and build in
+    # atom/mesh; test_c.py, after test_a.py in the first shard, builds elsewhere.
+    root = _tree(tmp_path / "ATOM", stamped=True)
+    mesh = root / "atom" / "mesh"
+    mesh.mkdir(parents=True)
+    (mesh / "Cargo.toml").write_text("")
+    (root / "tests" / "compass").mkdir()
+    for name, cwd in (("a", mesh), ("b", mesh), ("c", tmp_path)):
+        test = BUILD.format(name=name, cwd=str(cwd))
+        (root / "tests" / "compass" / f"test_{name}.py").write_text(test)
+    cargo = tmp_path / "bin" / "cargo"
+    cargo.parent.mkdir()
+    cargo.write_text(TIMED)
+    cargo.chmod(0o755)
+    out = _run(root, f"COMPASS_GATE_SHARDS=2 PATH={cargo.parent}:$PATH {{gate}}")
+    assert "pytest: rc=0" in out.stdout, out.stdout + out.stderr
+    starts, ends = {}, {}
+    for line in cargo.with_suffix(".log").read_text().splitlines():
+        at, event, pid, *rest = line.split()
+        if event == "start":
+            starts[pid] = (int(at), rest[0], " ".join(rest[1:]))
+        else:
+            ends[pid] = int(at)
+    builds = {
+        args: (start, ends[pid], cwd)
+        for pid, (start, cwd, args) in starts.items()
+        if args.startswith("build")
+    }
+    assert sorted(builds) == ["build a", "build b", "build c"], builds
+    assert builds["build c"][2] == str(tmp_path), builds
+    first, second = sorted([builds["build a"], builds["build b"]])
+    assert first[1] <= second[0], f"two shards built in atom/mesh at once: {builds}"
+
+
+# A crate whose build script runs `cargo --version` from the crate's directory,
+# as atomesh's does.
+CRATE = {
+    "Cargo.toml": '[package]\nname = "stand_in"\nversion = "0.1.0"\nedition = "2021"\n',
+    "build.rs": (
+        "fn main() {\n"
+        '    let cargo = std::process::Command::new("cargo").arg("--version").status();\n'
+        "    assert!(cargo.unwrap().success());\n"
+        "}\n"
+    ),
+    "src/lib.rs": "",
+}
+RELEASE = """import os, signal, subprocess
+def test_release():
+    run = subprocess.Popen(["cargo", "build", "--release"], cwd={cwd!r}, start_new_session=True)
+    try:
+        assert run.wait(timeout=60) == 0
+    finally:
+        if run.poll() is None:
+            os.killpg(run.pid, signal.SIGKILL)
+"""
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="needs cargo")
+def test_a_cargo_started_inside_a_locked_one_does_not_wait_for_the_lock(tmp_path):
+    # The gate's own `cargo test --lib` runs the build script before pytest;
+    # `--release` runs it again, inside a cargo the wrapper has locked.
+    root = _tree(tmp_path / "ATOM", stamped=True)
+    mesh = root / "atom" / "mesh"
+    for name, text in CRATE.items():
+        (mesh / name).parent.mkdir(parents=True, exist_ok=True)
+        (mesh / name).write_text(text)
+    (root / "tests" / "compass").mkdir()
+    test = RELEASE.format(cwd=str(mesh))
+    (root / "tests" / "compass" / "test_release.py").write_text(test)
+    out = _run(root, "COMPASS_CARGO_LOCK=/nonexistent {gate}")
+    assert "pytest: rc=0" in out.stdout, out.stdout + out.stderr

@@ -10,10 +10,13 @@ or not a stamped request it holds, which only a grant would release, is open.
 The stop first ends every LP's run through the authority, so an engine in a
 process of its own leaves its loop and hands in what its steps cost, whether
 the signal reaches the server alone or its process group, whose SIGTERM would
-have ATOM's handler stop the engine's workers. An engine whose input thread
-has read a request the authority has not released leaves the same way: the
-stop's ``+inf`` grant releases it, and the input thread takes it even when the
-server's SHUTDOWN reached it first.
+have ATOM's handler stop the engine's workers. That holds from just before
+the engine says it is ready, while its construction goes on after that and
+before its loop asks its workers for a step grid bundle; ATOM's handler is
+back once the engine leaves. An engine whose input thread has read a request the
+authority has not released leaves the same way: the stop's ``+inf`` grant
+releases it, and the input thread takes it even when the server's SHUTDOWN
+reached it first.
 """
 
 import asyncio
@@ -127,6 +130,42 @@ def call_func(name, wait_out):
 
 print("ready", flush=True)
 with compass_run.engine_loop(SimpleNamespace(runner_mgr=SimpleNamespace(call_func=call_func))):
+    while not clock.idle(lambda: math.inf):
+        pass
+"""
+#: `ENGINE` as ATOM's engine is built: its handler is set inside the
+#: construction, which says ``ready`` through ATOM's `_send_ready_signal` and
+#: then goes on until the test has signalled the server's process group.
+BUILDING_ENGINE = """\
+import math, signal, time
+from pathlib import Path
+from types import SimpleNamespace
+from atom.compass import run as compass_run
+from atom.model_engine.engine_core import EngineCore
+from atom.utils import clock
+
+stopped = []
+said = {"refused_commands": [], "predicted_memory": {}}
+said["priced_steps"] = {"steps": 3, "seconds": 0.75}
+
+def call_func(name, wait_out):
+    if stopped:
+        raise RuntimeError("the workers stopped")
+    return said[name]
+
+engine = SimpleNamespace(
+    runner_mgr=SimpleNamespace(call_func=call_func),
+    output_queue=SimpleNamespace(put_nowait=lambda _: print("ready", flush=True)),
+    _ready_payload=lambda: None,
+)
+signalled = Path(compass_run.spec()["out_dir"]) / "signalled"
+rank = SimpleNamespace(data_parallel_size=1, data_parallel_rank=0)
+with compass_run.engine(SimpleNamespace(parallel_config=rank, kv_transfer_config={})):
+    signal.signal(signal.SIGTERM, lambda *_: stopped.append(True))
+    EngineCore._send_ready_signal(engine)
+    while not signalled.exists():
+        time.sleep(0.01)
+with compass_run.engine_loop(engine):
     while not clock.idle(lambda: math.inf):
         pass
 """
@@ -285,6 +324,117 @@ def test_a_stopped_servers_summary_carries_its_engines_priced_steps(tmp_path, gr
     reasons = dict(summary["schedule"]["refusals"]["reasons"])
     assert reasons == {"ended:frontend stopped by SIGTERM": 1}, out
     assert summary["schedule"]["predicted_seconds"] == 0.75, out
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["answered", "refused"])
+def test_a_sigterm_while_an_engine_asks_for_its_bundle_stops_no_worker(
+    monkeypatch, tmp_path, refused
+):
+    """An engine has said it is ready before its loop asks its workers for the
+    step grid bundle, so a group SIGTERM can come then. It reaches no handler,
+    and the one that stops the workers is back once the engine leaves."""
+    run = {"bound_s": 100.0, "out_dir": str(tmp_path), "step_grid": {}}
+    (tmp_path / "run.json").write_text(json.dumps(run))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    monkeypatch.setattr(compass_run, "_member", None)
+    engine = LPRuntime(compass_run.ENGINE, TABLE, None)
+    engine.now = math.inf  # the finish: the loop leaves at once
+    monkeypatch.setattr(clock, "_installed", engine)
+    stopped, said = [], {"refused_commands": [], "predicted_memory": {}}
+    said["priced_steps"] = {"steps": 3, "seconds": 0.75}
+
+    def call_func(name, wait_out):
+        if stopped:
+            raise RuntimeError("the workers stopped")
+        if name != "step_grid_bundle":
+            return said[name]
+        signal.raise_signal(signal.SIGTERM)
+        if refused:
+            raise RuntimeError("no bundle")
+        return {}
+
+    previous = signal.signal(signal.SIGTERM, lambda *_: stopped.append(True))
+    atom = signal.getsignal(signal.SIGTERM)
+    workers = SimpleNamespace(call_func=call_func)
+    try:
+        with (
+            pytest.raises(RuntimeError) if refused else contextlib.nullcontext(),
+            compass_run.engine_loop(SimpleNamespace(runner_mgr=workers)),
+        ):
+            pass
+        assert (stopped, signal.getsignal(signal.SIGTERM)) == ([], atom)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    if not refused:
+        hand_in = tmp_path / compass_run.LP_FILE.format("engine")
+        assert json.loads(hand_in.read_text())["priced"] == said["priced_steps"]
+
+
+def test_a_group_stop_while_an_engine_is_built_after_ready_stops_no_worker(tmp_path):
+    """ATOM's engine says it is ready before its construction ends, so a group
+    SIGTERM can come while it is still being built."""
+    with _serve(tmp_path, ENGINE_SERVER, BUILDING_ENGINE) as (server, _, log):
+        os.killpg(server.pid, signal.SIGTERM)
+        (tmp_path / "signalled").touch()
+        server.wait(timeout=30)
+    out = log.read_text()
+    assert server.returncode == 0 and "frontend_done: True" in out, out
+    summary = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())
+    reasons = dict(summary["schedule"]["refusals"]["reasons"])
+    assert reasons == {"ended:frontend stopped by SIGTERM": 1}, out
+    assert summary["schedule"]["predicted_seconds"] == 0.75, out
+
+
+@pytest.mark.parametrize("raised", [False, True], ids=["looped", "raised"])
+def test_an_engine_has_the_handler_it_set_aside_at_ready_back_as_it_leaves(
+    monkeypatch, tmp_path, raised
+):
+    """From READY on a SIGTERM reaches no handler. The one set aside then is
+    back once the engine leaves its loop, or its construction if that raises,
+    and ATOM's `_send_ready_signal` is its own again."""
+    run = {"clock_endpoint": "", "bound_s": 100.0, "out_dir": str(tmp_path)}
+    run |= {"admission_path": "serving", "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
+    (tmp_path / "run.json").write_text(json.dumps(run))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    monkeypatch.setattr(compass_run, "_member", None)
+    monkeypatch.setattr(compass_run, "connect", lambda *_: None)
+    monkeypatch.setattr(clock, "_installed", None)
+    monkeypatch.setattr(clock, "settle_before_collectives", lambda: None)
+    monkeypatch.setattr("atom.utils.distributed.utils.LP_OF_RANK", None, raising=False)
+    stopped, sent = [], []
+    said = {"refused_commands": [], "priced_steps": {}, "predicted_memory": {}}
+    engine = SimpleNamespace(
+        runner_mgr=SimpleNamespace(call_func=lambda name, wait_out: said[name]),
+        output_queue=SimpleNamespace(put_nowait=sent.append),
+        _ready_payload=lambda: None,
+    )
+    rank = SimpleNamespace(data_parallel_size=1, data_parallel_rank=0)
+    config = SimpleNamespace(parallel_config=rank, kv_transfer_config={})
+    # The module `compass_run.engine` reads, not this file's `EngineCore`: that
+    # was imported under the aiter stub, which drops the module again.
+    from atom.model_engine import engine_core
+
+    ready = engine_core.EngineCore._send_ready_signal
+    previous = signal.signal(signal.SIGTERM, lambda *_: stopped.append(True))
+    atom = signal.getsignal(signal.SIGTERM)
+    try:
+        with (
+            pytest.raises(RuntimeError) if raised else contextlib.nullcontext(),
+            compass_run.engine(config),
+        ):
+            engine_core.EngineCore._send_ready_signal(engine)
+            signal.raise_signal(signal.SIGTERM)
+            if raised:
+                raise RuntimeError("the disaggregated init failed")
+        if not raised:
+            clock.installed().now = math.inf  # the finish: the loop leaves at once
+            with compass_run.engine_loop(engine):
+                pass
+        assert (sent, stopped) == ([("READY", None)], [])
+        assert signal.getsignal(signal.SIGTERM) is atom
+        assert engine_core.EngineCore._send_ready_signal is ready
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def test_an_engine_stopped_holding_a_read_request_hands_in_no_straggler(

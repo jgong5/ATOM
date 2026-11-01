@@ -3,7 +3,7 @@
   "name": "mi455-a0",
   "provenance": {
     "authored_by": "compass agent for jgong5",
-    "date": "2026-10-29",
+    "date": "2026-11-01",
     "origin": "mixed",
     "origins": {
       "host.cpu.cores_physical": {
@@ -91,10 +91,20 @@
         "origin": "probed"
       },
       "host.http_intake.fixed_s": {
-        "origin": "assumed"
+        "origin": "probed",
+        "model": "/apps/perzhang/models/DeepSeek-V4.1-Flash",
+        "source_root": "commit:a0381bfc1",
+        "record": "sha256:3e42ff61b321708d3638f9f0252cc3a4b707f206e703ae1abd60312d51f94f72",
+        "p10": 0.005848353691439428,
+        "p90": 0.006622099884347502
       },
       "host.http_intake.per_byte_s": {
-        "origin": "assumed"
+        "origin": "probed",
+        "model": "/apps/perzhang/models/DeepSeek-V4.1-Flash",
+        "source_root": "commit:a0381bfc1",
+        "record": "sha256:3e42ff61b321708d3638f9f0252cc3a4b707f206e703ae1abd60312d51f94f72",
+        "p10": 1.2611548747658177e-08,
+        "p90": 1.760107581851583e-08
       },
       "device.memory.bandwidth_curve": {
         "origin": "probed",
@@ -184,7 +194,7 @@
       "intake",
       "peaks"
     ],
-    "notes": "probe_device.py's record at b71c071d3 | MI455X product page and brochure (07/26), read 2026-10-09 | no probe fills these | no card has a ptl directory | mi355x-gpu45's, until a burst on MI455 fits them | probe_device.py: GEMM, read, write, copy, graph and link samples"
+    "notes": "probe_device.py's record at b71c071d3 | MI455X product page and brochure (07/26), read 2026-10-09 | no probe fills these | no card has a ptl directory | one real c=256 first-turn cc-traces burst at a0381bfc1 | probe_device.py: GEMM, read, write, copy, graph and link samples"
   },
   "host": {
     "cpu": {
@@ -226,8 +236,8 @@
       "shm_broadcast_s": 2e-05
     },
     "http_intake": {
-      "fixed_s": 0.001966482509138914,
-      "per_byte_s": 5.288974015662166e-09
+      "fixed_s": 0.006044910365805244,
+      "per_byte_s": 1.478828601664519e-08
     }
   },
   "device": {

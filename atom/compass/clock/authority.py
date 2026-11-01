@@ -149,7 +149,7 @@ class ClockAuthority:
     recovered, released, sent)`` call per reply, in issue order: ``released``
     the ``(channel, seq, arrival)`` messages the reply released, ``sent`` those
     logged by the requests it answers. `grants` counts each LP's finite grants
-    by name; `diagnostics`, the stall diagnostics its serve loop printed. `final_clocks` is every LP's clock just before the run
+    by name; `diagnostics`, the stall diagnostics its serve side printed. `final_clocks` is every LP's clock just before the run
     finished, and ``None`` until it has. `members` maps an LP to
     ``{member: names of the channels into or out of it that the member owns}``;
     an LP not in it is its own single caller. `bound_s` is the simulated-time

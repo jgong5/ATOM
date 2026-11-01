@@ -478,7 +478,10 @@ def _as_recorded(cell, warmup=()):
                 "skip": [],
                 "refusals": summary["schedule"]["refusals"] | {"reasons": []},
                 "coverage": None,
-                "provenance": {"digest": "sha256:0", "provenance": None},
+                "provenance": {
+                    "digest": "sha256:0",
+                    "provenance": {"inputs": [{"run": "fit", "traces": ["t-fit"]}]},
+                },
             }
         (d / "run.json").write_text(json.dumps(run))
 
