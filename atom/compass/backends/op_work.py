@@ -1060,8 +1060,8 @@ def _layer_post(op, view, tp, kv) -> Work:
     if key.get("tok_par"):
         chosen = [s for s, on in (("irow", "iact"), ("icout", "iprod")) if args[on]]
         gathered = _bytes(args["normed"]) + sum(_bytes(args[s]) for s in chosen)
-        sums = reduce_scatter(ranks, summed) + reduce_scatter(ranks, summed)
-        sums += allgather(ranks, gathered)
+        scattered = reduce_scatter(ranks, summed)
+        sums = scattered + scattered + allgather(ranks, gathered)
     else:
         sums = allreduce(ranks, summed) + allreduce(ranks, summed)
     work += _rows_through(op, key, K2_PRODUCTS) + routed + sums
