@@ -878,12 +878,27 @@ modelled time — about **4,450 events per LP**. A frontend LP is counted at the
 it takes one delivery per engine output step plus its requests' HTTP events, so it is
 about as busy as its engine. That is an assumption, not a measurement.
 
-| LPs | Grants per run | CA cost at 50 us (local IPC) | at 500 us (cross-node TCP) |
-|---|---|---|---|
-| 3 | 13k | 0.7 s | 7 s |
-| 5 | 22k | 1.1 s | 11 s |
-| 34 | 151k | 7.6 s | 76 s |
-| 82 | 365k | 18 s | 182 s |
+The CA's cost was measured on 2026-11-01 with `scripts/compass/ca_grant_cost.py` over
+`aea9b15b5`'s clock and `tcp` carrier: one CA process over N synthetic LPs, each LP its
+own process and one lookahead from every other, asking `TAR` one step past its clock
+1,000 times. At a lookahead of one step each round is a barrier, an LP granted only once
+every other has asked, so each request rescans every waiting LP's LBTS: the O(LPs²) worst
+case. **Local**: CA and LPs on hjbog-srdc-18 (224 CPUs, shared, load 27 to 53), over
+loopback. **Cross-node**: CA on hjbog-srdc-18, LPs on hjbog-srdc-39. CPU is the CA
+process's, every thread, per request served; the two columns' runs are independent. The
+round trip is an LP's, from its `TAR` to its grant, p50 with p10 to p90.
+
+| LPs | Grants per run | CA CPU per request, local / cross-node | CA CPU per run | Round trip, local | Round trip, cross-node |
+|---|---|---|---|---|---|
+| 3 | 13k | 43 / 46 us | 0.6 s | 132 us (129 to 139) | 275 us (267 to 327) |
+| 5 | 22k | 63 / 55 us | 1.4 s | 272 us (238 to 385) | 394 us (377 to 430) |
+| 34 | 151k | 179 / 169 us | 27 s | 5.4 ms (5.2 to 6.3) | 5.3 ms (5.1 to 6.2) |
+| 82 | 365k | 600 / 605 us | 219 s | 43.5 ms (42.2 to 49.5) | 43.0 ms (41.7 to 49.7) |
+
+CA CPU per run is the grants times the local figure. These replace an estimate of 50 us
+per grant at local IPC and 500 us cross-node. With a lookahead of two steps, so an LP may
+run one round ahead of the slowest, the CA's CPU per request is 54 to 67 us at 3 and 5
+LPs, 100 to 106 us at 34 and 167 to 255 us at 82.
 
 Against the **cost model on the same steps**: previously measured at **4.3 ms per step**
 with the bound allocation carried in the cache key (2.3 ms with a shape-only key, but
@@ -891,15 +906,19 @@ that key is unsound — a second valid allocation for the same shape moves 64 of
 operator signatures; 41.7 ms with no cache at all). 4,450 steps x 4.3 ms = **~19 s per
 LP, running in parallel across LPs.**
 
-**A grant is therefore ~1% of the per-step cost at local IPC and ~10% cross-node.** The
-simulator's own pricing dominates by two orders of magnitude. Optimising the time
+**At the milestones' 3 and 5 LPs, the CA's whole run is 3% and 7% of that pricing, and
+an LP's grants (4,450 round trips) are 3% and 6% of it locally, 6% and 9% cross-node.**
+The simulator's own pricing still dominates there, by 14x or more, and optimising the time
 protocol before the cost model would be optimising the wrong thing.
 
-Throughput headroom: a Python ZMQ ROUTER sustains roughly 50-200k msg/s; the largest case
-above is ~19k/s (365k grants over the ~19 s the pricing takes). The CA's own work per
-state change is an LBTS for each waiting LP, each a `min` over the other LPs: O(LPs²),
-nothing at the milestones' 3-5 LPs but ~6.7k terms at 82, so measure it before the
-replica scale. RTTs pipeline across LPs.
+**At the replica scale the CA dominates.** Under the barrier, its 34- and 82-LP runs take
+27 s and 219 s of one CPU, serialised, beside the 19 s of pricing each LP does in
+parallel; at 34 and 82 LPs the round trip is the CA serving every other LP's request in
+turn, so the cross-node hop no longer shows. One CA serves at most the inverse of its CPU
+per request: ~23k requests/s at 3 LPs, ~1.7k/s at 82, against the ~19k/s the 82-LP case asks
+(365k grants over the ~19 s the pricing takes). Before the replica rows run, the LBTS
+scan per request must stop growing with the square of the LPs, or the CA must split as
+Option B below describes.
 
 ### Options
 
@@ -919,7 +938,8 @@ interface is identical in both.
 **B. Hierarchical CA built now.** Node-local CA per physical node, root CA over them.
 
 - *Pros:* cross-node grant traffic drops from O(LPs) to O(nodes). The correct end state
-  beyond ~100 LPs across many nodes.
+  at the replica scale, where the sizing above measures one CA outweighing the pricing
+  from 34 LPs.
 - *Cons:* two levels to debug and a global-min protocol to get right, at a scale no
   milestone reaches. The sizing above says this is premature.
 
