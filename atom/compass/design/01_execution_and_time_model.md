@@ -395,7 +395,7 @@ one LP:
 | Traffic source | — | **1** | |
 | Atomesh router | 1 Rust process | **0** in 1P1D, or **1** under `--dp-aware` or with several P or D instances | Part of the channels that cross it: with one P and one D it has no choice to make, so it contributes only a fixed per-request forward cost, stated in those channels' lookahead (D7). Under `--dp-aware` (DP attention) it chooses among DP ranks on load that responses move, and with several P or D instances among those instances, and is then LP `router` (D7, `channels.py::prefill_decode_table`). |
 | lmcache MP server (`ATOM_KV_OFFLOAD=lmcache_mp`) | 1 process | **1** (`lmcache`) | Its cached chunks decide later hits for every engine that reaches it, so it is a Compass stand-in on the real channels (D6.1). |
-| RapidServe (`--enable-rapidserve`) | 2 EngineCores on the same devices | **2** (`engine-P`, `engine-D`) | Each runs its own scheduler and step loop, and no collective joins them: they exchange only `prefill_done` and `block_assignment` over ZMQ, each taken by a handler thread (`channels.py::_rapidserve`). Sharing the devices is a cost question, not a time domain. |
+| RapidServe (`--enable-rapidserve`) | 2 EngineCores on the same devices | **2** (`engine-P`, `engine-D`) | Each runs its own scheduler and step loop, and no collective joins them: they exchange only `prefill_done` and `block_assignment` over ZMQ, each taken by a handler thread (`channels.py::_rapidserve`). Sharing the devices is a cost question, not a time domain. This holds only without `--disagg-constrained`: with it, decode writes its decode-token count to shared memory and prefill reads it on wall time, off every channel, to pick its CU split, so `run/__init__.py::frontend` refuses the combination. |
 | PP stages | N EngineCores | **N** | The collapse does not cover them either. |
 
 LP counts for the milestones (`16` D95):
@@ -856,11 +856,9 @@ run (D3). Beyond that, only these create an LP:
    replica per role the router chooses among them and is LP `router`, as under
    `--dp-aware`; in 1P1D without `--dp-aware` it is transport (D7,
    `channels.py::prefill_decode_table`).
-4. **RapidServe** (`--enable-rapidserve`), which replaces the engine LP with two,
-   `engine-P` and `engine-D` (`channels.py::_rapidserve`). Its prefill and decode
-   `EngineCore`s share the devices but each runs its own scheduler and step loop, and no
-   collective joins them; they exchange `prefill_done` and `block_assignment` over ZMQ.
-   Sharing the devices is a cost question, not a time domain.
+4. **RapidServe** (`--enable-rapidserve`, never with `--disagg-constrained`), which
+   replaces the engine LP with two, `engine-P` and `engine-D`
+   (`channels.py::_rapidserve`); the RapidServe row of D3's LP table says why.
 
 | Deployment | GPUs | LPs |
 |---|---|---|
