@@ -800,6 +800,15 @@ concurrency, and a call of `atom/model_ops/deepseek_v41/unit_table.py::unit_tabl
 variant on tile buffers as `ScoreWorkspace` sizes them, came first; a record that still
 built one was taken again.
 
+`scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json` is the same law for
+cell A, TP4 with whole-expert EP4: fitted alike on `calibrate.sh` records at ATOM bb161b906
+in the same image, at the same concurrencies, under the same environment and `SERVER_ARGS`
+with `--enable-expert-parallel` added. Its first-turn records served under expert parallel
+here with no [#2538](https://github.com/jgong5/ATOM/issues/2538) fault. Its decode vectors
+stop at rung 48, and a c=256 record for rungs 56 and 64 is
+[#2582](https://github.com/jgong5/ATOM/issues/2582). An unscored record at each concurrency
+came first; a record that still built a Triton variant was taken again.
+
 ## Cost accuracy on a real run's own steps — `validate.cost`
 
 `PYTHONPATH=$T python -m atom.compass.validate.cost RECORD LAW` prices each step of a real
