@@ -232,7 +232,14 @@ fi
 # refused when the probe fails.
 MESH=$ROOT/atom/mesh
 MESH_RC=0
+CARGO_BIN=
 if [ -r "$MESH/Cargo.toml" ]; then
+    # pytest's cargo calls in atom/mesh run under flock (below), so a missing
+    # flock is refused here, before any cargo runs.
+    if CARGO_BIN=$(command -v cargo); then
+        FLOCK=$(command -v flock) ||
+            finish 96 "flock not found, so cargo in atom/mesh cannot run one process at a time; nothing was run"
+    fi
     export CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:-true}
     LOCK=${COMPASS_CARGO_LOCK:-/app/ATOM/atom/mesh/Cargo.lock}
     [ -e "$MESH/Cargo.lock" ] || [ ! -r "$LOCK" ] || cp "$LOCK" "$MESH/Cargo.lock"
@@ -278,13 +285,13 @@ trap 'rm -rf "${HARNESS:-}" "$LOGS"' EXIT
 # takes no lock on atom/mesh/target: two builds there at once delete each
 # other's artifacts (#2587). So every process finds cargo through a wrapper
 # that runs one started in atom/mesh only under a lock they all share, and any
-# other cargo as it is.
-if [ -r "$MESH/Cargo.toml" ] && CARGO=$(command -v cargo); then
-    FLOCK=$(command -v flock) ||
-        finish 96 "flock not found, so cargo in atom/mesh cannot run one process at a time; pytest was not run"
+# other cargo as it is. A cargo started inside a locked one, as atomesh's build
+# script runs `cargo --version`, finds the lock's path in
+# COMPASS_GATE_CARGO_LOCK and runs without it, instead of waiting on its parent.
+if [ -n "$CARGO_BIN" ]; then
     mkdir "$LOGS/bin" &&
-        printf '#!/usr/bin/env bash\ncase $(pwd -P)/ in %q/*) exec 9>>%q && %q 9 || exit ;; esac\nexec %q "$@"\n' \
-            "$(cd "$MESH" && pwd -P)" "$LOGS/cargo.lock" "$FLOCK" "$CARGO" >"$LOGS/bin/cargo" &&
+        printf '#!/usr/bin/env bash\nL=%q\ncase $(pwd -P)/ in %q/*)\n    [ "${COMPASS_GATE_CARGO_LOCK:-}" = "$L" ] ||\n        { exec 9>>"$L" && %q 9 && export COMPASS_GATE_CARGO_LOCK=$L || exit; } ;;\nesac\nexec %q "$@"\n' \
+            "$LOGS/cargo.lock" "$(cd "$MESH" && pwd -P)" "$FLOCK" "$CARGO_BIN" >"$LOGS/bin/cargo" &&
         chmod +x "$LOGS/bin/cargo" || finish 96 "cannot write the cargo wrapper; pytest was not run"
     export PATH=$LOGS/bin:$PATH
 fi

@@ -5,10 +5,14 @@ when a diff touching atom/mesh would leave them skipped.
 Each case runs the real script over the throwaway tree of
 ``test_gate_cpu_verdict_through_pipe.py`` plus an ``atom/mesh/Cargo.toml``, with
 a stand-in ``cargo`` first on PATH that logs its environment and arguments and
-exits as told. Nothing needs cargo or a network. The last case's stand-in logs
-when each of its runs starts and ends instead.
+exits as told. Nothing needs cargo or a network. The shard case's stand-in logs
+when each of its runs starts and ends instead. The last case builds a small
+real crate, so it needs cargo, offline, and skips without it.
 """
 
+import shutil
+
+import pytest
 from test_gate_cpu_verdict_through_pipe import BLIND, _run, _tree
 
 CARGO = """#!/bin/sh
@@ -120,3 +124,42 @@ def test_two_shards_never_run_cargo_in_atom_mesh_at_once(tmp_path):
     assert builds["build c"][2] == str(tmp_path), builds
     first, second = sorted([builds["build a"], builds["build b"]])
     assert first[1] <= second[0], f"two shards built in atom/mesh at once: {builds}"
+
+
+# A crate whose build script runs `cargo --version` from the crate's directory,
+# as atomesh's does.
+CRATE = {
+    "Cargo.toml": '[package]\nname = "stand_in"\nversion = "0.1.0"\nedition = "2021"\n',
+    "build.rs": (
+        "fn main() {\n"
+        '    let cargo = std::process::Command::new("cargo").arg("--version").status();\n'
+        "    assert!(cargo.unwrap().success());\n"
+        "}\n"
+    ),
+    "src/lib.rs": "",
+}
+RELEASE = """import os, signal, subprocess
+def test_release():
+    run = subprocess.Popen(["cargo", "build", "--release"], cwd={cwd!r}, start_new_session=True)
+    try:
+        assert run.wait(timeout=60) == 0
+    finally:
+        if run.poll() is None:
+            os.killpg(run.pid, signal.SIGKILL)
+"""
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="needs cargo")
+def test_a_cargo_started_inside_a_locked_one_does_not_wait_for_the_lock(tmp_path):
+    # The gate's own `cargo test --lib` runs the build script before pytest;
+    # `--release` runs it again, inside a cargo the wrapper has locked.
+    root = _tree(tmp_path / "ATOM", stamped=True)
+    mesh = root / "atom" / "mesh"
+    for name, text in CRATE.items():
+        (mesh / name).parent.mkdir(parents=True, exist_ok=True)
+        (mesh / name).write_text(text)
+    (root / "tests" / "compass").mkdir()
+    test = RELEASE.format(cwd=str(mesh))
+    (root / "tests" / "compass" / "test_release.py").write_text(test)
+    out = _run(root, "COMPASS_CARGO_LOCK=/nonexistent {gate}")
+    assert "pytest: rc=0" in out.stdout, out.stdout + out.stderr
