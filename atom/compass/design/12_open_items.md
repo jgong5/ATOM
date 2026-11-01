@@ -234,7 +234,7 @@ M-f `14`; M-g `01` D3.5.
 
 | # | Item | Topic |
 |---|---|---|
-| **T47** | A wrong lookahead is a calibration error no causality detector sees; only validation against real runs (`08`) or a stated-vs-measured channel-delay check catches it | `01` |
+| **T47** | A wrong lookahead is a calibration error no causality detector sees; only validation against real runs (`08`) or a stated-vs-measured channel-delay check catches it. `scripts/compass/http_intake.py hops` is that check for `ipc_s` and `stream_s` ([#2600](https://github.com/jgong5/ATOM/issues/2600)); `kv_write_req_s` and `router_in_s` have none yet ([#2603](https://github.com/jgong5/ATOM/issues/2603)) | `01` |
 | **T97** | Settle the recurrence check's provisional thresholds, p10 to p90 of the host-period error within 2% per step kind and the run total within 0.5%, once [#827](https://github.com/jgong5/ATOM/issues/827) reports them on [#828](https://github.com/jgong5/ATOM/issues/828)'s records | `01` |
 | ~~**T91**~~ | ~~How the DP ranks that make no CA call register sends and get frames released~~ — ruled 2026-10-01, option (b) ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)); stated in `01` D3 | `01` |
 | **T49** | The prefix-index *lookup* cost is charged to nobody — ~1,387 blocks hashed and probed per request at the cc-traces p50, magnitude unmeasured | `03` |

@@ -51,12 +51,15 @@ from atom.compass.fit.publish import RANK
 
 #: Each backend flag's store kind; the step stub's coefficients are a file.
 KINDS = {run.STEP_LINEAR: Kind.STEP_LINEAR_LAW, run.STEP_GRID: Kind.STEP_GRID_BUNDLE}
-#: The API server's admission path, the lookaheads no measurement backs
-#: (`single_engine_table`), and a simulated-time bound past any run's.
+#: The API server's admission path, the lookaheads (`single_engine_table`) and
+#: a simulated-time bound past any run's. ``ipc_s`` no measurement backs.
+#: ``stream_s`` is measured on hjbog-srdc-18 by `scripts/compass/http_intake.py
+#: hops`: the median, over parity workload requests sent one at a time, of an
+#: SSE response's head sent to the client reading it.
 FIXED = {
     "admission_path": "serving",
     "ipc_s": 2.0**-14,
-    "stream_s": 2.0**-12,
+    "stream_s": 159e-6,
     "bound_s": 1e7,
 }
 #: A prefill-decode run's write-request lookahead, which no measurement backs.
