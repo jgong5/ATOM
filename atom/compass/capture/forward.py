@@ -432,7 +432,7 @@ class _Recorder(TorchDispatchMode):
         self.replaying = None  # the kernels a replay launched, while one runs
         self.counted = None  # what a size the step's data sets counts, if stated
         self.lands = False  # whether a device value read on the host reads zeros
-        self.declined = []  # the mono refusals a deployment makes too (`_mono`)
+        self.declined = []  # the mono refusals this shape's steps met (`_mono`)
         self.start()
 
     def start(self):
@@ -926,8 +926,8 @@ def _mono(recorder, unpatched):
     at the declared arch through `unpatched`, so their scratch is read off
     their binaries. A refusal the deployment makes too, a bind check's
     `MonoUnsupported` or a kernel that needs scratch, leaves the original path
-    to trace and is told to `recorder.declined`; any other bind or build
-    failure is refused by name.
+    to trace and is told to `recorder.declined` by every step it turns away;
+    any other bind or build failure is refused by name.
     """
     from torch.utils._python_dispatch import _disable_current_modes
 
@@ -935,27 +935,41 @@ def _mono(recorder, unpatched):
     from atom.mono.runtime.compile import compile_kernels, scratch_bytes
 
     agree, init = consensus.tp_agree, route.LazyRunner.__init__
-    prepare = widths.WidthBuilds.prepare
+    ready, prepare = route.LazyRunner.ready, widths.WidthBuilds.prepare
+    refused = {}  # each refusal, by its runner and width (None for a bind)
 
     def host_agree(ok, group):
         with _disable_current_modes():
             return agree(ok, group)
 
-    def bound(create, what):
+    def bound(create, lazy):
         try:
             return create()
         except consensus.MonoUnsupported as why:
             if why.__cause__ is not None:  # a failure `bind_agreed` converted
-                raise ValueError(f"{what} failed to bind: {why}") from why.__cause__
-            recorder.declined.append({"runner": what, "width": None, "why": str(why)})
+                raise ValueError(
+                    f"{lazy.what} failed to bind: {why}"
+                ) from why.__cause__
+            refused[lazy, None] = {"runner": lazy.what, "width": None, "why": str(why)}
             raise
 
     def lazy(self, create, what):
-        init(self, functools.partial(bound, create, what), what)
+        init(self, functools.partial(bound, create, self), what)
+
+    def turned_away(self, rows, *shape):
+        held = ready(self, rows, *shape)
+        if (self, None) in refused:  # no step of a runner whose bind refused is mono
+            recorder.declined.append(refused[self, None])
+        return held
 
     def built(self, width):
-        if width in self._built or width in self._refused:
-            return prepare(self, width)
+        new = width not in self._built and width not in self._refused
+        held = building(self, width) if new else prepare(self, width)
+        if not held:  # the step takes the original path
+            recorder.declined.append(refused[self, width])
+        return held
+
+    def building(self, width):
         failed, scratch = [], []
 
         def noted(fn):
@@ -983,10 +997,14 @@ def _mono(recorder, unpatched):
             )
             return launchers
 
-        with (
-            patch.object(self, "_build", noted(self._build)),
-            patch.object(widths, "compile_kernels", noted(compiled)),
-        ):
+        with contextlib.ExitStack() as noting:
+            for name in ("_build", "_kernels", "_scratch_free"):
+                noting.enter_context(
+                    patch.object(self, name, noted(getattr(self, name)))
+                )
+            noting.enter_context(
+                patch.object(widths, "compile_kernels", noted(compiled))
+            )
             held = prepare(self, width)
         if failed or not (held or any(scratch)):
             why = repr(failed[0]) if failed else "no kernel needs scratch"
@@ -995,7 +1013,7 @@ def _mono(recorder, unpatched):
             ) from (failed[0] if failed else None)
         if not held:  # a kernel needs scratch, which the deployment refuses too
             why = f"a kernel needs {max(scratch)} B of scratch a lane"
-            recorder.declined.append({"runner": self._what, "width": width, "why": why})
+            refused[self, width] = {"runner": self._what, "width": width, "why": why}
         return held
 
     return (
@@ -1003,6 +1021,7 @@ def _mono(recorder, unpatched):
         (widths, "tp_agree", host_agree),
         (lifecycle, "PeerBuffer", driverless.PeerBuffer),
         (route.LazyRunner, "__init__", lazy),
+        (route.LazyRunner, "ready", turned_away),
         (widths.WidthBuilds, "prepare", built),
     )
 
@@ -1464,7 +1483,7 @@ def capture(
             return (False, False, 0, 0)
 
         for shape, output in variants:
-            recorder.shape, recorder.output = shape, output
+            recorder.shape, recorder.output, recorder.declined = shape, output, []
             # `decide` pads the step to the one width the ladder holds.
             ladder = [shape.width or shape.seqs]
             runner.capture_sizes_np = numpy.array(ladder, dtype=numpy.int32)
@@ -1502,6 +1521,7 @@ def capture(
                 graph = build(part, traced, crossing)
                 gone = [*left_out, *(("step-crossing", op) for op in crossing)]
                 declared["left_out"] = [{"why": why, **_json(op)} for why, op in gone]
-                if recorder.declined:
-                    declared["mono"] = list(recorder.declined)
+                declared.pop("mono", None)
+                if mono := list({id(why): why for why in recorder.declined}.values()):
+                    declared["mono"] = mono
                 yield graph, digest, dict(declared)

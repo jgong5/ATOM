@@ -542,9 +542,10 @@ and a capture's group is one process. Capture stands in for what needs a peer or
   and capture logs it.
 - **A refusal is the deployment's or the capture's.** A bind check's `MonoUnsupported` and
   a kernel that needs scratch are refusals the deployment makes too: the step traces the
-  original path, and the graph's `declared` names each under `mono`. Any other bind failure,
-  which `consensus.bind_agreed` converts to a refusal, and any build failure, which
-  `WidthBuilds.prepare` logs and declines, stop the capture by name: the deployment does
+  original path, and the `declared` of each graph whose steps it turned away names it under
+  `mono`. Any other bind failure, which `consensus.bind_agreed` converts to a refusal, and
+  any build failure, which `WidthBuilds.prepare` logs and declines, stop the capture by
+  name: the deployment does
   not fail there, so it runs mono, and the original path is not its step.
 
 Past its bind and its builds, a mono runner's launches lift by the lift rule (D20).

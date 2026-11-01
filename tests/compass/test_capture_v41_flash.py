@@ -42,8 +42,10 @@ MOE = "aiter.fused_moe_.default"
 COMPILED = "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits"
 #: A decode V4.1's mono decode serves: gfx950, expert parallelism off.
 MONO = "--width 16" + ARGS
+#: Two such decodes and a prefill, which mono never serves.
+MONOS = "--width 16 --width 8 --prefill 512 1" + ARGS
 #: Each run before a capture: the mono runtime's bind check refuses, its bind
-#: fails, its build fails, or a built kernel needs scratch.
+#: fails, its build or its kernel list fails, or a built kernel needs scratch.
 BIND = (
     "from atom.mono.runtime import consensus\n"
     "agreed = consensus.bind_agreed\n"
@@ -58,6 +60,13 @@ BUILD_FAILURE = (
     "def compile_kernels(kernels):\n"
     "    raise RuntimeError('an injected build failure')\n"
     "built.compile_kernels = compile_kernels\n"
+)
+KERNELS = (
+    "from atom.mono.runtime import widths\n"
+    "init = widths.WidthBuilds.__init__\n"
+    "def kernels(built):\n"
+    "    raise RuntimeError('an injected kernel-list failure')\n"
+    "widths.WidthBuilds.__init__ = lambda s, b, _, g, w: init(s, b, kernels, g, w)\n"
 )
 SCRATCH = (
     "from atom.mono.runtime import compile as built\n"
@@ -235,8 +244,15 @@ def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(tmp_p
                 "RuntimeError('an injected build failure')"
             ),
         ),
+        (
+            KERNELS,
+            (
+                "V4.1 mono declined its width-16 kernels: "
+                "RuntimeError('an injected kernel-list failure')"
+            ),
+        ),
     ],
-    ids=["bind", "build"],
+    ids=["bind", "build", "kernels"],
 )
 def test_a_mono_failure_the_capture_makes_stops_it_by_name(prelude, refusal, tmp_path):
     done = trace(tmp_path, MONO, "gfx950", prelude)
@@ -248,17 +264,25 @@ def test_a_mono_failure_the_capture_makes_stops_it_by_name(prelude, refusal, tmp
 @pytest.mark.parametrize(
     "prelude, declined",
     [
-        (BIND_REFUSAL, ("V4.1 mono decode", None, "an injected bind refusal")),
-        (SCRATCH, ("V4.1 mono", 16, "a kernel needs 64 B of scratch a lane")),
+        (
+            BIND_REFUSAL,
+            lambda w: ("V4.1 mono decode", None, "an injected bind refusal"),
+        ),
+        (SCRATCH, lambda w: ("V4.1 mono", w, "a kernel needs 64 B of scratch a lane")),
     ],
     ids=["bind_check", "scratch"],
 )
-def test_a_mono_refusal_the_deployment_makes_too_traces_the_original_path(
+def test_a_mono_refusal_the_deployment_makes_too_is_declared_by_the_graphs_it_turns_away(
     prelude, declined, tmp_path_factory
 ):
-    graph, declared = capture(tmp_path_factory, MONO, "gfx950", prelude)["decode B=16"]
+    graphs = capture(tmp_path_factory, MONOS, "gfx950", prelude)
 
-    assert declared["mono"] == [dict(zip(("runner", "width", "why"), declined))]
-    ops = _ops(graph["region"])
-    assert not [op for op in ops if ".mono." in op["op"]]
-    assert len([op for op in ops if op["op"] == V41_ATTENTION]) == LAYERS
+    assert len(graphs) == 3
+    for shape, (graph, declared) in graphs.items():
+        # Each the original path; a prefill is never mono's, so it declares none.
+        ops = _ops(graph["region"])
+        assert not [op for op in ops if ".mono." in op["op"]]
+        assert len([op for op in ops if op["op"] == V41_ATTENTION]) == LAYERS
+        width = int(shape.split("B=")[1]) if shape.startswith("decode") else None
+        why = [dict(zip(("runner", "width", "why"), declined(width)))]
+        assert declared.get("mono") == (why if width else None), shape
