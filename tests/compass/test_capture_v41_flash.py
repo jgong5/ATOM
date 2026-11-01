@@ -8,7 +8,8 @@ builds its width as its deployment does.
 V4.1's attention, Engram and the step's staging run their bodies on a real
 step's batch, so their kernels are leaves; its sparse attention states its
 layer's window, compression ratio and top k, and its indexer's scorer the
-ratio and the candidates it scores among.
+ratio and the candidates it scores among; the mono decode's K2, which runs
+both, states all four.
 """
 
 import hashlib
@@ -23,7 +24,12 @@ import pytest
 from test_capture_ir import MAIN, _decoder, _ops
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
-from atom.compass.capture.forward import V41_ATTENTION, V41_OPENED, V41_SCORERS
+from atom.compass.capture.forward import (
+    V41_ATTENTION,
+    V41_LAYER_POST,
+    V41_OPENED,
+    V41_SCORERS,
+)
 
 TREE = pathlib.Path(__file__).resolve().parents[2]
 # `deepseek-ai/DeepSeek-V4.1-Flash` at the revision its `reference_manifest.json`
@@ -266,6 +272,19 @@ def test_gfx950_s_mono_leaves_hold_the_buffers_their_runner_keeps_as_metadata(
         # its buffers are metadata, never activations a bench fills at random.
         held = {slot: roles(op["args"][slot]) for slot in HELD[op["op"]].split()}
         assert held == {slot: {"metadata"} for slot in held}, op["op"]
+
+
+def test_gfx950_s_mono_k2_states_its_layer_s_geometry(tmp_path_factory):
+    graph, _ = capture(tmp_path_factory, MONO, "gfx950")["decode B=16"]
+
+    posts = [op for op in _ops(graph["region"]) if op["op"] == V41_LAYER_POST]
+    assert len(posts) == LAYERS
+    for index, op in enumerate(posts):
+        # Mono calls no layer's forward: its runner's call states the layer's.
+        indexed = index in TEXT["index_source_layer_ids"]
+        cap = scored(index)["index_candidates"] if indexed else None
+        assert op["stated"] == {**geometry(index), "index_candidates": cap}
+        assert op["args"]["iact"] == indexed
 
 
 @pytest.mark.parametrize(
