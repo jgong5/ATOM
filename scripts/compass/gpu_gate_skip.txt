@@ -10,3 +10,5 @@
 MI308X tests/attentions/deepseek_v41/test_tbo.py
 # #2631: the V4 paged-decode kernel returns a different output on each call at head dim 96.
 MI308X tests/model_ops/test_v4_fused_decode.py
+# #2637: reads the host's real amd-smi and times out while any card on the node is busy.
+MI308X tests/test_atomesh_spur_dispatch.py
