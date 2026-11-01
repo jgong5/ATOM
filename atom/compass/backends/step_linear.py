@@ -56,6 +56,11 @@ requests: on a prefill step that produces output it adds the drafter's
 output and 0 on one that does not: the draft-KV pass projects and writes a tail
 only for requests that finish their prompts. Under either, a prefill step that
 does not say whether it produces output is refused.
+Beside `propose` it may hold a `short_propose` vector over `[1, seqs]` with a
+`below` entry, a token count: a prefill step of fewer tokens that produces
+output prices its `propose` pass by it instead. The pass replays one draft
+graph at any prefill length; what moves its window is whether the target's
+launch paced the device, which a batch shows only through its tokens.
 A draft law may also hold a `draft_kv` vector over `[1, seqs]`: on a decode
 step it adds the drafter's draft-KV pass, which runs before
 `forward_done_event`, so its terms are the target's. A draft law with
@@ -70,7 +75,8 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
      "decode": {"eager": VECTOR, "1": VECTOR, "2": VECTOR, ...},
      "draft": {"provenance": ..., "prefill": VECTOR, "decode": {...},
                "propose": VECTOR, "draft_kv": VECTOR,
-               "output_prefill_kv": true}}   # all three optional
+               "short_propose": VECTOR,     # with "below": tokens
+               "output_prefill_kv": true}}   # all four optional
 
     VECTOR = {"coefficients": {<feature>: seconds, ...},
               "hull": HULL,
@@ -184,6 +190,15 @@ class StepLinearLaw:
         self.propose = law.get("propose") and _Vector(
             "propose", PROPOSE, law["propose"]
         )
+        short = law.get("short_propose")
+        self.short_propose = short and _Vector("short_propose", PROPOSE, short)
+        if short and ("below" not in short or not self.propose):
+            lacks = "no below" if "below" not in short else "no propose vector"
+            raise ValueError(
+                "the short_propose vector prices a pass under its below token "
+                f"count, beside a propose vector; the law states {lacks}"
+            )
+        self.below = short and int(short["below"])
         self.draft_kv = law.get("draft_kv") and _Vector(
             "draft_kv", PROPOSE, law["draft_kv"]
         )
@@ -279,7 +294,10 @@ class StepLinearBackend(CostBackend):
             terms, kv = [], terms
         seqs = (1, len(batch_view.requests))
         if prefill and law.propose is not None and batch_view.produces_output:
-            terms += self._priced(law, law.propose, "propose", seqs, what)
+            propose = law.propose
+            if law.short_propose and sum_tokens(prefill) < law.below:
+                propose = law.short_propose
+            terms += self._priced(law, propose, "propose", seqs, what)
         if decode and law.draft_kv is not None:
             kv = self._priced(law, law.draft_kv, "draft_kv", seqs, what)
         return terms, kv

@@ -29,7 +29,7 @@ member, the frontend's included, connects to.
   selects the simulated runner.
 - `engine(config)` wraps the engine's construction in its own process the
   same way, and maps every DP rank to the engine LP for the process-group
-  check.
+  check. The engine ignores SIGTERM from just before it says READY.
 - `runner(runner, tree)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
@@ -236,7 +236,7 @@ from atom.compass.clock import (
     single_engine_table,
 )
 from atom.compass.clock.channels import add_lmcache
-from atom.compass.clock_transport import connect, serve
+from atom.compass.clock_transport import connect, connect_here, serve
 from atom.compass.detect.determinism import StepTable
 from atom.compass.runner import COMPASS_RAPIDSERVE_QUALNAME, COMPASS_RUNNER_QUALNAME
 from atom.utils import clock
@@ -367,6 +367,8 @@ _authority: "_RecordingAuthority | None" = None
 _early_end: threading.Thread | None = None
 #: This engine process's member name in the engine LP, None at DP width one.
 _member: str | None = None
+#: The SIGTERM handler this engine process set aside as it said READY.
+_sigterm_at_ready: list = []
 
 
 def spec() -> dict | None:
@@ -1018,8 +1020,12 @@ class _StoppingClock(clock.LPRuntime):
         super().end_run()
 
 
-def _runtime(lp: LpId, run: dict, member=None, cls=clock.LPRuntime) -> clock.LPRuntime:
-    rt = cls(lp, channel_table(run), connect(lp, run["clock_endpoint"], member))
+def _runtime(
+    lp: LpId, run: dict, member=None, cls=clock.LPRuntime, here=False
+) -> clock.LPRuntime:
+    """`lp`'s runtime on the run's clock; `here` when this process serves it."""
+    reach = connect_here if here else connect
+    rt = cls(lp, channel_table(run), reach(lp, run["clock_endpoint"], member))
     clock.install(rt)
     return rt
 
@@ -1138,7 +1144,8 @@ def frontend(config):
         )
         _early_end.start()
     _launch_lmcache(config, run, side)
-    rt = _runtime(lp, run, cls=_StoppingClock)
+    # A co-hosting frontend reaches the authority in-process, with no socket.
+    rt = _runtime(lp, run, cls=_StoppingClock, here=authority is not None)
     rt.client_run_ended = lambda k: _frontend_hand_in(run, rt, k)
     return _start_on_leaving(rt, authority)
 
@@ -1291,7 +1298,39 @@ def engine(config):
     clock.settle_before_collectives()
     if _member is not None and _offloads_to_lmcache_mp(config.kv_transfer_config):
         _park_before_dispatch()
-    return _named(_start_on_leaving(_runtime(lp, run, _member, _PublishedClock)))
+    rt = _runtime(lp, run, _member, _PublishedClock)
+    return _ignoring_sigterm_from_ready(_named(_start_on_leaving(rt)))
+
+
+@contextlib.contextmanager
+def _ignoring_sigterm_from_ready(inner):
+    """`inner`, in which the engine ignores SIGTERM from just before it says
+    READY and sets ATOM's handler aside, for `engine_loop` to put back.
+
+    The construction goes on after READY: a pipeline stage's transport, a DP
+    engine's prefill delayer, a prefill-decode engine's `_init_disagg`. A group
+    stop from then on would run ATOM's handler, which stops the workers before
+    the engine hands in; it reaches the engine as the ``+inf`` grant instead.
+    A construction that raises has the handler back."""
+    from atom.model_engine.engine_core import EngineCore
+
+    ready = EngineCore._send_ready_signal
+
+    @functools.wraps(ready)
+    def ignoring(self):
+        _sigterm_at_ready.append(signal.signal(signal.SIGTERM, signal.SIG_IGN))
+        return ready(self)
+
+    EngineCore._send_ready_signal = ignoring
+    try:
+        with inner:
+            yield
+    except BaseException:
+        if _sigterm_at_ready and (before := _sigterm_at_ready.pop()) is not None:
+            signal.signal(signal.SIGTERM, before)
+        raise
+    finally:
+        EngineCore._send_ready_signal = ready
 
 
 def _offloads_to_lmcache_mp(kv) -> bool:
@@ -1635,13 +1674,15 @@ def op_graph(run: dict, config, machine, ep: int = 1, lazy: dict | None = None):
         and getattr(config, "enable_low_latency", False),
         price_list=PRICE_LIST in run and _price_list(run, config, machine),
         drafts=drafter.num_speculative_tokens if drafter else 0,
+        block=bool(drafter) and drafter.use_dspark(),
     )
 
 
 def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or of its drafter's part (`draft`), or when it holds none
+    that does not, or of its drafter's part (`draft`, a block drafter's
+    draft-KV pass where it is `forward.KV`), or when it holds none
     `forward.missed`'s text, None for no text; under DP, at the rows the
     step's MoE gathers; a prefill's drafter at the `width` its later passes
     pad to.
@@ -1786,14 +1827,17 @@ def _graph_pool(model_runner, machine, model):
 
 
 def tokenizer(tok, config) -> None:
-    """Wrap `tok`'s ``encode`` and ``decode`` with the machine spec's entry for
-    the model's architecture and the backend that loaded; the entry warns when
-    the loaded ``tokenizer.json`` is not the one it was measured on."""
+    """Wrap `tok`'s ``encode`` and ``decode``, and its Rust backend's
+    ``encode_batch``, with the machine spec's entry for the model's architecture
+    and the backend that loaded; the entry warns when the loaded
+    ``tokenizer.json`` is not the one it was measured on."""
     run = spec()
     if run is None:
         return
+    from tokenizers import Tokenizer
+
     from atom.compass.spec import Backend
-    from atom.utils.compass_loop import wrap_decode, wrap_encode
+    from atom.utils.compass_loop import wrap_decode, wrap_encode, wrap_encode_batch
 
     entry = _machine(run).tokenizer_for(
         config.hf_config.architectures[0],
@@ -1802,6 +1846,11 @@ def tokenizer(tok, config) -> None:
     )
     tok.encode = wrap_encode(tok.encode, entry)
     tok.decode = wrap_decode(tok.decode, entry)
+    # ATOM's segment tokenizer, which only a Rust backend gets, encodes a long
+    # prompt's uncached segments with its ``encode_batch``, not ``encode``.
+    backend = getattr(tok, "_tokenizer", None)
+    if isinstance(backend, Tokenizer):
+        backend.encode_batch = wrap_encode_batch(backend.encode_batch, entry)
 
 
 def http_intake() -> tuple[float, float, float] | None:
@@ -2003,16 +2052,18 @@ def engine_loop(engine_core):
     In a run the engine ignores SIGTERM until it has handed in: ATOM's handler
     would stop the workers inside a clock call, before they say what their
     steps cost. A stop reaches the engine as the ``+inf`` grant instead. The
-    engine said it was ready as its construction ended, so a stop can come
-    from then on: it ignores SIGTERM first, before the run file's read, a
-    pipeline stage's sends or the bundle's request, and has its handler back
-    however it leaves.
+    engine has ignored SIGTERM since it said READY (`engine`); the loop
+    ignores it first too, before the run file's read, a pipeline stage's sends
+    or the bundle's request, and however it leaves puts back the handler set
+    aside at READY, or else the one it found.
 
     A pipeline stage's runner calls go through `pp_send.install`'s sends. A
     recorded real run's SIGTERM goes through `_stop_recording`, and its input
     queue stamps each request frame's handoff (`clock.stamp_input`)."""
     ignoring = bool(os.environ.get(ENV))  # a run, as `spec` would say, unread
     before = signal.signal(signal.SIGTERM, signal.SIG_IGN) if ignoring else None
+    if _sigterm_at_ready:
+        before = _sigterm_at_ready.pop()
     try:
         from atom.compass import parity
 

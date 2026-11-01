@@ -317,14 +317,39 @@ def charge(d: float) -> None:
         rt.advance_to(rt.now + d)
 
 
+#: Whether this thread is inside a `wrap_encode` call, which charges the backend
+#: calls its ``encode`` makes.
+_in_encode = threading.local()
+
+
 def wrap_encode(encode, entry):
     """`encode`, charging the current job ``fixed + tokens / derated rate``."""
     rate = entry.encode_tokens_per_s * entry.derate
 
     def charged(*args, **kwargs):
-        ids = encode(*args, **kwargs)
+        _in_encode.on = True
+        try:
+            ids = encode(*args, **kwargs)
+        finally:
+            _in_encode.on = False
         charge(entry.encode_fixed_s + len(ids) / rate)
         return ids
+
+    return charged
+
+
+def wrap_encode_batch(encode_batch, entry):
+    """A fast tokenizer backend's ``encode_batch``, charging the current job
+    ``fixed + tokens / derated rate`` over the ids of all the encodings it
+    returns, the batch at the single-call rate; a call made inside a
+    `wrap_encode` call is that call's to charge."""
+    rate = entry.encode_tokens_per_s * entry.derate
+
+    def charged(*args, **kwargs):
+        encodings = encode_batch(*args, **kwargs)
+        if not getattr(_in_encode, "on", False):
+            charge(entry.encode_fixed_s + sum(len(e.ids) for e in encodings) / rate)
+        return encodings
 
     return charged
 
