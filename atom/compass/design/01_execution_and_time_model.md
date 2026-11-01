@@ -393,9 +393,10 @@ one LP:
 | API server | 1 process: uvicorn, `CoreManager` and its threads | **1** (frontend) | Its asyncio event loop is a clock owner of its own: it tokenizes and streams while the engine runs a forward, so it overlaps the step loop in simulated time and cannot be folded into it. Offline, the owner is the loop that calls `get_output`. |
 | PD container (prefill or decode) | one full ATOM deployment | **2** | its frontend LP and its engine LP |
 | Traffic source | — | **1** | |
-| Atomesh router, 1P1D | 1 Rust process | **0**, or **1** under `--dp-aware` | Part of the channels that cross it: with one P and one D it has no choice to make, so it contributes only a fixed per-request forward cost, stated in those channels' lookahead (D7). Under `--dp-aware` (DP attention) it chooses among DP ranks on load that responses move, and is LP `router` (D7). Several P or D instances are deferred. |
+| Atomesh router | 1 Rust process | **0** in 1P1D, or **1** under `--dp-aware` or with several P or D instances | Part of the channels that cross it: with one P and one D it has no choice to make, so it contributes only a fixed per-request forward cost, stated in those channels' lookahead (D7). Under `--dp-aware` (DP attention) it chooses among DP ranks on load that responses move, and with several P or D instances among those instances, and is then LP `router` (D7, `channels.py::prefill_decode_table`). |
 | lmcache MP server (`ATOM_KV_OFFLOAD=lmcache_mp`) | 1 process | **1** (`lmcache`) | Its cached chunks decide later hits for every engine that reaches it, so it is a Compass stand-in on the real channels (D6.1). |
-| PP stages | N EngineCores | **N** | The only group the collapse does not cover. |
+| RapidServe (`--enable-rapidserve`) | 2 EngineCores on the same devices | **2** (`engine-P`, `engine-D`) | Each runs its own scheduler and step loop, and no collective joins them: they exchange only `prefill_done` and `block_assignment` over ZMQ, each taken by a handler thread (`channels.py::_rapidserve`). Sharing the devices is a cost question, not a time domain. This holds only without `--disagg-constrained`: with it, decode writes its decode-token count to shared memory and prefill reads it on wall time, off every channel, to pick its CU split, so `run/__init__.py::frontend` refuses the combination. |
+| PP stages | N EngineCores | **N** | The collapse does not cover them either. |
 
 LP counts for the milestones (`16` D95):
 
@@ -852,7 +853,12 @@ run (D3). Beyond that, only these create an LP:
 3. an **independent replica** behind the router. `.github/scripts/atomesh/pd_server_atom.sh`
    deploys *xP* prefill servers and *yD* decode servers, each an independent deployment
    with its own `Scheduler`, none synchronizing with the others. With more than one
-   replica per role the router itself is an LP (deferred; in 1P1D it is transport).
+   replica per role the router chooses among them and is LP `router`, as under
+   `--dp-aware`; in 1P1D without `--dp-aware` it is transport (D7,
+   `channels.py::prefill_decode_table`).
+4. **RapidServe** (`--enable-rapidserve`, never with `--disagg-constrained`), which
+   replaces the engine LP with two, `engine-P` and `engine-D`
+   (`channels.py::_rapidserve`); the RapidServe row of D3's LP table says why.
 
 | Deployment | GPUs | LPs |
 |---|---|---|
@@ -2175,8 +2181,11 @@ per step per member.
 pricing a LOOKUP by a declared law in prompt chunks and the bookkeeping requests at a
 declared constant; and the copy engine, a stated width, pricing a STORE or RETRIEVE as a
 `TransferModel` (`kv/transfer.py`) over the machine spec's host link, `bytes` the
-chunks moved times the chunk's bytes from the KV geometry. Both are declared until
-measured; their accuracy is out of scope here.
+chunks moved times the chunk's bytes from the KV geometry. The copy engine applies no
+derate, unlike `TransferModel.from_spec` on a fabric link: the spec states the host link
+as a copy reaches it, not as a peak (`spec/fields.py`, `interconnect.host_link`;
+`run/__init__.py::_lmcache_stations`). Both stations' laws are declared until measured;
+their accuracy is out of scope here.
 
 **Fake-model duties.**
 
