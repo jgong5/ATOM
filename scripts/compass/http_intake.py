@@ -119,10 +119,8 @@ def serve(stamps: str, args: list[str]) -> None:
 
         def patch(module) -> None:
             cls = getattr(module, owner)
-            # A method the class lacks is not stamped; `hops` then refuses.
             for name, kind in kinds.items():
-                if hasattr(cls, name):
-                    setattr(cls, name, timed(getattr(cls, name), kind))
+                setattr(cls, name, timed(getattr(cls, name), kind))
 
         return patch
 

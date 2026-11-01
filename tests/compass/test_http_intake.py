@@ -280,6 +280,8 @@ def test_serve_stamps_each_tokenizer_pool_job_and_engine_send(tmp_path):
             "class CoreManager:\n"
             "    def add_request(self, seqs):\n"
             "        print(seqs)\n"
+            "    def _mark_seq_prefill_complete(self, seq_id): pass\n"
+            "    def _deliver_terminal_output(self, seq): return False\n"
         ),
         "entrypoints/openai/api_server.py": (
             "from atom.model_engine.engine_core_mgr import CoreManager\n"
@@ -341,6 +343,7 @@ def test_serve_stamps_each_sse_head_and_each_engine_output_taken_in(tmp_path):
         "model_engine/__init__.py": "",
         "model_engine/engine_core_mgr.py": (
             "class CoreManager:\n"
+            "    def add_request(self, seqs): pass\n"
             "    def _mark_seq_prefill_complete(self, seq_id): pass\n"
             "    def _deliver_terminal_output(self, seq): return False\n"
         ),
