@@ -51,8 +51,6 @@ def test_each_a0_device_field_is_probed_or_the_datasheet_and_the_rest_assumed():
     assert {p for p, o in origins.items() if o == "assumed"} == {
         "host.ipc.zmq_roundtrip_s",
         "host.ipc.shm_broadcast_s",
-        "host.http_intake.fixed_s",
-        "host.http_intake.per_byte_s",
         "interconnect.inter_node.link_latency_s",
         "interconnect.inter_node.derate",
         "interconnect.router_relay_s",
@@ -114,6 +112,31 @@ def test_b0_shares_a0_s_peaks_and_carries_mi355x_s_ratios_never_a0_s_readings():
         "MI455X B0 gfx1250",
     )
     assert a0_key["software_stack"] != b0_key["software_stack"]
+
+
+def test_a_run_on_a0_charges_the_intake_the_node_s_bursts_fitted(monkeypatch, tmp_path):
+    """The frontend loop's intake a simulated run on A0's spec charges: the
+    terms the node's bursts fitted, probed from their record and band, and no
+    longer mi355-gpu-45's."""
+    from atom.compass import run as compass_run
+
+    _, _, terms, band, record = _script().INTAKE
+    a0, mi355x = _spec(A0), _spec(MI355X)
+    for term in terms:
+        origin = a0.origin(f"host.http_intake.{term}")
+        assert (origin["origin"], origin.get("record")) == (
+            "probed",
+            f"sha256:{record}",
+        )
+        assert (origin["p10"], origin["p90"]) == band[term]
+        assert terms[term] != mi355x.value(f"host.http_intake.{term}")
+    run = tmp_path / "run.json"
+    machine = json.loads(A0.read_text())
+    run.write_text(json.dumps({"bound_s": 600.0, "machine": machine}))
+    monkeypatch.setenv(compass_run.ENV, str(run))
+    fixed = terms["fixed_s"]
+    # No lone request was timed on the node, so the fixed term stands for idle.
+    assert compass_run.http_intake() == (fixed, terms["per_byte_s"], fixed)
 
 
 #: rocm-smi's listing of GPU 0 on the MI455 node, 2026-10-27: the series is no

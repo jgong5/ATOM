@@ -12,7 +12,7 @@ them (`PEAKS`) give each format's derate over the peaks, the bandwidth curve,
 the kernel floor and the intra-node link's latency and derate, and its record
 the device fragment (`DEVICE`): the arch, the capacity torch reads and the
 stack, beside the host's cores. No card has a ptl directory. The HTTP intake
-terms are mi355-gpu-45's, assumed, until a burst on MI455 fits them; what no
+terms are a real burst's on the node (`INTAKE`); what no
 probe fills on any machine (the IPC costs, the inter-node link's latency and
 derate, the router relay) is assumed as on mi355-gpu-45. `--model` and
 `--sweep-from` work as `mi308x_spec.py`'s do; with neither the script sweeps
@@ -49,8 +49,7 @@ NAME = "mi455-a0"
 base.NAME = NAME  # the shared fragment and sweep functions name this machine
 B0 = "mi455-b0"
 MACHINES = Path(__file__).resolve().parent / "machines"
-#: The probed machine whose ratios and values B0 carries, and whose HTTP
-#: intake terms A0 carries until it has its own.
+#: The probed machine whose ratios and values B0 carries.
 MI355X = MACHINES / "mi355x-gpu45.json"
 MODEL = "/apps/perzhang/models/DeepSeek-V4.1-Flash"
 SHEET = "MI455X product page and brochure (07/26), read 2026-10-09"
@@ -155,6 +154,23 @@ DEVICE = {
     },
 }
 
+#: `http_intake.py`'s fit over one real c=256 first-turn cc-traces burst of
+#: `MODEL` at TP4, DSpark5, experts sharded across TP, at the commit named and
+#: on NUMA node 1's cores; the record is its stamp file, the burst nearest both
+#: medians. The band is each term's p10 and p90 over six bursts after a
+#: warm-up, each fitted alone: the record and stamp files sha256 dddc0d42,
+#: aa66ea72, 0fb869f1, 19a346f6 and ae02794a.
+INTAKE = (
+    "2026-11-01",
+    "a0381bfc1",
+    {"fixed_s": 0.006044910365805244, "per_byte_s": 1.478828601664519e-08},
+    {
+        "fixed_s": (0.005848353691439428, 0.006622099884347502),
+        "per_byte_s": (1.2611548747658177e-08, 1.760107581851583e-08),
+    },
+    "3e42ff61b321708d3638f9f0252cc3a4b707f206e703ae1abd60312d51f94f72",
+)
+
 #: No probe fills these: mi308x_spec's assumed values less what the datasheet
 #: states and what `PEAKS` fills.
 DECLARED = copy.deepcopy(base.DECLARED)
@@ -166,7 +182,7 @@ for block, groups in DATASHEET.items():
 
 def a0_fragments() -> list[Fragment]:
     """A0's: the probe record's device, the datasheet's peaks, the probed
-    peaks, the cards' PTL state, MI355X's intake terms and the assumed rest."""
+    peaks, the cards' PTL state, the burst's intake terms and the assumed rest."""
     date, root, _, record = PEAKS
     subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
     notes = f"probe_device.py's record at {root}"
@@ -175,23 +191,13 @@ def a0_fragments() -> list[Fragment]:
         "assumed", DECLARED, "assumed", "no probe fills these", date=date
     )
     probed, assumed = base.peaks(PEAKS, datasheet.values, assumed)
-    mi355x = MachineSpec.from_mapping(json.loads(MI355X.read_text()))
-    intake = {
-        "host": {
-            "http_intake": {
-                k: mi355x.value(f"host.http_intake.{k}")
-                for k in ("fixed_s", "per_byte_s")
-            }
-        }
-    }
-    carried = f"{MI355X.stem}'s, until a burst on MI455 fits them"
     ptl = {"device": {"ptl": "disabled"}}
     return [
         fragment("device", DEVICE, "probed", notes, subject, date),
         datasheet,
         assumed,
         fragment("ptl", ptl, "probed", "no card has a ptl directory", date=date),
-        fragment("intake", intake, "assumed", carried, date=date),
+        base.intake(MODEL, *INTAKE),
         probed,
     ]
 
