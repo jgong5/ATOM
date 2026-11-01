@@ -15,8 +15,9 @@ preshuffled weight. A tensor's role is where its storage came from:
 the model's parameters, buffers and tensor attributes are weights, what
 `allocate_kv_cache` allocated is KV, what the model's forward and the sampler
 after it allocated is an activation, and anything else (the runner's buffers,
-what its input preparation allocated) is metadata. A functional collective's
-group is the aiter coordinator it belongs to (`_coordinator`).
+a mono runner's among them, what its input preparation allocated) is
+metadata. A functional collective's group is the aiter coordinator it belongs
+to (`_coordinator`).
 
 A raw Triton or FlyDSL launch lifts to the function that issues it
 (`_Recorder`): one leaf, that function by its module and name, its parameters at
@@ -927,7 +928,9 @@ def _mono(recorder, unpatched):
     their binaries. A refusal the deployment makes too, a bind check's
     `MonoUnsupported` or a kernel that needs scratch, leaves the original path
     to trace and is told to `recorder.declined` by every step it turns away;
-    any other bind or build failure is refused by name.
+    any other bind or build failure is refused by name. A runner is made in
+    the model's first forward but holds its buffers for the run, a model
+    runner's own buffers' role: what its making allocates is metadata.
     """
     from torch.utils._python_dispatch import _disable_current_modes
 
@@ -943,6 +946,7 @@ def _mono(recorder, unpatched):
             return agree(ok, group)
 
     def bound(create, lazy):
+        creating, recorder.creating = recorder.creating, ir.Role.METADATA
         try:
             return create()
         except consensus.MonoUnsupported as why:
@@ -952,6 +956,8 @@ def _mono(recorder, unpatched):
                 ) from why.__cause__
             refused[lazy, None] = {"runner": lazy.what, "width": None, "why": str(why)}
             raise
+        finally:
+            recorder.creating = creating
 
     def lazy(self, create, what):
         init(self, functools.partial(bound, create, self), what)
