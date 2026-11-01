@@ -251,24 +251,59 @@ A change to atomesh's `Cargo.toml` that needs a crate the cache lacks makes the
 probe fail, and so the gate exit 96, until `cargo fetch` runs in that tree's
 `atom/mesh` in the container, with the network.
 
-## The MI455 image, and what stops a TP4 start in it
+## The MI455 image, and what stopped a TP4 start in the earlier one
 
 The gate image ships no gfx1250 kernels. MI455 work runs under
-`rocm/fw-bringup-mlperf:gfx1250-atom-20261026-dsv41` (`sha256:fd7450fde2da`),
-whose aiter is a git checkout (`/app/aiter`) and which carries `rocm-smi`, the
-two things `compass measure memory` reads for the stack and the device. Its
-entrypoint is `/bin/bash`, so the command is `-c`; a tree runs as in the gate,
+`rocm/ufb-private:vllm-dsv4flash-mori-epv2-mi455-20260922-r5`
+(`sha256:1a3ff678e922`) with aiter at `b6a9d0aeb`, the stack
+`machines/mi455-a0.json` pins and `compass measure memory` holds a start to.
+Its aiter is a git checkout (`/sgl-workspace/aiter`) and it carries `rocm-smi`,
+the two things that command reads for the stack and the device. Its entrypoint
+launches vLLM, so the container sleeps instead; a tree runs as in the gate,
 a `snapshot.sh` tarball extracted inside and run from `/` with `PYTHONPATH=$T`:
 
 ```
-docker run -d --name <user>_mi455 --network host --device /dev/kfd --device /dev/dri \
+docker run -d --name <user>_ufb --network host --device /dev/kfd --device /dev/dri \
   --group-add video --ipc host -v <parent>:<parent> -v <models>:<models> \
-  rocm/fw-bringup-mlperf:gfx1250-atom-20261026-dsv41 -c 'sleep infinity'
+  --entrypoint /bin/sleep rocm/ufb-private:vllm-dsv4flash-mori-epv2-mi455-20260922-r5 infinity
 ```
 
-DeepSeek-V4.1-Flash's gfx1250 flags are in
-[its recipe](../../recipes/DeepSeek-V4.1-Flash.md#gfx1250-mi455x). What stops
-`ec341a05a` serving it at TP4 in this image on an A0 node, with the measurements
+In each new container, move aiter from the image's `a6d2b564f` to `b6a9d0aeb`,
+and FlyDSL from 0.2.4 to the 0.4.0 it pins. `git stash` sets the image's own aiter
+patches aside: a modified checkout reads `b6a9d0aeb-dirty`, and the stack check
+compares the commit exactly. Each command has its own line because `set -e` does
+not stop on a failure before the last command of an `&&` list.
+
+```
+docker exec <user>_ufb bash -c 'set -e
+  cd /sgl-workspace/aiter
+  git stash
+  git fetch origin main
+  git checkout --detach b6a9d0aeb
+  git submodule update --init --recursive
+  git clean -fdX -- aiter/jit
+  pip install --no-deps flydsl==0.4.0
+  PREBUILD_KERNELS=0 pip install --no-build-isolation --no-deps -e .'
+```
+
+Every ATOM process in it runs with these settings:
+
+| Setting | Without it |
+|---|---|
+| `ENABLE_CK=0` | aiter's JIT fails `module_activation` and `module_sample` in CK's `amd_tdm_store` |
+| `GPU_ARCHS=gfx1250` | aiter's JIT fails `module_deepgemm_opus`, built for the card's 192 CUs where OPUS registers gfx1250 at 256 |
+| `ATOM_ENGRAM_UVA=0` | a V4.1-Flash start page-locks 189 GiB of Engram tables |
+| `NCCL_MIN_NCHANNELS` unset | the image's 112 faults the first RCCL all-reduce |
+
+DeepSeek-V4.1-Flash then serves at TP4 with
+[its recipe's](../../recipes/DeepSeek-V4.1-Flash.md#gfx1250-mi455x) gfx1250
+flags and default hotswap, each rank peaking near 26 GB of host memory
+([#2359's finding](https://github.com/jgong5/ATOM/issues/2359#issuecomment-6491285682)).
+aiter past `b6a9d0aeb` faults in its TP4 MoE (#2458).
+
+What stopped `ec341a05a` serving V4.1-Flash at TP4 on an A0 node in the earlier
+image, `rocm/fw-bringup-mlperf:gfx1250-atom-20261026-dsv41`
+(`sha256:fd7450fde2da`), with the measurements
 in [#2359](https://github.com/jgong5/ATOM/issues/2359):
 
 - **Every process translates its own GPU code.** On a gfx1250 A0 card ROCr
