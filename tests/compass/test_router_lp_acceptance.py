@@ -73,7 +73,7 @@ RANKS = [(0, 0), (0, 1), (1, 0), (0, 0)]
 
 
 @pytest.fixture(scope="module")
-def atomesh():
+def atomesh(tmp_path_factory):
     resolved = shutil.which("cargo") and subprocess.run(
         ["cargo", "metadata", "--format-version", "1"],
         cwd=MESH,
@@ -86,7 +86,31 @@ def atomesh():
     subprocess.run(
         ["cargo", "build", "--bin", "atomesh"], cwd=MESH, check=True, timeout=1800
     )
-    return Path(os.environ.get("CARGO_TARGET_DIR", MESH / "target")) / "debug/atomesh"
+    # Any later cargo call in atom/mesh, such as another gate shard's `cargo
+    # test`, re-links target/debug/atomesh to the binary it built, with other
+    # dependency features, and the path is missing while it does. The tests
+    # start a copy in their own directory instead, which no cargo call touches.
+    built = Path(os.environ.get("CARGO_TARGET_DIR", MESH / "target")) / "debug/atomesh"
+    return Path(shutil.copy(built, tmp_path_factory.mktemp("atomesh")))
+
+
+def test_a_later_cargo_call_leaves_the_binary_the_tests_start_alone(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    # A stand-in cargo whose build and test each re-link target/debug/atomesh,
+    # as cargo does, to a new binary that prints the command that linked it.
+    (tmp_path / "cargo").write_text(
+        '#!/bin/sh\n[ "$1" = metadata ] && exit 0\nd=$CARGO_TARGET_DIR/debug\n'
+        'mkdir -p "$d" && rm -f "$d/atomesh" &&\n'
+        'printf "#!/bin/sh\\necho %s\\n" "$1" >"$d/atomesh" && chmod +x "$d/atomesh"\n'
+    )
+    (tmp_path / "cargo").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(tmp_path / "target"))
+    binary = atomesh.__wrapped__(tmp_path_factory)
+    subprocess.run(["cargo", "test"], check=True)
+    started = subprocess.run([binary], capture_output=True, text=True, check=True)
+    assert started.stdout == "build\n"
 
 
 class Frontend:

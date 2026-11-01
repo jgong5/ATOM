@@ -321,6 +321,40 @@ def test_a_tp_log_is_checked_line_by_line_and_its_spread_reported(
     assert rows["memory real", "peak_torch across TP ranks"][0].endswith(" 0.00% apart")
 
 
+def test_the_command_at_tp_4_prints_a_table_per_line_and_validates_spread(
+    monkeypatch, tmp_path, capsys
+):
+    rows = _tp_rows(monkeypatch, tmp_path, [1.0, 1.0, 2.0, 1.0])
+    log = tmp_path / "real" / "server.log"
+    main([str(tmp_path / compass_run.LP_FILE.format("engine")), str(log), "--tp", "4"])
+    out = capsys.readouterr().out
+    tables = out.split(" against run ")[1:]
+    runs = [t.split("\n", 1)[0] for t in tables]
+    assert runs == [f"{log} line {i}" for i in (1, 2, 3, 4)]
+    non_torch = [
+        next(row for row in t.splitlines() if row.startswith("  non_torch "))
+        for t in tables
+    ]
+    assert [row.split()[-1] for row in non_torch] == ["pass", "pass", "fail", "pass"]
+    for term in ("peak_torch", "non_torch"):
+        value, _ = rows["memory real", f"{term} across TP ranks"]
+        assert f"\n{term} across TP ranks: {value}\n" in out
+
+
+@pytest.mark.parametrize("zero", [1, 2])
+def test_a_tp_line_logging_non_torch_as_zero_leaves_the_spread_over_the_rest(
+    monkeypatch, tmp_path, zero
+):
+    # ATOM clamps non_torch at 0, and a term recorded as zero bytes is refused.
+    factors = [1.0, 1.0, 2.0, 1.0]
+    factors[zero - 1] = 0.0
+    rows = _tp_rows(monkeypatch, tmp_path, factors)
+    assert rows[f"memory real line {zero}", "non_torch"][1] == "refused"
+    value, _ = rows["memory real", "non_torch across TP ranks"]
+    assert value.endswith(" apart; 3 of 4 lines compare it")
+    assert rows["memory real", "peak_torch across TP ranks"][0].endswith(" 0.00% apart")
+
+
 @pytest.mark.parametrize(
     "factors,tp,tokens,refused",
     [
