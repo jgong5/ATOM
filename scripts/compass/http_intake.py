@@ -8,15 +8,15 @@
     python3 scripts/compass/http_intake.py hops STAMPS HANDOFF ARRIVALS
 
 `serve` runs `atom.entrypoints.openai.api_server` as ``python3 -m`` does and
-appends ``<end ns> <thread id> body|tmpl|app|prep|send|out|fin|head <start ns> <size>`` to STAMPS for
+appends ``<end ns> <thread id> body|tmpl|app|prep|send|out|head <start ns> <size>`` to STAMPS for
 each request body first read (`Request.body`), chat template rendered
 (`apply_chat_template`) and HTTP request handed to the ASGI app
 (`Starlette.__call__`, size 0); `cctraces_sim.sh` runs it when HTTP_INTAKE is set.
 `prep` is a tokenizer pool job (`InputOutputProcessor.preprocess_fanout`) and `send`
-a request handed to the engine (`CoreManager.add_request`), `out` and `fin`
-an engine output its output thread took in (`CoreManager._mark_seq_prefill_complete`
-per streamed output, `_deliver_terminal_output` per finished sequence) and `head`
-an SSE response's head sent to the client, all size 0.
+a request handed to the engine (`CoreManager.add_request`), `out` an engine
+output its output thread took in (`CoreManager._mark_seq_prefill_complete` per
+streamed output, `_deliver_terminal_output` per finished sequence) and `head` an
+SSE response's head sent to the client, all size 0.
 
 `floor` reads the transport from client send to ASGI app call off a server
 `serve` ran and the parity workload's real-run ARRIVALS
@@ -29,9 +29,9 @@ median as `idle_s`, p10, p90, PER_BYTE_S, N and the sha256 as JSON.
 `hops` reads three hops off the same run, the server run with
 ``ATOM_COMPASS_PARITY_RECORD`` set so its engine writes HANDOFF
 (``dp0.handoff.jsonl``): ``request``, each engine send's return to the engine
-input thread's receipt; ``output``, the engine output thread's send of streamed
-outputs returning to the server's output thread taking them in; ``stream``, each SSE head sent to the
-client reading it (ARRIVALS' ``admitted_ns``). Prints each hop's median, p10,
+input thread's receipt; ``output``, each engine output's put on the engine's
+output queue to the server's output thread taking it in; ``stream``, each SSE
+head sent to the client reading it (ARRIVALS' ``admitted_ns``). Prints each hop's median, p10,
 p90 and N, and the three inputs' sha256, as JSON.
 
 `fit` reads a burst of N first-turn requests (default 256), which the loop takes
@@ -137,7 +137,7 @@ def serve(stamps: str, args: list[str]) -> None:
             "CoreManager",
             add_request="send",
             _mark_seq_prefill_complete="out",
-            _deliver_terminal_output="fin",
+            _deliver_terminal_output="out",
         ),
     }
 
@@ -259,30 +259,28 @@ def hops(stamps: str, handoff: str, arrivals: str) -> dict:
     sent_data = Path(arrivals).read_bytes()
     rows = [line.split() for line in data.decode().splitlines()]
     sends = [int(r[0]) for r in rows if r[2] == "send"]
-    outs = sorted((int(r[3]), r[2]) for r in rows if r[2] in ("out", "fin"))
+    outs = [int(r[3]) for r in rows if r[2] == "out"]
     heads = [int(r[0]) for r in rows if r[2] == "head"]
     lines = [json.loads(line) for line in handoff_data.decode().splitlines()]
     recvs = [h["t_recv_ns"] for h in lines if "t_recv_ns" in h]
-    # Outputs from the first request on. The output thread stamps each of a
-    # message's rows: the message arrived with its first.
+    # Outputs put from the first request on, each timed from its put: the
+    # engine's send stamp is its output thread's next get, which can trail the
+    # server's receipt. The server stamps each of a message's rows, and the
+    # message arrived with its first.
     first = min(sends, default=0)
-    put = sorted((h["t_out_sent_ns"], h["rows"]) for h in lines if "rows" in h)
+    put = sorted((h["t_out_put_ns"], h["rows"]) for h in lines if "rows" in h)
     put = [(t, n) for t, n in put if t > first]
-    outs = [(t, kind) for t, kind in outs if t > first]
+    outs = sorted(t for t in outs if t > first)
     starts = np.cumsum([0] + [n for _, n in put])
     if starts[-1] != len(outs):
         raise SystemExit(
             f"output: {len(outs)} rows taken in, not the {starts[-1]} sent"
         )
-    # The engine logs a finished-sequence message once sent, which its next get
-    # waits for, so only streamed outputs are timed.
-    streamed = [
-        (t, outs[i][0]) for (t, _), i in zip(put, starts) if outs[i][1] == "out"
-    ]
+    got = [outs[i] for i in starts[:-1]]
     admitted = json.loads(sent_data)["admitted_ns"]
     return {
         "request": _hop(sends, recvs, "request"),
-        "output": _hop(*zip(*streamed), "output", alone=False),
+        "output": _hop([t for t, _ in put], got, "output", alone=False),
         "stream": _hop(heads, admitted, "stream"),
         "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
         "handoff": f"sha256:{hashlib.sha256(handoff_data).hexdigest()}",

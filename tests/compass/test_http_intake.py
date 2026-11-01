@@ -390,7 +390,7 @@ if __name__ == "__main__":
     )
     rows = [line.split() for line in stamps.read_text().splitlines()]
     # The plain-text response sends a head too, and is no stream.
-    assert [r[2] for r in rows] == ["app", "head", "app", "out", "fin"]
+    assert [r[2] for r in rows] == ["app", "head", "app", "out", "out"]
 
 
 def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
@@ -399,16 +399,14 @@ def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
     stamps, handoff = [], []
     for s, h in zip(sent, hop):
         # Two streamed outputs in one message, then the finished sequence, whose
-        # send the engine stamps only once it has logged it.
-        put, fin = s + 5 * 10**6, s + 5 * 10**6 + 100_010 + h
+        # send stamp trails its receipt.
+        put = s + 5 * 10**6
         stamps += [f"{s} 1 send {s - 50} 0", f"{s + 7} 1 head {s + 5} 0"]
-        stamps += [
-            f"{put + 100_000 + h + p} 2 out {put + 100_000 + h + p} 0" for p in (0, 5)
-        ]
-        stamps += [f"{fin} 2 fin {fin} 0"]
+        got = [put + 100_000 + h + p for p in (0, 5, 10)]
+        stamps += [f"{g} 2 out {g} 0" for g in got]
         handoff += [
-            {"t_out_put_ns": put - 9, "t_out_sent_ns": put, "rows": 2},
-            {"t_out_put_ns": put - 9, "t_out_sent_ns": fin + 10, "rows": 1},
+            {"t_out_put_ns": put, "t_out_sent_ns": put + 50, "rows": 2},
+            {"t_out_put_ns": put + 10, "t_out_sent_ns": got[2] + 20, "rows": 1},
         ]
         handoff.append({"t_recv_ns": s + 200_000 + h, "t_in_put_ns": 0})
     # An output before the first request.
@@ -424,7 +422,7 @@ def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
     assert (got["request"]["p10_s"], got["request"]["p90_s"]) == pytest.approx(
         (209e-6, 281e-6)
     )
-    assert [got[k]["messages"] for k in ("request", "output", "stream")] == [10, 10, 10]
+    assert [got[k]["messages"] for k in ("request", "output", "stream")] == [10, 20, 10]
     # A request the engine never received pairs nothing.
     paths[1].write_text(
         "".join(json.dumps(line) + "\n" for line in handoff[:2] + handoff[3:])
@@ -436,5 +434,5 @@ def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
     # Nor does a message with a row the server never took in.
     paths[1].write_text("".join(json.dumps(line) + "\n" for line in handoff))
     paths[0].write_text("\n".join(r for r in stamps if " out " not in r) + "\n")
-    with pytest.raises(SystemExit, match="output: 10 rows taken in, not the 30 sent"):
+    with pytest.raises(SystemExit, match="output: 0 rows taken in, not the 30 sent"):
         probe.hops(*map(str, paths))
