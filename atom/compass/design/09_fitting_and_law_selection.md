@@ -187,7 +187,8 @@ The pass replays one draft graph at any prefill length, yet on the DeepSeek-V4.1
 DSpark TP4 records it ran about three times as long after a short prefill whose launch
 paced the device as after a long one or a middle chunk. So the fit splits `propose` at
 the power-of-two token count that prices the labels best, `short_propose` below it, when
-that cuts their mean log error by a tenth
+that cuts their mean log error by a tenth; a count is a candidate only when each side of
+it holds at least `step_linear_fit.PROPOSE_SPLIT_STEPS` steps
 ([#2492](https://github.com/jgong5/ATOM/issues/2492)).
 
 **Host laws** price the host segments of `01` D4: `E`, `W_pre`, `W_launch` and
