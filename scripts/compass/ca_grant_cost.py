@@ -100,14 +100,14 @@ def lps(n: int, endpoint: str, rounds: int = 1000) -> dict:
     }
 
 
-def main(argv=None) -> None:
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("mode", choices=("serve", "lps"))
     parser.add_argument("n", type=int, help="how many LPs")
     parser.add_argument("endpoint", help="tcp://HOST:PORT")
     parser.add_argument("--lookahead", type=float, default=1.0)
     parser.add_argument("--rounds", type=int, default=1000)
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
     if args.mode == "serve":
         result = ca(args.n, args.endpoint, args.lookahead)
     else:

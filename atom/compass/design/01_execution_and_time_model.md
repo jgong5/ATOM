@@ -819,7 +819,9 @@ grounds.
 
 ### Open issues
 
-- Grant RPC latency has not been measured on this box. The 50 us figure is an estimate.
+- The ~50 us per grant in Sizing above is the old estimate. The grant cost is measured in
+  [Sizing against a measured workload](#sizing-against-a-measured-workload); PP8's
+  sizing has not been redone on it.
 - Whether the CA should be a process or a thread in the API-server process is open. A
   separate process is cleaner for the PD case where the API server is not obviously the
   right host.
@@ -908,7 +910,7 @@ LP, running in parallel across LPs.**
 
 **At the milestones' 3 and 5 LPs, the CA's whole run is 3% and 7% of that pricing, and
 an LP's grants (4,450 round trips) are 3% and 6% of it locally, 6% and 9% cross-node.**
-The simulator's own pricing still dominates there, by 14x or more, and optimising the time
+The simulator's own pricing still dominates there, by 10x or more, and optimising the time
 protocol before the cost model would be optimising the wrong thing.
 
 **At the replica scale the CA dominates.** Under the barrier, its 34- and 82-LP runs take
@@ -1008,9 +1010,6 @@ the property they are supposed to be testing.
 
 ### Open issues
 
-- Grant RPC latency has not been measured on this hardware. The 50 us figure is an
-  estimate and should be measured before it is quoted. Note this matters only for the
-  standalone form; co-hosted grants are function calls.
 - The CA is the only component that knows every LP's virtual time. It should therefore
   own the global timeline log and the stall diagnostic. That makes it an observability
   component as well as a coordination one, which is a benefit but also means its output
