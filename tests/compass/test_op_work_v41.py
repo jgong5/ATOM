@@ -5,30 +5,54 @@ states.
 Each extractor matches a hand count on one shape; the sparse attention and the
 indexer's scorer read their entries at the geometry their leaf states, over
 the queries the leaf holds, and are refused by name where it states none, as
-the mono K2 is; every leaf of the V4.1-Flash TP4 captures, EP off and EP4,
-and gfx950's EP4 and mono EP-off decodes prices; and the op-level backend
-prices a V4.1-Flash decode step and a prefill step on MI455 A0's spec, a
-decode step over a longer context higher.
+the mono K2 is; a token-parallel mono K1 and K2 run a rank's own rows and
+gather the rest; every leaf of the V4.1-Flash TP4 captures, EP off and EP4,
+and gfx950's EP4 and mono EP-off decodes prices; the mono decode runs token
+parallel at 16 requests and not at 8, and the op-level backend prices both on
+MI355X's spec; and it prices a V4.1-Flash decode step and a prefill step on
+MI455 A0's spec, a decode step over a longer context higher.
 """
 
 import json
 
 import pytest
-from test_capture_v41_flash import ARGS, COMPILED, EP4, MONO, SHAPES, TP, TREE, capture
+from test_capture_ir import _ops
+from test_capture_v41_flash import (
+    ARGS,
+    COMPILED,
+    EP4,
+    LAYERS,
+    MONO,
+    SHAPES,
+    TEXT,
+    TP,
+    TREE,
+    capture,
+)
 from test_op_work import BF16, F32, I32, leaf, rows, t
 
 from atom.compass.backends import BatchView, RequestShape
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.resolver import CostRefused
-from atom.compass.backends.work import Work, allgather, allreduce, gemm, price
+from atom.compass.backends.work import (
+    Work,
+    allgather,
+    allreduce,
+    gemm,
+    price,
+    reduce_scatter,
+)
 from atom.compass.bench.ops import leaves
 from atom.compass.capture.forward import V41_ATTENTION, V41_LAYER_POST, V41_SCORERS
 from atom.compass.spec import MachineSpec
 
 FP8, E8M0, I64 = "torch.float8_e4m3fn", "torch.float8_e8m0fnu", "torch.int64"
-MI455 = MachineSpec.from_mapping(
-    json.loads((TREE / "scripts/compass/machines/mi455-a0.json").read_text())
+MI455, MI355X = (
+    MachineSpec.from_mapping(
+        json.loads((TREE / f"scripts/compass/machines/{name}.json").read_text())
+    )
+    for name in ("mi455-a0", "mi355x-gpu45")
 )
 #: Window 4, every 2 tokens compressed, the top 3 read.
 GEOMETRY = {"window_size": 4, "compress_ratio": 2, "index_topk": 3}
@@ -58,12 +82,12 @@ TABLES = {
 }
 
 
-def attn_pre(fold, tok_par=False):
+def attn_pre(fold):
     """K1 of 2 rows over 2 hc copies of width 8: 12 mixes, a 16-row QKV
     and a 32-row Q product; no indexer feed."""
     return leaf(
         K1,
-        key=build("AttnPre", tokens=2, fold=fold, tok_par=tok_par),
+        key=build("AttnPre", tokens=2, fold=fold, tok_par=False),
         res_in=t([1, 2, 2, 8]),
         pend=t([1, 2, 8]) if fold else 0,
         res_out=t([1, 2, 2, 8]),
@@ -239,13 +263,72 @@ def test_the_mono_mailbox_reset_zeroes_its_buffers_whole_whatever_the_rows():
 
 
 @pytest.mark.parametrize(
-    "op",
-    [attn_pre(True, tok_par=True), layer_post(ep=2), layer_post(moe_tp=2)],
-    ids=["token_parallel", "ep", "moe_tp"],
+    "op", [layer_post(ep=2), layer_post(moe_tp=2)], ids=["ep", "moe_tp"]
 )
 def test_a_mono_build_whose_rows_cross_ranks_is_refused_by_name(op):
-    with pytest.raises(CostRefused, match=f"{op['op']}: a token-parallel or DP-"):
+    with pytest.raises(CostRefused, match=f"{op['op']}: a DP-attention build"):
         work(op, rows((1, 9)), TP, "bf16")
+
+
+def test_a_token_parallel_mono_k1_runs_its_rank_s_rows_and_gathers_every_rank_s():
+    # K1 of 2 rows at TP 2, feeding the indexer: rank 0 owns row 0.
+    op = leaf(
+        K1,
+        key=build("AttnPre", tokens=2, fold=True, feeds_index=True, tok_par=True, tp=2),
+        res_in=t([1, 2, 2, 8]),
+        pend=t([1, 2, 8]),
+        res_out=t([1, 2, 2, 8]),
+        hc_fn=weight([12, 16], F32),
+        wqkv=weight([16, 8]),
+        wqb=weight([32, 16]),
+        iq_w=weight([8, 16]),
+        iw_w=weight([2, 8], BF16),
+        ring=t([4096, 8], role="kv"),
+        qr_out=t([1, 2, 16], FP8),
+        qrs_out=t([1, 2, 1], E8M0),
+        normed=t([1, 2, 8]),
+        iw_out=t([2, 2], F32),
+        **TABLES,
+    )
+    # Its row through the 192 mix, 16 head-weight and 128 QKV weights; both
+    # rows through the 512 Q and 128 index-query weights. Each weight read
+    # once, the normed rows and head weights whole, and of the residual, the
+    # owed post and the q latent its row: 194 bytes halved.
+    flops = {"bf16": 2 * (192 + 16), "fp8": 2 * 128 + 4 * (512 + 128)}
+    read = 768 + 32 + 128 + 512 + 128 + 32 + 16 + 194 / 2
+    # Every row's 16-byte window row, q latent, normed row and head weights,
+    # each rank's to every other.
+    gathered = allgather(2, 2 * 16 + 32 + 2 + 32 + 16)
+
+    assert work(op, rows((1, 300), (1, 5)), TP, "bf16") == Work(flops, read) + gathered
+
+
+def test_a_token_parallel_mono_k2_reduce_scatters_its_sums_and_gathers_its_rows():
+    # K2 of 2 rows at TP 2 whose indexer runs: rank 0 owns row 0.
+    op = layer_post(tok_par=True)
+    state = dict(op["args"]["key"]["state"]) | {"tp": 2}
+    op["args"] |= {
+        "key": build("LayerPost", **state),
+        "hc_fn": weight([12, 16], F32),
+        "normed": t([1, 2, 8]),
+        "irow": t([2, 3], I32),
+        "iprod": 0,
+    }
+    # The attention's 13 entries over both rows, half the scorer's 102.
+    attended = Work({"bf16": 4 * 2 * 8 * 13, "fp8": 2 * 16 * 102}, 13 * 16 + 51 * 16)
+    # Both rows through the output projection, the router and the experts;
+    # its row through the 192 mix weights.
+    products = Work({"bf16": 4 * 32 + 2 * 192, "fp8": 4 * 128 + 4 * 2 * 48}, 3 * 26)
+    # q, the products' weights, the normed rows and the selection whole; its
+    # row of iq and of the output.
+    io = Work({}, 64 + 128 + 64 + 768 + 32 + 24 + (64 + 32) / 2)
+    # Each sum to its row's owner; the normed rows and the selection to every rank.
+    sums = reduce_scatter(2, 2 * 8 * 2) + reduce_scatter(2, 2 * 8 * 2)
+    sums += allgather(2, 32 + 24)
+
+    got = work(op, rows((1, 300), (1, 5)), TP, "bf16")
+
+    assert got == attended + products + io + sums
 
 
 def test_the_delayed_hyper_connection_projects_each_row_s_widened_residual():
@@ -398,3 +481,30 @@ def test_every_v41_flash_leaf_prices(argv, arch, ep, attends, tmp_path_factory):
     backend = OpGraphBackend(MI455, lambda *s: graph["region"], tp=TP, kv="bf16", ep=ep)
     near, far = (backend.price(_view("decode B=16", c)).seconds for c in (1024, 65536))
     assert far > near
+
+
+#: V4.1's mono decode at 16 requests, which TP4 runs token parallel, and at 8.
+WIDTHS = "--width 16 --width 8" + ARGS
+GATHER = "_c10d_functional.all_gather_into_tensor.default"
+
+
+def test_the_mono_decode_runs_token_parallel_at_16_requests_and_not_at_8(
+    tmp_path_factory,
+):
+    graphs = capture(tmp_path_factory, WIDTHS, "gfx950")
+
+    for width, parallel in ((16, True), (8, False)):
+        graph, _ = graphs[f"decode B={width}"]
+        ops = _ops(graph["region"])
+        built = [op["args"]["key"] for op in ops if op["op"] in (K1, V41_LAYER_POST)]
+        assert len(built) == 2 * LAYERS
+        assert {dict(key["state"])["tok_par"] for key in built} == {parallel}
+        # Each rank's rows gathered once, then the vocab gather as before.
+        own = [width // TP, 1, TEXT["hidden_size"]]
+        vocab = [width, TEXT["vocab_size"] // TP]
+        gathered = [op["args"]["input"]["shape"] for op in ops if op["op"] == GATHER]
+        assert gathered == [own] * parallel + [vocab]
+        backend = OpGraphBackend(
+            MI355X, lambda *s, g=graph: g["region"], tp=TP, kv="bf16"
+        )
+        assert backend.price(_view(f"decode B={width}")).seconds > 0
