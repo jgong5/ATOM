@@ -9,7 +9,7 @@ V4.1's attention, Engram and the step's staging run their bodies on a real
 step's batch, so their kernels are leaves; its sparse attention states its
 layer's window, compression ratio and top k, and its indexer's scorer the
 ratio and the candidates it scores among; the mono decode's K2, which runs
-both, states all four.
+both, states them all and its experts' unpadded width.
 """
 
 import hashlib
@@ -283,7 +283,9 @@ def test_gfx950_s_mono_k2_states_its_layer_s_geometry(tmp_path_factory):
         # Mono calls no layer's forward: its runner's call states the layer's.
         indexed = index in TEXT["index_source_layer_ids"]
         cap = scored(index)["index_candidates"] if indexed else None
-        assert op["stated"] == {**geometry(index), "index_candidates": cap}
+        width = TEXT["moe_intermediate_size"] // TP
+        stated = {"index_candidates": cap, "expert_width": width}
+        assert op["stated"] == {**geometry(index), **stated}
         assert op["args"]["iact"] == indexed
 
 

@@ -78,28 +78,30 @@ def attn_pre(fold, tok_par=False):
     )
 
 
-def layer_post(stated=True):
+def layer_post(stated=True, **fields):
     """K2 of 2 rows at width 8 whose indexer runs over 2 heads of width 16,
-    attending 2 heads of width 8: a 16-row attention and an 8-row router
-    product, and 4 experts of 8 rows of width 8 each way, 2 a route."""
+    attending 2 heads of width 8: 128 output-projection and 32 router weights,
+    and 4 experts whose width 2 the loader pads to 4, 2 a route."""
     op = leaf(
         V41_LAYER_POST,
-        key=build("LayerPost", tokens=2, experts=4, topk=2, tp=TP, index_fp4=False),
+        key=build(
+            "LayerPost", tokens=2, experts=4, topk=2, tp=TP, index_fp4=False, **fields
+        ),
         iact=1,
         iq=t([2, 2, 16], FP8),
         q=t([1, 2, 2, 8]),
         pool=t([4096, 8], role="kv"),
         woa=weight([8, 16]),
         gate_w=weight([4, 8], BF16),
-        w13=weight([4, 4, 4], FP4),
-        w13_s=weight([4, 1], U8),
-        w2=weight([4, 4, 4], FP4),
+        w13=weight([4, 8, 4], FP4),
+        w13_s=weight([4, 2], U8),
+        w2=weight([4, 8, 2], FP4),
         w2_s=weight([4, 1], U8),
         out=t([1, 2, 8]),
         **dict.fromkeys(("wob", "hc_fn", "sgu", "sw2"), 0),
         **TABLES,
     )
-    held = {**GEOMETRY, "index_candidates": 100}
+    held = {**GEOMETRY, "index_candidates": 100, "expert_width": 2}
     return {**op, "stated": held} if stated else op
 
 
@@ -177,7 +179,7 @@ def test_the_scorer_scores_every_compressed_entry_or_at_most_its_candidates():
         (scorer(2, None, stated=False), "compress_ratio, index_candidates"),
         (
             layer_post(stated=False),
-            "window_size, compress_ratio, index_topk, index_candidates",
+            ", ".join([*GEOMETRY, "index_candidates", "expert_width"]),
         ),
     ],
     ids=["attention", "scorer", "mono"],
@@ -205,9 +207,11 @@ def test_mono_k2_attends_scores_and_routes_the_view_s_rows():
     attended = Work(
         {"bf16": 4 * 2 * 8 * 13, "fp8": 2 * 2 * 16 * 102}, 13 * 16 + 102 * 16
     )
-    # 2 rows through 128 output-projection and 32 router weights; 4 routes through
-    # 64 of an expert's weights at fp8, 3 of 4 experts' 34 bytes read.
-    products = Work({"bf16": 4 * 32, "fp8": 4 * 128 + 4 * 2 * 64}, 3 * 34)
+    # 2 rows through 128 output-projection and 32 router weights; 4 routes
+    # through the real half of an expert's 96 weights at fp8. 3 of 4 experts
+    # read, each half its 50 bytes of weights and gate-up scales and its 1
+    # byte of down scales whole.
+    products = Work({"bf16": 4 * 32, "fp8": 4 * 128 + 4 * 2 * 48}, 3 * 26)
     # q, iq, the two products' weights and the output read once.
     io = Work({}, 64 + 64 + 128 + 64 + 32)
     reduced = allreduce(TP, 2 * 8 * 2)
@@ -234,9 +238,14 @@ def test_the_mono_mailbox_reset_zeroes_its_buffers_whole_whatever_the_rows():
     assert work(op, rows(*[(1, 9)] * 3), TP, "bf16") == want
 
 
-def test_a_token_parallel_mono_build_is_refused_by_name():
-    with pytest.raises(CostRefused, match=f"{K1}: a token-parallel or DP-attention"):
-        work(attn_pre(True, tok_par=True), rows((1, 9)), TP, "bf16")
+@pytest.mark.parametrize(
+    "op",
+    [attn_pre(True, tok_par=True), layer_post(ep=2), layer_post(moe_tp=2)],
+    ids=["token_parallel", "ep", "moe_tp"],
+)
+def test_a_mono_build_whose_rows_cross_ranks_is_refused_by_name(op):
+    with pytest.raises(CostRefused, match=f"{op['op']}: a token-parallel or DP-"):
+        work(op, rows((1, 9)), TP, "bf16")
 
 
 def test_the_delayed_hyper_connection_projects_each_row_s_widened_residual():
