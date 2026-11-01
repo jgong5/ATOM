@@ -380,3 +380,36 @@ def test_every_query_refuses_an_unregistered_process():
             query(b)
     with pytest.raises(KeyError, match="b is not registered; registered: a"):
         table.distance(a, b)
+
+
+OUT = 7.0e-4
+ENGINE_TABLES = {
+    "dp2": lambda **k: single_engine_table(dp=2, **k),
+    "pp2": lambda **k: single_engine_table(pp=2, **k),
+    "rapidserve": lambda **k: single_engine_table(rapidserve=True, **k),
+    "pd": lambda **k: prefill_decode_table(router_s=ROUTER, kv_write_req_s=KV, **k),
+}
+
+
+@pytest.mark.parametrize("form", sorted(ENGINE_TABLES))
+def test_an_engine_output_to_its_frontend_takes_ipc_out_s_and_other_zmq_ipc_s(form):
+    common = {"admission_path": "serving", "ipc_s": IPC, "stream_s": STREAM}
+    got = _whole(ENGINE_TABLES[form](ipc_out_s=OUT, **common))
+    outs = {n for n in got if ":output#" in n}
+    assert outs and {got[n][2] for n in outs} == {OUT}
+    assert OUT not in {c[2] for n, c in got.items() if n not in outs}
+    # Without it, the output channels keep ipc_s.
+    assert _whole(ENGINE_TABLES[form](**common)) == {
+        n: (*c[:2], IPC, c[3]) if n in outs else c for n, c in got.items()
+    }
+
+
+def test_a_run_files_ipc_out_s_reaches_the_output_channel():
+    from atom.compass import run as compass_run
+
+    run = {"admission_path": "serving", "ipc_s": IPC, "stream_s": STREAM}
+    output = "engine->frontend:output#dp0"
+    assert compass_run.channel_table(run).lookahead(output) == IPC
+    table = compass_run.channel_table(run | {"ipc_out_s": OUT})
+    assert table.lookahead(output) == OUT
+    assert table.lookahead("frontend->engine:request#dp0") == IPC
