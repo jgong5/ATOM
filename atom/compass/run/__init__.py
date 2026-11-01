@@ -59,7 +59,8 @@ member, the frontend's included, connects to.
   what has been handed in.
 
 Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
-``ipc_s``, ``stream_s``, one of ``step_stub`` (a `Coefficients` mapping,
+``ipc_s``, ``stream_s``, ``ipc_out_s`` (optional, the engine output channels'
+lookahead, ``ipc_s`` when absent), one of ``step_stub`` (a `Coefficients` mapping,
 priced by `StepStubBackend`), ``step_linear`` (a `StepLinearLaw` mapping,
 priced by `StepLinearBackend`; its ``machine_spec`` digest and
 its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
@@ -490,6 +491,7 @@ def channel_table(run: dict):
 
 def _engines_table(run: dict):
     common = {k: run[k] for k in ("admission_path", "ipc_s", "stream_s")}
+    common["ipc_out_s"] = run.get("ipc_out_s")
     pp, links = _pp(run, "P"), ()
     if pp > 1:
         from atom.compass.runner.pp_send import carrier_models, lookaheads

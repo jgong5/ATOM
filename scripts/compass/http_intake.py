@@ -5,14 +5,18 @@
     python3 scripts/compass/http_intake.py fit STAMPS [N]
     python3 scripts/compass/http_intake.py floor STAMPS ARRIVALS
     python3 scripts/compass/http_intake.py idle STAMPS [PER_BYTE_S]
+    python3 scripts/compass/http_intake.py hops STAMPS HANDOFF ARRIVALS
 
 `serve` runs `atom.entrypoints.openai.api_server` as ``python3 -m`` does and
-appends ``<end ns> <thread id> body|tmpl|app|prep|send <start ns> <size>`` to STAMPS for
+appends ``<end ns> <thread id> body|tmpl|app|prep|send|out|head <start ns> <size>`` to STAMPS for
 each request body first read (`Request.body`), chat template rendered
 (`apply_chat_template`) and HTTP request handed to the ASGI app
 (`Starlette.__call__`, size 0); `cctraces_sim.sh` runs it when HTTP_INTAKE is set.
 `prep` is a tokenizer pool job (`InputOutputProcessor.preprocess_fanout`) and `send`
-a request handed to the engine (`CoreManager.add_request`), both size 0.
+a request handed to the engine (`CoreManager.add_request`), `out` an engine
+output its output thread took in (`CoreManager._mark_seq_prefill_complete` per
+streamed output, `_deliver_terminal_output` per finished sequence) and `head` an
+SSE response's head sent to the client, all size 0.
 
 `floor` reads the transport from client send to ASGI app call off a server
 `serve` ran and the parity workload's real-run ARRIVALS
@@ -22,6 +26,14 @@ any request. Prints the median, p10 and p90 in seconds, N and both sha256s as JS
 from each ASGI app call to its pool job's start and from the job's end to its
 engine send, less PER_BYTE_S (default 0) per body byte. Prints the
 median as `idle_s`, p10, p90, PER_BYTE_S, N and the sha256 as JSON.
+`hops` reads three hops off a parity workload run, the server run with
+``ATOM_COMPASS_PARITY_RECORD`` set so its engine writes HANDOFF
+(``dp0.handoff.jsonl``): ``request``, each engine send's return to the engine
+input thread's receipt, from request 1 on, as request 0 (sent alone, or the
+long one) finds the engine idle; ``output``, each engine output's put on the engine's
+output queue to the server's output thread taking it in; ``stream``, each SSE
+head sent to the client reading it (ARRIVALS' ``admitted_ns``). Prints each hop's median, p10,
+p90 and N, and the three inputs' sha256, as JSON.
 
 `fit` reads a burst of N first-turn requests (default 256), which the loop takes
 in one at a time: each gap between template starts is the next request's
@@ -79,22 +91,36 @@ def serve(stamps: str, args: list[str]) -> None:
         async def __call__(self, scope, receive, send):
             if scope["type"] == "http":
                 stamp("app", time.monotonic_ns(), 0)
+                send = heads(send)
             await call(self, scope, receive, send)
 
         module.Starlette.__call__ = __call__
 
-    def stamped(owner: str, name: str, kind: str):
-        def patch(module) -> None:
-            cls = getattr(module, owner)
-            call = getattr(cls, name)
+    def heads(send):
+        async def sent(message):
+            start = time.monotonic_ns()
+            await send(message)
+            if message["type"] == "http.response.start":
+                kind = dict(message.get("headers", [])).get(b"content-type", b"")
+                if kind.startswith(b"text/event-stream"):
+                    stamp("head", start, 0)
 
+        return sent
+
+    def stamped(owner: str, **kinds: str):
+        def timed(call, kind: str):
             def timed(*a, **k):
                 start = time.monotonic_ns()
                 got = call(*a, **k)
                 stamp(kind, start, 0)
                 return got
 
-            setattr(cls, name, timed)
+            return timed
+
+        def patch(module) -> None:
+            cls = getattr(module, owner)
+            for name, kind in kinds.items():
+                setattr(cls, name, timed(getattr(cls, name), kind))
 
         return patch
 
@@ -104,10 +130,13 @@ def serve(stamps: str, args: list[str]) -> None:
         "starlette.applications": apps,
         "atom.entrypoints.openai.chat_encoders": encoders,
         "atom.model_engine.llm_engine": stamped(
-            "InputOutputProcessor", "preprocess_fanout", "prep"
+            "InputOutputProcessor", preprocess_fanout="prep"
         ),
         "atom.model_engine.engine_core_mgr": stamped(
-            "CoreManager", "add_request", "send"
+            "CoreManager",
+            add_request="send",
+            _mark_seq_prefill_complete="out",
+            _deliver_terminal_output="out",
         ),
     }
 
@@ -209,6 +238,55 @@ def idle(stamps: str, per_byte: float = 0.0) -> dict:
     }
 
 
+def _hop(sent, got, name: str, alone: bool = True) -> dict:
+    """Message k's ``got[k] - sent[k]``, in order; with `alone`, no message
+    is sent before the one ahead of it arrives."""
+    sent, got = sorted(sent), sorted(got)
+    after = sent[1:] + [float("inf")] if alone else [float("inf")] * len(sent)
+    if len(got) != len(sent) or not all(
+        s < g < nxt for s, g, nxt in zip(sent, got, after)
+    ):
+        raise SystemExit(
+            f"{name}: {len(got)} arrivals, not one after each of {len(sent)} sends"
+        )
+    p10, median, p90 = np.percentile((np.array(got) - sent) / 1e9, [10, 50, 90])
+    return {"median_s": median, "p10_s": p10, "p90_s": p90, "messages": len(sent)}
+
+
+def hops(stamps: str, handoff: str, arrivals: str) -> dict:
+    data, handoff_data = Path(stamps).read_bytes(), Path(handoff).read_bytes()
+    sent_data = Path(arrivals).read_bytes()
+    rows = [line.split() for line in data.decode().splitlines()]
+    sends = [int(r[0]) for r in rows if r[2] == "send"]
+    outs = [int(r[3]) for r in rows if r[2] == "out"]
+    heads = [int(r[0]) for r in rows if r[2] == "head"]
+    lines = [json.loads(line) for line in handoff_data.decode().splitlines()]
+    recvs = [h["t_recv_ns"] for h in lines if "t_recv_ns" in h]
+    # Outputs put from the first request on, each timed from its put: the
+    # engine's send stamp is its output thread's next get, which can trail the
+    # server's receipt. The server stamps each of a message's rows, and the
+    # message arrived with its first.
+    first = min(sends, default=0)
+    put = sorted((h["t_out_put_ns"], h["rows"]) for h in lines if "rows" in h)
+    put = [(t, n) for t, n in put if t > first]
+    outs = sorted(t for t in outs if t > first)
+    starts = np.cumsum([0] + [n for _, n in put])
+    if starts[-1] != len(outs):
+        raise SystemExit(
+            f"output: {len(outs)} rows taken in, not the {starts[-1]} sent"
+        )
+    got = [outs[i] for i in starts[:-1]]
+    admitted = json.loads(sent_data)["admitted_ns"]
+    return {
+        "request": _hop(sorted(sends)[1:], sorted(recvs)[1:], "request"),
+        "output": _hop([t for t, _ in put], got, "output", alone=False),
+        "stream": _hop(heads, admitted, "stream"),
+        "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
+        "handoff": f"sha256:{hashlib.sha256(handoff_data).hexdigest()}",
+        "arrivals": f"sha256:{hashlib.sha256(sent_data).hexdigest()}",
+    }
+
+
 if __name__ == "__main__":
     verb, stamps, *rest = sys.argv[1:]
     if verb == "serve":
@@ -217,5 +295,7 @@ if __name__ == "__main__":
         print(json.dumps(floor(stamps, *rest)))
     elif verb == "idle":
         print(json.dumps(idle(stamps, *map(float, rest))))
+    elif verb == "hops":
+        print(json.dumps(hops(stamps, *rest)))
     else:
         print(json.dumps(fit(stamps, *map(int, rest))))
