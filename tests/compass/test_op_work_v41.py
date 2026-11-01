@@ -5,13 +5,10 @@ states.
 Each extractor matches a hand count on one shape; the sparse attention and the
 indexer's scorer read their entries at the geometry their leaf states, over
 the queries the leaf holds, and are refused by name where it states none, as
-the mono decode's K2, which runs both, is; the mono decode's kernels run their
-build's rows through each weight and read none of the tables and scratch
-their runner sizes for its widest step, and its mailbox reset zeroes its
-buffers whole; every leaf of the V4.1-Flash TP4 captures, EP off and EP4, and
-gfx950's decodes, mono at EP off, prices; and the op-level backend prices a
-V4.1-Flash decode step and a prefill step on MI455 A0's spec, a decode step
-over a longer context higher.
+the mono K2 is; every leaf of the V4.1-Flash TP4 captures, EP off and EP4,
+and gfx950's EP4 and mono EP-off decodes prices; and the op-level backend
+prices a V4.1-Flash decode step and a prefill step on MI455 A0's spec, a
+decode step over a longer context higher.
 """
 
 import json
