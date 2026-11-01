@@ -809,6 +809,16 @@ stop at rung 48, and a c=256 record for rungs 56 and 64 is
 [#2582](https://github.com/jgong5/ATOM/issues/2582). An unscored record at each concurrency
 came first; a record that still built a Triton variant was taken again.
 
+A simulated run prices by a checked-in law when the law file stands in for both tokens:
+`compass run --step-linear LAW --host-laws LAW $M $S --out D -- $ATOM`, `LAW` a file in
+`scripts/compass/laws/` (or any law file `step_linear_fit` writes), and `$S` the store that
+holds the configuration's `memory_readings`. The run takes the step law at the machine spec
+and engine config the file states, and its `host` at the host key the file states, the
+`atom` digest it was last re-keyed at, so a law re-keyed to this tree runs here though its
+records ran at another; each refuses where a store entry's would. `run.json` states the
+law's digest and no fit provenance: a law file names no traces, so grading checks none of
+them against the cell's.
+
 ## Cost accuracy on a real run's own steps — `validate.cost`
 
 `PYTHONPATH=$T python -m atom.compass.validate.cost RECORD LAW` prices each step of a real

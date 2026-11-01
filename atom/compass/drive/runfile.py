@@ -13,11 +13,16 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   `price_list` key this run's model, parallel layout, machine spec and ATOM
   tree name, when ``--store`` holds one there.
   A KEY is the token `Key.token` prints, resolved under ``--store``.
+  ``--step-linear`` also takes a law file, as `step_linear_fit` writes one
+  and `scripts/compass/laws/` holds them: the law less its host laws, at the
+  machine spec and engine config it states.
   ``backend`` holds the backend's ``digest`` and, for a store entry, its
-  ``provenance``, with its report's as ``inputs``; a stub's, and an op graph's
-  with no price list, is None, its digest over what the run file states.
-- ``--host-laws KEY``, a `host_laws` entry's params, as ``host``; without it
-  the run charges no host time.
+  ``provenance``, with its report's as ``inputs``; a stub's, a law file's,
+  and an op graph's with no price list, is None, its digest over what the run
+  file states.
+- ``--host-laws KEY``, a `host_laws` entry's params, as ``host``; or a law
+  file, its ``host``, at the host key it states, so a law re-keyed to this
+  tree runs here; without it the run charges no host time.
 - ``--step-linear`` and ``--host-laws`` repeat, one entry per engine config:
   the key then holds a list, each process installing its own config's entry,
   and ``backend``'s digest is over every law's in any order, their provenance
@@ -61,6 +66,8 @@ FIXED = {
 }
 #: A prefill-decode run's write-request lookahead, which no measurement backs.
 KV_WRITE_REQ_S = 2.0**-10
+#: A law file's host laws and their fit report, which are not its step law.
+HOST_MEMBERS = ("host", "host_fit")
 
 
 def add_arguments(parser) -> None:
@@ -72,7 +79,10 @@ def add_arguments(parser) -> None:
         backend.add_argument(flag, dest=key, metavar="FILE" if stub else "KEY", **many)
     backend.add_argument("--op-graph", dest=run.OP_GRAPH, action="store_true")
     parser.add_argument(
-        "--host-laws", metavar="KEY", action="append", help="a host_laws token"
+        "--host-laws",
+        metavar="KEY",
+        action="append",
+        help="a host_laws token, or a law file",
     )
     parser.add_argument("--machine", required=True, help="the machine spec")
     parser.add_argument("--store", required=True, help="the artifact store's root")
@@ -112,6 +122,10 @@ def build(args, atom_args) -> dict:
         name = next(k for k in KINDS if getattr(args, k))
         tokens, laws, backends = getattr(args, name), [], []
         for token in [tokens] if isinstance(tokens, str) else tokens:
+            if name == run.STEP_LINEAR and (law := _law_file(token)) is not None:
+                laws.append({k: v for k, v in law.items() if k not in HOST_MEMBERS})
+                backends.append(_stated(laws[-1]))
+                continue
             key = store.key_from_token(KINDS[name], token)
             entry = store.read(key)
             if name == run.STEP_GRID:
@@ -130,15 +144,14 @@ def build(args, atom_args) -> dict:
                 "provenance": {
                     "entries": [b["provenance"] for b in backends],
                     "inputs": [
-                        i for b in backends for i in b["provenance"]["inputs"] or ()
+                        i
+                        for b in backends
+                        for i in (b["provenance"] or {}).get("inputs") or ()
                     ],
                 },
             }
     if args.host_laws:
-        hosts = [
-            _member(store.read(store.key_from_token(Kind.HOST_LAWS, k)), "params")
-            for k in args.host_laws
-        ]
+        hosts = [_host(store, k) for k in args.host_laws]
         out["host"] = hosts if len(hosts) > 1 else hosts[0]
     if args.padding:
         out["padding"] = args.padding
@@ -220,6 +233,27 @@ def _price_list_key(atom_args, machine) -> Key:
 def _member(entry, stem: str):
     """`entry`'s `stem` member, as `fit` publishes one, read as JSON."""
     return json.loads(entry.read_member(stem, RANK, "json"))
+
+
+def _law_file(value: str) -> dict | None:
+    """The law file `value` names, read as JSON; None when it names no file,
+    as a token does not."""
+    path = Path(value)
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
+def _host(store, value: str) -> dict:
+    """The run file's ``host`` entry `--host-laws value` names: a law file's
+    ``host``, else the params of the `host_laws` entry its token names."""
+    if (law := _law_file(value)) is None:
+        key = store.key_from_token(Kind.HOST_LAWS, value)
+        return _member(store.read(key), "params")
+    if "host" not in law:
+        raise ValueError(
+            f"--host-laws {value} states no host laws; a law file fitted on "
+            "records with host labels holds them as host"
+        )
+    return law["host"]
 
 
 def _engine_args(atom_args):
