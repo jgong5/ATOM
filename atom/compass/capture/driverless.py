@@ -7,9 +7,11 @@ capture owns its process.
 """
 
 import contextlib
+import inspect
 import os
 import pathlib
 import types
+from unittest.mock import patch
 
 import torch
 
@@ -282,6 +284,8 @@ def group(tp: int, dp: int) -> dict:
     legacy `c10d` collectives ATOM reaches have no fake kernel, so they go
     through their functional forms, which give the same shapes, and copy the
     result back under `standing_in`, since the legacy ones write in place.
+    aiter's custom all-gather, which reads the declined communicator, is the
+    functional one too.
     """
     import torch.distributed as dist
     from torch.distributed import _functional_collectives as functional
@@ -336,6 +340,12 @@ def group(tp: int, dp: int) -> dict:
         fused_allreduce_rmsnorm_quant_per_group
     )
 
+    def _all_gather_out_place(self, input_, dim=0):
+        with _stand_in():
+            return functional.all_gather_tensor(input_, dim, self.device_group)
+
+    coordinator._all_gather_out_place = _all_gather_out_place
+
     def all_gather_into_tensor(output, input, group=None, async_op=False):
         with _stand_in():
             gathered = functional.all_gather_tensor(input, 0, group or dist.group.WORLD)
@@ -357,9 +367,46 @@ def group(tp: int, dp: int) -> dict:
         "world_size": parallel_state.get_tp_group().world_size,
         "dp": parallel_state.get_dp_group().world_size,
         "declined": ["device_communicator", "message_queue_broadcaster", "barrier"],
-        "functional": ["all_gather_into_tensor", "broadcast", "all_to_all_single"],
+        "functional": [
+            "all_gather_into_tensor",
+            "broadcast",
+            "all_to_all_single",
+            "_all_gather_out_place",
+        ],
         "communicator_checked_only": ["fused_allreduce_rmsnorm_quant_per_group"],
     }
+
+
+def deployed_gather(fits):
+    """`fits(runner)`, a runner's check that its gather takes aiter's custom
+    all-gather, answered as a deployment's TP group answers it: at ATOM's
+    default `ATOM_USE_CUSTOM_ALL_GATHER`, which `install` turns off for the
+    vocab gather, and against the custom all-reduce aiter builds for the group
+    and `group` declines, on at the widths aiter supports on the arch, its
+    peers reachable, at its default size."""
+    from aiter.dist.device_communicators import custom_all_reduce
+    from aiter.dist.parallel_state import get_tp_group
+
+    built = custom_all_reduce.CustomAllreduce
+    widths = built._SUPPORTED_WORLD_SIZES
+    if custom_all_reduce._is_gfx1250:
+        widths = built._SUPPORTED_WORLD_SIZES_GFX1250
+
+    def answered(runner):
+        tp, ca = get_tp_group(), object.__new__(built)
+        ca.world_size, ca.disabled = tp.world_size, tp.world_size not in widths
+        ca.fully_connected = True
+        ca.max_size = inspect.signature(built).parameters["max_size"].default
+        declined = tp.device_communicator
+        tp.device_communicator = types.SimpleNamespace(ca_comm=ca)
+        try:
+            with patch.dict(os.environ):
+                os.environ.pop("ATOM_USE_CUSTOM_ALL_GATHER", None)
+                return fits(runner)
+        finally:
+            tp.device_communicator = declined
+
+    return answered
 
 
 class PeerBuffer(peer_memory.PeerBuffer):

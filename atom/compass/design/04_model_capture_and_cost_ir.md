@@ -427,6 +427,15 @@ configuration of the capture and belongs in the record beside the device reading
 the whole difference between the run that fails at 2,588 and the one that completes at
 2,611.
 
+The mono decode's row gather is not the vocab gather's. DeepSeek-V4.1's mono runner runs a
+step token parallel (`deepseek_v41/mono/runner.py::TOK_PAR_FROM`) only where the step's row
+gather takes aiter's custom all-gather (`V41MonoDecodeRunner._custom_gather_fits`), which
+the flag above would refuse. Capture answers that check as a deployment's TP group does, at
+ATOM's default flag with the custom all-reduce aiter builds for the group
+(`capture.driverless.deployed_gather`), and records the custom all-gather `_gather_rows`
+makes as the functional one, ATOM's work (`capture.driverless.group`,
+[#2562](https://github.com/jgong5/ATOM/issues/2562)). The vocab gather keeps the flag.
+
 The test that enumerated both operator sets by name — so that a future torch growing a
 meta kernel for one of the legacy forms would fail there rather than leave unexplained
 code behind — was withdrawn along with the capture module it exercised. Nothing on this

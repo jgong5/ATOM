@@ -1117,6 +1117,8 @@ def _v41(recorder, hf):
     and the model's config `hf`. Its mono decode's K2 (`V41_LAYER_POST`),
     which runs both, states them all, read off the layer its runner passes,
     and its routed experts' `expert_width`, their unpadded width on this rank.
+    Its mono runner's check that its row gather takes the custom all-gather is
+    answered as a deployment's group answers it (`driverless.deployed_gather`).
     """
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
@@ -1160,6 +1162,8 @@ def _v41(recorder, hf):
         patch.object(PagedAttentionCache, "_report_stale_state", lambda *a: None)
     )
     stack.enter_context(patch.object(V41MonoDecodeRunner, "_layer_post", layer_post))
+    fits = driverless.deployed_gather(V41MonoDecodeRunner._custom_gather_fits)
+    stack.enter_context(patch.object(V41MonoDecodeRunner, "_custom_gather_fits", fits))
     return stack
 
 
