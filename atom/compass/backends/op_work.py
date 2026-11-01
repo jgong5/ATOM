@@ -42,7 +42,9 @@ its runner holds for its widest step, which a step reads a part of: the
 step's rows run through each weight once, each expert they route to is read
 once, and each row reads the entries V4.1's sparse attention reads. The
 step's mailbox reset zeroes its buffers whole every step, so its bytes are
-theirs.
+theirs. A token-parallel build runs its per-token stages on a rank's own
+rows, reduce-scatters its sums to each row's owner and gathers the rows the
+next stage reads on every rank.
 """
 
 from __future__ import annotations
@@ -933,15 +935,34 @@ BY_INDEX += ("ibmax", "plane", "pscale", "iplan", "aux")
 #: width, skipping the loader's zero padding past it; it reads the down
 #: projection's scales, `w2_s`, whole.
 ROUTED = ("w13", "w13_s", "w2")
+#: What a token-parallel K1 or K2 runs at a rank's own rows alone: its
+#: per-token stages' products, and the arguments only those stages and K2's
+#: indexer read or write: the residual stream, its hyper-connection gates,
+#: K1's q latent, the indexer's query and head weights, K2's reduced output.
+OWN_PRODUCTS = ("hc_fn", "wqkv", "iw_w")
+OWN_ROWS = ("res_in", "pend", "res_out", "pre_in", "post_in", "comb_in", "pre_out")
+OWN_ROWS += ("post_out", "comb_out", "qr_out", "qrs_out", "iq", "iw", "out")
 
 
 def _mono_key(op) -> dict:
-    """A mono leaf's build key, by field; refused where the build moves its
-    rows between ranks (token parallel, DP attention), which is not counted."""
+    """A mono leaf's build key, by field; refused under DP attention, whose
+    rows cross ranks as no extractor counts."""
     key = dict(op["args"]["key"]["state"])
-    if key.get("tok_par") or key.get("ep", 1) * key.get("moe_tp", 1) > 1:
-        raise _Unpriced("a token-parallel or DP-attention build is not priced")
+    if key.get("ep", 1) * key.get("moe_tp", 1) > 1:
+        raise _Unpriced("a DP-attention build is not priced")
     return key
+
+
+def _own(key) -> float:
+    """The share of the step's rows a rank's per-token stages run: a
+    token-parallel build's rank its own."""
+    return 1 / key["tp"] if key.get("tok_par") else 1
+
+
+def _share(work: Work, share: float) -> Work:
+    return Work(
+        {f: v * share for f, v in work.flops_by_format.items()}, work.bytes * share
+    )
 
 
 def _through(op, rows, products) -> Work:
@@ -964,15 +985,41 @@ def _read_once(op, *left) -> Work:
     )
 
 
+def _rows_through(op, key, products) -> Work:
+    """The build's `tokens` rows through each of `products`, a rank's own
+    share of them through `OWN_PRODUCTS`'."""
+    own = {s: f for s, f in products.items() if s in OWN_PRODUCTS}
+    rest = {s: f for s, f in products.items() if s not in own}
+    tokens = key["tokens"]
+    return _through(op, tokens, rest) + _through(op, tokens * _own(key), own)
+
+
+def _rows_read(op, key, *left) -> Work:
+    """Each tensor argument but those of the `left` slots read once,
+    `OWN_ROWS`' at a rank's own share of their rows."""
+    rest = _read_once(op, *left, *OWN_ROWS)
+    own = _read_once(op, *left, *(s for s in op["args"] if s not in OWN_ROWS))
+    return rest + _share(own, _own(key))
+
+
 def _attn_pre(op, view, tp, kv) -> Work:
     """V4.1 mono's K1 of one layer, its attention seam to the rotated query:
     the build's `tokens` rows through each matrix product (`K1_PRODUCTS`), and
     each tensor argument read once but `BY_INDEX`'s and, where the build folds
     nothing, the residual it leaves where it is. The window and rotary rows it
-    reaches by position are left out, which only lowers M."""
-    key = _mono_key(op)
+    reaches by position are left out, which only lowers M. A token-parallel
+    build's rank runs its own rows (`OWN_ROWS`, `OWN_PRODUCTS`) and gathers
+    every rank's q latent and window rows and, where it feeds the indexer,
+    normed rows and head weights, to every rank."""
+    key, args = _mono_key(op), op["args"]
     kept = () if key["fold"] else ("res_out",)
-    return _through(op, key["tokens"], K1_PRODUCTS) + _read_once(op, *BY_INDEX, *kept)
+    work = _rows_through(op, key, K1_PRODUCTS) + _rows_read(op, key, *BY_INDEX, *kept)
+    if key.get("tok_par"):
+        ring, pushed = args["ring"], ["qr_out", "qrs_out"]
+        pushed += ["normed", "iw_out"] if key["feeds_index"] else []
+        rows = key["tokens"] * ring["shape"][-1] * _size(ring["dtype"])
+        work += allgather(key["tp"], rows + sum(_bytes(args[s]) for s in pushed))
+    return work
 
 
 def _layer_post(op, view, tp, kv) -> Work:
@@ -986,7 +1033,11 @@ def _layer_post(op, view, tp, kv) -> Work:
     deals them, each through one expert's MXFP4 weights at MXFP8 over the
     width the leaf states (`expert_width`), each expert they reach read once
     (`ROUTED`). The attention's and the MoE's all-reduces over the build's
-    `tp` ranks, and every other tensor argument read once but `BY_INDEX`'s."""
+    `tp` ranks, and every other tensor argument read once but `BY_INDEX`'s.
+    A token-parallel build's rank runs its own rows (`OWN_ROWS`,
+    `OWN_PRODUCTS`) and its share of the indexer's, reduce-scatters both sums
+    to each row's owner, and gathers the normed rows and a selecting layer's
+    selections to every rank."""
     key, args, rows, q = _mono_key(op), op["args"], view.requests, op["args"]["q"]
     geometry = ("window_size", "compress_ratio", "index_topk", "index_candidates")
     window, ratio, top, cap, width = _stated(op, *geometry, "expert_width")
@@ -996,7 +1047,7 @@ def _layer_post(op, view, tp, kv) -> Work:
         fmt, iq = "fp4" if key["index_fp4"] else "fp8", args["iq"]
         *_, ih, packed = iq["shape"]
         scored = int(packed * _size(iq["dtype"]) / ELEMENT_BYTES[fmt])
-        work += _index_scores(rows, ratio, ih, scored, fmt, cap)
+        work += _share(_index_scores(rows, ratio, ih, scored, fmt, cap), _own(key))
     tokens, experts, out, w2 = key["tokens"], key["experts"], args["out"], args["w2"]
     routes, reached = _routing(view, tokens, key["topk"], experts, 1)
     # w2 holds each expert's hidden rows over the loader's padded width
@@ -1005,12 +1056,19 @@ def _layer_post(op, view, tp, kv) -> Work:
     routed = _through(op, routes / experts * real, dict.fromkeys(("w13", "w2"), "fp8"))
     held = real * sum(_bytes(t) for s in ROUTED for t in _tensors(args[s]))
     held += _bytes(args["w2_s"])
-    reduced = allreduce(key["tp"], tokens * out["shape"][-1] * _size(out["dtype"]))
-    work += _through(op, tokens, K2_PRODUCTS) + routed + reduced + reduced
+    ranks, summed = key["tp"], tokens * out["shape"][-1] * _size(out["dtype"])
+    if key.get("tok_par"):
+        chosen = [s for s, on in (("irow", "iact"), ("icout", "iprod")) if args[on]]
+        gathered = _bytes(args["normed"]) + sum(_bytes(args[s]) for s in chosen)
+        scattered = reduce_scatter(ranks, summed)
+        sums = scattered + scattered + allgather(ranks, gathered)
+    else:
+        sums = allreduce(ranks, summed) + allreduce(ranks, summed)
+    work += _rows_through(op, key, K2_PRODUCTS) + routed + sums
     return (
         work
         + Work({}, held * reached / experts)
-        + _read_once(op, *BY_INDEX, *ROUTED, "w2_s")
+        + _rows_read(op, key, *BY_INDEX, *ROUTED, "w2_s")
     )
 
 

@@ -42,6 +42,18 @@
    "mechanism_why": "arithmetic inside the cost backend, which cannot park"
   },
   {
+   "id": "atom/compass/backends/op_work.py::_layer_post::reduce_scatter(ranks, summed)::collective#0",
+   "file": "atom/compass/backends/op_work.py",
+   "symbol": "_layer_post",
+   "call": "reduce_scatter",
+   "expr": "reduce_scatter(ranks, summed)",
+   "shape": "collective",
+   "peer": "none",
+   "why": "a work primitive that counts the bytes a token-parallel mono K2's reduce-scatters send, so the op-level backend can price them; nothing is sent",
+   "mechanism": "K9",
+   "mechanism_why": "arithmetic inside the cost backend, which cannot park"
+  },
+  {
    "id": "atom/compass/backends/step_roofline.py::_moe::reduce_scatter(dp, rows * hidden * act)::collective#0",
    "file": "atom/compass/backends/step_roofline.py",
    "symbol": "_moe",
