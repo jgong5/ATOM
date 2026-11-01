@@ -27,10 +27,12 @@ Their LDS is one union: a CTA runs K2a's stages, then K2b's, with a barrier
 between every two.
 """
 
+import functools
 from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
@@ -399,3 +401,27 @@ def build_layer_post(key: LayerPostBuild):
 
     ABI.check(layer_post, launch)
     return launch
+
+
+@functools.cache
+def built_layer_post(key: LayerPostBuild):
+    """``build_layer_post(key)``, once a process: what ``launch_layer_post``
+    launches, the build a runner compiles."""
+    return build_layer_post(key)
+
+
+def launch_layer_post(
+    key, iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len, ibatch,
+    ishift, ibound, ilog, lstride, isel, icand, ilift, iprod, ibmax, bstride, icout,
+    irow, sbound, q, pool, sel, topk, kmeta, table, rows_per_page, page_rows,
+    main_off, ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
+    wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
+    res_out, post_out, comb_out, pre_out, normed, gate_w, bias, w13, w13_s, w2,
+    w2_s, sgu, sgu_s, sw2, sw2_s, out, scratch, sym, peers, rank, layer, moe_layer,
+    tl,
+) -> None:  # fmt: skip
+    """K2 of build ``key``, its arguments by ABI name: a tensor passed as its
+    address, an integer as itself, on the caller's stream."""
+    args = dict(locals())
+    del args["key"]
+    built_layer_post(key)(*ABI.pack(args), stream=torch.cuda.current_stream())

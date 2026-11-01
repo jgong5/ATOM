@@ -198,19 +198,33 @@ def step_begin(scratch, peers, state: torch.Tensor, debug: bool) -> None:
     """Zero ``scratch`` (at most MAX_SCRATCH tensors) and the data region of
     ``peers`` (a ``PeerBuffer``), then the fence: one launch on the current
     stream (a graph records it). ``state``: STATE_WORDS int64, zero at first."""
+    _launch_step_begin(
+        StepBeginBuild(peers.addresses.numel(), debug),
+        tuple(scratch),
+        peers.addresses,
+        # the peer data's size is its fence slots' offset
+        peers.bytes.nbytes,
+        peers.rank,
+        state,
+    )
+
+
+def _launch_step_begin(key, scratch, peers, fence_off, rank, state) -> None:
+    """``step_begin``'s launch, of the peer buffer's fields it reads (every
+    rank's buffer address, its data region's size, this rank): no
+    ``PeerBuffer``."""
     assert len(scratch) <= MAX_SCRATCH
-    # the peer data's size is its fence slots' offset
-    sizes = [peers.bytes.nbytes] + [b.nbytes for b in scratch]
+    sizes = [fence_off] + [b.nbytes for b in scratch]
     assert all(n % ZERO_ALIGN == 0 for n in sizes), sizes
     args = []
     for b in scratch:
         args += [b.data_ptr(), b.nbytes]
     args += [0, 0] * (MAX_SCRATCH - len(scratch))
-    _build(StepBeginBuild(peers.addresses.numel(), debug))(
+    _build(key)(
         *args,
-        peers.addresses.data_ptr(),
-        peers.bytes.nbytes,
-        peers.rank,
+        peers.data_ptr(),
+        fence_off,
+        rank,
         state.data_ptr(),
         stream=torch.cuda.current_stream(),
     )

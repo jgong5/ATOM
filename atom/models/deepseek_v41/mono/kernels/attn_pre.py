@@ -33,11 +33,13 @@ projection and the sums of squares, split-K reductions, differ only in their
 split and order.
 """
 
+import functools
 import math
 from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
@@ -1446,3 +1448,25 @@ def build_attn_pre(key: AttnPreBuild):
 
     ABI.check(attn_pre, launch)
     return launch
+
+
+@functools.cache
+def built_attn_pre(key: AttnPreBuild):
+    """``build_attn_pre(key)``, once a process: what ``launch_attn_pre``
+    launches, the build a runner compiles."""
+    return build_attn_pre(key)
+
+
+def launch_attn_pre(
+    key, res_in, pend, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, attn_w,
+    wqkv, wqkv_s, qn_w, kvn_w, wqb, wqb_s, cos, sin, pos, ring, ring_rows, ring_off,
+    res_out, post_out, comb_out, pre_out, q_out, normed, qr_out, qrs_out, aux, iq_w,
+    iq_ws, iw_w, iq_out, iqs_out, iw_out, scratch, sym, peers, rank, layer, tl,
+) -> None:  # fmt: skip
+    """K1 of build ``key``, its arguments by ABI name: a tensor passed as its
+    address, an integer as itself (0 for one the build does not read)."""
+    args = dict(locals())
+    del args["key"]
+    # the caller's stream: a FlyDSL launcher left to its default submits on the
+    # NULL stream, outside a graph capture
+    built_attn_pre(key)(*ABI.pack(args), stream=torch.cuda.current_stream())

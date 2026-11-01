@@ -104,13 +104,14 @@ def _rows(x, dim, s):
 @dataclass(frozen=True)
 class RowsBuild:
     """The kernels of an S-row step: K1's build a layer and their launchers,
-    and K2 (or, with ``check``, K2a and K2b apart)."""
+    and K2's build and launcher (or, with ``check``, K2a and K2b apart)."""
 
     keys: list
     launchers: dict
     layer_post: object = None
     attn_post: object = None
     moe: object = None
+    post_key: object = None
 
 
 # the layers whose attention norm has other readers (the compressor, the indexer)
@@ -377,7 +378,7 @@ class V41MonoDecodeRunner:
     def _rows_build(self, s: int) -> RowsBuild:
         """The s-row step's kernels."""
         keys = self._layer_keys(s)
-        launchers = {key: k1.build_attn_pre(key) for key in set(keys)}
+        launchers = {key: k1.built_attn_pre(key) for key in set(keys)}
         post_key = self._post_key(s)
         if self.split_k2:
             key_a, key_b = post_key.halves()
@@ -387,7 +388,9 @@ class V41MonoDecodeRunner:
                 attn_post=k2a.build_attn_post(key_a),
                 moe=k2b.build_moe(key_b),
             )
-        return RowsBuild(keys, launchers, layer_post=k2.build_layer_post(post_key))
+        return RowsBuild(
+            keys, launchers, layer_post=k2.built_layer_post(post_key), post_key=post_key
+        )
 
     @staticmethod
     def _row_kernels(build: RowsBuild) -> list:
@@ -613,35 +616,31 @@ class V41MonoDecodeRunner:
         res_out = self.res_attn if key.fold else state.residual
         pre, post, comb = self.gates_attn
         aux = self.aux.buffers[self.aux.layer_ids.index(layer_id)] if key.aux else None
-        p = torch.Tensor.data_ptr
         fold = key.fold
-        args = k1.ABI.pack({
-            "res_in": p(state.residual), "pend": p(state.pending) if fold else 0,
-            "post_in": p(state.post_mix) if fold else 0,
-            "comb_in": p(state.combination) if fold else 0, "pre_in": p(state.pre_mix),
-            "hc_fn": p(weights["hc_attn_fn"]), "hc_scale": p(weights["hc_attn_scale"]),
-            "hc_base": p(weights["hc_attn_base"]),
-            "attn_w": p(weights["attn_norm.weight"]),
-            "wqkv": p(weights["attn.wqkv_a.weight"]),
-            "wqkv_s": p(weights["attn.wqkv_a.weight_scale"]),
-            "qn_w": p(weights["attn.q_norm.weight"]),
-            "kvn_w": p(weights["attn.kv_norm.weight"]),
-            "wqb": p(weights["attn.wq_b.weight"]),
-            "wqb_s": p(weights["attn.wq_b.weight_scale"]),
-            "cos": p(rope.cos_cache), "sin": p(rope.sin_cache),
-            "pos": p(self._rope_positions(cache, step)), "ring": p(cache.pool),
-            "ring_rows": p(self.ring_rel),
+        k1.launch_attn_pre(key, **{
+            "res_in": state.residual, "pend": state.pending if fold else 0,
+            "post_in": state.post_mix if fold else 0,
+            "comb_in": state.combination if fold else 0, "pre_in": state.pre_mix,
+            "hc_fn": weights["hc_attn_fn"], "hc_scale": weights["hc_attn_scale"],
+            "hc_base": weights["hc_attn_base"],
+            "attn_w": weights["attn_norm.weight"],
+            "wqkv": weights["attn.wqkv_a.weight"],
+            "wqkv_s": weights["attn.wqkv_a.weight_scale"],
+            "qn_w": weights["attn.q_norm.weight"],
+            "kvn_w": weights["attn.kv_norm.weight"],
+            "wqb": weights["attn.wq_b.weight"],
+            "wqb_s": weights["attn.wq_b.weight_scale"],
+            "cos": rope.cos_cache, "sin": rope.sin_cache,
+            "pos": self._rope_positions(cache, step), "ring": cache.pool,
+            "ring_rows": self.ring_rel,
             "ring_off": cache.geometry.window(layer_id, cache.num_pages).ring_start,
-            "res_out": p(res_out), "post_out": p(post), "comb_out": p(comb),
-            "pre_out": p(pre), "q_out": p(self.q), "normed": p(self.normed),
-            "qr_out": p(self.qr), "qrs_out": p(self.qr_scale),
-            "aux": 0 if aux is None else p(aux), **self._index_projection_args(key, weights),
-            "scratch": p(self.scratch), **self.peers.kernel_args(), "layer": layer_id,
+            "res_out": res_out, "post_out": post, "comb_out": comb,
+            "pre_out": pre, "q_out": self.q, "normed": self.normed,
+            "qr_out": self.qr, "qrs_out": self.qr_scale,
+            "aux": 0 if aux is None else aux, **self._index_projection_args(key, weights),
+            **self._peer_args(), "layer": layer_id,
             "tl": self._timeline_ptr("k1", layer_id),
         })  # fmt: skip
-        # the caller's stream: a FlyDSL launcher left to its default submits on the
-        # NULL stream, outside a graph capture
-        self.build.launchers[key](*args, stream=torch.cuda.current_stream())
         return res_out, (pre, post, comb)
 
     def _index_projection_args(self, key, weights) -> dict:
@@ -649,26 +648,24 @@ class V41MonoDecodeRunner:
         names = ("iq_w", "iq_ws", "iw_w", "iq_out", "iqs_out", "iw_out")
         if not key.feeds_index:
             return dict.fromkeys(names, 0)
-        p = torch.Tensor.data_ptr
         return {
-            "iq_w": p(weights["attn.indexer.wq_b.weight"]),
-            "iq_ws": p(weights["attn.indexer.wq_b.weight_scale"]),
-            "iw_w": p(weights["attn.indexer.weights_proj.weight"]),
-            "iq_out": p(self.iq), "iqs_out": p(self.iq_scale),
-            "iw_out": p(self.iw),
+            "iq_w": weights["attn.indexer.wq_b.weight"],
+            "iq_ws": weights["attn.indexer.wq_b.weight_scale"],
+            "iw_w": weights["attn.indexer.weights_proj.weight"],
+            "iq_out": self.iq, "iqs_out": self.iq_scale,
+            "iw_out": self.iw,
         }  # fmt: skip
 
     def _layer_post(self, spec, block, weights, residual, gates, step, cache, rope):
         """K2: K2a's work, then K2b's, in one launch."""
         layer_id = spec.layer_id
-        args = k2.ABI.pack({
+        k2.launch_layer_post(self.build.post_key, **{
             **self._attn_post_args(spec, block, weights, residual, gates, step, cache, rope),
             **self._moe_args(weights),
             **self._peer_args(),
             "layer": POST_TAG0 + layer_id, "moe_layer": MOE_TAG0 + layer_id,
             "tl": self._timeline_ptr("k2", layer_id),
         })  # fmt: skip
-        self.build.layer_post(*args, stream=torch.cuda.current_stream())
 
     def _attn_post(self, spec, block, weights, residual, gates, step, cache, rope):
         """K2a: the decode sparse attention over this layer's keys (its class's
@@ -686,13 +683,11 @@ class V41MonoDecodeRunner:
         self.build.attn_post(*args, stream=torch.cuda.current_stream())
 
     def _peer_args(self) -> dict:
-        p = torch.Tensor.data_ptr
-        return {"scratch": p(self.scratch), **self.peers.kernel_args()}
+        return {"scratch": self.scratch, **self.peers.kernel_args()}
 
     def _attn_post_args(self, spec, block, weights, residual, gates, step, cache, rope):
         """K2a's own arguments."""
         layer_id = spec.layer_id
-        p = torch.Tensor.data_ptr
         pre, post, comb = gates
         pre_out, post_out, comb_out = self.gates_ffn
         attn = block.attn
@@ -702,33 +697,33 @@ class V41MonoDecodeRunner:
         owner = spec.topk_owner if spec.ratio else None
         return {
             **index,
-            "q": p(self.q), "pool": p(cache.pool),
+            "q": self.q, "pool": cache.pool,
             # a layer without a selection reads a dummy row it never uses
-            "sel": p(meta if owner is None else self.irow[owner]),
+            "sel": meta if owner is None else self.irow[owner],
             "topk": 1 if owner is None else ip.TOPK,
-            "sbound": p(self.no_bound if owner is None else self.bounds[owner]),
+            "sbound": self.no_bound if owner is None else self.bounds[owner],
             # a window layer's keys are all ring rows: it reads no block table
-            "kmeta": p(meta),
-            "table": p(step.block_tables) if spec.ratio else p(meta),
+            "kmeta": meta,
+            "table": step.block_tables if spec.ratio else meta,
             "rows_per_page": geometry.rows_per_page(spec.ratio or 1),
             "page_rows": geometry.page_bytes // geometry.row_bytes,
             "main_off": geometry.main_offset(spec.kv_owner) if spec.ratio else 0,
             "ring_off": geometry.window(layer_id, cache.num_pages).ring_start,
             "ring_slots": geometry.window(layer_id, cache.num_pages).ring_slots,
-            "sink": p(attn.attn_sink),
+            "sink": attn.attn_sink,
             "qk_scale": f32_bits(attn.softmax_scale * LOG2E),
-            "pos": p(self._rope_positions(cache, step)),
-            "cos": p(rope.cos_cache), "sin": p(rope.sin_cache),
-            "woa": p(weights["attn.wo_a.weight"]),
-            "woa_s": p(weights["attn.wo_a.weight_scale"]),
-            "wob": p(weights["attn.wo_b.weight"]),
-            "wob_s": p(weights["attn.wo_b.weight_scale"]),
-            "res_in": p(residual), "post_in": p(post), "comb_in": p(comb),
-            "pre_in": p(pre), "hc_fn": p(weights["hc_ffn_fn"]),
-            "hc_scale": p(weights["hc_ffn_scale"]), "hc_base": p(weights["hc_ffn_base"]),
-            "ffn_w": p(weights["ffn_norm.weight"]), "res_out": p(self.res_ffn),
-            "post_out": p(post_out), "comb_out": p(comb_out), "pre_out": p(pre_out),
-            "normed": p(self.ffn_normed),
+            "pos": self._rope_positions(cache, step),
+            "cos": rope.cos_cache, "sin": rope.sin_cache,
+            "woa": weights["attn.wo_a.weight"],
+            "woa_s": weights["attn.wo_a.weight_scale"],
+            "wob": weights["attn.wo_b.weight"],
+            "wob_s": weights["attn.wo_b.weight_scale"],
+            "res_in": residual, "post_in": post, "comb_in": comb,
+            "pre_in": pre, "hc_fn": weights["hc_ffn_fn"],
+            "hc_scale": weights["hc_ffn_scale"], "hc_base": weights["hc_ffn_base"],
+            "ffn_w": weights["ffn_norm.weight"], "res_out": self.res_ffn,
+            "post_out": post_out, "comb_out": comb_out, "pre_out": pre_out,
+            "normed": self.ffn_normed,
         }  # fmt: skip
 
     def _moe(self, layer_id, weights) -> None:
@@ -746,19 +741,18 @@ class V41MonoDecodeRunner:
 
     def _moe_args(self, weights) -> dict:
         """K2b's own arguments but its input."""
-        p = torch.Tensor.data_ptr
         return {
-            "gate_w": p(weights["ffn.gate.weight"]),
-            "bias": p(weights["ffn.gate.e_score_correction_bias"]),
-            "w13": p(weights["ffn.experts.w13_weight"]),
-            "w13_s": p(weights["ffn.experts.w13_weight_scale"]),
-            "w2": p(weights["ffn.experts.w2_weight"]),
-            "w2_s": p(weights["ffn.experts.w2_weight_scale"]),
-            "sgu": p(weights["ffn.shared_experts.gate_up_proj.weight"]),
-            "sgu_s": p(weights["ffn.shared_experts.gate_up_proj.weight_scale"]),
-            "sw2": p(weights["ffn.shared_experts.w2.weight"]),
-            "sw2_s": p(weights["ffn.shared_experts.w2.weight_scale"]),
-            "out": p(self.ffn_out),
+            "gate_w": weights["ffn.gate.weight"],
+            "bias": weights["ffn.gate.e_score_correction_bias"],
+            "w13": weights["ffn.experts.w13_weight"],
+            "w13_s": weights["ffn.experts.w13_weight_scale"],
+            "w2": weights["ffn.experts.w2_weight"],
+            "w2_s": weights["ffn.experts.w2_weight_scale"],
+            "sgu": weights["ffn.shared_experts.gate_up_proj.weight"],
+            "sgu_s": weights["ffn.shared_experts.gate_up_proj.weight_scale"],
+            "sw2": weights["ffn.shared_experts.w2.weight"],
+            "sw2_s": weights["ffn.shared_experts.w2.weight_scale"],
+            "out": self.ffn_out,
         }  # fmt: skip
 
     def _raise_on_given_up_waits(self, rows: int) -> None:
@@ -786,15 +780,14 @@ class V41MonoDecodeRunner:
         """K2a's indexer arguments: a selecting layer's scorer inputs, its bound
         (the one ``index_plan`` derives every cell from, recorded for the layers
         that reuse its selection) and outputs; dummies elsewhere."""
-        p = torch.Tensor.data_ptr
-        dummy = p(self.no_bound)
+        dummy = self.no_bound
         args = {
             "iact": 0, "iq": dummy, "iw": dummy, "plane": dummy, "iqs": dummy,
             "pscale": dummy, "iplan": dummy, "itab": dummy,
             "itab_stride": 0, "itab_len": 1, "ibatch": dummy, "ishift": 0,
-            "ibound": dummy, "ilog": p(self.ilog),
+            "ibound": dummy, "ilog": self.ilog,
             "lstride": self.ilog.shape[1], "isel": dummy, "icand": dummy, "ilift": 0,
-            "iprod": 0, "ibmax": p(self.ibmax), "bstride": self.ibmax.shape[1],
+            "iprod": 0, "ibmax": self.ibmax, "bstride": self.ibmax.shape[1],
             "icout": dummy, "irow": dummy,
         }  # fmt: skip
         if attn.indexer is None:
@@ -817,17 +810,17 @@ class V41MonoDecodeRunner:
         units = cache.index_units[spec.kv_owner]
         if self.index_fp4:
             args.update({
-                "iqs": p(self.iq_scale), "pscale": p(units.scales),
-                "iplan": dummy if reindex else p(self.walk_plans[spec.ratio]),
+                "iqs": self.iq_scale, "pscale": units.scales,
+                "iplan": dummy if reindex else self.walk_plans[spec.ratio],
             })  # fmt: skip
         args.update({
-            "iact": 1, "iq": p(self.iq), "iw": p(self.iw),
-            "plane": p(units.values), "itab": p(table),
+            "iact": 1, "iq": self.iq, "iw": self.iw,
+            "plane": units.values, "itab": table,
             "itab_stride": table.stride(0), "itab_len": table.shape[1],
-            "ibatch": p(batch_ids), "ishift": shift,
-            "ibound": p(bound), "isel": p(self.isel[spec.layer_id]),
-            "icand": p(self.icand), "ilift": int(reindex),
-            "iprod": int(spec.produces_candidates), "icout": p(self.icand),
-            "irow": p(self.irow[spec.layer_id]),
+            "ibatch": batch_ids, "ishift": shift,
+            "ibound": bound, "isel": self.isel[spec.layer_id],
+            "icand": self.icand, "ilift": int(reindex),
+            "iprod": int(spec.produces_candidates), "icout": self.icand,
+            "irow": self.irow[spec.layer_id],
         })  # fmt: skip
         return args
