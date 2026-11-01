@@ -17,6 +17,7 @@
 #                    0.01); no request waits for the one before it to be
 #                    admitted, so prefills overlap and the router chooses a
 #                    prefill rank
+#   LONG             tokens request 0 asks for (default: as the rest)
 #   PREFILL_DP DECODE_DP
 #                    each side's DP width (default 2); width 1 serves at -tp 1
 #   PREFILL_GPUS DECODE_GPUS
@@ -95,9 +96,9 @@ setsid "$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" \
 pids+=($!)
 compass_wait_up router "${pids[-1]}" "http://127.0.0.1:$ROUTER_PORT/v1/models"
 python3 -c 'import sys; from pathlib import Path; from atom.compass.parity.traffic import bodies, real
-port, model, record, n, gap_s = sys.argv[1:]
-real(int(port), bodies(model, int(n)), float(gap_s), Path(record), wait=False)' \
-    "$ROUTER_PORT" "$MODEL" "$OUT/real/record" "${REQUESTS:-16}" "${GAP_S:-0.01}" \
+port, model, record, n, gap_s, long = sys.argv[1:]
+real(int(port), bodies(model, int(n), long=int(long)), float(gap_s), Path(record), wait=False, long=int(long))' \
+    "$ROUTER_PORT" "$MODEL" "$OUT/real/record" "${REQUESTS:-16}" "${GAP_S:-0.01}" "${LONG:-0}" \
     >"$OUT/real/traffic.log" 2>&1
 # The records' last lines are written as the workers exit.
 for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done

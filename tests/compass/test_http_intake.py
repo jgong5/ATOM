@@ -509,10 +509,10 @@ if __name__ == "__main__":
 
 def test_pd_pairs_each_kv_write_request_with_its_receipt_in_order(tmp_path):
     sent = [10**12 + k * 10**7 for k in range(10)]
-    # Sent back to back, each received 100 us + 10 us k later, so receipts
-    # overlap later sends.
+    # Each received 100 us + 10 us k after its send call started, most before
+    # that call returned.
     got = [s + 100_000 + 10_000 * k for k, s in enumerate(sent)]
-    rows = [f"{s} 1 kvsend {s - 50} 0" for s in sent]
+    rows = [f"{s + 150_000} 1 kvsend {s} 0" for s in sent]
     rows += [f"{g} 2 kvrecv {g} 0" for g in got] + [f"{sent[0]} 3 send 0 0"]
     stamps = tmp_path / "stamps"
     stamps.write_text("\n".join(rows[::-1]) + "\n")

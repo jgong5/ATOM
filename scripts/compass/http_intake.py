@@ -39,8 +39,8 @@ output queue to the server's output thread taking it in; ``stream``, each SSE
 head sent to the client reading it (ARRIVALS' ``admitted_ns``). Prints each hop's median, p10,
 p90 and N, and the three inputs' sha256, as JSON.
 `pd` reads a prefill and a decode server's shared STAMPS (`parity_pd.sh` with
-HTTP_INTAKE): ``kv_write_req``, each write request's send's return on decode to
-prefill's receipt, its median, p10, p90 and N, and the sha256, as JSON.
+HTTP_INTAKE): ``kv_write_req``, each write request's send call on decode to prefill's
+receipt, its median, p10, p90 and N, and the sha256, as JSON.
 
 `fit` reads a burst of N first-turn requests (default 256), which the loop takes
 in one at a time: each gap between template starts is the next request's
@@ -351,8 +351,9 @@ def pd(stamps: str) -> dict:
     data = Path(stamps).read_bytes()
     rows = [line.split() for line in data.decode().splitlines()]
     # One decode rank writes to one prefill rank on one connection, which
-    # delivers in order.
-    sent = [int(r[0]) for r in rows if r[2] == "kvsend"]
+    # delivers in order. Timed from the send call's start: its thread can
+    # take the GIL back after prefill took the request in.
+    sent = [int(r[3]) for r in rows if r[2] == "kvsend"]
     got = [int(r[0]) for r in rows if r[2] == "kvrecv"]
     return {
         "kv_write_req": _hop(sent, got, "kv_write_req", alone=False),
