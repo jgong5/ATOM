@@ -132,6 +132,9 @@ V41_SCORERS = (
     ),
     "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
 )
+#: DeepSeek-V4.1's mono decode K2 of a layer, which runs its indexer's scorer
+#: and its sparse attention in one launch.
+V41_LAYER_POST = "atom.models.deepseek_v41.mono.kernels.layer_post:launch_layer_post"
 #: Where a drafter's step ends its target's work: ATOM records `forward_done_event`.
 CUT = "forward_done_event"
 
@@ -1111,27 +1114,42 @@ def _v41(recorder, hf):
     its indexer's scorers (`V41_SCORERS`) the `compress_ratio` and
     `index_candidates`, the most entries it scores where an earlier layer
     chose its candidates, else None: read off the layer `layer_name` names
-    and the model's config `hf`.
+    and the model's config `hf`. Its mono decode's K2 (`V41_LAYER_POST`),
+    which runs both, states them all, read off the layer its runner passes,
+    and its routed experts' `expert_width`, their unpadded width on this rank.
     """
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
 
     bodies = {name: _implementation(name) for name in V41_OPENED}
-    attend = bodies["v41_attention"]
+    attend, post = bodies["v41_attention"], V41MonoDecodeRunner._layer_post
 
-    def attention(hidden, layer_name, *args, **kwargs):
-        attn = recorder.contexts[layer_name][0].attn
+    def geometry(attn):
         ratio, ix = attn.spec.ratio, attn.indexer
         top = hf.index_topk if ratio else None
         chosen = ix is not None and attn.spec.candidate_source is not None
         candidates = ix.topk_blocks * ix.block_size if chosen else None
-        geometry = ("window_size", hf.sliding_window), ("compress_ratio", ratio)
-        scored = ("compress_ratio", ratio), ("index_candidates", candidates)
+        return (
+            ("window_size", hf.sliding_window),
+            ("compress_ratio", ratio),
+            ("index_topk", top),
+            ("index_candidates", candidates),
+        )
+
+    def attention(hidden, layer_name, *args, **kwargs):
+        window, ratio, top, scored = geometry(recorder.contexts[layer_name][0].attn)
         stated = {
-            V41_ATTENTION: (*geometry, ("index_topk", top)),
-            **dict.fromkeys(V41_SCORERS, scored),
+            V41_ATTENTION: (window, ratio, top),
+            **dict.fromkeys(V41_SCORERS, (ratio, scored)),
         }
         with patch.object(recorder, "stated", stated):
             return attend(hidden, layer_name, *args, **kwargs)
+
+    def layer_post(runner, spec, block, *args):
+        width = ("expert_width", runner.moe_dims.inter_real)
+        stated = {V41_LAYER_POST: (*geometry(block.attn), width)}
+        with patch.object(recorder, "stated", stated):
+            return post(runner, spec, block, *args)
 
     bodies["v41_attention"] = attention
     recorder.lands = True
@@ -1141,6 +1159,7 @@ def _v41(recorder, hf):
     stack.enter_context(
         patch.object(PagedAttentionCache, "_report_stale_state", lambda *a: None)
     )
+    stack.enter_context(patch.object(V41MonoDecodeRunner, "_layer_post", layer_post))
     return stack
 
 

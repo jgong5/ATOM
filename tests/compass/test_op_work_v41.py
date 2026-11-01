@@ -4,25 +4,26 @@ states.
 
 Each extractor matches a hand count on one shape; the sparse attention and the
 indexer's scorer read their entries at the geometry their leaf states, over
-the queries the leaf holds, and are refused by name where it states none;
-every leaf of the V4.1-Flash TP4 captures, EP off and EP4, and gfx950's EP4
-decode prices; and the op-level backend prices a V4.1-Flash decode step and a
-prefill step on MI455 A0's spec, a decode step over a longer context higher.
+the queries the leaf holds, and are refused by name where it states none, as
+the mono K2 is; every leaf of the V4.1-Flash TP4 captures, EP off and EP4,
+and gfx950's EP4 and mono EP-off decodes prices; and the op-level backend
+prices a V4.1-Flash decode step and a prefill step on MI455 A0's spec, a
+decode step over a longer context higher.
 """
 
 import json
 
 import pytest
-from test_capture_v41_flash import ARGS, COMPILED, EP4, SHAPES, TP, TREE, capture
+from test_capture_v41_flash import ARGS, COMPILED, EP4, MONO, SHAPES, TP, TREE, capture
 from test_op_work import BF16, F32, I32, leaf, rows, t
 
 from atom.compass.backends import BatchView, RequestShape
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.resolver import CostRefused
-from atom.compass.backends.work import Work, gemm, price
+from atom.compass.backends.work import Work, allgather, allreduce, gemm, price
 from atom.compass.bench.ops import leaves
-from atom.compass.capture.forward import V41_ATTENTION, V41_SCORERS
+from atom.compass.capture.forward import V41_ATTENTION, V41_LAYER_POST, V41_SCORERS
 from atom.compass.spec import MachineSpec
 
 FP8, E8M0, I64 = "torch.float8_e4m3fn", "torch.float8_e8m0fnu", "torch.int64"
@@ -31,6 +32,77 @@ MI455 = MachineSpec.from_mapping(
 )
 #: Window 4, every 2 tokens compressed, the top 3 read.
 GEOMETRY = {"window_size": 4, "compress_ratio": 2, "index_topk": 3}
+FP4, U8 = "torch.float4_e2m1fn_x2", "torch.uint8"
+V41_MONO = "atom.models.deepseek_v41.mono."
+K1 = V41_MONO + "kernels.attn_pre:launch_attn_pre"
+STEP_BEGIN = "atom.mono.runtime.step_begin:_launch_step_begin"
+#: The mono decode's kernels, every one in a decode it serves.
+MONOS = {K1, V41_LAYER_POST, STEP_BEGIN, V41_MONO + "step_meta:_launch_step_meta"}
+
+
+def build(name, **fields):
+    """A mono kernel's build key, as a leaf holds it."""
+    return {"object": f"{name}Build", "state": [[k, v] for k, v in fields.items()]}
+
+
+def weight(shape, dtype=FP8):
+    return t(shape, dtype, role="weight")
+
+
+#: What a mono kernel reaches by index or zeroes apart, each far wider than
+#: a step of 2 rows reads.
+TABLES = {
+    "scratch": t([1 << 20], U8),
+    "cos": weight([4096, 4], BF16),
+    "ilog": t([2, 1 << 16], F32),
+}
+
+
+def attn_pre(fold, tok_par=False):
+    """K1 of 2 rows over 2 hc copies of width 8: 12 mixes, a 16-row QKV
+    and a 32-row Q product; no indexer feed."""
+    return leaf(
+        K1,
+        key=build("AttnPre", tokens=2, fold=fold, tok_par=tok_par),
+        res_in=t([1, 2, 2, 8]),
+        pend=t([1, 2, 8]) if fold else 0,
+        res_out=t([1, 2, 2, 8]),
+        hc_fn=weight([12, 16], F32),
+        wqkv=weight([16, 8]),
+        wqkv_s=weight([1, 1], E8M0),
+        wqb=weight([32, 16]),
+        ring=t([4096, 8], role="kv"),
+        iq_w=0,
+        iw_w=0,
+        **TABLES,
+    )
+
+
+def layer_post(stated=True, **fields):
+    """K2 of 2 rows at width 8 whose indexer runs over 2 heads of width 16,
+    attending 2 heads of width 8: 128 output-projection and 32 router weights,
+    and 4 experts whose width 2 the loader pads to 4, 2 a route."""
+    op = leaf(
+        V41_LAYER_POST,
+        key=build(
+            "LayerPost", tokens=2, experts=4, topk=2, tp=TP, index_fp4=False, **fields
+        ),
+        iact=1,
+        iq=t([2, 2, 16], FP8),
+        q=t([1, 2, 2, 8]),
+        pool=t([4096, 8], role="kv"),
+        woa=weight([8, 16]),
+        gate_w=weight([4, 8], BF16),
+        w13=weight([4, 8, 4], FP4),
+        w13_s=weight([4, 2], U8),
+        w2=weight([4, 8, 2], FP4),
+        w2_s=weight([4, 1], U8),
+        out=t([1, 2, 8]),
+        **dict.fromkeys(("wob", "hc_fn", "sgu", "sw2"), 0),
+        **TABLES,
+    )
+    held = {**GEOMETRY, "index_candidates": 100, "expert_width": 2}
+    return {**op, "stated": held} if stated else op
 
 
 def sparse(q_rows, stated=GEOMETRY):
@@ -105,12 +177,75 @@ def test_the_scorer_scores_every_compressed_entry_or_at_most_its_candidates():
     [
         (sparse(2, stated=None), "window_size, compress_ratio, index_topk"),
         (scorer(2, None, stated=False), "compress_ratio, index_candidates"),
+        (
+            layer_post(stated=False),
+            ", ".join([*GEOMETRY, "index_candidates", "expert_width"]),
+        ),
     ],
-    ids=["attention", "scorer"],
+    ids=["attention", "scorer", "mono"],
 )
 def test_a_leaf_that_states_no_geometry_is_refused_by_name(op, missing):
     with pytest.raises(CostRefused, match=f"{op['op']}: the leaf states no {missing}"):
         work(op, rows((1, 300), (1, 5)), TP, "bf16")
+
+
+@pytest.mark.parametrize("fold", [True, False])
+def test_mono_k1_runs_its_rows_through_each_weight_and_reads_no_table(fold):
+    # 2 rows through 192 mix weights at bf16, and 128 and 512 at fp8. Each
+    # weight and row read once; with nothing to fold the residual stays put.
+    want = Work({"bf16": 4 * 192, "fp8": 4 * 640}, 768 + 128 + 1 + 512 + 64)
+
+    got = work(attn_pre(fold), rows((1, 300), (1, 5)), TP, "bf16")
+
+    assert got == want + Work({}, 32 + 64 if fold else 0)
+
+
+def test_mono_k2_attends_scores_and_routes_the_view_s_rows():
+    view = rows((1, 300), (1, 5))
+    # The attention's 13 entries and the scorer's 102 of its 100 candidates,
+    # as the sparse attention's and the scorer's leaves count them.
+    attended = Work(
+        {"bf16": 4 * 2 * 8 * 13, "fp8": 2 * 2 * 16 * 102}, 13 * 16 + 102 * 16
+    )
+    # 2 rows through 128 output-projection and 32 router weights; 4 routes
+    # through the real half of an expert's 96 weights at fp8. 3 of 4 experts
+    # read, each half its 50 bytes of weights and gate-up scales and its 1
+    # byte of down scales whole.
+    products = Work({"bf16": 4 * 32, "fp8": 4 * 128 + 4 * 2 * 48}, 3 * 26)
+    # q, iq, the two products' weights and the output read once.
+    io = Work({}, 64 + 64 + 128 + 64 + 32)
+    reduced = allreduce(TP, 2 * 8 * 2)
+
+    got = work(layer_post(), view, TP, "bf16")
+
+    assert got == attended + products + io + reduced + reduced
+
+
+def test_the_mono_mailbox_reset_zeroes_its_buffers_whole_whatever_the_rows():
+    op = leaf(
+        STEP_BEGIN,
+        key=build("StepBegin", tp=TP, debug=False),
+        scratch=[t([1024], U8), t([512], U8)],
+        peers=t([TP], I64),
+        fence_off=256,
+        rank=0,
+        state=t([137], I64),
+    )
+    # Then each rank's epoch word to every other: the fence.
+    want = Work({}, 1024 + 512 + 256) + allgather(TP, 8 * TP)
+
+    assert work(op, rows((1, 9)), TP, "bf16") == want
+    assert work(op, rows(*[(1, 9)] * 3), TP, "bf16") == want
+
+
+@pytest.mark.parametrize(
+    "op",
+    [attn_pre(True, tok_par=True), layer_post(ep=2), layer_post(moe_tp=2)],
+    ids=["token_parallel", "ep", "moe_tp"],
+)
+def test_a_mono_build_whose_rows_cross_ranks_is_refused_by_name(op):
+    with pytest.raises(CostRefused, match=f"{op['op']}: a token-parallel or DP-"):
+        work(op, rows((1, 9)), TP, "bf16")
 
 
 def test_the_delayed_hyper_connection_projects_each_row_s_widened_residual():
@@ -226,17 +361,21 @@ def _view(shape: str, context=1024) -> BatchView:
     return BatchView((RequestShape(tokens, tokens, False),), produces_output=True)
 
 
+#: Each capture, and the kinds its decode attends through.
 CAPTURES = [
-    (SHAPES + ARGS, "gfx1250", 1),
-    (SHAPES + ARGS + EP4, "gfx1250", TP),
-    ("--width 16" + ARGS + EP4, "gfx950", TP),
+    (SHAPES + ARGS, "gfx1250", 1, {V41_ATTENTION, V41_SCORERS[0]}),
+    (SHAPES + ARGS + EP4, "gfx1250", TP, {V41_ATTENTION, V41_SCORERS[0]}),
+    ("--width 16" + ARGS + EP4, "gfx950", TP, {V41_ATTENTION, COMPILED}),
+    (MONO, "gfx950", 1, MONOS),
 ]
 
 
 @pytest.mark.parametrize(
-    "argv, arch, ep", CAPTURES, ids=["gfx1250_ep_off", "gfx1250_ep4", "gfx950_ep4"]
+    "argv, arch, ep, attends",
+    CAPTURES,
+    ids=["gfx1250_ep_off", "gfx1250_ep4", "gfx950_ep4", "gfx950_ep_off"],
 )
-def test_every_v41_flash_leaf_prices(argv, arch, ep, tmp_path_factory):
+def test_every_v41_flash_leaf_prices(argv, arch, ep, attends, tmp_path_factory):
     graphs = capture(tmp_path_factory, argv, arch)
     kinds = set()
     for shape, (graph, _) in graphs.items():
@@ -246,8 +385,7 @@ def test_every_v41_flash_leaf_prices(argv, arch, ep, tmp_path_factory):
             w = work(op, view, TP, "bf16", ep)
             assert w is None or price(w, MI455) > 0
 
-    assert V41_ATTENTION in kinds
-    assert COMPILED in kinds if arch == "gfx950" else V41_SCORERS[0] in kinds
+    assert attends <= kinds
 
     # The op-level backend prices each step, a decode over a longer context
     # higher: its scorers read more entries.

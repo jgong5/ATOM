@@ -35,6 +35,14 @@ expert-parallel width is the run's `ep`, the experts `ep` times a rank's.
 DeepSeek-V4.1's sparse attention and indexer scorers read their entries at the
 geometry their leaf states, over the queries the leaf holds (`_last`): a
 replayed prefill's decoder layers run each finishing request's last rows.
+
+DeepSeek-V4.1's mono decode kernels are priced from each leaf's build key, its
+weights, the view's rows and the geometry its K2 states, not from the buffers
+its runner holds for its widest step, which a step reads a part of: the
+step's rows run through each weight once, each expert they route to is read
+once, and each row reads the entries V4.1's sparse attention reads. The
+step's mailbox reset zeroes its buffers whole every step, so its bytes are
+theirs.
 """
 
 from __future__ import annotations
@@ -908,6 +916,120 @@ EXTRACTORS |= {
         ),
         _launch,
     ),
+}
+#: V4.1 mono's matrix products in K1 and K2: each weight's slot, at the
+#: format of the rows it multiplies.
+K1_PRODUCTS = {"hc_fn": "bf16", "wqkv": "fp8", "wqb": "fp8"}
+K1_PRODUCTS |= {"iq_w": "fp8", "iw_w": "bf16"}
+K2_PRODUCTS = {"woa": "fp8", "wob": "fp8", "hc_fn": "bf16", "gate_w": "bf16"}
+K2_PRODUCTS |= {"sgu": "fp8", "sw2": "fp8"}
+#: What a mono kernel reaches by index or position, sized for the runner's
+#: widest step or the pool: the mailboxes' scratch, the KV pool and its window
+#: ring, the rope tables, the block tables, the indexer's planes and logits,
+#: and the drafter's tap.
+BY_INDEX = ("scratch", "ring", "pool", "cos", "sin", "table", "itab", "ilog")
+BY_INDEX += ("ibmax", "plane", "pscale", "iplan", "aux")
+#: K2's routed experts' weights and scales the kernel reads over their real
+#: width, skipping the loader's zero padding past it; it reads the down
+#: projection's scales, `w2_s`, whole.
+ROUTED = ("w13", "w13_s", "w2")
+
+
+def _mono_key(op) -> dict:
+    """A mono leaf's build key, by field; refused where the build moves its
+    rows between ranks (token parallel, DP attention), which is not counted."""
+    key = dict(op["args"]["key"]["state"])
+    if key.get("tok_par") or key.get("ep", 1) * key.get("moe_tp", 1) > 1:
+        raise _Unpriced("a token-parallel or DP-attention build is not priced")
+    return key
+
+
+def _through(op, rows, products) -> Work:
+    """`rows` rows through each weight in `products`' slots: two flops a
+    multiply-add at its rows' format, a weight's element each (two a byte of
+    an fp4 one)."""
+    weights = [(w, f) for s, f in products.items() for w in _tensors(op["args"][s])]
+    each = (
+        Work({f: 2 * rows * _bytes(w) / ELEMENT_BYTES[_fmt(w["dtype"])]})
+        for w, f in weights
+    )
+    return sum(each, Work())
+
+
+def _read_once(op, *left) -> Work:
+    """Each tensor argument but those of the `left` slots read once."""
+    args = op["args"]
+    return Work(
+        {}, sum(_bytes(t) for s in args if s not in left for t in _tensors(args[s]))
+    )
+
+
+def _attn_pre(op, view, tp, kv) -> Work:
+    """V4.1 mono's K1 of one layer, its attention seam to the rotated query:
+    the build's `tokens` rows through each matrix product (`K1_PRODUCTS`), and
+    each tensor argument read once but `BY_INDEX`'s and, where the build folds
+    nothing, the residual it leaves where it is. The window and rotary rows it
+    reaches by position are left out, which only lowers M."""
+    key = _mono_key(op)
+    kept = () if key["fold"] else ("res_out",)
+    return _through(op, key["tokens"], K1_PRODUCTS) + _read_once(op, *BY_INDEX, *kept)
+
+
+def _layer_post(op, view, tp, kv) -> Work:
+    """V4.1 mono's K2 of one layer, its attention to the MoE's reduced output.
+    Where its indexer runs (`iact`), each of the view's rows scored as the
+    step roofline counts it at the ratio and candidates the leaf states, at
+    the plane's format and `iq`'s heads and width; its logits are left out,
+    which only lowers M. Each row's sparse attention at the window, ratio and
+    top k the leaf states, at `q`'s heads and width. The build's `tokens` rows
+    through each dense product (`K2_PRODUCTS`), and its routes, as `_routing`
+    deals them, each through one expert's MXFP4 weights at MXFP8 over the
+    width the leaf states (`expert_width`), each expert they reach read once
+    (`ROUTED`). The attention's and the MoE's all-reduces over the build's
+    `tp` ranks, and every other tensor argument read once but `BY_INDEX`'s."""
+    key, args, rows, q = _mono_key(op), op["args"], view.requests, op["args"]["q"]
+    geometry = ("window_size", "compress_ratio", "index_topk", "index_candidates")
+    window, ratio, top, cap, width = _stated(op, *geometry, "expert_width")
+    *_, heads, dim = q["shape"]
+    work = _sparse_products(rows, heads, dim, _fmt(q["dtype"]), kv, window, ratio, top)
+    if args["iact"]:
+        fmt, iq = "fp4" if key["index_fp4"] else "fp8", args["iq"]
+        *_, ih, packed = iq["shape"]
+        scored = int(packed * _size(iq["dtype"]) / ELEMENT_BYTES[fmt])
+        work += _index_scores(rows, ratio, ih, scored, fmt, cap)
+    tokens, experts, out, w2 = key["tokens"], key["experts"], args["out"], args["w2"]
+    routes, reached = _routing(view, tokens, key["topk"], experts, 1)
+    # w2 holds each expert's hidden rows over the loader's padded width
+    padded = _bytes(w2) / ELEMENT_BYTES[_fmt(w2["dtype"])] / math.prod(w2["shape"][:-1])
+    real = width / padded
+    routed = _through(op, routes / experts * real, dict.fromkeys(("w13", "w2"), "fp8"))
+    held = real * sum(_bytes(t) for s in ROUTED for t in _tensors(args[s]))
+    held += _bytes(args["w2_s"])
+    reduced = allreduce(key["tp"], tokens * out["shape"][-1] * _size(out["dtype"]))
+    work += _through(op, tokens, K2_PRODUCTS) + routed + reduced + reduced
+    return (
+        work
+        + Work({}, held * reached / experts)
+        + _read_once(op, *BY_INDEX, *ROUTED, "w2_s")
+    )
+
+
+def _step_begin(op, view, tp, kv) -> Work:
+    """The mono step's mailbox reset: each scratch buffer and the peer
+    buffer's data region (`fence_off` bytes) zeroed whole, whatever the step's
+    rows, then the fence, each of the build's `tp` ranks' epoch word sent to
+    every other."""
+    args, ranks = op["args"], _mono_key(op)["tp"]
+    zeroed = sum(map(_bytes, _tensors(args["scratch"]))) + args["fence_off"]
+    return Work({}, zeroed) + allgather(ranks, 8 * ranks)
+
+
+MONO = "atom.models.deepseek_v41.mono."
+EXTRACTORS |= {
+    "atom.mono.runtime.step_begin:_launch_step_begin": _step_begin,
+    MONO + "step_meta:_launch_step_meta": _in_place(),
+    MONO + "kernels.attn_pre:launch_attn_pre": _attn_pre,
+    MONO + "kernels.layer_post:launch_layer_post": _layer_post,
 }
 #: DeepSeek-V4.1's DSpark drafter's kinds: its draft-KV pass and its block.
 DSPARK = "atom.model_ops.deepseek_v41.dspark:"
