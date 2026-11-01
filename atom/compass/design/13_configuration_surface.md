@@ -134,7 +134,7 @@ written from the flags, handed to ATOM's API server by `--compass-run`, and kept
 
 ```
 compass run --machine machine.json --step-grid <key> --store ./compass-store \
-    [--host-laws <key>] [--coverage <input>...] [--on-refusal mark|abort] --out <dir> \
+    [--host-laws <key|law>] [--coverage <input>...] [--on-refusal mark|abort] --out <dir> \
     -- --model <model> -tp 4 --max-num-seqs 256 ...      # ordinary ATOM, unchanged
 
 # which starts one instance's server as
@@ -145,9 +145,9 @@ python -m atom.entrypoints.openai_server <ATOM arguments> \
 | `run` flag | Meaning | Default |
 |---|---|---|
 | `--machine` | the machine specification (`05` D25) | **none — refuses** |
-| `--step-linear`, `--step-stub`, `--step-grid`, `--op-graph` | the backend, exactly one kind, each named by its run-file key: a step linear law by store key, a step stub's stated coefficients by file (its terms declared, never fitted), a step grid bundle by store key (`17` D103), the `op_graph` entries `--store` holds, each leaf priced first from the `price_list` the store holds at the run's model, parallel layout, machine spec and ATOM tree when there is one (#1715). There is no granularity or method flag. `--step-linear` repeats, one law per engine config: the run file then holds a list, and each process installs the law fitted under its own engine config and refuses when none or several were (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | **none — refuses**, as do two kinds |
+| `--step-linear`, `--step-stub`, `--step-grid`, `--op-graph` | the backend, exactly one kind, each named by its run-file key: a step linear law by store key or by a law file at the machine spec and engine config it states, which names no fit inputs, so grading refuses its run (#2594), a step stub's stated coefficients by file (its terms declared, never fitted), a step grid bundle by store key (`17` D103), the `op_graph` entries `--store` holds, each leaf priced first from the `price_list` the store holds at the run's model, parallel layout, machine spec and ATOM tree when there is one (#1715). There is no granularity or method flag. `--step-linear` repeats, one law per engine config: the run file then holds a list, and each process installs the law fitted under its own engine config and refuses when none or several were (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | **none — refuses**, as do two kinds |
 | `--store` | the artifact store keys resolve in, the configuration's `memory_readings` included (`07` D41) | **none — refuses** |
-| `--host-laws` | the host laws by store key (`09` D54), composed by `01` D4's recurrence. Repeats, one entry per engine config, each process installing its own config's, as `--step-linear` does (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | none: the run charges no host time and records that |
+| `--host-laws` | the host laws by store key (`09` D54), or a law file's `host` at the host key it states, so a law re-keyed to the run's ATOM tree runs there (#2594), composed by `01` D4's recurrence. Repeats, one entry per engine config, each process installing its own config's, as `--step-linear` does (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | none: the run charges no host time and records that |
 | `--on-refusal` | `mark`: a step the cost backend refuses charges no device time, its answered terms included, and a segment the host laws refuse 0 s; its reason is recorded, and the run continues. `abort`: stop at the first refusal; the run summary is still written. Either way a refusal makes the run a coverage report (`08` D50.1) | `mark` (`08` D50.1) |
 | `--step-roofline` | a switch, named by its run-file key `step_roofline`, with no value: the step roofline has no host bound (the owner's ruling on [#1047](https://github.com/jgong5/ATOM/issues/1047)). On, it composes `StepFallbackBackend`: the step roofline (`10` D64) prices the device time of the steps the backend refuses, with the method its inputs give it. A step grid run composes it without the switch (`17` D102) | off; `run.json` records it when on |
 | `--coverage` | `shape_population` keys and `record` directories the backend's coverage check reads before the run starts. An input whose engine states other scheduler bounds, capture ladder or TP size than ATOM's arguments resolve refuses, naming each field that differs and both values (the [#1294 ruling](https://github.com/jgong5/ATOM/issues/1294)); the step grid's check refuses no step, and counts those it extrapolates or declines to the roofline (`17` D99) | off; `run.json` records the check's result, or that none ran |
@@ -215,7 +215,7 @@ compass run            --join RUN_FILE        --out D -- <ATOM args>
 compass project        --model MODEL [--tp N] --machine M --store S RECORD... \
                        [-- RECORD <ATOM args>]...
 
-<backend>   one of --step-linear KEY, --step-stub FILE, --step-grid KEY, --op-graph; --step-linear
+<backend>   one of --step-linear KEY|LAW, --step-stub FILE, --step-grid KEY, --op-graph; --step-linear
             repeats, one KEY per engine config, as --host-laws does (#973 ruling)
 <batches>   record directories and shape_population keys, whose batches it replays
 --grid      shape_population keys, and record directories, that the step grid's planner

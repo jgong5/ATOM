@@ -853,6 +853,15 @@ first-turn records served under expert parallel here with no
 first six concurrencies came first; a record that still built a Triton variant was taken
 again.
 
+A simulated run prices by a checked-in law when the law file stands in for both tokens:
+`compass run --step-linear LAW --host-laws LAW $M $S --out D -- $ATOM`, `LAW` a file in
+`scripts/compass/laws/` (or any law file `step_linear_fit` writes), and `$S` the store that
+holds the configuration's `memory_readings`. The run takes the step law at the machine spec
+and engine config the file states, and its `host` at the host key the file states, the
+`atom` digest it was last re-keyed at, so a law re-keyed to this tree runs here though its
+records ran at another; each refuses where a store entry's would. A law file names no fit
+inputs, so grading cannot check its fitted traces against the cell's and refuses its run.
+
 ## Cost accuracy on a real run's own steps — `validate.cost`
 
 `PYTHONPATH=$T python -m atom.compass.validate.cost RECORD LAW` prices each step of a real
