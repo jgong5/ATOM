@@ -53,7 +53,7 @@ replayed nothing.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 def _refuse_shadowing(owner: type, cls: type) -> None:
@@ -220,6 +220,13 @@ class BatchView:
     on one rank. `image_tokens` counts the scheduled
     tokens whose embedding the step's vision encoder supplies; a backend that
     has no basis for pricing that encoder refuses a step with any.
+    `start_lag_s` is, on a step that produces output, how far behind its host
+    the device starts it: its device start less the host's return from the
+    wait on the previous output's tokens, where the host queues a drafter's
+    propose pass, in seconds, negative when the device started first; None
+    when the caller did not say. It is a timeline's, not the batch's: the
+    runner's host clock or a record's stamps supply it, and two views that
+    differ only in it are equal.
 
     What this does not do is make the collapsed form unreachable: one row is
     a legal batch, and a one-row batch is `tokens x history` by construction.
@@ -239,6 +246,7 @@ class BatchView:
     dp_rank: int | None = None
     dp_dummy: bool = False
     draft_rows: int | None = None
+    start_lag_s: float | None = field(default=None, compare=False)
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)

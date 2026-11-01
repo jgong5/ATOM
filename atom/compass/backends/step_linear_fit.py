@@ -76,7 +76,7 @@ under the law's `draft`; it holds no `held_out`. A step with a propose label
 (`step_labels`) is fitted there on its draft label less that label, the
 draft-KV pass a middle chunk runs too, and left out when nothing remains; the
 propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`,
-or, split at a token count, its `propose` and `short_propose` (`_proposes`).
+or, split at a lag, its `propose` and `near_propose` (`_proposes`).
 A decode's draft-KV label fits the draft law's `draft_kv` vector alike. An
 output prefill's fits the draft law's prefill vector in place of its draft
 label, which, all after `forward_done_event`, fits the `propose` vector, and
@@ -153,9 +153,11 @@ ROWMOD_GAIN = 0.1
 ROWMOD_SHUFFLES = 8
 #: The fraction of the unsplit `propose` vector's mean log error a split must cut.
 PROPOSE_SPLIT_GAIN = 0.1
-#: Steps each side of a `propose` split holds at least, as a `rowmod` cell holds
-#: `ROWMOD_CELL_STEPS`: on fewer, scatter that follows no token count clears the gain.
-PROPOSE_SPLIT_STEPS = 100
+#: Timed propose labels a split needs: on fewer, scatter that follows no lag
+#: clears the gain.
+PROPOSE_SPLIT_STEPS = 200
+#: Steps each side of a `propose` split holds at least, for its two coefficients.
+PROPOSE_SIDE_STEPS = 10
 HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
 
@@ -710,40 +712,43 @@ def _propose(samples, label: str = "propose_s") -> dict:
 
 
 def _proposes(samples) -> dict:
-    """The draft law's `propose` over `samples`, or, split at a token count,
-    `propose` over the steps of at least that many prefill tokens and
-    `short_propose` over the rest, the count its `below`.
+    """The draft law's `propose` over `samples`, or, split at a lag, `propose`
+    over the passes the device reached at least that far behind its host and
+    `near_propose` over the rest, the lag its `lag`.
 
-    The count runs over the powers of two up to the largest prefill, each side
-    holding at least `PROPOSE_SPLIT_STEPS` steps and solved as `_propose`
-    solves. The split whose vectors price the steps at the smallest mean
+    A pass's lag is its view's `start_lag_s` plus its step's target and draft-KV
+    labels. The lag runs over the powers of two of a second up to one, over the
+    steps that state one when they number at least `PROPOSE_SPLIT_STEPS`, each
+    side holding at least `PROPOSE_SIDE_STEPS` and solved as `_propose` solves.
+    The split whose vectors price those steps at the smallest mean
     |log(price / label)| is adopted when that cuts the unsplit vector's by
-    `PROPOSE_SPLIT_GAIN`; both errors go under `short_propose`'s `fit.split`.
+    `PROPOSE_SPLIT_GAIN`; both errors go under `near_propose`'s `fit.split`.
     Not a scaled MAD: unsplit, the more frequent pass length sets the MAD
     however far the rest are priced off it.
     """
-    tokens = np.array([sum_tokens(s.view.prefill) for s in samples])
-    x = np.array([(1, len(s.view.requests)) for s in samples], dtype=np.float64)
-    labels = np.array([s.propose_s for s in samples])
+    timed = [s for s in samples if s.view.start_lag_s is not None]
+    lags = [s.view.start_lag_s + s.device_s + (s.draft_kv_s or 0) for s in timed]
+    x = np.array([(1, len(s.view.requests)) for s in timed], dtype=np.float64)
+    labels = np.array([s.propose_s for s in timed])
 
     def error(short, below: dict, above: dict) -> float:
         price = [x @ list(v["coefficients"].values()) for v in (below, above)]
         return float(np.mean(np.abs(np.log(np.where(short, *price) / labels))))
 
     whole = _propose(samples)
-    without = error(np.zeros(len(samples), dtype=bool), whole, whole)
-    best, target, k = {"propose": whole}, (1 - PROPOSE_SPLIT_GAIN) * without, 2
-    while k <= tokens.max():
-        short = tokens < k
-        if min(short.sum(), (~short).sum()) >= PROPOSE_SPLIT_STEPS:
-            sides = [
-                [s for s, m in zip(samples, short) if m == w] for w in (True, False)
-            ]
+    if len(timed) < PROPOSE_SPLIT_STEPS:
+        return {"propose": whole}
+    without = error(np.zeros(len(timed), dtype=bool), whole, whole)
+    best, target, k = {"propose": whole}, (1 - PROPOSE_SPLIT_GAIN) * without, 2**-20
+    while k <= 1:
+        short = np.array(lags) < k
+        if min(short.sum(), (~short).sum()) >= PROPOSE_SIDE_STEPS:
+            sides = [[s for s, m in zip(timed, short) if m == w] for w in (True, False)]
             below, above = map(_propose, sides)
             if (got := error(short, below, above)) < target:
-                below["below"], target = k, got
+                below["lag"], target = k, got
                 below["fit"]["split"] = {"error": got, "error_without": without}
-                best = {"propose": above, "short_propose": below}
+                best = {"propose": above, "near_propose": below}
         k *= 2
     return best
 

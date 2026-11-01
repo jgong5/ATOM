@@ -56,11 +56,12 @@ requests: on a prefill step that produces output it adds the drafter's
 output and 0 on one that does not: the draft-KV pass projects and writes a tail
 only for requests that finish their prompts. Under either, a prefill step that
 does not say whether it produces output is refused.
-Beside `propose` it may hold a `short_propose` vector over `[1, seqs]` with a
-`below` entry, a token count: a prefill step of fewer tokens that produces
-output prices its `propose` pass by it instead. The pass replays one draft
-graph at any prefill length; what moves its window is whether the target's
-launch paced the device, which a batch shows only through its tokens.
+Beside `propose` it may hold a `near_propose` vector over `[1, seqs]` with a
+`lag` entry, in seconds: an output prefill whose device reaches the pass less
+than `lag` behind its host, the view's `start_lag_s` plus the step's target
+and draft-KV prices, prices the pass by it instead; a view stating no
+`start_lag_s` is refused. The pass replays one draft graph at any prefill
+length; what moves its window is how far the device runs behind its host.
 A draft law may also hold a `draft_kv` vector over `[1, seqs]`: on a decode
 step it adds the drafter's draft-KV pass, which runs before
 `forward_done_event`, so its terms are the target's. A draft law with
@@ -75,7 +76,7 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
      "decode": {"eager": VECTOR, "1": VECTOR, "2": VECTOR, ...},
      "draft": {"provenance": ..., "prefill": VECTOR, "decode": {...},
                "propose": VECTOR, "draft_kv": VECTOR,
-               "short_propose": VECTOR,     # with "below": tokens
+               "near_propose": VECTOR,      # with "lag": seconds
                "output_prefill_kv": true}}   # all four optional
 
     VECTOR = {"coefficients": {<feature>: seconds, ...},
@@ -190,15 +191,20 @@ class StepLinearLaw:
         self.propose = law.get("propose") and _Vector(
             "propose", PROPOSE, law["propose"]
         )
-        short = law.get("short_propose")
-        self.short_propose = short and _Vector("short_propose", PROPOSE, short)
-        if short and ("below" not in short or not self.propose):
-            lacks = "no below" if "below" not in short else "no propose vector"
+        if "short_propose" in law:
             raise ValueError(
-                "the short_propose vector prices a pass under its below token "
-                f"count, beside a propose vector; the law states {lacks}"
+                "the law splits the propose pass at a token count (short_propose), "
+                "which a lag has replaced (near_propose); refit it"
             )
-        self.below = short and int(short["below"])
+        near = law.get("near_propose")
+        self.near_propose = near and _Vector("near_propose", PROPOSE, near)
+        if near and ("lag" not in near or not self.propose):
+            lacks = "no lag" if "lag" not in near else "no propose vector"
+            raise ValueError(
+                "the near_propose vector prices a pass the device reaches under "
+                f"its lag, beside a propose vector; the law states {lacks}"
+            )
+        self.lag = near and float(near["lag"])
         self.draft_kv = law.get("draft_kv") and _Vector(
             "draft_kv", PROPOSE, law["draft_kv"]
         )
@@ -239,13 +245,18 @@ class StepLinearBackend(CostBackend):
         terms, kv = self._terms(self.law, batch_view, "")
         drafts = []
         if self.law.draft is not None:
-            drafts, draft_kv = self._terms(self.law.draft, batch_view, "draft ")
+            drafts, draft_kv = self._terms(
+                self.law.draft, batch_view, "draft ", terms + kv
+            )
             kv += draft_kv
         return StepCost(terms + kv, self.treatments, drafts)
 
-    def _terms(self, law: StepLinearLaw, batch_view: BatchView, what: str) -> tuple:
+    def _terms(
+        self, law: StepLinearLaw, batch_view: BatchView, what: str, target=()
+    ) -> tuple:
         """`law`'s terms for the step, named for `what`, and apart its draft-KV
-        pass's, which are the target's."""
+        pass's, which are the target's; `target` holds the target's terms,
+        which run before a draft's."""
         prefill, decode = batch_view.prefill, batch_view.decode
         if prefill:
             vector, kind = law.prefill, "prefill"
@@ -295,8 +306,17 @@ class StepLinearBackend(CostBackend):
         seqs = (1, len(batch_view.requests))
         if prefill and law.propose is not None and batch_view.produces_output:
             propose = law.propose
-            if law.short_propose and sum_tokens(prefill) < law.below:
-                propose = law.short_propose
+            if law.near_propose:
+                if batch_view.start_lag_s is None:
+                    raise self._refuse(
+                        batch_view,
+                        "an output prefill that does not say how far behind its "
+                        "host the device starts it, which its propose pass "
+                        "depends on",
+                    )
+                ahead = sum(t.seconds for t in (*target, *kv))
+                if batch_view.start_lag_s + ahead < law.lag:
+                    propose = law.near_propose
             terms += self._priced(law, propose, "propose", seqs, what)
         if decode and law.draft_kv is not None:
             kv = self._priced(law, law.draft_kv, "draft_kv", seqs, what)
