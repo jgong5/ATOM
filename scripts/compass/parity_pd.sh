@@ -17,6 +17,7 @@
 #                    0.01); no request waits for the one before it to be
 #                    admitted, so prefills overlap and the router chooses a
 #                    prefill rank
+#   LONG             tokens request 0 asks for (default: as the rest)
 #   PREFILL_DP DECODE_DP
 #                    each side's DP width (default 2); width 1 serves at -tp 1
 #   PREFILL_GPUS DECODE_GPUS
@@ -27,10 +28,13 @@
 #   ATOMESH          the router binary (default atomesh), on both runs
 #   MACHINE          machine spec (default scripts/compass/machines/mi308x-hjbog18.json)
 #   STORE            artifact store holding the simulated configuration's memory
-#                    readings, taken by `compass measure memory` (required)
+#                    readings, taken by `compass measure memory` (required
+#                    without HTTP_INTAKE)
 #   SERVER_ARGS      more API server flags, on every server (default
 #                    --enforce-eager --max-model-len 8192 --no-enable_prefix_caching)
 #   WAIT_S           seconds a server has to start, and to stop (default 1800)
+#   HTTP_INTAKE      a file: the real servers run under http_intake.py, which
+#                    stamps into it, and the script stops after the real run
 # OUT_DIR gets real/ and sim/, each with its logs and a record directory per
 # server, prefill/ and decode/, or prefill<k>/ and decode<k>/ above one server
 # of a side, and ranks.json; the last line counts the requests whose server or
@@ -43,7 +47,7 @@ compass_env "$ROOT"
 compass_require_tree "$ROOT" || exit $?
 OUT=${1:?usage: parity_pd.sh OUT_DIR}
 MODEL=${MODEL:?MODEL names the model directory}
-STORE=${STORE:?STORE names the store holding the memory readings}
+[[ -n ${HTTP_INTAKE:-} ]] || STORE=${STORE:?STORE names the store holding the memory readings}
 SERVER_ARGS=${SERVER_ARGS:---enforce-eager --max-model-len 8192 --no-enable_prefix_caching}
 ATOMESH=${ATOMESH:-atomesh}
 WAIT_S=${WAIT_S:-1800}
@@ -61,13 +65,15 @@ read -ra decode_gpus <<<"${DECODE_GPUS:-2,3}"
 # serve SIDE K N GPUS KV_ROLE DP: server K of N of a side, recording to
 # OUT/real/record/SIDE, or SIDE<K> above one, as pd_sim.sh names its servers.
 urls=()
+main=(-m atom.entrypoints.openai_server)
+[[ -z ${HTTP_INTAKE:-} ]] || main=("$ROOT/scripts/compass/http_intake.py" serve "$HTTP_INTAKE")
 serve() {
     local port name=$1
     (($3 == 1)) || name+=$2
     port=$(compass_held_port)
     # shellcheck disable=SC2086 # the server flags are word lists
     HIP_VISIBLE_DEVICES=$4 ATOM_COMPASS_PARITY_RECORD=$OUT/real/record/$name setsid \
-        python3 -m atom.entrypoints.openai_server --model "$MODEL" --host 127.0.0.1 \
+        python3 "${main[@]}" --model "$MODEL" --host 127.0.0.1 \
         --server-port "$port" $(dp_args "$6") \
         --data-parallel-master-port "$(compass_held_port)" $SERVER_ARGS --kv-transfer-config \
         "{\"kv_role\":\"$5\",\"kv_connector\":\"mooncake\",\"protocol\":\"tcp\",\"proxy_ip\":\"127.0.0.1\",\"handshake_port\":$(compass_held_port "$6")}" \
@@ -90,9 +96,9 @@ setsid "$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" \
 pids+=($!)
 compass_wait_up router "${pids[-1]}" "http://127.0.0.1:$ROUTER_PORT/v1/models"
 python3 -c 'import sys; from pathlib import Path; from atom.compass.parity.traffic import bodies, real
-port, model, record, n, gap_s = sys.argv[1:]
-real(int(port), bodies(model, int(n)), float(gap_s), Path(record), wait=False)' \
-    "$ROUTER_PORT" "$MODEL" "$OUT/real/record" "${REQUESTS:-16}" "${GAP_S:-0.01}" \
+port, model, record, n, gap_s, long = sys.argv[1:]
+real(int(port), bodies(model, int(n), long=int(long)), float(gap_s), Path(record), wait=False, long=int(long))' \
+    "$ROUTER_PORT" "$MODEL" "$OUT/real/record" "${REQUESTS:-16}" "${GAP_S:-0.01}" "${LONG:-0}" \
     >"$OUT/real/traffic.log" 2>&1
 # The records' last lines are written as the workers exit.
 for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
@@ -104,6 +110,7 @@ for pid in "${pids[@]}"; do
     done
 done
 pids=()
+[[ -z ${HTTP_INTAKE:-} ]] || exit 0
 # Each server's record is a whole record, as the replay reads it.
 for record in "$OUT"/real/record/*/; do cp "$OUT/real/record/arrivals.json" "$record"; done
 
@@ -114,6 +121,7 @@ python3 - "$RUN" "$OUT" "${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog1
     "$PREFILL_DP" "$DECODE_DP" "${urls[@]}" <<'EOF'
 import json, re, sys
 from pathlib import Path
+from atom.compass.drive.runfile import KV_WRITE_REQ_S
 
 run, out, machine, model, store, port, prefills, decodes, dp_p, dp_d, *urls = sys.argv[1:]
 machine = json.loads(Path(machine).read_text())
@@ -137,7 +145,7 @@ for url, rank in re.findall(r"Registered worker (\S+)@(\d+) ", log):
 Path(run).write_text(json.dumps({
     "clock_endpoint": f"tcp://127.0.0.1:{port}", "bound_s": 1e7,
     "admission_path": "serving", "ipc_s": 2.0**-14, "stream_s": 2.0**-12,
-    "router_s": 2.0**-12, "kv_write_req_s": 2.0**-10, "kv_link": "intra_node",
+    "router_s": 2.0**-12, "kv_write_req_s": KV_WRITE_REQ_S, "kv_link": "intra_node",
     "replay": f"{out}/real/record", "step_stub": {}, "machine": machine, "store": store,
     "prefill_data_parallel_size": int(dp_p), "decode_data_parallel_size": int(dp_d),
     "out_dir": f"{out}/sim",

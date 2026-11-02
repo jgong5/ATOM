@@ -6,6 +6,7 @@
     python3 scripts/compass/http_intake.py floor STAMPS ARRIVALS
     python3 scripts/compass/http_intake.py idle STAMPS [PER_BYTE_S]
     python3 scripts/compass/http_intake.py hops STAMPS HANDOFF ARRIVALS
+    python3 scripts/compass/http_intake.py pd STAMPS [STEPS]
 
 `serve` runs `atom.entrypoints.openai.api_server` as ``python3 -m`` does and
 appends ``<end ns> <thread id> body|tmpl|app|prep|send|out|head <start ns> <size>`` to STAMPS for
@@ -16,7 +17,10 @@ each request body first read (`Request.body`), chat template rendered
 a request handed to the engine (`CoreManager.add_request`), `out` an engine
 output its output thread took in (`CoreManager._mark_seq_prefill_complete` per
 streamed output, `_deliver_terminal_output` per finished sequence) and `head` an
-SSE response's head sent to the client, all size 0.
+SSE response's head sent to the client, all size 0. Every process the server
+spawns stamps into STAMPS too: `kvsend`, a Mooncake KV write request sent
+(`MooncakeConnector._send_on_socket`), and `kvrecv`, one the prefill's listener
+received, both size 0.
 
 `floor` reads the transport from client send to ASGI app call off a server
 `serve` ran and the parity workload's real-run ARRIVALS
@@ -34,6 +38,13 @@ long one) finds the engine idle; ``output``, each engine output's put on the eng
 output queue to the server's output thread taking it in; ``stream``, each SSE
 head sent to the client reading it (ARRIVALS' ``admitted_ns``). Prints each hop's median, p10,
 p90 and N, and the three inputs' sha256, as JSON.
+`pd` reads a prefill and a decode server's shared STAMPS (`parity_pd.sh` with
+HTTP_INTAKE): ``kv_write_req``, each write request's send call on decode to prefill's
+receipt, its median, p10, p90 and N, and the sha256, as JSON. With STEPS, prefill's
+step record (``dp0.jsonl``), it adds the same by prefill's state at each receipt
+(``by_state``): ``idle`` between forwards, ``forward`` inside one, split into
+``launch``, inside its kernel launches, and ``outside`` them; and the record's
+sha256. Several runs pool as their STAMPS and their STEPS each concatenated.
 
 `fit` reads a burst of N first-turn requests (default 256), which the loop takes
 in one at a time: each gap between template starts is the next request's
@@ -43,6 +54,7 @@ the burst's span; least squares on the starts swings the slope's sign between
 bursts. Prints the terms, a gap's rms residual, N, bytes and sha256 as JSON.
 """
 
+import contextlib
 import hashlib
 import importlib.abc
 import importlib.machinery
@@ -52,12 +64,23 @@ import runpy
 import sys
 import threading
 import time
+from multiprocessing import spawn
 from pathlib import Path
 
 import numpy as np
 
 
 def serve(stamps: str, args: list[str]) -> None:
+    install(stamps)
+    sys.argv[1:], sys.path[0] = args, os.getcwd()
+    main = "atom.entrypoints.openai.api_server"
+    runpy.run_module(main, run_name="__main__", alter_sys=True)
+
+
+def install(stamps: str) -> None:
+    """Stamp into `stamps` in this process and every process it spawns."""
+    out = open(stamps, "a", buffering=1)  # noqa: SIM115
+
     def stamp(kind: str, start: int, size: int) -> None:
         now, thread = time.monotonic_ns(), threading.get_ident()
         out.write(f"{now} {thread} {kind} {start} {size}\n")
@@ -124,6 +147,36 @@ def serve(stamps: str, args: list[str]) -> None:
 
         return patch
 
+    def mooncake(module) -> None:
+        cls, kind = module.MooncakeConnector, module.MSG_WRITE_REQUEST
+        send, open_socket = cls._send_on_socket, module.zmq_socket_ctx
+
+        def _send_on_socket(self, addr, parts, *a, **k):
+            start = time.monotonic_ns()
+            send(self, addr, parts, *a, **k)
+            if parts[0] == kind:
+                stamp("kvsend", start, 0)
+
+        class Received:
+            def __init__(self, sock):
+                self.sock = sock
+
+            def __getattr__(self, name):
+                return getattr(self.sock, name)
+
+            def recv_multipart(self, *a, **k):
+                parts = self.sock.recv_multipart(*a, **k)
+                if parts[1:2] == [kind]:
+                    stamp("kvrecv", time.monotonic_ns(), 0)
+                return parts
+
+        @contextlib.contextmanager
+        def zmq_socket_ctx(*a, **k):
+            with open_socket(*a, **k) as sock:
+                yield Received(sock)
+
+        cls._send_on_socket, module.zmq_socket_ctx = _send_on_socket, zmq_socket_ctx
+
     # Each module is patched once it has run, before anything imports from it.
     patches = {
         "starlette.requests": requests,
@@ -138,6 +191,7 @@ def serve(stamps: str, args: list[str]) -> None:
             _mark_seq_prefill_complete="out",
             _deliver_terminal_output="out",
         ),
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector": mooncake,
     }
 
     class Patcher(importlib.abc.MetaPathFinder):
@@ -150,10 +204,20 @@ def serve(stamps: str, args: list[str]) -> None:
             return spec
 
     sys.meta_path.insert(0, Patcher())
-    sys.argv[1:], sys.path[0] = args, os.getcwd()
-    with open(stamps, "a", buffering=1) as out:
-        main = "atom.entrypoints.openai.api_server"
-        runpy.run_module(main, run_name="__main__", alter_sys=True)
+    # A spawned process installs this before it runs anything else.
+    line, here = spawn.get_command_line, os.path.dirname(os.path.abspath(__file__))
+    stamps = os.path.abspath(stamps)
+
+    def get_command_line(**kwds) -> list[str]:
+        argv = line(**kwds)
+        i = argv.index("-c") + 1
+        argv[i] = (
+            f"import sys; sys.path.insert(0, {here!r}); import http_intake; "
+            f"http_intake.install({stamps!r}); {argv[i]}"
+        )
+        return argv
+
+    spawn.get_command_line = get_command_line
 
 
 def fit(stamps: str, n: int = 256) -> dict:
@@ -287,6 +351,39 @@ def hops(stamps: str, handoff: str, arrivals: str) -> dict:
     }
 
 
+def pd(stamps: str, steps: str | None = None) -> dict:
+    data = Path(stamps).read_bytes()
+    rows = [line.split() for line in data.decode().splitlines()]
+    # One decode rank writes to one prefill rank on one connection, which
+    # delivers in order. Timed from the send call's start: its thread can
+    # take the GIL back after prefill took the request in.
+    sent = [int(r[3]) for r in rows if r[2] == "kvsend"]
+    got = [int(r[0]) for r in rows if r[2] == "kvrecv"]
+    out = {
+        "kv_write_req": _hop(sent, got, "kv_write_req", alone=False),
+        "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
+    }
+    if steps is None:
+        return out
+    # Each receipt by prefill's state then: between forwards, or inside a
+    # forward, and there inside its kernel launches or outside them.
+    steps_data = Path(steps).read_bytes()
+    lines = [json.loads(line) for line in steps_data.decode().splitlines()]
+    fw = [(s["t_enter_ns"], s["t_exit_ns"], *s["t_launch_ns"]) for s in lines]
+    by: dict[str, tuple[list, list]] = {}
+    for s, g in zip(sorted(sent), sorted(got)):
+        states = ["idle"]
+        for enter, exit_, l0, l1 in fw:
+            if enter <= g <= exit_:
+                states = ["forward", "launch" if l0 <= g <= l1 else "outside"]
+        for state in states:
+            by.setdefault(state, ([], []))[0].append(s)
+            by[state][1].append(g)
+    out["by_state"] = {k: _hop(*v, k, alone=False) for k, v in sorted(by.items())}
+    out["steps"] = f"sha256:{hashlib.sha256(steps_data).hexdigest()}"
+    return out
+
+
 if __name__ == "__main__":
     verb, stamps, *rest = sys.argv[1:]
     if verb == "serve":
@@ -297,5 +394,7 @@ if __name__ == "__main__":
         print(json.dumps(idle(stamps, *map(float, rest))))
     elif verb == "hops":
         print(json.dumps(hops(stamps, *rest)))
+    elif verb == "pd":
+        print(json.dumps(pd(stamps, *rest)))
     else:
         print(json.dumps(fit(stamps, *map(int, rest))))

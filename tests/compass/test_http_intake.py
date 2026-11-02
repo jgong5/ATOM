@@ -2,6 +2,7 @@
 """The HTTP intake probe: what it stamps on a server it runs, what its fit
 recovers, and the machine specs that state its terms."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -441,3 +442,121 @@ def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
     paths[0].write_text("\n".join(r for r in stamps if " out " not in r) + "\n")
     with pytest.raises(SystemExit, match="output: 0 rows taken in, not the 30 sent"):
         probe.hops(*map(str, paths))
+
+
+def test_serve_stamps_each_kv_write_request_sent_and_received_in_a_spawned_process(
+    tmp_path,
+):
+    server = SERVER | {
+        "kv_transfer/__init__.py": "",
+        "kv_transfer/disaggregation/__init__.py": "",
+        "kv_transfer/disaggregation/mooncake/__init__.py": "",
+        "kv_transfer/disaggregation/mooncake/mooncake_connector.py": """
+import contextlib
+MSG_WRITE_REQUEST, MSG_WRITE_DONE = b"write_request", b"write_done"
+
+class Socket:
+    def __init__(self):
+        self.parts = [[b"id", MSG_WRITE_DONE, b""], [b"id", MSG_WRITE_REQUEST, b""]]
+
+    def recv_multipart(self):
+        return self.parts.pop()
+
+@contextlib.contextmanager
+def zmq_socket_ctx(path, kind, bind=None):
+    yield Socket()
+
+class MooncakeConnector:
+    def _send_on_socket(self, addr, parts, repeat=1):
+        pass
+""",
+        "worker.py": """
+from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+def work():
+    mc.MooncakeConnector()._send_on_socket("tcp://a", [mc.MSG_WRITE_REQUEST, b""])
+    mc.MooncakeConnector()._send_on_socket("tcp://a", [mc.MSG_WRITE_DONE, b""])
+    with mc.zmq_socket_ctx("tcp://*:1", "ROUTER", bind=True) as sock:
+        assert [sock.recv_multipart()[1] for _ in range(2)] == [
+            mc.MSG_WRITE_REQUEST, mc.MSG_WRITE_DONE
+        ]
+""",
+        "entrypoints/openai/api_server.py": """
+import multiprocessing
+from atom.worker import work
+
+if __name__ == "__main__":
+    p = multiprocessing.get_context("spawn").Process(target=work)
+    p.start()
+    p.join()
+    assert p.exitcode == 0
+""",
+    }
+    for name, text in server.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    stamps = tmp_path / "stamps"
+    subprocess.run(
+        [sys.executable, PROBE, "serve", stamps],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path)),
+        check=True,
+    )
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    # Only the write requests; the server process itself sent none.
+    assert [r[2] for r in rows] == ["kvsend", "kvrecv"]
+    assert int(rows[0][3]) <= int(rows[0][0]) <= int(rows[1][0])
+
+
+def test_pd_pairs_each_kv_write_request_with_its_receipt_in_order(tmp_path):
+    sent = [10**12 + k * 10**7 for k in range(10)]
+    # Each received 100 us + 10 us k after its send call started, most before
+    # that call returned.
+    got = [s + 100_000 + 10_000 * k for k, s in enumerate(sent)]
+    rows = [f"{s + 150_000} 1 kvsend {s} 0" for s in sent]
+    rows += [f"{g} 2 kvrecv {g} 0" for g in got] + [f"{sent[0]} 3 send 0 0"]
+    stamps = tmp_path / "stamps"
+    stamps.write_text("\n".join(rows[::-1]) + "\n")
+    hop = probe.pd(str(stamps))["kv_write_req"]
+    assert hop["median_s"] == pytest.approx(145e-6)
+    assert (hop["p10_s"], hop["p90_s"]) == pytest.approx((109e-6, 181e-6))
+    assert hop["messages"] == 10
+    # A write request prefill never received pairs nothing.
+    stamps.write_text("\n".join(r for r in rows if str(got[3]) not in r) + "\n")
+    with pytest.raises(
+        SystemExit, match="kv_write_req: 9 arrivals, not one after each of 10"
+    ):
+        probe.pd(str(stamps))
+
+
+def test_pd_splits_the_hop_by_prefill_s_state_at_each_receipt(tmp_path):
+    ms, base = 10**6, 10**12
+    sent = [base + k * 10 * ms for k in range(6)]
+    # Two receipts between forwards, two inside the forward's launches, two
+    # inside it after them.
+    hops_ns = [400_000, 400_000, 2 * ms, 3 * ms, 100_000, 200_000]
+    rows = [f"{s} 1 kvsend {s} 0" for s in sent]
+    rows += [f"{s + h} 2 kvrecv {s + h} 0" for s, h in zip(sent, hops_ns)]
+    stamps, steps = tmp_path / "stamps", tmp_path / "dp0.jsonl"
+    stamps.write_text("\n".join(rows) + "\n")
+    forwards = [(base - 5 * ms, base - ms, base - 4 * ms), (base + 19 * ms, base + 60 * ms, base + 38 * ms)]  # fmt: skip
+    steps.write_text(
+        "".join(
+            json.dumps({"t_enter_ns": e, "t_exit_ns": x, "t_launch_ns": [e, l]}) + "\n"
+            for e, x, l in forwards
+        )
+    )
+    out = probe.pd(str(stamps), str(steps))
+    by = out["by_state"]
+    assert {k: v["messages"] for k, v in by.items()} == {
+        "forward": 4,
+        "idle": 2,
+        "launch": 2,
+        "outside": 2,
+    }
+    assert by["idle"]["median_s"] == pytest.approx(400e-6)
+    assert by["launch"]["median_s"] == pytest.approx(2.5e-3)
+    assert by["outside"]["median_s"] == pytest.approx(150e-6)
+    assert by["forward"]["p10_s"] == pytest.approx(130e-6)
+    assert out["kv_write_req"]["messages"] == 6
+    assert out["steps"] == "sha256:" + hashlib.sha256(steps.read_bytes()).hexdigest()
