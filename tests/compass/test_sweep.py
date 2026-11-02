@@ -15,6 +15,7 @@ import queue
 import signal
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -93,11 +94,14 @@ def test_rounds_send_only_the_points_still_missing_until_the_cell_is_swept(
     assert missed and all(len(p.rows) > 1 for p in missed)
     (cell,) = (library / sweep.COVERAGE).iterdir()
     assert json.loads(cell.read_text())["swept"] is False
-    # Round 2 sends those alone; queued behind its blockers, each runs as one batch.
+    # Round 2 sends those alone; queued behind its blockers, each runs as one
+    # batch. Each was sent before, so its first blocker spans a budget step for
+    # each request behind it: the held ones, the blocker beside them, the rows.
     sent, missing, engine = _round(tmp_path, monkeypatch, 2, library)
     assert (sent, missing) == (missed, [])
-    rows = [len(b["prompt_token_ids"]) for b in engine.sent]
-    assert rows.count(64) == len(sent)  # one budget blocker a point
+    lengths = Counter(len(b["prompt_token_ids"]) for b in engine.sent)
+    behind = Counter(64 * (p.held + (p.held > 0) + 2) for p in sent)
+    assert lengths & behind == behind
     out = capsys.readouterr().out.splitlines()
     assert out[-1].endswith(f"{len(planned)} in all, 0 missing; swept")
     assert json.loads(cell.read_text())["swept"] is True
@@ -112,6 +116,7 @@ def test_rounds_send_only_the_points_still_missing_until_the_cell_is_swept(
 
 def test_a_points_requests_reuse_its_context_and_queue_behind_its_blockers():
     engine = {"max_num_batched_tokens": 64, "max_model_len": 40}
+    engine |= {"num_kvcache_blocks": 100, "kv_cache_block_size": 16}
     point = sweep_plan.Point(1, ((5, 37),), ("prefix",), 3, {"ignore_eos": True})
     tokens = iter(range(10**6))
     phases = sweep._phases(point, engine, lambda n: list(itertools.islice(tokens, n)))
@@ -124,6 +129,13 @@ def test_a_points_requests_reuse_its_context_and_queue_behind_its_blockers():
     # requests and a budget's rest beside them, then the row on the prefix.
     assert lengths == [[38, 26], [1, 1, 1], [38, 23], [37]]
     assert main[-1][0]["prompt_token_ids"][:32] == shared
+    # Sent again, the first blocker spans a budget step for each of the 5
+    # requests behind it; half the KV pool, 800 tokens, would hold 12.
+    phases = sweep._phases(point, engine, lambda n: [0] * n, resent=True)
+    assert sum(len(b["prompt_token_ids"]) for b in phases[1][0]) == 5 * 64
+    engine["num_kvcache_blocks"] = 10
+    phases = sweep._phases(point, engine, lambda n: [0] * n, resent=True)
+    assert sum(len(b["prompt_token_ids"]) for b in phases[1][0]) == 64
 
 
 STANDIN = """

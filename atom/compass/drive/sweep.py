@@ -22,13 +22,16 @@ the engine's batched-token budget; the held requests, all at once; a second
 blocker filling the budget beside them; and each row. A budget-filling blocker
 has a step to itself, so the held requests, admitted while it runs, are
 prefilled in the step after it, and the rows queue and run as one batch in the
-next. A row on its own prompt's chunks is one prompt, its earlier chunks the
-steps before. The DP ranks are sent in parallel, one point at a time each.
+next. A point sent before and still missing was not all admitted within one
+step: its first blocker spans a budget step for each request behind it, within
+half the KV pool. A row on its own prompt's chunks is one prompt, its earlier
+chunks the steps before. The DP ranks are sent in parallel, one point at a time
+each.
 
 `cover`, once the server has stopped, reads OUT's step record and adds the
 points it covers (`sweep_plan.covered`) to the library's coverage of the cell,
 ``<library>/sweep/<cell>.json``, the cell named by a digest of its planned
-points. The cell is swept when every point is covered. It writes the points
+points, with the points any round has sent. The cell is swept when every point is covered. It writes the points
 still missing to ``OUT/sweep.json`` and prints the counts.
 
 The library is the one ``OUT/server.json`` names, a real server's given
@@ -60,8 +63,8 @@ from atom.compass.parity.traffic import DONE, Traffic, post
 
 #: A library's directory of cell coverage.
 COVERAGE = "sweep"
-#: Written to OUT: the library, the cell, its planned points and, after
-#: `cover`, those still missing.
+#: Written to OUT: the library, the cell, its planned points, those sent and,
+#: after `cover`, those still missing.
 STATE = "sweep.json"
 #: Simulated seconds between two groups' sends on a simulated server.
 EPS = 1e-4
@@ -157,12 +160,13 @@ def send(out, workload: dict, sender=None) -> list[Point]:
         )
         points = plan(out / "steps", workload)
         cell = _cell(points)
-        seen = _seen(library, cell)
+        seen, tried = _seen(library, cell)
         missing = [p for p in points if _key(p) not in seen]
         state = {
             "library": str(library),
             "cell": cell,
             "points": [_entry(p) for p in points],
+            "sent": [_key(p) for p in missing],
         }
         (out / STATE).write_text(json.dumps(state))
         print(
@@ -173,7 +177,7 @@ def send(out, workload: dict, sender=None) -> list[Point]:
         def lane(rank):
             for p in missing:
                 if p.rank == rank:
-                    yield from _phases(p, stated[rank], fresh)
+                    yield from _phases(p, stated[rank], fresh, _key(p) in tried)
 
         lanes = map(lane, sorted({p.rank for p in missing}))
         for phases in itertools.zip_longest(*lanes, fillvalue=[]):
@@ -196,9 +200,19 @@ def cover(out) -> list[Point]:
     hit, _ = covered(points, read(out / "steps"))
     path = Path(state["library"], COVERAGE, f"{state['cell']}.json")
     # ponytail: two covers of one cell at once can lose one's points; the next round sends them again.
-    seen = _seen(state["library"], state["cell"]) | {_key(p) for p in hit}
+    seen, tried = _seen(state["library"], state["cell"])
+    seen |= {_key(p) for p in hit}
     missing = [p for p in points if _key(p) not in seen]
-    _write(path, {"points": len(points), "covered": sorted(seen), "swept": not missing})
+    tried = sorted(tried | set(state["sent"]))
+    _write(
+        path,
+        {
+            "points": len(points),
+            "covered": sorted(seen),
+            "sent": tried,
+            "swept": not missing,
+        },
+    )
     _write(out / STATE, state | {"missing": [_entry(p) for p in missing]})
     print(
         f"sweep: cell {state['cell']}: {len(hit)} of {len(points)} points covered by this record, "
@@ -230,9 +244,13 @@ def _prime(steps: Path, sender, primer) -> None:
         sender.send([[primer(r) for r in range(size)]])
 
 
-def _phases(point: Point, engine: dict, fresh) -> list[list[list[dict]]]:
+def _phases(
+    point: Point, engine: dict, fresh, resent: bool = False
+) -> list[list[list[dict]]]:
     """The point's requests, in groups: those whose KV a row reuses, read to
-    their end first, then the blockers, the held requests and the rows."""
+    their end first, then the blockers, the held requests and the rows. A
+    `resent` point's first blocker spans a budget step for each request behind
+    it, within half the KV pool."""
     body = {**point.body, "stream": True, "data_parallel_rank": point.rank}
 
     def req(ids):
@@ -252,8 +270,11 @@ def _phases(point: Point, engine: dict, fresh) -> list[list[list[dict]]]:
             rows.append([req(fresh(c))])
     budget = engine["max_num_batched_tokens"]
     held = [req(fresh(1)) for _ in range(point.held)]
+    behind = len(held) + bool(held) + len(rows)
+    pool = engine["num_kvcache_blocks"] * engine["kv_cache_block_size"] // 2
+    steps = max(1, min(behind, pool // budget)) if resent else 1
     main = [
-        blockers(budget),
+        blockers(budget * steps),
         held,
         blockers(budget - point.held) if held else [],
         *rows,
@@ -280,9 +301,13 @@ def _cell(points: list[Point]) -> str:
     return hashlib.sha256(planned.encode()).hexdigest()[:16]
 
 
-def _seen(library, cell: str) -> set[str]:
+def _seen(library, cell: str) -> tuple[set[str], set[str]]:
+    """The cell's points the library has seen covered, and those sent."""
     path = Path(library, COVERAGE, f"{cell}.json")
-    return set(json.loads(path.read_text())["covered"]) if path.exists() else set()
+    if not path.exists():
+        return set(), set()
+    coverage = json.loads(path.read_text())
+    return set(coverage["covered"]), set(coverage.get("sent", ()))
 
 
 def _write(path: Path, data: dict) -> None:
