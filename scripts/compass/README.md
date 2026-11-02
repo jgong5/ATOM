@@ -1034,11 +1034,18 @@ row, about 60 s inside the run, and keeps it in the container's aiter tree, whic
 no cache directory above holds. A record names each module its server built, or
 began to, in run.json's `aiter_jit_builds`, and grading, `compass fit steps`,
 `compass fit host`, `step_linear_fit` and `validate.cost` refuse it, naming them.
-So warm a fresh container before its first record: serve the same workload for a
-few minutes on a server whose record nothing reads, `compass record --gpu G --out
-$R/warm -- $ATOM` with `client.sh $R/warm --traces A-B --concurrency <C>
---duration 300 --stop` at the record's traces, and take again any record refused
-for a build.
+So sweep a fresh container before its first record, on a server whose record
+nothing reads: `compass record --gpu G $S --out $R/sweep1 -- $ATOM` with
+`client.sh $R/sweep1 --sweep --traces A-B --stop`, A to B every trace the cell's
+records serve. The sweep (`atom/compass/drive/sweep.py`) sends each DP rank a
+prefill step of every token count up to its budget, each step's rows designed
+(`atom/compass/drive/sweep_plan.py`), and after the stop keeps the points the
+step record covers in the store's JIT cache library, per stack and cell. Each
+round sends only the points still missing; take rounds with a fresh `--out`
+until its last line reads `swept`. A third round's missing points, `missing` in
+its `sweep.json`, are the residual to report with the cell: the sweep never
+constructs preemption, recompute or an error path. Take again any record
+refused for a build.
 
 1. `compass measure memory --gpu G $M $S --out $R/mem -- $ATOM`.
 2. Calibration, alone on the node: per concurrency 1, 4 and 16,

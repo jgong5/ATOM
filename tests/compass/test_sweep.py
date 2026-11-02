@@ -88,6 +88,8 @@ def test_rounds_send_only_the_points_still_missing_until_the_cell_is_swept(
     planned, missed, _ = _round(tmp_path, monkeypatch, 1, library, apart=True)
     assert {how for p in planned for how in p.cached} == {"", "chunk", "prefix", "turn"}
     assert missed == [p for p in planned if len(p.rows) > 1] != []
+    (cell,) = (library / sweep.COVERAGE).iterdir()
+    assert json.loads(cell.read_text())["swept"] is False
     # Round 2 sends those alone; queued behind its blockers, each runs as one batch.
     sent, missing, engine = _round(tmp_path, monkeypatch, 2, library)
     assert (sent, missing) == (missed, [])
@@ -95,7 +97,6 @@ def test_rounds_send_only_the_points_still_missing_until_the_cell_is_swept(
     assert rows.count(64) == len(sent)  # one budget blocker a point
     out = capsys.readouterr().out.splitlines()
     assert out[-1].endswith(f"{len(planned)} in all, 0 missing; swept")
-    (cell,) = (library / sweep.COVERAGE).iterdir()
     assert json.loads(cell.read_text())["swept"] is True
     # A swept cell's round primes the engine file and sends nothing more.
     sent, missing, engine = _round(tmp_path, monkeypatch, 3, library)

@@ -169,8 +169,8 @@ Then offer the full path, or Cleanup.
 QUICKSTART's The path, steps 0 to 6, each a step of its own: announce it from
 QUICKSTART's times and Disk, check the GPU (steps 0 to 3) and the disk, ask,
 run it detached as above, explain it. Use a new cell directory. The smoke
-cell's container and tree may be reused; that container is warm (QUICKSTART's
-step 0), so step 0 may be skipped: say so and let the developer choose. Before
+cell's container and tree may be reused; that container is warm only for the
+smoke cell's traces, so step 0 (QUICKSTART) still runs there. Before
 step 2, wait for the quiet node QUICKSTART's Environment asks for (GPUs are
 shared). Run step 3's two loops at once only on two GPUs that both pass the GPU
 check. Step 5 reads step 4's `LAW` and `HOST`: add them to the variables file
@@ -209,7 +209,7 @@ mean. Design topics are under `atom/compass/design/`; give the one named.
 | After | Open | Explain |
 |---|---|---|
 | memory | `memory/memory_readings.json`; the log's `published ... as <token>` line; `memory/engine.log` | What an engine start reads off the device (`members`: capacity, reserves, activations, the graph pool), taken once so that a simulated run sizes ATOM's own KV pool from them with no device. Its `key` is what it was measured under; the token names it in the store. `03` D14. The engine sees only the GPU `HIP_VISIBLE_DEVICES` names and numbers it 0, so its log's `GPUs 0 to 0` and `cuda:0` are rocm-smi's GPU G. A `memory.cold/` beside it means the first start compiled (inductor autotuned a kernel or missed a graph), so its files moved to `<out>.cold` and it started again on the warmed cache. |
-| warm | `warm/run.json`, `aiter_jit_builds` | The kernels aiter built the first time this container met them. The cost model does not model warmth, so nothing reads this record and grading refuses a record that built one (`06` D27, *Warmup is not a protocol feature*). |
+| sweep | each round's `sweep<k>/sweep.json` (`points`, `missing`) and its last `sweep:` line; `run.json`'s `aiter_jit_builds` | The JIT sweep: one prefill step per token count up to the engine's budget, each step's rows designed, so the server compiles every kernel variant the later records can meet. A round sends only the points the store's library has not seen covered, and the cell is swept when none is missing; the compiled kernels stay in this container and in the library for the next container on the stack. The cost model does not model warmth, so nothing reads these records and grading refuses a record that built one (`06` D27, *Warmup is not a protocol feature*; `07` D106). A third round's `missing` is the residual to report. |
 | a record: calibration, real1, real2 | `run.json`; `steps/dp0.jsonl` and `dp0.engine.json`; `artifacts/client_run.json`; `server.log`; `preflight_*.txt`, `gpu_*.txt` | `run.json`: the tree (`source`), the stack, the device and PTL, the environment, the engine's bounds (`engine`). The step record: one line per forward step, its batch and its times (`atom/compass/parity/__init__.py` says what each field holds); show one prefill and one decode line with their durations. The client run names every request sent. The GPU checks before and after the server: a `preflight_after.txt` that leaves the just-freed GPU out of `idle and empty` while it reads `PREFLIGHT_RC=0` and `gpu_after.txt` lists no PID is normal, its VRAM still being released. `07` D38 |
 | fit_steps | `fit_steps/step_linear_law.json` | The step linear law: per vector, a step cost fitted in relative error on the calibration steps (`09` D53 to D55). `params.unfitted` must be `{}`; `report.vectors` holds the samples behind each. `report.held_out` is empty with one calibration record, which is why the smoke cell's cost rows read unvalidated. |
 | fit_host | `fit_host/host_laws.json` | The CPU time around each step, per step kind, which a simulated server charges on its clock (`09` D54, composed by `01` D4). |
