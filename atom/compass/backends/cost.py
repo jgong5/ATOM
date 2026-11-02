@@ -37,6 +37,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from atom.compass.backends.provenance import Method, Provenance, Refusal
+from atom.compass.backends.shape import BatchView
 
 
 def fold_seconds(values: Iterable[float]) -> float:
@@ -254,13 +255,28 @@ class StepCost:
 
 #: The treatment of a DP dummy forward that replays no graph, priced 0 s.
 EAGER_DP_DUMMY = "eager DP dummy"
+#: The treatment of a DP rank's decode that replays no graph while a peer
+#: prefills, priced 0 s.
+EAGER_DECODE_BESIDE_PREFILL = "eager decode beside prefill"
 
 
-def eager_dp_dummy(source: str) -> StepCost:
-    """0 s: the group's device-end max already carries the peer it waits on."""
-    note = "real DP records give an eager dummy its busiest peer's device time"
+def eager_beside_peer(view: BatchView, source: str) -> StepCost | None:
+    """0 s for a step that replays no graph beside a peer with work, under its
+    treatment: a DP dummy forward, or a decode while a peer prefills. None for
+    any other step. The group's device-end max already carries the peer it
+    waits on."""
+    if view.prefill or view.capture_rung is not None:
+        return None
+    if view.dp_dummy:
+        name, treatment = "dp_dummy", EAGER_DP_DUMMY
+        note = "real DP records give an eager dummy its busiest peer's device time"
+    elif view.group_prefills:
+        name, treatment = "decode_beside_prefill", EAGER_DECODE_BESIDE_PREFILL
+        note = "real DP records give it its prefilling peers' device time"
+    else:
+        return None
     said = Provenance(Method.DECLARED, "0 s", source, note=note)
-    return StepCost([CostTerm("dp_dummy", 0.0, said)], (EAGER_DP_DUMMY,))
+    return StepCost([CostTerm(name, 0.0, said)], (treatment,))
 
 
 #: How a run summary groups seconds: a method each, estimated seconds split

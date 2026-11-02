@@ -43,8 +43,9 @@ Also refused: a step mixing prefill and decode rows, a decode row computing
 a width not the grid's, a count that is not an int, a prefill step that does not
 say whether it produces output, and under a replay bundle a decode step that
 replays no graph, being wider than the widest rung or eager, and a step with
-image tokens. A DP dummy forward (`BatchView.dp_dummy`) that replays no graph
-is, under a replay bundle, `eager_dp_dummy`: 0 s, not refused.
+image tokens. Under a replay bundle, a DP dummy forward (`BatchView.dp_dummy`)
+and a decode while a peer prefills (`BatchView.group_prefills`) that replay no
+graph cost 0 s, each under its treatment (`eager_beside_peer`), not refused.
 
 The answer is the lookup times the residual's factor for the batch's ordered
 rows (`step_grid_residual.py`), which the residual may refuse, and which
@@ -101,7 +102,7 @@ from typing import TYPE_CHECKING
 
 from atom.compass.backends import provenance
 from atom.compass.backends.base import CostBackend, Granularity
-from atom.compass.backends.cost import CostTerm, StepCost, eager_dp_dummy
+from atom.compass.backends.cost import CostTerm, StepCost, eager_beside_peer
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import (
@@ -532,9 +533,10 @@ class StepGridBackend(CostBackend):
         view = batch_view
         if view.image_tokens:
             raise _refused(view, IMAGES)
-        eager = not view.prefill and view.capture_rung is None
-        if eager and view.dp_dummy and self.grid.graph_mode != "eager":
-            return eager_dp_dummy(SOURCE)
+        if self.grid.graph_mode != "eager":
+            beside = eager_beside_peer(view, SOURCE)
+            if beside is not None:
+                return beside
         target = _term("forward", self.grid, self.residual, view)
         drafts = [_term("draft", *self.drafter, view)] if self.drafter else []
         return StepCost([target], draft_terms=drafts)
