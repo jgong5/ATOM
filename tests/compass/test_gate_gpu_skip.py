@@ -19,18 +19,15 @@ from test_gate_gpu_verdict_through_pipe import (
     EXPECT,
     GATE,
     KNOWN,
+    KNOWN_TXT,
     _preflight,
     _suite,
+    _torch,
 )
 
 REPO = Path(__file__).resolve().parents[2]
 
 pytestmark = pytest.mark.skipif(BASH is None, reason="needs bash")
-
-TORCH = (
-    "import os\n__version__ = 1\nclass version:\n    hip = 1\n"
-    "class cuda:\n    get_device_name = staticmethod(lambda i: os.environ['CARD'])\n"
-)
 
 
 def _run(tmp_path, card):
@@ -43,10 +40,10 @@ def _run(tmp_path, card):
     )
     files = {
         "scripts/compass/preflight.sh": _preflight(0),
-        "scripts/compass/gpu_gate_known_failures.txt": "\n".join(KNOWN) + "\n",
+        KNOWN_TXT: "\n".join(KNOWN) + "\n",
         "scripts/compass/gpu_gate_skip.txt": "# a comment\nMI308X tests/test_stall.py\n",
         "atom/__init__.py": "",
-        "torch/__init__.py": TORCH,
+        "torch/__init__.py": _torch(),
         "tests/test_suite.py": _suite(EXPECT - 3),
         "tests/test_stall.py": (
             "import pytest\n\n\n@pytest.mark.parametrize('i', range(3))\n"
@@ -61,7 +58,7 @@ def _run(tmp_path, card):
     env = {k: v for k, v in os.environ.items() if not k.startswith("COMPASS_")}
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env["PATH"]
     env["GIT_CEILING_DIRECTORIES"] = str(tmp_path)
-    env["CARD"] = card
+    env["GPU_NAME"] = card
     out = subprocess.run(
         [BASH, "-c", f"{root / GATE} 2>&1"],
         cwd=root,
