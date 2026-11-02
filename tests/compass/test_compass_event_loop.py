@@ -42,6 +42,7 @@ from atom.utils.compass_loop import (
     CompassSelector,
     HttpChannel,
     Station,
+    charge,
     wrap_decode,
     wrap_encode,
 )
@@ -1267,3 +1268,46 @@ def test_an_on_loop_tokenizer_call_places_open_encode_jobs_first(run, caplog, de
     assert seen == pytest.approx({"result": 5e-3, "decode": 5e-3, "timer": 10e-3})
     warned = [r for r in caplog.records if "event-loop charge waits" in r.getMessage()]
     assert len(warned) == (delay_s > 0.1)
+
+
+def test_an_off_owner_charge_is_refused_before_it_places_the_loop_s_jobs(run):
+    # Another thread with no job of its own charges while the loop's tokenizer
+    # job is open. It is refused at once: it neither waits for the job nor
+    # places it, so no timer is set off the loop. The loop places it once it runs.
+    _idle_traffic(run)
+    loop = CompassEventLoop()
+    loop.executor.start_run()
+    release, refused, seen = threading.Event(), [], {}
+
+    def do_preprocess():  # a service job, by name
+        release.wait()
+
+    job = loop.executor.submit(do_preprocess)
+
+    def off_owner():
+        try:
+            charge(0.1)
+        except RuntimeError as e:
+            refused.append(str(e))
+
+    thread = threading.Thread(target=off_owner, name="EngineCoreOutputThread-DP0")
+    thread.start()
+    thread.join(5)
+    seen["waited"] = thread.is_alive()
+    release.set()
+    thread.join(5)
+    loop.executor.serial.submit(lambda: None).result(5)  # the job's thread is done
+    station = loop.executor.station
+    seen["placed"], seen["timers"] = station.final, len(loop._scheduled)
+    seen["left_for_the_loop"] = not loop.executor.done.empty()
+    loop.run_forever()
+    loop.close()
+    assert seen == {
+        "waited": False,
+        "placed": 0,
+        "timers": 0,
+        "left_for_the_loop": True,
+    }
+    assert "only the clock owner" in refused[0]
+    assert run.rt.refusals == ["clock:advance_to from EngineCoreOutputThread-DP0"]
+    assert station.final == 1 and job.done() and run.rt.now == INF
