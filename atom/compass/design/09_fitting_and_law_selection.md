@@ -191,7 +191,11 @@ when the device ran further behind, after a long prefill or a middle chunk
 the power-of-two lag that prices the labels best, `near_propose` below it, when that
 cuts their mean log error by a tenth, over at least `PROPOSE_SPLIT_STEPS` labels and
 `PROPOSE_SIDE_STEPS` a side (`step_linear_fit`); a run reads the lag off its host recurrence
-([#2572](https://github.com/jgong5/ATOM/issues/2572)).
+([#2572](https://github.com/jgong5/ATOM/issues/2572)). Below that lag, an output prefill
+of 6144 tokens or more still ran the pass at its far time, in the records of both DSpark
+TP4 cells, with expert parallelism and without; so once the lag split is adopted, the fit
+also bounds `near_propose` at the token count, a power of two or one and a half times one,
+that cuts its error by another tenth ([#2615](https://github.com/jgong5/ATOM/issues/2615)).
 
 **Host laws** price the host segments of `01` D4: `E`, `W_pre`, `W_launch` and
 `W_post`, each linear in `(1, tokens, seqs)`, fitted separately for decode, output
