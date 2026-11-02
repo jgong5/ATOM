@@ -262,6 +262,28 @@ compass_pytest_counts() {
     ERRORS=$(grep -oE '[0-9]+ errors?' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
 }
 
+# compass_gpu_arch CARD: the GPU target of HIP ordinal CARD as torch reads it
+# (gfx942, gfx950), or nothing. The GPU gate keeps one baseline per target.
+compass_gpu_arch() {
+    HIP_VISIBLE_DEVICES=$1 python -c 'import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])' 2>/dev/null
+}
+
+# compass_gpu_skips DEVICE: sets SKIP_ARGS to an --ignore for each file
+# gpu_gate_skip.txt leaves out on DEVICE, torch's name for the first card, and
+# SKIP_N to the tests those files collect, run from the tree being measured. A
+# file it cannot count fails, SKIP_WHY naming it.
+compass_gpu_skips() {
+    local gpu file n
+    SKIP_ARGS=() SKIP_N=0
+    while read -r gpu file; do
+        [[ -n $1 && $1 == *"$gpu"* && -e $file ]] || continue
+        n=$(python -m pytest "$file" --collect-only -q -p no:cacheprovider 2>&1 | sed -nE 's/^([0-9]+) tests? collected.*/\1/p')
+        [ -n "$n" ] || { SKIP_WHY="cannot count the tests of $file, which gpu_gate_skip.txt leaves out on $gpu"; return 1; }
+        printf 'left out on %s: %s (%s tests)\n' "$gpu" "$file" "$n"
+        SKIP_ARGS+=("--ignore=$file") SKIP_N=$((SKIP_N + n))
+    done < <(grep -vE '^[[:space:]]*(#|$)' "$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_skip.txt")
+}
+
 # compass_held_port [N]: the first of N ports in a row (default 1), each one
 # a free TCP port, held until this script exits, so no other process binds it
 # before its server does. A block of more than one is drawn below the

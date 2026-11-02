@@ -24,8 +24,11 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 GATE = "scripts/compass/gate_gpu.sh"
+# The gate reads the pair of the GPU target torch names for the first card.
+PAIR = "scripts/compass/gpu_gate_baselines/gfx950"
+KNOWN_TXT = f"{PAIR}/gpu_gate_known_failures.txt"
+BASELINE = REPO / PAIR / "gpu_gate_baseline.env"
 BASH = shutil.which("bash")
-BASELINE = REPO / "scripts" / "compass" / "gpu_gate_baseline.env"
 BASE = dict(re.findall(r"^(BASE_\w+)=(\S+)$", BASELINE.read_text(), re.MULTILINE))
 KNOWN = [
     f"tests/test_suite.py::test_known[{i}]" for i in range(int(BASE["BASE_FAILED"]))
@@ -42,6 +45,17 @@ def _suite(passing, extra=""):
         "def test_ok(i):\n    pass\n\n\n"
         f"@pytest.mark.parametrize('i', range({len(KNOWN)}))\n"
         "def test_known(i):\n    assert False\n" + extra
+    )
+
+
+def _torch(arch="gfx950"):
+    """A stub torch: its version, the card name in $GPU_NAME, its GPU target."""
+    return (
+        "import os, types\n__version__ = 1\nclass version:\n    hip = 1\n"
+        "class cuda:\n"
+        "    get_device_name = staticmethod(lambda i: os.environ['GPU_NAME'])\n"
+        "    get_device_properties = staticmethod(\n"
+        f"        lambda i: types.SimpleNamespace(gcnArchName='{arch}:sramecc+:xnack-'))\n"
     )
 
 
@@ -84,19 +98,31 @@ CASES = {
     "known-missing": (
         93,
         "known-failures list is missing",
-        {"scripts/compass/gpu_gate_known_failures.txt": None},
+        {KNOWN_TXT: None},
         "",
     ),
     "known-disagrees": (
         93,
         "BASE_FAILED disagrees",
-        {"scripts/compass/gpu_gate_known_failures.txt": ""},
+        {KNOWN_TXT: ""},
         "",
     ),
     "compass-failure": (
         1,
         "first tests/compass/test_c.py::test_c; 2 more",
         {"tests/compass/test_c.py": "def test_c():\n    assert False\n"},
+        "",
+    ),
+    "no-pair": (
+        93,
+        "no baseline for gfx000",
+        {"torch/__init__.py": _torch("gfx000")},
+        "",
+    ),
+    "target-unread": (
+        93,
+        "torch reads no GPU target for card",
+        {"torch/__init__.py": "__version__ = 1\nclass version:\n    hip = 1\n"},
         "",
     ),
     "r-flag": (95, "refused a -r argument", {}, " -rE"),
@@ -125,10 +151,10 @@ def _tree(root, case):
     )
     files = {
         "scripts/compass/preflight.sh": _preflight(0),
-        "scripts/compass/gpu_gate_known_failures.txt": "\n".join(KNOWN) + "\n",
+        KNOWN_TXT: "\n".join(KNOWN) + "\n",
         "atom/__init__.py": "",
-        # The probes only read torch's version; a real import costs 1.6 s a run.
-        "torch/__init__.py": "__version__ = 1\nclass version:\n    hip = 1\n",
+        # The probes read only torch's version and card; a real import costs 1.6 s.
+        "torch/__init__.py": _torch(),
         "tests/test_suite.py": _suite(1),
         **CASES[case][2],
     }
