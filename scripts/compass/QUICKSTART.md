@@ -215,7 +215,11 @@ Times were measured on node 18 for the cell in
 [PR #1336](https://github.com/jgong5/ATOM/pull/1336), at concurrencies 1, 4, 16,
 64 and 256 with a 1800 s benchmark each.
 
-**0. Sweep a fresh container** (GPU, once per container; SWEEP_TIME).
+**0. Sweep a fresh container** (GPU, once per container; not timed on this cell:
+a round sends one prefill step for every token count up to the budget, 16384 here,
+each behind budget-filling steps, so it grows with the budget squared; Qwen3-0.6B
+at a 1024-token budget took 4.5 min a round on one MI308X of node 18, its server
+start included).
 
 ```bash
 for k in 1 2 3; do
