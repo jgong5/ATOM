@@ -111,7 +111,7 @@ def engines(directory) -> dict[int, dict]:
     (first, engine), *rest = stated.items()
     for rank, other in rest:
         keys = (engine.keys() | other.keys()) - {"num_kvcache_blocks"}
-        if differ := sorted(k for k in keys if engine.get(k) != other.get(k)):
+        if differ := [k for k in sorted(keys) if engine.get(k) != other.get(k)]:
             raise ValueError(
                 f"dp{first} and dp{rank} state two engines, which differ on "
                 + ", ".join(differ)
