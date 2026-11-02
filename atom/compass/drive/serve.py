@@ -21,9 +21,10 @@ the directory, so the server's stop removes it (`drop_compiled`).
 The server runs this driver's tree in its own process group, so its engine
 processes stop with it, and writes ``<out>/server.log`` and its step record in
 ``<out>/steps``. Once its ``/health`` first answers, ``<out>/server.json``
-names its URL and process id and, for a simulated server, its clock endpoint
-and run file. SIGINT or SIGTERM to the command, or the server's exit, stops the
-whole group: SIGTERM first, SIGKILL for what is left after `STOP_GRACE_S`.
+names its URL and process id, for a simulated server its clock endpoint and
+run file, and, given an artifact store, the JIT cache library's absolute path.
+SIGINT or SIGTERM to the command, or the server's exit, stops the whole group:
+SIGTERM first, SIGKILL for what is left after `STOP_GRACE_S`.
 A real server's stop, for the GPU check after it, lasts until KFD, which
 frees a process's GPU memory after it exits, lists no process it did not list
 before the server started. Then ``<out>/run.json`` gets the run's identity,
@@ -150,6 +151,8 @@ def serve(
     argv = [*SERVER, *KEEP_ALIVE, *atom_args, "--host", host]
     argv += ["--server-port", str(server_port), "--port", str(engine_port)]
     ready = {"url": f"http://{host}:{server_port}"}
+    if library:
+        ready["library"] = str(library.absolute())
     # Nor can the environment hand the server a run file or a clock.
     env = {**os.environ, **(extra_env or {})}
     env = {k: v for k, v in env.items() if k not in (ENV, CLOCK_ENV)}

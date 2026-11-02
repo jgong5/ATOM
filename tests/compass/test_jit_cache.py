@@ -171,10 +171,10 @@ def test_two_saves_at_once_leave_the_union_of_their_artifacts(tmp_path, monkeypa
 def test_a_record_s_stop_saves_what_it_finished_and_the_next_container_restores_it(
     tmp_path, planted_gpu, monkeypatch  # noqa: F811
 ):
-    """`compass record --store`: the first record's server finishes a Triton
-    key and leaves an aiter module's build locked; a second record in a fresh
-    container of the same stack finds the key in its cache before it serves,
-    and names no build."""
+    """`compass record --store`: the first record's server.json names the
+    library, and its server finishes a Triton key and leaves an aiter module's
+    build locked; a second record in a fresh container of the same stack finds
+    the key in its cache before it serves, and names no build."""
     _caches(tmp_path, monkeypatch)
     triton, jit = tmp_path / "triton", tmp_path / JIT
     built = [triton / "K1" / "k1.hsaco", triton / "K1" / "__grp__k1.json"]
@@ -193,6 +193,8 @@ def test_a_record_s_stop_saves_what_it_finished_and_the_next_container_restores_
     aiter = _git(tmp_path / "aiter", "rev-parse", "--short=9", "HEAD")
     assert library.name.startswith(f"rocm-7.2.4_aiter-{aiter}_rccl-")
     assert library.name.endswith("_gfx942")
+    ready = json.loads((tmp_path / "first" / "server.json").read_text())
+    assert ready["library"] == str(library)
 
     for root in (triton, jit):
         shutil.rmtree(root)
