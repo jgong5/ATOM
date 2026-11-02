@@ -1025,11 +1025,11 @@
    "mechanism_why": "inside a transfer backend the simulator replaces; the simulated connector reproduces its write requests on the scheduler side"
   },
   {
-   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._write_listener::self._send_executor.submit(self._execute_transfer, request_data)::executor_handoff#0",
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._write_listener::self._send_executor.submit(self._serve_write, request_data)::executor_handoff#0",
    "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
    "symbol": "MooncakeConnector._write_listener",
    "call": "self._send_executor.submit",
-   "expr": "self._send_executor.submit(self._execute_transfer, request_data)",
+   "expr": "self._send_executor.submit(self._serve_write, request_data)",
    "shape": "executor_handoff",
    "category": "ignore",
    "peer": "thread",
