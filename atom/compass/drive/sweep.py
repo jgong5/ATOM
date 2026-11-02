@@ -248,7 +248,12 @@ def _phases(point: Point, engine: dict, fresh) -> list[list[list[dict]]]:
             rows.append([req(fresh(c))])
     budget = engine["max_num_batched_tokens"]
     held = [req(fresh(1)) for _ in range(point.held)]
-    main = [blockers(budget), held, blockers(budget - point.held) if held else [], *rows]
+    main = [
+        blockers(budget),
+        held,
+        blockers(budget - point.held) if held else [],
+        *rows,
+    ]
     main = [group for group in main if group]
     return [[first], main] if first else [main]
 

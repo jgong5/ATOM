@@ -8,6 +8,7 @@ command whose server, of two DP ranks, answers each completion at once and
 records no step. Nothing needs a driver.
 """
 
+import itertools
 import json
 import os
 import queue
@@ -35,8 +36,8 @@ WORKLOAD = {"traces": [{"requests": [{"in": 300}]}], "sampling": {"ignore_eos": 
 class Engine:
     """One scheduler and simulated runner, recording in `directory`. A sent
     phase's requests all queue, then the engine steps until every one has
-    ended; with `apart`, each reaches an idle engine, which steps once before
-    the next."""
+    ended; with `apart`, each group reaches an idle engine, which steps once
+    before the next."""
 
     def __init__(self, directory, monkeypatch, apart=False):
         monkeypatch.setenv(ENV, str(directory))
@@ -45,14 +46,15 @@ class Engine:
         self.scheduler, self.runner = Scheduler(config), _Runner(config)
         self.apart, self.sent = apart, []
 
-    def send(self, bodies):
-        for body in bodies:
-            assert body["max_tokens"] == 2 and body["stream"]
-            assert body["data_parallel_rank"] == 0
-            self.sent.append(body)
-            params = SamplingParams(max_tokens=2, ignore_eos=body["ignore_eos"])
-            seq = Sequence(body["prompt_token_ids"], 16, sampling_params=params)
-            self.scheduler.add(seq)
+    def send(self, groups):
+        for group in groups:
+            for body in group:
+                assert body["max_tokens"] == 2 and body["stream"]
+                assert body["data_parallel_rank"] == 0
+                self.sent.append(body)
+                params = SamplingParams(max_tokens=2, ignore_eos=body["ignore_eos"])
+                seq = Sequence(body["prompt_token_ids"], 16, sampling_params=params)
+                self.scheduler.add(seq)
             if self.apart:
                 self._step()
         while self.scheduler.has_unfinished_requests():
@@ -83,11 +85,12 @@ def test_rounds_send_only_the_points_still_missing_until_the_cell_is_swept(
 ):
     monkeypatch.setattr(sweep_plan, "SPACING", 8)
     library = tmp_path / "library"
-    # Round 1's requests each reach an idle engine, so a point of two rows
-    # runs as two steps and is missed.
+    # Round 1's groups each reach an idle engine, so a point of two rows runs
+    # as two steps and is missed.
     planned, missed, _ = _round(tmp_path, monkeypatch, 1, library, apart=True)
     assert {how for p in planned for how in p.cached} == {"", "chunk", "prefix", "turn"}
-    assert missed == [p for p in planned if len(p.rows) > 1] != []
+    # (A two-row point whose rows another point's held requests ran is not.)
+    assert missed and all(len(p.rows) > 1 for p in missed)
     (cell,) = (library / sweep.COVERAGE).iterdir()
     assert json.loads(cell.read_text())["swept"] is False
     # Round 2 sends those alone; queued behind its blockers, each runs as one batch.
@@ -111,16 +114,16 @@ def test_a_points_requests_reuse_its_context_and_queue_behind_its_blockers():
     engine = {"max_num_batched_tokens": 64, "max_model_len": 40}
     point = sweep_plan.Point(1, ((5, 37),), ("prefix",), 3, {"ignore_eos": True})
     tokens = iter(range(10**6))
-    first, main = sweep._phases(
-        point, engine, lambda n: [next(tokens) for _ in range(n)]
-    )
+    phases = sweep._phases(point, engine, lambda n: list(itertools.islice(tokens, n)))
+    (first,), main = phases
     (shared,) = [b["prompt_token_ids"] for b in first]
-    assert len(shared) == 32 and {b["data_parallel_rank"] for b in first + main} == {1}
-    lengths = [len(b["prompt_token_ids"]) for b in main]
+    assert len(shared) == 32
+    assert {b["data_parallel_rank"] for p in phases for g in p for b in g} == {1}
+    lengths = [[len(b["prompt_token_ids"]) for b in group] for group in main]
     # Blockers no longer than the model takes fill the budget, then the held
     # requests and a budget's rest beside them, then the row on the prefix.
-    assert lengths == [38, 26, 1, 1, 1, 38, 23, 37]
-    assert main[-1]["prompt_token_ids"][:32] == shared
+    assert lengths == [[38, 26], [1, 1, 1], [38, 23], [37]]
+    assert main[-1][0]["prompt_token_ids"][:32] == shared
 
 
 STANDIN = """
@@ -224,9 +227,12 @@ def test_client_sh_sweeps_a_cell_and_after_the_stop_keeps_its_coverage(tmp_path)
         "0 of 16 points covered by this record, 0 in all, 16 missing; not swept"
     )
     # The ranks are sent in parallel, a point of each at a time: count 1's
-    # blocker and row, then each rank's count 2.
-    ranks = [b["data_parallel_rank"] for b in bodies]
-    assert ranks[:4] == [0, 0, 1, 1] and ranks.count(1) == len(ranks) / 2
+    # blockers, then its rows.
+    sent = [(b["data_parallel_rank"], len(b["prompt_token_ids"])) for b in bodies]
+    assert sorted(sent[:2]) == [(0, 8), (1, 8)] and sorted(sent[2:4]) == [
+        (0, 1),
+        (1, 1),
+    ]
     assert {b["ignore_eos"] for b in bodies} == {True}
     assert (out / "run.json").exists()
     # Marked covered, the cell is swept, and its next sweep sends nothing.
