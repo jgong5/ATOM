@@ -1,0 +1,145 @@
+# SPDX-License-Identifier: MIT
+"""A simulated run's workers sleep between their engine's calls, and take each.
+
+The ring is aiter's own, written by `RingingQueue` and read by the reader that
+`MessageQueue.create_from_handle` opens, as a worker's is; the loop is ATOM's
+`AsyncIOProc.busy_loop`, run in a thread on a worker given only what it reads.
+The manager is ATOM's `AsyncIOProcManager`, built inside the run's engine
+bootstrap with no worker process started.
+"""
+
+import json
+import queue
+import threading
+import time
+from types import SimpleNamespace
+
+from aiter.dist.shm_broadcast import MessageQueue
+
+from atom.compass import run as compass_run
+from atom.compass.runner.doorbell import RingingQueue, SleepingWorker
+from atom.model_engine import async_proc
+from atom.model_engine.block_table_codec import BlockTableDeltaDecoder
+from atom.utils import clock
+from atom.utils.distributed import utils
+
+IDLE_S = 0.5
+
+
+class Runner:
+    """Takes the calls, noting the worker thread's CPU seconds at each."""
+
+    def __init__(self):
+        self.calls = []
+
+    def record(self, n):
+        self.calls.append((n, time.thread_time()))
+
+    def exit(self):
+        pass
+
+
+def _start():
+    """A one-reader ring's writer, and its worker looping in a thread."""
+    writer = RingingQueue(1, 1, max_chunk_bytes=1 << 16)
+    worker = object.__new__(SleepingWorker)
+    worker.label, worker.runners, worker.io_threads = "worker", [Runner()], []
+    worker.rpc_broadcast_mq = MessageQueue.create_from_handle(writer.export_handle(), 0)
+    worker._block_table_decoder = BlockTableDeltaDecoder()
+    worker.io_addrs, worker.io_queues = (None, None), (queue.Queue(), queue.Queue())
+    worker.kv_queue = worker.rpc_queue = worker.all_ranks_barrier = None
+
+    def loop():
+        try:
+            worker.busy_loop()
+        except TypeError:  # the ring `exit` closed, as it ends a spin
+            pass
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return writer, worker, thread
+
+
+def _close(writer, worker):
+    worker.doorbell.socket.close()
+    worker.rpc_broadcast_mq.close()
+    writer.close()
+
+
+def test_a_worker_sleeps_between_calls_and_takes_each_in_order():
+    writer, worker, thread = _start()
+    writer.enqueue(("record", 0))
+    time.sleep(IDLE_S)  # the worker waits for its next call
+    writer.enqueue(("record", 1))
+    writer.enqueue(("exit",))
+    thread.join(10)
+    (first, before), (second, after) = worker.runners[0].calls
+    assert (first, second, thread.is_alive()) == (0, 1, False)
+    assert after - before < IDLE_S / 10, f"waiting took {after - before:.3f} CPU s"
+    _close(writer, worker)
+
+
+def test_a_worker_sigtermed_while_it_sleeps_leaves_its_loop():
+    writer, worker, thread = _start()
+    writer.enqueue(("record", 0))
+    for _ in range(500):
+        if worker.runners[0].calls:
+            break
+        time.sleep(0.01)
+    time.sleep(0.2)  # asleep on its doorbell again
+    worker.exit()  # what its SIGTERM handler runs
+    thread.join(10)
+    alive = thread.is_alive()
+    writer.enqueue(("exit",))  # a worker still asleep wakes to the closed ring
+    thread.join(10)
+    _close(writer, worker)
+    assert not alive
+
+
+def test_an_engine_built_in_a_simulated_run_rings_workers_that_sleep(
+    monkeypatch, tmp_path
+):
+    run = {
+        "admission_path": "serving",
+        "ipc_s": 2.0**-10,
+        "stream_s": 2.0**-9,
+        "bound_s": 100.0,
+        "clock_endpoint": f"inproc:{tmp_path}",
+        "out_dir": str(tmp_path),
+    }
+    (tmp_path / "run.json").write_text(json.dumps(run))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    for module, name in [(clock, "_installed"), (utils, "LP_OF_RANK")]:
+        monkeypatch.setattr(module, name, None, raising=False)
+    monkeypatch.setattr(compass_run, "_member", None)
+    monkeypatch.setattr(compass_run, "connect", lambda lp, endpoint, member: None)
+    # ATOM's manager constructor, with no worker process, socket thread or signal.
+    targets = []
+    process = SimpleNamespace(start=lambda: None)
+    ctx = SimpleNamespace(
+        Barrier=lambda n: None,
+        Process=lambda target, **kw: targets.append(target) or process,
+    )
+    monkeypatch.setattr(async_proc, "get_mp_context", lambda: ctx)
+    monkeypatch.setattr(async_proc, "init_exit_handler", lambda self: None)
+    for name in (
+        "process_output_sockets",
+        "process_kv_output_sockets",
+        "process_rpc_output_sockets",
+        "monitor_procs",
+    ):
+        monkeypatch.setattr(async_proc.AsyncIOProcManager, name, lambda *args: None)
+    rank = SimpleNamespace(data_parallel_size=1, data_parallel_rank=0)
+    config = SimpleNamespace(parallel_config=rank, kv_transfer_config={})
+    with compass_run.engine(config):
+        manager = async_proc.AsyncIOProcManager(None, 2, "workers.Runner")
+    ring = manager.rpc_broadcast_mq
+    try:
+        assert (type(ring), len(ring.ringers)) == (RingingQueue, 2)
+        assert targets == [SleepingWorker, SleepingWorker]
+        # Outside the engine's construction, a manager built takes ATOM's own.
+        assert async_proc.MessageQueue is MessageQueue
+        assert async_proc.AsyncIOProc is SleepingWorker.__base__
+    finally:
+        ring.close()
+        manager.zmq_ctx.term()

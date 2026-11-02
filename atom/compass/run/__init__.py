@@ -29,7 +29,8 @@ member, the frontend's included, connects to.
   selects the simulated runner.
 - `engine(config)` wraps the engine's construction in its own process the
   same way, and maps every DP rank to the engine LP for the process-group
-  check. The engine ignores SIGTERM from just before it says READY.
+  check. The engine ignores SIGTERM from just before it says READY. The
+  workers it starts sleep between its calls (`atom.compass.runner.doorbell`).
 - `runner(runner, tree)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
@@ -1279,6 +1280,7 @@ def engine(config):
             handoff = record / f"dp{rank}.handoff.jsonl"
             clock.stamp_pulls(pulls, handoff, time.monotonic_ns)
         return contextlib.nullcontext()
+    from atom.compass.runner.doorbell import sleeping_workers
     from atom.utils.distributed import utils
 
     lp, side = ENGINE, _pd_side(config)
@@ -1301,7 +1303,7 @@ def engine(config):
     if _member is not None and _offloads_to_lmcache_mp(config.kv_transfer_config):
         _park_before_dispatch()
     rt = _runtime(lp, run, _member, _PublishedClock)
-    return _ignoring_sigterm_from_ready(_named(_start_on_leaving(rt)))
+    return sleeping_workers(_ignoring_sigterm_from_ready(_named(_start_on_leaving(rt))))
 
 
 @contextlib.contextmanager
