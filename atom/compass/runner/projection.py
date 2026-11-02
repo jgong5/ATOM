@@ -130,10 +130,9 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     Whether the step produces output is `ScheduledBatch.produces_output`, and
     the TBO split is the collective's `ub_tokens_across_dp`, this rank's slot
     in it the config's `data_parallel_rank`. A data-parallel rank's
-    `is_dummy_run` batch is its `dp_dummy`, and a step whose ranks run no one
-    height, some rank prefilling, its `group_prefills`. A single rank reads
-    none of the collective's counts, though `decide` returns them for a group
-    of one.
+    `is_dummy_run` batch is its `dp_dummy`, and a step some rank prefills its
+    `group_prefills`. A single rank reads none of the
+    collective's counts, though `decide` returns them for a group of one.
 
     The MoE gather's rows follow `running_tokens_are_unified`, as
     `FusedMoE.forward_impl_graph` does. Every rank decoding, the padded

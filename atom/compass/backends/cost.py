@@ -255,16 +255,14 @@ class StepCost:
 
 #: The treatment of a DP dummy forward that replays no graph, priced 0 s.
 EAGER_DP_DUMMY = "eager DP dummy"
-#: The treatment of a DP rank's decode that replays no graph while a peer
-#: prefills, priced 0 s.
+#: The treatment of a decode that replays no graph while a DP peer prefills, 0 s.
 EAGER_DECODE_BESIDE_PREFILL = "eager decode beside prefill"
 
 
 def eager_beside_peer(view: BatchView, source: str) -> StepCost | None:
-    """0 s for a step that replays no graph beside a peer with work, under its
-    treatment: a DP dummy forward, or a decode while a peer prefills. None for
-    any other step. The group's device-end max already carries the peer it
-    waits on."""
+    """0 s, under its treatment, for a DP dummy forward or a decode while a peer
+    prefills that replays no graph; None for any other step. The group's
+    device-end max already carries the peer it waits on."""
     if view.prefill or view.capture_rung is not None:
         return None
     if view.dp_dummy:
@@ -272,7 +270,7 @@ def eager_beside_peer(view: BatchView, source: str) -> StepCost | None:
         note = "real DP records give an eager dummy its busiest peer's device time"
     elif view.group_prefills:
         name, treatment = "decode_beside_prefill", EAGER_DECODE_BESIDE_PREFILL
-        note = "real DP records give it its prefilling peers' device time"
+        note = "unchecked: ends before its slowest prefilling peer; #2655 removes it"
     else:
         return None
     said = Provenance(Method.DECLARED, "0 s", source, note=note)

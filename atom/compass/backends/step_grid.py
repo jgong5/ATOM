@@ -43,9 +43,8 @@ Also refused: a step mixing prefill and decode rows, a decode row computing
 a width not the grid's, a count that is not an int, a prefill step that does not
 say whether it produces output, and under a replay bundle a decode step that
 replays no graph, being wider than the widest rung or eager, and a step with
-image tokens. Under a replay bundle, a DP dummy forward (`BatchView.dp_dummy`)
-and a decode while a peer prefills (`BatchView.group_prefills`) that replay no
-graph cost 0 s, each under its treatment (`eager_beside_peer`), not refused.
+image tokens. Under a replay bundle, a DP dummy or a decode while a peer prefills
+that replays no graph costs 0 s under its treatment (`eager_beside_peer`).
 
 The answer is the lookup times the residual's factor for the batch's ordered
 rows (`step_grid_residual.py`), which the residual may refuse, and which
@@ -533,10 +532,9 @@ class StepGridBackend(CostBackend):
         view = batch_view
         if view.image_tokens:
             raise _refused(view, IMAGES)
-        if self.grid.graph_mode != "eager":
-            beside = eager_beside_peer(view, SOURCE)
-            if beside is not None:
-                return beside
+        beside = eager_beside_peer(view, SOURCE)
+        if beside is not None and self.grid.graph_mode != "eager":
+            return beside
         target = _term("forward", self.grid, self.residual, view)
         drafts = [_term("draft", *self.drafter, view)] if self.drafter else []
         return StepCost([target], draft_terms=drafts)
