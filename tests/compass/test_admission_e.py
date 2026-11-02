@@ -9,18 +9,24 @@ law and the admissions by `admit`; a run's runner reads them off ATOM's own
 batches and `HostDeviceRecurrence` adds them to `E`.
 """
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from conftest import MockConfig
 from test_dp_step_max import runner
+from test_fit_steps import DIGEST
+from test_memory_readings import META_8B
 from test_parity_recurrence import _labelled, _law, line
+from test_run_step_grid import deployment, publish, run_file
 from test_runner_step_semantics import _drive
 
+from atom.compass import run as compass_run
+from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_labels import Sample
-from atom.compass.backends.step_linear_fit import fit_host
+from atom.compass.backends.step_linear_fit import fit_host, host_held_out
 from atom.compass.backends.step_stub import StepStubBackend
 from atom.compass.parity import recurrence
 from atom.compass.runner import overrides
@@ -88,23 +94,22 @@ def _sample(step, kind, tokens, e, admitted=(0, 0, 0), run="a"):
     return Sample(step, 0, view, 0.01, None, host, False, provenance, admitted=admitted)
 
 
-def _cell(rng, n=80):
+def _cell(rng, n=80, run="a"):
     """Forwards of each kind; a prompt's last chunk and a middle chunk that
     continue a request cost 0.6 ms plus 4 ns a token of `E`, a decode 0.3 ms,
     and a forward that admits a request `ADMIT` on top of its kind's."""
     out = []
     for i in range(n):
-        out.append(_sample(4 * i, "decode", 1, 3e-4 * rng.uniform(0.98, 1.02)))
+        out.append(_sample(4 * i, "decode", 1, 3e-4 * rng.uniform(0.98, 1.02), run=run))
         for j, kind in enumerate(("prefill", "middle")):
             tokens = int(rng.integers(1000, 16000))
             e = (6e-4 + 4e-9 * tokens) * rng.uniform(0.98, 1.02)
-            out.append(_sample(4 * i + 1 + j, kind, tokens, e))
+            out.append(_sample(4 * i + 1 + j, kind, tokens, e, run=run))
         cached, uncached = int(rng.integers(0, 200_000)), int(rng.integers(1000, 16000))
         e = 6e-4 + 4e-9 * uncached + np.dot(ADMIT, (1, uncached, cached))
         a = (1, uncached, cached)
-        out.append(
-            _sample(4 * i + 3, "prefill", uncached, e * rng.uniform(0.98, 1.02), a)
-        )
+        e *= rng.uniform(0.98, 1.02)
+        out.append(_sample(4 * i + 3, "prefill", uncached, e, a, run=run))
     return out
 
 
@@ -124,11 +129,87 @@ def test_a_kind_s_e_law_prices_the_forwards_that_admit_nothing_and_admit_the_res
     assert "admit" not in report["unfitted"]
 
 
-def test_records_with_no_admitting_forward_say_so_and_fit_no_admission():
-    rng = np.random.default_rng(1)
-    host, report = fit_host([s for s in _cell(rng) if not s.admitted[0]])
-    assert "admit" not in host
-    assert report["unfitted"]["admit"] == "0 forwards for 3 coefficients"
+def _first(admitted=(1, 8000, 100_000)):
+    """An output prefill of 8000 tokens admitting a request with 100k cached."""
+    return SimpleNamespace(
+        total_seqs_num_prefill=1,
+        total_tokens_num=8000,
+        total_seqs_num=1,
+        produces_output=lambda: True,
+        compass_admitted=admitted,
+    )
+
+
+@pytest.mark.parametrize("kept", [0, 3])
+def test_too_few_admitting_forwards_fit_no_admit_and_a_run_refuses_them(kept):
+    """A fit's kind `E` laws leave the admitting forwards out whether or not
+    `admit` fits, so with no `admit` a run refuses those forwards by name
+    rather than charge their admissions nothing."""
+    cell = _cell(np.random.default_rng(1))
+    admitting = [s for s in cell if s.admitted[0]][:kept]
+    host, report = fit_host([s for s in cell if not s.admitted[0]] + admitting)
+    assert host["admit"] is None
+    assert report["unfitted"]["admit"] == f"{kept} forwards for 3 coefficients"
+
+    run = HostDeviceRecurrence(host["laws"], (), lambda: 0.0, admit=host["admit"])
+    with pytest.raises(CostRefused, match="no law for admit"):
+        run.charge(_first(), 0.01, 0.0)
+    assert run.charge(_first((0, 0, 0)), 0.01, 0.0) > 0
+
+
+def test_a_run_file_s_host_entry_without_admit_charges_admissions_in_e(
+    tmp_path, monkeypatch
+):
+    """An entry fitted before `admit` existed holds the admissions in its `E`
+    laws: a run charges an admitting forward that `E` and refuses nothing. One
+    whose `admit` is null refuses it."""
+    r = deployment(tmp_path)
+    publish(tmp_path, r)
+    laws = {k: {g: [1e-4, 0, 0] for g in HOST_SEGMENTS} for k in FORWARD_KINDS}
+    key = {**compass_run.host_key(r.config), "machine_spec": DIGEST}
+    for admit in ("absent", None):
+        host = {"key": key, "laws": laws} | (
+            {} if admit == "absent" else {"admit": None}
+        )
+        run_file(tmp_path, monkeypatch, host=host)
+        monkeypatch.setenv(compass_run.NOW_ENV, str(tmp_path / "now.bin"))
+        compass_run._PublishedClock(
+            compass_run.ENGINE,
+            compass_run.channel_table(json.loads((tmp_path / "run.json").read_text())),
+            None,
+        )
+        compass_run.runner(r, META_8B)
+        if admit == "absent":
+            r.compass_host.charge(_first(), 0.01, 0.0)
+            assert r.compass_host.segments["E"] == pytest.approx(1e-4)
+        else:
+            with pytest.raises(CostRefused, match="no law for admit"):
+                r.compass_host.charge(_first(), 0.01, 0.0)
+
+
+def test_the_held_out_report_prices_an_admitting_forward_s_e_with_admit():
+    rng = np.random.default_rng(7)
+    errors = host_held_out(_cell(rng) + _cell(rng, run="b"))
+    assert len(errors["host admit E"]) == 160
+    assert np.median(np.abs(errors["host admit E"])) < 0.02
+
+
+def test_a_request_first_seen_on_a_decode_row_is_not_admitted():
+    """A decode instance's request arrives with its KV: its first row decodes,
+    and no admission of its prompt runs there or later."""
+
+    def batch(rid, prefill):
+        return SimpleNamespace(
+            req_ids=[rid],
+            block_tables=[[1, 2, 3]],
+            num_cached_tokens=[0],
+            total_seqs_num_prefill=int(prefill),
+        )
+
+    seen = set()
+    assert overrides.admitted(batch(5, False), seen, 16) == (0, 0, 0)
+    assert overrides.admitted(batch(5, True), seen, 16) == (0, 0, 0)
+    assert overrides.admitted(batch(6, True), seen, 16) == (1, 48, 0)
 
 
 #: The pricing `NonAllocatingRunner.forward` calls; `Priced` stands in for it.

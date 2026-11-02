@@ -279,6 +279,9 @@ OUT_SEGMENT = "E_out"
 #: Every segment a law may price.
 SEGMENTS = (*HOST_SEGMENTS, MTP_SEGMENT, MTP_COPY, PP_RECV_SEGMENT, OUT_SEGMENT)
 FORWARD_KINDS = ("decode", "prefill", "middle")
+#: `admit` for a host entry fitted before admissions were priced apart, whose
+#: `E` laws hold them: they cost nothing on top.
+ADMISSION_IN_E = (0.0, 0.0, 0.0)
 #: The format of a simulated run's `dp<r>.cost.jsonl`, its first line.
 COST_TABLE_VERSION = 1
 
@@ -333,11 +336,19 @@ class HostDeviceRecurrence:
     `segments` holds the seconds the last `charge` charged each segment, 0 for
     one in `skip`. `admit`, coefficients on a batch's `compass_admitted`
     (`admitted`), adds what its admissions cost to its `E`, except on a
-    pipeline stage that receives its input; with none, they cost nothing.
+    pipeline stage that receives its input; None, a fit that priced them apart
+    and fitted no law for them, and `device_end` refuses a forward that admits.
     """
 
     def __init__(
-        self, laws: dict, skip, now, stage=None, mtp=False, sync=False, admit=None
+        self,
+        laws: dict,
+        skip,
+        now,
+        stage=None,
+        mtp=False,
+        sync=False,
+        admit=ADMISSION_IN_E,
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
         self.admit = admit
@@ -368,7 +379,8 @@ class HostDeviceRecurrence:
         of `now`; its launch posts the receive after `PP_RECV_SEGMENT` and
         runs the rest once `meta` is in. With any
         laws and `refuse`, a forward whose kind lacks one for a segment it runs
-        is refused, naming each ``<kind>.<segment>``, the state as it was;
+        is refused, naming each ``<kind>.<segment>``, the state as it was, as
+        is one that admits a request with `admit` None, naming ``admit``;
         without `refuse` that segment is 0. A segment in `skip` needs none, a
         middle chunk runs no `W_post`, and only an output forward under `mtp`
         runs `MTP_SEGMENT`, and on a single stage `MTP_COPY`; a stage after the
@@ -383,11 +395,14 @@ class HostDeviceRecurrence:
         ran += (PP_RECV_SEGMENT,) if self.recv else ()
         out = any(OUT_SEGMENT in v for v in self.laws.values())
         ran += (OUT_SEGMENT,) if out else ()
-        missing = [s for s in ran if s not in {*law, *self.skip}]
+        missing = [f"{kind}.{s}" for s in ran if s not in {*law, *self.skip}]
+        a = getattr(batch, "compass_admitted", None)
+        if self.admit is None and a and a[0] and not self.recv and "E" not in self.skip:
+            missing.append("admit")
         if refuse and self.laws and missing:
             from atom.compass.backends.resolver import CostRefused, Refusal
 
-            named = ", ".join(f"{kind}.{s}" for s in missing)
+            named = ", ".join(missing)
             raise CostRefused(kind, [Refusal("host", f"no law for {named}")])
         now = self.now()
         called, meta = getattr(batch, "compass_pp_host", (now, -math.inf))
@@ -1606,8 +1621,9 @@ def _group_step_seconds(
     In a run, `compass_host` composes the price, the target's device seconds
     and then the draft's (`StepCost.target_seconds`, `draft_seconds`), with
     host time; a `HostDeviceRecurrence` gives the view its `start_lag_s` and,
-    with an admission law, reads the batch's `compass_admitted`, set here
-    first (`admitted`, over the requests this runner has seen).
+    unless its `admit` is `ADMISSION_IN_E`, reads the batch's
+    `compass_admitted`, set here first (`admitted`, over the requests this
+    runner has seen).
     Under DP, a `HostDeviceRecurrence`'s device end, and its output mark
     (the device end, or under MTP the target end), are first replaced by
     the group's latest, an `all_reduce(MAX)` standing in
@@ -1671,7 +1687,7 @@ def _group_step_seconds(
     spec = getattr(runner.config, "speculative_config", None)
     terms, refused = (), None
     host = getattr(runner, "compass_host", None)
-    if isinstance(host, HostDeviceRecurrence) and host.admit:
+    if isinstance(host, HostDeviceRecurrence) and host.admit != ADMISSION_IN_E:
         # A block-table entry holds a block's tokens on each DCP rank.
         entry = _config_field(runner, "kv_cache_block_size") * _config_field(
             runner, "decode_context_parallel_size"

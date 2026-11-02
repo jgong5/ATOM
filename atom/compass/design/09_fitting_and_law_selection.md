@@ -219,8 +219,10 @@ and their prompt tokens past the hit and within it, prices what those forwards' 
 spends beyond their kind's law, pooled over every kind: one scheduler admits for all
 of them. On the DeepSeek-V4.1-Flash DSpark TP4 records the admission ran about 26 ns a
 token past the hit and 10 ns a token within it, all of it `schedule()`'s CPU time
-([#2620](https://github.com/jgong5/ATOM/issues/2620)). A host law entry with no
-`admit` charges admissions nothing.
+([#2620](https://github.com/jgong5/ATOM/issues/2620)). Records with too few such
+forwards fit no `admit`, and a run refuses a forward that admits a request; an
+entry fitted before `admit` existed, whose `E` laws hold the admissions, charges
+none apart.
 They use the step linear law's solver: D53's relative error and MAD drops, D57's report, D58's hull. An
 `E` sample whose gap spans an idle engine is cut as idle and counted apart.
 An output prefill or middle chunk the host did not pace whose launch ends after its device

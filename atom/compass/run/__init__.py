@@ -97,8 +97,11 @@ on ``(1, tokens, seqs)``; with any laws, a forward whose kind has none for a
 segment it runs and ``skip`` does not name is refused, that segment costing 0 s
 (`HostDeviceRecurrence.device_end`); ``key``, the `host_key` they were
 fitted under and the ``machine_spec`` digest of the spec of the platform they
-were fitted on, which a run with laws must match; ``skip``, segments zeroed for
-a what-if run, which the graders refuse; a list of them as ``step_linear``'s),
+were fitted on, which a run with laws must match; ``admit``, coefficients on
+a forward's admissions, which add to its ``E``, or null to refuse a forward
+that admits a request, and absent from an entry whose ``E`` laws hold them;
+``skip``, segments zeroed for a what-if run, which the graders refuse; a list
+of them as ``step_linear``'s),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
 ``decode/``, ``prefill<k>/`` and ``decode<k>/`` above one of a side, and for a
@@ -403,7 +406,7 @@ def spec() -> dict | None:
 
 def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time."""
-    from atom.compass.runner.overrides import FORWARD_KINDS, SEGMENTS
+    from atom.compass.runner.overrides import ADMISSION_IN_E, FORWARD_KINDS, SEGMENTS
 
     laws = host.get("laws", {})
     if (
@@ -412,13 +415,13 @@ def _check_host(path, host: dict) -> None:
         or set(laws) - set(FORWARD_KINDS)
         or {s for v in laws.values() for s in v} - set(SEGMENTS)
         or {len(c) for v in laws.values() for c in v.values()} - {3}
-        or len(host.get("admit", (0, 0, 0))) != 3
+        or len(host.get("admit") or ADMISSION_IN_E) != 3
     ):
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
-            "admit, three coefficients on a forward's admissions, and key, the "
-            "host key the laws were fitted under"
+            "admit, three coefficients on a forward's admissions or null, and "
+            "key, the host key the laws were fitted under"
         )
 
 
@@ -1414,6 +1417,7 @@ def runner(model_runner, tree) -> None:
     from atom.compass.memory import ModelTerms, device_readings
     from atom.compass.memory.check import record
     from atom.compass.runner.overrides import (
+        ADMISSION_IN_E,
         HostDeviceRecurrence,
         install_cost_backend,
         install_device_readings,
@@ -1626,7 +1630,7 @@ def runner(model_runner, tree) -> None:
             stage,
             mtp=mtp,
             sync=rapid and not config.disagg_is_decode,
-            admit=host.get("admit"),
+            admit=host.get("admit", ADMISSION_IN_E),
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])

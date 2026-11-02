@@ -57,7 +57,8 @@ A forward's `E` that admits requests (`step_labels.admissions`) is left out of
 its kind's law: the law then prices the engine loop alone, and `admit`, seconds
 on `ADMIT_FEATURES`, prices what the forwards of every kind that admit spend
 beyond it, fitted on their `E` with their kind's law as a fixed part. Records
-with no forward to fit it on give none, and the report says why under
+on too few such forwards give `admit` null, so a run refuses a forward that
+admits a request rather than charge it nothing, and the report says why under
 `unfitted`.
 
 Each equation is divided by its own label and the coefficients are bound to be
@@ -332,6 +333,7 @@ def fit_host(samples) -> tuple[dict, dict]:
     try:
         host["admit"], report["admit"] = _host_law(a, labels, ADMIT_FEATURES, base)
     except (ValueError, QhullError) as e:
+        host["admit"] = None  # a run refuses a forward that admits a request
         report["unfitted"]["admit"] = str(e).splitlines()[0]
     return host, report
 

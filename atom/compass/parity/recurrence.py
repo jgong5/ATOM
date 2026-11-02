@@ -62,6 +62,7 @@ from atom.compass.backends.shape import sum_tokens
 from atom.compass.backends.step_linear_fit import WARM_FACTOR
 from atom.compass.parity import ARRIVALS, read
 from atom.compass.runner.overrides import (
+    ADMISSION_IN_E,
     FORWARD_KINDS,
     MTP_COPY,
     HostDeviceRecurrence,
@@ -297,7 +298,7 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     mtp = any("d_target_ns" in s for s in steps)
     clock, exit_, out_s, prev, rows, refused = [0.0], 0.0, 0.0, None, [], {}
     apart, uncharged = {*jit, *(n + 1 for n in jit)}, 0.0
-    admit = law["host"].get("admit")
+    admit = law["host"].get("admit", ADMISSION_IN_E)
     rec = HostDeviceRecurrence({}, (), lambda: clock[0], mtp=mtp, admit=admit)
     kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
     admits = step_labels.admissions(steps)
