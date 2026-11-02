@@ -359,6 +359,19 @@ def intake(
     return fragment("intake", body, "probed", how, subject, date, band)
 
 
+def idle(
+    model: str, date: str, root: str, value: float, band: tuple, record: str
+) -> Fragment:
+    """The idle intake `http_intake.py idle` read over 64 lone requests of
+    `model` at commit `root`, and its band over those requests."""
+    subject = {"model": model, "source_root": f"commit:{root}"}
+    subject["record"] = f"sha256:{record}"
+    body = {"host": {"http_intake": {"idle_s": value}}}
+    band = {"host.http_intake.idle_s": band}
+    how = f"http_intake.py idle over 64 lone requests at {root}"
+    return fragment("idle", body, "probed", how, subject, date, band)
+
+
 def device_fragments() -> list[Fragment]:
     """The fragments the engine start and any other probe filled, and the
     assumed rest."""
@@ -367,13 +380,7 @@ def device_fragments() -> list[Fragment]:
     probes = [fragment("ptl", ptl, "probed", "ptl_enable", date="2026-10-18")]
     probes.append(intake("Qwen/Qwen3.8-27B", *INTAKE))
     if IDLE:
-        date, root, value, band, record = IDLE
-        subject = {"model": "Qwen/Qwen3.8-27B", "source_root": f"commit:{root}"}
-        subject["record"] = f"sha256:{record}"
-        body = {"host": {"http_intake": {"idle_s": value}}}
-        band = {"host.http_intake.idle_s": band}
-        how = f"http_intake.py idle over 64 lone requests at {root}"
-        probes.append(fragment("idle", body, "probed", how, subject, date, band))
+        probes.append(idle("Qwen/Qwen3.8-27B", *IDLE))
     if PP:
         date, root, carriers, band, record = PP
         subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
