@@ -103,10 +103,10 @@ def test_a_stamped_record_is_labelled_by_step_kind(tmp_path, monkeypatch):
     assert set(kinds) == {(False, False), (False, True), (True, True)}
     exposed = [row["step"] for row in table if row["launch_exposed"]]
     assert exposed and all(not samples[n].view.decode for n in exposed)
-    # The second request's first chunk follows the first's last: no request in
-    # common, so its `E` is cut as idle, as the record's first forward has none.
-    assert [s.step for s in samples if s.idle] == [4]
-    assert [s.step for s in samples if "E" not in s.host] == [0, 4]
+    # The second request's first chunk follows the first's last while the first
+    # waits to decode: the engine is busy, so only the first forward has no `E`.
+    assert [s.step for s in samples if s.idle] == []
+    assert [s.step for s in samples if "E" not in s.host] == [0]
 
 
 def test_a_rank_s_moe_rows_ride_in_each_sample_s_view(tmp_path):
