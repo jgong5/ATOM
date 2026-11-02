@@ -198,7 +198,7 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     fell: dict[str, dict] = {}
     warm, priced, extrapolated = [], [], 0
     for group in joined:
-        key, _, seconds, step, _ = next(iter(group.values()))
+        key, _, seconds, step, *_ = next(iter(group.values()))
         try:
             costs = {i: backend.price(views[i][step]) for i in group}
         except CostRefused as refused:

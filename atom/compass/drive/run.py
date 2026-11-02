@@ -2,7 +2,7 @@
 """`compass run`: one simulated instance's server, serving whatever client runs
 reach it until it is stopped, with run.json recording what grading reads.
 
-    compass run <backend> --machine M --store S [--host-laws KEY]
+    compass run <backend> --machine M --store S [--host-laws KEY|LAW]
         [--coverage INPUT...] [--on-refusal mark|abort] [--step-roofline]
         [--acceptance-record RECORD] --out D -- <ATOM args>
 

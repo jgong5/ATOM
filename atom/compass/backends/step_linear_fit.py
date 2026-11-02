@@ -3,7 +3,7 @@
 
 """The step linear law fitted from real step records.
 
-    python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--engine FILE]
+    python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K [--reference LAW]] [--engine FILE]
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
@@ -90,6 +90,13 @@ prefill plus `Sum (N_KV - N_Q)`, the KV a short chunk reads on a deep history;
 `shared`, decode with the context and padding slopes shared by every rung and
 an intercept per rung.
 
+With `moe_routing`, the model's routed experts and top-k (`--moe-routing E,K`),
+the law states `moe_routing` and, outside `shared`, a decode rung may adopt one
+MoE column (`StepLinearLaw`), `moe_tokens` or `moe_experts`, by the rule
+`_moe_column` states, its bar read from the law `--reference LAW` names when
+given; the vector records under `fit.moe_column` the figures the rule read.
+An MTP record's draft law adopts none.
+
 Outside `shared`, a decode rung may adopt a `rowmod(k)` column (`StepLinearLaw`),
 read from its rows in scheduled order, by the rule `_rowmod` states; the
 vector then names `k` and records, under `fit.rowmod`, the MAD without the
@@ -129,9 +136,11 @@ from atom.compass.backends.step_linear import (
     DECODE,
     EAGER,
     HISTORY,
+    MOE_COLUMNS,
     PREFILL,
     PROPOSE,
-    ROWMOD,
+    moe_column,
+    moe_tokens,
     rowmod,
 )
 
@@ -167,16 +176,23 @@ def _rung_key(rung: int | None) -> str:
 
 
 def _features(
-    samples, form: str, dp: int, draft: bool = False, serial: bool = False
+    samples,
+    form: str,
+    dp: int,
+    draft: bool = False,
+    serial: bool = False,
+    routing: tuple[int, int] | None = None,
 ) -> tuple[list[tuple], dict]:
-    """One rank's fittable samples as (vector, features, seconds, step, context),
-    and how many were cut, per reason.
+    """One rank's fittable samples as (vector, features, seconds, step, context,
+    tokens), and how many were cut, per reason.
 
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
     order, plus `history` for that form, above `dp` 1 `moe_rows` on prefill and
     under `serial` `serial_moe_rows`, and under `draft` or on a step with a draft
     label `seqs` and `out` on prefill, as `StepLinearBackend` counts them;
-    `context` is the decode rows' N_KV in scheduled order, empty for prefill.
+    `context` is the decode rows' N_KV in scheduled order, empty for prefill;
+    `tokens` a decode step's real MoE tokens under `routing`, the model's
+    (experts, top-k), which its MoE column reads, else None.
     """
     cut, rows = dict.fromkeys(CUTS, 0), []
     for s in samples:
@@ -184,6 +200,7 @@ def _features(
         if s.cut:
             cut[s.cut] += 1
         else:
+            tokens = None
             if view.prefill:
                 r = view.prefill
                 key = "prefill"
@@ -205,8 +222,13 @@ def _features(
             else:
                 key = _rung_key(view.capture_rung)
                 counts = (1, sum_context(view.decode), view.graph_padding)
+                if routing and (tokens := moe_tokens(view)) is None:
+                    raise ValueError(
+                        f"{s.provenance['run']} step {s.step} has no moe_tokens, "
+                        "which a data-parallel law's MoE column reads"
+                    )
             context = tuple(r.context_tokens for r in view.decode)
-            rows.append((key, counts, s.device_s, s.step, context))
+            rows.append((key, counts, s.device_s, s.step, context, tokens))
     return rows, cut
 
 
@@ -361,10 +383,104 @@ def _solve(x: np.ndarray, y: np.ndarray, names: list[str]) -> dict:
     }
 
 
-def _rowmod(members, rung: int, base: dict, seed: int) -> tuple | None:
+def _folds(design, y, cell, names) -> dict:
+    """Per record of `cell` beside which another holds rows, (its rows, the p50
+    error on them of the solve of `design` on the other records' rows)."""
+    out = {}
+    for c in sorted(set(cell.tolist())):
+        other = cell != c
+        if other.any():
+            coef = _solve(design[other], y[other], names)["coef"]
+            error = design[~other] @ coef / y[~other] - 1.0
+            out[c] = (int((~other).sum()), float(np.median(error)))
+    return out
+
+
+def _floor(members) -> list[float] | None:
+    """The dispersion floor of decode rung `members`, its `fit` rows: the p10
+    and p90 of `median / label - 1` over its steps, each priced at the median
+    label of its record's steps at the same real MoE tokens. A step alone at
+    its record's tokens has no spread to read and is left out."""
+    labels: dict[tuple, list[float]] = {}
+    for r in members:
+        labels.setdefault((r[0], r[6]), []).append(r[3])
+    error = [np.median(v) / y - 1.0 for v in labels.values() if len(v) > 1 for y in v]
+    return np.percentile(error, (10, 90)).tolist() if error else None
+
+
+def _reference_band(reference: dict | None, key: str) -> list[float] | None:
+    """The p10 and p90 of `reference`'s held-out band at decode rung `key`."""
+    vector = (reference or {}).get("decode", {}).get(key) or {}
+    band = vector.get("held_out", {}).get("bands", {}).get(_band(key, None))
+    return band and [band["p10"], band["p90"]]
+
+
+def _moe_column(members, x, names, routing, reference=None) -> tuple:
+    """The MoE column decode rung `members` adopts, or None, and the figures the
+    rule read, as the vector records them under `fit.moe_column`.
+
+    `members` are the rung's `fit` rows, `x` their design over `names`. The
+    forms are no column and each of `MOE_COLUMNS` over the steps' real MoE
+    tokens, `moe_experts` under `routing`. Each form is solved with each record
+    held out of the rung's rows, and its held-out error is the mean over the
+    records of the held-out p50 error's magnitude, weighted by the record's
+    steps. The form of smallest held-out error is picked, no column on a tie;
+    a picked column is adopted unless some record's held-out p50 lies inside
+    the rung's bar without it and outside with it. The bar is the wider, p90
+    less p10, of `reference`, the reference law's held-out p10 and p90 at the
+    rung, and the dispersion floor (`_floor`). Adopted, the column is returned
+    as (feature, column, solve). A rung of one record has no held-out error
+    and adopts none.
+    """
+    cell = np.array([r[0] for r in members])
+    y = np.array([r[3] for r in members])
+    forms = {"none": (x, names)}
+    for feature in MOE_COLUMNS:
+        column = [moe_column(feature, r[6], routing) for r in members]
+        forms[feature] = (np.column_stack([x, column]), [*names, feature])
+    held, error = {}, {}
+    for form, (design, wide) in forms.items():
+        folds = _folds(design, y, cell, wide)
+        held[form] = folds
+        steps = sum(n for n, _ in folds.values())
+        error[form] = (
+            sum(n * abs(p) for n, p in folds.values()) / steps if steps else None
+        )
+    floor = _floor(members)
+    bar = max(filter(None, (reference, floor)), key=lambda b: b[1] - b[0], default=None)
+    picked = min(error, key=error.get) if held["none"] else None
+    left = [
+        c
+        for c, (_, p) in held.get(picked, {}).items()
+        if bar and bar[0] <= held["none"][c][1] <= bar[1] and not bar[0] <= p <= bar[1]
+    ]
+    adopted = None if picked in (None, "none") or left else picked
+    figures = {
+        "picked": picked,
+        "adopted": adopted,
+        "bar": bar,
+        "reference": reference,
+        "floor": floor,
+        "left_bar": [str(c) for c in left],
+        "held_out": {
+            form: {
+                "error": error[form],
+                "folds": {str(c): list(f) for c, f in held[form].items()},
+            }
+            for form in forms
+        },
+    }
+    if adopted is None:
+        return None, figures
+    design, wide = forms[adopted]
+    return (adopted, design[:, -1], _solve(design, y, wide)), figures
+
+
+def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None:
     """The `rowmod(k)` column decode rung `rung` adopts, or None.
 
-    `members` are the rung's `fit` rows, `base` their solve without the column.
+    `members` are the rung's `fit` rows, `x` their design over `names`, `base`
+    its solve without the column.
     `k` runs over the powers of two up to the rung. A `k` qualifies when its
     solve cuts `base`'s scaled MAD by `ROWMOD_GAIN`, the mean MAD of the same
     solve over `ROWMOD_SHUFFLES` shuffles of each step's rows, by `seed`, does not,
@@ -378,32 +494,27 @@ def _rowmod(members, rung: int, base: dict, seed: int) -> tuple | None:
     cells = sorted(set(cell.tolist()))
     if len(cells) < 2 or min((cell == c).sum() for c in cells) < ROWMOD_CELL_STEPS:
         return None
-    x = np.array([r[2] for r in members], dtype=np.float64)
     y = np.array([r[3] for r in members])
     rng = np.random.default_rng(seed)
     shuffles = [
         [rng.permutation(r[5]) for r in members] for _ in range(ROWMOD_SHUFFLES)
     ]
+    wide = [*names, "rowmod"]
 
     def mad(rows, k):
         column = [rowmod(r, k) for r in rows]
-        return _solve(np.column_stack([x, column]), y, list(ROWMOD))["mad"]
+        return _solve(np.column_stack([x, column]), y, wide)["mad"]
 
     def p50(design):
-        names = list(ROWMOD[: design.shape[1]])
-        out = []
-        for c in cells:
-            other = cell != c
-            coef = _solve(design[other], y[other], names)["coef"]
-            out.append(float(np.median(design[~other] @ coef / y[~other] - 1.0)))
-        return out
+        folds = _folds(design, y, cell, wide[: design.shape[1]])
+        return [p for _, p in folds.values()]
 
     without, best, k = p50(x), None, 2
     target = (1.0 - ROWMOD_GAIN) * base["mad"]
     while k <= rung:
         column = np.array([rowmod(r[5], k) for r in members], dtype=np.float64)
         design = np.column_stack([x, column])
-        solved = _solve(design, y, list(ROWMOD))
+        solved = _solve(design, y, wide)
         if solved["mad"] < min(target, best[2]["mad"] if best else target):
             shuffled_mad = float(np.mean([mad(s, k) for s in shuffles]))
             held = p50(design)
@@ -447,15 +558,20 @@ def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
 
 
 def _groups(
-    run, form: str, draft: bool = False, steps=None, serial: bool = False
+    run,
+    form: str,
+    draft: bool = False,
+    steps=None,
+    serial: bool = False,
+    routing: tuple[int, int] | None = None,
 ) -> tuple[list[dict[int, tuple]], dict, list[float]]:
     """One run's steps, each {rank: its `_features` row} labelled with the
     smallest rank label, a rank that ran the step as a dummy forward holding
     none; what was cut; and each step's rank label spread. With `steps`, only
-    the steps numbered in it; `serial` as `_features` reads it."""
+    the steps numbered in it; `serial` and `routing` as `_features` reads them."""
     dummies = [rank[0].dummies for rank in run]
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
-    got = [_features(rank, form, len(run), draft, serial) for rank in run]
+    got = [_features(rank, form, len(run), draft, serial, routing) for rank in run]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
     if len(run) == 1:
         return [{0: r} for r in got[0][0]], cut, []
@@ -523,16 +639,36 @@ def _options(options) -> tuple[str, int]:
     return options["form"], options["dp"]
 
 
+def _routing(options) -> tuple[int, int] | None:
+    """`options`' `moe_routing`, (routed experts, top-k), or None; refused under
+    `shared`, whose decode solve has no MoE column."""
+    routing = (options or {}).get("moe_routing")
+    if routing and _options(options)[0] == "shared":
+        raise ValueError("the shared form fits no MoE column")
+    return tuple(routing) if routing else None
+
+
+def _law_routing(law: dict) -> tuple[int, int] | None:
+    """`law`'s `moe_routing` as (experts, top-k), or None."""
+    routing = law.get("moe_routing")
+    return routing and (routing["experts"], routing["top_k"])
+
+
 def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict, dict]:
     """The law over `samples`, as the mapping `StepLinearLaw` reads, and its report.
 
-    `options` takes `form` (`base` by default) and `dp`, the ranks each run
-    holds (1 by default); `seed` fixes the `rowmod` shuffles; `draft`, or a
+    `options` takes `form` (`base` by default), `dp`, the ranks each run
+    holds (1 by default), `moe_routing`, the model's (routed experts,
+    top-k), under which each decode rung but the draft law's may adopt a MoE
+    column, and `reference`, a law whose held-out bands bar that adoption
+    (`_moe_column`); `seed` fixes the `rowmod` shuffles; `draft`, or a
     sample with a draft label, adds `seqs` and `out` to the prefill vector.
     """
     from scipy.spatial import QhullError
 
     form, dp = _options(options)
+    routing = _routing(options)
+    reference = (options or {}).get("reference")
     serial = _serial(samples, options)
     kvs = [s for s in samples if s.draft_kv_s is not None and not s.view.prefill]
     samples = [
@@ -546,7 +682,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     runs = _runs(samples, dp)
     groups, cut, spread = [], {"warm": 0, "warm_s": 0.0}, []
     for i, run in enumerate(runs.values()):
-        got, c, s = _groups(run, form, draft, serial=serial)
+        got, c, s = _groups(run, form, draft, serial=serial, routing=routing)
         groups += [[(i, *r) for r in g.values()] for g in got]
         spread += s
         for k, v in c.items():
@@ -565,6 +701,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         "unfitted": {},
         "decode": {},
     }
+    if routing:
+        law["moe_routing"] = {"experts": routing[0], "top_k": routing[1]}
     if spread:
         law["spread"] = np.percentile(spread, (50, 90)).tolist()
     keys = sorted(
@@ -593,13 +731,21 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             onehot = [[float(r[1] == k) for k in rungs] for r in members]
             x = np.column_stack([counts[:, 1:], onehot])
         solved = _solve(x, np.array([r[3] for r in members]), names)
-        rowmod_k = None
+        rowmod_k = figures = None
         if key and key.isdigit():
-            chosen = _rowmod(members, int(key), solved, seed)
+            if routing:
+                chosen, figures = _moe_column(
+                    members, counts, names, routing, _reference_band(reference, key)
+                )
+                if chosen:
+                    feature, column, solved = chosen
+                    counts = np.column_stack([counts, column])
+                    names = [*names, feature]
+            chosen = _rowmod(members, counts, int(key), solved, seed, names)
             if chosen:
                 rowmod_k, column, solved, evidence = chosen
                 counts = np.column_stack([counts, column])
-                names = list(ROWMOD)
+                names = [*names, "rowmod"]
         slow = ~solved["keep"] & (solved["residual"] < 0)
         once = solved["residual"] < 1 / WARM_FACTOR - 1
         warm = np.zeros(len(members), dtype=bool)
@@ -644,6 +790,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             }
             if k in alternation:
                 vector["fit"].update(alternation[k])
+            if figures:
+                vector["fit"]["moe_column"] = figures
             if rowmod_k:
                 vector["rowmod"] = rowmod_k
                 vector["fit"]["rowmod"] = evidence
@@ -672,7 +820,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         if s.draft_s is not None and _draft_kv(s) > 0
     ]
     if drafts:
-        law["draft"] = fit(drafts, options, seed, draft=True)[0]
+        unrouted = {**(options or {}), "moe_routing": None}
+        law["draft"] = fit(drafts, unrouted, seed, draft=True)[0]
         if proposes := [
             s if s.draft_kv_s is None else dataclasses.replace(s, propose_s=s.draft_s)
             for s in samples
@@ -776,7 +925,7 @@ def priced_rank(ranks: dict):
 def _held_out(samples, options, seed, warm=None):
     """Each step of each run, warm steps left out, priced as its costliest rank
     by the law fitted on the other runs: (run, vector, band, that rank's (counts,
-    context), relative error), the error nan where that law has no vector."""
+    context, tokens), relative error), the error nan where that law has no vector."""
     form, dp = _options(options)
     options = {**(options or {}), "serial": _serial(samples, options)}
     runs = _runs(samples, dp)
@@ -785,25 +934,30 @@ def _held_out(samples, options, seed, warm=None):
     for i, (run, ranks) in enumerate(runs.items()):
         others = [s for s in samples if s.provenance["run"] != run]
         law = fit(others, options, seed)[0]
-        for group in _groups(ranks, form, serial=options["serial"])[0]:
-            key, _, seconds, step, _ = next(iter(group.values()))
+        routing = _law_routing(law)
+        for group in _groups(
+            ranks, form, serial=options["serial"], routing=_routing(options)
+        )[0]:
+            key, _, seconds, step, *_ = next(iter(group.values()))
             if step in warm[i]:
                 continue
             vector = law["decode"].get(key) if key != "prefill" else law.get(key)
-            mine = [(r[1], r[4]) for r in group.values()]
-            price, error = [c[1] for c, _ in mine], float("nan")
+            mine = [(r[1], r[4], r[5]) for r in group.values()]
+            price, error = [c[1] for c, *_ in mine], float("nan")
             if vector is not None:
                 c = list(vector["coefficients"].values())
-                price = [
-                    float(np.dot(c, x + _rowmod_count(vector, n))) for x, n in mine
-                ]
+                price = [float(np.dot(c, _counts(vector, routing, *m))) for m in mine]
                 error = max(price) / seconds - 1.0
             top = mine[priced_rank({j: (p, mine[j][0]) for j, p in enumerate(price)})]
             yield run, key, _band(key, top[0]), top, error
 
 
-def _rowmod_count(vector: dict, context) -> tuple:
-    return (rowmod(context, vector["rowmod"]),) if "rowmod" in vector else ()
+def _counts(vector: dict, routing, counts, context, tokens) -> tuple:
+    """A step's `counts` with the MoE column and `rowmod` count `vector` adds,
+    over its rows' `context` and its real MoE `tokens`, under `routing`."""
+    moe = [f for f in MOE_COLUMNS if f in vector["coefficients"]]
+    counts = (*counts, *(moe_column(f, tokens, routing) for f in moe))
+    return counts + ((rowmod(context, vector["rowmod"]),) if "rowmod" in vector else ())
 
 
 def held_out(samples, options=None, seed: int = 0) -> dict:
@@ -838,11 +992,12 @@ def mark_held_out(law: dict, report: dict, samples, options=None, seed: int = 0)
     ]
     for run in dict.fromkeys(r[0] for r in rows):
         report["held_out"][run] = _bands([r for r in rows if r[0] == run])
+    routing = _law_routing(law)
     for key, vector in [("prefill", law.get("prefill")), *law["decode"].items()]:
         mine = [r for r in rows if r[1] == key]
         if vector is None or not mine:
             continue
-        points = [r[3][0] + _rowmod_count(vector, r[3][1]) for r in mine]
+        points = [_counts(vector, routing, *r[3]) for r in mine]
         try:
             hull = _hull(
                 np.array(points, dtype=np.float64)[:, 1:],
@@ -922,6 +1077,17 @@ def join_width(engine: dict) -> int:
     return engine["data_parallel_size"]
 
 
+def _routing_arg(value: str) -> tuple[int, int]:
+    """`--moe-routing`'s `E,K`: two positive integers, `K` at most `E`."""
+    try:
+        experts, top_k = map(int, value.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not E,K") from None
+    if not 0 < top_k <= experts:
+        raise argparse.ArgumentTypeError(f"{value!r} routes to {top_k} of {experts}")
+    return experts, top_k
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         prog="python -m atom.compass.backends.step_linear_fit",
@@ -932,6 +1098,19 @@ def main(argv=None) -> None:
         "--out", required=True, help="where the law is written, as JSON"
     )
     parser.add_argument("--form", choices=FORMS, default="base")
+    parser.add_argument(
+        "--moe-routing",
+        metavar="E,K",
+        type=_routing_arg,
+        help="the model's routed experts and top-k: each decode rung may adopt its "
+        "steps' real MoE tokens, or the experts they reach, as a column",
+    )
+    parser.add_argument(
+        "--reference",
+        metavar="LAW",
+        help="a law whose held-out band at each decode rung, with the dispersion "
+        "floor, bars that rung's MoE column",
+    )
     parser.add_argument(
         "--machine-spec",
         required=True,
@@ -960,7 +1139,9 @@ def main(argv=None) -> None:
     else:
         engine = engine_config(args.records)
     dp = join_width(engine)
-    options = {"form": args.form, "dp": dp}
+    options = {"form": args.form, "dp": dp, "moe_routing": args.moe_routing}
+    if args.reference:
+        options["reference"] = json.loads(Path(args.reference).read_text())
     samples, tables = label_records(args.records, dp)
     for record, table in tables.items():
         step_labels.write_table(record, table)
@@ -984,7 +1165,10 @@ def main(argv=None) -> None:
         print(f"host: {json.dumps(law['host']['laws'])} {json.dumps(law['host_fit'])}")
     if len(args.records) > dp:
         for form in FORMS:
-            errors = held_out(samples, {"form": form, "dp": dp})
+            routing = None if form == "shared" else args.moe_routing
+            errors = held_out(
+                samples, {**options, "form": form, "moe_routing": routing}
+            )
             print(f"\nheld out, form {form}\n{_table(errors)}")
         if "host" in law:
             print(f"\nheld out, host laws\n{_table(host_held_out(samples))}")
