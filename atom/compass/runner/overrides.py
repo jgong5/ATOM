@@ -97,6 +97,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import dataclasses
 import json
 import logging
 import math
@@ -375,6 +376,17 @@ class HostDeviceRecurrence:
         self.target_end = max(queued_end, host, release) + device_s
         self._held = now, launch_end, output, post
         return max(self.target_end + draft_s, launch_end)
+
+    def start_lag(self, batch: Any) -> float | None:
+        """`BatchView.start_lag_s` of an output forward on a single stage, as
+        `device_end` and `release` would place it: its device start less the
+        host's return from the previous output forward's wait; else None."""
+        if not batch.produces_output() or self.last is not None or self.sync:
+            return None
+        kind, x = forward_shape(batch)
+        prepared, seg = self.prepare_end(self.now(), kind, x)
+        start = max(self.ends[-1] + getattr(batch, "compass_queued_s", 0.0), prepared)
+        return start - max(prepared + seg["W_launch"], self.output_end)
 
     def prepare_end(self, called: float, kind: str, x: tuple) -> tuple[float, dict]:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
@@ -1557,8 +1569,9 @@ def _group_step_seconds(
 
     In a run, `compass_host` composes the price, the target's device seconds
     and then the draft's (`StepCost.target_seconds`, `draft_seconds`), with
-    host time. Under DP, a `HostDeviceRecurrence`'s device end, and its output
-    mark (the device end, or under MTP the target end), are first replaced by
+    host time; a `HostDeviceRecurrence` gives the view its `start_lag_s`.
+    Under DP, a `HostDeviceRecurrence`'s device end, and its output mark
+    (the device end, or under MTP the target end), are first replaced by
     the group's latest, an `all_reduce(MAX)` standing in
     for a real forward's cross-rank collectives, and every rank leaves at its
     own charge. With no
@@ -1619,8 +1632,12 @@ def _group_step_seconds(
     mix = vars(runner).setdefault("_priced", ProvenanceMix())
     spec = getattr(runner.config, "speculative_config", None)
     terms, refused = (), None
+    host = getattr(runner, "compass_host", None)
     try:
-        cost = backend.price(batch_view(batch, mode, runner))
+        view = batch_view(batch, mode, runner)
+        if isinstance(host, HostDeviceRecurrence):
+            view = dataclasses.replace(view, start_lag_s=host.start_lag(batch))
+        cost = backend.price(view)
         if spec and not cost.draft_terms and EAGER_DP_DUMMY not in cost.treatments:
             name = type(backend).__name__
             raise CostRefused(batch, [Refusal(name, "prices no draft")])
@@ -1635,7 +1652,6 @@ def _group_step_seconds(
         mix.record(cost)
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
         terms = (*cost.terms, *cost.draft_terms)
-    host = getattr(runner, "compass_host", None)
     # `decide` returns the collective's rows for a group of one too.
     many = mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1
     group = dp_group() if many else None
