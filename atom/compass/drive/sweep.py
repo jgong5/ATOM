@@ -17,13 +17,13 @@ A point's requests are completions of fresh token ids, each asking for its
 two output tokens and naming its DP rank, so placement needs no session
 affinity. First, and read to their end, the prompts whose KV a row reuses:
 the shared prefix, or a first turn, which the row's prompt starts with. Then,
-in this order, each admitted before the next is sent: a blocker filling the
-engine's batched-token budget, the held requests, a second blocker filling
-the budget beside them, and the rows. A budget-filling blocker has a step to
-itself, so the held requests are prefilled in the step after it and the rows
-queue and run as one batch in the next. A row on its own prompt's chunks is
-one prompt, its earlier chunks the steps before. The DP ranks are sent in
-parallel, one point at a time each.
+in this order, each group admitted before the next is sent: a blocker filling
+the engine's batched-token budget; the held requests, all at once; a second
+blocker filling the budget beside them; and each row. A budget-filling blocker
+has a step to itself, so the held requests, admitted while it runs, are
+prefilled in the step after it, and the rows queue and run as one batch in the
+next. A row on its own prompt's chunks is one prompt, its earlier chunks the
+steps before. The DP ranks are sent in parallel, one point at a time each.
 
 `cover`, once the server has stopped, reads OUT's step record and adds the
 points it covers (`sweep_plan.covered`) to the library's coverage of the cell,
@@ -33,7 +33,7 @@ still missing to ``OUT/sweep.json`` and prints the counts.
 
 The library is the one ``OUT/server.json`` names, a real server's given
 `--store`. A simulated server's is its run file's store's for this
-container's stack, and its requests are sent on the run's clock, each
+container's stack, and its requests are sent on the run's clock, each group
 `EPS` after the one before, as its traffic LP.
 """
 
@@ -63,7 +63,7 @@ COVERAGE = "sweep"
 #: Written to OUT: the library, the cell, its planned points and, after
 #: `cover`, those still missing.
 STATE = "sweep.json"
-#: Simulated seconds between two requests' sends on a simulated server.
+#: Simulated seconds between two groups' sends on a simulated server.
 EPS = 1e-4
 #: The token ids fresh prompts draw from, clear of every tokenizer's special
 #: tokens at either end.
@@ -71,15 +71,18 @@ TOKENS = range(1000, 20000)
 
 
 class _Wall:
-    """A real server: each request admitted before the next is sent, and every
-    one read to its end."""
+    """A real server: each group's requests sent at once and admitted before
+    the next group is sent, and every one read to its end."""
 
     def __init__(self, port: int) -> None:
         self.port = port
 
-    def send(self, bodies: list[dict]) -> None:
-        with ThreadPoolExecutor(max(1, len(bodies))) as pool:
-            reads = [pool.submit(list, post(self.port, b, {})) for b in bodies]
+    def send(self, groups: list[list[dict]]) -> None:
+        with ThreadPoolExecutor(max(1, 2 * sum(map(len, groups)))) as pool:
+            reads = []
+            for group in groups:
+                heads = [pool.submit(post, self.port, b, {}) for b in group]
+                reads += [pool.submit(list, h.result()) for h in heads]
         for r in reads:
             if DONE not in r.result():
                 raise RuntimeError(f"a sweep request ended before {DONE}")
@@ -89,24 +92,27 @@ class _Wall:
 
 
 class _Clocked(Traffic):
-    """A simulated server's traffic LP: each request sent `EPS` after the one
-    before on the run's clock, and every one read to its end."""
+    """A simulated server's traffic LP: each group sent `EPS` after the one
+    before on the run's clock, and every request read to its end."""
 
     def __init__(self, run: dict, port: int) -> None:
         super().__init__(run, port, [], [])
         self.rt.start_run()
         self.sent = 0
 
-    def send(self, bodies: list[dict]) -> None:
+    def send(self, groups: list[list[dict]]) -> None:
         rt = self.rt
-        for body in bodies:
+        for group in groups:
             at = rt.now + EPS
             while rt.now < at:
                 rt.next_event(at)
                 self._take()
-            stamp = tracestate_with(None, *rt.stamp_send(self.http))
-            threading.Thread(target=self._read, args=(body, stamp), daemon=True).start()
-        self.sent += len(bodies)
+            for body in group:
+                stamp = tracestate_with(None, *rt.stamp_send(self.http))
+                thread = threading.Thread(target=self._read, args=(body, stamp))
+                thread.daemon = True
+                thread.start()
+            self.sent += len(group)
         while self.done < self.sent:
             if rt.next_event(math.inf) == math.inf:
                 raise RuntimeError(
@@ -167,7 +173,8 @@ def send(out, workload: dict, sender=None) -> list[Point]:
 
         lanes = map(lane, sorted({p.rank for p in missing}))
         for phases in itertools.zip_longest(*lanes, fillvalue=[]):
-            sender.send([b for phase in phases for b in phase])
+            groups = itertools.zip_longest(*phases, fillvalue=[])
+            sender.send([[b for group in same for b in group] for same in groups])
     finally:
         sender.close()
     return missing
@@ -216,12 +223,12 @@ def _prime(steps: Path, sender, primer) -> None:
         size = json.loads(files[0].read_text())["data_parallel_size"] if files else 1
         if len(files) >= size:
             return
-        sender.send([primer(r) for r in range(size)])
+        sender.send([[primer(r) for r in range(size)]])
 
 
-def _phases(point: Point, engine: dict, fresh) -> list[list[dict]]:
-    """The point's requests: those whose KV a row reuses, read to their end
-    first, then the blockers, the held requests and the rows."""
+def _phases(point: Point, engine: dict, fresh) -> list[list[list[dict]]]:
+    """The point's requests, in groups: those whose KV a row reuses, read to
+    their end first, then the blockers, the held requests and the rows."""
     body = {**point.body, "stream": True, "data_parallel_rank": point.rank}
 
     def req(ids):
@@ -236,15 +243,14 @@ def _phases(point: Point, engine: dict, fresh) -> list[list[dict]]:
         if how in ("prefix", "turn"):
             before = fresh(c - q)
             first.append(req(before))
-            rows.append(req(before + fresh(q)))
+            rows.append([req(before + fresh(q))])
         else:
-            rows.append(req(fresh(c)))
+            rows.append([req(fresh(c))])
     budget = engine["max_num_batched_tokens"]
     held = [req(fresh(1)) for _ in range(point.held)]
-    main = (
-        blockers(budget) + held + (blockers(budget - point.held) if held else []) + rows
-    )
-    return [first, main] if first else [main]
+    main = [blockers(budget), held, blockers(budget - point.held) if held else [], *rows]
+    main = [group for group in main if group]
+    return [[first], main] if first else [main]
 
 
 def _fresh(rng: random.Random):
