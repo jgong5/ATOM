@@ -75,8 +75,6 @@ def test_each_rank_runs_every_count_once_and_its_compositions_cover_each_axis(
     assert [sum(q for q, _ in p.rows) for p in mine] == list(range(1, 513))
     assert {p.held for p in mine} == set(range(16))
     fresh = [p for p in mine if p.cached == ("",) * len(p.rows)]
-    # The second row's offset, the first row's length, takes every residue.
-    assert {p.rows[0][0] % 16 for p in fresh if p.rows[0][0] <= 16} == set(range(16))
     # Under two-batch overlap every fresh step past one token has a request
     # boundary to split on.
     assert all(len(p.rows) == 2 for p in fresh[1:])
@@ -107,6 +105,19 @@ def test_no_point_leaves_the_engine_or_the_workload(tmp_path):
     assert len(points) == 512
     assert max(c for p in points for _, c in p.rows) == 100
     assert {len(p.rows) for p in points} == set(range(1, 7))
+    # With no two-batch overlap, the second row's offset, the first row's
+    # length, still takes every residue mod 16.
+    firsts = {p.rows[0][0] for p in points if len(p.rows) == 2}
+    assert {q % 16 for q in firsts if q <= 16} == set(range(16))
+    # A prompt leaves room in the context for its two output tokens.
+    _write(tmp_path, engine | {"max_num_seqs": 64, "max_model_len": 50})
+    assert max(c for p in plan(tmp_path, _workload(100)) for _, c in p.rows) == 48
+    # A drafter's tokens take KV blocks too: one block of 16 holds 14 prompt
+    # tokens and the two output tokens, but only 9 with three drafts.
+    one_block = engine | {"num_kvcache_blocks": 1}
+    assert len(plan(_write(tmp_path, one_block), _workload(100))) == 14
+    _write(tmp_path, one_block | {"speculative": ["mtp", 3]})
+    assert len(plan(tmp_path, _workload(100))) == 9
     # Without DP attention a rank's budget is its share of the group's.
     no_dpa = _engine(enable_dp_attention=False)
     assert len(plan(_write(tmp_path, no_dpa, no_dpa), _workload(3000))) == 2 * 256

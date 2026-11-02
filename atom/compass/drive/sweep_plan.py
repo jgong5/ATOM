@@ -26,8 +26,8 @@ gives one forward, and designs each step's composition:
 
 Every request asks for two output tokens, so its decode is reached too, with
 the workload's other sampling arguments copied unchanged. No point is outside
-the engine's bounds (rows within `max_num_seqs`, contexts within
-`max_model_len`, KV blocks within the pool, with a drafter's tokens) or the
+the engine's bounds (rows within `max_num_seqs`, contexts and their output
+tokens within `max_model_len`, KV blocks within the pool, with a drafter's tokens) or the
 workload's (no prompt longer than its longest); a count no composition fits
 has no point. A step-record line covers a point when it is a step of the
 point's rank whose prefill rows are the point's, in batch order.
@@ -80,12 +80,6 @@ class Point:
     cached: tuple[str, ...]
     held: int
     body: dict = field(hash=False)
-
-    @property
-    def tokens(self) -> int:
-        """The prefill tokens the point's requests compute, sent alone: each
-        row's whole context and each held prompt."""
-        return sum(c for _, c in self.rows) + self.held
 
 
 def budget(engine: dict) -> int:
@@ -206,7 +200,7 @@ def plan(engine, workload: dict) -> list[Point]:
     body = {**workload.get("sampling", {}), "max_tokens": OUTPUT_TOKENS}
     points = []
     for rank, e in engines(engine).items():
-        cap = min(e["max_model_len"], top)
+        cap = min(e["max_model_len"] - OUTPUT_TOKENS, top)
         kinds = ("chunk",) if cap > e["max_num_batched_tokens"] else ()
         if e["enable_prefix_caching"]:
             kinds += ("prefix", "turn")
