@@ -333,8 +333,9 @@ def _record(runner):
         record = None
         if directory and runner.rank == 0:
             directory = record_dir(directory, runner.config)
+            from atom.compass.backends.step_grid_plan import UNKEYED
             from atom.compass.backends.step_linear_fit import CONTEXT_PARALLEL
-            from atom.compass.run.step_grid import BOUNDS, keyed
+            from atom.compass.run.step_grid import keyed
 
             pc = runner.config.parallel_config
             pp = runner.config.pipeline_parallel_size > 1
@@ -342,8 +343,7 @@ def _record(runner):
             record = StepRecord(directory, pc.data_parallel_rank, stage)
             # By its first step the runner has resolved its engine.
             engine = keyed(runner.config) | {
-                name: getattr(runner.config, name)
-                for name in (*BOUNDS, "num_kvcache_blocks")
+                name: getattr(runner.config, name) for name in UNKEYED
             }
             for name in CONTEXT_PARALLEL:
                 if (width := getattr(runner.config, name, 1)) > 1:

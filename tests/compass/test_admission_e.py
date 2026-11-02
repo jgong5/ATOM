@@ -9,6 +9,8 @@ law and the admissions by `admit`; a run's runner reads them off ATOM's own
 batches and `HostDeviceRecurrence` adds them to `E`.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from conftest import MockConfig
@@ -234,3 +236,31 @@ def test_the_recurrence_grade_charges_a_busy_admission_and_measures_an_idle_one(
     moved = {k: queued(admitted)[k] - v for k, v in queued(bare).items()}
     assert moved == pytest.approx({2: 0, 3: -2.0, 4: 0})
     assert admitted["kinds"]["idle"] == bare["kinds"]["idle"]
+
+
+def test_an_output_forward_s_device_start_lag_counts_its_admission():
+    """The device runs until 5 ms; a forward called at 0 prepares for its `E`,
+    then launches for 0.5 ms. A 2 ms admission on a 1 ms `E` places it as a
+    3 ms `E` does: its device start lags its host's return by 1.5 ms, not 3.5."""
+    batch = SimpleNamespace(
+        total_seqs_num_prefill=1,
+        total_tokens_num=100,
+        total_seqs_num=1,
+        produces_output=lambda: True,
+        compass_admitted=(1, 0, 0),
+    )
+
+    def lag(e, admit):
+        law = {
+            g: [e * (g == "E") + 5e-4 * (g == "W_launch"), 0, 0] for g in HOST_SEGMENTS
+        }
+        host = HostDeviceRecurrence({"prefill": law}, (), lambda: 0.0, admit=admit)
+        host.ends.append(5e-3)
+        return host.start_lag(batch)
+
+    assert (
+        lag(1e-3, [2e-3, 0, 0])
+        == pytest.approx(lag(3e-3, None))
+        == pytest.approx(1.5e-3)
+    )
+    assert lag(1e-3, None) == pytest.approx(3.5e-3)

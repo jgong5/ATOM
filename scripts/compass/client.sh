@@ -5,6 +5,7 @@
 # with cctraces_sim.sh's arguments over traces A to B, then the run's export.
 #
 # Usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop]
+#        client.sh OUT --sweep --traces A-B --stop
 #   OUT              the server's --out, whose server.json names its URL and,
 #                    for a simulated server, its run file
 #   --traces A-B     TRACES' traces A to B, each counted from 0
@@ -14,6 +15,12 @@
 #   --stop           then SIGTERM the command that started the server, wait
 #                    WAIT_S (default 600) for it to write OUT/run.json and leave,
 #                    and set the export's server_stopped
+#   --sweep          in place of aiperf, send the JIT sweep of the cell the
+#                    server's engine and traces A to B make, then after the
+#                    stop keep the points its record covers in the server's
+#                    JIT cache library (atom/compass/drive/sweep.py); only
+#                    points not yet covered are sent, and the last line says
+#                    whether the cell is swept. Needs TRACES alone
 #   MODEL, TRACES    as cctraces_sim.sh takes them
 #   HARNESS_PYTHON   the Python with agentx-harness, and with compass-harness
 #                    when the server is simulated and only then
@@ -41,12 +48,12 @@
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
-USAGE="usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop]"
+USAGE="usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop] | OUT --sweep --traces A-B --stop"
 bad() { echo "client: $1; $USAGE" >&2; exit 2; }
 fail() { echo "client: $1" >&2; exit 1; }
 ROOT=$(compass_tree_root) || exit $?
 (($#)) && [[ $1 != -* ]] || bad "no OUT"
-OUT=$1 duration=1800 stop=0
+OUT=$1 duration=1800 stop=0 sweep=0
 shift
 while (($#)); do
     case $1 in
@@ -58,12 +65,19 @@ while (($#)); do
     --concurrency) [[ ${2-} =~ ^[1-9][0-9]*$ ]] || bad "--concurrency takes a positive integer"; c=$2; shift ;;
     --duration) [[ ${2-} =~ ^[1-9][0-9]*$ ]] || bad "--duration takes whole seconds"; duration=$2; shift ;;
     --stop) stop=1 ;;
+    --sweep) sweep=1 ;;
     *) bad "unknown argument $1" ;;
     esac
     shift
 done
-[[ -n ${first-} && -n ${c-} ]] || bad "--traces and --concurrency are required"
-for v in MODEL TRACES HARNESS_PYTHON; do [[ -n ${!v-} ]] || bad "$v is not set"; done
+if ((sweep)); then
+    [[ -n ${first-} ]] && ((stop)) || bad "--sweep takes --traces and --stop"
+    need=(TRACES)
+else
+    [[ -n ${first-} && -n ${c-} ]] || bad "--traces and --concurrency are required"
+    need=(MODEL TRACES HARNESS_PYTHON)
+fi
+for v in "${need[@]}"; do [[ -n ${!v-} ]] || bad "$v is not set"; done
 
 [[ -s $OUT/server.json ]] || fail "server: no $OUT/server.json; a compass record or compass run --out $OUT writes it once its server answers"
 OUT=$(realpath "$OUT")
@@ -77,6 +91,34 @@ compass_env "$ROOT"
 export PYTHONPATH=$ROOT:$ROOT/compass_harness
 compass_require_tree "$ROOT" || exit $?
 unset ATOM_COMPASS_RUN ATOM_COMPASS_CLOCK_ENDPOINT
+
+stop_server() {
+    # The command that started the server is its parent.
+    local stat command deadline
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || fail "stop: the server, process $pid, has left"
+    read -r _ command _ <<<"${stat##*\) }"
+    [[ $(tr '\0' ' ' <"/proc/$command/cmdline") == *compass* ]] ||
+        fail "stop: process $command, the server's parent, is no compass command"
+    kill -TERM "$command" || fail "stop: SIGTERM to process $command failed"
+    deadline=$((SECONDS + ${WAIT_S:-600}))
+    # Until it has exited; a zombie has.
+    while stat=$(cat "/proc/$command/stat" 2>/dev/null) && [[ ${stat##*\) } != Z* ]]; do
+        ((SECONDS < deadline)) || fail "stop: the command, process $command, is up ${WAIT_S:-600} s after SIGTERM"
+        sleep 1
+    done
+    [[ -s $OUT/run.json ]] || fail "stop: the command left without writing $OUT/run.json"
+    echo "client: stopped the server; $OUT/run.json written"
+}
+
+if ((sweep)); then
+    traces=$(realpath "$TRACES")
+    (cd / && python3 -m atom.compass.drive.sweep send "$OUT" "$traces" "$first" "$last") ||
+        fail "sweep: atom.compass.drive.sweep send exited $?"
+    stop_server
+    (cd / && python3 -m atom.compass.drive.sweep cover "$OUT") ||
+        fail "sweep: atom.compass.drive.sweep cover exited $?"
+    exit 0
+fi
 # Importing compass_harness also checks the aiperf it would run against.
 harness=$(cd / && "$HARNESS_PYTHON" -c 'import compass_harness; print(compass_harness.__file__)') ||
     fail "harness: $HARNESS_PYTHON cannot import compass_harness"
@@ -154,19 +196,7 @@ Path(out, "artifacts/workload.json").write_text(json.dumps(workload))
 EOF
 
 ((stop)) || exit 0
-# The command that started the server is its parent.
-stat=$(cat "/proc/$pid/stat" 2>/dev/null) || fail "stop: the server, process $pid, has left"
-read -r _ command _ <<<"${stat##*\) }"
-[[ $(tr '\0' ' ' <"/proc/$command/cmdline") == *compass* ]] ||
-    fail "stop: process $command, the server's parent, is no compass command"
-kill -TERM "$command" || fail "stop: SIGTERM to process $command failed"
-deadline=$((SECONDS + ${WAIT_S:-600}))
-# Until it has exited; a zombie has.
-while stat=$(cat "/proc/$command/stat" 2>/dev/null) && [[ ${stat##*\) } != Z* ]]; do
-    ((SECONDS < deadline)) || fail "stop: the command, process $command, is up ${WAIT_S:-600} s after SIGTERM"
-    sleep 1
-done
-[[ -s $OUT/run.json ]] || fail "stop: the command left without writing $OUT/run.json"
+stop_server
 # No later client run reached the server: whole grading takes the steps after
 # this one's own, of requests aiperf cancelled at its cutoff and recorded nothing of.
 python3 - "$OUT/artifacts/client_run.json" <<'EOF' || fail "stop: cannot mark $OUT/artifacts/client_run.json"
@@ -177,4 +207,3 @@ path = Path(sys.argv[1])
 export = json.loads(path.read_text()) | {"server_stopped": True}
 path.write_text(json.dumps(export, sort_keys=True))
 EOF
-echo "client: stopped the server; $OUT/run.json written"

@@ -10,7 +10,8 @@ mi355-gpu-40's, under rocm/atom-dev nightly 20261026's stack, the first that
 starts DeepSeek-V4.1-Flash.
 The device fragment is one DeepSeek-V4-Pro start at the nightly DPA-TP8 prefill
 side's arguments (`FLAGS`): the device, its capacity and the stack. One real
-burst at the same arguments adds the HTTP intake terms (`INTAKE`), and
+burst at the same arguments adds the HTTP intake terms (`INTAKE`), on gpu-40
+lone requests to a DeepSeek-V4.1-Flash server the idle intake (`IDLE`), and
 `probe_device.py`'s readings (`PEAKS`) the compute and memory derates, the
 bandwidth curve, the kernel floor and the intra-node link's latency and derate.
 The peaks are the datasheet's; the rest is assumed. An engine start's memory
@@ -111,6 +112,23 @@ if GPU40:
             "per_byte_s": (3.577973224796102e-09, 6.711557841376081e-09),
         },
         "163c6320f4e4793c1d153a3058649d4feb05a4cfc0ff65d30712aedfa2577373",
+    )
+
+#: On gpu-40, the intake of a request that finds no other on the loop:
+#: `http_intake.py idle` less `INTAKE`'s per-byte rate over the parity
+#: workload's 64 lone requests (`atom.compass.parity.traffic` with
+#: `64 3 0 0 1`) to one DeepSeek-V4.1-Flash TP4 DSpark5 server on cards 0-3,
+#: at the commit named; the record is its stamp file, the band the p10 and p90
+#: over those requests.
+IDLE = None
+if GPU40:
+    IDLE = (
+        "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
+        "2026-11-02",
+        "0cd22bcc3",
+        0.0010968477849480863,
+        (0.000840771034976077, 0.0013093755415280821),
+        "d90b6703f0b2c276c64fb297d715cc596acfe342cf34794002abc25e3f70cf78",
     )
 
 #: Each host's core counts as /proc/cpuinfo reads them, aiter's commit in the
@@ -311,8 +329,9 @@ for block, groups in DATASHEET.items():
 
 
 def device_fragments() -> list[Fragment]:
-    """The start's readings, the burst's intake terms, the datasheet's peaks,
-    the probed peaks and the assumed rest."""
+    """The start's readings, the burst's intake terms, the lone requests' idle
+    intake where read, the datasheet's peaks, the probed peaks and the assumed
+    rest."""
     notes = f"one DeepSeek-V4-Pro {FLAGS} start at {COMMIT}"
     ptl = {"device": {"ptl": "disabled"}}
     datasheet = fragment(
@@ -329,6 +348,7 @@ def device_fragments() -> list[Fragment]:
         assumed,
         fragment("ptl", ptl, "probed", "no card has a ptl directory", date=PTL_DATE),
         probed,
+        *([base.idle(*IDLE)] if IDLE else []),
     ]
 
 

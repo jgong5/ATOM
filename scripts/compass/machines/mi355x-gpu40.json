@@ -3,7 +3,7 @@
   "name": "mi355x-gpu40",
   "provenance": {
     "authored_by": "compass agent for jgong5",
-    "date": "2026-10-29",
+    "date": "2026-11-02",
     "origin": "mixed",
     "origins": {
       "host.cpu.cores_physical": {
@@ -170,6 +170,14 @@
         "source_root": "commit:b71c071d3",
         "record": "sha256:020692760182d835943e2ac416f59df1abd2bb82cbe71870ce0c9f316cae436a"
       },
+      "host.http_intake.idle_s": {
+        "origin": "probed",
+        "model": "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
+        "source_root": "commit:0cd22bcc3",
+        "record": "sha256:d90b6703f0b2c276c64fb297d715cc596acfe342cf34794002abc25e3f70cf78",
+        "p10": 0.000840771034976077,
+        "p90": 0.0013093755415280821
+      },
       "host.tokenizers[deepseek-v4-pro fast]": {
         "origin": "probed",
         "model": "/shared/data/amd_int/models/DeepSeek-V4-Pro",
@@ -212,9 +220,10 @@
       "datasheet",
       "assumed",
       "ptl",
-      "peaks"
+      "peaks",
+      "idle"
     ],
-    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at b71c071d3 | one real c=256 first-turn cc-traces burst at b71c071d3 | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples"
+    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at b71c071d3 | one real c=256 first-turn cc-traces burst at b71c071d3 | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples | http_intake.py idle over 64 lone requests at 0cd22bcc3"
   },
   "host": {
     "cpu": {
@@ -257,7 +266,8 @@
     },
     "http_intake": {
       "fixed_s": 0.004323501788394507,
-      "per_byte_s": 3.8541166293528945e-09
+      "per_byte_s": 3.8541166293528945e-09,
+      "idle_s": 0.0010968477849480863
     }
   },
   "device": {
