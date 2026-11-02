@@ -47,6 +47,10 @@ prefill and decode rows is cut.
 A step of an MTP record without `d_target_ns` is cut as `unsplit`: its device
 label would hold a draft the law prices again.
 
+An output forward's view takes `start_lag_s`: its device start, placed by the
+lead, less the exit of its token copy wait (`t_recv_ns`, else `t_read_ns`,
+else its launch's end).
+
 A step's host labels are its segments: `E` from the previous forward's exit,
 cut as idle when the two batches share no request; `W_pre` to the launch, less
 the staging gate's wait; `W_launch` from the launch to the token copy wait,
@@ -330,6 +334,8 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             "by its device time"
         )
     exposed, paced, held = _host_cut(lines)
+    timed, lead = _timed(lines)
+    placed = {s["step"]: start + lead for s, start in timed}
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
@@ -357,6 +363,10 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
                         "rebuild it"
                     )
                 split = split_rule(group)
+        lag = None
+        if s["produces_output"]:
+            returned = s.get("t_recv_ns", s.get("t_read_ns", s["t_launch_ns"]))[1]
+            lag = (placed[s["step"]] - returned) * 1e-9
         view = BatchView(
             tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
             capture_rung=s["rung"],
@@ -365,6 +375,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             tbo_tokens=None if split is None else tuple(map(tuple, split)),
             moe_tokens=tokens,
             dp_rank=s["dp_rank"] if dp else None,
+            start_lag_s=lag,
         )
         cut = None
         if view.prefill and view.decode:
