@@ -1188,8 +1188,11 @@ and 5 at concurrency 16 alone, with these changes:
   serves V4.1-Flash on, and `$M` names `machines/mi355x-gpu40.json`, pinned to its stack.
 - `$ATOM` is `--model <DeepSeek-V4.1-Flash> --max-model-len 262144 -tp 4
   --kv_cache_dtype bf16 --index-cache-dtype fp8 --method dspark
-  --num-speculative-tokens 5 --level 0`, plus `--enable-expert-parallel` for the EP4
-  cell, and `G` names four GPUs.
+  --num-speculative-tokens 5 --spec-decode-acceptance-length 3 --level 0`, plus
+  `--enable-expert-parallel` for the EP4 cell, and `G` names four GPUs. Every record and
+  every run states the acceptance length, 3, near the 3.13 the smoke measured; another
+  length is another value of the flag, the same in every record and run
+  ([ruling](https://github.com/jgong5/ATOM/pull/2683#issuecomment-6578751421)).
 - The warm record serves traces 0 to 255 at 16. V4.1's Triton kernels still compile
   new variants after it, so take again every record that names `aiter_jit_builds`.
 - Calibration adds a first-turn record at 16, its `client.sh` run with
@@ -1201,7 +1204,7 @@ and 5 at concurrency 16 alone, with these changes:
   law stops at the widest rung the sampled records fit, and the simulated run
   refuses each step above it.
 - Steps 4 and 5 take `--duration 3600`, with a calibration record between step 4's
-  two real runs; step 5 adds `--acceptance-record $R/cell/c16/real1`. A step 5 at
-  another duration than step 4's is graded as another workload, and refused.
+  two real runs. A step 5 at another duration than step 4's is graded as another
+  workload, and refused.
 - The draft vectors hold no held-out error: check 2's `cost` rows of kind `draft` give
   the draft law's error on the real runs' own steps.

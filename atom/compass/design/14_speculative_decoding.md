@@ -15,6 +15,12 @@ a method, reported in the run summary and propagated into no cost term (D83, D84
 [#2138](https://github.com/jgong5/ATOM/issues/2138):** stage 4 prices DeepSeek-V4.1-Flash's
 DSpark5 on MI455, a second draft path beside V4-Pro's serial MTP (*Milestone placement*).
 
+**Revised 2026-11-02 by the owner's ruling on
+[#2683](https://github.com/jgong5/ATOM/pull/2683#issuecomment-6578751421):** stage 4's exit
+cells state `--spec-decode-acceptance-length 3` on their real and simulated runs alike, in
+place of rates measured from the real run; contract 3 stays unbuilt (D84, *Milestone
+placement*).
+
 **Scope.** What speculative decoding — Eagle3, DSpark, and MTP heads — changes for a
 simulator, and why one of those changes is different in kind from everything else in this
 design. The draft paths it prices are DeepSeek-V4-Pro's serial MTP, in M2's MI355X cells,
@@ -206,6 +212,16 @@ Contract 3 stays on the shelf rather than being rejected: it is the only way to 
 correlation gap above, and if a result ever turns out to depend on it, the transport is
 the same additive-field mechanism `06` D28 already defines.
 
+A graded result did come to depend on it. On stage 4's c=16 smoke cell, the simulated run
+drawing per step from rates measured on one real run read TPOT 10% to 15% below both real
+runs, because a real request keeps its own acceptance level and per-step draws lose it;
+with each request's real decode-row count it read 2% above
+([#2574](https://github.com/jgong5/ATOM/issues/2574)). Contract 3 was built to close that
+gap ([#2683](https://github.com/jgong5/ATOM/pull/2683)) and closed unmerged: a graded cell
+instead fixes the acceptance length on both runs through ATOM's flag, so the real run
+accepts by the same synthetic schedule the simulated run draws, and no request has a level
+of its own to lose (*Milestone placement*).
+
 For contract 2, the flow:
 
 ```
@@ -252,16 +268,18 @@ Small, useful to ATOM independently of Compass, and it is the same shape of ask 
 
 | # | Input | When | Method |
 |---|---|---|---|
-| 1 | measured per-position rates from a paired real run | acceptance cells | `measured` |
+| 1 | measured per-position rates from a paired real run | M2's MTP acceptance cells | `measured` |
 | 2 | measured mean AL, expanded by the min-variance schedule | a real run exists but only its mean was recorded | `estimated` |
-| 3 | a stated AL from a datasheet or a published figure | exploration, day zero, a draft head that does not exist yet | `declared` |
+| 3 | a stated AL from a datasheet or a published figure | exploration, day zero, a draft head that does not exist yet; stage 4's exit cells, whose real runs state the same AL | `declared` |
 
 The run summary reports the input's method. It propagates into no cost term: a step's
 terms carry the methods their own inputs give them, whatever the acceptance input's.
 
 Input 3 is legitimate and is what makes *"what if the draft head reaches AL 3.0"* a question
-Compass can answer. It is **not** legitimate in an acceptance run, and `08`'s hygiene
-refusals gain a row saying so.
+Compass can answer. It is **not** legitimate in an acceptance run whose real side drafted
+without it, and `08`'s hygiene refusals gain a row saying so. When the paired real run
+states the same AL through the same flag, both sides accept by one schedule and the cell
+grades time at that acceptance (D87).
 
 ---
 
@@ -375,8 +393,10 @@ Concretely, for acceptance cells:
   will achieve on a workload. Nothing in this design attempts that, and a result that
   appeared to show it would be an artifact of the input.
 
-A new hygiene refusal for `08` D49: **a speculative acceptance cell run on input 3
-(declared acceptance) is not acceptance evidence.** It is exploration.
+A new hygiene refusal for `08` D49: **a speculative acceptance cell whose simulated run
+takes input 3 (declared acceptance) while its real run drafts unforced is not acceptance
+evidence.** It is exploration. A cell whose two runs state the same length, as stage 4's
+do, is evidence for the claim above.
 
 ### Milestone placement
 
@@ -414,9 +434,15 @@ target's, and relaxed verification.
 | draft KV | in the target's pool: `validate_speculative_config` requires the target checkpoint, so `DSparkProposer._build_draft_model` builds the draft from it and never calls `draft_kv_builder`. Under a speculative config `DeepseekV41MetadataBuilder` adds `num_nextn_predict_layers` window-only layers to the backbone's, each a sliding window in the request's STATE entry (`V41PoolGeometry.state_fields`) | D86: the target builder's `sub_pool_specs()` declares it |
 | verification | the cells set no confidence schedule (`DSparkConfig.confidence_schedule` is off by default), so every verify step carries the full block, real and simulated (D83) | no truncation to model |
 
-**Each stage-4 cell is an acceptance cell**, as M2's MTP cells are: its per-position rates
-are measured from the paired real run's record, which `compass run --acceptance-record`
-reads, and never declared.
+**Stage 4's exit cells state their acceptance**: `--spec-decode-acceptance-length 3`, near
+the 3.13 measured on the c=16 smoke cell, in the ATOM arguments of the real runs
+(`compass record`) and the simulated runs (`compass run`) alike
+([ruling](https://github.com/jgong5/ATOM/pull/2683#issuecomment-6578751421)). At length 3
+the minimum-variance schedule (D84) accepts two of the five drafts on every verify row, on
+both sides, so the cell grades time at one acceptance and the summary names its input
+`declared`. Another length is set the same way, one value of the flag passed to both
+commands. `compass run --acceptance-record` stays a tool: it feeds a speculative record's
+measured rates (input 1) to a simulated run whose ATOM arguments state none.
 
 ---
 
@@ -446,10 +472,10 @@ reads, and never declared.
 |---|---|---|
 | D82 | Spec decode changes four things; three are routine and acceptance is different in kind, because it is a behaviour Compass cannot compute. | 2026-09-19 |
 | D83 | Acceptance is a **stated input**, carrying a method, supplied through ATOM's existing `--spec-decode-acceptance-*` flags. The sampler splits: its **cost** is traced and priced like any op, its **value** (`num_bonus_tokens`) needs a ~15-line device-free host draw, because the synthetic sampler is a Triton kernel and no kernel runs. Compass builds no acceptance *model*. | 2026-09-19 |
-| D84 | Feed the **measured per-position distribution**, not the mean - the minimum-variance schedule matches an aggregate and not a schedule. Contracts 1 and 2 (stated or measured statistical rates) are the design; contract 3 (per-request per-token lists) is recorded and not built. Transport for a list does not exist today and needs an ATOM flag (T63). Three acceptance inputs, measured, estimated and declared; the summary reports the method, which propagates into no cost term; input 3 is not acceptance evidence. | 2026-09-19; revised 2026-10-14 (#952) |
+| D84 | Feed the **measured per-position distribution**, not the mean - the minimum-variance schedule matches an aggregate and not a schedule. Contracts 1 and 2 (stated or measured statistical rates) are the design; contract 3 (per-request per-token lists) is recorded and not built. Transport for a list does not exist today and needs an ATOM flag (T63). Three acceptance inputs, measured, estimated and declared; the summary reports the method, which propagates into no cost term; input 3 is not acceptance evidence unless the real run states the same AL. Contract 3 stays unbuilt after #2574 measured the per-request gap; stage 4's exit cells state AL 3 on both runs instead. | 2026-09-19; revised 2026-10-14 (#952), 2026-11-02 (#2683) |
 | D85 | No new cost form. Drop the separate decode form and price every step with the general one; non-speculative decode is the `N_Q = 1` case. | 2026-09-19 |
 | D86 | Draft weights are Class A; draft KV comes from ATOM's own pool declarations (`ModelRunner._sub_pool_specs`), and its layer count is never re-derived. | 2026-09-19; revised 2026-10-29 (#2437) |
-| D87 | A speculative throughput result is **conditional on its acceptance input**, and the run summary names its method. Mean AL and the accepted-count histogram are gated; per-step realisation and within-sequence correlation are **not reproduced and not claimed**. Schedule agreement is graded more loosely for speculative cells. Predicting acceptance itself is explicitly not attempted. | 2026-09-19 |
+| D87 | A speculative throughput result is **conditional on its acceptance input**, and the run summary names its method. Mean AL and the accepted-count histogram are gated; per-step realisation and within-sequence correlation are **not reproduced and not claimed**. Schedule agreement is graded more loosely for speculative cells. Predicting acceptance itself is explicitly not attempted. A cell whose two runs state the same AL is acceptance evidence. | 2026-09-19; revised 2026-11-02 (#2683) |
 
 ---
 
