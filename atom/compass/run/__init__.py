@@ -407,16 +407,18 @@ def _check_host(path, host: dict) -> None:
 
     laws = host.get("laws", {})
     if (
-        set(host) - {"laws", "skip", "key"}
+        set(host) - {"laws", "skip", "key", "admit"}
         or set(host.get("skip", ())) - set(SEGMENTS)
         or set(laws) - set(FORWARD_KINDS)
         or {s for v in laws.values() for s in v} - set(SEGMENTS)
         or {len(c) for v in laws.values() for c in v.values()} - {3}
+        or len(host.get("admit", (0, 0, 0))) != 3
     ):
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
-            "and key, the host key the laws were fitted under"
+            "admit, three coefficients on a forward's admissions, and key, the "
+            "host key the laws were fitted under"
         )
 
 
@@ -1624,6 +1626,7 @@ def runner(model_runner, tree) -> None:
             stage,
             mtp=mtp,
             sync=rapid and not config.disagg_is_decode,
+            admit=host.get("admit"),
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])

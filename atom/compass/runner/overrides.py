@@ -289,6 +289,24 @@ def forward_shape(batch: Any) -> tuple[str, tuple]:
     return kind, (1, batch.total_tokens_num, batch.total_seqs_num)
 
 
+def admitted(batch: Any, seen: set, tokens_per_entry: int) -> tuple[int, int, int]:
+    """``(requests, uncached, cached)`` of the requests `batch` admits: those
+    a prefill row schedules for the first time, not in `seen`, which takes
+    every request the batch holds. The scheduler allocated each one's whole
+    prompt there, so its prompt is its block table's entries times
+    `tokens_per_entry`, and its prefix-cache hit is the tokens its row starts
+    from."""
+    n = uncached = cached = 0
+    rows = zip(batch.req_ids, batch.block_tables, strict=True)
+    for i, (r, table) in enumerate(rows):
+        if r not in seen and i < batch.total_seqs_num_prefill:
+            hit = int(batch.num_cached_tokens[i])
+            n, uncached = n + 1, uncached + len(table) * tokens_per_entry - hit
+            cached += hit
+        seen.add(r)
+    return n, uncached, cached
+
+
 class HostDeviceRecurrence:
     """One runner's host and device timelines, composed into each forward's charge.
 
@@ -307,13 +325,16 @@ class HostDeviceRecurrence:
     does. `ends[-1]` is the last forward's device end. `laws[kind][segment]` are coefficients on `(1,
     tokens, seqs)`; `charge` says what an absent one costs. `now` reads the engine LP's clock.
     `segments` holds the seconds the last `charge` charged each segment, 0 for
-    one in `skip`.
+    one in `skip`. `admit`, coefficients on a batch's `compass_admitted`
+    (`admitted`), adds what its admissions cost to its `E`, except on a
+    pipeline stage that receives its input; with none, they cost nothing.
     """
 
     def __init__(
-        self, laws: dict, skip, now, stage=None, mtp=False, sync=False
+        self, laws: dict, skip, now, stage=None, mtp=False, sync=False, admit=None
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
+        self.admit = admit
         ring = 2 if stage is None else stage[1]
         self.ends = collections.deque([-math.inf] * ring, maxlen=ring)  # n-ring..n-1
         self.last = None if stage is None else stage[0] == stage[1] - 1
@@ -364,7 +385,7 @@ class HostDeviceRecurrence:
             raise CostRefused(kind, [Refusal("host", f"no law for {named}")])
         now = self.now()
         called, meta = getattr(batch, "compass_pp_host", (now, -math.inf))
-        prepared, self.segments = self.prepare_end(called, kind, x)
+        prepared, self.segments = self.prepare_end(called, kind, x, self.admit_s(batch))
         self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)
@@ -376,12 +397,22 @@ class HostDeviceRecurrence:
         self._held = now, launch_end, output, post
         return max(self.target_end + draft_s, launch_end)
 
-    def prepare_end(self, called: float, kind: str, x: tuple) -> tuple[float, dict]:
+    def admit_s(self, batch: Any) -> float:
+        """What `batch`'s admissions add to its `E`."""
+        a = getattr(batch, "compass_admitted", None)
+        if not (self.admit and a) or self.recv:
+            return 0.0
+        return float(np.dot(self.admit, a))
+
+    def prepare_end(
+        self, called: float, kind: str, x: tuple, admit_s: float = 0.0
+    ) -> tuple[float, dict]:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
-        `PP_RECV_SEGMENT`'s too."""
+        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`."""
         law = self.laws.get(kind, {})
         seg = {
-            s: float(np.dot(law.get(s, (0, 0, 0)), x)) * (s not in self.skip)
+            s: (float(np.dot(law.get(s, (0, 0, 0)), x)) + admit_s * (s == "E"))
+            * (s not in self.skip)
             for s in SEGMENTS
         }
         host = max(called + seg["E"], self.ends[0]) + seg["W_pre"]
@@ -1557,7 +1588,9 @@ def _group_step_seconds(
 
     In a run, `compass_host` composes the price, the target's device seconds
     and then the draft's (`StepCost.target_seconds`, `draft_seconds`), with
-    host time. Under DP, a `HostDeviceRecurrence`'s device end, and its output
+    host time; for a `HostDeviceRecurrence` with an admission law, the batch's
+    `compass_admitted` is set here (`admitted`, over the requests this runner
+    has seen). Under DP, a `HostDeviceRecurrence`'s device end, and its output
     mark (the device end, or under MTP the target end), are first replaced by
     the group's latest, an `all_reduce(MAX)` standing in
     for a real forward's cross-rank collectives, and every rank leaves at its
@@ -1636,6 +1669,13 @@ def _group_step_seconds(
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
         terms = (*cost.terms, *cost.draft_terms)
     host = getattr(runner, "compass_host", None)
+    if isinstance(host, HostDeviceRecurrence) and host.admit:
+        # A block-table entry holds a block's tokens on each DCP rank.
+        entry = _config_field(runner, "kv_cache_block_size") * _config_field(
+            runner, "decode_context_parallel_size"
+        )
+        seen = vars(runner).setdefault("_admitted", set())
+        batch.compass_admitted = admitted(batch, seen, entry)
     # `decide` returns the collective's rows for a group of one too.
     many = mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1
     group = dp_group() if many else None

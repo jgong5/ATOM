@@ -279,11 +279,12 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     """`check`'s report with each forward priced in place of measured: its
     device time, target then draft, by `law`'s step linear law
     (`StepLinearBackend` on its `step_labels` sample's view, from `samples`),
-    and its host segments by the law's host laws, `law["host"]["laws"]`,
-    graded against the same measured period. After each forward the engine
+    and its host segments by the law's host laws, `law["host"]["laws"]`, its
+    `E` with what its admissions cost (`law["host"]["admit"]`), graded
+    against the same measured period. After each forward the engine
     runs its `E_out` before the next call. An idle forward's `E`, the first's
-    too, stays measured from the last pull or exit: it holds the wait for an
-    arrival, which no law prices. Steps in `warm` are charged and not graded,
+    too, stays measured from the last pull or exit, admissions and all: it
+    holds the wait for an arrival, which no law prices. Steps in `warm` are charged and not graded,
     as is a forward whose period ran more than `WARM_FACTOR` times its charge,
     a one-off first touch the laws do not price; so are steps the law
     refuses, charged 0 s of device time as a run charges them and counted per
@@ -296,9 +297,11 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     mtp = any("d_target_ns" in s for s in steps)
     clock, exit_, out_s, prev, rows, refused = [0.0], 0.0, 0.0, None, [], {}
     apart, uncharged = {*jit, *(n + 1 for n in jit)}, 0.0
-    rec = HostDeviceRecurrence({}, (), lambda: clock[0], mtp=mtp)
+    admit = law["host"].get("admit")
+    rec = HostDeviceRecurrence({}, (), lambda: clock[0], mtp=mtp, admit=admit)
     kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
-    for s, kind in zip(steps, kinds):
+    admits = step_labels.admissions(steps)
+    for s, kind, admitted in zip(steps, kinds, admits):
         if (view := views.get(s["step"])) is None:
             raise ValueError(f"step {s['step']} has no labelled sample to price")
         rec.laws = hosts
@@ -312,9 +315,11 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
             total_seqs_num=len(view.requests),
             total_seqs_num_prefill=len(view.prefill),
             produces_output=lambda out=s["produces_output"]: out,
+            compass_admitted=None if kind == "idle" else admitted,
         )
         clock[0] = exit_ + out_s
-        queued = rec.ends[1] - rec.prepare_end(clock[0], *forward_shape(batch))[0]
+        shape = forward_shape(batch)
+        queued = rec.ends[1] - rec.prepare_end(clock[0], *shape, rec.admit_s(batch))[0]
         graded = s["step"] not in {*warm, *apart}
         try:
             cost = backend.price(view)
