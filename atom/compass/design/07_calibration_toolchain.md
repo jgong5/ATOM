@@ -41,6 +41,11 @@ D60 requires, and nothing else, so region terms and the op-level residual are re
 recorded by [#1868](https://github.com/jgong5/ATOM/issues/1868):** `measure ops` runs no
 forward (Phase 1b, D39).
 
+**Revised 2026-11-02 by the
+[design session on #2640](https://github.com/jgong5/ATOM/issues/2640#issuecomment-6568381628):**
+a constructed JIT sweep and a per-stack cache library warm a container before a graded
+run (D106).
+
 **Depends on:** `04_model_capture_and_cost_ir.md` (what is traced and priced),
 `05_machine_spec_and_probes.md` (the machine artifact and its probes).
 
@@ -1083,6 +1088,125 @@ So: every gate's state is written into the artifact and checked there.
 
 ---
 
+## D106. Warming a container: a constructed JIT sweep and a per-stack cache library
+
+Decided 2026-11-02 by the
+[design session on #2640](https://github.com/jgong5/ATOM/issues/2640#issuecomment-6568381628).
+
+### Problem
+
+A real record whose `run.json` names `aiter_jit_builds` is refused whole (`08` D52,
+[#1704's ruling](https://github.com/jgong5/ATOM/issues/1704#issuecomment-6405004644)), so
+a graded run must compile nothing its container could have compiled before it. Each JIT
+compiler in play (aiter's JIT modules, `compile_hsaco`, FlyDSL, Triton and Gluon,
+Inductor) caches by its own key, and a key mixes code identity with a runtime
+specialization: shapes, constexprs, argument divisibility by 16, pointer alignment,
+`None` arguments, dtypes, a tuned config a token count selects.
+
+A container was warmed by serving the workload until no record built
+(`scripts/compass/README.md`). Serving reaches the key space by sampling: the tail is
+reached rarely and never certainly, and under DP attention and TBO no client controls a
+rank's batch. DeepSeek-V4-Pro's prefill still built new keys at its eighth load
+([#2493](https://github.com/jgong5/ATOM/issues/2493),
+[#2634's reading](https://github.com/jgong5/ATOM/issues/2634#issuecomment-6560767690)):
+the FlyDSL A16W16 GEMM, keyed by the tuned config a forward's token count selects, whose
+uncompiled configs sit in narrow token-count windows, the Gluon `fp8_mqa_logits` and
+`_hash_topk`. A per-kernel list is no answer: models, kernels and images change faster
+than one.
+
+### Decision
+
+**Construct the inputs that select keys instead of sampling them, and keep what is
+compiled per stack, not per container.** The goal is to reach the JIT key space faster
+than serving samples it. A compile in a graded run still voids that run; the sweep
+changes when keys are compiled, not what a graded run may contain.
+
+**The driver.** A constructed client against the real server. The deployment is the
+cell's own, unchanged, and ATOM gains no hook point: a changed deployment compiles
+another configuration's keys, so only the traffic varies. Per DP rank, and the ranks in
+parallel, so the sweep takes the longest rank's time rather than the sum:
+
+- **Every prefill token count** from 1 to the rank's batched-token budget, as
+  `ModelRunner.warmup_max_tokens` sizes it, one step each. A tuned config is selected by
+  the token count, and only a walk over every count reaches every config with certainty.
+- **Each step's composition, designed**, because a token count does not select the
+  alignment and divisibility keys:
+  - row lengths whose offsets cover every residue mod 16, for the divisibility and
+    pointer-alignment specializations;
+  - 0 to 15 held requests, which set the probe's state slot: slots come off a min-heap
+    (`atom/model_engine/state_pool.py::StateSlotPool`), so the requests held ahead of a
+    probe decide which slot it takes;
+  - two or more rows a step where the engine enables TBO, whose prefill split falls on a
+    request boundary (`atom/utils/tbo/ubatch_splitting.py`), which one row lacks;
+  - a shared prefix where prefix caching is on, and a second turn, each starting a
+    prefill at a cached offset;
+  - chunked long prompts, up to the workload's longest context, for the keys a context or
+    KV length selects;
+  - two output tokens a request: the second is the request's one decode step, so decode
+    is reached and the request leaves a step later.
+- **A blocker prefill** queues each step's rows, so the scheduler takes them as one batch;
+  rows that reach an idle engine are scheduled as they arrive, split across steps.
+
+**The axes come from the cell.** Each axis and its range is read from the cell's own
+engine (its budget, DP, TBO, prefix caching and drafter state) and workload (its longest
+context): a point outside them compiles a key its graded run never meets. Sampling
+arguments are copied from the workload, never varied, since they select the sampling path
+the graded run takes.
+
+**A cache library per stack.** Keyed by what a container can read of its stack: ROCm,
+aiter's commit, RCCL, torch, Triton, FlyDSL and the gfx arch, because an artifact is
+reusable only on the stack that compiled it, and each compiler's own key separates the
+rest. It lives at `<store>/jit`, under the artifact store's root (D41), because it must
+outlive the container whose caches it collects; `compass record` takes an optional
+`--store`, and a record given none behaves as before. A real server's start merges the
+library into the container's cache roots, the ones `atom/compass/drive/aiter_jit.py`
+reads, never overwriting a file the container has. Its stop writes back only finished
+artifacts, judged per compiler, each staged and renamed into place: a compiler writes one
+key as several files (an aiter module and its `.so`, a Triton directory and its `__grp__`
+json, a FlyDSL pkl and its lock), so a build the stop cut short would reach every later
+container as finished, and two servers stopping at once must leave the union. Each key is
+then compiled once per stack, not once per container.
+
+**Closed by coverage.** `client.sh --sweep` drives the sweep against a running server.
+Coverage is read from the step record after the server stops, a point covered when a line
+states its batch: the scheduler, not the client, decides what each rank ran, and the
+record states it. A later sweep of the cell sends only the points still missing, so the
+rounds converge instead of repeating, and a cell is marked swept only when every point is
+covered.
+
+**Not swept: preemption and recompute, and error paths.** The client cannot construct
+them without changing the deployment. A build there is a residual, recorded with the
+batch that compiled it, not a defect of the sweep; the record naming it is still refused
+(`08` D52) and taken again (T104).
+
+**Deferred: streaming the real record** to the client, so that one round reads its own
+coverage and closes its own loop before the stop (T103). Until then a round's missing
+points wait for the next round.
+
+**The estimate.** Read against #2634's keys, a token-count sweep alone covers about two
+thirds of them with certainty, the GEMM's included; the designed composition covers the
+alignment keys.
+
+**Acceptance**, on #975's DeepSeek-V4-Pro cell
+([#2650](https://github.com/jgong5/ATOM/issues/2650)), all of: a fresh container on an
+empty library sweeps the cell to swept within three rounds, compiling every key #2634
+names; two real records of #975's workload after it name no `aiter_jit_builds`, and a
+build that does appear is traced to the batch that compiled it and classed: in a path left
+unswept above it is recorded, on a swept axis it fails the acceptance; a second fresh container on the same
+stack returns from `--sweep` at once, and its record names no build.
+
+**What stays.** `06` D27's *Warmup is not a protocol feature*: sweep traffic is
+ordinary requests to a server whose record nothing grades. Detection stays as well: the
+sweep stops warmth recurring on the axes it covers, and `08` D52's refusal and T54 catch
+what it leaves.
+
+### Open issues
+
+- T103: streaming the real record, deferred above.
+- T104: the unswept paths, preemption and recompute and error paths.
+
+---
+
 ## Decision log
 
 | # | Decision | Date |
@@ -1097,6 +1221,7 @@ So: every gate's state is written into the artifact and checked there.
 | D43 | Per-artifact invalidation matrix, not a global fingerprint. Every gate's state is written into the artifact and checked there. Rows for `shape_population`, `step_measurement`, `step_linear_law` and `host_laws`, and a host-CPU axis. The region-term row retired; `op_measurement` on `price_list`'s row. | 2026-09-18; rows 2026-10-13 (#851); region-term row retired, `op_measurement` 2026-10-18 (#1489); `host_laws` row gains the device, stack and PTL its machine-spec digest carries, and torch through its fingerprint, 2026-10-29 (#2484); PTL back to `-`, carried only because the digest is one hash, and a run does not yet check torch for host laws, 2026-10-30 (#2308, #2475) |
 | D38.1 | One recommended flow per half: steps (`measure memory`, `record`, `trace steps`, `measure steps` with the step grid's planner, `fit host` and `fit steps`, `run --coverage`, then grading outside the CLI), each server driven by a client started apart, and ops, after the steps half's `measure memory`, `record`, `trace steps` and `fit host` (`trace ops --population`, `measure ops --plan` over the record directories of `record` or `trace steps --out`, `fit ops` publishing a `price_list` only, then `run` and grading). Phases unchanged; the op bench, ATOM's runner preparing each point and running no forward, hosts 1b and the step bench 1c, Phase 2 is a plain startup `measure memory` runs. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); ops half 2026-10-18 (#1489); `measure ops --plan` reads record directories 2026-10-18 (#1527); op bench without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)) |
 | D40.1 | Classes (a) and p2p ride `measure ops` unchanged. Classes (b) and (c) share one new stated-entry-point benchmark inside the same multi-rank op bench, also run by `measure ops`. KV transfer is never priced. Collective prices are labelled upper bounds. | 2026-09-19; one command 2026-10-13 (#851); the multi-rank op bench 2026-10-18 (#1489) |
+| D106 | A container is warmed for a graded run by a constructed JIT sweep and a per-stack cache library; a compile in a graded run still voids it. A client against the real, unchanged deployment, no ATOM hook point, walks per DP rank, ranks in parallel, every prefill token count from 1 to the rank's batched-token budget, one step each, each step's composition designed (row offsets over every residue mod 16, 0 to 15 held requests for the state slot, TBO splits, a shared prefix, a second turn, chunked long prompts, two output tokens), a blocker prefill making each step's rows one batch; axes and ranges from the cell's engine and workload, sampling arguments copied. One library per stack (ROCm, aiter's commit, RCCL, torch, Triton, FlyDSL, gfx arch) at `<store>/jit`, `compass record --store` optional, merged in at a real server's start and written back at its stop, finished artifacts only, per compiler, atomically. `client.sh --sweep` drives it; coverage is read from the step record after the stop, a later sweep sends only missing points, and a cell is swept only when all are covered. Preemption, recompute and error paths are not swept: a build there is recorded, not a defect. Streaming the real record is deferred. | 2026-11-02 ([#2640](https://github.com/jgong5/ATOM/issues/2640#issuecomment-6568381628)) |
 
 ---
 
@@ -1115,3 +1240,5 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T21 | Establish whether Phase 1c transfers across width (the TP2 test run) | it is the recipe's one unproven assumption |
 | ~~T22~~ | ~~Analytical laws as their own design topic~~ — **done**, now `10` | — |
 | T100 | Compare `measure memory`'s readings under ATOM's `--load_dummy` with a real load's on Qwen3.8-27B TP1 on MI308X; until they match, `measure memory` refuses `--load_dummy` (D38, Phase 2) | needs `measure memory` built |
+| T103 | Stream the real record to the JIT sweep's client, so one round reads its own coverage and sends its missing points before the stop (D106) | deferred by #2640's design session; coverage is read after the stop meanwhile |
+| T104 | The paths the JIT sweep does not construct: preemption and recompute, and error paths. A build there is recorded with its batch, not a defect, and the record naming it is refused and taken again (D106) | the client cannot reach them without changing the deployment |
