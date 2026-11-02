@@ -121,6 +121,10 @@ class _Clocked(Traffic):
             self._take()
 
     def close(self) -> None:
+        """Take the run's events to its +inf grant, which ends the client run,
+        then leave."""
+        while self.rt.next_event(math.inf) != math.inf:
+            self._take()
         self.rt.close()
 
 
