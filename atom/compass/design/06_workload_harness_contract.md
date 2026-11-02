@@ -109,7 +109,11 @@ Three consequences worth being explicit about:
 
 - Nothing here handles a workload where warmth *recurs* mid-run — a new shape reaching
   autotune for the first time at minute 10. Doc `09` D62 measures leading warmth; it
-  does not detect a late one. Recorded as **T54**.
+  does not detect a late one. Recorded as **T54**. Where the warmth is a JIT compile,
+  `07` D106's sweep stops it recurring on the axes the sweep covers, by compiling their
+  keys before the graded run; detection stays for the rest, the paths the sweep leaves
+  unswept among them: `08` D52 refuses a real record that names a build, and T54 remains
+  open.
 
 ---
 

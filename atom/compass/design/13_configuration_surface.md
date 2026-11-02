@@ -358,7 +358,9 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
   `max_num_seqs`, `max_num_batched_tokens` and `max_model_len`. Its `aiter_jit_builds`
   names each JIT compile, aiter's, FlyDSL's, Triton's or Inductor's, outside ATOM's
   per-start compile cache, that the server ran or began after `/health` first answered
-  (`atom/compass/drive/aiter_jit.py`), and is absent when there was none. `record` takes no memory
+  (`atom/compass/drive/aiter_jit.py`), and is absent when there was none. An optional
+  `--store` names the store whose per-stack JIT cache library the server's start merges in
+  and its stop writes back (`07` D106); without it `record` touches no library. `record` takes no memory
   readings; `measure memory` does. `--host` binds an address other than 127.0.0.1, one a
   router on another node reaches. Steps are timed unprofiled; op times come only from a
   separate profiled pass (`--profile-ops`, ops half), which splits a step and never prices
