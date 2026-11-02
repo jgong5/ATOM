@@ -172,7 +172,7 @@ class ClockAuthority:
     recovered, released, sent)`` call per reply, in issue order: ``released``
     the ``(channel, seq, arrival)`` messages the reply released, ``sent`` those
     logged by the requests it answers. `grants` counts each LP's finite grants
-    by name, its replayed steps included, and `requests` the calls each made;
+    by name, its replayed steps included, and `requests_served` its calls;
     `diagnostics`, the stall diagnostics its serve side printed. `final_clocks`
     is every LP's clock just before the run finished, and ``None`` until it
     has. `members` maps an LP to
@@ -226,7 +226,7 @@ class ClockAuthority:
         self.timeline = timeline
         self._sent = {i: [] for i in self._ids}  # logged since its last reply
         self.grants = {i.name: 0 for i in self._ids}
-        self.requests = {i.name: 0 for i in self._ids}  # calls made, by LP name
+        self.requests_served = {i.name: 0 for i in self._ids}  # by LP name
         self.diagnostics = 0
         self._diagnosed = 0  # `diagnostics` at the open client run's start
         self.final_clocks = None
@@ -306,7 +306,7 @@ class ClockAuthority:
         # The registered object itself: every lookup below then matches by
         # identity rather than by calling LpId.__eq__.
         lp = self._lp.get(lp) or self._channels.registry.require(lp)
-        self.requests[lp.name] += 1
+        self.requests_served[lp.name] += 1
         members = self._members.get(lp, ())
         if member not in (members or (None,)):
             raise KeyError(

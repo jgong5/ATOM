@@ -177,4 +177,4 @@ def test_local_grants_change_no_drain_and_no_timeline_only_the_calls():
     for lp in (PREFILL, DECODE):
         mine = [r for r in on.timeline.records() if r.lp == lp]
         assert mine == [r for r in off.timeline.records() if r.lp == lp]
-    assert (off.requests["prefill"], on.requests["prefill"]) == (4, 2)
+    assert (off.requests_served["prefill"], on.requests_served["prefill"]) == (4, 2)

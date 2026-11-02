@@ -963,7 +963,7 @@ class _RecordingAuthority(ClockAuthority):
             self.started = time.monotonic()
         stop = kind == TAR and t == math.inf and lp.name.startswith(FRONTEND.name)
         if stop and self.final_clocks is None:
-            self.requests[lp.name] += 1
+            self.requests_served[lp.name] += 1
             for ch, seq, arrival in self._catch_up(lp, steps, log, member):
                 self._register(lp, ch, seq, arrival, member)
             self.stopped = True

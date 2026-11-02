@@ -661,7 +661,8 @@ def test_steps_below_the_ceiling_replay_as_the_grants_their_calls_would_have_had
     assert off.on_request(B, TAR, 2.0, [(BA, 0, 1.25)]) == []
     assert _by_lp(on) == _by_lp(off)
     assert on.grants == off.grants == {"a": 1, "b": 3}
-    assert (on.requests, off.requests) == ({"a": 1, "b": 2}, {"a": 1, "b": 4})
+    assert on.requests_served == {"a": 1, "b": 2}
+    assert off.requests_served == {"a": 1, "b": 4}
 
 
 def test_a_step_out_of_bounds_or_past_a_registered_message_aborts():
@@ -757,8 +758,8 @@ def test_local_grants_leave_every_lps_grants_and_the_timeline_as_they_are():
             assert on == off, seed
             assert on_ca.grants == off_ca.grants, seed
             assert _by_lp(on_ca) == _by_lp(off_ca), seed
-            asked += sum(off_ca.requests.values())
-            answered += sum(on_ca.requests.values())
+            asked += sum(off_ca.requests_served.values())
+            answered += sum(on_ca.requests_served.values())
             ahead += sent
     # The LPs answered some of their own requests, some below a message ahead.
     assert answered < asked and ahead > 0

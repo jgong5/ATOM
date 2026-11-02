@@ -250,7 +250,7 @@ class RunSummary:
             detectors if detectors is not None else DetectorState(),
             refusals,
             ended_by,
-            tuple(authority.requests.items()),
+            tuple(authority.requests_served.items()),
         )
 
     @property
