@@ -62,6 +62,7 @@ found.
 
 import asyncio
 import collections
+import contextvars
 import heapq
 import itertools
 import json
@@ -82,6 +83,7 @@ from atom.compass.carriers import (
     cancel_seq,
     relay_stamp,
     stamp_events,
+    tracestate_acceptance,
     with_relay_stamp,
 )
 from atom.utils import clock
@@ -650,6 +652,11 @@ class CompassSelector(selectors.DefaultSelector):
 GENERATION_PATHS = frozenset(
     ("/v1/completions", "/v1/chat/completions", "/v1/messages", "/v1/responses")
 )
+#: The ``compass-acceptance`` digits of the stamped request the app is serving
+#: in this context, None for one that carries none.
+ACCEPTANCE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "compass_acceptance", default=None
+)
 
 
 class HttpChannel:
@@ -662,7 +669,9 @@ class HttpChannel:
     stamped request waits until it is released and every released request has
     been read; released requests are handed on in ``(arrival, seq)`` order and
     count as handled once their body has been received. The app gets the
-    received body messages again from its ``receive``.
+    received body messages again from its ``receive``, and serves a stamped
+    request with `ACCEPTANCE` set to its ``compass-acceptance`` entry
+    (`atom.compass.carriers.tracestate_acceptance`).
 
     A stamped request whose body is a cancel
     (`atom.compass.carriers.cancel_seq`) goes to no app: it is answered 204,
@@ -700,7 +709,7 @@ class HttpChannel:
 
     async def __call__(self, scope, receive, send):
         rt = clock.installed()
-        relay_in = relay_out = hangup = None
+        relay_in = relay_out = hangup = accepted = None
         if rt is not None and scope["type"] == "http":
             relay_in = _relay(rt.table.channels_into(rt.me))
             relay_out = _relay(rt.table.channels_from(rt.me))
@@ -765,6 +774,14 @@ class HttpChannel:
                 await send({"type": "http.response.body", "body": b""})
                 return
             hangup = self.hangups[seq] = asyncio.Event()
+            headers = scope["headers"]
+            accepted = ACCEPTANCE.set(
+                tracestate_acceptance(
+                    ",".join(
+                        v.decode("latin-1") for k, v in headers if k == b"tracestate"
+                    )
+                )
+            )
             inner = receive
 
             async def receive():
@@ -780,6 +797,8 @@ class HttpChannel:
         finally:
             if hangup is not None:
                 del self.hangups[seq]
+            if accepted is not None:
+                ACCEPTANCE.reset(accepted)
 
 
 async def _refuse_unstamped(rt, method: str, path: str, send) -> None:

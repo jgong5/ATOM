@@ -68,7 +68,12 @@ from compass_harness.transport import (
     credit_key,
 )
 
-from atom.compass.carriers import cancel_body, stamp_events, tracestate_stamp
+from atom.compass.carriers import (
+    cancel_body,
+    stamp_events,
+    tracestate_acceptance,
+    tracestate_stamp,
+)
 from atom.compass.clock import LpId, single_engine_table
 from compass_harness import fingerprint
 
@@ -400,3 +405,22 @@ def test_the_worker_that_sent_a_request_posts_its_stamped_cancel(tmp_path, monke
     written, cancels = _run(run())
     assert written == (_key(0),)
     assert cancels == [("compass=a:11.0;s:3", cancel_body(SENDS[0][1]))]
+
+
+def test_a_request_the_run_file_lists_carries_its_digits(tmp_path, monkeypatch):
+    """The run file lists conversation c0's turn 0, credit 0's, and no other."""
+    run_file = tmp_path / "run.json"
+    lists = {"c0": {"0": "50a3"}, "c1": {"1": "2"}}
+    run_file.write_text(json.dumps({"bound_s": 1.0, "acceptance_lists": lists}))
+    monkeypatch.setenv("ATOM_COMPASS_RUN", str(run_file))
+
+    async def run():
+        async with Harness(tmp_path, monkeypatch) as h:
+            for num in (0, 1):
+                await h.stamp(num)
+                await h.send(num)
+            return h
+
+    h = _run(run())
+    assert [tracestate_acceptance(h.tracestate[n]) for n in (0, 1)] == ["50a3", None]
+    assert [tracestate_stamp(h.tracestate[n]) for n in (0, 1)] == [SENDS[0], SENDS[1]]

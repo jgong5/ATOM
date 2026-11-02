@@ -124,7 +124,8 @@ It holds the memory the worker predicts too, for
 under ``step_grid`` the bundle's key, digest and ``describe()`` line, which the
 summary carries. A speculative engine's holds its acceptance input and its
 scheduler's accepted-draft histogram (`_acceptance`), which the summary carries
-by LP over its steps, with their mean acceptance length. The authority
+by LP over its steps, with their mean acceptance length, and under a run file's
+`ACCEPTANCE_LISTS` how many requests brought their own. The authority
 removes an earlier run's files there as it starts. At the end of client run
 ``k`` every server LP hands in to ``client-<k>/`` there, and the authority's
 host writes the step table and that client run's summary, its steps taken as
@@ -278,6 +279,12 @@ CLIENT_DIR = "client-{}"
 ACCEPTANCE_FILE = "dp{}.acceptance.json"
 #: The run-file key naming the record that gave the acceptance rates.
 ACCEPTANCE_RECORD = "acceptance_record"
+#: The run-file key of the drafts each request of that record accepted per
+#: verify row: base-36 digits by conversation, then by turn.
+ACCEPTANCE_LISTS = "acceptance_lists"
+#: The attribute a request's sequence holds its accepted-draft digits in, from
+#: the frontend's `add_request` to its engine's first scheduled batch.
+ACCEPTANCE_ATTR = "compass_acceptance"
 #: The endpoint a standalone authority serves at, written to its out_dir.
 AUTHORITY_FILE = "authority_endpoint.txt"
 #: Wall seconds the summary's writer waits for the server LPs' refusals.
@@ -286,7 +293,7 @@ HAND_IN_WAIT_S = 300.0
 PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
-SUMMARY_SCHEMA_VERSION = 11
+SUMMARY_SCHEMA_VERSION = 12
 #: Compass source the host-law key leaves out, by path under the package: all
 #: of it (None), or the top-level names (def, class or assigned) only a simulated
 #: run reaches, with the comments above each and the module docstring.
@@ -370,6 +377,8 @@ _early_end: threading.Thread | None = None
 _member: str | None = None
 #: The SIGTERM handler this engine process set aside as it said READY.
 _sigterm_at_ready: list = []
+#: The requests whose accepted-draft digits this engine process scheduled.
+_replayed_requests = 0
 
 
 def spec() -> dict | None:
@@ -1046,14 +1055,19 @@ def frontend(config):
     A real run with the parity record's variable set runs ATOM's runner
     through the recording one, and refuses any other runner, which would
     record nothing. With it set, real or simulated, each request's sequence
-    carries its response id (`parity.carry_response_ids`).
+    carries its response id (`parity.carry_response_ids`). On a simulated run
+    each one-sequence request's sequence carries the accepted-draft digits its
+    HTTP request brought (`_attach_acceptance`).
     """
     global _authority, _early_end
     from atom.compass import parity
 
+    run = spec()
+    if run is not None:
+        _attach_acceptance()
+    # After it: carry_response_ids reads its caller's frame as the API server's.
     if os.environ.get(parity.ENV):
         parity.carry_response_ids()
-    run = spec()
     if run is None:
         if os.environ.get(parity.ENV):
             recording = {ATOM_RUNNER: parity.RUNNER, RAPIDSERVE_RUNNER: parity.RAPID}
@@ -1150,6 +1164,47 @@ def frontend(config):
     rt = _runtime(lp, run, cls=_StoppingClock, here=authority is not None)
     rt.client_run_ended = lambda k: _frontend_hand_in(run, rt, k)
     return _start_on_leaving(rt, authority)
+
+
+def _attach_acceptance() -> None:
+    """A one-sequence request's sequence carries, as `ACCEPTANCE_ATTR`, the
+    ``compass-acceptance`` digits of the HTTP request the API server is
+    serving (`compass_loop.ACCEPTANCE`) to its engine; a fan-out's carry none."""
+    from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+    from atom.utils.compass_loop import ACCEPTANCE
+
+    for cls in (CoreManager, DisaggCoreManager):
+
+        def add_request(self, seqs, add=cls.add_request):
+            if len(seqs) == 1 and (digits := ACCEPTANCE.get()) is not None:
+                setattr(seqs[0], ACCEPTANCE_ATTR, digits)
+            return add(self, seqs)
+
+        cls.add_request = add_request
+
+
+def _carry_acceptance() -> None:
+    """Each scheduled batch carries, as ``compass_acceptance``, the digits of
+    each of its sequences that still holds them, taken off the sequence, so a
+    request's reach its runner once, in its first batch, and are counted."""
+    from atom.model_engine.scheduler import ScheduledBatch
+
+    init = ScheduledBatch.__init__
+
+    @functools.wraps(init)
+    def carrying(self, seqs, *args, **kwargs):
+        global _replayed_requests
+        init(self, seqs, *args, **kwargs)
+        held = {
+            seq.id: digits
+            for seq in seqs.values()
+            if (digits := vars(seq).pop(ACCEPTANCE_ATTR, None)) is not None
+        }
+        if held:
+            vars(self).setdefault("compass_acceptance", {}).update(held)
+            _replayed_requests += len(held)
+
+    ScheduledBatch.__init__ = carrying
 
 
 def _refuse_unshared(run: dict, standalone: bool) -> None:
@@ -1257,7 +1312,8 @@ def engine(config):
     At DP width above one, the process joins the engine LP as the member of its
     DP rank, and its host collectives first join the group rounds it owes. A
     pipeline stage is the engine LP ``engine-pp<stage>``, or a prefill side's
-    ``engine-P-pp<stage>``.
+    ``engine-P-pp<stage>``. Its scheduled batches carry their sequences'
+    accepted-draft digits to the runner (`_carry_acceptance`).
 
     A real run recording its steps (`parity.ENV`) outside a pipeline stamps the
     engine's input pulls and output puts into ``dp<rank>.pulls.jsonl`` beside
@@ -1281,6 +1337,7 @@ def engine(config):
         return contextlib.nullcontext()
     from atom.utils.distributed import utils
 
+    _carry_acceptance()
     lp, side = ENGINE, _pd_side(config)
     pc = config.parallel_config
     if (name := _engine_name(config, run)) is not None:
@@ -2008,7 +2065,9 @@ def _acceptance(scheduler, run: dict) -> dict:
     """A speculative engine's drafter, its draft width, the acceptance input
     ATOM's flag stated with its method, the per-position rates it resolved to,
     and the scheduler's accepted-draft histogram (`EngineStats.distribution`).
-    The input is ``measured`` from a run file's `ACCEPTANCE_RECORD`."""
+    The input is ``measured`` from a run file's `ACCEPTANCE_RECORD`; with its
+    `ACCEPTANCE_LISTS`, the input names how many requests they list, and
+    ``replayed_requests`` how many of them reached this engine."""
     spec = scheduler.config.speculative_config
     # A stated rate also resolves a length, so it is read first.
     stated = (
@@ -2020,13 +2079,17 @@ def _acceptance(scheduler, run: dict) -> dict:
     said = {"flag": flag, "value": value, "method": "declared"}
     if record := run.get(ACCEPTANCE_RECORD):
         said |= {"method": "measured", "record": record}
-    return {
+    out = {
         "drafter": spec.method,
         "draft_tokens": spec.num_speculative_tokens,
         "input": said,
         "rates": spec.synthetic_acceptance_rates,
         "distribution": dict(scheduler.engine_stats.distribution),
     }
+    if (lists := run.get(ACCEPTANCE_LISTS)) is not None:
+        said["requests"] = sum(map(len, lists.values()))
+        out["replayed_requests"] = _replayed_requests
+    return out
 
 
 def _block_file(now: Path) -> Path:
@@ -2321,6 +2384,11 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
                 "distribution": seen,
                 "mean_acceptance_length": mean,
             }
+            if "replayed_requests" in h["speculative"]:
+                before = since.get(n, {}).get("speculative", {})
+                speculative[n]["replayed_requests"] -= before.get(
+                    "replayed_requests", 0
+                )
     if speculative:
         summary["speculative"] = speculative
     return summary

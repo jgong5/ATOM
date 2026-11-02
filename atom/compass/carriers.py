@@ -11,6 +11,11 @@ the ``compass`` field of its ``kv_transfer_params``, ``a:<arrival>;s:<seq>``,
 which the router copies onto the decode request. The arrival is written as
 ``repr(float)``, so it parses back exactly.
 
+A speculative request may carry the drafts each of its verify rows accepted as
+a second entry, ``compass-acceptance=<digits>``, one base-36 digit a row in
+row order, written after the ``compass`` entry; a router that restamps the
+``compass`` entry keeps it. Its value may pass W3C's 256 characters.
+
 A client's cancel of a request is itself a stamped request to the same URL,
 whose body names the cancelled request's seq: ``{"compass_cancel": <seq>}``.
 A router hands a cancel on along the request's path; on a relay it carries
@@ -27,6 +32,8 @@ _NUM = r"(inf|\d[\d.e+-]*)"
 _ENTRY = re.compile(rf"a:{_NUM};s:(\d+)")
 _COMMENT = re.compile(rf": compass a={_NUM} s=(\d+)")
 _MAX_ENTRIES = 32
+ACCEPTANCE_KEY = "compass-acceptance"
+_DIGITS = re.compile(r"[0-9a-z]+")
 
 
 def _parse(pattern: re.Pattern, text: str, what: str) -> tuple[float, int]:
@@ -55,16 +62,40 @@ def tracestate_stamp(header: str | None) -> tuple[float, int] | None:
     return _parse(_ENTRY, found[0], "tracestate entry")
 
 
-def tracestate_with(header: str | None, arrival: float, seq: int) -> str:
-    """`header` with the ``compass`` entry for ``(arrival, seq)`` first.
+def tracestate_with(
+    header: str | None, arrival: float, seq: int, acceptance: str | None = None
+) -> str:
+    """`header` with the ``compass`` entry for ``(arrival, seq)`` first, and
+    with `acceptance` the ``compass-acceptance`` entry after it.
 
     The other entries keep their order; empty ones are dropped, and so are
     entries from the end past W3C Trace Context's limit of 32.
     """
     if tracestate_stamp(header) is not None:
         raise ValueError(f"tracestate {header!r} already has a compass entry")
+    ours = [f"compass=a:{arrival!r};s:{seq}"]
+    if acceptance is not None:
+        if not _DIGITS.fullmatch(acceptance):
+            raise ValueError(f"acceptance {acceptance!r} is not base-36 digits")
+        ours.append(f"{ACCEPTANCE_KEY}={acceptance}")
     others = [e.strip() for e in (header or "").split(",") if e.strip()]
-    return ",".join([f"compass=a:{arrival!r};s:{seq}", *others][:_MAX_ENTRIES])
+    return ",".join([*ours, *others][:_MAX_ENTRIES])
+
+
+def tracestate_acceptance(header: str | None) -> str | None:
+    """The digits of the ``compass-acceptance`` entry in `header`; None without one."""
+    found = [
+        value
+        for key, _, value in (
+            e.strip().partition("=") for e in (header or "").split(",")
+        )
+        if key == ACCEPTANCE_KEY
+    ]
+    if len(found) > 1:
+        raise ValueError(f"tracestate {header!r} has more than one {ACCEPTANCE_KEY}")
+    if found and not _DIGITS.fullmatch(found[0]):
+        raise ValueError(f"malformed {ACCEPTANCE_KEY} entry {found[0]!r}")
+    return found[0] if found else None
 
 
 def stamp_events(text: str, rt) -> str:

@@ -37,6 +37,10 @@ check, and refuses `--coverage`.
 `--acceptance-record` names a speculative `compass record` directory: its
 histograms' rates (`measured`) go to ATOM as ``--spec-decode-acceptance-rates``,
 and the run file names the record, so the summary states the input ``measured``.
+When the record holds its client run's raw records, the run file's
+``acceptance_lists`` also holds the drafts each verify row of each of its
+requests accepted (`per_request`), which the client sends with the request of
+the same conversation and turn, and the engine replays in place of the rates.
 
 Once the server stops, run.json gains, beside `serve`'s identity: `run_file`,
 the run file the server was handed; `step_roofline`, the run file's key,
@@ -50,10 +54,12 @@ member an engine read states, empty when every one was measured.
 """
 
 import argparse
+import gzip
 import json
 import re
 import tempfile
 from collections import Counter, defaultdict
+from itertools import pairwise
 from pathlib import Path
 
 from atom.compass import run as compass_run
@@ -61,6 +67,7 @@ from atom.compass.artifacts import ArtifactStore, Kind
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.step_grid_plan import BOUNDS, coverage
 from atom.compass.drive import runfile, serve
+from atom.compass.parity.client_run import response_id
 from atom.compass.run import (
     OP_GRAPH,
     PRICE_LIST,
@@ -78,6 +85,9 @@ SHAPING = (*BOUNDS, "ladder", "tensor_parallel_size")
 #: A number standing alone in a reason, which `op_coverage` masks so one cause
 #: at many steps' counts is one reason; a kernel's name keeps its digits.
 NUMBER = r"(?<![\w.])\d+(?:\.\d+)?"
+#: A record's client run's raw records, compressed or not yet.
+RAW_RECORDS = ("profile_export_raw.jsonl.gz", "profile_export_raw.jsonl")
+DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
 def main(argv: list[str]) -> None:
@@ -106,6 +116,13 @@ def main(argv: list[str]) -> None:
             ",".join(map(str, rates)),
         ]
         run[compass_run.ACCEPTANCE_RECORD] = str(Path(record).resolve())
+        lists, left = per_request(record, len(rates))
+        if lists:
+            run[compass_run.ACCEPTANCE_LISTS] = lists
+        print(
+            f"compass run: {record}: accepted drafts listed for "
+            f"{sum(map(len, lists.values()))} requests; left out: {dict(left) or 'none'}"
+        )
     report = check(args.coverage, run, atom_args) if args.coverage else None
     serve.serve(atom_args, args.out, run=run)
     write_grading(args.out, report)
@@ -189,6 +206,99 @@ def measured(record, atom_args, ranks: int) -> list[float]:
             f"ATOM's arguments run {ranks} DP ranks"
         )
     return [sum(n for a, n in counts.items() if a > i) / rows for i in range(width)]
+
+
+def per_request(record, width: int) -> tuple[dict, Counter]:
+    """The drafts each verify row of each finished request of `record`'s client
+    run accepted, one base-36 digit a row, by its conversation and turn; and the
+    requests left out, counted by why. A record with no raw records gives none.
+
+    The scheduler reads a step's output a step late, and grows a decoding
+    request's context once per verify row by one more than the drafts of the
+    last output it read: so between its verify rows ``i`` and ``i + 1`` the
+    context grows by ``width + 1`` for ``i = 1``, the prefill's token, and by
+    one more than row ``i - 1``'s accepted drafts after that. The last two
+    rows' drafts have no growth after them. The output length the stream's
+    usage states says how many of them the request read: none when the growths
+    account for all of it, one when the rest fits one row's ``width + 1``
+    tokens, else two; each is stated as ``width``, which ends the request at
+    that row, since tokens past its limit are dropped. A row after those was
+    scheduled before the request's end was read, and is left to the rates.
+    Left out: a request the client recorded no response id, usage or success
+    for, one the steps do not name, one a prefill row follows a verify row of
+    (preempted), and one whose growths and length disagree.
+    """
+    record, rows, ids, preempted = Path(record), defaultdict(list), {}, set()
+    raw = [p for n in RAW_RECORDS if (p := record / "artifacts" / n).is_file()]
+    if not raw:
+        return {}, Counter()
+    if width >= len(DIGITS):
+        raise ValueError(f"a draft width of {width} needs more than one digit a row")
+    for path in (record / serve.STEPS).glob("dp*[0-9].jsonl"):
+        with path.open() as lines:
+            for line in map(json.loads, lines):
+                for req, _, *rid in line["named"]:
+                    if rid:
+                        ids[rid[0]] = (path.stem, req)
+                if line["is_dummy_run"]:
+                    continue
+                for (req, _, context), (_, _, decode) in zip(
+                    line["batch"], line["rows"]
+                ):
+                    if decode:
+                        rows[path.stem, req].append(context)
+                    elif (path.stem, req) in rows:
+                        preempted.add((path.stem, req))
+    lists, left = {}, Counter()
+    with (gzip.open if raw[0].suffix == ".gz" else open)(raw[0], "rb") as lines:
+        for r in map(json.loads, lines):
+            meta, responses = r["metadata"], r.get("responses") or ()
+            length, at = _length(responses), ids.get(response_id(responses))
+            if length is None or r.get("error") or meta.get("was_cancelled"):
+                left["unfinished"] += 1
+            elif at is None:
+                left["not in the steps"] += 1
+            elif at in preempted:
+                left["preempted"] += 1
+            elif (digits := _digits(rows.get(at, []), length, width)) is None:
+                left["growths disagree with the length"] += 1
+            elif digits:
+                turns = lists.setdefault(meta["conversation_id"], {})
+                if str(meta["turn_index"]) in turns:
+                    raise ValueError(
+                        f"{record}: two requests of conversation "
+                        f"{meta['conversation_id']} turn {meta['turn_index']}"
+                    )
+                turns[str(meta["turn_index"])] = digits
+    return lists, left
+
+
+def _length(responses) -> int | None:
+    """The completion tokens the last usage a stream's data chunks state."""
+    for message in reversed(responses):
+        for p in message.get("packets", ()):
+            if (
+                p["name"] == "data"
+                and '"usage"' in p["value"]
+                and (usage := json.loads(p["value"]).get("usage"))
+            ):
+                return usage["completion_tokens"]
+    return None
+
+
+def _digits(contexts: list[int], length: int, width: int) -> str | None:
+    """The digits of a request whose verify rows held `contexts` and whose
+    output was `length` tokens (`per_request`); None when the two disagree."""
+    known = [b - a - 1 for a, b in pairwise(contexts[1:])]
+    rest = length - 1 - sum(a + 1 for a in known)
+    tail = 0 if rest == 0 else 1 if rest <= width + 1 else 2
+    if contexts[1:2] and contexts[1] - contexts[0] != width + 1:
+        return None
+    if not all(0 <= a <= width for a in known) or rest < 0 or rest > 2 * width + 2:
+        return None
+    if len(contexts) - len(known) - tail not in (0, 1):
+        return None
+    return "".join(DIGITS[a] for a in [*known, *[width] * tail])
 
 
 def check(inputs, run: dict, atom_args) -> dict:

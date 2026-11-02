@@ -55,6 +55,7 @@ output rather than the object itself, for the same reason.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
@@ -107,8 +108,10 @@ class DeferredTokenStream:
     ATOM's forced acceptance resolves to, one per draft. Each row of a decode
     batch that verifies drafts accepts `a` of them, drawn from a stream seeded
     by `seed`: `a >= i + 1` with probability `rates[i]`, the distribution
-    ATOM's synthetic rejection kernel draws. Every row reports one draft id per
-    rate.
+    ATOM's synthetic rejection kernel draws. A request whose batch carried its
+    accepted drafts (``compass_acceptance``: request id to one base-36 digit a
+    verify row) accepts its next digit's instead, while it has one. Every row
+    reports one draft id per rate.
     """
 
     def __init__(
@@ -123,6 +126,8 @@ class DeferredTokenStream:
         self.prev_batch: Any = None
         self.rates = rates
         self.rng = np.random.default_rng(seed)
+        # request id -> the digits of its verify rows still to come
+        self.replays: dict[Any, Iterator[int]] = {}
 
     @staticmethod
     def is_pure_middle_chunk(batch: Any) -> bool:
@@ -135,6 +140,8 @@ class DeferredTokenStream:
 
     def step(self, batch: Any) -> dict[str, Any]:
         """The batch output a predicted step reports, as constructor arguments."""
+        for req_id, digits in getattr(batch, "compass_acceptance", {}).items():
+            self.replays.setdefault(req_id, (int(d, 36) for d in digits))
         if self.is_pure_middle_chunk(batch):
             # Same requests, no tokens, and the deferred flag left clear. The
             # flag is passed rather than left to the constructor default
@@ -166,6 +173,15 @@ class DeferredTokenStream:
         if k and not source.total_tokens_num_prefill:  # ATOM verifies no prefill
             u = self.rng.random((width, 1))
             accepted[:] = (u < np.asarray(self.rates[:k])).sum(axis=1)
+            for i, req_id in enumerate(req_ids):
+                if (a := next(self.replays.get(req_id, iter(())), None)) is None:
+                    continue
+                if a > k:
+                    raise ValueError(
+                        f"request {req_id}'s acceptance names {a} accepted drafts "
+                        f"at a row that verified {k}"
+                    )
+                accepted[i] = a
             rejected[:] = k - accepted
         # Picked by request id: requests fewer than len(ids) apart never share one.
         ids = [self.token_ids[int(r) % len(self.token_ids)] for r in req_ids]

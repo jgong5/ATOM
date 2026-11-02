@@ -4,7 +4,9 @@
 Runs in each aiperf worker. The traffic LP in ``timing_manager`` stamps every
 request it sends with an ``(arrival, seq)`` on the HTTP channel and publishes it
 on the adapter's stamp socket, keyed by credit; the stamp and the credit reach
-the worker in either order. The request carries its stamp in ``tracestate``.
+the worker in either order. The request carries its stamp in ``tracestate``,
+and, when the run file's ``acceptance_lists`` hold its conversation and turn,
+the drafts each of its verify rows accepted there too.
 Each SSE event ATOM streams back carries its own stamp in a comment line; the
 transport reports each one to the traffic LP as it arrives, ``[DONE]`` marked
 final, and rewrites the record's times from the stamps, so aiperf's TTFT, ITL
@@ -72,6 +74,10 @@ class CompassTransport(AioHttpTransport):
         self._push = ctx.socket(zmq.PUSH)
         self._push.connect(reports)
         self._reader = asyncio.create_task(self._read_stamps())
+        from atom.compass import run as compass_run
+
+        run = compass_run.spec() or {}
+        self._acceptance = run.get(compass_run.ACCEPTANCE_LISTS, {})
 
     @on_stop
     async def _close_traffic_lp(self) -> None:
@@ -120,8 +126,12 @@ class CompassTransport(AioHttpTransport):
         headers = super().build_headers(request_info)
         arrival, seq = self._sending[self._key(request_info)]
         old = [k for k in headers if k.lower() == "tracestate"]
+        turns = self._acceptance.get(request_info.conversation_id, {})
         headers["tracestate"] = tracestate_with(
-            ",".join(headers.pop(k) for k in old) or None, arrival, seq
+            ",".join(headers.pop(k) for k in old) or None,
+            arrival,
+            seq,
+            turns.get(str(request_info.turn_index)),
         )
         return headers
 

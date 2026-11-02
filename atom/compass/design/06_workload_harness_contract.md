@@ -143,6 +143,7 @@ dedicated one.
 |---|---|---|
 | request -> | the `compass` entry of the `tracestate` header, `compass=a:<arrival_s>;s:<seq>` | when this request counts as arriving, on the run's simulated timeline, and its sequence number on the channel |
 | <- response | an SSE comment line before each streamed event, `: compass a=<t> s=<seq>`; not streamed, a `compass` response header, `compass: a=<t>;s=<seq>` | when that event reaches the harness on the simulated timeline: the first content event's is `first_token_s`, the last event's `finish_s` |
+| request -> | on a speculative request with a list, the `compass-acceptance` entry of `tracestate`, one base-36 digit a verify row | the drafts each of its verify rows accepted in the paired real run, which the simulated run replays (`14` D84) |
 
 **Revised 2026-09-28 (#443): a header entry and SSE comment lines, not body fields.**
 Atomesh re-serializes a chat request through a typed struct that keeps no unknown
@@ -193,6 +194,11 @@ its arrival is granted, so ATOM never sees it early, and a request whose arrival
 already behind the frontend's clock when it is read is a straggler that fails the run
 (`01` D3.2). There is no silent clamp
 left to detect.
+
+**Added 2026-11-02 ([#2574](https://github.com/jgong5/ATOM/issues/2574)): a
+speculative request's accepted drafts (in)**, `14` D84's contract 3. Like `arrival_s` it
+is stated, not derivable: the server computes no logits. It is an entry of its own, not
+a member of `compass`, because a router restamps `compass` and keeps the other entries.
 
 **What was considered and rejected as a fourth field:** a per-step or per-token timeline.
 It would make TPOT *distribution* gradeable rather than just its mean. Rejected because
