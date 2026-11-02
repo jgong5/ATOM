@@ -31,8 +31,10 @@ from atom.compass.backends.step_stub import StepStubBackend
 from atom.compass.parity import recurrence
 from atom.compass.runner import overrides
 from atom.compass.runner.overrides import (
+    ADMISSION_IN_E,
     FORWARD_KINDS,
     HOST_SEGMENTS,
+    PP_RECV_SEGMENT,
     HostDeviceRecurrence,
 )
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
@@ -238,18 +240,18 @@ class Priced:
 
 
 def driven(admit, stage=None, skip=()):
-    """`Priced`'s record of ATOM's own run of four 200-token prompts, each
+    """`Priced` after ATOM's own run of four 200-token prompts, each
     prefilled in four chunks of 64 tokens and decoded."""
     priced = Priced(admit, stage, skip)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(overrides, "_group_step_seconds", lambda _, b, *a: priced(b))
         _drive()
-    return priced.out
+    return priced
 
 
 def test_a_run_charges_each_request_s_admission_on_its_first_forward():
     seen, admitting = set(), 0
-    for ids, e, admitted in driven(ADMIT):
+    for ids, e, admitted in driven(ADMIT).out:
         new = [r for r in ids if r not in seen]
         seen.update(ids)
         # Each prompt of 200 tokens fills 13 blocks of 16; none is cached.
@@ -257,14 +259,34 @@ def test_a_run_charges_each_request_s_admission_on_its_first_forward():
         assert e == pytest.approx(1e-4 + np.dot(ADMIT, admitted), rel=1e-12)
         admitting += len(new)
     assert admitting == len(seen) == 4
-    bare = [e for _, e, _ in driven(None)]
+    bare = [e for _, e, _ in driven(ADMISSION_IN_E).out]
     assert bare == pytest.approx([1e-4] * len(bare), rel=1e-12)
 
 
 def test_skipping_e_skips_its_admission_and_a_later_stage_admits_nothing():
-    assert {e for _, e, _ in driven(ADMIT, skip=("E",))} == {0.0}
-    later = [e for _, e, _ in driven(ADMIT, stage=(1, 2))]
+    assert {e for _, e, _ in driven(ADMIT, skip=("E",)).out} == {0.0}
+    later = [e for _, e, _ in driven(ADMIT, stage=(1, 2)).out]
     assert later == pytest.approx([1e-4] * len(later), rel=1e-12)
+
+
+def test_a_run_whose_admit_is_null_refuses_each_request_s_first_forward_by_name():
+    """The runner reads each batch's admissions though no law prices them, so
+    each of the four requests' first forwards is refused by name and charged
+    with its segments at 0, the rest charged."""
+    priced = driven(None)
+    admitting = [a for *_, a in priced.out if a and a[0]]
+    assert admitting == [(1, 208, 0)] * 4
+    refused = vars(priced.r).get("_refused_commands")
+    assert refused == ["cost:host: no law for admit"] * 4
+
+
+def test_a_receiving_stage_with_no_admit_refuses_no_admission():
+    """A later pipeline stage runs no `schedule()`: it neither charges nor
+    refuses the admissions of the batch it receives."""
+    law = {g: [1e-4, 0, 0] for g in (*HOST_SEGMENTS, PP_RECV_SEGMENT)}
+    stage = HostDeviceRecurrence({"prefill": law}, (), lambda: 0.0, (1, 2), admit=None)
+    stage.charge(_first(), 0.01, 0.0)
+    assert stage.segments["E"] == pytest.approx(1e-4)
 
 
 def test_the_hit_a_run_reads_is_the_tokens_the_first_row_starts_from():
@@ -341,7 +363,7 @@ def test_an_output_forward_s_device_start_lag_counts_its_admission():
 
     assert (
         lag(1e-3, [2e-3, 0, 0])
-        == pytest.approx(lag(3e-3, None))
+        == pytest.approx(lag(3e-3, ADMISSION_IN_E))
         == pytest.approx(1.5e-3)
     )
-    assert lag(1e-3, None) == pytest.approx(3.5e-3)
+    assert lag(1e-3, ADMISSION_IN_E) == pytest.approx(3.5e-3)
