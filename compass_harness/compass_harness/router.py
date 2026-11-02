@@ -4,7 +4,8 @@
 Every credit leaves through ``send_credit`` (``CreditIssuer._issue_credit_internal``
 is its one call site), so the stamp is taken there; every return reaches the
 strategy only through the return callback, so the hold wraps it. aiperf's
-cancel of the requests in flight goes through the traffic LP first.
+cancel of the requests in flight goes through the traffic LP first. The
+controller hears when the traffic LP is done, or the error that failed it.
 """
 
 import asyncio
@@ -14,6 +15,7 @@ from aiperf.common.messages import BaseServiceErrorMessage, ProfileCancelCommand
 from aiperf.common.models.error_models import ErrorDetails
 from aiperf.credit.sticky_router import StickyCreditRouter
 
+from compass_harness.controller import TrafficDone
 from compass_harness.scheduler import ClockPacedLoopScheduler
 from compass_harness.traffic_lp import TrafficLP
 from compass_harness.transport import credit_key
@@ -23,7 +25,7 @@ class CompassCreditRouter(StickyCreditRouter):
     def __init__(self, *args, service_id: str, **kwargs) -> None:
         super().__init__(*args, service_id=service_id, **kwargs)
         self.service_id = service_id
-        # Tells the controller when the traffic LP fails.
+        # Tells the controller when the traffic LP is done or fails.
         self._bus = self.comms.create_pub_client(CommAddress.EVENT_BUS_PROXY_FRONTEND)
         self.traffic = TrafficLP.from_env()
         ClockPacedLoopScheduler.clock = self.traffic
@@ -52,7 +54,15 @@ class CompassCreditRouter(StickyCreditRouter):
         self.traffic.finish()
 
     def _on_finish(self, done: asyncio.Future) -> None:
-        if not done.cancelled() and done.exception() is not None:
+        if done.cancelled():
+            return
+        if done.exception() is None:
+            # The controller's shutdown waits for this: until the +inf grant the
+            # loop was blocked in the traffic LP's last clock wait.
+            asyncio.ensure_future(
+                self._bus.publish(TrafficDone(service_id=self.service_id))
+            )
+        else:
             # The traffic LP failed: a request was open at the +inf grant, or one
             # failed mid-stream before it.
             self.exception(f"traffic LP: {done.exception()!r}")

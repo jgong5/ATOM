@@ -17,3 +17,13 @@ transport:
     metadata:
       transport_type: http
       url_schemes: [http, https]
+
+service:
+  system_controller:
+    class: compass_harness.controller:CompassSystemController
+    description: |
+      aiperf's system controller, whose shutdown also waits for the traffic
+      LP's +inf grant, so it never kills the timing manager before it.
+    metadata:
+      required: true
+      auto_start: false
