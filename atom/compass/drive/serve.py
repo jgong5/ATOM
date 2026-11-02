@@ -5,8 +5,11 @@ command is stopped or the server exits.
 A server handed a run file is simulated, and co-hosts its clock authority
 unless it joins one its run file names. One without a run file is real, on the
 GPUs the command names, which `gpu.quiet` checks before the server starts and
-after it stops. ATOM's arguments pass verbatim; the driver assigns the host,
-127.0.0.1 unless the command names another, its ports and the run file, and
+after it stops; given an artifact store, its start merges the store's JIT cache
+library for the stack into the container's caches and its stop writes back
+what it finished compiling (`jit_cache`). ATOM's arguments pass verbatim; the
+driver assigns the host, 127.0.0.1 unless the command names another, its ports
+and the run file, and
 refuses them, and the clock endpoint flag, among ATOM's arguments; an op graph
 run's file also holds ATOM's arguments, from which its engines trace a shape
 the store lacks (`run.ATOM_ARGS`). Each start
@@ -44,8 +47,9 @@ from pathlib import Path
 
 import atom
 from atom.compass import parity
+from atom.compass.drive import jit_cache
 from atom.compass.drive.gpu import KFD, hip_visible, quiet
-from atom.compass.drive.identity import identity
+from atom.compass.drive.identity import _device, _stack, identity
 from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _write_whole
 
 SERVER = (sys.executable, "-m", "atom.entrypoints.openai.api_server")
@@ -103,7 +107,14 @@ class ServeError(ValueError):
 
 
 def serve(
-    atom_args, out, gpus=(), run=None, extra_env=None, host=HOST, joined=False
+    atom_args,
+    out,
+    gpus=(),
+    run=None,
+    extra_env=None,
+    host=HOST,
+    joined=False,
+    store=None,
 ) -> None:
     """Serve one instance from ATOM's arguments `atom_args`, writing to the
     directory `out`, until SIGINT or SIGTERM or the server's exit.
@@ -115,9 +126,12 @@ def serve(
     server binds `host`, which its URL names. `extra_env` maps variables the
     server's environment holds over the command's. Raises `ServeError` when
     the server exits before ``/health`` answers, or on its own with a non-zero
-    status, and `GpuRefusal` from the GPU checks. Once the server has stopped,
-    writes run.json from the engine file, and raises `ServeError` when no step
-    wrote one.
+    status, and `GpuRefusal` from the GPU checks. Given `store`, an artifact
+    store's root, a real server's start merges the store's JIT cache library
+    for the stack on `gpus` into the container's caches, and its stop writes
+    back what it finished compiling since the merge. Once the server has
+    stopped, writes run.json from the engine file, and raises `ServeError` when
+    no step wrote one.
     """
     _refuse(atom_args)
     model = _model(atom_args)
@@ -126,6 +140,7 @@ def serve(
             "a server is real, on the GPUs it names, or simulated, from a run "
             f"file, exactly one; got gpus={gpus} and a run file: {run is not None}"
         )
+    library = jit_cache.library(store, _stack(), _device(gpus)) if store else None
     out = Path(out)
     if out.exists() and any(out.iterdir()):
         raise ServeError(f"{out} holds an earlier run's files; one run per directory")
@@ -160,6 +175,9 @@ def serve(
         ready |= {"clock_endpoint": run["clock_endpoint"], "run_file": str(run_file)}
     with held, _stop_signals() as stopped, quiet(gpus, out) if gpus else nullcontext():
         kfd = _kfd() if gpus else None
+        since = time.time_ns()
+        if library:
+            jit_cache.restore(library)
         with (out / LOG_FILE).open("w") as log:
             server = subprocess.Popen(
                 argv,
@@ -185,6 +203,8 @@ def serve(
             _stop(server.pid, kfd)
             server.wait()
             drop_compiled(out / LOG_FILE)
+            if library:
+                jit_cache.save(library, since)
     if not stopped and server.returncode:
         raise ServeError(f"the server exited {server.returncode}; see {out / LOG_FILE}")
     # Any rank's: every DP rank resolves one engine configuration.
