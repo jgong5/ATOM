@@ -205,8 +205,9 @@ built now.**
 
 Rationale: per-step accepted-token counts are too heavy to carry for a 300-second,
 multi-thousand-request replay, and the statistics are a good trade for what they cost.
-Contract 2 is the one to use for acceptance cells; contract 1 is what makes *"what if the
-draft head reaches AL 3.0"* answerable at all.
+Contract 2 is the one to use for M2's MTP acceptance cells; contract 1 is what makes
+*"what if the draft head reaches AL 3.0"* answerable at all, and stage 4's exit cells use
+it, one stated length on the real and simulated runs alike (D87, *Milestone placement*).
 
 Contract 3 stays on the shelf rather than being rejected: it is the only way to close the
 correlation gap above, and if a result ever turns out to depend on it, the transport is
@@ -277,9 +278,8 @@ terms carry the methods their own inputs give them, whatever the acceptance inpu
 
 Input 3 is legitimate and is what makes *"what if the draft head reaches AL 3.0"* a question
 Compass can answer. It is **not** legitimate in an acceptance run whose real side drafted
-without it, and `08`'s hygiene refusals gain a row saying so. When the paired real run
-states the same AL through the same flag, both sides accept by one schedule and the cell
-grades time at that acceptance (D87).
+without it, and `08`'s hygiene refusals gain a row saying so; D87 gives the row and when a
+stated AL is evidence.
 
 ---
 
@@ -361,7 +361,10 @@ bound. Compass runs ATOM's sizing and never re-derives the count — which is `0
 Concretely, for acceptance cells:
 
 1. Run the real side. Record `SpecStats.distribution`.
-2. Feed the measured per-position rates to the simulated side (D84 input 1).
+2. Give the simulated side the real side's acceptance: for M2's MTP cells, the measured
+   per-position rates (D84 input 1); for stage 4's, the same
+   `--spec-decode-acceptance-length` the real side ran with (D84 input 3,
+   *Milestone placement*).
 3. Report the three results of `08` D44 as usual — **plus** an acceptance-agreement check
    between the two sides, at the right strength — which is weaker than exact agreement,
    for the reason D84 gives. What is checkable:
