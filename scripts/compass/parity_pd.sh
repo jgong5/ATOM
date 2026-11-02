@@ -121,6 +121,7 @@ python3 - "$RUN" "$OUT" "${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog1
     "$PREFILL_DP" "$DECODE_DP" "${urls[@]}" <<'EOF'
 import json, re, sys
 from pathlib import Path
+from atom.compass.drive.runfile import KV_WRITE_REQ_S
 
 run, out, machine, model, store, port, prefills, decodes, dp_p, dp_d, *urls = sys.argv[1:]
 machine = json.loads(Path(machine).read_text())
@@ -144,7 +145,7 @@ for url, rank in re.findall(r"Registered worker (\S+)@(\d+) ", log):
 Path(run).write_text(json.dumps({
     "clock_endpoint": f"tcp://127.0.0.1:{port}", "bound_s": 1e7,
     "admission_path": "serving", "ipc_s": 2.0**-14, "stream_s": 2.0**-12,
-    "router_s": 2.0**-12, "kv_write_req_s": 2.0**-10, "kv_link": "intra_node",
+    "router_s": 2.0**-12, "kv_write_req_s": KV_WRITE_REQ_S, "kv_link": "intra_node",
     "replay": f"{out}/real/record", "step_stub": {}, "machine": machine, "store": store,
     "prefill_data_parallel_size": int(dp_p), "decode_data_parallel_size": int(dp_d),
     "out_dir": f"{out}/sim",

@@ -21,8 +21,10 @@
 #   <router args>  `atomesh launch` arguments, as given; the script adds the
 #                  router's host and ports, --pd-disaggregation and each
 #                  instance's URL; run with --dp-aware runs the router as LP
-#                  `router`, refusing an ATOMESH not built from this tree.
-#                  run refuses --prefill and --decode, a worker more to
+#                  `router`, refusing an ATOMESH not built from this tree,
+#                  and the run file gains `router_in_s`, each hop into it,
+#                  at `ipc_s`, borrowed: Atomesh logs no receipt to measure
+#                  its own from. run refuses --prefill and --decode, a worker more to
 #                  choose, and --max-concurrent-requests and
 #                  --rate-limit-tokens-per-second, a limiter on the wall
 #                  clock; it sets --request-timeout-secs (`_lib.sh`) and

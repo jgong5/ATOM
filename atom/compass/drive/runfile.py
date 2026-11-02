@@ -68,8 +68,13 @@ FIXED = {
     "stream_s": 159e-6,
     "bound_s": 1e7,
 }
-#: A prefill-decode run's write-request lookahead, which no measurement backs.
-KV_WRITE_REQ_S = 2.0**-10
+#: A prefill-decode run's write-request lookahead: decode's send call to
+#: prefill's receipt, measured on hjbog-srdc-18 by
+#: `scripts/compass/http_intake.py pd` over real TP1 1P1D runs, the p10 of the
+#: receipts that found prefill inside a forward. The hop is priced
+#: uncontended: a receipt waits on prefill's worker freeing the GIL, mostly
+#: during kernel launches, which is ATOM's to fix.
+KV_WRITE_REQ_S = 106e-6
 #: A law file's host laws and their fit report, which are not its step law.
 HOST_MEMBERS = ("host", "host_fit")
 

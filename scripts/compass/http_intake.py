@@ -6,7 +6,7 @@
     python3 scripts/compass/http_intake.py floor STAMPS ARRIVALS
     python3 scripts/compass/http_intake.py idle STAMPS [PER_BYTE_S]
     python3 scripts/compass/http_intake.py hops STAMPS HANDOFF ARRIVALS
-    python3 scripts/compass/http_intake.py pd STAMPS
+    python3 scripts/compass/http_intake.py pd STAMPS [STEPS]
 
 `serve` runs `atom.entrypoints.openai.api_server` as ``python3 -m`` does and
 appends ``<end ns> <thread id> body|tmpl|app|prep|send|out|head <start ns> <size>`` to STAMPS for
@@ -40,7 +40,11 @@ head sent to the client reading it (ARRIVALS' ``admitted_ns``). Prints each hop'
 p90 and N, and the three inputs' sha256, as JSON.
 `pd` reads a prefill and a decode server's shared STAMPS (`parity_pd.sh` with
 HTTP_INTAKE): ``kv_write_req``, each write request's send call on decode to prefill's
-receipt, its median, p10, p90 and N, and the sha256, as JSON.
+receipt, its median, p10, p90 and N, and the sha256, as JSON. With STEPS, prefill's
+step record (``dp0.jsonl``), it adds the same by prefill's state at each receipt
+(``by_state``): ``idle`` between forwards, ``forward`` inside one, split into
+``launch``, inside its kernel launches, and ``outside`` them; and the record's
+sha256. Several runs pool as their STAMPS and their STEPS each concatenated.
 
 `fit` reads a burst of N first-turn requests (default 256), which the loop takes
 in one at a time: each gap between template starts is the next request's
@@ -347,7 +351,7 @@ def hops(stamps: str, handoff: str, arrivals: str) -> dict:
     }
 
 
-def pd(stamps: str) -> dict:
+def pd(stamps: str, steps: str | None = None) -> dict:
     data = Path(stamps).read_bytes()
     rows = [line.split() for line in data.decode().splitlines()]
     # One decode rank writes to one prefill rank on one connection, which
@@ -355,10 +359,29 @@ def pd(stamps: str) -> dict:
     # take the GIL back after prefill took the request in.
     sent = [int(r[3]) for r in rows if r[2] == "kvsend"]
     got = [int(r[0]) for r in rows if r[2] == "kvrecv"]
-    return {
+    out = {
         "kv_write_req": _hop(sent, got, "kv_write_req", alone=False),
         "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
     }
+    if steps is None:
+        return out
+    # Each receipt by prefill's state then: between forwards, or inside a
+    # forward, and there inside its kernel launches or outside them.
+    steps_data = Path(steps).read_bytes()
+    lines = [json.loads(line) for line in steps_data.decode().splitlines()]
+    fw = [(s["t_enter_ns"], s["t_exit_ns"], *s["t_launch_ns"]) for s in lines]
+    by: dict[str, tuple[list, list]] = {}
+    for s, g in zip(sorted(sent), sorted(got)):
+        states = ["idle"]
+        for enter, exit_, l0, l1 in fw:
+            if enter <= g <= exit_:
+                states = ["forward", "launch" if l0 <= g <= l1 else "outside"]
+        for state in states:
+            by.setdefault(state, ([], []))[0].append(s)
+            by[state][1].append(g)
+    out["by_state"] = {k: _hop(*v, k, alone=False) for k, v in sorted(by.items())}
+    out["steps"] = f"sha256:{hashlib.sha256(steps_data).hexdigest()}"
+    return out
 
 
 if __name__ == "__main__":
@@ -372,6 +395,6 @@ if __name__ == "__main__":
     elif verb == "hops":
         print(json.dumps(hops(stamps, *rest)))
     elif verb == "pd":
-        print(json.dumps(pd(stamps)))
+        print(json.dumps(pd(stamps, *rest)))
     else:
         print(json.dumps(fit(stamps, *map(int, rest))))

@@ -2,6 +2,7 @@
 """The HTTP intake probe: what it stamps on a server it runs, what its fit
 recovers, and the machine specs that state its terms."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -526,3 +527,36 @@ def test_pd_pairs_each_kv_write_request_with_its_receipt_in_order(tmp_path):
         SystemExit, match="kv_write_req: 9 arrivals, not one after each of 10"
     ):
         probe.pd(str(stamps))
+
+
+def test_pd_splits_the_hop_by_prefill_s_state_at_each_receipt(tmp_path):
+    ms, base = 10**6, 10**12
+    sent = [base + k * 10 * ms for k in range(6)]
+    # Two receipts between forwards, two inside the forward's launches, two
+    # inside it after them.
+    hops_ns = [400_000, 400_000, 2 * ms, 3 * ms, 100_000, 200_000]
+    rows = [f"{s} 1 kvsend {s} 0" for s in sent]
+    rows += [f"{s + h} 2 kvrecv {s + h} 0" for s, h in zip(sent, hops_ns)]
+    stamps, steps = tmp_path / "stamps", tmp_path / "dp0.jsonl"
+    stamps.write_text("\n".join(rows) + "\n")
+    forwards = [(base - 5 * ms, base - ms, base - 4 * ms), (base + 19 * ms, base + 60 * ms, base + 38 * ms)]  # fmt: skip
+    steps.write_text(
+        "".join(
+            json.dumps({"t_enter_ns": e, "t_exit_ns": x, "t_launch_ns": [e, l]}) + "\n"
+            for e, x, l in forwards
+        )
+    )
+    out = probe.pd(str(stamps), str(steps))
+    by = out["by_state"]
+    assert {k: v["messages"] for k, v in by.items()} == {
+        "forward": 4,
+        "idle": 2,
+        "launch": 2,
+        "outside": 2,
+    }
+    assert by["idle"]["median_s"] == pytest.approx(400e-6)
+    assert by["launch"]["median_s"] == pytest.approx(2.5e-3)
+    assert by["outside"]["median_s"] == pytest.approx(150e-6)
+    assert by["forward"]["p10_s"] == pytest.approx(130e-6)
+    assert out["kv_write_req"]["messages"] == 6
+    assert out["steps"] == "sha256:" + hashlib.sha256(steps.read_bytes()).hexdigest()
