@@ -875,8 +875,8 @@ def _proposes(samples) -> dict:
     The split whose vectors price those steps at the smallest mean
     |log(price / label)| is adopted when that cuts the unsplit vector's by
     `PROPOSE_SPLIT_GAIN`. The bound runs over the powers of two and one and a
-    half times each, below the largest prefill, with every lag again; the best
-    bounded split is adopted in its place when it cuts the adopted split's
+    half times each, below the largest prefill, with every lag again, once a
+    split is adopted: the best bounded split replaces it when that cuts its
     error by `PROPOSE_SPLIT_GAIN` too. The errors go under `near_propose`'s
     `fit.split`.
     Not a scaled MAD: unsplit, the more frequent pass length sets the MAD
