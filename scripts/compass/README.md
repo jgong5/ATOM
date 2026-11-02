@@ -1039,6 +1039,13 @@ few minutes on a server whose record nothing reads, `compass record --gpu G --ou
 $R/warm -- $ATOM` with `client.sh $R/warm --traces A-B --concurrency <C>
 --duration 300 --stop` at the record's traces, and take again any record refused
 for a build.
+What a container compiled need not be compiled again in the next one on the same
+stack: `compass record` with `$S`, and a `REAL=1 cctraces_sim.sh` run with `STORE`
+set, keep a JIT cache library per stack under the store's `jit` directory
+(`atom/compass/drive/jit_cache.py`). The server's start merges it into the
+container's caches, replacing no file there, and its stop writes back each artifact
+the server finished compiling; `compass measure memory` does the same with its
+store. A record without a store touches no library.
 
 1. `compass measure memory --gpu G $M $S --out $R/mem -- $ATOM`.
 2. Calibration, alone on the node: per concurrency 1, 4 and 16,
