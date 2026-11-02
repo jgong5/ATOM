@@ -1170,9 +1170,10 @@ then compiled once per stack, not once per container.
 **Closed by coverage.** `client.sh --sweep` drives the sweep against a running server.
 Coverage is read from the step record after the server stops, a point covered when a line
 states its batch: the scheduler, not the client, decides what each rank ran, and the
-record states it. A later sweep of the cell sends only the points still missing, so the
-rounds converge instead of repeating, and a cell is marked swept only when every point is
-covered.
+record states it. The coverage is kept in the library, per stack and cell, since a cell
+swept on one stack is unswept on the next. A later sweep of the cell sends only the points
+still missing, so the rounds converge instead of repeating, and a cell is marked swept
+only when every point is covered.
 
 **Not swept: preemption and recompute, and error paths.** The client cannot construct
 them without changing the deployment. A build there is a residual, recorded with the
@@ -1192,8 +1193,8 @@ alignment keys.
 empty library sweeps the cell to swept within three rounds, compiling every key #2634
 names; two real records of #975's workload after it name no `aiter_jit_builds`, and a
 build that does appear is traced to the batch that compiled it and classed: in a path left
-unswept above it is recorded, on a swept axis it fails the acceptance; a second fresh container on the same
-stack returns from `--sweep` at once, and its record names no build.
+unswept above it is recorded, on a swept axis it fails the acceptance; a second fresh
+container on the same stack returns from `--sweep` at once, and its record names no build.
 
 **What stays.** `06` D27's *Warmup is not a protocol feature*: sweep traffic is
 ordinary requests to a server whose record nothing grades. Detection stays as well: the
@@ -1221,7 +1222,7 @@ what it leaves.
 | D43 | Per-artifact invalidation matrix, not a global fingerprint. Every gate's state is written into the artifact and checked there. Rows for `shape_population`, `step_measurement`, `step_linear_law` and `host_laws`, and a host-CPU axis. The region-term row retired; `op_measurement` on `price_list`'s row. | 2026-09-18; rows 2026-10-13 (#851); region-term row retired, `op_measurement` 2026-10-18 (#1489); `host_laws` row gains the device, stack and PTL its machine-spec digest carries, and torch through its fingerprint, 2026-10-29 (#2484); PTL back to `-`, carried only because the digest is one hash, and a run does not yet check torch for host laws, 2026-10-30 (#2308, #2475) |
 | D38.1 | One recommended flow per half: steps (`measure memory`, `record`, `trace steps`, `measure steps` with the step grid's planner, `fit host` and `fit steps`, `run --coverage`, then grading outside the CLI), each server driven by a client started apart, and ops, after the steps half's `measure memory`, `record`, `trace steps` and `fit host` (`trace ops --population`, `measure ops --plan` over the record directories of `record` or `trace steps --out`, `fit ops` publishing a `price_list` only, then `run` and grading). Phases unchanged; the op bench, ATOM's runner preparing each point and running no forward, hosts 1b and the step bench 1c, Phase 2 is a plain startup `measure memory` runs. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); ops half 2026-10-18 (#1489); `measure ops --plan` reads record directories 2026-10-18 (#1527); op bench without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)) |
 | D40.1 | Classes (a) and p2p ride `measure ops` unchanged. Classes (b) and (c) share one new stated-entry-point benchmark inside the same multi-rank op bench, also run by `measure ops`. KV transfer is never priced. Collective prices are labelled upper bounds. | 2026-09-19; one command 2026-10-13 (#851); the multi-rank op bench 2026-10-18 (#1489) |
-| D106 | A container is warmed for a graded run by a constructed JIT sweep and a per-stack cache library; a compile in a graded run still voids it. A client against the real, unchanged deployment, no ATOM hook point, walks per DP rank, ranks in parallel, every prefill token count from 1 to the rank's batched-token budget, one step each, each step's composition designed (row offsets over every residue mod 16, 0 to 15 held requests for the state slot, TBO splits, a shared prefix, a second turn, chunked long prompts, two output tokens), a blocker prefill making each step's rows one batch; axes and ranges from the cell's engine and workload, sampling arguments copied. One library per stack (ROCm, aiter's commit, RCCL, torch, Triton, FlyDSL, gfx arch) at `<store>/jit`, `compass record --store` optional, merged in at a real server's start and written back at its stop, finished artifacts only, per compiler, atomically. `client.sh --sweep` drives it; coverage is read from the step record after the stop, a later sweep sends only missing points, and a cell is swept only when all are covered. Preemption, recompute and error paths are not swept: a build there is recorded, not a defect. Streaming the real record is deferred. | 2026-11-02 ([#2640](https://github.com/jgong5/ATOM/issues/2640#issuecomment-6568381628)) |
+| D106 | A container is warmed for a graded run by a constructed JIT sweep and a per-stack cache library; a compile in a graded run still voids it. A client against the real, unchanged deployment, no ATOM hook point, walks per DP rank, ranks in parallel, every prefill token count from 1 to the rank's batched-token budget, one step each, each step's composition designed (row offsets over every residue mod 16, 0 to 15 held requests for the state slot, TBO splits, a shared prefix, a second turn, chunked long prompts, two output tokens), a blocker prefill making each step's rows one batch; axes and ranges from the cell's engine and workload, sampling arguments copied. One library per stack (ROCm, aiter's commit, RCCL, torch, Triton, FlyDSL, gfx arch) at `<store>/jit`, `compass record --store` optional, merged in at a real server's start and written back at its stop, finished artifacts only, per compiler, atomically. `client.sh --sweep` drives it; coverage is read from the step record after the stop and kept in the library per stack and cell, a later sweep sends only missing points, and a cell is swept only when all are covered. Preemption, recompute and error paths are not swept: a build there is recorded, not a defect. Streaming the real record is deferred. | 2026-11-02 ([#2640](https://github.com/jgong5/ATOM/issues/2640#issuecomment-6568381628)) |
 
 ---
 
