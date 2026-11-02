@@ -896,8 +896,8 @@ def _proposes(samples) -> dict:
 
     def best(bounds) -> tuple | None:
         """The (error, near, far) of the best split at any lag under `bounds`."""
-        found, k, seen = None, 2**-20, set()
-        while k <= 1:
+        found, seen = None, set()
+        for k in (2.0**-n for n in range(20, -1, -1)):
             for bound in bounds:
                 short = (lags < k) & (tokens < bound)
                 if short.tobytes() in seen or (
@@ -915,7 +915,6 @@ def _proposes(samples) -> dict:
                     if bound < math.inf:
                         below["below"] = bound
                     found = (got, below, above)
-            k *= 2
         return found
 
     whole = _propose(samples)
@@ -926,8 +925,9 @@ def _proposes(samples) -> dict:
     if split is None or split[0] >= (1 - PROPOSE_SPLIT_GAIN) * without:
         return {"propose": whole}
     errors = {"error": split[0], "error_without": without}
-    grid = {b << j for b in (2, 3) for j in range(int(tokens.max()).bit_length())}
-    bounded = best(sorted(b for b in grid if b < tokens.max()))
+    top = int(tokens.max())
+    grid = [b << j for b in (2, 3) for j in range(top.bit_length()) if b << j < top]
+    bounded = best(sorted(grid))
     if bounded is not None and bounded[0] < (1 - PROPOSE_SPLIT_GAIN) * split[0]:
         errors["error_unbounded"], errors["error"] = split[0], bounded[0]
         split = bounded
