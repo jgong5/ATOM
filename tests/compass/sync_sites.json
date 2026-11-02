@@ -5500,8 +5500,8 @@
    "shape": "p2p",
    "peer": "process",
    "why": "the sweep sends a group of each DP rank's point requests to the server and waits for every one to end",
-   "mechanism": "K4",
-   "mechanism_why": "to a simulated server the sender is _Clocked, the sweep's traffic LP, whose clock owner stamps each request it sends on the traffic to frontend channel; to a real one it is _Wall, with no run configured"
+   "mechanism": "K3",
+   "mechanism_why": "a call into the sweep's sender, not a channel: to a simulated server the sender is _Clocked, the sweep's traffic LP, whose clock owner sends each request as Traffic.run does and waits for their ends in next_event; to a real one it is _Wall, with no run configured"
   },
   {
    "id": "atom/compass/drive/sweep.py::_prime::sender.send([[primer(r) for r in range(size)]])::p2p#0",
@@ -5512,8 +5512,8 @@
    "shape": "p2p",
    "peer": "process",
    "why": "the sweep sends each DP rank one request so that its engine writes its engine file, and waits for them to end",
-   "mechanism": "K4",
-   "mechanism_why": "to a simulated server the sender is _Clocked, the sweep's traffic LP, whose clock owner stamps each request it sends on the traffic to frontend channel; to a real one it is _Wall, with no run configured"
+   "mechanism": "K3",
+   "mechanism_why": "a call into the sweep's sender, not a channel: to a simulated server the sender is _Clocked, the sweep's traffic LP, whose clock owner sends each request as Traffic.run does and waits for their ends in next_event; to a real one it is _Wall, with no run configured"
   },
   {
    "id": "atom/compass/drive/sweep.py::main::send(out, workload)::p2p#0",
