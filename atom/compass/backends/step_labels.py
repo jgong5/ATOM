@@ -52,7 +52,7 @@ lead, less the exit of its token copy wait (`t_recv_ns`, else `t_read_ns`,
 else its launch's end).
 
 A step's host labels are its segments: `E` from the previous forward's exit,
-cut as idle when the two batches share no request; `W_pre` to the launch, less
+cut as idle after an idle engine (`busy_gaps`); `W_pre` to the launch, less
 the staging gate's wait; `W_launch` from the launch to the token copy wait,
 the sampler's launch included, or to the launch's end on a forward with no
 such wait, and none on a prefill the host did not pace whose launch ends
@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import bisect
 import hashlib
+import itertools
 import json
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -264,9 +265,20 @@ def join_stamps(steps: list[dict], path) -> None:
                 step[key] = ts[i]
 
 
-def _shared(step, other) -> bool:
-    """Whether two steps' batches hold a request in common."""
-    return bool({r[0] for r in step["batch"]} & {r[0] for r in other["batch"]})
+def busy_gaps(lines: list[dict]) -> list[bool]:
+    """Per line, whether the engine was busy in the gap before it, holding a
+    request an earlier line scheduled and this line or a later one schedules
+    again. A busy loop steps on at its next pull; an idle one waits there for an
+    arrival, which the gap then holds."""
+    spans: dict = {}
+    for i, s in enumerate(lines):
+        for r in s["batch"]:
+            spans[r[0]] = (spans.get(r[0], (i,))[0], i)
+    opened = [0] * (len(lines) + 1)
+    for first, last in spans.values():
+        opened[first + 1] += 1
+        opened[last + 1] -= 1
+    return [n > 0 for n in itertools.accumulate(opened[:-1])]
 
 
 def _read(record) -> list[dict]:
@@ -343,6 +355,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
     tbo = (config or {}).get("engine", {}).get("enable_tbo")
     run = run or digest(record)
     samples, table, prev, ranks = [], [], None, None
+    busy = busy_gaps(lines)
     for i, s in enumerate(lines):
         if s["is_dummy_run"]:
             prev = s
@@ -416,7 +429,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
         if copy.get(s["step"], (0, False))[1]:
             host["L_mtp"] = copy[s["step"]][0]
-        idle = prev is not None and not _shared(s, prev)
+        idle = prev is not None and not busy[i]
         if prev is not None and not idle:
             host["E"] = enter - starts[i - 1]
         host = {k: v * 1e-9 for k, v in host.items()}

@@ -313,8 +313,8 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
     and the prefill-decode keys from `--machine`, the layout and fixed code: each side's
     DP width from its ATOM arguments, `router_s` from the spec's
     `interconnect.router_relay_s` (`05`), `kv_link` from the layout, `intra_node` on one
-    node and `inter_node` across two, and `kv_write_req_s`, which no measurement backs,
-    fixed as `ipc_s` is. Its `out_dir` is the deployment directory and its
+    node and `inter_node` across two, and `kv_write_req_s`, a node-18
+    measurement fixed in code as `ipc_s` is. Its `out_dir` is the deployment directory and its
     `clock_endpoint` the authority's. The script starts the authority on it
     (`python -m atom.compass.run`), then each instance as
     `compass run --join RUN_FILE --out D/<side> -- <ATOM args>`.
@@ -358,7 +358,9 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
   `max_num_seqs`, `max_num_batched_tokens` and `max_model_len`. Its `aiter_jit_builds`
   names each JIT compile, aiter's, FlyDSL's, Triton's or Inductor's, outside ATOM's
   per-start compile cache, that the server ran or began after `/health` first answered
-  (`atom/compass/drive/aiter_jit.py`), and is absent when there was none. `record` takes no memory
+  (`atom/compass/drive/aiter_jit.py`), and is absent when there was none. An optional
+  `--store` names the store whose per-stack JIT cache library the server's start merges in
+  and its stop writes back (`07` D106); without it `record` touches no library. `record` takes no memory
   readings; `measure memory` does. `--host` binds an address other than 127.0.0.1, one a
   router on another node reaches. Steps are timed unprofiled; op times come only from a
   separate profiled pass (`--profile-ops`, ops half), which splits a step and never prices
@@ -429,7 +431,7 @@ Audited, because an absent flag is a decision and should be a visible one:
 | a workload, the client's settings | no command starts the client: a client started apart sends them, and grading reads which traces it served from the client run |
 | acceptance rate for speculative decoding | **ATOM's own flag** — `--spec-decode-acceptance-length` / `--spec-decode-acceptance-rate` already exist (`14` D83) |
 | thread-pool widths | ATOM's, per `05` D24 |
-| the run file's lookaheads, bound and admission path | fixed in code: `ipc_s`, `ipc_out_s` and `stream_s` are node-18 medians in `atom/compass/drive/runfile.py::FIXED`; only a deployment's write request's `kv_write_req_s` has none (#2603); `run` always drives the API server |
+| the run file's lookaheads, bound and admission path | fixed in code: `ipc_s`, `ipc_out_s` and `stream_s` are node-18 medians in `atom/compass/drive/runfile.py::FIXED`; a deployment's write request's `kv_write_req_s` is the node-18 hop uncontended, a p10, in `KV_WRITE_REQ_S` there, and a router LP's `router_in_s` borrows `ipc_s`, since Atomesh logs no receipt to measure it from; `run` always drives the API server |
 | the model's parameter count, the DP width | read from the model directory and from ATOM's arguments |
 
 ---
