@@ -72,7 +72,10 @@ Beside `propose` it may hold a `near_propose` vector over `[1, seqs]` with a
 than `lag` behind its host, the view's `start_lag_s` plus the step's target
 and draft-KV prices, prices the pass by it instead; a view stating no
 `start_lag_s` is refused. The pass replays one draft graph at any prefill
-length; what moves its window is how far the device runs behind its host.
+length; what moves its window is how far the device runs behind its host,
+and below that lag the prefill's length: with a `below` entry, a token count,
+only an output prefill of fewer tokens is priced by `near_propose`, and a
+longer one by `propose` whatever its lag.
 A law fitted before that split may hold in its place a `short_propose` vector
 with a `below` entry, a token count: an output prefill of fewer tokens prices
 its pass by it. A law holding both is refused.
@@ -91,7 +94,7 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
      "moe_routing": {"experts": E, "top_k": K},   # with a moe_experts column
      "draft": {"provenance": ..., "prefill": VECTOR, "decode": {...},
                "propose": VECTOR, "draft_kv": VECTOR,
-               "near_propose": VECTOR,      # with "lag": seconds
+               "near_propose": VECTOR,      # with "lag": seconds, "below": tokens
                "output_prefill_kv": true}}   # all four optional
 
     VECTOR = {"coefficients": {<feature>: seconds, ...},
@@ -256,6 +259,7 @@ class StepLinearLaw:
                 )
         self.lag = near and float(near["lag"])
         self.below = short and int(short["below"])
+        self.near_below = near and near.get("below") and int(near["below"])
         self.draft_kv = law.get("draft_kv") and _Vector(
             "draft_kv", PROPOSE, law["draft_kv"]
         )
@@ -364,7 +368,9 @@ class StepLinearBackend(CostBackend):
             propose = law.propose
             if law.short_propose and sum_tokens(prefill) < law.below:
                 propose = law.short_propose
-            if law.near_propose:
+            if law.near_propose and (
+                not law.near_below or sum_tokens(prefill) < law.near_below
+            ):
                 if batch_view.start_lag_s is None:
                     raise self._refuse(
                         batch_view,
