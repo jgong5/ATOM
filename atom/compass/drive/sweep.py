@@ -109,7 +109,9 @@ class _Clocked(Traffic):
         self.sent += len(bodies)
         while self.done < self.sent:
             if rt.next_event(math.inf) == math.inf:
-                raise RuntimeError(f"{self.sent - self.done} sweep requests never ended")
+                raise RuntimeError(
+                    f"{self.sent - self.done} sweep requests never ended"
+                )
             self._take()
 
     def close(self) -> None:
@@ -122,24 +124,40 @@ def send(out, workload: dict, sender=None) -> list[Point]:
     through `sender`; return them. `workload` is as `sweep_plan.plan` takes it."""
     out = Path(out)
     server = json.loads((out / "server.json").read_text())
-    run = json.loads(Path(server["run_file"]).read_text()) if "run_file" in server else None
+    run = (
+        json.loads(Path(server["run_file"]).read_text())
+        if "run_file" in server
+        else None
+    )
     library = _library(server, run)
     if sender is None:
         url = urlsplit(server["url"])
         if url.hostname != "127.0.0.1":
-            raise ValueError(f"the sweep sends to 127.0.0.1, and the server is at {url.hostname}")
+            raise ValueError(
+                f"the sweep sends to 127.0.0.1, and the server is at {url.hostname}"
+            )
         sender = _Clocked(run, url.port) if run else _Wall(url.port)
     fresh = _fresh(random.Random(0))
     body = {**workload.get("sampling", {}), "max_tokens": OUTPUT_TOKENS, "stream": True}
     try:
-        _prime(out / "steps", sender, lambda r: {**body, "prompt_token_ids": fresh(1), "data_parallel_rank": r})
+        _prime(
+            out / "steps",
+            sender,
+            lambda r: {**body, "prompt_token_ids": fresh(1), "data_parallel_rank": r},
+        )
         points = plan(out / "steps", workload)
         cell = _cell(points)
         seen = _seen(library, cell)
         missing = [p for p in points if _key(p) not in seen]
-        state = {"library": str(library), "cell": cell, "points": [_entry(p) for p in points]}
+        state = {
+            "library": str(library),
+            "cell": cell,
+            "points": [_entry(p) for p in points],
+        }
         (out / STATE).write_text(json.dumps(state))
-        print(f"sweep: cell {cell}: {len(points)} points planned, {len(points) - len(missing)} covered before, {len(missing)} to send")
+        print(
+            f"sweep: cell {cell}: {len(points)} points planned, {len(points) - len(missing)} covered before, {len(missing)} to send"
+        )
         stated = engines(out / "steps")
 
         def lane(rank):
@@ -160,7 +178,10 @@ def cover(out) -> list[Point]:
     its cell, and return those still missing."""
     out = Path(out)
     state = json.loads((out / STATE).read_text())
-    points = [Point(r, tuple(map(tuple, rows)), tuple(how), held, {}) for r, rows, how, held in state["points"]]
+    points = [
+        Point(r, tuple(map(tuple, rows)), tuple(how), held, body)
+        for r, rows, how, held, body in state["points"]
+    ]
     hit, _ = covered(points, read(out / "steps"))
     path = Path(state["library"], COVERAGE, f"{state['cell']}.json")
     # ponytail: two covers of one cell at once can lose one's points; the next round sends them again.
@@ -220,7 +241,9 @@ def _phases(point: Point, engine: dict, fresh) -> list[list[dict]]:
             rows.append(req(fresh(c)))
     budget = engine["max_num_batched_tokens"]
     held = [req(fresh(1)) for _ in range(point.held)]
-    main = blockers(budget) + held + (blockers(budget - point.held) if held else []) + rows
+    main = (
+        blockers(budget) + held + (blockers(budget - point.held) if held else []) + rows
+    )
     return [first, main] if first else [main]
 
 
@@ -234,12 +257,12 @@ def _key(point: Point) -> str:
 
 
 def _entry(point: Point) -> list:
-    return [point.rank, point.rows, point.cached, point.held]
+    return [point.rank, point.rows, point.cached, point.held, point.body]
 
 
 def _cell(points: list[Point]) -> str:
-    planned = [[*_entry(p), p.body] for p in points]
-    return hashlib.sha256(json.dumps(planned, sort_keys=True).encode()).hexdigest()[:16]
+    planned = json.dumps([_entry(p) for p in points], sort_keys=True)
+    return hashlib.sha256(planned.encode()).hexdigest()[:16]
 
 
 def _seen(library, cell: str) -> set[str]:
@@ -261,7 +284,7 @@ def _sampling(extra: str) -> dict:
     and each ``--extra-inputs K:V`` in `extra`, AIPERF_EXTRA_ARGS."""
     words = ["--extra-inputs", "ignore_eos:true", *shlex.split(extra)]
     fields = {}
-    for flag, value in zip(words, words[1:]):
+    for flag, value in itertools.pairwise(words):
         if flag == "--extra-inputs":
             key, _, raw = value.partition(":")
             try:
