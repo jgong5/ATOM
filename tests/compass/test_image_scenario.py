@@ -12,9 +12,10 @@ The runs need a driver, as in `test_vertical_slice`, and
 `ATOM_COMPASS_IMAGE_MODEL`, a multimodal model directory ATOM serves; its
 memory readings are measured first on the GPU ``HIP_VISIBLE_DEVICES`` names,
 under the machine spec `test_lmcache_mp_engine` reads, with an assumed entry
-for the model's tokenizer where that spec probed none.
+for the model's tokenizer where that spec probed none and `PROBED` did.
 """
 
+import contextlib
 import json
 import math
 import os
@@ -77,18 +78,19 @@ class Workload(Traffic):
 
 
 def _machine(out: Path) -> Path:
-    """`MACHINE`, with `PROBED`'s tokenizer entry for the image model's
-    architecture, its origin assumed, where `MACHINE` probed none."""
+    """`MACHINE`, with `PROBED`'s tokenizer entries for the image model's
+    architecture, their origin assumed, where `MACHINE` probed none; where
+    neither spec names it, `MACHINE` as it is, for the server to refuse."""
     machine = json.loads(MACHINE.read_text())
     config = json.loads((Path(MODEL) / "config.json").read_text())
     [architecture] = config["architectures"]
     tokenizers = machine["host"]["tokenizers"]
     if not any(architecture in t["applies_to"] for t in tokenizers):
         probed = json.loads(PROBED.read_text())["host"]["tokenizers"]
-        [entry] = [t for t in probed if architecture in t["applies_to"]]
-        tokenizers.append(entry)
-        label = entry_label(entry["id"], entry["backend"])
-        machine["provenance"]["origins"][label] = {"origin": "assumed"}
+        for entry in [t for t in probed if architecture in t["applies_to"]]:
+            tokenizers.append(entry)
+            label = entry_label(entry["id"], entry["backend"])
+            machine["provenance"]["origins"][label] = {"origin": "assumed"}
     (out / "machine.json").write_text(json.dumps(machine))
     return out / "machine.json"
 
@@ -131,6 +133,14 @@ def run_images(out: Path, seed: str, machine: Path) -> dict:
                 )
                 traffic.run()
                 code = server.wait(timeout=120)
+            except Exception as error:
+                # A server that refuses at startup reaches the traffic LP only
+                # as a closed clock connection; its own words are in its log.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    server.wait(timeout=30)
+                tail = (out / "server.log").read_text()[-4000:]
+                error.add_note(f"the server's log ends:\n{tail}")
+                raise
             finally:
                 watchdog.cancel()
                 if server.poll() is None:
