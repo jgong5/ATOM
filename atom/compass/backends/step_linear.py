@@ -73,6 +73,9 @@ than `lag` behind its host, the view's `start_lag_s` plus the step's target
 and draft-KV prices, prices the pass by it instead; a view stating no
 `start_lag_s` is refused. The pass replays one draft graph at any prefill
 length; what moves its window is how far the device runs behind its host.
+A law fitted before that split may hold in its place a `short_propose` vector
+with a `below` entry, a token count: an output prefill of fewer tokens prices
+its pass by it. A law holding both is refused.
 A draft law may also hold a `draft_kv` vector over `[1, seqs]`: on a decode
 step it adds the drafter's draft-KV pass, which runs before
 `forward_done_event`, so its terms are the target's. A draft law with
@@ -233,20 +236,26 @@ class StepLinearLaw:
         self.propose = law.get("propose") and _Vector(
             "propose", PROPOSE, law["propose"]
         )
-        if "short_propose" in law:
+        near, short = law.get("near_propose"), law.get("short_propose")
+        if near and short:
             raise ValueError(
-                "the law splits the propose pass at a token count (short_propose), "
-                "which a lag has replaced (near_propose); refit it"
+                "the law splits the propose pass at a lag (near_propose) and at "
+                "a token count (short_propose); a law splits it once"
             )
-        near = law.get("near_propose")
         self.near_propose = near and _Vector("near_propose", PROPOSE, near)
-        if near and ("lag" not in near or not self.propose):
-            lacks = "no lag" if "lag" not in near else "no propose vector"
-            raise ValueError(
-                "the near_propose vector prices a pass the device reaches under "
-                f"its lag, beside a propose vector; the law states {lacks}"
-            )
+        self.short_propose = short and _Vector("short_propose", PROPOSE, short)
+        for name, split, at in (
+            ("near_propose", near, "lag"),
+            ("short_propose", short, "below"),
+        ):
+            if split and (at not in split or not self.propose):
+                lacks = f"no {at}" if at not in split else "no propose vector"
+                raise ValueError(
+                    f"the {name} vector prices a pass under its {at}, beside a "
+                    f"propose vector; the law states {lacks}"
+                )
         self.lag = near and float(near["lag"])
+        self.below = short and int(short["below"])
         self.draft_kv = law.get("draft_kv") and _Vector(
             "draft_kv", PROPOSE, law["draft_kv"]
         )
@@ -353,6 +362,8 @@ class StepLinearBackend(CostBackend):
         seqs = (1, len(batch_view.requests))
         if prefill and law.propose is not None and batch_view.produces_output:
             propose = law.propose
+            if law.short_propose and sum_tokens(prefill) < law.below:
+                propose = law.short_propose
             if law.near_propose:
                 if batch_view.start_lag_s is None:
                     raise self._refuse(

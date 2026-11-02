@@ -4,6 +4,8 @@ reaches it close behind its host apart, when the records' propose labels split
 at that lag, and a simulated runner reads the lag off its host clock."""
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -59,10 +61,10 @@ def _proposed(cost) -> float:
     )
 
 
-def _priced(law, start_lag_s) -> float:
+def _priced(law, start_lag_s, tokens=512) -> float:
     """The seconds `law`'s draft prices a one-request output prefill's
     `propose` pass at, its device starting it `start_lag_s` behind its host."""
-    row = RequestShape(512, 612, False)
+    row = RequestShape(tokens, tokens + 100, False)
     view = BatchView((row,), produces_output=True, start_lag_s=start_lag_s)
     return _proposed(StepLinearBackend(StepLinearLaw(law)).price(view))
 
@@ -110,10 +112,44 @@ def test_a_near_propose_the_law_cannot_read_whole_is_refused(law):
     for draft, match in (
         ({"near_propose": {k: v for k, v in near.items() if k != "lag"}}, "no lag"),
         ({"propose": None}, "no propose vector"),
-        ({"short_propose": near}, "token count.*refit"),
+        ({"short_propose": {**near, "below": 1024}}, "near_propose.*short_propose"),
     ):
         with pytest.raises(ValueError, match=match):
             StepLinearLaw({**law, "draft": {**law["draft"], **draft}})
+
+
+def test_a_law_split_at_a_token_count_prices_the_pass_by_it(law):
+    """A law fitted before the lag split, as the checked-in MI455 ones were."""
+    draft = {k: v for k, v in law["draft"].items() if k != "near_propose"}
+    short = {**law["draft"]["near_propose"], "below": 1024}
+    old = {**law, "draft": {**draft, "short_propose": short}}
+    assert _priced(old, None, 1023) == pytest.approx(sum(PROPOSE) + WAIT, rel=1e-4)
+    assert _priced(old, None, 1024) == pytest.approx(sum(PROPOSE), rel=1e-4)
+    del short["below"]
+    with pytest.raises(ValueError, match="short_propose.*no below"):
+        StepLinearLaw(old)
+
+
+def test_every_checked_in_law_loads():
+    laws = sorted((Path(__file__).parents[2] / "scripts/compass/laws").glob("*.json"))
+    assert laws
+    for path in laws:
+        StepLinearLaw(json.loads(path.read_text()))
+
+
+def test_off_mtp_the_start_lag_waits_for_the_last_output_s_target():
+    """The host returns from the wait once the previous output forward's target
+    ends, after a launch that took no time."""
+    batch = SimpleNamespace(
+        total_seqs_num_prefill=1,
+        total_tokens_num=8,
+        total_seqs_num=1,
+        produces_output=lambda: True,
+    )
+    host = HostDeviceRecurrence({}, (), lambda: 0.0)
+    assert host.start_lag(batch) == 0.0
+    host.charge(batch, 1.0, 0.0)
+    assert host.start_lag(batch) == 0.0
 
 
 class _Kept(StepLinearBackend):
