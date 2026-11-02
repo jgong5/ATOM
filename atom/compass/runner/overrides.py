@@ -296,9 +296,14 @@ def admitted(batch: Any, seen: set, tokens_per_entry: int) -> tuple[int, int, in
     prompt there, so its prompt is its block table's entries times
     `tokens_per_entry`, and its prefix-cache hit is the tokens its row starts
     from."""
+    if len(batch.block_tables) != len(batch.req_ids):
+        raise RunnerRefusal(
+            f"a batch of {len(batch.req_ids)} requests holds "
+            f"{len(batch.block_tables)} block tables, so a request's prompt "
+            "cannot be read off its own"
+        )
     n = uncached = cached = 0
-    rows = zip(batch.req_ids, batch.block_tables, strict=True)
-    for i, (r, table) in enumerate(rows):
+    for i, (r, table) in enumerate(zip(batch.req_ids, batch.block_tables)):
         if r not in seen and i < batch.total_seqs_num_prefill:
             hit = int(batch.num_cached_tokens[i])
             n, uncached = n + 1, uncached + len(table) * tokens_per_entry - hit
