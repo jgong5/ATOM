@@ -90,6 +90,9 @@ ends the run there, which still writes the summary),
 ``client_runs`` (optional: how many client runs the server serves, one traffic
 LP after another, 1 when absent and ``null`` for no limit; each ends when no
 essential work is left, and the last one's end finishes the run),
+``local_grants`` (optional, ``true`` or ``false``: with ``true`` the authority
+gives each grant a ceiling, below which the LP answers its own clock calls and
+reports them with its next one, `ClockAuthority`; the step table is the same),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -259,14 +262,25 @@ PREFILL_PP = "prefill_pipeline_parallel_size"
 INSTANCE_KEY = "compass_instance"
 #: The run-file key of each side's worker order in the router, a per-run outcome.
 WORKER_ORDER = "worker_order"
+#: The run-file key that gives grants their ceilings.
+LOCAL_GRANTS = "local_grants"
 ATOM_RUNNER = "atom.model_engine.model_runner.ModelRunner"
 RAPIDSERVE_RUNNER = "atom.model_engine.model_runner.RapidServeModelRunner"
 #: The run-file key that says the deployment runs RapidServe.
 RAPIDSERVE = "rapidserve"
 #: Keys that differ between two runs of one configuration, kept out of its name.
 #: The store is a place: the memory readings a run reads from it are keyed by
-#: the configuration and the machine spec, which the name holds.
-PER_RUN = ("clock_endpoint", "out_dir", "client_runs", "router", "store", WORKER_ORDER)
+#: the configuration and the machine spec, which the name holds. Local grants
+#: change how many calls a run makes, not its schedule.
+PER_RUN = (
+    "clock_endpoint",
+    "out_dir",
+    "client_runs",
+    "router",
+    "store",
+    WORKER_ORDER,
+    LOCAL_GRANTS,
+)
 LP_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
     "lp-{}.json",  # by LP name, or <lp>.<member> for a member
     "step_table.txt",
@@ -868,9 +882,10 @@ def _hand_ins(run: dict) -> list[str]:
 
 
 class _RecordingAuthority(ClockAuthority):
-    """The authority, recording the step table: a row per reply and a row per
-    message each reply releases, from the receiver's clock before that grant to
-    the message's arrival; and the wall seconds of the run, from its start
+    """The authority, recording the step table: a row per grant, each step an
+    LP took on its own below a ceiling included, and a row per message each
+    releases, from the receiver's clock before that grant to the message's
+    arrival; and the wall seconds of the run, from its start
     to the end of each client run in `ends` and to the finish, which sets `done`.
     A co-hosting frontend starts the run as it starts its own; otherwise it
     starts once every server LP, and every member of one declared with members,
@@ -898,7 +913,6 @@ class _RecordingAuthority(ClockAuthority):
         self.done = threading.Event()
         self._joining = set(_hand_ins(run))
         self._clock_before = {}  # LP -> its clock before its latest grant
-        self._held_clock = {}  # (channel, seq) held for a parked member -> the same
         # A rerun into the same out_dir starts from none of the last run's files.
         out = Path(run["out_dir"])
         for name in (
@@ -914,6 +928,12 @@ class _RecordingAuthority(ClockAuthority):
             shutil.rmtree(d)
         table = channel_table(run)
         count = run.get("client_runs", 1)
+        local = run.get(LOCAL_GRANTS, False)
+        if not isinstance(local, bool):
+            raise TypeError(
+                f"the run file's {LOCAL_GRANTS} is {local!r}; it is true, which "
+                "gives grants their ceilings, or false"
+            )
         super().__init__(
             table,
             timeline=self,
@@ -921,29 +941,30 @@ class _RecordingAuthority(ClockAuthority):
             bound_s=run["bound_s"],
             client=TRAFFIC,
             client_runs=math.inf if count is None else count,
+            ceilings=local,
         )
 
-    def record(self, lp, time_from, time_to, kind, recovered, *_) -> None:
+    def record(self, lp, time_from, time_to, kind, recovered, released=(), *_):
         self._clock_before[lp] = time_from
         self.steps.record(lp, time_from, time_to, kind, detail="recovered" * recovered)
-
-    def _hold(self, lp, member, released) -> None:
-        for ch, msgs in released.items():
-            for seq, _ in msgs:
-                self._held_clock[ch, seq] = self._clock_before[lp]
-        super()._hold(lp, member, released)
+        for ch, seq, arrival in released:
+            # From the receiver's clock as the grant found it.
+            self.steps.record(lp, time_from, arrival, "release", ch, seq)
 
     def on_bind(self, lp):
         self.client_run_open |= lp == TRAFFIC
         return super().on_bind(lp)
 
-    def on_request(self, lp, kind, t, log, t_daemon=math.inf, member=None) -> list:
+    def on_request(
+        self, lp, kind, t, log, t_daemon=math.inf, member=None, steps=(), ahead=False
+    ) -> list:
         self._joining.discard(f"{lp.name}.{member}" if member else lp.name)
         if not self._joining and self.started is None:
             self.started = time.monotonic()
         stop = kind == TAR and t == math.inf and lp.name.startswith(FRONTEND.name)
         if stop and self.final_clocks is None:
-            for ch, seq, arrival in log:
+            self.requests[lp.name] += 1
+            for ch, seq, arrival in self._catch_up(lp, steps, log, member):
                 self._register(lp, ch, seq, arrival, member)
             self.stopped = True
             self.stopped_whole = (
@@ -954,16 +975,17 @@ class _RecordingAuthority(ClockAuthority):
                 for to, g, released in self._address(self._finish())
                 if to != TRAFFIC or self.client_run_open
             ]
+            # What the stop releases, which no recorded grant does.
+            for to, _, released in replies:
+                lp = to[0] if isinstance(to, tuple) else to  # a member's: (lp, member)
+                for ch, msgs in released.items():
+                    for seq, arrival in msgs:
+                        clock = self._clock_before[lp]
+                        self.steps.record(lp, clock, arrival, "release", ch, seq)
         else:
-            replies = super().on_request(lp, kind, t, log, t_daemon, member)
-        for to, _, released, *_ in replies:
-            # A member's reply is addressed (lp, member); its channels name its rank.
-            lp = to[0] if isinstance(to, tuple) else to
-            for ch, msgs in released.items():
-                for seq, arrival in msgs:
-                    # From the receiver's clock as the grant found it.
-                    clock = self._held_clock.pop((ch, seq), self._clock_before[lp])
-                    self.steps.record(lp, clock, arrival, "release", ch, seq)
+            replies = super().on_request(
+                lp, kind, t, log, t_daemon, member, steps, ahead
+            )
         while len(self.ends) < len(self.ended):
             self.ends.append(time.monotonic())
             self.client_run_open = False

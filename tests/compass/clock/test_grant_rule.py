@@ -34,6 +34,7 @@ from atom.compass.clock import (
     ClockAuthority,
     LpId,
     LpRegistry,
+    TimelineLog,
     single_engine_table,
 )
 from atom.compass.clock import authority as authority_module
@@ -602,3 +603,162 @@ def test_the_kept_n_grants_what_n_recomputed_at_every_request_grants():
                 assert row.row == tuple(
                     (j, n[j] + d(j, row.lp)) for j in n if j != row.lp
                 ), seed
+
+
+# --- local grants -------------------------------------------------------------
+
+AB, BA = "a->b:m", "b->a:m"
+
+
+def _ceilinged(**kw):
+    """a <-> b, a sending at 0.5 and b back at 0.25, with a timeline."""
+    table = _table(("a", "b"), [("a", "b", 0.5), ("b", "a", 0.25)])
+    return ClockAuthority(table, timeline=TimelineLog(), **kw)
+
+
+def _by_lp(ca):
+    """The authority's timeline, each LP's records in its own order."""
+    return sorted(ca.timeline.records(), key=lambda r: (str(r.lp), r.time_to))
+
+
+def _first_grant(ca, a_target, log, ahead=False):
+    """a waits in TAR(`a_target`) having sent `log`; b's NER is granted."""
+    assert ca.on_request(A, TAR, a_target, log) == []
+    return ca.on_request(B, NER, INF, [], ahead=ahead)
+
+
+@pytest.mark.parametrize(
+    "a_target, log, ceiling",
+    [
+        (1.0, [(AB, 0, 0.5)], 0.5 + 0.75),  # b's cycle, 0.25 + 0.5
+        (0.6, [(AB, 0, 0.5)], 0.6 + 0.5),  # LBTS(b), a's target plus 0.5
+        (1.0, [(AB, 0, 0.5), (AB, 1, 0.9)], 0.9),  # the arrival still unreleased
+    ],
+)
+def test_a_ceiling_is_the_least_of_lbts_the_cycle_and_the_earliest_arrival(
+    a_target, log, ceiling
+):
+    lp, g, released = _first_grant(_ceilinged(ceilings=True), a_target, log)[0]
+    assert (lp, g, released) == (B, 0.5, {AB: [(0, 0.5)]})
+    assert released.ceiling == pytest.approx(ceiling)
+    assert _first_grant(_ceilinged(), a_target, log)[0][2].ceiling is None
+
+
+def test_steps_below_the_ceiling_replay_as_the_grants_their_calls_would_have_had():
+    """b takes 0.9 and its message ahead, then a TAR to 1.0, on its own; the
+    authority records and counts them as if b had asked each time."""
+    log = [(AB, 0, 0.5), (AB, 1, 0.9)]
+    on = _ceilinged(ceilings=True)
+    ((_, _, released),) = _first_grant(on, 1.0, log, ahead=True)
+    assert released == {AB: [(0, 0.5), (1, 0.9)]} and released.ceiling == 1.25
+    steps = [(NER, INF, 0.9, 0), (TAR, 1.0, 1.0, 0)]
+    replies = on.on_request(B, TAR, 2.0, [(BA, 0, 1.25)], steps=steps)
+    assert _grants(replies) == [("a", 1.0)]
+    off = _ceilinged()
+    _first_grant(off, 1.0, log)
+    assert _grants(off.on_request(B, NER, INF, [])) == [("b", 0.9), ("a", 1.0)]
+    assert _grants(off.on_request(B, TAR, 1.0, [])) == [("b", 1.0)]
+    assert off.on_request(B, TAR, 2.0, [(BA, 0, 1.25)]) == []
+    assert _by_lp(on) == _by_lp(off)
+    assert on.grants == off.grants == {"a": 1, "b": 3}
+    assert (on.requests, off.requests) == ({"a": 1, "b": 2}, {"a": 1, "b": 4})
+
+
+def test_a_step_out_of_bounds_or_past_a_registered_message_aborts():
+    def ceilinged():
+        ca = _ceilinged(ceilings=True)
+        _first_grant(ca, 1.0, [(AB, 0, 0.5)])  # b's ceiling: 1.25
+        return ca
+
+    for steps, needle in [
+        ([(TAR, 1.25, 1.25, 0)], "below its ceiling 1.25"),
+        ([(NER, 0.75, 0.8, 0)], "answered 0.8"),
+        ([(TAR, 0.75, 0.75, 1)], "over a log of 0"),
+    ]:
+        with pytest.raises(ClockAbort, match=needle):
+            ceilinged().on_request(B, NER, INF, [], steps=steps)
+    ca = ceilinged()
+    ca._undelivered[AB][1] = 0.95  # a message the ceiling should have kept out
+    with pytest.raises(BackdatedEvent, match=r"past \(0.95"):
+        ca.on_request(B, NER, INF, [], steps=[(TAR, 1.0, 1.0, 0)])
+    ca = _ceilinged(ceilings=True)
+    _first_grant(ca, 1.0, [(AB, 0, 0.5), (AB, 1, 0.9)], ahead=True)
+    with pytest.raises(ClockAbort, match="sent ahead of it unreached"):
+        ca.on_request(B, NER, INF, [])
+
+
+def _drive_below_ceilings(seed, pick, ceilings, shuffle=0):
+    """`_drive`'s LPs, each answering its own requests below its last grant's
+    ceiling as `atom.utils.clock.LPRuntime` does, and asking for messages
+    ahead; returns each LP's grants as it sees them, its own included, the
+    authority and how many messages were sent ahead."""
+    table = _generated_table(seed)
+    ca = ClockAuthority(table, timeline=TimelineLog(), ceilings=ceilings)
+    ids = table.registry.ids()
+    own = {
+        i: {"k": 0, "g": 0.0, "received": 0}
+        | {"seq": {c.name: 0 for c in table.channels_from(i)}}
+        for i in ids
+    }
+    lp = {i: {"ceiling": -INF, "ahead": [], "log": [], "steps": []} for i in ids}
+    seen = {i: [] for i in ids}
+
+    def took(i, g, got):
+        seen[i].append((g, sorted(got)))
+        own[i].update(k=own[i]["k"] + 1, g=g, received=own[i]["received"] + len(got))
+
+    running, x, sent_ahead = list(ids), shuffle, 0
+    for _ in range(100000):
+        x = _lcg(x)
+        i = pick(sorted(running), x)
+        running.remove(i)
+        mine = lp[i]
+        while True:
+            kind, t, log, t_daemon = _request(table, i, own[i], seed)
+            mine["log"] += log
+            first = mine["ahead"][0][0] if mine["ahead"] else INF
+            to = t if kind == TAR else min(t, t_daemon, first)
+            essential = kind == TAR or t < INF or mine["ahead"]
+            if not (own[i]["g"] <= to < mine["ceiling"] and essential):
+                break
+            reached = [m for m in mine["ahead"] if m[0] <= to]
+            mine["ahead"] = mine["ahead"][len(reached) :]
+            mine["steps"].append((kind, t, to, len(mine["log"])))
+            took(i, to, [(c, s, a) for a, c, s in reached])
+        steps, log = mine["steps"], mine["log"]
+        mine["steps"], mine["log"] = [], []
+        ahead = ceilings and kind == NER
+        replies = ca.on_request(i, kind, t, log, t_daemon, None, steps, ahead)
+        for j, g, released in replies:
+            theirs = lp[j]
+            pairs = [(c, s, a) for c, r in released.items() for s, a in r]
+            reached = [(c, s, a) for a, c, s in theirs["ahead"]]
+            got = [m for m in pairs if m[2] <= g] + reached
+            theirs["ahead"] = sorted((a, c, s) for c, s, a in pairs if a > g)
+            sent_ahead += len(theirs["ahead"])
+            ceiling = getattr(released, "ceiling", None)
+            theirs["ceiling"] = -INF if ceiling is None else ceiling
+            if g == INF:
+                seen[j].append((g, sorted(got)))
+                continue
+            took(j, g, got)
+            running.append(j)
+        if any(r and r[-1][0] == INF for r in seen.values()):
+            return seen, ca, sent_ahead
+    raise AssertionError(f"seed {seed} did not finish")
+
+
+def test_local_grants_leave_every_lps_grants_and_the_timeline_as_they_are():
+    asked = answered = ahead = 0
+    for seed in SEEDS:
+        for pick in PICKS.values():
+            off, off_ca, _ = _drive_below_ceilings(seed, pick, False)
+            on, on_ca, sent = _drive_below_ceilings(seed, pick, True)
+            assert on == off, seed
+            assert on_ca.grants == off_ca.grants, seed
+            assert _by_lp(on_ca) == _by_lp(off_ca), seed
+            asked += sum(off_ca.requests.values())
+            answered += sum(on_ca.requests.values())
+            ahead += sent
+    # The LPs answered some of their own requests, some below a message ahead.
+    assert answered < asked and ahead > 0

@@ -618,6 +618,22 @@ recovery (below) grants one LP at a time: a single global event loop across proc
 correct, serialized, no parallelism. That is why zero-lookahead couplings stay inside one
 LP (partition principle, above).
 
+**Local grants** (`compass run --local-grants`, the owner's ruling (c) on
+[#2542](https://github.com/jgong5/ATOM/issues/2542#issuecomment-6539617449)). A grant to an
+LP without members, other than a recovery's, also carries a ceiling: the least of
+`LBTS(i)`, `G` plus the LP's shortest cycle `min over j of D(i->j) + D(j->i)`, and its
+earliest unreleased arrival. Nothing reaches the LP below it: a message not yet sent
+arrives at or past `LBTS(i)`, and one its own sends provoke at or past the cycle. Its owner
+answers its own TAR and NER below the ceiling as the CA would and reports each such step
+with its next request, with how many of that request's logged sends preceded it; the CA
+keeps `N[i]` at the last grant meanwhile. The CA replays each step as the grant its own
+request would have had: it registers the sends made before it, records the reply with what
+it releases and counts the grant, so the step table and the grant counts are those of a
+run without the flag, which is why the run-file key is per-run. An NER may ask for its
+messages ahead: every message registered for it below the ceiling goes with the grant, and
+the owner releases each in the step that reaches it. A step outside the LP's clock and
+ceiling, or past a message registered for it since, aborts the run.
+
 #### Invariants
 
 - **Safety (asserted, always on):** every message registered into LP *j* must have
@@ -651,7 +667,8 @@ LP (partition principle, above).
 
 The grant rule relies on these invariants inside each LP:
 
-- **I1** An LP's clock moves only inside its clock owner's CA call (TAR/NER). In a DP
+- **I1** An LP's clock moves only inside its clock owner's CA call (TAR/NER), or under local
+  grants in a step below its last grant's ceiling, which its next call reports. In a DP
   group's LP each member's clock moves only inside its own owner's call, to the common
   grant (above).
 - **I2** In a CA call the owner holds no lock another thread of its LP needs; otherwise a
