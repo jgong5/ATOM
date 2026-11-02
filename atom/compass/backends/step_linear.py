@@ -74,8 +74,8 @@ and draft-KV prices, prices the pass by it instead; a view stating no
 `start_lag_s` is refused. The pass replays one draft graph at any prefill
 length; what moves its window is how far the device runs behind its host,
 and below that lag the prefill's length: with a `below` entry, a token count,
-only an output prefill of fewer tokens is priced by `near_propose`, and a
-longer one by `propose` whatever its lag.
+only an output prefill of fewer tokens is priced by `near_propose` or
+refused, and a longer one by `propose` whatever its lag, stated or not.
 A law fitted before that split may hold in its place a `short_propose` vector
 with a `below` entry, a token count: an output prefill of fewer tokens prices
 its pass by it. A law holding both is refused.
