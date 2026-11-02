@@ -136,6 +136,11 @@ def test_a_points_requests_reuse_its_context_and_queue_behind_its_blockers():
     engine["num_kvcache_blocks"] = 10
     phases = sweep._phases(point, engine, lambda n: [0] * n, resent=True)
     assert sum(len(b["prompt_token_ids"]) for b in phases[1][0]) == 64
+    # A model that takes two budgets and more: each blocker prompt is whole
+    # budget steps, so none of its chunks shares a step with what follows.
+    engine |= {"max_model_len": 150, "num_kvcache_blocks": 100}
+    phases = sweep._phases(point, engine, lambda n: [0] * n, resent=True)
+    assert [len(b["prompt_token_ids"]) for b in phases[1][0]] == [128, 128, 64]
 
 
 STANDIN = """

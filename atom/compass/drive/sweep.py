@@ -256,9 +256,22 @@ def _phases(
     def req(ids):
         return {**body, "prompt_token_ids": ids}
 
+    budget = engine["max_num_batched_tokens"]
+    longest = engine["max_model_len"] - OUTPUT_TOKENS
+
     def blockers(tokens):
-        longest = engine["max_model_len"] - OUTPUT_TOKENS
-        return [req(fresh(min(longest, tokens - k))) for k in range(0, tokens, longest)]
+        """Prompts of `tokens` in all, none longer than the model takes, each
+        chunked on the edges of budget steps: a whole number of steps each, or
+        where the budget passes the model's length, each step's in pieces."""
+        if budget <= longest:
+            per = longest // budget * budget
+            return [req(fresh(min(per, tokens - k))) for k in range(0, tokens, per)]
+        steps = (min(budget, tokens - k) for k in range(0, tokens, budget))
+        return [
+            req(fresh(min(longest, step - k)))
+            for step in steps
+            for k in range(0, step, longest)
+        ]
 
     first, rows = [], []
     for (q, c), how in zip(point.rows, point.cached):
@@ -268,7 +281,6 @@ def _phases(
             rows.append([req(before + fresh(q))])
         else:
             rows.append([req(fresh(c))])
-    budget = engine["max_num_batched_tokens"]
     held = [req(fresh(1)) for _ in range(point.held)]
     behind = len(held) + bool(held) + len(rows)
     pool = engine["num_kvcache_blocks"] * engine["kv_cache_block_size"] // 2
