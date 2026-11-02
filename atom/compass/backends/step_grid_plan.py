@@ -70,14 +70,16 @@ SCOPE = "forward"
 BOUNDS = ("max_num_seqs", "max_num_batched_tokens", "max_model_len")
 #: The engine fields `plan` plans for.
 TARGET = (*BOUNDS, "kv_cache_block_size", "num_kvcache_blocks", "ladder")
+#: The fields an engine file states beside `run.step_grid.keyed`'s.
+UNKEYED = (*BOUNDS, "num_kvcache_blocks", "enable_prefix_caching")
 #: The grid definition's own fields.
 DEFINITION = ("prefill", "decode", "margin")
 
 
 def keyed_of(engine: dict) -> dict:
     """`run.step_grid.keyed`'s fields of an engine file's mapping `engine`, which
-    adds the scheduler's bounds and the KV block count to them."""
-    return {k: v for k, v in engine.items() if k not in (*BOUNDS, "num_kvcache_blocks")}
+    adds `UNKEYED` to them."""
+    return {k: v for k, v in engine.items() if k not in UNKEYED}
 
 
 def _views(steps) -> list[tuple[str, BatchView]]:
