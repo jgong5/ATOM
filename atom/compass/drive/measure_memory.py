@@ -49,7 +49,6 @@ import shlex
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 from atom.compass import parity
@@ -167,7 +166,8 @@ def main(argv: list[str], again: bool = False) -> None:
         env["ATOM_DP_MASTER_PORT"] = str(dp_port)
         # KFD lists an exited rank until it has freed the rank's GPU memory.
         kfd = serve._kfd()
-        since = time.time_ns()
+        # The log's creation, on the clock a cache file's mtime reads.
+        since = os.fstat(log.fileno()).st_mtime_ns
         jit_cache.restore(library)
         engine = subprocess.Popen(
             [sys.executable, "-c", code, *atom_args],

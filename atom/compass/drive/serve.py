@@ -175,10 +175,11 @@ def serve(
         ready |= {"clock_endpoint": run["clock_endpoint"], "run_file": str(run_file)}
     with held, _stop_signals() as stopped, quiet(gpus, out) if gpus else nullcontext():
         kfd = _kfd() if gpus else None
-        since = time.time_ns()
         if library:
             jit_cache.restore(library)
         with (out / LOG_FILE).open("w") as log:
+            # The log's creation, on the clock a cache file's mtime reads.
+            since = os.fstat(log.fileno()).st_mtime_ns
             server = subprocess.Popen(
                 argv,
                 stdout=log,
