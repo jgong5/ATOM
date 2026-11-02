@@ -162,7 +162,8 @@ One server and its client run, used by steps 0, 2, 3 and 5:
 
 ```bash
 # serve OUT TRACES C PYTHON COMMAND...: start a compass server writing to OUT,
-# send it one client run of D seconds (default 1800), and stop it. The server
+# send it one client run of D seconds (default 1800), or with C `sweep` the
+# JIT sweep, and stop it. The server
 # logs to OUT/server.log; the compass command's own output, empty unless it
 # refuses, goes to $R/logs/. It refuses an OUT that exists, and fails when the
 # server dies or does not answer within 30 min, or the client run fails.
@@ -178,8 +179,10 @@ serve() {
       { kill $pid 2>/dev/null; echo "serve: no server; see $log" >&2; return 1; }
     sleep 5
   done
+  local run=(--concurrency $c --duration ${D:-1800})
+  [ $c != sweep ] || run=(--sweep)
   HARNESS_PYTHON=$py $T/scripts/compass/client.sh $out --traces $traces \
-    --concurrency $c --duration ${D:-1800} --stop || { kill $pid 2>/dev/null; wait $pid; return 1; }
+    "${run[@]}" --stop || { kill $pid 2>/dev/null; wait $pid; return 1; }
   wait $pid
 }
 ```
@@ -212,12 +215,18 @@ Times were measured on node 18 for the cell in
 [PR #1336](https://github.com/jgong5/ATOM/pull/1336), at concurrencies 1, 4, 16,
 64 and 256 with a 1800 s benchmark each.
 
-**0. Warm a fresh container** (GPU, once per container; 15 min as in the smoke
-cell, and a minute more for the build below).
+**0. Sweep a fresh container** (GPU, once per container; not timed on this cell:
+a round sends one prefill step for every token count up to the budget, 16384 here,
+each behind budget-filling steps, so it grows with the budget squared; Qwen3-0.6B
+at a 1024-token budget took 4.5 min a round on one MI308X of node 18, its server
+start included).
 
 ```bash
-rm -rf $R/warm   # a restarted container's earlier warm-up, which serve would refuse
-D=600 serve $R/warm 0-7 1 $REAL_PY record --gpu $G
+for k in 1 2 3; do
+  rm -rf $R/sweep$k   # a restarted container's earlier round, which serve would refuse
+  serve $R/sweep$k 0-392 sweep $REAL_PY record --gpu $G $S || break
+  grep -qF '"missing": []' $R/sweep$k/sweep.json && break
+done
 ```
 
 A server builds an aiter, FlyDSL or `compile_hsaco` kernel, or a Triton or Inductor one outside ATOM's compile cache, the first time it meets a variant its image did
@@ -225,10 +234,17 @@ not prebuild, such as `mha_varlen_fwd`'s for a prefill step of one new token a
 row, about 60 s inside the run, and the container keeps it for every later
 server. A record whose server built one names it in run.json's
 `aiter_jit_builds`, and grading, the fits and `validate.cost` refuse that
-record. This record takes those builds; nothing reads it. `smoke_cell.sh`
-serves the same record before its calibration, so a container it ran in is
-warm. A restarted container takes this step again (Environment), over the
-`warm/` it took before. Success: `serve` returns 0.
+record. Each round sends the server the JIT sweep of this cell for the traces
+every later step serves, the points its records' keys are selected by, and
+after the stop keeps what it compiled and the points its record covered in the
+store's JIT cache library (`scripts/compass/README.md`, the full path); nothing
+reads its record. A round sends only the points still missing, and its last
+line says whether the cell is `swept`. A third round's missing points, in
+`sweep3/sweep.json`, are the residual to report. The next container on the same
+stack starts from the library, and its sweep returns at once. `smoke_cell.sh`
+serves a record before its calibration instead, so a container it ran in is
+warm only for its own traces. A restarted container takes this step again
+(Environment). Success: the last round's line reads `swept`.
 
 **1. Memory readings** (GPU, 2 to 3 min after step 0; 5 min as a fresh
 container's first start, as in
