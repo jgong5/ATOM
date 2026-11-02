@@ -675,6 +675,9 @@ class Scheduler:
         # by `take_rejected` each EngineCore step; routed through the same
         # output_queue path as forward-finished seqs.
         self._rejected: list[Sequence] = []
+        # An aborted send handed to the connector since its last metadata,
+        # which carries the abort to the workers.
+        self._abort_awaits_meta = False
 
         # KV transfer bookkeeping
         self.finished_recving_kv_req_ids: list[int] = []
@@ -2053,8 +2056,11 @@ class Scheduler:
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
 
-        # Rejections may still need an empty batch to dispatch connector cleanup.
-        if not self.running and not self.waiting and not self._rejected:
+        # Rejections, and an abort handed to the connector, may still need an
+        # empty batch to dispatch connector cleanup.
+        if not (
+            self.running or self.waiting or self._rejected or self._abort_awaits_meta
+        ):
             return None
 
         # ---- Phase 1: resume partial prefills from running ----
@@ -2601,6 +2607,7 @@ class Scheduler:
                 self._publish_state_loads()
                 self._publish_state_stores()
                 connector_meta_output = self.kv_connector.build_connector_meta()
+                self._abort_awaits_meta = False
 
             # Freeze, per seq, whether this chunk is the last one this prefill
             # owes. Uses the pre-advance offsets so it is correct whether or not
@@ -2784,6 +2791,7 @@ class Scheduler:
             self._publish_state_loads()
             self._publish_state_stores()
             connector_meta_output = self.kv_connector.build_connector_meta()
+            self._abort_awaits_meta = False
 
         self._check_draft_writes_allocated(scheduled_seqs.values())
         decode_batch = ScheduledBatch(
@@ -2942,7 +2950,18 @@ class Scheduler:
             if seq.id == req_id:
                 seq.status = SequenceStatus.ABORTED
                 return True
-        return False
+        # Finished and parked for its send: the connector reports the send
+        # done once no transfer of the blocks can run, and refuses a later one.
+        seq = self._deferred_sequence(req_id)
+        if seq is None:
+            return False
+        abort_send = getattr(self.kv_connector, "abort_send", None)
+        if callable(abort_send):
+            abort_send(seq.id)
+            # An idle scheduler builds no metadata, so `_schedule` builds an
+            # empty batch to carry the abort to the workers.
+            self._abort_awaits_meta = True
+        return True
 
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.
