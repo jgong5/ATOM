@@ -4645,6 +4645,18 @@
    "mechanism_why": "starting a process cannot park; the stand-in joins the clock authority itself and is LP lmcache's clock owner"
   },
   {
+   "id": "atom/compass/run/__init__.py::_attach_acceptance.add_request::ACCEPTANCE.get()::queue_get#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "_attach_acceptance.add_request",
+   "call": "ACCEPTANCE.get",
+   "expr": "ACCEPTANCE.get()",
+   "shape": "queue_get",
+   "peer": "none",
+   "why": "reads the ContextVar HttpChannel sets for the request it is serving, as add_request hands that request's sequence on; the call returns at once",
+   "mechanism": "K9",
+   "mechanism_why": "a ContextVar read, which cannot park"
+  },
+  {
    "id": "atom/kv_transfer/offload/_offload_common.py::OffloadWorkerMixin._init_worker_common::ThreadPoolExecutor( max_workers=n_save, thread_name_prefix=f\"{thread_name_prefix}-save\" )::thread_start#0",
    "file": "atom/kv_transfer/offload/_offload_common.py",
    "symbol": "OffloadWorkerMixin._init_worker_common",
