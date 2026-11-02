@@ -393,9 +393,10 @@ one LP:
 | API server | 1 process: uvicorn, `CoreManager` and its threads | **1** (frontend) | Its asyncio event loop is a clock owner of its own: it tokenizes and streams while the engine runs a forward, so it overlaps the step loop in simulated time and cannot be folded into it. Offline, the owner is the loop that calls `get_output`. |
 | PD container (prefill or decode) | one full ATOM deployment | **2** | its frontend LP and its engine LP |
 | Traffic source | — | **1** | |
-| Atomesh router, 1P1D | 1 Rust process | **0**, or **1** under `--dp-aware` | Part of the channels that cross it: with one P and one D it has no choice to make, so it contributes only a fixed per-request forward cost, stated in those channels' lookahead (D7). Under `--dp-aware` (DP attention) it chooses among DP ranks on load that responses move, and is LP `router` (D7). Several P or D instances are deferred. |
+| Atomesh router | 1 Rust process | **0** in 1P1D, or **1** under `--dp-aware` or with several P or D instances | Part of the channels that cross it: with one P and one D it has no choice to make, so it contributes only a fixed per-request forward cost, stated in those channels' lookahead (D7). Under `--dp-aware` (DP attention) it chooses among DP ranks on load that responses move, and with several P or D instances among those instances, and is then LP `router` (D7, `channels.py::prefill_decode_table`). |
 | lmcache MP server (`ATOM_KV_OFFLOAD=lmcache_mp`) | 1 process | **1** (`lmcache`) | Its cached chunks decide later hits for every engine that reaches it, so it is a Compass stand-in on the real channels (D6.1). |
-| PP stages | N EngineCores | **N** | The only group the collapse does not cover. |
+| RapidServe (`--enable-rapidserve`) | 2 EngineCores on the same devices | **2** (`engine-P`, `engine-D`) | Each runs its own scheduler and step loop, and no collective joins them: they exchange only `prefill_done` and `block_assignment` over ZMQ, each taken by a handler thread (`channels.py::_rapidserve`). Sharing the devices is a cost question, not a time domain. This holds only without `--disagg-constrained`: with it, decode writes its decode-token count to shared memory and prefill reads it on wall time, off every channel, to pick its CU split, so `run/__init__.py::frontend` refuses the combination. |
+| PP stages | N EngineCores | **N** | The collapse does not cover them either. |
 
 LP counts for the milestones (`16` D95):
 
@@ -771,10 +772,10 @@ receives it itself, at its own receive point.
 | Channel | Sender | Receiver (mode) | Lookahead |
 |---|---|---|---|
 | `traffic->frontend:http` | Compass traffic source | event loop (inline) | modelled admission delay. Path-specific; the values and what each was measured on are in `channels.py::ADMISSION_DELAY_S`. On the serving path it is the HTTP transport only, client send to the ASGI app call (#1381): the loop's intake after that call is `host.http_intake`, charged by `HttpChannel` (`06` D33). Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. 1P+1D adds the router hop. |
-| `frontend->traffic:stream` | event loop, writing the SSE stream | traffic source (inline) | stated return delay |
-| `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_request` | engine input thread, `poller.poll()` in `engine_core.py::EngineCore.process_input_sockets` (thread) | stated IPC delay |
-| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | stated IPC delay |
-| `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | stated IPC delay |
+| `frontend->traffic:stream` | event loop, writing the SSE stream | traffic source (inline) | `stream_s`, measured (`drive/runfile.py::FIXED`) |
+| `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_request` | engine input thread, `poller.poll()` in `engine_core.py::EngineCore.process_input_sockets` (thread) | `ipc_s`, measured (`drive/runfile.py::FIXED`) |
+| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | `ipc_s`, measured (`drive/runfile.py::FIXED`) |
+| `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | `ipc_out_s`, measured (`drive/runfile.py::FIXED`); `ipc_s` when a run file has none |
 | `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | the router's per-request forward cost (D7) |
 | `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline); under prefill PP the head's, `engine-P-pp0` (D6) | stated request latency (D6) |
 | PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py::PPStageTransport.send_metadata` / `send_tokens` / `send_kv_status` | the stage loop's own poll and receive (inline) | stated IPC delay: each is one ZMQ message, as on the frontend channels; the head's batch to stage `k` is `meta#pp<k>`. The hidden states between stages are `pp_data` (`15` D91). |
@@ -819,7 +820,9 @@ grounds.
 
 ### Open issues
 
-- Grant RPC latency has not been measured on this box. The 50 us figure is an estimate.
+- The ~50 us per grant in Sizing above is the old estimate. The grant cost is measured in
+  [Sizing against a measured workload](#sizing-against-a-measured-workload); PP8's
+  sizing has not been redone on it.
 - Whether the CA should be a process or a thread in the API-server process is open. A
   separate process is cleaner for the PD case where the API server is not obviously the
   right host.
@@ -852,7 +855,12 @@ run (D3). Beyond that, only these create an LP:
 3. an **independent replica** behind the router. `.github/scripts/atomesh/pd_server_atom.sh`
    deploys *xP* prefill servers and *yD* decode servers, each an independent deployment
    with its own `Scheduler`, none synchronizing with the others. With more than one
-   replica per role the router itself is an LP (deferred; in 1P1D it is transport).
+   replica per role the router chooses among them and is LP `router`, as under
+   `--dp-aware`; in 1P1D without `--dp-aware` it is transport (D7,
+   `channels.py::prefill_decode_table`).
+4. **RapidServe** (`--enable-rapidserve`, never with `--disagg-constrained`), which
+   replaces the engine LP with two, `engine-P` and `engine-D`
+   (`channels.py::_rapidserve`); the RapidServe row of D3's LP table says why.
 
 | Deployment | GPUs | LPs |
 |---|---|---|
@@ -878,12 +886,27 @@ modelled time — about **4,450 events per LP**. A frontend LP is counted at the
 it takes one delivery per engine output step plus its requests' HTTP events, so it is
 about as busy as its engine. That is an assumption, not a measurement.
 
-| LPs | Grants per run | CA cost at 50 us (local IPC) | at 500 us (cross-node TCP) |
-|---|---|---|---|
-| 3 | 13k | 0.7 s | 7 s |
-| 5 | 22k | 1.1 s | 11 s |
-| 34 | 151k | 7.6 s | 76 s |
-| 82 | 365k | 18 s | 182 s |
+The CA's cost was measured on 2026-11-01 with `scripts/compass/ca_grant_cost.py` over
+`aea9b15b5`'s clock and `tcp` carrier: one CA process over N synthetic LPs, each LP its
+own process and one lookahead from every other, asking `TAR` one step past its clock
+1,000 times. At a lookahead of one step each round is a barrier, an LP granted only once
+every other has asked, so each request rescans every waiting LP's LBTS: the O(LPs²) worst
+case. **Local**: CA and LPs on hjbog-srdc-18 (224 CPUs, shared, load 27 to 53), over
+loopback. **Cross-node**: CA on hjbog-srdc-18, LPs on hjbog-srdc-39. CPU is the CA
+process's, every thread, per request served; the two columns' runs are independent. The
+round trip is an LP's, from its `TAR` to its grant, p50 with p10 to p90.
+
+| LPs | Grants per run | CA CPU per request, local / cross-node | CA CPU per run | Round trip, local | Round trip, cross-node |
+|---|---|---|---|---|---|
+| 3 | 13k | 43 / 46 us | 0.6 s | 132 us (129 to 139) | 275 us (267 to 327) |
+| 5 | 22k | 63 / 55 us | 1.4 s | 272 us (238 to 385) | 394 us (377 to 430) |
+| 34 | 151k | 179 / 169 us | 27 s | 5.4 ms (5.2 to 6.3) | 5.3 ms (5.1 to 6.2) |
+| 82 | 365k | 600 / 605 us | 219 s | 43.5 ms (42.2 to 49.5) | 43.0 ms (41.7 to 49.7) |
+
+CA CPU per run is the grants times the local figure. These replace an estimate of 50 us
+per grant at local IPC and 500 us cross-node. With a lookahead of two steps, so an LP may
+run one round ahead of the slowest, the CA's CPU per request is 54 to 67 us at 3 and 5
+LPs, 100 to 106 us at 34 and 167 to 255 us at 82.
 
 Against the **cost model on the same steps**: previously measured at **4.3 ms per step**
 with the bound allocation carried in the cache key (2.3 ms with a shape-only key, but
@@ -891,15 +914,19 @@ that key is unsound — a second valid allocation for the same shape moves 64 of
 operator signatures; 41.7 ms with no cache at all). 4,450 steps x 4.3 ms = **~19 s per
 LP, running in parallel across LPs.**
 
-**A grant is therefore ~1% of the per-step cost at local IPC and ~10% cross-node.** The
-simulator's own pricing dominates by two orders of magnitude. Optimising the time
+**At the milestones' 3 and 5 LPs, the CA's whole run is 3% and 7% of that pricing, and
+an LP's grants (4,450 round trips) are 3% and 6% of it locally, 6% and 9% cross-node.**
+The simulator's own pricing still dominates there, by 10x or more, and optimising the time
 protocol before the cost model would be optimising the wrong thing.
 
-Throughput headroom: a Python ZMQ ROUTER sustains roughly 50-200k msg/s; the largest case
-above is ~19k/s (365k grants over the ~19 s the pricing takes). The CA's own work per
-state change is an LBTS for each waiting LP, each a `min` over the other LPs: O(LPs²),
-nothing at the milestones' 3-5 LPs but ~6.7k terms at 82, so measure it before the
-replica scale. RTTs pipeline across LPs.
+**At the replica scale the CA dominates.** Under the barrier, its 34- and 82-LP runs take
+27 s and 219 s of one CPU, serialised, beside the 19 s of pricing each LP does in
+parallel; at 34 and 82 LPs the round trip is the CA serving every other LP's request in
+turn, so the cross-node hop no longer shows. One CA serves at most the inverse of its CPU
+per request: ~23k requests/s at 3 LPs, ~1.7k/s at 82, against the ~19k/s the 82-LP case asks
+(365k grants over the ~19 s the pricing takes). Before the replica rows run, the LBTS
+scan per request must stop growing with the square of the LPs, or the CA must split as
+Option B below describes.
 
 ### Options
 
@@ -919,7 +946,8 @@ interface is identical in both.
 **B. Hierarchical CA built now.** Node-local CA per physical node, root CA over them.
 
 - *Pros:* cross-node grant traffic drops from O(LPs) to O(nodes). The correct end state
-  beyond ~100 LPs across many nodes.
+  at the replica scale, where the sizing above measures one CA outweighing the pricing
+  from 34 LPs.
 - *Cons:* two levels to debug and a global-min protocol to get right, at a scale no
   milestone reaches. The sizing above says this is premature.
 
@@ -988,9 +1016,6 @@ the property they are supposed to be testing.
 
 ### Open issues
 
-- Grant RPC latency has not been measured on this hardware. The 50 us figure is an
-  estimate and should be measured before it is quoted. Note this matters only for the
-  standalone form; co-hosted grants are function calls.
 - The CA is the only component that knows every LP's virtual time. It should therefore
   own the global timeline log and the stall diagnostic. That makes it an observability
   component as well as a coordination one, which is a benefit but also means its output
@@ -1525,13 +1550,14 @@ cost error. T97 records settling the thresholds.
 
 **Accepted approximations**, each added back only if that check shows its error: TP ranks
 are symmetric; PP send backpressure; the MTP plus DP draft barrier; the overlaps of the
-copy stream, staging and `prep_stream`; the device work an MTP decode's prepare queues
+copy stream, staging and `prep_stream`; in a run, the device work an MTP decode's prepare queues
 ahead of its launch (metadata uploads, the SWA cursor probe, index and input-id fills), so
-a launch that finds the device busy starts its device early by that work: busy-launch
-decodes measure -0.27% (#1608) and -0.16% (the third DSpark record) at p50 at `fffff70db`,
-and the work is added back if a later record's busy-launch decodes miss the band (owner
-ruling on [#2092](https://github.com/jgong5/ATOM/issues/2092#issuecomment-6397638783),
-2026-10-25). One more follows from #815's ruling 2, which
+a launch that finds the device busy starts its device early by that work, which no cost
+backend prices (owner ruling on
+[#2092](https://github.com/jgong5/ATOM/issues/2092#issuecomment-6397638783), 2026-10-25).
+The check feeds each MTP decode's `d_gap_ns` as that work, after the last device end:
+uncharged, #2144's c=1 and c=16 DSpark records measure -0.73% at decode p50 at `debfaf80a`
+([#2491](https://github.com/jgong5/ATOM/issues/2491)). One more follows from #815's ruling 2, which
 makes `E` the recurrence's first term: `E` is charged inside forward `n`'s TAR, but
 `scheduler.postprocess()` and `schedule()` run before the forward is called, at `now`, so
 their clock reads (the first-token stamps, the waiting-prefill age, the arrivals a
@@ -2174,8 +2200,11 @@ per step per member.
 pricing a LOOKUP by a declared law in prompt chunks and the bookkeeping requests at a
 declared constant; and the copy engine, a stated width, pricing a STORE or RETRIEVE as a
 `TransferModel` (`kv/transfer.py`) over the machine spec's host link, `bytes` the
-chunks moved times the chunk's bytes from the KV geometry. Both are declared until
-measured; their accuracy is out of scope here.
+chunks moved times the chunk's bytes from the KV geometry. The copy engine applies no
+derate, unlike `TransferModel.from_spec` on a fabric link: the spec states the host link
+as a copy reaches it, not as a peak (`spec/fields.py`, `interconnect.host_link`;
+`run/__init__.py::_lmcache_stations`). Both stations' laws are declared until measured;
+their accuracy is out of scope here.
 
 **Fake-model duties.**
 

@@ -48,7 +48,8 @@ another backend than the step grid, which always prices below it; when its
 first client run refused anything, or has no summary to say, or priced no step,
 since the graded client run then came later; when it ran the step grid without
 a coverage check; when its backend's fit inputs were profiled or served a trace
-it served; and when its engines read an assumed `memory_readings` member,
+it served, or its step law names none, as a law file does; and when its
+engines read an assumed `memory_readings` member,
 naming each assumption its `provenance` lists, since its KV blocks rest on
 readings no start took. The step grid's plan, an input of `source` `plan`, is
 not one: it placed the points from shapes alone, so it may have read any trace,
@@ -119,6 +120,7 @@ from atom.compass.run import (
     ENGINE,
     LP_FILE,
     STEP_GRID,
+    STEP_LINEAR,
     SUMMARY_FILE,
     entries,
 )
@@ -357,6 +359,10 @@ def _not_graded(run, traces) -> list[str]:
         why.append(f"its backend was fitted on traces it served: {fitted}")
     if profiled := [i["run"] for i in inputs if i.get("profiled")]:
         why.append(f"its backend was fitted on profiled inputs: {profiled}")
+    if STEP_LINEAR in run["run_file"] and not all(
+        law and law.get("inputs") for law in provenance.get("entries", [provenance])
+    ):
+        why.append("its step law names no fit inputs, so its fitted traces are unknown")
     if assumed := run["provenance"].get("memory_readings_assumed"):
         why.append(ASSUMED.format(assumed))
     return why

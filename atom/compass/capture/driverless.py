@@ -13,6 +13,8 @@ import types
 
 import torch
 
+from atom.mono.runtime import peer_memory
+
 #: The devices a capture can declare, by arch: compute units, capability and
 #: memory. ATOM and aiter branch on the arch and size grids by the CU count.
 #: Nothing here reads a device.
@@ -358,3 +360,16 @@ def group(tp: int, dp: int) -> dict:
         "functional": ["all_gather_into_tensor", "broadcast", "all_to_all_single"],
         "communicator_checked_only": ["fused_allreduce_rmsnorm_quant_per_group"],
     }
+
+
+class PeerBuffer(peer_memory.PeerBuffer):
+    """A mono runner's peer buffer of the sizes it asks for, on the declared
+    device: no IPC heap and no handle exchange, since every rank of a capture
+    is this one. Its data and never-zeroed regions are tensors of their own,
+    and every peer's address is this rank's. Closing it frees nothing."""
+
+    def __init__(self, nbytes, group, rank, npes, device, plain_bytes=0):
+        self.local, self.rank, self._opened = 0, rank, []
+        self.bytes = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        self.plain = torch.empty(plain_bytes, dtype=torch.uint8, device=device)
+        self.addresses = torch.zeros(npes, dtype=torch.int64, device=device)

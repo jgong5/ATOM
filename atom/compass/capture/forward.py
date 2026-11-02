@@ -36,7 +36,9 @@ it (its passes, the shared embedding and LM head among them), each its own
 graph. A middle chunk, which samples nothing, is a real step's batch too, so
 ATOM runs its draft-KV pass, and is cut where that pass starts; under DP
 ATOM runs the drafter's propose in its place, cut where that starts. A block
-drafter writes its draft KV before `forward_done_event` and is refused.
+drafter runs its draft-KV pass between the target's forward and its sampling,
+before `forward_done_event` on a step that samples: that pass is cut at both
+its ends into a third graph.
 A decode of fewer rows than its width ran padded to that rung: its rows run
 the drafter's first pass, which takes the target's tokens unpadded, and the
 step continues at the rung past the cut; only its drafter's graph is kept. A
@@ -56,6 +58,8 @@ import gc
 import importlib
 import inspect
 import json
+import logging
+import os
 import pathlib
 import re
 import sys
@@ -71,7 +75,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 import atom
 from atom.compass import ir
-from atom.compass.backends.op_graph import gathered_off_default
+from atom.compass.backends.op_graph import KV, gathered_off_default
 from atom.compass.ir.nodes import Reduced
 
 from . import driverless, peers
@@ -132,6 +136,7 @@ CUT = "forward_done_event"
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
+logger = logging.getLogger(__name__)
 
 
 class Shape(NamedTuple):
@@ -209,7 +214,8 @@ def structure(
     a drafter's method and width, the TP width, the DP width and the EP group's
     when they are set, the phase and the mode, `config`'s unless `eager` names
     it, ``no output`` unless the step produces output (`output`), and ``draft``
-    for the drafter's part of the step (`draft`)."""
+    for the drafter's part of the step (`draft`), ``draft kv`` for a block
+    drafter's draft-KV pass on a step that samples (`draft` is `KV`)."""
     from atom.compass.run import _file_digest
     from atom.compass.run.step_grid import keyed
 
@@ -223,7 +229,8 @@ def structure(
     widths += f" ep={tp * dp}" if config.enable_expert_parallel else ""
     key = f"{arch} {device} {digest} {engine} {widths} {phase} {mode}"
     key = key if output else f"{key} no output"
-    return f"{key} draft" if draft else key
+    key = f"{key} draft" if draft else key
+    return f"{key} {KV}" if draft == KV else key
 
 
 def _engine(text: str):
@@ -425,6 +432,7 @@ class _Recorder(TorchDispatchMode):
         self.replaying = None  # the kernels a replay launched, while one runs
         self.counted = None  # what a size the step's data sets counts, if stated
         self.lands = False  # whether a device value read on the host reads zeros
+        self.declined = []  # the mono refusals this shape's steps met (`_mono`)
         self.start()
 
     def start(self):
@@ -439,11 +447,12 @@ class _Recorder(TorchDispatchMode):
                 "a call that neither returned nor raised has no end to fold to"
             )
 
-    def cut(self):
+    def cut(self, mark=CUT):
         """ATOM records `forward_done_event`: the target's work ends here, and
-        what follows is the drafter's."""
+        what follows is the drafter's; or a block drafter's draft-KV pass
+        starts or ends here (`KV`)."""
         if self.on:
-            self.items.append((None, CUT))
+            self.items.append((None, mark))
 
     @contextlib.contextmanager
     def quiet(self):
@@ -764,6 +773,8 @@ def _patches(recorder):
     * aiter's top-k scratch sizes are host queries into a module built for a
       device, which a capture cannot load: each answers 0, and the scratch
       the call allocates holds one byte.
+    * A mono runner binds and builds its widths as its deployment does
+      (`_mono`).
     """
     import flydsl
     import triton
@@ -866,6 +877,11 @@ def _patches(recorder):
         with patch.object(recorder, "counted", live):
             return attach(builder, md, num_reqs, is_prefill)
 
+    unpatched = [
+        (fly.JitFunction, "__call__", fly.JitFunction.__call__),
+        (fly, "_compile_impl", fly._compile_impl),
+        (fly.CompiledFunction, "__call__", fly.CompiledFunction.__call__),
+    ]
     stack = contextlib.ExitStack()
     for owner, name, value in (
         (JITFunction, "run", run),
@@ -891,10 +907,123 @@ def _patches(recorder):
             "maybe_dual_stream_forward",
             module_dispatch_ops.maybe_dual_stream_forward,
         ),
+        *_mono(recorder, unpatched),
     ):
         stack.enter_context(patch.object(owner, name, value))
     stack.enter_context(_entries(recorder))
     return stack
+
+
+def _mono(recorder, unpatched):
+    """What a mono runner's bind and width builds run under the capture, as
+    `(owner, name, value)` patches; `unpatched` are FlyDSL's entries before
+    `_patches` replaced them.
+
+    Every rank of a capture is this one: the TP consensus runs on the host,
+    outside the fake mode and the recorder, and agrees with this rank, and the
+    peer buffer is one of the sizes the runner asks for on the declared device
+    (`driverless.PeerBuffer`). A width's kernels compile for real, compile-only
+    at the declared arch through `unpatched`, so their scratch is read off
+    their binaries. A refusal the deployment makes too, a bind check's
+    `MonoUnsupported` or a kernel that needs scratch, leaves the original path
+    to trace and is told to `recorder.declined` by every step it turns away;
+    any other bind or build failure is refused by name.
+    """
+    from torch.utils._python_dispatch import _disable_current_modes
+
+    from atom.mono.runtime import consensus, lifecycle, route, widths
+    from atom.mono.runtime.compile import compile_kernels, scratch_bytes
+
+    agree, init = consensus.tp_agree, route.LazyRunner.__init__
+    ready, prepare = route.LazyRunner.ready, widths.WidthBuilds.prepare
+    refused = {}  # each refusal, by its runner and width (None for a bind)
+
+    def host_agree(ok, group):
+        with _disable_current_modes():
+            return agree(ok, group)
+
+    def bound(create, lazy):
+        try:
+            return create()
+        except consensus.MonoUnsupported as why:
+            if why.__cause__ is not None:  # a failure `bind_agreed` converted
+                raise ValueError(
+                    f"{lazy.what} failed to bind: {why}"
+                ) from why.__cause__
+            refused[lazy, None] = {"runner": lazy.what, "width": None, "why": str(why)}
+            raise
+
+    def lazy(self, create, what):
+        init(self, functools.partial(bound, create, self), what)
+
+    def turned_away(self, rows, *shape):
+        held = ready(self, rows, *shape)
+        if (self, None) in refused:  # no step of a runner whose bind refused is mono
+            recorder.declined.append(refused[self, None])
+        return held
+
+    def built(self, width):
+        new = width not in self._built and width not in self._refused
+        held = building(self, width) if new else prepare(self, width)
+        if not held:  # the step takes the original path
+            recorder.declined.append(refused[self, width])
+        return held
+
+    def building(self, width):
+        failed, scratch = [], []
+
+        def noted(fn):
+            def call(*args):
+                try:
+                    return fn(*args)
+                except Exception as error:
+                    failed.append(error)
+                    raise
+
+            return call
+
+        def compiled(kernels):
+            arch = device_arch()
+            with contextlib.ExitStack() as real:
+                for owner, name, value in unpatched:
+                    real.enter_context(patch.object(owner, name, value))
+                real.enter_context(patch.dict(os.environ, ARCH=arch))
+                real.enter_context(_disable_current_modes())
+                launchers = compile_kernels(kernels)
+            scratch.extend(map(scratch_bytes, launchers))
+            logger.info(
+                "%s: %d width-%d kernels compiled at %s, scratch %s B a lane",
+                *(self._what, len(launchers), width, arch, scratch),
+            )
+            return launchers
+
+        with contextlib.ExitStack() as noting:
+            for name in ("_build", "_kernels", "_scratch_free"):
+                noting.enter_context(
+                    patch.object(self, name, noted(getattr(self, name)))
+                )
+            noting.enter_context(
+                patch.object(widths, "compile_kernels", noted(compiled))
+            )
+            held = prepare(self, width)
+        if failed or not (held or any(scratch)):
+            why = repr(failed[0]) if failed else "no kernel needs scratch"
+            raise ValueError(
+                f"{self._what} declined its width-{width} kernels: {why}"
+            ) from (failed[0] if failed else None)
+        if not held:  # a kernel needs scratch, which the deployment refuses too
+            why = f"a kernel needs {max(scratch)} B of scratch a lane"
+            refused[self, width] = {"runner": self._what, "width": width, "why": why}
+        return held
+
+    return (
+        (consensus, "tp_agree", host_agree),
+        (widths, "tp_agree", host_agree),
+        (lifecycle, "PeerBuffer", driverless.PeerBuffer),
+        (route.LazyRunner, "__init__", lazy),
+        (route.LazyRunner, "ready", turned_away),
+        (widths.WidthBuilds, "prepare", built),
+    )
 
 
 @contextlib.contextmanager
@@ -1053,27 +1182,26 @@ def _build_runner(config, fake_mode):
 
 def _drafter(runner, recorder):
     """The width of `runner`'s drafter and its models, none without one. Its
-    step is cut where its target's work ends, as the parity record stamps it:
-    at `forward_done_event` on a step that samples, else where the drafter's
-    draft-KV pass starts, under DP its propose. A block drafter writes its
-    draft KV before `forward_done_event` on a step that samples, and is
-    refused."""
+    step is cut where the parity record stamps it: its target's work ends at
+    `forward_done_event` on a step that samples, else where the drafter's
+    draft-KV pass starts, under DP its propose. A block drafter runs its
+    draft-KV pass before `forward_done_event` on a step that samples, between
+    the target's forward and its sampling: it is cut at both its ends."""
     drafter = getattr(runner, "drafter", None)
     if drafter is None:
         return 0, []
-    if drafter.is_block_drafter:
-        raise ValueError(
-            f"{type(drafter).__name__} writes its draft KV before "
-            "forward_done_event on a step that samples: no cut parts its "
-            "target from its draft"
-        )
     done, draft_kv = runner.forward_done_event, drafter.compute_draft_kv
     done.record = lambda *a: (recorder.cut(), driverless.Event.record(done, *a))
-    propose = runner.propose_draft_token_ids
+    propose, block = runner.propose_draft_token_ids, drafter.is_block_drafter
 
     def compute_draft_kv(*args, **kwargs):
         if not recorder.output:
             recorder.cut()
+        elif block:
+            recorder.cut(KV)
+            out = draft_kv(*args, **kwargs)
+            recorder.cut(KV)
+            return out
         return draft_kv(*args, **kwargs)
 
     def propose_draft_token_ids(*args, **kwargs):
@@ -1084,6 +1212,22 @@ def _drafter(runner, recorder):
     drafter.compute_draft_kv = compute_draft_kv
     runner.propose_draft_token_ids = propose_draft_token_ids
     return drafter.mtp_k, [drafter.model]
+
+
+def _parts(items):
+    """A traced step's `items` by part, each its own graph: the target's, a
+    block drafter's draft-KV pass between its two marks on a step that
+    samples (`KV`), and the drafter's work after the first cut, a later cut
+    in it (a DP middle chunk's propose after its draft-KV pass) dropped."""
+    at = next((i for i, (_, item) in enumerate(items) if item is CUT), None)
+    parts = [(False, items if at is None else items[:at])]
+    if marks := [i for i, (_, item) in enumerate(parts[0][1]) if item is KV]:
+        (start, end), target = marks, parts[0][1]
+        parts = [(False, target[:start] + target[end + 1 :])]
+        parts.append((KV, target[start + 1 : end]))
+    if at is not None:
+        parts.append((True, [item for item in items[at + 1 :] if item[1] is not CUT]))
+    return parts
 
 
 def _weights(model):
@@ -1339,7 +1483,7 @@ def capture(
             return (False, False, 0, 0)
 
         for shape, output in variants:
-            recorder.shape, recorder.output = shape, output
+            recorder.shape, recorder.output, recorder.declined = shape, output, []
             # `decide` pads the step to the one width the ladder holds.
             ladder = [shape.width or shape.seqs]
             runner.capture_sizes_np = numpy.array(ladder, dtype=numpy.int32)
@@ -1363,12 +1507,8 @@ def capture(
             items, left_out = traces[0]
             if len(traces) > 1:
                 items = _affine(str(shape), items, traces[1][0])
-            # A drafter's work follows its target's: its own graph.
-            cut = [i for i, (_, item) in enumerate(items) if item is CUT][:1]
-            for draft, part in enumerate(
-                (items[: cut[0]], items[cut[0] + 1 :]) if cut else (items,)
-            ):
-                if draft:
+            for draft, part in _parts(items):
+                if draft is True:
                     # A decode's drafter is read from its own shape, at its rows.
                     skip = shape.phase == "decode" and shape.width
                 else:
@@ -1376,9 +1516,12 @@ def capture(
                     skip = shape.tokens < shape.seqs or shape.width and not output
                 if skip:
                     continue
-                key = structure(config, shape.phase, output=output, draft=bool(draft))
+                key = structure(config, shape.phase, output=output, draft=draft)
                 crossing, traced = [], Traced(key, str(shape))
                 graph = build(part, traced, crossing)
                 gone = [*left_out, *(("step-crossing", op) for op in crossing)]
                 declared["left_out"] = [{"why": why, **_json(op)} for why, op in gone]
+                declared.pop("mono", None)
+                if mono := list({id(why): why for why in recorder.declined}.values()):
+                    declared["mono"] = mono
                 yield graph, digest, dict(declared)

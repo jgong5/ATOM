@@ -280,6 +280,8 @@ def test_serve_stamps_each_tokenizer_pool_job_and_engine_send(tmp_path):
             "class CoreManager:\n"
             "    def add_request(self, seqs):\n"
             "        print(seqs)\n"
+            "    def _mark_seq_prefill_complete(self, seq_id): pass\n"
+            "    def _deliver_terminal_output(self, seq): return False\n"
         ),
         "entrypoints/openai/api_server.py": (
             "from atom.model_engine.engine_core_mgr import CoreManager\n"
@@ -334,3 +336,108 @@ def test_the_idle_intake_is_the_loops_time_on_a_lone_request_less_the_bytes(
         SystemExit, match="10 engine sends, not one each after each of 11"
     ):
         probe.idle(str(stamps))
+
+
+def test_serve_stamps_each_sse_head_and_each_engine_output_taken_in(tmp_path):
+    server = SERVER | {
+        "model_engine/__init__.py": "",
+        "model_engine/engine_core_mgr.py": (
+            "class CoreManager:\n"
+            "    def add_request(self, seqs): pass\n"
+            "    def _mark_seq_prefill_complete(self, seq_id): pass\n"
+            "    def _deliver_terminal_output(self, seq): return False\n"
+        ),
+        "entrypoints/openai/api_server.py": """
+import asyncio
+from starlette.applications import Starlette
+from starlette.responses import PlainTextResponse, StreamingResponse
+from starlette.routing import Route
+from atom.model_engine.engine_core_mgr import CoreManager
+
+async def sse(request):
+    async def chunks():
+        yield "data: 1\\n\\n"
+    return StreamingResponse(chunks(), media_type="text/event-stream")
+
+async def text(request):
+    return PlainTextResponse("x")
+
+async def main():
+    app = Starlette(routes=[Route("/sse", sse), Route("/text", text)])
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    async def send(message):
+        pass
+
+    for path in ("/sse", "/text"):
+        scope = {"type": "http", "method": "GET", "path": path, "headers": []}
+        await app(scope | {"query_string": b"", "root_path": ""}, receive, send)
+    CoreManager()._mark_seq_prefill_complete(1)
+    CoreManager()._deliver_terminal_output(None)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+""",
+    }
+    for name, text in server.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    stamps = tmp_path / "stamps"
+    subprocess.run(
+        [sys.executable, PROBE, "serve", stamps],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path)),
+        check=True,
+    )
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    # The plain-text response sends a head too, and is no stream.
+    assert [r[2] for r in rows] == ["app", "head", "app", "out", "out"]
+
+
+def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
+    sent = [10**12 + k * 10**9 for k in range(10)]
+    hop = [10_000 * k for k in range(10)]
+    stamps, handoff = [], []
+    for s, h in zip(sent, hop):
+        # Two streamed outputs in one message, then the finished sequence, whose
+        # send stamp trails its receipt.
+        put = s + 5 * 10**6
+        stamps += [f"{s} 1 send {s - 50} 0", f"{s + 7} 1 head {s + 5} 0"]
+        got = [put + 100_000 + h + p for p in (0, 5, 10)]
+        stamps += [f"{g} 2 out {g} 0" for g in got]
+        handoff += [
+            {"t_out_put_ns": put, "t_out_sent_ns": put + 50, "rows": 2},
+            {"t_out_put_ns": put + 10, "t_out_sent_ns": got[2] + 20, "rows": 1},
+        ]
+        # Request 0 finds the engine idle, and its receipt waits.
+        idle = 5 * 10**6 if s == sent[0] else 0
+        handoff.append({"t_recv_ns": s + 200_000 + h + idle, "t_in_put_ns": 0})
+    # An output before the first request.
+    handoff.append({"t_out_put_ns": 0, "t_out_sent_ns": sent[0] - 10**9, "rows": 1})
+    admitted = [s + 7 + 400_000 + h for s, h in zip(sent, hop)]
+    paths = [tmp_path / name for name in ("stamps", "handoff", "arrivals")]
+    paths[0].write_text("\n".join(stamps[::-1]) + "\n")
+    paths[1].write_text("".join(json.dumps(line) + "\n" for line in handoff))
+    paths[2].write_text(json.dumps({"sent_ns": sent, "admitted_ns": admitted}))
+    got = probe.hops(*map(str, paths))
+    for name, median in (("request", 250e-6), ("output", 145e-6), ("stream", 445e-6)):
+        assert got[name]["median_s"] == pytest.approx(median), name
+    assert (got["request"]["p10_s"], got["request"]["p90_s"]) == pytest.approx(
+        (218e-6, 282e-6)
+    )
+    assert [got[k]["messages"] for k in ("request", "output", "stream")] == [9, 20, 10]
+    # A request the engine never received pairs nothing.
+    paths[1].write_text(
+        "".join(json.dumps(line) + "\n" for line in handoff[:2] + handoff[3:])
+    )
+    with pytest.raises(
+        SystemExit, match="request: 8 arrivals, not one after each of 9"
+    ):
+        probe.hops(*map(str, paths))
+    # Nor does a message with a row the server never took in.
+    paths[1].write_text("".join(json.dumps(line) + "\n" for line in handoff))
+    paths[0].write_text("\n".join(r for r in stamps if " out " not in r) + "\n")
+    with pytest.raises(SystemExit, match="output: 0 rows taken in, not the 30 sent"):
+        probe.hops(*map(str, paths))

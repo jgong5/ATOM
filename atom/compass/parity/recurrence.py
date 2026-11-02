@@ -11,7 +11,8 @@ less the draft copy wait; with
 `d_target_ns`, under MTP, the target runs to `forward_done_event`, with
 `d_draft_kv_ns` on an output forward, the rest of `d_busy_ns` is draft, `W_inputs` is the part of
 `W_pre` after the MTP status wait, `L_mtp` is `step_labels.mtp_copy`'s time,
-and no `d_gap_ns` is fed. Each forward is called at the
+and a decode's `d_gap_ns` is the work queued ahead of its launch
+(`check`). Each forward is called at the
 exit predicted for the one before, so only the waits and device times move it.
 A pipeline record is gated step by step, each stage charged with the predicted
 times of the others (`pipeline`), its sends priced on a machine spec's PP
@@ -135,9 +136,10 @@ def pipeline(stages: list[list[dict]], carriers=None) -> list[dict]:
 def check(steps: list[dict]) -> dict:
     """One DP rank's steps charged on their measured inputs: the gate's report.
 
-    Under MTP a decode is fed no `d_gap_ns`: the device work its prepare
-    queues ahead of its launch is not charged, so a launch that finds the
-    device busy starts its device early by that work."""
+    Under MTP a decode's `d_gap_ns` is the device work its prepare queues
+    ahead of its launch, its `compass_queued_s`: its device starts where the
+    record measured it. An idle launch's gap also holds the device idle,
+    which the prepare end covers, and the first command's dispatch."""
     *_, report = _charged(steps, None, None, None)
     return report
 
@@ -221,7 +223,8 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
         batch.compass_pp_host = (called, sent)
         batch.total_seqs_num_prefill = sum(not d for *_, d in s["rows"])
         batch.produces_output = lambda out=s["produces_output"]: out
-        gap = 0 if batch.total_seqs_num_prefill or mtp else s.get("d_gap_ns", 0)
+        gap = 0 if batch.total_seqs_num_prefill else s.get("d_gap_ns", 0)
+        batch.compass_queued_s, gap = (gap * 1e-9, 0) if mtp else (0.0, gap)
         if stage is not None:
             # A stage's host may trail its device, so the gap may be idle: it
             # follows the last forward's device end. The tensors' arrival holds it too.

@@ -223,7 +223,10 @@ def test_a_frame_from_before_the_run_decoded_on_an_output_thread_is_a_summary_re
     # An engine frame sent outside the run reaches ATOM's output thread with no
     # job open after the frontend's run has started; its decode is refused, and
     # ATOM logs the refusal as `flush_stream_batch failed` and drops the update.
-    # A stamped frame after it keeps the run open until the first is handled.
+    # A stamped frame, sent once the first is decoded, keeps the run open until
+    # it is handled. Sent before, the two can be read in one poll; the first then
+    # waits until the stamped one is handled (`LPRuntime.holds_unstamped`), and
+    # its decode can come after the frontend's +inf grant and ask for no time.
     run = {
         "admission_path": "serving",
         "ipc_s": IPC,
@@ -248,7 +251,15 @@ def test_a_frame_from_before_the_run_decoded_on_an_output_thread_is_a_summary_re
     )
     monkeypatch.setattr(clock, "_installed", frontend)
     tokenizer = _Tokenizer()
-    tokenizer.decode = wrap_decode(tokenizer.decode, _entry())
+    charged, decoded = wrap_decode(tokenizer.decode, _entry()), threading.Event()
+
+    def decode(ids, *args, **kwargs):
+        try:
+            return charged(ids, *args, **kwargs)
+        finally:
+            decoded.set()
+
+    tokenizer.decode = decode
     dispatcher = StreamBatchDispatcher(tokenizer)
     monkeypatch.setattr(api_server, "_stream_batch_dispatcher", dispatcher)
     state = dispatcher.new_state()
@@ -278,6 +289,7 @@ def test_a_frame_from_before_the_run_decoded_on_an_output_thread_is_a_summary_re
         out = RequestOutput(7, list(range(n)), False)
         frame = pickle.dumps((EngineCoreRequestType.STREAM, [(7, out)]))
         WrappedSocket(engine, push, OUT).send(frame)
+        assert decoded.wait(20)  # the first frame's, before the second is sent
         engine.start_run()  # so only the first frame is unstamped
     clock_transport.connect(LpId("engine"), run["clock_endpoint"]).send(
         (NER, math.inf, engine.send_log, math.inf)

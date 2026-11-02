@@ -86,6 +86,9 @@ def test_an_engine_that_raises_mid_run_leaves_a_summary_naming_it(
         def __init__(self, *args) -> None:
             pass
 
+        def _send_ready_signal(self) -> None:  # wrapped by `compass_run.engine`
+            pass
+
         def busy_loop(self) -> None:
             # Below the frontend's lookahead, so granted while it runs at 0.
             clock.installed().advance_to(run["ipc_s"] / 2)
