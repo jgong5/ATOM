@@ -488,6 +488,7 @@ def _engine(blocks):
         "max_num_batched_tokens": BUDGET,
         "max_model_len": 2048,
         "num_kvcache_blocks": blocks,
+        "enable_prefix_caching": False,
     }
 
 

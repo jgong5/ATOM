@@ -492,9 +492,12 @@ Each of these voided real percentages before.
    chosen by LOO alone is not admissible evidence. An op-level leaf is not extrapolated:
    with no same-kernel bracket it is priced by its analytical law, counted in D50.3's
    fallback share (`09` D60; revised 2026-10-18, #1489).
-7. **A speculative acceptance cell run at an assumed acceptance is not acceptance
-   evidence.** It is exploration. Acceptance cells use the *measured* per-position
-   distribution from the paired real run (`14` D84); the run summary reports the acceptance input's method.
+7. **A speculative acceptance cell whose simulated run assumes an acceptance its real run
+   did not run under is not acceptance evidence.** It is exploration. An acceptance cell's
+   two runs take one acceptance: M2's MTP cells feed the *measured* per-position
+   distribution of the paired real run to the simulated one, and stage 4's cells state the
+   same acceptance length on both (`14` D84, *Milestone placement*); the run summary
+   reports the acceptance input's method.
 
 ---
 

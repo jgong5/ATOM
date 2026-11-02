@@ -681,7 +681,9 @@ alone.
   stay frozen, `1dedbac561b6` (#2036) and `af1ea3021902` (#2070), and the spec they read
   is the before side of the method error.
 - **Cells**, each TP4 with DSpark5 (`14`): `-tp 4 --kv_cache_dtype bf16
-  --index-cache-dtype fp8 --method dspark --num-speculative-tokens 5 --level 0`. Cell A
+  --index-cache-dtype fp8 --method dspark --num-speculative-tokens 5
+  --spec-decode-acceptance-length 3 --level 0` on the real and the simulated runs alike
+  ([ruling](https://github.com/jgong5/ATOM/pull/2683#issuecomment-6578751421)). Cell A
   adds whole-expert EP4, `--enable-expert-parallel`; cell B shards the routed experts
   across TP. Each runs concurrency 1, 4, 16, 64 and 256 on cc-traces 0 to 255, three real
   rounds at `--duration 3600` as #975 ran them; traces 256 to 392 calibrate (`08` D50).

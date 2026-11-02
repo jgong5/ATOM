@@ -157,13 +157,13 @@ class TestPerRequestSums:
         none can disagree with the rows it came from.
 
         `capture_rung`, `moe_rows`, `produces_output`, `tbo_tokens`,
-        `image_tokens`, `moe_tokens`, `dp_dummy` and `group_prefills` are
-        batch-level values deliberately: a rung is a property of the replayed
-        graph, the MoE gather rows, their real tokens and the agreed
-        two-batch-overlap split of the data-parallel group, and whether it
-        samples, what its vision encoder fills of the step, whether it is a DP
-        rank's dummy forward and whether a rank of its group prefills, not of
-        any row.
+        `image_tokens`, `moe_tokens` and `dp_dummy` are batch-level values
+        deliberately: a rung is a property of the replayed graph, the MoE
+        gather rows, their real tokens and the agreed two-batch-overlap split
+        of the data-parallel group, and whether it samples, what its vision
+        encoder fills of the step and whether it is a DP rank's dummy forward,
+        not of any row. `start_lag_s` is the timeline's: how far behind its
+        host the device starts the step.
         """
         assert [f.name for f in fields(BatchView)] == [
             "requests",
@@ -178,8 +178,9 @@ class TestPerRequestSums:
             "moe_tokens",
             "dp_rank",
             "dp_dummy",
-            "draft_rows",
             "group_prefills",
+            "draft_rows",
+            "start_lag_s",
         ]
         assert [f.name for f in fields(RequestShape)] == [
             "query_tokens",
