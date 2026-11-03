@@ -70,15 +70,17 @@ def test_a_worker_sleeps_between_calls_and_takes_each_in_order():
     worker = _worker(writer)
     thread = threading.Thread(target=_loop, args=(worker,), daemon=True)
     thread.start()
-    writer.enqueue(("record", 0))
-    time.sleep(IDLE_S)  # the worker waits for its next call
-    writer.enqueue(("record", 1))
-    writer.enqueue(("exit",))
-    thread.join(10)
+    try:
+        writer.enqueue(("record", 0))
+        time.sleep(IDLE_S)  # the worker waits for its next call
+        writer.enqueue(("record", 1))
+        writer.enqueue(("exit",))
+        thread.join(10)
+    finally:
+        _close(writer, worker)
     (first, before), (second, after) = worker.runners[0].calls
     assert (first, second, thread.is_alive()) == (0, 1, False)
     assert after - before < IDLE_S / 10, f"waiting took {after - before:.3f} CPU s"
-    _close(writer, worker)
 
 
 def test_a_worker_signalled_while_it_sleeps_leaves_its_loop():
