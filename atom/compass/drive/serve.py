@@ -254,11 +254,15 @@ def _model(atom_args) -> str:
 
 def log_more(atom_args) -> dict:
     """`LOG_MORE` when ATOM's arguments run DP and TP both above 1, else
-    nothing, so any other start logs in the format its environment gives."""
+    nothing, so any other start logs in the format its environment gives.
+    Under DP attention ATOM makes each TP rank a DP rank and runs TP 1."""
     parser = FlexibleArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
     parser.add_argument("--data-parallel-size", "-dp", type=int, default=1)
+    parser.add_argument("--enable-dp-attention", action="store_true")
     widths = parser.parse_known_args(atom_args)[0]
+    if widths.enable_dp_attention:
+        return {}
     if widths.tensor_parallel_size > 1 and widths.data_parallel_size > 1:
         return LOG_MORE
     return {}

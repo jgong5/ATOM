@@ -218,6 +218,7 @@ def runners_logged(log: Path, cache: Path) -> None:
         (["--data_parallel_size=2", "--tensor-parallel-size", "2"], "1"),
         (["-tp", "2"], "unset"),
         (["-dp", "2"], "unset"),
+        (["-dp", "2", "-tp", "2", "--enable_dp_attention"], "unset"),
     ],
 )
 def test_a_server_at_dp_and_tp_above_1_logs_each_line_s_process(

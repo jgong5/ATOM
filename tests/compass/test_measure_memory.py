@@ -192,7 +192,14 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_the_start_used(
     assert not used.parents[1].exists() and other.exists()
 
 
-@pytest.mark.parametrize("widths, seen", [(["-dp", "2"], "1"), ([], "unset")])
+@pytest.mark.parametrize(
+    "widths, seen",
+    [
+        (["-dp", "2"], "1"),
+        ([], "unset"),
+        (["-dp", "2", "--enable-dp-attention"], "unset"),
+    ],
+)
 def test_a_start_at_dp_and_tp_above_1_logs_each_line_s_process(
     tmp_path, monkeypatch, widths, seen
 ):
