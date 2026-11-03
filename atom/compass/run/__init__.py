@@ -36,6 +36,8 @@ member, the frontend's included, connects to.
   ``decode`` to the frontend's clock, at the rates of its ``host`` entry's
   ``tokenizer`` term. A term that refuses the tokenizer stops the run as a
   signal would, so the engines leave and the server exits on the refusal.
+  On a real run recording its steps it records each such call, and stamps
+  each HTTP request's intake, beside the step record instead.
 - `http_intake()` is what `atom.utils.compass_loop.HttpChannel` charges the
   frontend's event loop for each request it takes in, from the ``host``
   entry's ``http_intake`` term.
@@ -384,6 +386,9 @@ _early_end: threading.Thread | None = None
 _member: str | None = None
 #: The SIGTERM handler this engine process set aside as it said READY.
 _sigterm_at_ready: list = []
+#: The files a recorded real run's frontend writes beside its step record:
+#: each served tokenizer call, and each HTTP request's intake stamps.
+TOKENIZER_RECORD, INTAKE_RECORD = "tokenizer.jsonl", "intake.stamps"
 #: This server's ``host`` entry among several, which `tokenizer` resolves.
 _frontend_host: dict | None = None
 
@@ -1892,10 +1897,17 @@ def tokenizer(tok, config) -> None:
     entry, its engine config's among several: a term fitted on another backend
     is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
     ends the run before the server serves (`_end_before_serving`). With no
-    term, `tok` is left as it is, charging 0 s."""
+    term, `tok` is left as it is, charging 0 s.
+
+    On a real run recording its steps (`parity.ENV`), it records instead
+    (`_record_host`); with neither, `tok` is left as it is."""
     global _frontend_host
     run = spec()
     if run is None:
+        from atom.compass import parity
+
+        if record := os.environ.get(parity.ENV):
+            _record_host(tok, Path(record))
         return
     from tokenizers import Tokenizer
 
@@ -1937,6 +1949,34 @@ def tokenizer(tok, config) -> None:
     rust = getattr(tok, "_tokenizer", None)
     if isinstance(rust, Tokenizer):
         rust.encode_batch = wrap_encode_batch(rust.encode_batch, term["encode"])
+
+
+def _record_host(tok, record: Path) -> None:
+    """Record, beside the step record in `record`, each call of `tok`'s
+    ``encode`` and ``decode`` and its Rust backend's ``encode_batch`` into
+    `TOKENIZER_RECORD`, after a first line naming `tok`'s ``backend`` and the
+    ``fingerprint`` of its ``tokenizer.json``; and stamp each HTTP request's
+    intake into `INTAKE_RECORD` (`compass_loop.stamp_intake`)."""
+    from tokenizers import Tokenizer
+
+    from atom.utils.compass_loop import LineFile, recorded, stamp_intake
+
+    record.mkdir(parents=True, exist_ok=True)
+    calls = LineFile(record / TOKENIZER_RECORD)
+    backend = "fast" if tok.is_fast else "slow"
+    calls.write(json.dumps({"backend": backend, "fingerprint": _fingerprint(tok)}))
+    calls.write("\n")
+    tok.encode = recorded(tok.encode, "encode", calls, lambda _, ids: len(ids))
+    tok.decode = recorded(tok.decode, "decode", calls, lambda a, _: len(a[0]))
+    rust = getattr(tok, "_tokenizer", None)
+    if isinstance(rust, Tokenizer):
+        rust.encode_batch = recorded(
+            rust.encode_batch,
+            "encode_batch",
+            calls,
+            lambda _, encodings: sum(len(e.ids) for e in encodings),
+        )
+    stamp_intake(LineFile(record / INTAKE_RECORD))
 
 
 def _end_before_serving(run: dict, e: BaseException) -> None:
