@@ -11,9 +11,10 @@ over the modules `run.modules.walk` reads off the meta build ATOM's arguments
 configure, and at op level by `OpGraphBackend`, over the `op_graph`s `compass
 trace ops` published in S for the spec's arch; both price the rows a replayed
 graph pads to. Each price is compared with the step's device busy time,
-`d_busy_ns`, or on an MTP record the target's, `d_target_ns`, against the
-target's price alone: a drafter's price, which the op level adds, is reported
-apart.
+`d_busy_ns`, or on an MTP record the target's, `d_target_ns`, plus on a step
+that samples a block drafter's draft-KV pass, `d_draft_kv_ns`, which runs
+before `forward_done_event`. On an MTP record only the target's price is
+compared, that pass's included; the drafter's is reported apart.
 With `--ratios-from`, the prices are --machine's datasheet peaks at the other
 spec's probed ratios (`project.projected`): run on a device's own records,
 the report is the error of projecting it from the other.
@@ -49,7 +50,7 @@ of `dp<r>.key.json`) states another TP width or KV cache format than ATOM's
 arguments resolve; two-batch overlap of decode steps or on one rank, whose
 split no step line states; a data-parallel step some rank's record lacks; a
 step of an MTP record without `d_target_ns`, whose `d_busy_ns` holds the
-draft no backend prices.
+draft, which the gate does not compare.
 """
 
 import argparse
@@ -82,7 +83,7 @@ PARTIAL = (
 )
 UNSPLIT = (
     "a step of an MTP record without `d_target_ns`: its `d_busy_ns` holds the "
-    "draft, which no backend prices"
+    "draft, which the gate does not compare"
 )
 
 
@@ -124,7 +125,11 @@ def steps(record, tbo=False, mtp=False):
                 tbo_tokens=split if dp else None,
                 moe_tokens=group if dp else None,
             )
-            yield name, view, s.get("d_target_ns", s["d_busy_ns"]) * 1e-9
+            measured = s.get("d_target_ns", s["d_busy_ns"])
+            if "d_target_ns" in s and s["produces_output"]:
+                # A block drafter's draft-KV pass precedes forward_done_event.
+                measured += s.get("d_draft_kv_ns", 0)
+            yield name, view, measured * 1e-9
 
 
 def _split(lines):

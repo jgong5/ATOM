@@ -21,7 +21,7 @@ from test_work import SPEC
 
 from atom.compass.backends import BatchView, RequestShape, op_work
 from atom.compass.backends.cost import CostTerm, StepCost
-from atom.compass.backends.op_graph import OpGraphBackend
+from atom.compass.backends.op_graph import DRAFT_KV, OpGraphBackend
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.step_roofline import Module, StepRooflineBackend
 from atom.compass.backends.work import Work, price
@@ -361,7 +361,8 @@ def test_a_measured_point_prices_at_the_ep_width(tmp_path):
     assert q["median"] == pytest.approx(1)
 
 
-def _config(drafts=0, dp=1, tbo=False, low_latency=False):
+def _config(drafts=0, dp=1, tbo=False, low_latency=False, block=False):
+    drafter = SimpleNamespace(num_speculative_tokens=drafts, use_dspark=lambda: block)
     return SimpleNamespace(
         tensor_parallel_size=1,
         kv_cache_dtype="bf16",
@@ -369,8 +370,7 @@ def _config(drafts=0, dp=1, tbo=False, low_latency=False):
         enable_tbo_decode=False,
         enable_expert_parallel=low_latency,
         enable_low_latency=low_latency,
-        speculative_config=drafts
-        and SimpleNamespace(method="mtp", num_speculative_tokens=drafts),
+        speculative_config=drafts and drafter,
         parallel_config=SimpleNamespace(data_parallel_size=dp),
     )
 
@@ -391,13 +391,14 @@ def drafted(*shape, draft=False):
     return {"seq": [g(shape[1], 8192, 8192)]} if draft else graph(*shape)
 
 
-@pytest.mark.parametrize("drafts", [1, 3])
+@pytest.mark.parametrize("drafts,block", [(1, False), (3, False), (5, True)])
 def test_an_mtp_step_prices_at_op_level_its_target_against_d_target_ns(
-    monkeypatch, tmp_path, drafts
+    monkeypatch, tmp_path, drafts, block
 ):
     decode = {"rows": [[drafts + 1, 900, True], [drafts + 1, 300, True]], "rung": 2}
     lines = [decode, LINES[1]]
-    priced = _backends(monkeypatch, tmp_path, _config(drafts), lookup=drafted)
+    config = _config(drafts, block=block)
+    priced = _backends(monkeypatch, tmp_path, config, lookup=drafted)
     views = [
         BatchView(
             tuple(RequestShape(*r) for r in s["rows"]),
@@ -407,10 +408,16 @@ def test_an_mtp_step_prices_at_op_level_its_target_against_d_target_ns(
         for s in lines
     ]
     costs = [priced["op"].price(v) for v in views]
-    # Measured: the target's price to the next nanosecond, under the step's.
+    # Measured: the target's price to the next nanosecond, under the step's;
+    # a block drafter's draft-KV pass, which that price holds, stamped apart.
+    kv = [sum(t.seconds for t in c.terms if t.name.startswith(DRAFT_KV)) for c in costs]
     lines = [
-        {**s, "d_target_ns": math.ceil(c.target_seconds * 1e9)}
-        for s, c in zip(lines, costs)
+        {
+            **s,
+            "d_target_ns": math.ceil((c.target_seconds - k) * 1e9),
+            "d_draft_kv_ns": math.ceil(k * 1e9),
+        }
+        for s, c, k in zip(lines, costs, kv)
     ]
     rec = record(tmp_path / "mtp", lines)
 
@@ -418,6 +425,7 @@ def test_an_mtp_step_prices_at_op_level_its_target_against_d_target_ns(
     r = report["op"]
 
     assert all(c.draft_terms and c.seconds > c.target_seconds * 1.5 for c in costs)
+    assert all((k > c.target_seconds / 2) == block for c, k in zip(costs, kv))
     assert (r["verdict"], r["steps"], r["refused"]) == ("pass", 2, {})
     assert r["draft_s"] == {
         "decode": pytest.approx(costs[0].draft_seconds),
@@ -427,6 +435,17 @@ def test_an_mtp_step_prices_at_op_level_its_target_against_d_target_ns(
         costs[0].target_seconds
     )
     assert report["step"]["steps"] == 2
+
+
+def test_a_draft_kv_pass_is_measured_with_its_target_on_a_step_that_samples(tmp_path):
+    stamps = {"d_target_ns": 4 * 10**8, "d_draft_kv_ns": 10**8}
+    middle = {**LINES[1], **stamps, "produces_output": False}
+    record(tmp_path, [{**LINES[0], **stamps}, middle])
+
+    measured = [m for _, _, m in bound.steps(tmp_path)]
+
+    # A middle chunk's pass runs after its target's end, in the drafter's time.
+    assert measured == [pytest.approx(0.5), pytest.approx(0.4)]
 
 
 def test_ep_low_latency_split_under_tbo_refuses_at_both_levels(monkeypatch, tmp_path):
