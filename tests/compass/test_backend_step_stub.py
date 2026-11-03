@@ -177,6 +177,7 @@ class TestPerRequestSums:
             "moe_tokens",
             "dp_rank",
             "dp_dummy",
+            "group_prefills",
             "draft_rows",
         ]
         assert [f.name for f in fields(RequestShape)] == [
