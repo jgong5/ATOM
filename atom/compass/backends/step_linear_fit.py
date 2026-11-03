@@ -353,16 +353,16 @@ def fit_tokenizer(paths) -> tuple[dict, dict]:
     ``fixed_s + tokens / tokens_per_s`` by the host-law solver; the report
     gives each record's p10, p50 and p90 relative residual per call kind.
     Raises on records of two tokenizers, or too few calls of a kind."""
-    heads, calls = set(), []
+    heads, calls = {}, []
     for i, path in enumerate(paths):
         head, *lines = Path(path).read_text().splitlines()
-        heads.add(json.dumps(json.loads(head), sort_keys=True))
+        heads[json.dumps(json.loads(head), sort_keys=True)] = None
         for c in map(json.loads, lines):
             s = (c["t_end_ns"] - c["t_start_ns"]) * 1e-9
             calls.append((i, c["call"] == "decode", c["tokens"], s))
     if len(heads) != 1:
         raise ValueError(f"the records name {len(heads)} tokenizers: {sorted(heads)}")
-    term, report = json.loads(heads.pop()), {}
+    term, report = json.loads(next(iter(heads))), {}
     for kind in ("encode", "decode"):
         rows = np.array([c for c in calls if c[1] == (kind == "decode") and c[3] > 0])
         if not len(rows):
@@ -416,8 +416,7 @@ def _intakes(path) -> tuple[list, list]:
         ]:
             continue
         body, _, prep, send = between
-        if send[1] < after:
-            lone.append((body[3], (prep[0] - call + send[1] - prep[1]) * 1e-9))
+        lone.append((body[3], (prep[0] - call + send[1] - prep[1]) * 1e-9))
     # The loop renders each request's template as soon as its body is read.
     starts = [e[0] for e in ev if e[2] == "tmpl"]
     sizes = [e[3] for e in sorted(ev, key=lambda e: e[1]) if e[2] == "body"]
