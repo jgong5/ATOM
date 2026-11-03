@@ -8,6 +8,7 @@ Kept apart from the package because importing `ModelRunner` needs a driver.
 import torch
 from aiter.dist.parallel_state import get_world_group
 
+from atom.compass.bench import routing
 from atom.compass.bench.window import BenchWindow
 from atom.compass.parity.runner import RecordingModelRunner
 
@@ -27,6 +28,18 @@ class BenchModelRunner(BenchWindow, RecordingModelRunner):
         end = self.device_event()
         end.synchronize()
         self.cycles_per_ns = CALIBRATION_CYCLES / (start.elapsed_time(end) * 1e6)
+
+    def route_uniformly(self) -> int:
+        """Every MoE layer, the drafter's too, routed by a uniform draw of as
+        many tokens as a pass routes at data-parallel width 1, ATOM's MoE
+        token capacity there
+        (`model_ops/fused_moe/config.py::moe_kernel_token_capacity`); how many
+        layers, a reply, which the runner manager waits for."""
+        return routing.route_uniformly(
+            self.config.compilation_config.static_forward_context,
+            self.config.max_num_batched_tokens,
+            self.device,
+        )
 
     def preload(self, ns: int) -> None:
         """Queue about `ns` of device work on the current stream: a spin kernel."""

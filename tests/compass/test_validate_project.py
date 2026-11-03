@@ -12,7 +12,7 @@ import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_backend_step_roofline import STACK
 from test_probe_device import SCRIPTS
-from test_validate_bound import LINES, _main, graph, record
+from test_validate_bound import LINES, _main, drafted, graph, record
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends.step_roofline import StepRooflineBackend
@@ -80,20 +80,23 @@ def test_bound_ratios_from_prices_records_at_the_projected_spec(monkeypatch, tmp
     assert at_ratios == direct["step"]["analytical_s"]["prefill"]["total"] != own
 
 
-def _priced_here(monkeypatch):
-    """Each cell priced in this process, by the stack and graphs `_main` uses."""
+def _priced_here(monkeypatch, drafter=None):
+    """Each cell priced in this process, by the stack and graphs `_main` uses,
+    under `drafter`, a speculative config."""
     config = SimpleNamespace(
         model="m",
         tensor_parallel_size=1,
         kv_cache_dtype="bf16",
         enable_tbo=False,
         enable_tbo_decode=False,
-        speculative_config=None,
+        enable_expert_parallel=False,
+        speculative_config=drafter,
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
     tree = SimpleNamespace(modules=list)
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
-    monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree: STACK)
+    monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
+    monkeypatch.setattr("atom.compass.run.modules.drafter", lambda config: None)
     monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: graph)
     monkeypatch.setattr("atom.compass.run._file_digest", lambda *a: "sha256:m")
     monkeypatch.setattr("atom.compass.run.step_grid.keyed", lambda *a, **k: {})
@@ -143,6 +146,22 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
         base = doc["cells"][str(prefill)][level]["tokens_per_s"]
         slower = doc["band"]["device.compute.derate.bf16"]["0.8"]["tokens_per_s"]
         assert slower[level][str(prefill)] < base
+
+
+def test_a_cell_under_a_drafter_states_the_drafters_seconds_apart(
+    monkeypatch, tmp_path
+):
+    mtp1 = SimpleNamespace(num_speculative_tokens=1, use_dspark=lambda: False)
+    _priced_here(monkeypatch, mtp1)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: drafted)
+    line = {"rows": [[2, 900, True]] * 2, "rung": 2, "d_target_ns": 10**9}
+    decode = ran(tmp_path / "mtp", [line])
+
+    cell = project.cell("m", 1, json.loads(MI455.read_text()), "s", str(decode), [])
+
+    op = cell["levels"]["op"]
+    # The drafter costs more than the target, and is not in its seconds.
+    assert op["draft_s"]["decode"] > op["analytical_s"]["decode"]["total"] > 0
 
 
 def test_main_reads_a_records_atom_arguments_from_its_run_json(monkeypatch, tmp_path):

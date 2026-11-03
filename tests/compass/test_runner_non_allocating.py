@@ -55,6 +55,7 @@ ATOM_RUNNER = ENGINE / "model_runner.py"
 # module of this package imports at module scope, keyed by its path in the
 # package; every other module, none.
 ENGINE_READS = {
+    "doorbell.py": {"atom.model_engine"},
     "model_runner.py": {"atom.model_engine.model_runner"},
     "overrides.py": {"atom.compass.backends.base"},
     "projection.py": {
@@ -593,7 +594,8 @@ def test_only_the_binding_module_reaches_the_engine(path):
     `ENGINE_READS` by the exact set. `model_runner` binds ATOM's runner.
     `overrides` reads the cost backend's base class, from a package whose own
     test keeps it free of the engine. `projection` reads a scheduled batch and
-    the dispatch rule; neither reaches
+    the dispatch rule. `doorbell` subclasses ATOM's worker, whose module the
+    engine's manager builds its ring and workers from. None of them reaches
     `atom.model_engine.model_runner`, and
     `test_every_other_module_imports_here` runs the import to measure it.
     """

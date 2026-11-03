@@ -14,6 +14,8 @@ A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
 rebuilds `moe_tokens` from every rank's line, and, when its host key's engine
 states `enable_tbo`, the caller's `split_rule`, ATOM's two-batch-overlap split
 over those lines, rebuilds `tbo_tokens`; with no rule such a line refuses.
+No line states its group's dummy forwards: a view's `group_dummies` counts the
+run's rank records whose line at its step is a dummy run (`group_dummies`).
 
 A step's device label is its device busy time, `d_busy_ns`, plus for a decode
 step the device work queued since the previous forward's exit, `d_gap_ns`. A
@@ -86,7 +88,8 @@ import bisect
 import hashlib
 import itertools
 import json
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -190,6 +193,17 @@ def group_tokens(lines) -> int | None:
     `num_tokens_across_dp` summed over every rank's line at that step, a dummy
     rank's one row. None when a rank's line is missing."""
     return None if None in lines else sum(q for s in lines for q, _, _ in s["rows"])
+
+
+def group_dummies(ranks: Iterable[list[dict]]) -> Counter:
+    """Per step, how many of `ranks`, one run's rank records as their lines,
+    ran it as a DP dummy forward; a record that lacks the step counts none."""
+    return Counter(s["step"] for lines in ranks for s in lines if s["is_dummy_run"])
+
+
+def _peers(path: Path) -> list[Path]:
+    """The rank records of `path`'s run, itself among them: those beside it."""
+    return sorted(path.parent.glob(path.name.split("dp")[0] + "dp*[0-9].jsonl"))
 
 
 def digest(record) -> str:
@@ -330,10 +344,12 @@ def label(
     """The record's samples, in step order, and its table's rows.
 
     `run` names the run in each sample's provenance, the record's `digest` by
-    default; `split_rule` rebuilds an older record's split, as above.
+    default; `split_rule` rebuilds an older record's split, as above. A
+    data-parallel record's `group_dummies` is read from the rank records
+    beside it.
     """
     lines = _read(record)
-    return _label(record, lines, run, [_pull(s) for s in lines], split_rule)
+    return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None)
 
 
 def label_run(
@@ -352,17 +368,20 @@ def label_run(
         )
     n = max(map(len, ranks), default=0)
     starts = [max(_pull(x[i]) for x in ranks if i < len(x)) for i in range(n)]
+    dummy_ranks = group_dummies(ranks)
     return [
         (
             ([], [])
             if x and all(s["is_dummy_run"] for s in x)
-            else _label(r, x, run, starts, split_rule)
+            else _label(r, x, run, starts, split_rule, dummy_ranks)
         )
         for r, x in zip(records, ranks)
     ]
 
 
-def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[dict]]:
+def _label(
+    record, lines, run, starts, split_rule, dummy_ranks
+) -> tuple[list[Sample], list[dict]]:
     """`label` of `record`'s `lines`, each `E` from `starts` at the line before."""
     path = Path(record)
     steps = [s for s in lines if not s["is_dummy_run"]]
@@ -393,10 +412,11 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             continue
         dp, tokens = "moe_rows" in s, s.get("moe_tokens")
         split = s.get("tbo_tokens")
+        if dp and dummy_ranks is None:
+            dummy_ranks = group_dummies(map(read_jsonl, _peers(path)))
         if dp and tokens is None:
             if ranks is None:
-                peers = path.parent.glob(path.name.split("dp")[0] + "dp*[0-9].jsonl")
-                ranks = [{t["step"]: t for t in read_jsonl(p)} for p in sorted(peers)]
+                ranks = [{t["step"]: t for t in read_jsonl(p)} for p in _peers(path)]
             group = [r.get(s["step"]) for r in ranks]
             tokens = group_tokens(group)
             if tokens is not None and tbo:
@@ -419,6 +439,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             tbo_tokens=None if split is None else tuple(map(tuple, split)),
             moe_tokens=tokens,
             dp_rank=s["dp_rank"] if dp else None,
+            group_dummies=dummy_ranks.get(s["step"], 0) if dp else 0,
             start_lag_s=lag,
         )
         cut = None

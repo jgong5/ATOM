@@ -3,7 +3,7 @@
 
 """The step linear law fitted from real step records.
 
-    python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K [--reference LAW]] [--engine FILE]
+    python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K] [--engine FILE]
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
@@ -101,8 +101,8 @@ an intercept per rung.
 With `moe_routing`, the model's routed experts and top-k (`--moe-routing E,K`),
 the law states `moe_routing` and, outside `shared`, a decode rung may adopt one
 MoE column (`StepLinearLaw`), `moe_tokens` or `moe_experts`, by the rule
-`_moe_column` states, its bar read from the law `--reference LAW` names when
-given; the vector records under `fit.moe_column` the figures the rule read.
+`_moe_column` states; the vector records under `fit.moe_column` the figures the
+rule read.
 An MTP record's draft law adopts none.
 
 Outside `shared`, a decode rung may adopt a `rowmod(k)` column (`StepLinearLaw`),
@@ -195,7 +195,7 @@ def _features(
     routing: tuple[int, int] | None = None,
 ) -> tuple[list[tuple], dict]:
     """One rank's fittable samples as (vector, features, seconds, step, context,
-    tokens), and how many were cut, per reason.
+    tokens, dummies), and how many were cut, per reason.
 
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
     order, plus `history` for that form, above `dp` 1 `moe_rows` on prefill and
@@ -203,7 +203,9 @@ def _features(
     label `seqs` and `out` on prefill, as `StepLinearBackend` counts them;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill;
     `tokens` a decode step's real MoE tokens under `routing`, the model's
-    (experts, top-k), which its MoE column reads, else None.
+    (experts, top-k), which its MoE column reads, else None; `dummies` its
+    group's dummy forwards (`BatchView.group_dummies`), which the column's
+    `moe_experts` counts as one token.
     """
     cut, rows = dict.fromkeys(CUTS, 0), []
     for s in samples:
@@ -239,7 +241,8 @@ def _features(
                         "which a data-parallel law's MoE column reads"
                     )
             context = tuple(r.context_tokens for r in view.decode)
-            rows.append((key, counts, s.device_s, s.step, context, tokens))
+            dummies = view.group_dummies
+            rows.append((key, counts, s.device_s, s.step, context, tokens, dummies))
     return rows, cut
 
 
@@ -447,47 +450,25 @@ def _folds(design, y, cell, names) -> dict:
     return out
 
 
-def _floor(members) -> list[float] | None:
-    """The dispersion floor of decode rung `members`, its `fit` rows: the p10
-    and p90 of `median / label - 1` over its steps, each priced at the median
-    label of its record's steps at the same real MoE tokens. A step alone at
-    its record's tokens has no spread to read and is left out."""
-    labels: dict[tuple, list[float]] = {}
-    for r in members:
-        labels.setdefault((r[0], r[6]), []).append(r[3])
-    error = [np.median(v) / y - 1.0 for v in labels.values() if len(v) > 1 for y in v]
-    return np.percentile(error, (10, 90)).tolist() if error else None
-
-
-def _reference_band(reference: dict | None, key: str) -> list[float] | None:
-    """The p10 and p90 of `reference`'s held-out band at decode rung `key`."""
-    vector = (reference or {}).get("decode", {}).get(key) or {}
-    band = vector.get("held_out", {}).get("bands", {}).get(_band(key, None))
-    return band and [band["p10"], band["p90"]]
-
-
-def _moe_column(members, x, names, routing, reference=None) -> tuple:
+def _moe_column(members, x, names, routing) -> tuple:
     """The MoE column decode rung `members` adopts, or None, and the figures the
     rule read, as the vector records them under `fit.moe_column`.
 
     `members` are the rung's `fit` rows, `x` their design over `names`. The
     forms are no column and each of `MOE_COLUMNS` over the steps' real MoE
-    tokens, `moe_experts` under `routing`. Each form is solved with each record
+    tokens, `moe_experts` under `routing` and with each step's group dummies
+    as one token (`moe_column`). Each form is solved with each record
     held out of the rung's rows, and its held-out error is the mean over the
     records of the held-out p50 error's magnitude, weighted by the record's
-    steps. The form of smallest held-out error is picked, no column on a tie;
-    a picked column is adopted unless some record's held-out p50 lies inside
-    the rung's bar without it and outside with it. The bar is the wider, p90
-    less p10, of `reference`, the reference law's held-out p10 and p90 at the
-    rung, and the dispersion floor (`_floor`). Adopted, the column is returned
-    as (feature, column, solve). A rung of one record has no held-out error
-    and adopts none.
+    steps. The form of smallest held-out error is picked, no column on a tie,
+    and a picked column is adopted, returned as (feature, column, solve). A
+    rung of one record has no held-out error and adopts none.
     """
     cell = np.array([r[0] for r in members])
     y = np.array([r[3] for r in members])
     forms = {"none": (x, names)}
     for feature in MOE_COLUMNS:
-        column = [moe_column(feature, r[6], routing) for r in members]
+        column = [moe_column(feature, r[6], routing, r[7]) for r in members]
         forms[feature] = (np.column_stack([x, column]), [*names, feature])
     held, error = {}, {}
     for form, (design, wide) in forms.items():
@@ -497,22 +478,11 @@ def _moe_column(members, x, names, routing, reference=None) -> tuple:
         error[form] = (
             sum(n * abs(p) for n, p in folds.values()) / steps if steps else None
         )
-    floor = _floor(members)
-    bar = max(filter(None, (reference, floor)), key=lambda b: b[1] - b[0], default=None)
     picked = min(error, key=error.get) if held["none"] else None
-    left = [
-        c
-        for c, (_, p) in held.get(picked, {}).items()
-        if bar and bar[0] <= held["none"][c][1] <= bar[1] and not bar[0] <= p <= bar[1]
-    ]
-    adopted = None if picked in (None, "none") or left else picked
+    adopted = None if picked in (None, "none") else picked
     figures = {
         "picked": picked,
         "adopted": adopted,
-        "bar": bar,
-        "reference": reference,
-        "floor": floor,
-        "left_bar": [str(c) for c in left],
         "held_out": {
             form: {
                 "error": error[form],
@@ -711,15 +681,13 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     `options` takes `form` (`base` by default), `dp`, the ranks each run
     holds (1 by default), `moe_routing`, the model's (routed experts,
     top-k), under which each decode rung but the draft law's may adopt a MoE
-    column, and `reference`, a law whose held-out bands bar that adoption
-    (`_moe_column`); `seed` fixes the `rowmod` shuffles; `draft`, or a
+    column (`_moe_column`); `seed` fixes the `rowmod` shuffles; `draft`, or a
     sample with a draft label, adds `seqs` and `out` to the prefill vector.
     """
     from scipy.spatial import QhullError
 
     form, dp = _options(options)
     routing = _routing(options)
-    reference = (options or {}).get("reference")
     serial = _serial(samples, options)
     kvs = [s for s in samples if s.draft_kv_s is not None and not s.view.prefill]
     samples = [
@@ -785,9 +753,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         rowmod_k = figures = None
         if key and key.isdigit():
             if routing:
-                chosen, figures = _moe_column(
-                    members, counts, names, routing, _reference_band(reference, key)
-                )
+                chosen, figures = _moe_column(members, counts, names, routing)
                 if chosen:
                     feature, column, solved = chosen
                     counts = np.column_stack([counts, column])
@@ -1008,7 +974,8 @@ def priced_rank(ranks: dict):
 def _held_out(samples, options, seed, warm=None):
     """Each step of each run, warm steps left out, priced as its costliest rank
     by the law fitted on the other runs: (run, vector, band, that rank's (counts,
-    context, tokens), relative error), the error nan where that law has no vector."""
+    context, tokens, dummies), relative error), the error nan where that law has
+    no vector."""
     form, dp = _options(options)
     options = {**(options or {}), "serial": _serial(samples, options)}
     runs = _runs(samples, dp)
@@ -1025,7 +992,7 @@ def _held_out(samples, options, seed, warm=None):
             if step in warm[i]:
                 continue
             vector = law["decode"].get(key) if key != "prefill" else law.get(key)
-            mine = [(r[1], r[4], r[5]) for r in group.values()]
+            mine = [(r[1], *r[4:7]) for r in group.values()]
             price, error = [c[1] for c, *_ in mine], float("nan")
             if vector is not None:
                 c = list(vector["coefficients"].values())
@@ -1035,11 +1002,12 @@ def _held_out(samples, options, seed, warm=None):
             yield run, key, _band(key, top[0]), top, error
 
 
-def _counts(vector: dict, routing, counts, context, tokens) -> tuple:
+def _counts(vector: dict, routing, counts, context, tokens, dummies) -> tuple:
     """A step's `counts` with the MoE column and `rowmod` count `vector` adds,
-    over its rows' `context` and its real MoE `tokens`, under `routing`."""
+    over its rows' `context` and its real MoE `tokens`, `dummies` of them its
+    group's dummy forwards', under `routing`."""
     moe = [f for f in MOE_COLUMNS if f in vector["coefficients"]]
-    counts = (*counts, *(moe_column(f, tokens, routing) for f in moe))
+    counts = (*counts, *(moe_column(f, tokens, routing, dummies) for f in moe))
     return counts + ((rowmod(context, vector["rowmod"]),) if "rowmod" in vector else ())
 
 
@@ -1200,12 +1168,6 @@ def main(argv=None) -> None:
         "steps' real MoE tokens, or the experts they reach, as a column",
     )
     parser.add_argument(
-        "--reference",
-        metavar="LAW",
-        help="a law whose held-out band at each decode rung, with the dispersion "
-        "floor, bars that rung's MoE column",
-    )
-    parser.add_argument(
         "--machine-spec",
         required=True,
         help="the machine_spec_digest of the spec of the platform the records ran "
@@ -1234,8 +1196,6 @@ def main(argv=None) -> None:
         engine = engine_config(args.records)
     dp = join_width(engine)
     options = {"form": args.form, "dp": dp, "moe_routing": args.moe_routing}
-    if args.reference:
-        options["reference"] = json.loads(Path(args.reference).read_text())
     samples, tables = label_records(args.records, dp)
     for record, table in tables.items():
         step_labels.write_table(record, table)

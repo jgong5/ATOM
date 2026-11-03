@@ -11,6 +11,7 @@ does.
 
 import json
 import math
+import re
 import shutil
 from types import SimpleNamespace
 
@@ -282,6 +283,79 @@ def test_a_log_at_dp_and_tp_both_above_1_is_refused_by_name(monkeypatch, tmp_pat
     for rank in ("dp0", "dp1"):
         value, verdict = rows[f"memory real {rank}", "memory"]
         assert verdict == "refused" and "at 2 DP ranks of TP 2" in value
+
+
+#: DP2 TP2 runners in the order they log: (DP rank, TP rank, factor on the
+#: predicted non_torch); dp0's TP rank 1 at twice the prediction.
+RUNNERS = [(1, 1, 1.0), (0, 0, 1.0), (1, 0, 1.0), (0, 1, 2.0)]
+
+
+def _process_rows(monkeypatch, tmp_path, runners) -> dict:
+    """validate's memory rows for DP2 at TP 2 against a log written under
+    ATOM_LOG_MORE, each line under a header naming its process: per runner, the
+    line naming its ranks (none where they are None), its warmup and its
+    Memory budget line."""
+    saved = _memory(monkeypatch, tmp_path, eager=True)
+    real, one, logged = tmp_path / "real", tmp_path / "one.log", ""
+    (real / "steps").mkdir(parents=True)
+    for r, _ in enumerate(_ranks(tmp_path)):
+        record = {"num_kvcache_blocks": 77049, "tensor_parallel_size": 2}
+        (real / "steps" / f"dp{r}.engine.json").write_text(json.dumps(record))
+    for pid, (dp, tp, f) in enumerate(runners, 4100):
+        named = [] if dp is None else [f"ModelRunner rank={tp}, dp_rank_local={dp},"]
+        non_torch = _total(saved, "non_torch") * f
+        text = _log(one, peak=_total(saved, "peak_torch"), non_torch=non_torch)
+        lines = named + [t.split("] ", 1)[1] for t in text.read_text().splitlines()]
+        head = f"[atom INFO] 2026-11-03 08:31:41.5 - ModelRunner{tp}/2:{pid} - m:1 - f"
+        logged += "".join(f"{head}\n{line}\n" for line in lines)
+    (real / "server.log").write_text(logged)
+    rows = validate._memory("real", tmp_path, "engine", real)
+    return {(where, name): (value, verdict) for where, name, value, verdict in rows}
+
+
+def test_a_dp_tp_log_naming_its_processes_is_graded_per_dp_rank_and_tp_line(
+    monkeypatch, tmp_path, capsys
+):
+    rows = _process_rows(monkeypatch, tmp_path, RUNNERS)
+    verdicts = [rows[f"memory real dp{d} tp{t}", "non_torch"][1] for d, t, _ in RUNNERS]
+    assert verdicts == ["pass", "pass", "pass", "fail"]
+    spreads = [rows[f"memory real dp{d}", "non_torch across TP ranks"] for d in (0, 1)]
+    assert [v.endswith(" 0.00% apart") for v, _ in spreads] == [False, True]
+    log = tmp_path / "real" / "server.log"
+    main([*_ranks(tmp_path), str(log), "--tp", "2"])
+    out = capsys.readouterr().out
+    runs = [t.split("\n", 1)[0] for t in out.split(" against run ")[1:]]
+    assert runs == [f"{log} tp{t}" for _ in (0, 1) for t in (0, 1)]
+    for value, _ in spreads:
+        assert f"\nnon_torch across TP ranks: {value}\n" in out
+
+
+@pytest.mark.parametrize(
+    "runners",
+    [RUNNERS[:3] + [(None, 1, 1.0)], RUNNERS[:3] + [(1, 1, 1.0)]],
+    ids=["a-runner-names-no-rank", "two-runners-at-one-rank"],
+)
+def test_a_dp_tp_log_whose_processes_miss_a_rank_is_refused(
+    monkeypatch, tmp_path, runners
+):
+    rows = _process_rows(monkeypatch, tmp_path, runners)
+    value, verdict = rows["memory real dp0", "memory"]
+    assert verdict == "refused" and "not one each of [(0, 0), (0, 1)," in value
+
+
+@pytest.mark.parametrize("name", ["rank{}.json", "lp-engine.dp{}.json"])
+def test_a_dp_tp_hand_in_whose_name_gives_no_dp_rank_is_refused_by_its_name(
+    monkeypatch, tmp_path, name
+):
+    _process_rows(monkeypatch, tmp_path, RUNNERS)
+    # Named as no DP rank, or as ranks 2 and 3 of a log at two.
+    named = [tmp_path / name.format(r + 2) for r in (0, 1)]
+    for rank, path in zip(_ranks(tmp_path), named):
+        shutil.copy(rank, path)
+    log = tmp_path / "real" / "server.log"
+    refused = re.escape(f"{named[0]}'s name gives no DP rank of the 2")
+    with pytest.raises(MemoryRefusal, match=refused):
+        main([*map(str, named), str(log), "--tp", "2"])
 
 
 def _tp_rows(monkeypatch, tmp_path, factors, tp=4, tokens=()) -> dict:

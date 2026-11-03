@@ -1151,3 +1151,29 @@ def test_a_dp_step_a_peer_ran_as_a_dummy_is_fitted_on_the_ranks_that_ran_it(tmp_
     assert sum(v["fit"]["samples"] for v in fitted) == 120
     assert fitted[0]["coefficients"] == pytest.approx(dp.PREFILL, rel=1e-6)
     assert fitted[1]["coefficients"] == pytest.approx(dp.DECODE, rel=1e-6)
+
+
+def test_a_routed_dp_law_is_held_out_with_each_step_s_dummy_forwards(tmp_path):
+    """Three DP runs whose idle ranks run dummy forwards: each run, held out of
+    a fit on the other two, is priced with its steps' dummies reaching one
+    token's experts, so the held-out errors are nil, and each step's costliest
+    rank lies inside their hull."""
+    import test_step_linear_moe_column as moe
+
+    runs = [
+        moe._dummy_records(tmp_path / f"run{s}", moe._dummy_groups(s, 120))
+        for s in (0, 1, 2)
+    ]
+    law, samples, options = moe._routed([r for run in runs for r in run])
+    report = {"held_out": {}}
+    mark_held_out(law, report, samples, options)
+
+    vector = law["decode"][str(moe.RUNG)]
+    band = vector["held_out"]["bands"][f"decode rung {moe.RUNG}"]
+    assert band["steps"] == 360
+    assert max(abs(band["p10"]), abs(band["p90"])) < 1e-6
+    assert len(report["held_out"]) == 3
+    backend = StepLinearBackend(StepLinearLaw(law), moe.DP)
+    views = [vs[0] for vs, _ in moe._dummy_groups(0, 120)]  # rank 0 always works
+    validated = {t.provenance.validated for v in views for t in backend.price(v).terms}
+    assert validated == {True}

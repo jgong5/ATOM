@@ -1618,7 +1618,9 @@ def _group_step_seconds(
     Only TP rank 0 prices; any other TP rank of the engine charges 0 s.
 
     `mode` is the step's `ForwardMode` when the step record already settled
-    it; without one it is settled here, which runs the DP collective.
+    it; without one it is settled here, which runs the DP collective. Under DP
+    the group then sums its dummy forwards (`projection.dummy_ranks`), which
+    the view states as its `group_dummies`.
 
     In a run, `compass_host` composes the price, the target's device seconds
     and then the draft's (`StepCost.target_seconds`, `draft_seconds`), with
@@ -1667,7 +1669,12 @@ def _group_step_seconds(
     `{"version": COST_TABLE_VERSION}` as the record starts, replacing an
     earlier run's file, and keeps it open in `_cost_table` for the run.
     """
-    from atom.compass.runner.projection import batch_view, dp_group, forward_mode
+    from atom.compass.runner.projection import (
+        batch_view,
+        dp_group,
+        dummy_ranks,
+        forward_mode,
+    )
 
     if runner.rank != 0:
         # The engine reads TP rank 0's reply only, and the other ranks'
@@ -1696,8 +1703,9 @@ def _group_step_seconds(
         )
         seen = vars(runner).setdefault("_admitted", set())
         batch.compass_admitted = admitted(batch, seen, entry)
+    dummies = dummy_ranks(batch, mode)
     try:
-        view = batch_view(batch, mode, runner)
+        view = batch_view(batch, mode, runner, dummies)
         if isinstance(host, HostDeviceRecurrence):
             view = dataclasses.replace(view, start_lag_s=host.start_lag(batch))
         cost = backend.price(view)
