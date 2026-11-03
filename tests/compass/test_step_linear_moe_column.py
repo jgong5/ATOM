@@ -426,24 +426,19 @@ def _merged_price(view: BatchView, law=EXPERTS) -> float:
 
 
 def _dummy_groups(seed, n, law=EXPERTS):
-    """`n` decode steps at rung 4 over `DP` ranks, rank `i % DP` the slowest
-    with 4 rows. Of the others, the first `(i // DP) % DP` after it run a
-    dummy forward, one row of context 1, and the rest hold 1 to 3 rows. Each
+    """`n` decode steps at rung 4 over `DP` ranks: at step `i` the last
+    `i % DP` ranks run a dummy forward, one row of context 1, and the others
+    hold the same 4 rows. The fit picks a step's slowest rank on the rung's
+    features without the MoE column, so ranks that differ only in those
+    features keep that pick off the MoE term, which the dummies move. Each
     rank's view states the group's tokens, a dummy's one among them, and its
     dummies; each step is priced by `law` as `_merged_price` prices it."""
     rng = np.random.default_rng(seed)
     out = []
     for i in range(n):
-        slow, idle = i % DP, (i // DP) % DP
-        dummies = {(slow + k) % DP for k in range(1, idle + 1)}
-        contexts = []
-        for r in range(DP):
-            if r in dummies:
-                contexts.append([1])
-                continue
-            span = (150_000, 200_000) if r == slow else (1, 40_000)
-            width = RUNG if r == slow else int(rng.integers(1, RUNG))
-            contexts.append([int(rng.integers(*span)) for _ in range(width)])
+        dummies = range(DP - i % DP, DP)
+        rows = [int(rng.integers(150_000, 200_000)) for _ in range(RUNG)]
+        contexts = [[1] if r in dummies else rows for r in range(DP)]
         tokens = sum(map(len, contexts))
         views = [
             BatchView(
@@ -456,9 +451,7 @@ def _dummy_groups(seed, n, law=EXPERTS):
             )
             for r, mine in enumerate(contexts)
         ]
-        prices = [_merged_price(v, law) for v in views]
-        assert int(np.argmax(prices)) == slow
-        out.append((views, max(prices)))
+        out.append((views, max(_merged_price(v, law) for v in views)))
     return out
 
 
