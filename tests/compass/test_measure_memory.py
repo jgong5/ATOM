@@ -58,7 +58,7 @@ from atom.compass.artifacts import (
     machine_spec_digest,
     member_name,
 )
-from atom.compass.drive import gpu, measure_memory, serve
+from atom.compass.drive import aiter_jit, gpu, jit_cache, measure_memory, serve
 from atom.compass.drive.gpu import GpuRefusal
 from atom.compass.memory import ModelTerms, device_readings, reserves
 from atom.compass.memory.check import STORAGE
@@ -120,8 +120,15 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
 def a_start(tmp_path, monkeypatch, stack):
     """The suite's TP2 worker and `main`'s arguments for a start on GPU 5 under
     `stack`, its engine and identity stood in for: the command reads `stack`, the
-    ranks write their files as the engine starts, and run.json names `stack`."""
+    ranks write their files as the engine starts, and run.json names `stack`.
+    The JIT cache roots its start restores into and its stop saves from are
+    empty directories of the test's own, so a compile elsewhere in the
+    container while it runs reaches no store."""
     r, out = tp2(tmp_path), tmp_path / "out"
+    roots = {tmp_path / "roots" / compiler: compiler for compiler in jit_cache.RULES}
+    for root in roots:
+        root.mkdir(parents=True)
+    monkeypatch.setattr(aiter_jit, "_roots", lambda: roots)
 
     class Engine:
         pid = 0
