@@ -168,7 +168,7 @@ def _doubling(start: int, below: int) -> list[int]:
 def _queries(b: int) -> list[int]:
     """Each of `_levels(b)` and the 15 sizes past it, or the 16 up to `b`
     where those pass it: every residue mod 16 at every size."""
-    starts = {max(1, min(q, b + 1 - SLOTS)) for q in _levels(b)}
+    starts = [max(1, min(q, b + 1 - SLOTS)) for q in _levels(b)]
     return sorted({s + r for s in starts for r in range(SLOTS) if s + r <= b})
 
 
