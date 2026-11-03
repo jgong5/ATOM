@@ -106,18 +106,18 @@ def test_a_row_routed_to_no_expert_stays_so_and_shared_columns_are_kept():
 
 
 def test_the_draw_is_independent_and_uniform_over_the_routed_experts():
-    """V4.1-Flash's 256 experts, top-6. Counts over the experts follow
-    chi-squared at 255 degrees of freedom, mean 255 and spread 22.6: a draw
+    """V4.1-Flash's 384 experts, top-6. Counts over the experts follow
+    chi-squared at 383 degrees of freedom, mean 383 and spread 27.7: a draw
     that favours experts lands above the band, one that deals them out in
     turn, as a balanced router does, below it."""
-    experts, k, rows = 256, 6, 4096
+    experts, k, rows = 384, 6, 4096
     ids = routing.uniform_ids(rows, experts, k, 0, "cpu")
 
     assert all(len(set(row)) == k for row in ids.tolist())
     counts = torch.bincount(ids.flatten(), minlength=experts).double()
     mean = rows * k / experts
     chi2 = float(((counts - mean) ** 2 / mean).sum())
-    assert 255 - 6 * 22.6 < chi2 < 255 + 6 * 22.6
+    assert 383 - 6 * 27.7 < chi2 < 383 + 6 * 27.7
     assert torch.equal(routing.uniform_ids(rows, experts, k, 0, "cpu"), ids)
     assert not torch.equal(routing.uniform_ids(rows, experts, k, 1, "cpu"), ids)
 
