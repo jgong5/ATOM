@@ -595,7 +595,7 @@ def test_only_the_binding_module_reaches_the_engine(path):
     `overrides` reads the cost backend's base class, from a package whose own
     test keeps it free of the engine. `projection` reads a scheduled batch and
     the dispatch rule. `doorbell` subclasses ATOM's worker, whose module the
-    engine's manager builds its ring and workers from. None of the three reaches
+    engine's manager builds its ring and workers from. None of them reaches
     `atom.model_engine.model_runner`, and
     `test_every_other_module_imports_here` runs the import to measure it.
     """
