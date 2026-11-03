@@ -688,6 +688,22 @@ def test_a_step_out_of_bounds_or_past_a_registered_message_aborts():
         ca.on_request(B, NER, INF, [])
 
 
+def test_a_ceiling_stops_at_the_bound_so_a_tar_past_it_aborts_as_without_one():
+    """b's ceiling, 1.25 with no bound, stops at the bound 1.0: b asks for
+    1.1, which aborts as it does without ceilings, and a step to 1.1 that b
+    reports having taken on its own aborts too."""
+    for ceilings in (False, True):
+        ca = _ceilinged(ceilings=ceilings, bound_s=1.0)
+        ((_, _, released),) = _first_grant(ca, 1.0, [(AB, 0, 0.5)])
+        assert released.ceiling == (1.0 if ceilings else None)
+        with pytest.raises(ClockAbort, match="a grant to 1.1 for b passes"):
+            ca.on_request(B, TAR, 1.1, [])
+    ca = _ceilinged(ceilings=True, bound_s=1.0)
+    _first_grant(ca, 1.0, [(AB, 0, 0.5)])
+    with pytest.raises(ClockAbort, match=r"TAR\(1.1\) answered 1.1, .* ceiling 1.0"):
+        ca.on_request(B, NER, INF, [], steps=[(TAR, 1.1, 1.1, 0)])
+
+
 def _drive_below_ceilings(seed, pick, ceilings, shuffle=0):
     """`_drive`'s LPs, each answering its own requests below its last grant's
     ceiling as `atom.utils.clock.LPRuntime` does, and asking for messages

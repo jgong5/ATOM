@@ -76,10 +76,11 @@ otherwise keep the run alive forever.
 
 An authority built with `ceilings` gives each grant to an LP without members,
 but a recovery's, a ceiling: the least of ``LBTS(i)``, the grant plus the LP's
-shortest cycle ``min over j of D(i->j) + D(j->i)``, and its earliest message
-still unreleased. Nothing reaches the LP below it: a message not yet sent
-arrives at or past ``LBTS(i)``, and one its own sends provoke at or past the
-cycle. Below it the LP's owner answers its own TARs and NERs, as this
+shortest cycle ``min over j of D(i->j) + D(j->i)``, its earliest message still
+unreleased, and the simulated-time bound. Nothing reaches the LP below it: a
+message not yet sent arrives at or past ``LBTS(i)``, and one its own sends
+provoke at or past the cycle; a time past the bound is asked for, and aborts
+as above. Below it the LP's owner answers its own TARs and NERs, as this
 authority would answer them, and reports each such step with its next request,
 with how many of the request's logged sends it made before that step. The
 authority replays each step as the grant its own request would have had:
@@ -122,8 +123,8 @@ class LpRow:
 @dataclass(frozen=True, slots=True)
 class ClientRun:
     """One ended client run: its client's clock at binding, the latest LP clock
-    at its end, each LP's clock and finite grants by name at its end, and the
-    stall diagnostics printed during it."""
+    at its end, each LP's clock, finite grants and calls served by name at its
+    end, and the stall diagnostics printed during it."""
 
     index: int
     start: float
@@ -131,6 +132,7 @@ class ClientRun:
     final_clocks: tuple[tuple[LpId, float], ...]
     grants: dict = field(repr=False)
     diagnostics: int = 0
+    requests_served: dict = field(default_factory=dict, repr=False)
 
 
 class ClockAbort(Exception):
@@ -583,7 +585,7 @@ class ClockAuthority:
     def _ceiling_of(self, i: LpId, g: float, released: Released) -> float:
         """The ceiling of `i`'s grant to `g`: `released` takes every message
         below it when `i` asked for them ahead."""
-        ceiling = min(self._lbts(i), g + self._cycle[i])
+        ceiling = min(self._lbts(i), g + self._cycle[i], self._bound)
         for name in self._into[i] if self._asks.get(i) else ():
             pending = self._undelivered[name]
             early = [(seq, a) for seq, a in pending.items() if a < ceiling]
@@ -674,7 +676,10 @@ class ClockAuthority:
         self._ceiling.clear()  # no LP runs below one now
         clocks, grants = tuple(self._now.items()), dict(self.grants)
         diagnostics = self.diagnostics - self._diagnosed
-        self.ended.append(ClientRun(k, self._start, end, clocks, grants, diagnostics))
+        served = dict(self.requests_served)
+        self.ended.append(
+            ClientRun(k, self._start, end, clocks, grants, diagnostics, served)
+        )
         if self._client is None or k + 1 == self._client_runs:
             return self._finish()
         self._start, self._diagnosed = end, self.diagnostics

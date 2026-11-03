@@ -621,18 +621,19 @@ LP (partition principle, above).
 **Local grants** (`compass run --local-grants`, the owner's ruling (c) on
 [#2542](https://github.com/jgong5/ATOM/issues/2542#issuecomment-6539617449)). A grant to an
 LP without members, other than a recovery's, also carries a ceiling: the least of
-`LBTS(i)`, `G` plus the LP's shortest cycle `min over j of D(i->j) + D(j->i)`, and its
-earliest unreleased arrival. Nothing reaches the LP below it: a message not yet sent
-arrives at or past `LBTS(i)`, and one its own sends provoke at or past the cycle. Its owner
-answers its own TAR and NER below the ceiling as the CA would and reports each such step
-with its next request, with how many of that request's logged sends preceded it; the CA
-keeps `N[i]` at the last grant meanwhile. The CA replays each step as the grant its own
-request would have had: it registers the sends made before it, records the reply with what
-it releases and counts the grant, so the step table and the grant counts are those of a
-run without the flag, which is why the run-file key is per-run. An NER may ask for its
-messages ahead: every message registered for it below the ceiling goes with the grant, and
-the owner releases each in the step that reaches it. A step outside the LP's clock and
-ceiling, or past a message registered for it since, aborts the run.
+`LBTS(i)`, `G` plus the LP's shortest cycle `min over j of D(i->j) + D(j->i)`, its
+earliest unreleased arrival, and the bound on simulated time. Nothing reaches the LP below
+it: a message not yet sent arrives at or past `LBTS(i)`, and one its own sends provoke at
+or past the cycle; a time past the bound is asked for, and aborts as any grant past it
+does. Its owner answers its own TAR and NER below the ceiling as the CA would and reports
+each such step with its next request, with how many of that request's logged sends
+preceded it; the CA keeps `N[i]` at the last grant meanwhile. The CA replays each step as
+the grant its own request would have had: it registers the sends made before it, records
+the reply with what it releases and counts the grant, so the step table and the grant
+counts are those of a run without the flag, which is why the run-file key is per-run. An
+NER may ask for its messages ahead: every message registered for it below the ceiling goes
+with the grant, and the owner releases each in the step that reaches it. A step outside
+the LP's clock and ceiling, or past a message registered for it since, aborts the run.
 
 #### Invariants
 
