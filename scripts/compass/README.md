@@ -872,7 +872,9 @@ holds the configuration's `memory_readings`. The run takes the step law at the m
 and engine config the file states, and its `host` at the host key the file states, the
 `atom` digest it was last re-keyed at, so a law re-keyed to this tree runs here though its
 records ran at another; each refuses where a store entry's would. A law file names no fit
-inputs, so grading cannot check its fitted traces against the cell's and refuses its run.
+inputs, so grading cannot check its fitted traces against the cell's; it takes the run,
+since calibration replays traces no cell is graded on (the
+[#2698 ruling](https://github.com/jgong5/ATOM/issues/2698#issuecomment-6591251259)).
 
 ## Cost accuracy on a real run's own steps — `validate.cost`
 
