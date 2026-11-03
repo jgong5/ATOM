@@ -405,9 +405,11 @@ def test_exactly_these_config_fields_are_read_with_no_default():
     way is not seen here.
     """
     assert _fields_read_with_no_default() == [
+        "decode_context_parallel_size",
         "disagg_is_decode",
         "enforce_eager",
         "eos_token_id",
+        "kv_cache_block_size",
         "kv_transfer_config",
         "model",
         "pipeline_parallel_size",

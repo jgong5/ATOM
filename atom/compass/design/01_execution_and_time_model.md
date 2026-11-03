@@ -1420,6 +1420,8 @@ stage and per DP rank, with a TP group modelled on its rank 0.
   forward, where `_sync_dp_state` releases every member, so a member's wait for that
   pull is the group round's, not `E`
   ([#1893](https://github.com/jgong5/ATOM/issues/1893)).
+  A forward that schedules a request for the first time also runs its admission
+  inside `schedule()`, priced apart by the host laws' `admit` (`09` D54).
 - `W_pre`: prepare (`ModelRunner.prepare_model`), which waits only at its two ends;
   under MTP, an output forward's prepare up to R1's wait.
 - `W_inputs`: under MTP, an output forward's prepare after R1's wait: the input ids,

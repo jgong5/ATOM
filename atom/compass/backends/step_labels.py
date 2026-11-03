@@ -69,6 +69,10 @@ the event it waits for.
 pull, else exit, over the ranks before the same forward, where the group's
 `_sync_dp_state` releases each of them.
 
+A step's `admitted` is what its `E` spent admitting requests (`admissions`):
+the scheduler allocates a request's whole prompt the first time it schedules
+it, walking its prefix-cache hit and taking a fresh block for each one past it.
+
 `write_table` writes a record's labels beside it, `dp<r>.cost.jsonl`, for
 people: a first line `{"version": TABLE_VERSION}`, then per step `step`,
 `d_busy_s`, `d_gap_s`, `launch_exposed`, `idle`, the segments, `label_s`,
@@ -138,6 +142,8 @@ class Sample:
     or None).
     `dummies` holds the steps its rank ran as a DP dummy forward, which give no
     sample: the same set on each of the rank's samples.
+    `admitted` is `(requests, uncached, cached)` of the requests it admits
+    (`admissions`).
     """
 
     step: int
@@ -152,6 +158,23 @@ class Sample:
     propose_s: float | None = None
     dummies: frozenset = frozenset()
     draft_kv_s: float | None = None
+    admitted: tuple = (0, 0, 0)
+
+
+def admissions(lines: list[dict]) -> list[tuple[int, int, int]]:
+    """Per line, `(requests, uncached, cached)` of the requests it admits: those
+    a prefill row schedules for the first time, with their prompt tokens past
+    the prefix-cache hit and within it. A request's prompt is its last prefill
+    row's context; its hit, the context its first row starts from."""
+    rows = [list(zip(s["batch"], (r[2] for r in s["rows"]))) for s in lines]
+    prompt = {r: c for line in rows for (r, _, c), decode in line if not decode}
+    seen, out = set(), []
+    for line in rows:
+        new = [(r, q, c) for (r, q, c), decode in line if r not in seen and not decode]
+        seen.update(r for (r, _, _), _ in line)
+        hits = [c - q for _, q, c in new]
+        out.append((len(new), sum(prompt[r] for r, *_ in new) - sum(hits), sum(hits)))
+    return out
 
 
 def group_tokens(lines) -> int | None:
@@ -355,7 +378,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
     tbo = (config or {}).get("engine", {}).get("enable_tbo")
     run = run or digest(record)
     samples, table, prev, ranks = [], [], None, None
-    busy = busy_gaps(lines)
+    busy, admits = busy_gaps(lines), admissions(lines)
     for i, s in enumerate(lines):
         if s["is_dummy_run"]:
             prev = s
@@ -453,6 +476,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
                 None if cut or propose is None else propose * 1e-9,
                 dummies,
                 None if cut or draft_kv is None else draft_kv * 1e-9,
+                admits[i],
             )
         )
         gap_ns = s.get("d_gap_ns")
