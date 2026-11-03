@@ -34,6 +34,7 @@ stating no `moe_tokens` is refused. The column is `moe_tokens`, `n` itself, or
 over `m`, `n` with the group's dummy forwards (`BatchView.group_dummies`)
 counted as one token: each dummy runs one row, token 0 at position 0, so
 together they reach one token's experts, where `n` counts each dummy's row.
+Under a drafter a dummy runs `mtp_k + 1` rows, and `m` merges one row per dummy.
 The gather pads every rank to the rung, and a pad row reaches no expert
 (before #2340, the one expert set of token 0), so at one rung the MoE's work
 follows the group's real tokens, which an uneven spread over the ranks leaves

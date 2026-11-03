@@ -279,7 +279,9 @@ experts `m` tokens reach in expectation, each routed to `K` of `E`
 (`work.activated_experts`), for the expert weights read. `m` is `n` with a step's DP dummy
 forwards counted as one token: a rank with no work runs one dummy row, token 0 at position
 0, which reaches the gate where a pad row does not, and every dummy's row is the same, so
-`d` dummies read one token's experts and `m = n − (d − 1)` for `d ≥ 1`. A record states
+`d` dummies read one token's experts and `m = n − (d − 1)` for `d ≥ 1`. Under a drafter a
+dummy runs `mtp_k + 1` rows, and `m` merges one row per dummy until a data-parallel MTP
+record tests a MoE column there. A record states
 `d` in its ranks' lines (`is_dummy_run`); a simulated step sums it over the DP group's CPU
 group, since ATOM's DP sync carries no dummy flag, a dummy reporting one token as a rank
 decoding one request does (`BatchView.group_dummies`,

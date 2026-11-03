@@ -220,8 +220,8 @@ class BatchView:
     on one rank. `group_dummies` counts the ranks of the data-parallel group
     that run a dummy forward at this step, this one among them when
     `dp_dummy`; 0 on one rank. Unlike a pad row, a dummy's row is scheduled
-    and reaches the MoE gate, and every dummy's is the same row, token 0 at
-    position 0, so the group's dummies route alike.
+    and reaches the MoE gate, and every dummy runs the same rows, from token 0
+    at position 0, so the group's dummies route alike.
     `group_prefills` says some rank of the data-parallel group
     prefills at this step; False on one rank. `image_tokens` counts the scheduled
     tokens whose embedding the step's vision encoder supplies; a backend that
