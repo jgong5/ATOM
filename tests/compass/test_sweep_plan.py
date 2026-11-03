@@ -77,19 +77,26 @@ def test_b_takes_every_offset_and_parked_count_and_splits_each_tbo_step(tmp_path
     points = plan(_write(tmp_path, engine, engine), _workload(3000))
     two = [p for p in points if p.split is not None and len(p.rows) == 2]
     unsplit = [p for p in two if not p.split]
+    short = [p for p in two if p.rows[0][0] < p.rows[1][0]]
     # The second row's offset, the first row's length, mod 16, by parked decodes.
     pairs = {(p.rows[0][0] % 16, p.held) for p in unsplit}
     assert pairs == {(o, h) for o in range(16) for h in range(1, 17)}
-    assert all(p.rows[0][0] < p.rows[1][0] for p in two)
     assert max(_tokens(p) for p in unsplit) < TBO_MIN
     steps = {}
     for p in two:
         steps.setdefault(p.step, []).append(p)
     assert {tuple(p.rank for p in s) for s in steps.values()} == {(0, 1)}
     # Each split step's first rank reaches the TBO minimum, the other does not.
-    split = [s for s in steps.values() if s[0].split]
-    assert len(split) == 128
+    split = [s for s in steps.values() if s[0].split and s[0] in short]
+    assert len(split) == 128 and set(unsplit) <= set(short)
     assert {tuple(_tokens(p) >= TBO_MIN for p in s) for s in split} == {(True, False)}
+    # Swapped, every first row reaches the minimum and the split falls inside
+    # it, at every residue mod 16 by parked decodes.
+    long = [p for p in two if p not in short]
+    assert all(p.split and _tokens(p) // 2 < p.rows[0][0] for p in long)
+    assert {(_tokens(p) // 2 % 16, p.held) for p in long} == {
+        (r, h) for r in range(16) for h in range(1, 17)
+    }
     # Too small a budget for a split step of two rows plans none.
     small = engine | {"max_num_batched_tokens": TBO_MIN + 16 * 17}
     points = plan(_write(tmp_path, small, small), _workload(3000))
@@ -135,17 +142,33 @@ def test_b_rows_on_a_context_take_each_query_size_over_chunk_cuts_and_prefixes(
             assert (p.held, p.split, len(p.rows)) == (1, False, 1)
             ((q, c),) = p.rows
             contexts.setdefault(p.cached[0], set()).add((q, c - q))
-    # Chunk cuts from the scheduler's alignment, 64 at 16-token blocks, below the
-    # budget, then whole budgets, within the longest prompt.
-    queries = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-    cuts = [64, 128, 256, 512, 1024, 2048]
+    # Each query size and the 15 past it, or up to the budget, on chunk cuts
+    # from the scheduler's alignment, 64 at 16-token blocks, below the budget,
+    # then whole budgets, then the last cut a budget fits behind in the longest
+    # prompt.
+    queries = {
+        *range(1, 32),
+        *(s + r for s in (32, 64, 128, 256, 497) for r in range(16)),
+    }
+    cuts = [64, 128, 256, 512, 1024, 2048, 2432]
     want = {(q, c) for q in queries for c in cuts if q + c <= 3000}
     assert contexts["chunk"] == want
     # Prefixes from one KV block, where no chunk row already takes them.
-    assert {c for _, c in contexts["prefix"]} == {16, 32}
+    assert {c for _, c in contexts["prefix"]} == {16, 32, 2480}
     no_prefix = engine | {"enable_prefix_caching": False}
     points = plan(_write(tmp_path, no_prefix), _workload(3000))
     assert {p.cached for p in points} == {("",), ("", ""), ("chunk",)}
+
+
+def test_a_steps_chunked_rows_take_as_many_earlier_chunks_each(tmp_path):
+    engine = _engine(enable_prefix_caching=False)
+    earlier = {}
+    for p in plan(_write(tmp_path, engine, engine), _workload(3000)):
+        if p.cached == ("chunk",):
+            ((q, c),) = p.rows
+            earlier.setdefault(p.step, set()).add(-(-(c - q) // 512))
+    assert {len(chunks) for chunks in earlier.values()} == {1}
+    assert set().union(*earlier.values()) == {1, 2, 4, 5}
 
 
 def test_no_point_leaves_the_engine_or_the_workload(tmp_path):

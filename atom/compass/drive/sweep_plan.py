@@ -19,12 +19,16 @@ roots: each point is planned once, on the rank its place in the walk names.
   decodes. Two rows whose first is 1 to 16 tokens long, so the second row's
   offset in the batch takes every residue mod 16, by every count of parked
   decodes; under two-batch overlap again, each step's first point past
-  `ATOM_TBO_PREFILL_MIN_TOKENS` so the step splits. Then one row of 1, 2, 4
-  and so on tokens up to the budget on a context already computed, doubling up
-  to the longest prompt: its own prompt's earlier chunks, from the scheduler's
-  chunk alignment below the budget, where a first row of the budget's rest
-  ends the first chunk, and from the budget up; with prefix caching on, a
-  prefix another request computed, from one KV block up.
+  `ATOM_TBO_PREFILL_MIN_TOKENS` so the step splits, and again with the rows
+  swapped and every first row past the minimum, so the split falls inside it.
+  Then one row of 1, 2, 4 and so on tokens up to the budget, each with the 15
+  sizes past it, on a context already computed: its own prompt's earlier
+  chunks, from the scheduler's chunk alignment doubling below the budget,
+  where a first row of the budget's rest ends the first chunk, then the
+  budget doubling, then the last aligned context a whole budget fits behind
+  in the longest prompt; with prefix caching on, a prefix another request
+  computed, from one KV block up. A step's chunked rows take as many earlier
+  chunks each.
 
 Every request asks for two output tokens, so its decode is reached too, with
 the workload's other sampling arguments copied unchanged; a parked decode asks
@@ -40,6 +44,7 @@ rank's unsplit step of the point's token count, and a B point when its
 prefill rows are the point's, in batch order, and its split is the point's.
 """
 
+import itertools
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -160,6 +165,22 @@ def _doubling(start: int, below: int) -> list[int]:
     return [start << j for j in range(max(0, (below - 1) // start).bit_length())]
 
 
+def _queries(b: int) -> list[int]:
+    """Each of `_levels(b)` and the 15 sizes past it, or the 16 up to `b`
+    where those pass it: every residue mod 16 at every size."""
+    starts = {max(1, min(q, b + 1 - SLOTS)) for q in _levels(b)}
+    return sorted({s + r for s in starts for r in range(SLOTS) if s + r <= b})
+
+
+def _contexts(start: int, b: int, cap: int) -> list[int]:
+    """`start` doubling below the budget `b`, `b` doubling below `cap`, and
+    the top: the last multiple of `start` that leaves a budget before `cap`."""
+    top = (cap - b) // start * start
+    return sorted(
+        {*_doubling(start, b), *_doubling(b, cap), *([top] if top > 0 else [])}
+    )
+
+
 def _fits(engine: dict, rows, held: int) -> bool:
     """Whether the rows and parked decodes fit the engine's sequences and KV
     pool, each with its output tokens and a drafter's tokens past them."""
@@ -241,34 +262,47 @@ def plan(engine, workload: dict, a_only: bool = False) -> list[Point]:
         families.append(
             [(((o, o), (s, s)), ("", ""), h, split) for (o, _, h), s in zip(two, big)]
         )
-    contexts = {
-        "chunk": _doubling(chunk_alignment(e["kv_cache_block_size"]), b)
-        + _doubling(b, cap)
-    }
+    if tbo:
+        # Every rank's first row past the minimum, so the split falls inside it
+        # and the ranks cost alike, which admits each second row.
+        families.append(
+            [(((tbo_min + s,) * 2, (o, o)), ("", ""), h, True) for o, s, h in two]
+        )
+    starts = {"chunk": chunk_alignment(e["kv_cache_block_size"])}
     if e["enable_prefix_caching"]:
-        contexts["prefix"] = _doubling(e["kv_cache_block_size"], cap)
+        starts["prefix"] = e["kv_cache_block_size"]
     families += [
         [
             (((q, c + q),), (kind,), 1, False)
-            for c in levels
-            for q in _levels(b)
+            for c in _contexts(start, b, cap)
+            for q in _queries(b)
             if c + q <= cap
         ]
-        for kind, levels in contexts.items()
+        for kind, start in starts.items()
     ]
     seen = set()
     for family in families:
         kept = [d for d in family if (d[3], d[0]) not in seen and _fits(e, d[0], d[2])]
         seen |= {(d[3], d[0]) for d in kept}
-        for i in range(0, len(kept), ranks):
-            group = kept[i : i + ranks]
-            split = _splits(e, ranks, [d[0] for d in group])
-            points += [
-                Point(rank, rows, how, held, split, step, body)
-                for rank, (rows, how, held, _) in enumerate(group)
-            ]
-            step += 1
+        # A step's chunked rows need as many earlier chunks each, so their
+        # last chunks run in one step.
+        for _, same in itertools.groupby(kept, lambda d: _chunks(d, b)):
+            same = list(same)
+            for i in range(0, len(same), ranks):
+                group = same[i : i + ranks]
+                split = _splits(e, ranks, [d[0] for d in group])
+                points += [
+                    Point(rank, rows, how, held, split, step, body)
+                    for rank, (rows, how, held, _) in enumerate(group)
+                ]
+                step += 1
     return points
+
+
+def _chunks(design, b: int) -> int:
+    """The earlier chunks a designed point's row on its own prompt takes."""
+    ((q, c), *_), how, *_ = design
+    return -(-(c - q) // b) if how == ("chunk",) else 0
 
 
 def covered(points, steps: dict[int, list[dict]]) -> tuple[list, list]:
