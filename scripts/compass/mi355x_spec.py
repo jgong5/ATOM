@@ -1,23 +1,19 @@
 # SPDX-License-Identifier: MIT
-"""An MI355X machine spec, from the tokenizers swept here and one real start.
+"""An MI355X machine spec, from one real start and the probes named below.
 
-    python3 scripts/compass/mi355x_spec.py [--model M ...] [--sweep-from DOC] [--out PATH]
+    python3 scripts/compass/mi355x_spec.py [--out PATH]
 
 Builds mi355-gpu-45's spec, or with COMPASS_MACHINE=mi355x-crs005
-crsuse2-m2m-v3-005's, which -013 shares: the same host CPU, cards, VBIOS and
-driver, and no ptl directory. With COMPASS_MACHINE=mi355x-gpu40 it builds
-mi355-gpu-40's, under rocm/atom-dev nightly 20261026's stack, the first that
-starts DeepSeek-V4.1-Flash.
+crsuse2-m2m-v3-005's, which -013 shares: the same cards, VBIOS and driver, and
+no ptl directory. With COMPASS_MACHINE=mi355x-gpu40 it builds mi355-gpu-40's,
+under rocm/atom-dev nightly 20261026's stack, the first that starts
+DeepSeek-V4.1-Flash.
 The device fragment is one DeepSeek-V4-Pro start at the nightly DPA-TP8 prefill
-side's arguments (`FLAGS`): the device, its capacity and the stack. One real
-burst at the same arguments adds the HTTP intake terms (`INTAKE`), on gpu-40
-lone requests to a DeepSeek-V4.1-Flash server the idle intake (`IDLE`), and
-`probe_device.py`'s readings (`PEAKS`) the compute and memory derates, the
+side's arguments (`FLAGS`): the device, its capacity and the stack.
+`probe_device.py`'s readings (`PEAKS`) add the compute and memory derates, the
 bandwidth curve, the kernel floor and the intra-node link's latency and derate.
 The peaks are the datasheet's; the rest is assumed. An engine start's memory
 readings are `compass measure memory`'s, not the spec's.
-`--model` and `--sweep-from` work as `mi308x_spec.py`'s do; with neither the
-script sweeps the tokenizers `SWEPT` names.
 """
 
 import argparse
@@ -38,11 +34,11 @@ if NAME not in MACHINES:
 CRS005, GPU40 = NAME == "mi355x-crs005", NAME == "mi355x-gpu40"
 
 import mi308x_spec as base
-from mi308x_spec import fragment, saved, swept
+from mi308x_spec import fragment
 
 from atom.compass.spec import Fragment, merge, validate
 
-base.NAME = NAME  # the shared fragment and sweep functions name this machine
+base.NAME = NAME  # the shared fragment functions name this machine
 MODEL = "/models/DeepSeek-V4-Pro"
 FLAGS = "-tp 8 --enable-dp-attention --enable-tbo"
 
@@ -51,7 +47,7 @@ DATE, COMMIT = "2026-10-16", "409bedc98"
 TOTAL = 309220868096
 #: The sha256 of the start's server log.
 RECORD = "02618dade3d07bcaac510da11cf8a279a1fe3ef2fce72d41e88a76f2df7c32c6"
-#: On 005, the start is the `INTAKE` record's server; its 287.98 GB total
+#: On 005, the start served a c=256 cc-traces burst; its 287.98 GB total
 #: is `TOTAL`, the bytes rocm-smi reads on every card of 005 and -013.
 if CRS005:
     MODEL = "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro"
@@ -62,88 +58,20 @@ if GPU40:
     MODEL = "/shared/data/amd_int/models/DeepSeek-V4-Pro"
     DATE, COMMIT = "2026-10-29", "b71c071d3"
     RECORD = "300adea69f618f9da5fd7258c927c14000b2f247a1bad8c02bd74928b62ce787"
-#: The models whose tokenizers a sweep with no `--model` takes.
-SWEPT = [MODEL]
-if GPU40:
-    SWEPT.append("/shared/data/amd_int/models/DeepSeek-V4.1-Flash")
 SUBJECT = {"model": MODEL, "width": 8, "source_root": f"commit:{COMMIT}"}
 SUBJECT["record"] = f"sha256:{RECORD}"
 
-#: `http_intake.py`'s fit over one real c=256 first-turn cc-traces burst at
-#: `FLAGS`, run at the commit named; the record is the probe's stamp file. The
-#: band is each term's p10 and p90 over six bursts, each fitted alone: the
-#: record and five more at 10a0609f7 on 2026-10-19, stamp files sha256
-#: 4e304c7a, 246e816a, 69148498, 0b987d21 and 59cac66f.
-INTAKE = (
-    "2026-10-18",
-    "19c5ab09e",
-    {"fixed_s": 0.001966482509138914, "per_byte_s": 5.288974015662166e-09},
-    {
-        "fixed_s": (0.0019362225299832747, 0.0023826020769630186),
-        "per_byte_s": (3.617351613835432e-09, 5.241243893276638e-09),
-    },
-    "2397696f6df3a280660cbc95e7c8db0d61b77fba9986c3d388ccde75f2d5f574",
-)
-#: On 005, three bursts started one after another with no gate on either
-#: node and no other deployment on 005: the record, 133dde61 and ae9b8a49; the
-#: record is the median of the fixed term, the larger.
+#: aiter's commit in the stack each host's start and probe ran under (on 005
+#: rocm/atom-dev sha256 4d44267b1d5a, nightly 20261026), and the day its cards
+#: were read with no ptl directory.
+AITER, PTL_DATE = "9205e1059", "2026-10-18"
 if CRS005:
-    INTAKE = (
-        "2026-10-29",
-        "f6e1fa77d",
-        {"fixed_s": 0.0020912355743506537, "per_byte_s": 4.19943165426115e-09},
-        {
-            "fixed_s": (0.0020310947130036056, 0.002139447088691459),
-            "per_byte_s": (3.9301788350529524e-09, 4.159128855060515e-09),
-        },
-        "fc9dadb1074821306edad43745d303c9de754feb03e9efcb195885b7282663cb",
-    )
-
-#: On gpu-40, one warm-up burst and then three, each started once no process
-#: held any card: 32a41c18, the record and ef2785a8; the record is the median
-#: of both terms.
-if GPU40:
-    INTAKE = (
-        "2026-10-29",
-        "b71c071d3",
-        {"fixed_s": 0.004323501788394507, "per_byte_s": 3.8541166293528945e-09},
-        {
-            "fixed_s": (0.004132315291889949, 0.004513225799755211),
-            "per_byte_s": (3.577973224796102e-09, 6.711557841376081e-09),
-        },
-        "163c6320f4e4793c1d153a3058649d4feb05a4cfc0ff65d30712aedfa2577373",
-    )
-
-#: On gpu-40, the intake of a request that finds no other on the loop:
-#: `http_intake.py idle` less `INTAKE`'s per-byte rate over the parity
-#: workload's 64 lone requests (`atom.compass.parity.traffic` with
-#: `64 3 0 0 1`) to one DeepSeek-V4.1-Flash TP4 DSpark5 server on cards 0-3,
-#: at the commit named; the record is its stamp file, the band the p10 and p90
-#: over those requests.
-IDLE = None
-if GPU40:
-    IDLE = (
-        "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
-        "2026-11-02",
-        "0cd22bcc3",
-        0.0010968477849480863,
-        (0.000840771034976077, 0.0013093755415280821),
-        "d90b6703f0b2c276c64fb297d715cc596acfe342cf34794002abc25e3f70cf78",
-    )
-
-#: Each host's core counts as /proc/cpuinfo reads them, aiter's commit in the
-#: stack its start and probe ran under (on 005 rocm/atom-dev sha256
-#: 4d44267b1d5a, nightly 20261026), and the day its cards were read with no
-#: ptl directory.
-CPU, AITER, PTL_DATE = (128, 256), "9205e1059", "2026-10-18"
-if CRS005:
-    CPU, AITER, PTL_DATE = (118, 236), "41d4d8d7e", "2026-10-29"
+    AITER, PTL_DATE = "41d4d8d7e", "2026-10-29"
 #: On gpu-40, rocm/atom-dev nightly 20261026 (sha256 4d44267b1d5a).
 if GPU40:
     AITER, PTL_DATE = "41d4d8d7e", "2026-10-29"
 
 DEVICE = {
-    "host": {"cpu": {"cores_physical": CPU[0], "cores_logical": CPU[1]}},
     "device": {
         "name": "MI355X",
         "arch": "gfx950",
@@ -329,9 +257,8 @@ for block, groups in DATASHEET.items():
 
 
 def device_fragments() -> list[Fragment]:
-    """The start's readings, the burst's intake terms, the lone requests' idle
-    intake where read, the datasheet's peaks, the probed peaks and the assumed
-    rest."""
+    """The start's readings, the datasheet's peaks, the probed peaks and the
+    assumed rest."""
     notes = f"one DeepSeek-V4-Pro {FLAGS} start at {COMMIT}"
     ptl = {"device": {"ptl": "disabled"}}
     datasheet = fragment(
@@ -343,12 +270,10 @@ def device_fragments() -> list[Fragment]:
     probed, assumed = base.peaks(PEAKS, datasheet.values, assumed)
     return [
         fragment("device", DEVICE, "probed", notes, SUBJECT, DATE),
-        base.intake(MODEL, *INTAKE),
         datasheet,
         assumed,
         fragment("ptl", ptl, "probed", "no card has a ptl directory", date=PTL_DATE),
         probed,
-        *([base.idle(*IDLE)] if IDLE else []),
     ]
 
 
@@ -356,14 +281,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     out = Path(__file__).resolve().parent / "machines" / f"{NAME}.json"
     parser.add_argument("--out", type=Path, default=out)
-    default = ", ".join(SWEPT)
-    parser.add_argument("--model", action="append", help="repeats; default " + default)
-    parser.add_argument("--sweep-from", type=Path, help="a document to reuse")
     args = parser.parse_args(argv)
-    sweeps = [saved(args.sweep_from)] if args.sweep_from else []
-    if args.model or not sweeps:
-        sweeps += swept(args.model or SWEPT)
-    merged = merge([*sweeps, *device_fragments()])
+    merged = merge(device_fragments())
     verdict = validate(merged.document)
     print(verdict)
     if not verdict.ok:

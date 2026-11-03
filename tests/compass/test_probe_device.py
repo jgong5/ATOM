@@ -79,9 +79,8 @@ def test_the_node18_script_publishes_the_probed_fields(monkeypatch, tmp_path):
     script = _load("mi308x_spec")
     found = probe.readings(RECORD)
     monkeypatch.setattr(script, "PEAKS", ("2026-10-19", "abc", found, "f00d"))
-    document = SCRIPTS / "machines" / "mi308x-hjbog18.json"
     out = tmp_path / "spec.json"
-    assert script.main(["--sweep-from", str(document), "--out", str(out)]) == 0
+    assert script.main(["--out", str(out)]) == 0
     spec = MachineSpec.from_mapping(json.loads(out.read_text()))
     assert spec.value("device.compute.derate.fp8") == 2 * 8192**3 / 2e-3 / 6.88e14
     assert spec.value("device.memory.derate") == 2.048e9 / 5.3e12
@@ -262,9 +261,8 @@ def test_the_mi355x_script_publishes_the_probed_fields_fp4_included(
     gemm = RECORD["gemm"] | {"fp4": {"8192x8192x8192": [1e-3, 2e-3, 3e-3]}}
     found = probe.readings(RECORD | {"gemm": gemm})
     monkeypatch.setattr(script, "PEAKS", ("2026-10-19", "abc", found, "f00d"))
-    document = SCRIPTS / "machines" / "mi355x-gpu45.json"
     out = tmp_path / "spec.json"
-    assert script.main(["--sweep-from", str(document), "--out", str(out)]) == 0
+    assert script.main(["--out", str(out)]) == 0
     spec = MachineSpec.from_mapping(json.loads(out.read_text()))
     # Each derate is over the datasheet's peak, FP4's over `fp4_flops`.
     assert spec.value("device.compute.derate.fp4") == 2 * 8192**3 / 2e-3 / 1.00663e16
