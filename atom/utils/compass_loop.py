@@ -687,13 +687,16 @@ class HttpChannel:
     (`SimExecutor.placed`), so a burst reaches the app one request at a time.
     A request that arrives once the last intake has ended is charged ``idle_s``
     in place of ``fixed_s``. A ``host`` entry with no ``http_intake`` charges nothing.
+    A body outside the bytes the term was fitted over
+    (`atom.compass.run.http_intake_hull`) is charged nothing and is a run-summary
+    reason ``http:intake ...`` naming that hull.
     """
 
     def __init__(self, app, stamp) -> None:
-        from atom.compass.run import http_intake
+        from atom.compass.run import http_intake, http_intake_hull
 
         self.app, self.stamp = app, stamp
-        self.intake = http_intake()
+        self.intake, self.hull = http_intake(), http_intake_hull()
         self.intake_end = -math.inf  # the LP time the last intake ended
         # http seq -> its hang-up, for each stamped request the app is serving
         self.hangups: dict[int, asyncio.Event] = {}
@@ -754,7 +757,14 @@ class HttpChannel:
                     if arrival >= self.intake_end:
                         fixed = idle
                     nbytes = sum(len(m.get("body", b"")) for m in body)
-                    charge(fixed + per_byte * nbytes)
+                    lo, hi = self.hull or (0, math.inf)
+                    if lo <= nbytes <= hi:
+                        charge(fixed + per_byte * nbytes)
+                    else:
+                        rt.refusals.append(
+                            f"http:intake of a {nbytes}-byte body, outside the "
+                            f"{lo:.0f} to {hi:.0f} bytes its http_intake was fitted on"
+                        )
                     self.intake_end = loop.time()
                 with rt.lock:
                     rt.count_done_locked(ch, seq)

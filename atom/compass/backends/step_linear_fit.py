@@ -61,6 +61,11 @@ on too few such forwards give `admit` null, so a run refuses a forward that
 admits a request rather than charge it nothing, and the report says why under
 `unfitted`.
 
+The same solver fits the host entry's ``tokenizer`` term on a recorded
+server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
+HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
+requests, over the body bytes their hull spans, and ``fixed_s`` from a burst.
+
 Each equation is divided by its own label and the coefficients are bound to be
 non-negative. Steps whose relative residual is more than `MAD_K` scaled MADs
 from the median are dropped and the rest refitted, until the kept set settles.
@@ -177,6 +182,8 @@ PROPOSE_SPLIT_STEPS = 200
 PROPOSE_SIDE_STEPS = 10
 HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
+#: What a lone HTTP request's intake costs: per request, and per body byte.
+INTAKE_FEATURES = ("idle", "bytes")
 #: What a forward's admissions cost per request, per prompt token past the
 #: prefix-cache hit and per token within it (`step_labels.admissions`).
 ADMIT_FEATURES = ("requests", "uncached", "cached")
@@ -339,6 +346,121 @@ def fit_host(samples) -> tuple[dict, dict]:
     return host, report
 
 
+def fit_tokenizer(paths) -> tuple[dict, dict]:
+    """The ``tokenizer`` term over the calls each tokenizer record in `paths`
+    holds, and its report: the records' backend and fingerprint, and
+    ``encode``, over ``encode`` and ``encode_batch`` calls, and ``decode``, each
+    ``fixed_s + tokens / tokens_per_s`` by the host-law solver; the report
+    gives each record's p10, p50 and p90 relative residual per call kind.
+    Raises on records of two tokenizers, or too few calls of a kind."""
+    heads, calls = set(), []
+    for i, path in enumerate(paths):
+        head, *lines = Path(path).read_text().splitlines()
+        heads.add(json.dumps(json.loads(head), sort_keys=True))
+        for c in map(json.loads, lines):
+            s = (c["t_end_ns"] - c["t_start_ns"]) * 1e-9
+            calls.append((i, c["call"] == "decode", c["tokens"], s))
+    if len(heads) != 1:
+        raise ValueError(f"the records name {len(heads)} tokenizers: {sorted(heads)}")
+    term, report = json.loads(heads.pop()), {}
+    for kind in ("encode", "decode"):
+        rows = np.array([c for c in calls if c[1] == (kind == "decode") and c[3] > 0])
+        if not len(rows):
+            raise ValueError(f"the records hold no {kind} call")
+        x = np.column_stack([np.ones(len(rows)), rows[:, 2]])
+        coef, fitted = _host_law(x, rows[:, 3], ("fixed", "tokens"))
+        if coef[1] <= 0:
+            raise ValueError(f"{kind}'s calls take no time per token")
+        term[kind] = {"fixed_s": coef[0], "tokens_per_s": 1 / coef[1]}
+        error = x @ coef / rows[:, 3] - 1
+        fitted["records"] = {
+            str(p): np.percentile(error[rows[:, 0] == i], [10, 50, 90]).tolist()
+            for i, p in enumerate(paths)
+            if (rows[:, 0] == i).any()
+        }
+        report[kind] = fitted
+    return term, report
+
+
+def _intakes(path) -> tuple[list, list]:
+    """The HTTP intake stamps `path` holds (`atom.compass.run.INTAKE_RECORD`) as
+    each lone request's ``(body bytes, seconds)``, and each burst's
+    ``(body bytes, template start ns)`` per request.
+
+    A request is its app call and the body, template, pool job and engine send
+    that follow it. A lone one found every earlier request sent and its own
+    sent before the next app call, with nothing else stamped between: its
+    seconds are the loop's, from the app call to the pool job and from the
+    job's end to the send's. A burst is a run of requests each of whose app
+    call came before the template of the one ahead of it began, the loop
+    taking them in one after another."""
+    rows = [line.split() for line in Path(path).read_text().splitlines()]
+    ev = sorted((int(r[3]), int(r[0]), r[2], int(r[4])) for r in rows)
+    at = [e[0] for e in ev]
+    apps = [e[0] for e in ev if e[2] == "app"]
+    # A request's app call is the last before its body's first read; any
+    # other, such as a health probe's, has no body.
+    calls = sorted(
+        {apps[np.searchsorted(apps, e[0]) - 1] for e in ev if e[2] == "body"}
+    )
+    sends = np.array(sorted(e[1] for e in ev if e[2] == "send"))
+    lone = []
+    for i, (call, after) in enumerate(zip(calls, calls[1:] + [math.inf])):
+        span = ev[np.searchsorted(at, call, "right") : np.searchsorted(at, after)]
+        between = [e for e in span if e[2] != "app"]
+        if np.searchsorted(sends, call) != i or [e[2] for e in between] != [
+            "body",
+            "tmpl",
+            "prep",
+            "send",
+        ]:
+            continue
+        body, _, prep, send = between
+        if send[1] < after:
+            lone.append((body[3], (prep[0] - call + send[1] - prep[1]) * 1e-9))
+    # The loop renders each request's template as soon as its body is read.
+    starts = [e[0] for e in ev if e[2] == "tmpl"]
+    sizes = [e[3] for e in sorted(ev, key=lambda e: e[1]) if e[2] == "body"]
+    # A template whose start finds a later request arrived and not yet rendered.
+    queued = [np.searchsorted(calls, t) > k + 1 for k, t in enumerate(starts)]
+    bursts, run = [], []
+    for k, t in enumerate(starts):
+        run.append((sizes[k], t))
+        if not queued[k]:
+            if len(run) > 1:
+                bursts.append(run)
+            run = []
+    return lone, bursts
+
+
+def fit_intake(paths) -> tuple[dict, dict]:
+    """The ``http_intake`` term over the intake stamps each record in `paths`
+    holds (`_intakes`), and its report: ``idle_s`` and ``per_byte_s`` by the
+    host-law solver on the lone requests' seconds over their body bytes, whose
+    hull is the term's ``bytes``; ``fixed_s`` the longest burst's mean gap
+    between template starts less ``per_byte_s`` times its mean body, each
+    gap the next request's. Raises on too few lone requests or no burst."""
+    lone, bursts = [], []
+    for path in paths:
+        got = _intakes(path)
+        lone += got[0]
+        bursts += got[1]
+    nbytes, seconds = np.array(lone, dtype=np.float64).reshape(-1, 2).T
+    x = np.column_stack([np.ones(len(nbytes)), nbytes])
+    (idle, per_byte), report = _host_law(x, seconds, INTAKE_FEATURES)
+    if not bursts:
+        raise ValueError(f"no burst among {len(lone)} lone requests")
+    sizes, starts = np.array(max(bursts, key=len), dtype=np.float64).T
+    fixed = np.diff(starts).mean() * 1e-9 - per_byte * sizes[1:].mean()
+    lo, hi = report["hull"]["facets"][0][1], -report["hull"]["facets"][1][1]
+    report["burst"] = {
+        "requests": len(sizes),
+        "span_s": (starts[-1] - starts[0]) * 1e-9,
+    }
+    term = {"fixed_s": fixed, "per_byte_s": per_byte, "idle_s": idle, "bytes": [lo, hi]}
+    return term, report
+
+
 def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
     """The host law on `names` over the forwards `x` labelled `y`, the part
     `offset` of each label fixed, and its report. Raises on too few forwards or
@@ -347,9 +469,10 @@ def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
     x = np.array(x, dtype=np.float64).reshape(-1, len(names))
     if len(x) <= len(names):
         raise ValueError(f"{len(x)} forwards for {len(names)} coefficients")
-    width = 3 if np.linalg.matrix_rank(x[:, 1:]) == 2 else 2
-    if width == 2:
-        x[:, 2] = 0.0
+    width = len(names)
+    if np.linalg.matrix_rank(x[:, 1:]) < width - 1:
+        width -= 1
+        x[:, width] = 0.0
     s = _solve(x, np.array(y), list(names), np.array(offset), names[0])
     hull = _hull(x[s["keep"]][:, 1:width], names[1:width])
     return s["coef"].tolist(), {

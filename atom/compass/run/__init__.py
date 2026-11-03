@@ -109,9 +109,11 @@ that admits a request, and absent from an entry whose ``E`` laws hold them;
 ``tokenizer``, the served tokenizer's ``backend`` (``fast`` or ``slow``), the
 ``fingerprint`` of the ``tokenizer.json`` it was fitted on, and ``encode`` and
 ``decode``, each ``fixed_s`` and ``tokens_per_s``; ``http_intake``,
-``fixed_s`` and ``per_byte_s``, with ``idle_s`` optional; a term an entry
-lacks, or every term with no entry, is charged 0 s and the run summary names
-it under ``uncharged_host_terms``; a list of them as ``step_linear``'s),
+``fixed_s`` and ``per_byte_s``, with ``idle_s`` optional and ``bytes``, the
+``[lo, hi]`` body bytes it was fitted over, outside which an intake is refused
+and charged 0 s; a term an entry lacks, or every term with no entry, is
+charged 0 s and the run summary names it under ``uncharged_host_terms``; a
+list of them as ``step_linear``'s),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
 ``decode/``, ``prefill<k>/`` and ``decode<k>/`` above one of a side, and for a
@@ -459,12 +461,21 @@ def _check_host(path, host: dict) -> None:
             "fingerprint, the tokenizer.json it was fitted on, and encode and "
             "decode, each fixed_s and a positive tokens_per_s"
         )
-    if intake is not None and not _seconds(
-        intake, {"fixed_s", "per_byte_s"}, {"idle_s"}
+    hull = intake.get("bytes", [0, 0]) if isinstance(intake, dict) else None
+    if intake is not None and not (
+        _seconds(
+            {k: v for k, v in intake.items() if k != "bytes"},
+            {"fixed_s", "per_byte_s"},
+            {"idle_s"},
+        )
+        and isinstance(hull, list)
+        and _seconds(dict(enumerate(hull)), {0, 1})
+        and hull[0] <= hull[1]
     ):
         raise ValueError(
             f"{path}: host's http_intake is {intake!r}; it takes fixed_s and "
-            "per_byte_s, and idle_s optional, each a non-negative number"
+            "per_byte_s, and idle_s optional, each a non-negative number, and "
+            "bytes optional, the body bytes it was fitted over, [lo, hi]"
         )
 
 
@@ -2095,6 +2106,20 @@ def http_intake() -> tuple[float, float, float] | None:
     HTTP request, from the ``http_intake`` term of this server's ``host`` entry,
     the one `tokenizer` resolved among several, ``fixed_s`` standing for an
     unstated ``idle_s``; None on a real run or with no term."""
+    if (term := _intake_term()) is None:
+        return None
+    return term["fixed_s"], term["per_byte_s"], term.get("idle_s", term["fixed_s"])
+
+
+def http_intake_hull() -> tuple[float, float] | None:
+    """The body bytes, ``(lo, hi)``, the ``http_intake`` term `http_intake`
+    reads was fitted over, outside which `HttpChannel` refuses a request's
+    intake; None on a real run, with no term, or a term stating none."""
+    term = _intake_term() or {}
+    return tuple(term["bytes"]) if "bytes" in term else None
+
+
+def _intake_term() -> dict | None:
     run = spec()
     if run is None:
         return None
@@ -2106,9 +2131,7 @@ def http_intake() -> tuple[float, float, float] | None:
                 "resolved for this server's: compass_run.tokenizer resolves it"
             )
         host = _frontend_host
-    if (term := host.get("http_intake")) is None:
-        return None
-    return term["fixed_s"], term["per_byte_s"], term.get("idle_s", term["fixed_s"])
+    return host.get("http_intake")
 
 
 def _fingerprint(tok) -> str | None:
