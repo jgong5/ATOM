@@ -224,7 +224,7 @@ spends beyond their kind's law, pooled over every kind: one scheduler admits for
 of them. On the DeepSeek-V4.1-Flash DSpark TP4 records the admission ran about 26 ns a
 token past the hit and 10 ns a token within it, all of it `schedule()`'s CPU time
 ([#2620](https://github.com/jgong5/ATOM/issues/2620)). A further request in the same
-forward adds its tokens and about 0.13 ms, against 0.64 ms for the first, in a probed
+forward adds its tokens and about 0.13 ms, against 0.66 ms for the first, in a probed
 simulated run; the records hold too few such forwards to fit that part, so it is left
 unpriced ([#2705](https://github.com/jgong5/ATOM/issues/2705)). Records with too few admitting
 forwards fit no `admit`, and a run refuses a forward that admits a request; an
