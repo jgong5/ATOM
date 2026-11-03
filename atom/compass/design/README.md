@@ -156,11 +156,11 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 ```
   +=====================================================================+
   |  L5  TOOLING          compass record | trace {steps,ops} |          |
-  |                       measure {steps,ops,memory} |                  |
-  |                       fit {steps,ops,host} | run; the bench;        |
+  |                       measure {steps,ops,memory,device} |           |
+  |                       fit {steps,ops,host,device} | run; the bench; |
   |                       step grid's planner, inside measure steps     |
-  |                       spec package: probes . merge . validate .     |
-  |                       explain, run by per-machine scripts           |
+  |                       device datasheets, network files; the spec    |
+  |                       a run composes from them and its readings     |
   |                       flags, precedence, the `compass` entry        |
   |                                                docs 07, 05, 13      |
   +=====================================================================+
@@ -195,8 +195,8 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       PP adds one LP per stage                      |
   |                                                docs 01, 15          |
   +=====================================================================+
-  |  L0  ARTIFACTS        machine_spec   op_graph      price_list       |
-  |                       op_measurement memory_readings                |
+  |  L0  ARTIFACTS        probe_record  platform_readings  op_graph     |
+  |                       price_list  op_measurement  memory_readings   |
   |                       shape_population  step_measurement            |
   |                       step_linear_law  host_laws  step grid bundle  |
   |                       keys . digests . fingerprints . invalidation  |
@@ -230,7 +230,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L4 | Harness contract, wire fields, adapter | [`06_workload_harness_contract.md`](06_workload_harness_contract.md) | D27–D35 |
 | L5 | The calibration phases, the measurement bench and the recommended flow | [`07_calibration_toolchain.md`](07_calibration_toolchain.md) | D36–D43 |
 | L5 | The JIT sweep and the per-stack cache library that warm a container before a graded run | [`07`](07_calibration_toolchain.md) | D106 |
-| L5 | Machine spec schema and probes | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
+| L5 | Machine spec layers, their schema, `measure device` and `fit device` | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
 | L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
 | — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D50.1, D50.2, D50.3) |
 | L5 | Configuration surface: flags, precedence, the `compass` commands with their inputs and outputs | [`13_configuration_surface.md`](13_configuration_surface.md) | D78–D81 |
@@ -278,7 +278,7 @@ This is what makes "no GPU at simulation time" work.
   OFFLINE, needs a GPU, run rarely          ONLINE, device-free, every run
   ================================          ==============================
 
-   spec probes      Phase 1b price
+   measure device   Phase 1b price
    Phase 1c in-situ Phase 2 memory
         |                  |
         v                  v
@@ -286,7 +286,7 @@ This is what makes "no GPU at simulation time" work.
    |        ARTIFACT STORE          |------>|  Phase 0  discovery       |
    |  key + digest + fingerprint    |       |  Phase 1a trace (JIT)     |
    |                                |<------|  cost model -> seconds    |
-   |  machine_spec   price_list     |  JIT  |  memory model -> blocks   |
+   |  platform_readings  price_list |  JIT  |  memory model -> blocks   |
    |  op_graph                      | trace |                           |
    |  memory_readings               |       |  -> simulated run         |
    +--------------------------------+       +---------------------------+
@@ -536,7 +536,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`05`](05_machine_spec_and_probes.md) | Machine Specification and its Probes | The one input artifact describing device, host, interconnect and the software stack it is pinned to. Read this before `03` and `04`, both of which consume it. Probe tools and their contamination refusals. |
+| [`05`](05_machine_spec_and_probes.md) | Machine Specification and its Probes | A value lives in the layer that names what it varies with: a device datasheet per SKU, platform readings per device, stack, PTL state and torch, folded from each node's probe record, and a network file per scale-out network for a run across nodes, composed into one machine spec for a run; every artifact keys the platform its row depends on. Read this before `03` and `04`, both of which consume it. Probe tools and their contamination refusals. |
 | [`03`](03_memory_and_kv_model.md) | Memory Model and the KV Pool | **Do not simulate the KV pool** — ATOM's real one is pure arithmetic. Substitute the five device readings, never the arithmetic. How a prefix-cache hit reaches the cost model. Validate per term, never as a sum. |
 | [`04`](04_model_capture_and_cost_ir.md) | Model Capture and the Cost IR | Capture with `TorchDispatchMode` + `FakeTensorMode`, concrete, one graph per decode width and prefill (T, B). A hierarchical, stream-annotated IR whose leaves carry their call contract and whose `Repeat` nests and tolerates non-contiguous layer patterns. **Opaque leaves** are priced, not decomposed. |
 | [`10`](10_analytical_laws.md) | Analytical Laws | Cost and memory from device parameters and model geometry, with no observation of the subject. Three classes: exact from geometry, device-parameterised, policy-determined. The analytical fallback, the step roofline and the MI455 projection. Its gate is a **bound**, at most the measured time on every measured step; ranking is reported. **The most speculative document here.** |
