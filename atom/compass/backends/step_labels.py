@@ -89,7 +89,7 @@ import hashlib
 import itertools
 import json
 from collections import Counter, defaultdict, deque
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -331,21 +331,17 @@ def _pull(step: dict) -> int:
 
 
 def label(
-    record,
-    run: str | None = None,
-    split_rule=None,
-    dummy_ranks: Mapping[int, int] | None = None,
+    record, run: str | None = None, split_rule=None
 ) -> tuple[list[Sample], list[dict]]:
     """The record's samples, in step order, and its table's rows.
 
     `run` names the run in each sample's provenance, the record's `digest` by
-    default; `split_rule` rebuilds an older record's split, as above;
-    `dummy_ranks` is the run's `group_dummies`, read from the rank records
-    beside a data-parallel record when None.
+    default; `split_rule` rebuilds an older record's split, as above. A
+    data-parallel record's `group_dummies` is read from the rank records
+    beside it.
     """
     lines = _read(record)
-    starts = [_pull(s) for s in lines]
-    return _label(record, lines, run, starts, split_rule, dummy_ranks)
+    return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None)
 
 
 def label_run(
