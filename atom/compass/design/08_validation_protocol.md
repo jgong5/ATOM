@@ -850,16 +850,23 @@ inventory of forms, and each one's level today, is tracked on
 
 1. **Three outcomes, two levels.** A form is at **level 0** when a scenario of it runs under
    the step stub and passes `detect/scenario.py::check_run`; at **level 1** when the same
-   run, priced by a real backend, still passes. `check_run` already fails a run with any
-   refusal or a coverage report (D50.1), so level 1 needs no check of its own. A form
-   Compass cannot run is **refused**: at start, by name, with a test that asserts the
-   refusal. Timeline parity and grading (D44 to D50) are not levels of this decision: they
-   stay with the stage trackers and their graded cells, and no gate runs them.
-2. **The target.** Every supported form reaches level 1. Where the backend refuses one, it
-   stays at level 0 and the refusal is an issue, not a target met. A form that is neither
-   supported nor refused is decided one or the other; none stays unclear. Images stay at
-   level 0 (the owner, 2026-11-02, on [#2712](https://github.com/jgong5/ATOM/issues/2712)):
-   every real backend refuses a step with image tokens, and the table names why.
+   run, priced by the step roofline alone (point 3), still passes. `check_run` already fails
+   a run with any refusal or a coverage report (D50.1), so level 1 needs no check of its
+   own. A form Compass cannot run or price is **refused**: by name, at start or at its
+   first step, with a test that asserts the refusal. Level 0 alone shows that the
+   simulation runs, not that the form is supported: a form every real backend refuses, with
+   no task planned to price it, is refused, whatever its level 0. Timeline parity and
+   grading (D44 to D50) are not levels of this decision: they stay with the stage trackers
+   and their graded cells, and no gate runs them.
+2. **The target.** Every supported form reaches level 1. Where the step roofline refuses
+   one and a task is planned to price it, the form stays at level 0 until that task lands,
+   and the refusal is an issue, not a target met. A form that is neither supported nor
+   refused is decided one or the other; none stays unclear. Images are refused (the owner's
+   decision of 2026-11-02, confirmed as refused on 2026-11-03, recorded in
+   [#2712](https://github.com/jgong5/ATOM/issues/2712)'s body): every real backend refuses
+   a step with image tokens (`backends/shape.py::IMAGES`), and no task prices a vision
+   encoder. `tests/compass/test_image_scenario.py` tests the frontend's media station under
+   the stub; it is no evidence that images are supported.
 3. **The backend is the step roofline, alone.** It reads no measurement, so it prices any
    scenario on any host, and a form on MI355X or MI455 is priced on that machine's spec
    document (`05`) from node 18, with memory readings the test publishes, as the vertical
@@ -911,7 +918,7 @@ RapidServe adds, until [#2598](https://github.com/jgong5/ATOM/issues/2598) is ru
 | D50.3 | The op-level empirical backend is graded by this protocol as the step-level backends are, on the same real runs: Qwen3.8-27B TP1 on MI308X on #974's runs, then M2's cells with the ranking gate. Faster than real is gated; 5× is reported. Reported, not gated: the analytical fallback's share of priced seconds, the per-step composed-over-measured gap per phase and op kind, the step-level backend's table beside it, and warm-over-cold. | 2026-10-18 (#1489) |
 | D51 | Measure a saturated cell early. Account cold costs once; report the simulator's own per-step CPU cost alongside the ratio. | 2026-09-18 |
 | D52 | Fail-closed invalidation conditions; any refusal is one, an answered step is not, whatever its method or share (D50.1). Scheduling claims require slack; throughput claims at saturation are fine. | 2026-09-18; revised 2026-10-11 twice |
-| D107 | Every supported form is a gated scenario. Level 0: its scenario passes `check_run` under the step stub; level 1: the same run passes priced by the step roofline alone, on the machine's spec document; otherwise refused at start by name, with a refusal test. Every supported form targets level 1, a backend refusal leaving it at level 0 with an issue; none stays unclear. The capability matrix is printed from marks on the tests, checked against a vocabulary by a CPU test, never against prose; engine scenarios run in the GPU gate per wave, and D43.1's trigger list is unchanged. Timeline parity and grading are not levels and run in no gate. | 2026-11-03 ([#2712](https://github.com/jgong5/ATOM/issues/2712)) |
+| D107 | Every supported form is a gated scenario. Level 0: its scenario passes `check_run` under the step stub; level 1: the same run passes priced by the step roofline alone, on the machine's spec document; otherwise refused by name, at start or at its first step, with a refusal test; a form every real backend refuses, with no task planned to price it, is refused whatever its level 0. Every supported form targets level 1, a roofline refusal with a planned task leaving it at level 0 with an issue; none stays unclear. Images are refused. The capability matrix is printed from marks on the tests, checked against a vocabulary by a CPU test, never against prose; engine scenarios run in the GPU gate per wave, and D43.1's trigger list is unchanged. Timeline parity and grading are not levels and run in no gate. | 2026-11-03 ([#2712](https://github.com/jgong5/ATOM/issues/2712)) |
 
 ---
 
