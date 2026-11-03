@@ -100,8 +100,10 @@ def main(argv: list[str]) -> None:
     command = " ".join(["compass", "trace", "ops", *argv])
     with tempfile.TemporaryDirectory(prefix="compass-capture-") as tmpdir:
         began = time.perf_counter()  # the first shape's seconds include the build
+        # A card's reading only when read: a declared arch's call is as before.
+        on = {"read": read} if read else {}
         captured = capture(
-            args.model, args.tp, shapes, tmpdir, atom_args, arch, args.population, read
+            args.model, args.tp, shapes, tmpdir, atom_args, arch, args.population, **on
         )
         for graph, model, declared in captured:
             seconds = time.perf_counter() - began
