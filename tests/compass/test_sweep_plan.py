@@ -1,29 +1,16 @@
 # SPDX-License-Identifier: MIT
 """A JIT sweep's points, planned from a cell's engine files and workload, and
-their coverage read off a step record.
+their coverage read off a step record's lines."""
 
-The coverage tests send a plan's requests through ATOM's real `Scheduler` and
-the simulated runner's `forward`, as `test_parity_record.py` drives them, and
-read the record those write with `parity.read`.
-"""
-
-import itertools
 import json
-import queue
 
 import pytest
-from test_parity_record import _config, _Runner
 
-from atom.compass.drive import sweep_plan
 from atom.compass.drive.sweep_plan import Point, covered, plan
-from atom.compass.parity import ENV, read
-from atom.model_engine.scheduler import Scheduler
-from atom.model_engine.sequence import Sequence
-from atom.sampling_params import SamplingParams
-
-pytestmark = pytest.mark.usefixtures("unpriced")
 
 SAMPLING = {"ignore_eos": True, "temperature": 0}
+#: The server's ATOM_TBO_PREFILL_MIN_TOKENS.
+TBO_MIN = 512
 
 
 def _engine(**fields):
@@ -53,74 +40,114 @@ def _workload(longest):
     return {"traces": [trace, {"requests": [{"in": 7}]}], "sampling": SAMPLING}
 
 
-def _by_rank(points):
-    return {r: [p for p in points if p.rank == r] for r in {p.rank for p in points}}
+def _tokens(point):
+    return sum(q for q, _ in point.rows)
 
 
-def test_each_rank_runs_every_count_once_and_its_compositions_cover_each_axis(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(sweep_plan, "SPACING", 8)
-    engine = _engine(enable_tbo=True)
-    small = engine | {"num_kvcache_blocks": 9}
-    points = plan(_write(tmp_path, engine, small), _workload(3000))
-    ranks = _by_rank(points)
-    assert sorted(ranks) == [0, 1]
-    # dp1's 9 KV blocks hold only some steps, and it plans those alone.
-    counts = [sum(q for q, _ in p.rows) for p in ranks[1]]
-    assert counts == sorted(set(counts)) and 0 < len(counts) < 512
-    for point in ranks[1]:
-        assert sum(-(-(c + 2) // 16) for _, c in point.rows) + point.held <= 9
-    mine = ranks[0]
-    assert [sum(q for q, _ in p.rows) for p in mine] == list(range(1, 513))
-    assert {p.held for p in mine} == set(range(16))
-    fresh = [p for p in mine if p.cached == ("",) * len(p.rows)]
-    # Under two-batch overlap every fresh step past one token has a request
-    # boundary to split on.
-    assert all(len(p.rows) == 2 for p in fresh[1:])
-    contexts = {}
-    for p in mine:
-        if p.cached != ("",) * len(p.rows):
-            ((q, c),) = p.rows
-            contexts.setdefault(p.cached[0], []).append(c - q)
-    assert sorted(contexts) == ["chunk", "prefix", "turn"]
-    # Chunks of the whole budget, as deep as the longest prompt holds.
-    assert {c % 512 for c in contexts["chunk"]} == {0}
-    assert max(c for p in mine for _, c in p.rows) <= 3000
-    assert max(contexts["chunk"]) == 5 * 512
-    assert {c % 16 for c in contexts["prefix"] + contexts["turn"]} == {0}
+def test_a_walks_every_count_once_on_the_rank_its_count_chooses(tmp_path):
+    points = plan(_write(tmp_path, _engine(), _engine()), _workload(300), TBO_MIN)
+    a = [p for p in points if p.split is None]
+    assert [_tokens(p) for p in a] == list(range(1, 513))
+    assert [(p.rank, p.step) for p in a[:4]] == [(0, 0), (1, 0), (0, 1), (1, 1)]
+    # One row and no parked decode up to the longest prompt; past it, rows of
+    # at most its length behind one parked decode.
+    assert {(len(p.rows), p.held) for p in a[:300]} == {(1, 0)}
+    assert {(len(p.rows), p.held) for p in a[300:]} == {(2, 1)}
+    assert max(c for p in a for _, c in p.rows) == 300
     assert all(p.body == SAMPLING | {"max_tokens": 2} for p in points)
+    # B's steps follow A's rounds, one point a rank.
+    b = [p for p in points if p.split is not None]
+    assert b[0].step == 256 and [p.rank for p in b[:4]] == [0, 1, 0, 1]
+    # Without DP attention a rank's budget is its share of the group's.
+    no_dpa = _engine(enable_dp_attention=False)
+    points = plan(_write(tmp_path, no_dpa, no_dpa), _workload(300), TBO_MIN)
+    assert max(_tokens(p) for p in points if p.split is None) == 256
+
+
+def test_b_takes_every_offset_and_parked_count_and_splits_each_tbo_step(tmp_path):
+    engine = _engine(enable_tbo=True, max_num_batched_tokens=1024)
+    points = plan(_write(tmp_path, engine, engine), _workload(3000), TBO_MIN)
+    two = [p for p in points if p.split is not None and len(p.rows) == 2]
+    unsplit = [p for p in two if not p.split]
+    # The second row's offset, the first row's length, mod 16, by parked decodes.
+    pairs = {(p.rows[0][0] % 16, p.held) for p in unsplit}
+    assert pairs == {(o, h) for o in range(16) for h in range(1, 17)}
+    assert all(p.rows[0][0] < p.rows[1][0] for p in two)
+    assert max(_tokens(p) for p in unsplit) < TBO_MIN
+    steps = {}
+    for p in two:
+        steps.setdefault(p.step, []).append(p)
+    assert {tuple(p.rank for p in s) for s in steps.values()} == {(0, 1)}
+    # Each split step's first rank reaches the TBO minimum, the other does not.
+    split = [s for s in steps.values() if s[0].split]
+    assert len(split) == 128
+    assert {tuple(_tokens(p) >= TBO_MIN for p in s) for s in split} == {(True, False)}
+    # Too small a budget for a split step plans none.
+    small = engine | {"max_num_batched_tokens": TBO_MIN + 16 * 17}
+    points = plan(_write(tmp_path, small, small), _workload(3000), TBO_MIN)
+    assert not any(p.split for p in points)
+
+
+def test_b_rows_on_a_context_take_each_query_size_over_chunk_cuts_and_prefixes(
+    tmp_path,
+):
+    engine = _engine(data_parallel_size=1)
+    points = plan(_write(tmp_path, engine), _workload(3000), TBO_MIN)
+    contexts = {}
+    for p in points:
+        if p.cached[0]:
+            assert (p.held, p.split, len(p.rows)) == (1, False, 1)
+            ((q, c),) = p.rows
+            contexts.setdefault(p.cached[0], set()).add((q, c - q))
+    # Chunk cuts from the scheduler's alignment, 64 at 16-token blocks, below the
+    # budget, then whole budgets, within the longest prompt.
+    queries = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+    cuts = [64, 128, 256, 512, 1024, 2048]
+    want = {(q, c) for q in queries for c in cuts if q + c <= 3000}
+    assert contexts["chunk"] == want
+    # Prefixes from one KV block, where no chunk row already takes them.
+    assert {c for _, c in contexts["prefix"]} == {16, 32}
+    no_prefix = engine | {"enable_prefix_caching": False}
+    points = plan(_write(tmp_path, no_prefix), _workload(3000), TBO_MIN)
+    assert {p.cached for p in points} == {("",), ("", ""), ("chunk",)}
 
 
 def test_no_point_leaves_the_engine_or_the_workload(tmp_path):
     engine = _engine(data_parallel_size=1, enable_prefix_caching=False, max_num_seqs=1)
-    points = plan(_write(tmp_path, engine), _workload(100))
-    # One sequence: one row, no held request; prompts no longer than 100.
-    assert [p.rows for p in points[:3]] == [((1, 1),), ((2, 2),), ((3, 3),)]
-    assert all(len(p.rows) == 1 and p.held == 0 for p in points)
-    assert [sum(q for q, _ in p.rows) for p in points] == list(range(1, 101))
-    # More sequences: a count past the longest prompt runs as several rows.
-    _write(tmp_path, engine | {"max_num_seqs": 64})
-    points = plan(tmp_path, _workload(100))
-    assert len(points) == 512
-    assert max(c for p in points for _, c in p.rows) == 100
-    assert {len(p.rows) for p in points} == set(range(1, 7))
-    # With no two-batch overlap, the second row's offset, the first row's
-    # length, still takes every residue mod 16.
-    firsts = {p.rows[0][0] for p in points if len(p.rows) == 2}
-    assert {q % 16 for q in firsts if q <= 16} == set(range(16))
+    points = plan(_write(tmp_path, engine), _workload(100), TBO_MIN)
+    # One sequence: A's counts up to the longest prompt, one row each, and no B.
+    assert [p.rows for p in points] == [((t, t),) for t in range(1, 101)]
+    # Two rows and 15 parked decodes fill 17 sequences.
+    _write(tmp_path, engine | {"max_num_seqs": 17})
+    assert max(p.held for p in plan(tmp_path, _workload(3000), TBO_MIN)) == 15
     # A prompt leaves room in the context for its two output tokens.
     _write(tmp_path, engine | {"max_num_seqs": 64, "max_model_len": 50})
-    assert max(c for p in plan(tmp_path, _workload(100)) for _, c in p.rows) == 48
+    assert (
+        max(c for p in plan(tmp_path, _workload(100), TBO_MIN) for _, c in p.rows) == 48
+    )
     # A drafter's tokens take KV blocks too: one block of 16 holds 14 prompt
-    # tokens and the two output tokens, but only 9 with three drafts.
+    # tokens and the two output tokens, but only 9 with three drafts; a parked
+    # decode needs more than one.
     one_block = engine | {"num_kvcache_blocks": 1}
-    assert len(plan(_write(tmp_path, one_block), _workload(100))) == 14
+    assert len(plan(_write(tmp_path, one_block), _workload(100), TBO_MIN)) == 14
     _write(tmp_path, one_block | {"speculative": ["mtp", 3]})
-    assert len(plan(tmp_path, _workload(100))) == 9
-    # Without DP attention a rank's budget is its share of the group's.
-    no_dpa = _engine(enable_dp_attention=False)
-    assert len(plan(_write(tmp_path, no_dpa, no_dpa), _workload(3000))) == 2 * 256
+    assert len(plan(tmp_path, _workload(100), TBO_MIN)) == 9
+    # The smallest rank's pool bounds every rank's points.
+    two = plan(
+        _write(
+            tmp_path,
+            engine | {"data_parallel_size": 2},
+            one_block | {"data_parallel_size": 2},
+        ),
+        _workload(100),
+        TBO_MIN,
+    )
+    assert max(_tokens(p) for p in two) == 14
+
+
+def test_a_deployment_no_delayer_coalesces_plans_a_alone(tmp_path):
+    points = plan(_write(tmp_path, _engine(), _engine()), _workload(300), TBO_MIN, True)
+    assert len(points) == 512 and all(p.split is None for p in points)
 
 
 @pytest.mark.parametrize(
@@ -136,93 +163,25 @@ def test_no_point_leaves_the_engine_or_the_workload(tmp_path):
 def test_ranks_that_state_two_engines_or_none_are_refused(tmp_path, second, refusal):
     engines = [_engine()] + ([_engine() | second] if second else [])
     with pytest.raises(ValueError, match=refusal):
-        plan(_write(tmp_path, *engines), _workload(3000))
+        plan(_write(tmp_path, *engines), _workload(3000), TBO_MIN)
 
 
 def test_an_engine_file_that_states_no_prefix_caching_is_refused(tmp_path):
     engine = _engine(data_parallel_size=1)
     del engine["enable_prefix_caching"]
     with pytest.raises(ValueError, match="dp0.engine.json states no enable_prefix"):
-        plan(_write(tmp_path, engine), _workload(3000))
+        plan(_write(tmp_path, engine), _workload(3000), TBO_MIN)
 
 
-def test_a_line_covers_a_point_by_its_rank_and_prefill_rows_in_order():
-    a, b = (
-        Point(0, ((3, 3), (5, 5)), ("", ""), 0, {}),
-        Point(1, ((8, 40),), ("chunk",), 2, {}),
-    )
+def test_a_line_covers_a_by_its_tokens_unsplit_and_b_by_its_rows_and_split():
+    a = Point(1, ((8, 8),), ("",), 0, None, 0, {})
+    b = Point(0, ((3, 3), (5, 5)), ("", ""), 2, False, 9, {})
+    split = Point(1, ((3, 3), (5, 5)), ("", ""), 2, True, 10, {})
     line = {"rows": [[3, 3, False], [5, 5, False], [1, 9, True]], "is_dummy_run": False}
+    # Any rank's unsplit step of 8 prefill tokens holds A's count 8.
+    assert covered([a, b, split], {0: [line]}) == ([a, b], [split])
+    tbo = line | {"tbo_tokens": [3, 5]}
+    assert covered([a, b, split], {1: [tbo]}) == ([split], [a, b])
     swapped = line | {"rows": [[5, 5, False], [3, 3, False]]}
-    dummy = {"rows": [[8, 40, False]], "is_dummy_run": True}
-    assert covered([a, b], {0: [line], 1: [dummy]}) == ([a], [b])
-    assert covered([a, b], {0: [swapped], 1: [line]}) == ([], [a, b])
-
-
-def _send(directory, monkeypatch, points=None):
-    """Send each point's requests, as its fields say, to one rank's scheduler
-    and simulated runner recording in `directory`. With no `points`, plan
-    them once one request's steps have written the engine file."""
-    monkeypatch.setenv(ENV, str(directory))
-    config = _config(budget=64, enable_prefix_caching=True)
-    config.max_num_seqs = 32
-    scheduler, runner = Scheduler(config), _Runner(config)
-    tokens = itertools.count(10)
-
-    def fresh(n):
-        return [next(tokens) for _ in range(n)]
-
-    def add(prompts, max_tokens=2):
-        params = SamplingParams(max_tokens=max_tokens, ignore_eos=True)
-        sequences = [Sequence(p, 16, sampling_params=params) for p in prompts]
-        for sequence in sequences:
-            scheduler.add(sequence)
-        return sequences
-
-    def step():
-        batch, seqs = scheduler.schedule()
-        reply = runner.forward(batch)
-        scheduler.postprocess(
-            list(seqs.values()), reply, stream_output_queue=queue.Queue(), batch=batch
-        )
-
-    def run(prompts, max_tokens=2):
-        sequences = add(prompts, max_tokens)
-        while scheduler.has_unfinished_requests():
-            step()
-        return sequences
-
-    if points is None:
-        run([fresh(1)])
-        points = plan(directory, _workload(300))
-    for point in points:
-        prompts = []
-        for (q, c), how in zip(point.rows, point.cached):
-            if how == "prefix":
-                shared = fresh(c - q)
-                run([shared], max_tokens=1)
-                prompts.append(shared + fresh(q))
-            elif how == "turn":
-                (first,) = run([fresh(c - q)])
-                tokens_so_far = [*first.prompt_token_ids, *first.completion_token_ids]
-                prompts.append(tokens_so_far + fresh(q - 2))
-            else:
-                prompts.append(fresh(c))
-        # Held: prefilled in a step of their own, decoded after the point's.
-        if add([fresh(1) for _ in range(point.held)]):
-            step()
-        run(prompts)
-    return points
-
-
-def test_a_simulated_run_sent_a_plans_requests_covers_each_point(tmp_path, monkeypatch):
-    monkeypatch.setattr(sweep_plan, "SPACING", 8)
-    points = _send(tmp_path / "all", monkeypatch)
-    kinds = {how for p in points for how in p.cached}
-    assert kinds == {"", "chunk", "prefix", "turn"}
-    assert covered(points, read(tmp_path / "all")) == (points, [])
-
-    # The same plan less one chunk's final step: that point, and only it, is missing.
-    dropped = next(p for p in points if p.cached == ("chunk",))
-    rest = [p for p in points if p is not dropped]
-    _send(tmp_path / "less", monkeypatch, rest)
-    assert covered(points, read(tmp_path / "less")) == (rest, [dropped])
+    dummy = line | {"is_dummy_run": True}
+    assert covered([a, b, split], {0: [swapped, dummy]}) == ([a], [b, split])
