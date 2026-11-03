@@ -729,7 +729,7 @@ and `buffers` terms of `peak_torch` with the storage bytes the start loaded.
 
 ## The step linear law from real cells — `step_linear_fit`
 
-`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K [--reference LAW]] [--engine FILE]`
+`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K] [--engine FILE]`
 fits the law a run file's `step_linear` key holds (`atom/compass/backends/step_linear.py`) from
 the step records of real cells, `OUT_DIR/steps/dp0.jsonl` of `REAL=1
 cctraces_sim.sh` runs, each with the `dp0.engine.json` the run wrote beside it,
@@ -745,8 +745,7 @@ counts and condition number, and names any vector it could not fit under
 decode rung adopt one column over its steps' real MoE tokens, the tokens or the
 experts they reach (`atom/compass/backends/step_linear.py`), by the rule the
 module's docstring states, and records under the vector's `fit.moe_column` what
-the rule read; a law refitted without it adopts none. `--reference LAW` names the
-law whose held-out band at each rung, with the dispersion floor, bars the column.
+the rule read; a law refitted without it adopts none.
 
 `DIGEST` is the `machine_spec_digest` of the capture host's spec in
 `scripts/compass/machines/`, which a run's spec must match, printed by
@@ -812,10 +811,9 @@ cell that built an aiter JIT module was run again. The decode side adds a c=256 
 at seed 20260709 and, for rung 12, c=96 at seeds 20260707 and 20260708 and c=112 at
 seed 20260709: a lone decode server at c=256 decodes at rungs 16 to 28, and at c=64
 at rungs 4 and 8. The decode law's rung 1, 2, 4 and 8 vectors are refitted with
-`--moe-routing 384,6`, DeepSeek-V4-Pro's routed experts and top-k, and the gpu-45
-decode law as `--reference`, on those cells and on the decode sides of two 1P1D
-`deploy.sh record` cells (below) at c=256 over traces 256 to 392, seeds 20260707 and
-20260708, whose decode ranks run unevenly loaded
+`--moe-routing 384,6`, DeepSeek-V4-Pro's routed experts and top-k, on those cells
+and on the decode sides of two 1P1D `deploy.sh record` cells (below) at c=256 over
+traces 256 to 392, seeds 20260707 and 20260708, whose decode ranks run unevenly loaded
 ([#2493](https://github.com/jgong5/ATOM/issues/2493)), with a step's DP dummy forwards
 counted as one token in `moe_experts` ([#2536](https://github.com/jgong5/ATOM/issues/2536));
 rungs 1, 4 and 8 adopt `moe_experts` and rung 2 adopts no column.
