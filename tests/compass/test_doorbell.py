@@ -11,6 +11,7 @@ worker process started.
 import json
 import queue
 import signal
+import socket
 import threading
 import time
 from types import SimpleNamespace
@@ -76,10 +77,15 @@ def test_a_worker_sleeps_between_calls_and_takes_each_in_order():
         writer.enqueue(("record", 1))
         writer.enqueue(("exit",))
         thread.join(10)
+        calls, alive = list(worker.runners[0].calls), thread.is_alive()
     finally:
+        # A worker still asleep holds its ring's buffer, which then cannot
+        # close: the doorbell shut wakes it to the calls left, and it leaves.
+        worker.doorbell.socket.shutdown(socket.SHUT_RD)
+        thread.join(10)
         _close(writer, worker)
-    (first, before), (second, after) = worker.runners[0].calls
-    assert (first, second, thread.is_alive()) == (0, 1, False)
+    assert ([n for n, _ in calls], alive) == ([0, 1], False)
+    (_, before), (_, after) = calls
     assert after - before < IDLE_S / 10, f"waiting took {after - before:.3f} CPU s"
 
 
