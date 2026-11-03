@@ -112,8 +112,8 @@ def _grouped(pattern: re.Pattern, text: str, log: Path, ranks: int, tp: int, dp)
     rank = {pid: (int(d), int(t)) for pid, t, d in _RANK.findall(text)}
     if not rank:
         raise MemoryRefusal(
-            f"{log}'s lines name no process, as under ATOM_LOG_MORE=1, so at "
-            f"{ranks} DP ranks of TP {tp} none can be paired with a DP rank's hand-in",
+            f"{log}'s lines name no process, as they do under ATOM_LOG_MORE=1, so "
+            f"at {ranks} DP ranks of TP {tp} none can be paired with a hand-in",
             "start the real server with ATOM_LOG_MORE=1, whose lines name "
             "their process, or compare a log at one DP rank or at TP 1",
         )
