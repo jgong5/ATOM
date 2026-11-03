@@ -295,8 +295,8 @@ that adopts neither keeps its three columns, and a rung of one record has no hel
 to pick by. Two columns at once were tried and refused: on the small
 rungs `n` and `X` are nearly collinear, and the non-negative solve kept one of the two at
 every rung ([#2493](https://github.com/jgong5/ATOM/issues/2493)). The column is a hull
-coordinate, so a step whose `n` falls outside the `n` its rung was fitted on is priced as
-an extrapolation (D58). Prefill needs no such column: its gather is variable-length, so
+coordinate, so a step whose `n`, or under `X` whose `m`, falls outside those its rung was
+fitted on is priced as an extrapolation (D58). Prefill needs no such column: its gather is variable-length, so
 `moe_rows` is its real tokens. An MTP draft law's decode vectors take no MoE column until
 a data-parallel MTP record tests it there.
 
