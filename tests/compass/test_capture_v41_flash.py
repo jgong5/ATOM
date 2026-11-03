@@ -72,6 +72,19 @@ SCRATCH = (
     "from atom.mono.runtime import compile as built\n"
     "built.scratch_bytes = lambda launcher: 64\n"
 )
+#: Each mono launcher, by its arguments that hold a buffer its runner keeps for
+#: the run: the scratch, the mailboxes' peer table and step state, the step
+#: metadata and the row buffers K1 and K2 write.
+HELD = {
+    "atom.mono.runtime.step_begin:_launch_step_begin": "scratch peers state",
+    "atom.models.deepseek_v41.mono.step_meta:_launch_step_meta": "ring_rel key_meta",
+    "atom.models.deepseek_v41.mono.kernels.attn_pre:launch_attn_pre": (
+        "scratch ring_rows q_out normed qr_out qrs_out"
+    ),
+    "atom.models.deepseek_v41.mono.kernels.layer_post:launch_layer_post": (
+        "scratch kmeta q ilog ibmax normed out"
+    ),
+}
 
 _CAPTURES: dict = {}
 
@@ -232,6 +245,27 @@ def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(tmp_p
     graph, _ = published(tmp_path, done)["decode B=16"]
     mono = r"atom\.(mono|models\.deepseek_v41\.mono)\.[\w.]+:\w"
     assert [op for op in _ops(graph["region"]) if re.match(mono, op["op"])]
+
+
+def roles(value):
+    """The roles of the tensors argument `value` holds."""
+    if isinstance(value, dict):
+        return {value["role"]} if "role" in value else roles([*value.values()])
+    return set().union(*map(roles, value)) if isinstance(value, list) else set()
+
+
+def test_gfx950_s_mono_leaves_hold_the_buffers_their_runner_keeps_as_metadata(
+    tmp_path_factory,
+):
+    graph, _ = capture(tmp_path_factory, MONO, "gfx950")["decode B=16"]
+
+    leaves = [op for op in _ops(graph["region"]) if op["op"] in HELD]
+    assert {op["op"] for op in leaves} == set(HELD)
+    for op in leaves:
+        # The runner is made in the model's first forward and lives the run:
+        # its buffers are metadata, never activations a bench fills at random.
+        held = {slot: roles(op["args"][slot]) for slot in HELD[op["op"]].split()}
+        assert held == {slot: {"metadata"} for slot in held}, op["op"]
 
 
 @pytest.mark.parametrize(
