@@ -152,7 +152,9 @@ class Released(dict):
     """What a grant releases, ``{channel: [(seq, arrival)]}``, and as `ceiling`
     the time below which its LP may advance on its own, or None."""
 
-    ceiling: float | None = None
+    def __init__(self, released=(), /) -> None:
+        super().__init__(released)
+        self.ceiling: float | None = None
 
 
 def _seconds(value, finite: bool, what: str, *args) -> float:
