@@ -3,17 +3,19 @@
 
 The ring is aiter's own, written by `RingingQueue` and read by the reader that
 `MessageQueue.create_from_handle` opens, as a worker's is; the loop is ATOM's
-`AsyncIOProc.busy_loop`, run in a thread on a worker given only what it reads.
-The manager is ATOM's `AsyncIOProcManager`, built inside the run's engine
-bootstrap with no worker process started.
+`AsyncIOProc.busy_loop`, run on a worker given only what it reads. The manager
+is ATOM's `AsyncIOProcManager`, built inside the run's engine bootstrap with no
+worker process started.
 """
 
 import json
 import queue
+import signal
 import threading
 import time
 from types import SimpleNamespace
 
+import torch.distributed as dist
 from aiter.dist.shm_broadcast import MessageQueue
 
 from atom.compass import run as compass_run
@@ -39,25 +41,22 @@ class Runner:
         pass
 
 
-def _start():
-    """A one-reader ring's writer, and its worker looping in a thread."""
-    writer = RingingQueue(1, 1, max_chunk_bytes=1 << 16)
+def _worker(writer):
+    """A worker reading `writer`'s ring as its reader 0, given only what it reads."""
     worker = object.__new__(SleepingWorker)
     worker.label, worker.runners, worker.io_threads = "worker", [Runner()], []
     worker.rpc_broadcast_mq = MessageQueue.create_from_handle(writer.export_handle(), 0)
     worker._block_table_decoder = BlockTableDeltaDecoder()
     worker.io_addrs, worker.io_queues = (None, None), (queue.Queue(), queue.Queue())
     worker.kv_queue = worker.rpc_queue = worker.all_ranks_barrier = None
+    return worker
 
-    def loop():
-        try:
-            worker.busy_loop()
-        except TypeError:  # the ring `exit` closed, as it ends a spin
-            pass
 
-    thread = threading.Thread(target=loop, daemon=True)
-    thread.start()
-    return writer, worker, thread
+def _loop(worker):
+    try:
+        worker.busy_loop()
+    except TypeError:  # the ring `exit` closed, as it ends a spin
+        pass
 
 
 def _close(writer, worker):
@@ -67,7 +66,10 @@ def _close(writer, worker):
 
 
 def test_a_worker_sleeps_between_calls_and_takes_each_in_order():
-    writer, worker, thread = _start()
+    writer = RingingQueue(1, 1, max_chunk_bytes=1 << 16)
+    worker = _worker(writer)
+    thread = threading.Thread(target=_loop, args=(worker,), daemon=True)
+    thread.start()
     writer.enqueue(("record", 0))
     time.sleep(IDLE_S)  # the worker waits for its next call
     writer.enqueue(("record", 1))
@@ -79,21 +81,29 @@ def test_a_worker_sleeps_between_calls_and_takes_each_in_order():
     _close(writer, worker)
 
 
-def test_a_worker_sigtermed_while_it_sleeps_leaves_its_loop():
-    writer, worker, thread = _start()
-    writer.enqueue(("record", 0))
-    for _ in range(500):
-        if worker.runners[0].calls:
-            break
-        time.sleep(0.01)
-    time.sleep(0.2)  # asleep on its doorbell again
-    worker.exit()  # what its SIGTERM handler runs
-    thread.join(10)
-    alive = thread.is_alive()
-    writer.enqueue(("exit",))  # a worker still asleep wakes to the closed ring
-    thread.join(10)
-    _close(writer, worker)
-    assert not alive
+def test_a_worker_signalled_while_it_sleeps_leaves_its_loop():
+    """A signal whose handler runs `exit`, as the one `init_exit_handler`
+    installs does, ends the loop of a worker asleep on its doorbell."""
+    writer = RingingQueue(1, 1, max_chunk_bytes=1 << 16)
+    worker = _worker(writer)
+    main = threading.main_thread().ident
+    before = signal.signal(signal.SIGUSR1, lambda *_: worker.exit())
+    signalled = threading.Timer(IDLE_S, signal.pthread_kill, (main, signal.SIGUSR1))
+    # A worker the signal leaves asleep wakes to the ring `exit` closed.
+    rung = threading.Timer(10 * IDLE_S, writer.enqueue, (("exit",),))
+    signalled.start()
+    rung.start()
+    started = time.monotonic()
+    try:
+        _loop(worker)
+    finally:
+        left = time.monotonic() - started
+        rung.cancel()
+        signalled.join()
+        rung.join()
+        signal.signal(signal.SIGUSR1, before)
+        _close(writer, worker)
+    assert left < 5 * IDLE_S, f"the worker left its loop {left:.1f} s after it began"
 
 
 def test_an_engine_built_in_a_simulated_run_rings_workers_that_sleep(
@@ -111,6 +121,8 @@ def test_an_engine_built_in_a_simulated_run_rings_workers_that_sleep(
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     for module, name in [(clock, "_installed"), (utils, "LP_OF_RANK")]:
         monkeypatch.setattr(module, name, None, raising=False)
+    for name in clock.COLLECTIVES:  # the engine's bootstrap wraps each
+        monkeypatch.setattr(dist, name, getattr(dist, name))
     monkeypatch.setattr(compass_run, "_member", None)
     monkeypatch.setattr(compass_run, "connect", lambda lp, endpoint, member: None)
     # ATOM's manager constructor, with no worker process, socket thread or signal.
