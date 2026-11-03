@@ -113,7 +113,6 @@ from torch.overrides import TorchFunctionMode
 from torch.utils._device import _device_constructors
 
 from atom.compass.backends.base import CostBackend
-from atom.compass.backends.step_labels import admit_x
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
 from atom.compass.runner.step_output import DeferredTokenStream, filler_token_ids
 
@@ -421,6 +420,8 @@ class HostDeviceRecurrence:
 
     def admit_s(self, batch: Any) -> float:
         """What `batch`'s admissions add to its `E`."""
+        from atom.compass.backends.step_labels import admit_x
+
         a = getattr(batch, "compass_admitted", None)
         if not (self.admit and a) or self.recv:
             return 0.0
