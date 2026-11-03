@@ -395,7 +395,13 @@ def test_a_cell_record_and_run_wrote_grades_as_the_one_cctraces_sim_wrote(tmp_pa
             {"run_file": {"step_grid": {}, "host": {}}, "coverage": {"declined": []}},
             None,
         ),
-        ({"provenance": {"digest": "sha256:stub", "provenance": None}}, None),
+        (
+            {
+                "run_file": {"step_stub": {}, "host": {}},
+                "provenance": {"digest": "sha256:stub", "provenance": None},
+            },
+            None,
+        ),
     ],
 )
 def test_a_simulated_run_grading_does_not_take_is_refused_naming_why(

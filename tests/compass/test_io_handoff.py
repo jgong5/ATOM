@@ -22,6 +22,7 @@ from test_vertical_slice import _run_file
 
 from atom.compass import parity
 from atom.compass import run as compass_run
+from atom.compass.drive.runfile import FIXED
 from atom.model_engine.engine_core import EngineCore
 from atom.model_engine.sequence import SequenceStatus, get_exit_sequence
 from atom.utils import clock
@@ -160,6 +161,6 @@ def test_the_reader_buckets_an_output_by_its_steps_batch(tmp_path):
         "every p99 but queue's under 1% of its step: no",
         (
             "p10 at prompt bucket 64: recv+queue 25.0 us, recv+past pull 15.0 us; "
-            "ipc_s 61.0 us"
+            f"ipc_s {FIXED['ipc_s'] * 1e6:.1f} us"
         ),
     ]

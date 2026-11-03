@@ -47,8 +47,12 @@ prefill and decode rows is cut.
 A step of an MTP record without `d_target_ns` is cut as `unsplit`: its device
 label would hold a draft the law prices again.
 
+An output forward's view takes `start_lag_s`: its device start, placed by the
+lead, less the exit of its token copy wait (`t_recv_ns`, else `t_read_ns`,
+else its launch's end).
+
 A step's host labels are its segments: `E` from the previous forward's exit,
-cut as idle when the two batches share no request; `W_pre` to the launch, less
+cut as idle after an idle engine (`busy_gaps`); `W_pre` to the launch, less
 the staging gate's wait; `W_launch` from the launch to the token copy wait,
 the sampler's launch included, or to the launch's end on a forward with no
 such wait, and none on a prefill the host did not pace whose launch ends
@@ -76,6 +80,7 @@ from __future__ import annotations
 
 import bisect
 import hashlib
+import itertools
 import json
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -260,9 +265,20 @@ def join_stamps(steps: list[dict], path) -> None:
                 step[key] = ts[i]
 
 
-def _shared(step, other) -> bool:
-    """Whether two steps' batches hold a request in common."""
-    return bool({r[0] for r in step["batch"]} & {r[0] for r in other["batch"]})
+def busy_gaps(lines: list[dict]) -> list[bool]:
+    """Per line, whether the engine was busy in the gap before it, holding a
+    request an earlier line scheduled and this line or a later one schedules
+    again. A busy loop steps on at its next pull; an idle one waits there for an
+    arrival, which the gap then holds."""
+    spans: dict = {}
+    for i, s in enumerate(lines):
+        for r in s["batch"]:
+            spans[r[0]] = (spans.get(r[0], (i,))[0], i)
+    opened = [0] * (len(lines) + 1)
+    for first, last in spans.values():
+        opened[first + 1] += 1
+        opened[last + 1] -= 1
+    return [n > 0 for n in itertools.accumulate(opened[:-1])]
 
 
 def _read(record) -> list[dict]:
@@ -330,6 +346,8 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             "by its device time"
         )
     exposed, paced, held = _host_cut(lines)
+    timed, lead = _timed(lines)
+    placed = {s["step"]: start + lead for s, start in timed}
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
@@ -337,6 +355,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
     tbo = (config or {}).get("engine", {}).get("enable_tbo")
     run = run or digest(record)
     samples, table, prev, ranks = [], [], None, None
+    busy = busy_gaps(lines)
     for i, s in enumerate(lines):
         if s["is_dummy_run"]:
             prev = s
@@ -357,6 +376,10 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
                         "rebuild it"
                     )
                 split = split_rule(group)
+        lag = None
+        if s["produces_output"]:
+            returned = s.get("t_recv_ns", s.get("t_read_ns", s["t_launch_ns"]))[1]
+            lag = (placed[s["step"]] - returned) * 1e-9
         view = BatchView(
             tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
             capture_rung=s["rung"],
@@ -365,6 +388,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             tbo_tokens=None if split is None else tuple(map(tuple, split)),
             moe_tokens=tokens,
             dp_rank=s["dp_rank"] if dp else None,
+            start_lag_s=lag,
         )
         cut = None
         if view.prefill and view.decode:
@@ -405,7 +429,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
         if copy.get(s["step"], (0, False))[1]:
             host["L_mtp"] = copy[s["step"]][0]
-        idle = prev is not None and not _shared(s, prev)
+        idle = prev is not None and not busy[i]
         if prev is not None and not idle:
             host["E"] = enter - starts[i - 1]
         host = {k: v * 1e-9 for k, v in host.items()}

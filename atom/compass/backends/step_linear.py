@@ -25,17 +25,31 @@ segment is priced as if routing spread tokens evenly over the experts, which
 no feature carries. A run refuses a law whose
 `machine_spec` is not its spec's `machine_spec_digest`, naming both.
 
-A decode vector may add `rowmod`, `rowmod(k)` over its rows in scheduled
+A decode vector may add one MoE column over `n`, the real tokens the step's
+MoE runs on: a data-parallel group's gathered tokens (`BatchView.moe_tokens`),
+or on one rank, which has no `moe_rows`, the step's own; a data-parallel step
+stating no `moe_tokens` is refused. The column is `moe_tokens`, `n` itself, or
+`moe_experts`, the routed experts those tokens are expected to reach,
+`E (1 - (1 - K/E)^n)` for the law's `moe_routing` `{"experts": E, "top_k": K}`.
+The gather pads every rank to the rung, and a pad row reaches no expert
+(before #2340, the one expert set of token 0), so at one rung the MoE's work
+follows the group's real tokens, which an uneven spread over the ranks leaves
+well below the rung's rows. A law whose decode vector carries `moe_experts`
+and that states no `moe_routing` is refused.
+After it a decode vector may add `rowmod`, `rowmod(k)` over its rows in scheduled
 order: the largest summed N_KV over the rows `i = r (mod k)`, with `k` the
 vector's `"rowmod"` entry. It prices an order the same multiset of rows can
 take at a different cost; `rowmod(1)` is Sum N_KV.
 
 A decode step that replays no graph (an eager runner, or a batch wider than
 the widest captured size) is the rung named `eager`, whose padding is zero.
-A DP dummy forward (`BatchView.dp_dummy`) at that rung, under a law with no
-`eager` vector, is `eager_dp_dummy`: 0 s, not refused.
+At that rung, under a law with no `eager` vector, a DP dummy forward and a decode
+while a peer prefills (`BatchView.dp_dummy`, `group_prefills`) cost 0 s, each
+under its treatment (`eager_beside_peer`), not refused.
 
-Every term is `estimated`. Each vector carries the convex hull of the features
+Every term is `estimated`, but a vector's stating `declared`, the origin of one
+fitted on another subject: those are `declared`, with that note, never validated.
+Each vector carries the convex hull of the features
 it was fitted on. A step outside it is priced by the same vector, its terms'
 source is `EXTRAPOLATED` and their detail names the hull; it is not refused.
 A vector may also carry, under `held_out`, the hull of the steps
@@ -56,11 +70,18 @@ requests: on a prefill step that produces output it adds the drafter's
 output and 0 on one that does not: the draft-KV pass projects and writes a tail
 only for requests that finish their prompts. Under either, a prefill step that
 does not say whether it produces output is refused.
-Beside `propose` it may hold a `short_propose` vector over `[1, seqs]` with a
-`below` entry, a token count: a prefill step of fewer tokens that produces
-output prices its `propose` pass by it instead. The pass replays one draft
-graph at any prefill length; what moves its window is whether the target's
-launch paced the device, which a batch shows only through its tokens.
+Beside `propose` it may hold a `near_propose` vector over `[1, seqs]` with a
+`lag` entry, in seconds: an output prefill whose device reaches the pass less
+than `lag` behind its host, the view's `start_lag_s` plus the step's target
+and draft-KV prices, prices the pass by it instead; a view stating no
+`start_lag_s` is refused. The pass replays one draft graph at any prefill
+length; what moves its window is how far the device runs behind its host,
+and below that lag the prefill's length: with a `below` entry, a token count,
+only an output prefill of fewer tokens is priced by `near_propose` or
+refused, and a longer one by `propose` whatever its lag, stated or not.
+A law fitted before that split may hold in its place a `short_propose` vector
+with a `below` entry, a token count: an output prefill of fewer tokens prices
+its pass by it. A law holding both is refused.
 A draft law may also hold a `draft_kv` vector over `[1, seqs]`: on a decode
 step it adds the drafter's draft-KV pass, which runs before
 `forward_done_event`, so its terms are the target's. A draft law with
@@ -73,14 +94,16 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
      "machine_spec": "sha256:<hex>",
      "prefill": VECTOR,
      "decode": {"eager": VECTOR, "1": VECTOR, "2": VECTOR, ...},
+     "moe_routing": {"experts": E, "top_k": K},   # with a moe_experts column
      "draft": {"provenance": ..., "prefill": VECTOR, "decode": {...},
                "propose": VECTOR, "draft_kv": VECTOR,
-               "short_propose": VECTOR,     # with "below": tokens
+               "near_propose": VECTOR,      # with "lag": seconds, "below": tokens
                "output_prefill_kv": true}}   # all four optional
 
     VECTOR = {"coefficients": {<feature>: seconds, ...},
               "hull": HULL,
               "rowmod": k,    # a decode vector with a `rowmod` coefficient only
+              "declared": "<where it was fitted>",  # optional
               "held_out": {"hull": HULL, "bands": {<band>: ERRORS, ...}}}  # optional
 
     HULL = {"equal": {<feature>: value, ...}, "facets": [[a_1, ..., a_k, c], ...]}
@@ -98,7 +121,7 @@ import math
 from collections.abc import Mapping
 
 from atom.compass.backends.base import CostBackend, Granularity
-from atom.compass.backends.cost import CostTerm, StepCost, eager_dp_dummy
+from atom.compass.backends.cost import CostTerm, StepCost, eager_beside_peer
 from atom.compass.backends.hull import Hull
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostRefused
@@ -110,11 +133,15 @@ from atom.compass.backends.shape import (
     sum_query_square,
     sum_tokens,
 )
+from atom.compass.backends.work import activated_experts
 
 PREFILL = ("step", "tokens", "query_square", "query_cached")
 HISTORY = PREFILL + ("history",)
 DECODE = ("step", "context", "graph_padding")
-ROWMOD = DECODE + ("rowmod",)
+#: The MoE columns a decode vector may add, over its step's real MoE tokens.
+MOE_COLUMNS = ("moe_tokens", "moe_experts")
+#: The decode vector's optional features, in the order they follow `DECODE`.
+DECODE_EXTRA = MOE_COLUMNS + ("rowmod",)
 PROPOSE = ("step", "seqs")
 EAGER = "eager"
 SOURCE = "step-linear"
@@ -147,9 +174,27 @@ class _Vector:
             f"the {name} held-out hull", features[1:], held["hull"]
         )
         self.features = features
+        self.declared = str(spec.get("declared", "")).strip()
         self.rowmod = int(spec["rowmod"]) if "rowmod" in features else None
         if self.rowmod is not None and self.rowmod < 1:
             raise ValueError(f"the {name} vector's rowmod modulus is {self.rowmod}")
+
+
+def moe_tokens(view: BatchView) -> int | None:
+    """The real tokens `view`'s MoE runs on: its data-parallel group's, or on
+    one rank, which has no `moe_rows`, its own decode rows'. None for a
+    data-parallel view that states no group tokens."""
+    if view.moe_rows is None:
+        return sum_tokens(view.decode)
+    return view.moe_tokens
+
+
+def moe_column(feature: str, tokens: int, routing: tuple[int, int] | None) -> float:
+    """MoE column `feature` of `MOE_COLUMNS` for a step of `tokens` real MoE
+    tokens, `moe_experts` over `routing`, the (experts, top-k) of `moe_routing`."""
+    if feature == "moe_experts":
+        return activated_experts(*routing, tokens)
+    return float(tokens)
 
 
 def rowmod(context, k: int) -> int:
@@ -181,24 +226,45 @@ class StepLinearLaw:
         self.decode = {
             None if rung == EAGER else int(rung): _Vector(
                 f"decode rung {rung}",
-                ROWMOD if "rowmod" in spec["coefficients"] else DECODE,
+                DECODE + tuple(f for f in DECODE_EXTRA if f in spec["coefficients"]),
                 spec,
             )
             for rung, spec in law["decode"].items()
         }
+        routing = law.get("moe_routing")
+        self.moe_routing = routing and (int(routing["experts"]), int(routing["top_k"]))
+        if not self.moe_routing and any(
+            "moe_experts" in v.features for v in self.decode.values()
+        ):
+            raise ValueError(
+                "a decode vector carries moe_experts and the law states no "
+                "moe_routing, the experts and top-k it is counted over"
+            )
         self.draft = StepLinearLaw(law["draft"]) if "draft" in law else None
         self.propose = law.get("propose") and _Vector(
             "propose", PROPOSE, law["propose"]
         )
-        short = law.get("short_propose")
-        self.short_propose = short and _Vector("short_propose", PROPOSE, short)
-        if short and ("below" not in short or not self.propose):
-            lacks = "no below" if "below" not in short else "no propose vector"
+        near, short = law.get("near_propose"), law.get("short_propose")
+        if near and short:
             raise ValueError(
-                "the short_propose vector prices a pass under its below token "
-                f"count, beside a propose vector; the law states {lacks}"
+                "the law splits the propose pass at a lag (near_propose) and at "
+                "a token count (short_propose); a law splits it once"
             )
+        self.near_propose = near and _Vector("near_propose", PROPOSE, near)
+        self.short_propose = short and _Vector("short_propose", PROPOSE, short)
+        for name, split, at in (
+            ("near_propose", near, "lag"),
+            ("short_propose", short, "below"),
+        ):
+            if split and (at not in split or not self.propose):
+                lacks = f"no {at}" if at not in split else "no propose vector"
+                raise ValueError(
+                    f"the {name} vector prices a pass under its {at}, beside a "
+                    f"propose vector; the law states {lacks}"
+                )
+        self.lag = near and float(near["lag"])
         self.below = short and int(short["below"])
+        self.near_below = near and near.get("below") and int(near["below"])
         self.draft_kv = law.get("draft_kv") and _Vector(
             "draft_kv", PROPOSE, law["draft_kv"]
         )
@@ -233,19 +299,24 @@ class StepLinearBackend(CostBackend):
                 "a step mixing prefill and decode rows; "
                 "the law prices a step of one kind",
             )
-        eager = not prefill and batch_view.capture_rung is None
-        if eager and batch_view.dp_dummy and None not in self.law.decode:
-            return eager_dp_dummy(SOURCE)
+        beside = eager_beside_peer(batch_view, SOURCE)
+        if beside is not None and None not in self.law.decode:
+            return beside
         terms, kv = self._terms(self.law, batch_view, "")
         drafts = []
         if self.law.draft is not None:
-            drafts, draft_kv = self._terms(self.law.draft, batch_view, "draft ")
+            drafts, draft_kv = self._terms(
+                self.law.draft, batch_view, "draft ", terms + kv
+            )
             kv += draft_kv
         return StepCost(terms + kv, self.treatments, drafts)
 
-    def _terms(self, law: StepLinearLaw, batch_view: BatchView, what: str) -> tuple:
+    def _terms(
+        self, law: StepLinearLaw, batch_view: BatchView, what: str, target=()
+    ) -> tuple:
         """`law`'s terms for the step, named for `what`, and apart its draft-KV
-        pass's, which are the target's."""
+        pass's, which are the target's; `target` holds the target's terms,
+        which run before a draft's."""
         prefill, decode = batch_view.prefill, batch_view.decode
         if prefill:
             vector, kind = law.prefill, "prefill"
@@ -287,6 +358,11 @@ class StepLinearBackend(CostBackend):
                     f"no {what}decode vector for rung {EAGER if rung is None else rung}",
                 )
             counts = (1, sum_context(decode), batch_view.graph_padding)
+            if moe := [f for f in MOE_COLUMNS if f in vector.features]:
+                tokens = moe_tokens(batch_view)
+                if tokens is None:
+                    raise self._refuse(batch_view, "no MoE group tokens on this step")
+                counts += tuple(moe_column(f, tokens, law.moe_routing) for f in moe)
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
         terms, kv = self._priced(law, vector, kind, counts, what), []
@@ -297,6 +373,19 @@ class StepLinearBackend(CostBackend):
             propose = law.propose
             if law.short_propose and sum_tokens(prefill) < law.below:
                 propose = law.short_propose
+            if law.near_propose and (
+                not law.near_below or sum_tokens(prefill) < law.near_below
+            ):
+                if batch_view.start_lag_s is None:
+                    raise self._refuse(
+                        batch_view,
+                        "an output prefill that does not say how far behind its "
+                        "host the device starts it, which its propose pass "
+                        "depends on",
+                    )
+                ahead = sum(t.seconds for t in (*target, *kv))
+                if batch_view.start_lag_s + ahead < law.lag:
+                    propose = law.near_propose
             terms += self._priced(law, propose, "propose", seqs, what)
         if decode and law.draft_kv is not None:
             kv = self._priced(law, law.draft_kv, "draft_kv", seqs, what)
@@ -309,15 +398,17 @@ class StepLinearBackend(CostBackend):
             source = EXTRAPOLATED
             detail = f"{detail}; outside the {what}{vector.name} hull"
         validated = bool(vector.held_out and vector.held_out.contains(counts[1:]))
+        method = Method.DECLARED if vector.declared else Method.ESTIMATED
         return [
             CostTerm(
                 f"{what.replace(' ', '.')}{kind}.{feature}",
                 count * coefficient,
                 Provenance(
-                    Method.ESTIMATED,
+                    method,
                     f"{coefficient:g} s x {count}; {detail}",
                     source,
-                    validated=validated,
+                    validated=validated and not vector.declared,
+                    note=vector.declared,
                 ),
             )
             for feature, count, coefficient in zip(

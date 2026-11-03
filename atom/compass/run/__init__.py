@@ -34,6 +34,8 @@ member, the frontend's included, connects to.
   `CompassModelRunner` where it would build its model, in the worker process.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
   ``decode`` to the frontend's clock, at the rates the machine spec measured.
+  A machine spec that refuses the tokenizer stops the run as a signal would,
+  so the engines leave and the server exits on the refusal.
 - `http_intake()` is what `atom.utils.compass_loop.HttpChannel` charges the
   frontend's event loop for each request it takes in.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
@@ -59,7 +61,8 @@ member, the frontend's included, connects to.
   what has been handed in.
 
 Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
-``ipc_s``, ``stream_s``, one of ``step_stub`` (a `Coefficients` mapping,
+``ipc_s``, ``stream_s``, ``ipc_out_s`` (optional, the engine output channels'
+lookahead, ``ipc_s`` when absent), one of ``step_stub`` (a `Coefficients` mapping,
 priced by `StepStubBackend`), ``step_linear`` (a `StepLinearLaw` mapping,
 priced by `StepLinearBackend`; its ``machine_spec`` digest and
 its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
@@ -490,6 +493,7 @@ def channel_table(run: dict):
 
 def _engines_table(run: dict):
     common = {k: run[k] for k in ("admission_path", "ipc_s", "stream_s")}
+    common["ipc_out_s"] = run.get("ipc_out_s")
     pp, links = _pp(run, "P"), ()
     if pp > 1:
         from atom.compass.runner.pp_send import carrier_models, lookaheads
@@ -1830,7 +1834,8 @@ def tokenizer(tok, config) -> None:
     """Wrap `tok`'s ``encode`` and ``decode``, and its Rust backend's
     ``encode_batch``, with the machine spec's entry for the model's architecture
     and the backend that loaded; the entry warns when the loaded
-    ``tokenizer.json`` is not the one it was measured on."""
+    ``tokenizer.json`` is not the one it was measured on. A refused entry
+    ends the run before the server serves (`_end_before_serving`)."""
     run = spec()
     if run is None:
         return
@@ -1839,11 +1844,15 @@ def tokenizer(tok, config) -> None:
     from atom.compass.spec import Backend
     from atom.utils.compass_loop import wrap_decode, wrap_encode, wrap_encode_batch
 
-    entry = _machine(run).tokenizer_for(
-        config.hf_config.architectures[0],
-        Backend.FAST if tok.is_fast else Backend.SLOW,
-        _fingerprint(tok),
-    )
+    try:
+        entry = _machine(run).tokenizer_for(
+            config.hf_config.architectures[0],
+            Backend.FAST if tok.is_fast else Backend.SLOW,
+            _fingerprint(tok),
+        )
+    except BaseException as e:
+        _end_before_serving(run, e)
+        raise
     tok.encode = wrap_encode(tok.encode, entry)
     tok.decode = wrap_decode(tok.decode, entry)
     # ATOM's segment tokenizer, which only a Rust backend gets, encodes a long
@@ -1851,6 +1860,19 @@ def tokenizer(tok, config) -> None:
     backend = getattr(tok, "_tokenizer", None)
     if isinstance(backend, Tokenizer):
         backend.encode_batch = wrap_encode_batch(backend.encode_batch, entry)
+
+
+def _end_before_serving(run: dict, e: BaseException) -> None:
+    """`e`, raised after the engines started and before the server serves, ends
+    the run in progress: stop it, as a signal stops the frontend's event loop, so
+    each engine leaves its loop at its ``+inf`` grant, hands in and its process
+    ends, which the server's exit waits for; then hand in `e` as the frontend's
+    ``ended:`` reason, which a standalone authority's summary waits for."""
+    rt = clock.installed()
+    if rt is None or not rt.in_run:
+        return
+    rt.end_run()
+    _hand_in(run, rt.me.name, rt.refusals + [f"ended:{rt.me.name} raised {e!r}"])
 
 
 def http_intake() -> tuple[float, float, float] | None:

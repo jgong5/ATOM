@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: MIT
 #
 # Re-measure the GPU gate's baseline and rewrite gpu_gate_baseline.env and
-# gpu_gate_known_failures.txt beside this script. Run it in the GPU container
+# gpu_gate_known_failures.txt in gpu_gate_baselines/<card's GPU target>/ beside
+# this script. Run it in the GPU container
 # whenever gate_gpu.sh warns that the toolchain differs from the baseline's: a
 # new image, a torch, HIP or aiter bump, or another GPU.
 #
@@ -13,8 +14,9 @@
 # it, so the baseline names the commit that ran, and its tree has no .git, as
 # the snapshot.sh trees the gate measures have none. Each of the two runs is the
 # gate's own suite over a fresh extraction: tests/ outside tests/plugin and
-# tests/compass, on the first card HIP_VISIBLE_DEVICES names. tests/compass is
-# the gate's separate run, added to its expectation per tree, so the baseline
+# tests/compass, on the first card HIP_VISIBLE_DEVICES names, less the files
+# gpu_gate_skip.txt leaves out there (BASE_LEFT_OUT counts them). tests/compass
+# is the gate's separate run, added to its expectation per tree, so the baseline
 # leaves it out.
 #
 # Nothing is written unless both runs complete with no error, pass the same
@@ -60,6 +62,10 @@ trap 'rm -rf "$WORK"' EXIT
 export CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:-true}
 CARD=${HIP_VISIBLE_DEVICES:-0}
 CARD=${CARD%%,*}
+ARCH=$(compass_gpu_arch "$CARD") && [ -n "$ARCH" ] || refuse 96 "torch reads no GPU target for card $CARD"
+PAIR=$DIR/gpu_gate_baselines/$ARCH
+DEVICE=$(HIP_VISIBLE_DEVICES=$CARD python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null)
+printf 'card:   %s, %s\n' "$ARCH" "${DEVICE:-UNKNOWN}"
 P=()
 for k in 1 2; do
     ROOT=$WORK/$k/ATOM
@@ -69,7 +75,8 @@ for k in 1 2; do
     compass_require_tree "$ROOT" || exit $?
     cd "$ROOT" || exit 90
     printf '===== run %s of 2 at %s on HIP_VISIBLE_DEVICES=%s =====\n' "$k" "${SHA:0:9}" "$CARD"
-    HIP_VISIBLE_DEVICES=$CARD python -m pytest tests/ --ignore=tests/plugin --ignore=tests/compass \
+    compass_gpu_skips "$DEVICE" || refuse 1 "$SKIP_WHY"
+    HIP_VISIBLE_DEVICES=$CARD python -m pytest tests/ --ignore=tests/plugin --ignore=tests/compass "${SKIP_ARGS[@]}" \
         -q --no-header -p no:cacheprovider -rfE 2>&1 | tee "$WORK/$k.log"
     RC=${PIPESTATUS[0]}
     compass_pytest_counts "$WORK/$k.log"
@@ -93,8 +100,9 @@ fi
 
 "$DIR/preflight.sh" || refuse 91 "pre-flight failed after the runs, so the node changed under them"
 
+mkdir -p "$PAIR" || refuse 1 "cannot create $PAIR"
 # Built beside the targets and renamed, so a failure above leaves both intact.
-cat >"$DIR/gpu_gate_baseline.env.tmp" <<EOF
+cat >"$PAIR/gpu_gate_baseline.env.tmp" <<EOF
 # SPDX-License-Identifier: MIT
 # The GPU gate's baseline, read by gate_gpu.sh, which says what each value is.
 # Written whole by regen_gpu_gate_baseline.sh, with gpu_gate_known_failures.txt.
@@ -102,6 +110,7 @@ BASE_COMMIT=${SHA:0:9}
 BASE_PASSED=${P[1]}
 BASE_FAILED=$FAILED
 BASE_COMPASS_TESTS=0
+BASE_LEFT_OUT=$SKIP_N
 BASE_TORCH=$TORCH
 BASE_ROCM=$ROCM
 BASE_AITER=$AITER
@@ -117,8 +126,8 @@ EOF
 # statements of one fact; gate_gpu.sh refuses to run if they disagree.
 EOF
     cat "$WORK/1.failed"
-} >"$DIR/gpu_gate_known_failures.txt.tmp"
-mv -f "$DIR/gpu_gate_baseline.env.tmp" "$DIR/gpu_gate_baseline.env"
-mv -f "$DIR/gpu_gate_known_failures.txt.tmp" "$DIR/gpu_gate_known_failures.txt"
-printf 'wrote %s and %s: %s passed, %s failed at %s\n' "$DIR/gpu_gate_baseline.env" \
-    "$DIR/gpu_gate_known_failures.txt" "${P[1]}" "$FAILED" "${SHA:0:9}"
+} >"$PAIR/gpu_gate_known_failures.txt.tmp"
+mv -f "$PAIR/gpu_gate_baseline.env.tmp" "$PAIR/gpu_gate_baseline.env"
+mv -f "$PAIR/gpu_gate_known_failures.txt.tmp" "$PAIR/gpu_gate_known_failures.txt"
+printf 'wrote %s and %s: %s passed, %s failed at %s\n' "$PAIR/gpu_gate_baseline.env" \
+    "$PAIR/gpu_gate_known_failures.txt" "${P[1]}" "$FAILED" "${SHA:0:9}"
