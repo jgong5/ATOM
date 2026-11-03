@@ -387,9 +387,10 @@ def main(record: str, machine=None, row_bytes=None, law=None) -> int:
     paths = [Path(record) / f"dp{rank}.jsonl" for rank in stages[0]]
     run = ", ".join(map(step_labels.digest, paths)) if law else None
     law = law and json.loads(Path(law).read_text())
+    dummies = law and step_labels.group_dummies(stages[0].values())
     for path, (rank, steps) in zip(paths, stages[0].items()):
         if law:
-            samples = step_labels.label(path)[0]
+            samples = step_labels.label(path, dummy_ranks=dummies)[0]
             warm, jit = warm_steps(law, run), jit_steps(law, run)
             reports = [priced(steps, samples, law, warm, jit)]
         elif pp > 1:
