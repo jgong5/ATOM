@@ -183,6 +183,7 @@ from atom.compass.artifacts import (
     roots_for,
 )
 from atom.compass.backends.op_graph import PERMILLE
+from atom.compass.bench.routing import uniform_ids
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.utils.arg_parser import FlexibleArgumentParser
 
@@ -1109,14 +1110,7 @@ class Stub:
             )
         [(experts, k)] = self.moe
         device = self.runner.device
-        seed = torch.Generator(device).manual_seed(SEED * CALLS + c)
-        # double, not the default dtype ATOM's runner sets to the model's: a
-        # bfloat16 or float32 draw ties, and the device's top-k breaks a tie
-        # differently from call to call
-        draw = torch.rand(
-            spec["shape"][0], experts, generator=seed, device=device, dtype=torch.double
-        )
-        ids = draw.topk(k).indices
+        ids = uniform_ids(spec["shape"][0], experts, k, SEED * CALLS + c, device)
         self.loads.append(torch.bincount(ids.flatten(), minlength=experts).tolist())
         out = _random(spec, device)
         out[:, :k] = ids
