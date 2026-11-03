@@ -113,6 +113,7 @@ from torch.overrides import TorchFunctionMode
 from torch.utils._device import _device_constructors
 
 from atom.compass.backends.base import CostBackend
+from atom.compass.backends.step_labels import admit_x
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
 from atom.compass.runner.step_output import DeferredTokenStream, filler_token_ids
 
@@ -334,8 +335,8 @@ class HostDeviceRecurrence:
     does. `ends[-1]` is the last forward's device end. `laws[kind][segment]` are coefficients on `(1,
     tokens, seqs)`; `charge` says what an absent one costs. `now` reads the engine LP's clock.
     `segments` holds the seconds the last `charge` charged each segment, 0 for
-    one in `skip`. `admit`, coefficients on a batch's `compass_admitted`
-    (`admitted`), adds what its admissions cost to its `E`, except on a
+    one in `skip`. `admit`, coefficients on `admit_x` of a batch's
+    `compass_admitted`, adds what its admissions cost to its `E`, except on a
     pipeline stage that receives its input; None, a fit that priced them apart
     and fitted no law for them, and `device_end` refuses a forward that admits.
     """
@@ -423,7 +424,7 @@ class HostDeviceRecurrence:
         a = getattr(batch, "compass_admitted", None)
         if not (self.admit and a) or self.recv:
             return 0.0
-        return float(np.dot(self.admit, a))
+        return float(np.dot(self.admit, admit_x(a)))
 
     def start_lag(self, batch: Any) -> float | None:
         """`BatchView.start_lag_s` of an output forward on a single stage, as

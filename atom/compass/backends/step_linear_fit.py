@@ -55,7 +55,7 @@ forward after it, whose period takes up the stall, are left out of every host
 law; the report lists the JIT forwards per run under `jit_steps`.
 A forward's `E` that admits requests (`step_labels.admissions`) is left out of
 its kind's law: the law then prices the engine loop alone, and `admit`, seconds
-on `ADMIT_FEATURES`, prices what the forwards of every kind that admit spend
+on `step_labels.admit_x`, prices what the forwards of every kind that admit spend
 beyond it, fitted on their `E` with their kind's law as a fixed part. Records
 on too few such forwards give `admit` null, so a run refuses a forward that
 admits a request rather than charge it nothing, and the report says why under
@@ -177,9 +177,9 @@ PROPOSE_SPLIT_STEPS = 200
 PROPOSE_SIDE_STEPS = 10
 HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
-#: What a forward's admissions cost per request, per prompt token past the
-#: prefix-cache hit and per token within it (`step_labels.admissions`).
-ADMIT_FEATURES = ("requests", "uncached", "cached")
+#: What a forward that admits requests spends once, per prompt token past the
+#: prefix-cache hit and per token within it (`step_labels.admit_x`).
+ADMIT_FEATURES = ("admits", "uncached", "cached")
 
 
 def _rung_key(rung: int | None) -> str:
@@ -261,10 +261,10 @@ def _host_rows(samples) -> list[tuple]:
 
 
 def _admit_rows(samples, laws) -> list[tuple]:
-    """(admitted, `E` its kind's law prices, `E`) per sample that admits
-    requests, has a positive `E` and a kind with an `E` law."""
+    """(`admit_x` of admitted, `E` its kind's law prices, `E`) per sample
+    that admits requests, has a positive `E` and a kind with an `E` law."""
     return [
-        (s.admitted, float(np.dot(c, _host_x(s))), s.host["E"])
+        (step_labels.admit_x(s.admitted), float(np.dot(c, _host_x(s))), s.host["E"])
         for s in samples
         if s.admitted[0]
         and s.host.get("E", 0) > 0

@@ -363,8 +363,8 @@ HOST = {
         "W_launch": [1e-4, 2e-6, 0.0],
         "W_post": [1.5e-4, 4e-6, 0.0],
     },
-    # A prefill row past the first is a request the forward admits: what it
-    # adds to `E` is `HOST_ADMIT`'s.
+    # A prefill row past the first is a request the forward admits: what they
+    # add to `E` is `HOST_ADMIT`'s, its intercept once.
     "prefill": {
         "E": [4e-4, 2e-8, 0.0],
         "W_pre": [6e-4, 1e-7, 8e-5],
@@ -377,7 +377,7 @@ HOST = {
         "W_launch": [2.5e-4, 2e-8, 3e-5],
     },
 }
-#: A forward's `E` per request it admits, per prompt token past the hit and in it.
+#: A forward's `E` if it admits requests, per prompt token past the hit and in it.
 HOST_ADMIT = [3e-4, 2e-8, 1e-9]
 KEY = {"host_cpu": "test cpu", "atom": "0" * 64, "model": None, "engine": {}}
 IDLE_NS = 10**9
@@ -411,7 +411,7 @@ def _timed_record(path, steps, idle_after=(), key=KEY, gap=0, scale=None):
         # Its rows past the first are requests it admits, each its only prefill row.
         new = [(q, n - q) for q, n, d in rows[1:] if not d]
         a = (len(new), sum(u for u, _ in new), sum(c for _, c in new))
-        ns["E"] += round(float(np.dot(HOST_ADMIT, a)) * 1e9)
+        ns["E"] += round(float(np.dot(HOST_ADMIT, (min(a[0], 1), *a[1:]))) * 1e9)
         ns = {k: round(v * (scale or {}).get((i, k), 1)) for k, v in ns.items()}
         enter = t + ns["E"]
         g0 = enter + ns["W_pre"] // 2

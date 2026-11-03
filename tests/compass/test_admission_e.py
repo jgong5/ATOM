@@ -214,6 +214,28 @@ def test_a_request_first_seen_on_a_decode_row_is_not_admitted():
     assert overrides.admitted(batch(6, True), seen, 16) == (1, 48, 0)
 
 
+def test_a_further_request_in_one_forward_adds_its_tokens_and_no_second_admission():
+    """Forwards admitting one to three requests at once, each spending
+    `ADMIT`'s intercept once and each request's tokens: the fit recovers
+    `ADMIT`, and a run charges a forward admitting three that intercept once."""
+    rng = np.random.default_rng(2705)
+    cell = [s for s in _cell(rng) if not s.admitted[0]]
+    for i in range(90):
+        uncached, cached = int(rng.integers(1000, 16000)), int(rng.integers(0, 200_000))
+        e = 6e-4 + 4e-9 * uncached + np.dot(ADMIT, (1, uncached, cached))
+        a = (1 + i % 3, uncached, cached)
+        cell.append(
+            _sample(400 + i, "prefill", uncached, e * rng.uniform(0.98, 1.02), a)
+        )
+    host, _ = fit_host(cell)
+    assert host["admit"] == pytest.approx(ADMIT, rel=0.1)
+
+    run = HostDeviceRecurrence(host["laws"], (), lambda: 0.0, admit=host["admit"])
+    run.charge(_first((3, 8000, 100_000)), 0.01, 0.0)
+    truth = 6.32e-4 + np.dot(ADMIT, (1, 8000, 100_000))
+    assert run.segments["E"] == pytest.approx(truth, rel=0.02)
+
+
 #: The pricing `NonAllocatingRunner.forward` calls; `Priced` stands in for it.
 PRICE = overrides._group_step_seconds
 
@@ -318,6 +340,44 @@ def test_the_hit_a_run_reads_is_the_tokens_the_first_row_starts_from():
             batch=batch,
         )
     assert [a for *_, a in priced.out] == [(1, 64, 0), (1, 32, 64)]
+
+
+def test_a_forward_admitting_two_of_atom_s_requests_is_charged_one_admission():
+    """A 64-token prompt, finished; then that prompt with 32 more tokens and a
+    fresh 48-token one, which one `schedule()` admits together: their tokens
+    past the hit and within it, one intercept."""
+    sched = Scheduler(
+        MockConfig(
+            enable_prefix_caching=True,
+            kv_cache_block_size=16,
+            num_kvcache_blocks=64,
+            max_num_batched_tokens=256,
+            max_model_len=256,
+        )
+    )
+    priced = Priced(ADMIT)
+    batches = ([list(range(5, 69))], [list(range(5, 101)), list(range(200, 248))])
+    for prompts in batches:
+        for prompt in prompts:
+            sched.add(
+                Sequence(prompt, 16, sampling_params=SamplingParams(max_tokens=1))
+            )
+        batch, seqs = sched.schedule()
+        priced(batch)
+        sched.postprocess(
+            list(seqs.values()),
+            ScheduledBatchOutput(
+                req_ids=list(batch.req_ids),
+                token_ids=[(2,)] * len(batch.req_ids),
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch,
+        )
+    ids, e, admitted = priced.out[-1]
+    assert len(ids) == 2 and admitted == (2, 32 + 48, 64)
+    assert e == pytest.approx(1e-4 + np.dot(ADMIT, (1, 80, 64)), rel=1e-12)
 
 
 def test_the_recurrence_grade_charges_a_busy_admission_and_measures_an_idle_one(
