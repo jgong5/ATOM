@@ -185,6 +185,7 @@ def served(key, traced) -> list[dict]:
             "run": run,
             "config": key,
             "traces": [f"{named[run]}.{k}" for k in range(3)],
+            "profiled": False,
         }
         for run in sorted(named)
     ]
@@ -240,6 +241,10 @@ def test_records_under_two_stacks_refuse_naming_the_component_and_both_values(
         (
             ["--backend", "step-linear", "--grid-definition", "g.json"],
             "--grid-definition is read by step-grid, not step-linear",
+        ),
+        (
+            ["--backend", "step-linear", "--grid=g"],
+            "--grid is read by step-grid, not step-linear",
         ),
         (
             ["--backend", "step-linear", "0f1e2d3c4b5a"],
@@ -351,7 +356,9 @@ def test_a_record_whose_server_built_an_aiter_module_refuses_naming_it(tmp_path)
     a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
     edit(b / "run.json", lambda r: r.update({BUILDS: ["mha_varlen_fwd"]}))
 
-    named = f"{b} is not fitted: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    named = (
+        f"{b} is not fitted: its server ran a JIT compile of ['mha_varlen_fwd'] while"
+    )
     with pytest.raises(SystemExit, match=re.escape(named)):
         fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
     assert not (tmp_path / "store").exists()

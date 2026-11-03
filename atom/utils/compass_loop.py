@@ -25,7 +25,9 @@ handling one released frame is one job, from `LPRuntime.handed_over` to its
 next `LPRuntime.back_at_wait_point`, charged by the `wrap_decode` calls it
 makes. Callbacks it posts with ``call_soon_threadsafe`` run at its completion.
 A `wrap_encode` or `wrap_decode` call on the event loop thread, such as the
-final decode of a non-streaming completion, advances the LP clock instead.
+final decode of a non-streaming completion, advances the LP clock instead, once
+every open service job is placed: a job's result due inside the call runs when
+it ends, whatever wall time the job's thread takes.
 
 `CompassEventLoop` is the frontend's event loop in a simulated run: its
 ``time()`` is the installed `LPRuntime`'s clock, so every timer is on LP time,
@@ -65,6 +67,7 @@ import itertools
 import json
 import logging
 import math
+import queue
 import select
 import selectors
 import signal
@@ -75,7 +78,12 @@ import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 
-from atom.compass.carriers import cancel_seq, relay_stamp, with_relay_stamp
+from atom.compass.carriers import (
+    cancel_seq,
+    relay_stamp,
+    stamp_events,
+    with_relay_stamp,
+)
 from atom.utils import clock
 from atom.utils.clock import DIAG_S, job
 
@@ -159,16 +167,30 @@ class Station:
 SERVICE_JOBS = frozenset(
     {"do_preprocess", "_prepare_multimodal_inputs", "AtomMetricsExporter.render"}
 )
+#: Service jobs by module and qualified name, for names too common to match
+#: bare: OpenTelemetry's tracer setup and flush, which the API server's lifespan
+#: hands to a thread as it starts and as it leaves, and which charge nothing.
+#: The frontend's run begins at its loop's first select, before the lifespan.
+MODULE_SERVICE_JOBS = frozenset(
+    {"atom.observability.tracing.initialize", "atom.observability.tracing.shutdown"}
+)
 
 
-def job_name(fn) -> str:
-    """`fn`'s qualified name, or that of the function `asyncio.to_thread` runs
-    when `fn` is its ``partial(Context.run, func, ...)``."""
+def _job(fn):
+    """`fn`, or the function `asyncio.to_thread` runs when `fn` is its
+    ``partial(Context.run, func, ...)``."""
     if (
         isinstance(fn, partial)
         and getattr(fn.func, "__qualname__", "") == "Context.run"
     ):
         fn = fn.args[0]
+    return fn
+
+
+def job_name(fn) -> str:
+    """`fn`'s qualified name, or that of the function `asyncio.to_thread` runs
+    when `fn` is its ``partial(Context.run, func, ...)``."""
+    fn = _job(fn)
     return getattr(fn, "__qualname__", repr(fn))
 
 
@@ -176,6 +198,8 @@ def classify(fn) -> str:
     """``service``, ``wait`` or ``refuse``: the job registry, by qualified name."""
     name = job_name(fn)
     if name in SERVICE_JOBS or name.rpartition(".")[2] in SERVICE_JOBS:
+        return "service"
+    if f"{getattr(_job(fn), '__module__', None)}.{name}" in MODULE_SERVICE_JOBS:
         return "service"
     if name == "Queue.get":
         return "wait"
@@ -192,6 +216,7 @@ class SimExecutor(ThreadPoolExecutor):
         self.passthrough = 0  # wait jobs in flight
         self.refusals: list[str] = []  # run-summary reasons, ``executor:<name>``
         self.settle: dict[int, partial | None] = {}  # finished, not yet placed
+        self.done = queue.SimpleQueue()  # (k, settle) from the serving thread
         self.serial = ThreadPoolExecutor(1)  # service jobs, in submission order
         self.placing: asyncio.Future | None = None  # `placed`'s wait
 
@@ -240,16 +265,30 @@ class SimExecutor(ThreadPoolExecutor):
                 settle = partial(out.set_exception, e)
             finally:
                 job.cur = None
-        self.loop.call_soon_threadsafe(self._finish, k, settle)
+        self.done.put((k, settle))
+        self.loop.call_soon_threadsafe(self.place)
 
-    def _finish(self, k: int, settle) -> None:
-        # On the loop thread, so a placed job's timer is set before the loop's
-        # next select can see the station resolved and advance the clock.
-        self.settle[k] = settle
-        for j in self.station.finish(k):
-            done = self.settle.pop(j)
-            if done is not None:
-                self.loop.call_at(self.station.completion(j), done)
+    def place(self, wait: bool = False) -> None:
+        """On the loop thread: place the jobs whose threads are done, so a placed
+        job's timer is set before the clock moves; with `wait`, until none is
+        open, warning for a job whose thread takes ``diag_s`` wall seconds."""
+        while (wait and self.station.unresolved()) or not self.done.empty():
+            try:
+                k, settle = self.done.get(timeout=self.station.diag_s if wait else None)
+            except queue.Empty:
+                logger.warning(
+                    "an event-loop charge waits for station job %d, open after "
+                    "%s wall seconds; still waiting",
+                    self.station.final,
+                    self.station.diag_s,
+                )
+                clock.installed().diagnostics += 1
+                k, settle = self.done.get()
+            self.settle[k] = settle
+            for j in self.station.finish(k):
+                done = self.settle.pop(j)
+                if done is not None:
+                    self.loop.call_at(self.station.completion(j), done)
 
     def idle(self) -> bool:
         """The loop is idle at the LP clock now: end `placed`'s wait, if there
@@ -265,14 +304,22 @@ class SimExecutor(ThreadPoolExecutor):
 def charge(d: float) -> None:
     """Charge `d` to this thread's station job; with none open, in the run, the
     caller is the clock owner and advances the LP clock by `d` (`advance_to`
-    refuses any other thread)."""
+    refuses any other thread), on an event loop only once every open service
+    job is placed, so one that completes inside the charge is not late."""
     cur = getattr(job, "cur", None)
     if cur is not None:
         cur[0].charge(cur[1], d)
         return
     rt = clock.installed()
     if rt is not None and rt.in_run:
+        if rt.loop is not None and rt.loop.executor.station is not None:
+            rt.loop.executor.place(wait=True)
         rt.advance_to(rt.now + d)
+
+
+#: Whether this thread is inside a `wrap_encode` call, which charges the backend
+#: calls its ``encode`` makes.
+_in_encode = threading.local()
 
 
 def wrap_encode(encode, entry):
@@ -280,9 +327,29 @@ def wrap_encode(encode, entry):
     rate = entry.encode_tokens_per_s * entry.derate
 
     def charged(*args, **kwargs):
-        ids = encode(*args, **kwargs)
+        _in_encode.on = True
+        try:
+            ids = encode(*args, **kwargs)
+        finally:
+            _in_encode.on = False
         charge(entry.encode_fixed_s + len(ids) / rate)
         return ids
+
+    return charged
+
+
+def wrap_encode_batch(encode_batch, entry):
+    """A fast tokenizer backend's ``encode_batch``, charging the current job
+    ``fixed + tokens / derated rate`` over the ids of all the encodings it
+    returns, the batch at the single-call rate; a call made inside a
+    `wrap_encode` call is that call's to charge."""
+    rate = entry.encode_tokens_per_s * entry.derate
+
+    def charged(*args, **kwargs):
+        encodings = encode_batch(*args, **kwargs)
+        if not getattr(_in_encode, "on", False):
+            charge(entry.encode_fixed_s + sum(len(e.ids) for e in encodings) / rate)
+        return encodings
 
     return charged
 
@@ -608,6 +675,11 @@ class HttpChannel:
     sends on one stamps a send on it for each JSON response whose
     ``kv_transfer_params`` is an object, and writes the stamp there.
 
+    During the run, each event of a ``text/event-stream`` response body leaves
+    with a comment line carrying its stamp on the LP's stream channel
+    (`atom.compass.carriers.stamp_events`). Each body message is one frame the
+    app's stream yielded, so it must end in a blank line.
+
     Taking in a stamped request other than a cancel costs the event loop
     ``fixed_s + body bytes x per_byte_s`` (`atom.compass.run.http_intake`),
     charged on the loop once its body is read and the loop is idle at that
@@ -632,6 +704,7 @@ class HttpChannel:
         if rt is not None and scope["type"] == "http":
             relay_in = _relay(rt.table.channels_into(rt.me))
             relay_out = _relay(rt.table.channels_from(rt.me))
+            send = _stamping_events(send, rt)
         if relay_out is not None:
             send = _stamping(send, rt, relay_out)
         if relay_in is not None:
@@ -750,6 +823,23 @@ async def _read_body(receive):
         return {"type": "http.request", "body": body, "more_body": False}
 
     return body, replay
+
+
+def _stamping_events(send, rt):
+    """`send`, stamping each event of an SSE response body sent during the run."""
+    events = False
+
+    async def stamping(message):
+        nonlocal events
+        if message["type"] == "http.response.start":
+            content_type = dict(message.get("headers", [])).get(b"content-type", b"")
+            events = content_type.startswith(b"text/event-stream")
+        elif events and rt.in_run:
+            text = stamp_events(message.get("body", b"").decode(), rt)
+            message = {**message, "body": text.encode()}
+        await send(message)
+
+    return stamping
 
 
 def _stamping(send, rt, ch: str):

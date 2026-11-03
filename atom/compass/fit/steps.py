@@ -34,12 +34,14 @@ planned point named as one refuses, and a ragged one (`measure steps
 --ragged`) fits the decode lookup's alpha, not the residual. `step_grid_fit.bundle` fits the bundle,
 keyed by the grid definition's digest; `--seed` fixes its held-out split. The
 report's provenance names each target run with every trace it served, and the
-plan with the `--grid` inputs it read and the traces their lines served.
+plan with the `--grid` inputs it read and the traces their lines served; the
+plan states it was not profiled, as the measurements at its points were not.
 
 A `--grid` input is read with the client runs a `--client-run` names for it,
 and one no `--client-run` names refuses, as `measure steps` refuses to plan
-over it. `--sessions A:B` keeps the `--grid` lines `measure steps --sessions
-A:B` keeps.
+over it; so does one that ran under another engine or sampling than the
+targets', naming the targets'. `--sessions A:B` keeps the `--grid` lines
+`measure steps --sessions A:B` keeps.
 """
 
 import copy
@@ -48,13 +50,15 @@ from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind
 from atom.compass.backends import step_grid_fit, step_linear_fit
-from atom.compass.backends.step_grid_plan import plan
 from atom.compass.bench import measure
 from atom.compass.fit import publish
 from atom.compass.fit.samples import MEMBER
 
 PROG = "compass fit steps"
 STUB = "a step stub's coefficients are stated, not fitted; a run takes their file"
+#: What a `--grid` input's engine and sampling are compared with, as a refusal
+#: names each.
+TARGETS = ("the targets'", "the targets' sampling is")
 
 
 def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
@@ -77,14 +81,9 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
             "targets are records and replayed batches"
         )
     store = ArtifactStore(args.store)
-    definition = json.loads(Path(args.grid_definition).read_text())
     engine, sampling = config["engine_config"], config["sampling"]
-    read = {}
-    for n in args.grid:
-        runs = [e for r, e in args.client_run if Path(r) == Path(n)]
-        read[n] = measure._read(n, store, runs, args.sessions, engine, sampling)
-    steps = [(f"{n} step {x['step']}", x) for n in args.grid for x in read[n][1]]
-    planned = plan(definition, steps, {f"{n} dp0": read[n][2] for n in args.grid})
+    _, grid = measure.grid_plan(args, args.grid, store, engine, sampling, TARGETS)
+    planned = grid["plan"]
     fields = ("model", "device", "source_root")
     keys = [
         measure.measurement_key(
@@ -107,18 +106,12 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
     ]
     points = [json.loads(entry.read_member(*MEMBER)) for entry in entries]
     bundle, report = step_grid_fit.bundle(
-        definition, planned, points, samples, args.seed
+        grid["definition"], planned, points, samples, args.seed
     )
     report["provenance"] = publish.runs(samples) + [
-        {
-            "source": "plan",
-            "run": measure._digest(planned),
-            "inputs": sorted({source for source, *_ in read.values()}),
-            "traces": sorted({t for _, x in steps for t in x["traces"]}),
-        }
+        {**grid["provenance"], "profiled": False}
     ]
-    fields = {"device": config["device"], "grid": measure._digest(definition)}
-    return fields, bundle, report
+    return {"device": config["device"], "grid": grid["grid"]}, bundle, report
 
 
 #: Each backend's name, to the kind it publishes, its label sources and its fit.

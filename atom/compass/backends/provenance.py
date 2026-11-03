@@ -142,7 +142,8 @@ class Provenance:
             )
 
     @property
-    def is_refused(self) -> bool:
+    def fell_through(self) -> bool:
+        """Whether a source declined before the one that answered."""
         return bool(self.refusals)
 
     @property

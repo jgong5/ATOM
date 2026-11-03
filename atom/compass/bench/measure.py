@@ -19,10 +19,8 @@ An input refuses unless a `--client-run` names it, its kept lines served
 requests under `--sampling` alone, and it states the engine ATOM's arguments
 resolve, `keyed`'s fields, at data-parallel width 1, the bench's.
 
-The bench measures at tensor parallel 1: above it, a point charges the ranks'
-preload skew (#1188), so a deployment of more ranks refuses. A prefill or
-decode context-parallel width above 1 refuses too: a bundle states no such
-width.
+A prefill or decode context-parallel width above 1 refuses: a bundle states
+no such width.
 
 A batch is a line's view: its `rows`, `rung` and `produces_output`, and the
 KV blocks its rows share where a planned line states them (`shared`). The
@@ -46,12 +44,13 @@ A measurement's key is the configuration (model, device,
 digest, so a view the store holds is not measured again and a stopped
 invocation resumes; a held entry taken under other readings than this run's
 refuses, naming it. Its member `MEMBER` holds the view, `seconds` (the median
-of the bench's kept repeats), the repeats, the protocol, the replay rule, the
-origin, the inputs it came from (`sources`) and the `traces` their lines
-served. A batch the rule or the bench refuses is not published; the command
-measures the rest, then fails naming each. `<out>` also holds run.json, with
-the warm-up's and the measuring's boundaries, the engine file and the GPU
-checks.
+of the bench's kept repeats, under a drafter of their target's parts, and
+`draft_seconds` that of their drafter's parts), the repeats, the protocol,
+the replay rule, the origin, the inputs it came from (`sources`) and the
+`traces` their lines served. A batch the rule or the bench refuses is not
+published; the command measures the rest, then fails naming each. `<out>`
+also holds run.json, with the warm-up's and the measuring's boundaries, the
+engine file and the GPU checks.
 
 The bench holds the largest KV pool its inputs' engines state, whatever this
 device's own budget gives, so every batch they ran, and every point planned
@@ -95,6 +94,9 @@ PROG = "compass measure steps"
 #: What of a step-record line is the batch it measures; a planned line may also
 #: state the KV blocks its rows share, `shared`.
 VIEW = ("rows", "rung", "produces_output")
+#: What an input's engine and sampling are compared with, as a refusal names
+#: each: here ATOM's arguments and `--sampling`.
+AGAINST = ("ATOM's arguments resolve", "--sampling states")
 
 
 def main(argv: list[str]) -> None:
@@ -105,12 +107,6 @@ def main(argv: list[str]) -> None:
     os.environ["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
     kfd_pid()  # before atom_config opens a GPU, so quiet leaves this process out
     config = atom_config(argv[cut + 1 :])
-    if config.tensor_parallel_size > 1:
-        raise ValueError(
-            f"tensor parallel size {config.tensor_parallel_size}: above 1 the bench "
-            "charges the ranks' preload skew (#1188), so measure steps measures "
-            "at tensor parallel 1 until that is fixed"
-        )
     for name in ("prefill_context_parallel_size", "decode_context_parallel_size"):
         if (width := getattr(config, name)) > 1:
             raise ValueError(
@@ -181,7 +177,9 @@ def _todo(points, configuration, engine, sampling, store, readings) -> list:
     if stale:
         raise ValueError(
             f"{len(stale)} measurements in the store were taken under other "
-            "readings than this run's:\n" + "\n".join(stale)
+            "readings than this run's:\n" + "\n".join(stale) + "\nA held entry "
+            "is never replaced: measure into a fresh --store, or remove the "
+            "entries named"
         )
     return todo
 
@@ -338,13 +336,7 @@ def _points(args, store, engine: dict, sampling: dict, out: Path) -> tuple[dict,
     """Each distinct view to measure, by its digest: replayed views drawn as
     `--sample` says, then planned points; and the largest KV pool an input's
     engine states."""
-    runs = {}
-    for name, export in args.client_run:
-        runs.setdefault(name, []).append(export)
-    read = {
-        n: _read(n, store, runs[n], args.sessions, engine, sampling)
-        for n in dict.fromkeys([*args.inputs, *args.grid])
-    }
+    read, grid = grid_plan(args, [*args.inputs, *args.grid], store, engine, sampling)
     points = {}
     for name in args.inputs:
         source, lines, _ = read[name]
@@ -361,17 +353,11 @@ def _points(args, store, engine: dict, sampling: dict, out: Path) -> tuple[dict,
         points = {v: p for v, p in points.items() if v in drawn}
     if args.ragged:
         points = _ragged(points, [read[n] for n in args.inputs], args.seed)
-    if args.grid:
-        definition = json.loads(Path(args.grid_definition).read_text())
-        steps = [
-            (f"{n} step {line['step']}", line) for n in args.grid for line in read[n][1]
-        ]
-        planned = plan(definition, steps, {f"{n} dp0": read[n][2] for n in args.grid})
-        (out / "plan.json").write_text(json.dumps(planned, indent=1))
-        digest = _digest(planned)
-        traces = {t for _, line in steps for t in line["traces"]}
-        for line in planned["lines"]:
-            _add(points, line, "plan", [read[n][0] for n in args.grid], traces, digest)
+    if grid:
+        (out / "plan.json").write_text(json.dumps(grid["plan"], indent=1))
+        made = grid["provenance"]
+        for line in grid["plan"]["lines"]:
+            _add(points, line, "plan", made["inputs"], made["traces"], made["run"])
     return points, max(r[2]["num_kvcache_blocks"] for r in read.values())
 
 
@@ -388,14 +374,43 @@ def _ragged(points: dict, read: list, seed) -> dict:
     for digest, point in sorted(points.items()):
         if _kind(point["view"]).startswith("decode"):
             rng = random.Random(f"{seed} {digest}")
-            for view in ragged.compose(point["view"], contexts, rng, blocks, size, top):
+            for view in ragged.compose(
+                point["view"], contexts, rng, blocks, size, top, engine["ladder"]
+            ):
                 _add(out, view, "ragged", sources, traces)
     return out
 
 
-def _read(name: str, store, client_runs, sessions, engine: dict, sampling: dict):
+def grid_plan(args, names, store, engine: dict, sampling: dict, against=AGAINST):
+    """Each input of `names`, read with the client runs `args.client_run` names
+    for it under `args.sessions`, refusing as `_read` does; and, under
+    `args.grid`, the step grid: the `definition` `args.grid_definition` holds
+    and its digest, `grid`; the `plan` over the `--grid` inputs' lines for the
+    engine they state; and the plan's `provenance`: its digest, `run`, those
+    inputs as sources and the traces their lines served."""
+    read = {}
+    for n in dict.fromkeys(names):
+        runs = [e for r, e in args.client_run if Path(r) == Path(n)]
+        read[n] = _read(n, store, runs, args.sessions, engine, sampling, against)
+    if not args.grid:
+        return read, None
+    definition = json.loads(Path(args.grid_definition).read_text())
+    steps = [(f"{n} step {x['step']}", x) for n in args.grid for x in read[n][1]]
+    planned = plan(definition, steps, {f"{n} dp0": read[n][2] for n in args.grid})
+    provenance = {
+        "source": "plan",
+        "run": _digest(planned),
+        "inputs": sorted({read[n][0] for n in args.grid}),
+        "traces": sorted({t for _, x in steps for t in x["traces"]}),
+    }
+    grid = {"definition": definition, "grid": _digest(definition), "plan": planned}
+    return read, grid | {"provenance": provenance}
+
+
+def _read(name: str, store, client_runs, sessions, engine, sampling, against=AGAINST):
     """The input `name`: what names it as a source, its kept lines, and the
-    engine its rank states."""
+    engine its rank states. One whose engine or sampling is not `engine` or
+    `sampling` refuses, naming what states those as `against` does."""
     path = Path(name)
     with tempfile.TemporaryDirectory() as unpacked:
         if (path / "run.json").is_file():
@@ -424,7 +439,7 @@ def _read(name: str, store, client_runs, sessions, engine: dict, sampling: dict)
     ]
     if differ:
         raise ValueError(
-            f"{name} ran under another engine than ATOM's arguments resolve: "
+            f"{name} ran under another engine than {against[0]}: "
             + "; ".join(
                 f"{k} {ran.get(k)!r} there, {engine.get(k)!r} here" for k in differ
             )
@@ -461,8 +476,8 @@ def _read(name: str, store, client_runs, sessions, engine: dict, sampling: dict)
     wanted = json.dumps(sampling, sort_keys=True)
     if sent := sorted({p for line in lines for p in line["sampling"]} - {wanted}):
         raise ValueError(
-            f"{name} served requests under {' and '.join(sent)}, and --sampling "
-            f"states {wanted}"
+            f"{name} served requests under {' and '.join(sent)}, and {against[1]} "
+            f"{wanted}"
         )
     return source, lines, stated
 
@@ -522,9 +537,11 @@ def _measure(bench, config, sampling, store, command, readings, todo) -> list[st
         if "refused" in got:
             refused.append(f"{key}: {got['refused']}")
             continue
+        drafter = got.get("draft_median_ns")
         member = {
             **point["view"],
             "seconds": got["median_ns"] / 1e9,
+            **({} if drafter is None else {"draft_seconds": drafter / 1e9}),
             "statistic": "median",
             "repeats": got["repeats"],
             "discarded": got["discarded"],

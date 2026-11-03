@@ -21,6 +21,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_backend_step_linear import _installed, law, view
 from test_backend_step_roofline import COMPUTE, MEMORY, ROOFLINE, _spec
 from test_capture_ir import CONFIG, WIDTH_2, _ops, capture

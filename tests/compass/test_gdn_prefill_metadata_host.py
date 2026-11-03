@@ -19,9 +19,18 @@ import torch
 from atom.utils import CpuGpuBuffer
 
 
+def _stand_in_attr(attr):
+    """A mock for each name an importer binds, and none for a dunder, so a
+    stand-in reads as a module without `__file__` or `__all__`, not as one
+    whose metadata is a mock."""
+    if attr.startswith("__"):
+        raise AttributeError(attr)
+    return MagicMock()
+
+
 class _AiterStandIn(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """Every `aiter` module as a stand-in. `gdn_attn` imports aiter at module
-    scope, and without a driver aiter's import raises; nothing here calls it."""
+    """Every `aiter` module as a stand-in, where aiter is not installed:
+    `gdn_attn` imports aiter at module scope, and nothing here calls it."""
 
     def find_spec(self, name, path, target=None):
         if name == "aiter" or name.startswith("aiter."):
@@ -30,20 +39,35 @@ class _AiterStandIn(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     def create_module(self, spec):
         module = types.ModuleType(spec.name)
         module.__path__ = []
-        module.__getattr__ = lambda _attr: MagicMock()
+        module.__getattr__ = _stand_in_attr
         return module
 
     def exec_module(self, module):
         pass
 
 
-if torch.cuda.is_available():
-    from atom.model_ops.attentions.gdn_attn import (
-        GDNStateMixin,
-        compute_causal_conv1d_metadata,
-    )
+try:
+    from aiter.ops.triton.utils._triton import arch_info as _arch_info
+except ImportError:
+    _arch_info = None
+
+if _arch_info is not None:
+    # A real import, so no engine module keeps a stand-in for a later importer
+    # to take. With no device, aiter's Triton helpers cannot probe the arch at
+    # import; nothing here launches a kernel, so they are lent one.
+    _lent = _arch_info._CACHED_ARCH is None
+    if _lent:
+        _arch_info._CACHED_ARCH = "gfx950"
+    try:
+        from atom.model_ops.attentions.gdn_attn import (
+            GDNStateMixin,
+            compute_causal_conv1d_metadata,
+        )
+    finally:
+        if _lent:
+            _arch_info._CACHED_ARCH = None
 else:
-    _finder = _AiterStandIn()
+    _finder, _before = _AiterStandIn(), set(sys.modules)
     sys.meta_path.insert(0, _finder)
     try:
         from atom.model_ops.attentions.gdn_attn import (
@@ -52,8 +76,15 @@ else:
         )
     finally:
         sys.meta_path.remove(_finder)
-        for _name in [n for n in sys.modules if n.split(".")[0] == "aiter"]:
-            del sys.modules[_name]
+        # Only the stand-ins go: an `aiter` module already in `sys.modules`
+        # stays, and keeps none of them bound.
+        for _name in [
+            n for n in set(sys.modules) - _before if n.split(".")[0] == "aiter"
+        ]:
+            _module = sys.modules.pop(_name)
+            _parent, _, _child = _name.rpartition(".")
+            if getattr(sys.modules.get(_parent), _child, None) is _module:
+                delattr(sys.modules[_parent], _child)
 
 BLOCK_M = 8
 

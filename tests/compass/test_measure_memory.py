@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -26,7 +27,9 @@ from types import SimpleNamespace
 
 import pytest
 from test_artifact_invalidation import BASE, STANZA
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_drive_gpu import FREE, _plant
+from test_launcher_held_ports import HELD, _squat
 from test_memory_readings import (
     CONFIG_JSON,
     DOCUMENT,
@@ -61,7 +64,6 @@ from atom.compass.memory.check import STORAGE
 from atom.compass.memory.readings import MemoryReadings
 from atom.compass.run import memory
 from atom.compass.spec import MachineSpec, SpecRefusal
-from atom.utils import backends
 
 MACHINE = MachineSpec.from_mapping(copy.deepcopy(DOCUMENT))
 #: One TP2 rank's readings beside `READINGS[2]`: a rank need not read as another.
@@ -164,7 +166,7 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_the_start_used(
 ):
     _, argv = a_start(tmp_path, monkeypatch, STACK)
     root = tmp_path / "home/.cache/atom"
-    monkeypatch.setattr(backends, "VLLM_CACHE_ROOT", str(root))
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(root))
     used = root / "torch_compile_cache/0123456789/rank_0/backbone"
     other = root / "torch_compile_cache/9876543210"
     other.mkdir(parents=True)
@@ -202,16 +204,21 @@ def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(
-    "gpus, cards",
+    "gpus, asked, cards",
     [
-        ("5", [dict(MI355X, name="MI308X", arch="gfx942")]),
-        ("4,5", [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")]),
+        ("5", (5,), [dict(MI355X, name="MI308X", arch="gfx942")]),
+        (
+            "4,5",
+            (4, 5),
+            [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")],
+        ),
     ],
 )
 def test_a_start_on_another_device_than_the_spec_states_refuses_naming_both(
-    tmp_path, monkeypatch, gpus, cards
+    tmp_path, monkeypatch, gpus, asked, cards
 ):
-    monkeypatch.setattr(measure_memory, "_device", lambda gpus: cards)
+    # Only the GPUs `--gpu` names have cards; asking about any others raises.
+    monkeypatch.setattr(measure_memory, "_device", {asked: cards}.__getitem__)
     machine = tmp_path / "machine.json"
     machine.write_text(json.dumps(DOCUMENT))
     flags = ["--gpu", gpus, "--machine", str(machine), "--store", str(tmp_path / "s")]
@@ -353,6 +360,53 @@ def test_the_after_check_waits_for_members_that_outlive_the_engine(
 ):
     """The named result: each member exits 3 s after the engine's stop."""
     measure_memory.main(group_start("3"))
+
+    assert (tmp_path / "out" / "gpu_after.txt").read_text() == FREE
+    assert (tmp_path / "out" / "memory_readings.json").exists()
+
+
+def test_the_after_check_waits_for_kfd_to_free_what_the_engine_left(
+    tmp_path, monkeypatch
+):
+    """KFD lists an exited rank until it has freed the rank's GPU memory, by a
+    PID a container's /proc need not show: DeepSeek-V4.1-Flash's TP4 ranks,
+    270 GB a card, stayed listed seconds after the engine's group had left.
+    Here the group's members exit at once and KFD frees the rank 2 s later."""
+    kill = os.killpg
+    r, argv = a_start(tmp_path, monkeypatch, STACK)
+    out = _plant(tmp_path, monkeypatch, FREE)
+    kfd, members = tmp_path / "kfd", tmp_path / "members"
+    rank = kfd / "proc" / "3362894"
+    rank.parent.mkdir(parents=True)
+    monkeypatch.setattr(serve, "KFD", kfd)
+    smi = tmp_path / "bin" / "rocm-smi"
+    listed = f"[ -d {rank} ] && printf 'PID 3362894 is using 1 DRM device(s):\\n5\\n'\n"
+    smi.write_text(
+        smi.read_text().replace("*--showpids*)\n", "*--showpids*)\n" + listed)
+    )
+
+    def freed():
+        _until(lambda: members.exists() and members.read_text())
+        pids = members.read_text().split()
+        _until(lambda: all(_state(p) in (None, "Z") for p in pids))
+        time.sleep(2)
+        rank.rmdir()
+
+    def popen(command, **kwargs):
+        ranks_wrote(out, r.config, [READINGS[2]] * 2)
+        rank.mkdir()
+        threading.Thread(target=freed, daemon=True).start()
+        group = [sys.executable, "-c", GROUP, str(members), "0"]
+        return subprocess.Popen(group, **kwargs)
+
+    started_by = SimpleNamespace(
+        Popen=popen, STDOUT=subprocess.STDOUT, TimeoutExpired=subprocess.TimeoutExpired
+    )
+    monkeypatch.setattr(measure_memory, "subprocess", started_by)
+    monkeypatch.setattr(measure_memory, "quiet", gpu.quiet)
+    monkeypatch.setattr(os, "killpg", kill)
+
+    measure_memory.main(argv)
 
     assert (tmp_path / "out" / "gpu_after.txt").read_text() == FREE
     assert (tmp_path / "out" / "memory_readings.json").exists()
@@ -808,7 +862,7 @@ def test_the_mi308x_entry_gives_the_readings_its_spec_gave():
     spec = MachineSpec.from_mapping(json.loads(path.read_text()))
     entry = MemoryReadings.from_member(MI308X_READINGS, "memory_readings mi308x")
     model = ModelTerms.from_tree(
-        meta_tree(54_713_457_120), activations=entry.activations(16_384)
+        meta_tree(54_713_457_120), activations=entry.activations()
     )
     readings = device_readings(
         spec,
@@ -856,3 +910,18 @@ def test_a_weights_compile_key_is_the_same_whatever_the_import_order():
         for order in ("first", "torch")
     }
     assert len(keys) == 1, keys
+
+
+def test_the_engine_s_dp_master_port_is_held_from_another_process_first(
+    tmp_path, monkeypatch
+):
+    _, argv = a_start(tmp_path, monkeypatch, STACK)
+    engine, squatted = measure_memory.subprocess.Popen, []
+
+    def squatting(*args, **kwargs):
+        squatted.extend(_squat(kwargs["env"]["ATOM_DP_MASTER_PORT"]))
+        return engine(*args, **kwargs)
+
+    monkeypatch.setattr(measure_memory.subprocess, "Popen", squatting)
+    measure_memory.main(argv)
+    assert squatted == [HELD]

@@ -436,16 +436,6 @@ class Site:
         """
         return f"{self.file}::{self.symbol}::{self.expr}::{self.shape}#{self.ordinal}"
 
-    def as_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "file": self.file,
-            "symbol": self.symbol,
-            "call": self.call,
-            "expr": self.expr,
-            "shape": self.shape,
-        }
-
 
 class _ScopedVisitor(ast.NodeVisitor):
     """Tracks the enclosing qualified name a site or an anchor carries.

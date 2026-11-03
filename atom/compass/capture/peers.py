@@ -7,12 +7,11 @@ A capture runs one rank, rank 0. Where ATOM reads its peers, two rules answer:
   split evenly the rows the shape's MoE gathers (`Shape.gathered`) less this
   rank's, the first of them a prefill, as a decode gathering other than every
   rank's count has a prefilling peer, or each schedules this rank's count when
-  the shape states none. The step's one DP all-gather (`sync_dp_metadata`), the
-  per-rank counts built from it and the sizes read off them (`DPMetadata.make`,
-  `get_sizes_across_dp`) run on the host with these rows. A drafter's pass
-  all-reduces its own count (`DPMetadata.num_tokens_across_dp`): its first
-  pass, the target's stream, takes the step's counts; a later one, a row a
-  sequence, this rank's at every peer.
+  the shape states none. The step's one DP all-gather (`sync_dp_metadata`)
+  runs on the host with these rows. A drafter's pass all-reduces its own count
+  (`DPMetadata.gather_running_tokens`): its first pass, the target's stream,
+  takes the step's counts; a later one, a row a sequence, this rank's at every
+  peer.
 * What the DP group gathers for the MoE, or MORI dispatches to this rank, is
   every rank's rows: the shape's gathered rows, by default the group's width
   times this rank's; for MORI, the height ATOM trims its buffer to, `T_moe`. A
@@ -31,6 +30,7 @@ their rows no longer give.
 import inspect
 import types
 
+import numpy as np
 import torch
 from torch.utils import _pytree
 
@@ -70,8 +70,7 @@ def patches(recorder):
     from atom.utils.forward_context import DPMetadata
     from atom.utils.tbo import ubatching
 
-    sync, make = ubatching.sync_dp_metadata, DPMetadata.make
-    sizes = DPMetadata.get_sizes_across_dp
+    sync = ubatching.sync_dp_metadata
     dp = get_dp_group().world_size
 
     def on_host(fn, *args, **kwargs):
@@ -91,8 +90,9 @@ def patches(recorder):
         counts.clear()
         counts[int(local[0])] = [int(slot[0]) for slot in gathered]
 
-    def num_tokens_across_dp(rows, dp_size, dp_rank):
-        return torch.tensor(counts.get(rows, [rows] * dp_size), dtype=torch.int32)
+    def gather_running_tokens(parallel_config, running_tokens):
+        each = [running_tokens] * parallel_config.data_parallel_size
+        return np.array(counts.get(running_tokens, each), dtype=np.int32)
 
     def sync_dp_metadata(**kwargs):
         gather, dist.all_gather = dist.all_gather, peers
@@ -102,6 +102,8 @@ def patches(recorder):
             dist.all_gather = gather
 
     def rows(x, height):
+        if isinstance(x, (list, tuple)):
+            return [rows(t, height) for t in x]
         return x.new_empty((height, *x.shape[1:]))
 
     # `sizes` holds this rank's count in slot 0.
@@ -111,23 +113,13 @@ def patches(recorder):
     def reduce_scatterv(x, sizes, group):
         return rows(x, sizes[0])
 
-    def all_gather_with_padding(x, use_cag=True):
-        return rows(x, dp * x.shape[0]), x.shape[0]
-
     def reduce_scatter_with_unpadding(x, local_tokens):
         return rows(x, local_tokens)
 
-    gathers = (
-        all_gatherv,
-        reduce_scatterv,
-        all_gather_with_padding,
-        reduce_scatter_with_unpadding,
-    )
+    gathers = (all_gatherv, reduce_scatterv, reduce_scatter_with_unpadding)
     return [
         (ubatching, "sync_dp_metadata", sync_dp_metadata),
-        (DPMetadata, "make", staticmethod(lambda *a, **k: on_host(make, *a, **k))),
-        (DPMetadata, "get_sizes_across_dp", lambda self: on_host(sizes, self)),
-        (DPMetadata, "num_tokens_across_dp", staticmethod(num_tokens_across_dp)),
+        (DPMetadata, "gather_running_tokens", staticmethod(gather_running_tokens)),
         *(
             (moe, f.__name__, _declared(recorder, f"{moe.__name__}:{f.__name__}", f))
             for f in gathers

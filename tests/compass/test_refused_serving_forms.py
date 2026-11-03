@@ -51,7 +51,7 @@ def run_file(monkeypatch, tmp_path):
     )
     yield run
     # A frontend that got as far as co-hosting the authority: end its run, so
-    # neither the early-end poller nor the serve loop outlives the test.
+    # neither the early-end poller nor the authority's server outlives the test.
     if compass_run._authority is not None:
         compass_run._authority.done.set()
         compass_run._early_end.join()

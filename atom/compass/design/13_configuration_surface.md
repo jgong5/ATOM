@@ -134,7 +134,7 @@ written from the flags, handed to ATOM's API server by `--compass-run`, and kept
 
 ```
 compass run --machine machine.json --step-grid <key> --store ./compass-store \
-    [--host-laws <key>] [--coverage <input>...] [--on-refusal mark|abort] --out <dir> \
+    [--host-laws <key|law>] [--coverage <input>...] [--on-refusal mark|abort] --out <dir> \
     -- --model <model> -tp 4 --max-num-seqs 256 ...      # ordinary ATOM, unchanged
 
 # which starts one instance's server as
@@ -145,12 +145,12 @@ python -m atom.entrypoints.openai_server <ATOM arguments> \
 | `run` flag | Meaning | Default |
 |---|---|---|
 | `--machine` | the machine specification (`05` D25) | **none — refuses** |
-| `--step-linear`, `--step-stub`, `--step-grid`, `--op-graph` | the backend, exactly one kind, each named by its run-file key: a step linear law by store key, a step stub's stated coefficients by file (its terms declared, never fitted), a step grid bundle by store key (`17` D103), the `op_graph` entries `--store` holds, each leaf priced first from the `price_list` the store holds at the run's model, parallel layout, machine spec and ATOM tree when there is one (#1715). There is no granularity or method flag. `--step-linear` repeats, one law per engine config: the run file then holds a list, and each process installs the law fitted under its own engine config and refuses when none or several were (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | **none — refuses**, as do two kinds |
+| `--step-linear`, `--step-stub`, `--step-grid`, `--op-graph` | the backend, exactly one kind, each named by its run-file key: a step linear law by store key or by a law file at the machine spec and engine config it states, which names no fit inputs, its calibration traces kept apart from the graded ones by process (#2594, the [#2698 ruling](https://github.com/jgong5/ATOM/issues/2698#issuecomment-6591251259)), a step stub's stated coefficients by file (its terms declared, never fitted), a step grid bundle by store key (`17` D103), the `op_graph` entries `--store` holds, each leaf priced first from the `price_list` the store holds at the run's model, parallel layout, machine spec and ATOM tree when there is one (#1715). There is no granularity or method flag. `--step-linear` repeats, one law per engine config: the run file then holds a list, and each process installs the law fitted under its own engine config and refuses when none or several were (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | **none — refuses**, as do two kinds |
 | `--store` | the artifact store keys resolve in, the configuration's `memory_readings` included (`07` D41) | **none — refuses** |
-| `--host-laws` | the host laws by store key (`09` D54), composed by `01` D4's recurrence. Repeats, one entry per engine config, each process installing its own config's, as `--step-linear` does (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | none: the run charges no host time and records that |
-| `--on-refusal` | `mark`: a refused step costs 0 s, its reason is recorded, and the run continues. `abort`: stop at the first refusal; the run summary is still written. Either way a refusal makes the run a coverage report (`08` D50.1) | `mark` (`08` D50.1) |
+| `--host-laws` | the host laws by store key (`09` D54), or a law file's `host` at the host key it states, so a law re-keyed to the run's ATOM tree runs there (#2594), composed by `01` D4's recurrence. Repeats, one entry per engine config, each process installing its own config's, as `--step-linear` does (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | none: the run charges no host time and records that |
+| `--on-refusal` | `mark`: a step the cost backend refuses charges no device time, its answered terms included, and a segment the host laws refuse 0 s; its reason is recorded, and the run continues. `abort`: stop at the first refusal; the run summary is still written. Either way a refusal makes the run a coverage report (`08` D50.1) | `mark` (`08` D50.1) |
 | `--step-roofline` | a switch, named by its run-file key `step_roofline`, with no value: the step roofline has no host bound (the owner's ruling on [#1047](https://github.com/jgong5/ATOM/issues/1047)). On, it composes `StepFallbackBackend`: the step roofline (`10` D64) prices the device time of the steps the backend refuses, with the method its inputs give it. A step grid run composes it without the switch (`17` D102) | off; `run.json` records it when on |
-| `--coverage` | `shape_population` keys and `record` directories the backend's coverage check reads before the run starts; the step grid's check refuses no step, and counts those it extrapolates or declines to the roofline (`17` D99) | off; `run.json` records the check's result, or that none ran |
+| `--coverage` | `shape_population` keys and `record` directories the backend's coverage check reads before the run starts. An input whose engine states other scheduler bounds, capture ladder or TP size than ATOM's arguments resolve refuses, naming each field that differs and both values (the [#1294 ruling](https://github.com/jgong5/ATOM/issues/1294)); the step grid's check refuses no step, and counts those it extrapolates or declines to the roofline (`17` D99) | off; `run.json` records the check's result, or that none ran |
 | `--join` | tool-only: a deployment's run file, which `scripts/compass/deploy.sh` builds from the flags above and hands every instance; the server joins the authority it names instead of co-hosting one, and every flag above but `--out` is refused beside it (below) | off: the server co-hosts its authority |
 
 `run` reads the `memory_readings` entry for its configuration (`07` D41) and refuses when
@@ -215,7 +215,7 @@ compass run            --join RUN_FILE        --out D -- <ATOM args>
 compass project        --model MODEL [--tp N] --machine M --store S RECORD... \
                        [-- RECORD <ATOM args>]...
 
-<backend>   one of --step-linear KEY, --step-stub FILE, --step-grid KEY, --op-graph; --step-linear
+<backend>   one of --step-linear KEY|LAW, --step-stub FILE, --step-grid KEY, --op-graph; --step-linear
             repeats, one KEY per engine config, as --host-laws does (#973 ruling)
 <batches>   record directories and shape_population keys, whose batches it replays
 --grid      shape_population keys, and record directories, that the step grid's planner
@@ -303,16 +303,18 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
     `--kv-transfer-config` and refuses one among its arguments. The router,
     `atomesh launch`, takes its arguments as given; the script adds its host and ports,
     `--pd-disaggregation` and each instance's URL, read from that instance's
-    `server.json`. Whether the router is an LP follows from those arguments (`01` D7):
-    the script refuses `--dp-aware`, under which it would be, until a cell needs it.
+    `server.json`. Simulated, the script refuses `--prefill` or `--decode` among them, a
+    worker more to choose, and the limiter `01` D7 leaves out; the caller switches the
+    router's detectors off (`01` D5). Whether the router is an LP follows from those
+    arguments (`01` D7): under `--dp-aware` it is the run's router LP.
   - *One Clock Authority, the script's.* A simulated deployment shares one standalone
     authority (`01` D3.3). The script builds the deployment's one run file from `run`'s
     flags, as `run` builds its own (`atom/compass/drive/runfile.py::prefill_decode`),
     and the prefill-decode keys from `--machine`, the layout and fixed code: each side's
     DP width from its ATOM arguments, `router_s` from the spec's
     `interconnect.router_relay_s` (`05`), `kv_link` from the layout, `intra_node` on one
-    node and `inter_node` across two, and `kv_write_req_s`, which no measurement backs,
-    fixed as `ipc_s` is. Its `out_dir` is the deployment directory and its
+    node and `inter_node` across two, and `kv_write_req_s`, a node-18
+    measurement fixed in code as `ipc_s` is. Its `out_dir` is the deployment directory and its
     `clock_endpoint` the authority's. The script starts the authority on it
     (`python -m atom.compass.run`), then each instance as
     `compass run --join RUN_FILE --out D/<side> -- <ATOM args>`.
@@ -353,7 +355,12 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
 
 - **`record`** runs at any TP and DP width, one record per DP rank. `run.json`'s `engine`
   entry holds the engine's bounds: the KV block count, block size and ladder,
-  `max_num_seqs`, `max_num_batched_tokens` and `max_model_len`. `record` takes no memory
+  `max_num_seqs`, `max_num_batched_tokens` and `max_model_len`. Its `aiter_jit_builds`
+  names each JIT compile, aiter's, FlyDSL's, Triton's or Inductor's, outside ATOM's
+  per-start compile cache, that the server ran or began after `/health` first answered
+  (`atom/compass/drive/aiter_jit.py`), and is absent when there was none. An optional
+  `--store` names the store whose per-stack JIT cache library the server's start merges in
+  and its stop writes back (`07` D106); without it `record` touches no library. `record` takes no memory
   readings; `measure memory` does. `--host` binds an address other than 127.0.0.1, one a
   router on another node reaches. Steps are timed unprofiled; op times come only from a
   separate profiled pass (`--profile-ops`, ops half), which splits a step and never prices
@@ -424,7 +431,7 @@ Audited, because an absent flag is a decision and should be a visible one:
 | a workload, the client's settings | no command starts the client: a client started apart sends them, and grading reads which traces it served from the client run |
 | acceptance rate for speculative decoding | **ATOM's own flag** — `--spec-decode-acceptance-length` / `--spec-decode-acceptance-rate` already exist (`14` D83) |
 | thread-pool widths | ATOM's, per `05` D24 |
-| the run file's lookaheads, bound and admission path | fixed in code: no measurement backs the lookaheads (`atom/compass/clock/channels.py::single_engine_table`), a deployment's write request's included, and `run` always drives the API server |
+| the run file's lookaheads, bound and admission path | fixed in code: `ipc_s`, `ipc_out_s` and `stream_s` are node-18 medians in `atom/compass/drive/runfile.py::FIXED`; a deployment's write request's `kv_write_req_s` is the node-18 hop uncontended, a p10, in `KV_WRITE_REQ_S` there, and a router LP's `router_in_s` borrows `ipc_s`, since Atomesh logs no receipt to measure it from; `run` always drives the API server |
 | the model's parameter count, the DP width | read from the model directory and from ATOM's arguments |
 
 ---

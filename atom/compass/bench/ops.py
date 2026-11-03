@@ -14,7 +14,8 @@ its instances grouped (`leaves`), at the shape and `--context`: a decode
 step's rows each hold `--context` tokens, and a prefill's rows, split as the
 capture split them, follow `--context` cached tokens each, none when it is not
 given. Rows the KV pool cannot hold at once are ragged (`point_rows`), and the
-point records its rows.
+point records its rows; under `--plan` over ragged decode steps a decode point
+the pool cannot hold refuses instead, past the first round (`RAGGED`).
 
 ATOM's runner is built from ATOM's arguments on each GPU `--gpu` names, one
 rank each of the layout the arguments resolve (`ranks`), its parameters on the
@@ -26,8 +27,11 @@ forward writes is written from ids spread over each token's compressed rows
 (`Stub._top_k`). A `Stub` calls each leaf from its contract:
 an activation is random at its shape, dtype and stride, except a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
-experts' ids ATOM fuses into them (`_route`), and the `NM_OUTPUT` slot at
-one KV split, a view at the start of twice its span; a weight is random at its
+experts' ids ATOM fuses into them (`_route`), the `NM_OUTPUT` slot at
+one KV split, a view at the start of twice its span, and aiter's top-k
+scratch (`TOPK_WORKSPACE`), one byte in the graph, built as aiter builds it
+on the device for the call's rows, row stride, k and path
+(`_topk_workspace`); a weight is random at its
 shape, dtype and stride, one tensor per occurrence of the leaf in the step;
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
@@ -52,15 +56,20 @@ alike (`exchange`), which the plan ladders, densifies and covers.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, a KV
 argument's as many entries of its first dimension, each the span of the
-others, as the batch's state slots, or its blocks when the model keeps no
+others, as the batch's rows, or its blocks when the model keeps no
 per-request state, or, of a decode attention leaf that states its layer's
 window and compress ratio, the plane rows the batch's blocks hold at that
 ratio, a RoPE table's (`TABLES`), a weight or a tensor of a module it names,
 as many rows as the point's tokens, a table a leaf gathers by token ids
-(`GATHERED`) as many rows as its ids, the other tensors of each module it names,
+(`GATHERED`) as many rows as its ids, aiter's top-k scratch (`TOPK_WORKSPACE`)
+the bytes it launches with, but none of the multi-block path's one cached
+buffer, which every copy launches and the point's footprint counts once, the
+other tensors of each module it names,
 of one whose first dimension is the pool's blocks the batch's blocks, and, for
 a leaf that names a context key, the KV and
-per-request state its layer holds for the batch. One graph runs the leaf K
+per-request state its layer holds for the batch, a state slot a row, but at a
+decode its recurrent state (`SNAPSHOTS`) at each slot a row holds, which under
+a drafter is one a token. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
 copies: N built ones: M, the least count whose bytes pass `COLD` times the
@@ -120,15 +129,17 @@ launched different kernels or, at a decode width, either side of a point off
 the line through theirs, or, on rows alike, whose cold times differ where the
 leaf's kind steps under one kernel between two adjacent contexts at some width
 (`_densify`), until they are adjacent; a collective's message bytes bend as a
-decode width does. DIR gets each round's ops.jsonl in `round<n>`, a run
+decode width does; and then, at the rows of each prefill family of a kind that
+depends on context, each token count its leaf's families at other rows hold
+between its own least and most, at each of its cached-token counts
+(`_filled`), densifying again after. DIR gets each round's ops.jsonl in `round<n>`, a run
 resumed into DIR numbering on from the last round there, and after each round
 every point held, a measured one with its store token, in plan.jsonl.
 
 `--coverage` counts the steps of record directories that DIR's plan.jsonl
 covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
-a step only when `fit ops`' price list of those points prices each leaf but a
-collective, and prints the count by phase and why each leaf kind left the rest
-out.
+a step only when `fit ops`' price list of those points prices each leaf, and
+prints the count by phase and why each leaf kind left the rest out.
 """
 
 import argparse
@@ -179,7 +190,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 17
+PROTOCOL = 22
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -279,6 +290,20 @@ V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
 #: the span, and past an exact buffer kills the process (aiter defect, #1977).
 NM_OUTPUT = (_NM, "output")
+#: aiter's top-k leaves, each with whether it is the decode one, whose
+#: `workspace` aiter sizes by host queries into a module built for the
+#: device, which the capture answers 0 (`capture.forward._patches`), so a
+#: graph holds one byte. A point records the bytes it launched.
+TOPK_WORKSPACE = {
+    "aiter._top_k_per_row_decode.default": True,
+    "aiter._top_k_per_row_prefill.default": False,
+}
+#: The field of a per-request state layer of ATOM's KV registry that a decode
+#: row's leaf reads and writes at every state slot the row holds: GDN's and
+#: KDA's recurrent state, which their spec-decode kernel takes with each row's
+#: slots and writes once a token, 1 + K under a drafter of K drafts without
+#: ReplaySSM. Their conv state (`k_cache`) takes the row's first slot alone.
+SNAPSHOTS = "v_cache"
 #: The seed of a copy's drawn expert ids, with the copy's index.
 SEED = 0
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
@@ -286,6 +311,11 @@ RANK = Topology().ranks()[0]
 #: The variable naming the file a measuring process appends each point's
 #: record to as it finishes it.
 JOURNAL = "COMPASS_OPS_JOURNAL"
+#: The variable `--plan` sets for its measuring processes past its first round
+#: when some step's decode rows are ragged: there a uniform decode point the KV
+#: pool cannot hold refuses, as a ragged one does, unless every leaf it times is
+#: a collective. A cut point's rows hold a mean its context does not name.
+RAGGED = "COMPASS_OPS_RAGGED"
 
 
 def main(argv: list[str]) -> None:
@@ -561,6 +591,7 @@ class Stub:
     a collective leaf refuses."""
 
     def __init__(self, runner, llc: int, journal=None) -> None:
+        from atom.compass.bench.replay import state_slots_per_request
         from atom.model_engine.kv_block import STATE_SLOT_CLASS
 
         self.runner, self.llc, self.journal = runner, llc, journal
@@ -569,9 +600,11 @@ class Stub:
         self.flush = None
         self.alone = getattr(runner.config, "dp_logical_size", 0)
         self.slots = runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
+        self.per_row = state_slots_per_request(runner.config)
         self.built, self.leaves, self.placed = {}, {}, []
         self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, set()
-        self.written = {}
+        # `once`: by leaf, the bytes of a buffer every copy launches
+        self.written, self.unplanned, self.once = {}, {}, {}
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
         self.moe = sorted(
@@ -717,7 +750,10 @@ class Stub:
             )
 
         pool = self.runner.config.num_kvcache_blocks
-        rows = point_rows(shape, context, pool, rule.block_size)
+        uncut = os.environ.get(RAGGED) and not all(
+            exchange(o) for o, _ in found.values()
+        )
+        rows = point_rows(shape, context, pool, rule.block_size, bool(uncut))
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
         view = {"rows": rows, "produces_output": True}
@@ -731,21 +767,24 @@ class Stub:
             for path, spec in _specs(op["args"])
             if spec["role"] == "kv"
         }
+        taken = len(rows) * self.per_row  # the batch's state slots
         room = [pool // blocks]
-        room += [t.k_cache.shape[0] // len(rows) for t in kv.values() if _stateful(t)]
+        room += [t.k_cache.shape[0] // taken for t in kv.values() if _stateful(t)]
+        self.context, self.unplanned, self.once = _split(context)[0], {}, {}
         plans = {
-            s: self._plan(op, i, kv, blocks, len(rows), shape.tokens, s)
+            s: self._plan(
+                op, i, kv, blocks, len(rows), shape.tokens, s, shape.phase == "decode"
+            )
             for s, (op, i) in found.items()
         }
         need = max(p for _, _, p, _ in plans.values())
         self.leaves, self.placed, self.clones = found, [], {}
         self.written = {}
-        self.context = _split(context)[0]
         self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
         for p in range(max(min(need, *room), 1)):
-            slot = p * len(rows)
-            if self.slots >= len(rows):  # past the state slots, take them again
-                slot %= self.slots - self.slots % len(rows)
+            slot = p * taken
+            if self.slots >= taken:  # past the state slots, take them again
+                slot %= self.slots - self.slots % taken
             try:
                 batch = rule.batch(view, p * blocks, slot)
             except ValueError as error:  # the rule refuses, before any preparation
@@ -770,7 +809,7 @@ class Stub:
                 # `c mod m`'s activations
                 built = min(n, record.get("copies", n))
                 at = min(len(self.placed), -(-built // len(inst)))
-                wrap = self.slots // len(rows) if self.slots >= len(rows) else at
+                wrap = self.slots // taken if self.slots >= taken else at
                 # ponytail: routed expert ids and an object's activations are
                 # drawn a copy each yet count once a cold copy here; split them
                 # out when a leaf with more instances than cold copies holds one
@@ -784,6 +823,7 @@ class Stub:
                     + min(built, self.cold_copies[sig]) * acts
                     + at * by_block
                     + min(at, wrap) * by_slot
+                    + self.once.get(sig, 0)
                 )
             except Exception as error:  # noqa: BLE001 - a refusal names what stopped it
                 record["refused"] = f"{type(error).__name__}: {error}"
@@ -795,11 +835,14 @@ class Stub:
         self.placed = []
         return got
 
-    def _plan(self, op, instances, kv, blocks, rows, tokens=None, sig=None):
+    def _plan(
+        self, op, instances, kv, blocks, rows, tokens=None, sig=None, decode=False
+    ):
         """A leaf's copies, its bytes per call, the placements its context
         keys and KV arguments take, and its KV arguments' bytes per call read
         by blocks and by state slots; `tokens` defaults to `rows`, a
-        decode's."""
+        decode's; at a `decode`, a context key's recurrent state counts each
+        state slot a row holds."""
         need, size, shared = 1, 0, [0, 0]
         table, ids = GATHERED.get(op["op"], (None, None))
         for slot, s in _specs(op["args"]):
@@ -832,6 +875,14 @@ class Stub:
                 entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
                 nbytes, need = entry * unit, None
                 shared[slotted] += nbytes
+            if slot == "workspace" and op["op"] in TOPK_WORKSPACE:
+                try:  # not the byte captured; a query that raises refuses the leaf
+                    scratch, cached = self._workspace(op)
+                    nbytes = scratch.nbytes
+                    if cached:  # no copy's own: one buffer, held once
+                        self.once[sig], nbytes = nbytes, 0
+                except Exception as error:  # noqa: BLE001 - raised at its copy
+                    self.unplanned[sig] = error
             size += nbytes
         for key in instances[0].values():
             module = self.contexts.get(key)
@@ -839,7 +890,11 @@ class Stub:
                 held = kv.get(f"layer_{module.layer_num}")
                 unit = rows if _stateful(held) else blocks
                 # ponytail: a tensor's first dim is its blocks or its state slots
-                size += sum(t.nbytes // t.shape[0] * unit for t in _fields(held))
+                for name, t in _fields(held):
+                    at = unit
+                    if name == SNAPSHOTS and decode and _stateful(held):
+                        at *= self.per_row  # each slot a row holds
+                    size += t.nbytes // t.shape[0] * at
                 need = None
             elif (module := self.modules.get(key, module)) is not None:
                 pool = self.runner.config.num_kvcache_blocks
@@ -922,7 +977,10 @@ class Stub:
         finally:
             forward_context._forward_context = forward_context.ForwardContext()
         medians = statistics.median(cold), warm and statistics.median(warm)
-        return {
+        scratch = {}
+        if op["op"] in TOPK_WORKSPACE:
+            scratch["workspace_bytes"] = calls[0][0]["workspace"].nbytes
+        return scratch | {
             "kernels": kernels,
             "cold_ns": medians[0],
             "warm_ns": medians[1],
@@ -981,6 +1039,10 @@ class Stub:
                 and old is not None
             ):
                 return old
+            if path == "workspace" and op["op"] in TOPK_WORKSPACE:
+                if sig in self.unplanned:  # its size query raised at planning
+                    raise self.unplanned[sig]
+                return self._workspace(op)[0]
             if _ref(value):
                 key, module = instance[path], "module" in value
                 held = (
@@ -1007,6 +1069,16 @@ class Stub:
 
         args = op["args"].items()
         return {s: build(s, v, like[0][s] if like else None) for s, v in args}, snap
+
+    def _workspace(self, op) -> tuple[torch.Tensor, bool]:
+        """`_topk_workspace` for the top-k leaf `op` at the point's context."""
+        rows, stride, k = (
+            ir.Affine(*v["affine"]).at(self.context) if isinstance(v, dict) else v
+            for v in map(op["args"].get, ("numRows", "stride0", "k"))
+        )
+        # a capture leaves out a trailing argument at its default
+        stable = op["args"].get("stable", False)
+        return _topk_workspace(op["op"], rows, stride, k, stable, self.runner.device)
 
     def _routed(self, spec, sig, path) -> bool:
         """Whether `spec` at `sig`'s `path` is a router's top-k expert ids: an
@@ -1123,14 +1195,17 @@ def _routing(loads) -> dict:
     }
 
 
-def point_rows(shape, context, pool: int, block_size: int) -> list[list] | None:
+def point_rows(
+    shape, context, pool: int, block_size: int, uncut: bool = False
+) -> list[list] | None:
     """A point's rows, `[query, context, decodes]` each, longest first: a decode
     row holds `context` tokens; a prefill row its query tokens, the capture's
     split, past `context` cached ones. When they need more than the `pool`'s
     KV blocks, the first keeps its context and each other shares what it
     leaves, as the rows of a ragged step do. A ragged decode point's rows
     (`_split`) are its first row's context and, past it, rows of at least a
-    token each that hold its mean; None when they need more than the pool."""
+    token each that hold its mean; None when they need more than the pool, as
+    a decode point's are when `uncut`."""
     decode = shape.phase == "decode"
     context, mean = _split(context)
     per, extra = divmod(shape.tokens, shape.seqs)
@@ -1143,7 +1218,7 @@ def point_rows(shape, context, pool: int, block_size: int) -> list[list] | None:
         for row in rows[1:]:
             row[1] = max(share, 1)
     blocks = [-(-row[1] // block_size) for row in rows]
-    if sum(blocks) > pool and mean:
+    if sum(blocks) > pool and (mean or uncut and decode):
         return None
     if sum(blocks) > pool and len(rows) > 1:
         share = (pool - blocks[0]) // (len(rows) - 1) * block_size
@@ -1534,6 +1609,23 @@ def _together() -> None:
     torch.distributed.all_reduce(flag, group=device)
 
 
+def _topk_workspace(name, rows, stride, k, stable, device) -> tuple[torch.Tensor, bool]:
+    """The `workspace` aiter's top-k leaf `name` launches with on `device`
+    for `rows` rows at row stride `stride` and `k`, as aiter's wrappers build
+    it: on the multi-block path, which a prefill takes unless `stable` where
+    the device's `topk_use_mulblocks` says so, aiter's cached buffer, zeroed
+    once and reset by its kernel after each launch; on the one-block path,
+    fresh scratch. With it, whether it is that cached buffer."""
+    from aiter.ops import topk
+
+    decode = TOPK_WORKSPACE[name]
+    if not (decode or stable) and topk.topk_use_mulblocks(rows, stride):
+        size = topk.topk_mb_workspace_size(rows, stride, k, False)
+        return topk.get_topk_mb_workspace(device, size), True
+    size = topk.topk_ob_workspace_size(rows, stride, k, decode)
+    return topk.get_topk_scratch_workspace(device, size), False
+
+
 def _span(shape, stride) -> int:
     """Elements a view of `shape` and `stride` reaches from its offset."""
     if 0 in shape:
@@ -1654,9 +1746,9 @@ def _stateful(held) -> bool:
 
 
 def _fields(held):
-    for value in vars(held).values() if held is not None else ():
+    for name, value in vars(held).items() if held is not None else ():
         if torch.is_tensor(value) and value.dim():
-            yield value
+            yield name, value
 
 
 def keys(config, run: dict):
@@ -1784,7 +1876,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             todo += [(shape, context, found)] if found else []
         print(f"round {first + n}: {sum(len(f) for *_, f in todo)} points to measure")
         gpus = len(run["device"])
-        results = _measured(config, todo, args.llc_mib << 20, gpus)
+        # round 0 cuts: `_dependent` reads its points for which kinds move
+        with patch.dict(os.environ, {RAGGED: "1"} if ragged and n else {}):
+            results = _measured(config, todo, args.llc_mib << 20, gpus)
         (into := out / f"round{first + n}").mkdir()
         publish(store, key, config, run, command, results, into)
         done.update((_point(r), r) for r in results)
@@ -1846,9 +1940,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         measure_round(want, n)
         n += 1
         want = cached_ladder(top_only=False) if n == 2 else {}
-        want = want or _densify(
-            _families(done.values(), _dependent(done.values())), tried
-        )
+        families = _families(done.values(), _dependent(done.values()))
+        want = want or _densify(families, tried)
+        want = want or _filled(families, tried, config.max_model_len)
     kinds = Counter(r["op"] for r in done.values() if "refused" not in r)
     print(json.dumps({"points per leaf kind": dict(kinds.most_common())}, indent=1))
     print(f"{sum(kinds.values())} of {len(done)} points measured in {n} rounds")
@@ -1900,9 +1994,9 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     decode leaf of a kind that depends on context over its rows' lowest to
     highest context (`_rows`), any other decode leaf at its width, a prefill
     leaf at its tokens, and one of a kind that depends on context over its
-    rows' cached tokens too (`_bracket_cached`); and, but for a collective,
-    which it does not price, `fit ops`' price list of `records` prices it at
-    the step, as `compass run --coverage` asks it. The graphs are `arch`'s."""
+    rows' cached tokens too (`_bracket_cached`); and `fit ops`' price list of
+    `records` prices it at the step, as `compass run --coverage` asks it. The
+    graphs are `arch`'s."""
     from atom.compass.backends.op_graph import band
     from atom.compass.backends.provenance import Refusal
     from atom.compass.capture import population_steps
@@ -1948,8 +2042,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 why = _bracket(*axes[fam], *_rows(line, shape.seqs)) if moves else ""
             else:
                 why = _bracket(*axes[fam], tokens, tokens)
-            listing = not why and not _exchanged(fam)
-            if listing and isinstance(got := listed.price((op, bound, None)), Refusal):
+            if not why and isinstance(got := listed.price((op, bound, None)), Refusal):
                 why = re.sub(r"\d+", "#", got.reason.split(": ")[1])
             if why:
                 whys[name] = why
@@ -2236,6 +2329,41 @@ def _densify(families, tried: set) -> dict:
                 want[shape, (mid, *ragged) if ragged else mid].add(fam)
             else:
                 want[prefill(mid, shape.seqs), record["context"]].add(fam)
+    return want
+
+
+def _filled(families, tried: set, max_model_len: int) -> dict:
+    """The points of each prefill family over cached tokens (`_cut`) at its
+    rows that its leaf's families at any rows hold the token count of, between
+    its own least and most, at each cached-token count its own points hold
+    that its first row has room for under `max_model_len`, unless `tried`.
+    `fit ops` reads such a leaf over T, then its rows: a step's rows are
+    bracketed only where the token counts either side of it hold them."""
+    from atom.compass.capture.forward import prefill
+    from atom.compass.fit.ops import skeleton
+
+    held, skeletons, axis = defaultdict(set), {}, defaultdict(set)
+    for fam, points in families.items():
+        if cut := _cut(fam):
+            for tokens, _, record in points:
+                held[cut[0]].add((tokens, cut[1]))
+                skeletons[cut[0]] = skeleton(record["shape"], record["leaf"])
+                axis[skeletons[cut[0]]].add(tokens)
+    want = defaultdict(set)
+    for base, at in held.items():
+        rows, tokens = json.loads(base)[1], [t for t, _ in at]
+        for t in sorted(axis[skeletons[base]]):
+            for c in sorted({c for _, c in at}):
+                fam = json.dumps([*json.loads(base), c], sort_keys=True)
+                if (
+                    not min(tokens) < t < max(tokens)
+                    or (t, c) in at
+                    or (fam, t) in tried
+                    or c > max_model_len - -(-t // rows)
+                ):
+                    continue
+                tried.add((fam, t))
+                want[prefill(t, rows), c or None].add(fam)
     return want
 
 

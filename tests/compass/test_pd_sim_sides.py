@@ -11,7 +11,6 @@ needs a driver.
 import ast
 import json
 import os
-import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +21,7 @@ import pytest
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
 from atom.compass.run.step_grid import keyed
+from tests.compass.held_ports import held_ports
 
 TREE = Path(__file__).resolve().parents[2]
 LAWS = [
@@ -54,12 +54,6 @@ exec {sys.executable} "$@"
 """
 
 
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def started(tmp_path, script) -> dict:
     """Each side's (arguments, environment) as `script` started its server."""
     bin_ = tmp_path / "bin"
@@ -83,22 +77,23 @@ def started(tmp_path, script) -> dict:
         TRACES=str(tmp_path / "traces.jsonl"),
         HARNESS_PYTHON=str(bin_ / "harness"),
         WAIT_S="2",
-        **{p: str(free_port()) for p in ("CLOCK_PORT", "PREFILL_PORT", "DECODE_PORT")},
         PREFILL_ARGS="--enable-tbo",
         DECODE_ARGS=f"--cudagraph-capture-sizes {DECODE_SIZES}",
         PREFILL_ENV=" ".join(f"{k}={v}" for k, v in PREFILL_ENV.items()),
         DECODE_ENV=" ".join(f"{k}={v}" for k, v in DECODE_ENV.items()),
     )
     args = [out / "run.json"] + ([out] if script == "cctraces_sim.sh" else [])
-    done = subprocess.run(
-        ["bash", str(TREE / "scripts/compass" / script), *map(str, args)],
-        env=env,
-        cwd=TREE,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
+    with held_ports(3) as ports:
+        env.update(zip(("CLOCK_PORT", "PREFILL_PORT", "DECODE_PORT"), map(str, ports)))
+        done = subprocess.run(
+            ["bash", str(TREE / "scripts/compass" / script), *map(str, args)],
+            env=env,
+            cwd=TREE,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
     assert done.returncode == 1, done.stdout + done.stderr
     sides = {}
     for side in ("prefill", "decode"):

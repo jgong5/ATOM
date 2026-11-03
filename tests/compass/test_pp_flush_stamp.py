@@ -26,6 +26,10 @@ def test_a_flush_that_settles_a_send_is_stamped_on_the_next_forward(
         def __init__(self, rank, config):
             self.rank, self.config = rank, config
             self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
             self.attn_metadata_builder = GRAPHABLE
             self._pp_pending_send, self.sends = [], True
 
@@ -36,6 +40,9 @@ def test_a_flush_that_settles_a_send_is_stamped_on_the_next_forward(
         def flush_pp_send(self):
             self._pp_pending_send.clear()
             return True
+
+        def exit(self):
+            pass
 
     class _Recorded(StepRecording, _Base):
         step_clock_ns = staticmethod(time.monotonic_ns)
@@ -51,6 +58,7 @@ def test_a_flush_that_settles_a_send_is_stamped_on_the_next_forward(
     runner.flush_pp_send()  # the forward settled its send: nothing pending
     for batch in batches[2:]:
         runner.forward(batch)
+    runner.exit()
     steps = read(tmp_path / "real")[0]
     assert ["t_flush_ns" in s for s in steps] == [False, True] + [False] * (
         len(steps) - 2

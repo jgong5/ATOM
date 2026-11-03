@@ -106,25 +106,50 @@ def test_a_rate_above_its_peak_is_refused():
     assert "device.compute.derate.bf16" in str(refused.value)
 
 
-def _card(drm, name, bdf, used, ptl=None, busy=0):
+def _card(drm, name, bdf, used, ptl=None, charged=()):
+    """A card at `bdf`, its KFD node and the processes `charged` its memory:
+    `(pid, bytes)` each. Every card reads 100% busy, as a gfx1250 card with no
+    process does."""
     device = drm / "devices" / bdf
     device.mkdir(parents=True)
     (device / "mem_info_vram_used").write_text(f"{used}\n")
-    (device / "gpu_busy_percent").write_text(f"{busy}\n")
+    (device / "gpu_busy_percent").write_text("100\n")
     if ptl:
         (device / "ptl").mkdir()
         (device / "ptl" / "ptl_enable").write_text(f"{ptl}\n")
     (drm / name).mkdir()
     (drm / name / "device").symlink_to(device)
+    domain, bus, slot = bdf.split(":")
+    dev, fn = slot.split(".")
+    node = drm / "kfd" / "topology" / "nodes" / name
+    node.mkdir(parents=True)
+    location = int(bus, 16) << 8 | int(dev, 16) << 3 | int(fn)
+    (node / "properties").write_text(
+        f"cpu_cores_count 0\nlocation_id {location}\ndomain {int(domain, 16)}\n"
+    )
+    gpu_id = 1000 + int(name.removeprefix("card"))
+    (node / "gpu_id").write_text(f"{gpu_id}\n")
+    for pid, nbytes in charged:
+        proc = drm / "kfd" / "proc" / pid
+        proc.mkdir(parents=True, exist_ok=True)
+        (proc / f"vram_{gpu_id}").write_text(f"{nbytes}\n")
 
 
-def test_cards_disagreeing_with_the_spec_ptl_holding_vram_or_busy_are_refused(tmp_path):
-    _card(tmp_path, "card1", "0000:0a:00.0", 3 * 10**8, "enabled")
+def test_cards_disagreeing_with_the_spec_ptl_holding_vram_or_another_process_are_refused(
+    tmp_path,
+):
+    # Process 77 is this one; process 5 holds no memory, as a node agent does.
+    _card(
+        tmp_path, "card1", "0000:0a:00.0", 3 * 10**8, "enabled", [("77", 9), ("5", 0)]
+    )
     _card(tmp_path, "card9", "0000:80:00.0", 3 * 10**8)
     _card(tmp_path, "card17", "0000:a4:00.0", 9 * 10**9, "enabled")
-    _card(tmp_path, "card25", "0000:c8:00.0", 3 * 10**8, "enabled", busy=37)
+    _card(tmp_path, "card25", "0000:c8:00.0", 3 * 10**8, "enabled", [("4242", 2**20)])
     read = probe.cards(
-        ["0000:0a:00.0", "0000:80:00.0", "0000:a4:00.0", "0000:c8:00.0"], tmp_path
+        ["0000:0a:00.0", "0000:80:00.0", "0000:a4:00.0", "0000:c8:00.0"],
+        tmp_path,
+        tmp_path / "kfd",
+        me="77",
     )
     assert [c["ptl"] for c in read] == ["enabled", "disabled", "enabled", "enabled"]
     probe.refuse_unfit(read[:1], "enabled")
@@ -133,9 +158,100 @@ def test_cards_disagreeing_with_the_spec_ptl_holding_vram_or_busy_are_refused(tm
     assert "0000:0a" not in str(refused.value)
     assert "0000:80:00.0 (ptl disabled" in str(refused.value)
     assert "0000:a4:00.0 (ptl enabled, 9000000000 B used" in str(refused.value)
-    assert "0000:c8:00.0 (ptl enabled, 300000000 B used, 37% busy)" in str(
+    assert "0000:c8:00.0 (ptl enabled, 300000000 B used, processes ['4242'])" in str(
         refused.value
     )
+
+
+#: aiter's MXFP4 GEMM on an MI455 card, as it refused on 2026-10-27.
+A0 = "gemm_a4w4 asm is only supported on gfx1250 B0+ (current device is gfx1250 A0)."
+
+
+def test_fp4_is_timed_through_the_library_that_runs_and_names_the_one_that_failed():
+    made = []
+
+    def refusing():
+        made.append("aiter")
+
+        def call():
+            raise RuntimeError(A0)
+
+        return call
+
+    hipblaslt, aiter, failed = {}, {}, {}
+    fp4 = dict(zip(probe.FP4, ((hipblaslt, lambda: list), (aiter, refusing))))
+    for shape in ("8192x8192x8192", "16384x8192x8192"):
+        ((samples, call),) = probe._running(fp4, failed)
+        samples[shape] = [2e-3]
+    assert samples is hipblaslt and call is list
+    assert failed == {"aiter.gemm_a4w4": f"RuntimeError: {A0}"}
+    assert made == ["aiter"]  # tried at the first shape only
+    gemm = RECORD["gemm"] | {"fp4": hipblaslt}
+    found = probe.readings(RECORD | {"gemm": gemm, "aiter": {"fp4": aiter}})
+    assert found["fp4"] == 2 * 16384 * 8192**2 / 2e-3
+
+
+def test_the_triton_tile_is_the_fastest_within_one_percent_of_torch(monkeypatch):
+    import torch
+
+    expected = torch.ones(4, 4)
+    off, broken, slow, fast = probe.TILES[False][:4]
+    outputs = {off: expected * 1.02, slow: expected, fast: expected * 1.005}
+    seconds = {off: 1e-4, slow: 3e-3, fast: 2e-3}
+
+    launched = {}
+
+    def triton(torch, operands, tile):
+        if tile == broken:
+            raise RuntimeError("no tile of that size on this arch")
+
+        def call():
+            pass
+
+        launched[call] = tile
+        return call, outputs.get(tile, expected * 9)
+
+    monkeypatch.setattr(probe, "_triton", triton)
+    monkeypatch.setattr(
+        probe, "_timed", lambda torch, call, reps: [seconds.get(launched[call], 1)]
+    )
+    failed = {}
+    assert (
+        probe._tile(torch, ("x", "w"), lambda: expected, "triton bf16", failed) == fast
+    )
+    assert failed == {}
+    # MXFP4 with no torch output to check against is not timed, and is named.
+    assert (
+        probe._tile(torch, ("x", "sx", "w", "sw"), None, "triton fp4", failed) is None
+    )
+    assert failed == {"triton fp4": "no torch output to check it against"}
+
+
+def test_a_format_takes_triton_s_rate_where_it_is_faster():
+    triton = {"bf16": {"8192x8192x8192": [1e-4]}, "fp8": {}}
+    found = probe.readings(RECORD | {"triton": triton})
+    assert found["bf16"] == 2 * 8192**3 / 1e-4
+    assert found["fp8"] == probe.readings(RECORD)["fp8"]
+
+
+def test_a_card_on_which_no_fp4_gemm_runs_is_refused_naming_each_error():
+    def raising(error):
+        def call():
+            raise error
+
+        return lambda: call
+
+    fp4 = dict(
+        zip(
+            probe.FP4,
+            (({}, raising(RuntimeError("no kernel"))), ({}, raising(RuntimeError(A0)))),
+        )
+    )
+    with pytest.raises(SpecRefusal) as refused:
+        probe._running(fp4, {})
+    assert refused.value.rule is Rule.MEASURED
+    assert "torch._scaled_mm RuntimeError: no kernel" in str(refused.value)
+    assert f"aiter.gemm_a4w4 RuntimeError: {A0}" in str(refused.value)
 
 
 def test_the_mi355x_script_publishes_the_probed_fields_fp4_included(
@@ -204,3 +320,26 @@ def test_the_record_names_the_stack_aiter_s_commit_included(monkeypatch, tmp_pat
         "rccl": "2.27.7",
         "torch": torch.__version__,
     }
+
+
+def test_the_cards_are_read_with_no_wait(monkeypatch, tmp_path):
+    """VRAM used, KFD's charges and PTL are counters and a setting the driver
+    keeps, none of which moves while a card wakes, so nothing waits for them."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from atom.compass.drive import identity
+
+    order = []
+    monkeypatch.setattr(probe, "time", SimpleNamespace(sleep=order.append))
+    card = SimpleNamespace(
+        pci_domain_id=0, pci_bus_id=10, pci_device_id=0, gcnArchName="gfx942"
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: card)
+    monkeypatch.setattr(identity, "_stack", dict)
+    monkeypatch.setattr(probe, "cards", lambda bdfs: order.append("cards") or [])
+    monkeypatch.setattr(probe, "probe", lambda torch, formats: RECORD)
+    spec = SCRIPTS / "machines" / "mi308x-hjbog18.json"
+    assert probe.main([str(spec), str(tmp_path / "record.json")]) == 0
+    assert order == ["cards"]

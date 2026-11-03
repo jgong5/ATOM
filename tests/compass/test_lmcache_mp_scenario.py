@@ -28,6 +28,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import pytest
+from test_lmcache_lp import lmcache_port  # noqa: F401  the lmcache_port fixture
 from test_lmcache_mp_engine import _machine
 from test_parity_record import _config as _parity_config
 from test_parity_record import _key
@@ -48,7 +49,6 @@ from atom.compass.backends.step_stub import Coefficients
 from atom.compass.carriers import tracestate_with
 from atom.compass.clock import TAR
 from atom.compass.detect.scenario import check_run, expected_timeline
-from atom.compass.drive.serve import _free_ports
 from atom.compass.kv.lmcache_server import reply_channel
 from atom.compass.parity import ENV as RECORD
 from atom.compass.parity import StepRecording, read
@@ -62,6 +62,7 @@ from atom.kv_transfer.offload.metadata import (
 )
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
+from tests.compass.held_ports import held_ports
 
 PREFIX_WORDS = 600  # two whole 256-token chunks
 BURST_S, BURST = 0.5, 3  # the burst's time, and its requests per DP rank
@@ -130,13 +131,13 @@ def _measure(out: Path, machine: Path, width: list, port: int) -> None:
 
 
 def run_scenario(
-    root: Path, seed: str, dp: int, lmcache_port: int, ports: list[int]
+    root: Path, seed: str, dp: int, server_port: int, ports: list[int]
 ) -> dict:
     """One run in its own process tree, reading the readings in ``root/store``,
     its clock and server on `ports`."""
     out = root / f"seed{seed}"
     out.mkdir()
-    (clock_port, port), flags = ports, _server(lmcache_port)
+    (clock_port, port), flags = ports, _server(server_port)
     machine = json.loads((root / "machine.json").read_text())
     run_file = _run_file(
         out,
@@ -150,7 +151,7 @@ def run_scenario(
     )
     env = dict(
         os.environ,
-        **_offload(lmcache_port),
+        **_offload(server_port),
         PYTHONHASHSEED=seed,
         PYTHONPATH=str(TREE),
         AITER_LOG_LEVEL="WARNING",
@@ -191,7 +192,7 @@ def run_scenario(
 
 
 @pytest.fixture(scope="module", params=[1, 2], ids=["dp1", "dp2"])
-def runs(request, tmp_path_factory):
+def runs(request, tmp_path_factory, lmcache_port):  # noqa: F811
     dp = request.param
     root = tmp_path_factory.mktemp(f"lmcache_dp{dp}")
     machine = _machine(root)
@@ -201,18 +202,17 @@ def runs(request, tmp_path_factory):
         "latency_s": COPY_S,
     }
     machine.write_text(json.dumps(spec))
-    # The run file names the lmcache port, so both runs share it; each run's
-    # clock and server ports are drawn with it.
-    lmcache_port, *ports = _free_ports(5)
+    # The run file names the lmcache port, so both runs share it.
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("AITER_LOG_LEVEL", "WARNING")  # the readings are keyed by it
         for name, value in _offload(lmcache_port).items():
             mp.setenv(name, value)
         _measure(root, machine, DP2 if dp > 1 else [], lmcache_port)
-    return dp, [
-        run_scenario(root, seed, dp, lmcache_port, ports[2 * i : 2 * i + 2])
-        for i, seed in enumerate(("1", "2"))
-    ]
+    with held_ports(4) as ports:
+        return dp, [
+            run_scenario(root, seed, dp, lmcache_port, ports[2 * i : 2 * i + 2])
+            for i, seed in enumerate(("1", "2"))
+        ]
 
 
 def _releases(table: str, lp=None) -> list[tuple[float, str, int]]:

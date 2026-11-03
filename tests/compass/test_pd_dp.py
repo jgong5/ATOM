@@ -29,16 +29,15 @@ import pytest
 from test_dp_slice import DP_MACHINE, MAX_TOKENS, Requests
 from test_kv_remote_prefill import Script, connector
 from test_kv_simulated_connector import PEAKS, geometry, model_for  # noqa: F401
-from test_multinode_dp import _bound
 from test_pd_slice import NEEDS_A_PD_RUN, PD, PORTS, PdTraffic, publish_pd_entries
 from test_vertical_slice import CONSTANT, MODEL, TREE, WALL_S, _run_file
 
 from atom.compass import run as compass_run
 from atom.compass.clock import NER, ClockAbort, LpId, prefill_decode_table
 from atom.compass.detect.scenario import check_run
-from atom.compass.drive.serve import _free_ports
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.utils.clock import LPRuntime
+from tests.compass.held_ports import held_ports
 
 DP = 2
 SERVER_ARGS = "-tp 2 --enable-dp-attention --enforce-eager --max-model-len 2048"
@@ -75,60 +74,60 @@ def run_pd_dp(out: Path, seed: str, form: str, sides=None) -> dict:
     out.mkdir()
     # Each side's DP master port too, or a second run on this host network
     # finds pd_sim.sh's default taken. The write requests take p * d ports
-    # from KV_WRITE_REQ_PORT, which may reach another drawn port or one
-    # another process holds: draw all of them again then.
-    kv, names = "KV_WRITE_REQ_PORT", (*PORTS, "PREFILL_DP_PORT", "DECODE_DP_PORT")
-    while True:
-        ports = dict(zip(names, _free_ports(len(names))))
-        block = range(ports[kv], ports[kv] + p * d)
-        others = {port for n, port in ports.items() if n != kv}
-        if not others & set(block) and all(map(_bound, block)):
-            break
-    run_file = _run_file(
-        out,
-        clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
-        **widths,
-        step_stub=CONSTANT,
-        machine=DP_MACHINE,
-        **PD,
-    )
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=seed,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
-        MODEL=MODEL,
-        **flags,
-        **cell,
-        **{name: str(port) for name, port in ports.items()},
-    )
-    publish_pd_entries(out / "store", DP_MACHINE, env)
-    log = out / "pd_sim.log"
-    with open(log, "w") as f:
-        sim = subprocess.Popen(
-            ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+    # from KV_WRITE_REQ_PORT, held with the rest.
+    names = (*PORTS, "PREFILL_DP_PORT", "DECODE_DP_PORT")
+    kv = names.index("KV_WRITE_REQ_PORT")
+    with held_ports(len(names), lambda q: range(q[kv] + 1, q[kv] + p * d)) as drawn:
+        ports = dict(zip(names, drawn))
+        run_file = _run_file(
+            out,
+            clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
+            **widths,
+            step_stub=CONSTANT,
+            machine=DP_MACHINE,
+            **PD,
         )
-    watchdog = threading.Timer(WALL_S, os.killpg, (sim.pid, signal.SIGKILL))
-    watchdog.start()
-    try:
-        deadline = time.monotonic() + WALL_S
-        while "pd_sim: ready" not in log.read_text():
-            assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
-            assert time.monotonic() < deadline, f"no router in {WALL_S} wall seconds"
-            time.sleep(0.5)
-        traffic = requests(json.loads(run_file.read_text()), ports["ROUTER_PORT"], sim)
-        traffic.run()
-        code = sim.wait(timeout=120)
-    finally:
-        watchdog.cancel()
-        if sim.poll() is None:
-            os.killpg(sim.pid, signal.SIGKILL)
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
+            MODEL=MODEL,
+            **flags,
+            **cell,
+            **{name: str(port) for name, port in ports.items()},
+        )
+        publish_pd_entries(out / "store", DP_MACHINE, env)
+        log = out / "pd_sim.log"
+        with open(log, "w") as f:
+            sim = subprocess.Popen(
+                ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        watchdog = threading.Timer(WALL_S, os.killpg, (sim.pid, signal.SIGKILL))
+        watchdog.start()
+        try:
+            deadline = time.monotonic() + WALL_S
+            while "pd_sim: ready" not in log.read_text():
+                assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
+                assert (
+                    time.monotonic() < deadline
+                ), f"no router in {WALL_S} wall seconds"
+                time.sleep(0.5)
+            traffic = requests(
+                json.loads(run_file.read_text()), ports["ROUTER_PORT"], sim
+            )
+            traffic.run()
+            code = sim.wait(timeout=120)
+        finally:
+            watchdog.cancel()
+            if sim.poll() is None:
+                os.killpg(sim.pid, signal.SIGKILL)
     assert code == 0, f"pd_sim.sh exited {code}:\n{log.read_text()[-4000:]}"
     return {
         "out": out,

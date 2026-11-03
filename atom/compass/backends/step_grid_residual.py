@@ -49,6 +49,10 @@ A residual is a mapping, as a bundle holds it, of one or more kinds:
               "intercept": z_0, "coefficients": {<feature>: z_f, ...}}
            | {"form": "band", "values": {<band>: factor, ...}}
 
+Under a drafter a bundle holds a second residual of this form, fitted on the
+drafter's value with each kind's features; `Residual(mapping, drafter=True)`
+reads it, and its refusals name the drafter residual.
+
 A step of a kind the residual does not hold is refused, naming the kind; every
 other step is answered by its kind's members alone. A linear member outputs its
 transform of z_0 + Sum z_f.feature_f, naming every feature of its kind. A band
@@ -90,14 +94,14 @@ lowest median absolute relative error on the held-out triples is selected with
 weight 1, a held-out triple in a band the fit holds no factor for counting as
 an error of 1; the hull is that of its kept views' features, and `held_out`
 that of the held-out views' coordinates, absent when they span none (too few
-or flat in their varying axes). The report gives,
-per kind, the held-out triples' indices and, per member, the kept and dropped
-counts, the centre and scaled MAD of the relative residuals, the condition
-number of the column-scaled design, the zeroed features or bands and the
-held-out error. A fit holding a triple of no kind, or whose lookup or measured
-time is not positive and finite, is refused; so is one where a kind's triples
-hold out none or leave no more than one per coefficient, or its kept views span
-no hull, naming the kind.
+or flat in their varying axes). The report gives, per kind, the held-out
+triples' indices, the selected member's dropped ones and, per member, the
+kept and dropped counts, the centre and scaled MAD of the relative residuals
+of those kept and dropped, the condition number of the column-scaled design,
+the zeroed features or bands and the held-out error. A fit holding a triple of
+no kind, or whose lookup or measured time is not positive and finite, is
+refused; so is one where a kind's triples hold out none or leave no more than
+one per coefficient, or its kept views span no hull, naming the kind.
 """
 
 from __future__ import annotations
@@ -287,17 +291,17 @@ def _bad(value: float) -> bool:
 
 class _Kind:
     """One kind's selected members, their weights, and the hull they were
-    fitted on."""
+    fitted on; `owner` names the residual in a refusal."""
 
-    def __init__(self, kind: str, fitted: Mapping) -> None:
-        self.kind, self.names = kind, RECIPE.names[kind]
-        self.hull = Hull(f"the residual's {kind} hull", self.names, fitted["hull"])
+    def __init__(self, kind: str, fitted: Mapping, owner: str) -> None:
+        self.kind, self.names, self.owner = kind, RECIPE.names[kind], owner
+        self.hull = Hull(f"{owner}'s {kind} hull", self.names, fitted["hull"])
         held = fitted.get("held_out")
         self.held_out = held and Hull(
-            f"the residual's {kind} held-out hull", axes(kind), held
+            f"{owner}'s {kind} held-out hull", axes(kind), held
         )
         if not fitted["selected"]:
-            raise ValueError(f"the residual selects no {kind} member")
+            raise ValueError(f"{owner} selects no {kind} member")
         self.members = []
         for name, weight in fitted["selected"].items():
             try:
@@ -311,7 +315,7 @@ class _Kind:
                 form = FORMS[member["form"]](member, self.names)
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError(
-                    f"the residual's {kind} member {name} does not load: "
+                    f"{owner}'s {kind} member {name} does not load: "
                     f"{type(error).__name__}: {error}"
                 ) from error
             self.members.append((name, float(weight), form))
@@ -320,19 +324,19 @@ class _Kind:
         x = tuple(float(v) for v in RECIPE(self.kind, view.requests))
         past = ""
         if not self.hull.contains(x):
-            past = f"{self.hull.excess(x):.3g} past the residual's {self.kind} hull"
+            past = f"{self.hull.excess(x):.3g} past {self.owner}'s {self.kind} hull"
         outputs = []
         for name, weight, member in self.members:
             try:
                 output = member(view, x)
             except LookupError as error:
                 raise _refused(
-                    view, f"the residual's {self.kind} member {name} has {error}"
+                    view, f"{self.owner}'s {self.kind} member {name} has {error}"
                 )
             if _bad(output):
                 raise _refused(
                     view,
-                    f"the residual's {self.kind} member {name} gives {output!r}, "
+                    f"{self.owner}'s {self.kind} member {name} gives {output!r}, "
                     "which is not a positive finite factor",
                 )
             outputs.append((name, weight, output))
@@ -340,7 +344,7 @@ class _Kind:
         if _bad(factor):
             raise _refused(
                 view,
-                f"the residual's {self.kind} factor is {factor!r}, which is not a "
+                f"{self.owner}'s {self.kind} factor is {factor!r}, which is not a "
                 "positive finite factor",
             )
         summed = " + ".join(f"{w!r} x {name} {out!r}" for name, w, out in outputs)
@@ -348,24 +352,26 @@ class _Kind:
 
 
 class Residual:
-    """Each fitted kind's selected members, their weights, and its hull."""
+    """Each fitted kind's selected members, their weights, and its hull; with
+    `drafter`, a drafter's value's, which a refusal names."""
 
-    def __init__(self, residual: Mapping) -> None:
+    def __init__(self, residual: Mapping, drafter: bool = False) -> None:
+        self.owner = owner = "the drafter residual" if drafter else "the residual"
         fitted = residual["recipe"]
         theirs = (fitted["name"], fitted["version"], fitted["digest"])
         ours = (RECIPE.name, RECIPE.version, RECIPE.digest)
         if theirs != ours:
             raise ValueError(
-                "the residual was fitted under recipe {} v{} digest {}, and this "
+                f"{owner} was fitted under recipe {{}} v{{}} digest {{}}, and this "
                 "code's is {} v{} digest {}".format(*theirs, *ours)
             )
         kinds = residual["kinds"]
         if not kinds or not set(kinds) <= set(RECIPE.names):
             raise ValueError(
-                f"the residual fits the kinds {sorted(kinds)}, and the grid's "
+                f"{owner} fits the kinds {sorted(kinds)}, and the grid's "
                 f"are one or more of {list(RECIPE.names)}"
             )
-        self.kinds = {k: _Kind(k, kinds[k]) for k in RECIPE.names if k in kinds}
+        self.kinds = {k: _Kind(k, kinds[k], owner) for k in RECIPE.names if k in kinds}
 
     def factor(self, view: BatchView) -> tuple[float, str, str]:
         """The factor for this batch's rows under its kind's fit, how it was
@@ -375,7 +381,7 @@ class Residual:
         except ValueError as error:
             raise _refused(view, str(error)) from None
         if k not in self.kinds:
-            raise _refused(view, f"the residual fits no {k} step")
+            raise _refused(view, f"{self.owner} fits no {k} step")
         return self.kinds[k].factor(view)
 
     def validated(self, view: BatchView, at: Sequence[Fraction]) -> bool:
@@ -480,6 +486,7 @@ def _fit(
             "held_out_error": float(np.median(error)),
         }
     best = min(members, key=lambda t: report["members"][t]["held_out_error"])
+    report["dropped"] = dev[~solved[best]["keep"]].tolist()
     kept = x[dev[solved[best]["keep"]], 1:]
     try:
         hull = _span(kept, names)
@@ -525,6 +532,7 @@ def fit(
             kinds[k], report[k] = _fit(k, [triples[i] for i in own], seed)
         except ValueError as error:
             raise ValueError(f"the {k} fit: {error}") from error
-        report[k]["held_out"] = [own[i] for i in report[k]["held_out"]]
+        for part in ("held_out", "dropped"):
+            report[k][part] = [own[i] for i in report[k][part]]
     recipe = {"name": RECIPE.name, "version": RECIPE.version, "digest": RECIPE.digest}
     return {"recipe": recipe, "kinds": kinds}, report

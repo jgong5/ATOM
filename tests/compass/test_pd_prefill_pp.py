@@ -45,13 +45,13 @@ from atom.compass.backends import KvGeometry
 from atom.compass.clock import LpId, prefill_decode_table
 from atom.compass.detect.determinism import StepTable
 from atom.compass.detect.scenario import check_run, pipeline_timeline
-from atom.compass.drive.serve import _free_ports
 from atom.compass.kv import Scope, TransferModel
 from atom.compass.runner.pp_send import StageSends
 from atom.compass.spec import MachineSpec
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.models.utils import get_pp_indices
 from atom.utils.clock import LPRuntime
+from tests.compass.held_ports import held_ports
 
 KV = "engine-D->engine-P-pp0:kv_write_req"
 
@@ -229,55 +229,63 @@ def test_a_request_prefilled_at_another_pipeline_width_is_refused_by_name(
 def run_pd_pp(out: Path, seed: str, pp: int) -> dict:
     """One run under `pd_sim.sh` with a prefill side of `pp` stages."""
     out.mkdir()
-    ports = dict(zip(PORTS, _free_ports(len(PORTS))))
-    more = {compass_run.PREFILL_PP: pp} if pp > 1 else {}
-    run_file = _run_file(
-        out,
-        clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
-        step_stub=CONSTANT,
-        machine=DP_MACHINE,
-        **PD,
-        **more,
-    )
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=seed,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        MODEL=MODEL,
-        PREFILL_ARGS=f"-pp {pp}" if pp > 1 else "",
-        **{name: str(port) for name, port in ports.items()},
-    )
-    publish_pd_entries(out / "store", DP_MACHINE, env)
-    log = out / "pd_sim.log"
-    with open(log, "w") as f:
-        sim = subprocess.Popen(
-            ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+    with held_ports(len(PORTS)) as drawn:
+        ports = dict(zip(PORTS, drawn))
+        more = {compass_run.PREFILL_PP: pp} if pp > 1 else {}
+        run_file = _run_file(
+            out,
+            clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
+            step_stub=CONSTANT,
+            machine=DP_MACHINE,
+            **PD,
+            **more,
         )
-    watchdog = threading.Timer(WALL_S, os.killpg, (sim.pid, signal.SIGKILL))
-    watchdog.start()
-    try:
-        deadline = time.monotonic() + WALL_S
-        while "pd_sim: ready" not in log.read_text():
-            assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
-            assert time.monotonic() < deadline, f"no router in {WALL_S} wall seconds"
-            time.sleep(0.5)
-        run = json.loads(run_file.read_text())
-        traffic = PdTraffic(run, ports["ROUTER_PORT"], sim, ports["PREFILL_PORT"])
-        traffic.run()
-        code = sim.wait(timeout=120)
-    finally:
-        watchdog.cancel()
-        if sim.poll() is None:
-            os.killpg(sim.pid, signal.SIGKILL)
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            MODEL=MODEL,
+            PREFILL_ARGS=f"-pp {pp}" if pp > 1 else "",
+            **{name: str(port) for name, port in ports.items()},
+        )
+        publish_pd_entries(out / "store", DP_MACHINE, env)
+        log = out / "pd_sim.log"
+        with open(log, "w") as f:
+            sim = subprocess.Popen(
+                ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        watchdog = threading.Timer(WALL_S, os.killpg, (sim.pid, signal.SIGKILL))
+        watchdog.start()
+        try:
+            deadline = time.monotonic() + WALL_S
+            while "pd_sim: ready" not in log.read_text():
+                assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
+                assert (
+                    time.monotonic() < deadline
+                ), f"no router in {WALL_S} wall seconds"
+                time.sleep(0.5)
+            run = json.loads(run_file.read_text())
+            traffic = PdTraffic(run, ports["ROUTER_PORT"], sim, ports["PREFILL_PORT"])
+            traffic.run()
+            code = sim.wait(timeout=120)
+        finally:
+            watchdog.cancel()
+            if sim.poll() is None:
+                os.killpg(sim.pid, signal.SIGKILL)
     assert code == 0, f"pd_sim.sh exited {code}:\n{log.read_text()[-4000:]}"
     table = (out / compass_run.STEP_TABLE_FILE).read_text()
-    return {"out": out, "run": run, "table": table, "events": traffic.events}
+    return {
+        "out": out,
+        "run": run,
+        "table": table,
+        "events": traffic.events,
+    }
 
 
 @pytest.fixture(scope="module", params=[1, 2], ids=["pp1", "pp2"])
@@ -295,12 +303,13 @@ def test_a_prefill_pipeline_meets_every_scenario_check(pipeline):
     assert not failed, "\n".join(failed)
 
 
-def _write_end(run: dict, a: float, prompt_tokens: int, pp: int) -> list[float]:
+def _write_end(ran: dict, a: float, prompt_tokens: int, pp: int) -> list[float]:
     """Each prefill stage's write-done of a request whose write request arrives
-    at `a`, by hand: its first write on its link, one block per 16 tokens."""
+    at `a` in the run `ran`, by hand: its first write on its link, one block
+    per 16 tokens."""
     from transformers import AutoConfig
 
-    hf = AutoConfig.from_pretrained(MODEL)
+    hf, run = AutoConfig.from_pretrained(MODEL), ran["run"]
     blocks, spec, ends = (
         -(-prompt_tokens // 16),
         MachineSpec.from_mapping(run["machine"]),
@@ -311,7 +320,7 @@ def _write_end(run: dict, a: float, prompt_tokens: int, pp: int) -> list[float]:
         block = KvGeometry.from_hf_config(
             hf, block_size=16, layer_range=span, kv_dtype="bf16"
         )
-        m = TransferModel.from_spec(spec, block, Scope(run["kv_link"]))
+        m = TransferModel.from_spec(spec, block.bytes_per_block, Scope(run["kv_link"]))
         moved = blocks * block.bytes_per_block / m.bandwidth_bytes_per_s
         ends.append(a + m.setup_s + m.latency_s + moved)
     return ends
@@ -331,7 +340,7 @@ def test_the_write_ends_where_both_ends_compute_it(pipeline):
     (usage,) = [
         json.loads(e[6:])["usage"] for _, e in runs[0]["events"] if '"usage"' in e
     ]
-    c = max(_write_end(runs[0]["run"], a, usage["prompt_tokens"], pp))
+    c = max(_write_end(runs[0], a, usage["prompt_tokens"], pp))
     ready, done = c + L, c + (2 * L if pp > 1 else 0.0)
 
     def polls(lp, start, until):

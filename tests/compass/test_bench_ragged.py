@@ -73,3 +73,38 @@ def test_a_view_past_the_kv_pool_is_not_composed():
 def test_a_ratio_the_contexts_cannot_reach_gives_no_view(contexts):
     views = compose(contexts=contexts)
     assert [max(c for _, c, _ in v["rows"]) for v in views] == [1000]
+
+
+LADDER = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48]
+
+
+def composed(seed, ladder=()):
+    return ragged.compose(seed, CONTEXTS, random.Random(7), 10**6, 16, 20_000, ladder)
+
+
+def test_a_seed_is_composed_across_its_rungs_row_range_keeping_its_sum():
+    """A rung-32 seed of 20 rows composes its own views first, as with no
+    ladder, then the same at 17 rows and at 32, the fewest and most rung 32
+    replays; a rung-8 seed, its rung replaying 8 rows alone, at its own."""
+    seed = {**SEED, "rows": SEED["rows"] * 2 + SEED["rows"][:4], "rung": 32}
+    total = sum(c for _, c, _ in seed["rows"])
+
+    views = composed(seed, LADDER)
+
+    each = 1 + 2 * (len(ragged.RATIOS) - 1)
+    assert views[:each] == composed(seed)
+    assert [len(v["rows"]) for v in views] == [20] * each + [17] * each + [32] * each
+    for view in views:
+        assert view["rung"] == 32
+        assert abs(sum(c for _, c, _ in view["rows"]) - total) <= len(view["rows"])
+    assert composed(SEED, LADDER) == composed(SEED)
+
+
+def test_a_ladder_whose_first_rung_is_above_1_composes_no_view_of_one_row():
+    """Rung 4 of a ladder [4, 8] replays 1 to 4 rows, and a view of one row has
+    no longest row beyond its mean: the fewest rows composed is 2."""
+    seed = {**SEED, "rows": SEED["rows"][:3], "rung": 4}
+
+    views = composed(seed, [4, 8])
+
+    assert {len(v["rows"]) for v in views} == {2, 3, 4}

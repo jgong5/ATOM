@@ -23,7 +23,7 @@ import atom.utils.distributed.utils as dist_utils
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
-from atom.utils import get_open_port
+from tests.compass.held_ports import held_ports
 
 DP = 8
 LADDER = np.array([1, 2, 4, 8], dtype=np.int32)
@@ -76,8 +76,6 @@ def group(monkeypatch):
     )
 
     def run(batches):
-        port = get_open_port()
-
         def on_rank(rank):
             backend = Recording()
             r = runner(backend, dp_size=DP, dp_rank=rank)
@@ -92,7 +90,7 @@ def group(monkeypatch):
                     local.group
                 )
 
-        with ThreadPoolExecutor(DP) as pool:
+        with held_ports(1) as [port], ThreadPoolExecutor(DP) as pool:
             return list(pool.map(on_rank, range(DP)))
 
     return run

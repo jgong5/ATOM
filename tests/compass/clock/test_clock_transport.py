@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""`atom.compass.clock_transport`: the serve loop, held replies, refusals and the wire.
+"""`atom.compass.clock_transport`: the serve side, held replies, refusals and the wire.
 
 Every LP here talks to a real `ClockAuthority` through `connect`, the way
 `LPRuntime` does: ``send((kind, t, log, t_daemon))`` with ``(channel, seq,
@@ -57,7 +57,7 @@ def _table():
 
 
 class _Recorded(ClockAuthority):
-    """Records every request the serve loop hands the rule."""
+    """Records every request the serve side hands the rule."""
 
     def __init__(self, channels):
         super().__init__(channels)
@@ -94,8 +94,8 @@ def _later(fn, *args):
     return box
 
 
-def _result(box):
-    ok, value = box.get(timeout=WAIT_S)
+def _result(box, timeout=WAIT_S):
+    ok, value = box.get(timeout=timeout)
     if not ok:
         raise value
     return value

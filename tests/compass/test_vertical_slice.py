@@ -19,11 +19,11 @@ import http.client
 import json
 import math
 import os
-import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -40,9 +40,9 @@ from atom.compass.clock_transport import connect
 from atom.compass.detect.determinism import CONFIGURATION_PREFIX
 from atom.compass.detect.scenario import check_run
 from atom.compass.drive import run as drive_run
-from atom.compass.drive.serve import _free_ports
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
+from tests.compass.held_ports import held_ports
 
 MODEL = os.environ.get("ATOM_COMPASS_SLICE_MODEL")
 NEEDS_A_RUN = pytest.mark.skipif(
@@ -64,12 +64,6 @@ CONSTANT = dataclasses.asdict(Coefficients.constant(2.0**-9, 2.0**-11))
 
 class UnansweredRequests(AssertionError):
     """The run finished with requests that never had their final response."""
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _retry(what, server, attempt):
@@ -206,8 +200,11 @@ class Traffic:
 
 
 def _run_file(out: Path, **overrides) -> Path:
+    """`out`'s run file with `overrides`. Its default clock endpoint is
+    in-process and takes no port; a run whose authority another process serves
+    names one on a held port."""
     run = {
-        "clock_endpoint": f"tcp://127.0.0.1:{_free_port()}",
+        "clock_endpoint": f"inproc:{uuid.uuid4().hex}",
         "bound_s": 600.0,
         "admission_path": "serving",
         "ipc_s": 2.0**-14,
@@ -235,39 +232,39 @@ def publish_entry(store, machine, argv, env) -> None:
 def run_slice(out: Path, seed: str) -> dict:
     """One run in its own process tree; its step table, summary and request times."""
     out.mkdir()
-    clock_port, port = _free_ports(2)
-    endpoint = f"tcp://127.0.0.1:{clock_port}"
-    run_file = _run_file(out, clock_endpoint=endpoint, step_stub=CONSTANT)
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=seed,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
-    )
-    args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
-    args += ["--enforce-eager", "--max-model-len", "2048"]
-    publish_entry(out / "store", DOCUMENT, args, env)
-    with open(out / "server.log", "w") as log:
-        server = subprocess.Popen(
-            [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
-            + ["--compass-run", str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
+    with held_ports(2) as (clock_port, port):
+        endpoint = f"tcp://127.0.0.1:{clock_port}"
+        run_file = _run_file(out, clock_endpoint=endpoint, step_stub=CONSTANT)
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
         )
-        # A run that hangs ends here: the clock's socket closes with the server.
-        watchdog = threading.Timer(WALL_S, server.kill)
-        watchdog.start()
-        try:
-            traffic = Traffic(json.loads(run_file.read_text()), port, server)
-            traffic.run()
-            code = server.wait(timeout=120)
-        finally:
-            watchdog.cancel()
-            if server.poll() is None:
-                server.kill()
+        args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
+        args += ["--enforce-eager", "--max-model-len", "2048"]
+        publish_entry(out / "store", DOCUMENT, args, env)
+        with open(out / "server.log", "w") as log:
+            server = subprocess.Popen(
+                [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
+                + ["--compass-run", str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            # A run that hangs ends here: the clock's socket closes with the server.
+            watchdog = threading.Timer(WALL_S, server.kill)
+            watchdog.start()
+            try:
+                traffic = Traffic(json.loads(run_file.read_text()), port, server)
+                traffic.run()
+                code = server.wait(timeout=120)
+            finally:
+                watchdog.cancel()
+                if server.poll() is None:
+                    server.kill()
     tail = (out / "server.log").read_text()[-4000:]
     assert code == 0, f"the server exited {code} after the finish:\n{tail}"
     return {

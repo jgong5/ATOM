@@ -3,7 +3,7 @@
   "name": "mi308x-hjbog18",
   "provenance": {
     "authored_by": "compass agent for jgong5",
-    "date": "2026-10-25",
+    "date": "2026-10-27",
     "origin": "mixed",
     "origins": {
       "host.cpu.cores_physical": {
@@ -270,6 +270,23 @@
           "decode_fixed_s": 1.9340936708995337e-06,
           "decode_tokens_per_s": 4214493.0078329975
         }
+      },
+      "host.tokenizers[qwen3-0.6b fast]": {
+        "origin": "probed",
+        "model": "Qwen/Qwen3-0.6B",
+        "source_root": "commit:b77bf26488eb4575bf14336fe90dcf726eea59b5",
+        "p10": {
+          "encode_fixed_s": 1.4820614299433245e-05,
+          "encode_tokens_per_s": 512558.3010221457,
+          "decode_fixed_s": 2.202056857319637e-06,
+          "decode_tokens_per_s": 2852747.8111874303
+        },
+        "p90": {
+          "encode_fixed_s": 1.591785651179596e-05,
+          "encode_tokens_per_s": 527919.3835395373,
+          "decode_fixed_s": 2.27880140187805e-06,
+          "decode_tokens_per_s": 2880310.3514559
+        }
       }
     },
     "fragments": [
@@ -302,6 +319,20 @@
         "encode_tokens_per_s": 636817.1671289918,
         "decode_fixed_s": 1.8340489314873881e-06,
         "decode_tokens_per_s": 4156658.937770821,
+        "derate": 1.0
+      },
+      {
+        "id": "qwen3-0.6b",
+        "backend": "fast",
+        "vocab_size": 151669,
+        "fingerprint": "sha256:aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        "applies_to": [
+          "Qwen3ForCausalLM"
+        ],
+        "encode_fixed_s": 1.5276093569196534e-05,
+        "encode_tokens_per_s": 522881.8833086043,
+        "decode_fixed_s": 2.221973115389149e-06,
+        "decode_tokens_per_s": 2862934.7592104906,
         "derate": 1.0
       }
     ],

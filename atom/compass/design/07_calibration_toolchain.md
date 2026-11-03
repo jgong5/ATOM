@@ -41,6 +41,18 @@ D60 requires, and nothing else, so region terms and the op-level residual are re
 recorded by [#1868](https://github.com/jgong5/ATOM/issues/1868):** `measure ops` runs no
 forward (Phase 1b, D39).
 
+**Revised 2026-11-02 by the
+[design session on #2640](https://github.com/jgong5/ATOM/issues/2640#issuecomment-6568381628):**
+a constructed JIT sweep and a per-stack cache library warm a container before a graded
+run (D106).
+
+**Revised 2026-11-02 by the owner's
+[Ruling on #2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6579531822) and
+[Ruling on #2687](https://github.com/jgong5/ATOM/issues/2687#issuecomment-6591321600):**
+the sweep's ranks share one walk of the token counts, ATOM's PrefillDelayer coalesces each
+designed step with no blocker, and the sweep server differs from the cell's deployment
+only in pacing variables that select no kernel or shape (D106).
+
 **Depends on:** `04_model_capture_and_cost_ir.md` (what is traced and priced),
 `05_machine_spec_and_probes.md` (the machine artifact and its probes).
 
@@ -471,9 +483,9 @@ campaign and the one with the tightest acceptance gate behind it — KV block co
 refuses it until its readings match a real load's on Qwen3.8-27B TP1 on MI308X (T100).
 
 **A device never measured** has no engine to start. Developer tooling outside the CLI
-publishes an entry for its configuration, every reading marked assumed, as `16` marks every
-MI455 input; `run` reads it as any entry, and every term built on it is declared, its note
-naming the assumption.
+publishes an entry for its configuration, every reading marked assumed, as the frozen MI455
+projection's entry is (`16` S3c.5); `run` reads it as any entry, and every term built on it
+is declared, its note naming the assumption.
 
 **Why it is per width and not fitted across widths:** because it does not fit. The
 measured `non_torch` sequence is 926 / 6906 / 7266 / 10704 MiB at widths 1/2/4/8, and
@@ -576,8 +588,9 @@ without a scheduler: `model_runner.py::ModelRunner.dummy_execution` and
 - **Replayed by rule.** A batch arrives as a step-record line (`13` D80), its rows in
   order with their query and context tokens, and is rebuilt by a fixed, versioned rule:
   row order kept, each row's KV blocks contiguous from a fresh pool in row order, filler
-  tokens, a fresh state slot per row that keeps one. Each measurement records the rule's
-  version. Whether that reproduces the recorded step's forward context is T18.
+  tokens, and a row that keeps state the fresh state slots ATOM's block manager gives a
+  request: one, or 1 + K under a GDN model's drafter of K drafts without ReplaySSM. Each
+  measurement records the rule's version. Whether that reproduces the recorded step's forward context is T18.
 
 ```
   record, trace steps;              the step bench (GPU): EngineCore's
@@ -1033,7 +1046,7 @@ mismatch **refuses** (warn only under an explicit flag).
 | `op_measurement`, `price_list` | **X** | **X** | X | - *(shape-parametric)* | **X** | X | - | - |
 | `step_measurement`, `step_linear_law` | X | X | X | X | X | X | - | X |
 | step grid bundle (`17` D101) | X | X | X | X | X | X | - | X |
-| `host_laws` | - | - | **X** | **X** | - | - | **X** | **X** |
+| `host_laws` | X | X | **X** | **X** | X | - *(in the key only because the machine-spec digest is one hash)* | **X** | **X** |
 | `projection` | - *(analytical)* | X *(op_graph capture)* | X | X | - *(the spec is in its key)* | - | - | X |
 | `memory_readings` | **X** | X | X | X | **X** | X | - | **X** |
 | `machine_spec`: capacity | - | - | - | - | **X** | - | - | - |
@@ -1048,9 +1061,16 @@ Consequences worth noting:
 - PTL invalidates what the device does, except the capacity: it moves the clock, not the
   memory. `memory_readings` still refuse under another PTL state, because their key
   carries the machine-spec digest; a parity run re-measures them.
-- `host_laws` time the host, so the host CPU invalidates them and the device does not;
-  `step_measurement` and `step_linear_law` hold device time, so the host CPU does not invalidate
-  them.
+- `host_laws` time the host, so the host CPU invalidates them. The device and the
+  software stack invalidate them too, through the machine-spec digest in their key:
+  `W_launch` is time spent launching into the HIP runtime, and `W_post` and `L_mtp` wait
+  on a device-to-host copy. PTL does not: it moves the device clock, not host time, and
+  their key carries it only because the machine-spec digest is one hash. Torch
+  invalidates them through their row's fingerprint, not the digest, which leaves torch
+  out: `W_pre`, `W_launch` and `W_post` run through torch. A run does not yet check torch
+  for host laws ([#2475](https://github.com/jgong5/ATOM/issues/2475)).
+  `step_measurement` and `step_linear_law` hold device time, so the host CPU does not
+  invalidate them.
 - The memory readings depend on the **library build** as much as the silicon, which is
   why ROCm, AITER and RCCL invalidate them. The +5980 MiB appearing the moment width
   exceeds one is collective buffer sizing; the 926 MiB at TP1 is HIP context plus
@@ -1075,6 +1095,219 @@ So: every gate's state is written into the artifact and checked there.
 
 ---
 
+## D106. Warming a container: a constructed JIT sweep and a per-stack cache library
+
+Decided 2026-11-02 by the
+[design session on #2640](https://github.com/jgong5/ATOM/issues/2640#issuecomment-6568381628).
+Revised the same day by the owner's
+[Ruling on #2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6579531822)
+and [Ruling on #2687](https://github.com/jgong5/ATOM/issues/2687#issuecomment-6591321600),
+on [#2687's measurements](https://github.com/jgong5/ATOM/issues/2687#issuecomment-6581166120):
+the ranks share one walk of the token counts, ATOM's PrefillDelayer coalesces each
+designed step, and no point needs a blocker.
+
+### Problem
+
+A real record whose `run.json` names `aiter_jit_builds` is refused whole (`08` D52,
+[#1704's ruling](https://github.com/jgong5/ATOM/issues/1704#issuecomment-6405004644)), so
+a graded run must compile nothing its container could have compiled before it. Each JIT
+compiler in play (aiter's JIT modules, `compile_hsaco`, FlyDSL, Triton and Gluon,
+Inductor) caches by its own key, and a key mixes code identity with a runtime
+specialization: shapes, constexprs, argument divisibility by 16, pointer alignment,
+`None` arguments, dtypes, a tuned config a token count selects.
+
+A container was warmed by serving the workload until no record built
+(`scripts/compass/README.md`). Serving reaches the key space by sampling: the tail is
+reached rarely and never certainly, and under DP attention and TBO no client controls a
+rank's batch. DeepSeek-V4-Pro's prefill still built new keys at its eighth load
+([#2493](https://github.com/jgong5/ATOM/issues/2493),
+[#2634's reading](https://github.com/jgong5/ATOM/issues/2634#issuecomment-6560767690)):
+the FlyDSL A16W16 GEMM, keyed by the tuned config a forward's token count selects, whose
+uncompiled configs sit in narrow token-count windows, the Gluon `fp8_mqa_logits` and
+`_hash_topk`. A per-kernel list is no answer: models, kernels and images change faster
+than one.
+
+The first driver walked every count on every rank and queued each step's rows behind a
+blocker prefill. Its first round on #975's cell
+([#2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6577201027)) projected
+31 h a round, 78% of the prompt tokens blockers, and covered 292 of about 2,230 points
+sent: rank 0 covered 231 of 278, ranks 1 to 7 at most 38 each. The delayer's alignment
+gate held their prefills while rank 0 had none, so their rows joined the held requests'
+step.
+
+### Decision
+
+**Construct the inputs that select keys instead of sampling them, and keep what is
+compiled per stack, not per container.** The goal is to reach the JIT key space faster
+than serving samples it. A compile in a graded run still voids that run; the sweep
+changes when keys are compiled, not what a graded run may contain.
+
+**The driver.** A constructed client against the real server, and ATOM gains no hook
+point. The deployment is the cell's own: a changed deployment compiles another
+configuration's keys. Only pacing variables that select no kernel or shape may differ:
+they decide when a prefill fires and how much of a row a step admits, so every step they
+allow is one a graded run of the cell reaches. `compass record --sweep` starts the server
+with them, and `client.sh --sweep` checks the server has them before it sends anything.
+They are:
+
+| Variable | Value | Why |
+|---|---|---|
+| `ATOM_ENABLE_PREFILL_DELAYER` | `1` | the delayer coalesces a designed step (below) |
+| `ATOM_PREFILL_DELAYER_COST_GATE` | `0` | the cost gate releases an unaligned step when it judges the wait cannot pay off; off, only the stall releases one |
+| `ATOM_PREFILL_DELAYER_TARGET_FILL` | `1.0` | the fill goal then fires only when the prefilling ranks hold whole budgets, not on a step's first rows before its last arrives |
+| `ATOM_PREFILL_DELAYER_STALL_TICKS` | `16` | a step's rows arrived within 4 ticks in all of #2687's runs (below); a step fired early is a missing point, resent |
+| `ATOM_PREFILL_DECODE_INTERVAL` | `1`, at DP 1 and PP 1 only | at DP 1 `EngineCore.__init__` builds the delayer only when the interval is above 0 |
+| `ATOM_DP_PREFILL_BALANCE_MIN_TOKENS` | the cell's batched-token budget | DP prefill cost balancing would cut the designed rows (below) |
+
+**The balancing floor.** Under DP attention at more than one rank, the scheduler's DP
+prefill cost balancing (`Scheduler._balance_prefill_step`) sets each prefill step a cost
+target of min(costliest rank, 1.1 times the mean) and cuts a rank above it to the target,
+never below the floor of 4096 tokens (`Scheduler._prefill_room`). On #2687's probe it cut
+178 of 256 designed points, and a resend sends the same lengths, so the target cuts them
+again. With the floor at the budget, `_prefill_room` grants every rank its whole chunk.
+The floor decides only how much of a row a step admits, as the delayer's variables decide
+when it fires: every step it allows is one balanced ranks reach in a graded run, and the
+cost exchange stays on, so the delayer's reduce keeps its shape. The floor reaches
+`_prefill_room` only: admission still stops taking new rows once a rank's step cost
+reaches the target (the `_tick_cost < _tick_cost_limit` guard in `Scheduler`'s prefill
+admission), so a designed step puts its costly row last. Balancing's truncation of a
+fractional cost ([#2695](https://github.com/jgong5/ATOM/issues/2695)) is ATOM's to fix;
+the sweep does not need it.
+
+**Two segments.** The ranks share one walk: each token count runs once per container,
+its rank chosen by the count. The ranks write one set of cache roots, so one compile
+serves all of them, and a per-rank walk compiles nothing more.
+
+- **A: every prefill token count** from 1 to the batched-token budget, as
+  `ModelRunner.warmup_max_tokens` sizes it, one single-row request per count and no
+  parked decode, one count to each rank a round. A tuned config is selected by the token
+  count, and only a walk over every count reaches every config with certainty. Count t is
+  covered by any rank's prefill step of t tokens that TBO did not split, since a split
+  step runs its halves, not t. With no decode running the delayer fires for whichever
+  ranks have arrived and the rest follow a few steps later (`FIRE (nodecode)`): 1 to 3
+  prefill groups a round on #2687's probe.
+- **B: designed compositions**, because a token count does not select the alignment and
+  divisibility keys. Lockstep steps, one designed point per rank, over the full product
+  of:
+  - the second row's offset mod 16, from a first row of 1 to 16 tokens, for the
+    divisibility and pointer-alignment specializations;
+  - 1 to 16 held requests a rank, parked decodes the step's rows queue behind. State
+    slots come off a min-heap (`atom/model_engine/state_pool.py::StateSlotPool`), so the
+    requests held ahead of a probe decide which slot it takes, and the parked decodes keep
+    the delayer's alignment gate armed (below);
+  - TBO on or off where the engine enables TBO: on, one rank's rows reach
+    `ATOM_TBO_PREFILL_MIN_TOKENS` and every rank's step splits on a request boundary
+    (`atom/utils/tbo/ubatch_splitting.py`), which one row lacks;
+
+  plus chunked rows over query sizes and context levels, up to the workload's longest
+  context, for the keys a context or KV length selects. The context levels include the
+  cuts below the budget that balancing makes in a graded run, aligned as the scheduler
+  aligns a cut chunk (`Scheduler._chunk_alignment`, 256 tokens on #975's cell): with the
+  floor the sweep no longer makes those cut points itself. Where prefix caching is on, a
+  shared prefix and a second turn start a row at a cached offset too. A B point is
+  covered by its exact rows and its split.
+
+Every request asks for two output tokens: the second is its one decode step, so decode is
+reached and the request leaves a step later.
+
+**Coalescing, with no blocker.** The parked decodes keep the delayer's alignment gate
+armed: it holds while any rank lacks prefill, and when pending tokens stop growing for the
+stall it releases the step's rows together on every rank. On #2687's probe of #975's cell,
+with the variables above at stall 80, every designed step fired once on all eight ranks,
+80 ticks after its last row's admission, and 32 of 32 steps and 256 of 256 points ran
+right first time, TBO steps split. The stall comes from #2687's tick: a decode step with
+1 to 16 parked decodes a rank takes 23.8 ms median (p10 20.3, p90 36.6); a step's rows
+were all admitted, across the eight ranks, within 96 ms of the first send (median 43 ms),
+4 ticks; and the stall counter restarts whenever pending tokens grow, so it has to cover
+the largest gap between arrivals. 16 ticks is four times that spread, 0.38 s. Stall 16 is
+unmeasured: every run #2687 made, and every projection below, is at stall 80.
+
+**What a sweep costs**, from #2687's runs with the floor, at stall 80, on #975's cell
+(DP 8, budget 16,384): a server start of 1.5 min; A in 2,048 rounds of 1.75 s, 0.99 h; B
+in 64 steps of 8.9 s (5.8 s to park the decodes, 3.1 s for the point), 9.5 min. That is
+1.2 h before the chunked rows, which #2687 did not probe, against acceptance's 3 h.
+
+**Cells the delayer does not coalesce** run A only and are not marked swept: ATOM builds
+no delayer at PP above 1 (`EngineCore.__init__`) or under rapidserve
+(`EngineCore._init_prefill_delayer`), so nothing makes a designed step's rows one batch
+there (T105).
+
+**A PD cell's decode side is outside the sweep.** The sweep covers the prefill side, whose
+steps the client designs. The decode side and the KV connector path are warmed by one
+unscored short run of the cell and by the library, which that run's stop writes back to as
+any real server's does.
+
+**The axes come from the cell.** Each axis and its range is read from the cell's own
+engine (its budget, DP, TBO, prefix caching and drafter state) and workload (its longest
+context): a point outside them compiles a key its graded run never meets. Sampling
+arguments are copied from the workload, never varied, since they select the sampling path
+the graded run takes.
+
+**A cache library per stack.** Keyed by what a container can read of its stack: ROCm,
+aiter's commit, RCCL, torch, Triton, FlyDSL and the gfx arch, because an artifact is
+reusable only on the stack that compiled it, and each compiler's own key separates the
+rest. It lives at `<store>/jit`, under the artifact store's root (D41), because it must
+outlive the container whose caches it collects; `compass record` takes an optional
+`--store`, and a record given none behaves as before. A real server's start merges the
+library into the container's cache roots, the ones `atom/compass/drive/aiter_jit.py`
+reads, never overwriting a file the container has. Its stop writes back only finished
+artifacts, judged per compiler, each staged and renamed into place: a compiler writes one
+key as several files (an aiter module and its `.so`, a Triton directory and its `__grp__`
+json, a FlyDSL pkl and its lock), so a build the stop cut short would reach every later
+container as finished, and two servers stopping at once must leave the union. Each key is
+then compiled once per stack, not once per container.
+
+**Closed by coverage.** `client.sh --sweep` drives the sweep against a running server.
+Coverage is read from the step record after the server stops, a point covered when a line
+states its batch as its segment requires (above): the scheduler, not the client, decides
+what each rank ran, and the record states it. The coverage is kept in the library, per
+stack and cell, since a cell swept on one stack is unswept on the next. A later sweep of
+the cell sends only the points still missing, so the rounds converge instead of
+repeating. It resends them unchanged, since a point missed by an early fire needs only to
+be sent again and there is no blocker to lengthen, and three rounds at most, the bound
+acceptance sets. A cell is marked swept only when every point is covered.
+
+**Not swept: preemption and recompute, and error paths**, which the client cannot
+construct without changing the deployment, and a PD cell's decode side and KV connector
+path (above). A build there is a residual, recorded with the batch that compiled it, not
+a defect of the sweep; the record naming it is still refused (`08` D52) and taken again
+(T104).
+
+**Deferred: streaming the real record** to the client, so that one round reads its own
+coverage and closes its own loop before the stop (T103). Until then a round's missing
+points wait for the next round.
+
+**The estimate.** Read against #2634's keys, A's token-count walk alone covers about two
+thirds of them with certainty, the GEMM's included; B's designed compositions cover the
+alignment keys.
+
+**Acceptance**, on #975's DeepSeek-V4-Pro cell
+([#2650](https://github.com/jgong5/ATOM/issues/2650)), all of: a fresh container on an
+empty library sweeps the cell to swept within three rounds, compiling every key #2634
+names; two real records of #975's workload on its prefill side after it name no
+`aiter_jit_builds`, and a build that does appear is traced to the batch that compiled it
+and classed: in a path left unswept above it is recorded, on a swept axis it fails the
+acceptance; a second fresh container on the same stack returns from `--sweep` at once,
+and its record names no build; and the first criterion's rounds take 3 h or less in all,
+server starts included, the time #975's warm pass took. The fallback the Ruling on #2650
+set, a short burst plus the library if under 90% of B steps ran right first time or any
+were left after one resend, is not taken: with the floor every step ran right first time.
+
+**What stays.** `06` D27's *Warmup is not a protocol feature*: sweep traffic is
+ordinary requests to a server whose record nothing grades. Detection stays as well: the
+sweep stops warmth recurring on the axes it covers, and `08` D52's refusal and T54 catch
+what it leaves.
+
+### Open issues
+
+- T103: streaming the real record, deferred above.
+- T104: the unswept paths, preemption and recompute, error paths, and a PD cell's decode
+  side and KV connector path.
+- T105: cells the delayer does not coalesce, PP above 1 and rapidserve, run A only and
+  are not marked swept.
+
+---
+
 ## Decision log
 
 | # | Decision | Date |
@@ -1086,9 +1319,10 @@ So: every gate's state is written into the artifact and checked there.
 | D40 | Four classes of communication, priced separately. Scaling is measured per width, never modelled. A collective's measured duration is an upper bound on device work. Collectives are leaves, interpolated over message bytes, measured on a multi-rank op bench that starts every rank of the layout through ATOM's own group initialisation, takes a barrier before each timed replay and measures the union of all ranks' signatures; the step bench is not reused. | 2026-09-18; collectives as leaves 2026-10-18 (#1489) |
 | D41 | Artifacts, each with key, digest, fingerprint and provenance. Keys are tuples; source roots are `git archive` digests; a source root with uncommitted files does not publish; resolution names its answer; handed-off artifacts are immutable. `step_measurement`, `step_linear_law` and `host_laws` added, and `shape_population` keyed by its pricing backend. `memory_readings` from `measure memory`, keyed as `step_linear_law` is, or published with every reading assumed for a device never measured. `price_list` and `memory_readings` keyed by the parallel layout, not a scalar width. The region-term artifact retired; `op_measurement` added, one per `measure ops` point, keyed as `price_list` is plus the point; `op_graph` keyed by structure and shape. | 2026-09-18; kinds 2026-10-13 (#851); `memory_readings` 2026-10-14 (#851); parallel layout 2026-10-15 (#165, #537); region terms retired, `op_measurement`, `op_graph` per shape 2026-10-18 (#1489); a dirty tree publishes nothing 2026-10-25 (#168) |
 | D42 | Trace is JIT and cached; pricing is offline or opt-in `--measure`. A `--measure` run is never an acceptance run. A new shape is captured, and each leaf in it interpolated between same-kernel neighbours; anywhere else, and for a new operator kind, the leaf falls to its analytical law, counted, and refuses without one. | 2026-09-18; same-kernel interpolation 2026-10-18 (#1489) |
-| D43 | Per-artifact invalidation matrix, not a global fingerprint. Every gate's state is written into the artifact and checked there. Rows for `shape_population`, `step_measurement`, `step_linear_law` and `host_laws`, and a host-CPU axis. The region-term row retired; `op_measurement` on `price_list`'s row. | 2026-09-18; rows 2026-10-13 (#851); region-term row retired, `op_measurement` 2026-10-18 (#1489) |
+| D43 | Per-artifact invalidation matrix, not a global fingerprint. Every gate's state is written into the artifact and checked there. Rows for `shape_population`, `step_measurement`, `step_linear_law` and `host_laws`, and a host-CPU axis. The region-term row retired; `op_measurement` on `price_list`'s row. | 2026-09-18; rows 2026-10-13 (#851); region-term row retired, `op_measurement` 2026-10-18 (#1489); `host_laws` row gains the device, stack and PTL its machine-spec digest carries, and torch through its fingerprint, 2026-10-29 (#2484); PTL back to `-`, carried only because the digest is one hash, and a run does not yet check torch for host laws, 2026-10-30 (#2308, #2475) |
 | D38.1 | One recommended flow per half: steps (`measure memory`, `record`, `trace steps`, `measure steps` with the step grid's planner, `fit host` and `fit steps`, `run --coverage`, then grading outside the CLI), each server driven by a client started apart, and ops, after the steps half's `measure memory`, `record`, `trace steps` and `fit host` (`trace ops --population`, `measure ops --plan` over the record directories of `record` or `trace steps --out`, `fit ops` publishing a `price_list` only, then `run` and grading). Phases unchanged; the op bench, ATOM's runner preparing each point and running no forward, hosts 1b and the step bench 1c, Phase 2 is a plain startup `measure memory` runs. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); ops half 2026-10-18 (#1489); `measure ops --plan` reads record directories 2026-10-18 (#1527); op bench without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)) |
 | D40.1 | Classes (a) and p2p ride `measure ops` unchanged. Classes (b) and (c) share one new stated-entry-point benchmark inside the same multi-rank op bench, also run by `measure ops`. KV transfer is never priced. Collective prices are labelled upper bounds. | 2026-09-19; one command 2026-10-13 (#851); the multi-rank op bench 2026-10-18 (#1489) |
+| D106 | A container is warmed for a graded run by a constructed JIT sweep and a per-stack cache library; a compile in a graded run still voids it. A client against the cell's own deployment, no ATOM hook point; only pacing variables that select no kernel or shape differ, set by `compass record --sweep` and checked by `client.sh --sweep`: `ATOM_ENABLE_PREFILL_DELAYER=1`, `ATOM_PREFILL_DELAYER_COST_GATE=0`, `ATOM_PREFILL_DELAYER_TARGET_FILL=1.0`, `ATOM_PREFILL_DELAYER_STALL_TICKS=16`, `ATOM_PREFILL_DECODE_INTERVAL=1` at DP 1 and PP 1, and `ATOM_DP_PREFILL_BALANCE_MIN_TOKENS` at the batched-token budget, so balancing cuts no designed row. The ranks share one walk, each count once per container on a rank the count chooses. A: one single-row request per prefill token count from 1 to the budget, no parked decode, covered by any rank's step of that count TBO did not split. B: lockstep steps, a designed point per rank, the product of the second row's offset mod 16, 1 to 16 parked decodes and TBO on or off, plus chunked rows over query sizes and context levels, balancing's aligned cuts below the budget included, the costly row last; covered by exact rows and split. Parked decodes keep the PrefillDelayer's alignment gate armed, so a step's rows release together; no blocker. Two output tokens a request; axes and ranges from the cell's engine and workload, sampling arguments copied. Missing points resent unchanged, three rounds at most. PP above 1 and rapidserve run A only, not marked swept; a PD cell's decode side and KV connector path are warmed by one unscored run and the library. One library per stack (ROCm, aiter's commit, RCCL, torch, Triton, FlyDSL, gfx arch) at `<store>/jit`, `compass record --store` optional, merged in at a real server's start and written back at its stop, finished artifacts only, per compiler, atomically. Coverage is read from the step record after the stop and kept in the library per stack and cell; a cell is swept only when all its points are covered. Preemption, recompute and error paths are not swept: a build there is recorded, not a defect. Streaming the real record is deferred. | 2026-11-02 ([#2640](https://github.com/jgong5/ATOM/issues/2640#issuecomment-6568381628)); shared walk, delayer coalescing, pacing variables 2026-11-02 ([#2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6579531822)); balancing floor, stall 16 2026-11-02 ([#2687](https://github.com/jgong5/ATOM/issues/2687#issuecomment-6591321600)) |
 
 ---
 
@@ -1107,3 +1341,6 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T21 | Establish whether Phase 1c transfers across width (the TP2 test run) | it is the recipe's one unproven assumption |
 | ~~T22~~ | ~~Analytical laws as their own design topic~~ — **done**, now `10` | — |
 | T100 | Compare `measure memory`'s readings under ATOM's `--load_dummy` with a real load's on Qwen3.8-27B TP1 on MI308X; until they match, `measure memory` refuses `--load_dummy` (D38, Phase 2) | needs `measure memory` built |
+| T103 | Stream the real record to the JIT sweep's client, so one round reads its own coverage and sends its missing points before the stop (D106) | deferred by #2640's design session; coverage is read after the stop meanwhile, and missing points are resent unchanged in the next round, three rounds at most |
+| T104 | The paths the JIT sweep does not construct: preemption and recompute, error paths, and a PD cell's decode side and KV connector path, which one unscored run and the library warm. A build there is recorded with its batch, not a defect, and the record naming it is refused and taken again (D106) | the client cannot reach the first two without changing the deployment, and designs only the prefill side's steps |
+| T105 | Sweep B on cells the PrefillDelayer does not coalesce: PP above 1 and rapidserve run A only and are not marked swept (D106) | ATOM builds no delayer there, so nothing makes a designed step's rows one batch |

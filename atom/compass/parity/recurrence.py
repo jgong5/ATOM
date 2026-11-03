@@ -11,7 +11,8 @@ less the draft copy wait; with
 `d_target_ns`, under MTP, the target runs to `forward_done_event`, with
 `d_draft_kv_ns` on an output forward, the rest of `d_busy_ns` is draft, `W_inputs` is the part of
 `W_pre` after the MTP status wait, `L_mtp` is `step_labels.mtp_copy`'s time,
-and no `d_gap_ns` is fed. Each forward is called at the
+and a decode's `d_gap_ns` is the work queued ahead of its launch
+(`check`). Each forward is called at the
 exit predicted for the one before, so only the waits and device times move it.
 A pipeline record is gated step by step, each stage charged with the predicted
 times of the others (`pipeline`), its sends priced on a machine spec's PP
@@ -31,8 +32,8 @@ after it, reported apart:
 
     python -m atom.compass.parity.recurrence RECORD_DIR --law LAW_JSON
 
-Per kind (decode, output prefill, middle chunk, and idle: sharing no request
-with the forward before), p10 and p90 of charge over measured exit-to-exit
+Per kind (decode, output prefill, middle chunk, and idle: after an idle engine,
+`step_labels.busy_gaps`), p10 and p90 of charge over measured exit-to-exit
 period, less one, in percent, lie within `STEP_BAND`, the run total within
 `TOTAL_BAND`. Each percentile is a step's own value, the one on the outer side
 where it would fall between two, so a kind of ten steps or fewer passes only
@@ -61,6 +62,7 @@ from atom.compass.backends.shape import sum_tokens
 from atom.compass.backends.step_linear_fit import WARM_FACTOR
 from atom.compass.parity import ARRIVALS, read
 from atom.compass.runner.overrides import (
+    ADMISSION_IN_E,
     FORWARD_KINDS,
     MTP_COPY,
     HostDeviceRecurrence,
@@ -81,11 +83,10 @@ META = [("gloo", 8), ("gloo", 179)]
 IDLE_FLUSH_S = 0.1
 
 
-def _kind(step, prev) -> str:
-    # ponytail: a DP dummy shares no request, so it and the forward after it
-    # count as idle; split them out once a DP record is gated.
-    held = {r[0] for r in prev["batch"]} if prev else set()
-    if not held & {r[0] for r in step["batch"]}:
+def _kind(step, busy: bool) -> str:
+    """A step's kind; `busy`, whether the engine was busy in the gap before it."""
+    # ponytail: a DP dummy counts as idle; split it out once a DP record is gated.
+    if step.get("is_dummy_run") or not busy:
         return "idle"
     if not step["produces_output"]:
         return "middle"
@@ -135,9 +136,10 @@ def pipeline(stages: list[list[dict]], carriers=None) -> list[dict]:
 def check(steps: list[dict]) -> dict:
     """One DP rank's steps charged on their measured inputs: the gate's report.
 
-    Under MTP a decode is fed no `d_gap_ns`: the device work its prepare
-    queues ahead of its launch is not charged, so a launch that finds the
-    device busy starts its device early by that work."""
+    Under MTP a decode's `d_gap_ns` is the device work its prepare queues
+    ahead of its launch, its `compass_queued_s`: its device starts where the
+    record measured it. An idle launch's gap also holds the device idle,
+    which the prepare end covers, and the first command's dispatch."""
     *_, report = _charged(steps, None, None, None)
     return report
 
@@ -166,6 +168,7 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
     mtp = any("d_target_ns" in s for s in steps)
     copy = step_labels.mtp_copy(steps) if mtp else {}
     rec = HostDeviceRecurrence({}, (), lambda: now, stage, mtp=mtp)
+    kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
     for n, s in enumerate(steps):
         if "d_busy_ns" not in s:
             raise ValueError(f"step {s['step']} has no device window to charge")
@@ -221,7 +224,8 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
         batch.compass_pp_host = (called, sent)
         batch.total_seqs_num_prefill = sum(not d for *_, d in s["rows"])
         batch.produces_output = lambda out=s["produces_output"]: out
-        gap = 0 if batch.total_seqs_num_prefill or mtp else s.get("d_gap_ns", 0)
+        gap = 0 if batch.total_seqs_num_prefill else s.get("d_gap_ns", 0)
+        batch.compass_queued_s, gap = (gap * 1e-9, 0) if mtp else (0.0, gap)
         if stage is not None:
             # A stage's host may trail its device, so the gap may be idle: it
             # follows the last forward's device end. The tensors' arrival holds it too.
@@ -243,7 +247,7 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
             r1_ms = (charge - (post + r1 - last) * 1e-9) * 1e3
         res, queued = (charge - period) * 1e3, max(queued, 0.0) * 1e3
         rows.append(
-            (s["step"], _kind(s, prev), 100 * (charge / period - 1), res, queued, r1_ms)
+            (s["step"], kinds[n], 100 * (charge / period - 1), res, queued, r1_ms)
         )
         now, prev = now + charge, s
         yield [origin + round(t * 1e9) if t > -math.inf else t for t in times]
@@ -276,11 +280,12 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     """`check`'s report with each forward priced in place of measured: its
     device time, target then draft, by `law`'s step linear law
     (`StepLinearBackend` on its `step_labels` sample's view, from `samples`),
-    and its host segments by the law's host laws, `law["host"]["laws"]`,
-    graded against the same measured period. After each forward the engine
+    and its host segments by the law's host laws, `law["host"]["laws"]`, its
+    `E` with what its admissions cost (`law["host"]["admit"]`), graded
+    against the same measured period. After each forward the engine
     runs its `E_out` before the next call. An idle forward's `E`, the first's
-    too, stays measured from the last pull or exit: it holds the wait for an
-    arrival, which no law prices. Steps in `warm` are charged and not graded,
+    too, stays measured from the last pull or exit, admissions and all: it
+    holds the wait for an arrival, which no law prices. Steps in `warm` are charged and not graded,
     as is a forward whose period ran more than `WARM_FACTOR` times its charge,
     a one-off first touch the laws do not price; so are steps the law
     refuses, charged 0 s of device time as a run charges them and counted per
@@ -293,11 +298,14 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     mtp = any("d_target_ns" in s for s in steps)
     clock, exit_, out_s, prev, rows, refused = [0.0], 0.0, 0.0, None, [], {}
     apart, uncharged = {*jit, *(n + 1 for n in jit)}, 0.0
-    rec = HostDeviceRecurrence({}, (), lambda: clock[0], mtp=mtp)
-    for s in steps:
+    admit = law["host"].get("admit", ADMISSION_IN_E)
+    rec = HostDeviceRecurrence({}, (), lambda: clock[0], mtp=mtp, admit=admit)
+    kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
+    admits = step_labels.admissions(steps)
+    for s, kind, admitted in zip(steps, kinds, admits):
         if (view := views.get(s["step"])) is None:
             raise ValueError(f"step {s['step']} has no labelled sample to price")
-        kind, rec.laws = _kind(s, prev), hosts
+        rec.laws = hosts
         last = prev["t_exit_ns"] if prev else s["t_enter_ns"]
         if kind == "idle":
             pull = prev.get("t_pull_ns", last) if prev else last
@@ -308,9 +316,11 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
             total_seqs_num=len(view.requests),
             total_seqs_num_prefill=len(view.prefill),
             produces_output=lambda out=s["produces_output"]: out,
+            compass_admitted=None if kind == "idle" else admitted,
         )
         clock[0] = exit_ + out_s
-        queued = rec.ends[1] - rec.prepare_end(clock[0], *forward_shape(batch))[0]
+        shape = forward_shape(batch)
+        queued = rec.ends[1] - rec.prepare_end(clock[0], *shape, rec.admit_s(batch))[0]
         graded = s["step"] not in {*warm, *apart}
         try:
             cost = backend.price(view)

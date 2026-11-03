@@ -363,18 +363,22 @@ HOST = {
         "W_launch": [1e-4, 2e-6, 0.0],
         "W_post": [1.5e-4, 4e-6, 0.0],
     },
+    # A prefill row past the first is a request the forward admits: what it
+    # adds to `E` is `HOST_ADMIT`'s.
     "prefill": {
-        "E": [4e-4, 2e-8, 5e-5],
+        "E": [4e-4, 2e-8, 0.0],
         "W_pre": [6e-4, 1e-7, 8e-5],
         "W_launch": [2e-4, 3e-8, 2e-5],
         "W_post": [3e-4, 1e-9, 6e-5],
     },
     "middle": {
-        "E": [5e-4, 3e-8, 4e-5],
+        "E": [5e-4, 3e-8, 0.0],
         "W_pre": [7e-4, 9e-8, 7e-5],
         "W_launch": [2.5e-4, 2e-8, 3e-5],
     },
 }
+#: A forward's `E` per request it admits, per prompt token past the hit and in it.
+HOST_ADMIT = [3e-4, 2e-8, 1e-9]
 KEY = {"host_cpu": "test cpu", "atom": "0" * 64, "model": None, "engine": {}}
 IDLE_NS = 10**9
 #: Device work between forwards, which a decode's label takes and a prefill's does not.
@@ -404,6 +408,10 @@ def _timed_record(path, steps, idle_after=(), key=KEY, gap=0, scale=None):
         kind = "decode" if not prefill else "prefill" if output else "middle"
         x = (1, sum(r[0] for r in rows), len(rows))
         ns = {k: round(float(np.dot(c, x)) * 1e9) for k, c in HOST[kind].items()}
+        # Its rows past the first are requests it admits, each its only prefill row.
+        new = [(q, n - q) for q, n, d in rows[1:] if not d]
+        a = (len(new), sum(u for u, _ in new), sum(c for _, c in new))
+        ns["E"] += round(float(np.dot(HOST_ADMIT, a)) * 1e9)
         ns = {k: round(v * (scale or {}).get((i, k), 1)) for k, v in ns.items()}
         enter = t + ns["E"]
         g0 = enter + ns["W_pre"] // 2
@@ -478,6 +486,7 @@ def test_device_busy_time_and_host_laws_are_recovered_from_a_timed_record(tmp_pa
         for segment, c in segments.items():
             got = host["laws"][kind][segment]
             assert got == pytest.approx(c, rel=1e-4, abs=1e-12), f"{kind}.{segment}"
+    assert host["admit"] == pytest.approx(HOST_ADMIT, rel=1e-4, abs=1e-12)
 
 
 def test_a_prefill_whose_exit_ran_under_the_paced_share_after_its_host_record_is_cut(
@@ -569,7 +578,7 @@ def test_the_command_writes_host_laws_a_run_file_takes_and_scores_them_held_out(
 
     law = json.loads((tmp_path / "law.json").read_text())
     StepLinearLaw(law)
-    assert set(law["host"]) == {"key", "laws"}
+    assert set(law["host"]) == {"key", "laws", "admit"}
     assert {len(c) for s in law["host"]["laws"].values() for c in s.values()} == {3}
     out = capsys.readouterr().out
     assert "held out, host laws" in out and "host decode W_post | " in out
@@ -1045,7 +1054,7 @@ def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
     args = [record, "--out", str(tmp_path / "law.json"), *SPEC]
 
     (tmp_path / "out/run.json").write_text(json.dumps({BUILDS: ["mha_varlen_fwd"]}))
-    named = f"{record} is not fitted: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    named = f"{record} is not fitted: its server ran a JIT compile of ['mha_varlen_fwd'] while"
     with pytest.raises(ValueError, match=re.escape(named)):
         main(args)
     assert not (steps / "dp0.cost.jsonl").exists()

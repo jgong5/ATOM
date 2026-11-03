@@ -22,7 +22,6 @@ import contextlib
 import json
 import logging
 import os
-import time
 import uuid
 from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -37,7 +36,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
 from atom.compass import run as compass_run
-from atom.compass.carriers import stamp_events, tracestate_stamp
+from atom.compass.carriers import tracestate_stamp
 from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
@@ -45,7 +44,11 @@ from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.multimodal.registry import get_native_multimodal_processor
+from atom.observability.tracing import TraceMiddleware, set_request_id
+from atom.observability.tracing import initialize as initialize_tracing
+from atom.observability.tracing import shutdown as shutdown_tracing
 from atom.utils import clock, envs
+from atom.utils import time_shim as time
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
     arm_reclaim_watch,
@@ -405,8 +408,10 @@ def _get_dp_session_affinity_ids(
     When its Dynamo-affinity header option is enabled it also sends the parent
     session ID for forked agent trees. CoreManager retains that lineage for
     observability but deliberately assigns each child correlation ID its own
-    strict cache owner, matching SGLang's agentic routing. Clients without a
-    session header retain normal DP load balancing.
+    strict cache owner, matching SGLang's agentic routing. The MLPerf Endpoints
+    agentic client instead sends ``X-Session-ID`` on every turn of a
+    conversation. Clients without a session header retain normal DP load
+    balancing.
     """
     if os.environ.get("ATOM_DP_SESSION_AFFINITY", "0").lower() not in {
         "1",
@@ -418,9 +423,11 @@ def _get_dp_session_affinity_ids(
     if raw_request is None:
         return None, None
 
-    session_id = raw_request.headers.get(
-        "x-dynamo-session-id"
-    ) or raw_request.headers.get("x-correlation-id")
+    session_id = (
+        raw_request.headers.get("x-dynamo-session-id")
+        or raw_request.headers.get("x-session-id")
+        or raw_request.headers.get("x-correlation-id")
+    )
     parent_id = raw_request.headers.get("x-dynamo-parent-session-id")
     return session_id, parent_id
 
@@ -435,7 +442,7 @@ def _log_request_event(event_type: str, request_id: str, data: Any) -> None:
     if _request_logger is None:
         return
     entry = {
-        "timestamp": clock.now(time.time),
+        "timestamp": time.time(),
         "request_id": request_id,
         "type": event_type,
         "data": data,
@@ -476,9 +483,6 @@ async def _client_stream(
     `_logged_stream`, and the Anthropic endpoint never used it. A watchdog
     with an endpoint-shaped hole in it is worse than none, because the zero it
     reports looks like an answer.
-
-    In a simulated run each event leaves with a comment line carrying its
-    stream stamp, written after the frame is logged.
     """
     # StreamingResponse sends its headers before iterating this generator, so
     # the middleware has already marked whether this response is eligible.
@@ -519,9 +523,6 @@ async def _client_stream(
                             timing = None
                 if timing is None and _request_logger is None:
                     break
-        rt = clock.installed()
-        if rt is not None and rt.in_run:
-            chunk = stamp_events(chunk, rt)
         yield chunk
 
 
@@ -663,9 +664,14 @@ def _get_multimodal_processor():
             _get_engine_config(), tokenizer, custom_message_encoder
         )
         if processor is None:
+            # The checkpoint path: model_name may be --served-model-name.
             processor = AutoProcessor.from_pretrained(
-                model_name, trust_remote_code=True
+                _get_engine_config().model, trust_remote_code=True
             )
+            # A checkpoint that ships its template for the tokenizer only
+            # (MiniMax-M3.1) renders with the server's, --chat-template included.
+            if processor.chat_template is None:
+                processor.chat_template = tokenizer.chat_template
     return processor
 
 
@@ -700,7 +706,7 @@ def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
         "token_ids": request_output.output_tokens,
         "finished": request_output.finished,
         "finish_reason": request_output.finish_reason,
-        "finished_at": clock.now(time.time),
+        "finished_at": time.time(),
         "started_at": started_at,
         "num_cached_tokens": getattr(request_output, "num_cached_tokens", 0),
     }
@@ -774,7 +780,7 @@ async def generate_async(
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
-    started_at = clock.now(time.time)
+    started_at = time.time()
     first_token_at: float | None = None
     last_token_at: float | None = None
     # An array, not a list: this grows for the whole life of the request,
@@ -797,7 +803,7 @@ async def generate_async(
         _ct = getattr(request_output, "num_cached_tokens", 0)
         if _ct:
             num_cached_tokens_seen = _ct
-        now = clock.now(time.time)
+        now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
             {
@@ -834,9 +840,9 @@ async def generate_async(
             token_ids = item.get("token_ids") or []
             if token_ids:
                 if first_token_at is None:
-                    first_token_at = item.get("ts", clock.now(time.time))
+                    first_token_at = item.get("ts", time.time())
                     record_nonstream_first_token()
-                last_token_at = item.get("ts", clock.now(time.time))
+                last_token_at = item.get("ts", time.time())
                 all_token_ids.extend(token_ids)
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
@@ -868,7 +874,7 @@ async def generate_async(
         )
     )
     num_tokens_output = len(all_token_ids)
-    finished_at = clock.now(time.time)
+    finished_at = time.time()
     latency = finished_at - started_at
     ttft = (first_token_at - started_at) if first_token_at is not None else 0.0
     tpot = (
@@ -911,7 +917,7 @@ async def generate_async_multimodal(
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
-    started_at = clock.now(time.time)
+    started_at = time.time()
     first_token_at: float | None = None
     last_token_at: float | None = None
     all_token_ids = new_token_ids()
@@ -919,7 +925,7 @@ async def generate_async_multimodal(
     seq = None
 
     def completion_callback(request_output: RequestOutput):
-        now = clock.now(time.time)
+        now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
             {
@@ -956,9 +962,9 @@ async def generate_async_multimodal(
             token_ids_out = item.get("token_ids") or []
             if token_ids_out:
                 if first_token_at is None:
-                    first_token_at = item.get("ts", clock.now(time.time))
+                    first_token_at = item.get("ts", time.time())
                     record_nonstream_first_token()
-                last_token_at = item.get("ts", clock.now(time.time))
+                last_token_at = item.get("ts", time.time())
                 all_token_ids.extend(token_ids_out)
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
@@ -974,7 +980,7 @@ async def generate_async_multimodal(
 
     text = delivered_text(all_token_ids)
     num_tokens_output = len(all_token_ids)
-    finished_at = clock.now(time.time)
+    finished_at = time.time()
     ttft = (first_token_at - started_at) if first_token_at is not None else 0.0
     tpot = (
         (last_token_at - first_token_at) / (num_tokens_output - 1)
@@ -1024,7 +1030,7 @@ async def generate_async_fanout(
     shared_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
-    started_at = clock.now(time.time)
+    started_at = time.time()
     per_tokens = [new_token_ids() for _ in range(n)]
     per_first_token_at: list[float | None] = [None] * n
     per_last_token_at: list[float | None] = [None] * n
@@ -1033,7 +1039,7 @@ async def generate_async_fanout(
 
     def make_callback(idx: int):
         def _cb(request_output: RequestOutput) -> None:
-            now = clock.now(time.time)
+            now = time.time()
             loop.call_soon_threadsafe(
                 shared_queue.put_nowait,
                 (
@@ -1083,9 +1089,9 @@ async def generate_async_fanout(
             tokens = item.get("token_ids") or []
             if tokens:
                 if per_first_token_at[idx] is None:
-                    per_first_token_at[idx] = item.get("ts", clock.now(time.time))
+                    per_first_token_at[idx] = item.get("ts", time.time())
                     record_nonstream_first_token()
-                per_last_token_at[idx] = item.get("ts", clock.now(time.time))
+                per_last_token_at[idx] = item.get("ts", time.time())
                 per_tokens[idx].extend(tokens)
             if item.get("finished", False):
                 per_finish_reason[idx] = item.get("finish_reason")
@@ -1101,7 +1107,7 @@ async def generate_async_fanout(
                     logger.debug("abort_request failed on teardown", exc_info=True)
             engine.io_processor.requests.pop(_seq.id, None)
 
-    finished_at = clock.now(time.time)
+    finished_at = time.time()
     outputs: list[dict[str, Any]] = []
     for i in range(n):
         num_tokens_output = len(per_tokens[i])
@@ -1214,7 +1220,7 @@ async def setup_streaming_request(
     stream_collector = StreamOutputCollector(request_id)
     stream_loop = asyncio.get_running_loop()
     _stream_loops[request_id] = stream_loop
-    _request_start_times[request_id] = clock.now(time.time)
+    _request_start_times[request_id] = time.time()
 
     # The detokenizer lives in this closure, so it is freed when the engine
     # drops the callback on the stream's last chunk -- no registry, no cleanup.
@@ -1424,7 +1430,7 @@ async def setup_streaming_request_fanout(
     shared_collector = StreamOutputCollector(request_id)
     stream_loop = asyncio.get_running_loop()
     _stream_loops[request_id] = stream_loop
-    _request_start_times[request_id] = clock.now(time.time)
+    _request_start_times[request_id] = time.time()
 
     assert _stream_batch_dispatcher is not None
 
@@ -1535,6 +1541,7 @@ async def _periodic(interval: float, step: Callable[[], Awaitable[None]]) -> Non
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
+    await asyncio.to_thread(initialize_tracing)
     metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
     logger.info("Server started successfully and ready to accept requests")
     tune_gc()
@@ -1564,8 +1571,11 @@ async def lifespan(app: FastAPI):
         _background_tasks.clear()
         await _metrics_exporter.wait_for_render()
         logger.info("Server shutting down, releasing resources...")
-        if engine is not None:
-            engine.close()
+        try:
+            if engine is not None:
+                engine.close()
+        finally:
+            await asyncio.to_thread(shutdown_tracing)
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
@@ -1573,6 +1583,7 @@ app.add_middleware(
     RequestTimingMiddleware,
     observe_ttft=_request_metrics.observe_time_to_first_token,
 )
+app.add_middleware(TraceMiddleware, model=lambda: model_name)
 
 
 # ---- Error handlers ----
@@ -1662,6 +1673,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        set_request_id(request_id)
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
         dp_routing = {
             "data_parallel_rank": request.data_parallel_rank,
@@ -1907,6 +1919,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
+        set_request_id(request_id)
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
         dp_routing = {
             "data_parallel_rank": request.data_parallel_rank,
@@ -2094,6 +2107,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
 
         request_id = uuid.uuid4().hex[:24]
+        set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
         input_tokens = len(tokenizer.encode(prompt))
 
@@ -2217,7 +2231,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
                             if field == "reasoning_content":
                                 if drop_reasoning:
-                                    now = clock.now(time.monotonic)
+                                    now = time.monotonic()
                                     if now - last_ping >= (
                                         _ANTHROPIC_PING_INTERVAL_SECONDS
                                     ):
@@ -2513,6 +2527,7 @@ async def responses_create(raw_request: Request):
         )
 
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
+        set_request_id(request_id)
         input_tokens = len(tokenizer.encode(prompt))
 
         max_ctx = 30720
@@ -2536,7 +2551,7 @@ async def responses_create(raw_request: Request):
             prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
             input_tokens = max_input
 
-        created_at = int(clock.now(time.time))
+        created_at = int(time.time())
         if request.stream:
             seq_id, stream_collector, _num_prompt_tokens = (
                 await setup_streaming_request(

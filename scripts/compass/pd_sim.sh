@@ -48,7 +48,8 @@
 # BENCHMARK_KIND=aiperf_agentic or a rank mapping policy other than none, that
 # is --dp-aware: the router chooses among DP ranks on load that responses
 # move, which makes it LP `router` of the run, and RUN_FILE gains `router_in_s`
-# unless it has one already, and `router`, the binary that runs it, refused unless built from this tree's
+# unless it has one already, at `ipc_s`, borrowed: Atomesh logs no receipt to
+# measure its own from; and `router`, the binary that runs it, refused unless built from this tree's
 # atom/mesh (`router_binary` in atom/compass/run). Several servers of a side
 # make it LP `router` too, as it chooses among them. As LP `router` it lists
 # each side's workers in RUN_FILE's `worker_order`, else sorted. Otherwise
@@ -203,7 +204,8 @@ done
 env "${router_env[@]}" "$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --pd-disaggregation \
     "${urls[@]}" \
     "${router[@]}" --backend atom --disable-health-check --disable-circuit-breaker \
-    --disable-retries --prometheus-port "$PROMETHEUS_PORT" --log-level info \
+    --disable-retries --request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S" \
+    --prometheus-port "$PROMETHEUS_PORT" --log-level info \
     >"$OUT/router.log" 2>&1 &
 compass_wait_up router $! "http://127.0.0.1:$ROUTER_PORT/v1/models"
 echo "pd_sim: ready"

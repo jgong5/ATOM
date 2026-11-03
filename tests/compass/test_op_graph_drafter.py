@@ -22,7 +22,7 @@ import pytest
 import torch
 from test_artifact_store import CONDITIONS, GATES, stanza
 from test_backend_step_linear import _installed, view
-from test_capture_ir import TREE, _ops, _record
+from test_capture_ir import MAIN, TREE, _ops, _record
 from test_dp_step_max import runner
 from test_memory_readings import WORKER
 from test_op_graph import FLAT, GEMM, MIDDLE, _engine, by_name, g
@@ -35,7 +35,7 @@ from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import gemm, price
-from atom.compass.capture import forward, population_shapes
+from atom.compass.capture import population_shapes
 from atom.compass.capture.forward import structure
 from atom.compass.run import _op_graphs
 from atom.compass.runner import projection
@@ -85,7 +85,7 @@ def capture(drafts, tmp_path_factory, shape=("--width", "2"), dp=1):
         [
             sys.executable,
             "-c",
-            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            MAIN,
             *argv,
         ],
         capture_output=True,
@@ -205,15 +205,6 @@ def test_a_run_prices_a_middle_chunk_s_draft_kv_pass_from_its_own_graph(
     assert {t.name: t.seconds for t in cost.draft_terms} == drafted(1)
 
 
-def test_a_block_drafter_is_refused_by_name_before_any_step():
-    class DSparkProposer:
-        is_block_drafter = True
-
-    runner = SimpleNamespace(drafter=DSparkProposer())
-    with pytest.raises(ValueError, match="DSparkProposer writes its draft KV before"):
-        forward._drafter(runner, None)
-
-
 FINAL = BatchView((RequestShape(9, 9, False),), produces_output=True)
 
 
@@ -266,7 +257,9 @@ def test_a_step_under_a_drafter_with_no_draft_to_price_is_refused_by_name(
 
 
 def test_a_run_file_op_graph_under_a_drafter_prices_its_drafts(monkeypatch, tmp_path):
-    drafter = SimpleNamespace(method="mtp", num_speculative_tokens=2)
+    drafter = SimpleNamespace(
+        method="mtp", num_speculative_tokens=2, use_dspark=lambda: False
+    )
     monkeypatch.setitem(WORKER, "speculative_config", drafter)
 
     assert _installed(monkeypatch, tmp_path, op_graph=True).drafts == 2
@@ -297,7 +290,9 @@ def dp_view(width, rung, dp, counts=None):
     r.drafter = SimpleNamespace(is_block_drafter=False, mtp_k=1)
     counts = torch.tensor(counts or [2 * width] * dp)
     mode = SimpleNamespace(
-        sync=SimpleNamespace(num_tokens_across_dp=counts, ub_tokens_across_dp=None),
+        sync=SimpleNamespace(
+            scheduled_tokens_per_dp_rank=counts, ub_tokens_across_dp=None
+        ),
         running_tokens_are_unified=True,
         running_tokens=2 * rung,
         running_bs=rung,
@@ -466,7 +461,7 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
     r.drafter = SimpleNamespace(is_block_drafter=False, mtp_k=1)
     mode = SimpleNamespace(
         sync=SimpleNamespace(
-            num_tokens_across_dp=torch.tensor([64, 64]),
+            scheduled_tokens_per_dp_rank=torch.tensor([64, 64]),
             max_bs_across_dp=1,
             ub_tokens_across_dp=None,
         ),
@@ -512,7 +507,7 @@ def _population(tmp_path_factory, line, drafts):
         [
             sys.executable,
             "-c",
-            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            MAIN,
             *argv,
         ],
         capture_output=True,

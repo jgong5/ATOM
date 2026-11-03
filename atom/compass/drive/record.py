@@ -2,7 +2,7 @@
 """`compass record`: one instance's real server, with its step record, serving
 whatever client runs reach it until it is stopped.
 
-    compass record --gpu G [--host H] --out DIR -- <ATOM args>
+    compass record --gpu G [--host H] [--store S] --out DIR -- <ATOM args>
 
 `serve` starts the server on the GPUs `--gpu` names with the step record on,
 bound to `--host`, 127.0.0.1 unless named, an address a router on another node
@@ -28,11 +28,18 @@ the switch on, Triton loads an autotuned kernel's choice for a shape an earlier
 server of the same directory tuned; a shape the cache lacks still tunes on its
 first launch, inside the record.
 
-run.json's ``aiter_jit_builds`` names each aiter JIT module built, or begun,
+run.json's ``aiter_jit_builds`` names each aiter JIT module or kernel built, or begun,
 since serve wrote ``server.json``, when ``/health`` first answered
 (`aiter_jit`): a step may have waited on its build, so grading, `compass fit
 steps`, `compass fit host`, `step_linear_fit` and `validate.cost` refuse the
 record. A server that built none leaves no entry.
+Its ``ptl_changes`` names each change of its cards' PTL state from then until
+the stop (`identity.ptl_changes`), which the fits refuse; ``ptl`` is the
+state at the stop.
+
+With `--store`, the server's start merges the store's JIT cache library for
+this stack into the container's caches, and its stop writes back each artifact
+it finished compiling (`jit_cache`); without it no library is touched.
 
 `--profile-ops` and `--profile-steps A:B`, the op-level half's profiled pass,
 refuse; so does ATOM's ``--load_dummy``: a record times real weights, and MoE
@@ -51,6 +58,7 @@ from atom.compass.backends.step_labels import label_run, write_table
 from atom.compass.cli import OPS
 from atom.compass.drive import aiter_jit, serve
 from atom.compass.drive.gpu import add_gpu_flag
+from atom.compass.drive.identity import PTL_CHANGES, ptl_changes
 from atom.compass.run import _write_whole
 
 PROG = "compass record"
@@ -78,13 +86,23 @@ def main(argv: list[str]) -> None:
         AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1"),
         "TRITON_CACHE_DIR": knobs.cache.dir,
     }
-    serve.serve(atom_args, args.out, args.gpu, extra_env=env, host=args.host)
-    run_json = Path(args.out) / serve.RUN_JSON
     # serve writes server.json when /health first answers, so its mtime is
     # when serving began; a server that never answered served nothing.
     ready = Path(args.out) / serve.READY_FILE
+    with ptl_changes(args.gpu, ready) as changes:
+        serve.serve(
+            atom_args,
+            args.out,
+            args.gpu,
+            extra_env=env,
+            host=args.host,
+            store=args.store,
+        )
+    run_json = Path(args.out) / serve.RUN_JSON
     builds = aiter_jit.builds_since(ready.stat().st_mtime_ns) if ready.exists() else {}
     run = {**json.loads(run_json.read_text()), "env": env, **builds}
+    if changes:
+        run[PTL_CHANGES] = changes
     _write_whole(run_json, json.dumps(run))
     write_engine_and_costs(args.out)
 
@@ -93,6 +111,9 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n\n")[0])
     add_gpu_flag(p)
     p.add_argument("--host", default=serve.HOST, help="the address the server binds")
+    p.add_argument(
+        "--store", help="the artifact store whose JIT cache library the server uses"
+    )
     p.add_argument(
         "--out", required=True, help="an empty directory for the record and logs"
     )

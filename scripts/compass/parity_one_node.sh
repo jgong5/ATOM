@@ -122,7 +122,7 @@ mkdir -p "$OUT/real" "$OUT/sim"
 OUT=$(realpath "$OUT")
 LMCACHE=${LMCACHE:-0} PREFIX=0 LM_FLAGS=
 if [[ $LMCACHE == 1 ]]; then
-    PREFIX=${PREFIX_WORDS:-600} LM_PORT=$(compass_free_port)
+    PREFIX=${PREFIX_WORDS:-600} LM_PORT=$(compass_held_port)
     LM_FLAGS="--host 127.0.0.1 --port $LM_PORT ${LMCACHE_FLAGS:---chunk-size 256
         --null-block-id -1 --separate-object-groups --supported-transfer-mode
         lmcache_driven --l1-size-gb 8 --eviction-policy LRU}"
@@ -135,7 +135,7 @@ if [[ -z ${STORE:-} ]]; then
     # measure memory takes rocm-smi's indexes of the real run's HIP devices.
     gpus=$(compass_gpus smi "${HIP_VISIBLE_DEVICES:-$(seq -s, 0 $((TP * PP - 1)))}")
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
-    ATOM_DP_MASTER_PORT=$(compass_free_port) python3 -c \
+    ATOM_DP_MASTER_PORT=$(compass_held_port) python3 -c \
         "from atom.compass.cli import main; main()" measure memory \
         --gpu "$gpus" --machine "$MACHINE" \
         ${LM_FLAGS:+--beside "lmcache server $LM_FLAGS"} \
@@ -151,28 +151,16 @@ trap 'kill -KILL -- ${servers[*]/#/-} ${authority:+-$authority} ${lmcache:+-$lmc
 serve() {
     local side=$1 deadline=$((SECONDS + WAIT_S)) master base k log port devices dp pid
     shift
-    PORT=$(compass_free_port) servers=()
+    PORT=$(compass_held_port) servers=()
     # The DP master port, the engine sockets across trees 100 above it (3 for
-    # each of four ranks) and the base port 112 above it: all free, and below
-    # the ephemeral range, so no connection's source port takes one of them
-    # before its server binds it.
-    master=$(python3 -c 'import random, socket
-low = int(open("/proc/sys/net/ipv4/ip_local_port_range").read().split()[0])
-def free(p):
-    with socket.socket() as s:
-        try:
-            s.bind(("", p))
-        except OSError:
-            return False
-    return True
-while not all(map(free, range(p := random.randrange(low // 2, low - 113), p + 113))):
-    pass
-print(p)')
+    # each of four ranks) and the base port 112 above it: all held, so no other
+    # process, nor any connection's source port, takes one of them first.
+    master=$(compass_held_port 113)
     base=$((master + 112))
     for ((k = 0; k < TREES; k++)); do
         log=$OUT/$side/server.log port=$PORT devices=() dp=()
         if ((TREES > 1)); then
-            ((k == 0)) || log=$OUT/$side/server$k.log port=$(compass_free_port)
+            ((k == 0)) || log=$OUT/$side/server$k.log port=$(compass_held_port)
             devices=(HIP_VISIBLE_DEVICES="${CARDS[2 * k]},${CARDS[2 * k + 1]}")
             dp=(--data-parallel-size "$TREES" --data-parallel-size-local 1
                 --data-parallel-rank "$k" --data-parallel-base-port "$base")
@@ -181,7 +169,7 @@ print(p)')
         env ATOM_DP_MASTER_PORT="$master" ATOM_COMPASS_PARITY_RECORD="$OUT/$side/record" \
             "${devices[@]}" setsid python3 -m atom.entrypoints.openai.api_server \
             --model "$MODEL" --host 127.0.0.1 --server-port "$port" \
-            --port "$(compass_free_port)" -tp "$TP" $PPA $DPA "${dp[@]}" $SERVER_ARGS "$@" \
+            --port "$(compass_held_port)" -tp "$TP" $PPA $DPA "${dp[@]}" $SERVER_ARGS "$@" \
             >"$log" 2>&1 &
         servers+=($!)
     done
@@ -230,7 +218,7 @@ for side in $SIDES; do
     cp "$OUT/real/record/arrivals.json" "$OUT/real/record/$side"
 done
 
-RUN=$OUT/sim/run.json CLOCK_PORT=$(compass_free_port)
+RUN=$OUT/sim/run.json CLOCK_PORT=$(compass_held_port)
 python3 - "$RUN" "$OUT" "$MACHINE" "$MODEL" "$STORE" "$CLOCK_PORT" "${DPA:+$((TP * TREES))}" \
     "$LM_FLAGS" "${IMAGE_S:-0.01}" "$TP" "$SIDES" "$PP" <<'EOF'
 import json, re, sys

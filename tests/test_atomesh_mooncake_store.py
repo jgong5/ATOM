@@ -874,6 +874,9 @@ kill -KILL "${mooncake_page_cache_dropper_pid}"
 wait "${mooncake_page_cache_dropper_pid}" 2>/dev/null || true
 setsid sleep 60 &
 other=$!
+# Until it execs, its command line is this shell's, which holds the dropper's
+# pattern: wait for the exec, as the dropper's start does.
+until [[ "$(< "/proc/${other}/comm")" == sleep ]]; do sleep 0.01; done
 mooncake_page_cache_dropper_pid="${other}"
 stop_mooncake_store
 kill -0 "${other}" && echo "OTHER SURVIVES"

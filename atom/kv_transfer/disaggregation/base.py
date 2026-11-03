@@ -132,6 +132,15 @@ class KVConnectorSchedulerBase(ABC):
         """Retire a P/D send claim; explicit no-op for backends without sends."""
         ...
 
+    def abort_send(self, req_id: Any) -> None:
+        """The request was aborted while its send claim was held.
+
+        A backend that sees every transfer of the source blocks reports the
+        send in ``finished_sending`` once none can run, at once when none has
+        started, and refuses a later one. This default keeps the claim: a
+        backend that cannot see a transfer must not free blocks one may read.
+        """
+
     @abstractmethod
     def source_blocks_released(self, seq: Any) -> None:
         """The scheduler has returned this request's source blocks to the pool.

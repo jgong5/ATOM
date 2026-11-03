@@ -11,9 +11,11 @@ prompt.
 The runs need a driver, as in `test_vertical_slice`, and
 `ATOM_COMPASS_IMAGE_MODEL`, a multimodal model directory ATOM serves; its
 memory readings are measured first on the GPU ``HIP_VISIBLE_DEVICES`` names,
-under the machine spec `test_lmcache_mp_engine` reads.
+under the machine spec `test_lmcache_mp_engine` reads, with an assumed entry
+for the model's tokenizer where that spec probed none and `PROBED` did.
 """
 
+import contextlib
 import json
 import math
 import os
@@ -38,8 +40,9 @@ from test_vertical_slice import (
 from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
 from atom.compass.detect.scenario import check_run
-from atom.compass.drive.serve import _free_ports
 from atom.compass.parity.traffic import bodies
+from atom.compass.spec.machine import entry_label
+from tests.compass.held_ports import held_ports
 
 MODEL = os.environ.get("ATOM_COMPASS_IMAGE_MODEL")
 NEEDS_AN_IMAGE_RUN = pytest.mark.skipif(
@@ -51,6 +54,9 @@ REQUESTS = 3
 IMAGE_S = 2.0**-5
 ARGS = ["--model", MODEL, "--enforce-eager", "--max-model-len", "2048"]
 ARGS += ["--no-enable_prefix_caching"]
+#: The spec whose tokenizer entry for the image model's architecture a run
+#: assumes where `MACHINE` probed none.
+PROBED = TREE / "scripts/compass/machines/mi308x-hjbog39.json"
 
 
 class Workload(Traffic):
@@ -71,46 +77,74 @@ class Workload(Traffic):
         rt.close()
 
 
-def run_images(out: Path, seed: str) -> dict:
+def _machine(out: Path) -> Path:
+    """`MACHINE`, with `PROBED`'s tokenizer entries for the image model's
+    architecture, their origin assumed, where `MACHINE` probed none; where
+    neither spec names it, `MACHINE` as it is, for the server to refuse."""
+    machine = json.loads(MACHINE.read_text())
+    config = json.loads((Path(MODEL) / "config.json").read_text())
+    [architecture] = config["architectures"]
+    tokenizers = machine["host"]["tokenizers"]
+    if not any(architecture in t["applies_to"] for t in tokenizers):
+        probed = json.loads(PROBED.read_text())["host"]["tokenizers"]
+        for entry in [t for t in probed if architecture in t["applies_to"]]:
+            tokenizers.append(entry)
+            label = entry_label(entry["id"], entry["backend"])
+            machine["provenance"]["origins"][label] = {"origin": "assumed"}
+    (out / "machine.json").write_text(json.dumps(machine))
+    return out / "machine.json"
+
+
+def run_images(out: Path, seed: str, machine: Path) -> dict:
     """One run in its own process tree, reading the readings in its parent's store."""
     out.mkdir()
-    clock_port, port = _free_ports(2)
-    run_file = _run_file(
-        out,
-        clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
-        step_stub=CONSTANT,
-        image_preprocess_s=IMAGE_S,
-        machine=json.loads(MACHINE.read_text()),
-        store=str(out.parent / "store"),
-    )
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=seed,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
-    )
-    requests = bodies(MODEL, REQUESTS, images=1)
-    with open(out / "server.log", "w") as log:
-        server = subprocess.Popen(
-            [sys.executable, "-m", "atom.entrypoints.openai.api_server"]
-            + [*ARGS, "--host", "127.0.0.1", "--server-port", str(port)]
-            + ["--compass-run", str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
+    with held_ports(2) as (clock_port, port):
+        run_file = _run_file(
+            out,
+            clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
+            step_stub=CONSTANT,
+            image_preprocess_s=IMAGE_S,
+            machine=json.loads(machine.read_text()),
+            store=str(out.parent / "store"),
         )
-        watchdog = threading.Timer(WALL_S, server.kill)
-        watchdog.start()
-        try:
-            traffic = Workload(requests, json.loads(run_file.read_text()), port, server)
-            traffic.run()
-            code = server.wait(timeout=120)
-        finally:
-            watchdog.cancel()
-            if server.poll() is None:
-                server.kill()
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
+        )
+        requests = bodies(MODEL, REQUESTS, images=1)
+        with open(out / "server.log", "w") as log:
+            server = subprocess.Popen(
+                [sys.executable, "-m", "atom.entrypoints.openai.api_server"]
+                + [*ARGS, "--host", "127.0.0.1", "--server-port", str(port)]
+                + ["--compass-run", str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            watchdog = threading.Timer(WALL_S, server.kill)
+            watchdog.start()
+            try:
+                traffic = Workload(
+                    requests, json.loads(run_file.read_text()), port, server
+                )
+                traffic.run()
+                code = server.wait(timeout=120)
+            except Exception as error:
+                # A server that refuses at startup reaches the traffic LP only
+                # as a closed clock connection; its own words are in its log.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    server.wait(timeout=30)
+                tail = (out / "server.log").read_text()[-4000:]
+                error.add_note(f"the server's log ends:\n{tail}")
+                raise
+            finally:
+                watchdog.cancel()
+                if server.poll() is None:
+                    server.kill()
     tail = (out / "server.log").read_text()[-4000:]
     assert code == 0, f"the server exited {code} after the finish:\n{tail}"
     return {
@@ -126,15 +160,16 @@ def runs(tmp_path_factory):
     from atom.compass import cli
 
     root = tmp_path_factory.mktemp("images")
+    machine = _machine(root)
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("AITER_LOG_LEVEL", "WARNING")  # the readings are keyed by it
         cli.main(
-            ["measure", "memory", "--machine", str(MACHINE)]
+            ["measure", "memory", "--machine", str(machine)]
             + ["--gpu", os.environ.get("HIP_VISIBLE_DEVICES", "0")]
             + ["--store", str(root / "store"), "--out", str(root / "measure")]
             + ["--", *ARGS]
         )
-    return [run_images(root / f"seed{seed}", seed) for seed in ("1", "2")]
+    return [run_images(root / f"seed{seed}", seed, machine) for seed in ("1", "2")]
 
 
 @NEEDS_AN_IMAGE_RUN

@@ -14,14 +14,13 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from atom.utils import clock
+from atom.utils import time_shim as time
 
 from .protocol import STREAM_DONE_MESSAGE
 from .sse import event_frame
@@ -491,9 +490,7 @@ def build_responses_response(
     response = {
         "id": request_id,
         "object": "response",
-        "created_at": (
-            created_at if created_at is not None else int(clock.now(time.time))
-        ),
+        "created_at": created_at if created_at is not None else int(time.time()),
         "status": "completed",
         "model": model,
         "output": output,
@@ -608,9 +605,7 @@ class ResponseStreamEmitter:
     ) -> None:
         self.response_id = response_id
         self.model = model
-        self.created_at = (
-            created_at if created_at is not None else int(clock.now(time.time))
-        )
+        self.created_at = created_at if created_at is not None else int(time.time())
         self.context = context or CodexToolContext()
         self.request = request
         self.sequence_number = 0

@@ -35,10 +35,13 @@ from test_lmcache_lp import (
     OFFLOAD,
     REQUEST_S,
     TOKENS,
+    _bound_port,
     _config,
     _run,
+    lmcache_port,  # noqa: F401  the lmcache_port fixture
 )
 from test_memory_readings import DOCUMENT
+from test_pd_planned_block import publish
 from test_vertical_slice import (
     CONSTANT,
     MODEL,
@@ -46,7 +49,6 @@ from test_vertical_slice import (
     TREE,
     WALL_S,
     Traffic,
-    _free_port,
     _run_file,
 )
 
@@ -74,6 +76,7 @@ from atom.kv_transfer.offload.mp import native_state_worker, transfer
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.utils import clock, forward_context
 from atom.utils.distributed import utils as dist_utils
+from tests.compass.held_ports import held_ports
 
 STEP = 0.01  # the step loop's clock calls, one per step
 #: A rank's recurrent-state image: its copy over the chunks moves a reply by
@@ -127,15 +130,18 @@ class Engine:
             "Popen",
             lambda *a, **k: started.append((a, real(*a, **k))) or started[-1][1],
         )
-        port = run["lmcache"]["server"][-1]
-        kv = _kv(port)
+        kv = _kv(0)  # the port the server binds, set once it has bound one
         if pd:
             write = {WRITE_REQ_KEY: f"inproc://kv-write-req-{os.getpid()}"}
             kv = {"kv_connector": "multi", "connectors": [COMPASS | write, kv]}
+            for engine in ("engine-P", "engine-D"):
+                publish(run["out_dir"], engine, 1)
         self.config = _config(kv, tensor_parallel_size=tp, kv_cache_block_size=CHUNK)
         compass_run._launch_lmcache(self.config, run, compass_run._pd_side(self.config))
         (argv, *_), self.proc = started[0]
         self.chunk_bytes = int(argv[-1])
+        lm = kv["connectors"][-1] if pd else kv
+        lm["kv_connector_extra_config"]["lmcache.mp.port"] = _bound_port(self.proc)
         me = "engine-P" if pd else "engine"
         self.idle = [
             connect(lp, self.served.endpoint)
@@ -488,7 +494,8 @@ def test_the_compass_runner_refuses_a_real_backend_beside_lmcache_mp(monkeypatch
 
 #: The machine the run is priced on and its memory readings measured on: the
 #: spec of the device `ATOM_COMPASS_SLICE_MACHINE` names, with a host link for
-#: the server's copies and the suite's tokenizer entry for Qwen3.
+#: the server's copies and, where the spec probed no Qwen3 tokenizer, the
+#: suite's entry for one.
 MACHINE = Path(
     os.environ.get(
         "ATOM_COMPASS_SLICE_MACHINE",
@@ -531,17 +538,21 @@ def _machine(out: Path) -> Path:
         "bandwidth_bytes_per_s": BANDWIDTH,
         "latency_s": LATENCY_S,
     }
-    machine["host"]["tokenizers"].append(DOCUMENT["host"]["tokenizers"][0])
     origins = machine["provenance"]["origins"]
     for field in ("bandwidth_bytes_per_s", "latency_s"):
         origins[f"interconnect.host_link.{field}"] = {"origin": "assumed"}
-    origins["host.tokenizers[qwen3-151k-bpe fast]"] = {"origin": "assumed"}
+    tokenizers, suite = machine["host"]["tokenizers"], DOCUMENT["host"]["tokenizers"][0]
+    if not any(set(suite["applies_to"]) & set(t["applies_to"]) for t in tokenizers):
+        tokenizers.append(suite)
+        origins["host.tokenizers[qwen3-151k-bpe fast]"] = {"origin": "assumed"}
     (out / "machine.json").write_text(json.dumps(machine))
     return out / "machine.json"
 
 
 @NEEDS_A_RUN
-def test_a_one_deployment_run_loads_a_stored_prefix_back(tmp_path, monkeypatch):
+def test_a_one_deployment_run_loads_a_stored_prefix_back(
+    tmp_path, monkeypatch, lmcache_port  # noqa: F811
+):
     """Three client runs of one prompt on a deployment that offloads to LP
     lmcache, its memory readings measured first on the GPU
     ``HIP_VISIBLE_DEVICES`` names: the first stores the prompt's chunks, the
@@ -553,7 +564,7 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(tmp_path, monkeypatch):
     # The readings are keyed by the performance environment the server runs in.
     monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
     machine = _machine(tmp_path)
-    port, server_port = _free_port(), _free_port()
+    server_port = lmcache_port
     flags = ["--host", "127.0.0.1", "--port", str(server_port), "--chunk-size", "256"]
     flags += ["--l1-size-gb", "1", "--eviction-policy", "LRU"]
     flags += ["--eviction-trigger-watermark", "0"]  # every tick evicts
@@ -569,21 +580,26 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(tmp_path, monkeypatch):
         + ["--store", str(tmp_path / "store"), "--out", str(tmp_path / "measure")]
         + ["--", *ATOM_ARGS]
     )
-    run_file = _run_file(
-        tmp_path,
-        step_stub=CONSTANT,
-        client_runs=3,
-        bound_s=LATE_S + 60.0,
-        machine=json.loads(machine.read_text()),
-        lmcache={"server": flags, "lookup_s": list(LOOKUP_S), "request_s": REQUEST_S},
-    )
     env = dict(
         os.environ,
         PYTHONPATH=str(TREE),
         OFFLOAD_MIN_LOAD_TOKENS="256",
         OFFLOAD_MIN_SAVE_TOKENS="256",
     )
-    with open(tmp_path / "server.log", "w") as log:
+    with held_ports(2) as (clock_port, port), open(tmp_path / "server.log", "w") as log:
+        run_file = _run_file(
+            tmp_path,
+            clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
+            step_stub=CONSTANT,
+            client_runs=3,
+            bound_s=LATE_S + 60.0,
+            machine=json.loads(machine.read_text()),
+            lmcache={
+                "server": flags,
+                "lookup_s": list(LOOKUP_S),
+                "request_s": REQUEST_S,
+            },
+        )
         server = subprocess.Popen(
             [sys.executable, "-m", "atom.entrypoints.openai.api_server", *ATOM_ARGS]
             + ["--host", "127.0.0.1", "--server-port", str(port)]

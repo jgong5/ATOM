@@ -138,7 +138,31 @@ def test_a_step_a_later_source_answered_is_not_refused_and_its_answer_is_apart(
     refusals = schedule["refusals"]
     assert (refusals["count"], refusals["steps"], refusals["reasons"]) == (0, 4, [])
     assert refusals["fraction_of_steps"] == 0.0
+    # The step fell through, and it is counted there, with no refused seconds.
+    assert schedule["fallback_steps"] == 1
+    assert sorted(refusals) == [
+        "by_source",
+        "count",
+        "fraction_of_steps",
+        "reasons",
+        "steps",
+    ]
     assert out["coverage_report"] is False
+
+
+def test_the_summary_counts_each_reason_a_fallback_step_was_declined_for_by_steps(
+    monkeypatch, tmp_path
+):
+    backend = AnalyticalBelow(STAGE1, tokens=40)
+    # Every term of a declined step carries the chain; a step counts once.
+    assert len(backend.price(BatchView((RequestShape(40, 40, False),))).terms) > 1
+    out = summary(monkeypatch, tmp_path, backend, 8, 40, 64)
+
+    assert out["schedule"]["fallback_steps"] == 2
+    assert out["schedule"]["fallback_reasons"] == {
+        "price_list: no entry for this shape": 2,
+        "nearest_key: outside the measured range": 2,
+    }
 
 
 @pytest.mark.parametrize(
@@ -202,7 +226,7 @@ def test_a_stub_run_reports_all_its_seconds_declared(monkeypatch, tmp_path):
     assert schedule["seconds_by_method"] == by_method(
         declared={"steps": 2, "fraction_of_predicted_seconds": pytest.approx(1.0)}
     )
-    assert out["schema_version"] == compass_run.SUMMARY_SCHEMA_VERSION == 9
+    assert out["schema_version"] == compass_run.SUMMARY_SCHEMA_VERSION == 11
     assert schedule["refusals"]["count"] == 0
     assert schedule["refusals"]["fraction_of_steps"] == 0.0
     assert out["coverage_report"] is False
@@ -245,7 +269,7 @@ def test_the_summary_counts_every_stall_diagnostic_and_says_how_the_run_ended(
     authority = compass_run._RecordingAuthority(run)
     for row in authority.lp_table():
         authority.on_request(row.lp, "NER", math.inf, [])
-    authority.diagnostics = 1  # what its serve loop counted
+    authority.diagnostics = 1  # what its serve side counted
     for lp, printed in (("engine", 2), ("frontend", 0)):
         monkeypatch.setattr(clock, "_installed", SimpleNamespace(diagnostics=printed))
         compass_run._hand_in(run, lp, [])

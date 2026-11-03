@@ -320,16 +320,12 @@ def test_worker_failures_arrive_as_failures_not_exceptions():
 
 
 def test_a_duplicate_dp_reply_is_ignored():
-    mgr = _mgr(1)
-
-    def broadcast_and_answer(cmd, **kw):
-        rid = kw["request_id"]
-        _answer_after(mgr, 0.01, 0, _tp_body(rid, results=[_tp(0, "first")]))
-        _answer_after(mgr, 0.02, 0, _tp_body(rid, results=[_tp(0, "second")]))
-
-    mgr.broadcast_utility_command = broadcast_and_answer
+    mgr = _mgr(2)
+    replies = [_tp_body(None, results=[_tp(0, v)]) for v in ("first", "second", "dp1")]
+    # Delivered in call order: rank 0's duplicate arrives before rank 1 answers.
+    mgr.broadcast_utility_command = _answering(mgr, replies, ranks=[0, 0, 1])
     results = mgr.collective_rpc("m", timeout=5)
-    assert [r.value for r in results] == ["first"]
+    assert [r.value for r in results] == ["first", "dp1"]
 
 
 def test_two_overlapping_calls_keep_their_own_replies():

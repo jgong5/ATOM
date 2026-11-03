@@ -20,8 +20,10 @@ from atom.compass.spec import MachineSpec, SpecRefusal
 from atom.compass.validate import bound, project
 
 MACHINES = SCRIPTS / "machines"
+#: MI455's B0 spec is MI355X's probed ratios on MI455X's datasheet, for a
+#: device no engine has run on.
 MI308X, MI355X, MI455 = (
-    MACHINES / f"{name}.json" for name in ("mi308x-hjbog18", "mi355x-gpu45", "mi455")
+    MACHINES / f"{name}.json" for name in ("mi308x-hjbog18", "mi355x-gpu45", "mi455-b0")
 )
 
 

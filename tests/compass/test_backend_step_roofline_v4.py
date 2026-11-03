@@ -297,7 +297,7 @@ def test_the_batch_view_states_the_real_tokens_among_the_gathered_rows():
     r = runner(None, dp_size=2)
     r.drafter = None
     sync = SimpleNamespace(
-        num_tokens_across_dp=torch.tensor([3, 2]), ub_tokens_across_dp=None
+        scheduled_tokens_per_dp_rank=torch.tensor([3, 2]), ub_tokens_across_dp=None
     )
     mode = SimpleNamespace(
         sync=sync,
@@ -316,7 +316,8 @@ def test_a_rank_s_view_names_its_own_slot_of_the_split():
     r = runner(None, dp_size=2, dp_rank=1)
     r.drafter = None
     sync = SimpleNamespace(
-        num_tokens_across_dp=torch.tensor([7, 7]), ub_tokens_across_dp=((4, 3), (3, 4))
+        scheduled_tokens_per_dp_rank=torch.tensor([7, 7]),
+        ub_tokens_across_dp=((4, 3), (3, 4)),
     )
     mode = SimpleNamespace(
         sync=sync, running_tokens_are_unified=False, use_cudagraph=False, running_bs=1
@@ -337,7 +338,7 @@ from types import SimpleNamespace
 from atom.compass.capture import driverless
 driverless.install(sys.argv[1], "gfx950")
 driverless.group(1, 1)
-from atom.model_ops.fused_moe import mori_prepare_finalize as mori
+from atom.model_ops.fused_moe.routed_rows import resolve_routed_rows_wire
 from atom.compass.run.modules import walk
 
 class Mxfp4MoEMethod:
@@ -358,10 +359,13 @@ for case, (method, backend, off, combine, fp4, v2) in json.loads(sys.argv[2]).it
     os.environ.update(
         ATOM_DISABLE_MORI_EP=off, ATOM_MORI_COMBINE_QUANT=combine, ATOM_MORI_V2=v2
     )
-    mori._FP4_DISPATCH = fp4
     # EP2 over two data-parallel ranks of TP1 attention.
     moe = FusedMoE()
     moe.quant_method, moe._comm_fused_moe = globals()[method](), None
+    # The method's routed-rows wire, as ATOM_MORI_FP4_DISPATCH sets it.
+    moe.quant_method.routed_rows_wire = (
+        resolve_routed_rows_wire(torch.bfloat16, 32, fp4=True) if fp4 else None
+    )
     moe.w13_weight = torch.empty(4, 64, 32, dtype=torch.bfloat16, device="meta")
     moe.global_num_experts, moe.top_k, moe.hidden_size = 8, 2, 32
     moe.moe_config = SimpleNamespace(in_dtype=torch.bfloat16)

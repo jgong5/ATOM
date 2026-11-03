@@ -2,7 +2,7 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header.
-**Decisions D0–D105, with no gaps, and their sub-decisions** are indexed at the end of this
+**Decisions D0–D106, with no gaps, and their sub-decisions** are indexed at the end of this
 file. The TODOs are registered in **`12_open_items.md`**, with the load-bearing assumptions
 and the cross-cutting issues. Implementation follows the execution plan in `16`.
 
@@ -75,7 +75,7 @@ ATOM's real code owns still never touch a device.
 | **Device memory readings** | **SUBSTITUTED** | The five readings are built from the machine spec, the model and a `memory_readings` entry `compass measure memory` took on the target, instead of the runtime, so a host without the device can model it. The budget *arithmetic* around them is ATOM's. `03` D14, `07` D38 |
 | **Wall-clock time** | **SUBSTITUTED** | Every clock read and timer the Clock Authority can reach runs on virtual time, failure detectors and metrics cadence included. Only the Atomesh router's bounds and health check, set by its flags, OS-level process-death detection and the control-command reply deadline stay real ([`01` K8](01_execution_and_time_model.md#d4-the-interception-contract-which-waits-must-be-touched)). `01` D5, `11` D72 |
 | **Collectives / comms** | **SIMULATED** (cost only) | Priced from measurements or the spec; no collective actually runs on a device. `07` D40 |
-| **Atomesh router** | **REUSED, configured** | No Compass change beyond the `--worker-request-timeout-secs` option (#478); a simulated launch sets it large and switches the health check and circuit breaker off. The simulated timeline rides carriers the router already relays: the `compass` entry of the `tracestate` header on requests, a field in `kv_transfer_params` on the prefill-to-decode forward, and SSE comment lines on streamed output. `01` D7, `06` D30 |
+| **Atomesh router** | **REUSED, configured** | No Compass change beyond the `--worker-request-timeout-secs` option (#478); a simulated launch sets it and `--request-timeout-secs` large and switches the health check and circuit breaker off. The simulated timeline rides carriers the router already relays: the `compass` entry of the `tracestate` header on requests, a field in `kv_transfer_params` on the prefill-to-decode forward, and SSE comment lines on streamed output. `01` D7, `06` D30 |
 | **Serving *decisions*** | **NOT MODELLED** | Compass predicts the time decisions consume, not the decisions themselves — because it reuses the code that makes them. *(A simple serving simulation is planned as a future part of Compass; explicitly out of scope for this work.)* |
 
 **The rule underneath the table:** anything that is *arithmetic* is reused; anything that is
@@ -229,6 +229,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L3 | Step grid backend (step-level), a stage-2 candidate | [`17`](17_step_grid_backend.md) | D96–D105 |
 | L4 | Harness contract, wire fields, adapter | [`06_workload_harness_contract.md`](06_workload_harness_contract.md) | D27–D35 |
 | L5 | The calibration phases, the measurement bench and the recommended flow | [`07_calibration_toolchain.md`](07_calibration_toolchain.md) | D36–D43 |
+| L5 | The JIT sweep and the per-stack cache library that warm a container before a graded run | [`07`](07_calibration_toolchain.md) | D106 |
 | L5 | Machine spec schema and probes | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
 | L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
 | — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D50.1, D50.2, D50.3) |
@@ -344,7 +345,9 @@ graded as a candidate for #627's stage 2 (`17` D96, `07` D36).
 
 The analytical method has its own gate, stated in advance: on every measured step, at both
 granularities, it prices **at most the measured time**; configuration ranking and the
-method's error are reported, not gated (`10` D67.1, #1392).
+method's error are reported, not gated (`10` D67.1, #1392). Stage 4 checks it on MI455's own
+runs at peaks probed there, and reports the method's error as the same MI455 records
+bounded at the frozen projection's spec and at the probed one (`16` *Stage 4*, `08` D50.2).
 
 Final proof is **paired simulated and real execution of cc-traces proper**.
 
@@ -353,7 +356,7 @@ Final proof is **paired simulated and real execution of cc-traces proper**.
 | # | Milestone |
 |---|---|
 | **M1** | **[#627](https://github.com/jgong5/ATOM/issues/627) stages 1 and 1b: cc-traces end to end on a GPU-free simulated run** (`16` D95). Stage 1 drives cc-traces through agentx-harness at TP1; stage 1b adds atomesh at 1P+1D; each run ends by the finish. Built on the discrete-event foundation, fake models covering prefill, decode and KV need, and the test harness |
-| **M2 — v1** | **#627 stage 3: DeepSeek-V4-Pro 1P+1D on MI355X within the targets above**, first in the nightly configurations with expert parallelism off, then at EP8 — each step first the same scheduling decisions as the real engine, then the separable results of `08` D44 and the configuration-ranking gate; **the MI455 roofline projection**, held to the soundness checks of `16` D95. **First gate, #627 stage 2:** Qwen3.8-27B TP1 on MI308X, paired real and simulated cc-traces graded by `08` |
+| **M2 — v1** | **#627 stage 3: DeepSeek-V4-Pro 1P+1D on MI355X within the targets above**, first in the nightly configurations with expert parallelism off, then at EP8 — each step first the same scheduling decisions as the real engine, then the separable results of `08` D44 and the configuration-ranking gate; **the MI455 roofline projection** of stage 3c, held to the soundness checks of `16` D95 and then frozen; last, **stage 4: DeepSeek-V4.1-Flash measured on MI455 and graded by the step linear backend in two TP4 DSpark5 cells**, with the analytical bound checked on the same runs (`16` *Stage 4*, [#2138](https://github.com/jgong5/ATOM/issues/2138)). **First gate, #627 stage 2:** Qwen3.8-27B TP1 on MI308X, paired real and simulated cc-traces graded by `08` |
 | ~~M3–M7~~ | Retired by `16` D95, which maps each one to where its scope went. PP, EP beyond one node, and further models come after v1 |
 
 Sequencing, dependencies and parallelisable work are in the execution plan (`16`). `00_initial_prompt.md` is the original seed and is
@@ -485,7 +488,7 @@ The documents use these precisely; a reader will bounce off without them.
 | **logical process (LP)** | the unit the Clock Authority coordinates. *Not* an OS process — a TP group is one LP, a DP group is one LP, because both already have a hardware barrier. |
 | **structure** | a distinct operator list, independent of shape: the discrete part of a graph's applicability key (`04` D19). Prefill has two (chunked, unchunked). Graphs are captured per shape, one per decode width and prefill (T, B) (`04` D18). |
 | **treatment** | a factor that moves cost and is invisible to every feature in the model. Uniform MoE routing under DP is one. Decode **row order** is one to the op-level IR. The step linear law prices it with `rowmod(k)` (`09` D61); the step grid's residual reads it (`17` D100). |
-| **refusal** | a declined answer with a named reason. Refusals are results, not errors, and are preferred to guesses everywhere. A **refused step** is one with some term still unanswered after method fallback, its reasons listed per term: it costs 0 s, the run continues, and any refusal makes the run a coverage report (`08` D50.1). A source that declines while a later one answers is a fall-through, and an answer of any method, unvalidated included, is reported by its method; neither is a refusal. |
+| **refusal** | a declined answer with a named reason. Refusals are results, not errors, and are preferred to guesses everywhere. A **refused step** is one with some term still unanswered after method fallback, its reasons listed per term: each unanswered term costs 0 s, and a step the cost backend refuses charges no device time, its answered terms included; the run continues, and any refusal makes the run a coverage report (`08` D50.1). A source that declines while a later one answers is a fall-through, and an answer of any method, unvalidated included, is reported by its method; neither is a refusal. |
 | **step grid** | the step-level backend of `17`, run-file key `step_grid`: a grid of step measurements looked up per batch, plus a residual, fitted on real-run step times, bench replays or both, for what the grid's coordinates cannot see (row order, raggedness). |
 | **complete cell** | a cell of the step grid whose every corner was measured. The step grid interpolates only inside one; it extrapolates a decode cell past the KV pool, and anywhere else declines to the step roofline (`17` D99, D102). |
 | **recipe** | the step grid's feature functions and the constants frozen with them. Configuration supplies geometry and hardware values, a fit supplies coefficients, and a recipe's version changes only when a function does. |
@@ -543,7 +546,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`07`](07_calibration_toolchain.md) | Calibration and Benchmarking Toolchain | The phases and the commands that run them; the backend that needs a measurement plans it; the step bench is `EngineCore` without its scheduler, with one window for every step; the op bench times each leaf from its contract, cold, at points ATOM's runner prepares without a forward, and `fit ops` interpolates only between same-kernel neighbours. One recommended flow per half, steps and ops. The minimal recipe: one full-engine run at TP1, plus one TP2 transfer test, plus an engine start per configuration (`measure memory`). Four classes of communication pricing. The artifact store, its keys and its invalidation matrix. |
+| [`07`](07_calibration_toolchain.md) | Calibration and Benchmarking Toolchain | The phases and the commands that run them; the backend that needs a measurement plans it; the step bench is `EngineCore` without its scheduler, with one window for every step; the op bench times each leaf from its contract, cold, at points ATOM's runner prepares without a forward, and `fit ops` interpolates only between same-kernel neighbours. One recommended flow per half, steps and ops. The minimal recipe: one full-engine run at TP1, plus one TP2 transfer test, plus an engine start per configuration (`measure memory`). Four classes of communication pricing. The artifact store, its keys and its invalidation matrix. A constructed JIT sweep and a per-stack cache library warm a container before a graded run. |
 | [`09`](09_fitting_and_law_selection.md) | Fitting and Law Selection | How measurements become a model: fit relative error, per-rung decode, hull guards not bounding boxes, and why leave-one-out cannot choose a family. Owns coverage geometry for every other document. |
 
 ### Part IV — How it is driven and judged
@@ -551,7 +554,7 @@ The documents use these precisely; a reader will bounce off without them.
 | Doc | Title | What it settles |
 |---|---|---|
 | [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced stamp each direction, audited for minimality: a `tracestate` entry in, an SSE comment line per event out. The timeline rides carriers Atomesh already forwards, so it needs no change. Tokenizer cost is a queue, not a constant. |
-| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two gates: a CPU gate over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU gate, a superset judged as a **delta** against pure upstream `661ef7661` on the nightly 20261013 image (`gate_gpu.sh`'s `BASE_*` constants, every failing node-id on file in `gpu_gate_known_failures.txt`). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible if stable; sensitivity is deferred. |
+| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two gates: a CPU gate over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU gate, a superset less the files that stall or fail at random on its GPU (`gpu_gate_skip.txt`), judged as a **delta** against a recorded baseline per GPU target (`gpu_gate_baselines/<target>/gpu_gate_baseline.env`, every failing node-id on file in `gpu_gate_known_failures.txt` beside it, both rewritten by `regen_gpu_gate_baseline.sh`). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible if stable; sensitivity is deferred. |
 | [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. The metrics push and refresh are daemon timers on simulated time. |
 
 ### Part V — Cross-cutting
@@ -586,7 +589,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D17 – D23 (+ D18.1) | `04` Model Capture and the Cost IR |
 | D24 – D26 (+ D25.1) | `05` Machine Specification and its Probes |
 | D27 – D35 (+ D34.1) | `06` Workload Harness Contract |
-| D36 – D43 (+ D38.1, D40.1) | `07` Calibration and Benchmarking Toolchain |
+| D36 – D43 (+ D38.1, D40.1), D106 | `07` Calibration and Benchmarking Toolchain |
 | D43.1, D44 – D52 (+ D50.1, D50.2, D50.3) | `08` Validation Protocol |
 | D53 – D62 | `09` Fitting and Law Selection |
 | D63 – D70 (+ D67.1) | `10` Analytical Laws |
@@ -617,5 +620,5 @@ The documents use these precisely; a reader will bounce off without them.
 | D45 | The real-vs-real spread is the tolerance; a metric must be stable, and sensitivity is deferred |
 | D3.2 | Always-on causality detectors: a straggler, checked on receipt and at each drain, fails the run rather than warning; a stall the Clock Authority cannot see waits for ever and prints one `DIAG_S` diagnostic, never aborting; a CI clock-source lint |
 | D3.3 | The Clock Authority ships two deployment forms from one implementation: co-hosted by default, standalone for multi-container runs |
-| D43.1 | ATOM's suite is a merge gate on every Compass change, unmodified, in two gates: a CPU gate (every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free as a batch, held to green) per change, a GPU gate, a superset judged as a delta per wave against `gate_gpu.sh`'s recorded baseline, by an equality on a per-tree expectation rather than "no worse than". The CPU gate **exits 98** rather than reporting "GPU not required" when it cannot tell |
+| D43.1 | ATOM's suite is a merge gate on every Compass change, unmodified, in two gates: a CPU gate (every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free as a batch, held to green) per change, a GPU gate, a superset less the files `gpu_gate_skip.txt` names for its GPU, judged as a delta per wave against `gate_gpu.sh`'s recorded baseline, by an equality on a per-tree expectation rather than "no worse than". The CPU gate **exits 98** rather than reporting "GPU not required" when it cannot tell |
 | D67.1 | The analytical method's gate is a **bound**: on every measured step, at both granularities, analytical is at most measured; configuration ranking and measured over analytical are reported, not gated |

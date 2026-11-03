@@ -111,8 +111,9 @@ container, entered with `docker exec -it ${USER}_compass_gpu bash`.
   templated modules, by about 230 MB: about 1.5 GB in all for the smoke cell.
   aiter's JIT directory, `/app/aiter-test/aiter/jit`, holds the image's prebuilt
   modules, so it stays in the container's layer on Docker's storage disk
-  (`docker info -f '{{.DockerRootDir}}'`), gaining each module a server builds,
-  10 MB for step 0's. Keep data off the root disk. When no disk has room for the data
+  (`docker info -f '{{.DockerRootDir}}'`), gaining each module a server builds:
+  through step 0 the layer grew by 22 MB (`docker ps -s`), 14 MB of aiter's build
+  and 6 MB of aiperf's bytecode. Keep data off the root disk. When no disk has room for the data
   directory, use the host's tmpfs, such
   as `/tmp/<user>_compass`: memory, lost at reboot, its files written as root,
   so copy out what should stay and remove the rest from inside the container.
@@ -161,7 +162,8 @@ One server and its client run, used by steps 0, 2, 3 and 5:
 
 ```bash
 # serve OUT TRACES C PYTHON COMMAND...: start a compass server writing to OUT,
-# send it one client run of D seconds (default 1800), and stop it. The server
+# send it one client run of D seconds (default 1800), or with C `sweep` the
+# JIT sweep, and stop it. The server
 # logs to OUT/server.log; the compass command's own output, empty unless it
 # refuses, goes to $R/logs/. It refuses an OUT that exists, and fails when the
 # server dies or does not answer within 30 min, or the client run fails.
@@ -177,8 +179,10 @@ serve() {
       { kill $pid 2>/dev/null; echo "serve: no server; see $log" >&2; return 1; }
     sleep 5
   done
+  local run=(--concurrency $c --duration ${D:-1800})
+  [ $c != sweep ] || run=(--sweep)
   HARNESS_PYTHON=$py $T/scripts/compass/client.sh $out --traces $traces \
-    --concurrency $c --duration ${D:-1800} --stop || { kill $pid 2>/dev/null; wait $pid; return 1; }
+    "${run[@]}" --stop || { kill $pid 2>/dev/null; wait $pid; return 1; }
   wait $pid
 }
 ```
@@ -197,27 +201,50 @@ traces 0 to 255 that is 15 requests, which took 1334 s on one MI308X of
 hjbog-srdc-39 ([#1760](https://github.com/jgong5/ATOM/issues/1760)). Grading
 refuses a run whose warmup is missing or overlaps its graded steps.
 
+The scenario also wants a first token or a request's end in the duration's last
+5%, and aiperf exits 1 when none falls there. At low concurrency one long request
+can span that window, and aiperf cancels it at the cutoff and records nothing of
+it, as step 2's c=1 record did once on node 18
+([#2330](https://github.com/jgong5/ATOM/issues/2330)). Such a run is complete.
+`client.sh` prints `client: aiperf failed its coverage check alone: ...` and
+writes the export; any other aiperf failure fails the client run.
+
 ## The path
 
 Times were measured on node 18 for the cell in
 [PR #1336](https://github.com/jgong5/ATOM/pull/1336), at concurrencies 1, 4, 16,
 64 and 256 with a 1800 s benchmark each.
 
-**0. Warm a fresh container** (GPU, once per container; 15 min as in the smoke
-cell, and a minute more for the build below).
+**0. Sweep a fresh container** (GPU, once per container; not timed on this cell:
+a round sends one prefill step for every token count up to the budget, 16384 here,
+each behind budget-filling steps, so it grows with the budget squared; Qwen3-0.6B
+at a 1024-token budget took 4.5 min a round on one MI308X of node 18, its server
+start included).
 
 ```bash
-D=600 serve $R/warm 0-7 1 $REAL_PY record --gpu $G
+for k in 1 2 3; do
+  rm -rf $R/sweep$k   # a restarted container's earlier round, which serve would refuse
+  serve $R/sweep$k 0-392 sweep $REAL_PY record --gpu $G $S || break
+  grep -qF '"missing": []' $R/sweep$k/sweep.json && break
+done
 ```
 
-A server builds an aiter kernel the first time it meets a variant its image did
+A server builds an aiter, FlyDSL or `compile_hsaco` kernel, or a Triton or Inductor one outside ATOM's compile cache, the first time it meets a variant its image did
 not prebuild, such as `mha_varlen_fwd`'s for a prefill step of one new token a
 row, about 60 s inside the run, and the container keeps it for every later
 server. A record whose server built one names it in run.json's
 `aiter_jit_builds`, and grading, the fits and `validate.cost` refuse that
-record. This record takes those builds; nothing reads it. `smoke_cell.sh`
-serves the same record before its calibration, so a container it ran in is
-warm. Success: `serve` returns 0.
+record. Each round sends the server the JIT sweep of this cell for the traces
+every later step serves, the points its records' keys are selected by, and
+after the stop keeps what it compiled and the points its record covered in the
+store's JIT cache library (`scripts/compass/README.md`, the full path); nothing
+reads its record. A round sends only the points still missing, and its last
+line says whether the cell is `swept`. A third round's missing points, in
+`sweep3/sweep.json`, are the residual to report. The next container on the same
+stack starts from the library, and its sweep returns at once. `smoke_cell.sh`
+serves a record before its calibration instead, so a container it ran in is
+warm only for its own traces. A restarted container takes this step again
+(Environment). Success: the last round's line reads `swept`.
 
 **1. Memory readings** (GPU, 2 to 3 min after step 0; 5 min as a fresh
 container's first start, as in
@@ -306,8 +333,25 @@ real spread`, `outside`, or `ungradeable` when the real runs disagree by more th
 the target. A graded row's value is the `spread`, the largest distance between
 two real runs, and the `result`, the simulated run's distance to each real run:
 `|a / b - 1|` end to end, the KS statistic for distributions, `|a - b|` for
-counts. The `warmup` rows state each run's warmup requests and steps. The
-protocol is [08_validation_protocol.md](../../atom/compass/design/08_validation_protocol.md).
+counts. Counts and distributions cover only the graded steps, after the warmup,
+so real runs that schedule them alike read `spread 0`. `within target` and
+`ungradeable` are end to end's only. The other verdicts:
+
+- `exact`: a count every real run shares with the simulated run.
+- `not gated`, alone or after a count's verdict (all but `preemptions` and
+  `prefill tokens`): reported, not gated.
+- `-`: cost on graded steps, which the protocol's cost gate reads; and rows with
+  nothing to judge: steps cost left out, declined or extrapolated, a TTFT band
+  with no request, the graph pool.
+- `not graded`: the `warmup` rows, each run's warmup requests and steps.
+- Memory, per term of a real run against the simulated engine's: `pass` or
+  `fail` against its gate; `not discharged`, within it but predicted from a
+  declared input or that same run; `refused`, the two sides not comparable.
+- The summary's `refusals`: `none`, or `coverage report` when the simulated run
+  refused a step or was stopped early. Its `speed`, simulated over wall seconds against the target
+  N: `meets <N>x`, `below <N>x`, or `no result for <N>x` with no wall time.
+
+The protocol is [08_validation_protocol.md](../../atom/compass/design/08_validation_protocol.md).
 
 Two more developer checks, the recurrence gate on each calibration record and
 the step-for-step comparison with `cctraces_sim.sh`, are in the README's
@@ -367,7 +411,7 @@ law's accuracy.
 | `kill: %%: no such job` | `serve` already stopped that server, when its client run failed or ended | nothing to stop; run `jobs` first |
 | `serve: OUT exists; leave a finished run out, rm -rf a stopped one` | a loop taken again over a run it already took | leave a finished concurrency out of the loop; `rm -rf` a stopped or short run's `--out` |
 | `Triton cache error`, or `failed to map segment from shared object` | a `--tmpfs` without `exec` | the container as Environment starts it |
-| grading, a fit or `validate.cost` refuses a record: `aiter ran a JIT build of [...] while its server served` | the container met that kernel variant for the first time inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
+| grading, a fit or `validate.cost` refuses a record: `its server ran a JIT compile of [...] while it served` | the server compiled a kernel the container had not met, aiter's, Triton's, Inductor's, FlyDSL's or `compile_hsaco`'s, inside the record | take the record again, since the container now holds the build; warm a fresh container first (step 0) |
 | verdict `coverage report`, `no decode vector for rung N` | no calibration step decoded N requests at once (a rung is the batch's captured-graph size). Concurrency alone does not reach N, since each lane replays from its own sampled start: for Qwen3.8-27B TP1 on one MI308X, calibration at c=16 (traces 256 to 392) decoded at most 7 at once, the graded cell (traces 0 to 255) up to 8 ([#1840](https://github.com/jgong5/ATOM/issues/1840)) | add a calibration record that starts every trajectory at its first turn, at concurrency N, to step 4's records: `calib_capture.sh` with `CELLS=N AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"` (`cctraces_sim.sh`'s header); such records at c=8, 10 and 12 give the shipped law its rung 8 |
 | grading refuses a run: `its export names no warmup` | no session was in flight at any lane's sampled start, so aiperf sent no warmup request: `artifacts/client_run.json` has an empty `warmup` and `client/aiperf.log` says `nothing to warm`. `client.sh` pins aiperf's seed, so the same traces and concurrency draw the same starts | no run of this cell is graded, since its first steps may be cold, and a fresh run repeats the draw; a higher concurrency adds lanes, each keeping its start; another trace range draws other starts |
 | grading refuses a run: warmup | its warmup overlapped its graded steps | a fresh server and client run |

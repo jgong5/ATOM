@@ -51,6 +51,7 @@ def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True, dr
         context_lens=[c for _, c, _ in rows],
         req_ids=list(range(len(rows))),
         produces_output=lambda: output,
+        final_prefill_requests=lambda: prefill,
         is_dummy_run=False,
     )
 
@@ -59,10 +60,11 @@ def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True, dr
         return SimpleNamespace(
             max_bs_across_dp=max([len(rows), *(b for b, _, _ in peers)]),
             any_rank_has_prefill=bool(prefill) or any(p for *_, p in peers),
+            prefill_across_dp=(bool(prefill), *(p for *_, p in peers)),
             any_rank_needs_eager=False,
             max_seqlen_q_across_dp=None,
             tbo_collective_active=False,
-            num_tokens_across_dp=torch.tensor(counts),
+            scheduled_tokens_per_dp_rank=torch.tensor(counts),
             ub_tokens_across_dp=None,
         )
 
@@ -74,11 +76,11 @@ def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True, dr
         enforce_eager=eager,
         step_needs_eager=False,
         capture_sizes=np.array([0] if eager else LADDER, dtype=np.int32),
-        captured_tokens=None,
         is_block_drafter=False,
         tbo_on=False,
         local_tbo=(False, False, 0, 0),
         max_seqlen_q=3,
+        running_tokens_per_dp_rank=np.zeros(1 + len(peers), dtype=np.int32),
     )
     r = runner(None, dp_size=1 + len(peers))
     step = object() if step else None

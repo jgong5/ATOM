@@ -65,7 +65,7 @@ def spec_with(peak_bytes_per_s, *, link="intra_node"):
 
 def model_for(geometry, peak, scope=Scope.INTRA_NODE):
     """The transfer model a spec at that link speed gives this geometry."""
-    return TransferModel.from_spec(spec_with(peak), geometry, scope)
+    return TransferModel.from_spec(spec_with(peak), geometry.bytes_per_block, scope)
 
 
 def test_the_worker_half_is_built_by_name_and_reports_nothing():
@@ -144,7 +144,7 @@ def test_the_connector_names_no_clock_of_its_own():
 def test_the_derate_is_spent_and_not_the_spec_peak(geometry):
     """A datasheet number is not an achievable one, and is not charged as one."""
     spec = spec_with(PEAKS[0])
-    model = TransferModel.from_spec(spec, geometry, Scope.INTRA_NODE)
+    model = TransferModel.from_spec(spec, geometry.bytes_per_block, Scope.INTRA_NODE)
     derate = spec.value("interconnect.intra_node.derate")
     assert 0 < derate < 1, "this document states no haircut, so nothing is proven"
     assert model.bandwidth_bytes_per_s == PEAKS[0] * derate
@@ -153,8 +153,8 @@ def test_the_derate_is_spent_and_not_the_spec_peak(geometry):
 def test_the_named_side_of_the_node_boundary_is_the_one_priced(geometry):
     """No transfer is quietly priced on the other side's link."""
     spec = spec_with(PEAKS[0])
-    intra = TransferModel.from_spec(spec, geometry, Scope.INTRA_NODE)
-    inter = TransferModel.from_spec(spec, geometry, Scope.INTER_NODE)
+    intra = TransferModel.from_spec(spec, geometry.bytes_per_block, Scope.INTRA_NODE)
+    inter = TransferModel.from_spec(spec, geometry.bytes_per_block, Scope.INTER_NODE)
     assert intra.latency_s == spec.value("interconnect.intra_node.link_latency_s")
     assert inter.latency_s == spec.value("interconnect.inter_node.link_latency_s")
     assert intra.duration_s(512) < inter.duration_s(512)
@@ -180,9 +180,9 @@ def test_a_spec_that_cannot_answer_for_the_link_refuses(geometry):
         },
         tokenizers=spec.tokenizers,
     )
-    TransferModel.from_spec(without, geometry, Scope.INTRA_NODE)
+    TransferModel.from_spec(without, geometry.bytes_per_block, Scope.INTRA_NODE)
     with pytest.raises(SpecRefusal) as refusal:
-        TransferModel.from_spec(without, geometry, Scope.INTER_NODE)
+        TransferModel.from_spec(without, geometry.bytes_per_block, Scope.INTER_NODE)
     message = str(refusal.value)
     assert "interconnect.inter_node.link_" in message, message
     assert "intra_node" not in message, message
@@ -250,9 +250,16 @@ def test_a_zero_block_write_leaves_the_setup_to_the_first_write_with_blocks():
 @pytest.mark.parametrize("scope", list(Scope))
 def test_the_setup_is_the_named_links_and_zero_when_absent(geometry, scope):
     document = copy.deepcopy(DOCUMENT)
-    assert TransferModel.from_spec(spec_with(PEAKS[0]), geometry, scope).setup_s == 0
+    assert (
+        TransferModel.from_spec(
+            spec_with(PEAKS[0]), geometry.bytes_per_block, scope
+        ).setup_s
+        == 0
+    )
     document["interconnect"][scope.value]["link_setup_s"] = 0.01
     spec = MachineSpec.from_mapping(document)
-    assert TransferModel.from_spec(spec, geometry, scope).setup_s == 0.01
+    assert (
+        TransferModel.from_spec(spec, geometry.bytes_per_block, scope).setup_s == 0.01
+    )
     other = next(s for s in Scope if s is not scope)
-    assert TransferModel.from_spec(spec, geometry, other).setup_s == 0
+    assert TransferModel.from_spec(spec, geometry.bytes_per_block, other).setup_s == 0
