@@ -43,7 +43,7 @@ from atom.sampling_params import SamplingParams
 
 MS = 1_000_000
 BACKEND = StepStubBackend()
-#: Per admitted request, per prompt token past the hit and per token in it.
+#: If a forward admits requests, per prompt token past the hit and per token in it.
 ADMIT = [1.0e-3, 26e-9, 10e-9]
 
 
