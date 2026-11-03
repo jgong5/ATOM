@@ -180,6 +180,14 @@ def admissions(lines: list[dict]) -> list[tuple[int, int, int]]:
     return out
 
 
+def admit_x(admitted: tuple) -> tuple[int, int, int]:
+    """The `admit` law's features of a forward's `admitted`: 1 if it admits a
+    request, then the prompt tokens past the hits and within them, summed over
+    every request it admits."""
+    requests, uncached, cached = admitted
+    return min(requests, 1), uncached, cached
+
+
 def group_tokens(lines) -> int | None:
     """The real tokens among a data-parallel step's `moe_rows`: ATOM's
     `num_tokens_across_dp` summed over every rank's line at that step, a dummy
