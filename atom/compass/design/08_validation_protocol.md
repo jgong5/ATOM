@@ -882,7 +882,7 @@ inventory of forms, and each one's level today, is tracked on
    start without one). Its cases, at either level, therefore run in the GPU gate, per wave,
    which sets their models. The matrix test and the router policies' cases, whose
    frontends are scripted and need no driver, run in the CPU gate. D43.1's trigger list is
-   unchanged: CPU-gate tests that collect import every `atom/compass` path, so none is in
+   unchanged: no test the CPU gate excludes names an `atom/compass` path, so none is in
    it, and a change that breaks a form's level 1 is found at the next wave, not before it
    lands. Whether the paths a level-1 case imports should trigger a GPU run of the matrix
    alone waits on the matrix's measured wall time (T106).

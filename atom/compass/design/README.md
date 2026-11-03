@@ -172,7 +172,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       +- op-level graph    +- weights               |
   |                       +- step-level: stub, +- KV (ATOM's arithmetic)|
   |                          linear, grid      +- activations           |
-  |                       +- step roofline, a fallback                  |
+  |                       +- step roofline, a fallback or alone         |
   |                       each term: analytical, declared, measured     |
   |                       or estimated                                  |
   |                       Cost IR: Seq/Repeat/Par, opaque leaves        |
