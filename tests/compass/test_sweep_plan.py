@@ -13,6 +13,14 @@ SAMPLING = {"ignore_eos": True, "temperature": 0}
 TBO_MIN = 512
 
 
+@pytest.fixture(autouse=True)
+def tbo(monkeypatch):
+    """ATOM's two-batch overlap rule as the server runs it: split at the token
+    midpoint once a rank reaches `TBO_MIN`."""
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", str(TBO_MIN))
+    monkeypatch.delenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", raising=False)
+
+
 def _engine(**fields):
     return {
         "ladder": [1, 2, 4],
@@ -45,7 +53,7 @@ def _tokens(point):
 
 
 def test_a_walks_every_count_once_on_the_rank_its_count_chooses(tmp_path):
-    points = plan(_write(tmp_path, _engine(), _engine()), _workload(300), TBO_MIN)
+    points = plan(_write(tmp_path, _engine(), _engine()), _workload(300))
     a = [p for p in points if p.split is None]
     assert [_tokens(p) for p in a] == list(range(1, 513))
     assert [(p.rank, p.step) for p in a[:4]] == [(0, 0), (1, 0), (0, 1), (1, 1)]
@@ -60,13 +68,13 @@ def test_a_walks_every_count_once_on_the_rank_its_count_chooses(tmp_path):
     assert b[0].step == 256 and [p.rank for p in b[:4]] == [0, 1, 0, 1]
     # Without DP attention a rank's budget is its share of the group's.
     no_dpa = _engine(enable_dp_attention=False)
-    points = plan(_write(tmp_path, no_dpa, no_dpa), _workload(300), TBO_MIN)
+    points = plan(_write(tmp_path, no_dpa, no_dpa), _workload(300))
     assert max(_tokens(p) for p in points if p.split is None) == 256
 
 
 def test_b_takes_every_offset_and_parked_count_and_splits_each_tbo_step(tmp_path):
     engine = _engine(enable_tbo=True, max_num_batched_tokens=1024)
-    points = plan(_write(tmp_path, engine, engine), _workload(3000), TBO_MIN)
+    points = plan(_write(tmp_path, engine, engine), _workload(3000))
     two = [p for p in points if p.split is not None and len(p.rows) == 2]
     unsplit = [p for p in two if not p.split]
     # The second row's offset, the first row's length, mod 16, by parked decodes.
@@ -82,17 +90,45 @@ def test_b_takes_every_offset_and_parked_count_and_splits_each_tbo_step(tmp_path
     split = [s for s in steps.values() if s[0].split]
     assert len(split) == 128
     assert {tuple(_tokens(p) >= TBO_MIN for p in s) for s in split} == {(True, False)}
-    # Too small a budget for a split step plans none.
+    # Too small a budget for a split step of two rows plans none.
     small = engine | {"max_num_batched_tokens": TBO_MIN + 16 * 17}
-    points = plan(_write(tmp_path, small, small), _workload(3000), TBO_MIN)
-    assert not any(p.split for p in points)
+    points = plan(_write(tmp_path, small, small), _workload(3000))
+    assert not any(p.split for p in points if len(p.rows) == 2)
+
+
+def test_steps_split_by_atoms_rule_and_a_leaves_a_rank_idle_where_it_would_split(
+    tmp_path, monkeypatch
+):
+    engine = _engine(enable_tbo=True, max_num_batched_tokens=1024)
+    steps = {}
+    for p in plan(_write(tmp_path, engine, engine), _workload(3000)):
+        steps.setdefault(p.step, []).append(p)
+    a = [s for s in steps.values() if s[0].split is None]
+    b = [s for s in steps.values() if s[0].split is not None]
+    # A round reaching the minimum would split, so from 511 and 512's round on
+    # rank 1 has no row, which vetoes the split.
+    assert [len(s) for s in a] == [2] * 255 + [1] * 514
+    assert [_tokens(s[0]) for s in a[254:257]] == [509, 511, 512]
+    # A B step splits when a rank reaches the minimum and every rank has two
+    # prefill tokens to cut, a chunked row's step among them.
+    tokens = [[_tokens(p) for p in s] for s in b]
+    assert [s[0].split for s in b] == [
+        len(t) == 2 and min(t) > 1 and max(t) >= TBO_MIN for t in tokens
+    ]
+    assert any(s[0].split for s in b if s[0].cached == ("chunk",))
+    # Split on a request boundary, one row cannot split: A keeps every rank, and
+    # only two-row steps split.
+    monkeypatch.setenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "0")
+    points = plan(tmp_path, _workload(3000))
+    assert max(p.step for p in points if p.split is None) == 511
+    assert {len(p.rows) for p in points if p.split} == {2}
 
 
 def test_b_rows_on_a_context_take_each_query_size_over_chunk_cuts_and_prefixes(
     tmp_path,
 ):
     engine = _engine(data_parallel_size=1)
-    points = plan(_write(tmp_path, engine), _workload(3000), TBO_MIN)
+    points = plan(_write(tmp_path, engine), _workload(3000))
     contexts = {}
     for p in points:
         if p.cached[0]:
@@ -108,30 +144,28 @@ def test_b_rows_on_a_context_take_each_query_size_over_chunk_cuts_and_prefixes(
     # Prefixes from one KV block, where no chunk row already takes them.
     assert {c for _, c in contexts["prefix"]} == {16, 32}
     no_prefix = engine | {"enable_prefix_caching": False}
-    points = plan(_write(tmp_path, no_prefix), _workload(3000), TBO_MIN)
+    points = plan(_write(tmp_path, no_prefix), _workload(3000))
     assert {p.cached for p in points} == {("",), ("", ""), ("chunk",)}
 
 
 def test_no_point_leaves_the_engine_or_the_workload(tmp_path):
     engine = _engine(data_parallel_size=1, enable_prefix_caching=False, max_num_seqs=1)
-    points = plan(_write(tmp_path, engine), _workload(100), TBO_MIN)
+    points = plan(_write(tmp_path, engine), _workload(100))
     # One sequence: A's counts up to the longest prompt, one row each, and no B.
     assert [p.rows for p in points] == [((t, t),) for t in range(1, 101)]
     # Two rows and 15 parked decodes fill 17 sequences.
     _write(tmp_path, engine | {"max_num_seqs": 17})
-    assert max(p.held for p in plan(tmp_path, _workload(3000), TBO_MIN)) == 15
+    assert max(p.held for p in plan(tmp_path, _workload(3000))) == 15
     # A prompt leaves room in the context for its two output tokens.
     _write(tmp_path, engine | {"max_num_seqs": 64, "max_model_len": 50})
-    assert (
-        max(c for p in plan(tmp_path, _workload(100), TBO_MIN) for _, c in p.rows) == 48
-    )
+    assert max(c for p in plan(tmp_path, _workload(100)) for _, c in p.rows) == 48
     # A drafter's tokens take KV blocks too: one block of 16 holds 14 prompt
     # tokens and the two output tokens, but only 9 with three drafts; a parked
     # decode needs more than one.
     one_block = engine | {"num_kvcache_blocks": 1}
-    assert len(plan(_write(tmp_path, one_block), _workload(100), TBO_MIN)) == 14
+    assert len(plan(_write(tmp_path, one_block), _workload(100))) == 14
     _write(tmp_path, one_block | {"speculative": ["mtp", 3]})
-    assert len(plan(tmp_path, _workload(100), TBO_MIN)) == 9
+    assert len(plan(tmp_path, _workload(100))) == 9
     # The smallest rank's pool bounds every rank's points.
     two = plan(
         _write(
@@ -140,13 +174,12 @@ def test_no_point_leaves_the_engine_or_the_workload(tmp_path):
             one_block | {"data_parallel_size": 2},
         ),
         _workload(100),
-        TBO_MIN,
     )
     assert max(_tokens(p) for p in two) == 14
 
 
 def test_a_deployment_no_delayer_coalesces_plans_a_alone(tmp_path):
-    points = plan(_write(tmp_path, _engine(), _engine()), _workload(300), TBO_MIN, True)
+    points = plan(_write(tmp_path, _engine(), _engine()), _workload(300), True)
     assert len(points) == 512 and all(p.split is None for p in points)
 
 
@@ -163,14 +196,14 @@ def test_a_deployment_no_delayer_coalesces_plans_a_alone(tmp_path):
 def test_ranks_that_state_two_engines_or_none_are_refused(tmp_path, second, refusal):
     engines = [_engine()] + ([_engine() | second] if second else [])
     with pytest.raises(ValueError, match=refusal):
-        plan(_write(tmp_path, *engines), _workload(3000), TBO_MIN)
+        plan(_write(tmp_path, *engines), _workload(3000))
 
 
 def test_an_engine_file_that_states_no_prefix_caching_is_refused(tmp_path):
     engine = _engine(data_parallel_size=1)
     del engine["enable_prefix_caching"]
     with pytest.raises(ValueError, match="dp0.engine.json states no enable_prefix"):
-        plan(_write(tmp_path, engine), _workload(3000), TBO_MIN)
+        plan(_write(tmp_path, engine), _workload(3000))
 
 
 def test_a_line_covers_a_by_its_tokens_unsplit_and_b_by_its_rows_and_split():

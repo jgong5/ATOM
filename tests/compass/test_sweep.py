@@ -268,7 +268,9 @@ ENGINE = {
 }
 
 
-def _client(tmp_path, name, *flags, library="lib", paced=True):
+def _client(
+    tmp_path, name, *flags, library="lib", paced=True, engine=ENGINE, server_env=None
+):
     out, bin_ = tmp_path / name, tmp_path / "bin"
     out.mkdir()
     bin_.mkdir(exist_ok=True)
@@ -278,8 +280,8 @@ def _client(tmp_path, name, *flags, library="lib", paced=True):
     lib = str(tmp_path / library) if library else ""
     (tmp_path / "compass.py").write_text(STANDIN.replace("SERVER", repr(SERVER)))
     command = subprocess.Popen(
-        [sys.executable, tmp_path / "compass.py", out, json.dumps(ENGINE), lib],
-        env=os.environ | sweep.pacing([]) if paced else None,
+        [sys.executable, tmp_path / "compass.py", out, json.dumps(engine), lib],
+        env=os.environ | sweep.pacing([]) | (server_env or {}) if paced else None,
     )
     try:
         while not (out / "server.json").exists():
@@ -338,6 +340,26 @@ def test_client_sh_sweeps_a_cell_and_after_the_stop_keeps_its_coverage(tmp_path)
     assert "8 points planned, 8 covered before, 0 to send" in done.stdout
     assert done.stdout.splitlines()[-1].endswith("0 missing; swept")
     assert bodies == []
+
+
+def test_client_sh_plans_two_batch_overlap_by_the_servers_variables(tmp_path):
+    # The server splits a step at 4 tokens, this process at its default, past
+    # the budget: from the round of 3 and 4 on, rank 1 has no row.
+    done, _, out = _client(
+        tmp_path,
+        "r",
+        "--sweep",
+        "--traces",
+        "0-1",
+        "--stop",
+        engine=ENGINE | {"enable_tbo": True},
+        server_env={"ATOM_TBO_PREFILL_MIN_TOKENS": "4"},
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    points = json.loads((out / sweep.STATE).read_text())["points"]
+    assert [(p[0], p[5]) for p in points] == [(0, 0), (1, 0)] + [
+        (0, k) for k in range(1, 7)
+    ]
 
 
 @pytest.mark.parametrize(

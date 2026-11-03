@@ -1183,7 +1183,11 @@ serves all of them, and a per-rank walk compiles nothing more.
   parked decode, one count to each rank a round. A tuned config is selected by the token
   count, and only a walk over every count reaches every config with certainty. Count t is
   covered by any rank's prefill step of t tokens that TBO did not split, since a split
-  step runs its halves, not t. With no decode running the delayer fires for whichever
+  step runs its halves, not t. A round TBO would split leaves one rank without a row,
+  since a rank with no prefill vetoes the split
+  ([Ruling on #2689](https://github.com/jgong5/ATOM/issues/2689#issuecomment-6595541171)):
+  on #975's cell a round past `ATOM_TBO_PREFILL_MIN_TOKENS` carries seven counts, not
+  eight. With no decode running the delayer fires for whichever
   ranks have arrived and the rest follow a few steps later (`FIRE (nodecode)`): 1 to 3
   prefill groups a round on #2687's probe.
 - **B: designed compositions**, because a token count does not select the alignment and
@@ -1196,8 +1200,11 @@ serves all of them, and a per-rank walk compiles nothing more.
     requests held ahead of a probe decide which slot it takes, and the parked decodes keep
     the delayer's alignment gate armed (below);
   - TBO on or off where the engine enables TBO: on, one rank's rows reach
-    `ATOM_TBO_PREFILL_MIN_TOKENS` and every rank's step splits on a request boundary
-    (`atom/utils/tbo/ubatch_splitting.py`), which one row lacks;
+    `ATOM_TBO_PREFILL_MIN_TOKENS` and every rank's step splits. Under ATOM's default
+    `ATOM_TBO_PREFILL_TOKEN_SPLIT=1` a rank splits at its token midpoint, so one row of
+    two tokens or more splits too; a rank with no prefill vetoes the split
+    (`atom/utils/tbo/ubatching.py`). The plan predicts every step's split, a chunked
+    row's included, by that rule (`atom/compass/validate/bound.py::_split`);
 
   plus chunked rows over query sizes and context levels, up to the workload's longest
   context, for the keys a context or KV length selects. The context levels include the
@@ -1223,9 +1230,10 @@ the largest gap between arrivals. 16 ticks is four times that spread, 0.38 s. St
 unmeasured: every run #2687 made, and every projection below, is at stall 80.
 
 **What a sweep costs**, from #2687's runs with the floor, at stall 80, on #975's cell
-(DP 8, budget 16,384): a server start of 1.5 min; A in 2,048 rounds of 1.75 s, 0.99 h; B
-in 64 steps of 8.9 s (5.8 s to park the decodes, 3.1 s for the point), 9.5 min. That is
-1.2 h before the chunked rows, which #2687 did not probe, against acceptance's 3 h.
+(DP 8, budget 16,384): a server start of 1.5 min; A in 2,195 rounds of 1.75 s, 1.07 h,
+with a rank idle past the TBO minimum; B in 64 steps of 8.9 s (5.8 s to park the decodes,
+3.1 s for the point), 9.5 min. That is 1.25 h before the chunked rows, which #2687 did not
+probe, against acceptance's 3 h.
 
 **Cells the delayer does not coalesce** run A only and are not marked swept: ATOM builds
 no delayer at PP above 1 (`EngineCore.__init__`) or under rapidserve

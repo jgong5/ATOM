@@ -7,7 +7,8 @@ coverage kept in the JIT cache library of the server's stack.
 
 `send` plans the cell's points (`sweep_plan.plan`) from the engine files in
 ``OUT/steps`` and TRACES' traces A to B, each line one trace, counted from 0,
-with the sampling arguments client.sh's aiperf adds to every request. A record
+with the sampling arguments client.sh's aiperf adds to every request, and
+the server's two-batch overlap variables (`TBO`) to plan its splits. A record
 with no engine file for some DP rank is first sent a one-token request on each
 rank. It sends every step holding a point the library has not seen covered,
 writes the points to ``OUT/sweep.json`` and prints the counts; a cell with none
@@ -60,7 +61,6 @@ from atom.compass.drive.identity import _stack
 from atom.compass.drive.sweep_plan import OUTPUT_TOKENS, Point, covered, engines, plan
 from atom.compass.parity import read
 from atom.compass.parity.traffic import DONE, Traffic, post
-from atom.utils import envs
 
 #: A library's directory of cell coverage.
 COVERAGE = "sweep"
@@ -81,7 +81,8 @@ PACING = {
     "ATOM_PREFILL_DELAYER_TARGET_FILL": "1.0",
     "ATOM_PREFILL_DELAYER_STALL_TICKS": "16",
 }
-TBO_MIN = "ATOM_TBO_PREFILL_MIN_TOKENS"
+#: The variables ATOM's two-batch overlap splits a prefill step by.
+TBO = ("ATOM_TBO_PREFILL_MIN_TOKENS", "ATOM_TBO_PREFILL_TOKEN_SPLIT")
 
 
 def pacing(atom_args) -> dict[str, str]:
@@ -233,8 +234,13 @@ def send(out, workload: dict, sender=None) -> list[Point]:
         )
         engine = runfile._engine_args(argv)
         a_only = engine.pipeline_parallel_size > 1 or engine.enable_rapidserve
-        tbo_min = int(environ.get(TBO_MIN, envs.ATOM_TBO_PREFILL_MIN_TOKENS))
-        points = plan(out / "steps", workload, tbo_min, a_only)
+        # The plan reads its splits off this process's TBO variables.
+        for k in TBO:
+            if k in environ:
+                os.environ[k] = environ[k]
+            else:
+                os.environ.pop(k, None)
+        points = plan(out / "steps", workload, a_only)
         cell = _cell(points)
         seen = _seen(library, cell)
         missing = [p for p in points if _key(p) not in seen]

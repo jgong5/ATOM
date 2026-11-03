@@ -10,9 +10,11 @@ sends them with. The ranks share one walk, since they write one set of cache
 roots: each point is planned once, on the rank its place in the walk names.
 
 - A: one step for every prefill token count from 1 to a rank's budget, the
-  tokens `ModelRunner.warmup_max_tokens` gives one forward, each one row,
-  count t on rank (t - 1) mod the DP width, one count a rank a round. A count
-  past the longest prompt runs as several rows behind one parked decode.
+  tokens `ModelRunner.warmup_max_tokens` gives one forward, each one row, in
+  rounds of one count a rank, from rank 0 up. A round that two-batch overlap
+  would split leaves its last rank without a row, since a rank with no
+  prefill vetoes the split and a split step runs its halves, not the count. A
+  count past the longest prompt runs as several rows behind one parked decode.
 - B: lockstep steps, one point a rank, its rows queued behind 1 to 16 parked
   decodes. Two rows whose first is 1 to 16 tokens long, so the second row's
   offset in the batch takes every residue mod 16, by every count of parked
@@ -29,17 +31,22 @@ the workload's other sampling arguments copied unchanged; a parked decode asks
 for `PARKED_TOKENS`. No point is outside the engine's bounds (rows and parked
 decodes within `max_num_seqs`, contexts and their output tokens within
 `max_model_len`, KV blocks within the smallest pool, with a drafter's tokens)
-or the workload's (no prompt longer than its longest). A step-record line
-covers an A point when it is any rank's unsplit step of the point's token
-count, and a B point when its prefill rows are the point's, in batch order,
-and its split is the point's.
+or the workload's (no prompt longer than its longest). Whether two-batch
+overlap splits a step is ATOM's prefill rule over the step's ranks
+(`atom.compass.validate.bound._split`), under this process's
+``ATOM_TBO_PREFILL_MIN_TOKENS`` and ``ATOM_TBO_PREFILL_TOKEN_SPLIT``, which
+must be the server's. A step-record line covers an A point when it is any
+rank's unsplit step of the point's token count, and a B point when its
+prefill rows are the point's, in batch order, and its split is the point's.
 """
 
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from atom.compass.validate.bound import _split
 from atom.model_engine.dynamic_chunking import chunk_alignment
+from atom.utils import envs
 
 #: Residues mod 16 the second row's offset takes, and the parked decodes 1 to 16.
 SLOTS = 16
@@ -74,8 +81,9 @@ class Point:
     row how the context before its query was computed: '' none, 'chunk' its
     own prompt's earlier chunks, 'prefix' another request sharing that many
     leading tokens of its prompt. `held` decodes, each a one-token prompt, are
-    parked on the rank before the step. `split` is None for an A point, else
-    whether two-batch overlap splits the B point's step. `step` is the A round
+    parked on the rank before the step. `split` is None for an A point, whose
+    step two-batch overlap does not split, else whether it splits the B
+    point's step. `step` is the A round
     or B step it is sent in. `body` is the sampling arguments every one of
     these requests sends.
     """
@@ -173,16 +181,25 @@ def _rows(t: int, cap: int) -> tuple:
     return tuple((q, q) for q in lengths)
 
 
-def plan(engine, workload: dict, tbo_min: int, a_only: bool = False) -> list[Point]:
+def _splits(engine: dict, ranks: int, step) -> bool:
+    """Whether two-batch overlap splits a step whose ranks, from 0 up, run
+    `step`'s rows, one rows tuple a rank, and the ranks past them none. At DP
+    width 1 no record line states a split, so none is planned."""
+    if not engine["enable_tbo"] or ranks == 1:
+        return False
+    lines = [{"rows": [(q, c, False) for q, c in rows]} for rows in step]
+    return _split(lines + [{"rows": []}] * (ranks - len(lines))) is not None
+
+
+def plan(engine, workload: dict, a_only: bool = False) -> list[Point]:
     """The points a sweep of a cell sets out to cause, A's rounds then B's steps.
 
     `engine` is the directory holding each DP rank's ``dp<r>.engine.json``
     (`engines`). `workload` maps ``traces`` to the traces the client sends,
     each a mapping holding its ``requests``, and ``sampling`` to the fields
     the client adds to every request body, ``ignore_eos`` among them; a
-    point's `body` is those with ``max_tokens`` set to `OUTPUT_TOKENS`.
-    `tbo_min` is the server's ``ATOM_TBO_PREFILL_MIN_TOKENS``; with `a_only`,
-    for a deployment no PrefillDelayer coalesces, B has no point.
+    point's `body` is those with ``max_tokens`` set to `OUTPUT_TOKENS`. With
+    `a_only`, for a deployment no PrefillDelayer coalesces, B has no point.
     """
     top = max((longest(t["requests"]) for t in workload["traces"]), default=0)
     if top < 1:
@@ -193,15 +210,19 @@ def plan(engine, workload: dict, tbo_min: int, a_only: bool = False) -> list[Poi
     e = {**stated[0], "num_kvcache_blocks": pool}
     ranks, b = len(stated), budget(e)
     cap = min(e["max_model_len"] - OUTPUT_TOKENS, top)
-    points = []
-    for t in range(1, b + 1):
-        rows = _rows(t, cap)
-        held, rank, step = int(len(rows) > 1), (t - 1) % ranks, (t - 1) // ranks
-        if _fits(e, rows, held):
-            cached = ("",) * len(rows)
-            points.append(Point(rank, rows, cached, held, None, step, body))
+    counts = [(r, int(len(r) > 1)) for t in range(1, b + 1) for r in [_rows(t, cap)]]
+    counts = [(r, h) for r, h in counts if _fits(e, r, h)]
+    points, step, i = [], 0, 0
+    while i < len(counts):
+        n = ranks - _splits(e, ranks, [r for r, _ in counts[i : i + ranks]])
+        points += [
+            Point(rank, r, ("",) * len(r), h, None, step, body)
+            for rank, (r, h) in enumerate(counts[i : i + n])
+        ]
+        i, step = i + n, step + 1
     if a_only:
         return points
+    tbo_min = envs.ATOM_TBO_PREFILL_MIN_TOKENS
     two = [
         (o, SLOTS * h + o, h) for h in range(1, SLOTS + 1) for o in range(1, SLOTS + 1)
     ]
@@ -235,14 +256,18 @@ def plan(engine, workload: dict, tbo_min: int, a_only: bool = False) -> list[Poi
         ]
         for kind, levels in contexts.items()
     ]
-    step, seen = -(-b // ranks), set()
+    seen = set()
     for family in families:
         kept = [d for d in family if (d[3], d[0]) not in seen and _fits(e, d[0], d[2])]
         seen |= {(d[3], d[0]) for d in kept}
-        points += [
-            Point(i % ranks, *d, step + i // ranks, body) for i, d in enumerate(kept)
-        ]
-        step += -(-len(kept) // ranks)
+        for i in range(0, len(kept), ranks):
+            group = kept[i : i + ranks]
+            split = _splits(e, ranks, [d[0] for d in group])
+            points += [
+                Point(rank, rows, how, held, split, step, body)
+                for rank, (rows, how, held, _) in enumerate(group)
+            ]
+            step += 1
     return points
 
 
