@@ -178,6 +178,7 @@ class TestPerRequestSums:
             "moe_tokens",
             "dp_rank",
             "dp_dummy",
+            "group_prefills",
             "draft_rows",
             "start_lag_s",
         ]

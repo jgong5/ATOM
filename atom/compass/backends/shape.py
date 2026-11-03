@@ -217,7 +217,8 @@ class BatchView:
     data-parallel group's counts, `tbo_tokens`' among them; None on one rank
     or when the caller did not say. `dp_dummy` says the step is a DP rank's
     dummy forward, run because a peer has work and this rank has none; False
-    on one rank. `image_tokens` counts the scheduled
+    on one rank. `group_prefills` says some rank of the data-parallel group
+    prefills at this step; False on one rank. `image_tokens` counts the scheduled
     tokens whose embedding the step's vision encoder supplies; a backend that
     has no basis for pricing that encoder refuses a step with any.
     `start_lag_s` is, on a step that produces output, how far behind its host
@@ -245,6 +246,7 @@ class BatchView:
     moe_tokens: int | None = None
     dp_rank: int | None = None
     dp_dummy: bool = False
+    group_prefills: bool = False
     draft_rows: int | None = None
     start_lag_s: float | None = field(default=None, compare=False)
 

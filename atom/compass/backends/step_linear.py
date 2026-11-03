@@ -43,10 +43,13 @@ take at a different cost; `rowmod(1)` is Sum N_KV.
 
 A decode step that replays no graph (an eager runner, or a batch wider than
 the widest captured size) is the rung named `eager`, whose padding is zero.
-A DP dummy forward (`BatchView.dp_dummy`) at that rung, under a law with no
-`eager` vector, is `eager_dp_dummy`: 0 s, not refused.
+At that rung, under a law with no `eager` vector, a DP dummy forward and a decode
+while a peer prefills (`BatchView.dp_dummy`, `group_prefills`) cost 0 s, each
+under its treatment (`eager_beside_peer`), not refused.
 
-Every term is `estimated`. Each vector carries the convex hull of the features
+Every term is `estimated`, but a vector's stating `declared`, the origin of one
+fitted on another subject: those are `declared`, with that note, never validated.
+Each vector carries the convex hull of the features
 it was fitted on. A step outside it is priced by the same vector, its terms'
 source is `EXTRAPOLATED` and their detail names the hull; it is not refused.
 A vector may also carry, under `held_out`, the hull of the steps
@@ -100,6 +103,7 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
     VECTOR = {"coefficients": {<feature>: seconds, ...},
               "hull": HULL,
               "rowmod": k,    # a decode vector with a `rowmod` coefficient only
+              "declared": "<where it was fitted>",  # optional
               "held_out": {"hull": HULL, "bands": {<band>: ERRORS, ...}}}  # optional
 
     HULL = {"equal": {<feature>: value, ...}, "facets": [[a_1, ..., a_k, c], ...]}
@@ -117,7 +121,7 @@ import math
 from collections.abc import Mapping
 
 from atom.compass.backends.base import CostBackend, Granularity
-from atom.compass.backends.cost import CostTerm, StepCost, eager_dp_dummy
+from atom.compass.backends.cost import CostTerm, StepCost, eager_beside_peer
 from atom.compass.backends.hull import Hull
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostRefused
@@ -170,6 +174,7 @@ class _Vector:
             f"the {name} held-out hull", features[1:], held["hull"]
         )
         self.features = features
+        self.declared = str(spec.get("declared", "")).strip()
         self.rowmod = int(spec["rowmod"]) if "rowmod" in features else None
         if self.rowmod is not None and self.rowmod < 1:
             raise ValueError(f"the {name} vector's rowmod modulus is {self.rowmod}")
@@ -294,9 +299,9 @@ class StepLinearBackend(CostBackend):
                 "a step mixing prefill and decode rows; "
                 "the law prices a step of one kind",
             )
-        eager = not prefill and batch_view.capture_rung is None
-        if eager and batch_view.dp_dummy and None not in self.law.decode:
-            return eager_dp_dummy(SOURCE)
+        beside = eager_beside_peer(batch_view, SOURCE)
+        if beside is not None and None not in self.law.decode:
+            return beside
         terms, kv = self._terms(self.law, batch_view, "")
         drafts = []
         if self.law.draft is not None:
@@ -393,15 +398,17 @@ class StepLinearBackend(CostBackend):
             source = EXTRAPOLATED
             detail = f"{detail}; outside the {what}{vector.name} hull"
         validated = bool(vector.held_out and vector.held_out.contains(counts[1:]))
+        method = Method.DECLARED if vector.declared else Method.ESTIMATED
         return [
             CostTerm(
                 f"{what.replace(' ', '.')}{kind}.{feature}",
                 count * coefficient,
                 Provenance(
-                    Method.ESTIMATED,
+                    method,
                     f"{coefficient:g} s x {count}; {detail}",
                     source,
-                    validated=validated,
+                    validated=validated and not vector.declared,
+                    note=vector.declared,
                 ),
             )
             for feature, count, coefficient in zip(
