@@ -169,7 +169,10 @@ A second projection, independent of capture, as hedge and cross-check.
 **The step roofline.** `backends/step_roofline.py::StepRooflineBackend` is the step-level
 projection. A run reaches it as the step-level fallback its run file composes
 (`StepFallbackBackend`, `07` D36), turned on by the run-file key `step_roofline`, and
-always on under `step_grid` (`17` D102). Its method counts the inputs it reads (owner ruling on
+always on under `step_grid` (`17` D102). A run file naming `step_roofline` and none of
+`step_stub`, `step_linear`, `step_grid` and `op_graph` installs it as the run's only
+backend, every step priced by it: the level-1 backend of `08` D107
+([#2661](https://github.com/jgong5/ATOM/issues/2661)). Its method counts the inputs it reads (owner ruling on
 [#1011](https://github.com/jgong5/ATOM/issues/1011), 2026-10-15): spec fields by their
 origin, analytical from a datasheet or a probe, declared if assumed; the run file's stated
 inputs declared unless they carry an origin.
@@ -431,7 +434,8 @@ extractors at op level (`16` *Wave 5*).
 ### The analytical fallback
 
 An op-level backend answers a leaf no measurement prices by its analytical law, always
-(#952); at step level the step roofline is the fallback a run file composes (D64). As the
+(#952); at step level the step roofline is the fallback a run file composes, or the run's only
+backend (D64, `08` D107). As the
 fallback of an empirical backend, the analytical method answers its own price, reported
 apart (#1392), with the method its inputs give it, declared while it reads an assumed
 parameter, and its share of seconds is always reported (`08` D50.1). A law never moves
@@ -530,7 +534,7 @@ claimed. That is what the empirical op-level backend exists for.
 | # | Decision | Date |
 |---|---|---|
 | D63 | Three classes: A exact from geometry, B device-parameterised, C policy-determined. An analytical law works where the quantity is a pure function of stated geometry and fails where a runtime or library policy decides it. `analytical` is #952's method: a form from first principles over geometry, deployment config and datasheet or probed device parameters; an assumed parameter makes a term declared. Class B prices at attainable peaks probed on the device. | 2026-09-19; revised 2026-10-14 (#952) and 2026-10-17 (#1392) |
-| D64 | One pricing unit costs `max(t0, F/peak_c, M/BW(M), t_comm)` at attainable peaks probed on the device: one rate per format, the wider format's for a mixed pair, a bandwidth curve, an empty-kernel floor and link alpha-beta. Work comes from the contract only; MoE in expectation under uniform routing, the EP width reaching MoE extractors from the backend as `tp` does; graph padding as executed. Op level: the captured IR, an extractor registry by op kind, refused by name without one, composed by the IR's joins. Step level: module extractors over the meta build, one `max` and one `t0` per module, summed; refused by name for an unclassified module. Every analytical law prices device time only; the host floor's `max` lives in `01` D4's recurrence, with the launch time from the measured `W_launch` law. The step roofline's method counts the inputs it reads; it has no host bound; the run-file key `step_roofline` turns it on. Replaces the derated leaf model first stated here. | 2026-09-19; revised 2026-10-11 (#815), 2026-10-15 (#1011), 2026-10-15 (#1047), 2026-10-17 (#1392) and 2026-10-20 (#1811) |
+| D64 | One pricing unit costs `max(t0, F/peak_c, M/BW(M), t_comm)` at attainable peaks probed on the device: one rate per format, the wider format's for a mixed pair, a bandwidth curve, an empty-kernel floor and link alpha-beta. Work comes from the contract only; MoE in expectation under uniform routing, the EP width reaching MoE extractors from the backend as `tp` does; graph padding as executed. Op level: the captured IR, an extractor registry by op kind, refused by name without one, composed by the IR's joins. Step level: module extractors over the meta build, one `max` and one `t0` per module, summed; refused by name for an unclassified module. Every analytical law prices device time only; the host floor's `max` lives in `01` D4's recurrence, with the launch time from the measured `W_launch` law. The step roofline's method counts the inputs it reads; it has no host bound; the run-file key `step_roofline` turns it on, and named with no other backend, it prices every step. Replaces the derated leaf model first stated here. | 2026-09-19; revised 2026-10-11 (#815), 2026-10-15 (#1011), 2026-10-15 (#1047), 2026-10-17 (#1392), 2026-10-20 (#1811) and 2026-11-03 (#2712) |
 | D65 | An analytical law is a smooth bound and says so: the known discontinuities are where the measured time sits furthest above it, shown by the measured-over-analytical report. A pricing unit has one price; the band first required here is withdrawn. | 2026-09-19; revised 2026-10-14 (#952) and 2026-10-17 (#1392) |
 | D66 | A collective takes an algorithm-free alpha-beta lower bound: one hop of link latency plus the minimum bytes any algorithm must send, over the link bandwidth. The spec names no algorithm (T36 withdrawn). Textbook ring/log models are refuted on this fabric as predictions. Replaces the two-regime form first stated here. | 2026-09-19; revised 2026-10-17 (#1392) |
 | D67.1 | The gate is the bound: on every measured step, at both granularities, analytical is at most measured. Reported, not gated: configuration ranking (top-1, top-3) over the four P/D cells, measured over analytical per op kind and per phase, and the method error: MI308X to MI355X, and on MI455 the same A0 records bounded at the frozen spec and at A0's probed spec. Memory goals: ≤5% on weights and on KV capacity/block count (the empirical gate for KV, tighter than it for weights), ≤25% each other non-KV memory term, no false "fits". The step and end-to-end latency goals and ranking as the primary gate, first stated here, are withdrawn. | 2026-09-19; revised 2026-10-14 (#952), 2026-10-17 (#1392), 2026-10-25 (#2138) and 2026-10-28 (#2141) |
