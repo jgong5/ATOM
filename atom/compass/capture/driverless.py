@@ -214,8 +214,11 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
     }
     for name, value in cuda.items():
         setattr(torch.cuda, name, value)
-    # ATOM's H2D publication reads the current stream's id off `torch._C`.
+    # ATOM's H2D publication reads the current stream's id off `torch._C`, and
+    # aiter's top-k the current device and the raw stream.
     torch._C._cuda_getCurrentStream = lambda *a: (current[0].stream_id, 0, 1)
+    torch._C._cuda_getDevice = lambda: 0
+    torch._C._cuda_getCurrentRawStream = lambda *a: current[0].cuda_stream
     # No checkpoint is read, so a parameter's fill is arbitrary either way, and
     # the in-place RNG fills ask the device for a generator.
     torch.Tensor.uniform_ = torch.Tensor.normal_ = lambda self, *a, **k: self

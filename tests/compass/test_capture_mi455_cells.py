@@ -123,3 +123,30 @@ def test_a_card_s_stepping_is_its_own_gpu_agent_s(monkeypatch):
 
     assert driverless.card(2) == {**A0, "index": 2}
     assert seen == ["2", "2"]
+
+
+#: aiter's top-k in the cells' stack asks `torch._C` for the device and raw
+#: stream, under the stream a capture has made current.
+RAW = """
+import sys, torch
+from atom.compass.capture import driverless
+driverless.install(sys.argv[1], "gfx1250")
+side = driverless.Stream()
+with torch.cuda.stream(side):
+    raw = torch._C._cuda_getCurrentRawStream(0)
+    print(torch._C._cuda_getDevice(), raw == side.cuda_stream)
+"""
+
+
+def test_a_capture_answers_the_raw_device_queries_on_the_declared_device(tmp_path):
+    env = {**os.environ, "PYTHONPATH": str(TREE)}
+    done = subprocess.run(
+        [sys.executable, "-c", RAW, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        cwd=TREE,
+        env=env,
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    assert done.stdout.splitlines()[-1] == "0 True"
