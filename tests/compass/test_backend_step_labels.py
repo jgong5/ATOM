@@ -522,3 +522,37 @@ def test_a_prefill_launch_the_device_held_gives_no_W_launch_label(tmp_path):
             line[k] = [t + 10**12 for t in v] if isinstance(v, list) else v + 10**12
     later.write_text("".join(json.dumps(line) + "\n" for line in lines))
     assert label(later)[1] == table
+
+
+def test_a_dp_view_counts_its_step_s_dummy_forwards_from_every_rank_s_line(tmp_path):
+    """Step `i` of a DP4 run has `i % 4` ranks run a dummy forward. Each rank's
+    view counts them, the run's records labelled together or one alone beside
+    its peers; one rank's record reads no peer and counts none."""
+    from test_step_linear_dp import DP, _groups, _records
+
+    records = _records(tmp_path, _groups(0, n=24))
+    ranks = [[json.loads(x) for x in r.read_text().splitlines()] for r in records]
+    for i in range(24):
+        for r in ((i + k) % DP for k in range(1, i % DP + 1)):
+            ranks[r][i].update(is_dummy_run=True, batch=[], rows=[[1, 1, True]])
+    for record, lines in zip(records, ranks):
+        record.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    expected = {
+        (r, i): i % DP
+        for r in range(DP)
+        for i in range(24)
+        if not ranks[r][i]["is_dummy_run"]
+    }
+    together = [samples for samples, _ in label_run(records)]
+    alone = [label(r)[0] for r in records]
+    for labelled in (together, alone):
+        got = {
+            (s.rank, s.step): s.view.group_dummies for rank in labelled for s in rank
+        }
+        assert got == expected
+
+    single = tmp_path / "one"
+    single.mkdir()
+    (single / "dp1.jsonl").write_text("not a record\n")
+    one = _record(single / "dp0.jsonl", _steps(5, n=12))
+    assert {s.view.group_dummies for s in label(one)[0]} == {0}

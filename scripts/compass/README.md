@@ -810,11 +810,13 @@ keyed by `machines/mi355x-crs005.json`, in the image that file pins, at
 cell that built an aiter JIT module was run again. The decode side adds a c=256 cell
 at seed 20260709 and, for rung 12, c=96 at seeds 20260707 and 20260708 and c=112 at
 seed 20260709: a lone decode server at c=256 decodes at rungs 16 to 28, and at c=64
-at rungs 4 and 8. The decode law's rung 2, 4 and 8 vectors are refitted with
+at rungs 4 and 8. The decode law's rung 1, 2, 4 and 8 vectors are refitted with
 `--moe-routing 384,6`, DeepSeek-V4-Pro's routed experts and top-k, on those cells
 and on the decode sides of two 1P1D `deploy.sh record` cells (below) at c=256 over
 traces 256 to 392, seeds 20260707 and 20260708, whose decode ranks run unevenly loaded
-([#2493](https://github.com/jgong5/ATOM/issues/2493)); each adopts `moe_experts`.
+([#2493](https://github.com/jgong5/ATOM/issues/2493)), with a step's DP dummy forwards
+counted as one token in `moe_experts` ([#2536](https://github.com/jgong5/ATOM/issues/2536));
+each adopts `moe_experts`.
 Its other vectors and its host laws are the ones fitted on the lone cells alone, and
 its `sources` names the records each came from.
 

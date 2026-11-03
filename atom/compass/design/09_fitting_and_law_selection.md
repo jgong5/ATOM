@@ -260,7 +260,8 @@ prefill:  [ 1,  tokens,  Σ_req N_Q²,  Σ_req N_Q·(ctx − N_Q) ]
           + history: Σ_req (ctx − N_Q), in `step_linear_fit`'s `history` form
 decode:   [ 1,  batch,   Σ ctx ]
 per rung: [ 1,  Σ ctx,   rung·max(ctx) − Σ ctx ]
-          + n or E·(1 − (1 − K/E)^n), on a rung that adopts one (`--moe-routing E,K`)
+          + n or E·(1 − (1 − K/E)^m), on a rung that adopts one (`--moe-routing E,K`),
+            m = n with the step's DP dummy forwards counted as one token
           + rowmod(k), on a rung that adopts one (D61)
 ```
 
@@ -273,9 +274,18 @@ uneven spread over the ranks leaves them well below the rung's rows: a 1P1D deco
 about 11 rows over 8 ranks decodes at rung 4 with 13 real of 32 gathered rows (p50), where
 lone decode servers at rung 4 run 26, and a rung-only vector fitted on the lone servers
 prices that side 10% high at rung 4 and 14% at rung 8. The candidates are `n` itself,
-`moe_tokens`, for the GEMM rows, and `moe_experts`, `X = E·(1 − (1 − K/E)^n)`, the routed
-experts `n` tokens reach in expectation, each routed to `K` of `E`
-(`work.activated_experts`), for the expert weights read. Nothing assumes decode is memory-
+`moe_tokens`, for the GEMM rows, and `moe_experts`, `X = E·(1 − (1 − K/E)^m)`, the routed
+experts `m` tokens reach in expectation, each routed to `K` of `E`
+(`work.activated_experts`), for the expert weights read. `m` is `n` with a step's DP dummy
+forwards counted as one token: a rank with no work runs one dummy row, token 0 at position
+0, which reaches the gate where a pad row does not, and every dummy's row is the same, so
+`d` dummies read one token's experts and `m = n − (d − 1)` for `d ≥ 1`. Under a drafter a
+dummy runs `mtp_k + 1` rows, and `m` merges one row per dummy until a data-parallel MTP
+record tests a MoE column there. A record states
+`d` in its ranks' lines (`is_dummy_run`); a simulated step sums it over the DP group's CPU
+group, since ATOM's DP sync carries no dummy flag, a dummy reporting one token as a rank
+decoding one request does (`BatchView.group_dummies`,
+[#2536](https://github.com/jgong5/ATOM/issues/2536)). Nothing assumes decode is memory-
 or compute-bound; the data picks. Each of the three forms, no column, `n` and `X`, is solved
 with each record held out of the rung's steps, and its held-out error is the magnitude of
 each held-out record's p50 error, averaged with the record's steps as weights. A rung adopts
@@ -288,8 +298,8 @@ and pushes 2,015 out), and a bar read from another machine's law is a rule for o
 Two columns at once were tried and refused: on the small
 rungs `n` and `X` are nearly collinear, and the non-negative solve kept one of the two at
 every rung ([#2493](https://github.com/jgong5/ATOM/issues/2493)). The column is a hull
-coordinate, so a step whose `n` falls outside the `n` its rung was fitted on is priced as
-an extrapolation (D58). Prefill needs no such column: its gather is variable-length, so
+coordinate, so a step whose `n`, or under `X` whose `m`, falls outside those its rung was
+fitted on is priced as an extrapolation (D58). Prefill needs no such column: its gather is variable-length, so
 `moe_rows` is its real tokens. An MTP draft law's decode vectors take no MoE column until
 a data-parallel MTP record tests it there.
 
@@ -680,7 +690,7 @@ choice that must be visible.
 |---|---|---|
 | D53 | Fit relative error, not absolute seconds. MAD outlier test on the same relative residuals. | 2026-09-18 |
 | D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under TP, DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by alternating max-affine regression. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes and host-paced prefills cut; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), and `admit`, `(requests, uncached, cached)` over every kind, on what a forward's `E` spends admitting requests, which its kind's `E` is fitted without, are fitted beside it, keyed by host CPU, `atom` digest, model, engine config and machine-spec digest, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); machine-spec digest in the host-law key 2026-10-16 (#952); host-paced prefill cut 2026-10-24 (#1983); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080); output prefill draft-KV pass 2026-10-25 (#2100); a prefill launch the device held gives no `W_launch` 2026-10-26 (#2256); TP above 1 2026-10-30 (#2490); a short output prefill's propose pass split off 2026-10-31 (#2492), at the device's lag 2026-11-01 (#2572); a forward's admissions priced apart, `admit` 2026-11-02 (#2620) |
-| D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61), and, given the model's routing, one MoE column, the step's real MoE tokens `n` or the experts `X` they reach: the form of smallest step-weighted held-out error, no column among them, adopted with no bar. | 2026-09-18; revised 2026-10-14 (#941), 2026-11-01 (MoE column, #2493) and 2026-11-03 (no bar, #2735) |
+| D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61), and, given the model's routing, one MoE column, the step's real MoE tokens `n` or the experts `X` they reach, the step's DP dummy forwards counted in `X` as one token: the form of smallest step-weighted held-out error, no column among them, adopted with no bar. | 2026-09-18; revised 2026-10-14 (#941), 2026-11-01 (MoE column, #2493) and 2026-11-03 (no bar, #2735; dummies in `X`, #2536) |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |
 | D58 | Refuse rather than fall back on a step kind with no samples. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box; an out-of-hull step is priced `estimated` and unvalidated, its source naming the extrapolation, not refused, and graded by cost accuracy as well as reported apart. The step linear law refuses a discrete value it has no vector for, extrapolates outside its fitted hull, and is validated only inside the hull of its held-out steps; a vector it states `declared`, fitted on another subject, prices declared terms. | 2026-09-18; revised 2026-10-11 (#765), 2026-10-14 (#952), 2026-10-23 (#2011) and 2026-11-02 (#2660) |

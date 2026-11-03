@@ -5,7 +5,10 @@ a pad row reaches no expert. A rung-only law fitted where every rank is full
 prices high a step at the same rung whose ranks are mostly idle. A law fitted
 with `moe_routing` lets each rung adopt one MoE column, the tokens `n` or the
 experts they reach `X`: the form a record held out of the rest prices nearest,
-weighted by steps.
+weighted by steps. A rank with no work runs a dummy forward whose one row,
+token 0 at position 0, reaches the gate like a real token, and every dummy's
+row is the same: `X` counts a step's dummies as one token, where `n` counts
+each.
 
 Each rank's record is written from a known per-rank law with a MoE slope,
 every line labelled with the group's step, as in `test_step_linear_dp`.
@@ -17,6 +20,7 @@ import json
 import numpy as np
 import pytest
 from test_backend_step_linear_fit import SPEC, _fit, _record, _steps
+from test_dp_step_max import Recording, dp2, prefill, runner  # noqa: F401  dp2
 from test_step_linear_draft import _mtp_record
 
 from atom.compass.backends import (
@@ -350,3 +354,126 @@ def test_a_rung_whose_steps_all_reach_the_same_experts_adopts_no_column(tmp_path
     backend = StepLinearBackend(StepLinearLaw(law), DP)
     terms = backend.price(_view((170_000, 175_000, 180_000, 185_000), DP * RUNG)).terms
     assert all(t.provenance.validated for t in terms)
+
+
+def _merged_price(view: BatchView, law=EXPERTS) -> float:
+    """`_price` of `view` under `law`, a law over the experts alone, with its
+    group's dummy forwards reaching one token's experts."""
+    reached = view.moe_tokens - max(view.group_dummies - 1, 0)
+    return _price(dataclasses.replace(view, moe_tokens=reached), law)
+
+
+def _dummy_groups(seed, n, law=EXPERTS):
+    """`n` decode steps at rung 4 over `DP` ranks: at step `i` the last
+    `i % DP` ranks run a dummy forward, one row of context 1, and the others
+    hold the same 4 rows. The fit picks a step's slowest rank on the rung's
+    features without the MoE column, so ranks that differ only in those
+    features keep that pick off the MoE term, which the dummies move. Each
+    rank's view states the group's tokens, a dummy's one among them, and its
+    dummies; each step is priced by `law` as `_merged_price` prices it."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for i in range(n):
+        dummies = range(DP - i % DP, DP)
+        rows = [int(rng.integers(150_000, 200_000)) for _ in range(RUNG)]
+        contexts = [[1] if r in dummies else rows for r in range(DP)]
+        tokens = sum(map(len, contexts))
+        views = [
+            BatchView(
+                tuple(RequestShape(1, c, True) for c in mine),
+                capture_rung=RUNG,
+                moe_rows=DP * RUNG,
+                moe_tokens=tokens,
+                dp_dummy=r in dummies,
+                group_dummies=len(dummies),
+            )
+            for r, mine in enumerate(contexts)
+        ]
+        out.append((views, max(_merged_price(v, law) for v in views)))
+    return out
+
+
+def _dummy_records(path, groups):
+    """Rank `r`'s record of `groups`, every rank's label the group's step, a
+    dummy rank's line written as ATOM writes a dummy forward's: no request,
+    its one row."""
+    path.mkdir()
+    paths = []
+    for r in range(DP):
+        steps = [
+            ([(1, row.context_tokens, True) for row in v[r].requests], RUNG, seconds)
+            for v, seconds in groups
+        ]
+        record = _record(path / f"dp{r}.jsonl", steps)
+        lines = [json.loads(line) for line in record.read_text().splitlines()]
+        for line, (v, _) in zip(lines, groups):
+            line.update(dp_rank=r, moe_rows=v[r].moe_rows, moe_tokens=v[r].moe_tokens)
+            if v[r].dp_dummy:
+                line.update(is_dummy_run=True, batch=[])
+        record.write_text("".join(json.dumps(line) + "\n" for line in lines))
+        paths.append(record)
+    return paths
+
+
+def test_a_group_s_dummy_forwards_reach_one_token_s_experts_in_the_fit(tmp_path):
+    """Idle ranks run dummy forwards on most steps, from none to three a step:
+    the routed fit reads each step's dummies off its ranks' lines and recovers
+    the law whose experts count them as one token."""
+    runs = [_dummy_records(tmp_path / f"run{s}", _dummy_groups(s, 200)) for s in (0, 1)]
+    law, samples, _ = _routed(runs[0] + runs[1])
+    assert {s.view.group_dummies for s in samples} == {0, 1, 2, 3}
+    vector = law["decode"][str(RUNG)]
+    figures = vector["fit"]["moe_column"]
+    assert figures["adopted"] == figures["picked"] == "moe_experts"
+    assert figures["held_out"]["moe_experts"]["error"] == pytest.approx(0, abs=1e-6)
+    fitted = {f: vector["coefficients"][f] for f in EXPERTS}
+    assert fitted == pytest.approx(EXPERTS, rel=1e-6)
+
+
+def test_the_backend_counts_a_group_s_dummies_as_one_token_in_the_experts(cells):
+    full, sparse = cells
+    law = _routed(full + sparse)[0]
+    backend = StepLinearBackend(StepLinearLaw(law), DP)
+    slope = law["decode"][str(RUNG)]["coefficients"]["moe_experts"]
+    view = _view((180_000, 20_000, 30_000, 40_000), 12)
+
+    def experts(dummies):
+        cost = backend.price(dataclasses.replace(view, group_dummies=dummies))
+        return {t.name: t.seconds for t in cost.terms}["decode.moe_experts"]
+
+    for dummies in (0, 1, 2, 3):
+        reached = activated_experts(*ROUTING, 12 - max(dummies - 1, 0))
+        assert experts(dummies) == pytest.approx(reached * slope, rel=1e-12)
+    assert experts(1) == experts(0) > experts(2) > experts(3)
+
+
+def test_the_tokens_column_counts_each_dummy_s_row(tmp_path):
+    full, sparse = _cells(tmp_path, TOKENS)
+    backend = StepLinearBackend(StepLinearLaw(_routed(full + sparse)[0]), DP)
+    view = _view((180_000, 20_000, 30_000, 40_000), 11)
+
+    def priced(dummies):
+        return backend.price(dataclasses.replace(view, group_dummies=dummies)).seconds
+
+    assert priced(3) == priced(0) == pytest.approx(_price(view, TOKENS))
+
+
+def test_the_cost_check_prices_each_step_with_its_group_s_dummies(tmp_path):
+    runs = [_dummy_records(tmp_path / f"run{s}", _dummy_groups(s, 200)) for s in (0, 1)]
+    law = _routed(runs[0] + runs[1])[0]
+    _dummy_records(tmp_path / "held", _dummy_groups(2, 200))
+    graded = cost_accuracy(tmp_path / "held", law)["graded"]["decode"]
+    assert graded["on_totals"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_simulated_dp_step_states_its_group_s_dummy_forwards(dp2):  # noqa: F811
+    """Rank 1 has no work on the first step and runs ATOM's dummy forward:
+    both ranks price a view stating one dummy. On the second both work."""
+    backends = [Recording(), Recording()]
+    ranks = [runner(b, dp_size=2, dp_rank=r) for r, b in enumerate(backends)]
+    dp2(
+        lambda: [ranks[0].forward(prefill(40)) for _ in range(2)],
+        lambda: [ranks[1].dummy_execution(), ranks[1].forward(prefill(8))],
+    )
+    assert [[v.group_dummies for v in b.views] for b in backends] == [[1, 0], [1, 0]]
+    assert [b.views[0].dp_dummy for b in backends] == [False, True]
