@@ -8,7 +8,8 @@ measured device time on every measured step, at step and at op level.
 A RECORD is a real run's directory, its step record in `steps/`. Each forward
 there that is not a DP dummy run is priced at step level by the step roofline,
 over the modules `run.modules.walk` reads off the meta build ATOM's arguments
-configure, and at op level by `OpGraphBackend`, over the `op_graph`s `compass
+configure and its block drafter's (`run.modules.drafter`), as a simulated run
+walks them, and at op level by `OpGraphBackend`, over the `op_graph`s `compass
 trace ops` published in S for the spec's arch; both price the rows a replayed
 graph pads to. Each price is compared with the step's device busy time,
 `d_busy_ns`, or on an MTP record the target's, `d_target_ns`, plus on a step
@@ -424,11 +425,12 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
     `ops`, that ran under another engine; two-batch overlap no line splits."""
     from atom.compass.backends.step_roofline import StepRooflineBackend
     from atom.compass.run import ep_width, op_graph
-    from atom.compass.run.modules import walk
+    from atom.compass.run.modules import drafter, walk
 
     arch = machine.value("device.arch")
     with tempfile.TemporaryDirectory(prefix="compass-bound-") as tmpdir:
         config, tree = _build(model, tp, atom_args, arch, tmpdir)
+        drafted = drafter(config)
     dp = config.parallel_config.data_parallel_size
     if config.enable_tbo_decode or config.enable_tbo and dp == 1:
         raise ValueError(
@@ -461,7 +463,7 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
         config,
         ep,
         {
-            "step": StepRooflineBackend(machine, walk(tree)),
+            "step": StepRooflineBackend(machine, walk(tree, drafted)),
             "op": op_graph({"store": store}, config, machine, ep),
         },
     )

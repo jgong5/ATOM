@@ -23,7 +23,7 @@ from atom.compass.backends import BatchView, RequestShape, op_work
 from atom.compass.backends.cost import CostTerm, StepCost
 from atom.compass.backends.op_graph import DRAFT_KV, OpGraphBackend
 from atom.compass.backends.provenance import Method, Provenance, Refusal
-from atom.compass.backends.step_roofline import Module, StepRooflineBackend
+from atom.compass.backends.step_roofline import CONTEXT, Module, StepRooflineBackend
 from atom.compass.backends.work import Work, price
 from atom.compass.validate import bound
 
@@ -214,7 +214,7 @@ def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1):
     moe = SimpleNamespace(moe_parallel_config=SimpleNamespace(ep_size=ep))
     tree = SimpleNamespace(modules=lambda: [SimpleNamespace(), moe])
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
-    monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree: STACK)
+    monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
     monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: graph)
     spec = tmp_path / "spec.json"
     spec.write_text(json.dumps(ROOFLINE))
@@ -375,13 +375,25 @@ def _config(drafts=0, dp=1, tbo=False, low_latency=False, block=False):
     )
 
 
+#: A block drafter's modules: its block's, and its KV pass over the target's rows.
+DRAFTER = [
+    Module("drafter.head", "gemm", (4096, 4096), draft=6),
+    Module("drafter.kv", "gemm", (4096, 4096), draft=CONTEXT),
+]
+
+
 def _backends(monkeypatch, tmp_path, config, modules=STACK, lookup=graph, ep=1):
     """`bound.backends` for `config` at EP width `ep`, its build, walk and
-    store stubbed."""
+    store stubbed, a block drafter's modules `DRAFTER`."""
     moe = SimpleNamespace(moe_parallel_config=SimpleNamespace(ep_size=ep))
     tree = SimpleNamespace(modules=lambda: [moe])
+    spec = config.speculative_config
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
-    monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree: modules)
+    monkeypatch.setattr("atom.compass.run.modules.drafter", lambda c: spec)
+    monkeypatch.setattr(
+        "atom.compass.run.modules.walk",
+        lambda t, d=None: modules + DRAFTER * bool(d and d.use_dspark()),
+    )
     monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: lookup)
     return bound.backends("m", 1, [], MACHINE, str(tmp_path), [])[2]
 
@@ -435,6 +447,7 @@ def test_an_mtp_step_prices_at_op_level_its_target_against_d_target_ns(
         costs[0].target_seconds
     )
     assert report["step"]["steps"] == 2
+    assert bool(report["step"]["draft_s"]) == block
 
 
 def test_a_draft_kv_pass_is_measured_with_its_target_on_a_step_that_samples(tmp_path):
