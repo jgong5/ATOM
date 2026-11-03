@@ -11,6 +11,7 @@ does.
 
 import json
 import math
+import re
 import shutil
 from types import SimpleNamespace
 
@@ -340,6 +341,21 @@ def test_a_dp_tp_log_whose_processes_miss_a_rank_is_refused(
     rows = _process_rows(monkeypatch, tmp_path, runners)
     value, verdict = rows["memory real dp0", "memory"]
     assert verdict == "refused" and "not one each of [(0, 0), (0, 1)," in value
+
+
+@pytest.mark.parametrize("name", ["rank{}.json", "lp-engine.dp{}.json"])
+def test_a_dp_tp_hand_in_whose_name_gives_no_dp_rank_is_refused_by_its_name(
+    monkeypatch, tmp_path, name
+):
+    _process_rows(monkeypatch, tmp_path, RUNNERS)
+    # Named as no DP rank, or as ranks 2 and 3 of a log at two.
+    named = [tmp_path / name.format(r + 2) for r in (0, 1)]
+    for rank, path in zip(_ranks(tmp_path), named):
+        shutil.copy(rank, path)
+    log = tmp_path / "real" / "server.log"
+    refused = re.escape(f"{named[0]}'s name gives no DP rank of the 2")
+    with pytest.raises(MemoryRefusal, match=refused):
+        main([*map(str, named), str(log), "--tp", "2"])
 
 
 def _tp_rows(monkeypatch, tmp_path, factors, tp=4, tokens=()) -> dict:

@@ -120,13 +120,12 @@ def _grouped(pattern: re.Pattern, text: str, log: Path, ranks: int, tp: int, dp)
     lines = re.findall(_PROCESS + pattern.pattern, text)
     found = sorted((rank.get(pid, (-1, -1)), tuple(v)) for pid, *v in lines)
     every = [(d, t) for d in range(ranks) for t in range(tp)]
-    if dp not in range(ranks) or [r for r, _ in found] != every:
+    if [r for r, _ in found] != every:
         raise MemoryRefusal(
-            f"the hand-in names DP rank {dp}, and the lines of {log} matching "
-            f"{pattern.pattern!r} come from runners of (DP, TP) ranks "
-            f"{[r for r, _ in found]}, not one each of {every}",
-            "pass each DP rank's lp-<engine>.dp<r>.json and the log of a real "
-            "server at as many DP ranks, at the TP width its record states",
+            f"the lines of {log} matching {pattern.pattern!r} come from runners "
+            f"of (DP, TP) ranks {[r for r, _ in found]}, not one each of {every}",
+            "pass the log of a real server at as many DP ranks as hand-ins, "
+            "at the TP width its record states",
         )
     return [v for (d, _), v in found if d == dp]
 
@@ -262,7 +261,14 @@ def parts(
         raise MemoryRefusal(what, "pass an engine's hand-in, lp-engine*.json")
     readings = {name: _reading(name, rows) for name, rows in saved["readings"].items()}
     dp = re.fullmatch(r".*\.dp(\d+)", predicted_file.stem)
-    runs, pool = recorded(log, ranks, blocks, tp, dp and int(dp[1]))
+    dp = dp and int(dp[1])
+    if ranks > 1 and tp > 1 and dp not in range(ranks):
+        raise MemoryRefusal(
+            f"{predicted_file}'s name gives no DP rank of the {ranks}, so its "
+            "TP lines cannot be chosen",
+            "pass each DP rank's hand-in as the run wrote it, lp-<engine>.dp<r>.json",
+        )
+    runs, pool = recorded(log, ranks, blocks, tp, dp)
     # The terms of `peak_torch` the run records alone: its storages.
     stored = runs[0].by_name().keys() - set(COMPARED)
     alone = tuple(t for t in readings["peak_torch"].terms if t.name in stored)
