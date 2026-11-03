@@ -596,13 +596,22 @@ the standard counting one (Fujimoto, Mattern):
    LP moving.
    Inline channels are taken by the owner at its own receive point.
 
-**The simulation window.** Each LP's window opens once its process is ready to serve (an
-engine after it queues READY, `engine_core.py::EngineCore._send_ready_signal`) and closes at that LP's `+inf` grant,
-before its process begins to shut down (`LPRuntime.next_event` calls `end_run` on that
-grant). Inside it every cross-LP frame is stamped, registered and counted, and the
-thread-identity assertion (I3, I4) applies. Frames outside it — READY, SHUTDOWN and the
-rest of startup and teardown — are not counted and are handed to ATOM at once; a send
-stamped after the `+inf` grant carries arrival `+inf`, which no grant releases.
+**The simulation window.** Each LP's window opens once its process is ready to serve, a
+frontend's or an engine's when its own construction ends
+(`run/__init__.py::_start_on_leaving`). A frontend's construction waits for its engines'
+READY (`engine_core.py::EngineCore._send_ready_signal`), and an engine's goes on after it
+(`run/__init__.py::_ignoring_sigterm_from_ready` names what follows), so a frontend can be
+in its window while an engine is not. The window closes at that LP's `+inf` grant, before
+its process begins to shut down (`LPRuntime.next_event` calls `end_run` on that grant).
+Inside it every cross-LP frame is stamped, registered and counted, and the thread-identity
+assertion (I3, I4) applies. Frames sent outside the sender's window — READY, SHUTDOWN and
+the rest of startup and teardown — are not counted. A receiver outside its own window hands
+them to ATOM at once; one inside it holds them while a frame a thread-received channel
+brought in is unhandled, and its `+inf` grant releases any still held
+(`LPRuntime.holds_unstamped`). That keeps a SHUTDOWN behind such frames read before it is
+taken (#1278). It also holds a frame from before its sender's window, so one read in one
+poll with a stamped frame sent after it reaches ATOM second. A send stamped after the
+`+inf` grant carries arrival `+inf`, which no grant releases.
 
 Counting is exact: release and completion are per `(channel, seq)`, so a channel need not
 be FIFO and arrivals on one channel need not be monotone — concurrent HTTP requests do
@@ -1411,6 +1420,8 @@ stage and per DP rank, with a TP group modelled on its rank 0.
   forward, where `_sync_dp_state` releases every member, so a member's wait for that
   pull is the group round's, not `E`
   ([#1893](https://github.com/jgong5/ATOM/issues/1893)).
+  A forward that schedules a request for the first time also runs its admission
+  inside `schedule()`, priced apart by the host laws' `admit` (`09` D54).
 - `W_pre`: prepare (`ModelRunner.prepare_model`), which waits only at its two ends;
   under MTP, an output forward's prepare up to R1's wait.
 - `W_inputs`: under MTP, an output forward's prepare after R1's wait: the input ids,

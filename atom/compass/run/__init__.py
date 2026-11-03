@@ -35,6 +35,8 @@ member, the frontend's included, connects to.
   `CompassModelRunner` where it would build its model, in the worker process.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
   ``decode`` to the frontend's clock, at the rates the machine spec measured.
+  A machine spec that refuses the tokenizer stops the run as a signal would,
+  so the engines leave and the server exits on the refusal.
 - `http_intake()` is what `atom.utils.compass_loop.HttpChannel` charges the
   frontend's event loop for each request it takes in.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
@@ -98,8 +100,11 @@ on ``(1, tokens, seqs)``; with any laws, a forward whose kind has none for a
 segment it runs and ``skip`` does not name is refused, that segment costing 0 s
 (`HostDeviceRecurrence.device_end`); ``key``, the `host_key` they were
 fitted under and the ``machine_spec`` digest of the spec of the platform they
-were fitted on, which a run with laws must match; ``skip``, segments zeroed for
-a what-if run, which the graders refuse; a list of them as ``step_linear``'s),
+were fitted on, which a run with laws must match; ``admit``, coefficients on
+a forward's admissions, which add to its ``E``, or null to refuse a forward
+that admits a request, and absent from an entry whose ``E`` laws hold them;
+``skip``, segments zeroed for a what-if run, which the graders refuse; a list
+of them as ``step_linear``'s),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
 ``decode/``, ``prefill<k>/`` and ``decode<k>/`` above one of a side, and for a
@@ -404,20 +409,22 @@ def spec() -> dict | None:
 
 def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time."""
-    from atom.compass.runner.overrides import FORWARD_KINDS, SEGMENTS
+    from atom.compass.runner.overrides import ADMISSION_IN_E, FORWARD_KINDS, SEGMENTS
 
     laws = host.get("laws", {})
     if (
-        set(host) - {"laws", "skip", "key"}
+        set(host) - {"laws", "skip", "key", "admit"}
         or set(host.get("skip", ())) - set(SEGMENTS)
         or set(laws) - set(FORWARD_KINDS)
         or {s for v in laws.values() for s in v} - set(SEGMENTS)
         or {len(c) for v in laws.values() for c in v.values()} - {3}
+        or len(host.get("admit") or ADMISSION_IN_E) != 3
     ):
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
-            "and key, the host key the laws were fitted under"
+            "admit, three coefficients on a forward's admissions or null, and "
+            "key, the host key the laws were fitted under"
         )
 
 
@@ -1414,6 +1421,7 @@ def runner(model_runner, tree) -> None:
     from atom.compass.memory import ModelTerms, device_readings
     from atom.compass.memory.check import record
     from atom.compass.runner.overrides import (
+        ADMISSION_IN_E,
         HostDeviceRecurrence,
         install_cost_backend,
         install_device_readings,
@@ -1626,6 +1634,7 @@ def runner(model_runner, tree) -> None:
             stage,
             mtp=mtp,
             sync=rapid and not config.disagg_is_decode,
+            admit=host.get("admit", ADMISSION_IN_E),
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])
@@ -1834,7 +1843,8 @@ def tokenizer(tok, config) -> None:
     """Wrap `tok`'s ``encode`` and ``decode``, and its Rust backend's
     ``encode_batch``, with the machine spec's entry for the model's architecture
     and the backend that loaded; the entry warns when the loaded
-    ``tokenizer.json`` is not the one it was measured on."""
+    ``tokenizer.json`` is not the one it was measured on. A refused entry
+    ends the run before the server serves (`_end_before_serving`)."""
     run = spec()
     if run is None:
         return
@@ -1843,11 +1853,15 @@ def tokenizer(tok, config) -> None:
     from atom.compass.spec import Backend
     from atom.utils.compass_loop import wrap_decode, wrap_encode, wrap_encode_batch
 
-    entry = _machine(run).tokenizer_for(
-        config.hf_config.architectures[0],
-        Backend.FAST if tok.is_fast else Backend.SLOW,
-        _fingerprint(tok),
-    )
+    try:
+        entry = _machine(run).tokenizer_for(
+            config.hf_config.architectures[0],
+            Backend.FAST if tok.is_fast else Backend.SLOW,
+            _fingerprint(tok),
+        )
+    except BaseException as e:
+        _end_before_serving(run, e)
+        raise
     tok.encode = wrap_encode(tok.encode, entry)
     tok.decode = wrap_decode(tok.decode, entry)
     # ATOM's segment tokenizer, which only a Rust backend gets, encodes a long
@@ -1855,6 +1869,19 @@ def tokenizer(tok, config) -> None:
     backend = getattr(tok, "_tokenizer", None)
     if isinstance(backend, Tokenizer):
         backend.encode_batch = wrap_encode_batch(backend.encode_batch, entry)
+
+
+def _end_before_serving(run: dict, e: BaseException) -> None:
+    """`e`, raised after the engines started and before the server serves, ends
+    the run in progress: stop it, as a signal stops the frontend's event loop, so
+    each engine leaves its loop at its ``+inf`` grant, hands in and its process
+    ends, which the server's exit waits for; then hand in `e` as the frontend's
+    ``ended:`` reason, which a standalone authority's summary waits for."""
+    rt = clock.installed()
+    if rt is None or not rt.in_run:
+        return
+    rt.end_run()
+    _hand_in(run, rt.me.name, rt.refusals + [f"ended:{rt.me.name} raised {e!r}"])
 
 
 def http_intake() -> tuple[float, float, float] | None:

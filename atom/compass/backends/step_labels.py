@@ -47,8 +47,12 @@ prefill and decode rows is cut.
 A step of an MTP record without `d_target_ns` is cut as `unsplit`: its device
 label would hold a draft the law prices again.
 
+An output forward's view takes `start_lag_s`: its device start, placed by the
+lead, less the exit of its token copy wait (`t_recv_ns`, else `t_read_ns`,
+else its launch's end).
+
 A step's host labels are its segments: `E` from the previous forward's exit,
-cut as idle when the two batches share no request; `W_pre` to the launch, less
+cut as idle after an idle engine (`busy_gaps`); `W_pre` to the launch, less
 the staging gate's wait; `W_launch` from the launch to the token copy wait,
 the sampler's launch included, or to the launch's end on a forward with no
 such wait, and none on a prefill the host did not pace whose launch ends
@@ -65,6 +69,10 @@ the event it waits for.
 pull, else exit, over the ranks before the same forward, where the group's
 `_sync_dp_state` releases each of them.
 
+A step's `admitted` is what its `E` spent admitting requests (`admissions`):
+the scheduler allocates a request's whole prompt the first time it schedules
+it, walking its prefix-cache hit and taking a fresh block for each one past it.
+
 `write_table` writes a record's labels beside it, `dp<r>.cost.jsonl`, for
 people: a first line `{"version": TABLE_VERSION}`, then per step `step`,
 `d_busy_s`, `d_gap_s`, `launch_exposed`, `idle`, the segments, `label_s`,
@@ -76,6 +84,7 @@ from __future__ import annotations
 
 import bisect
 import hashlib
+import itertools
 import json
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -133,6 +142,8 @@ class Sample:
     or None).
     `dummies` holds the steps its rank ran as a DP dummy forward, which give no
     sample: the same set on each of the rank's samples.
+    `admitted` is `(requests, uncached, cached)` of the requests it admits
+    (`admissions`).
     """
 
     step: int
@@ -147,6 +158,23 @@ class Sample:
     propose_s: float | None = None
     dummies: frozenset = frozenset()
     draft_kv_s: float | None = None
+    admitted: tuple = (0, 0, 0)
+
+
+def admissions(lines: list[dict]) -> list[tuple[int, int, int]]:
+    """Per line, `(requests, uncached, cached)` of the requests it admits: those
+    a prefill row schedules for the first time, with their prompt tokens past
+    the prefix-cache hit and within it. A request's prompt is its last prefill
+    row's context; its hit, the context its first row starts from."""
+    rows = [list(zip(s["batch"], (r[2] for r in s["rows"]))) for s in lines]
+    prompt = {r: c for line in rows for (r, _, c), decode in line if not decode}
+    seen, out = set(), []
+    for line in rows:
+        new = [(r, q, c) for (r, q, c), decode in line if r not in seen and not decode]
+        seen.update(r for (r, _, _), _ in line)
+        hits = [c - q for _, q, c in new]
+        out.append((len(new), sum(prompt[r] for r, *_ in new) - sum(hits), sum(hits)))
+    return out
 
 
 def group_tokens(lines) -> int | None:
@@ -260,9 +288,20 @@ def join_stamps(steps: list[dict], path) -> None:
                 step[key] = ts[i]
 
 
-def _shared(step, other) -> bool:
-    """Whether two steps' batches hold a request in common."""
-    return bool({r[0] for r in step["batch"]} & {r[0] for r in other["batch"]})
+def busy_gaps(lines: list[dict]) -> list[bool]:
+    """Per line, whether the engine was busy in the gap before it, holding a
+    request an earlier line scheduled and this line or a later one schedules
+    again. A busy loop steps on at its next pull; an idle one waits there for an
+    arrival, which the gap then holds."""
+    spans: dict = {}
+    for i, s in enumerate(lines):
+        for r in s["batch"]:
+            spans[r[0]] = (spans.get(r[0], (i,))[0], i)
+    opened = [0] * (len(lines) + 1)
+    for first, last in spans.values():
+        opened[first + 1] += 1
+        opened[last + 1] -= 1
+    return [n > 0 for n in itertools.accumulate(opened[:-1])]
 
 
 def _read(record) -> list[dict]:
@@ -330,6 +369,8 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             "by its device time"
         )
     exposed, paced, held = _host_cut(lines)
+    timed, lead = _timed(lines)
+    placed = {s["step"]: start + lead for s, start in timed}
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
@@ -337,6 +378,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
     tbo = (config or {}).get("engine", {}).get("enable_tbo")
     run = run or digest(record)
     samples, table, prev, ranks = [], [], None, None
+    busy, admits = busy_gaps(lines), admissions(lines)
     for i, s in enumerate(lines):
         if s["is_dummy_run"]:
             prev = s
@@ -357,6 +399,10 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
                         "rebuild it"
                     )
                 split = split_rule(group)
+        lag = None
+        if s["produces_output"]:
+            returned = s.get("t_recv_ns", s.get("t_read_ns", s["t_launch_ns"]))[1]
+            lag = (placed[s["step"]] - returned) * 1e-9
         view = BatchView(
             tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
             capture_rung=s["rung"],
@@ -365,6 +411,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             tbo_tokens=None if split is None else tuple(map(tuple, split)),
             moe_tokens=tokens,
             dp_rank=s["dp_rank"] if dp else None,
+            start_lag_s=lag,
         )
         cut = None
         if view.prefill and view.decode:
@@ -405,7 +452,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
         if copy.get(s["step"], (0, False))[1]:
             host["L_mtp"] = copy[s["step"]][0]
-        idle = prev is not None and not _shared(s, prev)
+        idle = prev is not None and not busy[i]
         if prev is not None and not idle:
             host["E"] = enter - starts[i - 1]
         host = {k: v * 1e-9 for k, v in host.items()}
@@ -429,6 +476,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
                 None if cut or propose is None else propose * 1e-9,
                 dummies,
                 None if cut or draft_kv is None else draft_kv * 1e-9,
+                admits[i],
             )
         )
         gap_ns = s.get("d_gap_ns")

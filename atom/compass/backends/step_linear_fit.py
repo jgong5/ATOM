@@ -53,6 +53,13 @@ record, and `W_recv`, on a later pipeline stage's. A forward whose `W_launch` it
 solve drops above the law paid a first-use JIT compile (`_jit`): it and the
 forward after it, whose period takes up the stall, are left out of every host
 law; the report lists the JIT forwards per run under `jit_steps`.
+A forward's `E` that admits requests (`step_labels.admissions`) is left out of
+its kind's law: the law then prices the engine loop alone, and `admit`, seconds
+on `ADMIT_FEATURES`, prices what the forwards of every kind that admit spend
+beyond it, fitted on their `E` with their kind's law as a fixed part. Records
+on too few such forwards give `admit` null, so a run refuses a forward that
+admits a request rather than charge it nothing, and the report says why under
+`unfitted`.
 
 Each equation is divided by its own label and the coefficients are bound to be
 non-negative. Steps whose relative residual is more than `MAD_K` scaled MADs
@@ -76,7 +83,8 @@ under the law's `draft`; it holds no `held_out`. A step with a propose label
 (`step_labels`) is fitted there on its draft label less that label, the
 draft-KV pass a middle chunk runs too, and left out when nothing remains; the
 propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`,
-or, split at a token count, its `propose` and `short_propose` (`_proposes`).
+or, split at a lag and maybe bounded at a token count, its `propose` and
+`near_propose` (`_proposes`).
 A decode's draft-KV label fits the draft law's `draft_kv` vector alike. An
 output prefill's fits the draft law's prefill vector in place of its draft
 label, which, all after `forward_done_event`, fits the `propose` vector, and
@@ -162,11 +170,16 @@ ROWMOD_GAIN = 0.1
 ROWMOD_SHUFFLES = 8
 #: The fraction of the unsplit `propose` vector's mean log error a split must cut.
 PROPOSE_SPLIT_GAIN = 0.1
-#: Steps each side of a `propose` split holds at least, as a `rowmod` cell holds
-#: `ROWMOD_CELL_STEPS`: on fewer, scatter that follows no token count clears the gain.
-PROPOSE_SPLIT_STEPS = 100
+#: Timed propose labels a split needs: on fewer, scatter that follows no lag
+#: clears the gain.
+PROPOSE_SPLIT_STEPS = 200
+#: Steps each side of a `propose` split holds at least, for its two coefficients.
+PROPOSE_SIDE_STEPS = 10
 HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
+#: What a forward's admissions cost per request, per prompt token past the
+#: prefix-cache hit and per token within it (`step_labels.admissions`).
+ADMIT_FEATURES = ("requests", "uncached", "cached")
 
 
 def _rung_key(rung: int | None) -> str:
@@ -230,13 +243,33 @@ def _features(
     return rows, cut
 
 
+def _host_x(s) -> tuple[int, int, int]:
+    return 1, sum_tokens(s.view.requests), len(s.view.requests)
+
+
 def _host_rows(samples) -> list[tuple]:
-    """(kind, segment, (1, tokens, seqs), seconds) per host label of each sample."""
+    """(kind, segment, (1, tokens, seqs), seconds) per host label of each
+    sample, but the `E` of one that admits requests."""
     rows = []
     for s in samples:
-        x = (1, sum_tokens(s.view.requests), len(s.view.requests))
-        rows += [(host_kind(s.view), k, x, v) for k, v in s.host.items()]
+        rows += [
+            (host_kind(s.view), k, _host_x(s), v)
+            for k, v in s.host.items()
+            if k != "E" or not s.admitted[0]
+        ]
     return rows
+
+
+def _admit_rows(samples, laws) -> list[tuple]:
+    """(admitted, `E` its kind's law prices, `E`) per sample that admits
+    requests, has a positive `E` and a kind with an `E` law."""
+    return [
+        (s.admitted, float(np.dot(c, _host_x(s))), s.host["E"])
+        for s in samples
+        if s.admitted[0]
+        and s.host.get("E", 0) > 0
+        and (c := laws.get(host_kind(s.view), {}).get("E")) is not None
+    ]
 
 
 def label_records(records, dp: int = 1) -> tuple[list, dict]:
@@ -275,9 +308,10 @@ def fit_host(samples) -> tuple[dict, dict]:
         )
     jit = _jit(samples)
     after = {(run, rank, n + 1) for run, rank, n in sorted(jit)}
-    rows = _host_rows(
+    kept = [
         s for s in samples if (s.provenance["run"], s.rank, s.step) not in jit | after
-    )
+    ]
+    rows = _host_rows(kept)
     host = {"key": json.loads(keys[0]), "laws": {}}
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
     report["jit_steps"] = {}
@@ -287,26 +321,43 @@ def fit_host(samples) -> tuple[dict, dict]:
         extra = sorted({r[1] for r in rows if r[0] == kind} - set(HOST_SEGMENTS))
         for segment in HOST_SEGMENTS[: 3 if kind == "middle" else 4] + tuple(extra):
             members = [r for r in rows if r[:2] == (kind, segment) and r[3] > 0]
-            x = np.array([r[2] for r in members], dtype=np.float64).reshape(-1, 3)
-            width = 3 if len(x) and np.linalg.matrix_rank(x[:, 1:]) == 2 else 2
-            if width == 2:
-                x[:, 2] = 0.0
             try:
-                if len(members) <= len(HOST_FEATURES):
-                    raise ValueError(f"{len(members)} forwards for 3 coefficients")
-                s = _solve(x, np.array([r[3] for r in members]), list(HOST_FEATURES))
-                hull = _hull(x[s["keep"]][:, 1:width], HOST_FEATURES[1:width])
+                coef, fitted = _host_law(
+                    [r[2] for r in members], [r[3] for r in members], HOST_FEATURES
+                )
             except (ValueError, QhullError) as e:
                 report["unfitted"][f"{kind}.{segment}"] = str(e).splitlines()[0]
                 continue
-            host["laws"].setdefault(kind, {})[segment] = s["coef"].tolist()
-            report[f"{kind}.{segment}"] = {
-                "hull": hull,
-                "samples": int(s["keep"].sum()),
-                "dropped": int((~s["keep"]).sum()),
-                **{k: s[k] for k in ("condition", "centre", "mad", "zero")},
-            }
+            host["laws"].setdefault(kind, {})[segment] = coef
+            report[f"{kind}.{segment}"] = fitted
+    a, base, labels = list(zip(*_admit_rows(kept, host["laws"]))) or [(), (), ()]
+    try:
+        host["admit"], report["admit"] = _host_law(a, labels, ADMIT_FEATURES, base)
+    except (ValueError, QhullError) as e:
+        host["admit"] = None  # a run refuses a forward that admits a request
+        report["unfitted"]["admit"] = str(e).splitlines()[0]
     return host, report
+
+
+def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
+    """The host law on `names` over the forwards `x` labelled `y`, the part
+    `offset` of each label fixed, and its report. Raises on too few forwards or
+    no hull; with the last feature in a fixed proportion to the one before on
+    every forward, the last gets zero."""
+    x = np.array(x, dtype=np.float64).reshape(-1, len(names))
+    if len(x) <= len(names):
+        raise ValueError(f"{len(x)} forwards for {len(names)} coefficients")
+    width = 3 if np.linalg.matrix_rank(x[:, 1:]) == 2 else 2
+    if width == 2:
+        x[:, 2] = 0.0
+    s = _solve(x, np.array(y), list(names), np.array(offset), names[0])
+    hull = _hull(x[s["keep"]][:, 1:width], names[1:width])
+    return s["coef"].tolist(), {
+        "hull": hull,
+        "samples": int(s["keep"].sum()),
+        "dropped": int((~s["keep"]).sum()),
+        **{k: s[k] for k in ("condition", "centre", "mad", "zero")},
+    }
 
 
 def _jit(samples) -> set[tuple]:
@@ -340,16 +391,18 @@ def _jit(samples) -> set[tuple]:
     return jit
 
 
-def _solve(x: np.ndarray, y: np.ndarray, names: list[str]) -> dict:
-    """Non-negative least squares on relative error, MAD-dropped until settled."""
+def _solve(
+    x: np.ndarray, y: np.ndarray, names: list[str], offset=0.0, kept: str = "step"
+) -> dict:
+    """Non-negative least squares on relative error, MAD-dropped until settled;
+    `offset` is a fixed part of each label's price, outside the coefficients."""
     from scipy.optimize import nnls
 
-    a = x / y[:, None]
-    # An intercept is kept whatever its variance; any other constant column is not.
+    a, b = x / y[:, None], 1.0 - offset / y
+    # An intercept, a column whose name starts with `kept`, is kept whatever
+    # its variance; any other constant column is not.
     vary = [
-        j
-        for j in range(x.shape[1])
-        if names[j].startswith("step") or np.ptp(x[:, j]) > 0
+        j for j in range(x.shape[1]) if names[j].startswith(kept) or np.ptp(x[:, j]) > 0
     ]
     keep = np.ones(len(y), dtype=bool)
     # Refitted until the kept set stops moving, so a step an outlier's pull
@@ -362,8 +415,8 @@ def _solve(x: np.ndarray, y: np.ndarray, names: list[str]) -> dict:
         solved = norms > 0
         cols, norms = cols[:, solved], norms[solved]
         coef = np.zeros(x.shape[1])
-        coef[np.array(vary)[solved]] = nnls(cols / norms, np.ones(len(cols)))[0] / norms
-        residual = a @ coef - 1.0
+        coef[np.array(vary)[solved]] = nnls(cols / norms, b[keep])[0] / norms
+        residual = a @ coef - b
         centre = np.median(residual)
         mad = 1.4826 * np.median(np.abs(residual - centre))
         moved = np.abs(residual - centre) <= max(MAD_K * mad, MAD_FLOOR)
@@ -859,42 +912,77 @@ def _propose(samples, label: str = "propose_s") -> dict:
 
 
 def _proposes(samples) -> dict:
-    """The draft law's `propose` over `samples`, or, split at a token count,
-    `propose` over the steps of at least that many prefill tokens and
-    `short_propose` over the rest, the count its `below`.
+    """The draft law's `propose` over `samples`, or, split at a lag, `propose`
+    over the passes the device reached at least that far behind its host and
+    `near_propose` over the rest, the lag its `lag`; and, bounded at a token
+    count, `near_propose` over those of fewer prefill tokens alone, the count
+    its `below`.
 
-    The count runs over the powers of two up to the largest prefill, each side
-    holding at least `PROPOSE_SPLIT_STEPS` steps and solved as `_propose`
-    solves. The split whose vectors price the steps at the smallest mean
+    A pass's lag is its view's `start_lag_s` plus its step's target and draft-KV
+    labels. The lag runs over the powers of two of a second up to one, over the
+    steps that state one when they number at least `PROPOSE_SPLIT_STEPS`, each
+    side holding at least `PROPOSE_SIDE_STEPS` and solved as `_propose` solves.
+    The split whose vectors price those steps at the smallest mean
     |log(price / label)| is adopted when that cuts the unsplit vector's by
-    `PROPOSE_SPLIT_GAIN`; both errors go under `short_propose`'s `fit.split`.
+    `PROPOSE_SPLIT_GAIN`. The bound runs over the powers of two and one and a
+    half times each, below the largest prefill, with every lag again, once a
+    split is adopted: the best bounded split replaces it when that cuts its
+    error by `PROPOSE_SPLIT_GAIN` too. The errors go under `near_propose`'s
+    `fit.split`.
     Not a scaled MAD: unsplit, the more frequent pass length sets the MAD
     however far the rest are priced off it.
     """
-    tokens = np.array([sum_tokens(s.view.prefill) for s in samples])
-    x = np.array([(1, len(s.view.requests)) for s in samples], dtype=np.float64)
-    labels = np.array([s.propose_s for s in samples])
+    timed = [s for s in samples if s.view.start_lag_s is not None]
+    lags = np.array(
+        [s.view.start_lag_s + s.device_s + (s.draft_kv_s or 0) for s in timed]
+    )
+    tokens = np.array([sum_tokens(s.view.prefill) for s in timed])
+    x = np.array([(1, len(s.view.requests)) for s in timed], dtype=np.float64)
+    labels = np.array([s.propose_s for s in timed])
 
     def error(short, below: dict, above: dict) -> float:
         price = [x @ list(v["coefficients"].values()) for v in (below, above)]
         return float(np.mean(np.abs(np.log(np.where(short, *price) / labels))))
 
+    def best(bounds) -> tuple | None:
+        """The (error, near, far) of the best split at any lag under `bounds`."""
+        found, seen = None, set()
+        for k in (2.0**-n for n in range(20, -1, -1)):
+            for bound in bounds:
+                short = (lags < k) & (tokens < bound)
+                if short.tobytes() in seen or (
+                    min(short.sum(), (~short).sum()) < PROPOSE_SIDE_STEPS
+                ):
+                    continue
+                seen.add(short.tobytes())
+                sides = [
+                    [s for s, m in zip(timed, short) if m == w] for w in (True, False)
+                ]
+                below, above = map(_propose, sides)
+                got = error(short, below, above)
+                if found is None or got < found[0]:
+                    below["lag"] = k
+                    if bound < math.inf:
+                        below["below"] = bound
+                    found = (got, below, above)
+        return found
+
     whole = _propose(samples)
-    without = error(np.zeros(len(samples), dtype=bool), whole, whole)
-    best, target, k = {"propose": whole}, (1 - PROPOSE_SPLIT_GAIN) * without, 2
-    while k <= tokens.max():
-        short = tokens < k
-        if min(short.sum(), (~short).sum()) >= PROPOSE_SPLIT_STEPS:
-            sides = [
-                [s for s, m in zip(samples, short) if m == w] for w in (True, False)
-            ]
-            below, above = map(_propose, sides)
-            if (got := error(short, below, above)) < target:
-                below["below"], target = k, got
-                below["fit"]["split"] = {"error": got, "error_without": without}
-                best = {"propose": above, "short_propose": below}
-        k *= 2
-    return best
+    if len(timed) < PROPOSE_SPLIT_STEPS:
+        return {"propose": whole}
+    without = error(np.zeros(len(timed), dtype=bool), whole, whole)
+    split = best([math.inf])
+    if split is None or split[0] >= (1 - PROPOSE_SPLIT_GAIN) * without:
+        return {"propose": whole}
+    errors = {"error": split[0], "error_without": without}
+    top = int(tokens.max())
+    grid = [b << j for b in (2, 3) for j in range(top.bit_length()) if b << j < top]
+    bounded = best(sorted(grid))
+    if bounded is not None and bounded[0] < (1 - PROPOSE_SPLIT_GAIN) * split[0]:
+        errors["error_unbounded"], errors["error"] = split[0], bounded[0]
+        split = bounded
+    split[1]["fit"]["split"] = errors
+    return {"propose": split[2], "near_propose": split[1]}
 
 
 def token_band(tokens: int) -> str:
@@ -1004,18 +1092,29 @@ def mark_held_out(law: dict, report: dict, samples, options=None, seed: int = 0)
 
 
 def host_held_out(samples) -> dict:
-    """Per host law, the relative errors on each run of the laws fitted on the others."""
+    """Per host law, the relative errors on each run of the laws fitted on the
+    others; under `admit E`, those of the `E` of the forwards that admit
+    requests, priced by their kind's law and `admit`."""
     errors: dict[str, list[float]] = {}
     for run in dict.fromkeys(s.provenance["run"] for s in samples):
         others = [s for s in samples if s.provenance["run"] != run]
-        laws = fit_host(others)[0]["laws"]
+        host = fit_host(others)[0]
+        laws, admit = host["laws"], host.get("admit")
         mine = [s for s in samples if s.provenance["run"] == run]
-        for kind, segment, x, seconds in _host_rows(mine):
-            c = laws.get(kind, {}).get(segment)
+        rows = [
+            (f"{kind} {segment}", c and float(np.dot(c, x)), seconds)
+            for kind, segment, x, seconds in _host_rows(mine)
+            for c in [laws.get(kind, {}).get(segment)]
+        ]
+        rows += [
+            ("admit E", admit and base + float(np.dot(admit, a)), e)
+            for a, base, e in _admit_rows(mine, laws)
+        ]
+        for band, price, seconds in rows:
             if seconds > 0:
                 errors.setdefault(
-                    f"host {kind} {segment}" + ("" if c else " (no law)"), []
-                ).append(float(np.dot(c, x)) / seconds - 1.0 if c else float("nan"))
+                    f"host {band}" + ("" if price is not None else " (no law)"), []
+                ).append(price / seconds - 1.0 if price is not None else float("nan"))
     return errors
 
 

@@ -874,7 +874,9 @@ holds the configuration's `memory_readings`. The run takes the step law at the m
 and engine config the file states, and its `host` at the host key the file states, the
 `atom` digest it was last re-keyed at, so a law re-keyed to this tree runs here though its
 records ran at another; each refuses where a store entry's would. A law file names no fit
-inputs, so grading cannot check its fitted traces against the cell's and refuses its run.
+inputs, so grading cannot check its fitted traces against the cell's; it takes the run,
+since calibration replays traces no cell is graded on (the
+[#2698 ruling](https://github.com/jgong5/ATOM/issues/2698#issuecomment-6591251259)).
 
 ## Cost accuracy on a real run's own steps — `validate.cost`
 
@@ -1034,11 +1036,18 @@ row, about 60 s inside the run, and keeps it in the container's aiter tree, whic
 no cache directory above holds. A record names each module its server built, or
 began to, in run.json's `aiter_jit_builds`, and grading, `compass fit steps`,
 `compass fit host`, `step_linear_fit` and `validate.cost` refuse it, naming them.
-So warm a fresh container before its first record: serve the same workload for a
-few minutes on a server whose record nothing reads, `compass record --gpu G --out
-$R/warm -- $ATOM` with `client.sh $R/warm --traces A-B --concurrency <C>
---duration 300 --stop` at the record's traces, and take again any record refused
-for a build.
+So sweep a fresh container before its first record, on a server whose record
+nothing reads: `compass record --gpu G $S --out $R/sweep1 -- $ATOM` with
+`client.sh $R/sweep1 --sweep --traces A-B --stop`, A to B every trace the cell's
+records serve. The sweep (`atom/compass/drive/sweep.py`) sends each DP rank a
+prefill step of every token count up to its budget, each step's rows designed
+(`atom/compass/drive/sweep_plan.py`), and after the stop keeps the points the
+step record covers in the store's JIT cache library, per stack and cell. Each
+round sends only the points still missing; take rounds with a fresh `--out`
+until its last line reads `swept`. A third round's missing points, `missing` in
+its `sweep.json`, are the residual to report with the cell: the sweep never
+constructs preemption, recompute or an error path. Take again any record
+refused for a build.
 What a container compiled need not be compiled again in the next one on the same
 stack: `compass record` with `$S`, and a `REAL=1 cctraces_sim.sh` run with `STORE`
 set, keep a JIT cache library per stack under the store's `jit` directory
@@ -1181,8 +1190,11 @@ and 5 at concurrency 16 alone, with these changes:
   serves V4.1-Flash on, and `$M` names `machines/mi355x-gpu40.json`, pinned to its stack.
 - `$ATOM` is `--model <DeepSeek-V4.1-Flash> --max-model-len 262144 -tp 4
   --kv_cache_dtype bf16 --index-cache-dtype fp8 --method dspark
-  --num-speculative-tokens 5 --level 0`, plus `--enable-expert-parallel` for the EP4
-  cell, and `G` names four GPUs.
+  --num-speculative-tokens 5 --spec-decode-acceptance-length 3 --level 0`, plus
+  `--enable-expert-parallel` for the EP4 cell, and `G` names four GPUs. Every record and
+  every run states the acceptance length, 3, near the 3.13 the smoke measured; another
+  length is another value of the flag, the same in every record and run
+  ([ruling](https://github.com/jgong5/ATOM/pull/2683#issuecomment-6578751421)).
 - The warm record serves traces 0 to 255 at 16. V4.1's Triton kernels still compile
   new variants after it, so take again every record that names `aiter_jit_builds`.
 - Calibration adds a first-turn record at 16, its `client.sh` run with
@@ -1194,7 +1206,7 @@ and 5 at concurrency 16 alone, with these changes:
   law stops at the widest rung the sampled records fit, and the simulated run
   refuses each step above it.
 - Steps 4 and 5 take `--duration 3600`, with a calibration record between step 4's
-  two real runs; step 5 adds `--acceptance-record $R/cell/c16/real1`. A step 5 at
-  another duration than step 4's is graded as another workload, and refused.
+  two real runs. A step 5 at another duration than step 4's is graded as another
+  workload, and refused.
 - The draft vectors hold no held-out error: check 2's `cost` rows of kind `draft` give
   the draft law's error on the real runs' own steps.

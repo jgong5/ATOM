@@ -1089,7 +1089,8 @@ they are off ATOM's default, and the performance environment
 (`atom.benchmarks.results.metadata.PERFORMANCE_KEYS`) less the client's `AIPERF_*`
 variables and the device selection; ATOM's Triton expert and GEMM switches
 (`ATOM_USE_TRITON_MOE`, `ATOM_USE_TRITON_MOE_A4W4`, `ATOM_USE_TRITON_MOE_DECODE`,
-`ATOM_USE_TRITON_GEMM`) are in it. One store holds V4-Pro graphs of one shape that
+`ATOM_USE_TRITON_GEMM`) are in it, and ATOM's prefill token buckets
+(`ATOM_TOKEN_GRAPH_SIZES`) only when ATOM reads them off its default. One store holds V4-Pro graphs of one shape that
 differ only in `kv_cache_dtype`, or only in `ATOM_USE_TRITON_MOE`, and each run reads its
 own.
 
