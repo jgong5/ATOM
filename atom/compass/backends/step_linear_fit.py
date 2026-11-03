@@ -195,7 +195,7 @@ def _features(
     routing: tuple[int, int] | None = None,
 ) -> tuple[list[tuple], dict]:
     """One rank's fittable samples as (vector, features, seconds, step, context,
-    tokens), and how many were cut, per reason.
+    tokens, dummies), and how many were cut, per reason.
 
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
     order, plus `history` for that form, above `dp` 1 `moe_rows` on prefill and
@@ -203,7 +203,9 @@ def _features(
     label `seqs` and `out` on prefill, as `StepLinearBackend` counts them;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill;
     `tokens` a decode step's real MoE tokens under `routing`, the model's
-    (experts, top-k), which its MoE column reads, else None.
+    (experts, top-k), which its MoE column reads, else None; `dummies` its
+    group's dummy forwards (`BatchView.group_dummies`), which the column's
+    `moe_experts` counts as one token.
     """
     cut, rows = dict.fromkeys(CUTS, 0), []
     for s in samples:
@@ -239,7 +241,8 @@ def _features(
                         "which a data-parallel law's MoE column reads"
                     )
             context = tuple(r.context_tokens for r in view.decode)
-            rows.append((key, counts, s.device_s, s.step, context, tokens))
+            dummies = view.group_dummies
+            rows.append((key, counts, s.device_s, s.step, context, tokens, dummies))
     return rows, cut
 
 
@@ -472,7 +475,8 @@ def _moe_column(members, x, names, routing, reference=None) -> tuple:
 
     `members` are the rung's `fit` rows, `x` their design over `names`. The
     forms are no column and each of `MOE_COLUMNS` over the steps' real MoE
-    tokens, `moe_experts` under `routing`. Each form is solved with each record
+    tokens, `moe_experts` under `routing` and with each step's group dummies
+    as one token (`moe_column`). Each form is solved with each record
     held out of the rung's rows, and its held-out error is the mean over the
     records of the held-out p50 error's magnitude, weighted by the record's
     steps. The form of smallest held-out error is picked, no column on a tie;
@@ -487,7 +491,7 @@ def _moe_column(members, x, names, routing, reference=None) -> tuple:
     y = np.array([r[3] for r in members])
     forms = {"none": (x, names)}
     for feature in MOE_COLUMNS:
-        column = [moe_column(feature, r[6], routing) for r in members]
+        column = [moe_column(feature, r[6], routing, r[7]) for r in members]
         forms[feature] = (np.column_stack([x, column]), [*names, feature])
     held, error = {}, {}
     for form, (design, wide) in forms.items():
@@ -1008,7 +1012,8 @@ def priced_rank(ranks: dict):
 def _held_out(samples, options, seed, warm=None):
     """Each step of each run, warm steps left out, priced as its costliest rank
     by the law fitted on the other runs: (run, vector, band, that rank's (counts,
-    context, tokens), relative error), the error nan where that law has no vector."""
+    context, tokens, dummies), relative error), the error nan where that law has
+    no vector."""
     form, dp = _options(options)
     options = {**(options or {}), "serial": _serial(samples, options)}
     runs = _runs(samples, dp)
@@ -1025,7 +1030,7 @@ def _held_out(samples, options, seed, warm=None):
             if step in warm[i]:
                 continue
             vector = law["decode"].get(key) if key != "prefill" else law.get(key)
-            mine = [(r[1], r[4], r[5]) for r in group.values()]
+            mine = [(r[1], *r[4:7]) for r in group.values()]
             price, error = [c[1] for c, *_ in mine], float("nan")
             if vector is not None:
                 c = list(vector["coefficients"].values())
@@ -1035,11 +1040,12 @@ def _held_out(samples, options, seed, warm=None):
             yield run, key, _band(key, top[0]), top, error
 
 
-def _counts(vector: dict, routing, counts, context, tokens) -> tuple:
+def _counts(vector: dict, routing, counts, context, tokens, dummies) -> tuple:
     """A step's `counts` with the MoE column and `rowmod` count `vector` adds,
-    over its rows' `context` and its real MoE `tokens`, under `routing`."""
+    over its rows' `context` and its real MoE `tokens`, `dummies` of them its
+    group's dummy forwards', under `routing`."""
     moe = [f for f in MOE_COLUMNS if f in vector["coefficients"]]
-    counts = (*counts, *(moe_column(f, tokens, routing) for f in moe))
+    counts = (*counts, *(moe_column(f, tokens, routing, dummies) for f in moe))
     return counts + ((rowmod(context, vector["rowmod"]),) if "rowmod" in vector else ())
 
 

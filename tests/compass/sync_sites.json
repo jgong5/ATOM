@@ -270,6 +270,18 @@
    "mechanism_why": "the stage-to-stage pp_data channel: the stage loop, its LP's clock owner, stamps the send at the later of the forward's device end and its previous send's completion; the TP-rank-0 worker posts the frame on the PP CPU group and never waits on it"
   },
   {
+   "id": "atom/compass/runner/projection.py::dummy_ranks::torch.distributed.all_reduce(flag, group=dp_group())::collective#0",
+   "file": "atom/compass/runner/projection.py",
+   "symbol": "dummy_ranks",
+   "call": "torch.distributed.all_reduce",
+   "expr": "torch.distributed.all_reduce(flag, group=dp_group())",
+   "shape": "collective",
+   "peer": "process",
+   "why": "every data-parallel rank's worker sums the group's dummy forwards, on the group's CPU group, once per simulated step before pricing it, since ATOM's DP sync carries no dummy flag",
+   "mechanism": "K6",
+   "mechanism_why": "a wait inside the data-parallel group's LP: every rank is a member of that one LP, the exchange is never reported to the clock authority and carries no cost; the summed count only sets each rank's view of its step"
+  },
+  {
    "id": "atom/distributed/indexer_cp.py::warmup_exchange::torch.cuda.synchronize()::device_sync#0",
    "file": "atom/distributed/indexer_cp.py",
    "symbol": "warmup_exchange",

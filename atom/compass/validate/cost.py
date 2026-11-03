@@ -185,7 +185,10 @@ def cost_accuracy(record, backend, steps=None) -> dict:
             f"{record} holds rank records of {lines} lines; one run's ranks "
             "differ by at most the step a stopped run leaves on some"
         )
-    run = [step_labels.label(r, split_rule=_split)[0] for r in ranks]
+    dummies = step_labels.group_dummies(records)
+    run = [
+        step_labels.label(r, split_rule=_split, dummy_ranks=dummies)[0] for r in ranks
+    ]
     joined, cut, _ = step_linear_fit._groups(run, "base", steps=steps)
     views = [{s.step: s.view for s in rank} for rank in run]
     drafts = [{s.step: s.draft_s for s in rank} for rank in run]
