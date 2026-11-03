@@ -147,8 +147,8 @@ def test_an_engine_built_in_a_simulated_run_rings_workers_that_sleep(
         manager = async_proc.AsyncIOProcManager(None, 2, "workers.Runner")
     ring = manager.rpc_broadcast_mq
     try:
-        assert (type(ring), len(ring.ringers)) == (RingingQueue, 2)
-        assert targets == [SleepingWorker, SleepingWorker]
+        assert type(ring) is RingingQueue
+        assert (len(ring.ringers), targets) == (2, [SleepingWorker, SleepingWorker])
         # Outside the engine's construction, a manager built takes ATOM's own.
         assert async_proc.MessageQueue is MessageQueue
         assert async_proc.AsyncIOProc is SleepingWorker.__base__
