@@ -58,9 +58,6 @@ serves and raises a caught one again once it has shut down, raises it into that
 handler, so ``uvicorn.run`` returns. Closing the loop puts back the handlers it
 found.
 `HttpChannel` is the inline receive of HTTP requests.
-
-On a real run recording its steps, `recorded` times each served tokenizer call
-and `stamp_intake` stamps each HTTP request's intake, each into a `LineFile`.
 """
 
 import asyncio
@@ -366,101 +363,6 @@ def wrap_decode(decode, rate):
         return decode(ids, *args, **kwargs)
 
     return charged
-
-
-class LineFile:
-    """A file of lines, each written whole and flushed as it is written, from
-    any thread."""
-
-    def __init__(self, path) -> None:
-        self.file = open(path, "w", buffering=1)  # noqa: SIM115
-        self.lock = threading.Lock()
-
-    def write(self, line: str) -> None:
-        with self.lock:
-            self.file.write(line)
-
-
-def recorded(call, kind: str, out: LineFile, tokens):
-    """`call`, writing to `out` per call a JSON line of `kind`, its
-    `tokens(args, result)` and its start and end on the monotonic clock in ns;
-    a call made inside a recorded ``encode`` call is that call's, as
-    `wrap_encode_batch` charges it."""
-
-    def timed(*args, **kwargs):
-        if getattr(_in_encode, "on", False):
-            return call(*args, **kwargs)
-        _in_encode.on = kind == "encode"
-        start = time.monotonic_ns()
-        try:
-            got = call(*args, **kwargs)
-        finally:
-            _in_encode.on = False
-        end = time.monotonic_ns()
-        out.write(
-            f'{{"call": "{kind}", "tokens": {tokens(args, got)}, '
-            f'"t_start_ns": {start}, "t_end_ns": {end}}}\n'
-        )
-        return got
-
-    return timed
-
-
-def stamp_intake(out: LineFile) -> None:
-    """Stamp each HTTP request's intake into `out` as
-    ``scripts/compass/http_intake.py serve`` does, one line
-    ``<end ns> <thread id> <kind> <start ns> <size>`` each, on the monotonic
-    clock: ``app``, the request handed to the ASGI app, size 0; ``body``, its
-    body first read, size its bytes; ``tmpl``, a chat template rendered, size
-    its characters; ``prep``, a tokenizer pool job, and ``send``, a request
-    handed to the engine, size 0. Patches the classes, and every loaded
-    module's binding of ``apply_chat_template``, for the rest of the process."""
-    from starlette.applications import Starlette
-    from starlette.requests import Request
-
-    from atom.entrypoints.openai import chat_encoders
-    from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
-    from atom.model_engine.llm_engine import InputOutputProcessor
-
-    def stamp(kind: str, start: int, size: int) -> None:
-        out.write(
-            f"{time.monotonic_ns()} {threading.get_ident()} {kind} {start} {size}\n"
-        )
-
-    def timed(call, kind: str, size=lambda got: 0):
-        def timed(*args, **kwargs):
-            start = time.monotonic_ns()
-            got = call(*args, **kwargs)
-            stamp(kind, start, size(got))
-            return got
-
-        return timed
-
-    read, handle = Request.body, Starlette.__call__
-
-    async def body(self):
-        cached, start = hasattr(self, "_body"), time.monotonic_ns()
-        got = await read(self)
-        if not cached:
-            stamp("body", start, len(got))
-        return got
-
-    async def app(self, scope, receive, send):
-        if scope["type"] == "http":
-            stamp("app", time.monotonic_ns(), 0)
-        await handle(self, scope, receive, send)
-
-    Request.body, Starlette.__call__ = body, app
-    # The API server imports the function by name, so each binding is replaced.
-    render = chat_encoders.apply_chat_template
-    rendered = timed(render, "tmpl", len)
-    for module in list(sys.modules.values()):
-        if getattr(module, "__dict__", {}).get("apply_chat_template") is render:
-            module.apply_chat_template = rendered
-    fanout = InputOutputProcessor.preprocess_fanout
-    InputOutputProcessor.preprocess_fanout = timed(fanout, "prep")
-    for cls in (CoreManager, DisaggCoreManager):
-        cls.add_request = timed(cls.add_request, "send")
 
 
 #: Timers that do not keep the run alive, by the qualified name of their
