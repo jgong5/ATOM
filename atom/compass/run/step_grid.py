@@ -28,7 +28,8 @@ is `keyed`, as JSON: the ladder the runner replays (none under
 ``enforce_eager``), the KV block size and dtype, the quantization, the TP and
 DP widths, DP attention, expert parallelism, TBO, the MoE backend, EPLB and
 DeepSeek-V4.1 decoder SWA bounded replay when
-off ATOM's default, the performance environment and, under speculation, its
+off ATOM's default, the performance environment, ATOM's prefill token buckets
+in it when off ATOM's default too, and, under speculation, its
 method and draft width. Loading refuses, naming what differs:
 
 - a run at data-parallel width above one, since every bundle is measured at one;
@@ -51,7 +52,9 @@ summary records the digest of the bundle it priced with.
 """
 
 import json
+import os
 from collections.abc import Mapping
+from types import FunctionType, SimpleNamespace
 
 from atom.benchmarks.results.metadata import performance_env
 from atom.compass.artifacts import (
@@ -79,13 +82,16 @@ MEMBER = ("params", Topology().ranks()[0], "json")
 #: Engine fields keyed only off ATOM's default, so keys written before they
 #: were read do not move.
 OFF_DEFAULT = ("moe_backend", "eplb_enable", "enable_decoder_swa_bounded_replay")
+#: ATOM's prefill token buckets, an environment variable `keyed` the same way.
+BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
 
 
 def keyed(config, ladder: bool = True) -> dict:
     """The conditions a bundle is measured under, as the resolved config holds them,
     `OFF_DEFAULT` only where it is off ATOM's default, and the performance
-    environment of this process less the client's and the device selection, and
-    under speculation its method and draft width; the ladder only with `ladder`."""
+    environment of this process less the client's and the device selection,
+    `BUCKETS` in it only off ATOM's default, and under speculation its method
+    and draft width; the ladder only with `ladder`."""
     from atom.config import Config
 
     spec = getattr(config, "speculative_config", None)
@@ -108,10 +114,21 @@ def keyed(config, ladder: bool = True) -> dict:
         "enable_tbo_decode": config.enable_tbo_decode,
         "env": {
             k: v
-            for k, v in sorted(performance_env().items())
+            for k, v in sorted((performance_env() | _buckets_off_default()).items())
             if not (k.startswith("AIPERF_") or k.endswith("_VISIBLE_DEVICES"))
         },
     }
+
+
+def _buckets_off_default() -> dict:
+    """`BUCKETS` as this process sets it when ATOM reads it off its default, else
+    nothing: ATOM states the default only inside its reader, run here unset."""
+    from atom.utils import envs
+
+    read = envs.environment_variables[BUCKETS]
+    unset = SimpleNamespace(getenv=lambda _, default=None: default)
+    off = read() != FunctionType(read.__code__, read.__globals__ | {"os": unset})()
+    return {BUCKETS: os.environ[BUCKETS]} if off else {}
 
 
 def differ(there: dict, here: dict, where: str) -> list[str]:
