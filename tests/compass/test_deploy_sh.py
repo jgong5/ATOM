@@ -116,6 +116,7 @@ http.server.HTTPServer(("127.0.0.1", port), Models).serve_forever()
 """
 PREFILL = ["-tp", "2", "--enable-dp-attention"]
 ROUTER_ARGS = ["--policy", "random", "--backend", "atom", "--disable-health-check"]
+ROUTER_LP_ARGS = [*ROUTER_ARGS, "--disable-retries", "--dp-aware"]
 
 
 @pytest.fixture
@@ -276,7 +277,7 @@ def test_a_dp_aware_router_runs_as_the_router_lp_on_the_run_s_clock(tmp_path, pl
     env, flags = planted
     env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
     d = tmp_path / "d"
-    words = argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"])
+    words = argv(tmp_path, flags, router=ROUTER_LP_ARGS)
     script = subprocess.Popen(
         words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
     )
@@ -323,7 +324,7 @@ def test_a_router_lp_that_leaves_as_the_traffic_closes_waits_for_the_client_s_st
     env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
     env["PLANTED_LEAVE"] = str(tmp_path / "leave")
     d = tmp_path / "d"
-    words = argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"])
+    words = argv(tmp_path, flags, router=ROUTER_LP_ARGS)
     script = subprocess.Popen(
         words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True,
@@ -358,7 +359,7 @@ def test_a_dp_aware_run_refuses_a_router_built_dirty_before_anything_starts(
 ):
     env, flags = planted
     env["PLANTED_BUILD"] = f"{_tree_commit()} dirty"
-    words = argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"])
+    words = argv(tmp_path, flags, router=ROUTER_LP_ARGS)
 
     done = subprocess.run(
         words, env=env, cwd=tmp_path, capture_output=True, text=True, check=False
@@ -431,6 +432,26 @@ def test_a_simulated_router_refuses_a_worker_more_or_a_limiter_before_anything_s
 
     assert done.returncode == 2, done.stderr
     assert f"the router's arguments carry {flag}," in done.stderr
+    assert not (tmp_path / "d").exists()
+
+
+def test_a_router_lp_without_disable_retries_exits_2_before_anything_starts(
+    tmp_path, planted
+):
+    env, flags = planted
+
+    done = subprocess.run(
+        argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"]),
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert done.returncode == 2, done.stderr
+    assert "carry --dp-aware but not --disable-retries:" in done.stderr
     assert not (tmp_path / "d").exists()
 
 
