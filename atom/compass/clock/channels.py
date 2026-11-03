@@ -35,7 +35,7 @@ class ReceiveMode(StrEnum):
 #: transport alone, measured on hjbog-srdc-18 by `scripts/compass/http_intake.py
 #: floor`: the median, over parity workload requests sent one at a time, of
 #: client send to the ASGI app call. The event loop's intake after that call is
-#: the machine spec's ``host.http_intake``, charged on top.
+#: the host laws' ``http_intake`` term, charged on top.
 #: ``offline_batch`` is from earlier work, which measured 13.7 ms end-to-end and
 #: found the two paths differ enough that one number would misprice one of them.
 ADMISSION_DELAY_S = {

@@ -322,9 +322,9 @@ def charge(d: float) -> None:
 _in_encode = threading.local()
 
 
-def wrap_encode(encode, entry):
-    """`encode`, charging the current job ``fixed + tokens / derated rate``."""
-    rate = entry.encode_tokens_per_s * entry.derate
+def wrap_encode(encode, rate):
+    """`encode`, charging the current job ``fixed_s + tokens / tokens_per_s`` of
+    `rate`, a ``host`` entry's ``tokenizer.encode``."""
 
     def charged(*args, **kwargs):
         _in_encode.on = True
@@ -332,34 +332,34 @@ def wrap_encode(encode, entry):
             ids = encode(*args, **kwargs)
         finally:
             _in_encode.on = False
-        charge(entry.encode_fixed_s + len(ids) / rate)
+        charge(rate["fixed_s"] + len(ids) / rate["tokens_per_s"])
         return ids
 
     return charged
 
 
-def wrap_encode_batch(encode_batch, entry):
+def wrap_encode_batch(encode_batch, rate):
     """A fast tokenizer backend's ``encode_batch``, charging the current job
-    ``fixed + tokens / derated rate`` over the ids of all the encodings it
-    returns, the batch at the single-call rate; a call made inside a
-    `wrap_encode` call is that call's to charge."""
-    rate = entry.encode_tokens_per_s * entry.derate
+    ``fixed_s + tokens / tokens_per_s`` of `rate` over the ids of all the
+    encodings it returns, the batch at the single-call rate; a call made inside
+    a `wrap_encode` call is that call's to charge."""
 
     def charged(*args, **kwargs):
         encodings = encode_batch(*args, **kwargs)
         if not getattr(_in_encode, "on", False):
-            charge(entry.encode_fixed_s + sum(len(e.ids) for e in encodings) / rate)
+            tokens = sum(len(e.ids) for e in encodings)
+            charge(rate["fixed_s"] + tokens / rate["tokens_per_s"])
         return encodings
 
     return charged
 
 
-def wrap_decode(decode, entry):
-    """`decode`, charging the current job ``fixed + tokens / derated rate``."""
-    rate = entry.decode_tokens_per_s * entry.derate
+def wrap_decode(decode, rate):
+    """`decode`, charging the current job ``fixed_s + tokens / tokens_per_s`` of
+    `rate`, a ``host`` entry's ``tokenizer.decode``."""
 
     def charged(ids, *args, **kwargs):
-        charge(entry.decode_fixed_s + len(ids) / rate)
+        charge(rate["fixed_s"] + len(ids) / rate["tokens_per_s"])
         return decode(ids, *args, **kwargs)
 
     return charged
@@ -686,7 +686,7 @@ class HttpChannel:
     instant, every tokenizer station job placed and all else due by then run
     (`SimExecutor.placed`), so a burst reaches the app one request at a time.
     A request that arrives once the last intake has ended is charged ``idle_s``
-    in place of ``fixed_s``. A run file with no machine spec charges nothing.
+    in place of ``fixed_s``. A ``host`` entry with no ``http_intake`` charges nothing.
     """
 
     def __init__(self, app, stamp) -> None:

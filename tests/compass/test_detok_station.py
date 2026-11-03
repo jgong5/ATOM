@@ -99,7 +99,7 @@ def _run(monkeypatch, callback, token_counts) -> None:
 
 def test_three_messages_on_one_thread_predicted_beside_observed(monkeypatch):
     tokenizer, entry = _Tokenizer(), _entry()
-    tokenizer.decode = wrap_decode(tokenizer.decode, entry)
+    tokenizer.decode = wrap_decode(tokenizer.decode, entry["decode"])
     dispatcher = StreamBatchDispatcher(tokenizer)
     monkeypatch.setattr(api_server, "_stream_batch_dispatcher", dispatcher)
     state, observed = dispatcher.new_state(), []
@@ -115,13 +115,13 @@ def test_three_messages_on_one_thread_predicted_beside_observed(monkeypatch):
 
     _run(monkeypatch, callback, [100, 50, 25])
     # Predicted by hand: one stream; each update decodes the window before it
-    # and the window with it, ``fixed + tokens / (rate x derate)`` per call.
+    # and the window with it, ``fixed_s + tokens / tokens_per_s`` per call.
     # The three arrive together at IPC and run back to back.
-    rate = entry.decode_tokens_per_s * entry.derate
+    rate = entry["decode"]["tokens_per_s"]
     windows = [(0, 100), (100, 150), (50, 75)]
     start, predicted = IPC, []
     for prefix, full in windows:
-        end = start + 2 * entry.decode_fixed_s + (prefix + full) / rate
+        end = start + 2 * entry["decode"]["fixed_s"] + (prefix + full) / rate
         predicted.append((start, end))
         start = end
     # (job start, completion): (0.001, 0.203), (0.203, 0.705), (0.705, 0.957)
@@ -146,7 +146,7 @@ def test_a_non_streaming_completion_is_delivered_after_its_loop_thread_decode(
     # 100 tokens in one finished output, then its final decode on the loop thread.
     entry = _entry()
     tokenizer = _Tokenizer()
-    tokenizer.decode = wrap_decode(tokenizer.decode, entry)
+    tokenizer.decode = wrap_decode(tokenizer.decode, entry["decode"])
     endpoint = f"inproc:test-loop-decode-{uuid.uuid4().hex}"
     server = clock_transport.serve(ClockAuthority(TABLE), endpoint)
     for lp in ("traffic", "engine"):
@@ -192,8 +192,9 @@ def test_a_non_streaming_completion_is_delivered_after_its_loop_thread_decode(
         server.close()
     task.result()
     # Predicted by hand: everything before the decode takes no simulated time,
-    # and the decode of 100 tokens costs ``fixed + 100 / (rate x derate)``.
-    predicted = entry.decode_fixed_s + 100 / (entry.decode_tokens_per_s * entry.derate)
+    # and the decode of 100 tokens costs ``fixed_s + 100 / tokens_per_s``.
+    rate = entry["decode"]
+    predicted = rate["fixed_s"] + 100 / rate["tokens_per_s"]
     assert predicted == pytest.approx(0.201)
     assert delivered == [pytest.approx((predicted, predicted))]
 
@@ -201,7 +202,7 @@ def test_a_non_streaming_completion_is_delivered_after_its_loop_thread_decode(
 def test_a_loop_thread_decode_outside_the_run_asks_for_no_time(monkeypatch):
     frontend = LPRuntime(LpId("frontend"), TABLE, None)  # no connection to ask on
     monkeypatch.setattr(clock, "_installed", frontend)
-    decode = wrap_decode(_Tokenizer().decode, _entry())
+    decode = wrap_decode(_Tokenizer().decode, _entry()["decode"])
     assert decode([1, 2]) == "xx" and frontend.now == 0.0
 
 
@@ -211,7 +212,7 @@ def test_a_decode_on_another_thread_with_no_job_open_is_refused(monkeypatch):
     frontend = LPRuntime(LpId("frontend"), TABLE, None, owner=threading.Thread())
     monkeypatch.setattr(clock, "_installed", frontend)
     frontend.start_run()
-    decode = wrap_decode(_Tokenizer().decode, _entry())
+    decode = wrap_decode(_Tokenizer().decode, _entry()["decode"])
     with pytest.raises(RuntimeError, match="only the clock owner"):
         decode([1, 2])
     assert frontend.now == 0.0
@@ -251,7 +252,10 @@ def test_a_frame_from_before_the_run_decoded_on_an_output_thread_is_a_summary_re
     )
     monkeypatch.setattr(clock, "_installed", frontend)
     tokenizer = _Tokenizer()
-    charged, decoded = wrap_decode(tokenizer.decode, _entry()), threading.Event()
+    charged, decoded = (
+        wrap_decode(tokenizer.decode, _entry()["decode"]),
+        threading.Event(),
+    )
 
     def decode(ids, *args, **kwargs):
         try:
