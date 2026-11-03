@@ -7,7 +7,8 @@ unless it joins one its run file names. One without a run file is real, on the
 GPUs the command names, which `gpu.quiet` checks before the server starts and
 after it stops; given an artifact store, its start merges the store's JIT cache
 library for the stack into the container's caches and its stop writes back
-what it finished compiling (`jit_cache`). ATOM's arguments pass verbatim; the
+what it finished compiling (`jit_cache`), and at DP and TP both above 1 it
+runs under `LOG_MORE`. ATOM's arguments pass verbatim; the
 driver assigns the host, 127.0.0.1 unless the command names another, its ports
 and the run file, and
 refuses them, and the clock endpoint flag, among ATOM's arguments; an op graph
@@ -52,6 +53,7 @@ from atom.compass.drive import jit_cache
 from atom.compass.drive.gpu import KFD, hip_visible, quiet
 from atom.compass.drive.identity import _device, _stack, identity
 from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _write_whole
+from atom.utils.arg_parser import FlexibleArgumentParser
 
 SERVER = (sys.executable, "-m", "atom.entrypoints.openai.api_server")
 HOST = "127.0.0.1"
@@ -94,6 +96,9 @@ CACHE_LINE = re.compile(r"Using cache directory: (\S+) for vLLM's torch\.compile
 #: ATOM's `atom.utils.backends.VLLM_CACHE_ROOT`, stated here because importing
 #: that module opens a HIP context on every GPU the calling process can see.
 CACHE_ROOT = os.path.expanduser("~/.cache/atom")
+#: ATOM's switch that heads each log line with its process, `<name>:<pid>`, so
+#: `memory.check` can pair a DP x TP log's Memory budget lines with DP ranks.
+LOG_MORE = {"ATOM_LOG_MORE": "1"}
 
 
 def below_ephemeral(ports: range) -> range:
@@ -164,6 +169,7 @@ def serve(
     env["ATOM_SHUTDOWN_TIMEOUT_S"] = str(SHUTDOWN_TIMEOUT_S)
     if run is None:
         env["HIP_VISIBLE_DEVICES"] = hip_visible(gpus)
+        env |= log_more(atom_args)
     else:
         run_file = out / RUN_FILE
         if run.get(OP_GRAPH):
@@ -244,6 +250,22 @@ def _model(atom_args) -> str:
             "ATOM's arguments name no --model; run.json digests its config"
         )
     return model
+
+
+def log_more(atom_args) -> dict:
+    """`LOG_MORE` when ATOM's arguments run DP and TP both above 1, else
+    nothing, so any other start logs in the format its environment gives.
+    Under DP attention ATOM makes each TP rank a DP rank and runs TP 1."""
+    parser = FlexibleArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
+    parser.add_argument("--data-parallel-size", "-dp", type=int, default=1)
+    parser.add_argument("--enable-dp-attention", action="store_true")
+    widths = parser.parse_known_args(atom_args)[0]
+    if widths.enable_dp_attention:
+        return {}
+    if widths.tensor_parallel_size > 1 and widths.data_parallel_size > 1:
+        return LOG_MORE
+    return {}
 
 
 def _refuse(atom_args) -> None:
