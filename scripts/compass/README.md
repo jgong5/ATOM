@@ -721,7 +721,9 @@ Against the server log of the paired real run, with the same deployment flags,
 `PYTHONPATH=$T python -m atom.compass.memory.check OUT_DIR/lp-engine.json REAL_SERVER_LOG`
 prints the per-term comparison of the non-KV memory and the graph pool. It takes
 the log of one rank; with `--tp N`, of one DP rank at TP width N, a table per TP
-rank's line. In place of that log it takes the `--out` of a `compass
+rank's line; with each DP rank's `lp-engine.dp<r>.json` too, of a server
+started under `ATOM_LOG_MORE=1`, whose lines name their process, and each
+runner process its DP and TP rank. In place of that log it takes the `--out` of a `compass
 measure memory` start of the deployment, and then also compares the `weights`
 and `buffers` terms of `peak_torch` with the storage bytes the start loaded.
 
@@ -983,9 +985,8 @@ reaches the clock authority and the write-request block at this node's
 127.0.0.1, which 013 cannot. A local prefix, such as `env -u GPU_MAX_HW_QUEUES
 -u ATOM_NUMA_BIND`, still starts the decode apart and makes the KV link
 `inter_node`, as the real pair spans. Its router arguments switch the router's
-wall-clock detectors off, as `deploy.sh`'s header says, `--disable-retries`
-among them: a router LP that retries resends a request under the seq it was
-first sent with, and the frontend refuses it as arrived twice. The script
+wall-clock detectors off, `--disable-retries` among them, as `deploy.sh`'s
+header requires. The script
 sets `--request-timeout-secs` itself: a stream lasts the wall time the run
 takes to finish it, and the router's default 1800 s cut c=256 streams.
 

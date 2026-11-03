@@ -10,6 +10,7 @@ by tokens a second.
 """
 
 import json
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -20,9 +21,9 @@ from test_work import SPEC
 
 from atom.compass.backends import BatchView, RequestShape, op_work
 from atom.compass.backends.cost import CostTerm, StepCost
-from atom.compass.backends.op_graph import OpGraphBackend
+from atom.compass.backends.op_graph import DRAFT_KV, OpGraphBackend
 from atom.compass.backends.provenance import Method, Provenance, Refusal
-from atom.compass.backends.step_roofline import Module, StepRooflineBackend
+from atom.compass.backends.step_roofline import CONTEXT, Module, StepRooflineBackend
 from atom.compass.backends.work import Work, price
 from atom.compass.validate import bound
 
@@ -206,13 +207,14 @@ def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1):
         kv_cache_dtype="bf16",
         enable_tbo=False,
         enable_tbo_decode=False,
+        enable_expert_parallel=False,
         speculative_config=None,
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
     moe = SimpleNamespace(moe_parallel_config=SimpleNamespace(ep_size=ep))
     tree = SimpleNamespace(modules=lambda: [SimpleNamespace(), moe])
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
-    monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree: STACK)
+    monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
     monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: graph)
     spec = tmp_path / "spec.json"
     spec.write_text(json.dumps(ROOFLINE))
@@ -357,3 +359,120 @@ def test_a_measured_point_prices_at_the_ep_width(tmp_path):
     [q] = bound.ops(out, SPEC, 1, "bf16", 8)["measured_over_analytical"].values()
 
     assert q["median"] == pytest.approx(1)
+
+
+def _config(drafts=0, dp=1, tbo=False, low_latency=False, block=False):
+    drafter = SimpleNamespace(num_speculative_tokens=drafts, use_dspark=lambda: block)
+    return SimpleNamespace(
+        tensor_parallel_size=1,
+        kv_cache_dtype="bf16",
+        enable_tbo=tbo,
+        enable_tbo_decode=False,
+        enable_expert_parallel=low_latency,
+        enable_low_latency=low_latency,
+        speculative_config=drafts and drafter,
+        parallel_config=SimpleNamespace(data_parallel_size=dp),
+    )
+
+
+#: A block drafter's modules: its block's, and its KV pass over the target's rows.
+DRAFTER = [
+    Module("drafter.head", "gemm", (4096, 4096), draft=6),
+    Module("drafter.kv", "gemm", (4096, 4096), draft=CONTEXT),
+]
+
+
+def _backends(monkeypatch, tmp_path, config, modules=STACK, lookup=graph, ep=1):
+    """`bound.backends` for `config` at EP width `ep`, its build, walk and
+    store stubbed, a block drafter's modules `DRAFTER`."""
+    moe = SimpleNamespace(moe_parallel_config=SimpleNamespace(ep_size=ep))
+    tree = SimpleNamespace(modules=lambda: [moe])
+    spec = config.speculative_config
+    monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
+    monkeypatch.setattr("atom.compass.run.modules.drafter", lambda c: spec)
+    monkeypatch.setattr(
+        "atom.compass.run.modules.walk",
+        lambda t, d=None: modules + DRAFTER * bool(d and d.use_dspark()),
+    )
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: lookup)
+    return bound.backends("m", 1, [], MACHINE, str(tmp_path), [])[2]
+
+
+def drafted(*shape, draft=False):
+    """A target's graph, and a drafter's that costs far more."""
+    return {"seq": [g(shape[1], 8192, 8192)]} if draft else graph(*shape)
+
+
+@pytest.mark.parametrize("drafts,block", [(1, False), (3, False), (5, True)])
+def test_an_mtp_step_prices_at_op_level_its_target_against_d_target_ns(
+    monkeypatch, tmp_path, drafts, block
+):
+    decode = {"rows": [[drafts + 1, 900, True], [drafts + 1, 300, True]], "rung": 2}
+    lines = [decode, LINES[1]]
+    config = _config(drafts, block=block)
+    priced = _backends(monkeypatch, tmp_path, config, lookup=drafted)
+    views = [
+        BatchView(
+            tuple(RequestShape(*r) for r in s["rows"]),
+            capture_rung=s["rung"],
+            produces_output=True,
+        )
+        for s in lines
+    ]
+    costs = [priced["op"].price(v) for v in views]
+    # Measured: the target's price to the next nanosecond, under the step's;
+    # a block drafter's draft-KV pass, which that price holds, stamped apart.
+    kv = [sum(t.seconds for t in c.terms if t.name.startswith(DRAFT_KV)) for c in costs]
+    lines = [
+        {
+            **s,
+            "d_target_ns": math.ceil((c.target_seconds - k) * 1e9),
+            "d_draft_kv_ns": math.ceil(k * 1e9),
+        }
+        for s, c, k in zip(lines, costs, kv)
+    ]
+    rec = record(tmp_path / "mtp", lines)
+
+    report = bound.gate([rec], priced, mtp=True)
+    r = report["op"]
+
+    assert all(c.draft_terms and c.seconds > c.target_seconds * 1.5 for c in costs)
+    assert all((k > c.target_seconds / 2) == block for c, k in zip(costs, kv))
+    assert (r["verdict"], r["steps"], r["refused"]) == ("pass", 2, {})
+    assert r["draft_s"] == {
+        "decode": pytest.approx(costs[0].draft_seconds),
+        "prefill": pytest.approx(costs[1].draft_seconds),
+    }
+    assert r["analytical_s"]["decode"]["total"] == pytest.approx(
+        costs[0].target_seconds
+    )
+    assert report["step"]["steps"] == 2
+    assert bool(report["step"]["draft_s"]) == block
+
+
+def test_a_draft_kv_pass_is_measured_with_its_target_on_a_step_that_samples(tmp_path):
+    stamps = {"d_target_ns": 4 * 10**8, "d_draft_kv_ns": 10**8}
+    middle = {**LINES[1], **stamps, "produces_output": False}
+    record(tmp_path, [{**LINES[0], **stamps}, middle])
+
+    measured = [m for _, _, m in bound.steps(tmp_path)]
+
+    # A middle chunk's pass runs after its target's end, in the drafter's time.
+    assert measured == [pytest.approx(0.5), pytest.approx(0.4)]
+
+
+def test_ep_low_latency_split_under_tbo_refuses_at_both_levels(monkeypatch, tmp_path):
+    split = (8, 1, 2, 32, 32, 8, 8, 1, 1632)
+    experts = Module("experts", "moe", split, "fp4", ranks=8, layer=0)
+    rows = [[9000, 9000, False]]
+    for rank in range(8):
+        record(tmp_path, [_line(rows, moe_rows=72000)], rank=rank)
+    config = _config(dp=8, tbo=True, low_latency=True)
+    priced = _backends(monkeypatch, tmp_path, config, [experts], ep=8)
+
+    report = bound.gate([tmp_path], priced, tbo=True)
+
+    for level in ("step", "op"):
+        r = report[level]
+        assert (r["steps"], r["steps_refused"]) == (0, 8), level
+        assert all("split send and receive" in k for k in r["refused"]), level

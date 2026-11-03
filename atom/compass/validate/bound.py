@@ -8,10 +8,14 @@ measured device time on every measured step, at step and at op level.
 A RECORD is a real run's directory, its step record in `steps/`. Each forward
 there that is not a DP dummy run is priced at step level by the step roofline,
 over the modules `run.modules.walk` reads off the meta build ATOM's arguments
-configure, and at op level by `OpGraphBackend`, over the `op_graph`s `compass
+configure and its block drafter's (`run.modules.drafter`), as a simulated run
+walks them, and at op level by `OpGraphBackend`, over the `op_graph`s `compass
 trace ops` published in S for the spec's arch; both price the rows a replayed
 graph pads to. Each price is compared with the step's device busy time,
-`d_busy_ns`, or on an MTP record the target's, `d_target_ns`.
+`d_busy_ns`, or on an MTP record the target's, `d_target_ns`, plus on a step
+that samples a block drafter's draft-KV pass, `d_draft_kv_ns`, which runs
+before `forward_done_event`. On an MTP record only the target's price is
+compared, that pass's included; the drafter's is reported apart.
 With `--ratios-from`, the prices are --machine's datasheet peaks at the other
 spec's probed ratios (`project.projected`): run on a device's own records,
 the report is the error of projecting it from the other.
@@ -32,7 +36,7 @@ roofline part that set them (`CostTerm.by_bound`), and those of a term no part
 set, an overlapped step's, `unattributed`; and the records ranked by tokens a
 second over the steps priced at that granularity, analytical against
 measured: whether measured's fastest is analytical's fastest (top-1), or
-among its first three (top-3).
+among its first three (top-3); and per phase the drafter's analytical seconds.
 
 Per op kind (`--ops`, a `measure ops --plan` run's `--out`): each point its
 plan.jsonl holds measured, its cold time over the analytical price of the same
@@ -47,7 +51,7 @@ of `dp<r>.key.json`) states another TP width or KV cache format than ATOM's
 arguments resolve; two-batch overlap of decode steps or on one rank, whose
 split no step line states; a data-parallel step some rank's record lacks; a
 step of an MTP record without `d_target_ns`, whose `d_busy_ns` holds the
-draft no backend prices.
+draft, which the gate does not compare.
 """
 
 import argparse
@@ -80,7 +84,7 @@ PARTIAL = (
 )
 UNSPLIT = (
     "a step of an MTP record without `d_target_ns`: its `d_busy_ns` holds the "
-    "draft, which no backend prices"
+    "draft, which the gate does not compare"
 )
 
 
@@ -122,7 +126,11 @@ def steps(record, tbo=False, mtp=False):
                 tbo_tokens=split if dp else None,
                 moe_tokens=group if dp else None,
             )
-            yield name, view, s.get("d_target_ns", s["d_busy_ns"]) * 1e-9
+            measured = s.get("d_target_ns", s["d_busy_ns"])
+            if "d_target_ns" in s and s["produces_output"]:
+                # A block drafter's draft-KV pass precedes forward_done_event.
+                measured += s.get("d_draft_kv_ns", 0)
+            yield name, view, measured * 1e-9
 
 
 def _split(lines):
@@ -164,6 +172,7 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
         violations, refused, rates, unpriced = [], Counter(), {}, 0
         seconds = {p: [] for p in PHASES}  # (measured, priced) per step
         parts = {p: [] for p in PHASES}  # each term's seconds by bound
+        drafts = Counter()  # the drafter's seconds by phase
         for record in records:
             tokens = measured_s = priced_s = 0.0
             for name, view, measured in steps(record, tbo, mtp):
@@ -175,8 +184,10 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
                     refused.update(str(r) for r in dict.fromkeys(e.declined))
                     unpriced += 1
                     continue
-                priced = cost.seconds
+                priced = cost.target_seconds
                 seconds[_phase(view)].append((measured, priced))
+                if cost.draft_terms:
+                    drafts[_phase(view)] += cost.draft_seconds
                 parts[_phase(view)] += [
                     t.by_bound or {UNATTRIBUTED: t.seconds} for t in cost.terms
                 ]
@@ -218,6 +229,7 @@ def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
                 if s
             },
             "ranking": _ranking(rates),
+            "draft_s": dict(drafts),
         }
     return report
 
@@ -345,6 +357,8 @@ def text(report: dict) -> str:
         out.append("  measured over analytical: phase | min | p10 | median | p90 | max")
         for phase, q in r["measured_over_analytical"].items():
             out.append(f"  {phase} | " + " | ".join(f"{x:.3f}" for x in q.values()))
+        for phase, s in r["draft_s"].items():
+            out.append(f"  drafter, not compared: {phase} {s * 1e3:.3f} ms analytical")
         if (k := r["ranking"]) is not None:
             out.append(
                 f"  ranking: top-1 {k['top_1']}, top-3 {k['top_3']}; measured fastest {k['measured_fastest']}"
@@ -405,17 +419,18 @@ def walked(atom_args, arch: str) -> list:
 
 def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=None):
     """ATOM's config for its arguments, the EP width its MoE resolves and the
-    step- and op-level backends pricing `records` on `machine`, the op_graphs
-    `store` holds for its arch. Refused: a record, or the `measure ops` run
+    step- and op-level backends pricing `records` on `machine`, the op level
+    as a simulated run's (`run.op_graph`) over the op_graphs `store` holds for
+    its arch. Refused: a record, or the `measure ops` run
     `ops`, that ran under another engine; two-batch overlap no line splits."""
-    from atom.compass.backends.op_graph import OpGraphBackend
     from atom.compass.backends.step_roofline import StepRooflineBackend
-    from atom.compass.run import _op_graphs, ep_width
-    from atom.compass.run.modules import walk
+    from atom.compass.run import ep_width, op_graph
+    from atom.compass.run.modules import drafter, walk
 
     arch = machine.value("device.arch")
     with tempfile.TemporaryDirectory(prefix="compass-bound-") as tmpdir:
         config, tree = _build(model, tp, atom_args, arch, tmpdir)
+        drafted = drafter(config)
     dp = config.parallel_config.data_parallel_size
     if config.enable_tbo_decode or config.enable_tbo and dp == 1:
         raise ValueError(
@@ -448,14 +463,8 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
         config,
         ep,
         {
-            "step": StepRooflineBackend(machine, walk(tree)),
-            "op": OpGraphBackend(
-                machine,
-                _op_graphs(store, config, arch),
-                tp=config.tensor_parallel_size,
-                ep=ep,
-                kv=config.kv_cache_dtype,
-            ),
+            "step": StepRooflineBackend(machine, walk(tree, drafted)),
+            "op": op_graph({"store": store}, config, machine, ep),
         },
     )
 
