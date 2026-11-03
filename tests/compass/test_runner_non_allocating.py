@@ -55,7 +55,7 @@ ATOM_RUNNER = ENGINE / "model_runner.py"
 # module of this package imports at module scope, keyed by its path in the
 # package; every other module, none.
 ENGINE_READS = {
-    "doorbell.py": {"atom.model_engine.async_proc"},
+    "doorbell.py": {"atom.model_engine"},
     "model_runner.py": {"atom.model_engine.model_runner"},
     "overrides.py": {"atom.compass.backends.base"},
     "projection.py": {

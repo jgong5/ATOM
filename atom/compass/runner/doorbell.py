@@ -24,7 +24,7 @@ import socket
 
 from aiter.dist.shm_broadcast import MessageQueue, SpinTimer
 
-import atom.model_engine.async_proc as async_proc
+from atom.model_engine import async_proc
 
 
 def doorbell_address(handle, reader: int) -> str:
