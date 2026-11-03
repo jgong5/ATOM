@@ -4075,6 +4075,66 @@
    "mechanism_why": "inside the real forward, which the simulated runner replaces whole"
   },
   {
+   "id": "atom/compass/drive/device_probe.py::_timed::end.synchronize()::device_sync#0",
+   "file": "atom/compass/drive/device_probe.py",
+   "symbol": "_timed",
+   "call": "end.synchronize",
+   "expr": "end.synchronize()",
+   "shape": "device_sync",
+   "peer": "none",
+   "why": "the device probe waits for each timed sample's end event on its card, so the sample is device time between two events",
+   "mechanism": "K9",
+   "mechanism_why": "in compass's device probe, a measuring command which is no LP, on idle cards it refuses otherwise; a GPU command serves no simulated run"
+  },
+  {
+   "id": "atom/compass/drive/device_probe.py::probe::time.sleep(1)::sleep#0",
+   "file": "atom/compass/drive/device_probe.py",
+   "symbol": "probe",
+   "call": "time.sleep",
+   "expr": "time.sleep(1)",
+   "shape": "sleep",
+   "peer": "none",
+   "why": "the device probe pauses a second between GEMM bursts so a PTL card recovers before the next one",
+   "mechanism": "K9",
+   "mechanism_why": "in compass's device probe, a measuring command which is no LP, on idle cards it refuses otherwise; a GPU command serves no simulated run"
+  },
+  {
+   "id": "atom/compass/drive/device_probe.py::probe::torch.cuda.synchronize(0)::device_sync#0",
+   "file": "atom/compass/drive/device_probe.py",
+   "symbol": "probe",
+   "call": "torch.cuda.synchronize",
+   "expr": "torch.cuda.synchronize(0)",
+   "shape": "device_sync",
+   "peer": "none",
+   "why": "the device probe drains card 0 before each round of its link ping-pong",
+   "mechanism": "K9",
+   "mechanism_why": "in compass's device probe, a measuring command which is no LP, on idle cards it refuses otherwise; a GPU command serves no simulated run"
+  },
+  {
+   "id": "atom/compass/drive/device_probe.py::probe::torch.cuda.synchronize(1)::device_sync#0",
+   "file": "atom/compass/drive/device_probe.py",
+   "symbol": "probe",
+   "call": "torch.cuda.synchronize",
+   "expr": "torch.cuda.synchronize(1)",
+   "shape": "device_sync",
+   "peer": "none",
+   "why": "the device probe drains card 1 before and after each round of its link ping-pong",
+   "mechanism": "K9",
+   "mechanism_why": "in compass's device probe, a measuring command which is no LP, on idle cards it refuses otherwise; a GPU command serves no simulated run"
+  },
+  {
+   "id": "atom/compass/drive/device_probe.py::probe::torch.cuda.synchronize(1)::device_sync#1",
+   "file": "atom/compass/drive/device_probe.py",
+   "symbol": "probe",
+   "call": "torch.cuda.synchronize",
+   "expr": "torch.cuda.synchronize(1)",
+   "shape": "device_sync",
+   "peer": "none",
+   "why": "the device probe drains card 1 before and after each round of its link ping-pong",
+   "mechanism": "K9",
+   "mechanism_why": "in compass's device probe, a measuring command which is no LP, on idle cards it refuses otherwise; a GPU command serves no simulated run"
+  },
+  {
    "id": "atom/compass/drive/gpu.py::_check::subprocess.Popen( [\"bash\", str(PREFLIGHT)], stdout=f, stderr=subprocess.STDOUT )::thread_start#0",
    "file": "atom/compass/drive/gpu.py",
    "symbol": "_check",
@@ -5706,6 +5766,30 @@
    "why": "client.sh's sweep command runs one round of the sweep against the server OUT names",
    "mechanism": "K9",
    "mechanism_why": "the command's call into the sweep's round, not a channel: the requests it sends are the rows of send and _prime"
+  },
+  {
+   "id": "atom/compass/runner/doorbell.py::RingingQueue.enqueue::super().enqueue(obj, timeout)::task_wait#0",
+   "file": "atom/compass/runner/doorbell.py",
+   "symbol": "RingingQueue.enqueue",
+   "call": "super().enqueue",
+   "expr": "super().enqueue(obj, timeout)",
+   "shape": "task_wait",
+   "peer": "process",
+   "why": "a simulated run's engine hands a call to its workers on the shared-memory ring, parking if the ring has no free slot, then rings their doorbells",
+   "mechanism": "K6",
+   "mechanism_why": "RPC between the engine and its workers inside one tensor-parallel group; the group is one LP, so this is not a wait across LPs"
+  },
+  {
+   "id": "atom/compass/runner/doorbell.py::Doorbell.spin::self.socket.recv(1)::socket_recv#0",
+   "file": "atom/compass/runner/doorbell.py",
+   "symbol": "Doorbell.spin",
+   "call": "self.socket.recv",
+   "expr": "self.socket.recv(1)",
+   "shape": "socket_recv",
+   "peer": "process",
+   "why": "a simulated run's worker sleeps here between its looks at the shared-memory ring, until its engine rings for the next call; this is where it is idle",
+   "mechanism": "K6",
+   "mechanism_why": "RPC between the engine and its workers inside one tensor-parallel group; the group is one LP, so this is not a wait across LPs"
   }
  ],
  "anchors": [
