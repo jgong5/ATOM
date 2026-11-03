@@ -29,6 +29,7 @@ import pytest
 from test_artifact_invalidation import BASE, STANZA
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_drive_gpu import FREE, _plant
+from test_drive_serve import RUNNERS, runners_logged
 from test_launcher_held_ports import HELD, _squat
 from test_memory_readings import (
     CONFIG_JSON,
@@ -182,6 +183,30 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_the_start_used(
     measure_memory.main(argv)
 
     assert not used.parents[1].exists() and other.exists()
+
+
+@pytest.mark.parametrize("widths, seen", [(["-dp", "2"], "1"), ([], "unset")])
+def test_a_start_at_dp_and_tp_above_1_logs_each_line_s_process(
+    tmp_path, monkeypatch, widths, seen
+):
+    _, argv = a_start(tmp_path, monkeypatch, STACK)
+    monkeypatch.delenv("ATOM_LOG_MORE", raising=False)
+    monkeypatch.setenv("PYTHONPATH", str(serve.TREE))
+    monkeypatch.setenv("RUNNERS_SEEN", str(tmp_path / "seen"))
+    monkeypatch.setenv("RUNNERS_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(tmp_path / "cache"))
+    engine = measure_memory.subprocess.Popen
+
+    def logging(args, **kwargs):
+        engine(args, **kwargs)  # the ranks' files
+        return subprocess.Popen([sys.executable, "-c", RUNNERS], **kwargs)
+
+    monkeypatch.setattr(measure_memory.subprocess, "Popen", logging)
+    measure_memory.main([*argv, "-tp", "2", *widths])
+
+    assert (tmp_path / "seen").read_text() == seen
+    if seen == "1":
+        runners_logged(tmp_path / "out" / measure_memory.LOG, tmp_path / "cache")
 
 
 def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypatch):

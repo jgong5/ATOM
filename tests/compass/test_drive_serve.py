@@ -25,6 +25,7 @@ from test_launcher_held_ports import HELD, _squat
 from atom.compass.drive import gpu as drive_gpu
 from atom.compass.drive import serve
 from atom.compass.drive.gpu import GpuRefusal
+from atom.compass.memory.check import recorded
 from atom.compass.run import ENV
 
 TREE = Path(__file__).resolve().parents[2]
@@ -172,6 +173,69 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_its_ranks_used(
 
     assert not mine.exists()
     assert other.exists() and configured.exists()
+
+
+#: Four runners of a DP2 TP2 engine, forked once ATOM's logger is set up under
+#: this process's environment, each logging through it what the readers of an
+#: engine's log read: its ranks, a compiled-graph directory it used under
+#: `RUNNERS_CACHE`, its warmup and its Memory budget line, at non_torch
+#: 10.<dp><tp> GB. Writes the environment's ATOM_LOG_MORE to `RUNNERS_SEEN`.
+RUNNERS = """\
+import os
+from atom.utils import logger
+with open(os.environ["RUNNERS_SEEN"], "w") as f:
+    f.write(os.environ.get("ATOM_LOG_MORE", "unset"))
+cache = os.path.join(os.environ["RUNNERS_CACHE"], "torch_compile_cache")
+for dp, tp in ((0, 0), (0, 1), (1, 0), (1, 1)):
+    if os.fork() == 0:
+        used = os.path.join(cache, f"dp{dp}tp{tp}", "rank_0", "backbone")
+        os.makedirs(used)
+        logger.info("ModelRunner rank=%d, dp_rank_local=%d, pp_rank=0", tp, dp)
+        logger.info("Using cache directory: %s for vLLM's torch.compile", used)
+        logger.info("Model Runner%d/2: warmup_model 2.2 seconds with 1 reqs 64 tokens", tp)
+        logger.info("Memory budget: peak_torch=3.87GB, non_torch=10.%d%dGB", dp, tp)
+        os._exit(0)
+for _ in range(4):
+    os.wait()
+"""
+
+
+def runners_logged(log: Path, cache: Path) -> None:
+    """Assert `log` was written as `RUNNERS` writes it under ATOM_LOG_MORE:
+    `memory.check` reads each DP rank's TP lines in TP order, and the stop
+    removed every directory the runners used."""
+    for dp in (0, 1):
+        runs, _ = recorded(log, 2, tp=2, dp=dp)
+        read = [r.by_name()["non_torch"].nbytes for r in runs]
+        assert read == [round(float(f"10.{dp}{tp}") * (1 << 30)) for tp in (0, 1)]
+    assert not any((cache / "torch_compile_cache").iterdir())
+
+
+@pytest.mark.parametrize(
+    "widths, seen",
+    [
+        (["-dp", "2", "-tp", "2"], "1"),
+        (["--data_parallel_size=2", "--tensor-parallel-size", "2"], "1"),
+        (["-tp", "2"], "unset"),
+        (["-dp", "2"], "unset"),
+    ],
+)
+def test_a_server_at_dp_and_tp_above_1_logs_each_line_s_process(
+    planted, monkeypatch, widths, seen
+):
+    (planted / "planted.py").write_text(RUNNERS + PLANTED)
+    monkeypatch.delenv("ATOM_LOG_MORE", raising=False)
+    monkeypatch.setenv("RUNNERS_SEEN", str(planted / "seen"))
+    monkeypatch.setenv("RUNNERS_CACHE", str(planted / "cache"))
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(planted / "cache"))
+    monkeypatch.setenv("PLANTED_EXIT", "late:0")
+    out = planted / "out"
+
+    serve.serve(["--model", "m", *widths], out, (7,))
+
+    assert (planted / "seen").read_text() == seen
+    if seen == "1":
+        runners_logged(out / serve.LOG_FILE, planted / "cache")
 
 
 #: The stop's cache removal in a process of its own: what it imports, then,
