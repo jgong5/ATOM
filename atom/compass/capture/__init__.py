@@ -3,7 +3,8 @@
 published as an `op_graph`.
 
     compass trace ops --model M [--tp N] [--width W ...] [--prefill T B ...]
-                      [--population P ...] [--arch A] --store S [-- ATOM args]
+                      [--population P ...] [--arch A | --gpu I] --store S
+                      [-- ATOM args]
 
 A shape is a decode width (`--width`), a prefill of T tokens over B sequences
 (`--prefill`), or every shape the steps of a record directory hold
@@ -34,7 +35,10 @@ a prefill shape is published twice, as a middle chunk, which samples nothing,
 and as a final one. ATOM's engine arguments after `--`
 configure the engine as they would a server's; `--arch` names the declared
 device, which the entry also states as its `device` condition: a store holds a
-graph per arch of one structure and shape. Its members are
+graph per arch of one structure and shape. `--gpu` declares card I of this host
+in its place, each property and the stepping as the card reports them
+(`driverless.card`), its arch that card's: the step still runs no kernel, but
+picks the kernels it would on that card. Its members are
 ``graph`` (`graph.to_json`) and ``declared``, what the capture stated in place
 of a device and the operators it left out of the graph, each with why. A TP
 group's ranks run one graph, so rank 0's is the entry's. The declarations are
@@ -75,13 +79,19 @@ def main(argv: list[str]) -> None:
         default=[],
         help="a record directory; every shape its steps hold",
     )
-    p.add_argument("--arch", default="gfx942", help="the declared device's arch")
+    where = p.add_mutually_exclusive_group()
+    where.add_argument("--arch", default="gfx942", help="the declared device's arch")
+    where.add_argument("--gpu", type=int, help="declare this card as it reads")
     p.add_argument("--store", required=True, help="the artifact store")
     args = p.parse_args(argv[:split])
 
     from atom.compass import artifacts as a
 
+    from . import driverless
     from .forward import capture, decode, prefill
+
+    read = None if args.gpu is None else driverless.card(args.gpu)
+    arch = read["arch"] if read else args.arch
 
     store = a.ArtifactStore(args.store)
     shapes = [decode(w) for w in args.width] + [prefill(*s) for s in args.prefill]
@@ -91,7 +101,7 @@ def main(argv: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="compass-capture-") as tmpdir:
         began = time.perf_counter()  # the first shape's seconds include the build
         captured = capture(
-            args.model, args.tp, shapes, tmpdir, atom_args, args.arch, args.population
+            args.model, args.tp, shapes, tmpdir, atom_args, arch, args.population, read
         )
         for graph, model, declared in captured:
             seconds = time.perf_counter() - began

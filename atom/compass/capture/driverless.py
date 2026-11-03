@@ -7,8 +7,12 @@ capture owns its process.
 """
 
 import contextlib
+import json
 import os
 import pathlib
+import re
+import subprocess
+import sys
 import types
 
 import torch
@@ -17,7 +21,7 @@ from atom.mono.runtime import peer_memory
 
 #: The devices a capture can declare, by arch: compute units, capability and
 #: memory. ATOM and aiter branch on the arch and size grids by the CU count.
-#: Nothing here reads a device.
+#: Nothing here reads a device; `card` reads one in their place.
 DEVICES = {
     "gfx942": (80, (9, 4), 192 << 30),  # MI308X
     "gfx950": (256, (9, 5), 288 << 30),  # MI355X
@@ -31,7 +35,48 @@ REVISIONS = {
 }
 
 
-def _props(arch):
+#: What `card` reads, in a process that sees the one card: the properties
+#: `_props` declares, as HIP reports them.
+_READ = (
+    "import json, torch; p = torch.cuda.get_device_properties(0); print(json.dumps("
+    "{f: getattr(p, f) for f in ('multi_processor_count', 'gcnArchName', 'name', "
+    "'major', 'minor', 'total_memory', 'warp_size', 'max_threads_per_multi_processor', "
+    "'L2_cache_size', 'regs_per_multiprocessor', 'shared_memory_per_block')}))"
+)
+
+
+def card(index: int) -> dict:
+    """Card `index` as a capture declares it in place of `DEVICES`: its
+    properties as HIP reports them (``props``), its arch and the stepping
+    rocminfo states for it (``revision``), each read in a child that sees that
+    card alone, so this process holds nothing on it."""
+    env = {**os.environ, "ROCR_VISIBLE_DEVICES": str(index)}
+    for name in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        env.pop(name, None)
+    run = dict(env=env, capture_output=True, text=True, timeout=300, check=False)
+    read = subprocess.run([sys.executable, "-c", _READ], **run)
+    if read.returncode:
+        raise ValueError(f"card {index} reads no device: {read.stderr[-2000:]}")
+    props = json.loads(read.stdout.splitlines()[-1])
+    arch = props["gcnArchName"].split(":")[0]
+    # rocminfo's agents, each with its header fields: aiter reads its stepping
+    # off the GPU agent of its arch.
+    states = []
+    info = subprocess.run(["rocminfo"], **run).stdout
+    for agent in re.split(r"^\s*Agent\s+\d+\s*$", info, flags=re.M):
+        gpu = re.search(r"^  Device Type:\s*GPU\s*$", agent, re.M)
+        named = re.search(rf"^  Name:\s*{arch}\b", agent, re.M)
+        stepping = re.search(r"^  ASIC Revision:\s*(\d+)", agent, re.M)
+        if gpu and named and stepping:
+            states.append(int(stepping[1]))
+    if len(states) != 1:
+        raise ValueError(f"rocminfo states {len(states)} steppings for card {index}")
+    return {"index": index, "arch": arch, "revision": states[0], "props": props}
+
+
+def _props(arch, read=None):
+    if read:
+        return types.SimpleNamespace(**read["props"])
     cus, (major, minor), memory = DEVICES[arch]
     return types.SimpleNamespace(
         multi_processor_count=cus,
@@ -126,10 +171,11 @@ def _stream(stream):
         current[0] = previous
 
 
-def install(tmpdir: str, arch: str) -> dict:
-    """Declare the device of `arch`; say what."""
-    if arch not in DEVICES:
+def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
+    """Declare the device of `arch`, or the card `read` (`card`); say what."""
+    if read is None and arch not in DEVICES:
         raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
+    props = _props(arch, read)
     cuda = {
         # True: on False ATOM takes paths no deployment runs. The fake mode is
         # told otherwise by `driverless_mode`.
@@ -138,9 +184,9 @@ def install(tmpdir: str, arch: str) -> dict:
         "_lazy_init": lambda *a, **k: None,
         "get_rng_state": lambda *a, **k: torch.zeros(16, dtype=torch.uint8),
         "set_rng_state": lambda *a, **k: None,
-        "get_device_properties": lambda *a, **k: _props(arch),
+        "get_device_properties": lambda *a, **k: props,
         "current_device": lambda: 0,
-        "get_device_capability": lambda *a, **k: DEVICES[arch][1],
+        "get_device_capability": lambda *a, **k: (props.major, props.minor),
         "Stream": Stream,
         "Event": Event,
         "current_stream": lambda *a, **k: current[0],
@@ -158,7 +204,7 @@ def install(tmpdir: str, arch: str) -> dict:
         },
         "memory_allocated": lambda *a, **k: 0,
         # Free and total: nothing is allocated on the declared device.
-        "mem_get_info": lambda *a, **k: (DEVICES[arch][2],) * 2,
+        "mem_get_info": lambda *a, **k: (props.total_memory,) * 2,
         "reset_peak_memory_stats": lambda *a, **k: None,
         "empty_cache": lambda *a, **k: None,
         "is_current_stream_capturing": lambda: False,
@@ -185,14 +231,21 @@ def install(tmpdir: str, arch: str) -> dict:
         # staging block; direct copies each buffer with its own `copy_`.
         "ATOM_H2D_BACKEND": "direct",
         # aiter's CU count, which it would otherwise ask rocminfo for.
-        "CU_NUM": str(DEVICES[arch][0]),
+        "CU_NUM": str(props.multi_processor_count),
+        # aiter's check that every rank sets it all-reduces over a group whose
+        # collectives reduce nothing; what it shares, the device
+        # communicators, a capture declines.
+        "AITER_REUSE_IDENTICAL_COMM_GROUPS": "0",
         # `group` names GPUs to HIP, which then holds memory on the first at
         # its first device query; ROCm's own mask, below HIP's, hides them all.
         "ROCR_VISIBLE_DEVICES": "",
     }
     os.environ.update(flags)
-    _declare_arch(tmpdir, arch)
-    return {"cuda": sorted(cuda), "arch": arch, "flags": flags}
+    revision = read["revision"] if read else REVISIONS.get(arch, 0)
+    _declare_arch(tmpdir, arch, props.multi_processor_count, revision)
+    return {"cuda": sorted(cuda), "arch": arch, "flags": flags} | (
+        {"card": read} if read else {}
+    )
 
 
 #: The operators outside torch that the fake mode's dispatch cache takes: each
@@ -248,8 +301,12 @@ def driverless_mode(shape_env):
     return _DriverlessFakeTensorMode(shape_env=shape_env, allow_non_fake_inputs=True)
 
 
-def _declare_arch(tmpdir: str, arch: str) -> None:
-    """Answer aiter's `rocminfo` shell-out and Triton's target query with `arch`."""
+def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None) -> None:
+    """Answer aiter's `rocminfo` shell-out and Triton's target query with `arch`,
+    its `cus` and stepping `revision` `DEVICES` and `REVISIONS` declare unless
+    given."""
+    cus = DEVICES[arch][0] if cus is None else cus
+    revision = REVISIONS.get(arch, 0) if revision is None else revision
     import triton
     from triton.backends.compiler import GPUTarget
 
@@ -257,7 +314,7 @@ def _declare_arch(tmpdir: str, arch: str) -> None:
     rocminfo.parent.mkdir(parents=True, exist_ok=True)
     rocminfo.write_text(
         f"#!/bin/sh\necho 'Agent 1\n  Name: {arch}\n  Device Type: GPU\n"
-        f"  Compute Unit: {DEVICES[arch][0]}\n  ASIC Revision: {REVISIONS.get(arch, 0)}'\n"
+        f"  Compute Unit: {cus}\n  ASIC Revision: {revision}'\n"
     )
     rocminfo.chmod(0o755)
     os.environ["PATH"] = f"{rocminfo.parent}:{os.environ.get('PATH', '')}"

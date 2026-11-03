@@ -775,6 +775,10 @@ def _patches(recorder):
       the call allocates holds one byte.
     * A mono runner binds and builds its widths as its deployment does
       (`_mono`).
+    * A forced acceptance (`--spec-decode-acceptance-length`) draws with a
+      device generator seeded by its sampler's count of steps: the generator
+      is a host one, the declared device having none, and the count stays at
+      zero, so a decode's two contexts seed alike.
     """
     import flydsl
     import triton
@@ -786,7 +790,7 @@ def _patches(recorder):
     from triton.runtime.jit import JITFunction
 
     from atom.model_loader import loader
-    from atom.model_ops import module_dispatch_ops, moe
+    from atom.model_ops import module_dispatch_ops, moe, rejection_sampler
     from atom.model_ops.attentions import gdn_attn
     from atom.utils import CpuGpuBuffer
     from atom.utils.tbo import ubatching
@@ -907,9 +911,13 @@ def _patches(recorder):
             "maybe_dual_stream_forward",
             module_dispatch_ops.maybe_dual_stream_forward,
         ),
+        (rejection_sampler, "_synthetic_generator", lambda device: torch.Generator()),
         *_mono(recorder, unpatched),
     ):
         stack.enter_context(patch.object(owner, name, value))
+    steps = property(lambda sampler: 0, lambda sampler, step: None)
+    sampler = rejection_sampler.RejectionSampler
+    stack.enter_context(patch.object(sampler, "_synthetic_step", steps, create=True))
     stack.enter_context(_entries(recorder))
     return stack
 
@@ -1370,10 +1378,12 @@ def capture(
     atom_args=(),
     arch="gfx942",
     population=(),
+    read=None,
     whole=False,
 ):
     """Trace one step of `model` at TP `tp` at each of `shapes`, in this process,
-    under ATOM's engine arguments `atom_args` on a declared `arch`.
+    under ATOM's engine arguments `atom_args` on a declared `arch`, or on the
+    card `read` declares (`driverless.card`).
 
     Yields, per shape, the graph, the model's config digest, what the capture
     declared, the operators it left out of the graph among it; per prefill
@@ -1385,7 +1395,7 @@ def capture(
     prefills runs as one forward, as it ran, this rank answering that it
     cannot split it; with `whole`, each prefill of `shapes` too.
     """
-    declared = driverless.install(tmpdir, arch)
+    declared = driverless.install(tmpdir, arch, read)
 
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
