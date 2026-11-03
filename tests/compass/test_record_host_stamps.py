@@ -187,6 +187,22 @@ def test_a_recorded_server_stamps_each_request_s_intake_as_the_probe_does(record
     assert probe.idle(str(record / "intake.stamps"))["requests"] == len(bodies)
 
 
+def test_a_recorded_server_s_engine_send_keeps_its_caller_s_response_id(record, tok):
+    parity.carry_response_ids()  # as the engine's construction does, before the wrap
+    compass_run.tokenizer(tok, None)
+    manager = CoreManager.__new__(CoreManager)
+    manager.label, manager.pp_size, manager.local_engine_count = "t", 1, 1
+    manager._seq_id_to_callback = {}
+    manager._send_request = lambda _rank, payload: None
+    processor = InputOutputProcessor(
+        SimpleNamespace(hf_config=SimpleNamespace(model_type="llama")), tok, 16
+    )
+    seq = processor.preprocess("hi there", SamplingParams())
+    request_id = "chatcmpl-1"  # noqa: F841 -- the API server's handler holds it
+    manager.add_request([seq])
+    assert seq.external_request_id == "chatcmpl-1"
+
+
 def test_with_compass_off_nothing_is_wrapped_or_written(patched, tok, tmp_path):
     body = Request.body
     compass_run.tokenizer(tok, None)

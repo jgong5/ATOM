@@ -2084,8 +2084,22 @@ def _stamp_intake(out: _LineFile) -> None:
             module.apply_chat_template = rendered
     fanout = InputOutputProcessor.preprocess_fanout
     InputOutputProcessor.preprocess_fanout = timed(fanout, "prep")
+
+    def sent(add):
+        def add_request(*args, **kwargs):
+            # `parity.carry_response_ids`, installed beneath this as the engine
+            # was built, reads the API server's `request_id` off its caller's
+            # frame, which is now this one.
+            request_id = sys._getframe(1).f_locals.get("request_id")  # noqa: F841
+            start = time.monotonic_ns()
+            got = add(*args, **kwargs)
+            stamp("send", start, 0)
+            return got
+
+        return add_request
+
     for cls in (CoreManager, DisaggCoreManager):
-        cls.add_request = timed(cls.add_request, "send")
+        cls.add_request = sent(cls.add_request)
 
 
 def _end_before_serving(run: dict, e: BaseException) -> None:
