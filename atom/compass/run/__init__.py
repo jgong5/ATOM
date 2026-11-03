@@ -1962,8 +1962,9 @@ def _record_host(tok, record: Path) -> None:
     record.mkdir(parents=True, exist_ok=True)
     calls = _LineFile(record / TOKENIZER_RECORD)
     backend = "fast" if tok.is_fast else "slow"
-    calls.write(json.dumps({"backend": backend, "fingerprint": _fingerprint(tok)}))
-    calls.write("\n")
+    calls.write(
+        json.dumps({"backend": backend, "fingerprint": _fingerprint(tok)}) + "\n"
+    )
     tok.encode = _recorded(tok.encode, "encode", calls, lambda _, ids: len(ids))
     tok.decode = _recorded(tok.decode, "decode", calls, lambda a, _: len(a[0]))
     rust = getattr(tok, "_tokenizer", None)

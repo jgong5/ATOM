@@ -104,7 +104,9 @@ CLOCK_READS = (
 DEFAULT_ALLOW_LIST: dict[str, str] = {
     "atom/compass/run/__init__.py": (
         "the run summary's wall seconds, from the run's start to its finish, "
-        "and each lazy trace's: the speed result, which no simulated time reads"
+        "and each lazy trace's: the speed result, which no simulated time reads; "
+        "and a recorded real run's tokenizer-call and HTTP intake stamps, which "
+        "a simulated run never installs"
     ),
     "atom/compass/parity/runner.py": (
         "a real runner's step timestamps; a simulated run runs its own runner "
