@@ -147,6 +147,36 @@ def write_step_meta(
     ``walk_plans``: ratio -> [BLOCKS, 4] int32, the FP4 score stage's FULL-layer
     tasks over this step's rows (``index_plan.fill_walk_plan``); none on the
     FP8 plane. ``walk_rows``: (first row, rows) the plans cover."""
+    _launch_step_meta(
+        step.batch_ids,
+        step.slots,
+        step.positions,
+        step.block_tables.stride(0),
+        window.slot_rows,
+        window.ring_slots,
+        geometry.window_size,
+        ring_rel,
+        key_meta,
+        walk_plans,
+        walk_rows,
+    )
+
+
+def _launch_step_meta(
+    batch_ids,
+    slots,
+    positions,
+    table_stride,
+    slot_rows,
+    ring_slots,
+    window_size,
+    ring_rel,
+    key_meta,
+    walk_plans,
+    walk_rows,
+) -> None:
+    """``write_step_meta``'s launch, of the step's and the window's fields it
+    reads: no ``BatchStep``."""
     n = ring_rel.shape[0]
     walk_lo, walk_n = walk_rows
     assert key_meta.shape == (n, KMETA) and key_meta.is_contiguous()
@@ -155,18 +185,18 @@ def write_step_meta(
     assert n < BLOCKS or not walk_plans, n
     ratios = tuple(walk_plans)
     _step_meta_kernel[(1 + len(ratios),)](
-        step.batch_ids,
-        step.slots,
-        step.positions,
+        batch_ids,
+        slots,
+        positions,
         ring_rel,
         key_meta,
         tuple(walk_plans.values()),
         walk_lo,
         walk_lo + walk_n,
-        step.block_tables.stride(0),
-        window.slot_rows,
-        window.ring_slots,
-        geometry.window_size,
+        table_stride,
+        slot_rows,
+        ring_slots,
+        window_size,
         n,
         WORDS=KMETA,
         RATIOS=ratios,

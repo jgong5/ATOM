@@ -104,7 +104,14 @@ def capture(tmp_path_factory, argv, arch="gfx1250", prelude=""):
     if (argv, arch, prelude) in _CAPTURES:
         return _CAPTURES[argv, arch, prelude]
     root = tmp_path_factory.mktemp("v41")
-    done = trace(root, argv, arch, prelude)
+    graphs = published(root, trace(root, argv, arch, prelude))
+    _CAPTURES[argv, arch, prelude] = graphs
+    return graphs
+
+
+def published(root, done):
+    """What `done`, a `trace` under `root`, published: each shape's graph and
+    declarations, by shape."""
     tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
     assert (
         done.returncode == 0 and tokens
@@ -119,7 +126,6 @@ def capture(tmp_path_factory, argv, arch="gfx1250", prelude=""):
             for stem in ("graph", "declared")
         )
         graphs[graph["shape"]] = graph, declared
-    _CAPTURES[argv, arch, prelude] = graphs
     return graphs
 
 
@@ -222,12 +228,10 @@ def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(tmp_p
     log = done.stdout + done.stderr
     # The width's kernels compiled for the declared arch, as the deployment's.
     assert re.search(r"V4\.1 mono: \d+ width-16 kernels compiled at gfx950,", log), log
-    # The step ran mono, not the original path: refused by name where it first
-    # calls a mono kernel whose contract a graph cannot hold.
-    refusal = done.stderr.strip().splitlines()[-1]
-    assert done.returncode and "published" not in done.stdout, refusal
+    # The step ran mono, not the original path: its leaves launch mono kernels.
+    graph, _ = published(tmp_path, done)["decode B=16"]
     mono = r"atom\.(mono|models\.deepseek_v41\.mono)\.[\w.]+:\w"
-    assert re.match(rf"compass trace ops: {mono}", refusal), refusal
+    assert [op for op in _ops(graph["region"]) if re.match(mono, op["op"])]
 
 
 @pytest.mark.parametrize(

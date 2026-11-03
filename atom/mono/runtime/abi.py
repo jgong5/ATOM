@@ -11,6 +11,8 @@ kernel's and the launcher's parameters against it, and the host packs by name.
 import inspect
 from dataclasses import dataclass
 
+import torch
+
 
 def _python_params(fn) -> tuple[str, ...]:
     """Parameter names of a ``@flyc.kernel`` / ``@flyc.jit`` object's Python
@@ -35,10 +37,11 @@ class KernelAbi:
             raise TypeError(f"launcher parameters {got} != ABI {self.names} + stream")
 
     def pack(self, values: dict) -> list:
-        """``values`` (every name, nothing else) in ABI order."""
+        """``values`` (every name, nothing else) in ABI order, a tensor as its
+        address."""
         try:
             if len(values) == len(self.names):
-                return [values[n] for n in self.names]
+                return [_address(values[n]) for n in self.names]
         except KeyError:
             pass
         extra = sorted(set(values) - set(self.names))
@@ -48,3 +51,7 @@ class KernelAbi:
     def zeros(self) -> list:
         """Every argument 0: what a compile-only call passes."""
         return [0] * len(self.names)
+
+
+def _address(value):
+    return value.data_ptr() if isinstance(value, torch.Tensor) else value
