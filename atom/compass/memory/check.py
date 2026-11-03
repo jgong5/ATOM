@@ -10,8 +10,10 @@ whose memory section holds the readings its KV pool was sized from, the warmup s
 what the graph pool really costs; at DP width N, the N ranks' ``lp-<engine>.dp<r>.json``,
 each checked in turn. SERVER_LOG is the log of one real ATOM server with the
 same deployment, at N ranks a line per rank. Those lines name no rank, so they
-are read only when every rank logs the same values. ``--tp N`` reads one DP rank's
-line per TP rank, a table each, then each term's spread. MEASURED is the ``--out``
+are read only when every rank logs the same values. ``--tp N`` reads each DP rank's
+line per TP rank, a table each, then each term's spread; above one DP rank only
+in a log written under ``ATOM_LOG_MORE=1``, whose lines name their process, and
+each runner process its DP and TP rank. MEASURED is the ``--out``
 of a `compass measure memory` start of that deployment: its engine's log is
 read as SERVER_LOG is.
 
@@ -67,6 +69,11 @@ _WARMUP = re.compile(r"warmup_model [\d.]+ seconds with \d+ reqs (\d+) tokens")
 _POOL = re.compile(
     r"CUDA graph capture memory: \d+ graphs \| pool\(reserved\)=([\d.]+)GB"
 )
+#: Under ATOM_LOG_MORE a line's header names its process, `<name>:<pid>`, and its
+#: message follows on the next line.
+_PROCESS = r"- [^\n:]+:(\d+) - [^\n]*\n"
+#: A runner process's own line, naming its TP rank and its DP rank on the node.
+_RANK = re.compile(_PROCESS + r"ModelRunner rank=(\d+), dp_rank_local=(\d+),")
 
 
 def _rows(reading: Reading) -> list[dict]:
@@ -98,20 +105,42 @@ def record(readings: DeviceReadings, *, tokens: int, memory) -> dict:
     }
 
 
+def _grouped(pattern: re.Pattern, text: str, log: Path, ranks: int, tp: int, dp):
+    """DP rank `dp`'s values on the lines matching `pattern`, by TP rank: under
+    ATOM_LOG_MORE each line names its process, and each runner process its DP
+    and TP rank on its `ModelRunner rank=` line. A log naming none is refused."""
+    rank = {pid: (int(d), int(t)) for pid, t, d in _RANK.findall(text)}
+    if not rank:
+        raise MemoryRefusal(
+            f"{log}'s lines name no process, as under ATOM_LOG_MORE=1, so at "
+            f"{ranks} DP ranks of TP {tp} none can be paired with a DP rank's hand-in",
+            "start the real server with ATOM_LOG_MORE=1, whose lines name "
+            "their process, or compare a log at one DP rank or at TP 1",
+        )
+    lines = re.findall(_PROCESS + pattern.pattern, text)
+    found = sorted((rank.get(pid, (-1, -1)), tuple(v)) for pid, *v in lines)
+    every = [(d, t) for d in range(ranks) for t in range(tp)]
+    if dp not in range(ranks) or [r for r, _ in found] != every:
+        raise MemoryRefusal(
+            f"the hand-in names DP rank {dp}, and the lines of {log} matching "
+            f"{pattern.pattern!r} come from runners of (DP, TP) ranks "
+            f"{[r for r, _ in found]}, not one each of {every}",
+            "pass each DP rank's lp-<engine>.dp<r>.json and the log of a real "
+            "server at as many DP ranks, at the TP width its record states",
+        )
+    return [v for (d, _), v in found if d == dp]
+
+
 def _one(
-    pattern: re.Pattern, text: str, log: Path, ranks: int, blocks=None, tp: int = 1
+    pattern: re.Pattern, text: str, log: Path, ranks: int, blocks=None, tp=1, dp=None
 ) -> list[tuple]:
     """The values on the lines matching `pattern`, which each of the `tp` TP ranks
     of each of `ranks` DP ranks logs once: at one DP rank each TP rank's, as
     logged; above it, at TP 1, the ranks' one value, or where ranks differ the
-    one on the lines that log `blocks`, the rank's KV block count. At DP and TP
-    both above 1 the lines are refused: they name no rank to group them by."""
+    one on the lines that log `blocks`, the rank's KV block count; at DP and TP
+    both above 1, DP rank `dp`'s, by TP rank, as `_grouped` groups them."""
     if ranks > 1 and tp > 1:
-        raise MemoryRefusal(
-            f"{log}'s lines name no rank, so at {ranks} DP ranks of TP {tp} "
-            "none of them can be paired with a DP rank's hand-in",
-            "compare a log at one DP rank or at TP 1",
-        )
+        return _grouped(pattern, text, log, ranks, tp, dp)
     found = pattern.findall(text)
     if len(found) != ranks * tp:
         raise MemoryRefusal(
@@ -168,16 +197,21 @@ def _stored(out: Path) -> tuple[Term, ...]:
     return footprint_terms(held[0], source=f"{STORAGE} in {out / READINGS}")
 
 
+def place(i: int, ranks: int) -> str:
+    """The `i`th TP line's name: above one DP rank its TP rank, else its place."""
+    return f"tp{i}" if ranks > 1 else f"line {i + 1}"
+
+
 def recorded(
-    log: Path, ranks: int = 1, blocks=None, tp: int = 1
+    log: Path, ranks: int = 1, blocks=None, tp: int = 1, dp: int | None = None
 ) -> tuple[list[Recorded], Term | None]:
     """The real server's two readings, which each TP rank of each of its `ranks`
-    DP ranks logs, at TP width `tp`, a recording per line `_one` reads, and the
-    pool its capture reserved; for a `compass measure memory` ``--out``, its
-    engine's, and its ranks' storage bytes besides.
+    DP ranks logs, at TP width `tp`, a recording per line `_one` reads for DP
+    rank `dp`, and the pool its capture reserved; for a `compass measure memory`
+    ``--out``, its engine's, and its ranks' storage bytes besides.
 
     ATOM logs GiB to two places, so each recorded term is good to 5 MiB.
-    The run is named by the log's path, of several lines with the line's place,
+    The run is named by the log's path, of several lines with `place`,
     and its record by the log's digest.
     The pool is None when the server captured no graph.
     """
@@ -186,12 +220,12 @@ def recorded(
         stored, log = _stored(log), log / LOG
     data = log.read_bytes()
     text = data.decode(errors="replace")
-    budgets = _one(_BUDGET, text, log, ranks, blocks, tp)
+    budgets = _one(_BUDGET, text, log, ranks, blocks, tp, dp)
     # The TP ranks of a DP rank warm up at its one shape.
     ((tokens,),) = _one(_WARMUP, text, log, ranks * tp)
     runs = [
         Recorded(
-            run=f"{log} line {i}" if len(budgets) > 1 else str(log),
+            run=f"{log} {place(i, ranks)}" if len(budgets) > 1 else str(log),
             shape=Shape(int(tokens), PHASE),
             # `ModelRunner.warmup_model` resets the peak before its forward.
             high_water_reset=True,
@@ -203,7 +237,7 @@ def recorded(
             at_shape=SHAPED,
             record="sha256:" + hashlib.sha256(data).hexdigest(),
         )
-        for i, (peak_torch, non_torch) in enumerate(budgets, 1)
+        for i, (peak_torch, non_torch) in enumerate(budgets)
     ]
     pools = _POOL.findall(text)
     if not pools:
@@ -220,13 +254,15 @@ def recorded(
 def parts(
     predicted_file: Path, log: Path, ranks: int = 1, blocks=None, tp: int = 1
 ) -> list:
-    """The per-term comparison against each recording `recorded` reads, the
-    predicted readings, and the graph pool's."""
+    """The per-term comparison against each recording `recorded` reads for the
+    DP rank the hand-in's name states, the predicted readings, and the graph
+    pool's."""
     if not (saved := read_json(predicted_file).get("memory")):
         what = f"{predicted_file} has no memory section"
         raise MemoryRefusal(what, "pass an engine's hand-in, lp-engine*.json")
     readings = {name: _reading(name, rows) for name, rows in saved["readings"].items()}
-    runs, pool = recorded(log, ranks, blocks, tp)
+    dp = re.fullmatch(r".*\.dp(\d+)", predicted_file.stem)
+    runs, pool = recorded(log, ranks, blocks, tp, dp and int(dp[1]))
     # The terms of `peak_torch` the run records alone: its storages.
     stored = runs[0].by_name().keys() - set(COMPARED)
     alone = tuple(t for t in readings["peak_torch"].terms if t.name in stored)

@@ -51,7 +51,7 @@ from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.step_linear_fit import TOKEN_BANDS, token_band
 from atom.compass.backends.step_roofline import StepFallbackBackend, StepRooflineBackend
-from atom.compass.memory.check import MemoryRefusal, parts, spread
+from atom.compass.memory.check import MemoryRefusal, parts, place, spread
 from atom.compass.run import (
     CLIENT_DIR,
     ENGINE,
@@ -177,9 +177,8 @@ def _checked(where: str, hand_in: Path, real: Path, ranks: int, blocks=None, tp=
     except MemoryRefusal as e:
         yield where, "memory", e.what, "refused"
         return
-    # A TP rank's line names no rank, so its rows name its place in the log.
-    for i, comparison in enumerate(compared, 1):
-        at = f"{where} line {i}" if len(compared) > 1 else where
+    for i, comparison in enumerate(compared):
+        at = f"{where} {place(i, ranks)}" if len(compared) > 1 else where
         for t in comparison.compared:
             value = f"{t.relative:+.2%} ({t.delta_bytes:+,} B)"
             yield at, t.name, value, str(t.verdict)
