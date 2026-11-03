@@ -68,14 +68,18 @@ assumed; the B0 performance machines' carries MI355X's probed derates, assumed, 
 frozen stage-3c projection took them, until a B0 node is probed (D25, rule 5).
 
 **Revised 2026-11-03 by [#2716](https://github.com/jgong5/ATOM/issues/2716), which
-supersedes [#2708](https://github.com/jgong5/ATOM/issues/2708):** the machine spec splits
-by what each value varies with, into a device datasheet per SKU, platform readings per
-(device, stack, PTL) and a network file per scale-out network, composed for a run; the
-host block is #2309's (D24, D25). `compass measure device` publishes one node's probe
-record and `compass fit device` folds a platform's records into its readings, so a new
-node, stack or device needs no developer and no per-machine script (D26). Each artifact
-kind keys the platform axes its invalidation row marks, in place of the machine-spec
-digest (`07` D41, D43).
+supersedes [#2708](https://github.com/jgong5/ATOM/issues/2708), and the owner's
+[ruling on #2724](https://github.com/jgong5/ATOM/pull/2724#issuecomment-6596632012):** the
+machine spec splits by what each value varies with, into a device datasheet per SKU,
+platform readings per (device, stack, PTL, torch) and a network file per scale-out
+network, composed for a run; the host block is #2309's, and the router's hop an assumed
+host transport constant (D24, D25). A measured readings entry holds attainable rates and
+an assumed one another device's ratios, each composed with the datasheet as it stands
+(D25 rule 2). `compass measure device` publishes one node's probe record and `compass fit
+device` folds a platform's records into its readings, so a new node, stack or device
+needs no developer and no per-machine script (D26). Each artifact kind keys the platform
+axes its invalidation row marks, torch included, in place of the machine-spec digest
+(`07` D41, D43).
 
 **Scope.** The inputs that tell Compass what machine it is simulating, the layers they
 split into, their schema, and the commands that fill them in. A project requirement is
@@ -134,28 +138,30 @@ node's value and stated no band across the others.
 
 | Layer | Varies with | What it is | Written by | Read by |
 |---|---|---|---|---|
-| 1. device datasheet | the SKU | a file, `atom/compass/devices/<sku>.json`, named by SKU or by path | a person, from the vendor's datasheet | `fit device` and every command that prices |
-| 2. platform readings | device, stack and PTL, its key; torch, its fingerprint | a `platform_readings` store entry, one per key, never replaced | `compass fit device`, from the probe records `compass measure device` publishes per node, or from another device's entry, assumed (D26) | every command that prices |
-| 3. network file | the scale-out network | a file, `atom/compass/networks/<name>.json`, named by name or by path | a person, or the class 3 probe (D26) | a prefill-decode deployment |
-| 4. host block | the host | the `host_laws` entry, by [#2309's Ruling (e)](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963) | #2309 | #2309 |
+| 1. device datasheet | the SKU | a file, `atom/compass/devices/<sku>.json`, named by SKU or by path | a person, from the vendor's datasheet | `fit device --assume-from` and every command that prices |
+| 2. platform readings | device, stack, PTL and torch, its key | a `platform_readings` store entry, one per key, never replaced | `compass fit device`, from the probe records `compass measure device` publishes per node, or from another device's entry, assumed (D26) | every command that prices |
+| 3. network file | the scale-out network | a file, `atom/compass/networks/<name>.json`, named by name or by path | a person, or the class 3 probe (D26) | a run across nodes |
+| 4. host block | the host | the `host_laws` entry, by [#2309's Ruling (e)](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963); the router's hop a host transport constant (D25) | #2309, [#2714](https://github.com/jgong5/ATOM/issues/2714) | #2309 |
 | 5. keys | — | the platform fields of every artifact key (`07` D41) | every publisher, from what its inputs read | every reader |
 
 **Stack** here is ROCm's version, aiter's commit and RCCL's version, the matrix's
 `ROCm / AITER / RCCL` axis (`07` D43); torch is an axis of its own.
 
 **The keys (layer 5).** Each artifact kind keys, by value, each of device, software
-stack and PTL state that its invalidation row marks (`07` D43), read from the records it
-was made from, where it stated the machine-spec digest of one spec file; its other key
-fields stay as `07` D41 lists them, and torch stays a fingerprint axis (`07` D43). A host
-law then keys no PTL state, which its row marks independent.
+stack, PTL state and torch that its invalidation row marks (`07` D43), read from the
+records it was made from, where it stated the machine-spec digest of one spec file; its
+other key fields stay as `07` D41 lists them. A host law then keys no PTL state, which
+its row marks independent, and a kind whose row marks torch keys it, so a torch bump
+publishes under a new key where a fit to the old one would refuse.
 
 **A run's platform is read from the entries it prices with.** A user names the device and
-its PTL state, `--stack` only when the store holds readings of several stacks for them
-and the entries it prices with state none, and `--network` for a deployment (`13` D80).
-The run composes the datasheet, the readings entry and, for a deployment, the network
-file into one machine spec, with the field paths of D25, and echoes
-it into every run artifact (D25 rule 4). A command whose inputs carry their platform, a
-GPU command from its cards and a fit from its records, names none: it keys what it read.
+its PTL state, `--stack`, which names a stack and a torch, only when the store holds
+readings of several for them and the entries it prices with state none, and `--network`
+for a run across nodes (`13` D80). The run composes the datasheet, the readings entry
+and, across nodes, the network file into one machine spec, with the field paths of D25,
+and echoes it into every run artifact (D25 rule 4). A command whose inputs carry their
+platform, a GPU command from its cards and a fit from its records, names none: it keys
+what it read.
 
 ### Open issues
 
@@ -169,9 +175,10 @@ GPU command from its cards and a fit from its records, names none: it keys what 
 Three documents, one per layer of D24, each holding the fields below at the paths shown,
 and composed for a run into **one machine spec, echoed verbatim into every run artifact**.
 A field sits in exactly one layer, and a layer document holding another layer's field is
-refused by name. The keys of layer 5 hold `device.software_pinned_to` and `device.ptl`,
-which no document states any more: a readings entry's key states its stack and PTL state,
-and its fingerprint its torch (`07` D41).
+refused by name. A readings entry's rates and ratios are the one change of path: the
+composition turns them into the spec's derates (rule 2). The keys of layer 5 hold
+`device.software_pinned_to` and `device.ptl`, which no document states any more: a
+readings entry's key states its stack, torch and PTL state (`07` D41).
 
 Every document states its own `schema_version`, `name` and `provenance`: who wrote it and
 when, the document's origin, each field's origin with a probed field's subject and band
@@ -197,19 +204,18 @@ interconnect:
     domain_devices:             8        # devices the fabric joins; may exceed count_per_node
     link_bandwidth_bytes_per_s: 1.0e12
 
-# 2. platform readings, a store entry keyed (MI355X gfx950, rocm 7.2.4 / aiter <commit> /
-#    rccl <version>, disabled)
+# 2. platform readings, a measured store entry keyed (MI355X gfx950, rocm 7.2.4 /
+#    aiter <commit> / rccl <version>, disabled, torch <version>)
 device:
   memory:
     bandwidth_curve:                     # optional: bytes -> attainable bytes/s, fastest of read, write, copy; monotone
       - [4096,        1.1e11]
       - [4294967296,  6.4e12]
-    derate:                    0.80      # the curve's largest point over the datasheet's bandwidth
   compute:
-    derate:                    # attainable over datasheet, one per format
-      bf16:                    0.70
-      fp8:                     0.65
-      fp4:                     0.60
+    attainable_flops:          # the best large-GEMM rate, one per format
+      bf16:                    1.75e15
+      fp8:                     3.25e15
+      fp4:                     6.0e15
   kernel_floor_s:              2.0e-6   # optional: an empty kernel, replayed in a graph
   # no memory readings, activations included: they are `compass measure memory`'s
   # entries (07 D38, Phase 2)
@@ -217,7 +223,7 @@ interconnect:
   intra_node:
     link_latency_s:             2.0e-6
     # link_setup_s: optional, once on a rank pair's first KV write; absent is zero
-    derate:                     0.80
+    attainable_bandwidth_bytes_per_s: 8.0e11   # a large peer copy
     pp: {rccl: {...}, gloo: {...}}       # optional: a pipeline stage's send per carrier
   host_link: {bandwidth_bytes_per_s, latency_s}   # optional: the device-to-host copy
 
@@ -228,17 +234,24 @@ interconnect:
     link_latency_s:             5.0e-6
     # link_setup_s: optional, once on a rank pair's first KV write; absent is zero
     derate:                     0.80
-  router_relay_s:               1.5e-3   # Atomesh per-hop, PD only
 ```
 
 `pp` holds, per carrier, `eager_threshold_bytes`, `latency_s`, `overhead_s`, `per_byte_s`
 and `rendezvous_fixed_s`, and for `gloo` also `wake_s` and `wake_rise_s`
 (`atom/compass/spec/fields.py::FIELDS`).
 
-A prefill-decode deployment reads the network file, one node or two: every deployment
-charges the router's hop, `router_relay_s` (`atom/compass/drive/runfile.py::prefill_decode`),
-and only one across two nodes prices its KV transfers on `inter_node`. Every other run reads
-none.
+An assumed readings entry, for a device never run (D26), holds the source's ratios where a
+measured one holds rates: `compute.derate` per format, `intra_node.derate`, and
+`memory.bandwidth_derate_curve`, the source's curve over its datasheet's bandwidth. Its
+other fields are as above.
+
+A run across nodes reads the network file, and no other run does: today that is a
+prefill-decode deployment whose two instances sit on two nodes, which prices its KV
+transfers on `inter_node` (`atom/compass/drive/runfile.py::prefill_decode`). The router's
+per-request hop, `router_relay_s`, is no network's: every prefill-decode deployment
+charges it, one node or two. It is a host transport cost, layer 4's: an assumed constant
+beside `atom/compass/drive/runfile.py::KV_WRITE_REQ_S`, among the host transport
+constants [#2714](https://github.com/jgong5/ATOM/issues/2714) moves into host laws.
 
 Layer 4, the host block, as the spec states it until
 [#2309](https://github.com/jgong5/ATOM/issues/2309) moves it into the `host_laws` entry; no
@@ -317,16 +330,21 @@ it carries Mooncake's KV transfer between the prefill and the decode node (`01` 
    **refuses and names it** (`07` D38). These are the terms with no law behind them; a
    silent default is the worst kind of wrong.
 2. **`derate` is mandatory wherever a spec-peak number appears**, so nobody can quietly
-   use a datasheet FLOP as an achievable one. The peak is the datasheet's and its derate
-   the readings entry's, so a composition that leaves a stated peak without its derate
-   refuses, naming both documents. `memory.derate` is derived, not probed: the bandwidth
-   curve's largest point over `bandwidth_bytes_per_s`. A readings entry names the
-   datasheet it divided by, by digest, and a run composing it with another datasheet
-   refuses, naming both.
+   use a datasheet FLOP as an achievable one. The peak is the datasheet's, and the
+   composition makes its derate from the readings entry and the datasheet as it stands:
+   a measured entry's attainable rate over the peak, an assumed entry's ratio as it is.
+   The bandwidth curve is a measured entry's as it is, or an assumed entry's
+   `bandwidth_derate_curve` times the datasheet's bandwidth, and `memory.derate` is
+   derived, not probed: the composed curve's largest point over `bandwidth_bytes_per_s`.
+   No readings entry names a datasheet, so correcting one re-prices every run that reads
+   it and refuses none. A stated peak the entry gives no derate for is left out of the
+   composed spec, as `atom/compass/validate/project.py::projected` leaves it: a price
+   that reads that rate refuses naming it, and a required peak refuses as a missing
+   field.
 3. **Entries one run reads must agree.** Device numbers track the ROCm/RCCL/AITER build
    as well as the die (`07` D43), so every entry a command reads states the platform it
-   was made on: its key the device, stack and PTL state its row marks, its fingerprint
-   its torch (D24, `07` D41). Entries that disagree on an axis two of them state refuse,
+   was made on: its key the device, stack, PTL state and torch its row marks (D24, `07`
+   D41). Entries that disagree on an axis two of them state refuse,
    naming each entry and both values; so do probe records of two devices, stacks,
    torches or PTL states folded together (D26). It is the target's platform: a step grid
    bundle's stack, torch included, is checked against the entries the run reads, never
@@ -417,8 +435,8 @@ developer script (`13` D80):
 ```
 compass measure device --gpu G... [--pp] --store S --out D     [GPU, every card of a node]
     -> one probe record per node
-compass fit device     RECORD... --device DATASHEET --store S --out D   [no GPU]
-    -> one platform_readings entry per (device, stack, PTL)
+compass fit device     RECORD... --store S --out D   [no GPU]
+    -> one platform_readings entry per (device, stack, PTL, torch)
 compass fit device     --device DATASHEET --assume-from DEVICE --ptl P --store S --out D
     -> one platform_readings entry, every field assumed
 ```
@@ -431,24 +449,25 @@ band, the cards and the contamination refusals below; a second record on the sam
 and key refuses.
 
 **`fit device` folds a platform's records into its readings.** It reads the probe
-records it names, each by the token its key prints, and the datasheet `--device` names,
-and publishes one `platform_readings` entry: each field the median over the records'
-nodes, a curve point by point, its p10 and p90 spanning every record's band, each derate that
-median rate over the datasheet's peak. The entry names each record it folded and the
-datasheet's digest (D25 rule 2). Records of two devices, stacks, torches or PTL states
-refuse together, naming both values; a fit to a key already published refuses, since
-handed-off artifacts are immutable (`07` D41 rule 4). A node probed after the fit adds a
-record and leaves the entry as it is.
+records it names, each by the token its key prints, and publishes one `platform_readings`
+entry: each field the median over the records' nodes, a curve point by point, its p10 and
+p90 spanning every record's band, every rate held as a rate. The entry names each record
+it folded and no datasheet, since a run divides its rates by the datasheet as it stands
+(D25 rule 2). Records of two devices, stacks, torches or PTL states refuse together,
+naming both values; a fit to a key already published refuses, since handed-off artifacts
+are immutable (`07` D41 rule 4). A node probed after the fit adds a record and leaves the
+entry as it is.
 
 **A device never run gets an assumed entry.** `fit device --assume-from DEVICE` takes the
-one readings entry the store holds for DEVICE at `--ptl`, and states it for the
-datasheet `--device` names, every field assumed: each derate as it is, the bandwidth
-curve scaled by the two datasheets' bandwidths, and the kernel floor and the link and
-carrier terms as they are; a compute format the source states no derate for is left
-out, so a price that reads its rate refuses. This is the rule `compass project` carries a
-probed device's ratios by, and it moves here. The entry is keyed by the target device,
-the source's stack and the PTL state, the stack stated as assumed from the source's.
-Several source entries refuse, listing them. MI455X B0's readings are MI355X's taken this
+one readings entry the store holds for DEVICE at `--ptl`, divides it by DEVICE's
+datasheet, and states the ratios for the device `--device` names, every field assumed:
+each derate, the bandwidth curve over DEVICE's bandwidth, and the kernel floor and the
+link and carrier terms as they are; a compute format the source states no rate for is
+left out, so the composition leaves its peak out (D25 rule 2). This is the rule `compass
+project` carries a probed device's ratios by (`atom/compass/validate/project.py::projected`),
+and it moves here. The entry is keyed by the target device and the source's stack, torch
+and PTL state, the stack stated as assumed from the source's. Several source entries
+refuse, listing them. MI455X B0's readings are MI355X's taken this
 way, as the frozen MI455 projection took them (`10` D69).
 
 The fragment merge, `validate`'s fragment checks, `explain` and the per-machine scripts
@@ -473,7 +492,7 @@ layer 4's.
 | Probe | Fills | Notes |
 |---|---|---|
 | `device-memory`, at TP1 | the datasheet's `capacity_bytes` | the device's capacity, `probed` and exact (D25 rule 5); the readings of an engine start are `measure memory`'s |
-| `device-compute` | `compute.derate`, one per format | per format (BF16, FP8, FP4 where the device has it), the best large-GEMM rate the vendor library reaches, recorded as a rate; `fit device` divides it by the datasheet's `*_flops` (#1392) |
+| `device-compute` | `compute.attainable_flops`, one per format | per format (BF16, FP8, FP4 where the device has it), the best large-GEMM rate the vendor library reaches, recorded as a rate, which a run divides by the datasheet's `*_flops` (#1392) |
 | `device-bandwidth` | `memory.bandwidth_curve` | read-only, write-only and STREAM copy sweeps over transfer sizes; the curve is the per-size maximum of the three, so it bounds any mix of reads and writes ([#1575](https://github.com/jgong5/ATOM/issues/1575)); `memory.derate` is derived from it (schema rule 2) |
 | `kernel-floor` | `kernel_floor_s` | an empty kernel replayed in a graph, so the host's launch time is not in it |
 | `host-link` | `host_link.*` | the device-to-host copy an lmcache server's stores and loads ride, its latency and the bandwidth a copy reaches |
@@ -484,7 +503,7 @@ layer 4's.
 
 | Probe | Fills | Notes |
 |---|---|---|
-| `interconnect-intra` | `intra_node.link_latency_s`, `intra_node.derate` | link latency as half a small-message round trip (one hop), the link's attainable bandwidth from a large peer copy, which `fit device` divides by the datasheet's (#1392); collectives in **real groups**, several sizes, are `measure ops`'s, for the empirical pricing of `07` D40 |
+| `interconnect-intra` | `intra_node.link_latency_s`, `intra_node.attainable_bandwidth_bytes_per_s` | link latency as half a small-message round trip (one hop), the link's attainable bandwidth from a large peer copy, which a run divides by the datasheet's (#1392); collectives in **real groups**, several sizes, are `measure ops`'s, for the empirical pricing of `07` D40 |
 | `pp-carriers` | `intra_node.pp.*` | a pipeline stage's send per carrier, RCCL and gloo, between two cards |
 
 `intra_node.link_setup_s` has no probe; absent is zero.
@@ -493,13 +512,13 @@ layer 4's.
 
 | Probe | Fills |
 |---|---|
-| `interconnect-inter` | a network file's `inter_node.*` and `router_relay_s` |
+| `interconnect-inter` | a network file's `inter_node.*` |
 
 **Class 4 — no hardware at all.**
 
 | Probe | Fills | Provenance stamped |
 |---|---|---|
-| `from-datasheet` | a datasheet: `capacity_bytes`, `bandwidth`, `flops`, the intra-node fabric | `origin: datasheet`; a datasheet states no derate, so a run refuses until a readings entry states them |
+| `from-datasheet` | a datasheet: `capacity_bytes`, `bandwidth`, `flops`, the intra-node fabric | `origin: datasheet`; a datasheet states no derate, so a run refuses without a readings entry for it |
 
 ### Two refusals every hardware probe must implement
 
@@ -526,7 +545,7 @@ with them.
 
 - a missing required field, in whichever layer holds it
 - a field in a layer that does not hold it
-- a `derate` missing beside a spec-peak number (D25 rule 2)
+- no readings entry for the device and PTL state, or several the run cannot choose between (D24)
 - entries that disagree on the platform (D25 rule 3)
 
 The composed spec in `run.json` states each field with its value and origin, one entry per
@@ -563,7 +582,7 @@ single term.
 
 | # | Decision | Date |
 |---|---|---|
-| D24 | The spec describes the machine; ATOM's config describes the deployment. Thread-pool width becomes an ATOM config option, not a Compass one. Revised: a value is stated once, in the layer that names what it varies with: a device datasheet per SKU, platform readings per (device, stack, PTL), a network file per scale-out network, the host block in host laws (#2309); each artifact kind keys the device, stack and PTL its invalidation row marks, read from its records, in place of the machine-spec digest; a run's platform is read from the entries it prices with, the user naming device and PTL, the stack only when the store holds several, and a deployment's network. | 2026-09-18; layers 2026-11-03 (#2716) |
-| D25 | Four-section schema: `provenance`, `host`, `device`, `interconnect`. Mandatory derates, no memory readings (`measure memory`'s entries, 2026-10-14), activations included (2026-10-16), `software_pinned_to` checked, torch included, as the target's stack, whole spec echoed into every artifact. Revised for the MI455 projection: an optional dense `fp4_flops`, `intra_node.domain_devices` for a scale-up fabric wider than a node, and every field given an origin, `datasheet`, `probed` or `assumed`, `provenance.origin` and per field `provenance.origins` with a probe's subject, kept across a save. Revised: a `host.http_intake` pair, the event loop's charge per HTTP request taken in, required once every committed spec stated it. An optional `host.http_intake.idle_s`, a lone request's intake. An optional per-link `link_setup_s`, charged once on a rank pair's first KV write. Revised for the attainable-peak roofline: a `derate` is attainable over datasheet, probed, one per compute format; an optional `memory.bandwidth_curve` and an optional `kernel_floor_s`; a device never run carries a probed device's derates, assumed; MI455 has two specs, the A0 samples' probed on their node and the B0 machines' carrying MI355X's derates, assumed, as the frozen projection took them, until a B0 node is probed. A probed number carries its measured p10 and p90 beside its subject, and a spec stating one without them is refused by name before it is written. Revised: three documents, a datasheet, a readings entry and a network file, each holding its own fields and their origins, composed for a run into one spec with the same field paths; `software_pinned_to` and `device.ptl` leave the documents for the readings key and fingerprint; a peak's derate is the readings entry's, which names the datasheet it divided by; the stack check becomes: entries one run reads must agree. | 2026-09-18; revised 2026-10-10; torch 2026-10-13 (#851); origin 2026-10-14 (#952); intake 2026-10-16 (#1103), required 2026-10-18 (#1230); idle intake 2026-10-20 (#1775); link setup 2026-10-16 (#1172); activations and the transfer origin dropped 2026-10-16 (#1226); attainable peaks 2026-10-17 (#1392); `host.admission_fixed_s` dropped 2026-10-17 (#1000); bands 2026-10-18 (#1482, #1518); MI455 probed 2026-10-25 (#2138), split into A0 and B0 2026-10-28 (#2141); layers 2026-11-03 (#2716) |
-| D26 | Probes emit fragments; `merge` / `validate` / `explain` combine and check them. Four hardware probe classes plus a datasheet path; the transfer path dropped 2026-10-14 (#937). Every hardware probe implements the contamination refusals. All are the `spec` package's functions, run by per-machine scripts, with no `compass` command. Machine specs are developers', one per supported machine, passed by `--machine`; an engine start's memory readings are `measure memory`'s, not the spec's. Revised: class 1 probes the per-format GEMM rate, the bandwidth curve and the kernel floor; class 2 the link latency and bandwidth. Revised: the bandwidth curve is the per-size maximum of a read-only, a write-only and a copy sweep. Revised: `compass measure device` publishes one probe record per node, raw rates with their bands; `compass fit device` folds a platform's records into one readings entry, each field the median over nodes with a band spanning theirs, derates over the datasheet, one entry per key, never replaced; `--assume-from` states another device's readings, assumed, for a device never run; the fragment merge, `explain` and the per-machine scripts go. | 2026-09-18; revised 2026-10-13 and 2026-10-14 (#851); 2026-10-17 (#1392); 2026-10-19 (#1575); 2026-11-03 (#2716) |
+| D24 | The spec describes the machine; ATOM's config describes the deployment. Thread-pool width becomes an ATOM config option, not a Compass one. Revised: a value is stated once, in the layer that names what it varies with: a device datasheet per SKU, platform readings per (device, stack, PTL, torch), a network file per scale-out network that only a run across nodes reads, the host block in host laws (#2309) and the router's hop an assumed host transport constant beside `KV_WRITE_REQ_S` (#2714); each artifact kind keys the device, stack, PTL and torch its invalidation row marks, read from its records, in place of the machine-spec digest; a run's platform is read from the entries it prices with, the user naming device and PTL, the stack only when the store holds several, and the network for a run across nodes. | 2026-09-18; layers 2026-11-03 (#2716, [ruling on #2724](https://github.com/jgong5/ATOM/pull/2724#issuecomment-6596632012)) |
+| D25 | Four-section schema: `provenance`, `host`, `device`, `interconnect`. Mandatory derates, no memory readings (`measure memory`'s entries, 2026-10-14), activations included (2026-10-16), `software_pinned_to` checked, torch included, as the target's stack, whole spec echoed into every artifact. Revised for the MI455 projection: an optional dense `fp4_flops`, `intra_node.domain_devices` for a scale-up fabric wider than a node, and every field given an origin, `datasheet`, `probed` or `assumed`, `provenance.origin` and per field `provenance.origins` with a probe's subject, kept across a save. Revised: a `host.http_intake` pair, the event loop's charge per HTTP request taken in, required once every committed spec stated it. An optional `host.http_intake.idle_s`, a lone request's intake. An optional per-link `link_setup_s`, charged once on a rank pair's first KV write. Revised for the attainable-peak roofline: a `derate` is attainable over datasheet, probed, one per compute format; an optional `memory.bandwidth_curve` and an optional `kernel_floor_s`; a device never run carries a probed device's derates, assumed; MI455 has two specs, the A0 samples' probed on their node and the B0 machines' carrying MI355X's derates, assumed, as the frozen projection took them, until a B0 node is probed. A probed number carries its measured p10 and p90 beside its subject, and a spec stating one without them is refused by name before it is written. Revised: three documents, a datasheet, a readings entry and a network file, each holding its own fields and their origins, composed for a run into one spec with the same field paths; `software_pinned_to` and `device.ptl` leave the documents for the readings key; a measured readings entry holds attainable rates and an assumed one the source's ratios, composed into derates with the datasheet as it stands, so no entry names a datasheet, and a peak with no derate is left out of the composition; `router_relay_s` leaves the network file for an assumed host transport constant; the stack check becomes: entries one run reads must agree. | 2026-09-18; revised 2026-10-10; torch 2026-10-13 (#851); origin 2026-10-14 (#952); intake 2026-10-16 (#1103), required 2026-10-18 (#1230); idle intake 2026-10-20 (#1775); link setup 2026-10-16 (#1172); activations and the transfer origin dropped 2026-10-16 (#1226); attainable peaks 2026-10-17 (#1392); `host.admission_fixed_s` dropped 2026-10-17 (#1000); bands 2026-10-18 (#1482, #1518); MI455 probed 2026-10-25 (#2138), split into A0 and B0 2026-10-28 (#2141); layers 2026-11-03 (#2716, [ruling on #2724](https://github.com/jgong5/ATOM/pull/2724#issuecomment-6596632012)) |
+| D26 | Probes emit fragments; `merge` / `validate` / `explain` combine and check them. Four hardware probe classes plus a datasheet path; the transfer path dropped 2026-10-14 (#937). Every hardware probe implements the contamination refusals. All are the `spec` package's functions, run by per-machine scripts, with no `compass` command. Machine specs are developers', one per supported machine, passed by `--machine`; an engine start's memory readings are `measure memory`'s, not the spec's. Revised: class 1 probes the per-format GEMM rate, the bandwidth curve and the kernel floor; class 2 the link latency and bandwidth. Revised: the bandwidth curve is the per-size maximum of a read-only, a write-only and a copy sweep. Revised: `compass measure device` publishes one probe record per node, raw rates with their bands; `compass fit device` folds a platform's records into one readings entry, each field the median over nodes with a band spanning theirs, rates held as rates and naming no datasheet, one entry per key, never replaced; `--assume-from` states another device's ratios, assumed, for a device never run; the fragment merge, `explain` and the per-machine scripts go. | 2026-09-18; revised 2026-10-13 and 2026-10-14 (#851); 2026-10-17 (#1392); 2026-10-19 (#1575); 2026-11-03 (#2716, [ruling on #2724](https://github.com/jgong5/ATOM/pull/2724#issuecomment-6596632012)) |
 | D25.1 | Runtime-constant fields renamed to say what they are; ATOM's own term recorded as a mapping column. `host.tokenizer` becomes `host.tokenizers[]`, keyed by tokenizer identity (id + backend + fingerprint) with `applies_to` model architectures. | 2026-09-19 |
