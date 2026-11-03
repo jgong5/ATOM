@@ -177,8 +177,7 @@ def test_a_spec_that_cannot_answer_for_the_link_refuses(geometry):
             path: value
             for path, value in spec.values.items()
             if not path.startswith("interconnect.inter_node")
-        },
-        tokenizers=spec.tokenizers,
+        }
     )
     TransferModel.from_spec(without, geometry.bytes_per_block, Scope.INTRA_NODE)
     with pytest.raises(SpecRefusal) as refusal:

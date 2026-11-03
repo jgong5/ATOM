@@ -51,11 +51,6 @@ from tests.compass.held_ports import held_ports
 MAX_TOKENS = (2, 4, 6, 8)
 #: The slice's machine.
 DP_MACHINE = copy.deepcopy(DOCUMENT)
-#: The tokenizers probed on the checked-in MI308X machine as well, so a slice
-#: model of theirs (Qwen3.8-27B) resolves its tokenizer.
-DP_MACHINE["host"]["tokenizers"] += json.loads(
-    (TREE / "scripts/compass/machines/mi308x-hjbog39.json").read_text()
-)["host"]["tokenizers"]
 #: Declared test values for a pipeline stage's send: every part is rendezvous.
 DP_MACHINE["interconnect"]["intra_node"]["pp"] = {
     carrier: {
@@ -73,10 +68,6 @@ DP_MACHINE["interconnect"]["intra_node"]["pp"]["gloo"] |= {
     "wake_s": 2.0**-12,
     "wake_rise_s": 2.0**-6,
 }
-#: The run test's machine: an HTTP intake of about a picosecond, so the four
-#: requests reach the engine together and each rank batches two.
-BATCHED = copy.deepcopy(DP_MACHINE)
-BATCHED["host"]["http_intake"] = {"fixed_s": 2.0**-40, "per_byte_s": 2.0**-60}
 DONE = "data: [DONE]"
 #: The slice's parallelism: two DP ranks at TP 1, with expert parallelism.
 DP_WIDTH = ["-tp", "2", "--enable-dp-attention", "--enable-expert-parallel"]
@@ -180,9 +171,9 @@ def run_dp_slice(
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("dp_slice")
-    return [
-        run_dp_slice(root / f"seed{seed}", seed, machine=BATCHED) for seed in ("1", "2")
-    ]
+    # With no HTTP intake term the four requests reach the engine together, and
+    # each rank batches two.
+    return [run_dp_slice(root / f"seed{seed}", seed) for seed in ("1", "2")]
 
 
 @NEEDS_A_RUN

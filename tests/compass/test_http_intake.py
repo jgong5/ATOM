@@ -192,44 +192,6 @@ def test_an_intake_with_no_idle_term_charges_its_fixed_one_to_a_lone_request(
     assert compass_run.http_intake() == (4.3e-3, 5.6e-9, 4.3e-3)
 
 
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39", "mi355x-gpu45"])
-def test_every_committed_spec_states_a_probed_intake_from_a_named_record(name):
-    from atom.compass.spec import MachineSpec
-
-    document = json.loads((TREE / f"scripts/compass/machines/{name}.json").read_text())
-    spec = MachineSpec.from_mapping(document)
-    for term in ("fixed_s", "per_byte_s"):
-        origin = spec.origin(f"host.http_intake.{term}")
-        assert origin["origin"] == "probed"
-        assert origin["record"].startswith("sha256:")
-
-
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39", "mi355x-gpu45"])
-def test_every_committed_intake_band_spans_more_than_one_burst(name):
-    from atom.compass.spec import MachineSpec
-
-    document = json.loads((TREE / f"scripts/compass/machines/{name}.json").read_text())
-    spec = MachineSpec.from_mapping(document)
-    for term in ("fixed_s", "per_byte_s"):
-        origin = spec.origin(f"host.http_intake.{term}")
-        assert origin["p10"] < origin["p90"]
-
-
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39"])
-def test_the_mi308x_specs_rebuild_byte_for_byte_from_their_own_sweeps(
-    monkeypatch, tmp_path, name
-):
-    monkeypatch.setenv("COMPASS_MACHINE", name)
-    path = TREE / "scripts/compass/mi308x_spec.py"
-    loaded = importlib.util.spec_from_file_location("mi308x_spec", path)
-    script = importlib.util.module_from_spec(loaded)
-    loaded.loader.exec_module(script)
-    document = TREE / f"scripts/compass/machines/{name}.json"
-    out = tmp_path / "rebuilt.json"
-    assert script.main(["--sweep-from", str(document), "--out", str(out)]) == 0
-    assert out.read_bytes() == document.read_bytes()
-
-
 #: The stand-in server: a Starlette app's lifespan, as uvicorn starts it, then
 #: one GET; prints when the app sent the GET's response.
 APP_SERVER = """
