@@ -443,7 +443,7 @@ predicted; if not, that is the finding and the recipe grows.
 real engine, reads the readings below on every rank once the KV cache is allocated and
 the graphs are captured, publishes one `memory_readings` entry (D41), and exits (`13`
 D80); `record` takes none. The entry is keyed by the model, the device, stack and PTL
-state its cards read, the parallel layout and the engine config, its KV offload connector and resolved
+state its cards read and torch, the parallel layout and the engine config, its KV offload connector and resolved
 `index_cache_dtype` included (any `kv_transfer_config` resolves DeepSeek-V4's
 indexer to fp8, so a PD start reads a plain fp8-indexer start's entry)
 (`atom/compass/run/memory.py::key_fields`). A run reads its rank's
@@ -658,7 +658,7 @@ each server in steps 2, 3 and 6 serves the client runs a client started apart se
 (`13` D80):
 
 ```
- Platform: once per node of a new device, stack or PTL state (05 D26)
+ Platform: once per node of a new device, stack, PTL state or torch (05 D26)
  0.  compass measure device --gpu ... on each node; compass fit device <records>
                                                            [GPU, every card; then CPU]
        -> a probe_record per node; platform_readings for the platform
