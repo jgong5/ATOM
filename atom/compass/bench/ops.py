@@ -21,7 +21,8 @@ ATOM's runner is built from ATOM's arguments on each GPU `--gpu` names, one
 rank each of the layout the arguments resolve (`ranks`), its parameters on the
 meta device and with no warmup (`_runner`): no forward of the model, its LM
 head or its sampler runs. Each point reaches the runner as a batch
-(`ReplayRule`) that `ModelRunner.prepare_model` prepares, so ATOM builds its
+(`ReplayRule`) that `ModelRunner.prepare_model` prepares, each row's state
+first seated at its cached context (`replay.seat_states`), so ATOM builds its
 metadata and forward context; for DeepSeek-V4, the CSA top-k section its
 forward writes is written from ids spread over each token's compressed rows
 (`Stub._top_k`). A `Stub` calls each leaf from its contract:
@@ -643,8 +644,10 @@ class Stub:
         """`batch` prepared by ATOM's runner as its forward prepares one, no
         forward run, and a snapshot of the forward context it built and the
         live metadata each leaf names, beside the KV `point` found for it."""
+        from atom.compass.bench.replay import seat_states
         from atom.utils.forward_context import get_forward_context
 
+        seat_states(getattr(self.runner, "attn_metadata_builder", None), batch)
         self.runner._gate_staging_reuse()
         with _placed_state():
             input_ids = self.runner.prepare_model(batch)[0]

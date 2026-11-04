@@ -2101,8 +2101,10 @@ def engine_loop(engine_core):
     aside at READY, or else the one it found.
 
     A pipeline stage's runner calls go through `pp_send.install`'s sends. A
-    recorded real run's SIGTERM goes through `_stop_recording`, and its input
-    queue stamps each request frame's handoff (`clock.stamp_input`)."""
+    recorded real run's SIGTERM goes through `_stop_recording`, its input
+    queue stamps each request frame's handoff (`clock.stamp_input`), and
+    however it leaves the loop, the stamps its engine held are written
+    (`clock.write_stamps`), as its workers then write their step lines."""
     ignoring = bool(os.environ.get(ENV))  # a run, as `spec` would say, unread
     before = signal.signal(signal.SIGTERM, signal.SIG_IGN) if ignoring else None
     if _sigterm_at_ready:
@@ -2157,15 +2159,18 @@ def engine_loop(engine_core):
             _hand_in(run, lp, reasons + [ended], **said, **sections)
         raise
     finally:
-        if before is not None:  # None: not set from Python
-            signal.signal(signal.SIGTERM, before)
+        try:
+            clock.write_stamps()
+        finally:
+            if before is not None:  # None: not set from Python
+                signal.signal(signal.SIGTERM, before)
 
 
 def _stop_recording(engine_core, previous, signum, frame) -> None:
-    """A recorded real run's SIGTERM, where its engine stops: a speculative
-    engine writes its draft width and accepted-draft histogram beside the
-    record (`ACCEPTANCE_FILE`), then ATOM's handler, `previous`, takes it,
-    whether or not the write succeeded."""
+    """A recorded real run's SIGTERM, where its engine stops: it writes its
+    held stamps, a speculative engine writes its draft width and
+    accepted-draft histogram beside the record (`ACCEPTANCE_FILE`), then ATOM's
+    handler, `previous`, takes it, whether or not the writes succeeded."""
     from atom.compass import parity
 
     scheduler = getattr(engine_core, "scheduler", None)
@@ -2173,11 +2178,14 @@ def _stop_recording(engine_core, previous, signum, frame) -> None:
         scheduler, "engine_stats", None
     )
     try:
-        if getattr(stats, "spec_enabled", False):
-            width = config.speculative_config.num_speculative_tokens
-            held = {"draft_tokens": width, "distribution": dict(stats.distribution)}
-            name = ACCEPTANCE_FILE.format(config.parallel_config.data_parallel_rank)
-            _write_whole(Path(os.environ[parity.ENV]) / name, json.dumps(held))
+        try:
+            clock.write_stamps()
+        finally:
+            if getattr(stats, "spec_enabled", False):
+                width = config.speculative_config.num_speculative_tokens
+                held = {"draft_tokens": width, "distribution": dict(stats.distribution)}
+                name = ACCEPTANCE_FILE.format(config.parallel_config.data_parallel_rank)
+                _write_whole(Path(os.environ[parity.ENV]) / name, json.dumps(held))
     finally:
         previous(signum, frame)
 

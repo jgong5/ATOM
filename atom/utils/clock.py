@@ -773,15 +773,24 @@ class PullStamps:
     clock), ``t_in_put_ns``, ``t_in_get_ns``, ``t_pull_ns`` (the busy loop's
     idle point in the pass that got it) and ``prompt_tokens``; an
     output's ``t_out_put_ns``, ``t_out_sent_ns`` (the output thread's next
-    get, so its send returned) and ``rows``."""
+    get, so its send returned) and ``rows``.
+
+    Both files get their lines when the engine leaves its loop (`write_held`);
+    after that, each line as it comes. A write on the loop is time the loop
+    spends: on a record kept on NFS, a pull stamp written tens of
+    microseconds after the put stamp blocked for about 1 ms in most forwards,
+    inside the `E` it opens."""
 
     def __init__(self, path, handoff, now) -> None:
-        self.file, self.now = open(path, "w", buffering=1), now  # noqa: SIM115
-        self.handoff = open(handoff, "w", buffering=1)  # noqa: SIM115
-        self.lock = threading.Lock()
+        self.file, self.now = open(path, "w"), now  # noqa: SIM115
+        self.handoff = open(handoff, "w")  # noqa: SIM115
+        # Reentrant: the stop handler writes the held lines on the loop's own
+        # thread, which a signal may have caught inside `stamp`.
+        self.lock = threading.RLock()
         self.armed: set[str] = set()
         self.inputs: dict[int, int] = {}  # id of an input item -> its put
         self.pull = 0  # the busy loop's last idle point
+        self.held: dict | None = {self.file: [], self.handoff: []}
 
     def arm(self) -> None:
         with self.lock:
@@ -791,11 +800,28 @@ class PullStamps:
         with self.lock:
             if key in self.armed:
                 self.armed.discard(key)
-                self.file.write(f'{{"{key}": {self.now()}}}\n')
+                self._put(self.file, f'{{"{key}": {self.now()}}}\n')
 
     def write(self, line: dict) -> None:
         with self.lock:
-            self.handoff.write(json.dumps(line) + "\n")
+            self._put(self.handoff, json.dumps(line) + "\n")
+
+    def _put(self, file, line: str) -> None:
+        if self.held is None:
+            file.write(line)
+            file.flush()
+        else:
+            self.held[file].append(line)
+
+    def write_held(self) -> None:
+        """Write the lines held so far; later ones are written as they come.
+        The lines are taken first, so a stop handler that runs inside this
+        write finds none left to write again."""
+        with self.lock:
+            held, self.held = self.held, None
+            for file, lines in (held or {}).items():
+                file.write("".join(lines))
+                file.flush()
 
 
 #: The engine's `PullStamps` on a real recording, else None.
@@ -807,6 +833,12 @@ def stamp_pulls(path, handoff, now) -> None:
     queue handoffs into `handoff`, off the clock `now`; a real recording's only."""
     global _stamps
     _stamps = PullStamps(path, handoff, now)
+
+
+def write_stamps() -> None:
+    """A real recording's engine leaves its loop: write the stamps it holds."""
+    if _stamps is not None:
+        _stamps.write_held()
 
 
 class _StampedQueue(queue.Queue):

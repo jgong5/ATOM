@@ -212,6 +212,13 @@ the latency from above ([#2080](https://github.com/jgong5/ATOM/issues/2080)).
 On a record that stamps the engine's input pulls (`dp<r>.pulls.jsonl`), every kind also
 fits `E_out`, from a forward's exit to the pull after it, and `E` runs from that pull to
 the next entry ([#1480](https://github.com/jgong5/ATOM/issues/1480)).
+A record whose engine wrote each stamp as it came holds in its `E` the loop's own write
+of the pull stamp, which no unrecorded run makes. On the DeepSeek-V4.1-Flash DSpark TP4
+records kept on NFS it blocked about 1 ms in most forwards after one that put an output,
+and in none after one that put none, such as an output prefill after a middle chunk or
+an idle engine, so their `E` laws charge it to every forward; records taken since hold
+their stamps until the engine stops (`01` D4, *Measured, not hooked*;
+[#2726](https://github.com/jgong5/ATOM/issues/2726)).
 Under DP, `E` runs from the latest pull over the group before the same forward, as `01`
 D4 places it ([#1893](https://github.com/jgong5/ATOM/issues/1893)).
 The first time ATOM's scheduler schedules a request, a prefill row, it allocates the whole

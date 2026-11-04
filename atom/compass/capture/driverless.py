@@ -26,8 +26,18 @@ DEVICES = {
     "gfx942": (80, (9, 4), 192 << 30),  # MI308X
     "gfx950": (256, (9, 5), 288 << 30),  # MI355X
     # MI455X, assumed: AMD counts 256 work-group processors and 432 GB of HBM4.
+    # Its capability is card 0's of the MI455 A0 node.
     "gfx1250": (256, (12, 5), 432 << 30),
 }
+#: The rest of a declared device, by arch, where a source states it: warp size,
+#: threads per CU, L2 bytes, registers per CU and shared memory per block.
+PROPERTIES = {
+    # Card 0 of the MI455 A0 node as `card` read it on 2026-11-04; gfx1250 runs
+    # wave32 on every stepping.
+    "gfx1250": (32, 2048, 4 << 20, 131072, 320 << 10),
+}
+#: What an arch with no `PROPERTIES` entry declares, stated with no source.
+UNSOURCED = (64, 2048, 8 << 20, 65536, 65536)
 #: The stepping `rocminfo` states, where not the first: aiter runs no shipped
 #: asm kernel on gfx1250 A0, revision 0.
 REVISIONS = {
@@ -78,6 +88,7 @@ def _props(arch, read=None):
     if read:
         return types.SimpleNamespace(**read["props"])
     cus, (major, minor), memory = DEVICES[arch]
+    warp, threads, l2, regs, shared = PROPERTIES.get(arch, UNSOURCED)
     return types.SimpleNamespace(
         multi_processor_count=cus,
         gcnArchName=arch,
@@ -85,11 +96,11 @@ def _props(arch, read=None):
         major=major,
         minor=minor,
         total_memory=memory,
-        warp_size=64,
-        max_threads_per_multi_processor=2048,
-        L2_cache_size=8 << 20,
-        regs_per_multiprocessor=65536,
-        shared_memory_per_block=65536,
+        warp_size=warp,
+        max_threads_per_multi_processor=threads,
+        L2_cache_size=l2,
+        regs_per_multiprocessor=regs,
+        shared_memory_per_block=shared,
     )
 
 
@@ -304,12 +315,13 @@ def driverless_mode(shape_env):
     return _DriverlessFakeTensorMode(shape_env=shape_env, allow_non_fake_inputs=True)
 
 
-def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None, warp=64) -> None:
+def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None, warp=None) -> None:
     """Answer aiter's `rocminfo` shell-out and Triton's target query with `arch`,
-    its `cus` and stepping `revision` `DEVICES` and `REVISIONS` declare unless
-    given, and its `warp` size."""
+    its `cus`, stepping `revision` and `warp` size, those `DEVICES`, `REVISIONS`
+    and `_props` declare unless given."""
     cus = DEVICES[arch][0] if cus is None else cus
     revision = REVISIONS.get(arch, 0) if revision is None else revision
+    warp = _props(arch).warp_size if warp is None else warp
     import triton
     from triton.backends.compiler import GPUTarget
 
