@@ -36,6 +36,13 @@ them the same way for every line:
   GDN model's drafter of K drafts without ReplaySSM 1 + K. They are
   contiguous, row after row, from slot 0 of a fresh pool or from the slot
   `batch` is given.
+- Under a model whose cache keeps each state slot's position and refuses a
+  row whose state stands elsewhere, DeepSeek-V4.1's, each row's state stands
+  at its cached context, where a request that reached it leaves it:
+  `seat_states` sets that position, on each worker before each forward of the
+  step bench, ahead of its window, and before the op bench prepares each
+  placement. Only the position is set; the slot's rows and history hold what
+  they hold, as a row's KV blocks hold what the pool does.
 - A prefill line that produces output has every row on its final chunk, one
   that does not has none: a line does not say which of its chunks ends a
   prompt, and ATOM's runner samples every row of a step that produces output.
@@ -52,6 +59,7 @@ route otherwise than the recorded step did.
 """
 
 import numpy as np
+import torch
 
 from atom.compass.runner.step_output import filler_token_ids
 from atom.model_engine.block_manager import draft_kv_lookahead
@@ -75,6 +83,30 @@ def state_slots_per_request(config) -> int:
     `get_num_blocks` reply carries, one where it states none."""
     per_req = getattr(config, "pool_entries_per_req", None) or {}
     return int(per_req.get(STATE_SLOT_CLASS, 1)) or 1
+
+
+def seat_states(builder, batch) -> None:
+    """Each state-holding row of `batch` with its state's position at its
+    cached context, the tokens before the row's forward, in the slot it
+    commits to, where `builder`'s cache keeps that position: DeepSeek-V4.1's
+    `PagedAttentionCache`, whose first cursor column is the position. Any
+    other cache, and a dummy batch, which runs on scratch state, are left as
+    they are."""
+    cache = getattr(builder, "cache", None)
+    if cache is None or batch.is_dummy_run:
+        return
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+
+    if not isinstance(cache, PagedAttentionCache):
+        return
+    rows = np.asarray(batch.state_rows, dtype=np.int64)
+    if not rows.size:
+        return
+    cached = batch.context_lens[rows] - batch.num_scheduled_tokens[rows]
+    device = cache.cursor.device
+    slots = torch.as_tensor(batch.state_slots_committed, dtype=torch.long)
+    positions = torch.as_tensor(cached, dtype=cache.cursor.dtype)
+    cache.cursor[slots.to(device), 0] = positions.to(device)
 
 
 class ReplayRule:

@@ -461,6 +461,23 @@ def test_a_draft_kv_pass_is_measured_with_its_target_on_a_step_that_samples(tmp_
     assert measured == [pytest.approx(0.5), pytest.approx(0.4)]
 
 
+@pytest.mark.parametrize("block", [False, True])
+def test_walked_walks_a_block_drafter_with_its_target(monkeypatch, block):
+    config = _config(5, block=block)
+    monkeypatch.setattr(bound, "_build", lambda *a: (config, SimpleNamespace()))
+    monkeypatch.setattr(
+        "atom.compass.run.modules.drafter", lambda c: c.speculative_config
+    )
+    monkeypatch.setattr(
+        "atom.compass.run.modules.walk",
+        lambda t, d=None: STACK + DRAFTER * bool(d and d.use_dspark()),
+    )
+
+    walked = bound.walked(["--model", "m", "-tp", "4"], "gfx1250")
+
+    assert walked == STACK + DRAFTER * block
+
+
 def test_ep_low_latency_split_under_tbo_refuses_at_both_levels(monkeypatch, tmp_path):
     split = (8, 1, 2, 32, 32, 8, 8, 1, 1632)
     experts = Module("experts", "moe", split, "fp4", ranks=8, layer=0)
