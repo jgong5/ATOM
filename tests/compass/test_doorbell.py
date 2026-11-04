@@ -80,8 +80,9 @@ def test_a_worker_sleeps_between_calls_and_takes_each_in_order():
         calls, alive = list(worker.runners[0].calls), thread.is_alive()
     finally:
         # A worker still asleep holds its ring's buffer, which then cannot
-        # close: the doorbell shut wakes it to the calls left, and it leaves.
-        worker.doorbell.socket.shutdown(socket.SHUT_RD)
+        # close. `exit` closes the ring and shuts the doorbell: a worker asleep
+        # or not yet bound leaves at its next look at the ring.
+        worker.exit()
         thread.join(10)
         _close(writer, worker)
     assert ([n for n, _ in calls], alive) == ([0, 1], False)
