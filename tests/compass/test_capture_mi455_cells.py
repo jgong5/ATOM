@@ -197,3 +197,35 @@ def test_a_capture_declares_a_card_s_reading_to_aiter_torch_and_triton(tmp_path)
         "warp": 32,
         "cus": "192",
     }
+
+
+#: What the declared gfx1250 answers torch, and Triton where only its arch is
+#: declared (as `measure ops --coverage` does) and where a capture installs it.
+ARCH = """
+import json, sys, torch, triton
+from atom.compass.capture import driverless
+driver = triton.runtime.driver
+driverless._declare_arch(sys.argv[1], "gfx1250")
+warps = [driver.active.get_current_target().warp_size]
+driverless.install(sys.argv[1], "gfx1250")
+warps.append(driver.active.get_current_target().warp_size)
+print(json.dumps([vars(torch.cuda.get_device_properties(0)), warps]))
+"""
+
+
+def test_the_declared_gfx1250_states_wave32_and_card_0_s_limits(tmp_path):
+    env = {**os.environ, "PYTHONPATH": str(TREE)}
+    done = subprocess.run(
+        [sys.executable, "-c", ARCH, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        cwd=TREE,
+        env=env,
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    props, warps = json.loads(done.stdout.splitlines()[-1])
+    # Card 0's reading, but for the CUs and memory AMD counts for B0.
+    b0 = {"multi_processor_count": 256, "total_memory": 432 << 30, "name": "gfx1250"}
+    assert props == A0["props"] | b0
+    assert warps == [32, 32]
