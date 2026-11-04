@@ -120,9 +120,9 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
 def left_group() -> int:
     """A process group this test started and whose one member has exited, for
     a stand-in engine's pid: `serve._stop` finds no member of it left. Not 0:
-    under `podman exec`, as the CPU gate runs, /proc shows every process the
-    exec started in group 0, this test among them, so a stop of group 0
-    waited `serve.STOP_GRACE_S` twice."""
+    under `podman exec`, as the CPU gate runs, /proc shows the exec's shell, an
+    ancestor of this test, in group 0, so a stop of group 0 waited
+    `serve.STOP_GRACE_S` twice."""
     leader = subprocess.Popen(["true"], start_new_session=True)
     leader.wait()
     return leader.pid
