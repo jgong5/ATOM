@@ -35,8 +35,7 @@ member, the frontend's included, connects to.
   shared memory when its ranks share a host
   (`atom.compass.runner.shm_collectives`).
 - `runner(runner, tree)` installs the cost backend and the device readings on a
-  `CompassModelRunner` where it would build its model, in the worker process,
-  and under DP puts the runner's DP group on shared memory the same way.
+  `CompassModelRunner` where it would build its model, in the worker process.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
   ``decode`` to the frontend's clock, at the rates the machine spec measured.
   A machine spec that refuses the tokenizer stops the run as a signal would,
@@ -1416,9 +1415,7 @@ def _named(inner):
 
 
 def runner(model_runner, tree) -> None:
-    """Install the cost backend and the device readings from the run file, and
-    at DP width above one put the runner's DP group on shared memory when its
-    ranks share a host (`shm_collectives`).
+    """Install the cost backend and the device readings from the run file.
 
     `tree` is the model built on the meta device, which the weights are read
     off."""
@@ -1673,14 +1670,6 @@ def runner(model_runner, tree) -> None:
     model_runner.compass_memory = record(readings, tokens=warmup, memory=measured)
     if bundle is not None:
         model_runner.compass_step_grid = {**bundle, "describe": backend.describe()}
-    if dp > 1:
-        # The DP group `start_on_host` built, which every rank's step uses.
-        from aiter.dist.parallel_state import get_dp_group
-
-        from atom.compass.runner import shm_collectives
-
-        shm_collectives.install()
-        shm_collectives.attach(get_dp_group().cpu_group)
 
 
 def ep_width(tree) -> int:

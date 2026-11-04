@@ -616,7 +616,9 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
     after the stages before it -- on gloo and with an empty custom group
     configuration, under which aiter builds no device communicator for any
     group. A simulated TP width is refused: it starts fewer workers than the
-    TP group `apply_simulated_tp` then reports on a device group.
+    TP group `apply_simulated_tp` then reports on a device group. In a simulated
+    run the DP group then runs its small collectives over shared memory when
+    its ranks share a host (`shm_collectives`).
     """
     pc = config.parallel_config
     if config.tp_world_size != config.tensor_parallel_size:
@@ -686,6 +688,15 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
         prefill_context_model_parallel_size=pcp,
         custom_group_config={},
     )
+    from atom.compass import run
+
+    if pc.data_parallel_size > 1 and run.spec() is not None:
+        from aiter.dist.parallel_state import get_dp_group
+
+        from atom.compass.runner import shm_collectives
+
+        shm_collectives.install()
+        shm_collectives.attach(get_dp_group().cpu_group)
 
 
 def _config_field(runner: Any, name: str) -> Any:

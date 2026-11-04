@@ -20,8 +20,9 @@ same call, so each makes the same choice. What comes back is gloo's bit for bit:
 does, MAX and MIN are exact in any order, and a float MAX or MIN that meets a
 NaN or a zero, whose sign gloo's order picks, is redone on gloo.
 
-A rank that has waited over a second checks its late peers' processes, and
-raises RuntimeError, as gloo does, once one has exited.
+A rank waiting for its peers yields its core, then sleeps between looks; about
+every second it checks its late peers' processes, and raises RuntimeError, as
+gloo does, once one has exited.
 """
 
 from __future__ import annotations
@@ -45,6 +46,10 @@ logger = logging.getLogger(__name__)
 ROW = 4096
 #: A rank's round sits alone on a cache line.
 LINE = 64
+#: A waiting rank's looks at its peers' rounds: yielding its core for the first
+#: `YIELDS`, then sleeping 0.1 ms between them, and checking its late peers'
+#: processes every `CHECK`, about a second.
+YIELDS, CHECK = 1000, 10000
 #: The types gloo reduces and numpy holds.
 _INTS = (torch.uint8, torch.int8, torch.int32, torch.int64)
 _FLOATS = (torch.float16, torch.float32, torch.float64)
@@ -70,17 +75,14 @@ class _Segment:
         raw = np.ascontiguousarray(a).reshape(-1).view(np.uint8)
         rows[self.rank, : raw.size] = raw
         rounds[self.rank] = self.round
-        start = checked = time.monotonic()
+        looks = 0
         while rounds.min() < self.round:
-            now = time.monotonic()
-            if now - checked > 1.0:
-                checked = now
+            looks += 1
+            if looks % CHECK == 0:
                 late = np.flatnonzero(rounds < self.round)
                 if gone := [int(r) for r in late if not _alive(self.pids[r])]:
                     raise RuntimeError(f"DP ranks {gone} of the group have exited")
-            # Yield for 10 ms, then sleep between looks, so a long wait for a
-            # peer does not hold a core.
-            os.sched_yield() if now - start < 0.01 else time.sleep(1e-4)
+            os.sched_yield() if looks < YIELDS else time.sleep(1e-4)
         out = rows[:, : raw.size].copy().view(a.dtype)
         return out.reshape((world, *a.shape))
 
@@ -159,25 +161,29 @@ def install() -> None:
     reduce, gather = dist.all_reduce, dist.all_gather
     SUM, MAX, MIN = dist.ReduceOp.SUM, dist.ReduceOp.MAX, dist.ReduceOp.MIN
 
-    def all_reduce(tensor, op=SUM, group=None, async_op=False):
-        segment = None if async_op else _GROUPS.get(group)
+    def all_reduce(*args, **kwargs):
+        call = dict(zip(("tensor", "op", "group", "async_op"), args), **kwargs)
+        tensor, op = call.get("tensor"), call.get("op", SUM)
+        segment = None if call.get("async_op") else _GROUPS.get(call.get("group"))
         fn = None
         if segment is not None and _fits(tensor):
             fn = np.max if op == MAX else np.min if op == MIN else None
             fn = np.sum if op == SUM and tensor.dtype in _INTS else fn
         if fn is None:
-            return reduce(tensor, op, group, async_op)
+            return reduce(*args, **kwargs)
         a = tensor.detach().numpy()
         rows = segment.exchange(a)
         if fn is not np.sum and rows.dtype.kind == "f" and not (abs(rows) > 0).all():
-            return reduce(tensor, op, group, async_op)
+            return reduce(*args, **kwargs)
         np.copyto(a, fn(rows, axis=0), casting="unsafe")
 
-    def all_gather(tensor_list, tensor, group=None, async_op=False):
-        segment = None if async_op else _GROUPS.get(group)
-        if segment is None or not _fits(tensor) or len(tensor_list) != segment.world:
-            return gather(tensor_list, tensor, group, async_op)
-        for out, row in zip(tensor_list, segment.exchange(tensor.detach().numpy())):
+    def all_gather(*args, **kwargs):
+        call = dict(zip(("tensor_list", "tensor", "group", "async_op"), args), **kwargs)
+        outs, tensor = call.get("tensor_list"), call.get("tensor")
+        segment = None if call.get("async_op") else _GROUPS.get(call.get("group"))
+        if segment is None or not _fits(tensor) or len(outs) != segment.world:
+            return gather(*args, **kwargs)
+        for out, row in zip(outs, segment.exchange(tensor.detach().numpy())):
             np.copyto(out.detach().numpy(), row.reshape(out.shape), casting="unsafe")
 
     dist.all_reduce, dist.all_gather = all_reduce, all_gather

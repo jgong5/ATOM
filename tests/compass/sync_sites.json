@@ -5814,6 +5814,78 @@
    "why": "a simulated run's worker sleeps here between its looks at the shared-memory ring, until its engine rings for the next call; this is where it is idle",
    "mechanism": "K6",
    "mechanism_why": "RPC between the engine and its workers inside one tensor-parallel group; the group is one LP, so this is not a wait across LPs"
+  },
+  {
+   "id": "atom/compass/runner/shm_collectives.py::_Segment.exchange::time.sleep(1e-4)::sleep#0",
+   "file": "atom/compass/runner/shm_collectives.py",
+   "symbol": "_Segment.exchange",
+   "call": "time.sleep",
+   "expr": "time.sleep(1e-4)",
+   "shape": "sleep",
+   "peer": "process",
+   "why": "a simulated run's DP rank, in a collective its node-local group runs over shared memory, waits for every peer's row: it yields its core for its first looks, then sleeps 0.1 ms between them, and about every second checks that its late peers' processes live",
+   "mechanism": "K6",
+   "mechanism_why": "the DP group's own collective, moved off gloo: a wait inside the data-parallel group's LP, never reported to the clock authority; the engine's clock owner settles its owed group rounds before the call, as before a gloo one"
+  },
+  {
+   "id": "atom/compass/runner/shm_collectives.py::attach::dist.all_reduce(token, group=group)::collective#0",
+   "file": "atom/compass/runner/shm_collectives.py",
+   "symbol": "attach",
+   "call": "dist.all_reduce",
+   "expr": "dist.all_reduce(token, group=group)",
+   "shape": "collective",
+   "peer": "process",
+   "why": "as a simulated run builds a DP group, its ranks pass rank 0's shared-memory segment name on gloo",
+   "mechanism": "K9",
+   "mechanism_why": "at startup, while the engine core or its worker is built and before its step loop's first clock request, so outside the simulated window"
+  },
+  {
+   "id": "atom/compass/runner/shm_collectives.py::attach::dist.all_gather(rows, me, group=group)::collective#0",
+   "file": "atom/compass/runner/shm_collectives.py",
+   "symbol": "attach",
+   "call": "dist.all_gather",
+   "expr": "dist.all_gather(rows, me, group=group)",
+   "shape": "collective",
+   "peer": "process",
+   "why": "as a simulated run builds a DP group, its ranks gather on gloo whether each mapped the segment, and each one's architecture, PID namespace and pid",
+   "mechanism": "K9",
+   "mechanism_why": "at startup, while the engine core or its worker is built and before its step loop's first clock request, so outside the simulated window"
+  },
+  {
+   "id": "atom/compass/runner/shm_collectives.py::install.all_reduce::reduce(*args, **kwargs)::collective#0",
+   "file": "atom/compass/runner/shm_collectives.py",
+   "symbol": "install.all_reduce",
+   "call": "reduce",
+   "expr": "reduce(*args, **kwargs)",
+   "shape": "collective",
+   "peer": "process",
+   "why": "the all_reduce a simulated DP process routes hands a call its group's shared memory leaves out to the all_reduce it wraps",
+   "mechanism": "K6",
+   "mechanism_why": "passes its caller's collective on unchanged, so the wait is the caller's, classified at the caller's own site; in a simulated run those are the DP groups' collectives, waits inside the data-parallel group's LP"
+  },
+  {
+   "id": "atom/compass/runner/shm_collectives.py::install.all_reduce::reduce(*args, **kwargs)::collective#1",
+   "file": "atom/compass/runner/shm_collectives.py",
+   "symbol": "install.all_reduce",
+   "call": "reduce",
+   "expr": "reduce(*args, **kwargs)",
+   "shape": "collective",
+   "peer": "process",
+   "why": "the all_reduce a simulated DP process routes hands a call its group's shared memory leaves out to the all_reduce it wraps",
+   "mechanism": "K6",
+   "mechanism_why": "passes its caller's collective on unchanged, so the wait is the caller's, classified at the caller's own site; in a simulated run those are the DP groups' collectives, waits inside the data-parallel group's LP"
+  },
+  {
+   "id": "atom/compass/runner/shm_collectives.py::install.all_gather::gather(*args, **kwargs)::collective#0",
+   "file": "atom/compass/runner/shm_collectives.py",
+   "symbol": "install.all_gather",
+   "call": "gather",
+   "expr": "gather(*args, **kwargs)",
+   "shape": "collective",
+   "peer": "process",
+   "why": "the all_gather a simulated DP process routes hands a call its group's shared memory leaves out to the all_gather it wraps",
+   "mechanism": "K6",
+   "mechanism_why": "passes its caller's collective on unchanged, so the wait is the caller's, classified at the caller's own site; in a simulated run those are the DP groups' collectives, waits inside the data-parallel group's LP"
   }
  ],
  "anchors": [

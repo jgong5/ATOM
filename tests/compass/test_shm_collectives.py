@@ -2,17 +2,19 @@
 """A simulated run's node-local DP group runs its small collectives over shared memory.
 
 Each rank is a thread on its own gloo group, built as ATOM builds the engine
-core's. An attached group returns what gloo returns, bit for bit; a call the
+core's, or as a simulated runner's `start_on_host` hands it on. An attached group returns what gloo returns, bit for bit; a call the
 module leaves out, and a group a rank cannot join, stay on gloo; a rank whose
 peer has exited raises, which ATOM's DP state sync reads as a shutdown.
 """
 
 import contextlib
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -24,9 +26,10 @@ from test_vertical_slice import _run_file
 import atom.utils.distributed.utils as dist_utils
 from atom.compass import run as compass_run
 from atom.compass.runner import shm_collectives
+from atom.compass.runner.overrides import start_on_host
 from atom.config import ParallelConfig
 from atom.model_engine.engine_core import DPEngineCoreProc
-from atom.utils import clock
+from atom.utils import CpuGpuBuffer, clock
 from tests.compass.held_ports import held_ports
 
 #: op, dtype, width, whether NaNs and zeros of either sign come up: ATOM's DP
@@ -212,7 +215,7 @@ def test_a_peer_that_exits_makes_atoms_state_sync_shut_down(on_ranks):
 
     (synced, shutting_down, waited), _ = on_ranks(2, rank)
     assert synced == (False, True, True) and shutting_down
-    assert 1.0 < waited < 5.0
+    assert waited < 10.0
 
 
 def test_a_simulated_dp_engine_core_syncs_its_state_over_shared_memory(
@@ -241,3 +244,54 @@ def test_a_simulated_dp_engine_core_syncs_its_state_over_shared_memory(
     with compass_run.engine(_deployment(dp=2, rank=0)):
         assert on_ranks(2, rank) == [((True, False, True), 1)] * 2
     assert ParallelConfig.stateless_init_dp_group is build
+
+
+def test_a_simulated_runner_puts_its_dp_group_on_shared_memory(
+    on_ranks, monkeypatch, tmp_path
+):
+    """`start_on_host` with aiter's group calls stood in, each thread's DP group its own."""
+    monkeypatch.setenv(compass_run.ENV, str(_run_file(tmp_path, data_parallel_size=2)))
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.dist.parallel_state",
+        SimpleNamespace(
+            init_distributed_environment=lambda **_: None,
+            initialize_model_parallel=lambda *_, **__: None,
+            get_dp_group=lambda: SimpleNamespace(cpu_group=local.group),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.dist.utils",
+        SimpleNamespace(get_distributed_init_method=lambda ip, p: f"tcp://{ip}:{p}"),
+    )
+    for name in ("Stream", "Event", "mem_get_info", "memory_allocated"):
+        monkeypatch.setattr(torch.cuda, name, getattr(torch.cuda, name))
+    monkeypatch.setattr(CpuGpuBuffer, "__init__", CpuGpuBuffer.__init__)
+    monkeypatch.delenv("MASTER_ADDR", raising=False)
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+
+    def rank(r, port):
+        config = SimpleNamespace(
+            tensor_parallel_size=1,
+            tp_world_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            pipeline_parallel_size=1,
+            master_addr="127.0.0.1",
+            port=port,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=2,
+                data_parallel_rank=r,
+                data_parallel_master_ip="127.0.0.1",
+                data_parallel_base_port=port,
+                _managed_distributed_store=False,
+            ),
+        )
+        with gloo_group(r, 2, port) as local.group:
+            start_on_host(SimpleNamespace(), 0, config)
+            t = torch.tensor([r])
+            dist.all_reduce(t, dist.ReduceOp.MAX, local.group)
+            return t.item(), shm_collectives._GROUPS[local.group].round
+
+    assert on_ranks(2, rank) == [(1, 1)] * 2
