@@ -89,6 +89,31 @@ def test_a_worker_sleeps_between_calls_and_takes_each_in_order():
     assert after - before < IDLE_S / 10, f"waiting took {after - before:.3f} CPU s"
 
 
+def test_a_call_enqueued_before_the_worker_binds_its_doorbell_is_taken():
+    """An engine enqueues its first call while its workers still build their
+    runners: the ring finds no doorbell bound, and the worker, which binds
+    it before its first look at the ring, still takes the call."""
+    writer = RingingQueue(1, 1, max_chunk_bytes=1 << 16)
+    worker = _worker(writer)
+    thread = threading.Thread(target=_loop, args=(worker,), daemon=True)
+    try:
+        writer.enqueue(("record", 0))
+        thread.start()
+        writer.enqueue(("exit",))
+        thread.join(10)
+        calls, alive = list(worker.runners[0].calls), thread.is_alive()
+    finally:
+        if thread.is_alive():  # asleep: the doorbell shut wakes it to the exit
+            worker.doorbell.socket.shutdown(socket.SHUT_RD)
+            thread.join(10)
+        if thread.ident is None:  # the first ring raised: no doorbell is bound
+            worker.rpc_broadcast_mq.close()
+            writer.close()
+        else:
+            _close(writer, worker)
+    assert ([n for n, _ in calls], alive) == ([0], False)
+
+
 def test_a_worker_signalled_while_it_sleeps_leaves_its_loop():
     """A signal whose handler runs `exit`, as the one `init_exit_handler`
     installs does, ends the loop of a worker asleep on its doorbell."""
