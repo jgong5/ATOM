@@ -530,7 +530,7 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         ``(arrival, seq)`` order; returns whether any was woken."""
         rt = self.rt
         with rt.lock:
-            if any(not rt.released[ch] <= rt.arrived[ch] for ch, _ in self.held):
+            if any(rt.unread[ch] for ch, _ in self.held):
                 return False
             out = sorted(
                 (a, seq, ch)
@@ -549,11 +549,7 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         rt = self.rt
         with rt.lock:
             return min(
-                (
-                    (seq, ch)
-                    for ch, got in rt.released.items()
-                    for seq in got - rt.arrived[ch]
-                ),
+                ((seq, ch) for ch, got in rt.unread.items() for seq in got),
                 default=None,
             )
 
