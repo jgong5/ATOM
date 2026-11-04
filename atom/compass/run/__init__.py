@@ -31,6 +31,9 @@ member, the frontend's included, connects to.
   same way, and maps every DP rank to the engine LP for the process-group
   check. The engine ignores SIGTERM from just before it says READY. The
   workers it starts sleep between its calls (`atom.compass.runner.doorbell`).
+  Under DP the group its engine core builds runs its small collectives over
+  shared memory when its ranks share a host
+  (`atom.compass.runner.shm_collectives`).
 - `runner(runner, tree)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
@@ -1263,7 +1266,9 @@ def engine(config):
     """Around the engine's construction in its process; a no-op context on a real run.
 
     At DP width above one, the process joins the engine LP as the member of its
-    DP rank, and its host collectives first join the group rounds it owes. A
+    DP rank, and its host collectives first join the group rounds it owes; the
+    DP group the engine core builds runs them over shared memory when its
+    ranks share a host (`shm_collectives`). A
     pipeline stage is the engine LP ``engine-pp<stage>``, or a prefill side's
     ``engine-P-pp<stage>``.
 
@@ -1287,6 +1292,7 @@ def engine(config):
             handoff = record / f"dp{rank}.handoff.jsonl"
             clock.stamp_pulls(pulls, handoff, time.monotonic_ns)
         return contextlib.nullcontext()
+    from atom.compass.runner import shm_collectives
     from atom.compass.runner.doorbell import sleeping_workers
     from atom.utils.distributed import utils
 
@@ -1306,11 +1312,17 @@ def engine(config):
     _member = f"dp{pc.data_parallel_rank}" if pc.data_parallel_size > 1 else None
     name = lp.name if _member is None else f"{lp.name}.{_member}"
     os.environ[NOW_ENV] = str(Path(run["out_dir"]) / NOW_FILE.format(name))
+    if _member is not None:
+        # Under the clock's wrap, so a call settles before it waits on its peers.
+        shm_collectives.install()
     clock.settle_before_collectives()
     if _member is not None and _offloads_to_lmcache_mp(config.kv_transfer_config):
         _park_before_dispatch()
     rt = _runtime(lp, run, _member, _PublishedClock)
-    return sleeping_workers(_ignoring_sigterm_from_ready(_named(_start_on_leaving(rt))))
+    inner = _ignoring_sigterm_from_ready(_named(_start_on_leaving(rt)))
+    if _member is not None:
+        inner = shm_collectives.attaching_engine_group(inner)
+    return sleeping_workers(inner)
 
 
 @contextlib.contextmanager
