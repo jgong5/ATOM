@@ -691,7 +691,6 @@ def test_a_pass_scans_only_the_open_stream_events(tmp_path):
     assert held_at_call == [0] * (n + 1)
 
 
-
 class ReportedDuringTheCall(ScriptedConn):
     """Grant ``k`` releases stream seq ``k - 1`` of request 0, the last one
     final; that event's report reaches the traffic LP's socket while the owner
@@ -755,6 +754,7 @@ def test_a_report_in_the_socket_at_its_grant_counts_without_a_turn_of_the_event_
     # Call k follows grant k; the loop first turns in the final event's hold,
     # after grant n.
     assert turns_at_call == [0] * n + [n]
+
 
 def test_a_raising_return_callback_does_not_stop_later_returns(tmp_path, caplog):
     async def main():
