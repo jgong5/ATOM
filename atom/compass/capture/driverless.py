@@ -245,7 +245,7 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
     }
     os.environ.update(flags)
     revision = read["revision"] if read else REVISIONS.get(arch, 0)
-    _declare_arch(tmpdir, arch, props.multi_processor_count, revision)
+    _declare_arch(tmpdir, arch, props.multi_processor_count, revision, props.warp_size)
     return {"cuda": sorted(cuda), "arch": arch, "flags": flags} | (
         {"card": read} if read else {}
     )
@@ -304,10 +304,10 @@ def driverless_mode(shape_env):
     return _DriverlessFakeTensorMode(shape_env=shape_env, allow_non_fake_inputs=True)
 
 
-def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None) -> None:
+def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None, warp=64) -> None:
     """Answer aiter's `rocminfo` shell-out and Triton's target query with `arch`,
     its `cus` and stepping `revision` `DEVICES` and `REVISIONS` declare unless
-    given."""
+    given, and its `warp` size."""
     cus = DEVICES[arch][0] if cus is None else cus
     revision = REVISIONS.get(arch, 0) if revision is None else revision
     import triton
@@ -325,7 +325,7 @@ def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None) -> None:
 
     class _DeclaredTarget:
         def get_current_target(self):
-            return GPUTarget("hip", arch, 64)
+            return GPUTarget("hip", arch, warp)
 
         def __getattr__(self, name):
             raise RuntimeError(f"a device-free capture has no Triton driver: {name}")

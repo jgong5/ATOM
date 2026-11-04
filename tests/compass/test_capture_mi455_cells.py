@@ -30,12 +30,20 @@ STEPS = [
     BatchView((RequestShape(512, 512, False),), produces_output=True),
     BatchView((RequestShape(512, 512, False),), produces_output=False),
 ]
-#: MI455 A0 as #2141's probe read it, its arch with the card's features.
+#: Card 0 of the MI455 A0 node as `driverless.card` read it on 2026-11-04.
 A0 = {"index": 0, "arch": "gfx1250", "revision": 0}
-A0["props"] = vars(driverless._props("gfx1250")) | {
+A0["props"] = {
+    "L2_cache_size": 4194304,
+    "gcnArchName": "gfx1250",
+    "major": 12,
+    "max_threads_per_multi_processor": 2048,
+    "minor": 5,
     "multi_processor_count": 192,
+    "name": "AMD Radeon Graphics",
+    "regs_per_multiprocessor": 131072,
+    "shared_memory_per_block": 327680,
     "total_memory": 309237645312,
-    "gcnArchName": "gfx1250:sramecc+:xnack-",
+    "warp_size": 32,
 }
 
 
@@ -150,3 +158,42 @@ def test_a_capture_answers_the_raw_device_queries_on_the_declared_device(tmp_pat
     )
     assert done.returncode == 0, done.stderr[-4000:]
     assert done.stdout.splitlines()[-1] == "0 True"
+
+
+#: What a capture that installed `A0` answers aiter, torch and Triton.
+DECLARED = """
+import json, os, subprocess, sys, torch, triton
+from atom.compass.capture import driverless
+driverless.install(sys.argv[1], "gfx1250", json.loads(sys.argv[2]))
+props = torch.cuda.get_device_properties(0)
+print(subprocess.run(["rocminfo"], capture_output=True, text=True).stdout)
+print(json.dumps({
+    "props": {k: getattr(props, k) for k in json.loads(sys.argv[2])["props"]},
+    "memory": torch.cuda.mem_get_info(),
+    "capability": torch.cuda.get_device_capability(),
+    "warp": triton.runtime.driver.active.get_current_target().warp_size,
+    "cus": os.environ["CU_NUM"]}))
+"""
+
+
+def test_a_capture_declares_a_card_s_reading_to_aiter_torch_and_triton(tmp_path):
+    env = {**os.environ, "PYTHONPATH": str(TREE)}
+    done = subprocess.run(
+        [sys.executable, "-c", DECLARED, str(tmp_path), json.dumps(A0)],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        cwd=TREE,
+        env=env,
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    *rocminfo, answered = done.stdout.strip().splitlines()
+    # aiter reads the stepping and CU count off its rocminfo.
+    assert "  Compute Unit: 192" in rocminfo and "  ASIC Revision: 0" in rocminfo
+    assert json.loads(answered) == {
+        "props": A0["props"],
+        "memory": [309237645312] * 2,
+        "capability": [12, 5],
+        "warp": 32,
+        "cus": "192",
+    }
