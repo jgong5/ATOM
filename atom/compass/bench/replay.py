@@ -93,7 +93,7 @@ def seat_states(builder, batch) -> None:
     other cache, and a dummy batch, which runs on scratch state, are left as
     they are."""
     cache = getattr(builder, "cache", None)
-    if batch.is_dummy_run or cache is None:
+    if cache is None or batch.is_dummy_run:
         return
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 
