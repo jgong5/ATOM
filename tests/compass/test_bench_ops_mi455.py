@@ -2,8 +2,9 @@
 """`compass measure ops --plan` on an MI455 card, with no device: a graph the
 store lacks is traced on the run's first GPU as that card reads, so its
 stepping and compute units pick the kernels, and `trace ops` holds an
-`--arch` beside `--gpu` to the card's. A point's batch finds DeepSeek-V4.1's
-per-request state where it wants it, though no forward built it.
+`--arch` beside `--gpu` to the card's. A point's second placement begins
+over the tentative state DeepSeek-V4.1's verify step left, which no sampler
+commits.
 """
 
 import os
@@ -61,11 +62,12 @@ def test_an_arch_beside_a_card_is_the_card_s(tmp_path, monkeypatch):
         assert stated["card"] == A0 and graph["structure"].split()[1] == "gfx1250"
 
 
-#: A point's batch on DeepSeek-V4.1's own cache, on the host of a declared
-#: gfx1250: a decode row verifying 5 drafts at 192 tokens, as the bench
-#: prepares one, with no forward to have advanced its state.
+#: Two placements of a point on DeepSeek-V4.1's own cache, on the host of a
+#: declared gfx1250: a decode row verifying 5 drafts at 192 tokens, its state
+#: seated there each time as `replay.seat_states` seats it, and no sampler to
+#: commit the first's tentative state before the second begins.
 STATE = """
-import sys
+import contextlib, sys
 from dataclasses import replace
 from atom.compass.capture import driverless
 driverless.install(sys.argv[1], "gfx1250")
@@ -82,20 +84,23 @@ config = DeepseekV41TextConfig(
     kv_source_layer_ids=(1, 3), index_source_layer_ids=(1, 3, 4),
     candidate_source_layer_id=3)
 geo = replace(geometry(config), window_size=32, speculative_tokens=5)
-cache = PagedAttentionCache(geo, 16, 4, "cpu")
 verify = PagedRequest(0, 192, 0, 6, 0, tuple(range(7)))
-try:
-    cache.prepare_state(begin_step(cache, [verify], tentative=True))
-except ValueError as refused:
-    print(refused)
-with ops._placed_state():
-    for _ in range(2):  # every placement of a point, none committed
-        cache.prepare_state(begin_step(cache, [verify], tentative=True))
-        print(int(cache.cursor[0, 0]), cache.pending is not None)
+for stand_in in (False, True):
+    cache = PagedAttentionCache(geo, 16, 4, "cpu")
+    try:
+        with ops._uncommitted() if stand_in else contextlib.nullcontext():
+            for _ in range(2):
+                cache.cursor[0, 0] = 192
+                cache.prepare_state(begin_step(cache, [verify], tentative=True))
+        print("placed twice")
+    except RuntimeError as refused:
+        print(refused)
 """
 
 
-def test_a_point_s_batch_finds_v41_state_where_it_wants_it(tmp_path):
+def test_a_point_s_second_placement_begins_over_the_first_s_tentative_state(
+    tmp_path,
+):
     env = {**os.environ, "PYTHONPATH": str(TREE)}
     done = subprocess.run(
         [sys.executable, "-c", STATE, str(tmp_path)],
@@ -106,7 +111,7 @@ def test_a_point_s_batch_finds_v41_state_where_it_wants_it(tmp_path):
         env=env,
     )
     assert done.returncode == 0, done.stderr[-4000:]
-    refused, *placed = done.stdout.strip().splitlines()[-3:]
-    # ATOM's own refusal, as on the card
-    assert refused.startswith("Request 0 needs state at 192, found 0")
-    assert placed == ["192 True"] * 2
+    refused, placed = done.stdout.strip().splitlines()[-2:]
+    # ATOM's own refusal on the second placement, where no sampler committed
+    assert refused.startswith("Commit the accepted prefix")
+    assert placed == "placed twice"
