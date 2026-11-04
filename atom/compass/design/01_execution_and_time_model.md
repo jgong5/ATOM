@@ -1546,7 +1546,12 @@ received tensors are in, and at the forward's exit, drained with `query()`, neve
 recording's engine process stamps the first input pull (`clock.idle`) and output put
 (`clock.relay_queue`'s queue) after each reply, `t_pull_ns` and `t_put_ns`, into
 `dp<rank>.pulls.jsonl` on the same monotonic clock; `parity.read` joins them to the
-steps (#1345).
+steps (#1345). It holds these stamps and its IO-thread handoff lines in memory and
+writes them when the engine leaves its loop or takes its SIGTERM, as a worker holds its
+step lines: a write on the loop is time the loop spends, and on a record kept on NFS the
+pull stamp's write, tens of microseconds after the put stamp's, blocked about 1 ms in
+most forwards, inside the `E` it opens
+([#2726](https://github.com/jgong5/ATOM/issues/2726)).
 
 **The recurrence's own check, provisional.** Fed each real record's measured device
 windows and host segments, and under MTP each forward's `L_mtp` measured as `09` D54
