@@ -37,7 +37,6 @@ import asyncio
 import logging
 import math
 import os
-import pickle
 
 import zmq
 import zmq.asyncio
@@ -233,28 +232,16 @@ class TrafficLP:
 
     async def _read_reports(self) -> None:
         while True:
-            self._take(await self._pull.recv_pyobj())
-
-    def _take_queued(self) -> None:
-        """Take the reports already queued without a turn of the event loop:
-        most reach the socket while the owner is blocked in a clock call."""
-        while True:
-            try:
-                frame = self._pull.recv(zmq.NOBLOCK).result()
-            except zmq.Again:
-                return
-            self._take(pickle.loads(frame))
-
-    def _take(self, report) -> None:
-        self._changed.set()
-        if len(report) == 1:  # a worker wrote this request's cancel
-            self._written.add(report[0])
-            return
-        key, seq, arrival, final = report
-        # A cancelled request's seq may be dropped already, before its report.
-        if key not in self.cancelled:
-            self.rt.check_arrival(self.stream, arrival, seq)
-        self._reports[seq] = (key, final)
+            report = await self._pull.recv_pyobj()
+            self._changed.set()
+            if len(report) == 1:  # a worker wrote this request's cancel
+                self._written.add(report[0])
+                continue
+            key, seq, arrival, final = report
+            # A cancelled request's seq may be dropped already, before its report.
+            if key not in self.cancelled:
+                self.rt.check_arrival(self.stream, arrival, seq)
+            self._reports[seq] = (key, final)
 
     async def _pass_returns(self) -> None:
         while True:
@@ -300,7 +287,6 @@ class TrafficLP:
             for task in self._tasks:
                 if task.done():
                     task.result()
-            self._take_queued()
             unreported, unreturned = [], []
             # A handled seq leaves the runtime's released set, so a pass scans
             # only the open events, not every event of the run. It stops at the
