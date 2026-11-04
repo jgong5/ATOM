@@ -95,8 +95,11 @@ def started(tmp_path, script) -> dict:
             check=False,
         )
     assert done.returncode == 1, done.stdout + done.stderr
+    # cctraces_sim.sh writes pd_sim.sh's output to pd_sim.log.
+    why = done.stderr + "".join(p.read_text() for p in out.glob("pd_sim.log"))
     sides = {}
     for side in ("prefill", "decode"):
+        assert (out / f"{side}.log").exists(), why
         argv, *lines = (out / f"{side}.log").read_text().splitlines()
         sides[side] = argv.split(), dict(e.split("=", 1) for e in lines if "=" in e)
     return sides
