@@ -65,23 +65,28 @@ def assembled(cache, rows, tokens):
 
 
 def prepared(built, batch):
-    """`batch`'s decode metadata and positions as ATOM's runner prepares them,
-    its state then judged as `prepare_model_inputs` judges it."""
+    """`batch`'s decode or prefill metadata and positions as ATOM's runner
+    prepares them, its state then judged as `prepare_model_inputs` judges it."""
     cu = built.model_runner.forward_vars["cu_seqlens_q"]
     lengths = [int(n) for n in batch.num_scheduled_tokens]
     cu.np[0], n = 0, len(lengths)
     cu.np[1 : n + 1] = np.cumsum(lengths)
     cu.copy_to_gpu(n + 1)
-    metadata, positions = built.prepare_decode(batch, n, sum(lengths), max(lengths))
+    if batch.total_seqs_num_prefill:
+        metadata, positions = built.prepare_prefill(batch, n, sum(lengths))
+    else:
+        metadata, positions = built.prepare_decode(batch, n, sum(lengths), max(lengths))
     built.cache.prepare_state(metadata.step)
     return metadata, positions
 
 
-def ops_placements(rule, seat):
-    """The op bench's placements of a two-row V4.1 decode point under `rule`,
-    over `test_bench_ops`'s state-only leaf with 8 state slots on the runner:
-    the state slots of each placement `Stub.point` prepared, and the refusal
-    that stopped them, if any. `seat` stands in for `replay.seat_states`."""
+def ops_placements(rule, seat, point=None, context=20, drafts=0):
+    """The op bench's placements of a V4.1 `point` under `rule`, a two-row
+    decode by default, at `context`, over `test_bench_ops`'s state-only leaf
+    with 8 state slots on the runner, on a cache of `drafts` speculative
+    tokens: the state slots of each placement `Stub.point` prepared, and the
+    refusal that stopped them, if any. `seat` stands in for
+    `replay.seat_states`."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -94,7 +99,9 @@ def ops_placements(rule, seat):
     from atom.compass.capture.forward import decode
     from atom.utils import forward_context as fctx
 
-    built = assembled(cache_of(0), 2, 2)
+    point = point or decode(2)
+    tokens = point.tokens * (1 + drafts if point.phase == "decode" else 1)
+    built = assembled(cache_of(drafts), point.seqs, tokens)
 
     class Runner(OpsRunner):
         """The stand-in runner, preparing its input through V4.1's builder."""
@@ -122,8 +129,9 @@ def ops_placements(rule, seat):
     real, replay.seat_states = replay.seat_states, seat
     refused = None
     try:
-        ops.Stub(runner, 1000).point(rule, decode(2), 20, found)
-    except ValueError as error:
+        got = ops.Stub(runner, 1000).point(rule, point, context, found)
+        refused = next((r["refused"] for r in got if "refused" in r), None)
+    except (ValueError, RuntimeError) as error:
         refused = str(error)
     finally:
         replay.seat_states = real
@@ -141,7 +149,7 @@ def main(root: pathlib.Path) -> None:
     from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 
     batches = pickle.loads((root / "batches.pkl").read_bytes())
-    plain = batches.pop("rule")
+    plain, drafted = batches.pop("rule"), batches.pop("drafted")
 
     def fresh():
         cache = cache_of()
@@ -232,6 +240,14 @@ def main(root: pathlib.Path) -> None:
 
     seen["ops"] = ops_placements(plain, replay.seat_states)
     seen["ops_unseated"] = ops_placements(plain, lambda *_: None)
+    from atom.compass.capture.forward import decode as width, prefill
+
+    # DSpark5's verify rows, tentative; a chunk past a cached prefix, scaled
+    # down from cell A's 2048 on 8192 to the cache's 64 PAGEs
+    seen["ops_verify"] = ops_placements(
+        drafted, replay.seat_states, width(2), 20, DRAFTS
+    )
+    seen["ops_prefill"] = ops_placements(plain, replay.seat_states, prefill(32, 1), 128)
 
     from atom.compass.bench.runner import BenchModelRunner
     from atom.compass.parity.runner import RecordingModelRunner

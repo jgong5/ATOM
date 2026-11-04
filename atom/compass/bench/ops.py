@@ -11,8 +11,8 @@
 Each shape names the `op_graph` `compass trace ops` published in S for the
 model and TP width ATOM's arguments resolve. A point is one leaf of that graph,
 its instances grouped (`leaves`), at the shape and `--context`: a decode
-step's rows each hold `--context` tokens, and a prefill's rows, split as the
-capture split them, follow `--context` cached tokens each, none when it is not
+step's rows each hold `--context` tokens, under a drafter verifying as many
+more as it drafts, and a prefill's rows, split as the capture split them, follow `--context` cached tokens each, none when it is not
 given. Rows the KV pool cannot hold at once are ragged (`point_rows`), and the
 point records its rows; under `--plan` over ragged decode steps a decode point
 the pool cannot hold refuses instead, past the first round (`RAGGED`).
@@ -114,8 +114,8 @@ parallel layout, the digest of the machine spec of the device, stack and PTL
 state run.json reads, the source root and the point.
 
 `--plan` measures, in rounds, the points the steps of record directories call
-for (`record`'s or `trace steps`' output), capturing each `op_graph` S lacks
-on the run's first GPU as it reads (`_capture`):
+for (`record`'s or `trace steps`' output), capturing each `op_graph` S
+lacks on the run's first GPU as it reads (`_capture`):
 every leaf at every rung of ATOM's decode ladder at the steps' lowest and
 highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
@@ -759,7 +759,9 @@ class Stub:
         uncut = os.environ.get(RAGGED) and not all(
             exchange(o) for o, _ in found.values()
         )
-        rows = point_rows(shape, context, pool, rule.block_size, bool(uncut))
+        rows = point_rows(
+            shape, context, pool, rule.block_size, bool(uncut), rule.drafts
+        )
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
         view = {"rows": rows, "produces_output": True}
@@ -1214,19 +1216,21 @@ def _uncommitted():
 
 
 def point_rows(
-    shape, context, pool: int, block_size: int, uncut: bool = False
+    shape, context, pool: int, block_size: int, uncut: bool = False, drafts: int = 0
 ) -> list[list] | None:
     """A point's rows, `[query, context, decodes]` each, longest first: a decode
-    row holds `context` tokens; a prefill row its query tokens, the capture's
-    split, past `context` cached ones. When they need more than the `pool`'s
-    KV blocks, the first keeps its context and each other shares what it
-    leaves, as the rows of a ragged step do. A ragged decode point's rows
+    row holds `context` tokens and, under a drafter of `drafts`, verifies as
+    many more, as the capture's rows do; a prefill row its query tokens, the
+    capture's split, past `context` cached ones. When they need more than the
+    `pool`'s KV blocks, the first keeps its context and each other shares what
+    it leaves, as the rows of a ragged step do. A ragged decode point's rows
     (`_split`) are its first row's context and, past it, rows of at least a
     token each that hold its mean; None when they need more than the pool, as
     a decode point's are when `uncut`."""
     decode = shape.phase == "decode"
     context, mean = _split(context)
     per, extra = divmod(shape.tokens, shape.seqs)
+    per += drafts if decode else 0
     past = context - 1 if decode else context or 0
     rows = [
         [q, q + past, decode] for q in (per + (i < extra) for i in range(shape.seqs))
