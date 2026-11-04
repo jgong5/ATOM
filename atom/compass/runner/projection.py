@@ -235,10 +235,12 @@ def image_tokens(batch: Any, runner: Any) -> int:
     handles them. With embedding spans, a payload still carrying pixel values
     encodes every span on this chunk, even one that fills none; a later chunk
     fills the spans it overlaps. Without spans, the image's embeddings sit at
-    the model's image token."""
+    the model's image token; a batch with no multimodal data has none."""
+    media = getattr(batch, "multimodal_data", None)
+    if not media:
+        return 0
     from atom.model_engine.multimodal_runtime import embedding_indices
 
-    media = getattr(batch, "multimodal_data", None) or {}
     count, offset = 0, 0
     for req, length, end in zip(
         batch.req_ids, batch.num_scheduled_tokens, batch.context_lens
