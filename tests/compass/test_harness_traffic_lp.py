@@ -712,7 +712,9 @@ class ReportedDuringTheCall(ScriptedConn):
             seq = self.k
             last = seq == self.grants - 1
             self.push.send_pyobj((_key(0), seq, float(seq + 1), last))
+            deadline = time.monotonic() + 5
             while not self.pull.get(zmq.EVENTS) & zmq.POLLIN:
+                assert time.monotonic() < deadline, f"seq {seq}'s report never arrived"
                 time.sleep(0.001)
             asyncio.get_running_loop().call_soon(self.turns.append, seq)
         return super().recv()
