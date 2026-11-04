@@ -4,8 +4,9 @@ under its own flags and environment, and from what each server was started
 with, `keyed` picks that side's entry of DeepSeek-V4-Pro's two DPA8 laws.
 
 `python3` is stubbed on `PATH`: an API server prints its arguments and its
-environment to its log and waits, and the clock authority only listens. Nothing
-needs a driver.
+environment to its log and then answers `/health`, and the clock authority only
+listens. The router binary is `false`: the script exits 1 once both servers have
+answered, never on a timeout. Nothing needs a driver.
 """
 
 import ast
@@ -45,7 +46,11 @@ DECODE_SIZES = "[1,2," + ",".join(map(str, range(4, 257, 4))) + "]"
 DEFAULT_SIZES = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
 PYTHON3 = f"""#!/bin/sh
 case "$2" in
-atom.entrypoints.openai_server) echo "$@"; env; exec sleep 60 ;;
+atom.entrypoints.openai_server) echo "$@"; env; exec {sys.executable} -c 'import sys
+from http.server import BaseHTTPRequestHandler as B, HTTPServer
+B.do_GET = lambda h: (h.send_response(200), h.end_headers())
+port = int(sys.argv[sys.argv.index("--server-port") + 1])
+HTTPServer(("127.0.0.1", port), B).serve_forever()' "$@" ;;
 atom.compass.run) exec {sys.executable} -c 'import socket, sys, time
 s = socket.create_server(("127.0.0.1", int(sys.argv[1].rsplit(":", 1)[1])))
 time.sleep(60)' "$6" ;;
@@ -76,15 +81,17 @@ def started(tmp_path, script) -> dict:
         MODEL=str(tmp_path),
         TRACES=str(tmp_path / "traces.jsonl"),
         HARNESS_PYTHON=str(bin_ / "harness"),
-        WAIT_S="2",
+        ATOMESH="false",
+        WAIT_S="60",
         PREFILL_ARGS="--enable-tbo",
         DECODE_ARGS=f"--cudagraph-capture-sizes {DECODE_SIZES}",
         PREFILL_ENV=" ".join(f"{k}={v}" for k, v in PREFILL_ENV.items()),
         DECODE_ENV=" ".join(f"{k}={v}" for k, v in DECODE_ENV.items()),
     )
     args = [out / "run.json"] + ([out] if script == "cctraces_sim.sh" else [])
-    with held_ports(3) as ports:
-        env.update(zip(("CLOCK_PORT", "PREFILL_PORT", "DECODE_PORT"), map(str, ports)))
+    with held_ports(4) as ports:
+        names = ("CLOCK_PORT", "PREFILL_PORT", "DECODE_PORT", "ROUTER_PORT")
+        env.update(zip(names, map(str, ports)))
         done = subprocess.run(
             ["bash", str(TREE / "scripts/compass" / script), *map(str, args)],
             env=env,
