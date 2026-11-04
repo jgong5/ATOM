@@ -542,7 +542,9 @@ def test_timers_fire_at_their_own_times_and_in_arming_order_when_due_together(
         shift = min(d for _, d, g in armed if g == "g2") - 0.125
         scheduler.cap_pending_delay_for_group("g2", 0.125)
         due = {k: d - shift if g == "g2" else d for k, d, g in armed}
-        while len(fired) < len(due):
+        for _ in range(100 * len(due)):
+            if len(fired) == len(due):
+                break
             await asyncio.sleep(0)
             if clock.waits:
                 clock.grant()
