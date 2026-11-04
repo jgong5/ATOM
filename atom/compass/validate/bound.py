@@ -406,15 +406,19 @@ def _build(model: str, tp: int, atom_args, arch: str, tmpdir: str):
 
 def walked(atom_args, arch: str) -> list:
     """The modules `run.modules.walk` reads off the model a server's ATOM
-    arguments `atom_args` build, `arch` declared. It declares a device
+    arguments `atom_args` build, `arch` declared, and off its block drafter
+    (`run.modules.drafter`), as a simulated run walks them. It declares a device
     process-wide, so it runs in a process of its own."""
     from atom.compass.drive import runfile
-    from atom.compass.run.modules import walk
+    from atom.compass.run.modules import drafter, walk
 
     engine, kept = runfile._engine_args(atom_args), runfile.engine_only(atom_args)
     with tempfile.TemporaryDirectory(prefix="compass-walk-") as tmpdir:
-        _, tree = _build(engine.model, engine.tensor_parallel_size, kept, arch, tmpdir)
-    return walk(tree)
+        config, tree = _build(
+            engine.model, engine.tensor_parallel_size, kept, arch, tmpdir
+        )
+        drafted = drafter(config)
+    return walk(tree, drafted)
 
 
 def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=None):
