@@ -113,7 +113,8 @@ parallel layout, the digest of the machine spec of the device, stack and PTL
 state run.json reads, the source root and the point.
 
 `--plan` measures, in rounds, the points the steps of record directories call
-for (`record`'s or `trace steps`' output), capturing each `op_graph` S lacks:
+for (`record`'s or `trace steps`' output), capturing each `op_graph` S lacks
+on the run's first GPU as it reads (`_capture`):
 every leaf at every rung of ATOM's decode ladder at the steps' lowest and
 highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
@@ -2404,7 +2405,9 @@ def _load(store, config, root, shapes, graphs: dict, arch=None, atom_args=()) ->
 
 def _capture(config, shapes, root, arch=None, atom_args=()) -> None:
     """`trace ops` of `shapes` under ATOM's arguments `atom_args` into the store
-    at `root`, in a process of its own that sees no GPU."""
+    at `root`, in a process of its own that sees no GPU, on a declared `arch`,
+    or with none on this run's first GPU as it reads (`trace ops --gpu`): its
+    stepping and compute units pick kernels as they do on the card."""
     from atom.compass import capture
     from atom.compass.capture.forward import device_arch
     from atom.model_engine.arg_utils import EngineArgs
@@ -2412,6 +2415,8 @@ def _capture(config, shapes, root, arch=None, atom_args=()) -> None:
     engine = EngineArgs.add_cli_args(FlexibleArgumentParser()).parse_args(atom_args)
     argv = ["--model", config.model, "--tp", str(engine.tensor_parallel_size)]
     argv += ["--arch", arch or device_arch()]
+    if not arch:  # the card read by its HIP ordinal, which ROCm indexes alike
+        argv += ["--gpu", os.environ.get("HIP_VISIBLE_DEVICES", "0").split(",")[0]]
     for s in shapes:
         argv += ["--prefill", str(s.tokens)] if s.phase == "prefill" else ["--width"]
         argv.append(str(s.seqs))

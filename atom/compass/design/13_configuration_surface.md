@@ -191,7 +191,7 @@ with the `spec` package and per-machine scripts (`05` D26). A user passes one by
 compass record         [--host H]             --out D -- <ATOM args>          [GPU]
 compass trace steps    <backend> --machine M  --out D --store S -- <ATOM args>
 compass trace ops      --model M [--tp N] [--width W]... [--prefill T B]... \
-                       [--population D]... [--arch A | --gpu G] --store S [-- <ATOM args>]
+                       [--population D]... [--arch A] [--gpu G] --store S [-- <ATOM args>]
 compass measure steps  [<batches>...] [--grid <population>... --grid-definition F] \
                        <sample> --sampling P --out D --store S -- <ATOM args> [GPU]
 compass measure ops    [--width W]... [--prefill T B]... [--context C] --llc-mib M \
