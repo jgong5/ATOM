@@ -117,6 +117,17 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
     assert len(copy_["members"]) == 2
 
 
+def left_group() -> int:
+    """A process group this test started and whose one member has exited, for
+    a stand-in engine's pid: `serve._stop` finds no member of it left. Not 0:
+    under `podman exec`, as the CPU gate runs, /proc shows every process the
+    exec started in group 0, this test among them, so a stop of group 0
+    waited `serve.STOP_GRACE_S` twice."""
+    leader = subprocess.Popen(["true"], start_new_session=True)
+    leader.wait()
+    return leader.pid
+
+
 def a_start(tmp_path, monkeypatch, stack):
     """The suite's TP2 worker and `main`'s arguments for a start on GPU 5 under
     `stack`, its engine and identity stood in for: the command reads `stack`, the
@@ -131,7 +142,7 @@ def a_start(tmp_path, monkeypatch, stack):
     monkeypatch.setattr(aiter_jit, "_roots", lambda: roots)
 
     class Engine:
-        pid = 0
+        pid = left_group()
 
         def __init__(self, *args, **kwargs):
             (tmp_path / "hip").write_text(kwargs["env"]["HIP_VISIBLE_DEVICES"])
@@ -546,7 +557,7 @@ def starts_autotuning(monkeypatch, r, out, autotuned, field="autotuned_kernels")
     left, envs = list(autotuned), []
 
     class Engine:
-        pid = 0
+        pid = left_group()
 
         def __init__(self, *args, env, **kwargs):
             envs.append(env)
