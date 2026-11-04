@@ -12,9 +12,10 @@ Each shape names the `op_graph` `compass trace ops` published in S for the
 model and TP width ATOM's arguments resolve. A point is one leaf of that graph,
 its instances grouped (`leaves`), at the shape and `--context`: a decode
 step's rows each hold `--context` tokens, under a drafter verifying as many
-more as it drafts, and a prefill's rows, split as the capture split them, follow `--context` cached tokens each, none when it is not
-given. Rows the KV pool cannot hold at once are ragged (`point_rows`), and the
-point records its rows; under `--plan` over ragged decode steps a decode point
+more as it drafts, and a prefill's rows, split as the capture split them,
+follow `--context` cached tokens each, none when it is not given. Rows the KV
+pool cannot hold at once are ragged (`point_rows`), and the point records its
+rows; under `--plan` over ragged decode steps a decode point
 the pool cannot hold refuses instead, past the first round (`RAGGED`).
 
 ATOM's runner is built from ATOM's arguments on each GPU `--gpu` names, one
