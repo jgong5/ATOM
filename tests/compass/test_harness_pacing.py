@@ -52,9 +52,10 @@ from aiperf.plugin.enums import TimingMode
 from aiperf.timing.config import CreditPhaseConfig
 from aiperf.timing.request_cancellation import RequestCancellationConfig
 from aiperf.timing.trajectory_source import TrajectorySource
-from compass_harness import scheduler as scheduler_module
 from compass_harness.scheduler import ClockPacedLoopScheduler
 from compass_harness.strategy import CompassAgenticReplay
+
+from compass_harness import scheduler as scheduler_module
 
 AIPERF = Path(aiperf.__file__).parent
 T0 = 1000.0
