@@ -646,7 +646,8 @@ class Stub:
         from atom.utils.forward_context import get_forward_context
 
         self.runner._gate_staging_reuse()
-        input_ids = self.runner.prepare_model(batch)[0]
+        with _placed_state():
+            input_ids = self.runner.prepare_model(batch)[0]
         self.runner._mark_staging_h2d_enqueued()
         fc, live = get_forward_context(), {"input_ids": input_ids, **self.topk}
         if self.csa is not None:
@@ -1188,6 +1189,38 @@ def _routing(loads) -> dict:
         "activated": [sum(n > 0 for n in load) for load in loads],
         "max_load": [max(load) for load in loads],
     }
+
+
+@contextlib.contextmanager
+def _placed_state():
+    """DeepSeek-V4.1's per-request state, when its cache is loaded, as a batch
+    whose earlier tokens no forward ran needs it: each request's state stands
+    where its step wants it (`PagedAttentionCache.prepare_state`), as that
+    forward would have left it, and a step's tentative state, which no
+    sampler here commits, is dropped before the next (`require_committed`)."""
+    v41 = sys.modules.get("atom.model_ops.attentions.deepseek_v41.cache")
+    if v41 is None:
+        yield
+        return
+    cls = v41.PagedAttentionCache
+    prepare_state = cls.prepare_state
+
+    def placed(cache, step, **kwargs):
+        n = step.scheduled_bs
+        resumes = torch.as_tensor(step.request_cached_until[:n])
+        starts = torch.as_tensor(step.request_positions[:n])
+        wanted = torch.where(resumes > 0, resumes, starts)
+        cache.cursor[step.slots[:n], 0] = wanted.to(cache.cursor)
+        return prepare_state(cache, step, **kwargs)
+
+    def dropped(cache):
+        cache.pending = None
+
+    with (
+        patch.object(cls, "prepare_state", placed),
+        patch.object(cls, "require_committed", dropped),
+    ):
+        yield
 
 
 def point_rows(
