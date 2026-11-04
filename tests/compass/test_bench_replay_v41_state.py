@@ -4,11 +4,12 @@
 V4.1's `PagedAttentionCache` keeps each state slot's position and refuses a
 request whose state is not where its forward starts. Each replayed row is a
 new request in a fresh pool, so unseated, every decode row, and every prefill
-row past a cached context, is refused at its first forward. The batches are
-the replay rule's, over `test_filler_tokens`'s tokenizer, for a V4.1 engine
-under a DSpark drafter of five drafts, as cell A runs; ATOM's cache judges them
-in a process of its own (`v41_state_probe.py`), since its module needs a
-declared device to import.
+row past a cached context, is refused at its first forward: by the step
+bench, and by the op bench at each placement it prepares. The batches are the
+replay rule's, over `test_filler_tokens`'s tokenizer, for a V4.1 engine under
+a DSpark drafter of five drafts, as cell A runs, and, for the op bench, with
+no drafter; ATOM's cache judges them in a process of its own
+(`v41_state_probe.py`), since its module needs a declared device to import.
 """
 
 import json
@@ -46,24 +47,29 @@ LINES = {
 OUTPUT = {"decode": True, "prefix": True, "chunks": False, "prompt": True}
 
 
-@pytest.fixture(scope="module")
-def probed(model_dir, tmp_path_factory):  # noqa: F811
-    """Each line's batch, and what V4.1's cache saw of it (`v41_state_probe`)."""
+def v41_rule(model_dir, drafter):  # noqa: F811
+    """The replay rule for a V4.1 engine over 64 blocks of 32 tokens, one state
+    slot a request, under `drafter`."""
     built = _config(
-        blocks=64,
-        speculative_config=spec(WIDTH - 1, True),
-        pool_entries_per_req={"state": 1},
+        blocks=64, speculative_config=drafter, pool_entries_per_req={"state": 1}
     )
     built.model, built.trust_remote_code = str(model_dir), False
     built.kv_cache_block_size = 32
     built.hf_config = SimpleNamespace(model_type="deepseek_v41_text")
-    rule = replay.ReplayRule(built)
+    return replay.ReplayRule(built)
+
+
+@pytest.fixture(scope="module")
+def probed(model_dir, tmp_path_factory):  # noqa: F811
+    """Each line's batch, and what V4.1's cache saw of it (`v41_state_probe`)."""
+    rule = v41_rule(model_dir, spec(WIDTH - 1, True))
     batches = {
         name: rule.batch({"rows": rows, "produces_output": OUTPUT[name]})
         for name, rows in LINES.items()
     }
     root = tmp_path_factory.mktemp("v41_state")
-    (root / "batches.pkl").write_bytes(pickle.dumps(batches))
+    plain = v41_rule(model_dir, None)
+    (root / "batches.pkl").write_bytes(pickle.dumps(batches | {"rule": plain}))
     done = subprocess.run(
         [sys.executable, str(PROBE), str(root)],
         capture_output=True,
@@ -124,9 +130,45 @@ def test_every_repeat_is_seated_again_after_a_forward_moves_the_state(probed):
 
 @pytest.mark.parametrize("name", ["prefix", "chunks", "prompt"])
 def test_a_replayed_prefill_row_starts_where_its_cached_context_ends(probed, name):
-    """A fresh prompt is seated at 0 and reset there, as a new request is."""
+    """Past a cached prefix a row's slot is kept as it stands; a fresh prompt
+    starts at 0 and its slot is reset there, as a new request's is, whatever
+    was seated."""
     batches, seen = probed
-    assert seen[name] == {"refused": None, "positions": cached(batches[name])}
+    assert seen[name] == {
+        "refused": None,
+        "positions": cached(batches[name]),
+        "reset": name == "prompt",
+    }
+
+
+def test_v41s_own_builder_starts_each_seated_verify_row_where_it_was_seated(
+    probed,
+):
+    """Prepared as ATOM's runner prepares a decode, each verify row starts at
+    `context_lens - (K + 1)`, where the bench seated it."""
+    _, seen = probed
+    assert "needs state at 202, found 0" in seen["builder"]["unseated"]
+    assert seen["builder"]["seated"] is None
+
+
+def test_every_op_bench_placement_is_seated_in_the_slots_it_is_given(probed):
+    """`Stub.point` gives each placement the next two of 8 state slots: past
+    the first, a row's slot is not its batch row, and every placement passes
+    the check only when its own slots are seated."""
+    _, seen = probed
+    ops = seen["ops"]
+    assert ops["refused"] is None
+    assert ops["slots"][:4] == [[0, 1], [2, 3], [4, 5], [6, 7]]
+    unseated = seen["ops_unseated"]
+    assert unseated["slots"] == [[0, 1]]
+    assert "needs state at 19, found 0" in unseated["refused"]
+
+
+def test_the_step_bench_seats_a_batch_before_the_forward_below_it(probed):
+    """`BenchModelRunner.forward` seats the rows, then calls the recording
+    runner's forward, which opens the window."""
+    batches, seen = probed
+    assert seen["runner"] == [cached(batches["decode"])]
 
 
 def test_a_dummy_batch_and_a_cache_that_keeps_no_position_are_left_alone(probed):

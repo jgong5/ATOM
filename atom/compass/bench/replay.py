@@ -39,9 +39,10 @@ them the same way for every line:
 - Under a model whose cache keeps each state slot's position and refuses a
   row whose state stands elsewhere, DeepSeek-V4.1's, each row's state stands
   at its cached context, where a request that reached it leaves it:
-  `seat_states` sets that position on each worker before each forward, ahead
-  of the bench's window. Only the position is set; the slot's rows and
-  history hold what they hold, as a row's KV blocks hold what the pool does.
+  `seat_states` sets that position, on each worker before each forward of the
+  step bench, ahead of its window, and before the op bench prepares each
+  placement. Only the position is set; the slot's rows and history hold what
+  they hold, as a row's KV blocks hold what the pool does.
 - A prefill line that produces output has every row on its final chunk, one
   that does not has none: a line does not say which of its chunks ends a
   prompt, and ATOM's runner samples every row of a step that produces output.

@@ -6,12 +6,18 @@
 `test_bench_replay_v41_state.py` runs it. The cache's module reads the device's
 FP8 at import, so the process first declares a gfx950 device as a capture does
 (`capture.driverless.install`), which reaches no device and is process-global;
-the cache itself is ATOM's, on the host. The batches are the replay rule's,
-pickled by name into `ROOT/batches.pkl`; what each scenario saw goes to
-`ROOT/probed.json`. Each step spans a batch as
-`DeepseekV41MetadataBuilder._prepare` spans one: each row a request from its
-forward's first token, `context_lens - num_scheduled_tokens`, in the slot it
-commits to.
+the cache itself is ATOM's, on the host. The batches, and the rule of an engine
+with no drafter, are the replay rule's, pickled into `ROOT/batches.pkl`; what
+each scenario saw goes to `ROOT/probed.json`.
+
+Most scenarios span a batch as `DeepseekV41MetadataBuilder._prepare` spans
+one: each row a request from its forward's first token,
+`context_lens - num_scheduled_tokens`, in the slot it commits to. `builder` and
+`ops` prepare it through ATOM's own builder (`prepare_decode`), assembled by
+hand as `tests/attentions/deepseek_v41` assembles it; `ops` drives the op
+bench's `Stub.point` beside `test_bench_ops`'s stand-in runner, each placement
+at the state slots `point` gives it; `runner` calls the step bench's
+`BenchModelRunner.forward` with the forward below it recorded.
 """
 
 import json
@@ -21,8 +27,107 @@ import sys
 import tempfile
 from types import SimpleNamespace
 
+import numpy as np
+
 #: The cache's PAGE, the replay rule's block size; DSpark5's drafts.
 BLOCK, DRAFTS = 32, 5
+
+
+def cache_of(drafts=DRAFTS):
+    """ATOM's V4.1 cache on the host: 64 PAGEs, 8 state slots."""
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
+        V41PoolGeometry,
+    )
+
+    geometry = V41PoolGeometry(
+        2, ((1, 2),), BLOCK, 8, 512, 32, speculative_tokens=drafts
+    )
+    return PagedAttentionCache(geometry, 64, 8, "cpu")
+
+
+def assembled(cache, rows, tokens):
+    """V4.1's builder over `cache`, assembled by hand, its buffers for `rows`
+    requests of `tokens` tokens in all."""
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+    from tests.attentions.deepseek_v41.helpers import metadata_buffers
+
+    built = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    built.geometry, built.device, built.block_size = cache.geometry, "cpu", BLOCK
+    built.cache, built.score_workspace = cache, None
+    built.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(rows, tokens, 8, "cpu", cache.geometry),
+        tokenID_processor=SimpleNamespace(num_rejected=None),
+    )
+    return built
+
+
+def prepared(built, batch):
+    """`batch`'s decode metadata and positions as ATOM's runner prepares them,
+    its state then judged as `prepare_model_inputs` judges it."""
+    cu = built.model_runner.forward_vars["cu_seqlens_q"]
+    lengths = [int(n) for n in batch.num_scheduled_tokens]
+    cu.np[0], n = 0, len(lengths)
+    cu.np[1 : n + 1] = np.cumsum(lengths)
+    cu.copy_to_gpu(n + 1)
+    metadata, positions = built.prepare_decode(batch, n, sum(lengths), max(lengths))
+    built.cache.prepare_state(metadata.step)
+    return metadata, positions
+
+
+def ops_placements(rule, seat):
+    """The op bench's placements of a two-row V4.1 decode point under `rule`,
+    over `test_bench_ops`'s state-only leaf with 8 state slots on the runner:
+    the state slots of each placement `Stub.point` prepared, and the refusal
+    that stopped them, if any. `seat` stands in for `replay.seat_states`."""
+    import torch
+
+    here = pathlib.Path(__file__).parent
+    sys.path[:0] = [str(here), str(here.parent)]  # its flat imports and conftest
+    from test_bench_ops import KEY, _graph, _leaf, _state, _t
+    from test_bench_ops import _Runner as OpsRunner
+
+    from atom.compass import ir
+    from atom.compass.bench import ops, replay
+    from atom.compass.capture.forward import decode
+    from atom.utils import forward_context as fctx
+
+    built = assembled(cache_of(0), 2, 2)
+
+    class Runner(OpsRunner):
+        """The stand-in runner, preparing its input through V4.1's builder."""
+
+        attn_metadata_builder = built
+
+        def prepare_model(self, batch):
+            self.batches.append(list(batch.state_slots_committed))
+            metadata, positions = prepared(built, batch)
+            fctx._forward_context = fctx.ForwardContext(
+                attn_metadata=metadata, context=fctx.Context(positions=positions)
+            )
+            return torch.zeros(len(positions), dtype=torch.int32), None
+
+    runner = Runner()
+    runner.pool_plan = SimpleNamespace(entries={"state": 8})
+    runner.config.pool_entries_per_req = {"state": 1}
+    runner.kv_held = _state((16,))
+    fctx._forward_kv_cache_context.kv_cache_data = {}
+    ops.Stub._time = lambda *_: {"cold_ns": 1.0}
+    state = _t([8, 16], "kv", stride=[64, 1])
+    args = ("kv", _t([2, 4], "activation")), ("kv_state", state), ("score", state)
+    leaf = _leaf("v4.states", *args, ("layer", ir.ContextRef(KEY)), key=KEY)
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    real, replay.seat_states = replay.seat_states, seat
+    refused = None
+    try:
+        ops.Stub(runner, 1000).point(rule, decode(2), 20, found)
+    except ValueError as error:
+        refused = str(error)
+    finally:
+        replay.seat_states = real
+    return {"slots": runner.batches, "refused": refused}
 
 
 def main(root: pathlib.Path) -> None:
@@ -33,17 +138,13 @@ def main(root: pathlib.Path) -> None:
     import torch
 
     from atom.compass.bench import replay
-    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
-    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
-        V41PoolGeometry,
-    )
 
     batches = pickle.loads((root / "batches.pkl").read_bytes())
-    geo = V41PoolGeometry(2, ((1, 2),), BLOCK, 8, 512, 32, speculative_tokens=DRAFTS)
+    plain = batches.pop("rule")
 
     def fresh():
-        cache = PagedAttentionCache(geo, 64, 8, "cpu")
+        cache = cache_of()
         return cache, SimpleNamespace(cache=cache)
 
     def step(cache, batch, **kwargs):
@@ -113,12 +214,37 @@ def main(root: pathlib.Path) -> None:
 
     for name in ("prefix", "chunks", "prompt"):
         cache, builder = fresh()
+        cache.state_bytes.fill_(57)
         batch = batches[name]
         replay.seat_states(builder, batch)
         seen[name] = {
             "refused": judged(cache.prepare_state, step(cache, batch)),
             "positions": positions(cache, batch),
+            # every byte of the rows' slots rewritten: a new request's reset
+            "reset": bool((cache.state_bytes[batch.state_slots_committed] != 57).all()),
         }
+
+    cache, _ = fresh()
+    seen["builder"] = {"unseated": judged(prepared, assembled(cache, 4, 24), decode)}
+    cache, builder = fresh()
+    replay.seat_states(builder, decode)
+    seen["builder"]["seated"] = judged(prepared, assembled(cache, 4, 24), decode)
+
+    seen["ops"] = ops_placements(plain, replay.seat_states)
+    seen["ops_unseated"] = ops_placements(plain, lambda *_: None)
+
+    from atom.compass.bench.runner import BenchModelRunner
+    from atom.compass.parity.runner import RecordingModelRunner
+
+    cache, builder = fresh()
+    reached = []
+    RecordingModelRunner.forward = lambda _, batch: reached.append(
+        positions(cache, batch)
+    )
+    runner = BenchModelRunner.__new__(BenchModelRunner)
+    runner.attn_metadata_builder = builder
+    BenchModelRunner.forward(runner, decode)
+    seen["runner"] = reached
 
     cache, builder = fresh()
     before = cache.backing.clone()
