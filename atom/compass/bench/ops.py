@@ -760,9 +760,8 @@ class Stub:
         uncut = os.environ.get(RAGGED) and not all(
             exchange(o) for o, _ in found.values()
         )
-        rows = point_rows(
-            shape, context, pool, rule.block_size, bool(uncut), rule.drafts
-        )
+        drafts = getattr(rule, "drafts", 0)  # a rule of no drafter states none
+        rows = point_rows(shape, context, pool, rule.block_size, bool(uncut), drafts)
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
         view = {"rows": rows, "produces_output": True}
@@ -1220,9 +1219,10 @@ def point_rows(
     shape, context, pool: int, block_size: int, uncut: bool = False, drafts: int = 0
 ) -> list[list] | None:
     """A point's rows, `[query, context, decodes]` each, longest first: a decode
-    row holds `context` tokens and, under a drafter of `drafts`, verifies as
-    many more, as the capture's rows do; a prefill row its query tokens, the
-    capture's split, past `context` cached ones. When they need more than the
+    row holds `context` tokens and, of a shape that names its rows alone, under
+    a drafter of `drafts` verifies as many more, as the capture's rows do; a
+    prefill row its query tokens, the capture's split, past `context` cached
+    ones. When they need more than the
     `pool`'s KV blocks, the first keeps its context and each other shares what
     it leaves, as the rows of a ragged step do. A ragged decode point's rows
     (`_split`) are its first row's context and, past it, rows of at least a
@@ -1231,7 +1231,7 @@ def point_rows(
     decode = shape.phase == "decode"
     context, mean = _split(context)
     per, extra = divmod(shape.tokens, shape.seqs)
-    per += drafts if decode else 0
+    per += drafts if decode and shape.tokens <= shape.seqs else 0
     past = context - 1 if decode else context or 0
     rows = [
         [q, q + past, decode] for q in (per + (i < extra) for i in range(shape.seqs))
