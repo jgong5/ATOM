@@ -9,6 +9,7 @@ import torch
 from aiter.dist.parallel_state import get_world_group
 
 from atom.compass.bench import routing
+from atom.compass.bench.replay import seat_states
 from atom.compass.bench.window import BenchWindow
 from atom.compass.parity.runner import RecordingModelRunner
 
@@ -28,6 +29,13 @@ class BenchModelRunner(BenchWindow, RecordingModelRunner):
         end = self.device_event()
         end.synchronize()
         self.cycles_per_ns = CALIBRATION_CYCLES / (start.elapsed_time(end) * 1e6)
+
+    def forward(self, batch):
+        """`batch`'s forward, each row's state first seated at its cached
+        context (`replay.seat_states`) on the stream, ahead of the preload and
+        the window's entry event."""
+        seat_states(self.attn_metadata_builder, batch)
+        return super().forward(batch)
 
     def route_uniformly(self) -> int:
         """Every MoE layer, the drafter's too, routed by a uniform draw of as
