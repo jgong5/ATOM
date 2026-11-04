@@ -9,6 +9,8 @@ the worked example of an idle process in the middle of a chain.
 """
 
 import math
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +22,7 @@ from atom.compass.clock import (
     single_engine_table,
 )
 from atom.compass.clock.channels import ADMISSION_DELAY_S, ReceiveMode
+from atom.utils.clock import LPRuntime, channel_of
 
 T, FP, EP, FD, ED = (
     LpId(n) for n in ("traffic", "frontend-P", "engine-P", "frontend-D", "engine-D")
@@ -283,6 +286,48 @@ def test_a_channel_declared_after_a_distance_was_read_is_counted():
     assert table.distance(a, c) == 0.25
     table.declare("a->c:z", a, c, 0.75, "thread")
     assert table.distance(a, c) == 0.25
+
+
+def test_a_channel_declared_after_a_lookup_is_in_the_next_one():
+    a, b, c = LpId("a"), LpId("b"), LpId("c")
+    table = _table(a, b, c)
+    table.declare("a->b:x", a, b, 1.0, "inline")
+    assert [ch.name for ch in table.channels_from(a)] == ["a->b:x"]
+    assert table.channels_into(c) == ()
+    table.declare("a->c:x", a, c, 1.0, "thread")
+    assert [ch.name for ch in table.channels_from(a)] == ["a->b:x", "a->c:x"]
+    assert [ch.name for ch in table.channels_into(c)] == ["a->c:x"]
+
+
+def _us_a_stream_lookup(others: int) -> float:
+    """`channel_of(rt, "stream")` for an LP of two channels, in a table that
+    also holds `others` channels between two other LPs: the best of three
+    passes, in microseconds a call."""
+    f, t, x, y = (LpId(n) for n in ("f", "t", "x", "y"))
+    table = _table(f, t, x, y)
+    table.declare("f->t:stream", f, t, 1.0, "inline")
+    table.declare("t->f:http", t, f, 1.0, "inline")
+    for k in range(others):
+        table.declare(f"x->y:k{k}", x, y, 1.0, "thread")
+    rt = LPRuntime(f, table, SimpleNamespace())
+    best = math.inf
+    for _ in range(3):
+        start = time.perf_counter()
+        for _ in range(200):
+            assert channel_of(rt, "stream") == "f->t:stream"
+        best = min(best, time.perf_counter() - start)
+    return best / 200 * 1e6
+
+
+def test_an_lps_lookup_costs_the_same_whatever_else_the_table_holds():
+    """A frontend looks its stream channel up for every event it streams
+    (`atom.compass.carriers.stamp_events`), so a lookup must not cost more as
+    the run's table grows."""
+    alone, among = _us_a_stream_lookup(0), _us_a_stream_lookup(2000)
+    assert among < 5 * alone + 5, (
+        f"{alone:.1f} us a lookup in a table of 2 channels, {among:.1f} us in one "
+        "of 2,002"
+    )
 
 
 def test_the_idle_process_in_the_middle_of_a_chain():

@@ -1311,3 +1311,56 @@ def test_an_off_owner_charge_is_refused_before_it_places_the_loop_s_jobs(run):
     assert "only the clock owner" in refused[0]
     assert run.rt.refusals == ["clock:advance_to from EngineCoreOutputThread-DP0"]
     assert station.final == 1 and job.done() and run.rt.now == INF
+
+
+class _Scripted:
+    """A clock connection that answers each request with the next scripted grant."""
+
+    def __init__(self, *grants) -> None:
+        self.grants = list(grants)
+
+    def send(self, msg) -> None:
+        pass
+
+    def recv(self):
+        return self.grants.pop(0)
+
+
+def _loop_after(frames):
+    """A frontend's loop whose engine output has brought `frames` frames, each
+    read and handled, and whose next request is released and not read yet."""
+    out = "engine->frontend:output#dp0"
+    grant = {out: [(k, k + 0.5) for k in range(frames)], HTTP: [(0, frames + 0.5)]}
+    rt = LPRuntime(FRONTEND, TABLE, _Scripted((frames + 1.0, grant), (INF, {})))
+    for k in range(frames):
+        rt.check_arrival(out, k + 0.5, k)
+    with rt.lock:
+        for k in range(frames):
+            rt.count_done_locked(out, k)
+    rt.advance_to(frames + 1.0)
+    clock.install(rt)
+    return rt, CompassEventLoop()
+
+
+def test_naming_the_unread_request_costs_the_same_however_many_frames_came_before():
+    """While a released request is unread, the loop names it at each idle point
+    (`CompassEventLoop.unread`)."""
+    costs = []
+    for frames in (10, 50_000):
+        rt, loop = _loop_after(frames)
+        try:
+            assert loop.unread() == (0, HTTP)
+            best = math.inf
+            for _ in range(3):
+                start = time.perf_counter()
+                for _ in range(200):
+                    loop.unread()
+                best = min(best, time.perf_counter() - start)
+            costs.append(best / 200 * 1e6)
+        finally:
+            rt.next_event(INF)
+            loop.close()
+            clock.install(None)
+    assert (
+        costs[1] < 5 * costs[0] + 5
+    ), f"{costs[0]:.1f} us after 10 frames, {costs[1]:.1f} us after 50,000"

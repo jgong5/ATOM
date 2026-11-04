@@ -152,6 +152,12 @@ class LPRuntime:
         self.arrived: dict[str, set[int]] = {ch: set() for ch in into}
         self.released: dict[str, set[int]] = {ch: set() for ch in into}
         self.handled: dict[str, set[int]] = {ch: set() for ch in into}
+        # Released and not yet read, per channel, and how many released are not
+        # yet handled: kept as messages come and go, so a check reads them
+        # without walking every message the run has brought.
+        self.unread: dict[str, set[int]] = {ch: set() for ch in into}
+        self.unhandled: dict[str, int] = dict.fromkeys(into, 0)
+        self.inline = tuple(c for c in into if table.recv_mode(c) is ReceiveMode.INLINE)
         # Frames read but not released, (channel, seq) -> arrival: checked at each drain.
         self.unreleased: dict[tuple[str, int], float] = {}
         self.taken_by: dict[threading.Thread, tuple[str, int]] = {}
@@ -327,7 +333,12 @@ class LPRuntime:
         with self.lock:
             for a, ch, seq in order:
                 self.now = max(self.now, a)
-                self.released[ch].add(seq)
+                if seq not in self.released[ch]:
+                    self.released[ch].add(seq)
+                    if seq not in self.arrived[ch]:
+                        self.unread[ch].add(seq)
+                    if seq not in self.handled[ch]:
+                        self.unhandled[ch] += 1
                 self.unreleased.pop((ch, seq), None)
                 for w in self.wakes.values():
                     if w.channels is None or ch in w.channels:
@@ -366,16 +377,13 @@ class LPRuntime:
             self.next_event(math.inf)
         with self.lock:
             self.arrived[ch].add(seq)
+            self.unread[ch].discard(seq)
             self.count_done_locked(ch, seq)
 
     def inline_pending(self) -> bool:
         """Is there a released inline message not yet taken?"""
         with self.lock:
-            return any(
-                self.released[ch] - self.handled[ch]
-                for ch in self.released
-                if self.table.recv_mode(ch) is ReceiveMode.INLINE
-            )
+            return any(self.unhandled[ch] for ch in self.inline)
 
     # ---- receive side ----
 
@@ -385,6 +393,7 @@ class LPRuntime:
             if seq in self.arrived[ch]:
                 raise RuntimeError(f"{ch} seq {seq} arrived twice")
             self.arrived[ch].add(seq)
+            self.unread[ch].discard(seq)
             if seq not in self.released[ch]:
                 self.unreleased[ch, seq] = arrival
                 if arrival < self.now:
@@ -432,6 +441,8 @@ class LPRuntime:
 
     def count_done_locked(self, ch: str, seq: int) -> None:
         """Caller holds `lock`."""
+        if seq in self.released[ch] and seq not in self.handled[ch]:
+            self.unhandled[ch] -= 1
         self.handled[ch].add(seq)
         self.cv.notify_all()
 
@@ -529,7 +540,7 @@ class WrappedSocket:
         while True:
             self.pull()
             with self.rt.lock:
-                if all(self.rt.released[c] <= self.rt.arrived[c] for c in self.into):
+                if not any(self.rt.unread[c] for c in self.into):
                     return
             self.raw.poll()
 
