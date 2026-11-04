@@ -2001,9 +2001,7 @@ def _workers_say(engine_core) -> dict:
 
 
 def engine_done(engine_core, **sections) -> None:
-    """After the engine's loop: write a real recording's held stamps, leave the
-    clock and hand in."""
-    clock.write_stamps()
+    """After the engine's loop: leave the clock and hand in."""
     clock.close()
     run = spec()
     if run is not None:
@@ -2091,8 +2089,10 @@ def engine_loop(engine_core):
     aside at READY, or else the one it found.
 
     A pipeline stage's runner calls go through `pp_send.install`'s sends. A
-    recorded real run's SIGTERM goes through `_stop_recording`, and its input
-    queue stamps each request frame's handoff (`clock.stamp_input`)."""
+    recorded real run's SIGTERM goes through `_stop_recording`, its input
+    queue stamps each request frame's handoff (`clock.stamp_input`), and
+    however it leaves the loop, the stamps its engine held are written
+    (`clock.write_stamps`), as its workers then write their step lines."""
     ignoring = bool(os.environ.get(ENV))  # a run, as `spec` would say, unread
     before = signal.signal(signal.SIGTERM, signal.SIG_IGN) if ignoring else None
     if _sigterm_at_ready:
@@ -2147,8 +2147,11 @@ def engine_loop(engine_core):
             _hand_in(run, lp, reasons + [ended], **said, **sections)
         raise
     finally:
-        if before is not None:  # None: not set from Python
-            signal.signal(signal.SIGTERM, before)
+        try:
+            clock.write_stamps()
+        finally:
+            if before is not None:  # None: not set from Python
+                signal.signal(signal.SIGTERM, before)
 
 
 def _stop_recording(engine_core, previous, signum, frame) -> None:

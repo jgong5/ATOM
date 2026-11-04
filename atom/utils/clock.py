@@ -814,13 +814,14 @@ class PullStamps:
             self.held[file].append(line)
 
     def write_held(self) -> None:
-        """Write the lines held so far; later ones are written as they come."""
+        """Write the lines held so far; later ones are written as they come.
+        The lines are taken first, so a stop handler that runs inside this
+        write finds none left to write again."""
         with self.lock:
-            if self.held is not None:
-                for file, lines in self.held.items():
-                    file.write("".join(lines))
-                    file.flush()
-                self.held = None
+            held, self.held = self.held, None
+            for file, lines in (held or {}).items():
+                file.write("".join(lines))
+                file.flush()
 
 
 #: The engine's `PullStamps` on a real recording, else None.
