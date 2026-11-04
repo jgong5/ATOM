@@ -124,8 +124,9 @@ class ClockPacedLoopScheduler(LoopScheduler):
         """The pending ``(timer, coro)`` due first, and among equals the first armed."""
         while True:
             _, _, timer = self._queue[0]
+            # The heap keeps `timer` alive, so no other object holds its id.
             entry = self._handles.get(id(timer))
-            if entry is not None and entry[0] is timer:
+            if entry is not None:
                 return entry
             heapq.heappop(self._queue)
 
