@@ -849,8 +849,8 @@ ATOM_DISABLE_MMAP=true AITER_REUSE_IDENTICAL_COMM_GROUPS=1`, `NCCL_MIN_NCHANNELS
 --method dspark --num-speculative-tokens 5 --gpu-memory-utilization 0.9
 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --block-size 16 --level 0
 --max-num-seqs 64 --cudagraph-capture-sizes [1,2,3,4,5,6,7,8,12,16,24,32,40,48,56,64]
---max-model-len 262144`; the law's engine config holds `AITER_LOG_LEVEL` and
-`OMP_NUM_THREADS`, so a run sets them too. A fresh container compiles Triton variants of
+--max-model-len 262144`; the law's engine config holds `AITER_LOG_LEVEL`, `OMP_NUM_THREADS`
+and `ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072`, so a run sets them too. A fresh container compiles Triton variants of
 `_unit_table_kernel`, `_indices`, `_swa_write_kernel` and
 `_gemm_a16w16_bandwidth_bound_kernel` record after record, so unscored records at each
 concurrency, and a call of `atom/model_ops/deepseek_v41/unit_table.py::unit_table` per
