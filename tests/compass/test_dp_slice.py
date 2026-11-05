@@ -242,6 +242,8 @@ def test_each_dp_rank_joins_the_engine_lp_as_its_own_member(monkeypatch, tmp_pat
     monkeypatch.setattr(clock, "_installed", None)
     monkeypatch.setattr(utils, "LP_OF_RANK", None, raising=False)
     monkeypatch.setattr(compass_run, "_member", None)
+    for name in clock.COLLECTIVES:  # the engine's bootstrap wraps each
+        monkeypatch.setattr(torch.distributed, name, getattr(torch.distributed, name))
     joined = []
     monkeypatch.setattr(
         compass_run, "connect", lambda lp, endpoint, member: joined.append((lp, member))
