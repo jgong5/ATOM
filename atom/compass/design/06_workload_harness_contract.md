@@ -443,8 +443,8 @@ hashing, copying ids) waits for host laws that time the whole call
 ([#2618](https://github.com/jgong5/ATOM/issues/2618)). On a real run that work costs more per
 id than in a back-to-back replay of the same prompts: half to two thirds of the excess when the
 replay's calls come 1.5 s apart on rotating threads, as the server's pool runs them, and most
-of the rest in `tolist`, ATOM's copy of the ids to a list
-([#2680](https://github.com/jgong5/ATOM/issues/2680)), whose cost per id grows over the run.
+of the rest in `tolist`, a copy of the ids to a list that ATOM has since dropped
+([#2680](https://github.com/jgong5/ATOM/issues/2680)); its cost per id grew over the run.
 The server's other threads stretch a call that runs alone only by its GIL waits, 0.02 to
 0.04 ms on #2144's cell ([#2619](https://github.com/jgong5/ATOM/issues/2619)). Calls that
 overlap wait for each other, on the library's pool and for the GIL in their own work, which

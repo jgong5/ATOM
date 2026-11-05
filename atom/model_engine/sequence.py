@@ -257,7 +257,7 @@ class Sequence:
 
     def __init__(
         self,
-        token_ids: list[int],
+        token_ids: list[int] | array.array,
         block_size: int,
         sampling_params: SamplingParams | None = None,
         stop_token_sequences: list[list[int]] | None = None,
