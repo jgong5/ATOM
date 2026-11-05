@@ -1176,7 +1176,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
-    # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
+    # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM
+    # unless ATOM_ENGRAM_UVA_HBM says so; the
     # GPU pulls only the rows a step names and dequantizes them there. On by default: the host gather gives the same rows
     # but costs ~50 ms of CPU per decode step with the GPU idle behind it. Set
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
@@ -1192,6 +1193,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # resident once. Copying needs the HIP runtime; elsewhere it registers in
     # place regardless. `tools/engram/bench_uva_shard.py` measures both.
     "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
+    # With ATOM_ENGRAM_UVA: hold each rank's shard in HBM instead of page-locked
+    # host memory (`engram.host_memory.to_device`), for a host that cannot
+    # page-lock the shards; the same kernel reads it there. Copied through one
+    # page-locked bounce chunk of at most 1 GiB. The shard is in HBM before
+    # the KV cache is sized, so the KV cache gets that much less.
+    "ATOM_ENGRAM_UVA_HBM": lambda: os.getenv("ATOM_ENGRAM_UVA_HBM", "0") == "1",
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.

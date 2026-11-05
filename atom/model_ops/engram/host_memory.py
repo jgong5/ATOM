@@ -5,7 +5,9 @@
 table's values and, when quantized, its block scales) and returns them as
 page-locked tensors -- copied into `hipHostMalloc` memory of exactly their
 size, or (`ATOM_ENGRAM_UVA_COPY=0`, or no HIP runtime) the checkpoint mapping
-registered in place.
+registered in place. `to_device` instead copies them into HBM
+(`ATOM_ENGRAM_UVA_HBM`), for a host that cannot page-lock the shard; the same
+kernel reads them there, and nothing below about releasing applies to it.
 
 Ownership: each returned tensor's storage holds the lease on its memory, so
 the memory is released when the last tensor viewing it is collected -- never
@@ -415,6 +417,74 @@ def _copy(allocator, sources, leases):
     finally:
         if pool is not None:
             pool.shutdown()
+
+
+def to_device(sources: list[torch.Tensor], device) -> tuple[torch.Tensor, ...] | None:
+    """`sources` (contiguous row ranges) copied into HBM on `device`, as
+    tensors of the same dtype and shape; all-or-nothing.
+
+    None on any failure -- no HBM, no page-locked bounce chunk -- with nothing
+    it allocated still held, so the TP group can fall back as one.
+
+    The host holds one page-locked bounce chunk of at most `_HBM_BOUNCE_BYTES`,
+    not a shard: each chunk of a source is copied into it (`_copy_into`, on
+    the threads `pin_rows` would use), then to the device, and its checkpoint
+    pages are dropped from this process (`_source_dropper`).
+    """
+    try:
+        return _to_device(sources, device)
+    except Exception:  # any failure is a fallback
+        logger.warning("engram: copying the UVA shard into HBM failed", exc_info=True)
+        return None
+
+
+# The most page-locked host memory an HBM copy holds at a time.
+_HBM_BOUNCE_BYTES = 1 << 30
+
+
+def _bounce(nbytes: int) -> torch.Tensor:
+    """`nbytes` of page-locked host memory from torch's own allocator.
+
+    Not `_HipHostAllocator`'s: that loads HIP by name, which can resolve to a
+    second HIP runtime beside torch's, and torch's runtime then takes its
+    memory for pageable -- an H2D copy from it faulted on MI455.
+    `device="cpu"` because the model is built under a CUDA default device,
+    where a bare `pin_memory=True` asks for a CUDA tensor and raises.
+    """
+    return torch.empty(nbytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+
+
+def _to_device(sources, device):
+    largest = max(s.numel() * s.element_size() for s in sources)
+    size = max(1, min(_HBM_BOUNCE_BYTES, largest))
+    bounce = _bounce(size)
+    threads = copy_threads(size)
+    pool = ThreadPoolExecutor(threads) if threads > 1 else None
+    try:
+        out = []
+        for src in sources:
+            flat = _as_bytes(src)
+            dst = torch.empty(flat.numel(), dtype=torch.uint8, device=device)
+            drop = _source_dropper(src)
+            try:
+                for o, n in _chunks(flat.data_ptr(), flat.numel(), size):
+                    _copy_into(bounce[:n], flat[o : o + n], pool)
+                    # Synchronous, so the bounce chunk is free to refill.
+                    dst[o : o + n].copy_(bounce[:n])
+                    if drop is not None:
+                        drop(o, n)
+            finally:
+                if drop is not None:
+                    drop.close()
+            out.append(dst.view(src.dtype).view(src.shape))
+        return tuple(out)
+    finally:
+        if pool is not None:
+            pool.shutdown()
+        del bounce
+        # Hand the bounce chunk back, rather than leave it page-locked in
+        # torch's cache of host blocks for the life of the process.
+        torch._C._host_emptyCache()
 
 
 def _register(sources, leases):
