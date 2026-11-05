@@ -104,11 +104,14 @@ if CRS005:
 #: On gpu-40, the per-byte rate of a request that finds no other intake on the
 #: loop, which a first-turn burst's bodies, short on messages, understate:
 #: `http_intake.py lone` over the long prompts of the DeepSeek-V4.1-Flash TP4
-#: DSpark5 cc-traces c=16 cell (traces 0-255): the bodies of 110 KB or more its
-#: client sent past warm-up, from the client's capture, all but five, sent one
-#: at a time to one server at the cell's arguments on cards 0-3, at the commit
-#: named, in five passes, each every fifth body; the record is its stamp file,
-#: the band the p10 and p90 over passes, each fitted alone.
+#: DSpark5 cc-traces c=16 cell (traces 0-255), sent one at a time to one server
+#: at the cell's arguments on cards 0-3, at the commit named. The bodies are the
+#: lines of the cell client's capture (counted from 0) of 110 KB or more that
+#: ask for more than one token, which leaves out lines 1-14, the client's
+#: warm-up, and line 268, each asking for one; less lines 17-20, sent first to
+#: warm the server, and the last, line 1053, dropped so that five passes, each
+#: every fifth of the rest in capture order, hold as many. The record is its
+#: stamp file, the band the p10 and p90 over passes, each fitted alone.
 LONE = None
 if GPU40:
     LONE = (
