@@ -27,7 +27,7 @@ from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.step_grid_residual import Residual
 from atom.compass.backends.step_roofline import StepFallbackBackend
 from atom.compass.drive.aiter_jit import BUILDS
-from atom.compass.validate.cost import cost_accuracy, main
+from atom.compass.validate.cost import _text, cost_accuracy, declined_text, main
 
 # Prefill hull: tokens 100-1000, Sum N_Q^2 1e4-1e6, Sum N_Q (N_KV - N_Q) 0-1e7.
 BOX = [[-1, 0, 0, 100], [1, 0, 0, -1000], [0, -1, 0, 1e4], [0, 1, 0, -1e6]]
@@ -594,3 +594,24 @@ def test_one_validated_and_one_out_of_hull_step_grade_together(tmp_path):
     graded = report["graded"]["prefill"]
     assert graded["steps"] == 2
     assert graded["on_totals"] == pytest.approx((a + b) / (a + 2 * b) - 1, rel=1e-6)
+
+
+def test_the_command_prints_the_steps_its_law_extrapolated(tmp_path, capsys):
+    # Decode steps 2 to 9 lie past the hull's context of `PAST`.
+    law = tmp_path / "law.json"
+    law.write_text(json.dumps(_past_hull("step-linear")))
+    main([str(_record(tmp_path / "steps", _steps())), str(law)])
+    assert "extrapolated: 8 steps" in capsys.readouterr().out.splitlines()
+
+
+def test_the_command_s_text_names_each_fallback_row(tmp_path):
+    """A law prices every step itself; a step grid falls to the step roofline
+    below it for the one decode step it holds no measurement of."""
+    from test_validate_step_grid import _below, _bundle  # it imports this module
+
+    report = cost_accuracy(
+        _record(tmp_path / "steps", _steps()), _below(_bundle(_steps(), missing={15}))
+    )
+    (row,) = report["fallback"].values()
+    line = f"fallback decode rung 1: {declined_text(row)}"
+    assert line in _text(report).splitlines()

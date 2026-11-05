@@ -336,8 +336,10 @@ def _text(report: dict) -> str:
             f"\nwarm step {w['step']} ({w['band']}): real {w['real_s']:.2f} s,"
             f" priced {w['priced_s']:.2f} s"
         )
-    for band, r in report["refused"].items():
-        out.append(f"\nrefused {band}: {declined_text(r)}")
+    for kind in ("fallback", "refused"):
+        for band, r in report[kind].items():
+            out.append(f"\n{kind} {band}: {declined_text(r)}")
+    out.append(f"\nextrapolated: {report['extrapolated']} steps")
     return "\n".join(out)
 
 
