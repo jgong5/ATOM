@@ -273,20 +273,28 @@ def test_a_stated_engine_file_contradicting_the_records_own_refuses(tmp_path):
 
 COMPASS = Path(__file__).resolve().parents[2] / "scripts" / "compass"
 GPU45 = json.loads((COMPASS / "machines" / "mi355x-gpu45.json").read_text())
+CRS005 = json.loads((COMPASS / "machines" / "mi355x-crs005.json").read_text())
+#: Each DeepSeek-V4-Pro EP8 law pair's file stem and the spec it was fitted under.
+EP8_PAIRS = [
+    pytest.param(
+        "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661", GPU45, id="gpu45"
+    ),
+    pytest.param("deepseek-v4-pro-dpa8-ep8-mi355x-crs005", CRS005, id="crs005"),
+]
 
 
 @pytest.mark.parametrize("side", ["prefill", "decode"])
+@pytest.mark.parametrize("stem,spec", EP8_PAIRS)
 def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
-    monkeypatch, tmp_path, side
+    monkeypatch, tmp_path, stem, spec, side
 ):
-    name = f"deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{side}.json"
-    fitted = json.loads((COMPASS / "laws" / name).read_text())
+    fitted = json.loads((COMPASS / "laws" / f"{stem}-{side}.json").read_text())
     engine = fitted["engine_config"]
     for key in PERFORMANCE_KEYS:
         monkeypatch.delenv(key, raising=False)
     for key, value in engine["env"].items():
         monkeypatch.setenv(key, value)
-    run = _without_step_stub(tmp_path, step_linear=fitted, machine=GPU45)
+    run = _without_step_stub(tmp_path, step_linear=fitted, machine=spec)
     monkeypatch.setenv(compass_run.ENV, str(run))
 
     def installed(ep):
@@ -304,7 +312,7 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
             enable_expert_parallel=ep,
             enable_tbo=engine["enable_tbo"],
         )
-        publish_readings(tmp_path / "store", r.config, GPU45)
+        publish_readings(tmp_path / "store", r.config, spec)
         compass_run.runner(r, META_8B)
         return r.compass_backend
 

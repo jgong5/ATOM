@@ -832,6 +832,25 @@ the decode side 64 once more at the default ([#1810](https://github.com/jgong5/A
 Each decode rung a law fits has steps in two or more cells, so each carries a held-out
 hull. Host keys as above.
 
+`scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-{prefill,decode}.json`
+are the EP8 pair for the cell on crsuse2-m2m-v3-005 (prefill) and -013 (decode), keyed by
+`machines/mi355x-crs005.json`, in the image that file pins: the `base` form with host
+laws, each written by `step_linear_fit` from its side's cells. The cells are the gpu-40 EP8
+pair's, run by `calib_capture.sh` at `--gpu-memory-utilization 0.75` with each side's EP8
+arguments, the prefill side's on 005. -013's page cache served other bytes than its disk while
+its first decode cells ran ([#2794](https://github.com/jgong5/ATOM/issues/2794)), so the decode
+cells were run again, on 005 and, after -013's reboot, on both nodes at once, each started once
+its node's page cache read the same bytes as its disk. A cell that built an aiter JIT module,
+or whose text came back garbled, was run again. The decode side adds c=32 cells at seeds
+20260707 and 20260708 and a c=24 cell at seed 20260707: a lone decode server at c=16 decodes at
+rung 1 and at c=64 at rungs 4 and 8, and the 1P1D decode side also at rung 2. The prefill law's
+prefill vector, and the decode law's rung 1, 2, 4 and 8 vectors with `--moe-routing 384,6`,
+DeepSeek-V4-Pro's routed experts and top-k, are refitted on their side's lone cells and on their
+side of three 1P1D `deploy.sh record` cells at c=256 over traces 256 to 392, seeds 20260707,
+20260708 and 20260709, the prefill side at `--gpu-memory-utilization 0.72`. Each law's other
+vectors, the prefill law's rung-1 vector among them, and its host laws are the ones fitted on its
+lone cells alone, and its `sources` names the records each came from. Host keys as above.
+
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json` is DeepSeek-V4.1-Flash's
 law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed
 experts sharded across TP and DSpark with 5 speculative tokens, on one MI455 A0 node: the
