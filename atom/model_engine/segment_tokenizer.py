@@ -120,8 +120,8 @@ def _shared_chars(a: str, b: str, limit: int) -> int:
 
 
 class SegmentTokenizer:
-    """``encode(prompt)``: ``tokenizer.encode(prompt)`` as `new_token_ids`
-    holds it, reusing earlier prompts' ids (module docstring)."""
+    """``encode(prompt)``: ``tokenizer.encode(prompt)``'s ids in an array, reusing
+    earlier prompts' ids (module docstring)."""
 
     def __init__(self, tokenizer, budget_bytes: int):
         self._tokenizer = tokenizer
