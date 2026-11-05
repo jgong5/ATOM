@@ -98,7 +98,8 @@ On an MTP record both prefill vectors, the target's and the draft's, add
 Forms (`FORMS`): `base`, the features `StepLinearLaw` always prices; `history`,
 prefill plus `Sum (N_KV - N_Q)`, the KV a short chunk reads on a deep history;
 `shared`, decode with the context and padding slopes shared by every rung and
-an intercept per rung.
+an intercept per rung; `cached_seqs`, prefill plus its rows with cached
+context, each a cost whatever its history's length.
 
 With `moe_routing`, the model's routed experts and top-k (`--moe-routing E,K`),
 the law states `moe_routing` and, outside `shared`, a decode rung may adopt one
@@ -150,12 +151,13 @@ from atom.compass.backends.step_linear import (
     MOE_COLUMNS,
     PREFILL,
     PROPOSE,
+    cached_seqs,
     moe_column,
     moe_tokens,
     rowmod,
 )
 
-FORMS = ("base", "history", "shared")
+FORMS = ("base", "history", "shared", "cached_seqs")
 CONTEXT_PARALLEL = ("prefill_context_parallel_size", "decode_context_parallel_size")
 MAD_K = 3.5
 #: A relative residual this small is never an outlier, however tight the rest.
@@ -201,7 +203,7 @@ def _features(
     tokens, dummies), and how many were cut, per reason.
 
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
-    order, plus `history` for that form, above `dp` 1 `moe_rows` on prefill and
+    order, plus `history` or `cached_seqs` in its form, above `dp` 1 `moe_rows` on prefill and
     under `serial` `serial_moe_rows`, and under `draft` or on a step with a draft
     label `seqs` and `out` on prefill, as `StepLinearBackend` counts them;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill;
@@ -223,6 +225,8 @@ def _features(
                 counts = (1, sum_tokens(r), sum_query_square(r), sum_query_cached(r))
                 if form == "history":
                     counts += (sum_context(r) - sum_tokens(r),)
+                if form == "cached_seqs":
+                    counts += (cached_seqs(r),)
                 if dp > 1:
                     if view.moe_rows is None:
                         raise ValueError(
@@ -709,7 +713,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         spread += s
         for k, v in c.items():
             cut[k] = cut.get(k, 0) + v
-    prefill = list(HISTORY if form == "history" else PREFILL) + ["moe_rows"] * (dp > 1)
+    prefill = list(HISTORY if form == "history" else PREFILL)
+    prefill += ["cached_seqs"] * (form == "cached_seqs") + ["moe_rows"] * (dp > 1)
     prefill += ["serial_moe_rows"] * serial
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
     rows, alternation = _slowest(groups, prefill)
