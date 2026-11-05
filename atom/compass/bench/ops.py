@@ -168,7 +168,7 @@ import sys
 import tempfile
 import time
 import warnings
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
@@ -1511,28 +1511,25 @@ def _bound(name, value, old, device) -> dict[str, torch.Tensor]:
     arena's fields (`view`) and its buffer as each field's dtype views it, an
     object's attributes; none `old` holds by id, nor a module. The walk adds
     each object it enters to `old`."""
-    out, queue = {}, deque([(name, value)])
-    while queue:
-        name, value = queue.popleft()
+    out, queue = {}, [(name, value)]
+    for name, value in queue:  # breadth first: the walk appends as it goes
         if torch.is_tensor(value):
             if value.device.type == device.type and id(value) not in old:
                 out[name] = value
-            continue
-        if id(value) in old or isinstance(value, torch.nn.Module):
-            continue
-        old.add(id(value))
-        items = ()
-        if isinstance(value, dict):
-            items = value.items()
-        elif isinstance(value, (list, tuple)):
-            items = enumerate(value)
-        elif hasattr(value, "fields") and callable(getattr(value, "view", None)):
-            dtypes = sorted({f.dtype for f in value.fields}, key=str)
-            items = [(f.name, value.view(f.name)) for f in value.fields]
-            items += [(f"buf.{t}", value.buf.view(t)) for t in dtypes]
-        elif hasattr(value, "__dict__"):
-            items = vars(value).items()
-        queue.extend((f"{name}.{key}", item) for key, item in items)
+        elif id(value) not in old and not isinstance(value, torch.nn.Module):
+            old.add(id(value))
+            items = ()
+            if isinstance(value, dict):
+                items = value.items()
+            elif isinstance(value, (list, tuple)):
+                items = enumerate(value)
+            elif hasattr(value, "fields") and callable(getattr(value, "view", None)):
+                dtypes = sorted({f.dtype for f in value.fields}, key=str)
+                items = [(f.name, value.view(f.name)) for f in value.fields]
+                items += [(f"buf.{t}", value.buf.view(t)) for t in dtypes]
+            elif hasattr(value, "__dict__"):
+                items = vars(value).items()
+            queue += [(f"{name}.{key}", item) for key, item in items]
     return out
 
 
