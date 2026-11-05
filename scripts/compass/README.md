@@ -843,12 +843,12 @@ cells were run again, on 005 and, after -013's reboot, on both nodes at once, ea
 its node's page cache read the same bytes as its disk. A cell that built an aiter JIT module,
 or whose text came back garbled, was run again. The decode side adds c=32 cells at seeds
 20260707 and 20260708 and a c=24 cell at seed 20260707: a lone decode server at c=16 decodes at
-rung 1 and at c=64 at rungs 4 and 8, and the 1P1D decode side also at rung 2. The vectors each
-side of a 1P1D deployment runs are refitted on that side's lone cells and on its side of three
-1P1D `deploy.sh record` cells at c=256 over traces 256 to 392, seeds 20260707, 20260708 and
-20260709, the prefill side at `--gpu-memory-utilization 0.72`: the prefill law's prefill vector,
-and the decode law's rung 1, 2, 4 and 8 vectors with `--moe-routing 384,6`, DeepSeek-V4-Pro's
-routed experts and top-k. Each law's other vectors and its host laws are the ones fitted on its
+rung 1 and at c=64 at rungs 4 and 8, and the 1P1D decode side also at rung 2. The prefill law's
+prefill vector, and the decode law's rung 1, 2, 4 and 8 vectors with `--moe-routing 384,6`,
+DeepSeek-V4-Pro's routed experts and top-k, are refitted on their side's lone cells and on their
+side of three 1P1D `deploy.sh record` cells at c=256 over traces 256 to 392, seeds 20260707,
+20260708 and 20260709, the prefill side at `--gpu-memory-utilization 0.72`. Each law's other
+vectors, the prefill law's rung-1 vector among them, and its host laws are the ones fitted on its
 lone cells alone, and its `sources` names the records each came from. Host keys as above.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json` is DeepSeek-V4.1-Flash's
