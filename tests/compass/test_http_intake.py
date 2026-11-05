@@ -157,6 +157,65 @@ def test_a_stall_on_the_loop_moves_the_fixed_term_and_not_the_per_byte_one(
     )
 
 
+def test_a_fit_at_a_given_rate_keeps_the_burst_span(tmp_path):
+    # A rate fitted elsewhere replaces the burst's own slope; the fixed term
+    # still makes the fitted gaps sum to what the burst spanned.
+    sizes = np.random.default_rng(0).integers(100, 200_000, 64).tolist()
+    stamps = tmp_path / "stamps"
+    stamps.write_text(_burst(2.1e-3, 1.8e-8, sizes))
+    span = 63 * 2.1e-3 + sum(sizes[1:]) * 1.8e-8
+    done = subprocess.run(
+        [sys.executable, PROBE, "fit", stamps, "64", "3e-8"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    got = json.loads(done.stdout)
+    assert got["per_byte_s"] == 3e-8
+    assert 63 * got["fixed_s"] + sum(sizes[1:]) * 3e-8 == pytest.approx(span)
+    assert got["fixed_s"] == pytest.approx(2.1e-3 - 1.2e-8 * np.mean(sizes[1:]))
+    assert got["rms_s"] > 1e-4
+
+
+def _lone(rates, sizes, idle_s=4e-4, t0=10**12):
+    """Stamp lines for lone requests a second apart, one pass over `sizes` per
+    rate: each request's loop time is `idle_s` plus its pass's rate per body
+    byte, half before its 2 ms pool job and half after."""
+    lines, c = [], t0
+    for rate in rates:
+        for size in sizes:
+            half = round((idle_s + rate * size) * 1e9 / 2)
+            j = c + half
+            e = j + 2_000_000
+            s = e + half
+            lines.append(
+                f"{c} 1 app {c} 0\n{c + 2} 1 body {c + 1} {size}\n"
+                f"{e} 2 prep {j} 0\n{s} 1 send {s - 50} 0\n"
+            )
+            c += 10**9
+    return "".join(lines)
+
+
+def test_lone_states_the_median_over_passes_of_each_pass_per_byte_rate(tmp_path):
+    sizes = [100_000 * (k + 1) for k in range(8)]
+    stamps = tmp_path / "stamps"
+    stamps.write_text(_lone([5e-9, 9e-9, 6e-9], sizes))
+    done = subprocess.run(
+        [sys.executable, PROBE, "lone", stamps, "3"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    got = json.loads(done.stdout)
+    assert got["passes"] == pytest.approx([5e-9, 9e-9, 6e-9])
+    assert got["per_byte_s"] == pytest.approx(6e-9)
+    assert (got["p10_s"], got["p90_s"]) == pytest.approx((5.2e-9, 8.4e-9))
+    assert (got["requests"], got["bytes"]) == (24, 3 * sum(sizes))
+    assert got["record"] == f"sha256:{hashlib.sha256(stamps.read_bytes()).hexdigest()}"
+    with pytest.raises(SystemExit, match="24 lone requests, not 5 passes"):
+        probe.lone(str(stamps), 5)
+
+
 @pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39", "mi355x-gpu45"])
 def test_every_committed_spec_states_a_probed_intake_from_a_named_record(name):
     from atom.compass.spec import MachineSpec
