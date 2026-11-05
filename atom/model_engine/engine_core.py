@@ -481,7 +481,8 @@ class EngineCore:
         """
         if clock.installed() is not None:
             return
-        timeout = min(self._idle_deadline(), next_metrics_push) - time.monotonic()
+        deadline = min(self._idle_deadline(), next_metrics_push)
+        timeout = deadline - clock.now(time.monotonic)
         q = self.input_queue
         with q.not_empty:
             if timeout > 0 and not q._qsize() and self.utility_queue.empty():
