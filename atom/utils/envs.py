@@ -558,9 +558,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 7168, where an
-    # eager prefill on V4.1-Flash TP4 stops being host-bound: the pool grows
-    # with the largest bucket, and past it a bucket saves no launch time. Only
-    # an attention backend with `supports_token_graph` takes them.
+    # eager prefill on V4.1-Flash TP4 stops being host-bound: past it a bucket's
+    # own device time is longer than the eager launch, while the pool grows with
+    # the largest bucket and with each one. Only an attention backend with
+    # `supports_token_graph` takes them.
     "ATOM_TOKEN_GRAPH_SIZES": lambda: tuple(
         int(s)
         for s in os.getenv(
