@@ -39,13 +39,15 @@ a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
 HCA decode workspace an `HCA_DECODE` slot names, or of the buffer
-`V4_METADATA` names for a DeepSeek-V4 slot, refused when it is not live; an
-integer the capture
+`V4_METADATA` names for a DeepSeek-V4 slot, refused when it is not live, or,
+when live, `V41_NAMES`' for a DeepSeek-V4.1 slot at its ratio (`_ratio`),
+whose step and scorer workspace are live too; an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names, its module's meta parameters
 moved to the device and filled as `--load_dummy xavier` fills them (`_fill`),
 and a runner attribute this runner's own; a KV tensor is a view of a tensor
-ATOM's KV allocation bound of its layout (`_kv`), refused when none is, whose
+ATOM's KV allocation bound, on the runner or a metadata builder (`_bound`),
+of its layout or `V41_NAMES`' (`_kv`), refused when none is, whose
 name the point records, the same on every copy; an object is rebuilt from its class
 and state as the capture's replay rebuilds one, its tensors built as any other
 argument's, its activations fresh on every copy. A leaf whose operator cannot
@@ -166,7 +168,7 @@ import sys
 import tempfile
 import time
 import warnings
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
@@ -230,7 +232,10 @@ _waited: Counter = Counter()
 #: Metadata arguments, by operator and slot, that are the token ids ATOM passes
 #: the model's forward; `_meta`'s name rule binds an embedding's `indices` to
 #: another index buffer.
-TOKEN_IDS = {("aten.embedding.default", "indices")}
+TOKEN_IDS = {
+    ("aten.embedding.default", "indices"),
+    ("aiter.masked_embedding.default", "x"),
+}
 #: Weight slots, and a named module's tensors, a leaf reads a row a token of:
 #: RoPE's cos and sin tables, indexed by each token's position (or by each
 #: compressed position, at most one a token), never read whole.
@@ -290,6 +295,49 @@ V4_METADATA = {
     (_QKN_BF16, "swa_dest_rows"): "v4_swa_dest_{dest}",
 }
 V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
+#: DeepSeek-V4.1's arguments, by operator and slot as `V4_METADATA` keys them,
+#: and the buffer ATOM passes each, at the leaf's compress ratio (`_ratio`): a
+#: KV tensor its builder's paged cache holds, named as `_bound` names it, or
+#: a tensor of its step (`step.`), its scorer's workspace (`workspace.`) or the
+#: forward context. Taken when the runner holds it, else the slot binds as
+#: any other: `_meta`'s rules take another ratio's table, and the MoE's token
+#: count V4.1's decoder-tail count. A packed pool's decode reads its prefix
+#: indptr for both; the cells' BF16 pool splits its window out.
+_CACHE = "attn_metadata_builder.cache.indptr_buffers.{ratio}"
+_LOGITS = (
+    "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
+    "flydsl_fp8_paged_mqa_logits_gfx1250"
+)
+_PLAN = "step.plans.{ratio}.compress_plan_gpu"
+_TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
+_INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
+_SCAN = f"{_INDPTRS}:_launch_indptr_scan"
+_INDICES = f"{_INDPTRS}:_launch_indices"
+_FUSED = "atom.model_ops.v4_kernels.fused_compress:_launch_fused_compress"
+V41_NAMES = {
+    ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_prefix"): f"{_CACHE}.0",
+    ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_extend"): f"{_CACHE}.1",
+    (_SCAN, "pptrs"): f"{_CACHE}.0",
+    (_SCAN, "eptrs"): f"{_CACHE}.1",
+    (_LOGITS, "out_logits"): "workspace._logits",
+    (_LOGITS, "context_lens"): "step.visible.{ratio}",
+    (_LOGITS, "kv_indices"): "workspace._tiles.{ratio}",
+    (_TOPK, "row_starts"): "step.visible.{ratio}",
+    (_TOPK, "row_ends"): "step.visible.{ratio}",
+    (_FUSED, "plan_gpu"): _PLAN,
+    ("atom.model_ops.deepseek_v41.index_write:write_index_rows", "plan"): _PLAN,
+    (_INDICES, "pptr"): f"{_CACHE}.0",
+    (_INDICES, "eptr"): f"{_CACHE}.1",
+    **{
+        (fn, slot): f"step.swa_{slot}"
+        for fn in (_INDICES, _SCAN)
+        for slot in ("replay_start", "cached_until")
+    },
+    (f"{_INDPTRS}:_launch_window_rows", "eptr"): f"{_CACHE.format(ratio=0)}.1",
+    (_FUSED, "state_slot_mapping"): "step.slots",
+    ("aiter.fused_moe_.default", "num_local_tokens"): "scheduled_tokens_gpu",
+    ("aiter.topk_gating_fwd.default", "num_valid_rows"): "scheduled_tokens_gpu",
+}
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
 #: the span, and past an exact buffer kills the process (aiter defect, #1977).
@@ -312,6 +360,10 @@ SNAPSHOTS = "v_cache"
 SEED = 0
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
 RANK = Topology().ranks()[0]
+#: The runner's metadata builders whose attributes the KV allocation may bind:
+#: DeepSeek-V4.1 binds its paged cache on its builder, and its DSpark drafter's
+#: draft-KV pool on a builder of its own.
+BUILDERS = ("attn_metadata_builder", "draft_kv_builder")
 #: The variable naming the file a measuring process appends each point's
 #: record to as it finishes it.
 JOURNAL = "COMPASS_OPS_JOURNAL"
@@ -529,9 +581,10 @@ def _runner(config, rank: int):
     the meta device and no warmup run, its KV pool allocated at the fewest
     blocks a rank has room for, sized by ATOM with the parameters' bytes held
     on the device and then freed for the weights each leaf builds; the runner
-    attributes the allocation set are in its `kv_held`; and, when the runner
-    defers its output, one sampled-id handoff to the host on ATOM's copy
-    stream, as ATOM's postprocess makes one after every forward. One DP rank
+    attributes the allocation set are in its `kv_held`, and by path each
+    tensor it bound on a metadata builder (`BUILDERS`, `_bound`); and, when
+    the runner defers its output, one sampled-id handoff to the host on ATOM's
+    copy stream, as ATOM's postprocess makes one after every forward. One DP rank
     of several run alone is built as ATOM's simulated DP attention builds it:
     DP 1, its experts cut as across the ranks."""
     from torch.distributed import TCPStore
@@ -573,10 +626,16 @@ def _runner(config, rank: int):
     _release()  # the pool takes the room the hold had
     config.num_kvcache_blocks = agreed(blocks, cpu_group())
     before = dict(vars(runner))
+    builders = {n: b for n in BUILDERS if (b := getattr(runner, n, None)) is not None}
+    old = {id(v) for b in [runner, *builders.values()] for v in [b, *vars(b).values()]}
     runner.allocate_kv_cache(config.num_kvcache_blocks)
     # what the allocation bound on the runner: `trace ops` reads a tensor
     # made there as KV
     runner.kv_held = {k: v for k, v in vars(runner).items() if before.get(k) is not v}
+    old |= set(map(id, runner.kv_held.values()))
+    for name, builder in builders.items():
+        for key, value in vars(builder).items():
+            runner.kv_held |= _bound(f"{name}.{key}", value, old, runner.device)
     # with no handoff made, a Qwen3.8-27B GDN decode leaf read 5% under a
     # runner that had made one
     ids, done = runner.tokenID_processor, torch.cuda.Event()
@@ -629,6 +688,14 @@ class Stub:
         )
         self.shared = self.topk.get("topk_ids")
         self.loads = []
+        # DeepSeek-V4.1's compress ratios by the rows a page holds at each
+        geometry = getattr(runner, "attn_metadata_builder", None)
+        geometry = getattr(geometry, "geometry", None)
+        self.known = self.pages = {
+            ("rows_per_page", geometry.rows_per_page(r)): r
+            for r in getattr(geometry, "layer_ratios", ())
+            if r and hasattr(geometry, "rows_per_page")
+        }
         # a DeepSeek-V4 CSA layer: its forward writes the top-k section of the
         # CSA index buffer, and `_prepare` runs none
         self.csa = next(
@@ -660,11 +727,16 @@ class Stub:
             live[name] = getattr(buffer, "gpu", buffer)
         for owner in (fc.attn_metadata, fc.context):
             live |= {k: v for k, v in vars(owner).items() if torch.is_tensor(v)}
-        device = self.runner.device.type
+        # DeepSeek-V4.1's step and its scorer's workspace, whose tensors its
+        # leaves view and no attribute of the metadata holds
+        device, md = self.runner.device, fc.attn_metadata
+        scorer = getattr(getattr(md, "cache", None), "workspace", None)
+        live |= _bound("step", getattr(md, "step", None), set(), device)
+        live |= _bound("workspace", scorer, set(), device)
         live = {
             k: v
             for k, v in live.items()
-            if torch.is_tensor(v) and v.device.type == device
+            if torch.is_tensor(v) and v.device.type == device.type
         }
         # DeepSeek-V4's persistent HCA decode workspace, one per device: a slot
         # of `HCA_DECODE` named as one of its fields is a view of that field
@@ -680,7 +752,6 @@ class Stub:
         }
         meta = dict(self.kv)
         for sig, (op, _) in self.leaves.items():
-            ratio = op["args"].get("ratio", op.get("stated", {}).get("compress_ratio"))
             writes = _writes(op["op"])
             for path, spec in _specs(op["args"]):
                 if spec["role"] == "metadata":
@@ -689,6 +760,7 @@ class Stub:
                     what, field = "metadata", path.split(".")[0]
                     if op["op"] == HCA_DECODE and field in work:
                         pool, what = {field: work[field]}, "HCA workspace"
+                    ratio = _ratio(op, path, self.known)
                     if wanted := V4_METADATA.get((op["op"], _keyed(op["args"], path))):
                         what = wanted.format(
                             ratio=ratio,
@@ -696,6 +768,8 @@ class Stub:
                             dest=_DESTS.get(ratio),
                         )
                         pool = {what: named[what]} if what in named else {}
+                    elif v41 := _named(op, path, live, self.known):
+                        pool = v41
                     try:
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
@@ -769,8 +843,15 @@ class Stub:
         kv = _forward_kv_cache_context.kv_cache_data
         held = _held(self.runner, kv)
         self.state = _state(self.runner, held)
+        # V4.1's ratios also by the width of the logits each scorer writes
+        self.known = self.pages | {
+            ("stride0", op["args"]["out_logits"]["shape"][1]): ratio
+            for op, _ in found.values()
+            if (ratio := op.get("stated", {}).get("compress_ratio")) is not None
+            and "out_logits" in op["args"]
+        }
         self.kv = {
-            (s, path): _kv(spec, path, held)
+            (s, path): _kv(spec, path, _named(op, path, held, self.known) or held)
             for s, (op, _) in found.items()
             for path, spec in _specs(op["args"])
             if spec["role"] == "kv"
@@ -1303,6 +1384,34 @@ def _values(args, path=""):
             yield where, value
 
 
+def _ratio(op, path, known=None):
+    """The compress ratio `op` runs at for its slot `path`: its `ratio`
+    argument, else the one it states; a list slot's i-th item the i-th of its
+    `ratios` (DeepSeek-V4.1's indptr scan, a table a ratio); else the ratio
+    `known` gives the rows a page holds at it (`rows_per_page`, V4.1's index
+    build, 0 when it takes no selection) or the width of the logits it reads
+    (`stride0`, V4.1's top-k, its scorer's)."""
+    args, (slot, *rest) = op["args"], path.split(".")
+    listed = args.get("ratios")
+    if rest and isinstance(args.get(slot), list) and isinstance(listed, list):
+        return listed[int(rest[0])]
+    ratio = args.get("ratio", op.get("stated", {}).get("compress_ratio"))
+    if ratio is None and "rows_per_page" in args and "selected" in args:
+        ratio = (known or {}).get(("rows_per_page", args["rows_per_page"]))
+        ratio = ratio if args["selected"] else 0
+    if ratio is None and known and "stride0" in args:
+        ratio = known.get(("stride0", args["stride0"]))
+    return ratio
+
+
+def _named(op, path, pool, known=None) -> dict | None:
+    """The buffer of `pool` `V41_NAMES` names for `op`'s slot `path`, by name,
+    when `pool` holds it."""
+    wanted = V41_NAMES.get((op["op"], _keyed(op["args"], path)))
+    name = wanted and wanted.format(ratio=_ratio(op, path, known))
+    return {name: pool[name]} if name in pool else None
+
+
 def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:
     """The live metadata tensor a metadata argument is a view of, and its name:
     one of its dtype with room for its span: one whose name the slot holds or
@@ -1335,8 +1444,11 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
     else among the last layers, `name.i`, of tensors stacked by layer whose
     layer has that layout: ATOM passes a layer of DeepSeek-V4's compressor
     state, and another field's base at this one's slot stride reaches past
-    the pool; or why none fits, and None: a tensor of another layout is
-    another buffer than the one ATOM passes."""
+    the pool; else among the buffers of arenas, as its dtype views them
+    (`_bound`), whose fields' strided views ATOM carves out of them, the
+    capture's pool sizing a dimension past the first (DeepSeek-V4.1's pages);
+    or why none fits, and None: a tensor of another layout is another buffer
+    than the one ATOM passes."""
     want = _layout(spec["shape"], spec["stride"])
     own = {n: t for n, t in live.items() if _layout(t.shape, t.stride()) == want}
     own = own or {
@@ -1344,6 +1456,8 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
         for n, t in live.items()
         if t.dim() > 2 and len(t) and _layout(t[-1].shape, t[-1].stride()) == want
     }
+    flat = f".buf.{spec['dtype']}"
+    own = own or {n: t for n, t in live.items() if n.endswith(flat)}
     if not own:
         return f"ATOM's KV holds no tensor laid out as {slot} {_text(spec)}", None
     try:
@@ -1384,6 +1498,37 @@ def _held(runner, registry) -> dict[str, torch.Tensor]:
         else:
             named.append((name, value))
     return {name: t for name, t in named if torch.is_tensor(t)}
+
+
+def _bound(name, value, old, device) -> dict[str, torch.Tensor]:
+    """Each tensor on `device` that `value` holds, by each of its paths from
+    `name`, the shortest first: itself, a dict's, list's or tuple's items, an
+    arena's fields (`view`) and its buffer as each field's dtype views it, an
+    object's attributes; none `old` holds by id, nor a module. The walk adds
+    each object it enters to `old`."""
+    out, queue = {}, deque([(name, value)])
+    while queue:
+        name, value = queue.popleft()
+        if torch.is_tensor(value):
+            if value.device.type == device.type and id(value) not in old:
+                out[name] = value
+            continue
+        if id(value) in old or isinstance(value, torch.nn.Module):
+            continue
+        old.add(id(value))
+        items = ()
+        if isinstance(value, dict):
+            items = value.items()
+        elif isinstance(value, (list, tuple)):
+            items = enumerate(value)
+        elif hasattr(value, "fields") and callable(getattr(value, "view", None)):
+            dtypes = sorted({f.dtype for f in value.fields}, key=str)
+            items = [(f.name, value.view(f.name)) for f in value.fields]
+            items += [(f"buf.{t}", value.buf.view(t)) for t in dtypes]
+        elif hasattr(value, "__dict__"):
+            items = vars(value).items()
+        queue.extend((f"{name}.{key}", item) for key, item in items)
+    return out
 
 
 def _state(runner, held) -> set[str]:
