@@ -117,7 +117,7 @@ def test_every_leaf_reaches_its_launch_but_a_plane_too_short_or_a_host_copy(
     fresh = [r for r in got["fresh"] if r["shape"] != "prefill T=128 B=1"]
     refused = [r for r in got["cached"] + fresh if r["verdict"] != "reaches launch"]
     host = [r for r in refused if r["op"] == HOST_COPY]
-    assert host and all("pageable host memory" in r["why"] for r in host)
+    assert host and all("no CUDA graph captures" in r["why"] for r in host)
     short = [r for r in refused if r["op"] != HOST_COPY]
     assert short and {(r["shape"], r["op"]) for r in short} <= {
         ("prefill T=2048 B=1", op) for op in PLANE_BOUND
