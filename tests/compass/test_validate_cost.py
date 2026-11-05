@@ -392,6 +392,21 @@ def test_a_group_step_is_validated_by_the_rank_it_is_priced_as(tmp_path):
     assert report["unvalidated"]["decode"]["steps"] == 1
 
 
+def test_a_group_step_is_counted_extrapolated_by_the_rank_it_is_priced_as(tmp_path):
+    # Step 10's cheaper rank 1 lies below the fitted hull; rank 0 prices it.
+    ranks = _two_ranks()
+    ranks[1][10] = ([(1, 50, True)], 1)
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "cheaper", steps, rank=r, group=ranks)
+    assert cost_accuracy(tmp_path / "cheaper", LAW)["extrapolated"] == 0
+
+    # Now rank 1 prices step 10, above the hull.
+    ranks[1][10] = ([(1, 200_000, True)], 1)
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "costlier", steps, rank=r, group=ranks)
+    assert cost_accuracy(tmp_path / "costlier", LAW)["extrapolated"] == 1
+
+
 def test_ranks_differing_by_more_than_a_trailing_step_refuse_naming_their_lengths(
     tmp_path,
 ):

@@ -41,7 +41,8 @@ under `refused` with its real seconds and its reasons, the most frequent named.
 A step whose priced rank a fallback answered after a source declined it
 (`StepCost.refusals`), as the step roofline below a step grid answers, is
 graded by its terms and also counted under `fallback`, with what declined it.
-A step it extrapolated, past its support domain, is counted too. An answer of any
+A step whose priced rank the backend extrapolated, past its support domain, is
+counted under `extrapolated`. An answer of any
 method but an estimated one outside its hull is validated, as the run summary
 groups seconds: an op graph's analytical and measured leaves are, its
 interpolated ones only inside a held-out bracket on each line they interpolate
@@ -208,8 +209,7 @@ def cost_accuracy(record, backend, steps=None) -> dict:
         top = step_linear_fit.priced_rank(
             {i: (c.target_seconds, group[i][1]) for i, c in costs.items()}
         )
-        terms = [t for c in costs.values() for t in c.terms]
-        extrapolated += any(t.provenance.extrapolated for t in terms)
+        extrapolated += any(t.provenance.extrapolated for t in costs[top].terms)
         band, price = _band(key, group[top][1]), costs[top].target_seconds
         # Each term of a fallback's answer carries what declined the step.
         if costs[top].refusals:
