@@ -335,6 +335,11 @@ V41_NAMES = {
     },
     (f"{_INDPTRS}:_launch_window_rows", "eptr"): f"{_CACHE.format(ratio=0)}.1",
     (_FUSED, "state_slot_mapping"): "step.slots",
+    **{
+        (fn, f"{field}_state"): f"attn_metadata_builder.cache.state.compress_{field}"
+        for fn in (_FUSED, _STATE)
+        for field in ("kv", "score")
+    },
     ("aiter.fused_moe_.default", "num_local_tokens"): "scheduled_tokens_gpu",
     ("aiter.topk_gating_fwd.default", "num_valid_rows"): "scheduled_tokens_gpu",
 }

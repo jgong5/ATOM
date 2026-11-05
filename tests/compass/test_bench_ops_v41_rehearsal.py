@@ -42,6 +42,11 @@ SCORER = (
 )
 TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
 CACHE = "attn_metadata_builder.cache."
+#: The compressor's leaves, which ATOM passes its kv and score state fields.
+STATE = (
+    "atom.model_ops.v4_kernels.state_writes:update_compressor_states",
+    "atom.model_ops.v4_kernels.fused_compress:_launch_fused_compress",
+)
 #: The MoE's slots of its valid rows, which ATOM passes the step's token count.
 MOE = {
     "aiter.fused_moe_.default": "num_local_tokens",
@@ -100,8 +105,9 @@ def _indptr(leaf, slot):
 def test_a_v41_leaf_takes_the_buffer_atom_passes_it(rehearsed):
     """ATOM's V4.1 forward passes each leaf its ratio's indptr pair, which
     the scan fills (`fill_step_indptrs`), its scorer's logits plane, tile
-    table and visible rows (`score_topk`), and the step's token count to its
-    MoE: none of which a buffer's shape and dtype alone names."""
+    table and visible rows (`score_topk`), its compressor's kv and score
+    state, and the step's token count to its MoE: none of which a buffer's
+    shape and dtype alone names."""
     leaves = [(r, json.loads(r["leaf"])) for r in rehearsed]
     widths = {
         leaf["args"]["out_logits"]["shape"][1]: _ratio(leaf, "out_logits")
@@ -124,6 +130,9 @@ def test_a_v41_leaf_takes_the_buffer_atom_passes_it(rehearsed):
         elif op == TOPK and leaf["args"]["logits"]["role"] == "metadata":
             ratio = widths[leaf["args"]["stride0"]]
             want = {s: f"step.visible.{ratio}" for s in ("row_starts", "row_ends")}
+        elif op in STATE:  # a layer of the compressor's stacked state field
+            want = {f"{f}_state": f"state.compress_{f}" for f in ("kv", "score")}
+            bound = {s: n.rsplit(".", 1)[0] for s, n in bound.items()}
         elif op in MOE:
             want = {MOE[op]: "scheduled_tokens_gpu"}
         elif op == "aiter.masked_embedding.default":
@@ -140,5 +149,6 @@ def test_a_v41_leaf_takes_the_buffer_atom_passes_it(rehearsed):
         SCORER,
         TOPK,
         *MOE,
+        *STATE,
         "aiter.masked_embedding.default",
     }
