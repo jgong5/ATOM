@@ -260,8 +260,7 @@ class EngramHost:
         # no UVA -- which is also what a CPU-only test wants to say.
         self.uva = False
         self._tp_group = None
-        # Every table this rank holds a shard of, for the fallback and the
-        # shutdown; in HBM rather than page-locked under ATOM_ENGRAM_UVA_HBM.
+        # Every table this rank holds a shard of, for the fallback and the shutdown.
         self._pinned_tables = []
         self.device = device
         self._in_hbm = envs.ATOM_ENGRAM_UVA_HBM
@@ -477,10 +476,10 @@ class EngramHost:
         """Drop every shard this rank holds; page-locked pages are unswappable.
 
         Each table gives up its shard tensors (`disable_uva`). The memory -- a
-        `hipHostMalloc` copy by default, the registration of the checkpoint
-        mapping in place, or HBM -- goes with the last tensor over it, after
-        the device has finished with it (`host_memory`), so a lookup still
-        holding one keeps it until then."""
+        `hipHostMalloc` copy by default, the checkpoint mapping registered in
+        place, or HBM -- goes with the last tensor over it, after the device
+        has finished with it (`host_memory`), so a lookup still holding one
+        keeps it until then."""
         for table in self._pinned_tables:
             table.disable_uva()
         self._pinned_tables = []
