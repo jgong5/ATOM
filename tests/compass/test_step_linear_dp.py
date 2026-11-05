@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """The step linear law under DP-attention with EP off: one law per rank, priced at
-the deployment's DP width, the group's step the max over its ranks. The checked-in
-DeepSeek-V4-Pro EP8 laws install at their own side's engine config only, and
-validate a step at every decode rung they fit.
+the deployment's DP width, the group's step the max over its ranks. A rung's hull
+holds each fitted step at the rank its vector prices it as, MoE column included.
+The checked-in DeepSeek-V4-Pro EP8 laws install at their own side's engine config
+only, and validate a step at every decode rung they fit.
 
 Each rank's record is written from a known per-rank law, every line labelled
 with the group's step, the max over the ranks' prices, as a real DP group's
@@ -17,6 +18,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import test_step_linear_moe_column as routed
 from test_backend_step_linear import _installed, _without_step_stub, law
 from test_backend_step_linear_fit import SPEC, _engine_file, _fit, _record
 from test_memory_readings import META_8B, publish_readings
@@ -159,6 +161,59 @@ def test_the_fit_records_whether_the_alternation_settled(
     law_ = _fit(_records(tmp_path, _groups(0)), dp=DP)
     assert law_["prefill"]["fit"]["passes"] == 1
     assert law_["decode"]["4"]["fit"]["passes"] == decode
+
+
+#: A rank's wide rows and another's one tall row cost about the same.
+WIDE_OR_TALL = {
+    "step": 0.015,
+    "context": 2e-8,
+    "graph_padding": 1e-8,
+    "moe_experts": 1.5e-4,
+}
+
+
+def _wide_or_tall(seed, widths, wide):
+    """200 decode steps at rung 4, each the group's step under `WIDE_OR_TALL`:
+    rank 0 runs 4 rows of one context drawn from `wide`, rank 1 one row 1.4 to
+    1.9 times as long, which the rung pads, and the others `widths` short rows,
+    so that the group's MoE tokens vary from step to step."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(200):
+        n = int(rng.uniform(*wide))
+        contexts = [[n] * routed.RUNG, [int(n * rng.uniform(1.4, 1.9))]]
+        for _ in range(DP - 2):
+            contexts.append(rng.integers(1, 1000, rng.integers(*widths)).tolist())
+        views = [routed._view(c, sum(map(len, contexts))) for c in contexts]
+        out.append((views, max(routed._price(v, WIDE_OR_TALL) for v in views)))
+    return out
+
+
+def test_a_routed_rung_hulls_each_step_at_the_rank_it_prices(tmp_path):
+    """The alternation takes each step's row on the rung's features alone; the
+    experts column the rung then adopts moves some steps' costliest rank from
+    the wide one to the tall one. Each step prices inside the fitted hull at
+    the rank it is priced as."""
+    full = _wide_or_tall(0, routed.FULL, (110_000, 130_000))
+    sparse = _wide_or_tall(1, routed.SPARSE, (80_000, 100_000))
+    records = routed._records(tmp_path / "full", full)
+    records += routed._records(tmp_path / "sparse", sparse)
+    law_ = routed._routed(records)[0]
+    vector = law_["decode"][str(routed.RUNG)]
+    assert vector["fit"]["moe_column"]["adopted"] == "moe_experts"
+    assert vector["fit"]["dropped"] == 0
+
+    laws = [_fit(records, dp=DP), law_]
+    backends = [StepLinearBackend(StepLinearLaw(x), DP) for x in laws]
+    moved, outside = 0, []
+    for i, (views, _) in enumerate(full + sparse):
+        costs = [[b.price(v) for v in views] for b in backends]
+        top = [int(np.argmax([c.seconds for c in cost])) for cost in costs]
+        moved += top[0] != top[1]
+        if any(t.provenance.extrapolated for t in costs[1][top[1]].terms):
+            outside.append(i)
+    assert moved
+    assert outside == []
 
 
 def test_a_law_fitted_on_dp_records_joins_at_their_width_and_refuses_at_dp_1(

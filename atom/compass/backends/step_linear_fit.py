@@ -73,7 +73,9 @@ order the law's `runs` names the runs. A feature with no variance gets coefficie
 zero and is named. Each vector reports its samples,
 warm and dropped counts, the centre and scaled MAD of its relative residuals,
 the condition number of its column-scaled design and
-the convex hull of its fitted steps, which `StepLinearLaw` reads. A vector with
+the convex hull of its fitted steps, which `StepLinearLaw` reads: each step's
+row at the rank the vector, with any column it adopted, prices highest
+(`priced_rank`), the rank a run prices the step as. A vector with
 no more fitted steps than coefficients, or whose steps span no hull, is left
 out and named under `unfitted`; `StepLinearBackend` refuses its steps.
 
@@ -132,6 +134,7 @@ from pathlib import Path
 import numpy as np
 
 from atom.compass.backends import step_labels
+from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.shape import (
     sum_context,
     sum_query_cached,
@@ -710,6 +713,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     prefill += ["serial_moe_rows"] * serial
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
     rows, alternation = _slowest(groups, prefill)
+    ranks = {(g[0][0], g[0][4]): g for g in groups}  # a step's rows by run and step
     law = {
         "provenance": f"step_linear_fit {form} on {len(runs) * dp} real records "
         f"({', '.join(runs)})",
@@ -760,8 +764,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     names = [*names, feature]
             chosen = _rowmod(members, counts, int(key), solved, seed, names)
             if chosen:
-                rowmod_k, column, solved, evidence = chosen
-                counts = np.column_stack([counts, column])
+                rowmod_k, _, solved, evidence = chosen
                 names = [*names, "rowmod"]
         slow = ~solved["keep"] & (solved["residual"] < 0)
         once = solved["residual"] < 1 / WARM_FACTOR - 1
@@ -782,18 +785,30 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             if key is None:
                 coef = (coef[2 + rungs.index(k)], *coef[:2])
             features = names if key else DECODE
+            coefficients = dict(zip(features, map(float, coef)))
+            priced = {"coefficients": coefficients}
+            if rowmod_k:
+                priced["rowmod"] = rowmod_k
             kept = mine & solved["keep"]
             try:
                 if kept.sum() <= len(features):
                     raise ValueError(
                         f"{int(kept.sum())} steps for {len(features)} coefficients"
                     )
-                hull = _hull(counts[kept][:, 1:], tuple(features[1:]))
+                # A column adopted after the alternation can move the costliest rank.
+                points = [
+                    _priced_row(priced, routing, ranks[r[0], r[4]])
+                    for r, keep in zip(members, kept)
+                    if keep
+                ]
+                hull = _hull(
+                    np.array(points, dtype=np.float64)[:, 1:], tuple(features[1:])
+                )
             except (ValueError, QhullError) as e:
                 law["unfitted"][k] = str(e).splitlines()[0]
                 continue
             vector = {
-                "coefficients": dict(zip(features, map(float, coef))),
+                "coefficients": coefficients,
                 "hull": hull,
                 "fit": {
                     "samples": int(kept.sum()),
@@ -1009,6 +1024,18 @@ def _counts(vector: dict, routing, counts, context, tokens, dummies) -> tuple:
     moe = [f for f in MOE_COLUMNS if f in vector["coefficients"]]
     counts = (*counts, *(moe_column(f, tokens, routing, dummies) for f in moe))
     return counts + ((rowmod(context, vector["rowmod"]),) if "rowmod" in vector else ())
+
+
+def _priced_row(vector: dict, routing, group) -> tuple:
+    """`_counts` of the row of `group`, a step's `fit` rows, at the rank `vector`
+    prices the step as (`priced_rank`), its terms folded as a run folds them."""
+    rows = [_counts(vector, routing, r[2], *r[5:]) for r in group]
+    c = vector["coefficients"].values()
+    price = {
+        j: (fold_seconds(x * w for x, w in zip(row, c)), r[2])
+        for j, (row, r) in enumerate(zip(rows, group))
+    }
+    return rows[priced_rank(price)]
 
 
 def held_out(samples, options=None, seed: int = 0) -> dict:
