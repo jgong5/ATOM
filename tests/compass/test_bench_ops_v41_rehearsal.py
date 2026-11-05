@@ -2,23 +2,27 @@
 """`compass measure ops` on DeepSeek-V4.1-Flash's two MI455 cells, off the
 card: every leaf of each cell's decode and prefill graphs, traced on card 0's
 reading at the cells' engine arguments, taken through `ops.measure` and
-`Stub.point` on ATOM's own runner up to its launch (`v41_ops_rehearsal.py`).
+`Stub.point` on ATOM's own runner up to its launch (`v41_ops_rehearsal.py`),
+each index, slot, pointer and count it takes checked against what it indexes.
 
-V4.1 binds its paged cache on its metadata builder, and its leaves take views
-of it, of the step its builder prepared and of its scorer's workspace, each
-table at the leaf's compress ratio: every leaf reaches its launch, on the
-buffers ATOM passes it.
+V4.1 binds its paged cache on its metadata builder, its leaves take views of
+it, of the step its builder prepared, of its decoder's tail and of its
+scorer's workspace, and a replaying prefill runs its decoder as passes of its
+own: each leaf takes the buffers ATOM's own capture passes it
+(`v41_capture_truth.py`).
 """
 
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 
 import pytest
 from test_capture_mi455_cells import A0, TREE, _trace
+from v41_ops_rehearsal import ATEN_INDEX
 from test_capture_v41_flash import ARGS, EP4
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
 
@@ -35,120 +39,92 @@ CELL = ARGS + (
 SHAPES = "--width 16 --prefill 2048 1"
 READ = "from atom.compass.capture import driverless\n"
 READ += f"driverless.card = {{0: {A0!r}}}.get\n"
-INDICES = "atom.model_ops.attentions.deepseek_v41.indices:"
-SCORER = (
+TRUTH = pathlib.Path(__file__).with_name("v41_capture_truth.py")
+#: A slot whose leaves of one signature ATOM passes either of two buffers,
+#: which the bench cannot yet tell apart (#2865): a query's RoPE and a ratio-1
+#: key's.
+UNTOLD = {("aiter.rope_cached_positions_fwd_impl.default", "positions")}
+#: The leaves the rehearsal refuses at a prefill past 8192 cached tokens, each
+#: reading rows of a logits plane past the columns the capture's prefill,
+#: which caches none, sized it to: the indexer's scorer, its top-k and the
+#: candidate pick's block maxima.
+PLANE_BOUND = {
     "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
-    "flydsl_fp8_paged_mqa_logits_gfx1250"
-)
-TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
-CACHE = "attn_metadata_builder.cache."
-#: The compressor's leaves, which ATOM passes its kv and score state fields.
-STATE = (
-    "atom.model_ops.v4_kernels.state_writes:update_compressor_states",
-    "atom.model_ops.v4_kernels.fused_compress:_launch_fused_compress",
-)
-#: The MoE's slots of its valid rows, which ATOM passes the step's token count.
-MOE = {
-    "aiter.fused_moe_.default": "num_local_tokens",
-    "aiter.topk_gating_fwd.default": "num_valid_rows",
+    "flydsl_fp8_paged_mqa_logits_gfx1250",
+    "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
+    "atom.model_ops.deepseek_v41.indexer:_block_maxima",
 }
-#: V4.1-Flash's compress ratios by the rows its 128-token page holds at each.
-PAGE_ROWS = {64: 2, 128: 1}
+
+
+def _run(script, *argv, cwd=TREE):
+    done = subprocess.run(
+        [sys.executable, str(script), *map(str, argv)],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        cwd=cwd,
+        env={**os.environ, "PYTHONPATH": str(TREE)},
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
 
 
 @pytest.fixture(scope="module", params=["", EP4], ids=["cell_b", "cell_a"])
 def rehearsed(request, model_dir, tmp_path_factory):  # noqa: F811
-    """A cell's graphs traced into a store, and the rehearsal's record of
-    each of their leaves at `--context 8192`."""
+    """A cell's graphs traced into a store; what its own capture passes each
+    leaf (`v41_capture_truth.py`); and the rehearsal's record of each leaf at
+    a decode of 8192 tokens a row and a prefill past as many cached, and of
+    each prefill leaf on no cached tokens."""
     root, ep = tmp_path_factory.mktemp("v41_rehearsal"), request.param
     _trace(root, SHAPES + CELL + ep, ("--arch", "gfx1250", "--gpu", "0"), READ)
+    model, cell = root / "model", (CELL + ep).split()[1:]
     for name in ("tokenizer.json", "tokenizer_config.json"):
-        shutil.copy(model_dir / name, root / "model" / name)
-    atom = ["--model", str(root / "model"), "-tp", "4", "--enforce-eager"]
-    atom += ["--level", "0", *(CELL + ep).split()[1:]]
-    bench = [*SHAPES.split(), "--context", "8192", "--llc-mib", "512"]
-    out = root / "records.json"
-    done = subprocess.run(
-        [sys.executable, str(HARNESS), str(out), *bench]
-        + ["--store", str(root / "store"), "--", *atom],
-        capture_output=True,
-        text=True,
-        timeout=1800,
-        cwd=TREE,
-        env={**os.environ, "PYTHONPATH": str(TREE)},
-    )
-    assert done.returncode == 0, done.stderr[-4000:]
-    return json.loads(out.read_text())
+        shutil.copy(model_dir / name, model / name)
+    _run(TRUTH, root / "truth.json", model, 4, *SHAPES.split(), "--", *cell)
+    atom = ["--model", model, "-tp", "4", "--enforce-eager", "--level", "0", *cell]
+    store = ["--llc-mib", "512", "--store", root / "store"]
+    points = {"cached": [*SHAPES.split(), "--context", "8192"]}
+    points["fresh"] = SHAPES.split()[2:]
+    got = {}
+    for name, shapes in points.items():
+        _run(HARNESS, root / f"{name}.json", *shapes, *store, "--", *atom)
+        got[name] = json.loads((root / f"{name}.json").read_text())
+    return got, json.loads((root / "truth.json").read_text())
 
 
-def test_every_leaf_of_both_shapes_reaches_its_launch(rehearsed):
-    assert {r["shape"] for r in rehearsed} == {"decode B=16", "prefill T=2048 B=1"}
-    assert [r for r in rehearsed if r["verdict"] != "reaches launch"] == []
-
-
-def _ratio(leaf, slot):
-    """The compress ratio ATOM runs `leaf` at for `slot`, read off its contract."""
-    args = leaf["args"]
-    if slot[-1].isdigit():  # the indptr scan's i-th table is its i-th ratio's
-        return args["ratios"][int(slot.split(".")[-1])]
-    if "rows_per_page" in args:  # the index build: no selection, no ratio
-        return PAGE_ROWS[args["rows_per_page"]] if args["selected"] else 0
-    return args.get("ratio", leaf.get("stated", {}).get("compress_ratio"))
-
-
-def _indptr(leaf, slot):
-    """The prefix or extend indptr of its ratio ATOM passes `leaf` as `slot`."""
-    extend = slot.startswith("e") or slot.endswith("extend")
-    return f"indptr_buffers.{_ratio(leaf, slot)}.{int(extend)}"
-
-
-def test_a_v41_leaf_takes_the_buffer_atom_passes_it(rehearsed):
-    """ATOM's V4.1 forward passes each leaf its ratio's indptr pair, which
-    the scan fills (`fill_step_indptrs`), its scorer's logits plane, tile
-    table and visible rows (`score_topk`), its compressor's kv and score
-    state, and the step's token count to its MoE: none of which a buffer's
-    shape and dtype alone names."""
-    leaves = [(r, json.loads(r["leaf"])) for r in rehearsed]
-    widths = {
-        leaf["args"]["out_logits"]["shape"][1]: _ratio(leaf, "out_logits")
-        for r, leaf in leaves
-        if r["op"] == SCORER
+def test_every_leaf_reaches_its_launch_but_a_plane_the_capture_sized_short(
+    rehearsed,
+):
+    """At a prefill past cached tokens, the indexer's row bounds reach past the
+    plane the capture's prefill, which caches none, sized: the rehearsal's
+    value check refuses those leaves by name; on no cached tokens they too
+    reach their launch."""
+    got, _ = rehearsed
+    cached = {r["shape"] for r in got["cached"]}
+    assert cached == {"decode B=16", "prefill T=2048 B=1"}
+    refused = [r for r in got["cached"] if r["verdict"] != "reaches launch"]
+    assert refused and {(r["shape"], r["op"]) for r in refused} <= {
+        ("prefill T=2048 B=1", op) for op in PLANE_BOUND
     }
-    checked = set()
-    for r, leaf in leaves:
-        op, bound = r["op"], r["bound"]
-        want = {}
-        if op in ("aiter.pa_sparse_prefill_opus.default", f"{INDICES}_launch_indices"):
-            want = {s: _indptr(leaf, s) for s in bound if "ptr" in s}
-        elif op == f"{INDICES}_launch_indptr_scan":
-            want = {s: _indptr(leaf, s) for s in bound if "ptrs." in s}
-        elif op == SCORER:
-            ratio = _ratio(leaf, "out_logits")
-            want = {"out_logits": "workspace._logits"}
-            want |= {"context_lens": f"step.visible.{ratio}"}
-            want |= {"kv_indices": f"workspace._tiles.{ratio}"}
-        elif op == TOPK and leaf["args"]["logits"]["role"] == "metadata":
-            ratio = widths[leaf["args"]["stride0"]]
-            want = {s: f"step.visible.{ratio}" for s in ("row_starts", "row_ends")}
-        elif op in STATE:  # a layer of the compressor's stacked state field
-            want = {f"{f}_state": f"state.compress_{f}" for f in ("kv", "score")}
-            bound = {s: n.rsplit(".", 1)[0] for s, n in bound.items()}
-        elif op in MOE:
-            want = {MOE[op]: "scheduled_tokens_gpu"}
-        elif op == "aiter.masked_embedding.default":
-            want = {"x": "input_ids"}
-        # a scorer or top-k of an earlier layer's candidates reads its rows' own
-        want = {s: w for s, w in want.items() if s in bound}
-        got = {s: bound[s].removeprefix(CACHE) for s in want}
-        assert got == want, (op, r["shape"])
-        checked |= {op} if want else set()
-    assert checked == {
-        "aiter.pa_sparse_prefill_opus.default",
-        f"{INDICES}_launch_indices",
-        f"{INDICES}_launch_indptr_scan",
-        SCORER,
-        TOPK,
-        *MOE,
-        *STATE,
-        "aiter.masked_embedding.default",
-    }
+    assert all(re.search(r"past 0 to \d+$", r["why"]) for r in refused)
+    assert [r for r in got["fresh"] if r["verdict"] != "reaches launch"] == []
+
+
+def test_each_leaf_takes_the_buffers_atom_s_capture_passes_it(rehearsed):
+    """Each argument a kernel leaf takes of ATOM's metadata, and each integer
+    table of its KV, and each index an aten index operator takes, is the
+    buffer ATOM's own capture passes that leaf, by name and offset. aten's
+    other leaves index nothing and launch the same work on any values."""
+    got, truth = rehearsed
+    wrong, checked = [], 0
+    for r in [*got["cached"], *got["fresh"]]:
+        for path, name in r["identity"].items():
+            slot = path.split(".")[0]
+            if r["op"].startswith("aten.") and (r["op"], slot) not in ATEN_INDEX:
+                continue
+            if (r["op"], slot) in UNTOLD:
+                continue
+            want = [w for w in truth.get(r["leaf"], {}).get(path, []) if w != "?"]
+            checked += bool(want)
+            if want and name not in want:
+                wrong.append((r["shape"], r["op"], path, name, want))
+    assert checked and wrong == []

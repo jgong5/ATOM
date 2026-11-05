@@ -40,8 +40,179 @@ VALUELESS = (
 )
 
 
+#: The integer dtypes of a leaf's indices, slots, pointers and counts.
+INTEGERS = ("torch.int32", "torch.int64")
+#: aten's index operators, by the slot of their indices: the dimension of
+#: `self` each indexes (`dim`, or the index's own position in the list), and
+#: the least value it may take, as a share of that extent.
+ATEN_INDEX = {
+    ("aten.index_select.default", "index"): ("dim", 0),
+    ("aten.index_fill_.int_Scalar", "index"): ("dim", 0),
+    ("aten.gather.default", "index"): ("dim", 0),
+    ("aten.index.Tensor", "indices"): (None, -1),
+    ("aten.index_put_.default", "indices"): (None, -1),
+}
+
+
 class Launched(Exception):
     """The leaf's call is built and its operator found: it would launch."""
+
+
+#: A step's tables its forward's first reader fills and a later reader takes
+#: from it, views of buffers the cache and workspace hold, which a step the
+#: bench prepares holds none of: a tensor is named by those buffers.
+PER_FORWARD = (
+    "group_indices",
+    "indptrs",
+    "tiles",
+    "selected",
+    "candidates",
+    "candidate_blocks",
+    "window_rows",
+)
+
+
+def named(runner) -> list:
+    """Each device tensor a V4.1 step can pass a leaf, by a name the capture's
+    runner and the bench's both give it: the forward variables, the forward
+    context's and its metadata's own, and what the builder's paged cache holds,
+    its step, its decoder plan (`decoder`, the forward's `replay`) and its
+    scorer's workspace among them, but its forward's tables (`PER_FORWARD`)."""
+    import torch
+
+    from atom.compass.bench import ops
+    from atom.utils.forward_context import get_forward_context
+
+    fc, device = get_forward_context(), runner.device
+    out = [(f"fv.{k}", getattr(v, "gpu", v)) for k, v in runner.forward_vars.items()]
+    for prefix, owner in (("md", fc.attn_metadata), ("ctx", fc.context)):
+        out += [(f"{prefix}.{k}", v) for k, v in getattr(owner, "__dict__", {}).items()]
+    cache = getattr(runner.attn_metadata_builder, "cache", None)
+    step = getattr(cache, "current_step", None)
+    plan = getattr(step, "decoder", None)
+    replay = ".current_step.replay." if getattr(step, "replay", None) is plan else None
+    for name, t in ops._bound("cache", cache, set(), device).items():
+        if not any(f".{table}" in name for table in PER_FORWARD):
+            out.append(
+                (name.replace(replay, ".current_step.decoder.") if replay else name, t)
+            )
+    return [
+        (n, t, _region(t))
+        for n, t in out
+        if torch.is_tensor(t) and t.device.type == device.type
+    ]
+
+
+def _region(t):
+    """`t`'s storage and the bytes it spans there."""
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    from atom.compass.bench import ops
+
+    start = t.storage_offset() * t.element_size()
+    end = start + ops._span(t.shape, t.stride()) * t.element_size()
+    return StorageWeakRef(t.untyped_storage()), start, end
+
+
+def identity(t, pool) -> str:
+    """The smallest of `pool`'s tensors that holds `t`'s bytes, an exact view
+    of them first, by name and byte offset; `?` when none does: a host tensor
+    or one the step made and holds nowhere."""
+    storage, lo, hi = _region(t)
+    best = None
+    for name, c, (where, clo, chi) in pool:
+        if where == storage and clo <= lo and hi <= chi:
+            exact = (c.shape, c.stride(), c.dtype, clo) == (
+                t.shape,
+                t.stride(),
+                t.dtype,
+                lo,
+            )
+            key = (not exact, chi - clo, name)
+            best = min(best or (key, name, lo - clo), (key, name, lo - clo))
+    return f"{best[1]}+{best[2]}" if best else "?"
+
+
+def staged(runner) -> dict:
+    """The host side of each buffer ATOM stages for the step (`CpuGpuBuffer`),
+    by its device side's storage: what the device side holds once published."""
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    from atom.utils import CpuGpuBuffer
+
+    cache = getattr(runner.attn_metadata_builder, "cache", None)
+    held = [*runner.forward_vars.values(), *getattr(cache, "__dict__", {}).values()]
+    return {
+        StorageWeakRef(b.gpu.untyped_storage()): b.cpu
+        for b in held
+        if isinstance(b, CpuGpuBuffer)
+    }
+
+
+def values(t, hosts):
+    """The values ATOM staged for the device tensor `t`, or None."""
+    from torch._subclasses.fake_tensor import unset_fake_temporarily
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    host = hosts.get(StorageWeakRef(t.untyped_storage()))
+    if host is None:
+        return None
+    with unset_fake_temporarily():
+        return host.as_strided(t.shape, t.stride(), t.storage_offset()).tolist()
+
+
+def out_of_range(op, held, known) -> str | None:
+    """Why an index, slot, pointer or count `op` takes, of the values `held`
+    by slot path, reaches past what it indexes, or None: aten's index
+    operators against `self`'s dimension (`ATEN_INDEX`), a gather's rows
+    against its tensors' token axis, a state slot against the slots and a
+    block table against the blocks `known` states, a position against the
+    model's length, a row bound against its logits' width, a count against
+    the rows the leaf runs, and a pointer table never falling."""
+    from atom.compass.bench import ops
+
+    args, specs = op["args"], dict(ops._specs(op["args"]))
+    first = next((s for s in specs.values() if s["role"] == "activation"), None)
+    logits = specs.get("logits", specs.get("out_logits"))
+    for path, got in held.items():
+        flat = [v for v in _flat(got)]
+        if not flat:
+            continue
+        slot, lo, hi = path.split(".")[0], min(flat), max(flat)
+        index = ATEN_INDEX.get((op["op"], slot))
+        if index is not None:
+            dim = args[index[0]] if index[0] else int(path.split(".")[1])
+            size = specs["self"]["shape"][dim]
+            bounds = index[1] * size, size - 1
+        elif slot == "rows" and "tensors" in args:
+            bounds = 0, specs["tensors.0"]["shape"][args["dim"]] - 1
+        elif "slot" in slot:
+            bounds = -1, known["slots"] - 1
+        elif "block_table" in slot:
+            bounds = -1, known["blocks"] - 1
+        elif slot == "positions":
+            bounds = 0, known["max_model_len"] - 1
+        elif slot in ("context_lens", "row_starts", "row_ends", "visible") and logits:
+            bounds = 0, logits["shape"][-1]
+        elif slot.startswith("num_") and first is not None:
+            bounds = 0, first["shape"][0]
+        elif "ptr" in slot or slot.startswith("cu_seqlens"):
+            if any(b < a for a, b in zip(flat, flat[1:])) or lo < 0:
+                return f"{path} falls or is negative: {flat[:8]}"
+            continue
+        else:
+            continue
+        if lo < bounds[0] or hi > bounds[1]:
+            return f"{path} holds {lo} to {hi}, past {bounds[0]} to {bounds[1]}"
+    return None
+
+
+def _flat(value):
+    if isinstance(value, list):
+        for v in value:
+            yield from _flat(v)
+    else:
+        yield value
 
 
 def first_of_each(found):
@@ -105,6 +276,48 @@ def main(out, argv) -> None:
     import torch._inductor.decomposition  # noqa: F401  as a capture imports it
 
     function, draw, bincount = ops._function, ops.uniform_ids, torch.bincount
+    deep, prepare, time_ = ops._deep, ops.Stub._prepare, ops.Stub._time
+    journal = ops._journal
+    # by the id of each metadata view's clone, the live view it cloned; by
+    # leaf and slot, the identity and staged values of what placement 0 bound
+    sources, bound, seen = {}, {}, {}
+
+    def cloning(x, memo, clones=None):
+        out = deep(x, memo, clones)
+        if torch.is_tensor(x):
+            sources[id(out)] = out, x
+        return out
+
+    def preparing(stub, batch):
+        prepare(stub, batch)
+        if len(stub.placed) > 1:
+            return
+        bound.clear()
+        pool, hosts = named(stub.runner), staged(stub.runner)
+        for (sig, path), (_, view) in stub.placed[0][1].items():
+            if view is None:
+                continue
+            live = sources.get(id(view), (None, view))[1]
+            spec = dict(ops._specs(stub.leaves[sig][0]["args"]))[path]
+            if spec["role"] == "metadata" or str(live.dtype) in INTEGERS:
+                bound[sig, path] = identity(live, pool), values(live, hosts)
+
+    def timing(stub, op, sig, instances, n):
+        held = {p: v for (s, p), (_, v) in bound.items() if s == sig and v}
+        seen[sig] = {p: i for (s, p), (i, _) in bound.items() if s == sig}
+        known = {
+            "slots": stub.slots,
+            "blocks": stub.runner.config.num_kvcache_blocks,
+            "max_model_len": stub.runner.config.max_model_len,
+        }
+        if why := out_of_range(op, held, known):
+            raise IndexError(why)
+        return time_(stub, op, sig, instances, n)
+
+    def journaled(path, records):
+        for r in records:
+            r["identity"] = seen.get(r["leaf"], {})
+        return journal(path, records)
 
     def launching(name):
         function(name)  # found, or the leaf refuses
@@ -139,6 +352,10 @@ def main(out, argv) -> None:
             (ModelRunner, "_setup_device_and_distributed", on_device),
             (ModelRunner, "_read_device_memory", readings),
             (ops, "_function", launching),
+            (ops, "_deep", cloning),
+            (ops, "_journal", journaled),
+            (ops.Stub, "_prepare", preparing),
+            (ops.Stub, "_time", timing),
             (ops, "uniform_ids", host_draw),
             (ranks, "cpu_group", lambda: None),
             (torch, "bincount", uncounted),
@@ -156,6 +373,7 @@ def main(out, argv) -> None:
         records.append(
             {k: r[k] for k in ("shape", "op", "leaf")}
             | {"verdict": state, "why": why, "bound": r.get("metadata", {})}
+            | {"identity": r.get("identity", {})}
         )
     pathlib.Path(out).write_text(json.dumps(records, indent=1))
 

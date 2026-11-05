@@ -314,6 +314,8 @@ _INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
 _SCAN = f"{_INDPTRS}:_launch_indptr_scan"
 _INDICES = f"{_INDPTRS}:_launch_indices"
 _FUSED = "atom.model_ops.v4_kernels.fused_compress:_launch_fused_compress"
+_SWA = "atom.model_ops.v4_kernels.state_writes:swa_write"
+_GATHER = "atom.model_ops.attentions.token_layout.gather:gather_rows"
 V41_NAMES = {
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_prefix"): f"{_CACHE}.0",
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_extend"): f"{_CACHE}.1",
@@ -335,6 +337,16 @@ V41_NAMES = {
     },
     (f"{_INDPTRS}:_launch_window_rows", "eptr"): f"{_CACHE.format(ratio=0)}.1",
     (_FUSED, "state_slot_mapping"): "step.slots",
+    (_SWA, "state_slot_per_seq"): "step.slots",
+    ("aiter.rope_cached_positions_fwd_impl.default", "positions"): (
+        "step.positions",
+        "step.plans.{ratio}.key_rope_positions_gpu",
+    ),
+    ("aten.index_select.default", "index", "kv"): "step.slots",
+    ("aten.index_select.default", "index", "metadata"): "plan.last",
+    ("aten.index.Tensor", "indices"): "plan.query_ptrs",
+    ("aten.index_put_.default", "indices"): ("plan.tail_rows", "plan.last_rows"),
+    (_GATHER, "rows"): ("plan.tail_rows", "plan.last"),
     **{
         (fn, f"{field}_state"): f"attn_metadata_builder.cache.state.compress_{field}"
         for fn in (_FUSED, _STATE)
@@ -732,16 +744,26 @@ class Stub:
             live[name] = getattr(buffer, "gpu", buffer)
         for owner in (fc.attn_metadata, fc.context):
             live |= {k: v for k, v in vars(owner).items() if torch.is_tensor(v)}
-        # DeepSeek-V4.1's step and its scorer's workspace, whose tensors its
-        # leaves view and no attribute of the metadata holds
         device, md = self.runner.device, fc.attn_metadata
-        scorer = getattr(getattr(md, "cache", None), "workspace", None)
-        live |= _bound("step", getattr(md, "step", None), set(), device)
-        live |= _bound("workspace", scorer, set(), device)
         live = {
             k: v
             for k, v in live.items()
             if torch.is_tensor(v) and v.device.type == device.type
+        }
+        # DeepSeek-V4.1's scorer workspace and decoder plan, whose tensors its
+        # leaves view and no attribute of the metadata holds, and each pass's
+        # step ahead of the rest, so a tie takes its own, its count of real
+        # rows the context's
+        scorer = getattr(getattr(md, "cache", None), "workspace", None)
+        plan = getattr(getattr(md, "step", None), "decoder", None)
+        live |= _bound("workspace", scorer, set(), device)
+        live |= _bound("plan", plan, set(), device)
+        passes, running = _passes(fc), getattr(fc.context, "running_tokens", None)
+        lives = {
+            rows: _bound("step", step, set(), device)
+            | live
+            | ({} if count is None else {"scheduled_tokens_gpu": count})
+            for rows, (step, count) in passes.items()
         }
         # DeepSeek-V4's persistent HCA decode workspace, one per device: a slot
         # of `HCA_DECODE` named as one of its fields is a view of that field
@@ -750,14 +772,15 @@ class Stub:
         work = work._asdict() if work is not None else {}
         # a decode split plan, `(splits, split_indptr)`: only a slot
         # `V4_METADATA` names takes it, so `_meta`'s rules never offer it
-        named = live | {
+        named = lives[None] | {
             f"{k}.1": v[1]
             for k, v in vars(fc.attn_metadata).items()
             if k.startswith("split_plan_") and v
         }
         meta = dict(self.kv)
         for sig, (op, _) in self.leaves.items():
-            writes = _writes(op["op"])
+            writes, rows = _writes(op["op"]), _pass_rows(op)
+            live = lives.get(None if rows == running else rows, lives[None])
             for path, spec in _specs(op["args"]):
                 if spec["role"] == "metadata":
                     token = (op["op"], path) in TOKEN_IDS
@@ -773,7 +796,7 @@ class Stub:
                             dest=_DESTS.get(ratio),
                         )
                         pool = {what: named[what]} if what in named else {}
-                    elif v41 := _named(op, path, live, self.known):
+                    elif v41 := _named(op, path, spec, live, self.known):
                         pool = v41
                     try:
                         if not pool:
@@ -856,7 +879,7 @@ class Stub:
             and "out_logits" in op["args"]
         }
         self.kv = {
-            (s, path): _kv(spec, path, _named(op, path, held, self.known) or held)
+            (s, path): _kv(spec, path, _named(op, path, spec, held, self.known) or held)
             for s, (op, _) in found.items()
             for path, spec in _specs(op["args"])
             if spec["role"] == "kv"
@@ -1389,6 +1412,33 @@ def _values(args, path=""):
             yield where, value
 
 
+def _passes(fc) -> dict:
+    """The passes of a forward, by the rows each runs, each its step and its
+    count of real rows (`ForwardContext.use_pass_rows`): DeepSeek-V4.1's
+    replaying prefill runs its decoder over its tail's rows and, at the last
+    layer, each finishing request's last row; any other rows are the step's,
+    under the key None."""
+    step = getattr(fc.attn_metadata, "step", None)
+    plan, passes = getattr(step, "decoder", None), {}
+    if plan is not None:
+        passes[plan.tail_rows.numel()] = plan.tail, plan.filled_gpu
+        queries = dataclasses.replace(plan.tail, batch_ids=plan.query_ids)
+        passes[plan.last.numel()] = queries, plan.finishing_gpu
+    passes[None] = step, getattr(fc.context, "scheduled_tokens_gpu", None)
+    return passes
+
+
+def _pass_rows(op) -> int | None:
+    """The rows a leaf runs: its positions' or batch ids', else its first
+    activation's leading rows, past a leading batch of one."""
+    specs = dict(_specs(op["args"]))
+    for slot in ("positions", "batch_ids"):
+        if slot in specs:
+            return specs[slot]["shape"][-1]
+    shape = next((s["shape"] for s in specs.values() if s["role"] == "activation"), [])
+    return shape[1] if shape[:1] == [1] and len(shape) > 2 else (shape or [None])[0]
+
+
 def _ratio(op, path, known=None):
     """The compress ratio `op` runs at for its slot `path`: its `ratio`
     argument, else the one it states; a list slot's i-th item the i-th of its
@@ -1409,12 +1459,23 @@ def _ratio(op, path, known=None):
     return ratio
 
 
-def _named(op, path, pool, known=None) -> dict | None:
-    """The buffer of `pool` `V41_NAMES` names for `op`'s slot `path`, by name,
-    when `pool` holds it."""
-    wanted = V41_NAMES.get((op["op"], _keyed(op["args"], path)))
-    name = wanted and wanted.format(ratio=_ratio(op, path, known))
-    return {name: pool[name]} if name in pool else None
+def _named(op, path, spec, pool, known=None) -> dict | None:
+    """The buffers of `pool` `V41_NAMES` names for `op`'s slot `path`, by
+    name, those of `spec`'s dtype `pool` holds, of its shape and stride if
+    any is, or None: at the leaf's ratio, or at each one `known` holds when it
+    states none."""
+    key = op["op"], _keyed(op["args"], path)
+    role = (op["args"].get("self") or {}).get("role")
+    wanted = V41_NAMES.get((*key, role), V41_NAMES.get(key, ()))
+    wanted = wanted if isinstance(wanted, tuple) else (wanted,)
+    ratio = _ratio(op, path, known)
+    ratios = [ratio] if ratio is not None else sorted(set((known or {}).values()))
+    names = [w.format(ratio=r) for w in wanted for r in ratios or [None]]
+    held = {
+        n: pool[n] for n in names if n in pool and str(pool[n].dtype) == spec["dtype"]
+    }
+    exact = {n: t for n, t in held.items() if _spec(t) == _spec_of(spec)}
+    return exact or held or None
 
 
 def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:
