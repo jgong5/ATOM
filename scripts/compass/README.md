@@ -292,7 +292,7 @@ Every ATOM process in it runs with these settings:
 |---|---|
 | `ENABLE_CK=0` | aiter's JIT fails `module_activation` and `module_sample` in CK's `amd_tdm_store` |
 | `GPU_ARCHS=gfx1250` | aiter's JIT fails `module_deepgemm_opus`, built for the card's 192 CUs where OPUS registers gfx1250 at 256 |
-| `ATOM_ENGRAM_UVA=0` | a V4.1-Flash start page-locks 189 GiB of Engram tables |
+| `ATOM_ENGRAM_UVA=1` with `ATOM_ENGRAM_UVA_HBM=1` | `ATOM_ENGRAM_UVA=1` alone page-locks 189 GiB of Engram tables, more than the node's host memory; `ATOM_ENGRAM_UVA=0` gathers each forward's Engram rows on the host, 5 to 50 ms on 28% of one-sequence decode steps ([#2797](https://github.com/jgong5/ATOM/issues/2797)) |
 | `NCCL_MIN_NCHANNELS` unset | the image's 112 faults the first RCCL all-reduce |
 
 DeepSeek-V4.1-Flash then serves at TP4 with
@@ -858,17 +858,14 @@ variant on tile buffers as `ScoreWorkspace` sizes them, came first; a record tha
 built one was taken again.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json` is the same law for
-cell A, TP4 with whole-expert EP4: fitted alike on `calibrate.sh` records at ATOM bb161b906
-in the same image, under the same environment and `SERVER_ARGS` with
-`--enable-expert-parallel` added. The records are concurrency 1, 4, 16, 64 and 256, then 8,
-12 and 56 from each trajectory's first turn for rungs 7, 8, 12 and 56: at c=256 the decode
-steps run at rung 64 but for a few at rung 1. The c=256 and first-turn c=56 records were
-taken later, for [#2582](https://github.com/jgong5/ATOM/issues/2582), each by
-`calibrate.sh`'s record step alone, and both fits were run again on every record. Its
-first-turn records served under expert parallel here with no
-[#2538](https://github.com/jgong5/ATOM/issues/2538) fault. An unscored record at each of the
-first six concurrencies came first; a record that still built a Triton variant was taken
-again.
+cell A, TP4 with whole-expert EP4: fitted alike on one `calibrate.sh` run's records at ATOM
+ed5fa7697 in the same image ([#2744](https://github.com/jgong5/ATOM/issues/2744)), under the
+same environment with `ATOM_ENGRAM_UVA=1 ATOM_ENGRAM_UVA_HBM=1` in place of
+`ATOM_ENGRAM_UVA=0`, so every rank held its Engram shard in HBM, and the same `SERVER_ARGS`
+with `--enable-expert-parallel --spec-decode-acceptance-length 3` added. A run priced by it
+passes `--spec-decode-acceptance-length 3` too. The records are concurrency 1, 4, 16, 64 and
+256, then 8, 12 and 56 from each trajectory's first turn: at c=256 all but a few hundred
+decode steps run at rung 64. No record built a JIT kernel.
 
 A simulated run prices by a checked-in law when the law file stands in for both tokens:
 `compass run --step-linear LAW --host-laws LAW $M $S --out D -- $ATOM`, `LAW` a file in
