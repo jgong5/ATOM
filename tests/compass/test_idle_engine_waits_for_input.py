@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """An idle engine parks on its input queue instead of spinning, and each kind of
 work its busy loop serves wakes it: a request, a utility command (an abort is
-one), a shutdown, the metrics push and pending KV work. A simulated run never
-parks there.
+one), a shutdown, the metrics push and pending KV work. A request or utility
+command that lands just before the wait, or while it checks for one, is not
+waited out. A simulated run never parks there.
 
 ATOM's `EngineCore.busy_loop` and input thread (`process_input_sockets`) run on
 the real clock over a fake wire, with ATOM's utility handler and a scheduler
@@ -98,8 +99,8 @@ class Scheduler:
         pass
 
 
-def _engine(kv: bool = False) -> EngineCore:
-    engine = EngineCore.__new__(EngineCore)
+def _engine(kv: bool = False, cls=EngineCore) -> EngineCore:
+    engine = cls.__new__(cls)
     engine.label, engine.scheduler = "engine", Scheduler()
     engine.input_queue, engine.utility_queue = queue.Queue(), queue.Queue()
     engine.output_queue = queue.Queue()
@@ -206,14 +207,89 @@ def test_pending_kv_work_is_polled_while_the_engine_is_idle(monkeypatch):
         assert _taken(engine)[0] == "kv"
 
 
-def test_a_simulated_engine_never_parks(monkeypatch):
-    monkeypatch.setattr(clock, "_installed", SimpleNamespace(read_clock=time.monotonic))
-    engine = _engine()
+def _parks(engine) -> bool:
+    """Whether `_wait_for_input`, handed a deadline no test reaches, is still
+    waiting after `PROMPT_S`; one that is gets woken."""
     waiter = threading.Thread(
         target=engine._wait_for_input, args=(time.monotonic() + QUIET_S,), daemon=True
     )
     waiter.start()
     waiter.join(PROMPT_S)
     parked = waiter.is_alive()
-    engine.input_queue.put([])  # wakes it if it parked
-    assert not parked
+    with engine.input_queue.not_empty:
+        engine.input_queue.not_empty.notify_all()
+    return parked
+
+
+def test_a_simulated_engine_never_parks(monkeypatch):
+    monkeypatch.setattr(clock, "_installed", SimpleNamespace(read_clock=time.monotonic))
+    assert not _parks(_engine())
+
+
+def test_a_request_queued_before_the_wait_is_not_waited_out():
+    engine = _engine()
+    engine.input_queue.put_nowait([])
+    assert not _parks(engine)
+
+
+def test_a_utility_command_queued_before_the_wait_is_not_waited_out():
+    engine = _engine()
+    engine.utility_queue.put_nowait(("abort_request", {"req_id": 7}))
+    engine._has_pending_utility = True  # as the input thread leaves it
+    assert not _parks(engine)
+
+
+def _arriving(arrive) -> None:
+    """Run `arrive`, the input thread's side, on another thread, waiting up to
+    0.2 s for it: while the wait's caller holds the input queue's lock, it
+    cannot finish until the wait releases the lock."""
+    thread = threading.Thread(target=arrive, daemon=True)
+    thread.start()
+    thread.join(0.2)
+
+
+class RacingQueue(queue.Queue):
+    """An input queue whose first size read sees a request put as it reads."""
+
+    raced = False
+
+    def _qsize(self):
+        n = super()._qsize()
+        if not self.raced:
+            self.raced = True
+            _arriving(lambda: self.put_nowait([]))
+        return n
+
+
+class RacingEngine(EngineCore):
+    """An engine whose first read of its utility flag sees a command put,
+    flagged and notified as it reads, as the input thread does."""
+
+    raced = False
+
+    @property
+    def _has_pending_utility(self):
+        pending = self.__dict__.get("_pending", False)
+        if not self.raced:
+            self.raced = True
+            _arriving(self._arrive)
+        return pending
+
+    @_has_pending_utility.setter
+    def _has_pending_utility(self, value):
+        self.__dict__["_pending"] = value
+
+    def _arrive(self):
+        self.utility_queue.put_nowait(("abort_request", {"req_id": 7}))
+        self._has_pending_utility = True
+        self._notify_input()
+
+
+def test_a_request_racing_the_check_is_not_lost():
+    engine = _engine()
+    engine.input_queue = RacingQueue()
+    assert not _parks(engine)
+
+
+def test_a_utility_command_racing_the_check_is_not_lost():
+    assert not _parks(_engine(cls=RacingEngine))

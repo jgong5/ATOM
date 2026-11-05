@@ -478,6 +478,11 @@ class EngineCore:
         A loop that spun instead would hold the GIL, so the input thread would
         take each request one or more 5 ms switch intervals late. A simulated
         run's idle point is `clock.idle`, so there this returns at once.
+
+        Both checks run under the lock a put or `_notify_input` takes, so input
+        landing between them and the wait still wakes it. The utility check
+        reads the flag `process_queue` drains on, which the input thread sets
+        before it notifies.
         """
         if clock.installed() is not None:
             return
@@ -485,7 +490,7 @@ class EngineCore:
         timeout = deadline - clock.now(time.monotonic)
         q = self.input_queue
         with q.not_empty:
-            if timeout > 0 and not q._qsize() and self.utility_queue.empty():
+            if timeout > 0 and not q._qsize() and not self._has_pending_utility:
                 q.not_empty.wait(min(timeout, threading.TIMEOUT_MAX))
 
     def _notify_input(self) -> None:
