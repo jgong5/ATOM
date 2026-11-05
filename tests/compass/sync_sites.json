@@ -1767,9 +1767,21 @@
    "shape": "spin_loop",
    "category": "A",
    "peer": "none",
-   "why": "the engine step loop turns with no pause and no blocking call when there is nothing to run: it drains its input queue without blocking and re-tests the scheduler, so an idle engine spins instead of waiting. Simulated time has to jump to the next declared event here",
+   "why": "the engine step loop makes no blocking call of its own: it drains its input queue without blocking and re-tests the scheduler. An idle real engine parks in `_wait_for_input`, which returns at once under a simulated clock, so there an idle engine spins and simulated time has to jump to the next declared event here",
    "mechanism": "K3",
    "mechanism_why": "the engine step loop's spin when there is nothing to run becomes an idle point that jumps to the next local event"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore._wait_for_input::q.not_empty.wait(min(timeout, threading.TIMEOUT_MAX))::event_wait#0",
+   "file": "atom/model_engine/engine_core.py",
+   "symbol": "EngineCore._wait_for_input",
+   "call": "q.not_empty.wait",
+   "expr": "q.not_empty.wait(min(timeout, threading.TIMEOUT_MAX))",
+   "shape": "event_wait",
+   "peer": "thread",
+   "why": "an idle real engine parks on its input queue until the input thread puts a request or a shutdown there or notifies a utility command, or until its next KV drain or metrics push is due",
+   "mechanism": "K9",
+   "mechanism_why": "reached only on a real run: under a simulated clock the method returns before it, and the loop's idle point is clock.idle"
   },
   {
    "id": "atom/model_engine/engine_core.py::EngineCore._process_engine_step_inner::self.runner_mgr.call_func( \"forward\", scheduled_batch, wait_out=True )::worker_rpc#0",
