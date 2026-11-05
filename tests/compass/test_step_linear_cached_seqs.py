@@ -4,7 +4,8 @@ history's length: the step linear law's `cached_seqs` column.
 
 Records are written from a known law that charges it; the `cached_seqs` form
 finds it where `base` cannot, and the backend prices it on each row with
-cached context and on no other.
+cached context and on no other. A law without the column prices a chunk on
+cached context by its `query_cached` slope alone, as it did before the column.
 """
 
 import numpy as np
@@ -57,3 +58,19 @@ def test_the_cached_seqs_form_finds_a_cost_per_row_on_cached_context(tmp_path):
         terms = {t.name: t.seconds for t in cost.terms}
         cached = sum(c > q for q, c, _ in rows)
         assert terms["prefill.cached_seqs"] == pytest.approx(CACHED * cached)
+
+
+def test_only_a_law_carrying_the_column_prices_a_later_chunk_apart_from_a_first(
+    tmp_path,
+):
+    records = [_record(tmp_path / f"dp0-{s}.jsonl", _cached_steps(s)) for s in (7, 8)]
+    first, later = _view([(4096, 4096, False)]), _view([(4096, 24096, False)])
+    for form in ("cached_seqs", "base"):
+        law = _fit(records, form)
+        backend = StepLinearBackend(StepLinearLaw(law))
+        apart = backend.price(later).seconds - backend.price(first).seconds
+        c = law["prefill"]["coefficients"]
+        slope = c["query_cached"] * 4096 * 20000
+        assert apart == pytest.approx(c.get("cached_seqs", 0.0) + slope)
+        names = {t.name for t in backend.price(later).terms}
+        assert ("prefill.cached_seqs" in names) == (form == "cached_seqs")
