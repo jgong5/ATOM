@@ -587,11 +587,11 @@ puts every serving run on the deadlock-recovery path (`01`, Invariants).
 On #2144's V4.1-Flash c=16 cell, client start to response headers less the segment
 tokenizer call is 11.75 ms per long prompt, and a simulated run charges each part
 apart ([#2580](https://github.com/jgong5/ATOM/issues/2580)). The HTTP transport, 0.67 ms,
-is the `serving` admission delay, 0.54 ms. The loop's intake, 4.59 ms, is `idle_s` plus
-`per_byte_s` per body byte, 2.59 ms on these 388 KB bodies: the loop takes 8.5 ns per byte
-of them, the spec 3.85, fitted on V4-Pro bursts
-([#2681](https://github.com/jgong5/ATOM/issues/2681)). The tokenizer pool job's work
-outside the segment tokenizer call, 5.86 ms, is charged nothing; most of it is ATOM copying
+is the `serving` admission delay, 0.54 ms. The loop's intake, 4.59 ms, is charged `idle_s`
+plus `per_byte_s` per body byte, 4.20 ms on these 388 KB bodies: `per_byte_s` is the 8.05 ns
+per byte that lone requests of the cell's own bodies read, where a V4-Pro first-turn burst's
+slope, 3.85, charged 2.59 ms ([#2681](https://github.com/jgong5/ATOM/issues/2681)). The
+tokenizer pool job's work outside the segment tokenizer call, 5.86 ms, is charged nothing; most of it is ATOM copying
 the prompt's ids from a list back into an array, ATOM's to fix
 ([#2680](https://github.com/jgong5/ATOM/issues/2680)). The last 0.63 ms, from the engine
 send to the headers reaching the client, is not on the request's way to the engine, where
