@@ -50,9 +50,9 @@ ATOM's KV allocation bound, on the runner or a metadata builder (`_bound`),
 of its layout or `V41_NAMES`' (`_kv`), refused when none is, whose
 name the point records, the same on every copy; an object is rebuilt from its class
 and state as the capture's replay rebuilds one, its tensors built as any other
-argument's, its activations fresh on every copy. A leaf whose operator cannot
-run so refuses by name. On one GPU at a
-DP-attention layout, the runner is one DP rank's own, TP 1 and DP 1, the
+argument's, its activations fresh on every copy, a lifted call's sequence a tuple.
+A leaf whose operator cannot run, or that copies to the host, refuses by name.
+On one GPU at a DP-attention layout, the runner is one DP rank's own, TP 1 and DP 1, the
 graphs read and the keys written keep the layout, and a collective leaf
 refuses: it is measured across the layout's ranks.
 A collective leaf is one family over its message bytes, decode and prefill
@@ -295,14 +295,10 @@ V4_METADATA = {
     (_QKN_BF16, "swa_dest_rows"): "v4_swa_dest_{dest}",
 }
 V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
-#: DeepSeek-V4.1's arguments, by operator and slot as `V4_METADATA` keys them,
-#: and the buffer ATOM passes each, at the leaf's compress ratio (`_ratio`): a
-#: KV tensor its builder's paged cache holds, named as `_bound` names it, or
-#: a tensor of its step (`step.`), its scorer's workspace (`workspace.`) or the
-#: forward context. Taken when the runner holds it, else the slot binds as
-#: any other: `_meta`'s rules take another ratio's table, and the MoE's token
-#: count V4.1's decoder-tail count. A packed pool's decode reads its prefix
-#: indptr for both; the cells' BF16 pool splits its window out.
+#: DeepSeek-V4.1's arguments, keyed as `V4_METADATA`'s, and the buffers ATOM
+#: passes each (`_named`), at the leaf's ratio (`_ratio`), as `_bound` names
+#: them: the paged cache's, the pass's step (`step.`), the decoder plan
+#: (`plan.`), the scorer workspace (`workspace.`), the forward context.
 _CACHE = "attn_metadata_builder.cache.indptr_buffers.{ratio}"
 _LOGITS = (
     "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
@@ -314,6 +310,7 @@ _INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
 _SCAN = f"{_INDPTRS}:_launch_indptr_scan"
 _INDICES = f"{_INDPTRS}:_launch_indices"
 _FUSED = "atom.model_ops.v4_kernels.fused_compress:_launch_fused_compress"
+_FROM = ("replay_start", "cached_until")
 _SWA = "atom.model_ops.v4_kernels.state_writes:swa_write"
 _GATHER = "atom.model_ops.attentions.token_layout.gather:gather_rows"
 V41_NAMES = {
@@ -330,11 +327,7 @@ V41_NAMES = {
     ("atom.model_ops.deepseek_v41.index_write:write_index_rows", "plan"): _PLAN,
     (_INDICES, "pptr"): f"{_CACHE}.0",
     (_INDICES, "eptr"): f"{_CACHE}.1",
-    **{
-        (fn, slot): f"step.swa_{slot}"
-        for fn in (_INDICES, _SCAN)
-        for slot in ("replay_start", "cached_until")
-    },
+    **{(f, s): f"step.swa_{s}" for f in (_INDICES, _SCAN) for s in _FROM},
     (f"{_INDPTRS}:_launch_window_rows", "eptr"): f"{_CACHE.format(ratio=0)}.1",
     (_FUSED, "state_slot_mapping"): "step.slots",
     (_SWA, "state_slot_per_seq"): "step.slots",
@@ -377,9 +370,8 @@ SNAPSHOTS = "v_cache"
 SEED = 0
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
 RANK = Topology().ranks()[0]
-#: The runner's metadata builders whose attributes the KV allocation may bind:
-#: DeepSeek-V4.1 binds its paged cache on its builder, and its DSpark drafter's
-#: draft-KV pool on a builder of its own.
+#: The runner's metadata builders the KV allocation may bind on: DeepSeek-V4.1's
+#: and its DSpark drafter's.
 BUILDERS = ("attn_metadata_builder", "draft_kv_builder")
 #: The variable naming the file a measuring process appends each point's
 #: record to as it finishes it.
@@ -750,10 +742,8 @@ class Stub:
             for k, v in live.items()
             if torch.is_tensor(v) and v.device.type == device.type
         }
-        # DeepSeek-V4.1's scorer workspace and decoder plan, whose tensors its
-        # leaves view and no attribute of the metadata holds, and each pass's
-        # step ahead of the rest, so a tie takes its own, its count of real
-        # rows the context's
+        # DeepSeek-V4.1's scorer workspace and decoder plan, and each pass's
+        # step first, so a tie takes its own, its real rows' count the context's
         scorer = getattr(getattr(md, "cache", None), "workspace", None)
         plan = getattr(getattr(md, "step", None), "decoder", None)
         live |= _bound("workspace", scorer, set(), device)
@@ -1057,6 +1047,11 @@ class Stub:
                 f"a collective over the layout's {self.alone} ranks, measured "
                 "across them, not on a runner that runs one alone"
             )
+        if op["args"].get("device") == "cpu":
+            raise ValueError(
+                "a copy to pageable host memory, which ATOM allocates and no "
+                "CUDA graph captures"
+            )
         fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
         self.loads, self.built = [], {}
         if self.flush is None:
@@ -1129,11 +1124,13 @@ class Stub:
         fresh = c >= len(self.placed) * len(instances)
         table, ids = GATHERED.get(op["op"], (None, None))
 
+        seq = tuple if ":" in op["op"] else list  # a lifted call's, as ATOM's
+
         def build(path, value, old):
             if isinstance(value, list):
-                return [
+                return seq(
                     build(f"{path}.{i}", v, old and old[i]) for i, v in enumerate(value)
-                ]
+                )
             if path == ids:  # copy c's own rows of the one table
                 out = self._tensor(value, meta.get((sig, path)), True)
                 n, rows = out.numel(), op["args"][table]["shape"][0]
@@ -1246,10 +1243,10 @@ class Stub:
 
         def build(path, value, old):
             if isinstance(value, list):
-                return [
+                return type(old)(
                     build(f"{path}.{i}", v, o)
                     for i, (v, o) in enumerate(zip(value, old))
-                ]
+                )
             if isinstance(value, dict) and value.get("role") == "weight":
                 return self._weight(value, c, op["occurrences"])
             if isinstance(value, dict) and self._routed(value, sig, path):
@@ -1422,11 +1419,9 @@ class PassRows(ValueError):
 
 
 def _passes(fc) -> dict:
-    """The passes of a forward, by the rows each runs, each its step and its
-    count of real rows (`ForwardContext.use_pass_rows`): DeepSeek-V4.1's
-    replaying prefill runs its decoder over its tail's rows and, at the last
-    layer, each finishing request's last row; any other rows are the step's,
-    under the key None."""
+    """A forward's passes by the rows each runs, each its step and real rows'
+    count (`use_pass_rows`): DeepSeek-V4.1's decoder over its tail's rows and
+    its finishing requests' last ones; the step's own under the key None."""
     step = getattr(fc.attn_metadata, "step", None)
     plan, passes = getattr(step, "decoder", None), {}
     if plan is not None:
@@ -1438,8 +1433,7 @@ def _passes(fc) -> dict:
 
 
 def _pass_rows(op) -> int | None:
-    """The rows a leaf runs: its positions' or batch ids', else its first
-    activation's leading rows, past a leading batch of one."""
+    """The rows a leaf runs: its positions', its batch ids' or first activation's."""
     specs = dict(_specs(op["args"]))
     for slot in ("positions", "batch_ids"):
         if slot in specs:
@@ -1469,10 +1463,8 @@ def _ratio(op, path, known=None):
 
 
 def _named(op, path, spec, pool, known=None) -> dict | None:
-    """The buffers of `pool` `V41_NAMES` names for `op`'s slot `path`, by
-    name, those of `spec`'s dtype `pool` holds, of its shape and stride if
-    any is, or None: at the leaf's ratio, or at each one `known` holds when it
-    states none."""
+    """`pool`'s buffers `V41_NAMES` names for `op`'s `path`, at its ratio or each
+    `known` one, of `spec`'s dtype, its shape and stride first if any; or None."""
     key = op["op"], _keyed(op["args"], path)
     role = (op["args"].get("self") or {}).get("role")
     wanted = V41_NAMES.get((*key, role), V41_NAMES.get(key, ()))
@@ -1576,11 +1568,10 @@ def _held(runner, registry) -> dict[str, torch.Tensor]:
 
 
 def _bound(name, value, old, device) -> dict[str, torch.Tensor]:
-    """Each tensor on `device` that `value` holds, by each of its paths from
-    `name`, the shortest first: itself, a dict's, list's or tuple's items, an
-    arena's fields (`view`) and its buffer as each field's dtype views it, an
-    object's attributes; none `old` holds by id, nor a module. The walk adds
-    each object it enters to `old`."""
+    """Each tensor on `device` `value` holds, by each path from `name`, the
+    shortest first, through items, attributes, an arena's fields (`view`) and
+    its buffer in each field's dtype; none `old` holds by id, which gains each
+    object entered, nor a module."""
     out, queue = {}, [(name, value)]
     for name, value in queue:  # breadth first: the walk appends as it goes
         if torch.is_tensor(value):
@@ -1628,7 +1619,7 @@ def _function(name: str):
     a functional collective waited on, as the in-place one ATOM calls is, on
     this rank's group of the coordinator it was captured on (`_on_coordinator`);
     a lifted collective that takes a group on the one ATOM calls it on
-    (`DP_GROUP`), refused when ATOM's group is not known."""
+    (`DP_GROUP`), refused when ATOM's group is not known; varargs by position."""
     if ":" in name:
         module, qualname = name.split(":")
         fn, path = importlib.import_module(module), qualname.split(".")
@@ -1647,6 +1638,11 @@ def _function(name: str):
         if name.startswith("_c10d_functional."):
             wait, fn = torch.ops._c10d_functional.wait_tensor, _on_coordinator(name, fn)
             return lambda **kwargs: wait(fn(**kwargs))
+    params = list(inspect.signature(fn).parameters) if inspect.isfunction(fn) else []
+    kinds = [inspect.signature(fn).parameters[p].kind for p in params]
+    if (star := inspect.Parameter.VAR_POSITIONAL) in kinds:
+        lead, slot = params[: kinds.index(star)], params[kinds.index(star)]
+        return lambda **kw: fn(*map(kw.pop, lead), *kw.pop(slot, ()), **kw)
     return fn
 
 

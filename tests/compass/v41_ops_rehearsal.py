@@ -10,18 +10,24 @@ the graphs of the store, one rank, in a capture's fake mode
 (`driverless_mode`, the capture's `_patches`): ATOM's runner is built as the
 bench builds it, its KV pool sized from that card's memory, all free past the
 parameters' bytes, and each point's batch prepared by ATOM; each leaf's call is
-built by `Stub.point` and its operator found, and there it stops: the call
-would launch next. With `--kinds` a graph keeps its first leaf of each
-operator, as a card run of one leaf an op kind takes them.
+built by `Stub.point`, each index, slot, pointer and count it binds checked
+against what it indexes on the values ATOM staged (`out_of_range`), and its
+operator called in the fake mode up to its kernels: a copy with pageable host
+memory, which no graph capture copies, refuses, and each Triton launch types
+and keys its arguments as Triton does, a tensor as an aligned pointer, and
+launches nothing. A FlyDSL launch and a compiled operator's are not typed.
+With `--kinds` a graph keeps its first leaf of each operator, as a card run of
+one leaf an op kind takes them.
 
 The fake mode stands in for the device where the bench reads it: the
 runner's checkpoint is ATOM's empty dummy, as a capture's is; a router's
 expert ids are drawn on the host and their loads not counted; no tensor
 equals another, so each placement clones its metadata; DeepSeek-V4.1's state
 cursors read back zeros and its check of them has no values to judge, as in
-a capture. OUT gets one record a leaf: its point, its verdict (`LAUNCH`,
-`REFUSED` with the bench's reason, or `UNTOLD`, which a fake tensor's
-missing values stopped) and the buffers its KV and metadata arguments bound.
+a capture. OUT gets one record a leaf: its point, its verdict (`LAUNCH` with
+the kernels it launched, `REFUSED` with the reason, or `UNTOLD`, which a fake
+tensor's missing values stopped), the buffers its KV and metadata arguments
+bound, and each one's identity (`identity`).
 """
 
 import contextlib
@@ -207,6 +213,38 @@ def out_of_range(op, held, known) -> str | None:
     return None
 
 
+class _Pointer:
+    """A tensor as Triton's argument typing reads one: its dtype and an
+    aligned address."""
+
+    def __init__(self, dtype):
+        self.dtype = dtype
+
+    def data_ptr(self):
+        return 0
+
+
+def _pointer(value):
+    import torch
+
+    if torch.is_tensor(value):
+        return _Pointer(value.dtype)
+    return tuple(map(_pointer, value)) if isinstance(value, tuple) else value
+
+
+def _pageable(value) -> bool:
+    """Whether `value` is a host tensor in pageable memory, which no copy in a
+    graph capture reads or writes."""
+    import torch
+
+    if not torch.is_tensor(value) or value.device.type != "cpu":
+        return False
+    try:
+        return not value.is_pinned()
+    except RuntimeError:  # a fake host tensor holds no memory to ask
+        return True
+
+
 def _flat(value):
     if isinstance(value, list):
         for v in value:
@@ -226,9 +264,11 @@ def first_of_each(found):
 
 
 def verdict(record) -> tuple[str, str]:
+    """Its verdict and why; the kernels its call launched when it reaches its
+    launch."""
     why = record.get("refused", "")
     if why.startswith(f"{Launched.__name__}:"):
-        return LAUNCH, ""
+        return LAUNCH, why.split(": ", 1)[1]
     return (UNTOLD if why.split(":")[0] in VALUELESS else REFUSED), why
 
 
@@ -252,6 +292,7 @@ def main(out, argv) -> None:
     from atom.config import set_current_atom_config
     from atom.model_engine.model_runner import DeviceMemoryReadings, ModelRunner
     from atom.utils import h2d
+    from triton.runtime import jit as triton_jit
 
     kinds = "--kinds" in argv
     argv = [a for a in argv if a != "--kinds"]
@@ -320,12 +361,32 @@ def main(out, argv) -> None:
         return journal(path, records)
 
     def launching(name):
-        function(name)  # found, or the leaf refuses
+        fn = function(name)  # found, or the leaf refuses
 
         def launch(**kwargs):
-            raise Launched(name)
+            pageable = kwargs.get("device") in ("cpu", torch.device("cpu"))
+            pageable &= not kwargs.get("pin_memory")
+            if pageable or any(_pageable(v) for v in kwargs.values()):
+                raise RuntimeError(
+                    "a copy with pageable host memory in a graph capture"
+                )
+            recorder.replaying = []  # each kernel told the recorder, not launched
+            try:
+                fn(**kwargs)
+            finally:
+                kernels, recorder.replaying = recorder.replaying, None
+            raise Launched(json.dumps(kernels))
 
         return launch
+
+    def typed(kernel, *args, grid=None, warmup=False, **kwargs):
+        # Triton's run up to its compile: each argument typed and the kernel
+        # keyed as Triton types and keys them, a tensor as an aligned pointer
+        caches = kernel.device_caches[0]
+        named = {k: _pointer(v) for k, v in kwargs.items()}
+        _, specialization, options = caches[4](*map(_pointer, args), **named)
+        triton_jit.compute_cache_key(caches[1], specialization, options)
+        recorder.launch(f"triton.{kernel.__name__}", kernel)
 
     def on_device(self, rank, config):
         self.device = torch.device("cuda:0")
@@ -352,6 +413,7 @@ def main(out, argv) -> None:
             (ModelRunner, "_setup_device_and_distributed", on_device),
             (ModelRunner, "_read_device_memory", readings),
             (ops, "_function", launching),
+            (triton_jit.JITFunction, "run", typed),
             (ops, "_deep", cloning),
             (ops, "_journal", journaled),
             (ops.Stub, "_prepare", preparing),
@@ -370,9 +432,12 @@ def main(out, argv) -> None:
     records = []
     for r in got:
         state, why = verdict(r)
+        kernels = json.loads(why) if state == LAUNCH else []
+        why = "" if state == LAUNCH else why
         records.append(
             {k: r[k] for k in ("shape", "op", "leaf")}
-            | {"verdict": state, "why": why, "bound": r.get("metadata", {})}
+            | {"verdict": state, "why": why, "kernels": kernels}
+            | {"bound": r.get("metadata", {})}
             | {"identity": r.get("identity", {})}
         )
     pathlib.Path(out).write_text(json.dumps(records, indent=1))

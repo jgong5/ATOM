@@ -62,6 +62,9 @@ PLANE_BOUND = {
     "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
     "atom.model_ops.deepseek_v41.indexer:_block_maxima",
 }
+#: V4.1's read of its state cursors back to the host, `.cpu()`, a copy into
+#: pageable memory, which no CUDA graph captures: `measure ops` refuses it.
+HOST_COPY = "aten.to.dtype_layout"
 
 
 def _run(script, *argv, cwd=TREE):
@@ -100,23 +103,31 @@ def rehearsed(request, model_dir, tmp_path_factory):  # noqa: F811
     return got, json.loads((root / "truth.json").read_text())
 
 
-def test_every_leaf_reaches_its_launch_but_a_plane_the_capture_sized_short(
+def test_every_leaf_reaches_its_launch_but_a_plane_too_short_or_a_host_copy(
     rehearsed,
 ):
-    """At a prefill past cached tokens, the indexer's row bounds reach past the
-    plane the capture's prefill, which caches none, sized: the rehearsal's
-    value check refuses those leaves by name; on no cached tokens they too
-    reach their launch."""
+    """Each leaf's call, Triton's typing of each argument it launches with
+    included, reaches its launch, but at a prefill past cached tokens the
+    indexer's row bounds past the plane the capture's prefill, which caches
+    none, sized, which the value check refuses by name; and the cursors' copy
+    to the host, which `measure ops` refuses by name, at every point."""
     got, _ = rehearsed
     cached = {r["shape"] for r in got["cached"]}
     assert cached == {"decode B=16", "prefill T=2048 B=1"}
-    refused = [r for r in got["cached"] if r["verdict"] != "reaches launch"]
-    assert refused and {(r["shape"], r["op"]) for r in refused} <= {
+    fresh = [r for r in got["fresh"] if r["shape"] != "prefill T=128 B=1"]
+    refused = [r for r in got["cached"] + fresh if r["verdict"] != "reaches launch"]
+    host = [r for r in refused if r["op"] == HOST_COPY]
+    assert host and all("pageable host memory" in r["why"] for r in host)
+    short = [r for r in refused if r["op"] != HOST_COPY]
+    assert short and {(r["shape"], r["op"]) for r in short} <= {
         ("prefill T=2048 B=1", op) for op in PLANE_BOUND
     }
-    assert all(re.search(r"past 0 to \d+$", r["why"]) for r in refused)
-    fresh = [r for r in got["fresh"] if r["shape"] != "prefill T=128 B=1"]
-    assert fresh and [r for r in fresh if r["verdict"] != "reaches launch"] == []
+    assert all(re.search(r"past 0 to \d+$", r["why"]) for r in short)
+    assert not {id(r) for r in short} & {id(r) for r in fresh}
+    triton = [
+        r for r in got["cached"] if any(k.startswith("triton.") for k in r["kernels"])
+    ]
+    assert triton
 
 
 def test_a_prefill_whose_forward_runs_its_tail_s_rows_refuses_by_name(rehearsed):
