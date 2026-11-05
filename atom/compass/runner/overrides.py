@@ -1554,7 +1554,7 @@ class NonAllocatingRunner(
         from atom.compass.parity import record_step
         from atom.model_engine.scheduler import ScheduledBatchOutput
 
-        mode = record_step(self, batch)
+        mode, view = record_step(self, batch) or (None, None)
         record = getattr(self, "_parity_record", None)
         if record is not None and record.step == 1:
             # The record was just created, replacing an earlier run's; so is
@@ -1597,7 +1597,7 @@ class NonAllocatingRunner(
             )
             self._token_stream = stream
         tokens = stream.step(batch)
-        seconds = _group_step_seconds(self, batch, backend, mode)
+        seconds = _group_step_seconds(self, batch, backend, mode, view)
         out = ScheduledBatchOutput(
             **tokens,
             predicted_s=seconds,
@@ -1622,16 +1622,21 @@ def _start_cost_table(runner: Any, record: Any) -> None:
 
 
 def _group_step_seconds(
-    runner: Any, batch: Any, backend: CostBackend, mode: Any = None
+    runner: Any,
+    batch: Any,
+    backend: CostBackend,
+    mode: Any = None,
+    view: Any = None,
 ) -> float:
     """This rank's step priced from its own batch, then its DP group target.
 
     Only TP rank 0 prices; any other TP rank of the engine charges 0 s.
 
     `mode` is the step's `ForwardMode` when the step record already settled
-    it; without one it is settled here, which runs the DP collective. Under DP
-    the group then sums its dummy forwards (`projection.dummy_ranks`), which
-    the view states as its `group_dummies`.
+    it; without one it is settled here, which runs the DP collective; `view`,
+    the `BatchView` the record built from it, is priced in place of a new one.
+    Under DP the group then sums its dummy forwards (`projection.dummy_ranks`),
+    which the view states as its `group_dummies`.
 
     In a run, `compass_host` composes the price, the target's device seconds
     and then the draft's (`StepCost.target_seconds`, `draft_seconds`), with
@@ -1716,9 +1721,15 @@ def _group_step_seconds(
         batch.compass_admitted = admitted(batch, seen, entry)
     dummies = dummy_ranks(batch, mode)
     try:
-        view = batch_view(batch, mode, runner, dummies)
+        changes = {}
+        if view is None:
+            view = batch_view(batch, mode, runner, dummies)
+        elif view.dp_rank is not None:
+            changes["group_dummies"] = dummies
         if isinstance(host, HostDeviceRecurrence):
-            view = dataclasses.replace(view, start_lag_s=host.start_lag(batch))
+            changes["start_lag_s"] = host.start_lag(batch)
+        if changes:
+            view = dataclasses.replace(view, **changes)
         cost = backend.price(view)
         if spec and not cost.draft_terms and EAGER_DP_DUMMY not in cost.treatments:
             name = type(backend).__name__
@@ -1767,8 +1778,8 @@ def _group_step_seconds(
         mine = torch.tensor([charge_s, waits, out], dtype=torch.float64)
         rows = [torch.empty_like(mine) for _ in range(group.size())]
         torch.distributed.all_gather(rows, mine, group=group)
-        top = max(r[0].item() for r in rows)
         rows = [r.tolist() for r in rows]
+        top = max(s for s, *_ in rows)
         targets = tuple(top if w else s for s, w, _ in rows)
         ends = zip(targets, (o for *_, o in rows))
         pulls = tuple(t + o for t, o in ends if not math.isnan(o)) or None

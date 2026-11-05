@@ -9,7 +9,9 @@ so a call that should return but blocks fails the test instead of hanging it.
 """
 
 import logging
+import math
 import queue
+import random
 import threading
 import time
 
@@ -232,3 +234,78 @@ def test_an_unhandled_release_prints_one_diagnostic_and_keeps_waiting(caplog):
     assert len(diags) == 1
     assert f"released {REQ} seq 0" in diags[0]
     assert rt.now == 10.2
+
+
+def _frontend_after(n):
+    """A frontend that has taken `n` requests on its inline channel, each read,
+    released and handled, as a run's frontend has by its `n`-th."""
+    rt, call = _runtime(FRONTEND, (n + 1.0, {HTTP: [(k, k + 0.5) for k in range(n)]}))
+    for k in range(n):
+        rt.check_arrival(HTTP, k + 0.5, k)
+    call(rt.advance_to, n + 1.0)
+    with rt.lock:
+        for k in range(n):
+            rt.count_done_locked(HTTP, k)
+    return rt
+
+
+def _us_a_call(fn):
+    """`fn()`'s cost: the best of three passes of 200 calls, in microseconds a call."""
+    best = math.inf
+    for _ in range(3):
+        start = time.perf_counter()
+        for _ in range(200):
+            fn()
+        best = min(best, time.perf_counter() - start)
+    return best / 200 * 1e6
+
+
+def test_the_idle_check_costs_the_same_however_many_requests_the_run_has_taken():
+    """`inline_pending` runs at every idle point of a frontend's event loop."""
+    early, late = _frontend_after(10), _frontend_after(50_000)
+    assert not early.inline_pending() and not late.inline_pending()
+    a, b = _us_a_call(early.inline_pending), _us_a_call(late.inline_pending)
+    assert b < 5 * a + 5, f"{a:.1f} us after 10 requests, {b:.1f} us after 50,000"
+
+
+def test_pending_and_unread_follow_each_request_read_released_and_handled():
+    """Requests read before or after their release, and handled in any order
+    once both: after each step, `inline_pending` and the unread set say what
+    the message sets say."""
+    rng, n = random.Random(0), 300
+    rt, call = _runtime(
+        FRONTEND, *((k + 1.0, {HTTP: [(k, k + 0.5)]}) for k in range(n))
+    )
+
+    def check():
+        with rt.lock:
+            pending = bool(rt.released[HTTP] - rt.handled[HTTP])
+            unread = rt.released[HTTP] - rt.arrived[HTTP]
+        assert rt.inline_pending() == pending
+        assert rt.unread[HTTP] == unread
+
+    open_ = []
+    for k in range(n + 40):
+        if k < n:
+            if rng.random() < 0.5:  # read before its release
+                rt.check_arrival(HTTP, k + 0.5, k)
+                check()
+            call(rt.advance_to, k + 1.0)
+            open_.append(k)
+            check()
+        for seq in list(open_):
+            if seq not in rt.arrived[HTTP] and rng.random() < 0.5:
+                rt.check_arrival(HTTP, seq + 0.5, seq)
+                check()
+            if seq in rt.arrived[HTTP] and rng.random() < 0.3:
+                with rt.lock:
+                    rt.count_done_locked(HTTP, seq)
+                open_.remove(seq)
+                check()
+    for seq in open_:
+        if seq not in rt.arrived[HTTP]:
+            rt.check_arrival(HTTP, seq + 0.5, seq)
+        with rt.lock:
+            rt.count_done_locked(HTTP, seq)
+    check()
+    assert not rt.inline_pending() and not rt.unread[HTTP]
