@@ -759,6 +759,9 @@ class Stub:
         live |= _bound("workspace", scorer, set(), device)
         live |= _bound("plan", plan, set(), device)
         passes, running = _passes(fc), getattr(fc.context, "running_tokens", None)
+        if running in passes or len(passes) < (1 if plan is None else 3):
+            rows = sorted(k for k in passes if k is not None)
+            raise PassRows(f"its passes run {rows} rows and its forward {running}")
         lives = {
             rows: _bound("step", step, set(), device)
             | live
@@ -908,6 +911,8 @@ class Stub:
                 return refuse(f"ValueError: {error}")
             try:
                 self._prepare(batch)
+            except PassRows as error:  # no leaf's rows tell which pass it runs
+                return refuse(f"ValueError: {error}: a leaf's rows name no pass")
             except Exception as error:
                 error.add_note(f"measuring {shape} at context {context}")
                 raise
@@ -1410,6 +1415,10 @@ def _values(args, path=""):
             yield from _values(value, where)
         else:
             yield where, value
+
+
+class PassRows(ValueError):
+    """A step whose passes run rows of one count: a leaf's rows tell no pass."""
 
 
 def _passes(fc) -> dict:

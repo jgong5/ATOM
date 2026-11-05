@@ -40,10 +40,18 @@ SHAPES = "--width 16 --prefill 2048 1"
 READ = "from atom.compass.capture import driverless\n"
 READ += f"driverless.card = {{0: {A0!r}}}.get\n"
 TRUTH = pathlib.Path(__file__).with_name("v41_capture_truth.py")
-#: A slot whose leaves of one signature ATOM passes either of two buffers,
-#: which the bench cannot yet tell apart (#2865): a query's RoPE and a ratio-1
-#: key's.
-UNTOLD = {("aiter.rope_cached_positions_fwd_impl.default", "positions")}
+#: The slots where ATOM passes the occurrences of one leaf two buffers, of
+#: which the bench binds one: a query's RoPE positions and a ratio-1 key's
+#: (#2865), and the decoder tail's batch ids and its layer 39's queries'
+#: (#2867).
+SPLIT = {
+    ("aiter.rope_cached_positions_fwd_impl.default", "positions"),
+    ("atom.model_ops.attentions.deepseek_v41.indices:_launch_indices", "batch_ids"),
+    ("atom.model_ops.attentions.deepseek_v41.indices:_launch_indptr_scan", "batch_ids"),
+}
+#: A prefill whose forward runs the rows of its decoder's tail: its tail
+#: holds the whole prompt, a window of it.
+WINDOW = "--prefill 128 1"
 #: The leaves the rehearsal refuses at a prefill past 8192 cached tokens, each
 #: reading rows of a logits plane past the columns the capture's prefill,
 #: which caches none, sized it to: the indexer's scorer, its top-k and the
@@ -73,9 +81,10 @@ def rehearsed(request, model_dir, tmp_path_factory):  # noqa: F811
     """A cell's graphs traced into a store; what its own capture passes each
     leaf (`v41_capture_truth.py`); and the rehearsal's record of each leaf at
     a decode of 8192 tokens a row and a prefill past as many cached, and of
-    each prefill leaf on no cached tokens."""
+    each prefill leaf, and `WINDOW`'s, on no cached tokens."""
     root, ep = tmp_path_factory.mktemp("v41_rehearsal"), request.param
-    _trace(root, SHAPES + CELL + ep, ("--arch", "gfx1250", "--gpu", "0"), READ)
+    traced = f"{SHAPES} {WINDOW}{CELL}{ep}"
+    _trace(root, traced, ("--arch", "gfx1250", "--gpu", "0"), READ)
     model, cell = root / "model", (CELL + ep).split()[1:]
     for name in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copy(model_dir / name, model / name)
@@ -83,7 +92,7 @@ def rehearsed(request, model_dir, tmp_path_factory):  # noqa: F811
     atom = ["--model", model, "-tp", "4", "--enforce-eager", "--level", "0", *cell]
     store = ["--llc-mib", "512", "--store", root / "store"]
     points = {"cached": [*SHAPES.split(), "--context", "8192"]}
-    points["fresh"] = SHAPES.split()[2:]
+    points["fresh"] = [*SHAPES.split()[2:], *WINDOW.split()]
     got = {}
     for name, shapes in points.items():
         _run(HARNESS, root / f"{name}.json", *shapes, *store, "--", *atom)
@@ -106,14 +115,23 @@ def test_every_leaf_reaches_its_launch_but_a_plane_the_capture_sized_short(
         ("prefill T=2048 B=1", op) for op in PLANE_BOUND
     }
     assert all(re.search(r"past 0 to \d+$", r["why"]) for r in refused)
-    assert [r for r in got["fresh"] if r["verdict"] != "reaches launch"] == []
+    fresh = [r for r in got["fresh"] if r["shape"] != "prefill T=128 B=1"]
+    assert fresh and [r for r in fresh if r["verdict"] != "reaches launch"] == []
+
+
+def test_a_prefill_whose_forward_runs_its_tail_s_rows_refuses_by_name(rehearsed):
+    """Its leaves' rows cannot say which pass each runs, so none is bound."""
+    got, _ = rehearsed
+    window = [r for r in got["fresh"] if r["shape"] == "prefill T=128 B=1"]
+    assert window and all("a leaf's rows name no pass" in r["why"] for r in window)
 
 
 def test_each_leaf_takes_the_buffers_atom_s_capture_passes_it(rehearsed):
     """Each argument a kernel leaf takes of ATOM's metadata, and each integer
-    table of its KV, and each index an aten index operator takes, is the
-    buffer ATOM's own capture passes that leaf, by name and offset. aten's
-    other leaves index nothing and launch the same work on any values."""
+    table of its KV, and each index an aten index operator takes, is the one
+    buffer ATOM's own capture passes every occurrence of that leaf, by name and
+    offset, but `SPLIT`'s. aten's other leaves index nothing and launch the
+    same work on any values."""
     got, truth = rehearsed
     wrong, checked = [], 0
     for r in [*got["cached"], *got["fresh"]]:
@@ -121,10 +139,10 @@ def test_each_leaf_takes_the_buffers_atom_s_capture_passes_it(rehearsed):
             slot = path.split(".")[0]
             if r["op"].startswith("aten.") and (r["op"], slot) not in ATEN_INDEX:
                 continue
-            if (r["op"], slot) in UNTOLD:
+            if (r["op"], slot) in SPLIT or r["shape"] == "prefill T=128 B=1":
                 continue
-            want = [w for w in truth.get(r["leaf"], {}).get(path, []) if w != "?"]
+            want = {w for w in truth.get(r["leaf"], {}).get(path, []) if w != "?"}
             checked += bool(want)
-            if want and name not in want:
+            if want and want != {name}:
                 wrong.append((r["shape"], r["op"], path, name, want))
     assert checked and wrong == []
