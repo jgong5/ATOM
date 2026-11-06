@@ -24,7 +24,7 @@ from aiter_stub import stubbed_aiter
 
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import Sequence
-from atom.utils import clock
+from atom.utils import clock, zmq_shim
 
 with stubbed_aiter():
     from atom.model_engine import engine_core
@@ -33,6 +33,19 @@ with stubbed_aiter():
 
 QUIET_S = 30.0  # the metrics interval: no timeout ends a wait inside a test
 PROMPT_S = 1.0  # a woken loop takes its work well inside this
+SERVED = ("served input", "served loop")  # `_serving`'s thread names
+
+
+@pytest.fixture(autouse=True)
+def leaves_nothing_behind():
+    """After each test, monkeypatch undone: no served thread is alive, and
+    `zmq_shim` still picks `Context`, `Poller` and `Socket` on each read. A
+    later test in this process installs an LP runtime and needs the shim's
+    `Poller`; a pyzmq one fixed on the shim never reports its requests."""
+    yield
+    threads = [t.name for t in threading.enumerate() if t.name in SERVED]
+    fixed = [n for n in ("Context", "Poller", "Socket") if n in vars(zmq_shim)]
+    assert not threads and not fixed, (threads, fixed)
 
 
 class Wire:
@@ -60,6 +73,18 @@ class Wire:
 
     def recv(self, copy=True):
         return self.frame
+
+
+class Zmq:
+    """`engine_core`'s `zmq` with the wire as its `Poller`. Set on
+    `engine_core`, not on the shim, whose `Poller` monkeypatch would undo by
+    fixing there the one it read."""
+
+    def __init__(self, wire):
+        self.Poller = lambda: wire
+
+    def __getattr__(self, name):
+        return getattr(zmq_shim, name)
 
 
 class Scheduler:
@@ -127,10 +152,12 @@ def _serving(engine, monkeypatch, interval=QUIET_S):
     monkeypatch.setattr(
         engine_core, "make_zmq_socket", lambda *a, **k: contextlib.nullcontext(wire)
     )
-    monkeypatch.setattr(engine_core.zmq, "Poller", lambda: wire)
+    monkeypatch.setattr(engine_core, "zmq", Zmq(wire))
     threads = [
-        threading.Thread(target=engine.process_input_sockets, args=("in", "ctl")),
-        threading.Thread(target=EngineCore.busy_loop, args=(engine,)),
+        threading.Thread(
+            target=engine.process_input_sockets, args=("in", "ctl"), name=SERVED[0]
+        ),
+        threading.Thread(target=EngineCore.busy_loop, args=(engine,), name=SERVED[1]),
     ]
     for t in threads:
         t.daemon = True
