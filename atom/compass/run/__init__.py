@@ -1976,15 +1976,15 @@ def _record_host(tok, record: Path) -> None:
     calls.write(
         json.dumps({"backend": backend, "fingerprint": _fingerprint(tok)}) + "\n"
     )
-    tok.encode = _recorded(tok.encode, "encode", calls, lambda _, ids: len(ids))
-    tok.decode = _recorded(tok.decode, "decode", calls, lambda a, _: len(a[0]))
+    tok.encode = _recorded(tok.encode, "encode", calls, lambda _, ids: (len(ids), 1))
+    tok.decode = _recorded(tok.decode, "decode", calls, lambda a, _: (len(a[0]), 1))
     rust = getattr(tok, "_tokenizer", None)
     if isinstance(rust, Tokenizer):
         rust.encode_batch = _recorded(
             rust.encode_batch,
             "encode_batch",
             calls,
-            lambda _, encodings: sum(len(e.ids) for e in encodings),
+            lambda _, got: (sum(len(e.ids) for e in got), len(got)),
         )
     _stamp_intake(_LineFile(record / INTAKE_RECORD))
 
@@ -2006,11 +2006,12 @@ class _LineFile:
 _in_encode = threading.local()
 
 
-def _recorded(call, kind: str, out: _LineFile, tokens):
-    """`call`, writing to `out` per call a JSON line of `kind`, its
-    `tokens(args, result)` and its start and end on the monotonic clock in ns;
-    a call made inside a recorded ``encode`` call is that call's, as
-    `compass_loop.wrap_encode_batch` charges it."""
+def _recorded(call, kind: str, out: _LineFile, count):
+    """`call`, writing to `out` per call a JSON line of `kind`, its ``tokens``
+    and ``items`` as `count(args, result)` gives them, its ``thread`` id and its
+    start and end on the monotonic clock in ns; a call made inside a recorded
+    ``encode`` call is that call's, as `compass_loop.wrap_encode_batch` charges
+    it."""
 
     def timed(*args, **kwargs):
         if getattr(_in_encode, "on", False):
@@ -2022,8 +2023,10 @@ def _recorded(call, kind: str, out: _LineFile, tokens):
         finally:
             _in_encode.on = False
         end = time.monotonic_ns()
+        tokens, items = count(args, got)
         out.write(
-            f'{{"call": "{kind}", "tokens": {tokens(args, got)}, '
+            f'{{"call": "{kind}", "tokens": {tokens}, "items": {items}, '
+            f'"thread": {threading.get_ident()}, '
             f'"t_start_ns": {start}, "t_end_ns": {end}}}\n'
         )
         return got
@@ -2034,11 +2037,12 @@ def _recorded(call, kind: str, out: _LineFile, tokens):
 def _stamp_intake(out: _LineFile) -> None:
     """Stamp each HTTP request's intake into `out` as
     ``scripts/compass/http_intake.py serve`` does, one line
-    ``<end ns> <thread id> <kind> <start ns> <size>`` each, on the monotonic
-    clock: ``app``, the request handed to the ASGI app, size 0; ``body``, its
-    body first read, size its bytes; ``tmpl``, a chat template rendered, size
-    its characters; ``prep``, a tokenizer pool job, and ``send``, a request
-    handed to the engine, size 0. Patches the classes, and every loaded
+    ``<end ns> <thread id> <kind> <start ns> <size> <end cpu ns> <start cpu ns>``
+    each, on the monotonic clock and the stamping thread's CPU clock: ``app``,
+    the request handed to the ASGI app, size 0; ``body``, its body first read,
+    size its bytes; ``tmpl``, a chat template rendered, size its characters;
+    ``prep``, a tokenizer pool job, and ``send``, a request handed to the
+    engine, size 0. Patches the classes, and every loaded
     module's binding of ``apply_chat_template``, for the rest of the process."""
     from starlette.applications import Starlette
     from starlette.requests import Request
@@ -2047,16 +2051,17 @@ def _stamp_intake(out: _LineFile) -> None:
     from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
     from atom.model_engine.llm_engine import InputOutputProcessor
 
-    def stamp(kind: str, start: int, size: int) -> None:
+    def stamp(kind: str, start: int, size: int, cpu: int) -> None:
         out.write(
-            f"{time.monotonic_ns()} {threading.get_ident()} {kind} {start} {size}\n"
+            f"{time.monotonic_ns()} {threading.get_ident()} {kind} {start} {size} "
+            f"{time.thread_time_ns()} {cpu}\n"
         )
 
     def timed(call, kind: str, size=lambda got: 0):
         def timed(*args, **kwargs):
-            start = time.monotonic_ns()
+            start, cpu = time.monotonic_ns(), time.thread_time_ns()
             got = call(*args, **kwargs)
-            stamp(kind, start, size(got))
+            stamp(kind, start, size(got), cpu)
             return got
 
         return timed
@@ -2064,15 +2069,16 @@ def _stamp_intake(out: _LineFile) -> None:
     read, handle = Request.body, Starlette.__call__
 
     async def body(self):
-        cached, start = hasattr(self, "_body"), time.monotonic_ns()
+        cached = hasattr(self, "_body")
+        start, cpu = time.monotonic_ns(), time.thread_time_ns()
         got = await read(self)
         if not cached:
-            stamp("body", start, len(got))
+            stamp("body", start, len(got), cpu)
         return got
 
     async def app(self, scope, receive, send):
         if scope["type"] == "http":
-            stamp("app", time.monotonic_ns(), 0)
+            stamp("app", time.monotonic_ns(), 0, time.thread_time_ns())
         await handle(self, scope, receive, send)
 
     Request.body, Starlette.__call__ = body, app
@@ -2091,9 +2097,9 @@ def _stamp_intake(out: _LineFile) -> None:
             # was built, reads the API server's `request_id` off its caller's
             # frame, which is now this one.
             request_id = sys._getframe(1).f_locals.get("request_id")  # noqa: F841
-            start = time.monotonic_ns()
+            start, cpu = time.monotonic_ns(), time.thread_time_ns()
             got = add(*args, **kwargs)
-            stamp("send", start, 0)
+            stamp("send", start, 0, cpu)
             return got
 
         return add_request

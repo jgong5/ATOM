@@ -99,8 +99,8 @@ def test_a_recorded_server_writes_each_tokenizer_call_it_serves(record, tok):
         "fingerprint": "sha256:" + hashlib.sha256(loaded).hexdigest(),
     }
     # A backend call the encode makes is the encode's: one line per served call.
-    got = [(c["call"], c["tokens"]) for c in calls]
-    assert got == [("encode", 3), ("decode", 3), ("encode_batch", 4)]
+    got = [(c["call"], c["tokens"], c["items"]) for c in calls]
+    assert got == [("encode", 3, 1), ("decode", 3, 1), ("encode_batch", 4, 2)]
     assert all(c["t_start_ns"] <= c["t_end_ns"] for c in calls)
     assert calls[0]["t_end_ns"] <= calls[1]["t_start_ns"]
 
@@ -174,7 +174,7 @@ def test_a_recorded_server_stamps_each_request_s_intake_as_the_probe_does(record
         for k in [("app", 0), ("body", len(body)), ("tmpl", len(text)), ("prep", 0)]
         + [("send", 0)]
     ]
-    assert all(int(r[3]) <= int(r[0]) for r in rows)
+    assert all(int(r[3]) <= int(r[0]) and int(r[6]) <= int(r[5]) for r in rows)
     # The pool job runs off the event loop's thread; the rest on it.
     threads = {r[2]: r[1] for r in rows}
     assert threads["prep"] != threads["app"] == threads["tmpl"] == threads["send"]
