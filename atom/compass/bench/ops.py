@@ -59,8 +59,9 @@ A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, a KV
-argument's as many entries of its first dimension, each the span of the
-others, as the batch's rows, or its blocks when the model keeps no
+argument's as many entries of its widest-strided dimension, on a tie the
+first of size above one, each the span of the others, as the batch's rows,
+or its blocks when the model keeps no
 per-request state, or, of a decode attention leaf that states its layer's
 window and compress ratio, the plane rows the batch's blocks hold at that
 ratio, a RoPE table's (`TABLES`), a weight or a tensor of a module it names,
@@ -196,7 +197,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 22
+PROTOCOL = 23
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -969,8 +970,8 @@ class Stub:
                 entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
                 nbytes = entry * min(read, s["shape"][0])
             if s["role"] == "kv":
-                # ponytail: its first dim taken as blocks or state slots, or as
-                # plane rows when the leaf states its layer's attention geometry;
+                # ponytail: its widest-strided dim taken as blocks or state slots,
+                # or plane rows when the leaf states its layer's attention geometry;
                 # beside state slots a block view is one block a request, the
                 # one a decode compressor writes its row to
                 unit = rows if self.slots else blocks
@@ -984,9 +985,16 @@ class Stub:
                     # of which a request reads at most its indexer's top-k
                     if top := stated.get("index_topk"):
                         unit = min(unit, rows * top)
-                # an entry is the span of its trailing dims: a view may be
-                # strided by a whole state slot or by every layer's block
-                entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
+                # an entry is the span of its other dims: a view may be strided
+                # by a whole state slot or by every layer's block, and a field
+                # laid out layers first, `[layers, slots, ...]`, is read a slot
+                # once a layer; on a tie, the first dim of size above one: a
+                # field of one layer filling its entry strides layer and slot alike
+                shape, stride = s["shape"], s["stride"]
+                widest = [(stride[i], shape[i] > 1, -i) for i in range(len(stride))]
+                cut = -max(widest, default=(0, 0, 0))[2]
+                rest = shape[:cut] + shape[cut + 1 :], stride[:cut] + stride[cut + 1 :]
+                entry = _span(*rest) * itemsize
                 nbytes, need = entry * unit, None
                 shared[slotted] += nbytes
             if slot == "workspace" and op["op"] in TOPK_WORKSPACE:
