@@ -2,7 +2,7 @@
 """`compass record`: one instance's real server, with its step record, serving
 whatever client runs reach it until it is stopped.
 
-    compass record --gpu G [--host H] [--store S] --out DIR -- <ATOM args>
+    compass record --gpu G [--host H] [--store S] [--sweep] --out DIR -- <ATOM args>
 
 `serve` starts the server on the GPUs `--gpu` names with the step record on,
 bound to `--host`, 127.0.0.1 unless named, an address a router on another node
@@ -41,6 +41,9 @@ With `--store`, the server's start merges the store's JIT cache library for
 this stack into the container's caches, and its stop writes back each artifact
 it finished compiling (`jit_cache`); without it no library is touched.
 
+With `--sweep` the server also holds the pacing variables a JIT sweep's steps
+need (`sweep.pacing`), which `client.sh --sweep` checks it has.
+
 `--profile-ops` and `--profile-steps A:B`, the op-level half's profiled pass,
 refuse; so does ATOM's ``--load_dummy``: a record times real weights, and MoE
 routing follows them.
@@ -59,6 +62,7 @@ from atom.compass.cli import OPS
 from atom.compass.drive import aiter_jit, serve
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.compass.drive.identity import PTL_CHANGES, ptl_changes
+from atom.compass.drive.sweep import pacing
 from atom.compass.run import _write_whole
 
 PROG = "compass record"
@@ -86,6 +90,8 @@ def main(argv: list[str]) -> None:
         AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1"),
         "TRITON_CACHE_DIR": knobs.cache.dir,
     }
+    if args.sweep:
+        env |= pacing(atom_args)
     # serve writes server.json when /health first answers, so its mtime is
     # when serving began; a server that never answered served nothing.
     ready = Path(args.out) / serve.READY_FILE
@@ -113,6 +119,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default=serve.HOST, help="the address the server binds")
     p.add_argument(
         "--store", help="the artifact store whose JIT cache library the server uses"
+    )
+    p.add_argument(
+        "--sweep",
+        action="store_true",
+        help="start the server with the pacing variables client.sh --sweep needs",
     )
     p.add_argument(
         "--out", required=True, help="an empty directory for the record and logs"

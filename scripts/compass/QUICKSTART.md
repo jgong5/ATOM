@@ -217,14 +217,12 @@ Times were measured on node 18 for the cell in
 
 **0. Sweep a fresh container** (GPU, once per container; not timed on this cell:
 a round sends one prefill step for every token count up to the budget, 16384 here,
-each behind budget-filling steps, so it grows with the budget squared; Qwen3-0.6B
-at a 1024-token budget took 4.5 min a round on one MI308X of node 18, its server
-start included).
+then designed steps whose rows queue behind parked decodes).
 
 ```bash
 for k in 1 2 3; do
   rm -rf $R/sweep$k   # a restarted container's earlier round, which serve would refuse
-  serve $R/sweep$k 0-392 sweep $REAL_PY record --gpu $G $S || break
+  serve $R/sweep$k 0-392 sweep $REAL_PY record --sweep --gpu $G $S || break
   grep -qF '"missing": []' $R/sweep$k/sweep.json && break
 done
 ```
@@ -238,8 +236,10 @@ record. Each round sends the server the JIT sweep of this cell for the traces
 every later step serves, the points its records' keys are selected by, and
 after the stop keeps what it compiled and the points its record covered in the
 store's JIT cache library (`scripts/compass/README.md`, the full path); nothing
-reads its record. A round sends only the points still missing, and its last
-line says whether the cell is `swept`. A third round's missing points, in
+reads its record. A round sends only the steps still missing, and its last
+line says whether the cell is `swept`. `record --sweep` starts the server with
+the pacing variables those steps need, and `client.sh --sweep` refuses one
+started without them. A third round's missing points, in
 `sweep3/sweep.json`, are the residual to report. The next container on the same
 stack starts from the library, and its sweep returns at once. `smoke_cell.sh`
 serves a record before its calibration instead, so a container it ran in is
