@@ -127,7 +127,9 @@ def _serving(engine, monkeypatch, interval=QUIET_S):
     monkeypatch.setattr(
         engine_core, "make_zmq_socket", lambda *a, **k: contextlib.nullcontext(wire)
     )
-    monkeypatch.setattr(engine_core.zmq, "Poller", lambda: wire)
+    # In the module's dict: `zmq_shim` serves `Poller` from its `__getattr__`,
+    # and a setattr's undo would leave pyzmq's class there for later tests.
+    monkeypatch.setitem(vars(engine_core.zmq), "Poller", lambda: wire)
     threads = [
         threading.Thread(target=engine.process_input_sockets, args=("in", "ctl")),
         threading.Thread(target=EngineCore.busy_loop, args=(engine,)),
