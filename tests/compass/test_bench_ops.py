@@ -616,6 +616,23 @@ def test_a_v41_prefill_past_cached_tokens_scores_on_a_plane_its_rows_blocks_wide
     assert rows == planes and taken[3]["kv_indices"].shape == (256, tiles.shape[1])
     assert [r[2]["metadata"]["row_ends"] for r in got] == ["step.visible.2"] * 2
 
+    # the FP4 index plane packs its logits over the whole block table, the
+    # candidate pick's block maxima flat, which no context widens
+    runner.attn_metadata_builder.geometry = dataclasses.replace(
+        geometry, index_dim=128, index_fp4=True
+    )
+    maxima = _leaf(
+        ops._MAXIMA,
+        ("logits", _t([256 * 128], "metadata")),
+        ("visible", _t([256], "metadata", dtype=I32)),
+        ("maxima", _t([256 * 16], "activation")),
+        ("blocks", 16),
+    )
+    found = ops.leaves(_graph(scorer("metadata", 2, 128), maxima)["region"])
+    taken.clear()
+    ops.Stub(runner, 10_000).point(placed, prefill(256, 1), 1024, found)
+    assert [c.get("max_model_len", c.get("blocks")) for c in taken] == [128, 16]
+
 
 def test_an_embedding_reads_the_token_ids_atom_prepared():
     runner = _Runner()

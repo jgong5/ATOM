@@ -14,8 +14,8 @@ its instances grouped (`leaves`), at the shape and `--context`: a decode
 step's rows each hold `--context` tokens, under a drafter verifying as many
 more as it drafts, and a prefill's rows, split as the capture split them,
 follow `--context` cached tokens each, none when it is not given; there
-DeepSeek-V4.1's indexer planes, which the capture sized to its own rows' KV
-blocks, are as wide as the point's rows' (`PAGE_WIDE`). Rows the KV
+the planes of DeepSeek-V4.1's FP8 indexer, which the capture sized to its own
+rows' KV blocks, are as wide as the point's rows' (`PAGE_WIDE`). Rows the KV
 pool cannot hold at once are ragged (`point_rows`), and the point records its
 rows; under `--plan` over ragged decode steps a decode point
 the pool cannot hold refuses instead, past the first round (`RAGGED`).
@@ -350,7 +350,7 @@ V41_NAMES = {
     ("aiter.fused_moe_.default", "num_local_tokens"): "scheduled_tokens_gpu",
     ("aiter.topk_gating_fwd.default", "num_valid_rows"): "scheduled_tokens_gpu",
 }
-#: DeepSeek-V4.1's prefill leaves whose logits plane holds the compressed rows
+#: DeepSeek-V4.1's FP8 prefill leaves whose logits plane holds the compressed rows
 #: of each KV block the step's longest row reaches (`PagedAttentionCache.
 #: unit_tiles`), by operator: the slot of its row bounds, then each slot and
 #: integer that wide. A capture's prefill caches nothing, so a point past
@@ -722,6 +722,10 @@ class Stub:
             for r in getattr(geometry, "layer_ratios", ())
             if r and hasattr(geometry, "rows_per_page")
         }
+        # V4.1's FP8 index plane, whose prefill logits are as wide as the
+        # step's KV blocks (`PAGE_WIDE`); the FP4 plane packs them over the
+        # whole block table, which no context widens
+        self.paged = bool(self.pages) and not getattr(geometry, "index_fp4", False)
         # a DeepSeek-V4 CSA layer: its forward writes the top-k section of the
         # CSA index buffer, and `_prepare` runs none
         self.csa = next(
@@ -876,7 +880,7 @@ class Stub:
         rows = point_rows(shape, context, pool, rule.block_size, bool(uncut), drafts)
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
-        if shape.phase != "decode" and self.pages:  # DeepSeek-V4.1's planes
+        if shape.phase != "decode" and self.paged:
             wide = [-(-max(r[i] for r in rows) // rule.block_size) for i in (0, 1)]
             found = {s: (_widened(op, wide), at) for s, (op, at) in found.items()}
         view = {"rows": rows, "produces_output": True}
