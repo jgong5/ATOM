@@ -210,3 +210,18 @@ def test_a_leaf_of_v41s_state_counts_it_once_a_slot_its_placements_hold(probed):
         for f in ("compress_kv", "compress_score")
     }
     assert record["footprint_bytes"] == 7 * 32 + 4 * placed["read"]
+
+
+def test_a_v41_state_field_taken_whole_counts_each_row_s_slot_once_a_layer(probed):
+    """`aten.select.int` takes a layer of V4.1's state field from the whole
+    field, `[layers, slots, ...]`, its slots strided past its layers: each row's
+    slot counts once a layer, at the 4 slot pairs 8 slots hold, and no slot
+    past the rows'."""
+    _, seen = probed
+    placed = seen["ops_v41_field"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert set(record["metadata"].values()) == {
+        f"attn_metadata_builder.cache.state.{f}" for f in ("window", "compress_score")
+    }
+    assert record["footprint_bytes"] == 7 * 32 + 4 * placed["read"]

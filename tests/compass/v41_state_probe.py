@@ -80,7 +80,9 @@ def prepared(built, batch):
     return metadata, positions
 
 
-def ops_placements(rule, seat, point=None, context=20, drafts=0, v41=False):
+def ops_placements(
+    rule, seat, point=None, context=20, drafts=0, v41=False, whole=False
+):
     """The op bench's placements of a V4.1 `point` under `rule`, a two-row
     decode by default, at `context`, over `test_bench_ops`'s state-only leaf
     with 8 state slots on the runner, on a cache of `drafts` speculative
@@ -89,7 +91,8 @@ def ops_placements(rule, seat, point=None, context=20, drafts=0, v41=False):
     `replay.seat_states`. With `v41`, the leaf instead takes the cache's two
     compressor states as the bench binds them on its builder (`ops._runner`),
     at a cache that gives it 7 copies; its record and the bytes its states
-    read a call are kept too."""
+    read a call are kept too. With `whole`, it takes the window and score
+    fields whole, `[layers, slots, ...]`, as `aten.select.int` takes them."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -134,11 +137,13 @@ def ops_placements(rule, seat, point=None, context=20, drafts=0, v41=False):
         runner.kv_held = ops._bound(
             "attn_metadata_builder.cache", cache, set(), runner.device
         )
-        fields = ("compress_kv", "compress_score")
-        states = [(f, cache.state.view(f)[-1]) for f in fields]
-        args = args[:1] + tuple((f, _t(t.shape, "kv", t.stride())) for f, t in states)
-        leaf = _leaf("v41.states", *args)
-        read = sum(2 * t[0].nbytes for _, t in states)  # two rows' slots
+        fields = ("window" if whole else "compress_kv", "compress_score")
+        states = [(f, cache.state.view(f)) for f in fields]
+        states = [(f, t if whole else t[-1]) for f, t in states]
+        dtyped = [(f, _t(t.shape, "kv", t.stride(), str(t.dtype))) for f, t in states]
+        leaf = _leaf("v41.states", *args[:1], *dtyped)
+        # two rows' slots, every layer of each
+        read = sum(2 * t.select(int(whole), 0).nbytes for _, t in states)
         llc = 3 * (32 + read)  # 7 copies of 32 bytes of activation and the states
     found = ops.leaves(_graph(leaf, layers=1)["region"])
     real, replay.seat_states = replay.seat_states, seat
@@ -264,6 +269,9 @@ def main(root: pathlib.Path) -> None:
     )
     seen["ops_prefill"] = ops_placements(plain, replay.seat_states, prefill(32, 1), 128)
     seen["ops_v41_state"] = ops_placements(plain, replay.seat_states, v41=True)
+    seen["ops_v41_field"] = ops_placements(
+        plain, replay.seat_states, v41=True, whole=True
+    )
 
     from atom.compass.bench.runner import BenchModelRunner
     from atom.compass.parity.runner import RecordingModelRunner

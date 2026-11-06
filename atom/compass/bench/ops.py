@@ -969,8 +969,8 @@ class Stub:
                 entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
                 nbytes = entry * min(read, s["shape"][0])
             if s["role"] == "kv":
-                # ponytail: its first dim taken as blocks or state slots, or as
-                # plane rows when the leaf states its layer's attention geometry;
+                # ponytail: its widest-strided dim taken as blocks or state slots,
+                # or plane rows when the leaf states its layer's attention geometry;
                 # beside state slots a block view is one block a request, the
                 # one a decode compressor writes its row to
                 unit = rows if self.slots else blocks
@@ -984,9 +984,14 @@ class Stub:
                     # of which a request reads at most its indexer's top-k
                     if top := stated.get("index_topk"):
                         unit = min(unit, rows * top)
-                # an entry is the span of its trailing dims: a view may be
-                # strided by a whole state slot or by every layer's block
-                entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
+                # an entry is the span of its other dims: a view may be strided
+                # by a whole state slot or by every layer's block, and a field
+                # laid out layers first, `[layers, slots, ...]`, is read a slot
+                # once a layer
+                shape, stride = s["shape"], s["stride"]
+                cut = max(range(len(stride)), key=stride.__getitem__, default=0)
+                rest = shape[:cut] + shape[cut + 1 :], stride[:cut] + stride[cut + 1 :]
+                entry = _span(*rest) * itemsize
                 nbytes, need = entry * unit, None
                 shared[slotted] += nbytes
             if slot == "workspace" and op["op"] in TOPK_WORKSPACE:
