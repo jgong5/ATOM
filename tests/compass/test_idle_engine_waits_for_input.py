@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 from aiter_stub import stubbed_aiter
+from conftest import ZmqPolling
 
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import Sequence
@@ -33,6 +34,16 @@ with stubbed_aiter():
 
 QUIET_S = 30.0  # the metrics interval: no timeout ends a wait inside a test
 PROMPT_S = 1.0  # a woken loop takes its work well inside this
+SERVED = ("served input", "served loop")  # `_serving`'s thread names
+
+
+@pytest.fixture(autouse=True)
+def served_threads_end():
+    """No served engine's thread outlives its test: a live input thread holds
+    its zmq context, which a later test or pytest's exit would wait on."""
+    yield
+    threads = [t.name for t in threading.enumerate() if t.name in SERVED]
+    assert not threads, threads
 
 
 class Wire:
@@ -127,10 +138,12 @@ def _serving(engine, monkeypatch, interval=QUIET_S):
     monkeypatch.setattr(
         engine_core, "make_zmq_socket", lambda *a, **k: contextlib.nullcontext(wire)
     )
-    monkeypatch.setattr(engine_core.zmq, "Poller", lambda: wire)
+    monkeypatch.setattr(engine_core, "zmq", ZmqPolling(engine_core.zmq, wire))
     threads = [
-        threading.Thread(target=engine.process_input_sockets, args=("in", "ctl")),
-        threading.Thread(target=EngineCore.busy_loop, args=(engine,)),
+        threading.Thread(
+            target=engine.process_input_sockets, args=("in", "ctl"), name=SERVED[0]
+        ),
+        threading.Thread(target=EngineCore.busy_loop, args=(engine,), name=SERVED[1]),
     ]
     for t in threads:
         t.daemon = True

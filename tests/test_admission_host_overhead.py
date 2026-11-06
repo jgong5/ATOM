@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from aiter_stub import stubbed_aiter
-from conftest import MockConfig
+from conftest import MockConfig, ZmqPolling
 from test_dsv4_state_replay import _bm, _mp_bm, _mp_seq
 from test_state_checkpoint import (
     PAGED_COPY_RUNTIME,
@@ -541,7 +541,7 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
     sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(feed))
     monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
     poller = SimpleNamespace(register=lambda *a: None, poll=lambda: [(sock, 1)])
-    monkeypatch.setattr(core.zmq, "Poller", lambda: poller)
+    monkeypatch.setattr(core, "zmq", ZmqPolling(core.zmq, poller))
     engine = object.__new__(core.EngineCore)
     engine.label, engine.input_queue = "test", queue.Queue()
     engine.process_input_sockets("input", "control")
