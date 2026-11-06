@@ -515,8 +515,8 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
     and no record (a cell) priced by a solve on the others has a p50 error
     further from zero than without the column. Every cell
     needs `ROWMOD_CELL_STEPS` steps at the rung, and a rung needs two cells.
-    The qualifying `k` of smallest MAD is adopted: returned with its column,
-    its solve and the evidence the law records.
+    The qualifying `k` of smallest MAD is adopted: returned with its solve and
+    the evidence the law records.
     """
     cell = np.array([r[0] for r in members])
     cells = sorted(set(cell.tolist()))
@@ -543,7 +543,7 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
         column = np.array([rowmod(r[5], k) for r in members], dtype=np.float64)
         design = np.column_stack([x, column])
         solved = _solve(design, y, wide)
-        if solved["mad"] < min(target, best[2]["mad"] if best else target):
+        if solved["mad"] < min(target, best[1]["mad"] if best else target):
             shuffled_mad = float(np.mean([mad(s, k) for s in shuffles]))
             held = p50(design)
             if shuffled_mad >= target and all(
@@ -556,7 +556,7 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
                         str(c): [o, w] for c, o, w in zip(cells, without, held)
                     },
                 }
-                best = (k, column, solved, evidence)
+                best = (k, solved, evidence)
         k *= 2
     return best
 
@@ -769,7 +769,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     names = [*names, feature]
             chosen = _rowmod(members, counts, int(key), solved, seed, names)
             if chosen:
-                rowmod_k, _, solved, evidence = chosen
+                rowmod_k, solved, evidence = chosen
                 names = [*names, "rowmod"]
         slow = ~solved["keep"] & (solved["residual"] < 0)
         once = solved["residual"] < 1 / WARM_FACTOR - 1
