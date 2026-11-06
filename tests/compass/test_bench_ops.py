@@ -1306,6 +1306,27 @@ def test_a_block_view_beside_state_slots_counts_once_a_placement(monkeypatch):
     assert record["footprint_bytes"] == 11 * 32 + 11 * 32 + 3 * 128
 
 
+def test_a_one_layer_field_filling_its_entry_counts_each_row_s_slot(monkeypatch):
+    # A state field of one layer of 64 floats, its whole 256-byte entry, taken
+    # whole: `[1, 8, 64]` strided `[64, 64, 1]`, its layer strided as its slot.
+    runner = _Runner()
+    runner.pool_plan = SimpleNamespace(entries={"state": 8})
+    runner.kv_held = _state((64,))
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    field = _t([1, 8, 64], "kv", stride=[64, 64, 1])
+    leaf = _leaf("v4.select", ("q", _t([2, 4], "activation")), ("st", field))
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    [record] = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+
+    # 32 bytes of q and two rows' slots of 256 a call: 4 copies pass twice
+    # 1000, on the 4 slot pairs 8 slots hold
+    assert record["metadata"] == {"st": "v4_state"}
+    assert record["footprint_bytes"] == 4 * 32 + 4 * 512
+
+
 @pytest.mark.parametrize(
     "shape, footprint", [(decode(2), 7 * 288), (prefill(6, 2), 3 * 800)]
 )
