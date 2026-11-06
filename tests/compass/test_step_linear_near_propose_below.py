@@ -6,7 +6,7 @@ prices a longer one's pass at its far price whatever its lag."""
 import json
 
 import pytest
-from test_backend_step_linear_fit import _fit, _record, _steps
+from test_backend_step_linear_fit import _fit, _record, _steps, traced
 from test_step_linear_draft import PROPOSE, SHARE
 from test_step_linear_near_propose import LATE, WAIT, _output_prefills, _priced
 
@@ -34,7 +34,7 @@ def _bounded(path, steps: int, below: int = BELOW, every: int = 3):
         if propose:
             line["d_propose_ns"] = round(propose * 1e9)
             line["t_recv_ns"][1] += round(LATE * 1e9) * late
-    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    path.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
     return path
 
 

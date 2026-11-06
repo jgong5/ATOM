@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from test_backend_step_linear_fit import _fit, _record, _steps
+from test_backend_step_linear_fit import _fit, _record, _steps, traced
 from test_dp_step_max import prefill, runner
 from test_step_linear_draft import PROPOSE, SHARE
 
@@ -46,7 +46,7 @@ def _output_prefills(path, steps: int, every: int = 3):
         if propose:
             line["d_propose_ns"] = round(propose * 1e9)
             line["t_recv_ns"][1] += round(LATE * 1e9) * near
-    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    path.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
     return path
 
 
@@ -103,7 +103,7 @@ def test_a_propose_pass_whose_scatter_follows_no_lag_is_not_split(tmp_path):
         scattered = round(line["d_propose_ns"] * rng.uniform(0.95, 1.05))
         line["d_busy_ns"] += scattered - line["d_propose_ns"]
         line["d_propose_ns"] = scattered
-    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    path.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
     assert "near_propose" not in _fit([path])["draft"]
 
 
