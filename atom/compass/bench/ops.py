@@ -30,7 +30,10 @@ metadata and forward context; for DeepSeek-V4, the CSA top-k section its
 forward writes is written from ids spread over each token's compressed rows
 (`Stub._top_k`); for DeepSeek-V4.1's FP8 index plane, each table an earlier
 leaf of its forward writes (`_WRITTEN`) is written for the reading leaf's pass
-as that leaf writes it (`Stub._index`). A `Stub` calls each leaf from its
+as that leaf writes it (`Stub._index`), and the logits plane its scorer
+writes, which a top-k or the pick's block maxima ranks (`PAGE_WIDE`), is
+drawn as an activation is, below each row's bound, on every copy
+(`_scores`). A `Stub` calls each leaf from its
 contract: an activation is random at its shape, dtype and stride, except such
 a table, the placement's, a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
@@ -1268,7 +1271,15 @@ class Stub:
                 whole = _random({**value, "shape": [2 * n], "stride": [1]}, device)
                 return whole.as_strided(value["shape"], value["stride"])
             if isinstance(value, dict):
-                return self._tensor(value, meta.get((sig, path)), fresh)
+                out = self._tensor(value, meta.get((sig, path)), fresh)
+                # V4.1's FP8 plane a top-k or block maxima ranks: ATOM's scorer
+                # writes it first, which here no leaf has, or a scorer timed
+                # before has, off its own random inputs
+                if self.paged and path == "logits" and value["role"] == "metadata":
+                    bound = PAGE_WIDE.get(op["op"], ("",))[0]
+                    if (ends := meta.get((sig, bound), ("", None))[1]) is not None:
+                        _scores(out, ends, value)
+                return out
             if isinstance(value, str) and value.startswith("torch."):
                 return getattr(torch, value[6:], value)
             if isinstance(value, str) and value.split(":")[0] == "cuda":
@@ -2076,6 +2087,14 @@ def _random(spec, device) -> torch.Tensor:
     else:
         flat = torch.zeros(n, device=device, dtype=dtype)
     return flat.as_strided(spec["shape"], spec["stride"])
+
+
+def _scores(plane, ends, spec) -> None:
+    """`plane`'s columns below each row's bound in `ends` drawn as an
+    activation of `spec` is (`_random`); the rest as they were."""
+    drawn = _random(spec, plane.device)
+    below = torch.arange(plane.shape[-1], device=plane.device) < ends.reshape(-1, 1)
+    plane.copy_(torch.where(below, drawn, plane))
 
 
 def _clone(t) -> torch.Tensor:
