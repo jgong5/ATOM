@@ -39,8 +39,9 @@ class HostEmbeddingTable:
         self.head_dim = head_dim
         self._scale = scale
         self.block_size = 0
-        # The page-locked row range and its rows (values, then scales), as
-        # `host_memory.pin_rows` returned them; the tensors own the memory.
+        # The row range a device kernel reads and its rows (values, then
+        # scales), as `host_memory.pin_rows` or `host_memory.to_device`
+        # returned them; the tensors own the memory.
         self._uva: tuple[int, int] | None = None
         self._shard: tuple[torch.Tensor, ...] = ()
         if scale is not None:
@@ -107,6 +108,8 @@ class HostEmbeddingTable:
     # the reference implementation. Only THIS RANK'S shard of the table is
     # page-locked -- no HBM -- and a device kernel reads the rows it needs
     # across the bus, which also moves the fp8 dequantization off the host.
+    # ATOM_ENGRAM_UVA_HBM holds the shard in HBM instead, for a host that
+    # cannot page-lock it; the same kernel reads it there.
     #
     # The shard is a whole number of hash heads. Each head owns a disjoint,
     # contiguous, prime-sized row range, so whole heads are a contiguous BYTE
@@ -114,9 +117,12 @@ class HostEmbeddingTable:
     # table. Registering the whole table on every rank is what a TP=4 job cannot
     # afford: 4 x 203 GB of unswappable pages.
 
-    def enable_uva(self, row_start: int = 0, row_end: int | None = None) -> bool:
+    def enable_uva(
+        self, row_start: int = 0, row_end: int | None = None, device=None
+    ) -> bool:
         """Page-lock rows `[row_start, row_end)` so a device kernel can read
-        them (`host_memory.pin_rows`); all-or-nothing.
+        them (`host_memory.pin_rows`), or with `device` copy them into its HBM
+        (`host_memory.to_device`); all-or-nothing.
 
         A table holds one range: enabling a different one while a range is
         held raises -- `disable_uva()` first.
@@ -137,7 +143,10 @@ class HostEmbeddingTable:
         sources = [self._tensor[row_start:row_end]]
         if self._scale is not None:
             sources.append(self._scale[row_start:row_end])
-        shard = host_memory.pin_rows(sources)
+        if device is None:
+            shard = host_memory.pin_rows(sources)
+        else:
+            shard = host_memory.to_device(sources, device)
         if shard is None:
             return False
         self._shard = shard
@@ -145,7 +154,7 @@ class HostEmbeddingTable:
         return True
 
     def disable_uva(self) -> None:
-        """Drop this table's page-locked range, if it holds one.
+        """Drop this table's shard, page-locked or in HBM, if it holds one.
 
         The memory goes when the last tensor over it does: at once unless a
         caller still holds one from `registered_shard`, then with that tensor.
