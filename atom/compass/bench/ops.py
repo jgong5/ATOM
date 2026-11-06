@@ -1599,8 +1599,10 @@ def _bound(name, value, old, device) -> dict[str, torch.Tensor]:
 def _state(runner, held) -> set[str]:
     """The names of the `held` tensors that hold per-request state, each also
     as `_kv` names its last layer: the fields of an arena of a request's state
-    an entry that the runner holds (DeepSeek-V4's compressor state). A KV
-    registry entry of it caps a point's placements at its slots instead."""
+    an entry that the runner holds (DeepSeek-V4's compressor state), and each
+    tensor inside the state arena of a metadata builder's cache (`BUILDERS`,
+    DeepSeek-V4.1's `cache.state`: its fields, a layer of one, the cursor). A
+    KV registry entry of it caps a point's placements at its slots instead."""
     from atom.model_ops.attentions.pool_layout.entry_arena import SplitEntryMajorArena
 
     state = []
@@ -1608,12 +1610,27 @@ def _state(runner, held) -> set[str]:
         if isinstance(arena, SplitEntryMajorArena):
             state += [p.view(f.name) for p in arena.arenas for f in p.fields]
     at = {(t.data_ptr(), t.shape, t.stride()) for t in state}
+    caches = [getattr(getattr(runner, b, None), "cache", None) for b in BUILDERS]
+    bufs = [s.buf for c in caches if hasattr(s := getattr(c, "state", None), "buf")]
     return {
         n
         for name, t in held.items()
         if (t.data_ptr(), t.shape, t.stride()) in at
-        for n in (name, f"{name}.{len(t) - 1}")
+        or any(_inside(t, buf) for buf in bufs)
+        for n in (name, f"{name}.{len(t) - 1}" if t.dim() else name)
     }
+
+
+def _inside(t, buf) -> bool:
+    """Whether `t`'s bytes lie within `buf`'s, of one storage."""
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    if StorageWeakRef(t.untyped_storage()) != StorageWeakRef(buf.untyped_storage()):
+        return False
+    at = buf.storage_offset() * buf.element_size()
+    start = t.storage_offset() * t.element_size()
+    end = start + _span(t.shape, t.stride()) * t.element_size()
+    return at <= start and end <= at + buf.nbytes
 
 
 def _function(name: str):

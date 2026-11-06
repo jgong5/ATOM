@@ -193,3 +193,20 @@ def test_every_op_bench_placement_of_a_verify_or_cached_prefill_point_prepares(
     placed = seen[point]
     assert placed["refused"] is None
     assert len(placed["slots"]) > 1
+
+
+def test_a_leaf_of_v41s_state_counts_it_once_a_slot_its_placements_hold(probed):
+    """V4.1's compressor states, bound on its builder: the leaf's 7 placements
+    of two rows take the 4 slot pairs 8 slots hold, its states counted once a
+    pair, its activation once a copy."""
+    _, seen = probed
+    placed = seen["ops_v41_state"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    pairs = [[0, 1], [2, 3], [4, 5], [6, 7]]
+    assert placed["slots"] == pairs + pairs[:3]
+    assert set(record["metadata"].values()) == {
+        f"attn_metadata_builder.cache.state.{f}.0"
+        for f in ("compress_kv", "compress_score")
+    }
+    assert record["footprint_bytes"] == 7 * 32 + 4 * placed["read"]
