@@ -457,7 +457,8 @@ def _intakes(path) -> tuple[list, list]:
     that follow it. A lone one found every earlier request sent and its own
     sent before the next app call, with nothing else stamped between: its
     seconds are the CPU time the loop's thread spent from the app call to the
-    send's end. A burst is a run of requests each of whose app call came
+    send's end, less what it spent from its pool job's submit to its resume
+    (``wait``), the job's and other requests' work. A burst is a run of requests each of whose app call came
     before the template of the one ahead of it began, the loop taking them in
     one after another."""
     ev = _stamps(path)
@@ -467,7 +468,8 @@ def _intakes(path) -> tuple[list, list]:
     lone = []
     for i, (call, after) in enumerate(zip(calls, calls[1:] + [math.inf])):
         span = ev[np.searchsorted(at, call, "right") : np.searchsorted(at, after)]
-        between = [e for e in span if e[2] != "app"]
+        between = [e for e in span if e[2] not in ("app", "recv", "wait")]
+        waits = sum(e[5] - e[4] for e in span if e[2] == "wait")
         if np.searchsorted(sends, call) != i or [e[2] for e in between] != [
             "body",
             "tmpl",
@@ -476,7 +478,7 @@ def _intakes(path) -> tuple[list, list]:
         ]:
             continue
         body, *_, send = between
-        lone.append((body[3], (send[5] - cpu[call]) * 1e-9))
+        lone.append((body[3], (send[5] - cpu[call] - waits) * 1e-9))
     # The loop renders each request's template as soon as its body is read.
     tmpl = [e for e in ev if e[2] == "tmpl"]
     sizes = [e[3] for e in sorted(ev, key=lambda e: e[1]) if e[2] == "body"]

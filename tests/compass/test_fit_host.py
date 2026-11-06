@@ -170,6 +170,8 @@ ENCODES = [
 IDLE, PER_BYTE, FIXED = 1.1e-3, 8.8e-9, 4.3e-3
 #: What the wall clock holds of an intake past its CPU time: GIL waits.
 WAIT = 700_000
+#: The loop's CPU time on other requests' work while a pool job runs, in ns.
+OTHERS = 2_000_000
 TOKENIZER = {"backend": "fast", "fingerprint": "sha256:tok"}
 
 
@@ -193,7 +195,8 @@ def stamped(
     """`directory`'s steps with the tokenizer calls and HTTP intake stamps a
     recorded server writes. A lone request per body size in `lone`, its loop
     thread's CPU time `IDLE + PER_BYTE x bytes` and its wall that plus
-    `WAIT`, its pool job holding its call of `encodes` and a decode after its
+    `WAIT`, besides `OTHERS` of others' work on the loop while its pool job runs,
+    its pool job holding its call of `encodes` and a decode after its
     send, each timed at `rates`; then calls that do not run lone, ten times
     slower, and one burst of `burst`'s body sizes, its templates
     `FIXED + PER_BYTE x bytes` of the loop's CPU time apart."""
@@ -211,13 +214,15 @@ def stamped(
     sizes = np.linspace(*lone, 8).astype(int).tolist() if lone else []
     for k, (size, encode) in enumerate(zip(sizes, encodes)):
         t += 10**9
-        loop = round((IDLE + PER_BYTE * size) * 1e9)
+        loop = round((IDLE + PER_BYTE * size) * 1e9) + OTHERS
         done = call(*encode, t + 20_000)
         lines += [
             _stamp("app", t, t, cpu=(cpu, cpu)),
+            _stamp("recv", t + 1100, t + 1900, 0, (cpu + 1100, cpu + 1900)),
             _stamp("body", t + 1000, t + 2000, size, (cpu + 1000, cpu + 2000)),
             _stamp("tmpl", t + 3000, t + 4000, size, (cpu + 3000, cpu + 4000)),
             _stamp("prep", t + 10_000, done + 1000, thread=2),
+            _stamp("wait", t + 9000, done + 1500, 0, (cpu + 5000, cpu + 5000 + OTHERS)),
             _stamp(
                 "send", done + 2000, done + 3000 + WAIT, 0, (cpu + loop - 1, cpu + loop)
             ),
