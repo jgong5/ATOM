@@ -592,12 +592,16 @@ def _groups(
     steps=None,
     serial: bool = False,
     routing: tuple[int, int] | None = None,
+    dummies: list[frozenset] | None = None,
 ) -> tuple[list[dict[int, tuple]], dict, list[float]]:
     """One run's steps, each {rank: its `_features` row} labelled with the
     smallest rank label, a rank that ran the step as a dummy forward holding
     none; what was cut; and each step's rank label spread. With `steps`, only
-    the steps numbered in it; `serial` and `routing` as `_features` reads them."""
-    dummies = [rank[0].dummies for rank in run]
+    the steps numbered in it; `serial` and `routing` as `_features` reads them;
+    `dummies`, each rank's dummy forwards, its samples' when None, which a
+    rank that gave no sample needs given."""
+    if dummies is None:
+        dummies = [rank[0].dummies for rank in run]
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
     got = [_features(rank, form, len(run), draft, serial, routing) for rank in run]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
