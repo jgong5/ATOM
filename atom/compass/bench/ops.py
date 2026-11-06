@@ -884,12 +884,14 @@ class Stub:
         kv = _forward_kv_cache_context.kv_cache_data
         held = _held(self.runner, kv)
         self.state = _state(self.runner, held)
-        # V4.1's ratios also by the width of the logits each scorer writes
+        # V4.1's ratios also by the width of the logits each scorer writes, but
+        # a candidate list's, whose width a widened plane can take
         self.known = self.pages | {
             ("stride0", op["args"]["out_logits"]["shape"][1]): ratio
             for op, _ in found.values()
             if (ratio := op.get("stated", {}).get("compress_ratio")) is not None
             and "out_logits" in op["args"]
+            and (op["args"].get("context_lens") or {}).get("role") != "activation"
         }
         self.kv = {
             (s, path): _kv(spec, path, _named(op, path, spec, held, self.known) or held)

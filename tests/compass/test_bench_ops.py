@@ -564,36 +564,57 @@ def test_a_v41_prefill_past_cached_tokens_scores_on_a_plane_its_rows_blocks_wide
     geometry = V41PoolGeometry(
         1, ((0, 2),), 128, 4, 512, 32, layer_ratios=(2,), index_block_rows=8
     )
-    runner, i32 = _Runner(), torch.int32
+    runner, i32, I32 = _Runner(), torch.int32, "torch.int32"
     runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
     runner.forward_vars |= {
         "logits": torch.zeros(256 * 640),
-        "visible": torch.zeros(256, dtype=i32),
         "tiles": torch.zeros(256 * 80, dtype=i32),
     }
+    step = SimpleNamespace(visible={r: torch.zeros(256, dtype=i32) for r in (1, 2)})
+    prepare = runner.prepare_model
 
-    def scorer(bounds):  # as a prefill of 256 tokens caching none traced it
-        return _leaf(
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        fctx._forward_context.attn_metadata.step = step
+        return out
+
+    runner.prepare_model = prepare_model
+
+    def scorer(bounds, ratio, width):  # as a prefill of 256 tokens traced it
+        leaf = _leaf(
             ops._LOGITS,
-            ("out_logits", _t([256, 128], "metadata")),
-            ("context_lens", _t([256], bounds, dtype="torch.int32")),
-            ("kv_indices", _t([256, 16], bounds, dtype="torch.int32")),
-            ("max_model_len", 128),
+            ("out_logits", _t([256, width], "metadata")),
+            ("context_lens", _t([256], bounds, dtype=I32)),
+            ("kv_indices", _t([256, width // 8], bounds, dtype=I32)),
+            ("max_model_len", width),
         )
+        return dataclasses.replace(leaf, stated=(("compress_ratio", ratio),))
 
-    # one whose row bounds are ATOM's, and one scoring a candidate list
-    found = ops.leaves(_graph(scorer("metadata"), scorer("activation"))["region"])
+    rows = [_t([256], "metadata", dtype=I32)] * 2
+    top_k = _leaf(
+        ops._TOPK,
+        ("logits", _t([256, 128], "metadata")),
+        *zip(("row_starts", "row_ends"), rows),
+        ("stride0", 128),
+    )
+    # its row bounds ATOM's, caching none; a candidate list's, 640 wide; top-k
+    graph = _graph(scorer("metadata", 2, 128), scorer("activation", 1, 640), top_k)
+    found = ops.leaves(graph["region"])
     placed = SimpleNamespace(block_size=128, batch=lambda *a: a[1:])
-    for context in (None, 1024):
+    got = [
         ops.Stub(runner, 10_000).point(placed, prefill(256, 1), context, found)
+        for context in (None, 1024)
+    ]
 
     # ATOM's tile table past 1024 cached tokens: the 10 blocks its row reaches
     units = geometry.index_blocks_per_page(2)
     tiles = unit_table(torch.zeros(1, 10, dtype=i32), torch.zeros(0, dtype=i32), units)
     width = tiles.shape[1] * geometry.index_block_rows
-    got = [(c["out_logits"].stride(0), c["max_model_len"]) for c in taken]
-    assert got == [(128, 128), (128, 128), (width, width), (128, 128)]
-    assert taken[2]["kv_indices"].shape == (256, tiles.shape[1]) and width == 640
+    planes = [c.get("max_model_len", c.get("stride0")) for c in taken]
+    assert planes == [128, 640, 128, width, 640, width] and width == 640
+    rows = [c.get("out_logits", c.get("logits")).stride(0) for c in taken]
+    assert rows == planes and taken[3]["kv_indices"].shape == (256, tiles.shape[1])
+    assert [r[2]["metadata"]["row_ends"] for r in got] == ["step.visible.2"] * 2
 
 
 def test_an_embedding_reads_the_token_ids_atom_prepared():
