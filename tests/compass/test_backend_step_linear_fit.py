@@ -547,8 +547,9 @@ def test_a_prefill_pass_is_labelled_by_a_trace_run_s_busy_time_alone(tmp_path):
         t, d, p = (x * 1e-9 for x in busy[s.step])
         assert (s.cut, s.device_s, s.draft_s) == (None, t, d)
         assert s.propose_s == (p if s.view.produces_output else None)
-    shutil.copytree(record.parent, tmp_path / "copied")
-    assert label(tmp_path / "copied" / record.name)[0] == got
+    copied = tmp_path / "copied" / "steps"
+    shutil.copytree(record.parent, copied)
+    assert label(copied / record.name)[0] == got
     record.with_suffix(".busy.jsonl").unlink()
     with pytest.raises(ValueError, match="trace run's record with no dp0.busy.jsonl"):
         label(record)
