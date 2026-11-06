@@ -426,7 +426,9 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         help="the device's last-level cache in MiB: 256 on MI300X, MI308X and "
-        "MI355X (AMD Infinity Cache, CDNA 3 and CDNA 4 white papers)",
+        "MI355X (AMD Infinity Cache, CDNA 3 and CDNA 4 white papers); 512 on "
+        "MI455, an upper bound confirmed cold at four times it (#2154's card "
+        "runs 7 and 8)",
     )
     add_gpu_flag(p)
     p.add_argument("--store", required=True, help="the artifact store's root")
