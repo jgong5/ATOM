@@ -28,8 +28,11 @@ head or its sampler runs. Each point reaches the runner as a batch
 first seated at its cached context (`replay.seat_states`), so ATOM builds its
 metadata and forward context; for DeepSeek-V4, the CSA top-k section its
 forward writes is written from ids spread over each token's compressed rows
-(`Stub._top_k`). A `Stub` calls each leaf from its contract:
-an activation is random at its shape, dtype and stride, except a router's
+(`Stub._top_k`); for DeepSeek-V4.1's FP8 index plane, each table an earlier
+leaf of its forward writes (`_WRITTEN`) is written for the reading leaf's pass
+as that leaf writes it (`Stub._index`). A `Stub` calls each leaf from its
+contract: an activation is random at its shape, dtype and stride, except such
+a table, the placement's, a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
 experts' ids ATOM fuses into them (`_route`), the `NM_OUTPUT` slot at
 one KV split, a view at the start of twice its span, and aiter's top-k
@@ -353,16 +356,38 @@ V41_NAMES = {
 }
 #: DeepSeek-V4.1's FP8 prefill leaves whose logits plane holds the compressed rows
 #: of each KV block the step's longest row reaches (`PagedAttentionCache.
-#: unit_tiles`), by operator: the slot of its row bounds, then each slot and
+#: unit_tiles`), and the tile table's build, which reads as many block-table
+#: columns, by operator: the slot of its row bounds, then each slot and
 #: integer that wide. A capture's prefill caches nothing, so a point past
 #: cached tokens takes them at its own rows' blocks (`_widened`). A leaf whose
-#: bounds are not metadata scores an earlier layer's candidate blocks, on a
-#: plane the checkpoint sizes.
+#: bounds are a candidate list's (`_written`) scores an earlier layer's
+#: candidate blocks, on a plane the checkpoint sizes.
 _MAXIMA = "atom.model_ops.deepseek_v41.indexer:_block_maxima"
+_PICK = "aiter._top_k_per_row_decode.default"
+_V41 = "atom.model_ops.deepseek_v41"
 PAGE_WIDE = {
     _LOGITS: ("context_lens", "out_logits", "kv_indices", "max_model_len"),
     _TOPK: ("row_ends", "logits", "stride0"),
+    _PICK: ("seqLens", "logits", "stride0"),
     _MAXIMA: ("visible", "logits", "maxima", "blocks"),
+    f"{_V41}.unit_table:unit_table": ("block_tables", "block_tables"),
+}
+#: DeepSeek-V4.1's FP8 index tables an earlier leaf of its forward writes, by
+#: the operator and slot that read them (`_written`): the page-wide scorer's
+#: tile table (`tiles`); the blocks each row keeps of the candidate pick
+#: (`ids`) and a candidate list's tile table (`table`) and row bounds
+#: (`context`), its scorer's and its top-k's; and the pick's top-k's row
+#: bounds (`ends`), there where its logits, the block maxima, are an activation.
+_WRITTEN = {
+    (_LOGITS, "kv_indices"): "tiles",
+    (_LOGITS, "context_lens"): "context",
+    (_TOPK, "row_starts"): "context",
+    (_TOPK, "row_ends"): "context",
+    (_PICK, "seqLens"): "context",
+    **{
+        (f"{_V41}.candidate_table:{f}", "candidates"): "ids"
+        for f in ("candidate_block_table", "lift_candidate_selection")
+    },
 }
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
@@ -727,6 +752,10 @@ class Stub:
         # step's KV blocks (`PAGE_WIDE`); the FP4 plane packs them over the
         # whole block table, which no context widens
         self.paged = bool(self.pages) and not getattr(geometry, "index_fp4", False)
+        # its index layer that picks its successors' candidate blocks
+        spec = {m: getattr(m, "spec", None) for m in self.modules.values()}
+        picks = [m for m, s in spec.items() if getattr(s, "produces_candidates", 0)]
+        self.picker = next((m for m in picks if hasattr(m, "topk_blocks")), None)
         # a DeepSeek-V4 CSA layer: its forward writes the top-k section of the
         # CSA index buffer, and `_prepare` runs none
         self.csa = next(
@@ -795,9 +824,11 @@ class Stub:
         meta = dict(self.kv)
         for sig, (op, _) in self.leaves.items():
             writes, rows = _writes(op["op"]), _pass_rows(op)
-            live = lives.get(None if rows == running else rows, lives[None])
+            at = None if rows == running else rows
+            live = lives.get(at, lives[None])
             for path, spec in _specs(op["args"]):
-                if spec["role"] == "metadata":
+                index = self.paged and _written(op, path)
+                if spec["role"] == "metadata" or index:
                     token = (op["op"], path) in TOKEN_IDS
                     pool = {"input_ids": input_ids} if token else live
                     what, field = "metadata", path.split(".")[0]
@@ -814,6 +845,9 @@ class Stub:
                     elif v41 := _named(op, path, spec, live, self.known):
                         pool = v41
                     try:
+                        if index:  # as the forward's first reader writes it
+                            step = passes.get(at, passes[None])[0]
+                            pool = self._index(md.cache, step, index, ratio)
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
@@ -857,6 +891,27 @@ class Stub:
         self.csa._fill_csa_paged_compress(
             fc.attn_metadata, ids.int(), fc.context.positions, tokens
         )
+
+    def _index(self, cache, step, kind, ratio) -> dict[str, torch.Tensor]:
+        """DeepSeek-V4.1's index table `kind` (`_written`) for the pass `step`,
+        by name, as its forward writes it: the tile table at `ratio`, into the
+        scorer workspace's (`unit_tiles`); or, off the blocks each row keeps of
+        the candidate pick (`_candidates`), those, a candidate list's tile
+        table or row bounds (`candidate_blocks`), or each row's visible blocks,
+        the pick's top-k's row bounds (`_block_maxima`'s `ends`)."""
+        if kind == "tiles":  # rewritten: another pass may have written it since
+            step.tiles.pop(ratio, None)
+            return {f"workspace._tiles.{ratio}": cache.unit_tiles(step, ratio)}
+        if self.picker is None:
+            raise ValueError("no layer of the model picks candidate blocks")
+        spec, block = self.picker.spec, self.picker.block_size
+        ends = (step.visible[spec.ratio] + block - 1) // block
+        if kind == "ends":
+            return {f"step.visible.{spec.ratio}.blocks": ends}
+        if spec.layer_id not in step.candidates:
+            step.candidates[spec.layer_id] = _candidates(ends, self.picker.topk_blocks)
+        bound = cache.candidate_blocks(step, spec.layer_id, spec.ratio)
+        return {f"step.candidate_blocks.{spec.layer_id}.{kind}": getattr(bound, kind)}
 
     def point(self, rule, shape, context, found) -> list[dict]:
         """Each leaf of `found` timed at `shape` on `point_rows`, or every leaf
@@ -1190,6 +1245,7 @@ class Stub:
                 isinstance(value, dict)
                 and value.get("role") == "activation"
                 and old is not None
+                and (sig, path) not in meta  # one the placement wrote
             ):
                 return old
             if path == "workspace" and op["op"] in TOPK_WORKSPACE:
@@ -1292,12 +1348,12 @@ class Stub:
 
     def _tensor(self, spec, meta, fresh):
         role = spec["role"]
-        if role == "activation":
+        if role == "activation" and meta is None:
             return _random(spec, self.runner.device)
-        if role in ("metadata", "kv"):
+        if role in ("metadata", "kv", "activation"):
             if meta[1] is None:
                 raise ValueError(meta[0])
-            return _clone(meta[1]) if fresh and role == "metadata" else meta[1]
+            return _clone(meta[1]) if fresh and role != "kv" else meta[1]
         raise ValueError(f"a {role} tensor argument {_text(spec)} is not built")
 
     def _weight(self, spec, c, count):
@@ -1518,8 +1574,7 @@ def _widened(op, blocks) -> dict:
     `blocks[1]` KV blocks rather than the capture's `blocks[0]`: an integer,
     a tensor's columns, and its row stride where that is its columns."""
     bound, *wide = PAGE_WIDE.get(op["op"], (None,))
-    bounds = op["args"].get(bound) or {}
-    if blocks[0] == blocks[1] or bounds.get("role") != "metadata":
+    if blocks[0] == blocks[1] or bound is None or _written(op, bound) == "context":
         return op
     op = copy.deepcopy(op)
     for slot in wide:
@@ -1532,6 +1587,32 @@ def _widened(op, blocks) -> dict:
             stride[0] = stride[0] // blocks[0] * blocks[1]
         shape[1] = shape[1] // blocks[0] * blocks[1]
     return op
+
+
+def _written(op, path) -> str | None:
+    """Which index table of `_WRITTEN` `op`'s `path` takes: a scorer's on a
+    plane its row bounds ATOM stages bound, the page-wide one, its tile table
+    (`tiles`), else a candidate list's (`table`); an activation row bound the
+    pick's (`ends`) under a top-k of activation logits, else a candidate
+    list's (`context`); None for a row bound ATOM stages, or another slot."""
+    kind = _WRITTEN.get((op["op"], path))
+    role = {s: v.get("role") for s, v in op["args"].items() if isinstance(v, dict)}
+    if kind == "tiles" and role.get("context_lens") != "metadata":
+        return "table"
+    if kind == "context" and role.get(path) != "activation":
+        return None
+    return "ends" if kind == "context" and role.get("logits") == "activation" else kind
+
+
+def _candidates(ends, k) -> torch.Tensor:
+    """`[rows, k]` int32 blocks each row of `ends` visible blocks keeps, as V4.1's
+    candidate pick keeps them, ascending: every one when it sees no more
+    than `k`, -1 past them; else `k`, the newest, which the pick pins, last."""
+    # ponytail: the rest spread evenly; the pick keeps the blocks its scores
+    # peak in, which no placement has
+    run, seen = torch.arange(k, device=ends.device), ends.long()[:, None]
+    kept = torch.where(run < seen, run, -1)
+    return torch.where(seen > k, (run + 1) * seen // k - 1, kept).int()
 
 
 def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:

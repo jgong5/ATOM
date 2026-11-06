@@ -571,11 +571,20 @@ def test_a_v41_prefill_past_cached_tokens_scores_on_a_plane_its_rows_blocks_wide
         "tiles": torch.zeros(256 * 80, dtype=i32),
     }
     step = SimpleNamespace(visible={r: torch.zeros(256, dtype=i32) for r in (1, 2)})
+    # its cache's tables, and the layer whose 80 candidate blocks bound a list
+    pick = SimpleNamespace(table=torch.zeros(256, 80, dtype=i32))
+    pick.context, tiles = torch.zeros(256, dtype=i32), runner.forward_vars["tiles"]
+    runner.model.append(_picker(80))
+    step.tiles, step.candidates = {}, {}
+    cache = SimpleNamespace(
+        unit_tiles=lambda step, ratio: tiles, candidate_blocks=lambda *a: pick
+    )
     prepare = runner.prepare_model
 
     def prepare_model(batch):  # and the step V4.1's builder prepares
         out = prepare(batch)
         fctx._forward_context.attn_metadata.step = step
+        fctx._forward_context.attn_metadata.cache = cache
         return out
 
     runner.prepare_model = prepare_model
@@ -632,6 +641,141 @@ def test_a_v41_prefill_past_cached_tokens_scores_on_a_plane_its_rows_blocks_wide
     taken.clear()
     ops.Stub(runner, 10_000).point(placed, prefill(256, 1), 1024, found)
     assert [c.get("max_model_len", c.get("blocks")) for c in taken] == [128, 16]
+
+
+def _picker(k):
+    """V4.1's index layer 0, at ratio 1, picking `k` candidate blocks of 8 rows."""
+    from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
+
+    picker = torch.nn.Module()
+    picker.spec = LayerAttentionSpec(0, 1, AttentionMode.FULL, candidate_owner=0)
+    picker.block_size, picker.topk_blocks = 8, k
+    return picker
+
+
+def _v41_index(monkeypatch, visible, leaves, shape, context):
+    """Each of `leaves`' first call at `shape` and `context` on V4.1's FP8
+    plane, a PAGE of 32 tokens 4 index blocks at ratio 1, under a pick of 4
+    candidate blocks, its step's rows seeing `visible` on blocks 3, 1 and 0, 2;
+    ATOM's cache binds its tables by its kernels' torch twins."""
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
+        V41PoolGeometry,
+    )
+    from atom.model_ops.deepseek_v41 import candidate_table as ct
+    from tests.models.deepseek_v41.reference_unit_table import unit_table_reference
+
+    monkeypatch.setattr(ct, "candidate_block_table", ct.candidate_block_table_reference)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    taken, i32 = [], torch.int32
+
+    def call(stub, op, sig, instances, n):
+        taken.append(stub._copy(op, sig, instances, 0)[0])
+        return {}
+
+    monkeypatch.setattr(ops.Stub, "_time", call)
+    runner = _Runner()
+    runner.model.append(_picker(4))
+    geometry = V41PoolGeometry(1, ((0, 1),), 32, 4, 512, 32, layer_ratios=(1,))
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(128)
+    runner.forward_vars["block_tables"] = torch.zeros(64, dtype=i32)
+    cache = SimpleNamespace(
+        unit_tiles=lambda s, r: unit_table_reference(s.block_tables, s.batch_ids, 4),
+        candidate_blocks=lambda s, source, r: ct.bind_candidates(
+            s.candidates[source], s.block_tables, s.batch_ids, 4, s.visible[r],
+            rows_per_block=8,
+        ),  # fmt: skip
+    )
+    step = SimpleNamespace(
+        visible={1: torch.tensor(visible, dtype=i32)},
+        block_tables=torch.tensor([[3, 1], [0, 2]], dtype=i32),
+        batch_ids=(torch.arange(len(visible)) % 2).int(),
+        tiles={},
+        candidates={},
+    )
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        fctx._forward_context.attn_metadata.step = step
+        fctx._forward_context.attn_metadata.cache = cache
+        return out
+
+    runner.prepare_model = prepare_model
+    found = ops.leaves(_graph(*leaves, layers=1)["region"])
+    placed = SimpleNamespace(block_size=32, batch=lambda *a: a[1:])
+    ops.Stub(runner, 10_000).point(placed, shape, context, found)
+    return taken
+
+
+def test_v41_index_leaves_take_the_tables_atom_s_forward_writes_for_their_step(
+    monkeypatch,
+):
+    I32 = "torch.int32"
+
+    def scorer(bounds, width):  # at decode B=2, ratio 1
+        leaf = _leaf(
+            ops._LOGITS,
+            ("out_logits", _t([2, width], "metadata")),
+            ("context_lens", _t([2], bounds, dtype=I32)),
+            ("kv_indices", _t([2, width // 8], bounds, dtype=I32)),
+            ("max_model_len", width),
+        )
+        return dataclasses.replace(leaf, stated=(("compress_ratio", 1),))
+
+    def top_k(logits, width):
+        bounds = [_t([2], "activation", dtype=I32)] * 2
+        return _leaf(
+            ops._TOPK,
+            ("logits", _t([2, width], logits)),
+            *zip(("row_starts", "row_ends"), bounds),
+            ("stride0", width),
+        )
+
+    picked = "atom.model_ops.deepseek_v41.candidate_table:candidate_block_table"
+    picked = _leaf(picked, ("candidates", _t([2, 4], "activation", dtype=I32)))
+    # the page-wide scorer, a candidate list's and its top-k, the pick's top-k
+    leaves = scorer("metadata", 64), scorer("activation", 32), top_k("metadata", 32)
+    leaves += top_k("activation", 8), picked
+    # rows seeing 50 and 20 compressed rows: 7 and 3 blocks of 8
+    page, listed, its, pick, kept = _v41_index(
+        monkeypatch, [50, 20], leaves, decode(2), 64
+    )
+
+    assert page["kv_indices"].tolist() == [
+        [12, 13, 14, 15, 4, 5, 6, 7],
+        [0, 1, 2, 3, 8, 9, 10, 11],
+    ]
+    # 4 of the first row's 7 blocks, its newest last, and the second's 3
+    assert kept["candidates"].tolist() == [[0, 2, 4, 6], [0, 1, 2, -1]]
+    assert listed["kv_indices"].tolist() == [[12, 14, 4, 6], [0, 1, 2, 0]]
+    assert listed["context_lens"].tolist() == [26, 20]
+    assert its["row_starts"].tolist() == its["row_ends"].tolist() == [26, 20]
+    assert pick["row_starts"].tolist() == pick["row_ends"].tolist() == [7, 3]
+
+
+def test_a_v41_prefill_past_cached_tokens_picks_candidates_off_its_rows_blocks(
+    monkeypatch,
+):
+    # as a prefill of 256 tokens traced them: 8 PAGEs, 32 index blocks
+    pick = _leaf(
+        "aiter._top_k_per_row_decode.default",
+        ("logits", _t([256, 32], "activation")),
+        ("seqLens", _t([256], "activation", dtype="torch.int32")),
+        ("stride0", 32),
+    )
+    tables = _t([1, 8], "metadata", [64, 1], "torch.int32")
+    units = "atom.model_ops.deepseek_v41.unit_table:unit_table"
+    units = _leaf(units, ("block_tables", tables))
+    visible = list(range(1025, 1281))  # past 1024 cached tokens
+
+    leaves = pick, units
+    pick, units = _v41_index(monkeypatch, visible, leaves, prefill(256, 1), 1024)
+
+    # its rows reach 40 PAGEs: 160 index blocks
+    assert pick["logits"].shape == (256, 160) and pick["stride0"] == 160
+    assert pick["seqLens"].tolist() == [-(-v // 8) for v in visible]
+    assert units["block_tables"].shape == (1, 40)
 
 
 def test_an_embedding_reads_the_token_ids_atom_prepared():
