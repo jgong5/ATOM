@@ -3,14 +3,23 @@
 # "<GPU> <test file>". A line applies when torch's name for the first card in
 # HIP_VISIBLE_DEVICES contains <GPU>, or <GPU> is that card's target; a file
 # outside tests/compass then has its collected tests come off the expected pass
-# count. Each line is a file that stalls there, passes and fails at random so no
-# baseline can name it, or needs an input that GPU's nodes do not hold, and goes
-# when what the comment above it names no longer holds.
+# count. Each line is a file that stalls or aborts there, errors or passes and
+# fails at random there so no baseline can name it, or needs an input that GPU's
+# nodes do not hold, and goes when what the comment above it names no longer
+# holds.
 
 # #2441: stalls at a device sync after a TBO forward.
 MI308X tests/attentions/deepseek_v41/test_tbo.py
 # #2631: the V4 paged-decode kernel returns a different output on each call at head dim 96.
 MI308X tests/model_ops/test_v4_fused_decode.py
+# #2914: FlyDSL 0.4.0's compile aborts the process on gfx1250.
+gfx1250 tests/models/deepseek_v41/test_index_fp4.py
+gfx1250 tests/models/glm52/kernels/test_glm5_tp4_index_fp8.py
+# #2915: aiter's pa_fwd_asm aborts the process on gfx1250.
+gfx1250 tests/test_model_runner_decode_padding.py
+# #2916: every test errors at setup, FlyDSL's s_waitcnt has no gfx1250.
+gfx1250 tests/test_deepseek_v41_mono_contract.py
+gfx1250 tests/test_minimax_m3_mono_contract.py
 # The Ruling on #2896: MI455 nodes run only models verified on them, today
 # DeepSeek-V4.1-Flash. Each file below has tests that need a Qwen slice, image,
 # MTP or cc-traces model.
