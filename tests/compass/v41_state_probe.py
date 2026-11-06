@@ -91,6 +91,7 @@ def ops_placements(
     whole=False,
     page=False,
     pool=None,
+    slots=8,
 ):
     """The op bench's placements of a V4.1 `point` under `rule`, a two-row
     decode by default, at `context`, over `test_bench_ops`'s state-only leaf
@@ -104,10 +105,10 @@ def ops_placements(
     fields whole, `[layers, slots, ...]`, as `aten.select.int` takes them; with
     `page` too, its page field whole, `[layers, pages, ...]`, of a capture's 4.
     With `pool`, the cache's pool, `[rows, dim]` over its PAGEs and state, as a
-    capture's 4 PAGEs held it, whole, as `_launch_rope_window` takes it; at
-    `ring`, that and layer 1's window ring cut from it (`ring_view`), as
-    `pa_sparse_prefill_opus` takes both, stating its window, compress ratio
-    and top-k 1."""
+    capture's 4 PAGEs and `slots` state slots held it, whole, as
+    `_launch_rope_window` takes it; at `ring`, that and layer 1's window ring
+    cut from it (`ring_view`), as `pa_sparse_prefill_opus` takes both, stating
+    its window, compress ratio and top-k 1."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -162,7 +163,7 @@ def ops_placements(
                 PagedAttentionCache,
             )
 
-            capture = PagedAttentionCache(cache.geometry, 4, 8, "cpu")
+            capture = PagedAttentionCache(cache.geometry, 4, slots, "cpu")
             states = [("pool", capture.pool)]
             states += [("ring", capture.ring_view(1))] if pool == "ring" else []
         dtyped = [(f, _t(t.shape, "kv", t.stride(), str(t.dtype))) for f, t in states]
@@ -304,9 +305,9 @@ def main(root: pathlib.Path) -> None:
     seen["ops_v41_page"] = ops_placements(
         plain, replay.seat_states, v41=True, whole=True, page=True
     )
-    for pool in ("whole", "ring"):
-        seen[f"ops_v41_{pool}_pool"] = ops_placements(
-            plain, replay.seat_states, v41=True, pool=pool
+    for pool, slots in (("whole", 8), ("ring", 8), ("ring", 4), ("ring", 16)):
+        seen[f"ops_v41_{pool}_pool_{slots}"] = ops_placements(
+            plain, replay.seat_states, v41=True, pool=pool, slots=slots
         )
 
     from atom.compass.bench.runner import BenchModelRunner
