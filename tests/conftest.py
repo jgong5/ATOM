@@ -273,6 +273,49 @@ def keep_envs_lazy():
             delattr(envs, name)
 
 
+_SHIM_SWAPPED = ("Context", "Poller", "Socket")
+
+
+@pytest.fixture(autouse=True)
+def keep_zmq_shim_choosing():
+    """Fail the test that leaves `zmq_shim` a fixed `Context`, `Poller` or
+    `Socket`, and undo it.
+
+    `atom.utils.zmq_shim` picks each of the three on every read, through a
+    module-level `__getattr__`: pyzmq's with no LP runtime installed, the
+    runtime's own with one. `monkeypatch.setattr` on the shim restores by
+    `setattr`, so the pyzmq class it read stays in the module dict, and a later
+    test that installs a runtime gets pyzmq's: an engine input thread then never
+    reports its requests. Patch the name on the module that imports the shim
+    instead (`monkeypatch.setattr(engine_core, "zmq", ...)`).
+
+    pytest sets autouse fixtures up in name order, and this name sorts before
+    `mono_runs_on_gfx950`, the first to take `monkeypatch`: its check runs
+    after monkeypatch's undo.
+    """
+    yield
+    shim = sys.modules.get("atom.utils.zmq_shim")
+    fixed = [n for n in _SHIM_SWAPPED if shim is not None and n in vars(shim)]
+    for name in fixed:
+        delattr(shim, name)
+    assert not fixed, (
+        f"this test left zmq_shim's {fixed} fixed, which a later test's LP "
+        "runtime would not get; patch `zmq` on the module that imports the shim"
+    )
+
+
+class ZmqPolling:
+    """A module's `zmq` whose `Poller` makes ``poller``, every other name read
+    from ``zmq`` itself: what a test sets on a module that imports `zmq_shim`
+    (`keep_zmq_shim_choosing`)."""
+
+    def __init__(self, zmq, poller):
+        self._zmq, self.Poller = zmq, lambda: poller
+
+    def __getattr__(self, name):
+        return getattr(self._zmq, name)
+
+
 @pytest.fixture
 def seq_factory():
     """Factory for creating Sequence objects with sensible defaults."""

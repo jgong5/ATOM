@@ -21,10 +21,11 @@ from types import SimpleNamespace
 
 import pytest
 from aiter_stub import stubbed_aiter
+from conftest import ZmqPolling
 
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import Sequence
-from atom.utils import clock, zmq_shim
+from atom.utils import clock
 
 with stubbed_aiter():
     from atom.model_engine import engine_core
@@ -37,15 +38,12 @@ SERVED = ("served input", "served loop")  # `_serving`'s thread names
 
 
 @pytest.fixture(autouse=True)
-def leaves_nothing_behind():
-    """After each test, monkeypatch undone: no served thread is alive, and
-    `zmq_shim` still picks `Context`, `Poller` and `Socket` on each read. A
-    later test in this process installs an LP runtime and needs the shim's
-    `Poller`; a pyzmq one fixed on the shim never reports its requests."""
+def served_threads_end():
+    """No served engine's thread outlives its test: a live input thread holds
+    its zmq context, which a later test or pytest's exit would wait on."""
     yield
     threads = [t.name for t in threading.enumerate() if t.name in SERVED]
-    fixed = [n for n in ("Context", "Poller", "Socket") if n in vars(zmq_shim)]
-    assert not threads and not fixed, (threads, fixed)
+    assert not threads, threads
 
 
 class Wire:
@@ -73,18 +71,6 @@ class Wire:
 
     def recv(self, copy=True):
         return self.frame
-
-
-class Zmq:
-    """`engine_core`'s `zmq` with the wire as its `Poller`. Set on
-    `engine_core`, not on the shim, whose `Poller` monkeypatch would undo by
-    fixing there the one it read."""
-
-    def __init__(self, wire):
-        self.Poller = lambda: wire
-
-    def __getattr__(self, name):
-        return getattr(zmq_shim, name)
 
 
 class Scheduler:
@@ -152,7 +138,7 @@ def _serving(engine, monkeypatch, interval=QUIET_S):
     monkeypatch.setattr(
         engine_core, "make_zmq_socket", lambda *a, **k: contextlib.nullcontext(wire)
     )
-    monkeypatch.setattr(engine_core, "zmq", Zmq(wire))
+    monkeypatch.setattr(engine_core, "zmq", ZmqPolling(engine_core.zmq, wire))
     threads = [
         threading.Thread(
             target=engine.process_input_sockets, args=("in", "ctl"), name=SERVED[0]

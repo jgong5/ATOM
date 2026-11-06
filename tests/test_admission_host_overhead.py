@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from aiter_stub import stubbed_aiter
-from conftest import MockConfig
+from conftest import MockConfig, ZmqPolling
 from test_dsv4_state_replay import _bm, _mp_bm, _mp_seq
 from test_state_checkpoint import (
     PAGED_COPY_RUNTIME,
@@ -507,18 +507,6 @@ def test_frontend_preprocess_ships_the_chain():
     assert off.preprocess(tokens, SamplingParams()).prompt_hash_chain is None
 
 
-class _ZmqPolling:
-    """`engine_core`'s `zmq` whose `Poller` makes ``poller``. Set on the
-    engine module, not on `zmq_shim`, whose `Poller` monkeypatch would undo
-    by fixing there the one it read."""
-
-    def __init__(self, shim, poller):
-        self._shim, self.Poller = shim, lambda: poller
-
-    def __getattr__(self, name):
-        return getattr(self._shim, name)
-
-
 def _real(name, monkeypatch):
     """`name` imported for real, even over a stub (no `__file__`) another test
     file left in `sys.modules`."""
@@ -553,7 +541,7 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
     sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(feed))
     monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
     poller = SimpleNamespace(register=lambda *a: None, poll=lambda: [(sock, 1)])
-    monkeypatch.setattr(core, "zmq", _ZmqPolling(core.zmq, poller))
+    monkeypatch.setattr(core, "zmq", ZmqPolling(core.zmq, poller))
     engine = object.__new__(core.EngineCore)
     engine.label, engine.input_queue = "test", queue.Queue()
     engine.process_input_sockets("input", "control")
