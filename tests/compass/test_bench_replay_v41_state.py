@@ -225,3 +225,15 @@ def test_a_v41_state_field_taken_whole_counts_each_row_s_slot_once_a_layer(probe
         f"attn_metadata_builder.cache.state.{f}" for f in ("window", "compress_score")
     }
     assert record["footprint_bytes"] == 7 * 32 + 4 * placed["read"]
+
+
+def test_a_v41_page_field_taken_whole_binds_it_and_counts_once_a_placement(probed):
+    """`aten.select.int` takes a layer of V4.1's page field from the whole
+    field, `[layers, pages, rows, dim]`, of the 4 PAGEs a capture's pool held:
+    it binds that field, not the state's buffer, so it counts once a placement."""
+    _, seen = probed
+    placed = seen["ops_v41_page"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert record["metadata"] == {"main_1": "attn_metadata_builder.cache.pages.main_1"}
+    assert record["footprint_bytes"] == 7 * 32 + 7 * placed["read"]

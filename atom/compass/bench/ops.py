@@ -1015,8 +1015,7 @@ class Stub:
                 # once a layer; on a tie, the first dim of size above one: a
                 # field of one layer filling its entry strides layer and slot alike
                 shape, stride = s["shape"], s["stride"]
-                widest = [(stride[i], shape[i] > 1, -i) for i in range(len(stride))]
-                cut = -max(widest, default=(0, 0, 0))[2]
+                cut = _widest(shape, stride)
                 rest = shape[:cut] + shape[cut + 1 :], stride[:cut] + stride[cut + 1 :]
                 entry = _span(*rest) * itemsize
                 nbytes, need = entry * unit, None
@@ -1561,14 +1560,14 @@ def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:
 
 def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
     """The live KV tensor a KV argument is a view of, and its name, picked as
-    `_meta` picks among those whose layout past the first dimension's size
+    `_meta` picks among those whose layout past its widest-strided dim's size
     is its own (`_layout`), when any is: the capture's pool sized that one;
     else among the last layers, `name.i`, of tensors stacked by layer whose
     layer has that layout: ATOM passes a layer of DeepSeek-V4's compressor
     state, and another field's base at this one's slot stride reaches past
     the pool; else among the buffers of arenas, as its dtype views them
     (`_bound`), whose fields' strided views ATOM carves out of them, the
-    capture's pool sizing a dimension past the first (DeepSeek-V4.1's pages);
+    capture's pool sizing a dimension other than the widest-strided;
     or why none fits, and None: a tensor of another layout is another buffer
     than the one ATOM passes."""
     want = _layout(spec["shape"], spec["stride"])
@@ -1589,10 +1588,17 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
 
 
 def _layout(shape, stride) -> list:
-    """Each dimension's size and stride, but the first's size and any
-    dimension of one."""
+    """Each dimension's size and stride, but the widest-strided one's size,
+    which a pool sizes (`_widest`), and any other dimension of one past the first."""
+    cut = _widest(shape, stride)
     dims = zip(range(len(shape)), shape, stride)
-    return [(n if i else None, s) for i, n, s in dims if n != 1 or not i]
+    return [(None if i == cut else n, s) for i, n, s in dims if n != 1 or i in (0, cut)]
+
+
+def _widest(shape, stride) -> int:
+    """The dimension of the widest stride, on a tie the first of size above one."""
+    dims = [(s, n > 1, -i) for i, (n, s) in enumerate(zip(shape, stride))]
+    return -max(dims, default=(0, 0, 0))[2]
 
 
 def _held(runner, registry) -> dict[str, torch.Tensor]:
