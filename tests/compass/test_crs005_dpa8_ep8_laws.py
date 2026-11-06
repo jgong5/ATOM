@@ -3,7 +3,8 @@
 hull each rung was fitted on, a step at the median context of each rung either
 side of a 1P1D EP8 deployment reaches on a run neither law was fitted on: the
 decode law its decode side's rungs, the prefill law the decodes its side runs for
-the requests it holds.
+the requests it holds. The prefill law prices its side's rung-2 decode, which none
+of its records holds, by the decode law's rung-2 vector, declared.
 """
 
 import json
@@ -12,7 +13,7 @@ from pathlib import Path
 import pytest
 from test_crs005_dpa8_laws import decode_step
 
-from atom.compass.backends import StepLinearBackend, StepLinearLaw
+from atom.compass.backends import Method, StepLinearBackend, StepLinearLaw
 from atom.compass.backends.step_linear import EXTRAPOLATED
 
 LAWS = Path(__file__).resolve().parents[2] / "scripts" / "compass" / "laws"
@@ -34,6 +35,9 @@ DECODE_SIDE = [
     (8, 16, (103161, 150439, 96501, 79890, 209928)),
 ]
 PREFILL_SIDE = [(1, 8, (52298,))]
+#: The prefill side's rung-2 decode nearest the median context of the three a 1P1D
+#: deployment's c=64 run on traces 0 to 255 ran, as its costliest rank ran it.
+PREFILL_RUNG_2 = (2, 10, (168434, 656))
 
 
 @pytest.mark.parametrize(
@@ -47,3 +51,17 @@ def test_each_crs005_ep8_law_prices_an_unfitted_runs_median_steps_inside_its_hul
     cost = backend.price(decode_step(rung, moe_tokens, contexts))
     assert cost.seconds > 0
     assert all(t.provenance.source != EXTRAPOLATED for t in cost.terms)
+
+
+def test_the_crs005_ep8_prefill_law_prices_rung_2_by_the_decode_law_s_vector():
+    prefill, decode = (
+        StepLinearBackend(StepLinearLaw(law(side)), dp=8)
+        for side in ("prefill", "decode")
+    )
+    step = decode_step(*PREFILL_RUNG_2)
+
+    cost, fitted = prefill.price(step), decode.price(step)
+
+    assert {t.provenance.method for t in cost.terms} == {Method.DECLARED}
+    assert {t.provenance.method for t in fitted.terms} == {Method.ESTIMATED}
+    assert cost.seconds == fitted.seconds > 0

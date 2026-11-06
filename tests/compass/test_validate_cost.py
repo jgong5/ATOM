@@ -456,6 +456,39 @@ def test_a_peer_s_dummy_forward_is_priced_0_s_and_its_step_graded(tmp_path):
     assert cost_accuracy(tmp_path / "stopped", LAW)["cut"]["ranks"] == 1
 
 
+def test_a_rank_that_ran_only_dummy_forwards_adds_no_step(tmp_path):
+    # Rank 2, which no request reached, runs a dummy beside each of the other
+    # ranks' steps: the record grades as theirs alone does.
+    served, idle = _two_ranks(), [(None, None)] * 10 + [(None, 1)] * 10
+    for r, steps in enumerate(served):
+        _record(tmp_path / "alone", steps, rank=r, group=served)
+    ranks = [*served, idle]
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "steps", steps, rank=r, group=ranks)
+    report = cost_accuracy(tmp_path / "steps", LAW)
+
+    alone = cost_accuracy(tmp_path / "alone", LAW)
+    assert report == {**alone, "record": str(tmp_path / "steps")}
+    assert report["cut"]["ranks"] == 0
+    assert report["validated"]["decode"]["steps"] == 10
+
+    # Its last step was in flight: that step is cut, as beside a rank that served.
+    stopped = [*served, idle[:-1]]
+    for r, steps in enumerate(stopped):
+        _record(tmp_path / "stopped", steps, rank=r, group=stopped)
+    report = cost_accuracy(tmp_path / "stopped", LAW)
+    assert report["cut"]["ranks"] == 1
+    assert report["validated"]["decode"]["steps"] == 9
+
+    # No rank ran a forward: the record refuses.
+    (tmp_path / "idle").mkdir()
+    for r in range(2):
+        dummies = (tmp_path / "steps/dp2.jsonl").read_text()
+        (tmp_path / f"idle/dp{r}.jsonl").write_text(dummies)
+    with pytest.raises(ValueError, match="ranks ran only DP's dummy forwards"):
+        cost_accuracy(tmp_path / "idle", LAW)
+
+
 def test_a_group_step_is_banded_by_its_costliest_rank_not_rank_0(tmp_path):
     # Rank 1, the costliest on its 9.95e6 of history, runs 500 tokens; rank 0
     # runs 515 and rank 2, the last, 520 tokens, both cheaper and in band 512-2048.

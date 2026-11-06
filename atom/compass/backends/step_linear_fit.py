@@ -515,8 +515,8 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
     and no record (a cell) priced by a solve on the others has a p50 error
     further from zero than without the column. Every cell
     needs `ROWMOD_CELL_STEPS` steps at the rung, and a rung needs two cells.
-    The qualifying `k` of smallest MAD is adopted: returned with its column,
-    its solve and the evidence the law records.
+    The qualifying `k` of smallest MAD is adopted: returned with its solve and
+    the evidence the law records.
     """
     cell = np.array([r[0] for r in members])
     cells = sorted(set(cell.tolist()))
@@ -543,7 +543,7 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
         column = np.array([rowmod(r[5], k) for r in members], dtype=np.float64)
         design = np.column_stack([x, column])
         solved = _solve(design, y, wide)
-        if solved["mad"] < min(target, best[2]["mad"] if best else target):
+        if solved["mad"] < min(target, best[1]["mad"] if best else target):
             shuffled_mad = float(np.mean([mad(s, k) for s in shuffles]))
             held = p50(design)
             if shuffled_mad >= target and all(
@@ -556,7 +556,7 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
                         str(c): [o, w] for c, o, w in zip(cells, without, held)
                     },
                 }
-                best = (k, column, solved, evidence)
+                best = (k, solved, evidence)
         k *= 2
     return best
 
@@ -592,12 +592,16 @@ def _groups(
     steps=None,
     serial: bool = False,
     routing: tuple[int, int] | None = None,
+    dummies: list[frozenset] | None = None,
 ) -> tuple[list[dict[int, tuple]], dict, list[float]]:
     """One run's steps, each {rank: its `_features` row} labelled with the
     smallest rank label, a rank that ran the step as a dummy forward holding
     none; what was cut; and each step's rank label spread. With `steps`, only
-    the steps numbered in it; `serial` and `routing` as `_features` reads them."""
-    dummies = [rank[0].dummies for rank in run]
+    the steps numbered in it; `serial` and `routing` as `_features` reads them;
+    `dummies`, each rank's steps run as dummy forwards, read from its samples
+    when None: a rank that gave no sample needs them given."""
+    if dummies is None:
+        dummies = [rank[0].dummies for rank in run]
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
     got = [_features(rank, form, len(run), draft, serial, routing) for rank in run]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
@@ -769,7 +773,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     names = [*names, feature]
             chosen = _rowmod(members, counts, int(key), solved, seed, names)
             if chosen:
-                rowmod_k, _, solved, evidence = chosen
+                rowmod_k, solved, evidence = chosen
                 names = [*names, "rowmod"]
         slow = ~solved["keep"] & (solved["residual"] < 0)
         once = solved["residual"] < 1 / WARM_FACTOR - 1
