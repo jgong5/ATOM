@@ -173,8 +173,8 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     rank lacks otherwise or cut, or whose
     ranks fall to different vectors, is counted under `cut.ranks`. Ranks whose
     records differ in length by more than the one step a stopped run leaves on
-    some ranks only are refused, and so are ranks that all ran only dummy
-    forwards.
+    some ranks only are refused, and so is a record whose every rank ran only
+    dummy forwards.
     So is a record whose run.json, beside `record`, names `aiter_jit_builds`.
     """
     run = Path(record).resolve().parent / "run.json"
@@ -190,7 +190,9 @@ def cost_accuracy(record, backend, steps=None) -> dict:
         )
     run = [got for got, _ in step_labels.label_run(ranks, split_rule=_split)]
     if not any(run):
-        raise ValueError(f"{record}'s ranks ran only DP's dummy forwards")
+        raise ValueError(
+            f"{record}'s ranks ran only DP's dummy forwards: no step to price"
+        )
     dummies = [frozenset(s["step"] for s in x if s["is_dummy_run"]) for x in records]
     joined, cut, _ = step_linear_fit._groups(run, "base", steps=steps, dummies=dummies)
     views = [{s.step: s.view for s in rank} for rank in run]

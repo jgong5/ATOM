@@ -598,8 +598,8 @@ def _groups(
     smallest rank label, a rank that ran the step as a dummy forward holding
     none; what was cut; and each step's rank label spread. With `steps`, only
     the steps numbered in it; `serial` and `routing` as `_features` reads them;
-    `dummies`, each rank's dummy forwards, its samples' when None, which a
-    rank that gave no sample needs given."""
+    `dummies`, each rank's steps run as dummy forwards, read from its samples
+    when None: a rank that gave no sample needs them given."""
     if dummies is None:
         dummies = [rank[0].dummies for rank in run]
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
