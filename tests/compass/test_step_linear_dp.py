@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """The step linear law under DP-attention with EP off: one law per rank, priced at
 the deployment's DP width, the group's step the max over its ranks. A rung's hull
-holds each fitted step at the rank its vector prices it as, MoE column included.
+holds each fitted step at the rank its vector prices it as, MoE column included,
+and a rung that adopts a column is solved on those rows.
 The checked-in DeepSeek-V4-Pro EP8 laws install at their own side's engine config
 only, and validate a step at every decode rung they fit.
 
@@ -214,6 +215,28 @@ def test_a_routed_rung_hulls_each_step_at_the_rank_it_prices(tmp_path):
             outside.append(i)
     assert moved
     assert outside == []
+
+
+@pytest.mark.parametrize("cap, passes", [(20, 3), (3, 3), (2, None)])
+def test_a_routed_rung_alternates_again_under_its_column(
+    tmp_path, monkeypatch, cap, passes
+):
+    """The experts column moves some steps' costliest rank off the row the
+    alternation took on the rung's features alone, so the rung alternates
+    again under it, its passes the solves under the column. Once no step
+    moves, it is solved on the rows it prices: the per-rank law."""
+    from atom.compass.backends import step_linear_fit
+
+    monkeypatch.setattr(step_linear_fit, "MAD_PASSES", cap)
+    full = _wide_or_tall(2, routed.FULL, (110_000, 130_000))
+    sparse = _wide_or_tall(3, routed.SPARSE, (80_000, 100_000))
+    records = routed._records(tmp_path / "full", full)
+    records += routed._records(tmp_path / "sparse", sparse)
+    vector = routed._routed(records)[0]["decode"][str(routed.RUNG)]
+    assert vector["fit"]["passes"] == passes
+    if passes:
+        assert vector["coefficients"] == pytest.approx(WIDE_OR_TALL, rel=1e-6)
+        assert vector["fit"]["mad"] < 1e-6
 
 
 def test_a_law_fitted_on_dp_records_joins_at_their_width_and_refuses_at_dp_1(
