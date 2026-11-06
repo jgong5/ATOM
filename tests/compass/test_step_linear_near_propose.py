@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
-"""A draft law prices the `propose` pass of an output prefill whose device
-reaches it close behind its host apart, when the records' propose labels split
-at that lag, and a simulated runner reads the lag off its host clock."""
+"""A draft law that holds `near_propose`, as one fitted before the fit's lag
+split went may, prices the `propose` pass of an output prefill whose device
+reaches it close behind its host apart, and a simulated runner reads the lag
+off its host clock. Propose labels fit one `propose` vector whatever their lag."""
 
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 from test_backend_step_linear_fit import _fit, _record, _steps, traced
 from test_dp_step_max import prefill, runner
@@ -25,6 +25,9 @@ from atom.compass.runner.overrides import HostDeviceRecurrence
 #: What a pass the device reaches close behind its host adds, in seconds, and
 #: how long after its device starts the step that host returns from its wait.
 WAIT, LATE = 1e-3, 10.0
+#: The lag a law's `near_propose` splits at, in seconds: the one the fit's lag
+#: split found on these records before it went.
+LAG = 2.0**-20
 
 
 def _output_prefills(path, steps: int, every: int = 3):
@@ -50,9 +53,19 @@ def _output_prefills(path, steps: int, every: int = 3):
     return path
 
 
+def with_near_propose(law, **extra) -> dict:
+    """`law` with a `near_propose` beside its draft's `propose`, `WAIT` more a
+    pass, below `LAG` and with `extra`'s entries, as a law fitted before the
+    fit's lag split went holds one."""
+    coefficients = {"step": PROPOSE[0] + WAIT, "seqs": PROPOSE[1]}
+    split = {**law["draft"]["propose"], "coefficients": coefficients, "lag": LAG}
+    return {**law, "draft": {**law["draft"], "near_propose": split | extra}}
+
+
 @pytest.fixture(scope="module")
 def law(tmp_path_factory):
-    return _fit([_output_prefills(tmp_path_factory.mktemp("near") / "dp0.jsonl", 1600)])
+    record = _output_prefills(tmp_path_factory.mktemp("near") / "dp0.jsonl", 1600, 0)
+    return with_near_propose(_fit([record]))
 
 
 def _proposed(cost) -> float:
@@ -69,42 +82,18 @@ def _priced(law, start_lag_s, tokens=512) -> float:
     return _proposed(StepLinearBackend(StepLinearLaw(law)).price(view))
 
 
-def test_a_pass_the_device_reaches_close_behind_its_host_is_fitted_and_priced_apart(
-    law,
-):
-    near = law["draft"]["near_propose"]
-    assert (near["coefficients"]["step"], near["coefficients"]["seqs"]) == (
-        pytest.approx((PROPOSE[0] + WAIT, PROPOSE[1]), rel=1e-4)
-    )
-    assert near["fit"]["split"]["error"] < 1e-9 < near["fit"]["split"]["error_without"]
+def test_propose_labels_that_follow_a_lag_fit_one_propose_vector(tmp_path):
+    """Every third pass runs `WAIT` longer, its host back from the wait `LATE`
+    after its device start: one `propose` vector prices them all."""
+    draft = _fit([_output_prefills(tmp_path / "dp0.jsonl", 1600)])["draft"]
+    assert "propose" in draft and "near_propose" not in draft
+
+
+def test_a_pass_the_device_reaches_close_behind_its_host_is_priced_apart(law):
     assert _priced(law, -LATE) == pytest.approx(sum(PROPOSE) + WAIT, rel=1e-4)
     assert _priced(law, 0.0) == pytest.approx(sum(PROPOSE), rel=1e-4)
     with pytest.raises(CostRefused, match="how far behind its host"):
         _priced(law, None)
-
-
-@pytest.mark.parametrize("steps, every", [(300, 3), (1600, 160)])
-def test_a_split_of_too_few_passes_or_too_few_a_side_is_not_adopted(
-    tmp_path, steps, every
-):
-    """150 output prefills, under `PROPOSE_SPLIT_STEPS`, where scatter that
-    follows no lag clears the gain; or a side of 5, under `PROPOSE_SIDE_STEPS`."""
-    path = _output_prefills(tmp_path / "dp0.jsonl", steps, every)
-    assert "near_propose" not in _fit([path])["draft"]
-
-
-def test_a_propose_pass_whose_scatter_follows_no_lag_is_not_split(tmp_path):
-    """Labels scattered 5% about one price: a split cuts the error only by the
-    two coefficients it adds."""
-    path = _output_prefills(tmp_path / "dp0.jsonl", 1600, every=0)
-    lines = [json.loads(x) for x in path.read_text().splitlines()]
-    rng = np.random.default_rng(0)
-    for line in (x for x in lines if "d_propose_ns" in x):
-        scattered = round(line["d_propose_ns"] * rng.uniform(0.95, 1.05))
-        line["d_busy_ns"] += scattered - line["d_propose_ns"]
-        line["d_propose_ns"] = scattered
-    path.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
-    assert "near_propose" not in _fit([path])["draft"]
 
 
 def test_a_near_propose_the_law_cannot_read_whole_is_refused(law):

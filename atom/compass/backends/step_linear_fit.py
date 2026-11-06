@@ -88,8 +88,7 @@ under the law's `draft`; it holds no `held_out`. A step with a propose label
 (`step_labels`) is fitted there on its draft label less that label, the
 draft-KV pass a middle chunk runs too, and left out when nothing remains; the
 propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`,
-or, split at a lag and maybe bounded at a token count, its `propose` and
-`near_propose` (`_proposes`).
+whatever lag the device ran at.
 A decode's draft-KV label fits the draft law's `draft_kv` vector alike. An
 output prefill's fits the draft law's prefill vector in place of its draft
 label, which, all after `forward_done_event`, fits the `propose` vector, and
@@ -176,13 +175,6 @@ ROWMOD_CELL_STEPS = 100
 ROWMOD_GAIN = 0.1
 #: Seeded shuffles of each step's rows whose mean MAD the `rowmod` column must not beat.
 ROWMOD_SHUFFLES = 8
-#: The fraction of the unsplit `propose` vector's mean log error a split must cut.
-PROPOSE_SPLIT_GAIN = 0.1
-#: Timed propose labels a split needs: on fewer, scatter that follows no lag
-#: clears the gain.
-PROPOSE_SPLIT_STEPS = 200
-#: Steps each side of a `propose` split holds at least, for its two coefficients.
-PROPOSE_SIDE_STEPS = 10
 HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
 #: What a forward that admits requests spends once, per prompt token past the
@@ -875,7 +867,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             for s in samples
             if s.propose_s is not None
         ]:
-            law["draft"] |= _proposes(proposes)
+            law["draft"]["propose"] = _propose(proposes)
         if kvs:
             law["draft"]["draft_kv"] = _propose(kvs, "draft_kv_s")
         if any(s.view.prefill and s.draft_kv_s is not None for s in samples):
@@ -906,80 +898,6 @@ def _propose(samples, label: str = "propose_s") -> dict:
             **fitted,
         },
     }
-
-
-def _proposes(samples) -> dict:
-    """The draft law's `propose` over `samples`, or, split at a lag, `propose`
-    over the passes the device reached at least that far behind its host and
-    `near_propose` over the rest, the lag its `lag`; and, bounded at a token
-    count, `near_propose` over those of fewer prefill tokens alone, the count
-    its `below`.
-
-    A pass's lag is its view's `start_lag_s` plus its step's target and draft-KV
-    labels. The lag runs over the powers of two of a second up to one, over the
-    steps that state one when they number at least `PROPOSE_SPLIT_STEPS`, each
-    side holding at least `PROPOSE_SIDE_STEPS` and solved as `_propose` solves.
-    The split whose vectors price those steps at the smallest mean
-    |log(price / label)| is adopted when that cuts the unsplit vector's by
-    `PROPOSE_SPLIT_GAIN`. The bound runs over the powers of two and one and a
-    half times each, below the largest prefill, with every lag again, once a
-    split is adopted: the best bounded split replaces it when that cuts its
-    error by `PROPOSE_SPLIT_GAIN` too. The errors go under `near_propose`'s
-    `fit.split`.
-    Not a scaled MAD: unsplit, the more frequent pass length sets the MAD
-    however far the rest are priced off it.
-    """
-    timed = [s for s in samples if s.view.start_lag_s is not None]
-    lags = np.array(
-        [s.view.start_lag_s + s.device_s + (s.draft_kv_s or 0) for s in timed]
-    )
-    tokens = np.array([sum_tokens(s.view.prefill) for s in timed])
-    x = np.array([(1, len(s.view.requests)) for s in timed], dtype=np.float64)
-    labels = np.array([s.propose_s for s in timed])
-
-    def error(short, below: dict, above: dict) -> float:
-        price = [x @ list(v["coefficients"].values()) for v in (below, above)]
-        return float(np.mean(np.abs(np.log(np.where(short, *price) / labels))))
-
-    def best(bounds) -> tuple | None:
-        """The (error, near, far) of the best split at any lag under `bounds`."""
-        found, seen = None, set()
-        for k in (2.0**-n for n in range(20, -1, -1)):
-            for bound in bounds:
-                short = (lags < k) & (tokens < bound)
-                if short.tobytes() in seen or (
-                    min(short.sum(), (~short).sum()) < PROPOSE_SIDE_STEPS
-                ):
-                    continue
-                seen.add(short.tobytes())
-                sides = [
-                    [s for s, m in zip(timed, short) if m == w] for w in (True, False)
-                ]
-                below, above = map(_propose, sides)
-                got = error(short, below, above)
-                if found is None or got < found[0]:
-                    below["lag"] = k
-                    if bound < math.inf:
-                        below["below"] = bound
-                    found = (got, below, above)
-        return found
-
-    whole = _propose(samples)
-    if len(timed) < PROPOSE_SPLIT_STEPS:
-        return {"propose": whole}
-    without = error(np.zeros(len(timed), dtype=bool), whole, whole)
-    split = best([math.inf])
-    if split is None or split[0] >= (1 - PROPOSE_SPLIT_GAIN) * without:
-        return {"propose": whole}
-    errors = {"error": split[0], "error_without": without}
-    top = int(tokens.max())
-    grid = [b << j for b in (2, 3) for j in range(top.bit_length()) if b << j < top]
-    bounded = best(sorted(grid))
-    if bounded is not None and bounded[0] < (1 - PROPOSE_SPLIT_GAIN) * split[0]:
-        errors["error_unbounded"], errors["error"] = split[0], bounded[0]
-        split = bounded
-    split[1]["fit"]["split"] = errors
-    return {"propose": split[2], "near_propose": split[1]}
 
 
 def token_band(tokens: int) -> str:
