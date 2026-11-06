@@ -2086,6 +2086,126 @@ def test_a_capture_that_fails_refuses_its_leaf_and_the_next_draws_its_activation
     assert collecting == [False] * 3 and gc.isenabled()
 
 
+class _Generator(torch.Generator):
+    """A host generator that is in capture or not, as a CUDA one is; set to a
+    clone's state, it is not."""
+
+    capturing = False
+
+    def clone_state(self):
+        return None
+
+    def graphsafe_set_state(self, state):
+        self.capturing = False
+
+
+def _forced(monkeypatch, end=lambda: None):
+    """ATOM's `rejection_sample` at a forced acceptance of two rows on the
+    host, its top-k and Triton kernel stood in, each launch recording whether
+    it was in a capture, under a stand-in capture that checks a draw as torch
+    does: in a capture, from a generator its graph registered before it
+    began; outside one, from none still in capture. A capture whose `end`
+    raises, as HIP's does on a graph a call invalidated, leaves them in it."""
+    from atom.model_ops import rejection_sampler as rs
+
+    capturing, launched, rand, synthetic = [], [], torch.rand, _Generator()
+    wrong = ("Offset increment outside graph capture", "not in capture mode")
+
+    class Graph:
+        def __init__(self):
+            self.registered, self.replay = [], lambda: None
+
+        def register_generator_state(self, generator):
+            assert not capturing, "Cannot register the state during capturing"
+            self.registered.append(generator)
+
+    class Capture:
+        capture_stream = "capture"
+
+        def __init__(self, graph, capture_error_mode):
+            self.graph = graph
+
+        def __enter__(self):
+            capturing.append(self)
+            for generator in self.graph.registered:
+                generator.capturing = True
+
+        def __exit__(self, *exc):
+            capturing.pop()
+            end()
+            for generator in self.graph.registered:
+                generator.capturing = False
+
+    def draw(*args, generator=None, **kwargs):
+        if generator is not None and generator.capturing != bool(capturing):
+            raise RuntimeError(wrong[bool(capturing)])
+        return rand(*args, generator=generator, **kwargs)
+
+    event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+    event.elapsed_time = lambda end: 1.0
+    for name, value in {
+        "CUDAGraph": Graph,
+        "graph": Capture,
+        "Event": lambda enable_timing: event,
+        "current_stream": lambda: "main",
+        "stream": lambda s: contextlib.nullcontext(),
+        "is_current_stream_capturing": lambda: False,
+        "default_generators": (_Generator(),),
+        "current_device": lambda: 0,
+    }.items():
+        monkeypatch.setattr(torch.cuda, name, value)
+    monkeypatch.setattr(torch, "rand", draw)
+    monkeypatch.setattr(ops.time, "sleep", lambda s: None)
+    monkeypatch.setattr(rs, "_SYNTHETIC_GENERATORS", {torch.device("cpu"): synthetic})
+    monkeypatch.setattr(rs, "topk_select", lambda t, k, tie: torch.topk(t, k))
+    kernel = {(2,): lambda *a, **k: launched.append(bool(capturing))}
+    monkeypatch.setattr(rs, "rejection_synthetic_sample_kernel", kernel)
+    kwargs = {
+        "input_ids": torch.zeros(12, dtype=torch.int32),
+        "target_logits_indices": torch.arange(10),
+        "num_spec_steps": 5,
+        "cu_num_draft_tokens": torch.tensor([5, 10], dtype=torch.int32),
+        "draft_probs": None,
+        "target_probs": torch.ones(10, 8),
+        "bonus_token_ids": torch.zeros(2, 1, dtype=torch.int32),
+        "bonus_logits_indices": torch.tensor([5, 11]),
+        "synthetic_acceptance_rates": (1.0, 1.0, 0.0, 0.0, 0.0),
+    }
+    return rs.rejection_sample, kwargs, synthetic, launched
+
+
+def test_a_forced_acceptance_is_captured_drawing_from_atom_s_own_generator(
+    monkeypatch,
+):
+    # ATOM's forced acceptance draws from a generator of its own, made and
+    # seeded by the leaf's eager call; a capture registers only the default
+    # generator, and a draw from any other in it raises.
+    sample, kwargs, synthetic, launched = _forced(monkeypatch)
+    sample(**kwargs)  # the leaf's eager call, as `Stub._time` makes it
+
+    times = ops._replay(sample, [(kwargs, fctx._forward_context)] * 4)
+
+    assert times == [1e6 / 4] * ops.REPEATS
+    assert launched == [False] + [True] * 4 and not synthetic.capturing
+
+
+def test_a_failed_capture_leaves_atom_s_forced_acceptance_generator_out_of_it(
+    monkeypatch,
+):
+    # A generator left in capture raises at ATOM's next eager draw from it.
+    def end():
+        raise RuntimeError("operation failed due to a previous error")
+
+    sample, kwargs, synthetic, launched = _forced(monkeypatch, end)
+    sample(**kwargs)
+
+    with pytest.raises(RuntimeError, match="previous error"):
+        ops._replay(sample, [(kwargs, fctx._forward_context)])
+    sample(**kwargs)
+
+    assert launched == [False, True, False] and not synthetic.capturing
+
+
 def test_a_device_argument_is_the_rank_s_own_device():
     # The capture ran on device 0: on another rank a call there would leave
     # the rank's device, and its capture.
