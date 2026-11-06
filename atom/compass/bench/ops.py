@@ -13,7 +13,9 @@ model and TP width ATOM's arguments resolve. A point is one leaf of that graph,
 its instances grouped (`leaves`), at the shape and `--context`: a decode
 step's rows each hold `--context` tokens, under a drafter verifying as many
 more as it drafts, and a prefill's rows, split as the capture split them,
-follow `--context` cached tokens each, none when it is not given. Rows the KV
+follow `--context` cached tokens each, none when it is not given; there
+DeepSeek-V4.1's indexer planes, which the capture sized to its own rows' KV
+blocks, are as wide as the point's rows' (`PAGE_WIDE`). Rows the KV
 pool cannot hold at once are ragged (`point_rows`), and the point records its
 rows; under `--plan` over ragged decode steps a decode point
 the pool cannot hold refuses instead, past the first round (`RAGGED`).
@@ -347,6 +349,19 @@ V41_NAMES = {
     },
     ("aiter.fused_moe_.default", "num_local_tokens"): "scheduled_tokens_gpu",
     ("aiter.topk_gating_fwd.default", "num_valid_rows"): "scheduled_tokens_gpu",
+}
+#: DeepSeek-V4.1's prefill leaves whose logits plane holds the compressed rows
+#: of each KV block the step's longest row reaches (`PagedAttentionCache.
+#: unit_tiles`), by operator: the slot of its row bounds, then each slot and
+#: integer that wide. A capture's prefill caches nothing, so a point past
+#: cached tokens takes them at its own rows' blocks (`_widened`). A leaf whose
+#: bounds are not metadata scores an earlier layer's candidate blocks, on a
+#: plane the checkpoint sizes.
+_MAXIMA = "atom.model_ops.deepseek_v41.indexer:_block_maxima"
+PAGE_WIDE = {
+    _LOGITS: ("context_lens", "out_logits", "kv_indices", "max_model_len"),
+    _TOPK: ("row_ends", "logits", "stride0"),
+    _MAXIMA: ("visible", "logits", "maxima", "blocks"),
 }
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
@@ -861,6 +876,9 @@ class Stub:
         rows = point_rows(shape, context, pool, rule.block_size, bool(uncut), drafts)
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
+        if shape.phase != "decode" and self.pages:  # DeepSeek-V4.1's planes
+            wide = [-(-max(r[i] for r in rows) // rule.block_size) for i in (0, 1)]
+            found = {s: (_widened(op, wide), at) for s, (op, at) in found.items()}
         view = {"rows": rows, "produces_output": True}
         blocks = sum(-(-row[1] // rule.block_size) for row in rows)
         kv = _forward_kv_cache_context.kv_cache_data
@@ -1479,6 +1497,27 @@ def _named(op, path, spec, pool, known=None) -> dict | None:
     }
     exact = {n: t for n, t in held.items() if _spec(t) == _spec_of(spec)}
     return exact or held or None
+
+
+def _widened(op, blocks) -> dict:
+    """`op` with the slots and integers `PAGE_WIDE` names for it as wide as
+    `blocks[1]` KV blocks rather than the capture's `blocks[0]`: an integer,
+    a tensor's columns, and its row stride where that is its columns."""
+    bound, *wide = PAGE_WIDE.get(op["op"], (None,))
+    bounds = op["args"].get(bound) or {}
+    if blocks[0] == blocks[1] or bounds.get("role") != "metadata":
+        return op
+    op = copy.deepcopy(op)
+    for slot in wide:
+        value = op["args"][slot]
+        if isinstance(value, int):
+            op["args"][slot] = value // blocks[0] * blocks[1]
+            continue
+        shape, stride = value["shape"], value["stride"]
+        if stride[0] == shape[1]:
+            stride[0] = stride[0] // blocks[0] * blocks[1]
+        shape[1] = shape[1] // blocks[0] * blocks[1]
+    return op
 
 
 def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:

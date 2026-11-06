@@ -15,7 +15,6 @@ own: each leaf takes the buffers ATOM's own capture passes it
 import json
 import os
 import pathlib
-import re
 import shutil
 import subprocess
 import sys
@@ -52,10 +51,10 @@ SPLIT = {
 #: A prefill whose forward runs the rows of its decoder's tail: its tail
 #: holds the whole prompt, a window of it.
 WINDOW = "--prefill 128 1"
-#: The leaves the rehearsal refuses at a prefill past 8192 cached tokens, each
-#: reading rows of a logits plane past the columns the capture's prefill,
-#: which caches none, sized it to: the indexer's scorer, its top-k and the
-#: candidate pick's block maxima.
+#: The leaves whose logits plane the capture's prefill, which caches none,
+#: sized to its own rows' KV blocks: the indexer's scorer, its top-k and the
+#: candidate pick's block maxima. Past 8192 cached tokens their row bounds
+#: reach past those columns, and `measure ops` widens the plane to the point's.
 PLANE_BOUND = {
     "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
     "flydsl_fp8_paged_mqa_logits_gfx1250",
@@ -103,27 +102,20 @@ def rehearsed(request, model_dir, tmp_path_factory):  # noqa: F811
     return got, json.loads((root / "truth.json").read_text())
 
 
-def test_every_leaf_reaches_its_launch_but_a_plane_too_short_or_a_host_copy(
-    rehearsed,
-):
+def test_every_leaf_reaches_its_launch_but_a_host_copy(rehearsed):
     """Each leaf's call, Triton's typing of each argument it launches with
-    included, reaches its launch, but at a prefill past cached tokens the
-    indexer's row bounds past the plane the capture's prefill, which caches
-    none, sized, which the value check refuses by name; and the cursors' copy
-    to the host, which `measure ops` refuses by name, at every point."""
+    included, reaches its launch, each row bound in its plane, the indexer's
+    at a prefill past cached tokens too; but the cursors' copy to the host,
+    which `measure ops` refuses by name, at every point."""
     got, _ = rehearsed
     cached = {r["shape"] for r in got["cached"]}
     assert cached == {"decode B=16", "prefill T=2048 B=1"}
     fresh = [r for r in got["fresh"] if r["shape"] != "prefill T=128 B=1"]
     refused = [r for r in got["cached"] + fresh if r["verdict"] != "reaches launch"]
-    host = [r for r in refused if r["op"] == HOST_COPY]
-    assert host and all("no CUDA graph captures" in r["why"] for r in host)
-    short = [r for r in refused if r["op"] != HOST_COPY]
-    assert short and {(r["shape"], r["op"]) for r in short} <= {
-        ("prefill T=2048 B=1", op) for op in PLANE_BOUND
-    }
-    assert all(re.search(r"past 0 to \d+$", r["why"]) for r in short)
-    assert not {id(r) for r in short} & {id(r) for r in fresh}
+    assert refused and {r["op"] for r in refused} == {HOST_COPY}
+    assert all("no CUDA graph captures" in r["why"] for r in refused)
+    past = {r["op"] for r in got["cached"] if r["shape"] == "prefill T=2048 B=1"}
+    assert PLANE_BOUND <= past
     triton = [
         r for r in got["cached"] if any(k.startswith("triton.") for k in r["kernels"])
     ]

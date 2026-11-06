@@ -545,6 +545,57 @@ def test_a_decode_point_takes_an_integer_affine_in_the_context_at_its_own(
     assert kernel.grids == [(2, 2), (2, 2)]
 
 
+def test_a_v41_prefill_past_cached_tokens_scores_on_a_plane_its_rows_blocks_wide(
+    monkeypatch,
+):
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
+        V41PoolGeometry,
+    )
+    from atom.model_ops.deepseek_v41.unit_table import unit_table
+
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    taken = []
+
+    def call(stub, op, sig, instances, n):
+        taken.append(stub._copy(op, sig, instances, 0)[0])
+        return {}
+
+    monkeypatch.setattr(ops.Stub, "_time", call)
+    geometry = V41PoolGeometry(
+        1, ((0, 2),), 128, 4, 512, 32, layer_ratios=(2,), index_block_rows=8
+    )
+    runner, i32 = _Runner(), torch.int32
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars |= {
+        "logits": torch.zeros(256 * 640),
+        "visible": torch.zeros(256, dtype=i32),
+        "tiles": torch.zeros(256 * 80, dtype=i32),
+    }
+
+    def scorer(bounds):  # as a prefill of 256 tokens caching none traced it
+        return _leaf(
+            ops._LOGITS,
+            ("out_logits", _t([256, 128], "metadata")),
+            ("context_lens", _t([256], bounds, dtype="torch.int32")),
+            ("kv_indices", _t([256, 16], bounds, dtype="torch.int32")),
+            ("max_model_len", 128),
+        )
+
+    # one whose row bounds are ATOM's, and one scoring a candidate list
+    found = ops.leaves(_graph(scorer("metadata"), scorer("activation"))["region"])
+    placed = SimpleNamespace(block_size=128, batch=lambda *a: a[1:])
+    for context in (None, 1024):
+        ops.Stub(runner, 10_000).point(placed, prefill(256, 1), context, found)
+
+    # ATOM's tile table past 1024 cached tokens: the 10 blocks its row reaches
+    units = geometry.index_blocks_per_page(2)
+    tiles = unit_table(torch.zeros(1, 10, dtype=i32), torch.zeros(0, dtype=i32), units)
+    width = tiles.shape[1] * geometry.index_block_rows
+    got = [(c["out_logits"].stride(0), c["max_model_len"]) for c in taken]
+    assert got == [(128, 128), (128, 128), (width, width), (128, 128)]
+    assert taken[2]["kv_indices"].shape == (256, tiles.shape[1]) and width == 640
+
+
 def test_an_embedding_reads_the_token_ids_atom_prepared():
     runner = _Runner()
     # An index buffer whose name holds the slot's, which the name rule picks.
