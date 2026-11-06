@@ -1824,10 +1824,11 @@ def _contained(capture):
 def _synthetic() -> list[torch.Generator]:
     """The generators ATOM's forced acceptance draws from, one a device it has
     drawn on (`rejection_sampler._synthetic_generator`): in the bench, the
-    leaf's, made by the leaf's eager call before its capture."""
-    from atom.model_ops.rejection_sampler import _SYNTHETIC_GENERATORS
-
-    return list(_SYNTHETIC_GENERATORS.values())
+    leaf's, made by the leaf's eager call before its capture. None before
+    ATOM imports its sampler, which has made none then: read where it is
+    loaded, not imported, as importing it imports aiter."""
+    sampler = sys.modules.get("atom.model_ops.rejection_sampler")
+    return list(sampler._SYNTHETIC_GENERATORS.values()) if sampler else []
 
 
 def _end_capture(stream) -> None:
