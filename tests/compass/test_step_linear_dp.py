@@ -2,7 +2,8 @@
 """The step linear law under DP-attention with EP off: one law per rank, priced at
 the deployment's DP width, the group's step the max over its ranks. A rung's hull
 holds each fitted step at the rank its vector prices it as, MoE column included,
-and a rung that adopts a column is solved on those rows.
+and at its rank of larger features where its ranks price alike; a rung that
+adopts a column is solved on those rows.
 The checked-in DeepSeek-V4-Pro EP8 laws install at their own side's engine config
 only, and validate a step at every decode rung they fit.
 
@@ -34,7 +35,9 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
+from atom.compass.backends.shape import sum_context
 from atom.compass.backends.step_linear import UNIFORM_ROUTING
+from atom.compass.backends.step_linear_fit import priced_rank
 
 DP = 4
 PREFILL = {
@@ -237,6 +240,50 @@ def test_a_routed_rung_alternates_again_under_its_column(
     if passes:
         assert vector["coefficients"] == pytest.approx(WIDE_OR_TALL, rel=1e-6)
         assert vector["fit"]["mad"] < 1e-6
+
+
+def _alike(seed, n=300):
+    """`n` decode steps at rung 4, each rank 1 to 4 rows of a random context,
+    each step 20 ms whatever its rows."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(n):
+        views = []
+        for _ in range(DP):
+            width = int(rng.integers(1, 5))
+            rows = [
+                RequestShape(1, int(rng.integers(1, 50_000)), True)
+                for _ in range(width)
+            ]
+            views.append(BatchView(tuple(rows), 4, DP * 4))
+        out.append((views, 0.02))
+    return out
+
+
+def test_ranks_priced_alike_hull_each_step_at_its_rank_of_larger_features(tmp_path):
+    """Every step takes 20 ms, so the rung's vector prices a step's ranks alike
+    up to rounding, and the step is priced as its costliest rank of larger
+    features (`priced_rank`), which some steps' first costliest rank is not.
+    Each step prices inside the fitted hull at that rank."""
+    runs = [_alike(seed) for seed in (0, 1)]
+    records = []
+    for i, steps in enumerate(runs):
+        (tmp_path / str(i)).mkdir()
+        records += _records(tmp_path / str(i), steps)
+    backend = StepLinearBackend(StepLinearLaw(_fit(records, dp=DP)), DP)
+    tied, outside = 0, []
+    for i, (views, _) in enumerate(runs[0] + runs[1]):
+        costs = [backend.price(v) for v in views]
+        ranks = {
+            j: (c.target_seconds, (1, sum_context(v.decode), v.graph_padding))
+            for j, (c, v) in enumerate(zip(costs, views))
+        }
+        top = priced_rank(ranks)
+        tied += top != max(ranks, key=lambda j: ranks[j][0])
+        if any(t.provenance.extrapolated for t in costs[top].terms):
+            outside.append(i)
+    assert tied
+    assert outside == []
 
 
 def test_a_law_fitted_on_dp_records_joins_at_their_width_and_refuses_at_dp_1(
