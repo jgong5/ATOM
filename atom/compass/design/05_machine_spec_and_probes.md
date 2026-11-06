@@ -271,9 +271,9 @@ composed spec has no `host` section:
 tokenizer:
   backend:     fast                     # fast (Rust) and slow (Python) differ by >10x
   fingerprint: sha256:<tokenizer.json>  # the file the timed calls loaded
-  encode: {fixed_s: 4.4e-4, tokens_per_s: 4.4e5}        # one-item calls: encode, one-item encode_batch
-  encode_batch: {fixed_s: 1.0e-3, item_s: 2.0e-5, tokens_per_s: 1.5e6}  # several-item encode_batch
-  decode: {fixed_s: 2.8e-5, tokens: [0, 9]}              # flat: fixed_s alone, inside tokens
+  encode: {fixed_s: 4.0e-4, tokens_per_s: 3.6e5}        # one-item calls: encode, one-item encode_batch
+  encode_batch: {fixed_s: 3.6e-4, tokens_per_s: 4.3e5}  # several-item encode_batch
+  decode: {fixed_s: 2.8e-5, tokens: [0, 9]}             # no slope: fixed_s alone, inside tokens
 http_intake:                  # the event loop's time to take in one HTTP request
   fixed_s:    4.3e-3          # per request of a burst
   per_byte_s: 5.6e-9          # per body byte

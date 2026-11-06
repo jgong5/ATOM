@@ -151,11 +151,10 @@ def test_a_dp_pair_s_host_laws_start_E_at_the_group_s_latest_pull(tmp_path):
         assert law["E"] != pytest.approx(alone[0][kind]["E"], rel=1e-3)
 
 
-#: The planted tokenizer terms the stamped records below are timed by: a
-#: one-item encode's (fixed, tokens/s), a several-item encode_batch's (fixed,
-#: per item, tokens/s) and a decode's (fixed, tokens/s), here with no positive
-#: slope: a nanosecond less per token.
-ENCODE, BATCH, DECODE = (5e-6, 9e5), (2e-5, 3e-6, 3e6), (2.8e-5, -1e9)
+#: The planted tokenizer terms the stamped records below are timed by, each
+#: (fixed, tokens/s): a one-item encode's, a several-item encode_batch's and a
+#: decode's, here with no positive slope: a nanosecond less per token.
+ENCODE, BATCH, DECODE = (5e-6, 9e5), (2e-5, 3e6), (2.8e-5, -1e9)
 #: Each lone request's encode call (kind, items, tokens), the request's own.
 ENCODES = [
     ("encode", 1, 9000),
@@ -176,11 +175,8 @@ TOKENIZER = {"backend": "fast", "fingerprint": "sha256:tok"}
 
 def _seconds(rates, kind, items, tokens) -> float:
     enc, batch, dec = rates
-    if kind == "decode":
-        return dec[0] + tokens / dec[1]
-    if items == 1:
-        return enc[0] + tokens / enc[1]
-    return batch[0] + items * batch[1] + tokens / batch[2]
+    fixed, rate = dec if kind == "decode" else enc if items == 1 else batch
+    return fixed + tokens / rate
 
 
 def _stamp(kind, start, end, size=0, cpu=(0, 0), thread=1) -> str:
@@ -277,7 +273,7 @@ def test_a_record_s_tokenizer_calls_and_intake_stamps_fit_the_entry_s_terms(
         {"fixed_s": ENCODE[0], "tokens_per_s": ENCODE[1]}, rel=1e-3
     )
     assert tok["encode_batch"] == pytest.approx(
-        dict(zip(("fixed_s", "item_s", "tokens_per_s"), BATCH)), rel=1e-3
+        {"fixed_s": BATCH[0], "tokens_per_s": BATCH[1]}, rel=1e-3
     )
     # The decodes take no time per token: a fixed charge over the tokens they span.
     assert tok["decode"]["fixed_s"] == pytest.approx(DECODE[0], rel=1e-3)

@@ -457,7 +457,9 @@ a GIL wait
   one-item `encode_batch`, reads the same on the wall and on its thread's CPU clock, and
   gives `encode`, `fixed_s + tokens / tokens_per_s`. A several-item `encode_batch` runs its
   items on the library's pool, where no thread clock sees them, and gives `encode_batch`,
-  `fixed_s + items x item_s + tokens / tokens_per_s`. `decode` is fitted apart, so one
+  in the same form with its own coefficients: a term per item adds nothing, since nine in
+  ten such calls carry two items ([#2751](https://github.com/jgong5/ATOM/issues/2751)).
+  `decode` is fitted apart, so one
   kind's refusal leaves the others fitted; with no positive slope over its tokens it is
   `fixed_s` alone, priced inside its token hull.
 - `http_intake`: on the loop thread's CPU time. `per_byte_s` and `idle_s` from requests

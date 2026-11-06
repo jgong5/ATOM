@@ -322,15 +322,14 @@ def charge(d: float) -> None:
 _in_encode = threading.local()
 
 
-def _price(rate, tokens: int, items: int = 1) -> float:
+def _price(rate, tokens: int) -> float:
     """Seconds `rate`, a kind of call's term in a ``host`` entry's
-    ``tokenizer``, charges a call of `items` items and `tokens` tokens:
-    ``fixed_s + items x item_s + tokens / tokens_per_s``, each part it lacks 0;
-    0 with no `rate`."""
+    ``tokenizer``, charges a call of `tokens` tokens: ``fixed_s + tokens /
+    tokens_per_s``, ``fixed_s`` alone with no ``tokens_per_s``; 0 with no
+    `rate`."""
     if rate is None:
         return 0.0
-    per_token = 1 / rate["tokens_per_s"] if "tokens_per_s" in rate else 0.0
-    return rate["fixed_s"] + items * rate.get("item_s", 0.0) + tokens * per_token
+    return rate["fixed_s"] + tokens / rate.get("tokens_per_s", math.inf)
 
 
 def wrap_encode(encode, rate):
@@ -359,8 +358,8 @@ def wrap_encode_batch(encode_batch, one, several):
     def charged(*args, **kwargs):
         encodings = encode_batch(*args, **kwargs)
         if not getattr(_in_encode, "on", False):
-            tokens, items = sum(len(e.ids) for e in encodings), len(encodings)
-            charge(_price(one if items == 1 else several, tokens, items))
+            tokens = sum(len(e.ids) for e in encodings)
+            charge(_price(one if len(encodings) == 1 else several, tokens))
         return encodings
 
     return charged

@@ -110,8 +110,7 @@ that admits a request, and absent from an entry whose ``E`` laws hold them;
 ``fingerprint`` of the ``tokenizer.json`` it was fitted on, and, each
 optional, ``encode``, one-item calls, ``encode_batch``, a backend
 ``encode_batch`` of several items, and ``decode``, each ``fixed_s`` and a
-positive ``tokens_per_s``, ``encode_batch`` with ``item_s`` too, and a
-``decode`` in their place ``fixed_s`` alone over ``tokens``, the ``[lo, hi]``
+positive ``tokens_per_s``, and a ``decode`` in their place ``fixed_s`` alone over ``tokens``, the ``[lo, hi]``
 token counts outside which a decode is refused and charged 0 s; ``http_intake``,
 ``fixed_s`` and ``per_byte_s``, with ``idle_s`` optional and ``bytes``, the
 ``[lo, hi]`` body bytes it was fitted over, outside which an intake is refused
@@ -466,8 +465,8 @@ def _check_host(path, host: dict) -> None:
             f"{path}: host's tokenizer is {tok!r}; it takes backend, fast or slow, "
             "fingerprint, the tokenizer.json it was fitted on, and, each "
             "optional, encode, encode_batch and decode, each fixed_s and a "
-            "positive tokens_per_s, encode_batch item_s too, a decode fixed_s "
-            "and tokens, [lo, hi], in their place"
+            "positive tokens_per_s, a decode fixed_s and tokens, [lo, hi], in "
+            "their place"
         )
     hull = intake.get("bytes", [0, 0]) if isinstance(intake, dict) else None
     if intake is not None and not (
@@ -497,10 +496,7 @@ def _rate(term, kind: str) -> bool:
             and _seconds(dict(enumerate(hull)), {0, 1})
             and hull[0] <= hull[1]
         )
-    optional = {"item_s"} if kind == "encode_batch" else set()
-    return _seconds(term, {"fixed_s", "tokens_per_s"}, optional) and (
-        term["tokens_per_s"] > 0
-    )
+    return _seconds(term, {"fixed_s", "tokens_per_s"}) and term["tokens_per_s"] > 0
 
 
 def _seconds(term, required: set, optional: set = frozenset()) -> bool:

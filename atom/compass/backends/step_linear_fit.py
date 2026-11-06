@@ -184,13 +184,8 @@ HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
 #: What a lone HTTP request's intake costs: per request, and per body byte.
 INTAKE_FEATURES = ("idle", "bytes")
-#: What a lone tokenizer call costs, per kind of call: per call, per item of a
-#: several-item ``encode_batch``, and per token.
-TOKENIZER_FEATURES = {
-    "encode": ("fixed", "tokens"),
-    "encode_batch": ("fixed", "items", "tokens"),
-    "decode": ("fixed", "tokens"),
-}
+#: What a lone tokenizer call costs: per call, and per token.
+TOKENIZER_FEATURES = ("fixed", "tokens")
 #: What a forward's admissions cost per request, per prompt token past the
 #: prefix-cache hit and per token within it (`step_labels.admissions`).
 ADMIT_FEATURES = ("requests", "uncached", "cached")
@@ -357,8 +352,8 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
     """The ``tokenizer`` term over the lone calls (`_lone_calls`) each
     tokenizer record in `paths` holds, beside the intake stamps in `intakes`,
     and its report: the records' backend and fingerprint, and per kind of
-    call (`TOKENIZER_FEATURES`), its coefficients by the host-law solver on
-    the calls' wall seconds, ``fixed_s``, ``item_s`` and ``tokens_per_s``.
+    call, ``fixed_s + tokens / tokens_per_s`` by the host-law solver on the
+    calls' wall seconds.
     One-item ``encode_batch`` calls are ``encode``'s and several-item ones
     their own kind. A ``decode`` with no positive slope is ``fixed_s`` alone
     over ``tokens``, the ``[lo, hi]`` token counts its calls span. A kind the
@@ -374,32 +369,29 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
         for c in _lone_calls([json.loads(line) for line in lines], intake):
             kind = c["call"] if c["items"] > 1 or c["call"] == "decode" else "encode"
             s = (c["t_end_ns"] - c["t_start_ns"]) * 1e-9
-            rows.append((i, kind, c["items"], c["tokens"], s))
+            rows.append((i, kind, c["tokens"], s))
     if len(heads) != 1:
         raise ValueError(f"the records name {len(heads)} tokenizers: {sorted(heads)}")
     term, report = json.loads(next(iter(heads))), {"unfitted": {}}
-    for kind, names in TOKENIZER_FEATURES.items():
-        got = np.array([r[2:] for r in rows if r[1] == kind and r[4] > 0])
-        record = np.array([r[0] for r in rows if r[1] == kind and r[4] > 0])
+    for kind in ("encode", "encode_batch", "decode"):
+        got = np.array([r[2:] for r in rows if r[1] == kind and r[3] > 0])
+        record = np.array([r[0] for r in rows if r[1] == kind and r[3] > 0])
         try:
             if not len(got):
                 raise ValueError(f"the records hold no lone {kind} call")
-            x = np.column_stack([np.ones(len(got)), *got[:, :2].T])
-            x = x[:, [("fixed", "items", "tokens").index(n) for n in names]]
-            coef, fitted = _host_law(x, got[:, 2], names)
+            x = np.column_stack([np.ones(len(got)), got[:, 0]])
+            coef, fitted = _host_law(x, got[:, 1], TOKENIZER_FEATURES)
         except (ValueError, QhullError) as e:
             report["unfitted"][kind] = str(e)
             continue
-        law = dict(zip(names, coef))
-        if law["tokens"] > 0:
-            term[kind] = {"fixed_s": law["fixed"], "tokens_per_s": 1 / law["tokens"]}
-            term[kind] |= {"item_s": law["items"]} if "items" in law else {}
+        if coef[1] > 0:
+            term[kind] = {"fixed_s": coef[0], "tokens_per_s": 1 / coef[1]}
         elif kind == "decode":
-            term[kind] = {"fixed_s": law["fixed"], "tokens": _span(fitted, "tokens")}
+            term[kind] = {"fixed_s": coef[0], "tokens": _span(fitted, "tokens")}
         else:
             report["unfitted"][kind] = f"{kind}'s calls take no time per token"
             continue
-        error = x @ coef / got[:, 2] - 1
+        error = x @ coef / got[:, 1] - 1
         fitted["records"] = {
             str(p): np.percentile(error[record == i], [10, 50, 90]).tolist()
             for i, p in enumerate(paths)
