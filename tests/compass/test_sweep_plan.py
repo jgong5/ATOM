@@ -143,13 +143,15 @@ def test_b_rows_on_a_context_take_each_query_size_over_chunk_cuts_and_prefixes(
             assert (p.held, p.split, len(p.rows)) == (1, False, 1)
             ((q, c),) = p.rows
             contexts.setdefault(p.cached[0], set()).add((q, c - q))
-    # Each query size and the 15 past it, or up to the budget, on chunk cuts
-    # from the scheduler's alignment, 64 at 16-token blocks, below the budget,
-    # then whole budgets, then the last cut a budget fits behind in the longest
+    # Each query size and the 15 past it, or up to the budget, and from the
+    # alignment up each multiple of 16 below it past it, on chunk cuts from the
+    # scheduler's alignment, 64 at 16-token blocks, below the budget, then
+    # whole budgets, then the last cut a budget fits behind in the longest
     # prompt.
     queries = {
         *range(1, 32),
         *(s + r for s in (32, 64, 128, 256, 497) for r in range(16)),
+        *(s + r for s in (64, 128, 256) for r in (16, 32, 48)),
     }
     cuts = [64, 128, 256, 512, 1024, 2048, 2432]
     want = {(q, c) for q in queries for c in cuts if q + c <= 3000}

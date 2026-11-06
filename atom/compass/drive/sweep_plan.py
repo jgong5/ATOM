@@ -24,7 +24,10 @@ roots: each point is planned once, on the rank its place in the walk names.
   and split steps whose other ranks each run one row cut into halves of
   `HALF` tokens and on, the second starting at every residue mod 16.
   Then one row of 1, 2, 4 and so on tokens up to the budget, each with the 15
-  sizes past it, on a context already computed: its own prompt's earlier
+  sizes past it and, from the scheduler's chunk alignment up, each multiple
+  of 16 below the alignment past it, so a KV length's residue mod the
+  alignment varies at a query on 16, on a context already computed: its own
+  prompt's earlier
   chunks, from the scheduler's chunk alignment doubling below the budget,
   where a first row of the budget's rest ends the first chunk, then the
   budget doubling, then the last aligned context a whole budget fits behind
@@ -170,11 +173,16 @@ def _doubling(start: int, below: int) -> list[int]:
     return [start << j for j in range(max(0, (below - 1) // start).bit_length())]
 
 
-def _queries(b: int) -> list[int]:
+def _queries(b: int, align: int) -> list[int]:
     """Each of `_levels(b)` and the 15 sizes past it, or the 16 up to `b`
-    where those pass it: every residue mod 16 at every size."""
+    where those pass it: every residue mod 16 at every size. A size from
+    `align` up also takes each multiple of 16 below `align` past it: on a
+    context aligned to `align`, a row's KV length moves only with its query,
+    so these vary its residue mod `align` at a query on 16."""
     starts = [max(1, min(q, b + 1 - SLOTS)) for q in _levels(b)]
-    return sorted({s + r for s in starts for r in range(SLOTS) if s + r <= b})
+    sizes = {s + r for s in starts for r in range(SLOTS)}
+    sizes |= {q + r for q in _levels(b) if q >= align for r in range(0, align, SLOTS)}
+    return sorted(q for q in sizes if q <= b)
 
 
 def _contexts(start: int, b: int, cap: int) -> list[int]:
@@ -288,14 +296,15 @@ def plan(engine, workload: dict, a_only: bool = False) -> list[Point]:
                 for t in [tbo_min + rest[0], *rest]
             ]
         )
-    starts = {"chunk": chunk_alignment(e["kv_cache_block_size"])}
+    align = chunk_alignment(e["kv_cache_block_size"])
+    starts = {"chunk": align}
     if e["enable_prefix_caching"]:
         starts["prefix"] = e["kv_cache_block_size"]
     families += [
         [
             (((q, c + q),), (kind,), 1, False)
             for c in _contexts(start, b, cap)
-            for q in _queries(b)
+            for q in _queries(b, align)
             if c + q <= cap
         ]
         for kind, start in starts.items()
