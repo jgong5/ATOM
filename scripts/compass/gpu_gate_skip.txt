@@ -20,6 +20,11 @@ gfx1250 tests/test_model_runner_decode_padding.py
 # #2916: every test errors at setup, FlyDSL's s_waitcnt has no gfx1250.
 gfx1250 tests/test_deepseek_v41_mono_contract.py
 gfx1250 tests/test_minimax_m3_mono_contract.py
+# #2921: the MI455 image imports torch in every Python process, so these
+# tests' no-tensor-import assertions fail there.
+gfx1250 tests/compass/test_gate_gpu_aiter_version.py
+gfx1250 tests/compass/test_kv_budget.py
+gfx1250 tests/compass/test_memory_readings.py
 # The Ruling on #2896: MI455 nodes run only models verified on them, today
 # DeepSeek-V4.1-Flash. Each file below has tests that need a Qwen slice, image,
 # MTP or cc-traces model.
