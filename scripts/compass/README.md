@@ -819,7 +819,9 @@ traces 256 to 392, seeds 20260707 and 20260708, whose decode ranks run unevenly 
 counted as one token in `moe_experts` ([#2536](https://github.com/jgong5/ATOM/issues/2536));
 each adopts `moe_experts`.
 Its other vectors and its host laws are the ones fitted on the lone cells alone, and
-its `sources` names the records each came from.
+its `sources` names the records each came from. The prefill law's rung-2 vector is the
+decode law's, stating `declared`, since the prefill law's own fit left rung 2 unfitted
+([#2660](https://github.com/jgong5/ATOM/issues/2660)).
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by
