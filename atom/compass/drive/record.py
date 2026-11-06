@@ -2,7 +2,7 @@
 """`compass record`: one instance's real server, with its step record, serving
 whatever client runs reach it until it is stopped.
 
-    compass record --gpu G [--host H] [--trace] --out DIR -- <ATOM args>
+    compass record --gpu G [--host H] [--store S] [--trace] --out DIR -- <ATOM args>
 
 `serve` starts the server on the GPUs `--gpu` names with the step record on,
 bound to `--host`, 127.0.0.1 unless named, an address a router on another node
@@ -43,6 +43,10 @@ record. A server that built none leaves no entry.
 Its ``ptl_changes`` names each change of its cards' PTL state from then until
 the stop (`identity.ptl_changes`), which the fits refuse; ``ptl`` is the
 state at the stop.
+
+With `--store`, the server's start merges the store's JIT cache library for
+this stack into the container's caches, and its stop writes back each artifact
+it finished compiling (`jit_cache`); without it no library is touched.
 
 `--profile-ops` and `--profile-steps A:B`, the op-level half's profiled pass,
 refuse; so does ATOM's ``--load_dummy``: a record times real weights, and MoE
@@ -108,6 +112,7 @@ def main(argv: list[str]) -> None:
             args.gpu,
             extra_env=env,
             host=args.host,
+            store=args.store,
             trace=args.trace,
         )
     run_json = Path(args.out) / serve.RUN_JSON
@@ -125,6 +130,9 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n\n")[0])
     add_gpu_flag(p)
     p.add_argument("--host", default=serve.HOST, help="the address the server binds")
+    p.add_argument(
+        "--store", help="the artifact store whose JIT cache library the server uses"
+    )
     p.add_argument(
         "--out", required=True, help="an empty directory for the record and logs"
     )

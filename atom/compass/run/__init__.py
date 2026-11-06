@@ -29,11 +29,17 @@ member, the frontend's included, connects to.
   selects the simulated runner.
 - `engine(config)` wraps the engine's construction in its own process the
   same way, and maps every DP rank to the engine LP for the process-group
-  check.
+  check. The engine ignores SIGTERM from just before it says READY. The
+  workers it starts sleep between its calls (`atom.compass.runner.doorbell`).
+  Under DP the group its engine core builds runs its small collectives over
+  shared memory when its ranks share a host
+  (`atom.compass.runner.shm_collectives`).
 - `runner(runner, tree)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
   ``decode`` to the frontend's clock, at the rates the machine spec measured.
+  A machine spec that refuses the tokenizer stops the run as a signal would,
+  so the engines leave and the server exits on the refusal.
 - `http_intake()` is what `atom.utils.compass_loop.HttpChannel` charges the
   frontend's event loop for each request it takes in.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
@@ -59,7 +65,8 @@ member, the frontend's included, connects to.
   what has been handed in.
 
 Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
-``ipc_s``, ``stream_s``, one of ``step_stub`` (a `Coefficients` mapping,
+``ipc_s``, ``stream_s``, ``ipc_out_s`` (optional, the engine output channels'
+lookahead, ``ipc_s`` when absent), one of ``step_stub`` (a `Coefficients` mapping,
 priced by `StepStubBackend`), ``step_linear`` (a `StepLinearLaw` mapping,
 priced by `StepLinearBackend`; its ``machine_spec`` digest and
 its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
@@ -96,8 +103,11 @@ on ``(1, tokens, seqs)``; with any laws, a forward whose kind has none for a
 segment it runs and ``skip`` does not name is refused, that segment costing 0 s
 (`HostDeviceRecurrence.device_end`); ``key``, the `host_key` they were
 fitted under and the ``machine_spec`` digest of the spec of the platform they
-were fitted on, which a run with laws must match; ``skip``, segments zeroed for
-a what-if run, which the graders refuse; a list of them as ``step_linear``'s),
+were fitted on, which a run with laws must match; ``admit``, coefficients on
+a forward's admissions, which add to its ``E``, or null to refuse a forward
+that admits a request, and absent from an entry whose ``E`` laws hold them;
+``skip``, segments zeroed for a what-if run, which the graders refuse; a list
+of them as ``step_linear``'s),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
 ``decode/``, ``prefill<k>/`` and ``decode<k>/`` above one of a side, and for a
@@ -236,7 +246,7 @@ from atom.compass.clock import (
     single_engine_table,
 )
 from atom.compass.clock.channels import add_lmcache
-from atom.compass.clock_transport import connect, serve
+from atom.compass.clock_transport import connect, connect_here, serve
 from atom.compass.detect.determinism import StepTable
 from atom.compass.runner import COMPASS_RAPIDSERVE_QUALNAME, COMPASS_RUNNER_QUALNAME
 from atom.utils import clock
@@ -367,6 +377,8 @@ _authority: "_RecordingAuthority | None" = None
 _early_end: threading.Thread | None = None
 #: This engine process's member name in the engine LP, None at DP width one.
 _member: str | None = None
+#: The SIGTERM handler this engine process set aside as it said READY.
+_sigterm_at_ready: list = []
 
 
 def spec() -> dict | None:
@@ -400,20 +412,22 @@ def spec() -> dict | None:
 
 def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time."""
-    from atom.compass.runner.overrides import FORWARD_KINDS, SEGMENTS
+    from atom.compass.runner.overrides import ADMISSION_IN_E, FORWARD_KINDS, SEGMENTS
 
     laws = host.get("laws", {})
     if (
-        set(host) - {"laws", "skip", "key"}
+        set(host) - {"laws", "skip", "key", "admit"}
         or set(host.get("skip", ())) - set(SEGMENTS)
         or set(laws) - set(FORWARD_KINDS)
         or {s for v in laws.values() for s in v} - set(SEGMENTS)
         or {len(c) for v in laws.values() for c in v.values()} - {3}
+        or len(host.get("admit") or ADMISSION_IN_E) != 3
     ):
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
-            "and key, the host key the laws were fitted under"
+            "admit, three coefficients on a forward's admissions or null, and "
+            "key, the host key the laws were fitted under"
         )
 
 
@@ -488,6 +502,7 @@ def channel_table(run: dict):
 
 def _engines_table(run: dict):
     common = {k: run[k] for k in ("admission_path", "ipc_s", "stream_s")}
+    common["ipc_out_s"] = run.get("ipc_out_s")
     pp, links = _pp(run, "P"), ()
     if pp > 1:
         from atom.compass.runner.pp_send import carrier_models, lookaheads
@@ -1018,8 +1033,12 @@ class _StoppingClock(clock.LPRuntime):
         super().end_run()
 
 
-def _runtime(lp: LpId, run: dict, member=None, cls=clock.LPRuntime) -> clock.LPRuntime:
-    rt = cls(lp, channel_table(run), connect(lp, run["clock_endpoint"], member))
+def _runtime(
+    lp: LpId, run: dict, member=None, cls=clock.LPRuntime, here=False
+) -> clock.LPRuntime:
+    """`lp`'s runtime on the run's clock; `here` when this process serves it."""
+    reach = connect_here if here else connect
+    rt = cls(lp, channel_table(run), reach(lp, run["clock_endpoint"], member))
     clock.install(rt)
     return rt
 
@@ -1138,7 +1157,8 @@ def frontend(config):
         )
         _early_end.start()
     _launch_lmcache(config, run, side)
-    rt = _runtime(lp, run, cls=_StoppingClock)
+    # A co-hosting frontend reaches the authority in-process, with no socket.
+    rt = _runtime(lp, run, cls=_StoppingClock, here=authority is not None)
     rt.client_run_ended = lambda k: _frontend_hand_in(run, rt, k)
     return _start_on_leaving(rt, authority)
 
@@ -1246,13 +1266,16 @@ def engine(config):
     """Around the engine's construction in its process; a no-op context on a real run.
 
     At DP width above one, the process joins the engine LP as the member of its
-    DP rank, and its host collectives first join the group rounds it owes. A
+    DP rank, and its host collectives first join the group rounds it owes; the
+    DP group the engine core builds runs them over shared memory when its
+    ranks share a host (`shm_collectives`). A
     pipeline stage is the engine LP ``engine-pp<stage>``, or a prefill side's
     ``engine-P-pp<stage>``.
 
     A real run recording its steps (`parity.ENV`) outside a pipeline stamps the
     engine's input pulls and output puts into ``dp<rank>.pulls.jsonl`` beside
-    the record (`clock.stamp_pulls`).
+    the record, and its IO-thread queue handoffs into ``dp<rank>.handoff.jsonl``
+    (`clock.stamp_pulls`).
     """
     global _member
     run = spec()
@@ -1266,8 +1289,11 @@ def engine(config):
             rank = config.parallel_config.data_parallel_rank
             # The worker's step timestamps read the same host clock.
             pulls = record / f"dp{rank}.pulls.jsonl"
-            clock.stamp_pulls(pulls, time.monotonic_ns)
+            handoff = record / f"dp{rank}.handoff.jsonl"
+            clock.stamp_pulls(pulls, handoff, time.monotonic_ns)
         return contextlib.nullcontext()
+    from atom.compass.runner import shm_collectives
+    from atom.compass.runner.doorbell import sleeping_workers
     from atom.utils.distributed import utils
 
     lp, side = ENGINE, _pd_side(config)
@@ -1286,10 +1312,48 @@ def engine(config):
     _member = f"dp{pc.data_parallel_rank}" if pc.data_parallel_size > 1 else None
     name = lp.name if _member is None else f"{lp.name}.{_member}"
     os.environ[NOW_ENV] = str(Path(run["out_dir"]) / NOW_FILE.format(name))
+    if _member is not None:
+        # Under the clock's wrap, so a call settles before it waits on its peers.
+        shm_collectives.install()
     clock.settle_before_collectives()
     if _member is not None and _offloads_to_lmcache_mp(config.kv_transfer_config):
         _park_before_dispatch()
-    return _named(_start_on_leaving(_runtime(lp, run, _member, _PublishedClock)))
+    rt = _runtime(lp, run, _member, _PublishedClock)
+    inner = _ignoring_sigterm_from_ready(_named(_start_on_leaving(rt)))
+    if _member is not None:
+        inner = shm_collectives.attaching_engine_group(inner)
+    return sleeping_workers(inner)
+
+
+@contextlib.contextmanager
+def _ignoring_sigterm_from_ready(inner):
+    """`inner`, in which the engine ignores SIGTERM from just before it says
+    READY and sets ATOM's handler aside, for `engine_loop` to put back.
+
+    The construction goes on after READY: a pipeline stage's transport, a DP
+    engine's prefill delayer, a prefill-decode engine's `_init_disagg`. A group
+    stop from then on would run ATOM's handler, which stops the workers before
+    the engine hands in; it reaches the engine as the ``+inf`` grant instead.
+    A construction that raises has the handler back."""
+    from atom.model_engine.engine_core import EngineCore
+
+    ready = EngineCore._send_ready_signal
+
+    @functools.wraps(ready)
+    def ignoring(self):
+        _sigterm_at_ready.append(signal.signal(signal.SIGTERM, signal.SIG_IGN))
+        return ready(self)
+
+    EngineCore._send_ready_signal = ignoring
+    try:
+        with inner:
+            yield
+    except BaseException:
+        if _sigterm_at_ready and (before := _sigterm_at_ready.pop()) is not None:
+            signal.signal(signal.SIGTERM, before)
+        raise
+    finally:
+        EngineCore._send_ready_signal = ready
 
 
 def _offloads_to_lmcache_mp(kv) -> bool:
@@ -1369,6 +1433,7 @@ def runner(model_runner, tree) -> None:
     from atom.compass.memory import ModelTerms, device_readings
     from atom.compass.memory.check import record
     from atom.compass.runner.overrides import (
+        ADMISSION_IN_E,
         HostDeviceRecurrence,
         install_cost_backend,
         install_device_readings,
@@ -1409,11 +1474,7 @@ def runner(model_runner, tree) -> None:
         side = {"P": "prefill", "D": "decode"}.get(name[:1], "") + name[1:]
         replay = ReplayHost(Path(run["replay"]) / side, dp_rank, stage)
     if STEP_LINEAR in run:
-        if tp != 1:
-            raise ValueError(
-                "a step linear law is fitted on one rank of tensor-parallel width "
-                f"1, and this run has tensor_parallel_size {tp}"
-            )
+        # A law prices a rank at the tensor-parallel width its engine config states.
         # Under DP-attention every rank runs at TP 1, and experts shard over the group.
         dpa = config.enable_dp_attention
         dp = config.parallel_config.data_parallel_size if dpa else 1
@@ -1585,6 +1646,7 @@ def runner(model_runner, tree) -> None:
             stage,
             mtp=mtp,
             sync=rapid and not config.disagg_is_decode,
+            admit=host.get("admit", ADMISSION_IN_E),
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])
@@ -1637,13 +1699,15 @@ def op_graph(run: dict, config, machine, ep: int = 1, lazy: dict | None = None):
         and getattr(config, "enable_low_latency", False),
         price_list=PRICE_LIST in run and _price_list(run, config, machine),
         drafts=drafter.num_speculative_tokens if drafter else 0,
+        block=bool(drafter) and drafter.use_dspark(),
     )
 
 
 def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or of its drafter's part (`draft`), or when it holds none
+    that does not, or of its drafter's part (`draft`, a block drafter's
+    draft-KV pass where it is `forward.KV`), or when it holds none
     `forward.missed`'s text, None for no text; under DP, at the rows the
     step's MoE gathers; a prefill's drafter at the `width` its later passes
     pad to.
@@ -1751,7 +1815,7 @@ def _price_list(run: dict, config, machine):
 def _graph_pool(model_runner, machine, model):
     """What ATOM's `_estimate_cudagraph_overhead` reserves for this deployment:
     nothing under ``enforce_eager``, else the branch the runner's own
-    `_piecewise_cg_active` picks, over the same config fields it reads."""
+    `_tr_hybrid_active` picks, over the same config fields it reads."""
     from atom.compass.memory import (
         PiecewiseCapture,
         capture_token_shapes,
@@ -1762,11 +1826,11 @@ def _graph_pool(model_runner, machine, model):
     config = model_runner.config
     if config.enforce_eager:
         return reserves(enforce_eager=True)
-    if not model_runner._piecewise_cg_active():
+    if not model_runner._tr_hybrid_active():
         return reserves(activations=model.activations)
     if getattr(config, "speculative_config", None):
         raise ValueError(
-            "under a drafter ATOM's piecewise capture reserves for each draft "
+            "under a drafter ATOM's token-graph capture reserves for each draft "
             "q bucket, and its DP token cap, which this mirror does not take"
         )
     hf = config.hf_config
@@ -1788,22 +1852,48 @@ def _graph_pool(model_runner, machine, model):
 
 
 def tokenizer(tok, config) -> None:
-    """Wrap `tok`'s ``encode`` and ``decode`` with the machine spec's entry for
-    the model's architecture and the backend that loaded; the entry warns when
-    the loaded ``tokenizer.json`` is not the one it was measured on."""
+    """Wrap `tok`'s ``encode`` and ``decode``, and its Rust backend's
+    ``encode_batch``, with the machine spec's entry for the model's architecture
+    and the backend that loaded; the entry warns when the loaded
+    ``tokenizer.json`` is not the one it was measured on. A refused entry
+    ends the run before the server serves (`_end_before_serving`)."""
     run = spec()
     if run is None:
         return
-    from atom.compass.spec import Backend
-    from atom.utils.compass_loop import wrap_decode, wrap_encode
+    from tokenizers import Tokenizer
 
-    entry = _machine(run).tokenizer_for(
-        config.hf_config.architectures[0],
-        Backend.FAST if tok.is_fast else Backend.SLOW,
-        _fingerprint(tok),
-    )
+    from atom.compass.spec import Backend
+    from atom.utils.compass_loop import wrap_decode, wrap_encode, wrap_encode_batch
+
+    try:
+        entry = _machine(run).tokenizer_for(
+            config.hf_config.architectures[0],
+            Backend.FAST if tok.is_fast else Backend.SLOW,
+            _fingerprint(tok),
+        )
+    except BaseException as e:
+        _end_before_serving(run, e)
+        raise
     tok.encode = wrap_encode(tok.encode, entry)
     tok.decode = wrap_decode(tok.decode, entry)
+    # ATOM's segment tokenizer, which only a Rust backend gets, encodes a long
+    # prompt's uncached segments with its ``encode_batch``, not ``encode``.
+    backend = getattr(tok, "_tokenizer", None)
+    if isinstance(backend, Tokenizer):
+        backend.encode_batch = wrap_encode_batch(backend.encode_batch, entry)
+
+
+def _end_before_serving(run: dict, e: BaseException) -> None:
+    """`e`, raised after the engines started and before the server serves, ends
+    the run in progress: stop it, as a signal stops the frontend's event loop, so
+    each engine leaves its loop at its ``+inf`` grant, hands in and its process
+    ends, which the server's exit waits for; then hand in `e` as the frontend's
+    ``ended:`` reason, which a standalone authority's summary waits for."""
+    rt = clock.installed()
+    if rt is None or not rt.in_run:
+        return
+    rt.end_run()
+    _hand_in(run, rt.me.name, rt.refusals + [f"ended:{rt.me.name} raised {e!r}"])
 
 
 def http_intake() -> tuple[float, float, float] | None:
@@ -2004,30 +2094,47 @@ def engine_loop(engine_core):
 
     In a run the engine ignores SIGTERM until it has handed in: ATOM's handler
     would stop the workers inside a clock call, before they say what their
-    steps cost. A stop reaches the engine as the ``+inf`` grant instead.
+    steps cost. A stop reaches the engine as the ``+inf`` grant instead. The
+    engine has ignored SIGTERM since it said READY (`engine`); the loop
+    ignores it first too, before the run file's read, a pipeline stage's sends
+    or the bundle's request, and however it leaves puts back the handler set
+    aside at READY, or else the one it found.
 
     A pipeline stage's runner calls go through `pp_send.install`'s sends. A
-    recorded real run's SIGTERM goes through `_stop_recording`."""
-    from atom.compass import parity
+    recorded real run's SIGTERM goes through `_stop_recording`, its input
+    queue stamps each request frame's handoff (`clock.stamp_input`), and
+    however it leaves the loop, the stamps its engine held are written
+    (`clock.write_stamps`), as its workers then write their step lines."""
+    ignoring = bool(os.environ.get(ENV))  # a run, as `spec` would say, unread
+    before = signal.signal(signal.SIGTERM, signal.SIG_IGN) if ignoring else None
+    if _sigterm_at_ready:
+        before = _sigterm_at_ready.pop()
+    try:
+        from atom.compass import parity
 
-    run, sections, before = spec(), {}, None
-    if run is not None and getattr(engine_core, "pp_size", 1) > 1:
-        from atom.compass.runner import pp_send
+        run, sections = spec(), {}
+        if run is not None and getattr(engine_core, "pp_size", 1) > 1:
+            from atom.compass.runner import pp_send
 
-        pp_send.install(engine_core, _machine(run))
-    if run is not None and STEP_GRID in run:
-        workers = engine_core.runner_mgr
-        sections["step_grid"] = workers.call_func("step_grid_bundle", wait_out=True)
-    if run is not None:
-        clock.installed().client_run_ended = lambda k: _engine_hand_in(
-            run, engine_core, sections, k
-        )
-        before = signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    elif os.environ.get(parity.ENV):
-        stop = functools.partial(
-            _stop_recording, engine_core, signal.getsignal(signal.SIGTERM)
-        )
-        before = signal.signal(signal.SIGTERM, stop)
+            pp_send.install(engine_core, _machine(run))
+        if run is not None and STEP_GRID in run:
+            workers = engine_core.runner_mgr
+            bundle = workers.call_func("step_grid_bundle", wait_out=True)
+            sections["step_grid"] = bundle
+        if run is not None:
+            clock.installed().client_run_ended = lambda k: _engine_hand_in(
+                run, engine_core, sections, k
+            )
+        elif os.environ.get(parity.ENV):
+            clock.stamp_input(engine_core)
+            stop = functools.partial(
+                _stop_recording, engine_core, signal.getsignal(signal.SIGTERM)
+            )
+            before = signal.signal(signal.SIGTERM, stop)
+    except BaseException:
+        if before is not None:  # None: not set from Python
+            signal.signal(signal.SIGTERM, before)
+        raise
     try:
         yield
         engine_done(engine_core, **sections)
@@ -2052,15 +2159,18 @@ def engine_loop(engine_core):
             _hand_in(run, lp, reasons + [ended], **said, **sections)
         raise
     finally:
-        if before is not None:  # None: not set from Python
-            signal.signal(signal.SIGTERM, before)
+        try:
+            clock.write_stamps()
+        finally:
+            if before is not None:  # None: not set from Python
+                signal.signal(signal.SIGTERM, before)
 
 
 def _stop_recording(engine_core, previous, signum, frame) -> None:
-    """A recorded real run's SIGTERM, where its engine stops: a speculative
-    engine writes its draft width and accepted-draft histogram beside the
-    record (`ACCEPTANCE_FILE`), then ATOM's handler, `previous`, takes it,
-    whether or not the write succeeded."""
+    """A recorded real run's SIGTERM, where its engine stops: it writes its
+    held stamps, a speculative engine writes its draft width and
+    accepted-draft histogram beside the record (`ACCEPTANCE_FILE`), then ATOM's
+    handler, `previous`, takes it, whether or not the writes succeeded."""
     from atom.compass import parity
 
     scheduler = getattr(engine_core, "scheduler", None)
@@ -2068,11 +2178,14 @@ def _stop_recording(engine_core, previous, signum, frame) -> None:
         scheduler, "engine_stats", None
     )
     try:
-        if getattr(stats, "spec_enabled", False):
-            width = config.speculative_config.num_speculative_tokens
-            held = {"draft_tokens": width, "distribution": dict(stats.distribution)}
-            name = ACCEPTANCE_FILE.format(config.parallel_config.data_parallel_rank)
-            _write_whole(Path(os.environ[parity.ENV]) / name, json.dumps(held))
+        try:
+            clock.write_stamps()
+        finally:
+            if getattr(stats, "spec_enabled", False):
+                width = config.speculative_config.num_speculative_tokens
+                held = {"draft_tokens": width, "distribution": dict(stats.distribution)}
+                name = ACCEPTANCE_FILE.format(config.parallel_config.data_parallel_rank)
+                _write_whole(Path(os.environ[parity.ENV]) / name, json.dumps(held))
     finally:
         previous(signum, frame)
 

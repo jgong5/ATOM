@@ -12,7 +12,7 @@ them (`PEAKS`) give each format's derate over the peaks, the bandwidth curve,
 the kernel floor and the intra-node link's latency and derate, and its record
 the device fragment (`DEVICE`): the arch, the capacity torch reads and the
 stack, beside the host's cores. No card has a ptl directory. The HTTP intake
-terms are mi355-gpu-45's, assumed, until a burst on MI455 fits them; what no
+terms are a real burst's on the node (`INTAKE`); what no
 probe fills on any machine (the IPC costs, the inter-node link's latency and
 derate, the router relay) is assumed as on mi355-gpu-45. `--model` and
 `--sweep-from` work as `mi308x_spec.py`'s do; with neither the script sweeps
@@ -49,8 +49,7 @@ NAME = "mi455-a0"
 base.NAME = NAME  # the shared fragment and sweep functions name this machine
 B0 = "mi455-b0"
 MACHINES = Path(__file__).resolve().parent / "machines"
-#: The probed machine whose ratios and values B0 carries, and whose HTTP
-#: intake terms A0 carries until it has its own.
+#: The probed machine whose ratios and values B0 carries.
 MI355X = MACHINES / "mi355x-gpu45.json"
 MODEL = "/apps/perzhang/models/DeepSeek-V4.1-Flash"
 SHEET = "MI455X product page and brochure (07/26), read 2026-10-09"
@@ -88,55 +87,55 @@ DATASHEET = {
 
 #: `probe_device.py`'s readings on cards 0001:04:00.0 and 0002:04:00.0 of the
 #: node, gfx1250 A0 samples of 192 compute units, neither with a ptl
-#: directory, under rocm/fw-bringup-mlperf:gfx1250-atom-20261026-dsv41
-#: (sha256:fd7450fde2da), the stack `DEVICE` pins, at the commit named; the
-#: record is its OUT. Each format's rate is its Triton GEMM's, which ran past
-#: hipBLASLt's in all three; aiter's MXFP4 GEMM did not compile. Each derate is
-#: a reading over `DATASHEET`'s peak, so it also holds the samples' 192 of the
-#: 256 compute units AMD counts for MI455X.
+#: directory, under rocm/ufb-private:vllm-dsv4flash-mori-epv2-mi455-20260922-r5
+#: (sha256:1a3ff678e922) with aiter at b6a9d0aeb, the stack `DEVICE` pins, at
+#: the commit named; the record is its OUT. Each format's rate is its Triton
+#: GEMM's, which ran past hipBLASLt's in all three; aiter's MXFP4 GEMM refuses
+#: an A0 card. Each derate is a reading over `DATASHEET`'s peak, so it also
+#: holds the samples' 192 of the 256 compute units AMD counts for MI455X.
 PEAKS = (
-    "2026-10-27",
-    "dc5e8efa6",
+    "2026-10-29",
+    "b71c071d3",
     {
-        "bf16": 1328645931957327.5,
-        "fp8": 1447678251827510.2,
-        "fp4": 2780799929426501.0,
+        "bf16": 1326569206455423.2,
+        "fp8": 1433698942416455.8,
+        "fp4": 2930049063615453.0,
         "bandwidth_curve": [
-            [4096, 1530666480.1579611],
-            [8192, 3060989328.727323],
-            [16384, 6121244111.007896],
-            [32768, 12244140021.858593],
-            [65536, 24485718013.116013],
-            [131072, 48974729786.66798],
-            [262144, 104017760859.1218],
-            [524288, 208027305262.93582],
-            [1048576, 474430357731.4853],
-            [2097152, 909953098725.0911],
-            [4194304, 1564486569957.3643],
-            [8388608, 2747429481067.666],
-            [16777216, 5106961425379.4],
-            [33554432, 7379491450234.512],
-            [67108864, 9802761677897.846],
-            [134217728, 12245916103059.629],
-            [268435456, 13789455773461.098],
-            [536870912, 14891726350520.275],
-            [1073741824, 15201029898451.355],
-            [2147483648, 15644687861213.988],
-            [4294967296, 15777066512305.184],
+            [4096, 2060892975.531358],
+            [8192, 3970182084.1511693],
+            [16384, 7555179560.401081],
+            [32768, 14627099352.700161],
+            [65536, 28949797442.450024],
+            [131072, 55867940447.79345],
+            [262144, 110223663229.01793],
+            [524288, 217727931138.8986],
+            [1048576, 430864767312.8557],
+            [2097152, 840296854194.1794],
+            [4194304, 1556811266586.995],
+            [8388608, 2515191448130.837],
+            [16777216, 4353063219415.6934],
+            [33554432, 6516170067582.693],
+            [67108864, 8630966264854.334],
+            [134217728, 11310075546313.322],
+            [268435456, 13164771502548.305],
+            [536870912, 14377614953763.12],
+            [1073741824, 15066571921666.877],
+            [2147483648, 15191458943780.54],
+            [4294967296, 15721654594216.334],
         ],
-        "link": 629989898092.7966,
+        "link": 629751000284.0652,
         "device.kernel_floor_s": [
-            1.3443179726600648e-06,
-            1.3400887489318846e-06,
-            1.349955356121063e-06,
+            1.3492149710655213e-06,
+            1.3432259798049928e-06,
+            1.3608998298645018e-06,
         ],
         "interconnect.intra_node.link_latency_s": [
-            2.6227587461471556e-06,
-            2.5976027250289913e-06,
-            2.6680062055587767e-06,
+            2.3556879758834836e-06,
+            2.322183871269226e-06,
+            2.386235427856446e-06,
         ],
     },
-    "d7dfcff22ef49192be8ba8f3a2a4b4fd5e475835fb9edf1ab412863ed1a4aceb",
+    "f264727900f52ebaa1e126f69959cf49ce8595448670b1c0754a832202ce4027",
 )
 
 #: What `PEAKS`'s record read on card 0 (the arch and the total torch reads, as
@@ -147,13 +146,30 @@ DEVICE = {
         "arch": "gfx1250",
         "memory": {"capacity_bytes": 309237645312},
         "software_pinned_to": {
-            "rocm": "10.1.0",
-            "aiter": "99e4450b6",
+            "rocm": "10.0.0",
+            "aiter": "b6a9d0aeb",
             "rccl": "2.30.4",
-            "torch": "2.11.0+rocm10.1.0a20260811-bkc.20260820",
+            "torch": "2.11.0+rocm10.0.0",
         },
     },
 }
+
+#: `http_intake.py`'s fit over one real c=256 first-turn cc-traces burst of
+#: `MODEL` at TP4, DSpark5, experts sharded across TP, at the commit named and
+#: on NUMA node 1's cores; the record is its stamp file, the burst nearest both
+#: medians. The band is each term's p10 and p90 over six bursts after a
+#: warm-up, each fitted alone: the record and stamp files sha256 dddc0d42,
+#: aa66ea72, 0fb869f1, 19a346f6 and ae02794a.
+INTAKE = (
+    "2026-11-01",
+    "a0381bfc1",
+    {"fixed_s": 0.006044910365805244, "per_byte_s": 1.478828601664519e-08},
+    {
+        "fixed_s": (0.005848353691439428, 0.006622099884347502),
+        "per_byte_s": (1.2611548747658177e-08, 1.760107581851583e-08),
+    },
+    "3e42ff61b321708d3638f9f0252cc3a4b707f206e703ae1abd60312d51f94f72",
+)
 
 #: No probe fills these: mi308x_spec's assumed values less what the datasheet
 #: states and what `PEAKS` fills.
@@ -166,7 +182,7 @@ for block, groups in DATASHEET.items():
 
 def a0_fragments() -> list[Fragment]:
     """A0's: the probe record's device, the datasheet's peaks, the probed
-    peaks, the cards' PTL state, MI355X's intake terms and the assumed rest."""
+    peaks, the cards' PTL state, the burst's intake terms and the assumed rest."""
     date, root, _, record = PEAKS
     subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
     notes = f"probe_device.py's record at {root}"
@@ -175,23 +191,13 @@ def a0_fragments() -> list[Fragment]:
         "assumed", DECLARED, "assumed", "no probe fills these", date=date
     )
     probed, assumed = base.peaks(PEAKS, datasheet.values, assumed)
-    mi355x = MachineSpec.from_mapping(json.loads(MI355X.read_text()))
-    intake = {
-        "host": {
-            "http_intake": {
-                k: mi355x.value(f"host.http_intake.{k}")
-                for k in ("fixed_s", "per_byte_s")
-            }
-        }
-    }
-    carried = f"{MI355X.stem}'s, until a burst on MI455 fits them"
     ptl = {"device": {"ptl": "disabled"}}
     return [
         fragment("device", DEVICE, "probed", notes, subject, date),
         datasheet,
         assumed,
         fragment("ptl", ptl, "probed", "no card has a ptl directory", date=date),
-        fragment("intake", intake, "assumed", carried, date=date),
+        base.intake(MODEL, *INTAKE),
         probed,
     ]
 

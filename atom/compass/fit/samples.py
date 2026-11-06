@@ -16,7 +16,8 @@ naming them, and so does one whose `source` counts uncommitted files.
 
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
-does (`rows`, `rung`, `produces_output`), its device seconds (`seconds`), its
+does (`rows`, `rung`, `produces_output`), its device seconds (`seconds`),
+under a drafter the target's, and the drafter's (`draft_seconds`), its
 `origin` (`replay`, `plan` or `ragged`) and the `traces` the batch came from.
 Its sample's provenance holds its `source`, the origin, its `run`, the entry's
 digest, those `traces`, and `profiled` false: the bench times a
@@ -190,7 +191,9 @@ def _measurement(store: ArtifactStore, key) -> tuple[Sample, dict]:
         raise ValueError(
             f"{key} does not load: {type(error).__name__}: {error}"
         ) from error
-    return Sample(0, 0, view, m["seconds"], None, {}, False, provenance), config
+    draft = m.get("draft_seconds")
+    sample = Sample(0, 0, view, m["seconds"], None, {}, False, provenance, draft)
+    return sample, config
 
 
 def _differ(field: str, held: dict) -> list[str]:

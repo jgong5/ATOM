@@ -1,22 +1,24 @@
 # SPDX-License-Identifier: MIT
-"""The ``tcp`` carrier: the Clock Authority's serve loop reached over a socket.
+"""The ``tcp`` carrier: the Clock Authority's serve side reached over a socket.
 
 ``serve(authority, "tcp://host:port")`` listens there; port 0 binds a free one,
 and the result's ``endpoint`` names the port it got. Each accepted connection
-gets a reader thread. Its first frame binds it to an LP through the serve loop,
+gets a reader thread. Its first frame binds it to an LP through the serve side,
 which answers with what the LP starts from, or a refusal. After that, the reader
-queues each request frame with the loop, and a writer thread sends each reply
-from that LP's slot. The writer waits on its own LP's slot under no lock, so an
-LP whose reply is held stops no other connection. The reader waits for no reply,
-so when a bound connection ends, however it ends and even while its LP waits for
-a grant, it tells the loop then, which ends the run.
+serves each request frame itself (`service`), and whichever thread serves a
+request writes each reply it makes straight onto its LP's socket: no thread
+stands between a socket and the serve side. A reply is a few hundred bytes and
+its LP reads every reply it is owed, so a write does not wait on a peer. The
+reader waits for no reply, so when a bound connection ends, however it ends and
+even while its LP waits for a grant, it tells the serve side then, which ends
+the run.
 
 ``connect(lp, "tcp://host:port")`` returns the in-process carrier's connection
-with a socket in place of the loop: the same ``send``, ``recv`` and ``close``,
+with a socket in place of the serve side: the same ``send``, ``recv`` and ``close``,
 and the same frames, each preceded by its length as four big-endian bytes, plus
 ``fileno`` to wait for a reply alongside other sockets. A
-connection that ends inside a frame is a `MalformedMessage`. A frame the loop
-will not queue, such as a reply kind sent as a request, is refused at ``recv``
+connection that ends inside a frame is a `MalformedMessage`. A frame the serve side
+will not take, such as a reply kind sent as a request, is refused at ``recv``
 here and at ``send`` in-process, with the same reason, and reaches no authority.
 """
 
@@ -24,10 +26,13 @@ import contextlib
 import socket
 import threading
 
-from .service import _Connection, _refusal, _reply, _Server
+from .service import _Connection, _HereConnection, _refusal, _reply, _Server
 from .wire import JOINED, MalformedMessage, encode
 
 STREAM_SCHEME = "tcp"
+#: The servers this process runs, by the endpoint each bound and the one it was
+#: asked for.
+_SERVED: dict[str, "_StreamServer"] = {}
 #: A frame is a few hundred bytes. A length far above that is a peer that is not
 #: speaking this protocol, and is refused before anything is allocated for it.
 LARGEST_FRAME = 1 << 22
@@ -64,7 +69,7 @@ def _end(sock: socket.socket) -> None:
 
 
 class _StreamServer:
-    """A serve loop that LPs reach over TCP."""
+    """A serve side that LPs reach over TCP."""
 
     def __init__(self, authority, host: str, port: int) -> None:
         self._listener = socket.create_server((host, port))
@@ -75,7 +80,9 @@ class _StreamServer:
         threading.Thread(target=self._admit, daemon=True).start()
 
     def close(self) -> None:
-        """Stop listening, end every connection and stop the loop."""
+        """Stop listening, end every connection and stop serving."""
+        for name in [k for k, v in _SERVED.items() if v is self]:
+            del _SERVED[name]
         for sock in [self._listener, *self._open]:
             _end(sock)
         self._server.close()
@@ -96,14 +103,17 @@ class _StreamServer:
                 while (frame := _receive(stream)) is not None:
                     try:
                         if slot is None:
-                            address, slot, joined = self._server.bind(frame)
-                            try:
-                                reply = encode((JOINED, *joined))
-                            except MalformedMessage as refused:
-                                reply = encode(_refusal(refused))
-                            threading.Thread(
-                                target=_write, args=(sock, slot, reply), daemon=True
-                            ).start()
+                            # Bound and answered under the serve side's lock,
+                            # so no reply reaches the socket before the bind's.
+                            with self._server._lock:
+                                address, slot, joined = self._server.bind(
+                                    frame, _SocketSlot(sock)
+                                )
+                                try:
+                                    reply = encode((JOINED, *joined))
+                                except MalformedMessage as refused:
+                                    reply = encode(_refusal(refused))
+                                slot.put(reply)
                         else:
                             self._server.submit(address, frame)
                     except (KeyError, ValueError) as refused:
@@ -118,18 +128,34 @@ class _StreamServer:
             if slot is None:
                 _end(sock)
             else:
-                self._server._closed(address, slot)
+                # Ended first: the peer has gone, so the end of the run its
+                # close makes is for every other LP.
                 slot.put(None)
+                self._server._closed(address, slot)
 
 
-def _write(sock: socket.socket, slot, reply: bytes) -> None:
-    """Send `reply`, then each reply `slot` gets, on `sock` until its reader
-    puts `None`; then end `sock`."""
-    with contextlib.suppress(OSError):
-        while reply is not None:
-            sock.sendall(_framed(reply))
-            reply = slot.get()
-    _end(sock)
+class _SocketSlot:
+    """An LP's reply slot on the serve side: `put` writes the frame onto the
+    LP's socket at once, and ``put(None)`` ends the socket, after which a put
+    writes nothing; nor does one to a peer that has gone. Its own lock keeps a
+    refusal the reader writes from interleaving with a reply another thread
+    writes."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+        self._lock = threading.Lock()
+        self._open = True
+
+    def put(self, frame: bytes | None) -> None:
+        with self._lock:
+            if not self._open:
+                return
+            if frame is None:
+                self._open = False
+                _end(self._sock)
+                return
+            with contextlib.suppress(OSError):
+                self._sock.sendall(_framed(frame))
 
 
 class _Remote:
@@ -175,7 +201,21 @@ class _StreamConnection(_Connection):
 
 def serve(authority, endpoint: str) -> _StreamServer:
     """Serve `authority` at ``tcp://host:port``."""
-    return _StreamServer(authority, *_address(endpoint))
+    host, port = _address(endpoint)
+    server = _StreamServer(authority, host, port)
+    _SERVED[server.endpoint] = server
+    if port:  # port 0 names no one server
+        _SERVED[endpoint] = server
+    return server
+
+
+def connect_here(lp, endpoint: str, member: str | None = None):
+    """`lp`'s connection, or its `member`'s, to the authority this process
+    serves at ``tcp://host:port``, with no socket (`service._HereConnection`)."""
+    server = _SERVED.get(endpoint)
+    if server is None:
+        raise KeyError(f"nothing is served at {endpoint} in this process")
+    return _HereConnection(server._server, lp, member)
 
 
 def connect(lp, endpoint: str, member: str | None = None) -> _StreamConnection:

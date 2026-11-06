@@ -5,7 +5,7 @@
   when off, one record per reply in issue order, the recovery marker on
   exactly the replies the recovery branch issued, and every released message
   and every logged send in exactly one record.
-* **The stall diagnostic**: the serve loop logs one LP table per stall, counts
+* **The stall diagnostic**: the serve side logs one LP table per stall, counts
   it, keeps waiting and aborts nothing; each runtime counts its own.
 * **The dump** renders `lp_table()` and nothing else, with the binding term
   marked, and no term marked when none is finite.

@@ -32,7 +32,12 @@ pytestmark = pytest.mark.skipif(
 
 def _tree(root, stamped):
     """A minimal checkout the gate accepts, green, touching one GPU trigger."""
-    shutil.copytree(REPO / "scripts" / "compass", root / "scripts" / "compass")
+    # Another gate shard may be writing bytecode into __pycache__ as this copies.
+    shutil.copytree(
+        REPO / "scripts" / "compass",
+        root / "scripts" / "compass",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     (root / "scripts" / "compass" / "cpu_gate_exclude.txt").write_text("")
     (root / "scripts" / "compass" / "gpu_gate_triggers.txt").write_text(BLIND + "\n")
     (root / "atom").mkdir()

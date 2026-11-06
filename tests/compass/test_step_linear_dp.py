@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 """The step linear law under DP-attention with EP off: one law per rank, priced at
-the deployment's DP width, the group's step the max over its ranks. The checked-in
-DeepSeek-V4-Pro EP8 laws install at their own side's engine config only, and
-validate a step at every decode rung they fit.
+the deployment's DP width, the group's step the max over its ranks. A rung's hull
+holds each fitted step at the rank its vector prices it as, MoE column included,
+and at its rank of larger features where its ranks price alike.
+The checked-in DeepSeek-V4-Pro EP8 laws install at their own side's engine config
+only, and validate a step at every decode rung they fit.
 
 Each rank's record is written from a known per-rank law, every line labelled
 with the group's step, the max over the ranks' prices, as a real DP group's
@@ -17,6 +19,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import test_step_linear_moe_column as routed
 from test_backend_step_linear import _installed, _without_step_stub, law
 from test_backend_step_linear_fit import SPEC, _engine_file, _fit, _record
 from test_memory_readings import META_8B, publish_readings
@@ -31,7 +34,9 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
+from atom.compass.backends.shape import sum_context
 from atom.compass.backends.step_linear import UNIFORM_ROUTING
+from atom.compass.backends.step_linear_fit import priced_rank
 
 DP = 4
 PREFILL = {
@@ -161,6 +166,103 @@ def test_the_fit_records_whether_the_alternation_settled(
     assert law_["decode"]["4"]["fit"]["passes"] == decode
 
 
+#: A rank's wide rows and another's one tall row cost about the same.
+WIDE_OR_TALL = {
+    "step": 0.015,
+    "context": 2e-8,
+    "graph_padding": 1e-8,
+    "moe_experts": 1.5e-4,
+}
+
+
+def _wide_or_tall(seed, widths, wide):
+    """200 decode steps at rung 4, each the group's step under `WIDE_OR_TALL`:
+    rank 0 runs 4 rows of one context drawn from `wide`, rank 1 one row 1.4 to
+    1.9 times as long, which the rung pads, and the others `widths` short rows,
+    so that the group's MoE tokens vary from step to step."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(200):
+        n = int(rng.uniform(*wide))
+        contexts = [[n] * routed.RUNG, [int(n * rng.uniform(1.4, 1.9))]]
+        for _ in range(DP - 2):
+            contexts.append(rng.integers(1, 1000, rng.integers(*widths)).tolist())
+        views = [routed._view(c, sum(map(len, contexts))) for c in contexts]
+        out.append((views, max(routed._price(v, WIDE_OR_TALL) for v in views)))
+    return out
+
+
+def test_a_routed_rung_hulls_each_step_at_the_rank_it_prices(tmp_path):
+    """The alternation takes each step's row on the rung's features alone; the
+    experts column the rung then adopts moves some steps' costliest rank from
+    the wide one to the tall one. Each step prices inside the fitted hull at
+    the rank it is priced as."""
+    full = _wide_or_tall(0, routed.FULL, (110_000, 130_000))
+    sparse = _wide_or_tall(1, routed.SPARSE, (80_000, 100_000))
+    records = routed._records(tmp_path / "full", full)
+    records += routed._records(tmp_path / "sparse", sparse)
+    law_ = routed._routed(records)[0]
+    vector = law_["decode"][str(routed.RUNG)]
+    assert vector["fit"]["moe_column"]["adopted"] == "moe_experts"
+    assert vector["fit"]["dropped"] == 0
+
+    laws = [_fit(records, dp=DP), law_]
+    backends = [StepLinearBackend(StepLinearLaw(x), DP) for x in laws]
+    moved, outside = 0, []
+    for i, (views, _) in enumerate(full + sparse):
+        costs = [[b.price(v) for v in views] for b in backends]
+        top = [int(np.argmax([c.seconds for c in cost])) for cost in costs]
+        moved += top[0] != top[1]
+        if any(t.provenance.extrapolated for t in costs[1][top[1]].terms):
+            outside.append(i)
+    assert moved
+    assert outside == []
+
+
+def _alike(seed, n=300):
+    """`n` decode steps at rung 4, each rank 1 to 4 rows of a random context,
+    each step 20 ms whatever its rows."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(n):
+        views = []
+        for _ in range(DP):
+            width = int(rng.integers(1, 5))
+            rows = [
+                RequestShape(1, int(rng.integers(1, 50_000)), True)
+                for _ in range(width)
+            ]
+            views.append(BatchView(tuple(rows), 4, DP * 4))
+        out.append((views, 0.02))
+    return out
+
+
+def test_ranks_priced_alike_hull_each_step_at_its_rank_of_larger_features(tmp_path):
+    """Every step takes 20 ms, so the rung's vector prices a step's ranks alike
+    up to rounding, and the step is priced as its costliest rank of larger
+    features (`priced_rank`), which some steps' first costliest rank is not.
+    Each step prices inside the fitted hull at that rank."""
+    runs = [_alike(seed) for seed in (0, 1)]
+    records = []
+    for i, steps in enumerate(runs):
+        (tmp_path / str(i)).mkdir()
+        records += _records(tmp_path / str(i), steps)
+    backend = StepLinearBackend(StepLinearLaw(_fit(records, dp=DP)), DP)
+    tied, outside = 0, []
+    for i, (views, _) in enumerate(runs[0] + runs[1]):
+        costs = [backend.price(v) for v in views]
+        ranks = {
+            j: (c.target_seconds, (1, sum_context(v.decode), v.graph_padding))
+            for j, (c, v) in enumerate(zip(costs, views))
+        }
+        top = priced_rank(ranks)
+        tied += top != max(ranks, key=lambda j: ranks[j][0])
+        if any(t.provenance.extrapolated for t in costs[top].terms):
+            outside.append(i)
+    assert tied
+    assert outside == []
+
+
 def test_a_law_fitted_on_dp_records_joins_at_their_width_and_refuses_at_dp_1(
     tmp_path,
     monkeypatch,
@@ -218,20 +320,28 @@ def test_a_stated_engine_file_contradicting_the_records_own_refuses(tmp_path):
 
 COMPASS = Path(__file__).resolve().parents[2] / "scripts" / "compass"
 GPU45 = json.loads((COMPASS / "machines" / "mi355x-gpu45.json").read_text())
+CRS005 = json.loads((COMPASS / "machines" / "mi355x-crs005.json").read_text())
+#: Each DeepSeek-V4-Pro EP8 law pair's file stem and the spec it was fitted under.
+EP8_PAIRS = [
+    pytest.param(
+        "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661", GPU45, id="gpu45"
+    ),
+    pytest.param("deepseek-v4-pro-dpa8-ep8-mi355x-crs005", CRS005, id="crs005"),
+]
 
 
 @pytest.mark.parametrize("side", ["prefill", "decode"])
+@pytest.mark.parametrize("stem,spec", EP8_PAIRS)
 def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
-    monkeypatch, tmp_path, side
+    monkeypatch, tmp_path, stem, spec, side
 ):
-    name = f"deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{side}.json"
-    fitted = json.loads((COMPASS / "laws" / name).read_text())
+    fitted = json.loads((COMPASS / "laws" / f"{stem}-{side}.json").read_text())
     engine = fitted["engine_config"]
     for key in PERFORMANCE_KEYS:
         monkeypatch.delenv(key, raising=False)
     for key, value in engine["env"].items():
         monkeypatch.setenv(key, value)
-    run = _without_step_stub(tmp_path, step_linear=fitted, machine=GPU45)
+    run = _without_step_stub(tmp_path, step_linear=fitted, machine=spec)
     monkeypatch.setenv(compass_run.ENV, str(run))
 
     def installed(ep):
@@ -249,7 +359,7 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
             enable_expert_parallel=ep,
             enable_tbo=engine["enable_tbo"],
         )
-        publish_readings(tmp_path / "store", r.config, GPU45)
+        publish_readings(tmp_path / "store", r.config, spec)
         compass_run.runner(r, META_8B)
         return r.compass_backend
 

@@ -11,13 +11,21 @@ not the count `get_num_blocks` reports: that count reads the device's memory
 outside torch, which moves from one start to the next, so a pool sized by it
 can be smaller than the one a batch filled. A worker that dies stops the
 bench, naming the call that got no reply; a device that cannot hold the pool
-stops it naming both counts.
+stops it naming both counts. The per-request entries `get_num_blocks` replies
+become `config.pool_entries_per_req`, as `EngineCore` carries them to its block
+manager: the state slots a request holds, which the replay rule reads.
 `measure(batch)` runs `bench_step` on every worker and returns rank 0's reply,
 the window's result (`window.py`). `exit()` stops the workers and returns
 once they and every process they had started have exited, or after
 `serve.STOP_GRACE_S`, so a GPU check after it does not find the bench's own
-processes still exiting. Data parallelism above one, expert
-parallelism and pipeline parallelism refuse.
+processes still exiting. Data parallelism above one and pipeline parallelism
+refuse.
+
+Under expert parallelism at data-parallel width 1 the workers start as
+without it, every rank runs a point's whole batch, and before the first call
+above each worker routes its MoE layers by a uniform draw, `route_uniformly`
+(`routing.py`): a replayed batch's filler tokens route neither as the
+workload's do nor uniformly.
 
 The manager leaves SIGINT ignored in the process that starts it, as an engine
 core's process wants; the bench's is the command's, so the bench restores
@@ -74,7 +82,6 @@ class Bench:
         )
         for refused, what in (
             (dp > 1, f"{dp} data-parallel ranks"),
-            (config.enable_expert_parallel, "expert parallelism"),
             (config.pipeline_parallel_size > 1, "pipeline parallelism"),
         ):
             if refused:
@@ -101,8 +108,12 @@ class Bench:
         signal.signal(signal.SIGINT, signal.default_int_handler)
         signal.signal(signal.SIGTERM, _signalled)
         try:
+            if config.enable_expert_parallel:
+                with _refuse_a_stop("route_uniformly"):
+                    self.runner_mgr.call_func("route_uniformly", wait_out=True)
             with _refuse_a_stop("get_num_blocks"):
                 budget = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
+            config.pool_entries_per_req = budget.get("pool_entries_per_req", {})
             try:
                 allocated = self.runner_mgr.call_func(
                     "allocate_kv_cache", num_blocks, wait_out=True

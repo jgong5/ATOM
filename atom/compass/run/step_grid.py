@@ -13,7 +13,11 @@ steps` publishes beside its report:
 
     {"grid": <a StepGrid mapping>, "residual": <a Residual mapping>,
      "bounds": {"max_num_seqs": n, "max_num_batched_tokens": n,
-                "max_model_len": n}}
+                "max_model_len": n},
+     "draft_residual": <a Residual mapping>}     # under a drafter
+
+A grid that states a draft width prices each step's drafter too, read for its
+points' drafter values with `draft_residual`.
 
 The grid states its timing scope (`scope`) and what its points hold
 (`value`); `step_grid_fit.bundle`, which writes a bundle, also writes the grid
@@ -24,7 +28,8 @@ is `keyed`, as JSON: the ladder the runner replays (none under
 ``enforce_eager``), the KV block size and dtype, the quantization, the TP and
 DP widths, DP attention, expert parallelism, TBO, the MoE backend, EPLB and
 DeepSeek-V4.1 decoder SWA bounded replay when
-off ATOM's default, the performance environment and, under speculation, its
+off ATOM's default, the performance environment, ATOM's prefill token buckets
+in it when off ATOM's default too, and, under speculation, its
 method and draft width. Loading refuses, naming what differs:
 
 - a run at data-parallel width above one, since every bundle is measured at one;
@@ -35,6 +40,10 @@ method and draft width. Loading refuses, naming what differs:
 - a rung of the ladder between the grid's lowest and highest measured rungs
   that was not measured;
 - a configured bound above the one the grid was planned for.
+
+Under expert parallelism the bench routed every MoE layer by a uniform draw
+(`bench/routing.py`), so every step the loaded backend prices from its grid
+names uniform routing among its assumed treatments; without it, none.
 
 A decode corner past the KV pool the grid records is extrapolated at lookup,
 and any other unmeasured corner refuses there, so neither needs a check here;
@@ -47,7 +56,9 @@ summary records the digest of the bundle it priced with.
 """
 
 import json
+import os
 from collections.abc import Mapping
+from types import FunctionType, SimpleNamespace
 
 from atom.benchmarks.results.metadata import performance_env
 from atom.compass.artifacts import (
@@ -68,6 +79,7 @@ from atom.compass.backends.step_grid import StepGrid, StepGridBackend
 from atom.compass.backends.step_grid_fit import VALUE
 from atom.compass.backends.step_grid_plan import BOUNDS, SCOPE, keyed_of  # noqa: F401
 from atom.compass.backends.step_grid_residual import Residual
+from atom.compass.backends.step_linear import UNIFORM_ROUTING
 from atom.compass.runner.overrides import schedulable_ladder
 
 #: The bundle's member a run reads: a group's step has a single writer.
@@ -75,13 +87,16 @@ MEMBER = ("params", Topology().ranks()[0], "json")
 #: Engine fields keyed only off ATOM's default, so keys written before they
 #: were read do not move.
 OFF_DEFAULT = ("moe_backend", "eplb_enable", "enable_decoder_swa_bounded_replay")
+#: ATOM's prefill token buckets, an environment variable `keyed` the same way.
+BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
 
 
 def keyed(config, ladder: bool = True) -> dict:
     """The conditions a bundle is measured under, as the resolved config holds them,
     `OFF_DEFAULT` only where it is off ATOM's default, and the performance
-    environment of this process less the client's and the device selection, and
-    under speculation its method and draft width; the ladder only with `ladder`."""
+    environment of this process less the client's and the device selection,
+    `BUCKETS` in it only off ATOM's default, and under speculation its method
+    and draft width; the ladder only with `ladder`."""
     from atom.config import Config
 
     spec = getattr(config, "speculative_config", None)
@@ -104,10 +119,21 @@ def keyed(config, ladder: bool = True) -> dict:
         "enable_tbo_decode": config.enable_tbo_decode,
         "env": {
             k: v
-            for k, v in sorted(performance_env().items())
+            for k, v in sorted((performance_env() | _buckets_off_default()).items())
             if not (k.startswith("AIPERF_") or k.endswith("_VISIBLE_DEVICES"))
         },
     }
+
+
+def _buckets_off_default() -> dict:
+    """`BUCKETS` as this process sets it when ATOM reads it off its default, else
+    nothing: ATOM states the default only inside its reader, run here unset."""
+    from atom.utils import envs
+
+    read = envs.environment_variables[BUCKETS]
+    unset = SimpleNamespace(getenv=lambda _, default=None: default)
+    off = read() != FunctionType(read.__code__, read.__globals__ | {"os": unset})()
+    return {BUCKETS: os.environ[BUCKETS]} if off else {}
 
 
 def differ(there: dict, here: dict, where: str) -> list[str]:
@@ -167,9 +193,12 @@ def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
     store = ArtifactStore(fields.pop("store"))
     key = Key.of(Kind.STEP_GRID_BUNDLE, **fields)
     entry = store.read(key)
+    ours = keyed(config)
+    treatments = (UNIFORM_ROUTING,) if ours["enable_expert_parallel"] else ()
     try:
         member = json.loads(entry.read_member(*MEMBER))
-        grid, residual = StepGrid(member["grid"]), Residual(member["residual"])
+        backend = _backend(member, str(key), treatments)
+        grid = backend.grid
         bounds = {name: member["bounds"][name] for name in BOUNDS}
         row = dict(entry.fingerprints[Row.STEP_GRID_BUNDLE].cells)
         recorded = json.loads(row[Axis.ENGINE_CONFIG].value)
@@ -177,7 +206,6 @@ def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
         raise ValueError(
             f"{key} does not load: {type(error).__name__}: {error}"
         ) from error
-    ours = keyed(config)
     pairs = {
         "graph mode": (grid.graph_mode, "eager" if config.enforce_eager else "replay"),
         "timing scope": (grid.scope, SCOPE),
@@ -215,10 +243,20 @@ def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
         raise ValueError(
             f"this run's {'; '.join(over)} the grid of {key} was planned for"
         )
-    return StepGridBackend(grid, residual, bundle=str(key)), {
-        "key": key.values,
-        "digest": entry.digest,
-    }
+    return backend, {"key": key.values, "digest": entry.digest}
+
+
+def _backend(member: Mapping, bundle: str, treatments=()) -> StepGridBackend:
+    """The backend of a bundle's member, under a drafter with the grid read for
+    the drafter's value and its residual, naming `treatments` on its steps."""
+    grid, residual = StepGrid(member["grid"]), Residual(member["residual"])
+    drafter = None
+    if grid.draft_width:
+        drafter = (
+            StepGrid(member["grid"], drafter=True),
+            Residual(member["draft_residual"], drafter=True),
+        )
+    return StepGridBackend(grid, residual, bundle, drafter, treatments)
 
 
 def read(spec: Mapping, digest: str) -> StepGridBackend:
@@ -230,6 +268,4 @@ def read(spec: Mapping, digest: str) -> StepGridBackend:
     fields = dict(spec)
     store = ArtifactStore(fields.pop("store"))
     entry = store.read_recorded(Kind.STEP_GRID_BUNDLE, fields, digest)
-    member = json.loads(entry.read_member(*MEMBER))
-    grid, residual = StepGrid(member["grid"]), Residual(member["residual"])
-    return StepGridBackend(grid, residual, bundle=str(entry.key))
+    return _backend(json.loads(entry.read_member(*MEMBER)), str(entry.key))

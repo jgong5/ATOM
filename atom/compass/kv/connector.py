@@ -14,7 +14,8 @@ the `LPRuntime` installed in the engine's process:
   `request_finished`, takes the write requests inline in `process_completions`
   and is done at ``c``. A write request for a request that has not
   finished (``r > a``) is refused: the router forwards to decode only after
-  prefill has returned.
+  prefill has returned. A claimed request aborted before its write request
+  is done at the abort.
 
 Both report from `process_completions`, which the engine calls at every step
 and every idle drain tick, one call after the first whose clock reached their
@@ -166,6 +167,8 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         # Mooncake's send claim: a producer keeps a request's blocks from the
         # pool from `request_finished` until its write is reported done.
         self._awaiting_send: set[str] = set()
+        # Requests aborted while claimed and before any write request.
+        self._aborted: set = set()
         self._socks: dict[tuple[str, int], clock.WrappedSocket] = {}
         if getattr(parallel, "pipeline_parallel_rank", 0):
             return  # Mooncake reports a send on the head stage only.
@@ -318,6 +321,18 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))
 
+    def abort_send(self, req_id) -> None:
+        """Mooncake's abort of a claimed request: a write request taken by now,
+        as Mooncake's listener takes one on arrival, reports when it would
+        have; with none, the send is done now."""
+        self._take_write_requests()
+        pending = req_id in self._due or req_id in self._snapshot
+        if str(req_id) not in self._awaiting_send or pending:
+            return
+        self._ready.pop(req_id, None)
+        self._aborted.add(req_id)
+        self._due[req_id] = self._rt.read_clock()
+
     def source_blocks_released(self, seq) -> None:
         """No block-lifetime state remains after the send claim is retired."""
 
@@ -327,15 +342,20 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             while sock.poll(0):
                 yield other, pickle.loads(sock.recv())
 
-    def process_completions(self, output):
-        """Take the write requests released so far; report what the clock had
-        reached at the previous call."""
+    def _take_write_requests(self) -> None:
+        """Prefill: time each write request released so far on its link."""
         for other, (req_id, blocks, a, rank) in self._write_requests():
             if rank != self._dp_rank:
                 raise ValueError(
                     f"the write request for {req_id!r} is for prefill DP rank "
                     f"{rank} and reached rank {self._dp_rank}"
                 )
+            if req_id in self._aborted:
+                # Mooncake refuses it. Decode, which cannot learn that, timed
+                # the write on its end of the link, and this end keeps in step.
+                self._written(other, a, blocks)
+                logger.info("compass: a write request for aborted %s", req_id)
+                continue
             r = self._ready.pop(req_id, None)
             if r is None or r > a:
                 raise ValueError(
@@ -353,6 +373,11 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                 a,
                 self._due[req_id],
             )
+
+    def process_completions(self, output):
+        """Take the write requests released so far; report what the clock had
+        reached at the previous call."""
+        self._take_write_requests()
         # The engine's aggregation keeps one poll in flight, so a poll returns
         # the snapshot the workers took at the previous poll: report that one.
         now = self._rt.read_clock()

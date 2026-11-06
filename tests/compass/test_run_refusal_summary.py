@@ -269,7 +269,7 @@ def test_the_summary_counts_every_stall_diagnostic_and_says_how_the_run_ended(
     authority = compass_run._RecordingAuthority(run)
     for row in authority.lp_table():
         authority.on_request(row.lp, "NER", math.inf, [])
-    authority.diagnostics = 1  # what its serve loop counted
+    authority.diagnostics = 1  # what its serve side counted
     for lp, printed in (("engine", 2), ("frontend", 0)):
         monkeypatch.setattr(clock, "_installed", SimpleNamespace(diagnostics=printed))
         compass_run._hand_in(run, lp, [])

@@ -11,11 +11,19 @@ every stream event the Clock Authority released has been reported by a worker,
 every credit whose final event is released has had its return passed to
 aiperf (a return that comes before its final event's release waits for it, so
 the next turn is scheduled from the final arrival either way), no return is
-still inside aiperf's callback, and every task on the loop is waiting on
-something. It asks for time only while a request is open, a clock wait (a
+still inside aiperf's callback, every task on the loop is waiting on
+something, and the done callbacks of a task that ended have run: the
+scheduler's drain observer, which rechecks the system idle cap once a timer's
+task ends, is one, and the clock moving on before it would let an idle gap run
+past the cap. It asks for time only while a request is open, a clock wait (a
 pacing timer, a phase deadline, the idle watchdog) is pending or the run is
 finishing; between phases aiperf works on the wall clock and the simulation
-waits for it.
+waits for it. While a request is open it asks for a phase deadline as a
+daemon deadline, and for no other wait due at or past it: the deadline fires
+once the open requests' work reaches it, and when the last one ends first and
+aiperf withdraws the deadline, nothing it asked for keeps an LP running past
+that end. The Clock Authority's essential horizon only grows, so a wait asked
+for and then withdrawn, or a pacing timer aiperf pulls earlier, would.
 
 When aiperf cancels the requests in flight at its grace deadline, the traffic
 LP closes them at that time (`cancel`): each one's cancel is a stamped request
@@ -87,7 +95,7 @@ class TrafficLP:
         # key -> its return, for aiperf; None once passed
         self._held: dict[tuple, object] = {}
         self._returns: asyncio.Queue = asyncio.Queue()  # passed in order, as upstream
-        self._waiters: list[tuple[float, asyncio.Future]] = []
+        self._waiters: list[tuple[float, asyncio.Future, bool]] = []
         self._passing = False  # a return is inside aiperf's callback
         self._finishing = False
         self._changed = asyncio.Event()
@@ -129,10 +137,14 @@ class TrafficLP:
         """Return at the next grant; the scheduler then reads its timers again."""
         await self.wait(t)
 
-    def wait(self, t: float) -> asyncio.Future:
-        """A clock wait for ``t``, resolved at the next grant or by ``withdraw``."""
+    def wait(self, t: float, phase_deadline: bool = False) -> asyncio.Future:
+        """A clock wait for ``t``, resolved at the next grant or by ``withdraw``.
+
+        A `phase_deadline` is asked for as a daemon deadline while a request
+        is open, and a wait due at or past it only once it has fired.
+        """
         fut = asyncio.get_running_loop().create_future()
-        self._waiters.append((t, fut))
+        self._waiters.append((t, fut, phase_deadline))
         self._changed.set()
         return fut
 
@@ -253,17 +265,27 @@ class TrafficLP:
                 self._changed.clear()
                 await self._changed.wait()
                 continue
-            t = min((t for t, _ in self._waiters), default=math.inf)
-            g = self.rt.next_event(t)
+            t, deadline = math.inf, math.inf
+            for at, _, phase_deadline in self._waiters:
+                if phase_deadline:
+                    deadline = min(deadline, at)
+                else:
+                    t = min(t, at)
+            if not self.open:
+                t, deadline = min(t, deadline), math.inf
+            elif t >= deadline:  # asked for once the deadline has fired
+                t = math.inf
+            g = self.rt.next_event(t, deadline)
             if g == math.inf:
                 return self._close()
 
     async def _settle(self) -> None:
         """Hold until every released event is reported and aiperf has caught up."""
-        for _, fut in self._waiters:  # wake the scheduler to read its timers again
+        for _, fut, _ in self._waiters:  # wake the scheduler to read its timers again
             fut.set_result(None)
         self._waiters.clear()
         spins = 0
+        alive = None  # the tasks not done at the last look; None before the first
         while True:
             # A reader that raised fails the run instead of leaving the hold waiting.
             for task in self._tasks:
@@ -316,8 +338,8 @@ class TrafficLP:
                         DIAG_S,
                     )
                 continue
-            ready = _ready_tasks()
-            if not ready:
+            ready, alive, ended = _look(alive)
+            if not ready and not ended:
                 if not self._caught_up:
                     return
                 for fut in self._caught_up:
@@ -342,14 +364,22 @@ class TrafficLP:
             )
 
 
-def _ready_tasks() -> list[str]:
-    """The tasks on this loop, but the current one, not waiting on a pending future."""
+def _look(alive: set | None) -> tuple[list[str], set, bool]:
+    """One look at this loop's tasks, but the current one.
+
+    Returns the names of those not waiting on a pending future, those not done,
+    and whether one of ``alive``, the tasks not done at the last look, has ended
+    since. A task that ends queues its done callbacks behind the current task,
+    so they run only on the loop's next turn; at the first look (``alive``
+    None) whether one has ended is unknown, and it reads as one.
+    """
     me = asyncio.current_task()
+    tasks = {task for task in asyncio.all_tasks() if task is not me and not task.done()}
     # ponytail: Task._fut_waiter is private; a loop-level idle hook would not be.
-    return [
+    ready = [
         task.get_name()
-        for task in asyncio.all_tasks()
-        if task is not me
-        and not task.done()
-        and (task._fut_waiter is None or task._fut_waiter.done())
+        for task in tasks
+        if task._fut_waiter is None or task._fut_waiter.done()
     ]
+    ended = alive is None or any(task.done() for task in alive)
+    return ready, tasks, ended

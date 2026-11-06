@@ -3,7 +3,7 @@
 
 Each port is taken by a plain bind on every address, which fails on a port any
 other socket holds, so no two holders, and no port draw such as
-`atom.compass.drive.serve._free_ports`, take the same one. The holder then sets
+`atom.compass.drive.serve._held_ports`, take the same one. The holder then sets
 SO_REUSEADDR and never listens: a listener that sets it too binds the port
 beside the holder, as uvicorn's, libzmq's, `socket.create_server`'s, torch's
 TCPStore's and Rust's `std::net::TcpListener` do, while a plain bind elsewhere

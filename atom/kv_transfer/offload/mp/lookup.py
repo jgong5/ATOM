@@ -6,12 +6,12 @@
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
 from typing import Any
 
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
 from atom.utils import clock
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
@@ -218,7 +218,7 @@ class _MPLookupClient:
         The clock starts on first sight when `discard` did not start it: a
         `lookup()` timeout orphans a lookup without a timestamp.
         """
-        now = clock.now(time.monotonic)
+        now = time.monotonic()
         return now - self._orphan_since.setdefault(lookup_id, now) > _ORPHAN_TIMEOUT_S
 
     def _requery_orphan_status(self, lookup_id: str) -> bool:
@@ -342,7 +342,7 @@ class _MPLookupClient:
         if lookup_id in self._async:
             # Still in flight: its locks exist only once it answers.
             self._orphans.add(lookup_id)
-            self._orphan_since.setdefault(lookup_id, clock.now(time.monotonic))
+            self._orphan_since.setdefault(lookup_id, time.monotonic())
             return
         if lookup_id in self._async_tokens:
             self._try_release_unconsumed(lookup_id)
@@ -357,7 +357,7 @@ class _MPLookupClient:
 
         self._orphans.discard(lookup_id)
         if lookup_id in self._async:
-            deadline = clock.now(time.monotonic) + self._timeout
+            deadline = time.monotonic() + self._timeout
             while lookup_id in self._async:
                 try:
                     if self._advance(lookup_id):
@@ -368,7 +368,7 @@ class _MPLookupClient:
                         _ASYNC_LOOKUP_FAILED, lookup_id, phase, exc_info=True
                     )
                     raise
-                if clock.now(time.monotonic) >= deadline:
+                if time.monotonic() >= deadline:
                     logger.warning(
                         "LMCache MP async lookup timed out after %.1fs for "
                         "request %s",
@@ -387,14 +387,14 @@ class _MPLookupClient:
             return async_hit
         request_id = _mp_session_id(self._config, lookup_id)
         self._adapter.maybe_submit_lookup_request(request_id, token_ids)
-        deadline = clock.now(time.monotonic) + self._timeout
+        deadline = time.monotonic() + self._timeout
         while True:
             result = self._adapter.check_lookup_result(request_id)
             if result is not None:
                 hit = int(result)
                 state.hit = hit
                 return hit
-            if clock.now(time.monotonic) >= deadline:
+            if time.monotonic() >= deadline:
                 logger.warning(
                     "LMCache MP lookup timed out after %.1fs for request %s",
                     self._timeout,

@@ -162,7 +162,8 @@ class TestPerRequestSums:
         gather rows, their real tokens and the agreed two-batch-overlap split
         of the data-parallel group, and whether it samples, what its vision
         encoder fills of the step and whether it is a DP rank's dummy forward,
-        not of any row.
+        not of any row. `start_lag_s` is the timeline's: how far behind its
+        host the device starts the step.
         """
         assert [f.name for f in fields(BatchView)] == [
             "requests",
@@ -177,7 +178,10 @@ class TestPerRequestSums:
             "moe_tokens",
             "dp_rank",
             "dp_dummy",
+            "group_prefills",
             "draft_rows",
+            "group_dummies",
+            "start_lag_s",
         ]
         assert [f.name for f in fields(RequestShape)] == [
             "query_tokens",
@@ -360,6 +364,7 @@ class TestTheRung:
         assert named(step)["decode.graph_padding"] == pytest.approx(99.9999999)
         padding = {name: prov for name, _, prov in step.rows()}
         assert UNCHECKED_RUNG in padding["decode.graph_padding"]
+        assert "nothing here bounds it above" in padding["decode.graph_padding"]
 
     def test_with_no_rung_the_padding_term_carries_no_rung_qualifier(self):
         """Nothing was supplied, so there is no unchecked width to declare."""
@@ -516,6 +521,8 @@ class TestCollectives:
         ).price(BatchView((prefill(128),)))
         for name, _, provenance in step.rows():
             assert (CANDIDATE in provenance) is name.startswith("collective.")
+            if name.startswith("collective."):
+                assert "not one observed to run" in provenance
 
     def test_a_charged_collective_says_which_layer_count_it_used(self):
         """Two counts describe the worker and the seconds carry neither.

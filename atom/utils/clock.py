@@ -38,6 +38,7 @@ send side stamps each frame with `stamp_send`, directly or through the
 """
 
 import contextlib
+import json
 import logging
 import math
 import os
@@ -107,12 +108,16 @@ class Straggler(Exception):
 
 
 class _Wakeup(threading.Event):
-    """An event `zmq.zmq_poll` can also wait on, through `fd`, beside the sockets."""
+    """An event `zmq.zmq_poll` can also wait on, through `fd`, beside the sockets.
+
+    A release sets it when its channel is in `channels`, the ones its thread's
+    poller waits on, and every release sets it while `channels` is None."""
 
     def __init__(self) -> None:
         super().__init__()
         # ponytail: one eventfd per receiving thread, never closed; threads are few
         self.fd = os.eventfd(0, os.EFD_NONBLOCK)
+        self.channels: frozenset[str] | None = None
 
     def set(self) -> None:
         super().set()
@@ -147,6 +152,12 @@ class LPRuntime:
         self.arrived: dict[str, set[int]] = {ch: set() for ch in into}
         self.released: dict[str, set[int]] = {ch: set() for ch in into}
         self.handled: dict[str, set[int]] = {ch: set() for ch in into}
+        # Released and not yet read, per channel, and how many released are not
+        # yet handled: kept as messages come and go, so a check reads them
+        # without walking every message the run has brought.
+        self.unread: dict[str, set[int]] = {ch: set() for ch in into}
+        self.unhandled: dict[str, int] = dict.fromkeys(into, 0)
+        self.inline = tuple(c for c in into if table.recv_mode(c) is ReceiveMode.INLINE)
         # Frames read but not released, (channel, seq) -> arrival: checked at each drain.
         self.unreleased: dict[tuple[str, int], float] = {}
         self.taken_by: dict[threading.Thread, tuple[str, int]] = {}
@@ -322,10 +333,16 @@ class LPRuntime:
         with self.lock:
             for a, ch, seq in order:
                 self.now = max(self.now, a)
-                self.released[ch].add(seq)
+                if seq not in self.released[ch]:
+                    self.released[ch].add(seq)
+                    if seq not in self.arrived[ch]:
+                        self.unread[ch].add(seq)
+                    if seq not in self.handled[ch]:
+                        self.unhandled[ch] += 1
                 self.unreleased.pop((ch, seq), None)
                 for w in self.wakes.values():
-                    w.set()
+                    if w.channels is None or ch in w.channels:
+                        w.set()
                 if self.table.recv_mode(ch) is ReceiveMode.INLINE:
                     continue
                 reported = False
@@ -360,16 +377,13 @@ class LPRuntime:
             self.next_event(math.inf)
         with self.lock:
             self.arrived[ch].add(seq)
+            self.unread[ch].discard(seq)
             self.count_done_locked(ch, seq)
 
     def inline_pending(self) -> bool:
         """Is there a released inline message not yet taken?"""
         with self.lock:
-            return any(
-                self.released[ch] - self.handled[ch]
-                for ch in self.released
-                if self.table.recv_mode(ch) is ReceiveMode.INLINE
-            )
+            return any(self.unhandled[ch] for ch in self.inline)
 
     # ---- receive side ----
 
@@ -379,17 +393,20 @@ class LPRuntime:
             if seq in self.arrived[ch]:
                 raise RuntimeError(f"{ch} seq {seq} arrived twice")
             self.arrived[ch].add(seq)
+            self.unread[ch].discard(seq)
             if seq not in self.released[ch]:
                 self.unreleased[ch, seq] = arrival
                 if arrival < self.now:
                     self._straggler(arrival, ch, seq)
 
-    def my_wakeup(self) -> _Wakeup:
-        """This thread's event, set whenever a message is released."""
+    def my_wakeup(self, channels=None) -> _Wakeup:
+        """This thread's event, set whenever a message on one of `channels` is
+        released, or any message while `channels` is None."""
         with self.lock:
             me = threading.current_thread()
             if me not in self.wakes:
                 self.wakes[me] = _Wakeup()
+            self.wakes[me].channels = None if channels is None else frozenset(channels)
             return self.wakes[me]
 
     def is_released(self, ch: str, seq: int) -> bool:
@@ -424,6 +441,8 @@ class LPRuntime:
 
     def count_done_locked(self, ch: str, seq: int) -> None:
         """Caller holds `lock`."""
+        if seq in self.released[ch] and seq not in self.handled[ch]:
+            self.unhandled[ch] -= 1
         self.handled[ch].add(seq)
         self.cv.notify_all()
 
@@ -486,7 +505,9 @@ class WrappedSocket:
 
     def _first_ready(self) -> int | None:
         with self.rt.lock:
-            held = self.rt.holds_unstamped()
+            # `holds_unstamped` reads every frame the run brought: ask it only
+            # when a frame sent outside the run is here for it to decide.
+            held = any(f[1] is None for f in self.buf) and self.rt.holds_unstamped()
             for k, (ch, arrival, seq, _) in enumerate(self.buf):
                 if (arrival is None and not held) or (
                     arrival is not None and self.rt.is_released(ch, seq)
@@ -519,7 +540,7 @@ class WrappedSocket:
         while True:
             self.pull()
             with self.rt.lock:
-                if all(self.rt.released[c] <= self.rt.arrived[c] for c in self.into):
+                if not any(self.rt.unread[c] for c in self.into):
                     return
             self.raw.poll()
 
@@ -567,8 +588,8 @@ class WrappedPoller:
 
     def poll(self) -> list[tuple]:
         self.rt.back_at_wait_point()
-        wake = self.rt.my_wakeup()
         wrapped = [s for s in self.socks if isinstance(s, WrappedSocket)]
+        wake = self.rt.my_wakeup([ch for s in wrapped for ch in s.into])
         waits = [(getattr(s, "raw", s), zmq.POLLIN) for s in self.socks]
         while True:
             wake.clear()
@@ -756,12 +777,31 @@ def reply_queue() -> queue.Queue:
 class PullStamps:
     """A real recording's engine loop: the first input pull and the first
     output put after each worker reply, one ``{"t_pull_ns" | "t_put_ns": ns}``
-    line each in `path`, read off `now`, the machine clock its caller hands in."""
+    line each in `path`, read off `now`, the machine clock its caller hands in.
 
-    def __init__(self, path, now) -> None:
-        self.file, self.now = open(path, "w", buffering=1), now  # noqa: SIM115
-        self.lock = threading.Lock()
+    In `handoff`, one line per item through the engine's IO-thread queues: an
+    input frame's ``t_recv_ns`` (the input thread's receipt, on the same
+    clock), ``t_in_put_ns``, ``t_in_get_ns``, ``t_pull_ns`` (the busy loop's
+    idle point in the pass that got it) and ``prompt_tokens``; an
+    output's ``t_out_put_ns``, ``t_out_sent_ns`` (the output thread's next
+    get, so its send returned) and ``rows``.
+
+    Both files get their lines when the engine leaves its loop (`write_held`);
+    after that, each line as it comes. A write on the loop is time the loop
+    spends: on a record kept on NFS, a pull stamp written tens of
+    microseconds after the put stamp blocked for about 1 ms in most forwards,
+    inside the `E` it opens."""
+
+    def __init__(self, path, handoff, now) -> None:
+        self.file, self.now = open(path, "w"), now  # noqa: SIM115
+        self.handoff = open(handoff, "w")  # noqa: SIM115
+        # Reentrant: the stop handler writes the held lines on the loop's own
+        # thread, which a signal may have caught inside `stamp`.
+        self.lock = threading.RLock()
         self.armed: set[str] = set()
+        self.inputs: dict[int, int] = {}  # id of an input item -> its put
+        self.pull = 0  # the busy loop's last idle point
+        self.held: dict | None = {self.file: [], self.handoff: []}
 
     def arm(self) -> None:
         with self.lock:
@@ -771,26 +811,103 @@ class PullStamps:
         with self.lock:
             if key in self.armed:
                 self.armed.discard(key)
-                self.file.write(f'{{"{key}": {self.now()}}}\n')
+                self._put(self.file, f'{{"{key}": {self.now()}}}\n')
+
+    def write(self, line: dict) -> None:
+        with self.lock:
+            self._put(self.handoff, json.dumps(line) + "\n")
+
+    def _put(self, file, line: str) -> None:
+        if self.held is None:
+            file.write(line)
+            file.flush()
+        else:
+            self.held[file].append(line)
+
+    def write_held(self) -> None:
+        """Write the lines held so far; later ones are written as they come.
+        The lines are taken first, so a stop handler that runs inside this
+        write finds none left to write again."""
+        with self.lock:
+            held, self.held = self.held, None
+            for file, lines in (held or {}).items():
+                file.write("".join(lines))
+                file.flush()
 
 
 #: The engine's `PullStamps` on a real recording, else None.
 _stamps: PullStamps | None = None
 
 
-def stamp_pulls(path, now) -> None:
-    """Stamp this engine's pulls and puts into `path` off the clock `now`; a
-    real recording's only."""
+def stamp_pulls(path, handoff, now) -> None:
+    """Stamp this engine's pulls and puts into `path`, and its IO-thread
+    queue handoffs into `handoff`, off the clock `now`; a real recording's only."""
     global _stamps
-    _stamps = PullStamps(path, now)
+    _stamps = PullStamps(path, handoff, now)
+
+
+def write_stamps() -> None:
+    """A real recording's engine leaves its loop: write the stamps it holds."""
+    if _stamps is not None:
+        _stamps.write_held()
 
 
 class _StampedQueue(queue.Queue):
-    """A real recording's output queue: each put is offered as a ``t_put_ns`` stamp."""
+    """A real recording's output queue: each put is offered as a ``t_put_ns``
+    stamp, and the output thread's next get writes the item before it with its
+    batch's row count, its send returned."""
+
+    taken = None  # (put, item) the output thread took last
 
     def put(self, item, block: bool = True, timeout=None) -> None:
         _stamps.stamp("t_put_ns")
+        super().put((_stamps.now(), item), block, timeout)
+
+    def get(self, block: bool = True, timeout=None):
+        if self.taken is not None:
+            (put, item), self.taken = self.taken, None
+            rows = item[1] if isinstance(item, tuple) and item[0] == "STREAM" else item
+            if isinstance(rows, list):
+                sent = _stamps.now()
+                _stamps.write(
+                    {"t_out_put_ns": put, "t_out_sent_ns": sent, "rows": len(rows)}
+                )
+        self.taken = super().get(block, timeout)
+        return self.taken[1]
+
+
+class _StampedInputQueue(queue.Queue):
+    """A real recording's input queue: the busy loop's get of each request
+    frame writes the frame's receipt, put and get, and its prompt tokens."""
+
+    def put(self, item, block: bool = True, timeout=None) -> None:
+        _stamps.inputs[id(item)] = _stamps.now()
         super().put(item, block, timeout)
+
+    def get(self, block: bool = True, timeout=None):
+        item = super().get(block, timeout)
+        got, put = _stamps.now(), _stamps.inputs.pop(id(item), None)
+        timing = getattr(item[0], "queue_timing", None) if item else None
+        if put is not None and timing is not None:
+            prompt = sum(s.num_prompt_tokens for s in item)
+            recv = int(timing.received_at * 1e9)  # perf_counter: CLOCK_MONOTONIC
+            _stamps.write(
+                {
+                    "t_recv_ns": recv,
+                    "t_in_put_ns": put,
+                    "t_in_get_ns": got,
+                    "t_pull_ns": _stamps.pull,
+                    "prompt_tokens": prompt,
+                }
+            )
+        return item
+
+
+def stamp_input(engine) -> None:
+    """On a real recording, make `engine`'s input queue write each request
+    frame's handoff (`_StampedInputQueue`); the queue keeps what it holds."""
+    if _stamps is not None:
+        engine.input_queue.__class__ = _StampedInputQueue
 
 
 # ---- the engine step loop: hooks ATOM calls, each a no-op on a real run ----
@@ -876,6 +993,7 @@ def idle(deadline, t_daemon: float = math.inf) -> bool:
     if rt is None:
         if _stamps is not None:
             _stamps.stamp("t_pull_ns")
+            _stamps.pull = _stamps.now()
         return False
     if rt.in_run and rt.calls == rt.idle_calls:
         rt.next_event(deadline(), t_daemon)

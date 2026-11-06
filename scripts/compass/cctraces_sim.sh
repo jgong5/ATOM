@@ -40,6 +40,11 @@
 #                   deployment has left (default 600)
 #   HTTP_INTAKE     a file: a TP1 cell's server runs under http_intake.py,
 #                   which stamps each request its event loop takes in there
+#   STORE           with REAL=1, an artifact store: the server's start merges
+#                   its JIT cache library for this stack into the container's
+#                   caches, and its stop writes back what the server finished
+#                   compiling (atom/compass/drive/jit_cache.py); unset, no
+#                   library is touched
 #
 # A run file with `router_s` and `kv_write_req_s` makes the cell 1P1D: the
 # deployment is pd_sim.sh's, and aiperf drives its atomesh router.
@@ -131,18 +136,25 @@ dp = run.get("data_parallel_size", 1)
 # One write-request port per prefill rank and decode rank pair, as pd_sim.sh binds.
 n = run.get("prefill_data_parallel_size", dp) * run.get("decode_data_parallel_size", dp)
 # Held together, so no two are the same port, and until this script exits, as
-# compass_free_port holds its port, so no other process binds one first.
+# compass_held_port holds its port, so no other process binds one first.
 socks = [socket.socket() for _ in range(6)]
 for s in socks:
     s.bind(("", 0))
 ports = [s.getsockname()[1] for s in socks]
-# The write requests take n ports from KV_WRITE_REQ_PORT, the fifth: re-pick
-# it, the others still held, until none of them lies in that block.
-while {*ports[:4], ports[5]} & set(range(ports[4], ports[4] + n)):
-    socks.append(socket.socket())
-    socks[-1].bind(("", 0))
-    ports[4] = socks[-1].getsockname()[1]
-for s in socks:
+# The write requests take n ports from KV_WRITE_REQ_PORT, the fifth: hold the
+# rest of its block too, re-picking it, the others still held, until they bind.
+block = []
+while len(block) < n - 1:
+    block.append(socket.socket())
+    try:
+        block[-1].bind(("", ports[4] + len(block)))
+    except (OSError, OverflowError):
+        while block:
+            block.pop().close()
+        socks.append(socket.socket())
+        socks[-1].bind(("", 0))
+        ports[4] = socks[-1].getsockname()[1]
+for s in socks + block:
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
 
@@ -184,13 +196,15 @@ if ((REAL)); then
     [[ $MODE == tp1 ]] || { echo "cctraces_sim: a real cell is TP1, and the run file is 1P1D" >&2; exit 2; }
     gpu=$(compass_gpus smi "$gpu")
     gpu_processes before
+    jit_since=$(date +%s%N)
+    [[ -z ${STORE:-} ]] || python3 -m atom.compass.drive.jit_cache restore "$STORE" "$gpu"
 fi
 if [[ $MODE == 1p1d ]]; then
     # pd_sim.sh takes the authority's port from its own variable; the run file
     # names the same one for the traffic LP.
-    # Each side's DP master port is free too, or a second run on this host
+    # Each side's DP master port is held too, or a second run on this host
     # network finds pd_sim.sh's default taken.
-    PREFILL_DP_PORT=$(compass_free_port) DECODE_DP_PORT=$(compass_free_port)
+    PREFILL_DP_PORT=$(compass_held_port) DECODE_DP_PORT=$(compass_held_port)
     export MODEL SERVER_ARGS WAIT_S CLOCK_PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT \
         PREFILL_DP_PORT DECODE_DP_PORT
     # An agentic cell, as the real one is launched: under DP attention its
@@ -209,12 +223,12 @@ else
     main=(-m atom.entrypoints.openai.api_server)
     [[ -z ${HTTP_INTAKE:-} ]] || main=("$ROOT/scripts/compass/http_intake.py" serve "$HTTP_INTAKE")
     # The keep-alive timeout as in pd_sim.sh, aiperf's pool in the router's place.
-    # Its own process group, so a real server's workers stop with it. A free
+    # Its own process group, so a real server's workers stop with it. A held
     # DP master port, as `compass record` gives one: the port keys ATOM's
     # compiled-graph cache, and the first start that loads it autotunes again.
     # No later start loads it, so the server's stop removes it, as there.
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
-    ATOM_DP_MASTER_PORT=$(compass_free_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
+    ATOM_DP_MASTER_PORT=$(compass_held_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
         python3 "${main[@]}" \
         --model "$MODEL" --host 127.0.0.1 --server-port "$PORT" --timeout-keep-alive 1000000 \
         $SERVER_ARGS "${compass[@]}" >"$OUT/server.log" 2>&1 &
@@ -265,6 +279,7 @@ wait $server || rc=$((rc || REAL ? rc : $?))
 ((REAL)) && { kill -KILL -- -$server 2>/dev/null || true; gpu_processes after; }
 [[ $MODE == 1p1d ]] || python3 -c 'import sys; from atom.compass.drive import serve; serve.drop_compiled(sys.argv[1])' "$OUT/server.log"
 ((REAL)) && { python3 -m atom.compass.drive.aiter_jit "$OUT/run.json" "$serving_ns" || rc=$((rc ? rc : 1)); }
+((REAL)) && [[ -n ${STORE:-} ]] && { python3 -m atom.compass.drive.jit_cache save "$STORE" "$gpu" "$jit_since" || rc=$((rc ? rc : 1)); }
 # The raw records keep each response's chunks, so the export names each request
 # by its response id; once it is written, they are compressed. A run that
 # failed before aiperf wrote any has none.

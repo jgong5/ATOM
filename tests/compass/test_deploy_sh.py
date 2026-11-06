@@ -23,6 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from test_launcher_held_ports import HELD, SQUAT
 from test_memory_readings import DOCUMENT
 
 from atom.compass import run as compass_run
@@ -115,6 +116,7 @@ http.server.HTTPServer(("127.0.0.1", port), Models).serve_forever()
 """
 PREFILL = ["-tp", "2", "--enable-dp-attention"]
 ROUTER_ARGS = ["--policy", "random", "--backend", "atom", "--disable-health-check"]
+ROUTER_LP_ARGS = [*ROUTER_ARGS, "--disable-retries", "--dp-aware"]
 
 
 @pytest.fixture
@@ -275,7 +277,7 @@ def test_a_dp_aware_router_runs_as_the_router_lp_on_the_run_s_clock(tmp_path, pl
     env, flags = planted
     env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
     d = tmp_path / "d"
-    words = argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"])
+    words = argv(tmp_path, flags, router=ROUTER_LP_ARGS)
     script = subprocess.Popen(
         words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
     )
@@ -322,7 +324,7 @@ def test_a_router_lp_that_leaves_as_the_traffic_closes_waits_for_the_client_s_st
     env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
     env["PLANTED_LEAVE"] = str(tmp_path / "leave")
     d = tmp_path / "d"
-    words = argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"])
+    words = argv(tmp_path, flags, router=ROUTER_LP_ARGS)
     script = subprocess.Popen(
         words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True,
@@ -357,7 +359,7 @@ def test_a_dp_aware_run_refuses_a_router_built_dirty_before_anything_starts(
 ):
     env, flags = planted
     env["PLANTED_BUILD"] = f"{_tree_commit()} dirty"
-    words = argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"])
+    words = argv(tmp_path, flags, router=ROUTER_LP_ARGS)
 
     done = subprocess.run(
         words, env=env, cwd=tmp_path, capture_output=True, text=True, check=False
@@ -431,3 +433,108 @@ def test_a_simulated_router_refuses_a_worker_more_or_a_limiter_before_anything_s
     assert done.returncode == 2, done.stderr
     assert f"the router's arguments carry {flag}," in done.stderr
     assert not (tmp_path / "d").exists()
+
+
+def test_a_router_lp_without_disable_retries_exits_2_before_anything_starts(
+    tmp_path, planted
+):
+    env, flags = planted
+
+    done = subprocess.run(
+        argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"]),
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert done.returncode == 2, done.stderr
+    assert "carry --dp-aware but not --disable-retries:" in done.stderr
+    assert not (tmp_path / "d").exists()
+
+
+def test_a_simulated_router_bounds_a_request_by_a_year_of_wall_time(tmp_path, planted):
+    # A stream lasts the wall time the run takes to reach its end: at c=256
+    # past the router's default 1800 s, which cut it there.
+    env, flags = planted
+    script = subprocess.Popen(
+        argv(tmp_path, flags), env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
+    )
+    _until(tmp_path / "d" / "server.json", script)
+    router = json.loads((tmp_path / "router.json").read_text())["argv"]
+    script.send_signal(signal.SIGTERM)
+    out, _ = script.communicate(timeout=60)
+
+    assert script.returncode == 0, out
+    assert router.count("--request-timeout-secs") == 1
+    bound = int(router[router.index("--request-timeout-secs") + 1])
+    assert bound >= 365 * 24 * 3600
+
+
+@pytest.mark.parametrize(
+    "words", [["--request-timeout-secs", "60"], ["--request-timeout-secs=60"]]
+)
+def test_a_simulated_router_refuses_the_caller_s_request_timeout(
+    tmp_path, planted, words
+):
+    env, flags = planted
+
+    done = subprocess.run(
+        argv(tmp_path, flags, router=[*ROUTER_ARGS, *words]),
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert done.returncode == 2, done.stderr
+    assert "the router's arguments carry --request-timeout-secs," in done.stderr
+    assert not (tmp_path / "d").exists()
+
+
+#: Another process, then a server, on the router's ports and the prefill's
+#: block of write requests, two for DP 2 by DP 1.
+SQUAT_ROUTER = """
+import json, os, sys
+a, d = sys.argv[1:], os.path.dirname(os.environ["PLANTED_SUMMARY"])
+kv = json.loads(json.load(open(d + "/prefill.argv.json"))[-1])
+base = int(kv["compass_kv_write_req"].rsplit(":", 1)[1])
+ports = [a[a.index(f) + 1] for f in ("--port", "--prometheus-port")]
+sys.argv[1:] = [*ports, str(base), str(base + 1)]
+""" + SQUAT
+
+
+def test_each_port_a_run_hands_a_server_is_held_from_another_process_first(
+    tmp_path, planted
+):
+    env, flags = planted
+    seen, bindir = tmp_path / "seen", Path(env["ATOMESH"]).parent
+    env |= {"SQUAT": SQUAT, "SQUAT_ROUTER": SQUAT_ROUTER}
+    python3 = (bindir / "python3").read_text().split("\n", 1)
+    (bindir / "python3").write_text(
+        f"{python3[0]}\n"
+        'case "$1 $2" in "-m atom.compass.run")\n'
+        f'    {sys.executable} -c "$SQUAT" "${{6##*:}}" >>{seen};;\n'
+        f"esac\n{python3[1]}"
+    )
+    (bindir / "atomesh").rename(bindir / "router")
+    (bindir / "atomesh").write_text(
+        f'#!/bin/sh\n{sys.executable} -c "$SQUAT_ROUTER" "$@" >>{seen}\n'
+        f'exec {bindir}/router "$@"\n'
+    )
+    (bindir / "atomesh").chmod(0o755)
+    script = subprocess.Popen(
+        argv(tmp_path, flags), env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
+    )
+    try:
+        _until(tmp_path / "d" / "server.json", script)
+    finally:
+        script.send_signal(signal.SIGTERM)
+        script.communicate(timeout=60)
+
+    squatted = [line.split()[1:] for line in seen.read_text().splitlines()]
+    assert squatted == [HELD] * 5  # the clock's first

@@ -2119,6 +2119,267 @@ def test_v4_nm_output_at_one_kv_split_has_room_for_the_fp32_stride(splits, room)
     assert built.dtype == torch.bfloat16 and ops._room(built) == room
 
 
+@pytest.mark.parametrize("rows, stride, k", [(512, 256, 512), (128, 64, 2048)])
+def test_the_decode_top_k_launches_the_scratch_aiter_sizes_for_its_rows_stride_and_k(
+    rows, stride, k
+):
+    # V4.1-Flash's prefill T=512 B=1 graph holds both calls, each with its
+    # scratch at the one byte the capture's sizing answers; each copy takes
+    # the bytes aiter's own query sizes for the call.
+    from aiter.ops import topk
+
+    def spec(shape, dtype):
+        steps = [shape[1], 1] if len(shape) == 2 else [1]
+        return {"shape": shape, "dtype": dtype, "stride": steps, "role": "activation"}
+
+    args = {
+        "logits": spec([rows, stride], F32),
+        "next_n": 1,
+        "seqLens": spec([rows], "torch.int32"),
+        "indices": spec([rows, k], "torch.int32"),
+        "numRows": rows,
+        "stride0": stride,
+        "stride1": 1,
+        "k": k,
+        "workspace": spec([1], "torch.uint8"),
+        "stable": True,
+    }
+    op = {"op": "aiter._top_k_per_row_decode.default", "args": args}
+    asked, graphs = [], []
+
+    def size(*query):  # aiter's query, which needs a device
+        asked.append(query)
+        return 16 * query[0] * query[1]
+
+    def replay(fn, calls, flush=None):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    with (
+        patch.object(topk, "topk_ob_workspace_size", side_effect=size),
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        record = stub._time(op, "sig", [{}], 2)
+
+    want = 16 * rows * stride
+    assert set(asked) == {(rows, stride, k, True)}
+    launched = {id(kwargs["workspace"]): kwargs["workspace"] for kwargs, _ in graphs[0]}
+    assert len(launched) == 2  # a scratch of its own each cold copy
+    for scratch in launched.values():
+        assert (scratch.dtype, scratch.shape) == (torch.uint8, (want,))
+        assert scratch.device == _Runner.device
+    assert record["workspace_bytes"] == want
+
+
+@pytest.mark.parametrize(
+    "stable, multi, queries, launched, scratches",
+    [
+        (None, True, {"use", "mb"}, 1024, 1),  # a capture leaves out stable=False
+        (False, False, {"use", "ob"}, 700, 2),
+        (True, True, {"ob"}, 700, 2),
+    ],
+)
+def test_the_prefill_top_k_launches_the_workspace_aiter_builds_for_its_path(
+    stable, multi, queries, launched, scratches
+):
+    # Where the device says so and the call is not stable, the multi-block
+    # path, on aiter's one cached buffer, zeroed, its size rounded up to a
+    # power of two; otherwise the one-block path, on scratch of its own each
+    # cold copy. Both sized for prefill.
+    from aiter.ops import topk
+
+    rows, stride, k = 4, 65536, 2048
+
+    def spec(shape, dtype):
+        steps = [shape[1], 1] if len(shape) == 2 else [1]
+        return {"shape": shape, "dtype": dtype, "stride": steps, "role": "activation"}
+
+    args = {
+        "logits": spec([rows, stride], F32),
+        "rowStarts": spec([rows], "torch.int32"),
+        "rowEnds": spec([rows], "torch.int32"),
+        "indices": spec([rows, k], "torch.int32"),
+        "values": None,
+        "numRows": rows,
+        "stride0": stride,
+        "stride1": 1,
+        "k": k,
+        "workspace": spec([1], "torch.uint8"),
+    } | ({} if stable is None else {"stable": stable})
+    op = {"op": "aiter._top_k_per_row_prefill.default", "args": args}
+    asked, graphs = [], []
+
+    def query(name, answer):  # aiter's queries, which need a device
+        return lambda *q: asked.append((name, *q)) or answer
+
+    def replay(fn, calls, flush=None):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    stream = SimpleNamespace(cuda_stream=0)
+    topk._get_topk_mb_workspace_keyed.cache_clear()
+    with (
+        patch.object(topk, "topk_use_mulblocks", query("use", multi)),
+        patch.object(topk, "topk_mb_workspace_size", query("mb", 1000)),
+        patch.object(topk, "topk_ob_workspace_size", query("ob", 700)),
+        # the device's stream and memory pool aiter's cached buffer is kept in
+        patch.object(torch.cuda, "current_stream", lambda device: stream),
+        patch.object(topk, "persistent_alloc", lambda device: contextlib.nullcontext()),
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        record = stub._time(op, "sig", [{}], 2)
+        cached = topk.get_topk_mb_workspace(_Runner.device, 1000)
+    topk._get_topk_mb_workspace_keyed.cache_clear()
+
+    assert {q[0] for q in asked} == queries
+    assert {q[1:] for q in asked if q[0] != "use"} == {(rows, stride, k, False)}
+    assert {q[1:] for q in asked if q[0] == "use"} <= {(rows, stride)}
+    used = {id(kwargs["workspace"]): kwargs["workspace"] for kwargs, _ in graphs[0]}
+    assert len(used) == scratches
+    for scratch in used.values():
+        assert (scratch.dtype, scratch.shape) == (torch.uint8, (launched,))
+        assert scratch.device == _Runner.device
+        if "mb" in queries:
+            assert scratch is cached and not scratch.any()
+    assert record["workspace_bytes"] == launched
+
+
+@pytest.mark.parametrize(
+    "decoding, rows, stride, scratch, copies",
+    [
+        (False, 8192, 2048, 8_388_863, 6),
+        (False, 1024, 32768, 16_777_471, 4),
+        (True, 512, 2048, 524_543, 94),
+    ],
+)
+def test_a_top_k_leaf_s_copies_and_footprint_count_the_scratch_it_launches(
+    monkeypatch, decoding, rows, stride, scratch, copies
+):
+    # The graph holds one byte of scratch; aiter sizes it as on MI455 for the
+    # two calls an 8192-token prefill makes at indexer budget 2048, from empty
+    # and ending at 128K, and for a 512-row decode whose row stride is its
+    # context.
+    from aiter.ops import topk
+
+    sizes = {(rows, stride, 512, decoding): scratch}
+    monkeypatch.setattr(topk, "topk_ob_workspace_size", lambda *q: sizes[q])
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda self, op, s, i, n: {"copies": n})
+    vector = _t([rows], "activation", [1], "torch.int32")
+    args = [
+        ("logits", _t([rows, stride], "activation", [stride, 1])),
+        *[(s, vector) for s in ("seqLens",) if decoding],
+        *[(s, vector) for s in ("rowStarts", "rowEnds") if not decoding],
+        ("indices", _t([rows, 512], "activation", [512, 1], "torch.int32")),
+        ("numRows", rows),
+        ("stride0", ir.Affine(1, 0) if decoding else stride),
+        ("k", 512),
+        ("workspace", _t([1], "activation", [1], "torch.uint8")),
+        ("stable", True),
+    ]
+    phase = "decode" if decoding else "prefill"
+    leaf = _leaf(f"aiter._top_k_per_row_{phase}.default", *args)
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    placed = SimpleNamespace(block_size=256, batch=lambda view, b, s: (b, s))
+    shape = decode(2) if decoding else prefill(6, 2)
+
+    [record] = ops.Stub(_Runner(), 256 << 20).point(placed, shape, 2048, found)
+
+    # Each call's logits, row bounds, indices and scratch: copies past twice
+    # a 256 MiB cache.
+    call = 4 * rows * (stride + 2 - decoding + 512) + scratch
+    assert (record["copies"], record["footprint_bytes"]) == (copies, copies * call)
+
+
+def test_a_top_k_leaf_whose_size_query_raises_refuses_and_its_point_is_timed(
+    monkeypatch,
+):
+    # aiter's top-k module fails to build: planning asks its size query, and
+    # the leaf refuses by name while the GEMM beside it is timed.
+    from aiter.ops import topk
+
+    def query(*q):
+        raise RuntimeError("module_top_k_per_row failed to build")
+
+    monkeypatch.setattr(topk, "topk_ob_workspace_size", query)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops, "_function", lambda name: lambda **kwargs: None)
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    monkeypatch.setattr(
+        ops, "_replay", lambda fn, calls, flush=None: [1.0] * ops.REPEATS
+    )
+    ints = [("numRows", 4), ("stride0", 8), ("k", 2), ("stable", True)]
+    scratch = ("workspace", _t([1], "activation", [1], "torch.uint8"))
+    top_k = _leaf(
+        "aiter._top_k_per_row_prefill.default",
+        ("logits", _t([4, 8], "activation")),
+        *ints,
+        scratch,
+    )
+    gemm = _leaf("aiter.gemm", ("x", _t([2, 8], "activation")))
+    found = ops.leaves(_graph(top_k, gemm, layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    got = ops.Stub(_Runner(), 1000).point(placed, prefill(6, 2), 20, found)
+
+    by_op = {record["op"]: record for record in got}
+    assert by_op["aiter._top_k_per_row_prefill.default"]["refused"] == (
+        "RuntimeError: module_top_k_per_row failed to build"
+    )
+    gemm = by_op["aiter.gemm"]
+    assert "refused" not in gemm and gemm["cold_ns"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "rows, stride, buffer, copies",
+    [(2, 65536, 1 << 16, 256), (32, 98304, 1 << 20, 43), (128, 262144, 4 << 20, 4)],
+)
+def test_a_multi_block_top_k_leaf_counts_aiter_s_one_buffer_once(
+    monkeypatch, rows, stride, buffer, copies
+):
+    # Every copy launches aiter's one cached multi-block buffer, sized as aiter
+    # sizes it at 11 bits a pass (a 768-byte counter and 3 passes of 2048
+    # 4-byte buckets a row, 256-byte aligned, plus 255) and rounded up to a
+    # power of two: no copy's own bytes, so the footprint holds it once.
+    from aiter.ops import topk
+
+    stream = SimpleNamespace(cuda_stream=0)
+    monkeypatch.setattr(topk, "topk_use_mulblocks", lambda *q: True)
+    monkeypatch.setattr(topk, "topk_mb_workspace_size", lambda r, *q: 25344 * r + 255)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(topk, "persistent_alloc", lambda d: contextlib.nullcontext())
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda self, op, s, i, n: {"copies": n})
+    vector = _t([rows], "activation", [1], "torch.int32")
+    leaf = _leaf(
+        "aiter._top_k_per_row_prefill.default",
+        ("logits", _t([rows, stride], "activation", [stride, 1])),
+        *[(s, vector) for s in ("rowStarts", "rowEnds")],
+        ("indices", _t([rows, 512], "activation", [512, 1], "torch.int32")),
+        *[("numRows", rows), ("stride0", stride), ("k", 512)],
+        ("workspace", _t([1], "activation", [1], "torch.uint8")),
+    )
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    placed = SimpleNamespace(block_size=256, batch=lambda view, b, s: (b, s))
+    topk._get_topk_mb_workspace_keyed.cache_clear()
+
+    [record] = ops.Stub(_Runner(), 256 << 20).point(placed, prefill(6, 2), 2048, found)
+    topk._get_topk_mb_workspace_keyed.cache_clear()
+
+    # Each call's logits, row bounds and indices: copies past twice a 256 MiB
+    # cache, and the one buffer.
+    footprint = copies * 4 * rows * (stride + 2 + 512) + buffer
+    assert (record["copies"], record["footprint_bytes"]) == (copies, footprint)
+
+
 def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
     monkeypatch,
 ):

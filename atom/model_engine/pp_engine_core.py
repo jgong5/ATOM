@@ -6,7 +6,6 @@
 
 import logging
 import queue
-import time
 from collections import deque
 
 from atom.distributed.pp_transport import PPStageTransport
@@ -19,6 +18,7 @@ from atom.model_engine.engine_core import EngineCore
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.observability import tracing
 from atom.utils import clock, envs
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
@@ -78,7 +78,7 @@ class PPEngineCoreProc(EngineCore):
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
-                now = clock.now(time.monotonic)
+                now = time.monotonic()
                 if now >= next_metrics_push:
                     next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics()
@@ -395,7 +395,7 @@ class PPEngineCoreProc(EngineCore):
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
-                now = clock.now(time.monotonic)
+                now = time.monotonic()
                 if now >= next_metrics_push:
                     next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics(scheduler_metrics=False)

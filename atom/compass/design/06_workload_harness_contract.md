@@ -109,7 +109,11 @@ Three consequences worth being explicit about:
 
 - Nothing here handles a workload where warmth *recurs* mid-run — a new shape reaching
   autotune for the first time at minute 10. Doc `09` D62 measures leading warmth; it
-  does not detect a late one. Recorded as **T54**.
+  does not detect a late one. Recorded as **T54**. Where the warmth is a JIT compile,
+  `07` D106's sweep stops it recurring on the axes the sweep covers, by compiling their
+  keys before the graded run; detection stays for the rest, the paths the sweep leaves
+  unswept among them: `08` D52 refuses a real record that names a build, and T54 remains
+  open.
 
 ---
 
@@ -425,6 +429,28 @@ p50 input is 88,768 tokens and p90 is 204,288, this is not a rounding error.
 `--preprocess-pool-width`; how the simulated run's executor composes with it is open
 (below).
 
+A prompt of `segment_tokenizer.py::_MIN_CACHED_CHARS` characters or more goes through ATOM's
+segment tokenizer instead (`SegmentTokenizer`, on by default, `ATOM_TOKENIZE_CACHE_MB`): it
+reuses the ids of segments earlier prompts encoded and encodes the rest in one
+`encode_batch` on the fast backend, not through `encode`. A simulated run charges that call
+by the same encode terms over the ids it returns, the batch at the single-call rate
+([#2558](https://github.com/jgong5/ATOM/issues/2558)); a serial encode of those segments
+takes within 10% of that on #2144's cell ([#2577](https://github.com/jgong5/ATOM/issues/2577)).
+What the real call takes beyond it is not charged: the tokenizers library's thread pool makes
+the batch slower than a serial encode, which is ATOM's to fix
+([#2617](https://github.com/jgong5/ATOM/issues/2617)); the reuse path's own work (splitting,
+hashing, copying ids) waits for host laws that time the whole call
+([#2618](https://github.com/jgong5/ATOM/issues/2618)). On a real run that work costs more per
+id than in a back-to-back replay of the same prompts: half to two thirds of the excess when the
+replay's calls come 1.5 s apart on rotating threads, as the server's pool runs them, and most
+of the rest in `tolist`, a copy of the ids to a list that ATOM has since dropped
+([#2680](https://github.com/jgong5/ATOM/issues/2680)); its cost per id grew over the run.
+The server's other threads stretch a call that runs alone only by its GIL waits, 0.02 to
+0.04 ms on #2144's cell ([#2619](https://github.com/jgong5/ATOM/issues/2619)). Calls that
+overlap wait for each other, on the library's pool and for the GIL in their own work, which
+the encode station does not model ([#2693](https://github.com/jgong5/ATOM/issues/2693)); at
+c=16 they are mostly the warmup's 13 prompts that reach the pool together.
+
 **Decode** — `IncrementalStreamDetokenizer.update` at
 `atom/entrypoints/openai/streaming_dispatch.py`:
 
@@ -557,6 +583,19 @@ arrival. The 1.6 ms the lookahead held
 before #1381 was send to response headers less encode, which counted one request's
 intake twice once `HttpChannel` charged it. A zero lookahead would not do instead: it
 puts every serving run on the deadlock-recovery path (`01`, Invariants).
+
+On #2144's V4.1-Flash c=16 cell, client start to response headers less the segment
+tokenizer call is 11.75 ms per long prompt, and a simulated run charges each part
+apart ([#2580](https://github.com/jgong5/ATOM/issues/2580)). The HTTP transport, 0.67 ms,
+is the `serving` admission delay, 0.54 ms. The loop's intake, 4.59 ms, is charged `idle_s`
+plus `per_byte_s` per body byte, 4.20 ms on these 388 KB bodies: `per_byte_s` is the 8.05 ns
+per byte that lone requests of the cell's own bodies read, where a V4-Pro first-turn burst's
+slope, 3.85, charged 2.59 ms ([#2681](https://github.com/jgong5/ATOM/issues/2681)). The
+tokenizer pool job's work outside the segment tokenizer call, 5.86 ms, is charged nothing; most of it is ATOM copying
+the prompt's ids from a list back into an array, ATOM's to fix
+([#2680](https://github.com/jgong5/ATOM/issues/2680)). The last 0.63 ms, from the engine
+send to the headers reaching the client, is not on the request's way to the engine, where
+a simulated run's span ends.
 
 ### Open issues
 
@@ -1006,7 +1045,7 @@ requires genuine fan-out in every root is not constructible without reusing sess
 | D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes on that path. Revised: three carriers, `tracestate` on the request, a `kv_transfer_params` field on the forward and SSE comment lines on the stream; still zero Atomesh changes. | 2026-09-18; revised 2026-09-28 |
 | D31 | Filler token is non-EOS, decodes to complete standalone ASCII, and is derived from the request id. | 2026-09-18 |
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
-| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. Revised: both are resource stations; encode width excludes the wait jobs resident when the run starts, pool jobs are classified by a registry and unregistered ones refused, and a clock read inside a job is its start plus accumulated service time. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. Revised: it does so only once every open encode job is placed. Revised: taking in an HTTP request charges the loop `fixed + body bytes x per_byte` from `host.http_intake`, so a burst reaches the pool one request at a time. Revised: a request that arrives once the last intake has ended is charged `idle_s` in place of `fixed`. | 2026-09-18; revised 2026-09-28, 2026-10-03, 2026-10-16 (#1103), 2026-10-20 (#1775) and 2026-10-26 (#1231) |
+| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. Revised: both are resource stations; encode width excludes the wait jobs resident when the run starts, pool jobs are classified by a registry and unregistered ones refused, and a clock read inside a job is its start plus accumulated service time. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. Revised: it does so only once every open encode job is placed. Revised: taking in an HTTP request charges the loop `fixed + body bytes x per_byte` from `host.http_intake`, so a burst reaches the pool one request at a time. Revised: a request that arrives once the last intake has ended is charged `idle_s` in place of `fixed`. Revised: the segment tokenizer's `encode_batch` of a long prompt's uncached segments is charged by the same encode terms over the ids it returns; its own work around that call is charged nothing. Revised: a serial encode of the segments takes within 10% of what those terms charge; a parallel batch's excess is ATOM's (#2617), and the call's own work waits for host laws that time it (#2618). Revised: the pool job's work outside its tokenizer calls is charged nothing; on a long prompt most of it is ATOM's copy of the ids (#2680). Revised: the server's other threads stretch a segment tokenizer call that runs alone only by its GIL waits; calls that overlap wait for each other's GIL-bound work, which the encode station does not model (#2693). | 2026-09-18; revised 2026-09-28, 2026-10-03, 2026-10-16 (#1103), 2026-10-20 (#1775), 2026-10-26 (#1231), 2026-10-31 (#2558), 2026-11-01 (#2577) and 2026-11-02 (#2580, #2619) |
 | D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. Revised: arrival rides the `compass` entry of `tracestate`, output times ride SSE comment lines, and the `/metrics` scrape is paced on simulated time. Revised 2026-10-02 (#533, #534): the scrape is a daemon deadline, and the run ends when no essential work is left. | 2026-09-18; revised 2026-09-28 and 2026-10-02 |
 | D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf`; an inline attempt does not raise to the operator, it de-registers the whole plugin and logs one `WARNING` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |

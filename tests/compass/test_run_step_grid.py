@@ -95,7 +95,7 @@ def deployment(tmp_path, **config):
     (tmp_path / "config.json").write_text(CONFIG_JSON.read_text())
     hf = PretrainedConfig.from_dict(json.loads(CONFIG_JSON.read_text())["text_config"])
     r = graphed(None)
-    r._piecewise_cg_active = lambda: False
+    r._tr_hybrid_active = lambda: False
     r.rank = 0
     r.config = SimpleNamespace(
         model=str(tmp_path),
@@ -550,6 +550,24 @@ def test_a_bundle_stating_no_value_or_another_than_the_bench_window_refuses(
         match=re.escape(f"value {value!r} in the bundle and 'bench window' here"),
     ):
         compass_run.runner(r, META_8B)
+
+
+@pytest.mark.parametrize(
+    "ep, treatments", [(True, {"uniform routing": 1}), (False, {})]
+)
+def test_a_step_a_bundle_keyed_with_expert_parallelism_prices_names_uniform_routing(
+    monkeypatch, tmp_path, ep, treatments
+):
+    """Under expert parallelism the bench drew every MoE layer's routing
+    uniformly; the bundle prices the step as without it."""
+    r = deployment(tmp_path, enable_expert_parallel=ep)
+    publish(tmp_path, r)
+    run = run_file(tmp_path, monkeypatch)
+
+    compass_run.runner(r, META_8B)
+
+    assert r.forward(decode(B37)).predicted_s == 8897.5e-6
+    assert summary(monkeypatch, run, r)["schedule"]["treatments"] == treatments
 
 
 def test_a_data_parallel_run_refuses(monkeypatch, tmp_path):

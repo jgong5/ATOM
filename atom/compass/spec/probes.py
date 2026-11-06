@@ -163,7 +163,9 @@ def tokenizer_sweep(
     """The rates of a tokenizer entry, swept through a loaded tokenizer.
 
     Each length is a prefix of `text`'s tokens, timed `repeats` times through
-    `encode` and `decode` with the fastest kept. Encode is fitted against the
+    `encode` and `decode`, after as many untimed calls, with the fastest kept:
+    the first few calls after a long one can take milliseconds whatever their
+    length. Encode is fitted against the
     token count `encode` returns, since that is what a run charges for. A fit
     whose worst relative residual exceeds `bound` is refused, naming the
     length. `clock` reads seconds, such as `time.perf_counter`.
@@ -178,6 +180,8 @@ def tokenizer_sweep(
         )
 
     def fastest(call, argument) -> float:
+        for _ in range(repeats):
+            call(argument)
         times = []
         for _ in range(repeats):
             start = clock()

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""`SegmentTokenizer` must return exactly what the plain encoder returns."""
+"""`SegmentTokenizer` must return exactly the plain encoder's ids, in the
+array a `Sequence` keeps them in."""
 
 import random
 from unittest.mock import MagicMock
@@ -19,6 +20,7 @@ from tokenizers import (
 
 from atom.model_engine import segment_tokenizer as seg_mod
 from atom.model_engine.segment_tokenizer import SegmentTokenizer
+from atom.model_engine.sequence import new_token_ids
 
 SPECIALS = ["<|begin|>", "<|User|>", "<|Assistant|>", "<|end|>", "<think>", "</think>"]
 WORDS = [
@@ -34,6 +36,13 @@ WORDS = [
     "hello,",
     "world!",
 ]
+
+
+def _plain(tokenizer, text):
+    """What the cache must return for `text`: the plain encoder's ids, as
+    `new_token_ids` holds them. An array never equals a list, so a list
+    result fails too."""
+    return new_token_ids(tokenizer.encode(text))
 
 
 def _stored(seg):
@@ -89,7 +98,7 @@ def test_matches_the_plain_encoder_turn_after_turn(tok):
     prompt = _conversation(rng, 2)
     for _ in range(10):
         prompt += "<|User|>" + _text(rng, 20) + "<|Assistant|>" + _text(rng, 8)
-        assert seg.encode(prompt) == tok.encode(prompt)
+        assert seg.encode(prompt) == _plain(tok, prompt)
     assert seg.enabled
     # Later turns re-encode only their new segments.
     reused, fresh = seg._stats[0], seg._stats[1]
@@ -101,7 +110,7 @@ def test_special_token_spelling_inside_text_still_splits(tok):
     token's spelling arriving inside message text."""
     seg = SegmentTokenizer.maybe_create(tok, 1_000_000)
     prompt = "<|begin|>tool output says <|end|> and more<|User|>hi"
-    assert seg.encode(prompt) == tok.encode(prompt)
+    assert seg.encode(prompt) == _plain(tok, prompt)
 
 
 def test_eviction_keeps_results_exact(tok):
@@ -109,18 +118,18 @@ def test_eviction_keeps_results_exact(tok):
     rng = random.Random(2)
     for _ in range(20):
         prompt = _conversation(rng, 6)
-        assert seg.encode(prompt) == tok.encode(prompt)
+        assert seg.encode(prompt) == _plain(tok, prompt)
     assert seg._lru.bytes <= 4096
 
 
 def test_a_mismatch_turns_the_cache_off(tok, monkeypatch):
     seg = SegmentTokenizer.maybe_create(tok, 1_000_000)
     prompt = _conversation(random.Random(3), 4)
-    monkeypatch.setattr(seg, "_encode_cached", lambda p: [0])
-    assert seg.encode(prompt) == tok.encode(prompt)
+    monkeypatch.setattr(seg, "_encode_cached", lambda p: new_token_ids([0]))
+    assert seg.encode(prompt) == _plain(tok, prompt)
     assert not seg.enabled
     monkeypatch.undo()
-    assert seg.encode(prompt) == tok.encode(prompt)
+    assert seg.encode(prompt) == _plain(tok, prompt)
 
 
 def test_not_created_when_off_or_not_a_fast_tokenizer(tok):
@@ -145,7 +154,7 @@ def test_short_prompts_are_encoded_whole(tok, monkeypatch):
     monkeypatch.setattr(seg_mod, "_MIN_CACHED_CHARS", 10**9)
     seg = SegmentTokenizer.maybe_create(tok, 1_000_000)
     prompt = _conversation(random.Random(5), 4)
-    assert seg.encode(prompt) == tok.encode(prompt)
+    assert seg.encode(prompt) == _plain(tok, prompt)
     assert seg._stats[3] == 0 and len(seg._lru) == 0
 
 
@@ -155,7 +164,7 @@ def test_eviction_by_another_request_mid_encode_is_harmless(tok, monkeypatch):
     seg = SegmentTokenizer.maybe_create(tok, 1_000_000)
     rng = random.Random(6)
     prompt = _conversation(rng, 6)
-    assert seg.encode(prompt) == tok.encode(prompt)
+    assert seg.encode(prompt) == _plain(tok, prompt)
     longer = prompt + "<|User|>" + _text(rng, 30)
     real = seg._split.backend.encode_batch
 
@@ -168,7 +177,7 @@ def test_eviction_by_another_request_mid_encode_is_harmless(tok, monkeypatch):
         seg._split, "backend", MagicMock(encode_batch=evict_then_encode)
     )
     seg._verified = seg_mod._VERIFY_FIRST  # unchecked, as in steady state
-    assert seg._encode_cached(longer) == tok.encode(longer)
+    assert seg._encode_cached(longer) == _plain(tok, longer)
 
 
 def _normalized_tokenizer(normalizer):
@@ -199,7 +208,7 @@ def test_normalized_added_tokens_need_an_identity_normalizer():
     tok = seg._tokenizer
     seg._verified = seg_mod._VERIFY_FIRST
     prompt = "<|User|>a\u0301 caf\u0301e" * 3
-    assert seg._encode_cached(prompt) == tok.encode(prompt)
+    assert seg._encode_cached(prompt) == _plain(tok, prompt)
 
 
 def test_segments_that_encode_to_nothing_are_not_cached(tok, monkeypatch):
@@ -256,7 +265,7 @@ def test_cross_pass_overlap_follows_the_backends_extraction_order():
     assert seg is not None
     seg._verified = seg_mod._VERIFY_FIRST  # past the window: unchecked
     prompt = "alpha x<|User|>beta" * 3
-    assert seg._encode_cached(prompt) == tok.encode(prompt)
+    assert seg._encode_cached(prompt) == _plain(tok, prompt)
 
 
 def test_offset_sensitive_pre_tokenizers_are_refused():
@@ -310,10 +319,10 @@ def test_a_result_finished_after_the_cache_turned_off_is_not_returned(tok, monke
 
     def wrong_and_meanwhile_disabled(p):
         seg.enabled = False
-        return [0]
+        return new_token_ids([0])
 
     monkeypatch.setattr(seg, "_encode_cached", wrong_and_meanwhile_disabled)
-    assert seg.encode(prompt) == tok.encode(prompt)
+    assert seg.encode(prompt) == _plain(tok, prompt)
 
 
 def test_a_check_finishing_after_the_cache_turned_off_does_not_count(tok, monkeypatch):
@@ -328,7 +337,7 @@ def test_a_check_finishing_after_the_cache_turned_off_does_not_count(tok, monkey
         return ids
 
     monkeypatch.setattr(seg, "_encode_cached", disabled_meanwhile)
-    assert seg.encode(prompt) == tok.encode(prompt)
+    assert seg.encode(prompt) == _plain(tok, prompt)
     assert seg._verified == seg_mod._VERIFY_FIRST - 1 and not seg.enabled
 
 
@@ -349,7 +358,7 @@ def test_a_later_turn_reuses_the_earlier_prompt_exactly(tok):
         # The generation prompt ends a turn; the next one replaces it, so a
         # later prompt diverges from the stored one just before its end.
         ask = prompt + "<|Assistant|>"
-        assert seg._encode_cached(ask) == tok.encode(ask)
+        assert seg._encode_cached(ask) == _plain(tok, ask)
         prompt += "<|Assistant|>" + _text(rng, 15) + "<|User|>" + _text(rng, 25)
     assert seg._stats[4] >= 5
     # One stored prefix per conversation: each turn replaced the one before.
@@ -364,7 +373,7 @@ def test_divergence_mid_prefix_reuses_up_to_the_last_shared_added_token(tok):
     seg._encode_cached(base)
     edited = base[: len(base) - 30] + "rewritten tail<|User|>" + _text(rng, 20)
     hits = seg._stats[4]
-    assert seg._encode_cached(edited) == tok.encode(edited)
+    assert seg._encode_cached(edited) == _plain(tok, edited)
     assert seg._stats[4] == hits + 1
 
 
@@ -391,7 +400,7 @@ def test_conversations_sharing_a_start_are_kept_apart_and_exact(tok):
     for _ in range(3):
         for p in (a, b):
             ask = p + "<|Assistant|>"
-            assert seg._encode_cached(ask) == tok.encode(ask)
+            assert seg._encode_cached(ask) == _plain(tok, ask)
         a += "<|Assistant|>" + _text(rng, 10) + "<|User|>" + _text(rng, 20)
         b += "<|Assistant|>" + _text(rng, 10) + "<|User|>" + _text(rng, 20)
     assert len(seg._buckets) == 1
@@ -413,7 +422,7 @@ def _covered_of_previous_turn(seg, prompts):
     missed, prev = [], {}
     for c, p in prompts:
         covered.clear()
-        assert seg._encode_cached(p) == seg._tokenizer.encode(p)
+        assert seg._encode_cached(p) == _plain(seg._tokenizer, p)
         if c in prev:
             missed.append(prev[c] - covered[0])
         prev[c] = len(p)
@@ -465,7 +474,7 @@ def test_a_fork_keeps_the_stored_prompt_it_left(tok):
     long_tail = "<|User|>" + _text(rng, 2000) + "<|Assistant|>"
     seg._encode_cached(base + long_tail)
     fork = base + "<|User|>" + _text(rng, 20) + "<|Assistant|>"
-    assert seg._encode_cached(fork) == tok.encode(fork)
+    assert seg._encode_cached(fork) == _plain(tok, fork)
     assert len(_stored(seg)) == 2
 
 
@@ -482,7 +491,7 @@ def test_a_fork_whose_unshared_text_is_one_token_is_kept(tok):
     first = base + "<|User|>" + one + "<|Assistant|>"
     seg._encode_cached(first)
     fork = base + "<|User|>" + _text(rng, 20) + "<|Assistant|>"
-    assert seg._encode_cached(fork) == tok.encode(fork)
+    assert seg._encode_cached(fork) == _plain(tok, fork)
     assert len(_stored(seg)) == 2
 
 
@@ -497,7 +506,7 @@ def test_a_divergence_with_no_new_added_token_stores_nothing(tok):
     msg = _text(rng, 40)
     seg._encode_cached(head + msg + "<|Assistant|>" + _text(rng, 30))
     edited = head + msg[:-10] + " rewritten without markers"
-    assert seg._encode_cached(edited) == tok.encode(edited)
+    assert seg._encode_cached(edited) == _plain(tok, edited)
     assert len(_stored(seg)) == 1
 
 
@@ -529,9 +538,9 @@ def test_turning_the_cache_off_releases_it(tok, monkeypatch):
     seg._encode_cached(_long_conversation(rng, 4))
     assert len(seg._lru)
     seg._verified = 0
-    monkeypatch.setattr(seg, "_encode_cached", lambda p: [0])
+    monkeypatch.setattr(seg, "_encode_cached", lambda p: new_token_ids([0]))
     p = _conversation(rng, 4)
-    assert seg.encode(p) == tok.encode(p)
+    assert seg.encode(p) == _plain(tok, p)
     assert not seg.enabled and not len(seg._lru) and seg._lru.bytes == 0
     assert not seg._buckets
 
@@ -553,7 +562,7 @@ def test_a_request_finishing_after_the_cache_turned_off_stores_nothing(tok):
 
     seg._split.backend = MagicMock(encode_batch=disabled_meanwhile)
     p = _long_conversation(random.Random(28), 4) + "<|Assistant|>"
-    assert seg._encode_cached(p) == tok.encode(p)
+    assert seg._encode_cached(p) == _plain(tok, p)
     assert not len(seg._lru) and seg._lru.bytes == 0 and not seg._buckets
 
 
@@ -605,7 +614,7 @@ def test_many_small_segments_stay_within_the_budget(tok):
         seg._verified = seg_mod._VERIFY_FIRST
         for b in range(30):
             p = "".join(f"<|User|>{b}_{i}" for i in range(1000))
-            assert seg._encode_cached(p) == tok.encode(p)
+            assert seg._encode_cached(p) == _plain(tok, p)
         return seg
 
     held, seg = _retained_by(fill)
@@ -623,7 +632,7 @@ def test_stored_prefixes_stay_within_the_budget(tok):
         rng = random.Random(15)
         for _ in range(12):
             p = _long_conversation(rng, 4) + "<|Assistant|>"
-            assert seg._encode_cached(p) == tok.encode(p)
+            assert seg._encode_cached(p) == _plain(tok, p)
             assert seg._lru.bytes <= budget
         return seg
 
@@ -646,7 +655,7 @@ def test_concurrent_turns_stay_exact(tok):
         p = common + "<|User|>" + _text(rng, 20)
         for _ in range(8):
             ask = p + "<|Assistant|>"
-            assert seg._encode_cached(ask) == tok.encode(ask), i
+            assert seg._encode_cached(ask) == _plain(tok, ask), i
             p += "<|Assistant|>" + _text(rng, 10) + "<|User|>" + _text(rng, 15)
         return i
 
@@ -667,7 +676,7 @@ def test_added_token_heavy_prefixes_stay_within_the_budget(tok):
         rng = random.Random(17)
         for _ in range(6):
             p = "<|begin|>" + _text(rng, 3000) + "<|User|>x" * 3000 + "<|Assistant|>"
-            assert seg._encode_cached(p) == tok.encode(p)
+            assert seg._encode_cached(p) == _plain(tok, p)
         return seg
 
     held, seg = _retained_by(fill)
@@ -691,8 +700,8 @@ def test_prefix_reuse_is_off_when_a_raw_token_overlaps_a_normalized_ones_end():
     seg._verified = seg_mod._VERIFY_FIRST
     rng = random.Random(18)
     p = "<|User|>" + _text(rng, 3000) + "ab"
-    assert seg._encode_cached(p) == tok.encode(p)
-    assert seg._encode_cached(p + "c") == tok.encode(p + "c")
+    assert seg._encode_cached(p) == _plain(tok, p)
+    assert seg._encode_cached(p + "c") == _plain(tok, p + "c")
 
 
 def test_a_prompt_spelling_a_whole_added_token_is_still_split():
@@ -709,7 +718,7 @@ def test_a_prompt_spelling_a_whole_added_token_is_still_split():
     assert seg is not None
     seg._verified = seg_mod._VERIFY_FIRST
     for prompt in (long_tok, "y" + long_tok, long_tok + "z"):
-        assert seg._encode_cached(prompt) == tok.encode(prompt), prompt[-20:]
+        assert seg._encode_cached(prompt) == _plain(tok, prompt), prompt[-20:]
 
 
 def test_byte_lru_charges_overhead_and_evicts_oldest():
@@ -770,7 +779,7 @@ def test_hashing_encoding_and_assembly_run_outside_the_lock(tok, monkeypatch):
     prompt = _long_conversation(rng, 6)
     for _ in range(3):
         ask = prompt + "<|Assistant|>"
-        assert seg._encode_cached(ask) == tok.encode(ask)
+        assert seg._encode_cached(ask) == _plain(tok, ask)
         prompt += "<|Assistant|>" + _text(rng, 10) + "<|User|>" + _text(rng, 20)
     assert held and not any(held)
 

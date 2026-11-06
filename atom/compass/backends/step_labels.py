@@ -14,6 +14,8 @@ A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
 rebuilds `moe_tokens` from every rank's line, and, when its host key's engine
 states `enable_tbo`, the caller's `split_rule`, ATOM's two-batch-overlap split
 over those lines, rebuilds `tbo_tokens`; with no rule such a line refuses.
+No line states its group's dummy forwards: a view's `group_dummies` counts the
+run's rank records whose line at its step is a dummy run (`group_dummies`).
 
 A decode step's device label is its device busy time, `d_busy_ns`, plus the
 device work queued since the previous forward's exit, `d_gap_ns`. A decode step
@@ -52,8 +54,12 @@ A record without device windows is refused. A step mixing prefill and decode
 rows is cut. A step of an MTP record without `d_target_ns` is cut as
 `unsplit`: its device label would hold a draft the law prices again.
 
+An output forward's view takes `start_lag_s`: its device start, placed by the
+lead, less the exit of its token copy wait (`t_recv_ns`, else `t_read_ns`,
+else its launch's end).
+
 A step's host labels are its segments: `E` from the previous forward's exit,
-cut as idle when the two batches share no request; `W_pre` to the launch, less
+cut as idle after an idle engine (`busy_gaps`); `W_pre` to the launch, less
 the staging gate's wait; `W_launch` from the launch to the token copy wait,
 the sampler's launch included, or to the launch's end on a forward with no
 such wait, and none on a prefill the host did not pace whose launch ends
@@ -72,6 +78,10 @@ the event it waits for.
 pull, else exit, over the ranks before the same forward, where the group's
 `_sync_dp_state` releases each of them.
 
+A step's `admitted` is what its `E` spent admitting requests (`admissions`):
+the scheduler allocates a request's whole prompt the first time it schedules
+it, walking its prefix-cache hit and taking a fresh block for each one past it.
+
 `write_table` writes a record's labels beside it, `dp<r>.cost.jsonl`, for
 people: a first line `{"version": TABLE_VERSION}`, then per step `step`,
 `d_busy_s`, `d_gap_s`, `launch_exposed`, `idle`, the segments, `label_s`,
@@ -83,8 +93,10 @@ from __future__ import annotations
 
 import bisect
 import hashlib
+import itertools
 import json
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -142,6 +154,8 @@ class Sample:
     or None).
     `dummies` holds the steps its rank ran as a DP dummy forward, which give no
     sample: the same set on each of the rank's samples.
+    `admitted` is `(requests, uncached, cached)` of the requests it admits
+    (`admissions`).
     """
 
     step: int
@@ -156,6 +170,31 @@ class Sample:
     propose_s: float | None = None
     dummies: frozenset = frozenset()
     draft_kv_s: float | None = None
+    admitted: tuple = (0, 0, 0)
+
+
+def admissions(lines: list[dict]) -> list[tuple[int, int, int]]:
+    """Per line, `(requests, uncached, cached)` of the requests it admits: those
+    a prefill row schedules for the first time, with their prompt tokens past
+    the prefix-cache hit and within it. A request's prompt is its last prefill
+    row's context; its hit, the context its first row starts from."""
+    rows = [list(zip(s["batch"], (r[2] for r in s["rows"]))) for s in lines]
+    prompt = {r: c for line in rows for (r, _, c), decode in line if not decode}
+    seen, out = set(), []
+    for line in rows:
+        new = [(r, q, c) for (r, q, c), decode in line if r not in seen and not decode]
+        seen.update(r for (r, _, _), _ in line)
+        hits = [c - q for _, q, c in new]
+        out.append((len(new), sum(prompt[r] for r, *_ in new) - sum(hits), sum(hits)))
+    return out
+
+
+def admit_x(admitted: tuple) -> tuple[int, int, int]:
+    """The `admit` law's features of a forward's `admitted`: 1 if it admits a
+    request, then the prompt tokens past the hits and within them, summed over
+    every request it admits."""
+    requests, uncached, cached = admitted
+    return min(requests, 1), uncached, cached
 
 
 def group_tokens(lines) -> int | None:
@@ -163,6 +202,17 @@ def group_tokens(lines) -> int | None:
     `num_tokens_across_dp` summed over every rank's line at that step, a dummy
     rank's one row. None when a rank's line is missing."""
     return None if None in lines else sum(q for s in lines for q, _, _ in s["rows"])
+
+
+def group_dummies(ranks: Iterable[list[dict]]) -> Counter:
+    """Per step, how many of `ranks`, one run's rank records as their lines,
+    ran it as a DP dummy forward; a record that lacks the step counts none."""
+    return Counter(s["step"] for lines in ranks for s in lines if s["is_dummy_run"])
+
+
+def _peers(path: Path) -> list[Path]:
+    """The rank records of `path`'s run, itself among them: those beside it."""
+    return sorted(path.parent.glob(path.name.split("dp")[0] + "dp*[0-9].jsonl"))
 
 
 def digest(record) -> str:
@@ -268,9 +318,20 @@ def join_stamps(steps: list[dict], path) -> None:
                 step[key] = ts[i]
 
 
-def _shared(step, other) -> bool:
-    """Whether two steps' batches hold a request in common."""
-    return bool({r[0] for r in step["batch"]} & {r[0] for r in other["batch"]})
+def busy_gaps(lines: list[dict]) -> list[bool]:
+    """Per line, whether the engine was busy in the gap before it, holding a
+    request an earlier line scheduled and this line or a later one schedules
+    again. A busy loop steps on at its next pull; an idle one waits there for an
+    arrival, which the gap then holds."""
+    spans: dict = {}
+    for i, s in enumerate(lines):
+        for r in s["batch"]:
+            spans[r[0]] = (spans.get(r[0], (i,))[0], i)
+    opened = [0] * (len(lines) + 1)
+    for first, last in spans.values():
+        opened[first + 1] += 1
+        opened[last + 1] -= 1
+    return [n > 0 for n in itertools.accumulate(opened[:-1])]
 
 
 def _read(record) -> list[dict]:
@@ -305,10 +366,12 @@ def label(
     """The record's samples, in step order, and its table's rows.
 
     `run` names the run in each sample's provenance, the record's `digest` by
-    default; `split_rule` rebuilds an older record's split, as above.
+    default; `split_rule` rebuilds an older record's split, as above. A
+    data-parallel record's `group_dummies` is read from the rank records
+    beside it.
     """
     lines = _read(record)
-    return _label(record, lines, run, [_pull(s) for s in lines], split_rule)
+    return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None)
 
 
 def label_run(
@@ -327,17 +390,20 @@ def label_run(
         )
     n = max(map(len, ranks), default=0)
     starts = [max(_pull(x[i]) for x in ranks if i < len(x)) for i in range(n)]
+    dummy_ranks = group_dummies(ranks)
     return [
         (
             ([], [])
             if x and all(s["is_dummy_run"] for s in x)
-            else _label(r, x, run, starts, split_rule)
+            else _label(r, x, run, starts, split_rule, dummy_ranks)
         )
         for r, x in zip(records, ranks)
     ]
 
 
-def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[dict]]:
+def _label(
+    record, lines, run, starts, split_rule, dummy_ranks
+) -> tuple[list[Sample], list[dict]]:
     """`label` of `record`'s `lines`, each `E` from `starts` at the line before."""
     path = Path(record)
     steps = [s for s in lines if not s["is_dummy_run"]]
@@ -352,6 +418,8 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             "by its device time"
         )
     (exposed, held), traced = _host_cut(lines), _traced(path)
+    timed, lead = _timed(lines)
+    placed = {s["step"]: start + lead for s, start in timed}
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
@@ -359,16 +427,18 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
     tbo = (config or {}).get("engine", {}).get("enable_tbo")
     run = run or digest(record)
     samples, table, prev, ranks = [], [], None, None
+    busy, admits = busy_gaps(lines), admissions(lines)
     for i, s in enumerate(lines):
         if s["is_dummy_run"]:
             prev = s
             continue
         dp, tokens = "moe_rows" in s, s.get("moe_tokens")
         split = s.get("tbo_tokens")
+        if dp and dummy_ranks is None:
+            dummy_ranks = group_dummies(map(read_jsonl, _peers(path)))
         if dp and tokens is None:
             if ranks is None:
-                peers = path.parent.glob(path.name.split("dp")[0] + "dp*[0-9].jsonl")
-                ranks = [{t["step"]: t for t in read_jsonl(p)} for p in sorted(peers)]
+                ranks = [{t["step"]: t for t in read_jsonl(p)} for p in _peers(path)]
             group = [r.get(s["step"]) for r in ranks]
             tokens = group_tokens(group)
             if tokens is not None and tbo:
@@ -379,6 +449,10 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
                         "rebuild it"
                     )
                 split = split_rule(group)
+        lag = None
+        if s["produces_output"]:
+            returned = s.get("t_recv_ns", s.get("t_read_ns", s["t_launch_ns"]))[1]
+            lag = (placed[s["step"]] - returned) * 1e-9
         view = BatchView(
             tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
             capture_rung=s["rung"],
@@ -387,6 +461,8 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             tbo_tokens=None if split is None else tuple(map(tuple, split)),
             moe_tokens=tokens,
             dp_rank=s["dp_rank"] if dp else None,
+            group_dummies=dummy_ranks.get(s["step"], 0) if dp else 0,
+            start_lag_s=lag,
         )
         cut = None
         if view.prefill and view.decode:
@@ -434,7 +510,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
             host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
         if copy.get(s["step"], (0, False))[1]:
             host["L_mtp"] = copy[s["step"]][0]
-        idle = prev is not None and not _shared(s, prev)
+        idle = prev is not None and not busy[i]
         if prev is not None and not idle:
             host["E"] = enter - starts[i - 1]
         host = {} if traced else {k: v * 1e-9 for k, v in host.items()}
@@ -458,6 +534,7 @@ def _label(record, lines, run, starts, split_rule) -> tuple[list[Sample], list[d
                 None if cut or propose is None else propose * 1e-9,
                 dummies,
                 None if cut or draft_kv is None else draft_kv * 1e-9,
+                admits[i],
             )
         )
         gap_ns = s.get("d_gap_ns")

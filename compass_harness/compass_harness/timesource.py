@@ -49,19 +49,21 @@ class ClockTimer:
     """A one-shot ``callback`` at clock time now + ``delay``, like ``loop.call_later``.
 
     Its clock wait is withdrawn on ``cancel``, so a dropped timer never asks
-    the clock for time. The task waiting is never cancelled.
+    the clock for time. The task waiting is never cancelled. A
+    ``phase_deadline`` asks for its time as one (`TrafficLP.wait`).
     """
 
-    def __init__(self, delay: float, callback) -> None:
+    def __init__(self, delay: float, callback, phase_deadline: bool = False) -> None:
         self._clock = clock()
         self._at = self._clock.now() + max(0.0, delay)
+        self._phase_deadline = phase_deadline
         self._wait = None
         self.cancelled = False
         asyncio.ensure_future(self._run(callback))
 
     async def _run(self, callback) -> None:
         while not self.cancelled and self._clock.now() < self._at:
-            self._wait = self._clock.wait(self._at)
+            self._wait = self._clock.wait(self._at, self._phase_deadline)
             await self._wait
         if not self.cancelled:
             callback()

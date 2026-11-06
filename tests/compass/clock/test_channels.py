@@ -9,6 +9,8 @@ the worked example of an idle process in the middle of a chain.
 """
 
 import math
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +22,7 @@ from atom.compass.clock import (
     single_engine_table,
 )
 from atom.compass.clock.channels import ADMISSION_DELAY_S, ReceiveMode
+from atom.utils.clock import LPRuntime, channel_of
 
 T, FP, EP, FD, ED = (
     LpId(n) for n in ("traffic", "frontend-P", "engine-P", "frontend-D", "engine-D")
@@ -285,6 +288,48 @@ def test_a_channel_declared_after_a_distance_was_read_is_counted():
     assert table.distance(a, c) == 0.25
 
 
+def test_a_channel_declared_after_a_lookup_is_in_the_next_one():
+    a, b, c = LpId("a"), LpId("b"), LpId("c")
+    table = _table(a, b, c)
+    table.declare("a->b:x", a, b, 1.0, "inline")
+    assert [ch.name for ch in table.channels_from(a)] == ["a->b:x"]
+    assert table.channels_into(c) == ()
+    table.declare("a->c:x", a, c, 1.0, "thread")
+    assert [ch.name for ch in table.channels_from(a)] == ["a->b:x", "a->c:x"]
+    assert [ch.name for ch in table.channels_into(c)] == ["a->c:x"]
+
+
+def _us_a_stream_lookup(others: int) -> float:
+    """`channel_of(rt, "stream")` for an LP of two channels, in a table that
+    also holds `others` channels between two other LPs: the best of three
+    passes, in microseconds a call."""
+    f, t, x, y = (LpId(n) for n in ("f", "t", "x", "y"))
+    table = _table(f, t, x, y)
+    table.declare("f->t:stream", f, t, 1.0, "inline")
+    table.declare("t->f:http", t, f, 1.0, "inline")
+    for k in range(others):
+        table.declare(f"x->y:k{k}", x, y, 1.0, "thread")
+    rt = LPRuntime(f, table, SimpleNamespace())
+    best = math.inf
+    for _ in range(3):
+        start = time.perf_counter()
+        for _ in range(200):
+            assert channel_of(rt, "stream") == "f->t:stream"
+        best = min(best, time.perf_counter() - start)
+    return best / 200 * 1e6
+
+
+def test_an_lps_lookup_costs_the_same_whatever_else_the_table_holds():
+    """A frontend looks its stream channel up for every event it streams
+    (`atom.compass.carriers.stamp_events`), so a lookup must not cost more as
+    the run's table grows."""
+    alone, among = _us_a_stream_lookup(0), _us_a_stream_lookup(2000)
+    assert among < 5 * alone + 5, (
+        f"{alone:.1f} us a lookup in a table of 2 channels, {among:.1f} us in one "
+        "of 2,002"
+    )
+
+
 def test_the_idle_process_in_the_middle_of_a_chain():
     # Frontend runs at 9.0 and feeds prefill (idle, so +inf) at 0.1; prefill
     # feeds decode at 0.5. Decode has no channel from frontend, but frontend's
@@ -380,3 +425,36 @@ def test_every_query_refuses_an_unregistered_process():
             query(b)
     with pytest.raises(KeyError, match="b is not registered; registered: a"):
         table.distance(a, b)
+
+
+OUT = 7.0e-4
+ENGINE_TABLES = {
+    "dp2": lambda **k: single_engine_table(dp=2, **k),
+    "pp2": lambda **k: single_engine_table(pp=2, **k),
+    "rapidserve": lambda **k: single_engine_table(rapidserve=True, **k),
+    "pd": lambda **k: prefill_decode_table(router_s=ROUTER, kv_write_req_s=KV, **k),
+}
+
+
+@pytest.mark.parametrize("form", sorted(ENGINE_TABLES))
+def test_an_engine_output_to_its_frontend_takes_ipc_out_s_and_other_zmq_ipc_s(form):
+    common = {"admission_path": "serving", "ipc_s": IPC, "stream_s": STREAM}
+    got = _whole(ENGINE_TABLES[form](ipc_out_s=OUT, **common))
+    outs = {n for n in got if ":output#" in n}
+    assert outs and {got[n][2] for n in outs} == {OUT}
+    assert OUT not in {c[2] for n, c in got.items() if n not in outs}
+    # Without it, the output channels keep ipc_s.
+    assert _whole(ENGINE_TABLES[form](**common)) == {
+        n: (*c[:2], IPC, c[3]) if n in outs else c for n, c in got.items()
+    }
+
+
+def test_a_run_files_ipc_out_s_reaches_the_output_channel():
+    from atom.compass import run as compass_run
+
+    run = {"admission_path": "serving", "ipc_s": IPC, "stream_s": STREAM}
+    output = "engine->frontend:output#dp0"
+    assert compass_run.channel_table(run).lookahead(output) == IPC
+    table = compass_run.channel_table(run | {"ipc_out_s": OUT})
+    assert table.lookahead(output) == OUT
+    assert table.lookahead("frontend->engine:request#dp0") == IPC
