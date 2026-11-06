@@ -1716,7 +1716,9 @@ def _replay(fn, calls, flush=None) -> list[float]:
     when any rank's refused, and nothing it left read by a later one
     (`_contained`), captured once the memory earlier leaves freed is cleared
     (`_release`). Over several ranks, a decode step's graph is captured as
-    ATOM captures one, each collective on the buffers it registered."""
+    ATOM captures one, each collective on the buffers it registered. The
+    graph registers ATOM's forced-acceptance generators (`_synthetic`) before
+    its capture, as the capture registers the default one."""
     from atom.compass.bench.ranks import cpu_group, refused_together
     from atom.utils import forward_context
 
@@ -1725,6 +1727,8 @@ def _replay(fn, calls, flush=None) -> list[float]:
         from aiter.dist.parallel_state import graph_capture
     _release()  # the capture's own release then has nothing to return
     graph = torch.cuda.CUDAGraph()
+    for generator in _synthetic():
+        graph.register_generator_state(generator)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         with (
@@ -1791,7 +1795,7 @@ def _vram_used() -> int | None:
 @contextlib.contextmanager
 def _contained(capture):
     """`capture` entered with no garbage collection, and when it fails,
-    undone what it leaves behind for later leaves: its stream current, the
+    undone what it leaves behind for later leaves: its stream current, each
     generator in capture, and the capture HIP leaves open on its stream when
     a call invalidated it. A failed capture's graph can sit in a reference
     cycle, and a graph freed during a capture synchronizes the device, which
@@ -1808,12 +1812,22 @@ def _contained(capture):
             stuck = torch.cuda.is_current_stream_capturing()
         if stuck:
             _end_capture(capture.capture_stream)
-        generator = torch.cuda.default_generators[torch.cuda.current_device()]
-        generator.graphsafe_set_state(generator.clone_state())
+        default = torch.cuda.default_generators[torch.cuda.current_device()]
+        for generator in (default, *_synthetic()):
+            generator.graphsafe_set_state(generator.clone_state())
         raise
     finally:
         if collecting:
             gc.enable()
+
+
+def _synthetic() -> list[torch.Generator]:
+    """The generators ATOM's forced acceptance draws from, one a device it has
+    drawn on (`rejection_sampler._synthetic_generator`): in the bench, the
+    leaf's, made by the leaf's eager call before its capture."""
+    from atom.model_ops.rejection_sampler import _SYNTHETIC_GENERATORS
+
+    return list(_SYNTHETIC_GENERATORS.values())
 
 
 def _end_capture(stream) -> None:
