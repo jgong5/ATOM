@@ -11,10 +11,11 @@
 Each shape names the `op_graph` `compass trace ops` published in S for the
 model and TP width ATOM's arguments resolve. A point is one leaf of that graph,
 its instances grouped (`leaves`), at the shape and `--context`: a decode
-step's rows each hold `--context` tokens, and a prefill's rows, split as the
-capture split them, follow `--context` cached tokens each, none when it is not
-given. Rows the KV pool cannot hold at once are ragged (`point_rows`), and the
-point records its rows; under `--plan` over ragged decode steps a decode point
+step's rows each hold `--context` tokens, under a drafter verifying as many
+more as it drafts, and a prefill's rows, split as the capture split them,
+follow `--context` cached tokens each, none when it is not given. Rows the KV
+pool cannot hold at once are ragged (`point_rows`), and the point records its
+rows; under `--plan` over ragged decode steps a decode point
 the pool cannot hold refuses instead, past the first round (`RAGGED`).
 
 ATOM's runner is built from ATOM's arguments on each GPU `--gpu` names, one
@@ -114,7 +115,8 @@ parallel layout, the digest of the machine spec of the device, stack and PTL
 state run.json reads, the source root and the point.
 
 `--plan` measures, in rounds, the points the steps of record directories call
-for (`record`'s or `trace steps`' output), capturing each `op_graph` S lacks:
+for (`record`'s or `trace steps`' output), capturing each `op_graph` S
+lacks on the run's first GPU as it reads (`_capture`):
 every leaf at every rung of ATOM's decode ladder at the steps' lowest and
 highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
@@ -424,7 +426,9 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         help="the device's last-level cache in MiB: 256 on MI300X, MI308X and "
-        "MI355X (AMD Infinity Cache, CDNA 3 and CDNA 4 white papers)",
+        "MI355X (AMD Infinity Cache, CDNA 3 and CDNA 4 white papers); 512 on "
+        "MI455, an upper bound confirmed cold at four times it (#2154's card "
+        "runs 7 and 8)",
     )
     add_gpu_flag(p)
     p.add_argument("--store", required=True, help="the artifact store's root")
@@ -648,7 +652,8 @@ class Stub:
 
         seat_states(getattr(self.runner, "attn_metadata_builder", None), batch)
         self.runner._gate_staging_reuse()
-        input_ids = self.runner.prepare_model(batch)[0]
+        with _uncommitted():
+            input_ids = self.runner.prepare_model(batch)[0]
         self.runner._mark_staging_h2d_enqueued()
         fc, live = get_forward_context(), {"input_ids": input_ids, **self.topk}
         if self.csa is not None:
@@ -757,7 +762,8 @@ class Stub:
         uncut = os.environ.get(RAGGED) and not all(
             exchange(o) for o, _ in found.values()
         )
-        rows = point_rows(shape, context, pool, rule.block_size, bool(uncut))
+        drafts = getattr(rule, "drafts", 0)  # a rule of no drafter states none
+        rows = point_rows(shape, context, pool, rule.block_size, bool(uncut), drafts)
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
         view = {"rows": rows, "produces_output": True}
@@ -1192,20 +1198,42 @@ def _routing(loads) -> dict:
     }
 
 
+@contextlib.contextmanager
+def _uncommitted():
+    """DeepSeek-V4.1's cache, when it is loaded, letting a batch begin over the
+    tentative state of the verify step prepared before it, which no sampler
+    here commits: that state is dropped rather than refused
+    (`PagedAttentionCache.require_committed`), its verdict being the
+    sampler's, which the bench never runs."""
+    v41 = sys.modules.get("atom.model_ops.attentions.deepseek_v41.cache")
+    if v41 is None:
+        yield
+        return
+
+    def dropped(cache):
+        cache.pending = None
+
+    with patch.object(v41.PagedAttentionCache, "require_committed", dropped):
+        yield
+
+
 def point_rows(
-    shape, context, pool: int, block_size: int, uncut: bool = False
+    shape, context, pool: int, block_size: int, uncut: bool = False, drafts: int = 0
 ) -> list[list] | None:
     """A point's rows, `[query, context, decodes]` each, longest first: a decode
-    row holds `context` tokens; a prefill row its query tokens, the capture's
-    split, past `context` cached ones. When they need more than the `pool`'s
-    KV blocks, the first keeps its context and each other shares what it
-    leaves, as the rows of a ragged step do. A ragged decode point's rows
+    row holds `context` tokens and, of a shape that names its rows alone, under
+    a drafter of `drafts` verifies as many more, as the capture's rows do; a
+    prefill row its query tokens, the capture's split, past `context` cached
+    ones. When they need more than the
+    `pool`'s KV blocks, the first keeps its context and each other shares what
+    it leaves, as the rows of a ragged step do. A ragged decode point's rows
     (`_split`) are its first row's context and, past it, rows of at least a
     token each that hold its mean; None when they need more than the pool, as
     a decode point's are when `uncut`."""
     decode = shape.phase == "decode"
     context, mean = _split(context)
     per, extra = divmod(shape.tokens, shape.seqs)
+    per += drafts if decode and shape.tokens <= shape.seqs else 0
     past = context - 1 if decode else context or 0
     rows = [
         [q, q + past, decode] for q in (per + (i < extra) for i in range(shape.seqs))
@@ -2407,7 +2435,9 @@ def _load(store, config, root, shapes, graphs: dict, arch=None, atom_args=()) ->
 
 def _capture(config, shapes, root, arch=None, atom_args=()) -> None:
     """`trace ops` of `shapes` under ATOM's arguments `atom_args` into the store
-    at `root`, in a process of its own that sees no GPU."""
+    at `root`, in a process of its own that sees no GPU, on a declared `arch`,
+    or with none on this run's first GPU as it reads (`trace ops --gpu`): its
+    stepping and compute units pick kernels as they do on the card."""
     from atom.compass import capture
     from atom.compass.capture.forward import device_arch
     from atom.model_engine.arg_utils import EngineArgs
@@ -2415,6 +2445,8 @@ def _capture(config, shapes, root, arch=None, atom_args=()) -> None:
     engine = EngineArgs.add_cli_args(FlexibleArgumentParser()).parse_args(atom_args)
     argv = ["--model", config.model, "--tp", str(engine.tensor_parallel_size)]
     argv += ["--arch", arch or device_arch()]
+    if not arch:  # the card read by its HIP ordinal, which ROCm indexes alike
+        argv += ["--gpu", os.environ.get("HIP_VISIBLE_DEVICES", "0").split(",")[0]]
     for s in shapes:
         argv += ["--prefill", str(s.tokens)] if s.phase == "prefill" else ["--width"]
         argv.append(str(s.seqs))
