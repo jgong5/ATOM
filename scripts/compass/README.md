@@ -296,8 +296,9 @@ Every ATOM process in it runs with these settings:
 | `NCCL_MIN_NCHANNELS` unset | the image's 112 faults the first RCCL all-reduce |
 
 The GPU gate on MI455 runs in a container of its own from this image, with the
-same aiter and FlyDSL and these settings, so `gpu_gate_baselines/gfx1250/` pins
-this stack; nothing for the gate is installed into the container that serves.
+same aiter and FlyDSL and these settings, `ATOM_ENGRAM_UVA` left unset, so
+`gpu_gate_baselines/gfx1250/` pins this stack; nothing for the gate is installed
+into the container that serves.
 It holds what the gate's runs import that this image lacks: LMCache at
 `f22dec28`, the commit nightly 20261026 carries, built for this image's torch
 (`BUILD_WITH_HIP=1 PYTORCH_ROCM_ARCH=gfx1250`), and the crates atomesh's cargo
