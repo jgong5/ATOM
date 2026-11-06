@@ -80,13 +80,16 @@ def prepared(built, batch):
     return metadata, positions
 
 
-def ops_placements(rule, seat, point=None, context=20, drafts=0):
+def ops_placements(rule, seat, point=None, context=20, drafts=0, v41=False):
     """The op bench's placements of a V4.1 `point` under `rule`, a two-row
     decode by default, at `context`, over `test_bench_ops`'s state-only leaf
     with 8 state slots on the runner, on a cache of `drafts` speculative
     tokens: the state slots of each placement `Stub.point` prepared, and the
     refusal that stopped them, if any. `seat` stands in for
-    `replay.seat_states`."""
+    `replay.seat_states`. With `v41`, the leaf instead takes the cache's two
+    compressor states as the bench binds them on its builder (`ops._runner`),
+    at a cache that gives it 7 copies; its record and the bytes its states
+    read a call are kept too."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -125,17 +128,29 @@ def ops_placements(rule, seat, point=None, context=20, drafts=0):
     state = _t([8, 16], "kv", stride=[64, 1])
     args = ("kv", _t([2, 4], "activation")), ("kv_state", state), ("score", state)
     leaf = _leaf("v4.states", *args, ("layer", ir.ContextRef(KEY)), key=KEY)
+    llc, read = 1000, 0
+    if v41:
+        cache = built.cache
+        runner.kv_held = ops._bound(
+            "attn_metadata_builder.cache", cache, set(), runner.device
+        )
+        fields = ("compress_kv", "compress_score")
+        states = [(f, cache.state.view(f)[-1]) for f in fields]
+        args = args[:1] + tuple((f, _t(t.shape, "kv", t.stride())) for f, t in states)
+        leaf = _leaf("v41.states", *args)
+        read = sum(2 * t[0].nbytes for _, t in states)  # two rows' slots
+        llc = 3 * (32 + read)  # 7 copies of 32 bytes of activation and the states
     found = ops.leaves(_graph(leaf, layers=1)["region"])
     real, replay.seat_states = replay.seat_states, seat
-    refused = None
+    refused, got = None, []
     try:
-        got = ops.Stub(runner, 1000).point(rule, point, context, found)
+        got = ops.Stub(runner, llc).point(rule, point, context, found)
         refused = next((r["refused"] for r in got if "refused" in r), None)
     except (ValueError, RuntimeError) as error:
         refused = str(error)
     finally:
         replay.seat_states = real
-    return {"slots": runner.batches, "refused": refused}
+    return {"slots": runner.batches, "refused": refused, "got": got, "read": read}
 
 
 def main(root: pathlib.Path) -> None:
@@ -248,6 +263,7 @@ def main(root: pathlib.Path) -> None:
         drafted, replay.seat_states, width(2), 20, DRAFTS
     )
     seen["ops_prefill"] = ops_placements(plain, replay.seat_states, prefill(32, 1), 128)
+    seen["ops_v41_state"] = ops_placements(plain, replay.seat_states, v41=True)
 
     from atom.compass.bench.runner import BenchModelRunner
     from atom.compass.parity.runner import RecordingModelRunner
