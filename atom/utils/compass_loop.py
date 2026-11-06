@@ -322,9 +322,20 @@ def charge(d: float) -> None:
 _in_encode = threading.local()
 
 
+def _price(rate, tokens: int, items: int = 1) -> float:
+    """Seconds `rate`, a kind of call's term in a ``host`` entry's
+    ``tokenizer``, charges a call of `items` items and `tokens` tokens:
+    ``fixed_s + items x item_s + tokens / tokens_per_s``, each part it lacks 0;
+    0 with no `rate`."""
+    if rate is None:
+        return 0.0
+    per_token = 1 / rate["tokens_per_s"] if "tokens_per_s" in rate else 0.0
+    return rate["fixed_s"] + items * rate.get("item_s", 0.0) + tokens * per_token
+
+
 def wrap_encode(encode, rate):
-    """`encode`, charging the current job ``fixed_s + tokens / tokens_per_s`` of
-    `rate`, a ``host`` entry's ``tokenizer.encode``."""
+    """`encode`, charging the current job `_price` of `rate`, a ``host`` entry's
+    ``tokenizer.encode``."""
 
     def charged(*args, **kwargs):
         _in_encode.on = True
@@ -332,34 +343,44 @@ def wrap_encode(encode, rate):
             ids = encode(*args, **kwargs)
         finally:
             _in_encode.on = False
-        charge(rate["fixed_s"] + len(ids) / rate["tokens_per_s"])
+        charge(_price(rate, len(ids)))
         return ids
 
     return charged
 
 
-def wrap_encode_batch(encode_batch, rate):
+def wrap_encode_batch(encode_batch, one, several):
     """A fast tokenizer backend's ``encode_batch``, charging the current job
-    ``fixed_s + tokens / tokens_per_s`` of `rate` over the ids of all the
-    encodings it returns, the batch at the single-call rate; a call made inside
-    a `wrap_encode` call is that call's to charge."""
+    `_price` over the ids of all the encodings it returns, of `one`, the
+    ``tokenizer.encode`` term, for one encoding, and of `several`, the
+    ``tokenizer.encode_batch`` term, for more; a call made inside a
+    `wrap_encode` call is that call's to charge."""
 
     def charged(*args, **kwargs):
         encodings = encode_batch(*args, **kwargs)
         if not getattr(_in_encode, "on", False):
-            tokens = sum(len(e.ids) for e in encodings)
-            charge(rate["fixed_s"] + tokens / rate["tokens_per_s"])
+            tokens, items = sum(len(e.ids) for e in encodings), len(encodings)
+            charge(_price(one if items == 1 else several, tokens, items))
         return encodings
 
     return charged
 
 
 def wrap_decode(decode, rate):
-    """`decode`, charging the current job ``fixed_s + tokens / tokens_per_s`` of
-    `rate`, a ``host`` entry's ``tokenizer.decode``."""
+    """`decode`, charging the current job `_price` of `rate`, a ``host`` entry's
+    ``tokenizer.decode``. A decode of a token count outside the term's
+    ``tokens`` is charged nothing and is a run-summary reason
+    ``tokenizer:decode ...`` naming them."""
+    lo, hi = (rate or {}).get("tokens", (0, math.inf))
 
     def charged(ids, *args, **kwargs):
-        charge(rate["fixed_s"] + len(ids) / rate["tokens_per_s"])
+        if lo <= len(ids) <= hi:
+            charge(_price(rate, len(ids)))
+        elif (rt := clock.installed()) is not None:
+            rt.refusals.append(
+                f"tokenizer:decode of {len(ids)} tokens, outside the {lo} to "
+                f"{hi} tokens its decode was fitted on"
+            )
         return decode(ids, *args, **kwargs)
 
     return charged

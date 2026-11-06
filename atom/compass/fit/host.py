@@ -10,8 +10,9 @@ each run with every trace its steps served. From the tokenizer calls and HTTP
 intake stamps the recorded server wrote beside its steps
 (`atom.compass.run.TOKENIZER_RECORD`, `INTAKE_RECORD`) it fits the entry's
 ``tokenizer`` term (`step_linear_fit.fit_tokenizer`) and ``http_intake`` term
-(`step_linear_fit.fit_intake`); a term the records cannot give is left out
-and its reason listed under the report's ``unfitted``. The host key gains the
+(`step_linear_fit.fit_intake`); a term the records cannot give, or a kind of
+tokenizer call as ``tokenizer.<kind>``, is left out and its reason listed
+under the report's ``unfitted``. The host key gains the
 configuration's `machine_spec`, which a run's spec must match; the entry is
 keyed by that host key's values and holds the run file's `host` entry as its
 params.
@@ -44,17 +45,20 @@ def host_laws(samples, records=()) -> tuple[dict, dict]:
             "fitted on real runs only"
         )
     host, report = fit_host(samples)
-    for term, name, fit in (
-        ("tokenizer", TOKENIZER_RECORD, fit_tokenizer),
-        ("http_intake", INTAKE_RECORD, fit_intake),
+    steps = [d for r in records if (d := Path(r) / "steps" / INTAKE_RECORD).is_file()]
+    calls = [d.with_name(TOKENIZER_RECORD) for d in steps]
+    for term, fit in (
+        ("tokenizer", lambda: fit_tokenizer(calls, steps)),
+        ("http_intake", lambda: fit_intake(steps)),
     ):
-        paths = [p for r in records if (p := Path(r) / "steps" / name).is_file()]
         try:
-            if not paths:
-                raise ValueError(f"no record holds steps/{name}")
-            host[term], report[term] = fit(paths)
+            if not steps:
+                raise ValueError(f"no record holds steps/{INTAKE_RECORD}")
+            host[term], report[term] = fit()
         except (ValueError, QhullError) as e:
             report["unfitted"][term] = str(e).splitlines()[0]
+    for kind, why in report.get("tokenizer", {}).pop("unfitted", {}).items():
+        report["unfitted"][f"tokenizer.{kind}"] = why.splitlines()[0]
     return host, {"provenance": publish.runs(samples), **report}
 
 

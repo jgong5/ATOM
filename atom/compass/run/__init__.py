@@ -107,12 +107,17 @@ a forward's admissions, which add to its ``E``, or null to refuse a forward
 that admits a request, and absent from an entry whose ``E`` laws hold them;
 ``skip``, segments zeroed for a what-if run, which the graders refuse;
 ``tokenizer``, the served tokenizer's ``backend`` (``fast`` or ``slow``), the
-``fingerprint`` of the ``tokenizer.json`` it was fitted on, and ``encode`` and
-``decode``, each ``fixed_s`` and ``tokens_per_s``; ``http_intake``,
+``fingerprint`` of the ``tokenizer.json`` it was fitted on, and, each
+optional, ``encode``, one-item calls, ``encode_batch``, a backend
+``encode_batch`` of several items, and ``decode``, each ``fixed_s`` and a
+positive ``tokens_per_s``, ``encode_batch`` with ``item_s`` too, and a
+``decode`` in their place ``fixed_s`` alone over ``tokens``, the ``[lo, hi]``
+token counts outside which a decode is refused and charged 0 s; ``http_intake``,
 ``fixed_s`` and ``per_byte_s``, with ``idle_s`` optional and ``bytes``, the
 ``[lo, hi]`` body bytes it was fitted over, outside which an intake is refused
 and charged 0 s; a term an entry lacks, or every term with no entry, is
-charged 0 s and the run summary names it under ``uncharged_host_terms``; a
+charged 0 s and the run summary names it, a kind of tokenizer call as
+``tokenizer.<kind>``, under ``uncharged_host_terms``; a
 list of them as ``step_linear``'s),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
@@ -305,6 +310,8 @@ PLANNED_BLOCK_WAIT_S = 300.0
 SUMMARY_SCHEMA_VERSION = 12
 #: The terms of a ``host`` entry the frontend charges, each 0 s where it is absent.
 HOST_TERMS = ("http_intake", "tokenizer")
+#: The kinds of call a ``tokenizer`` term prices, each 0 s where it is absent.
+TOKENIZER_KINDS = ("encode", "encode_batch", "decode")
 #: Compass source the host-law key leaves out, by path under the package: all
 #: of it (None), or the top-level names (def, class or assigned) only a simulated
 #: run reaches, with the comments above each and the module docstring.
@@ -448,18 +455,19 @@ def _check_host(path, host: dict) -> None:
     tok, intake = host.get("tokenizer"), host.get("http_intake")
     if tok is not None and not (
         isinstance(tok, dict)
-        and tok.keys() == {"backend", "fingerprint", "encode", "decode"}
+        and {"backend", "fingerprint"}
+        <= tok.keys()
+        <= {"backend", "fingerprint", *TOKENIZER_KINDS}
         and tok["backend"] in ("fast", "slow")
         and isinstance(tok["fingerprint"], str)
-        and all(
-            _seconds(tok[k], {"fixed_s", "tokens_per_s"}) for k in ("encode", "decode")
-        )
-        and tok["encode"]["tokens_per_s"] > 0 < tok["decode"]["tokens_per_s"]
+        and all(_rate(tok[k], k) for k in TOKENIZER_KINDS if k in tok)
     ):
         raise ValueError(
             f"{path}: host's tokenizer is {tok!r}; it takes backend, fast or slow, "
-            "fingerprint, the tokenizer.json it was fitted on, and encode and "
-            "decode, each fixed_s and a positive tokens_per_s"
+            "fingerprint, the tokenizer.json it was fitted on, and, each "
+            "optional, encode, encode_batch and decode, each fixed_s and a "
+            "positive tokens_per_s, encode_batch item_s too, a decode fixed_s "
+            "and tokens, [lo, hi], in their place"
         )
     hull = intake.get("bytes", [0, 0]) if isinstance(intake, dict) else None
     if intake is not None and not (
@@ -477,6 +485,22 @@ def _check_host(path, host: dict) -> None:
             "per_byte_s, and idle_s optional, each a non-negative number, and "
             "bytes optional, the body bytes it was fitted over, [lo, hi]"
         )
+
+
+def _rate(term, kind: str) -> bool:
+    """Whether `term` is a valid ``tokenizer`` term's `kind` (`_check_host`)."""
+    if kind == "decode" and isinstance(term, dict) and "tokens" in term:
+        hull = term["tokens"]
+        return (
+            _seconds({k: v for k, v in term.items() if k != "tokens"}, {"fixed_s"})
+            and isinstance(hull, list)
+            and _seconds(dict(enumerate(hull)), {0, 1})
+            and hull[0] <= hull[1]
+        )
+    optional = {"item_s"} if kind == "encode_batch" else set()
+    return _seconds(term, {"fixed_s", "tokens_per_s"}, optional) and (
+        term["tokens_per_s"] > 0
+    )
 
 
 def _seconds(term, required: set, optional: set = frozenset()) -> bool:
@@ -1953,13 +1977,15 @@ def tokenizer(tok, config) -> None:
             FingerprintMismatch,
             stacklevel=2,
         )
-    tok.encode = wrap_encode(tok.encode, term["encode"])
-    tok.decode = wrap_decode(tok.decode, term["decode"])
+    tok.encode = wrap_encode(tok.encode, term.get("encode"))
+    tok.decode = wrap_decode(tok.decode, term.get("decode"))
     # ATOM's segment tokenizer, which only a Rust backend gets, encodes a long
     # prompt's uncached segments with its ``encode_batch``, not ``encode``.
     rust = getattr(tok, "_tokenizer", None)
     if isinstance(rust, Tokenizer):
-        rust.encode_batch = wrap_encode_batch(rust.encode_batch, term["encode"])
+        rust.encode_batch = wrap_encode_batch(
+            rust.encode_batch, term.get("encode"), term.get("encode_batch")
+        )
 
 
 def _record_host(tok, record: Path) -> None:
@@ -2586,6 +2612,12 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     summary["configuration"] = configuration(run)
     summary["uncharged_host_terms"] = sorted(
         {t for h in entries(run, "host") or [{}] for t in HOST_TERMS if t not in h}
+        | {
+            f"tokenizer.{k}"
+            for h in entries(run, "host") or []
+            for k in TOKENIZER_KINDS
+            if k not in h.get("tokenizer", {k: None})
+        }
     )
     summary["schema_version"] = SUMMARY_SCHEMA_VERSION
     summary["source_root"] = a.source_root.as_json()

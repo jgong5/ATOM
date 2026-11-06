@@ -31,6 +31,7 @@ TERM = {
     "backend": "fast",
     "fingerprint": "sha256:" + "a" * 64,
     "encode": {"fixed_s": 3.0e-4, "tokens_per_s": 1.7e6},
+    "encode_batch": {"fixed_s": 3.0e-4, "item_s": 0.0, "tokens_per_s": 1.7e6},
     "decode": {"fixed_s": 1.5e-4, "tokens_per_s": 2.55e6},
 }
 
@@ -147,6 +148,39 @@ def test_a_tokenizer_term_a_charge_would_misread_is_refused(
         compass_run.spec()
 
 
+def test_each_kind_of_call_is_charged_its_own_term_a_flat_decode_inside_its_tokens(
+    monkeypatch, tmp_path, rt
+):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+
+    several = {"fixed_s": 1.0e-3, "item_s": 1.0e-4, "tokens_per_s": 1.0e4}
+    flat = {"fixed_s": 2.0e-5, "tokens": [1, 9]}
+    term = TERM | {"encode_batch": several, "decode": flat}
+    _run_file(monkeypatch, tmp_path, {"host": {"tokenizer": term}})
+    tok = _Tokenizer()
+    tok._tokenizer = Tokenizer(WordLevel({"a": 0}, unk_token="a"))
+    tok._tokenizer.pre_tokenizer = Whitespace()
+    compass_run.tokenizer(tok, None)
+
+    def cost(call, *args):
+        start = rt.now
+        call(*args)
+        return rt.now - start
+
+    one = cost(tok._tokenizer.encode_batch, ["a a"])
+    assert one == pytest.approx(TERM["encode"]["fixed_s"] + 2 / 1.7e6)
+    batch = cost(tok._tokenizer.encode_batch, ["a a", "a a a"])
+    assert batch == pytest.approx(1.0e-3 + 2 * 1.0e-4 + 5 / 1.0e4)
+    assert cost(tok.decode, [0] * 9) == pytest.approx(2.0e-5)
+    assert cost(tok.decode, [0] * 10) == 0.0
+    assert rt.refusals == [
+        "tokenizer:decode of 10 tokens, outside the 1 to 9 tokens its decode was "
+        + "fitted on"
+    ]
+
+
 class _LoadedFrom(_Tokenizer):
     """A fast tokenizer loaded from a model directory, as ``from_pretrained``
     records it."""
@@ -209,9 +243,13 @@ def test_a_server_charges_the_entry_fitted_under_its_engine_config(
     [
         (None, ["http_intake", "tokenizer"]),
         ({"tokenizer": TERM}, ["http_intake"]),
+        (
+            {"tokenizer": {k: v for k, v in TERM.items() if k != "encode_batch"}},
+            ["http_intake", "tokenizer.encode_batch"],
+        ),
         ({"tokenizer": TERM, "http_intake": {"fixed_s": 0.0, "per_byte_s": 0.0}}, []),
     ],
-    ids=["no-entry", "no-intake", "both"],
+    ids=["no-entry", "no-intake", "no-batch", "both"],
 )
 def test_the_summary_names_each_term_the_run_charged_nothing_for(
     monkeypatch, tmp_path, host, named
