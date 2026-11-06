@@ -56,7 +56,8 @@ rows is cut. A step of an MTP record without `d_target_ns` is cut as
 
 An output forward's view takes `start_lag_s`: its device start, placed by the
 lead, less the exit of its token copy wait (`t_recv_ns`, else `t_read_ns`,
-else its launch's end).
+else its launch's end). A trace run's states none: its host ran under the
+profiler.
 
 A step's host labels are its segments: `E` from the previous forward's exit,
 cut as idle after an idle engine (`busy_gaps`); `W_pre` to the launch, less
@@ -453,7 +454,7 @@ def _label(
                     )
                 split = split_rule(group)
         lag = None
-        if s["produces_output"]:
+        if s["produces_output"] and not traced:
             returned = s.get("t_recv_ns", s.get("t_read_ns", s["t_launch_ns"]))[1]
             lag = (placed[s["step"]] - returned) * 1e-9
         view = BatchView(
