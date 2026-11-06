@@ -81,7 +81,7 @@ def prepared(built, batch):
 
 
 def ops_placements(
-    rule, seat, point=None, context=20, drafts=0, v41=False, whole=False
+    rule, seat, point=None, context=20, drafts=0, v41=False, whole=False, page=False
 ):
     """The op bench's placements of a V4.1 `point` under `rule`, a two-row
     decode by default, at `context`, over `test_bench_ops`'s state-only leaf
@@ -92,7 +92,8 @@ def ops_placements(
     compressor states as the bench binds them on its builder (`ops._runner`),
     at a cache that gives it 7 copies; its record and the bytes its states
     read a call are kept too. With `whole`, it takes the window and score
-    fields whole, `[layers, slots, ...]`, as `aten.select.int` takes them."""
+    fields whole, `[layers, slots, ...]`, as `aten.select.int` takes them; with
+    `page` too, its page field whole, `[layers, pages, ...]`, of a capture's 4."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -140,6 +141,8 @@ def ops_placements(
         fields = ("window" if whole else "compress_kv", "compress_score")
         states = [(f, cache.state.view(f)) for f in fields]
         states = [(f, t if whole else t[-1]) for f, t in states]
+        if page:
+            states = [("main_1", cache.pages.view("main_1")[:, :4])]
         dtyped = [(f, _t(t.shape, "kv", t.stride(), str(t.dtype))) for f, t in states]
         leaf = _leaf("v41.states", *args[:1], *dtyped)
         # two rows' slots, every layer of each
@@ -271,6 +274,9 @@ def main(root: pathlib.Path) -> None:
     seen["ops_v41_state"] = ops_placements(plain, replay.seat_states, v41=True)
     seen["ops_v41_field"] = ops_placements(
         plain, replay.seat_states, v41=True, whole=True
+    )
+    seen["ops_v41_page"] = ops_placements(
+        plain, replay.seat_states, v41=True, whole=True, page=True
     )
 
     from atom.compass.bench.runner import BenchModelRunner
