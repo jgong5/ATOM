@@ -2160,14 +2160,16 @@ def _stamp_intake(out: _LineFile) -> None:
     submit = ThreadPoolExecutor.submit
 
     def submitted(self, fn, /, *args, **kwargs):
+        since = time.monotonic_ns(), 0, time.thread_time_ns()
+        job = submit(self, fn, *args, **kwargs)
+        if getattr(fn, "__name__", None) != "do_preprocess":
+            return job
         # The loop hands the API server's `do_preprocess` to its executor, and
         # wraps a returned future of its own loop's as it is.
-        if getattr(fn, "__name__", None) != "do_preprocess":
-            return submit(self, fn, *args, **kwargs)
-        job = Resumed(loop=asyncio.get_running_loop())
-        job.since = time.monotonic_ns(), 0, time.thread_time_ns()
-        asyncio.futures._chain_future(submit(self, fn, *args, **kwargs), job)
-        return job
+        resumed = Resumed(loop=asyncio.get_running_loop())
+        resumed.since = since
+        asyncio.futures._chain_future(job, resumed)
+        return resumed
 
     ThreadPoolExecutor.submit = submitted
 
