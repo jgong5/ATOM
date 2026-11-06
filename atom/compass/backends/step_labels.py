@@ -46,9 +46,9 @@ prefill's draft-KV pass, `b_draft_kv_ns`, runs before `forward_done_event`, as
 a decode's does: its device label holds it, as its draft-KV label too, and its
 draft label does not; a middle chunk's stays in its draft label. A window
 holds the device's idle between launches the host paced, so a prefill step
-without busy time is cut as `untraced`. A trace run, one whose run directory
-holds `TRACE`, ran under a profiler: its decode steps are cut as `traced` and
-its steps carry no host labels.
+without busy time is cut as `untraced`. A trace run, a record with its busy
+lines beside it or whose run directory holds `TRACE`, ran under a profiler: its
+decode steps are cut as `traced` and its steps carry no host labels.
 
 A record without device windows is refused. A step mixing prefill and decode
 rows is cut. A step of an MTP record without `d_target_ns` is cut as
@@ -352,8 +352,11 @@ def _read(record) -> list[dict]:
 
 
 def _traced(record: Path) -> bool:
-    """Whether `record` is a trace run's: its run directory holds `TRACE`."""
-    return (record.parent.parent / TRACE).is_dir()
+    """Whether `record` is a trace run's: its busy lines are beside it, so its
+    `steps` directory copied alone still says so, or its run directory holds
+    `TRACE`."""
+    busy = record.with_suffix(".busy.jsonl")
+    return busy.exists() or (record.parent.parent / TRACE).is_dir()
 
 
 def _pull(step: dict) -> int:

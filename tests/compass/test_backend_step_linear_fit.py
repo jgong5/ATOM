@@ -9,6 +9,7 @@ time (`d_busy_ns`) the known law's price. The fitted law is read by
 
 import json
 import re
+import shutil
 from types import SimpleNamespace
 
 import numpy as np
@@ -106,16 +107,6 @@ def traced(line: dict) -> dict:
         if key in line:
             busy["b" + key[1:]] = line[key]
     return {**line, **busy}
-
-
-def busy_file(record):
-    """Write `record`'s busy lines beside it, as a trace run's reducer does,
-    with `traced`'s busy time."""
-    lines = [traced(json.loads(x)) for x in record.read_text().splitlines()]
-    busy = [{k: v for k, v in x.items() if k == "step" or k[:2] == "b_"} for x in lines]
-    record.with_suffix(".busy.jsonl").write_text(
-        "".join(json.dumps(b) + "\n" for b in busy)
-    )
 
 
 def _record(path, steps, stretch=None):
@@ -519,8 +510,9 @@ def test_a_prefill_pass_is_labelled_by_a_trace_run_s_busy_time_alone(tmp_path):
     """On this MTP record a prefill step without busy lines is cut untraced,
     and the fit names the prefill vector unfitted. In a trace run, whose run
     directory holds its traces, the busy lines label each prefill pass, each
-    decode is cut as traced and no step has host labels; without its busy
-    lines it refuses."""
+    decode is cut as traced and no step has host labels, and its `steps`
+    directory copied alone labels the same; without its busy lines it
+    refuses."""
     (tmp_path / "steps").mkdir()
     record, _ = _timed_record(tmp_path / "steps" / "dp0.jsonl", _steps(14, n=40))
     lines = [json.loads(x) for x in record.read_text().splitlines()]
@@ -555,6 +547,8 @@ def test_a_prefill_pass_is_labelled_by_a_trace_run_s_busy_time_alone(tmp_path):
         t, d, p = (x * 1e-9 for x in busy[s.step])
         assert (s.cut, s.device_s, s.draft_s) == (None, t, d)
         assert s.propose_s == (p if s.view.produces_output else None)
+    shutil.copytree(record.parent, tmp_path / "copied")
+    assert label(tmp_path / "copied" / record.name)[0] == got
     record.with_suffix(".busy.jsonl").unlink()
     with pytest.raises(ValueError, match="trace run's record with no dp0.busy.jsonl"):
         label(record)
