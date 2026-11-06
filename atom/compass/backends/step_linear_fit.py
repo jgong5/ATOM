@@ -33,11 +33,15 @@ counted under `ranks` and not fitted. The law reports each step's rank label
 spread, `max / min - 1`, as its p50 and p90 under `spread`. The group's step
 is the max over its ranks, so each vector is fitted by alternating max-affine
 regression: from the fit on every rank's row, take each step's row the law
-prices highest and refit on those rows, until no step changes rank. Each
+prices highest and refit on those rows, until no step changes rank. A decode
+rung that adopts a column (below) alternates again under the vector with it,
+from its solve on those rows, each step's row at the rank that vector prices
+it as (`priced_rank`). Each
 vector reports, under `fit.all_rows`, the centre and scaled MAD of the fit on
 every rank's row, each step priced as its max over ranks, and under
-`fit.passes` the refits the alternation took, null when the picks still moved
-after `MAD_PASSES` refits. A held-out step is
+`fit.passes` the refits the alternation took (under a column, its solve on
+the base form's rows is the first), null when the picks still moved after
+`MAD_PASSES` refits. A held-out step is
 priced and banded as its costliest rank.
 
 Records with a host key (`dp0.key.json`, from the real runner) also give the
@@ -515,8 +519,8 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
     and no record (a cell) priced by a solve on the others has a p50 error
     further from zero than without the column. Every cell
     needs `ROWMOD_CELL_STEPS` steps at the rung, and a rung needs two cells.
-    The qualifying `k` of smallest MAD is adopted: returned with its column,
-    its solve and the evidence the law records.
+    The qualifying `k` of smallest MAD is adopted: returned with its solve and
+    the evidence the law records.
     """
     cell = np.array([r[0] for r in members])
     cells = sorted(set(cell.tolist()))
@@ -543,7 +547,7 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
         column = np.array([rowmod(r[5], k) for r in members], dtype=np.float64)
         design = np.column_stack([x, column])
         solved = _solve(design, y, wide)
-        if solved["mad"] < min(target, best[2]["mad"] if best else target):
+        if solved["mad"] < min(target, best[1]["mad"] if best else target):
             shuffled_mad = float(np.mean([mad(s, k) for s in shuffles]))
             held = p50(design)
             if shuffled_mad >= target and all(
@@ -556,7 +560,7 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
                         str(c): [o, w] for c, o, w in zip(cells, without, held)
                     },
                 }
-                best = (k, column, solved, evidence)
+                best = (k, solved, evidence)
         k *= 2
     return best
 
@@ -592,12 +596,16 @@ def _groups(
     steps=None,
     serial: bool = False,
     routing: tuple[int, int] | None = None,
+    dummies: list[frozenset] | None = None,
 ) -> tuple[list[dict[int, tuple]], dict, list[float]]:
     """One run's steps, each {rank: its `_features` row} labelled with the
     smallest rank label, a rank that ran the step as a dummy forward holding
     none; what was cut; and each step's rank label spread. With `steps`, only
-    the steps numbered in it; `serial` and `routing` as `_features` reads them."""
-    dummies = [rank[0].dummies for rank in run]
+    the steps numbered in it; `serial` and `routing` as `_features` reads them;
+    `dummies`, each rank's steps run as dummy forwards, read from its samples
+    when None: a rank that gave no sample needs them given."""
+    if dummies is None:
+        dummies = [rank[0].dummies for rank in run]
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
     got = [_features(rank, form, len(run), draft, serial, routing) for rank in run]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
@@ -769,8 +777,12 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     names = [*names, feature]
             chosen = _rowmod(members, counts, int(key), solved, seed, names)
             if chosen:
-                rowmod_k, _, solved, evidence = chosen
+                rowmod_k, solved, evidence = chosen
                 names = [*names, "rowmod"]
+            if key in alternation and len(names) > len(DECODE):
+                solved, alternation[key]["passes"] = _settle(
+                    members, ranks, names, rowmod_k, routing, solved
+                )
         slow = ~solved["keep"] & (solved["residual"] < 0)
         once = solved["residual"] < 1 / WARM_FACTOR - 1
         warm = np.zeros(len(members), dtype=bool)
@@ -800,7 +812,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     raise ValueError(
                         f"{int(kept.sum())} steps for {len(features)} coefficients"
                     )
-                # A column adopted after the alternation can move the costliest rank.
+                # The rank a run prices each step as: the base form's picks miss
+                # it on a tie, and picks that never settled may.
                 points = [
                     _priced_row(priced, routing, ranks[r[0], r[4]])
                     for r, keep in zip(members, kept)
@@ -1029,6 +1042,30 @@ def _counts(vector: dict, routing, counts, context, tokens, dummies) -> tuple:
     moe = [f for f in MOE_COLUMNS if f in vector["coefficients"]]
     counts = (*counts, *(moe_column(f, tokens, routing, dummies) for f in moe))
     return counts + ((rowmod(context, vector["rowmod"]),) if "rowmod" in vector else ())
+
+
+def _settle(
+    members, ranks, names, rowmod_k, routing, solved
+) -> tuple[dict, int | None]:
+    """The alternation of decode rung `members`, the rows `_slowest` picked,
+    continued under the vector over `names`, which adds the columns the rung
+    adopted, from `solved` on those rows: each step's row at the rank that
+    vector prices it as (`_priced_row`), refit, until no step's row changes.
+    The last solve and how many solves under `names` it took, None when the
+    rows still moved after `MAD_PASSES` of them."""
+    vector = {"rowmod": rowmod_k} if rowmod_k else {}
+    vector["coefficients"] = dict(zip(names, map(float, solved["coef"])))
+    rows = [_counts(vector, routing, r[2], *r[5:]) for r in members]
+    groups = [ranks[r[0], r[4]] for r in members]
+    y = np.array([r[3] for r in members])
+    passes = 1
+    while (now := [_priced_row(vector, routing, g) for g in groups]) != rows:
+        if passes == MAD_PASSES:
+            return solved, None
+        rows, passes = now, passes + 1
+        solved = _solve(np.array(rows, dtype=np.float64), y, names)
+        vector["coefficients"] = dict(zip(names, map(float, solved["coef"])))
+    return solved, passes
 
 
 def _priced_row(vector: dict, routing, group) -> tuple:

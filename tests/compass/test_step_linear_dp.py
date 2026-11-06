@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 """The step linear law under DP-attention with EP off: one law per rank, priced at
 the deployment's DP width, the group's step the max over its ranks. A rung's hull
-holds each fitted step at the rank its vector prices it as, MoE column included.
+holds each fitted step at the rank its vector prices it as, MoE column included,
+and at its rank of larger features where its ranks price alike; a rung that
+adopts a column is solved on those rows.
 The checked-in DeepSeek-V4-Pro EP8 laws install at their own side's engine config
 only, and validate a step at every decode rung they fit.
 
@@ -33,7 +35,9 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
+from atom.compass.backends.shape import sum_context
 from atom.compass.backends.step_linear import UNIFORM_ROUTING
+from atom.compass.backends.step_linear_fit import priced_rank
 
 DP = 4
 PREFILL = {
@@ -213,6 +217,73 @@ def test_a_routed_rung_hulls_each_step_at_the_rank_it_prices(tmp_path):
         if any(t.provenance.extrapolated for t in costs[1][top[1]].terms):
             outside.append(i)
     assert moved
+    assert outside == []
+
+
+@pytest.mark.parametrize(
+    "cap, passes, rel", [(20, 3, 1e-6), (3, 3, 1e-6), (2, None, 1e-3)]
+)
+def test_a_routed_rung_alternates_again_under_its_column(
+    tmp_path, monkeypatch, cap, passes, rel
+):
+    """The experts column moves some steps' costliest rank off the row the
+    alternation took on the rung's features alone, so the rung alternates
+    again under it, its passes the solves under the column. Once no step
+    moves, it is solved on the rows it prices: the per-rank law. At the cap
+    it ships its last solve, nearer that law than its first."""
+    from atom.compass.backends import step_linear_fit
+
+    monkeypatch.setattr(step_linear_fit, "MAD_PASSES", cap)
+    full = _wide_or_tall(2, routed.FULL, (110_000, 130_000))
+    sparse = _wide_or_tall(3, routed.SPARSE, (80_000, 100_000))
+    records = routed._records(tmp_path / "full", full)
+    records += routed._records(tmp_path / "sparse", sparse)
+    vector = routed._routed(records)[0]["decode"][str(routed.RUNG)]
+    assert vector["fit"]["passes"] == passes
+    assert vector["coefficients"] == pytest.approx(WIDE_OR_TALL, rel=rel)
+
+
+def _alike(seed, n=300):
+    """`n` decode steps at rung 4, each rank 1 to 4 rows of a random context,
+    each step 20 ms whatever its rows."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(n):
+        views = []
+        for _ in range(DP):
+            width = int(rng.integers(1, 5))
+            rows = [
+                RequestShape(1, int(rng.integers(1, 50_000)), True)
+                for _ in range(width)
+            ]
+            views.append(BatchView(tuple(rows), 4, DP * 4))
+        out.append((views, 0.02))
+    return out
+
+
+def test_ranks_priced_alike_hull_each_step_at_its_rank_of_larger_features(tmp_path):
+    """Every step takes 20 ms, so the rung's vector prices a step's ranks alike
+    up to rounding, and the step is priced as its costliest rank of larger
+    features (`priced_rank`), which some steps' first costliest rank is not.
+    Each step prices inside the fitted hull at that rank."""
+    runs = [_alike(seed) for seed in (0, 1)]
+    records = []
+    for i, steps in enumerate(runs):
+        (tmp_path / str(i)).mkdir()
+        records += _records(tmp_path / str(i), steps)
+    backend = StepLinearBackend(StepLinearLaw(_fit(records, dp=DP)), DP)
+    tied, outside = 0, []
+    for i, (views, _) in enumerate(runs[0] + runs[1]):
+        costs = [backend.price(v) for v in views]
+        ranks = {
+            j: (c.target_seconds, (1, sum_context(v.decode), v.graph_padding))
+            for j, (c, v) in enumerate(zip(costs, views))
+        }
+        top = priced_rank(ranks)
+        tied += top != max(ranks, key=lambda j: ranks[j][0])
+        if any(t.provenance.extrapolated for t in costs[top].terms):
+            outside.append(i)
+    assert tied
     assert outside == []
 
 

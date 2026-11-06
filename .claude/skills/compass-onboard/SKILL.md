@@ -3,7 +3,7 @@ name: compass-onboard
 description: Run scripts/compass/QUICKSTART.md with a developer new to Compass, on their own GPU, and explain each step from their own outputs. Checks the node's profile, the disk and an idle GPU before anything starts, announces each step with what it holds and asks before running it, smoke cell first and the full path after. Use when someone wants to get started with Compass, run the quickstart or the smoke cell, or learn Compass by running it.
 version: 1.0.0
 scope: jgong5/ATOM, scripts/compass/QUICKSTART.md, scripts/compass/smoke_cell.sh
-last_updated: 2026-10-20
+last_updated: 2026-11-06
 ---
 
 # compass-onboard
@@ -211,6 +211,7 @@ mean. Design topics are under `atom/compass/design/`; give the one named.
 | memory | `memory/memory_readings.json`; the log's `published ... as <token>` line; `memory/engine.log` | What an engine start reads off the device (`members`: capacity, reserves, activations, the graph pool), taken once so that a simulated run sizes ATOM's own KV pool from them with no device. Its `key` is what it was measured under; the token names it in the store. `03` D14. The engine sees only the GPU `HIP_VISIBLE_DEVICES` names and numbers it 0, so its log's `GPUs 0 to 0` and `cuda:0` are rocm-smi's GPU G. A `memory.cold/` beside it means the first start compiled (inductor autotuned a kernel or missed a graph), so its files moved to `<out>.cold` and it started again on the warmed cache. |
 | sweep | each round's `sweep<k>/sweep.json` (`points`, `missing`) and its last `sweep:` line; `run.json`'s `aiter_jit_builds` | The JIT sweep: one prefill step per token count up to the engine's budget, each step's rows designed, so the server compiles every kernel variant the later records can meet. A round sends only the points the store's library has not seen covered, and the cell is swept when none is missing; the compiled kernels stay in this container and in the library for the next container on the stack. The cost model does not model warmth, so nothing reads these records and grading refuses a record that built one (`06` D27, *Warmup is not a protocol feature*; `07` D106). A third round's `missing` is the residual to report. |
 | a record: calibration, real1, real2 | `run.json`; `steps/dp0.jsonl` and `dp0.engine.json`; `artifacts/client_run.json`; `server.log`; `preflight_*.txt`, `gpu_*.txt` | `run.json`: the tree (`source`), the stack, the device and PTL, the environment, the engine's bounds (`engine`). The step record: one line per forward step, its batch and its times (`atom/compass/parity/__init__.py` says what each field holds); show one prefill and one decode line with their durations. The client run names every request sent. The GPU checks before and after the server: a `preflight_after.txt` that leaves the just-freed GPU out of `idle and empty` while it reads `PREFLIGHT_RC=0` and `gpu_after.txt` lists no PID is normal, its VRAM still being released. `07` D38 |
+| warm | `warm/run.json`'s `aiter_jit_builds` | The smoke cell's stand-in for QUICKSTART's step 0: a record of the cell's traces, served once before calibration so that it, and not a record read later, takes the kernel builds a fresh container meets while serving; `aiter_jit_builds` names each. Grading, the fits and `validate.cost` refuse a record whose server built one, and nothing reads this one: the cost model does not model warmth (`06` D27, *Warmup is not a protocol feature*). |
 | fit_steps | `fit_steps/step_linear_law.json` | The step linear law: per vector, a step cost fitted in relative error on the calibration steps (`09` D53 to D55). `params.unfitted` must be `{}`; `report.vectors` holds the samples behind each. `report.held_out` is empty with one calibration record, which is why the smoke cell's cost rows read unvalidated. |
 | fit_host | `fit_host/host_laws.json` | The CPU time around each step, per step kind, which a simulated server charges on its clock (`09` D54, composed by `01` D4). |
 | real2 | real1's and real2's step records | Two real runs of one workload: how far apart they land is the spread every metric is judged against (`08` D45). |
@@ -266,4 +267,5 @@ body, one heading each:
   disk is full. QUICKSTART's Disk gives the sizes, the fallback and the
   container's layer.
 
-MI355X has a machine spec, `mi355x-gpu45.json`; its profile follows #1032.
+MI355X has machine specs, `scripts/compass/machines/mi355x-*.json`, and no profile:
+[#1032](https://github.com/jgong5/ATOM/issues/1032) closed without one.
