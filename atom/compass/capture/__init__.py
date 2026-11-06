@@ -3,7 +3,7 @@
 published as an `op_graph`.
 
     compass trace ops --model M [--tp N] [--width W ...] [--prefill T B ...]
-                      [--population P ...] [--arch A | --gpu I] --store S
+                      [--population P ...] [--arch A] [--gpu I] --store S
                       [-- ATOM args]
 
 A shape is a decode width (`--width`), a prefill of T tokens over B sequences
@@ -37,8 +37,9 @@ configure the engine as they would a server's; `--arch` names the declared
 device, which the entry also states as its `device` condition: a store holds a
 graph per arch of one structure and shape. `--gpu` declares card I of this host
 in its place, each property and the stepping as the card reports them
-(`driverless.card`), its arch that card's: the step still runs no kernel, but
-picks the kernels it would on that card. Its members are
+(`driverless.card`), its arch that card's, which an `--arch` beside it must
+name: the step still runs no kernel, but picks the kernels it would on that
+card. Its members are
 ``graph`` (`graph.to_json`) and ``declared``, what the capture stated in place
 of a device and the operators it left out of the graph, each with why. A TP
 group's ranks run one graph, so rank 0's is the entry's. The declarations are
@@ -79,9 +80,8 @@ def main(argv: list[str]) -> None:
         default=[],
         help="a record directory; every shape its steps hold",
     )
-    where = p.add_mutually_exclusive_group()
-    where.add_argument("--arch", default="gfx942", help="the declared device's arch")
-    where.add_argument("--gpu", type=int, help="declare this card as it reads")
+    p.add_argument("--arch", help="the declared device's arch, gfx942 by default")
+    p.add_argument("--gpu", type=int, help="declare this card as it reads")
     p.add_argument("--store", required=True, help="the artifact store")
     args = p.parse_args(argv[:split])
 
@@ -91,7 +91,9 @@ def main(argv: list[str]) -> None:
     from .forward import capture, decode, prefill
 
     read = None if args.gpu is None else driverless.card(args.gpu)
-    arch = read["arch"] if read else args.arch
+    if read and args.arch not in (None, read["arch"]):
+        raise ValueError(f"card {args.gpu} reads as {read['arch']}, not {args.arch}")
+    arch = read["arch"] if read else args.arch or "gfx942"
 
     store = a.ArtifactStore(args.store)
     shapes = [decode(w) for w in args.width] + [prefill(*s) for s in args.prefill]

@@ -881,19 +881,17 @@ def _hand_ins(run: dict) -> list[str]:
 class _RecordingAuthority(ClockAuthority):
     """The authority, recording the step table: a row per reply and a row per
     message each reply releases, from the receiver's clock before that grant to
-    the message's arrival; and the wall seconds of the run, from its start
-    to the end of each client run in `ends` and to the finish, which sets `done`.
-    A co-hosting frontend starts the run as it starts its own; otherwise it
-    starts once every server LP, and every member of one declared with members,
-    has asked once. Each client run that ends before the last has its summary
-    written once every server LP has handed in. A frontend's TAR to ``+inf``
-    before the finish is a stop: it registers that frontend's send log,
-    finishes the run there and sets `stopped`. Every LP but the client is
-    granted ``+inf``, and the client too while a client run is open, from its
-    bind to its end; outside one it holds no connection. Each such grant
-    releases every message registered for its receiver. A stop with none open,
-    on a server whose ``client_runs`` is ``null``, sets `stopped_whole`: the
-    run ended as its run file says, as at the finish."""
+    the message's arrival; and the wall time of each client run, from its
+    client's first request in `starts` to its end in `ends`, which `wall`
+    sums; the finish sets `finished` and `done`. Each client run that ends
+    before the last has its summary written once every server LP has handed
+    in. A frontend's TAR to ``+inf`` before the finish is a stop: it registers
+    that frontend's send log, finishes the run there and sets `stopped`. Every
+    LP but the client is granted ``+inf``, and the client too while a client
+    run is open, from its bind to its end; outside one it holds no connection.
+    Each such grant releases every message registered for its receiver. A stop
+    with none open, on a server whose ``client_runs`` is ``null``, sets
+    `stopped_whole`: the run ended as its run file says, as at the finish."""
 
     def __init__(self, run: dict) -> None:
         # The tree that runs, read before the run so an unidentifiable one is
@@ -903,11 +901,10 @@ class _RecordingAuthority(ClockAuthority):
         )
         self.steps = StepTable(json.dumps(configuration(run), sort_keys=True))
         self.run = run
-        self.started = self.finished = None
-        self.ends = []  # the wall time each client run ended
+        self.finished = None
+        self.starts, self.ends = [], []
         self.stopped = self.stopped_whole = self.client_run_open = False
         self.done = threading.Event()
-        self._joining = set(_hand_ins(run))
         self._clock_before = {}  # LP -> its clock before its latest grant
         self._held_clock = {}  # (channel, seq) held for a parked member -> the same
         # A rerun into the same out_dir starts from none of the last run's files.
@@ -949,9 +946,9 @@ class _RecordingAuthority(ClockAuthority):
         return super().on_bind(lp)
 
     def on_request(self, lp, kind, t, log, t_daemon=math.inf, member=None) -> list:
-        self._joining.discard(f"{lp.name}.{member}" if member else lp.name)
-        if not self._joining and self.started is None:
-            self.started = time.monotonic()
+        first = lp == TRAFFIC and len(self.starts) == len(self.ends)
+        if first and self.final_clocks is None:  # none opens after the finish
+            self.starts.append(time.monotonic())
         stop = kind == TAR and t == math.inf and lp.name.startswith(FRONTEND.name)
         if stop and self.final_clocks is None:
             for ch, seq, arrival in log:
@@ -991,6 +988,16 @@ class _RecordingAuthority(ClockAuthority):
             self.finished = time.monotonic()
             self.done.set()
         return replies
+
+    def wall(self, k: int | None = None) -> float:
+        """The wall seconds client runs 0 to `k` served, all of them with `k`
+        None, each from its client's first request to its end: for one still
+        open, the finish a stop brought or, before the finish, now."""
+        if k is None:
+            ends = [*self.ends, self.finished or time.monotonic()]
+        else:
+            ends = self.ends[: k + 1]
+        return sum(end - start for start, end in zip(self.starts, ends))
 
     def _release_all(self, into: dict) -> dict:
         """Every message registered on the channels of `into` and not yet
@@ -1044,11 +1051,9 @@ def _runtime(
 
 
 @contextlib.contextmanager
-def _start_on_leaving(rt: clock.LPRuntime, authority=None):
+def _start_on_leaving(rt: clock.LPRuntime):
     yield
     rt.start_run()
-    if authority is not None:
-        authority.started = time.monotonic()
 
 
 def frontend(config):
@@ -1160,7 +1165,7 @@ def frontend(config):
     # A co-hosting frontend reaches the authority in-process, with no socket.
     rt = _runtime(lp, run, cls=_StoppingClock, here=authority is not None)
     rt.client_run_ended = lambda k: _frontend_hand_in(run, rt, k)
-    return _start_on_leaving(rt, authority)
+    return _start_on_leaving(rt)
 
 
 def _refuse_unshared(run: dict, standalone: bool) -> None:
@@ -2260,8 +2265,7 @@ def _write_summary(run: dict, a: _RecordingAuthority, ended: bool = False) -> No
     out = Path(run["out_dir"])
     _write_whole(out / STEP_TABLE_FILE, a.steps.text())
     hand_ins = _read_hand_ins(run, out, not ended)
-    end = a.finished or time.monotonic()
-    summary = _summary(run, a, a, end - (a.started or end), hand_ins, {})
+    summary = _summary(run, a, a, a.wall(), hand_ins, {})
     _write_whole(out / SUMMARY_FILE, json.dumps(summary, sort_keys=True, indent=1))
     if not ended and a.ended and not a.stopped:
         _write_client_run(run, a, len(a.ended) - 1, hand_ins)
@@ -2276,7 +2280,7 @@ def _write_client_run(run: dict, a: _RecordingAuthority, k: int, hand_ins=None):
         hand_ins = _read_hand_ins(run, here, True)
     since = _read_hand_ins(run, out / CLIENT_DIR.format(k - 1), False) if k else {}
     record = a.ended[k]
-    summary = _summary(run, a, record, a.ends[k] - a.started, hand_ins, since)
+    summary = _summary(run, a, record, a.wall(k), hand_ins, since)
     summary["client_run"] = {"index": k, "start": record.start, "end": record.end}
     here.mkdir(exist_ok=True)
     _write_whole(here / SUMMARY_FILE, json.dumps(summary, sort_keys=True, indent=1))

@@ -69,7 +69,8 @@ def probed(model_dir, tmp_path_factory):  # noqa: F811
     }
     root = tmp_path_factory.mktemp("v41_state")
     plain = v41_rule(model_dir, None)
-    (root / "batches.pkl").write_bytes(pickle.dumps(batches | {"rule": plain}))
+    pickled = batches | {"rule": plain, "drafted": rule}
+    (root / "batches.pkl").write_bytes(pickle.dumps(pickled))
     done = subprocess.run(
         [sys.executable, str(PROBE), str(root)],
         capture_output=True,
@@ -179,3 +180,16 @@ def test_a_dummy_batch_and_a_cache_that_keeps_no_position_are_left_alone(probed)
 def _first_id(probed):
     batches, _ = probed
     return batches["decode"].req_ids[0]
+
+
+@pytest.mark.parametrize("point", ["ops_verify", "ops_prefill"])
+def test_every_op_bench_placement_of_a_verify_or_cached_prefill_point_prepares(
+    probed, point
+):
+    """`Stub.point`'s placements of DSpark5's tentative verify rows, each
+    beginning over the last one's uncommitted state, and of a chunk past a
+    cached prefix, through V4.1's own builder: every one prepares."""
+    _, seen = probed
+    placed = seen[point]
+    assert placed["refused"] is None
+    assert len(placed["slots"]) > 1

@@ -159,7 +159,7 @@ def run_file(tmp_path, monkeypatch, **keys):
 def summary(monkeypatch, run, r):
     """The engine's and the frontend's hand-ins after the finish, and the summary."""
     authority = compass_run._RecordingAuthority(run)
-    authority.started = authority.finished = time.monotonic()
+    authority.finished = time.monotonic()
     table = compass_run.channel_table(run)
     engine = LPRuntime(compass_run.ENGINE, table, None)
     engine.now = math.inf

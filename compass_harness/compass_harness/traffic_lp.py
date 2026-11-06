@@ -11,8 +11,11 @@ every stream event the Clock Authority released has been reported by a worker,
 every credit whose final event is released has had its return passed to
 aiperf (a return that comes before its final event's release waits for it, so
 the next turn is scheduled from the final arrival either way), no return is
-still inside aiperf's callback, and every task on the loop is waiting on
-something. It asks for time only while a request is open, a clock wait (a
+still inside aiperf's callback, every task on the loop is waiting on
+something, and the done callbacks of a task that ended have run: the
+scheduler's drain observer, which rechecks the system idle cap once a timer's
+task ends, is one, and the clock moving on before it would let an idle gap run
+past the cap. It asks for time only while a request is open, a clock wait (a
 pacing timer, a phase deadline, the idle watchdog) is pending or the run is
 finishing; between phases aiperf works on the wall clock and the simulation
 waits for it. While a request is open it asks for a phase deadline as a
@@ -282,6 +285,7 @@ class TrafficLP:
             fut.set_result(None)
         self._waiters.clear()
         spins = 0
+        alive = None  # the tasks not done at the last look; None before the first
         while True:
             # A reader that raised fails the run instead of leaving the hold waiting.
             for task in self._tasks:
@@ -334,8 +338,8 @@ class TrafficLP:
                         DIAG_S,
                     )
                 continue
-            ready = _ready_tasks()
-            if not ready:
+            ready, alive, ended = _look(alive)
+            if not ready and not ended:
                 if not self._caught_up:
                     return
                 for fut in self._caught_up:
@@ -360,14 +364,22 @@ class TrafficLP:
             )
 
 
-def _ready_tasks() -> list[str]:
-    """The tasks on this loop, but the current one, not waiting on a pending future."""
+def _look(alive: set | None) -> tuple[list[str], set, bool]:
+    """One look at this loop's tasks, but the current one.
+
+    Returns the names of those not waiting on a pending future, those not done,
+    and whether one of ``alive``, the tasks not done at the last look, has ended
+    since. A task that ends queues its done callbacks behind the current task,
+    so they run only on the loop's next turn; at the first look (``alive``
+    None) whether one has ended is unknown, and it reads as one.
+    """
     me = asyncio.current_task()
+    tasks = {task for task in asyncio.all_tasks() if task is not me and not task.done()}
     # ponytail: Task._fut_waiter is private; a loop-level idle hook would not be.
-    return [
+    ready = [
         task.get_name()
-        for task in asyncio.all_tasks()
-        if task is not me
-        and not task.done()
-        and (task._fut_waiter is None or task._fut_waiter.done())
+        for task in tasks
+        if task._fut_waiter is None or task._fut_waiter.done()
     ]
+    ended = alive is None or any(task.done() for task in alive)
+    return ready, tasks, ended

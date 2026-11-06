@@ -248,6 +248,47 @@ def test_an_idle_gap_over_the_cap_replays_as_the_cap_on_the_clock(
     assert strategy._system_idle_seconds_skipped == 100.0 - CAP
 
 
+def test_a_turn_held_at_the_cap_lets_the_turn_it_waits_for_start_at_the_cap(
+    tmp_path, monkeypatch
+):
+    """A parent's next turn due 100 s after the last return waits on a child's
+    turn 0 due 185 s after it, with the system idle cap at 10 s.
+
+    The return pulls the next turn in to the cap. At the cap the watchdog finds
+    it due, and it ends at once without a request, as aiperf's replay barrier
+    holds a turn whose recorded predecessor has not run. Its task's end is what
+    rechecks the idle cap (the scheduler's drain observer), and the child's turn
+    starts at the cap, as on the real client, not at its own uncapped time.
+    """
+
+    async def main():
+        traffic = await _traffic(tmp_path, monkeypatch)
+        runner = _runner(system_cap=CAP)
+        strategy = runner._build_strategy()
+        scheduler = runner._scheduler
+        # What setup_phase registers for a run with the system idle cap.
+        scheduler.set_drain_observer(strategy.enforce_system_idle_cap)
+        started = asyncio.get_running_loop().create_future()
+
+        async def held_by_the_barrier():
+            pass
+
+        async def child_turn_0():
+            started.set_result(traffic.now())
+
+        scheduler.schedule_later(100.0, held_by_the_barrier())
+        scheduler.schedule_later(185.0, child_turn_0())
+        strategy._progress = SimpleNamespace(in_flight=0)
+        strategy.enforce_system_idle_cap(0)  # the return
+        at = await started
+        traffic.done.cancel()
+        return at, strategy
+
+    at, strategy = asyncio.run(main())
+    assert at == CAP
+    assert strategy._system_idle_seconds_skipped == 185.0 - CAP
+
+
 def _one_credit_unreturned(runner) -> None:
     """One credit sent and never returned, so the grace wait times out and
     aiperf cancels it."""
