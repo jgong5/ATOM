@@ -45,7 +45,7 @@ its header.
 | `gpu_gate_triggers.txt` | — | The source paths that no *running* CPU-gate test names. Generated, not hand-written; matched by `gate_cpu.sh`. A trailing `/` matches a subtree. |
 | `gpu_gate_baselines/<target>/gpu_gate_baseline.env` | — | The GPU gate's baseline for one GPU target (`gfx942`, `gfx950`, `gfx1250`), as the `BASE_*` lines `gate_gpu.sh` reads when torch names that target for the first card: the commit measured, its pass and fail counts, how many tests `gpu_gate_skip.txt` left out of the run (`BASE_LEFT_OUT`), and the torch, HIP and AITER versions it ran under. A target with no pair is refused with 93, naming it. Written by `regen_gpu_gate_baseline.sh`; a change is a reviewed edit. |
 | `gpu_gate_baselines/<target>/gpu_gate_known_failures.txt` | — | The known-failing GPU node-ids at the `BASE_COMMIT` of the `gpu_gate_baseline.env` beside it, verbatim, written by `regen_gpu_gate_baseline.sh`. Its line count and `BASE_FAILED` are two statements of one fact; `gate_gpu.sh` refuses to run if they disagree. |
-| `gpu_gate_skip.txt` | — | Hand-written `<GPU> <test file>` lines: a file that stalls on that GPU, or passes and fails at random there, which `gate_gpu.sh` leaves out when torch's name for the first card contains `<GPU>`, taking the file's collected tests off the expected passes; `regen_gpu_gate_baseline.sh` leaves it out the same way and records the count as `BASE_LEFT_OUT`, which goes back on. Each line goes when the issue named above it closes. |
+| `gpu_gate_skip.txt` | — | Hand-written `<GPU> <test file>` lines: a file that stalls on that GPU, passes and fails at random there, or needs an input that GPU's nodes do not hold, which `gate_gpu.sh` leaves out when torch's name for the first card contains `<GPU>` or `<GPU>` is its target, taking the file's collected tests off the expected passes (a `tests/compass` file comes off nothing: the expectation counts what `tests/compass` passes); `regen_gpu_gate_baseline.sh` leaves it out the same way and records the count as `BASE_LEFT_OUT`, which goes back on. Each line goes when the issue named above it closes. |
 | `_lib.sh` | — | Tree resolution, `PYTHONPATH`, the `import atom` assertion, commit stamp, and the pytest summary parse `gate_gpu.sh` and `regen_gpu_gate_baseline.sh` count with. |
 
 ## Gate a tree with its own `scripts/compass/` — four `test_snapshot_ref.py` failures mean you overlaid
@@ -295,9 +295,16 @@ Every ATOM process in it runs with these settings:
 | `ATOM_ENGRAM_UVA=1` with `ATOM_ENGRAM_UVA_HBM=1` | `ATOM_ENGRAM_UVA=1` alone page-locks 189 GiB of Engram tables, more than the node's host memory; `ATOM_ENGRAM_UVA=0` gathers each forward's Engram rows on the host, 5 to 50 ms on 28% of one-sequence decode steps ([#2797](https://github.com/jgong5/ATOM/issues/2797)) |
 | `NCCL_MIN_NCHANNELS` unset | the image's 112 faults the first RCCL all-reduce |
 
-The GPU gate on MI455 runs here too, with these settings: `gpu_gate_baselines/gfx1250/`
-is measured in this container, so a gate in another image or with another aiter
-reads a toolchain warning.
+The GPU gate on MI455 runs in a container of its own from this image, with the
+same aiter and FlyDSL and these settings, so `gpu_gate_baselines/gfx1250/` pins
+this stack; nothing for the gate is installed into the container that serves.
+It holds what the gate's runs import that this image lacks: LMCache at
+`f22dec28`, the commit nightly 20261026 carries, built for this image's torch
+(`BUILD_WITH_HIP=1 PYTORCH_ROCM_ARCH=gfx1250`), and the crates atomesh's cargo
+tests build from. MI455 nodes run only models verified on them, so on gfx1250
+`gpu_gate_skip.txt` leaves out every `tests/compass` file whose tests need
+another model, and the gate there needs no driver-run input (below) and one
+card.
 
 DeepSeek-V4.1-Flash then serves at TP4 with
 [its recipe's](../../recipes/DeepSeek-V4.1-Flash.md#gfx1250-mi455x) gfx1250
@@ -598,10 +605,10 @@ xfails is accounted for, with one exception below. A file `gpu_gate_skip.txt` le
 The driver-run tests start ATOM's own servers on the simulated clock (the
 vertical slice and every scenario test built on it). Each skips without its
 inputs, and a skip is not a failure, so a gate that does not set them passes
-without running them. On a tree whose `tests/compass/` reads
-`ATOM_COMPASS_SLICE_MODEL`, `gate_gpu.sh` sets each input, keeps one the caller
-set, and refuses with **92**, naming every one that is missing, before any test
-runs:
+without running them. Where a `tests/compass/` file the card runs, the gate's
+own tests aside, reads `ATOM_COMPASS_SLICE_MODEL`, `gate_gpu.sh` sets each
+input, keeps one the caller set, and refuses with **92**, naming every one that
+is missing, before any test runs:
 
 | input | default |
 |---|---|

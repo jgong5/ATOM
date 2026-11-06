@@ -188,14 +188,26 @@ if [ "$TORCH" != "$BASE_TORCH" ] || [ "$ROCM" != "$BASE_ROCM" ] || [ "$AITER" !=
     printf '         re-measured on this stack with regen_gpu_gate_baseline.sh.\n' >&2
 fi
 
+GPUS=$HIP_VISIBLE_DEVICES
+# A file that stalls on one GPU keeps the suite from ever printing a summary,
+# and one that passes and fails at random there cannot be named in a baseline.
+# gpu_gate_skip.txt names such files per GPU, and files whose tests need an
+# input that GPU's nodes do not hold; on a matching first card each is left out
+# of its run, and the suite's collected tests come off the expectation.
+DEVICE=$(HIP_VISIBLE_DEVICES=${GPUS%%,*} python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null)
+printf 'device: %s\n' "${DEVICE:-UNKNOWN}"
+compass_gpu_skips "$DEVICE" "$ARCH" || finish 1 "$SKIP_WHY"
+
 # The driver-run tests start ATOM's own servers on the simulated clock. Each
 # skips without its inputs, and a skip is not a failure, so a gate that does not
-# set them passes without running them. On a tree whose tests read the slice
-# model, every input is set here, by default to node 18's, and a missing one
-# refuses the run by name.
-GPUS=$HIP_VISIBLE_DEVICES
+# set them passes without running them. Where a tests/compass file run here
+# reads the slice model, every input is set here, by default to node 18's, and
+# a missing one refuses the run by name. The gate's own tests name the inputs
+# and read none.
 SMOKE=
-if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
+READERS=$(grep -lrs --include='*.py' --exclude='test_gate_gpu_*' ATOM_COMPASS_SLICE_MODEL tests/compass |
+    grep -vxF -f <(printf '%s\n' "${COMPASS_LEFT[@]}"))
+if [ -n "$READERS" ]; then
     hf_snapshot() { ls -d "${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--$1/snapshots/"*/ 2>/dev/null | head -1; }
     export ATOM_COMPASS_SLICE_MODEL=${ATOM_COMPASS_SLICE_MODEL:-$(hf_snapshot Qwen3-0.6B)}
     export ATOM_COMPASS_IMAGE_MODEL=${ATOM_COMPASS_IMAGE_MODEL:-$(hf_snapshot Qwen3.5-9B)}
@@ -206,6 +218,7 @@ if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
     # The cc-traces smoke replays turns longer than the slice model's context, so
     # it runs alone, with this model as its slice model.
     SMOKE=tests/compass/test_cctraces_sim_smoke.py
+    [[ " ${COMPASS_LEFT[*]} " != *" $SMOKE "* ]] || SMOKE=
     export ATOM_COMPASS_CCTRACES_MODEL=${ATOM_COMPASS_CCTRACES_MODEL:-$(hf_snapshot Qwen3.8-27B)}
     export ATOM_COMPASS_CCTRACES=${ATOM_COMPASS_CCTRACES:-/root/cells/cc-traces-256k/traces.jsonl}
     # agentx-harness with compass-harness installed, and without it.
@@ -267,22 +280,15 @@ compass_tests() {
     COMPASS_N=$((COMPASS_N + PASSED)) C_FAILED=$((C_FAILED + FAILED)) C_ERRORS=$((C_ERRORS + ERRORS))
 }
 if [ -f "$SMOKE" ]; then
-    compass_tests tests/compass --ignore="$SMOKE"
+    compass_tests tests/compass --ignore="$SMOKE" "${COMPASS_LEFT[@]/#/--ignore=}"
     # The tree's compass-harness ahead of the one the harness Python has installed.
     PYTHONPATH=$ROOT/compass_harness:$PYTHONPATH ATOM_COMPASS_SLICE_MODEL=$ATOM_COMPASS_CCTRACES_MODEL \
         compass_tests "$SMOKE"
 elif [ -d "$ROOT/tests/compass" ]; then
-    compass_tests tests/compass
+    compass_tests tests/compass "${COMPASS_LEFT[@]/#/--ignore=}"
 else
     printf 'tests/compass: absent on this tree, so it contributes no tests.\n'
 fi
-# A file that stalls on one GPU keeps the suite from ever printing a summary,
-# and one that passes and fails at random there cannot be named in a baseline.
-# gpu_gate_skip.txt names such files per GPU; on a matching first card each is
-# left out of the suite and its collected tests come off the expectation.
-DEVICE=$(HIP_VISIBLE_DEVICES=${GPUS%%,*} python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null)
-printf 'device: %s\n' "${DEVICE:-UNKNOWN}"
-compass_gpu_skips "$DEVICE" || finish 1 "$SKIP_WHY"
 LEFT_OUT=$((SKIP_N - ${BASE_LEFT_OUT:-0}))
 EXPECT_PASSED=$((BASE_PASSED + COMPASS_N - BASE_COMPASS_TESTS - LEFT_OUT))
 printf 'expected: %s passed = %s baseline + (%s - %s) tests/compass - (%s - %s) left out here and there\n' \
