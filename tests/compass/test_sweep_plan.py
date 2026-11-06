@@ -7,6 +7,7 @@ import json
 import pytest
 
 from atom.compass.drive.sweep_plan import Point, covered, plan
+from atom.compass.validate.bound import _split
 
 SAMPLING = {"ignore_eos": True, "temperature": 0}
 #: The server's ATOM_TBO_PREFILL_MIN_TOKENS.
@@ -241,3 +242,28 @@ def test_a_line_covers_a_by_its_tokens_unsplit_and_b_by_its_rows_and_split():
     swapped = line | {"rows": [[5, 5, False], [3, 3, False]]}
     dummy = line | {"is_dummy_run": True}
     assert covered([a, b, split], {0: [swapped, dummy]}) == ([a], [b, split])
+
+
+def test_split_steps_cut_each_other_ranks_row_from_256_at_every_residue(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "1024")
+    engine = _engine(enable_tbo=True, max_num_batched_tokens=4096, data_parallel_size=4)
+    steps = {}
+    for p in plan(_write(tmp_path, *[engine] * 4), _workload(3000)):
+        if p.split and p.cached == ("",):
+            steps.setdefault(p.step, []).append(p)
+    lines = [
+        [{"rows": [(q, c, False) for q, c in p.rows]} for p in s]
+        for s in steps.values()
+    ]
+    # Every step is full and splits by its first rank alone, past the minimum;
+    # the others' rows are cut into halves of 256 to 511 tokens, the second
+    # starting at every residue mod 16.
+    halves = [_split(step) for step in lines]
+    assert len(lines) == 6 and None not in halves
+    tokens = [[_tokens(p) >= 1024 for p in s] for s in steps.values()]
+    assert tokens == [[True, False, False, False]] * 6
+    cuts = [(first[r], second[r]) for first, second in halves for r in (1, 2, 3)]
+    assert {a % 16 for a, _ in cuts} == set(range(16))
+    assert all(256 <= a <= b <= 511 for a, b in cuts)

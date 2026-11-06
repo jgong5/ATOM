@@ -1217,7 +1217,12 @@ serves all of them, and a per-rank walk compiles nothing more.
     first row past the minimum, so the cut falls inside it at every offset mod 16 and the
     second micro-batch starts on the first sequence's state slot: an aligned slot with
     unaligned positions is the specialization #2650's served records built. Every rank's
-    first row then costs about the same, which admits each second row (above);
+    first row then costs about the same, which admits each second row (above). A third
+    set of split steps gives one rank a row past the minimum and every other rank one
+    row of 512 tokens and on, cut into halves of 256 and on, the second at every offset
+    mod 16: a micro-batch of 256 to 511 tokens at an offset off 16 is the
+    `_csa_translate_pack_kernel` specialization a TBO split built in #2650's served
+    records, which no other point gives;
 
   plus chunked rows, for the keys a context or KV length selects, over the full product
   of:

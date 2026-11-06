@@ -20,7 +20,9 @@ roots: each point is planned once, on the rank its place in the walk names.
   offset in the batch takes every residue mod 16, by every count of parked
   decodes; under two-batch overlap again, each step's first point past
   `ATOM_TBO_PREFILL_MIN_TOKENS` so the step splits, and again with the rows
-  swapped and every first row past the minimum, so the split falls inside it.
+  swapped and every first row past the minimum, so the split falls inside it;
+  and split steps whose other ranks each run one row cut into halves of
+  `HALF` tokens and on, the second starting at every residue mod 16.
   Then one row of 1, 2, 4 and so on tokens up to the budget, each with the 15
   sizes past it, on a context already computed: its own prompt's earlier
   chunks, from the scheduler's chunk alignment doubling below the budget,
@@ -62,6 +64,9 @@ OUTPUT_TOKENS = 2
 #: the rows' arrival and the PrefillDelayer's stall take, so it outlasts the
 #: step's fire, and few enough that waiting for its end costs little.
 PARKED_TOKENS = 128
+#: The fewest tokens of a micro-batch in 256 to 511, a launch size
+#: `csa_translate_pack` takes a block size of its own for.
+HALF = 256
 #: The engine fields `plan` reads; `speculative` and
 #: `prefill_context_parallel_size` too, where a rank states them.
 ENGINE = (
@@ -267,6 +272,21 @@ def plan(engine, workload: dict, a_only: bool = False) -> list[Point]:
         # and the ranks cost alike, which admits each second row.
         families.append(
             [(((tbo_min + s,) * 2, (o, o)), ("", ""), h, True) for o, s, h in two]
+        )
+    if tbo and ranks > 1 and tbo_min + 4 * HALF <= min(b, cap):
+        # A step's first rank past the minimum and every other rank one row
+        # cut in halves of `HALF` tokens and on, so the second starts at every
+        # residue mod 16; each step full, since a rank with no row vetoes the
+        # split.
+        n = -(-SLOTS // (ranks - 1)) * (ranks - 1)
+        cut = [2 * (HALF + r) for r in range(n)]
+        steps = [cut[i : i + ranks - 1] for i in range(0, n, ranks - 1)]
+        families.append(
+            [
+                (((t, t),), ("",), 1, True)
+                for rest in steps
+                for t in [tbo_min + rest[0], *rest]
+            ]
         )
     starts = {"chunk": chunk_alignment(e["kv_cache_block_size"])}
     if e["enable_prefix_caching"]:
