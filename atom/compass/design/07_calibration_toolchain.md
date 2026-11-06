@@ -443,7 +443,9 @@ A `record` server times each tokenizer call it serves, `encode`, `decode` and th
 backend's `encode_batch`, with its tokens, its items, its thread, the backend and the loaded
 `tokenizer.json`'s fingerprint, and stamps each HTTP request's intake where
 `scripts/compass/http_intake.py serve` does: `app`, `body`, `tmpl`, `prep` and `send`, with
-the body's bytes, each on the wall clock and on its thread's CPU clock. `fit host` fits both
+the body's bytes, each on the wall clock and on its thread's CPU clock, and on the loop
+`wait`, from the tokenizer pool job's submit to the request's resume, and `recv`, each
+receive of the body's read. `fit host` fits both
 into the entry's `tokenizer` and `http_intake` terms (`05` D25) with the host laws' solver,
 drops and hulls (`09` D53, D58). Compass does not model the GIL, so no fitted term may carry
 a GIL wait
@@ -463,9 +465,14 @@ a GIL wait
   kind's refusal leaves the others fitted; with no positive slope over its tokens it is
   `fixed_s` alone, priced inside its token hull.
 - `http_intake`: on the loop thread's CPU time. `per_byte_s` and `idle_s` from requests
-  that found no other intake on the loop, each the CPU time from its app call to its
-  send's end; `fixed_s` the loop's CPU time per request in the records' longest burst of
-  served bodies, at that `per_byte_s`. No first-turn cell is recorded: cc-traces sessions
+  that found no other intake on the loop, each the loop's CPU time from its app call to
+  its send's end less its `wait`, which holds the loop's work for other streams while the
+  pool job runs
+  ([the exits Ruling](https://github.com/jgong5/ATOM/issues/2751#issuecomment-6686324280)).
+  Its `recv` stretches stay in: the transport parses the request's own body as the read
+  awaits it, and on a loaded loop serves other streams there too
+  ([#2919](https://github.com/jgong5/ATOM/issues/2919)). `fixed_s` is the loop's CPU time per
+  request in the records' longest burst of served bodies, at that `per_byte_s`. No first-turn cell is recorded: cc-traces sessions
   begin mid-conversation, so the longest burst is a client run's start. A burst alone would
   underprice later turns: on mi355-gpu-40 a V4.1-Flash
   first-turn body takes 5.64 to 5.80 ns a byte to parse and template, and the c=16 cell's
