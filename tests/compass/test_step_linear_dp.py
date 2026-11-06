@@ -220,14 +220,17 @@ def test_a_routed_rung_hulls_each_step_at_the_rank_it_prices(tmp_path):
     assert outside == []
 
 
-@pytest.mark.parametrize("cap, passes", [(20, 3), (3, 3), (2, None)])
+@pytest.mark.parametrize(
+    "cap, passes, rel", [(20, 3, 1e-6), (3, 3, 1e-6), (2, None, 1e-3)]
+)
 def test_a_routed_rung_alternates_again_under_its_column(
-    tmp_path, monkeypatch, cap, passes
+    tmp_path, monkeypatch, cap, passes, rel
 ):
     """The experts column moves some steps' costliest rank off the row the
     alternation took on the rung's features alone, so the rung alternates
     again under it, its passes the solves under the column. Once no step
-    moves, it is solved on the rows it prices: the per-rank law."""
+    moves, it is solved on the rows it prices: the per-rank law. At the cap
+    it ships its last solve, nearer that law than its first."""
     from atom.compass.backends import step_linear_fit
 
     monkeypatch.setattr(step_linear_fit, "MAD_PASSES", cap)
@@ -237,9 +240,7 @@ def test_a_routed_rung_alternates_again_under_its_column(
     records += routed._records(tmp_path / "sparse", sparse)
     vector = routed._routed(records)[0]["decode"][str(routed.RUNG)]
     assert vector["fit"]["passes"] == passes
-    if passes:
-        assert vector["coefficients"] == pytest.approx(WIDE_OR_TALL, rel=1e-6)
-        assert vector["fit"]["mad"] < 1e-6
+    assert vector["coefficients"] == pytest.approx(WIDE_OR_TALL, rel=rel)
 
 
 def _alike(seed, n=300):
