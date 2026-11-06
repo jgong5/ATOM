@@ -1,12 +1,36 @@
 # SPDX-License-Identifier: MIT
-# Test files gate_gpu.sh leaves out of the suite on one GPU, one per line as
+# Test files gate_gpu.sh leaves out on one GPU, one per line as
 # "<GPU> <test file>". A line applies when torch's name for the first card in
-# HIP_VISIBLE_DEVICES contains <GPU>; the file's collected tests then come off
-# the expected pass count. Each line is a file that stalls there, or passes and
-# fails at random so no baseline can name it, and goes when the issue above it
-# closes.
+# HIP_VISIBLE_DEVICES contains <GPU>, or <GPU> is that card's target; a file
+# outside tests/compass then has its collected tests come off the expected pass
+# count. Each line is a file that stalls there, passes and fails at random so no
+# baseline can name it, or needs an input that GPU's nodes do not hold, and goes
+# when what the comment above it names no longer holds.
 
 # #2441: stalls at a device sync after a TBO forward.
 MI308X tests/attentions/deepseek_v41/test_tbo.py
 # #2631: the V4 paged-decode kernel returns a different output on each call at head dim 96.
 MI308X tests/model_ops/test_v4_fused_decode.py
+# The Ruling on #2896: MI455 nodes run only models verified on them, today
+# DeepSeek-V4.1-Flash. Each file below has tests that need a Qwen slice, image,
+# MTP or cc-traces model.
+gfx1250 tests/compass/test_cctraces_sim_smoke.py
+gfx1250 tests/compass/test_client_runs_slice.py
+gfx1250 tests/compass/test_dp_slice.py
+gfx1250 tests/compass/test_drive_trace_steps.py
+gfx1250 tests/compass/test_image_scenario.py
+gfx1250 tests/compass/test_lmcache_mp_engine.py
+gfx1250 tests/compass/test_lmcache_mp_scenario.py
+gfx1250 tests/compass/test_meta_build_device.py
+gfx1250 tests/compass/test_multinode_dp.py
+gfx1250 tests/compass/test_pd_dp.py
+gfx1250 tests/compass/test_pd_prefill_pp.py
+gfx1250 tests/compass/test_pd_slice.py
+gfx1250 tests/compass/test_pd_widths.py
+gfx1250 tests/compass/test_pd_xpyd.py
+gfx1250 tests/compass/test_pp_send_allgather.py
+gfx1250 tests/compass/test_pp_stages.py
+gfx1250 tests/compass/test_rapidserve_lps.py
+gfx1250 tests/compass/test_spec_scenario.py
+gfx1250 tests/compass/test_tp_slice.py
+gfx1250 tests/compass/test_vertical_slice.py

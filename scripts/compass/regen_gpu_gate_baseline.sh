@@ -75,7 +75,7 @@ for k in 1 2; do
     compass_require_tree "$ROOT" || exit $?
     cd "$ROOT" || exit 90
     printf '===== run %s of 2 at %s on HIP_VISIBLE_DEVICES=%s =====\n' "$k" "${SHA:0:9}" "$CARD"
-    compass_gpu_skips "$DEVICE" || refuse 1 "$SKIP_WHY"
+    compass_gpu_skips "$DEVICE" "$ARCH" || refuse 1 "$SKIP_WHY"
     HIP_VISIBLE_DEVICES=$CARD python -m pytest tests/ --ignore=tests/plugin --ignore=tests/compass "${SKIP_ARGS[@]}" \
         -q --no-header -p no:cacheprovider -rfE 2>&1 | tee "$WORK/$k.log"
     RC=${PIPESTATUS[0]}
