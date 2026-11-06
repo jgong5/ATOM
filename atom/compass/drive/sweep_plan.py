@@ -182,7 +182,7 @@ def _queries(b: int, align: int) -> list[int]:
     starts = [max(1, min(q, b + 1 - SLOTS)) for q in _levels(b)]
     sizes = {s + r for s in starts for r in range(SLOTS)}
     sizes |= {q + r for q in _levels(b) if q >= align for r in range(0, align, SLOTS)}
-    return sorted(q for q in sizes if q <= b)
+    return [q for q in sorted(sizes) if q <= b]
 
 
 def _contexts(start: int, b: int, cap: int) -> list[int]:
