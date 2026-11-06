@@ -819,7 +819,9 @@ traces 256 to 392, seeds 20260707 and 20260708, whose decode ranks run unevenly 
 counted as one token in `moe_experts` ([#2536](https://github.com/jgong5/ATOM/issues/2536));
 each adopts `moe_experts`.
 Its other vectors and its host laws are the ones fitted on the lone cells alone, and
-its `sources` names the records each came from.
+its `sources` names the records each came from. The prefill law's rung-2 vector is the
+decode law's, stating `declared`, since the prefill law's own fit left rung 2 unfitted
+([#2660](https://github.com/jgong5/ATOM/issues/2660)).
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by
@@ -849,7 +851,10 @@ DeepSeek-V4-Pro's routed experts and top-k, are refitted on their side's lone ce
 side of three 1P1D `deploy.sh record` cells at c=256 over traces 256 to 392, seeds 20260707,
 20260708 and 20260709, the prefill side at `--gpu-memory-utilization 0.72`. Each law's other
 vectors, the prefill law's rung-1 vector among them, and its host laws are the ones fitted on its
-lone cells alone, and its `sources` names the records each came from. Host keys as above.
+lone cells alone, and its `sources` names the records each came from. The prefill law's rung-2
+vector is not: it is the decode law's, stating `declared`, since no prefill-side record decodes at
+rung 2, which the 1P1D prefill side reaches at c=64 ([#2878](https://github.com/jgong5/ATOM/issues/2878)).
+Host keys as above.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json` is DeepSeek-V4.1-Flash's
 law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed
