@@ -15,6 +15,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -64,6 +65,7 @@ def patched(monkeypatch):
         (InputOutputProcessor, "preprocess_fanout"),
         (CoreManager, "add_request"),
         (DisaggCoreManager, "add_request"),
+        (ThreadPoolExecutor, "submit"),
     ):
         monkeypatch.setattr(owner, name, vars(owner)[name])
     render = chat_encoders.apply_chat_template
@@ -121,9 +123,11 @@ def _server(tok):
     async def chat(request):
         messages = (await request.json())["messages"]
         prompt = api_server.apply_chat_template(tok, None, messages)
-        seq = await asyncio.get_running_loop().run_in_executor(
-            None, processor.preprocess, prompt, SamplingParams()
-        )
+
+        def do_preprocess():
+            return processor.preprocess(prompt, SamplingParams())
+
+        seq = await asyncio.get_running_loop().run_in_executor(None, do_preprocess)
         manager.add_request([seq])
         return JSONResponse({"prompt_tokens": seq.num_prompt_tokens})
 
@@ -171,13 +175,22 @@ def test_a_recorded_server_stamps_each_request_s_intake_as_the_probe_does(record
     assert kinds == [
         k
         for body, text in zip(bodies, ("hi there ", "how are you user "))
-        for k in [("app", 0), ("body", len(body)), ("tmpl", len(text)), ("prep", 0)]
-        + [("send", 0)]
+        for k in [("app", 0), ("recv", 0), ("body", len(body)), ("tmpl", len(text))]
+        + [("prep", 0), ("wait", 0), ("send", 0)]
     ]
+    # The loop waits on the body's receive inside its read, and on the pool job
+    # from its submit to its resume.
+    for k in range(len(bodies)):
+        app, receive, body, _, job, waited, _ = (
+            (int(r[3]), int(r[0])) for r in rows[7 * k : 7 * k + 7]
+        )
+        assert body[0] <= receive[0] <= receive[1] <= body[1]
+        assert waited[0] <= job[0] <= job[1] <= waited[1]
     assert all(int(r[3]) <= int(r[0]) and int(r[6]) <= int(r[5]) for r in rows)
     # The pool job runs off the event loop's thread; the rest on it.
     threads = {r[2]: r[1] for r in rows}
     assert threads["prep"] != threads["app"] == threads["tmpl"] == threads["send"]
+    assert threads["recv"] == threads["wait"] == threads["app"]
     # The pool job's encode is recorded too, its tokens the prompt's.
     _, calls = _calls(record)
     assert [(c["call"], c["tokens"]) for c in calls] == [

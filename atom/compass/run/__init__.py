@@ -2064,8 +2064,14 @@ def _stamp_intake(out: _LineFile) -> None:
     the request handed to the ASGI app, size 0; ``body``, its body first read,
     size its bytes; ``tmpl``, a chat template rendered, size its characters;
     ``prep``, a tokenizer pool job, and ``send``, a request handed to the
-    engine, size 0. Patches the classes, and every loaded
-    module's binding of ``apply_chat_template``, for the rest of the process."""
+    engine, size 0; on the loop from an await's start to the coroutine's
+    resume, size 0, ``recv``, each receive of the body's first read, and
+    ``wait``, the API server's tokenizer pool job, from its submit. Patches the
+    classes, and every loaded module's binding of ``apply_chat_template``, for
+    the rest of the process."""
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
     from starlette.applications import Starlette
     from starlette.requests import Request
 
@@ -2090,10 +2096,25 @@ def _stamp_intake(out: _LineFile) -> None:
 
     read, handle = Request.body, Starlette.__call__
 
+    def waited(receive):
+        async def received():
+            start, cpu = time.monotonic_ns(), time.thread_time_ns()
+            try:
+                return await receive()
+            finally:
+                stamp("recv", start, 0, cpu)
+
+        return received
+
     async def body(self):
-        cached = hasattr(self, "_body")
+        cached, receive = hasattr(self, "_body"), self._receive
         start, cpu = time.monotonic_ns(), time.thread_time_ns()
-        got = await read(self)
+        if not cached:
+            self._receive = waited(receive)
+        try:
+            got = await read(self)
+        finally:
+            self._receive = receive
         if not cached:
             stamp("body", start, len(got), cpu)
         return got
@@ -2128,6 +2149,27 @@ def _stamp_intake(out: _LineFile) -> None:
 
     for cls in (CoreManager, DisaggCoreManager):
         cls.add_request = sent(cls.add_request)
+
+    class Resumed(asyncio.Future):
+        def __await__(self):
+            try:
+                return (yield from super().__await__())
+            finally:
+                stamp("wait", *self.since)
+
+    submit = ThreadPoolExecutor.submit
+
+    def submitted(self, fn, /, *args, **kwargs):
+        # The loop hands the API server's `do_preprocess` to its executor, and
+        # wraps a returned future of its own loop's as it is.
+        if getattr(fn, "__name__", None) != "do_preprocess":
+            return submit(self, fn, *args, **kwargs)
+        job = Resumed(loop=asyncio.get_running_loop())
+        job.since = time.monotonic_ns(), 0, time.thread_time_ns()
+        asyncio.futures._chain_future(submit(self, fn, *args, **kwargs), job)
+        return job
+
+    ThreadPoolExecutor.submit = submitted
 
 
 def _end_before_serving(run: dict, e: BaseException) -> None:
