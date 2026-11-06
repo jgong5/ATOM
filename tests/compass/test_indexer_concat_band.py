@@ -4,16 +4,20 @@
 """A prefill indexer band stays under 2 GiB as aiter's `fp8_mqa_logits`
 allocates it: the step's keys rounded up to 256 columns."""
 
+import importlib.util
+import pathlib
+
 import pytest
 import torch
 
-rows_module = pytest.importorskip(
-    "atom.model_ops.indexer.rows",
-    reason="the indexer's rows import aiter at load",
-    exc_type=ImportError,
-)
-
 from atom.model_ops.sparse_indexer_chunk import logits_rows
+
+# By path: the `atom.model_ops.indexer` package imports Triton kernels that
+# need a GPU driver to load, and `rows.py` alone does not.
+_PATH = pathlib.Path(__file__).resolve().parents[2] / "atom/model_ops/indexer/rows.py"
+_spec = importlib.util.spec_from_file_location("_indexer_rows_under_test", _PATH)
+rows_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(rows_module)
 
 
 @pytest.fixture(autouse=True)
