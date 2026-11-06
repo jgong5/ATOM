@@ -213,8 +213,7 @@ trace runs A and B's host-paced propose busy within 2.4%. The fit's split of `pr
 a lag ([#2572](https://github.com/jgong5/ATOM/issues/2572)), bounded at a token count
 ([#2615](https://github.com/jgong5/ATOM/issues/2615)), is gone. A law fitted before may
 still hold `near_propose`, with its `lag` and `below`, which a run prices off its host
-recurrence's lag until [#2917](https://github.com/jgong5/ATOM/issues/2917) starts the
-pass no earlier than its host queues it.
+recurrence's lag until [#2917](https://github.com/jgong5/ATOM/issues/2917) deletes it.
 
 **Host laws** price the host segments of `01` D4: `E`, `W_pre`, `W_launch` and
 `W_post`, each linear in `(1, tokens, seqs)`, fitted separately for decode, output
