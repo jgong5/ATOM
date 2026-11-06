@@ -301,8 +301,13 @@ same aiter and FlyDSL and these settings, `ATOM_ENGRAM_UVA` left unset, so
 into the container that serves.
 It holds what the gate's runs import that this image lacks: LMCache at
 `f22dec28`, the commit nightly 20261026 carries, built for this image's torch
-(`BUILD_WITH_HIP=1 PYTORCH_ROCM_ARCH=gfx1250`), and the crates atomesh's cargo
-tests build from. MI455 nodes run only models verified on them, so on gfx1250
+(`BUILD_WITH_HIP=1 BUILD_MOONCAKE=0 PYTORCH_ROCM_ARCH=gfx1250 pip wheel
+--no-deps --no-build-isolation`, with `grpcio-tools` 1.83.1) and installed
+`--no-deps` with numba 0.65.0, llvmlite 0.47.0, sortedcontainers, aiofile,
+aiofiles, caio, cryptography 50.0.2, redis, httptools and
+`opentelemetry-exporter-prometheus` 0.65b0, the image's own numpy, protobuf and
+OpenTelemetry kept; and the crates atomesh's cargo tests build from, fetched
+under nightly 20261026's `Cargo.lock`. MI455 nodes run only models verified on them, so on gfx1250
 `gpu_gate_skip.txt` leaves out every `tests/compass` file whose tests need
 another model, and the gate there needs no driver-run input (below) and one
 card.
