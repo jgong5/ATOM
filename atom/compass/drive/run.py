@@ -37,6 +37,8 @@ check, and refuses `--coverage`.
 `--acceptance-record` names a speculative `compass record` directory: its
 histograms' rates (`measured`) go to ATOM as ``--spec-decode-acceptance-rates``,
 and the run file names the record, so the summary states the input ``measured``.
+A deployment's run file that names one, a decode record, gives its rates to
+each instance that joins it as `joined_atom_args` says.
 
 Once the server stops, run.json gains, beside `serve`'s identity: `run_file`,
 the run file the server was handed; `step_roofline`, the run file's key,
@@ -99,12 +101,7 @@ def main(argv: list[str]) -> None:
     runfile.pd_side(atom_args, refuse=True)
     run = runfile.build(args, atom_args)
     if record := args.acceptance_record:
-        rates = measured(record, atom_args, run["data_parallel_size"])
-        atom_args = [
-            *atom_args,
-            "--spec-decode-acceptance-rates",
-            ",".join(map(str, rates)),
-        ]
+        atom_args = with_measured_rates(record, atom_args, run["data_parallel_size"])
         run[compass_run.ACCEPTANCE_RECORD] = str(Path(record).resolve())
     report = check(args.coverage, run, atom_args) if args.coverage else None
     serve.serve(atom_args, args.out, run=run)
@@ -120,6 +117,7 @@ def join(args, atom_args, side) -> None:
             f"--join {args.join} names no clock_endpoint and out_dir; a "
             "deployment's run file names its authority and its directory"
         )
+    atom_args = joined_atom_args(run, atom_args, side)
     serve.serve(atom_args, args.out, run=run, joined=True)
     write_grading(args.out, None, side)
 
@@ -189,6 +187,28 @@ def measured(record, atom_args, ranks: int) -> list[float]:
             f"ATOM's arguments run {ranks} DP ranks"
         )
     return [sum(n for a, n in counts.items() if a > i) / rows for i in range(width)]
+
+
+def with_measured_rates(record, atom_args, ranks: int) -> list[str]:
+    """ATOM's arguments `atom_args` stating the rates `measured` reads from
+    `record` over DP ranks ``0..ranks-1``."""
+    rates = measured(record, atom_args, ranks)
+    return [*atom_args, "--spec-decode-acceptance-rates", ",".join(map(str, rates))]
+
+
+def joined_atom_args(run: dict, atom_args, side) -> list[str]:
+    """ATOM's arguments `atom_args` of a deployment's `side` instance, stating
+    the rates of the decode record its run file `run` names: the decode
+    instance always, the prefill instance when it drafts, since its hand-in
+    reads the same run file."""
+    record = run.get(compass_run.ACCEPTANCE_RECORD)
+    if not record or (side == "P" and not runfile._engine_args(atom_args).method):
+        return atom_args
+    try:
+        return with_measured_rates(record, atom_args, run[compass_run.DP_WIDTHS["D"]])
+    except ValueError as refused:
+        name = "prefill" if side == "P" else "decode"
+        raise ValueError(f"the {name} instance: {refused}") from None
 
 
 def check(inputs, run: dict, atom_args) -> dict:
