@@ -432,13 +432,14 @@ p50 input is 88,768 tokens and p90 is 204,288, this is not a rounding error.
 A prompt of `segment_tokenizer.py::_MIN_CACHED_CHARS` characters or more goes through ATOM's
 segment tokenizer instead (`SegmentTokenizer`, on by default, `ATOM_TOKENIZE_CACHE_MB`): it
 reuses the ids of segments earlier prompts encoded and encodes the rest in one
-`encode_batch` on the fast backend, not through `encode`. A simulated run charges that call
-by the same encode terms over the ids it returns, the batch at the single-call rate
-([#2558](https://github.com/jgong5/ATOM/issues/2558)); a serial encode of those segments
-takes within 10% of that on #2144's cell ([#2577](https://github.com/jgong5/ATOM/issues/2577)).
-What the real call takes beyond it is not charged: the tokenizers library's thread pool makes
-the batch slower than a serial encode, which is ATOM's to fix
-([#2617](https://github.com/jgong5/ATOM/issues/2617)); the reuse path's own work (splitting,
+`encode_batch` on the fast backend, not through `encode`. A simulated run charges a call of
+one item by the `encode` term and a call of several by the `encode_batch` term, over the
+ids it returns (`05` D25): the tokenizers library's pool runs a several-item call's items in
+parallel, off the caller's thread, so the one-item rate misprices it
+([#2751](https://github.com/jgong5/ATOM/issues/2751#issuecomment-6655175759)). Whether that
+pool makes the batch slower than a serial encode is ATOM's to fix
+([#2617](https://github.com/jgong5/ATOM/issues/2617)); the term prices the call as served.
+The reuse path's own work (splitting,
 hashing, copying ids) waits for host laws that time the whole call
 ([#2618](https://github.com/jgong5/ATOM/issues/2618)). On a real run that work costs more per
 id than in a back-to-back replay of the same prompts: half to two thirds of the excess when the
@@ -449,7 +450,9 @@ The server's other threads stretch a call that runs alone only by its GIL waits,
 0.04 ms on #2144's cell ([#2619](https://github.com/jgong5/ATOM/issues/2619)). Calls that
 overlap wait for each other, on the library's pool and for the GIL in their own work, which
 the encode station does not model ([#2693](https://github.com/jgong5/ATOM/issues/2693)); at
-c=16 they are mostly the warmup's 13 prompts that reach the pool together.
+c=16 they are mostly the warmup's 13 prompts that reach the pool together. The terms are
+fitted on lone calls, which hold neither wait, and the first is a stated residual (`07` D38,
+Phase 1c).
 
 **Decode** — `IncrementalStreamDetokenizer.update` at
 `atom/entrypoints/openai/streaming_dispatch.py`:
@@ -488,8 +491,8 @@ rule as the forward pass.
 
 | Stage | Where | Concurrency | Service time |
 |---|---|---|---|
-| encode | default `ThreadPoolExecutor` | the executor's actual width, **minus the wait jobs resident when the run starts** | `encode.fixed_s + tokens / encode.tokens_per_s` |
-| decode | engine output thread, per stream per step | **1**, one station per output thread | `2 x (decode.fixed_s + window / decode.tokens_per_s)` |
+| encode | default `ThreadPoolExecutor` | the executor's actual width, **minus the wait jobs resident when the run starts** | `encode.fixed_s + tokens / encode.tokens_per_s` for one item; a several-item `encode_batch` by the `encode_batch` term |
+| decode | engine output thread, per stream per step | **1**, one station per output thread | `2 x (decode.fixed_s + window / decode.tokens_per_s)`; a decode with no slope `2 x decode.fixed_s`, a window outside its `tokens` refused |
 | encode or decode on the loop thread | the API server's event loop: the final `decode` of a non-streaming completion (`delivered_text`) in `generate_async`, `generate_async_multimodal` and `generate_async_fanout`, the reasoning-channel `decode` of a token-id prompt in `chat_completions`, and the `encode` and `decode` calls in `anthropic_messages` and `responses_create` | **1**, the loop itself | the same terms per call, over the tokens it encodes or decodes |
 
 A loop-thread call is not a station job. The event loop is the frontend LP's clock owner,

@@ -1023,6 +1023,31 @@ def test_a_burst_reaches_the_app_one_intake_charge_at_a_time(
     assert entered == pytest.approx([first, first + fixed + sizes[1] * per_byte])
 
 
+def test_a_body_outside_the_intake_hull_is_charged_nothing_and_named(
+    run, monkeypatch, tmp_path
+):
+    from atom.compass import run as compass_run
+
+    intake = {"fixed_s": 2e-3, "per_byte_s": 1e-6, "idle_s": 2e-3, "bytes": [500, 2000]}
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"bound_s": 600.0, "host": {"http_intake": intake}}))
+    monkeypatch.setenv(compass_run.ENV, str(path))
+    entered, named = [], []
+
+    async def app(scope, receive, send):
+        loop = asyncio.get_running_loop()
+        entered.append(loop.time())
+        named.append(list(loop.rt.refusals))
+
+    arrival = _burst(run, monkeypatch, 2, app, {0: 1000, 1: 3000})
+    first = arrival + 2e-3 + 1000 * 1e-6
+    assert entered == pytest.approx([first, first])
+    assert named[1] == [
+        "http:intake of a 3000-byte body, outside the 500 to 2000 bytes its "
+        + "http_intake was fitted on"
+    ]
+
+
 def test_a_request_that_finds_no_intake_on_the_loop_is_charged_the_idle_one(
     run, monkeypatch, tmp_path
 ):

@@ -15,6 +15,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -64,6 +65,7 @@ def patched(monkeypatch):
         (InputOutputProcessor, "preprocess_fanout"),
         (CoreManager, "add_request"),
         (DisaggCoreManager, "add_request"),
+        (ThreadPoolExecutor, "submit"),
     ):
         monkeypatch.setattr(owner, name, vars(owner)[name])
     render = chat_encoders.apply_chat_template
@@ -99,8 +101,8 @@ def test_a_recorded_server_writes_each_tokenizer_call_it_serves(record, tok):
         "fingerprint": "sha256:" + hashlib.sha256(loaded).hexdigest(),
     }
     # A backend call the encode makes is the encode's: one line per served call.
-    got = [(c["call"], c["tokens"]) for c in calls]
-    assert got == [("encode", 3), ("decode", 3), ("encode_batch", 4)]
+    got = [(c["call"], c["tokens"], c["items"]) for c in calls]
+    assert got == [("encode", 3, 1), ("decode", 3, 1), ("encode_batch", 4, 2)]
     assert all(c["t_start_ns"] <= c["t_end_ns"] for c in calls)
     assert calls[0]["t_end_ns"] <= calls[1]["t_start_ns"]
 
@@ -121,9 +123,11 @@ def _server(tok):
     async def chat(request):
         messages = (await request.json())["messages"]
         prompt = api_server.apply_chat_template(tok, None, messages)
-        seq = await asyncio.get_running_loop().run_in_executor(
-            None, processor.preprocess, prompt, SamplingParams()
-        )
+
+        def do_preprocess():
+            return processor.preprocess(prompt, SamplingParams())
+
+        seq = await asyncio.get_running_loop().run_in_executor(None, do_preprocess)
         manager.add_request([seq])
         return JSONResponse({"prompt_tokens": seq.num_prompt_tokens})
 
@@ -171,13 +175,22 @@ def test_a_recorded_server_stamps_each_request_s_intake_as_the_probe_does(record
     assert kinds == [
         k
         for body, text in zip(bodies, ("hi there ", "how are you user "))
-        for k in [("app", 0), ("body", len(body)), ("tmpl", len(text)), ("prep", 0)]
-        + [("send", 0)]
+        for k in [("app", 0), ("recv", 0), ("body", len(body)), ("tmpl", len(text))]
+        + [("prep", 0), ("wait", 0), ("send", 0)]
     ]
-    assert all(int(r[3]) <= int(r[0]) for r in rows)
+    # The loop waits on the body's receive inside its read, and on the pool job
+    # from its submit to its resume.
+    for k in range(len(bodies)):
+        app, receive, body, _, job, waited, _ = (
+            (int(r[3]), int(r[0])) for r in rows[7 * k : 7 * k + 7]
+        )
+        assert body[0] <= receive[0] <= receive[1] <= body[1]
+        assert waited[0] <= job[0] <= job[1] <= waited[1]
+    assert all(int(r[3]) <= int(r[0]) and int(r[6]) <= int(r[5]) for r in rows)
     # The pool job runs off the event loop's thread; the rest on it.
     threads = {r[2]: r[1] for r in rows}
     assert threads["prep"] != threads["app"] == threads["tmpl"] == threads["send"]
+    assert threads["recv"] == threads["wait"] == threads["app"]
     # The pool job's encode is recorded too, its tokens the prompt's.
     _, calls = _calls(record)
     assert [(c["call"], c["tokens"]) for c in calls] == [
@@ -185,6 +198,22 @@ def test_a_recorded_server_stamps_each_request_s_intake_as_the_probe_does(record
     ]
     # The lone-request reader of the probe's stamps reads the record as it is.
     assert probe.idle(str(record / "intake.stamps"))["requests"] == len(bodies)
+
+
+def test_a_recorded_server_s_engine_send_keeps_its_caller_s_response_id(record, tok):
+    parity.carry_response_ids()  # as the engine's construction does, before the wrap
+    compass_run.tokenizer(tok, None)
+    manager = CoreManager.__new__(CoreManager)
+    manager.label, manager.pp_size, manager.local_engine_count = "t", 1, 1
+    manager._seq_id_to_callback = {}
+    manager._send_request = lambda _rank, payload: None
+    processor = InputOutputProcessor(
+        SimpleNamespace(hf_config=SimpleNamespace(model_type="llama")), tok, 16
+    )
+    seq = processor.preprocess("hi there", SamplingParams())
+    request_id = "chatcmpl-1"  # noqa: F841 -- the API server's handler holds it
+    manager.add_request([seq])
+    assert seq.external_request_id == "chatcmpl-1"
 
 
 def test_with_compass_off_nothing_is_wrapped_or_written(patched, tok, tmp_path):
