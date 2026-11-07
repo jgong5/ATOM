@@ -260,3 +260,30 @@ def test_a_v41_window_ring_reached_through_its_pool_counts_once_a_slot(
     pages = 0 if pool == "whole" else placed["read"] // 2
     ring = placed["read"] - pages
     assert record["footprint_bytes"] == 7 * 32 + 7 * pages + 4 * ring
+
+
+#: The bench tensor each KV view `v41_state_probe.kv_bound` takes binds.
+BOUND = {
+    "pages": "pages.buf.torch.bfloat16",
+    "page_bytes": "pages.buf.torch.bfloat16",
+    "state_bytes": "state.buf.torch.bfloat16",
+    "state_fp32": "state.buf.torch.float32",
+    "cursor": "cursor",
+    "ring": "pool",
+    "pool": "pool",
+}
+
+
+@pytest.mark.parametrize(
+    "view, slots",
+    [(v, s) for s in ("8", "2") for v in BOUND if (v, s) != ("ring", "2")],
+)
+def test_a_v41_kv_view_binds_the_bytes_atom_passes(probed, view, slots):
+    """A KV view of a capture's cache of 4 PAGEs, bound on the bench's of 64
+    PAGEs and 8 state slots: the page and state arenas' flat buffers, the
+    cursor history and layer 1's window ring at the bytes ATOM passes there,
+    the state arena in float32 and the whole pool as before. At a capture of
+    2 slots, the state arena's 2, and the whole pool, which lies an entry
+    and more inside the bench's state arena, at the pool's start."""
+    _, seen = probed
+    assert seen["kv_bound"][slots][view] == [f"cache.{BOUND[view]}", 0]

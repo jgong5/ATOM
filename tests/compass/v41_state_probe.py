@@ -188,6 +188,36 @@ def ops_placements(
     return {"slots": runner.batches, "refused": refused, "got": got, "read": read}
 
 
+def kv_bound(slots):
+    """Each KV view a capture's cache of 4 PAGEs and `slots` state slots
+    passes, as `ops._kv` binds it on `cache_of`'s as `ops._runner` holds it:
+    the name it binds and how far its first byte lies from that view there."""
+    import torch
+
+    from atom.compass.bench import ops
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+
+    bench = cache_of()
+    capture = PagedAttentionCache(bench.geometry, 4, slots, "cpu")
+    held = ops._bound("cache", bench, set(), torch.device("cpu"))
+    views = {
+        "pages": lambda c: c.pages.buf.view(torch.bfloat16),
+        "page_bytes": lambda c: c.page_bytes.view(-1),
+        "state_bytes": lambda c: c.state_bytes.view(-1),
+        "state_fp32": lambda c: c.state.buf.view(torch.float32),
+        "cursor": lambda c: c.cursor[:, 1:],
+        "ring": lambda c: c.ring_view(1),
+        "pool": lambda c: c.pool,
+    }
+    out = {}
+    for case, view in views.items():
+        t = view(capture)
+        spec = {"shape": [*t.shape], "stride": [*t.stride()], "dtype": str(t.dtype)}
+        name, got = ops._kv(spec, "self", held)
+        out[case] = [name, got.data_ptr() - view(bench).data_ptr()]
+    return out
+
+
 def main(root: pathlib.Path) -> None:
     from atom.compass.capture import driverless
 
@@ -309,6 +339,7 @@ def main(root: pathlib.Path) -> None:
         seen[f"ops_v41_{pool}_pool_{slots}"] = ops_placements(
             plain, replay.seat_states, v41=True, pool=pool, slots=slots
         )
+    seen["kv_bound"] = {slots: kv_bound(slots) for slots in (8, 2)}
 
     from atom.compass.bench.runner import BenchModelRunner
     from atom.compass.parity.runner import RecordingModelRunner
