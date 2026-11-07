@@ -1173,17 +1173,21 @@ powers of two and no margin:
    GPUs each take a subset of the inputs into a store of its own, starts a minute
    apart; copying each store's `step_measurement` entries into one, and this step
    again over every input, measures what remains.
-   Then `compass measure steps $R/cal/c* --sample 6 --seed N --ragged --client-run
-   $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... --sampling '{"ignore_eos":
-   true}' --gpu G $S --out $R/ragged -- $ATOM`, naming every record: it draws six
-   decode steps a rung and measures the ragged views composed from each. Alpha
-   is fitted on these views alone. Each view measured prints `measured decode
-   rung <R> <token>: ...`; keep every token, since a rerun prints only the views
-   the store lacked.
+   Then `compass measure steps $R/cal/c* --sample 6 --seed N --ragged --grid POP...
+   $R/cell/c*/real* --grid-definition $G --client-run $R/cal/c<C>
+   $R/cal/c<C>/artifacts/client_run.json ... --sampling '{"ignore_eos": true}'
+   --gpu G $S --out $R/ragged -- $ATOM`, naming every record, population and real
+   run: it draws six decode steps a rung and measures the ragged views composed
+   from each, and the cells the planner places for them, each view's longest
+   row's among them, which alpha reads; the grid's other points are held. Alpha
+   is fitted on these views alone. Each view measured prints `measured ragged
+   decode rung <R> <token>: ...`; keep every such token, since a rerun prints
+   only the views the store lacked.
 8. `compass fit steps --backend step-grid --grid POP... $R/cell/c*/real*
     --grid-definition $G $R/cal/c* RAGGED... --client-run ...`, naming every
-    population, real run and record, and as `RAGGED` every token step 7's
-    `--ragged` run printed, `$M $S --out $R/fit-grid`; it prints the bundle's
+    population, real run and record, and as `RAGGED` every view token step 7's
+    `--ragged` run printed, `$M $S --out $R/fit-grid`; it plans the views' cells
+    again and refuses naming any not measured. It prints the bundle's
     token, and its report's `alpha` states per rung whether alpha was kept. A
     second fit of one definition into one store is refused as an overwrite:
     refit into a fresh store.
