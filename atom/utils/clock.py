@@ -401,11 +401,15 @@ class LPRuntime:
 
     def my_wakeup(self, channels=None) -> _Wakeup:
         """This thread's event, set whenever a message on one of `channels` is
-        released, or any message while `channels` is None."""
+        released, or any message while `channels` is None. No release sets the
+        clock owner's: the owner makes every release itself, so none comes while
+        it waits, as it waits before the run for the engines' first frames."""
         with self.lock:
             me = threading.current_thread()
             if me not in self.wakes:
                 self.wakes[me] = _Wakeup()
+            if me is self.owner:
+                channels = ()
             self.wakes[me].channels = None if channels is None else frozenset(channels)
             return self.wakes[me]
 
@@ -491,12 +495,10 @@ class WrappedSocket:
         return frames
 
     def pull(self) -> None:
-        """Read every frame already here, without blocking; check and buffer each."""
-        while True:
-            try:
-                hdr, payload = self.raw.recv_multipart(zmq.NOBLOCK, copy=False)
-            except zmq.Again:
-                return
+        """Read every frame already here, without blocking; check and buffer each.
+        The socket's events say when it is empty, so no read fails with `zmq.Again`."""
+        while self.raw.get(zmq.EVENTS) & zmq.POLLIN:
+            hdr, payload = self.raw.recv_multipart(zmq.NOBLOCK, copy=False)
             ch, arrival, seq = pickle.loads(hdr.bytes)
             if arrival is not None:
                 self.rt.check_arrival(ch, arrival, seq)
@@ -577,7 +579,7 @@ class WrappedPoller:
     """`zmq.Poller` for a receiving thread: the wait point where a frame counts as done.
 
     Channel sockets count as readable only with a released frame; any other socket
-    registered (a shutdown signal) is polled as it is.
+    registered (a shutdown signal) counts once `zmq_poll` has reported it.
     """
 
     def __init__(self, rt: LPRuntime, socks=()) -> None:
@@ -587,22 +589,32 @@ class WrappedPoller:
         self.socks.append(sock)
 
     def poll(self) -> list[tuple]:
-        self.rt.back_at_wait_point()
         wrapped = [s for s in self.socks if isinstance(s, WrappedSocket)]
         wake = self.rt.my_wakeup([ch for s in wrapped for ch in s.into])
         waits = [(getattr(s, "raw", s), zmq.POLLIN) for s in self.socks]
+        polled, back = [], True
         while True:
             wake.clear()
             for s in wrapped:
                 s.pull()
+            if back:
+                # The frame taken before counts as handled only now, with the
+                # wakeup cleared and the sockets read, so the owner it lets go
+                # finds this thread about to block rather than holding the GIL.
+                self.rt.back_at_wait_point()
+                back = False
             ready = [
                 s
                 for s in self.socks
-                if (s.ready() if isinstance(s, WrappedSocket) else s.poll(0))
+                if (
+                    s.ready()
+                    if isinstance(s, WrappedSocket)
+                    else getattr(s, "raw", s) in polled
+                )
             ]
             if ready:
                 return [(s, zmq.POLLIN) for s in ready]
-            zmq.zmq_poll([*waits, (wake.fd, zmq.POLLIN)])
+            polled = [p for p, _ in zmq.zmq_poll([*waits, (wake.fd, zmq.POLLIN)])]
 
 
 class RelayQueue:
