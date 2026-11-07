@@ -21,6 +21,7 @@ from atom.compass.clock import LpId, prefill_decode_table, single_engine_table
 from atom.utils.clock import (
     LPRuntime,
     RelayQueue,
+    Straggler,
     UnsentRelayItem,
     WrappedPoller,
     WrappedSocket,
@@ -282,6 +283,188 @@ def test_holds_unstamped_is_asked_only_while_an_unstamped_frame_is_buffered(ctx)
     call(rt.advance_to, 10.4)
     thread.join(5)
     assert seen == [b"p0", b"p1", b"p2", b"stop"] and not thread.is_alive()
+
+
+def _output_thread(rt, rx, stop, seen, handle=lambda frame: None):
+    """ATOM's output thread: wait on its shutdown socket and `rx`, take and
+    handle each frame, until the shutdown is among the sockets ready."""
+
+    def run():
+        poller = WrappedPoller(rt)
+        poller.register(stop, zmq.POLLIN)
+        poller.register(rx, zmq.POLLIN)
+        while True:
+            socks = poller.poll()
+            if len(socks) == 2 or socks[0][0] is stop:
+                return
+            seen.append(rx.recv())
+            handle(seen[-1])
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def _shut(stop_tx, thread):
+    stop_tx.send(b"")
+    thread.join(5)
+    assert not thread.is_alive()
+
+
+def test_a_frame_counts_as_handled_once_its_thread_has_read_what_came_meanwhile(ctx):
+    """Frame 1 reaches the socket while the output thread handles frame 0. The
+    thread is back at its wait point, and frame 0 handled, only once it has
+    read frame 1: the owner it lets go finds nothing left on the socket."""
+    push, pull = _pair(ctx, "out", zmq.PUSH, zmq.PULL)
+    late = ctx.socket(zmq.PUSH)  # frame 1's sender, used on the output thread only
+    late.connect("inproc://out")
+    engine = _rt(ENGINE)[0]
+    tx = _relayed(engine, push, OUT, (10.05, 0))
+    tx_late = _relayed(engine, late, OUT, (10.1, 1))
+    rt, call = _rt(FRONTEND, (10.2, {OUT: [(0, 10.05), (1, 10.1)]}))
+    read_when_handled = []
+
+    def count_done_locked(ch, seq, real=rt.count_done_locked):
+        read_when_handled.append((seq, sorted(rt.arrived[ch])))
+        real(ch, seq)
+
+    def handle(frame):
+        if frame == b"p0":
+            tx_late.send(b"p1")
+            assert pull.poll(5000)  # on the socket, not yet read
+
+    rt.count_done_locked = count_done_locked
+    stop_tx, stop_rx = _pair(ctx, "stop", zmq.PAIR, zmq.PAIR)
+    thread = _output_thread(rt, WrappedSocket(rt, pull, OUT), stop_rx, [], handle)
+    tx.send(b"p0")
+    call(rt.advance_to, 10.2)
+    assert read_when_handled == [(0, [0, 1]), (1, [0, 1])]
+    _shut(stop_tx, thread)
+
+
+def test_a_straggler_an_output_thread_reads_still_fails_the_run(ctx):
+    """A stray frame, released by no grant and arriving below the clock, comes
+    while the output thread handles frame 0. The thread's read raises on it,
+    and frame 0 still counts as handled, so the owner's drain fails the run
+    rather than waiting for ever on frame 0."""
+    push, pull = _pair(ctx, "out", zmq.PUSH, zmq.PULL)
+    late = ctx.socket(zmq.PUSH)  # the stray's sender, used on the output thread only
+    late.connect("inproc://out")
+    engine = _rt(ENGINE)[0]
+    tx = _relayed(engine, push, OUT, (10.05, 0))
+    stray = _relayed(engine, late, OUT, (10.0, 5))
+    rt, call = _rt(FRONTEND, (10.2, {OUT: [(0, 10.05)]}), (10.3, {}))
+    rx = WrappedSocket(rt, pull, OUT)
+    raised = []
+
+    def output_thread():
+        poller = WrappedPoller(rt, [rx])
+        try:
+            while True:
+                poller.poll()
+                rx.recv()
+                stray.send(b"stray")
+                assert pull.poll(5000)  # on the socket, not yet read
+        except Straggler as e:
+            raised.append(e)
+
+    thread = threading.Thread(target=output_thread, daemon=True)
+    thread.start()
+    tx.send(b"p0")
+    with pytest.raises(Straggler, match="seq 5 arrives at 10.0"):
+        call(rt.advance_to, 10.2)
+        thread.join(5)
+        call(rt.advance_to, 10.3)
+    thread.join(5)
+    assert raised and not thread.is_alive()
+
+
+class _Reads:
+    """A socket that counts its reads that found nothing (`zmq.Again`)."""
+
+    def __init__(self, raw) -> None:
+        self.raw, self.empty = raw, 0
+
+    def __getattr__(self, name):
+        return getattr(self.raw, name)
+
+    def recv_multipart(self, *args, **kw):
+        try:
+            return self.raw.recv_multipart(*args, **kw)
+        except zmq.Again:
+            self.empty += 1
+            raise
+
+
+def test_reading_a_socket_stops_at_its_last_frame_without_a_failed_read(ctx):
+    push, pull = _pair(ctx, "out", zmq.PUSH, zmq.PULL)
+    tx = _relayed(_rt(ENGINE)[0], push, OUT, (0.1, 0), (0.2, 1))
+    reads = _Reads(pull)
+    rx = WrappedSocket(_rt(FRONTEND)[0], reads, OUT)
+    rx.pull()
+    tx.send(b"p0")
+    tx.send(b"p1")
+    assert pull.poll(5000)
+    rx.pull()
+    rx.pull()
+    assert [f[3].bytes for f in rx.buf] == [b"p0", b"p1"]
+    assert reads.empty == 0
+
+
+class _Shutdown:
+    """ATOM's shutdown socket as its output thread registers it: no channel's,
+    the shim's wrapper around a pyzmq socket, here counting its own polls."""
+
+    def __init__(self, raw) -> None:
+        self.raw, self.polls = raw, 0
+
+    def poll(self, *args):
+        self.polls += 1
+        return self.raw.poll(*args)
+
+
+def test_a_shutdown_socket_counts_once_the_wait_reports_it_and_is_never_polled(ctx):
+    push, pull = _pair(ctx, "out", zmq.PUSH, zmq.PULL)
+    stamps = [(0.1 * (k + 1), k) for k in range(3)]
+    tx = _relayed(_rt(ENGINE)[0], push, OUT, *stamps)
+    rt, call = _rt(FRONTEND, (1.0, {OUT: [(k, a) for a, k in stamps]}))
+    stop_tx, stop_raw = _pair(ctx, "stop", zmq.PAIR, zmq.PAIR)
+    stop, seen = _Shutdown(stop_raw), []
+    thread = _output_thread(rt, WrappedSocket(rt, pull, OUT), stop, seen)
+    for k in range(3):
+        tx.send(b"p%d" % k)
+    call(rt.advance_to, 1.0)
+    assert seen == [b"p0", b"p1", b"p2"]
+    _shut(stop_tx, thread)
+    assert stop.polls == 0
+
+
+def test_a_release_sets_no_wakeup_of_the_clock_owner(ctx):
+    """Before the run the frontend's owner waits for an engine's first frame
+    through the poller, as `CoreManager` does. In the run only the output
+    thread's wakeup is set by a release: the owner makes every release itself."""
+    push, pull = _pair(ctx, "out", zmq.PUSH, zmq.PULL)
+    engine = _rt(ENGINE)[0]
+    engine.end_run()
+    WrappedSocket(engine, push, OUT).send(b"ready")
+    engine.start_run()
+    rt, call = _rt(FRONTEND, (0.2, {OUT: [(0, 0.1)]}))
+    rt.end_run()
+    rx = WrappedSocket(rt, pull, OUT)
+
+    def first_frame():
+        WrappedPoller(rt, [rx]).poll()
+        return rx.recv()
+
+    assert call(first_frame) == b"ready"
+    rt.start_run()
+    stop_tx, stop_rx = _pair(ctx, "stop", zmq.PAIR, zmq.PAIR)
+    seen = []
+    thread = _output_thread(rt, rx, stop_rx, seen)
+    _relayed(engine, push, OUT, (0.1, 0)).send(b"d0")
+    call(rt.advance_to, 0.2)
+    assert seen == [b"d0"] and not rt.wakes[rt.owner].is_set()
+    _shut(stop_tx, thread)
 
 
 KV = "engine-D->engine-P:kv_write_req"

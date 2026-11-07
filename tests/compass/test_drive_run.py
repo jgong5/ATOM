@@ -548,7 +548,7 @@ def op_graph_run(tmp_path, monkeypatch, steps, price_list):
     bounds = {k: ENGINE[k] for k in ("max_num_seqs", "max_num_batched_tokens")}
     r = deployment(tmp_path, **bounds, capture_sizes=LADDER)
     monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
-    monkeypatch.setattr(compass_run, "_op_graphs", lambda *args: decode_gemm)
+    monkeypatch.setattr(compass_run, "_op_graphs", lambda *args, **kw: decode_gemm)
     if price_list:
         key = price_list_key(tmp_path)
         published(tmp_path, r, Kind.PRICE_LIST, key, price_list.params)
@@ -636,7 +636,7 @@ def test_coverage_of_a_v4_pro_ep8_run_asks_its_price_list_at_atom_s_ep_width(
     monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
     kinds = ("aiter.fused_moe_.default", MORI + "dispatch", MORI + "combine")
     region = {"seq": [{"op": kind, "args": {}} for kind in kinds]}
-    monkeypatch.setattr(compass_run, "_op_graphs", lambda *args: lambda *s: region)
+    monkeypatch.setattr(compass_run, "_op_graphs", lambda *a, **kw: lambda *s: region)
     asked = Asked()
     monkeypatch.setattr(compass_run, "_price_list", lambda *args: asked)
     widths = set()
@@ -679,7 +679,7 @@ def test_coverage_of_a_v4_pro_dpa_run_reads_graphs_at_the_widths_its_ranks_run(
     region = {"seq": [{"op": kind, "args": {}} for kind in kinds]}
     structures = []
 
-    def graphs(root, config, arch):
+    def graphs(root, config, arch, env=None):
         structures.append(structure(config, "decode", True, arch))
         return lambda *shape: region
 

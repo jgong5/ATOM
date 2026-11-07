@@ -1021,17 +1021,16 @@ with expert parallelism on. Both sides add `--enable-expert-parallel --moe-backe
 standard` to their ATOM arguments and `MORI_SHMEM_HEAP_SIZE=16G` to their
 environment, the decode side as an `-e` word of its prefix. MORI's high-throughput
 all-to-all is the default; EPLB, MTP and the decode's low-latency mode stay off.
-The prefill side keeps `--gpu-memory-utilization 0.72` and `--enable-tbo`, the
-decode side 0.75 and the `--cudagraph-capture-sizes` its law's `engine_config`
-states. A real run is `deploy.sh record ... --store S`, which merges in the
+A real run is `deploy.sh record ... --store S`, which merges in the
 stack's JIT cache library from `S` and writes it back. A simulated run is
 `deploy.sh run --step-linear P --step-linear D --host-laws P --host-laws D
---machine machines/mi355x-crs005.json --store S`, which builds the cell's run file
-from these flags and both sides' arguments. `P` and `D` are
-`laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json` and `-decode.json`,
-and `S` holds each side's `compass measure memory` readings, taken at the run's
-own commit on the node that side runs on: decode readings taken on 005 sized the
-simulated decode 79 to 80 KV blocks per rank above every real decode on 013
+--machine scripts/compass/machines/mi355x-crs005.json --store S`, which builds the
+cell's run file from these flags and both sides' arguments. `P` and `D` are
+`scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json` and
+`-decode.json`, and `S` holds each side's `compass measure memory` readings, taken
+at the run's own commit on the node where that side's real instance runs (013 for
+the decode): decode readings taken on 005 sized the simulated decode 79 to 80 KV
+blocks per rank above every real decode on 013
 ([ruling](https://github.com/jgong5/ATOM/issues/1111#issuecomment-6659985920)).
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
