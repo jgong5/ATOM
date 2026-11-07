@@ -958,12 +958,21 @@ class Stub:
             and "out_logits" in op["args"]
             and (op["args"].get("context_lens") or {}).get("role") != "activation"
         }
-        self.kv = {
-            (s, path): _kv(spec, path, _named(op, path, spec, held, self.known) or held)
+        bind = {
+            (s, path): (spec, _named(op, path, spec, held, self.known) or held)
             for s, (op, _) in found.items()
             for path, spec in _specs(op["args"])
             if spec["role"] == "kv"
         }
+        self.kv = {k: _kv(spec, k[1], live) for k, (spec, live) in bind.items()}
+        # a view of a pool holding the state arena past its pages, narrower than
+        # the widest of it its leaf takes, is a window ring, as `_plan` reads one
+        span = {k: _span(v["shape"], v["stride"]) for k, (v, _) in bind.items()}
+        named = {k: (k[0], self.kv[k][0]) for k in bind}
+        for k, (spec, live) in bind.items():
+            pooled = self.state.get(named[k][1])
+            if pooled and span[k] < max(span[j] for j in bind if named[j] == named[k]):
+                self.kv[k] = _kv(spec, k[1], live, ring=True)
         taken = len(rows) * self.per_row  # the batch's state slots
         room = [pool // blocks]
         room += [t.k_cache.shape[0] // taken for t in kv.values() if _stateful(t)]
@@ -1674,7 +1683,7 @@ def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:
     return name, t.as_strided(spec["shape"], spec["stride"], t.storage_offset())
 
 
-def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
+def _kv(spec, slot, live, ring=False) -> tuple[str, torch.Tensor | None]:
     """The live KV tensor a KV argument is a view of, and its name, picked as
     `_meta` picks among those whose layout past its widest-strided dim's size
     is its own (`_layout`), when any is: the capture's pool sized that one;
@@ -1689,10 +1698,9 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
     own dtype first, whose whole entries (`_entry`) it fills, as the capture's
     pool sized it. Before an arena's buffer, one takes a tensor in one, of its
     strides and dtype, that it lies inside, cut from that tensor's end in
-    every dim but the widest-strided (V4.1's cursor history). One short of an
-    arena's buffer that ends its tensor by less than an entry binds that
-    tensor's end: the window ring ATOM cuts from V4.1's pool (`ring_view`),
-    when the capture held the bench's state slots."""
+    every dim but the widest-strided (V4.1's cursor history). A `ring` (V4.1's
+    `ring_view`) binds the arena buffer ending its tensor, past its start by the
+    bytes it falls short of whole entries, or refuses past that buffer's."""
     shape, stride, dtype = spec["shape"], spec["stride"], _dtype(spec["dtype"])
     nbytes = _span(shape, stride) * dtype.itemsize
     bufs = {n: (t, _entry(n, live)) for n, t in live.items() if ".buf." in n}
@@ -1725,10 +1733,14 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
     except ValueError as error:  # the leaf refuses, not the point
         return str(error), None
     t, end = own[name], lambda x: x.storage_offset() + _span(x.shape, x.stride())
-    for b, e in bufs.values() if len(shape) > 1 else ():
-        ends = end(b) * b.itemsize == end(t) * t.itemsize
-        if ends and _inside(b, t) and 0 <= b.nbytes - nbytes < e:
-            view = t.as_strided(shape, stride, end(t) - _span(shape, stride))
+    for b, e in bufs.values() if ring else ():
+        if end(b) * b.itemsize == end(t) * t.itemsize and _inside(b, t):
+            n, room = -(-nbytes // e), b.nbytes // e
+            if n > room:
+                why = f"a window ring over {n} state slots; the bench holds {room}"
+                return f"{slot} {_text(spec)}: {why}", None
+            at = b.storage_offset() * b.itemsize + n * e - nbytes
+            view = t.as_strided(shape, stride, at // t.itemsize)
     return name, view
 
 
