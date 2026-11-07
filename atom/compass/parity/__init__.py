@@ -113,13 +113,11 @@ TIMESTAMPS = (
     "t_pull_ns",
     "t_put_ns",
 )
-#: Profiler ranges a trace run (`busy`) splits a forward's kernels at: the target
-#: ends where `TARGET_DONE` opens, and each drafter pass is the range named `MARK`
-#: and its line field; a rank that paused its profiler for a drafter pass opens
-#: the empty range `PAUSED` as the pause starts.
+#: Profiler ranges a trace run (`busy`) splits a forward's kernels at, on every
+#: TP rank: the target ends where `TARGET_DONE` opens, and each drafter pass is
+#: the range named `MARK` and its line field.
 MARK = "compass::"
 TARGET_DONE = MARK + "target_done"
-PAUSED = MARK + "paused"
 
 
 class StepRecord:
@@ -530,26 +528,17 @@ class StepRecording:
     def _draft_pass(self, key, call, *args, **kwargs):
         """`call`, a drafter pass, between two device events kept under `key`,
         the line field that times it. The first pass's start also ends the
-        target of a forward that samples nothing. Under ATOM's profiler, TP rank
-        0 opens its range and every other rank pauses its profiler for the pass:
-        a trace run profiles the drafter on rank 0 alone."""
+        target of a forward that samples nothing. Under ATOM's profiler every TP
+        rank opens the pass's range, recording or not."""
         if getattr(self, "_parity_record", None) is None:
-            with self._drafter_traced(MARK + key):
+            with _traced(MARK + key):
                 return call(*args, **kwargs)
         start = self.device_event()
         self._stamps.setdefault("draft_event", start)
-        with self._drafter_traced(MARK + key):
+        with _traced(MARK + key):
             reply = call(*args, **kwargs)
         self._stamps[key] = [start, self.device_event()]
         return reply
-
-    def _drafter_traced(self, name: str):
-        """`_traced(name)` on TP rank 0 or with no ATOM profiler; on another
-        rank, ATOM's profiler paused while the pass runs (`_paused`)."""
-        profiler = getattr(self, "profiler", None)
-        if getattr(self, "rank", 0) == 0 or profiler is None:
-            return _traced(name)
-        return _paused(profiler)
 
     def propose_draft_token_ids(self, *args, **kwargs):
         call = super().propose_draft_token_ids
@@ -597,20 +586,6 @@ class StepRecording:
         if getattr(self, "_parity_record", None) is not None:
             self._parity_record.write()
         return super().exit()
-
-
-@contextlib.contextmanager
-def _paused(profiler):
-    """`profiler` collecting nothing inside the block, its start marked by the
-    empty range `PAUSED`."""
-    with _traced(PAUSED):
-        pass
-    activities = list(profiler.activities)
-    profiler.toggle_collection_dynamic(False, activities)
-    try:
-        yield
-    finally:
-        profiler.toggle_collection_dynamic(True, activities)
 
 
 def _traced(name: str):

@@ -17,7 +17,7 @@ from test_parity_device_window import _recorded
 from test_parity_record import _config, _drive
 
 from atom.compass.drive import serve
-from atom.compass.parity import ENV, MARK, PAUSED, TARGET_DONE, busy
+from atom.compass.parity import ENV, MARK, TARGET_DONE, busy
 
 #: One MTP output prefill, in us. The target: K1, K2 queued 2 after K1 and
 #: counted whole, the collective K3, queued on rank 0 before K2 ends but
@@ -38,19 +38,15 @@ KERNELS = [
     ("allgather_naive", 126, 130, 113),
 ]
 PROPOSE = MARK + "d_propose_ns"
-#: Where the recorder's ranges open, each planted on a rank only where its real
+#: Where the recorder's ranges open, each planted on a rank where its real
 #: recorder opens it (`_opened`).
 MARKS = {MARK + "d_draft_kv_ns": (80, 90), TARGET_DONE: (100, 101), PROPOSE: (110, 200)}
 
 
 def _trace(path, kernels, tokens=100, marks=MARKS):
     """A kineto trace of one forward running `kernels`, (name, start, end,
-    launch), each launch call 1 us long, and opening `marks`; a drafter pass
-    whose range it does not open ran with the profiler paused, so it holds none
-    of the kernels launched there and opens `PAUSED` where the pass starts.
-    Written over many lines."""
-    paused = [MARKS[m] for m in MARKS if m != TARGET_DONE and m not in marks]
-    kernels = [k for k in kernels if not any(a <= k[3] <= b for a, b in paused)]
+    launch), each launch call 1 us long, and opening `marks`. Written over many
+    lines."""
     events = [
         {
             "cat": "user_annotation",
@@ -61,11 +57,9 @@ def _trace(path, kernels, tokens=100, marks=MARKS):
         {"cat": "user_annotation", "name": "ATOM::run_model", "ts": 0, "dur": 95},
         {"cat": "cpu_op", "name": "aten::mm", "ts": 5, "dur": 1},
     ]
-    for name in set(marks) - {PAUSED}:
+    for name in marks:
         a, b = MARKS[name]
         events.append({"cat": "user_annotation", "name": name, "ts": a, "dur": b - a})
-    for a, _ in paused:
-        events.append({"cat": "user_annotation", "name": PAUSED, "ts": a, "dur": 0})
     for corr, (name, start, end, launch) in enumerate(kernels):
         args = {"correlation": corr}
         events.append(
@@ -102,17 +96,20 @@ def _run(
     marks=(MARKS, MARKS),
     collective=KERNELS[2][0],
     slow=(),
+    late_draft=False,
 ):
     """A trace run's directory: its record's one line and each rank's trace,
     opening its `marks`, rank 1's K1 starting 5 us earlier, its collective,
-    named `collective`, at 50, and each kernel named in `slow` running 7 us
-    longer."""
+    named `collective`, at 50, under `late_draft` its D2 launched at 127 and
+    starting at 128, and each kernel named in `slow` running 7 us longer."""
     steps = tmp_path / "steps"
     steps.mkdir()
     line = {"step": 7, "rows": [[100, 100, False]], "d_target_ns": 1}
     line.update(d_draft_kv_ns=1, d_propose_ns=1)
     (steps / "dp0.jsonl").write_text(json.dumps(line) + "\n")
     late = {"k1": (5, 20, 1), KERNELS[2][0]: (50, 60, 45)}
+    if late_draft:
+        late["allgather_naive"] = (128, 130, 127)
     for r, name in enumerate(ranks):
         kernels = [(k, *late[k]) if r and k in late else (k, *x) for k, *x in KERNELS]
         kernels = [(k, a, b + 7 * (r and k in slow), q) for k, a, b, q in kernels]
@@ -130,12 +127,10 @@ def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
 ):
     """The named result. Rank 0's target: union 39, gaps 2 + 1 + 1 + 1, the
     collective (an all-reduce, or the mono runner's peer fence) from rank 1's
-    start and its gap capped, 44; rank 1's 48.5, its K1 5 longer and no gap
-    before the sampler, launched after its paused draft-KV pass, its queued
-    gaps 2 and 1. The draft: DK, D1 and D2, their union 12 and gaps 1 + 1 + 1;
-    the draft-KV pass DK, the propose pass D1 and D2. Each rank opens the ranges its real recorder opens under ATOM's
-    profiler: rank 1 pauses it for the drafter's passes, so the draft's
-    collective is on rank 0 alone and aligns with none."""
+    start and its gap capped, 44; rank 1's 49, its K1 5 longer. The draft, alike
+    on both ranks: DK, D1 and D2, their union 12 and gaps 1 + 1 + 1; the
+    draft-KV pass DK, the propose pass D1 and D2. Each rank opens the ranges its
+    real recorder opens under ATOM's profiler: every rank, every range."""
     marks = [set(_opened(tmp_path / f"r{r}", monkeypatch, r)[2]) for r in (0, 1)]
     monkeypatch.setattr(busy, "CHUNK", 64)  # a decode straddles every read
     path = busy.reduce(_run(tmp_path, marks=marks, collective=collective))
@@ -145,7 +140,7 @@ def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
     assert got == [
         {
             "step": 7,
-            "b_target_ns": 48500,
+            "b_target_ns": 49000,
             "b_draft_ns": 15000,
             "b_propose_ns": 11000,
             "b_draft_kv_ns": 4000,
@@ -153,56 +148,32 @@ def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
     ]
 
 
-def test_the_drafter_s_passes_are_rank_0_s_though_another_rank_traced_them(tmp_path):
-    """Rank 1 traced the drafter too, its K2, DK and D1 7 us longer: the target
-    takes the larger rank, rank 1's 53.5 (union 49, gaps 2 + 1 and its cap of
-    1.5 once), the draft and its passes rank 0's alone."""
+def test_each_pass_takes_its_largest_rank(tmp_path):
+    """Rank 1 ran its K2, DK and D1 7 us longer: each pass is rank 1's, the
+    target 53.5 (union 49, gaps 2 + 1 and its cap of 1.5 once), the draft 25,
+    its draft-KV pass 11.5 and its propose pass 13.5."""
     path = busy.reduce(_run(tmp_path, slow=("k2", "dk", "d1")))
 
     got = json.loads(path.read_text())
     assert got["b_target_ns"] == 53500
     assert (got["b_draft_ns"], got["b_propose_ns"], got["b_draft_kv_ns"]) == (
-        15000,
-        11000,
-        4000,
+        25000,
+        13500,
+        11500,
     )
 
 
-#: `KERNELS` device-paced: each launched before the one ahead of it ends, K4
-#: running to 95, so the sampler is queued when the draft-KV pass's DK ends.
-PACED = [
-    ("k1", 10, 20, 1),
-    ("k2", 22, 30, 3),
-    ("cross_device_reduce_1stage", 40, 60, 25),
-    ("k4", 61, 95, 37),
-    ("dk", 96, 99, 81),
-    ("sample", 100, 102, 92),
-    ("d1", 120, 125, 111),
-    ("allgather_naive", 126, 130, 113),
-]
-
-
-def test_a_paused_rank_counts_no_gap_across_the_paused_pass(tmp_path):
-    """Device-paced, both ranks alike, rank 1 paused for the drafter: its gap
-    from K4 to the sampler is DK's device time, so it counts nothing, rank 1's
-    target 87. The target is rank 0's 88 (union 74, queued gaps 2, 10, 1 and
-    1 whole), the draft-KV pass DK and its gap, 4: 92 in all, as on the
-    device."""
-    steps = tmp_path / "steps"
-    steps.mkdir()
-    line = {"step": 7, "rows": [[100, 100, False]], "d_target_ns": 1}
-    line.update(d_draft_kv_ns=1, d_propose_ns=1)
-    (steps / "dp0.jsonl").write_text(json.dumps(line) + "\n")
-    for r, marks in enumerate((MARKS, {TARGET_DONE, PAUSED})):
-        _trace(
-            tmp_path / "trace" / f"rank_{r}" / "m.pt.trace.json.gz", PACED, 100, marks
-        )
-    ranks = [busy.forwards(p) for p in sorted(tmp_path.glob("trace/*/*.gz"))]
-    busy._align(ranks)
-    assert [busy.busy(fs)[0]["target"] for fs in ranks] == [88000, 87000]
-
-    got = json.loads(busy.reduce(tmp_path).read_text())
-    assert (got["b_target_ns"], got["b_draft_kv_ns"]) == (88000, 4000)
+def test_a_drafter_collective_counts_from_its_latest_rank_s_start(tmp_path):
+    """Rank 1 launched D2, the propose pass's collective, at 127 and started it
+    at 128, after rank 0's D1 ended at 125: on rank 0 its gap is then capped, as
+    on rank 1, and both ranks' caps are 1.5. Each rank's propose pass is D1, 5
+    and its capped gap, and D2, 2 and its capped gap: 10."""
+    got = json.loads(busy.reduce(_run(tmp_path, late_draft=True)).read_text())
+    assert (got["b_draft_ns"], got["b_propose_ns"], got["b_draft_kv_ns"]) == (
+        14500,
+        10000,
+        4500,
+    )
 
 
 @pytest.mark.parametrize(
@@ -293,14 +264,13 @@ def test_a_trace_run_profiles_from_before_its_ready_file_to_its_stop(
 def test_only_a_profiled_forward_marks_its_target_end_and_each_drafter_pass(
     tmp_path, monkeypatch, rank
 ):
-    """The target's end on every TP rank, though only rank 0 records; each
-    drafter pass on rank 0 alone, every other rank's profiler paused for it."""
+    """The target's end and each drafter pass on every TP rank, though only
+    rank 0 records."""
     runner, batches, names = _opened(tmp_path, monkeypatch, rank)
     outputs = sum(b.produces_output() for b in batches)
     assert names.count(TARGET_DONE) == outputs > 0
-    assert names.count(PROPOSE) == (0 if rank else outputs)
-    assert names.count(MARK + "d_draft_kv_ns") == (0 if rank else len(batches))
-    assert names.count(PAUSED) == (outputs + len(batches) if rank else 0)
+    assert names.count(PROPOSE) == outputs
+    assert names.count(MARK + "d_draft_kv_ns") == len(batches)
 
     def opened(name):
         raise AssertionError(f"{name} opened with no profiler running")

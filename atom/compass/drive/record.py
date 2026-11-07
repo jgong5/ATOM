@@ -22,8 +22,7 @@ client run it served included; `parity.served` splits it per client run.
 
 `--trace` makes it a trace run, a second run of a record's recipe and client
 that labels its prefill passes: the server runs ATOM's profiler on every rank
-from before the first request to its stop (`serve`), the drafter's passes on
-rank 0 alone (`parity.StepRecording`), and the record gets its
+from before the first request to its stop (`serve`), and the record gets its
 busy lines (`parity.busy`) before its cost lines. A run under DP or pipeline
 stages refuses it before its server starts.
 

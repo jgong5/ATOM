@@ -3,8 +3,7 @@
 
 A trace run is `compass record --trace`: its server ran under ATOM's kineto
 profiler on every TP rank, without Python stacks, from before the first
-request to its stop, every rank but 0 paused for each drafter pass, and each
-rank wrote ``OUT/trace/rank_<r>/`` one gzipped
+request to its stop, and each rank wrote ``OUT/trace/rank_<r>/`` one gzipped
 chrome trace. `reduce` writes ``OUT/steps/dp0.busy.jsonl``: per line of the
 record, its ``step`` and ``b_target_ns``, and on an MTP record ``b_draft_ns``
 and, for each drafter pass `PASSES` names that the line times, its busy time
@@ -23,13 +22,10 @@ before one of them on the forward's device timeline: whole where that kernel's
 launch call had returned when the gap opened, so the device idled on its own,
 else capped at the rank's median such queued gap, since the device then waited
 for the host's launch. A TP collective's kernel on one rank includes its wait
-for the peers: the n-th target collective kernel (`COLLECTIVE`) of a forward
-counts on every rank from its latest rank's start, and as queued once its
-latest rank's launch call returned. A rank that paused its profiler for a
-drafter pass holds none of its kernels, so the gap before the first kernel
-launched after its `PAUSED` range opened holds that pass's device time and
-counts nothing. The target's busy time is its largest over the ranks; the
-draft's and each drafter pass's are rank 0's, the one rank that profiled them.
+for the peers: the n-th collective kernel (`COLLECTIVE`) of a forward, the
+target's or the drafter's, counts on every rank from its latest rank's start,
+and as queued once its latest rank's launch call returned. Each pass's busy
+time is its largest over the ranks.
 
 A trace directory not named ``rank_<r>``, a DP or a pipeline run's, refuses:
 per-rank busy time under DP is not reduced.
@@ -44,7 +40,7 @@ from pathlib import Path
 
 from atom.compass.backends.json_file import read_jsonl
 from atom.compass.backends.step_labels import TRACE
-from atom.compass.parity import MARK, PAUSED, TARGET_DONE
+from atom.compass.parity import MARK, TARGET_DONE
 
 RECORD = "steps/dp0.jsonl"
 GPU = ("kernel", "gpu_memcpy", "gpu_memset")
@@ -90,8 +86,7 @@ def events(path):
 def forwards(path) -> list[dict]:
     """One rank's forwards: each its ``tokens`` and its ``kernels``, each
     (start, end, launch return, pass, its drafter pass's line field or None,
-    name, whether it is the first launched after a `PAUSED` range), in start
-    order."""
+    name), in start order."""
     ranges, runs, marks, launches, kernels = [], [], [], {}, []
     for e in events(path):
         cat, ts = e.get("cat"), e.get("ts")
@@ -113,14 +108,13 @@ def forwards(path) -> list[dict]:
     for f0, f1, name in ranges:
         mine = [m for m in marks if f0 <= m[0] <= f1]
         done = [m[0] for m in mine if m[2] == TARGET_DONE]
-        drafts = [m for m in mine if m[2] not in (TARGET_DONE, PAUSED)]
+        drafts = [m for m in mine if m[2] != TARGET_DONE]
         out.append(
             {
                 "tokens": int(re.search(r"tokens=(\d+)", name).group(1)),
                 "run": min((t for t in runs if f0 <= t <= f1), default=f0),
                 "end": min(done or [m[0] for m in drafts] or [f1 + 1]),
                 "drafts": drafts,
-                "pauses": [m[0] for m in mine if m[2] == PAUSED],
                 "kernels": [],
             }
         )
@@ -135,30 +129,22 @@ def forwards(path) -> list[dict]:
         key = next((m[len(MARK) :] for m in inside), None)
         f["kernels"].append((launch, start, stop, queued, part, key, name))
     for f in out:
-        resumed = {
-            min((k for k in f["kernels"] if k[0] > p), default=None)
-            for p in f.pop("pauses")
-        }
-        f["kernels"] = sorted((*k[1:], k in resumed) for k in f["kernels"])
+        f["kernels"] = sorted(k[1:] for k in f["kernels"])
     return out
 
 
 def _align(ranks: list[list[dict]]) -> None:
-    """Start each forward's n-th target collective kernel on every rank no
-    earlier than its latest rank's start, queued at its latest launch return."""
+    """Start each forward's n-th collective kernel on every rank no earlier
+    than its latest rank's start, queued at its latest launch return."""
     for fs in zip(*ranks):
         calls = [
-            [
-                j
-                for j, k in enumerate(f["kernels"])
-                if k[3] == "target" and COLLECTIVE.search(k[5])
-            ]
+            [j for j, k in enumerate(f["kernels"]) if COLLECTIVE.search(k[5])]
             for f in fs
         ]
         if len({len(c) for c in calls}) > 1:
             raise ValueError(
                 f"the ranks' forward of {fs[0]['tokens']} tokens runs "
-                f"{[len(c) for c in calls]} target collective kernels"
+                f"{[len(c) for c in calls]} collective kernels"
             )
         for n in range(len(calls[0])):
             ks = [f["kernels"][c[n]] for f, c in zip(fs, calls)]
@@ -171,11 +157,10 @@ def _align(ranks: list[list[dict]]) -> None:
 
 def _walk(kernels):
     """Per kernel in start order: its passes, the union it adds, and the gap
-    before it, none after a paused pass, with whether it was queued when the
-    gap opened."""
+    before it with whether it was queued when the gap opened."""
     end = None
-    for start, stop, queued, part, key, _, resumed in kernels:
-        gap = start - end if end is not None and start > end and not resumed else 0.0
+    for start, stop, queued, part, key, _ in kernels:
+        gap = start - end if end is not None and start > end else 0.0
         was = end is not None and queued is not None and queued <= end
         add = stop - max(start, end) if end is not None else stop - start
         end = stop if end is None else max(end, stop)
@@ -225,8 +210,10 @@ def reduce(out) -> Path:
     per_rank = [busy(fs) for fs in ranks]
     rows = []
     for i, s in enumerate(lines):
-        got = {p: per_rank[0][i].get(p, 0) for p in ("draft", *PASSES)}
-        got["target"] = max(r[i].get("target", 0) for r in per_rank)
+        got = {
+            p: max(r[i].get(p, 0) for r in per_rank)
+            for p in ("target", "draft", *PASSES)
+        }
         row = {"step": s["step"], "b_target_ns": got["target"]}
         if "d_target_ns" in s:
             row["b_draft_ns"] = got["draft"]
