@@ -63,10 +63,14 @@ A step's host labels are its segments: `E` from the previous forward's exit,
 cut as idle after an idle engine (`busy_gaps`); `W_pre` to the launch, less
 the staging gate's wait; `W_launch` from the launch to the token copy wait,
 the sampler's launch included, or to the launch's end on a forward with no
-such wait, and none on a prefill the host did not pace whose launch ends
-after its device ran `HELD_SHARE` of its device window, placed by the lead:
-that launch waited on the device; `W_post` from that wait's end to the exit,
-less the draft copy wait, and a middle chunk has none. A prefill is host-paced
+such wait, and none on a prefill the host did not pace whose launch began
+before the device ended the forward before it and ends after its device ran
+`HELD_SHARE` of its device window, placed by the lead: that launch waited on
+the device; `W_post` from that wait's end to the exit, less the draft copy
+wait, and a middle chunk has none. A launch begun on a device that had ended
+every earlier forward has no earlier work to wait for: the device starts with
+it, so the share of the window it outlasts is the launch's own length.
+A prefill is host-paced
 when its exit event ran less than `PACED_SHARE` of its device window after the
 host recorded it. With an MTP status wait,
 `W_pre` ends at it and `W_inputs` runs from it to the launch. On a later
@@ -115,10 +119,10 @@ TRACE = "trace"
 #: its host record makes it host-paced: between the two clusters the DSpark TP2
 #: records show, host-paced output prefills at 0 to 4.3%, device-paced at 11% up.
 PACED_SHARE = 0.08
-#: A prefill whose launch ends after its device ran more than this share of its
-#: device window waited on the device inside the launch. On the DeepSeek-V4-Pro
-#: DPA8 MI355X records, launches over 0.5 s end past it on 99.5%, shorter ones
-#: before it on 99.2%.
+#: A prefill launch begun before the device ended the forward before it, which
+#: ends after its device ran more than this share of its device window, waited
+#: on the device inside the launch. On the DeepSeek-V4-Pro DPA8 MI355X records,
+#: launches over 0.5 s end past it on 99.5%, shorter ones before it on 99.2%.
 HELD_SHARE = 0.2
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
 TABLE_VERSION = 1
@@ -262,7 +266,9 @@ def mtp_copy(lines) -> dict[int, tuple[int, bool]]:
 
 def _host_cut(lines) -> tuple[set[int], set[int]]:
     """The steps whose device start precedes their host launch end, and the
-    prefill steps the host did not pace whose launch the device held."""
+    prefill steps the host did not pace whose launch the device held: begun
+    before the device ended the forward before it, the launch ended after the
+    device ran `HELD_SHARE` of its own window."""
     (lines_timed, lead), output_end, timed = _timed(lines), None, []
     for s, start in lines_timed:
         bound = None
@@ -298,6 +304,9 @@ def _host_cut(lines) -> tuple[set[int], set[int]]:
         for s, start, _ in timed
         if not all(r[2] for r in s["rows"])
         and s["step"] not in paced
+        # The window before it, placed by the lead, ends after the launch begins.
+        and "d_gap_ns" in s
+        and start - s["d_gap_ns"] + lead > s["t_launch_ns"][0]
         and s["t_launch_ns"][1] - start - lead
         > HELD_SHARE * s.get("d_target_ns", s["d_busy_ns"])
     }

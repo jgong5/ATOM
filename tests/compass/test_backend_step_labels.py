@@ -528,6 +528,30 @@ def test_a_prefill_launch_the_device_held_gives_no_W_launch_label(tmp_path):
     assert label(later)[1] == table
 
 
+def test_a_prefill_launch_begun_on_an_idle_device_keeps_its_W_launch_label(tmp_path):
+    """From step 40 on, each middle chunk launches for twice its device price
+    while the decode before it still runs, and each output prefill launches for
+    half its price after an idle engine: both launches end after the device ran
+    a fifth of their label. The middle chunk's launch queued behind the decode
+    and waited on the device. The output prefill's device had run every forward
+    before it, so its launch was the host's alone: it keeps its `W_launch`."""
+    steps, held, alone = _steps(14, n=80), list(range(40, 80, 4)), range(42, 80, 4)
+    scale = {}
+    for n in (*held, *alone):
+        rows = steps[n][0]
+        x = (1, sum(r[0] for r in rows), len(rows))
+        kind, times = ("middle", 2) if n in held else ("prefill", 0.5)
+        launch = float(np.dot(HOST[kind]["W_launch"], x))
+        scale[(n, "W_launch")] = times * steps[n][2] / launch
+    record = _timed_record(
+        tmp_path / "dp0.jsonl", steps, [n - 1 for n in alone], scale=scale
+    )[0]
+    samples, table = label(record)
+
+    assert [s.step for s in samples if "W_launch" not in s.host] == held
+    assert [row["step"] for row in table if row["W_launch"] is None] == held
+
+
 def test_a_dp_view_counts_its_step_s_dummy_forwards_from_every_rank_s_line(tmp_path):
     """Step `i` of a DP4 run has `i % 4` ranks run a dummy forward. Each rank's
     view counts them, the run's records labelled together or one alone beside
