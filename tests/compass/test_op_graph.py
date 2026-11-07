@@ -1449,7 +1449,9 @@ def test_a_dirty_tree_s_lazy_trace_answers_its_run_and_publishes_nothing(
 def test_a_run_file_op_graph_traces_from_the_server_s_arguments(monkeypatch, tmp_path):
     seen = []
     monkeypatch.setattr(
-        compass_run, "_op_graphs", lambda *a: seen.append(a[3:]) or (lambda *s: None)
+        compass_run,
+        "_op_graphs",
+        lambda *a, **kw: seen.append(a[3:]) or (lambda *s: None),
     )
     _installed(monkeypatch, tmp_path, op_graph=True, atom_args=["--model", "m"])
 

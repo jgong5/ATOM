@@ -206,21 +206,26 @@ def structure(
     device: str | None = None,
     output: bool = True,
     draft: bool = False,
+    env: dict | None = None,
 ) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the arch of `device`, else
     `device_arch()`, the engine config a step law is keyed by less its ladder
     (`run.step_grid.keyed`), which names every variable that picks a kernel and
-    a drafter's method and width, the TP width, the DP width and the EP group's
-    when they are set, the phase and the mode, `config`'s unless `eager` names
-    it, ``no output`` unless the step produces output (`output`), and ``draft``
-    for the drafter's part of the step (`draft`), ``draft kv`` for a block
-    drafter's draft-KV pass on a step that samples (`draft` is `KV`)."""
+    a drafter's method and width, its performance environment `env` when given,
+    as an engine file states one, else this process's, the TP width, the DP
+    width and the EP group's when they are set, the phase and the mode,
+    `config`'s unless `eager` names it, ``no output`` unless the step produces
+    output (`output`), and ``draft`` for the drafter's part of the step
+    (`draft`), ``draft kv`` for a block drafter's draft-KV pass on a step that
+    samples (`draft` is `KV`)."""
     from atom.compass.run import _file_digest
     from atom.compass.run.step_grid import keyed
 
     digest = _file_digest(config.model, "config.json")
     engine = keyed(config, ladder=False)
+    if env is not None:
+        engine["env"] = env
     engine = json.dumps(engine, sort_keys=True, separators=(",", ":"))
     mode = "eager" if (config.enforce_eager if eager is None else eager) else "graph"
     arch, device = config.hf_config.architectures[0], device or device_arch()
