@@ -639,6 +639,29 @@ def test_a_slow_report_with_no_errored_request_keeps_the_hold_waiting(
     assert passed == [None] and calls[-1] == INF
 
 
+def test_a_grant_resolves_only_the_clock_waits_it_makes_due(tmp_path):
+    """Waits for 2 and 5, with a grant at 1 that comes before the time asked,
+    as an arrival's does: each wait resolves at the grant that reaches its
+    time, and each clock call asks for the earliest one pending."""
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, set())])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        resolved = {}
+
+        async def waiter(t):
+            await traffic.wait(t)
+            resolved[t] = traffic.now()
+
+        await asyncio.gather(waiter(2.0), waiter(5.0))
+        traffic.done.cancel()
+        return resolved, rt.calls
+
+    resolved, calls = _run(main())
+    assert resolved == {2.0: 2.0, 5.0: 5.0}
+    assert calls == [2.0, 2.0, 5.0]
+
+
 class ScriptedConn:
     """A Clock Authority connection whose grants are scripted: grant ``k``
     releases stream seq ``k`` at ``k + 1``, then ``+inf`` ends the run. Each
@@ -689,6 +712,76 @@ def test_a_pass_scans_only_the_open_stream_events(tmp_path):
     passed, held_at_call, rt = _run(main())
     assert passed == list(range(n)) and rt.now == INF
     assert held_at_call == [0] * (n + 1)
+
+
+class ReportedDuringTheCall(ScriptedConn):
+    """Grant ``k`` releases stream seq ``k - 1`` of request 0, the last one
+    final; that event's report reaches the traffic LP's socket while the owner
+    is blocked in the clock call, as a worker's report usually does. Each grant
+    also puts a marker on the event loop, and each clock call records how many
+    markers have run: the loop's turns since the first grant."""
+
+    def __init__(self, grants: int) -> None:
+        super().__init__(grants)
+        self.push = self.pull = None
+        self.turns, self.turns_at_call = [], []
+
+    def send(self, msg) -> None:
+        super().send(msg)
+        self.turns_at_call.append(len(self.turns))
+
+    def recv(self):
+        if self.k < self.grants:
+            seq = self.k
+            last = seq == self.grants - 1
+            self.push.send_pyobj((_key(0), seq, float(seq + 1), last))
+            while not self.pull.get(zmq.EVENTS) & zmq.POLLIN:
+                time.sleep(0.001)
+            asyncio.get_running_loop().call_soon(self.turns.append, seq)
+        return super().recv()
+
+
+def test_a_report_in_the_socket_at_its_grant_counts_without_a_turn_of_the_event_loop(
+    tmp_path, monkeypatch
+):
+    """The owner takes each report already in its socket and asks for its next
+    time with no turn of the event loop between, while a pacing timer waits on
+    the clock for a time past every grant; only the final event's grant, whose
+    return aiperf must take, waits for one."""
+    n = 20
+
+    async def main():
+        conn = ReportedDuringTheCall(n)
+        conn.rt = rt = LPRuntime(LpId("traffic"), TABLE, conn)
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        monkeypatch.setattr(ClockPacedLoopScheduler, "clock", traffic)
+        scheduler = ClockPacedLoopScheduler()
+        scheduler.schedule_later(10.0 * n, _nothing())
+        conn.pull = traffic._pull
+        conn.push = zmq.Context.instance().socket(zmq.PUSH)
+        conn.push.connect(addresses(str(tmp_path / "lp"))[1])
+        passed = []
+
+        async def on_return(worker_id, ret):
+            passed.append(ret.credit.id)
+
+        traffic.send(_key(0))
+        await traffic.hold(on_return)(
+            "worker_0", SimpleNamespace(credit=_credit(0), error=None)
+        )
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 10)
+        finally:
+            conn.push.close(linger=0)
+            scheduler.cancel_all()
+        return passed, conn.turns_at_call
+
+    passed, turns_at_call = _run(main())
+    assert passed == [0]
+    # Call k follows grant k; the loop first turns in the final event's hold,
+    # after grant n.
+    assert turns_at_call == [0] * n + [n]
 
 
 def test_a_raising_return_callback_does_not_stop_later_returns(tmp_path, caplog):

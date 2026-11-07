@@ -72,14 +72,19 @@ OTHER_TIMING_MODES = {
 
 
 class StandInClock:
+    """A clock that reaches each time it is asked for at once."""
+
     def __init__(self) -> None:
         self.t = T0
 
     def now(self) -> float:
         return self.t
 
-    async def advance_to(self, t: float) -> None:
+    def wait(self, t: float) -> asyncio.Future:
         self.t = t
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result(None)
+        return fut
 
 
 def _wall_timer(*args, **kwargs):
@@ -403,7 +408,8 @@ def test_an_unbound_clock_refuses_the_phase_runner(monkeypatch):
 
 
 class GrantingClock:
-    """A clock whose ``advance_to`` suspends until ``grant()`` wakes every wait at once."""
+    """A clock whose ``grant()`` moves it to the earliest wait and resolves the
+    waits due then, as the traffic LP's grants do."""
 
     def __init__(self) -> None:
         self.t = T0
@@ -412,15 +418,20 @@ class GrantingClock:
     def now(self) -> float:
         return self.t
 
-    async def advance_to(self, t: float) -> None:
+    def wait(self, t: float) -> asyncio.Future:
         fut = asyncio.get_running_loop().create_future()
         self.waits.append((t, fut))
-        await fut
+        return fut
+
+    def withdraw(self, fut: asyncio.Future) -> None:
+        self.waits = [w for w in self.waits if w[1] is not fut]
+        fut.set_result(None)
 
     def grant(self) -> None:
-        waits, self.waits = self.waits, []
-        self.t = min(t for t, _ in waits)
-        for _, fut in waits:
+        self.t = min(t for t, _ in self.waits)
+        due = [fut for t, fut in self.waits if t <= self.t]
+        self.waits = [w for w in self.waits if w[0] > self.t]
+        for fut in due:
             fut.set_result(None)
 
 
@@ -491,6 +502,34 @@ def test_a_timer_due_before_the_driver_wait_starts_at_its_own_time(
         return started
 
     assert asyncio.run(main()) == expected
+
+
+def test_a_cancel_moves_the_clock_wait_to_the_next_timer_or_withdraws_it(
+    monkeypatch,
+):
+    """The driver waits on the clock for the earlier of two timers. Its cancel
+    leaves the clock waiting for the other; the phase end's ``cancel_all()``
+    leaves it waiting for nothing."""
+
+    async def main():
+        clock = GrantingClock()
+        monkeypatch.setattr(ClockPacedLoopScheduler, "clock", clock)
+        scheduler = ClockPacedLoopScheduler()
+        first = scheduler.schedule_later(1.0, _nothing())
+        scheduler.schedule_later(5.0, _nothing())
+        asked = []
+        for cancel in (
+            lambda: None,
+            lambda: scheduler.cancel_handle_id(first),
+            scheduler.cancel_all,
+        ):
+            cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+            asked.append([t - T0 for t, _ in clock.waits])
+        return asked
+
+    assert asyncio.run(main()) == [[1.0], [5.0], []]
 
 
 @pytest.mark.parametrize(
@@ -573,7 +612,7 @@ class _CountedTimer(scheduler_module._Timer):
 def test_a_wake_with_nothing_due_reads_as_many_timers_with_2000_pending_as_with_10(
     monkeypatch,
 ):
-    """Every grant wakes the driver; one that finds no timer due costs the same
+    """A cancel wakes the driver; one that finds no timer due costs the same
     however many timers are pending."""
 
     async def reads_a_wake(pending):
@@ -583,15 +622,14 @@ def test_a_wake_with_nothing_due_reads_as_many_timers_with_2000_pending_as_with_
         scheduler = ClockPacedLoopScheduler()
         for k in range(pending):
             scheduler.schedule_later(100.0 + k, _nothing())
+        # Due after all the others: each one's cancel wakes the driver, which
+        # then finds the same timer first.
+        later = [scheduler.schedule_later(10_000.0 + k, _nothing()) for k in range(20)]
         await asyncio.sleep(0)
         reads = []
-        for k in range(1, 21):
-            # Another wait, due first, takes each grant.
-            other = asyncio.ensure_future(clock.advance_to(T0 + k))
-            await asyncio.sleep(0)
+        for handle_id in later:
             before = _CountedTimer.reads
-            clock.grant()
-            await other
+            scheduler.cancel_handle_id(handle_id)
             for _ in range(3):
                 await asyncio.sleep(0)
             reads.append(_CountedTimer.reads - before)
