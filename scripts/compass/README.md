@@ -328,11 +328,14 @@ watchdog line, and the server log shows HSA's `HW Exception by GPU node-N ...
 reason :GPU Hang`. Either way, removing the stalled queue makes one card's MES
 time out (`MES(0, 0) failed to respond to msg=REMOVE_QUEUE` in dmesg), and that
 card resets (`device wedged, but recovered through reset`) and passes a GEMM
-check afterwards. The card differs between runs. A wave dump taken before a reset
-(loss A in [#2922's record](https://github.com/jgong5/ATOM/issues/2922#issuecomment-6703152077))
-showed a workgroup in the context-save trap with stores that never complete. The
-record holds the rate, its exposure, and the runs that did not reproduce it: no
-fix is shown by three clean runs. For cell A, #2147 gives a run lost to this
+check afterwards. The card differs between runs. Wave dumps taken before a reset
+([#2922's record](https://github.com/jgong5/ATOM/issues/2922#issuecomment-6703152077))
+show a few waves on one WGP of the stalled card whose stores never complete: in
+their kernel while the other cards' waves wait in a collective for them, or in the
+context-save trap once a removal has begun. py-spy can show every rank at the next
+step's start, waiting in `D2HQueue.receive` for the previous step's output copy.
+The record holds the rate, its exposure, and the runs that did not reproduce it:
+no fix is shown by three clean runs. For cell A, #2147 gives a run lost to this
 signature one retake and makes a second loss at one concurrency a leftover on
 #2922 ([#2147's term](https://github.com/jgong5/ATOM/issues/2147#issuecomment-6703124926)).
 
