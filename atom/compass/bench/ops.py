@@ -1668,18 +1668,18 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
     else among the last layers, `name.i`, of tensors stacked by layer whose
     layer has that layout: ATOM passes a layer of DeepSeek-V4's compressor
     state, and another field's base at this one's slot stride reaches past
-    the pool; else among the tensors of its strides and dtype it lies inside,
-    each cut from its end in every dim but the widest-strided (DeepSeek-V4.1's
-    cursor history); else among the buffers of arenas, as its dtype views them
+    the pool; else among the buffers of arenas, as its dtype views them
     (`_bound`), whose fields' strided views ATOM carves out of them, the
     capture's pool sizing a dimension other than the widest-strided;
     or why none fits, and None: a tensor of another layout is another buffer
     than the one ATOM passes. A flat one takes first an arena's buffer, of its
-    own dtype first, of which it fills whole entries (`_entry`), as the
-    capture's pool sized it. One short of an arena's buffer that ends its
-    tensor by less than an entry binds that tensor's end: the window ring ATOM
-    cuts from V4.1's pool (`ring_view`), when the capture held the bench's
-    state slots."""
+    own dtype first, whose whole entries (`_entry`) it fills, as the capture's
+    pool sized it. Before an arena's buffer, one takes a tensor in one, of its
+    strides and dtype, that it lies inside, cut from that tensor's end in
+    every dim but the widest-strided (V4.1's cursor history). One short of an
+    arena's buffer that ends its tensor by less than an entry binds that
+    tensor's end: the window ring ATOM cuts from V4.1's pool (`ring_view`),
+    when the capture held the bench's state slots."""
     shape, stride, dtype = spec["shape"], spec["stride"], _dtype(spec["dtype"])
     nbytes = _span(shape, stride) * dtype.itemsize
     bufs = {n: (t, _entry(n, live)) for n, t in live.items() if ".buf." in n}
@@ -1701,6 +1701,7 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
         for n, t in live.items()
         if (t.stride(), t.dtype) == (tuple(stride), dtype)
         and all(m >= k for _, (m, k) in dims(t))
+        and any(_inside(t, b) for b, _ in bufs.values())
     }
     flat = f".buf.{spec['dtype']}"
     own = own or {n: t for n, t in live.items() if n.endswith(flat)}
