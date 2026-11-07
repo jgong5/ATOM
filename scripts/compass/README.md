@@ -1063,17 +1063,25 @@ no cache directory above holds. A record names each module its server built, or
 began to, in run.json's `aiter_jit_builds`, and grading, `compass fit steps`,
 `compass fit host`, `step_linear_fit` and `validate.cost` refuse it, naming them.
 So sweep a fresh container before its first record, on a server whose record
-nothing reads: `compass record --gpu G $S --out $R/sweep1 -- $ATOM` with
+nothing reads: `compass record --sweep --gpu G $S --out $R/sweep1 -- $ATOM` with
 `client.sh $R/sweep1 --sweep --traces A-B --stop`, A to B every trace the cell's
-records serve. The sweep (`atom/compass/drive/sweep.py`) sends each DP rank a
-prefill step of every token count up to its budget, each step's rows designed
-(`atom/compass/drive/sweep_plan.py`), and after the stop keeps the points the
-step record covers in the store's JIT cache library, per stack and cell. Each
-round sends only the points still missing; take rounds with a fresh `--out`
-until its last line reads `swept`. A third round's missing points, `missing` in
-its `sweep.json`, are the residual to report with the cell: the sweep never
-constructs preemption, recompute or an error path. Take again any record
-refused for a build.
+records serve. `--sweep` adds the pacing variables the sweep's steps need
+(`sweep.pacing` in `atom/compass/drive/sweep.py`): ATOM's PrefillDelayer
+coalesces each step, and DP prefill balancing cuts no row; `client.sh --sweep`
+refuses a server started without them. The sweep sends every prefill token count
+up to the budget once, one count to each DP rank a round, then lockstep steps of
+designed rows queued behind parked decodes (`atom/compass/drive/sweep_plan.py`),
+and after the stop keeps the points the step record covers in the store's JIT
+cache library, per stack and cell. Each round sends only the steps still
+missing; take rounds with a fresh `--out` until its last line reads `swept`. A
+third round's missing points, `missing` in its `sweep.json`, are the residual to
+report with the cell: the sweep never constructs preemption, recompute or an
+error path. Under pipeline parallelism or RapidServe it sends the token counts
+alone and never marks the cell swept. A 1P1D cell's sweep runs on its prefill
+side, with that side's own ATOM arguments; its decode side and KV connector path
+are warmed by one short run of the whole cell after it, whose records nothing
+grades and whose stops write back to the library as any record's does. Take
+again any record refused for a build.
 What a container compiled need not be compiled again in the next one on the same
 stack: `compass record` with `$S`, and a `REAL=1 cctraces_sim.sh` run with `STORE`
 set, keep a JIT cache library per stack under the store's `jit` directory

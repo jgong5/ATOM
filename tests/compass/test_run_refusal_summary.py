@@ -94,7 +94,7 @@ def summary(
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     table = compass_run.channel_table(run)
     authority = compass_run._RecordingAuthority(run)
-    authority.started = authority.finished = time.monotonic()
+    authority.finished = time.monotonic()
 
     r = runner(backend)
     for tokens in prompts:

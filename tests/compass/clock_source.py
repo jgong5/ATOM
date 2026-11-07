@@ -103,8 +103,9 @@ CLOCK_READS = (
 #: does not collect the exemption.
 DEFAULT_ALLOW_LIST: dict[str, str] = {
     "atom/compass/run/__init__.py": (
-        "the run summary's wall seconds, from the run's start to its finish, "
-        "and each lazy trace's: the speed result, which no simulated time reads"
+        "the run summary's wall seconds, each client run's from its client's "
+        "first request to its end, and each lazy trace's: the speed result, "
+        "which no simulated time reads"
     ),
     "atom/compass/parity/runner.py": (
         "a real runner's step timestamps; a simulated run runs its own runner "

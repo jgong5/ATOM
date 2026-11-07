@@ -69,7 +69,8 @@ def probed(model_dir, tmp_path_factory):  # noqa: F811
     }
     root = tmp_path_factory.mktemp("v41_state")
     plain = v41_rule(model_dir, None)
-    (root / "batches.pkl").write_bytes(pickle.dumps(batches | {"rule": plain}))
+    pickled = batches | {"rule": plain, "drafted": rule}
+    (root / "batches.pkl").write_bytes(pickle.dumps(pickled))
     done = subprocess.run(
         [sys.executable, str(PROBE), str(root)],
         capture_output=True,
@@ -179,3 +180,101 @@ def test_a_dummy_batch_and_a_cache_that_keeps_no_position_are_left_alone(probed)
 def _first_id(probed):
     batches, _ = probed
     return batches["decode"].req_ids[0]
+
+
+@pytest.mark.parametrize("point", ["ops_verify", "ops_prefill"])
+def test_every_op_bench_placement_of_a_verify_or_cached_prefill_point_prepares(
+    probed, point
+):
+    """`Stub.point`'s placements of DSpark5's tentative verify rows, each
+    beginning over the last one's uncommitted state, and of a chunk past a
+    cached prefix, through V4.1's own builder: every one prepares."""
+    _, seen = probed
+    placed = seen[point]
+    assert placed["refused"] is None
+    assert len(placed["slots"]) > 1
+
+
+def test_a_leaf_of_v41s_state_counts_it_once_a_slot_its_placements_hold(probed):
+    """V4.1's compressor states, bound on its builder: the leaf's 7 placements
+    of two rows take the 4 slot pairs 8 slots hold, its states counted once a
+    pair, its activation once a copy."""
+    _, seen = probed
+    placed = seen["ops_v41_state"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    pairs = [[0, 1], [2, 3], [4, 5], [6, 7]]
+    assert placed["slots"] == pairs + pairs[:3]
+    assert set(record["metadata"].values()) == {
+        f"attn_metadata_builder.cache.state.{f}.0"
+        for f in ("compress_kv", "compress_score")
+    }
+    assert record["footprint_bytes"] == 7 * 32 + 4 * placed["read"]
+
+
+def test_a_v41_state_field_taken_whole_counts_each_row_s_slot_once_a_layer(probed):
+    """`aten.select.int` takes a layer of V4.1's state field from the whole
+    field, `[layers, slots, ...]`, its slots strided past its layers: each row's
+    slot counts once a layer, at the 4 slot pairs 8 slots hold, and no slot
+    past the rows'."""
+    _, seen = probed
+    placed = seen["ops_v41_field"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert set(record["metadata"].values()) == {
+        f"attn_metadata_builder.cache.state.{f}" for f in ("window", "compress_score")
+    }
+    assert record["footprint_bytes"] == 7 * 32 + 4 * placed["read"]
+
+
+def test_a_v41_page_field_taken_whole_binds_it_and_counts_once_a_placement(probed):
+    """`aten.select.int` takes a layer of V4.1's page field from the whole
+    field, `[layers, pages, rows, dim]`, of the 4 PAGEs a capture's pool held:
+    it binds that field, not the state's buffer, so it counts once a placement."""
+    _, seen = probed
+    placed = seen["ops_v41_page"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert record["metadata"] == {"main_1": "attn_metadata_builder.cache.pages.main_1"}
+    assert record["footprint_bytes"] == 7 * 32 + 7 * placed["read"]
+
+
+@pytest.mark.parametrize(
+    "pool, slots",
+    [("whole", 8), ("ring", 8), ("ring", 4), ("ring", 16), ("ring0", 8)],
+)
+def test_a_v41_window_ring_reached_through_its_pool_counts_once_a_slot(
+    probed, pool, slots
+):
+    """V4.1's pool, `[rows, dim]` over its PAGEs and its state arena, as a
+    capture's 4 PAGEs held it. Taken whole with its ring's window, a decode
+    row's token is the window ring row it writes, in the arena: it counts once
+    a slot pair of the 4 that 8 slots hold. Beside a ring cut from it
+    (`ring_view`), at a leaf stating its window of 8, the ring's rows a row's
+    window reads count once a slot pair, and the whole pool's selection, top-k
+    1 a row, once a placement, none at ratio 0; whether the capture held the
+    bench's 8 state slots or 4 or 16."""
+    _, seen = probed
+    placed = seen[f"ops_v41_{pool}_pool_{slots}"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert record["metadata"]["pool"] == "attn_metadata_builder.cache.pool"
+    ring = placed["ring"]
+    pages = placed["read"] - ring
+    assert record["footprint_bytes"] == 7 * 32 + 7 * pages + 4 * ring
+
+
+@pytest.mark.parametrize("point, tokens, sets", [("verify", 12, 4), ("prefill", 32, 7)])
+def test_a_v41_window_ring_written_through_its_pool_counts_a_row_a_token(
+    probed, point, tokens, sets
+):
+    """`_launch_rope_window` and `swa_write` take V4.1's pool whole, with its
+    ring's window, and write a row a token into a request's ring, its ring's
+    rows at most: DSpark5's two verify rows of 6 tokens write 12 rows, once a
+    slot pair of the 4 that 8 slots hold, and a 32-token chunk past a cached
+    prefix its ring's 8, once a placement's slot."""
+    _, seen = probed
+    placed = seen[f"ops_v41_write_{point}"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert record["footprint_bytes"] == 7 * 16 * tokens + sets * placed["ring"]

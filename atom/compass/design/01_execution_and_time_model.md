@@ -1304,7 +1304,9 @@ The rules that settle the boundaries #53's categories left in the wrong place:
   the loops it would have served do, and each spins rather than waits when there is
   nothing to run, because `pull_and_process_input_queue` drains with `get_nowait` and
   nothing else in the turn blocks: `EngineCore.busy_loop`, `DPEngineCoreProc.busy_loop`
-  and `PPEngineCoreProc._head_busy_loop`. D8's measurement of the prior design — first
+  and `PPEngineCoreProc._head_busy_loop`. On a real run `EngineCore.busy_loop` parks on
+  its input queue instead (`_wait_for_input`, #2613), which returns at once under a
+  simulated clock. D8's measurement of the prior design — first
   real step is tick 1, first simulated step is tick **89,336** — is this loop counted.
   Each becomes `next_event(t, t_daemon)`, `t` the LP's earliest essential local event and
   `t_daemon` its next daemon deadline (the metrics push). The PP bounded polls

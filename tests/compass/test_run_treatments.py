@@ -36,7 +36,7 @@ def dp_summary(monkeypatch, tmp_path, ranks):
     for rank, r in enumerate(ranks):
         monkeypatch.setattr(compass_run, "_member", f"dp{rank}")
         compass_run.engine_done(SimpleNamespace(runner_mgr=Worker(r)))
-    authority.started = authority.finished = time.monotonic()
+    authority.finished = time.monotonic()
     monkeypatch.setattr(compass_run, "_authority", authority)
     frontend = LPRuntime(compass_run.FRONTEND, table, None)
     frontend.now = math.inf
