@@ -167,16 +167,18 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   rank, without Python stacks (`07` D38, Phase 1c). Per forward and pass, split at
   `forward_done_event`, busy time is the union of the pass's kernels plus each gap before
   one of them: whole where that kernel was already queued when the gap opened, else capped
-  at the trace's median such queued gap. A TP collective counts from its last rank's start;
-  a target pass's busy time is its largest over the ranks. Drafter passes are traced on rank
-  0 alone, every other rank's profiler paused for them, and labelled from rank 0; a paused
-  rank counts no gap across the paused pass, which holds that pass's device time
-  ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6438763733)): with both
-  ranks profiled the draft-KV concatenation ran 6% long. A traced kernel shorter than about
-  4.7 us runs to that floor, so drafter labels stay 5 to 11% over unprofiled time until
-  [#2415](https://github.com/jgong5/ATOM/issues/2415) subtracts each kernel's floor
-  ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6460474362)). No cut,
-  threshold or interval. The
+  at the trace's median such queued gap. A TP collective, the target's or the drafter's,
+  counts from its last rank's start, and each pass's busy time is its largest over the
+  ranks. Every rank is profiled throughout and none pauses
+  ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6702728444)): on
+  crsuse2-m2m-v3-005 a pause ran `hipDeviceSynchronize` on its rank, and the peer waited
+  about 107 ms at the drafter's step-begin fence. With both ranks profiled the draft-KV
+  concatenation runs about 6% long; drafter labels keep that, and
+  [#2945](https://github.com/jgong5/ATOM/issues/2945) finds its cause. A traced kernel
+  shorter than about 4.7 us runs to that floor, so drafter labels stay 5 to 11% over
+  unprofiled time until [#2415](https://github.com/jgong5/ATOM/issues/2415) subtracts each
+  kernel's floor ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6460474362)).
+  No cut, threshold or interval. The
   prefill device law fits from trace runs only, and a fit given none names its prefill
   vector unfitted; a trace run's decodes and host segments are profiled, so it gives no
   decode or host label, and an ordinary record fits the decode and host laws. A trace run

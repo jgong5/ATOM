@@ -412,13 +412,11 @@ the host laws are fitted on.
 **The trace run** ([#2072](https://github.com/jgong5/ATOM/issues/2072)): a second run of
 a record's recipe and client, `compass record --trace`, under ATOM's kineto profiler on
 every TP rank without Python stacks, from before the first request to the server's stop,
-every rank but 0 paused for each drafter pass, so the drafter is traced on rank 0 alone
-(`09` D54).
+no rank pausing (`09` D54).
 `atom/compass/parity/busy.py` reduces its traces to each forward's busy time per pass,
 which labels prefill (`09` D54); its decodes and host segments are profiled and label
-nothing. The recorder marks where a forward's target ends and, on rank 0, where each
-drafter pass runs with profiler ranges, opened only while the profiler runs; on every
-other rank it pauses the profiler for the pass, marking where the pause starts. Every
+nothing. On every rank the recorder marks where a forward's target ends and where each
+drafter pass runs with profiler ranges, opened only while the profiler runs. Every
 trace run carries `09`'s
 profiler check.
 
