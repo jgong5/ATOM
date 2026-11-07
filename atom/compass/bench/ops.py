@@ -126,8 +126,11 @@ parallel layout, the digest of the machine spec of the device, stack and PTL
 state run.json reads, the source root and the point.
 
 `--plan` measures, in rounds, the points the steps of record directories call
-for (`record`'s or `trace steps`' output), capturing each `op_graph` S
-lacks on the run's first GPU as it reads (`_capture`):
+for (`record`'s or `trace steps`' output), under `--enable-tbo` a step its DP
+group split as its two micro-batches, as `trace ops --population` traces it
+(`population_steps`), capturing each `op_graph` S lacks on the run's first GPU
+as it reads (`_capture`), or, before any point, refusing one only that call
+traces:
 every leaf at every rung of ATOM's decode ladder at the steps' lowest and
 highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
@@ -135,6 +138,7 @@ and, when some step's rows are ragged, at a rung of more than one row on
 ragged rows too (`_means`): the first at the context, the rest sharing a mean,
 each `GRID`th of it from the least the rows hold; and each prefill family
 (`_family`) over a ladder of their token counts, chunk remainders among them,
+its shapes that state the rows a DP group gathers apart, as `fit ops` prices them,
 one of a kind that depends on context at each at the most cached tokens of
 steps of its rows, and over a ladder of them once those points and the fresh
 ones show the kind still does; then the point halfway between two neighbours
@@ -150,10 +154,11 @@ between its own least and most, at each of its cached-token counts
 resumed into DIR numbering on from the last round there, and after each round
 every point held, a measured one with its store token, in plan.jsonl.
 
-`--coverage` counts the steps of record directories that DIR's plan.jsonl
-covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
-a step only when `fit ops`' price list of those points prices each leaf, and
-prints the count by phase and why each leaf kind left the rest out.
+`--coverage` counts the steps of record directories, read as `--plan` reads
+them, that DIR's plan.jsonl covers (`coverage`), with the `op_graph`s of the
+arch DIR's run.json records, a step only when `fit ops`' price list of those
+points prices each leaf, and prints the count by phase and why each leaf kind
+left the rest out.
 """
 
 import argparse
@@ -172,6 +177,7 @@ import json
 import multiprocessing
 import os
 import re
+import shlex
 import statistics
 import sys
 import tempfile
@@ -958,12 +964,21 @@ class Stub:
             and "out_logits" in op["args"]
             and (op["args"].get("context_lens") or {}).get("role") != "activation"
         }
-        self.kv = {
-            (s, path): _kv(spec, path, _named(op, path, spec, held, self.known) or held)
+        bind = {
+            (s, path): (spec, _named(op, path, spec, held, self.known) or held)
             for s, (op, _) in found.items()
             for path, spec in _specs(op["args"])
             if spec["role"] == "kv"
         }
+        self.kv = {k: _kv(spec, k[1], live) for k, (spec, live) in bind.items()}
+        # a view of a pool holding the state arena past its pages, narrower than
+        # the widest of it its leaf takes, is a window ring, as `_plan` reads one
+        span = {k: _span(v["shape"], v["stride"]) for k, (v, _) in bind.items()}
+        named = {k: (k[0], self.kv[k][0]) for k in bind}
+        for k, (spec, live) in bind.items():
+            pooled = self.state.get(named[k][1])
+            if pooled and span[k] < max(span[j] for j in bind if named[j] == named[k]):
+                self.kv[k] = _kv(spec, k[1], live, ring=True)
         taken = len(rows) * self.per_row  # the batch's state slots
         room = [pool // blocks]
         room += [t.k_cache.shape[0] // taken for t in kv.values() if _stateful(t)]
@@ -1674,7 +1689,7 @@ def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:
     return name, t.as_strided(spec["shape"], spec["stride"], t.storage_offset())
 
 
-def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
+def _kv(spec, slot, live, ring=False) -> tuple[str, torch.Tensor | None]:
     """The live KV tensor a KV argument is a view of, and its name, picked as
     `_meta` picks among those whose layout past its widest-strided dim's size
     is its own (`_layout`), when any is: the capture's pool sized that one;
@@ -1689,10 +1704,9 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
     own dtype first, whose whole entries (`_entry`) it fills, as the capture's
     pool sized it. Before an arena's buffer, one takes a tensor in one, of its
     strides and dtype, that it lies inside, cut from that tensor's end in
-    every dim but the widest-strided (V4.1's cursor history). One short of an
-    arena's buffer that ends its tensor by less than an entry binds that
-    tensor's end: the window ring ATOM cuts from V4.1's pool (`ring_view`),
-    when the capture held the bench's state slots."""
+    every dim but the widest-strided (V4.1's cursor history). A `ring` (V4.1's
+    `ring_view`) binds the arena buffer ending its tensor, past its start by the
+    bytes it falls short of whole entries, or refuses past that buffer's."""
     shape, stride, dtype = spec["shape"], spec["stride"], _dtype(spec["dtype"])
     nbytes = _span(shape, stride) * dtype.itemsize
     bufs = {n: (t, _entry(n, live)) for n, t in live.items() if ".buf." in n}
@@ -1725,10 +1739,14 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
     except ValueError as error:  # the leaf refuses, not the point
         return str(error), None
     t, end = own[name], lambda x: x.storage_offset() + _span(x.shape, x.stride())
-    for b, e in bufs.values() if len(shape) > 1 else ():
-        ends = end(b) * b.itemsize == end(t) * t.itemsize
-        if ends and _inside(b, t) and 0 <= b.nbytes - nbytes < e:
-            view = t.as_strided(shape, stride, end(t) - _span(shape, stride))
+    for b, e in bufs.values() if ring else ():
+        if end(b) * b.itemsize == end(t) * t.itemsize and _inside(b, t):
+            n, room = -(-nbytes // e), b.nbytes // e
+            if n > room:
+                why = f"a window ring over {n} state slots; the bench holds {room}"
+                return f"{slot} {_text(spec)}: {why}", None
+            at = b.storage_offset() * b.itemsize + n * e - nbytes
+            view = t.as_strided(shape, stride, at // t.itemsize)
     return name, view
 
 
@@ -2331,7 +2349,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     from atom.compass.capture.forward import decode
     from atom.compass.runner.overrides import schedulable_ladder
 
-    steps = list(population_steps(args.plan))
+    steps = list(population_steps(args.plan, config.enable_tbo))
     contexts = [
         c for s, line in steps if s.phase == "decode" for c in _rows(line, s.seqs)
     ]
@@ -2342,6 +2360,13 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     )
     rungs = [decode(r) for r in schedulable_ladder(config)]
     graphs, done, tried = {}, {}, set()
+    prefills, cached = set(), defaultdict(list)
+    for s, line in steps:
+        if s.phase == "prefill":
+            prefills.add(s)
+            cached[s.seqs] += _cached(line)
+    # first, so a graph only `trace ops --population` traces refuses before any point
+    _load(store, config, args.store, prefills, graphs, None, atom_args, args.plan)
     # a run resumed into `out` keeps the rounds an earlier one wrote there
     rounds = [int(d.name[5:]) for d in out.glob("round*") if d.name[5:].isdigit()]
     first = max(rounds, default=-1) + 1
@@ -2393,17 +2418,12 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     for at in [c, *((c, m) for m in means)]:
                         fam = _family(shape, at, op["op"], sig, dependent)[0]
                         want[shape, at].add(fam)
-    prefills, cached = set(), defaultdict(list)
-    for s, line in steps:
-        if s.phase == "prefill":
-            prefills.add(s)
-            cached[s.seqs] += _cached(line)
-    _load(store, config, args.store, prefills, graphs, None, atom_args)
     seen = defaultdict(dict)
-    for shape in sorted(prefills):
+    for shape in sorted(prefills, key=str):  # G and W are None or a count
         for sig, (op, _) in graphs[shape].items():
             fam, tokens = _family(shape, None, op["op"], sig, dependent)
-            seen[fam].setdefault(tokens, (shape, op["op"], sig))
+            # `fit ops` keeps a shape that states G apart from one that does not
+            seen[fam, not shape.gathered].setdefault(tokens, (shape, op["op"], sig))
 
     def cached_ladder(top_only: bool) -> dict:
         """The points of each prefill family over its rows' cached tokens, of
@@ -2423,7 +2443,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                         want[shape, c].add(fam)
         return want
 
-    for fam, at in seen.items():
+    for (fam, _), at in seen.items():
         for tokens in _ladder(at):
             want[at[tokens][0], None].add(fam)
     for point, fams in cached_ladder(top_only=True).items():
@@ -2481,7 +2501,8 @@ def _eager(config) -> None:
 
 def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     """How the measured points among `records` cover the steps of the record
-    directories `names`: the steps and those covered by phase, and per leaf
+    directories `names`, each micro-batch of a step its DP group split under
+    two-batch overlap a step: the steps and those covered by phase, and per leaf
     kind the steps it left out by why. A step is covered when each leaf of its
     `op_graph` lies on a point or between two of one kernel (`_bracket`): a
     decode leaf of a kind that depends on context over its rows' lowest to
@@ -2495,7 +2516,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     from atom.compass.capture import population_steps
     from atom.compass.fit.ops import PriceList, fit, held_out
 
-    steps = list(population_steps(names))
+    steps = list(population_steps(names, config.enable_tbo))
     dependent = _dependent(records)
     held_out(params := fit([r for r in records if "refused" not in r]))
     listed = PriceList(params)
@@ -2505,7 +2526,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
         if cut := _cut(fam):
             cuts[cut[0]][cut[1]] = axes[fam]
     graphs, report, out = {}, defaultdict(Counter), defaultdict(Counter)
-    _load(store, config, root, {s for s, _ in steps}, graphs, arch, atom_args)
+    _load(store, config, root, {s for s, _ in steps}, graphs, arch, atom_args, names)
     families = {
         s: [
             (op["op"], *_family(s, None, op["op"], sig, dependent), op)
@@ -2605,10 +2626,14 @@ def _ladder(values) -> list:
 
 
 def _shape(text: str):
+    """The `Shape` whose `str` is `text`, each count read by its name."""
     from atom.compass.capture.forward import decode, prefill
+    from atom.compass.fit.ops import shape_counts
 
-    counts = [int(n) for n in re.findall(r"=(\d+)", text)]
-    return prefill(*counts) if text.startswith("prefill") else decode(*counts)
+    n = shape_counts(text)
+    if text.startswith("prefill"):
+        return prefill(n["T"], n["B"], n.get("G"), n.get("W"))
+    return decode(n["B"], n.get("G"), n.get("T"))._replace(width=n.get("W"))
 
 
 def _abstract(value, n: int):
@@ -2884,30 +2909,37 @@ def _apart(p, q) -> bool:
     return hi - lo > BENDS * lo
 
 
-def _load(store, config, root, shapes, graphs: dict, arch=None, atom_args=()) -> None:
+def _load(
+    store, config, root, shapes, graphs: dict, arch=None, atom_args=(), records=()
+) -> None:
     """Each of `shapes`' leaves into `graphs`, its op_graph captured first when
-    the store has none."""
+    the store has none (`_capture`, naming the record directories `records`
+    the shapes are of)."""
     from atom.compass.artifacts import ArtifactRefusal
 
     missing = []
-    for shape in sorted(shapes - graphs.keys()):
+    for shape in sorted(shapes - graphs.keys(), key=str):  # G and W: None or a count
         try:
             graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
         except ArtifactRefusal:
             missing.append(shape)
     if missing:
-        _capture(config, missing, root, arch, atom_args)
+        _capture(config, missing, root, arch, atom_args, records)
     for shape in missing:
         graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
 
 
-def _capture(config, shapes, root, arch=None, atom_args=()) -> None:
+def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
     """`trace ops` of `shapes` under ATOM's arguments `atom_args` into the store
     at `root`, in a process of its own that sees no GPU, on a declared `arch`,
     or with none on this run's first GPU as it reads (`trace ops --gpu`): its
-    stepping and compute units pick kernels as they do on the card."""
+    stepping and compute units pick kernels as they do on the card. A shape
+    its `--prefill` and `--width` cannot name, a DP group's gathered rows or a
+    padded width, refuses before any is traced, naming the `trace ops
+    --population` of the record directories `records` that traces it."""
     from atom.compass import capture
-    from atom.compass.capture.forward import device_arch
+    from atom.compass.artifacts import ArtifactRefusal, Rule
+    from atom.compass.capture.forward import decode, device_arch, prefill
     from atom.model_engine.arg_utils import EngineArgs
 
     engine = EngineArgs.add_cli_args(FlexibleArgumentParser()).parse_args(atom_args)
@@ -2915,6 +2947,16 @@ def _capture(config, shapes, root, arch=None, atom_args=()) -> None:
     argv += ["--arch", arch or device_arch()]
     if not arch:  # the card read by its HIP ordinal, which ROCm indexes alike
         argv += ["--gpu", os.environ.get("HIP_VISIBLE_DEVICES", "0").split(",")[0]]
+    for s in shapes:
+        if s != (prefill(s.tokens, s.seqs) if s.phase == "prefill" else decode(s.seqs)):
+            population = [a for r in records for a in ("--population", r)]
+            call = ["compass", "trace", "ops", *argv, *population, "--store", str(root)]
+            raise ArtifactRefusal(
+                Rule.RESOLUTION,
+                f"no op_graph holds {s}, a shape trace ops takes only from the "
+                "steps of a record",
+                f"trace it with {shlex.join([*call, '--', *atom_args])}",
+            )
     for s in shapes:
         argv += ["--prefill", str(s.tokens)] if s.phase == "prefill" else ["--width"]
         argv.append(str(s.seqs))

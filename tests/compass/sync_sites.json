@@ -78,14 +78,14 @@
    "mechanism_why": "arithmetic inside the cost backend, which cannot park"
   },
   {
-   "id": "atom/compass/kv/connector.py::SimulatedKVConnectorScheduler.update_state_after_alloc::self._socks[key].send(pickle.dumps((params[\"transfer_id\"], blocks, a, key[1])))::p2p#0",
+   "id": "atom/compass/kv/connector.py::SimulatedKVConnectorScheduler._send::self._socks[key].send(pickle.dumps((params[\"transfer_id\"], blocks, a, key[1])))::p2p#0",
    "file": "atom/compass/kv/connector.py",
-   "symbol": "SimulatedKVConnectorScheduler.update_state_after_alloc",
+   "symbol": "SimulatedKVConnectorScheduler._send",
    "call": "self._socks[key].send",
    "expr": "self._socks[key].send(pickle.dumps((params[\"transfer_id\"], blocks, a, key[1])))",
    "shape": "p2p",
    "peer": "deployment",
-   "why": "the decode engine's KV write request to the prefill engine of another deployment, sent on the decode step loop right after the request's blocks are allocated",
+   "why": "the decode engine's KV write request to the prefill engine of another deployment, sent on the decode step loop right after the request's blocks are allocated, or its notice that none will come, sent when the request finishes before one",
    "mechanism": "K4",
    "mechanism_why": "the decode end of the kv_write_req channel: the wrapped socket stamps the send with the LP's time, and the step loop that makes it is the clock owner"
   },
@@ -5332,6 +5332,18 @@
    "why": "reads a producer's metadata in a transfer backend the simulator replaces with a priced one",
    "mechanism": "K9",
    "mechanism_why": "inside a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnectorScheduler._abort_unwritten::sock.send_multipart([MSG_ABORT, notice])::p2p#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
+   "symbol": "MooncakeConnectorScheduler._abort_unwritten",
+   "call": "sock.send_multipart",
+   "expr": "sock.send_multipart([MSG_ABORT, notice])",
+   "shape": "p2p",
+   "peer": "deployment",
+   "why": "tells a producer that a request the consumer finished before its write request will not ask for one, in a transfer backend the simulator replaces with a priced one",
+   "mechanism": "K9",
+   "mechanism_why": "inside a transfer backend the simulator replaces; the simulated connector reproduces the notice on the kv_write_req channel"
   },
   {
    "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector._execute_handshake::recv()::socket_recv#0",
