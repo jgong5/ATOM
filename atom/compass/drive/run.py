@@ -244,7 +244,9 @@ def op_coverage(backend, steps) -> dict:
     on a line the fit declined among them, goes to the roofline and leaves its
     step out. A step the backend refuses is left out under ``step refused``.
     A line's `tbo_tokens`, the two-batch-overlap split its data-parallel
-    group agreed, makes the step its rank's (`dp_rank`) two micro-batches."""
+    group agreed, makes the step its rank's (`dp_rank`) two micro-batches.
+    Its `target_bs`, `draft_bs` and `draft_moe_rows` read its target and its
+    drafter at the widths and rows they ran at, as a simulated run reads them."""
     by_phase, out = defaultdict(Counter), defaultdict(Counter)
     for _, line in steps:
         split = line.get("tbo_tokens")
@@ -252,6 +254,9 @@ def op_coverage(backend, steps) -> dict:
             tuple(RequestShape(*row) for row in line["rows"]),
             capture_rung=line["rung"],
             moe_rows=line.get("moe_rows"),
+            draft_moe_rows=line.get("draft_moe_rows"),
+            draft_bs=line.get("draft_bs"),
+            target_bs=line.get("target_bs"),
             produces_output=line["produces_output"],
             tbo_tokens=split and tuple(map(tuple, split)),
             dp_rank=split and line.get("dp_rank"),
