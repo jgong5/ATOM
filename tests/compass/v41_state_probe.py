@@ -94,6 +94,7 @@ def ops_placements(
     slots=8,
     ratio=2,
     reach=0,
+    query=None,
 ):
     """The op bench's placements of a V4.1 `point` under `rule`, a two-row
     decode by default, at `context`, over `test_bench_ops`'s state-only leaf
@@ -111,8 +112,9 @@ def ops_placements(
     window, as `_launch_rope_window` and `swa_write` take it; at `ring`, that
     and layer 1's window ring cut from it (`ring_view`), as
     `pa_sparse_prefill_opus` takes both, stating its window of 8, compress
-    `ratio` and, past ratio 0, top-k 1. Its activation is a row a token, and
-    the bytes its ring rows read a call, `reach` rows, are kept too."""
+    `ratio` and, past ratio 0, top-k 1, or at `prefix` the pool alone stating
+    them. Its activation is a row a token, `query` rows if given, and the
+    bytes its ring rows read a call, `reach` rows, are kept too."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -172,8 +174,9 @@ def ops_placements(
             states = [("pool", capture.pool)]
             states += [("ring", capture.ring_view(1))] if pool == "ring" else []
         dtyped = [(f, _t(t.shape, "kv", t.stride(), str(t.dtype))) for f, t in states]
-        leaf = _leaf("v41.states", ("kv", _t([tokens, 4], "activation")), *dtyped)
-        if pool == "ring":  # two rows' blocks hold 32 rows at ratio 2
+        query = query or tokens
+        leaf = _leaf("v41.states", ("kv", _t([query, 4], "activation")), *dtyped)
+        if pool in ("ring", "prefix"):  # two rows' blocks hold 32 rows at ratio 2
             runner.config.kv_cache_block_size = BLOCK
             top = ("index_topk", 1 if ratio else None)
             stated = ("window_size", 8), ("compress_ratio", ratio), top
@@ -186,10 +189,10 @@ def ops_placements(
             given = ("window", Reduced(cls, tuple(vars(window).items())))
             leaf = dataclasses.replace(leaf, args=(*leaf.args, given))
         if pool:  # its `reach` ring rows; beside a ring at a ratio, top-k 1 a row
-            pages = point.seqs if pool == "ring" and ratio else 0
+            pages = point.seqs if pool != "whole" and ratio else 0
             ring = reach * capture.pool[0].nbytes
             read = ring + pages * capture.pool[0].nbytes
-        llc = 3 * (16 * tokens + read)  # 7 copies of the activation and the states
+        llc = 3 * (16 * query + read)  # 7 copies of the activation and the states
     found = ops.leaves(_graph(leaf, layers=1)["region"])
     real, replay.seat_states = replay.seat_states, seat
     refused, got = None, []
@@ -369,6 +372,13 @@ def main(root: pathlib.Path) -> None:
     seen["ops_v41_write_prefill"] = ops_placements(
         plain, point=prefill(32, 1), context=128, pool="whole", reach=8, **seated
     )
+    # a cached prefill's prefix reads each row's 7 history ring rows through the
+    # pool; a bounded-replay tail's, 16 query rows of the forward's 32, none
+    cut = {"point": prefill(32, 2), "context": 96, "pool": "prefix", **seated}
+    for case, ratio, query in (("prefix0", 0, 32), ("prefix2", 2, 32), ("tail", 2, 16)):
+        seen[f"ops_v41_{case}"] = ops_placements(
+            plain, ratio=ratio, query=query, reach=14 * (query == 32), **cut
+        )
     seen["kv_bound"] = {slots: kv_bound(slots) for slots in (8, 2)}
 
     from atom.compass.bench.runner import BenchModelRunner
