@@ -31,7 +31,10 @@
 #                  refuses the caller's; the caller switches the router's
 #                  wall-clock detectors off, as pd_sim.sh does:
 #                  --disable-health-check
-#                  --disable-circuit-breaker --disable-retries
+#                  --disable-circuit-breaker --disable-retries. run refuses
+#                  a router LP without --disable-retries: one that retries
+#                  resends a request under the seq it was first sent with,
+#                  and the frontend refuses it as arrived twice
 #   ATOMESH        the router binary (default atomesh)
 #   SEED           the router LP's seed (default 20260707, client.sh's)
 #   WAIT_S         seconds each instance and the router have to answer, and
@@ -98,6 +101,8 @@ while (($#)); do
 done
 [[ $seen == " prefill decode router" ]] || bad "--prefill --, --decode -- and --router -- come once each, in that order"
 [[ " ${prefill[*]} ${decode[*]} " != *" --kv-transfer-config"* ]] || bad "an instance's ATOM arguments carry --kv-transfer-config, which the script fills"
+ATOMESH=${ATOMESH:-atomesh} ROUTER_LP=
+[[ $cmd == record || " ${router[*]} " != *" --dp-aware "* ]] || ROUTER_LP=$ATOMESH
 [[ $cmd == record ]] || for word in "${router[@]}"; do
     case ${word%%=*} in
     --prefill | --decode) bad "the router's arguments carry ${word%%=*}, a worker more for a simulated router to choose" ;;
@@ -105,13 +110,13 @@ done
     --request-timeout-secs) bad "the router's arguments carry ${word%%=*}, a wall-clock bound the script sets for a simulated router" ;;
     esac
 done
+[[ -z $ROUTER_LP || " ${router[*]} " == *" --disable-retries "* ]] || bad "the router's arguments carry --dp-aware but not --disable-retries: a router LP's retry resends a request under its first seq, which the frontend refuses as arrived twice"
 for path in "$(realpath -m "$OUT")" "$ROOT" "$PWD"; do
     ((${#on[@]} == 0)) || [[ $(printf %q "$path") == "$path" ]] || bad "--on's prefix may parse $path again, which a shell would split or expand"
 done
 mkdir -p "$OUT"
 [[ -z $(ls -A "$OUT") ]] || bad "$OUT holds an earlier deployment's files"
 OUT=$(realpath "$OUT")
-ATOMESH=${ATOMESH:-atomesh}
 WAIT_S=${WAIT_S:-600}
 PREFIX_S=${PREFIX_S:-60}
 KV_LINK=intra_node
@@ -121,8 +126,6 @@ compass_env "$ROOT"
 compass_require_tree "$ROOT" || exit $?
 RUN_FILE= CLOCK=
 [[ $cmd == record ]] || RUN_FILE=$OUT/run_file.json
-ROUTER_LP=
-[[ -z $RUN_FILE || " ${router[*]} " != *" --dp-aware "* ]] || ROUTER_LP=$ATOMESH
 # The ports, all held together so no two are the same: the router's and its
 # metrics', and each side's KV block. Simulated, both sides share one block of
 # write requests, one per prefill and decode rank pair, and the authority

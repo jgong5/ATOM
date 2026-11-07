@@ -5,8 +5,12 @@ command is stopped or the server exits.
 A server handed a run file is simulated, and co-hosts its clock authority
 unless it joins one its run file names. One without a run file is real, on the
 GPUs the command names, which `gpu.quiet` checks before the server starts and
-after it stops. ATOM's arguments pass verbatim; the driver assigns the host,
-127.0.0.1 unless the command names another, its ports and the run file, and
+after it stops; given an artifact store, its start merges the store's JIT cache
+library for the stack into the container's caches and its stop writes back
+what it finished compiling (`jit_cache`), and at DP and TP both above 1 it
+runs under `LOG_MORE`. ATOM's arguments pass verbatim; the
+driver assigns the host, 127.0.0.1 unless the command names another, its ports
+and the run file, and
 refuses them, and the clock endpoint flag, among ATOM's arguments; an op graph
 run's file also holds ATOM's arguments, from which its engines trace a shape
 the store lacks (`run.ATOM_ARGS`). Each start
@@ -18,9 +22,10 @@ the directory, so the server's stop removes it (`drop_compiled`).
 The server runs this driver's tree in its own process group, so its engine
 processes stop with it, and writes ``<out>/server.log`` and its step record in
 ``<out>/steps``. Once its ``/health`` first answers, ``<out>/server.json``
-names its URL and process id and, for a simulated server, its clock endpoint
-and run file. SIGINT or SIGTERM to the command, or the server's exit, stops the
-whole group: SIGTERM first, SIGKILL for what is left after `STOP_GRACE_S`.
+names its URL and process id, for a simulated server its clock endpoint and
+run file, and, given an artifact store, the JIT cache library's absolute path.
+SIGINT or SIGTERM to the command, or the server's exit, stops the whole group:
+SIGTERM first, SIGKILL for what is left after `STOP_GRACE_S`.
 A real server's stop, for the GPU check after it, lasts until KFD, which
 frees a process's GPU memory after it exits, lists no process it did not list
 before the server started. Then ``<out>/run.json`` gets the run's identity,
@@ -44,9 +49,11 @@ from pathlib import Path
 
 import atom
 from atom.compass import parity
+from atom.compass.drive import jit_cache
 from atom.compass.drive.gpu import KFD, hip_visible, quiet
-from atom.compass.drive.identity import identity
+from atom.compass.drive.identity import _device, _stack, identity
 from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _write_whole
+from atom.utils.arg_parser import FlexibleArgumentParser
 
 SERVER = (sys.executable, "-m", "atom.entrypoints.openai.api_server")
 HOST = "127.0.0.1"
@@ -89,6 +96,9 @@ CACHE_LINE = re.compile(r"Using cache directory: (\S+) for vLLM's torch\.compile
 #: ATOM's `atom.utils.backends.VLLM_CACHE_ROOT`, stated here because importing
 #: that module opens a HIP context on every GPU the calling process can see.
 CACHE_ROOT = os.path.expanduser("~/.cache/atom")
+#: ATOM's switch that heads each log line with its process, `<name>:<pid>`, so
+#: `memory.check` can pair a DP x TP log's Memory budget lines with DP ranks.
+LOG_MORE = {"ATOM_LOG_MORE": "1"}
 
 
 def below_ephemeral(ports: range) -> range:
@@ -103,7 +113,14 @@ class ServeError(ValueError):
 
 
 def serve(
-    atom_args, out, gpus=(), run=None, extra_env=None, host=HOST, joined=False
+    atom_args,
+    out,
+    gpus=(),
+    run=None,
+    extra_env=None,
+    host=HOST,
+    joined=False,
+    store=None,
 ) -> None:
     """Serve one instance from ATOM's arguments `atom_args`, writing to the
     directory `out`, until SIGINT or SIGTERM or the server's exit.
@@ -115,9 +132,12 @@ def serve(
     server binds `host`, which its URL names. `extra_env` maps variables the
     server's environment holds over the command's. Raises `ServeError` when
     the server exits before ``/health`` answers, or on its own with a non-zero
-    status, and `GpuRefusal` from the GPU checks. Once the server has stopped,
-    writes run.json from the engine file, and raises `ServeError` when no step
-    wrote one.
+    status, and `GpuRefusal` from the GPU checks. Given `store`, an artifact
+    store's root, a real server's start merges the store's JIT cache library
+    for the stack on `gpus` into the container's caches, and its stop writes
+    back what it finished compiling since the merge. Once the server has
+    stopped, writes run.json from the engine file, and raises `ServeError` when
+    no step wrote one.
     """
     _refuse(atom_args)
     model = _model(atom_args)
@@ -126,6 +146,7 @@ def serve(
             "a server is real, on the GPUs it names, or simulated, from a run "
             f"file, exactly one; got gpus={gpus} and a run file: {run is not None}"
         )
+    library = jit_cache.library(store, _stack(), _device(gpus)) if store else None
     out = Path(out)
     if out.exists() and any(out.iterdir()):
         raise ServeError(f"{out} holds an earlier run's files; one run per directory")
@@ -135,6 +156,8 @@ def serve(
     argv = [*SERVER, *KEEP_ALIVE, *atom_args, "--host", host]
     argv += ["--server-port", str(server_port), "--port", str(engine_port)]
     ready = {"url": f"http://{host}:{server_port}"}
+    if library:
+        ready["library"] = str(library.absolute())
     # Nor can the environment hand the server a run file or a clock.
     env = {**os.environ, **(extra_env or {})}
     env = {k: v for k, v in env.items() if k not in (ENV, CLOCK_ENV)}
@@ -146,6 +169,7 @@ def serve(
     env["ATOM_SHUTDOWN_TIMEOUT_S"] = str(SHUTDOWN_TIMEOUT_S)
     if run is None:
         env["HIP_VISIBLE_DEVICES"] = hip_visible(gpus)
+        env |= log_more(atom_args)
     else:
         run_file = out / RUN_FILE
         if run.get(OP_GRAPH):
@@ -160,7 +184,11 @@ def serve(
         ready |= {"clock_endpoint": run["clock_endpoint"], "run_file": str(run_file)}
     with held, _stop_signals() as stopped, quiet(gpus, out) if gpus else nullcontext():
         kfd = _kfd() if gpus else None
+        if library:
+            jit_cache.restore(library)
         with (out / LOG_FILE).open("w") as log:
+            # The log's creation, on the clock a cache file's mtime reads.
+            since = os.fstat(log.fileno()).st_mtime_ns
             server = subprocess.Popen(
                 argv,
                 stdout=log,
@@ -185,6 +213,8 @@ def serve(
             _stop(server.pid, kfd)
             server.wait()
             drop_compiled(out / LOG_FILE)
+            if library:
+                jit_cache.save(library, since)
     if not stopped and server.returncode:
         raise ServeError(f"the server exited {server.returncode}; see {out / LOG_FILE}")
     # Any rank's: every DP rank resolves one engine configuration.
@@ -220,6 +250,22 @@ def _model(atom_args) -> str:
             "ATOM's arguments name no --model; run.json digests its config"
         )
     return model
+
+
+def log_more(atom_args) -> dict:
+    """`LOG_MORE` when ATOM's arguments run DP and TP both above 1, else
+    nothing, so any other start logs in the format its environment gives.
+    Under DP attention ATOM makes each TP rank a DP rank and runs TP 1."""
+    parser = FlexibleArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
+    parser.add_argument("--data-parallel-size", "-dp", type=int, default=1)
+    parser.add_argument("--enable-dp-attention", action="store_true")
+    widths = parser.parse_known_args(atom_args)[0]
+    if widths.enable_dp_attention:
+        return {}
+    if widths.tensor_parallel_size > 1 and widths.data_parallel_size > 1:
+        return LOG_MORE
+    return {}
 
 
 def _refuse(atom_args) -> None:

@@ -176,15 +176,18 @@ class StepRecord:
         and `t_exit_ns` read off `runner.step_clock_ns()` around it and
         `runner.step_stamps()` added; a line with a device window waits in
         `pending` until the window closes, then in `lines` until `write`. Returns `forward`'s reply, or
-        without one the mode the view was built from, so a caller pricing the
-        step need not run the collective again.
+        without one the mode the view was built from and the view, so a caller
+        pricing the step need not run the collective or build the view again.
         """
         from atom.compass.runner.projection import batch_view, forward_mode
 
-        # The view is settled after `forward`, from the fields it was handed.
-        before = copy.copy(batch)
-        before.num_scheduled_tokens = np.copy(batch.num_scheduled_tokens)
-        before.context_lens = np.copy(batch.context_lens)
+        # The view is settled after `forward`, from the fields it was handed;
+        # with no forward to rewrite them, the batch is its own.
+        before = batch
+        if forward is not None:
+            before = copy.copy(batch)
+            before.num_scheduled_tokens = np.copy(batch.num_scheduled_tokens)
+            before.context_lens = np.copy(batch.context_lens)
         rows, named = [], []
         if not batch.is_dummy_run:
             ends = np.cumsum(batch.num_scheduled_tokens)
@@ -270,7 +273,7 @@ class StepRecord:
         if forward is None:  # a simulated step: priced, not timed
             self.write()
         self.step += 1
-        return mode if forward is None else reply
+        return (mode, view) if forward is None else reply
 
     def flush(self, wait: bool = False) -> None:
         """Finish the lines whose device windows have closed, in step order.
@@ -301,8 +304,8 @@ def record_step(runner, batch, forward=None):
 
     With `forward`, it runs on `batch` whether or not the step is recorded,
     inside the line's timestamps when it is, and its reply is returned.
-    Without `forward`, a recorded step returns the `ForwardMode` it settled
-    and an unrecorded one None.
+    Without `forward`, a recorded step returns the `ForwardMode` it settled and
+    the `BatchView` it built from it, and an unrecorded one None.
     """
     if _record(runner) is not None:
         return runner._parity_record.add(batch, runner, forward)
@@ -333,8 +336,9 @@ def _record(runner):
         record = None
         if directory and runner.rank == 0:
             directory = record_dir(directory, runner.config)
+            from atom.compass.backends.step_grid_plan import UNKEYED
             from atom.compass.backends.step_linear_fit import CONTEXT_PARALLEL
-            from atom.compass.run.step_grid import BOUNDS, keyed
+            from atom.compass.run.step_grid import keyed
 
             pc = runner.config.parallel_config
             pp = runner.config.pipeline_parallel_size > 1
@@ -342,8 +346,7 @@ def _record(runner):
             record = StepRecord(directory, pc.data_parallel_rank, stage)
             # By its first step the runner has resolved its engine.
             engine = keyed(runner.config) | {
-                name: getattr(runner.config, name)
-                for name in (*BOUNDS, "num_kvcache_blocks")
+                name: getattr(runner.config, name) for name in UNKEYED
             }
             for name in CONTEXT_PARALLEL:
                 if (width := getattr(runner.config, name, 1)) > 1:

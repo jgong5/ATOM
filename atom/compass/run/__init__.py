@@ -29,11 +29,17 @@ member, the frontend's included, connects to.
   selects the simulated runner.
 - `engine(config)` wraps the engine's construction in its own process the
   same way, and maps every DP rank to the engine LP for the process-group
-  check. The engine ignores SIGTERM from just before it says READY.
+  check. The engine ignores SIGTERM from just before it says READY. The
+  workers it starts sleep between its calls (`atom.compass.runner.doorbell`).
+  Under DP the group its engine core builds runs its small collectives over
+  shared memory when its ranks share a host
+  (`atom.compass.runner.shm_collectives`).
 - `runner(runner, tree)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
   ``decode`` to the frontend's clock, at the rates the machine spec measured.
+  A machine spec that refuses the tokenizer stops the run as a signal would,
+  so the engines leave and the server exits on the refusal.
 - `http_intake()` is what `atom.utils.compass_loop.HttpChannel` charges the
   frontend's event loop for each request it takes in.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
@@ -100,8 +106,11 @@ on ``(1, tokens, seqs)``; with any laws, a forward whose kind has none for a
 segment it runs and ``skip`` does not name is refused, that segment costing 0 s
 (`HostDeviceRecurrence.device_end`); ``key``, the `host_key` they were
 fitted under and the ``machine_spec`` digest of the spec of the platform they
-were fitted on, which a run with laws must match; ``skip``, segments zeroed for
-a what-if run, which the graders refuse; a list of them as ``step_linear``'s),
+were fitted on, which a run with laws must match; ``admit``, coefficients on
+a forward's admissions, which add to its ``E``, or null to refuse a forward
+that admits a request, and absent from an entry whose ``E`` laws hold them;
+``skip``, segments zeroed for a what-if run, which the graders refuse; a list
+of them as ``step_linear``'s),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
 ``decode/``, ``prefill<k>/`` and ``decode<k>/`` above one of a side, and for a
@@ -417,20 +426,22 @@ def spec() -> dict | None:
 
 def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time."""
-    from atom.compass.runner.overrides import FORWARD_KINDS, SEGMENTS
+    from atom.compass.runner.overrides import ADMISSION_IN_E, FORWARD_KINDS, SEGMENTS
 
     laws = host.get("laws", {})
     if (
-        set(host) - {"laws", "skip", "key"}
+        set(host) - {"laws", "skip", "key", "admit"}
         or set(host.get("skip", ())) - set(SEGMENTS)
         or set(laws) - set(FORWARD_KINDS)
         or {s for v in laws.values() for s in v} - set(SEGMENTS)
         or {len(c) for v in laws.values() for c in v.values()} - {3}
+        or len(host.get("admit") or ADMISSION_IN_E) != 3
     ):
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
-            "and key, the host key the laws were fitted under"
+            "admit, three coefficients on a forward's admissions or null, and "
+            "key, the host key the laws were fitted under"
         )
 
 
@@ -884,20 +895,18 @@ def _hand_ins(run: dict) -> list[str]:
 class _RecordingAuthority(ClockAuthority):
     """The authority, recording the step table: a row per grant, each step an
     LP took on its own below a ceiling included, and a row per message each
-    releases, from the receiver's clock before that grant to the message's
-    arrival; and the wall seconds of the run, from its start
-    to the end of each client run in `ends` and to the finish, which sets `done`.
-    A co-hosting frontend starts the run as it starts its own; otherwise it
-    starts once every server LP, and every member of one declared with members,
-    has asked once. Each client run that ends before the last has its summary
-    written once every server LP has handed in. A frontend's TAR to ``+inf``
-    before the finish is a stop: it registers that frontend's send log,
-    finishes the run there and sets `stopped`. Every LP but the client is
-    granted ``+inf``, and the client too while a client run is open, from its
-    bind to its end; outside one it holds no connection. Each such grant
-    releases every message registered for its receiver. A stop with none open,
-    on a server whose ``client_runs`` is ``null``, sets `stopped_whole`: the
-    run ended as its run file says, as at the finish."""
+    releases, from the receiver's clock before that grant to
+    the message's arrival; and the wall time of each client run, from its
+    client's first request in `starts` to its end in `ends`, which `wall`
+    sums; the finish sets `finished` and `done`. Each client run that ends
+    before the last has its summary written once every server LP has handed
+    in. A frontend's TAR to ``+inf`` before the finish is a stop: it registers
+    that frontend's send log, finishes the run there and sets `stopped`. Every
+    LP but the client is granted ``+inf``, and the client too while a client
+    run is open, from its bind to its end; outside one it holds no connection.
+    Each such grant releases every message registered for its receiver. A stop
+    with none open, on a server whose ``client_runs`` is ``null``, sets
+    `stopped_whole`: the run ended as its run file says, as at the finish."""
 
     def __init__(self, run: dict) -> None:
         # The tree that runs, read before the run so an unidentifiable one is
@@ -907,11 +916,10 @@ class _RecordingAuthority(ClockAuthority):
         )
         self.steps = StepTable(json.dumps(configuration(run), sort_keys=True))
         self.run = run
-        self.started = self.finished = None
-        self.ends = []  # the wall time each client run ended
+        self.finished = None
+        self.starts, self.ends = [], []
         self.stopped = self.stopped_whole = self.client_run_open = False
         self.done = threading.Event()
-        self._joining = set(_hand_ins(run))
         self._clock_before = {}  # LP -> its clock before its latest grant
         # A rerun into the same out_dir starts from none of the last run's files.
         out = Path(run["out_dir"])
@@ -958,9 +966,9 @@ class _RecordingAuthority(ClockAuthority):
     def on_request(
         self, lp, kind, t, log, t_daemon=math.inf, member=None, steps=(), ahead=False
     ) -> list:
-        self._joining.discard(f"{lp.name}.{member}" if member else lp.name)
-        if not self._joining and self.started is None:
-            self.started = time.monotonic()
+        first = lp == TRAFFIC and len(self.starts) == len(self.ends)
+        if first and self.final_clocks is None:  # none opens after the finish
+            self.starts.append(time.monotonic())
         stop = kind == TAR and t == math.inf and lp.name.startswith(FRONTEND.name)
         if stop and self.final_clocks is None:
             self.requests_served[lp.name] += 1
@@ -1002,6 +1010,16 @@ class _RecordingAuthority(ClockAuthority):
             self.finished = time.monotonic()
             self.done.set()
         return replies
+
+    def wall(self, k: int | None = None) -> float:
+        """The wall seconds client runs 0 to `k` served, all of them with `k`
+        None, each from its client's first request to its end: for one still
+        open, the finish a stop brought or, before the finish, now."""
+        if k is None:
+            ends = [*self.ends, self.finished or time.monotonic()]
+        else:
+            ends = self.ends[: k + 1]
+        return sum(end - start for start, end in zip(self.starts, ends))
 
     def _release_all(self, into: dict) -> dict:
         """Every message registered on the channels of `into` and not yet
@@ -1055,11 +1073,9 @@ def _runtime(
 
 
 @contextlib.contextmanager
-def _start_on_leaving(rt: clock.LPRuntime, authority=None):
+def _start_on_leaving(rt: clock.LPRuntime):
     yield
     rt.start_run()
-    if authority is not None:
-        authority.started = time.monotonic()
 
 
 def frontend(config):
@@ -1171,7 +1187,7 @@ def frontend(config):
     # A co-hosting frontend reaches the authority in-process, with no socket.
     rt = _runtime(lp, run, cls=_StoppingClock, here=authority is not None)
     rt.client_run_ended = lambda k: _frontend_hand_in(run, rt, k)
-    return _start_on_leaving(rt, authority)
+    return _start_on_leaving(rt)
 
 
 def _refuse_unshared(run: dict, standalone: bool) -> None:
@@ -1277,7 +1293,9 @@ def engine(config):
     """Around the engine's construction in its process; a no-op context on a real run.
 
     At DP width above one, the process joins the engine LP as the member of its
-    DP rank, and its host collectives first join the group rounds it owes. A
+    DP rank, and its host collectives first join the group rounds it owes; the
+    DP group the engine core builds runs them over shared memory when its
+    ranks share a host (`shm_collectives`). A
     pipeline stage is the engine LP ``engine-pp<stage>``, or a prefill side's
     ``engine-P-pp<stage>``.
 
@@ -1301,6 +1319,8 @@ def engine(config):
             handoff = record / f"dp{rank}.handoff.jsonl"
             clock.stamp_pulls(pulls, handoff, time.monotonic_ns)
         return contextlib.nullcontext()
+    from atom.compass.runner import shm_collectives
+    from atom.compass.runner.doorbell import sleeping_workers
     from atom.utils.distributed import utils
 
     lp, side = ENGINE, _pd_side(config)
@@ -1319,11 +1339,17 @@ def engine(config):
     _member = f"dp{pc.data_parallel_rank}" if pc.data_parallel_size > 1 else None
     name = lp.name if _member is None else f"{lp.name}.{_member}"
     os.environ[NOW_ENV] = str(Path(run["out_dir"]) / NOW_FILE.format(name))
+    if _member is not None:
+        # Under the clock's wrap, so a call settles before it waits on its peers.
+        shm_collectives.install()
     clock.settle_before_collectives()
     if _member is not None and _offloads_to_lmcache_mp(config.kv_transfer_config):
         _park_before_dispatch()
     rt = _runtime(lp, run, _member, _PublishedClock)
-    return _ignoring_sigterm_from_ready(_named(_start_on_leaving(rt)))
+    inner = _ignoring_sigterm_from_ready(_named(_start_on_leaving(rt)))
+    if _member is not None:
+        inner = shm_collectives.attaching_engine_group(inner)
+    return sleeping_workers(inner)
 
 
 @contextlib.contextmanager
@@ -1434,6 +1460,7 @@ def runner(model_runner, tree) -> None:
     from atom.compass.memory import ModelTerms, device_readings
     from atom.compass.memory.check import record
     from atom.compass.runner.overrides import (
+        ADMISSION_IN_E,
         HostDeviceRecurrence,
         install_cost_backend,
         install_device_readings,
@@ -1646,6 +1673,7 @@ def runner(model_runner, tree) -> None:
             stage,
             mtp=mtp,
             sync=rapid and not config.disagg_is_decode,
+            admit=host.get("admit", ADMISSION_IN_E),
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])
@@ -1854,7 +1882,8 @@ def tokenizer(tok, config) -> None:
     """Wrap `tok`'s ``encode`` and ``decode``, and its Rust backend's
     ``encode_batch``, with the machine spec's entry for the model's architecture
     and the backend that loaded; the entry warns when the loaded
-    ``tokenizer.json`` is not the one it was measured on."""
+    ``tokenizer.json`` is not the one it was measured on. A refused entry
+    ends the run before the server serves (`_end_before_serving`)."""
     run = spec()
     if run is None:
         return
@@ -1863,11 +1892,15 @@ def tokenizer(tok, config) -> None:
     from atom.compass.spec import Backend
     from atom.utils.compass_loop import wrap_decode, wrap_encode, wrap_encode_batch
 
-    entry = _machine(run).tokenizer_for(
-        config.hf_config.architectures[0],
-        Backend.FAST if tok.is_fast else Backend.SLOW,
-        _fingerprint(tok),
-    )
+    try:
+        entry = _machine(run).tokenizer_for(
+            config.hf_config.architectures[0],
+            Backend.FAST if tok.is_fast else Backend.SLOW,
+            _fingerprint(tok),
+        )
+    except BaseException as e:
+        _end_before_serving(run, e)
+        raise
     tok.encode = wrap_encode(tok.encode, entry)
     tok.decode = wrap_decode(tok.decode, entry)
     # ATOM's segment tokenizer, which only a Rust backend gets, encodes a long
@@ -1875,6 +1908,19 @@ def tokenizer(tok, config) -> None:
     backend = getattr(tok, "_tokenizer", None)
     if isinstance(backend, Tokenizer):
         backend.encode_batch = wrap_encode_batch(backend.encode_batch, entry)
+
+
+def _end_before_serving(run: dict, e: BaseException) -> None:
+    """`e`, raised after the engines started and before the server serves, ends
+    the run in progress: stop it, as a signal stops the frontend's event loop, so
+    each engine leaves its loop at its ``+inf`` grant, hands in and its process
+    ends, which the server's exit waits for; then hand in `e` as the frontend's
+    ``ended:`` reason, which a standalone authority's summary waits for."""
+    rt = clock.installed()
+    if rt is None or not rt.in_run:
+        return
+    rt.end_run()
+    _hand_in(run, rt.me.name, rt.refusals + [f"ended:{rt.me.name} raised {e!r}"])
 
 
 def http_intake() -> tuple[float, float, float] | None:
@@ -2082,8 +2128,10 @@ def engine_loop(engine_core):
     aside at READY, or else the one it found.
 
     A pipeline stage's runner calls go through `pp_send.install`'s sends. A
-    recorded real run's SIGTERM goes through `_stop_recording`, and its input
-    queue stamps each request frame's handoff (`clock.stamp_input`)."""
+    recorded real run's SIGTERM goes through `_stop_recording`, its input
+    queue stamps each request frame's handoff (`clock.stamp_input`), and
+    however it leaves the loop, the stamps its engine held are written
+    (`clock.write_stamps`), as its workers then write their step lines."""
     ignoring = bool(os.environ.get(ENV))  # a run, as `spec` would say, unread
     before = signal.signal(signal.SIGTERM, signal.SIG_IGN) if ignoring else None
     if _sigterm_at_ready:
@@ -2138,15 +2186,18 @@ def engine_loop(engine_core):
             _hand_in(run, lp, reasons + [ended], **said, **sections)
         raise
     finally:
-        if before is not None:  # None: not set from Python
-            signal.signal(signal.SIGTERM, before)
+        try:
+            clock.write_stamps()
+        finally:
+            if before is not None:  # None: not set from Python
+                signal.signal(signal.SIGTERM, before)
 
 
 def _stop_recording(engine_core, previous, signum, frame) -> None:
-    """A recorded real run's SIGTERM, where its engine stops: a speculative
-    engine writes its draft width and accepted-draft histogram beside the
-    record (`ACCEPTANCE_FILE`), then ATOM's handler, `previous`, takes it,
-    whether or not the write succeeded."""
+    """A recorded real run's SIGTERM, where its engine stops: it writes its
+    held stamps, a speculative engine writes its draft width and
+    accepted-draft histogram beside the record (`ACCEPTANCE_FILE`), then ATOM's
+    handler, `previous`, takes it, whether or not the writes succeeded."""
     from atom.compass import parity
 
     scheduler = getattr(engine_core, "scheduler", None)
@@ -2154,11 +2205,14 @@ def _stop_recording(engine_core, previous, signum, frame) -> None:
         scheduler, "engine_stats", None
     )
     try:
-        if getattr(stats, "spec_enabled", False):
-            width = config.speculative_config.num_speculative_tokens
-            held = {"draft_tokens": width, "distribution": dict(stats.distribution)}
-            name = ACCEPTANCE_FILE.format(config.parallel_config.data_parallel_rank)
-            _write_whole(Path(os.environ[parity.ENV]) / name, json.dumps(held))
+        try:
+            clock.write_stamps()
+        finally:
+            if getattr(stats, "spec_enabled", False):
+                width = config.speculative_config.num_speculative_tokens
+                held = {"draft_tokens": width, "distribution": dict(stats.distribution)}
+                name = ACCEPTANCE_FILE.format(config.parallel_config.data_parallel_rank)
+                _write_whole(Path(os.environ[parity.ENV]) / name, json.dumps(held))
     finally:
         previous(signum, frame)
 
@@ -2233,8 +2287,7 @@ def _write_summary(run: dict, a: _RecordingAuthority, ended: bool = False) -> No
     out = Path(run["out_dir"])
     _write_whole(out / STEP_TABLE_FILE, a.steps.text())
     hand_ins = _read_hand_ins(run, out, not ended)
-    end = a.finished or time.monotonic()
-    summary = _summary(run, a, a, end - (a.started or end), hand_ins, {})
+    summary = _summary(run, a, a, a.wall(), hand_ins, {})
     _write_whole(out / SUMMARY_FILE, json.dumps(summary, sort_keys=True, indent=1))
     if not ended and a.ended and not a.stopped:
         _write_client_run(run, a, len(a.ended) - 1, hand_ins)
@@ -2249,7 +2302,7 @@ def _write_client_run(run: dict, a: _RecordingAuthority, k: int, hand_ins=None):
         hand_ins = _read_hand_ins(run, here, True)
     since = _read_hand_ins(run, out / CLIENT_DIR.format(k - 1), False) if k else {}
     record = a.ended[k]
-    summary = _summary(run, a, record, a.ends[k] - a.started, hand_ins, since)
+    summary = _summary(run, a, record, a.wall(k), hand_ins, since)
     summary["client_run"] = {"index": k, "start": record.start, "end": record.end}
     here.mkdir(exist_ok=True)
     _write_whole(here / SUMMARY_FILE, json.dumps(summary, sort_keys=True, indent=1))

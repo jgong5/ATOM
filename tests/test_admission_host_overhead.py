@@ -541,7 +541,9 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
     sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(feed))
     monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
     poller = SimpleNamespace(register=lambda *a: None, poll=lambda: [(sock, 1)])
-    monkeypatch.setattr(core.zmq, "Poller", lambda: poller)
+    # In the module's dict: `zmq_shim` serves `Poller` from its `__getattr__`,
+    # and a setattr's undo would leave pyzmq's class there for later tests.
+    monkeypatch.setitem(vars(core.zmq), "Poller", lambda: poller)
     engine = object.__new__(core.EngineCore)
     engine.label, engine.input_queue = "test", queue.Queue()
     engine.process_input_sockets("input", "control")

@@ -29,6 +29,7 @@ import pytest
 from test_artifact_invalidation import BASE, STANZA
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_drive_gpu import FREE, _plant
+from test_drive_serve import RUNNERS, runners_logged
 from test_launcher_held_ports import HELD, _squat
 from test_memory_readings import (
     CONFIG_JSON,
@@ -57,7 +58,7 @@ from atom.compass.artifacts import (
     machine_spec_digest,
     member_name,
 )
-from atom.compass.drive import gpu, measure_memory, serve
+from atom.compass.drive import aiter_jit, gpu, jit_cache, measure_memory, serve
 from atom.compass.drive.gpu import GpuRefusal
 from atom.compass.memory import ModelTerms, device_readings, reserves
 from atom.compass.memory.check import STORAGE
@@ -116,14 +117,32 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
     assert len(copy_["members"]) == 2
 
 
+def left_group() -> int:
+    """A process group this test started and whose one member has exited, for
+    a stand-in engine's pid: `serve._stop` finds no member of it left. Not 0:
+    under `podman exec`, as the CPU gate runs, /proc shows the exec's shell, an
+    ancestor of this test, in group 0, so a stop of group 0 waited
+    `serve.STOP_GRACE_S` twice."""
+    leader = subprocess.Popen(["true"], start_new_session=True)
+    leader.wait()
+    return leader.pid
+
+
 def a_start(tmp_path, monkeypatch, stack):
     """The suite's TP2 worker and `main`'s arguments for a start on GPU 5 under
     `stack`, its engine and identity stood in for: the command reads `stack`, the
-    ranks write their files as the engine starts, and run.json names `stack`."""
+    ranks write their files as the engine starts, and run.json names `stack`.
+    The JIT cache roots its start restores into and its stop saves from are
+    empty directories of the test's own, so a compile elsewhere in the
+    container while it runs reaches no store."""
     r, out = tp2(tmp_path), tmp_path / "out"
+    roots = {tmp_path / "roots" / compiler: compiler for compiler in jit_cache.RULES}
+    for root in roots:
+        root.mkdir(parents=True)
+    monkeypatch.setattr(aiter_jit, "_roots", lambda: roots)
 
     class Engine:
-        pid = 0
+        pid = left_group()
 
         def __init__(self, *args, **kwargs):
             (tmp_path / "hip").write_text(kwargs["env"]["HIP_VISIBLE_DEVICES"])
@@ -182,6 +201,37 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_the_start_used(
     measure_memory.main(argv)
 
     assert not used.parents[1].exists() and other.exists()
+
+
+@pytest.mark.parametrize(
+    "widths, seen",
+    [
+        (["-dp", "2"], "1"),
+        ([], "unset"),
+        (["-dp", "2", "--enable-dp-attention"], "unset"),
+    ],
+)
+def test_a_start_at_dp_and_tp_above_1_logs_each_line_s_process(
+    tmp_path, monkeypatch, widths, seen
+):
+    _, argv = a_start(tmp_path, monkeypatch, STACK)
+    monkeypatch.delenv("ATOM_LOG_MORE", raising=False)
+    monkeypatch.setenv("PYTHONPATH", str(serve.TREE))
+    monkeypatch.setenv("RUNNERS_SEEN", str(tmp_path / "seen"))
+    monkeypatch.setenv("RUNNERS_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(tmp_path / "cache"))
+    engine = measure_memory.subprocess.Popen
+
+    def logging(args, **kwargs):
+        engine(args, **kwargs)  # the ranks' files
+        return subprocess.Popen([sys.executable, "-c", RUNNERS], **kwargs)
+
+    monkeypatch.setattr(measure_memory.subprocess, "Popen", logging)
+    measure_memory.main([*argv, "-tp", "2", *widths])
+
+    assert (tmp_path / "seen").read_text() == seen
+    if seen == "1":
+        runners_logged(tmp_path / "out" / measure_memory.LOG, tmp_path / "cache")
 
 
 def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypatch):
@@ -507,7 +557,7 @@ def starts_autotuning(monkeypatch, r, out, autotuned, field="autotuned_kernels")
     left, envs = list(autotuned), []
 
     class Engine:
-        pid = 0
+        pid = left_group()
 
         def __init__(self, *args, env, **kwargs):
             envs.append(env)

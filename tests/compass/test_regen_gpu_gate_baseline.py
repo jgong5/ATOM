@@ -2,11 +2,11 @@
 """`regen_gpu_gate_baseline.sh` re-measures the GPU gate's baseline.
 
 It runs the gate's suite twice over a `git archive` tarball and rewrites
-`gpu_gate_baseline.env` and `gpu_gate_known_failures.txt`, or refuses and
-writes nothing. Each case runs the real script over a throwaway tree, as
-`test_gate_gpu_verdict_through_pipe.py` runs the gate: a stub pre-flight, stub
-`torch` and `aiter` packages, and a generated suite. Nothing here reaches a GPU
-or its driver.
+`gpu_gate_baseline.env` and `gpu_gate_known_failures.txt` in the pair of the
+first card's GPU target, or refuses and writes nothing. Each case runs the real
+script over a throwaway tree, as `test_gate_gpu_verdict_through_pipe.py` runs
+the gate: a stub pre-flight, stub `torch` and `aiter` packages, and a generated
+suite. Nothing here reaches a GPU or its driver.
 """
 
 import os
@@ -16,12 +16,21 @@ import sys
 from pathlib import Path
 
 import pytest
-from test_gate_gpu_verdict_through_pipe import BASH, _preflight
+from test_gate_gpu_verdict_through_pipe import BASH, _preflight, _torch
 
 REPO = Path(__file__).resolve().parents[2]
 GIT = shutil.which("git")
 COMPASS = "scripts/compass"
+PAIRS = f"{COMPASS}/gpu_gate_baselines"
+# A target the tree has no pair for, so the regenerated pair is the only one it
+# can read.
+ARCH = "gfx000"
 WRITTEN = ("gpu_gate_baseline.env", "gpu_gate_known_failures.txt")
+# Stands in for a file that stalls on the card; gpu_gate_skip.txt leaves it out.
+STALL = (
+    "import pytest\n\n\n@pytest.mark.parametrize('i', range(3))\n"
+    "def test_stall(i):\n    assert False\n"
+)
 
 pytestmark = pytest.mark.skipif(
     BASH is None or GIT is None, reason="needs bash and git"
@@ -77,7 +86,8 @@ def _write(root, files):
 def _setup(tmp_path):
     """A tarball of a base commit, and a Compass tree to regenerate in."""
     base = tmp_path / "base"
-    _write(base, {"atom/__init__.py": "", "tests/test_suite.py": SUITE})
+    suite = {"tests/test_suite.py": SUITE, "tests/test_stall.py": STALL}
+    _write(base, {"atom/__init__.py": "", **suite})
     _git(base, "init", "-q")
     _git(base, "add", "-A")
     _git(base, "commit", "-qm", "base")
@@ -100,9 +110,10 @@ def _setup(tmp_path):
                 f"atom/compass/artifacts/{name}": (artifacts / name).read_text()
                 for name in ("provenance.py", "rules.py")
             },
-            "torch/__init__.py": "__version__ = 1\nclass version:\n    hip = 1\n",
+            f"{COMPASS}/gpu_gate_skip.txt": "MI308X tests/test_stall.py\n",
+            "torch/__init__.py": _torch(ARCH),
             "aiter/__init__.py": "raise RuntimeError('aiter was executed')\n",
-            "tests/test_suite.py": SUITE,
+            **suite,
         },
     )
     (root / COMPASS / "preflight.sh").chmod(0o755)
@@ -118,6 +129,7 @@ def _run(tmp_path, root, argv, **env_over):
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env["PATH"]
     env["GIT_CEILING_DIRECTORIES"] = str(tmp_path)
     env["HIP_VISIBLE_DEVICES"] = "3"
+    env["GPU_NAME"] = "AMD Instinct MI308X"
     env.update(env_over)
     return subprocess.run(
         [BASH, "-c", f"{argv} 2>&1"],
@@ -130,30 +142,41 @@ def _run(tmp_path, root, argv, **env_over):
     )
 
 
+def _pairs(root):
+    """Every baseline file in the tree, by path."""
+    return {p: p.read_bytes() for p in (root / PAIRS).rglob("*") if p.is_file()}
+
+
 def test_the_gate_passes_against_the_baseline_it_regenerates(tmp_path):
     root, sha = _setup(tmp_path)
+    before = _pairs(root)
     out = _run(
         tmp_path, root, f"{root / COMPASS}/regen_gpu_gate_baseline.sh ../base.tar"
     )
     assert out.returncode == 0, out.stdout
-    env = (root / COMPASS / WRITTEN[0]).read_text().splitlines()
+    pair = root / PAIRS / ARCH
+    env = (pair / WRITTEN[0]).read_text().splitlines()
     assert [line for line in env if not line.startswith("#")] == [
         f"BASE_COMMIT={sha[:9]}",
         "BASE_PASSED=5",
         "BASE_FAILED=2",
         "BASE_COMPASS_TESTS=0",
+        "BASE_LEFT_OUT=3",
         "BASE_TORCH=1",
         "BASE_ROCM=1",
         "BASE_AITER=v0",
     ]
-    known = (root / COMPASS / WRITTEN[1]).read_text().splitlines()
+    known = (pair / WRITTEN[1]).read_text().splitlines()
     assert [line for line in known if not line.startswith("#")] == [
         f"tests/test_suite.py::test_known[{i}]" for i in range(2)
     ]
+    # The other targets' pairs are untouched.
+    assert {p: b for p, b in _pairs(root).items() if pair not in p.parents} == before
 
     gate = _run(tmp_path, root, f"{root / COMPASS}/gate_gpu.sh")
     assert gate.stdout.splitlines()[-1] == "GATE_GPU_RC=0 PASSED", gate.stdout
     assert "toolchain differs" not in gate.stdout
+    assert "left out on MI308X: tests/test_stall.py (3 tests)" in gate.stdout
 
 
 # id: (exit status, text the refusal carries, how the setup changes)
@@ -168,6 +191,7 @@ REFUSALS = {
     ),
     "not-an-archive": (94, "is not a git archive tarball naming its commit", "plain"),
     "aiter-unread": (96, "part of the stack reads UNKNOWN", "aiter-not-in-git"),
+    "target-unread": (96, "torch reads no GPU target for card 3", "torch-without-cuda"),
 }
 
 
@@ -183,13 +207,18 @@ def test_a_refusal_names_its_reason_and_writes_nothing(tmp_path, case):
         subprocess.run(
             ["tar", "-cf", tmp_path / "plain.tar", "-C", tmp_path, "base"], check=True
         )
+    elif change == "torch-without-cuda":
+        _write(
+            root,
+            {"torch/__init__.py": "__version__ = 1\nclass version:\n    hip = 1\n"},
+        )
     else:
         shutil.rmtree(root / "aiter" / ".git")
-    before = [(root / COMPASS / name).read_bytes() for name in WRITTEN]
+    before = _pairs(root)
 
     out = _run(
         tmp_path, root, f"{root / COMPASS}/regen_gpu_gate_baseline.sh {tar}", **env
     )
     assert out.returncode == rc, out.stdout
     assert why in out.stdout and "nothing was written" in out.stdout, out.stdout
-    assert [(root / COMPASS / name).read_bytes() for name in WRITTEN] == before
+    assert _pairs(root) == before

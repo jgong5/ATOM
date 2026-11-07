@@ -7,7 +7,8 @@ A law re-keyed to this tree's `atom` digest runs here, where the `host_laws`
 entry its records' fit published, keyed by their digest, refuses at engine
 start. The run file is read back through `run.spec` and installed by
 `run.runner`, as `test_drive_runfile` installs a store entry's. A law file
-names no fit inputs, so grading refuses its run.
+names no fit inputs, so grading checks none and takes its run; a store entry's
+report names them, and grading refuses its run where one served a trace.
 """
 
 import hashlib
@@ -16,7 +17,7 @@ import re
 
 import pytest
 from test_backend_step_linear import law
-from test_drive_runfile import LAWS, build, install, published, step_linear
+from test_drive_runfile import LAWS, REPORT, build, install, published, step_linear
 from test_run_step_grid import SPEC_DIGEST, deployment, host_laws_key
 
 from atom.compass import run as compass_run
@@ -106,28 +107,35 @@ def test_two_law_files_install_each_at_its_own_engine_config(monkeypatch, tmp_pa
         assert r.compass_host.laws == LAWS
 
 
+#: The traces the report of each store entry `test_drive_runfile` publishes names.
+FITTED = [t for i in REPORT["provenance"] for t in i["traces"]]
+
+
 @pytest.mark.parametrize(
-    "given, why",
+    "given, served, why",
     [
-        ("token", []),
-        (
-            "file",
-            ["its step law names no fit inputs, so its fitted traces are unknown"],
-        ),
+        (["token"], ["trace-z"], []),
+        (["token"], FITTED, [f"its backend was fitted on traces it served: {FITTED}"]),
+        (["file"], FITTED, []),
+        (["file", "file"], FITTED, []),
     ],
 )
-def test_grading_refuses_a_law_files_run_for_its_unnamed_fit_inputs(
-    tmp_path, given, why
+def test_grading_takes_a_law_files_run_and_refuses_a_fit_on_a_trace_it_served(
+    tmp_path, given, served, why
 ):
-    r = deployment(tmp_path)
-    path, _ = law_file(tmp_path, r)
-    step = {"token": step_linear(tmp_path, r).key.token(), "file": path}[given]
-    run = build(tmp_path, "--step-linear", step, "--host-laws", path)
-    (tmp_path / serve.RUN_FILE).write_text(json.dumps(run))
+    """Each step law `given` by store token or law file, two as a deployment's
+    sides run them, each at its own engine config; the run served `served`."""
+    flags = []
+    for i, (form, block) in enumerate(zip(given, (16, 32))):
+        r = deployment(tmp_path, kv_cache_block_size=block)
+        path, _ = law_file(tmp_path, r, f"law{i}.json")
+        step = step_linear(tmp_path, r).key.token() if form == "token" else path
+        flags += ["--step-linear", step, "--host-laws", path]
+    (tmp_path / serve.RUN_FILE).write_text(json.dumps(build(tmp_path, *flags)))
     (tmp_path / serve.RUN_JSON).write_text("{}")
 
     drive_run.write_grading(tmp_path, None)
 
     written = json.loads((tmp_path / serve.RUN_JSON).read_text())
     written["refusals"] = {"count": 0, "steps": 1}
-    assert runs._not_graded(written, ["trace-z"]) == why
+    assert runs._not_graded(written, served) == why

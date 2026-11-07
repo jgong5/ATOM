@@ -10,7 +10,10 @@ mi355-gpu-40's, under rocm/atom-dev nightly 20261026's stack, the first that
 starts DeepSeek-V4.1-Flash.
 The device fragment is one DeepSeek-V4-Pro start at the nightly DPA-TP8 prefill
 side's arguments (`FLAGS`): the device, its capacity and the stack. One real
-burst at the same arguments adds the HTTP intake terms (`INTAKE`), and
+burst at the same arguments adds the HTTP intake terms (`INTAKE`). On gpu-40,
+lone requests of a DeepSeek-V4.1-Flash cell's own bodies give the per-byte
+rate (`LONE`), at which the burst gives the fixed term, and lone parity
+requests the idle intake (`IDLE`); and
 `probe_device.py`'s readings (`PEAKS`) the compute and memory derates, the
 bandwidth curve, the kernel floor and the intra-node link's latency and derate.
 The peaks are the datasheet's; the rest is assumed. An engine start's memory
@@ -98,19 +101,59 @@ if CRS005:
         "fc9dadb1074821306edad43745d303c9de754feb03e9efcb195885b7282663cb",
     )
 
+#: On gpu-40, the per-byte rate of a request that finds no other intake on the
+#: loop, which a first-turn burst's bodies, short on messages, understate:
+#: `http_intake.py lone` over the long prompts of the DeepSeek-V4.1-Flash TP4
+#: DSpark5 cc-traces c=16 cell (traces 0-255), sent one at a time to one server
+#: at the cell's arguments on cards 0-3, at the commit named. The bodies are the
+#: lines of the cell client's capture (counted from 0) of 110 KB or more that
+#: ask for more than one token, which leaves out lines 1-14, the client's
+#: warm-up, and line 268, each asking for one; less lines 17-20, sent first to
+#: warm the server, and the last, line 1053, dropped so that five passes, each
+#: every fifth of the rest in capture order, hold as many. The record is its
+#: stamp file, the band the p10 and p90 over passes, each fitted alone.
+LONE = None
+if GPU40:
+    LONE = (
+        "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
+        "2026-11-05",
+        "6522636a3",
+        8.048014667965391e-09,
+        (7.59695877802096e-09, 8.707441989363081e-09),
+        "ca42cf60bc8759afb8fdc1c3f03449c1ac82abe01c69be13dcbcac30837aaf74",
+    )
+
 #: On gpu-40, one warm-up burst and then three, each started once no process
-#: held any card: 32a41c18, the record and ef2785a8; the record is the median
-#: of both terms.
+#: held any card: 32a41c18, the record and ef2785a8. Each is fitted at
+#: `LONE`'s rate, so `fixed_s` keeps its span (`http_intake.py fit STAMPS 256
+#: RATE`); the record is the median of that term.
 if GPU40:
     INTAKE = (
         "2026-10-29",
         "b71c071d3",
-        {"fixed_s": 0.004323501788394507, "per_byte_s": 3.8541166293528945e-09},
+        {"fixed_s": 0.004117017669015608, "per_byte_s": LONE[3]},
         {
-            "fixed_s": (0.004132315291889949, 0.004513225799755211),
-            "per_byte_s": (3.577973224796102e-09, 6.711557841376081e-09),
+            "fixed_s": (0.0040678600071484316, 0.0042950561500559375),
+            "per_byte_s": LONE[4],
         },
         "163c6320f4e4793c1d153a3058649d4feb05a4cfc0ff65d30712aedfa2577373",
+    )
+
+#: On gpu-40, the intake of a request that finds no other on the loop:
+#: `http_intake.py idle` less `INTAKE`'s per-byte rate over the parity
+#: workload's 64 lone requests (`atom.compass.parity.traffic` with
+#: `64 3 0 0 1`) to one DeepSeek-V4.1-Flash TP4 DSpark5 server on cards 0-3,
+#: at the commit named; the record is its stamp file, the band the p10 and p90
+#: over those requests.
+IDLE = None
+if GPU40:
+    IDLE = (
+        "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
+        "2026-11-02",
+        "0cd22bcc3",
+        0.001072699129032258,
+        (0.0008107075027502436, 0.0013017854022116544),
+        "d90b6703f0b2c276c64fb297d715cc596acfe342cf34794002abc25e3f70cf78",
     )
 
 #: Each host's core counts as /proc/cpuinfo reads them, aiter's commit in the
@@ -310,9 +353,29 @@ for block, groups in DATASHEET.items():
             DECLARED[block][group].pop(key, None)
 
 
+def intake_fragments() -> list[Fragment]:
+    """The burst's intake terms; where `LONE` is read, the burst's `fixed_s`
+    and the lone requests' `per_byte_s`, each with its own subject."""
+    if LONE is None:
+        return [base.intake(MODEL, *INTAKE)]
+    date, root, terms, bands, record = INTAKE
+    fixed = {"fixed_s": terms["fixed_s"]}, {"fixed_s": bands["fixed_s"]}
+    model, day, commit, rate, band, lone = LONE
+    subject = {"model": model, "source_root": f"commit:{commit}"}
+    subject["record"] = f"sha256:{lone}"
+    body = {"host": {"http_intake": {"per_byte_s": rate}}}
+    how = f"http_intake.py lone over one V4.1-Flash cell's bodies at {commit}"
+    band = {"host.http_intake.per_byte_s": band}
+    return [
+        base.intake(MODEL, date, root, *fixed, record),
+        fragment("lone", body, "probed", how, subject, day, band),
+    ]
+
+
 def device_fragments() -> list[Fragment]:
-    """The start's readings, the burst's intake terms, the datasheet's peaks,
-    the probed peaks and the assumed rest."""
+    """The start's readings, the burst's intake terms, the lone requests'
+    per-byte rate and idle intake where read, the datasheet's peaks, the probed
+    peaks and the assumed rest."""
     notes = f"one DeepSeek-V4-Pro {FLAGS} start at {COMMIT}"
     ptl = {"device": {"ptl": "disabled"}}
     datasheet = fragment(
@@ -324,11 +387,12 @@ def device_fragments() -> list[Fragment]:
     probed, assumed = base.peaks(PEAKS, datasheet.values, assumed)
     return [
         fragment("device", DEVICE, "probed", notes, SUBJECT, DATE),
-        base.intake(MODEL, *INTAKE),
+        *intake_fragments(),
         datasheet,
         assumed,
         fragment("ptl", ptl, "probed", "no card has a ptl directory", date=PTL_DATE),
         probed,
+        *([base.idle(*IDLE)] if IDLE else []),
     ]
 
 

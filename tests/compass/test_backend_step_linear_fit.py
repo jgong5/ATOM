@@ -363,18 +363,22 @@ HOST = {
         "W_launch": [1e-4, 2e-6, 0.0],
         "W_post": [1.5e-4, 4e-6, 0.0],
     },
+    # A prefill row past the first is a request the forward admits: what they
+    # add to `E` is `HOST_ADMIT`'s, its intercept once.
     "prefill": {
-        "E": [4e-4, 2e-8, 5e-5],
+        "E": [4e-4, 2e-8, 0.0],
         "W_pre": [6e-4, 1e-7, 8e-5],
         "W_launch": [2e-4, 3e-8, 2e-5],
         "W_post": [3e-4, 1e-9, 6e-5],
     },
     "middle": {
-        "E": [5e-4, 3e-8, 4e-5],
+        "E": [5e-4, 3e-8, 0.0],
         "W_pre": [7e-4, 9e-8, 7e-5],
         "W_launch": [2.5e-4, 2e-8, 3e-5],
     },
 }
+#: A forward's `E` if it admits requests, per prompt token past the hit and in it.
+HOST_ADMIT = [3e-4, 2e-8, 1e-9]
 KEY = {"host_cpu": "test cpu", "atom": "0" * 64, "model": None, "engine": {}}
 IDLE_NS = 10**9
 #: Device work between forwards, which a decode's label takes and a prefill's does not.
@@ -404,6 +408,10 @@ def _timed_record(path, steps, idle_after=(), key=KEY, gap=0, scale=None):
         kind = "decode" if not prefill else "prefill" if output else "middle"
         x = (1, sum(r[0] for r in rows), len(rows))
         ns = {k: round(float(np.dot(c, x)) * 1e9) for k, c in HOST[kind].items()}
+        # Its rows past the first are requests it admits, each its only prefill row.
+        new = [(q, n - q) for q, n, d in rows[1:] if not d]
+        a = (len(new), sum(u for u, _ in new), sum(c for _, c in new))
+        ns["E"] += round(float(np.dot(HOST_ADMIT, (min(a[0], 1), *a[1:]))) * 1e9)
         ns = {k: round(v * (scale or {}).get((i, k), 1)) for k, v in ns.items()}
         enter = t + ns["E"]
         g0 = enter + ns["W_pre"] // 2
@@ -478,6 +486,7 @@ def test_device_busy_time_and_host_laws_are_recovered_from_a_timed_record(tmp_pa
         for segment, c in segments.items():
             got = host["laws"][kind][segment]
             assert got == pytest.approx(c, rel=1e-4, abs=1e-12), f"{kind}.{segment}"
+    assert host["admit"] == pytest.approx(HOST_ADMIT, rel=1e-4, abs=1e-12)
 
 
 def test_a_prefill_whose_exit_ran_under_the_paced_share_after_its_host_record_is_cut(
@@ -569,7 +578,7 @@ def test_the_command_writes_host_laws_a_run_file_takes_and_scores_them_held_out(
 
     law = json.loads((tmp_path / "law.json").read_text())
     StepLinearLaw(law)
-    assert set(law["host"]) == {"key", "laws"}
+    assert set(law["host"]) == {"key", "laws", "admit"}
     assert {len(c) for s in law["host"]["laws"].values() for c in s.values()} == {3}
     out = capsys.readouterr().out
     assert "held out, host laws" in out and "host decode W_post | " in out
@@ -1142,3 +1151,29 @@ def test_a_dp_step_a_peer_ran_as_a_dummy_is_fitted_on_the_ranks_that_ran_it(tmp_
     assert sum(v["fit"]["samples"] for v in fitted) == 120
     assert fitted[0]["coefficients"] == pytest.approx(dp.PREFILL, rel=1e-6)
     assert fitted[1]["coefficients"] == pytest.approx(dp.DECODE, rel=1e-6)
+
+
+def test_a_routed_dp_law_is_held_out_with_each_step_s_dummy_forwards(tmp_path):
+    """Three DP runs whose idle ranks run dummy forwards: each run, held out of
+    a fit on the other two, is priced with its steps' dummies reaching one
+    token's experts, so the held-out errors are nil, and each step's costliest
+    rank lies inside their hull."""
+    import test_step_linear_moe_column as moe
+
+    runs = [
+        moe._dummy_records(tmp_path / f"run{s}", moe._dummy_groups(s, 120))
+        for s in (0, 1, 2)
+    ]
+    law, samples, options = moe._routed([r for run in runs for r in run])
+    report = {"held_out": {}}
+    mark_held_out(law, report, samples, options)
+
+    vector = law["decode"][str(moe.RUNG)]
+    band = vector["held_out"]["bands"][f"decode rung {moe.RUNG}"]
+    assert band["steps"] == 360
+    assert max(abs(band["p10"]), abs(band["p90"])) < 1e-6
+    assert len(report["held_out"]) == 3
+    backend = StepLinearBackend(StepLinearLaw(law), moe.DP)
+    views = [vs[0] for vs, _ in moe._dummy_groups(0, 120)]  # rank 0 always works
+    validated = {t.provenance.validated for v in views for t in backend.price(v).terms}
+    assert validated == {True}

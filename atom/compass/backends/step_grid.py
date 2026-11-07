@@ -43,8 +43,8 @@ Also refused: a step mixing prefill and decode rows, a decode row computing
 a width not the grid's, a count that is not an int, a prefill step that does not
 say whether it produces output, and under a replay bundle a decode step that
 replays no graph, being wider than the widest rung or eager, and a step with
-image tokens. A DP dummy forward (`BatchView.dp_dummy`) that replays no graph
-is, under a replay bundle, `eager_dp_dummy`: 0 s, not refused.
+image tokens. Under a replay bundle, a DP dummy or a decode while a peer prefills
+that replays no graph costs 0 s under its treatment (`eager_beside_peer`).
 
 The answer is the lookup times the residual's factor for the batch's ordered
 rows (`step_grid_residual.py`), which the residual may refuse, and which
@@ -62,6 +62,9 @@ of its window after the target's. `StepGrid(grid, drafter=True)` reads that
 value at the same coordinates by the same rules, with the drafter's own alpha,
 `draft_alpha`; the backend prices it, times its own residual's factor, as the
 step's draft term, `draft`, beside the target's `forward`.
+
+A backend built with `treatments`, the assumed treatments its points were
+measured under, names them on every step it prices from its grid.
 
 The grid is a mapping, as a bundle holds it:
 
@@ -101,7 +104,7 @@ from typing import TYPE_CHECKING
 
 from atom.compass.backends import provenance
 from atom.compass.backends.base import CostBackend, Granularity
-from atom.compass.backends.cost import CostTerm, StepCost, eager_dp_dummy
+from atom.compass.backends.cost import CostTerm, StepCost, eager_beside_peer
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import (
@@ -508,7 +511,8 @@ class StepGridBackend(CostBackend):
     """Prices a step as the grid's value at its equivalent shape, times the
     residual; `bundle` names the artifact both came from, for `describe`.
     Under a drafter, `drafter` is the grid read for the drafter's value and
-    the drafter's residual, which price the step's draft term alike."""
+    the drafter's residual, which price the step's draft term alike. Every
+    step it prices from its grid names `treatments`."""
 
     def __init__(
         self,
@@ -516,9 +520,11 @@ class StepGridBackend(CostBackend):
         residual: Residual,
         bundle: str,
         drafter: tuple[StepGrid, Residual] | None = None,
+        treatments: Sequence[str] = (),
     ) -> None:
         self.grid, self.residual, self.bundle = grid, residual, bundle
         self.drafter = drafter
+        self.treatments = tuple(treatments)
 
     @property
     def granularity(self) -> Granularity:
@@ -532,12 +538,12 @@ class StepGridBackend(CostBackend):
         view = batch_view
         if view.image_tokens:
             raise _refused(view, IMAGES)
-        eager = not view.prefill and view.capture_rung is None
-        if eager and view.dp_dummy and self.grid.graph_mode != "eager":
-            return eager_dp_dummy(SOURCE)
+        beside = eager_beside_peer(view, SOURCE)
+        if beside is not None and self.grid.graph_mode != "eager":
+            return beside
         target = _term("forward", self.grid, self.residual, view)
         drafts = [_term("draft", *self.drafter, view)] if self.drafter else []
-        return StepCost([target], draft_terms=drafts)
+        return StepCost([target], self.treatments, drafts)
 
     def describe(self) -> str:
         drafter = self.drafter and f"; drafter {self.drafter[1].describe()}"
