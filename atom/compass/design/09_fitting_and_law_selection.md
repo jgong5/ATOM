@@ -167,9 +167,13 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   rank, without Python stacks (`07` D38, Phase 1c). Per forward and pass, split at
   `forward_done_event`, busy time is the union of the pass's kernels plus each gap before
   one of them: whole where that kernel was already queued when the gap opened, else capped
-  at the trace's median such queued gap. A TP collective, the target's or the drafter's,
-  counts from its last rank's start, and each pass's busy time is its largest over the
-  ranks. Every rank is profiled throughout and none pauses
+  at the trace's median such queued gap. Copies on ATOM's copy stream, the stream that runs
+  no kernel, are left out: the host waits for them and no kernel does, and `01` keeps the
+  copy stream off the timeline
+  ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6707000151)). A TP
+  collective, the target's or the drafter's, counts from its last rank's start, and each
+  pass's busy time is its largest over the ranks. Every rank is profiled throughout and
+  none pauses
   ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6702728444)): on
   crsuse2-m2m-v3-005 a pause ran `hipDeviceSynchronize` on its rank, and the peer waited
   about 107 ms at the drafter's step-begin fence. With both ranks profiled the draft-KV
@@ -184,8 +188,8 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   decode or host label, and an ordinary record fits the decode and host laws. A trace run
   under DP refuses. Checked-in laws keep their labels until refitted, and a refit needs a
   trace run. On Run 4B's TP0 trace the busy time of device-paced forwards sat within 0.6%
-  of the window per target pass and the final's draft at +2.3%, where side-stream copies
-  run past the window's last event; the capped gaps added none of a host-paced final's
+  of the window per target pass and the final's draft at +2.3%, where copy-stream copies
+  ran past the window's last event; the capped gaps added none of a host-paced final's
   busy time ([#2072](https://github.com/jgong5/ATOM/issues/2072#issuecomment-6387348851)).
 - **Profiler check.** On each trace run, a law fitted on ordinary records prices the busy
   time of the forwards no kernel of which waited on its launch, per kind and pass, so a
