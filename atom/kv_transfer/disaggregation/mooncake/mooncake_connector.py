@@ -712,6 +712,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 if sock is None:
                     sock = zmq.Context.instance().socket(zmq.DEALER)
                     sock.setsockopt(zmq.LINGER, 0)
+                    # Queued, never blocking the step loop, while a producer
+                    # rank is unreachable.
+                    sock.setsockopt(zmq.SNDHWM, 0)
                     sock.connect(addr)
                     self._abort_sockets[addr] = sock
                 sock.send_multipart([MSG_ABORT, notice])

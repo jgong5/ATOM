@@ -126,7 +126,10 @@ def test_every_rank_of_every_producer_stage_is_told(monkeypatch):
 
     context = SimpleNamespace(socket=lambda _kind: Socket())
     fake = SimpleNamespace(
-        Context=SimpleNamespace(instance=lambda: context), DEALER=0, LINGER=0
+        Context=SimpleNamespace(instance=lambda: context),
+        DEALER=0,
+        LINGER=0,
+        SNDHWM=0,
     )
     monkeypatch.setitem(MC, "zmq", fake)
     blob = {
