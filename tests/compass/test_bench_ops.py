@@ -778,6 +778,36 @@ def test_a_v41_prefill_past_cached_tokens_picks_candidates_off_its_rows_blocks(
     assert units["block_tables"].shape == (1, 40)
 
 
+def test_v41_index_leaves_rank_a_logits_plane_drawn_below_each_row_s_bound(
+    monkeypatch,
+):
+    # ATOM's scorer writes the plane first, no leaf here: the page-wide
+    # top-k, the pick's block maxima and a candidate list's top-k at decode B=2
+    def top_k(width, bounds):
+        bounds = [_t([2], bounds, dtype="torch.int32")] * 2
+        return _leaf(
+            ops._TOPK,
+            ("logits", _t([2, width], "metadata")),
+            *zip(("row_starts", "row_ends"), bounds),
+            ("stride0", width),
+        )
+
+    maxima = _leaf(
+        ops._MAXIMA,
+        ("logits", _t([2, 64], "metadata")),
+        ("visible", _t([2], "metadata", dtype="torch.int32")),
+        ("maxima", _t([2, 8], "activation")),
+        ("blocks", 8),
+    )
+    leaves = top_k(64, "metadata"), maxima, top_k(32, "activation")
+    taken = _v41_index(monkeypatch, [50, 20], leaves, decode(2), 64)
+
+    # rows seeing 50 and 20 compressed rows; the list keeps 26 and 20 of them
+    for call, bounds in zip(taken, ([50, 20], [50, 20], [26, 20])):
+        for row, n in zip(call["logits"], bounds):
+            assert row[:n].ne(0).all() and row[n:].eq(0).all()
+
+
 def test_an_embedding_reads_the_token_ids_atom_prepared():
     runner = _Runner()
     # An index buffer whose name holds the slot's, which the name rule picks.
