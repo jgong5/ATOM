@@ -21,6 +21,7 @@ import msgpack
 import pytest
 import zmq
 from test_pd_source_claim import (
+    MooncakeConnector,
     _engine,
     _mooncake,
     _parked,
@@ -30,9 +31,13 @@ from test_pd_source_claim import (
     _write_request,
 )
 
-from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+
+#: The namespace of the Mooncake module the helpers' classes were built from.
+#: `stubbed_aiter` drops that module from `sys.modules` once it is built, so an
+#: import here would be a second copy, which those classes never read.
+MC = MooncakeConnector._write_listener.__globals__
 
 
 class _Ended(Exception):
@@ -49,8 +54,8 @@ def _listen(rank, monkeypatch, messages) -> None:
         return messages.pop(0)
 
     sock = SimpleNamespace(recv_multipart=recv_multipart)
-    monkeypatch.setattr(
-        mc, "zmq_socket_ctx", lambda *_a, **_k: contextlib.nullcontext(sock)
+    monkeypatch.setitem(
+        MC, "zmq_socket_ctx", lambda *_a, **_k: contextlib.nullcontext(sock)
     )
     rank._side_channel_port = 0
     rank._publish_listener_state = lambda exc=None: None
@@ -93,7 +98,7 @@ def test_a_decode_abort_before_the_write_request_frees_the_producer(monkeypatch)
         listener.close()
         for sock in consumer._abort_sockets.values():
             sock.close()
-    assert message[1:] == [mc.MSG_ABORT, msgpack.dumps({"transfer_id": x.id})]
+    assert message[1:] == [MC["MSG_ABORT"], msgpack.dumps({"transfer_id": x.id})]
 
     _listen(rank, monkeypatch, [message])
     _step(prefill)
@@ -123,7 +128,7 @@ def test_every_rank_of_every_producer_stage_is_told(monkeypatch):
     fake = SimpleNamespace(
         Context=SimpleNamespace(instance=lambda: context), DEALER=0, LINGER=0
     )
-    monkeypatch.setattr(mc, "zmq", fake)
+    monkeypatch.setitem(MC, "zmq", fake)
     blob = {
         "do_remote_prefill": True,
         "transfer_id": 9,
@@ -145,8 +150,9 @@ def test_every_rank_of_every_producer_stage_is_told(monkeypatch):
 
     _consumer().request_finished(seq)
 
+    port = MC["_port_offset"]
     listeners = [
-        f"tcp://producer:{7000 + mc._port_offset(1, tp_rank, 2, pp_rank, 2, 2)}"
+        f"tcp://producer:{7000 + port(1, tp_rank, 2, pp_rank, 2, 2)}"
         for pp_rank in (0, 1)
         for tp_rank in (0, 1)
     ]
