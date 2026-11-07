@@ -700,6 +700,29 @@ def test_a_task_ending_while_the_hold_waits_on_a_return_has_its_callbacks_run_fi
     assert _run(main()) == [1]
 
 
+def test_a_task_ending_while_the_owner_idles_has_its_callbacks_run_first(tmp_path):
+    """The owner idles with no request open, no clock wait and no finish; a
+    task sends a request and ends in one step, so its done callbacks queue
+    behind the owner's wake: they run before the traffic LP asks for time."""
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, {0})])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        calls_at_done = []
+        await asyncio.sleep(0.05)  # the owner settles, then idles
+
+        async def sends():
+            traffic.send(_key(0))
+
+        sent = asyncio.ensure_future(sends())
+        sent.add_done_callback(lambda _: calls_at_done.append(len(rt.calls)))
+        await asyncio.sleep(0.05)
+        traffic.done.cancel()
+        return calls_at_done
+
+    assert _run(main()) == [0]
+
+
 class ScriptedConn:
     """A Clock Authority connection whose grants are scripted: grant ``k``
     releases stream seq ``k`` at ``k + 1``, then ``+inf`` ends the run. Each
