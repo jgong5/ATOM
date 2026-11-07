@@ -642,16 +642,18 @@ def test_an_eager_dp_mtp1_drafter_asks_its_one_pass_at_its_own_g(monkeypatch):
 
 #: A DP rank's step-record lines whose target ran past its rows without a graph
 #: replay (`target_bs`): an eager decode of 3 rows padded to a peer's 4, and a
-#: prefill whose LM head samples at a peer's 2 rows; and under MTP2 an eager
-#: decode so padded, its drafter's first pass gathering 9 + 12 tokens
-#: (`draft_moe_rows`) and its later passes run at 4 (`draft_bs`).
+#: prefill whose LM head samples at a peer's 2 rows; and under MTP2 two eager
+#: decodes so padded, each drafter's first pass gathering 9 + 12 tokens
+#: (`draft_moe_rows`) and its later passes run at 4 (`draft_bs`). A record's
+#: second line ties its host and device clocks, which cost accuracy reads.
 PADDED = [
     {"rows": [[1, 90, True]] * 3, "moe_rows": 8, "target_bs": 4},
     {"rows": [[64, 64, False]], "moe_rows": 100, "target_bs": 2},
 ]
 DRAFTED = [
-    {"rows": [[3, 90, True]] * 3, "moe_rows": 24, "target_bs": 4}
+    {"rows": [[3, context, True]] * 3, "moe_rows": 24, "target_bs": 4}
     | {"draft_moe_rows": 21, "draft_bs": 4}
+    for context in (90, 93)
 ]
 LINES = pytest.mark.parametrize(
     "drafts,lines", [(0, PADDED), (2, DRAFTED)], ids=["target", "mtp2"]
