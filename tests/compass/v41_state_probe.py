@@ -123,6 +123,7 @@ def ops_placements(
     from atom.compass import ir
     from atom.compass.bench import ops, replay
     from atom.compass.capture.forward import decode
+    from atom.compass.ir.nodes import Reduced
     from atom.utils import forward_context as fctx
 
     point = point or decode(2)
@@ -182,7 +183,7 @@ def ops_placements(
         if pool == "whole":  # and the ring's window, as the ring's writers take it
             window = cache.geometry.window(1, 4)
             cls = f"{type(window).__module__}:{type(window).__name__}"
-            given = ("window", ir.Reduced(cls, tuple(vars(window).items())))
+            given = ("window", Reduced(cls, tuple(vars(window).items())))
             leaf = dataclasses.replace(leaf, args=(*leaf.args, given))
         if pool:  # its `reach` ring rows; beside a ring at a ratio, top-k 1 a row
             pages = point.seqs if pool == "ring" and ratio else 0
