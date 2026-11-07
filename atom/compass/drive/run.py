@@ -31,11 +31,9 @@ both values. The check refuses no step: it counts those the grid extrapolates
 and those that fall to the step roofline below it, naming each with the grid's
 reasons. The op graph's is `op_coverage`, over the backend `run.op_graph`
 builds from the run file: a step is covered when its price list prices every
-leaf, and a run file that names no price list refuses. Under `--enable-tbo` a
-data-parallel step its group splits, by the rule `validate.bound` agrees over
-every rank's line at that step, is priced as its two micro-batches, as a
-simulated run prices it. Another backend has no check, and refuses
-`--coverage`.
+leaf, a step its DP group splits under `--enable-tbo` read as its two
+micro-batches, and a run file that names no price list refuses. Another backend
+has no check, and refuses `--coverage`.
 
 `--acceptance-record` names a speculative `compass record` directory: its
 histograms' rates (`measured`) go to ATOM as ``--spec-decode-acceptance-rates``,
@@ -317,25 +315,18 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
                     f"{k} {ran.get(k)!r} there, {here[k]!r} here" for k in differ
                 )
             )
-    ranks = {
-        rank: [json.loads(t) for t in text.splitlines()]
+    at = {
+        rank: {s["step"]: s for s in map(json.loads, text.splitlines())}
         for rank, (text, _) in sorted(records.items())
     }
-    splits = {}
-    # One rank is no data-parallel group. Dummy runs' lines join the split; a
-    # step some rank's record lacks splits none, as `trace ops --population`
-    # reads it (`capture.population_steps`).
-    if tbo and len(ranks) > 1:
-        at = [{s["step"]: s for s in lines} for lines in ranks.values()]
-        for step in set.intersection(*map(set, at)):
-            splits[step] = _split([r[step] for r in at])
+    # One rank is no DP group; dummy runs join the split, and a step some rank
+    # lacks splits none, as `trace ops --population` reads it.
+    every = set.intersection(*map(set, at.values())) if tbo and len(at) > 1 else ()
+    splits = {n: _split([r[n] for r in at.values()]) for n in every}
     return [
-        (
-            f"{name} dp{rank} step {line['step']}",
-            line | {"tbo_tokens": splits.get(line["step"])},
-        )
-        for rank, lines in ranks.items()
-        for line in lines
+        (f"{name} dp{rank} step {n}", line | {"tbo_tokens": splits.get(n)})
+        for rank, steps in at.items()
+        for n, line in steps.items()
         if not line["is_dummy_run"]
     ]
 
