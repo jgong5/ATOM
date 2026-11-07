@@ -280,6 +280,23 @@ def test_a_v41_window_ring_written_through_its_pool_counts_a_row_a_token(
     assert record["footprint_bytes"] == 7 * 16 * tokens + sets * placed["ring"]
 
 
+@pytest.mark.parametrize("case, rows", [("prefix0", 32), ("prefix2", 32), ("tail", 16)])
+def test_a_v41_cached_prefill_reads_its_history_through_its_pool_once_a_slot(
+    probed, case, rows
+):
+    """A two-row prefill past 96 cached tokens, its attention taking V4.1's
+    pool alone, stating its window of 8: each row's prefix reads there the 7
+    ring rows before its first token, once a slot pair of the 4 that 8 slots
+    hold, and its selection, top-k 1 a row, once a placement, none at ratio 0.
+    A bounded-replay tail's, 16 query rows of the 32, reads no ring row."""
+    _, seen = probed
+    placed = seen[f"ops_v41_{case}"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    ring, pages = placed["ring"], placed["read"] - placed["ring"]
+    assert record["footprint_bytes"] == 7 * 16 * rows + 7 * pages + 4 * ring
+
+
 #: The bench tensor each KV view `v41_state_probe.kv_bound` takes binds.
 BOUND = {
     "pages": "pages.buf.torch.bfloat16",
