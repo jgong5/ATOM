@@ -1669,21 +1669,23 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
     layer has that layout: ATOM passes a layer of DeepSeek-V4's compressor
     state, and another field's base at this one's slot stride reaches past
     the pool; else among the tensors of its strides and dtype it lies inside,
-    from their end past the widest-strided dim, as ATOM passes DeepSeek-V4.1's
-    cursor history; else among the buffers of arenas, as its dtype views them
+    each cut from its end in every dim but the widest-strided (DeepSeek-V4.1's
+    cursor history); else among the buffers of arenas, as its dtype views them
     (`_bound`), whose fields' strided views ATOM carves out of them, the
     capture's pool sizing a dimension other than the widest-strided;
     or why none fits, and None: a tensor of another layout is another buffer
-    than the one ATOM passes. A flat one is first an arena's buffer, its own
-    dtype's first, of which it fills whole entries, as the capture's pool
-    sized it; one an entry short of an arena's buffer ending its tensor, or
-    less, binds that tensor's end: V4.1's window ring (`ring_view`)."""
+    than the one ATOM passes. A flat one takes first an arena's buffer, of its
+    own dtype first, of which it fills whole entries (`_entry`), as the
+    capture's pool sized it. One short of an arena's buffer that ends its
+    tensor by less than an entry binds that tensor's end: the window ring ATOM
+    cuts from V4.1's pool (`ring_view`), when the capture held the bench's
+    state slots."""
     shape, stride, dtype = spec["shape"], spec["stride"], _dtype(spec["dtype"])
-    nbytes, at = _span(shape, stride) * dtype.itemsize, lambda b: b[1][0].dtype != dtype
+    nbytes = _span(shape, stride) * dtype.itemsize
     bufs = {n: (t, _entry(n, live)) for n, t in live.items() if ".buf." in n}
     own = {
         n: t.view(dtype)
-        for n, (t, e) in sorted(bufs.items(), key=at)
+        for n, (t, e) in sorted(bufs.items(), key=lambda b: b[1][0].dtype != dtype)
         if stride == [1] and 0 < nbytes <= t.nbytes and not nbytes % e
     }
     want = _layout(spec["shape"], spec["stride"])
@@ -1717,8 +1719,8 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
 
 
 def _entry(name, live) -> int:
-    """An entry's bytes of the arena buffer `name` (`_bound`): its bytes over
-    its fields' entries, `[layers, entries, ...]`."""
+    """The bytes an entry takes of the arena buffer `name` (`_bound`): its bytes
+    over the entries of its fields' views, `[layers, entries, ...]`."""
     arena = name.split(".buf.")[0] + "."
     held = [t.shape[1] for n, t in live.items() if n.startswith(arena) and t.dim() > 1]
     return live[name].nbytes // (held or [1])[0]
