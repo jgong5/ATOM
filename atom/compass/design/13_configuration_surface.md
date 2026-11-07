@@ -188,7 +188,7 @@ with the `spec` package and per-machine scripts (`05` D26). A user passes one by
 `--machine`.
 
 ```
-compass record         --gpu G [--host H] [--store S] [--trace] \
+compass record         --gpu G [--host H] [--store S] [--sweep] [--trace] \
                        --out D -- <ATOM args>                                 [GPU]
 compass trace steps    <backend> --machine M  --out D --store S -- <ATOM args>
 compass trace ops      --model M [--tp N] [--width W]... [--prefill T B]... \
