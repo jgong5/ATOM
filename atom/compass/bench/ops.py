@@ -2605,10 +2605,14 @@ def _ladder(values) -> list:
 
 
 def _shape(text: str):
+    """The `Shape` whose `str` is `text`, each count read by its name."""
     from atom.compass.capture.forward import decode, prefill
+    from atom.compass.fit.ops import shape_counts
 
-    counts = [int(n) for n in re.findall(r"=(\d+)", text)]
-    return prefill(*counts) if text.startswith("prefill") else decode(*counts)
+    n = shape_counts(text)
+    if text.startswith("prefill"):
+        return prefill(n["T"], n["B"], n.get("G"), n.get("W"))
+    return decode(n["B"], n.get("G"), n.get("T"))._replace(width=n.get("W"))
 
 
 def _abstract(value, n: int):
