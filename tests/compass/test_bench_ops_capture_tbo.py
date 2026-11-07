@@ -32,7 +32,13 @@ def test_a_prefill_point_two_batch_overlap_would_split_is_traced_as_one_forward(
         command = [sys.executable, "-c", MAIN, "trace", "ops", *argv]
         env = {**os.environ, "PYTHONPATH": str(TREE)}
         run = subprocess.run(
-            command, capture_output=True, text=True, timeout=1800, cwd=TREE, env=env
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=1800,
+            cwd=TREE,
+            env=env,
         )
         done.append(run)
 
