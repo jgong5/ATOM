@@ -766,8 +766,9 @@ READERS = {
 def test_a_reader_asks_a_recorded_eager_dp_drafter_what_a_simulated_run_asks(
     monkeypatch, tmp_path, reader
 ):
-    # The step above, whose later passes gather 3 + 4 rows, and the line the
-    # step recorder writes of its batch, run alike on two ranks.
+    # MTP2 at DP2 with no draft graph, 3 rows beside a peer's 4: its later
+    # passes gather 3 + 4 rows. Its line is the one the step recorder writes
+    # of its batch, run alike on two ranks.
     view = settled(monkeypatch, DECODE, [(4, 12, False)], eager=True, step=False)
     monkeypatch.setattr(projection, "forward_mode", lambda *_: None)
     monkeypatch.setattr(projection, "batch_view", lambda *_: view)
