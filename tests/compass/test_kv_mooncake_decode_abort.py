@@ -15,6 +15,8 @@ own listener then reads those frames from a scripted socket.
 from __future__ import annotations
 
 import contextlib
+import signal
+import socket
 from types import SimpleNamespace
 
 import msgpack
@@ -67,6 +69,18 @@ def _consumer():
     consumer = _mooncake(is_producer=False)
     consumer._abort_sockets = {}
     return consumer
+
+
+def _unwritten(blob):
+    """A request a consumer finishes before asking for its write."""
+    return SimpleNamespace(
+        id=5,
+        kv_transfer_params={**blob, "do_remote_prefill": True},
+        block_table=[],
+        output_tokens=[],
+        spec_token_ids=None,
+        prefix_cache_hit_tokens=0,
+    )
 
 
 def test_a_decode_abort_before_the_write_request_frees_the_producer(monkeypatch):
@@ -133,7 +147,6 @@ def test_every_rank_of_every_producer_stage_is_told(monkeypatch):
     )
     monkeypatch.setitem(MC, "zmq", fake)
     blob = {
-        "do_remote_prefill": True,
         "transfer_id": 9,
         "remote_host": "producer",
         "remote_handshake_port": 7000,
@@ -142,16 +155,8 @@ def test_every_rank_of_every_producer_stage_is_told(monkeypatch):
         "remote_dp_rank": 1,
         "remote_dp_size": 2,
     }
-    seq = SimpleNamespace(
-        id=5,
-        kv_transfer_params=blob,
-        block_table=[],
-        output_tokens=[],
-        spec_token_ids=None,
-        prefix_cache_hit_tokens=0,
-    )
 
-    _consumer().request_finished(seq)
+    _consumer().request_finished(_unwritten(blob))
 
     port = MC["_port_offset"]
     listeners = [
@@ -160,3 +165,33 @@ def test_every_rank_of_every_producer_stage_is_told(monkeypatch):
         for tp_rank in (0, 1)
     ]
     assert sent == listeners
+
+
+def test_notices_to_an_unreachable_producer_rank_never_block_the_step_loop():
+    """A producer rank that never answers keeps every notice sent to it queued,
+    and decode's step loop, which sends them, goes on. At a DEALER's default
+    high-water mark, the send after the thousandth queued one would block."""
+    with socket.socket() as unbound:
+        unbound.bind(("127.0.0.1", 0))
+        port = unbound.getsockname()[1]
+    blob = {
+        "transfer_id": 9,
+        "remote_host": "127.0.0.1",
+        "remote_handshake_port": port,
+        "tp_size": 1,
+    }
+    consumer = _consumer()
+
+    def blocked(*_):
+        raise TimeoutError("a notice blocked the step loop")
+
+    previous = signal.signal(signal.SIGALRM, blocked)
+    signal.alarm(20)
+    try:
+        for _ in range(1001):
+            consumer.request_finished(_unwritten(blob))
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+        for sock in consumer._abort_sockets.values():
+            sock.close()
