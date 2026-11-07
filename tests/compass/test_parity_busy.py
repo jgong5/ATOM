@@ -127,17 +127,25 @@ def _run(
 
 
 @pytest.mark.parametrize(
-    "collective", ["cross_device_reduce_1stage", "atom::mono_step_begin_tp2_debug0"]
+    "collective",
+    [
+        "cross_device_reduce_1stage",
+        "void aiter::ar_ll_gfx9<std::bfloat16_t, 2, 256>(std::bfloat16_t* const*)",
+        "void aiter::allReduceQuantFp8<std::bfloat16_t, 2>(aiter::RankData*)",
+        "void aiter::reduce_scatter_cross_device_store<std::bfloat16_t, 2>()",
+        "atom::mono_step_begin_tp2_debug0",
+    ],
 )
 def test_each_pass_is_its_union_with_queued_gaps_whole_and_the_rest_capped(
     tmp_path, monkeypatch, collective
 ):
     """The named result. Rank 0's target: union 39, gaps 2 + 1 + 1 + 1, the
-    collective (an all-reduce, or the mono runner's peer fence) from rank 1's
-    start and its gap capped, 44; rank 1's 49, its K1 5 longer. The draft, alike
-    on both ranks: DK, D1 and D2, their union 12 and gaps 1 + 1 + 1; the
-    draft-KV pass DK, the propose pass D1 and D2. Each rank opens the ranges its
-    real recorder opens under ATOM's profiler: every rank, every range."""
+    collective (an all-reduce, a low-latency one, a reduce-scatter, or the mono
+    runner's peer fence) from rank 1's start and its gap capped, 44; rank 1's
+    49, its K1 5 longer. The draft, alike on both ranks: DK, D1 and D2, their
+    union 12 and gaps 1 + 1 + 1; the draft-KV pass DK, the propose pass D1 and
+    D2. Each rank opens the ranges its real recorder opens under ATOM's
+    profiler: every rank, every range."""
     marks = [set(_opened(tmp_path / f"r{r}", monkeypatch, r)[2]) for r in (0, 1)]
     monkeypatch.setattr(busy, "CHUNK", 64)  # a decode straddles every read
     path = busy.reduce(_run(tmp_path, marks=marks, collective=collective))

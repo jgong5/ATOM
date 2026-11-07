@@ -48,11 +48,13 @@ from atom.compass.parity import MARK, TARGET_DONE
 RECORD = "steps/dp0.jsonl"
 GPU = ("kernel", "gpu_memcpy", "gpu_memset")
 RUNTIME = ("cuda_runtime", "cuda_driver")
-#: A kernel whose name matches is a TP collective: aiter's custom all-reduce
-#: and all-gather, RCCL's, and the mono runner's step-begin peer fence, which
-#: holds each rank until every rank has launched it.
+#: A kernel whose name matches is a TP collective: aiter's custom all-reduces,
+#: its low-latency ones for small messages included, its all-gathers and
+#: reduce-scatters, RCCL's kernels, and the mono runner's step-begin peer fence,
+#: which holds each rank until every rank has launched it.
 COLLECTIVE = re.compile(
-    r"cross_device_reduce|allgather|all_gather|all_?reduce|nccl|mono_step_begin"
+    r"cross_device_reduce|allgather|all_gather|all_?reduce|allReduce|\bar_ll"
+    r"|reduce_scatter|nccl|mono_step_begin"
 )
 #: The drafter passes a busy line times apart, by their record line field.
 PASSES = ("d_propose_ns", "d_draft_kv_ns")
