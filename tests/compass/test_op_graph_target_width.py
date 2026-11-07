@@ -11,6 +11,7 @@ reads the step there: `compass run --coverage`, the bound and cost accuracy.
 
 import json
 import re
+from types import SimpleNamespace
 
 import pytest
 from test_capture_ir import _ops, _record
@@ -29,6 +30,8 @@ from atom.compass.backends.work import gemm, price
 from atom.compass.capture import population_shapes
 from atom.compass.capture.forward import Shape
 from atom.compass.drive import run as drive_run
+from atom.compass.parity import StepRecord
+from atom.compass.runner import projection
 from atom.compass.validate import bound
 from atom.compass.validate.cost import cost_accuracy
 
@@ -742,3 +745,62 @@ def test_cost_accuracy_prices_a_line_where_its_target_and_drafter_ran(
     # A step is its ranks' lines joined.
     assert report["refused"] == {}
     assert sum(k["steps"] for k in report["graded"].values()) == len(lines)
+
+
+def coverage(record, backend):
+    """`compass run --coverage`'s check of `record`'s first rank's lines."""
+    lines = (record / "steps" / "dp0.jsonl").read_text().splitlines()
+    named = [(str(n), json.loads(s)) for n, s in enumerate(lines)]
+    drive_run.op_coverage(backend, named)
+
+
+#: Each reader of a record directory, pricing its steps with a backend.
+READERS = {
+    "coverage": coverage,
+    "bound": lambda record, backend: bound.gate([record], {"op": backend}),
+    "cost": lambda record, backend: cost_accuracy(record / "steps", backend),
+}
+
+
+@pytest.mark.parametrize("reader", READERS)
+def test_a_reader_asks_a_recorded_eager_dp_drafter_what_a_simulated_run_asks(
+    monkeypatch, tmp_path, reader
+):
+    # The step above, whose later passes gather 3 + 4 rows, and the line the
+    # step recorder writes of its batch, run alike on two ranks.
+    view = settled(monkeypatch, DECODE, [(4, 12, False)], eager=True, step=False)
+    monkeypatch.setattr(projection, "forward_mode", lambda *_: None)
+    monkeypatch.setattr(projection, "batch_view", lambda *_: view)
+    batch = SimpleNamespace(
+        is_dummy_run=False,
+        req_ids=[0, 1, 2],
+        num_scheduled_tokens=[3, 3, 3],
+        context_lens=[90, 90, 90],
+        is_final_chunk=None,  # a decode instance's batch: no prompt to digest
+        external_request_ids=[None] * 3,
+        produces_output=lambda: True,
+    )
+    StepRecord(tmp_path / "recorded", 0).add(batch, None)
+    line = json.loads((tmp_path / "recorded" / "dp0.jsonl").read_text())
+    del line["step"], line["dp_rank"]
+    record = padded_record(tmp_path, [line] * 2)
+    drafted = [g(9, 64, 64), g(21, 32, 64), argmax(3), g(3, 64, 64)]
+    drafted += [g(6, 32, 64), g(7, 32, 64)]
+    graphs = {False: {"seq": [g(4, 64, 64)]}, True: {"seq": drafted}}
+
+    def asked(read):
+        listing = AskedG()
+        read(
+            OpGraphBackend(
+                SPEC,
+                lambda *_, draft=False, **__: graphs[draft],
+                kv="bf16",
+                dp=2,
+                drafts=2,
+                price_list=listing,
+            )
+        )
+        return set(listing.asked)
+
+    simulated = asked(lambda backend: backend.price(view))
+    assert asked(lambda backend: READERS[reader](record, backend)) == simulated
