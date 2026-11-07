@@ -1668,26 +1668,60 @@ def _kv(spec, slot, live) -> tuple[str, torch.Tensor | None]:
     else among the last layers, `name.i`, of tensors stacked by layer whose
     layer has that layout: ATOM passes a layer of DeepSeek-V4's compressor
     state, and another field's base at this one's slot stride reaches past
-    the pool; else among the buffers of arenas, as its dtype views them
+    the pool; else among the tensors of its strides and dtype it lies inside,
+    from their end past the widest-strided dim, as ATOM passes DeepSeek-V4.1's
+    cursor history; else among the buffers of arenas, as its dtype views them
     (`_bound`), whose fields' strided views ATOM carves out of them, the
     capture's pool sizing a dimension other than the widest-strided;
     or why none fits, and None: a tensor of another layout is another buffer
-    than the one ATOM passes."""
+    than the one ATOM passes. A flat one is first an arena's buffer, its own
+    dtype's first, of which it fills whole entries, as the capture's pool
+    sized it; one an entry short of an arena's buffer ending its tensor, or
+    less, binds that tensor's end: V4.1's window ring (`ring_view`)."""
+    shape, stride, dtype = spec["shape"], spec["stride"], _dtype(spec["dtype"])
+    nbytes, at = _span(shape, stride) * dtype.itemsize, lambda b: b[1][0].dtype != dtype
+    bufs = {n: (t, _entry(n, live)) for n, t in live.items() if ".buf." in n}
+    own = {
+        n: t.view(dtype)
+        for n, (t, e) in sorted(bufs.items(), key=at)
+        if stride == [1] and 0 < nbytes <= t.nbytes and not nbytes % e
+    }
     want = _layout(spec["shape"], spec["stride"])
-    own = {n: t for n, t in live.items() if _layout(t.shape, t.stride()) == want}
+    own = own or {n: t for n, t in live.items() if _layout(t.shape, t.stride()) == want}
     own = own or {
         f"{n}.{len(t) - 1}": t[-1]
         for n, t in live.items()
         if t.dim() > 2 and len(t) and _layout(t[-1].shape, t[-1].stride()) == want
+    }
+    cut, dims = _widest(shape, stride), lambda t: enumerate(zip(t.shape, shape))
+    own = own or {
+        n: t[tuple(slice(0 if i == cut else m - k, None) for i, (m, k) in dims(t))]
+        for n, t in live.items()
+        if (t.stride(), t.dtype) == (tuple(stride), dtype)
+        and all(m >= k for _, (m, k) in dims(t))
     }
     flat = f".buf.{spec['dtype']}"
     own = own or {n: t for n, t in live.items() if n.endswith(flat)}
     if not own:
         return f"ATOM's KV holds no tensor laid out as {slot} {_text(spec)}", None
     try:
-        return _meta(spec, slot, own, "KV")
+        name, view = _meta(spec, slot, own, "KV")
     except ValueError as error:  # the leaf refuses, not the point
         return str(error), None
+    t, end = own[name], lambda x: x.storage_offset() + _span(x.shape, x.stride())
+    for b, e in bufs.values() if len(shape) > 1 else ():
+        ends = end(b) * b.itemsize == end(t) * t.itemsize
+        if ends and _inside(b, t) and 0 <= b.nbytes - nbytes < e:
+            view = t.as_strided(shape, stride, end(t) - _span(shape, stride))
+    return name, view
+
+
+def _entry(name, live) -> int:
+    """An entry's bytes of the arena buffer `name` (`_bound`): its bytes over
+    its fields' entries, `[layers, entries, ...]`."""
+    arena = name.split(".buf.")[0] + "."
+    held = [t.shape[1] for n, t in live.items() if n.startswith(arena) and t.dim() > 1]
+    return live[name].nbytes // (held or [1])[0]
 
 
 def _layout(shape, stride) -> list:
