@@ -11,7 +11,9 @@ over the modules `run.modules.walk` reads off the meta build ATOM's arguments
 configure and its block drafter's (`run.modules.drafter`), as a simulated run
 walks them, and at op level by `OpGraphBackend`, over the `op_graph`s `compass
 trace ops` published in S for the spec's arch; both price the rows a replayed
-graph pads to. Each price is compared with the step's device busy time,
+graph pads to, and the op level a target and drafter at the widths and rows a
+line states they ran at (`target_bs`, `draft_bs`, `draft_moe_rows`).
+Each price is compared with the step's device busy time,
 `d_busy_ns`, or on an MTP record the target's, `d_target_ns`, plus on a step
 that samples a block drafter's draft-KV pass, `d_draft_kv_ns`, which runs
 before `forward_done_event`. On an MTP record only the target's price is
@@ -122,6 +124,9 @@ def steps(record, tbo=False, mtp=False):
                 tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
                 capture_rung=s["rung"],
                 moe_rows=s.get("moe_rows"),
+                draft_moe_rows=s.get("draft_moe_rows"),
+                draft_bs=s.get("draft_bs"),
+                target_bs=s.get("target_bs"),
                 produces_output=s["produces_output"],
                 tbo_tokens=split if dp else None,
                 moe_tokens=group if dp else None,

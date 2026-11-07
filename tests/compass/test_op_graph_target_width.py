@@ -4,7 +4,9 @@
 `ForwardMode.decide` settles `running_bs` on every step. An eager decode every
 rank of whose DP group decodes runs its model at it
 (`ModelRunner._padded_decode_inputs`), and a prefill that samples runs its LM
-head at it (`cu_seqlens_q`). Each step's mode here is `decide`'s own.
+head at it (`cu_seqlens_q`). Each step's mode here is `decide`'s own. A step
+record's line states that width, and a drafter's, and each reader of a record
+reads the step there: `compass run --coverage`, the bound and cost accuracy.
 """
 
 import json
@@ -19,11 +21,16 @@ from test_work import SPEC
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends import BatchView, RequestShape
+from atom.compass.backends.cost import CostTerm
 from atom.compass.backends.op_graph import LISTED, OpGraphBackend
-from atom.compass.backends.provenance import Method, Refusal
+from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.work import gemm, price
 from atom.compass.capture import population_shapes
+from atom.compass.capture.forward import Shape
+from atom.compass.drive import run as drive_run
+from atom.compass.validate import bound
+from atom.compass.validate.cost import cost_accuracy
 
 EMBED = "aten.embedding.default"
 MOE = "aiter.fused_moe_.default"
@@ -631,3 +638,107 @@ def test_an_eager_dp_mtp1_drafter_asks_its_one_pass_at_its_own_g(monkeypatch):
         (ARGMAX, 3, 3, 3, None),
         (GEMM, 3, 3, 3, None),
     ]
+
+
+#: A DP rank's step-record lines whose target ran past its rows without a graph
+#: replay (`target_bs`): an eager decode of 3 rows padded to a peer's 4, and a
+#: prefill whose LM head samples at a peer's 2 rows; and under MTP2 two eager
+#: decodes so padded, each drafter's first pass gathering 9 + 12 tokens
+#: (`draft_moe_rows`) and its later passes run at 4 (`draft_bs`). A record's
+#: second line ties its host and device clocks, which cost accuracy reads.
+PADDED = [
+    {"rows": [[1, 90, True]] * 3, "moe_rows": 8, "target_bs": 4},
+    {"rows": [[64, 64, False]], "moe_rows": 100, "target_bs": 2},
+]
+DRAFTED = [
+    {"rows": [[3, context, True]] * 3, "moe_rows": 24, "target_bs": 4}
+    | {"draft_moe_rows": 21, "draft_bs": 4}
+    for context in (90, 93)
+]
+LINES = pytest.mark.parametrize(
+    "drafts,lines", [(0, PADDED), (2, DRAFTED)], ids=["target", "mtp2"]
+)
+#: Each line's device busy time: twice its target's price, one leaf at 1 us.
+BUSY_NS = 2000
+
+
+class Priced(CostSource):
+    """A price list that prices every leaf at a microsecond."""
+
+    name = LISTED
+
+    def price(self, request):
+        return CostTerm(f"op.{request[0]['op']}", 1e-6, Provenance(Method.MEASURED))
+
+
+def padded_record(path, lines):
+    """A record of two DP ranks that ran `lines` alike, stamped as a real run's."""
+    (path / "steps").mkdir()
+    (path / "run.json").write_text("{}")
+    for rank in (0, 1):
+        stamped = [
+            {"step": n, "dp_rank": rank, "is_dummy_run": False, "rung": None}
+            | {"produces_output": True, "named": [], "d_busy_ns": BUSY_NS}
+            | {"batch": [[i, q, c] for i, (q, c, _) in enumerate(line["rows"])]}
+            | {"t_enter_ns": at, "t_launch_ns": [at, at], "t_recv_ns": [at, at]}
+            | {"t_exit_ns": at, **line}
+            for n, line in enumerate(lines)
+            for at in [n * BUSY_NS]
+        ]
+        text = "".join(json.dumps(s) + "\n" for s in stamped)
+        (path / "steps" / f"dp{rank}.jsonl").write_text(text)
+    return path
+
+
+def traced(record, drafts):
+    """An op graph at DP2 under a drafter of `drafts`, over the graphs `trace ops
+    --population` traces from `record`, one GEMM each, every leaf priced."""
+    shapes = set(population_shapes([str(record)]))
+
+    def graph(phase, tokens, seqs, output=True, gathered=None, draft=False, width=None):
+        if Shape(phase, tokens, seqs, gathered, width).at(2, drafts) in shapes:
+            return {"seq": [g(tokens, 64, 64)]}
+
+    return OpGraphBackend(
+        SPEC, graph, kv="bf16", dp=2, drafts=drafts, price_list=Priced()
+    )
+
+
+@LINES
+def test_the_coverage_check_reads_a_line_where_its_target_and_drafter_ran(
+    tmp_path, drafts, lines
+):
+    record = padded_record(tmp_path, lines)
+    steps = (record / "steps" / "dp0.jsonl").read_text().splitlines()
+
+    report = drive_run.op_coverage(
+        traced(record, drafts), [(str(n), json.loads(s)) for n, s in enumerate(steps)]
+    )
+
+    assert report["left out, by leaf kind"] == {}
+    assert report["covered"] == len(lines)
+
+
+@LINES
+def test_the_bound_prices_a_line_where_its_target_and_drafter_ran(
+    tmp_path, drafts, lines
+):
+    record = padded_record(tmp_path, lines)
+
+    r = bound.gate([record], {"op": traced(record, drafts)})["op"]
+
+    # Each rank's line is a step of its own.
+    assert (r["refused"], r["steps"]) == ({}, 2 * len(lines))
+
+
+@LINES
+def test_cost_accuracy_prices_a_line_where_its_target_and_drafter_ran(
+    tmp_path, drafts, lines
+):
+    record = padded_record(tmp_path, lines)
+
+    report = cost_accuracy(record / "steps", traced(record, drafts))
+
+    # A step is its ranks' lines joined.
+    assert report["refused"] == {}
+    assert sum(k["steps"] for k in report["graded"].values()) == len(lines)
