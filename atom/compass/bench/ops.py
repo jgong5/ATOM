@@ -129,8 +129,8 @@ state run.json reads, the source root and the point.
 for (`record`'s or `trace steps`' output), under `--enable-tbo` a step its DP
 group split as its two micro-batches, as `trace ops --population` traces it
 (`population_steps`), capturing each `op_graph` S lacks on the run's first GPU
-as it reads (`_capture`), or, before any point, refusing one only that call
-traces:
+as it reads, a prefill as one forward (`_capture`), or, before any point,
+refusing one only that call traces:
 every leaf at every rung of ATOM's decode ladder at the steps' lowest and
 highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
@@ -2920,7 +2920,9 @@ def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
     stepping and compute units pick kernels as they do on the card. A shape
     its `--prefill` and `--width` cannot name, a DP group's gathered rows or a
     padded width, refuses before any is traced, naming the `trace ops
-    --population` of the record directories `records` that traces it."""
+    --population` of the record directories `records` that traces it. Under
+    `--enable-tbo` a prefill is traced as one forward (`--whole`), where ATOM
+    would split a step of its tokens: a point times a leaf at its own shape."""
     from atom.compass import capture
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture.forward import decode, device_arch, prefill
@@ -2944,6 +2946,8 @@ def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
     for s in shapes:
         argv += ["--prefill", str(s.tokens)] if s.phase == "prefill" else ["--width"]
         argv.append(str(s.seqs))
+    if engine.enable_tbo:
+        argv.append("--whole")
     # The capture sets HIP_VISIBLE_DEVICES itself, and HIP then holds memory on
     # the GPU it names; ROCm's own mask, below HIP's, hides every GPU.
     with patch.dict(os.environ, ROCR_VISIBLE_DEVICES=""):
