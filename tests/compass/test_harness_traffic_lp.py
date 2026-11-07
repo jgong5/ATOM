@@ -662,6 +662,44 @@ def test_a_grant_resolves_only_the_clock_waits_it_makes_due(tmp_path):
     assert calls == [2.0, 2.0, 5.0]
 
 
+def test_a_task_ending_while_the_hold_waits_on_a_return_has_its_callbacks_run_first(
+    tmp_path,
+):
+    """aiperf's return callback yields, so the hold waits for it, then starts a
+    task that ends at its first step, as a turn the replay barrier holds does:
+    that task's done callbacks run before the traffic LP asks for time again."""
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, {0})])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        calls_at_done = []
+
+        async def ends_at_once():
+            pass
+
+        async def on_return(worker_id, ret):
+            await asyncio.sleep(0)
+            ended = asyncio.ensure_future(ends_at_once())
+            ended.add_done_callback(lambda _: calls_at_done.append(len(rt.calls)))
+
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(str(tmp_path / "lp"))[1])
+        traffic.send(_key(0))
+        push.send_pyobj((_key(0), 0, 1.0, True))
+        await traffic.hold(on_return)(
+            "worker_0", SimpleNamespace(credit=_credit(0), error=None)
+        )
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 5)
+        finally:
+            push.close(linger=0)
+        return calls_at_done
+
+    # The final event's grant answers the first clock call; the task ends in its hold.
+    assert _run(main()) == [1]
+
+
 class ScriptedConn:
     """A Clock Authority connection whose grants are scripted: grant ``k``
     releases stream seq ``k`` at ``k + 1``, then ``+inf`` ends the run. Each
