@@ -92,6 +92,8 @@ def ops_placements(
     page=False,
     pool=None,
     slots=8,
+    ratio=2,
+    reach=0,
 ):
     """The op bench's placements of a V4.1 `point` under `rule`, a two-row
     decode by default, at `context`, over `test_bench_ops`'s state-only leaf
@@ -105,10 +107,12 @@ def ops_placements(
     fields whole, `[layers, slots, ...]`, as `aten.select.int` takes them; with
     `page` too, its page field whole, `[layers, pages, ...]`, of a capture's 4.
     With `pool`, the cache's pool, `[rows, dim]` over its PAGEs and state, as a
-    capture's 4 PAGEs and `slots` state slots held it, whole, as
-    `_launch_rope_window` takes it; at `ring`, that and layer 1's window ring
-    cut from it (`ring_view`), as `pa_sparse_prefill_opus` takes both, stating
-    its window, compress ratio and top-k 1."""
+    capture's 4 PAGEs and `slots` state slots held it, whole, with its ring's
+    window, as `_launch_rope_window` and `swa_write` take it; at `ring`, that
+    and layer 1's window ring cut from it (`ring_view`), as
+    `pa_sparse_prefill_opus` takes both, stating its window of 8, compress
+    `ratio` and, past ratio 0, top-k 1. Its activation is a row a token, and
+    the bytes its ring rows read a call, `reach` rows, are kept too."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -119,6 +123,7 @@ def ops_placements(
     from atom.compass import ir
     from atom.compass.bench import ops, replay
     from atom.compass.capture.forward import decode
+    from atom.compass.ir.nodes import Reduced
     from atom.utils import forward_context as fctx
 
     point = point or decode(2)
@@ -147,7 +152,7 @@ def ops_placements(
     state = _t([8, 16], "kv", stride=[64, 1])
     args = ("kv", _t([2, 4], "activation")), ("kv_state", state), ("score", state)
     leaf = _leaf("v4.states", *args, ("layer", ir.ContextRef(KEY)), key=KEY)
-    llc, read = 1000, 0
+    llc, read, ring = 1000, 0, 0
     if v41:
         cache = built.cache
         runner.kv_held = ops._bound(
@@ -167,14 +172,24 @@ def ops_placements(
             states = [("pool", capture.pool)]
             states += [("ring", capture.ring_view(1))] if pool == "ring" else []
         dtyped = [(f, _t(t.shape, "kv", t.stride(), str(t.dtype))) for f, t in states]
-        leaf = _leaf("v41.states", *args[:1], *dtyped)
+        leaf = _leaf("v41.states", ("kv", _t([tokens, 4], "activation")), *dtyped)
         if pool == "ring":  # two rows' blocks hold 32 rows at ratio 2
             runner.config.kv_cache_block_size = BLOCK
-            stated = ("window_size", 8), ("compress_ratio", 2), ("index_topk", 1)
+            top = ("index_topk", 1 if ratio else None)
+            stated = ("window_size", 8), ("compress_ratio", ratio), top
             leaf = dataclasses.replace(leaf, stated=stated)
         # two rows' slots, every layer of each
         read = sum(2 * t.select(int(whole), 0).nbytes for _, t in states)
-        llc = 3 * (32 + read)  # 7 copies of 32 bytes of activation and the states
+        if pool == "whole":  # and the ring's window, as the ring's writers take it
+            window = cache.geometry.window(1, 4)
+            cls = f"{type(window).__module__}:{type(window).__name__}"
+            given = ("window", Reduced(cls, tuple(vars(window).items())))
+            leaf = dataclasses.replace(leaf, args=(*leaf.args, given))
+        if pool:  # its `reach` ring rows; beside a ring at a ratio, top-k 1 a row
+            pages = point.seqs if pool == "ring" and ratio else 0
+            ring = reach * capture.pool[0].nbytes
+            read = ring + pages * capture.pool[0].nbytes
+        llc = 3 * (16 * tokens + read)  # 7 copies of the activation and the states
     found = ops.leaves(_graph(leaf, layers=1)["region"])
     real, replay.seat_states = replay.seat_states, seat
     refused, got = None, []
@@ -185,7 +200,8 @@ def ops_placements(
         refused = str(error)
     finally:
         replay.seat_states = real
-    return {"slots": runner.batches, "refused": refused, "got": got, "read": read}
+    kept = {"slots": runner.batches, "refused": refused, "got": got}
+    return kept | {"read": read, "ring": ring}
 
 
 def kv_bound(slots):
@@ -335,10 +351,23 @@ def main(root: pathlib.Path) -> None:
     seen["ops_v41_page"] = ops_placements(
         plain, replay.seat_states, v41=True, whole=True, page=True
     )
+    # the ring rows a call reaches: a row a token written, a window of 8 a row
+    # read; a ring a request at most, of 8 rows, or 13 under DSpark5
+    seated = {"seat": replay.seat_states, "v41": True}
     for pool, slots in (("whole", 8), ("ring", 8), ("ring", 4), ("ring", 16)):
+        reach = 2 if pool == "whole" else 16
         seen[f"ops_v41_{pool}_pool_{slots}"] = ops_placements(
-            plain, replay.seat_states, v41=True, pool=pool, slots=slots
+            plain, replay.seat_states, v41=True, pool=pool, slots=slots, reach=reach
         )
+    seen["ops_v41_ring0_pool_8"] = ops_placements(
+        plain, pool="ring", ratio=0, reach=16, **seated
+    )
+    seen["ops_v41_write_verify"] = ops_placements(
+        drafted, point=width(2), drafts=DRAFTS, pool="whole", reach=12, **seated
+    )
+    seen["ops_v41_write_prefill"] = ops_placements(
+        plain, point=prefill(32, 1), context=128, pool="whole", reach=8, **seated
+    )
     seen["kv_bound"] = {slots: kv_bound(slots) for slots in (8, 2)}
 
     from atom.compass.bench.runner import BenchModelRunner
