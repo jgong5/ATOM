@@ -292,16 +292,16 @@ BOUND = {
 }
 
 
-@pytest.mark.parametrize(
-    "view, slots",
-    [(v, s) for s in ("8", "2") for v in BOUND if (v, s) != ("ring", "2")],
-)
+@pytest.mark.parametrize("view, slots", [(v, s) for s in ("8", "2") for v in BOUND])
 def test_a_v41_kv_view_binds_the_bytes_atom_passes(probed, view, slots):
     """A KV view of a capture's cache of 4 PAGEs, bound on the bench's of 64
     PAGEs and 8 state slots: the page and state arenas' flat buffers, the
     cursor history and layer 1's window ring at the bytes ATOM passes there,
     the state arena in float32 and the whole pool as before. At a capture of
     2 slots, the state arena's 2, and the whole pool, which lies an entry
-    and more inside the bench's state arena, at the pool's start."""
+    and more inside the bench's state arena, at the pool's start; so does the
+    ring, whose rows the capture's slots size (#2946)."""
     _, seen = probed
-    assert seen["kv_bound"][slots][view] == [f"cache.{BOUND[view]}", 0]
+    bound = seen["kv_bound"][slots]
+    off = -bound["ring_start"] if (view, slots) == ("ring", "2") else 0
+    assert bound[view] == [f"cache.{BOUND[view]}", off]

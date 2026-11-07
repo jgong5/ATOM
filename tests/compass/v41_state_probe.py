@@ -207,7 +207,8 @@ def ops_placements(
 def kv_bound(slots):
     """Each KV view a capture's cache of 4 PAGEs and `slots` state slots
     passes, as `ops._kv` binds it on `cache_of`'s as `ops._runner` holds it:
-    the name it binds and how far its first byte lies from that view there."""
+    the name it binds and how far its first byte lies from that view there;
+    and how far layer 1's window ring there lies from its pool's start."""
     import torch
 
     from atom.compass.bench import ops
@@ -225,7 +226,7 @@ def kv_bound(slots):
         "ring": lambda c: c.ring_view(1),
         "pool": lambda c: c.pool,
     }
-    out = {}
+    out = {"ring_start": bench.ring_view(1).data_ptr() - bench.pool.data_ptr()}
     for case, view in views.items():
         t = view(capture)
         spec = {"shape": [*t.shape], "stride": [*t.stride()], "dtype": str(t.dtype)}
