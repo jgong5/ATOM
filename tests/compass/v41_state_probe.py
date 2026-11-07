@@ -20,6 +20,7 @@ at the state slots `point` gives it; `runner` calls the step bench's
 `BenchModelRunner.forward` with the forward below it recorded.
 """
 
+import dataclasses
 import json
 import pathlib
 import pickle
@@ -81,7 +82,16 @@ def prepared(built, batch):
 
 
 def ops_placements(
-    rule, seat, point=None, context=20, drafts=0, v41=False, whole=False, page=False
+    rule,
+    seat,
+    point=None,
+    context=20,
+    drafts=0,
+    v41=False,
+    whole=False,
+    page=False,
+    pool=None,
+    slots=8,
 ):
     """The op bench's placements of a V4.1 `point` under `rule`, a two-row
     decode by default, at `context`, over `test_bench_ops`'s state-only leaf
@@ -93,7 +103,12 @@ def ops_placements(
     at a cache that gives it 7 copies; its record and the bytes its states
     read a call are kept too. With `whole`, it takes the window and score
     fields whole, `[layers, slots, ...]`, as `aten.select.int` takes them; with
-    `page` too, its page field whole, `[layers, pages, ...]`, of a capture's 4."""
+    `page` too, its page field whole, `[layers, pages, ...]`, of a capture's 4.
+    With `pool`, the cache's pool, `[rows, dim]` over its PAGEs and state, as a
+    capture's 4 PAGEs and `slots` state slots held it, whole, as
+    `_launch_rope_window` takes it; at `ring`, that and layer 1's window ring
+    cut from it (`ring_view`), as `pa_sparse_prefill_opus` takes both, stating
+    its window, compress ratio and top-k 1."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -143,8 +158,20 @@ def ops_placements(
         states = [(f, t if whole else t[-1]) for f, t in states]
         if page:
             states = [("main_1", cache.pages.view("main_1")[:, :4])]
+        if pool:
+            from atom.model_ops.attentions.deepseek_v41.cache import (
+                PagedAttentionCache,
+            )
+
+            capture = PagedAttentionCache(cache.geometry, 4, slots, "cpu")
+            states = [("pool", capture.pool)]
+            states += [("ring", capture.ring_view(1))] if pool == "ring" else []
         dtyped = [(f, _t(t.shape, "kv", t.stride(), str(t.dtype))) for f, t in states]
         leaf = _leaf("v41.states", *args[:1], *dtyped)
+        if pool == "ring":  # two rows' blocks hold 32 rows at ratio 2
+            runner.config.kv_cache_block_size = BLOCK
+            stated = ("window_size", 8), ("compress_ratio", 2), ("index_topk", 1)
+            leaf = dataclasses.replace(leaf, stated=stated)
         # two rows' slots, every layer of each
         read = sum(2 * t.select(int(whole), 0).nbytes for _, t in states)
         llc = 3 * (32 + read)  # 7 copies of 32 bytes of activation and the states
@@ -278,6 +305,10 @@ def main(root: pathlib.Path) -> None:
     seen["ops_v41_page"] = ops_placements(
         plain, replay.seat_states, v41=True, whole=True, page=True
     )
+    for pool, slots in (("whole", 8), ("ring", 8), ("ring", 4), ("ring", 16)):
+        seen[f"ops_v41_{pool}_pool_{slots}"] = ops_placements(
+            plain, replay.seat_states, v41=True, pool=pool, slots=slots
+        )
 
     from atom.compass.bench.runner import BenchModelRunner
     from atom.compass.parity.runner import RecordingModelRunner

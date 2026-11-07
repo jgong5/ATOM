@@ -720,7 +720,7 @@ class Stub:
         self.slots = runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
         self.per_row = state_slots_per_request(runner.config)
         self.built, self.leaves, self.placed = {}, {}, []
-        self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, set()
+        self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, {}
         # `once`: by leaf, the bytes of a buffer every copy launches
         self.written, self.unplanned, self.once = {}, {}, {}
         self.modules = dict(runner.model.named_modules())
@@ -1055,15 +1055,26 @@ class Stub:
                 # ponytail: its widest-strided dim taken as blocks or state slots,
                 # or plane rows when the leaf states its layer's attention geometry;
                 # beside state slots a block view is one block a request, the
-                # one a decode compressor writes its row to
+                # one a decode compressor writes its row to, and a row view
+                # holding a state arena past its pages (`_state`) one row a
+                # request, the one its decode writes to its window ring there
                 unit = rows if self.slots else blocks
-                slotted = int(self.kv.get((sig, slot), ("",))[0] in self.state)
+                name = self.kv.get((sig, slot), ("",))[0]
+                slotted = int(name in self.state)
                 stated = op.get("stated", {})
                 if "window_size" in stated and (ratio := stated["compress_ratio"]):
                     # the rows the batch's blocks hold at its layer: a row
-                    # per `ratio` tokens; its window rows are left out
+                    # per `ratio` tokens; its window rows are left out. Read
+                    # by block, but by slot in a window ring: ATOM passes such
+                    # a row view whole or a ring cut from it (`ring_view`), so
+                    # one smaller than the widest the leaf takes of it
                     unit = blocks * self.runner.config.kv_cache_block_size // ratio
-                    slotted = 0
+                    widest = max(
+                        _span(v["shape"], v["stride"]) * itemsize
+                        for p, v in _specs(op["args"])
+                        if self.kv.get((sig, p), ("",))[0] == name
+                    )
+                    slotted = int(bool(self.state.get(name)) and nbytes < widest)
                     # of which a request reads at most its indexer's top-k
                     if top := stated.get("index_topk"):
                         unit = min(unit, rows * top)
@@ -1747,13 +1758,15 @@ def _bound(name, value, old, device) -> dict[str, torch.Tensor]:
     return out
 
 
-def _state(runner, held) -> set[str]:
+def _state(runner, held) -> dict[str, bool]:
     """The names of the `held` tensors that hold per-request state, each also
     as `_kv` names its last layer: the fields of an arena of a request's state
     an entry that the runner holds (DeepSeek-V4's compressor state), and each
     tensor inside the state arena of a metadata builder's cache (`BUILDERS`,
-    DeepSeek-V4.1's `cache.state`: its fields, a layer of one, the cursor). A
-    KV registry entry of it caps a point's placements at its slots instead."""
+    DeepSeek-V4.1's `cache.state`: its fields, a layer of one, the cursor),
+    each to False; and each that holds such an arena past its pages as one
+    view (V4.1's `cache.pool`, whose window rings lie in it) to True.
+    A KV registry entry of it caps a point's placements at its slots instead."""
     from atom.model_ops.attentions.pool_layout.entry_arena import SplitEntryMajorArena
 
     state = []
@@ -1763,13 +1776,14 @@ def _state(runner, held) -> set[str]:
     at = {(t.data_ptr(), t.shape, t.stride()) for t in state}
     caches = [getattr(getattr(runner, b, None), "cache", None) for b in BUILDERS]
     bufs = [s.buf for c in caches if hasattr(s := getattr(c, "state", None), "buf")]
-    return {
-        n
+    named = {
+        n: False
         for name, t in held.items()
         if (t.data_ptr(), t.shape, t.stride()) in at
         or any(_inside(t, buf) for buf in bufs)
         for n in (name, f"{name}.{len(t) - 1}" if t.dim() else name)
     }
+    return {n: True for n, t in held.items() for b in bufs if _inside(b, t)} | named
 
 
 def _inside(t, buf) -> bool:

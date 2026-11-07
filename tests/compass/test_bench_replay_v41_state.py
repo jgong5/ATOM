@@ -237,3 +237,26 @@ def test_a_v41_page_field_taken_whole_binds_it_and_counts_once_a_placement(probe
     assert placed["refused"] is None and record["placements"] == 7
     assert record["metadata"] == {"main_1": "attn_metadata_builder.cache.pages.main_1"}
     assert record["footprint_bytes"] == 7 * 32 + 7 * placed["read"]
+
+
+@pytest.mark.parametrize(
+    "pool, slots", [("whole", 8), ("ring", 8), ("ring", 4), ("ring", 16)]
+)
+def test_a_v41_window_ring_reached_through_its_pool_counts_once_a_slot(
+    probed, pool, slots
+):
+    """V4.1's pool, `[rows, dim]` over its PAGEs and its state arena, as a
+    capture's 4 PAGEs held it. Taken whole, a row a request is the window ring
+    row its decode writes, in the arena: it counts once a slot pair of the 4
+    that 8 slots hold. Beside a ring cut from it (`ring_view`), at a leaf
+    stating its window and compress ratio, the whole pool's plane rows count
+    once a placement and the ring's once a slot pair, whether the capture held
+    the bench's 8 state slots or 4 or 16."""
+    _, seen = probed
+    placed = seen[f"ops_v41_{pool}_pool_{slots}"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert record["metadata"]["pool"] == "attn_metadata_builder.cache.pool"
+    pages = 0 if pool == "whole" else placed["read"] // 2
+    ring = placed["read"] - pages
+    assert record["footprint_bytes"] == 7 * 32 + 7 * pages + 4 * ring
