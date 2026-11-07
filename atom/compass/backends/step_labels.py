@@ -16,8 +16,9 @@ states `enable_tbo`, the caller's `split_rule`, ATOM's two-batch-overlap split
 over those lines, rebuilds `tbo_tokens`; with no rule such a line refuses.
 No line states its group's dummy forwards: a view's `group_dummies` counts the
 run's rank records whose line at its step is a dummy run (`group_dummies`).
-A view also takes its line's `target_bs`, `draft_bs` and `draft_moe_rows`, the
-widths and rows its target and drafter ran at, which an op graph reads.
+A view also takes its line's `target_bs`, `draft_bs`, `draft_moe_rows` and
+`draft_rows`, the widths and rows its target and drafter ran at, which an op
+graph reads.
 
 A step's device label is its device busy time, `d_busy_ns`, plus for a decode
 step the device work queued since the previous forward's exit, `d_gap_ns`. A
@@ -439,6 +440,7 @@ def _label(
             moe_rows=s.get("moe_rows"),
             draft_moe_rows=s.get("draft_moe_rows"),
             draft_bs=s.get("draft_bs"),
+            draft_rows=s.get("draft_rows"),
             target_bs=s.get("target_bs"),
             produces_output=s["produces_output"],
             tbo_tokens=None if split is None else tuple(map(tuple, split)),
