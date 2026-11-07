@@ -18,8 +18,8 @@ quantity is a positive real, a derate is a fraction in (0, 1], and a bandwidth
 curve is `[bytes, bytes per second]` points, both rising with the bytes.
 
 Every field is required except the provenance fields `merge` fills in,
-`fp4_flops` and its derate, the bandwidth curve, the kernel floor, the pipeline
-send terms, a link's `link_setup_s` (zero when absent), the `host_link` pair
+`fp4_flops` and its derate, the bandwidth curve, the kernel and profiler
+floors, the pipeline send terms, a link's `link_setup_s` (zero when absent), the `host_link` pair
 and `device.ptl`, the cards' PTL state (`disabled` when absent). An engine
 start's memory readings are no field here: `compass measure memory` publishes
 them per configuration, as a `memory_readings` entry.
@@ -148,6 +148,8 @@ FIELDS = (
     Field("device.compute.fp4_flops", Kind.QUANTITY, peak=True, required=False),
     # An empty kernel replayed in a graph: the device's floor on one kernel.
     Field("device.kernel_floor_s", Kind.QUANTITY, required=False),
+    # What ATOM's kineto profiler records for a queued kernel shorter than it.
+    Field("device.profiler_floor_s", Kind.QUANTITY, required=False),
     Field("device.software_pinned_to.rocm", Kind.TEXT),
     Field("device.software_pinned_to.aiter", Kind.TEXT),
     Field("device.software_pinned_to.rccl", Kind.TEXT),

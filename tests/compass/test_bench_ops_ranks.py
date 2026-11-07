@@ -176,7 +176,8 @@ def _measuring_rank(config, todo, refuse, rank):
     def kernels(fn, kwargs):
         ops._together()
         profiles.append(1)
-        return ([] if (me, refuse, len(profiles)) == (1, "profile", 1) else ["k"]), 1.0
+        names = [] if (me, refuse, len(profiles)) == (1, "profile", 1) else ["k"]
+        return names, [None] * len(names), 1.0
 
     ops._kernels = kernels
     ops._together = dist.barrier
@@ -664,7 +665,7 @@ def _dpa_main(argv, bench, tmp_path, monkeypatch, config):  # noqa: F811
     graph = _graph(_gather(2), _leaf(NEG, x), layers=1)
     monkeypatch.setattr(ops, "graph", lambda *a: graph)
     monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
-    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], [None], 1.0))
     monkeypatch.setattr(ops, "_replay", lambda fn, calls, *_: [1.0] * ops.REPEATS)
     argv += ["--width", "2", "--context", "20", "--llc-mib", "1", "--gpu", "0"]
     argv += ["--store", root, "--out", str(tmp_path / "out")]

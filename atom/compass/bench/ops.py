@@ -113,8 +113,10 @@ one each time after a read of `COLD` times the last-level cache outside the
 timing, the host idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
-aside, are the point's kernel identity. When `ReplayRule` refuses a batch, its
-leaves refuse; an error in ATOM's preparation fails the run, naming the point.
+aside, are the point's kernel identity, and the point records each one's grid
+(`grids`), by which `step_labels` finds a traced kernel's own length. When
+`ReplayRule` refuses a batch, its leaves refuse; an error in ATOM's
+preparation fails the run, naming the point.
 The points run in a process of their own on each GPU, which dies when its
 device faulted (`_alive`); one that dies ends every rank, keeps the points
 every rank finished, the point it was measuring refuses, and new ones measure
@@ -1187,7 +1189,7 @@ class Stub:
             forward_context._forward_context = calls[0][1]
             with refused_together():
                 fn(**calls[0][0])  # compiles and tunes outside the graphs
-            kernels, ns = _identity(fn, calls[0][0])
+            kernels, grids, ns = _identity(fn, calls[0][0])
             k = min(CALLS, max(int(GRAPH_NS // ns), 1)) if ns else CALLS
             # a collective's call holds its wait on the last rank to arrive,
             # whose own call is the shortest: every graph takes its calls
@@ -1214,6 +1216,7 @@ class Stub:
             scratch["workspace_bytes"] = calls[0][0]["workspace"].nbytes
         return scratch | {
             "kernels": kernels,
+            "grids": grids,
             "cold_ns": medians[0],
             "warm_ns": medians[1],
             "warm_over_cold": medians[1] / medians[0] if warm and medians[0] else None,
@@ -1862,7 +1865,7 @@ def _on_coordinator(name: str, fn):
     return call
 
 
-def _identity(fn, kwargs) -> tuple[list[str], float]:
+def _identity(fn, kwargs) -> tuple[list[str], list, float]:
     """`_kernels` of one call of `fn` once two profiles in a row name the same
     kernels on every rank, at most `PROFILES`; refused on every rank together
     when no two do."""
@@ -1870,9 +1873,9 @@ def _identity(fn, kwargs) -> tuple[list[str], float]:
 
     last = None
     for _ in range(PROFILES):
-        names, ns = _kernels(fn, kwargs)
+        names, grids, ns = _kernels(fn, kwargs)
         if agreed(int(names == last), cpu_group()):
-            return names, ns
+            return names, grids, ns
         last = names
     raise ValueError(
         f"no two profiles in a row of {PROFILES} named the same kernels; "
@@ -1880,12 +1883,14 @@ def _identity(fn, kwargs) -> tuple[list[str], float]:
     )
 
 
-def _kernels(fn, kwargs) -> tuple[list[str], float]:
-    """The kernels one call of `fn` launches, in order, and their device time
-    in ns: its device activity except memory copies, which the profiler
-    records at some calls of a leaf and misses at others; started on every
-    rank together (`_together`), once the device has finished `_together`'s
-    all-reduce, which would otherwise join the call's kernels."""
+def _kernels(fn, kwargs) -> tuple[list[str], list, float]:
+    """The kernels one call of `fn` launches, in order, each one's grid, and
+    their device time in ns: its device activity except memory copies, which
+    the profiler records at some calls of a leaf and misses at others; started
+    on every rank together (`_together`), once the device has finished
+    `_together`'s all-reduce, which would otherwise join the call's kernels.
+    Kineto states a launch's grid in the profile's chrome trace alone, so all
+    three are read from it; a memory set has no grid."""
     from torch.profiler import ProfilerActivity, profile
 
     _together()
@@ -1893,15 +1898,14 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         fn(**kwargs)
         torch.cuda.synchronize()
-    device = [
-        e
-        for e in prof.events()
-        if e.device_type == torch.autograd.DeviceType.CUDA
-        and not e.name.startswith("Memcpy")
-    ]
-    device.sort(key=lambda e: e.time_range.start)
-    ns = 1e3 * sum(e.time_range.elapsed_us() for e in device)
-    return [e.name for e in device], ns
+    with tempfile.TemporaryDirectory() as tmp:
+        prof.export_chrome_trace(f"{tmp}/trace.json")
+        events = json.loads(Path(tmp, "trace.json").read_text())["traceEvents"]
+    device = [e for e in events if e.get("cat") in ("kernel", "gpu_memset")]
+    device.sort(key=lambda e: e["ts"])
+    ns = 1e3 * sum(e["dur"] for e in device)
+    grids = [e["args"].get("grid") for e in device]
+    return [e["name"] for e in device], grids, ns
 
 
 def _replay(fn, calls, flush=None) -> list[float]:
