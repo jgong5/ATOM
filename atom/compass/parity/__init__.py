@@ -66,6 +66,7 @@ may then report a step where the twins' rows differ.
 """
 
 import collections
+import contextlib
 import copy
 import functools
 import hashlib
@@ -112,6 +113,11 @@ TIMESTAMPS = (
     "t_pull_ns",
     "t_put_ns",
 )
+#: Profiler ranges a trace run (`busy`) splits a forward's kernels at, on every
+#: TP rank: the target ends where `TARGET_DONE` opens, and each drafter pass is
+#: the range named `MARK` and its line field.
+MARK = "compass::"
+TARGET_DONE = MARK + "target_done"
 
 
 class StepRecord:
@@ -522,17 +528,21 @@ class StepRecording:
         recorded `forward_done_event`: the target's end, sampling included."""
         if getattr(self, "_parity_record", None) is not None:
             self._stamps["target_event"] = self.device_event()
-        return call(*args)
+        with _traced(TARGET_DONE):
+            return call(*args)
 
     def _draft_pass(self, key, call, *args, **kwargs):
         """`call`, a drafter pass, between two device events kept under `key`,
         the line field that times it. The first pass's start also ends the
-        target of a forward that samples nothing."""
+        target of a forward that samples nothing. Under ATOM's profiler every TP
+        rank opens the pass's range, recording or not."""
         if getattr(self, "_parity_record", None) is None:
-            return call(*args, **kwargs)
+            with _traced(MARK + key):
+                return call(*args, **kwargs)
         start = self.device_event()
         self._stamps.setdefault("draft_event", start)
-        reply = call(*args, **kwargs)
+        with _traced(MARK + key):
+            reply = call(*args, **kwargs)
         self._stamps[key] = [start, self.device_event()]
         return reply
 
@@ -582,6 +592,16 @@ class StepRecording:
         if getattr(self, "_parity_record", None) is not None:
             self._parity_record.write()
         return super().exit()
+
+
+def _traced(name: str):
+    """A profiler range named `name` while ATOM's profiler runs, else none, so
+    an untraced forward's host time pays for no range."""
+    import torch
+
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(name)
+    return contextlib.nullcontext()
 
 
 def _window(previous, launch, done, marks, wait: bool):

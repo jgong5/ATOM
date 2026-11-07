@@ -147,7 +147,7 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
 | step kind | label | cut |
 |---|---|---|
 | decode | device gap + busy window | launch-exposed |
-| output prefill, middle chunk | busy window | host-paced |
+| output prefill, middle chunk | a trace run's busy time, per pass | no trace run |
 
 - **Decode.** The gap is device work between forwards that no other term carries; leaving
   it out charged decode about 0.29% short on #824's c=1 record (#841). A forward whose
@@ -158,19 +158,43 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   No launch-exposed cut: under an eager launch the device starts the first kernel while the host still
   launches the rest, so device start precedes launch end on every eager forward, and the
   cut would leave prefill unpriced.
-- **Host-paced prefill.** A prefill forward whose exit event ran less than 8% of its label
-  after the host recorded it is cut as host-paced and counted apart: the device had caught
-  up with the host's launch, so its window holds device idle between launches and only
-  bounds its device time. A device event runs no earlier than the host records it, so the
-  largest launch record less its device start, over the record, places device times on the
-  host clock. On the DSpark TP2 records the share falls in two clusters, host-paced output
-  prefills at 0 to 4.3% and device-paced forwards from 11%; a traced run's kernel busy time
-  confirms the split ([#1983](https://github.com/jgong5/ATOM/issues/1983)). The 8% share is
-  interim: [#2072](https://github.com/jgong5/ATOM/issues/2072) labels every prefill pass
-  with traced busy time instead.
-- **Accepted approximation.** A host bubble inside a device-paced prefill forward stays in its device
-  time. Same-host parity absorbs it through `01` D4's `end = max(target_end,
-  launch_end)`; skipping a host segment or pricing another host does not.
+- **Traced prefill.** Owner ruling on
+  [#2072](https://github.com/jgong5/ATOM/issues/2072#issuecomment-6380112358), 2026-10-24,
+  replacing [#1983](https://github.com/jgong5/ATOM/issues/1983)'s interim cut of
+  host-paced prefills: a window holds the device's idle between launches the host paced,
+  so every prefill pass, target and draft, is labelled with busy time from a **trace run**,
+  a second run of the record's recipe and client under ATOM's kineto profiler on every TP
+  rank, without Python stacks (`07` D38, Phase 1c). Per forward and pass, split at
+  `forward_done_event`, busy time is the union of the pass's kernels plus each gap before
+  one of them: whole where that kernel was already queued when the gap opened, else capped
+  at the trace's median such queued gap. Copies on ATOM's copy stream, the stream that runs
+  no kernel, are left out: the host waits for them and no kernel does, and `01` keeps the
+  copy stream off the timeline
+  ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6707000151)). A TP
+  collective, the target's or the drafter's, counts from its last rank's start, and each
+  pass's busy time is its largest over the ranks. Every rank is profiled throughout and
+  none pauses
+  ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6702728444)): on
+  crsuse2-m2m-v3-005 a pause ran `hipDeviceSynchronize` on its rank, and the peer waited
+  about 107 ms at the drafter's step-begin fence. With both ranks profiled the draft-KV
+  concatenation runs about 6% long; drafter labels keep that, and
+  [#2945](https://github.com/jgong5/ATOM/issues/2945) finds its cause. A traced kernel
+  shorter than about 4.7 us runs to that floor, so drafter labels stay 5 to 11% over
+  unprofiled time until [#2415](https://github.com/jgong5/ATOM/issues/2415) subtracts each
+  kernel's floor ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6460474362)).
+  No cut, threshold or interval. The
+  prefill device law fits from trace runs only, and a fit given none names its prefill
+  vector unfitted; a trace run's decodes and host segments are profiled, so it gives no
+  decode or host label, and an ordinary record fits the decode and host laws. A trace run
+  under DP refuses. Checked-in laws keep their labels until refitted, and a refit needs a
+  trace run. On Run 4B's TP0 trace the busy time of device-paced forwards sat within 0.6%
+  of the window per target pass and the final's draft at +2.3%, where copy-stream copies
+  ran past the window's last event; the capped gaps added none of a host-paced final's
+  busy time ([#2072](https://github.com/jgong5/ATOM/issues/2072#issuecomment-6387348851)).
+- **Profiler check.** On each trace run, a law fitted on ordinary records prices the busy
+  time of the forwards no kernel of which waited on its launch, per kind and pass, so a
+  pass the profiler slows reads apart. On Run 4B, traced with Python stacks, the final's
+  draft read 9% over such a law, its target within 1%.
 
 The R1 wait's exit, a host time at which a known device event has completed, anchors the
 host and device clocks to each other. With MTP the label splits at
@@ -184,18 +208,18 @@ prices a middle chunk's pass as draft, prices it among the target's terms, as th
 draft law's `output_prefill_kv` states; the output prefill's draft label, all after
 the event, fits the `propose` vector ([#2100](https://github.com/jgong5/ATOM/issues/2100)).
 The pass replays one draft graph at any prefill length, yet on the DeepSeek-V4.1-Flash
-DSpark TP4 records it ran about three times as long when the device reached it a few
-milliseconds behind the host's return from the R1 wait, where the host queues it, as
+DSpark TP4 records its window ran about three times as long when the device reached it a
+few milliseconds behind the host's return from the R1 wait, where the host queues it, as
 when the device ran further behind, after a long prefill or a middle chunk
-([#2492](https://github.com/jgong5/ATOM/issues/2492)). So the fit splits `propose` at
-the power-of-two lag that prices the labels best, `near_propose` below it, when that
-cuts their mean log error by a tenth, over at least `PROPOSE_SPLIT_STEPS` labels and
-`PROPOSE_SIDE_STEPS` a side (`step_linear_fit`); a run reads the lag off its host recurrence
-([#2572](https://github.com/jgong5/ATOM/issues/2572)). Below that lag, an output prefill
-of 6144 tokens or more still ran the pass at its far time, in the records of both DSpark
-TP4 cells, with expert parallelism and without; so once the lag split is adopted, the fit
-also bounds `near_propose` at the token count, a power of two or one and a half times one,
-that cuts its error by another tenth ([#2615](https://github.com/jgong5/ATOM/issues/2615)).
+([#2492](https://github.com/jgong5/ATOM/issues/2492)). That extra window is host time
+([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6684001197), 2026-11-06):
+a trace run's busy time leaves it out, and its host ran under the profiler, so a trace
+run states no lag and the propose labels fit one `propose` vector; one unsplit law priced
+trace runs A and B's host-paced propose busy within 2.4%. The fit's split of `propose` at
+a lag ([#2572](https://github.com/jgong5/ATOM/issues/2572)), bounded at a token count
+([#2615](https://github.com/jgong5/ATOM/issues/2615)), is gone. A law fitted before may
+still hold `near_propose`, with its `lag` and `below`, which a run prices off its host
+recurrence's lag until [#2917](https://github.com/jgong5/ATOM/issues/2917) deletes it.
 
 **Host laws** price the host segments of `01` D4: `E`, `W_pre`, `W_launch` and
 `W_post`, each linear in `(1, tokens, seqs)`, fitted separately for decode, output
@@ -239,8 +263,8 @@ entry fitted before `admit` existed, whose `E` laws hold the admissions, charges
 none apart.
 They use the step linear law's solver: D53's relative error and MAD drops, D57's report, D58's hull. An
 `E` sample whose gap spans an idle engine is cut as idle and counted apart.
-An output prefill or middle chunk the host did not pace whose launch ends after its device
-ran a fifth of its label, placed on the host clock by the lead, waited on the device inside
+An output prefill or middle chunk the host did not pace (`step_labels.PACED_SHARE`) whose
+launch ends after its device ran a fifth of its window, placed on the host clock by the lead, waited on the device inside
 the launch: it gives no `W_launch` sample, since the recurrence's `end = max(start + D, launch_end)`
 charges that wait as `D`. On the DeepSeek-V4-Pro DPA8 MI355X records, pooling such launches
 priced a c=1 middle chunk's launch at 1.83 s against 0.13 s measured
@@ -699,7 +723,7 @@ choice that must be visible.
 | # | Decision | Date |
 |---|---|---|
 | D53 | Fit relative error, not absolute seconds. MAD outlier test on the same relative residuals. | 2026-09-18 |
-| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under TP, DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by alternating max-affine regression. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes and host-paced prefills cut; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), and `admit`, `(admits, uncached, cached)` over every kind, on what a forward's `E` spends admitting requests, which its kind's `E` is fitted without, are fitted beside it, keyed by host CPU, `atom` digest, model, engine config and machine-spec digest, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); machine-spec digest in the host-law key 2026-10-16 (#952); host-paced prefill cut 2026-10-24 (#1983); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080); output prefill draft-KV pass 2026-10-25 (#2100); a prefill launch the device held gives no `W_launch` 2026-10-26 (#2256); TP above 1 2026-10-30 (#2490); a short output prefill's propose pass split off 2026-10-31 (#2492), at the device's lag 2026-11-01 (#2572); a forward's admissions priced apart, `admit` 2026-11-02 (#2620), its intercept once a forward 2026-11-03 (#2705) |
+| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under TP, DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by alternating max-affine regression. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes cut, and on prefill a trace run's busy time per pass; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), and `admit`, `(admits, uncached, cached)` over every kind, on what a forward's `E` spends admitting requests, which its kind's `E` is fitted without, are fitted beside it, keyed by host CPU, `atom` digest, model, engine config and machine-spec digest, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); machine-spec digest in the host-law key 2026-10-16 (#952); host-paced prefill cut 2026-10-24 (#1983); traced prefill 2026-10-24 (#2072); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080); output prefill draft-KV pass 2026-10-25 (#2100); a prefill launch the device held gives no `W_launch` 2026-10-26 (#2256); TP above 1 2026-10-30 (#2490); a short output prefill's propose pass split off 2026-10-31 (#2492), at the device's lag 2026-11-01 (#2572); a forward's admissions priced apart, `admit` 2026-11-02 (#2620), its intercept once a forward 2026-11-03 (#2705); the propose pass unsplit on trace runs 2026-11-06 (#2072) |
 | D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61), and, given the model's routing, one MoE column, the step's real MoE tokens `n` or the experts `X` they reach, the step's DP dummy forwards counted in `X` as one token: the form of smallest step-weighted held-out error, no column among them, adopted with no bar. | 2026-09-18; revised 2026-10-14 (#941), 2026-11-01 (MoE column, #2493) and 2026-11-03 (no bar, #2735; dummies in `X`, #2536) |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |
