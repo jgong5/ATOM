@@ -1005,7 +1005,9 @@ stack's JIT cache library from `S` and writes it back. A simulated run is
 from these flags and both sides' arguments. `P` and `D` are
 `laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json` and `-decode.json`,
 and `S` holds each side's `compass measure memory` readings, taken at the run's
-own commit.
+own commit on the node that side runs on: decode readings taken on 005 sized the
+simulated decode 79 to 80 KV blocks per rank above every real decode on 013
+([ruling](https://github.com/jgong5/ATOM/issues/1111#issuecomment-6659985920)).
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
