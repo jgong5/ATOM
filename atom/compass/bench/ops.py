@@ -126,8 +126,11 @@ parallel layout, the digest of the machine spec of the device, stack and PTL
 state run.json reads, the source root and the point.
 
 `--plan` measures, in rounds, the points the steps of record directories call
-for (`record`'s or `trace steps`' output), capturing each `op_graph` S
-lacks on the run's first GPU as it reads (`_capture`):
+for (`record`'s or `trace steps`' output), under `--enable-tbo` a step its DP
+group split as its two micro-batches, as `trace ops --population` traces it
+(`population_steps`), capturing each `op_graph` S lacks on the run's first GPU
+as it reads (`_capture`), or, before any point, refusing one only that call
+traces:
 every leaf at every rung of ATOM's decode ladder at the steps' lowest and
 highest row context (`_rows`); then each leaf of a kind those show depends on
 context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
@@ -135,6 +138,7 @@ and, when some step's rows are ragged, at a rung of more than one row on
 ragged rows too (`_means`): the first at the context, the rest sharing a mean,
 each `GRID`th of it from the least the rows hold; and each prefill family
 (`_family`) over a ladder of their token counts, chunk remainders among them,
+its shapes that state the rows a DP group gathers apart, as `fit ops` prices them,
 one of a kind that depends on context at each at the most cached tokens of
 steps of its rows, and over a ladder of them once those points and the fresh
 ones show the kind still does; then the point halfway between two neighbours
@@ -150,10 +154,11 @@ between its own least and most, at each of its cached-token counts
 resumed into DIR numbering on from the last round there, and after each round
 every point held, a measured one with its store token, in plan.jsonl.
 
-`--coverage` counts the steps of record directories that DIR's plan.jsonl
-covers (`coverage`), with the `op_graph`s of the arch DIR's run.json records,
-a step only when `fit ops`' price list of those points prices each leaf, and
-prints the count by phase and why each leaf kind left the rest out.
+`--coverage` counts the steps of record directories, read as `--plan` reads
+them, that DIR's plan.jsonl covers (`coverage`), with the `op_graph`s of the
+arch DIR's run.json records, a step only when `fit ops`' price list of those
+points prices each leaf, and prints the count by phase and why each leaf kind
+left the rest out.
 """
 
 import argparse
@@ -172,6 +177,7 @@ import json
 import multiprocessing
 import os
 import re
+import shlex
 import statistics
 import sys
 import tempfile
@@ -2343,7 +2349,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     from atom.compass.capture.forward import decode
     from atom.compass.runner.overrides import schedulable_ladder
 
-    steps = list(population_steps(args.plan))
+    steps = list(population_steps(args.plan, config.enable_tbo))
     contexts = [
         c for s, line in steps if s.phase == "decode" for c in _rows(line, s.seqs)
     ]
@@ -2354,6 +2360,13 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     )
     rungs = [decode(r) for r in schedulable_ladder(config)]
     graphs, done, tried = {}, {}, set()
+    prefills, cached = set(), defaultdict(list)
+    for s, line in steps:
+        if s.phase == "prefill":
+            prefills.add(s)
+            cached[s.seqs] += _cached(line)
+    # first, so a graph only `trace ops --population` traces refuses before any point
+    _load(store, config, args.store, prefills, graphs, None, atom_args, args.plan)
     # a run resumed into `out` keeps the rounds an earlier one wrote there
     rounds = [int(d.name[5:]) for d in out.glob("round*") if d.name[5:].isdigit()]
     first = max(rounds, default=-1) + 1
@@ -2405,17 +2418,12 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     for at in [c, *((c, m) for m in means)]:
                         fam = _family(shape, at, op["op"], sig, dependent)[0]
                         want[shape, at].add(fam)
-    prefills, cached = set(), defaultdict(list)
-    for s, line in steps:
-        if s.phase == "prefill":
-            prefills.add(s)
-            cached[s.seqs] += _cached(line)
-    _load(store, config, args.store, prefills, graphs, None, atom_args)
     seen = defaultdict(dict)
-    for shape in sorted(prefills):
+    for shape in sorted(prefills, key=str):  # G and W are None or a count
         for sig, (op, _) in graphs[shape].items():
             fam, tokens = _family(shape, None, op["op"], sig, dependent)
-            seen[fam].setdefault(tokens, (shape, op["op"], sig))
+            # `fit ops` keeps a shape that states G apart from one that does not
+            seen[fam, not shape.gathered].setdefault(tokens, (shape, op["op"], sig))
 
     def cached_ladder(top_only: bool) -> dict:
         """The points of each prefill family over its rows' cached tokens, of
@@ -2435,7 +2443,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                         want[shape, c].add(fam)
         return want
 
-    for fam, at in seen.items():
+    for (fam, _), at in seen.items():
         for tokens in _ladder(at):
             want[at[tokens][0], None].add(fam)
     for point, fams in cached_ladder(top_only=True).items():
@@ -2493,7 +2501,8 @@ def _eager(config) -> None:
 
 def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     """How the measured points among `records` cover the steps of the record
-    directories `names`: the steps and those covered by phase, and per leaf
+    directories `names`, each micro-batch of a step its DP group split under
+    two-batch overlap a step: the steps and those covered by phase, and per leaf
     kind the steps it left out by why. A step is covered when each leaf of its
     `op_graph` lies on a point or between two of one kernel (`_bracket`): a
     decode leaf of a kind that depends on context over its rows' lowest to
@@ -2507,7 +2516,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     from atom.compass.capture import population_steps
     from atom.compass.fit.ops import PriceList, fit, held_out
 
-    steps = list(population_steps(names))
+    steps = list(population_steps(names, config.enable_tbo))
     dependent = _dependent(records)
     held_out(params := fit([r for r in records if "refused" not in r]))
     listed = PriceList(params)
@@ -2517,7 +2526,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
         if cut := _cut(fam):
             cuts[cut[0]][cut[1]] = axes[fam]
     graphs, report, out = {}, defaultdict(Counter), defaultdict(Counter)
-    _load(store, config, root, {s for s, _ in steps}, graphs, arch, atom_args)
+    _load(store, config, root, {s for s, _ in steps}, graphs, arch, atom_args, names)
     families = {
         s: [
             (op["op"], *_family(s, None, op["op"], sig, dependent), op)
@@ -2900,30 +2909,37 @@ def _apart(p, q) -> bool:
     return hi - lo > BENDS * lo
 
 
-def _load(store, config, root, shapes, graphs: dict, arch=None, atom_args=()) -> None:
+def _load(
+    store, config, root, shapes, graphs: dict, arch=None, atom_args=(), records=()
+) -> None:
     """Each of `shapes`' leaves into `graphs`, its op_graph captured first when
-    the store has none."""
+    the store has none (`_capture`, naming the record directories `records`
+    the shapes are of)."""
     from atom.compass.artifacts import ArtifactRefusal
 
     missing = []
-    for shape in sorted(shapes - graphs.keys()):
+    for shape in sorted(shapes - graphs.keys(), key=str):  # G and W: None or a count
         try:
             graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
         except ArtifactRefusal:
             missing.append(shape)
     if missing:
-        _capture(config, missing, root, arch, atom_args)
+        _capture(config, missing, root, arch, atom_args, records)
     for shape in missing:
         graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
 
 
-def _capture(config, shapes, root, arch=None, atom_args=()) -> None:
+def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
     """`trace ops` of `shapes` under ATOM's arguments `atom_args` into the store
     at `root`, in a process of its own that sees no GPU, on a declared `arch`,
     or with none on this run's first GPU as it reads (`trace ops --gpu`): its
-    stepping and compute units pick kernels as they do on the card."""
+    stepping and compute units pick kernels as they do on the card. A shape
+    its `--prefill` and `--width` cannot name, a DP group's gathered rows or a
+    padded width, refuses before any is traced, naming the `trace ops
+    --population` of the record directories `records` that traces it."""
     from atom.compass import capture
-    from atom.compass.capture.forward import device_arch
+    from atom.compass.artifacts import ArtifactRefusal, Rule
+    from atom.compass.capture.forward import decode, device_arch, prefill
     from atom.model_engine.arg_utils import EngineArgs
 
     engine = EngineArgs.add_cli_args(FlexibleArgumentParser()).parse_args(atom_args)
@@ -2931,6 +2947,16 @@ def _capture(config, shapes, root, arch=None, atom_args=()) -> None:
     argv += ["--arch", arch or device_arch()]
     if not arch:  # the card read by its HIP ordinal, which ROCm indexes alike
         argv += ["--gpu", os.environ.get("HIP_VISIBLE_DEVICES", "0").split(",")[0]]
+    for s in shapes:
+        if s != (prefill(s.tokens, s.seqs) if s.phase == "prefill" else decode(s.seqs)):
+            population = [a for r in records for a in ("--population", r)]
+            call = ["compass", "trace", "ops", *argv, *population, "--store", str(root)]
+            raise ArtifactRefusal(
+                Rule.RESOLUTION,
+                f"no op_graph holds {s}, a shape trace ops takes only from the "
+                "steps of a record",
+                f"trace it with {shlex.join([*call, '--', *atom_args])}",
+            )
     for s in shapes:
         argv += ["--prefill", str(s.tokens)] if s.phase == "prefill" else ["--width"]
         argv.append(str(s.seqs))
