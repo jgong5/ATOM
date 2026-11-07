@@ -181,8 +181,8 @@ inputs declared unless they carry an origin.
 only.** Every backend prices one forward's device busy time (`02` D11) and host time is
 composed per runner, so the host floor the prior work established, `t_step = max(Σ t_leaf,
 launches × h)`, leaves both granularities. The `max` it states survives in `01` D4's
-recurrence, `end = max(target_end + D_draft, launch_end)`, where `launch_end` plays the
-part of `launches × h`. The launch time comes from the measured `W_launch` host law (`09`
+recurrence, whose device `end` is no earlier than `launch_end`, which plays the part of
+`launches × h`. The launch time comes from the measured `W_launch` host law (`09`
 D54), not from `host.*`. The evidence below is why that `max` is kept. `t0` is the
 device's own floor on one kernel, not this host floor.
 
