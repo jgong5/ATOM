@@ -93,8 +93,8 @@ def test_a_simulated_runner_starts_each_draft_no_earlier_than_its_exit(
     got = []
     for batch in decodes:
         clock[0] += overrides._group_step_seconds(r, batch, backend)
-        got.append((clock[0] * 1e3, host.ends[-1] * 1e3, host.target_end * 1e3))
-    assert got == pytest.approx(list(zip(exits, ends, targets)))
+        got += [clock[0] * 1e3, host.ends[-1] * 1e3, host.target_end * 1e3]
+    assert got == pytest.approx([x for t in zip(exits, ends, targets) for x in t])
 
 
 def test_under_sync_a_draft_starts_no_earlier_than_its_launch_s_end():
