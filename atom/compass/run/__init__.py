@@ -1705,18 +1705,28 @@ def ep_width(tree) -> int:
     return moe[0].moe_parallel_config.ep_size if moe else 1
 
 
-def op_graph(run: dict, config, machine, ep: int = 1, lazy: dict | None = None):
+def op_graph(
+    run: dict,
+    config,
+    machine,
+    ep: int = 1,
+    lazy: dict | None = None,
+    env: dict | None = None,
+):
     """The `OpGraphBackend` the run file `run` names for `config` on
     `machine` at EP width `ep`, with its price list when it names one; with
     `lazy`, a shape no graph holds is traced from the run file's `ATOM_ARGS`
-    when it holds them (`_op_graphs`), counted in `lazy`."""
+    when it holds them (`_op_graphs`), counted in `lazy`; with `env`, its
+    graphs are read under that performance environment (`forward.structure`)."""
     from atom.compass.backends.op_graph import OpGraphBackend
 
     drafter = getattr(config, "speculative_config", None)
     lazily = (run[ATOM_ARGS], lazy) if lazy is not None and ATOM_ARGS in run else ()
     return OpGraphBackend(
         machine,
-        _op_graphs(run["store"], config, machine.value("device.arch"), *lazily),
+        _op_graphs(
+            run["store"], config, machine.value("device.arch"), *lazily, env=env
+        ),
         tp=config.tensor_parallel_size,
         ep=ep,
         dp=config.parallel_config.data_parallel_size,
@@ -1730,14 +1740,15 @@ def op_graph(run: dict, config, machine, ep: int = 1, lazy: dict | None = None):
     )
 
 
-def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
+def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
     that does not, or of its drafter's part (`draft`, a block drafter's
     draft-KV pass where it is `forward.KV`), or when it holds none
     `forward.missed`'s text, None for no text; under DP, at the rows the
     step's MoE gathers; a prefill's drafter at the `width` its later passes
-    pad to.
+    pad to; keyed under the performance environment `env` when given, else
+    this process's.
 
     With ATOM's arguments `atom_args`, a shape the store holds no graph at is
     first traced once, as `compass trace ops` traces a record's step from
@@ -1759,7 +1770,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None):
         phase, tokens, seqs, output=True, gathered=None, draft=False, width=None
     ) -> dict | str | None:
         shape = Shape(phase, tokens, seqs, gathered, width).at(dp, drafts)
-        at = structure(config, phase, True, arch, output, draft)
+        at = structure(config, phase, True, arch, output, draft, env)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
         missing = not store.directory_for(key).exists()
         if missing and atom_args is not None and shape not in traced:
