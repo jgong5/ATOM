@@ -12,10 +12,13 @@ under that pass's ``b_`` name. `step_labels` labels a prefill pass by them.
 The n-th ``ATOM::forward`` range on each rank is the record's n-th line, its
 ``tokens=`` the line's; the ranks and the record must agree on both. A
 forward's kernels, memcpys and memsets are those whose launch call opens
-between its ``ATOM::run_model`` start and its end. The target's are launched
-before the recorder's `TARGET_DONE` range opens, on a forward with none before
-its first drafter pass, and outside every drafter pass range; the rest are the
-draft's, and those launched inside a drafter pass's range that pass's too.
+between its ``ATOM::run_model`` start and its end, on a stream that runs
+kernels. A stream that runs none is ATOM's copy stream: the host waits for its
+copies to the host and no kernel does, so they are left out. The target's are
+launched before the recorder's `TARGET_DONE` range opens, on a forward with
+none before its first drafter pass, and outside every drafter pass range; the
+rest are the draft's, and those launched inside a drafter pass's range that
+pass's too.
 
 A pass's busy time is the union of its kernels' device intervals plus each gap
 before one of them on the forward's device timeline: whole where that kernel's
@@ -87,7 +90,7 @@ def forwards(path) -> list[dict]:
     """One rank's forwards: each its ``tokens`` and its ``kernels``, each
     (start, end, launch return, pass, its drafter pass's line field or None,
     name), in start order."""
-    ranges, runs, marks, launches, kernels = [], [], [], {}, []
+    ranges, runs, marks, launches, kernels, computes = [], [], [], {}, [], set()
     for e in events(path):
         cat, ts = e.get("cat"), e.get("ts")
         if cat == "user_annotation":
@@ -101,7 +104,12 @@ def forwards(path) -> list[dict]:
         elif cat in RUNTIME and "correlation" in e.get("args", {}):
             launches[e["args"]["correlation"]] = (ts, ts + e["dur"])
         elif cat in GPU:
-            kernels.append((ts, ts + e["dur"], e["args"]["correlation"], e["name"]))
+            stream = e["args"].get("stream")
+            kernels.append(
+                (ts, ts + e["dur"], e["args"]["correlation"], e["name"], stream)
+            )
+            if cat == "kernel":
+                computes.add(stream)
     ranges.sort()
     starts = [r[0] for r in ranges]
     out = []
@@ -118,7 +126,9 @@ def forwards(path) -> list[dict]:
                 "kernels": [],
             }
         )
-    for start, stop, corr, name in kernels:
+    for start, stop, corr, name, stream in kernels:
+        if stream not in computes:
+            continue
         launch, queued = launches.get(corr, (None, None))
         i = bisect_right(starts, launch) - 1 if launch is not None else -1
         if i < 0 or not out[i]["run"] <= launch <= ranges[i][1]:

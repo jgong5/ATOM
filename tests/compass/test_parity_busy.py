@@ -41,12 +41,15 @@ PROPOSE = MARK + "d_propose_ns"
 #: Where the recorder's ranges open, each planted on a rank where its real
 #: recorder opens it (`_opened`).
 MARKS = {MARK + "d_draft_kv_ns": (80, 90), TARGET_DONE: (100, 101), PROPOSE: (110, 200)}
+#: The stream every planted kernel runs on, and ATOM's copy stream, which runs
+#: only its copies to the host.
+STREAM, COPY_STREAM = 3, 10
 
 
-def _trace(path, kernels, tokens=100, marks=MARKS):
+def _trace(path, kernels, tokens=100, marks=MARKS, copies=()):
     """A kineto trace of one forward running `kernels`, (name, start, end,
-    launch), each launch call 1 us long, and opening `marks`. Written over many
-    lines."""
+    launch), on `STREAM`, and `copies`, (start, end, launch, stream), each
+    launch call 1 us long, and opening `marks`. Written over many lines."""
     events = [
         {
             "cat": "user_annotation",
@@ -60,12 +63,14 @@ def _trace(path, kernels, tokens=100, marks=MARKS):
     for name in marks:
         a, b = MARKS[name]
         events.append({"cat": "user_annotation", "name": name, "ts": a, "dur": b - a})
-    for corr, (name, start, end, launch) in enumerate(kernels):
+    gpu = [("kernel", "hipLaunchKernel", *k, STREAM) for k in kernels]
+    gpu += [("gpu_memcpy", "hipMemcpyAsync", "Memcpy DtoH", *c) for c in copies]
+    for corr, (cat, call, name, start, end, launch, stream) in enumerate(gpu):
         args = {"correlation": corr}
         events.append(
             {
                 "cat": "cuda_runtime",
-                "name": "hipLaunchKernel",
+                "name": call,
                 "ts": launch,
                 "dur": 1,
                 "args": args,
@@ -73,11 +78,11 @@ def _trace(path, kernels, tokens=100, marks=MARKS):
         )
         events.append(
             {
-                "cat": "kernel",
+                "cat": cat,
                 "name": name,
                 "ts": start,
                 "dur": end - start,
-                "args": args,
+                "args": dict(args, stream=stream),
             }
         )
     path.parent.mkdir(parents=True)
@@ -97,11 +102,13 @@ def _run(
     collective=KERNELS[2][0],
     slow=(),
     late_draft=False,
+    copies=(),
 ):
     """A trace run's directory: its record's one line and each rank's trace,
-    opening its `marks`, rank 1's K1 starting 5 us earlier, its collective,
-    named `collective`, at 50, under `late_draft` its D2 launched at 127 and
-    starting at 128, and each kernel named in `slow` running 7 us longer."""
+    opening its `marks` and running `copies`, rank 1's K1 starting 5 us
+    earlier, its collective, named `collective`, at 50, under `late_draft` its
+    D2 launched at 127 and starting at 128, and each kernel named in `slow`
+    running 7 us longer."""
     steps = tmp_path / "steps"
     steps.mkdir()
     line = {"step": 7, "rows": [[100, 100, False]], "d_target_ns": 1}
@@ -115,7 +122,7 @@ def _run(
         kernels = [(k, a, b + 7 * (r and k in slow), q) for k, a, b, q in kernels]
         kernels = [(collective if k == KERNELS[2][0] else k, *x) for k, *x in kernels]
         trace = tmp_path / "trace" / name / "m_ts_1.pt.trace.json.gz"
-        _trace(trace, kernels, tokens, marks[r])
+        _trace(trace, kernels, tokens, marks[r], copies)
     return tmp_path
 
 
@@ -174,6 +181,20 @@ def test_a_drafter_collective_counts_from_its_latest_rank_s_start(tmp_path):
         10000,
         4500,
     )
+
+
+@pytest.mark.parametrize("stream, propose", [(COPY_STREAM, 11000), (STREAM, 21000)])
+def test_a_copy_counts_on_the_kernels_stream_and_not_on_the_copy_stream(
+    tmp_path, stream, propose
+):
+    """The propose pass queues a copy at 127 that runs 131 to 140, past D2. On
+    the copy stream, which runs no kernel, it is left out; on the kernels'
+    stream it adds 9 and its queued gap of 1 to the propose pass and the
+    draft."""
+    got = json.loads(
+        busy.reduce(_run(tmp_path, copies=[(131, 140, 127, stream)])).read_text()
+    )
+    assert (got["b_draft_ns"], got["b_propose_ns"]) == (propose + 4000, propose)
 
 
 @pytest.mark.parametrize(
