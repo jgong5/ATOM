@@ -17,7 +17,7 @@ import time
 
 import pytest
 
-from atom.compass.clock import LpId, single_engine_table
+from atom.compass.clock import LpId, Released, single_engine_table
 from atom.utils.clock import LPRuntime, Straggler
 
 ENGINE, FRONTEND = LpId("engine"), LpId("frontend")
@@ -234,6 +234,85 @@ def test_an_unhandled_release_prints_one_diagnostic_and_keeps_waiting(caplog):
     assert len(diags) == 1
     assert f"released {REQ} seq 0" in diags[0]
     assert rt.now == 10.2
+
+
+# --- below a ceiling ----------------------------------------------------------
+
+
+def _under(ceiling, released=None):
+    """A grant's releases with `ceiling`, as the authority sends them."""
+    out = Released(released or {})
+    out.ceiling = ceiling
+    return out
+
+
+def test_below_a_ceiling_the_owner_advances_on_its_own_and_its_next_call_says_so():
+    rt, call = _runtime(FRONTEND, (0.5, _under(0.6)), (0.7, {}), (0.75, {}))
+    assert call(rt.next_event, INF) == 0.5
+    call(rt.stamp_send, REQ)
+    call(rt.advance_to, 0.55)
+    call(rt.stamp_send, REQ)
+    call(rt.advance_to, 0.7)
+    call(rt.advance_to, 0.75)  # the grant to 0.7 carried no ceiling
+    assert rt.conn.sent == [
+        ("NER", INF, [], INF),
+        (
+            "TAR",
+            0.7,
+            [(REQ, 0, 0.5 + IPC), (REQ, 1, 0.55 + IPC)],
+            INF,
+            [("TAR", 0.55, 0.55, 1)],
+            False,
+        ),
+        ("TAR", 0.75, [], INF),
+    ]
+    assert rt.calls == 4 and rt.now == 0.75
+
+
+def test_messages_sent_ahead_are_released_one_step_at_a_time():
+    ahead = {HTTP: [(0, 1.0), (1, 1.2), (2, 1.2), (3, 1.5)]}
+    rt, call = _runtime(
+        FRONTEND, (0.5, _under(0.75)), (1.0, _under(1.6, ahead)), (INF, {})
+    )
+    seen = []
+    for t, t_daemon in [(INF, INF)] * 3 + [(1.3, INF), (INF, 1.4)] + [(INF, INF)] * 2:
+        seen.append((call(rt.next_event, t, t_daemon), sorted(rt.released[HTTP])))
+    assert seen == [
+        (0.5, []),
+        (1.0, [0]),
+        (1.2, [0, 1, 2]),
+        (1.3, [0, 1, 2]),
+        (1.4, [0, 1, 2]),
+        (1.5, [0, 1, 2, 3]),
+        (INF, [0, 1, 2, 3]),
+    ]
+    steps = [
+        ("NER", INF, 1.2, 0),
+        ("NER", 1.3, 1.3, 0),
+        ("NER", INF, 1.4, 0),
+        ("NER", INF, 1.5, 0),
+    ]
+    assert rt.conn.sent == [
+        ("NER", INF, [], INF),
+        ("NER", INF, [], INF, [], True),
+        ("NER", INF, [], INF, steps, True),
+    ]
+
+
+def test_a_handler_runs_at_the_arrival_of_a_message_sent_ahead():
+    ahead = {REQ: [(0, 10.1), (1, 10.3)]}
+    rt, call = _runtime(ENGINE, (10.0, _under(10.05)), (10.1, _under(10.5, ahead)))
+    seen = []
+    handler = _receiver(rt, REQ, 2, seen)
+    call(rt.next_event, INF)
+    call(rt.next_event, INF)
+    with pytest.raises(RuntimeError, match="messages sent ahead unreached"):
+        call(rt.ask_next_event, INF)
+    call(rt.advance_to, 10.4)
+    assert seen == [(REQ, 0, 10.1), (REQ, 1, 10.3)]
+    assert rt.now == 10.4 and len(rt.conn.sent) == 2
+    handler.join(5)
+    assert not handler.is_alive()
 
 
 def _frontend_after(n):
