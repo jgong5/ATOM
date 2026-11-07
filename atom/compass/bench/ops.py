@@ -138,6 +138,7 @@ and, when some step's rows are ragged, at a rung of more than one row on
 ragged rows too (`_means`): the first at the context, the rest sharing a mean,
 each `GRID`th of it from the least the rows hold; and each prefill family
 (`_family`) over a ladder of their token counts, chunk remainders among them,
+its shapes that state the rows a DP group gathers apart, as `fit ops` prices them,
 one of a kind that depends on context at each at the most cached tokens of
 steps of its rows, and over a ladder of them once those points and the fresh
 ones show the kind still does; then the point halfway between two neighbours
@@ -2409,7 +2410,8 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     for shape in sorted(prefills, key=str):  # G and W are None or a count
         for sig, (op, _) in graphs[shape].items():
             fam, tokens = _family(shape, None, op["op"], sig, dependent)
-            seen[fam].setdefault(tokens, (shape, op["op"], sig))
+            # `fit ops` keeps a shape that states G apart from one that does not
+            seen[fam, not shape.gathered].setdefault(tokens, (shape, op["op"], sig))
 
     def cached_ladder(top_only: bool) -> dict:
         """The points of each prefill family over its rows' cached tokens, of
@@ -2429,7 +2431,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                         want[shape, c].add(fam)
         return want
 
-    for fam, at in seen.items():
+    for (fam, _), at in seen.items():
         for tokens in _ladder(at):
             want[at[tokens][0], None].add(fam)
     for point, fams in cached_ladder(top_only=True).items():

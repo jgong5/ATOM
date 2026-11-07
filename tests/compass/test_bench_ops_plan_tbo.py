@@ -78,6 +78,8 @@ def test_coverage_counts_a_split_step_as_its_micro_batches(
 
     report = ops.coverage(store, root, CONFIG, [split], records, "gfx942")
 
+    # Each rank's two micro-batches and its even step, each at points of its own
+    # shape: `fit ops` prices a shape that states G apart from one that does not.
     assert report["by phase"]["prefill"] == {"steps": 6, "covered": 6}
 
 
