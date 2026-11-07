@@ -97,7 +97,7 @@ def _priced_here(monkeypatch, drafter=None):
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
     monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
     monkeypatch.setattr("atom.compass.run.modules.drafter", lambda config: None)
-    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: graph)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: graph)
     monkeypatch.setattr("atom.compass.run._file_digest", lambda *a: "sha256:m")
     monkeypatch.setattr("atom.compass.run.step_grid.keyed", lambda *a, **k: {})
     monkeypatch.setattr(project, "_each", lambda jobs: [project.cell(*j) for j in jobs])
@@ -153,7 +153,7 @@ def test_a_cell_under_a_drafter_states_the_drafters_seconds_apart(
 ):
     mtp1 = SimpleNamespace(num_speculative_tokens=1, use_dspark=lambda: False)
     _priced_here(monkeypatch, mtp1)
-    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: drafted)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: drafted)
     line = {"rows": [[2, 900, True]] * 2, "rung": 2, "d_target_ns": 10**9}
     decode = ran(tmp_path / "mtp", [line])
 
