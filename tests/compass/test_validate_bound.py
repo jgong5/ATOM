@@ -215,7 +215,7 @@ def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1):
     tree = SimpleNamespace(modules=lambda: [SimpleNamespace(), moe])
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
     monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
-    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: graph)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: graph)
     spec = tmp_path / "spec.json"
     spec.write_text(json.dumps(ROOFLINE))
     argv = ["--model", "m", "--machine", str(spec), "--store", "s", *more]
@@ -394,7 +394,7 @@ def _backends(monkeypatch, tmp_path, config, modules=STACK, lookup=graph, ep=1):
         "atom.compass.run.modules.walk",
         lambda t, d=None: modules + DRAFTER * bool(d and d.use_dspark()),
     )
-    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: lookup)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: lookup)
     return bound.backends("m", 1, [], MACHINE, str(tmp_path), [])[2]
 
 
