@@ -63,6 +63,7 @@ def _serve(monkeypatch, out: Path, client_runs, stop: float, late=None) -> Path:
             time.sleep(0.05)
     wall[0] = stop
     authority.on_request(FRONTEND, TAR, INF, [])
+    wall[0] = stop + 1  # the hand-ins and the summary come after the finish
     if late is not None:
         wall[0] = late
         authority.on_bind(TRAFFIC)
