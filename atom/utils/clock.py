@@ -595,14 +595,18 @@ class WrappedPoller:
         polled, back = [], True
         while True:
             wake.clear()
-            for s in wrapped:
-                s.pull()
-            if back:
-                # The frame taken before counts as handled only now, with the
-                # wakeup cleared and the sockets read, so the owner it lets go
-                # finds this thread about to block rather than holding the GIL.
-                self.rt.back_at_wait_point()
-                back = False
+            try:
+                for s in wrapped:
+                    s.pull()
+            finally:
+                if back:
+                    # The frame taken before counts as handled only now, with
+                    # the wakeup cleared and the sockets read, so the owner it
+                    # lets go finds this thread about to block rather than
+                    # holding the GIL; and also when a read raises, as a
+                    # straggler's does, so the owner's drain fails the run.
+                    self.rt.back_at_wait_point()
+                    back = False
             ready = [
                 s
                 for s in self.socks

@@ -21,6 +21,7 @@ from atom.compass.clock import LpId, prefill_decode_table, single_engine_table
 from atom.utils.clock import (
     LPRuntime,
     RelayQueue,
+    Straggler,
     UnsentRelayItem,
     WrappedPoller,
     WrappedSocket,
@@ -339,6 +340,43 @@ def test_a_frame_counts_as_handled_once_its_thread_has_read_what_came_meanwhile(
     call(rt.advance_to, 10.2)
     assert read_when_handled == [(0, [0, 1]), (1, [0, 1])]
     _shut(stop_tx, thread)
+
+
+def test_a_straggler_an_output_thread_reads_still_fails_the_run(ctx):
+    """A stray frame, released by no grant and arriving below the clock, comes
+    while the output thread handles frame 0. The thread's read raises on it,
+    and frame 0 still counts as handled, so the owner's drain fails the run
+    rather than waiting for ever on frame 0."""
+    push, pull = _pair(ctx, "out", zmq.PUSH, zmq.PULL)
+    late = ctx.socket(zmq.PUSH)  # the stray's sender, used on the output thread only
+    late.connect("inproc://out")
+    engine = _rt(ENGINE)[0]
+    tx = _relayed(engine, push, OUT, (10.05, 0))
+    stray = _relayed(engine, late, OUT, (10.0, 5))
+    rt, call = _rt(FRONTEND, (10.2, {OUT: [(0, 10.05)]}), (10.3, {}))
+    rx = WrappedSocket(rt, pull, OUT)
+    raised = []
+
+    def output_thread():
+        poller = WrappedPoller(rt, [rx])
+        try:
+            while True:
+                poller.poll()
+                rx.recv()
+                stray.send(b"stray")
+                assert pull.poll(5000)  # on the socket, not yet read
+        except Straggler as e:
+            raised.append(e)
+
+    thread = threading.Thread(target=output_thread, daemon=True)
+    thread.start()
+    tx.send(b"p0")
+    with pytest.raises(Straggler, match="seq 5 arrives at 10.0"):
+        call(rt.advance_to, 10.2)
+        thread.join(5)
+        call(rt.advance_to, 10.3)
+    thread.join(5)
+    assert raised and not thread.is_alive()
 
 
 class _Reads:
