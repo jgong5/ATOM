@@ -425,7 +425,8 @@ class GrantingClock:
 
     def withdraw(self, fut: asyncio.Future) -> None:
         self.waits = [w for w in self.waits if w[1] is not fut]
-        fut.set_result(None)
+        if not fut.done():
+            fut.set_result(None)
 
     def grant(self) -> None:
         self.t = min(t for t, _ in self.waits)
