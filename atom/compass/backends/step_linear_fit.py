@@ -64,6 +64,12 @@ beyond it, fitted on their `E` with their kind's law as a fixed part. Records
 on too few such forwards give `admit` null, so a run refuses a forward that
 admits a request rather than charge it nothing, and the report says why under
 `unfitted`.
+A decode whose forward before it was an output prefill (`Sample.after`) is left
+out of each decode law that also fits `after_prefill[segment]`, seconds on that
+prefill's `(1, tokens, seqs)`, on what those decodes spend beyond the law, its
+price a fixed part (`_after_prefill`). A segment with too few of them to fit
+the term keeps them in its law, with no term, and the report says why under
+`unfitted`.
 
 Each equation is divided by its own label and the coefficients are bound to be
 non-negative. Steps whose relative residual is more than `MAD_K` scaled MADs
@@ -257,17 +263,19 @@ def _features(
     return rows, cut
 
 
-def _host_x(s) -> tuple[int, int, int]:
-    return 1, sum_tokens(s.view.requests), len(s.view.requests)
+def _host_x(view) -> tuple[int, int, int]:
+    return 1, sum_tokens(view.requests), len(view.requests)
 
 
 def _host_rows(samples) -> list[tuple]:
-    """(kind, segment, (1, tokens, seqs), seconds) per host label of each
-    sample, but the `E` of one that admits requests."""
+    """(kind, segment, (1, tokens, seqs), seconds, after) per host label of
+    each sample, but the `E` of one that admits requests; `after` is `_host_x`
+    of the output prefill before a decode (`Sample.after`), else None."""
     rows = []
     for s in samples:
+        after = None if s.after is None else _host_x(s.after)
         rows += [
-            (host_kind(s.view), k, _host_x(s), v)
+            (host_kind(s.view), k, _host_x(s.view), v, after)
             for k, v in s.host.items()
             if k != "E" or not s.admitted[0]
         ]
@@ -278,7 +286,11 @@ def _admit_rows(samples, laws) -> list[tuple]:
     """(`admit_x` of admitted, `E` its kind's law prices, `E`) per sample
     that admits requests, has a positive `E` and a kind with an `E` law."""
     return [
-        (step_labels.admit_x(s.admitted), float(np.dot(c, _host_x(s))), s.host["E"])
+        (
+            step_labels.admit_x(s.admitted),
+            float(np.dot(c, _host_x(s.view))),
+            s.host["E"],
+        )
         for s in samples
         if s.admitted[0]
         and s.host.get("E", 0) > 0
@@ -342,6 +354,15 @@ def fit_host(samples) -> tuple[dict, dict]:
             except (ValueError, QhullError) as e:
                 report["unfitted"][f"{kind}.{segment}"] = str(e).splitlines()[0]
                 continue
+            if any(r[4] is not None for r in members):
+                try:
+                    (coef, fitted), term = _after_prefill(members)
+                except (ValueError, QhullError) as e:
+                    why = str(e).splitlines()[0]
+                    report["unfitted"][f"after_prefill.{segment}"] = why
+                else:
+                    host.setdefault("after_prefill", {})[segment] = term[0]
+                    report[f"after_prefill.{segment}"] = term[1]
             host["laws"].setdefault(kind, {})[segment] = coef
             report[f"{kind}.{segment}"] = fitted
     a, base, labels = list(zip(*_admit_rows(kept, host["laws"]))) or [(), (), ()]
@@ -351,6 +372,18 @@ def fit_host(samples) -> tuple[dict, dict]:
         host["admit"] = None  # a run refuses a forward that admits a request
         report["unfitted"]["admit"] = str(e).splitlines()[0]
     return host, report
+
+
+def _after_prefill(members) -> tuple[tuple, tuple]:
+    """A decode segment's law over `members`, its `_host_rows` rows, but those
+    after an output prefill, and its `after_prefill` term over those, the
+    law's price a fixed part: each `_host_law`'s answer. Raises as it does."""
+    plain = [r for r in members if r[4] is None]
+    after = [r for r in members if r[4] is not None]
+    law = _host_law([r[2] for r in plain], [r[3] for r in plain], HOST_FEATURES)
+    base = [float(np.dot(law[0], r[2])) for r in after]
+    x, y = [r[4] for r in after], [r[3] for r in after]
+    return law, _host_law(x, y, HOST_FEATURES, base)
 
 
 def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
@@ -1137,12 +1170,17 @@ def host_held_out(samples) -> dict:
         others = [s for s in samples if s.provenance["run"] != run]
         host = fit_host(others)[0]
         laws, admit = host["laws"], host.get("admit")
+        terms = host.get("after_prefill", {})
         mine = [s for s in samples if s.provenance["run"] == run]
-        rows = [
-            (f"{kind} {segment}", c and float(np.dot(c, x)), seconds)
-            for kind, segment, x, seconds in _host_rows(mine)
-            for c in [laws.get(kind, {}).get(segment)]
-        ]
+        rows = []
+        for kind, segment, x, seconds, after in _host_rows(mine):
+            c, band = laws.get(kind, {}).get(segment), f"{kind} {segment}"
+            price = c and float(np.dot(c, x))
+            if after is not None and (t := terms.get(segment)) and price is not None:
+                band, price = f"after_prefill {segment}", price + float(
+                    np.dot(t, after)
+                )
+            rows.append((band, price, seconds))
         rows += [
             ("admit E", admit and base + float(np.dot(admit, a)), e)
             for a, base, e in _admit_rows(mine, laws)

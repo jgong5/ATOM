@@ -147,6 +147,8 @@ class Sample:
     sample: the same set on each of the rank's samples.
     `admitted` is `(requests, uncached, cached)` of the requests it admits
     (`admissions`).
+    `after` is, on a decode, the view of the output prefill that ran just
+    before it on its rank; None elsewhere.
     """
 
     step: int
@@ -162,6 +164,7 @@ class Sample:
     dummies: frozenset = frozenset()
     draft_kv_s: float | None = None
     admitted: tuple = (0, 0, 0)
+    after: BatchView | None = None
 
 
 def admissions(lines: list[dict]) -> list[tuple[int, int, int]]:
@@ -405,10 +408,11 @@ def _label(
     tbo = (config or {}).get("engine", {}).get("enable_tbo")
     run = run or digest(record)
     samples, table, prev, ranks = [], [], None, None
+    prefill = None  # the view of the forward before, if an output prefill
     busy, admits = busy_gaps(lines), admissions(lines)
     for i, s in enumerate(lines):
         if s["is_dummy_run"]:
-            prev = s
+            prev, prefill = s, None
             continue
         dp, tokens = "moe_rows" in s, s.get("moe_tokens")
         split = s.get("tbo_tokens")
@@ -506,6 +510,7 @@ def _label(
                 dummies,
                 None if cut or draft_kv is None else draft_kv * 1e-9,
                 admits[i],
+                prefill if host_kind(view) == "decode" else None,
             )
         )
         gap_ns = s.get("d_gap_ns")
@@ -522,7 +527,7 @@ def _label(
                 "cut": cut,
             }
         )
-        prev = s
+        prev, prefill = s, view if host_kind(view) == "prefill" else None
     return samples, table
 
 
