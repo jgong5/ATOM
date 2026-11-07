@@ -56,7 +56,8 @@ from atom.compass.backends.provenance import Method, Provenance
 from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.backends.work import Work
-from atom.compass.capture.forward import structure
+from atom.compass.capture import population_shapes
+from atom.compass.capture.forward import Shape, structure
 from atom.compass.clock import RefusalTally
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import serve, trace_steps
@@ -702,3 +703,54 @@ def test_coverage_of_a_v4_pro_dpa_run_reads_graphs_at_the_widths_its_ranks_run(
     assert asked.kinds == set(kinds)
     assert widths == {(kind, 1, 8) for kind in kinds}
     assert [s.endswith(" tp=1 dp=8 ep=8 decode eager") for s in structures] == [True]
+
+
+@pytest.mark.parametrize("token_split", ["1", "0"], ids=["midpoint", "request"])
+def test_coverage_under_tbo_reads_a_step_its_dp_group_split_as_its_micro_batches(
+    tmp_path, monkeypatch, token_split
+):
+    # At step 0 each of two DP ranks prefills 9000 tokens, past ATOM's
+    # 8192-token bar, so the group splits it: at the token midpoint, or on a
+    # request boundary, each rank its own way round. At step 1 rank 1 runs a
+    # dummy, which cannot split, so rank 0 runs whole. The store holds the
+    # graphs `trace ops --population` traces from the record, all priced.
+    monkeypatch.setenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", token_split)
+    directory = tmp_path / "record"
+    (directory / serve.STEPS).mkdir(parents=True)
+    (directory / serve.RUN_JSON).write_text(json.dumps(IDENTITY))
+    first, second = [6000, 6000, False], [3000, 3000, False]
+    ranks = [
+        [([first, second], 18000, False), ([[9000, 9000, False]], 9001, False)],
+        [([second, first], 18000, False), ([[1, 1, True]], 9001, True)],
+    ]
+    for rank, steps in enumerate(ranks):
+        lines = [
+            {"step": n, "dp_rank": rank, "is_dummy_run": dummy, "rows": rows}
+            | {"rung": None, "moe_rows": gathered, "produces_output": True}
+            for n, (rows, gathered, dummy) in enumerate(steps)
+        ]
+        path = directory / serve.STEPS / f"dp{rank}.jsonl"
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+        engine = ENGINE | {"tensor_parallel_size": 1}
+        path.with_suffix(".engine.json").write_text(json.dumps(engine))
+    bounds = {k: ENGINE[k] for k in ("max_num_seqs", "max_num_batched_tokens")}
+    dp = SimpleNamespace(data_parallel_size=2, data_parallel_rank=0)
+    r = deployment(
+        tmp_path, **bounds, capture_sizes=LADDER, enable_tbo=True, parallel_config=dp
+    )
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
+    traced = set(population_shapes([str(directory)], tbo=True))
+
+    def graph(phase, tokens, seqs, output, gathered=None):
+        if Shape(phase, tokens, seqs, gathered).at(2) in traced:
+            return {"seq": [g(tokens, 64, 64)]}
+
+    monkeypatch.setattr(compass_run, "_op_graphs", lambda *args: graph)
+    monkeypatch.setattr(compass_run, "_price_list", lambda *args: Asked())
+    run = {"store": str(tmp_path / "store"), "machine": DOCUMENT}
+    run |= {compass_run.OP_GRAPH: True, compass_run.PRICE_LIST: {}}
+
+    report = drive_run.check([str(directory)], run, ["--model", str(tmp_path)])
+
+    assert report["left out, by leaf kind"] == {}
+    assert report["by phase"] == {"prefill": {"steps": 3, "covered": 3}}

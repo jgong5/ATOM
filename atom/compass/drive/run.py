@@ -31,8 +31,11 @@ both values. The check refuses no step: it counts those the grid extrapolates
 and those that fall to the step roofline below it, naming each with the grid's
 reasons. The op graph's is `op_coverage`, over the backend `run.op_graph`
 builds from the run file: a step is covered when its price list prices every
-leaf, and a run file that names no price list refuses. Another backend has no
-check, and refuses `--coverage`.
+leaf, and a run file that names no price list refuses. Under `--enable-tbo` a
+data-parallel step its group splits, by the rule `validate.bound` agrees over
+every rank's line at that step, is priced as its two micro-batches, as a
+simulated run prices it. Another backend has no check, and refuses
+`--coverage`.
 
 `--acceptance-record` names a speculative `compass record` directory: its
 histograms' rates (`measured`) go to ATOM as ``--spec-decode-acceptance-rates``,
@@ -69,6 +72,7 @@ from atom.compass.run import (
     STEP_STUB,
     step_grid,
 )
+from atom.compass.validate.bound import _split
 
 PROG = "compass run"
 #: The engine fields that shape a step's batches: the scheduler's bounds, the
@@ -198,7 +202,7 @@ def check(inputs, run: dict, atom_args) -> dict:
     refuses."""
     store, config = ArtifactStore(run["store"]), _config(atom_args)
     here = step_grid.keyed(config) | {name: getattr(config, name) for name in BOUNDS}
-    steps = [s for name in inputs for s in _steps(name, store, here)]
+    steps = [s for name in inputs for s in _steps(name, store, here, config.enable_tbo)]
     machine = compass_run._machine(run)
     if run.get(OP_GRAPH):
         if PRICE_LIST not in run:
@@ -240,14 +244,19 @@ def op_coverage(backend, steps) -> dict:
     per kind per step so a kind's counts sum to steps. A step is covered
     when the list prices each leaf the backend asks it for; a leaf it declines,
     on a line the fit declined among them, goes to the roofline and leaves its
-    step out. A step the backend refuses is left out under ``step refused``."""
+    step out. A step the backend refuses is left out under ``step refused``.
+    A line's `tbo_tokens`, the two-batch-overlap split its data-parallel
+    group agreed, makes the step its rank's (`dp_rank`) two micro-batches."""
     by_phase, out = defaultdict(Counter), defaultdict(Counter)
     for _, line in steps:
+        split = line.get("tbo_tokens")
         view = BatchView(
             tuple(RequestShape(*row) for row in line["rows"]),
             capture_rung=line["rung"],
             moe_rows=line.get("moe_rows"),
             produces_output=line["produces_output"],
+            tbo_tokens=split and tuple(map(tuple, split)),
+            dp_rank=split and line.get("dp_rank"),
         )
         try:
             cost = backend.price(view)
@@ -276,10 +285,13 @@ def op_coverage(backend, steps) -> dict:
     }
 
 
-def _steps(name: str, store, here: dict) -> list:
+def _steps(name: str, store, here: dict, tbo: bool) -> list:
     """The steps of the record directory or `shape_population` token `name`,
     less DP's dummy runs, each named `<name> dp<r> step <n>`; a rank whose
-    engine states other `SHAPING` fields than `here` refuses, naming each."""
+    engine states other `SHAPING` fields than `here` refuses, naming each.
+    Whatever a line states, its `tbo_tokens` is, on a data-parallel step under
+    two-batch overlap (`tbo`, ATOM's `enable_tbo`), the split `bound._split`
+    agrees over every rank's line at that step, else None."""
     path = Path(name)
     if (path / serve.RUN_JSON).is_file():
         records = {
@@ -305,10 +317,25 @@ def _steps(name: str, store, here: dict) -> list:
                     f"{k} {ran.get(k)!r} there, {here[k]!r} here" for k in differ
                 )
             )
-    return [
-        (f"{name} dp{rank} step {line['step']}", line)
+    ranks = {
+        rank: [json.loads(t) for t in text.splitlines()]
         for rank, (text, _) in sorted(records.items())
-        for line in map(json.loads, text.splitlines())
+    }
+    splits = {}
+    # One rank is no data-parallel group. Dummy runs' lines join the split; a
+    # step some rank's record lacks splits none, as `trace ops --population`
+    # reads it (`capture.population_steps`).
+    if tbo and len(ranks) > 1:
+        at = [{s["step"]: s for s in lines} for lines in ranks.values()]
+        for step in set.intersection(*map(set, at)):
+            splits[step] = _split([r[step] for r in at])
+    return [
+        (
+            f"{name} dp{rank} step {line['step']}",
+            line | {"tbo_tokens": splits.get(line["step"])},
+        )
+        for rank, lines in ranks.items()
+        for line in lines
         if not line["is_dummy_run"]
     ]
 
