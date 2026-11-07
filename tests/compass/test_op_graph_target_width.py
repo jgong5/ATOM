@@ -739,6 +739,9 @@ def test_cost_accuracy_prices_a_line_where_its_target_and_drafter_ran(
 
     report = cost_accuracy(record / "steps", traced(record, drafts))
 
-    # A step is its ranks' lines joined.
+    # A step is its ranks' lines joined. A prefill's label is a trace run's busy
+    # time, which this record holds none of, so each rank's prefill line is cut.
+    prefills = sum(not any(r[2] for r in line["rows"]) for line in lines)
     assert report["refused"] == {}
-    assert sum(k["steps"] for k in report["graded"].values()) == len(lines)
+    assert report["cut"]["untraced"] == 2 * prefills
+    assert sum(k["steps"] for k in report["graded"].values()) == len(lines) - prefills
