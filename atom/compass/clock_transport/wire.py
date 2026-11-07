@@ -11,9 +11,13 @@ A message is a tuple, one of these shapes:
 * ``(kind, t, log, t_daemon)`` with `kind` ``TAR``, ``NER`` or ``PARK`` -- a request,
   where `log` is ``[(channel, seq, arrival)]``, the requester's sends since its
   previous request, and `t_daemon` an NER's daemon deadline, ``+inf`` for none;
+  ``(kind, t, log, t_daemon, steps, ahead)`` also carries the steps the
+  requester took below its last grant's ceiling, ``[(kind, t, G, n)]``, and
+  whether an NER asks for its messages ahead (`ClockAuthority.on_request`);
 * ``("GRANT", G, released)`` -- the reply, `released` being
-  ``{channel: [(seq, arrival)]}``; ``("GRANT", G, released, k)`` also marks
-  the end of client run `k`;
+  ``{channel: [(seq, arrival)]}`` and, when it has one, its ``ceiling``
+  (`Released`); ``("GRANT", G, released, k)`` also marks the end of client
+  run `k`;
 * ``("REFUSED", error, reason, table)`` -- the request was refused; `error` names
   the exception the requester raises, and `table` is the LP table a `ClockAbort`
   carries, or ``None``.
@@ -36,6 +40,7 @@ from atom.compass.clock import (
     ClockAbort,
     LpId,
     LpRow,
+    Released,
 )
 
 BIND, JOINED, GRANT, REFUSED = "BIND", "JOINED", "GRANT", "REFUSED"
@@ -123,13 +128,37 @@ def _row_in(fields: list) -> LpRow:
     )
 
 
-def _request_out(kind, t, log, t_daemon) -> dict:
-    return {
+def _request_out(kind, t, log, t_daemon, steps=(), ahead=False) -> dict:
+    body = {
         "kind": kind,
         "t": _out(t),
         "log": [[c, s, _out(a)] for c, s, a in log],
         "t_daemon": _out(t_daemon),
     }
+    if steps:
+        body["steps"] = [[k, _out(s), _out(g), n] for k, s, g, n in steps]
+    if ahead:
+        body["ahead"] = True
+    return body
+
+
+def _request_in(body) -> tuple:
+    request = (
+        body["kind"],
+        _in(body["t"]),
+        [_entry(*e) for e in body["log"]],
+        _in(body["t_daemon"]),
+    )
+    if "steps" not in body and "ahead" not in body:
+        return request
+    steps = [_step(*s) for s in body.get("steps", ())]
+    return (*request, steps, body.get("ahead") is True)
+
+
+def _step(kind, t, g, n) -> tuple[str, float, float, int]:
+    if kind not in (TAR, NER) or type(n) is not int:
+        raise TypeError(f"{[kind, t, g, n]!r} is not (TAR or NER, t, G, n)")
+    return kind, _in(t), _in(g), n
 
 
 def _error(name: str) -> str:
@@ -185,14 +214,18 @@ def _grant_out(_, g, released, *ended) -> dict:
     }
     if ended:
         (body["ended"],) = ended
+    if getattr(released, "ceiling", None) is not None:
+        body["ceiling"] = _out(released.ceiling)
     return body
 
 
 def _grant_in(body) -> tuple:
-    released = {
-        ch: [(seq, _in(a)) for seq, a in pairs]
+    released = Released(
+        (ch, [(seq, _in(a)) for seq, a in pairs])
         for ch, pairs in body["released"].items()
-    }
+    )
+    if "ceiling" in body:
+        released.ceiling = _in(body["ceiling"])
     ended = (body["ended"],) if "ended" in body else ()
     return (GRANT, _in(body["G"]), released, *ended)
 
@@ -210,13 +243,5 @@ _DECODE = {
     JOINED: lambda body: (JOINED, _in(body["now"]), dict(body["seqs"])),
     GRANT: _grant_in,
     REFUSED: _refused_in,
-    **dict.fromkeys(
-        REQUESTS,
-        lambda body: (
-            body["kind"],
-            _in(body["t"]),
-            [_entry(*e) for e in body["log"]],
-            _in(body["t_daemon"]),
-        ),
-    ),
+    **dict.fromkeys(REQUESTS, _request_in),
 }

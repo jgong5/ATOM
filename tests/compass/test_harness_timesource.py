@@ -149,7 +149,7 @@ def test_a_deadline_met_early_withdraws_its_clock_wait(tmp_path, monkeypatch):
         event = asyncio.Event()
 
         async def set_at_5():
-            await traffic.advance_to(5.0)
+            await traffic.wait(5.0)
             event.set()
 
         setter = asyncio.ensure_future(set_at_5())

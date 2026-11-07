@@ -315,6 +315,45 @@ in [#2359](https://github.com/jgong5/ATOM/issues/2359):
 - **Its aiter lacks `ROCm/aiter#6833`:** `fused_dual_rmsnorm_mxfp8_quant` takes
   no `amax_floor`, which V4.1's `DualRMSNormMXFP8` passes.
 
+### A TP4 serve that stops mid-run, and what to capture before stopping it
+
+A V4.1-Flash TP4 serve on the A0 cards can stop mid-run at concurrency 16 and
+above ([#2922](https://github.com/jgong5/ATOM/issues/2922)). Every rank stops
+logging steps while requests keep arriving, and the stall ends in one of two
+forms. In one, after 600 s the NCCL watchdog names the TP group's one-element
+`BROADCAST` in `ModelRunner.postprocess` on all four ranks, the first tracked op
+that did not finish, and the abort that follows removes the stalled queue. In the
+other, something else removes it before the watchdog fires: there is no
+watchdog line, and the server log shows HSA's `HW Exception by GPU node-N ...
+reason :GPU Hang`. Either way, removing the stalled queue makes one card's MES
+time out (`MES(0, 0) failed to respond to msg=REMOVE_QUEUE` in dmesg), and that
+card resets (`device wedged, but recovered through reset`) and passes a GEMM
+check afterwards. The card differs between runs. Wave dumps taken before a reset
+([#2922's record](https://github.com/jgong5/ATOM/issues/2922#issuecomment-6703152077))
+show a few waves on one WGP of the stalled card whose stores never complete: in
+their kernel while the other cards' waves wait in a collective for them, or in the
+context-save trap once a removal has begun. py-spy can show every rank at the next
+step's start, waiting in `D2HQueue.receive` for the previous step's output copy.
+The record holds the rate, its exposure, and the runs that did not reproduce it:
+no fix is shown by three clean runs. For cell A, #2147 gives a run lost to this
+signature one retake and makes a second loss at one concurrency a leftover on
+#2922 ([#2147's term](https://github.com/jgong5/ATOM/issues/2147#issuecomment-6703124926)).
+
+The state is gone once the card resets, and the node's `mes-monitor` service
+dumps waves only on its first MES failure after it starts. So treat no
+`Scheduled prefill batch` or `Engine Core: output send` line for 90 s, while the
+engine's last `Running: N reqs, Waiting: M reqs` report is not 0 and 0, as a
+stall, and before stopping anything take these, with the owner's OK. The
+container has its own PID namespace, so take each pid from
+`docker exec <user>_ufb ps -ef`, not from the host:
+
+```
+sudo /usr/local/bin/ddvs checkmi sq_waves verbose   # resident waves: PC, status, outstanding counts
+sudo /usr/local/bin/ddvs checkmi cp_dump            # queue and CP state
+docker exec <user>_ufb py-spy dump --pid <pid>      # each rank, the EngineCore, the api_server
+dmesg -T
+```
+
 ## A red CPU gate that may not be your diff — one flaky test in ATOM's suite
 
 `tests/entrypoints/test_stream_marker_properties.py::TestTheRegionIsNotCopiedPerChunk`
@@ -1012,6 +1051,26 @@ wall-clock detectors off, `--disable-retries` among them, as `deploy.sh`'s
 header requires. The script
 sets `--request-timeout-secs` itself: a stream lasts the wall time the run
 takes to finish it, and the router's default 1800 s cut c=256 streams.
+
+### The EP8 cell
+
+The EP8 cell is the DPA-TP8 cell
+[as registered](https://github.com/jgong5/ATOM/issues/975#issuecomment-6570682669)
+with expert parallelism on. Both sides add `--enable-expert-parallel --moe-backend
+standard` to their ATOM arguments and `MORI_SHMEM_HEAP_SIZE=16G` to their
+environment, the decode side as an `-e` word of its prefix. MORI's high-throughput
+all-to-all is the default; EPLB, MTP and the decode's low-latency mode stay off.
+A real run is `deploy.sh record ... --store S`, which merges in the
+stack's JIT cache library from `S` and writes it back. A simulated run is
+`deploy.sh run --step-linear P --step-linear D --host-laws P --host-laws D
+--machine scripts/compass/machines/mi355x-crs005.json --store S`, which builds the
+cell's run file from these flags and both sides' arguments. `P` and `D` are
+`scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json` and
+`-decode.json`, and `S` holds each side's `compass measure memory` readings, taken
+at the run's own commit on the node where that side's real instance runs (013 for
+the decode): decode readings taken on 005 sized the simulated decode 79 to 80 KV
+blocks per rank above every real decode on 013
+([ruling](https://github.com/jgong5/ATOM/issues/1111#issuecomment-6659985920)).
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 

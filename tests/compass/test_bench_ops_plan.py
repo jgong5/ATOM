@@ -46,6 +46,7 @@ CONFIG = SimpleNamespace(
     max_num_batched_tokens=8192,
     max_model_len=262144,
     speculative_config=None,
+    enable_tbo=False,
 )
 
 
