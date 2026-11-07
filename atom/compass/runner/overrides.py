@@ -338,6 +338,9 @@ class HostDeviceRecurrence:
     `compass_admitted`, adds what its admissions cost to its `E`, except on a
     pipeline stage that receives its input; None, a fit that priced them apart
     and fitted no law for them, and `device_end` refuses a forward that admits.
+    `after_prefill[segment]`, coefficients on the `(1, tokens, seqs)` of an
+    output prefill, adds to that segment of the decode charged right after one
+    what it spends beyond its law; None charges none.
     """
 
     def __init__(
@@ -349,9 +352,11 @@ class HostDeviceRecurrence:
         mtp=False,
         sync=False,
         admit=ADMISSION_IN_E,
+        after_prefill=None,
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
-        self.admit = admit
+        self.admit, self.after = admit, after_prefill or {}
+        self.prefill_x = None  # the last forward's features, if an output prefill
         ring = 2 if stage is None else stage[1]
         self.ends = collections.deque([-math.inf] * ring, maxlen=ring)  # n-ring..n-1
         self.last = None if stage is None else stage[0] == stage[1] - 1
@@ -407,6 +412,7 @@ class HostDeviceRecurrence:
         now = self.now()
         called, meta = getattr(batch, "compass_pp_host", (now, -math.inf))
         prepared, self.segments = self.prepare_end(called, kind, x, self.admit_s(batch))
+        self.prefill_x = x if kind == "prefill" else None
         self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)
@@ -442,10 +448,18 @@ class HostDeviceRecurrence:
         self, called: float, kind: str, x: tuple, admit_s: float = 0.0
     ) -> tuple[float, dict]:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
-        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`."""
+        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, and on a decode right
+        after an output prefill, `after_prefill` on that prefill joins each."""
         law = self.laws.get(kind, {})
+        after, prev = {}, (0, 0, 0)
+        if kind == "decode" and self.prefill_x is not None:
+            after, prev = self.after, self.prefill_x
         seg = {
-            s: (float(np.dot(law.get(s, (0, 0, 0)), x)) + admit_s * (s == "E"))
+            s: (
+                float(np.dot(law.get(s, (0, 0, 0)), x))
+                + admit_s * (s == "E")
+                + float(np.dot(after.get(s, (0, 0, 0)), prev))
+            )
             * (s not in self.skip)
             for s in SEGMENTS
         }

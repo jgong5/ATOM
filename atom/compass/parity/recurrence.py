@@ -281,8 +281,9 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     device time, target then draft, by `law`'s step linear law
     (`StepLinearBackend` on its `step_labels` sample's view, from `samples`),
     and its host segments by the law's host laws, `law["host"]["laws"]`, its
-    `E` with what its admissions cost (`law["host"]["admit"]`), graded
-    against the same measured period. After each forward the engine
+    `E` with what its admissions cost (`law["host"]["admit"]`), and a decode
+    right after an output prefill with the law's `after_prefill` on that
+    prefill, graded against the same measured period. After each forward the engine
     runs its `E_out` before the next call. An idle forward's `E`, the first's
     too, stays measured from the last pull or exit, admissions and all: it
     holds the wait for an arrival, which no law prices. Steps in `warm` are charged and not graded,
@@ -299,7 +300,10 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     clock, exit_, out_s, prev, rows, refused = [0.0], 0.0, 0.0, None, [], {}
     apart, uncharged = {*jit, *(n + 1 for n in jit)}, 0.0
     admit = law["host"].get("admit", ADMISSION_IN_E)
-    rec = HostDeviceRecurrence({}, (), lambda: clock[0], mtp=mtp, admit=admit)
+    after = law["host"].get("after_prefill")
+    rec = HostDeviceRecurrence(
+        {}, (), lambda: clock[0], mtp=mtp, admit=admit, after_prefill=after
+    )
     kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
     admits = step_labels.admissions(steps)
     for s, kind, admitted in zip(steps, kinds, admits):

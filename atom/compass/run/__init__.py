@@ -429,19 +429,21 @@ def _check_host(path, host: dict) -> None:
     from atom.compass.runner.overrides import ADMISSION_IN_E, FORWARD_KINDS, SEGMENTS
 
     laws = host.get("laws", {})
+    segments = [*laws.values(), host.get("after_prefill") or {}]
     if (
-        set(host) - {"laws", "skip", "key", "admit"}
+        set(host) - {"laws", "skip", "key", "admit", "after_prefill"}
         or set(host.get("skip", ())) - set(SEGMENTS)
         or set(laws) - set(FORWARD_KINDS)
-        or {s for v in laws.values() for s in v} - set(SEGMENTS)
-        or {len(c) for v in laws.values() for c in v.values()} - {3}
+        or {s for v in segments for s in v} - set(SEGMENTS)
+        or {len(c) for v in segments for c in v.values()} - {3}
         or len(host.get("admit") or ADMISSION_IN_E) != 3
     ):
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
-            "admit, three coefficients on a forward's admissions or null, and "
-            "key, the host key the laws were fitted under"
+            "admit, three coefficients on a forward's admissions or null, "
+            "after_prefill, segments to three coefficients on the output prefill "
+            "before a decode, and key, the host key the laws were fitted under"
         )
 
 
@@ -1674,6 +1676,7 @@ def runner(model_runner, tree) -> None:
             mtp=mtp,
             sync=rapid and not config.disagg_is_decode,
             admit=host.get("admit", ADMISSION_IN_E),
+            after_prefill=host.get("after_prefill"),
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])

@@ -578,7 +578,7 @@ def test_the_command_writes_host_laws_a_run_file_takes_and_scores_them_held_out(
 
     law = json.loads((tmp_path / "law.json").read_text())
     StepLinearLaw(law)
-    assert set(law["host"]) == {"key", "laws", "admit"}
+    assert set(law["host"]) == {"key", "laws", "admit", "after_prefill"}
     assert {len(c) for s in law["host"]["laws"].values() for c in s.values()} == {3}
     out = capsys.readouterr().out
     assert "held out, host laws" in out and "host decode W_post | " in out
