@@ -315,6 +315,45 @@ in [#2359](https://github.com/jgong5/ATOM/issues/2359):
 - **Its aiter lacks `ROCm/aiter#6833`:** `fused_dual_rmsnorm_mxfp8_quant` takes
   no `amax_floor`, which V4.1's `DualRMSNormMXFP8` passes.
 
+### A TP4 serve that stops mid-run, and what to capture before stopping it
+
+A V4.1-Flash TP4 serve on the A0 cards can stop mid-run at concurrency 16 and
+above ([#2922](https://github.com/jgong5/ATOM/issues/2922)). Every rank stops
+logging steps while requests keep arriving, and the stall ends in one of two
+forms. In one, after 600 s the NCCL watchdog names the TP group's one-element
+`BROADCAST` in `ModelRunner.postprocess` on all four ranks, the first tracked op
+that did not finish, and the abort that follows removes the stalled queue. In the
+other, something else removes it before the watchdog fires: there is no
+watchdog line, and the server log shows HSA's `HW Exception by GPU node-N ...
+reason :GPU Hang`. Either way, removing the stalled queue makes one card's MES
+time out (`MES(0, 0) failed to respond to msg=REMOVE_QUEUE` in dmesg), and that
+card resets (`device wedged, but recovered through reset`) and passes a GEMM
+check afterwards. The card differs between runs. Wave dumps taken before a reset
+([#2922's record](https://github.com/jgong5/ATOM/issues/2922#issuecomment-6703152077))
+show a few waves on one WGP of the stalled card whose stores never complete: in
+their kernel while the other cards' waves wait in a collective for them, or in the
+context-save trap once a removal has begun. py-spy can show every rank at the next
+step's start, waiting in `D2HQueue.receive` for the previous step's output copy.
+The record holds the rate, its exposure, and the runs that did not reproduce it:
+no fix is shown by three clean runs. For cell A, #2147 gives a run lost to this
+signature one retake and makes a second loss at one concurrency a leftover on
+#2922 ([#2147's term](https://github.com/jgong5/ATOM/issues/2147#issuecomment-6703124926)).
+
+The state is gone once the card resets, and the node's `mes-monitor` service
+dumps waves only on its first MES failure after it starts. So treat no
+`Scheduled prefill batch` or `Engine Core: output send` line for 90 s, while the
+engine's last `Running: N reqs, Waiting: M reqs` report is not 0 and 0, as a
+stall, and before stopping anything take these, with the owner's OK. The
+container has its own PID namespace, so take each pid from
+`docker exec <user>_ufb ps -ef`, not from the host:
+
+```
+sudo /usr/local/bin/ddvs checkmi sq_waves verbose   # resident waves: PC, status, outstanding counts
+sudo /usr/local/bin/ddvs checkmi cp_dump            # queue and CP state
+docker exec <user>_ufb py-spy dump --pid <pid>      # each rank, the EngineCore, the api_server
+dmesg -T
+```
+
 ## A red CPU gate that may not be your diff — one flaky test in ATOM's suite
 
 `tests/entrypoints/test_stream_marker_properties.py::TestTheRegionIsNotCopiedPerChunk`
