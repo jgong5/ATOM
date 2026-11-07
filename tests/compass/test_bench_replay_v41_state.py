@@ -240,23 +240,41 @@ def test_a_v41_page_field_taken_whole_binds_it_and_counts_once_a_placement(probe
 
 
 @pytest.mark.parametrize(
-    "pool, slots", [("whole", 8), ("ring", 8), ("ring", 4), ("ring", 16)]
+    "pool, slots",
+    [("whole", 8), ("ring", 8), ("ring", 4), ("ring", 16), ("ring0", 8)],
 )
 def test_a_v41_window_ring_reached_through_its_pool_counts_once_a_slot(
     probed, pool, slots
 ):
     """V4.1's pool, `[rows, dim]` over its PAGEs and its state arena, as a
-    capture's 4 PAGEs held it. Taken whole, a row a request is the window ring
-    row its decode writes, in the arena: it counts once a slot pair of the 4
-    that 8 slots hold. Beside a ring cut from it (`ring_view`), at a leaf
-    stating its window and compress ratio, the whole pool's plane rows count
-    once a placement and the ring's once a slot pair, whether the capture held
-    the bench's 8 state slots or 4 or 16."""
+    capture's 4 PAGEs held it. Taken whole with its ring's window, a decode
+    row's token is the window ring row it writes, in the arena: it counts once
+    a slot pair of the 4 that 8 slots hold. Beside a ring cut from it
+    (`ring_view`), at a leaf stating its window of 8, the ring's rows a row's
+    window reads count once a slot pair, and the whole pool's selection, top-k
+    1 a row, once a placement, none at ratio 0; whether the capture held the
+    bench's 8 state slots or 4 or 16."""
     _, seen = probed
     placed = seen[f"ops_v41_{pool}_pool_{slots}"]
     [record] = placed["got"]
     assert placed["refused"] is None and record["placements"] == 7
     assert record["metadata"]["pool"] == "attn_metadata_builder.cache.pool"
-    pages = 0 if pool == "whole" else placed["read"] // 2
-    ring = placed["read"] - pages
+    ring = placed["ring"]
+    pages = placed["read"] - ring
     assert record["footprint_bytes"] == 7 * 32 + 7 * pages + 4 * ring
+
+
+@pytest.mark.parametrize("point, tokens, sets", [("verify", 12, 4), ("prefill", 32, 7)])
+def test_a_v41_window_ring_written_through_its_pool_counts_a_row_a_token(
+    probed, point, tokens, sets
+):
+    """`_launch_rope_window` and `swa_write` take V4.1's pool whole, with its
+    ring's window, and write a row a token into a request's ring, its ring's
+    rows at most: DSpark5's two verify rows of 6 tokens write 12 rows, once a
+    slot pair of the 4 that 8 slots hold, and a 32-token chunk past a cached
+    prefix its ring's 8, once a placement's slot."""
+    _, seen = probed
+    placed = seen[f"ops_v41_write_{point}"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert record["footprint_bytes"] == 7 * 16 * tokens + sets * placed["ring"]
