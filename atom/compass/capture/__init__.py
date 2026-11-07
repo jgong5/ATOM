@@ -49,6 +49,7 @@ another misses them, and its refusal names each field that differs.
 """
 
 import argparse
+import dataclasses
 import datetime
 import json
 import pathlib
@@ -131,7 +132,8 @@ def population_steps(names, tbo=False, drafters=False):
     overlap (`tbo`, ATOM's `enable_tbo`) a DP step the group split, by the
     rule `validate.bound` agrees over every rank's line at that step
     (`bound._split`), is its two micro-batches (`step_roofline.micro_batches`),
-    each a prefill at its own tokens and the group's rows of it. With
+    each a prefill at its own tokens and the group's rows of it, its line
+    holding its own rows. With
     `drafters`, a drafter's shape follows it where they differ: a decode's
     at its rows padded to `draft_bs`, else to its rung, a sampling prefill's
     or a DP middle chunk's with `draft_bs` as its `width`. A target that
@@ -186,7 +188,8 @@ def population_steps(names, tbo=False, drafters=False):
                 for half in halves:
                     rows = [(r.query_tokens, r.decode) for r in half.requests]
                     _, tokens, seqs = step_shape(rows, None)
-                    yield prefill(tokens, seqs, half.moe_rows).at(dp), line
+                    own = {"rows": [dataclasses.astuple(r) for r in half.requests]}
+                    yield prefill(tokens, seqs, half.moe_rows).at(dp), line | own
 
 
 def publish(store, graph, model, declared, tp, atom_args, command):

@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: MIT
+"""`compass measure ops --plan` and `--coverage` over a record whose DP group
+split a prefill step under two-batch overlap: each reads the step as its two
+micro-batches at their own rows, as `trace ops --population` traces it and
+`OpGraphBackend` prices it, and the plan refuses a graph only that call traces
+before it traces or measures anything. The bench and graphs are
+`test_bench_ops_plan`'s stand-ins.
+"""
+
+import json
+from types import SimpleNamespace
+
+import pytest
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
+from test_bench_ops_plan import CONFIG, _bench, _plan, bench  # noqa: F401  a fixture
+
+from atom.compass.artifacts import ArtifactRefusal, Rule
+from atom.compass.bench import ops
+from atom.compass.capture import forward
+
+#: Rank 0 prefills 9000 tokens, past the 8192-token bar, and rank 1 100: each
+#: cuts its own at the midpoint, each micro-batch gathering both ranks' rows of
+#: it (`test_op_graph_gathered`); then each decodes a row at its context.
+RANKS = ([[9000, 9000, False]], 1000), ([[100, 100, False]], 3000)
+HALVES = {"prefill T=4500 B=1 G=4550", "prefill T=50 B=1 G=4550"}
+WHOLE = {"prefill T=9000 B=1 G=9100", "prefill T=100 B=1 G=9100"}
+
+
+@pytest.fixture
+def split(tmp_path, monkeypatch):
+    """The record's directory, read under `--enable-tbo`."""
+    monkeypatch.setattr(CONFIG, "enable_tbo", True)
+    steps = tmp_path / "plan" / "steps"
+    steps.mkdir(parents=True)
+    (steps.parent / "run.json").write_text("{}")
+    for rank, (rows, context) in enumerate(RANKS):
+        prefill = {"step": 0, "rows": rows, "moe_rows": 9100, "rung": None}
+        decode = {"step": 1, "rows": [[1, context, True]], "moe_rows": 2, "rung": 1}
+        # 4500 tokens on each rank, under the bar: one step, its gather the default
+        even = prefill | {"step": 2, "rows": [[4500, 4500, False]], "moe_rows": 9000}
+        lines = (
+            json.dumps(s | {"is_dummy_run": False}) for s in (prefill, decode, even)
+        )
+        (steps / f"dp{rank}.jsonl").write_text("\n".join(lines) + "\n")
+    return str(steps.parent)
+
+
+def test_a_plan_loads_a_split_step_s_micro_batches_graphs_not_the_whole_step_s(
+    bench, tmp_path, split, monkeypatch  # noqa: F811
+):
+    loaded, stand_in = set(), ops.graph
+
+    def graph(store, config, shape, arch=None):
+        loaded.add(str(shape))
+        return stand_in(store, config, shape, arch)
+
+    monkeypatch.setattr(ops, "graph", graph)
+    _plan(bench, tmp_path, split)
+
+    assert HALVES <= loaded and not loaded & WHOLE
+
+
+def test_a_plan_reads_a_micro_batch_s_cached_tokens_off_its_own_rows(
+    bench, tmp_path, split  # noqa: F811
+):
+    records = _plan(bench, tmp_path, split)
+
+    # Rank 0's second micro-batch attends the 4500 tokens of its first.
+    prefill = [r for r in records if r["shape"].startswith("prefill")]
+    assert 4500 in {r["context"] for r in prefill if r["op"] == "aiter.attn"}
+
+
+def test_coverage_counts_a_split_step_as_its_micro_batches(
+    bench, tmp_path, split  # noqa: F811
+):
+    records = _plan(bench, tmp_path, split)
+    store, root, _, _ = bench
+
+    report = ops.coverage(store, root, CONFIG, [split], records, "gfx942")
+
+    assert report["by phase"]["prefill"] == {"steps": 6, "covered": 6}
+
+
+def test_a_plan_refuses_a_micro_batch_no_graph_holds_before_tracing_or_measuring(
+    bench, tmp_path, split, monkeypatch  # noqa: F811
+):
+    """`_bench` stands in for every child the plan starts, and takes no capture."""
+    store, root, key, run = bench
+
+    def empty(store, config, shape, arch=None):
+        raise ArtifactRefusal(Rule.RESOLUTION, f"no op_graph holds {shape}", "")
+
+    monkeypatch.setattr(ops, "graph", empty)
+    monkeypatch.setattr(forward, "device_arch", lambda: "gfx942")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "3")
+    config = SimpleNamespace(**vars(CONFIG), model="m")
+    args = SimpleNamespace(plan=[split], store=root, llc_mib=256)
+
+    with pytest.raises(ArtifactRefusal) as refused:
+        ops.plan(store, key, config, run, args, "plan", tmp_path, ["--enable-tbo"])
+
+    # `prefill T=4500 B=1`, the even step's, is one `--prefill 4500 1` names.
+    assert refused.value.what.startswith("no op_graph holds prefill T=4500 B=1 G=4550")
+    call = "compass trace ops --model m --tp 1 --arch gfx942 --gpu 3 --population"
+    call += f" {split} --store {root} -- --enable-tbo"
+    assert refused.value.remedy == f"trace it with {call}"
+    assert _bench.calls == 0
