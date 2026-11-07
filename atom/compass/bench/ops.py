@@ -205,7 +205,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 23
+PROTOCOL = 24
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -751,6 +751,8 @@ class Stub:
             for r in getattr(geometry, "layer_ratios", ())
             if r and hasattr(geometry, "rows_per_page")
         }
+        # and the rows a request's window ring holds at a layer
+        self.ring = getattr(geometry, "ring_slots", 0)
         # V4.1's FP8 index plane, whose prefill logits are as wide as the
         # step's KV blocks (`PAGE_WIDE`); the FP4 plane packs them over the
         # whole block table, which no context widens
@@ -1042,6 +1044,7 @@ class Stub:
         state slot a row holds."""
         need, size, shared = 1, 0, [0, 0]
         table, ids = GATHERED.get(op["op"], (None, None))
+        acts = [s for _, s in _specs(op["args"]) if s["role"] == "activation"]
         for slot, s in _specs(op["args"]):
             itemsize = _dtype(s["dtype"]).itemsize
             nbytes = _span(s["shape"], s["stride"]) * itemsize
@@ -1057,27 +1060,37 @@ class Stub:
                 # beside state slots a block view is one block a request, the
                 # one a decode compressor writes its row to, and a row view
                 # holding a state arena past its pages (`_state`) one row a
-                # request, the one its decode writes to its window ring there
+                # request
                 unit = rows if self.slots else blocks
                 name = self.kv.get((sig, slot), ("",))[0]
                 slotted = int(name in self.state)
                 stated = op.get("stated", {})
-                if "window_size" in stated and (ratio := stated["compress_ratio"]):
+                window = stated.get("window_size")
+                if window and (ratio := stated["compress_ratio"]):
                     # the rows the batch's blocks hold at its layer: a row
-                    # per `ratio` tokens; its window rows are left out. Read
-                    # by block, but by slot in a window ring: ATOM passes such
-                    # a row view whole or a ring cut from it (`ring_view`), so
-                    # one smaller than the widest the leaf takes of it
+                    # per `ratio` tokens; its window rows are left out
                     unit = blocks * self.runner.config.kv_cache_block_size // ratio
+                    slotted = 0
+                    # of which a request reads at most its indexer's top-k
+                    if top := stated.get("index_topk"):
+                        unit = min(unit, rows * top)
+                elif window and decode and self.state.get(name):
+                    unit = 0  # a decode reads its window from the ring alone
+                if self.state.get(name):
+                    # its window rings: a ring cut from it (`ring_view`), smaller
+                    # than the widest of it a leaf stating its window takes, read
+                    # a window a token, or the view a leaf given the ring's
+                    # `window` writes a row a token; a ring a request at most
                     widest = max(
                         _span(v["shape"], v["stride"]) * itemsize
                         for p, v in _specs(op["args"])
                         if self.kv.get((sig, p), ("",))[0] == name
                     )
-                    slotted = int(bool(self.state.get(name)) and nbytes < widest)
-                    # of which a request reads at most its indexer's top-k
-                    if top := stated.get("index_topk"):
-                        unit = min(unit, rows * top)
+                    given = op["args"].get("window")
+                    writes = isinstance(given, dict) and "object" in given
+                    if nbytes < widest if window else writes:
+                        reach = acts[0]["shape"][0] + rows * ((window or 1) - 1)
+                        unit, slotted = min(reach, rows * self.ring), 1
                 # an entry is the span of its other dims: a view may be strided
                 # by a whole state slot or by every layer's block, and a field
                 # laid out layers first, `[layers, slots, ...]`, is read a slot
