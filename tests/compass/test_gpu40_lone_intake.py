@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""A simulated run under the law file captured on mi355-gpu-40, whose per-byte
-intake rate lone requests of a served DeepSeek-V4.1-Flash cell's bodies read,
-charges the cell's mean body about what the cell's loop took to take it in."""
+"""A simulated run under the DeepSeek-V4-Pro EP8 decode law captured on
+mi355-gpu-40, whose HTTP intake is fitted on its own recorded server's lone
+requests, charges their mean body about what that loop took to take one in."""
 
 import asyncio
 import json
@@ -26,10 +26,9 @@ from atom.utils.compass_loop import CompassEventLoop, HttpChannel
 
 LAW = SPEC_ROOT / "scripts/compass/laws"
 GPU40 = LAW / "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-decode.json"
-#: The DeepSeek-V4.1-Flash TP4 DSpark5 cc-traces c=16 cell as a real recording
-#: at 0cd22bcc3 read it, over its long prompts: the mean body, and the loop's
-#: mean intake of one.
-CELL_BYTES, CELL_INTAKE_S = 388_200, 4.59e-3
+#: The law's decode-side record at 2d701d657 (cc-traces 256 to 392, c=16), over
+#: its lone requests: the mean body, and the loop's mean CPU time to take one in.
+CELL_BYTES, CELL_INTAKE_S = 509_461, 4.212e-3
 
 
 def test_a_simulated_run_on_gpu40_charges_a_lone_cell_body_what_the_cell_took(
