@@ -1148,7 +1148,9 @@ def test_v4_prefill_index_leaves_take_atom_s_lists_whole_by_ratio_past_cached_to
     # Bound by size, the writer's indptrs were `kv_indptr`, its batch ids
     # `top_ks`, its row scalars `context_lens`; a CSA layer's attention read the
     # HCA list, an HCA layer's the SWA one, both the indptr `kv_indptr`.
-    fill = "atom.model_ops.v4_kernels.paged_prefill_indices:write_v4_paged_prefill_indices"
+    fill = (
+        "atom.model_ops.v4_kernels.paged_prefill_indices:write_v4_paged_prefill_indices"
+    )
     attend = "aiter.pa_sparse_prefill_fp8_opus.default"
 
     def i32(*shape):
@@ -1225,7 +1227,11 @@ def test_v4_prefill_index_leaves_take_atom_s_lists_whole_by_ratio_past_cached_to
             (r, slot): (name, n)
             for r, kind in ((4, "csa"), (128, "hca"))
             for slot, name, n in (
-                ("kv_indices_prefix", f"kv_indices_prefix_{kind}", lists[f"prefix_{kind}"]),
+                (
+                    "kv_indices_prefix",
+                    f"kv_indices_prefix_{kind}",
+                    lists[f"prefix_{kind}"],
+                ),
                 ("kv_indptr_prefix", f"kv_indptr_prefix_{kind}", 7),
                 ("kv_indices_extend", "kv_indices_extend", 21),
                 ("kv_indptr_extend", "kv_indptr_extend", 7),
