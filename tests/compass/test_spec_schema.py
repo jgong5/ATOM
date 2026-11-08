@@ -917,13 +917,16 @@ def test_the_package_imports_only_the_standard_library_it_names(module):
     # a spec can be authored and checked on any machine: no device runtime, no
     # engine, and no document parser either -- turning a file into a mapping is
     # the caller's, which keeps a dependency the engine does not declare out of
-    # the path that reads a spec.
+    # the path that reads a spec. `pathlib` is here for `layers.py`, which finds
+    # a device datasheet or a network file by name or by path: reading a path is
+    # not a device runtime.
     allowed = {
         "collections",
         "dataclasses",
         "enum",
         "hashlib",
         "json",
+        "pathlib",
         "typing",
     }
     tree = ast.parse(module.read_text())
