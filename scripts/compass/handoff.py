@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Print a real recording's engine IO-thread queue handoffs against its step time.
 
-    PYTHONPATH=$T python3 scripts/compass/handoff.py RECORD_DIR
+    PYTHONPATH=$T python3 scripts/compass/handoff.py RECORD_DIR [LAW_FILE]
 
 Reads each ``dp<r>.handoff.jsonl`` a recorded engine writes beside its step
 record ``dp<r>.jsonl`` (`atom.compass.run.engine`). Segments: ``recv``, the
@@ -15,11 +15,12 @@ holds counts in ``[b, 2b)``. Per segment and bucket it prints N, p50 and p99
 in microseconds, and p99 as a share of the median step, the period between
 consecutive forward entries over every step. Then whether every p99 but
 ``queue``'s is under 1% of the step, and in the smallest prompt bucket the
-p10 of ``recv`` + ``queue`` and of ``recv`` + ``past pull`` beside the run
-file's ``ipc_s``.
+p10 of ``recv`` + ``queue`` and of ``recv`` + ``past pull``, beside the
+``ipc_s`` hop of `LAW_FILE`'s host laws when given.
 """
 
 import bisect
+import json
 import sys
 from collections import defaultdict
 from itertools import pairwise
@@ -28,14 +29,13 @@ from pathlib import Path
 import numpy as np
 
 from atom.compass.backends.json_file import read_jsonl
-from atom.compass.drive.runfile import FIXED
 
 
 def _bucket(n: int) -> int:
     return 1 << (max(n, 1).bit_length() - 1)
 
 
-def report(record) -> list[str]:
+def report(record, ipc_s: float | None = None) -> list[str]:
     segments, periods = defaultdict(list), []
     for path in sorted(Path(record).glob("dp*.handoff.jsonl")):
         steps = read_jsonl(path.with_name(path.name.replace(".handoff", "")))
@@ -79,10 +79,13 @@ def report(record) -> list[str]:
         ]
         rows.append(
             f"p10 at prompt bucket {first}: recv+queue {p10s[0]:.1f} us, "
-            f"recv+past pull {p10s[1]:.1f} us; ipc_s {FIXED['ipc_s'] * 1e6:.1f} us"
+            f"recv+past pull {p10s[1]:.1f} us"
+            + (f"; ipc_s {ipc_s * 1e6:.1f} us" if ipc_s is not None else "")
         )
     return rows
 
 
 if __name__ == "__main__":
-    print("\n".join(report(sys.argv[1])))
+    law = json.loads(Path(sys.argv[2]).read_text()) if len(sys.argv) > 2 else {}
+    ipc_s = law.get("host", {}).get("hops", {}).get("ipc_s")
+    print("\n".join(report(sys.argv[1], ipc_s)))

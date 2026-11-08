@@ -156,7 +156,7 @@ def test_a_1p1d_cell_hands_pd_sim_a_free_dp_master_port_for_each_side(tmp_path):
     traces = tmp_path / "traces.jsonl"
     traces.write_text('{"id": 0}\n')
     run_file = tmp_path / "run.json"
-    run_file.write_text(json.dumps({"kv_write_req_s": 2.0**-10}))
+    run_file.write_text(json.dumps({"router_s": 2.0**-12}))
     done = subprocess.run(
         [bash, str(SCRIPT), str(run_file), str(tmp_path / "cell")],
         cwd="/",

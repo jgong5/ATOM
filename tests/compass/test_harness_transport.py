@@ -87,7 +87,7 @@ class _Frontend:
     """Stand-in for the frontend LP's runtime: hands out the scripted stamps."""
 
     me = LpId("frontend")
-    table = single_engine_table(admission_path="serving", ipc_s=0.0, stream_s=0.0)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=0.0, stream_s=0.0)
 
     def __init__(self) -> None:
         self.arrival, self.seq = 0.0, 0

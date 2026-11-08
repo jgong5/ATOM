@@ -77,7 +77,7 @@ def _run(tmp_path, **entry):
     run = {
         "clock_endpoint": "tcp://127.0.0.1:0",
         "bound_s": 60.0,
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": IPC,
         "stream_s": 2.0**-12,
         "machine": machine,

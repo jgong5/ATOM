@@ -33,7 +33,7 @@ from atom.utils.distributed import utils
 from tests.compass import sync_scan
 
 TABLE = single_engine_table(
-    admission_path="serving", ipc_s=2.0**-14, stream_s=2.0**-12, dp=2
+    admission_s=0.54e-3, ipc_s=2.0**-14, stream_s=2.0**-12, dp=2
 )
 ENGINE, FRONTEND = LpId("engine"), LpId("frontend")
 REQUEST = "frontend->engine:request#dp1"

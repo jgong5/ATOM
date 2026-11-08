@@ -17,7 +17,9 @@ A simulated run also writes `dp<r>.cost.jsonl`, a line per step saying what
 its charge was made of (`_group_step_seconds` in
 `atom/compass/runner/overrides.py` says what each line holds).
 A 1P1D decode instance also writes `transfers.jsonl` (`transfers` in
-`__init__.py` says what it joins).
+`__init__.py` says what it joins). On a real Mooncake P/D side, every worker writes
+`dp<r>.tp<t>.writes.jsonl` too, a line per KV write it served or write-done it
+received (`writes.py` says what each line holds).
 
 Compare two records with
 
