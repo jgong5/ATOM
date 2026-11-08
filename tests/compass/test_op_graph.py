@@ -1421,6 +1421,15 @@ def _run_config(structure: str, model) -> SimpleNamespace:
     )
 
 
+def _spawned(monkeypatch) -> list:
+    """The lazy-trace processes the test's lookups spawn, as they spawn them."""
+    spawned, spawn = [], compass_run._trace_process
+    monkeypatch.setattr(
+        compass_run, "_trace_process", lambda: spawned.append(spawn()) or spawned[-1]
+    )
+    return spawned
+
+
 def _tracers() -> tuple[int, int]:
     """In a lookup's lazy-trace process: the tracers it made, and the traces
     that took one made before them."""
@@ -1452,11 +1461,7 @@ def test_a_run_s_lazy_traces_share_one_process_and_trace_as_a_process_each(
             alone[graph["shape"], output] = graph["region"]
     config = _run_config(graph["structure"], root / "model")
     args = ["--model", config.model, "-tp", "8", *DPA_TP8.split()[1:]]
-    spawned, spawn = [], compass_run._trace_process
-    monkeypatch.setattr(
-        compass_run, "_trace_process", lambda: spawned.append(spawn()) or spawned[-1]
-    )
-    lazy = _counts()
+    spawned, lazy = _spawned(monkeypatch), _counts()
     lookup = _op_graphs(str(tmp_path), config, "gfx950", args, lazy)
     warm = {}
     for phase, tokens, seqs in POOLS:
@@ -1472,6 +1477,36 @@ def test_a_run_s_lazy_traces_share_one_process_and_trace_as_a_process_each(
     # One process traced the three, its tracer made at the first and kept.
     made = spawned[0].submit(_tracers).result()
     assert (len(spawned), lazy["lazy_traces"], made) == (1, 3, (1, 2))
+
+
+def _held(atom_args) -> list[int]:
+    """In a lookup's lazy-trace process: the roles its tracer of the 27B under
+    `atom_args` holds after each of two more traces of a decode B=2."""
+    from atom.compass.capture.forward import decode
+    from atom.compass.drive.runfile import _engine_args, engine_only
+
+    model, kept = _engine_args(atom_args).model, tuple(engine_only(atom_args))
+    _, tracer = compass_run._tracer(model, 1, kept, "gfx942")
+    held = []
+    for _ in range(2):
+        for _ in tracer.trace([decode(2)], [decode(2)]):
+            pass
+        held.append(len(tracer.recorder.roles))
+    return held
+
+
+def test_a_warm_tracer_holds_no_role_of_a_storage_an_earlier_trace_freed(
+    tmp_path_factory, tmp_path, monkeypatch
+):
+    spawned = _spawned(monkeypatch)
+    lookup, _ = _lazily(tmp_path_factory, tmp_path)
+    assert isinstance(lookup("decode", 2, 2), dict)
+    model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
+
+    # Each trace adds its own storages' roles and drops those of storages that
+    # died: a run's thousands of shapes hold what one does.
+    held = spawned[0].submit(_held, ["--model", str(model)]).result()
+    assert held[0] == held[1], held
 
 
 def _alive(pid: int) -> bool:

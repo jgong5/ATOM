@@ -1523,6 +1523,9 @@ class Tracer:
         runner, recorder, fake_mode = self.runner, self.recorder, self.fake_mode
         stateful, v41, own = self.stateful, self.v41, self.own
         block_size = config.kv_cache_block_size
+        # A dead storage's role answers no later step: a runner stepped through
+        # many shapes holds the roles of what lives, not of all it ever made.
+        recorder.roles = {k: v for k, v in recorder.roles.items() if not k.expired()}
         blocks = max(
             KV_BLOCKS,
             *(_batch(s, block_size, max(CONTEXTS), True, drafts)[1] for s in shapes),
