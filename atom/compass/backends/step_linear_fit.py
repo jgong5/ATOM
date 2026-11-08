@@ -71,7 +71,7 @@ admits a request rather than charge it nothing, and the report says why under
 The same solver fits the host entry's ``tokenizer`` term on a recorded
 server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
 HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
-requests, over the body bytes their hull spans, and ``fixed_s`` from a burst.
+requests, ``fixed_s`` from a burst, and ``bytes`` over every request's body.
 
 Each equation is divided by its own label and the coefficients are bound to be
 non-negative. Steps whose relative residual is more than `MAD_K` scaled MADs
@@ -457,10 +457,10 @@ def _lone_calls(calls: list[dict], intake) -> list[dict]:
     return [c for c, k in zip(calls, lone) if k]
 
 
-def _intakes(path) -> tuple[list, list]:
+def _intakes(path) -> tuple[list, list, list]:
     """The HTTP intake stamps `path` holds as each lone request's ``(body
-    bytes, CPU seconds)``, and each burst's ``(body bytes, template start CPU
-    ns)`` per request.
+    bytes, CPU seconds)``, each burst's ``(body bytes, template start CPU
+    ns)`` per request, and every request's body bytes.
 
     A request is its app call and the body, template, pool job and engine send
     that follow it. A lone one found every earlier request sent and its own
@@ -500,22 +500,23 @@ def _intakes(path) -> tuple[list, list]:
             if len(run) > 1:
                 bursts.append(run)
             run = []
-    return lone, bursts
+    return lone, bursts, sizes
 
 
 def fit_intake(paths) -> tuple[dict, dict]:
     """The ``http_intake`` term over the intake stamps each record in `paths`
     holds (`_intakes`), and its report: ``idle_s`` and ``per_byte_s`` by the
-    host-law solver on the lone requests' CPU seconds over their body bytes,
-    whose hull is the term's ``bytes``; ``fixed_s`` the loop's CPU time per
+    host-law solver on the lone requests' CPU seconds over their body bytes;
+    ``bytes`` spans every request's body; ``fixed_s`` the loop's CPU time per
     request between template starts in the longest burst, less ``per_byte_s``
     times its mean body, each gap the next request's. Raises on too few lone
     requests or no burst."""
-    lone, bursts = [], []
+    lone, bursts, bodies = [], [], []
     for path in paths:
         got = _intakes(path)
         lone += got[0]
         bursts += got[1]
+        bodies += got[2]
     nbytes, seconds = np.array(lone, dtype=np.float64).reshape(-1, 2).T
     x = np.column_stack([np.ones(len(nbytes)), nbytes])
     (idle, per_byte), report = _host_law(x, seconds, INTAKE_FEATURES)
@@ -531,7 +532,7 @@ def fit_intake(paths) -> tuple[dict, dict]:
         "fixed_s": fixed,
         "per_byte_s": per_byte,
         "idle_s": idle,
-        "bytes": _span(report, "bytes"),
+        "bytes": [min(bodies), max(bodies)],
     }
     return term, report
 
