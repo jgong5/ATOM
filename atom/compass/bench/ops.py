@@ -2484,13 +2484,14 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
 
     steps = parts(args.plan, config)
     # a drafter's own decode shapes, past their steps': a leaf their width's
-    # graphs hold is that width's point
+    # graphs hold is that width's point. G and W are None or a count
     own = {
         shape
         for _, reads in steps
         for part, shape, *_ in reads
         if part == DRAFT and shape.phase == "decode" and shape != reads[0][1]
     }
+    own = sorted(own, key=str)
     steps = [(reads[0][1], line) for line, reads in steps]
     contexts = [
         c for s, line in steps if s.phase == "decode" for c in _rows(line, s.seqs)
@@ -2509,7 +2510,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             cached[s.seqs] += _cached(line)
     # first, so a graph only `trace ops --population` traces refuses before any point
     widths = {decode(s.seqs) for s in own}
-    shapes = prefills | own | widths
+    shapes = prefills | set(own) | widths
     _load(store, config, args.store, shapes, graphs, None, atom_args, args.plan, own)
     for s in own:
         width = graphs[decode(s.seqs)]
@@ -2553,7 +2554,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     r = r | {"token": key(r["shape"], r["context"], r["leaf"]).token()}
                 lines.write(json.dumps(r) + "\n")
 
-    decodes = [*rungs, *sorted(own, key=str)]
+    decodes = [*rungs, *own]
     measure_round(
         {(s, c): None for s in decodes for c in (min(contexts), max(contexts))}, 0
     )
