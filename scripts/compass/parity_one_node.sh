@@ -228,7 +228,8 @@ run, out, machine, model, store, port, width, lmcache, image_s, tp, sides, pp = 
 machine = json.loads(Path(machine).read_text())
 spec = {
     "clock_endpoint": f"tcp://127.0.0.1:{port}", "bound_s": 1e7,
-    "admission_path": "serving", "ipc_s": 2.0**-14, "stream_s": 2.0**-12,
+    # Declared, but for the node-18 HTTP transport, as the law files state it.
+    "admission_s": 0.54e-3, "ipc_s": 2.0**-14, "stream_s": 2.0**-12,
     "replay": f"{out}/real/record", "step_stub": {}, "machine": machine, "store": store,
     "data_parallel_size": int(width or 1), "out_dir": f"{out}/sim",
     "image_preprocess_s": float(image_s), "pipeline_parallel_size": int(pp),

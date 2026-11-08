@@ -90,7 +90,7 @@ def rt(monkeypatch, tmp_path):
     monkeypatch.setenv(compass_run.ENV, str(path))
     rt = LPRuntime(
         LpId("frontend"),
-        single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002),
+        single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002),
         _GrantAll(),
     )
     clock.install(rt)

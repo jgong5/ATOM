@@ -84,7 +84,7 @@ sharp test, and it disqualifies most candidates:
 | device peaks, capacity and the in-node fabric | yes, but read from the device today | **a device datasheet**, per SKU — because the requirement is that they are *configured*, not probed (`05` D24) |
 | derates, bandwidth curve, kernel floor, link latencies, PP carriers | yes, but read from the device today | **a `platform_readings` entry**, per (device, stack, PTL, torch), which `compass fit device` publishes (`05` D26) |
 | the scale-out network | yes | **a network file**, per network, which only a run across nodes reads (`05` D25) |
-| tokenizer throughput, HTTP intake, the router's hop | yes | **host laws**: the `host_laws` entry's `tokenizer` and `http_intake` terms, which `compass fit host` fits (`05` D25, `07` D38); the router's hop is among the host transport constants [#2714](https://github.com/jgong5/ATOM/issues/2714) moves there, until then an assumed constant in code (`05` D25) |
+| tokenizer throughput, HTTP intake, the router's hop | yes | **host laws**: the `host_laws` entry's `tokenizer` and `http_intake` terms, which `compass fit host` fits (`05` D25, `07` D38); the other hops are its `hops` (`01`, Lookahead sources), and the router's hop joins them ([#3009](https://github.com/jgong5/ATOM/issues/3009)), until then an assumed constant (`05` D25) |
 | the runtime and library memory readings (`03` D14) | yes, read from the device | **not a setting**: a `memory_readings` entry per configuration, which `compass measure memory` takes on the target (`07` D38) |
 | where the Clock Authority listens | **no** | **Compass flag** |
 | which artifact store to read | **no** | **Compass flag** |
@@ -332,11 +332,12 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
   - *One Clock Authority, the script's.* A simulated deployment shares one standalone
     authority (`01` D3.3). The script builds the deployment's one run file from `run`'s
     flags, as `run` builds its own (`atom/compass/drive/runfile.py::prefill_decode`),
-    and the prefill-decode keys from the platform flags, the layout and fixed code: each
-    side's DP width from its ATOM arguments, `router_s` an assumed constant fixed in
-    code (`05` D25), `kv_link` from the layout, `intra_node` on one node and
-    `inter_node` across two, and `kv_write_req_s`, a node-18
-    measurement fixed in code as `ipc_s` is. Its `out_dir` is the deployment directory and its
+    and the prefill-decode keys from the platform flags, the layout and the host laws:
+    each side's DP width from its ATOM arguments, `router_s` an assumed constant
+    (`05` D25), `kv_link` from the layout, `intra_node` on one node and `inter_node`
+    across two, and each side's hops from the `host_laws` entry fitted under its engine
+    config, prefill's at the top level, `kv_write_req_s` among them, and decode's under
+    `decode_hops` (`01`, Lookahead sources). Its `out_dir` is the deployment directory and its
     `clock_endpoint` the authority's. The script starts the authority on it
     (`python -m atom.compass.run`), then each instance as
     `compass run --join RUN_FILE --out D/<side> -- <ATOM args>`.
@@ -453,7 +454,7 @@ Audited, because an absent flag is a decision and should be a visible one:
 | a workload, the client's settings | no command starts the client: a client started apart sends them, and grading reads which traces it served from the client run |
 | acceptance rate for speculative decoding | **ATOM's own flag** — `--spec-decode-acceptance-length` / `--spec-decode-acceptance-rate` already exist (`14` D83) |
 | thread-pool widths | ATOM's, per `05` D24 |
-| the run file's lookaheads, bound and admission path | fixed in code: `ipc_s`, `ipc_out_s` and `stream_s` are node-18 medians in `atom/compass/drive/runfile.py::FIXED`; a deployment's write request's `kv_write_req_s` is the node-18 hop uncontended, a p10, in `KV_WRITE_REQ_S` there, a deployment's `router_s`, the router's hop, is an assumed constant beside it, a host transport cost and no network's (`05` D25), and a router LP's `router_in_s` borrows `ipc_s`, since Atomesh logs no receipt to measure it from; `run` always drives the API server |
+| the run file's lookaheads and bound | the bound is fixed in code (`atom/compass/drive/runfile.py::FIXED`); the hops come from the `host_laws` entry's `hops`, each a floor where no entry states it (`01`, Lookahead sources); a deployment's `router_s`, the router's hop, is an assumed constant, a host transport cost and no network's (`05` D25), and a router LP's `router_in_s` borrows `ipc_s`, since Atomesh logs no receipt to measure it from; `run` always drives the API server, so there is no admission path to choose |
 | the model's parameter count, the DP width | read from the model directory and from ATOM's arguments |
 
 ---

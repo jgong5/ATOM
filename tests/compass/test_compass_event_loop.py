@@ -46,7 +46,7 @@ from atom.utils.compass_loop import (
     wrap_encode,
 )
 
-TABLE = single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002)
+TABLE = single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002)
 TRAFFIC, FRONTEND, ENGINE = LpId("traffic"), LpId("frontend"), LpId("engine")
 HTTP = "traffic->frontend:http"
 INF = math.inf
@@ -876,7 +876,7 @@ def test_a_cancel_on_the_relay_hangs_its_request_up_at_its_arrival_never_the_soc
     1, is stamped at 1. The app serving request 0 reads ``http.disconnect`` at
     the cancel's arrival, and the cancel reaches no app: it is answered 204."""
     table = prefill_decode_table(
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=0.001,
         stream_s=0.002,
         router_s=2.0**-12,

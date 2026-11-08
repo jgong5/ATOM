@@ -968,14 +968,16 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   `ModuleRef("runner.<attr>")`. Any other object that pickle reduces to its class and a
   dict of attributes, each attribute contract-legal in turn, is recorded in that shape
   (`ir.nodes.Reduced`): its class by `module:qualname` and its state, an enum member by
-  its value, a plain dict by its items. Anything else, a callable among it, refuses the
-  leaf by its type. Widening to the runner's whole object graph or the full reduce
-  protocol is additive, and a refusal on an in-scope configuration forces it.
+  its value, a plain dict by its items, a NamedTuple by its fields, which a callee reads
+  by name (DeepSeek-V4.1's FP4 index plane,
+  [#3001](https://github.com/jgong5/ATOM/issues/3001)). Anything else, a callable among
+  it, refuses the leaf by its type. Widening to the runner's whole object graph or the
+  full reduce protocol is additive, and a refusal on an in-scope configuration forces it.
   [#1812's census](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6296604735)
   holds the Triton MoE's `RoutingData`, `ExptData`, `Bitmatrix` and
   `DequantScaleRoundingMode` and V4's `UnifiedPoolGeometry`, `ClassLayout` and
   `WindowParams` this way, and finds no argument that is a runner attribute. `measure
-  ops` does not rebuild such an argument yet
+  ops` rebuilds such an argument as the replay does
   ([#1853](https://github.com/jgong5/ATOM/issues/1853)).
 - **An integer that moves with the context is stored affine in it.** A decode shape is
   traced at two contexts; an integer argument that differs between them is stored as
@@ -1085,14 +1087,17 @@ the DP and EP widths when set, the phase, the mode, and whether the step produce
 output. That engine config holds the KV block size and dtype, the quantization's hash,
 the parallel layout, TBO, speculation when it is on, `moe_backend`, `eplb_enable` and
 `enable_decoder_swa_bounded_replay` when
-they are off ATOM's default, and the performance environment
+they are off ATOM's default, the `index_cache_dtype` ATOM resolved where it differs
+from `kv_cache_dtype` (the [ruling on #2981](https://github.com/jgong5/ATOM/issues/2981)),
+and the performance environment
 (`atom.benchmarks.results.metadata.PERFORMANCE_KEYS`) less the client's `AIPERF_*`
 variables and the device selection; ATOM's Triton expert and GEMM switches
 (`ATOM_USE_TRITON_MOE`, `ATOM_USE_TRITON_MOE_A4W4`, `ATOM_USE_TRITON_MOE_DECODE`,
 `ATOM_USE_TRITON_GEMM`) are in it, and ATOM's prefill token buckets
 (`ATOM_TOKEN_GRAPH_SIZES`) only when ATOM reads them off its default. One store holds V4-Pro graphs of one shape that
-differ only in `kv_cache_dtype`, or only in `ATOM_USE_TRITON_MOE`, and each run reads its
-own.
+differ only in `kv_cache_dtype`, only in `ATOM_USE_TRITON_MOE`, or only in the index
+cache dtype ATOM resolves for a P/D side and for a plain start at gfx950
+(`atom/config.py::Config.__post_init__`), and each run reads its own.
 
 A run, or `measure ops`, that finds no graph at its key where the store holds one at
 the same shape and otherwise the same structure refuses, naming each engine field that
@@ -1532,7 +1537,7 @@ Deferred to future work by decision on 2026-09-18.
 | D18 | Capture with `TorchDispatchMode` + `FakeTensorMode`, on FakeTensor rather than bare meta, at concrete shapes: one graph per decode width and prefill (T, B) that `trace ops` is given or that a record directory's steps hold. The symbolic route A and its four disciplines (the fourth: the engine's host arithmetic asks a symbol for a number, so a symbolic capture keeps the conversion, logs it with its line, and asserts that log against a stated set) are recorded, not built. Under a drafter a step that samples is two graphs, the target's and the drafter's, cut at `forward_done_event`; a block drafter's draft-KV pass before that event is a third, priced among the target's terms. A mono runner binds and builds its widths as its deployment does: a refusal the deployment makes too is declared, any other bind or build failure refused by name | 2026-09-18, fourth discipline 2026-09-22; concrete 2026-10-18 (#1489); drafter 2026-10-21 (#1270); block drafter 2026-10-30 (#2345); mono 2026-10-31 (#2560) |
 | D18.1 | `torch.export` recorded as an unverified alternative; rejected now on decomposition fidelity and on capturing a model call rather than an engine step | 2026-09-18 |
 | D19 | Hierarchical, concrete, stream-annotated IR: `Seq` / `Repeat` / `Par`, a node's arguments its leaf contract. No branches in the IR — applicability is a discrete key and the captured shape, matched by equality | 2026-09-18; revised 2026-10-18 (#531); concrete 2026-10-18 (#1489) |
-| D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride, role by provenance (activation, weight, KV, metadata) and preshuffled mark, non-tensor arguments and module references kept, a runner attribute as `runner.<attr>`, any other object in pickle's reduce shape or refused by its type. A raw Triton (`JITFunction.run`, a warmup aside) or FlyDSL (`JitFunction.__call__`, `CompiledFunction.__call__`) launch lifts to the first function its `module:qualname` names, past the languages' frames, closures and generic launchers, and so does a direct `CompiledKernel` launch. Nested launching calls and custom ops fold into the outermost; arguments come from call entry in a traced step that follows two untraced steps of its shape; each contract must replay to the same kernels and operators outside torch's, and a launch outside a found function, a raise after a launch or a call open at the step's end is refused. An `op_graph` is keyed by the step law's engine config less its ladder, the performance environment in it, and a miss names each differing field; keying on a kernel-selecting environment variable is a workaround for an ATOM design that should take the choice as an argument. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401); lift rule and key 2026-10-20 (#1811); two untraced steps 2026-10-21 (#1812); preshuffled mark 2026-10-22 (#1953); compiled kernels lift 2026-10-28 (#2344) |
+| D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride, role by provenance (activation, weight, KV, metadata) and preshuffled mark, non-tensor arguments and module references kept, a runner attribute as `runner.<attr>`, any other object in pickle's reduce shape or refused by its type. A raw Triton (`JITFunction.run`, a warmup aside) or FlyDSL (`JitFunction.__call__`, `CompiledFunction.__call__`) launch lifts to the first function its `module:qualname` names, past the languages' frames, closures and generic launchers, and so does a direct `CompiledKernel` launch. Nested launching calls and custom ops fold into the outermost; arguments come from call entry in a traced step that follows two untraced steps of its shape; each contract must replay to the same kernels and operators outside torch's, and a launch outside a found function, a raise after a launch or a call open at the step's end is refused. An `op_graph` is keyed by the step law's engine config less its ladder, the performance environment in it, and a miss names each differing field; keying on a kernel-selecting environment variable is a workaround for an ATOM design that should take the choice as an argument. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401); lift rule and key 2026-10-20 (#1811); two untraced steps 2026-10-21 (#1812); preshuffled mark 2026-10-22 (#1953); compiled kernels lift 2026-10-28 (#2344); NamedTuple arguments 2026-11-08 (#3001) |
 | D21 | Stated nodes over chased coverage, their terms declared; refuse and record `unpriced` reasons; a failed forward writes no graph. The MoE exchanges are the first stated nodes | 2026-09-18; revised 2026-10-14 (#952); MoE exchanges 2026-10-19 (#1401) |
 | D22 | Liveness stays observational under fake tensors; internal scratch of an opaque leaf is a stated per-leaf constant. Revised: until capture lands the activation term is a coefficient measured on a real run, scratch inside it, and the walk replaces it after | 2026-09-18; revised 2026-10-10 |
 | D23 | Trace eager, price with the regime constant of the real step. The inductor fusion gap (~4.8% decode) is a documented **TODO**, not a decision. | 2026-09-18 |

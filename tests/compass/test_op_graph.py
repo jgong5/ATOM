@@ -1459,7 +1459,7 @@ def test_a_run_file_op_graph_traces_from_the_server_s_arguments(monkeypatch, tmp
 
 
 def test_the_run_summary_totals_each_engine_s_lazy_traces(monkeypatch, tmp_path):
-    run = {"admission_path": "serving", "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+    run = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
     run.update(bound_s=100.0, client_runs=None, out_dir=str(tmp_path))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     authority = compass_run._RecordingAuthority(run)

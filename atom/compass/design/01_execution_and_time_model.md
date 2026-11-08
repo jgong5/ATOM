@@ -798,17 +798,27 @@ receives it itself, at its own receive point.
 
 | Channel | Sender | Receiver (mode) | Lookahead |
 |---|---|---|---|
-| `traffic->frontend:http` | Compass traffic source | event loop (inline) | modelled admission delay. Path-specific; the values and what each was measured on are in `channels.py::ADMISSION_DELAY_S`. On the serving path it is the HTTP transport only, client send to the ASGI app call (#1381): the loop's intake after that call is the host laws' `http_intake`, charged by `HttpChannel` (`06` D33). Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. 1P+1D adds the router hop. |
-| `frontend->traffic:stream` | event loop, writing the SSE stream | traffic source (inline) | `stream_s`, measured (`drive/runfile.py::FIXED`) |
-| `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_request` | engine input thread, `poller.poll()` in `engine_core.py::EngineCore.process_input_sockets` (thread) | `ipc_s`, measured (`drive/runfile.py::FIXED`) |
-| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | `ipc_s`, measured (`drive/runfile.py::FIXED`) |
-| `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | `ipc_out_s`, measured (`drive/runfile.py::FIXED`); `ipc_s` when a run file has none |
+| `traffic->frontend:http` | Compass traffic source | event loop (inline) | `admission_s`, the HTTP transport alone, client send to the ASGI app call (#1381): the loop's intake after that call is the host laws' `http_intake`, charged by `HttpChannel` (`06` D33). Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. 1P+1D adds the router hop. |
+| `frontend->traffic:stream` | event loop, writing the SSE stream | traffic source (inline) | `stream_s` |
+| `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_request` | engine input thread, `poller.poll()` in `engine_core.py::EngineCore.process_input_sockets` (thread) | `ipc_s` |
+| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | `ipc_s` |
+| `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | `ipc_out_s` |
 | `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | the router's per-request forward cost (D7) |
-| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker. For a request that finishes before its write request, aborted while it waits, the scheduler-side `request_finished` (`scheduler.py::Scheduler._cleanup_aborted_load`) sends instead the notice that none will come, which retires prefill's send claim (Mooncake's `MSG_ABORT`) | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline); under prefill PP the head's, `engine-P-pp0` (D6) | stated request latency (D6) |
+| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker. For a request that finishes before its write request, aborted while it waits, the scheduler-side `request_finished` (`scheduler.py::Scheduler._cleanup_aborted_load`) sends instead the notice that none will come, which retires prefill's send claim (Mooncake's `MSG_ABORT`) | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline); under prefill PP the head's, `engine-P-pp0` (D6) | `kv_write_req_s`, a stated request latency (D6) |
 | PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py::PPStageTransport.send_metadata` / `send_tokens` / `send_kv_status` | the stage loop's own poll and receive (inline) | stated IPC delay: each is one ZMQ message, as on the frontend channels; the head's batch to stage `k` is `meta#pp<k>`. The hidden states between stages are `pp_data` (`15` D91). |
 | `engine-P->engine-D:prefill_done` (RapidServe only, in neither M1 nor M2) | prefill step loop, direct send in `engine_core.py::PrefillEngineCore._process_engine_step` | decode handler thread `DecodeEngineCore._recv_prefill_done`, `sock.recv()` (thread) | stated IPC delay |
 | `engine-D->engine-P:block_assignment` (RapidServe only, in neither M1 nor M2) | decode step loop, direct send in `engine_core.py::DecodeEngineCore._send_block_assignment` | prefill handler thread `PrefillEngineCore._recv_block_assignments`, `sock.recv()` (thread) | stated IPC delay |
 | `engine->lmcache:lookup#dpN`, `engine->lmcache:transfer#dpN.tpK` and their replies (`ATOM_KV_OFFLOAD=lmcache_mp` only) | D6.1 | D6.1 | stated `lmcache_ipc_s` |
+
+Each hop's lookahead is the run-file key of its name, which `drive/runfile.py` writes
+from the `hops` of the `host_laws` entry (`09` D54): `admission_s`, `ipc_s`,
+`ipc_out_s`, `stream_s` and `kv_write_req_s`. A prefill-decode run takes each side's
+from its own instance's entry, the one fitted under that instance's engine config: the
+top-level keys are prefill's, `decode_hops` holds decode's `ipc_s`, `ipc_out_s` and
+`stream_s`, and the write request, received by prefill, is prefill's. A hop no entry
+states takes one floor, 2^-14 s (`run.HOP_FLOOR_S`), and the run summary lists it under
+`unmeasured_hops`. Not 0 s: a zero lookahead puts every serving run on the
+deadlock-recovery path (Invariants). Each hop is one value, the delay it charges.
 
 The RapidServe rows exist only under `--enable-rapidserve` (D2), whose prefill and decode
 `EngineCore`s are two engine LPs of one deployment; they are the only channels received
@@ -1469,14 +1479,24 @@ launch_end = max(h, R7 - W_recv) + W_launch    # non-first PP stage: R7, the met
                                                # holds the launch after W_recv
 start      = max(end[n-1], h, R7)
 target_end = start + D_target
-end        = max(target_end + D_draft, launch_end)
 exit       = max(launch_end, R1) + W_post      # no MTP: R1 for an output forward
+end        = max(target_end, exit) + D_draft   # no draft: max(target_end, launch_end)
 charge     = exit - now                        # the K1 TAR: advance_to(exit)
 ```
 
 `end` and `target_end` are the runner's device state, kept across forwards; they never
 touch the clock. A device-bound forward charges device time and a host-bound one host
 time.
+
+**The draft starts no earlier than the exit** (owner ruling on
+[#2917](https://github.com/jgong5/ATOM/issues/2917#issuecomment-6686075949), 2026-11-06).
+The host queues a forward's drafter passes before it exits (the `propose` pass in
+`postprocess`, just before the draft copy wait), and a pass the device reaches first waits
+for it. So `max(target_end, exit)` bounds the draft's start for every drafter, one graph
+or serial passes alike, adds no host segment, and errs only by the host time after the
+pass. The draft's end reaches the timeline only through the next forward's `start` and
+R4, which a late pass moves only when it outlasts the next forward's `E + W_pre +
+W_inputs`.
 
 **After the return: `E_out`** (owner ruling on
 [#1345](https://github.com/jgong5/ATOM/issues/1345), 2026-10-18). `Scheduler.postprocess`,
