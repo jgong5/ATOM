@@ -79,7 +79,7 @@ def _template(path: Path, **extra) -> Path:
     }
     path.write_text(json.dumps(run))
     env = DEFAULTS | dict(os.environ)
-    if "kv_write_req_s" in run:
+    if "router_s" in run:
         publish_pd_entries(run["store"], machine, env)
     else:
         argv = ["--model", MODEL, *env["SERVER_ARGS"].split()]
