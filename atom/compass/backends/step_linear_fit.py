@@ -683,15 +683,15 @@ def _fit_form(
             full, solved = solve(a[steps, pick][keep], b[keep])
             if (price(full).argmax(axis=1)[keep] == pick[keep]).all():
                 c, cols, on = full, solved, picked
-                continue
-            d, f, t = full - c, cost(c), 1.0
-            moves = np.abs(price(full - c)[real & keep[:, None]]).max()
-            while cost(c + t * d) >= f and t * moves > tol:
-                t /= 2
-            if t * moves <= tol:
-                stop = "tie"
-                break
-            c, cols, on = c + t * d, solved, picked if t == 1 else None
+            else:
+                d, f, t = full - c, cost(c), 1.0
+                moves = np.abs(price(full - c)[real & keep[:, None]]).max()
+                while cost(c + t * d) >= f and t * moves > tol:
+                    t /= 2
+                if t * moves <= tol:
+                    stop = "tie"
+                    break
+                c, cols, on = c + t * d, solved, picked if t == 1 else None
         residual = price(c).max(axis=1) - b
         centre = np.median(residual)
         mad = 1.4826 * np.median(np.abs(residual - centre))
