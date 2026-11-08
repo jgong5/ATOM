@@ -39,8 +39,9 @@ is the max over its ranks, so each vector is fitted by max-affine regression
 each step's price picks, a step line-searched until it lowers the squared
 relative error, until no step changes rank or the step's ranks tie; MAD drops
 rerun it. The vector's solve, warm steps and hull read each step's row at the
-rank it prices the step as (`priced_rank`); a decode rung that adopts a
-column (below) is fitted again under it. Each
+rank it prices the step as (`priced_rank`); so does each form a decode rung
+chooses among, MoE column and `rowmod` (below), and each held-out fold
+that chooses, which prices a step as the max over its ranks. Each
 vector reports, under `fit.all_rows`, the centre and scaled MAD of the fit on
 every rank's row, each step priced as its max over ranks, and under
 `fit.passes` the passes, how they stopped, `settled` or `tie`, and the
@@ -726,46 +727,63 @@ def _fit_form(
     }
 
 
-def _folds(design, y, cell, names) -> dict:
-    """Per record of `cell` beside which another holds rows, (its rows, the p50
-    error on them of the solve of `design` on the other records' rows)."""
+def _fit_vector(steps, vector: dict, routing) -> dict:
+    """`_fit_steps` of `steps` on the features `vector` names under
+    `coefficients`, as `_counts` counts them."""
+    return _fit_steps(
+        steps,
+        list(vector["coefficients"]),
+        lambda r: _counts(vector, routing, r[2], *r[5:]),
+    )
+
+
+def _folds(steps, vector: dict, routing) -> dict:
+    """Per record beside which another holds steps, (its steps, the p50 error
+    on them, each priced as the max over its ranks, of `_fit_vector` of
+    `vector` on the other records' steps)."""
+    cell = np.array([s[0][0] for s in steps])
     out = {}
     for c in sorted(set(cell.tolist())):
         other = cell != c
         if other.any():
-            coef = _solve(design[other], y[other], names)["coef"]
-            error = design[~other] @ coef / y[~other] - 1.0
-            out[c] = (int((~other).sum()), float(np.median(error)))
+            fold = [s for s, o in zip(steps, other) if o]
+            coef = _fit_vector(fold, vector, routing)["coef"]
+            error = [
+                max(np.dot(coef, _counts(vector, routing, r[2], *r[5:])) for r in s)
+                / s[0][3]
+                - 1.0
+                for s, o in zip(steps, other)
+                if not o
+            ]
+            out[c] = (len(error), float(np.median(error)))
     return out
 
 
-def _moe_column(members, x, names, routing) -> tuple:
-    """The MoE column decode rung `members` adopts, or None, and the figures the
-    rule read, as the vector records them under `fit.moe_column`.
+def _moe_column(steps, routing) -> tuple:
+    """The vector decode rung `steps` adopts with a MoE column, or None, and the
+    figures the rule read, as the vector records them under `fit.moe_column`.
 
-    `members` are the rung's `fit` rows, `x` their design over `names`. The
-    forms are no column and each of `MOE_COLUMNS` over the steps' real MoE
-    tokens, `moe_experts` under `routing` and with each step's group dummies
-    as one token (`moe_column`). Each form is solved with each record
-    held out of the rung's rows, and its held-out error is the mean over the
+    `steps` are the rung's steps, each its ranks' `fit` rows. The forms are no
+    column and each of `MOE_COLUMNS` over the steps' real MoE tokens,
+    `moe_experts` under `routing` and with each step's group dummies as one
+    token (`moe_column`). Each form is fitted with each record held out of the
+    rung's steps (`_folds`), and its held-out error is the mean over the
     records of the held-out p50 error's magnitude, weighted by the record's
     steps. The form of smallest held-out error is picked, no column on a tie,
-    and a picked column is adopted, returned as (feature, column, solve). A
+    and a picked column is adopted, returned as the vector `_counts` reads. A
     rung of one record has no held-out error and adopts none.
     """
-    cell = np.array([r[0] for r in members])
-    y = np.array([r[3] for r in members])
-    forms = {"none": (x, names)}
-    for feature in MOE_COLUMNS:
-        column = [moe_column(feature, r[6], routing, r[7]) for r in members]
-        forms[feature] = (np.column_stack([x, column]), [*names, feature])
+    forms = {"none": {"coefficients": list(DECODE)}}
+    forms |= {f: {"coefficients": [*DECODE, f]} for f in MOE_COLUMNS}
     held, error = {}, {}
-    for form, (design, wide) in forms.items():
-        folds = _folds(design, y, cell, wide)
+    for form, vector in forms.items():
+        folds = _folds(steps, vector, routing)
         held[form] = folds
-        steps = sum(n for n, _ in folds.values())
+        held_steps = sum(n for n, _ in folds.values())
         error[form] = (
-            sum(n * abs(p) for n, p in folds.values()) / steps if steps else None
+            sum(n * abs(p) for n, p in folds.values()) / held_steps
+            if held_steps
+            else None
         )
     picked = min(error, key=error.get) if held["none"] else None
     adopted = None if picked in (None, "none") else picked
@@ -780,60 +798,57 @@ def _moe_column(members, x, names, routing) -> tuple:
             for form in forms
         },
     }
-    if adopted is None:
-        return None, figures
-    design, wide = forms[adopted]
-    return (adopted, design[:, -1], _solve(design, y, wide)), figures
+    return (None if adopted is None else forms[adopted]), figures
 
 
-def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None:
+def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing):
     """The `rowmod(k)` column decode rung `rung` adopts, or None.
 
-    `members` are the rung's `fit` rows, `x` their design over `names`, `base`
-    its solve without the column.
+    `steps` are the rung's steps, each its ranks' `fit` rows, `vector` the
+    rung's form without the column and `base` its `_fit_vector`.
     `k` runs over the powers of two up to the rung. A `k` qualifies when its
-    solve cuts `base`'s scaled MAD by `ROWMOD_GAIN`, the mean MAD of the same
-    solve over `ROWMOD_SHUFFLES` shuffles of each step's rows, by `seed`, does not,
-    and no record (a cell) priced by a solve on the others has a p50 error
-    further from zero than without the column. Every cell
+    fit cuts `base`'s scaled MAD by `ROWMOD_GAIN`, the mean MAD of the same
+    fit over `ROWMOD_SHUFFLES` shuffles of each rank's rows, by `seed`, does
+    not, and no record (a cell) priced by a fit on the others (`_folds`) has a
+    p50 error further from zero than without the column. Every cell
     needs `ROWMOD_CELL_STEPS` steps at the rung, and a rung needs two cells.
-    The qualifying `k` of smallest MAD is adopted: returned with its solve and
+    The qualifying `k` of smallest MAD is adopted: returned with its fit and
     the evidence the law records.
     """
-    cell = np.array([r[0] for r in members])
+    cell = np.array([s[0][0] for s in steps])
     cells = sorted(set(cell.tolist()))
     if len(cells) < 2 or min((cell == c).sum() for c in cells) < ROWMOD_CELL_STEPS:
         return None
-    y = np.array([r[3] for r in members])
-    rng = np.random.default_rng(seed)
-    shuffles = [
-        [rng.permutation(r[5]) for r in members] for _ in range(ROWMOD_SHUFFLES)
-    ]
-    wide = [*names, "rowmod"]
 
-    def mad(rows, k):
-        column = [rowmod(r, k) for r in rows]
-        return _solve(np.column_stack([x, column]), y, wide)["mad"]
+    def wide(k):
+        return {"coefficients": [*vector["coefficients"], "rowmod"], "rowmod": k}
 
-    def p50(design):
-        folds = _folds(design, y, cell, wide[: design.shape[1]])
-        return [p for _, p in folds.values()]
+    def shuffled_mad(k):
+        # The same shuffles at every `k`.
+        rng, mads = np.random.default_rng(seed), []
+        for _ in range(ROWMOD_SHUFFLES):
+            moved = [
+                [(*r[:5], rng.permutation(r[5]), *r[6:]) for r in s] for s in steps
+            ]
+            mads.append(_fit_vector(moved, wide(k), routing)["mad"])
+        return float(np.mean(mads))
 
-    without, best, k = p50(x), None, 2
+    def p50(v):
+        return [p for _, p in _folds(steps, v, routing).values()]
+
+    without, best, k = p50(vector), None, 2
     target = (1.0 - ROWMOD_GAIN) * base["mad"]
     while k <= rung:
-        column = np.array([rowmod(r[5], k) for r in members], dtype=np.float64)
-        design = np.column_stack([x, column])
-        solved = _solve(design, y, wide)
+        solved = _fit_vector(steps, wide(k), routing)
         if solved["mad"] < min(target, best[1]["mad"] if best else target):
-            shuffled_mad = float(np.mean([mad(s, k) for s in shuffles]))
-            held = p50(design)
-            if shuffled_mad >= target and all(
+            shuffled = shuffled_mad(k)
+            held = p50(wide(k))
+            if shuffled >= target and all(
                 abs(w) <= abs(o) for w, o in zip(held, without)
             ):
                 evidence = {
                     "mad_without": base["mad"],
-                    "shuffled_mad": shuffled_mad,
+                    "shuffled_mad": shuffled,
                     "held_out_p50": {
                         str(c): [o, w] for c, o, w in zip(cells, without, held)
                     },
@@ -1031,28 +1046,15 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             solved = _fit_steps(steps, names, lambda r: r[2])
         rowmod_k = figures = None
         if key and key.isdigit():
-            # The column and `rowmod` are chosen on the base form's rows.
-            members, base = solved["rows"], solved
-            counts = np.array([r[2] for r in members], dtype=np.float64)
+            vector = {"coefficients": names}
             if routing:
-                chosen, figures = _moe_column(members, counts, names, routing)
+                chosen, figures = _moe_column(steps, routing)
                 if chosen:
-                    feature, column, base = chosen
-                    counts = np.column_stack([counts, column])
-                    names = [*names, feature]
-            chosen = _rowmod(members, counts, int(key), base, seed, names)
+                    vector, solved = chosen, _fit_vector(steps, chosen, routing)
+            chosen = _rowmod(steps, int(key), vector, solved, seed, routing)
             if chosen:
-                rowmod_k, _, evidence = chosen
-                names = [*names, "rowmod"]
-            if len(names) > len(DECODE):
-                adopted = {"coefficients": names}
-                if rowmod_k:
-                    adopted["rowmod"] = rowmod_k
-                solved = _fit_steps(
-                    steps,
-                    names,
-                    lambda r, v=adopted: _counts(v, routing, r[2], *r[5:]),
-                )
+                rowmod_k, solved, evidence = chosen
+            names = [*vector["coefficients"], *["rowmod"] * bool(rowmod_k)]
         members = solved["rows"]
         slow = ~solved["keep"] & (solved["residual"] < 0)
         once = solved["residual"] < 1 / WARM_FACTOR - 1
