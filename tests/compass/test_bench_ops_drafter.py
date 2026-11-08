@@ -50,17 +50,21 @@ OWN[False, True] = OWN[True, KV]
 
 def _parted(store, config, shape, arch=None, output=True, draft=False):
     """The target's graph, or a part of the drafter's, as `trace ops` keeps
-    them: a decode has no middle chunk's. A decode's drafter runs its block at
-    the step's width, B, and stages its anchors at its rows, T, as
-    DeepSeek-V4.1's DSpark drafter does."""
+    them: a decode has no middle chunk's, and one padded past its rows its
+    drafter's alone. A decode's drafter runs its block at the step's width, B,
+    and stages its anchors at its rows, T, and past them cuts its rows from
+    the width's, as DeepSeek-V4.1's DSpark drafter does."""
+    padded = shape.phase == "decode" and shape.tokens < shape.seqs
+    if shape.phase == "decode" and not output or padded and draft is not True:
+        raise ArtifactRefusal(Rule.RESOLUTION, f"no op_graph holds {shape}", "")
     if not draft:
         return _graph_at(store, config, shape, arch)
-    if shape.phase == "decode" and not output:
-        raise ArtifactRefusal(Rule.RESOLUTION, f"no op_graph holds {shape}", "")
     rows = shape.tokens if shape.phase == "prefill" else shape.seqs
     own = [_leaf(OWN[output, draft], ("x", _t([rows, 8], "activation")))]
     if shape.phase == "decode" and draft is True:
         own.append(_anchor(shape.tokens))
+    if padded:
+        own.append(_leaf("aiter.cut", ("x", _t([shape.seqs, 3], "activation"))))
     return _graph(*own, layers=1)
 
 
@@ -102,20 +106,23 @@ def test_a_plan_measures_a_drafter_s_parts_and_coverage_reads_each_step_s(
     shapes = {r["shape"] for r in records if r["op"] == "aiter.propose"}
     assert shapes == {r["shape"] for r in records if r["op"] == "aiter.gemm"}
     # The decode padded past its rows runs its drafter at `decode T=1 B=2`: its
-    # block is the width's, measured at rung 2, its anchors a point there.
+    # block is the width's, measured at rung 2, its anchors and cut points there.
     rungs = {"decode B=1", "decode B=2", "decode B=4"}
     anchors = {r["shape"] for r in records if r["op"] == "aiter.anchor"}
     assert anchors == rungs | {"decode T=1 B=2"} and rungs <= shapes
+    assert {r["shape"] for r in records if r["op"] == "aiter.cut"} == {"decode T=1 B=2"}
     assert {r["op"] for r in records} == {
         "aiter.attn",
         "aiter.gemm",
         "aiter.anchor",
+        "aiter.cut",
         *OWN.values(),
     }
     report = ops.coverage(store, root, DRAFTING, [steps], records, "gfx942")
     # Each step reads its target's and its drafter's graphs; one that samples
     # also its draft-KV pass's; a middle chunk its drafter's alone. The padded
-    # decode's drafter is read at its own shape.
+    # decode's drafter is read at its own shape, each leaf at the rows it ran:
+    # its cut, measured there alone, at its one row.
     assert report["by part"] == {
         "target": {"steps": 5, "covered": 5},
         "draft": {"steps": 5, "covered": 5},
