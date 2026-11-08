@@ -161,3 +161,16 @@ def test_a_decode_whose_device_reached_its_propose_pass_first_gives_no_draft_lab
         n: (pytest.approx(10e-3), None if n == 3 else pytest.approx(0.5e-3))
         for n in kept
     }
+
+
+def test_a_traced_output_prefill_keeps_a_host_paced_draft_label(tmp_path):
+    """A prefill's draft label is a trace run's busy time, which leaves out
+    the device's wait for the host: step 3 as an output prefill keeps its
+    pass's 0.5 ms."""
+    path = _record(tmp_path / "dp0.jsonl", [0, 0, 0, 9.625, 0, 0, 9, 0])
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    lines[3] |= {"rows": [[64, 214, False]], "b_target_ns": 10 * MS}
+    lines[3]["b_draft_ns"] = MS // 2
+    path.write_text("".join(json.dumps(s) + "\n" for s in lines))
+    [(samples, _)] = label_run([path])
+    assert {s.step: s.draft_s for s in samples}[3] == pytest.approx(0.5e-3)
