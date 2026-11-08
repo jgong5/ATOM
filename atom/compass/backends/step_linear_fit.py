@@ -578,22 +578,36 @@ def fit_hops(intakes, clients) -> tuple[dict, dict]:
 
 
 def _alone(sent, got, returned=None) -> tuple[np.ndarray, np.ndarray]:
-    """The arrival and ``got - sent`` of each message alone on its hop, `sent`
-    and `got` paired in order: sent once the one ahead of it arrived, and
-    arrived before the next was sent. With `returned`, the return of each send
+    """The arrival and ``got - sent`` of each message alone on its hop: sent
+    once every message ahead of it arrived, and arrived before the next was
+    sent. One side may miss messages the other saw, as a client misses those
+    in flight at its stop (`_paired`). With `returned`, the return of each send
     call, made one at a time, a message is timed from it, and is not alone when
-    it arrived first. Raises unless one arrival follows each send."""
+    it arrived first. Raises on a side with no message."""
     sent, got = np.sort(np.array(sent, np.int64)), np.sort(np.array(got, np.int64))
-    if len(sent) != len(got) or (got <= sent).any():
-        raise ValueError(
-            f"{len(got)} arrivals, not one after each of {len(sent)} sends"
-        )
-    edge = np.iinfo(np.int64).max
-    alone = (got < np.r_[sent[1:], edge]) & (np.r_[-edge, got[:-1]] < sent)
+    if not len(sent) or not len(got):
+        raise ValueError(f"{len(sent)} sends and {len(got)} arrivals")
+    if len(got) >= len(sent):
+        k, i = _paired(sent, got)
+    else:  # in reverse time each arrival is a send, and each send an arrival
+        i, k = _paired(-got[::-1], -sent[::-1])
+        k, i = len(sent) - 1 - k, len(got) - 1 - i
     if returned is not None:
         sent = np.sort(np.array(returned, np.int64))
-        alone &= got > sent
-    return got[alone], (got - sent)[alone]
+    took = got[i] - sent[k]
+    return got[i][took > 0], took[took > 0]
+
+
+def _paired(sent, got) -> tuple[np.ndarray, np.ndarray]:
+    """The indices into `sent` and `got`, both sorted, of each message alone:
+    exactly one arrival between its send and the next, and as many before its
+    send as at any send before it. `got` may hold arrivals whose sends `sent`
+    misses, each raising that count for good."""
+    before = np.searchsorted(got, sent, "right")
+    upto = np.searchsorted(got, np.r_[sent[1:], np.iinfo(np.int64).max], "right")
+    ahead = before - np.arange(len(sent))
+    alone = (upto - before == 1) & (ahead == np.maximum.accumulate(ahead))
+    return np.flatnonzero(alone), before[alone]
 
 
 def _hop_messages(intake: Path, client) -> dict:

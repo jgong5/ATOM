@@ -43,8 +43,10 @@ def hopped(directory, alone=10, raw=RAW + ".gz") -> None:
     `alone` messages taking the hop's `PLANTED` time, then two in flight at
     once taking `OVERLAP`; on ``ipc_s`` each received inside a forward, and two
     more alone: one taking `OVERLAP`, received once the engine left its last,
-    and one received before its send call returned. The client's raw records
-    are written as `raw` beside the export."""
+    and one received before its send call returned. On ``admission_s`` and
+    ``stream_s`` the client missed one more request, one the server took in
+    between the fourth and fifth, which leaves the fourth not alone. The
+    client's raw records are written as `raw` beside the export."""
     steps = directory / "steps"
     forwards = [json.loads(x) for x in (steps / "dp0.jsonl").read_text().splitlines()]
     windows = [(s["t_enter_ns"], s["t_exit_ns"]) for s in forwards]
@@ -74,6 +76,10 @@ def hopped(directory, alone=10, raw=RAW + ".gz") -> None:
         lines += [_stamp("app", a, a), _stamp("body", a + 100, a + 200, 9000)]
     lines += [_stamp("out", g, g + 10) for _, g in outputs]
     lines += [_stamp("head", s - 10, s) for s, _ in stream]
+    missed = admission[3][1] + 10**6, stream[3][1] + 10**6
+    lines += [_stamp("app", missed[0], missed[0])]
+    lines += [_stamp("body", missed[0] + 100, missed[0] + 200, 9000)]
+    lines += [_stamp("head", missed[1] - 10, missed[1])]
     (steps / compass_run.INTAKE_RECORD).write_text("\n".join(lines) + "\n")
     (steps / compass_run.TOKENIZER_RECORD).write_text(json.dumps(TOKENIZER) + "\n")
     handoff = [{"t_recv_ns": g, "prompt_tokens": 9} for _, g in ipc]
@@ -107,9 +113,8 @@ def test_each_hop_is_the_p10_of_its_messages_alone_on_it_and_a_run_takes_it(
     host = member(tmp_path / "store", key, "params")
     report = member(tmp_path / "store", key, "report")
     assert host["hops"] == pytest.approx({h: ns * 1e-9 for h, ns in PLANTED.items()})
-    assert {h: report["hops"][h]["messages"] for h in PLANTED} == dict.fromkeys(
-        PLANTED, 10
-    )
+    messages = {h: report["hops"][h]["messages"] for h in PLANTED}
+    assert messages == {"admission_s": 9, "ipc_s": 10, "ipc_out_s": 10, "stream_s": 9}
     assert not {k for k in report["unfitted"] if k.startswith("hops")}
     # A run built on the published entry charges them on its channels.
     token = ArtifactStore(tmp_path / "store").read(key).key.token()
@@ -139,7 +144,7 @@ def test_a_hop_the_records_cannot_give_is_left_out_and_listed_unfitted(tmp_path)
     assert {k: v for k, v in report["unfitted"].items() if k.startswith("hops")} == {
         "hops.admission_s": f"{stamps}: no {RAW} beside {a / 'client.json'}",
         "hops.stream_s": f"{stamps}: no {RAW} beside {a / 'client.json'}",
-        "hops.ipc_s": f"{stamps}: 0 arrivals, not one after each of 14 sends",
+        "hops.ipc_s": f"{stamps}: 14 sends and 0 arrivals",
         "hops.ipc_out_s": f"{stamps}: 12 rows taken in, not the 0 put",
     }
 
