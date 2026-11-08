@@ -17,6 +17,10 @@ each rank sizes its pool from its own free memory. DP ranks whose engine files
 state different bounds otherwise refuse the entry, naming each. A speculative
 engine's stop writes ``steps/dp<r>.acceptance.json``, which `compass run
 --acceptance-record` reads.
+Beside them the frontend writes ``steps/tokenizer.jsonl``, each call of the
+served tokenizer with its tokens and its start and end, under a line naming
+the tokenizer's backend and fingerprint, and ``steps/intake.stamps``, each HTTP
+request's intake stamps with its body's bytes (`atom.compass.run.tokenizer`).
 One record spans the server's lifetime, every
 client run it served included; `parity.served` splits it per client run.
 

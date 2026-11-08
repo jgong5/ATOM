@@ -183,7 +183,7 @@ composed per runner, so the host floor the prior work established, `t_step = max
 launches × h)`, leaves both granularities. The `max` it states survives in `01` D4's
 recurrence, whose device `end` is no earlier than `launch_end`, which plays the part of
 `launches × h`. The launch time comes from the measured `W_launch` host law (`09`
-D54), not from `host.*`. The evidence below is why that `max` is kept. `t0` is the
+D54), not from the machine spec. The evidence below is why that `max` is kept. `t0` is the
 device's own floor on one kernel, not this host floor.
 
 The step roofline has no host bound (owner ruling on

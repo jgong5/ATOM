@@ -68,6 +68,11 @@ on too few such forwards give `admit` null, so a run refuses a forward that
 admits a request rather than charge it nothing, and the report says why under
 `unfitted`.
 
+The same solver fits the host entry's ``tokenizer`` term on a recorded
+server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
+HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
+requests, over the body bytes their hull spans, and ``fixed_s`` from a burst.
+
 Each equation is divided by its own label and the coefficients are bound to be
 non-negative. Steps whose relative residual is more than `MAD_K` scaled MADs
 from the median are dropped and the rest refitted, until the kept set settles.
@@ -181,6 +186,10 @@ ROWMOD_GAIN = 0.1
 ROWMOD_SHUFFLES = 8
 HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
+#: What a lone HTTP request's intake costs: per request, and per body byte.
+INTAKE_FEATURES = ("idle", "bytes")
+#: What a lone tokenizer call costs: per call, and per token.
+TOKENIZER_FEATURES = ("fixed", "tokens")
 #: What a forward that admits requests spends once, per prompt token past the
 #: prefix-cache hit and per token within it (`step_labels.admit_x`).
 ADMIT_FEATURES = ("admits", "uncached", "cached")
@@ -348,6 +357,185 @@ def fit_host(samples) -> tuple[dict, dict]:
     return host, report
 
 
+def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
+    """The ``tokenizer`` term over the lone calls (`_lone_calls`) each
+    tokenizer record in `paths` holds, beside the intake stamps in `intakes`,
+    and its report: the records' backend and fingerprint, and per kind of
+    call, ``fixed_s + tokens / tokens_per_s`` by the host-law solver on the
+    calls' wall seconds.
+    One-item ``encode_batch`` calls are ``encode``'s and several-item ones
+    their own kind. A ``decode`` with no positive slope is ``fixed_s`` alone
+    over ``tokens``, the ``[lo, hi]`` token counts its calls span. A kind the
+    calls cannot give is left out and its reason listed under the report's
+    ``unfitted``; the report gives each record's p10, p50 and p90 relative
+    residual per kind. Raises on records of two tokenizers."""
+    from scipy.spatial import QhullError
+
+    heads, rows = {}, []
+    for i, (path, intake) in enumerate(zip(paths, intakes)):
+        head, *lines = Path(path).read_text().splitlines()
+        heads[json.dumps(json.loads(head), sort_keys=True)] = None
+        for c in _lone_calls([json.loads(line) for line in lines], intake):
+            kind = c["call"] if c["items"] > 1 or c["call"] == "decode" else "encode"
+            s = (c["t_end_ns"] - c["t_start_ns"]) * 1e-9
+            rows.append((i, kind, c["tokens"], s))
+    if len(heads) != 1:
+        raise ValueError(f"the records name {len(heads)} tokenizers: {sorted(heads)}")
+    term, report = json.loads(next(iter(heads))), {"unfitted": {}}
+    for kind in ("encode", "encode_batch", "decode"):
+        got = np.array([r[2:] for r in rows if r[1] == kind and r[3] > 0])
+        record = np.array([r[0] for r in rows if r[1] == kind and r[3] > 0])
+        try:
+            if not len(got):
+                raise ValueError(f"the records hold no lone {kind} call")
+            x = np.column_stack([np.ones(len(got)), got[:, 0]])
+            coef, fitted = _host_law(x, got[:, 1], TOKENIZER_FEATURES)
+        except (ValueError, QhullError) as e:
+            report["unfitted"][kind] = str(e)
+            continue
+        if coef[1] > 0:
+            term[kind] = {"fixed_s": coef[0], "tokens_per_s": 1 / coef[1]}
+        elif kind == "decode":
+            term[kind] = {"fixed_s": coef[0], "tokens": _span(fitted, "tokens")}
+        else:
+            report["unfitted"][kind] = f"{kind}'s calls take no time per token"
+            continue
+        error = x @ coef / got[:, 1] - 1
+        fitted["records"] = {
+            str(p): np.percentile(error[record == i], [10, 50, 90]).tolist()
+            for i, p in enumerate(paths)
+            if (record == i).any()
+        }
+        report[kind] = fitted
+    return term, report
+
+
+def _span(fitted: dict, name: str) -> list:
+    """The ``[lo, hi]`` of the one feature `name` of `_host_law`'s report."""
+    if name in fitted["hull"]["equal"]:
+        return [fitted["hull"]["equal"][name]] * 2
+    (_, lo), (_, hi) = fitted["hull"]["facets"]
+    return [lo, -hi]
+
+
+def _stamps(path) -> list[tuple]:
+    """The HTTP intake stamps `path` holds (`atom.compass.run.INTAKE_RECORD`),
+    each ``(start ns, end ns, kind, size, start cpu ns, end cpu ns)``, in order
+    of start."""
+    rows = [line.split() for line in Path(path).read_text().splitlines()]
+    return sorted(
+        (int(r[3]), int(r[0]), r[2], int(r[4]), int(r[6]), int(r[5])) for r in rows
+    )
+
+
+def _requests(ev) -> tuple[list, np.ndarray]:
+    """Each request's app call among the stamps `ev`, in order, and every
+    engine send's end, sorted."""
+    apps = [e[0] for e in ev if e[2] == "app"]
+    # A request's app call is the last before its body's first read; any
+    # other, such as a health probe's, has no body.
+    calls = sorted(
+        {apps[np.searchsorted(apps, e[0]) - 1] for e in ev if e[2] == "body"}
+    )
+    return calls, np.array(sorted(e[1] for e in ev if e[2] == "send"))
+
+
+def _lone_calls(calls: list[dict], intake) -> list[dict]:
+    """The tokenizer calls among `calls` that ran lone: no other call, and no
+    request's intake (`_requests` over the stamps in `intake`) in flight from
+    the call's start to its end but, for an encode, its own."""
+    apps, sends = _requests(_stamps(intake))
+    calls = sorted(calls, key=lambda c: c["t_start_ns"])
+    start = np.array([c["t_start_ns"] for c in calls])
+    end = np.array([c["t_end_ns"] for c in calls])
+    before = np.maximum.accumulate(np.r_[-math.inf, end[:-1]])
+    after = np.r_[start[1:], math.inf]
+    arrived = np.searchsorted(apps, end, "right") - np.searchsorted(apps, start)
+    flight = np.searchsorted(apps, start) - np.searchsorted(sends, start)
+    own = np.array([c["call"] != "decode" for c in calls])
+    lone = (before < start) & (after > end) & (arrived == 0) & (flight <= own)
+    return [c for c, k in zip(calls, lone) if k]
+
+
+def _intakes(path) -> tuple[list, list]:
+    """The HTTP intake stamps `path` holds as each lone request's ``(body
+    bytes, CPU seconds)``, and each burst's ``(body bytes, template start CPU
+    ns)`` per request.
+
+    A request is its app call and the body, template, pool job and engine send
+    that follow it. A lone one found every earlier request sent and its own
+    sent before the next app call, with nothing else stamped between: its
+    seconds are the CPU time the loop's thread spent from the app call to the
+    send's end, less what it spent from its pool job's submit to its resume
+    (``wait``), the job's and other requests' work. A burst is a run of requests each of whose app call came
+    before the template of the one ahead of it began, the loop taking them in
+    one after another."""
+    ev = _stamps(path)
+    at = [e[0] for e in ev]
+    cpu = {e[0]: e[4] for e in ev if e[2] == "app"}
+    calls, sends = _requests(ev)
+    lone = []
+    for i, (call, after) in enumerate(zip(calls, calls[1:] + [math.inf])):
+        span = ev[np.searchsorted(at, call, "right") : np.searchsorted(at, after)]
+        between = [e for e in span if e[2] not in ("app", "recv", "wait")]
+        waits = sum(e[5] - e[4] for e in span if e[2] == "wait")
+        if np.searchsorted(sends, call) != i or [e[2] for e in between] != [
+            "body",
+            "tmpl",
+            "prep",
+            "send",
+        ]:
+            continue
+        body, *_, send = between
+        lone.append((body[3], (send[5] - cpu[call] - waits) * 1e-9))
+    # The loop renders each request's template as soon as its body is read.
+    tmpl = [e for e in ev if e[2] == "tmpl"]
+    sizes = [e[3] for e in sorted(ev, key=lambda e: e[1]) if e[2] == "body"]
+    # A template whose start finds a later request arrived and not yet rendered.
+    queued = [np.searchsorted(calls, t[0]) > k + 1 for k, t in enumerate(tmpl)]
+    bursts, run = [], []
+    for k, t in enumerate(tmpl):
+        run.append((sizes[k], t[0], t[4]))
+        if not queued[k]:
+            if len(run) > 1:
+                bursts.append(run)
+            run = []
+    return lone, bursts
+
+
+def fit_intake(paths) -> tuple[dict, dict]:
+    """The ``http_intake`` term over the intake stamps each record in `paths`
+    holds (`_intakes`), and its report: ``idle_s`` and ``per_byte_s`` by the
+    host-law solver on the lone requests' CPU seconds over their body bytes,
+    whose hull is the term's ``bytes``; ``fixed_s`` the loop's CPU time per
+    request between template starts in the longest burst, less ``per_byte_s``
+    times its mean body, each gap the next request's. Raises on too few lone
+    requests or no burst."""
+    lone, bursts = [], []
+    for path in paths:
+        got = _intakes(path)
+        lone += got[0]
+        bursts += got[1]
+    nbytes, seconds = np.array(lone, dtype=np.float64).reshape(-1, 2).T
+    x = np.column_stack([np.ones(len(nbytes)), nbytes])
+    (idle, per_byte), report = _host_law(x, seconds, INTAKE_FEATURES)
+    if not bursts:
+        raise ValueError(f"no burst among {len(lone)} lone requests")
+    sizes, starts, cpu = np.array(max(bursts, key=len), dtype=np.float64).T
+    fixed = np.diff(cpu).mean() * 1e-9 - per_byte * sizes[1:].mean()
+    report["burst"] = {
+        "requests": len(sizes),
+        "span_s": (starts[-1] - starts[0]) * 1e-9,
+    }
+    term = {
+        "fixed_s": fixed,
+        "per_byte_s": per_byte,
+        "idle_s": idle,
+        "bytes": _span(report, "bytes"),
+    }
+    return term, report
+
+
 def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
     """The host law on `names` over the forwards `x` labelled `y`, the part
     `offset` of each label fixed, and its report. Raises on too few forwards or
@@ -356,9 +544,10 @@ def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
     x = np.array(x, dtype=np.float64).reshape(-1, len(names))
     if len(x) <= len(names):
         raise ValueError(f"{len(x)} forwards for {len(names)} coefficients")
-    width = 3 if np.linalg.matrix_rank(x[:, 1:]) == 2 else 2
-    if width == 2:
-        x[:, 2] = 0.0
+    width = len(names)
+    if np.linalg.matrix_rank(x[:, 1:]) < width - 1:
+        width -= 1
+        x[:, width] = 0.0
     s = _solve(x, np.array(y), list(names), np.array(offset), names[0])
     hull = _hull(x[s["keep"]][:, 1:width], names[1:width])
     return s["coef"].tolist(), {
