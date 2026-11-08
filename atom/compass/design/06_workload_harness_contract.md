@@ -5,8 +5,8 @@ interview and reviewed by jgong5 across two review rounds on PR #3. No code has 
 written against it yet; implementation follows the execution plan in `16`.
 
 **Depends on:** `01_execution_and_time_model.md` (the Clock Authority, its channels and
-the K1-K9 mechanisms), `05_machine_spec_and_probes.md` (the host terms the tokenizer
-model needs).
+the K1-K9 mechanisms), `05_machine_spec_and_probes.md` D25 (the host laws' tokenizer and HTTP intake
+terms the service model reads).
 
 **Scope.** How traffic reaches a simulated ATOM: the contract any harness must satisfy,
 the wire protocol, the per-harness adapter, and the serving-side costs the harness makes
@@ -488,8 +488,8 @@ rule as the forward pass.
 
 | Stage | Where | Concurrency | Service time |
 |---|---|---|---|
-| encode | default `ThreadPoolExecutor` | the executor's actual width, **minus the wait jobs resident when the run starts** | `encode_fixed_s + tokens / encode_tokens_per_s` |
-| decode | engine output thread, per stream per step | **1**, one station per output thread | `2 x (decode_fixed_s + window / decode_tokens_per_s)` |
+| encode | default `ThreadPoolExecutor` | the executor's actual width, **minus the wait jobs resident when the run starts** | `encode.fixed_s + tokens / encode.tokens_per_s` |
+| decode | engine output thread, per stream per step | **1**, one station per output thread | `2 x (decode.fixed_s + window / decode.tokens_per_s)` |
 | encode or decode on the loop thread | the API server's event loop: the final `decode` of a non-streaming completion (`delivered_text`) in `generate_async`, `generate_async_multimodal` and `generate_async_fanout`, the reasoning-channel `decode` of a token-id prompt in `chat_completions`, and the `encode` and `decode` calls in `anthropic_messages` and `responses_create` | **1**, the loop itself | the same terms per call, over the tokens it encodes or decodes |
 
 A loop-thread call is not a station job. The event loop is the frontend LP's clock owner,
@@ -500,8 +500,9 @@ completes inside the call hands its result on when the call ends, as on a real l
 whatever wall time its thread took ([#1231](https://github.com/jgong5/ATOM/issues/1231)).
 Outside the simulation window it is charged nothing.
 
-Terms come from `host.tokenizers[]` in the machine spec (doc 05 D25), populated by the
-`spec` package's class-0 tokenizer probe (doc 05 D26).
+Terms come from the `tokenizer` term of the run's `host_laws` entry (`05` D25), which
+`compass fit host` fits from the calls a `compass record` server served (`07` D38, Phase
+1c).
 
 **The encode and decode stages are resource stations** (revised 2026-09-28, #443; PDES
 term: a multi-server FIFO queue). The simulated run installs its own default executor on
@@ -558,13 +559,13 @@ requests reach the tokenizer pool over 744 ms. Handed to the pool at one instant
 encode station passes the burst to the engine shortest-first, and step 1 admits about
 twice the real count (225 against 109; [#1103](https://github.com/jgong5/ATOM/issues/1103)).
 So `HttpChannel` (`atom/utils/compass_loop.py`) charges the frontend LP's clock
-`host.http_intake.fixed_s + body bytes x host.http_intake.per_byte_s` (doc 05 D25) for each
+`http_intake.fixed_s + body bytes x http_intake.per_byte_s`, the host laws' terms (`05` D25), for each
 stamped request it takes in, a cancel excepted, once the body is read and before the app
 runs: an event cost, as a tokenizer call on the loop is. The clock stands still until every
 open encode job is placed and the callbacks due by then have run, so an encode that
 completes inside an intake hands its result on when the intake ends, whatever wall time
 its real thread took. A request that arrives once the last intake has ended is charged
-`host.http_intake.idle_s` in place of `fixed_s` (revised 2026-10-20,
+`http_intake.idle_s` in place of `fixed_s` (revised 2026-10-20,
 [#1775](https://github.com/jgong5/ATOM/issues/1775)). In a burst, `fixed_s` is the loop's
 whole time per request: between two template starts the loop also parses the next request
 and finishes earlier ones after their encode (the result, `add_request`, the response
@@ -572,8 +573,8 @@ start). A lone request waits for none of that, only for its own path: from the A
 to its tokenizer pool job, and from the job's end to its engine send, as
 `scripts/compass/http_intake.py idle` reads it. Both parts are charged at the intake, which
 starts the encode later by the second part and leaves the engine arrival unchanged. On
-node 18 `idle_s` is 0.82 ms against a `fixed_s` of 2.61 ms. A spec with no `idle_s`
-charges `fixed_s` to every request, and a run file with no machine spec charges nothing. The client's own
+node 18 `idle_s` is 0.82 ms against a `fixed_s` of 2.61 ms. What an entry without the
+term or without `idle_s` charges is `05` D25's. The client's own
 send spread is not modelled. The `http` channel's admission delay
 (`channels.py::ADMISSION_DELAY_S`) stays the channel's lookahead and ends at the app call,
 where the idle intake starts, so the two do not overlap. A burst's `fixed_s` holds
@@ -590,7 +591,8 @@ apart ([#2580](https://github.com/jgong5/ATOM/issues/2580)). The HTTP transport,
 is the `serving` admission delay, 0.54 ms. The loop's intake, 4.59 ms, is charged `idle_s`
 plus `per_byte_s` per body byte, 4.20 ms on these 388 KB bodies: `per_byte_s` is the 8.05 ns
 per byte that lone requests of the cell's own bodies read, where a V4-Pro first-turn burst's
-slope, 3.85, charged 2.59 ms ([#2681](https://github.com/jgong5/ATOM/issues/2681)). The
+slope, 3.85, charged 2.59 ms ([#2681](https://github.com/jgong5/ATOM/issues/2681)), which
+is why `fit host` fits `per_byte_s` on lone requests (`07` D38, Phase 1c). The
 tokenizer pool job's work outside the segment tokenizer call, 5.86 ms, is charged nothing; most of it is ATOM copying
 the prompt's ids from a list back into an array, ATOM's to fix
 ([#2680](https://github.com/jgong5/ATOM/issues/2680)). The last 0.63 ms, from the engine
@@ -1045,7 +1047,7 @@ requires genuine fan-out in every root is not constructible without reusing sess
 | D30 | Piggyback the simulated timeline on `kv_transfer_params`; Atomesh needs zero changes on that path. Revised: three carriers, `tracestate` on the request, a `kv_transfer_params` field on the forward and SSE comment lines on the stream; still zero Atomesh changes. | 2026-09-18; revised 2026-09-28 |
 | D31 | Filler token is non-EOS, decodes to complete standalone ASCII, and is derived from the request id. | 2026-09-18 |
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
-| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. Revised: both are resource stations; encode width excludes the wait jobs resident when the run starts, pool jobs are classified by a registry and unregistered ones refused, and a clock read inside a job is its start plus accumulated service time. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. Revised: it does so only once every open encode job is placed. Revised: taking in an HTTP request charges the loop `fixed + body bytes x per_byte` from `host.http_intake`, so a burst reaches the pool one request at a time. Revised: a request that arrives once the last intake has ended is charged `idle_s` in place of `fixed`. Revised: the segment tokenizer's `encode_batch` of a long prompt's uncached segments is charged by the same encode terms over the ids it returns; its own work around that call is charged nothing. Revised: a serial encode of the segments takes within 10% of what those terms charge; a parallel batch's excess is ATOM's (#2617), and the call's own work waits for host laws that time it (#2618). Revised: the pool job's work outside its tokenizer calls is charged nothing; on a long prompt most of it is ATOM's copy of the ids (#2680). Revised: the server's other threads stretch a segment tokenizer call that runs alone only by its GIL waits; calls that overlap wait for each other's GIL-bound work, which the encode station does not model (#2693). | 2026-09-18; revised 2026-09-28, 2026-10-03, 2026-10-16 (#1103), 2026-10-20 (#1775), 2026-10-26 (#1231), 2026-10-31 (#2558), 2026-11-01 (#2577) and 2026-11-02 (#2580, #2619) |
+| D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. Revised: both are resource stations; encode width excludes the wait jobs resident when the run starts, pool jobs are classified by a registry and unregistered ones refused, and a clock read inside a job is its start plus accumulated service time. A tokenizer call on the event loop thread (the final `decode` of a non-streaming completion, the calls in `anthropic_messages`) is no station job: it advances the frontend LP clock by its service time on the loop. Revised: it does so only once every open encode job is placed. Revised: taking in an HTTP request charges the loop `fixed + body bytes x per_byte` from `host.http_intake`, so a burst reaches the pool one request at a time. Revised: a request that arrives once the last intake has ended is charged `idle_s` in place of `fixed`. Revised: the segment tokenizer's `encode_batch` of a long prompt's uncached segments is charged by the same encode terms over the ids it returns; its own work around that call is charged nothing. Revised: a serial encode of the segments takes within 10% of what those terms charge; a parallel batch's excess is ATOM's (#2617), and the call's own work waits for host laws that time it (#2618). Revised: the pool job's work outside its tokenizer calls is charged nothing; on a long prompt most of it is ATOM's copy of the ids (#2680). Revised: the server's other threads stretch a segment tokenizer call that runs alone only by its GIL waits; calls that overlap wait for each other's GIL-bound work, which the encode station does not model (#2693). Revised: the tokenizer and HTTP intake terms are the run's `host_laws` entry's, fitted by `compass fit host` from served records, not the machine spec's (#2309). | 2026-09-18; revised 2026-09-28, 2026-10-03, 2026-10-16 (#1103), 2026-10-20 (#1775), 2026-10-26 (#1231), 2026-10-31 (#2558), 2026-11-01 (#2577), 2026-11-02 (#2580, #2619) and 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)) |
 | D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. Revised: arrival rides the `compass` entry of `tracestate`, output times ride SSE comment lines, and the `/metrics` scrape is paced on simulated time. Revised 2026-10-02 (#533, #534): the scrape is a daemon deadline, and the run ends when no essential work is left. | 2026-09-18; revised 2026-09-28 and 2026-10-02 |
 | D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf`; an inline attempt does not raise to the operator, it de-registers the whole plugin and logs one `WARNING` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |

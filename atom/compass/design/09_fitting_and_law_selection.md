@@ -285,7 +285,8 @@ D62 treats leading warmth, never charged
 - **Key:** the host CPU, the `atom` source digest, the model, the engine config, the
   device, the software stack and torch (`07` D41). A mismatch refuses. There is no transfer mode: the MI455 projection prices no host floor
   (`08` D50.2).
-- **Home:** beside the step linear law, not in the machine spec's `host.*` (`05` D25).
+- **Home:** beside the step linear law; the entry also holds the tokenizer and HTTP
+  intake terms (`05` D25), which the machine spec no longer states.
 - **Use:** the runner composes them with any backend's device time by `01` D4's
   recurrence; no backend adds them to its own price.
 
