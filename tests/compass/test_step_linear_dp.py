@@ -431,6 +431,7 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
         r = deployment(
             tmp_path,
             **{k: engine[k] for k in ("kv_cache_block_size", "kv_cache_dtype")},
+            index_cache_dtype=engine.get("index_cache_dtype"),
             quant_config=SimpleNamespace(compute_hash=lambda: engine["quantization"]),
             parallel_config=SimpleNamespace(
                 data_parallel_size=8, data_parallel_rank=0, pipeline_parallel_rank=0
