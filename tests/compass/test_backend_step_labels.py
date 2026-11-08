@@ -24,6 +24,7 @@ from test_backend_step_linear_fit import (
     _steps,
     _timed_record,
     _view,
+    traced,
 )
 from test_memory_readings import DOCUMENT, META_8B
 from test_parity_device_window import BUSY, GAP, _recorded
@@ -68,7 +69,10 @@ def _stamped(tmp_path, monkeypatch):
         runner.forward(batch)
     device.tick = BUSY // 3
     runner.exit()
-    return tmp_path / "real" / "dp0.jsonl"
+    record = tmp_path / "real" / "dp0.jsonl"
+    lines = [traced(json.loads(x)) for x in record.read_text().splitlines()]
+    record.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    return record
 
 
 def test_a_stamped_record_is_labelled_by_step_kind(tmp_path, monkeypatch):
@@ -509,7 +513,7 @@ def test_a_prefill_launch_the_device_held_gives_no_W_launch_label(tmp_path):
 
     assert [s.step for s in samples if "W_launch" not in s.host] == held
     assert [row["step"] for row in table if row["W_launch"] is None] == held
-    assert [samples[n].cut for n in long] == ["exposed", "paced"]
+    assert [samples[n].cut for n in long] == ["exposed", None]
     got = fit_host(samples)[0]["laws"]["middle"]["W_launch"]
     assert got == pytest.approx(HOST["middle"]["W_launch"], rel=1e-4, abs=1e-12)
 
@@ -522,3 +526,37 @@ def test_a_prefill_launch_the_device_held_gives_no_W_launch_label(tmp_path):
             line[k] = [t + 10**12 for t in v] if isinstance(v, list) else v + 10**12
     later.write_text("".join(json.dumps(line) + "\n" for line in lines))
     assert label(later)[1] == table
+
+
+def test_a_dp_view_counts_its_step_s_dummy_forwards_from_every_rank_s_line(tmp_path):
+    """Step `i` of a DP4 run has `i % 4` ranks run a dummy forward. Each rank's
+    view counts them, the run's records labelled together or one alone beside
+    its peers; one rank's record reads no peer and counts none."""
+    from test_step_linear_dp import DP, _groups, _records
+
+    records = _records(tmp_path, _groups(0, n=24))
+    ranks = [[json.loads(x) for x in r.read_text().splitlines()] for r in records]
+    for i in range(24):
+        for r in ((i + k) % DP for k in range(1, i % DP + 1)):
+            ranks[r][i].update(is_dummy_run=True, batch=[], rows=[[1, 1, True]])
+    for record, lines in zip(records, ranks):
+        record.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    expected = {
+        (r, i): i % DP
+        for r in range(DP)
+        for i in range(24)
+        if not ranks[r][i]["is_dummy_run"]
+    }
+    together = [samples for samples, _ in label_run(records)]
+    alone = [label(r)[0] for r in records]
+    for labelled in (together, alone):
+        got = {
+            (s.rank, s.step): s.view.group_dummies for rank in labelled for s in rank
+        }
+        assert got == expected
+
+    single = tmp_path / "one"
+    single.mkdir()
+    (single / "dp1.jsonl").write_text("not a record\n")
+    one = _record(single / "dp0.jsonl", _steps(5, n=12))
+    assert {s.view.group_dummies for s in label(one)[0]} == {0}

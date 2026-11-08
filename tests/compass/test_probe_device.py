@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from atom.compass.drive import device_probe
 from atom.compass.spec import Fragment, MachineSpec, SpecRefusal
 from atom.compass.spec.rules import Rule
 
@@ -41,7 +42,7 @@ RECORD = {
 
 
 def test_readings_take_the_best_shape_and_keep_the_curve_monotone():
-    found = probe.readings(RECORD)
+    found = device_probe.readings(RECORD)
     assert found["bf16"] == 2 * 8192 * 4096 * 8192 / 2e-3  # the second shape is best
     assert [r for _, r in found["bandwidth_curve"]] == [1.024e9, 2.048e9, 2.048e9]
     assert found["link"] == 3.2e10
@@ -53,9 +54,9 @@ def test_fp4_takes_the_faster_library_at_each_shape():
         "fp4": {"8192x8192x8192": [2e-3], "16384x8192x8192": [3e-3]}
     }
     aiter = {"fp4": {"8192x8192x8192": [1e-3], "16384x8192x8192": [8e-3]}}
-    found = probe.readings(RECORD | {"gemm": gemm, "aiter": aiter})
+    found = device_probe.readings(RECORD | {"gemm": gemm, "aiter": aiter})
     assert found["fp4"] == 2 * 8192**3 / 1e-3  # aiter's, at the first shape
-    assert found["bf16"] == probe.readings(RECORD)["bf16"]
+    assert found["bf16"] == device_probe.readings(RECORD)["bf16"]
 
 
 def test_the_curve_is_at_least_every_kind_at_every_size():
@@ -63,21 +64,21 @@ def test_the_curve_is_at_least_every_kind_at_every_size():
         "read": {"4096": [2e-6], "8192": [8e-6], "16384": [8e-6]},
         "write": {"4096": [8e-6], "8192": [2e-6], "16384": [5e-6]},
     }
-    curve = probe.readings(record)["bandwidth_curve"]
+    curve = device_probe.readings(record)["bandwidth_curve"]
     # read is the fastest at 4 KiB, write at 8 KiB; 16 KiB keeps 8 KiB's rate
     assert curve == [
         [4096, pytest.approx(2.048e9)],
         [8192, pytest.approx(4.096e9)],
         [16384, pytest.approx(4.096e9)],
     ]
-    for kind in probe.rates(record).values():
+    for kind in device_probe.rates(record).values():
         assert all(rate >= kind[size] for size, rate in curve)
 
 
 def test_the_node18_script_publishes_the_probed_fields(monkeypatch, tmp_path):
     monkeypatch.setenv("COMPASS_MACHINE", "mi308x-hjbog18")
     script = _load("mi308x_spec")
-    found = probe.readings(RECORD)
+    found = device_probe.readings(RECORD)
     monkeypatch.setattr(script, "PEAKS", ("2026-10-19", "abc", found, "f00d"))
     out = tmp_path / "spec.json"
     assert script.main(["--out", str(out)]) == 0
@@ -97,7 +98,7 @@ def test_a_rate_above_its_peak_is_refused():
         "device.memory.bandwidth_bytes_per_s": 1e30,
         "interconnect.intra_node.link_bandwidth_bytes_per_s": 1e30,
     }
-    found = probe.readings(RECORD)
+    found = device_probe.readings(RECORD)
     document = probe.fragment("m", found, peaks, "a", "2026-10-19", {"record": "r"})
     with pytest.raises(SpecRefusal) as refused:
         Fragment.from_mapping(document, "probe")
@@ -144,16 +145,16 @@ def test_cards_disagreeing_with_the_spec_ptl_holding_vram_or_another_process_are
     _card(tmp_path, "card9", "0000:80:00.0", 3 * 10**8)
     _card(tmp_path, "card17", "0000:a4:00.0", 9 * 10**9, "enabled")
     _card(tmp_path, "card25", "0000:c8:00.0", 3 * 10**8, "enabled", [("4242", 2**20)])
-    read = probe.cards(
+    read = device_probe.cards(
         ["0000:0a:00.0", "0000:80:00.0", "0000:a4:00.0", "0000:c8:00.0"],
         tmp_path,
         tmp_path / "kfd",
         me="77",
     )
     assert [c["ptl"] for c in read] == ["enabled", "disabled", "enabled", "enabled"]
-    probe.refuse_unfit(read[:1], "enabled")
+    device_probe.refuse_unfit(read[:1], "enabled")
     with pytest.raises(SpecRefusal) as refused:
-        probe.refuse_unfit(read, "enabled")
+        device_probe.refuse_unfit(read, "enabled")
     assert "0000:0a" not in str(refused.value)
     assert "0000:80:00.0 (ptl disabled" in str(refused.value)
     assert "0000:a4:00.0 (ptl enabled, 9000000000 B used" in str(refused.value)
@@ -178,15 +179,15 @@ def test_fp4_is_timed_through_the_library_that_runs_and_names_the_one_that_faile
         return call
 
     hipblaslt, aiter, failed = {}, {}, {}
-    fp4 = dict(zip(probe.FP4, ((hipblaslt, lambda: list), (aiter, refusing))))
+    fp4 = dict(zip(device_probe.FP4, ((hipblaslt, lambda: list), (aiter, refusing))))
     for shape in ("8192x8192x8192", "16384x8192x8192"):
-        ((samples, call),) = probe._running(fp4, failed)
+        ((samples, call),) = device_probe._running(fp4, failed)
         samples[shape] = [2e-3]
     assert samples is hipblaslt and call is list
     assert failed == {"aiter.gemm_a4w4": f"RuntimeError: {A0}"}
     assert made == ["aiter"]  # tried at the first shape only
     gemm = RECORD["gemm"] | {"fp4": hipblaslt}
-    found = probe.readings(RECORD | {"gemm": gemm, "aiter": {"fp4": aiter}})
+    found = device_probe.readings(RECORD | {"gemm": gemm, "aiter": {"fp4": aiter}})
     assert found["fp4"] == 2 * 16384 * 8192**2 / 2e-3
 
 
@@ -194,7 +195,7 @@ def test_the_triton_tile_is_the_fastest_within_one_percent_of_torch(monkeypatch)
     import torch
 
     expected = torch.ones(4, 4)
-    off, broken, slow, fast = probe.TILES[False][:4]
+    off, broken, slow, fast = device_probe.TILES[False][:4]
     outputs = {off: expected * 1.02, slow: expected, fast: expected * 1.005}
     seconds = {off: 1e-4, slow: 3e-3, fast: 2e-3}
 
@@ -210,27 +211,31 @@ def test_the_triton_tile_is_the_fastest_within_one_percent_of_torch(monkeypatch)
         launched[call] = tile
         return call, outputs.get(tile, expected * 9)
 
-    monkeypatch.setattr(probe, "_triton", triton)
+    monkeypatch.setattr(device_probe, "_triton", triton)
     monkeypatch.setattr(
-        probe, "_timed", lambda torch, call, reps: [seconds.get(launched[call], 1)]
+        device_probe,
+        "_timed",
+        lambda torch, call, reps: [seconds.get(launched[call], 1)],
     )
     failed = {}
     assert (
-        probe._tile(torch, ("x", "w"), lambda: expected, "triton bf16", failed) == fast
+        device_probe._tile(torch, ("x", "w"), lambda: expected, "triton bf16", failed)
+        == fast
     )
     assert failed == {}
     # MXFP4 with no torch output to check against is not timed, and is named.
     assert (
-        probe._tile(torch, ("x", "sx", "w", "sw"), None, "triton fp4", failed) is None
+        device_probe._tile(torch, ("x", "sx", "w", "sw"), None, "triton fp4", failed)
+        is None
     )
     assert failed == {"triton fp4": "no torch output to check it against"}
 
 
 def test_a_format_takes_triton_s_rate_where_it_is_faster():
     triton = {"bf16": {"8192x8192x8192": [1e-4]}, "fp8": {}}
-    found = probe.readings(RECORD | {"triton": triton})
+    found = device_probe.readings(RECORD | {"triton": triton})
     assert found["bf16"] == 2 * 8192**3 / 1e-4
-    assert found["fp8"] == probe.readings(RECORD)["fp8"]
+    assert found["fp8"] == device_probe.readings(RECORD)["fp8"]
 
 
 def test_a_card_on_which_no_fp4_gemm_runs_is_refused_naming_each_error():
@@ -242,12 +247,12 @@ def test_a_card_on_which_no_fp4_gemm_runs_is_refused_naming_each_error():
 
     fp4 = dict(
         zip(
-            probe.FP4,
+            device_probe.FP4,
             (({}, raising(RuntimeError("no kernel"))), ({}, raising(RuntimeError(A0)))),
         )
     )
     with pytest.raises(SpecRefusal) as refused:
-        probe._running(fp4, {})
+        device_probe._running(fp4, {})
     assert refused.value.rule is Rule.MEASURED
     assert "torch._scaled_mm RuntimeError: no kernel" in str(refused.value)
     assert f"aiter.gemm_a4w4 RuntimeError: {A0}" in str(refused.value)
@@ -259,7 +264,7 @@ def test_the_mi355x_script_publishes_the_probed_fields_fp4_included(
     monkeypatch.delenv("COMPASS_MACHINE", raising=False)
     script = _load("mi355x_spec")
     gemm = RECORD["gemm"] | {"fp4": {"8192x8192x8192": [1e-3, 2e-3, 3e-3]}}
-    found = probe.readings(RECORD | {"gemm": gemm})
+    found = device_probe.readings(RECORD | {"gemm": gemm})
     monkeypatch.setattr(script, "PEAKS", ("2026-10-19", "abc", found, "f00d"))
     out = tmp_path / "spec.json"
     assert script.main(["--out", str(out)]) == 0
@@ -330,7 +335,7 @@ def test_the_cards_are_read_with_no_wait(monkeypatch, tmp_path):
     from atom.compass.drive import identity
 
     order = []
-    monkeypatch.setattr(probe, "time", SimpleNamespace(sleep=order.append))
+    monkeypatch.setattr(device_probe, "time", SimpleNamespace(sleep=order.append))
     card = SimpleNamespace(
         pci_domain_id=0, pci_bus_id=10, pci_device_id=0, gcnArchName="gfx942"
     )

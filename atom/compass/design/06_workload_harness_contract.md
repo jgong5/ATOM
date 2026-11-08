@@ -443,8 +443,8 @@ hashing, copying ids) waits for host laws that time the whole call
 ([#2618](https://github.com/jgong5/ATOM/issues/2618)). On a real run that work costs more per
 id than in a back-to-back replay of the same prompts: half to two thirds of the excess when the
 replay's calls come 1.5 s apart on rotating threads, as the server's pool runs them, and most
-of the rest in `tolist`, ATOM's copy of the ids to a list
-([#2680](https://github.com/jgong5/ATOM/issues/2680)), whose cost per id grows over the run.
+of the rest in `tolist`, a copy of the ids to a list that ATOM has since dropped
+([#2680](https://github.com/jgong5/ATOM/issues/2680)); its cost per id grew over the run.
 The server's other threads stretch a call that runs alone only by its GIL waits, 0.02 to
 0.04 ms on #2144's cell ([#2619](https://github.com/jgong5/ATOM/issues/2619)). Calls that
 overlap wait for each other, on the library's pool and for the GIL in their own work, which
@@ -588,12 +588,12 @@ puts every serving run on the deadlock-recovery path (`01`, Invariants).
 On #2144's V4.1-Flash c=16 cell, client start to response headers less the segment
 tokenizer call is 11.75 ms per long prompt, and a simulated run charges each part
 apart ([#2580](https://github.com/jgong5/ATOM/issues/2580)). The HTTP transport, 0.67 ms,
-is the `serving` admission delay, 0.54 ms. The loop's intake, 4.59 ms, is `idle_s` plus
-`per_byte_s` per body byte, 2.59 ms on these 388 KB bodies: the loop takes 8.5 ns per byte
-of them, gpu-40's spec stated 3.85, fitted on V4-Pro bursts
-([#2681](https://github.com/jgong5/ATOM/issues/2681)), which is why `fit host` fits
-`per_byte_s` on lone requests (`07` D38, Phase 1c). The tokenizer pool job's work
-outside the segment tokenizer call, 5.86 ms, is charged nothing; most of it is ATOM copying
+is the `serving` admission delay, 0.54 ms. The loop's intake, 4.59 ms, is charged `idle_s`
+plus `per_byte_s` per body byte, 4.20 ms on these 388 KB bodies: `per_byte_s` is the 8.05 ns
+per byte that lone requests of the cell's own bodies read, where a V4-Pro first-turn burst's
+slope, 3.85, charged 2.59 ms ([#2681](https://github.com/jgong5/ATOM/issues/2681)), which
+is why `fit host` fits `per_byte_s` on lone requests (`07` D38, Phase 1c). The
+tokenizer pool job's work outside the segment tokenizer call, 5.86 ms, is charged nothing; most of it is ATOM copying
 the prompt's ids from a list back into an array, ATOM's to fix
 ([#2680](https://github.com/jgong5/ATOM/issues/2680)). The last 0.63 ms, from the engine
 send to the headers reaching the client, is not on the request's way to the engine, where

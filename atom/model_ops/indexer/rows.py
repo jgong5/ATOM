@@ -190,7 +190,9 @@ def concat_rows(row_ends, keys: ConcatKeys, split: DcpSplit | None = None):
     logits budget alone: a prefill's temporaries are allocated as it runs.
     This DCP rank's rows of them, `split` (every row by default)."""
     split = split or DcpSplit.of(row_ends.shape[0])
-    band = max(1, logits_rows(split.end - split.first, keys.total))
+    # aiter's fp8_mqa_logits allocates a band's keys rounded up to 256.
+    allocated = -(-keys.total // 256) * 256
+    band = max(1, logits_rows(split.end - split.first, allocated))
     return IndexRows(
         row_ends,
         keys.total,

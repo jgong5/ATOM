@@ -16,8 +16,9 @@ measured time, which is another device's. Each cell is priced in a process of
 its own, since a build declares one engine per process.
 
 The `projection` published in S states, per cell and granularity, the steps
-priced and refused by reason, the projected seconds per phase, and the tokens
-a second over the steps priced; per granularity, the cells ranked by those
+priced and refused by reason, the projected seconds per phase (under a
+drafter, the target's, its drafter's apart in `draft_s`), and the tokens a
+second over the steps priced; per granularity, the cells ranked by those
 tokens a second, its first (top-1) and first three (top-3); and each field of
 SPEC whose origin is `assumed` that a price read, with its value, and for an
 assumed arch the compute units and stepping its op_graphs were traced at.
@@ -135,7 +136,7 @@ def cell(model: str, tp: int, machine: dict, store: str, record: str, atom_args)
     for level, r in report.items():
         rate = r["ranking"] and r["ranking"]["tokens_per_s"][record]["analytical"]
         held = ("steps", "steps_refused", "refused", "analytical_s", "by_bound")
-        levels[level] = {k: r[k] for k in held} | {"tokens_per_s": rate}
+        levels[level] = {k: r[k] for k in (*held, "draft_s")} | {"tokens_per_s": rate}
     return {
         "model": _file_digest(config.model, "config.json"),
         "engine": keyed(config, ladder=False),
@@ -305,6 +306,7 @@ def text(document: dict) -> str:
                 f"refused, {rate} tokens/s; {phases}"
             )
             out += [f"    refused {n} steps: {why}" for why, n in r["refused"].items()]
+            out += [f"    drafter: {p} {t:.2f} s" for p, t in r["draft_s"].items()]
             parts = fold_parts(r["by_bound"].values())
             whole = fold_seconds(parts.values())
             shares = ", ".join(

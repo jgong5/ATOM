@@ -110,6 +110,36 @@ async fn reads_each_time_exactly() {
     assert_eq!(grant.released[0].seq, 1);
 }
 
+/// Once a grant carries a ceiling, each request asks for its messages ahead
+/// and carries the steps the LP took on its own, each after the sends before it.
+#[tokio::test]
+async fn after_a_ceiling_asks_ahead_and_reports_its_own_steps() {
+    let (endpoint, served) = scripted(vec![
+        json!({"kind": "JOINED", "now": 0.0, "seqs": {}}),
+        json!({"kind": "GRANT", "G": 1.0, "released": {}, "ceiling": 2.0}),
+        json!({"kind": "GRANT", "G": 3.0, "released": {}}),
+    ])
+    .await;
+    let mut clock = ClockClient::bind(&endpoint, "router").await.unwrap();
+    clock.next_event(INF, INF).await.unwrap();
+    clock.send("router->traffic:stream", 1.25);
+    clock.step(INF, 1.5);
+    clock.send("router->traffic:stream", 1.75);
+    assert_eq!(clock.next_event(INF, INF).await.unwrap().time, 3.0);
+    assert_eq!(
+        served.await.unwrap(),
+        [
+            r#"{"kind":"BIND","lp":"router"}"#,
+            r#"{"kind":"NER","log":[],"t":"+inf","t_daemon":"+inf"}"#,
+            concat!(
+                r#"{"ahead":true,"kind":"NER","log":[["router->traffic:stream",0,1.25],"#,
+                r#"["router->traffic:stream",1,1.75]],"steps":[["NER","+inf",1.5,1]],"#,
+                r#""t":"+inf","t_daemon":"+inf"}"#,
+            ),
+        ]
+    );
+}
+
 /// Run by `tests/compass/test_mesh_clock_client.py`, which serves the Python
 /// authority with LPs `traffic` and `router` and sends one request from
 /// `traffic` at 0.5; the router answers on its stream channel 0.25 later.

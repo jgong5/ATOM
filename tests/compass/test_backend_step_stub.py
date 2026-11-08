@@ -180,6 +180,7 @@ class TestPerRequestSums:
             "dp_dummy",
             "group_prefills",
             "draft_rows",
+            "group_dummies",
             "start_lag_s",
         ]
         assert [f.name for f in fields(RequestShape)] == [

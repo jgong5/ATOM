@@ -576,8 +576,8 @@ def test_every_rule_is_named_by_at_least_one_site():
     }
     assert named
     # MEASURED is the rule a probe is held to, and the one probe left is the
-    # device probe, a script outside the package.
-    probe = ast.parse((REPO / "scripts" / "compass" / "probe_device.py").read_text())
+    # device probe, `atom/compass/drive/device_probe.py`, outside the spec package.
+    probe = ast.parse((REPO / "atom/compass/drive/device_probe.py").read_text())
     named |= {
         node.attr
         for node in ast.walk(probe)

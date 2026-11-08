@@ -8,10 +8,11 @@ ATOM's engine starts from ATOM's arguments (`EngineArgs`) on the GPUs `--gpu`
 names, through `MemoryReadingModelRunner` (under `--enable-rapidserve` its
 RapidServe form, whose decode engine writes its own readings beside prefill's),
 and stops once it has started: its weights loaded, its one warmup run, its KV
-cache sized and its graphs captured. `gpu.quiet` checks those GPUs before the
-start and, once every process of the start has exited, after it. Each rank
-writes its readings and the key it read off its resolved config, and the ranks
-must agree on the key. The entry's key is that one with the digest of the
+cache sized and its graphs captured; at DP and TP both above 1 under
+`serve.LOG_MORE`, as `compass record` starts a server. `gpu.quiet` checks those
+GPUs before the start and, once every process of the start has exited, after
+it. Each rank writes its readings and the key it read off its resolved config,
+and the ranks must agree on the key. The entry's key is that one with the digest of the
 machine spec `--machine` names; its conditions are that spec's device and
 stack, torch included. A `--gpu` whose device or PTL state is not the spec's,
 or a stack the spec does not pin, refuses before the start, so no entry
@@ -152,6 +153,7 @@ def main(argv: list[str], again: bool = False) -> None:
     env = {k: v for k, v in os.environ.items() if k not in (ENV, CLOCK_ENV, parity.ENV)}
     env[OUT_ENV] = str(out / READINGS)
     env["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
+    env |= serve.log_more(atom_args)
     if args.beside:
         env[BESIDE_ENV] = args.beside
     code = f"import sys; from {__name__} import start; start(sys.argv[1:])"
