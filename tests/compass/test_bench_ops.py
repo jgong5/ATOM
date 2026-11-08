@@ -2355,6 +2355,9 @@ def test_a_graph_s_first_call_runs_once_on_its_capture_stream_before_the_capture
         "Event": lambda enable_timing: event,
         "current_stream": lambda: current[-1],
         "stream": stream,
+        "is_current_stream_capturing": lambda: bool(capturing),
+        "default_generators": (_Generator(),),
+        "current_device": lambda: 0,
     }.items():
         monkeypatch.setattr(torch.cuda, name, value)
     monkeypatch.setattr(ops, "_release", lambda: log.append("release"))
