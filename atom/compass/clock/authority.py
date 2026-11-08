@@ -55,12 +55,17 @@ An LP may be declared with members: processes that each hold a runtime for it,
 as the ranks of a data-parallel group do. A member names itself in each call,
 and each channel into or out of the LP is owned by exactly one member, as the
 caller declares; a member may log sends only on channels it owns. The members'
-calls are joined into one request per round: each member makes the same number
-of calls, all ask one kind, every TAR asks the same target, and the joined
-NER's target and daemon deadline are each the least over the members. A call
-before the round is complete registers its send log and nothing else: the LP
-stays running, so its ``N`` stays at its clock. Every member gets the common
-grant, carrying the releases on its own channels only.
+requests are joined into one per round: each member asks every round, all ask
+one kind, every TAR asks the same target, and the joined NER's target and
+daemon deadline are each the least over the members. A member's TAR may name
+later rounds, ascending, which queue behind it: once a round is granted, each
+member's next queued round joins the next one, so a round joins once it heads
+every member's queue, and each is still its own grant. A call before the
+round is complete registers its send log and nothing else: the LP stays
+running, so its ``N`` stays at its clock. Every member gets the common grant,
+carrying the releases on its own channels only; a member whose call named
+later rounds gets one reply, at its last round's grant, with what each of its
+rounds released to it.
 
 A member may instead *park*: one call, before it dispatches a forward, that
 stands in every later round as NER with no target and no daemon deadline, so
@@ -242,6 +247,10 @@ class ClockAuthority:
         self._owner = {}  # LP -> channel into or out of it -> the member owning it
         self._round = {}  # LP -> member -> (kind, t, daemon) of the round being joined
         self._parked = {}  # LP -> parked member -> {channel: releases held for it}
+        self._queued = {}  # LP -> member -> later TAR rounds asked, not yet joined
+        # LP -> member whose call named later rounds -> (the call's last round,
+        # {channel: releases held for it until that round's grant})
+        self._held = {}
         self._ceilings = ceilings
         self._ceiling = {}  # LP -> the ceiling of its latest grant
         self._ahead = {}  # LP -> channel -> {seq: arrival} sent ahead, not yet reached
@@ -278,6 +287,7 @@ class ClockAuthority:
                 self._owner[lp][name] = owners[0]
             self._members[lp] = tuple(sorted(owned))
             self._round[lp], self._parked[lp] = {}, {}
+            self._queued[lp], self._held[lp] = {}, {}
 
     def on_request(
         self,
@@ -289,6 +299,7 @@ class ClockAuthority:
         member: str | None = None,
         steps=(),
         ahead: bool = False,
+        rounds=(),
     ) -> list:
         """Register `lp`'s send log, record its request, and grant what is due.
 
@@ -297,7 +308,8 @@ class ClockAuthority:
         `steps` are the LP's own steps below its ceiling since its last grant,
         as ``(kind, t, G, n)``: asked `t`, answered `G`, after the first `n`
         entries of `log`. `ahead` asks an NER's grant to send every message
-        below its ceiling.
+        below its ceiling. `rounds` are a member's later TAR rounds, each past
+        the one before, asked in the same call.
         Returns the replies made due, as ``(lp, G, released)`` in the order
         issued, where ``released`` maps each channel into that LP to its newly
         released ``(seq, arrival)`` pairs; a member's reply is addressed
@@ -333,6 +345,13 @@ class ClockAuthority:
             raise ValueError(
                 f"{lp} sent TAR with daemon deadline {daemon}; only NER has one"
             )
+        rounds = [_seconds(r, True, "a round {} asked", lp) for r in rounds]
+        ascending = all(a < b for a, b in zip([t, *rounds], rounds))
+        if rounds and (kind != TAR or not members or not ascending):
+            raise ValueError(
+                f"{lp} asked {kind} rounds {[t, *rounds]}; only a member's TAR "
+                "asks later rounds, each past the one before"
+            )
         log = self._catch_up(lp, steps, log, member)
         now = self._now[lp]
         if t < now or daemon < now:
@@ -356,10 +375,11 @@ class ClockAuthority:
         if members:
             joined, parked = self._round[lp], self._parked[lp]
             joined[member] = _STANDING if kind == PARK else (kind, t, daemon)
+            if rounds:
+                self._queued[lp][member] = rounds
+                self._held[lp][member] = (rounds[-1], self._own_into(lp, member))
             if kind == PARK:
-                parked[member] = {
-                    c: [] for c in self._into[lp] if self._owner[lp][c] == member
-                }
+                parked[member] = self._own_into(lp, member)
             if len(joined) < len(members):
                 return []
             if len(parked) == len(members):
@@ -369,10 +389,7 @@ class ClockAuthority:
             daemon = min(deadline for _, _, deadline in joined.values())
             joined.clear()
             joined.update(dict.fromkeys(parked, _STANDING))
-        if t < math.inf:
-            self._horizon = max(self._horizon, t)
-        self._state[lp], self._target[lp], self._daemon[lp] = kind, t, daemon
-        self._nv[lp] = t if kind == TAR else self._n(lp)
+        self._wait(lp, kind, t, daemon)
         return self._address(self._grant_due())
 
     def on_bind(self, lp: LpId) -> tuple[float, dict[str, int]]:
@@ -381,6 +398,32 @@ class ClockAuthority:
         out = self._channels.channels_from(lp)
         return self._now[lp], {c.name: self._next_seq[c.name] for c in out}
 
+    def _wait(self, lp: LpId, kind: str, t: float, daemon: float) -> None:
+        """`lp` waits in `kind`, asking `t` with daemon deadline `daemon`."""
+        if t < math.inf:
+            self._horizon = max(self._horizon, t)
+        self._state[lp], self._target[lp], self._daemon[lp] = kind, t, daemon
+        self._nv[lp] = t if kind == TAR else self._n(lp)
+
+    def _join_queued(self, lp: LpId) -> None:
+        """After a round of `lp` is granted, each member's next queued round
+        joins the next one, which waits in TAR once every member has asked it."""
+        joined, queued = self._round[lp], self._queued[lp]
+        for member in list(queued):
+            t = queued[member].pop(0)
+            if not queued[member]:
+                del queued[member]
+            self._refuse_unjoinable(lp, member, TAR, t)
+            joined[member] = (TAR, t, math.inf)
+        if len(joined) == len(self._members[lp]):
+            (_, t, _), *_ = joined.values()
+            joined.clear()
+            self._wait(lp, TAR, t, math.inf)
+
+    def _own_into(self, lp: LpId, member: str) -> dict:
+        """An empty list for each channel into `lp` that `member` owns."""
+        return {c: [] for c in self._into[lp] if self._owner[lp][c] == member}
+
     def _refuse_unjoinable(self, lp: LpId, member: str, kind: str, t: float) -> None:
         joined = self._round[lp]
         reason = None
@@ -388,7 +431,7 @@ class ClockAuthority:
             behind = ", ".join(m for m in self._members[lp] if m not in joined)
             reason = (
                 f"{lp}: {member} called again before {behind} called; every "
-                "member calls once per round"
+                "member asks each round once"
             )
         elif joined:
             other, (other_kind, other_t, _) = next(iter(joined.items()))
@@ -404,7 +447,8 @@ class ClockAuthority:
     def _address(self, replies: list) -> list:
         """One reply per member for an LP with members, each with its own
         channels; a parked member's are held for it, unless the reply finishes
-        the run or ends a client run."""
+        the run or ends a client run, and so are those of a member whose call
+        named later rounds, until the last one's grant."""
         out = []
         for i, g, released, *ended in replies:
             for m in self._members.get(i, (None,)):
@@ -414,19 +458,27 @@ class ClockAuthority:
                 mine = {c: r for c, r in released.items() if self._owner[i][c] == m}
                 held = self._parked[i].get(m)
                 if held is not None:
-                    self._hold(i, m, mine)
+                    self._hold(held, mine)
                     if g < math.inf and not ended:
                         continue
                     del self._parked[i][m]
                     self._round[i].pop(m, None)
                     mine = held
+                elif m in self._held[i]:
+                    last, held = self._held[i][m]
+                    self._hold(held, mine)
+                    if g < last and not ended:
+                        continue
+                    del self._held[i][m]
+                    mine = held
                 out.append(((i, m), g, mine, *ended))
         return out
 
-    def _hold(self, lp: LpId, member: str, released: dict) -> None:
-        """Keep what a grant released to parked `member` until it leaves."""
+    @staticmethod
+    def _hold(held: dict, released: dict) -> None:
+        """Keep what a grant released to a member until its reply goes."""
         for c, r in released.items():
-            self._parked[lp][member][c] += r
+            held[c] += r
 
     def _release(self, lp: LpId) -> list:
         """The last member parked: each leaves at the LP's clock with the
@@ -582,6 +634,8 @@ class ClockAuthority:
         self.grants[i.name] += 1
         # g is N[i], so N[i] is unchanged: a running LP's N is its clock.
         self._now[i], self._state[i], self._target[i] = g, RUNNING, None
+        if self._queued.get(i):
+            self._join_queued(i)
         return (i, g, released)
 
     def _ceiling_of(self, i: LpId, g: float, released: Released) -> float:

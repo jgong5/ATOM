@@ -22,7 +22,7 @@ def test_a_clock_call_refused_on_an_engine_thread_is_a_summary_refusal(
     monkeypatch, tmp_path
 ):
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 0.001,
         "stream_s": 0.002,
         "bound_s": 10.0,

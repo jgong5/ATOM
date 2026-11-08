@@ -184,7 +184,7 @@ def test_a_log_that_would_write_nothing_anywhere_is_refused():
 
 
 def test_the_finish_records_one_reply_per_lp_from_the_clock_it_finished_at():
-    table = single_engine_table(admission_path="serving", ipc_s=1.0e-4, stream_s=2.0e-3)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=1.0e-4, stream_s=2.0e-3)
     engine, frontend, traffic = table.registry.ids()
     ca = ClockAuthority(table, TimelineLog())
     ca.on_request(engine, NER, INF, [])
@@ -309,7 +309,7 @@ def test_a_stall_is_logged_again_only_after_a_request_and_never_before_all_ask(
 
 
 def test_a_client_run_counts_the_stalls_printed_during_it():
-    table = single_engine_table(admission_path="serving", ipc_s=1.0e-4, stream_s=2.0e-3)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=1.0e-4, stream_s=2.0e-3)
     engine, frontend, traffic = table.registry.ids()
     ca = ClockAuthority(table, client=traffic, client_runs=2)
     for stalls in (2, 1):
@@ -324,7 +324,7 @@ def test_a_client_run_counts_the_stalls_printed_during_it():
 def test_a_client_runs_summary_counts_the_calls_served_up_to_its_end():
     """Each end keeps the calls served, as it keeps the grants, for the
     summary that client run writes."""
-    table = single_engine_table(admission_path="serving", ipc_s=1.0e-4, stream_s=2.0e-3)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=1.0e-4, stream_s=2.0e-3)
     engine, frontend, traffic = table.registry.ids()
     ca = ClockAuthority(table, client=traffic, client_runs=2)
     for _ in range(2):

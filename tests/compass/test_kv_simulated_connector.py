@@ -100,7 +100,7 @@ def test_the_scheduler_half_refuses_what_it_cannot_invent(
     kv.pop(missing, None)
     if missing is not None:
         table = prefill_decode_table(
-            admission_path="serving",
+            admission_s=0.54e-3,
             ipc_s=0.0,
             stream_s=0.0,
             router_s=0.0,

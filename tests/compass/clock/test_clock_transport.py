@@ -13,7 +13,6 @@ import math
 import queue
 import re
 import threading
-from unittest import mock
 
 import pytest
 
@@ -29,7 +28,6 @@ from atom.compass.clock import (
     Released,
     single_engine_table,
 )
-from atom.compass.clock.channels import ADMISSION_DELAY_S
 from atom.compass.clock_transport import (
     MalformedMessage,
     connect,
@@ -188,10 +186,7 @@ def _drive(conn, table, script):
 def _three_lp_run(cls, served):
     """Serve a `cls` over the single-engine table and run `SCRIPTS` on it."""
     # SCRIPTS' grant times are written for a 1.6 ms request lookahead.
-    with mock.patch.dict(ADMISSION_DELAY_S, serving=1.6e-3):
-        table = single_engine_table(
-            admission_path="serving", ipc_s=IPC_S, stream_s=STREAM_S
-        )
+    table = single_engine_table(admission_s=1.6e-3, ipc_s=IPC_S, stream_s=STREAM_S)
     ca = cls(table)
     endpoint = served(ca).endpoint
     conns = {name: connect(LpId(name), endpoint) for name in SCRIPTS}
@@ -258,6 +253,22 @@ def test_each_member_binds_its_own_connection_and_reads_its_own_releases(
         ((1.0, {REQ0: []}), (1.0, {REQ1: [(0, 1.0)]})),
         ((2.0, {REQ0: []}), (2.0, {REQ1: []})),
     ]
+
+
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+def test_a_member_asks_later_rounds_in_one_frame_and_reads_one_reply(served, endpoint):
+    authority = _joined()
+    endpoint = served(authority, endpoint).endpoint
+    frontend = connect(FRONTEND, endpoint)
+    dp0, dp1 = (connect(ENGINE, endpoint, rank) for rank in RANKS)
+    assert (frontend.member, dp0.member, dp1.member) == (None, *RANKS)
+    _result(_later(frontend.send, (NER, INF, [(REQ0, 0, 1.5), (REQ1, 0, 2.5)], INF)))
+    _result(_later(dp0.send, (TAR, 2.0, [], INF, [], False, [3.0])))
+    held = _later(dp0.recv)
+    assert _ask(dp1, (TAR, 2.0, [], INF)) == (2.0, {REQ1: []})
+    assert _ask(dp1, (TAR, 3.0, [], INF)) == (3.0, {REQ1: [(0, 2.5)]})
+    assert _result(held) == (3.0, {REQ0: [(0, 1.5)]})
+    assert authority.requests_served["engine"] == 3
 
 
 # --- refusals -----------------------------------------------------------------
@@ -554,6 +565,15 @@ def test_steps_ahead_and_a_ceiling_ride_their_frames_and_only_when_present():
     assert encode((NER, INF, [], 2.0, [], False)) == encode((NER, INF, [], 2.0))
     with pytest.raises(MalformedMessage):
         decode(encode((NER, INF, [], 2.0, [("PARK", INF, 1.0, 0)], False)))
+
+
+def test_later_rounds_ride_a_request_frame_and_only_when_present():
+    request = (TAR, 1.0, [], INF, [], False, [2.0, 3.0])
+    assert decode(encode(request)) == request
+    assert b'"rounds":[2.0,3.0]' in encode(request)
+    assert encode((TAR, 1.0, [], INF, [], False, [])) == encode((TAR, 1.0, [], INF))
+    with pytest.raises(MalformedMessage):
+        decode(b'{"kind":"TAR","log":[],"rounds":["soon"],"t":1.0,"t_daemon":"+inf"}')
 
 
 def test_a_frame_is_json_a_stranger_can_read():
