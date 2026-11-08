@@ -1935,11 +1935,16 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
 def _trace_process():
     """A process of its own, spawned, for a lookup's lazy traces (`_trace`): a
     capture's process-wide patches stay in it, and the runner its first trace
-    builds steps every later one."""
+    builds steps every later one. It ends when the process that spawned it
+    does, however that ends: the runner takes SIGTERM for its own exit, not
+    the process's."""
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
 
-    return ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"))
+    from atom.utils import enable_orphan_reaping
+
+    spawn = multiprocessing.get_context("spawn")
+    return ProcessPoolExecutor(1, mp_context=spawn, initializer=enable_orphan_reaping)
 
 
 @functools.cache

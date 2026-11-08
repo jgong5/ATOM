@@ -17,7 +17,13 @@ carrying why.
 
 import copy
 import json
+import os
+import pathlib
 import re
+import signal
+import subprocess
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
@@ -26,7 +32,7 @@ import pytest
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_backend_step_linear import _installed, law, view
 from test_backend_step_roofline import COMPUTE, MEMORY, ROOFLINE, _spec
-from test_capture_ir import CONFIG, WIDTH_2, _ops, capture
+from test_capture_ir import CONFIG, TREE, WIDTH_2, _ops, capture
 from test_memory_readings import DOCUMENT, WORKER
 from test_op_graph_arch import ENGINE
 from test_op_work import leaf, t
@@ -1461,11 +1467,57 @@ def test_a_run_s_lazy_traces_share_one_process_and_trace_as_a_process_each(
 
     # Byte for byte the graphs a process each traces, each pool its own.
     assert warm.keys() == alone.keys() and len(alone) == 5
-    for at, region in alone.items():
-        assert json.dumps(warm[at]) == json.dumps(region), at
+    same = {at: json.dumps(warm[at]) == json.dumps(r) for at, r in alone.items()}
+    assert all(same.values()), same
     # One process traced the three, its tracer made at the first and kept.
     made = spawned[0].submit(_tracers).result()
     assert (len(spawned), lazy["lazy_traces"], made) == (1, 3, (1, 2))
+
+
+def _alive(pid: int) -> bool:
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def test_a_run_s_trace_process_ends_with_the_process_that_spawned_it(tmp_path):
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_bytes(CONFIG.read_bytes())
+    # Its process traces a shape, which builds the 27B's runner there, then the
+    # spawner is killed outright: it runs no exit of its own. Its output goes
+    # to a file, which a process that outlives it cannot hold open.
+    spawner = (
+        "import os, signal, sys; from atom.compass import run; "
+        "from atom.compass.capture.forward import decode; "
+        "tracing = run._trace_process(); "
+        "args = sys.argv[2], ['--model', sys.argv[3]], 'gfx942', decode(2); "
+        "tracing.submit(run._trace, *args).result(); "
+        "pid = tracing.submit(os.getpid).result(); "
+        "open(sys.argv[1], 'w').write(str(pid)); os.kill(os.getpid(), signal.SIGKILL)"
+    )
+    paths = [tmp_path / name for name in ("pid", "store", "model")]
+    with open(tmp_path / "log", "w") as log:
+        subprocess.run(
+            [sys.executable, "-c", spawner, *map(str, paths)],
+            stdout=log,
+            stderr=log,
+            check=False,  # it ends killed
+            timeout=300,
+            cwd=TREE,
+            env={**os.environ, "PYTHONPATH": str(TREE)},
+        )
+    assert (tmp_path / "pid").exists(), (tmp_path / "log").read_text()[-4000:]
+    pid = int((tmp_path / "pid").read_text())
+    try:
+        deadline = time.monotonic() + 60
+        while _alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not _alive(pid)
+    finally:
+        if _alive(pid):
+            os.kill(pid, signal.SIGKILL)
 
 
 def test_a_lazy_trace_that_fails_ends_the_run_naming_the_shape(tmp_path):
