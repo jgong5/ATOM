@@ -508,11 +508,11 @@ def test_device_busy_time_and_host_laws_are_recovered_from_a_timed_record(tmp_pa
 
 def test_a_prefill_pass_is_labelled_by_a_trace_run_s_busy_time_alone(tmp_path):
     """On this MTP record a prefill step without busy lines is cut untraced,
-    the fit names the prefill vector unfitted, and each output forward states
-    its lag. In a trace run, whose run directory holds its traces, the busy
-    lines label each prefill pass, each decode is cut as traced and no step has
-    host labels or a lag, and its `steps` directory copied alone labels the
-    same; without its busy lines it refuses."""
+    and the fit names the prefill vector unfitted. In a trace run, whose run
+    directory holds its traces, the busy lines label each prefill pass, each
+    decode is cut as traced and no step has host labels, and its `steps`
+    directory copied alone labels the same; without its busy lines it
+    refuses."""
     (tmp_path / "steps").mkdir()
     record, _ = _timed_record(tmp_path / "steps" / "dp0.jsonl", _steps(14, n=40))
     lines = [json.loads(x) for x in record.read_text().splitlines()]
@@ -526,8 +526,6 @@ def test_a_prefill_pass_is_labelled_by_a_trace_run_s_busy_time_alone(tmp_path):
     got = label(record)[0]
     assert {s.cut for s in got if s.step in prefill} == {"untraced"}
     assert all(s.host for s in got)
-    lagged = [s.view.start_lag_s is not None for s in got]
-    assert lagged == [s.view.produces_output for s in got] and any(lagged)
     why = "no prefill step carries a trace run's busy time"
     assert _fit([record])["unfitted"]["prefill"] == why
 
@@ -543,7 +541,7 @@ def test_a_prefill_pass_is_labelled_by_a_trace_run_s_busy_time_alone(tmp_path):
     )
     (tmp_path / "trace").mkdir()
     got = label(record)[0]
-    assert all(s.host == {} and s.view.start_lag_s is None for s in got)
+    assert all(s.host == {} for s in got)
     assert {s.cut for s in got if s.step not in prefill} == {"traced"}
     for s in (s for s in got if s.step in prefill):
         t, d, p = (x * 1e-9 for x in busy[s.step])

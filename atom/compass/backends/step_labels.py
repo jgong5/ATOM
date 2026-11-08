@@ -39,7 +39,10 @@ the target's, `d_target_ns` with no gap, and the draft label is the rest of
 `forward_done_event`: its device label holds it, as its draft-KV label too,
 and its draft label does not. A device event runs no earlier than the host
 records it, so the largest launch record less its device start, over the
-record, is the host clock's lead there.
+record, is the host clock's lead there. A decode's draft label, its `propose`
+pass, is cut where the device reached the pass, placed by that lead, before
+the host's draft copy wait (`t_draft_recv_ns`) began: the host queues the pass
+just before that wait, so the window may hold the device's wait for it.
 
 A prefill step's labels are a trace run's busy time per pass (`parity.busy`),
 which a trace run's record joins from `dp<r>.busy.jsonl` beside it: the device
@@ -56,11 +59,6 @@ decode steps are cut as `traced` and its steps carry no host labels.
 A record without device windows is refused. A step mixing prefill and decode
 rows is cut. A step of an MTP record without `d_target_ns` is cut as
 `unsplit`: its device label would hold a draft the law prices again.
-
-An output forward's view takes `start_lag_s`: its device start, placed by the
-lead, less the exit of its token copy wait (`t_recv_ns`, else `t_read_ns`,
-else its launch's end). A trace run's states none: its host ran under the
-profiler.
 
 A step's host labels are its segments: `E` from the previous forward's exit,
 cut as idle after an idle engine (`busy_gaps`); `W_pre` to the launch, less
@@ -146,7 +144,9 @@ class Sample:
     """One real forward, labelled.
 
     `device_s` is its device label, None when cut, and `cut` names why (`CUTS`).
-    `draft_s` is its draft label, None when cut or on a step with no draft.
+    `draft_s` is its draft label, None when cut, on a step with no draft, or
+    on a decode whose device reached its `propose` pass before the host's
+    draft copy wait.
     `propose_s` is its propose label, the part of `draft_s` that is the
     `propose` pass, on a prefill step that produces output; None elsewhere.
     `draft_kv_s` is its draft-KV label, the part of `device_s` that is the
@@ -263,9 +263,11 @@ def mtp_copy(lines) -> dict[int, tuple[int, bool]]:
     return copy
 
 
-def _host_cut(lines) -> tuple[set[int], set[int]]:
-    """The steps whose device start precedes their host launch end, and the
-    prefill steps the host did not pace whose launch the device held."""
+def _host_cut(lines) -> tuple[set[int], set[int], set[int]]:
+    """The steps whose device start precedes their host launch end, the
+    prefill steps the host did not pace whose launch the device held, and the
+    MTP decodes whose device reached the propose pass before the host's draft
+    copy wait."""
     (lines_timed, lead), output_end, timed = _timed(lines), None, []
     for s, start in lines_timed:
         bound = None
@@ -289,6 +291,15 @@ def _host_cut(lines) -> tuple[set[int], set[int]]:
             recent.append(bound)
         if start + min(recent, default=first) < s["t_launch_ns"][1]:
             exposed.add(s["step"])
+    early = {
+        s["step"]
+        for s, start, _ in timed
+        if all(r[2] for r in s["rows"])
+        and "t_draft_recv_ns" in s
+        and "d_target_ns" in s
+        and start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0) + lead
+        < s["t_draft_recv_ns"][0]
+    }
     paced = {
         s["step"]
         for s, start, _ in timed
@@ -304,7 +315,7 @@ def _host_cut(lines) -> tuple[set[int], set[int]]:
         and s["t_launch_ns"][1] - start - lead
         > HELD_SHARE * s.get("d_target_ns", s["d_busy_ns"])
     }
-    return exposed, held
+    return exposed, held, early
 
 
 def join_stamps(steps: list[dict], path) -> None:
@@ -424,9 +435,7 @@ def _label(
             f"{record} has no device windows (`d_busy_ns`); a fit labels a step "
             "by its device time"
         )
-    (exposed, held), traced = _host_cut(lines), _traced(path)
-    timed, lead = _timed(lines)
-    placed = {s["step"]: start + lead for s, start in timed}
+    (exposed, held, early), traced = _host_cut(lines), _traced(path)
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
@@ -456,10 +465,6 @@ def _label(
                         "rebuild it"
                     )
                 split = split_rule(group)
-        lag = None
-        if s["produces_output"] and not traced:
-            returned = s.get("t_recv_ns", s.get("t_read_ns", s["t_launch_ns"]))[1]
-            lag = (placed[s["step"]] - returned) * 1e-9
         view = BatchView(
             tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
             capture_rung=s["rung"],
@@ -473,7 +478,6 @@ def _label(
             moe_tokens=tokens,
             dp_rank=s["dp_rank"] if dp else None,
             group_dummies=dummy_ranks.get(s["step"], 0) if dp else 0,
-            start_lag_s=lag,
         )
         cut = None
         if view.prefill and view.decode:
@@ -541,7 +545,7 @@ def _label(
                 host,
                 idle,
                 provenance,
-                None if cut else draft,
+                None if cut or s["step"] in early else draft,
                 None if cut or propose is None else propose * 1e-9,
                 dummies,
                 None if cut or draft_kv is None else draft_kv * 1e-9,

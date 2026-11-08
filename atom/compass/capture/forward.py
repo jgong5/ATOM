@@ -22,8 +22,8 @@ A raw Triton or FlyDSL launch lifts to the function that issues it
 (`_Recorder`): one leaf, that function by its module and name, its parameters at
 call entry as the arguments, with whatever else the call ran folded in. An
 argument that is an attribute of the runner is a `ModuleRef` `runner.<attr>`;
-any other object is held as pickle reduces it (`ir.nodes.Reduced`), or refused
-by its type.
+a NamedTuple is held as its class and fields, and any other object as pickle
+reduces it (`ir.nodes.Reduced`), or refused by its type.
 
 The engine is ATOM's own `Config` for ATOM's engine arguments, on a declared
 device of one arch. Under DP the capture runs one rank, and its peers the rest of
@@ -366,14 +366,17 @@ def _rebuilt(value, live):
 
 def rebuild_object(cls: str, state):
     """The object pickle reduced to class `cls`, `module:qualname`, and `state`:
-    an enum member from its value, a dict from its (key, value) pairs, any other
-    object from its (attribute, value) pairs."""
+    an enum member from its value, a dict from its (key, value) pairs, a
+    NamedTuple from its (field, value) pairs, any other object from its
+    (attribute, value) pairs."""
     cls = _function(cls)
     if issubclass(cls, enum.Enum):
         return cls(state)
     state = dict(state)
     if cls is dict:
         return state
+    if _pytree.is_namedtuple_class(cls):
+        return cls(**state)
     obj = cls.__new__(cls)
     if setstate := getattr(obj, "__setstate__", None):
         setstate(state)
@@ -680,6 +683,9 @@ class _Recorder(TorchDispatchMode):
             return ir.ModuleRef(self._layered(self.modules[id(value)]))
         if isinstance(value, str) and value in self.contexts:
             return ir.ContextRef(self._layered(value))
+        if _pytree.is_namedtuple_instance(value):  # its callee reads fields by name
+            items = value._asdict().items()
+            return Reduced(_class(value), tuple((k, self._arg(v)) for k, v in items))
         if isinstance(value, (list, tuple)):
             return tuple(self._arg(v) for v in value)
         if isinstance(value, (torch.dtype, torch.device, torch.layout)):
