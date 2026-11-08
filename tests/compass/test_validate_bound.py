@@ -375,8 +375,9 @@ def test_a_run_under_other_performance_variables_refuses_naming_each(
         _main(monkeypatch, tmp_path, [slow], more=["--ops", str(out)])
 
     assert str(refused.value) == (
-        f"{out if ops else slow / 'steps'} ran under another engine than this "
-        "process prices: env ATOM_NUMA_BIND '1' in its engine file and None here; "
+        f"{out if ops else slow / 'steps'} ran under other performance variables "
+        "than this process's, which builds the model and keys the op graphs under "
+        "its own: env ATOM_NUMA_BIND '1' in its engine file and None here; "
         "env ATOM_USE_TRITON_MOE None in its engine file and '1' here"
     )
 
