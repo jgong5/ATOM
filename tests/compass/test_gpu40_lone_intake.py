@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """mi355-gpu-40's spec states the per-byte intake rate that lone requests of a
 served DeepSeek-V4.1-Flash cell's bodies read, beside the burst's fixed term at
-that rate, and a simulated run on it charges the cell's mean body about what
-the cell's loop took to take it in."""
+that rate, and a simulated run under the law file captured there charges the
+cell's mean body about what the cell's loop took to take it in."""
 
 import asyncio
 import json
@@ -25,7 +25,8 @@ from atom.compass import run as compass_run
 from atom.utils.clock import LPRuntime
 from atom.utils.compass_loop import CompassEventLoop, HttpChannel
 
-GPU40 = SPEC_ROOT / "scripts" / "compass" / "machines" / "mi355x-gpu40.json"
+LAW = SPEC_ROOT / "scripts/compass/laws"
+GPU40 = LAW / "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-decode.json"
 #: The DeepSeek-V4.1-Flash TP4 DSpark5 cc-traces c=16 cell as a real recording
 #: at 0cd22bcc3 read it, over its long prompts: the mean body, and the loop's
 #: mean intake of one.
@@ -57,8 +58,8 @@ def test_a_simulated_run_on_gpu40_charges_a_lone_cell_body_what_the_cell_took(
     run, monkeypatch, tmp_path  # noqa: F811
 ):
     path = tmp_path / "run.json"
-    machine = json.loads(GPU40.read_text())
-    path.write_text(json.dumps({"bound_s": 600.0, "machine": machine}))
+    host = json.loads(GPU40.read_text())["host"]
+    path.write_text(json.dumps({"bound_s": 600.0, "host": host}))
     monkeypatch.setenv(compass_run.ENV, str(path))
     stamps = queue.Queue()
 

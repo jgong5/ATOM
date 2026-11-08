@@ -37,11 +37,12 @@ member, the frontend's included, connects to.
 - `runner(runner, tree)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
-  ``decode`` to the frontend's clock, at the rates the machine spec measured.
-  A machine spec that refuses the tokenizer stops the run as a signal would,
-  so the engines leave and the server exits on the refusal.
+  ``decode`` to the frontend's clock, at the rates of its ``host`` entry's
+  ``tokenizer`` term. A term that refuses the tokenizer stops the run as a
+  signal would, so the engines leave and the server exits on the refusal.
 - `http_intake()` is what `atom.utils.compass_loop.HttpChannel` charges the
-  frontend's event loop for each request it takes in.
+  frontend's event loop for each request it takes in, from the ``host``
+  entry's ``http_intake`` term.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
   finish, each handing in its LP's refusals; the frontend's, when it co-hosts
   the authority, then writes the step table and the run summary. A SIGINT or
@@ -109,8 +110,13 @@ fitted under and the ``machine_spec`` digest of the spec of the platform they
 were fitted on, which a run with laws must match; ``admit``, coefficients on
 a forward's admissions, which add to its ``E``, or null to refuse a forward
 that admits a request, and absent from an entry whose ``E`` laws hold them;
-``skip``, segments zeroed for a what-if run, which the graders refuse; a list
-of them as ``step_linear``'s),
+``skip``, segments zeroed for a what-if run, which the graders refuse;
+``tokenizer``, the served tokenizer's ``backend`` (``fast`` or ``slow``), the
+``fingerprint`` of the ``tokenizer.json`` it was fitted on, and ``encode`` and
+``decode``, each ``fixed_s`` and ``tokens_per_s``; ``http_intake``,
+``fixed_s`` and ``per_byte_s``, with ``idle_s`` optional; a term an entry
+lacks, or every term with no entry, is charged 0 s and the run summary names
+it under ``uncharged_host_terms``; a list of them as ``step_linear``'s),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
 ``decode/``, ``prefill<k>/`` and ``decode<k>/`` above one of a side, and for a
@@ -231,6 +237,7 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 from collections import Counter
 from pathlib import Path
 
@@ -309,7 +316,9 @@ HAND_IN_WAIT_S = 300.0
 PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
-SUMMARY_SCHEMA_VERSION = 12
+SUMMARY_SCHEMA_VERSION = 13
+#: The terms of a ``host`` entry the frontend charges, each 0 s where it is absent.
+HOST_TERMS = ("http_intake", "tokenizer")
 #: Compass source the host-law key leaves out, by path under the package: all
 #: of it (None), or the top-level names (def, class or assigned) only a simulated
 #: run reaches, with the comments above each and the module docstring.
@@ -393,6 +402,8 @@ _early_end: threading.Thread | None = None
 _member: str | None = None
 #: The SIGTERM handler this engine process set aside as it said READY.
 _sigterm_at_ready: list = []
+#: This server's ``host`` entry among several, which `tokenizer` resolves.
+_frontend_host: dict | None = None
 
 
 def spec() -> dict | None:
@@ -425,12 +436,13 @@ def spec() -> dict | None:
 
 
 def _check_host(path, host: dict) -> None:
-    """Refuse a ``host`` entry the runner would read as zero host time."""
+    """Refuse a ``host`` entry the runner would read as zero host time, or
+    whose ``tokenizer`` or ``http_intake`` term the frontend would misread."""
     from atom.compass.runner.overrides import ADMISSION_IN_E, FORWARD_KINDS, SEGMENTS
 
     laws = host.get("laws", {})
     if (
-        set(host) - {"laws", "skip", "key", "admit"}
+        set(host) - {"laws", "skip", "key", "admit", *HOST_TERMS}
         or set(host.get("skip", ())) - set(SEGMENTS)
         or set(laws) - set(FORWARD_KINDS)
         or {s for v in laws.values() for s in v} - set(SEGMENTS)
@@ -440,9 +452,46 @@ def _check_host(path, host: dict) -> None:
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
-            "admit, three coefficients on a forward's admissions or null, and "
-            "key, the host key the laws were fitted under"
+            "admit, three coefficients on a forward's admissions or null, "
+            "key, the host key the laws were fitted under, and the terms "
+            f"{' and '.join(HOST_TERMS)}"
         )
+    tok, intake = host.get("tokenizer"), host.get("http_intake")
+    if tok is not None and not (
+        isinstance(tok, dict)
+        and tok.keys() == {"backend", "fingerprint", "encode", "decode"}
+        and tok["backend"] in ("fast", "slow")
+        and isinstance(tok["fingerprint"], str)
+        and all(
+            _seconds(tok[k], {"fixed_s", "tokens_per_s"}) for k in ("encode", "decode")
+        )
+        and tok["encode"]["tokens_per_s"] > 0 < tok["decode"]["tokens_per_s"]
+    ):
+        raise ValueError(
+            f"{path}: host's tokenizer is {tok!r}; it takes backend, fast or slow, "
+            "fingerprint, the tokenizer.json it was fitted on, and encode and "
+            "decode, each fixed_s and a positive tokens_per_s"
+        )
+    if intake is not None and not _seconds(
+        intake, {"fixed_s", "per_byte_s"}, {"idle_s"}
+    ):
+        raise ValueError(
+            f"{path}: host's http_intake is {intake!r}; it takes fixed_s and "
+            "per_byte_s, and idle_s optional, each a non-negative number"
+        )
+
+
+def _seconds(term, required: set, optional: set = frozenset()) -> bool:
+    """Whether `term` is a mapping of the `required` fields and any `optional`
+    ones, each a finite non-negative number."""
+    return (
+        isinstance(term, dict)
+        and required <= term.keys() <= required | optional
+        and all(
+            type(v) in (int, float) and math.isfinite(v) and v >= 0
+            for v in term.values()
+        )
+    )
 
 
 def _dp(run: dict, side: str | None = None) -> int:
@@ -1891,34 +1940,55 @@ def _graph_pool(model_runner, machine, model):
 
 def tokenizer(tok, config) -> None:
     """Wrap `tok`'s ``encode`` and ``decode``, and its Rust backend's
-    ``encode_batch``, with the machine spec's entry for the model's architecture
-    and the backend that loaded; the entry warns when the loaded
-    ``tokenizer.json`` is not the one it was measured on. A refused entry
-    ends the run before the server serves (`_end_before_serving`)."""
+    ``encode_batch``, with the ``tokenizer`` term of this server's ``host``
+    entry, its engine config's among several: a term fitted on another backend
+    is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
+    ends the run before the server serves (`_end_before_serving`). With no
+    term, `tok` is left as it is, charging 0 s."""
+    global _frontend_host
     run = spec()
     if run is None:
         return
     from tokenizers import Tokenizer
 
-    from atom.compass.spec import Backend
+    from atom.compass.spec.rules import FingerprintMismatch
     from atom.utils.compass_loop import wrap_decode, wrap_encode, wrap_encode_batch
 
     try:
-        entry = _machine(run).tokenizer_for(
-            config.hf_config.architectures[0],
-            Backend.FAST if tok.is_fast else Backend.SLOW,
-            _fingerprint(tok),
-        )
+        host = run.get("host", {})
+        if isinstance(host, list):
+            from atom.compass.run.step_grid import keyed
+
+            host = _frontend_host = _fitted_here(
+                host, keyed(config), lambda e: e.get("key", {}).get("engine"), "host"
+            )
+        term = host.get("tokenizer")
+        if term is None:
+            return
+        backend = "fast" if tok.is_fast else "slow"
+        if term["backend"] != backend:
+            raise ValueError(
+                f"the host laws' tokenizer was fitted on the {term['backend']} "
+                f"backend and the server loaded the {backend} one, which runs an "
+                "order of magnitude apart on one tokenizer.json"
+            )
     except BaseException as e:
         _end_before_serving(run, e)
         raise
-    tok.encode = wrap_encode(tok.encode, entry)
-    tok.decode = wrap_decode(tok.decode, entry)
+    if (loaded := _fingerprint(tok)) not in (None, term["fingerprint"]):
+        warnings.warn(
+            f"the host laws' tokenizer was fitted on {term['fingerprint']}, but "
+            f"the tokenizer.json now loaded hashes to {loaded}",
+            FingerprintMismatch,
+            stacklevel=2,
+        )
+    tok.encode = wrap_encode(tok.encode, term["encode"])
+    tok.decode = wrap_decode(tok.decode, term["decode"])
     # ATOM's segment tokenizer, which only a Rust backend gets, encodes a long
     # prompt's uncached segments with its ``encode_batch``, not ``encode``.
-    backend = getattr(tok, "_tokenizer", None)
-    if isinstance(backend, Tokenizer):
-        backend.encode_batch = wrap_encode_batch(backend.encode_batch, entry)
+    rust = getattr(tok, "_tokenizer", None)
+    if isinstance(rust, Tokenizer):
+        rust.encode_batch = wrap_encode_batch(rust.encode_batch, term["encode"])
 
 
 def _end_before_serving(run: dict, e: BaseException) -> None:
@@ -1936,14 +2006,23 @@ def _end_before_serving(run: dict, e: BaseException) -> None:
 
 def http_intake() -> tuple[float, float, float] | None:
     """``(fixed_s, per_byte_s, idle_s)``, the frontend loop's time to take in one
-    HTTP request, from the run's machine spec, ``fixed_s`` standing for an unstated
-    ``idle_s``; None on a real run or a run file with no machine spec."""
+    HTTP request, from the ``http_intake`` term of this server's ``host`` entry,
+    the one `tokenizer` resolved among several, ``fixed_s`` standing for an
+    unstated ``idle_s``; None on a real run or with no term."""
     run = spec()
-    if run is None or "machine" not in run:
+    if run is None:
         return None
-    machine, terms = _machine(run), ("fixed_s", "per_byte_s")
-    fixed, per_byte = (machine.value(f"host.http_intake.{k}") for k in terms)
-    return fixed, per_byte, machine.values.get("host.http_intake.idle_s", fixed)
+    host = run.get("host", {})
+    if isinstance(host, list):
+        if _frontend_host is None:
+            raise ValueError(
+                "the run file holds a host entry per engine config, and none was "
+                "resolved for this server's: compass_run.tokenizer resolves it"
+            )
+        host = _frontend_host
+    if (term := host.get("http_intake")) is None:
+        return None
+    return term["fixed_s"], term["per_byte_s"], term.get("idle_s", term["fixed_s"])
 
 
 def _fingerprint(tok) -> str | None:
@@ -2383,6 +2462,9 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
         schedule["fallback_reasons"] = None
         schedule["refusals"].update(steps=None, fraction_of_steps=None)
     summary["configuration"] = configuration(run)
+    summary["uncharged_host_terms"] = sorted(
+        {t for h in entries(run, "host") or [{}] for t in HOST_TERMS if t not in h}
+    )
     summary["schema_version"] = SUMMARY_SCHEMA_VERSION
     summary["source_root"] = a.source_root.as_json()
     if "router" in run:

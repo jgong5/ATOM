@@ -115,9 +115,9 @@ def test_b0_shares_a0_s_peaks_and_carries_mi355x_s_ratios_never_a0_s_readings():
 
 
 def test_a_run_on_a0_charges_the_intake_the_node_s_bursts_fitted(monkeypatch, tmp_path):
-    """The frontend loop's intake a simulated run on A0's spec charges: the
-    terms the node's bursts fitted, probed from their record and band, and no
-    longer mi355-gpu-45's."""
+    """The frontend loop's intake a simulated run on A0 charges, from its law
+    file's host entry: the terms the node's bursts fitted, probed from their
+    record and band, and no longer mi355-gpu-45's."""
     from atom.compass import run as compass_run
 
     _, _, terms, band, record = _script().INTAKE
@@ -131,8 +131,9 @@ def test_a_run_on_a0_charges_the_intake_the_node_s_bursts_fitted(monkeypatch, tm
         assert (origin["p10"], origin["p90"]) == band[term]
         assert terms[term] != mi355x.value(f"host.http_intake.{term}")
     run = tmp_path / "run.json"
-    machine = json.loads(A0.read_text())
-    run.write_text(json.dumps({"bound_s": 600.0, "machine": machine}))
+    law = SCRIPTS / "laws" / "deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json"
+    host = json.loads(law.read_text())["host"]
+    run.write_text(json.dumps({"bound_s": 600.0, "host": host}))
     monkeypatch.setenv(compass_run.ENV, str(run))
     fixed = terms["fixed_s"]
     # No lone request was timed on the node, so the fixed term stands for idle.

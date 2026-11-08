@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """The HTTP intake probe: what it stamps on a server it runs, what its fit
-recovers, and the machine specs that state its terms."""
+recovers, and the machine specs that state its terms; and the run's ``host``
+entry, whose ``http_intake`` a simulated run charges."""
 
 import hashlib
 import importlib.util
@@ -155,6 +156,40 @@ def test_a_stall_on_the_loop_moves_the_fixed_term_and_not_the_per_byte_one(
     assert 63 * got["fixed_s"] + sum(sizes[1:]) * got["per_byte_s"] == pytest.approx(
         span
     )
+
+
+def _host(monkeypatch, tmp_path, intake):
+    from atom.compass import run as compass_run
+
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"bound_s": 600.0, "host": {"http_intake": intake}}))
+    monkeypatch.setenv(compass_run.ENV, str(path))
+    return compass_run
+
+
+@pytest.mark.parametrize(
+    "intake",
+    [
+        {"per_byte_s": 5.6e-9, "idle_s": 1.1e-3},
+        {"fixed_s": 4.3e-3, "idle_s": 1.1e-3},
+        {"fixed_s": 4.3e-3, "per_byte_s": 5.6e-9, "derate": 1.0},
+        {"fixed_s": -4.3e-3, "per_byte_s": 5.6e-9},
+    ],
+    ids=["no-fixed", "no-per-byte", "unknown-field", "negative"],
+)
+def test_an_intake_a_charge_would_misread_is_refused(monkeypatch, tmp_path, intake):
+    compass_run = _host(monkeypatch, tmp_path, intake)
+    with pytest.raises(ValueError, match="host's http_intake is"):
+        compass_run.http_intake()
+
+
+def test_an_intake_with_no_idle_term_charges_its_fixed_one_to_a_lone_request(
+    monkeypatch, tmp_path
+):
+    compass_run = _host(
+        monkeypatch, tmp_path, {"fixed_s": 4.3e-3, "per_byte_s": 5.6e-9}
+    )
+    assert compass_run.http_intake() == (4.3e-3, 5.6e-9, 4.3e-3)
 
 
 def test_a_fit_at_a_given_rate_keeps_the_burst_span(tmp_path):

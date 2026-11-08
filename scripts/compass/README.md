@@ -706,10 +706,10 @@ The header of the script lists its environment; `MODEL`, `TRACES` and
   the sha256 of `TRACES` and of each replayed trace, the aiperf arguments and the
   pinned benchmark id. The step table's configuration line and the run summary
   carry it.
-- Since the served tokenizer is charged, a tokenizer entry of the run file's
-  machine spec must name the model's architecture
-  (`Qwen3_5ForConditionalGeneration` for a Qwen3.8-27B `config.json`), or the
-  server refuses to start.
+- The served tokenizer and the HTTP intake are charged from the run file's
+  `host` entry (`--host-laws`): a `tokenizer` term fitted on the other backend
+  refuses to start the server, and a term the entry lacks is charged 0 s and
+  named in the run summary's `uncharged_host_terms`.
 - `HARNESS_PYTHON` is a Python with agentx-harness 56a0cf70 and compass-harness
   installed; the script puts this tree's `compass_harness` first on `PYTHONPATH`
   and refuses (exit 92) when it resolves elsewhere.
