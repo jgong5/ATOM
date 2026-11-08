@@ -303,17 +303,19 @@ class SimExecutor(ThreadPoolExecutor):
 
 def charge(d: float) -> None:
     """Charge `d` to this thread's station job; with none open, in the run, the
-    caller is the clock owner and advances the LP clock by `d` (`advance_to`
-    refuses any other thread), on an event loop only once every open service
-    job is placed, so one that completes inside the charge is not late."""
+    caller is the clock owner and advances the LP clock by `d`, on an event
+    loop only once every open service job is placed, so one that completes
+    inside the charge is not late. `advance_to` refuses any other thread before
+    it places anything, so the loop's jobs are placed only on its own thread."""
     cur = getattr(job, "cur", None)
     if cur is not None:
         cur[0].charge(cur[1], d)
         return
     rt = clock.installed()
     if rt is not None and rt.in_run:
-        if rt.loop is not None and rt.loop.executor.station is not None:
-            rt.loop.executor.place(wait=True)
+        loop = rt.loop if threading.current_thread() is rt.owner else None
+        if loop is not None and loop.executor.station is not None:
+            loop.executor.place(wait=True)
         rt.advance_to(rt.now + d)
 
 
@@ -548,7 +550,7 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         ``(arrival, seq)`` order; returns whether any was woken."""
         rt = self.rt
         with rt.lock:
-            if any(not rt.released[ch] <= rt.arrived[ch] for ch, _ in self.held):
+            if any(rt.unread[ch] for ch, _ in self.held):
                 return False
             out = sorted(
                 (a, seq, ch)
@@ -567,11 +569,7 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         rt = self.rt
         with rt.lock:
             return min(
-                (
-                    (seq, ch)
-                    for ch, got in rt.released.items()
-                    for seq in got - rt.arrived[ch]
-                ),
+                ((seq, ch) for ch, got in rt.unread.items() for seq in got),
                 default=None,
             )
 

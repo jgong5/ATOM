@@ -11,8 +11,10 @@ decode one per capture rung, each over the features `StepStubBackend` reads:
 
 A prefill vector may add `history`, Sum (N_KV - N_Q): the KV a chunk reads
 on its cached history, which a short chunk on a deep history pays apart from
-its attention arithmetic, and then `moe_rows`, the rows the data-parallel
-group's MoE gather carries (`BatchView.moe_rows`), which every rank's MoE runs on.
+its attention arithmetic; then `cached_seqs`, its rows with cached context
+(N_KV above N_Q), each of which adds a cost whatever its history's length;
+and then `moe_rows`, the rows the data-parallel group's MoE gather carries
+(`BatchView.moe_rows`), which every rank's MoE runs on.
 After `moe_rows` it may add `serial_moe_rows`: `moe_rows` on a step the group did
 not split for two-batch overlap (`BatchView.tbo_tokens` None), else 0, the MoE
 rows no second micro-batch overlaps.
@@ -30,7 +32,11 @@ MoE runs on: a data-parallel group's gathered tokens (`BatchView.moe_tokens`),
 or on one rank, which has no `moe_rows`, the step's own; a data-parallel step
 stating no `moe_tokens` is refused. The column is `moe_tokens`, `n` itself, or
 `moe_experts`, the routed experts those tokens are expected to reach,
-`E (1 - (1 - K/E)^n)` for the law's `moe_routing` `{"experts": E, "top_k": K}`.
+`E (1 - (1 - K/E)^m)` for the law's `moe_routing` `{"experts": E, "top_k": K}`,
+over `m`, `n` with the group's dummy forwards (`BatchView.group_dummies`)
+counted as one token: each dummy runs one row, token 0 at position 0, so
+together they reach one token's experts, where `n` counts each dummy's row.
+Under a drafter a dummy runs `mtp_k + 1` rows, and `m` merges one row per dummy.
 The gather pads every rank to the rung, and a pad row reaches no expert
 (before #2340, the one expert set of token 0), so at one rung the MoE's work
 follows the group's real tokens, which an uneven spread over the ranks leaves
@@ -137,6 +143,8 @@ from atom.compass.backends.work import activated_experts
 
 PREFILL = ("step", "tokens", "query_square", "query_cached")
 HISTORY = PREFILL + ("history",)
+#: The prefill vector's optional features, in the order they follow `PREFILL`.
+PREFILL_EXTRA = ("history", "cached_seqs", "moe_rows", "serial_moe_rows", "seqs", "out")
 DECODE = ("step", "context", "graph_padding")
 #: The MoE columns a decode vector may add, over its step's real MoE tokens.
 MOE_COLUMNS = ("moe_tokens", "moe_experts")
@@ -189,12 +197,22 @@ def moe_tokens(view: BatchView) -> int | None:
     return view.moe_tokens
 
 
-def moe_column(feature: str, tokens: int, routing: tuple[int, int] | None) -> float:
+def moe_column(
+    feature: str, tokens: int, routing: tuple[int, int] | None, dummies: int = 0
+) -> float:
     """MoE column `feature` of `MOE_COLUMNS` for a step of `tokens` real MoE
-    tokens, `moe_experts` over `routing`, the (experts, top-k) of `moe_routing`."""
+    tokens, `dummies` of them its data-parallel group's dummy forwards' rows:
+    `moe_tokens` counts each row, `moe_experts`, over `routing`, the (experts,
+    top-k) of `moe_routing`, counts the dummies' rows as one token, since
+    every dummy runs the same row."""
     if feature == "moe_experts":
-        return activated_experts(*routing, tokens)
+        return activated_experts(*routing, tokens - max(dummies - 1, 0))
     return float(tokens)
+
+
+def cached_seqs(rows) -> int:
+    """How many of `rows` have cached context, N_KV above N_Q."""
+    return sum(1 for r in rows if r.cached_tokens)
 
 
 def rowmod(context, k: int) -> int:
@@ -217,11 +235,7 @@ class StepLinearLaw:
         self.prefill = None
         if "prefill" in law:
             prefill = law["prefill"]
-            extra = [
-                f
-                for f in ("history", "moe_rows", "serial_moe_rows", "seqs", "out")
-                if f in prefill["coefficients"]
-            ]
+            extra = [f for f in PREFILL_EXTRA if f in prefill["coefficients"]]
             self.prefill = _Vector("prefill", PREFILL + tuple(extra), prefill)
         self.decode = {
             None if rung == EAGER else int(rung): _Vector(
@@ -330,6 +344,8 @@ class StepLinearBackend(CostBackend):
             )
             if "history" in vector.features:
                 counts += (sum_context(prefill) - sum_tokens(prefill),)
+            if "cached_seqs" in vector.features:
+                counts += (cached_seqs(prefill),)
             if "moe_rows" in vector.features:
                 if batch_view.moe_rows is None:
                     raise self._refuse(batch_view, "no MoE gather rows on this step")
@@ -362,7 +378,10 @@ class StepLinearBackend(CostBackend):
                 tokens = moe_tokens(batch_view)
                 if tokens is None:
                     raise self._refuse(batch_view, "no MoE group tokens on this step")
-                counts += tuple(moe_column(f, tokens, law.moe_routing) for f in moe)
+                dummies = batch_view.group_dummies
+                counts += tuple(
+                    moe_column(f, tokens, law.moe_routing, dummies) for f in moe
+                )
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
         terms, kv = self._priced(law, vector, kind, counts, what), []

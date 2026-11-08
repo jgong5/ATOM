@@ -33,6 +33,8 @@ LAYERS = json.loads(CONFIG.read_text())["num_hidden_layers"]
 SHAPES = "--width 1 --width 2 --prefill 512 1 --prefill 512 2"
 DPA_TP8 = " -- --kv_cache_dtype fp8 --enable-dp-attention"
 EP8 = " --enable-expert-parallel"
+#: A P/D prefill side's transfer config, as a 1P1D cell's prefill record states it.
+PRODUCER = ' --kv-transfer-config {"kv_role":"kv_producer","kv_connector":"mooncake"}'
 DP = 8
 MOE = "atom.model_ops.moe"
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp"
@@ -42,6 +44,8 @@ PS_DECODE = "aiter.mla_decode_v4_ps_asm.default"
 INDEXER = "aiter.indexer_score_topk.default"
 QKN = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
 QKN_BF16 = "aiter.ops.flydsl.kernels.qk_norm_rope_quant:flydsl_qk_norm_rope_quant"
+#: The indexer's query rotation and quantization under an fp8 indexer cache.
+FP8_QUERY = "aiter._rope_rotate_activation_fp8quant.default"
 #: The bf16 KV cache's decode leaf, a Triton launch lifted to its function.
 BF16_DECODE = (
     "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
@@ -307,6 +311,21 @@ def test_the_bf16_cache_s_qk_norm_states_its_ratio_beside_the_rows_it_writes(
         assert qkn["stated"] == {"compress_ratio": ratio}
         for slot in ("swa_dest_rows", "batch_id_per_token"):
             assert qkn["args"][slot]["role"] == "metadata"
+
+
+def test_a_mooncake_producer_traces_its_steps_with_its_indexer_cache_in_fp8(
+    tmp_path_factory,
+):
+    # A Mooncake connector would register the fake KV pool, which has no
+    # address. P/D pins the indexer cache to fp8, where gfx950 takes fp4.
+    config = json.loads(CONFIG.read_text())
+    graphs = capture(tmp_path_factory, "--width 2 --prefill 512 2" + DPA_TP8 + PRODUCER)
+
+    assert graphs.keys() == {"decode B=2", "prefill T=512 B=2"}
+    indexed = [int(ratio == 4) for ratio in config["compress_ratios"][:LAYERS]]
+    for graph, _ in graphs.values():
+        layers = [[op["op"] for op in layer] for layer in _decoder(graph)]
+        assert [names.count(FP8_QUERY) for names in layers] == indexed
 
 
 def test_tp8_without_dp_attention_reduces_in_each_layer_and_declares_nothing(

@@ -36,7 +36,7 @@ def dp_summary(monkeypatch, tmp_path, ranks):
     for rank, r in enumerate(ranks):
         monkeypatch.setattr(compass_run, "_member", f"dp{rank}")
         compass_run.engine_done(SimpleNamespace(runner_mgr=Worker(r)))
-    authority.started = authority.finished = time.monotonic()
+    authority.finished = time.monotonic()
     monkeypatch.setattr(compass_run, "_authority", authority)
     frontend = LPRuntime(compass_run.FRONTEND, table, None)
     frontend.now = math.inf
@@ -63,7 +63,7 @@ def test_a_dp_attention_run_at_dp2_names_uniform_routing_and_its_steps(
 
     assert out["schedule"]["treatments"] == {"uniform routing": 4}
     assert out["schedule"]["refusals"]["steps"] == 4
-    assert out["schema_version"] == compass_run.SUMMARY_SCHEMA_VERSION == 12
+    assert out["schema_version"] == compass_run.SUMMARY_SCHEMA_VERSION == 13
 
 
 def test_a_one_rank_run_names_no_treatment(monkeypatch, tmp_path):

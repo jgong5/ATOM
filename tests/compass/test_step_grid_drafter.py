@@ -35,6 +35,7 @@ from test_backend_step_grid import (
 from test_backend_step_grid_fit import BENCHED, clients, loaded
 from test_backend_step_grid_fit import fitted as fit_steps
 from test_backend_step_grid_fit import view as line_view
+from test_backend_step_linear_fit import traced
 from test_backend_step_roofline_v41 import CONFIG as V41_CONFIG
 from test_bench_replay_drafter import config, scheduled
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
@@ -364,7 +365,7 @@ def flash_record(tmp_path, run, lines, monkeypatch):
     written = [json.loads(x) for x in path.read_text().splitlines()]
     for line, x in zip(written, lines):
         line["d_target_ns"] = round(target(x) * 1e9)
-    path.write_text("".join(json.dumps(x) + "\n" for x in written))
+    path.write_text("".join(json.dumps(traced(x)) + "\n" for x in written))
     return directory
 
 

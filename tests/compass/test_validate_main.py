@@ -164,7 +164,7 @@ def test_a_cell_is_graded_from_every_source_and_its_method_shares_grade_nothing(
     )
     # Every step the cost rows leave out is named, a warm one with its real seconds.
     assert rows["cost real0", "left out"][0] == (
-        'not labelled {"exposed": 0, "mixed": 0, "unsplit": 0, "paced": 0}; warm steps, real s {5: 0.81}'
+        'not labelled {"exposed": 0, "mixed": 0, "unsplit": 0, "untraced": 0, "traced": 0}; warm steps, real s {5: 0.81}'
     )
     assert rows["cost real0", "prefill validated"][0].startswith("9 steps")
     assert rows["cost real1", "left out"][0].endswith("warm steps, real s {}")
@@ -888,6 +888,7 @@ def test_an_op_graph_cell_grades_with_its_method_shares_term_gaps_and_warm_over_
         "host": {"laws": {}},
     }
     (sim / "run.json").write_text(json.dumps(run))
+    (sim / "steps" / "dp0.engine.json").write_text(json.dumps({"env": {}}))
     # Decode's small GEMM is listed at its measured 20 ms, a large one is its
     # roofline, about 30 ms; prefill of 190 tokens has no graph.
     large = gemm_leaf(4096, 4096, 4096)
@@ -903,7 +904,7 @@ def test_an_op_graph_cell_grades_with_its_method_shares_term_gaps_and_warm_over_
     )
     built = []
 
-    def op_graph(run_file, config, machine, ep):
+    def op_graph(run_file, config, machine, ep, env=None):
         built.append((run_file, config.atom_args, ep))
         return OpGraphBackend(
             SPEC,

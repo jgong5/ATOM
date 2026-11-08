@@ -470,7 +470,13 @@ memory` takes them per configuration into a `memory_readings` entry (`07` D38, P
 class 1's `http-intake` burst, filled the spec's host block. The tokenizer and the HTTP
 intake are now timed on what a `compass record` server serves and fitted by `compass fit
 host` (D25, `07` D38); nothing read the IPC round trips or the host's core counts.
-`scripts/compass/http_intake.py` stays as a check of the hops (`12` T47).
+`scripts/compass/http_intake.py` stays as a check of the hops (`12` T47). A first-turn
+burst's bodies carry few messages, and the loop's cost per byte grows with a body's
+message count, so gpu-40's spec took `per_byte` from `http_intake.py lone` over a
+lone run of a served cell's bodies, the median over passes of each pass's Theil-Sen slope
+on body bytes, and the burst's `fixed` alone at that rate (`http_intake.py fit STAMPS N
+PER_BYTE_S`) ([#2681](https://github.com/jgong5/ATOM/issues/2681)); `fit host` fits the
+intake the same way (`07` D38, Phase 1c).
 
 **Class 1 — one GPU of the target type.** `measure device` runs each but
 `device-memory`, whose capacity a datasheet states once per SKU.

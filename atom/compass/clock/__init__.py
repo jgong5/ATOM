@@ -29,6 +29,7 @@ from .authority import (
     ClockAbort,
     ClockAuthority,
     LpRow,
+    Released,
 )
 from .channels import (
     Channel,
@@ -64,6 +65,7 @@ __all__ = [
     "LpRegistry",
     "LpRow",
     "RefusalTally",
+    "Released",
     "RunSummary",
     "TimelineLog",
     "TimelineRecord",
