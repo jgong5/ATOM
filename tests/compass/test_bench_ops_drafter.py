@@ -150,6 +150,22 @@ def test_a_drafter_s_pass_of_its_own_rows_counts_them_as_batch_info_states():
     assert {rows: bound[sig].item() for rows, sig in sigs.items()} == {24: 24, 20: 20}
 
 
+def test_a_placement_keeps_the_clone_of_a_view_whose_nans_stand_unchanged():
+    # A drafter's draft-KV pass reads ATOM's uninitialised `outputs`: by value
+    # its NaNs never equal their clone's, and each placement cloned it again.
+    runner = _Runner()
+    runner.forward_vars["outputs"] = torch.full((6,), float("nan"))
+    stub = ops.Stub(runner, 10_000)
+    leaf = _leaf("aten.cat.default", ("tensors", (_t([6], "metadata"),)))
+    stub.leaves = ops.leaves(_graph(leaf, layers=1)["region"])
+
+    for p in range(2):
+        stub._prepare((4 * p, 2 * p))
+
+    first, second = ([v for _, v in views.values()] for _, views in stub.placed)
+    assert first[0] is second[0]
+
+
 def test_a_drafter_s_moe_draws_its_ids_over_its_own_experts():
     stub = ops.Stub(_Drafting(), 10_000)
 

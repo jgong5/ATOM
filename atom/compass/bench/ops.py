@@ -431,6 +431,8 @@ TOPK_WORKSPACE = {
 SNAPSHOTS = "v_cache"
 #: The seed of a copy's drawn expert ids, with the copy's index.
 SEED = 0
+#: An integer dtype of each element size, which compares a tensor's bits.
+BITS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
 RANK = Topology().ranks()[0]
 #: The runner's metadata builders the KV allocation may bind on: DeepSeek-V4.1's
@@ -600,15 +602,16 @@ def leaves_at(store, config, shape, arch=None) -> dict[str, tuple[dict, list]]:
     from atom.compass.artifacts import ArtifactRefusal
 
     found = leaves(graph(store, config, shape, arch)["region"])
-    target = set(found)
-    for output, draft in DRAFTED if config.speculative_config else ():
+    target, drafter = set(found), getattr(config, "speculative_config", None)
+    for output, draft in DRAFTED if drafter else ():
         try:
             region = graph(store, config, shape, arch, output, draft)["region"]
         except ArtifactRefusal:
             continue
         leaves(region, None, found)
-    for sig in found.keys() - target:
-        found[sig][0]["drafted"] = True
+    for sig, (op, _) in found.items():
+        if sig not in target:
+            op["drafted"] = True
     return found
 
 
@@ -2245,14 +2248,16 @@ def _clone(t) -> torch.Tensor:
 
 def _deep(x, memo, clones=None):
     """`x` with every tensor it reaches through dataclasses, ATOM objects,
-    dicts and lists cloned, aliases kept; with `clones`, a tensor whose values
-    have not changed since the last clone of its live view takes that clone."""
+    dicts and lists cloned, aliases kept; with `clones`, a tensor whose bits
+    have not changed since the last clone of its live view takes that clone:
+    an uninitialised buffer's NaNs equal nothing by value."""
     if id(x) in memo:
         return memo[id(x)]
     if torch.is_tensor(x):
         key = x.data_ptr(), x.shape, x.stride(), x.dtype
         twin = None if clones is None else clones.get(key)
-        if twin is None or not torch.equal(twin, x):
+        bits = BITS.get(x.element_size(), x.dtype)
+        if twin is None or not torch.equal(twin.view(bits), x.view(bits)):
             twin = _clone(x)
         memo[id(x)] = twin
         if clones is not None:
@@ -2661,7 +2666,7 @@ def parts(names, config) -> list:
     step that samples, at the step's shape."""
     from atom.compass.capture import population_steps
 
-    spec, steps = config.speculative_config, []
+    spec, steps = getattr(config, "speculative_config", None), []
     for shape, line in population_steps(names, config.enable_tbo, drafters=True):
         if steps and line is steps[-1][0]:  # the drafter's own shape, past its step's
             reads = steps[-1][1]
