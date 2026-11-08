@@ -30,7 +30,7 @@ from unittest import mock
 
 import pytest
 import torch
-from test_memory_readings import DOCUMENT, META_8B, TOKENIZER, publish_readings
+from test_memory_readings import DOCUMENT, META_8B, publish_readings
 
 from atom.compass import run as compass_run
 from atom.compass.backends.step_stub import Coefficients
@@ -54,6 +54,13 @@ NEEDS_A_RUN = pytest.mark.skipif(
 TREE = Path(__file__).resolve().parents[2]
 TRAFFIC = LpId("traffic")
 HTTP, STREAM = "traffic->frontend:http", "frontend->traffic:stream"
+#: The served tokenizer's charge, as the slice's `host` entry states it.
+TOKENIZER = {
+    "backend": "fast",
+    "fingerprint": "sha256:" + "a" * 64,
+    "encode": {"fixed_s": 3.0e-4, "tokens_per_s": 2.0e6},
+    "decode": {"fixed_s": 1.5e-4, "tokens_per_s": 3.0e6},
+}
 SCRAPE_S = 16.0
 WALL_S = 600.0
 MAX_TOKENS = 4
@@ -234,7 +241,12 @@ def run_slice(out: Path, seed: str) -> dict:
     out.mkdir()
     with held_ports(2) as (clock_port, port):
         endpoint = f"tcp://127.0.0.1:{clock_port}"
-        run_file = _run_file(out, clock_endpoint=endpoint, step_stub=CONSTANT)
+        run_file = _run_file(
+            out,
+            clock_endpoint=endpoint,
+            step_stub=CONSTANT,
+            host={"tokenizer": TOKENIZER},
+        )
         env = dict(
             os.environ,
             PYTHONHASHSEED=seed,
@@ -322,8 +334,8 @@ def test_the_served_tokenizer_charges_the_request_its_encode_and_decode(runs):
     output = _release(table, "frontend", "engine->frontend:output#dp0", 1)
     decode = _release(table, "traffic", STREAM, 0) - output - run["stream_s"]
     print(f"\nrequest 0: encode {encode!r} s, first frame's decode {decode!r} s")
-    assert encode >= TOKENIZER["encode_fixed_s"]
-    assert decode >= TOKENIZER["decode_fixed_s"]
+    assert encode >= TOKENIZER["encode"]["fixed_s"]
+    assert decode >= TOKENIZER["decode"]["fixed_s"]
 
 
 # --- without a driver: the bootstrap off, and its refusals -------------------

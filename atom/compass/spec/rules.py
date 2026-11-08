@@ -19,7 +19,6 @@ class Rule(enum.Enum):
     RANK_AGREEMENT = "ranks of one group measure one machine"
     DERATE = "a spec-peak number carries a derate"
     PINNED_STACK = "the constants are pinned to a software stack"
-    TOKENIZER_IDENTITY = "a tokenizer is probed or it is refused"
     SHAPE = "the document has the shape the schema declares"
     TOTALITY = "a spec resolves every field the document was required to state"
     ADDRESSING = "a field is asked for by the path of the field itself"

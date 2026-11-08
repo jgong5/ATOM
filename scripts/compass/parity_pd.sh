@@ -125,12 +125,6 @@ from atom.compass.drive.runfile import KV_WRITE_REQ_S
 
 run, out, machine, model, store, port, prefills, decodes, dp_p, dp_d, *urls = sys.argv[1:]
 machine = json.loads(Path(machine).read_text())
-# ponytail: a spec that measured no tokenizer for the model prices it as its
-# first entry, as parity_one_node.sh does; only arrival latency reads it.
-arch = json.loads((Path(model) / "config.json").read_text())["architectures"][0]
-tokenizers = machine["host"]["tokenizers"]
-if not any(arch in entry["applies_to"] for entry in tokenizers):
-    tokenizers[0]["applies_to"].append(arch)
 # Each side's (instance, DP rank) pairs in the order the real router logged
 # registering them.
 deployment, count = {}, {"--prefill": 0, "--decode": 0}
