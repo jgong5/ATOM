@@ -209,7 +209,7 @@ def test_a_bounded_poll_is_essential_while_the_stage_holds_work():
     thread, on_owner = _owner()
     rt = LPRuntime(LpId("engine"), table, FakeConn((0.1, {}), (0.2, {})), owner=thread)
     rt.start_run()
-    raw = SimpleNamespace(recv_multipart=_nothing_here)
+    raw = SimpleNamespace(recv_multipart=_nothing_here, get=lambda option: 0)
     rx = WrappedSocket(rt, raw, "frontend->engine:request#dp0")
     on_owner(rx.poll, 100)
     rt.holds_work = lambda: True

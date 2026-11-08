@@ -242,6 +242,8 @@ def test_each_dp_rank_joins_the_engine_lp_as_its_own_member(monkeypatch, tmp_pat
     monkeypatch.setattr(clock, "_installed", None)
     monkeypatch.setattr(utils, "LP_OF_RANK", None, raising=False)
     monkeypatch.setattr(compass_run, "_member", None)
+    for name in clock.COLLECTIVES:  # the engine's bootstrap wraps each
+        monkeypatch.setattr(torch.distributed, name, getattr(torch.distributed, name))
     joined = []
     monkeypatch.setattr(
         compass_run, "connect", lambda lp, endpoint, member: joined.append((lp, member))
@@ -269,18 +271,6 @@ def test_the_authority_joins_the_ranks_and_releases_each_its_own_channels(tmp_pa
     assert [str(r) for r in ca.steps.rows if r.event == "release"] == [
         f"engine 0.0 1.0 release {request} 0 -"
     ]
-
-
-def test_a_standalone_authority_starts_the_run_once_every_rank_has_asked(tmp_path):
-    run = json.loads(_run_file(tmp_path, data_parallel_size=2).read_text())
-    ca = compass_run._RecordingAuthority(run)
-    ca.on_request(LpId("traffic"), NER, math.inf, [])
-    ca.on_request(compass_run.FRONTEND, NER, math.inf, [])
-    # The member positionally, as the clock transport passes it.
-    ca.on_request(compass_run.ENGINE, NER, math.inf, [], math.inf, "dp0")
-    assert ca.started is None
-    ca.on_request(compass_run.ENGINE, NER, math.inf, [], math.inf, "dp1")
-    assert ca.started is not None
 
 
 # Each rank's own `priced_steps` reply; no field is equal across the ranks.
@@ -324,7 +314,7 @@ def _finish(monkeypatch, tmp_path, ranks):
         worker = SimpleNamespace(call_func=lambda name, wait_out, r=replies: r[name])
         compass_run.engine_done(SimpleNamespace(runner_mgr=worker))
 
-    authority.started = authority.finished = time.monotonic()
+    authority.finished = time.monotonic()
     monkeypatch.setattr(compass_run, "_authority", authority)
     frontend = LPRuntime(compass_run.FRONTEND, table, None)
     frontend.now = math.inf

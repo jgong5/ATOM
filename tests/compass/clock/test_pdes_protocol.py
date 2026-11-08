@@ -8,7 +8,9 @@ clock it read, for the stand-in of `schedule()` that `decode`'s clock owner
 runs after each grant. Everything between the two LPs is real: `LPRuntime` on
 each side, the wrappers, the in-process carrier and `ClockAuthority`. A
 forwarder thread between the two sockets is the transport, and adds real delay.
-Each run ends by the finish, both LPs idle and granted ``+inf``.
+Each run ends by the finish, both LPs idle and granted ``+inf``. Under local
+grants `prefill`, which nothing sends to, takes its steps after its first grant
+on its own, and the drains and the timeline are what they were.
 """
 
 import math
@@ -18,7 +20,13 @@ import time
 
 import zmq
 
-from atom.compass.clock import ChannelTable, ClockAuthority, LpId, LpRegistry
+from atom.compass.clock import (
+    ChannelTable,
+    ClockAuthority,
+    LpId,
+    LpRegistry,
+    TimelineLog,
+)
 from atom.compass.clock_transport import connect, serve
 from atom.utils.clock import LPRuntime, WrappedSocket
 
@@ -49,15 +57,16 @@ def _forward(pull, push, delay_s):
             return
 
 
-def _run(sends, steps, delay_s=0.0, present=0):
+def _run(sends, steps, delay_s=0.0, present=0, authority=ClockAuthority):
     """One run: `prefill` sends one message after each grant in `sends`, and
     `decode` drains its queue after each grant in `steps`, first waiting until
-    `present` frames have physically reached it.
+    `present` frames have physically reached it. `authority` builds the
+    authority from the channel table.
 
     Returns each drain as ``(time, [(payload, clock its handler read)])``.
     """
     table = _table()
-    server = serve(ClockAuthority(table), "inproc:pdes")
+    server = serve(authority(table), "inproc:pdes")
     ctx = zmq.Context()
     try:
         tx, fwd_in, fwd_out, rx = (
@@ -144,3 +153,28 @@ def test_a_handler_runs_at_each_arrival_and_a_drain_sees_no_later_one():
         steps=(10.0, 10.2),
         present=3,
     )
+
+
+def test_local_grants_change_no_drain_and_no_timeline_only_the_calls():
+    built = {}
+
+    def authority(ceilings):
+        def build(table):
+            built[ceilings] = ClockAuthority(
+                table, timeline=TimelineLog(), ceilings=ceilings
+            )
+            return built[ceilings]
+
+        return build
+
+    sends, steps = (9.6, 9.62, 9.65), (10.0, 10.2)
+    taken = [(b"m%d" % k, t + L) for k, t in enumerate(sends)]
+    for ceilings in (False, True):
+        drained = _run(sends, steps, present=3, authority=authority(ceilings))
+        assert drained == [(10.0, []), (10.2, taken)]
+    off, on = built[False], built[True]
+    assert on.grants == off.grants
+    for lp in (PREFILL, DECODE):
+        mine = [r for r in on.timeline.records() if r.lp == lp]
+        assert mine == [r for r in off.timeline.records() if r.lp == lp]
+    assert (off.requests_served["prefill"], on.requests_served["prefill"]) == (4, 2)

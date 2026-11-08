@@ -103,10 +103,10 @@ CLOCK_READS = (
 #: does not collect the exemption.
 DEFAULT_ALLOW_LIST: dict[str, str] = {
     "atom/compass/run/__init__.py": (
-        "the run summary's wall seconds, from the run's start to its finish, "
-        "and each lazy trace's: the speed result, which no simulated time reads; "
-        "and a recorded real run's tokenizer-call and HTTP intake stamps, which "
-        "a simulated run never installs"
+        "the run summary's wall seconds, each client run's from its client's "
+        "first request to its end, and each lazy trace's: the speed result, "
+        "which no simulated time reads; and a recorded real run's tokenizer-call "
+        "and HTTP intake stamps, which a simulated run never installs"
     ),
     "atom/compass/parity/runner.py": (
         "a real runner's step timestamps; a simulated run runs its own runner "
@@ -144,6 +144,11 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
     "atom/compass/drive/measure_memory.py": (
         "when measure memory published its entry, for the entry's provenance; it "
         "starts a real engine and never runs inside a simulated run"
+    ),
+    "atom/compass/drive/pp_probe.py": (
+        "the PP carrier probe's send and receive stamps, on the monotonic clock "
+        "both its ranks share; it times two real devices and never runs inside "
+        "a simulated run"
     ),
     "atom/compass/validate/project.py": (
         "when compass project published its projection, for the entry's "
