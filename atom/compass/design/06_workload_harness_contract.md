@@ -548,12 +548,13 @@ scales with prompt length while a constant does not. At 256 clients with sub-age
 requests will queue for the executor, and that queueing is a real serving effect worth
 reproducing rather than averaging away.
 
-`ADMISSION_DELAY_S` (`atom/compass/clock/channels.py`) covers what is left, per admission
-path: the request channel's lookahead from the traffic source into the serving stack,
-**excluding** tokenize. On the serving path it is the HTTP transport alone (revised
-2026-10-20, [#1381](https://github.com/jgong5/ATOM/issues/1381)): client send to the
-ASGI app call with one request in flight, as `scripts/compass/http_intake.py floor`
-measures it. What the event loop does with the request after that call is the intake
+The `host_laws` entry's `admission_s` hop (`01`, Lookahead sources) covers what is left: the
+request channel's lookahead from the traffic source into the serving stack,
+**excluding** tokenize. It is the HTTP transport alone (revised 2026-10-20,
+[#1381](https://github.com/jgong5/ATOM/issues/1381)): client send to the ASGI app call
+with one request in flight, as `scripts/compass/http_intake.py floor` measures it. The
+offline batch path's admission delay went with its last reader (2026-11-03,
+[#2714](https://github.com/jgong5/ATOM/issues/2714)): no entry point selects it. What the event loop does with the request after that call is the intake
 below.
 
 **HTTP intake is a serial cost on the event loop** (revised 2026-10-16, #1103). The real
@@ -579,7 +580,7 @@ starts the encode later by the second part and leaves the engine arrival unchang
 node 18 `idle_s` is 0.82 ms against a `fixed_s` of 2.61 ms. What an entry without the
 term or without `idle_s` charges is `05` D25's. The client's own
 send spread is not modelled. The `http` channel's admission delay
-(`channels.py::ADMISSION_DELAY_S`) stays the channel's lookahead and ends at the app call,
+(`admission_s`) stays the channel's lookahead and ends at the app call,
 where the idle intake starts, so the two do not overlap. A burst's `fixed_s` holds
 uvicorn's parse of each request, which the lookahead holds too, but nothing is charged
 twice: a burst request's intake starts when the one before it ends, after its own

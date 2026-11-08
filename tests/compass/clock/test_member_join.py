@@ -202,7 +202,7 @@ def test_a_one_member_lp_is_granted_exactly_as_an_lp_with_none():
 
     def run(members, member):
         ca = ClockAuthority(
-            single_engine_table(admission_path="serving", ipc_s=1.0, stream_s=1.0),
+            single_engine_table(admission_s=0.54e-3, ipc_s=1.0, stream_s=1.0),
             members=members,
         )
         return [
