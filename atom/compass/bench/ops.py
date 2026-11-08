@@ -59,6 +59,7 @@ context key is the one each instance names, its module's meta parameters
 moved to the device and filled as `--load_dummy xavier` fills them (`_fill`),
 and a runner attribute this runner's own; a KV tensor is a view of a tensor
 ATOM's KV allocation bound, on the runner or a metadata builder (`_bound`),
+but no view a builder cut from the runner's (`_cut_from`),
 of its layout or `V41_NAMES`' (`_kv`), refused when none is, whose
 name the point records, the same on every copy; an object is rebuilt from its class
 and state as the capture's replay rebuilds one, its tensors built as any other
@@ -683,7 +684,8 @@ def _runner(config, rank: int):
     blocks a rank has room for, sized by ATOM with the parameters' bytes held
     on the device and then freed for the weights each leaf builds; the runner
     attributes the allocation set are in its `kv_held`, and by path each
-    tensor it bound on a metadata builder (`BUILDERS`, `_bound`); and, when
+    tensor it bound on a metadata builder (`BUILDERS`, `_bound`) but a view the
+    builder cut from one of the runner's (`_cut_from`); and, when
     the runner defers its output, one sampled-id handoff to the host on ATOM's
     copy stream, as ATOM's postprocess makes one after every forward. One DP rank
     of several run alone is built as ATOM's simulated DP attention builds it:
@@ -734,9 +736,11 @@ def _runner(config, rank: int):
     # made there as KV
     runner.kv_held = {k: v for k, v in vars(runner).items() if before.get(k) is not v}
     old |= set(map(id, runner.kv_held.values()))
+    own = _held(runner, None).values()
     for name, builder in builders.items():
         for key, value in vars(builder).items():
-            runner.kv_held |= _bound(f"{name}.{key}", value, old, runner.device)
+            bound = _bound(f"{name}.{key}", value, old, runner.device)
+            runner.kv_held |= {n: t for n, t in bound.items() if not _cut_from(t, own)}
     # with no handoff made, a Qwen3.8-27B GDN decode leaf read 5% under a
     # runner that had made one
     ids, done = runner.tokenID_processor, torch.cuda.Event()
@@ -1884,6 +1888,17 @@ def _bound(name, value, old, device) -> dict[str, torch.Tensor]:
                 items = vars(value).items()
             queue += [(f"{name}.{key}", item) for key, item in items]
     return out
+
+
+def _cut_from(t, held) -> bool:
+    """Whether `t` is a view cut from one of the `held` tensors: inside it, of
+    its dtype and layout (`_layout`). `_kv`, taking the tightest of a layout,
+    would bind the cut at its own base, where ATOM passes its leaves the tensors
+    it was cut from (DeepSeek-V4's slot views of its KV planes, one a state slot)."""
+    like = t.dtype, _layout(t.shape, t.stride())
+    return any(
+        (h.dtype, _layout(h.shape, h.stride())) == like and _inside(t, h) for h in held
+    )
 
 
 def _state(runner, held) -> dict[str, bool]:

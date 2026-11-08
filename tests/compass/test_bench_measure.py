@@ -356,7 +356,7 @@ def test_grid_points_are_measured_with_origin_plan_and_new_shapes_add_only_their
     lines = read(run.record / "steps")[0]
     engine = {"r": json.loads((run.record / "steps/dp0.engine.json").read_text())}
 
-    def prefill(d, steps, e):
+    def prefill(d, steps, e, views=()):
         """The plan of the prefill steps alone."""
         return plan(d, [(n, s) for n, s in steps if not s["rows"][0][2]], e)
 
@@ -710,6 +710,46 @@ def test_ragged_composes_across_the_rungs_of_the_ladder_the_record_states(
     run(rec, "--sample", "2", "--seed", "3", "--ragged", *run.named(rec))
 
     assert given and all(g == ladder for g in given)
+
+
+def test_ragged_under_grid_also_plans_the_cells_of_the_views_it_composes(
+    run, monkeypatch, capsys
+):
+    """Each composed view, here a drawn seed with its first row on 999 cached,
+    past every row the record ran, has its cells planned on the record's
+    nodes, its longest row's among them, and measured; the views' tokens are
+    the lines printed `measured ragged`."""
+    monkeypatch.setattr(
+        measure.ragged,
+        "compose",
+        lambda seed, *_: [{**seed, "rows": [[1, 1000, True], *seed["rows"][1:]]}],
+    )
+    rec = str(run.record)
+    definition = run.tmp / "definition.json"
+    definition.write_text(json.dumps(DEFINITION))
+    grid = ["--grid", rec, "--grid-definition", str(definition)]
+    store = run(rec, "--sample", "2", "--seed", "3", "--ragged", *grid, *run.named(rec))
+
+    held = entries(store)
+    composed = [
+        (key.values["view"], {k: m[k] for k in measure.VIEW})
+        for key, m in held
+        if m["origin"] == "ragged"
+    ]
+    named = [(str(s["step"]), s) for s in read(run.record / "steps")[0]]
+    engine = {"r": json.loads((run.record / "steps/dp0.engine.json").read_text())}
+    planned = json.loads((run.tmp / "out/plan.json").read_text())["lines"]
+    assert planned == plan(DEFINITION, named, engine, composed)["lines"]
+    assert len(planned) > len(plan(DEFINITION, named, engine)["lines"])
+    digests = {measure._digest(measure.view_of(x)) for x in planned}
+    assert set(by_view(store)) == digests | {v for v, _ in composed}
+    printed = [
+        x.split()[5].rstrip(":")
+        for x in capsys.readouterr().out.splitlines()
+        if x.startswith("measured ragged ")
+    ]
+    tokens = [key.token() for key, m in held if m["origin"] == "ragged"]
+    assert sorted(printed) == sorted(tokens) != []
 
 
 def test_ragged_without_a_replayed_input_refuses(run):
