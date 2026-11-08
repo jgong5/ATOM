@@ -9,7 +9,9 @@
         --out DIR -- <ATOM args>
 
 Each shape names the `op_graph` `compass trace ops` published in S for the
-model and TP width ATOM's arguments resolve. A point is one leaf of that graph,
+model and TP width ATOM's arguments resolve, and under a speculative drafter
+each graph of the drafter's part of a step S holds at that shape (`DRAFTED`,
+`leaves_at`), timed on the target's batch. A point is one leaf of those graphs,
 its instances grouped (`leaves`), at the shape and `--context`: a decode
 step's rows each hold `--context` tokens, under a drafter verifying as many
 more as it drafts, and a prefill's rows, split as the capture split them,
@@ -49,7 +51,9 @@ the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
 HCA decode workspace an `HCA_DECODE` slot names, or of the buffer
 `V4_METADATA` names for a DeepSeek-V4 slot, refused when it is not live, or,
 when live, `V41_NAMES`' for a DeepSeek-V4.1 slot at its ratio (`_ratio`),
-whose step and scorer workspace are live too; an integer the capture
+whose step and scorer workspace are live too; a leaf of the drafter's alone
+takes what ATOM passes a drafter (`DRAFTER_NAMES`) and, of a pass of its own,
+the entry of ATOM's `batch_info` stating its real rows; an integer the capture
 found affine in a decode step's context is taken at the point's; a module or
 context key is the one each instance names, its module's meta parameters
 moved to the device and filled as `--load_dummy xavier` fills them (`_fill`),
@@ -157,8 +161,9 @@ every point held, a measured one with its store token, in plan.jsonl.
 `--coverage` counts the steps of record directories, read as `--plan` reads
 them, that DIR's plan.jsonl covers (`coverage`), with the `op_graph`s of the
 arch DIR's run.json records, a step only when `fit ops`' price list of those
-points prices each leaf, and prints the count by phase and why each leaf kind
-left the rest out.
+points prices each leaf, and prints the count by phase, by part of the step
+(its target's graph and its drafter's, `parts`) and why each leaf kind left
+the rest out, a drafter's kinds named as a run names their terms.
 """
 
 import argparse
@@ -202,7 +207,7 @@ from atom.compass.artifacts import (
     member_name,
     roots_for,
 )
-from atom.compass.backends.op_graph import PERMILLE
+from atom.compass.backends.op_graph import DRAFT, DRAFT_KV, KV, PERMILLE
 from atom.compass.bench.routing import uniform_ids
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.utils.arg_parser import FlexibleArgumentParser
@@ -363,6 +368,14 @@ V41_NAMES = {
     ("aiter.fused_moe_.default", "num_local_tokens"): "scheduled_tokens_gpu",
     ("aiter.topk_gating_fwd.default", "num_valid_rows"): "scheduled_tokens_gpu",
 }
+#: A drafter's arguments, keyed as `V4_METADATA`'s, that ATOM passes it from
+#: buffers no leaf of a target takes: each row's anchor among its sampled
+#: tokens on a step that scored no draft, at the runner's zero rejections, and
+#: the rows of DeepSeek-V4.1's replayed tail, which its draft-KV pass reads.
+DRAFTER_NAMES = {
+    ("aten.gather.default", "index"): "zero_spec_counts",
+    ("aten.index.Tensor", "indices"): "plan.tail_rows",
+}
 #: DeepSeek-V4.1's FP8 prefill leaves whose logits plane holds the compressed rows
 #: of each KV block the step's longest row reaches (`PagedAttentionCache.
 #: unit_tiles`), and the tile table's build, which reads as many block-table
@@ -426,6 +439,11 @@ BUILDERS = ("attn_metadata_builder", "draft_kv_builder")
 #: The variable naming the file a measuring process appends each point's
 #: record to as it finishes it.
 JOURNAL = "COMPASS_OPS_JOURNAL"
+#: The graphs of a drafter's part of a step at a shape, beside its target's, by
+#: the `(output, draft)` `forward.structure` keys them by: its work past the
+#: target's on a step that samples, a block drafter's draft-KV pass there
+#: (`KV`), and its work past the target's forward on a middle chunk.
+DRAFTED = ((True, True), (True, KV), (False, True))
 #: The variable `--plan` sets for its measuring processes past its first round
 #: when some step's decode rows are ragged: there a uniform decode point the KV
 #: pool cannot hold refuses, as a ragged one does, unless every leaf it times is
@@ -475,9 +493,7 @@ def main(argv: list[str]) -> None:
         )
     _eager(config)
     store = ArtifactStore(args.store)
-    todo = [
-        (s, args.context, leaves(graph(store, config, s)["region"])) for s in shapes
-    ]
+    todo = [(s, args.context, leaves_at(store, config, s)) for s in shapes]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "engine.json").write_text(json.dumps(keyed(config)))
@@ -552,27 +568,48 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
-def graph(store, config, shape, arch=None) -> dict:
+def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     """The `op_graph` `trace ops` published for `config` at `shape` on `arch`,
-    this GPU's when it is None, of a step that produces output, as JSON: a
-    prefill that produces none runs the same leaves less the LM head and the
-    sampler, so this graph's points cover both. A miss where the store holds
-    the shape under another engine config refuses naming what differs."""
+    this GPU's when it is None, as JSON: of a step that produces output, or
+    one that does not (`output`), of its target or of its drafter's part
+    (`draft`, as `forward.structure` keys it). A prefill that produces none
+    runs its target's leaves less the LM head and the sampler, so the
+    target's points at output cover both. A miss where the store holds the
+    shape under another engine config refuses naming what differs."""
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture.forward import missed, structure
 
-    key = Key.of(
-        Kind.OP_GRAPH,
-        structure=structure(config, shape.phase, device=arch),
-        shape=str(shape),
-    )
+    at = structure(config, shape.phase, device=arch, output=output, draft=draft)
+    key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
     if not store.directory_for(key).exists() and (why := missed(store, key)):
+        part = " that produces no output" * (not output)
+        part += " for its drafter" * bool(draft) + "'s draft-KV pass" * (draft == KV)
         raise ArtifactRefusal(
             Rule.RESOLUTION,
-            f"no op_graph holds {shape} under this engine config{why}",
+            f"no op_graph holds {shape}{part} under this engine config{why}",
             "compass trace ops captures one under this process's environment",
         )
     return json.loads(store.read(key).read_member("graph", RANK, "json"))
+
+
+def leaves_at(store, config, shape, arch=None) -> dict[str, tuple[dict, list]]:
+    """Each leaf (`leaves`) of `shape`'s `graph` and, under a speculative
+    drafter, of each graph of the drafter's (`DRAFTED`) the store holds there,
+    the capture having kept no other; one of a drafter's graphs alone is
+    marked ``drafted``."""
+    from atom.compass.artifacts import ArtifactRefusal
+
+    found = leaves(graph(store, config, shape, arch)["region"])
+    target = set(found)
+    for output, draft in DRAFTED if config.speculative_config else ():
+        try:
+            region = graph(store, config, shape, arch, output, draft)["region"]
+        except ArtifactRefusal:
+            continue
+        leaves(region, None, found)
+    for sig in found.keys() - target:
+        found[sig][0]["drafted"] = True
+    return found
 
 
 def _ref(value) -> bool:
@@ -731,10 +768,13 @@ class Stub:
         self.written, self.unplanned, self.once = {}, {}, {}
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
+        drafter = getattr(runner, "drafter", None)
+        models = [runner.model, *([drafter.model] if drafter else [])]
         self.moe = sorted(
             {
                 (m.global_num_experts, m.top_k)
-                for m in self.modules.values()
+                for model in models
+                for m in model.modules()
                 if hasattr(m, "global_num_experts")
             }
         )
@@ -832,11 +872,23 @@ class Stub:
             for k, v in vars(fc.attn_metadata).items()
             if k.startswith("split_plan_") and v
         }
+        # a drafter's pass of rows of its own counts its real rows at the entry
+        # of ATOM's `batch_info` stating them, as the drafter publishes its shape
+        info = self.runner.forward_vars.get("batch_info")
+        counts = {} if info is None else {n: i for i, n in enumerate(info.np.tolist())}
+        tokens = getattr(self.runner, "tokenID_processor", None)
+        zeros = getattr(tokens, "zero_spec_counts", None)
+        drafter = {} if zeros is None else {"zero_spec_counts": zeros}
         meta = dict(self.kv)
         for sig, (op, _) in self.leaves.items():
             writes, rows = _writes(op["op"]), _pass_rows(op)
             at = None if rows == running else rows
             live = lives.get(at, lives[None])
+            if drafted := op.get("drafted", False):
+                live = live | drafter
+                if at not in lives and rows in counts:
+                    i = counts[rows]
+                    live = live | {"scheduled_tokens_gpu": info.gpu[i : i + 1]}
             for path, spec in _specs(op["args"]):
                 index = self.paged and _written(op, path)
                 if spec["role"] == "metadata" or index:
@@ -846,13 +898,16 @@ class Stub:
                     if op["op"] == HCA_DECODE and field in work:
                         pool, what = {field: work[field]}, "HCA workspace"
                     ratio = _ratio(op, path, self.known)
-                    if wanted := V4_METADATA.get((op["op"], _keyed(op["args"], path))):
+                    key = op["op"], _keyed(op["args"], path)
+                    if wanted := V4_METADATA.get(key):
                         what = wanted.format(
                             ratio=ratio,
                             kind=V4_KINDS.get(ratio),
                             dest=_DESTS.get(ratio),
                         )
                         pool = {what: named[what]} if what in named else {}
+                    elif drafted and (want := DRAFTER_NAMES.get(key)) in live:
+                        pool = {want: live[want]}
                     elif v41 := _named(op, path, spec, live, self.known):
                         pool = v41
                     try:
@@ -1359,13 +1414,15 @@ class Stub:
         """Copy `c`'s expert ids for `spec`: each row's experts drawn
         independently and uniformly, distinct, from the model's routed experts,
         seeded by `SEED` and `c`, and past top-k the row's ids in ATOM's buffer;
-        the copy's expert loads go to `loads`."""
-        if len(self.moe) > 1:
+        the copy's expert loads go to `loads`; of the MoE layers the model and
+        its drafter hold, the one whose top-k is the ids' width."""
+        fits = [m for m in self.moe if m[1] == spec["shape"][1]] or self.moe
+        if len(fits) > 1:
             raise ValueError(
                 f"the model's MoE layers route (experts, top-k) {self.moe}: "
                 f"which one draws {_text(spec)} is not known"
             )
-        [(experts, k)] = self.moe
+        [(experts, k)] = fits
         device = self.runner.device
         ids = uniform_ids(spec["shape"][0], experts, k, SEED * CALLS + c, device)
         self.loads.append(torch.bincount(ids.flatten(), minlength=experts).tolist())
@@ -2502,21 +2559,24 @@ def _eager(config) -> None:
 def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     """How the measured points among `records` cover the steps of the record
     directories `names`, each micro-batch of a step its DP group split under
-    two-batch overlap a step: the steps and those covered by phase, and per leaf
-    kind the steps it left out by why. A step is covered when each leaf of its
-    `op_graph` lies on a point or between two of one kernel (`_bracket`): a
+    two-batch overlap a step: the steps and those covered by phase and by part
+    (`parts`), and per leaf kind, a drafter's prefixed as a run names its
+    terms, the steps it left out by why. A step is covered when each leaf of
+    each of its parts' `op_graph`s lies on a point or between two of one
+    kernel (`_bracket`): a
     decode leaf of a kind that depends on context over its rows' lowest to
     highest context (`_rows`), any other decode leaf at its width, a prefill
     leaf at its tokens, and one of a kind that depends on context over its
     rows' cached tokens too (`_bracket_cached`); and `fit ops`' price list of
     `records` prices it at the step, as `compass run --coverage` asks it. The
-    graphs are `arch`'s."""
+    graphs are `arch`'s; a part's graph the store does not hold leaves the step
+    out, by its refusal."""
+    from atom.compass.artifacts import ArtifactRefusal
     from atom.compass.backends.op_graph import band
     from atom.compass.backends.provenance import Refusal
-    from atom.compass.capture import population_steps
     from atom.compass.fit.ops import PriceList, fit, held_out
 
-    steps = list(population_steps(names, config.enable_tbo))
+    steps = parts(names, config)
     dependent = _dependent(records)
     held_out(params := fit([r for r in records if "refused" not in r]))
     listed = PriceList(params)
@@ -2525,42 +2585,60 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
         axes[fam] = [p[0] for p in points], [p[1] for p in points]
         if cut := _cut(fam):
             cuts[cut[0]][cut[1]] = axes[fam]
-    graphs, report, out = {}, defaultdict(Counter), defaultdict(Counter)
-    _load(store, config, root, {s for s, _ in steps}, graphs, arch, atom_args, names)
-    families = {
-        s: [
-            (op["op"], *_family(s, None, op["op"], sig, dependent), op)
-            for sig, (op, _) in g.items()
+    report, out, by_part = defaultdict(Counter), defaultdict(Counter), {}
+    targets = {shape for _, reads in steps for part, shape, *_ in reads if not part}
+    _load(store, config, root, targets, {}, arch, atom_args, names)
+
+    @functools.cache
+    def families(shape, output, draft):
+        try:  # a target's graph at output as `graph` reads it by default
+            which = [output, draft] if draft else []
+            region = graph(store, config, shape, arch, *which)["region"]
+        except ArtifactRefusal as refused:
+            return refused.what
+        return [
+            (op["op"], *_family(shape, None, op["op"], sig, dependent), op)
+            for sig, (op, _) in leaves(region).items()
         ]
-        for s, g in graphs.items()
-    }
-    for shape, line in steps:
-        whys, decoding = {}, shape.phase == "decode"
-        mean, top = band(line["rows"], decoding)
-        bound = (*shape[:4], mean, top)
-        if decoding:  # its max, then its mean over B, as `OpGraphBackend` asks
-            bound = (*shape[:4], top, sum(r[1] for r in line["rows"]) / shape.seqs)
-        for name, fam, tokens, op in families[shape]:
-            moves = dependent.get(name, True)
-            cut = _cut(fam)
-            if cut and cut[0] in cuts:
-                at, (lo, hi) = cuts[cut[0]], _cached(line)
-                why = (
-                    "a cached row, measured on fresh rows only"
-                    if hi and at.keys() == {0}
-                    else _bracket_cached(at, tokens, lo, hi)
-                )
-            elif fam not in axes:
-                why = "no measured point"
-            elif shape.phase == "decode" and not _exchanged(fam):
-                why = _bracket(*axes[fam], *_rows(line, shape.seqs)) if moves else ""
-            else:
-                why = _bracket(*axes[fam], tokens, tokens)
-            if not why and isinstance(got := listed.price((op, bound, None)), Refusal):
-                why = re.sub(r"\d+", "#", got.reason.split(": ")[1])
-            if why:
-                whys[name] = why
-        report[shape.phase].update(steps=1, covered=not whys)
+
+    for line, reads in steps:
+        whys = {}
+        for part, shape, output, draft in reads:
+            by_part.setdefault(part, Counter())["steps"] += 1
+            decoding, before = shape.phase == "decode", len(whys)
+            mean, top = band(line["rows"], decoding)
+            # a drafter decodes its rows unpadded, as `OpGraphBackend` asks it
+            rows = shape.tokens if decoding and draft is True else shape.seqs
+            bound = (*shape[:4], mean, top)
+            if decoding:  # its max, then its mean over B, as `OpGraphBackend` asks
+                bound = (*shape[:2], rows, shape.gathered, top)
+                bound += (sum(r[1] for r in line["rows"]) / rows,)
+            if isinstance(found := families(shape, output, draft), str):
+                whys[f"{part}op_graph"], found = found, []
+            for name, fam, tokens, op in found:
+                moves = dependent.get(name, True)
+                cut = _cut(fam)
+                if cut and cut[0] in cuts:
+                    at, (lo, hi) = cuts[cut[0]], _cached(line)
+                    why = (
+                        "a cached row, measured on fresh rows only"
+                        if hi and at.keys() == {0}
+                        else _bracket_cached(at, tokens, lo, hi)
+                    )
+                elif fam not in axes:
+                    why = "no measured point"
+                elif decoding and not _exchanged(fam):
+                    why = _bracket(*axes[fam], *_rows(line, rows)) if moves else ""
+                else:
+                    why = _bracket(*axes[fam], tokens, tokens)
+                if not why and isinstance(
+                    got := listed.price((op, bound, None)), Refusal
+                ):
+                    why = re.sub(r"\d+", "#", got.reason.split(": ")[1])
+                if why:
+                    whys[part + name] = why
+            by_part[part]["covered"] += len(whys) == before
+        report[reads[0][1].phase].update(steps=1, covered=not whys)
         for name, why in whys.items():
             out[name][why] += 1
     total = sum(report.values(), Counter())
@@ -2569,8 +2647,33 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
         "covered": total["covered"],
         "share": total["covered"] / max(total["steps"], 1),
         "by phase": {phase: dict(c) for phase, c in report.items()},
+        "by part": {part.strip() or "target": dict(c) for part, c in by_part.items()},
         "left out, by leaf kind": {k: dict(v) for k, v in sorted(out.items())},
     }
+
+
+def parts(names, config) -> list:
+    """Each step of the record directories `names`, as `--plan` reads them, and
+    the graphs a run prices it from, `(part, shape, output, draft)` each, its
+    part as the run prefixes its terms: its target's; under a speculative
+    drafter its drafter's at the shape `trace ops --population` traces it, of
+    a step that samples or not; and a block drafter's draft-KV pass's on a
+    step that samples, at the step's shape."""
+    from atom.compass.capture import population_steps
+
+    spec, steps = config.speculative_config, []
+    for shape, line in population_steps(names, config.enable_tbo, drafters=True):
+        if steps and line is steps[-1][0]:  # the drafter's own shape, past its step's
+            reads = steps[-1][1]
+            reads[1:2] = [(DRAFT, shape, *reads[1][2:])] if spec else []
+            continue
+        samples = shape.phase == "decode" or bool(line.get("produces_output"))
+        reads = [("", shape, True, False)]
+        if spec:
+            reads.append((DRAFT, shape, samples, True))
+            reads += [(DRAFT_KV, shape, True, KV)] * (samples and spec.use_dspark())
+        steps.append((line, reads))
+    return steps
 
 
 def _rows(line, rung: int) -> tuple[int, int]:
@@ -2912,21 +3015,21 @@ def _apart(p, q) -> bool:
 def _load(
     store, config, root, shapes, graphs: dict, arch=None, atom_args=(), records=()
 ) -> None:
-    """Each of `shapes`' leaves into `graphs`, its op_graph captured first when
-    the store has none (`_capture`, naming the record directories `records`
-    the shapes are of)."""
+    """Each of `shapes`' leaves (`leaves_at`) into `graphs`, its op_graph captured
+    first when the store has none (`_capture`, naming the record directories
+    `records` the shapes are of)."""
     from atom.compass.artifacts import ArtifactRefusal
 
     missing = []
     for shape in sorted(shapes - graphs.keys(), key=str):  # G and W: None or a count
         try:
-            graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
+            graphs[shape] = leaves_at(store, config, shape, arch)
         except ArtifactRefusal:
             missing.append(shape)
     if missing:
         _capture(config, missing, root, arch, atom_args, records)
     for shape in missing:
-        graphs[shape] = leaves(graph(store, config, shape, arch)["region"])
+        graphs[shape] = leaves_at(store, config, shape, arch)
 
 
 def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
