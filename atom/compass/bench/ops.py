@@ -136,12 +136,15 @@ group split as its two micro-batches, as `trace ops --population` traces it
 (`population_steps`), capturing each `op_graph` S lacks on the run's first GPU
 as it reads, a prefill as one forward (`_capture`), or, before any point,
 refusing one only that call traces:
-every leaf at every rung of ATOM's decode ladder at the steps' lowest and
-highest row context (`_rows`); then each leaf of a kind those show depends on
-context (`_dependent`) over a ladder (`_ladder`) of the steps' row contexts,
-and, when some step's rows are ragged, at a rung of more than one row on
-ragged rows too (`_means`): the first at the context, the rest sharing a mean,
-each `GRID`th of it from the least the rows hold; and each prefill family
+every leaf at every rung of ATOM's decode ladder, and under a speculative
+drafter each leaf of its own decode shape past a step's (`parts`) that the
+graphs at its width, its B, do not hold, at its rows padded to that width,
+at the steps' lowest and highest row context (`_rows`); then each leaf of a
+kind those show depends on context (`_dependent`) over a ladder (`_ladder`)
+of the steps' row contexts, and, when some step's rows are ragged, at a
+shape of more than one row on ragged rows too (`_means`): the first at the
+context, the rest sharing a mean, each `GRID`th of it from the least the rows
+hold; and each prefill family
 (`_family`) over a ladder of their token counts, chunk remainders among them,
 its shapes that state the rows a DP group gathers apart, as `fit ops` prices them,
 one of a kind that depends on context at each at the most cached tokens of
@@ -195,6 +198,7 @@ from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from atom.compass import ir
@@ -600,21 +604,29 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     return json.loads(store.read(key).read_member("graph", RANK, "json"))
 
 
-def leaves_at(store, config, shape, arch=None) -> dict[str, tuple[dict, list]]:
+def leaves_at(
+    store, config, shape, arch=None, own=False
+) -> dict[str, tuple[dict, list]]:
     """Each leaf (`leaves`) of `shape`'s `graph` and, under a speculative
     drafter, of each graph of the drafter's (`DRAFTED`) the store holds there,
     the capture having kept no other; one of a drafter's graphs alone is
-    marked ``drafted``."""
+    marked ``drafted``. With `own`, `shape` is a drafter's own decode shape
+    past its step's (`parts`), where a capture keeps the drafter's graph
+    alone: its leaves."""
     from atom.compass.artifacts import ArtifactRefusal
 
-    found = leaves(graph(store, config, shape, arch)["region"])
-    target, drafter = set(found), getattr(config, "speculative_config", None)
-    for output, draft in DRAFTED if drafter else ():
-        try:
-            region = graph(store, config, shape, arch, output, draft)["region"]
-        except ArtifactRefusal:
-            continue
-        leaves(region, None, found)
+    if own:
+        found = leaves(graph(store, config, shape, arch, True, True)["region"])
+        target = set()
+    else:
+        found = leaves(graph(store, config, shape, arch)["region"])
+        target, drafter = set(found), getattr(config, "speculative_config", None)
+        for output, draft in DRAFTED if drafter else ():
+            try:
+                region = graph(store, config, shape, arch, output, draft)["region"]
+            except ArtifactRefusal:
+                continue
+            leaves(region, None, found)
     for sig, (op, _) in found.items():
         if sig not in target:
             op["drafted"] = True
@@ -1056,6 +1068,14 @@ class Stub:
         self.leaves, self.placed, self.clones = found, [], {}
         self.written = {}
         self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
+        ladder = contextlib.nullcontext
+        if shape.phase == "decode" and shape.tokens < shape.seqs:
+            # a drafter's own shape is prepared padded to its B, as the
+            # capture's runner pads it: a block drafter's passes run there
+            width = np.array([shape.seqs], dtype=np.int32)
+            ladder = functools.partial(
+                patch.object, self.runner, "capture_sizes_np", width
+            )
         for p in range(max(min(need, *room), 1)):
             slot = p * taken
             if self.slots >= taken:  # past the state slots, take them again
@@ -1065,7 +1085,8 @@ class Stub:
             except ValueError as error:  # the rule refuses, before any preparation
                 return refuse(f"ValueError: {error}")
             try:
-                self._prepare(batch)
+                with ladder():
+                    self._prepare(batch)
             except PassRows as error:  # no leaf's rows tell which pass it runs
                 return refuse(f"ValueError: {error}: a leaf's rows name no pass")
             except Exception as error:
@@ -1543,6 +1564,8 @@ def point_rows(
     """A point's rows, `[query, context, decodes]` each, longest first: a decode
     row holds `context` tokens and, of a shape that names its rows alone, under
     a drafter of `drafts` verifies as many more, as the capture's rows do; a
+    decode of fewer rows than its B, a drafter's own shape past its step's,
+    holds those rows alone, its step padded to B (`Stub.point`); a
     prefill row its query tokens, the capture's split, past `context` cached
     ones. When they need more than the
     `pool`'s KV blocks, the first keeps its context and each other shares what
@@ -1552,12 +1575,11 @@ def point_rows(
     a decode point's are when `uncut`."""
     decode = shape.phase == "decode"
     context, mean = _split(context)
-    per, extra = divmod(shape.tokens, shape.seqs)
+    seqs = min(shape.tokens, shape.seqs) if decode else shape.seqs
+    per, extra = divmod(shape.tokens, seqs)
     per += drafts if decode and shape.tokens <= shape.seqs else 0
     past = context - 1 if decode else context or 0
-    rows = [
-        [q, q + past, decode] for q in (per + (i < extra) for i in range(shape.seqs))
-    ]
+    rows = [[q, q + past, decode] for q in (per + (i < extra) for i in range(seqs))]
     if mean:
         share = (mean * context * len(rows) // PERMILLE - context) // (len(rows) - 1)
         for row in rows[1:]:
@@ -2457,11 +2479,20 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     round by round, numbered on from the last round `out` holds, and after
     each round write every point held, a measured one with its store token, to
     plan.jsonl in `out`."""
-    from atom.compass.capture import population_steps
     from atom.compass.capture.forward import decode
     from atom.compass.runner.overrides import schedulable_ladder
 
-    steps = list(population_steps(args.plan, config.enable_tbo))
+    steps = parts(args.plan, config)
+    # a drafter's own decode shapes, past their steps': a leaf their width's
+    # graphs hold is that width's point. G and W are None or a count
+    own = {
+        shape
+        for _, reads in steps
+        for part, shape, *_ in reads
+        if part == DRAFT and shape.phase == "decode" and shape != reads[0][1]
+    }
+    own = sorted(own, key=str)
+    steps = [(reads[0][1], line) for line, reads in steps]
     contexts = [
         c for s, line in steps if s.phase == "decode" for c in _rows(line, s.seqs)
     ]
@@ -2478,7 +2509,12 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             prefills.add(s)
             cached[s.seqs] += _cached(line)
     # first, so a graph only `trace ops --population` traces refuses before any point
-    _load(store, config, args.store, prefills, graphs, None, atom_args, args.plan)
+    widths = {decode(s.seqs) for s in own}
+    shapes = prefills | set(own) | widths
+    _load(store, config, args.store, shapes, graphs, None, atom_args, args.plan, own)
+    for s in own:
+        width = graphs[decode(s.seqs)]
+        graphs[s] = {sig: leaf for sig, leaf in graphs[s].items() if sig not in width}
     # a run resumed into `out` keeps the rounds an earlier one wrote there
     rounds = [int(d.name[5:]) for d in out.glob("round*") if d.name[5:].isdigit()]
     first = max(rounds, default=-1) + 1
@@ -2518,15 +2554,16 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     r = r | {"token": key(r["shape"], r["context"], r["leaf"]).token()}
                 lines.write(json.dumps(r) + "\n")
 
+    decodes = [*rungs, *own]
     measure_round(
-        {(s, c): None for s in rungs for c in (min(contexts), max(contexts))}, 0
+        {(s, c): None for s in decodes for c in (min(contexts), max(contexts))}, 0
     )
     dependent, want = _dependent(done.values()), defaultdict(set)
-    for shape in rungs:
+    for shape in decodes:
         for sig, (op, _) in graphs[shape].items():
             if dependent.get(op["op"], True) and not exchange(op):
                 for c in _ladder(contexts):
-                    means = _means(shape.seqs) if ragged else []
+                    means = _means(shape.tokens) if ragged else []
                     for at in [c, *((c, m) for m in means)]:
                         fam = _family(shape, at, op["op"], sig, dependent)[0]
                         want[shape, at].add(fam)
@@ -2623,12 +2660,15 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     highest context (`_rows`), any other decode leaf at its width, a prefill
     leaf at its tokens, and one of a kind that depends on context over its
     rows' cached tokens too (`_bracket_cached`); and `fit ops`' price list of
-    `records` prices it at the step, as `compass run --coverage` asks it. The
-    graphs are `arch`'s; a part's graph the store does not hold leaves the step
-    out, by its refusal."""
+    `records` prices it at the step, as `compass run --coverage` asks it. A
+    decode leaf is read at the rows it ran, its shape's T: of a drafter's own
+    decode shape past its step's, a leaf its width's graphs hold at that
+    width, as `--plan` measures it. The graphs are `arch`'s; a part's graph
+    the store does not hold leaves the step out, by its refusal."""
     from atom.compass.artifacts import ArtifactRefusal
     from atom.compass.backends.op_graph import band
     from atom.compass.backends.provenance import Refusal
+    from atom.compass.capture.forward import decode
     from atom.compass.fit.ops import PriceList, fit, held_out
 
     steps = parts(names, config)
@@ -2645,15 +2685,20 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     _load(store, config, root, targets, {}, arch, atom_args, names)
 
     @functools.cache
-    def families(shape, output, draft):
+    def families(shape, output, draft, own):
         try:  # a target's graph at output as `graph` reads it by default
             which = [output, draft] if draft else []
             region = graph(store, config, shape, arch, *which)["region"]
+            width, held = shape, {}
+            if own:  # a drafter's own decode shape, past its step's
+                width = decode(shape.seqs)
+                held = leaves_at(store, config, width, arch)
         except ArtifactRefusal as refused:
             return refused.what
         return [
-            (op["op"], *_family(shape, None, op["op"], sig, dependent), op)
+            (op["op"], *_family(at, None, op["op"], sig, dependent), op, at)
             for sig, (op, _) in leaves(region).items()
+            for at in [width if sig in held else shape]
         ]
 
     for line, reads in steps:
@@ -2662,12 +2707,14 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
             by_part.setdefault(part, Counter())["steps"] += 1
             decoding, before = shape.phase == "decode", len(whys)
             mean, top = band(line["rows"], decoding)
-            bound = (*shape[:4], mean, top)
-            if decoding:  # its max, then its mean over B, as `OpGraphBackend` asks
-                bound = (*shape[:4], top, sum(r[1] for r in line["rows"]) / shape.seqs)
-            if isinstance(found := families(shape, output, draft), str):
+            own = part == DRAFT and decoding and shape != reads[0][1]
+            if isinstance(found := families(shape, output, draft, own), str):
                 whys[f"{part}op_graph"], found = found, []
-            for name, fam, tokens, op in found:
+            for name, fam, tokens, op, at in found:
+                bound = (*at[:4], mean, top)
+                if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
+                    total = sum(r[1] for r in line["rows"])
+                    bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
                 moves = dependent.get(name, True)
                 cut = _cut(fam)
                 if cut and cut[0] in cuts:
@@ -2680,9 +2727,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 elif fam not in axes:
                     why = "no measured point"
                 elif decoding and not _exchanged(fam):
-                    why = (
-                        _bracket(*axes[fam], *_rows(line, shape.seqs)) if moves else ""
-                    )
+                    why = _bracket(*axes[fam], *_rows(line, at.tokens)) if moves else ""
                 else:
                     why = _bracket(*axes[fam], tokens, tokens)
                 if not why and isinstance(
@@ -3071,23 +3116,31 @@ def _apart(p, q) -> bool:
 
 
 def _load(
-    store, config, root, shapes, graphs: dict, arch=None, atom_args=(), records=()
+    store,
+    config,
+    root,
+    shapes,
+    graphs: dict,
+    arch=None,
+    atom_args=(),
+    records=(),
+    own=(),
 ) -> None:
-    """Each of `shapes`' leaves (`leaves_at`) into `graphs`, its op_graph captured
-    first when the store has none (`_capture`, naming the record directories
-    `records` the shapes are of)."""
+    """Each of `shapes`' leaves (`leaves_at`, a drafter's own at a shape `own`
+    holds) into `graphs`, its op_graph captured first when the store has none
+    (`_capture`, naming the record directories `records` the shapes are of)."""
     from atom.compass.artifacts import ArtifactRefusal
 
     missing = []
     for shape in sorted(shapes - graphs.keys(), key=str):  # G and W: None or a count
         try:
-            graphs[shape] = leaves_at(store, config, shape, arch)
+            graphs[shape] = leaves_at(store, config, shape, arch, shape in own)
         except ArtifactRefusal:
             missing.append(shape)
     if missing:
         _capture(config, missing, root, arch, atom_args, records)
     for shape in missing:
-        graphs[shape] = leaves_at(store, config, shape, arch)
+        graphs[shape] = leaves_at(store, config, shape, arch, shape in own)
 
 
 def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
