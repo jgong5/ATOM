@@ -64,11 +64,9 @@ DEFAULTS = {
 
 
 def _template(path: Path, **extra) -> Path:
-    """A run file whose declared tokenizer also covers the model's architecture,
-    and whose store holds the entry of each server the script starts for it."""
+    """A run file whose store holds the entry of each server the script starts
+    for it."""
     machine = copy.deepcopy(DOCUMENT)
-    arch = json.loads((Path(MODEL) / "config.json").read_text())["architectures"][0]
-    machine["host"]["tokenizers"][0]["applies_to"].append(arch)
     run = {
         "bound_s": 1e7,
         "admission_path": "serving",
