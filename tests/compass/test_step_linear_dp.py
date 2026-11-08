@@ -161,7 +161,7 @@ def test_the_fit_records_its_passes_and_a_cap_reached_refuses_it(
 ):
     from atom.compass.backends import step_linear_fit
 
-    monkeypatch.setattr(step_linear_fit, "MAD_PASSES", cap)
+    monkeypatch.setattr(step_linear_fit, "FIT_PASSES", cap)
     records = _records(tmp_path, _groups(0))
     if cap < 4:
         with pytest.raises(ValueError, match="still moved after 3 passes"):
@@ -235,7 +235,7 @@ def test_a_routed_rung_is_fitted_again_under_its_column(tmp_path, monkeypatch, c
     prices: the per-rank law. A cap reached refuses the fit."""
     from atom.compass.backends import step_linear_fit
 
-    monkeypatch.setattr(step_linear_fit, "MAD_PASSES", cap)
+    monkeypatch.setattr(step_linear_fit, "FIT_PASSES", cap)
     full = _wide_or_tall(2, routed.FULL, (110_000, 130_000))
     sparse = _wide_or_tall(3, routed.SPARSE, (80_000, 100_000))
     records = routed._records(tmp_path / "full", full)

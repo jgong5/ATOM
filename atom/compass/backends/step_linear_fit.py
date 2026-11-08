@@ -44,7 +44,7 @@ column (below) is fitted again under it. Each
 vector reports, under `fit.all_rows`, the centre and scaled MAD of the fit on
 every rank's row, each step priced as its max over ranks, and under
 `fit.passes` the passes, how they stopped, `settled` or `tie`, and the
-squared error `F`; more than `MAD_PASSES` passes refuse the fit. A held-out
+squared error `F`; more than `FIT_PASSES` passes refuse the fit. A held-out
 step is priced and banded as its costliest rank.
 
 Records with a host key (`dp0.key.json`, from the real runner) also give the
@@ -174,6 +174,10 @@ MAD_K = 3.5
 #: A relative residual this small is never an outlier, however tight the rest.
 MAD_FLOOR = 0.01
 MAD_PASSES = 20
+#: Passes after which a max-affine fit whose error still falls refuses. Near a
+#: tie between ranks each line-searched pass gains little, so a fit that ends
+#: at a tie takes far more passes than one that settles.
+FIT_PASSES = 10_000
 #: A step that ran this many times its price is a one-off first touch, not scatter.
 WARM_FACTOR = 5.0
 TOKEN_BANDS = (512, 2048, 8192)
@@ -619,7 +623,7 @@ def _fit_form(
     falls. The passes end settled, the solve picking the rows it was solved
     on, or at a tie between ranks, when no step that moves some price by more
     than the square root of the float epsilon makes `F` fall; more than
-    `MAD_PASSES` passes in all raise. Steps whose residual is more than
+    `FIT_PASSES` passes in all raise. Steps whose residual is more than
     `MAD_K` scaled MADs from the median are then dropped and the passes rerun
     from there, until the kept set settles or for `MAD_PASSES` rounds.
 
@@ -671,9 +675,9 @@ def _fit_form(
             if on is not None and (on[keep] == picked[keep]).all():
                 stop = "settled"
                 break
-            if passes == MAD_PASSES:
+            if passes == FIT_PASSES:
                 raise ValueError(
-                    f"the alternation on {names} still moved after {MAD_PASSES} passes"
+                    f"the alternation on {names} still moved after {FIT_PASSES} passes"
                 )
             passes += 1
             full, solved = solve(a[steps, pick][keep], b[keep])
