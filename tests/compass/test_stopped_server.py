@@ -519,6 +519,7 @@ def test_a_stop_hands_a_dp_member_what_was_held_for_it(tmp_path, held_by):
     ]
     assert [r.time_to for r in ca.steps.rows if r.channel == req0] == [0.25]
 
+
 def test_an_engine_whose_input_thread_reads_shutdown_first_takes_the_released_request(
     monkeypatch, tmp_path
 ):
