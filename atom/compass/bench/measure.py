@@ -33,9 +33,10 @@ digest, from the contexts of the positional inputs' decode rows, origin
 `ragged`, naming those inputs and every trace their lines served; a drawn
 prefill view is not measured. `--grid` runs the step grid's planner over its
 inputs' lines for the engine they state and the nodes and margin
-`--grid-definition` states, and its points are measured with origin `plan`,
-the digest of the plan, which `<out>/plan.json` holds, and the `--grid`
-inputs as their sources. A planned
+`--grid-definition` states, under `--ragged` over the ragged views too, whose
+longest rows' cells alpha's fit reads, and its points are measured with
+origin `plan`, the digest of the plan, which `<out>/plan.json` holds, and the
+`--grid` inputs as their sources. A planned
 point that is also a replayed view is measured once, as that replay alone: its
 origin, sources and traces are the replay's, and it names no plan.
 
@@ -334,9 +335,9 @@ def start_bench(config, num_blocks: int):
 
 def _points(args, store, engine: dict, sampling: dict, out: Path) -> tuple[dict, int]:
     """Each distinct view to measure, by its digest: replayed views drawn as
-    `--sample` says, then planned points; and the largest KV pool an input's
-    engine states."""
-    read, grid = grid_plan(args, [*args.inputs, *args.grid], store, engine, sampling)
+    `--sample` says, or the ragged views composed from them, then planned
+    points; and the largest KV pool an input's engine states."""
+    read = read_inputs(args, [*args.inputs, *args.grid], store, engine, sampling)
     points = {}
     for name in args.inputs:
         source, lines, _ = read[name]
@@ -353,7 +354,9 @@ def _points(args, store, engine: dict, sampling: dict, out: Path) -> tuple[dict,
         points = {v: p for v, p in points.items() if v in drawn}
     if args.ragged:
         points = _ragged(points, [read[n] for n in args.inputs], args.seed)
-    if grid:
+    if args.grid:
+        composed = [(v, p["view"]) for v, p in points.items()] if args.ragged else []
+        grid = grid_plan(args, read, composed)
         (out / "plan.json").write_text(json.dumps(grid["plan"], indent=1))
         made = grid["provenance"]
         for line in grid["plan"]["lines"]:
@@ -381,22 +384,26 @@ def _ragged(points: dict, read: list, seed) -> dict:
     return out
 
 
-def grid_plan(args, names, store, engine: dict, sampling: dict, against=AGAINST):
+def read_inputs(args, names, store, engine: dict, sampling: dict, against=AGAINST):
     """Each input of `names`, read with the client runs `args.client_run` names
-    for it under `args.sessions`, refusing as `_read` does; and, under
-    `args.grid`, the step grid: the `definition` `args.grid_definition` holds
-    and its digest, `grid`; the `plan` over the `--grid` inputs' lines for the
-    engine they state; and the plan's `provenance`: its digest, `run`, those
-    inputs as sources and the traces their lines served."""
+    for it under `args.sessions`, refusing as `_read` does."""
     read = {}
     for n in dict.fromkeys(names):
         runs = [e for r, e in args.client_run if Path(r) == Path(n)]
         read[n] = _read(n, store, runs, args.sessions, engine, sampling, against)
-    if not args.grid:
-        return read, None
+    return read
+
+
+def grid_plan(args, read: dict, views=()) -> dict:
+    """The step grid: the `definition` `args.grid_definition` holds and its
+    digest, `grid`; the `plan` over the lines of the `--grid` inputs, as
+    `read_inputs` read them into `read`, for the engine they state, and over
+    the ragged `views`, named lines; and the plan's `provenance`: its digest,
+    `run`, those inputs as sources and the traces their lines served."""
     definition = json.loads(Path(args.grid_definition).read_text())
     steps = [(f"{n} step {x['step']}", x) for n in args.grid for x in read[n][1]]
-    planned = plan(definition, steps, {f"{n} dp0": read[n][2] for n in args.grid})
+    engines = {f"{n} dp0": read[n][2] for n in args.grid}
+    planned = plan(definition, steps, engines, views)
     provenance = {
         "source": "plan",
         "run": _digest(planned),
@@ -404,7 +411,7 @@ def grid_plan(args, names, store, engine: dict, sampling: dict, against=AGAINST)
         "traces": sorted({t for _, x in steps for t in x["traces"]}),
     }
     grid = {"definition": definition, "grid": _digest(definition), "plan": planned}
-    return read, grid | {"provenance": provenance}
+    return grid | {"provenance": provenance}
 
 
 def _read(name: str, store, client_runs, sessions, engine, sampling, against=AGAINST):
@@ -563,7 +570,6 @@ def _measure(bench, config, sampling, store, command, readings, todo) -> list[st
             members={member_name(*MEMBER): json.dumps(member).encode()},
         )
         ms = got["median_ns"] / 1e6
-        print(
-            f"measured {key.values['step_kind']} {key.token()}: {ms:.3f} ms", flush=True
-        )
+        named = f"{point['origin']} {key.values['step_kind']} {key.token()}"
+        print(f"measured {named}: {ms:.3f} ms", flush=True)
     return refused
