@@ -5,8 +5,8 @@ With the stand-in bench and graphs of `test_bench_ops_plan.py`, each part of a
 drafter's step holds a leaf of its own: `--plan` measures them beside the
 target's leaves, and `--coverage` reads each step's parts as a run prices them.
 Beside the stand-in runner of `test_bench_ops.py`, a leaf of the drafter's
-alone counts the rows of its own pass as ATOM's `batch_info` states them, and
-a drafter's MoE draws its expert ids over its own experts. DeepSeek-V4.1-Flash's
+alone counts the rows of its own pass as ATOM's `batch_info` states them and
+draws its expert ids over its drafter's experts. DeepSeek-V4.1-Flash's
 DSpark5 drafter, traced at #2086's trace run b's arguments where a capture
 holds them, reaches each leaf's launch off the card (`v41_ops_rehearsal.py`).
 """
@@ -181,13 +181,22 @@ def test_a_collective_whose_bytes_fall_as_its_step_s_rows_rise_halves_no_step():
 
 
 def test_a_drafter_s_moe_draws_its_ids_over_its_own_experts():
+    # The model's MoE leaf draws over its 384 experts, the drafter's over its
+    # 128; a leaf of the model's whose integer view is as wide as the
+    # drafter's top-k, as V4.1's target's at a decode of 3 rows, draws none.
     stub = ops.Stub(_Drafting(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    moe = "aiter.fused_moe_.default"
+    for op, rows, k, drafted in (
+        (moe, 24, 6, False),
+        (moe, 20, 3, True),
+        ("aten.view.default", 24, 3, False),
+    ):
+        ids = {"shape": [rows, k], "stride": [k, 1], "dtype": "torch.int32"}
+        args = {"ids": ids | {"role": "activation"}}
+        stub._copy({"op": op, "args": args, "drafted": drafted}, "sig", [{}], 0)
 
-    assert stub.moe == [(128, 3), (384, 6)]
-    for experts, k in stub.moe:
-        spec = {"shape": [20, k], "stride": [k, 1], "dtype": "torch.int32"}
-        ids = stub._route(spec | {"role": "activation"}, 0)
-        assert ids.shape == (20, k) and int(ids.max()) < experts
+    assert [len(loads) for loads in stub.loads] == [384, 128]
 
 
 #: Trace run b's engine arguments past the model and TP, in the setup a capture

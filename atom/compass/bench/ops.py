@@ -776,15 +776,8 @@ class Stub:
         self.modules = dict(runner.model.named_modules())
         self.contexts = runner.config.compilation_config.static_forward_context
         drafter = getattr(runner, "drafter", None)
-        models = [runner.model, *([drafter.model] if drafter else [])]
-        self.moe = sorted(
-            {
-                (m.global_num_experts, m.top_k)
-                for model in models
-                for m in model.modules()
-                if hasattr(m, "global_num_experts")
-            }
-        )
+        self.moe = _moe(runner.model)
+        self.draft_moe = _moe(drafter.model) if drafter else []
         # ATOM's top-k weights and ids buffers when its MoE layers fuse shared
         # experts into top-k (`init_aiter_topK_meta_data`), live metadata a
         # leaf may read: past top-k, the shared experts' ids, under EP one
@@ -792,7 +785,10 @@ class Stub:
         topk = sys.modules.get("atom.model_ops.topK")
         meta = getattr(topk, "aiter_topK_meta_data", None)
         self.topk = dict(
-            zip(("topk_weights", "topk_ids"), meta if meta and self.moe else ())
+            zip(
+                ("topk_weights", "topk_ids"),
+                meta if meta and (self.moe or self.draft_moe) else (),
+            )
         )
         self.shared = self.topk.get("topk_ids")
         self.loads = []
@@ -1315,6 +1311,7 @@ class Stub:
         snap, meta = self.placed[p]
         fresh = c >= len(self.placed) * len(instances)
         table, ids = GATHERED.get(op["op"], (None, None))
+        drafted = op.get("drafted", False)
 
         seq = tuple if ":" in op["op"] else list  # a lifted call's, as ATOM's
 
@@ -1333,8 +1330,8 @@ class Stub:
                     )
                 at = torch.arange(c * n, (c + 1) * n, device=out.device) % rows
                 return out.copy_(self.built["rows"][at].view(out.shape))
-            if isinstance(value, dict) and self._routed(value, sig, path):
-                return self._route(value, c)
+            if isinstance(value, dict) and self._routed(value, sig, path, drafted):
+                return self._route(value, c, drafted)
             if isinstance(value, dict) and value.get("role") == "weight":
                 # each cache-sized copy takes a weight of its own, as it does
                 # activations; a gathered table's copies share one
@@ -1400,14 +1397,16 @@ class Stub:
         stable = op["args"].get("stable", False)
         return _topk_workspace(op["op"], rows, stride, k, stable, self.runner.device)
 
-    def _routed(self, spec, sig, path) -> bool:
+    def _routed(self, spec, sig, path, drafted=False) -> bool:
         """Whether `spec` at `sig`'s `path` is a router's top-k expert ids: an
         integer activation, or a metadata view `_meta` bound to ATOM's ids
         buffer, a row per token, a column per expert an MoE layer of the model
-        takes, or per column of ATOM's ids buffer with its fused shared
-        experts."""
-        widths = {k for _, k in self.moe}
-        if self.shared is not None:
+        takes, of its drafter's for a leaf of the drafter's alone (`drafted`),
+        or, where it holds one, per column of ATOM's ids buffer with its fused
+        shared experts."""
+        moe = self.draft_moe if drafted else self.moe
+        widths = {k for _, k in moe}
+        if moe and self.shared is not None:
             widths.add(self.shared.shape[1])
         bound = self.placed[0][1].get((sig, path), ("",))[0]
         return (
@@ -1417,19 +1416,19 @@ class Stub:
             and spec["shape"][1] in widths
         )
 
-    def _route(self, spec, c):
+    def _route(self, spec, c, drafted=False):
         """Copy `c`'s expert ids for `spec`: each row's experts drawn
         independently and uniformly, distinct, from the model's routed experts,
-        seeded by `SEED` and `c`, and past top-k the row's ids in ATOM's buffer;
-        the copy's expert loads go to `loads`; of the MoE layers the model and
-        its drafter hold, the one whose top-k is the ids' width."""
-        fits = [m for m in self.moe if m[1] == spec["shape"][1]] or self.moe
-        if len(fits) > 1:
+        its drafter's for a leaf of the drafter's alone (`drafted`), seeded by
+        `SEED` and `c`, and past top-k the row's ids in ATOM's buffer; the
+        copy's expert loads go to `loads`."""
+        moe = self.draft_moe if drafted else self.moe
+        if len(moe) > 1:
             raise ValueError(
-                f"the model's MoE layers route (experts, top-k) {self.moe}: "
+                f"the model's MoE layers route (experts, top-k) {moe}: "
                 f"which one draws {_text(spec)} is not known"
             )
-        [(experts, k)] = fits
+        [(experts, k)] = moe
         device = self.runner.device
         ids = uniform_ids(spec["shape"][0], experts, k, SEED * CALLS + c, device)
         self.loads.append(torch.bincount(ids.flatten(), minlength=experts).tolist())
@@ -1443,6 +1442,7 @@ class Stub:
         """Copy `like` of `op`'s call with the c-th weight of each weight
         argument's spec and expert ids of its own, its other arguments and
         forward context shared."""
+        drafted = op.get("drafted", False)
 
         def build(path, value, old):
             if isinstance(value, list):
@@ -1452,8 +1452,8 @@ class Stub:
                 )
             if isinstance(value, dict) and value.get("role") == "weight":
                 return self._weight(value, c, op["occurrences"])
-            if isinstance(value, dict) and self._routed(value, sig, path):
-                return self._route(value, c)
+            if isinstance(value, dict) and self._routed(value, sig, path, drafted):
+                return self._route(value, c, drafted)
             return old
 
         kwargs, snap = like
@@ -2289,6 +2289,17 @@ def _deep(x, memo, clones=None):
     else:
         return x
     return memo[id(x)]
+
+
+def _moe(model) -> list:
+    """The `(experts, top-k)` of each MoE layer `model` holds."""
+    return sorted(
+        {
+            (m.global_num_experts, m.top_k)
+            for m in model.modules()
+            if hasattr(m, "global_num_experts")
+        }
+    )
 
 
 def _own(module):
