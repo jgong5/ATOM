@@ -19,6 +19,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
@@ -33,6 +34,7 @@ from atom.compass.artifacts import ArtifactRefusal, Rule
 from atom.compass.backends.op_graph import KV
 from atom.compass.bench import ops
 from atom.compass.capture.forward import decode, prefill
+from atom.compass.fit import ops as fit_ops
 from atom.utils import forward_context as fctx
 
 #: A block drafter of one draft: a decode row verifies two tokens.
@@ -48,14 +50,18 @@ OWN[False, True] = OWN[True, KV]
 
 def _parted(store, config, shape, arch=None, output=True, draft=False):
     """The target's graph, or a part of the drafter's, as `trace ops` keeps
-    them: a decode has no middle chunk's."""
+    them: a decode has no middle chunk's. A decode's drafter runs its block at
+    the step's width, B, and stages its anchors at its rows, T, as
+    DeepSeek-V4.1's DSpark drafter does."""
     if not draft:
         return _graph_at(store, config, shape, arch)
     if shape.phase == "decode" and not output:
         raise ArtifactRefusal(Rule.RESOLUTION, f"no op_graph holds {shape}", "")
     rows = shape.tokens if shape.phase == "prefill" else shape.seqs
-    own = _leaf(OWN[output, draft], ("x", _t([rows, 8], "activation")))
-    return _graph(own, layers=1)
+    own = [_leaf(OWN[output, draft], ("x", _t([rows, 8], "activation")))]
+    if shape.phase == "decode" and draft is True:
+        own.append(_anchor(shape.tokens))
+    return _graph(*own, layers=1)
 
 
 def _records(path, *steps):
@@ -95,19 +101,96 @@ def test_a_plan_measures_a_drafter_s_parts_and_coverage_reads_each_step_s(
     records = [json.loads(x) for x in (out / "plan.jsonl").read_text().splitlines()]
     shapes = {r["shape"] for r in records if r["op"] == "aiter.propose"}
     assert shapes == {r["shape"] for r in records if r["op"] == "aiter.gemm"}
-    assert {r["op"] for r in records} == {"aiter.attn", "aiter.gemm", *OWN.values()}
+    # The decode padded past its rows runs its drafter at `decode T=1 B=2`: its
+    # block is the width's, measured at rung 2, its anchors a point there.
+    rungs = {"decode B=1", "decode B=2", "decode B=4"}
+    anchors = {r["shape"] for r in records if r["op"] == "aiter.anchor"}
+    assert anchors == rungs | {"decode T=1 B=2"} and rungs <= shapes
+    assert {r["op"] for r in records} == {
+        "aiter.attn",
+        "aiter.gemm",
+        "aiter.anchor",
+        *OWN.values(),
+    }
     report = ops.coverage(store, root, DRAFTING, [steps], records, "gfx942")
     # Each step reads its target's and its drafter's graphs; one that samples
-    # also its draft-KV pass's; a middle chunk its drafter's alone. A decode
-    # padded past its rows reads its drafter's at them, unpadded, a shape
-    # `--plan` measures no point at.
+    # also its draft-KV pass's; a middle chunk its drafter's alone. The padded
+    # decode's drafter is read at its own shape.
     assert report["by part"] == {
         "target": {"steps": 5, "covered": 5},
-        "draft": {"steps": 5, "covered": 4},
+        "draft": {"steps": 5, "covered": 5},
         "draft_kv": {"steps": 4, "covered": 4},
     }
-    assert report["left out, by leaf kind"] == {
-        "draft aiter.propose": {"no measured point": 1}
+    assert report["left out, by leaf kind"] == {}
+
+
+def _anchor(rows):
+    """The leaf staging a drafter's anchors, of `rows` rows."""
+    return _leaf("aiter.anchor", ("ids", _t([rows, 6], "activation")))
+
+
+def test_fit_ops_reads_a_drafter_s_own_point_at_the_rows_it_ran():
+    # One row padded to two ran the anchors of its one row: a point of B=1,
+    # beside the drafter's at B=1, not of B=2.
+    leaf = {}
+
+    def point(shape, rows, ns):
+        [(sig, (op, _))] = ops.leaves(_graph(_anchor(rows), layers=1)["region"]).items()
+        leaf[rows] = op
+        point = {"shape": shape, "context": 1000, "op": "aiter.anchor", "leaf": sig}
+        return point | {"cold_ns": ns, "kernels": ["anchor"]}
+
+    points = [
+        point("decode B=1", 1, 1000.0),
+        point("decode T=1 B=2", 1, 1200.0),
+        point("decode B=2", 2, 2000.0),
+    ]
+    listed = fit_ops.PriceList(fit_ops.fit(points))
+
+    got = [
+        listed.price((leaf[n], ("decode", n, n, None, 1000, 1000.0), None)).seconds
+        for n in (1, 2)
+    ]
+
+    assert got == pytest.approx([1100e-9, 2000e-9])
+
+
+class _Padding(_Runner):
+    """`_Runner` keeping, for each batch it prepares, the ladder its step pads
+    to, ATOM's under `--enforce-eager` unless the bench pads it."""
+
+    capture_sizes_np = np.array([0], dtype=np.int32)
+
+    def prepare_model(self, batch):
+        self.ladders.add(tuple(self.capture_sizes_np.tolist()))
+        return super().prepare_model(batch)
+
+
+def test_a_drafter_s_own_shape_holds_its_rows_on_a_step_padded_to_its_width(
+    monkeypatch,
+):
+    # A decode of one row padded to two, beside one of two rows: the point
+    # holds the row, verifying its draft, and the runner pads its step to
+    # two, as the capture's runner did, so the drafter's passes run there.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    runner, got = _Padding(), {}
+    batches = []
+    rule = SimpleNamespace(
+        block_size=16,
+        drafts=1,
+        batch=lambda view, block, slot: batches.append(view["rows"]) or (block, slot),
+    )
+    stub = ops.Stub(runner, 10_000)
+    found = ops.leaves(_graph(_anchor(1), layers=1)["region"])
+    for shape in (decode(2, None, 1), decode(2)):
+        runner.ladders, batches[:] = set(), []
+        stub.point(rule, shape, 20, found)
+        got[str(shape)] = batches[0], runner.ladders
+
+    assert got == {
+        "decode T=1 B=2": ([[2, 21, True]], {(2,)}),
+        "decode B=2": ([[2, 21, True], [2, 21, True]], {(0,)}),
     }
 
 
