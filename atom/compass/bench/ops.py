@@ -2048,15 +2048,26 @@ def _replay(fn, calls, flush=None) -> list[float]:
     (`_release`). Over several ranks, a decode step's graph is captured as
     ATOM captures one, each collective on the buffers it registered. The
     graph registers ATOM's forced-acceptance generators (`_synthetic`) before
-    its capture, as the capture registers the default one."""
+    its capture, as the capture registers the default one. Before the
+    capture, the first call runs once on the stream it captures on, as ATOM's
+    runner warms a graph's stream before it captures: aiter's Mega-MHC grows
+    a scratch per stream, and refuses to while that stream captures."""
     from atom.compass.bench.ranks import cpu_group, refused_together
     from atom.utils import forward_context
 
     registered = cpu_group() is not None and not calls[0][1].context.is_prefill
     if registered:
         from aiter.dist.parallel_state import graph_capture
-    _release()  # the capture's own release then has nothing to return
     graph = torch.cuda.CUDAGraph()
+    forward_context._forward_context = calls[0][1]
+    with refused_together():
+        capture = torch.cuda.graph(graph, capture_error_mode="thread_local")
+        stream, current = capture.capture_stream, torch.cuda.current_stream()
+        stream.wait_stream(current)
+        with torch.cuda.stream(stream):
+            fn(**calls[0][0])
+        current.wait_stream(stream)
+    _release()  # the capture's own release then has nothing to return
     for generator in _synthetic():
         graph.register_generator_state(generator)
     with warnings.catch_warnings(record=True) as caught:
@@ -2064,7 +2075,7 @@ def _replay(fn, calls, flush=None) -> list[float]:
         with (
             refused_together(),
             graph_capture() if registered else contextlib.nullcontext(),
-            _contained(torch.cuda.graph(graph, capture_error_mode="thread_local")),
+            _contained(capture),
         ):
             for kwargs, snap in calls:
                 forward_context._forward_context = snap

@@ -61,6 +61,28 @@ def _graph(*layer_ops, layers=4):
     return json.loads(to_json(build(items, Traced("x tp=1 decode eager", "B=2"))))
 
 
+class _Stream(str):
+    """A stand-in stream, by name: nothing runs on it, so it waits for nothing."""
+
+    def wait_stream(self, other):
+        pass
+
+
+class _Capture(contextlib.nullcontext):
+    """`torch.cuda.graph` capturing nothing, on a stand-in stream."""
+
+    capture_stream = _Stream("capture")
+
+    def __init__(self, graph, **kwargs):
+        super().__init__()
+
+
+def _captures(monkeypatch, graph=_Capture):
+    """`torch.cuda.graph` as `graph`, beside a stand-in current stream."""
+    monkeypatch.setattr(torch.cuda, "graph", graph)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream("main"))
+
+
 def test_each_leaf_holds_every_instance_s_context_key_and_module_path():
     attn = _leaf(
         "aiter.attention",
@@ -347,7 +369,7 @@ def test_a_leaf_timed_after_a_copy_into_its_metadata_reads_the_prepared_values(
     placed = SimpleNamespace(
         block_size=16, batch=lambda view, block, slot: (block, slot)
     )
-    monkeypatch.setattr(torch.cuda, "graph", lambda g, **_: contextlib.nullcontext())
+    _captures(monkeypatch)
     monkeypatch.setattr(
         torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=lambda: None)
     )
@@ -2056,7 +2078,7 @@ def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
             return end.at - self.at
 
     monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
-    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: contextlib.nullcontext())
+    _captures(monkeypatch)
     monkeypatch.setattr(torch.cuda, "Event", Event)
     monkeypatch.setattr(ops.time, "sleep", slept.append)
 
@@ -2088,7 +2110,7 @@ def test_each_cold_replay_follows_one_read_of_cold_caches_and_a_warm_one_none(
         "CUDAGraph",
         lambda: SimpleNamespace(replay=lambda: seen.append("replay")),
     )
-    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: contextlib.nullcontext())
+    _captures(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "Event",
@@ -2127,17 +2149,16 @@ def test_a_capture_waits_for_the_driver_to_clear_a_release_and_a_capped_wait_is_
     )
     monkeypatch.setattr(torch.cuda, "memory_reserved", iter([8 * gib, 0] * 2).__next__)
 
-    @contextlib.contextmanager
-    def graph(g, capture_error_mode=None):
-        captured.append(len(read))
-        yield
+    class Graph(_Capture):
+        def __enter__(self):
+            captured.append(len(read))
 
     def event(enable_timing):
         return SimpleNamespace(
             record=lambda: None, synchronize=lambda: None, elapsed_time=lambda e: 1.0
         )
 
-    monkeypatch.setattr(torch.cuda, "graph", graph)
+    _captures(monkeypatch, Graph)
     monkeypatch.setattr(
         torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=lambda: None)
     )
@@ -2223,18 +2244,19 @@ def test_a_graph_over_placements_reads_one_clone_of_metadata_none_changed(
             assert not capturing, "operation not permitted when stream is capturing"
             prepared["cu"] = cu
 
-    @contextlib.contextmanager
-    def graph(g, capture_error_mode=None):
-        capturing.append(g)
-        yield
-        capturing.clear()
+    class Graph(_Capture):
+        def __enter__(self):
+            capturing.append(self)
+
+        def __exit__(self, *exc):
+            capturing.clear()
 
     def event(enable_timing):
         return SimpleNamespace(
             record=lambda: None, synchronize=lambda: None, elapsed_time=lambda e: 1.0
         )
 
-    monkeypatch.setattr(torch.cuda, "graph", graph)
+    _captures(monkeypatch, Graph)
     monkeypatch.setattr(
         torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=lambda: None)
     )
@@ -2274,15 +2296,82 @@ def test_a_replay_prices_each_timed_replay_per_call_each_under_its_context(
 
     monkeypatch.setattr(fctx, "_forward_context", fctx._forward_context)
     monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
-    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: contextlib.nullcontext())
+    _captures(monkeypatch)
     monkeypatch.setattr(torch.cuda, "Event", Event)
     calls = [({"x": i}, f"snap{i}") for i in range(4)]
 
     times = ops._replay(lambda x: seen.append((x, fctx._forward_context)), calls)
 
-    assert seen == [(i, f"snap{i}") for i in range(4)]
+    # the first call once on the capture's stream, then the capture
+    assert seen == [(0, "snap0")] + [(i, f"snap{i}") for i in range(4)]
     timed = range(ops.WARMUPS, ops.WARMUPS + ops.REPEATS)
     assert times == [(i + 1) * 1e6 / 4 for i in timed]
+
+
+def test_a_graph_s_first_call_runs_once_on_its_capture_stream_before_the_capture(
+    monkeypatch,
+):
+    # aiter's Mega-MHC grows a scratch per stream, and refuses to while that
+    # stream captures; the leaf's eager call grew the current stream's. The
+    # capture's stream waits for the current one, its call grows its own,
+    # the current one waits for it, and the capture's release follows.
+    log, scratch, capturing = [], set(), []
+
+    class Stream(_Stream):
+        def wait_stream(self, other):
+            log.append(f"{self} waits for {other}")
+
+    current = [Stream("main")]
+
+    class Graph(_Capture):
+        capture_stream = Stream("capture")
+
+        def __enter__(self):
+            current.append(self.capture_stream)
+            capturing.append(self)
+
+        def __exit__(self, *exc):
+            capturing.clear()
+            current.pop()
+
+    @contextlib.contextmanager
+    def stream(s):
+        current.append(s)
+        yield
+        current.pop()
+
+    def mega_mhc():
+        if current[-1] not in scratch:
+            if capturing:
+                raise RuntimeError("Warm up Mega-MHC scratch on the capture stream")
+            scratch.add(current[-1])
+        log.append(f"call on {current[-1]}")
+
+    event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+    event.elapsed_time = lambda end: 1.0
+    for name, value in {
+        "CUDAGraph": lambda: SimpleNamespace(replay=lambda: None),
+        "graph": Graph,
+        "Event": lambda enable_timing: event,
+        "current_stream": lambda: current[-1],
+        "stream": stream,
+    }.items():
+        monkeypatch.setattr(torch.cuda, name, value)
+    monkeypatch.setattr(ops, "_release", lambda: log.append("release"))
+    monkeypatch.setattr(fctx, "_forward_context", fctx._forward_context)
+    mega_mhc()  # the leaf's eager call, as `Stub._time` makes it
+
+    ops._replay(mega_mhc, [({}, fctx._forward_context)] * 2)
+
+    assert log == [
+        "call on main",
+        "capture waits for main",
+        "call on capture",
+        "main waits for capture",
+        "release",
+        "call on capture",
+        "call on capture",
+    ]
 
 
 def test_a_capture_that_fails_refuses_its_leaf_and_the_next_draws_its_activations(
@@ -2292,7 +2381,7 @@ def test_a_capture_that_fails_refuses_its_leaf_and_the_next_draws_its_activation
     # stream current and still capturing, and the generator in capture: a
     # draw then raises, and so does the next capture on that stream. A graph
     # a garbage collection frees in a capture would end the process.
-    world = {"stream": "main", "capturing": set(), "generator": "free"}
+    world = {"stream": _Stream("main"), "capturing": set(), "generator": "free"}
     collecting = []
     randn = torch.randn
 
@@ -2302,7 +2391,7 @@ def test_a_capture_that_fails_refuses_its_leaf_and_the_next_draws_its_activation
         return randn(*args, **kwargs)
 
     class Capture:
-        capture_stream = "capture"
+        capture_stream = _Stream("capture")
 
         def __init__(self, graph, capture_error_mode):
             restore = lambda *_: world.update(stream=self.found)
@@ -2331,7 +2420,7 @@ def test_a_capture_that_fails_refuses_its_leaf_and_the_next_draws_its_activation
 
     def function(name):
         def call(**kwargs):
-            if name == "aten.neg.default" and world["stream"] == "capture":
+            if name == "aten.neg.default" and world["stream"] in world["capturing"]:
                 world["invalid"] = True
 
         return call
@@ -2404,7 +2493,7 @@ def _forced(monkeypatch, end=lambda: None):
             self.registered.append(generator)
 
     class Capture:
-        capture_stream = "capture"
+        capture_stream = _Stream("capture")
 
         def __init__(self, graph, capture_error_mode):
             self.graph = graph
@@ -2431,7 +2520,7 @@ def _forced(monkeypatch, end=lambda: None):
         "CUDAGraph": Graph,
         "graph": Capture,
         "Event": lambda enable_timing: event,
-        "current_stream": lambda: "main",
+        "current_stream": lambda: _Stream("main"),
         "stream": lambda s: contextlib.nullcontext(),
         "is_current_stream_capturing": lambda: False,
         "default_generators": (_Generator(),),
@@ -2470,7 +2559,8 @@ def test_a_forced_acceptance_is_captured_drawing_from_atom_s_own_generator(
     times = ops._replay(sample, [(kwargs, fctx._forward_context)] * 4)
 
     assert times == [1e6 / 4] * ops.REPEATS
-    assert launched == [False] + [True] * 4 and not synthetic.capturing
+    # the eager call, the first call once on the capture's stream, the graph
+    assert launched == [False] * 2 + [True] * 4 and not synthetic.capturing
 
 
 def test_a_failed_capture_leaves_atom_s_forced_acceptance_generator_out_of_it(
@@ -2487,7 +2577,7 @@ def test_a_failed_capture_leaves_atom_s_forced_acceptance_generator_out_of_it(
         ops._replay(sample, [(kwargs, fctx._forward_context)])
     sample(**kwargs)
 
-    assert launched == [False, True, False] and not synthetic.capturing
+    assert launched == [False, False, True, False] and not synthetic.capturing
 
 
 def test_a_device_argument_is_the_rank_s_own_device():
