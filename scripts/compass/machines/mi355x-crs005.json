@@ -161,10 +161,9 @@
       "assumed",
       "ptl",
       "peaks",
-      "rdma bench",
-      "rdma run"
+      "crs005-013-ionic"
     ],
-    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at f6e1fa77d | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples | rdma_link.py's bench, 005's GPUs writing into 013's over ionic_N | a recorded 1P1D run's KV writes, 005 into 013 over ionic_N"
+    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at f6e1fa77d | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples | rdma_link.py fit BENCH RECORD at f371241a0, crsuse2-m2m-v3-005 writing into -013 over ionic_N, the rails of matched-rail Mooncake: the bench (005's GPUs into 013's, the 1P1D deployment's RDMA settings) gives the port rate read on all sixteen ports and the latency fitted per round on every GPU's writes, on its own rail and the next GPU's; one recorded 1P1D run of #975's EP-off cell at c=64 for 600 s (its prefill server log) gives the derate of its KV writes that no other write was in flight beside on their prefill rank or rail"
   },
   "device": {
     "name": "MI355X",

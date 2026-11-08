@@ -12,9 +12,10 @@ The device fragment is one DeepSeek-V4-Pro start at the nightly DPA-TP8 prefill
 side's arguments (`FLAGS`): the device, its capacity and the stack.
 `probe_device.py`'s readings (`PEAKS`) add the compute and memory derates, the
 bandwidth curve, the kernel floor and the intra-node link's latency and derate.
-On crsuse2-m2m-v3-005, `rdma_link.py`'s bench into -013 adds the inter-node
-link (`INTER_NODE`). The peaks are the datasheet's; the rest is assumed. An
-engine start's memory readings are `compass measure memory`'s, not the spec's.
+On crsuse2-m2m-v3-005, the network file of its rails into -013 adds the
+inter-node link (`NETWORK`). The peaks are the datasheet's; the rest is
+assumed. An engine start's memory readings are `compass measure memory`'s, not
+the spec's.
 """
 
 import argparse
@@ -247,58 +248,22 @@ if GPU40:
         "020692760182d835943e2ac416f59df1abd2bb82cbe71870ce0c9f316cae436a",
     )
 
-#: On 005 and 013, the link `rdma_link.py fit BENCH RECORD` publishes, each
-#: field `[value, p10, p90]`. Per probe: its fragment, notes, date, commit,
-#: fields and its record's sha256. The bench (BENCH), 005's GPUs writing into
-#: 013's over ionic_N under the 1P1D deployment's RDMA settings, gives the port
-#: rate read on all sixteen ports and the latency fitted per round on every
-#: GPU's writes, on its own rail and the next GPU's. One recorded 1P1D run of
-#: #975's EP-off cell at c=64 for 600 s (RECORD, sha256 of its prefill server
-#: log) gives the derate of its KV writes that no other write was in flight
-#: beside on their prefill rank or rail.
-INTER_NODE = ()
+#: On 005, the network file of its rails into 013, which `rdma_link.py fit
+#: BENCH RECORD` published; its notes say what each value was read from.
+NETWORK = None
 if CRS005:
-    INTER_NODE = (
-        (
-            "rdma bench",
-            "rdma_link.py's bench, 005's GPUs writing into 013's over ionic_N",
-            "2026-11-08",
-            "f371241a0",
-            {
-                "link_bandwidth_bytes_per_s": [5e10, 5e10, 5e10],
-                "link_latency_s": [
-                    3.008648854934795e-05,
-                    2.950775364256114e-05,
-                    6.060598291460931e-05,
-                ],
-            },
-            "8c5a2b561e898c28f51605e5069c4a98cbe362db40a8f734a83cb74423f88103",
-        ),
-        (
-            "rdma run",
-            "a recorded 1P1D run's KV writes, 005 into 013 over ionic_N",
-            "2026-11-08",
-            "f371241a0",
-            {
-                "derate": [
-                    0.46939086521217643,
-                    0.3716563888843095,
-                    0.5117426951060756,
-                ]
-            },
-            "4b35806ba3cd4eca3d7aee08916dac2290435d52291d645e80a51a749ca70fea",
-        ),
-    )
+    NETWORK = Path(__file__).resolve().parents[2] / "atom/compass/networks"
+    NETWORK /= "crs005-013-ionic.json"
 
 #: No probe fills these: mi308x_spec's assumed values less what the datasheet
-#: states and what `PEAKS` and `INTER_NODE` fill. Its inter-node link is one
+#: states and what `PEAKS` and `NETWORK` fill. Its inter-node link is one
 #: 400 Gb/s NIC's line rate here too.
 DECLARED = copy.deepcopy(base.DECLARED)
 for block, groups in DATASHEET.items():
     for group, values in groups.items():
         for key in values:
             DECLARED[block][group].pop(key, None)
-if INTER_NODE:
+if NETWORK:
     del DECLARED["interconnect"]["inter_node"]
 
 
@@ -321,11 +286,9 @@ def device_fragments() -> list[Fragment]:
         fragment("ptl", ptl, "probed", "no card has a ptl directory", date=PTL_DATE),
         probed,
     ]
-    for name, how, date, root, found, record in INTER_NODE:
-        subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
-        link = {"interconnect": {"inter_node": {k: v[0] for k, v in found.items()}}}
-        band = {f"interconnect.inter_node.{k}": v[1:] for k, v in found.items()}
-        fragments.append(fragment(name, link, "probed", how, subject, date, band))
+    if NETWORK:
+        network = json.loads(NETWORK.read_text()) | {"name": NAME}
+        fragments.append(Fragment.from_mapping(network, NETWORK.stem))
     return fragments
 
 

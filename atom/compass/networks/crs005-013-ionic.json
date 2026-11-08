@@ -28,7 +28,7 @@
         "p90": 0.5117426951060756
       }
     },
-    "notes": "crsuse2-m2m-v3-005 writing into -013 over ionic_N, the rails of matched-rail Mooncake: the port rate and latency from rdma_link.py's bench, the derate from a recorded 1P1D run's KV writes (scripts/compass/mi355x_spec.py, INTER_NODE)"
+    "notes": "rdma_link.py fit BENCH RECORD at f371241a0, crsuse2-m2m-v3-005 writing into -013 over ionic_N, the rails of matched-rail Mooncake: the bench (005's GPUs into 013's, the 1P1D deployment's RDMA settings) gives the port rate read on all sixteen ports and the latency fitted per round on every GPU's writes, on its own rail and the next GPU's; one recorded 1P1D run of #975's EP-off cell at c=64 for 600 s (its prefill server log) gives the derate of its KV writes that no other write was in flight beside on their prefill rank or rail"
   },
   "interconnect": {
     "inter_node": {
