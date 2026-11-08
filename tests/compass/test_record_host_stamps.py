@@ -66,6 +66,7 @@ def patched(monkeypatch):
         (CoreManager, "add_request"),
         (DisaggCoreManager, "add_request"),
         (CoreManager, "_mark_seq_prefill_complete"),
+        (CoreManager, "_deliver_terminal_output"),
         (ThreadPoolExecutor, "submit"),
     ):
         monkeypatch.setattr(owner, name, vars(owner)[name])
@@ -206,11 +207,13 @@ def test_a_recorded_server_stamps_each_output_row_taken_in_and_each_stream_head(
 ):
     compass_run.tokenizer(tok, None)
     manager = CoreManager.__new__(CoreManager)
-    manager._seq_load = {}
+    manager._seq_load, manager._seq_id_to_callback = {}, {}
 
     async def streamed(request):
         await request.body()
-        manager._mark_seq_prefill_complete(1)  # the output thread takes a row in
+        # The output thread takes in a streamed row and a finished sequence's.
+        manager._mark_seq_prefill_complete(1)
+        manager._deliver_terminal_output(SimpleNamespace(id=2))
         return StreamingResponse(iter([b"data: x\n\n"]), media_type="text/event-stream")
 
     async def answered(request):
@@ -244,8 +247,8 @@ def test_a_recorded_server_stamps_each_output_row_taken_in_and_each_stream_head(
     rows = [
         line.split() for line in (record / "intake.stamps").read_text().splitlines()
     ]
-    # One row taken in, and one head: the stream's, not the JSON answer's.
-    assert [r[2] for r in rows if r[2] in ("out", "head")] == ["out", "head"]
+    # Two rows taken in, and one head: the stream's, not the JSON answer's.
+    assert [r[2] for r in rows if r[2] in ("out", "head")] == ["out", "out", "head"]
     assert all(int(r[3]) <= int(r[0]) for r in rows)
 
 

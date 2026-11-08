@@ -41,9 +41,10 @@ WALL = 1_700_000_000_000_000_000
 def hopped(directory, alone=10, raw=RAW + ".gz") -> None:
     """`directory`'s record with what its server and client leave of each hop:
     `alone` messages taking the hop's `PLANTED` time, then two in flight at
-    once taking `OVERLAP`; on ``ipc_s`` each received inside a forward, and one
-    more alone taking `OVERLAP`, received once the engine left its last. The
-    client's raw records are written as `raw` beside the export."""
+    once taking `OVERLAP`; on ``ipc_s`` each received inside a forward, and two
+    more alone: one taking `OVERLAP`, received once the engine left its last,
+    and one received before its send call returned. The client's raw records
+    are written as `raw` beside the export."""
     steps = directory / "steps"
     forwards = [json.loads(x) for x in (steps / "dp0.jsonl").read_text().splitlines()]
     windows = [(s["t_enter_ns"], s["t_exit_ns"]) for s in forwards]
@@ -54,6 +55,8 @@ def hopped(directory, alone=10, raw=RAW + ".gz") -> None:
     ipc += [(e + 10_000, e + 10_000 + OVERLAP), (e + 11_000, e + 11_000 + OVERLAP)]
     last = windows[-1][1]
     ipc += [(last + 1_000, last + 1_000 + OVERLAP)]
+    called = [s - 10 for s, _ in ipc] + [last + 10_000]
+    ipc += [(last + 10_000 + OVERLAP, last + 10_000 + OVERLAP // 2)]
 
     def messages(hop, t):
         """The hop's sends and arrivals from `t` on, 10 ms apart."""
@@ -66,7 +69,7 @@ def hopped(directory, alone=10, raw=RAW + ".gz") -> None:
     outputs = messages("ipc_out_s", t + 10**9)
     stream = messages("stream_s", t + 2 * 10**9)
     lines = [_stamp("app", t - 10**8, t - 10**8)]  # a health probe: no body
-    lines += [_stamp("send", s - 10, s) for s, _ in ipc]
+    lines += [_stamp("send", c, s) for c, (s, _) in zip(called, ipc)]
     for _, a in admission:
         lines += [_stamp("app", a, a), _stamp("body", a + 100, a + 200, 9000)]
     lines += [_stamp("out", g, g + 10) for _, g in outputs]
@@ -136,7 +139,7 @@ def test_a_hop_the_records_cannot_give_is_left_out_and_listed_unfitted(tmp_path)
     assert {k: v for k, v in report["unfitted"].items() if k.startswith("hops")} == {
         "hops.admission_s": f"{stamps}: no {RAW} beside {a / 'client.json'}",
         "hops.stream_s": f"{stamps}: no {RAW} beside {a / 'client.json'}",
-        "hops.ipc_s": f"{stamps}: 0 arrivals, not one after each of 13 sends",
+        "hops.ipc_s": f"{stamps}: 0 arrivals, not one after each of 14 sends",
         "hops.ipc_out_s": f"{stamps}: 12 rows taken in, not the 0 put",
     }
 

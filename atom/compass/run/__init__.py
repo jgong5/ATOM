@@ -2157,7 +2157,7 @@ def _stamp_intake(out: _LineFile) -> None:
     engine, size 0; on the loop from an await's start to the coroutine's
     resume, size 0, ``recv``, each receive of the body's first read, and
     ``wait``, the API server's tokenizer pool job, from its submit; ``out``,
-    each row of a streamed engine output its output thread took in, and
+    each row of an engine output its output thread took in, and
     ``head``, an SSE response's head sent, size 0. Patches the
     classes, and every loaded module's binding of ``apply_chat_template``, for
     the rest of the process."""
@@ -2253,10 +2253,10 @@ def _stamp_intake(out: _LineFile) -> None:
 
     for cls in (CoreManager, DisaggCoreManager):
         cls.add_request = sent(cls.add_request)
-    # Called once per row of each streamed output, as the queue handoff counts
-    # them (`clock.PullStamps`).
-    taken = CoreManager._mark_seq_prefill_complete
-    CoreManager._mark_seq_prefill_complete = timed(taken, "out")
+    # Each called once per row of an output, as the queue handoff counts them
+    # (`clock.PullStamps`): a streamed one's, and a finished sequence's.
+    for name in ("_mark_seq_prefill_complete", "_deliver_terminal_output"):
+        setattr(CoreManager, name, timed(getattr(CoreManager, name), "out"))
 
     class Resumed(asyncio.Future):
         def __await__(self):

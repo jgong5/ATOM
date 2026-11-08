@@ -551,7 +551,7 @@ def fit_hops(intakes, clients) -> tuple[dict, dict]:
 
     Each hop is the p10 of its messages alone on it (`_alone`) in every
     record: ``admission_s``, a client send to its request's app call;
-    ``ipc_s``, an engine send's return to the engine input thread's receipt,
+    ``ipc_s``, an engine send call's return to the engine input thread's receipt,
     inside a forward of that DP rank, since an idle engine's loop holds the GIL
     the thread waits on; ``ipc_out_s``, an output's put on the engine's output
     queue to the server's output thread taking its first row; ``stream_s``,
@@ -577,11 +577,12 @@ def fit_hops(intakes, clients) -> tuple[dict, dict]:
     return term, report
 
 
-def _alone(sent, got) -> tuple[np.ndarray, np.ndarray]:
+def _alone(sent, got, returned=None) -> tuple[np.ndarray, np.ndarray]:
     """The arrival and ``got - sent`` of each message alone on its hop, `sent`
     and `got` paired in order: sent once the one ahead of it arrived, and
-    arrived before the next was sent. Raises unless one arrival follows each
-    send."""
+    arrived before the next was sent. With `returned`, the return of each send
+    call, made one at a time, a message is timed from it, and is not alone when
+    it arrived first. Raises unless one arrival follows each send."""
     sent, got = np.sort(np.array(sent, np.int64)), np.sort(np.array(got, np.int64))
     if len(sent) != len(got) or (got <= sent).any():
         raise ValueError(
@@ -589,6 +590,9 @@ def _alone(sent, got) -> tuple[np.ndarray, np.ndarray]:
         )
     edge = np.iinfo(np.int64).max
     alone = (got < np.r_[sent[1:], edge]) & (np.r_[-edge, got[:-1]] < sent)
+    if returned is not None:
+        sent = np.sort(np.array(returned, np.int64))
+        alone &= got > sent
     return got[alone], (got - sent)[alone]
 
 
@@ -627,7 +631,8 @@ def _hop_messages(intake: Path, client) -> dict:
 
     def ipc():
         handed()
-        got, took = _alone(sends, list(recvs))
+        called = [e[0] for e in ev if e[2] == "send"]
+        got, took = _alone(called, list(recvs), returned=sends)
         return [d for g, d in zip(got, took) if stepping(g, recvs[g])]
 
     def ipc_out():
