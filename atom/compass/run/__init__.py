@@ -40,6 +40,8 @@ member, the frontend's included, connects to.
   ``decode`` to the frontend's clock, at the rates of its ``host`` entry's
   ``tokenizer`` term. A term that refuses the tokenizer stops the run as a
   signal would, so the engines leave and the server exits on the refusal.
+  On a real run recording its steps it records each such call, and stamps
+  each HTTP request's intake, beside the step record instead.
 - `http_intake()` is what `atom.utils.compass_loop.HttpChannel` charges the
   frontend's event loop for each request it takes in, from the ``host``
   entry's ``http_intake`` term.
@@ -402,6 +404,9 @@ _early_end: threading.Thread | None = None
 _member: str | None = None
 #: The SIGTERM handler this engine process set aside as it said READY.
 _sigterm_at_ready: list = []
+#: The files a recorded real run's frontend writes beside its step record:
+#: each served tokenizer call, and each HTTP request's intake stamps.
+TOKENIZER_RECORD, INTAKE_RECORD = "tokenizer.jsonl", "intake.stamps"
 #: This server's ``host`` entry among several, which `tokenizer` resolves.
 _frontend_host: dict | None = None
 
@@ -1944,10 +1949,17 @@ def tokenizer(tok, config) -> None:
     entry, its engine config's among several: a term fitted on another backend
     is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
     ends the run before the server serves (`_end_before_serving`). With no
-    term, `tok` is left as it is, charging 0 s."""
+    term, `tok` is left as it is, charging 0 s.
+
+    On a real run recording its steps (`parity.ENV`), it records instead
+    (`_record_host`); with neither, `tok` is left as it is."""
     global _frontend_host
     run = spec()
     if run is None:
+        from atom.compass import parity
+
+        if record := os.environ.get(parity.ENV):
+            _record_host(tok, Path(record))
         return
     from tokenizers import Tokenizer
 
@@ -1989,6 +2001,132 @@ def tokenizer(tok, config) -> None:
     rust = getattr(tok, "_tokenizer", None)
     if isinstance(rust, Tokenizer):
         rust.encode_batch = wrap_encode_batch(rust.encode_batch, term["encode"])
+
+
+def _record_host(tok, record: Path) -> None:
+    """Record, beside the step record in `record`, each call of `tok`'s
+    ``encode`` and ``decode`` and its Rust backend's ``encode_batch`` into
+    `TOKENIZER_RECORD`, after a first line naming `tok`'s ``backend`` and the
+    ``fingerprint`` of its ``tokenizer.json``; and stamp each HTTP request's
+    intake into `INTAKE_RECORD` (`_stamp_intake`)."""
+    from tokenizers import Tokenizer
+
+    record.mkdir(parents=True, exist_ok=True)
+    calls = _LineFile(record / TOKENIZER_RECORD)
+    backend = "fast" if tok.is_fast else "slow"
+    calls.write(
+        json.dumps({"backend": backend, "fingerprint": _fingerprint(tok)}) + "\n"
+    )
+    tok.encode = _recorded(tok.encode, "encode", calls, lambda _, ids: len(ids))
+    tok.decode = _recorded(tok.decode, "decode", calls, lambda a, _: len(a[0]))
+    rust = getattr(tok, "_tokenizer", None)
+    if isinstance(rust, Tokenizer):
+        rust.encode_batch = _recorded(
+            rust.encode_batch,
+            "encode_batch",
+            calls,
+            lambda _, encodings: sum(len(e.ids) for e in encodings),
+        )
+    _stamp_intake(_LineFile(record / INTAKE_RECORD))
+
+
+class _LineFile:
+    """A file of lines, each written whole and flushed as it is written, from
+    any thread."""
+
+    def __init__(self, path) -> None:
+        self.file = open(path, "w", buffering=1)  # noqa: SIM115
+        self.lock = threading.Lock()
+
+    def write(self, line: str) -> None:
+        with self.lock:
+            self.file.write(line)
+
+
+#: Whether this thread is inside a `_recorded` ``encode`` call.
+_in_encode = threading.local()
+
+
+def _recorded(call, kind: str, out: _LineFile, tokens):
+    """`call`, writing to `out` per call a JSON line of `kind`, its
+    `tokens(args, result)` and its start and end on the monotonic clock in ns;
+    a call made inside a recorded ``encode`` call is that call's, as
+    `compass_loop.wrap_encode_batch` charges it."""
+
+    def timed(*args, **kwargs):
+        if getattr(_in_encode, "on", False):
+            return call(*args, **kwargs)
+        _in_encode.on = kind == "encode"
+        start = time.monotonic_ns()
+        try:
+            got = call(*args, **kwargs)
+        finally:
+            _in_encode.on = False
+        end = time.monotonic_ns()
+        out.write(
+            f'{{"call": "{kind}", "tokens": {tokens(args, got)}, '
+            f'"t_start_ns": {start}, "t_end_ns": {end}}}\n'
+        )
+        return got
+
+    return timed
+
+
+def _stamp_intake(out: _LineFile) -> None:
+    """Stamp each HTTP request's intake into `out` as
+    ``scripts/compass/http_intake.py serve`` does, one line
+    ``<end ns> <thread id> <kind> <start ns> <size>`` each, on the monotonic
+    clock: ``app``, the request handed to the ASGI app, size 0; ``body``, its
+    body first read, size its bytes; ``tmpl``, a chat template rendered, size
+    its characters; ``prep``, a tokenizer pool job, and ``send``, a request
+    handed to the engine, size 0. Patches the classes, and every loaded
+    module's binding of ``apply_chat_template``, for the rest of the process."""
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+
+    from atom.entrypoints.openai import chat_encoders
+    from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+    from atom.model_engine.llm_engine import InputOutputProcessor
+
+    def stamp(kind: str, start: int, size: int) -> None:
+        out.write(
+            f"{time.monotonic_ns()} {threading.get_ident()} {kind} {start} {size}\n"
+        )
+
+    def timed(call, kind: str, size=lambda got: 0):
+        def timed(*args, **kwargs):
+            start = time.monotonic_ns()
+            got = call(*args, **kwargs)
+            stamp(kind, start, size(got))
+            return got
+
+        return timed
+
+    read, handle = Request.body, Starlette.__call__
+
+    async def body(self):
+        cached, start = hasattr(self, "_body"), time.monotonic_ns()
+        got = await read(self)
+        if not cached:
+            stamp("body", start, len(got))
+        return got
+
+    async def app(self, scope, receive, send):
+        if scope["type"] == "http":
+            stamp("app", time.monotonic_ns(), 0)
+        await handle(self, scope, receive, send)
+
+    Request.body, Starlette.__call__ = body, app
+    # The API server imports the function by name, so each binding is replaced.
+    render = chat_encoders.apply_chat_template
+    rendered = timed(render, "tmpl", len)
+    for module in list(sys.modules.values()):
+        if getattr(module, "__dict__", {}).get("apply_chat_template") is render:
+            module.apply_chat_template = rendered
+    fanout = InputOutputProcessor.preprocess_fanout
+    InputOutputProcessor.preprocess_fanout = timed(fanout, "prep")
+    for cls in (CoreManager, DisaggCoreManager):
+        cls.add_request = timed(cls.add_request, "send")
 
 
 def _end_before_serving(run: dict, e: BaseException) -> None:
