@@ -162,7 +162,7 @@ def _pd_pp(geometry, monkeypatch, pp: int):  # noqa: F811
     address = f"inproc://kv-pp{pp}-{id(models)}"
     monkeypatch.setattr(test_kv_remote_prefill, "KV", KV)
     table = prefill_decode_table(
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=L,
         stream_s=L,
         router_s=L,

@@ -296,7 +296,7 @@ def test_a_daemon_deadline_is_only_an_ner_and_never_behind_the_clock():
 
 
 def test_the_finish_grants_every_lp_infinity_once_and_then_changes_nothing():
-    table = single_engine_table(admission_path="serving", ipc_s=1.0e-4, stream_s=2.0e-3)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=1.0e-4, stream_s=2.0e-3)
     ca = ClockAuthority(table)
     engine, frontend, traffic = table.registry.ids()
     assert ca.on_request(engine, NER, INF, [], t_daemon=5.0) == []

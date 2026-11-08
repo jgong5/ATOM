@@ -71,7 +71,7 @@ class _Loop(asyncio.SelectorEventLoop):
 def loop():
     rt = LPRuntime(
         LpId("frontend"),
-        single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002),
+        single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002),
         _GrantAll(),
     )
     loop = _Loop(rt)

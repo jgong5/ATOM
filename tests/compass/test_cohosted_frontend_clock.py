@@ -26,7 +26,7 @@ from atom.utils.distributed import utils
 def tcp_run(monkeypatch, tmp_path):
     with held_ports(1) as (port,):
         run = {
-            "admission_path": "serving",
+            "admission_s": 0.54e-3,
             "ipc_s": 0.001,
             "stream_s": 0.002,
             "bound_s": 10.0,

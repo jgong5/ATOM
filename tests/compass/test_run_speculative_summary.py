@@ -64,7 +64,7 @@ def _served(monkeypatch, spec):
 
 def _run(monkeypatch, tmp_path):
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 0.001,
         "stream_s": 0.002,
         "bound_s": 10.0,
