@@ -15,17 +15,18 @@ from pathlib import Path
 import pytest
 from test_pp_stage_input import MS, pp2_record, staged
 
+from atom.compass.drive import pp_probe as probe
 from atom.compass.parity import recurrence
 from atom.compass.runner.pp_send import CarrierModel, carrier_models
 from atom.compass.spec import MachineSpec, SpecRefusal
 
 TREE = Path(__file__).resolve().parents[2]
 SPEC = TREE / "scripts/compass/machines/mi308x-hjbog39.json"
-_probe = importlib.util.spec_from_file_location(
+_script = importlib.util.spec_from_file_location(
     "pp_carriers", TREE / "scripts/compass/pp_carriers.py"
 )
-probe = importlib.util.module_from_spec(_probe)
-_probe.loader.exec_module(probe)
+script = importlib.util.module_from_spec(_script)
+_script.loader.exec_module(script)
 
 #: gloo free; each RCCL tensor of one 500-byte token rendezvous in 0.5 ms.
 MODELS = {
@@ -258,7 +259,7 @@ def test_the_probe_pools_the_records_it_wrote(tmp_path):
             )
         runs.append(tmp_path / f"run{k}.json")
         runs[-1].write_text(json.dumps({"samples": samples}) + "\n")
-    probe.main(str(tmp_path / "pooled.json"), *map(str, runs))
+    script.main(str(tmp_path / "pooled.json"), *map(str, runs))
     pooled = json.loads((tmp_path / "pooled.json").read_text())
     both = [s for r in runs for s in json.loads(r.read_text())["samples"]]
     assert pooled["carriers"] == probe.fit(both)

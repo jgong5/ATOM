@@ -7,7 +7,8 @@ unless it joins one its run file names. One without a run file is real, on the
 GPUs the command names, which `gpu.quiet` checks before the server starts and
 after it stops; given an artifact store, its start merges the store's JIT cache
 library for the stack into the container's caches and its stop writes back
-what it finished compiling (`jit_cache`). ATOM's arguments pass verbatim; the
+what it finished compiling (`jit_cache`), and at DP and TP both above 1 it
+runs under `LOG_MORE`. ATOM's arguments pass verbatim; the
 driver assigns the host, 127.0.0.1 unless the command names another, its ports
 and the run file, and
 refuses them, and the clock endpoint flag, among ATOM's arguments; an op graph
@@ -48,10 +49,12 @@ from pathlib import Path
 
 import atom
 from atom.compass import parity
+from atom.compass.backends.step_labels import TRACE
 from atom.compass.drive import jit_cache
 from atom.compass.drive.gpu import KFD, hip_visible, quiet
 from atom.compass.drive.identity import _device, _stack, identity
 from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _write_whole
+from atom.utils.arg_parser import FlexibleArgumentParser
 
 SERVER = (sys.executable, "-m", "atom.entrypoints.openai.api_server")
 HOST = "127.0.0.1"
@@ -66,8 +69,17 @@ OWNED = (
     "--compass-clock-endpoint",
     "--data-parallel-master-port",
 )
-#: ATOM's profiler: only a profiled pass may time ops, and no command runs one yet.
+#: ATOM's profiler, which the driver points at `TRACE` for a trace run alone.
 PROFILER = "--torch-profiler-dir"
+#: A trace run's profiler: kernels and ranges, no Python stacks, shapes or
+#: memory; and the seconds its stop, which writes every rank's trace, may take.
+TRACE_STOP_S = 3600
+TRACE_ENV = {
+    "ATOM_PROFILER_WITH_STACK": "0",
+    "ATOM_PROFILER_RECORD_SHAPES": "0",
+    "ATOM_PROFILER_PROFILE_MEMORY": "0",
+    "ATOM_PROFILER_TIMEOUT": str(TRACE_STOP_S),
+}
 #: As `cctraces_sim.sh` sets it, so a pooling client's idle connection is not
 #: closed under it; before ATOM's arguments, so one there wins.
 KEEP_ALIVE = ("--timeout-keep-alive", "1000000")
@@ -94,6 +106,9 @@ CACHE_LINE = re.compile(r"Using cache directory: (\S+) for vLLM's torch\.compile
 #: ATOM's `atom.utils.backends.VLLM_CACHE_ROOT`, stated here because importing
 #: that module opens a HIP context on every GPU the calling process can see.
 CACHE_ROOT = os.path.expanduser("~/.cache/atom")
+#: ATOM's switch that heads each log line with its process, `<name>:<pid>`, so
+#: `memory.check` can pair a DP x TP log's Memory budget lines with DP ranks.
+LOG_MORE = {"ATOM_LOG_MORE": "1"}
 
 
 def below_ephemeral(ports: range) -> range:
@@ -116,6 +131,7 @@ def serve(
     host=HOST,
     joined=False,
     store=None,
+    trace=False,
 ) -> None:
     """Serve one instance from ATOM's arguments `atom_args`, writing to the
     directory `out`, until SIGINT or SIGTERM or the server's exit.
@@ -125,7 +141,9 @@ def serve(
     here, or, `joined`, kept: the server joins the authority its
     ``clock_endpoint`` names, which reads the hand-ins in its ``out_dir``. The
     server binds `host`, which its URL names. `extra_env` maps variables the
-    server's environment holds over the command's. Raises `ServeError` when
+    server's environment holds over the command's. A real server under `trace`
+    runs ATOM's profiler on every rank into `out`'s `TRACE` directory, started
+    before `READY_FILE` is written and stopped before the server is. Raises `ServeError` when
     the server exits before ``/health`` answers, or on its own with a non-zero
     status, and `GpuRefusal` from the GPU checks. Given `store`, an artifact
     store's root, a real server's start merges the store's JIT cache library
@@ -140,6 +158,10 @@ def serve(
         raise ServeError(
             "a server is real, on the GPUs it names, or simulated, from a run "
             f"file, exactly one; got gpus={gpus} and a run file: {run is not None}"
+        )
+    if trace and run is not None:
+        raise ServeError(
+            "a trace run profiles a real server, and this one is simulated"
         )
     library = jit_cache.library(store, _stack(), _device(gpus)) if store else None
     out = Path(out)
@@ -162,8 +184,12 @@ def serve(
     env[parity.ENV] = str(out / STEPS)
     env["ATOM_DP_MASTER_PORT"] = str(dp_port)
     env["ATOM_SHUTDOWN_TIMEOUT_S"] = str(SHUTDOWN_TIMEOUT_S)
+    if trace:
+        argv += [PROFILER, str(out / TRACE)]
+        env.update(TRACE_ENV)
     if run is None:
         env["HIP_VISIBLE_DEVICES"] = hip_visible(gpus)
+        env |= log_more(atom_args)
     else:
         run_file = out / RUN_FILE
         if run.get(OP_GRAPH):
@@ -199,10 +225,14 @@ def serve(
                     )
                 time.sleep(POLL_S)
             if not stopped:
+                if trace:
+                    _post(host, server_port, "/start_profile", STOP_GRACE_S)
                 ready["pid"] = server.pid
                 _write_whole(out / READY_FILE, json.dumps(ready))
             while not stopped and server.poll() is None:
                 time.sleep(POLL_S)
+            if trace and "pid" in ready and server.poll() is None:
+                _post(host, server_port, "/stop_profile", TRACE_STOP_S)
         finally:
             _stop(server.pid, kfd)
             server.wait()
@@ -246,6 +276,22 @@ def _model(atom_args) -> str:
     return model
 
 
+def log_more(atom_args) -> dict:
+    """`LOG_MORE` when ATOM's arguments run DP and TP both above 1, else
+    nothing, so any other start logs in the format its environment gives.
+    Under DP attention ATOM makes each TP rank a DP rank and runs TP 1."""
+    parser = FlexibleArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
+    parser.add_argument("--data-parallel-size", "-dp", type=int, default=1)
+    parser.add_argument("--enable-dp-attention", action="store_true")
+    widths = parser.parse_known_args(atom_args)[0]
+    if widths.enable_dp_attention:
+        return {}
+    if widths.tensor_parallel_size > 1 and widths.data_parallel_size > 1:
+        return LOG_MORE
+    return {}
+
+
 def _refuse(atom_args) -> None:
     for arg in atom_args:
         flag = arg.split("=", 1)[0].replace("_", "-")
@@ -254,7 +300,7 @@ def _refuse(atom_args) -> None:
         if any(f.startswith(flag) for f in OWNED):
             raise ServeError(f"{arg} is among ATOM's arguments; the driver owns it")
         if PROFILER.startswith(flag):
-            raise ServeError(f"{arg} profiles the server, and only a profiled pass may")
+            raise ServeError(f"{arg} profiles the server, which only a trace run does")
 
 
 @contextmanager
@@ -281,6 +327,18 @@ def _held_ports(n: int):
     finally:
         for s in held:
             s.close()
+
+
+def _post(host: str, port: int, path: str, timeout: float) -> None:
+    """POST `path` to the server; a reply other than 200 raises `ServeError`."""
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.request("POST", path)
+        reply = conn.getresponse()
+        if reply.status != 200:
+            raise ServeError(f"{path} answered {reply.status}: {reply.read()[:300]!r}")
+    finally:
+        conn.close()
 
 
 def _answers(host: str, port: int) -> bool:

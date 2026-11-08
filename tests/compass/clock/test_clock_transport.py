@@ -26,6 +26,7 @@ from atom.compass.clock import (
     ClockAuthority,
     LpId,
     LpRegistry,
+    Released,
     single_engine_table,
 )
 from atom.compass.clock.channels import ADMISSION_DELAY_S
@@ -538,6 +539,21 @@ def test_a_message_encodes_the_same_bytes_every_time():
     assert encode((NER, INF, [], 2.0)) == (
         b'{"kind":"NER","log":[],"t":"+inf","t_daemon":2.0}'
     )
+
+
+def test_steps_ahead_and_a_ceiling_ride_their_frames_and_only_when_present():
+    steps = [(TAR, 1.0, 1.0, 0), (NER, INF, 1.25, 1)]
+    request = (NER, INF, [(AB, 0, 1.5)], 2.0, steps, True)
+    assert decode(encode(request)) == request
+    assert b'"steps":[["TAR",1.0,1.0,0],["NER","+inf",1.25,1]]' in encode(request)
+    released = Released({AB: [(0, 0.5)]})
+    released.ceiling = INF
+    grant = decode(encode(("GRANT", 0.5, released)))
+    assert grant == ("GRANT", 0.5, {AB: [(0, 0.5)]}) and grant[2].ceiling == INF
+    assert decode(encode(("GRANT", 0.5, {AB: []})))[2].ceiling is None
+    assert encode((NER, INF, [], 2.0, [], False)) == encode((NER, INF, [], 2.0))
+    with pytest.raises(MalformedMessage):
+        decode(encode((NER, INF, [], 2.0, [("PARK", INF, 1.0, 0)], False)))
 
 
 def test_a_frame_is_json_a_stranger_can_read():

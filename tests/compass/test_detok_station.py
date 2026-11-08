@@ -11,7 +11,6 @@ import json
 import math
 import pickle
 import threading
-import time
 import uuid
 from types import SimpleNamespace
 
@@ -284,7 +283,6 @@ def test_a_frame_from_before_the_run_decoded_on_an_output_thread_is_a_summary_re
     push.connect(address)
     engine = LPRuntime(LpId("engine"), TABLE, None)
     frontend.start_run()
-    authority.started = time.monotonic()
     for n in (2, 3):
         out = RequestOutput(7, list(range(n)), False)
         frame = pickle.dumps((EngineCoreRequestType.STREAM, [(7, out)]))

@@ -321,6 +321,22 @@ def test_a_client_run_counts_the_stalls_printed_during_it():
     assert ca.diagnostics == 3 and ca.final_clocks is not None
 
 
+def test_a_client_runs_summary_counts_the_calls_served_up_to_its_end():
+    """Each end keeps the calls served, as it keeps the grants, for the
+    summary that client run writes."""
+    table = single_engine_table(admission_path="serving", ipc_s=1.0e-4, stream_s=2.0e-3)
+    engine, frontend, traffic = table.registry.ids()
+    ca = ClockAuthority(table, client=traffic, client_runs=2)
+    for _ in range(2):
+        for lp in (engine, frontend, traffic):
+            ca.on_request(lp, NER, INF, [])
+    first, second = (RunSummary.of(run, 0.1).cost_record() for run in ca.ended)
+    names = [lp.name for lp in (engine, frontend, traffic)]
+    assert first["requests"] == [[name, 1] for name in names]
+    assert second["requests"] == [[name, 2] for name in names]
+    assert (first["requests_total"], second["requests_total"]) == (3, 6)
+
+
 def test_a_runtime_counts_its_unhandled_release_diagnostic():
     rt, call = _runtime(ENGINE, (10.2, {REQ: [(0, 10.1)]}), diag_s=DIAG_S)
     _receiver(rt, REQ, 1, [], hold=lambda: time.sleep(6 * DIAG_S))

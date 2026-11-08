@@ -217,7 +217,12 @@ class BatchView:
     data-parallel group's counts, `tbo_tokens`' among them; None on one rank
     or when the caller did not say. `dp_dummy` says the step is a DP rank's
     dummy forward, run because a peer has work and this rank has none; False
-    on one rank. `group_prefills` says some rank of the data-parallel group
+    on one rank. `group_dummies` counts the ranks of the data-parallel group
+    that run a dummy forward at this step, this one among them when
+    `dp_dummy`; 0 on one rank. Unlike a pad row, a dummy's row is scheduled
+    and reaches the MoE gate, and every dummy runs the same rows, from token 0
+    at position 0, so the group's dummies route alike.
+    `group_prefills` says some rank of the data-parallel group
     prefills at this step; False on one rank. `image_tokens` counts the scheduled
     tokens whose embedding the step's vision encoder supplies; a backend that
     has no basis for pricing that encoder refuses a step with any.
@@ -248,6 +253,7 @@ class BatchView:
     dp_dummy: bool = False
     group_prefills: bool = False
     draft_rows: int | None = None
+    group_dummies: int = 0
     start_lag_s: float | None = field(default=None, compare=False)
 
     def __init_subclass__(cls, **kwargs: object) -> None:

@@ -627,6 +627,23 @@ recovery (below) grants one LP at a time: a single global event loop across proc
 correct, serialized, no parallelism. That is why zero-lookahead couplings stay inside one
 LP (partition principle, above).
 
+**Local grants** (`compass run --local-grants`, the owner's ruling (c) on
+[#2542](https://github.com/jgong5/ATOM/issues/2542#issuecomment-6539617449)). A grant to an
+LP without members, other than a recovery's, also carries a ceiling: the least of
+`LBTS(i)`, `G` plus the LP's shortest cycle `min over j of D(i->j) + D(j->i)`, its
+earliest unreleased arrival, and the bound on simulated time. Nothing reaches the LP below
+it: a message not yet sent arrives at or past `LBTS(i)`, and one its own sends provoke at
+or past the cycle; a time past the bound is asked for, and aborts as any grant past it
+does. Its owner answers its own TAR and NER below the ceiling as the CA would and reports
+each such step with its next request, with how many of that request's logged sends
+preceded it; the CA keeps `N[i]` at the last grant meanwhile. The CA replays each step as
+the grant its own request would have had: it registers the sends made before it, records
+the reply with what it releases and counts the grant, so the step table and the grant
+counts are those of a run without the flag, which is why the run-file key is per-run. An
+NER may ask for its messages ahead: every message registered for it below the ceiling goes
+with the grant, and the owner releases each in the step that reaches it. A step outside
+the LP's clock and ceiling, or past a message registered for it since, aborts the run.
+
 #### Invariants
 
 - **Safety (asserted, always on):** every message registered into LP *j* must have
@@ -660,7 +677,8 @@ LP (partition principle, above).
 
 The grant rule relies on these invariants inside each LP:
 
-- **I1** An LP's clock moves only inside its clock owner's CA call (TAR/NER). In a DP
+- **I1** An LP's clock moves only inside its clock owner's CA call (TAR/NER), or under local
+  grants in a step below its last grant's ceiling, which its next call reports. In a DP
   group's LP each member's clock moves only inside its own owner's call, to the common
   grant (above).
 - **I2** In a CA call the owner holds no lock another thread of its LP needs; otherwise a
@@ -786,7 +804,7 @@ receives it itself, at its own receive point.
 | `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | `ipc_s`, measured (`drive/runfile.py::FIXED`) |
 | `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | `ipc_out_s`, measured (`drive/runfile.py::FIXED`); `ipc_s` when a run file has none |
 | `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | the router's per-request forward cost (D7) |
-| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline); under prefill PP the head's, `engine-P-pp0` (D6) | stated request latency (D6) |
+| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker. For a request that finishes before its write request, aborted while it waits, the scheduler-side `request_finished` (`scheduler.py::Scheduler._cleanup_aborted_load`) sends instead the notice that none will come, which retires prefill's send claim (Mooncake's `MSG_ABORT`) | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline); under prefill PP the head's, `engine-P-pp0` (D6) | stated request latency (D6) |
 | PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py::PPStageTransport.send_metadata` / `send_tokens` / `send_kv_status` | the stage loop's own poll and receive (inline) | stated IPC delay: each is one ZMQ message, as on the frontend channels; the head's batch to stage `k` is `meta#pp<k>`. The hidden states between stages are `pp_data` (`15` D91). |
 | `engine-P->engine-D:prefill_done` (RapidServe only, in neither M1 nor M2) | prefill step loop, direct send in `engine_core.py::PrefillEngineCore._process_engine_step` | decode handler thread `DecodeEngineCore._recv_prefill_done`, `sock.recv()` (thread) | stated IPC delay |
 | `engine-D->engine-P:block_assignment` (RapidServe only, in neither M1 nor M2) | decode step loop, direct send in `engine_core.py::DecodeEngineCore._send_block_assignment` | prefill handler thread `PrefillEngineCore._recv_block_assignments`, `sock.recv()` (thread) | stated IPC delay |
@@ -1304,7 +1322,9 @@ The rules that settle the boundaries #53's categories left in the wrong place:
   the loops it would have served do, and each spins rather than waits when there is
   nothing to run, because `pull_and_process_input_queue` drains with `get_nowait` and
   nothing else in the turn blocks: `EngineCore.busy_loop`, `DPEngineCoreProc.busy_loop`
-  and `PPEngineCoreProc._head_busy_loop`. D8's measurement of the prior design — first
+  and `PPEngineCoreProc._head_busy_loop`. On a real run `EngineCore.busy_loop` parks on
+  its input queue instead (`_wait_for_input`, #2613), which returns at once under a
+  simulated clock. D8's measurement of the prior design — first
   real step is tick 1, first simulated step is tick **89,336** — is this loop counted.
   Each becomes `next_event(t, t_daemon)`, `t` the LP's earliest essential local event and
   `t_daemon` its next daemon deadline (the metrics push). The PP bounded polls
@@ -1546,7 +1566,12 @@ received tensors are in, and at the forward's exit, drained with `query()`, neve
 recording's engine process stamps the first input pull (`clock.idle`) and output put
 (`clock.relay_queue`'s queue) after each reply, `t_pull_ns` and `t_put_ns`, into
 `dp<rank>.pulls.jsonl` on the same monotonic clock; `parity.read` joins them to the
-steps (#1345).
+steps (#1345). It holds these stamps and its IO-thread handoff lines in memory and
+writes them when the engine leaves its loop or takes its SIGTERM, as a worker holds its
+step lines: a write on the loop is time the loop spends, and on a record kept on NFS the
+pull stamp's write, tens of microseconds after the put stamp's, blocked about 1 ms in
+most forwards, inside the `E` it opens
+([#2726](https://github.com/jgong5/ATOM/issues/2726)).
 
 **The recurrence's own check, provisional.** Fed each real record's measured device
 windows and host segments, and under MTP each forward's `L_mtp` measured as `09` D54
@@ -1874,7 +1899,11 @@ and receives both run on the engine's step loop, and no worker takes part.
   `engine-D->engine-P:kv_write_req`, sent at `t`, arriving at `a = t + request latency`.
   It computes its own ready time `c + notify latency` and reports the request in
   `finished_recving` from `process_completions` as the pipelined funnel would: at the
-  call after the first one whose clock reached it. A local event of engine-D.
+  call after the first one whose clock reached it. A local event of engine-D. A request
+  that finishes before it posts one, aborted while it waits, sends instead, from
+  `request_finished` (called from `Scheduler._cleanup_aborted_load`), the notice that
+  none will come, on the same channel, as Mooncake's consumer sends `MSG_ABORT`
+  (`mooncake_connector.py::MooncakeConnectorScheduler._abort_unwritten`).
 - **Prefill** records the data-ready time `r` in `request_finished` and takes the write
   request in `process_completions`, which the step loop receives inline.
   `Scheduler._mark_finished` calls `request_finished` once per finished request. There
@@ -1888,7 +1917,10 @@ and receives both run on the engine's step loop, and no worker takes part.
   `c`, reported the same way, prefill reports `finished_sending`, and
   `Scheduler._update_from_kv_xfer_finished` retires the claim through `send_finished`
   and frees the parked blocks. `source_blocks_released` does nothing. A local event of
-  engine-P. Scheduler code is unchanged.
+  engine-P. Scheduler code is unchanged. Decode's notice that no write will come retires
+  the claim the same way, done at the notice's arrival, and a later write request for
+  the request is refused, as Mooncake's listener does through
+  `mooncake_connector.py::MooncakeConnector._abort_transfers`.
 - **Write-done is not a message.** Real Mooncake sends `MSG_WRITE_DONE` when the write
   ends (`mooncake_connector.py::MooncakeConnector._send_write_done`). Both ends compute
   that time instead, for two reasons: the router forwards strictly in sequence (D2), so
