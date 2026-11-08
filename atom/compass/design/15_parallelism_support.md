@@ -178,6 +178,14 @@ transfer to DP.
   own, because the MoE segment already prices those collectives; each is a wait inside one
   LP (`01` D4, K6). With one rank both are skipped. The lockstep `all_reduce` in `DPEngineCoreProc._sync_dp_state`
   keeps its payload, the three booleans above; the step's cost is not exchanged on it.
+- **Transport.** ATOM builds both DP groups on gloo, the engine cores' (`_sync_dp_state`
+  and the prefill delayer) and the runners' (`sync_dp_metadata` and the exchanges above),
+  and gloo takes half a millisecond or more to move each call's few bytes, several times
+  a round ([#2658](https://github.com/jgong5/ATOM/issues/2658)). In a simulated run a
+  group whose ranks share a host runs its `all_reduce` and `all_gather` over shared
+  memory instead (`atom/compass/runner/shm_collectives.py`), with gloo's results bit for
+  bit; a group spanning hosts, a host other than x86 and every call that module leaves
+  to gloo keep gloo. A real run's groups are ATOM's, untouched.
 - **Two token counts.** `T_own` is the rank's own scheduled token count. `T_moe` is the
   number of rows the group's MoE gather carries, the same on every rank. With EP off, MoE
   is tensor-parallel across the whole group (`flatten_tp_across_dp` in

@@ -280,7 +280,8 @@ def test_a_real_recording_stamps_the_first_pull_and_put_after_each_reply(
     )
     engine.utility_handler.push_metrics = lambda: None
 
-    EngineCore.busy_loop(engine)
+    with compass_run.engine_loop(engine):  # whose end writes the stamps
+        EngineCore.busy_loop(engine)
 
     lines = (tmp_path / "dp3.pulls.jsonl").read_text().splitlines()
     stamps = [next(iter(json.loads(line).items())) for line in lines]

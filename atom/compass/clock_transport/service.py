@@ -169,11 +169,11 @@ class _Server:
                     )
                     replies = [(i, self._ended) for i in list(self._slots)]
             elif self._ended is None:
-                kind, t, log, t_daemon = request
+                kind, t, log, t_daemon, *steps_ahead = request
                 try:
                     try:
                         grants = self._authority.on_request(
-                            lp, kind, t, log, t_daemon, member
+                            lp, kind, t, log, t_daemon, member, *steps_ahead
                         )
                     except (KeyError, ValueError) as refused:
                         replies = [(address, encode(_refusal(refused)))]

@@ -7,7 +7,7 @@ import math
 import pathlib
 
 import pytest
-from test_pp_carriers import TRUTH, _samples, probe
+from test_pp_carriers import TRUTH, _samples, probe, script
 from test_spec_origin import labels, saved, three_origins
 from test_spec_verbs import TOKENIZER, fragment, published_topology
 
@@ -159,7 +159,7 @@ def test_the_pooled_probe_states_each_fields_band_over_its_records(tmp_path):
             )
         runs.append(tmp_path / f"run{k}.json")
         runs[-1].write_text(json.dumps({"samples": samples}) + "\n")
-    probe.main(str(tmp_path / "pooled.json"), *map(str, runs))
+    script.main(str(tmp_path / "pooled.json"), *map(str, runs))
     pooled = json.loads((tmp_path / "pooled.json").read_text())
     for carrier, fields in pooled["carriers"].items():
         stated = {k for k, v in fields.items() if not isinstance(v, list)}

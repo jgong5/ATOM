@@ -30,7 +30,7 @@ from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 from atom.compass import capture, cli, ir
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
 from atom.compass.bench import ops
-from atom.compass.capture import forward
+from atom.compass.capture import driverless, forward
 from atom.compass.capture.forward import decode, prefill, structure
 from atom.compass.fit import ops as fit_ops
 from atom.compass.run import memory, step_grid
@@ -46,6 +46,7 @@ CONFIG = SimpleNamespace(
     max_num_batched_tokens=8192,
     max_model_len=262144,
     speculative_config=None,
+    enable_tbo=False,
 )
 
 
@@ -1243,7 +1244,7 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     config.max_num_seqs, config.max_model_len = 4, CONFIG.max_model_len
     published = []
 
-    def trace(model, tp, shapes, tmpdir, atom_args, arch, population=()):
+    def trace(model, tp, shapes, tmpdir, atom_args, arch, population=(), read=None):
         traced = forward._config(model, tp, atom_args)
         for shape in shapes:
             at = structure(traced, shape.phase, device=arch)
@@ -1282,6 +1283,9 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     monkeypatch.setattr(step_grid, "keyed", KEYED)
     monkeypatch.setattr(ops, "_child", child)
     monkeypatch.setattr(forward, "device_arch", lambda: "gfx942")
+    # The plan's capture reads its first GPU's card as the arch's device.
+    card = {"arch": "gfx942", "revision": 0, "props": vars(driverless._props("gfx942"))}
+    monkeypatch.setattr(driverless, "card", lambda index: {"index": index, **card})
     steps = ([[1, 1000, True]], 1), ([[40, 40, False]], None)
     args = SimpleNamespace(
         plan=[_records(tmp_path / "plan", *steps)], store=root, llc_mib=256

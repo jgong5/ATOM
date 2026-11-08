@@ -62,6 +62,9 @@ class ChannelTable:
         self.registry = registry
         self._channels: dict[str, Channel] = {}
         self._distances: dict[tuple[LpId, LpId], float] | None = None
+        # Each LP's channels out and in, by name; a declare empties both.
+        self._from: dict[LpId, tuple[Channel, ...]] = {}
+        self._into: dict[LpId, tuple[Channel, ...]] = {}
 
     def declare(
         self,
@@ -94,6 +97,8 @@ class ChannelTable:
         channel = Channel(name, source, target, lookahead, ReceiveMode(receive))
         self._channels[name] = channel
         self._distances = None
+        self._from.clear()
+        self._into.clear()
         return channel
 
     def channel(self, name: str) -> Channel:
@@ -107,12 +112,20 @@ class ChannelTable:
     def channels_into(self, lp: LpId) -> tuple[Channel, ...]:
         """Every channel whose receiver is `lp`, by name."""
         self.registry.require(lp)
-        return tuple(c for _, c in sorted(self._channels.items()) if c.target == lp)
+        if lp not in self._into:
+            self._into[lp] = tuple(
+                c for _, c in sorted(self._channels.items()) if c.target == lp
+            )
+        return self._into[lp]
 
     def channels_from(self, lp: LpId) -> tuple[Channel, ...]:
         """Every channel whose sender is `lp`, by name."""
         self.registry.require(lp)
-        return tuple(c for _, c in sorted(self._channels.items()) if c.source == lp)
+        if lp not in self._from:
+            self._from[lp] = tuple(
+                c for _, c in sorted(self._channels.items()) if c.source == lp
+            )
+        return self._from[lp]
 
     def lookahead(self, name: str) -> float:
         return self.channel(name).lookahead_s

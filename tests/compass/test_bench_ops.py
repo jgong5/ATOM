@@ -545,6 +545,269 @@ def test_a_decode_point_takes_an_integer_affine_in_the_context_at_its_own(
     assert kernel.grids == [(2, 2), (2, 2)]
 
 
+def test_a_v41_prefill_past_cached_tokens_scores_on_a_plane_its_rows_blocks_wide(
+    monkeypatch,
+):
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
+        V41PoolGeometry,
+    )
+    from atom.model_ops.deepseek_v41.unit_table import unit_table
+
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    taken = []
+
+    def call(stub, op, sig, instances, n):
+        taken.append(stub._copy(op, sig, instances, 0)[0])
+        return {}
+
+    monkeypatch.setattr(ops.Stub, "_time", call)
+    geometry = V41PoolGeometry(
+        1, ((0, 2),), 128, 4, 512, 32, layer_ratios=(2,), index_block_rows=8
+    )
+    runner, i32, I32 = _Runner(), torch.int32, "torch.int32"
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars |= {
+        "logits": torch.zeros(256 * 640),
+        "tiles": torch.zeros(256 * 80, dtype=i32),
+    }
+    step = SimpleNamespace(visible={r: torch.zeros(256, dtype=i32) for r in (1, 2)})
+    # its cache's tables, and the layer whose 80 candidate blocks bound a list
+    pick = SimpleNamespace(table=torch.zeros(256, 80, dtype=i32))
+    pick.context, tiles = torch.zeros(256, dtype=i32), runner.forward_vars["tiles"]
+    runner.model.append(_picker(80))
+    step.tiles, step.candidates = {}, {}
+    cache = SimpleNamespace(
+        unit_tiles=lambda step, ratio: tiles, candidate_blocks=lambda *a: pick
+    )
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        fctx._forward_context.attn_metadata.step = step
+        fctx._forward_context.attn_metadata.cache = cache
+        return out
+
+    runner.prepare_model = prepare_model
+
+    def scorer(bounds, ratio, width):  # as a prefill of 256 tokens traced it
+        leaf = _leaf(
+            ops._LOGITS,
+            ("out_logits", _t([256, width], "metadata")),
+            ("context_lens", _t([256], bounds, dtype=I32)),
+            ("kv_indices", _t([256, width // 8], bounds, dtype=I32)),
+            ("max_model_len", width),
+        )
+        return dataclasses.replace(leaf, stated=(("compress_ratio", ratio),))
+
+    rows = [_t([256], "metadata", dtype=I32)] * 2
+    top_k = _leaf(
+        ops._TOPK,
+        ("logits", _t([256, 128], "metadata")),
+        *zip(("row_starts", "row_ends"), rows),
+        ("stride0", 128),
+    )
+    # its row bounds ATOM's, caching none; a candidate list's, 640 wide; top-k
+    graph = _graph(scorer("metadata", 2, 128), scorer("activation", 1, 640), top_k)
+    found = ops.leaves(graph["region"])
+    placed = SimpleNamespace(block_size=128, batch=lambda *a: a[1:])
+    got = [
+        ops.Stub(runner, 10_000).point(placed, prefill(256, 1), context, found)
+        for context in (None, 1024)
+    ]
+
+    # ATOM's tile table past 1024 cached tokens: the 10 blocks its row reaches
+    units = geometry.index_blocks_per_page(2)
+    tiles = unit_table(torch.zeros(1, 10, dtype=i32), torch.zeros(0, dtype=i32), units)
+    width = tiles.shape[1] * geometry.index_block_rows
+    planes = [c.get("max_model_len", c.get("stride0")) for c in taken]
+    assert planes == [128, 640, 128, width, 640, width] and width == 640
+    rows = [c.get("out_logits", c.get("logits")).stride(0) for c in taken]
+    assert rows == planes and taken[3]["kv_indices"].shape == (256, tiles.shape[1])
+    assert [r[2]["metadata"]["row_ends"] for r in got] == ["step.visible.2"] * 2
+
+    # the FP4 index plane packs its logits over the whole block table, the
+    # candidate pick's block maxima flat, which no context widens
+    runner.attn_metadata_builder.geometry = dataclasses.replace(
+        geometry, index_dim=128, index_fp4=True
+    )
+    maxima = _leaf(
+        ops._MAXIMA,
+        ("logits", _t([256 * 128], "metadata")),
+        ("visible", _t([256], "metadata", dtype=I32)),
+        ("maxima", _t([256 * 16], "activation")),
+        ("blocks", 16),
+    )
+    found = ops.leaves(_graph(scorer("metadata", 2, 128), maxima)["region"])
+    taken.clear()
+    ops.Stub(runner, 10_000).point(placed, prefill(256, 1), 1024, found)
+    assert [c.get("max_model_len", c.get("blocks")) for c in taken] == [128, 16]
+
+
+def _picker(k):
+    """V4.1's index layer 0, at ratio 1, picking `k` candidate blocks of 8 rows."""
+    from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
+
+    picker = torch.nn.Module()
+    picker.spec = LayerAttentionSpec(0, 1, AttentionMode.FULL, candidate_owner=0)
+    picker.block_size, picker.topk_blocks = 8, k
+    return picker
+
+
+def _v41_index(monkeypatch, visible, leaves, shape, context):
+    """Each of `leaves`' first call at `shape` and `context` on V4.1's FP8
+    plane, a PAGE of 32 tokens 4 index blocks at ratio 1, under a pick of 4
+    candidate blocks, its step's rows seeing `visible` on blocks 3, 1 and 0, 2;
+    ATOM's cache binds its tables by its kernels' torch twins."""
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
+        V41PoolGeometry,
+    )
+    from atom.model_ops.deepseek_v41 import candidate_table as ct
+    from tests.models.deepseek_v41.reference_unit_table import unit_table_reference
+
+    monkeypatch.setattr(ct, "candidate_block_table", ct.candidate_block_table_reference)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    taken, i32 = [], torch.int32
+
+    def call(stub, op, sig, instances, n):
+        taken.append(stub._copy(op, sig, instances, 0)[0])
+        return {}
+
+    monkeypatch.setattr(ops.Stub, "_time", call)
+    runner = _Runner()
+    runner.model.append(_picker(4))
+    geometry = V41PoolGeometry(1, ((0, 1),), 32, 4, 512, 32, layer_ratios=(1,))
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(128)
+    runner.forward_vars["block_tables"] = torch.zeros(64, dtype=i32)
+    cache = SimpleNamespace(
+        unit_tiles=lambda s, r: unit_table_reference(s.block_tables, s.batch_ids, 4),
+        candidate_blocks=lambda s, source, r: ct.bind_candidates(
+            s.candidates[source], s.block_tables, s.batch_ids, 4, s.visible[r],
+            rows_per_block=8,
+        ),  # fmt: skip
+    )
+    step = SimpleNamespace(
+        visible={1: torch.tensor(visible, dtype=i32)},
+        block_tables=torch.tensor([[3, 1], [0, 2]], dtype=i32),
+        batch_ids=(torch.arange(len(visible)) % 2).int(),
+        tiles={},
+        candidates={},
+    )
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        fctx._forward_context.attn_metadata.step = step
+        fctx._forward_context.attn_metadata.cache = cache
+        return out
+
+    runner.prepare_model = prepare_model
+    found = ops.leaves(_graph(*leaves, layers=1)["region"])
+    placed = SimpleNamespace(block_size=32, batch=lambda *a: a[1:])
+    ops.Stub(runner, 10_000).point(placed, shape, context, found)
+    return taken
+
+
+def test_v41_index_leaves_take_the_tables_atom_s_forward_writes_for_their_step(
+    monkeypatch,
+):
+    I32 = "torch.int32"
+
+    def scorer(bounds, width):  # at decode B=2, ratio 1
+        leaf = _leaf(
+            ops._LOGITS,
+            ("out_logits", _t([2, width], "metadata")),
+            ("context_lens", _t([2], bounds, dtype=I32)),
+            ("kv_indices", _t([2, width // 8], bounds, dtype=I32)),
+            ("max_model_len", width),
+        )
+        return dataclasses.replace(leaf, stated=(("compress_ratio", 1),))
+
+    def top_k(logits, width):
+        bounds = [_t([2], "activation", dtype=I32)] * 2
+        return _leaf(
+            ops._TOPK,
+            ("logits", _t([2, width], logits)),
+            *zip(("row_starts", "row_ends"), bounds),
+            ("stride0", width),
+        )
+
+    picked = "atom.model_ops.deepseek_v41.candidate_table:candidate_block_table"
+    picked = _leaf(picked, ("candidates", _t([2, 4], "activation", dtype=I32)))
+    # the page-wide scorer, a candidate list's and its top-k, the pick's top-k
+    leaves = scorer("metadata", 64), scorer("activation", 32), top_k("metadata", 32)
+    leaves += top_k("activation", 8), picked
+    # rows seeing 50 and 20 compressed rows: 7 and 3 blocks of 8
+    page, listed, its, pick, kept = _v41_index(
+        monkeypatch, [50, 20], leaves, decode(2), 64
+    )
+
+    assert page["kv_indices"].tolist() == [
+        [12, 13, 14, 15, 4, 5, 6, 7],
+        [0, 1, 2, 3, 8, 9, 10, 11],
+    ]
+    # 4 of the first row's 7 blocks, its newest last, and the second's 3
+    assert kept["candidates"].tolist() == [[0, 2, 4, 6], [0, 1, 2, -1]]
+    assert listed["kv_indices"].tolist() == [[12, 14, 4, 6], [0, 1, 2, 0]]
+    assert listed["context_lens"].tolist() == [26, 20]
+    assert its["row_starts"].tolist() == its["row_ends"].tolist() == [26, 20]
+    assert pick["row_starts"].tolist() == pick["row_ends"].tolist() == [7, 3]
+
+
+def test_a_v41_prefill_past_cached_tokens_picks_candidates_off_its_rows_blocks(
+    monkeypatch,
+):
+    # as a prefill of 256 tokens traced them: 8 PAGEs, 32 index blocks
+    pick = _leaf(
+        "aiter._top_k_per_row_decode.default",
+        ("logits", _t([256, 32], "activation")),
+        ("seqLens", _t([256], "activation", dtype="torch.int32")),
+        ("stride0", 32),
+    )
+    tables = _t([1, 8], "metadata", [64, 1], "torch.int32")
+    units = "atom.model_ops.deepseek_v41.unit_table:unit_table"
+    units = _leaf(units, ("block_tables", tables))
+    visible = list(range(1025, 1281))  # past 1024 cached tokens
+
+    leaves = pick, units
+    pick, units = _v41_index(monkeypatch, visible, leaves, prefill(256, 1), 1024)
+
+    # its rows reach 40 PAGEs: 160 index blocks
+    assert pick["logits"].shape == (256, 160) and pick["stride0"] == 160
+    assert pick["seqLens"].tolist() == [-(-v // 8) for v in visible]
+    assert units["block_tables"].shape == (1, 40)
+
+
+def test_v41_index_leaves_rank_a_logits_plane_drawn_below_each_row_s_bound(
+    monkeypatch,
+):
+    # ATOM's scorer writes the plane first, no leaf here: the page-wide
+    # top-k, the pick's block maxima and a candidate list's top-k at decode B=2
+    def top_k(width, bounds):
+        bounds = [_t([2], bounds, dtype="torch.int32")] * 2
+        return _leaf(
+            ops._TOPK,
+            ("logits", _t([2, width], "metadata")),
+            *zip(("row_starts", "row_ends"), bounds),
+            ("stride0", width),
+        )
+
+    maxima = _leaf(
+        ops._MAXIMA,
+        ("logits", _t([2, 64], "metadata")),
+        ("visible", _t([2], "metadata", dtype="torch.int32")),
+        ("maxima", _t([2, 8], "activation")),
+        ("blocks", 8),
+    )
+    leaves = top_k(64, "metadata"), maxima, top_k(32, "activation")
+    taken = _v41_index(monkeypatch, [50, 20], leaves, decode(2), 64)
+
+    # rows seeing 50 and 20 compressed rows; the list keeps 26 and 20 of them
+    for call, bounds in zip(taken, ([50, 20], [50, 20], [26, 20])):
+        for row, n in zip(call["logits"], bounds):
+            assert row[:n].ne(0).all() and row[n:].eq(0).all()
+
+
 def test_an_embedding_reads_the_token_ids_atom_prepared():
     runner = _Runner()
     # An index buffer whose name holds the slot's, which the name rule picks.
@@ -1304,6 +1567,27 @@ def test_a_block_view_beside_state_slots_counts_once_a_placement(monkeypatch):
     assert record["metadata"] == {"kv": "v4_unified_kv.0", "st": "v4_state.0"}
     assert record["placements"] == 11
     assert record["footprint_bytes"] == 11 * 32 + 11 * 32 + 3 * 128
+
+
+def test_a_one_layer_field_filling_its_entry_counts_each_row_s_slot(monkeypatch):
+    # A state field of one layer of 64 floats, its whole 256-byte entry, taken
+    # whole: `[1, 8, 64]` strided `[64, 64, 1]`, its layer strided as its slot.
+    runner = _Runner()
+    runner.pool_plan = SimpleNamespace(entries={"state": 8})
+    runner.kv_held = _state((64,))
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    field = _t([1, 8, 64], "kv", stride=[64, 64, 1])
+    leaf = _leaf("v4.select", ("q", _t([2, 4], "activation")), ("st", field))
+    found = ops.leaves(_graph(leaf, layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+
+    [record] = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
+
+    # 32 bytes of q and two rows' slots of 256 a call: 4 copies pass twice
+    # 1000, on the 4 slot pairs 8 slots hold
+    assert record["metadata"] == {"st": "v4_state"}
+    assert record["footprint_bytes"] == 4 * 32 + 4 * 512
 
 
 @pytest.mark.parametrize(
@@ -2084,6 +2368,126 @@ def test_a_capture_that_fails_refuses_its_leaf_and_the_next_draws_its_activation
     assert "refused" not in abs_ and abs_["cold_ns"] > 0
     assert world == {"stream": "main", "capturing": set(), "generator": "free"}
     assert collecting == [False] * 3 and gc.isenabled()
+
+
+class _Generator(torch.Generator):
+    """A host generator that is in capture or not, as a CUDA one is; set to a
+    clone's state, it is not."""
+
+    capturing = False
+
+    def clone_state(self):
+        return None
+
+    def graphsafe_set_state(self, state):
+        self.capturing = False
+
+
+def _forced(monkeypatch, end=lambda: None):
+    """ATOM's `rejection_sample` at a forced acceptance of two rows on the
+    host, its top-k and Triton kernel stood in, each launch recording whether
+    it was in a capture, under a stand-in capture that checks a draw as torch
+    does: in a capture, from a generator its graph registered before it
+    began; outside one, from none still in capture. A capture whose `end`
+    raises, as HIP's does on a graph a call invalidated, leaves them in it."""
+    from atom.model_ops import rejection_sampler as rs
+
+    capturing, launched, rand, synthetic = [], [], torch.rand, _Generator()
+    wrong = ("Offset increment outside graph capture", "not in capture mode")
+
+    class Graph:
+        def __init__(self):
+            self.registered, self.replay = [], lambda: None
+
+        def register_generator_state(self, generator):
+            assert not capturing, "Cannot register the state during capturing"
+            self.registered.append(generator)
+
+    class Capture:
+        capture_stream = "capture"
+
+        def __init__(self, graph, capture_error_mode):
+            self.graph = graph
+
+        def __enter__(self):
+            capturing.append(self)
+            for generator in self.graph.registered:
+                generator.capturing = True
+
+        def __exit__(self, *exc):
+            capturing.pop()
+            end()
+            for generator in self.graph.registered:
+                generator.capturing = False
+
+    def draw(*args, generator=None, **kwargs):
+        if generator is not None and generator.capturing != bool(capturing):
+            raise RuntimeError(wrong[bool(capturing)])
+        return rand(*args, generator=generator, **kwargs)
+
+    event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+    event.elapsed_time = lambda end: 1.0
+    for name, value in {
+        "CUDAGraph": Graph,
+        "graph": Capture,
+        "Event": lambda enable_timing: event,
+        "current_stream": lambda: "main",
+        "stream": lambda s: contextlib.nullcontext(),
+        "is_current_stream_capturing": lambda: False,
+        "default_generators": (_Generator(),),
+        "current_device": lambda: 0,
+    }.items():
+        monkeypatch.setattr(torch.cuda, name, value)
+    monkeypatch.setattr(torch, "rand", draw)
+    monkeypatch.setattr(ops.time, "sleep", lambda s: None)
+    monkeypatch.setattr(rs, "_SYNTHETIC_GENERATORS", {torch.device("cpu"): synthetic})
+    monkeypatch.setattr(rs, "topk_select", lambda t, k, tie: torch.topk(t, k))
+    kernel = {(2,): lambda *a, **k: launched.append(bool(capturing))}
+    monkeypatch.setattr(rs, "rejection_synthetic_sample_kernel", kernel)
+    kwargs = {
+        "input_ids": torch.zeros(12, dtype=torch.int32),
+        "target_logits_indices": torch.arange(10),
+        "num_spec_steps": 5,
+        "cu_num_draft_tokens": torch.tensor([5, 10], dtype=torch.int32),
+        "draft_probs": None,
+        "target_probs": torch.ones(10, 8),
+        "bonus_token_ids": torch.zeros(2, 1, dtype=torch.int32),
+        "bonus_logits_indices": torch.tensor([5, 11]),
+        "synthetic_acceptance_rates": (1.0, 1.0, 0.0, 0.0, 0.0),
+    }
+    return rs.rejection_sample, kwargs, synthetic, launched
+
+
+def test_a_forced_acceptance_is_captured_drawing_from_atom_s_own_generator(
+    monkeypatch,
+):
+    # ATOM's forced acceptance draws from a generator of its own, made and
+    # seeded by the leaf's eager call; a capture registers only the default
+    # generator, and a draw from any other in it raises.
+    sample, kwargs, synthetic, launched = _forced(monkeypatch)
+    sample(**kwargs)  # the leaf's eager call, as `Stub._time` makes it
+
+    times = ops._replay(sample, [(kwargs, fctx._forward_context)] * 4)
+
+    assert times == [1e6 / 4] * ops.REPEATS
+    assert launched == [False] + [True] * 4 and not synthetic.capturing
+
+
+def test_a_failed_capture_leaves_atom_s_forced_acceptance_generator_out_of_it(
+    monkeypatch,
+):
+    # A generator left in capture raises at ATOM's next eager draw from it.
+    def end():
+        raise RuntimeError("operation failed due to a previous error")
+
+    sample, kwargs, synthetic, launched = _forced(monkeypatch, end)
+    sample(**kwargs)
+
+    with pytest.raises(RuntimeError, match="previous error"):
+        ops._replay(sample, [(kwargs, fctx._forward_context)])
+    sample(**kwargs)
+
+    assert launched == [False, True, False] and not synthetic.capturing
 
 
 def test_a_device_argument_is_the_rank_s_own_device():
