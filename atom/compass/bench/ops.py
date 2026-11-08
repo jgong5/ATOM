@@ -1779,10 +1779,13 @@ def _widest(shape, stride) -> int:
 def _held(runner, registry) -> dict[str, torch.Tensor]:
     """Each tensor ATOM's KV allocation bound, by name: the runner attributes
     it set (`kv_held`), a list's items as `name.i`, each field of a KV
-    `registry` entry as `layer_<n>.field`, and the block views of the KV
-    planes it bound on DeepSeek-V4's attention compressors, which no runner
-    attribute holds, as `<module>.kv_cache` and `<module>.kv_cache_rope`; an
-    indexer's compressor writes a layer of a pool the runner holds."""
+    `registry` entry as `layer_<n>.field`, the block views of the KV planes
+    it bound on DeepSeek-V4's attention compressors, which no runner
+    attribute holds, as `<module>.kv_cache` and `<module>.kv_cache_rope` (an
+    indexer's compressor writes a layer of a pool the runner holds), and the
+    scales it bound on any V4 compressor, an indexer's included, as
+    `<module>.cache_scale`: under an FP8 indexer cache, a strided view of
+    the scale region of the pool layer the compressor writes."""
     named = [
         (f"{key}.{field}", t)
         for key, entry in (registry or {}).items()
@@ -1795,6 +1798,8 @@ def _held(runner, registry) -> dict[str, torch.Tensor]:
                 (f"{path}.{a}", getattr(module, a, None))
                 for a in ("kv_cache", "kv_cache_rope")
             ]
+        if path.endswith("compressor"):
+            named.append((f"{path}.cache_scale", getattr(module, "cache_scale", None)))
     for name, value in runner.kv_held.items():
         if isinstance(value, (list, tuple)):
             named += [(f"{name}.{i}", t) for i, t in enumerate(value)]
