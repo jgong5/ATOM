@@ -443,6 +443,9 @@ class StepRecording:
     device events at `run_model` entry and at the forward's exit. At
     `run_model` entry it also keeps the `ForwardMode` the forward settled,
     which the line's view is built from.
+
+    Once `allocate_kv_cache` has built a Mooncake connector, every worker
+    records that connector's KV writes (`writes`), written at `exit`.
     """
 
     _recording = False
@@ -499,6 +502,14 @@ class StepRecording:
         if self._recording:
             record_kv(self, meta)
         return super().process_kvconnector_output(meta)
+
+    def allocate_kv_cache(self, num_kvcache_blocks):
+        reply = super().allocate_kv_cache(num_kvcache_blocks)
+        from atom.compass.parity import writes
+
+        # The KV connector is built here, before any request can reach it.
+        self._writes = writes.install(self)
+        return reply
 
     def flush_pp_send(self):
         """ATOM's idle flush, stamped for the next forward when a send is pending."""
@@ -591,6 +602,8 @@ class StepRecording:
         # Reached on a clean stop and on a SIGTERM (ATOM's exit handler).
         if getattr(self, "_parity_record", None) is not None:
             self._parity_record.write()
+        if getattr(self, "_writes", None) is not None:
+            self._writes.write()
         return super().exit()
 
 
