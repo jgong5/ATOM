@@ -17,6 +17,8 @@ carrying why.
 
 import copy
 import json
+import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -1323,6 +1325,12 @@ def _counts() -> dict:
     return {"lazy_traces": 0, "lazy_trace_wall_seconds": 0}
 
 
+def in_thread(monkeypatch):
+    """A lookup's lazy traces run in a thread of this process, not a process
+    of their own, so what a test patches reaches them."""
+    monkeypatch.setattr(compass_run, "_trace_process", lambda: ThreadPoolExecutor(1))
+
+
 def test_a_shape_no_graph_holds_is_traced_in_the_run_as_trace_ops_traces_it(
     tmp_path_factory, tmp_path
 ):
@@ -1381,6 +1389,78 @@ def test_a_lazy_trace_reads_atom_s_arguments_in_either_spelling_as_its_server_do
     assert lazy["lazy_traces"] == 1
 
 
+#: DeepSeek-V4-Pro's DPA-TP8 steps whose KV pools differ, in the order a run
+#: meets them: a decode's the fewest blocks a capture allocates
+#: (`forward.KV_BLOCKS`), a prefill of one-token rows a block a row.
+POOLS = (("decode", 2, 2), ("prefill", 100, 100), ("prefill", 80, 80))
+
+
+def _run_config(structure: str, model) -> SimpleNamespace:
+    """An eager run's config of the model directory `model` that
+    `forward.structure` keys as `structure` keys it."""
+    from atom.compass.capture.forward import _engine
+
+    head, engine, _ = _engine(structure)
+    fixed = ("quantization", "tensor_parallel_size", "data_parallel_size", "env")
+    return SimpleNamespace(
+        model=str(model),
+        hf_config=SimpleNamespace(architectures=[head.split()[0]]),
+        tensor_parallel_size=engine["tensor_parallel_size"],
+        parallel_config=SimpleNamespace(
+            data_parallel_size=engine["data_parallel_size"]
+        ),
+        quant_config=SimpleNamespace(compute_hash=lambda: engine["quantization"]),
+        enforce_eager=True,
+        **{k: v for k, v in engine.items() if k not in fixed},
+    )
+
+
+def test_a_run_s_lazy_traces_share_one_process_and_trace_as_a_process_each(
+    tmp_path_factory, tmp_path, monkeypatch
+):
+    from test_capture_v4_pro import DPA_TP8, trace
+
+    from atom.compass.artifacts import ArtifactStore, Kind, Topology
+    from atom.compass.capture.forward import Shape
+
+    # Each shape alone in a `trace ops` of its own, a prefill as one forward.
+    alone, rank = {}, Topology().ranks()[0]
+    for phase, tokens, seqs in POOLS:
+        root = tmp_path_factory.mktemp("alone")
+        at = f"--width {seqs}" if phase == "decode" else f"--prefill {tokens} {seqs}"
+        done = trace(root, f"{at} --whole{DPA_TP8}")
+        published = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
+        assert published, done.stderr[-4000:]
+        store = ArtifactStore(str(root / "store"))
+        for token in published:
+            entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
+            graph = json.loads(entry.read_member("graph", rank, "json"))
+            output = not graph["structure"].endswith("no output")
+            alone[graph["shape"], output] = graph["region"]
+    config = _run_config(graph["structure"], root / "model")
+    args = ["--model", config.model, "-tp", "8", *DPA_TP8.split()[1:]]
+    spawned, spawn = [], compass_run._trace_process
+    monkeypatch.setattr(
+        compass_run, "_trace_process", lambda: spawned.append(spawn()) or spawned[-1]
+    )
+    lazy = _counts()
+    lookup = _op_graphs(str(tmp_path), config, "gfx950", args, lazy)
+    warm = {}
+    for phase, tokens, seqs in POOLS:
+        for output in (False, True) if phase == "prefill" else (True,):
+            warm[str(Shape(phase, tokens, seqs)), output] = lookup(
+                phase, tokens, seqs, output
+            )
+
+    # Byte for byte the graphs a process each traces, each pool its own.
+    assert warm.keys() == alone.keys() and len(alone) == 5
+    for at, region in alone.items():
+        assert json.dumps(warm[at]) == json.dumps(region), at
+    # One process traced the three, its tracer made at the first and kept.
+    made = spawned[0].submit(compass_run._tracer.cache_info).result()
+    assert (len(spawned), lazy["lazy_traces"], made.misses, made.hits) == (1, 3, 1, 2)
+
+
 def test_a_lazy_trace_that_fails_ends_the_run_naming_the_shape(tmp_path):
     (tmp_path / "model").mkdir()  # holds no config.json, so no capture builds it
     (tmp_path / "read").mkdir()
@@ -1410,7 +1490,6 @@ def test_a_dirty_tree_s_lazy_trace_answers_its_run_and_publishes_nothing(
     from test_artifact_store import AITER_ROOT, ATOM_ROOT
 
     from atom.compass import artifacts
-    from atom.compass.bench import ops
     from atom.compass.capture import forward
     from atom.compass.capture.graph import Traced, to_json
     from atom.compass.ir import Graph, Op
@@ -1429,15 +1508,16 @@ def test_a_dirty_tree_s_lazy_trace_answers_its_run_and_publishes_nothing(
     at = forward.structure(config, "decode", True, "gfx942", True, False)
     traced = []
 
-    def capture(model, tp, shapes, *_, **__):
+    def trace(shapes, unsplit):
         leaf = Op("aiter.leaf", "opaque_leaf", (("n", 2),), ())
         traced.append(Graph(Traced(at, str(shapes[0])), leaf))
-        return [(traced[-1], model, {"arch": "gfx942"})]
+        return [(traced[-1], config.model, {"arch": "gfx942"})]
 
     dirty = (replace(ATOM_ROOT, dirty=3), AITER_ROOT)
     monkeypatch.setattr(artifacts, "roots_for", lambda modules: dirty)
-    monkeypatch.setattr(forward, "capture", capture)
-    monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
+    tracer = SimpleNamespace(trace=trace)
+    monkeypatch.setattr(compass_run, "_tracer", lambda *args: (None, tracer))
+    in_thread(monkeypatch)
     lazy, store = _counts(), tmp_path / "store"
     lookup = _op_graphs(str(store), config, "gfx942", ["--model", config.model], lazy)
 
