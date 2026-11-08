@@ -3,8 +3,8 @@
 published as an `op_graph`.
 
     compass trace ops --model M [--tp N] [--width W ...] [--prefill T B ...]
-                      [--population P ...] [--arch A] [--gpu I] --store S
-                      [-- ATOM args]
+                      [--whole] [--population P ...] [--arch A] [--gpu I]
+                      --store S [-- ATOM args]
 
 A shape is a decode width (`--width`), a prefill of T tokens over B sequences
 (`--prefill`), or every shape the steps of a record directory hold
@@ -20,7 +20,8 @@ replays no graph yet pads past its rows, `target_bs`, at that width. Under
 micro-batches, each a prefill at its own tokens and the group's rows of it,
 by the split `validate.bound` rebuilds from every rank's line; a population's
 prefill is traced as one forward, as it ran, where ATOM would split a step of
-its tokens. Each is traced at that concrete shape (`forward`), decoder layers folded
+its tokens, and with `--whole` each `--prefill` too. Each is traced at that
+concrete shape (`forward`), decoder layers folded
 into `Repeat` and forked streams into `Par` (`graph`).
 
 An `op_graph` is keyed by structure (`forward.structure`: the model's
@@ -76,6 +77,11 @@ def main(argv: list[str]) -> None:
         help="a prefill of T tokens over B sequences",
     )
     p.add_argument(
+        "--whole",
+        action="store_true",
+        help="trace each --prefill as one forward where ATOM would split it",
+    )
+    p.add_argument(
         "--population",
         action="append",
         default=[],
@@ -103,8 +109,10 @@ def main(argv: list[str]) -> None:
     command = " ".join(["compass", "trace", "ops", *argv])
     with tempfile.TemporaryDirectory(prefix="compass-capture-") as tmpdir:
         began = time.perf_counter()  # the first shape's seconds include the build
-        # A card's reading only when read: a declared arch's call is as before.
+        # A card's reading and `--whole` only when given: any other call is as before.
         on = {"read": read} if read else {}
+        if args.whole:
+            on["whole"] = True
         captured = capture(
             args.model, args.tp, shapes, tmpdir, atom_args, arch, args.population, **on
         )
