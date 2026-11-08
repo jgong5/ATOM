@@ -213,7 +213,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 24
+PROTOCOL = 25
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -332,7 +332,8 @@ V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
 #: entries its rows read (`_build_paged_prefill_meta`). A capture's prefill
 #: caches nothing, so past cached tokens each is longer than the leaf's
 #: captured one: a slot `V4_METADATA` binds to one takes it whole, as ATOM
-#: passes it, and aiter's prefill attention splits its KV by its length.
+#: passes it, and aiter's prefill attention splits its KV by its length. Its
+#: bytes still count at the captured span.
 V4_LISTS = {
     f"kv_indices_{kind}"
     for kind in ("extend", "prefix_swa", "prefix_csa", "prefix_hca")
