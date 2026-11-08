@@ -56,7 +56,7 @@ def no_eager_rung():
 
 def run_file(tmp_path, monkeypatch, **keys):
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 0.001,
         "stream_s": 0.002,
         "bound_s": 10.0,
