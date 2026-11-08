@@ -24,6 +24,7 @@ import torch
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_bench_ops import TREE, _graph, _leaf, _Runner, _t
 from test_bench_ops_plan import CONFIG, _graph_at, bench  # noqa: F401  a fixture
+from test_bench_ops_ranks import _sig
 from test_capture_ir import MAIN
 from test_capture_v41_flash import CONFIG as V41
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
@@ -31,6 +32,7 @@ from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
 from atom.compass.artifacts import ArtifactRefusal, Rule
 from atom.compass.backends.op_graph import KV
 from atom.compass.bench import ops
+from atom.compass.capture.forward import decode, prefill
 from atom.utils import forward_context as fctx
 
 #: A block drafter of one draft: a decode row verifies two tokens.
@@ -164,6 +166,18 @@ def test_a_placement_keeps_the_clone_of_a_view_whose_nans_stand_unchanged():
 
     first, second = ([v for _, v in views.values()] for _, views in stub.placed)
     assert first[0] is second[0]
+
+
+def test_a_collective_whose_bytes_fall_as_its_step_s_rows_rise_halves_no_step():
+    # The DSpark drafter's all-reduce of its one anchor at a prefill of 8192
+    # tokens, beside its block's of 5 rows at a decode of 1: no step between.
+    fam = ops.exchange(json.loads(_sig(1)))[0]
+    points = [
+        (10240, ("one",), {"shape": str(prefill(8192, 1)), "context": None}),
+        (51200, ("two",), {"shape": str(decode(1)), "context": 1024}),
+    ]
+
+    assert ops._densify({fam: points}, set()) == {}
 
 
 def test_a_drafter_s_moe_draws_its_ids_over_its_own_experts():

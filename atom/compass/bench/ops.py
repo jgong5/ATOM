@@ -2907,7 +2907,9 @@ def _densify(families, tried: set) -> dict:
     of the kind holds two adjacent contexts of one kernel that are `_apart`;
     between two
     points of a collective's family, the step of the rows halfway, a decode
-    when the farther is one, else a prefill of one sequence. A collective's
+    when the farther is one, else a prefill of one sequence, and none where
+    the farther's step holds fewer rows (a drafter's collective over its
+    anchors or its block, whose bytes do not follow its step's). A collective's
     family is `_bent` too, each message size at the mean of its readings, as
     `fit ops` merges them."""
     from atom.compass.capture.forward import decode, prefill
@@ -2948,6 +2950,8 @@ def _densify(families, tried: set) -> dict:
                 want[shape, mid].add(new)
             elif _exchanged(fam):
                 far = _shape(other["shape"])
+                if far.tokens < shape.tokens:  # no step's rows lie between
+                    continue
                 rows = (shape.tokens + far.tokens) // 2
                 step = decode(rows) if far.phase == "decode" else prefill(rows, 1)
                 want[step, other["context"]].add(fam)
