@@ -82,10 +82,10 @@ eager forwards, so a graph-mode run reads the eager graphs too; with
 ``price_list``, the fields of a `price_list` key ``store`` holds, loaded
 under this run's readings, it prices each leaf from it first; with
 ``atom_args``, ATOM's arguments the server was started with, which `compass
-run` writes, a shape the store holds no graph at is traced first, in a
-process of its own, and published there, or from a tree with uncommitted
-files kept for this run alone, unpublished, and a trace that fails ends the
-run, naming the shape),
+run` writes, a shape the store holds no graph at is traced first, in the
+one process each engine spawns for its traces, the model built once there,
+and published there, or from a tree with uncommitted files kept for this run
+alone, unpublished, and a trace that fails ends the run, naming the shape),
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
 `StepFallbackBackend`, as it always does under ``step_grid``, from the
@@ -1886,10 +1886,11 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
 
     With ATOM's arguments `atom_args`, a shape the store holds no graph at is
     first traced once, as `compass trace ops` traces a record's step from
-    them, in a process of its own (a process runs one capture), its count and wall
-    seconds added to `lazy`'s ``lazy_traces`` and ``lazy_trace_wall_seconds``;
-    a trace that fails raises, naming the shape. A trace from a tree with
-    uncommitted files answers this lookup alone and is not published."""
+    them, in the one process this lookup spawns at its first such shape
+    (`_trace`), its count and wall seconds added to `lazy`'s ``lazy_traces``
+    and ``lazy_trace_wall_seconds``; a trace that fails raises, naming the
+    shape. A trace from a tree with uncommitted files answers this lookup alone
+    and is not published."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture.forward import Shape, missed, structure
 
@@ -1897,7 +1898,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     dp = config.parallel_config.data_parallel_size
     drafter = getattr(config, "speculative_config", None)
     drafts = drafter.num_speculative_tokens if drafter else 0
-    traced, unpublished = set(), {}
+    traced, unpublished, process = set(), {}, []
 
     @functools.lru_cache(maxsize=64)
     def graph(
@@ -1908,12 +1909,13 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
         missing = not store.directory_for(key).exists()
         if missing and atom_args is not None and shape not in traced:
-            from atom.compass.bench.ops import _child
-
             traced.add(shape)
             began = time.monotonic()
             try:
-                unpublished.update(_child(_trace, root, atom_args, arch, shape))
+                if not process:
+                    process.append(_trace_process())
+                done = process[0].submit(_trace, root, atom_args, arch, shape)
+                unpublished.update(done.result())
             # An argument parser's error exits.
             except (Exception, SystemExit) as failed:
                 why = f"{type(failed).__name__}: {failed}"
@@ -1930,18 +1932,46 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     return graph
 
 
+def _trace_process():
+    """A process of its own, spawned, for a lookup's lazy traces (`_trace`): a
+    capture's process-wide patches stay in it, and the runner its first trace
+    builds steps every later one. It ends when the process that spawned it
+    does, however that ends: the runner takes SIGTERM for its own exit, not
+    the process's."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    from atom.utils import enable_orphan_reaping
+
+    spawn = multiprocessing.get_context("spawn")
+    return ProcessPoolExecutor(1, mp_context=spawn, initializer=enable_orphan_reaping)
+
+
+@functools.cache
+def _tracer(model: str, tp: int, atom_args: tuple, arch: str):
+    """This process's `forward.Tracer` of `model` at TP `tp` under ATOM's engine
+    arguments `atom_args` on a declared `arch`, made at its first lazy trace and
+    kept for every later one, beside the directory its declared device lives
+    in."""
+    import tempfile
+
+    from atom.compass.capture.forward import Tracer
+
+    tmpdir = tempfile.TemporaryDirectory(prefix="compass-capture-")
+    return tmpdir, Tracer(model, tp, tmpdir.name, atom_args, arch)
+
+
 def _trace(root: str, atom_args, arch: str, shape) -> dict:
     """Trace `shape` as `compass trace ops` traces a record's step, a prefill
     as one forward, from ATOM's arguments `atom_args` less the server's, on a
-    declared `arch`, and publish each graph in the store at `root`, one another
-    engine of the run published first aside. From a tree with uncommitted
-    files, which may run but not publish, return each graph's region by its
-    structure and shape instead; else return an empty dict."""
-    import tempfile
-
+    declared `arch`, in this process's tracer (`_tracer`), its KV pool the one
+    a capture of `shape` alone allocates; and publish each graph in the store
+    at `root`, one another engine of the run published first aside. From a
+    tree with uncommitted files, which may run but not publish, return each
+    graph's region by its structure and shape instead; else return an empty
+    dict."""
     from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, Rule, roots_for
     from atom.compass.capture import publish
-    from atom.compass.capture.forward import capture
     from atom.compass.capture.graph import to_json
     from atom.compass.drive.runfile import _engine_args, engine_only
 
@@ -1950,21 +1980,17 @@ def _trace(root: str, atom_args, arch: str, shape) -> dict:
     command = f"compass run: a lazy trace of {shape}"
     dirty = any(r.dirty for r in roots_for({"atom": "atom", "aiter": "aiter"}))
     unpublished = {}
-    with tempfile.TemporaryDirectory(prefix="compass-capture-") as tmpdir:
-        for graph, model, declared in capture(
-            engine.model, tp, [shape], tmpdir, kept, arch, whole=True
-        ):
-            if dirty:
-                at = graph.applicability
-                unpublished[at.structure, at.shape] = json.loads(to_json(graph))[
-                    "region"
-                ]
-                continue
-            try:
-                publish(store, graph, model, declared, tp, kept, command)
-            except ArtifactRefusal as refused:
-                if refused.rule is not Rule.IMMUTABLE:
-                    raise
+    _, tracer = _tracer(engine.model, tp, tuple(kept), arch)
+    for graph, model, declared in tracer.trace([shape], [shape]):
+        if dirty:
+            at = graph.applicability
+            unpublished[at.structure, at.shape] = json.loads(to_json(graph))["region"]
+            continue
+        try:
+            publish(store, graph, model, declared, tp, kept, command)
+        except ArtifactRefusal as refused:
+            if refused.rule is not Rule.IMMUTABLE:
+                raise
     return unpublished
 
 
