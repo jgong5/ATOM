@@ -40,6 +40,7 @@ its header.
 | `handoff.py` | any container with `atom` | `PYTHONPATH=$T python3 scripts/compass/handoff.py RECORD [LAW]`: over a real run's step record (`compass record`'s `steps/`), the engine IO threads' queue handoffs it stamped, input receipt to queue put, put to the busy loop's get, and output put to send, as p50 and p99 per prompt-token or step-batch bucket against the median step, and the input p10, beside the law file `LAW`'s `ipc_s` hop when given. |
 | `ca_grant_cost.py` | any container with `atom`; for the cross-node figure, one on each of two hosts | `python3 scripts/compass/ca_grant_cost.py serve N tcp://0.0.0.0:PORT` on the clock's host, then `python3 scripts/compass/ca_grant_cost.py lps N tcp://HOST:PORT` on the LPs' host: a clock authority over N synthetic LPs, each one channel of `--lookahead` seconds (default 1) from every other, served over the `tcp` carrier, and N LP processes that each ask `TAR` one second past their clock `--rounds` times (default 1000), then `NER(+inf)`. `lps` prints a `TAR`'s round trip, send to grant (p10, p50, p90); `serve` prints the endpoint it bound, then its CPU seconds per request served. At the default lookahead each round is a barrier, every LP granted once the last has asked; at 2 an LP may run one round ahead. The clock authority's sizing in `atom/compass/design/01_execution_and_time_model.md` (D3.1) states its figures. |
 | `mi355x_spec.py` | any container with `atom` | `python3 scripts/compass/mi355x_spec.py`: rebuild `machines/mi355x-gpu45.json`, the mi355-gpu-45 MI355X machine spec, from the device, capacity, datasheet peaks, the attainable peaks `probe_device.py` read on mi355-gpu-45 (`PEAKS`) and assumed values recorded in the script; byte for byte while this script and `mi308x_spec.py` are unchanged. With `COMPASS_MACHINE=mi355x-crs005`, the same for crsuse2-m2m-v3-005 into `machines/mi355x-crs005.json`, which -013 also reads (same cards, VBIOS and driver, no ptl directory); with `COMPASS_MACHINE=mi355x-gpu40`, for mi355-gpu-40 under nightly 20261026's stack into `machines/mi355x-gpu40.json`. Prints `validate`'s verdict and `explain`'s fields grouped by origin. |
+| `rdma_link.py` | a GPU container on each of two nodes; `fit` in any container with `atom` | Times Mooncake KV writes between two nodes and fits the inter-node link `mi355x_spec.py` states for crsuse2-m2m-v3-005 and -013 (`INTER_NODE`): `target` on the decode node, `bench` on the prefill node, `fit BENCH [RECORD]` anywhere; its docstring lists the experiments, and [the 1P1D section](#the-inter-node-link--rdma_linkpy) the commands. |
 | `mi455_spec.py` | any container with `atom` | `python3 scripts/compass/mi455_spec.py a0`: rebuild `machines/mi455-a0.json`, the spec of the node's MI455 A0 sample cards, from MI455X's datasheet peaks (`DATASHEET`), the attainable peaks `probe_device.py` read on two of the node's cards (`PEAKS`), the arch, capacity and stack its record holds (`DEVICE`) and assumed values recorded in the script. `python3 scripts/compass/mi455_spec.py b0`: rebuild `machines/mi455-b0.json`, the spec of the MI455 B0 performance machines, device `MI455X B0`, which no card here reads, from the same datasheet peaks and `machines/mi355x-gpu45.json`, every value taken from that file assumed: its derates, and its bandwidth curve scaled to MI455X's datasheet bandwidth, carry MI355X's probed ratios onto MI455X's peaks, and its own values stand where no datasheet states one; its arch, assumed, is the A0 samples', and no rate, latency or stack A0's probe read reaches it. Each is byte for byte while this script, `mi308x_spec.py` and `mi355x-gpu45.json` are unchanged, and prints `validate`'s verdict and `explain`'s fields grouped by origin. |
 | `cpu_gate_exclude.txt` | — | Excluded test files in two marked sections: **GENERATED** (`# BEGIN GENERATED`, driver-dependent at *collection* time; never hand-edit — `regen_cpu_gate_exclude.sh` rewrites it wholesale) and **MANUAL** (`# BEGIN MANUAL`, collects cleanly then fails on a driver call or for want of a `.git`, so the regenerator cannot see it). The MANUAL section **is** hand-edited; every entry must carry its observed failure above it. |
 | `gpu_gate_triggers.txt` | — | The source paths that no *running* CPU-gate test names. Generated, not hand-written; matched by `gate_cpu.sh`. A trailing `/` matches a subtree. |
@@ -1077,6 +1078,30 @@ at the run's own commit on the node where that side's real instance runs (013 fo
 the decode): decode readings taken on 005 sized the simulated decode 79 to 80 KV
 blocks per rank above every real decode on 013
 ([ruling](https://github.com/jgong5/ATOM/issues/1111#issuecomment-6659985920)).
+
+### The inter-node link — `rdma_link.py`
+
+`rdma_link.py` times Mooncake writes from 005's GPUs into 013's over the
+rails, as the cell's KV moves under matched rails, and `fit` publishes the
+link `mi355x_spec.py` states for the pair (`INTER_NODE`): the port rate and
+latency from the bench, and the derate a recorded deployment's own KV writes
+attained (`atom/compass/parity/writes.py`). Both ends run in a node's GPU
+container, created as above, with both nodes' locks and both page caches
+checked before and after, as the Rulings on #2794 have every 1P1D run's:
+
+```
+# 013: an engine per rail, stopped once the bench has ended
+PYTHONPATH=$T MC_IB_TC=96 python3 $T/scripts/compass/rdma_link.py target --ip 10.245.149.94 --out TARGETS
+# 005, once TARGETS is there
+PYTHONPATH=$T MC_IB_TC=96 python3 $T/scripts/compass/rdma_link.py bench --ip 10.245.151.159 --targets TARGETS --out BENCH
+# anywhere atom imports; RECORD, a `deploy.sh record` deployment's directory
+PYTHONPATH=$T python3 $T/scripts/compass/rdma_link.py fit BENCH RECORD
+```
+
+`fit` also replays the record's writes on that link per rank pair, per
+prefill rank and per rail, each one write at a time or sharing the
+bandwidth, and prints each one's error on every `_rdma_write` call and on
+the contended ones.
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 

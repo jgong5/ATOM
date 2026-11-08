@@ -3,7 +3,7 @@
   "name": "mi355x-crs005",
   "provenance": {
     "authored_by": "compass agent for jgong5",
-    "date": "2026-10-29",
+    "date": "2026-11-08",
     "origin": "mixed",
     "origins": {
       "device.name": {
@@ -83,16 +83,7 @@
       "interconnect.intra_node.topology": {
         "origin": "assumed"
       },
-      "interconnect.inter_node.link_bandwidth_bytes_per_s": {
-        "origin": "assumed"
-      },
-      "interconnect.inter_node.link_latency_s": {
-        "origin": "assumed"
-      },
       "interconnect.router_relay_s": {
-        "origin": "assumed"
-      },
-      "interconnect.inter_node.derate": {
         "origin": "assumed"
       },
       "device.ptl": {
@@ -141,6 +132,27 @@
         "origin": "probed",
         "source_root": "commit:f6e1fa77d",
         "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "interconnect.inter_node.link_bandwidth_bytes_per_s": {
+        "origin": "probed",
+        "source_root": "commit:f371241a0",
+        "record": "sha256:8c5a2b561e898c28f51605e5069c4a98cbe362db40a8f734a83cb74423f88103",
+        "p10": 50000000000.0,
+        "p90": 50000000000.0
+      },
+      "interconnect.inter_node.link_latency_s": {
+        "origin": "probed",
+        "source_root": "commit:f371241a0",
+        "record": "sha256:8c5a2b561e898c28f51605e5069c4a98cbe362db40a8f734a83cb74423f88103",
+        "p10": 2.950775364256114e-05,
+        "p90": 6.060598291460931e-05
+      },
+      "interconnect.inter_node.derate": {
+        "origin": "probed",
+        "source_root": "commit:f371241a0",
+        "record": "sha256:4b35806ba3cd4eca3d7aee08916dac2290435d52291d645e80a51a749ca70fea",
+        "p10": 0.3716563888843095,
+        "p90": 0.5117426951060756
       }
     },
     "fragments": [
@@ -148,9 +160,11 @@
       "datasheet",
       "assumed",
       "ptl",
-      "peaks"
+      "peaks",
+      "rdma bench",
+      "rdma run"
     ],
-    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at f6e1fa77d | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples"
+    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at f6e1fa77d | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples | rdma_link.py's bench, 005's GPUs writing into 013's over ionic_N | a recorded 1P1D run's KV writes, 005 into 013 over ionic_N"
   },
   "device": {
     "name": "MI355X",
@@ -276,8 +290,8 @@
     },
     "inter_node": {
       "link_bandwidth_bytes_per_s": 50000000000.0,
-      "link_latency_s": 5e-06,
-      "derate": 0.8
+      "link_latency_s": 3.008648854934795e-05,
+      "derate": 0.46939086521217643
     },
     "router_relay_s": 0.0015
   }

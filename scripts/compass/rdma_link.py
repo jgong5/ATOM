@@ -18,13 +18,16 @@ writers into one rail from GPUs `i % 8`, started together each round;
 `spread`, GPU 0 writing on 1 to 8 rails at once.
 
 `fit` prints each rail case's link, `latency + bytes / bandwidth` fitted on
-relative error, with the p10 and p90 of its fits per round; the start-ups;
+relative error per round, as the p50, p10 and p90 of its fits; the start-ups;
 each concurrency's finishing spread (the slowest write's time over the
-fastest's) and aggregate rate; and, given the record directory of a Mooncake
-P/D run (`atom/compass/parity/writes.py`), each sharing unit's error when
-every `_rdma_write` call is replayed at its recorded start on the `PUBLISHED`
-link, one at a time on a `Link` (FIFO) or splitting the bandwidth evenly
-among the calls in flight (shared).
+fastest's) and aggregate rate. Given the record directory of a Mooncake P/D
+run (`atom/compass/parity/writes.py`), it publishes the link the run's KV
+writes attained: the port rate and the latency of every rail case, with the
+derate of the writes none of whose calls was in flight beside another of its
+prefill rank or rail. Then it replays every `_rdma_write` call at its recorded
+start on that link per sharing unit, one at a time on a `Link` (FIFO) or
+splitting the bandwidth evenly among the calls in flight (shared), and prints
+each one's error on every call and on the contended ones.
 """
 
 import argparse
@@ -44,8 +47,6 @@ SIZES = [ENTRY << 2 * i for i in range(8)]  # 64 KiB to 1 GiB
 REPS = 8
 ROUND_BYTES = 256 << 20
 FLOOR = 2e9  # rounds are spaced as if writes moved no faster than this
-#: The rail case whose link `fit` publishes and replays the record on.
-PUBLISHED = "all"
 #: A startup line's `t`, `[start, first write, next write]`, read as times.
 STARTUP = {
     "engine start": lambda t: (t[1][0] - t[0]) / 1e6,
@@ -217,9 +218,10 @@ def link(rows) -> tuple:
     return (sa * sbb - sb * sab) / det, det / (saa * sb - sab * sa)
 
 
-def band(values) -> tuple:
+def spread3(values) -> list:
+    """`[p50, p10, p90]` of `values`."""
     q = statistics.quantiles(values, n=10, method="inclusive")
-    return q[0], q[-1]
+    return [statistics.median(values), q[0], q[-1]]
 
 
 def fifo(jobs, latency, bandwidth) -> list:
@@ -258,26 +260,45 @@ UNITS = {
 
 
 def calls(record) -> list:
-    """`(rank, hca, start s, bytes, seconds)` of each `_rdma_write` call a
-    producer rank of `record` stamped, in start order."""
-    found = []
+    """`(rank, hca, start s, bytes, seconds, write)` of each `_rdma_write` call
+    a producer rank of `record` stamped, in start order; `write` numbers the
+    write that made it."""
+    found, writes = [], 0
     for path in sorted(Path(record).rglob("*.writes.jsonl")):
         for line in path.read_text().splitlines():
-            w = json.loads(line)
+            w, writes = json.loads(line), writes + 1
             for s, e, n in w.get("rdma", []):
-                found.append((str(path), w.get("hca"), s / 1e9, n, (e - s) / 1e9))
+                found.append(
+                    (str(path), w.get("hca"), s / 1e9, n, (e - s) / 1e9, writes)
+                )
     return sorted(found, key=lambda c: c[2])
 
 
-def replay(found, unit, discipline, latency, bandwidth) -> list:
+def contended(found) -> set:
+    """The calls in flight beside another of their prefill rank or their rail."""
+    hit = set()
+    for unit in ("prefill rank", "rail"):
+        queues = {}
+        for c in found:
+            queues.setdefault(UNITS[unit](c), []).append(c)
+        for q in queues.values():
+            for a in q:
+                if any(
+                    b is not a and b[2] < a[2] + a[4] and a[2] < b[2] + b[4] for b in q
+                ):
+                    hit.add(a)
+    return hit
+
+
+def replay(found, unit, discipline, latency, bandwidth) -> dict:
     """Each call's predicted over recorded seconds, less 1."""
     queues = {}
     for c in found:
         queues.setdefault(UNITS[unit](c), []).append(c)
-    errors = []
+    errors = {}
     for q in queues.values():
         done = discipline([(c[2], c[3]) for c in q], latency, bandwidth)
-        errors += [(d - c[2]) / c[4] - 1 for d, c in zip(done, q) if c[4] > 0]
+        errors |= {c: (d - c[2]) / c[4] - 1 for d, c in zip(done, q) if c[4] > 0}
     return errors
 
 
@@ -290,26 +311,23 @@ def fit(args) -> None:
     )
     sweep = [x for x in lines if x["exp"] == "sweep" and x["t"][2]]
     pts = lambda xs: [(x["bytes"], (x["t"][1] - x["t"][0]) / 1e9) for x in xs]
-    cases, links = {}, {}
+    cases, port = {}, max(rates)
     for case, rows in (
         ("own", [x for x in sweep if x["gpu"] == x["rail"]]),
         ("next", [x for x in sweep if x["gpu"] != x["rail"]]),
         ("all", sweep),
     ):
         fits = [link(pts(x for x in rows if x["round"] == i)) for i in range(REPS)]
-        lat, bw = links[case] = link(pts(rows))
-        lat_band, bw_band = band([f[0] for f in fits]), band([f[1] for f in fits])
-        port = max(rates)
+        lat, bw = (spread3([f[i] for f in fits]) for i in (0, 1))
         cases[case] = {
             "link_bandwidth_bytes_per_s": [port, min(rates), max(rates)],
-            "link_latency_s": [lat, *lat_band],
-            "derate": [bw / port, *(b / port for b in bw_band)],
+            "link_latency_s": lat,
+            "derate": [b / port for b in bw],
         }
         print(
-            f"{case} rail, [value, p10, p90]: latency {cases[case]['link_latency_s']}"
-            f", bandwidth {[bw, *bw_band]}, derate {cases[case]['derate']}"
+            f"{case} rail, [p50, p10, p90] of the fits per round: latency {lat}, "
+            f"bandwidth {bw}, derate {cases[case]['derate']}"
         )
-    print(f"published ({PUBLISHED}): {json.dumps(cases[PUBLISHED])}")
     starts = {}
     for x in (x for x in lines if x["exp"].startswith("startup")):
         starts.setdefault(x["exp"], []).append(x["t"])
@@ -336,19 +354,35 @@ def fit(args) -> None:
                 f", aggregate {statistics.median(rate):.4g} B/s"
             )
     if args.record:
-        found = calls(args.record)
-        print(f"record: {len(found)} calls, {sum(c[3] for c in found)} bytes")
+        found, latency = calls(args.record), cases["all"]["link_latency_s"][0]
+        busy, writes = contended(found), {}
+        for c in found:
+            writes.setdefault(c[5], []).append(c)
+        alone = [w for w in writes.values() if busy.isdisjoint(w)]
+        rate = spread3(
+            [sum(c[3] for c in w) / sum(c[4] - latency for c in w) for w in alone]
+        )
+        published = {**cases["all"], "derate": [r / port for r in rate]}
+        print(
+            f"record: {len(writes)} writes, {len(found)} calls, {len(busy)} contended"
+        )
+        print(
+            f"published, the derate of {len(alone)} uncontended writes: {json.dumps(published)}"
+        )
         for unit in UNITS:
             for name, discipline in (("FIFO", fifo), ("shared", shared)):
-                errors = replay(found, unit, discipline, *links[PUBLISHED])
-                p50, p90 = (
-                    statistics.quantiles([abs(e) for e in errors], n=10)[i]
-                    for i in (4, 8)
-                )
-                print(
-                    f"per {unit}, {name}: |error| p50 {p50:.3g} p90 {p90:.3g}, "
-                    f"signed p50 {statistics.median(errors):+.3g}"
-                )
+                e = replay(found, unit, discipline, latency, rate[0])
+                for among, errors in (
+                    ("every", list(e.values())),
+                    ("contended", [e[c] for c in busy]),
+                ):
+                    if len(errors) > 1:
+                        q = spread3([abs(x) for x in errors])
+                        print(
+                            f"per {unit}, {name}, {among} call: |error| p50/p10/p90 "
+                            f"{q[0]:.3g}/{q[1]:.3g}/{q[2]:.3g}, signed p50 "
+                            f"{statistics.median(errors):+.3g}"
+                        )
 
 
 def main(argv=None) -> int:
