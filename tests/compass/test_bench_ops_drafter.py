@@ -80,6 +80,7 @@ def test_a_plan_measures_a_drafter_s_parts_and_coverage_reads_each_step_s(
     steps = _records(
         tmp_path / "steps",
         ([[2, 1000, True], [2, 3000, True]], 2, True),
+        ([[2, 4000, True]], 2, True),  # one row padded to two
         ([[2, 12000, True]], 1, True),
         ([[40, 40, False]], None, True),  # a final chunk
         ([[150, 150, False]], None, False),  # a middle chunk
@@ -97,13 +98,17 @@ def test_a_plan_measures_a_drafter_s_parts_and_coverage_reads_each_step_s(
     assert {r["op"] for r in records} == {"aiter.attn", "aiter.gemm", *OWN.values()}
     report = ops.coverage(store, root, DRAFTING, [steps], records, "gfx942")
     # Each step reads its target's and its drafter's graphs; one that samples
-    # also its draft-KV pass's; a middle chunk its drafter's alone.
+    # also its draft-KV pass's; a middle chunk its drafter's alone. A decode
+    # padded past its rows reads its drafter's at them, unpadded, a shape
+    # `--plan` measures no point at.
     assert report["by part"] == {
-        "target": {"steps": 4, "covered": 4},
-        "draft": {"steps": 4, "covered": 4},
-        "draft_kv": {"steps": 3, "covered": 3},
+        "target": {"steps": 5, "covered": 5},
+        "draft": {"steps": 5, "covered": 4},
+        "draft_kv": {"steps": 4, "covered": 4},
     }
-    assert report["covered"] == 4
+    assert report["left out, by leaf kind"] == {
+        "draft aiter.propose": {"no measured point": 1}
+    }
 
 
 class _Drafting(_Runner):

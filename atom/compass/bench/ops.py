@@ -2638,12 +2638,9 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
             by_part.setdefault(part, Counter())["steps"] += 1
             decoding, before = shape.phase == "decode", len(whys)
             mean, top = band(line["rows"], decoding)
-            # a drafter decodes its rows unpadded, as `OpGraphBackend` asks it
-            rows = shape.tokens if decoding and draft is True else shape.seqs
             bound = (*shape[:4], mean, top)
             if decoding:  # its max, then its mean over B, as `OpGraphBackend` asks
-                bound = (*shape[:2], rows, shape.gathered, top)
-                bound += (sum(r[1] for r in line["rows"]) / rows,)
+                bound = (*shape[:4], top, sum(r[1] for r in line["rows"]) / shape.seqs)
             if isinstance(found := families(shape, output, draft), str):
                 whys[f"{part}op_graph"], found = found, []
             for name, fam, tokens, op in found:
@@ -2659,7 +2656,9 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 elif fam not in axes:
                     why = "no measured point"
                 elif decoding and not _exchanged(fam):
-                    why = _bracket(*axes[fam], *_rows(line, rows)) if moves else ""
+                    why = (
+                        _bracket(*axes[fam], *_rows(line, shape.seqs)) if moves else ""
+                    )
                 else:
                     why = _bracket(*axes[fam], tokens, tokens)
                 if not why and isinstance(
