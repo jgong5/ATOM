@@ -40,8 +40,10 @@ WALL = 1_700_000_000_000_000_000
 
 def hopped(directory, alone=10, raw=RAW + ".gz") -> None:
     """`directory`'s record with what its server and client leave of each hop:
-    `alone` messages taking the hop's `PLANTED` time, then two in flight at
-    once taking `OVERLAP`; on ``ipc_s`` each received inside a forward, and two
+    `alone` messages taking the hop's `PLANTED` time, then messages in flight
+    at once, each taking at most `OVERLAP`: the second of three, whose one
+    arrival before the next send is the first's, is not alone either. On
+    ``ipc_s`` each is received inside a forward, and two
     more alone: one taking `OVERLAP`, received once the engine left its last,
     and one received before its send call returned. On ``admission_s`` and
     ``stream_s`` the client missed one more request, one the server took in
@@ -64,7 +66,7 @@ def hopped(directory, alone=10, raw=RAW + ".gz") -> None:
         """The hop's sends and arrivals from `t` on, 10 ms apart."""
         out = [(t + k * 10**7, t + k * 10**7 + PLANTED[hop]) for k in range(alone)]
         t += alone * 10**7
-        return out + [(t, t + 1_500), (t + 1_000, t + 3_000)]
+        return out + [(t, t + 1_500), (t + 1_000, t + 3_000), (t + 2_000, t + 3_500)]
 
     t = last + 10**9
     admission = messages("admission_s", t)
@@ -145,7 +147,7 @@ def test_a_hop_the_records_cannot_give_is_left_out_and_listed_unfitted(tmp_path)
         "hops.admission_s": f"{stamps}: no {RAW} beside {a / 'client.json'}",
         "hops.stream_s": f"{stamps}: no {RAW} beside {a / 'client.json'}",
         "hops.ipc_s": f"{stamps}: 14 sends and 0 arrivals",
-        "hops.ipc_out_s": f"{stamps}: 12 rows taken in, not the 0 put",
+        "hops.ipc_out_s": f"{stamps}: 13 rows taken in, not the 0 put",
     }
 
 
