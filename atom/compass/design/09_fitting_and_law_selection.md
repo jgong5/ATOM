@@ -191,7 +191,10 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   vector unfitted; a trace run's decodes and host segments are profiled, so it gives no
   decode or host label, and an ordinary record fits the decode and host laws. A trace run
   under DP refuses. Checked-in laws keep their labels until refitted, and a refit needs a
-  trace run. On Run 4B's TP0 trace the busy time of device-paced forwards sat within 0.6%
+  trace run. A DP law's prefill vector keeps its window labels at a refit, its provenance
+  naming them and the tree it was fitted at, until [#3010](https://github.com/jgong5/ATOM/issues/3010)
+  gives DP ranks a trace run ([Ruling](https://github.com/jgong5/ATOM/issues/2853#issuecomment-6717057158)).
+  On Run 4B's TP0 trace the busy time of device-paced forwards sat within 0.6%
   of the window per target pass and the final's draft at +2.3%, where copy-stream copies
   ran past the window's last event; the capped gaps added none of a host-paced final's
   busy time ([#2072](https://github.com/jgong5/ATOM/issues/2072#issuecomment-6387348851)).

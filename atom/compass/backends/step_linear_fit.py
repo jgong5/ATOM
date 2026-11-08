@@ -750,8 +750,11 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
 
 
 def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
-    """`StepLinearLaw`'s hull over the non-intercept features of the fitted steps."""
-    from scipy.spatial import ConvexHull
+    """`StepLinearLaw`'s hull over the non-intercept features of the fitted steps.
+    qhull's precision checks depend on the order the points come in: where it
+    refuses them, it hulls their distinct points in sorted order, the same hull.
+    A set that spans none still raises."""
+    from scipy.spatial import ConvexHull, QhullError
 
     equal = {
         names[j]: int(points[0, j])
@@ -765,7 +768,11 @@ def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
         facets = [[-1.0, float(lo[0])], [1.0, -float(hi[0])]]
     elif vary:
         # Hulled in the unit box, where qhull's tolerances suit every feature.
-        eq = ConvexHull((x - lo) / (hi - lo)).equations
+        unit = (x - lo) / (hi - lo)
+        try:
+            eq = ConvexHull(unit).equations
+        except QhullError:
+            eq = ConvexHull(np.unique(unit, axis=0)).equations
         normals = eq[:, :-1] / (hi - lo)
         facets = np.column_stack([normals, eq[:, -1] - normals @ lo]).tolist()
     else:
