@@ -71,7 +71,7 @@ def run_file(monkeypatch, tmp_path):
 def rt():
     rt = LPRuntime(
         LpId("frontend"),
-        single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002),
+        single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002),
         _GrantAll(),
     )
     clock.install(rt)
@@ -255,7 +255,7 @@ def test_the_summary_names_each_term_the_run_charged_nothing_for(
     monkeypatch, tmp_path, host, named
 ):
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 0.001,
         "stream_s": 0.002,
         "clock_endpoint": "inproc:unused",

@@ -86,7 +86,7 @@ def test_a_lookahead_that_is_not_positive_is_refused_by_name():
 def _stage(rank, *grants, frames=(), parts=ACKED):
     """Stage `rank` of two, its owner thread and the names its runner was called with."""
     table = single_engine_table(
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=0.5,
         stream_s=0.5,
         pp=2,
@@ -205,7 +205,7 @@ def test_a_stage_waits_for_its_own_ring_and_only_the_last_for_its_device_work():
 
 
 def test_a_bounded_poll_is_essential_while_the_stage_holds_work():
-    table = single_engine_table(admission_path="serving", ipc_s=0.5, stream_s=0.5)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=0.5, stream_s=0.5)
     thread, on_owner = _owner()
     rt = LPRuntime(LpId("engine"), table, FakeConn((0.1, {}), (0.2, {})), owner=thread)
     rt.start_run()

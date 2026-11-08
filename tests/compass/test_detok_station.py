@@ -35,7 +35,7 @@ with stubbed_aiter():
     from atom.model_engine.engine_core_mgr import CoreManager
 
 IPC = 0.001
-TABLE = single_engine_table(admission_path="serving", ipc_s=IPC, stream_s=0.002)
+TABLE = single_engine_table(admission_s=0.54e-3, ipc_s=IPC, stream_s=0.002)
 OUT = "engine->frontend:output#dp0"
 
 
@@ -228,7 +228,7 @@ def test_a_frame_from_before_the_run_decoded_on_an_output_thread_is_a_summary_re
     # waits until the stamped one is handled (`LPRuntime.holds_unstamped`), and
     # its decode can come after the frontend's +inf grant and ask for no time.
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": IPC,
         "stream_s": 0.002,
         "bound_s": 10.0,

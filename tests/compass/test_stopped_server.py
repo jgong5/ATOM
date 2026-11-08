@@ -56,7 +56,7 @@ with stubbed_aiter():
     from atom.model_engine.engine_core_mgr import CoreManager
 
 TREE = Path(__file__).resolve().parents[2]
-TABLE = single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002)
+TABLE = single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002)
 SIGNALS = pytest.mark.parametrize(
     "sig", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"]
 )
@@ -222,7 +222,7 @@ def _serve(tmp_path, script, *argv):
                 {
                     "clock_endpoint": f"tcp://127.0.0.1:{clock_port}",
                     "bound_s": 100.0,
-                    "admission_path": "serving",
+                    "admission_s": 0.54e-3,
                     "ipc_s": 2.0**-10,
                     "stream_s": 2.0**-9,
                     "out_dir": str(tmp_path),
@@ -393,7 +393,7 @@ def test_an_engine_has_the_handler_it_set_aside_at_ready_back_as_it_leaves(
     back once the engine leaves its loop, or its construction if that raises,
     and ATOM's `_send_ready_signal` is its own again."""
     run = {"clock_endpoint": "", "bound_s": 100.0, "out_dir": str(tmp_path)}
-    run |= {"admission_path": "serving", "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
+    run |= {"admission_s": 0.54e-3, "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
     (tmp_path / "run.json").write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     monkeypatch.setattr(compass_run, "_member", None)
@@ -445,7 +445,7 @@ def test_an_engine_stopped_holding_a_read_request_hands_in_no_straggler(
     stop's ``+inf`` one has released it."""
     endpoint, request = f"inproc:{uuid.uuid4().hex}", "frontend->engine:request#dp0"
     run = {"clock_endpoint": endpoint, "bound_s": 100.0, "out_dir": str(tmp_path)}
-    run |= {"admission_path": "serving", "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
+    run |= {"admission_s": 0.54e-3, "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
     (tmp_path / "run.json").write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     monkeypatch.setattr(compass_run, "_member", None)
@@ -500,7 +500,7 @@ def test_an_engine_whose_input_thread_reads_shutdown_first_takes_the_released_re
     takes the request first, then leaves on SHUTDOWN, and the engine hands in."""
     endpoint, request = f"inproc:{uuid.uuid4().hex}", "frontend->engine:request#dp0"
     run = {"clock_endpoint": endpoint, "bound_s": 100.0, "out_dir": str(tmp_path)}
-    run |= {"admission_path": "serving", "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
+    run |= {"admission_s": 0.54e-3, "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
     (tmp_path / "run.json").write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     monkeypatch.setattr(compass_run, "_member", None)

@@ -67,9 +67,10 @@ member, the frontend's included, connects to.
   step table and the run summary at once, each LP's clock as it stands, from
   what has been handed in.
 
-Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
-``ipc_s``, ``stream_s``, ``ipc_out_s`` (optional, the engine output channels'
-lookahead, ``ipc_s`` when absent), one of ``step_stub`` (a `Coefficients` mapping,
+Run file keys: ``clock_endpoint``, ``bound_s`` (finite), the hops `HOPS` (each
+optional, the lookahead of the channels it names, `HOP_FLOOR_S` where absent,
+which the run summary names under ``unmeasured_hops``), one of ``step_stub`` (a
+`Coefficients` mapping,
 priced by `StepStubBackend`), ``step_linear`` (a `StepLinearLaw` mapping,
 priced by `StepLinearBackend`; its ``machine_spec`` digest and
 its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
@@ -123,8 +124,8 @@ token counts outside which a decode is refused and charged 0 s; ``http_intake``,
 ``[lo, hi]`` body bytes it was fitted over, outside which an intake is refused
 and charged 0 s; a term an entry lacks, or every term with no entry, is
 charged 0 s and the run summary names it, a kind of tokenizer call as
-``tokenizer.<kind>``, under ``uncharged_host_terms``; a
-list of them as ``step_linear``'s),
+``tokenizer.<kind>``, under ``uncharged_host_terms``; ``hops``, the
+`HOPS` `runfile` writes to the run file; a list of them as ``step_linear``'s),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
 ``decode/``, ``prefill<k>/`` and ``decode<k>/`` above one of a side, and for a
@@ -164,8 +165,9 @@ channel table from the run file alone. Each DP rank's engine process hands in
 its own refusals, as ``<lp>.<member>``. A key `RENAMED_KEYS` lists refuses,
 naming its name now.
 
-A run file that also has ``router_s`` and ``kv_write_req_s`` describes a
-prefill-decode run over `prefill_decode_table`, and ``kv_link`` (``intra_node``
+A run file that also has ``router_s`` describes a prefill-decode run over
+`prefill_decode_table`: its hops are prefill's, its ``decode_hops`` decode's
+``ipc_s``, ``ipc_out_s`` and ``stream_s``, and ``kv_link`` (``intra_node``
 or ``inter_node``) names the link its KV transfers are priced on. An optional
 ``router_in_s`` makes the router the ``router`` LP, with that lookahead on each
 hop into it; it prices no work, so it is no server LP and hands nothing in.
@@ -324,11 +326,20 @@ HAND_IN_WAIT_S = 300.0
 PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
-SUMMARY_SCHEMA_VERSION = 13
+SUMMARY_SCHEMA_VERSION = 14
 #: The terms of a ``host`` entry the frontend charges, each 0 s where it is absent.
 HOST_TERMS = ("http_intake", "tokenizer")
 #: The kinds of call a ``tokenizer`` term prices, each 0 s where it is absent.
 TOKENIZER_KINDS = ("encode", "encode_batch", "decode")
+#: A ``host`` entry's ``hops``, each optional and the run-file key of its name:
+#: the lookaheads of the traffic's request, an engine's ZMQ message in, its
+#: output, the stream back and a prefill-decode run's write request. Such a run
+#: states its decode side's under `DECODE_HOPS`.
+HOPS = ("admission_s", "ipc_s", "ipc_out_s", "stream_s", "kv_write_req_s")
+DECODE_HOPS = "decode_hops"
+#: A hop's lookahead where the run file states none: not 0 s, which puts a
+#: serving run on deadlock recovery.
+HOP_FLOOR_S = 2.0**-14
 #: Compass source the host-law key leaves out, by path under the package: all
 #: of it (None), or the top-level names (def, class or assigned) only a simulated
 #: run reaches, with the comments above each and the module docstring.
@@ -455,7 +466,7 @@ def _check_host(path, host: dict) -> None:
 
     laws = host.get("laws", {})
     if (
-        set(host) - {"laws", "skip", "key", "admit", *HOST_TERMS}
+        set(host) - {"laws", "skip", "key", "admit", "hops", *HOST_TERMS}
         or set(host.get("skip", ())) - set(SEGMENTS)
         or set(laws) - set(FORWARD_KINDS)
         or {s for v in laws.values() for s in v} - set(SEGMENTS)
@@ -466,8 +477,14 @@ def _check_host(path, host: dict) -> None:
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
             "admit, three coefficients on a forward's admissions or null, "
-            "key, the host key the laws were fitted under, and the terms "
+            "key, the host key the laws were fitted under, hops, and the terms "
             f"{' and '.join(HOST_TERMS)}"
+        )
+    hops = host.get("hops", {})
+    if not (_seconds(hops, set(), set(HOPS)) and all(v > 0 for v in hops.values())):
+        raise ValueError(
+            f"{path}: host's hops is {hops!r}; it takes {', '.join(HOPS)}, each "
+            "optional and a positive number of seconds"
         )
     tok, intake = host.get("tokenizer"), host.get("http_intake")
     if tok is not None and not (
@@ -554,7 +571,7 @@ def worker_order(run: dict) -> dict:
 
 def _widths(run: dict) -> int | tuple[int, int]:
     """The run's DP width, or a prefill-decode run's (prefill, decode) widths."""
-    if "kv_write_req_s" in run:
+    if "router_s" in run:
         return _dp(run, "P"), _dp(run, "D")
     if named := [k for k in DP_WIDTHS.values() if k in run]:
         raise ValueError(
@@ -568,7 +585,7 @@ def _pp(run: dict, side: str | None = None) -> int:
     """The pipeline width of `side`'s deployments, ``P`` or ``D``, else the
     run's. A prefill-decode run states its prefill side's as `PREFILL_PP`, and
     its decode side runs one stage."""
-    pd = "kv_write_req_s" in run
+    pd = "router_s" in run
     if (named := "pipeline_parallel_size" if pd else PREFILL_PP) in run:
         raise ValueError(
             f"the run file names {named}: a prefill-decode run states its prefill "
@@ -588,11 +605,11 @@ def channel_table(run: dict):
             "ATOM's lmcache_mp does not run under PP"
         )
     if "lmcache" in run:
-        pd = "kv_write_req_s" in run
+        pd = "router_s" in run
         add_lmcache(
             table,
             "engine-P" if pd else ENGINE.name,
-            run.get("lmcache_ipc_s", run["ipc_s"]),
+            run.get("lmcache_ipc_s", hop(run, "ipc_s")),
             _dp(run, "P" if pd else None),
             run["lmcache"].get("writers", 1),
         )
@@ -600,18 +617,19 @@ def channel_table(run: dict):
 
 
 def _engines_table(run: dict):
-    common = {k: run[k] for k in ("admission_path", "ipc_s", "stream_s")}
-    common["ipc_out_s"] = run.get("ipc_out_s")
+    common = {k: hop(run, k) for k in HOPS[:3]}
     pp, links = _pp(run, "P"), ()
     if pp > 1:
         from atom.compass.runner.pp_send import carrier_models, lookaheads
 
         links = lookaheads(carrier_models(_machine(run)))
-    if "kv_write_req_s" in run:
+    if "router_s" in run:
         return prefill_decode_table(
             **common,
+            stream_s=hop(run, f"{DECODE_HOPS}.stream_s"),
+            decode_ipc=tuple(hop(run, f"{DECODE_HOPS}.{k}") for k in HOPS[1:3]),
             router_s=run["router_s"],
-            kv_write_req_s=run["kv_write_req_s"],
+            kv_write_req_s=hop(run, "kv_write_req_s"),
             dp=_widths(run),
             router_in_s=run.get("router_in_s"),
             prefill=run.get(INSTANCES["P"], 1),
@@ -621,11 +639,31 @@ def _engines_table(run: dict):
         )
     return single_engine_table(
         **common,
+        stream_s=hop(run, "stream_s"),
         dp=_widths(run),
         pp=pp,
         pp_links=links,
         rapidserve=run.get(RAPIDSERVE, False),
     )
+
+
+def hops(run: dict) -> dict:
+    """Each hop `run`'s channel table reads, by name: a prefill-decode run's
+    prefill side's, and its decode side's ``ipc_s``, ``ipc_out_s`` and
+    ``stream_s`` as ``decode_hops.<name>``; the run file's value, None where it
+    states none."""
+    if "router_s" not in run:
+        return {k: run.get(k) for k in HOPS[:4]}
+    decode = run.get(DECODE_HOPS, {})
+    return {k: run.get(k) for k in HOPS if k != "stream_s"} | {
+        f"{DECODE_HOPS}.{k}": decode.get(k) for k in HOPS[1:4]
+    }
+
+
+def hop(run: dict, name: str) -> float:
+    """The hop `name` of `hops`, `HOP_FLOOR_S` where the run file states none."""
+    value = hops(run)[name]
+    return HOP_FLOOR_S if value is None else value
 
 
 def _machine(run: dict):
@@ -2718,6 +2756,7 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
             if k not in h.get("tokenizer", {k: None})
         }
     )
+    summary["unmeasured_hops"] = sorted(k for k, v in hops(run).items() if v is None)
     summary["schema_version"] = SUMMARY_SCHEMA_VERSION
     summary["source_root"] = a.source_root.as_json()
     if "router" in run:

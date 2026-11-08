@@ -213,7 +213,7 @@ def _run_file(out: Path, **overrides) -> Path:
     run = {
         "clock_endpoint": f"inproc:{uuid.uuid4().hex}",
         "bound_s": 600.0,
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 2.0**-14,
         "stream_s": 2.0**-12,
         "step_stub": dataclasses.asdict(Coefficients()),

@@ -101,9 +101,7 @@ def test_a_release_wakes_only_the_pollers_waiting_on_its_channel(ctx):
     """A frontend's output threads, one per DP rank: a release on one rank's
     channel sets no other rank's wakeup, and one no poller registered, as
     lmcache's polling thread adds, is set by every release."""
-    table = single_engine_table(
-        admission_path="serving", ipc_s=IPC, stream_s=0.002, dp=2
-    )
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=IPC, stream_s=0.002, dp=2)
     outs = ("engine->frontend:output#dp0", "engine->frontend:output#dp1")
     grants = (0.2, {outs[0]: [(0, 0.1)]}), (0.4, {outs[1]: [(0, 0.3)]})
     rt, call = _rt(FRONTEND, *grants, table=table)
@@ -472,7 +470,7 @@ KV = "engine-D->engine-P:kv_write_req"
 
 def _pd_table():
     return prefill_decode_table(
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=IPC,
         stream_s=0.002,
         router_s=0.001,

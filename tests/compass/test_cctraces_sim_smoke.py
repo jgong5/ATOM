@@ -69,7 +69,7 @@ def _template(path: Path, **extra) -> Path:
     machine = copy.deepcopy(DOCUMENT)
     run = {
         "bound_s": 1e7,
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 2.0**-14,
         "stream_s": 2.0**-12,
         "step_stub": dataclasses.asdict(Coefficients()),
