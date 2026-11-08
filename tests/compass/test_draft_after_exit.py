@@ -99,7 +99,8 @@ def test_a_simulated_runner_starts_each_draft_no_earlier_than_its_exit(
 
 def test_under_sync_a_draft_starts_no_earlier_than_its_launch_s_end():
     """The exit waits for the device's end, so the draft runs from the
-    launch's end, 2 ms, to 4 ms, and the host leaves 4 ms after that."""
+    launch's end, 2 ms, not the target's, 1.5 ms, to 4 ms, and the host leaves
+    4 ms after that."""
     batch = SimpleNamespace(
         total_seqs_num_prefill=1,
         total_tokens_num=8,
@@ -107,7 +108,7 @@ def test_under_sync_a_draft_starts_no_earlier_than_its_launch_s_end():
         produces_output=lambda: True,
     )
     host = HostDeviceRecurrence({"prefill": _host(4)}, (), lambda: 0.0, sync=True)
-    assert host.charge(batch, 1e-3, 2e-3) == pytest.approx(8e-3)
+    assert host.charge(batch, 0.5e-3, 2e-3) == pytest.approx(8e-3)
     assert host.ends[-1] == pytest.approx(4e-3)
 
 
