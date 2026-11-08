@@ -162,6 +162,18 @@
    "mechanism_why": "an RPC to the engine's own workers, which share the engine's LP, made before the step loop's first clock request, while the LP's clock stands at its start"
   },
   {
+   "id": "atom/compass/run/__init__.py::_stamp_intake.submitted::submit(self, fn, *args, **kwargs)::executor_handoff#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "_stamp_intake.submitted",
+   "call": "submit",
+   "expr": "submit(self, fn, *args, **kwargs)",
+   "shape": "executor_handoff",
+   "peer": "thread",
+   "why": "a recorded real server's thread pool submit, which stamps the loop's CPU clock at the tokenizer pool job's submit and hands the job on as it was given",
+   "mechanism": "K9",
+   "mechanism_why": "installed only by a real run recording its steps (_record_host); a simulated run never installs it, and its pool jobs go through SimExecutor"
+  },
+  {
    "id": "atom/compass/run/__init__.py::engine_loop::ask.join(10.0)::join#0",
    "file": "atom/compass/run/__init__.py",
    "symbol": "engine_loop",

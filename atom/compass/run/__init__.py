@@ -37,11 +37,14 @@ member, the frontend's included, connects to.
 - `runner(runner, tree)` installs the cost backend and the device readings on a
   `CompassModelRunner` where it would build its model, in the worker process.
 - `tokenizer(tokenizer, config)` charges the served tokenizer's ``encode`` and
-  ``decode`` to the frontend's clock, at the rates the machine spec measured.
-  A machine spec that refuses the tokenizer stops the run as a signal would,
-  so the engines leave and the server exits on the refusal.
+  ``decode`` to the frontend's clock, at the rates of its ``host`` entry's
+  ``tokenizer`` term. A term that refuses the tokenizer stops the run as a
+  signal would, so the engines leave and the server exits on the refusal.
+  On a real run recording its steps it records each such call, and stamps
+  each HTTP request's intake, beside the step record instead.
 - `http_intake()` is what `atom.utils.compass_loop.HttpChannel` charges the
-  frontend's event loop for each request it takes in.
+  frontend's event loop for each request it takes in, from the ``host``
+  entry's ``http_intake`` term.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
   finish, each handing in its LP's refusals; the frontend's, when it co-hosts
   the authority, then writes the step table and the run summary. A SIGINT or
@@ -64,9 +67,10 @@ member, the frontend's included, connects to.
   step table and the run summary at once, each LP's clock as it stands, from
   what has been handed in.
 
-Run file keys: ``clock_endpoint``, ``bound_s`` (finite), ``admission_path``,
-``ipc_s``, ``stream_s``, ``ipc_out_s`` (optional, the engine output channels'
-lookahead, ``ipc_s`` when absent), one of ``step_stub`` (a `Coefficients` mapping,
+Run file keys: ``clock_endpoint``, ``bound_s`` (finite), the hops `HOPS` (each
+optional, the lookahead of the channels it names, `HOP_FLOOR_S` where absent,
+which the run summary names under ``unmeasured_hops``), one of ``step_stub`` (a
+`Coefficients` mapping,
 priced by `StepStubBackend`), ``step_linear`` (a `StepLinearLaw` mapping,
 priced by `StepLinearBackend`; its ``machine_spec`` digest and
 its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
@@ -109,8 +113,19 @@ fitted under and the ``machine_spec`` digest of the spec of the platform they
 were fitted on, which a run with laws must match; ``admit``, coefficients on
 a forward's admissions, which add to its ``E``, or null to refuse a forward
 that admits a request, and absent from an entry whose ``E`` laws hold them;
-``skip``, segments zeroed for a what-if run, which the graders refuse; a list
-of them as ``step_linear``'s),
+``skip``, segments zeroed for a what-if run, which the graders refuse;
+``tokenizer``, the served tokenizer's ``backend`` (``fast`` or ``slow``), the
+``fingerprint`` of the ``tokenizer.json`` it was fitted on, and, each
+optional, ``encode``, one-item calls, ``encode_batch``, a backend
+``encode_batch`` of several items, and ``decode``, each ``fixed_s`` and a
+positive ``tokens_per_s``, and a ``decode`` in their place ``fixed_s`` alone over ``tokens``, the ``[lo, hi]``
+token counts outside which a decode is refused and charged 0 s; ``http_intake``,
+``fixed_s`` and ``per_byte_s``, with ``idle_s`` optional and ``bytes``, the
+``[lo, hi]`` body bytes it was fitted over, outside which an intake is refused
+and charged 0 s; a term an entry lacks, or every term with no entry, is
+charged 0 s and the run summary names it, a kind of tokenizer call as
+``tokenizer.<kind>``, under ``uncharged_host_terms``; ``hops``, the
+`HOPS` `runfile` writes to the run file; a list of them as ``step_linear``'s),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
 ``decode/``, ``prefill<k>/`` and ``decode<k>/`` above one of a side, and for a
@@ -150,8 +165,9 @@ channel table from the run file alone. Each DP rank's engine process hands in
 its own refusals, as ``<lp>.<member>``. A key `RENAMED_KEYS` lists refuses,
 naming its name now.
 
-A run file that also has ``router_s`` and ``kv_write_req_s`` describes a
-prefill-decode run over `prefill_decode_table`, and ``kv_link`` (``intra_node``
+A run file that also has ``router_s`` describes a prefill-decode run over
+`prefill_decode_table`: its hops are prefill's, its ``decode_hops`` decode's
+``ipc_s``, ``ipc_out_s`` and ``stream_s``, and ``kv_link`` (``intra_node``
 or ``inter_node``) names the link its KV transfers are priced on. An optional
 ``router_in_s`` makes the router the ``router`` LP, with that lookahead on each
 hop into it; it prices no work, so it is no server LP and hands nothing in.
@@ -231,6 +247,7 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 from collections import Counter
 from pathlib import Path
 
@@ -309,7 +326,20 @@ HAND_IN_WAIT_S = 300.0
 PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
-SUMMARY_SCHEMA_VERSION = 12
+SUMMARY_SCHEMA_VERSION = 14
+#: The terms of a ``host`` entry the frontend charges, each 0 s where it is absent.
+HOST_TERMS = ("http_intake", "tokenizer")
+#: The kinds of call a ``tokenizer`` term prices, each 0 s where it is absent.
+TOKENIZER_KINDS = ("encode", "encode_batch", "decode")
+#: A ``host`` entry's ``hops``, each optional and the run-file key of its name:
+#: the lookaheads of the traffic's request, an engine's ZMQ message in, its
+#: output, the stream back and a prefill-decode run's write request. Such a run
+#: states its decode side's under `DECODE_HOPS`.
+HOPS = ("admission_s", "ipc_s", "ipc_out_s", "stream_s", "kv_write_req_s")
+DECODE_HOPS = "decode_hops"
+#: A hop's lookahead where the run file states none: not 0 s, which puts a
+#: serving run on deadlock recovery.
+HOP_FLOOR_S = 2.0**-14
 #: Compass source the host-law key leaves out, by path under the package: all
 #: of it (None), or the top-level names (def, class or assigned) only a simulated
 #: run reaches, with the comments above each and the module docstring.
@@ -393,6 +423,11 @@ _early_end: threading.Thread | None = None
 _member: str | None = None
 #: The SIGTERM handler this engine process set aside as it said READY.
 _sigterm_at_ready: list = []
+#: The files a recorded real run's frontend writes beside its step record:
+#: each served tokenizer call, and each HTTP request's intake stamps.
+TOKENIZER_RECORD, INTAKE_RECORD = "tokenizer.jsonl", "intake.stamps"
+#: This server's ``host`` entry among several, which `tokenizer` resolves.
+_frontend_host: dict | None = None
 
 
 def spec() -> dict | None:
@@ -425,12 +460,13 @@ def spec() -> dict | None:
 
 
 def _check_host(path, host: dict) -> None:
-    """Refuse a ``host`` entry the runner would read as zero host time."""
+    """Refuse a ``host`` entry the runner would read as zero host time, or
+    whose ``tokenizer`` or ``http_intake`` term the frontend would misread."""
     from atom.compass.runner.overrides import ADMISSION_IN_E, FORWARD_KINDS, SEGMENTS
 
     laws = host.get("laws", {})
     if (
-        set(host) - {"laws", "skip", "key", "admit"}
+        set(host) - {"laws", "skip", "key", "admit", "hops", *HOST_TERMS}
         or set(host.get("skip", ())) - set(SEGMENTS)
         or set(laws) - set(FORWARD_KINDS)
         or {s for v in laws.values() for s in v} - set(SEGMENTS)
@@ -440,9 +476,75 @@ def _check_host(path, host: dict) -> None:
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
-            "admit, three coefficients on a forward's admissions or null, and "
-            "key, the host key the laws were fitted under"
+            "admit, three coefficients on a forward's admissions or null, "
+            "key, the host key the laws were fitted under, hops, and the terms "
+            f"{' and '.join(HOST_TERMS)}"
         )
+    hops = host.get("hops", {})
+    if not (_seconds(hops, set(), set(HOPS)) and all(v > 0 for v in hops.values())):
+        raise ValueError(
+            f"{path}: host's hops is {hops!r}; it takes {', '.join(HOPS)}, each "
+            "optional and a positive number of seconds"
+        )
+    tok, intake = host.get("tokenizer"), host.get("http_intake")
+    if tok is not None and not (
+        isinstance(tok, dict)
+        and {"backend", "fingerprint"}
+        <= tok.keys()
+        <= {"backend", "fingerprint", *TOKENIZER_KINDS}
+        and tok["backend"] in ("fast", "slow")
+        and isinstance(tok["fingerprint"], str)
+        and all(_rate(tok[k], k) for k in TOKENIZER_KINDS if k in tok)
+    ):
+        raise ValueError(
+            f"{path}: host's tokenizer is {tok!r}; it takes backend, fast or slow, "
+            "fingerprint, the tokenizer.json it was fitted on, and, each "
+            "optional, encode, encode_batch and decode, each fixed_s and a "
+            "positive tokens_per_s, a decode fixed_s and tokens, [lo, hi], in "
+            "their place"
+        )
+    hull = intake.get("bytes", [0, 0]) if isinstance(intake, dict) else None
+    if intake is not None and not (
+        _seconds(
+            {k: v for k, v in intake.items() if k != "bytes"},
+            {"fixed_s", "per_byte_s"},
+            {"idle_s"},
+        )
+        and isinstance(hull, list)
+        and _seconds(dict(enumerate(hull)), {0, 1})
+        and hull[0] <= hull[1]
+    ):
+        raise ValueError(
+            f"{path}: host's http_intake is {intake!r}; it takes fixed_s and "
+            "per_byte_s, and idle_s optional, each a non-negative number, and "
+            "bytes optional, the body bytes it was fitted over, [lo, hi]"
+        )
+
+
+def _rate(term, kind: str) -> bool:
+    """Whether `term` is a valid ``tokenizer`` term's `kind` (`_check_host`)."""
+    if kind == "decode" and isinstance(term, dict) and "tokens" in term:
+        hull = term["tokens"]
+        return (
+            _seconds({k: v for k, v in term.items() if k != "tokens"}, {"fixed_s"})
+            and isinstance(hull, list)
+            and _seconds(dict(enumerate(hull)), {0, 1})
+            and hull[0] <= hull[1]
+        )
+    return _seconds(term, {"fixed_s", "tokens_per_s"}) and term["tokens_per_s"] > 0
+
+
+def _seconds(term, required: set, optional: set = frozenset()) -> bool:
+    """Whether `term` is a mapping of the `required` fields and any `optional`
+    ones, each a finite non-negative number."""
+    return (
+        isinstance(term, dict)
+        and required <= term.keys() <= required | optional
+        and all(
+            type(v) in (int, float) and math.isfinite(v) and v >= 0
+            for v in term.values()
+        )
+    )
 
 
 def _dp(run: dict, side: str | None = None) -> int:
@@ -469,7 +571,7 @@ def worker_order(run: dict) -> dict:
 
 def _widths(run: dict) -> int | tuple[int, int]:
     """The run's DP width, or a prefill-decode run's (prefill, decode) widths."""
-    if "kv_write_req_s" in run:
+    if "router_s" in run:
         return _dp(run, "P"), _dp(run, "D")
     if named := [k for k in DP_WIDTHS.values() if k in run]:
         raise ValueError(
@@ -483,7 +585,7 @@ def _pp(run: dict, side: str | None = None) -> int:
     """The pipeline width of `side`'s deployments, ``P`` or ``D``, else the
     run's. A prefill-decode run states its prefill side's as `PREFILL_PP`, and
     its decode side runs one stage."""
-    pd = "kv_write_req_s" in run
+    pd = "router_s" in run
     if (named := "pipeline_parallel_size" if pd else PREFILL_PP) in run:
         raise ValueError(
             f"the run file names {named}: a prefill-decode run states its prefill "
@@ -503,11 +605,11 @@ def channel_table(run: dict):
             "ATOM's lmcache_mp does not run under PP"
         )
     if "lmcache" in run:
-        pd = "kv_write_req_s" in run
+        pd = "router_s" in run
         add_lmcache(
             table,
             "engine-P" if pd else ENGINE.name,
-            run.get("lmcache_ipc_s", run["ipc_s"]),
+            run.get("lmcache_ipc_s", hop(run, "ipc_s")),
             _dp(run, "P" if pd else None),
             run["lmcache"].get("writers", 1),
         )
@@ -515,18 +617,19 @@ def channel_table(run: dict):
 
 
 def _engines_table(run: dict):
-    common = {k: run[k] for k in ("admission_path", "ipc_s", "stream_s")}
-    common["ipc_out_s"] = run.get("ipc_out_s")
+    common = {k: hop(run, k) for k in HOPS[:3]}
     pp, links = _pp(run, "P"), ()
     if pp > 1:
         from atom.compass.runner.pp_send import carrier_models, lookaheads
 
         links = lookaheads(carrier_models(_machine(run)))
-    if "kv_write_req_s" in run:
+    if "router_s" in run:
         return prefill_decode_table(
             **common,
+            stream_s=hop(run, f"{DECODE_HOPS}.stream_s"),
+            decode_ipc=tuple(hop(run, f"{DECODE_HOPS}.{k}") for k in HOPS[1:3]),
             router_s=run["router_s"],
-            kv_write_req_s=run["kv_write_req_s"],
+            kv_write_req_s=hop(run, "kv_write_req_s"),
             dp=_widths(run),
             router_in_s=run.get("router_in_s"),
             prefill=run.get(INSTANCES["P"], 1),
@@ -536,11 +639,31 @@ def _engines_table(run: dict):
         )
     return single_engine_table(
         **common,
+        stream_s=hop(run, "stream_s"),
         dp=_widths(run),
         pp=pp,
         pp_links=links,
         rapidserve=run.get(RAPIDSERVE, False),
     )
+
+
+def hops(run: dict) -> dict:
+    """Each hop `run`'s channel table reads, by name: a prefill-decode run's
+    prefill side's, and its decode side's ``ipc_s``, ``ipc_out_s`` and
+    ``stream_s`` as ``decode_hops.<name>``; the run file's value, None where it
+    states none."""
+    if "router_s" not in run:
+        return {k: run.get(k) for k in HOPS[:4]}
+    decode = run.get(DECODE_HOPS, {})
+    return {k: run.get(k) for k in HOPS if k != "stream_s"} | {
+        f"{DECODE_HOPS}.{k}": decode.get(k) for k in HOPS[1:4]
+    }
+
+
+def hop(run: dict, name: str) -> float:
+    """The hop `name` of `hops`, `HOP_FLOOR_S` where the run file states none."""
+    value = hops(run)[name]
+    return HOP_FLOOR_S if value is None else value
 
 
 def _machine(run: dict):
@@ -1891,34 +2014,254 @@ def _graph_pool(model_runner, machine, model):
 
 def tokenizer(tok, config) -> None:
     """Wrap `tok`'s ``encode`` and ``decode``, and its Rust backend's
-    ``encode_batch``, with the machine spec's entry for the model's architecture
-    and the backend that loaded; the entry warns when the loaded
-    ``tokenizer.json`` is not the one it was measured on. A refused entry
-    ends the run before the server serves (`_end_before_serving`)."""
+    ``encode_batch``, with the ``tokenizer`` term of this server's ``host``
+    entry, its engine config's among several: a term fitted on another backend
+    is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
+    ends the run before the server serves (`_end_before_serving`). With no
+    term, `tok` is left as it is, charging 0 s.
+
+    On a real run recording its steps (`parity.ENV`), it records instead
+    (`_record_host`); with neither, `tok` is left as it is."""
+    global _frontend_host
     run = spec()
     if run is None:
+        from atom.compass import parity
+
+        if record := os.environ.get(parity.ENV):
+            _record_host(tok, Path(record))
         return
     from tokenizers import Tokenizer
 
-    from atom.compass.spec import Backend
+    from atom.compass.spec.rules import FingerprintMismatch
     from atom.utils.compass_loop import wrap_decode, wrap_encode, wrap_encode_batch
 
     try:
-        entry = _machine(run).tokenizer_for(
-            config.hf_config.architectures[0],
-            Backend.FAST if tok.is_fast else Backend.SLOW,
-            _fingerprint(tok),
-        )
+        host = run.get("host", {})
+        if isinstance(host, list):
+            from atom.compass.run.step_grid import keyed
+
+            host = _frontend_host = _fitted_here(
+                host, keyed(config), lambda e: e.get("key", {}).get("engine"), "host"
+            )
+        term = host.get("tokenizer")
+        if term is None:
+            return
+        backend = "fast" if tok.is_fast else "slow"
+        if term["backend"] != backend:
+            raise ValueError(
+                f"the host laws' tokenizer was fitted on the {term['backend']} "
+                f"backend and the server loaded the {backend} one, which runs an "
+                "order of magnitude apart on one tokenizer.json"
+            )
     except BaseException as e:
         _end_before_serving(run, e)
         raise
-    tok.encode = wrap_encode(tok.encode, entry)
-    tok.decode = wrap_decode(tok.decode, entry)
+    if (loaded := _fingerprint(tok)) not in (None, term["fingerprint"]):
+        warnings.warn(
+            f"the host laws' tokenizer was fitted on {term['fingerprint']}, but "
+            f"the tokenizer.json now loaded hashes to {loaded}",
+            FingerprintMismatch,
+            stacklevel=2,
+        )
+    tok.encode = wrap_encode(tok.encode, term.get("encode"))
+    tok.decode = wrap_decode(tok.decode, term.get("decode"))
     # ATOM's segment tokenizer, which only a Rust backend gets, encodes a long
     # prompt's uncached segments with its ``encode_batch``, not ``encode``.
-    backend = getattr(tok, "_tokenizer", None)
-    if isinstance(backend, Tokenizer):
-        backend.encode_batch = wrap_encode_batch(backend.encode_batch, entry)
+    rust = getattr(tok, "_tokenizer", None)
+    if isinstance(rust, Tokenizer):
+        rust.encode_batch = wrap_encode_batch(
+            rust.encode_batch, term.get("encode"), term.get("encode_batch")
+        )
+
+
+def _record_host(tok, record: Path) -> None:
+    """Record, beside the step record in `record`, each call of `tok`'s
+    ``encode`` and ``decode`` and its Rust backend's ``encode_batch`` into
+    `TOKENIZER_RECORD`, after a first line naming `tok`'s ``backend`` and the
+    ``fingerprint`` of its ``tokenizer.json``; and stamp each HTTP request's
+    intake into `INTAKE_RECORD` (`_stamp_intake`)."""
+    from tokenizers import Tokenizer
+
+    record.mkdir(parents=True, exist_ok=True)
+    calls = _LineFile(record / TOKENIZER_RECORD)
+    backend = "fast" if tok.is_fast else "slow"
+    calls.write(
+        json.dumps({"backend": backend, "fingerprint": _fingerprint(tok)}) + "\n"
+    )
+    tok.encode = _recorded(tok.encode, "encode", calls, lambda _, ids: (len(ids), 1))
+    tok.decode = _recorded(tok.decode, "decode", calls, lambda a, _: (len(a[0]), 1))
+    rust = getattr(tok, "_tokenizer", None)
+    if isinstance(rust, Tokenizer):
+        rust.encode_batch = _recorded(
+            rust.encode_batch,
+            "encode_batch",
+            calls,
+            lambda _, got: (sum(len(e.ids) for e in got), len(got)),
+        )
+    _stamp_intake(_LineFile(record / INTAKE_RECORD))
+
+
+class _LineFile:
+    """A file of lines, each written whole and flushed as it is written, from
+    any thread."""
+
+    def __init__(self, path) -> None:
+        self.file = open(path, "w", buffering=1)  # noqa: SIM115
+        self.lock = threading.Lock()
+
+    def write(self, line: str) -> None:
+        with self.lock:
+            self.file.write(line)
+
+
+#: Whether this thread is inside a `_recorded` ``encode`` call.
+_in_encode = threading.local()
+
+
+def _recorded(call, kind: str, out: _LineFile, count):
+    """`call`, writing to `out` per call a JSON line of `kind`, its ``tokens``
+    and ``items`` as `count(args, result)` gives them, its ``thread`` id and its
+    start and end on the monotonic clock in ns; a call made inside a recorded
+    ``encode`` call is that call's, as `compass_loop.wrap_encode_batch` charges
+    it."""
+
+    def timed(*args, **kwargs):
+        if getattr(_in_encode, "on", False):
+            return call(*args, **kwargs)
+        _in_encode.on = kind == "encode"
+        start = time.monotonic_ns()
+        try:
+            got = call(*args, **kwargs)
+        finally:
+            _in_encode.on = False
+        end = time.monotonic_ns()
+        tokens, items = count(args, got)
+        out.write(
+            f'{{"call": "{kind}", "tokens": {tokens}, "items": {items}, '
+            f'"thread": {threading.get_ident()}, '
+            f'"t_start_ns": {start}, "t_end_ns": {end}}}\n'
+        )
+        return got
+
+    return timed
+
+
+def _stamp_intake(out: _LineFile) -> None:
+    """Stamp each HTTP request's intake into `out` as
+    ``scripts/compass/http_intake.py serve`` does, one line
+    ``<end ns> <thread id> <kind> <start ns> <size> <end cpu ns> <start cpu ns>``
+    each, on the monotonic clock and the stamping thread's CPU clock: ``app``,
+    the request handed to the ASGI app, size 0; ``body``, its body first read,
+    size its bytes; ``tmpl``, a chat template rendered, size its characters;
+    ``prep``, a tokenizer pool job, and ``send``, a request handed to the
+    engine, size 0; on the loop from an await's start to the coroutine's
+    resume, size 0, ``recv``, each receive of the body's first read, and
+    ``wait``, the API server's tokenizer pool job, from its submit. Patches the
+    classes, and every loaded module's binding of ``apply_chat_template``, for
+    the rest of the process."""
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+
+    from atom.entrypoints.openai import chat_encoders
+    from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+    from atom.model_engine.llm_engine import InputOutputProcessor
+
+    def stamp(kind: str, start: int, size: int, cpu: int) -> None:
+        out.write(
+            f"{time.monotonic_ns()} {threading.get_ident()} {kind} {start} {size} "
+            f"{time.thread_time_ns()} {cpu}\n"
+        )
+
+    def timed(call, kind: str, size=lambda got: 0):
+        def timed(*args, **kwargs):
+            start, cpu = time.monotonic_ns(), time.thread_time_ns()
+            got = call(*args, **kwargs)
+            stamp(kind, start, size(got), cpu)
+            return got
+
+        return timed
+
+    read, handle = Request.body, Starlette.__call__
+
+    def waited(receive):
+        async def received():
+            start, cpu = time.monotonic_ns(), time.thread_time_ns()
+            try:
+                return await receive()
+            finally:
+                stamp("recv", start, 0, cpu)
+
+        return received
+
+    async def body(self):
+        cached, receive = hasattr(self, "_body"), self._receive
+        start, cpu = time.monotonic_ns(), time.thread_time_ns()
+        if not cached:
+            self._receive = waited(receive)
+        try:
+            got = await read(self)
+        finally:
+            self._receive = receive
+        if not cached:
+            stamp("body", start, len(got), cpu)
+        return got
+
+    async def app(self, scope, receive, send):
+        if scope["type"] == "http":
+            stamp("app", time.monotonic_ns(), 0, time.thread_time_ns())
+        await handle(self, scope, receive, send)
+
+    Request.body, Starlette.__call__ = body, app
+    # The API server imports the function by name, so each binding is replaced.
+    render = chat_encoders.apply_chat_template
+    rendered = timed(render, "tmpl", len)
+    for module in list(sys.modules.values()):
+        if getattr(module, "__dict__", {}).get("apply_chat_template") is render:
+            module.apply_chat_template = rendered
+    fanout = InputOutputProcessor.preprocess_fanout
+    InputOutputProcessor.preprocess_fanout = timed(fanout, "prep")
+
+    def sent(add):
+        def add_request(*args, **kwargs):
+            # `parity.carry_response_ids`, installed beneath this as the engine
+            # was built, reads the API server's `request_id` off its caller's
+            # frame, which is now this one.
+            request_id = sys._getframe(1).f_locals.get("request_id")  # noqa: F841
+            start, cpu = time.monotonic_ns(), time.thread_time_ns()
+            got = add(*args, **kwargs)
+            stamp("send", start, 0, cpu)
+            return got
+
+        return add_request
+
+    for cls in (CoreManager, DisaggCoreManager):
+        cls.add_request = sent(cls.add_request)
+
+    class Resumed(asyncio.Future):
+        def __await__(self):
+            try:
+                return (yield from super().__await__())
+            finally:
+                stamp("wait", *self.since)
+
+    submit = ThreadPoolExecutor.submit
+
+    def submitted(self, fn, /, *args, **kwargs):
+        since = time.monotonic_ns(), 0, time.thread_time_ns()
+        job = submit(self, fn, *args, **kwargs)
+        if getattr(fn, "__name__", None) != "do_preprocess":
+            return job
+        # The loop hands the API server's `do_preprocess` to its executor, and
+        # wraps a returned future of its own loop's as it is.
+        resumed = Resumed(loop=asyncio.get_running_loop())
+        resumed.since = since
+        asyncio.futures._chain_future(job, resumed)
+        return resumed
+
+    ThreadPoolExecutor.submit = submitted
 
 
 def _end_before_serving(run: dict, e: BaseException) -> None:
@@ -1936,14 +2279,35 @@ def _end_before_serving(run: dict, e: BaseException) -> None:
 
 def http_intake() -> tuple[float, float, float] | None:
     """``(fixed_s, per_byte_s, idle_s)``, the frontend loop's time to take in one
-    HTTP request, from the run's machine spec, ``fixed_s`` standing for an unstated
-    ``idle_s``; None on a real run or a run file with no machine spec."""
-    run = spec()
-    if run is None or "machine" not in run:
+    HTTP request, from the ``http_intake`` term of this server's ``host`` entry,
+    the one `tokenizer` resolved among several, ``fixed_s`` standing for an
+    unstated ``idle_s``; None on a real run or with no term."""
+    if (term := _intake_term()) is None:
         return None
-    machine, terms = _machine(run), ("fixed_s", "per_byte_s")
-    fixed, per_byte = (machine.value(f"host.http_intake.{k}") for k in terms)
-    return fixed, per_byte, machine.values.get("host.http_intake.idle_s", fixed)
+    return term["fixed_s"], term["per_byte_s"], term.get("idle_s", term["fixed_s"])
+
+
+def http_intake_hull() -> tuple[float, float] | None:
+    """The body bytes, ``(lo, hi)``, the ``http_intake`` term `http_intake`
+    reads was fitted over, outside which `HttpChannel` refuses a request's
+    intake; None on a real run, with no term, or a term stating none."""
+    term = _intake_term() or {}
+    return tuple(term["bytes"]) if "bytes" in term else None
+
+
+def _intake_term() -> dict | None:
+    run = spec()
+    if run is None:
+        return None
+    host = run.get("host", {})
+    if isinstance(host, list):
+        if _frontend_host is None:
+            raise ValueError(
+                "the run file holds a host entry per engine config, and none was "
+                "resolved for this server's: compass_run.tokenizer resolves it"
+            )
+        host = _frontend_host
+    return host.get("http_intake")
 
 
 def _fingerprint(tok) -> str | None:
@@ -2383,6 +2747,16 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
         schedule["fallback_reasons"] = None
         schedule["refusals"].update(steps=None, fraction_of_steps=None)
     summary["configuration"] = configuration(run)
+    summary["uncharged_host_terms"] = sorted(
+        {t for h in entries(run, "host") or [{}] for t in HOST_TERMS if t not in h}
+        | {
+            f"tokenizer.{k}"
+            for h in entries(run, "host") or []
+            for k in TOKENIZER_KINDS
+            if k not in h.get("tokenizer", {k: None})
+        }
+    )
+    summary["unmeasured_hops"] = sorted(k for k, v in hops(run).items() if v is None)
     summary["schema_version"] = SUMMARY_SCHEMA_VERSION
     summary["source_root"] = a.source_root.as_json()
     if "router" in run:

@@ -597,7 +597,7 @@ receive (Q3).
 `xiaobizh_n18_cpu`, where every aiter line quoted below is byte-identical at the same
 numbers. Two aiter versions are in circulation on this project and they agree here; that
 they agree is a reading, not a guarantee. An entry does not answer across them: the
-machine-spec key pins aiter's commit (T86, closed by the owner's [ruling on #168](https://github.com/jgong5/ATOM/issues/168#issuecomment-6399062318)).
+software stack in its key pins aiter's commit (T86, closed by the owner's [ruling on #168](https://github.com/jgong5/ATOM/issues/168#issuecomment-6399062318); the stack replaced the machine-spec key 2026-11-03, [#2716](https://github.com/jgong5/ATOM/issues/2716)).
 
 **ATOM does not construct the EP group — aiter does.** No ATOM file assigns `_EP`, and
 every use site imports `get_ep_group` from `aiter.dist.parallel_state` (`moe.py::FusedMoEMethodBase._maybe_make_prepare_finalize`,

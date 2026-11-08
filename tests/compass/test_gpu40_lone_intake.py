@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""mi355-gpu-40's spec states the per-byte intake rate that lone requests of a
-served DeepSeek-V4.1-Flash cell's bodies read, beside the burst's fixed term at
-that rate, and a simulated run on it charges the cell's mean body about what
-the cell's loop took to take it in."""
+"""A simulated run under the law file captured on mi355-gpu-40, whose per-byte
+intake rate lone requests of a served DeepSeek-V4.1-Flash cell's bodies read,
+charges the cell's mean body about what the cell's loop took to take it in."""
 
 import asyncio
 import json
@@ -18,47 +17,27 @@ from test_compass_event_loop import (
     _stamp,
     run,  # noqa: F401  the run fixture
 )
-from test_spec_verbs import SPEC_ROOT, _mi355x_spec
+from test_spec_verbs import SPEC_ROOT
 
 from atom.compass import clock_transport
 from atom.compass import run as compass_run
 from atom.utils.clock import LPRuntime
 from atom.utils.compass_loop import CompassEventLoop, HttpChannel
 
-GPU40 = SPEC_ROOT / "scripts" / "compass" / "machines" / "mi355x-gpu40.json"
+LAW = SPEC_ROOT / "scripts/compass/laws"
+GPU40 = LAW / "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-decode.json"
 #: The DeepSeek-V4.1-Flash TP4 DSpark5 cc-traces c=16 cell as a real recording
 #: at 0cd22bcc3 read it, over its long prompts: the mean body, and the loop's
 #: mean intake of one.
 CELL_BYTES, CELL_INTAKE_S = 388_200, 4.59e-3
 
 
-def test_gpu40_states_the_lone_requests_rate_and_the_burst_fixed_term_at_it(
-    monkeypatch,
-):
-    script, spec = _mi355x_spec(monkeypatch, "mi355x-gpu40")
-    model, _, root, rate, band, record = script.LONE
-    origin = spec.origin("host.http_intake.per_byte_s")
-    assert origin["origin"] == "probed"
-    assert (origin["model"], origin["source_root"]) == (model, f"commit:{root}")
-    assert origin["record"] == f"sha256:{record}"
-    assert (origin["p10"], origin["p90"]) == band
-    assert spec.value("host.http_intake.per_byte_s") == rate
-    _, root, terms, bands, record = script.INTAKE
-    origin = spec.origin("host.http_intake.fixed_s")
-    assert (origin["source_root"], origin["record"]) == (
-        f"commit:{root}",
-        f"sha256:{record}",
-    )
-    assert (origin["p10"], origin["p90"]) == bands["fixed_s"]
-    assert spec.value("host.http_intake.fixed_s") == terms["fixed_s"]
-
-
 def test_a_simulated_run_on_gpu40_charges_a_lone_cell_body_what_the_cell_took(
     run, monkeypatch, tmp_path  # noqa: F811
 ):
     path = tmp_path / "run.json"
-    machine = json.loads(GPU40.read_text())
-    path.write_text(json.dumps({"bound_s": 600.0, "machine": machine}))
+    host = json.loads(GPU40.read_text())["host"]
+    path.write_text(json.dumps({"bound_s": 600.0, "host": host}))
     monkeypatch.setenv(compass_run.ENV, str(path))
     stamps = queue.Queue()
 

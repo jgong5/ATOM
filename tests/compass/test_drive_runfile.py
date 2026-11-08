@@ -447,7 +447,7 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
     lps = {lp.name for lp in table.registry.ids()}
     assert lps == {"traffic", "frontend-P", "engine-P", "frontend-D", "engine-D"}
     write = [f"engine-D->engine-P:kv_write_req#dp0.dp{p}" for p in (0, 1)]
-    assert [table.lookahead(c) for c in write] == [runfile.KV_WRITE_REQ_S] * 2
+    assert [table.lookahead(c) for c in write] == [compass_run.HOP_FLOOR_S] * 2
     relay = table.lookahead("frontend-P->frontend-D:relay")
     assert relay == run["router_s"]
 

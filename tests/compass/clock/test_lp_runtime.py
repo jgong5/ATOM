@@ -30,7 +30,7 @@ INF = float("inf")
 
 
 def _table():
-    return single_engine_table(admission_path="serving", ipc_s=IPC, stream_s=0.002)
+    return single_engine_table(admission_s=0.54e-3, ipc_s=IPC, stream_s=0.002)
 
 
 class FakeConn:
