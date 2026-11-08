@@ -328,6 +328,21 @@ def test_a_mooncake_producer_traces_its_steps_with_its_indexer_cache_in_fp8(
         assert [names.count(FP8_QUERY) for names in layers] == indexed
 
 
+def test_the_prefill_attention_states_the_ratio_of_the_lists_it_is_passed(
+    tmp_path_factory,
+):
+    # Each layer's prefill attention reads the prefix index list and indptr of
+    # its layer's compress class, which `measure ops` binds by that ratio.
+    config = json.loads(CONFIG.read_text())
+    graphs = capture(tmp_path_factory, "--width 2 --prefill 512 2" + DPA_TP8 + PRODUCER)
+
+    layers = _decoder(graphs["prefill T=512 B=2"][0])
+    assert len(layers) == LAYERS
+    for layer, ratio in zip(layers, config["compress_ratios"], strict=False):
+        [core] = [op for op in layer if op["op"] == CORE["prefill"]]
+        assert core["stated"] == {"compress_ratio": ratio}
+
+
 def test_tp8_without_dp_attention_reduces_in_each_layer_and_declares_nothing(
     tmp_path_factory,
 ):

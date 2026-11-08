@@ -1005,6 +1005,10 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   extended to the bf16 leaf by [#2031](https://github.com/jgong5/ATOM/issues/2031)):
   at decode it writes each token's window row to the destination rows of that ratio's
   class, which `bench.ops.V4_METADATA` binds to `v4_swa_dest_{dense,csa,hca}`.
+  DeepSeek-V4's prefill attention under the fp8 KV cache (`capture.forward.V4_PREFILL`)
+  states its layer's `compress_ratio` too: it is passed the prefix index list and indptr of
+  that ratio's class, which `bench.ops.V4_METADATA` binds to
+  `kv_{indices,indptr}_prefix_{swa,csa,hca}` ([#3023](https://github.com/jgong5/ATOM/issues/3023)).
   DeepSeek-V4.1's sparse attention (`capture.forward.V41_ATTENTION`), its index lists
   sized as V4's, states the same three of its layer, and its indexer's scorers
   (`capture.forward.V41_SCORERS`: gfx1250's FlyDSL one and gfx950's Triton one) its
