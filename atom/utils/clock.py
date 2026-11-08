@@ -28,6 +28,11 @@ carried one, `next_event` asks the authority for every message below the next
 ceiling ahead of time; the owner releases each in the step that reaches it.
 `ask_next_event`, whose caller waits on the connection, always asks.
 
+A member of a DP group, its connection bound as one (``conn.member``), asks
+its group step's rounds up to its own return in one call, and the rounds it
+owes in one more (`advance_group`, `settle`); the call's one grant releases
+what each of its rounds released to it.
+
 A grant names the messages it releases as ``{channel: [(seq, arrival)]}``.
 `_step_through` releases them one at a time in ``(arrival, channel, seq)``
 order, setting the LP clock to each arrival. On a ``thread`` channel it then
@@ -148,6 +153,7 @@ class LPRuntime:
         diag_s: float = DIAG_S,
     ) -> None:
         self.me, self.table, self.conn, self.diag_s = me, table, conn, diag_s
+        self.member = getattr(conn, "member", None)  # of a DP group's LP, or None
         self.owner = owner or threading.current_thread()
         self.lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
@@ -231,32 +237,40 @@ class LPRuntime:
             self.send_log.append((ch, seq, arrival))
         return arrival, seq
 
-    def advance_to(self, T: float) -> None:
-        """Price an event: block until granted `T`, releasing what arrives up to it."""
+    def advance_to(self, T: float, *later: float) -> None:
+        """Price an event: block until granted `T`, releasing what arrives up
+        to it. A DP member asks the `later` rounds of its group step, each past
+        the one before, in the same call, and returns at the last one."""
         self._require_open("advance_to")
         if self.owed and T < self.owed[-1]:
             self._refuse(f"advance_to({T}) before the owed group round {self.owed[-1]}")
         self.settle()
         if T < self.now:
             raise ValueError(f"{self.me} cannot advance to {T}, it is at {self.now}")
-        if T < self.ceiling:
+        if T < self.ceiling:  # an LP with members has no ceiling
             self._own_step("TAR", T, T)
         else:
-            self._grant(*self._ca_call("TAR", T))
+            self._grant(*self._ca_call("TAR", T, rounds=later))
 
     def advance_group(self, targets, mine: float) -> None:
-        """A DP group step: one TAR per distinct target, ascending, as every
-        member asks; this one returns at `mine` and owes the later rounds."""
+        """A DP group step: each distinct target is a round every member asks,
+        ascending; this one returns at `mine` and owes the later rounds. A
+        member asks its rounds up to `mine` in one call."""
         rounds = sorted(set(targets))
-        for t in rounds:
-            if t <= mine:
+        asked = [t for t in rounds if t <= mine]
+        if self.member is not None and asked:
+            self.advance_to(*asked)
+        else:
+            for t in asked:
                 self.advance_to(t)
         self.owed = [t for t in rounds if t > mine]
 
     def settle(self) -> None:
-        """Join the owed rounds; they end the owing step, so `idle` counts none."""
-        while self.owed:
-            self._grant(*self._ca_call("TAR", self.owed.pop(0)))
+        """Join the owed rounds in one call; they end the owing step, so
+        `idle` counts none."""
+        if self.owed:
+            owed, self.owed = self.owed, []
+            self._grant(*self._ca_call("TAR", owed[0], rounds=owed[1:]))
             self.calls -= 1
 
     def next_event(self, t: float, t_daemon: float = float("inf")) -> float:
@@ -340,23 +354,25 @@ class LPRuntime:
         if self.now == float("inf"):
             raise RuntimeError(f"{what} from {self.me} after the +inf grant")
 
-    def _ca_call(self, kind: str, t: float, t_daemon: float = float("inf")):
+    def _ca_call(self, kind: str, t: float, t_daemon: float = float("inf"), rounds=()):
         if self.parking:
             self._refuse(
                 f"{kind}({t}) between the DP state sync and the forward dispatch; "
                 "a member's park is its last clock call there"
             )
-        self._ca_send(kind, t, t_daemon)
+        self._ca_send(kind, t, t_daemon, rounds=rounds)
         return self.conn.recv()
 
     def _ca_send(
-        self, kind: str, t: float, t_daemon: float, ahead: bool = False
+        self, kind: str, t: float, t_daemon: float, ahead: bool = False, rounds=()
     ) -> None:
         with self.lock:
             log, self.send_log = self.send_log, []
         steps, self.steps = self.steps, []
         self.calls += 1
-        extra = (steps, ahead) if steps or ahead else ()
+        extra = (steps, ahead) if steps or ahead or rounds else ()
+        if rounds:
+            extra += (list(rounds),)
         self.conn.send((kind, t, log, t_daemon, *extra))
 
     def _own_step(self, kind: str, t: float, G: float) -> None:

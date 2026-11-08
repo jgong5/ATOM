@@ -1027,7 +1027,8 @@ class _RecordingAuthority(ClockAuthority):
     that frontend's send log, finishes the run there and sets `stopped`. Every
     LP but the client is granted ``+inf``, and the client too while a client
     run is open, from its bind to its end; outside one it holds no connection.
-    Each such grant releases every message registered for its receiver. A stop
+    Each such grant releases every message registered for its receiver, and to
+    a member also those a park or a call of later rounds held for it. A stop
     with none open, on a server whose ``client_runs`` is ``null``, sets
     `stopped_whole`: the run ended as its run file says, as at the finish."""
 
@@ -1087,7 +1088,16 @@ class _RecordingAuthority(ClockAuthority):
         return super().on_bind(lp)
 
     def on_request(
-        self, lp, kind, t, log, t_daemon=math.inf, member=None, steps=(), ahead=False
+        self,
+        lp,
+        kind,
+        t,
+        log,
+        t_daemon=math.inf,
+        member=None,
+        steps=(),
+        ahead=False,
+        rounds=(),
     ) -> list:
         first = lp == TRAFFIC and len(self.starts) == len(self.ends)
         if first and self.final_clocks is None:  # none opens after the finish
@@ -1101,21 +1111,22 @@ class _RecordingAuthority(ClockAuthority):
             self.stopped_whole = (
                 self._client_runs == math.inf and not self.client_run_open
             )
-            replies = [
-                (to, g, self._release_all(released))
-                for to, g, released in self._address(self._finish())
-                if to != TRAFFIC or self.client_run_open
-            ]
-            # What the stop releases, which no recorded grant does.
-            for to, _, released in replies:
-                lp = to[0] if isinstance(to, tuple) else to  # a member's: (lp, member)
-                for ch, msgs in released.items():
+            replies = []
+            for to, g, held in self._address(self._finish()):
+                if to == TRAFFIC and not self.client_run_open:
+                    continue
+                # What the stop releases, which no recorded grant does, beside
+                # what was held for a member, which its own grant recorded.
+                added = self._release_all(held)
+                i = to[0] if isinstance(to, tuple) else to  # a member's: (lp, member)
+                for ch, msgs in added.items():
                     for seq, arrival in msgs:
-                        clock = self._clock_before[lp]
-                        self.steps.record(lp, clock, arrival, "release", ch, seq)
+                        clock = self._clock_before[i]
+                        self.steps.record(i, clock, arrival, "release", ch, seq)
+                replies.append((to, g, {ch: [*held[ch], *added[ch]] for ch in held}))
         else:
             replies = super().on_request(
-                lp, kind, t, log, t_daemon, member, steps, ahead
+                lp, kind, t, log, t_daemon, member, steps, ahead, rounds
             )
         while len(self.ends) < len(self.ended):
             self.ends.append(time.monotonic())

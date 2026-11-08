@@ -108,7 +108,7 @@ class WriteRecord:
     ):
         received = self.clock()
         key = (req_id, pp_rank, tp_rank, write_nonce)
-        if key not in self.heard:  # the producer sends each write-done thrice
+        if key not in self.heard:  # the producer resends each write-done
             self.heard.add(key)
             self.lines.append(
                 {
