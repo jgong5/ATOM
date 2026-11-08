@@ -1790,6 +1790,20 @@ def test_a_packed_fp4_activation_and_weight_are_built_at_their_shape_and_stride(
         assert t.view(torch.uint8).unique().numel() > 1
 
 
+def test_each_weight_a_leaf_cycles_starts_where_the_allocator_starts_a_block():
+    # aiter's Mega-MHC aborts the process on an `hc_scale` of three floats
+    # that is not 16-byte aligned, as the second of three packed back to back
+    # is; ATOM allocates each parameter alone, on a 512-byte block.
+    stub = ops.Stub(_Runner(), 1)
+    w = {"shape": [3], "dtype": F32, "stride": [1], "role": "weight"}
+
+    built = [stub._weight(w, c, 3) for c in range(3)]
+
+    starts = [t.data_ptr() - built[0].data_ptr() for t in built]
+    assert [s % 512 for s in starts] == [0, 0, 0] and starts[1] > 0
+    assert all(t.shape == (3,) and t.std() > 0 for t in built)
+
+
 def test_a_weight_captured_preshuffled_is_built_marked_and_only_that_one():
     # aiter's fused_moe_ picks its kernel by its weights' `is_shuffled`, which
     # no shape or dtype shows: a leaf built without it runs another kernel.
