@@ -206,21 +206,26 @@ def structure(
     device: str | None = None,
     output: bool = True,
     draft: bool = False,
+    env: dict | None = None,
 ) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the arch of `device`, else
     `device_arch()`, the engine config a step law is keyed by less its ladder
     (`run.step_grid.keyed`), which names every variable that picks a kernel and
-    a drafter's method and width, the TP width, the DP width and the EP group's
-    when they are set, the phase and the mode, `config`'s unless `eager` names
-    it, ``no output`` unless the step produces output (`output`), and ``draft``
-    for the drafter's part of the step (`draft`), ``draft kv`` for a block
-    drafter's draft-KV pass on a step that samples (`draft` is `KV`)."""
+    a drafter's method and width, its performance environment `env` when given,
+    as an engine file states one, else this process's, the TP width, the DP
+    width and the EP group's when they are set, the phase and the mode,
+    `config`'s unless `eager` names it, ``no output`` unless the step produces
+    output (`output`), and ``draft`` for the drafter's part of the step
+    (`draft`), ``draft kv`` for a block drafter's draft-KV pass on a step that
+    samples (`draft` is `KV`)."""
     from atom.compass.run import _file_digest
     from atom.compass.run.step_grid import keyed
 
     digest = _file_digest(config.model, "config.json")
     engine = keyed(config, ladder=False)
+    if env is not None:
+        engine["env"] = env
     engine = json.dumps(engine, sort_keys=True, separators=(",", ":"))
     mode = "eager" if (config.enforce_eager if eager is None else eager) else "graph"
     arch, device = config.hf_config.architectures[0], device or device_arch()
@@ -765,6 +770,11 @@ def _patches(recorder):
       collectives, the streams and the expert kernels.
     * The checkpoint's weights iterator yields nothing: ATOM's dummy load still
       runs it, which would open every shard, or download them for a hub name.
+    * No KV connector is built (`get_kvconnector` answers none): under a P/D
+      side's `--kv-transfer-config`, ATOM's KV allocation would start the
+      worker's transfer engine and register the fake KV pool with it, which
+      has no address. The config's other effects on the model stay, such as
+      DeepSeek-V4's indexer cache in fp8.
     * A step ATOM splits into two micro-batches (`--enable-tbo`) is refused by
       name before its threads start: one graph cannot hold the two.
     * The step's DP exchange (`sync_dp_metadata`) runs on the host, outside
@@ -775,6 +785,10 @@ def _patches(recorder):
       the call allocates holds one byte.
     * A mono runner binds and builds its widths as its deployment does
       (`_mono`).
+    * A forced acceptance (`--spec-decode-acceptance-length`) draws with a
+      device generator seeded by its sampler's count of steps: the generator
+      is a host one, the declared device having none, and the count stays at
+      zero, so a decode's two contexts seed alike.
     """
     import flydsl
     import triton
@@ -786,9 +800,9 @@ def _patches(recorder):
     from triton.runtime.jit import JITFunction
 
     from atom.model_loader import loader
-    from atom.model_ops import module_dispatch_ops, moe
+    from atom.model_ops import module_dispatch_ops, moe, rejection_sampler
     from atom.model_ops.attentions import gdn_attn
-    from atom.utils import CpuGpuBuffer
+    from atom.utils import CpuGpuBuffer, forward_context
     from atom.utils.tbo import ubatching
     from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
@@ -898,6 +912,7 @@ def _patches(recorder):
         (FakeTensor, "tolist", host_tolist),
         (torch.Tensor, "numpy", lambda t, *a, **k: host_numpy(landed(t), *a, **k)),
         (loader, "safetensors_weights_iterator", lambda *a, **k: iter(())),
+        (forward_context, "get_kvconnector", lambda *a, **k: None),
         (UBatchWrapper, "_run_ubatches", micro_batches),
         (topk, "topk_ob_workspace_size", lambda *a: 0),
         (topk, "topk_mb_workspace_size", lambda *a: 0),
@@ -907,9 +922,13 @@ def _patches(recorder):
             "maybe_dual_stream_forward",
             module_dispatch_ops.maybe_dual_stream_forward,
         ),
+        (rejection_sampler, "_synthetic_generator", lambda device: torch.Generator()),
         *_mono(recorder, unpatched),
     ):
         stack.enter_context(patch.object(owner, name, value))
+    steps = property(lambda sampler: 0, lambda sampler, step: None)
+    sampler = rejection_sampler.RejectionSampler
+    stack.enter_context(patch.object(sampler, "_synthetic_step", steps, create=True))
     stack.enter_context(_entries(recorder))
     return stack
 
@@ -1370,10 +1389,12 @@ def capture(
     atom_args=(),
     arch="gfx942",
     population=(),
+    read=None,
     whole=False,
 ):
     """Trace one step of `model` at TP `tp` at each of `shapes`, in this process,
-    under ATOM's engine arguments `atom_args` on a declared `arch`.
+    under ATOM's engine arguments `atom_args` on a declared `arch`, or on the
+    card `read` declares (`driverless.card`).
 
     Yields, per shape, the graph, the model's config digest, what the capture
     declared, the operators it left out of the graph among it; per prefill
@@ -1385,7 +1406,7 @@ def capture(
     prefills runs as one forward, as it ran, this rank answering that it
     cannot split it; with `whole`, each prefill of `shapes` too.
     """
-    declared = driverless.install(tmpdir, arch)
+    declared = driverless.install(tmpdir, arch, read)
 
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
 

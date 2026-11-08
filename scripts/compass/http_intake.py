@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""Fit the API server event loop's charge per HTTP request from one real burst.
+"""Fit the API server event loop's charge per HTTP request from real requests.
 
     python3 scripts/compass/http_intake.py serve STAMPS API_SERVER_ARGS...
-    python3 scripts/compass/http_intake.py fit STAMPS [N]
+    python3 scripts/compass/http_intake.py fit STAMPS [N [PER_BYTE_S]]
     python3 scripts/compass/http_intake.py floor STAMPS ARRIVALS
     python3 scripts/compass/http_intake.py idle STAMPS [PER_BYTE_S]
+    python3 scripts/compass/http_intake.py lone STAMPS [PASSES]
     python3 scripts/compass/http_intake.py hops STAMPS HANDOFF ARRIVALS
     python3 scripts/compass/http_intake.py pd STAMPS [STEPS]
 
@@ -30,6 +31,11 @@ any request. Prints the median, p10 and p90 in seconds, N and both sha256s as JS
 from each ASGI app call to its pool job's start and from the job's end to its
 engine send, less PER_BYTE_S (default 0) per body byte. Prints the
 median as `idle_s`, p10, p90, PER_BYTE_S, N and the sha256 as JSON.
+`lone` reads the same loop time off a run of lone requests sent in PASSES
+passes (default 1) of as many requests each, in order: each pass's per-byte
+rate is the Theil-Sen slope of its requests' loop time on their body bytes.
+Prints the median over passes as `per_byte_s`, p10, p90, each pass's rate, N,
+bytes and the sha256 as JSON.
 `hops` reads three hops off a parity workload run, the server run with
 ``ATOM_COMPASS_PARITY_RECORD`` set so its engine writes HANDOFF
 (``dp0.handoff.jsonl``): ``request``, each engine send's return to the engine
@@ -51,7 +57,8 @@ in one at a time: each gap between template starts is the next request's
 ``fixed_s + body bytes x per_byte_s``. Some gaps also hold tens of milliseconds
 of other loop work, so `per_byte_s` is the Theil-Sen slope and `fixed_s` keeps
 the burst's span; least squares on the starts swings the slope's sign between
-bursts. Prints the terms, a gap's rms residual, N, bytes and sha256 as JSON.
+bursts. With PER_BYTE_S, that is the slope, and `fixed_s` keeps the span at
+it. Prints the terms, a gap's rms residual, N, bytes and sha256 as JSON.
 """
 
 import contextlib
@@ -220,7 +227,7 @@ def install(stamps: str) -> None:
     spawn.get_command_line = get_command_line
 
 
-def fit(stamps: str, n: int = 256) -> dict:
+def fit(stamps: str, n: int = 256, per_byte: float | None = None) -> dict:
     data = Path(stamps).read_bytes()
     rows = [line.split() for line in data.decode().splitlines()]
     reads = sorted((int(r[0]), int(r[3]), int(r[4])) for r in rows if r[2] == "body")
@@ -233,9 +240,8 @@ def fit(stamps: str, n: int = 256) -> dict:
             f"{stamps}: {len(sizes)} bodies and {len(starts)} templates, not {n}"
         )
     gaps, nbytes = np.diff(starts) / 1e9, np.array(sizes[1:])
-    i, j = np.triu_indices(len(gaps), 1)
-    pair = nbytes[i] != nbytes[j]
-    per_byte = np.median((gaps[j] - gaps[i])[pair] / (nbytes[j] - nbytes[i])[pair])
+    if per_byte is None:
+        per_byte = _theil_sen(nbytes, gaps)
     fixed = gaps.mean() - per_byte * nbytes.mean()
     return {
         "fixed_s": float(fixed),
@@ -270,7 +276,10 @@ def floor(stamps: str, arrivals: str) -> dict:
     }
 
 
-def idle(stamps: str, per_byte: float = 0.0) -> dict:
+def _alone(stamps: str) -> tuple[bytes, np.ndarray, np.ndarray]:
+    """The stamp file, and each lone request's loop time in seconds and body
+    bytes, in order: from its ASGI app call to its pool job's start and from
+    the job's end to its engine send."""
     data = Path(stamps).read_bytes()
     rows = [line.split() for line in data.decode().splitlines()]
     calls = sorted(int(r[3]) for r in rows if r[2] == "app")
@@ -290,14 +299,47 @@ def idle(stamps: str, per_byte: float = 0.0) -> dict:
         for c, (j, _) in zip(calls, jobs)
     ]
     loop = [j - c + s - e for c, (j, e), s in zip(calls, jobs, sends)]
-    took = np.array(loop) / 1e9 - per_byte * np.array(nbytes)
+    return data, np.array(loop) / 1e9, np.array(nbytes)
+
+
+def _theil_sen(nbytes: np.ndarray, took: np.ndarray) -> float:
+    """The median slope of `took` on `nbytes` over pairs of unequal sizes."""
+    i, j = np.triu_indices(len(took), 1)
+    pair = nbytes[i] != nbytes[j]
+    return float(np.median((took[j] - took[i])[pair] / (nbytes[j] - nbytes[i])[pair]))
+
+
+def idle(stamps: str, per_byte: float = 0.0) -> dict:
+    data, loop, nbytes = _alone(stamps)
+    took = loop - per_byte * nbytes
     p10, median, p90 = np.percentile(took, [10, 50, 90])
     return {
         "idle_s": float(median),
         "p10_s": float(p10),
         "p90_s": float(p90),
         "per_byte_s": per_byte,
-        "requests": len(jobs),
+        "requests": len(loop),
+        "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
+    }
+
+
+def lone(stamps: str, passes: int = 1) -> dict:
+    data, loop, nbytes = _alone(stamps)
+    if passes < 1 or len(loop) % passes:
+        raise SystemExit(f"{stamps}: {len(loop)} lone requests, not {passes} passes")
+    n = len(loop) // passes
+    slopes = [
+        _theil_sen(nbytes[k * n : (k + 1) * n], loop[k * n : (k + 1) * n])
+        for k in range(passes)
+    ]
+    p10, median, p90 = np.percentile(slopes, [10, 50, 90])
+    return {
+        "per_byte_s": float(median),
+        "p10_s": float(p10),
+        "p90_s": float(p90),
+        "passes": slopes,
+        "requests": len(loop),
+        "bytes": int(nbytes.sum()),
         "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
     }
 
@@ -392,9 +434,12 @@ if __name__ == "__main__":
         print(json.dumps(floor(stamps, *rest)))
     elif verb == "idle":
         print(json.dumps(idle(stamps, *map(float, rest))))
+    elif verb == "lone":
+        print(json.dumps(lone(stamps, *map(int, rest))))
     elif verb == "hops":
         print(json.dumps(hops(stamps, *rest)))
     elif verb == "pd":
         print(json.dumps(pd(stamps, *rest)))
     else:
-        print(json.dumps(fit(stamps, *map(int, rest))))
+        n, *per_byte = rest or ["256"]
+        print(json.dumps(fit(stamps, int(n), *map(float, per_byte))))

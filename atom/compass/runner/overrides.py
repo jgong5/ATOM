@@ -334,8 +334,8 @@ class HostDeviceRecurrence:
     does. `ends[-1]` is the last forward's device end. `laws[kind][segment]` are coefficients on `(1,
     tokens, seqs)`; `charge` says what an absent one costs. `now` reads the engine LP's clock.
     `segments` holds the seconds the last `charge` charged each segment, 0 for
-    one in `skip`. `admit`, coefficients on a batch's `compass_admitted`
-    (`admitted`), adds what its admissions cost to its `E`, except on a
+    one in `skip`. `admit`, coefficients on `admit_x` of a batch's
+    `compass_admitted`, adds what its admissions cost to its `E`, except on a
     pipeline stage that receives its input; None, a fit that priced them apart
     and fitted no law for them, and `device_end` refuses a forward that admits.
     """
@@ -420,10 +420,12 @@ class HostDeviceRecurrence:
 
     def admit_s(self, batch: Any) -> float:
         """What `batch`'s admissions add to its `E`."""
+        from atom.compass.backends.step_labels import admit_x
+
         a = getattr(batch, "compass_admitted", None)
         if not (self.admit and a) or self.recv:
             return 0.0
-        return float(np.dot(self.admit, a))
+        return float(np.dot(self.admit, admit_x(a)))
 
     def start_lag(self, batch: Any) -> float | None:
         """`BatchView.start_lag_s` of an output forward on a single stage, as
@@ -614,7 +616,9 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
     after the stages before it -- on gloo and with an empty custom group
     configuration, under which aiter builds no device communicator for any
     group. A simulated TP width is refused: it starts fewer workers than the
-    TP group `apply_simulated_tp` then reports on a device group.
+    TP group `apply_simulated_tp` then reports on a device group. In a simulated
+    run the DP group then runs its small collectives over shared memory when
+    its ranks share a host (`shm_collectives`).
     """
     pc = config.parallel_config
     if config.tp_world_size != config.tensor_parallel_size:
@@ -684,6 +688,15 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
         prefill_context_model_parallel_size=pcp,
         custom_group_config={},
     )
+    from atom.compass import run
+
+    if pc.data_parallel_size > 1 and run.spec() is not None:
+        from aiter.dist.parallel_state import get_dp_group
+
+        from atom.compass.runner import shm_collectives
+
+        shm_collectives.install()
+        shm_collectives.attach(get_dp_group().cpu_group)
 
 
 def _config_field(runner: Any, name: str) -> Any:
@@ -1541,7 +1554,7 @@ class NonAllocatingRunner(
         from atom.compass.parity import record_step
         from atom.model_engine.scheduler import ScheduledBatchOutput
 
-        mode = record_step(self, batch)
+        mode, view = record_step(self, batch) or (None, None)
         record = getattr(self, "_parity_record", None)
         if record is not None and record.step == 1:
             # The record was just created, replacing an earlier run's; so is
@@ -1584,7 +1597,7 @@ class NonAllocatingRunner(
             )
             self._token_stream = stream
         tokens = stream.step(batch)
-        seconds = _group_step_seconds(self, batch, backend, mode)
+        seconds = _group_step_seconds(self, batch, backend, mode, view)
         out = ScheduledBatchOutput(
             **tokens,
             predicted_s=seconds,
@@ -1609,14 +1622,21 @@ def _start_cost_table(runner: Any, record: Any) -> None:
 
 
 def _group_step_seconds(
-    runner: Any, batch: Any, backend: CostBackend, mode: Any = None
+    runner: Any,
+    batch: Any,
+    backend: CostBackend,
+    mode: Any = None,
+    view: Any = None,
 ) -> float:
     """This rank's step priced from its own batch, then its DP group target.
 
     Only TP rank 0 prices; any other TP rank of the engine charges 0 s.
 
     `mode` is the step's `ForwardMode` when the step record already settled
-    it; without one it is settled here, which runs the DP collective.
+    it; without one it is settled here, which runs the DP collective; `view`,
+    the `BatchView` the record built from it, is priced in place of a new one.
+    Under DP the group then sums its dummy forwards (`projection.dummy_ranks`),
+    which the view states as its `group_dummies`.
 
     In a run, `compass_host` composes the price, the target's device seconds
     and then the draft's (`StepCost.target_seconds`, `draft_seconds`), with
@@ -1665,7 +1685,12 @@ def _group_step_seconds(
     `{"version": COST_TABLE_VERSION}` as the record starts, replacing an
     earlier run's file, and keeps it open in `_cost_table` for the run.
     """
-    from atom.compass.runner.projection import batch_view, dp_group, forward_mode
+    from atom.compass.runner.projection import (
+        batch_view,
+        dp_group,
+        dummy_ranks,
+        forward_mode,
+    )
 
     if runner.rank != 0:
         # The engine reads TP rank 0's reply only, and the other ranks'
@@ -1694,10 +1719,17 @@ def _group_step_seconds(
         )
         seen = vars(runner).setdefault("_admitted", set())
         batch.compass_admitted = admitted(batch, seen, entry)
+    dummies = dummy_ranks(batch, mode)
     try:
-        view = batch_view(batch, mode, runner)
+        changes = {}
+        if view is None:
+            view = batch_view(batch, mode, runner, dummies)
+        elif view.dp_rank is not None:
+            changes["group_dummies"] = dummies
         if isinstance(host, HostDeviceRecurrence):
-            view = dataclasses.replace(view, start_lag_s=host.start_lag(batch))
+            changes["start_lag_s"] = host.start_lag(batch)
+        if changes:
+            view = dataclasses.replace(view, **changes)
         cost = backend.price(view)
         if spec and not cost.draft_terms and EAGER_DP_DUMMY not in cost.treatments:
             name = type(backend).__name__
@@ -1746,8 +1778,8 @@ def _group_step_seconds(
         mine = torch.tensor([charge_s, waits, out], dtype=torch.float64)
         rows = [torch.empty_like(mine) for _ in range(group.size())]
         torch.distributed.all_gather(rows, mine, group=group)
-        top = max(r[0].item() for r in rows)
         rows = [r.tolist() for r in rows]
+        top = max(s for s, *_ in rows)
         targets = tuple(top if w else s for s, w, _ in rows)
         ends = zip(targets, (o for *_, o in rows))
         pulls = tuple(t + o for t, o in ends if not math.isnan(o)) or None

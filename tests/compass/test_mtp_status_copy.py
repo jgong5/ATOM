@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from test_backend_step_linear_fit import _fit, _record, _steps, _view
+from test_backend_step_linear_fit import _fit, _record, _steps, _view, traced
 from test_parity_recurrence import MS, line
 from test_step_linear_draft import SHARE, _mtp_record, _output
 
@@ -186,7 +186,7 @@ def test_an_output_prefill_s_draft_kv_pass_prices_as_target_and_a_middle_chunk_s
         x["d_draft_kv_ns"] = round(kv * 1e9)
         if propose:
             x["d_propose_ns"] = round(propose * 1e9)
-    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    path.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
 
     samples = {s.step: s for s in label(path)[0]}
     for i in (2, 8):  # an output prefill, a middle chunk

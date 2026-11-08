@@ -27,7 +27,7 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   ``entries``.
 - ``--machine``, the spec; ``--store``'s root as ``store``; ``--on-refusal``;
   ``--step-roofline``; ``--padding none``, which prices a replayed graph's
-  real rows.
+  real rows; ``--local-grants``, which gives grants their ceilings.
 - Not flags: `FIXED`, and ``data_parallel_size``, read from ATOM's arguments.
   The server serves client runs until it is stopped.
 
@@ -95,6 +95,7 @@ def add_arguments(parser) -> None:
     parser.add_argument("--on-refusal", choices=("mark", "abort"), default="mark")
     parser.add_argument("--step-roofline", action="store_true")
     parser.add_argument("--padding", choices=("none",))
+    parser.add_argument("--local-grants", action="store_true")
 
 
 def build(args, atom_args) -> dict:
@@ -109,6 +110,7 @@ def build(args, atom_args) -> dict:
         "store": str(store.root),
         "on_refusal": args.on_refusal,
         "step_roofline": args.step_roofline,
+        run.LOCAL_GRANTS: args.local_grants,
     }
     # Read as the runner and `compass fit` read it, so a spec they would
     # refuse refuses before a server starts.

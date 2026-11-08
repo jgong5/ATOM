@@ -20,7 +20,8 @@
 #                    stop keep the points its record covers in the server's
 #                    JIT cache library (atom/compass/drive/sweep.py); only
 #                    points not yet covered are sent, and the last line says
-#                    whether the cell is swept. Needs TRACES alone
+#                    whether the cell is swept. Refuses a server that
+#                    `compass record --sweep` did not start. Needs TRACES alone
 #   MODEL, TRACES    as cctraces_sim.sh takes them
 #   HARNESS_PYTHON   the Python with agentx-harness, and with compass-harness
 #                    when the server is simulated and only then

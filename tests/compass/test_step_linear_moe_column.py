@@ -5,7 +5,10 @@ a pad row reaches no expert. A rung-only law fitted where every rank is full
 prices high a step at the same rung whose ranks are mostly idle. A law fitted
 with `moe_routing` lets each rung adopt one MoE column, the tokens `n` or the
 experts they reach `X`: the form a record held out of the rest prices nearest,
-weighted by steps, unless it takes some record out of the rung's bar.
+weighted by steps. A rank with no work runs a dummy forward whose one row,
+token 0 at position 0, reaches the gate like a real token, and every dummy's
+row is the same: `X` counts a step's dummies as one token, where `n` counts
+each.
 
 Each rank's record is written from a known per-rank law with a MoE slope,
 every line labelled with the group's step, as in `test_step_linear_dp`.
@@ -17,6 +20,7 @@ import json
 import numpy as np
 import pytest
 from test_backend_step_linear_fit import SPEC, _fit, _record, _steps
+from test_dp_step_max import Recording, dp2, prefill, runner  # noqa: F401  dp2
 from test_step_linear_draft import _mtp_record
 
 from atom.compass.backends import (
@@ -27,8 +31,6 @@ from atom.compass.backends import (
     StepLinearLaw,
 )
 from atom.compass.backends.step_linear_fit import (
-    _floor,
-    _moe_column,
     fit,
     label_records,
     main,
@@ -152,73 +154,43 @@ def test_a_rung_whose_cost_is_linear_in_the_tokens_adopts_them(tmp_path):
     assert backend.price(view).seconds == pytest.approx(_price(view, TOKENS))
 
 
-def _members(cells):
-    """A rung's `fit` rows over `cells`, each (steps, (low, high) tokens, price
-    of `n` tokens): its steps at tokens cycling over the span."""
-    members = []
-    for cell, (steps, (low, high), price) in enumerate(cells):
-        for step in range(steps):
-            n = low + step % (high - low + 1)
-            members.append((cell, "8", (1, 0, 0), price(n), step, (), n))
-    x = np.array([m[2] for m in members], dtype=np.float64)
-    return members, x
-
-
-def test_a_rung_whose_records_the_tokens_do_not_order_picks_no_column():
+def test_a_rung_whose_records_the_tokens_do_not_order_picks_no_column(tmp_path):
     """Within each record the cost rises with the tokens, across the two it
-    does not: a column fitted on one record prices the other high."""
-    rising = lambda low: lambda n: 0.010 + 1e-7 * (n - low)
-    members, x = _members([(200, (10, 20), rising(10)), (200, (30, 40), rising(30))])
-    chosen, figures = _moe_column(members, x, list(BASE), (384, 6))
-    assert chosen is None
+    does not: a column fitted on one record prices the other far off."""
+    dearer = {**TOKENS, "step": TOKENS["step"] + 0.002}
+    sparse = _records(tmp_path / "sparse", _groups(3, 200, SPARSE, dearer))
+    full = _records(tmp_path / "full", _groups(4, 200, FULL, TOKENS))
+    vector = _routed(sparse + full)[0]["decode"][str(RUNG)]
+    figures = vector["fit"]["moe_column"]
     assert figures["picked"] == "none" and figures["adopted"] is None
+    assert list(vector["coefficients"]) == list(BASE)
     error = {f: v["error"] for f, v in figures["held_out"].items()}
     assert error["none"] < min(error["moe_tokens"], error["moe_experts"])
 
 
-def test_the_pick_weighs_each_held_out_record_by_its_steps():
-    """Two large records the tokens price exactly, and a small one at the
-    second's tokens that costs what the first does: the column misses the small
-    one by more than no column does, and is picked on the steps."""
-    line = lambda n: 0.010 + 5e-5 * n
-    members, x = _members(
-        [
-            (400, (10, 20), line),
-            (400, (30, 40), line),
-            (20, (30, 40), lambda n: line(n - 20)),
-        ]
-    )
-    figures = _moe_column(members, x, list(BASE), (384, 6))[1]
+WIDE = {"step": 0.015, "context": 2e-8, "graph_padding": 1e-10, "moe_experts": 2e-4}
+
+
+def test_the_pick_weighs_each_held_out_record_by_its_steps(tmp_path):
+    """Two large records the experts price exactly, and a small one at the
+    first's tokens that costs 3% less: held out, the column misses the small
+    one by more than no column does, and is adopted on the steps however far
+    it moves that one record."""
+    cheaper = {**WIDE, "step": WIDE["step"] - 0.0011}
+    records = _records(tmp_path / "full", _groups(0, 200, FULL, WIDE))
+    records += _records(tmp_path / "sparse", _groups(1, 200, SPARSE, WIDE))
+    records += _records(tmp_path / "small", _groups(2, 20, FULL, cheaper))
+    vector = _routed(records)[0]["decode"][str(RUNG)]
+    figures = vector["fit"]["moe_column"]
     held = figures["held_out"]
     for got in held.values():
         folds = got["folds"].values()
         weighted = sum(n * abs(p) for n, p in folds) / sum(n for n, _ in folds)
         assert got["error"] == pytest.approx(weighted)
     small = {f: abs(held[f]["folds"]["2"][1]) for f in held}
-    assert small["moe_tokens"] > small["none"]
-    assert figures["picked"] == figures["adopted"] == "moe_tokens"
-
-
-def test_a_column_that_takes_a_record_out_of_the_bar_is_not_adopted():
-    """The column prices the two large records far closer, but the small
-    record, held out, leaves a bar of 4% either way that no column kept it in."""
-    line = lambda n: 0.010 + 2e-5 * n
-    members, x = _members(
-        [
-            (1000, (10, 20), line),
-            (1000, (30, 40), line),
-            (50, (50, 60), lambda n: line(25)),
-        ]
-    )
-    reference = [-0.04, 0.04]
-    chosen, figures = _moe_column(members, x, list(BASE), (384, 6), reference)
-    held = figures["held_out"]
-    assert figures["picked"] != "none"
-    assert held[figures["picked"]]["error"] < held["none"]["error"]
-    assert figures["bar"] == reference
-    assert figures["left_bar"] == ["2"]
-    assert abs(held["none"]["folds"]["2"][1]) <= 0.04
-    assert chosen is None and figures["adopted"] is None
+    assert small["moe_experts"] > small["none"] + 0.02
+    assert figures["picked"] == figures["adopted"] == "moe_experts"
+    assert list(vector["coefficients"]) == list(WIDE)
 
 
 def test_a_rung_with_a_record_of_few_steps_adopts_its_column(tmp_path):
@@ -235,37 +207,13 @@ def test_a_rung_with_a_record_of_few_steps_adopts_its_column(tmp_path):
     assert vector["coefficients"] == pytest.approx(EXPERTS, rel=1e-6)
 
 
-def test_a_rung_of_one_record_has_no_held_out_error_and_adopts_none():
-    members, x = _members([(300, (10, 40), lambda n: 0.010 + 5e-5 * n)])
-    chosen, figures = _moe_column(members, x, list(BASE), (384, 6))
-    assert chosen is None and figures["picked"] is None
+def test_a_rung_of_one_record_has_no_held_out_error_and_adopts_none(cells):
+    full, _ = cells
+    vector = _routed(full)[0]["decode"][str(RUNG)]
+    figures = vector["fit"]["moe_column"]
+    assert figures["picked"] is None and figures["adopted"] is None
     assert all(v == {"error": None, "folds": {}} for v in figures["held_out"].values())
-
-
-def test_the_floor_reads_each_records_steps_at_the_same_tokens():
-    """Each step priced at the median of its record's steps at its tokens: a
-    record's level is not mixed with another's, and a lone step is left out."""
-    rows = [(0, 5, 1.0), (0, 5, 2.0), (0, 5, 3.0), (1, 5, 30.0), (1, 5, 30.0)]
-    rows += [(0, 6, 9.0)]
-    members = [(c, "4", (1, 0, 0), y, i, (), n) for i, (c, n, y) in enumerate(rows)]
-    error = [1.0, 0.0, 2 / 3 - 1, 0.0, 0.0]
-    assert _floor(members) == pytest.approx(np.percentile(error, (10, 90)).tolist())
-
-
-@pytest.mark.parametrize("wide", [True, False])
-def test_the_bar_is_the_wider_of_the_reference_band_and_the_floor(cells, wide):
-    full, sparse = cells
-    samples = label_records(full + sparse, DP)[0]
-    band = 0.5 if wide else 1e-6
-    held = {"bands": {f"decode rung {RUNG}": {"p10": -band, "p50": 0.0, "p90": band}}}
-    reference = {"decode": {str(RUNG): {"held_out": held}}}
-    options = {"form": "base", "dp": DP, "moe_routing": ROUTING}
-    law = fit(samples, {**options, "reference": reference})[0]
-    figures = law["decode"][str(RUNG)]["fit"]["moe_column"]
-    assert figures["reference"] == [-band, band]
-    floor = figures["floor"]
-    assert floor[1] - floor[0] > 2e-6
-    assert figures["bar"] == ([-band, band] if wide else floor)
+    assert list(vector["coefficients"]) == list(BASE)
 
 
 def test_a_rung_law_fitted_on_full_ranks_prices_idle_ranks_high_and_the_routed_one_does_not(
@@ -368,25 +316,19 @@ def test_the_shared_form_refuses_moe_routing(cells):
         fit(samples, options)
 
 
-def test_the_command_states_the_routing_it_fitted_and_the_reference_band(tmp_path):
+def test_the_command_states_the_routing_it_fitted_and_takes_no_reference_law(
+    tmp_path, capsys
+):
     records = [str(_record(tmp_path / f"dp0-{s}.jsonl", _steps(s))) for s in (6, 7)]
-    band = {"p10": -0.03, "p50": 0.0, "p90": 0.02}
-    held = {"held_out": {"bands": {"decode rung 4": band}}}
-    reference = tmp_path / "reference.json"
-    reference.write_text(json.dumps({"decode": {"4": held}}))
     out = tmp_path / "law.json"
-    main(
-        [*records, "--out", str(out), *SPEC, "--moe-routing", "64,4"]
-        + [
-            "--reference",
-            str(reference),
-        ]
-    )
+    argv = [*records, "--out", str(out), *SPEC, "--moe-routing", "64,4"]
+    with pytest.raises(SystemExit):
+        main([*argv, "--reference", str(tmp_path / "reference.json")])
+    assert "unrecognized arguments: --reference" in capsys.readouterr().err
+    main(argv)
     law = json.loads(out.read_text())
     assert law["moe_routing"] == {"experts": 64, "top_k": 4}
-    figures = {k: law["decode"][k]["fit"]["moe_column"] for k in ("2", "4")}
-    assert figures["4"]["reference"] == [-0.03, 0.02]
-    assert figures["2"]["reference"] is None
+    assert all("moe_column" in law["decode"][k]["fit"] for k in ("2", "4"))
     StepLinearLaw(law)
 
 
@@ -412,3 +354,126 @@ def test_a_rung_whose_steps_all_reach_the_same_experts_adopts_no_column(tmp_path
     backend = StepLinearBackend(StepLinearLaw(law), DP)
     terms = backend.price(_view((170_000, 175_000, 180_000, 185_000), DP * RUNG)).terms
     assert all(t.provenance.validated for t in terms)
+
+
+def _merged_price(view: BatchView, law=EXPERTS) -> float:
+    """`_price` of `view` under `law`, a law over the experts alone, with its
+    group's dummy forwards reaching one token's experts."""
+    reached = view.moe_tokens - max(view.group_dummies - 1, 0)
+    return _price(dataclasses.replace(view, moe_tokens=reached), law)
+
+
+def _dummy_groups(seed, n, law=EXPERTS):
+    """`n` decode steps at rung 4 over `DP` ranks: at step `i` the last
+    `i % DP` ranks run a dummy forward, one row of context 1, and the others
+    hold the same 4 rows. The fit picks a step's slowest rank on the rung's
+    features without the MoE column, so ranks that differ only in those
+    features keep that pick off the MoE term, which the dummies move. Each
+    rank's view states the group's tokens, a dummy's one among them, and its
+    dummies; each step is priced by `law` as `_merged_price` prices it."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for i in range(n):
+        dummies = range(DP - i % DP, DP)
+        rows = [int(rng.integers(150_000, 200_000)) for _ in range(RUNG)]
+        contexts = [[1] if r in dummies else rows for r in range(DP)]
+        tokens = sum(map(len, contexts))
+        views = [
+            BatchView(
+                tuple(RequestShape(1, c, True) for c in mine),
+                capture_rung=RUNG,
+                moe_rows=DP * RUNG,
+                moe_tokens=tokens,
+                dp_dummy=r in dummies,
+                group_dummies=len(dummies),
+            )
+            for r, mine in enumerate(contexts)
+        ]
+        out.append((views, max(_merged_price(v, law) for v in views)))
+    return out
+
+
+def _dummy_records(path, groups):
+    """Rank `r`'s record of `groups`, every rank's label the group's step, a
+    dummy rank's line written as ATOM writes a dummy forward's: no request,
+    its one row."""
+    path.mkdir()
+    paths = []
+    for r in range(DP):
+        steps = [
+            ([(1, row.context_tokens, True) for row in v[r].requests], RUNG, seconds)
+            for v, seconds in groups
+        ]
+        record = _record(path / f"dp{r}.jsonl", steps)
+        lines = [json.loads(line) for line in record.read_text().splitlines()]
+        for line, (v, _) in zip(lines, groups):
+            line.update(dp_rank=r, moe_rows=v[r].moe_rows, moe_tokens=v[r].moe_tokens)
+            if v[r].dp_dummy:
+                line.update(is_dummy_run=True, batch=[])
+        record.write_text("".join(json.dumps(line) + "\n" for line in lines))
+        paths.append(record)
+    return paths
+
+
+def test_a_group_s_dummy_forwards_reach_one_token_s_experts_in_the_fit(tmp_path):
+    """Idle ranks run dummy forwards on most steps, from none to three a step:
+    the routed fit reads each step's dummies off its ranks' lines and recovers
+    the law whose experts count them as one token."""
+    runs = [_dummy_records(tmp_path / f"run{s}", _dummy_groups(s, 200)) for s in (0, 1)]
+    law, samples, _ = _routed(runs[0] + runs[1])
+    assert {s.view.group_dummies for s in samples} == {0, 1, 2, 3}
+    vector = law["decode"][str(RUNG)]
+    figures = vector["fit"]["moe_column"]
+    assert figures["adopted"] == figures["picked"] == "moe_experts"
+    assert figures["held_out"]["moe_experts"]["error"] == pytest.approx(0, abs=1e-6)
+    fitted = {f: vector["coefficients"][f] for f in EXPERTS}
+    assert fitted == pytest.approx(EXPERTS, rel=1e-6)
+
+
+def test_the_backend_counts_a_group_s_dummies_as_one_token_in_the_experts(cells):
+    full, sparse = cells
+    law = _routed(full + sparse)[0]
+    backend = StepLinearBackend(StepLinearLaw(law), DP)
+    slope = law["decode"][str(RUNG)]["coefficients"]["moe_experts"]
+    view = _view((180_000, 20_000, 30_000, 40_000), 12)
+
+    def experts(dummies):
+        cost = backend.price(dataclasses.replace(view, group_dummies=dummies))
+        return {t.name: t.seconds for t in cost.terms}["decode.moe_experts"]
+
+    for dummies in (0, 1, 2, 3):
+        reached = activated_experts(*ROUTING, 12 - max(dummies - 1, 0))
+        assert experts(dummies) == pytest.approx(reached * slope, rel=1e-12)
+    assert experts(1) == experts(0) > experts(2) > experts(3)
+
+
+def test_the_tokens_column_counts_each_dummy_s_row(tmp_path):
+    full, sparse = _cells(tmp_path, TOKENS)
+    backend = StepLinearBackend(StepLinearLaw(_routed(full + sparse)[0]), DP)
+    view = _view((180_000, 20_000, 30_000, 40_000), 11)
+
+    def priced(dummies):
+        return backend.price(dataclasses.replace(view, group_dummies=dummies)).seconds
+
+    assert priced(3) == priced(0) == pytest.approx(_price(view, TOKENS))
+
+
+def test_the_cost_check_prices_each_step_with_its_group_s_dummies(tmp_path):
+    runs = [_dummy_records(tmp_path / f"run{s}", _dummy_groups(s, 200)) for s in (0, 1)]
+    law = _routed(runs[0] + runs[1])[0]
+    _dummy_records(tmp_path / "held", _dummy_groups(2, 200))
+    graded = cost_accuracy(tmp_path / "held", law)["graded"]["decode"]
+    assert graded["on_totals"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_simulated_dp_step_states_its_group_s_dummy_forwards(dp2):  # noqa: F811
+    """Rank 1 has no work on the first step and runs ATOM's dummy forward:
+    both ranks price a view stating one dummy. On the second both work."""
+    backends = [Recording(), Recording()]
+    ranks = [runner(b, dp_size=2, dp_rank=r) for r, b in enumerate(backends)]
+    dp2(
+        lambda: [ranks[0].forward(prefill(40)) for _ in range(2)],
+        lambda: [ranks[1].dummy_execution(), ranks[1].forward(prefill(8))],
+    )
+    assert [[v.group_dummies for v in b.views] for b in backends] == [[1, 0], [1, 0]]
+    assert [b.views[0].dp_dummy for b in backends] == [False, True]
