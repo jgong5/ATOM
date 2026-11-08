@@ -68,7 +68,7 @@ from unittest.mock import patch
 
 import numpy
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils import _pytree
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -1523,9 +1523,6 @@ class Tracer:
         runner, recorder, fake_mode = self.runner, self.recorder, self.fake_mode
         stateful, v41, own = self.stateful, self.v41, self.own
         block_size = config.kv_cache_block_size
-        # A dead storage's role answers no later step: a runner stepped through
-        # many shapes holds the roles of what lives, not of all it ever made.
-        recorder.roles = {k: v for k, v in recorder.roles.items() if not k.expired()}
         blocks = max(
             KV_BLOCKS,
             *(_batch(s, block_size, max(CONTEXTS), True, drafts)[1] for s in shapes),
@@ -1539,6 +1536,12 @@ class Tracer:
             # collection need walk them again.
             gc.collect()
             gc.freeze()
+        # What earlier steps left answers none of these steps: the roles of
+        # storages that died, the leaves replayed, the fake mode's cached
+        # outputs. A runner stepped through many shapes holds one call's worth.
+        recorder.roles = {k: v for k, v in recorder.roles.items() if not k.expired()}
+        recorder.replayed.clear()
+        FakeTensorMode.cache_clear()
         # A prefill of `unsplit` ran as one forward: this rank cannot split it.
         unsplit = {s for s in unsplit if s.phase == "prefill"}
         # A prefill is traced as a middle chunk, which samples nothing, then as

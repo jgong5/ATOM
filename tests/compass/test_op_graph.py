@@ -1479,23 +1479,30 @@ def test_a_run_s_lazy_traces_share_one_process_and_trace_as_a_process_each(
     assert (len(spawned), lazy["lazy_traces"], made) == (1, 3, (1, 2))
 
 
-def _held(atom_args) -> list[int]:
-    """In a lookup's lazy-trace process: the roles its tracer of the 27B under
-    `atom_args` holds after each of two more traces of a decode B=2."""
+def _held(atom_args) -> list[tuple[int, int, int]]:
+    """In a lookup's lazy-trace process: what its tracer of the 27B under
+    `atom_args` holds after each of three more traces, of a decode B=2, a B=3
+    and a B=2 again: its storage roles, the leaves it replayed and the fake
+    mode's cached outputs."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
     from atom.compass.capture.forward import decode
     from atom.compass.drive.runfile import _engine_args, engine_only
 
     model, kept = _engine_args(atom_args).model, tuple(engine_only(atom_args))
     _, tracer = compass_run._tracer(model, 1, kept, "gfx942")
     held = []
-    for _ in range(2):
-        for _ in tracer.trace([decode(2)], [decode(2)]):
+    for shape in (decode(2), decode(3), decode(2)):
+        for _ in tracer.trace([shape], [shape]):
             pass
-        held.append(len(tracer.recorder.roles))
+        recorder = tracer.recorder
+        held.append(
+            (len(recorder.roles), len(recorder.replayed), len(FakeTensorMode.cache))
+        )
     return held
 
 
-def test_a_warm_tracer_holds_no_role_of_a_storage_an_earlier_trace_freed(
+def test_a_warm_tracer_holds_one_trace_s_worth_whatever_it_traced_before(
     tmp_path_factory, tmp_path, monkeypatch
 ):
     spawned = _spawned(monkeypatch)
@@ -1503,10 +1510,11 @@ def test_a_warm_tracer_holds_no_role_of_a_storage_an_earlier_trace_freed(
     assert isinstance(lookup("decode", 2, 2), dict)
     model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
 
-    # Each trace adds its own storages' roles and drops those of storages that
-    # died: a run's thousands of shapes hold what one does.
+    # A trace keeps nothing of the one before it but the runner: the second
+    # decode B=2 holds the roles and replays the first did, and a fake-mode
+    # cache kept across traces could only have grown past the B=3's.
     held = spawned[0].submit(_held, ["--model", str(model)]).result()
-    assert held[0] == held[1], held
+    assert held[0][:2] == held[2][:2] and held[2][2] < held[1][2], held
 
 
 def _alive(pid: int) -> bool:
