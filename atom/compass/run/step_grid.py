@@ -128,11 +128,18 @@ def keyed(config, ladder: bool = True) -> dict:
         "enable_expert_parallel": config.enable_expert_parallel,
         "enable_tbo": config.enable_tbo,
         "enable_tbo_decode": config.enable_tbo_decode,
-        "env": {
-            k: v
-            for k, v in sorted((performance_env() | _buckets_off_default()).items())
-            if not (k.startswith("AIPERF_") or k.endswith("_VISIBLE_DEVICES"))
-        },
+        "env": keyed_env(),
+    }
+
+
+def keyed_env() -> dict:
+    """This process's performance environment as `keyed` states it: less the
+    client's variables and the device selection, `BUCKETS` in it only off
+    ATOM's default."""
+    return {
+        k: v
+        for k, v in sorted((performance_env() | _buckets_off_default()).items())
+        if not (k.startswith("AIPERF_") or k.endswith("_VISIBLE_DEVICES"))
     }
 
 
