@@ -100,3 +100,22 @@ def test_a_record_served_fifo_per_rail_is_fitted_by_the_rail_fifo_alone(tmp_path
     assert errors["rail", "shared"] == pytest.approx([0.5, 0, 0], abs=1e-9)
     for unit in ("pair", "prefill rank"):
         assert sorted(errors[unit, "fifo"]) == pytest.approx([-1 / 3, 0, 0])
+
+
+def test_fit_publishes_the_port_rate_and_the_link_it_attains(tmp_path, capsys):
+    rates = {r: 5e10 for r in range(rdma.GPUS)}
+    targets = {r: {"target": f"d:{r}", "addr": 0, "rate": 5e10} for r in rates}
+    lines = [{"exp": "env", "env": {}, "rates": rates, "targets": targets}]
+    for i in range(rdma.REPS):
+        for g, r, n in ((g, r, n) for g in (0, 1) for r in (0, 1) for n in rdma.SIZES):
+            t = (6e-6 if i % 2 else 4e-6) + n / (1e10 if g == r else 8e9)
+            lines.append({"exp": "sweep", "gpu": g, "rail": r, "round": i,
+                          "bytes": n, "t": [0, round(t * 1e9), True]})  # fmt: skip
+    bench = tmp_path / "bench.jsonl"
+    bench.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    rdma.main(["fit", str(bench)])
+    published = capsys.readouterr().out.split("published (all): ")[1]
+    found = json.loads(published.splitlines()[0])
+    assert found["link_bandwidth_bytes_per_s"] == [5e10, 5e10, 5e10]
+    assert found["link_latency_s"][1:] == pytest.approx([4e-6, 6e-6], rel=0.05)
+    assert 8e9 / 5e10 < found["derate"][0] < 1e10 / 5e10

@@ -6,27 +6,25 @@ the link values and write discipline fitted from it and a recorded P/D run.
     rdma_link.py bench --ip IP --targets TARGETS --out BENCH
     rdma_link.py fit BENCH [RECORD_DIR]
 
-`target` runs on the decode node: an engine per rail N on its HCA (`--hca`,
-`ionic_N`), holding `BUFFER` bytes of GPU N, until it is killed. `bench` runs
-on the prefill node: a process per GPU, as each prefill rank is one, writing
-from its GPU through an engine started on the rail it names, as
-`RailEnginePool` starts one under matched rails, in `ENTRY`-byte entries cut
-into the connector's batches. Both ends need the settings of a 1P1D
-deployment over RDMA (`scripts/compass/README.md`). The bench writes a JSON
-line per write: `startup`, a rail engine's start, its first write and the
-next; `sweep`, one writer at each of `SIZES`, every GPU on its own rail and
-on the next GPU's; `rail`, 1 to 16 writers into one rail from GPUs `i % 8`,
-started together each round; `spread`, GPU 0 writing on 1 to 8 rails at once.
+`target`, on the decode node, holds `BUFFER` bytes of each GPU N registered
+with an engine on N's HCA, as the connector picks it, until it is killed.
+`bench`, on the prefill node, runs a process per GPU, as each prefill rank is
+one, writing from its GPU through an engine it starts on the rail it names, as
+`RailEnginePool` does under matched rails, in `ENTRY`-byte entries cut into
+the connector's batches. It writes a JSON line per write: `startup`, a rail
+engine's start, its first write and the next; `sweep`, one writer at each of
+`SIZES`, every GPU on its own rail and on the next GPU's; `rail`, 1 to 16
+writers into one rail from GPUs `i % 8`, started together each round;
+`spread`, GPU 0 writing on 1 to 8 rails at once.
 
-`fit` reads only the standard library and `atom.compass.kv.transfer`. It
-prints each rail case's link, `latency + bytes / bandwidth` fitted on relative
-error, with the p10 and p90 of its fits per round; the start-ups; each
-concurrency's finishing spread (the last write's time over the first's) and
-aggregate rate; and, given the record directory of a Mooncake P/D run
-(`atom/compass/parity/writes.py`), each sharing unit's error when every
-`_rdma_write` call is replayed at its recorded start through the `own` link,
-one at a time on a `Link` (FIFO) or with the calls in flight splitting the
-bandwidth evenly (shared).
+`fit` prints each rail case's link, `latency + bytes / bandwidth` fitted on
+relative error, with the p10 and p90 of its fits per round; the start-ups;
+each concurrency's finishing spread (the slowest write's time over the
+fastest's) and aggregate rate; and, given the record directory of a Mooncake
+P/D run (`atom/compass/parity/writes.py`), each sharing unit's error when
+every `_rdma_write` call is replayed at its recorded start on the `PUBLISHED`
+link, one at a time on a `Link` (FIFO) or splitting the bandwidth evenly
+among the calls in flight (shared).
 """
 
 import argparse
@@ -46,24 +44,38 @@ SIZES = [ENTRY << 2 * i for i in range(8)]  # 64 KiB to 1 GiB
 REPS = 8
 ROUND_BYTES = 256 << 20
 FLOOR = 2e9  # rounds are spaced as if writes moved no faster than this
+#: The rail case whose link `fit` publishes and replays the record on.
+PUBLISHED = "all"
+#: A startup line's `t`, `[start, first write, next write]`, read as times.
+STARTUP = {
+    "engine start": lambda t: (t[1][0] - t[0]) / 1e6,
+    "first write": lambda t: (t[1][1] - t[1][0]) / 1e6,
+    "next write": lambda t: (t[2][1] - t[2][0]) / 1e6,
+}
 
 
-def port_rate(hca: str) -> float:
-    """The bytes per second `hca`'s port negotiated."""
-    rate = Path(f"/sys/class/infiniband/{hca}/ports/1/rate").read_text()
+def hca(gpu: int) -> str:
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    return mc._auto_select_ib_device(gpu)
+
+
+def port_rate(gpu: int) -> float:
+    """The bytes per second the port of `gpu`'s HCA negotiated."""
+    rate = Path(f"/sys/class/infiniband/{hca(gpu)}/ports/1/rate").read_text()
     return float(rate.split()[0]) * 1e9 / 8
 
 
-def engine(ip: str, hca: str, buf):
+def engine(ip: str, rail: int, buf):
     from mooncake.engine import TransferEngine
 
     e = TransferEngine()
-    ok = e.initialize(ip, "P2PHANDSHAKE", "rdma", hca) == 0
+    ok = e.initialize(ip, "P2PHANDSHAKE", "rdma", hca(rail)) == 0
     for off in range(0, buf.numel(), CHUNK):
         size = min(CHUNK, buf.numel() - off)
         ok = ok and e.register_memory(buf.data_ptr() + off, size) == 0
     if not ok:
-        raise RuntimeError(f"a Mooncake engine on {hca} did not start or register")
+        raise RuntimeError(f"a Mooncake engine on {hca(rail)} did not start")
     return e
 
 
@@ -100,82 +112,64 @@ def target(args) -> None:
     held, out = [], {}
     for r in range(GPUS):
         buf = torch.empty(BUFFER, dtype=torch.uint8, device=f"cuda:{r}")
-        e = engine(args.ip, args.hca.format(r), buf)
-        held.append((buf, e))
-        out[r] = {"target": f"{args.ip}:{e.get_rpc_port()}", "addr": buf.data_ptr()}
-        out[r]["rate"] = port_rate(args.hca.format(r))
+        held.append((buf, engine(args.ip, r, buf)))
+        addr = f"{args.ip}:{held[-1][1].get_rpc_port()}"
+        out[r] = {"target": addr, "addr": buf.data_ptr(), "rate": port_rate(r)}
     Path(args.out).write_text(json.dumps(out))
     threading.Event().wait()
 
 
-def worker(gpu, ip, hca, targets, inbox, outbox) -> None:
+def worker(gpu, ip, targets, inbox, outbox) -> None:
     """GPU `gpu`'s writes: each command's rails, a thread each, at its starts."""
     import torch
 
-    from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
-        MooncakeConnector,
-    )
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
 
-    per_batch = MooncakeConnector._MAX_RDMA_ENTRIES_PER_BATCH
+    per_batch = mc.MooncakeConnector._MAX_RDMA_ENTRIES_PER_BATCH
     buf = torch.empty(BUFFER, dtype=torch.uint8, device=f"cuda:{gpu}")
+    plan = lambda r, n: batches(buf.data_ptr(), targets[r]["addr"], n, per_batch)
     engines, lines = {}, []
     while (cmd := inbox.get()) is not None:
+        rails, line = cmd
         lines.clear()
-        for r in dict.fromkeys(cmd["rails"]):
+        for r in dict.fromkeys(rails):
             if r not in engines:
                 t0 = time.monotonic_ns()
-                engines[r] = engine(ip, hca.format(r), buf)
-                small = batches(buf.data_ptr(), targets[r]["addr"], ENTRY, per_batch)
-                cold = write(engines[r], targets[r]["target"], small)
-                warm = write(engines[r], targets[r]["target"], small)
-                init = [t0, cold[0]]
+                e = engines[r] = engine(ip, r, buf)
+                t = [t0] + [
+                    write(e, targets[r]["target"], plan(r, ENTRY)) for _ in range(2)
+                ]
                 lines.append(
-                    {
-                        "exp": "startup",
-                        "during": cmd["exp"],
-                        "gpu": gpu,
-                        "rail": r,
-                        "init": init,
-                        "first": cold,
-                        "next": warm,
-                    }
+                    {"exp": f"startup {line['exp']}", "gpu": gpu, "rail": r, "t": t}
                 )
         outbox.put(None)
         starts = inbox.get()
 
-        def run(r, starts):
-            plan = batches(buf.data_ptr(), targets[r]["addr"], cmd["bytes"], per_batch)
+        def run(r, starts, line):
+            batched = plan(r, line["bytes"])
             for i, at in enumerate(starts):
                 wait_until(at)
-                t = write(engines[r], targets[r]["target"], plan)
-                lines.append(
-                    {
-                        "exp": cmd["exp"],
-                        "gpu": gpu,
-                        "rail": r,
-                        "round": i,
-                        "writers": cmd["writers"],
-                        "bytes": cmd["bytes"],
-                        "t": t,
-                    }
-                )
+                t = write(engines[r], targets[r]["target"], batched)
+                lines.append({**line, "gpu": gpu, "rail": r, "round": i, "t": t})
 
-        threads = [threading.Thread(target=run, args=(r, starts)) for r in cmd["rails"]]
-        [t.start() for t in threads]
-        [t.join() for t in threads]
+        threads = [threading.Thread(target=run, args=(r, starts, line)) for r in rails]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
         outbox.put(list(lines))
 
 
 def experiments(rail: int):
-    """`(experiment, [(gpu, rail)], bytes, rounds)`, in the order they run."""
+    """`(experiment, [(gpu, rail)], bytes)`, in the order they run, `REPS` rounds each."""
     for g in range(GPUS):
         for r in (g, (g + 1) % GPUS):
             for n in SIZES:
-                yield "sweep", [(g, r)], n, REPS
+                yield "sweep", [(g, r)], n
     for k in (1, 2, 4, 8, 16):
-        yield "rail", [(i % GPUS, rail) for i in range(k)], ROUND_BYTES, REPS
+        yield "rail", [(i % GPUS, rail) for i in range(k)], ROUND_BYTES
     for m in (1, 2, 4, 8):
-        yield "spread", [(0, r) for r in range(m)], ROUND_BYTES, REPS
+        yield "spread", [(0, r) for r in range(m)], ROUND_BYTES
 
 
 def bench(args) -> None:
@@ -186,30 +180,30 @@ def bench(args) -> None:
     ctx = mp.get_context("spawn")
     outbox, inboxes = ctx.Queue(), [ctx.Queue() for _ in range(GPUS)]
     for g in range(GPUS):
-        work = (g, args.ip, args.hca, targets, inboxes[g], outbox)
+        work = (g, args.ip, targets, inboxes[g], outbox)
         ctx.Process(target=worker, args=work, daemon=True).start()
     env = {k: os.environ.get(k) for k in ("MC_IB_TC", "MOONCAKE_DISABLE_HIP_DMABUF")}
-    rates = {r: port_rate(args.hca.format(r)) for r in range(GPUS)}
-    head = {"exp": "env", "env": env, "rates": rates, "targets": targets}
+    rates = {r: port_rate(r) for r in range(GPUS)}
     with open(args.out, "w") as out:
-        out.write(json.dumps(head) + "\n")
-        for exp, writers, n, rounds in experiments(args.rail):
+        out.write(json.dumps({"env": env, "rates": rates, "targets": targets}) + "\n")
+        for exp, writers, n in experiments(args.rail):
             by_gpu = {}
             for g, r in writers:
                 by_gpu.setdefault(g, []).append(r)
+            line = {"exp": exp, "writers": len(writers), "bytes": n}
             for g, rails in by_gpu.items():
-                inboxes[g].put(
-                    {"exp": exp, "rails": rails, "bytes": n, "writers": len(writers)}
-                )
-            [outbox.get(timeout=600) for _ in by_gpu]  # every engine started
+                inboxes[g].put((rails, line))
+            for _ in by_gpu:  # every engine started
+                outbox.get(timeout=600)
             gap = 0.01 + len(writers) * n / FLOOR
             t0 = time.monotonic_ns() + 200_000_000
-            starts = [t0 + round(i * gap * 1e9) for i in range(rounds)]
-            [inboxes[g].put(starts) for g in by_gpu]
+            for g in by_gpu:
+                inboxes[g].put([t0 + round(i * gap * 1e9) for i in range(REPS)])
             for _ in by_gpu:
                 out.writelines(json.dumps(x) + "\n" for x in outbox.get(timeout=600))
             out.flush()
-    [q.put(None) for q in inboxes]
+    for q in inboxes:
+        q.put(None)
 
 
 def link(rows) -> tuple:
@@ -295,29 +289,35 @@ def fit(args) -> None:
         f"port rate, B/s: {min(rates):.4g} to {max(rates):.4g} over {len(rates)} ports"
     )
     sweep = [x for x in lines if x["exp"] == "sweep" and x["t"][2]]
-    cases = {}
-    for case in ("own", "next"):
-        rows = [x for x in sweep if (x["gpu"] == x["rail"]) == (case == "own")]
-        pts = lambda xs: [(x["bytes"], (x["t"][1] - x["t"][0]) / 1e9) for x in xs]
+    pts = lambda xs: [(x["bytes"], (x["t"][1] - x["t"][0]) / 1e9) for x in xs]
+    cases, links = {}, {}
+    for case, rows in (
+        ("own", [x for x in sweep if x["gpu"] == x["rail"]]),
+        ("next", [x for x in sweep if x["gpu"] != x["rail"]]),
+        ("all", sweep),
+    ):
         fits = [link(pts(x for x in rows if x["round"] == i)) for i in range(REPS)]
-        cases[case] = link(pts(rows))
-        lat, bw = band([f[0] for f in fits]), band([f[1] for f in fits])
+        lat, bw = links[case] = link(pts(rows))
+        lat_band, bw_band = band([f[0] for f in fits]), band([f[1] for f in fits])
+        port = max(rates)
+        cases[case] = {
+            "link_bandwidth_bytes_per_s": [port, min(rates), max(rates)],
+            "link_latency_s": [lat, *lat_band],
+            "derate": [bw / port, *(b / port for b in bw_band)],
+        }
         print(
-            f"{case} rail: latency {cases[case][0]:.4g} s (p10 {lat[0]:.4g}, p90 "
-            f"{lat[1]:.4g}), bandwidth {cases[case][1]:.4g} B/s (p10 {bw[0]:.4g}, "
-            f"p90 {bw[1]:.4g}), derate {cases[case][1] / max(rates):.4g}"
+            f"{case} rail, [value, p10, p90]: latency {cases[case]['link_latency_s']}"
+            f", bandwidth {[bw, *bw_band]}, derate {cases[case]['derate']}"
         )
-    ms = lambda t: (t[1] - t[0]) / 1e6
+    print(f"published ({PUBLISHED}): {json.dumps(cases[PUBLISHED])}")
     starts = {}
-    for x in (x for x in lines if x["exp"] == "startup"):
-        starts.setdefault(x["during"], []).append(x)
-    for during, xs in starts.items():
-        p50 = [
-            statistics.median(ms(x[k]) for x in xs) for k in ("init", "first", "next")
-        ]
+    for x in (x for x in lines if x["exp"].startswith("startup")):
+        starts.setdefault(x["exp"], []).append(x["t"])
+    for exp, ts in starts.items():
+        p50 = [statistics.median(f(t) for t in ts) for f in STARTUP.values()]
         print(
-            f"startup during {during}, {len(xs)} engines, p50: start {p50[0]:.1f}"
-            f" ms, first write {p50[1]:.2f} ms, next {p50[2]:.2f} ms"
+            f"{exp}, {len(ts)} engines, p50 ms: "
+            + ", ".join(f"{k} {v:.2f}" for k, v in zip(STARTUP, p50))
         )
     for exp in ("rail", "spread"):
         rounds = {}
@@ -327,7 +327,7 @@ def fit(args) -> None:
             spread, rate = [], []
             for (w, _), xs in rounds.items():
                 if w == k:
-                    secs = [ms(x["t"]) / 1e3 for x in xs]
+                    secs = [x["t"][1] - x["t"][0] for x in xs]
                     span = max(x["t"][1] for x in xs) - min(x["t"][0] for x in xs)
                     spread.append(max(secs) / min(secs))
                     rate.append(sum(x["bytes"] for x in xs) / span * 1e9)
@@ -340,7 +340,7 @@ def fit(args) -> None:
         print(f"record: {len(found)} calls, {sum(c[3] for c in found)} bytes")
         for unit in UNITS:
             for name, discipline in (("FIFO", fifo), ("shared", shared)):
-                errors = replay(found, unit, discipline, *cases["own"])
+                errors = replay(found, unit, discipline, *links[PUBLISHED])
                 p50, p90 = (
                     statistics.quantiles([abs(e) for e in errors], n=10)[i]
                     for i in (4, 8)
@@ -357,7 +357,6 @@ def main(argv=None) -> int:
     for verb in ("target", "bench"):
         p = sub.add_parser(verb)
         p.add_argument("--ip", required=True, help="this node's address")
-        p.add_argument("--hca", default="ionic_{}", help="rail N's HCA name")
         p.add_argument("--out", required=True)
     sub.choices["bench"].add_argument("--targets", required=True)
     sub.choices["bench"].add_argument("--rail", type=int, default=0)
