@@ -964,7 +964,16 @@ class _RecordingAuthority(ClockAuthority):
         return super().on_bind(lp)
 
     def on_request(
-        self, lp, kind, t, log, t_daemon=math.inf, member=None, steps=(), ahead=False
+        self,
+        lp,
+        kind,
+        t,
+        log,
+        t_daemon=math.inf,
+        member=None,
+        steps=(),
+        ahead=False,
+        rounds=(),
     ) -> list:
         first = lp == TRAFFIC and len(self.starts) == len(self.ends)
         if first and self.final_clocks is None:  # none opens after the finish
@@ -992,7 +1001,7 @@ class _RecordingAuthority(ClockAuthority):
                         self.steps.record(lp, clock, arrival, "release", ch, seq)
         else:
             replies = super().on_request(
-                lp, kind, t, log, t_daemon, member, steps, ahead
+                lp, kind, t, log, t_daemon, member, steps, ahead, rounds
             )
         while len(self.ends) < len(self.ended):
             self.ends.append(time.monotonic())

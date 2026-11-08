@@ -17,6 +17,10 @@ groups below defend:
 * **The deadlock the join exists for.** With one LP per rank, a rank woken by a
   message waits in the lockstep all-reduce for a rank that waits in NER with no
   message; with the join, both ranks are woken together.
+* **Later rounds in one call.** A member's TAR naming later rounds leaves every
+  grant and the timeline as one call a round does, and is answered once, at
+  its last round, with what each round released to it; a queued round that
+  cannot join is refused as a call would be.
 """
 
 import math
@@ -32,6 +36,7 @@ from atom.compass.clock import (
     ClockAuthority,
     LpId,
     LpRegistry,
+    TimelineLog,
     single_engine_table,
 )
 
@@ -273,3 +278,86 @@ def test_one_lp_per_rank_deadlocks_and_the_member_join_does_not():
     assert _lockstep(per_rank, ranks) == (("dp0",), 0, False)
     joined = {r: (ENGINE, r) for r in RANKS}
     assert _lockstep(_joined(), joined) == ((), 1, True)
+
+
+# --- later rounds in one call -------------------------------------------------
+
+REQ0, REQ1 = "frontend->engine:request#dp0", "frontend->engine:request#dp1"
+
+
+def _two_rounds(batched):
+    """Requests to both ranks, then a step of rounds 2.0 and 3.0 in which dp0
+    returns at 3.0 and dp1 at 2.0, owing 3.0: dp0 asks both rounds in one call
+    when `batched`, else one a call. Returns each member's replies and the
+    authority."""
+    ca = ClockAuthority(
+        _dp_table(("engine", "engine")),
+        timeline=TimelineLog(),
+        members={ENGINE: {rank: _own(rank) for rank in RANKS}},
+    )
+    log = [(REQ0, 0, 1.5), (REQ0, 1, 2.5), (REQ1, 0, 1.5)]
+    assert ca.on_request(FRONTEND, NER, INF, log) == []
+    calls = [("dp0", 2.0, [3.0] if batched else []), ("dp1", 2.0, [])]
+    calls += [("dp1", 3.0, [])] if batched else [("dp0", 3.0, []), ("dp1", 3.0, [])]
+    replies = []
+    for member, t, rounds in calls:
+        got = ca.on_request(ENGINE, TAR, t, [], member=member, rounds=rounds)
+        replies += [(i[1], g, released) for i, g, released in got]
+    return replies, ca
+
+
+def test_a_call_naming_later_rounds_is_answered_once_with_what_each_released():
+    replies, ca = _two_rounds(batched=True)
+    assert replies == [
+        ("dp1", 2.0, {REQ1: [(0, 1.5)]}),
+        ("dp0", 3.0, {REQ0: [(0, 1.5), (1, 2.5)]}),
+        ("dp1", 3.0, {REQ1: []}),
+    ]
+    one_a_call, each = _two_rounds(batched=False)
+    assert [(m, g) for m, g, _ in one_a_call] == [
+        ("dp0", 2.0),
+        ("dp1", 2.0),
+        ("dp0", 3.0),
+        ("dp1", 3.0),
+    ]
+    # Each round is still its own grant, releasing what it released.
+    assert ca.timeline.records() == each.timeline.records()
+    assert ca.grants == each.grants and ca.grants["engine"] == 2
+    assert (ca.requests_served["engine"], each.requests_served["engine"]) == (3, 4)
+
+
+@pytest.mark.parametrize(
+    "lp, member, kind, t, rounds, needle",
+    [
+        (FRONTEND, None, TAR, 1.0, [2.0], "only a member's TAR asks later rounds"),
+        (ENGINE, "dp0", NER, 1.0, [2.0], "only a member's TAR asks later rounds"),
+        (ENGINE, "dp0", TAR, 2.0, [2.0], "each past the one before"),
+        (ENGINE, "dp0", TAR, 2.0, [3.0, 2.5], "each past the one before"),
+        (ENGINE, "dp0", TAR, 2.0, [INF], "must be a finite number"),
+    ],
+    ids=["no-member", "ner", "repeated", "descending", "infinite"],
+)
+def test_later_rounds_are_a_members_tar_each_past_the_one_before(
+    lp, member, kind, t, rounds, needle
+):
+    ca = _joined()
+    with pytest.raises(ValueError, match=re.escape(needle)):
+        ca.on_request(lp, kind, t, [], member=member, rounds=rounds)
+    assert ca.lp_table() == _joined().lp_table()
+
+
+def test_a_queued_round_that_cannot_join_is_refused_as_a_call_would_be():
+    def asked(*calls):
+        ca = _joined()
+        ca.on_request(FRONTEND, NER, INF, [])
+        for member, t, rounds in calls:
+            ca.on_request(ENGINE, TAR, t, [], member=member, rounds=rounds)
+        return ca
+
+    unequal = "engine: dp1 asked TAR(3.0) while dp0 asked TAR(2.0)"
+    with pytest.raises(ClockAbort, match="^" + re.escape(unequal)):
+        asked(("dp0", 1.0, [2.0]), ("dp1", 1.0, [3.0]))
+    ca = asked(("dp0", 1.0, [2.0]), ("dp1", 1.0, []))
+    again = "engine: dp0 called again before dp1 called"
+    with pytest.raises(ClockAbort, match="^" + re.escape(again)):
+        ca.on_request(ENGINE, NER, INF, [], member="dp0")

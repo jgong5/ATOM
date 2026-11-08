@@ -157,6 +157,28 @@ def test_sends_are_stamped_now_plus_lookahead_and_ride_the_next_request():
         call(rt.advance_to, 0.1)
 
 
+def test_a_member_asks_its_rounds_to_its_pull_in_one_call_and_its_owed_in_one_more():
+    thread, call = _owner()
+    conn = FakeConn((0.3, {}), (0.5, {}))
+    conn.member = "dp0"
+    rt = LPRuntime(ENGINE, _table(), conn, owner=thread)
+    call(rt.stamp_send, OUT)
+    call(rt.advance_group, [0.2, 0.1, 0.4, 0.3, 0.5, 0.3], 0.3)
+    assert (rt.now, rt.owed) == (0.3, [0.4, 0.5])
+    call(rt.stamp_send, OUT)
+    call(rt.settle)
+    assert conn.sent == [
+        ("TAR", 0.1, [(OUT, 0, IPC)], INF, [], False, [0.2, 0.3]),
+        ("TAR", 0.4, [(OUT, 1, 0.3 + IPC)], INF, [], False, [0.5]),
+    ]
+    assert (rt.now, rt.owed, rt.calls) == (0.5, [], 1)
+    # An LP without members asks each round in a call of its own.
+    plain = FakeConn((0.1, {}), (0.2, {}), (0.3, {}))
+    rt = LPRuntime(ENGINE, _table(), plain, owner=thread)
+    call(rt.advance_group, [0.1, 0.2, 0.3], 0.3)
+    assert plain.sent == [("TAR", t, [], INF) for t in (0.1, 0.2, 0.3)]
+
+
 def test_the_inf_grant_closes_the_clock_and_leaves_sends_stamped_inf():
     rt, call = _runtime(ENGINE, (INF, {}))
     rt.start_run()

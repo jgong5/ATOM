@@ -169,11 +169,11 @@ class _Server:
                     )
                     replies = [(i, self._ended) for i in list(self._slots)]
             elif self._ended is None:
-                kind, t, log, t_daemon, *steps_ahead = request
+                kind, t, log, t_daemon, *steps_ahead_rounds = request
                 try:
                     try:
                         grants = self._authority.on_request(
-                            lp, kind, t, log, t_daemon, member, *steps_ahead
+                            lp, kind, t, log, t_daemon, member, *steps_ahead_rounds
                         )
                     except (KeyError, ValueError) as refused:
                         replies = [(address, encode(_refusal(refused)))]
@@ -266,8 +266,10 @@ class _Connection:
 
     def __init__(self, server: _Server, lp: LpId, member: str | None = None) -> None:
         self._server = server
-        # `joined`: the clock and next sequence numbers the LP starts from.
+        # `joined`: the clock and next sequence numbers the LP starts from;
+        # `member`: the member of `lp` it is bound as, or None.
         self._lp, self._slot, self.joined = server.bind(encode((BIND, lp, member)))
+        self.member = member
 
     def send(self, request: tuple) -> None:
         self._server.submit(self._lp, encode(request))
@@ -312,6 +314,7 @@ class _HereConnection(_Connection):
         self._lp, self._slot, self.joined = server.bind(
             encode((BIND, lp, member)), _ReadableSlot()
         )
+        self.member = member
 
     def fileno(self) -> int:
         return self._slot.fileno()
