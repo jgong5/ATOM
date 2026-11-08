@@ -507,10 +507,10 @@ def fit_intake(paths) -> tuple[dict, dict]:
     """The ``http_intake`` term over the intake stamps each record in `paths`
     holds (`_intakes`), and its report: ``idle_s`` and ``per_byte_s`` by the
     host-law solver on the lone requests' CPU seconds over their body bytes;
-    ``fixed_s`` the loop's CPU time per request between template starts in the
-    longest burst, less ``per_byte_s`` times its mean body, each gap the next
-    request's; ``bytes`` the span of every request's body. Raises on too few
-    lone requests or no burst."""
+    ``bytes`` spans every request's body; ``fixed_s`` the loop's CPU time per
+    request between template starts in the longest burst, less ``per_byte_s``
+    times its mean body, each gap the next request's. Raises on too few lone
+    requests or no burst."""
     lone, bursts, bodies = [], [], []
     for path in paths:
         got = _intakes(path)
