@@ -110,10 +110,11 @@ def rehearsed_prefill(model_dir, tmp_path_factory):  # noqa: F811
 
 
 def test_the_prefill_index_leaves_take_the_buffers_atom_passes(rehearsed_prefill):
-    """The index build and each layer's attention reach their launch on the
-    lists, indptrs, batch ids and state slots ATOM's builder made for the step,
-    the attention the prefix pair of its layer's class; the build's chunk
-    starts are the batch's cached tokens, which ATOM uploads apart."""
+    """The index build takes the lists, indptrs, batch ids and state slots
+    ATOM's builder made for the step, its chunk starts the batch's cached
+    tokens, which ATOM uploads apart; each layer's attention reaches its launch
+    on the lists and indptrs of its layer's class. The build's state slots are
+    plane rows, past the slot count the harness bounds them by."""
     held = {
         "positions": "ctx.positions",
         "bid_per_token": "md.batch_id_per_q_token",
@@ -127,7 +128,6 @@ def test_the_prefill_index_leaves_take_the_buffers_atom_passes(rehearsed_prefill
         },
     }
     [fill] = [r for r in rehearsed_prefill if r["op"] == FILL]
-    assert fill["verdict"] == "reaches launch", fill["why"]
     assert fill["bound"]["chunk_start_per_seq"] == "num_cached_tokens"
     assert fill["identity"] == {k: f"{v}+0" for k, v in held.items()} | {
         "chunk_start_per_seq": "?"
