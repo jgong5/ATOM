@@ -144,7 +144,7 @@ def test_an_engine_built_in_a_simulated_run_rings_workers_that_sleep(
     monkeypatch, tmp_path
 ):
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 2.0**-10,
         "stream_s": 2.0**-9,
         "bound_s": 100.0,

@@ -54,6 +54,12 @@ decode point's rows share the fewest leading blocks that bring them into it,
 as a server's prefix cache lets rows share, and its line states them as
 `shared`; they are full blocks of the cached context, so at most
 floor(c / block size).
+
+`plan` also takes ragged views (`measure steps --ragged`), named lines as the
+steps are, and plans their cells as a step's, the cell of each one's longest
+row among them, which alpha's fit reads (`step_grid_fit.py`). A view places
+no node: the nodes are the steps' alone, so views planned in separate runs
+add points to one grid.
 """
 
 import bisect
@@ -285,10 +291,10 @@ def _line(step: int, phase: str, key: str, at: list, shared: int, width) -> dict
     } | ({"shared": shared} if shared else {})
 
 
-def plan(definition: dict, steps, engines: dict) -> dict:
-    """The points to measure for `steps` in the grid `definition` makes for
-    the engine `engines` states, a mapping from each input rank's name to the
-    engine it states.
+def plan(definition: dict, steps, engines: dict, views=()) -> dict:
+    """The points to measure for `steps`, and for the ragged `views`, in the
+    grid `definition` makes for the engine `engines` states, a mapping from
+    each input rank's name to the engine it states.
 
     It returns `graph_mode`, `scope` and `bounds`, under a drafter its
     `draft_width`, and `prefill` and `decode` in a bundle grid's layout
@@ -297,12 +303,12 @@ def plan(definition: dict, steps, engines: dict) -> dict:
     which that grid locates on the point's node, a decode point past the KV
     pool stating the blocks its rows share; `counts` per grid;
     `infeasible`, the points not planned and why; and `unplaced`, the steps
-    outside the grid with the backend's reason.
+    and views outside the grid with the backend's reason.
     """
-    steps = _views(steps)
+    steps, ragged = _views(steps), _views(views) if views else []
     definition = {**definition, **_target(definition, engines)}
     width = definition["draft_width"] + 1
-    for name, view in steps:
+    for name, view in steps + ragged:
         if other := sorted({r.query_tokens for r in view.decode} - {width}):
             many, n = "more than one token", other[0]
             if width > 1:
@@ -347,7 +353,7 @@ def plan(definition: dict, steps, engines: dict) -> dict:
     out = _layout(definition, b_nodes)
     grid = StepGrid({**out, "unit": "s"})
     planned, unplaced = defaultdict(set), []
-    for where, view in steps:
+    for where, view in steps + ragged:
         try:
             cells, at = grid.locate(view)
             corners = cells.corners(view, at)

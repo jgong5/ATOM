@@ -87,7 +87,7 @@ def test_a_server_whose_tokenizer_is_refused_exits_with_its_engine_gone(tmp_path
                 {
                     "clock_endpoint": f"tcp://127.0.0.1:{clock_port}",
                     "bound_s": 100.0,
-                    "admission_path": "serving",
+                    "admission_s": 0.54e-3,
                     "ipc_s": 2.0**-10,
                     "stream_s": 2.0**-9,
                     "host": {"tokenizer": TERM | {"backend": "slow"}},

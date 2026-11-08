@@ -72,7 +72,7 @@ def started(tmp_path, script) -> dict:
         f.chmod(0o755)
     out = tmp_path / "out"
     out.mkdir()
-    (out / "run.json").write_text(json.dumps({"kv_write_req_s": 1e-5}))
+    (out / "run.json").write_text(json.dumps({"router_s": 1e-5}))
     (tmp_path / "traces.jsonl").write_text('{"id": 0}\n')
     env = {k: v for k, v in os.environ.items() if k not in PERFORMANCE_KEYS}
     env.update(

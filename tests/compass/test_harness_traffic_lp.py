@@ -97,7 +97,7 @@ from atom.utils.clock import LPRuntime, Straggler
 from compass_harness import ADDRESS_ENV, fingerprint, traffic_lp
 
 #: The run file's table keys, as the deployment writes them.
-RUN = {"admission_path": "serving", "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+RUN = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
 TABLE = single_engine_table(**RUN)
 FRONTEND, ENGINE = LpId("frontend"), LpId("engine")
 INF = math.inf

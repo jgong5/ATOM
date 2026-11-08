@@ -446,10 +446,13 @@ collective) and interact only with lookahead > 0.
 ruling 2026-10-01, `12` T91, #528). Each DP rank is its own `EngineCore` process with its
 own `#dpN` channels and input and output threads, and holds its own LP runtime: its step
 loop is that member's clock owner, registers that rank's sends and releases its received
-frames. The CA completes the LP's request only when every member has called:
+frames. The CA completes each round of the LP only when every member has asked it:
 
-1. Every member makes the same number of CA calls per loop iteration; a per-member call
-   counter refuses a mismatch by name.
+1. Every member asks the same rounds per loop iteration; rounds are counted, not calls
+   (owner ruling on #2820, 2026-11-08). A member's TAR call may ask several rounds,
+   ascending, which the CA queues per member, and a round joins once it heads every
+   member's queue. A member that calls again before its round has joined is refused by
+   name.
 2. One request kind per round: TAR with equal `T` on every member, or NER with `t`
    and `t_daemon` each the minimum over members. Unequal `T` or mixed kinds are refused.
 3. Every member's send log is merged before any grant is computed, so the LP's promised
@@ -473,8 +476,11 @@ waits on its device, one with output other than the DP dummy, ends at the group'
 any other ends at its own seconds, as a real idle rank's forward returns on its own. Where
 `out_s` is set, each member then returns at its own pull, its end plus its `out_s`, and
 takes in arrivals there before `_sync_dp_state`; the pulls join the ends as rounds
-(`group_out`). Each member asks one TAR per distinct round, ascending, returns at its own
-pull (its own end where there is no `out_s`) and owes the rest. Until they are paid its sends are stamped at its own end; a TAR before
+(`group_out`). Each member asks every distinct round, ascending: those up to its own pull
+in one TAR call, which returns at its pull (its own end where there is no `out_s`), and
+the rest, which it owes, in one more call when it pays them (#2820). Each round is still
+its own grant, and a call's one reply releases what each of its rounds released to the
+member. Until the owed rounds are paid its sends are stamped at its own end; a TAR before
 the last owed round and any NER are refused; and every host collective on its clock owner
 thread, a `torch.distributed` collective whose tensors are all on the CPU or that has none,
 pays them first, as it returns at the latest arrival. A device collective returns once
@@ -798,17 +804,27 @@ receives it itself, at its own receive point.
 
 | Channel | Sender | Receiver (mode) | Lookahead |
 |---|---|---|---|
-| `traffic->frontend:http` | Compass traffic source | event loop (inline) | modelled admission delay. Path-specific; the values and what each was measured on are in `channels.py::ADMISSION_DELAY_S`. On the serving path it is the HTTP transport only, client send to the ASGI app call (#1381): the loop's intake after that call is the host laws' `http_intake`, charged by `HttpChannel` (`06` D33). Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. 1P+1D adds the router hop. |
-| `frontend->traffic:stream` | event loop, writing the SSE stream | traffic source (inline) | `stream_s`, measured (`drive/runfile.py::FIXED`) |
-| `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_request` | engine input thread, `poller.poll()` in `engine_core.py::EngineCore.process_input_sockets` (thread) | `ipc_s`, measured (`drive/runfile.py::FIXED`) |
-| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | `ipc_s`, measured (`drive/runfile.py::FIXED`) |
-| `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | `ipc_out_s`, measured (`drive/runfile.py::FIXED`); `ipc_s` when a run file has none |
+| `traffic->frontend:http` | Compass traffic source | event loop (inline) | `admission_s`, the HTTP transport alone, client send to the ASGI app call (#1381): the loop's intake after that call is the host laws' `http_intake`, charged by `HttpChannel` (`06` D33). Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. 1P+1D adds the router hop. |
+| `frontend->traffic:stream` | event loop, writing the SSE stream | traffic source (inline) | `stream_s` |
+| `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_request` | engine input thread, `poller.poll()` in `engine_core.py::EngineCore.process_input_sockets` (thread) | `ipc_s` |
+| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | `ipc_s` |
+| `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | `ipc_out_s` |
 | `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | the router's per-request forward cost (D7) |
-| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker. For a request that finishes before its write request, aborted while it waits, the scheduler-side `request_finished` (`scheduler.py::Scheduler._cleanup_aborted_load`) sends instead the notice that none will come, which retires prefill's send claim (Mooncake's `MSG_ABORT`) | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline); under prefill PP the head's, `engine-P-pp0` (D6) | stated request latency (D6) |
+| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker. For a request that finishes before its write request, aborted while it waits, the scheduler-side `request_finished` (`scheduler.py::Scheduler._cleanup_aborted_load`) sends instead the notice that none will come, which retires prefill's send claim (Mooncake's `MSG_ABORT`) | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline); under prefill PP the head's, `engine-P-pp0` (D6) | `kv_write_req_s`, a stated request latency (D6) |
 | PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py::PPStageTransport.send_metadata` / `send_tokens` / `send_kv_status` | the stage loop's own poll and receive (inline) | stated IPC delay: each is one ZMQ message, as on the frontend channels; the head's batch to stage `k` is `meta#pp<k>`. The hidden states between stages are `pp_data` (`15` D91). |
 | `engine-P->engine-D:prefill_done` (RapidServe only, in neither M1 nor M2) | prefill step loop, direct send in `engine_core.py::PrefillEngineCore._process_engine_step` | decode handler thread `DecodeEngineCore._recv_prefill_done`, `sock.recv()` (thread) | stated IPC delay |
 | `engine-D->engine-P:block_assignment` (RapidServe only, in neither M1 nor M2) | decode step loop, direct send in `engine_core.py::DecodeEngineCore._send_block_assignment` | prefill handler thread `PrefillEngineCore._recv_block_assignments`, `sock.recv()` (thread) | stated IPC delay |
 | `engine->lmcache:lookup#dpN`, `engine->lmcache:transfer#dpN.tpK` and their replies (`ATOM_KV_OFFLOAD=lmcache_mp` only) | D6.1 | D6.1 | stated `lmcache_ipc_s` |
+
+Each hop's lookahead is the run-file key of its name, which `drive/runfile.py` writes
+from the `hops` of the `host_laws` entry (`09` D54): `admission_s`, `ipc_s`,
+`ipc_out_s`, `stream_s` and `kv_write_req_s`. A prefill-decode run takes each side's
+from its own instance's entry, the one fitted under that instance's engine config: the
+top-level keys are prefill's, `decode_hops` holds decode's `ipc_s`, `ipc_out_s` and
+`stream_s`, and the write request, received by prefill, is prefill's. A hop no entry
+states takes one floor, 2^-14 s (`run.HOP_FLOOR_S`), and the run summary lists it under
+`unmeasured_hops`. Not 0 s: a zero lookahead puts every serving run on the
+deadlock-recovery path (Invariants). Each hop is one value, the delay it charges.
 
 The RapidServe rows exist only under `--enable-rapidserve` (D2), whose prefill and decode
 `EngineCore`s are two engine LPs of one deployment; they are the only channels received
@@ -1258,8 +1274,8 @@ The rules that settle the boundaries #53's categories left in the wrong place:
   sizes both). So the TP workers and every rank of a lockstep DP group sit in the engine
   LP, and a startup assertion refuses a process group whose ranks map to more than one
   LP.
-- **A DP step is one TAR per member release and per member pull; each member returns at
-  its own pull** (D3, #988, #1267, #1345). Each rank charges its own forward by the recurrence below, from the group's
+- **A DP step is one TAR round per member release and per member pull; each member
+  returns at its own pull** (D3, #988, #1267, #1345, #2820). Each rank charges its own forward by the recurrence below, from the group's
   device end, the `max` over ranks of each rank's absolute device end by one
   `all_reduce(MAX)`; the ranks exchange the step targets by one `all_gather` inside the
   predicted forward, and every rank calls the CA as a member of the LP (D3). With no host
@@ -1469,14 +1485,24 @@ launch_end = max(h, R7 - W_recv) + W_launch    # non-first PP stage: R7, the met
                                                # holds the launch after W_recv
 start      = max(end[n-1], h, R7)
 target_end = start + D_target
-end        = max(target_end + D_draft, launch_end)
 exit       = max(launch_end, R1) + W_post      # no MTP: R1 for an output forward
+end        = max(target_end, exit) + D_draft   # no draft: max(target_end, launch_end)
 charge     = exit - now                        # the K1 TAR: advance_to(exit)
 ```
 
 `end` and `target_end` are the runner's device state, kept across forwards; they never
 touch the clock. A device-bound forward charges device time and a host-bound one host
 time.
+
+**The draft starts no earlier than the exit** (owner ruling on
+[#2917](https://github.com/jgong5/ATOM/issues/2917#issuecomment-6686075949), 2026-11-06).
+The host queues a forward's drafter passes before it exits (the `propose` pass in
+`postprocess`, just before the draft copy wait), and a pass the device reaches first waits
+for it. So `max(target_end, exit)` bounds the draft's start for every drafter, one graph
+or serial passes alike, adds no host segment, and errs only by the host time after the
+pass. The draft's end reaches the timeline only through the next forward's `start` and
+R4, which a late pass moves only when it outlasts the next forward's `E + W_pre +
+W_inputs`.
 
 **After the return: `E_out`** (owner ruling on
 [#1345](https://github.com/jgong5/ATOM/issues/1345), 2026-10-18). `Scheduler.postprocess`,
@@ -2719,7 +2745,7 @@ Ordered by how much they could cost.
 | D0 | Fresh design; prior branches referenced at the design level only, not as a code-port plan | 2026-09-17 |
 | D1 | Keep ATOM's multi-process / multi-thread topology; additive changes only | 2026-09-17 |
 | D2 | "Two nodes" means true PD disaggregation, realised as two containers on one physical node | 2026-09-17 |
-| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP only after every rank has called; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares | 2026-09-18; revised 2026-09-28, 2026-10-02 and 2026-10-14 (#966) |
+| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP a round only after every rank has asked it; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares | 2026-09-18; revised 2026-09-28, 2026-10-02, 2026-10-14 (#966) and 2026-11-08 (#2820) |
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
 | D3.2 | Always-on causality detectors: a straggler check against the receiver's last drain (fails the run); a stall the CA cannot see prints one diagnostic after 30 wall seconds and keeps waiting, never aborting; clock-source CI lint | 2026-09-19; revised 2026-09-28 |
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for multi-container runs (1P+1D in M1 and M2) | 2026-09-19 |
