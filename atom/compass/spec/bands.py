@@ -3,12 +3,9 @@
 stated in `provenance.origins` beside its subject. Readers use the value. A
 count or a text is read, not sampled, and so is a field marked `exact`."""
 
-from collections.abc import Mapping
-
 from .fields import SCHEMA, Kind
-from .machine import MachineSpec, entry_label
+from .machine import MachineSpec
 from .rules import Rule, SpecRefusal
-from .tokenizers import ENTRY_FIELDS
 
 #: The kinds a probe samples.
 BANDED = (Kind.QUANTITY, Kind.BYTES)
@@ -16,22 +13,16 @@ BANDED = (Kind.QUANTITY, Kind.BYTES)
 
 def refuse_unbanded(spec: MachineSpec) -> None:
     """Refuse to publish `spec` while a probed number states no band, naming
-    each; a probed tokenizer entry states one per rate."""
-    owed = {
-        f.path: None
+    each."""
+    owed = [
+        f.path
         for f in SCHEMA
         if f.kind in BANDED and not f.exact and f.path in spec.values
-    }
-    rates = {f.path for f in ENTRY_FIELDS if f.kind in BANDED}
-    for e in spec.tokenizers.entries:
-        owed[entry_label(e.key.id, e.key.backend.value)] = rates
+    ]
     unbanded = []
-    for label, keys in owed.items():
+    for label in owed:
         found = spec.origin(label)
-        low = found.get("p10")
-        if found["origin"] == "probed" and (
-            low is None or (set(low) if isinstance(low, Mapping) else None) != keys
-        ):
+        if found["origin"] == "probed" and "p10" not in found:
             unbanded.append(f"`{label}`")
     if unbanded:
         raise SpecRefusal(

@@ -8,7 +8,6 @@ and uvicorn's server tick and keep-alive timeout.
 """
 
 import asyncio
-import copy
 import http.client
 import importlib.util
 import json
@@ -961,17 +960,14 @@ def test_a_cancel_on_the_relay_hangs_its_request_up_at_its_arrival_never_the_soc
 
 
 def _intake_run_file(monkeypatch, tmp_path, intake) -> None:
-    """A run file whose machine spec states `intake` as host.http_intake, or
-    with no machine spec for None."""
-    from test_memory_readings import DOCUMENT
-
+    """A run file whose host entry states `intake` as its http_intake, or
+    with no host entry for None."""
     from atom.compass import run as compass_run
 
     run = {"bound_s": 600.0}
     if intake is not None:
-        machine = run["machine"] = copy.deepcopy(DOCUMENT)
         terms = ("fixed_s", "per_byte_s", "idle_s")
-        machine["host"]["http_intake"] = dict(zip(terms, intake))
+        run["host"] = {"http_intake": dict(zip(terms, intake))}
     path = tmp_path / "run.json"
     path.write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(path))
@@ -1026,6 +1022,31 @@ def test_a_burst_reaches_the_app_one_intake_charge_at_a_time(
     first = arrival + fixed + sizes[0] * per_byte
     print(f"\n  app entered at {entered}")
     assert entered == pytest.approx([first, first + fixed + sizes[1] * per_byte])
+
+
+def test_a_body_outside_the_intake_hull_is_charged_nothing_and_named(
+    run, monkeypatch, tmp_path
+):
+    from atom.compass import run as compass_run
+
+    intake = {"fixed_s": 2e-3, "per_byte_s": 1e-6, "idle_s": 2e-3, "bytes": [500, 2000]}
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"bound_s": 600.0, "host": {"http_intake": intake}}))
+    monkeypatch.setenv(compass_run.ENV, str(path))
+    entered, named = [], []
+
+    async def app(scope, receive, send):
+        loop = asyncio.get_running_loop()
+        entered.append(loop.time())
+        named.append(list(loop.rt.refusals))
+
+    arrival = _burst(run, monkeypatch, 2, app, {0: 1000, 1: 3000})
+    first = arrival + 2e-3 + 1000 * 1e-6
+    assert entered == pytest.approx([first, first])
+    assert named[1] == [
+        "http:intake of a 3000-byte body, outside the 500 to 2000 bytes its "
+        + "http_intake was fitted on"
+    ]
 
 
 def test_a_request_that_finds_no_intake_on_the_loop_is_charged_the_idle_one(
@@ -1093,7 +1114,7 @@ def test_an_intake_waits_for_the_open_tokenizer_job_so_its_result_is_not_late(
     # 3 ms, inside request 1's intake, so its result runs when that intake
     # ends, at 4 ms, not once the clock has run on through every intake.
     _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-9))  # empty bodies
-    entry = SimpleNamespace(encode_fixed_s=1e-3, encode_tokens_per_s=1.0, derate=1.0)
+    entry = {"fixed_s": 1e-3, "tokens_per_s": 1.0}
     encode, done = wrap_encode(list, entry), []
 
     async def app(scope, receive, send):
@@ -1122,7 +1143,7 @@ def test_a_tokenizer_result_due_when_an_intake_starts_runs_before_its_charge(
     # the instant request 1's intake starts, so its result runs then, before
     # that intake is charged, not when the intake ends at 4 ms.
     _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-9))  # empty bodies
-    entry = SimpleNamespace(encode_fixed_s=0.0, encode_tokens_per_s=1.0, derate=1.0)
+    entry = {"fixed_s": 0.0, "tokens_per_s": 1.0}
     encode, done = wrap_encode(list, entry), []
 
     async def app(scope, receive, send):
@@ -1156,7 +1177,7 @@ def test_a_burst_tokenizer_results_do_not_depend_on_loop_turns_or_thread_speed(
     # 1's intake ends, at 4 ms, job 1's when request 2's ends, at 6 ms, and
     # job 2's at its completion, 7 ms.
     _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-9))  # empty bodies
-    entry = SimpleNamespace(encode_fixed_s=1e-3, encode_tokens_per_s=1.0, derate=1.0)
+    entry = {"fixed_s": 1e-3, "tokens_per_s": 1.0}
     encode, done = wrap_encode(list, entry), []
 
     async def app(scope, receive, send):
@@ -1190,7 +1211,7 @@ def test_tokenizer_results_due_at_one_instant_resume_in_submission_order(
     # in the loop's heap. Neither may decide which of the two resumes first.
     _idle_traffic(run)
     loop = CompassEventLoop()
-    entry = SimpleNamespace(encode_fixed_s=0.0, encode_tokens_per_s=1.0, derate=1.0)
+    entry = {"fixed_s": 0.0, "tokens_per_s": 1.0}
     encode, tokens, resumed = wrap_encode(list, entry), [5, 2, 3, 2, 4, 1, 6, 7], []
     # A server per job, whatever the host's pool width: every job starts at 0.
     loop.executor.station = Station(len(tokens))
@@ -1227,12 +1248,10 @@ def test_an_on_loop_tokenizer_call_places_open_encode_jobs_first(run, caplog, de
     _idle_traffic(run)
     loop = CompassEventLoop()
     loop.executor.station = Station(1, diag_s=0.1)
-    encode = wrap_encode(
-        list, SimpleNamespace(encode_fixed_s=1e-3, encode_tokens_per_s=1.0, derate=1.0)
-    )
+    encode = wrap_encode(list, {"fixed_s": 1e-3, "tokens_per_s": 1.0})
     decode = wrap_decode(
         lambda ids: "",
-        SimpleNamespace(decode_fixed_s=5e-3, decode_tokens_per_s=1.0, derate=1.0),
+        {"fixed_s": 5e-3, "tokens_per_s": 1.0},
     )
     seen = {}
 

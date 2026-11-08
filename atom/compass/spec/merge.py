@@ -1,21 +1,18 @@
 # SPDX-License-Identifier: MIT
-"""Fragments combined into one spec document, refusing what one host cannot be.
+"""Fragments combined into one spec document, refusing what one machine cannot be.
 
 A probe measures part of a machine and emits a **fragment**: a partial document
 plus the stanza saying which machine it is for, by whom, when and how.
 
 Nothing in a fragment's shape says which host it came from, so fragments that
 name different machines are refused, and so are fragments that name one machine
-and disagree about a field, with both readings and both stanzas. The tokenizer
-probe writes the core counts of the processor it ran on, so a tokenizer swept
-on another host disagrees there.
+and disagree about a field, with both readings and both stanzas.
 
-The tokenizer table is combined per entry, keyed by id and backend; one id over
-two fingerprints is refused. The provenance block is rebuilt: it names every
-fragment, those a saved merge names included, carries the latest date, and
-records each field's origin in `provenance.origins`, a field two fragments
-agree on taking the stronger origin. The document states one origin only when
-every field has it, else `mixed`.
+The provenance block is rebuilt: it names every fragment, those a saved merge
+names included, carries the latest date, and records each field's origin in
+`provenance.origins`, a field two fragments agree on taking the stronger
+origin. The document states one origin only when every field has it, else
+`mixed`.
 
 The result is a document, not a spec; `validate` says whether it is complete.
 """
@@ -25,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .fields import SCHEMA, check
-from .machine import TOKENIZERS, _walk, check_subject, entry_label, field_origin
+from .machine import _walk, check_subject, field_origin
 from .rules import Rule, SpecRefusal
 
 #: The block holding the stack the spec's numbers were taken on.
@@ -141,18 +138,6 @@ def _conflict(
     )
 
 
-def _identity(raw: object, fragment: Fragment, index: int) -> tuple:
-    if not isinstance(raw, Mapping) or not isinstance(raw.get("id"), str):
-        raise SpecRefusal(
-            Rule.TOKENIZER_IDENTITY,
-            f"`{TOKENIZERS}[{index}]` in {fragment.source!r} states no id",
-            "a tokenizer entry carries an author-chosen id; it is what two "
-            "fragments conflict on, so an entry without one combines with "
-            "nothing",
-        )
-    return raw["id"], raw.get("backend")
-
-
 def _strength(found: dict) -> int:
     return STRENGTH.index(found["origin"])
 
@@ -187,7 +172,7 @@ def _provenance(fragments: tuple[Fragment, ...], origins: dict) -> dict:
 
 
 def merge(fragments: Sequence[Fragment]) -> Merge:
-    """Combine fragments into one document, refusing what one host cannot be."""
+    """Combine fragments into one document, refusing what one machine cannot be."""
     fragments = tuple(fragments)
     if not fragments:
         raise SpecRefusal(
@@ -201,43 +186,21 @@ def merge(fragments: Sequence[Fragment]) -> Merge:
     supplied: dict[str, Fragment] = {}
     sources: dict[str, tuple[str, ...]] = {}
     origins: dict[str, dict] = {}
-
-    def claim(where: str, holder: dict, key: Any, value: Any, by: Fragment) -> None:
-        if where != "schema_version":
-            found = field_origin(by.values, where, by.stanza())
-            origins[where] = min(origins.get(where, found), found, key=_strength)
-        if key in holder:
-            if holder[key] != value:
-                _conflict(where, holder[key], supplied[where], value, by)
-            sources[where] += (by.source,)
-            return
-        holder[key] = value
-        supplied[where] = by
-        sources[where] = (by.source,)
-
     for fragment in fragments:
         for path, value in fragment.values.items():
-            if path == "name" or path == TOKENIZERS or path.startswith("provenance."):
+            if path == "name" or path.startswith("provenance."):
                 continue
-            claim(path, values, path, value, fragment)
-
-    entries: dict[tuple, Any] = {}
-    files: dict[str, tuple[Any, Fragment]] = {}
-    for fragment in fragments:
-        for index, raw in enumerate(fragment.values.get(TOKENIZERS, ())):
-            identity = _identity(raw, fragment, index)
-            named = files.setdefault(identity[0], (raw.get("fingerprint"), fragment))
-            if named[0] != raw.get("fingerprint"):
-                raise SpecRefusal(
-                    Rule.TOKENIZER_IDENTITY,
-                    f"{identity[0]!r} is {named[0]!r} in {named[1].stanza()} and "
-                    f"{raw.get('fingerprint')!r} in {fragment.stanza()}",
-                    "one identity names one probed file; two fingerprints "
-                    "under one id are two revisions nothing will ever compare",
-                )
-            claim(entry_label(*identity), entries, identity, raw, fragment)
-    if entries:
-        values[TOKENIZERS] = list(entries.values())
+            if path != "schema_version":
+                found = field_origin(fragment.values, path, fragment.stanza())
+                origins[path] = min(origins.get(path, found), found, key=_strength)
+            if path in values:
+                if values[path] != value:
+                    _conflict(path, values[path], supplied[path], value, fragment)
+                sources[path] += (fragment.source,)
+                continue
+            values[path] = value
+            supplied[path] = fragment
+            sources[path] = (fragment.source,)
 
     values["name"] = fragments[0].machine
     for leaf, stated in _provenance(fragments, origins).items():

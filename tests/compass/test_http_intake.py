@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """The HTTP intake probe: what it stamps on a server it runs, what its fit
-recovers, and the machine specs that state its terms."""
+recovers, and the machine specs that state its terms; and the run's ``host``
+entry, whose ``http_intake`` a simulated run charges."""
 
 import hashlib
 import importlib.util
@@ -157,6 +158,40 @@ def test_a_stall_on_the_loop_moves_the_fixed_term_and_not_the_per_byte_one(
     )
 
 
+def _host(monkeypatch, tmp_path, intake):
+    from atom.compass import run as compass_run
+
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"bound_s": 600.0, "host": {"http_intake": intake}}))
+    monkeypatch.setenv(compass_run.ENV, str(path))
+    return compass_run
+
+
+@pytest.mark.parametrize(
+    "intake",
+    [
+        {"per_byte_s": 5.6e-9, "idle_s": 1.1e-3},
+        {"fixed_s": 4.3e-3, "idle_s": 1.1e-3},
+        {"fixed_s": 4.3e-3, "per_byte_s": 5.6e-9, "derate": 1.0},
+        {"fixed_s": -4.3e-3, "per_byte_s": 5.6e-9},
+    ],
+    ids=["no-fixed", "no-per-byte", "unknown-field", "negative"],
+)
+def test_an_intake_a_charge_would_misread_is_refused(monkeypatch, tmp_path, intake):
+    compass_run = _host(monkeypatch, tmp_path, intake)
+    with pytest.raises(ValueError, match="host's http_intake is"):
+        compass_run.http_intake()
+
+
+def test_an_intake_with_no_idle_term_charges_its_fixed_one_to_a_lone_request(
+    monkeypatch, tmp_path
+):
+    compass_run = _host(
+        monkeypatch, tmp_path, {"fixed_s": 4.3e-3, "per_byte_s": 5.6e-9}
+    )
+    assert compass_run.http_intake() == (4.3e-3, 5.6e-9, 4.3e-3)
+
+
 def test_a_fit_at_a_given_rate_keeps_the_burst_span(tmp_path):
     # A rate fitted elsewhere replaces the burst's own slope; the fixed term
     # still makes the fitted gaps sum to what the burst spanned.
@@ -214,44 +249,6 @@ def test_lone_states_the_median_over_passes_of_each_pass_per_byte_rate(tmp_path)
     assert got["record"] == f"sha256:{hashlib.sha256(stamps.read_bytes()).hexdigest()}"
     with pytest.raises(SystemExit, match="24 lone requests, not 5 passes"):
         probe.lone(str(stamps), 5)
-
-
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39", "mi355x-gpu45"])
-def test_every_committed_spec_states_a_probed_intake_from_a_named_record(name):
-    from atom.compass.spec import MachineSpec
-
-    document = json.loads((TREE / f"scripts/compass/machines/{name}.json").read_text())
-    spec = MachineSpec.from_mapping(document)
-    for term in ("fixed_s", "per_byte_s"):
-        origin = spec.origin(f"host.http_intake.{term}")
-        assert origin["origin"] == "probed"
-        assert origin["record"].startswith("sha256:")
-
-
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39", "mi355x-gpu45"])
-def test_every_committed_intake_band_spans_more_than_one_burst(name):
-    from atom.compass.spec import MachineSpec
-
-    document = json.loads((TREE / f"scripts/compass/machines/{name}.json").read_text())
-    spec = MachineSpec.from_mapping(document)
-    for term in ("fixed_s", "per_byte_s"):
-        origin = spec.origin(f"host.http_intake.{term}")
-        assert origin["p10"] < origin["p90"]
-
-
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39"])
-def test_the_mi308x_specs_rebuild_byte_for_byte_from_their_own_sweeps(
-    monkeypatch, tmp_path, name
-):
-    monkeypatch.setenv("COMPASS_MACHINE", name)
-    path = TREE / "scripts/compass/mi308x_spec.py"
-    loaded = importlib.util.spec_from_file_location("mi308x_spec", path)
-    script = importlib.util.module_from_spec(loaded)
-    loaded.loader.exec_module(script)
-    document = TREE / f"scripts/compass/machines/{name}.json"
-    out = tmp_path / "rebuilt.json"
-    assert script.main(["--sweep-from", str(document), "--out", str(out)]) == 0
-    assert out.read_bytes() == document.read_bytes()
 
 
 #: The stand-in server: a Starlette app's lifespan, as uvicorn starts it, then
