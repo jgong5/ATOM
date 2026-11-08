@@ -1415,6 +1415,13 @@ def _run_config(structure: str, model) -> SimpleNamespace:
     )
 
 
+def _tracers() -> tuple[int, int]:
+    """In a lookup's lazy-trace process: the tracers it made, and the traces
+    that took one made before them."""
+    made = compass_run._tracer.cache_info()
+    return made.misses, made.hits
+
+
 def test_a_run_s_lazy_traces_share_one_process_and_trace_as_a_process_each(
     tmp_path_factory, tmp_path, monkeypatch
 ):
@@ -1457,8 +1464,8 @@ def test_a_run_s_lazy_traces_share_one_process_and_trace_as_a_process_each(
     for at, region in alone.items():
         assert json.dumps(warm[at]) == json.dumps(region), at
     # One process traced the three, its tracer made at the first and kept.
-    made = spawned[0].submit(compass_run._tracer.cache_info).result()
-    assert (len(spawned), lazy["lazy_traces"], made.misses, made.hits) == (1, 3, 1, 2)
+    made = spawned[0].submit(_tracers).result()
+    assert (len(spawned), lazy["lazy_traces"], made) == (1, 3, (1, 2))
 
 
 def test_a_lazy_trace_that_fails_ends_the_run_naming_the_shape(tmp_path):
