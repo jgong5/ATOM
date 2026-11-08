@@ -39,11 +39,12 @@ from types import SimpleNamespace
 import pytest
 import zmq
 from aiter_stub import stubbed_aiter
+from test_vertical_slice import _run_file
 
 from atom.compass import clock_transport
 from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
-from atom.compass.clock import LpId, single_engine_table
+from atom.compass.clock import NER, PARK, TAR, LpId, single_engine_table
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import SequenceStatus
 from atom.utils import clock, get_open_zmq_ipc_path, make_zmq_socket, zmq_shim
@@ -490,6 +491,33 @@ def test_an_engine_stopped_holding_a_read_request_hands_in_no_straggler(
     server.close()
     ctx.destroy(linger=0)
 
+
+
+@pytest.mark.parametrize("held_by", ["a call naming a later round", "a park"])
+def test_a_stop_hands_a_dp_member_what_was_held_for_it(tmp_path, held_by):
+    """Request 0 reaches dp0 at 0.25 and a round grants it while dp0 waits, in a
+    call that named a later round or parked; then the frontend stops. dp0's one
+    reply, the stop's ``+inf``, carries request 0, whose release row its round's
+    grant wrote once."""
+    req0 = "frontend->engine:request#dp0"
+    run = json.loads(_run_file(tmp_path, data_parallel_size=2).read_text())
+    ca = compass_run._RecordingAuthority(run)
+    engine, inf = compass_run.ENGINE, math.inf
+    ca.on_request(LpId("traffic"), NER, inf, [])
+    ca.on_request(compass_run.FRONTEND, NER, inf, [(req0, 0, 0.25)])
+    if held_by == "a park":
+        replies = ca.on_request(engine, PARK, inf, [], member="dp0")
+        replies += ca.on_request(engine, NER, inf, [], member="dp1")
+    else:  # dp0 returns at 0.5, dp1 at 0.3
+        replies = ca.on_request(engine, TAR, 0.3, [], member="dp0", rounds=[0.5])
+        replies += ca.on_request(engine, TAR, 0.3, [], member="dp1")
+    replies += ca.on_request(compass_run.FRONTEND, TAR, inf, [])  # the stop
+
+    dp0 = [(g, released) for to, g, released, *_ in replies if to == (engine, "dp0")]
+    assert [(g, {c: r for c, r in held.items() if r}) for g, held in dp0] == [
+        (inf, {req0: [(0, 0.25)]})
+    ]
+    assert [r.time_to for r in ca.steps.rows if r.channel == req0] == [0.25]
 
 def test_an_engine_whose_input_thread_reads_shutdown_first_takes_the_released_request(
     monkeypatch, tmp_path
