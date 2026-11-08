@@ -162,6 +162,18 @@
    "mechanism_why": "an RPC to the engine's own workers, which share the engine's LP, made before the step loop's first clock request, while the LP's clock stands at its start"
   },
   {
+   "id": "atom/compass/run/__init__.py::_stamp_intake.heads.sent::send(message)::p2p#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "_stamp_intake.heads.sent",
+   "call": "send",
+   "expr": "send(message)",
+   "shape": "p2p",
+   "peer": "thread",
+   "why": "a recorded real server's ASGI send, which stamps an SSE response's head as it is sent and hands each message on as it was given",
+   "mechanism": "K9",
+   "mechanism_why": "installed only by a real run recording its steps (_record_host); a simulated run never installs it, and its streams go through HttpChannel"
+  },
+  {
    "id": "atom/compass/run/__init__.py::_stamp_intake.submitted::submit(self, fn, *args, **kwargs)::executor_handoff#0",
    "file": "atom/compass/run/__init__.py",
    "symbol": "_stamp_intake.submitted",

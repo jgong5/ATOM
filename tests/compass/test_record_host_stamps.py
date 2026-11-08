@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -65,6 +65,7 @@ def patched(monkeypatch):
         (InputOutputProcessor, "preprocess_fanout"),
         (CoreManager, "add_request"),
         (DisaggCoreManager, "add_request"),
+        (CoreManager, "_mark_seq_prefill_complete"),
         (ThreadPoolExecutor, "submit"),
     ):
         monkeypatch.setattr(owner, name, vars(owner)[name])
@@ -198,6 +199,54 @@ def test_a_recorded_server_stamps_each_request_s_intake_as_the_probe_does(record
     ]
     # The lone-request reader of the probe's stamps reads the record as it is.
     assert probe.idle(str(record / "intake.stamps"))["requests"] == len(bodies)
+
+
+def test_a_recorded_server_stamps_each_output_row_taken_in_and_each_stream_head(
+    record, tok
+):
+    compass_run.tokenizer(tok, None)
+    manager = CoreManager.__new__(CoreManager)
+    manager._seq_load = {}
+
+    async def streamed(request):
+        await request.body()
+        manager._mark_seq_prefill_complete(1)  # the output thread takes a row in
+        return StreamingResponse(iter([b"data: x\n\n"]), media_type="text/event-stream")
+
+    async def answered(request):
+        return JSONResponse({})
+
+    app = Starlette(
+        routes=[
+            Route("/v1/chat/completions", streamed, methods=["POST"]),
+            Route("/v1/completions", answered, methods=["POST"]),
+        ]
+    )
+
+    async def post(path):
+        messages = [{"type": "http.request", "body": b"{}", "more_body": False}]
+        scope = {"type": "http", "method": "POST", "path": path, "headers": []}
+        scope |= {"query_string": b"", "root_path": ""}
+
+        async def receive():
+            return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+        async def send(message):
+            pass
+
+        await app(scope, receive, send)
+
+    async def both():
+        await post("/v1/chat/completions")
+        await post("/v1/completions")
+
+    asyncio.run(both())
+    rows = [
+        line.split() for line in (record / "intake.stamps").read_text().splitlines()
+    ]
+    # One row taken in, and one head: the stream's, not the JSON answer's.
+    assert [r[2] for r in rows if r[2] in ("out", "head")] == ["out", "head"]
+    assert all(int(r[3]) <= int(r[0]) for r in rows)
 
 
 def test_a_recorded_server_s_engine_send_keeps_its_caller_s_response_id(record, tok):

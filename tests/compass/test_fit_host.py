@@ -63,10 +63,11 @@ def test_the_host_laws_published_are_fit_hosts_and_a_run_file_carrying_them_runs
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     laws, report = fit_host(label_records(paths)[0])
     assert host == {**laws, "key": {**laws["key"], "machine_spec": DIGEST}}
-    # Records with no tokenizer calls or intake stamps give neither term.
+    # Records with no tokenizer calls or intake stamps give none of these terms.
     report["unfitted"].update(
         tokenizer=f"no record holds steps/{compass_run.INTAKE_RECORD}",
         http_intake=f"no record holds steps/{compass_run.INTAKE_RECORD}",
+        hops=f"no record holds steps/{compass_run.INTAKE_RECORD}",
     )
     assert member(tmp_path / "store", host_laws_key(key), "report") == {
         "provenance": served(key, {a: "trace-a", b: "trace-b"}),
@@ -294,7 +295,7 @@ def test_a_record_s_tokenizer_calls_and_intake_stamps_fit_the_entry_s_terms(
         rel=1e-6,
     )
     report = member(tmp_path / "store", host_laws_key(key), "report")
-    assert report["unfitted"] == {} and report["http_intake"]["burst"]["requests"] == 4
+    assert not _unfitted(report) and report["http_intake"]["burst"]["requests"] == 4
     # Only the lone calls are fitted: each lone request's encode and decode.
     fitted = {k: report["tokenizer"][k] for k in ("encode", "encode_batch", "decode")}
     assert {k: v["samples"] + v["dropped"] for k, v in fitted.items()} == {
@@ -358,9 +359,15 @@ def test_a_term_the_records_cannot_give_is_left_out_and_listed_unfitted(
 
     host = member(tmp_path / "store", host_laws_key(HOST), "params")
     report = member(tmp_path / "store", host_laws_key(HOST), "report")
-    assert report["unfitted"] == unfitted
+    assert _unfitted(report) == unfitted
     left = {t.split(".")[-1] for t in unfitted}
     assert not left & (set(host) | set(host.get("tokenizer", {})))
+
+
+def _unfitted(report) -> dict:
+    """The report's unfitted terms but the hops, which these records, with no
+    queue handoffs or client records, cannot give (`test_fit_hops.py`)."""
+    return {k: v for k, v in report["unfitted"].items() if k.split(".")[0] != "hops"}
 
 
 def test_the_tokenizer_fit_reports_each_record_s_residuals_apart(tmp_path):
