@@ -492,7 +492,6 @@ def test_an_engine_stopped_holding_a_read_request_hands_in_no_straggler(
     ctx.destroy(linger=0)
 
 
-
 @pytest.mark.parametrize("held_by", ["a call naming a later round", "a park"])
 def test_a_stop_hands_a_dp_member_what_was_held_for_it(tmp_path, held_by):
     """Request 0 reaches dp0 at 0.25 and a round grants it while dp0 waits, in a
