@@ -42,7 +42,8 @@ bytes and the sha256 as JSON.
 input thread's receipt, from request 1 on, as request 0 (sent alone, or the
 long one) finds the engine idle; ``output``, each engine output's put on the engine's
 output queue to the server's output thread taking it in; ``stream``, each SSE
-head sent to the client reading it (ARRIVALS' ``admitted_ns``). Prints each hop's median, p10,
+head sent to the client reading it (ARRIVALS' ``admitted_ns``), paired on the head's send
+call and timed from its return, a head the client read first left out. Prints each hop's median, p10,
 p90 and N, and the three inputs' sha256, as JSON.
 `pd` reads a prefill and a decode server's shared STAMPS (`parity_pd.sh` with
 HTTP_INTAKE): ``kv_write_req``, each write request's send call on decode to prefill's
@@ -344,9 +345,11 @@ def lone(stamps: str, passes: int = 1) -> dict:
     }
 
 
-def _hop(sent, got, name: str, alone: bool = True) -> dict:
+def _hop(sent, got, name: str, alone: bool = True, returned=None) -> dict:
     """Message k's ``got[k] - sent[k]``, in order; with `alone`, no message
-    is sent before the one ahead of it arrives."""
+    is sent before the one ahead of it arrives; with `returned`, each send
+    call's return, message k is timed from it, and left out when it arrived
+    first."""
     sent, got = sorted(sent), sorted(got)
     after = sent[1:] + [float("inf")] if alone else [float("inf")] * len(sent)
     if len(got) != len(sent) or not all(
@@ -355,8 +358,10 @@ def _hop(sent, got, name: str, alone: bool = True) -> dict:
         raise SystemExit(
             f"{name}: {len(got)} arrivals, not one after each of {len(sent)} sends"
         )
-    p10, median, p90 = np.percentile((np.array(got) - sent) / 1e9, [10, 50, 90])
-    return {"median_s": median, "p10_s": p10, "p90_s": p90, "messages": len(sent)}
+    took = np.array(got) - sorted(sent if returned is None else returned)
+    took = took[took > 0]
+    p10, median, p90 = np.percentile(took / 1e9, [10, 50, 90])
+    return {"median_s": median, "p10_s": p10, "p90_s": p90, "messages": len(took)}
 
 
 def hops(stamps: str, handoff: str, arrivals: str) -> dict:
@@ -366,6 +371,7 @@ def hops(stamps: str, handoff: str, arrivals: str) -> dict:
     sends = [int(r[0]) for r in rows if r[2] == "send"]
     outs = [int(r[3]) for r in rows if r[2] == "out"]
     heads = [int(r[0]) for r in rows if r[2] == "head"]
+    head_calls = [int(r[3]) for r in rows if r[2] == "head"]
     lines = [json.loads(line) for line in handoff_data.decode().splitlines()]
     recvs = [h["t_recv_ns"] for h in lines if "t_recv_ns" in h]
     # Outputs put from the first request on, each timed from its put: the
@@ -386,7 +392,7 @@ def hops(stamps: str, handoff: str, arrivals: str) -> dict:
     return {
         "request": _hop(sorted(sends)[1:], sorted(recvs)[1:], "request"),
         "output": _hop([t for t, _ in put], got, "output", alone=False),
-        "stream": _hop(heads, admitted, "stream"),
+        "stream": _hop(head_calls, admitted, "stream", returned=heads),
         "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
         "handoff": f"sha256:{hashlib.sha256(handoff_data).hexdigest()}",
         "arrivals": f"sha256:{hashlib.sha256(sent_data).hexdigest()}",

@@ -555,7 +555,7 @@ def fit_hops(intakes, clients) -> tuple[dict, dict]:
     inside a forward of that DP rank, since an idle engine's loop holds the GIL
     the thread waits on; ``ipc_out_s``, an output's put on the engine's output
     queue to the server's output thread taking its first row; ``stream_s``,
-    an SSE head sent to the client's ack. A hop the records cannot give is
+    an SSE head's send call's return to the client's ack. A hop the records cannot give is
     left out and its reason listed under the report's ``unfitted``."""
     took, report = {h: [] for h in HOPS}, {"unfitted": {}}
     for intake, client in zip(intakes, clients):
@@ -662,12 +662,14 @@ def _hop_messages(intake: Path, client) -> dict:
             raise ValueError(f"{len(rows)} rows taken in, not the {firsts[-1]} put")
         return _alone([t for t, _ in put], [rows[i] for i in firsts[:-1]])[1].tolist()
 
-    heads = [e[1] for e in ev if e[2] == "head"]
+    heads = [e for e in ev if e[2] == "head"]
     return {
         "admission_s": lambda: _alone(of_client("sent"), calls)[1].tolist(),
         "ipc_s": ipc,
         "ipc_out_s": ipc_out,
-        "stream_s": lambda: _alone(heads, of_client("acked"))[1].tolist(),
+        "stream_s": lambda: _alone(
+            [e[0] for e in heads], of_client("acked"), [e[1] for e in heads]
+        )[1].tolist(),
     }
 
 

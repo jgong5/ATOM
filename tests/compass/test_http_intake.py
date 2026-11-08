@@ -500,6 +500,26 @@ def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
         probe.hops(*map(str, paths))
 
 
+def test_a_head_the_client_read_before_its_send_returned_is_left_out(tmp_path):
+    sent = [10**12 + k * 10**9 for k in range(4)]
+    stamps = [f"{s} 1 send {s - 50} 0" for s in sent]
+    # Each head's send call takes 1 ms; the client reads the third's inside it.
+    stamps += [f"{s + 10**6} 1 head {s} 0" for s in sent]
+    admitted = [s + 10**6 + 150_000 for s in sent]
+    admitted[2] = sent[2] + 500_000
+    handoff = [{"t_recv_ns": s + 100_000, "t_in_put_ns": 0} for s in sent]
+    handoff += [{"t_out_put_ns": s + 3 * 10**6, "rows": 1} for s in sent]
+    stamps += [f"{s + 3 * 10**6 + 9} 2 out {s + 3 * 10**6 + 9} 0" for s in sent]
+    paths = [tmp_path / name for name in ("stamps", "handoff", "arrivals")]
+    paths[0].write_text("\n".join(stamps) + "\n")
+    paths[1].write_text("".join(json.dumps(line) + "\n" for line in handoff))
+    paths[2].write_text(json.dumps({"sent_ns": sent, "admitted_ns": admitted}))
+
+    stream = probe.hops(*map(str, paths))["stream"]
+
+    assert stream["messages"] == 3 and stream["median_s"] == pytest.approx(150e-6)
+
+
 def test_serve_stamps_each_kv_write_request_sent_and_received_in_a_spawned_process(
     tmp_path,
 ):
