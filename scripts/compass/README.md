@@ -863,7 +863,8 @@ decode law's, stating `declared`, since the prefill law's own fit left rung 2 un
 ([#2660](https://github.com/jgong5/ATOM/issues/2660)). Its prefill vector is refitted
 in the `cached_seqs` form on the lone prefill cells and on the prefill side of one 1P1D
 `deploy.sh record` cell, #975's cell at c=1 over traces 256 to 392, seed 20260707
-([#2853](https://github.com/jgong5/ATOM/issues/2853)); the rest is the lone cells' fit.
+([#2853](https://github.com/jgong5/ATOM/issues/2853)); its other vectors but rung 2, and its
+host laws, are the lone cells' fit.
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by
