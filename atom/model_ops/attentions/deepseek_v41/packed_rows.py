@@ -109,24 +109,53 @@ def write_packed_window(values, scales, pool, step, window, dim, cached_until=No
     stride. `cached_until`: as `swa_write`'s, per request the position below
     which its ring keeps the rows it holds; None writes every row."""
     if step.width:
-        _write_window[(step.width,)](
-            values.view(torch.uint8),
-            scales.view(torch.uint8),
-            values.stride(-2),
-            scales.stride(-2),
+        _launch_write_window(
+            values,
+            scales,
             pool,
             step.positions,
             step.batch_ids,
             step.cu_seqlens_q,
             step.slots,
-            window.ring_start,
-            step.positions if cached_until is None else cached_until,
-            cached_until is not None,
-            window.slot_rows,
-            window.ring_slots,
-            dim,
-            triton.next_power_of_2(dim),
+            window,
+            cached_until,
+            dim=dim,
         )
+
+
+def _launch_write_window(
+    values,
+    scales,
+    pool,
+    positions,
+    batch_ids,
+    cu_seqlens_q,
+    slots,
+    window,
+    cached_until,
+    *,
+    dim,
+):
+    """`write_packed_window`'s launch, from the step's fields it reads: no
+    `BatchStep`, whose per-request host state the kernel does not read."""
+    _write_window[(positions.numel(),)](
+        values.view(torch.uint8),
+        scales.view(torch.uint8),
+        values.stride(-2),
+        scales.stride(-2),
+        pool,
+        positions,
+        batch_ids,
+        cu_seqlens_q,
+        slots,
+        window.ring_start,
+        positions if cached_until is None else cached_until,
+        cached_until is not None,
+        window.slot_rows,
+        window.ring_slots,
+        dim,
+        triton.next_power_of_2(dim),
+    )
 
 
 @triton.jit(do_not_specialize=["first", "end", "CAPACITY"])
