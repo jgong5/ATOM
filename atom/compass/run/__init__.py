@@ -2511,7 +2511,8 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     """Hand in what the worker's steps cost and the memory it predicts, with
     `sections`, its command refusals and the engine's refused clock calls; a
     DP member that parked also hands in ``parks``: their count, CPU seconds, and
-    each park's clock and the clock it left at. An engine whose offload
+    each park's clock and the clock it left at; a DP member hands in ``owed``,
+    `LPRuntime.paid`. An engine whose offload
     scheduler keeps lookup counters hands in ``lookups``: its tier lookups,
     the prefetches among them, and the deferred prefetches it stopped
     waiting for. A speculative engine hands in ``speculative``, `_acceptance`."""
@@ -2522,6 +2523,8 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     if parks := getattr(rt, "parks", None):
         cpu_s, at = sum(p[2] for p in parks), [p[:2] for p in parks]
         sections = sections | {"parks": {"count": len(parks), "cpu_s": cpu_s, "at": at}}
+    if rt.member is not None:
+        sections = sections | {"owed": dict(rt.paid)}
     kv = getattr(getattr(engine_core, "scheduler", None), "kv_connector", None)
     if (counts := getattr(kv, "_perf_counters", None)) is not None:
         keys = ("lookup_n", "lookup_prefetched", "lookup_defer_expired")

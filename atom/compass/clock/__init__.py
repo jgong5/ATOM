@@ -23,6 +23,7 @@ package, not inside it.
 from .authority import (
     NER,
     PARK,
+    REPORT,
     TAR,
     BackdatedEvent,
     ClientRun,
@@ -52,6 +53,7 @@ from .registry import LpRegistry
 __all__ = [
     "NER",
     "PARK",
+    "REPORT",
     "SPEED_TARGET_RATIO",
     "TAR",
     "BackdatedEvent",
