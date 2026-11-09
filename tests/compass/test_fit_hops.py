@@ -45,7 +45,8 @@ def hopped(directory, alone=10, raw=RAW + ".gz") -> None:
     arrival before the next send is the first's, is not alone either. On
     ``ipc_s`` each is received inside a forward, and two
     more alone: one taking `OVERLAP`, received once the engine left its last,
-    and one received before its send call returned. On ``admission_s`` and
+    and one received inside a forward before its send call returned. On
+    ``ipc_out_s`` each alone output carries two rows. On ``admission_s`` and
     ``stream_s`` the client missed one more request, one the server took in
     between the fourth and fifth, which leaves the fourth not alone. The
     client's raw records are written as `raw` beside the export."""
@@ -59,8 +60,8 @@ def hopped(directory, alone=10, raw=RAW + ".gz") -> None:
     ipc += [(e + 10_000, e + 10_000 + OVERLAP), (e + 11_000, e + 11_000 + OVERLAP)]
     last = windows[-1][1]
     ipc += [(last + 1_000, last + 1_000 + OVERLAP)]
-    called = [s - 10 for s, _ in ipc] + [last + 10_000]
-    ipc += [(last + 10_000 + OVERLAP, last + 10_000 + OVERLAP // 2)]
+    called = [s - 10 for s, _ in ipc] + [e + 50_000]
+    ipc += [(e + 50_000 + OVERLAP, e + 50_000 + OVERLAP // 2)]
 
     def messages(hop, t):
         """The hop's sends and arrivals from `t` on, 10 ms apart."""
@@ -77,6 +78,7 @@ def hopped(directory, alone=10, raw=RAW + ".gz") -> None:
     for _, a in admission:
         lines += [_stamp("app", a, a), _stamp("body", a + 100, a + 200, 9000)]
     lines += [_stamp("out", g, g + 10) for _, g in outputs]
+    lines += [_stamp("out", g + 5_000, g + 5_010) for _, g in outputs[:alone]]
     lines += [_stamp("head", s - 10, s) for s, _ in stream]
     missed = admission[3][1] + 10**6, stream[3][1] + 10**6
     lines += [_stamp("app", missed[0], missed[0])]
@@ -86,7 +88,8 @@ def hopped(directory, alone=10, raw=RAW + ".gz") -> None:
     (steps / compass_run.TOKENIZER_RECORD).write_text(json.dumps(TOKENIZER) + "\n")
     handoff = [{"t_recv_ns": g, "prompt_tokens": 9} for _, g in ipc]
     handoff += [
-        {"t_out_put_ns": p, "t_out_sent_ns": p + 1, "rows": 1} for p, _ in outputs
+        {"t_out_put_ns": p, "t_out_sent_ns": p + 1, "rows": 1 + (k < alone)}
+        for k, (p, _) in enumerate(outputs)
     ]
     text = "".join(json.dumps(h) + "\n" for h in handoff)
     (steps / "dp0.handoff.jsonl").write_text(text)
@@ -147,7 +150,7 @@ def test_a_hop_the_records_cannot_give_is_left_out_and_listed_unfitted(tmp_path)
         "hops.admission_s": f"{stamps}: no {RAW} beside {a / 'client.json'}",
         "hops.stream_s": f"{stamps}: no {RAW} beside {a / 'client.json'}",
         "hops.ipc_s": f"{stamps}: 14 sends and 0 arrivals",
-        "hops.ipc_out_s": f"{stamps}: 13 rows taken in, not the 0 put",
+        "hops.ipc_out_s": f"{stamps}: 23 rows taken in, not the 0 put",
     }
 
 

@@ -206,6 +206,7 @@ def test_a_recorded_server_stamps_each_output_row_taken_in_and_each_stream_head(
     record, tok
 ):
     compass_run.tokenizer(tok, None)
+    send_s = 0.001  # each send of a response message takes this long
     manager = CoreManager.__new__(CoreManager)
     manager._seq_load, manager._seq_id_to_callback = {}, {}
 
@@ -232,10 +233,12 @@ def test_a_recorded_server_stamps_each_output_row_taken_in_and_each_stream_head(
         scope |= {"query_string": b"", "root_path": ""}
 
         async def receive():
-            return messages.pop(0) if messages else {"type": "http.disconnect"}
+            if messages:
+                return messages.pop(0)
+            await asyncio.Event().wait()  # the client stays connected
 
         async def send(message):
-            pass
+            await asyncio.sleep(send_s)
 
         await app(scope, receive, send)
 
@@ -250,6 +253,9 @@ def test_a_recorded_server_stamps_each_output_row_taken_in_and_each_stream_head(
     # Two rows taken in, and one head: the stream's, not the JSON answer's.
     assert [r[2] for r in rows if r[2] in ("out", "head")] == ["out", "out", "head"]
     assert all(int(r[3]) <= int(r[0]) for r in rows)
+    # The head is stamped from its send call's start, not its return.
+    head = next(r for r in rows if r[2] == "head")
+    assert int(head[0]) - int(head[3]) >= send_s * 1e9
 
 
 def test_a_recorded_server_s_engine_send_keeps_its_caller_s_response_id(record, tok):
