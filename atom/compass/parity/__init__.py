@@ -30,7 +30,9 @@ receive of its input is `t_pp_recv_ns`, its device part `d_recv_ns`; an idle
 never waited on, so a line is finished once its exit event has completed. A
 real runner's lines are kept in memory and written at its `exit`, so no file
 call or JSON encoding runs between its forwards; a worker that never reaches
-`exit` (SIGKILL, a native crash) leaves an empty record. A simulated runner's line is
+`exit` (SIGKILL, a native crash) leaves an empty record. A real line also
+carries `launch`, where its model's launch provider declares features
+(`backends.launch_features`). A simulated runner's line is
 written as its step is recorded, and flushed to the file the record keeps open
 from its start, so a killed simulated worker keeps every line. Under `kv` a line carries the lmcache offload loads
 and saves the scheduler handed the worker since the previous line
@@ -43,7 +45,8 @@ of each DP rank writes `dp<rank>.jsonl` there, replacing any earlier file
 a RapidServe engine in its `record_dir`).
 Unset, nothing is recorded. On its first step it also writes the engine its
 runner resolved to `dp<rank>.engine.json` (`README.md` says what it holds), and
-a runner with a `host_key` writes that to `dp<rank>.key.json`. The simulated
+a runner with a `host_key` writes that to `dp<rank>.key.json`, with the
+graph sets ATOM recorded (`recorded_graphs`) where `launch` is written. The simulated
 runner records from `NonAllocatingRunner.forward`; a real one records through
 `StepRecording`, composed into `RUNNER`, which the frontend names on a real run
 with the variable set.
@@ -80,6 +83,7 @@ from itertools import zip_longest
 import numpy as np
 
 from atom.compass.backends.json_file import read_json, read_jsonl
+from atom.compass.backends.launch_features import GRAPHS, architecture, provider
 from atom.compass.backends.step_labels import join_stamps
 
 ENV = "ATOM_COMPASS_PARITY_RECORD"
@@ -366,9 +370,24 @@ def _record(runner):
             record.path.with_suffix(".engine.json").write_text(json.dumps(engine))
             key = getattr(runner, "host_key", None)
             if key is not None:
+                if getattr(runner, "_launch", None) and runner._launch.features:
+                    graphs = {GRAPHS: recorded_graphs(runner.config)}
+                    key = {**key, "engine": {**key["engine"], **graphs}}
                 record.path.with_suffix(".key.json").write_text(json.dumps(key))
         runner._parity_record = record
     return runner._parity_record
+
+
+def recorded_graphs(config) -> dict:
+    """`GRAPHS`' mapping for a runner of `config` whose ATOM has recorded its
+    graphs: its model's architecture, each phase's token-graph buckets
+    (`TokenGraph.captured_sizes`) and each request graph's keys, sorted."""
+    from atom.utils.region_graph import ReqGraph, TokenGraph
+
+    token = {p: TokenGraph.captured_sizes(p) for p in ("prefill", "decode")}
+    request = sorted(sorted(g.keys()) for g in ReqGraph._live if g.keys())
+    graphs = {"architecture": architecture(config), "token": token, "request": request}
+    return json.loads(json.dumps(graphs))
 
 
 def carry_response_ids() -> None:
@@ -445,13 +464,18 @@ class StepRecording:
     which the line's view is built from.
 
     Once `allocate_kv_cache` has built a Mooncake connector, every worker
-    records that connector's KV writes (`writes`), written at `exit`.
+    records that connector's KV writes (`writes`), written at `exit`. A
+    launch provider that declares features is installed once built, and its
+    `observe` is the line's `launch`.
     """
 
     _recording = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self._launch = provider(architecture(getattr(self, "config", None)))
+        if self._launch.features:
+            self._launch.install(self)
         self._stamps: dict = {}
         self._last_exit = None
         processor = getattr(self, "tokenID_processor", None)
@@ -576,6 +600,8 @@ class StepRecording:
     def step_stamps(self) -> tuple:
         """At a recorded forward's exit: its stamps, and its device window callable or None."""
         stamps, self._stamps = self._stamps, {}
+        if self._launch.features:
+            stamps["launch"] = self._launch.observe(self)
         launch = stamps.pop("launch_event", None)
         names = {"d_target_ns": "target_event", "d_recv_ns": "recv_event"}
         marks = {k: [stamps.pop(e)] for k, e in names.items() if e in stamps}
@@ -706,8 +732,8 @@ def compare(real, simulated, stage: int = 0) -> dict:
     A rank's entry is None where its steps all agree, else the step index and
     both steps, None for a record that has already ended. A record with no
     steps is refused: two runs that scheduled nothing agree, and that means
-    nothing. Steps are compared and reported without timestamps or request
-    or response ids. Under `steps`, each rank's count of step pairs compared
+    nothing. Steps are compared and reported without timestamps, request
+    or response ids or a real line's `launch`. Under `steps`, each rank's count of step pairs compared
     and of identical ones.
     """
     records = {"real": read(real, stage), "simulated": read(simulated, stage)}
@@ -716,7 +742,7 @@ def compare(real, simulated, stage: int = 0) -> dict:
             raise ValueError(f"the {name} record has no steps to compare.")
         for steps in record.values():
             for step in steps:
-                for key in (*TIMESTAMPS, "request_ids", "response_ids"):
+                for key in (*TIMESTAMPS, "request_ids", "response_ids", "launch"):
                     step.pop(key, None)
     first, counts = {}, {}
     for rank in sorted(records["real"].keys() | records["simulated"].keys()):

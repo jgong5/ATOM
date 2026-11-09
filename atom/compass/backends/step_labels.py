@@ -99,7 +99,7 @@ import itertools
 import json
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from atom.compass.backends.json_file import read_json, read_jsonl
@@ -159,7 +159,8 @@ class Sample:
     `dummies` holds the steps its rank ran as a DP dummy forward, which give no
     sample: the same set on each of the rank's samples.
     `admitted` is `(requests, uncached, cached)` of the requests it admits
-    (`admissions`).
+    (`admissions`). `launch` is its line's, what its launch ran per launch
+    feature (`launch_features`), empty on a line that states none.
     """
 
     step: int
@@ -175,6 +176,7 @@ class Sample:
     dummies: frozenset = frozenset()
     draft_kv_s: float | None = None
     admitted: tuple = (0, 0, 0)
+    launch: dict = field(default_factory=dict)
 
 
 def admissions(lines: list[dict]) -> list[tuple[int, int, int]]:
@@ -559,6 +561,7 @@ def _label(
                 dummies,
                 None if cut or draft_kv is None else draft_kv * 1e-9,
                 admits[i],
+                s.get("launch", {}),
             )
         )
         gap_ns = s.get("d_gap_ns")

@@ -114,6 +114,9 @@ were fitted on, which a run with laws must match; ``admit``, coefficients on
 a forward's admissions, which add to its ``E``, or null to refuse a forward
 that admits a request, and absent from an entry whose ``E`` laws hold them;
 ``skip``, segments zeroed for a what-if run, which the graders refuse;
+``columns``, per kind and segment, coefficients on launch features
+(`backends.launch_features`), predicted under the graph sets ``key``'s engine
+states, which the run takes as its own, since it records no graphs;
 ``tokenizer``, the served tokenizer's ``backend`` (``fast`` or ``slow``), the
 ``fingerprint`` of the ``tokenizer.json`` it was fitted on, and, each
 optional, ``encode``, one-item calls, ``encode_batch``, a backend
@@ -464,18 +467,19 @@ def _check_host(path, host: dict) -> None:
     whose ``tokenizer`` or ``http_intake`` term the frontend would misread."""
     from atom.compass.runner.overrides import ADMISSION_IN_E, FORWARD_KINDS, SEGMENTS
 
-    laws = host.get("laws", {})
+    laws, columns = host.get("laws", {}), host.get("columns", {})
     if (
-        set(host) - {"laws", "skip", "key", "admit", "hops", *HOST_TERMS}
+        set(host) - {"laws", "skip", "key", "admit", "hops", "columns", *HOST_TERMS}
         or set(host.get("skip", ())) - set(SEGMENTS)
-        or set(laws) - set(FORWARD_KINDS)
-        or {s for v in laws.values() for s in v} - set(SEGMENTS)
+        or {*laws, *columns} - set(FORWARD_KINDS)
+        or {s for v in (*laws.values(), *columns.values()) for s in v} - set(SEGMENTS)
         or {len(c) for v in laws.values() for c in v.values()} - {3}
         or len(host.get("admit") or ADMISSION_IN_E) != 3
     ):
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
+            "columns, mapping them to segments to launch features' coefficients, "
             "admit, three coefficients on a forward's admissions or null, "
             "key, the host key the laws were fitted under, hops, and the terms "
             f"{' and '.join(HOST_TERMS)}"
@@ -1585,6 +1589,7 @@ def runner(model_runner, tree) -> None:
         return
     from atom.compass.artifacts import machine_spec_digest, machine_spec_key
     from atom.compass.backends.geometry import Parallelism
+    from atom.compass.backends.launch_features import GRAPHS, stated
     from atom.compass.backends.step_linear import StepLinearBackend, StepLinearLaw
     from atom.compass.backends.step_roofline import (
         StepFallbackBackend,
@@ -1605,7 +1610,11 @@ def runner(model_runner, tree) -> None:
     refuse_renamed_keys(run, "the run file")
     engines = {
         STEP_LINEAR: lambda e: e.get("engine_config"),
-        "host": lambda e: e.get("key", {}).get("engine"),
+        "host": lambda e: {
+            k: v
+            for k, v in (e.get("key", {}).get("engine") or {}).items()
+            if k != GRAPHS
+        },
     }
     for name, engine in engines.items():
         if isinstance(run.get(name), list):
@@ -1778,6 +1787,9 @@ def runner(model_runner, tree) -> None:
         host = run.get("host", {})
         ours = host.get("laws") and {**host_key(config), "machine_spec": platform}
         theirs = host.get("key") or {}
+        launch = stated(theirs)
+        if ours and launch[1] is not None:
+            ours["engine"] = {**ours["engine"], GRAPHS: launch[1]}
         if ours and theirs != ours:
             differ = [k for k in ours if theirs.get(k) != ours[k]]
             if isinstance(engine := theirs.get("engine"), dict):
@@ -1808,6 +1820,8 @@ def runner(model_runner, tree) -> None:
             mtp=mtp,
             sync=rapid and not config.disagg_is_decode,
             admit=host.get("admit", ADMISSION_IN_E),
+            columns=host.get("columns"),
+            launch=launch,
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])
