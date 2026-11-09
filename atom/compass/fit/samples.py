@@ -27,8 +27,8 @@ Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
 config.json's digest; `device`, each GPU's `<name> <arch>`, as a spec states
 it; `engine_config`, `keyed`'s fields, the parallel layout among them;
-`prefill_buckets`, the prefill token-graph buckets it states, where it states
-some; `source_root`, `<revision_kind>-<revision>`; `sampling`, the request
+`prefill_buckets`, the prefill token-graph buckets it states, null where it
+states none; `source_root`, `<revision_kind>-<revision>`; `sampling`, the request
 parameters, null for a record serving no client run's request; its host key
 less its model and engine; its `stack`, the software versions run.json
 names; and its `ptl`, the cards' PTL state, `unrecorded` for a run.json that
@@ -135,17 +135,15 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
             samples.append(dataclasses.replace(s, provenance=traced))
     engine = json.loads((steps / "dp0.engine.json").read_text())
     host = run["host_key"]
-    config = {
+    return samples, {
         **fields,
         "engine_config": keyed_of(engine),
+        PREFILL_BUCKETS: engine.get(PREFILL_BUCKETS),
         "stack": run["stack"],
         "ptl": run.get("ptl", UNRECORDED),
         "sampling": json.loads(sampling[0]) if sampling else None,
         "host_key": {k: v for k, v in host.items() if k not in ("model", "engine")},
     }
-    if PREFILL_BUCKETS in engine:
-        config[PREFILL_BUCKETS] = engine[PREFILL_BUCKETS]
-    return samples, config
 
 
 def run_fields(run: dict, record="run.json") -> dict:

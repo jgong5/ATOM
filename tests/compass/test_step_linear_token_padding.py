@@ -15,6 +15,7 @@ No device.
 
 import dataclasses
 import json
+import re
 from types import SimpleNamespace
 
 import numpy as np
@@ -22,6 +23,7 @@ import pytest
 from test_backend_step_linear_fit import ENGINE, SPEC, _engine_file, _record
 from test_fit_steps import DIGEST, LINEAR, clients, fit, law_key, member, record
 from test_parity_record import _config
+from test_step_linear_draft import _mtp_record
 
 from atom.compass.backends import (
     BatchView,
@@ -32,6 +34,7 @@ from atom.compass.backends import (
     step_linear_fit,
 )
 from atom.compass.backends.step_labels import digest
+from atom.compass.parity import StepRecording
 from atom.compass.parity import _record as parity_record
 from atom.compass.runner import projection
 from atom.utils.region_graph import TokenGraph
@@ -214,6 +217,18 @@ def test_a_data_parallel_step_pads_every_rank_to_its_groups_largest(tmp_path):
         backend.price(unknown)
 
 
+def test_an_mtp_record_s_draft_law_adds_no_padding(tmp_path):
+    path = _mtp_record(_path(tmp_path / "mtp"), _trace_steps(0))
+    _engine_file(path, {**ENGINE, "prefill_buckets": BUCKETS})
+    law = _law_of(tmp_path, [path])
+
+    assert law["prefill"]["buckets"] == BUCKETS
+    assert "padding" in law["prefill"]["coefficients"]
+    draft = law["draft"]["prefill"]
+    assert "padding" not in draft["coefficients"]
+    assert "buckets" not in draft
+
+
 def test_a_data_parallel_step_stating_no_largest_rank_refuses_a_padded_fit(
     tmp_path,
 ):
@@ -280,6 +295,18 @@ def test_the_published_law_pads_to_the_records_buckets_as_the_command_does(tmp_p
     assert law == {k: v for k, v in written.items() if k not in ("host", "host_fit")}
 
 
+def test_fit_steps_refuses_records_of_which_only_some_state_buckets(tmp_path):
+    a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
+    engine = a / "steps/dp0.engine.json"
+    held = json.loads(engine.read_text())
+    engine.write_text(json.dumps({**held, "prefill_buckets": BUCKETS}))
+
+    named = f"prefill_buckets: {json.dumps(BUCKETS)} in {a}; null in {b}"
+    with pytest.raises(SystemExit, match=re.escape(named)):
+        fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
+    assert not (tmp_path / "store").exists()
+
+
 def test_a_record_states_the_prefill_buckets_its_runner_recorded(tmp_path, monkeypatch):
     monkeypatch.setenv("ATOM_COMPASS_PARITY_RECORD", str(tmp_path / "none"))
     path = parity_record(SimpleNamespace(rank=0, config=_config())).path
@@ -292,6 +319,31 @@ def test_a_record_states_the_prefill_buckets_its_runner_recorded(tmp_path, monke
     path = parity_record(SimpleNamespace(rank=0, config=_config())).path
     engine = json.loads(path.with_suffix(".engine.json").read_text())
     assert engine["prefill_buckets"] == [256, 512]
+
+
+def test_a_capture_after_the_record_s_first_step_adds_the_buckets_it_recorded(
+    tmp_path, monkeypatch
+):
+    class _Base:
+        def __init__(self):
+            self.rank, self.config = 0, _config()
+
+        def capture_cudagraph(self):
+            monkeypatch.setattr(
+                TokenGraph, "captured_sizes", lambda phase=None: (256, 512)
+            )
+            return 0.0, [], 0
+
+    class _Recorded(StepRecording, _Base):
+        pass
+
+    monkeypatch.setenv("ATOM_COMPASS_PARITY_RECORD", str(tmp_path))
+    runner = _Recorded()
+    # The dynamic-chunking sweep's first forward makes the record before capture.
+    engine = parity_record(runner).path.with_suffix(".engine.json")
+    assert "prefill_buckets" not in json.loads(engine.read_text())
+    assert runner.capture_cudagraph() == (0.0, [], 0)
+    assert json.loads(engine.read_text())["prefill_buckets"] == [256, 512]
 
 
 @pytest.mark.parametrize("dp", [1, 2])
