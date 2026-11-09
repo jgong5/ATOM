@@ -1982,8 +1982,8 @@ and receives both run on the engine's step loop, and no worker takes part.
   assuming "at once" frees prefill's blocks early exactly when decode is congested.
 - **Ceiling: per-pair links are a simplification under RDMA.** Each prefill-decode rank
   pair is one FIFO link, and writes on different pairs never contend. FIFO per rank pair
-  is measured on Mooncake TCP; under RDMA it is Compass's simplification through v1
-  (owner ruling on #1179). The real sharing unit depends on the fabric:
+  is measured on Mooncake TCP and kept under RDMA through v1 by the owner ruling on
+  #1179. The real sharing unit depends on the fabric:
   - With matched rails (`ATOM_MOONCAKE_MATCHED_RAILS`, as on the MI355X nodes crs005 and
     crs013), a producer writes through the rail engine of the consumer's HCA
     (`RailEnginePool.get`), so writes into one decode rank share its rail across prefill
@@ -2075,9 +2075,10 @@ two differ the code is right.
 
 ### Cons / open issues
 
-- The transfer model is now **unvalidated** — a real RDMA baseline is needed at least
-  once to fit `latency` and `bandwidth`, or the numbers are assumed rather than
-  measured. This is a calibration task, not a simulator task, but it must be named.
+- A link's `latency` and `bandwidth` are as good as its network spec, whose provenance
+  says per value whether it came from a datasheet, was assumed or was probed; a link no
+  probe fills prices every transfer on assumed or datasheet numbers. #3051 probed the
+  MI355X rails between crs005 and crs013 (`atom/compass/networks/crs005-013-ionic.json`).
 - Mooncake requires **all** `(pp_rank, tp_rank)` pairs to report before a request
   completes (`mooncake_connector.py::MooncakeConnector._record_write_done`). The
   simulated write is one event per request, priced on the whole block table, so ranks

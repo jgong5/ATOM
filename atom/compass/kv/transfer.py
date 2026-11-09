@@ -24,7 +24,8 @@ the other side: a transfer between two nodes priced on the intra-node link is
 wrong by roughly an order of magnitude and would look entirely plausible.
 
 The numbers are as good as the document they came from. A spec's provenance
-says per value whether it was declared or probed. A probed RDMA link is
+says per value whether it came from a datasheet, was assumed or was probed. A
+probed RDMA link is
 `atom/compass/networks/crs005-013-ionic.json`, measured on the rails between
 two MI355X nodes; its provenance names the bench and the run.
 
