@@ -383,11 +383,14 @@ def _record(runner):
 def recorded_graphs(config) -> dict:
     """`GRAPHS`' mapping for a runner of `config` whose ATOM has recorded its
     graphs: its model's architecture, each phase's token-graph buckets
-    (`TokenGraph.captured_sizes`) and each request graph's keys, sorted."""
+    (`TokenGraph.captured_sizes`) and each request graph's keys, sorted: the
+    graphs by their keys' text, since one keys by a tuple (a decode's request
+    bucket) and another by an int (a DSpark draft's `running_bs`)."""
     from atom.utils.region_graph import ReqGraph, TokenGraph
 
     token = {p: TokenGraph.captured_sizes(p) for p in ("prefill", "decode")}
-    request = sorted(sorted(g.keys()) for g in ReqGraph._live if g.keys())
+    keys = (sorted(g.keys()) for g in ReqGraph._live if g.keys())
+    request = sorted(keys, key=repr)
     graphs = {"architecture": architecture(config), "token": token, "request": request}
     return json.loads(json.dumps(graphs))
 
