@@ -59,7 +59,11 @@ fitted for a kind whose samples carry it: `W_inputs` and `L_mtp`, on an MTP
 record, and `W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
 solve drops above the law paid a first-use JIT compile (`_jit`): it and the
 forward after it, whose period takes up the stall, are left out of every host
-law; the report lists the JIT forwards per run under `jit_steps`.
+law; the report lists the JIT forwards per run under `jit_steps`. A `W_launch`
+label leaves out the time its launch spent in HIP's blocking calls, which the
+report states per run and kind under `blocked` (`_blocked`); it names under
+`unstamped` the runs whose records state none, so their `W_launch` labels are
+wall times.
 A forward's `E` that admits requests (`step_labels.admissions`) is left out of
 its kind's law: the law then prices the engine loop alone, and `admit`, seconds
 on `step_labels.admit_x`, prices what the forwards of every kind that admit spend
@@ -376,6 +380,7 @@ def fit_host(samples) -> tuple[dict, dict]:
     rows = _host_rows(kept)
     host = {"key": json.loads(keys[0]), "laws": {}}
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
+    report["blocked"], report["unstamped"] = _blocked(samples)
     report["jit_steps"] = {}
     for run, _, n in sorted(jit):
         report["jit_steps"].setdefault(run, []).append(n)
@@ -407,6 +412,35 @@ def fit_host(samples) -> tuple[dict, dict]:
         host["admit"] = None  # a run refuses a forward that admits a request
         report["unfitted"]["admit"] = str(e).splitlines()[0]
     return host, report
+
+
+def _blocked(samples) -> tuple[dict, list[str]]:
+    """Per run whose lines state `blocked_ns` and kind, its launches, those
+    that blocked in a HIP call, their blocked ms at p50 and p90, and each
+    call's blocked ms in all; and the runs whose lines state none, so their
+    `W_launch` labels are wall times."""
+    runs: dict = {}
+    for s in samples:
+        if "W_launch" in s.host:
+            runs.setdefault(s.provenance["run"], []).append(s)
+    blocked = {}
+    for run, launches in runs.items():
+        if all(s.blocked is None for s in launches):
+            continue
+        for kind in HOST_KINDS:
+            mine = [s.blocked or {} for s in launches if host_kind(s.view) == kind]
+            ms = [sum(b.values()) * 1e3 for b in mine if b]
+            calls: dict = {}
+            for b in mine:
+                for call, seconds in b.items():
+                    calls[call] = calls.get(call, 0.0) + seconds * 1e3
+            blocked.setdefault(run, {})[kind] = {
+                "launches": len(mine),
+                "blocked": len(ms),
+                "ms": np.percentile(ms, (50, 90)).tolist() if ms else None,
+                "calls": calls,
+            }
+    return blocked, sorted(runs.keys() - blocked.keys())
 
 
 def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:

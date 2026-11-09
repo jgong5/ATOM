@@ -32,7 +32,10 @@ real runner's lines are kept in memory and written at its `exit`, so no file
 call or JSON encoding runs between its forwards; a worker that never reaches
 `exit` (SIGKILL, a native crash) leaves an empty record. A real line also
 carries `launch`, where its model's launch provider declares features
-(`backends.launch_features`). A simulated runner's line is
+(`backends.launch_features`), and `blocked_ns`, where the worker loaded the
+blocking-call tool (`blocked`): the nanoseconds its thread spent in each HIP
+call that blocked, from the launch's entry to the token copy wait's, or to
+the launch's exit on a forward with no such wait. A simulated runner's line is
 written as its step is recorded, and flushed to the file the record keeps open
 from its start, so a killed simulated worker keeps every line. Under `kv` a line carries the lmcache offload loads
 and saves the scheduler handed the worker since the previous line
@@ -117,12 +120,16 @@ TIMESTAMPS = (
     "d_propose_ns",
     "t_pull_ns",
     "t_put_ns",
+    "blocked_ns",
 )
 #: Profiler ranges a trace run (`busy`) splits a forward's kernels at, on every
 #: TP rank: the target ends where `TARGET_DONE` opens, and each drafter pass is
 #: the range named `MARK` and its line field.
 MARK = "compass::"
 TARGET_DONE = MARK + "target_done"
+#: The stamps the blocking-call tool's sums are read at: a line's `blocked_ns`
+#: runs from the launch's entry to the token copy wait's, as `W_launch` does.
+BLOCKED_AT = ("t_launch_ns", "t_recv_ns")
 
 
 class StepRecord:
@@ -473,10 +480,14 @@ class StepRecording:
     Once `allocate_kv_cache` has built a Mooncake connector, every worker
     records that connector's KV writes (`writes`), written at `exit`. A
     launch provider that declares features is installed once built, and its
-    `observe` is the line's `launch`.
+    `observe` is the line's `launch`. Where the class it is composed into sets
+    `_blocked` to the loaded blocking-call tool (`blocked.loaded`), the tool's
+    sums read at the launch's and the token copy wait's stamps give the line's
+    `blocked_ns`.
     """
 
     _recording = False
+    _blocked = None
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -549,12 +560,17 @@ class StepRecording:
         return super().flush_pp_send()
 
     def _stamped(self, key, call, *args):
-        """`call(*args)`, stamped under `key` when this forward is recorded."""
+        """`call(*args)`, stamped under `key` when this forward is recorded,
+        with the blocking-call tool's sums around it at `BLOCKED_AT`."""
         if getattr(self, "_parity_record", None) is None:
             return call(*args)
+        tool = self._blocked if key in BLOCKED_AT else None
         enter = self.step_clock_ns()
+        before = None if tool is None else tool()
         reply = call(*args)
         self._stamps[key] = (enter, self.step_clock_ns())
+        if tool is not None:
+            self._stamps[(key, "blocked")] = (before, tool())
         return reply
 
     def _pp_received(self, call, *args, **kwargs):
@@ -609,6 +625,11 @@ class StepRecording:
         stamps, self._stamps = self._stamps, {}
         if self._launch.features:
             stamps["launch"] = self._launch.observe(self)
+        sums = {key: stamps.pop((key, "blocked"), None) for key in BLOCKED_AT}
+        if sums["t_launch_ns"]:
+            before, end = sums["t_launch_ns"]
+            end = sums["t_recv_ns"][0] if sums["t_recv_ns"] else end
+            stamps["blocked_ns"] = self._blocked.between(before, end)
         launch = stamps.pop("launch_event", None)
         names = {"d_target_ns": "target_event", "d_recv_ns": "recv_event"}
         marks = {k: [stamps.pop(e)] for k, e in names.items() if e in stamps}
