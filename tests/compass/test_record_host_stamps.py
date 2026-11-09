@@ -23,7 +23,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
-from tokenizers import Tokenizer
+from tokenizers import AddedToken, Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
@@ -31,6 +31,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from atom.compass import parity
 from atom.compass import run as compass_run
 from atom.entrypoints.openai import api_server, chat_encoders
+from atom.model_engine import segment_tokenizer
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.llm_engine import InputOutputProcessor
 from atom.sampling_params import SamplingParams
@@ -68,6 +69,7 @@ def patched(monkeypatch):
         (CoreManager, "_mark_seq_prefill_complete"),
         (CoreManager, "_deliver_terminal_output"),
         (ThreadPoolExecutor, "submit"),
+        (segment_tokenizer.SegmentTokenizer, "_encode_cached"),
     ):
         monkeypatch.setattr(owner, name, vars(owner)[name])
     render = chat_encoders.apply_chat_template
@@ -108,6 +110,30 @@ def test_a_recorded_server_writes_each_tokenizer_call_it_serves(record, tok):
     assert got == [("encode", 3, 1), ("decode", 3, 1), ("encode_batch", 4, 2)]
     assert all(c["t_start_ns"] <= c["t_end_ns"] for c in calls)
     assert calls[0]["t_end_ns"] <= calls[1]["t_start_ns"]
+
+
+def test_a_recorded_server_writes_each_segment_tokenizer_call_around_its_own(
+    record, monkeypatch
+):
+    # Every prompt takes the cache, and none is checked with a plain encode.
+    monkeypatch.setattr(segment_tokenizer, "_MIN_CACHED_CHARS", 0)
+    monkeypatch.setattr(segment_tokenizer, "_VERIFY_FIRST", 0)
+    vocab = {"[UNK]": 0} | {w: i + 1 for i, w in enumerate(WORDS)}
+    backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    backend.add_special_tokens([AddedToken("<sep>", special=True)])
+    tok = PreTrainedTokenizerFast(tokenizer_object=backend)
+    seg = segment_tokenizer.SegmentTokenizer.maybe_create(tok, 1 << 20)
+    compass_run.tokenizer(tok, None)  # the engine is built before the wrap
+    ids = [seg.encode("hi there<sep>how are you") for _ in range(2)]
+    _, calls = _calls(record)
+    # Each call's tokens are the prompt's ids; the second encodes nothing.
+    got = [(c["call"], c["tokens"], c["items"]) for c in calls]
+    assert got == [("encode_batch", 5, 2)] + [("segment", len(i), 1) for i in ids]
+    batch, first = calls[:2]
+    assert batch["thread"] == first["thread"]
+    assert first["t_start_ns"] < batch["t_start_ns"] < batch["t_end_ns"]
+    assert batch["t_end_ns"] < first["t_end_ns"]
 
 
 def _server(tok):
