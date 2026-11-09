@@ -1268,6 +1268,99 @@ def test_v4_prefill_index_leaves_take_atom_s_lists_whole_by_ratio_past_cached_to
     assert start.tolist() == [8]
 
 
+def test_v4_bf16_prefill_attention_takes_v4_s_lists_by_ratio_and_v41_s_leaf_its_own():
+    # DeepSeek-V4's bf16-cache prefill attention is V4.1's sparse attention's
+    # operator. On a V4 prefill past 8 cached tokens, bound by size, a CSA
+    # layer's read the HCA list, an HCA layer's the SWA one, both the SWA
+    # indptr, at the lists' captured spans. A V4.1 step holds none of V4's
+    # lists, and its leaf takes V4.1's indptrs.
+    attend = "aiter.pa_sparse_prefill_opus.default"
+    cache = "attn_metadata_builder.cache.indptr_buffers"
+
+    def i32(n):
+        return torch.zeros(n, dtype=torch.int32)
+
+    def meta(slot, n):
+        return slot, _t([n], "metadata", dtype="torch.int32")
+
+    lists = {"extend": 21, "prefix_swa": 9, "prefix_csa": 40, "prefix_hca": 15}
+    v4 = {
+        **{f"kv_indptr_{k}": i32(7) for k in lists},
+        **{f"kv_indices_{k}": i32(n) for k, n in lists.items()},
+    }
+
+    def bound(step, held, stated):
+        """Each slot's buffer and elements on a step whose attention metadata
+        gains `step`, beside the runner's buffers `held`, by its leaf's ratio."""
+        runner = _Runner()
+        runner.forward_vars |= held
+        prepare = runner.prepare_model
+
+        def prepare_model(batch):
+            prepared = prepare((0, 0))
+            vars(fctx.get_forward_context().attn_metadata).update(step)
+            return prepared
+
+        runner.prepare_model = prepare_model
+        attention = [
+            dataclasses.replace(
+                _leaf(
+                    attend,
+                    meta("kv_indices_prefix", n),
+                    meta("kv_indptr_prefix", 7),
+                    meta("kv_indices_extend", 21),
+                    meta("kv_indptr_extend", 7),
+                ),
+                stated=stated(r),
+            )
+            for r, n in ((4, 12), (128, 2))
+        ]
+        stub = ops.Stub(runner, 10_000)
+        stub.leaves = ops.leaves(_graph(*attention, layers=1)["region"])
+        stub._prepare(SimpleNamespace(total_seqs_num_prefill=1, num_cached_tokens=[8]))
+        [(_, views)] = stub.placed
+        return {
+            (stub.leaves[s][0]["stated"]["compress_ratio"], path): (
+                name,
+                None if view is None else view.numel(),  # None: refused
+            )
+            for (s, path), (name, view) in views.items()
+        }
+
+    assert bound(v4, {}, lambda r: (("compress_ratio", r),)) == {
+        (r, slot): (name, n)
+        for r, kind in ((4, "csa"), (128, "hca"))
+        for slot, name, n in (
+            ("kv_indices_prefix", f"kv_indices_prefix_{kind}", lists[f"prefix_{kind}"]),
+            ("kv_indptr_prefix", f"kv_indptr_prefix_{kind}", 7),
+            ("kv_indices_extend", "kv_indices_extend", 21),
+            ("kv_indptr_extend", "kv_indptr_extend", 7),
+        )
+    }
+
+    def geometry(r):
+        return ("window_size", 128), ("compress_ratio", r), ("index_topk", None)
+
+    v41 = {f"{cache}.{r}.{i}": i32(7) for r in (4, 128) for i in (0, 1)}
+    got = bound({}, v41, geometry)
+    # V4.1's index lists bind by size, at their captured spans
+    assert {k: n for k, (_, n) in got.items()} == {
+        (r, slot): n
+        for r, captured in ((4, 12), (128, 2))
+        for slot, n in (
+            ("kv_indices_prefix", captured),
+            ("kv_indptr_prefix", 7),
+            ("kv_indices_extend", 21),
+            ("kv_indptr_extend", 7),
+        )
+    }
+    assert {k: name for k, (name, _) in got.items() if "indptr" in k[1]} == {
+        (r, f"kv_indptr_{part}"): f"{cache}.{r}.{i}"
+        for r in (4, 128)
+        for i, part in enumerate(("prefix", "extend"))
+    }
+
+
 def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
     layers = {f"model.layers.{i}.attn": SimpleNamespace(layer_num=i) for i in (0, 1)}
     kv = {f"layer_{i}": SimpleNamespace(k_cache=torch.zeros(64, 16, 4)) for i in (0, 1)}

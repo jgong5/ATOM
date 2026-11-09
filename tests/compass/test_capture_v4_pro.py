@@ -50,6 +50,8 @@ FP8_QUERY = "aiter._rope_rotate_activation_fp8quant.default"
 BF16_DECODE = (
     "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
 )
+#: The bf16 KV cache's prefill attention, V4.1's sparse attention's operator.
+BF16_PREFILL = "aiter.pa_sparse_prefill_opus.default"
 #: The attention's core kernel, one a layer, by phase.
 CORE = {"decode": DECODE, "prefill": "aiter.pa_sparse_prefill_fp8_opus.default"}
 
@@ -421,7 +423,8 @@ def test_the_attention_body_runs_as_a_real_step_then_the_batch_is_dummy_again(
         geometry = {"window_size": 64, "compress_ratio": ratio, "index_topk": top}
         ratio = {"compress_ratio": ratio}
         decodes = (DECODE, "aiter.mla_decode_v4_asm.default", BF16_DECODE, PS_DECODE)
-        ratios = dict.fromkeys((INDEXER, QKN, QKN_BF16, CORE["prefill"]), ratio)
+        prefills = CORE["prefill"], BF16_PREFILL
+        ratios = dict.fromkeys((INDEXER, QKN, QKN_BF16, *prefills), ratio)
         return {**dict.fromkeys(decodes, geometry), **ratios}
 
     assert seen == [(False, stated(4, 512)), (False, stated(128, None))]
