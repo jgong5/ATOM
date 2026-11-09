@@ -766,10 +766,9 @@ def _jit(samples, features=()) -> set[tuple]:
 def _launch_columns(members, features) -> tuple[list[str], dict]:
     """The `features` host-law `members` (`_host_rows`) adopt as columns, in
     order, and the report's `launch_columns`: each round's held-out error per
-    design tried. As `_moe_column` picks, a design's error is its p50 error's
-    magnitude, each run held out, weighted by the run's members; a round adds
-    the feature of least error while it is below the last design's. Members
-    of one run adopt none."""
+    design tried (`_held_out_error`, each run held out). A round adds the
+    feature of least error while it is below the last design's. Members of one
+    run adopt none."""
     if not features:
         return [], {}
     x = np.array([r[2] for r in members], dtype=np.float64).reshape(-1, 3)
@@ -779,9 +778,8 @@ def _launch_columns(members, features) -> tuple[list[str], dict]:
 
     def error(names):
         values = [[r[5][f] for r in members] for f in names]
-        folds = _folds(np.column_stack([x, *values]), y, cell, [*HOST_FEATURES, *names])
-        n = sum(k for k, _ in folds.values())
-        return sum(k * abs(p) for k, p in folds.values()) / n if n else None
+        design = np.column_stack([x, *values])
+        return _held_out_error(_folds(design, y, cell, [*HOST_FEATURES, *names]))
 
     adopted, rounds = [], [{"none": error([])}]
     while rounds[0]["none"] is not None and len(adopted) < len(features):
@@ -939,6 +937,13 @@ def _folds(design, y, cell, names) -> dict:
     return out
 
 
+def _held_out_error(folds: dict) -> float | None:
+    """`_folds`' held-out error: the mean of each record's held-out p50 error's
+    magnitude, weighted by its rows; None with no record held out."""
+    rows = sum(n for n, _ in folds.values())
+    return sum(n * abs(p) for n, p in folds.values()) / rows if rows else None
+
+
 def _moe_column(members, x, names, routing) -> tuple:
     """The MoE column decode rung `members` adopts, or None, and the figures the
     rule read, as the vector records them under `fit.moe_column`.
@@ -947,11 +952,10 @@ def _moe_column(members, x, names, routing) -> tuple:
     forms are no column and each of `MOE_COLUMNS` over the steps' real MoE
     tokens, `moe_experts` under `routing` and with each step's group dummies
     as one token (`moe_column`). Each form is solved with each record
-    held out of the rung's rows, and its held-out error is the mean over the
-    records of the held-out p50 error's magnitude, weighted by the record's
-    steps. The form of smallest held-out error is picked, no column on a tie,
-    and a picked column is adopted, returned as (feature, column, solve). A
-    rung of one record has no held-out error and adopts none.
+    held out of the rung's rows, its held-out error `_held_out_error`'s. The
+    form of smallest held-out error is picked, no column on a tie, and a
+    picked column is adopted, returned as (feature, column, solve). A rung of
+    one record has no held-out error and adopts none.
     """
     cell = np.array([r[0] for r in members])
     y = np.array([r[3] for r in members])
@@ -961,12 +965,8 @@ def _moe_column(members, x, names, routing) -> tuple:
         forms[feature] = (np.column_stack([x, column]), [*names, feature])
     held, error = {}, {}
     for form, (design, wide) in forms.items():
-        folds = _folds(design, y, cell, wide)
-        held[form] = folds
-        steps = sum(n for n, _ in folds.values())
-        error[form] = (
-            sum(n * abs(p) for n, p in folds.values()) / steps if steps else None
-        )
+        held[form] = _folds(design, y, cell, wide)
+        error[form] = _held_out_error(held[form])
     picked = min(error, key=error.get) if held["none"] else None
     adopted = None if picked in (None, "none") else picked
     figures = {

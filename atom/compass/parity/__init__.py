@@ -386,8 +386,7 @@ def recorded_graphs(config) -> dict:
 
     token = {p: TokenGraph.captured_sizes(p) for p in ("prefill", "decode")}
     request = sorted(sorted(g.keys()) for g in ReqGraph._live if g.keys())
-    graphs = {"architecture": architecture(config), "token": token, "request": request}
-    return json.loads(json.dumps(graphs))
+    return {"architecture": architecture(config), "token": token, "request": request}
 
 
 def carry_response_ids() -> None:
