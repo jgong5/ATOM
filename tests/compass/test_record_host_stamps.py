@@ -86,6 +86,7 @@ def record(patched, monkeypatch, tmp_path):
 
 
 def _calls(record) -> tuple[dict, list[dict]]:
+    compass_run._move_line_files()  # as the server exits
     path = record / compass_run.TOKENIZER_RECORD
     head, *calls = (json.loads(line) for line in path.read_text().splitlines())
     return head, calls
@@ -170,6 +171,7 @@ def test_a_recorded_server_stamps_each_request_s_intake_as_the_probe_does(record
         return [await _post(app, body) for body in bodies]
 
     answers = asyncio.run(lone())
+    compass_run._move_line_files()  # as the server exits
     rows = [
         line.split() for line in (record / "intake.stamps").read_text().splitlines()
     ]
@@ -247,6 +249,7 @@ def test_a_recorded_server_stamps_each_output_row_taken_in_and_each_stream_head(
         await post("/v1/completions")
 
     asyncio.run(both())
+    compass_run._move_line_files()  # as the server exits
     rows = [
         line.split() for line in (record / "intake.stamps").read_text().splitlines()
     ]
@@ -293,3 +296,54 @@ def test_a_simulated_run_recording_its_steps_records_no_host_calls(
     assert "encode" not in vars(tok)
     assert Request.body is body
     assert not record.exists()
+
+
+def test_a_recorded_server_writes_no_line_under_its_record_until_it_exits(
+    record, tok, monkeypatch, tmp_path
+):
+    """On NFS a line written right after another waits for the first's round
+    trip; served requests write theirs to the host's own file system."""
+    import builtins
+    import io
+    import os
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "local"))
+    (tmp_path / "local").mkdir()
+    app = _server(tok)
+    compass_run.tokenizer(tok, None)
+    opened = []
+
+    def spied(real):
+        def spy(file, *a, **k):
+            opened.append(os.fspath(file) if not isinstance(file, int) else "")
+            return real(file, *a, **k)
+
+        return spy
+
+    for owner in (builtins, io, os):
+        monkeypatch.setattr(owner, "open", spied(owner.open))
+    body = json.dumps({"messages": [{"role": "user", "content": "hi there"}]})
+
+    async def lone():
+        return [await _post(app, body.encode()) for _ in range(2)]
+
+    asyncio.run(lone())
+    monkeypatch.undo()
+    # No file under the record was opened, and none of its lines is there.
+    assert not [p for p in opened if pathlib.Path(p).is_relative_to(record)]
+    names = (compass_run.INTAKE_RECORD, compass_run.TOKENIZER_RECORD)
+    assert not [n for n in names if (record / n).exists()]
+    local = {
+        n: pathlib.Path((record / (n + compass_run.LOCAL)).read_text().strip())
+        for n in names
+    }
+    assert {p.parent for p in local.values()} == {tmp_path / "local"}
+    lines = {n: p.read_text() for n, p in local.items()}
+    assert len(lines[compass_run.INTAKE_RECORD].splitlines()) == 2 * 7
+    # The server's stop, once uvicorn has returned, moves them into the record.
+    monkeypatch.setattr(compass_run.clock, "installed", lambda: None)  # a real run
+    assert not compass_run.frontend_done(None)
+    assert {n: (record / n).read_text() for n in names} == lines
+    assert not [p for n, p in local.items() if p.exists()]
+    assert not list(record.glob("*" + compass_run.LOCAL))

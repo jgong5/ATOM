@@ -232,6 +232,7 @@ not find it naming its endpoint's port is refused.
 """
 
 import ast
+import atexit
 import contextlib
 import functools
 import hashlib
@@ -244,6 +245,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -426,6 +428,9 @@ _sigterm_at_ready: list = []
 #: The files a recorded real run's frontend writes beside its step record:
 #: each served tokenizer call, and each HTTP request's intake stamps.
 TOKENIZER_RECORD, INTAKE_RECORD = "tokenizer.jsonl", "intake.stamps"
+#: Beside one of those, ``<name>.local`` names the file its lines are in until
+#: the server's exit moves them there (`_LineFile`).
+LOCAL = ".local"
 #: This server's ``host`` entry among several, which `tokenizer` resolves.
 _frontend_host: dict | None = None
 
@@ -2139,16 +2144,45 @@ def _record_host(tok, record: Path) -> None:
 
 
 class _LineFile:
-    """A file of lines, each written whole and flushed as it is written, from
-    any thread."""
+    """A file of lines at `path`, each written whole and flushed as it is
+    written, from any thread, into a file on the host's own file system, which
+    ``<path>.local`` names until `move`, at the process's exit, moves them to
+    `path`. On NFS a line written right after another waits for the first's
+    round trip, inside the request stage the line stamps."""
 
     def __init__(self, path) -> None:
-        self.file = open(path, "w", buffering=1)  # noqa: SIM115
+        self.path = Path(path)
+        fd, self.local = tempfile.mkstemp(prefix=f"compass.{self.path.name}.")
+        self.file = os.fdopen(fd, "w", buffering=1)
         self.lock = threading.Lock()
+        self.path.unlink(missing_ok=True)
+        self.path.with_name(self.path.name + LOCAL).write_text(f"{self.local}\n")
+        atexit.unregister(_move_line_files)
+        atexit.register(_move_line_files)
+        _line_files.append(self)
 
     def write(self, line: str) -> None:
         with self.lock:
-            self.file.write(line)
+            if not self.file.closed:
+                self.file.write(line)
+
+    def move(self) -> None:
+        """Move the lines to `path`; a line written after is dropped."""
+        with self.lock:
+            self.file.close()
+        shutil.copyfile(self.local, self.path)
+        self.path.with_name(self.path.name + LOCAL).unlink()
+        os.remove(self.local)
+
+
+#: The `_LineFile`s not yet moved to their record.
+_line_files: list[_LineFile] = []
+
+
+def _move_line_files() -> None:
+    """Move each `_LineFile`'s lines to its record, as the server exits."""
+    while _line_files:
+        _line_files.pop().move()
 
 
 #: Whether this thread is inside a `_recorded` ``encode`` call.
@@ -2671,7 +2705,9 @@ def frontend_done(llm_engine) -> bool:
     hand in the frontend's refusals, at a stop with the signal that ended it.
     With the authority co-hosted, then write the step table and the run summary;
     at a stop, after the early end's writer, which has written its own if an LP
-    handed in before the stop, so the summary left counts every hand-in."""
+    handed in before the stop, so the summary left counts every hand-in. A
+    recorded real run's served lines move into its record first (`_LineFile`)."""
+    _move_line_files()
     rt = clock.installed()
     stop = None if rt is None else getattr(rt.loop, "stopped", None)
     if rt is None or (rt.now != math.inf and stop is None):

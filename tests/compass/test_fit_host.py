@@ -104,6 +104,23 @@ def test_a_record_whose_server_built_an_aiter_module_refuses_naming_it(tmp_path)
     assert not (tmp_path / "store").exists()
 
 
+def test_a_record_whose_server_did_not_exit_refuses_naming_its_lines(tmp_path):
+    a = record(tmp_path / "a", 19)
+    stamped(a)
+    stamps = a / "steps" / compass_run.INTAKE_RECORD
+    local = tmp_path / "compass.intake.stamps.x"
+    stamps.rename(local)
+    stamps.with_name(stamps.name + compass_run.LOCAL).write_text(f"{local}\n")
+
+    named = (
+        f"{a}: its server did not exit, so steps/intake.stamps does not hold its "
+        f"lines; steps/intake.stamps.local names the file that holds them, {local}"
+    )
+    with pytest.raises(SystemExit, match=re.escape(named)):
+        fit(tmp_path, "fit host", a, *clients(a))
+    assert not (tmp_path / "store").exists()
+
+
 def test_records_with_pull_stamps_give_every_kind_an_E_out_law_a_run_prices(
     tmp_path, monkeypatch
 ):

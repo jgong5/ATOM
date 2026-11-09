@@ -68,6 +68,88 @@ def test_serve_stamps_a_body_read_off_the_socket_once_and_each_template(tmp_path
     assert all(int(r[0]) >= int(r[3]) for r in rows)
 
 
+#: A stand-in server that reads a body and renders a template, then prints
+#: what it opened meanwhile, whether STAMPS (its argument) exists and the file
+#: ``STAMPS.<pid>.local`` names, before it exits.
+LOCAL_SERVER = """
+import asyncio, builtins, glob, io, json, os, sys
+from starlette.requests import Request
+from .chat_encoders import apply_chat_template
+
+opened = []
+for owner in (builtins, io, os):
+    real = owner.open
+    owner.open = lambda f, *a, _real=real, **k: (opened.append(str(f)), _real(f, *a, **k))[1]
+
+async def main():
+    async def receive():
+        return {"type": "http.request", "body": b"x" * 1234}
+
+    await Request({"type": "http"}, receive).body()
+    apply_chat_template(None, None, [])
+
+if __name__ == "__main__":
+    stamps = sys.argv[1]
+    asyncio.run(main())
+    seen, named = list(opened), glob.glob(stamps + ".*.local")
+    local = [open(n).read().strip() for n in named]
+    print(json.dumps({"opened": seen, "exists": os.path.exists(stamps), "local": local}))
+"""
+
+
+def test_serve_writes_no_stamp_line_into_stamps_until_the_server_exits(tmp_path):
+    """On NFS a line written right after another waits for the first's round
+    trip; a served request's lines go to the host's own file system."""
+    server = SERVER | {"entrypoints/openai/api_server.py": LOCAL_SERVER}
+    for name, text in server.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    record, local = tmp_path / "record", tmp_path / "local"
+    record.mkdir()
+    local.mkdir()
+    stamps = record / "stamps"
+    done = subprocess.run(
+        [sys.executable, PROBE, "serve", stamps, stamps],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path), TMPDIR=str(local)),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    seen = json.loads(done.stdout)
+    # While it served, nothing under the record was opened and STAMPS held no
+    # line: they were in one file of the host's own.
+    assert not [p for p in seen["opened"] if Path(p).is_relative_to(record)]
+    assert not seen["exists"]
+    assert [Path(p).parent for p in seen["local"]] == [local]
+    # At its exit they are in STAMPS, and nothing else is left.
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    assert [(r[2], r[4]) for r in rows] == [("body", "1234"), ("tmpl", "6")]
+    assert [p.name for p in record.iterdir()] == ["stamps"]
+    assert not list(local.iterdir())
+
+
+def test_a_reader_refuses_stamps_whose_server_did_not_exit_naming_its_lines(
+    tmp_path,
+):
+    stamps, local = tmp_path / "stamps", tmp_path / "http_intake.x.stamps"
+    stamps.write_text("1000 1 app 1000 0\n")
+    named = tmp_path / "stamps.4242.local"
+    named.write_text(f"{local}\n")
+    for verb in ("idle", "lone", "fit"):
+        done = subprocess.run(
+            [sys.executable, PROBE, verb, stamps],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert done.returncode == 1
+        assert done.stderr.strip() == (
+            f"{stamps}: the server that stamped into it did not exit, so its lines "
+            f"are not in it; {named} names the file that holds them, {local}"
+        )
+
+
 def test_a_cell_with_http_intake_runs_its_server_under_the_probe(tmp_path):
     # The script is executed as a program, as a user runs it, with a python3
     # stand-in that records the server's arguments and exits before it is ready.

@@ -21,7 +21,11 @@ streamed output, `_deliver_terminal_output` per finished sequence) and `head` an
 SSE response's head sent to the client, all size 0. Every process the server
 spawns stamps into STAMPS too: `kvsend`, a Mooncake KV write request sent
 (`MooncakeConnector._send_on_socket`), and `kvrecv`, one the prefill's listener
-received, both size 0.
+received, both size 0. While it serves, the lines go to a file on the host's own
+file system, which ``STAMPS.<pid>.local`` names, and at its exit they are appended to
+STAMPS: on NFS a line written right after another waits for the first's round
+trip, inside the stage it stamps. Every other verb refuses STAMPS while such a
+file names lines not yet appended.
 
 `floor` reads the transport from client send to ASGI app call off a server
 `serve` ran and the parity workload's real-run ARRIVALS
@@ -64,14 +68,18 @@ bursts. With PER_BYTE_S, that is the slope, and `fixed_s` keeps the span at
 it. Prints the terms, a gap's rms residual, N, bytes and sha256 as JSON.
 """
 
+import atexit
 import contextlib
+import glob
 import hashlib
 import importlib.abc
 import importlib.machinery
 import json
 import os
 import runpy
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from multiprocessing import spawn
@@ -87,9 +95,19 @@ def serve(stamps: str, args: list[str]) -> None:
     runpy.run_module(main, run_name="__main__", alter_sys=True)
 
 
-def install(stamps: str) -> None:
-    """Stamp into `stamps` in this process and every process it spawns."""
-    out = open(stamps, "a", buffering=1)  # noqa: SIM115
+def install(stamps: str, local: str | None = None) -> None:
+    """Stamp into `stamps` in this process and every process it spawns, each
+    line into `local` as it is written. With no `local`, a new file on the
+    host's own file system, which ``<stamps>.<pid>.local`` names until this
+    process's exit appends its lines to `stamps`."""
+    stamps = os.path.abspath(stamps)
+    if local is None:
+        fd, local = tempfile.mkstemp(prefix="http_intake.", suffix=".stamps")
+        os.close(fd)
+        named = f"{stamps}.{os.getpid()}.local"
+        Path(named).write_text(f"{local}\n")
+        atexit.register(_append, local, stamps, named)
+    out = open(local, "a", buffering=1)  # noqa: SIM115
 
     def stamp(kind: str, start: int, size: int) -> None:
         now, thread = time.monotonic_ns(), threading.get_ident()
@@ -216,18 +234,38 @@ def install(stamps: str) -> None:
     sys.meta_path.insert(0, Patcher())
     # A spawned process installs this before it runs anything else.
     line, here = spawn.get_command_line, os.path.dirname(os.path.abspath(__file__))
-    stamps = os.path.abspath(stamps)
 
     def get_command_line(**kwds) -> list[str]:
         argv = line(**kwds)
         i = argv.index("-c") + 1
         argv[i] = (
             f"import sys; sys.path.insert(0, {here!r}); import http_intake; "
-            f"http_intake.install({stamps!r}); {argv[i]}"
+            f"http_intake.install({stamps!r}, {local!r}); {argv[i]}"
         )
         return argv
 
     spawn.get_command_line = get_command_line
+
+
+def _append(local: str, stamps: str, named: str) -> None:
+    """Append the lines in `local` to `stamps`, then remove `local` and the
+    file `named` that names it."""
+    with open(local, "rb") as lines, open(stamps, "ab") as out:
+        shutil.copyfileobj(lines, out)
+    os.remove(named)
+    os.remove(local)
+
+
+def unstopped(stamps: str) -> None:
+    """Refuse `stamps` while a ``<stamps>.<pid>.local`` names lines a server
+    stamping into it has not appended: one that did not exit."""
+    named = sorted(glob.glob(f"{glob.escape(stamps)}.*.local"))
+    if named:
+        raise SystemExit(
+            f"{stamps}: the server that stamped into it did not exit, so its lines "
+            f"are not in it; {named[0]} names the file that holds them, "
+            f"{Path(named[0]).read_text().strip()}"
+        )
 
 
 def fit(stamps: str, n: int = 256, per_byte: float | None = None) -> dict:
@@ -451,6 +489,8 @@ def pd(stamps: str, steps: str | None = None) -> dict:
 
 if __name__ == "__main__":
     verb, stamps, *rest = sys.argv[1:]
+    if verb != "serve":
+        unstopped(stamps)
     if verb == "serve":
         serve(stamps, rest)
     elif verb == "floor":
