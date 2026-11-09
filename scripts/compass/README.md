@@ -1358,8 +1358,7 @@ smoke above:
   it passes; otherwise two more real runs follow, and the mean of the three grades it. No
   checked-in command grades this yet: `python -m atom.compass.validate` and `validate.runs`
   refuse fewer than two real runs, and
-  [#3101](https://github.com/jgong5/ATOM/issues/3101) adds it. #2147's grades came from
-  `agent_scratch/2147/r4/bin/grade.py`, which reads both exports as `validate.runs` does.
+  [#3101](https://github.com/jgong5/ATOM/issues/3101) adds it.
 - A real run has hung when, for 90 s while requests run or wait, its log shows neither a step
   line nor a load report with nonzero prompt or generation throughput
   ([#2922](https://github.com/jgong5/ATOM/issues/2922)). Check the node after the GPU reset
