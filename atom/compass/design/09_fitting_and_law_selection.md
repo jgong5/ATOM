@@ -294,11 +294,8 @@ DeepSeek-V4-Pro's TBO split reading its KV total off the device is
 [#2984](https://github.com/jgong5/ATOM/issues/2984)). A launch that waits for HIP queue
 space, or on an async copy from pageable memory, stays in the label
 ([#3071](https://github.com/jgong5/ATOM/issues/3071)). A record without the stamp labels
-`W_launch` by its wall time, and the fit's report names it. The stamp replaced a cut on
-timing alone, which took a prefill launch that ended after its device ran a fifth of its
-window to have waited: it dropped DeepSeek-V4.1's launches that never waited and kept
-DPA8's that did ([Ruling on #2980](https://github.com/jgong5/ATOM/issues/2980#issuecomment-6729555447),
-[#3069](https://github.com/jgong5/ATOM/issues/3069)).
+`W_launch` by its wall time, and the fit's report names it
+([Ruling on #2980](https://github.com/jgong5/ATOM/issues/2980#issuecomment-6729555447)).
 A forward whose `W_launch` its kind's fit drops above the law paid a first-use JIT
 compile, on a decode only past five times its price, since a decode's launch
 of a millisecond or so drops on host noise. It and the forward after it, whose period

@@ -480,10 +480,8 @@ class StepRecording:
     Once `allocate_kv_cache` has built a Mooncake connector, every worker
     records that connector's KV writes (`writes`), written at `exit`. A
     launch provider that declares features is installed once built, and its
-    `observe` is the line's `launch`. Where the class it is composed into sets
-    `_blocked` to the loaded blocking-call tool (`blocked.loaded`), the tool's
-    sums read at the launch's and the token copy wait's stamps give the line's
-    `blocked_ns`.
+    `observe` is the line's `launch`. The class it is composed into may set
+    `_blocked` to the blocking-call tool (`blocked.loaded`) for `blocked_ns`.
     """
 
     _recording = False

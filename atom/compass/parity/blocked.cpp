@@ -30,18 +30,13 @@ uint64_t now() {
   return t.tv_sec * 1000000000ull + t.tv_nsec;
 }
 
-bool ends_with(const char* s, const char* end) {
-  size_t n = strlen(s), m = strlen(end);
-  return n >= m && strcmp(s + n - m, end) == 0;
-}
-
 // The calls that return only once the device has caught up: stream, event and
 // device synchronizes, synchronous copies and frees.
 bool blocking(const char* name) {
   if (strstr(name, "Async")) return false;
-  return ends_with(name, "Synchronize") || ends_with(name, "Synchronize_spt") ||
-         strncmp(name, "hipMemcpy", 9) == 0 || strncmp(name, "hipDrvMemcpy", 12) == 0 ||
-         strncmp(name, "hipFree", 7) == 0 || strcmp(name, "hipHostFree") == 0;
+  return strstr(name, "Synchronize") || strncmp(name, "hipMemcpy", 9) == 0 ||
+         strncmp(name, "hipDrvMemcpy", 12) == 0 || strncmp(name, "hipFree", 7) == 0 ||
+         strcmp(name, "hipHostFree") == 0;
 }
 
 int collect(rocprofiler_callback_tracing_kind_t, rocprofiler_tracing_operation_t op,
