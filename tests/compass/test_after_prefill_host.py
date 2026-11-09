@@ -22,6 +22,7 @@ from test_parity_recurrence import _labelled, _law, line, record
 from test_run_step_grid import deployment, publish, run_file
 
 from atom.compass import run as compass_run
+from atom.compass.backends.launch_features import GRAPHS, REGISTRY, LaunchFeatures
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_labels import Sample
 from atom.compass.backends.step_linear_fit import fit_host, host_held_out
@@ -134,6 +135,38 @@ def test_the_held_out_report_prices_a_decode_after_an_output_prefill_with_its_te
     assert len(after) == 240
     assert np.median(np.abs(after)) < 0.02
     assert len(errors[f"host decode {MTP_SEGMENT}"]) == 600
+
+
+class Wide(LaunchFeatures):
+    """A decode of more than four rows launches a wider graph."""
+
+    features = ("wide",)
+
+    def predict(self, view, graphs):
+        return {"wide": float(len(view.requests) > 4)}
+
+
+def test_the_term_is_fitted_past_the_decode_law_s_launch_column(monkeypatch):
+    """A wide decode spends 0.3 ms more in `MTP_SEGMENT`: the decode law,
+    fitted without the decodes after an output prefill, adopts the column, and
+    the term over those decodes takes the law's price, column included, as its
+    fixed part."""
+    monkeypatch.setitem(REGISTRY, "WideForCausalLM", Wide())
+    key = {"engine": {GRAPHS: {"architecture": "WideForCausalLM"}}}
+    rng, cell = np.random.default_rng(3), []
+    for s in _cell(rng, run="a") + _cell(rng, run="b"):
+        launch = Wide().predict(s.view, None)
+        host = s.host | {MTP_SEGMENT: s.host[MTP_SEGMENT] + 3e-4 * launch["wide"]}
+        provenance = s.provenance | {"config": key}
+        cell.append(
+            dataclasses.replace(s, host=host, launch=launch, provenance=provenance)
+        )
+    host = fit_host(cell)[0]
+    column = host["columns"]["decode"][MTP_SEGMENT]
+    assert column == pytest.approx({"wide": 3e-4}, rel=0.05)
+    p = (1, 8000, 4)
+    term = np.dot(host["after_prefill"][MTP_SEGMENT], p)
+    assert term == pytest.approx(np.dot(TERM[MTP_SEGMENT], p), rel=0.05)
 
 
 def _batch(kind, tokens, seqs):
