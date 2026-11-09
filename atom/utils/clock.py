@@ -31,7 +31,11 @@ ceiling ahead of time; the owner releases each in the step that reaches it.
 A member of a DP group, its connection bound as one (``conn.member``), asks
 its group step's rounds up to its own return in one call, and the rounds it
 owes in one more (`advance_group`, `settle`); the call's one grant releases
-what each of its rounds released to it.
+what each of its rounds released to it. When the grant it returns at carries
+a ceiling, the authority granted its owed rounds below it ahead and sent what
+they release with that grant: `settle` steps through them, releasing each
+message in the step that reaches it, and reports the steps with the call for
+the rounds left or, with none left, in a ``REPORT`` that waits for no reply.
 
 A grant names the messages it releases as ``{channel: [(seq, arrival)]}``.
 `_step_through` releases them one at a time in ``(arrival, channel, seq)``
@@ -186,6 +190,11 @@ class LPRuntime:
         self.asked = False  # a next-event request is out, its grant not taken
         self.idle_calls = 0  # `calls` when the step loop last passed its idle point
         self.owed: list[float] = []  # DP group rounds left before (`advance_group`)
+        # A member's: its owed rounds below this were granted ahead of it.
+        self.owed_ceiling = -math.inf
+        # A member's owed rounds paid, those it stepped through on its own, and
+        # the reports that paid them all.
+        self.paid = {"rounds": 0, "ahead": 0, "reports": 0}
         self.parking = False  # a DP member between its state sync and its park
         # The frontend's event loop, once built: a frame a thread takes is a job on it.
         self.loop = None
@@ -266,12 +275,26 @@ class LPRuntime:
         self.owed = [t for t in rounds if t > mine]
 
     def settle(self) -> None:
-        """Join the owed rounds in one call; they end the owing step, so
-        `idle` counts none."""
-        if self.owed:
-            owed, self.owed = self.owed, []
-            self._grant(*self._ca_call("TAR", owed[0], rounds=owed[1:]))
-            self.calls -= 1
+        """Pay the owed rounds: step through those granted ahead, below the
+        owed ceiling, and join the rest in one call that reports the steps, or
+        with none left report them without waiting. They end the owing step,
+        so `idle` counts none."""
+        if not self.owed:
+            return
+        owed, self.owed, calls = self.owed, [], self.calls
+        ahead = [t for t in owed if t < self.owed_ceiling]
+        self.owed_ceiling = -math.inf
+        for t in ahead:
+            self._own_step("TAR", t, t)
+        rest = owed[len(ahead) :]
+        if rest:
+            self._grant(*self._ca_call("TAR", rest[0], rounds=rest[1:]))
+        else:
+            self._ca_send("REPORT", self.now, math.inf)
+        self.calls = calls
+        self.paid["rounds"] += len(owed)
+        self.paid["ahead"] += len(ahead)
+        self.paid["reports"] += not rest
 
     def next_event(self, t: float, t_daemon: float = float("inf")) -> float:
         """Idle until `t`, the daemon deadline `t_daemon` or the earliest arrival,
@@ -393,7 +416,11 @@ class LPRuntime:
         """Take a grant: walk what it releases up to `G` and every message sent
         ahead before it, and keep its ceiling and the messages it sends ahead."""
         ceiling = getattr(released, "ceiling", None)
-        self.ceiling = -math.inf if ceiling is None else ceiling
+        below = -math.inf if ceiling is None else ceiling
+        if self.member is None:
+            self.ceiling = below
+        else:  # a member answers none of its own calls, only its owed rounds
+            self.owed_ceiling = below
         if ceiling is None and not self.ahead:
             self._step_through(G, released)
             return
@@ -407,7 +434,7 @@ class LPRuntime:
         self.ahead = sorted(
             (a, ch, s) for ch, msgs in released.items() for s, a in msgs if a > G
         )
-        self.asks_ahead |= ceiling is not None
+        self.asks_ahead |= ceiling is not None and self.member is None
         self._step_through(G, walk)
 
     def _step_through(self, G: float, released: dict) -> None:

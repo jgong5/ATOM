@@ -16,6 +16,9 @@ A message is a tuple, one of these shapes:
   whether an NER asks for its messages ahead, and
   ``(kind, t, log, t_daemon, steps, ahead, rounds)`` the later TAR rounds a
   member asks in the same call (`ClockAuthority.on_request`);
+* ``("REPORT", t, log, t_daemon, steps, ahead)`` -- a member's steps through
+  the rounds granted ahead of it, which reach `t`, with its send log; it gets
+  no reply;
 * ``("GRANT", G, released)`` -- the reply, `released` being
   ``{channel: [(seq, arrival)]}`` and, when it has one, its ``ceiling``
   (`Released`); ``("GRANT", G, released, k)`` also marks the end of client
@@ -37,6 +40,7 @@ import math
 from atom.compass.clock import (
     NER,
     PARK,
+    REPORT,
     TAR,
     BackdatedEvent,
     ClockAbort,
@@ -46,7 +50,7 @@ from atom.compass.clock import (
 )
 
 BIND, JOINED, GRANT, REFUSED = "BIND", "JOINED", "GRANT", "REFUSED"
-REQUESTS = (TAR, NER, PARK)
+REQUESTS = (TAR, NER, PARK, REPORT)
 UNBOUNDED = {math.inf: "+inf", -math.inf: "-inf"}
 BOUNDS = {name: value for value, name in UNBOUNDED.items()}
 #: What a refusal can raise at the requester, most specific first.

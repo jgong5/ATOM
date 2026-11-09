@@ -96,6 +96,18 @@ it below the ceiling sent with its grant, and the LP releases each in the step
 that reaches it. A step outside the LP's clock and ceiling, or past a message
 registered for it since, aborts the run.
 
+With `ceilings`, an LP with members gets one at a grant at which some of its
+members return while others still ask later rounds: the least of ``LBTS(i)``,
+the grant plus the LP's shortest cycle, and the bound. Each later round below
+it is granted at once, each its own grant, the members that returned standing
+in it, since they owe it; what a round releases to such a member goes ahead in
+that member's reply, which carries the ceiling. The member steps its own clock
+through those rounds and reports its steps with its send log: in a ``REPORT``,
+which gets no reply, or in its call for the rounds left. Until it has, the LP's
+``N`` is no later than that member's clock, so no LP is granted past a send it
+has yet to log. A request from such a member that does not report exactly
+those rounds, each with its own target, aborts the run.
+
 Nothing here reads a clock, opens a socket or starts a thread. The caller
 carries requests in and replies out.
 """
@@ -106,7 +118,7 @@ from dataclasses import dataclass, field
 from .channels import ChannelTable
 from .identity import LpId
 
-TAR, NER, PARK = "TAR", "NER", "PARK"
+TAR, NER, PARK, REPORT = "TAR", "NER", "PARK", "REPORT"
 RUNNING = "running"
 _STANDING = (PARK, math.inf, math.inf)  # a parked member's place in each round
 
@@ -248,9 +260,12 @@ class ClockAuthority:
         self._round = {}  # LP -> member -> (kind, t, daemon) of the round being joined
         self._parked = {}  # LP -> parked member -> {channel: releases held for it}
         self._queued = {}  # LP -> member -> later TAR rounds asked, not yet joined
-        # LP -> member whose call named later rounds -> (the call's last round,
-        # {channel: releases held for it until that round's grant})
+        # LP -> member whose reply is held -> (the round that sends it,
+        # {channel: releases held for it until then}, the grant it carries)
         self._held = {}
+        # LP -> member -> [its clock, the rounds granted ahead of it that it
+        # has not yet reported]
+        self._owing = {}
         self._ceilings = ceilings
         self._ceiling = {}  # LP -> the ceiling of its latest grant
         self._ahead = {}  # LP -> channel -> {seq: arrival} sent ahead, not yet reached
@@ -287,7 +302,7 @@ class ClockAuthority:
                 self._owner[lp][name] = owners[0]
             self._members[lp] = tuple(sorted(owned))
             self._round[lp], self._parked[lp] = {}, {}
-            self._queued[lp], self._held[lp] = {}, {}
+            self._queued[lp], self._held[lp], self._owing[lp] = {}, {}, {}
 
     def on_request(
         self,
@@ -309,7 +324,9 @@ class ClockAuthority:
         as ``(kind, t, G, n)``: asked `t`, answered `G`, after the first `n`
         entries of `log`. `ahead` asks an NER's grant to send every message
         below its ceiling. `rounds` are a member's later TAR rounds, each past
-        the one before, asked in the same call.
+        the one before, asked in the same call. A ``REPORT`` is a member's
+        `steps` through the rounds granted ahead of it, `t` the clock they
+        reach, with its send log; it gets no reply.
         Returns the replies made due, as ``(lp, G, released)`` in the order
         issued, where ``released`` maps each channel into that LP to its newly
         released ``(seq, arrival)`` pairs; a member's reply is addressed
@@ -335,11 +352,13 @@ class ClockAuthority:
                 "running LP can produce a request",
                 self.lp_table(),
             )
-        if kind not in (TAR, NER, PARK):
-            raise ValueError(f"{kind!r} is not one of {TAR}, {NER}, {PARK}")
-        if kind == PARK and not members:
-            raise ValueError(f"{lp} parked; only a member of an LP with members parks")
-        t = _seconds(t, kind == TAR, "the {} target of {}", kind, lp)
+        if kind not in (TAR, NER, PARK, REPORT):
+            raise ValueError(f"{kind!r} is not one of {TAR}, {NER}, {PARK}, {REPORT}")
+        if kind in (PARK, REPORT) and not members:
+            raise ValueError(
+                f"{lp} sent {kind}; only a member of an LP with members does"
+            )
+        t = _seconds(t, kind in (TAR, REPORT), "the {} target of {}", kind, lp)
         daemon = _seconds(t_daemon, False, "the daemon deadline of {}", lp)
         if kind == TAR and daemon != math.inf:
             raise ValueError(
@@ -353,6 +372,23 @@ class ClockAuthority:
                 "asks later rounds, each past the one before"
             )
         log = self._catch_up(lp, steps, log, member)
+        owing = self._owing.get(lp, {}).get(member)
+        if owing is not None and owing[1]:
+            raise ClockAbort(
+                f"{lp}: {member} sent {kind} before reporting the rounds "
+                f"{owing[1]} granted ahead of it",
+                self.lp_table(),
+            )
+        if kind == REPORT and (owing is None or t != owing[0]):
+            raise ClockAbort(
+                f"{lp}: {member} reported its clock at {t}, but "
+                + (
+                    "no round was granted ahead of it"
+                    if owing is None
+                    else f"its last round granted ahead is {owing[0]}"
+                ),
+                self.lp_table(),
+            )
         now = self._now[lp]
         if t < now or daemon < now:
             asked = f"{kind}({t})" if t < now else f"daemon deadline {daemon}"
@@ -365,23 +401,29 @@ class ClockAuthority:
                 f"{lp} asked {kind} with messages sent ahead of it unreached",
                 self.lp_table(),
             )
-        if members:
+        if members and kind != REPORT:
             self._refuse_unjoinable(lp, member, kind, t)
         for name, seq, arrival in log:
             self._register(lp, name, seq, arrival, member)
         if self.timeline is not None:
             self._sent[lp] += map(tuple, log)
+        if owing is not None:  # its sends are logged: N may rise
+            del self._owing[lp][member]
+            self._nv[lp] = self._n(lp)
+            if kind == REPORT:
+                return self._address(self._grant_due())
         self._asks[lp] = ahead and kind == NER
         if members:
             joined, parked = self._round[lp], self._parked[lp]
             joined[member] = _STANDING if kind == PARK else (kind, t, daemon)
             if rounds:
                 self._queued[lp][member] = rounds
-                self._held[lp][member] = (rounds[-1], self._own_into(lp, member))
+                own = self._own_into(lp, member)
+                self._held[lp][member] = (rounds[-1], own, rounds[-1])
             if kind == PARK:
                 parked[member] = self._own_into(lp, member)
             if len(joined) < len(members):
-                return []
+                return [] if owing is None else self._address(self._grant_due())
             if len(parked) == len(members):
                 return self._release(lp)
             kind = NER if kind == PARK else kind
@@ -420,9 +462,9 @@ class ClockAuthority:
             joined.clear()
             self._wait(lp, TAR, t, math.inf)
 
-    def _own_into(self, lp: LpId, member: str) -> dict:
+    def _own_into(self, lp: LpId, member: str) -> Released:
         """An empty list for each channel into `lp` that `member` owns."""
-        return {c: [] for c in self._into[lp] if self._owner[lp][c] == member}
+        return Released({c: [] for c in self._into[lp] if self._owner[lp][c] == member})
 
     def _refuse_unjoinable(self, lp: LpId, member: str, kind: str, t: float) -> None:
         joined = self._round[lp]
@@ -448,7 +490,9 @@ class ClockAuthority:
         """One reply per member for an LP with members, each with its own
         channels; a parked member's are held for it, unless the reply finishes
         the run or ends a client run, and so are those of a member whose call
-        named later rounds, until the last one's grant."""
+        named later rounds, until the last one's grant, and of a member that
+        returned, until the last round granted ahead of it: that reply carries
+        the grant it returned at."""
         out = []
         for i, g, released, *ended in replies:
             for m in self._members.get(i, (None,)):
@@ -456,7 +500,7 @@ class ClockAuthority:
                     out.append((i, g, released, *ended))
                     continue
                 mine = {c: r for c, r in released.items() if self._owner[i][c] == m}
-                held = self._parked[i].get(m)
+                held, at = self._parked[i].get(m), g
                 if held is not None:
                     self._hold(held, mine)
                     if g < math.inf and not ended:
@@ -465,13 +509,13 @@ class ClockAuthority:
                     self._round[i].pop(m, None)
                     mine = held
                 elif m in self._held[i]:
-                    last, held = self._held[i][m]
+                    last, held, back = self._held[i][m]
                     self._hold(held, mine)
                     if g < last and not ended:
                         continue
                     del self._held[i][m]
-                    mine = held
-                out.append(((i, m), g, mine, *ended))
+                    mine, at = held, back if g == last and not ended else g
+                out.append(((i, m), at, mine, *ended))
         return out
 
     @staticmethod
@@ -516,7 +560,8 @@ class ClockAuthority:
         channel = self._channels.channel(name)
         a = _seconds(arrival, True, "the arrival of {} seq {}", name, seq)
         expected = self._next_seq[name]
-        floor = self._now[lp] + channel.lookahead_s
+        clock = self._clock_of(lp, member)
+        floor = clock + channel.lookahead_s
         if channel.source != lp:
             refusal = f"{lp} logged a send on {name}, whose sender is {channel.source}"
         elif member is not None and self._owner[lp][name] != member:
@@ -537,7 +582,7 @@ class ClockAuthority:
         elif a < floor:
             refusal = (
                 f"{name} seq {seq} arrives at {a}, before {lp}'s clock "
-                f"{self._now[lp]} plus the channel's lookahead {channel.lookahead_s}"
+                f"{clock} plus the channel's lookahead {channel.lookahead_s}"
             )
         else:
             self._undelivered[name][seq] = a
@@ -555,9 +600,15 @@ class ClockAuthority:
             for seq, a in self._undelivered[name].items()
         )
 
+    def _clock_of(self, lp: LpId, member: str | None) -> float:
+        """The clock `member` of `lp` sends at: its own while rounds granted
+        ahead of it are unreported, else the LP's."""
+        owing = self._owing.get(lp, {}).get(member)
+        return self._now[lp] if owing is None else owing[0]
+
     def _n(self, j: LpId) -> float:
-        if self._state[j] == RUNNING:
-            return self._now[j]
+        if self._state[j] == RUNNING:  # no later than a member yet to report
+            return min([self._now[j], *(c for c, _ in self._owing.get(j, {}).values())])
         if self._state[j] == TAR:
             return self._target[j]
         n = min(self._target[j], self._daemon[j])
@@ -587,12 +638,37 @@ class ClockAuthority:
             due = next(((i, n) for n, i in grantable if n < self._lbts(i)), None)
             if due is not None:
                 replies.append(self._grant(*due))
+                replies += self._grant_ahead(due[0])
             elif len(waiting) < len(self._ids):
                 return replies
             elif not grantable:
                 return replies + self._end_client_run()
             else:
                 replies.append(self._recover(grantable[0][1], grantable[0][0]))
+
+    def _grant_ahead(self, i: LpId) -> list:
+        """With ceilings, after a grant at which members of `i` returned while
+        others ask later rounds: each later round below that grant's ceiling is
+        granted now, the members that returned standing in it, as they owe it.
+        Each such member's reply is held until the last of them, to carry
+        what they release to it ahead, beside the ceiling."""
+        joined = self._round.get(i)
+        if not (self._ceilings and joined) or len(joined) == len(self._members[i]):
+            return []
+        ceiling, replies = self._ceiling_of(i, self._now[i]), []
+        while joined and (t := next(iter(joined.values()))[1]) < ceiling:
+            for m in self._members[i]:
+                if m not in joined:
+                    self._owing[i].setdefault(m, [self._now[i], []])[1].append(t)
+                    own = (t, self._own_into(i, m), self._now[i])
+                    _, held, back = self._held[i].get(m, own)
+                    held.ceiling = ceiling
+                    self._held[i][m] = (t, held, back)
+            joined.clear()
+            self._wait(i, TAR, t, math.inf)
+            replies.append(self._grant(i, t))
+        self._nv[i] = self._n(i)
+        return replies
 
     def _recover(self, i: LpId, g: float) -> tuple:
         # The one grant whose guarantee is weaker: a message may still land at g.
@@ -638,10 +714,13 @@ class ClockAuthority:
             self._join_queued(i)
         return (i, g, released)
 
-    def _ceiling_of(self, i: LpId, g: float, released: Released) -> float:
+    def _ceiling_of(self, i: LpId, g: float, released: Released | None = None) -> float:
         """The ceiling of `i`'s grant to `g`: `released` takes every message
-        below it when `i` asked for them ahead."""
+        below it when `i` asked for them ahead. An LP with members takes none:
+        the rounds granted below it release them."""
         ceiling = min(self._lbts(i), g + self._cycle[i], self._bound)
+        if i in self._members:
+            return ceiling
         for name in self._into[i] if self._asks.get(i) else ():
             pending = self._undelivered[name]
             early = [(seq, a) for seq, a in pending.items() if a < ceiling]
@@ -681,9 +760,26 @@ class ClockAuthority:
                 self._register(lp, name, seq, arrival, member)
             if self.timeline is not None:
                 self._sent[lp] += map(tuple, log[k:n])
-            self._replay(lp, kind, t, to)
+            if member is None:
+                self._replay(lp, kind, t, to)
+            else:
+                self._step_member(lp, member, kind, t, to)
             k = n
         return log[k:]
+
+    def _step_member(
+        self, i: LpId, member: str, kind: str, t: float, to: float
+    ) -> None:
+        """`member` of `i` stepped on its own to `kind`(`t`), answered `to`:
+        the next round granted ahead of it, which it now sends from."""
+        owing = self._owing[i].get(member)
+        if not (owing and owing[1] and kind == TAR and t == to == owing[1][0]):
+            raise ClockAbort(
+                f"{i}: {member} stepped on its own to {kind}({t}) answered {to}; "
+                f"the rounds granted ahead of it: {owing[1] if owing else []}",
+                self.lp_table(),
+            )
+        owing[0] = owing[1].pop(0)
 
     def _replay(self, i: LpId, kind: str, t: float, to: float) -> None:
         """One step `i` took on its own, asking `t` and answered `to`, as the
@@ -755,6 +851,8 @@ class ClockAuthority:
 
     def _finish(self) -> list:
         self.final_clocks = tuple(self._now.items())
+        for owing in self._owing.values():
+            owing.clear()
         for i in self._ids:
             if self.timeline is not None:
                 self._record(i, math.inf, self._state[i])
