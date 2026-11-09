@@ -338,7 +338,9 @@ def _admit_rows(samples, host) -> list[tuple]:
         for s in samples
         if s.admitted[0]
         and s.host.get("E", 0) > 0
-        and (base := _host_price(host, host_kind(s.view), "E", _host_x(s.view), s.launch))
+        and (
+            base := _host_price(host, host_kind(s.view), "E", _host_x(s.view), s.launch)
+        )
         is not None
     ]
 
