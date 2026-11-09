@@ -49,7 +49,8 @@ a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
 HCA decode workspace an `HCA_DECODE` slot names, or of the buffer
-`V4_METADATA` names for a DeepSeek-V4 slot, refused when it is not live, or,
+`V4_METADATA` names for a DeepSeek-V4 slot, refused when it is not live, a
+prefill's index list whole (`V4_LISTS`), or,
 when live, `V41_NAMES`' for a DeepSeek-V4.1 slot at its ratio (`_ratio`),
 whose step and scorer workspace are live too; a leaf of the drafter's alone
 takes what ATOM passes a drafter (`DRAFTER_NAMES`) and, of a pass of its own,
@@ -221,7 +222,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 25
+PROTOCOL = 26
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -287,7 +288,9 @@ HCA_DECODE = "aiter.mla_decode_v4_ps_asm.default"
 #: buffer is not live refuses.
 #: A decode's `split_indptr` is its split plan's, `split_plan_<kind>.1`. The
 #: paged-decode index leaves write their indptrs into the clone that the
-#: leaves timed after them at a placement read.
+#: leaves timed after them at a placement read. A prefill's index build takes
+#: each row's cached tokens, which ATOM uploads apart each step and holds
+#: nowhere: `num_cached_tokens` is the batch's (`Stub._prepare`).
 _NM = "aiter.mla:mla_decode_fwd_v4_nm"
 _INDICES = "atom.model_ops.v4_kernels.paged_decode_indices"
 _WRITE = f"{_INDICES}:write_v4_paged_decode_indices"
@@ -297,6 +300,8 @@ _STATE = "atom.model_ops.v4_kernels.state_writes:update_compressor_states"
 _QKN = "aiter._fused_qk_norm_rope_group_quant_kernel.default"
 _QKN_BF16 = "aiter.ops.flydsl.kernels.qk_norm_rope_quant:flydsl_qk_norm_rope_quant"
 _BF16 = "atom.model_ops.v4_kernels.paged_decode:_sparse_attn_v4_paged_decode_triton"
+_FILL = "atom.model_ops.v4_kernels.paged_prefill_indices:write_v4_paged_prefill_indices"
+_PREFILL = "aiter.pa_sparse_prefill_fp8_opus.default"
 _DESTS = {0: "dense", 4: "csa", 128: "hca"}
 V4_METADATA = {
     (_NM, "kv_indptr"): "kv_indptr_{kind}",
@@ -323,8 +328,30 @@ V4_METADATA = {
     (_QKN, "swa_dest_row"): "v4_swa_dest_{dest}",
     (_QKN_BF16, "batch_id_per_token"): "batch_id_per_q_token",
     (_QKN_BF16, "swa_dest_rows"): "v4_swa_dest_{dest}",
+    (_FILL, "bid_per_token"): "batch_id_per_q_token",
+    (_FILL, "chunk_start_per_seq"): "num_cached_tokens",
+    (_FILL, "state_slot_per_seq"): "state_slot_out",
+    **{
+        (_FILL, f"{kind}_{part}"): f"kv_{part}_{kind}"
+        for kind in ("extend", "prefix_swa", "prefix_csa", "prefix_hca")
+        for part in ("indptr", "indices")
+    },
+    (_PREFILL, "kv_indptr_prefix"): "kv_indptr_prefix_{kind}",
+    (_PREFILL, "kv_indices_prefix"): "kv_indices_prefix_{kind}",
+    (_PREFILL, "kv_indptr_extend"): "kv_indptr_extend",
+    (_PREFILL, "kv_indices_extend"): "kv_indices_extend",
 }
 V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
+#: DeepSeek-V4's prefill index lists, which ATOM allocates each step at the
+#: entries its rows read (`_build_paged_prefill_meta`). A capture's prefill
+#: caches nothing, so past cached tokens each is longer than the leaf's
+#: captured one: a slot `V4_METADATA` binds to one takes it whole, as ATOM
+#: passes it, and aiter's prefill attention splits its KV by its length. Its
+#: bytes still count at the captured span.
+V4_LISTS = {
+    f"kv_indices_{kind}"
+    for kind in ("extend", "prefix_swa", "prefix_csa", "prefix_hca")
+}
 #: DeepSeek-V4.1's arguments, keyed as `V4_METADATA`'s, and the buffers ATOM
 #: passes each (`_named`), at the leaf's ratio (`_ratio`), as `_bound` names
 #: them: the paged cache's, the pass's step (`step.`), the decoder plan
@@ -892,6 +919,11 @@ class Stub:
             for k, v in vars(fc.attn_metadata).items()
             if k.startswith("split_plan_") and v
         }
+        if rows := getattr(batch, "total_seqs_num_prefill", 0):
+            cached = batch.num_cached_tokens[:rows]
+            named["num_cached_tokens"] = torch.tensor(
+                cached, dtype=torch.int32, device=device
+            )
         # a drafter's pass of rows of its own counts its real rows at the entry
         # of ATOM's `batch_info` stating them, as the drafter publishes its shape
         info = self.runner.forward_vars.get("batch_info")
@@ -937,6 +969,8 @@ class Stub:
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
+                        if what in V4_LISTS:  # at the point's rows, not the capture's
+                            view = pool[what]
                         # leaves share a view's clone: DeepSeek-V4's decode
                         # leaves view 2.7 GB of it at a placement. What an
                         # operator writes is cloned apart, or a leaf timed

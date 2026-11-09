@@ -1164,6 +1164,106 @@ def test_v4_index_leaves_write_the_indptrs_atom_passes_and_a_decode_its_split_pl
     }
 
 
+def test_v4_prefill_index_leaves_take_atom_s_lists_whole_by_ratio_past_cached_tokens():
+    # A prefill of 6 tokens over one row past 8 cached: each leaf's slots as the
+    # capture, which caches none, sized them, and ATOM's step lists longer.
+    # Bound by size, the writer's indptrs were `kv_indptr`, its batch ids
+    # `top_ks`, its row scalars `context_lens`; a CSA layer's attention read the
+    # HCA list, an HCA layer's the SWA one, both the indptr `kv_indptr`.
+    fill = (
+        "atom.model_ops.v4_kernels.paged_prefill_indices:write_v4_paged_prefill_indices"
+    )
+    attend = "aiter.pa_sparse_prefill_fp8_opus.default"
+
+    def i32(*shape):
+        return torch.zeros(shape, dtype=torch.int32)
+
+    def meta(slot, *shape, dtype="torch.int32"):
+        return slot, _t(list(shape), "metadata", dtype=dtype)
+
+    runner = _Runner()
+    runner.positions = torch.zeros(16, dtype=torch.int64)
+    runner.forward_vars |= {"top_ks": i32(6), "context_lens": i32(1)}
+    runner.forward_vars["kv_indptr"] = i32(7)
+    lists = {"extend": 21, "prefix_swa": 9, "prefix_csa": 40, "prefix_hca": 15}
+    v4 = {
+        "cu_seqlens_q": torch.tensor([0, 6], dtype=torch.int32),
+        "batch_id_per_q_token": i32(6),
+        "state_slot_out": i32(1),
+        "num_cached_tokens": torch.tensor([3], dtype=torch.int32),  # a past step's
+        **{f"kv_indptr_{k}": i32(7) for k in lists},
+        **{f"kv_indices_{k}": i32(n) for k, n in lists.items()},
+    }
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):
+        prepared = prepare((0, 0))
+        vars(fctx.get_forward_context().attn_metadata).update(v4)
+        return prepared
+
+    runner.prepare_model = prepare_model
+    captured = {"extend": 21, "prefix_swa": 1, "prefix_csa": 12, "prefix_hca": 2}
+    writer = _leaf(
+        fill,
+        meta("positions", 6, dtype="torch.int64"),
+        meta("bid_per_token", 6),
+        *(meta(s, 1) for s in ("chunk_start_per_seq", "cu_seqlens_q_per_seq")),
+        meta("state_slot_per_seq", 1),
+        meta("block_tables", 1, 8),
+        *(meta(f"{k}_indptr", 7) for k in captured),
+        *(meta(f"{k}_indices", n) for k, n in captured.items()),
+    )
+    attention = [
+        dataclasses.replace(
+            _leaf(
+                attend,
+                meta("kv_indices_prefix", n),
+                meta("kv_indptr_prefix", 7),
+                meta("kv_indices_extend", 21),
+                meta("kv_indptr_extend", 7),
+            ),
+            stated=(("compress_ratio", r),),
+        )
+        for r, n in ((4, 12), (128, 2))
+    ]
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(writer, *attention, layers=1)["region"])
+
+    stub._prepare(SimpleNamespace(total_seqs_num_prefill=1, num_cached_tokens=[8]))
+
+    [(_, views)] = stub.placed
+    got = {}
+    for (s, path), (name, view) in views.items():
+        ratio = stub.leaves[s][0].get("stated", {}).get("compress_ratio")
+        got[ratio, path] = name, view.numel()
+    assert got == {
+        (None, "positions"): ("positions", 6),
+        (None, "bid_per_token"): ("batch_id_per_q_token", 6),
+        (None, "chunk_start_per_seq"): ("num_cached_tokens", 1),
+        (None, "cu_seqlens_q_per_seq"): ("cu_seqlens_q", 1),
+        (None, "state_slot_per_seq"): ("state_slot_out", 1),
+        (None, "block_tables"): ("block_tables", 8),
+        **{(None, f"{k}_indptr"): (f"kv_indptr_{k}", 7) for k in lists},
+        **{(None, f"{k}_indices"): (f"kv_indices_{k}", n) for k, n in lists.items()},
+        **{
+            (r, slot): (name, n)
+            for r, kind in ((4, "csa"), (128, "hca"))
+            for slot, name, n in (
+                (
+                    "kv_indices_prefix",
+                    f"kv_indices_prefix_{kind}",
+                    lists[f"prefix_{kind}"],
+                ),
+                ("kv_indptr_prefix", f"kv_indptr_prefix_{kind}", 7),
+                ("kv_indices_extend", "kv_indices_extend", 21),
+                ("kv_indptr_extend", "kv_indptr_extend", 7),
+            )
+        },
+    }
+    [start] = [v for (s, p), (_, v) in views.items() if p == "chunk_start_per_seq"]
+    assert start.tolist() == [8]
+
+
 def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
     layers = {f"model.layers.{i}.attn": SimpleNamespace(layer_num=i) for i in (0, 1)}
     kv = {f"layer_{i}": SimpleNamespace(k_cache=torch.zeros(64, 16, 4)) for i in (0, 1)}
