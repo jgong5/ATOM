@@ -1008,7 +1008,8 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   DeepSeek-V4's prefill attention under the fp8 KV cache (`capture.forward.V4_PREFILL`)
   states its layer's `compress_ratio` too: it is passed the prefix index list and indptr of
   that ratio's class, which `bench.ops.V4_METADATA` binds to
-  `kv_{indices,indptr}_prefix_{swa,csa,hca}` ([#3023](https://github.com/jgong5/ATOM/issues/3023)).
+  `kv_{indices,indptr}_prefix_{swa,csa,hca}`
+  ([ruling on #3023](https://github.com/jgong5/ATOM/pull/3040#issuecomment-6730173331)).
   DeepSeek-V4.1's sparse attention (`capture.forward.V41_ATTENTION`), its index lists
   sized as V4's, states the same three of its layer, and its indexer's scorers
   (`capture.forward.V41_SCORERS`: gfx1250's FlyDSL one and gfx950's Triton one) its
