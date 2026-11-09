@@ -940,10 +940,11 @@ ed5fa7697 in the same image ([#2744](https://github.com/jgong5/ATOM/issues/2744)
 same environment with `ATOM_ENGRAM_UVA=1 ATOM_ENGRAM_UVA_HBM=1` in place of
 `ATOM_ENGRAM_UVA=0`, so every rank held its Engram shard in HBM, and the same `SERVER_ARGS`
 with `--enable-expert-parallel --spec-decode-acceptance-length 3` added. Its engine config
-holds the same three settings, `ATOM_TOKEN_GRAPH_SIZES` being ed5fa7697's default; a run
-priced by it sets them and passes `--spec-decode-acceptance-length 3` too. The records are
-concurrency 1, 4, 16, 64 and 256, then 8, 12 and 56 from each trajectory's first turn: at
-c=256 all but a few hundred decode steps run at rung 64. No record built a JIT kernel.
+holds `AITER_LOG_LEVEL`, `OMP_NUM_THREADS` and `ATOM_TOKEN_GRAPH_SIZES` at ed5fa7697's
+default buckets; a run priced by it sets them and passes the acceptance length too. The
+records are concurrency 1, 4, 16, 64 and 256, then 8, 12 and 56 from each trajectory's
+first turn: at c=256 all but a few hundred decode steps run at rung 64. No record built a
+JIT kernel.
 
 A simulated run prices by a checked-in law when the law file stands in for both tokens:
 `compass run --step-linear LAW --host-laws LAW $M $S --out D -- $ATOM`, `LAW` a file in
