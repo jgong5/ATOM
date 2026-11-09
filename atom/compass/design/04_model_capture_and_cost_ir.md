@@ -1005,6 +1005,15 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   extended to the bf16 leaf by [#2031](https://github.com/jgong5/ATOM/issues/2031)):
   at decode it writes each token's window row to the destination rows of that ratio's
   class, which `bench.ops.V4_METADATA` binds to `v4_swa_dest_{dense,csa,hca}`.
+  DeepSeek-V4's prefill attention (`capture.forward.V4_PREFILLS`: the fp8 KV cache's
+  `aiter.pa_sparse_prefill_fp8_opus.default` and the bf16 one's
+  `aiter.pa_sparse_prefill_opus.default`) states its layer's `compress_ratio` too: it is
+  passed the prefix index list and indptr of that ratio's class, which
+  `bench.ops.V4_METADATA` binds to `kv_{indices,indptr}_prefix_{swa,csa,hca}`
+  ([ruling on #3023](https://github.com/jgong5/ATOM/pull/3040#issuecomment-6730173331),
+  extended to the bf16 leaf by [#3038](https://github.com/jgong5/ATOM/issues/3038)). The
+  bf16 leaf is V4.1's sparse attention's operator, so `bench.ops.V4_SHARED` binds it so
+  only on a step holding V4's prefill lists.
   DeepSeek-V4.1's sparse attention (`capture.forward.V41_ATTENTION`), its index lists
   sized as V4's, states the same three of its layer, and its indexer's scorers
   (`capture.forward.V41_SCORERS`: gfx1250's FlyDSL one and gfx950's Triton one) its
@@ -1208,8 +1217,9 @@ Python entries, before the arguments are erased.
 ### Open issues
 
 - The op-level extractor table is `backends/op_work.py::EXTRACTORS` (`10` D64); a leaf
-  kind with none is refused by name, V4-Pro bf16 prefill's `pa_sparse_prefill_opus`
-  among them.
+  kind with none is refused by name. V4-Pro bf16 prefill's `pa_sparse_prefill_opus` takes
+  V4.1's extractor, which refuses it for the `window_size` and `index_topk` it does not
+  state.
 - Leaf prices are not repeatable to better than about 1%: two runs of one graph, one box,
   back to back, identical code moved the summed contribution **0.96%**, median
   per-signature **1.18%**, **p90 32%**. **Any residual quoted below ~2% is quoting the

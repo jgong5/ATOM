@@ -12,8 +12,10 @@ The device fragment is one DeepSeek-V4-Pro start at the nightly DPA-TP8 prefill
 side's arguments (`FLAGS`): the device, its capacity and the stack.
 `probe_device.py`'s readings (`PEAKS`) add the compute and memory derates, the
 bandwidth curve, the kernel floor and the intra-node link's latency and derate.
-The peaks are the datasheet's; the rest is assumed. An engine start's memory
-readings are `compass measure memory`'s, not the spec's.
+On crsuse2-m2m-v3-005, the network file of its rails into -013 adds the
+inter-node link (`NETWORK`). The peaks are the datasheet's; the rest is
+assumed. An engine start's memory readings are `compass measure memory`'s, not
+the spec's.
 """
 
 import argparse
@@ -246,14 +248,23 @@ if GPU40:
         "020692760182d835943e2ac416f59df1abd2bb82cbe71870ce0c9f316cae436a",
     )
 
+#: On 005, the network file of its rails into 013, which `rdma_link.py fit
+#: BENCH RECORD` published; its notes say what each value was read from.
+NETWORK = None
+if CRS005:
+    NETWORK = Path(__file__).resolve().parents[2] / "atom/compass/networks"
+    NETWORK /= "crs005-013-ionic.json"
+
 #: No probe fills these: mi308x_spec's assumed values less what the datasheet
-#: states and what `PEAKS` fills. Its inter-node link is one 400 Gb/s NIC's
-#: line rate here too.
+#: states and what `PEAKS` and `NETWORK` fill. Its inter-node link is one
+#: 400 Gb/s NIC's line rate here too.
 DECLARED = copy.deepcopy(base.DECLARED)
 for block, groups in DATASHEET.items():
     for group, values in groups.items():
         for key in values:
             DECLARED[block][group].pop(key, None)
+if NETWORK:
+    del DECLARED["interconnect"]["inter_node"]
 
 
 def device_fragments() -> list[Fragment]:
@@ -268,13 +279,17 @@ def device_fragments() -> list[Fragment]:
         "assumed", DECLARED, "assumed", "no probe fills these", date=DATE
     )
     probed, assumed = base.peaks(PEAKS, datasheet.values, assumed)
-    return [
+    fragments = [
         fragment("device", DEVICE, "probed", notes, SUBJECT, DATE),
         datasheet,
         assumed,
         fragment("ptl", ptl, "probed", "no card has a ptl directory", date=PTL_DATE),
         probed,
     ]
+    if NETWORK:
+        network = json.loads(NETWORK.read_text()) | {"name": NAME}
+        fragments.append(Fragment.from_mapping(network, NETWORK.stem))
+    return fragments
 
 
 def main(argv: list[str] | None = None) -> int:

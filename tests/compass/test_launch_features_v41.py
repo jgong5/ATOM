@@ -267,7 +267,7 @@ def test_the_recorded_request_graphs_hold_int_and_tuple_keys():
     graphs[0]._buckets[(None, 4)] = graphs[1]._buckets[(None, (4, 5))] = None
     config = _config(hf_config=SimpleNamespace(architectures=[ARCH]))
     request = recorded_graphs(config)["request"]
-    assert [4] in request and [[4, 5]] in request
+    assert [4] in request and [(4, 5)] in request
 
 
 def test_both_columns_are_adopted_and_priced(monkeypatch):

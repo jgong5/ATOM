@@ -485,6 +485,21 @@ def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
         (218e-6, 282e-6)
     )
     assert [got[k]["messages"] for k in ("request", "output", "stream")] == [9, 20, 10]
+    # With the step record, the request hop again over receipts 4 to 8, the
+    # ones inside a forward.
+    steps = tmp_path / "dp0.jsonl"
+    recvs = [h["t_recv_ns"] for h in handoff if "t_recv_ns" in h]
+    steps.write_text(
+        "".join(
+            json.dumps({"t_enter_ns": recvs[a] - 1, "t_exit_ns": recvs[b] + 1}) + "\n"
+            for a, b in ((6, 8), (4, 5))
+        )
+    )
+    got = probe.hops(*map(str, paths), str(steps))
+    assert got["request_forward"]["messages"] == 5
+    assert got["request_forward"]["median_s"] == pytest.approx(260e-6)
+    assert got["request"]["messages"] == 9
+    assert got["steps"] == "sha256:" + hashlib.sha256(steps.read_bytes()).hexdigest()
     # A request the engine never received pairs nothing.
     paths[1].write_text(
         "".join(json.dumps(line) + "\n" for line in handoff[:2] + handoff[3:])
@@ -498,6 +513,26 @@ def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
     paths[0].write_text("\n".join(r for r in stamps if " out " not in r) + "\n")
     with pytest.raises(SystemExit, match="output: 0 rows taken in, not the 30 sent"):
         probe.hops(*map(str, paths))
+
+
+def test_a_head_the_client_read_before_its_send_returned_is_left_out(tmp_path):
+    sent = [10**12 + k * 10**9 for k in range(4)]
+    stamps = [f"{s} 1 send {s - 50} 0" for s in sent]
+    # Each head's send call takes 1 ms; the client reads the third's inside it.
+    stamps += [f"{s + 10**6} 1 head {s} 0" for s in sent]
+    admitted = [s + 10**6 + 150_000 for s in sent]
+    admitted[2] = sent[2] + 500_000
+    handoff = [{"t_recv_ns": s + 100_000, "t_in_put_ns": 0} for s in sent]
+    handoff += [{"t_out_put_ns": s + 3 * 10**6, "rows": 1} for s in sent]
+    stamps += [f"{s + 3 * 10**6 + 9} 2 out {s + 3 * 10**6 + 9} 0" for s in sent]
+    paths = [tmp_path / name for name in ("stamps", "handoff", "arrivals")]
+    paths[0].write_text("\n".join(stamps) + "\n")
+    paths[1].write_text("".join(json.dumps(line) + "\n" for line in handoff))
+    paths[2].write_text(json.dumps({"sent_ns": sent, "admitted_ns": admitted}))
+
+    stream = probe.hops(*map(str, paths))["stream"]
+
+    assert stream["messages"] == 3 and stream["median_s"] == pytest.approx(150e-6)
 
 
 def test_serve_stamps_each_kv_write_request_sent_and_received_in_a_spawned_process(

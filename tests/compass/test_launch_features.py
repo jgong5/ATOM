@@ -3,9 +3,10 @@
 
 `Planted` says a prefill past its runner's largest recorded prefill bucket
 launches eagerly, 40 ms dearer. A recording runner writes what it observed on
-each line and the graph sets in its key; `fit_host` refuses a step it predicts
-otherwise and adopts the column where the held-out error falls; a run and the
-recurrence grade price it from `predict`. With no provider, nothing moves.
+each line and the graph sets in its key, which labelling and the fit's main
+keep; `fit_host` refuses a step it predicts otherwise and adopts the column
+where the held-out error falls; a run's forward and the recurrence grade price
+it from `predict`. With no provider, nothing moves.
 """
 
 import dataclasses
@@ -14,6 +15,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from test_backend_step_grid import scheduler_of
+from test_backend_step_linear_fit import SPEC, _steps, _timed_record
 from test_fit_steps import DIGEST
 from test_memory_readings import META_8B
 from test_parity_device_window import _recorded
@@ -31,8 +34,13 @@ from atom.compass.backends.launch_features import (
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView, RequestShape, sum_tokens
 from atom.compass.backends.step_labels import Sample
-from atom.compass.backends.step_linear_fit import fit_host
-from atom.compass.parity import ENV, read, recurrence
+from atom.compass.backends.step_linear_fit import (
+    fit_host,
+    host_held_out,
+    label_records,
+    main,
+)
+from atom.compass.parity import ENV, compare, read, recurrence
 from atom.compass.runner.overrides import (
     FORWARD_KINDS,
     HOST_SEGMENTS,
@@ -40,7 +48,10 @@ from atom.compass.runner.overrides import (
 )
 
 ARCH = "PlantedForCausalLM"
-SETS = {"architecture": ARCH, "token": {"prefill": [2048], "decode": []}}
+#: A bucket past which a third of `_samples`' prefills launch eagerly: a
+#: minority, which a `W_launch` fit blind to the column cuts as compiles.
+BUCKET = 4000
+SETS = {"architecture": ARCH, "token": {"prefill": [BUCKET], "decode": []}}
 EAGER_S = 0.04
 
 
@@ -64,12 +75,12 @@ def planted(monkeypatch):
     monkeypatch.setitem(REGISTRY, ARCH, Planted())
 
 
-def _samples(graphs=SETS, seed=3068):
-    """Two runs of output prefills and decodes; a prefill's `W_launch` is 2 ms
-    plus 1 us a token, and `EAGER_S` more past 2048 tokens."""
+def _samples(graphs=SETS, seed=3068, runs=("a", "b")):
+    """`runs` of output prefills and decodes; a prefill's `W_launch` is 2 ms
+    plus 1 us a token, and `EAGER_S` more past `BUCKET` tokens."""
     rng, out = np.random.default_rng(seed), []
     key = {"engine": {GRAPHS: graphs} if graphs else {}}
-    for run in ("a", "b"):
+    for run in runs:
         for i in range(60):
             tokens = int(rng.integers(256, 6000)) if i % 2 else 1
             view = BatchView(
@@ -93,6 +104,8 @@ def _samples(graphs=SETS, seed=3068):
 
 def test_a_planted_column_is_adopted_where_it_lowers_the_held_out_error_and_priced():
     host, report = fit_host(_samples())
+    # Solved with the column, no eager launch is cut as a compile.
+    assert report["jit_steps"] == {}
     column = host["columns"]["prefill"]["W_launch"]
     assert column == pytest.approx({"eager": EAGER_S}, rel=0.05)
     assert host["laws"]["prefill"]["W_launch"] == pytest.approx(
@@ -110,12 +123,16 @@ def test_a_planted_column_is_adopted_where_it_lowers_the_held_out_error_and_pric
         columns=host["columns"],
         launch=stated(host["key"]),
     )
-    for tokens, eager in ((1000, 0.0), (4000, EAGER_S)):
+    for tokens, eager in ((1000, 0.0), (BUCKET + 1000, EAGER_S)):
         view = BatchView((RequestShape(tokens, tokens, False),), produces_output=True)
         batch = _batch(tokens, compass_launch=rec.predicted(view))
         rec.charge(batch, 0.01, 0.0)
         law = np.dot(host["laws"]["prefill"]["W_launch"], (1, tokens, 1))
         assert rec.segments["W_launch"] == pytest.approx(law + eager, rel=0.05)
+    # Each of three runs held out, the other two adopt the column and price
+    # its eager prefills with it.
+    held = host_held_out(_samples(runs=("a", "b", "c")))["host prefill W_launch"]
+    assert np.abs(held).max() < 0.05
 
 
 def _batch(tokens, **fields):
@@ -175,14 +192,46 @@ def test_a_recording_runner_writes_what_it_observed_and_the_sets_in_its_key(
     runner.exit()
     lines = read(tmp_path / "real")[0]
     key = json.loads((tmp_path / "real" / "dp0.key.json").read_text())
+    samples = label_records([tmp_path / "real" / "dp0.jsonl"])[0]
     if architectures == [ARCH]:
         assert [s["launch"] for s in lines] == [
             {"eager": (n + 1) % 2} for n in range(len(lines))
         ]
         assert key["engine"][GRAPHS]["architecture"] == ARCH
         assert set(key["engine"][GRAPHS]) == {"architecture", "token", "request"}
+        # Each labelled sample carries its line's `launch` to the fit.
+        assert {s.step: s.launch for s in samples} == {
+            s.step: lines[s.step]["launch"] for s in samples
+        }
+        assert {s.launch["eager"] for s in samples} == {0, 1}
     else:
         assert not any("launch" in s for s in lines) and key == runner.host_key
+        assert samples and not any(s.launch for s in samples)
+    # A real line's `launch` is no part of a step's decision.
+    first = compare(tmp_path / "real", tmp_path / "simulated")["first_divergence"]
+    assert first == {0: None}
+
+
+def test_the_fit_s_main_keeps_its_records_graph_sets_in_the_host_key(tmp_path):
+    """A timed record whose lines carry `Planted`'s launch and whose key states
+    `SETS`: the law's host key keeps the sets, which its engine config, read
+    from the engine file, does not state, and `W_launch` is offered the
+    column."""
+    path, _ = _timed_record(tmp_path / "dp0.jsonl", _steps(14, n=400))
+    key = json.loads(path.with_suffix(".key.json").read_text())
+    key["engine"][GRAPHS] = SETS
+    path.with_suffix(".key.json").write_text(json.dumps(key))
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    for line in lines:
+        line["launch"] = {"eager": float(sum(r[0] for r in line["rows"]) > BUCKET)}
+    assert {line["launch"]["eager"] for line in lines} == {0, 1}
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+
+    main([str(path), "--out", str(tmp_path / "law.json"), *SPEC])
+    law = json.loads((tmp_path / "law.json").read_text())
+    assert law["host"]["key"]["engine"][GRAPHS] == SETS
+    assert GRAPHS not in law["engine_config"]
+    assert "launch_columns" in law["host_fit"]["prefill.W_launch"]
 
 
 def test_a_run_prices_a_column_under_the_sets_its_host_laws_key_states(
@@ -193,11 +242,12 @@ def test_a_run_prices_a_column_under_the_sets_its_host_laws_key_states(
     key = {**compass_run.host_key(r.config), "machine_spec": DIGEST}
     key["engine"] = {**key["engine"], GRAPHS: SETS}
     laws = {k: {g: [1e-4, 0, 0] for g in HOST_SEGMENTS} for k in FORWARD_KINDS}
+    # An entry fitted under another engine config, which the run passes over.
+    elsewhere = {**key, "engine": {**key["engine"], "kv_cache_dtype": "fp8"}}
     for feature in ("eager", "other"):
         columns = {"prefill": {"W_launch": {feature: EAGER_S}}}
-        run_file(
-            tmp_path, monkeypatch, host={"key": key, "laws": laws, "columns": columns}
-        )
+        entry = {"key": key, "laws": laws, "columns": columns}
+        run_file(tmp_path, monkeypatch, host=[{**entry, "key": elsewhere}, entry])
         monkeypatch.setenv(compass_run.NOW_ENV, str(tmp_path / "now.bin"))
         compass_run._PublishedClock(
             compass_run.ENGINE,
@@ -209,10 +259,9 @@ def test_a_run_prices_a_column_under_the_sets_its_host_laws_key_states(
                 compass_run.runner(r, META_8B)
             continue
         compass_run.runner(r, META_8B)
-        view = BatchView((RequestShape(4000, 4000, False),), produces_output=True)
-        r.compass_host.charge(
-            _batch(4000, compass_launch=r.compass_host.predicted(view)), 0.01, 0.0
-        )
+        batch, _ = scheduler_of([1000] * 5).schedule()
+        assert batch.total_tokens_num > BUCKET
+        r.forward(batch)
         assert r.compass_host.segments["W_launch"] == pytest.approx(1e-4 + EAGER_S)
 
 
