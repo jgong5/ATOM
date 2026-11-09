@@ -171,6 +171,8 @@ ENCODES = [
 #: The planted segment tokenizer term: the call's own work over the ids its
 #: encode_batch returned, half before that call and half after it.
 SEGMENT = (6e-4, 4e6)
+#: The two pool threads the lone requests' jobs alternate between.
+POOL = (3, 5)
 #: The planted intake terms, on the loop thread's CPU clock.
 IDLE, PER_BYTE, FIXED = 1.1e-3, 8.8e-9, 4.3e-3
 #: What the wall clock holds of an intake past its CPU time: GIL waits.
@@ -201,11 +203,12 @@ def stamped(
     recorded server writes. A lone request per body size in `lone`, its loop
     thread's CPU time `IDLE + PER_BYTE x bytes` and its wall that plus
     `WAIT`, besides `OTHERS` of others' work on the loop while its pool job runs,
-    its pool job holding its call of `encodes`, an ``encode_batch`` inside a
-    segment tokenizer call (one of which another thread's decode overlaps), and
-    a decode after its send, each timed at `rates`; then calls that do not run
-    lone, ten times slower, and one burst of `burst`'s body sizes, its templates
-    `FIXED + PER_BYTE x bytes` of the loop's CPU time apart."""
+    its pool job, on one `POOL` thread and then the other, holding its call of
+    `encodes`, an ``encode_batch`` inside a segment tokenizer call (one of
+    which another thread's decode overlaps), and a decode after its send, each
+    timed at `rates`; then calls that do not run lone, ten times slower, and one
+    burst of `burst`'s body sizes, its templates `FIXED + PER_BYTE x bytes` of
+    the loop's CPU time apart."""
     calls, lines = [], [_stamp("app", 10**12 + 5, 10**12 + 5)]  # a health probe
 
     def call(kind, items, tokens, start, slow=1.0, thread=3, segment=True) -> int:
@@ -230,7 +233,8 @@ def stamped(
     for k, (size, encode) in enumerate(zip(sizes, encodes)):
         t += 10**9
         loop = round((IDLE + PER_BYTE * size) * 1e9) + OTHERS
-        done = call(*encode, t + 20_000)
+        # The pool runs the jobs on rotating threads.
+        done = call(*encode, t + 20_000, thread=POOL[k % 2])
         if encode == ("encode_batch", 7, 90_000):
             # Another thread's call inside the segment call's own work: not lone.
             call("decode", 1, 2, t + 21_000, thread=4)
@@ -323,8 +327,8 @@ def test_a_record_s_tokenizer_calls_and_intake_stamps_fit_the_entry_s_terms(
         {"fixed_s": SEGMENT[0], "tokens_per_s": SEGMENT[1]}, rel=1e-3
     )
     # Only the lone calls are fitted: each lone request's encode and decode, and
-    # its segment tokenizer call, lone among the calls it did not make: not the
-    # one another thread's decode overlaps.
+    # its segment tokenizer call, lone among the calls it did not make, those on
+    # its own thread: not the one another thread's decode overlaps.
     fitted = {k: report["tokenizer"][k] for k in compass_run.TOKENIZER_KINDS}
     assert {k: v["samples"] + v["dropped"] for k, v in fitted.items()} == {
         "encode": 4,
