@@ -485,6 +485,21 @@ def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
         (218e-6, 282e-6)
     )
     assert [got[k]["messages"] for k in ("request", "output", "stream")] == [9, 20, 10]
+    # With the step record, the request hop again over receipts 4 to 8, the
+    # ones inside a forward.
+    steps = tmp_path / "dp0.jsonl"
+    recvs = [h["t_recv_ns"] for h in handoff if "t_recv_ns" in h]
+    steps.write_text(
+        "".join(
+            json.dumps({"t_enter_ns": recvs[a] - 1, "t_exit_ns": recvs[b] + 1}) + "\n"
+            for a, b in ((6, 8), (4, 5))
+        )
+    )
+    got = probe.hops(*map(str, paths), str(steps))
+    assert got["request_forward"]["messages"] == 5
+    assert got["request_forward"]["median_s"] == pytest.approx(260e-6)
+    assert got["request"]["messages"] == 9
+    assert got["steps"] == "sha256:" + hashlib.sha256(steps.read_bytes()).hexdigest()
     # A request the engine never received pairs nothing.
     paths[1].write_text(
         "".join(json.dumps(line) + "\n" for line in handoff[:2] + handoff[3:])

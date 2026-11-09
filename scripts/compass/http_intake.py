@@ -6,7 +6,7 @@
     python3 scripts/compass/http_intake.py floor STAMPS ARRIVALS
     python3 scripts/compass/http_intake.py idle STAMPS [PER_BYTE_S]
     python3 scripts/compass/http_intake.py lone STAMPS [PASSES]
-    python3 scripts/compass/http_intake.py hops STAMPS HANDOFF ARRIVALS
+    python3 scripts/compass/http_intake.py hops STAMPS HANDOFF ARRIVALS [STEPS]
     python3 scripts/compass/http_intake.py pd STAMPS [STEPS]
 
 `serve` runs `atom.entrypoints.openai.api_server` as ``python3 -m`` does and
@@ -44,7 +44,9 @@ long one) finds the engine idle; ``output``, each engine output's put on the eng
 output queue to the server's output thread taking it in; ``stream``, each SSE
 head sent to the client reading it (ARRIVALS' ``admitted_ns``), paired on the head's send
 call and timed from its return, a head the client read first left out. Prints each hop's median, p10,
-p90 and N, and the three inputs' sha256, as JSON.
+p90 and N, and the three inputs' sha256, as JSON. With STEPS, the engine's step
+record (``dp0.jsonl``), it adds ``request_forward``, the request hop over the
+receipts inside a forward, and the record's sha256.
 `pd` reads a prefill and a decode server's shared STAMPS (`parity_pd.sh` with
 HTTP_INTAKE): ``kv_write_req``, each write request's send call on decode to prefill's
 receipt, its median, p10, p90 and N, and the sha256, as JSON. With STEPS, prefill's
@@ -364,7 +366,7 @@ def _hop(sent, got, name: str, alone: bool = True, returned=None) -> dict:
     return {"median_s": median, "p10_s": p10, "p90_s": p90, "messages": len(took)}
 
 
-def hops(stamps: str, handoff: str, arrivals: str) -> dict:
+def hops(stamps: str, handoff: str, arrivals: str, steps: str | None = None) -> dict:
     data, handoff_data = Path(stamps).read_bytes(), Path(handoff).read_bytes()
     sent_data = Path(arrivals).read_bytes()
     rows = [line.split() for line in data.decode().splitlines()]
@@ -389,14 +391,29 @@ def hops(stamps: str, handoff: str, arrivals: str) -> dict:
         )
     got = [outs[i] for i in starts[:-1]]
     admitted = json.loads(sent_data)["admitted_ns"]
-    return {
-        "request": _hop(sorted(sends)[1:], sorted(recvs)[1:], "request"),
+    sent, recvs = sorted(sends)[1:], sorted(recvs)[1:]
+    out = {
+        "request": _hop(sent, recvs, "request"),
         "output": _hop([t for t, _ in put], got, "output", alone=False),
         "stream": _hop(head_calls, admitted, "stream", returned=heads),
         "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
         "handoff": f"sha256:{hashlib.sha256(handoff_data).hexdigest()}",
         "arrivals": f"sha256:{hashlib.sha256(sent_data).hexdigest()}",
     }
+    if steps is None:
+        return out
+    # A receipt between forwards waits on the step loop's GIL.
+    steps_data = Path(steps).read_bytes()
+    lines = [json.loads(line) for line in steps_data.decode().splitlines()]
+    fw = np.array(sorted((s["t_enter_ns"], s["t_exit_ns"]) for s in lines))
+    got = np.array(recvs)
+    i = np.searchsorted(fw[:, 0], got, "right") - 1
+    inside = (i >= 0) & (got <= fw[i, 1])
+    out["request_forward"] = _hop(
+        np.array(sent)[inside].tolist(), got[inside].tolist(), "request_forward"
+    )
+    out["steps"] = f"sha256:{hashlib.sha256(steps_data).hexdigest()}"
+    return out
 
 
 def pd(stamps: str, steps: str | None = None) -> dict:
