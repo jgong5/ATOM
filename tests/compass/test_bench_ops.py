@@ -78,9 +78,13 @@ class _Capture(contextlib.nullcontext):
 
 
 def _captures(monkeypatch, graph=_Capture):
-    """`torch.cuda.graph` as `graph`, beside a stand-in current stream."""
+    """`torch.cuda.graph` as `graph`, beside a stand-in current stream and a
+    `torch.cuda.stream` that makes no stream current: torch's own, with a
+    device present, reads the current stream and sets the one it is given on
+    the device, which no stand-in can be."""
     monkeypatch.setattr(torch.cuda, "graph", graph)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream("main"))
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
 
 
 def test_each_leaf_holds_every_instance_s_context_key_and_module_path():
