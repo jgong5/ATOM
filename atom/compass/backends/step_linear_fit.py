@@ -35,16 +35,18 @@ lacks otherwise or cut, or whose ranks' rows fall to different vectors, is
 counted under `ranks` and not fitted. The law reports each step's rank label
 spread, `max / min - 1`, as its p50 and p90 under `spread`. The group's step
 is the max over its ranks, so each vector is fitted by max-affine regression
-(`_fit_form`): from the fit on every rank's row, each pass refits on the row
-each step's price picks, a step line-searched until it lowers the squared
-relative error, until no step changes rank or the step's ranks tie; MAD drops
-rerun it. The vector's solve, warm steps and hull read each step's row at the
+(`_fit_form`): from the fit on every rank's row and from each feature that
+differs between a step's ranks, each pass refits on the row each step's price
+picks, a step line-searched until it lowers the squared relative error, until
+no step changes rank or the step's ranks tie; the start ending lowest goes on,
+and MAD drops rerun it. The vector's solve, warm steps and hull read each step's row at the
 rank it prices the step as (`priced_rank`); a decode rung that adopts a
 column (below) is fitted again under it. Each
 vector reports, under `fit.all_rows`, the centre and scaled MAD of the fit on
 every rank's row, each step priced as its max over ranks, and under
-`fit.passes` the passes, how they stopped, `settled` or `tie`, and the
-squared error `F`; more than `FIT_PASSES` passes refuse the fit. A held-out
+`fit.passes` the start that went on, its passes, how they stopped, `settled`
+or `tie`, and the squared error `F`; more than `FIT_PASSES` passes from any
+start refuse the fit. A held-out
 step is priced and banded as its costliest rank.
 
 Records with a host key (`dp0.key.json`, from the real runner) also give the
@@ -793,20 +795,24 @@ def _fit_form(
     price, plus `offset`, a fixed part of it outside the coefficients.
 
     `F(c) = sum_i ((max_r x_ir.c + offset_i) / y_i - 1)^2` over the kept steps.
-    The start is the non-negative least-squares solve of every rank's row, each
-    equation divided by its label. Each pass solves on the row each step's
-    current price picks, a Gauss-Newton step on `F`, and halves it until `F`
-    falls. The passes end settled, the solve picking the rows it was solved
-    on, or at a tie between ranks, when no step that moves some price by more
-    than the square root of the float epsilon makes `F` fall; more than
-    `FIT_PASSES` passes in all raise. Steps whose residual is more than
-    `MAD_K` scaled MADs from the median are then dropped and the passes rerun
-    from there, until the kept set settles or for `MAD_PASSES` rounds.
+    The starts are the non-negative least-squares solve of every rank's row,
+    each equation divided by its label, and, per feature that differs between
+    some step's ranks, that feature's axis scaled to the labels. Each pass
+    solves on the row each step's current price picks, a Gauss-Newton step on
+    `F`, and halves it until `F` falls. The passes end settled, the solve
+    picking the rows it was solved on, or at a tie between ranks, when no step
+    that moves some price by more than the square root of the float epsilon
+    makes `F` fall; more than `FIT_PASSES` passes from any start raise. The
+    first round runs from every start with every step kept, and the lowest
+    `F` goes on. Steps whose residual is more than `MAD_K` scaled MADs from
+    the median are then dropped and the passes rerun from there, until the
+    kept set settles or for `MAD_PASSES` rounds.
 
     Returns the solve's figures: `pick`, each step's rank, at a tie the rank
     of larger features (`priced_rank`, prices folded as a run folds them);
-    `passes`, the passes over every round, the last stop and `F`; and
-    `all_rows`, the centre and scaled MAD of the start's residuals.
+    `passes`, the start that went on, its passes over every round, the last
+    stop and `F`; and `all_rows`, the centre and scaled MAD of the residuals
+    of the solve of every rank's row.
     """
     from scipy.optimize import nnls
 
@@ -837,20 +843,14 @@ def _fit_form(
     def cost(c):
         return float(((price(c).max(axis=1) - b)[keep] ** 2).sum())
 
-    keep = np.ones(n, dtype=bool)
-    c, cols = solve(a[real], np.broadcast_to(b[:, None], real.shape)[real])
-    start = price(c).max(axis=1) - b
-    on, passes = real, 0
-    # Refitted until the kept set stops moving, so a step an outlier's pull
-    # dropped on the first pass comes back once the outlier is gone.
-    for rounds in range(1, MAD_PASSES + 1):
+    def alternate(c, cols, on, passes):
+        """Passes from `c` over the kept steps until settled or at a tie."""
         while True:
             pick = price(c).argmax(axis=1)
             picked = np.zeros_like(real)
             picked[steps, pick] = True
             if on is not None and (on[keep] == picked[keep]).all():
-                stop = "settled"
-                break
+                return c, cols, on, passes, "settled"
             if passes == FIT_PASSES:
                 raise ValueError(
                     f"the alternation on {names} still moved after {FIT_PASSES} passes"
@@ -865,9 +865,33 @@ def _fit_form(
                 while cost(c + t * d) >= f and t * moves > tol:
                     t /= 2
                 if t * moves <= tol:
-                    stop = "tie"
-                    break
+                    return c, cols, on, passes, "tie"
                 c, cols, on = c + t * d, solved, picked if t == 1 else None
+
+    keep = np.ones(n, dtype=bool)
+    c, cols = solve(a[real], np.broadcast_to(b[:, None], real.shape)[real])
+    start = price(c).max(axis=1) - b
+    # Beside the all-rows solve, each feature that differs between some step's
+    # ranks starts from its axis, scaled to the median of each step's label
+    # over its largest value of the feature.
+    starts = {"all_rows": (c, real)}
+    top = np.where(real[..., None], x, -np.inf).max(axis=1)
+    low = np.where(real[..., None], x, np.inf).min(axis=1)
+    rest = y - offset
+    for j in np.flatnonzero((top > low).any(axis=0)):
+        lit = top[:, j] > 0
+        axis = np.zeros(k)
+        axis[j] = np.median(rest[lit] / top[lit, j])
+        starts[names[j]] = (axis, None)
+    # Each start's first round keeps every step; the lowest `F` wins.
+    ends = {s: alternate(c0, cols, on, 0) for s, (c0, on) in starts.items()}
+    first = min(ends, key=lambda s: cost(ends[s][0]))
+    c, cols, on, passes, stop = ends[first]
+    # Refitted until the kept set stops moving, so a step an outlier's pull
+    # dropped on the first pass comes back once the outlier is gone.
+    for rounds in range(1, MAD_PASSES + 1):
+        if rounds > 1:
+            c, cols, on, passes, stop = alternate(c, cols, on, passes)
         residual = price(c).max(axis=1) - b
         centre = np.median(residual)
         mad = 1.4826 * np.median(np.abs(residual - centre))
@@ -875,6 +899,7 @@ def _fit_form(
         if (moved == keep).all() or rounds == MAD_PASSES:
             break
         keep, on = moved, None
+    pick = np.zeros(n, dtype=int)
     if width > 1:
         pick = [
             priced_rank(
@@ -894,7 +919,7 @@ def _fit_form(
         "condition": float(np.linalg.cond(cols)),
         "zero": [names[j] for j in range(k) if j not in vary],
         "pick": np.asarray(pick),
-        "passes": {"count": passes, "stop": stop, "F": cost(c)},
+        "passes": {"start": first, "count": passes, "stop": stop, "F": cost(c)},
         "all_rows": {
             "centre": float(np.median(start)),
             "mad": float(1.4826 * np.median(np.abs(start - np.median(start)))),
