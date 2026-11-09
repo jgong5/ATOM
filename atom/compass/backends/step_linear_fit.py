@@ -68,6 +68,11 @@ on too few such forwards give `admit` null, so a run refuses a forward that
 admits a request rather than charge it nothing, and the report says why under
 `unfitted`.
 
+Under a launch provider that declares features (`launch_features`), a step it
+predicts otherwise than its line observed refuses, naming it; each host law
+adopts features as columns (`_launch_columns`), their coefficients under the
+entry's `columns[kind][segment]`, and `_jit` solves `W_launch` with every one.
+
 The same solver fits the host entry's ``tokenizer`` term on a recorded
 server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
 HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
@@ -152,7 +157,7 @@ from pathlib import Path
 
 import numpy as np
 
-from atom.compass.backends import json_file, step_labels
+from atom.compass.backends import json_file, launch_features, step_labels
 from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.shape import (
     sum_context,
@@ -289,27 +294,37 @@ def _host_x(s) -> tuple[int, int, int]:
 
 
 def _host_rows(samples) -> list[tuple]:
-    """(kind, segment, (1, tokens, seqs), seconds) per host label of each
-    sample, but the `E` of one that admits requests."""
+    """(kind, segment, (1, tokens, seqs), seconds, run, launch) per host label
+    of each sample, but the `E` of one that admits requests."""
     rows = []
     for s in samples:
         rows += [
-            (host_kind(s.view), k, _host_x(s), v)
+            (host_kind(s.view), k, _host_x(s), v, s.provenance["run"], s.launch)
             for k, v in s.host.items()
             if k != "E" or not s.admitted[0]
         ]
     return rows
 
 
-def _admit_rows(samples, laws) -> list[tuple]:
+def _host_price(host, kind, segment, x, launch) -> float | None:
+    """What the host entry `host` prices a `kind` forward's `segment` at `x`
+    that launched `launch`, its columns included; None with no law."""
+    c = host["laws"].get(kind, {}).get(segment)
+    columns = host.get("columns", {}).get(kind, {}).get(segment, {})
+    priced = sum(v * launch[f] for f, v in columns.items())
+    return None if c is None else float(np.dot(c, x)) + priced
+
+
+def _admit_rows(samples, host) -> list[tuple]:
     """(`admit_x` of admitted, `E` its kind's law prices, `E`) per sample
     that admits requests, has a positive `E` and a kind with an `E` law."""
     return [
-        (step_labels.admit_x(s.admitted), float(np.dot(c, _host_x(s))), s.host["E"])
+        (step_labels.admit_x(s.admitted), base, s.host["E"])
         for s in samples
         if s.admitted[0]
         and s.host.get("E", 0) > 0
-        and (c := laws.get(host_kind(s.view), {}).get("E")) is not None
+        and (base := _host_price(host, host_kind(s.view), "E", _host_x(s), s.launch))
+        is not None
     ]
 
 
@@ -347,7 +362,14 @@ def fit_host(samples) -> tuple[dict, dict]:
             f"the records carry {len(keys)} host keys ({' / '.join(keys)}); "
             "host laws are fitted under one"
         )
-    jit = _jit(samples)
+    launch, graphs = launch_features.stated(json.loads(keys[0]))
+    for s in samples:
+        if (predicted := launch.predict(s.view, graphs)) != s.launch:
+            raise ValueError(
+                f"{s.provenance['run']} step {s.step} launched {s.launch}, and "
+                f"its launch provider predicts {predicted}"
+            )
+    jit = _jit(samples, launch.features)
     after = {(run, rank, n + 1) for run, rank, n in sorted(jit)}
     kept = [
         s for s in samples if (s.provenance["run"], s.rank, s.step) not in jit | after
@@ -363,15 +385,23 @@ def fit_host(samples) -> tuple[dict, dict]:
         for segment in HOST_SEGMENTS[: 3 if kind == "middle" else 4] + tuple(extra):
             members = [r for r in rows if r[:2] == (kind, segment) and r[3] > 0]
             try:
+                adopted, figures = _launch_columns(members, launch.features)
+                columns = [(f, [r[5][f] for r in members]) for f in adopted]
                 coef, fitted = _host_law(
-                    [r[2] for r in members], [r[3] for r in members], HOST_FEATURES
+                    [r[2] for r in members],
+                    [r[3] for r in members],
+                    HOST_FEATURES,
+                    columns=columns,
                 )
             except (ValueError, QhullError) as e:
                 report["unfitted"][f"{kind}.{segment}"] = str(e).splitlines()[0]
                 continue
-            host["laws"].setdefault(kind, {})[segment] = coef
-            report[f"{kind}.{segment}"] = fitted
-    a, base, labels = list(zip(*_admit_rows(kept, host["laws"]))) or [(), (), ()]
+            host["laws"].setdefault(kind, {})[segment] = coef[: len(HOST_FEATURES)]
+            if adopted:
+                c = dict(zip(adopted, coef[len(HOST_FEATURES) :]))
+                host.setdefault("columns", {}).setdefault(kind, {})[segment] = c
+            report[f"{kind}.{segment}"] = fitted | figures
+    a, base, labels = list(zip(*_admit_rows(kept, host))) or [(), (), ()]
     try:
         host["admit"], report["admit"] = _host_law(a, labels, ADMIT_FEATURES, base)
     except (ValueError, QhullError) as e:
@@ -729,19 +759,21 @@ def _hop_messages(intake: Path, client) -> dict:
     }
 
 
-def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
+def _host_law(x, y, names, offset=0.0, columns=()) -> tuple[list, dict]:
     """The host law on `names` over the forwards `x` labelled `y`, the part
     `offset` of each label fixed, and its report. Raises on too few forwards or
-    no hull; with the last feature in a fixed proportion to the one before on
-    every forward, the last gets zero."""
+    no hull; with the last of `names` in a fixed proportion to the one before on
+    every forward, it gets zero. Each of `columns`, (feature, values), follows."""
     x = np.array(x, dtype=np.float64).reshape(-1, len(names))
-    if len(x) <= len(names):
-        raise ValueError(f"{len(x)} forwards for {len(names)} coefficients")
+    if len(x) <= (k := len(names) + len(columns)):
+        raise ValueError(f"{len(x)} forwards for {k} coefficients")
     width = len(names)
     if np.linalg.matrix_rank(x[:, 1:]) < width - 1:
         width -= 1
         x[:, width] = 0.0
-    s = _solve(x, np.array(y), list(names), np.array(offset), names[0])
+    wide = np.column_stack([x, *(v for _, v in columns)])
+    names = [*names, *(f for f, _ in columns)]
+    s = _solve(wide, np.array(y), names, np.array(offset), names[0])
     hull = _hull(x[s["keep"]][:, 1:width], names[1:width])
     return s["coef"].tolist(), {
         "hull": hull,
@@ -751,11 +783,11 @@ def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
     }
 
 
-def _jit(samples) -> set[tuple]:
+def _jit(samples, features=()) -> set[tuple]:
     """(run, rank, step) of each forward whose `W_launch` the fit of its kind
     drops above its law, a first-use JIT compile; on a decode, whose launch
     of a millisecond or so drops on host noise, only past `WARM_FACTOR` times
-    its price."""
+    its price. Each launch feature of `features` is a column of that fit."""
     jit = set()
     for kind in HOST_KINDS:
         members = [
@@ -763,16 +795,16 @@ def _jit(samples) -> set[tuple]:
             for s in samples
             if host_kind(s.view) == kind and s.host.get("W_launch", 0) > 0
         ]
-        if len(members) <= len(HOST_FEATURES):
+        if len(members) <= len(HOST_FEATURES) + len(features):
             continue
         x = np.array(
-            [(1, sum_tokens(m.view.requests), len(m.view.requests)) for m in members],
+            [(*_host_x(m), *(m.launch[f] for f in features)) for m in members],
             dtype=np.float64,
         )
-        if np.linalg.matrix_rank(x[:, 1:]) < 2:
+        if np.linalg.matrix_rank(x[:, 1:3]) < 2:
             x[:, 2] = 0.0
         y = np.array([m.host["W_launch"] for m in members])
-        solved = _solve(x, y, list(HOST_FEATURES))
+        solved = _solve(x, y, [*HOST_FEATURES, *features])
         floor = 1 / WARM_FACTOR - 1 if kind == "decode" else 0.0
         jit |= {
             (m.provenance["run"], m.rank, m.step)
@@ -780,6 +812,34 @@ def _jit(samples) -> set[tuple]:
             if not keep and r < floor
         }
     return jit
+
+
+def _launch_columns(members, features) -> tuple[list[str], dict]:
+    """The `features` host-law `members` (`_host_rows`) adopt as columns, in
+    order, and the report's `launch_columns`: each round's held-out error per
+    design tried (`_held_out_error`, each run held out). A round adds the
+    feature of least error while it is below the last design's. Members of one
+    run adopt none."""
+    if not features:
+        return [], {}
+    x = np.array([r[2] for r in members], dtype=np.float64).reshape(-1, 3)
+    if np.linalg.matrix_rank(x[:, 1:]) < 2:
+        x[:, 2] = 0.0
+    y, cell = np.array([r[3] for r in members]), np.array([r[4] for r in members])
+
+    def error(names):
+        values = [[r[5][f] for r in members] for f in names]
+        design = np.column_stack([x, *values])
+        return _held_out_error(_folds(design, y, cell, [*HOST_FEATURES, *names]))
+
+    adopted, rounds = [], [{"none": error([])}]
+    while rounds[0]["none"] is not None and len(adopted) < len(features):
+        last = min(rounds[-1].values())
+        rounds.append({f: error([*adopted, f]) for f in features if f not in adopted})
+        if not min(rounds[-1].values()) < last:
+            break
+        adopted.append(min(rounds[-1], key=rounds[-1].get))
+    return adopted, {"launch_columns": {"adopted": adopted, "held_out": rounds}}
 
 
 def _solve(
@@ -928,6 +988,13 @@ def _folds(design, y, cell, names) -> dict:
     return out
 
 
+def _held_out_error(folds: dict) -> float | None:
+    """`_folds`' held-out error: the mean of each record's held-out p50 error's
+    magnitude, weighted by its rows; None with no record held out."""
+    rows = sum(n for n, _ in folds.values())
+    return sum(n * abs(p) for n, p in folds.values()) / rows if rows else None
+
+
 def _moe_column(members, x, names, routing) -> tuple:
     """The MoE column decode rung `members` adopts, or None, and the figures the
     rule read, as the vector records them under `fit.moe_column`.
@@ -936,11 +1003,10 @@ def _moe_column(members, x, names, routing) -> tuple:
     forms are no column and each of `MOE_COLUMNS` over the steps' real MoE
     tokens, `moe_experts` under `routing` and with each step's group dummies
     as one token (`moe_column`). Each form is solved with each record
-    held out of the rung's rows, and its held-out error is the mean over the
-    records of the held-out p50 error's magnitude, weighted by the record's
-    steps. The form of smallest held-out error is picked, no column on a tie,
-    and a picked column is adopted, returned as (feature, column, solve). A
-    rung of one record has no held-out error and adopts none.
+    held out of the rung's rows, its held-out error `_held_out_error`'s. The
+    form of smallest held-out error is picked, no column on a tie, and a
+    picked column is adopted, returned as (feature, column, solve). A rung of
+    one record has no held-out error and adopts none.
     """
     cell = np.array([r[0] for r in members])
     y = np.array([r[3] for r in members])
@@ -950,12 +1016,8 @@ def _moe_column(members, x, names, routing) -> tuple:
         forms[feature] = (np.column_stack([x, column]), [*names, feature])
     held, error = {}, {}
     for form, (design, wide) in forms.items():
-        folds = _folds(design, y, cell, wide)
-        held[form] = folds
-        steps = sum(n for n, _ in folds.values())
-        error[form] = (
-            sum(n * abs(p) for n, p in folds.values()) / steps if steps else None
-        )
+        held[form] = _folds(design, y, cell, wide)
+        error[form] = _held_out_error(held[form])
     picked = min(error, key=error.get) if held["none"] else None
     adopted = None if picked in (None, "none") else picked
     figures = {
@@ -1513,16 +1575,15 @@ def host_held_out(samples) -> dict:
     for run in dict.fromkeys(s.provenance["run"] for s in samples):
         others = [s for s in samples if s.provenance["run"] != run]
         host = fit_host(others)[0]
-        laws, admit = host["laws"], host.get("admit")
+        admit = host.get("admit")
         mine = [s for s in samples if s.provenance["run"] == run]
         rows = [
-            (f"{kind} {segment}", c and float(np.dot(c, x)), seconds)
-            for kind, segment, x, seconds in _host_rows(mine)
-            for c in [laws.get(kind, {}).get(segment)]
+            (f"{kind} {segment}", _host_price(host, kind, segment, x, launch), seconds)
+            for kind, segment, x, seconds, _, launch in _host_rows(mine)
         ]
         rows += [
             ("admit E", admit and base + float(np.dot(admit, a)), e)
-            for a, base, e in _admit_rows(mine, laws)
+            for a, base, e in _admit_rows(mine, host)
         ]
         for band, price, seconds in rows:
             if seconds > 0:
@@ -1675,7 +1736,12 @@ def main(argv=None) -> None:
     law["machine_spec"] = args.machine_spec
     law["engine_config"] = engine
     if "host" in law:
-        law["host"]["key"] |= {"machine_spec": args.machine_spec, "engine": engine}
+        stated = law["host"]["key"]["engine"]  # its graph sets stay
+        graphs = {k: v for k, v in stated.items() if k == launch_features.GRAPHS}
+        law["host"]["key"] |= {
+            "machine_spec": args.machine_spec,
+            "engine": engine | graphs,
+        }
     if len(args.records) > dp:
         mark_held_out(law, report, samples, options)
     Path(args.out).write_text(json.dumps(law) + "\n")
