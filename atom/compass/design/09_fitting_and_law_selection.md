@@ -308,6 +308,11 @@ the held-out error, with every feature a column of the JIT cut's solve. A run pr
 adopted column from `predict` under the graph sets its host laws' key states, a simulated
 runner recording none, and refuses a column whose feature the provider lacks
 ([Ruling on #2958](https://github.com/jgong5/ATOM/issues/2958#issuecomment-6729555201)).
+DeepSeek-V4.1's provider (`launch_features.DeepseekV41`) declares an eager body and an eager
+decoder tail. On four records of [#2218](https://github.com/jgong5/ATOM/issues/2218)'s TP2
+DSpark recipe with prefill token graphs to 3072 tokens, an output prefill's launch ran 11 ms at
+p50 with both replayed, 43 ms with an eager body, 55 ms with an eager tail and 91 ms with both;
+the fit adopted both columns, at 32 and 43 ms ([#2958](https://github.com/jgong5/ATOM/issues/2958)).
 
 - **Key:** the host CPU, the `atom` source digest, the model, the engine config, the
   device, the software stack and torch (`07` D41). A mismatch refuses. There is no transfer mode: the MI455 projection prices no host floor
