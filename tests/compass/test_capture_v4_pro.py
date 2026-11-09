@@ -269,7 +269,7 @@ def test_the_attention_s_leaves_are_the_functions_that_launch_its_kernels(
             assert op["args"]["split_indptr"]["shape"] == [2 + 1]
 
 
-def test_the_decode_indexer_and_qk_norm_leaves_alone_state_their_layer_s_geometry(
+def test_the_decode_indexer_qk_norm_and_prefill_attention_leaves_alone_state_their_layer_s_geometry(
     tmp_path_factory,
 ):
     config = json.loads(CONFIG.read_text())
@@ -277,7 +277,7 @@ def test_the_decode_indexer_and_qk_norm_leaves_alone_state_their_layer_s_geometr
 
     for graph, _ in graphs.values():
         stating = {op["op"] for op in _ops(graph["region"]) if "stated" in op}
-        assert stating <= {DECODE, PS_DECODE, INDEXER, QKN}
+        assert stating <= {DECODE, PS_DECODE, INDEXER, QKN, CORE["prefill"]}
     layers = _decoder(graphs["decode B=2"][0])
     for layer, ratio in zip(layers, config["compress_ratios"], strict=False):
         top = config["index_topk"] if ratio == 4 else None
@@ -326,6 +326,21 @@ def test_a_mooncake_producer_traces_its_steps_with_its_indexer_cache_in_fp8(
     for graph, _ in graphs.values():
         layers = [[op["op"] for op in layer] for layer in _decoder(graph)]
         assert [names.count(FP8_QUERY) for names in layers] == indexed
+
+
+def test_the_prefill_attention_states_the_ratio_of_the_lists_it_is_passed(
+    tmp_path_factory,
+):
+    # Each layer's prefill attention reads the prefix index list and indptr of
+    # its layer's compress class, which `measure ops` binds by that ratio.
+    config = json.loads(CONFIG.read_text())
+    graphs = capture(tmp_path_factory, "--width 2 --prefill 512 2" + DPA_TP8 + PRODUCER)
+
+    layers = _decoder(graphs["prefill T=512 B=2"][0])
+    assert len(layers) == LAYERS
+    for layer, ratio in zip(layers, config["compress_ratios"], strict=False):
+        [core] = [op for op in layer if op["op"] == CORE["prefill"]]
+        assert core["stated"] == {"compress_ratio": ratio}
 
 
 def test_tp8_without_dp_attention_reduces_in_each_layer_and_declares_nothing(
@@ -406,7 +421,7 @@ def test_the_attention_body_runs_as_a_real_step_then_the_batch_is_dummy_again(
         geometry = {"window_size": 64, "compress_ratio": ratio, "index_topk": top}
         ratio = {"compress_ratio": ratio}
         decodes = (DECODE, "aiter.mla_decode_v4_asm.default", BF16_DECODE, PS_DECODE)
-        qkns = dict.fromkeys((QKN, QKN_BF16), ratio)
-        return {**dict.fromkeys(decodes, geometry), INDEXER: ratio, **qkns}
+        ratios = dict.fromkeys((INDEXER, QKN, QKN_BF16, CORE["prefill"]), ratio)
+        return {**dict.fromkeys(decodes, geometry), **ratios}
 
     assert seen == [(False, stated(4, 512)), (False, stated(128, None))]
