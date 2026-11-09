@@ -841,7 +841,10 @@ pulls, so every kind carries `E_out`, `E` runs from the latest pull over the
 eight ranks before the same forward and `W_launch` ends at the token read.
 Their host keys carry the `atom`
 digest of the tree they were last re-keyed at; `provenance` names the
-capture tree's.
+capture tree's. Their engine config, in each law and its host key, states
+`index_cache_dtype` fp4: each cell ran one server with no `--kv-transfer-config`,
+for which ATOM resolves the fp4 indexer at gfx950, so a P/D side, which ATOM
+resolves to fp8, refuses them ([#2998](https://github.com/jgong5/ATOM/issues/2998)).
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-crs005-{prefill,decode}.json`
 are the same pair for the cell on crsuse2-m2m-v3-005 (prefill) and -013 (decode),
@@ -866,7 +869,9 @@ decode law's, stating `declared`, since the prefill law's own fit left rung 2 un
 in the `cached_seqs` form on the lone prefill cells and on the prefill side of one 1P1D
 `deploy.sh record` cell, #975's cell at c=1 over traces 256 to 392, seed 20260707
 ([#2853](https://github.com/jgong5/ATOM/issues/2853)); its other vectors but rung 2, and its
-host laws, are the lone cells' fit.
+host laws, are the lone cells' fit. The pair's lone cells ran the fp4 indexer and its 1P1D
+cells the fp8 one, so neither law states `index_cache_dtype`, and each reads as fp8
+([#2998](https://github.com/jgong5/ATOM/issues/2998)).
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by
@@ -877,7 +882,7 @@ concurrency 1, 4, 16, 64 and 256 at `cctraces_sim.sh`'s default `SEED`
 the prefill side adds 64 three more times at `SEED=20260708` and once at the default,
 the decode side 64 once more at the default ([#1810](https://github.com/jgong5/ATOM/issues/1810)).
 Each decode rung a law fits has steps in two or more cells, so each carries a held-out
-hull. Host keys as above.
+hull. Host keys and the fp4 indexer as the gpu-45 pair's.
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-{prefill,decode}.json`
 are the EP8 pair for the cell on crsuse2-m2m-v3-005 (prefill) and -013 (decode), keyed by
@@ -899,7 +904,8 @@ vectors, the prefill law's rung-1 vector among them, and its host laws are the o
 lone cells alone, and its `sources` names the records each came from. The prefill law's rung-2
 vector is not: it is the decode law's, stating `declared`, since no prefill-side record decodes at
 rung 2, which the 1P1D prefill side reaches at c=64 ([#2878](https://github.com/jgong5/ATOM/issues/2878)).
-Host keys as above.
+Host keys as above; the indexer as the crs005 DPA-TP8 pair's, its lone cells fp4 and its 1P1D
+cells fp8, so neither law states it.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json` is DeepSeek-V4.1-Flash's
 law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed
