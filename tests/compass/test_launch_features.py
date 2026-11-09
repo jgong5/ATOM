@@ -152,7 +152,9 @@ def test_a_column_is_refused_where_it_cannot_be_priced():
     with pytest.raises(CostRefused, match=r"no law for prefill\.W_launch\.eager"):
         rec.charge(_batch(4000), 0.01, 0.0)
     with pytest.raises(ValueError, match="pipeline stage"):
-        HostDeviceRecurrence(laws, (), lambda: 0.0, (0, 2), columns=columns, launch=launch)
+        HostDeviceRecurrence(
+            laws, (), lambda: 0.0, (0, 2), columns=columns, launch=launch
+        )
 
 
 @pytest.mark.parametrize("architectures", [[ARCH], ["OtherForCausalLM"]])
