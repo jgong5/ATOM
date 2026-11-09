@@ -226,7 +226,11 @@ def test_a_recording_runner_writes_what_replayed_and_the_decoder_buckets(
     config = _config(hf_config=SimpleNamespace(architectures=[ARCH]))
     monkeypatch.setenv(ENV, str(tmp_path / "real"))
     runner = recorded(0, config)
-    vars(runtime.early)["_token_graph"] = _TokenGraph()  # ATOM's capture, after install
+    # ATOM's capture, after `install`: the decoder runs, and the body's token
+    # graph is made.
+    capture = SimpleNamespace(token_graph=False, req_graphs=False, running_bs=1)
+    assert _run_decoder(runtime.decoder, capture) == "decoded"
+    vars(runtime.early)["_token_graph"] = _TokenGraph()
     runner.host_key = {"engine": {"ladder": [1, 2, 4, 8]}}
     for batch in batches:
         runner.forward(batch)
