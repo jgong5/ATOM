@@ -1085,10 +1085,14 @@ def settle_before_collectives() -> None:
     """The clock owner pays its owed group rounds before a host collective, a
     `torch.distributed` collective whose tensors are all on the CPU, or that
     has none: it returns at the latest arrival. A device collective returns
-    once enqueued, so it settles nothing."""
+    once enqueued, so it settles nothing. A collective this has wrapped is
+    left as it is, so a process that calls this again wraps nothing twice."""
     import torch.distributed as dist
 
     def settled(fn):
+        if getattr(fn, "settles", False):
+            return fn
+
         def call(*args, **kwargs):
             rt = _installed
             if (
@@ -1099,6 +1103,7 @@ def settle_before_collectives() -> None:
                 rt.settle()
             return fn(*args, **kwargs)
 
+        call.settles = True
         return call
 
     for name in COLLECTIVES:
