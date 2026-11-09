@@ -23,13 +23,10 @@ the caller says which side it is on. There is no default and no fall back to
 the other side: a transfer between two nodes priced on the intra-node link is
 wrong by roughly an order of magnitude and would look entirely plausible.
 
-Two things this model is not.
-
-It is **unvalidated**. No real RDMA baseline has been fitted to it, so the
-latency and bandwidth in a spec are declarations rather than measurements, and
-a predicted transfer time inherits that. Fitting them is a calibration
-exercise against a real deployment; until then the numbers are as good as the
-document they came from and no better.
+The numbers are as good as the document they came from. A spec's provenance
+says per value whether it was declared or probed. A probed RDMA link is
+`atom/compass/networks/crs005-013-ionic.json`, measured on the rails between
+two MI355X nodes; its provenance names the bench and the run.
 
 It charges the same duration to both ends of the same wire. A push and a pull
 of the same blocks cost the same here, which is a claim about the fabric being
@@ -39,7 +36,8 @@ Writes on one `Link` move one at a time, in arrival order. A link's first
 write that moves bytes also pays the link's one-off setup, when the spec
 declares one; a write that moves no block and no slot makes no transfer call
 and pays none. Writes on different links do not contend, even where real ones
-would share a NIC.
+share a rail or a NIC, so writes that fan in on one are each priced at a lone
+writer's rate.
 
 Nothing in this module imports the engine or a tensor library. Reaching it
 through the package around it is not the same import: `atom.compass.kv` loads
