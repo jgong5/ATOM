@@ -9,27 +9,16 @@ import pathlib
 import pytest
 from test_pp_carriers import TRUTH, _samples, probe, script
 from test_spec_origin import labels, saved, three_origins
-from test_spec_verbs import TOKENIZER, fragment, published_topology
+from test_spec_verbs import fragment
 
 from atom.compass.artifacts import machine_spec_digest
-from atom.compass.spec import (
-    MachineSpec,
-    SpecRefusal,
-    merge,
-    tokenizer_fragment,
-)
+from atom.compass.spec import MachineSpec, SpecRefusal, merge
 from atom.compass.spec.bands import refuse_unbanded
-from atom.compass.spec.machine import entry_label
 from atom.compass.spec.rules import Rule
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-ENTRY = entry_label("qwen3-151k-bpe", "fast")
-RATES = (
-    "encode_fixed_s",
-    "encode_tokens_per_s",
-    "decode_fixed_s",
-    "decode_tokens_per_s",
-)
+#: A probed number of `three_origins`, to state a band on.
+BANDWIDTH = "device.memory.bandwidth_bytes_per_s"
 
 
 def _banded(document, low=0.5, high=2.0):
@@ -38,10 +27,7 @@ def _banded(document, low=0.5, high=2.0):
     for label, found in document["provenance"]["origins"].items():
         if found["origin"] != "probed":
             continue
-        if label == ENTRY:
-            found["p10"] = {r: TOKENIZER[r] * low for r in RATES}
-            found["p90"] = {r: TOKENIZER[r] * high for r in RATES}
-        elif isinstance(spec.value(label), int | float):
+        if isinstance(spec.value(label), int | float):
             found["p10"], found["p90"] = (
                 spec.value(label) * low,
                 spec.value(label) * high,
@@ -55,11 +41,11 @@ def test_a_probed_number_without_its_band_is_refused_by_name():
         refuse_unbanded(spec)
     assert refused.value.rule is Rule.BAND
     said = refused.value.what
-    for owed in ("host.ipc.zmq_roundtrip_s", "device.compute.bf16_flops", ENTRY):
+    for owed in (BANDWIDTH, "device.compute.bf16_flops"):
         assert f"`{owed}`" in said
     # Read, not sampled: a count, a text, the capacity; a derate; an assumed link.
     for free in (
-        "cores_physical",
+        "count_per_node",
         "device.name",
         "capacity_bytes",
         "derate",
@@ -73,12 +59,10 @@ def test_a_band_beside_each_probed_number_publishes_and_moves_no_value():
     banded = MachineSpec.from_mapping(_banded(saved(merge(three_origins()).document)))
     refuse_unbanded(banded)
     for label in labels(plain):
-        if label != ENTRY:
-            assert banded.value(label) == plain.value(label), label
-    assert banded.tokenizers == plain.tokenizers
+        assert banded.value(label) == plain.value(label), label
     assert machine_spec_digest(banded) == machine_spec_digest(plain)
-    rate = banded.origin("host.ipc.zmq_roundtrip_s")
-    assert (rate["p10"], rate["p90"]) == (2.5e-5, 1.0e-4)
+    rate = banded.origin(BANDWIDTH)
+    assert (rate["p10"], rate["p90"]) == (4.0e12, 1.6e13)
 
 
 def test_a_saved_band_survives_a_second_merge():
@@ -88,30 +72,6 @@ def test_a_saved_band_survives_a_second_merge():
     spec = MachineSpec.from_mapping(saved(again.document))
     refuse_unbanded(spec)
     assert spec.origin("device.compute.fp8_flops")["p90"] == 1.0e16
-
-
-def test_a_tokenizer_entry_states_a_band_for_every_rate(tmp_path):
-    def swept(band):
-        return tokenizer_fragment(
-            [TOKENIZER],
-            machine="mi355x-8gpu-2node",
-            authored_by="ana",
-            date="2026-10-18",
-            origin="probed",
-            processors=published_topology(tmp_path, cores_physical=96),
-            band=band,
-        )
-
-    whole = {"p10": {r: TOKENIZER[r] for r in RATES}}
-    whole["p90"] = dict(whole["p10"])
-    document = saved(merge([swept(whole), *three_origins()]).document)
-    assert MachineSpec.from_mapping(document).origin(ENTRY)["p90"] == whole["p90"]
-    short = {end: dict(list(rates.items())[:3]) for end, rates in whole.items()}
-    document = _banded(document)
-    document["provenance"]["origins"][ENTRY] |= short
-    with pytest.raises(SpecRefusal) as refused:
-        refuse_unbanded(MachineSpec.from_mapping(document))
-    assert refused.value.what.startswith(f"`{ENTRY}` probed")
 
 
 @pytest.mark.parametrize(
@@ -126,7 +86,7 @@ def test_a_tokenizer_entry_states_a_band_for_every_rate(tmp_path):
 )
 def test_a_band_is_two_ends_the_low_one_first(band):
     document = saved(merge(three_origins()).document)
-    document["provenance"]["origins"]["host.ipc.zmq_roundtrip_s"] |= band
+    document["provenance"]["origins"][BANDWIDTH] |= band
     with pytest.raises(SpecRefusal, match="a band, a `p10` at most its `p90`"):
         MachineSpec.from_mapping(document)
 

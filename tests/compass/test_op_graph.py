@@ -17,6 +17,14 @@ carrying why.
 
 import copy
 import json
+import os
+import pathlib
+import re
+import signal
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -24,7 +32,7 @@ import pytest
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_backend_step_linear import _installed, law, view
 from test_backend_step_roofline import COMPUTE, MEMORY, ROOFLINE, _spec
-from test_capture_ir import CONFIG, WIDTH_2, _ops, capture
+from test_capture_ir import CONFIG, TREE, WIDTH_2, _ops, capture
 from test_memory_readings import DOCUMENT, WORKER
 from test_op_graph_arch import ENGINE
 from test_op_work import leaf, t
@@ -1323,6 +1331,12 @@ def _counts() -> dict:
     return {"lazy_traces": 0, "lazy_trace_wall_seconds": 0}
 
 
+def in_thread(monkeypatch):
+    """A lookup's lazy traces run in a thread of this process, not a process
+    of their own, so what a test patches reaches them."""
+    monkeypatch.setattr(compass_run, "_trace_process", lambda: ThreadPoolExecutor(1))
+
+
 def test_a_shape_no_graph_holds_is_traced_in_the_run_as_trace_ops_traces_it(
     tmp_path_factory, tmp_path
 ):
@@ -1381,6 +1395,174 @@ def test_a_lazy_trace_reads_atom_s_arguments_in_either_spelling_as_its_server_do
     assert lazy["lazy_traces"] == 1
 
 
+#: DeepSeek-V4-Pro's DPA-TP8 steps whose KV pools differ, in the order a run
+#: meets them: a decode's the fewest blocks a capture allocates
+#: (`forward.KV_BLOCKS`), a prefill of one-token rows a block a row.
+POOLS = (("decode", 2, 2), ("prefill", 100, 100), ("prefill", 80, 80))
+
+
+def _run_config(structure: str, model) -> SimpleNamespace:
+    """An eager run's config of the model directory `model` that
+    `forward.structure` keys as `structure` keys it."""
+    from atom.compass.capture.forward import _engine
+
+    head, engine, _ = _engine(structure)
+    fixed = ("quantization", "tensor_parallel_size", "data_parallel_size", "env")
+    return SimpleNamespace(
+        model=str(model),
+        hf_config=SimpleNamespace(architectures=[head.split()[0]]),
+        tensor_parallel_size=engine["tensor_parallel_size"],
+        parallel_config=SimpleNamespace(
+            data_parallel_size=engine["data_parallel_size"]
+        ),
+        quant_config=SimpleNamespace(compute_hash=lambda: engine["quantization"]),
+        enforce_eager=True,
+        **{k: v for k, v in engine.items() if k not in fixed},
+    )
+
+
+def _spawned(monkeypatch) -> list:
+    """The lazy-trace processes the test's lookups spawn, as they spawn them."""
+    spawned, spawn = [], compass_run._trace_process
+    monkeypatch.setattr(
+        compass_run, "_trace_process", lambda: spawned.append(spawn()) or spawned[-1]
+    )
+    return spawned
+
+
+def _tracers() -> tuple[int, int]:
+    """In a lookup's lazy-trace process: the tracers it made, and the traces
+    that took one made before them."""
+    made = compass_run._tracer.cache_info()
+    return made.misses, made.hits
+
+
+def test_a_run_s_lazy_traces_share_one_process_and_trace_as_a_process_each(
+    tmp_path_factory, tmp_path, monkeypatch
+):
+    from test_capture_v4_pro import DPA_TP8, trace
+
+    from atom.compass.artifacts import ArtifactStore, Kind, Topology
+    from atom.compass.capture.forward import Shape
+
+    # Each shape alone in a `trace ops` of its own, a prefill as one forward.
+    alone, rank = {}, Topology().ranks()[0]
+    for phase, tokens, seqs in POOLS:
+        root = tmp_path_factory.mktemp("alone")
+        at = f"--width {seqs}" if phase == "decode" else f"--prefill {tokens} {seqs}"
+        done = trace(root, f"{at} --whole{DPA_TP8}")
+        published = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
+        assert published, done.stderr[-4000:]
+        store = ArtifactStore(str(root / "store"))
+        for token in published:
+            entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
+            graph = json.loads(entry.read_member("graph", rank, "json"))
+            output = not graph["structure"].endswith("no output")
+            alone[graph["shape"], output] = graph["region"]
+    config = _run_config(graph["structure"], root / "model")
+    args = ["--model", config.model, "-tp", "8", *DPA_TP8.split()[1:]]
+    spawned, lazy = _spawned(monkeypatch), _counts()
+    lookup = _op_graphs(str(tmp_path), config, "gfx950", args, lazy)
+    warm = {}
+    for phase, tokens, seqs in POOLS:
+        for output in (False, True) if phase == "prefill" else (True,):
+            warm[str(Shape(phase, tokens, seqs)), output] = lookup(
+                phase, tokens, seqs, output
+            )
+
+    # Byte for byte the graphs a process each traces, each pool its own.
+    assert warm.keys() == alone.keys() and len(alone) == 5
+    same = {at: json.dumps(warm[at]) == json.dumps(r) for at, r in alone.items()}
+    assert all(same.values()), same
+    # One process traced the three, its tracer made at the first and kept.
+    made = spawned[0].submit(_tracers).result()
+    assert (len(spawned), lazy["lazy_traces"], made) == (1, 3, (1, 2))
+
+
+def _held(atom_args) -> list[tuple[int, int, int]]:
+    """In a lookup's lazy-trace process: what its tracer of the 27B under
+    `atom_args` holds after each of three more traces, of a decode B=2, a B=3
+    and a B=2 again: its storage roles, the leaves it replayed and the fake
+    mode's cached outputs."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from atom.compass.capture.forward import decode
+    from atom.compass.drive.runfile import _engine_args, engine_only
+
+    model, kept = _engine_args(atom_args).model, tuple(engine_only(atom_args))
+    _, tracer = compass_run._tracer(model, 1, kept, "gfx942")
+    held = []
+    for shape in (decode(2), decode(3), decode(2)):
+        for _ in tracer.trace([shape], [shape]):
+            pass
+        recorder = tracer.recorder
+        held.append(
+            (len(recorder.roles), len(recorder.replayed), len(FakeTensorMode.cache))
+        )
+    return held
+
+
+def test_a_warm_tracer_holds_one_trace_s_worth_whatever_it_traced_before(
+    tmp_path_factory, tmp_path, monkeypatch
+):
+    spawned = _spawned(monkeypatch)
+    lookup, _ = _lazily(tmp_path_factory, tmp_path)
+    assert isinstance(lookup("decode", 2, 2), dict)
+    model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
+
+    # A trace keeps nothing of the one before it but the runner: the second
+    # decode B=2 holds the roles and replays the first did, and a fake-mode
+    # cache kept across traces could only have grown past the B=3's.
+    held = spawned[0].submit(_held, ["--model", str(model)]).result()
+    assert held[0][:2] == held[2][:2] and held[2][2] < held[1][2], held
+
+
+def _alive(pid: int) -> bool:
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def test_a_run_s_trace_process_ends_with_the_process_that_spawned_it(tmp_path):
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_bytes(CONFIG.read_bytes())
+    # Its process traces a shape, which builds the 27B's runner there, then the
+    # spawner is killed outright: it runs no exit of its own. Its output goes
+    # to a file, which a process that outlives it cannot hold open.
+    spawner = (
+        "import os, signal, sys; from atom.compass import run; "
+        "from atom.compass.capture.forward import decode; "
+        "tracing = run._trace_process(); "
+        "args = sys.argv[2], ['--model', sys.argv[3]], 'gfx942', decode(2); "
+        "tracing.submit(run._trace, *args).result(); "
+        "pid = tracing.submit(os.getpid).result(); "
+        "open(sys.argv[1], 'w').write(str(pid)); os.kill(os.getpid(), signal.SIGKILL)"
+    )
+    paths = [tmp_path / name for name in ("pid", "store", "model")]
+    with open(tmp_path / "log", "w") as log:
+        subprocess.run(
+            [sys.executable, "-c", spawner, *map(str, paths)],
+            stdout=log,
+            stderr=log,
+            check=False,  # it ends killed
+            timeout=300,
+            cwd=TREE,
+            env={**os.environ, "PYTHONPATH": str(TREE)},
+        )
+    assert (tmp_path / "pid").exists(), (tmp_path / "log").read_text()[-4000:]
+    pid = int((tmp_path / "pid").read_text())
+    try:
+        deadline = time.monotonic() + 60
+        while _alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not _alive(pid)
+    finally:
+        if _alive(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
 def test_a_lazy_trace_that_fails_ends_the_run_naming_the_shape(tmp_path):
     (tmp_path / "model").mkdir()  # holds no config.json, so no capture builds it
     (tmp_path / "read").mkdir()
@@ -1410,7 +1592,6 @@ def test_a_dirty_tree_s_lazy_trace_answers_its_run_and_publishes_nothing(
     from test_artifact_store import AITER_ROOT, ATOM_ROOT
 
     from atom.compass import artifacts
-    from atom.compass.bench import ops
     from atom.compass.capture import forward
     from atom.compass.capture.graph import Traced, to_json
     from atom.compass.ir import Graph, Op
@@ -1429,15 +1610,16 @@ def test_a_dirty_tree_s_lazy_trace_answers_its_run_and_publishes_nothing(
     at = forward.structure(config, "decode", True, "gfx942", True, False)
     traced = []
 
-    def capture(model, tp, shapes, *_, **__):
+    def trace(shapes, unsplit):
         leaf = Op("aiter.leaf", "opaque_leaf", (("n", 2),), ())
         traced.append(Graph(Traced(at, str(shapes[0])), leaf))
-        return [(traced[-1], model, {"arch": "gfx942"})]
+        return [(traced[-1], config.model, {"arch": "gfx942"})]
 
     dirty = (replace(ATOM_ROOT, dirty=3), AITER_ROOT)
     monkeypatch.setattr(artifacts, "roots_for", lambda modules: dirty)
-    monkeypatch.setattr(forward, "capture", capture)
-    monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
+    tracer = SimpleNamespace(trace=trace)
+    monkeypatch.setattr(compass_run, "_tracer", lambda *args: (None, tracer))
+    in_thread(monkeypatch)
     lazy, store = _counts(), tmp_path / "store"
     lookup = _op_graphs(str(store), config, "gfx942", ["--model", config.model], lazy)
 
@@ -1459,7 +1641,7 @@ def test_a_run_file_op_graph_traces_from_the_server_s_arguments(monkeypatch, tmp
 
 
 def test_the_run_summary_totals_each_engine_s_lazy_traces(monkeypatch, tmp_path):
-    run = {"admission_path": "serving", "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+    run = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
     run.update(bound_s=100.0, client_runs=None, out_dir=str(tmp_path))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     authority = compass_run._RecordingAuthority(run)

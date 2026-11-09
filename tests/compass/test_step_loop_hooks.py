@@ -41,7 +41,7 @@ with stubbed_aiter():
     from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
 INF = float("inf")
-TABLE = single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002)
+TABLE = single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002)
 STEP_S = 0.01
 STEPS = 3  # steps per request
 #: 64 requests, Poisson at 8 per second: the schedule the arrival barrier spun on.

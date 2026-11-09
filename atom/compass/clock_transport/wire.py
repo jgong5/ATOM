@@ -13,7 +13,12 @@ A message is a tuple, one of these shapes:
   previous request, and `t_daemon` an NER's daemon deadline, ``+inf`` for none;
   ``(kind, t, log, t_daemon, steps, ahead)`` also carries the steps the
   requester took below its last grant's ceiling, ``[(kind, t, G, n)]``, and
-  whether an NER asks for its messages ahead (`ClockAuthority.on_request`);
+  whether an NER asks for its messages ahead, and
+  ``(kind, t, log, t_daemon, steps, ahead, rounds)`` the later TAR rounds a
+  member asks in the same call (`ClockAuthority.on_request`);
+* ``("REPORT", t, log, t_daemon, steps, ahead)`` -- a member's steps through
+  the rounds granted ahead of it, which reach `t`, with its send log; it gets
+  no reply;
 * ``("GRANT", G, released)`` -- the reply, `released` being
   ``{channel: [(seq, arrival)]}`` and, when it has one, its ``ceiling``
   (`Released`); ``("GRANT", G, released, k)`` also marks the end of client
@@ -35,6 +40,7 @@ import math
 from atom.compass.clock import (
     NER,
     PARK,
+    REPORT,
     TAR,
     BackdatedEvent,
     ClockAbort,
@@ -44,7 +50,7 @@ from atom.compass.clock import (
 )
 
 BIND, JOINED, GRANT, REFUSED = "BIND", "JOINED", "GRANT", "REFUSED"
-REQUESTS = (TAR, NER, PARK)
+REQUESTS = (TAR, NER, PARK, REPORT)
 UNBOUNDED = {math.inf: "+inf", -math.inf: "-inf"}
 BOUNDS = {name: value for value, name in UNBOUNDED.items()}
 #: What a refusal can raise at the requester, most specific first.
@@ -128,7 +134,7 @@ def _row_in(fields: list) -> LpRow:
     )
 
 
-def _request_out(kind, t, log, t_daemon, steps=(), ahead=False) -> dict:
+def _request_out(kind, t, log, t_daemon, steps=(), ahead=False, rounds=()) -> dict:
     body = {
         "kind": kind,
         "t": _out(t),
@@ -139,6 +145,8 @@ def _request_out(kind, t, log, t_daemon, steps=(), ahead=False) -> dict:
         body["steps"] = [[k, _out(s), _out(g), n] for k, s, g, n in steps]
     if ahead:
         body["ahead"] = True
+    if rounds:
+        body["rounds"] = [_out(r) for r in rounds]
     return body
 
 
@@ -149,10 +157,13 @@ def _request_in(body) -> tuple:
         [_entry(*e) for e in body["log"]],
         _in(body["t_daemon"]),
     )
-    if "steps" not in body and "ahead" not in body:
+    if not {"steps", "ahead", "rounds"} & body.keys():
         return request
     steps = [_step(*s) for s in body.get("steps", ())]
-    return (*request, steps, body.get("ahead") is True)
+    request += (steps, body.get("ahead") is True)
+    if "rounds" not in body:
+        return request
+    return (*request, [_in(r) for r in body["rounds"]])
 
 
 def _step(kind, t, g, n) -> tuple[str, float, float, int]:

@@ -9,7 +9,7 @@ it sits. The stated version is read first, so a document written to a later
 schema is told this reader is old rather than that its new field is unknown.
 
 **A field has one value, however it is spelled.** A dotted key resolves to the
-nested path, so `host.cpu.cores_physical` may be written flat or nested;
+nested path, so `device.memory.capacity_bytes` may be written flat or nested;
 writing it both ways is refused, because the nested echo could not equal the
 document.
 
@@ -29,15 +29,6 @@ from typing import Any
 
 from .fields import BLOCKS, BY_PATH, SCHEMA, SCHEMA_VERSION, Field, Kind, check
 from .rules import Rule, SpecRefusal, refuse_unknown_key
-from .tokenizers import Backend, TokenizerEntry, TokenizerTable, table
-
-#: The tokenizer table, combined and given an origin per entry.
-TOKENIZERS = "host.tokenizers"
-
-
-def entry_label(identity: str, backend: object) -> str:
-    """How one tokenizer entry is named, by the two fields that select it."""
-    return f"{TOKENIZERS}[{identity} {backend}]"
 
 
 def field_origin(values: Mapping[str, Any], label: str, holder: str) -> dict:
@@ -179,7 +170,6 @@ class MachineSpec:
     """One machine, as a document checked against the schema."""
 
     values: Mapping[str, Any]
-    tokenizers: TokenizerTable
 
     @classmethod
     def from_mapping(cls, document: object) -> "MachineSpec":
@@ -199,7 +189,7 @@ class MachineSpec:
                 values[field.path] = check(field, found[field.path], field.path)
         check_subject(values, "this spec")
         _check_domain(values)
-        return cls(values, table(values[TOKENIZERS]))
+        return cls(values)
 
     def value(self, path: str) -> Any:
         """One checked field by its dotted path, or a refusal."""
@@ -216,13 +206,8 @@ class MachineSpec:
 
     def origin(self, path: str) -> dict:
         """Where one field came from: its origin and, when probed, the subject
-        the probe ran on. A tokenizer entry is asked by its label,
-        `host.tokenizers[<id> <backend>]`."""
-        labels = [
-            entry_label(e.key.id, e.key.backend.value) for e in self.tokenizers.entries
-        ]
-        if path not in labels:
-            self.value(path)
+        the probe ran on."""
+        self.value(path)
         return field_origin(self.values, path, "this spec")
 
     def echo(self) -> dict:
@@ -243,9 +228,3 @@ class MachineSpec:
         """A fingerprint of the echo, so an artifact can name the spec it used."""
         canonical = json.dumps(self.echo(), sort_keys=True, separators=(",", ":"))
         return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
-
-    def tokenizer_for(
-        self, architecture: str, backend: Backend, fingerprint: str | None = None
-    ) -> TokenizerEntry:
-        """The probed tokenizer for a model architecture, or a refusal."""
-        return self.tokenizers.resolve(architecture, backend, fingerprint)

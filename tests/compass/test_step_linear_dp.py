@@ -98,7 +98,7 @@ def _groups(seed, n=300):
 def _records(tmp_path, groups):
     """Rank `r`'s record, its labels stretched by `1 + 0.01 r`."""
     paths = []
-    for r in range(DP):
+    for r in range(len(groups[0][0])):
         steps = [
             (
                 [
@@ -155,16 +155,58 @@ def test_a_law_stating_key_refuses_by_name():
         StepLinearLaw(dict(law(), key=[8, 1]))
 
 
-@pytest.mark.parametrize("cap, decode", [(20, 4), (4, 4), (3, None)])
-def test_the_fit_records_whether_the_alternation_settled(
-    tmp_path, monkeypatch, cap, decode
+@pytest.mark.parametrize("cap", [20, 7, 6])
+def test_the_fit_records_its_passes_and_a_cap_reached_refuses_it(
+    tmp_path, monkeypatch, cap
 ):
+    """Rung 4 settles in 4 passes from every rank's row, the start that goes
+    on; a start from a feature's axis takes 7, and its cap refuses the fit."""
     from atom.compass.backends import step_linear_fit
 
-    monkeypatch.setattr(step_linear_fit, "MAD_PASSES", cap)
-    law_ = _fit(_records(tmp_path, _groups(0)), dp=DP)
-    assert law_["prefill"]["fit"]["passes"] == 1
-    assert law_["decode"]["4"]["fit"]["passes"] == decode
+    monkeypatch.setattr(step_linear_fit, "FIT_PASSES", cap)
+    records = _records(tmp_path, _groups(0))
+    if cap < 7:
+        with pytest.raises(ValueError, match="still moved after 6 passes"):
+            _fit(records, dp=DP)
+        return
+    law_ = _fit(records, dp=DP)
+    assert law_["prefill"]["fit"]["passes"]["count"] == 1
+    passes = law_["decode"]["4"]["fit"]["passes"]
+    assert (passes["start"], passes["count"], passes["stop"]) == (
+        "all_rows",
+        4,
+        "settled",
+    )
+    assert passes["F"] == pytest.approx(0.0, abs=1e-20)
+
+
+#: Two ranks' (context, graph_padding) in units of 800 tokens, six steps
+#: labelled by `DECODE`, on which the alternation from the fit on every rank's
+#: row settles with `context` near zero.
+CORNER = (
+    ((2, 3), (9, 5)),
+    ((9, 4), (8, 3)),
+    ((8, 9), (1, 2)),
+    ((9, 1), (1, 3)),
+    ((8, 4), (8, 4)),
+    ((1, 1), (8, 3)),
+)
+
+
+def test_a_fit_that_settles_from_every_rank_s_row_above_a_feature_s_start_goes_on_from_that_start(
+    tmp_path,
+):
+    """From the fit on every rank's row the alternation settles at `F` above
+    zero; from the `context` axis it reaches the per-rank law."""
+    groups = []
+    for ranks in CORNER:
+        views = [_decode_step(8, 800 * c, 800 * p) for c, p in ranks]
+        groups.append((views, max(_price(v) for v in views)))
+
+    vector = _fit(_records(tmp_path, groups), dp=2)["decode"]["8"]
+    assert vector["coefficients"] == pytest.approx(DECODE, rel=1e-6)
+    assert vector["fit"]["passes"]["start"] == "context"
+    assert vector["fit"]["passes"]["F"] == pytest.approx(0.0, abs=1e-20)
 
 
 #: A rank's wide rows and another's one tall row cost about the same.
@@ -220,27 +262,79 @@ def test_a_routed_rung_hulls_each_step_at_the_rank_it_prices(tmp_path):
     assert outside == []
 
 
-@pytest.mark.parametrize(
-    "cap, passes, rel", [(20, 3, 1e-6), (3, 3, 1e-6), (2, None, 1e-3)]
-)
-def test_a_routed_rung_alternates_again_under_its_column(
-    tmp_path, monkeypatch, cap, passes, rel
-):
+@pytest.mark.parametrize("cap", [20, 9, 8])
+def test_a_routed_rung_is_fitted_again_under_its_column(tmp_path, monkeypatch, cap):
     """The experts column moves some steps' costliest rank off the row the
-    alternation took on the rung's features alone, so the rung alternates
-    again under it, its passes the solves under the column. Once no step
-    moves, it is solved on the rows it prices: the per-rank law. At the cap
-    it ships its last solve, nearer that law than its first."""
+    rung's features alone pick, so the rung is fitted again under it, from
+    every rank's row. Once no step moves, it is solved on the rows it
+    prices: the per-rank law. A cap reached refuses the fit."""
     from atom.compass.backends import step_linear_fit
 
-    monkeypatch.setattr(step_linear_fit, "MAD_PASSES", cap)
+    monkeypatch.setattr(step_linear_fit, "FIT_PASSES", cap)
     full = _wide_or_tall(2, routed.FULL, (110_000, 130_000))
     sparse = _wide_or_tall(3, routed.SPARSE, (80_000, 100_000))
     records = routed._records(tmp_path / "full", full)
     records += routed._records(tmp_path / "sparse", sparse)
+    if cap < 9:
+        with pytest.raises(ValueError, match="still moved after 8 passes"):
+            routed._routed(records)
+        return
     vector = routed._routed(records)[0]["decode"][str(routed.RUNG)]
-    assert vector["fit"]["passes"] == passes
-    assert vector["coefficients"] == pytest.approx(WIDE_OR_TALL, rel=rel)
+    passes = vector["fit"]["passes"]
+    assert (passes["count"], passes["stop"]) == (9, "settled")
+    assert vector["coefficients"] == pytest.approx(WIDE_OR_TALL, rel=1e-6)
+
+
+#: Two ranks' (context, graph_padding) in thousands of tokens and the group's
+#: step in centiseconds, six steps on which the alternation by full refits
+#: cycles between two states that differ at the last step's rank.
+CYCLE = (
+    ((3, 4), (1, 2), 3.68),
+    ((3, 5), (1, 5), 3.9),
+    ((6, 5), (1, 5), 4.79),
+    ((1, 5), (1, 5), 3.36),
+    ((2, 1), (8, 2), 4.81),
+    ((7, 1), (5, 4), 4.22),
+)
+
+
+def test_an_alternation_that_cycles_on_full_refits_ends_at_a_tie_below_both(
+    tmp_path,
+):
+    """Solved on the rows one state picks, each state's vector picks the
+    other's. The fit's line search ends between them where the last step's
+    two ranks price alike, `F` below either state."""
+    from scipy.optimize import nnls
+
+    groups = [
+        ([_decode_step(8, 800 * c, 800 * p) for c, p in ranks], y / 100)
+        for *ranks, y in CYCLE
+    ]
+    x = np.array([[(1, 800 * c, 800 * p) for c, p in ranks] for *ranks, _ in CYCLE])
+    y = np.array([g[1] for g in groups])
+
+    def state(pick):
+        coef = nnls(x[np.arange(len(y)), pick] / y[:, None], np.ones(len(y)))[0]
+        return coef, tuple(np.argmax(x @ coef, axis=1))
+
+    def cost(coef):
+        return float((((x @ coef).max(axis=1) / y - 1) ** 2).sum())
+
+    a, b = (0, 0, 0, 0, 1, 0), (0, 0, 0, 0, 1, 1)
+    (coef_a, after_a), (coef_b, after_b) = state(a), state(b)
+    assert (after_a, after_b) == (b, a)
+
+    law_ = _fit(_records(tmp_path, groups), dp=2)
+    passes = law_["decode"]["8"]["fit"]["passes"]
+    assert passes["stop"] == "tie"
+    assert passes["F"] < min(cost(coef_a), cost(coef_b))
+    backend = StepLinearBackend(StepLinearLaw(law_), 2)
+    last = [backend.price(v).seconds for v in groups[-1][0]]
+    assert last[0] == pytest.approx(last[1], rel=1e-6)
+    for views, _ in groups:
+        costs = [backend.price(v) for v in views]
+        top = max(costs, key=lambda c: c.seconds)
+        assert not any(t.provenance.extrapolated for t in top.terms)
 
 
 def _alike(seed, n=300):
@@ -372,6 +466,7 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
         r = deployment(
             tmp_path,
             **{k: engine[k] for k in ("kv_cache_block_size", "kv_cache_dtype")},
+            index_cache_dtype=engine.get("index_cache_dtype"),
             quant_config=SimpleNamespace(compute_hash=lambda: engine["quantization"]),
             parallel_config=SimpleNamespace(
                 data_parallel_size=8, data_parallel_rank=0, pipeline_parallel_rank=0

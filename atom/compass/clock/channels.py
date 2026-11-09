@@ -30,20 +30,6 @@ class ReceiveMode(StrEnum):
     INLINE = "inline"
 
 
-#: Measured admission delay from the traffic source into the serving stack, per
-#: path, in seconds; a run charges tokenization on top. ``serving`` is the HTTP
-#: transport alone, measured on hjbog-srdc-18 by `scripts/compass/http_intake.py
-#: floor`: the median, over parity workload requests sent one at a time, of
-#: client send to the ASGI app call. The event loop's intake after that call is
-#: the machine spec's ``host.http_intake``, charged on top.
-#: ``offline_batch`` is from earlier work, which measured 13.7 ms end-to-end and
-#: found the two paths differ enough that one number would misprice one of them.
-ADMISSION_DELAY_S = {
-    "offline_batch": 13.0e-3,
-    "serving": 0.54e-3,
-}
-
-
 @dataclass(frozen=True, slots=True)
 class Channel:
     """One declared channel. Frozen: the accessors hand it out."""
@@ -270,7 +256,7 @@ def _rapidserve(ipc_s: float, out_s: float) -> tuple[tuple[str, ...], list]:
 
 def single_engine_table(
     *,
-    admission_path: str,
+    admission_s: float,
     ipc_s: float,
     stream_s: float,
     ipc_out_s: float | None = None,
@@ -284,10 +270,10 @@ def single_engine_table(
     LP per stage instead (`_pipeline`), and under `rapidserve` its prefill and
     decode engine LPs (`_rapidserve`).
 
-    The request channel's lookahead is the measured admission delay of
-    `admission_path` (``serving`` or ``offline_batch``). The caller declares
-    the others: `ipc_s` for each ZMQ message, but an engine's output to the
-    frontend, which takes `ipc_out_s` (`ipc_s` when None).
+    The caller declares every lookahead: `admission_s` for the traffic's HTTP
+    request, `stream_s` for the stream back, `ipc_s` for each ZMQ message, but
+    an engine's output to the frontend, which takes `ipc_out_s` (`ipc_s` when
+    None).
     """
     out_s = ipc_s if ipc_out_s is None else ipc_out_s
     engines = ("engine",)
@@ -299,13 +285,7 @@ def single_engine_table(
     return _table(
         ("traffic", "frontend", *engines),
         [
-            (
-                "traffic",
-                "frontend",
-                "http",
-                ADMISSION_DELAY_S[admission_path],
-                "inline",
-            ),
+            ("traffic", "frontend", "http", admission_s, "inline"),
             ("frontend", "traffic", "stream", stream_s, "inline"),
         ]
         + rows,
@@ -345,12 +325,13 @@ def add_lmcache(
 
 def prefill_decode_table(
     *,
-    admission_path: str,
+    admission_s: float,
     ipc_s: float,
     stream_s: float,
     router_s: float,
     kv_write_req_s: float,
     ipc_out_s: float | None = None,
+    decode_ipc: tuple[float, float] | None = None,
     dp: int | tuple[int, int] = 1,
     router_in_s: float | None = None,
     prefill: int = 1,
@@ -383,10 +364,15 @@ def prefill_decode_table(
 
     Above `prefill_pp` one, each prefill deployment ``P`` is the pipeline
     ``engine-P-pp<k>`` (`_pipeline`, with `pp_links`), and decode writes to its
-    head, ``engine-P-pp0``. A pipeline runs at DP width one. An engine's
-    output to its frontend takes `ipc_out_s` (`ipc_s` when None).
+    head, ``engine-P-pp0``. A pipeline runs at DP width one.
+
+    A prefill deployment's ZMQ messages each take `ipc_s`, but an engine's
+    output to its frontend, which takes `ipc_out_s` (`ipc_s` when None); a
+    decode deployment's take `decode_ipc`, decode's ``(ipc_s, ipc_out_s)``,
+    the prefill side's when None.
     """
     out_s = ipc_s if ipc_out_s is None else ipc_out_s
+    ipc = {"P": (ipc_s, out_s), "D": decode_ipc or (ipc_s, out_s)}
     dp_p, dp_d = (dp, dp) if isinstance(dp, int) else dp
     if prefill_pp > 1 and dp_p > 1:
         raise ValueError(
@@ -400,15 +386,7 @@ def prefill_decode_table(
         )
     ps = [f"P{k}" if prefill > 1 else "P" for k in range(prefill)]
     ds = [f"D{k}" if decode > 1 else "D" for k in range(decode)]
-    paths = [
-        (
-            "traffic",
-            f"frontend-{p}",
-            "http",
-            ADMISSION_DELAY_S[admission_path] + router_s,
-        )
-        for p in ps
-    ]
+    paths = [("traffic", f"frontend-{p}", "http", admission_s + router_s) for p in ps]
     paths += [(f"frontend-{d}", "traffic", "stream", stream_s + router_s) for d in ds]
     paths += [
         (f"frontend-{p}", f"frontend-{d}", "relay", router_s) for p in ps for d in ds
@@ -418,12 +396,12 @@ def prefill_decode_table(
     for s in ps + ds:
         if s in ps and prefill_pp > 1:
             engines[s], more = _pipeline(
-                prefill_pp, ipc_s, out_s, pp_links, f"engine-{s}", f"frontend-{s}"
+                prefill_pp, *ipc["P"], pp_links, f"engine-{s}", f"frontend-{s}"
             )
         else:
             width = dp_p if s in ps else dp_d
             engines[s] = (f"engine-{s}",)
-            more = _frontend_engine(f"frontend-{s}", f"engine-{s}", ipc_s, out_s, width)
+            more = _frontend_engine(f"frontend-{s}", f"engine-{s}", *ipc[s[0]], width)
         rows += more
     lps = ("traffic", *(lp for s in ps + ds for lp in (f"frontend-{s}", *engines[s])))
     if router_in_s is None:
