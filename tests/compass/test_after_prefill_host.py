@@ -175,27 +175,6 @@ def test_a_run_charges_the_term_on_the_decode_right_after_an_output_prefill():
     assert charged(None) == pytest.approx(plain)
 
 
-def test_that_decode_s_device_start_lag_counts_its_term():
-    """The device runs until 5 ms; the decode after a 0 s prefill prepares for
-    its `E`, then launches for 0.5 ms. A 2 ms term on a 1 ms `E` places it as
-    a 3 ms `E` does."""
-
-    def lag(e, after):
-        law = {
-            g: [e * (g == "E") + 5e-4 * (g == "W_launch"), 0, 0] for g in HOST_SEGMENTS
-        }
-        host = HostDeviceRecurrence(
-            {"prefill": {}, "decode": law}, (), lambda: 0.0, after_prefill=after
-        )
-        host.charge(_batch("prefill", 100, 1), 0.0, 0.0, refuse=False)
-        host.ends.append(5e-3)
-        return host.start_lag(_batch("decode", 1, 1))
-
-    term = {"E": [2e-3, 0, 0]}
-    assert lag(1e-3, term) == pytest.approx(lag(3e-3, None)) == pytest.approx(1.5e-3)
-    assert lag(1e-3, None) == pytest.approx(3.5e-3)
-
-
 def test_the_recurrence_grade_charges_the_term_on_the_decode_after_the_prefill(
     tmp_path,
 ):

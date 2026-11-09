@@ -30,7 +30,7 @@ INF = float("inf")
 
 
 def _table():
-    return single_engine_table(admission_path="serving", ipc_s=IPC, stream_s=0.002)
+    return single_engine_table(admission_s=0.54e-3, ipc_s=IPC, stream_s=0.002)
 
 
 class FakeConn:
@@ -155,6 +155,73 @@ def test_sends_are_stamped_now_plus_lookahead_and_ride_the_next_request():
     ]
     with pytest.raises(ValueError, match="cannot advance to 0.1, it is at 0.7"):
         call(rt.advance_to, 0.1)
+
+
+def test_a_member_asks_its_rounds_to_its_pull_in_one_call_and_its_owed_in_one_more():
+    thread, call = _owner()
+    conn = FakeConn((0.3, {}), (0.5, {}))
+    conn.member = "dp0"
+    rt = LPRuntime(ENGINE, _table(), conn, owner=thread)
+    call(rt.stamp_send, OUT)
+    call(rt.advance_group, [0.2, 0.1, 0.4, 0.3, 0.5, 0.3], 0.3)
+    assert (rt.now, rt.owed) == (0.3, [0.4, 0.5])
+    call(rt.stamp_send, OUT)
+    call(rt.settle)
+    assert conn.sent == [
+        ("TAR", 0.1, [(OUT, 0, IPC)], INF, [], False, [0.2, 0.3]),
+        ("TAR", 0.4, [(OUT, 1, 0.3 + IPC)], INF, [], False, [0.5]),
+    ]
+    assert (rt.now, rt.owed, rt.calls) == (0.5, [], 1)
+    # An LP without members asks each round in a call of its own.
+    plain = FakeConn((0.1, {}), (0.2, {}), (0.3, {}))
+    rt = LPRuntime(ENGINE, _table(), plain, owner=thread)
+    call(rt.advance_group, [0.1, 0.2, 0.3], 0.3)
+    assert plain.sent == [("TAR", t, [], INF) for t in (0.1, 0.2, 0.3)]
+
+
+def _member(*replies):
+    """dp0's runtime of the engine, answered by `replies`."""
+    thread, call = _owner()
+    conn = FakeConn(*replies)
+    conn.member = "dp0"
+    return LPRuntime(ENGINE, _table(), conn, owner=thread), call
+
+
+def test_a_member_steps_through_its_owed_rounds_granted_ahead_and_asks_the_rest():
+    ahead = _under(0.45, {REQ: [(0, 0.25), (1, 0.4)]})
+    rt, call = _member((0.3, ahead), (0.5, {}))
+    seen = []
+    handler = _receiver(rt, REQ, 2, seen)
+    call(rt.stamp_send, OUT)
+    call(rt.advance_group, [0.1, 0.3, 0.4, 0.5], 0.3)
+    assert (rt.now, rt.owed, rt.released[REQ]) == (0.3, [0.4, 0.5], {0})
+    call(rt.stamp_send, OUT)
+    call(rt.settle)
+    # The message sent ahead is handled at its arrival, in the step reaching it.
+    assert seen == [(REQ, 0, 0.25), (REQ, 1, 0.4)]
+    assert rt.conn.sent == [
+        ("TAR", 0.1, [(OUT, 0, IPC)], INF, [], False, [0.3]),
+        ("TAR", 0.5, [(OUT, 1, 0.3 + IPC)], INF, [("TAR", 0.4, 0.4, 1)], False),
+    ]
+    assert (rt.now, rt.calls) == (0.5, 1)
+    assert rt.paid == {"rounds": 2, "ahead": 1, "reports": 0}
+    handler.join(5)
+    assert not handler.is_alive()
+
+
+def test_a_member_whose_owed_rounds_were_all_granted_ahead_reports_and_goes_on():
+    rt, call = _member((0.3, _under(0.6)))  # one reply: a second recv would fail
+    call(rt.advance_group, [0.3, 0.4, 0.5], 0.3)
+    call(rt.stamp_send, OUT)
+    call(rt.settle)
+    steps = [("TAR", 0.4, 0.4, 1), ("TAR", 0.5, 0.5, 1)]
+    assert rt.conn.sent[-1] == ("REPORT", 0.5, [(OUT, 0, 0.3 + IPC)], INF, steps, False)
+    assert (rt.now, rt.owed) == (0.5, [])
+    assert rt.paid == {"rounds": 2, "ahead": 2, "reports": 1}
+    # The ceiling answered only its owed rounds: the member's next is a call.
+    rt.conn.replies.append((0.55, {}))
+    call(rt.advance_to, 0.55)
+    assert rt.conn.sent[-1] == ("TAR", 0.55, [], INF) and rt.calls == 2
 
 
 def test_the_inf_grant_closes_the_clock_and_leaves_sends_stamped_inf():

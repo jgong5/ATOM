@@ -28,6 +28,15 @@ carried one, `next_event` asks the authority for every message below the next
 ceiling ahead of time; the owner releases each in the step that reaches it.
 `ask_next_event`, whose caller waits on the connection, always asks.
 
+A member of a DP group, its connection bound as one (``conn.member``), asks
+its group step's rounds up to its own return in one call, and the rounds it
+owes in one more (`advance_group`, `settle`); the call's one grant releases
+what each of its rounds released to it. When the grant it returns at carries
+a ceiling, the authority granted its owed rounds below it ahead and sent what
+they release with that grant: `settle` steps through them, releasing each
+message in the step that reaches it, and reports the steps with the call for
+the rounds left or, with none left, in a ``REPORT`` that waits for no reply.
+
 A grant names the messages it releases as ``{channel: [(seq, arrival)]}``.
 `_step_through` releases them one at a time in ``(arrival, channel, seq)``
 order, setting the LP clock to each arrival. On a ``thread`` channel it then
@@ -148,6 +157,7 @@ class LPRuntime:
         diag_s: float = DIAG_S,
     ) -> None:
         self.me, self.table, self.conn, self.diag_s = me, table, conn, diag_s
+        self.member = getattr(conn, "member", None)  # of a DP group's LP, or None
         self.owner = owner or threading.current_thread()
         self.lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
@@ -180,6 +190,11 @@ class LPRuntime:
         self.asked = False  # a next-event request is out, its grant not taken
         self.idle_calls = 0  # `calls` when the step loop last passed its idle point
         self.owed: list[float] = []  # DP group rounds left before (`advance_group`)
+        # A member's: its owed rounds below this were granted ahead of it.
+        self.owed_ceiling = -math.inf
+        # A member's owed rounds paid, those it stepped through on its own, and
+        # the reports that paid them all.
+        self.paid = {"rounds": 0, "ahead": 0, "reports": 0}
         self.parking = False  # a DP member between its state sync and its park
         # The frontend's event loop, once built: a frame a thread takes is a job on it.
         self.loop = None
@@ -231,33 +246,55 @@ class LPRuntime:
             self.send_log.append((ch, seq, arrival))
         return arrival, seq
 
-    def advance_to(self, T: float) -> None:
-        """Price an event: block until granted `T`, releasing what arrives up to it."""
+    def advance_to(self, T: float, *later: float) -> None:
+        """Price an event: block until granted `T`, releasing what arrives up
+        to it. A DP member asks the `later` rounds of its group step, each past
+        the one before, in the same call, and returns at the last one."""
         self._require_open("advance_to")
         if self.owed and T < self.owed[-1]:
             self._refuse(f"advance_to({T}) before the owed group round {self.owed[-1]}")
         self.settle()
         if T < self.now:
             raise ValueError(f"{self.me} cannot advance to {T}, it is at {self.now}")
-        if T < self.ceiling:
+        if T < self.ceiling:  # a member's stays -inf
             self._own_step("TAR", T, T)
         else:
-            self._grant(*self._ca_call("TAR", T))
+            self._grant(*self._ca_call("TAR", T, rounds=later))
 
     def advance_group(self, targets, mine: float) -> None:
-        """A DP group step: one TAR per distinct target, ascending, as every
-        member asks; this one returns at `mine` and owes the later rounds."""
+        """A DP group step: each distinct target is a round every member asks,
+        ascending; this one returns at `mine` and owes the later rounds. A
+        member asks its rounds up to `mine` in one call."""
         rounds = sorted(set(targets))
-        for t in rounds:
-            if t <= mine:
+        asked = [t for t in rounds if t <= mine]
+        if self.member is not None and asked:
+            self.advance_to(*asked)
+        else:
+            for t in asked:
                 self.advance_to(t)
         self.owed = [t for t in rounds if t > mine]
 
     def settle(self) -> None:
-        """Join the owed rounds; they end the owing step, so `idle` counts none."""
-        while self.owed:
-            self._grant(*self._ca_call("TAR", self.owed.pop(0)))
-            self.calls -= 1
+        """Pay the owed rounds: step through those granted ahead, below the
+        owed ceiling, and join the rest in one call that reports the steps, or
+        with none left report them without waiting. They end the owing step,
+        so `idle` counts none."""
+        if not self.owed:
+            return
+        owed, self.owed, calls = self.owed, [], self.calls
+        ahead = [t for t in owed if t < self.owed_ceiling]
+        self.owed_ceiling = -math.inf
+        for t in ahead:
+            self._own_step("TAR", t, t)
+        rest = owed[len(ahead) :]
+        if rest:
+            self._grant(*self._ca_call("TAR", rest[0], rounds=rest[1:]))
+        else:
+            self._ca_send("REPORT", self.now, math.inf)
+        self.calls = calls
+        self.paid["rounds"] += len(owed)
+        self.paid["ahead"] += len(ahead)
+        self.paid["reports"] += not rest
 
     def next_event(self, t: float, t_daemon: float = float("inf")) -> float:
         """Idle until `t`, the daemon deadline `t_daemon` or the earliest arrival,
@@ -340,23 +377,25 @@ class LPRuntime:
         if self.now == float("inf"):
             raise RuntimeError(f"{what} from {self.me} after the +inf grant")
 
-    def _ca_call(self, kind: str, t: float, t_daemon: float = float("inf")):
+    def _ca_call(self, kind: str, t: float, t_daemon: float = float("inf"), rounds=()):
         if self.parking:
             self._refuse(
                 f"{kind}({t}) between the DP state sync and the forward dispatch; "
                 "a member's park is its last clock call there"
             )
-        self._ca_send(kind, t, t_daemon)
+        self._ca_send(kind, t, t_daemon, rounds=rounds)
         return self.conn.recv()
 
     def _ca_send(
-        self, kind: str, t: float, t_daemon: float, ahead: bool = False
+        self, kind: str, t: float, t_daemon: float, ahead: bool = False, rounds=()
     ) -> None:
         with self.lock:
             log, self.send_log = self.send_log, []
         steps, self.steps = self.steps, []
         self.calls += 1
-        extra = (steps, ahead) if steps or ahead else ()
+        extra = (steps, ahead) if steps or ahead or rounds else ()
+        if rounds:
+            extra += (list(rounds),)
         self.conn.send((kind, t, log, t_daemon, *extra))
 
     def _own_step(self, kind: str, t: float, G: float) -> None:
@@ -377,7 +416,11 @@ class LPRuntime:
         """Take a grant: walk what it releases up to `G` and every message sent
         ahead before it, and keep its ceiling and the messages it sends ahead."""
         ceiling = getattr(released, "ceiling", None)
-        self.ceiling = -math.inf if ceiling is None else ceiling
+        below = -math.inf if ceiling is None else ceiling
+        if self.member is None:
+            self.ceiling = below
+        else:  # a member answers none of its own calls, only its owed rounds
+            self.owed_ceiling = below
         if ceiling is None and not self.ahead:
             self._step_through(G, released)
             return
@@ -391,7 +434,7 @@ class LPRuntime:
         self.ahead = sorted(
             (a, ch, s) for ch, msgs in released.items() for s, a in msgs if a > G
         )
-        self.asks_ahead |= ceiling is not None
+        self.asks_ahead |= ceiling is not None and self.member is None
         self._step_through(G, walk)
 
     def _step_through(self, G: float, released: dict) -> None:
@@ -467,11 +510,15 @@ class LPRuntime:
 
     def my_wakeup(self, channels=None) -> _Wakeup:
         """This thread's event, set whenever a message on one of `channels` is
-        released, or any message while `channels` is None."""
+        released, or any message while `channels` is None. No release sets the
+        clock owner's: the owner makes every release itself, so none comes while
+        it waits, as it waits before the run for the engines' first frames."""
         with self.lock:
             me = threading.current_thread()
             if me not in self.wakes:
                 self.wakes[me] = _Wakeup()
+            if me is self.owner:
+                channels = ()
             self.wakes[me].channels = None if channels is None else frozenset(channels)
             return self.wakes[me]
 
@@ -557,12 +604,10 @@ class WrappedSocket:
         return frames
 
     def pull(self) -> None:
-        """Read every frame already here, without blocking; check and buffer each."""
-        while True:
-            try:
-                hdr, payload = self.raw.recv_multipart(zmq.NOBLOCK, copy=False)
-            except zmq.Again:
-                return
+        """Read every frame already here, without blocking; check and buffer each.
+        The socket's events say when it is empty, so no read fails with `zmq.Again`."""
+        while self.raw.get(zmq.EVENTS) & zmq.POLLIN:
+            hdr, payload = self.raw.recv_multipart(zmq.NOBLOCK, copy=False)
             ch, arrival, seq = pickle.loads(hdr.bytes)
             if arrival is not None:
                 self.rt.check_arrival(ch, arrival, seq)
@@ -643,7 +688,7 @@ class WrappedPoller:
     """`zmq.Poller` for a receiving thread: the wait point where a frame counts as done.
 
     Channel sockets count as readable only with a released frame; any other socket
-    registered (a shutdown signal) is polled as it is.
+    registered (a shutdown signal) counts once `zmq_poll` has reported it.
     """
 
     def __init__(self, rt: LPRuntime, socks=()) -> None:
@@ -653,22 +698,36 @@ class WrappedPoller:
         self.socks.append(sock)
 
     def poll(self) -> list[tuple]:
-        self.rt.back_at_wait_point()
         wrapped = [s for s in self.socks if isinstance(s, WrappedSocket)]
         wake = self.rt.my_wakeup([ch for s in wrapped for ch in s.into])
         waits = [(getattr(s, "raw", s), zmq.POLLIN) for s in self.socks]
+        polled, back = [], True
         while True:
             wake.clear()
-            for s in wrapped:
-                s.pull()
+            try:
+                for s in wrapped:
+                    s.pull()
+            finally:
+                if back:
+                    # The frame taken before counts as handled only now, with
+                    # the wakeup cleared and the sockets read, so the owner it
+                    # lets go finds this thread about to block rather than
+                    # holding the GIL; and also when a read raises, as a
+                    # straggler's does, so the owner's drain fails the run.
+                    self.rt.back_at_wait_point()
+                    back = False
             ready = [
                 s
                 for s in self.socks
-                if (s.ready() if isinstance(s, WrappedSocket) else s.poll(0))
+                if (
+                    s.ready()
+                    if isinstance(s, WrappedSocket)
+                    else getattr(s, "raw", s) in polled
+                )
             ]
             if ready:
                 return [(s, zmq.POLLIN) for s in ready]
-            zmq.zmq_poll([*waits, (wake.fd, zmq.POLLIN)])
+            polled = [p for p, _ in zmq.zmq_poll([*waits, (wake.fd, zmq.POLLIN)])]
 
 
 class RelayQueue:

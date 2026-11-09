@@ -11,8 +11,7 @@ prompt.
 The runs need a driver, as in `test_vertical_slice`, and
 `ATOM_COMPASS_IMAGE_MODEL`, a multimodal model directory ATOM serves; its
 memory readings are measured first on the GPU ``HIP_VISIBLE_DEVICES`` names,
-under the machine spec `test_lmcache_mp_engine` reads, with an assumed entry
-for the model's tokenizer where that spec probed none and `PROBED` did.
+under the machine spec `test_lmcache_mp_engine` reads.
 """
 
 import contextlib
@@ -41,7 +40,6 @@ from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
 from atom.compass.detect.scenario import check_run
 from atom.compass.parity.traffic import bodies
-from atom.compass.spec.machine import entry_label
 from tests.compass.held_ports import held_ports
 
 MODEL = os.environ.get("ATOM_COMPASS_IMAGE_MODEL")
@@ -54,9 +52,6 @@ REQUESTS = 3
 IMAGE_S = 2.0**-5
 ARGS = ["--model", MODEL, "--enforce-eager", "--max-model-len", "2048"]
 ARGS += ["--no-enable_prefix_caching"]
-#: The spec whose tokenizer entry for the image model's architecture a run
-#: assumes where `MACHINE` probed none.
-PROBED = TREE / "scripts/compass/machines/mi308x-hjbog39.json"
 
 
 class Workload(Traffic):
@@ -75,24 +70,6 @@ class Workload(Traffic):
         while rt.next_event(math.inf) != math.inf:
             self._take()
         rt.close()
-
-
-def _machine(out: Path) -> Path:
-    """`MACHINE`, with `PROBED`'s tokenizer entries for the image model's
-    architecture, their origin assumed, where `MACHINE` probed none; where
-    neither spec names it, `MACHINE` as it is, for the server to refuse."""
-    machine = json.loads(MACHINE.read_text())
-    config = json.loads((Path(MODEL) / "config.json").read_text())
-    [architecture] = config["architectures"]
-    tokenizers = machine["host"]["tokenizers"]
-    if not any(architecture in t["applies_to"] for t in tokenizers):
-        probed = json.loads(PROBED.read_text())["host"]["tokenizers"]
-        for entry in [t for t in probed if architecture in t["applies_to"]]:
-            tokenizers.append(entry)
-            label = entry_label(entry["id"], entry["backend"])
-            machine["provenance"]["origins"][label] = {"origin": "assumed"}
-    (out / "machine.json").write_text(json.dumps(machine))
-    return out / "machine.json"
 
 
 def run_images(out: Path, seed: str, machine: Path) -> dict:
@@ -160,7 +137,7 @@ def runs(tmp_path_factory):
     from atom.compass import cli
 
     root = tmp_path_factory.mktemp("images")
-    machine = _machine(root)
+    machine = MACHINE
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("AITER_LOG_LEVEL", "WARNING")  # the readings are keyed by it
         cli.main(

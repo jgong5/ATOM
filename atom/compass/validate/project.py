@@ -61,7 +61,6 @@ PROG = "compass project"
 #: What a projected device takes from the probed one as it stands, no
 #: datasheet stating it.
 CARRIED = (
-    "host.",
     "device.kernel_floor_s",
     "device.software_pinned_to.",
     "interconnect.intra_node.link_latency_s",
@@ -100,7 +99,7 @@ def projected(target: MachineSpec, source: MachineSpec) -> MachineSpec:
         },
     }
     values["name"] = f"{target.values['name']} at {source.values['name']} ratios"
-    echo = MachineSpec(values, source.tokenizers).echo()
+    echo = MachineSpec(values).echo()
     return MachineSpec.from_mapping(echo)
 
 
@@ -193,7 +192,7 @@ def scaled(machine: MachineSpec, path: str, factor: float):
         values[path] = min(machine.value(path) * factor, 1.0)
     else:
         capped, values[path] = False, machine.value(path) * factor
-    return MachineSpec(values, machine.tokenizers), capped
+    return MachineSpec(values), capped
 
 
 def band(machine: MachineSpec, assumed: dict, jobs: list, base: dict) -> dict:

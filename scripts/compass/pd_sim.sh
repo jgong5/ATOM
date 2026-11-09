@@ -157,7 +157,7 @@ if ((${#dp_aware[@]} || PREFILLS > 1 || DECODES > 1)); then
     lp=$(python3 - "$RUN_FILE" "$ATOMESH" "$PREFILL_PORT" "$DECODE_PORT" <<'EOF'
 import json, sys
 from pathlib import Path
-from atom.compass.run import ROUTER, channel_table, router_binary, worker_order
+from atom.compass.run import ROUTER, channel_table, hop, router_binary, worker_order
 
 path = Path(sys.argv[1])
 run = json.loads(path.read_text())
@@ -166,7 +166,7 @@ try:
     order = worker_order(run)
 except Exception as e:
     sys.exit(f"pd_sim: {e}")
-run.setdefault("router_in_s", run["ipc_s"])
+run.setdefault("router_in_s", hop(run, "ipc_s"))
 path.write_text(json.dumps(run))
 table = channel_table(run)
 print(json.dumps({c.name: table.lookahead(c.name) for c in table.channels_from(ROUTER)}))

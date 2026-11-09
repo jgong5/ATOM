@@ -16,7 +16,7 @@ from atom.utils.clock import LPRuntime
 
 def _run(tmp_path, monkeypatch) -> dict:
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 0.001,
         "stream_s": 0.002,
         "bound_s": 10.0,

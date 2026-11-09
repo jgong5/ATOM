@@ -6,7 +6,8 @@ A step priced above measured fails the gate, named by its costliest term; a
 law seeded to price one op kind above its measured time fails it naming that
 kind. Refusals are counted by reason and make the result a coverage report;
 measured over analytical is reported per phase, and the records are ranked
-by tokens a second.
+by tokens a second. A record or `measure ops` run whose engine file states
+other performance variables than the grading process's is refused, each named.
 """
 
 import json
@@ -19,12 +20,14 @@ from test_op_graph import g
 from test_op_work import leaf, t
 from test_work import SPEC
 
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass.backends import BatchView, RequestShape, op_work
 from atom.compass.backends.cost import CostTerm, StepCost
 from atom.compass.backends.op_graph import DRAFT_KV, OpGraphBackend
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.step_roofline import CONTEXT, Module, StepRooflineBackend
 from atom.compass.backends.work import Work, price
+from atom.compass.run.step_grid import BUCKETS
 from atom.compass.validate import bound
 
 SILU = "aiter.silu_and_mul.default"
@@ -215,7 +218,7 @@ def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1):
     tree = SimpleNamespace(modules=lambda: [SimpleNamespace(), moe])
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
     monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
-    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: graph)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: graph)
     spec = tmp_path / "spec.json"
     spec.write_text(json.dumps(ROOFLINE))
     argv = ["--model", "m", "--machine", str(spec), "--store", "s", *more]
@@ -343,6 +346,60 @@ def test_main_prices_ops_and_points_at_the_model_s_ep_width(monkeypatch, tmp_pat
     assert seen == {"op": 8, "points": 8}
 
 
+ENGINE = {"tensor_parallel_size": 1, "kv_cache_dtype": "bf16"}
+# The performance variables a run's engine file states, sorted as `keyed` writes them.
+RAN = {"ATOM_NUMA_BIND": "1", "GPU_MAX_HW_QUEUES": "5"}
+
+
+def _performance_env(monkeypatch, **env):
+    """This process's performance environment set to `env` alone."""
+    for name in PERFORMANCE_KEYS | {BUCKETS}:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+
+@pytest.mark.parametrize("ops", [False, True])
+def test_a_run_under_other_performance_variables_refuses_naming_each(
+    monkeypatch, tmp_path, ops
+):
+    here = {"ATOM_USE_TRITON_MOE": "1", "GPU_MAX_HW_QUEUES": "5"}
+    _performance_env(monkeypatch, **here)
+    slow = record(tmp_path / "slow", LINES[:3])
+    out = plan(tmp_path / "plan", [])
+    stated = {"env": here if ops else RAN}
+    (slow / "steps" / "dp0.engine.json").write_text(json.dumps(ENGINE | stated))
+    (out / "engine.json").write_text(json.dumps(ENGINE | {"env": RAN if ops else here}))
+
+    with pytest.raises(ValueError) as refused:
+        _main(monkeypatch, tmp_path, [slow], more=["--ops", str(out)])
+
+    assert str(refused.value) == (
+        f"{out if ops else slow / 'steps'} ran under other performance variables "
+        "than this process's, which builds the model and keys the op graphs under "
+        "its own: env ATOM_NUMA_BIND '1' in its engine file and None here; "
+        "env ATOM_USE_TRITON_MOE None in its engine file and '1' here"
+    )
+
+
+def test_a_run_under_this_process_s_performance_variables_prices_as_before(
+    monkeypatch, tmp_path, capsys
+):
+    _performance_env(monkeypatch, **RAN)
+    slow = record(tmp_path / "slow", LINES[:3])
+    out = plan(tmp_path / "plan", [])
+    engines = (slow / "steps" / "dp0.engine.json", out / "engine.json")
+    reports = []
+    for engine in (ENGINE, ENGINE | {"env": RAN}):
+        for path in engines:
+            path.write_text(json.dumps(engine))
+        _main(monkeypatch, tmp_path, [slow], more=["--ops", str(out)])
+        reports.append(capsys.readouterr().out)
+
+    assert reports[1] == reports[0]
+    assert "op level: pass, 3 steps priced, 0 refused" in reports[1]
+
+
 def test_a_measured_point_prices_at_the_ep_width(tmp_path):
     op = leaf(
         "mori.ops.dispatch_combine:EpDispatchCombineOp.combine",
@@ -394,7 +451,7 @@ def _backends(monkeypatch, tmp_path, config, modules=STACK, lookup=graph, ep=1):
         "atom.compass.run.modules.walk",
         lambda t, d=None: modules + DRAFTER * bool(d and d.use_dspark()),
     )
-    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: lookup)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: lookup)
     return bound.backends("m", 1, [], MACHINE, str(tmp_path), [])[2]
 
 

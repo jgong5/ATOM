@@ -65,7 +65,7 @@ ROUTER_IN_S = 2.0**-14
 
 def _table(prefill=2, decode=2, **kw):
     return prefill_decode_table(
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=ROUTER_IN_S,
         stream_s=PD["router_s"],
         router_s=PD["router_s"],

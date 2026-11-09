@@ -49,7 +49,7 @@ def _decode_request(**params) -> bytes:
 def _sent_as_frontend_p(document: dict) -> tuple[LPRuntime, list]:
     """`document` served as a JSON response behind `HttpChannel` on frontend-P."""
     table = prefill_decode_table(
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=0.001,
         stream_s=0.002,
         router_s=0.004,

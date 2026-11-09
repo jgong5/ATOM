@@ -78,14 +78,14 @@
    "mechanism_why": "arithmetic inside the cost backend, which cannot park"
   },
   {
-   "id": "atom/compass/kv/connector.py::SimulatedKVConnectorScheduler.update_state_after_alloc::self._socks[key].send(pickle.dumps((params[\"transfer_id\"], blocks, a, key[1])))::p2p#0",
+   "id": "atom/compass/kv/connector.py::SimulatedKVConnectorScheduler._send::self._socks[key].send(pickle.dumps((params[\"transfer_id\"], blocks, a, key[1])))::p2p#0",
    "file": "atom/compass/kv/connector.py",
-   "symbol": "SimulatedKVConnectorScheduler.update_state_after_alloc",
+   "symbol": "SimulatedKVConnectorScheduler._send",
    "call": "self._socks[key].send",
    "expr": "self._socks[key].send(pickle.dumps((params[\"transfer_id\"], blocks, a, key[1])))",
    "shape": "p2p",
    "peer": "deployment",
-   "why": "the decode engine's KV write request to the prefill engine of another deployment, sent on the decode step loop right after the request's blocks are allocated",
+   "why": "the decode engine's KV write request to the prefill engine of another deployment, sent on the decode step loop right after the request's blocks are allocated, or its notice that none will come, sent when the request finishes before one",
    "mechanism": "K4",
    "mechanism_why": "the decode end of the kv_write_req channel: the wrapped socket stamps the send with the LP's time, and the step loop that makes it is the clock owner"
   },
@@ -162,6 +162,30 @@
    "mechanism_why": "an RPC to the engine's own workers, which share the engine's LP, made before the step loop's first clock request, while the LP's clock stands at its start"
   },
   {
+   "id": "atom/compass/run/__init__.py::_stamp_intake.heads.sent::send(message)::p2p#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "_stamp_intake.heads.sent",
+   "call": "send",
+   "expr": "send(message)",
+   "shape": "p2p",
+   "peer": "thread",
+   "why": "a recorded real server's ASGI send, which stamps an SSE response's head as it is sent and hands each message on as it was given",
+   "mechanism": "K9",
+   "mechanism_why": "installed only by a real run recording its steps (_record_host); a simulated run never installs it, and its streams go through HttpChannel"
+  },
+  {
+   "id": "atom/compass/run/__init__.py::_stamp_intake.submitted::submit(self, fn, *args, **kwargs)::executor_handoff#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "_stamp_intake.submitted",
+   "call": "submit",
+   "expr": "submit(self, fn, *args, **kwargs)",
+   "shape": "executor_handoff",
+   "peer": "thread",
+   "why": "a recorded real server's thread pool submit, which stamps the loop's CPU clock at the tokenizer pool job's submit and hands the job on as it was given",
+   "mechanism": "K9",
+   "mechanism_why": "installed only by a real run recording its steps (_record_host); a simulated run never installs it, and its pool jobs go through SimExecutor"
+  },
+  {
    "id": "atom/compass/run/__init__.py::engine_loop::ask.join(10.0)::join#0",
    "file": "atom/compass/run/__init__.py",
    "symbol": "engine_loop",
@@ -232,6 +256,43 @@
    "why": "a prefill-decode engine building its KV connector waits, in tenths of a wall second up to a bound, for every engine's planned KV block file",
    "mechanism": "K9",
    "mechanism_why": "at startup, while the engine is built and before its step loop's first clock request, so outside the simulated window; the wall bound only turns a missing block into an error naming the engine"
+  },
+  {
+   "id": "atom/compass/run/__init__.py::_trace_process::ProcessPoolExecutor(1, mp_context=spawn, initializer=enable_orphan_reaping)::thread_start#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "_trace_process",
+   "call": "ProcessPoolExecutor",
+   "expr": "ProcessPoolExecutor(1, mp_context=spawn, initializer=enable_orphan_reaping)",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "engine",
+   "why": "an op-graph run's lookup spawns one process for its lazy traces at the first shape its store holds no graph at; the process builds the model once and ends with the engine",
+   "mechanism": "K9",
+   "mechanism_why": "starting a process cannot park; the process is the engine's own, prices nothing and sends nothing"
+  },
+  {
+   "id": "atom/compass/run/__init__.py::_op_graphs.graph::process[0].submit(_trace, root, atom_args, arch, shape)::executor_handoff#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "_op_graphs.graph",
+   "call": "process[0].submit",
+   "expr": "process[0].submit(_trace, root, atom_args, arch, shape)",
+   "shape": "executor_handoff",
+   "peer": "process",
+   "why": "the lookup hands a shape its store holds no graph at to its lazy-trace process",
+   "mechanism": "K9",
+   "mechanism_why": "a hand-off onto the executor's queue cannot park; the wait for its result is `done.result()`'s row"
+  },
+  {
+   "id": "atom/compass/run/__init__.py::_op_graphs.graph::done.result()::event_wait#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "_op_graphs.graph",
+   "call": "done.result",
+   "expr": "done.result()",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "the engine's worker waits while its lazy-trace process traces the shape, then prices the step from the graph",
+   "mechanism": "K6",
+   "mechanism_why": "a wait inside the engine's LP on the engine's own trace process: never reported to the clock authority and carries no cost; the step is priced from the traced graph, and the run summary reports the wait as lazy_trace_wall_seconds"
   },
   {
    "id": "atom/compass/runner/overrides.py::_group_step_seconds::torch.distributed.all_gather(rows, mine, group=group)::collective#0",
@@ -4433,7 +4494,7 @@
    "expr": "server.poll()",
    "shape": "poll",
    "peer": "process",
-   "why": "the serve command asks whether its server has exited, while it waits for /health to answer and then while the server serves",
+   "why": "the serve command asks whether its server has exited, while it waits for /health to answer, while the server serves, and on a trace run before it posts /stop_profile",
    "mechanism": "K9",
    "mechanism_why": "a process poll returns at once and cannot park; serve refuses a run file and a clock, in ATOM's arguments and in the environment, so its server is a real one and the command is no LP"
   },
@@ -4457,7 +4518,7 @@
    "expr": "server.poll()",
    "shape": "poll",
    "peer": "process",
-   "why": "the serve command asks whether its server has exited, while it waits for /health to answer and then while the server serves",
+   "why": "the serve command asks whether its server has exited, while it waits for /health to answer, while the server serves, and on a trace run before it posts /stop_profile",
    "mechanism": "K9",
    "mechanism_why": "a process poll returns at once and cannot park; serve refuses a run file and a clock, in ATOM's arguments and in the environment, so its server is a real one and the command is no LP"
   },
@@ -4496,6 +4557,42 @@
    "why": "the serve command's stop waits in half seconds, up to a wall bound, for the server's process group to exit after SIGTERM and then after SIGKILL",
    "mechanism": "K9",
    "mechanism_why": "the server is stopping; serve refuses a run file and a clock, in ATOM's arguments and in the environment, so its server is a real one and the command is no LP, and the bound only decides when SIGTERM gives way to SIGKILL"
+  },
+  {
+   "id": "atom/compass/drive/record.py::main::busy.reduce(args.out)::collective#0",
+   "file": "atom/compass/drive/record.py",
+   "symbol": "main",
+   "call": "busy.reduce",
+   "expr": "busy.reduce(args.out)",
+   "shape": "collective",
+   "peer": "none",
+   "why": "the record command reduces a trace run's kernel traces to its busy lines once its server has stopped; nothing is sent",
+   "mechanism": "K9",
+   "mechanism_why": "file arithmetic in the measuring command after its server stopped, which cannot park"
+  },
+  {
+   "id": "atom/compass/drive/serve.py::serve::server.poll()::poll#2",
+   "file": "atom/compass/drive/serve.py",
+   "symbol": "serve",
+   "call": "server.poll",
+   "expr": "server.poll()",
+   "shape": "poll",
+   "peer": "process",
+   "why": "the serve command asks whether its server has exited, while it waits for /health to answer, while the server serves, and on a trace run before it posts /stop_profile",
+   "mechanism": "K9",
+   "mechanism_why": "a process poll returns at once and cannot park; serve refuses a run file and a clock, in ATOM's arguments and in the environment, so its server is a real one and the command is no LP"
+  },
+  {
+   "id": "atom/compass/parity/busy.py::events::while True::spin_loop#0",
+   "file": "atom/compass/parity/busy.py",
+   "symbol": "events",
+   "call": "while True",
+   "expr": "while True",
+   "shape": "spin_loop",
+   "peer": "none",
+   "why": "a trace reader's loop over one file's events; it consumes its input and returns, and parks on nothing",
+   "mechanism": "K9",
+   "mechanism_why": "a loop over a file in a measuring command, which cannot park"
   },
   {
    "id": "atom/compass/capture/driverless.py::group.broadcast::functional.broadcast(tensor, src, group or dist.group.WORLD)::collective#0",
@@ -5332,6 +5429,18 @@
    "why": "reads a producer's metadata in a transfer backend the simulator replaces with a priced one",
    "mechanism": "K9",
    "mechanism_why": "inside a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnectorScheduler._abort_unwritten::sock.send_multipart([MSG_ABORT, notice])::p2p#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
+   "symbol": "MooncakeConnectorScheduler._abort_unwritten",
+   "call": "sock.send_multipart",
+   "expr": "sock.send_multipart([MSG_ABORT, notice])",
+   "shape": "p2p",
+   "peer": "deployment",
+   "why": "tells a producer that a request the consumer finished before its write request will not ask for one, in a transfer backend the simulator replaces with a priced one",
+   "mechanism": "K9",
+   "mechanism_why": "inside a transfer backend the simulator replaces; the simulated connector reproduces the notice on the kv_write_req channel"
   },
   {
    "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector._execute_handshake::recv()::socket_recv#0",

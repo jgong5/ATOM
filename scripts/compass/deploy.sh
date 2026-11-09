@@ -180,7 +180,7 @@ try:
     lookaheads = "-"
     if router_lp:
         run["router"] = compass_run.router_binary(router_lp)
-        run.setdefault("router_in_s", run["ipc_s"])
+        run.setdefault("router_in_s", compass_run.hop(run, "ipc_s"))
         table = compass_run.channel_table(run)
         lookaheads = json.dumps({c.name: table.lookahead(c.name) for c in table.channels_from(compass_run.ROUTER)}, separators=(",", ":"))
 except (ValueError, OSError, ArtifactRefusal, SpecRefusal) as refused:

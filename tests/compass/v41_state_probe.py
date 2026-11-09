@@ -112,7 +112,8 @@ def ops_placements(
     and layer 1's window ring cut from it (`ring_view`), as
     `pa_sparse_prefill_opus` takes both, stating its window of 8, compress
     `ratio` and, past ratio 0, top-k 1. Its activation is a row a token, and
-    the bytes its ring rows read a call, `reach` rows, are kept too."""
+    the bytes its ring rows read a call, `reach` rows, are kept too, and each
+    pool view's name and offset from ATOM's on the bench, or refusal and None."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -192,23 +193,28 @@ def ops_placements(
         llc = 3 * (16 * tokens + read)  # 7 copies of the activation and the states
     found = ops.leaves(_graph(leaf, layers=1)["region"])
     real, replay.seat_states = replay.seat_states, seat
-    refused, got = None, []
+    refused, got, stub = None, [], ops.Stub(runner, llc)
     try:
-        got = ops.Stub(runner, llc).point(rule, point, context, found)
+        got = stub.point(rule, point, context, found)
         refused = next((r["refused"] for r in got if "refused" in r), None)
     except (ValueError, RuntimeError) as error:
         refused = str(error)
     finally:
         replay.seat_states = real
     kept = {"slots": runner.batches, "refused": refused, "got": got}
+    if pool:
+        atom = {"pool": built.cache.pool, "ring": built.cache.ring_view(1)}
+        kept["bound"] = {
+            p: [n, v if v is None else v.data_ptr() - atom[p].data_ptr()]
+            for (_, p), (n, v) in stub.kv.items()
+        }
     return kept | {"read": read, "ring": ring}
 
 
 def kv_bound(slots):
     """Each KV view a capture's cache of 4 PAGEs and `slots` state slots
     passes, as `ops._kv` binds it on `cache_of`'s as `ops._runner` holds it:
-    the name it binds and how far its first byte lies from that view there;
-    and how far layer 1's window ring there lies from its pool's start."""
+    the name it binds and how far its first byte lies from that view there."""
     import torch
 
     from atom.compass.bench import ops
@@ -223,10 +229,9 @@ def kv_bound(slots):
         "state_bytes": lambda c: c.state_bytes.view(-1),
         "state_fp32": lambda c: c.state.buf.view(torch.float32),
         "cursor": lambda c: c.cursor[:, 1:],
-        "ring": lambda c: c.ring_view(1),
         "pool": lambda c: c.pool,
     }
-    out = {"ring_start": bench.ring_view(1).data_ptr() - bench.pool.data_ptr()}
+    out = {}
     for case, view in views.items():
         t = view(capture)
         spec = {"shape": [*t.shape], "stride": [*t.stride()], "dtype": str(t.dtype)}
@@ -355,7 +360,7 @@ def main(root: pathlib.Path) -> None:
     # the ring rows a call reaches: a row a token written, a window of 8 a row
     # read; a ring a request at most, of 8 rows, or 13 under DSpark5
     seated = {"seat": replay.seat_states, "v41": True}
-    for pool, slots in (("whole", 8), ("ring", 8), ("ring", 4), ("ring", 16)):
+    for pool, slots in (("whole", 8), *(("ring", n) for n in (8, 4, 2, 16))):
         reach = 2 if pool == "whole" else 16
         seen[f"ops_v41_{pool}_pool_{slots}"] = ops_placements(
             plain, replay.seat_states, v41=True, pool=pool, slots=slots, reach=reach
