@@ -637,8 +637,10 @@ recovery (below) grants one LP at a time: a single global event loop across proc
 correct, serialized, no parallelism. That is why zero-lookahead couplings stay inside one
 LP (partition principle, above).
 
-**Local grants** (`compass run --local-grants`, the owner's ruling (c) on
-[#2542](https://github.com/jgong5/ATOM/issues/2542#issuecomment-6539617449)). A grant to an
+**Local grants** (on by default, `compass run --no-local-grants` turns them off; the
+owner's ruling (c) on
+[#2542](https://github.com/jgong5/ATOM/issues/2542#issuecomment-6539617449) and the
+[#3086 ruling](https://github.com/jgong5/ATOM/pull/3086#issuecomment-6739389313)). A grant to an
 LP without members, other than a recovery's, also carries a ceiling: the least of
 `LBTS(i)`, `G` plus the LP's shortest cycle `min over j of D(i->j) + D(j->i)`, its
 earliest unreleased arrival, and the bound on simulated time. Nothing reaches the LP below
@@ -649,7 +651,7 @@ each such step with its next request, with how many of that request's logged sen
 preceded it; the CA keeps `N[i]` at the last grant meanwhile. The CA replays each step as
 the grant its own request would have had: it registers the sends made before it, records
 the reply with what it releases and counts the grant, so the step table and the grant
-counts are those of a run without the flag, which is why the run-file key is per-run. An
+counts are those of a run with local grants off, which is why the run-file key is per-run. An
 NER may ask for its messages ahead: every message registered for it below the ceiling goes
 with the grant, and the owner releases each in the step that reaches it. A step outside
 the LP's clock and ceiling, or past a message registered for it since, aborts the run.
