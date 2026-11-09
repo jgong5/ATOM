@@ -4,7 +4,8 @@ run resumed, and a resume under other inputs refused.
 
 It runs from a copy in a stub tree, as `test_smoke_cell.py` drives
 `smoke_cell.sh`: `atom.compass.cli` logs each command; a `record` writes
-server.json and waits for the SIGTERM `client.sh --stop` sends; `measure
+server.json and waits for the SIGTERM `client.sh --stop` sends, then with
+`--trace` writes its busy lines, or exits 1 without them when NO_BUSY; `measure
 memory` and a fit write their readable copy with a token, the law with one
 held-out band; FAIL, matched against a command's words, makes it refuse.
 `client.sh` logs its arguments, its Python and its scenario, stops its server
@@ -34,7 +35,13 @@ def main():
     out = Path(argv[argv.index("--out") + 1])
     out.mkdir(parents=True)
     if argv[0] == "record":
-        stop = lambda *_: (out.joinpath("run.json").write_text("{}"), sys.exit(0))
+        def stop(*_):
+            out.joinpath("run.json").write_text("{}")
+            if "--trace" in argv:
+                os.environ.get("NO_BUSY") and sys.exit(1)
+                out.joinpath("steps").mkdir()
+                out.joinpath("steps", "dp0.busy.jsonl").write_text("{}")
+            sys.exit(0)
         signal.signal(signal.SIGTERM, stop)
         out.joinpath("server.json").write_text(json.dumps({"pid": os.getpid()}))
         time.sleep(600)
@@ -194,3 +201,35 @@ def test_a_record_left_after_a_fit_refuses_and_records_nothing(tmp_path):
     assert f"step cal1-c1 failed: {law} was fitted without it" in r.stderr
     assert "calibrate into a new OUT" in r.stderr
     assert log == []
+
+
+def test_trace_runs_go_to_fit_steps_alone(tmp_path):
+    r, log = _calibrate(tmp_path, "1", "trace 16", "trace 4")
+    assert r.returncode == 0, r.stderr
+    o, client = tmp_path / "o", "--stop /real/python []"
+    machine = f"--machine {tmp_path}/spec.json --store {o}/store"
+    dirs = ("cal1-c1", "trace2-c16", "trace3-c4")
+    runs = [f"--client-run {o}/{d} {o}/{d}/artifacts/client_run.json" for d in dirs]
+    inputs = " ".join([*(f"{o}/{d}" for d in dirs), *runs])
+    assert log[3:] == [
+        f"record --gpu 7 --out {o}/cal1-c1",
+        f"client {o}/cal1-c1 --traces 256-392 --concurrency 1 --duration 1800 {client}",
+        f"record --gpu 7 --trace --out {o}/trace2-c16",
+        f"client {o}/trace2-c16 --traces 256-392 --concurrency 16 --duration 120 {client}",
+        f"record --gpu 7 --trace --out {o}/trace3-c4",
+        f"client {o}/trace3-c4 --traces 256-392 --concurrency 4 --duration 120 {client}",
+        f"fit steps --backend step-linear --form history {inputs} {machine} --out {o}/fit_steps",
+        f"fit host {o}/cal1-c1 {runs[0]} {machine} --out {o}/fit_host",
+    ]
+
+
+def test_a_trace_run_refused_at_its_stop_is_taken_again(tmp_path):
+    r, _ = _calibrate(tmp_path, "1", "trace 4", NO_BUSY="1")
+    assert r.returncode == 1
+    assert "calibrate: step trace2-c4 failed: its server exit 1" in r.stderr
+    exported = tmp_path / "o" / "trace2-c4" / "artifacts" / "client_run.json"
+    assert "server_stopped" in exported.read_text()
+    r, log = _calibrate(tmp_path, "1", "trace 4")
+    assert r.returncode == 0, r.stderr
+    assert "calibrate: trace2-c4 was stopped; taking it again" in r.stdout
+    assert log[0] == f"record --gpu 7 --trace --out {tmp_path}/o/trace2-c4"
