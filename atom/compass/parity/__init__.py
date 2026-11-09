@@ -46,7 +46,8 @@ a RapidServe engine in its `record_dir`).
 Unset, nothing is recorded. On its first step it also writes the engine its
 runner resolved to `dp<rank>.engine.json` (`README.md` says what it holds), and
 a runner with a `host_key` writes that to `dp<rank>.key.json`, with the
-graph sets ATOM recorded (`recorded_graphs`) where `launch` is written. The simulated
+graph sets ATOM recorded (`recorded_graphs`, and its launch provider's
+`recorded`) where `launch` is written. The simulated
 runner records from `NonAllocatingRunner.forward`; a real one records through
 `StepRecording`, composed into `RUNNER`, which the frontend names on a real run
 with the variable set.
@@ -374,7 +375,8 @@ def _record(runner):
             key = getattr(runner, "host_key", None)
             if key is not None:
                 if getattr(runner, "_launch", None) and runner._launch.features:
-                    graphs = {GRAPHS: recorded_graphs(runner.config)}
+                    sets = recorded_graphs(runner.config)
+                    graphs = {GRAPHS: sets | runner._launch.recorded(runner)}
                     key = {**key, "engine": {**key["engine"], **graphs}}
                 record.path.with_suffix(".key.json").write_text(json.dumps(key))
         runner._parity_record = record
@@ -384,11 +386,14 @@ def _record(runner):
 def recorded_graphs(config) -> dict:
     """`GRAPHS`' mapping for a runner of `config` whose ATOM has recorded its
     graphs: its model's architecture, each phase's token-graph buckets
-    (`TokenGraph.captured_sizes`) and each request graph's keys, sorted."""
+    (`TokenGraph.captured_sizes`) and each request graph's keys, sorted: the
+    graphs by their keys' text, since one keys by a tuple (a decode's request
+    bucket) and another by an int (a DSpark draft's `running_bs`)."""
     from atom.utils.region_graph import ReqGraph, TokenGraph
 
     token = {p: TokenGraph.captured_sizes(p) for p in ("prefill", "decode")}
-    request = sorted(sorted(g.keys()) for g in ReqGraph._live if g.keys())
+    keys = (sorted(g.keys()) for g in ReqGraph._live if g.keys())
+    request = sorted(keys, key=repr)
     return {"architecture": architecture(config), "token": token, "request": request}
 
 
