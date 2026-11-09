@@ -43,13 +43,18 @@ class Join(NamedTuple):
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Traced(ir.Applicability):
-    """Where a traced step applies: its discrete key, and the shape it ran at."""
+    """Where a traced step applies: its discrete key, and the shape it ran at;
+    for a graph that holds G (`ir.G`), the G range its two traces' `hints`
+    span and the `guards` its trace installed on G, each a condition in G."""
 
     structure: str
     shape: str
+    guards: tuple[str, ...] = ()
+    hints: tuple[int, int] | None = None
 
     def describe(self) -> str:
-        return f"{self.structure} at {self.shape}"
+        held = f", G in {list(self.hints or ())} where {list(self.guards)}"
+        return f"{self.structure} at {self.shape}" + held * bool(self.hints)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -204,29 +209,35 @@ def _seq(regions):
 
 
 def to_json(graph: ir.Graph) -> str:
-    """The graph as JSON."""
+    """The graph as JSON; one that holds G with its ``guards`` and ``hints``."""
     applicability = graph.applicability
+    held = {}
+    if getattr(applicability, "hints", None):
+        held = {"guards": list(applicability.guards), "hints": applicability.hints}
     return json.dumps(
         {
             "structure": applicability.structure,
             "shape": applicability.shape,
             "region": _json(graph.region),
         }
+        | held
     )
 
 
 def _arg(value):
     """An argument as JSON: a tensor, module, context key, integer affine in
-    the context or reduced object as an object."""
+    the context, symbol or reduced object as an object."""
     if isinstance(value, Reduced):
         return {"object": value.cls, "state": _arg(value.state)}
     if isinstance(value, ir.Affine):
         return {"affine": [value.slope, value.intercept]}
+    if isinstance(value, ir.Symbol):
+        return {"symbol": value.name}
     if isinstance(value, ir.Tensor):
         return {
-            "shape": list(value.shape),
+            "shape": _arg(value.shape),
             "dtype": value.dtype,
-            "stride": list(value.stride),
+            "stride": _arg(value.stride),
             "role": value.role.value,
         } | ({"is_shuffled": True} if value.shuffled else {})
     if isinstance(value, ir.ContextRef):
@@ -244,7 +255,7 @@ def _json(region):
             "op": region.name,
             "kind": region.kind.value,
             "args": {slot: _arg(value) for slot, value in region.args},
-            "out": [list(s) for s in region.out_shapes],
+            "out": [_arg(s) for s in region.out_shapes],
             "stream": region.stream_id,
             "context": region.context_ref and region.context_ref.key,
         } | ({"stated": stated} if stated else {})

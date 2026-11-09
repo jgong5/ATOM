@@ -3,8 +3,8 @@
 published as an `op_graph`.
 
     compass trace ops --model M [--tp N] [--width W ...] [--prefill T B ...]
-                      [--whole] [--population P ...] [--arch A] [--gpu I]
-                      --store S [-- ATOM args]
+                      [--whole] [--population P ...] [--symbolic] [--arch A]
+                      [--gpu I] --store S [-- ATOM args]
 
 A shape is a decode width (`--width`), a prefill of T tokens over B sequences
 (`--prefill`), or every shape the steps of a record directory hold
@@ -22,7 +22,10 @@ by the split `validate.bound` rebuilds from every rank's line; a population's
 prefill is traced as one forward, as it ran, where ATOM would split a step of
 its tokens, and with `--whole` each `--prefill` too. Each is traced at that
 concrete shape (`forward`), decoder layers folded
-into `Repeat` and forked streams into `Par` (`graph`).
+into `Repeat` and forked streams into `Par` (`graph`). Under DP with no
+drafter, `--symbolic` then traces each prefill's (T, B) once more with G a
+symbol, published at `forward.symbolic_shape` as a run's lookup traces it
+(`forward.Tracer.symbolic`), so a run reads it for each G it admits.
 
 An `op_graph` is keyed by structure (`forward.structure`: the model's
 architecture and config.json digest, `--arch`, the engine config a step law is
@@ -87,6 +90,11 @@ def main(argv: list[str]) -> None:
         default=[],
         help="a record directory; every shape its steps hold",
     )
+    p.add_argument(
+        "--symbolic",
+        action="store_true",
+        help="under DP, also trace each prefill's (T, B) with G a symbol",
+    )
     p.add_argument("--arch", help="the declared device's arch, gfx942 by default")
     p.add_argument("--gpu", type=int, help="declare this card as it reads")
     p.add_argument("--store", required=True, help="the artifact store")
@@ -109,10 +117,13 @@ def main(argv: list[str]) -> None:
     command = " ".join(["compass", "trace", "ops", *argv])
     with tempfile.TemporaryDirectory(prefix="compass-capture-") as tmpdir:
         began = time.perf_counter()  # the first shape's seconds include the build
-        # A card's reading and `--whole` only when given: any other call is as before.
+        # A card's reading, `--whole` and `--symbolic` only when given: any
+        # other call is as before.
         on = {"read": read} if read else {}
         if args.whole:
             on["whole"] = True
+        if args.symbolic:
+            on["symbolic"] = True
         captured = capture(
             args.model, args.tp, shapes, tmpdir, atom_args, arch, args.population, **on
         )

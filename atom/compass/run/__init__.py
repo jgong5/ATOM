@@ -148,7 +148,8 @@ calls, a frontend's its executor's refused jobs and its refused clock calls.
 An engine's also holds what its worker's steps cost, for the summary's
 predicted seconds and their shares by method (`backends.cost.GROUPS`), and
 its counts of steps extrapolated and of steps a fallback priced, and of its
-lazy traces with their wall seconds, which the summary's cost half totals.
+lazy traces with their wall seconds, which the summary's cost half totals,
+with each DP prefill whose G it traced one by one (`_op_graphs`).
 It holds the memory the worker predicts too, for
 ``python -m atom.compass.memory.check``, with the assumption a
 `memory_readings` member it read states, which `compass run` records, and
@@ -1905,15 +1906,76 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     (`_trace`), its count and wall seconds added to `lazy`'s ``lazy_traces``
     and ``lazy_trace_wall_seconds``; a trace that fails raises, naming the
     shape. A trace from a tree with uncommitted files answers this lookup alone
-    and is not published."""
+    and is not published.
+
+    Under DP a prefill the store holds no graph at, with no drafter and no
+    width, reads the graph of its tokens and sequences that holds G
+    (`forward.Tracer.symbolic`, keyed by `forward.symbolic_shape`) at the
+    step's G, when its hints span G and its guards admit it (`peers.at`); with
+    `atom_args`, the first such step of a shape traces that graph, and when
+    its two ends differ (`forward.PerG`) each G of the shape is traced as
+    above instead, the shape and why named in `lazy`'s ``lazy_per_g``."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
-    from atom.compass.capture.forward import Shape, missed, structure
+    from atom.compass.capture import peers
+    from atom.compass.capture.forward import (
+        PerG,
+        Shape,
+        admits,
+        missed,
+        structure,
+        symbolic_shape,
+    )
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
     dp = config.parallel_config.data_parallel_size
     drafter = getattr(config, "speculative_config", None)
     drafts = drafter.num_speculative_tokens if drafter else 0
-    traced, unpublished, process = set(), {}, []
+    traced, held_traced, unpublished, process = set(), set(), {}, []
+
+    def lazily(shape, symbolic=False):
+        """Trace `shape` (`_trace`), counted in `lazy`; why its G are each
+        traced, when a `symbolic` trace's two ends differ, else None."""
+        began, why = time.monotonic(), None
+        # `symbolic` only when set: a concrete trace's call is as before.
+        symbolically = {"symbolic": True} if symbolic else {}
+        try:
+            if not process:
+                process.append(_trace_process())
+            done = process[0].submit(
+                _trace, root, atom_args, arch, shape, **symbolically
+            )
+            unpublished.update(done.result())
+        except PerG as differ:
+            why = str(differ)
+            lazy.setdefault("lazy_per_g", {})[why] = 1
+        # An argument parser's error exits.
+        except (Exception, SystemExit) as failed:
+            why = f"{type(failed).__name__}: {failed}"
+            raise RuntimeError(f"a lazy trace of {shape} failed: {why}") from failed
+        lazy["lazy_traces"] += 1
+        lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
+        return why
+
+    def read(at: str, shape: str) -> dict | None:
+        """The graph the store, or this lookup's unpublished traces, hold at
+        structure `at` and `shape`, as `capture.graph.to_json` writes it."""
+        if (at, shape) in unpublished:
+            return unpublished[at, shape]
+        key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
+        if not store.directory_for(key).exists():
+            return None
+        return json.loads(store.read(key).read_member("graph", rank, "json"))
+
+    @functools.lru_cache(maxsize=64)
+    def held(at: str, tokens: int, seqs: int) -> tuple | None:
+        """The graph that holds G of a DP prefill of `tokens` over `seqs` at
+        structure `at`, and its G's slots (`peers.slots`), or None."""
+        text, new = symbolic_shape(tokens, seqs), (tokens, seqs) not in held_traced
+        if new and atom_args is not None and read(at, text) is None:
+            held_traced.add((tokens, seqs))
+            lazily(Shape("prefill", tokens, seqs), symbolic=True)
+        found = read(at, text)
+        return found and (found, peers.slots(found["region"]))
 
     @functools.lru_cache(maxsize=64)
     def graph(
@@ -1923,23 +1985,18 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         at = structure(config, phase, True, arch, output, draft, env)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
         missing = not store.directory_for(key).exists()
+        if missing and dp > 1 and phase == "prefill" and not (draft or width or drafts):
+            g = shape.gathered or dp * tokens
+            if found := held(at, tokens, seqs):
+                (lo, hi), region = found[0]["hints"], found[0]["region"]
+                if lo <= g <= hi and admits(found[0]["guards"], g):
+                    return peers.at(region, found[1], g, dp)
         if missing and atom_args is not None and shape not in traced:
             traced.add(shape)
-            began = time.monotonic()
-            try:
-                if not process:
-                    process.append(_trace_process())
-                done = process[0].submit(_trace, root, atom_args, arch, shape)
-                unpublished.update(done.result())
-            # An argument parser's error exits.
-            except (Exception, SystemExit) as failed:
-                why = f"{type(failed).__name__}: {failed}"
-                raise RuntimeError(f"a lazy trace of {shape} failed: {why}") from failed
-            lazy["lazy_traces"] += 1
-            lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
+            lazily(shape)
             missing = not store.directory_for(key).exists()
         if (at, str(shape)) in unpublished:
-            return unpublished[at, str(shape)]
+            return unpublished[at, str(shape)]["region"]
         if missing:
             return missed(store, key) or None
         return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
@@ -1976,30 +2033,35 @@ def _tracer(model: str, tp: int, atom_args: tuple, arch: str):
     return tmpdir, Tracer(model, tp, tmpdir.name, atom_args, arch)
 
 
-def _trace(root: str, atom_args, arch: str, shape) -> dict:
+def _trace(root: str, atom_args, arch: str, shape, symbolic=False) -> dict:
     """Trace `shape` as `compass trace ops` traces a record's step, a prefill
-    as one forward, from ATOM's arguments `atom_args` less the server's, on a
+    as one forward, or with `symbolic` a DP prefill's graphs that hold G
+    (`forward.Tracer.symbolic`, which raises `forward.PerG` where they
+    cannot), from ATOM's arguments `atom_args` less the server's, on a
     declared `arch`, in this process's tracer (`_tracer`), its KV pool the one
     a capture of `shape` alone allocates; and publish each graph in the store
     at `root`, one another engine of the run published first aside. From a
     tree with uncommitted files, which may run but not publish, return each
-    graph's region by its structure and shape instead; else return an empty
-    dict."""
+    graph by its structure and shape instead, as `capture.graph.to_json`
+    writes it; else return an empty dict."""
     from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, Rule, roots_for
     from atom.compass.capture import publish
+    from atom.compass.capture.forward import symbolic_shape
     from atom.compass.capture.graph import to_json
     from atom.compass.drive.runfile import _engine_args, engine_only
 
     engine, kept = _engine_args(atom_args), engine_only(atom_args)
     store, tp = ArtifactStore(root), engine.tensor_parallel_size
-    command = f"compass run: a lazy trace of {shape}"
+    what = symbolic_shape(shape.tokens, shape.seqs) if symbolic else shape
+    command = f"compass run: a lazy trace of {what}"
     dirty = any(r.dirty for r in roots_for({"atom": "atom", "aiter": "aiter"}))
     unpublished = {}
     _, tracer = _tracer(engine.model, tp, tuple(kept), arch)
-    for graph, model, declared in tracer.trace([shape], [shape]):
+    graphs = tracer.symbolic(shape) if symbolic else tracer.trace([shape], [shape])
+    for graph, model, declared in graphs:
         if dirty:
             at = graph.applicability
-            unpublished[at.structure, at.shape] = json.loads(to_json(graph))["region"]
+            unpublished[at.structure, at.shape] = json.loads(to_json(graph))
             continue
         try:
             publish(store, graph, model, declared, tp, kept, command)
@@ -2804,6 +2866,9 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     summary = RunSummary.of(
         record, wall, *lazy, diagnostics=diagnostics, refusals=tally
     ).as_record()
+    # Each DP prefill whose G were each traced, and why, by the engines that did.
+    if per_g := counted("lazy_per_g"):
+        summary["cost"]["lazy_per_g"] = dict(per_g)
     schedule = summary["schedule"]
     schedule["predicted_seconds"] = seconds
     # How the seconds were obtained: reported, never gated.
