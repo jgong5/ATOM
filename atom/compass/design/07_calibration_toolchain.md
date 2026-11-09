@@ -480,7 +480,8 @@ a GIL wait
   `fixed_s` alone, priced inside its token hull. `segment`, the segment tokenizer call's
   own work, is its wall less the calls it makes, those on its thread that start inside it,
   over the ids they return and, where every call's record holds them, the characters its
-  stored-prefix search compared; it is lone among the calls it does not make
+  stored-prefix search compared, else listed unfitted as `tokenizer.segment.chars_per_s`;
+  it is lone among the calls it does not make
   ([#2618](https://github.com/jgong5/ATOM/issues/2618), [#3083](https://github.com/jgong5/ATOM/issues/3083)).
 - `http_intake`: on the loop thread's CPU time. `per_byte_s` and `idle_s` from requests
   that found no other intake on the loop, each the loop's CPU time from its app call to

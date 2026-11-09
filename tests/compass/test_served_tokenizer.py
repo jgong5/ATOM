@@ -36,6 +36,8 @@ TERM = {
 }
 #: `TERM` with the segment tokenizer call's own work.
 FULL = TERM | {"segment": {"fixed_s": 9.0e-4, "tokens_per_s": 4.0e6}}
+#: `FULL` with the segment tokenizer's stored-prefix search too.
+SEARCHED = FULL | {"segment": FULL["segment"] | {"chars_per_s": 2.5e9}}
 
 
 class _Tokenizer:
@@ -342,15 +344,22 @@ def test_a_server_charges_the_entry_fitted_under_its_engine_config(
     "host, named",
     [
         (None, ["http_intake", "tokenizer"]),
-        ({"tokenizer": FULL}, ["http_intake"]),
+        ({"tokenizer": SEARCHED}, ["http_intake"]),
         (
-            {"tokenizer": {k: v for k, v in FULL.items() if k != "encode_batch"}},
+            {"tokenizer": {k: v for k, v in SEARCHED.items() if k != "encode_batch"}},
             ["http_intake", "tokenizer.encode_batch"],
         ),
         ({"tokenizer": TERM}, ["http_intake", "tokenizer.segment"]),
-        ({"tokenizer": FULL, "http_intake": {"fixed_s": 0.0, "per_byte_s": 0.0}}, []),
+        (
+            {"tokenizer": FULL, "http_intake": {"fixed_s": 0.0, "per_byte_s": 0.0}},
+            ["tokenizer.segment.chars_per_s"],
+        ),
+        (
+            {"tokenizer": SEARCHED, "http_intake": {"fixed_s": 0.0, "per_byte_s": 0.0}},
+            [],
+        ),
     ],
-    ids=["no-entry", "no-intake", "no-batch", "no-segment", "both"],
+    ids=["no-entry", "no-intake", "no-batch", "no-segment", "no-search", "both"],
 )
 def test_the_summary_names_each_term_the_run_charged_nothing_for(
     monkeypatch, tmp_path, host, named

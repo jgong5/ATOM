@@ -130,7 +130,8 @@ token counts outside which a decode is refused and charged 0 s; ``http_intake``,
 ``[lo, hi]`` body bytes it was fitted over, outside which an intake is refused
 and charged 0 s; a term an entry lacks, or every term with no entry, is
 charged 0 s and the run summary names it, a kind of tokenizer call as
-``tokenizer.<kind>``, under ``uncharged_host_terms``; ``hops``, the
+``tokenizer.<kind>`` and a ``segment`` without ``chars_per_s`` as
+``tokenizer.segment.chars_per_s``, under ``uncharged_host_terms``; ``hops``, the
 `HOPS` `runfile` writes to the run file; a list of them as ``step_linear``'s),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
@@ -2880,6 +2881,12 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
             for h in entries(run, "host") or []
             for k in TOKENIZER_KINDS
             if k not in h.get("tokenizer", {k: None})
+        }
+        | {
+            "tokenizer.segment.chars_per_s"
+            for h in entries(run, "host") or []
+            if "segment" in h.get("tokenizer", {})
+            and "chars_per_s" not in h["tokenizer"]["segment"]
         }
     )
     summary["unmeasured_hops"] = sorted(k for k, v in hops(run).items() if v is None)

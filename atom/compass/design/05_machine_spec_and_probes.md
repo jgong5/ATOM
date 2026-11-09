@@ -297,7 +297,8 @@ work, the call less the `encode_batch` it makes, over the ids that `encode_batch
 characters its stored-prefix search compares, what the prompt shares with each prompt stored
 in its bucket ([#3083](https://github.com/jgong5/ATOM/issues/3083)). **An entry with no `tokenizer` or no `http_intake`,
 a `tokenizer` with no term for a kind of call, and a run with no host laws, charges that
-term 0 s, and the run summary names the term, a kind as `tokenizer.<kind>`.** An `http_intake`
+term 0 s, and the run summary names the term, a kind as `tokenizer.<kind>` and a `segment`
+with no `chars_per_s` as `tokenizer.segment.chars_per_s`.** An `http_intake`
 with no `idle_s` charges `fixed_s` to every request. Neither term carries a derate: the
 entry is keyed by the host CPU it was fitted on and answers for no other (`09` D54). Why
 every term stays keyed by model, and how `fit host` fits them, is `07` D38, Phase 1c.

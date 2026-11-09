@@ -408,8 +408,14 @@ def test_a_term_the_records_cannot_give_is_left_out_and_listed_unfitted(
 
 def _unfitted(report) -> dict:
     """The report's unfitted terms but the hops, which these records, with no
-    queue handoffs or client records, cannot give (`test_fit_hops.py`)."""
-    return {k: v for k, v in report["unfitted"].items() if k.split(".")[0] != "hops"}
+    queue handoffs or client records, cannot give (`test_fit_hops.py`), and the
+    segment term's search rate, which `stamped` records without
+    ``compared_chars`` cannot give."""
+    return {
+        k: v
+        for k, v in report["unfitted"].items()
+        if k.split(".")[0] != "hops" and k != "tokenizer.segment.chars_per_s"
+    }
 
 
 def test_the_tokenizer_fit_reports_each_record_s_residuals_apart(tmp_path):
@@ -461,12 +467,35 @@ def test_the_segment_term_takes_what_its_stored_prefix_search_compared(tmp_path)
 
     def segment(lines):
         path.write_text("".join(json.dumps(c) + "\n" for c in [TOKENIZER, *lines]))
-        return fit_tokenizer([path], [intake])[0]["segment"]
+        term, report = fit_tokenizer([path], [intake])
+        return term["segment"], report["unfitted"].get("segment.chars_per_s")
 
-    assert segment(lines) == pytest.approx(
-        {"fixed_s": fixed, "tokens_per_s": 1 / per_id, "chars_per_s": 1 / per_char},
-        rel=1e-3,
+    assert segment(lines) == (
+        pytest.approx(
+            {"fixed_s": fixed, "tokens_per_s": 1 / per_id, "chars_per_s": 1 / per_char},
+            rel=1e-3,
+        ),
+        None,
     )
-    # A record without the search's characters keeps the term on ids alone.
-    lines = [{k: v for k, v in c.items() if k != "compared_chars"} for c in lines]
-    assert set(segment(lines)) == {"fixed_s", "tokens_per_s"}
+
+    # A call whose record lacks the characters keeps the term on ids alone,
+    # and the search rate is listed unfitted, naming how many lack them.
+    def without(lines, k):
+        cut = [c for c in lines if c["call"] == "segment"][:k]
+        return [
+            {n: v for n, v in c.items() if n != "compared_chars" or c not in cut}
+            for c in lines
+        ]
+
+    for k in (3, len(work)):
+        term, why = segment(without(lines, k))
+        assert set(term) == {"fixed_s", "tokens_per_s"}
+        assert (
+            why
+            == f"{k} of {len(work)} lone segment calls' records hold no compared_chars"
+        )
+    # Searches that compared nothing give the rate no time either.
+    zero = [c | {"compared_chars": 0} if c["call"] == "segment" else c for c in lines]
+    term, why = segment(zero)
+    assert set(term) == {"fixed_s", "tokens_per_s"}
+    assert why == "the records give no time per compared character"

@@ -423,8 +423,9 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
     their own kind. A ``decode`` with no positive slope is ``fixed_s`` alone
     over ``tokens``, the ``[lo, hi]`` token counts its calls span. A kind the
     calls cannot give is left out and its reason listed under the report's
-    ``unfitted``; the report gives each record's p10, p50 and p90 relative
-    residual per kind. Raises on records of two tokenizers."""
+    ``unfitted``, a ``segment`` without ``chars_per_s`` as
+    ``segment.chars_per_s``; the report gives each record's p10, p50 and p90
+    relative residual per kind. Raises on records of two tokenizers."""
     from scipy.spatial import QhullError
 
     heads, rows = {}, []
@@ -458,6 +459,14 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
             term[kind] = {"fixed_s": coef[0], "tokens_per_s": 1 / coef[1]}
             if len(coef) > 2 and coef[2] > 0:
                 term[kind]["chars_per_s"] = 1 / coef[2]
+            elif kind == "segment":
+                lack = chars.count(None)
+                report["unfitted"]["segment.chars_per_s"] = (
+                    f"{lack} of {len(chars)} lone segment calls' records hold no "
+                    "compared_chars"
+                    if lack
+                    else "the records give no time per compared character"
+                )
         elif kind == "decode":
             term[kind] = {"fixed_s": coef[0], "tokens": _span(fitted, "tokens")}
         else:
