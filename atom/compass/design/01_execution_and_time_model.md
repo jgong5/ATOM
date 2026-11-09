@@ -1980,18 +1980,28 @@ and receives both run on the engine's step loop, and no worker takes part.
   and no worker ever sends or receives across LPs. A prefill-side local timer would not
   do: when decode posts depends on its own admission, which prefill cannot know, and
   assuming "at once" frees prefill's blocks early exactly when decode is congested.
-- **Ceiling.** FIFO per rank pair is measured on Mooncake TCP only; for RDMA it is an
-  assumption. Under RDMA the real sharing unit is each prefill rank's NIC: its worker
-  writes through the HCA set `_select_ib_devices` resolves for its GPU, and
-  `MooncakeConnector._write_listener` hands every write request, from any decode rank,
-  to one `_send_executor` of `send_worker_count` (`num_worker_threads`) threads. Writes
-  on different rank pairs do not contend here. At decode DP width one a prefill rank's
-  NIC carries only the one decode rank's writes, so both ends still compute the same `c`
-  under any sharing discipline. Above that, `c` depends on other decode ranks' writes,
-  which this decode rank never sees, so a per-prefill-rank model cannot keep both ends
-  computing `c` without a message: decode would need Mooncake's own write-done notice
-  (`MooncakeConnector._send_write_done` to the consumer's `_notification_listener`) as a
-  prefill-to-decode channel (#1179).
+- **Ceiling: per-pair links are a simplification under RDMA.** Each prefill-decode rank
+  pair is one FIFO link, and writes on different pairs never contend. FIFO per rank pair
+  is measured on Mooncake TCP and kept under RDMA through v1 by the owner ruling on
+  #1179. The real sharing unit depends on the fabric:
+  - With matched rails (`ATOM_MOONCAKE_MATCHED_RAILS`, as on the MI355X nodes crs005 and
+    crs013), a producer writes through the rail engine of the consumer's HCA
+    (`RailEnginePool.get`), so writes into one decode rank share its rail across prefill
+    engines and queue within one engine, and one prefill GPU's writes stay under its cap
+    across rails (#3051).
+  - Without matched rails, it is the prefill rank's HCA set, which `_select_ib_devices`
+    resolves for its GPU.
+  - Either way, `MooncakeConnector._write_listener` hands each prefill rank's write
+    requests, from any decode rank, to one `_send_executor` of `send_worker_count`
+    (`num_worker_threads`) threads.
+
+  Effect: fan-in on a rail is priced at a lone writer's rate, so contended writes finish
+  early, and decode admission and prefill's block release come early with them. It grows
+  with concurrency, prefill ranks per decode rank and KV bytes. #3051 has its size on
+  those nodes and #2991 its share of TTFT at #1111's cell. Pricing rail fan-in needs every
+  write into a decode rank, which its prefill ranks do not see, so decode would have to
+  send prefill each write's done time, a message the real deployment never sends; #1179
+  prices it after v1.
 - It must still emit the `kv_transfer_params` blob that Atomesh relays, so
   `AtomAdapter` works unmodified. The router hard-errors if it is absent
   (`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`). The two backends emit
@@ -2065,9 +2075,10 @@ two differ the code is right.
 
 ### Cons / open issues
 
-- The transfer model is now **unvalidated** — a real RDMA baseline is needed at least
-  once to fit `latency` and `bandwidth`, or the numbers are assumed rather than
-  measured. This is a calibration task, not a simulator task, but it must be named.
+- A link's `latency` and `bandwidth` are as good as its network spec, whose provenance
+  says per value whether it came from a datasheet, was assumed or was probed; a link no
+  probe fills prices every transfer on assumed or datasheet numbers. #3051 probed the
+  MI355X rails between crs005 and crs013 (`atom/compass/networks/crs005-013-ionic.json`).
 - Mooncake requires **all** `(pp_rank, tp_rank)` pairs to report before a request
   completes (`mooncake_connector.py::MooncakeConnector._record_write_done`). The
   simulated write is one event per request, priced on the whole block table, so ranks
@@ -2771,7 +2782,7 @@ Ordered by how much they could cost.
 | D4 | Every synchronization site maps to one of the PDES mechanisms K1-K9, none undecided; the boundary is the LP, not the process; a DP member's step is one TAR at its own release from the group's device end, the `max` over ranks by an `all_reduce(MAX)` (with no host time, an output rank's at the `max` of the step seconds), exchanged inside the forward by K6 waits with no cost, and the lockstep `all_reduce` is K1 for its own cost; handler threads stay and TSO delivery runs them at their message's timestamp. A forward's K1 charge is one recurrence per runner over the backend's device busy time and host segments (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs` after R1), with wait rules R1, R4 and R6 to R8; after the return the engine LP advances the host's `out_s` (`E_out`) to its input pull, a DP member's pull joining the group rounds; `host.skip` makes a what-if; ATOM's bugs, its sync stalls included, are fixed in ATOM and listed under the `atom-issue` label | 2026-09-18; revised 2026-09-28, 2026-10-01, 2026-10-11 (#815), 2026-10-16 (#829, #1267), 2026-10-18 (#1345), 2026-10-19 (#1409) and 2026-10-21 (#1859) |
 | D5 | Every timer and clock read the CA can reach runs on the LP clock, except the out-of-band control-command reply deadline; only what it cannot reach is configured or left real; metric cadence is virtual time (revising `11` D72); the profiler and RL control commands are refused by the simulated runner with a reply, counted, and make the run a coverage report; a synchronous command from the frontend's clock owner is refused by the frontend | 2026-09-18; revised 2026-09-28, 2026-10-09, 2026-10-14, 2026-10-15 |
 | D5.1 | The simulated run uses stdlib asyncio, not uvloop: only a Python event loop can host virtual time | 2026-09-28 |
-| D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only; a rank pair's writes queue on its link | 2026-09-18; revised 2026-09-28; link sharing 2026-10-16 (#1157); first-write setup 2026-10-16 (#1172) |
+| D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only; a rank pair's writes queue on its link | 2026-09-18; revised 2026-09-28; link sharing 2026-10-16 (#1157); first-write setup 2026-10-16 (#1172); per-pair links kept under RDMA 2026-11-09 (#1179) |
 | D6.1 | The lmcache MP server is LP `lmcache`, a Compass stand-in on the real ZMQ channels with a content index and two stations; a store or load completes as a stamped reply that the step loop takes in timestamp order; a blocking lookup is a request and reply whose wait is an idle point; inside a DP group each member parks before its forward, amending member join rules 1, 2 and 5, and the last park releases every member at the group's time | 2026-10-16 (#1087, #1162) |
 | D7 | Atomesh gets no virtual clock: mesh-only mode; in 1P1D the router is one segment of a channel, not an LP, and its relay latency is that channel's lookahead; its bounds are configured (health check and circuit breaker off, `--worker-request-timeout-secs` set large); timestamps ride carriers it already relays; under `--dp-aware`, or with several instances per role, the router is LP `router`, handling requests, prefill responses and stream events in timestamp order (#449, #1085) | 2026-09-18; revised 2026-09-30, 2026-10-15, 2026-10-16 |
 | D8 | Arrivals are messages in transit, covered by the send and receive counts for closed and open workloads alike; the arrival timestamp rides the `tracestate` header | 2026-09-18; revised 2026-09-28 |
