@@ -446,10 +446,13 @@ collective) and interact only with lookahead > 0.
 ruling 2026-10-01, `12` T91, #528). Each DP rank is its own `EngineCore` process with its
 own `#dpN` channels and input and output threads, and holds its own LP runtime: its step
 loop is that member's clock owner, registers that rank's sends and releases its received
-frames. The CA completes the LP's request only when every member has called:
+frames. The CA completes each round of the LP only when every member has asked it:
 
-1. Every member makes the same number of CA calls per loop iteration; a per-member call
-   counter refuses a mismatch by name.
+1. Every member asks the same rounds per loop iteration; rounds are counted, not calls
+   (owner ruling on #2820, 2026-11-08). A member's TAR call may ask several rounds,
+   ascending, which the CA queues per member, and a round joins once it heads every
+   member's queue. A member that calls again before its round has joined is refused by
+   name.
 2. One request kind per round: TAR with equal `T` on every member, or NER with `t`
    and `t_daemon` each the minimum over members. Unequal `T` or mixed kinds are refused.
 3. Every member's send log is merged before any grant is computed, so the LP's promised
@@ -473,8 +476,11 @@ waits on its device, one with output other than the DP dummy, ends at the group'
 any other ends at its own seconds, as a real idle rank's forward returns on its own. Where
 `out_s` is set, each member then returns at its own pull, its end plus its `out_s`, and
 takes in arrivals there before `_sync_dp_state`; the pulls join the ends as rounds
-(`group_out`). Each member asks one TAR per distinct round, ascending, returns at its own
-pull (its own end where there is no `out_s`) and owes the rest. Until they are paid its sends are stamped at its own end; a TAR before
+(`group_out`). Each member asks every distinct round, ascending: those up to its own pull
+in one TAR call, which returns at its pull (its own end where there is no `out_s`), and
+the rest, which it owes, in one more call when it pays them (#2820). Each round is still
+its own grant, and a call's one reply releases what each of its rounds released to the
+member. Until the owed rounds are paid its sends are stamped at its own end; a TAR before
 the last owed round and any NER are refused; and every host collective on its clock owner
 thread, a `torch.distributed` collective whose tensors are all on the CPU or that has none,
 pays them first, as it returns at the latest arrival. A device collective returns once
@@ -1268,8 +1274,8 @@ The rules that settle the boundaries #53's categories left in the wrong place:
   sizes both). So the TP workers and every rank of a lockstep DP group sit in the engine
   LP, and a startup assertion refuses a process group whose ranks map to more than one
   LP.
-- **A DP step is one TAR per member release and per member pull; each member returns at
-  its own pull** (D3, #988, #1267, #1345). Each rank charges its own forward by the recurrence below, from the group's
+- **A DP step is one TAR round per member release and per member pull; each member
+  returns at its own pull** (D3, #988, #1267, #1345, #2820). Each rank charges its own forward by the recurrence below, from the group's
   device end, the `max` over ranks of each rank's absolute device end by one
   `all_reduce(MAX)`; the ranks exchange the step targets by one `all_gather` inside the
   predicted forward, and every rank calls the CA as a member of the LP (D3). With no host
@@ -2739,7 +2745,7 @@ Ordered by how much they could cost.
 | D0 | Fresh design; prior branches referenced at the design level only, not as a code-port plan | 2026-09-17 |
 | D1 | Keep ATOM's multi-process / multi-thread topology; additive changes only | 2026-09-17 |
 | D2 | "Two nodes" means true PD disaggregation, realised as two containers on one physical node | 2026-09-17 |
-| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP only after every rank has called; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares | 2026-09-18; revised 2026-09-28, 2026-10-02 and 2026-10-14 (#966) |
+| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP a round only after every rank has asked it; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares | 2026-09-18; revised 2026-09-28, 2026-10-02, 2026-10-14 (#966) and 2026-11-08 (#2820) |
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
 | D3.2 | Always-on causality detectors: a straggler check against the receiver's last drain (fails the run); a stall the CA cannot see prints one diagnostic after 30 wall seconds and keeps waiting, never aborting; clock-source CI lint | 2026-09-19; revised 2026-09-28 |
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for multi-container runs (1P+1D in M1 and M2) | 2026-09-19 |

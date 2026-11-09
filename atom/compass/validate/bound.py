@@ -54,7 +54,10 @@ of `dp<r>.key.json`) states another TP width or KV cache format than ATOM's
 arguments resolve; two-batch overlap of decode steps or on one rank, whose
 split no step line states; a data-parallel step some rank's record lacks; a
 step of an MTP record without `d_target_ns`, whose `d_busy_ns` holds the
-draft, which the gate does not compare.
+draft, which the gate does not compare. Refused too: a record, or an `--ops`
+run, whose engine block states another performance environment (`env`) than
+this process's, each variable named: this process builds the model and keys
+the op graphs under its own.
 """
 
 import argparse
@@ -433,9 +436,10 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
     step- and op-level backends pricing `records` on `machine`, the op level
     as a simulated run's (`run.op_graph`) over the op_graphs `store` holds for
     its arch. Refused: a record, or the `measure ops` run
-    `ops`, that ran under another engine; two-batch overlap no line splits."""
+    `ops`, that ran under another engine or other performance variables than
+    this process's; two-batch overlap no line splits."""
     from atom.compass.backends.step_roofline import StepRooflineBackend
-    from atom.compass.run import ep_width, op_graph
+    from atom.compass.run import ep_width, op_graph, step_grid
     from atom.compass.run.modules import drafter, walk
 
     arch = machine.value("device.arch")
@@ -460,6 +464,7 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
             engines.append((path.parent, ran))
     if ops:
         engines.append((ops, json.loads(Path(ops, "engine.json").read_text())))
+    here = {"env": step_grid.keyed_env()}
     for where, ran in engines:
         if differ := [k for k in PRICED if ran.get(k) != getattr(config, k)]:
             raise ValueError(
@@ -468,6 +473,13 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
                     f"{k} {ran.get(k)!r} there, {getattr(config, k)!r} here"
                     for k in differ
                 )
+            )
+        stated = {"env": ran.get("env", here["env"])}
+        if named := step_grid.differ(stated, here, "its engine file"):
+            raise ValueError(
+                f"{where} ran under other performance variables than this "
+                "process's, which builds the model and keys the op graphs under "
+                "its own: " + "; ".join(named)
             )
     ep = ep_width(tree)
     return (

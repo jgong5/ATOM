@@ -263,6 +263,22 @@ def mtp_copy(lines) -> dict[int, tuple[int, bool]]:
     return copy
 
 
+def host_paced_drafts(lines) -> set[int]:
+    """The steps whose device reached their `propose` pass, after their target
+    and draft-KV pass and placed by the lead, before their host's draft copy
+    wait began: the host queues the pass just before that wait, so the device
+    waited for it there."""
+    timed, lead = _timed(lines)
+    return {
+        s["step"]
+        for s, start in timed
+        if "t_draft_recv_ns" in s
+        and "d_target_ns" in s
+        and start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0) + lead
+        < s["t_draft_recv_ns"][0]
+    }
+
+
 def _host_cut(lines) -> tuple[set[int], set[int], set[int]]:
     """The steps whose device start precedes their host launch end, the
     prefill steps the host did not pace whose launch the device held, and the
@@ -291,15 +307,8 @@ def _host_cut(lines) -> tuple[set[int], set[int], set[int]]:
             recent.append(bound)
         if start + min(recent, default=first) < s["t_launch_ns"][1]:
             exposed.add(s["step"])
-    early = {
-        s["step"]
-        for s, start, _ in timed
-        if all(r[2] for r in s["rows"])
-        and "t_draft_recv_ns" in s
-        and "d_target_ns" in s
-        and start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0) + lead
-        < s["t_draft_recv_ns"][0]
-    }
+    decodes = {s["step"] for s, _, _ in timed if all(r[2] for r in s["rows"])}
+    early = decodes & host_paced_drafts(lines)
     paced = {
         s["step"]
         for s, start, _ in timed

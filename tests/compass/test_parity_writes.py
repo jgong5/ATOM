@@ -7,8 +7,8 @@ base whose `allocate_kv_cache` builds that connector, as ATOM's does. The
 producer's listener takes write requests off a scripted socket, and its send
 workers serve them through `_execute_transfer` into fake transfer engines that
 log each write they are handed; the two writes that move bytes are in flight
-at once. Its write-dones, each sent three times, reach the consumer's listener
-the same way.
+at once. Its write-dones, which ATOM resends, reach the consumer's listener the
+same way.
 """
 
 import importlib
@@ -270,7 +270,8 @@ def test_each_write_is_stamped_on_the_calls_that_serve_it(
     consumer = _consumer(mc, requests)
     monkeypatch.setenv(ENV, str(tmp_path / "decode"))
     decode = _runner(consumer, monkeypatch)
-    assert len(producer.sent) == 3 * len(requests)
+    # More write-dones than writes: the consumer's record must drop the repeats.
+    assert len(producer.sent) > len(requests)
     frames = [[b"p", *parts] for parts in producer.sent]
     _listen(mc, monkeypatch, consumer._notification_listener, frames)
     decode.exit()
