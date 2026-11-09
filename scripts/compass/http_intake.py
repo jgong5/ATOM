@@ -21,11 +21,12 @@ streamed output, `_deliver_terminal_output` per finished sequence) and `head` an
 SSE response's head sent to the client, all size 0. Every process the server
 spawns stamps into STAMPS too: `kvsend`, a Mooncake KV write request sent
 (`MooncakeConnector._send_on_socket`), and `kvrecv`, one the prefill's listener
-received, both size 0. While it serves, the lines go to a file on the host's own
-file system, which ``STAMPS.<pid>.local`` names, and at its exit they are appended to
-STAMPS: on NFS a line written right after another waits for the first's round
-trip, inside the stage it stamps. Every other verb refuses STAMPS while such a
-file names lines not yet appended.
+received, both size 0. While it serves, the lines go to a file in the temp
+directory, which ``STAMPS.<pid>.local`` names, and at its stop, its exit or a
+SIGTERM, they are appended to STAMPS: on NFS a line written right after another
+waits for the first's round trip, inside the stage it stamps, so a temp
+directory on NFS or CIFS refuses. Every other verb refuses STAMPS while such a
+file names lines not yet appended; the server that died first left them there.
 
 `floor` reads the transport from client send to ASGI app call off a server
 `serve` ran and the parity workload's real-run ARRIVALS
@@ -69,7 +70,10 @@ it. Prints the terms, a gap's rms residual, N, bytes and sha256 as JSON.
 """
 
 import atexit
+import codecs
 import contextlib
+import fcntl
+import functools
 import glob
 import hashlib
 import importlib.abc
@@ -78,6 +82,7 @@ import json
 import os
 import runpy
 import shutil
+import signal
 import sys
 import tempfile
 import threading
@@ -97,16 +102,26 @@ def serve(stamps: str, args: list[str]) -> None:
 
 def install(stamps: str, local: str | None = None) -> None:
     """Stamp into `stamps` in this process and every process it spawns, each
-    line into `local` as it is written. With no `local`, a new file on the
-    host's own file system, which ``<stamps>.<pid>.local`` names until this
-    process's exit appends its lines to `stamps`."""
+    line into `local` as it is written. With no `local`, a new file in the
+    temp directory (`_local_dir`), which ``<stamps>.<pid>.local`` names until
+    this process's stop, its exit or a SIGTERM, appends its lines to `stamps`.
+    uvicorn takes a SIGTERM while it serves and raises it again once it has
+    stopped, after putting back the handler it found, which by default ends
+    the process before any exit handler runs."""
     stamps = os.path.abspath(stamps)
     if local is None:
-        fd, local = tempfile.mkstemp(prefix="http_intake.", suffix=".stamps")
+        fd, local = tempfile.mkstemp(
+            prefix="http_intake.", suffix=".stamps", dir=_local_dir()
+        )
         os.close(fd)
         named = f"{stamps}.{os.getpid()}.local"
         Path(named).write_text(f"{local}\n")
         atexit.register(_append, local, stamps, named)
+        previous = signal.getsignal(signal.SIGTERM)
+        main = threading.current_thread() is threading.main_thread()
+        if main and previous not in (signal.SIG_IGN, None):
+            stop = functools.partial(_stopped, previous, local, stamps, named)
+            signal.signal(signal.SIGTERM, stop)
     out = open(local, "a", buffering=1)  # noqa: SIM115
 
     def stamp(kind: str, start: int, size: int) -> None:
@@ -248,12 +263,67 @@ def install(stamps: str, local: str | None = None) -> None:
 
 
 def _append(local: str, stamps: str, named: str) -> None:
-    """Append the lines in `local` to `stamps`, then remove `local` and the
-    file `named` that names it."""
+    """Append the lines in `local` to `stamps` under an exclusive lock, so that
+    no other server's lines land inside one, then remove `local` and the file
+    `named` that names it; once only."""
+    if not os.path.exists(named):
+        return
     with open(local, "rb") as lines, open(stamps, "ab") as out:
+        fcntl.flock(out, fcntl.LOCK_EX)
         shutil.copyfileobj(lines, out)
+        out.flush()
     os.remove(named)
     os.remove(local)
+
+
+def _stopped(previous, local: str, stamps: str, named: str, signum, frame) -> None:
+    """A SIGTERM: append the lines (`_append`), then `previous` takes it, the
+    default delivered again so that the process ends of the signal."""
+    try:
+        _append(local, stamps, named)
+    finally:
+        signal.signal(signum, previous)
+        if callable(previous):
+            previous(signum, frame)
+        else:
+            os.kill(os.getpid(), signum)
+
+
+#: The mount table `_local_dir` reads, and the file systems it refuses.
+MOUNTINFO, NETWORK_FS = "/proc/self/mountinfo", ("nfs", "nfs4", "cifs", "smb3")
+
+
+def _local_dir() -> str:
+    """The temp directory, refused when `MOUNTINFO` puts it, or the upper
+    directory of the overlay holding it, on a network file system: a line
+    written there right after another waits for the first's round trip."""
+    where = os.path.realpath(tempfile.gettempdir())
+    point, fs, source, options = _mount(where)
+    upper = dict(o.partition("=")[::2] for o in options.split(",")).get("upperdir")
+    if fs not in NETWORK_FS and upper and _mount(upper)[0] != point:
+        _, fs, source, _ = _mount(upper)
+    if fs in NETWORK_FS:
+        raise SystemExit(
+            f"the stamp lines' temp directory {where} is on {fs} ({source}), where "
+            "a line written right after another waits for the first's round trip; "
+            "set TMPDIR to a directory on this host's own disk or a tmpfs"
+        )
+    return where
+
+
+def _mount(path: str) -> tuple[str, str, str, str]:
+    """The mount point, file system, source and options of the mount
+    `MOUNTINFO` lists as holding `path`."""
+    held = ("", "", "", "")
+    with open(MOUNTINFO) as table:
+        for line in table:
+            left, _, right = line.partition(" - ")
+            point = codecs.decode(left.split()[4], "unicode_escape")
+            fs, source, options = (right.split() + ["", "", ""])[:3]
+            inside = path == point or path.startswith(point.rstrip("/") + "/")
+            if inside and len(point) >= len(held[0]):
+                held = (point, fs, source, options)
+    return held
 
 
 def unstopped(stamps: str) -> None:

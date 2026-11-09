@@ -234,6 +234,7 @@ not find it naming its endpoint's port is refused.
 
 import ast
 import atexit
+import codecs
 import contextlib
 import functools
 import hashlib
@@ -430,7 +431,7 @@ _sigterm_at_ready: list = []
 #: each served tokenizer call, and each HTTP request's intake stamps.
 TOKENIZER_RECORD, INTAKE_RECORD = "tokenizer.jsonl", "intake.stamps"
 #: Beside one of those, ``<name>.local`` names the file its lines are in until
-#: the server's exit moves them there (`_LineFile`).
+#: the server's stop moves them there (`_LineFile`).
 LOCAL = ".local"
 #: This server's ``host`` entry among several, which `tokenizer` resolves.
 _frontend_host: dict | None = None
@@ -2161,21 +2162,23 @@ def _record_host(tok, record: Path) -> None:
 
 class _LineFile:
     """A file of lines at `path`, each written whole and flushed as it is
-    written, from any thread, into a file on the host's own file system, which
-    ``<path>.local`` names until `move`, at the process's exit, moves them to
+    written, from any thread, into a file in the temp directory, which
+    ``<path>.local`` names until `move`, at the server's stop, moves them to
     `path`. On NFS a line written right after another waits for the first's
-    round trip, inside the request stage the line stamps."""
+    round trip, inside the request stage the line stamps, so a temp directory
+    on a network file system refuses (`_local_dir`)."""
 
     def __init__(self, path) -> None:
         self.path = Path(path)
-        fd, self.local = tempfile.mkstemp(prefix=f"compass.{self.path.name}.")
+        fd, self.local = tempfile.mkstemp(
+            prefix=f"compass.{self.path.name}.", dir=_local_dir()
+        )
         self.file = os.fdopen(fd, "w", buffering=1)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()  # a SIGTERM's move may interrupt a write
         self.path.unlink(missing_ok=True)
         self.path.with_name(self.path.name + LOCAL).write_text(f"{self.local}\n")
-        atexit.unregister(_move_line_files)
-        atexit.register(_move_line_files)
         _line_files.append(self)
+        _move_at_stop()
 
     def write(self, line: str) -> None:
         with self.lock:
@@ -2193,12 +2196,77 @@ class _LineFile:
 
 #: The `_LineFile`s not yet moved to their record.
 _line_files: list[_LineFile] = []
+#: The SIGTERM handler `_move_at_stop` found, once it has set its own.
+_sigterm_moving: list = []
+#: The mount table `_local_dir` reads, and the file systems it refuses.
+MOUNTINFO, NETWORK_FS = "/proc/self/mountinfo", ("nfs", "nfs4", "cifs", "smb3")
 
 
 def _move_line_files() -> None:
-    """Move each `_LineFile`'s lines to its record, as the server exits."""
+    """Move each `_LineFile`'s lines to its record, as the server stops."""
     while _line_files:
         _line_files.pop().move()
+
+
+def _move_at_stop() -> None:
+    """Move the line files into their records at the process's exit, and at a
+    SIGTERM, a stop's signal: uvicorn takes it while it serves and raises it
+    again once it has stopped, after putting back the handler it found, which
+    by default ends the process before any exit handler runs."""
+    atexit.unregister(_move_line_files)
+    atexit.register(_move_line_files)
+    if _sigterm_moving or threading.current_thread() is not threading.main_thread():
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+    if previous in (signal.SIG_IGN, None):  # None: not set from Python
+        return
+    signal.signal(signal.SIGTERM, functools.partial(_stop_moving, previous))
+    _sigterm_moving.append(previous)
+
+
+def _stop_moving(previous, signum, frame) -> None:
+    """A SIGTERM: move the line files, then `previous` takes it, the default
+    delivered again so that the process ends of the signal as it would have."""
+    try:
+        _move_line_files()
+    finally:
+        signal.signal(signum, previous)
+        if callable(previous):
+            previous(signum, frame)
+        else:
+            os.kill(os.getpid(), signum)
+
+
+def _local_dir() -> str:
+    """The temp directory, refused when `MOUNTINFO` puts it, or the upper
+    directory of the overlay holding it, on a network file system."""
+    where = os.path.realpath(tempfile.gettempdir())
+    point, fs, source, options = _mount(where)
+    upper = dict(o.partition("=")[::2] for o in options.split(",")).get("upperdir")
+    if fs not in NETWORK_FS and upper and _mount(upper)[0] != point:
+        _, fs, source, _ = _mount(upper)
+    if fs in NETWORK_FS:
+        raise ValueError(
+            f"the stamp lines' temp directory {where} is on {fs} ({source}), where "
+            "a line written right after another waits for the first's round trip; "
+            "set TMPDIR to a directory on this host's own disk or a tmpfs"
+        )
+    return where
+
+
+def _mount(path: str) -> tuple[str, str, str, str]:
+    """The mount point, file system, source and options of the mount
+    `MOUNTINFO` lists as holding `path`."""
+    held = ("", "", "", "")
+    with open(MOUNTINFO) as table:
+        for line in table:
+            left, _, right = line.partition(" - ")
+            point = codecs.decode(left.split()[4], "unicode_escape")
+            fs, source, options = (right.split() + ["", "", ""])[:3]
+            inside = path == point or path.startswith(point.rstrip("/") + "/")
+            if inside and len(point) >= len(held[0]):
+                held = (point, fs, source, options)
+    return held
 
 
 #: Whether this thread is inside a `_recorded` ``encode`` call.

@@ -373,3 +373,124 @@ def test_a_recorded_server_writes_no_line_under_its_record_until_it_exits(
     assert {n: (record / n).read_text() for n in names} == lines
     assert not [p for n, p in local.items() if p.exists()]
     assert not list(record.glob("*" + compass_run.LOCAL))
+
+
+#: A recording server with no engine: its tokenizer and one request stamped,
+#: then served by uvicorn until a stop, as the API server's ``main`` does.
+SIGTERM_SERVER = """
+import asyncio, contextlib, pathlib, sys
+import uvicorn
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+from transformers import AutoTokenizer
+from atom.compass import run as compass_run
+
+model, ready = sys.argv[1], pathlib.Path(sys.argv[2])
+tok = AutoTokenizer.from_pretrained(model)
+compass_run.tokenizer(tok, None)
+tok.encode("hi there")
+
+
+async def read(request):
+    return JSONResponse({"bytes": len(await request.body())})
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    ready.touch()
+    yield
+
+
+app = Starlette(routes=[Route("/", read, methods=["POST"])], lifespan=lifespan)
+
+
+async def post():
+    messages = [{"type": "http.request", "body": b"{}", "more_body": False}]
+
+    async def receive():
+        return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+    async def send(message):
+        pass
+
+    scope = {"type": "http", "method": "POST", "path": "/", "headers": []}
+    await app(scope | {"query_string": b"", "root_path": ""}, receive, send)
+
+
+asyncio.run(post())
+uvicorn.run(app, host="127.0.0.1", port=0, log_level="warning")
+compass_run.frontend_done(None)
+"""
+
+
+def test_a_recording_server_stopped_by_sigterm_moves_its_lines_into_its_record(
+    tok, tmp_path
+):
+    """A stop SIGTERMs the server's process group. uvicorn takes the signal while
+    it serves, then raises it again, which by default ends the process before
+    any exit handler or `frontend_done` runs."""
+    import os
+    import signal
+    import subprocess
+    import time
+
+    record, local, ready = tmp_path / "steps", tmp_path / "local", tmp_path / "ready"
+    local.mkdir()
+    env = dict(os.environ, TMPDIR=str(local)) | {parity.ENV: str(record)}
+    env.pop(compass_run.ENV, None)
+    server = subprocess.Popen(
+        [sys.executable, "-c", SIGTERM_SERVER, tok.name_or_path, str(ready)],
+        env=env,
+        start_new_session=True,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        end = time.monotonic() + 300
+        while not ready.exists():
+            assert server.poll() is None, server.stderr.read()
+            assert time.monotonic() < end, "the server never served"
+            time.sleep(0.1)
+        os.killpg(server.pid, signal.SIGTERM)
+        server.wait(timeout=120)
+    finally:
+        if server.poll() is None:
+            os.killpg(server.pid, signal.SIGKILL)
+    # It ends of the signal, as it did, and its lines are in the record.
+    assert server.returncode == -signal.SIGTERM
+    stamps = (record / compass_run.INTAKE_RECORD).read_text().splitlines()
+    assert [r.split()[2] for r in stamps] == ["app", "recv", "body"]
+    _, calls = _calls(record)
+    assert [(c["call"], c["tokens"]) for c in calls] == [("encode", 2)]
+    assert not list(record.glob("*" + compass_run.LOCAL))
+    assert not list(local.iterdir())
+
+
+@pytest.mark.parametrize("held", ["nfs", "overlay"])
+def test_a_temp_dir_on_a_network_file_system_refuses_the_record(
+    record, tok, monkeypatch, tmp_path, held
+):
+    """A line written there right after another would wait for the first's
+    round trip, the wait the local file keeps out of the request's stages."""
+    import re
+    import tempfile
+
+    shared, temp = tmp_path / "shared", tmp_path / "tmp"
+    if held == "nfs":
+        temp = shared / "tmp"
+    temp.mkdir(parents=True)
+    table = tmp_path / "mountinfo"
+    root = f"upperdir={shared / 'upper'},workdir={shared / 'work'}"
+    table.write_text(
+        f"1 0 0:40 / / rw - {'overlay overlay' if held == 'overlay' else 'ext4 /dev/sdb2'}"
+        f" rw,{root if held == 'overlay' else 'relatime'}\n"
+        f"2 1 0:48 / {shared} rw,relatime - nfs 10.0.0.1:/home rw,vers=3\n"
+    )
+    monkeypatch.setattr(compass_run, "MOUNTINFO", str(table), raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+
+    refused = f"the stamp lines' temp directory {temp} is on nfs (10.0.0.1:/home)"
+    with pytest.raises(ValueError, match=re.escape(refused) + ".*set TMPDIR"):
+        compass_run.tokenizer(tok, None)
+    assert not list(record.iterdir())

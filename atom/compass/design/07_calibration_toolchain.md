@@ -458,7 +458,16 @@ backend's `encode_batch`, and ATOM's segment tokenizer call around its `encode_b
 the body's bytes, each on the wall clock and on its thread's CPU clock, and on the loop
 `wait`, from the tokenizer pool job's submit to the request's resume, and `recv`, each
 receive of the body's read; and `out`, each row of a streamed engine output the server's
-output thread takes in, and `head`, each SSE head sent. `fit host` fits both
+output thread takes in, and `head`, each SSE head sent. The lines reach the record at the
+server's stop, its exit or the SIGTERM a stop sends: until then they are in files in the
+server's temp directory, which `steps/<name>.local` names, since on NFS a line written right
+after another waits for the first's round trip inside the stage it stamps
+([#2870](https://github.com/jgong5/ATOM/issues/2870)); a temp directory on NFS or CIFS
+refuses. A server that died first leaves the `.local` file, naming a path inside its
+container, and `fit host` refuses the record: copy the file into `steps/` with
+`podman cp` and delete the `.local` file while that container runs. A tmpfs `/tmp`, as
+QUICKSTART's container mounts, goes with the container's stop, and the record is taken
+again. `fit host` fits both
 into the entry's `tokenizer` and `http_intake` terms (`05` D25) with the host laws' solver,
 drops and hulls (`09` D53, D58). Compass does not model the GIL, so no fitted term may carry
 a GIL wait
