@@ -70,6 +70,7 @@ def patched(monkeypatch):
         (CoreManager, "_deliver_terminal_output"),
         (ThreadPoolExecutor, "submit"),
         (segment_tokenizer.SegmentTokenizer, "_encode_cached"),
+        (segment_tokenizer, "_shared_chars"),
     ):
         monkeypatch.setattr(owner, name, vars(owner)[name])
     render = chat_encoders.apply_chat_template
@@ -134,6 +135,33 @@ def test_a_recorded_server_writes_each_segment_tokenizer_call_around_its_own(
     assert batch["thread"] == first["thread"]
     assert first["t_start_ns"] < batch["t_start_ns"] < batch["t_end_ns"]
     assert batch["t_end_ns"] < first["t_end_ns"]
+
+
+def test_a_recorded_segment_tokenizer_call_writes_what_its_stored_prefix_search_compared(
+    record, monkeypatch
+):
+    # Every prompt takes the cache unchecked, and its first two characters bucket it.
+    monkeypatch.setattr(segment_tokenizer, "_MIN_CACHED_CHARS", 0)
+    monkeypatch.setattr(segment_tokenizer, "_VERIFY_FIRST", 0)
+    monkeypatch.setattr(segment_tokenizer, "_PREFIX_KEY_CHARS", 2)
+    vocab = {"[UNK]": 0} | {w: i + 1 for i, w in enumerate(WORDS)}
+    backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    backend.add_special_tokens([AddedToken("<sep>", special=True)])
+    tok = PreTrainedTokenizerFast(tokenizer_object=backend)
+    seg = segment_tokenizer.SegmentTokenizer.maybe_create(tok, 1 << 20)
+    compass_run.tokenizer(tok, None)
+    # Two conversations that share "hi there<sep>", 13 characters, each stored,
+    # then a third prompt that the search compares with both.
+    for prompt in (
+        "hi there<sep>how<sep>",
+        "hi there<sep>you<sep>",
+        "hi there<sep>are",
+    ):
+        seg.encode(prompt)
+    _, calls = _calls(record)
+    searched = [c["compared_chars"] for c in calls if c["call"] == "segment"]
+    assert searched == [0, 13, 26]
 
 
 def _server(tok):
