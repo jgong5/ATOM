@@ -568,24 +568,25 @@ def test_an_engine_whose_input_thread_reads_shutdown_first_takes_the_released_re
         target=engine.process_input_sockets, args=addrs, daemon=True
     )
     reader.start()
-    assert mgr.input_sockets[0].raw.poll(5000) and mgr.control_sockets[0].raw.poll(5000)
-    mgr.engine_core_identities = [mgr.input_sockets[0].recv_multipart()[0]]
-    mgr.control_identities = [mgr.control_sockets[0].recv_multipart()[0]]
-    frontend.start_run()
-    rt.start_run()
-    add = (EngineCoreRequestType.ADD, [SimpleNamespace(id=7)])
-    mgr._send_request(0, pickle.dumps(add))
-    deadline = time.monotonic() + 10
-    while 0 not in rt.arrived[request]:
-        assert time.monotonic() < deadline, "request 0 not read in 10 wall seconds"
-        time.sleep(0.01)
-    frontend.end_run()  # the stop, as the frontend's event loop makes it
-    mgr._send_control(0, pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
-    reader.join(1)  # SHUTDOWN reaches the input thread before the engine asks
-    owner.start()
-    owner.join(10)
-    reader.join(10)
     try:
+        assert mgr.input_sockets[0].raw.poll(5000)
+        assert mgr.control_sockets[0].raw.poll(5000)
+        mgr.engine_core_identities = [mgr.input_sockets[0].recv_multipart()[0]]
+        mgr.control_identities = [mgr.control_sockets[0].recv_multipart()[0]]
+        frontend.start_run()
+        rt.start_run()
+        add = (EngineCoreRequestType.ADD, [SimpleNamespace(id=7)])
+        mgr._send_request(0, pickle.dumps(add))
+        deadline = time.monotonic() + 10
+        while 0 not in rt.arrived[request]:
+            assert time.monotonic() < deadline, "request 0 not read in 10 wall seconds"
+            time.sleep(0.01)
+        frontend.end_run()  # the stop, as the frontend's event loop makes it
+        mgr._send_control(0, pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+        reader.join(1)  # SHUTDOWN reaches the input thread before the engine asks
+        owner.start()
+        owner.join(10)
+        reader.join(10)
         assert not owner.is_alive(), "the engine never took the released request"
         assert not reader.is_alive()
         taken = [engine.input_queue.get_nowait()[0] for _ in range(2)]
@@ -594,5 +595,15 @@ def test_an_engine_whose_input_thread_reads_shutdown_first_takes_the_released_re
         hand_in = tmp_path / compass_run.LP_FILE.format("engine")
         assert json.loads(hand_in.read_text())["refusals"] == []
     finally:
+        # A context left to the garbage collector can hang the session in
+        # `Context.term`, so every path closes it here. An input thread that a
+        # failure left polling, once connected, leaves on a SHUTDOWN neither
+        # run holds back: sent after the stop, read once the engine's run ends.
+        if reader.is_alive() and hasattr(mgr, "control_identities"):
+            if frontend.in_run:
+                frontend.end_run()
+            rt.end_run()
+            mgr._send_control(0, pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+            reader.join(10)
         server.close()
         ctx.destroy(linger=0)
