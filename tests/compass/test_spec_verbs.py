@@ -16,6 +16,7 @@ import copy
 import importlib.util
 import json
 import pathlib
+import re
 
 import pytest
 
@@ -601,21 +602,28 @@ def test_the_mi355x_spec_rebuilds_byte_for_byte(monkeypatch, tmp_path, name):
     assert out.read_bytes() == document.read_bytes()
 
 
-def test_the_gpu40_spec_pins_nightly_20261026(monkeypatch):
-    _, spec = _mi355x_spec(monkeypatch, "mi355x-gpu40")
+def test_the_gpu40_spec_pins_nightly_20261026_with_the_recipes_aiter(monkeypatch):
+    script, spec = _mi355x_spec(monkeypatch, "mi355x-gpu40")
     document = SPEC_ROOT / "scripts" / "compass" / "machines" / "mi355x-gpu40.json"
     assert validate(json.loads(document.read_text())).ok
+    recipe = SPEC_ROOT / "scripts" / "compass" / "aiter_c90842add0.sh"
+    patched = re.search(r"^PATCHED=([0-9a-f]{40})$", recipe.read_text(), re.M)
     pinned = {
         k: spec.value(f"device.software_pinned_to.{k}")
         for k in ("rocm", "aiter", "rccl", "torch")
     }
     assert pinned == {
         "rocm": "7.2.4",
-        "aiter": "41d4d8d7e",
+        "aiter": patched.group(1)[:9],
         "rccl": "2.27.7",
         "torch": "2.10.0+rocm7.2.4.git3d3aa833",
     }
     assert spec.value("device.ptl") == "disabled"
+    # The stack is the patched container's start's; the device is still the
+    # device start's, which ran the image's aiter.
+    stack = spec.origin("device.software_pinned_to.aiter")["record"]
+    assert stack == f"sha256:{script.STACK[-1]}"
+    assert spec.origin("device.name")["record"] == f"sha256:{script.RECORD}"
 
 
 @pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39"])
