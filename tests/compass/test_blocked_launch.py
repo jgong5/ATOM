@@ -73,7 +73,7 @@ def test_the_tool_times_each_thread_s_blocking_hip_calls(tmp_path):
     """Loaded by rocprofiler-sdk, the tool times a device and a stream
     synchronize on the thread that made them, and the other thread's
     synchronize on that thread alone; an error query is not a blocking call.
-    It traces synchronous copies and frees, and no async call or launch."""
+    It times synchronous copies and frees, and no async call or launch."""
     library = blocked.build(tmp_path)
     run = _child(CHILD, ROCP_TOOL_LIBRARIES=str(library))
     assert run.returncode == 0, run.stderr
@@ -89,7 +89,7 @@ def test_the_tool_times_each_thread_s_blocking_hip_calls(tmp_path):
     assert not {n for n in names if "Async" in n or "Launch" in n or "Graph" in n}
 
 
-def test_a_process_without_the_tool_reads_none_and_one_it_never_started_refuses(
+def test_a_process_without_the_tool_reads_none_and_one_hip_never_hooked_refuses(
     tmp_path,
 ):
     library = blocked.build(tmp_path)
@@ -100,7 +100,7 @@ def test_a_process_without_the_tool_reads_none_and_one_it_never_started_refuses(
         "from atom.compass.parity import blocked; blocked.loaded()"
     )
     assert run.returncode == 1
-    assert "rocprofiler-sdk started no tracing in it" in run.stderr
+    assert "HIP handed it no dispatch table to hook" in run.stderr
 
 
 def _planted_tool(names):

@@ -41,7 +41,7 @@ def build(directory) -> Path:
 
 class Blocked:
     """The tool loaded in this process: calling it reads the calling thread's
-    nanoseconds inside each traced call, in the order of `names`."""
+    nanoseconds inside each timed call, in the order of `names`."""
 
     def __init__(self, lib) -> None:
         lib.compass_blocked_name.restype = ctypes.c_char_p
@@ -62,7 +62,7 @@ class Blocked:
 
 def loaded() -> Blocked | None:
     """The tool, if HIP's initialization loaded it into this process; None
-    without it. Loaded with no tracing started, it refuses: its sums would
+    without it. Loaded with no dispatch table hooked, it refuses: its sums would
     read nothing blocked."""
     try:
         lib = ctypes.CDLL(LIBRARY, mode=os.RTLD_NOLOAD | os.RTLD_NOW)
@@ -70,7 +70,7 @@ def loaded() -> Blocked | None:
         return None
     if lib.compass_blocked_calls() < 0:
         raise RuntimeError(
-            f"{LIBRARY} is loaded but rocprofiler-sdk started no tracing in it; "
+            f"{LIBRARY} is loaded but HIP handed it no dispatch table to hook; "
             "it is loaded through ROCP_TOOL_LIBRARIES before HIP initializes"
         )
     return Blocked(lib)
