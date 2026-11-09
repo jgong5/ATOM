@@ -72,7 +72,9 @@ def _samples(graphs=SETS, seed=3068):
     for run in ("a", "b"):
         for i in range(60):
             tokens = int(rng.integers(256, 6000)) if i % 2 else 1
-            view = BatchView((RequestShape(tokens, tokens, i % 2 == 0),), produces_output=True)
+            view = BatchView(
+                (RequestShape(tokens, tokens, i % 2 == 0),), produces_output=True
+            )
             launch = Planted().predict(view, graphs) if graphs else {}
             w = 2e-3 + 1e-6 * tokens + EAGER_S * launch.get("eager", 0.0)
             host = {"E": 1e-4, "W_pre": 1e-4, "W_post": 1e-4}
