@@ -43,20 +43,13 @@ import ast
 import copy
 import pathlib
 import sys
-import warnings
 
 import pytest
 
 from atom.compass import spec as spec_package
-from atom.compass.spec import (
-    Backend,
-    Fragment,
-    MachineSpec,
-    SpecRefusal,
-    explain,
-)
+from atom.compass.spec import Fragment, MachineSpec, SpecRefusal, explain
 from atom.compass.spec.fields import FIELDS, SCHEMA, SCHEMA_VERSION, Kind
-from atom.compass.spec.rules import DEPLOYMENT_OWNED, FingerprintMismatch, Rule
+from atom.compass.spec.rules import DEPLOYMENT_OWNED, Rule
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 PACKAGE = REPO / "atom" / "compass" / "spec"
@@ -65,19 +58,6 @@ ENGINE_ARGS = REPO / "atom" / "model_engine" / "arg_utils.py"
 #: The stack the constants below were measured against.
 STACK = {"rocm": "7.2.4", "aiter": "f4e7c7509", "rccl": "2.22.3", "torch": "2.10.0"}
 
-TOKENIZER = {
-    "id": "qwen3-151k-bpe",
-    "backend": "fast",
-    "vocab_size": 151936,
-    "fingerprint": "sha256:" + "a" * 64,
-    "applies_to": ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"],
-    "encode_fixed_s": 3.0e-4,
-    "encode_tokens_per_s": 2.0e6,
-    "decode_fixed_s": 1.5e-4,
-    "decode_tokens_per_s": 3.0e6,
-    "derate": 0.85,
-}
-
 DOCUMENT = {
     "schema_version": 1,
     "name": "mi355x-8gpu-2node",
@@ -85,12 +65,6 @@ DOCUMENT = {
         "authored_by": "a person",
         "date": "2026-09-18",
         "origin": "probed",
-    },
-    "host": {
-        "cpu": {"cores_physical": 96, "cores_logical": 192},
-        "tokenizers": [TOKENIZER],
-        "ipc": {"zmq_roundtrip_s": 5.0e-5, "shm_broadcast_s": 2.0e-5},
-        "http_intake": {"fixed_s": 2.0e-3, "per_byte_s": 2.0e-8},
     },
     "device": {
         "name": "MI355X",
@@ -187,10 +161,10 @@ def test_the_digest_moves_when_any_number_does():
 # does not test it.
 
 #: A field stated nested by the reference document, for a dotted twin to meet.
-TWIN = "host.cpu.cores_physical"
+TWIN = "interconnect.inter_node.link_latency_s"
 
 #: What the reference document states there, for a twin that agrees with it.
-AGREED = DOCUMENT["host"]["cpu"]["cores_physical"]
+AGREED = DOCUMENT["interconnect"]["inter_node"]["link_latency_s"]
 
 
 def both_spellings(dotted_first, value=1):
@@ -233,7 +207,7 @@ def test_both_orders_give_the_same_refusal():
     nested_first = refusal_from(both_spellings(False))
     assert dotted_first.rule is nested_first.rule
     assert str(dotted_first) == str(nested_first)
-    for value in ("96", "1"):
+    for value in ("5e-06", "1"):
         assert value not in str(dotted_first)
 
 
@@ -269,10 +243,10 @@ def test_the_collision_is_about_the_path_and_not_about_the_top_level():
     # Two spellings meeting one block down, neither of them the whole path, so
     # what is compared is what each resolves to.
     written = document()
-    written["host"]["cpu.cores_logical"] = 1
+    written["interconnect"]["intra_node.link_latency_s"] = 1
     refusal = refusal_from(written)
     assert refusal.rule is Rule.SHAPE
-    assert "host.cpu.cores_logical" in refusal.what
+    assert "interconnect.intra_node.link_latency_s" in refusal.what
 
 
 def test_a_dotted_key_on_its_own_is_a_supported_spelling():
@@ -280,10 +254,10 @@ def test_a_dotted_key_on_its_own_is_a_supported_spelling():
     # the echo is the nested document -- which is also why carrying both
     # spellings is one field twice rather than two fields.
     written = document()
-    cpu = written["host"].pop("cpu")
-    flat = {f"host.cpu.{name}": value for name, value in cpu.items()}
+    link = written["interconnect"].pop("inter_node")
+    flat = {f"interconnect.inter_node.{name}": value for name, value in link.items()}
     machine = MachineSpec.from_mapping({**written, **flat})
-    assert machine.value(TWIN) == 96
+    assert machine.value(TWIN) == AGREED
     assert machine.echo() == DOCUMENT
     assert machine.digest() == read().digest()
 
@@ -359,19 +333,7 @@ BREAKAGES = {
     "a required field is missing": lambda: drop(
         document(), "device", "memory", "capacity_bytes"
     ),
-    "the http intake fixed cost is missing": lambda: drop(
-        document(), "host", "http_intake", "fixed_s"
-    ),
-    "the http intake per-byte cost is missing": lambda: drop(
-        document(), "host", "http_intake", "per_byte_s"
-    ),
     "a spec that is not a mapping at all": lambda: [1, 2],
-    "a tokenizer entry field is missing": lambda: drop(
-        document(), "host", "tokenizers", 0, "vocab_size"
-    ),
-    "a tokenizer entry that is not a mapping": lambda: written(
-        "host.tokenizers", ["not an entry"]
-    ),
     "a value the schema cannot hold": lambda: written(
         "device.memory.capacity_bytes", "lots"
     ),
@@ -613,6 +575,14 @@ def test_every_rule_is_named_by_at_least_one_site():
         if isinstance(node, ast.Attribute) and getattr(node.value, "id", None) == "Rule"
     }
     assert named
+    # MEASURED is the rule a probe is held to, and the one probe left is the
+    # device probe, `atom/compass/drive/device_probe.py`, outside the spec package.
+    probe = ast.parse((REPO / "atom/compass/drive/device_probe.py").read_text())
+    named |= {
+        node.attr
+        for node in ast.walk(probe)
+        if isinstance(node, ast.Attribute) and getattr(node.value, "id", None) == "Rule"
+    }
     assert [member.name for member in Rule if member.name not in named] == []
 
 
@@ -698,30 +668,19 @@ def test_the_spec_does_not_move_when_the_document_does():
     machine = MachineSpec.from_mapping(written)
     before = machine.digest()
     echoed = machine.echo()
-    entries = written["host"]["tokenizers"]
     written["provenance"]["fragments"].append("probe-device")
-    entries.append(dict(TOKENIZER, id="another"))
-    entries[0]["encode_tokens_per_s"] = 1.0
-    entries[0]["applies_to"].append("LlamaForCausalLM")
     assert machine.digest() == before
     assert machine.echo() == echoed
 
 
 def test_no_container_the_document_owns_reaches_the_spec():
-    # A list of names copies with `tuple`; a tokenizer entry holds mappings and
-    # lists of its own, so the same guarantee there is a walk rather than a
-    # constructor.
+    # A list of names copies with `tuple`.
     written = document()
     written["provenance"]["fragments"] = ["probe-cpu"]
     machine = MachineSpec.from_mapping(written)
-    entries = written["host"]["tokenizers"]
-    held = machine.value("host.tokenizers")
     assert (
         machine.value("provenance.fragments") is not written["provenance"]["fragments"]
     )
-    assert held is not entries
-    assert held[0] is not entries[0]
-    assert held[0]["applies_to"] is not entries[0]["applies_to"]
 
 
 # --- the separation rule -----------------------------------------------------
@@ -854,17 +813,6 @@ def test_a_derate_may_shrink_a_peak_and_never_grow_it(value):
     assert "(0, 1]" in refusal.value.what
 
 
-def test_a_tokenizer_entry_owes_a_derate_too():
-    entry = dict(TOKENIZER)
-    del entry["derate"]
-    edited = document()
-    edited["host"]["tokenizers"] = [entry]
-    with pytest.raises(SpecRefusal) as refusal:
-        MachineSpec.from_mapping(edited)
-    assert refusal.value.rule is Rule.DERATE
-    assert "host.tokenizers[0].derate` is missing" in refusal.value.what
-
-
 # --- the stack pin is required ----------------------------------------------
 
 
@@ -874,98 +822,15 @@ def test_a_missing_stack_pin_is_refused():
         MachineSpec.from_mapping(edited)
 
 
-# --- the tokenizer is keyed by the tokenizer ---------------------------------
-
-
-def test_two_models_sharing_one_tokenizer_resolve_to_one_entry():
-    # Two architectures, one measured entry: four rates and a derate stored
-    # once. Keyed by model the same spec would hold one copy per
-    # architecture -- two here, more in a real family -- with nothing in the
-    # document ever comparing them, so they would drift silently.
-    machine = read()
-    qwen = machine.tokenizer_for("Qwen3ForCausalLM", Backend.FAST)
-    qwen_moe = machine.tokenizer_for("Qwen3MoeForCausalLM", Backend.FAST)
-    assert qwen is qwen_moe
-    assert len(machine.tokenizers.entries) == 1
-    copies_if_keyed_by_model = sum(
-        len(entry.key.applies_to) for entry in machine.tokenizers.entries
-    )
-    assert copies_if_keyed_by_model == 2
-    assert qwen.encode_tokens_per_s == 2.0e6
-
-
-def test_an_unmeasured_architecture_is_refused_not_defaulted():
-    with pytest.raises(SpecRefusal) as refusal:
-        read().tokenizer_for("LlamaForCausalLM", Backend.FAST)
-    assert refusal.value.rule is Rule.TOKENIZER_IDENTITY
-    assert "LlamaForCausalLM" in refusal.value.what
-    assert "qwen3-151k-bpe" in refusal.value.what
-
-
-def test_the_other_backend_is_a_different_measurement():
-    # The two implementations run an order of magnitude apart on the same file,
-    # so an entry measured on one says nothing about the other.
-    with pytest.raises(SpecRefusal) as refusal:
-        read().tokenizer_for("Qwen3ForCausalLM", Backend.SLOW)
-    assert refusal.value.rule is Rule.TOKENIZER_IDENTITY
-    # Both backends appear in this message -- the one asked for and the one the
-    # entry was measured on -- so naming the word alone would hold with the two
-    # of them the wrong way round, which is the claim being made.
-    assert "on the slow backend" in refusal.value.what
-    assert "qwen3-151k-bpe (fast)" in refusal.value.what
-
-
-def test_a_fingerprint_mismatch_warns_and_names_both():
-    loaded = "sha256:" + "b" * 64
-    with pytest.warns(FingerprintMismatch) as caught:
-        entry = read().tokenizer_for("Qwen3ForCausalLM", Backend.FAST, loaded)
-    assert entry.key.id == "qwen3-151k-bpe"
-    message = str(caught[0].message)
-    assert TOKENIZER["fingerprint"] in message and loaded in message
-
-
-def test_the_measured_fingerprint_is_silent():
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        read().tokenizer_for("Qwen3ForCausalLM", Backend.FAST, TOKENIZER["fingerprint"])
-
-
-def test_two_entries_claiming_one_architecture_are_refused():
-    other = dict(TOKENIZER, id="qwen3-151k-bpe-again")
-    edited = document()
-    edited["host"]["tokenizers"] = [TOKENIZER, other]
-    with pytest.raises(SpecRefusal) as refusal:
-        MachineSpec.from_mapping(edited)
-    assert refusal.value.rule is Rule.TOKENIZER_IDENTITY
-    assert "qwen3-151k-bpe-again" in refusal.value.what
-
-
-def test_an_unknown_backend_names_the_two_that_exist():
-    edited = document()
-    edited["host"]["tokenizers"] = [dict(TOKENIZER, backend="rust")]
-    with pytest.raises(SpecRefusal) as refusal:
-        MachineSpec.from_mapping(edited)
-    assert refusal.value.rule is Rule.TOKENIZER_IDENTITY
-    assert "fast" in refusal.value.remedy and "slow" in refusal.value.remedy
-
-
-def test_a_tokenizer_entry_is_closed_like_the_rest_of_the_schema():
-    edited = document()
-    edited["host"]["tokenizers"] = [dict(TOKENIZER, max_model_len=4096)]
-    with pytest.raises(SpecRefusal) as refusal:
-        MachineSpec.from_mapping(edited)
-    assert refusal.value.rule is Rule.SEPARATION
-
-
 # --- shapes ------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "path, value",
     [
-        (("host", "cpu", "cores_physical"), True),
-        (("host", "cpu", "cores_physical"), 0),
-        (("host", "ipc", "zmq_roundtrip_s"), -1.0),
+        (("device", "count_per_node"), True),
+        (("device", "count_per_node"), 0),
+        (("interconnect", "router_relay_s"), -1.0),
         (("device", "name"), ""),
         (("device", "arch"), 950),
         (("schema_version",), 2),
@@ -1052,9 +917,9 @@ def test_the_package_imports_only_the_standard_library_it_names(module):
     # a spec can be authored and checked on any machine: no device runtime, no
     # engine, and no document parser either -- turning a file into a mapping is
     # the caller's, which keeps a dependency the engine does not declare out of
-    # the path that reads a spec. `pathlib` is here for the probe that reads the
-    # processor topology the kernel publishes: reading a path is not a device
-    # runtime, and nothing on the path that checks a document touches it.
+    # the path that reads a spec. `pathlib` is here for `layers.py`, which finds
+    # a device datasheet or a network file by name or by path: reading a path is
+    # not a device runtime.
     allowed = {
         "collections",
         "dataclasses",
@@ -1063,7 +928,6 @@ def test_the_package_imports_only_the_standard_library_it_names(module):
         "json",
         "pathlib",
         "typing",
-        "warnings",
     }
     tree = ast.parse(module.read_text())
     roots = []

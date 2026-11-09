@@ -198,13 +198,11 @@ def shim_ctx():
 
 
 def _engine_table():
-    return single_engine_table(admission_path="serving", ipc_s=IPC, stream_s=IPC)
+    return single_engine_table(admission_s=0.54e-3, ipc_s=IPC, stream_s=IPC)
 
 
 def _pp_table(stages):
-    return single_engine_table(
-        admission_path="serving", ipc_s=IPC, stream_s=IPC, pp=stages
-    )
+    return single_engine_table(admission_s=0.54e-3, ipc_s=IPC, stream_s=IPC, pp=stages)
 
 
 def _stage(monkeypatch, table, rank, stages, ctx, conn=None, owner=None):

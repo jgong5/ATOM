@@ -322,11 +322,24 @@ def charge(d: float) -> None:
 #: Whether this thread is inside a `wrap_encode` call, which charges the backend
 #: calls its ``encode`` makes.
 _in_encode = threading.local()
+#: The ids the ``encode_batch`` calls this thread charged returned, over which a
+#: segment tokenizer call's own work is charged.
+_encoded = threading.local()
 
 
-def wrap_encode(encode, entry):
-    """`encode`, charging the current job ``fixed + tokens / derated rate``."""
-    rate = entry.encode_tokens_per_s * entry.derate
+def _price(rate, tokens: int) -> float:
+    """Seconds `rate`, a kind of call's term in a ``host`` entry's
+    ``tokenizer``, charges a call of `tokens` tokens: ``fixed_s + tokens /
+    tokens_per_s``, ``fixed_s`` alone with no ``tokens_per_s``; 0 with no
+    `rate`."""
+    if rate is None:
+        return 0.0
+    return rate["fixed_s"] + tokens / rate.get("tokens_per_s", math.inf)
+
+
+def wrap_encode(encode, rate):
+    """`encode`, charging the current job `_price` of `rate`, a ``host`` entry's
+    ``tokenizer.encode``."""
 
     def charged(*args, **kwargs):
         _in_encode.on = True
@@ -334,34 +347,58 @@ def wrap_encode(encode, entry):
             ids = encode(*args, **kwargs)
         finally:
             _in_encode.on = False
-        charge(entry.encode_fixed_s + len(ids) / rate)
+        charge(_price(rate, len(ids)))
         return ids
 
     return charged
 
 
-def wrap_encode_batch(encode_batch, entry):
+def wrap_encode_batch(encode_batch, one, several):
     """A fast tokenizer backend's ``encode_batch``, charging the current job
-    ``fixed + tokens / derated rate`` over the ids of all the encodings it
-    returns, the batch at the single-call rate; a call made inside a
+    `_price` over the ids of all the encodings it returns, of `one`, the
+    ``tokenizer.encode`` term, for one encoding, and of `several`, the
+    ``tokenizer.encode_batch`` term, for more; a call made inside a
     `wrap_encode` call is that call's to charge."""
-    rate = entry.encode_tokens_per_s * entry.derate
 
     def charged(*args, **kwargs):
         encodings = encode_batch(*args, **kwargs)
         if not getattr(_in_encode, "on", False):
-            charge(entry.encode_fixed_s + sum(len(e.ids) for e in encodings) / rate)
+            tokens = sum(len(e.ids) for e in encodings)
+            _encoded.ids = getattr(_encoded, "ids", 0) + tokens
+            charge(_price(one if len(encodings) == 1 else several, tokens))
         return encodings
 
     return charged
 
 
-def wrap_decode(decode, entry):
-    """`decode`, charging the current job ``fixed + tokens / derated rate``."""
-    rate = entry.decode_tokens_per_s * entry.derate
+def wrap_segment(encode_cached, rate):
+    """The segment tokenizer call, charging its own work: `_price` of `rate`, a
+    ``tokenizer.segment``, over the ids its ``encode_batch`` calls returned."""
+
+    def charged(*args, **kwargs):
+        _encoded.ids = 0
+        got = encode_cached(*args, **kwargs)
+        charge(_price(rate, _encoded.ids))
+        return got
+
+    return charged
+
+
+def wrap_decode(decode, rate):
+    """`decode`, charging the current job `_price` of `rate`, a ``host`` entry's
+    ``tokenizer.decode``. A decode of a token count outside the term's
+    ``tokens`` is charged nothing and is a run-summary reason
+    ``tokenizer:decode ...`` naming them."""
+    lo, hi = (rate or {}).get("tokens", (0, math.inf))
 
     def charged(ids, *args, **kwargs):
-        charge(entry.decode_fixed_s + len(ids) / rate)
+        if lo <= len(ids) <= hi:
+            charge(_price(rate, len(ids)))
+        elif (rt := clock.installed()) is not None:
+            rt.refusals.append(
+                f"tokenizer:decode of {len(ids)} tokens, outside the {lo} to "
+                f"{hi} tokens its decode was fitted on"
+            )
         return decode(ids, *args, **kwargs)
 
     return charged
@@ -684,14 +721,17 @@ class HttpChannel:
     instant, every tokenizer station job placed and all else due by then run
     (`SimExecutor.placed`), so a burst reaches the app one request at a time.
     A request that arrives once the last intake has ended is charged ``idle_s``
-    in place of ``fixed_s``. A run file with no machine spec charges nothing.
+    in place of ``fixed_s``. A ``host`` entry with no ``http_intake`` charges nothing.
+    A body outside the bytes the term was fitted over
+    (`atom.compass.run.http_intake_hull`) is charged nothing and is a run-summary
+    reason ``http:intake ...`` naming that hull.
     """
 
     def __init__(self, app, stamp) -> None:
-        from atom.compass.run import http_intake
+        from atom.compass.run import http_intake, http_intake_hull
 
         self.app, self.stamp = app, stamp
-        self.intake = http_intake()
+        self.intake, self.hull = http_intake(), http_intake_hull()
         self.intake_end = -math.inf  # the LP time the last intake ended
         # http seq -> its hang-up, for each stamped request the app is serving
         self.hangups: dict[int, asyncio.Event] = {}
@@ -752,7 +792,14 @@ class HttpChannel:
                     if arrival >= self.intake_end:
                         fixed = idle
                     nbytes = sum(len(m.get("body", b"")) for m in body)
-                    charge(fixed + per_byte * nbytes)
+                    lo, hi = self.hull or (0, math.inf)
+                    if lo <= nbytes <= hi:
+                        charge(fixed + per_byte * nbytes)
+                    else:
+                        rt.refusals.append(
+                            f"http:intake of a {nbytes}-byte body, outside the "
+                            f"{lo:.0f} to {hi:.0f} bytes its http_intake was fitted on"
+                        )
                     self.intake_end = loop.time()
                 with rt.lock:
                     rt.count_done_locked(ch, seq)

@@ -289,7 +289,7 @@ def test_a_dp_aware_router_runs_as_the_router_lp_on_the_run_s_clock(tmp_path, pl
         "commit": _tree_commit(),
         "status": "clean",
     }
-    assert run["router_in_s"] == run["ipc_s"]
+    assert run["router_in_s"] == compass_run.hop(run, "ipc_s")
     table = compass_run.channel_table(run)
     assert compass_run.ROUTER in table.registry.ids()
     router = json.loads((tmp_path / "router.json").read_text())

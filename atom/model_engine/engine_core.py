@@ -53,9 +53,9 @@ from atom.utils.gc_utils import (
 
 logger = logging.getLogger("atom")
 
-# Pace of the idle KV drain. The busy loops never block, so an unpaced drain
-# would fire one worker RPC round per spin; 1ms matches the PP head's existing
-# idle token-poll timeout and is far below any transfer latency.
+# Pace of the idle KV drain. No busy loop blocks while KV work is pending, so
+# an unpaced drain would fire one worker RPC round per spin; 1ms matches the PP
+# head's existing idle token-poll timeout and is far below any transfer latency.
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
 
 # Upper bound on the drain that runs after the loop exits. A peer that died
@@ -454,6 +454,8 @@ class EngineCore:
                     self._process_engine_step()
                 elif self.has_pending_kv_work():
                     self._advance_idle_kv_transfer()
+                else:
+                    self._wait_for_input(next_metrics_push)
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -467,6 +469,35 @@ class EngineCore:
                 self.scheduler.shutdown_kv_events()
             finally:
                 tracing.shutdown()
+
+    def _wait_for_input(self, next_metrics_push: float) -> None:
+        """Park an idle loop on its input queue until a request or shutdown is
+        put there, a utility command arrives (`_notify_input`), or the earlier
+        of `_idle_deadline()` and `next_metrics_push` passes.
+
+        A loop that spun instead would hold the GIL, so the input thread would
+        take each request one or more 5 ms switch intervals late. A simulated
+        run's idle point is `clock.idle`, so there this returns at once.
+
+        Both checks run under the lock a put or `_notify_input` takes, so input
+        landing between them and the wait still wakes it. The utility check
+        reads the flag `process_queue` drains on, which the input thread sets
+        before it notifies.
+        """
+        if clock.installed() is not None:
+            return
+        deadline = min(self._idle_deadline(), next_metrics_push)
+        timeout = deadline - clock.now(time.monotonic)
+        q = self.input_queue
+        with q.not_empty:
+            if timeout > 0 and not q._qsize() and not self._has_pending_utility:
+                q.not_empty.wait(min(timeout, threading.TIMEOUT_MAX))
+
+    def _notify_input(self) -> None:
+        """Wake a loop parked in `_wait_for_input`; a put on the input queue
+        wakes it by itself."""
+        with self.input_queue.not_empty:
+            self.input_queue.not_empty.notify()
 
     def _process_engine_step(self):
         try:
@@ -816,6 +847,7 @@ class EngineCore:
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         self.utility_queue.put_nowait((cmd, reqs))
                         self._has_pending_utility = True
+                        self._notify_input()
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])

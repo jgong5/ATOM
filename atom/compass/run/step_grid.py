@@ -28,7 +28,8 @@ is `keyed`, as JSON: the ladder the runner replays (none under
 ``enforce_eager``), the KV block size and dtype, the quantization, the TP and
 DP widths, DP attention, expert parallelism, TBO, the MoE backend, EPLB and
 DeepSeek-V4.1 decoder SWA bounded replay when
-off ATOM's default, the performance environment, ATOM's prefill token buckets
+off ATOM's default, the index cache's dtype where ATOM resolved it apart from
+the KV cache's, the performance environment, ATOM's prefill token buckets
 in it when off ATOM's default too, and, under speculation, its
 method and draft width. Loading refuses, naming what differs:
 
@@ -84,16 +85,24 @@ from atom.compass.runner.overrides import schedulable_ladder
 
 #: The bundle's member a run reads: a group's step has a single writer.
 MEMBER = ("params", Topology().ranks()[0], "json")
-#: Engine fields keyed only off ATOM's default, so keys written before they
-#: were read do not move.
-OFF_DEFAULT = ("moe_backend", "eplb_enable", "enable_decoder_swa_bounded_replay")
+#: Engine fields keyed only off their default, so keys written before they
+#: were read do not move: ATOM's, or for a field in `DERIVED` the config's own
+#: value of the field it names there. None, a field left unresolved, is default.
+OFF_DEFAULT = (
+    "moe_backend",
+    "eplb_enable",
+    "enable_decoder_swa_bounded_replay",
+    "index_cache_dtype",
+)
+#: The index cache takes the KV cache's dtype unless ATOM resolves it apart.
+DERIVED = {"index_cache_dtype": "kv_cache_dtype"}
 #: ATOM's prefill token buckets, an environment variable `keyed` the same way.
 BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
 
 
 def keyed(config, ladder: bool = True) -> dict:
     """The conditions a bundle is measured under, as the resolved config holds them,
-    `OFF_DEFAULT` only where it is off ATOM's default, and the performance
+    `OFF_DEFAULT` only where it is off its default, and the performance
     environment of this process less the client's and the device selection,
     `BUCKETS` in it only off ATOM's default, and under speculation its method
     and draft width; the ladder only with `ladder`."""
@@ -105,7 +114,9 @@ def keyed(config, ladder: bool = True) -> dict:
         drafts["ladder"] = [] if config.enforce_eager else schedulable_ladder(config)
     for name in OFF_DEFAULT:
         default = Config.__dataclass_fields__[name].default
-        if (value := getattr(config, name, default)) != default:
+        if name in DERIVED:
+            default = getattr(config, DERIVED[name])
+        if (value := getattr(config, name, None)) not in (None, default):
             drafts[name] = value
     return drafts | {
         "kv_cache_block_size": config.kv_cache_block_size,
@@ -117,11 +128,18 @@ def keyed(config, ladder: bool = True) -> dict:
         "enable_expert_parallel": config.enable_expert_parallel,
         "enable_tbo": config.enable_tbo,
         "enable_tbo_decode": config.enable_tbo_decode,
-        "env": {
-            k: v
-            for k, v in sorted((performance_env() | _buckets_off_default()).items())
-            if not (k.startswith("AIPERF_") or k.endswith("_VISIBLE_DEVICES"))
-        },
+        "env": keyed_env(),
+    }
+
+
+def keyed_env() -> dict:
+    """This process's performance environment as `keyed` states it: less the
+    client's variables and the device selection, `BUCKETS` in it only off
+    ATOM's default."""
+    return {
+        k: v
+        for k, v in sorted((performance_env() | _buckets_off_default()).items())
+        if not (k.startswith("AIPERF_") or k.endswith("_VISIBLE_DEVICES"))
     }
 
 

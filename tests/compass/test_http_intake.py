@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """The HTTP intake probe: what it stamps on a server it runs, what its fit
-recovers, and the machine specs that state its terms."""
+recovers, and the machine specs that state its terms; and the run's ``host``
+entry, whose ``http_intake`` a simulated run charges."""
 
 import hashlib
 import importlib.util
@@ -157,6 +158,40 @@ def test_a_stall_on_the_loop_moves_the_fixed_term_and_not_the_per_byte_one(
     )
 
 
+def _host(monkeypatch, tmp_path, intake):
+    from atom.compass import run as compass_run
+
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"bound_s": 600.0, "host": {"http_intake": intake}}))
+    monkeypatch.setenv(compass_run.ENV, str(path))
+    return compass_run
+
+
+@pytest.mark.parametrize(
+    "intake",
+    [
+        {"per_byte_s": 5.6e-9, "idle_s": 1.1e-3},
+        {"fixed_s": 4.3e-3, "idle_s": 1.1e-3},
+        {"fixed_s": 4.3e-3, "per_byte_s": 5.6e-9, "derate": 1.0},
+        {"fixed_s": -4.3e-3, "per_byte_s": 5.6e-9},
+    ],
+    ids=["no-fixed", "no-per-byte", "unknown-field", "negative"],
+)
+def test_an_intake_a_charge_would_misread_is_refused(monkeypatch, tmp_path, intake):
+    compass_run = _host(monkeypatch, tmp_path, intake)
+    with pytest.raises(ValueError, match="host's http_intake is"):
+        compass_run.http_intake()
+
+
+def test_an_intake_with_no_idle_term_charges_its_fixed_one_to_a_lone_request(
+    monkeypatch, tmp_path
+):
+    compass_run = _host(
+        monkeypatch, tmp_path, {"fixed_s": 4.3e-3, "per_byte_s": 5.6e-9}
+    )
+    assert compass_run.http_intake() == (4.3e-3, 5.6e-9, 4.3e-3)
+
+
 def test_a_fit_at_a_given_rate_keeps_the_burst_span(tmp_path):
     # A rate fitted elsewhere replaces the burst's own slope; the fixed term
     # still makes the fitted gaps sum to what the burst spanned.
@@ -214,44 +249,6 @@ def test_lone_states_the_median_over_passes_of_each_pass_per_byte_rate(tmp_path)
     assert got["record"] == f"sha256:{hashlib.sha256(stamps.read_bytes()).hexdigest()}"
     with pytest.raises(SystemExit, match="24 lone requests, not 5 passes"):
         probe.lone(str(stamps), 5)
-
-
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39", "mi355x-gpu45"])
-def test_every_committed_spec_states_a_probed_intake_from_a_named_record(name):
-    from atom.compass.spec import MachineSpec
-
-    document = json.loads((TREE / f"scripts/compass/machines/{name}.json").read_text())
-    spec = MachineSpec.from_mapping(document)
-    for term in ("fixed_s", "per_byte_s"):
-        origin = spec.origin(f"host.http_intake.{term}")
-        assert origin["origin"] == "probed"
-        assert origin["record"].startswith("sha256:")
-
-
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39", "mi355x-gpu45"])
-def test_every_committed_intake_band_spans_more_than_one_burst(name):
-    from atom.compass.spec import MachineSpec
-
-    document = json.loads((TREE / f"scripts/compass/machines/{name}.json").read_text())
-    spec = MachineSpec.from_mapping(document)
-    for term in ("fixed_s", "per_byte_s"):
-        origin = spec.origin(f"host.http_intake.{term}")
-        assert origin["p10"] < origin["p90"]
-
-
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39"])
-def test_the_mi308x_specs_rebuild_byte_for_byte_from_their_own_sweeps(
-    monkeypatch, tmp_path, name
-):
-    monkeypatch.setenv("COMPASS_MACHINE", name)
-    path = TREE / "scripts/compass/mi308x_spec.py"
-    loaded = importlib.util.spec_from_file_location("mi308x_spec", path)
-    script = importlib.util.module_from_spec(loaded)
-    loaded.loader.exec_module(script)
-    document = TREE / f"scripts/compass/machines/{name}.json"
-    out = tmp_path / "rebuilt.json"
-    assert script.main(["--sweep-from", str(document), "--out", str(out)]) == 0
-    assert out.read_bytes() == document.read_bytes()
 
 
 #: The stand-in server: a Starlette app's lifespan, as uvicorn starts it, then
@@ -488,6 +485,21 @@ def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
         (218e-6, 282e-6)
     )
     assert [got[k]["messages"] for k in ("request", "output", "stream")] == [9, 20, 10]
+    # With the step record, the request hop again over receipts 4 to 8, the
+    # ones inside a forward.
+    steps = tmp_path / "dp0.jsonl"
+    recvs = [h["t_recv_ns"] for h in handoff if "t_recv_ns" in h]
+    steps.write_text(
+        "".join(
+            json.dumps({"t_enter_ns": recvs[a] - 1, "t_exit_ns": recvs[b] + 1}) + "\n"
+            for a, b in ((6, 8), (4, 5))
+        )
+    )
+    got = probe.hops(*map(str, paths), str(steps))
+    assert got["request_forward"]["messages"] == 5
+    assert got["request_forward"]["median_s"] == pytest.approx(260e-6)
+    assert got["request"]["messages"] == 9
+    assert got["steps"] == "sha256:" + hashlib.sha256(steps.read_bytes()).hexdigest()
     # A request the engine never received pairs nothing.
     paths[1].write_text(
         "".join(json.dumps(line) + "\n" for line in handoff[:2] + handoff[3:])
@@ -501,6 +513,26 @@ def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
     paths[0].write_text("\n".join(r for r in stamps if " out " not in r) + "\n")
     with pytest.raises(SystemExit, match="output: 0 rows taken in, not the 30 sent"):
         probe.hops(*map(str, paths))
+
+
+def test_a_head_the_client_read_before_its_send_returned_is_left_out(tmp_path):
+    sent = [10**12 + k * 10**9 for k in range(4)]
+    stamps = [f"{s} 1 send {s - 50} 0" for s in sent]
+    # Each head's send call takes 1 ms; the client reads the third's inside it.
+    stamps += [f"{s + 10**6} 1 head {s} 0" for s in sent]
+    admitted = [s + 10**6 + 150_000 for s in sent]
+    admitted[2] = sent[2] + 500_000
+    handoff = [{"t_recv_ns": s + 100_000, "t_in_put_ns": 0} for s in sent]
+    handoff += [{"t_out_put_ns": s + 3 * 10**6, "rows": 1} for s in sent]
+    stamps += [f"{s + 3 * 10**6 + 9} 2 out {s + 3 * 10**6 + 9} 0" for s in sent]
+    paths = [tmp_path / name for name in ("stamps", "handoff", "arrivals")]
+    paths[0].write_text("\n".join(stamps) + "\n")
+    paths[1].write_text("".join(json.dumps(line) + "\n" for line in handoff))
+    paths[2].write_text(json.dumps({"sent_ns": sent, "admitted_ns": admitted}))
+
+    stream = probe.hops(*map(str, paths))["stream"]
+
+    assert stream["messages"] == 3 and stream["median_s"] == pytest.approx(150e-6)
 
 
 def test_serve_stamps_each_kv_write_request_sent_and_received_in_a_spawned_process(

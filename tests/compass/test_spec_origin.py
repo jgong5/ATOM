@@ -13,11 +13,10 @@ import pathlib
 
 import pytest
 from test_spec_schema import DOCUMENT
-from test_spec_verbs import CLASS0, CLASS1, LINKS, fragment
+from test_spec_verbs import CLASS1, LINKS, fragment
 
 from atom.compass.spec import MachineSpec, SpecRefusal, explain, merge
-from atom.compass.spec.fields import SCHEMA, Kind
-from atom.compass.spec.machine import entry_label
+from atom.compass.spec.fields import SCHEMA
 from atom.compass.spec.rules import Rule
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -35,19 +34,16 @@ def labels(spec):
         path = field.path
         if path in ("name", "schema_version") or path.startswith("provenance."):
             continue
-        if path not in spec.values:
-            continue
-        if field.kind is Kind.TOKENIZERS:
-            for e in spec.tokenizers.entries:
-                yield entry_label(e.key.id, e.key.backend.value)
-        else:
+        if path in spec.values:
             yield path
 
 
 def three_origins():
     """Probed and assumed fragments of one machine, the probes of two subjects."""
     return [
-        fragment("class0", CLASS0, subject={"model": "Qwen/Qwen3-8B"}),
+        fragment(
+            "ptl", {"device": {"ptl": "disabled"}}, subject={"model": "Qwen/Qwen3-8B"}
+        ),
         fragment("class1", CLASS1, subject=CARD),
         fragment("links", LINKS, origin="assumed"),
     ]
@@ -61,7 +57,7 @@ def test_a_saved_spec_answers_origin_for_every_field():
     capacity = "device.memory.capacity_bytes"
     assert spec.origin(capacity) == {"origin": "probed", **CARD}
     assert spec.origin("interconnect.intra_node.derate") == {"origin": "assumed"}
-    assert spec.origin(entry_label("qwen3-151k-bpe", "fast")) == {
+    assert spec.origin("device.ptl") == {
         "origin": "probed",
         "model": "Qwen/Qwen3-8B",
     }
@@ -125,7 +121,7 @@ def test_a_document_of_one_origin_answers_without_the_map():
     stanza = dict(DOCUMENT["provenance"], subject={"model": "Qwen/Qwen3-8B"})
     spec = MachineSpec.from_mapping(dict(DOCUMENT, provenance=stanza))
     assert "provenance.origins" not in spec.values
-    assert spec.origin("host.ipc.zmq_roundtrip_s") == {
+    assert spec.origin("interconnect.router_relay_s") == {
         "origin": "probed",
         "model": "Qwen/Qwen3-8B",
     }
@@ -136,7 +132,7 @@ def test_a_document_of_one_origin_answers_without_the_map():
 )
 def test_an_origin_nobody_defined_is_refused(stated):
     with pytest.raises(SpecRefusal, match="which is not an origin"):
-        fragment("class0", CLASS0, origin=stated)
+        fragment("class1", CLASS1, origin=stated)
 
 
 def test_one_field_is_never_mixed_and_only_a_probed_one_has_a_subject():
@@ -149,7 +145,7 @@ def test_one_field_is_never_mixed_and_only_a_probed_one_has_a_subject():
     ):
         broken = copy.deepcopy(document)
         broken["provenance"]["origins"] = dict(
-            origins, **{"host.ipc.zmq_roundtrip_s": entry}
+            origins, **{"interconnect.router_relay_s": entry}
         )
         with pytest.raises(SpecRefusal, match=wanted):
             MachineSpec.from_mapping(broken)
@@ -157,14 +153,9 @@ def test_one_field_is_never_mixed_and_only_a_probed_one_has_a_subject():
         fragment("links", LINKS, origin="assumed", subject={"model": "m"})
 
 
-def test_origin_is_asked_per_tokenizer_entry():
+def test_origin_of_a_host_field_is_refused_as_of_any_unknown_path():
     spec = MachineSpec.from_mapping(saved(merge(three_origins()).document))
-    for e in spec.tokenizers.entries:
-        assert spec.origin(entry_label(e.key.id, e.key.backend.value)) == {
-            "origin": "probed",
-            "model": "Qwen/Qwen3-8B",
-        }
-    for path in ("host.tokenizers[nope fast]", "device.memory.colour"):
+    for path in ("host.http_intake.fixed_s", "device.memory.colour"):
         with pytest.raises(SpecRefusal, match="not a field of this schema"):
             spec.origin(path)
 
@@ -213,10 +204,8 @@ def test_the_checked_in_specs_say_where_each_field_came_from(monkeypatch, name):
         engine = label.startswith("device.") and label != "device.ptl"
         if engine and found["origin"] == "probed" and label not in peaks:
             assert found == {"origin": "probed", **script.SUBJECT}, label
-    # A core count is the host's own, read with no model or width under it, and
-    # so is the cards' PTL state, read from sysfs.
-    for label in ("host.cpu.cores_physical", "host.cpu.cores_logical", "device.ptl"):
-        assert answered[label] == {"origin": "probed"}
+    # The cards' PTL state is read from sysfs, with no model or width under it.
+    assert answered["device.ptl"] == {"origin": "probed"}
     for label, found in answered.items():
         if label in peaks:
             continue

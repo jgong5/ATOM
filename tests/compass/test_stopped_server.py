@@ -39,11 +39,12 @@ from types import SimpleNamespace
 import pytest
 import zmq
 from aiter_stub import stubbed_aiter
+from test_vertical_slice import _run_file
 
 from atom.compass import clock_transport
 from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
-from atom.compass.clock import LpId, single_engine_table
+from atom.compass.clock import NER, PARK, TAR, LpId, single_engine_table
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import SequenceStatus
 from atom.utils import clock, get_open_zmq_ipc_path, make_zmq_socket, zmq_shim
@@ -56,7 +57,7 @@ with stubbed_aiter():
     from atom.model_engine.engine_core_mgr import CoreManager
 
 TREE = Path(__file__).resolve().parents[2]
-TABLE = single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002)
+TABLE = single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002)
 SIGNALS = pytest.mark.parametrize(
     "sig", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"]
 )
@@ -222,7 +223,7 @@ def _serve(tmp_path, script, *argv):
                 {
                     "clock_endpoint": f"tcp://127.0.0.1:{clock_port}",
                     "bound_s": 100.0,
-                    "admission_path": "serving",
+                    "admission_s": 0.54e-3,
                     "ipc_s": 2.0**-10,
                     "stream_s": 2.0**-9,
                     "out_dir": str(tmp_path),
@@ -393,7 +394,7 @@ def test_an_engine_has_the_handler_it_set_aside_at_ready_back_as_it_leaves(
     back once the engine leaves its loop, or its construction if that raises,
     and ATOM's `_send_ready_signal` is its own again."""
     run = {"clock_endpoint": "", "bound_s": 100.0, "out_dir": str(tmp_path)}
-    run |= {"admission_path": "serving", "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
+    run |= {"admission_s": 0.54e-3, "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
     (tmp_path / "run.json").write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     monkeypatch.setattr(compass_run, "_member", None)
@@ -445,7 +446,7 @@ def test_an_engine_stopped_holding_a_read_request_hands_in_no_straggler(
     stop's ``+inf`` one has released it."""
     endpoint, request = f"inproc:{uuid.uuid4().hex}", "frontend->engine:request#dp0"
     run = {"clock_endpoint": endpoint, "bound_s": 100.0, "out_dir": str(tmp_path)}
-    run |= {"admission_path": "serving", "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
+    run |= {"admission_s": 0.54e-3, "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
     (tmp_path / "run.json").write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     monkeypatch.setattr(compass_run, "_member", None)
@@ -491,6 +492,33 @@ def test_an_engine_stopped_holding_a_read_request_hands_in_no_straggler(
     ctx.destroy(linger=0)
 
 
+@pytest.mark.parametrize("held_by", ["a call naming a later round", "a park"])
+def test_a_stop_hands_a_dp_member_what_was_held_for_it(tmp_path, held_by):
+    """Request 0 reaches dp0 at 0.25 and a round grants it while dp0 waits, in a
+    call that named a later round or parked; then the frontend stops. dp0's one
+    reply, the stop's ``+inf``, carries request 0, whose release row its round's
+    grant wrote once."""
+    req0 = "frontend->engine:request#dp0"
+    run = json.loads(_run_file(tmp_path, data_parallel_size=2).read_text())
+    ca = compass_run._RecordingAuthority(run)
+    engine, inf = compass_run.ENGINE, math.inf
+    ca.on_request(LpId("traffic"), NER, inf, [])
+    ca.on_request(compass_run.FRONTEND, NER, inf, [(req0, 0, 0.25)])
+    if held_by == "a park":
+        replies = ca.on_request(engine, PARK, inf, [], member="dp0")
+        replies += ca.on_request(engine, NER, inf, [], member="dp1")
+    else:  # dp0 returns at 0.5, dp1 at 0.3
+        replies = ca.on_request(engine, TAR, 0.3, [], member="dp0", rounds=[0.5])
+        replies += ca.on_request(engine, TAR, 0.3, [], member="dp1")
+    replies += ca.on_request(compass_run.FRONTEND, TAR, inf, [])  # the stop
+
+    dp0 = [(g, released) for to, g, released, *_ in replies if to == (engine, "dp0")]
+    assert [(g, {c: r for c, r in held.items() if r}) for g, held in dp0] == [
+        (inf, {req0: [(0, 0.25)]})
+    ]
+    assert [r.time_to for r in ca.steps.rows if r.channel == req0] == [0.25]
+
+
 def test_an_engine_whose_input_thread_reads_shutdown_first_takes_the_released_request(
     monkeypatch, tmp_path
 ):
@@ -500,7 +528,7 @@ def test_an_engine_whose_input_thread_reads_shutdown_first_takes_the_released_re
     takes the request first, then leaves on SHUTDOWN, and the engine hands in."""
     endpoint, request = f"inproc:{uuid.uuid4().hex}", "frontend->engine:request#dp0"
     run = {"clock_endpoint": endpoint, "bound_s": 100.0, "out_dir": str(tmp_path)}
-    run |= {"admission_path": "serving", "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
+    run |= {"admission_s": 0.54e-3, "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
     (tmp_path / "run.json").write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     monkeypatch.setattr(compass_run, "_member", None)

@@ -4,11 +4,14 @@
 `ForwardMode.decide` settles `running_bs` on every step. An eager decode every
 rank of whose DP group decodes runs its model at it
 (`ModelRunner._padded_decode_inputs`), and a prefill that samples runs its LM
-head at it (`cu_seqlens_q`). Each step's mode here is `decide`'s own.
+head at it (`cu_seqlens_q`). Each step's mode here is `decide`'s own. A step
+record's line states that width, and a drafter's, and each reader of a record
+reads the step there: `compass run --coverage`, the bound and cost accuracy.
 """
 
 import json
 import re
+from types import SimpleNamespace
 
 import pytest
 from test_capture_ir import _ops, _record
@@ -19,11 +22,18 @@ from test_work import SPEC
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends import BatchView, RequestShape
+from atom.compass.backends.cost import CostTerm
 from atom.compass.backends.op_graph import LISTED, OpGraphBackend
-from atom.compass.backends.provenance import Method, Refusal
+from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.work import gemm, price
 from atom.compass.capture import population_shapes
+from atom.compass.capture.forward import Shape
+from atom.compass.drive import run as drive_run
+from atom.compass.parity import StepRecord
+from atom.compass.runner import projection
+from atom.compass.validate import bound
+from atom.compass.validate.cost import cost_accuracy
 
 EMBED = "aten.embedding.default"
 MOE = "aiter.fused_moe_.default"
@@ -631,3 +641,170 @@ def test_an_eager_dp_mtp1_drafter_asks_its_one_pass_at_its_own_g(monkeypatch):
         (ARGMAX, 3, 3, 3, None),
         (GEMM, 3, 3, 3, None),
     ]
+
+
+#: A DP rank's step-record lines whose target ran past its rows without a graph
+#: replay (`target_bs`): an eager decode of 3 rows padded to a peer's 4, and a
+#: prefill whose LM head samples at a peer's 2 rows; and under MTP2 two eager
+#: decodes so padded, each drafter's first pass gathering 9 + 12 tokens
+#: (`draft_moe_rows`) and its later passes run at 4 (`draft_bs`). A record's
+#: second line ties its host and device clocks, which cost accuracy reads.
+PADDED = [
+    {"rows": [[1, 90, True]] * 3, "moe_rows": 8, "target_bs": 4},
+    {"rows": [[64, 64, False]], "moe_rows": 100, "target_bs": 2},
+]
+DRAFTED = [
+    {"rows": [[3, context, True]] * 3, "moe_rows": 24, "target_bs": 4}
+    | {"draft_moe_rows": 21, "draft_bs": 4}
+    for context in (90, 93)
+]
+LINES = pytest.mark.parametrize(
+    "drafts,lines", [(0, PADDED), (2, DRAFTED)], ids=["target", "mtp2"]
+)
+#: Each line's device busy time: twice its target's price, one leaf at 1 us.
+BUSY_NS = 2000
+
+
+class Priced(CostSource):
+    """A price list that prices every leaf at a microsecond."""
+
+    name = LISTED
+
+    def price(self, request):
+        return CostTerm(f"op.{request[0]['op']}", 1e-6, Provenance(Method.MEASURED))
+
+
+def padded_record(path, lines):
+    """A record of two DP ranks that ran `lines` alike, stamped as a real run's."""
+    (path / "steps").mkdir()
+    (path / "run.json").write_text("{}")
+    for rank in (0, 1):
+        stamped = [
+            {"step": n, "dp_rank": rank, "is_dummy_run": False, "rung": None}
+            | {"produces_output": True, "named": [], "d_busy_ns": BUSY_NS}
+            | {"batch": [[i, q, c] for i, (q, c, _) in enumerate(line["rows"])]}
+            | {"t_enter_ns": at, "t_launch_ns": [at, at], "t_recv_ns": [at, at]}
+            | {"t_exit_ns": at, **line}
+            for n, line in enumerate(lines)
+            for at in [n * BUSY_NS]
+        ]
+        text = "".join(json.dumps(s) + "\n" for s in stamped)
+        (path / "steps" / f"dp{rank}.jsonl").write_text(text)
+    return path
+
+
+def traced(record, drafts):
+    """An op graph at DP2 under a drafter of `drafts`, over the graphs `trace ops
+    --population` traces from `record`, one GEMM each, every leaf priced."""
+    shapes = set(population_shapes([str(record)]))
+
+    def graph(phase, tokens, seqs, output=True, gathered=None, draft=False, width=None):
+        if Shape(phase, tokens, seqs, gathered, width).at(2, drafts) in shapes:
+            return {"seq": [g(tokens, 64, 64)]}
+
+    return OpGraphBackend(
+        SPEC, graph, kv="bf16", dp=2, drafts=drafts, price_list=Priced()
+    )
+
+
+@LINES
+def test_the_coverage_check_reads_a_line_where_its_target_and_drafter_ran(
+    tmp_path, drafts, lines
+):
+    record = padded_record(tmp_path, lines)
+    steps = (record / "steps" / "dp0.jsonl").read_text().splitlines()
+
+    report = drive_run.op_coverage(
+        traced(record, drafts), [(str(n), json.loads(s)) for n, s in enumerate(steps)]
+    )
+
+    assert report["left out, by leaf kind"] == {}
+    assert report["covered"] == len(lines)
+
+
+@LINES
+def test_the_bound_prices_a_line_where_its_target_and_drafter_ran(
+    tmp_path, drafts, lines
+):
+    record = padded_record(tmp_path, lines)
+
+    r = bound.gate([record], {"op": traced(record, drafts)})["op"]
+
+    # Each rank's line is a step of its own.
+    assert (r["refused"], r["steps"]) == ({}, 2 * len(lines))
+
+
+@LINES
+def test_cost_accuracy_prices_a_line_where_its_target_and_drafter_ran(
+    tmp_path, drafts, lines
+):
+    record = padded_record(tmp_path, lines)
+
+    report = cost_accuracy(record / "steps", traced(record, drafts))
+
+    # A step is its ranks' lines joined. A prefill's label is a trace run's busy
+    # time, which this record holds none of, so each rank's prefill line is cut.
+    prefills = sum(not any(r[2] for r in line["rows"]) for line in lines)
+    assert report["refused"] == {}
+    assert report["cut"]["untraced"] == 2 * prefills
+    assert sum(k["steps"] for k in report["graded"].values()) == len(lines) - prefills
+
+
+def coverage(record, backend):
+    """`compass run --coverage`'s check of `record`'s first rank's lines."""
+    lines = (record / "steps" / "dp0.jsonl").read_text().splitlines()
+    named = [(str(n), json.loads(s)) for n, s in enumerate(lines)]
+    drive_run.op_coverage(backend, named)
+
+
+#: Each reader of a record directory, pricing its steps with a backend.
+READERS = {
+    "coverage": coverage,
+    "bound": lambda record, backend: bound.gate([record], {"op": backend}),
+    "cost": lambda record, backend: cost_accuracy(record / "steps", backend),
+}
+
+
+@pytest.mark.parametrize("reader", READERS)
+def test_a_reader_asks_a_recorded_eager_dp_drafter_what_a_simulated_run_asks(
+    monkeypatch, tmp_path, reader
+):
+    # MTP2 at DP2 with no draft graph, 3 rows beside a peer's 4: its later
+    # passes gather 3 + 4 rows. Its line is the one the step recorder writes
+    # of its batch, run alike on two ranks.
+    view = settled(monkeypatch, DECODE, [(4, 12, False)], eager=True, step=False)
+    monkeypatch.setattr(projection, "forward_mode", lambda *_: None)
+    monkeypatch.setattr(projection, "batch_view", lambda *_: view)
+    batch = SimpleNamespace(
+        is_dummy_run=False,
+        req_ids=[0, 1, 2],
+        num_scheduled_tokens=[3, 3, 3],
+        context_lens=[90, 90, 90],
+        is_final_chunk=None,  # a decode instance's batch: no prompt to digest
+        external_request_ids=[None] * 3,
+        produces_output=lambda: True,
+    )
+    StepRecord(tmp_path / "recorded", 0).add(batch, None)
+    line = json.loads((tmp_path / "recorded" / "dp0.jsonl").read_text())
+    del line["step"], line["dp_rank"]
+    record = padded_record(tmp_path, [line] * 2)
+    drafted = [g(9, 64, 64), g(21, 32, 64), argmax(3), g(3, 64, 64)]
+    drafted += [g(6, 32, 64), g(7, 32, 64)]
+    graphs = {False: {"seq": [g(4, 64, 64)]}, True: {"seq": drafted}}
+
+    def asked(read):
+        listing = AskedG()
+        read(
+            OpGraphBackend(
+                SPEC,
+                lambda *_, draft=False, **__: graphs[draft],
+                kv="bf16",
+                dp=2,
+                drafts=2,
+                price_list=listing,
+            )
+        )
+        return set(listing.asked)
+
+    simulated = asked(lambda backend: backend.price(view))
+    assert asked(lambda backend: READERS[reader](record, backend)) == simulated

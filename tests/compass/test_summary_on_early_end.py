@@ -46,7 +46,7 @@ def test_an_engine_that_raises_mid_run_leaves_a_summary_naming_it(
     monkeypatch, tmp_path, host, error, reason
 ):
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 0.001,
         "stream_s": 0.002,
         "bound_s": 10.0,

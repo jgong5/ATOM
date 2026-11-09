@@ -338,6 +338,10 @@ class HostDeviceRecurrence:
     `compass_admitted`, adds what its admissions cost to its `E`, except on a
     pipeline stage that receives its input; None, a fit that priced them apart
     and fitted no law for them, and `device_end` refuses a forward that admits.
+    `columns[kind][segment]` prices launch features, a batch's `compass_launch`,
+    which its caller sets from `predicted`; `launch`, the provider and graph
+    sets predicting them, refuses a column naming a feature it lacks; a
+    pipeline stage refuses any column.
     """
 
     def __init__(
@@ -349,9 +353,22 @@ class HostDeviceRecurrence:
         mtp=False,
         sync=False,
         admit=ADMISSION_IN_E,
+        columns=None,
+        launch=(None, None),
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
-        self.admit = admit
+        self.admit, self.columns, self.launch = admit, columns or {}, launch
+        named = {f for v in self.columns.values() for c in v.values() for f in c}
+        if lacks := sorted(named - set(getattr(launch[0], "features", ()))):
+            raise ValueError(
+                f"the host laws adopt launch features {lacks}, which this model's "
+                f"launch provider, {type(launch[0]).__name__}, does not declare"
+            )
+        if self.columns and stage is not None:
+            raise ValueError(
+                "the host laws adopt launch columns, and a pipeline stage posts "
+                "its receive at a prepare end `pp_recv_posted` prices without them"
+            )
         ring = 2 if stage is None else stage[1]
         self.ends = collections.deque([-math.inf] * ring, maxlen=ring)  # n-ring..n-1
         self.last = None if stage is None else stage[0] == stage[1] - 1
@@ -371,10 +388,12 @@ class HostDeviceRecurrence:
         self, batch: Any, device_s: float, draft_s: float, refuse: bool = True
     ) -> float:
         """The end of the forward's device work, launch included, for `device_s`
-        of target device time and then `draft_s` of draft, starting no earlier
-        than the batch's `compass_pp_release` or `compass_queued_s` after
-        `ends[-1]`; `target_end` is the target's
-        end, and `release` follows. A batch's
+        of target device time, starting no earlier than the batch's
+        `compass_pp_release` or `compass_queued_s` after `ends[-1]`, then
+        `draft_s` of draft, starting no earlier than the forward's exit, since
+        its host queues the draft before it exits; under `sync`, whose exit
+        waits for this end, no earlier than its launch's end. `target_end` is
+        the target's end, and `release` follows. A batch's
         `compass_pp_host = (called, meta)` runs the host from `called` in place
         of `now`; its launch posts the receive after `PP_RECV_SEGMENT` and
         runs the rest once `meta` is in. With any
@@ -396,6 +415,14 @@ class HostDeviceRecurrence:
         out = any(OUT_SEGMENT in v for v in self.laws.values())
         ran += (OUT_SEGMENT,) if out else ()
         missing = [f"{kind}.{s}" for s in ran if s not in {*law, *self.skip}]
+        features = getattr(batch, "compass_launch", None) or {}
+        columns = self.columns.get(kind, {})
+        missing += [
+            f"{kind}.{s}.{f}"
+            for s in ran
+            for f in columns.get(s, ())
+            if f not in features
+        ]
         a = getattr(batch, "compass_admitted", None)
         if self.admit is None and a and a[0] and not self.recv and "E" not in self.skip:
             missing.append("admit")
@@ -406,7 +433,8 @@ class HostDeviceRecurrence:
             raise CostRefused(kind, [Refusal("host", f"no law for {named}")])
         now = self.now()
         called, meta = getattr(batch, "compass_pp_host", (now, -math.inf))
-        prepared, self.segments = self.prepare_end(called, kind, x, self.admit_s(batch))
+        admit_s = self.admit_s(batch)
+        prepared, self.segments = self.prepare_end(called, kind, x, admit_s, features)
         self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)
@@ -416,7 +444,16 @@ class HostDeviceRecurrence:
         queued_end = self.ends[-1] + getattr(batch, "compass_queued_s", 0.0)
         self.target_end = max(queued_end, host, release) + device_s
         self._held = now, launch_end, output, post
-        return max(self.target_end + draft_s, launch_end)
+        if not draft_s:
+            return max(self.target_end, launch_end)
+        queued = launch_end if self.sync else self._exit(self.target_end)
+        return max(self.target_end, queued) + draft_s
+
+    def predicted(self, view: Any) -> dict:
+        """A step's launch features by `launch`'s provider, from its
+        `BatchView` `view`; none where no law adopts a column."""
+        provider, graphs = self.launch
+        return provider.predict(view, graphs) if self.columns else {}
 
     def admit_s(self, batch: Any) -> float:
         """What `batch`'s admissions add to its `E`."""
@@ -427,25 +464,20 @@ class HostDeviceRecurrence:
             return 0.0
         return float(np.dot(self.admit, admit_x(a)))
 
-    def start_lag(self, batch: Any) -> float | None:
-        """`BatchView.start_lag_s` of an output forward on a single stage, as
-        `device_end` and `release` would place it: its device start less the
-        host's return from the previous output forward's wait; else None."""
-        if not batch.produces_output() or self.last is not None or self.sync:
-            return None
-        kind, x = forward_shape(batch)
-        prepared, seg = self.prepare_end(self.now(), kind, x, self.admit_s(batch))
-        start = max(self.ends[-1] + getattr(batch, "compass_queued_s", 0.0), prepared)
-        return start - max(prepared + seg["W_launch"], self.output_end)
-
     def prepare_end(
-        self, called: float, kind: str, x: tuple, admit_s: float = 0.0
+        self, called: float, kind: str, x: tuple, admit_s: float = 0.0, features=None
     ) -> tuple[float, dict]:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
-        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`."""
-        law = self.laws.get(kind, {})
+        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, and each column a segment
+        adopts prices `features`' value of its feature, 0 where absent."""
+        law, columns = self.laws.get(kind, {}), self.columns.get(kind, {})
+        features = features or {}
         seg = {
-            s: (float(np.dot(law.get(s, (0, 0, 0)), x)) + admit_s * (s == "E"))
+            s: (
+                float(np.dot(law.get(s, (0, 0, 0)), x))
+                + admit_s * (s == "E")
+                + sum(c * features.get(f, 0.0) for f, c in columns.get(s, {}).items())
+            )
             * (s not in self.skip)
             for s in SEGMENTS
         }
@@ -458,17 +490,28 @@ class HostDeviceRecurrence:
         """The exit less `now` of the forward `device_end` priced, its device
         work ending at `end` and its target's at `target_end`, no earlier than
         it said."""
-        now, launch_end, output, post = self._held
+        now, _, output, _ = self._held
         self.ends.append(end)
+        exit_ = self._exit(target_end, end)
+        if output and self.last is None and not self.sync:
+            self.output_end = target_end
+        return exit_ - now
+
+    def _exit(self, target_end: float, end: float = -math.inf) -> float:
+        """The exit of the forward `device_end` priced, its device work ending
+        at `end` and its target's at `target_end`: `W_post` after its launch
+        and the wait that follows it, an output forward's for the previous
+        output forward's target on a single stage or its own on the last, or
+        under `sync` for `end`."""
+        _, launch_end, output, post = self._held
         released = launch_end
         if self.sync:
             released = max(launch_end, end)
-        elif output:
-            if self.last is None:
-                released, self.output_end = max(launch_end, self.output_end), target_end
-            elif self.last:
-                released = max(launch_end, target_end)
-        return released + post - now
+        elif output and self.last is None:
+            released = max(launch_end, self.output_end)
+        elif output and self.last:
+            released = max(launch_end, target_end)
+        return released + post
 
 
 def schedulable_ladder(config: Any) -> list[int]:
@@ -1640,8 +1683,8 @@ def _group_step_seconds(
 
     In a run, `compass_host` composes the price, the target's device seconds
     and then the draft's (`StepCost.target_seconds`, `draft_seconds`), with
-    host time; a `HostDeviceRecurrence` gives the view its `start_lag_s` and,
-    unless its `admit` is `ADMISSION_IN_E`, reads the batch's
+    host time; a `HostDeviceRecurrence`, unless its `admit` is
+    `ADMISSION_IN_E`, reads the batch's
     `compass_admitted`, set here first (`admitted`, over the requests this
     runner has seen).
     Under DP, a `HostDeviceRecurrence`'s device end, and its output mark
@@ -1721,15 +1764,12 @@ def _group_step_seconds(
         batch.compass_admitted = admitted(batch, seen, entry)
     dummies = dummy_ranks(batch, mode)
     try:
-        changes = {}
         if view is None:
             view = batch_view(batch, mode, runner, dummies)
         elif view.dp_rank is not None:
-            changes["group_dummies"] = dummies
+            view = dataclasses.replace(view, group_dummies=dummies)
         if isinstance(host, HostDeviceRecurrence):
-            changes["start_lag_s"] = host.start_lag(batch)
-        if changes:
-            view = dataclasses.replace(view, **changes)
+            batch.compass_launch = host.predicted(view)
         cost = backend.price(view)
         if spec and not cost.draft_terms and EAGER_DP_DUMMY not in cost.treatments:
             name = type(backend).__name__

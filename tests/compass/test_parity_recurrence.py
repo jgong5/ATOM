@@ -240,6 +240,45 @@ def test_an_mtp_record_the_wait_rules_wrote_passes_and_charged_without_mtp_fails
     assert (step, err) == (1, pytest.approx(-5))
 
 
+def paced_record():
+    """Five MTP decodes of one request, written by the wait rules: 1 ms per
+    host segment, 10 ms of target, then a 0.5 ms `propose` pass the host
+    queues as it leaves. Each launch waits for the previous target's end. Step
+    2's host leaves 12 ms after its token read, so its device waits 2.5 ms for
+    the pass, and step 3's device idles 1.5 ms for its launch."""
+    steps, exit_, target, end = [], -1.0, None, None
+    for n, post in enumerate((1, 1, 12, 1, 1)):
+        enter = exit_ + 1
+        m1 = enter + 1 if target is None else max(enter + 1, target)
+        start = m1 if end is None else max(end, m1)
+        exit_ = m1 + 1 + post
+        rows, launch = [[2, 150 + n, True]], (m1, m1 + 1)
+        s = line(n, rows, True, enter, (enter,) * 2, launch, None, exit_)
+        s["t_mtp_ns"] = [(enter + 1) * MS, m1 * MS]
+        s["t_recv_ns"] = [(m1 + 1) * MS] * 2
+        s["t_draft_recv_ns"] = [exit_ * MS] * 2
+        if end is not None:
+            s["d_gap_ns"] = (start - end) * MS
+        target, end = start + 10, max(start + 10, exit_) + 0.5
+        s["d_busy_ns"], s["d_target_ns"] = (end - start) * MS, 10 * MS
+        s["d_propose_ns"] = MS // 2
+        steps.append(s)
+    return steps
+
+
+def test_a_draft_the_host_paced_is_charged_its_propose_pass_alone():
+    """Step 2's draft runs from its exit for the pass's 0.5 ms. Charged its
+    window's 3 ms, which holds the device's wait for the host, step 3's device
+    would start 2.5 ms late, and step 4's status wait would hold as long."""
+    report = recurrence.check(paced_record())
+    assert report["kinds"]["decode"][1:4] == pytest.approx((0, 0, 0), abs=1e-9)
+    assert report["pass"] and report["total"] == pytest.approx(0, abs=1e-9)
+    steps = paced_record()
+    del steps[2]["d_propose_ns"]
+    with pytest.raises(ValueError, match="step 2's device reached its propose pass"):
+        recurrence.check(steps)
+
+
 def _law(prefill_s=0.01, decode=True, out_ms=0.0):
     """A law pricing `record()`'s forwards as it ran: 10 ms of device work
     each and 1 ms per host segment, `out_ms` of `E_out` after each exit
