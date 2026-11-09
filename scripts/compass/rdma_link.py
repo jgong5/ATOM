@@ -24,13 +24,15 @@ fastest's) and aggregate rate. Given the record directory of a Mooncake P/D
 run (`atom/compass/parity/writes.py`), it publishes the link the run's KV
 writes attained: the port rate and the latency of every rail case, with the
 derate of the writes none of whose calls was in flight beside another of its
-prefill rank or rail. Then it replays every `_rdma_write` call at its recorded
+prefill rank or rail, and the sha256 of the run's writes files it read. Then
+it replays every `_rdma_write` call at its recorded
 start on that link per sharing unit, one at a time on a `Link` (FIFO) or
 splitting the bandwidth evenly among the calls in flight (shared), and prints
 each one's error on every call and on the contended ones.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
@@ -42,7 +44,6 @@ from pathlib import Path
 GPUS = 8
 ENTRY = 64 << 10
 BUFFER = 4 << 30
-CHUNK = 2 << 30  # the connector's largest registration
 SIZES = [ENTRY << 2 * i for i in range(8)]  # 64 KiB to 1 GiB
 REPS = 8
 ROUND_BYTES = 256 << 20
@@ -68,12 +69,17 @@ def port_rate(gpu: int) -> float:
 
 
 def engine(ip: str, rail: int, buf):
+    """An engine on `rail`'s HCA with `buf` registered as the connector
+    registers a region of `ENTRY`-byte units."""
     from mooncake.engine import TransferEngine
 
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    chunk = mc.MooncakeConnector._MAX_RDMA_CHUNK_BYTES
     e = TransferEngine()
     ok = e.initialize(ip, "P2PHANDSHAKE", "rdma", hca(rail)) == 0
-    for off in range(0, buf.numel(), CHUNK):
-        size = min(CHUNK, buf.numel() - off)
+    for off in range(0, buf.numel(), chunk):
+        size = min(chunk, buf.numel() - off)
         ok = ok and e.register_memory(buf.data_ptr() + off, size) == 0
     if not ok:
         raise RuntimeError(f"a Mooncake engine on {hca(rail)} did not start")
@@ -259,19 +265,22 @@ UNITS = {
 }
 
 
-def calls(record) -> list:
+def calls(record) -> tuple:
     """`(rank, hca, start s, bytes, seconds, write)` of each `_rdma_write` call
-    a producer rank of `record` stamped, in start order; `write` numbers the
-    write that made it."""
-    found, writes = [], 0
+    a producer rank of `record` stamped, in start order, where `write` numbers
+    the write that made it; and `sha256:` over the writes files, in the order
+    read."""
+    found, writes, digest = [], 0, hashlib.sha256()
     for path in sorted(Path(record).rglob("*.writes.jsonl")):
-        for line in path.read_text().splitlines():
+        data = path.read_bytes()
+        digest.update(data)
+        for line in data.decode().splitlines():
             w, writes = json.loads(line), writes + 1
             for s, e, n in w.get("rdma", []):
                 found.append(
                     (str(path), w.get("hca"), s / 1e9, n, (e - s) / 1e9, writes)
                 )
-    return sorted(found, key=lambda c: c[2])
+    return sorted(found, key=lambda c: c[2]), f"sha256:{digest.hexdigest()}"
 
 
 def contended(found) -> set:
@@ -354,7 +363,7 @@ def fit(args) -> None:
                 f", aggregate {statistics.median(rate):.4g} B/s"
             )
     if args.record:
-        found, latency = calls(args.record), cases["all"]["link_latency_s"][0]
+        (found, digest), latency = calls(args.record), cases["all"]["link_latency_s"][0]
         busy, writes = contended(found), {}
         for c in found:
             writes.setdefault(c[5], []).append(c)
@@ -365,6 +374,7 @@ def fit(args) -> None:
         published = {**cases["all"], "derate": [r / port for r in rate]}
         print(
             f"record: {len(writes)} writes, {len(found)} calls, {len(busy)} contended"
+            f", writes files {digest}"
         )
         print(
             f"published, the derate of {len(alone)} uncontended writes: {json.dumps(published)}"

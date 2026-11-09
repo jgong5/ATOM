@@ -4,8 +4,11 @@ them, its link fit recovers a line, and its replay of a recorded P/D run's
 `_rdma_write` calls tells a FIFO rail from a shared one and from per-pair or
 per-prefill-rank queues."""
 
+import hashlib
 import importlib.util
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -45,6 +48,28 @@ def test_a_write_posts_the_connectors_batches_of_entries():
     dst = [a for c in e.calls for a in c[2]]
     assert src == [(1 << 20) + i * rdma.ENTRY for i in range(len(src))]
     assert [d - s for s, d in zip(src, dst)] == [(1 << 40) - (1 << 20)] * len(src)
+
+
+def test_an_engine_registers_its_buffer_as_the_connector_would(monkeypatch):
+    registered = []
+
+    class TransferEngine:
+        def initialize(self, *args):
+            return 0
+
+        def register_memory(self, addr, size):
+            registered.append((addr, size))
+            return 0
+
+    engine = types.SimpleNamespace(TransferEngine=TransferEngine)
+    monkeypatch.setitem(sys.modules, "mooncake.engine", engine)
+    monkeypatch.setattr(rdma, "hca", lambda gpu: f"ionic_{gpu}")
+    buf = types.SimpleNamespace(numel=lambda: rdma.BUFFER, data_ptr=lambda: 1 << 40)
+    rdma.engine("ip", 0, buf)
+    sizes = object.__new__(MooncakeConnector)._rdma_chunk_sizes(rdma.BUFFER, rdma.ENTRY)
+    assert [s for _, s in registered] == sizes
+    offsets = [sum(sizes[:i]) for i in range(len(sizes))]
+    assert [a - (1 << 40) for a, _ in registered] == offsets
 
 
 def test_the_link_fit_recovers_latency_and_bandwidth():
@@ -91,7 +116,7 @@ RECORD = [
 
 
 def test_a_record_served_fifo_per_rail_is_fitted_by_the_rail_fifo_alone(tmp_path):
-    found = rdma.calls(record(tmp_path, RECORD[:3]))
+    found, _ = rdma.calls(record(tmp_path, RECORD[:3]))
     assert [c[2] for c in found] == [0.0, 0.05, 0.3]
     assert rdma.contended(found) == set(found[:2])
     errors = {
@@ -116,9 +141,13 @@ def test_fit_publishes_the_bench_latency_and_the_rate_writes_attained(tmp_path, 
                           "bytes": n, "t": [0, round(t * 1e9), True]})  # fmt: skip
     bench = tmp_path / "bench.jsonl"
     bench.write_text("".join(json.dumps(x) + "\n" for x in lines))
-    rdma.main(["fit", str(bench), str(record(tmp_path / "run", RECORD))])
+    run = record(tmp_path / "run", RECORD)
+    rdma.main(["fit", str(bench), str(run)])
     out = capsys.readouterr().out
-    assert "record: 4 writes, 4 calls, 2 contended" in out
+    files = sorted(run.rglob("*.writes.jsonl"))
+    digest = hashlib.sha256(b"".join(f.read_bytes() for f in files)).hexdigest()
+    want = f"record: 4 writes, 4 calls, 2 contended, writes files sha256:{digest}"
+    assert want in out.splitlines()
     found = json.loads(out.split("uncontended writes: ")[1].splitlines()[0])
     assert found["link_bandwidth_bytes_per_s"] == [5e10, 5e10, 5e10]
     # Latency 4 or 6 us by round; the uncontended writes moved 20 and 10 GB/s.
