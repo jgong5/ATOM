@@ -112,6 +112,9 @@ V4_QKNS = (
     "aiter._fused_qk_norm_rope_group_quant_kernel.default",
     "aiter.ops.flydsl.kernels.qk_norm_rope_quant:flydsl_qk_norm_rope_quant",
 )
+#: DeepSeek-V4's prefill attention under the fp8 KV cache, which takes the
+#: prefix index list and indptr of its layer's compress ratio.
+V4_PREFILL = "aiter.pa_sparse_prefill_fp8_opus.default"
 #: DeepSeek-V4.1's guarded ops a capture runs the bodies of: attention,
 #: Engram and the step's staging hold kernels of their own.
 V41_OPENED = (
@@ -1085,8 +1088,9 @@ def _v4_attention(v4, recorder):
 
     The decode leaves (`V4_DECODES`) state the layer's `window_size`,
     `compress_ratio` and `index_topk` (None when it has no indexer), and the
-    indexer's and the fused QK-norms (`V4_QKNS`) its `compress_ratio`, none of
-    which they are passed: read off the layer `layer_name` names.
+    indexer's, the fused QK-norms (`V4_QKNS`) and the prefill attention
+    (`V4_PREFILL`) its `compress_ratio`, none of which they are passed: read
+    off the layer `layer_name` names.
     """
     from atom.utils.forward_context import get_forward_context
 
@@ -1097,7 +1101,7 @@ def _v4_attention(v4, recorder):
         geometry = (("window_size", layer.window_size), *ratio, ("index_topk", top))
         stated = {
             **dict.fromkeys(V4_DECODES, geometry),
-            **dict.fromkeys((V4_INDEXER, *V4_QKNS), ratio),
+            **dict.fromkeys((V4_INDEXER, *V4_QKNS, V4_PREFILL), ratio),
         }
         with (
             patch.object(recorder, "stated", stated),

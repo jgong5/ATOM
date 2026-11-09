@@ -41,6 +41,7 @@ its header.
 | `ca_grant_cost.py` | any container with `atom`; for the cross-node figure, one on each of two hosts | `python3 scripts/compass/ca_grant_cost.py serve N tcp://0.0.0.0:PORT` on the clock's host, then `python3 scripts/compass/ca_grant_cost.py lps N tcp://HOST:PORT` on the LPs' host: a clock authority over N synthetic LPs, each one channel of `--lookahead` seconds (default 1) from every other, served over the `tcp` carrier, and N LP processes that each ask `TAR` one second past their clock `--rounds` times (default 1000), then `NER(+inf)`. `lps` prints a `TAR`'s round trip, send to grant (p10, p50, p90); `serve` prints the endpoint it bound, then its CPU seconds per request served. At the default lookahead each round is a barrier, every LP granted once the last has asked; at 2 an LP may run one round ahead. The clock authority's sizing in `atom/compass/design/01_execution_and_time_model.md` (D3.1) states its figures. |
 | `mi355x_spec.py` | any container with `atom` | `python3 scripts/compass/mi355x_spec.py`: rebuild `machines/mi355x-gpu45.json`, the mi355-gpu-45 MI355X machine spec, from the device, capacity, datasheet peaks, the attainable peaks `probe_device.py` read on mi355-gpu-45 (`PEAKS`) and assumed values recorded in the script; byte for byte while this script and `mi308x_spec.py` are unchanged. With `COMPASS_MACHINE=mi355x-crs005`, the same for crsuse2-m2m-v3-005 into `machines/mi355x-crs005.json`, which -013 also reads (same cards, VBIOS and driver, no ptl directory); with `COMPASS_MACHINE=mi355x-gpu40`, for mi355-gpu-40 under nightly 20261026's stack with the aiter `aiter_c90842add0.sh` builds into `machines/mi355x-gpu40.json`, whose stack is read from a start in a container it built (`STACK`) and the rest from the device start, which ran the image's aiter. Prints `validate`'s verdict and `explain`'s fields grouped by origin. |
 | `aiter_c90842add0.sh` | every GPU container on mi355-gpu-40, before its first server | `podman exec CONTAINER bash scripts/compass/aiter_c90842add0.sh`: commit upstream aiter `c90842add0`'s csrc (`aiter_c90842add0.patch`) on the image's aiter `41d4d8d7e` as `09d256420`, the aiter commit `machines/mi355x-gpu40.json` pins, rebuild `module_quant` and `module_moe_sorting_opus` for gfx950, and check that a fresh process loads the files it built, by path and sha256. Without it a MoE pass whose `num_local_tokens` is one short of its rows zeroes the row past its stage-2 activations ([#2538](https://github.com/jgong5/ATOM/issues/2538)), and every command that checks the stack refuses against gpu-40's spec. Run again, it rebuilds nothing. |
+| `rdma_link.py` | a GPU container on each of two nodes; `fit` in any container with `atom` | Times Mooncake KV writes between two nodes and fits the inter-node link of crsuse2-m2m-v3-005 and -013 that `atom/compass/networks/crs005-013-ionic.json` holds and `mi355x_spec.py` states: `target` on the decode node, `bench` on the prefill node, `fit BENCH [RECORD]` anywhere; its docstring lists the experiments, and [the 1P1D section](#the-inter-node-link--rdma_linkpy) the commands. |
 | `mi455_spec.py` | any container with `atom` | `python3 scripts/compass/mi455_spec.py a0`: rebuild `machines/mi455-a0.json`, the spec of the node's MI455 A0 sample cards, from MI455X's datasheet peaks (`DATASHEET`), the attainable peaks `probe_device.py` read on two of the node's cards (`PEAKS`), the arch, capacity and stack its record holds (`DEVICE`) and assumed values recorded in the script. `python3 scripts/compass/mi455_spec.py b0`: rebuild `machines/mi455-b0.json`, the spec of the MI455 B0 performance machines, device `MI455X B0`, which no card here reads, from the same datasheet peaks and `machines/mi355x-gpu45.json`, every value taken from that file assumed: its derates, and its bandwidth curve scaled to MI455X's datasheet bandwidth, carry MI355X's probed ratios onto MI455X's peaks, and its own values stand where no datasheet states one; its arch, assumed, is the A0 samples', and no rate, latency or stack A0's probe read reaches it. Each is byte for byte while this script, `mi308x_spec.py` and `mi355x-gpu45.json` are unchanged, and prints `validate`'s verdict and `explain`'s fields grouped by origin. |
 | `cpu_gate_exclude.txt` | — | Excluded test files in two marked sections: **GENERATED** (`# BEGIN GENERATED`, driver-dependent at *collection* time; never hand-edit — `regen_cpu_gate_exclude.sh` rewrites it wholesale) and **MANUAL** (`# BEGIN MANUAL`, collects cleanly then fails on a driver call or for want of a `.git`, so the regenerator cannot see it). The MANUAL section **is** hand-edited; every entry must carry its observed failure above it. |
 | `gpu_gate_triggers.txt` | — | The source paths that no *running* CPU-gate test names. Generated, not hand-written; matched by `gate_cpu.sh`. A trailing `/` matches a subtree. |
@@ -842,7 +843,10 @@ pulls, so every kind carries `E_out`, `E` runs from the latest pull over the
 eight ranks before the same forward and `W_launch` ends at the token read.
 Their host keys carry the `atom`
 digest of the tree they were last re-keyed at; `provenance` names the
-capture tree's.
+capture tree's. Their engine config, in each law and its host key, states
+`index_cache_dtype` fp4: each cell ran one server with no `--kv-transfer-config`,
+for which ATOM resolves the fp4 indexer at gfx950, so a P/D side, which ATOM
+resolves to fp8, refuses them ([#2998](https://github.com/jgong5/ATOM/issues/2998)).
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-crs005-{prefill,decode}.json`
 are the same pair for the cell on crsuse2-m2m-v3-005 (prefill) and -013 (decode),
@@ -867,7 +871,9 @@ decode law's, stating `declared`, since the prefill law's own fit left rung 2 un
 in the `cached_seqs` form on the lone prefill cells and on the prefill side of one 1P1D
 `deploy.sh record` cell, #975's cell at c=1 over traces 256 to 392, seed 20260707
 ([#2853](https://github.com/jgong5/ATOM/issues/2853)); its other vectors but rung 2, and its
-host laws, are the lone cells' fit.
+host laws, are the lone cells' fit. The pair's lone cells ran the fp4 indexer and its 1P1D
+cells the fp8 one, so neither law states `index_cache_dtype`, and each reads as fp8
+([#2998](https://github.com/jgong5/ATOM/issues/2998)).
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by
@@ -878,7 +884,7 @@ concurrency 1, 4, 16, 64 and 256 at `cctraces_sim.sh`'s default `SEED`
 the prefill side adds 64 three more times at `SEED=20260708` and once at the default,
 the decode side 64 once more at the default ([#1810](https://github.com/jgong5/ATOM/issues/1810)).
 Each decode rung a law fits has steps in two or more cells, so each carries a held-out
-hull. Host keys as above.
+hull. Host keys and the fp4 indexer as the gpu-45 pair's.
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-{prefill,decode}.json`
 are the EP8 pair for the cell on crsuse2-m2m-v3-005 (prefill) and -013 (decode), keyed by
@@ -900,7 +906,8 @@ vectors, the prefill law's rung-1 vector among them, and its host laws are the o
 lone cells alone, and its `sources` names the records each came from. The prefill law's rung-2
 vector is not: it is the decode law's, stating `declared`, since no prefill-side record decodes at
 rung 2, which the 1P1D prefill side reaches at c=64 ([#2878](https://github.com/jgong5/ATOM/issues/2878)).
-Host keys as above.
+Host keys as above; the indexer as the crs005 DPA-TP8 pair's, its lone cells fp4 and its 1P1D
+cells fp8, so neither law states it.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json` is DeepSeek-V4.1-Flash's
 law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed
@@ -1078,6 +1085,30 @@ at the run's own commit on the node where that side's real instance runs (013 fo
 the decode): decode readings taken on 005 sized the simulated decode 79 to 80 KV
 blocks per rank above every real decode on 013
 ([ruling](https://github.com/jgong5/ATOM/issues/1111#issuecomment-6659985920)).
+
+### The inter-node link — `rdma_link.py`
+
+`rdma_link.py` times Mooncake writes from 005's GPUs into 013's over the
+rails, as the cell's KV moves under matched rails, and `fit` publishes the
+link of the network file `atom/compass/networks/crs005-013-ionic.json`, which
+`mi355x_spec.py` states for the pair: the port rate and latency from the bench, and the derate a recorded deployment's own KV writes
+attained (`atom/compass/parity/writes.py`). Both ends run in a node's GPU
+container, created as above, with both nodes' locks and both page caches
+checked before and after, as the Rulings on #2794 have every 1P1D run's:
+
+```
+# 013: an engine per rail, stopped once the bench has ended
+PYTHONPATH=$T MC_IB_TC=96 python3 $T/scripts/compass/rdma_link.py target --ip 10.245.149.94 --out TARGETS
+# 005, once TARGETS is there
+PYTHONPATH=$T MC_IB_TC=96 python3 $T/scripts/compass/rdma_link.py bench --ip 10.245.151.159 --targets TARGETS --out BENCH
+# anywhere atom imports; RECORD, a `deploy.sh record` deployment's directory
+PYTHONPATH=$T python3 $T/scripts/compass/rdma_link.py fit BENCH RECORD
+```
+
+`fit` also replays the record's writes on that link per rank pair, per
+prefill rank and per rail, each one write at a time or sharing the
+bandwidth, and prints each one's error on every `_rdma_write` call and on
+the contended ones.
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
