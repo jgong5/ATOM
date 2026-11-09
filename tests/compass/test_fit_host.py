@@ -167,6 +167,9 @@ ENCODES = [
     ("encode", 1, 40_000),
     ("encode_batch", 5, 20_000),
 ]
+#: The planted segment tokenizer term: the call's own work over the ids its
+#: encode_batch returned, half before that call and half after it.
+SEGMENT = (6e-4, 4e6)
 #: The planted intake terms, on the loop thread's CPU clock.
 IDLE, PER_BYTE, FIXED = 1.1e-3, 8.8e-9, 4.3e-3
 #: What the wall clock holds of an intake past its CPU time: GIL waits.
@@ -197,16 +200,26 @@ def stamped(
     recorded server writes. A lone request per body size in `lone`, its loop
     thread's CPU time `IDLE + PER_BYTE x bytes` and its wall that plus
     `WAIT`, besides `OTHERS` of others' work on the loop while its pool job runs,
-    its pool job holding its call of `encodes` and a decode after its
+    its pool job holding its call of `encodes`, an ``encode_batch`` inside a
+    segment tokenizer call, and a decode after its
     send, each timed at `rates`; then calls that do not run lone, ten times
     slower, and one burst of `burst`'s body sizes, its templates
     `FIXED + PER_BYTE x bytes` of the loop's CPU time apart."""
     calls, lines = [], [_stamp("app", 10**12 + 5, 10**12 + 5)]  # a health probe
 
-    def call(kind, items, tokens, start, slow=1.0) -> int:
+    def call(kind, items, tokens, start, slow=1.0, thread=3, segment=True) -> int:
+        if kind == "encode_batch" and segment:
+            # The segment tokenizer's, inside its call on the same thread.
+            half = round(slow * (SEGMENT[0] + tokens / SEGMENT[1]) * 5e8)
+            end = call(kind, items, tokens, start + half, slow, thread, False) + half
+            calls.append(
+                {"call": "segment", "tokens": 3 * tokens, "items": 1, "thread": thread}
+                | {"t_start_ns": start, "t_end_ns": end}
+            )
+            return end
         end = start + round(slow * _seconds(rates, kind, items, tokens) * 1e9)
         calls.append(
-            {"call": kind, "tokens": tokens, "items": items, "thread": 3}
+            {"call": kind, "tokens": tokens, "items": items, "thread": thread}
             | {"t_start_ns": start, "t_end_ns": end}
         )
         return end
@@ -245,6 +258,9 @@ def stamped(
     lines += [_stamp("send", y + 3000, y + 4000)]
     call("decode", 1, 4, y + 10**6, slow=10)
     call("decode", 1, 4, y + 10**6 + 500, slow=10)
+    # A segment tokenizer call while another pool thread's encode runs.
+    call("encode", 1, 9000, y + 5 * 10**6, slow=10, thread=4)
+    call("encode_batch", 4, 30_000, y + 6 * 10**6, slow=10)
     t = y + 10**9
     gaps = [round((FIXED + PER_BYTE * size) * 1e9) for size in burst]
     cpus = cpu + np.cumsum([0] + gaps[1:])
@@ -297,12 +313,19 @@ def test_a_record_s_tokenizer_calls_and_intake_stamps_fit_the_entry_s_terms(
     )
     report = member(tmp_path / "store", host_laws_key(key), "report")
     assert report["unfitted"] == {} and report["http_intake"]["burst"]["requests"] == 4
-    # Only the lone calls are fitted: each lone request's encode and decode.
-    fitted = {k: report["tokenizer"][k] for k in ("encode", "encode_batch", "decode")}
+    # The segment tokenizer call's own work: its wall less its encode_batch's,
+    # over the ids that returned.
+    assert tok["segment"] == pytest.approx(
+        {"fixed_s": SEGMENT[0], "tokens_per_s": SEGMENT[1]}, rel=1e-3
+    )
+    # Only the lone calls are fitted: each lone request's encode and decode, and
+    # its segment tokenizer call, lone among the calls it did not make.
+    fitted = {k: report["tokenizer"][k] for k in compass_run.TOKENIZER_KINDS}
     assert {k: v["samples"] + v["dropped"] for k, v in fitted.items()} == {
         "encode": 4,
         "encode_batch": 4,
         "decode": 8,
+        "segment": 5,
     }
     run_file(tmp_path, monkeypatch, host=host)
     assert compass_run.http_intake() == (
@@ -347,7 +370,7 @@ def test_the_intake_hull_spans_bodies_past_the_lone_requests_both_ways(tmp_path)
             {"http_intake": "0 forwards for 2 coefficients"}
             | {
                 f"tokenizer.{k}": f"the records hold no lone {k} call"
-                for k in ("encode", "encode_batch", "decode")
+                for k in compass_run.TOKENIZER_KINDS
             },
         ),
         (

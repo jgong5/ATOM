@@ -366,7 +366,8 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
     tokenizer record in `paths` holds, beside the intake stamps in `intakes`,
     and its report: the records' backend and fingerprint, and per kind of
     call, ``fixed_s + tokens / tokens_per_s`` by the host-law solver on the
-    calls' wall seconds.
+    calls' wall seconds, a segment tokenizer call's less its calls', over
+    their ids (`_own_work`).
     One-item ``encode_batch`` calls are ``encode``'s and several-item ones
     their own kind. A ``decode`` with no positive slope is ``fixed_s`` alone
     over ``tokens``, the ``[lo, hi]`` token counts its calls span. A kind the
@@ -379,14 +380,16 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
     for i, (path, intake) in enumerate(zip(paths, intakes)):
         head, *lines = Path(path).read_text().splitlines()
         heads[json.dumps(json.loads(head), sort_keys=True)] = None
-        for c in _lone_calls([json.loads(line) for line in lines], intake):
+        got = [json.loads(line) for line in lines]
+        for c in _lone_calls([c for c in got if c["call"] != "segment"], intake):
             kind = c["call"] if c["items"] > 1 or c["call"] == "decode" else "encode"
             s = (c["t_end_ns"] - c["t_start_ns"]) * 1e-9
             rows.append((i, kind, c["tokens"], s))
+        rows += [(i, "segment", n, s) for n, s in _own_work(got, intake)]
     if len(heads) != 1:
         raise ValueError(f"the records name {len(heads)} tokenizers: {sorted(heads)}")
     term, report = json.loads(next(iter(heads))), {"unfitted": {}}
-    for kind in ("encode", "encode_batch", "decode"):
+    for kind in ("encode", "encode_batch", "decode", "segment"):
         got = np.array([r[2:] for r in rows if r[1] == kind and r[3] > 0])
         record = np.array([r[0] for r in rows if r[1] == kind and r[3] > 0])
         try:
@@ -459,6 +462,23 @@ def _lone_calls(calls: list[dict], intake) -> list[dict]:
     own = np.array([c["call"] != "decode" for c in calls])
     lone = (before < start) & (after > end) & (arrived == 0) & (flight <= own)
     return [c for c, k in zip(calls, lone) if k]
+
+
+def _own_work(calls: list[dict], intake) -> list[tuple[int, float]]:
+    """Each ``segment`` call among `calls` lone (`_lone_calls`) among the calls it
+    did not make, its thread's that start in its span, as the ids those returned
+    and its wall seconds less theirs."""
+    own, ids, made, last = {}, {}, set(), None
+    for c in sorted(calls, key=lambda c: (c["thread"], c["t_start_ns"])):
+        start, end = c["t_start_ns"], c["t_end_ns"]
+        if last and last["thread"] == c["thread"] and start < last["t_end_ns"]:
+            own[id(last)] -= end - start
+            ids[id(last)] += c["tokens"]
+            made.add(id(c))
+        elif c["call"] == "segment":
+            own[id(c)], ids[id(c)], last = end - start, 0, c
+    lone = _lone_calls([c for c in calls if id(c) not in made], intake)
+    return [(ids[id(c)], own[id(c)] * 1e-9) for c in lone if c["call"] == "segment"]
 
 
 def _intakes(path) -> tuple[list, list, list]:

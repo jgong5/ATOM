@@ -117,7 +117,8 @@ that admits a request, and absent from an entry whose ``E`` laws hold them;
 ``tokenizer``, the served tokenizer's ``backend`` (``fast`` or ``slow``), the
 ``fingerprint`` of the ``tokenizer.json`` it was fitted on, and, each
 optional, ``encode``, one-item calls, ``encode_batch``, a backend
-``encode_batch`` of several items, and ``decode``, each ``fixed_s`` and a
+``encode_batch`` of several items, ``decode``, and ``segment``, the segment
+tokenizer call's own work over the ids its ``encode_batch`` calls return, each ``fixed_s`` and a
 positive ``tokens_per_s``, and a ``decode`` in their place ``fixed_s`` alone over ``tokens``, the ``[lo, hi]``
 token counts outside which a decode is refused and charged 0 s; ``http_intake``,
 ``fixed_s`` and ``per_byte_s``, with ``idle_s`` optional and ``bytes``, the
@@ -330,7 +331,7 @@ SUMMARY_SCHEMA_VERSION = 14
 #: The terms of a ``host`` entry the frontend charges, each 0 s where it is absent.
 HOST_TERMS = ("http_intake", "tokenizer")
 #: The kinds of call a ``tokenizer`` term prices, each 0 s where it is absent.
-TOKENIZER_KINDS = ("encode", "encode_batch", "decode")
+TOKENIZER_KINDS = ("encode", "encode_batch", "decode", "segment")
 #: A ``host`` entry's ``hops``, each optional and the run-file key of its name:
 #: the lookaheads of the traffic's request, an engine's ZMQ message in, its
 #: output, the stream back and a prefill-decode run's write request. Such a run
@@ -499,7 +500,7 @@ def _check_host(path, host: dict) -> None:
         raise ValueError(
             f"{path}: host's tokenizer is {tok!r}; it takes backend, fast or slow, "
             "fingerprint, the tokenizer.json it was fitted on, and, each "
-            "optional, encode, encode_batch and decode, each fixed_s and a "
+            "optional, encode, encode_batch, decode and segment, each fixed_s and a "
             "positive tokens_per_s, a decode fixed_s and tokens, [lo, hi], in "
             "their place"
         )
@@ -2055,7 +2056,7 @@ def tokenizer(tok, config) -> None:
     entry, its engine config's among several: a term fitted on another backend
     is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
     ends the run before the server serves (`_end_before_serving`). With no
-    term, `tok` is left as it is, charging 0 s.
+    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer.
 
     On a real run recording its steps (`parity.ENV`), it records instead
     (`_record_host`); with neither, `tok` is left as it is."""
@@ -2109,15 +2110,24 @@ def tokenizer(tok, config) -> None:
         rust.encode_batch = wrap_encode_batch(
             rust.encode_batch, term.get("encode"), term.get("encode_batch")
         )
+    if "segment" in term:
+        from atom.model_engine.segment_tokenizer import SegmentTokenizer
+        from atom.utils.compass_loop import wrap_segment
+
+        SegmentTokenizer._encode_cached = wrap_segment(
+            SegmentTokenizer._encode_cached, term["segment"]
+        )
 
 
 def _record_host(tok, record: Path) -> None:
     """Record, beside the step record in `record`, each call of `tok`'s
-    ``encode`` and ``decode`` and its Rust backend's ``encode_batch`` into
+    ``encode``, ``decode``, its Rust backend's ``encode_batch`` and ``segment`` into
     `TOKENIZER_RECORD`, after a first line naming `tok`'s ``backend`` and the
     ``fingerprint`` of its ``tokenizer.json``; and stamp each HTTP request's
     intake into `INTAKE_RECORD` (`_stamp_intake`)."""
     from tokenizers import Tokenizer
+
+    from atom.model_engine.segment_tokenizer import SegmentTokenizer
 
     record.mkdir(parents=True, exist_ok=True)
     calls = _LineFile(record / TOKENIZER_RECORD)
@@ -2135,6 +2145,12 @@ def _record_host(tok, record: Path) -> None:
             calls,
             lambda _, got: (sum(len(e.ids) for e in got), len(got)),
         )
+    SegmentTokenizer._encode_cached = _recorded(
+        SegmentTokenizer._encode_cached,
+        "segment",
+        calls,
+        lambda _, got: (len(getattr(got, "token_ids", got)), 1),
+    )
     _stamp_intake(_LineFile(record / INTAKE_RECORD))
 
 

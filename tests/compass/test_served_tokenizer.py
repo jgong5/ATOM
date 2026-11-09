@@ -34,6 +34,8 @@ TERM = {
     "encode_batch": {"fixed_s": 3.0e-4, "tokens_per_s": 1.7e6},
     "decode": {"fixed_s": 1.5e-4, "tokens_per_s": 2.55e6},
 }
+#: `TERM` with the segment tokenizer call's own work.
+FULL = TERM | {"segment": {"fixed_s": 9.0e-4, "tokens_per_s": 4.0e6}}
 
 
 class _Tokenizer:
@@ -181,6 +183,47 @@ def test_each_kind_of_call_is_charged_its_own_term_a_flat_decode_inside_its_toke
     ]
 
 
+def test_a_segment_tokenizer_call_is_charged_its_own_work_over_the_ids_it_encoded(
+    monkeypatch, tmp_path, rt
+):
+    from tokenizers import AddedToken, Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    from atom.model_engine import segment_tokenizer
+
+    cls = segment_tokenizer.SegmentTokenizer
+    monkeypatch.setattr(cls, "_encode_cached", vars(cls)["_encode_cached"])
+    # Every prompt takes the cache, and none is checked with a plain encode.
+    monkeypatch.setattr(segment_tokenizer, "_MIN_CACHED_CHARS", 0)
+    monkeypatch.setattr(segment_tokenizer, "_VERIFY_FIRST", 0)
+    several = {"fixed_s": 1.0e-3, "tokens_per_s": 1.0e4}
+    term = FULL | {"encode_batch": several}
+    _run_file(monkeypatch, tmp_path, {"host": {"tokenizer": term}})
+    backend = Tokenizer(WordLevel({"a": 0, "b": 1, "c": 2}, unk_token="a"))
+    backend.pre_tokenizer = Whitespace()
+    backend.add_special_tokens([AddedToken("<sep>", special=True)])
+    tok = PreTrainedTokenizerFast(tokenizer_object=backend)
+    seg = cls.maybe_create(tok, 1 << 20)  # the engine is built before the wrap
+    compass_run.tokenizer(tok, None)
+
+    def cost(prompt):
+        start = rt.now
+        assert seg.encode(prompt).tolist() == backend.encode(prompt).ids
+        return rt.now - start
+
+    own, one = term["segment"], term["encode"]
+    # Two segments of five ids in one encode_batch, then none, then one of one id.
+    assert cost("a a a<sep>b b") == pytest.approx(
+        several["fixed_s"] + 5 / 1.0e4 + own["fixed_s"] + 5 / own["tokens_per_s"]
+    )
+    assert cost("a a a<sep>b b") == pytest.approx(own["fixed_s"])
+    assert cost("a a a<sep>b b<sep>c") == pytest.approx(
+        one["fixed_s"] + 1 / one["tokens_per_s"] + own["fixed_s"] + 1 / 4.0e6
+    )
+
+
 class _LoadedFrom(_Tokenizer):
     """A fast tokenizer loaded from a model directory, as ``from_pretrained``
     records it."""
@@ -242,14 +285,15 @@ def test_a_server_charges_the_entry_fitted_under_its_engine_config(
     "host, named",
     [
         (None, ["http_intake", "tokenizer"]),
-        ({"tokenizer": TERM}, ["http_intake"]),
+        ({"tokenizer": FULL}, ["http_intake"]),
         (
-            {"tokenizer": {k: v for k, v in TERM.items() if k != "encode_batch"}},
+            {"tokenizer": {k: v for k, v in FULL.items() if k != "encode_batch"}},
             ["http_intake", "tokenizer.encode_batch"],
         ),
-        ({"tokenizer": TERM, "http_intake": {"fixed_s": 0.0, "per_byte_s": 0.0}}, []),
+        ({"tokenizer": TERM}, ["http_intake", "tokenizer.segment"]),
+        ({"tokenizer": FULL, "http_intake": {"fixed_s": 0.0, "per_byte_s": 0.0}}, []),
     ],
-    ids=["no-entry", "no-intake", "no-batch", "both"],
+    ids=["no-entry", "no-intake", "no-batch", "no-segment", "both"],
 )
 def test_the_summary_names_each_term_the_run_charged_nothing_for(
     monkeypatch, tmp_path, host, named
