@@ -851,8 +851,6 @@ class ClockAuthority:
 
     def _finish(self) -> list:
         self.final_clocks = tuple(self._now.items())
-        for owing in self._owing.values():
-            owing.clear()
         for i in self._ids:
             if self.timeline is not None:
                 self._record(i, math.inf, self._state[i])

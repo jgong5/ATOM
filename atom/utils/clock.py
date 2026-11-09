@@ -256,7 +256,7 @@ class LPRuntime:
         self.settle()
         if T < self.now:
             raise ValueError(f"{self.me} cannot advance to {T}, it is at {self.now}")
-        if T < self.ceiling:  # an LP with members has no ceiling
+        if T < self.ceiling:  # a member's stays -inf
             self._own_step("TAR", T, T)
         else:
             self._grant(*self._ca_call("TAR", T, rounds=later))
