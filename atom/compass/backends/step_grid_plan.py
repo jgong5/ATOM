@@ -78,14 +78,17 @@ BOUNDS = ("max_num_seqs", "max_num_batched_tokens", "max_model_len")
 TARGET = (*BOUNDS, "kv_cache_block_size", "num_kvcache_blocks", "ladder")
 #: The fields an engine file states beside `run.step_grid.keyed`'s.
 UNKEYED = (*BOUNDS, "num_kvcache_blocks", "enable_prefix_caching")
+#: The engine file's prefill token-graph buckets its runner recorded, where it
+#: recorded some, also beside `keyed`'s.
+PREFILL_BUCKETS = "prefill_buckets"
 #: The grid definition's own fields.
 DEFINITION = ("prefill", "decode", "margin")
 
 
 def keyed_of(engine: dict) -> dict:
     """`run.step_grid.keyed`'s fields of an engine file's mapping `engine`, which
-    adds `UNKEYED` to them."""
-    return {k: v for k, v in engine.items() if k not in UNKEYED}
+    adds `UNKEYED` and `PREFILL_BUCKETS` to them."""
+    return {k: v for k, v in engine.items() if k not in (*UNKEYED, PREFILL_BUCKETS)}
 
 
 def _views(steps) -> list[tuple[str, BatchView]]:

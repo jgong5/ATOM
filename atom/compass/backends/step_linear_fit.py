@@ -106,6 +106,13 @@ label less the draft-KV label.
 On an MTP record both prefill vectors, the target's and the draft's, add
 `seqs` and `out` (`StepLinearLaw`).
 
+Records whose engine files state the prefill token-graph buckets their runner
+recorded (`PREFILL_BUCKETS`) fit a prefill vector that adds `padding` and
+states them (`StepLinearLaw`); every record states the same buckets, or none
+does. A record whose runner recorded none, or that predates the field, states
+none and fits no `padding`; `--engine` states them in place of its own file.
+The draft law adds none: #2976 measured the target's token graph alone.
+
 Forms (`FORMS`): `base`, the features `StepLinearLaw` always prices; `history`,
 prefill plus `Sum (N_KV - N_Q)`, the KV a short chunk reads on a deep history;
 `shared`, decode with the context and padding slopes shared by every rung and
@@ -153,7 +160,7 @@ from atom.compass.backends.shape import (
     sum_query_square,
     sum_tokens,
 )
-from atom.compass.backends.step_grid_plan import keyed_of
+from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, keyed_of
 from atom.compass.backends.step_labels import CUTS, HOST_SEGMENTS, host_kind
 from atom.compass.backends.step_linear import (
     DECODE,
@@ -166,6 +173,7 @@ from atom.compass.backends.step_linear import (
     moe_column,
     moe_tokens,
     rowmod,
+    token_padding,
 )
 
 FORMS = ("base", "history", "shared", "cached_seqs")
@@ -210,6 +218,7 @@ def _features(
     draft: bool = False,
     serial: bool = False,
     routing: tuple[int, int] | None = None,
+    buckets: tuple[int, ...] = (),
 ) -> tuple[list[tuple], dict]:
     """One rank's fittable samples as (vector, features, seconds, step, context,
     tokens, dummies), and how many were cut, per reason.
@@ -217,7 +226,8 @@ def _features(
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
     order, plus `history` or `cached_seqs` in its form, above `dp` 1 `moe_rows` on prefill and
     under `serial` `serial_moe_rows`, and under `draft` or on a step with a draft
-    label `seqs` and `out` on prefill, as `StepLinearBackend` counts them;
+    label `seqs` and `out` on prefill, with `buckets` its `padding`, as
+    `StepLinearBackend` counts them;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill;
     `tokens` a decode step's real MoE tokens under `routing`, the model's
     (experts, top-k), which its MoE column reads, else None; `dummies` its
@@ -251,6 +261,14 @@ def _features(
                 if draft or s.draft_s is not None:
                     output = bool(view.produces_output)
                     counts += (len(r) if output else 0, int(output))
+                if buckets:
+                    if (padding := token_padding(view, buckets)) is None:
+                        raise ValueError(
+                            f"{s.provenance['run']} step {s.step} has no "
+                            "group_max_tokens, which its prefill token graph's "
+                            "bucket holds"
+                        )
+                    counts += (padding,)
             else:
                 key = _rung_key(view.capture_rung)
                 counts = (1, sum_context(view.decode), view.graph_padding)
@@ -1020,17 +1038,21 @@ def _groups(
     serial: bool = False,
     routing: tuple[int, int] | None = None,
     dummies: list[frozenset] | None = None,
+    buckets: tuple[int, ...] = (),
 ) -> tuple[list[dict[int, tuple]], dict, list[float]]:
     """One run's steps, each {rank: its `_features` row} labelled with the
     smallest rank label, a rank that ran the step as a dummy forward holding
     none; what was cut; and each step's rank label spread. With `steps`, only
-    the steps numbered in it; `serial` and `routing` as `_features` reads them;
+    the steps numbered in it; `serial`, `routing` and `buckets` as
+    `_features` reads them;
     `dummies`, each rank's steps run as dummy forwards, read from its samples
     when None: a rank that gave no sample needs them given."""
     if dummies is None:
         dummies = [rank[0].dummies for rank in run]
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
-    got = [_features(rank, form, len(run), draft, serial, routing) for rank in run]
+    got = [
+        _features(rank, form, len(run), draft, serial, routing, buckets) for rank in run
+    ]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
     if len(run) == 1:
         return [{0: r} for r in got[0][0]], cut, []
@@ -1087,6 +1109,11 @@ def _routing(options) -> tuple[int, int] | None:
     return tuple(routing) if routing else None
 
 
+def _buckets(options) -> tuple[int, ...]:
+    """`options`' `buckets`, the records' prefill token-graph buckets, ascending."""
+    return tuple(sorted((options or {}).get("buckets") or ()))
+
+
 def _law_routing(law: dict) -> tuple[int, int] | None:
     """`law`'s `moe_routing` as (experts, top-k), or None."""
     routing = law.get("moe_routing")
@@ -1099,14 +1126,17 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     `options` takes `form` (`base` by default), `dp`, the ranks each run
     holds (1 by default), `moe_routing`, the model's (routed experts,
     top-k), under which each decode rung but the draft law's may adopt a MoE
-    column (`_moe_column`); `seed` fixes the `rowmod` shuffles; `draft`, or a
-    sample with a draft label, adds `seqs` and `out` to the prefill vector.
+    column (`_moe_column`), and `buckets`, the records' prefill token-graph
+    buckets, under which the prefill vector adds `padding`; `seed` fixes the
+    `rowmod` shuffles; `draft`, or a sample with a draft label, adds `seqs` and
+    `out` to the prefill vector.
     """
     from scipy.spatial import QhullError
 
     form, dp = _options(options)
     routing = _routing(options)
     serial = _serial(samples, options)
+    buckets = _buckets(options)
     kvs = [s for s in samples if s.draft_kv_s is not None and not s.view.prefill]
     samples = [
         (
@@ -1119,7 +1149,9 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     runs = _runs(samples, dp)
     groups, cut, spread = [], {"warm": 0, "warm_s": 0.0}, []
     for i, run in enumerate(runs.values()):
-        got, c, s = _groups(run, form, draft, serial=serial, routing=routing)
+        got, c, s = _groups(
+            run, form, draft, serial=serial, routing=routing, buckets=buckets
+        )
         groups += [[(i, *r) for r in g.values()] for g in got]
         spread += s
         for k, v in c.items():
@@ -1128,6 +1160,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     prefill += ["cached_seqs"] * (form == "cached_seqs") + ["moe_rows"] * (dp > 1)
     prefill += ["serial_moe_rows"] * serial
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
+    prefill += ["padding"] * bool(buckets)
     law = {
         "provenance": f"step_linear_fit {form} on {len(runs) * dp} real records "
         f"({', '.join(runs)})",
@@ -1261,6 +1294,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                 vector["rowmod"] = rowmod_k
                 vector["fit"]["rowmod"] = evidence
             if k == "prefill":
+                if buckets:
+                    vector["buckets"] = list(buckets)
                 law["prefill"] = vector
             else:
                 law["decode"][k] = vector
@@ -1285,7 +1320,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         if s.draft_s is not None and _draft_kv(s) > 0
     ]
     if drafts:
-        unrouted = {**(options or {}), "moe_routing": None}
+        unrouted = {**(options or {}), "moe_routing": None, "buckets": None}
         law["draft"] = fit(drafts, unrouted, seed, draft=True)[0]
         if proposes := [
             s if s.draft_kv_s is None else dataclasses.replace(s, propose_s=s.draft_s)
@@ -1360,7 +1395,11 @@ def _held_out(samples, options, seed, warm=None):
         law = fit(others, options, seed)[0]
         routing = _law_routing(law)
         for group in _groups(
-            ranks, form, serial=options["serial"], routing=_routing(options)
+            ranks,
+            form,
+            serial=options["serial"],
+            routing=_routing(options),
+            buckets=_buckets(options),
         )[0]:
             key, _, seconds, step, *_ = next(iter(group.values()))
             if step in warm[i]:
@@ -1491,6 +1530,24 @@ def engine_config(records) -> dict:
     return held[0]
 
 
+def recorded_buckets(files) -> tuple[int, ...]:
+    """The prefill token-graph buckets the engine files `files` state
+    (`PREFILL_BUCKETS`), empty when none states any. Files stating two sets, or
+    some stating them and others not, refuse, naming each."""
+    held: dict = {}
+    for file in files:
+        buckets = json.loads(Path(file).read_text()).get(PREFILL_BUCKETS) or ()
+        held.setdefault(tuple(buckets), []).append(str(file))
+    if len(held) > 1:
+        raise ValueError(
+            "the engine files state other prefill buckets: "
+            + "; ".join(
+                f"{list(b) or 'none'} in {', '.join(f)}" for b, f in held.items()
+            )
+        )
+    return next(iter(held), ())
+
+
 def refuse_context_parallel(engine: dict, where: str) -> None:
     """Refuse an engine config that states a context-parallel width: a step
     linear law states none, so a run at width 1 would price with it."""
@@ -1550,7 +1607,8 @@ def main(argv=None) -> None:
     parser.add_argument(
         "--engine",
         help="the engine file the records ran under, stated in place of the "
-        ".engine.json beside each; refused where one contradicts it",
+        ".engine.json beside each, its prefill buckets for a record that states "
+        "none; refused where one contradicts it",
     )
     args = parser.parse_args(argv)
     for record in args.records:
@@ -1559,17 +1617,22 @@ def main(argv=None) -> None:
             built := step_labels.refusal(json.loads(run.read_text()))
         ):
             raise ValueError(f"{record} is not fitted: {built}")
+    owns = [Path(r).with_suffix(".engine.json") for r in args.records]
     if args.engine:
         engine = keyed_of(json.loads(Path(args.engine).read_text()))
-        for own in (Path(r).with_suffix(".engine.json") for r in args.records):
-            held = keyed_of(json.loads(own.read_text())) if own.exists() else {}
+        stated = [args.engine]
+        for own in owns:
+            raw = json.loads(own.read_text()) if own.exists() else {}
+            held = keyed_of(raw)
             refuse_context_parallel(held, str(own))
             if differ := [k for k, v in held.items() if engine.get(k, v) != v]:
                 raise ValueError(f"{own} contradicts {args.engine} in {differ}")
+            stated += [own] * (PREFILL_BUCKETS in raw)
     else:
-        engine = engine_config(args.records)
+        engine, stated = engine_config(args.records), owns
     dp = join_width(engine)
     options = {"form": args.form, "dp": dp, "moe_routing": args.moe_routing}
+    options["buckets"] = recorded_buckets(stated)
     samples, tables = label_records(args.records, dp)
     for record, table in tables.items():
         step_labels.write_table(record, table)

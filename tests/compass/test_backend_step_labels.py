@@ -415,13 +415,16 @@ def _dp_view(rows, rank, **group):
 #: gather pads the group's 4 real rows to 8, then a prefill step split in two.
 GROUP = [
     [
-        _dp_view(decode, rank, capture_rung=4, moe_rows=8, moe_tokens=4),
+        _dp_view(
+            decode, rank, capture_rung=4, moe_rows=8, moe_tokens=4, group_max_tokens=3
+        ),
         _dp_view(
             prefill,
             rank,
             moe_rows=900,
             moe_tokens=900,
             tbo_tokens=((300, 200), (200, 200)),
+            group_max_tokens=500,
         ),
     ]
     for rank, decode, prefill in (

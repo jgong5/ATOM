@@ -223,9 +223,12 @@ class BatchView:
     and reaches the MoE gate, and every dummy runs the same rows, from token 0
     at position 0, so the group's dummies route alike.
     `group_prefills` says some rank of the data-parallel group
-    prefills at this step; False on one rank. `image_tokens` counts the scheduled
-    tokens whose embedding the step's vision encoder supplies; a backend that
-    has no basis for pricing that encoder refuses a step with any.
+    prefills at this step; False on one rank. `group_max_tokens` is the most
+    tokens any rank of the group scheduled at this step, which ATOM picks the
+    step's prefill token-graph bucket by (`ForwardMode._pad_to_token_graph`),
+    never fewer than this rank's; None on one rank. `image_tokens` counts the
+    scheduled tokens whose embedding the step's vision encoder supplies; a
+    backend that has no basis for pricing that encoder refuses a step with any.
 
     What this does not do is make the collapsed form unreachable: one row is
     a legal batch, and a one-row batch is `tokens x history` by construction.
@@ -247,6 +250,7 @@ class BatchView:
     group_prefills: bool = False
     draft_rows: int | None = None
     group_dummies: int = 0
+    group_max_tokens: int | None = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -264,6 +268,12 @@ class BatchView:
         for row in rows:
             if not isinstance(row, RequestShape):
                 raise TypeError(f"not a request shape: {row!r}")
+        peak = self.group_max_tokens
+        if peak is not None and peak < sum_tokens(rows):
+            raise ValueError(
+                f"group max tokens {peak} is fewer than the {sum_tokens(rows)} "
+                "this rank scheduled"
+            )
         if self.capture_rung is None:
             return
         decode = self.decode

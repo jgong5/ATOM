@@ -18,6 +18,12 @@ and then `moe_rows`, the rows the data-parallel group's MoE gather carries
 After `moe_rows` it may add `serial_moe_rows`: `moe_rows` on a step the group did
 not split for two-batch overlap (`BatchView.tbo_tokens` None), else 0, the MoE
 rows no second micro-batch overlaps.
+Last, a prefill vector may add `padding`, the rows its token graph runs past
+the step's tokens (`token_padding`): ATOM replays a prefill's first layers at
+the smallest of the vector's `buckets`, the prefill token-graph buckets the
+runner recorded, that holds the most tokens any rank of the data-parallel group
+scheduled. A data-parallel step stating no `group_max_tokens` is refused, and a
+vector with a `padding` coefficient states its `buckets`.
 
 A law prices one rank's step; the runner takes the group's step as the max
 over its ranks. Its parallel layout is its `engine_config`'s, which a run
@@ -89,7 +95,7 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
 
     {"provenance": "<what it was fitted on>",
      "machine_spec": "sha256:<hex>",
-     "prefill": VECTOR,
+     "prefill": VECTOR,   # with a padding column, its "buckets"
      "decode": {"eager": VECTOR, "1": VECTOR, "2": VECTOR, ...},
      "moe_routing": {"experts": E, "top_k": K},   # with a moe_experts column
      "draft": {"provenance": ..., "prefill": VECTOR, "decode": {...},
@@ -135,7 +141,15 @@ from atom.compass.backends.work import activated_experts
 PREFILL = ("step", "tokens", "query_square", "query_cached")
 HISTORY = PREFILL + ("history",)
 #: The prefill vector's optional features, in the order they follow `PREFILL`.
-PREFILL_EXTRA = ("history", "cached_seqs", "moe_rows", "serial_moe_rows", "seqs", "out")
+PREFILL_EXTRA = (
+    "history",
+    "cached_seqs",
+    "moe_rows",
+    "serial_moe_rows",
+    "seqs",
+    "out",
+    "padding",
+)
 DECODE = ("step", "context", "graph_padding")
 #: The MoE columns a decode vector may add, over its step's real MoE tokens.
 MOE_COLUMNS = ("moe_tokens", "moe_experts")
@@ -177,6 +191,14 @@ class _Vector:
         self.rowmod = int(spec["rowmod"]) if "rowmod" in features else None
         if self.rowmod is not None and self.rowmod < 1:
             raise ValueError(f"the {name} vector's rowmod modulus is {self.rowmod}")
+        self.buckets = None
+        if "padding" in features:
+            self.buckets = tuple(sorted(int(b) for b in spec.get("buckets") or ()))
+            if not self.buckets:
+                raise ValueError(
+                    f"the {name} vector carries padding and states no buckets, "
+                    "the prefill token-graph buckets it pads to"
+                )
 
 
 def moe_tokens(view: BatchView) -> int | None:
@@ -199,6 +221,22 @@ def moe_column(
     if feature == "moe_experts":
         return activated_experts(*routing, tokens - max(dummies - 1, 0))
     return float(tokens)
+
+
+def token_padding(view: BatchView, buckets: tuple[int, ...]) -> int | None:
+    """The rows `view`'s prefill token graph runs past its tokens: the smallest
+    of `buckets`, ascending, that holds its group's `group_max_tokens` (on one
+    rank its own tokens), less its own; 0 past the largest and on a step the
+    group split for two-batch overlap, both of which ATOM runs eagerly
+    (`ForwardMode._pad_to_token_graph`). None for a data-parallel view
+    stating no `group_max_tokens`."""
+    if view.tbo_tokens:
+        return 0
+    tokens = sum_tokens(view.requests)
+    peak = tokens if view.moe_rows is None else view.group_max_tokens
+    if peak is None:
+        return None
+    return next((b - tokens for b in buckets if b >= peak), 0)
 
 
 def cached_seqs(rows) -> int:
@@ -339,6 +377,15 @@ class StepLinearBackend(CostBackend):
                     f"which its {what}prefill terms depend on",
                 )
             counts += tuple(by_output[f] for f in mine)
+            if vector.buckets:
+                padding = token_padding(batch_view, vector.buckets)
+                if padding is None:
+                    raise self._refuse(
+                        batch_view,
+                        "no group_max_tokens on this data-parallel step, which "
+                        "its prefill token graph's bucket holds",
+                    )
+                counts += (padding,)
         else:
             rung, kind = batch_view.capture_rung, "decode"
             vector = law.decode.get(rung)

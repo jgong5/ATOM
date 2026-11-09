@@ -180,6 +180,7 @@ class TestPerRequestSums:
             "group_prefills",
             "draft_rows",
             "group_dummies",
+            "group_max_tokens",
         ]
         assert [f.name for f in fields(RequestShape)] == [
             "query_tokens",
