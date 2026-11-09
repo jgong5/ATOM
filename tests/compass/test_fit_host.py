@@ -29,6 +29,7 @@ from atom.compass.artifacts import Key, Kind
 from atom.compass.backends.step_labels import digest
 from atom.compass.backends.step_linear_fit import (
     fit_host,
+    fit_intake,
     fit_tokenizer,
     label_records,
 )
@@ -284,13 +285,14 @@ def test_a_record_s_tokenizer_calls_and_intake_stamps_fit_the_entry_s_terms(
     # The decodes take no time per token: a fixed charge over the tokens they span.
     assert tok["decode"]["fixed_s"] == pytest.approx(DECODE[0], rel=1e-3)
     assert tok["decode"]["tokens"] == [1, 8] and "tokens_per_s" not in tok["decode"]
-    # On the loop's CPU clock, not the wall's, which holds the GIL waits.
+    # On the loop's CPU clock, not the wall's, which holds the GIL waits. The
+    # hull spans every body taken in, the two 9000 B requests that overlap too.
     assert intake == pytest.approx(
         {
             "fixed_s": FIXED,
             "per_byte_s": PER_BYTE,
             "idle_s": IDLE,
-            "bytes": [30_000, 400_000],
+            "bytes": [9000, 400_000],
         },
         rel=1e-6,
     )
@@ -309,7 +311,16 @@ def test_a_record_s_tokenizer_calls_and_intake_stamps_fit_the_entry_s_terms(
         intake["per_byte_s"],
         intake["idle_s"],
     )
-    assert compass_run.http_intake_hull() == (30_000, 400_000)
+    assert compass_run.http_intake_hull() == (9000, 400_000)
+
+
+def test_the_intake_hull_spans_bodies_past_the_lone_requests_both_ways(tmp_path):
+    # Lone requests of 30 to 400 KB; a burst's 600 KB body above them, and
+    # two overlapping requests' 9000 B below.
+    (tmp_path / "steps").mkdir()
+    stamped(tmp_path, burst=(40_000, 600_000, 50_000))
+    term, report = fit_intake([tmp_path / "steps" / compass_run.INTAKE_RECORD])
+    assert term["bytes"] == [9000, 600_000] and report["samples"] == 8
 
 
 @pytest.mark.parametrize(

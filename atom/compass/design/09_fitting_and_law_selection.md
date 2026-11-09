@@ -121,14 +121,27 @@ TP4 run and is refused at any other width, like any other layout field
   TP1-only full-engine calibration of `07` D38; with EP off the MoE segment does not,
   since `flatten_tp_across_dp` shards every expert `dp` ways; with EP on it does, each
   rank running its own experts whole on the rows MORI delivers.
-- **The fit: alternating max-affine regression.** The ranks wait for each other inside the
-  forward, so a rank's measured step is the group's step and its own cost is never seen:
-  the observation is `y = max_r f(x_r)`. The fit alternates two moves until no step
-  changes rank: assign each step to the rank with the largest prediction under the
-  current coefficients, then refit the one law on the assigned ranks' features, each
-  equation divided by its target (D53). This is the least-squares partition heuristic for
-  max-affine fitting (Magnani and Boyd, 2009), with the ranks in place of the affine
-  pieces and one coefficient vector shared by all of them.
+- **The fit: line-searched alternating max-affine regression.** The ranks wait for each
+  other inside the forward, so a rank's measured step is the group's step and its own
+  cost is never seen: the observation is `y = max_r f(x_r)`. The fit minimises
+  `F(c) = sum_i (max_r x_ir.c / y_i - 1)^2`, each equation divided by its target (D53),
+  under non-negative coefficients. It starts from the fit on every rank's row. Each pass
+  assigns each step to the rank with the largest prediction under the current
+  coefficients and refits the one law on the assigned ranks' features: a Gauss-Newton
+  step on `F`. A backtracking line search halves the step until `F` falls, so `F` falls
+  on every pass and the passes cannot cycle. They end settled, the refit assigning
+  each step the rank it was fitted on, or at a tie between ranks, when no step larger
+  than a numerical tolerance (the square root of the float epsilon, on the relative
+  prices) lowers `F`. MAD drops are its outer loop. A pass cap reached refuses the fit.
+  This is the least-squares partition heuristic for max-affine fitting (Magnani and Boyd,
+  2009), with the ranks in place of the affine pieces and one coefficient vector shared
+  by all of them, damped so that it descends.
+- **Each vector on the rows it prices.** Owner's decision on
+  [#2904](https://github.com/jgong5/ATOM/issues/2904), 2026-11-06: a DP vector is solved,
+  hulled and warm-cut on the rows it prices itself, the rank `priced_rank` picks under
+  it; a decode rung that adopts a MoE column or `rowmod` is fitted again under it, from
+  every rank's row. One entry, `step_linear_fit._fit_form`, fits a form and returns its
+  vector with those rows.
 
 ### The label: device time per step kind, and the host laws beside it
 
@@ -191,7 +204,10 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   vector unfitted; a trace run's decodes and host segments are profiled, so it gives no
   decode or host label, and an ordinary record fits the decode and host laws. A trace run
   under DP refuses. Checked-in laws keep their labels until refitted, and a refit needs a
-  trace run. On Run 4B's TP0 trace the busy time of device-paced forwards sat within 0.6%
+  trace run. A DP law's prefill vector keeps its window labels at a refit, its provenance
+  naming them and the tree it was fitted at, until [#3010](https://github.com/jgong5/ATOM/issues/3010)
+  gives DP ranks a trace run ([Ruling](https://github.com/jgong5/ATOM/issues/2853#issuecomment-6717057158)).
+  On Run 4B's TP0 trace the busy time of device-paced forwards sat within 0.6%
   of the window per target pass and the final's draft at +2.3%, where copy-stream copies
   ran past the window's last event; the capped gaps added none of a host-paced final's
   busy time ([#2072](https://github.com/jgong5/ATOM/issues/2072#issuecomment-6387348851)).
@@ -217,13 +233,14 @@ few milliseconds behind the host's return from the R1 wait, where the host queue
 when the device ran further behind, after a long prefill or a middle chunk
 ([#2492](https://github.com/jgong5/ATOM/issues/2492)). That extra window is host time
 ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6684001197), 2026-11-06):
-a trace run's busy time leaves it out, and its host ran under the profiler, so a trace
-run states no lag and the propose labels fit one `propose` vector; one unsplit law priced
-trace runs A and B's host-paced propose busy within 2.4%. The fit's split of `propose` at
-a lag ([#2572](https://github.com/jgong5/ATOM/issues/2572)), bounded at a token count
-([#2615](https://github.com/jgong5/ATOM/issues/2615)), is gone. A law fitted before may
-still hold `near_propose`, with its `lag` and `below`, which a run prices off its host
-recurrence's lag until [#2917](https://github.com/jgong5/ATOM/issues/2917) deletes it.
+a trace run's busy time leaves it out, so the propose labels fit one `propose` vector, and
+one unsplit law priced trace runs A and B's host-paced propose busy within 2.4%. The
+recurrence starts the draft no earlier than the forward's exit, before which the host
+queues it (`01` D4, [#2917](https://github.com/jgong5/ATOM/issues/2917)). On an ordinary
+record a decode's draft label, its `propose` pass, is cut where the device reached the
+pass, placed on the host clock by the lead, before the host's draft copy wait began: the
+host queues the pass just before that wait, so the window may hold the device's wait for
+it.
 
 **Host laws** price the host segments of `01` D4: `E`, `W_pre`, `W_launch` and
 `W_post`, each linear in `(1, tokens, seqs)`, fitted separately for decode, output
@@ -728,7 +745,7 @@ choice that must be visible.
 | # | Decision | Date |
 |---|---|---|
 | D53 | Fit relative error, not absolute seconds. MAD outlier test on the same relative residuals. | 2026-09-18 |
-| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under TP, DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by alternating max-affine regression. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes cut, and on prefill a trace run's busy time per pass; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), and `admit`, `(admits, uncached, cached)` over every kind, on what a forward's `E` spends admitting requests, which its kind's `E` is fitted without, are fitted beside it, keyed by host CPU, `atom` digest, model, engine config, device, software stack and torch, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); machine-spec digest in the host-law key 2026-10-16 (#952); host-paced prefill cut 2026-10-24 (#1983); traced prefill 2026-10-24 (#2072); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080); output prefill draft-KV pass 2026-10-25 (#2100); a prefill launch the device held gives no `W_launch` 2026-10-26 (#2256); TP above 1 2026-10-30 (#2490); a short output prefill's propose pass split off 2026-10-31 (#2492), at the device's lag 2026-11-01 (#2572); a forward's admissions priced apart, `admit` 2026-11-02 (#2620), its intercept once a forward 2026-11-03 (#2705); device, software stack and torch in place of the machine-spec digest 2026-11-03 (#2716); the propose pass unsplit on trace runs 2026-11-06 (#2072) |
+| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under TP, DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by line-searched alternating max-affine regression, each vector on the rows it prices. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes cut and a decode's `propose` label cut where the device reached the pass before the host's draft copy wait, and on prefill a trace run's busy time per pass; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), and `admit`, `(admits, uncached, cached)` over every kind, on what a forward's `E` spends admitting requests, which its kind's `E` is fitted without, are fitted beside it, keyed by host CPU, `atom` digest, model, engine config, device, software stack and torch, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); machine-spec digest in the host-law key 2026-10-16 (#952); host-paced prefill cut 2026-10-24 (#1983); traced prefill 2026-10-24 (#2072); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080); output prefill draft-KV pass 2026-10-25 (#2100); a prefill launch the device held gives no `W_launch` 2026-10-26 (#2256); TP above 1 2026-10-30 (#2490); a short output prefill's propose pass split off 2026-10-31 (#2492), at the device's lag 2026-11-01 (#2572); a forward's admissions priced apart, `admit` 2026-11-02 (#2620), its intercept once a forward 2026-11-03 (#2705); device, software stack and torch in place of the machine-spec digest 2026-11-03 (#2716); the propose pass unsplit on trace runs 2026-11-06 (#2072); a decode's host-paced `propose` label cut 2026-11-06 (#2917); line-searched alternation, each vector on the rows it prices, 2026-11-06 (#2904) |
 | D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61), and, given the model's routing, one MoE column, the step's real MoE tokens `n` or the experts `X` they reach, the step's DP dummy forwards counted in `X` as one token: the form of smallest step-weighted held-out error, no column among them, adopted with no bar. | 2026-09-18; revised 2026-10-14 (#941), 2026-11-01 (MoE column, #2493) and 2026-11-03 (no bar, #2735; dummies in `X`, #2536) |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |
