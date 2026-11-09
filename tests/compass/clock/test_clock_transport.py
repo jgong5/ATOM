@@ -12,6 +12,7 @@ import json
 import math
 import queue
 import re
+import socket
 import threading
 
 import pytest
@@ -305,6 +306,14 @@ def test_a_report_gets_no_reply_and_hands_out_the_grants_it_makes_due(served, en
     first = _later(dp0.recv)
     assert _ask(dp1, (TAR, 4.0, [], INF)) == (4.0, {REQ1: []})
     assert _result(first) == (4.0, {REQ0: []})
+
+
+def test_a_call_after_a_report_leaves_at_once_over_tcp(served):
+    """A report waits for no reply, so the frame after it must not wait in the
+    kernel for the report's acknowledgement."""
+    a = connect(A, served(ClockAuthority(_table()), "tcp://127.0.0.1:0").endpoint)
+    sock = a._server._sock
+    assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
 
 
 def test_a_refused_report_ends_the_run_as_its_sender_reads_no_refusal(served):
