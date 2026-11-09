@@ -286,8 +286,8 @@ def keep_zmq_shim_choosing():
     runtime's own with one. `monkeypatch.setattr` on the shim restores by
     `setattr`, so the pyzmq class it read stays in the module dict, and a later
     test that installs a runtime gets pyzmq's: an engine input thread then never
-    reports its requests. Patch the name on the module that imports the shim
-    instead (`monkeypatch.setattr(engine_core, "zmq", ...)`).
+    reports its requests. Patch it in the shim's dict instead
+    (`monkeypatch.setitem(vars(zmq_shim), ...)`), whose undo deletes it.
 
     pytest sets autouse fixtures up in name order, and this name sorts before
     `mono_runs_on_gfx950`, the first to take `monkeypatch`: its check runs
@@ -300,20 +300,8 @@ def keep_zmq_shim_choosing():
         delattr(shim, name)
     assert not fixed, (
         f"this test left zmq_shim's {fixed} fixed, which a later test's LP "
-        "runtime would not get; patch `zmq` on the module that imports the shim"
+        "runtime would not get; patch it with `monkeypatch.setitem(vars(...))`"
     )
-
-
-class ZmqPolling:
-    """A module's `zmq` whose `Poller` makes ``poller``, every other name read
-    from ``zmq`` itself: what a test sets on a module that imports `zmq_shim`
-    (`keep_zmq_shim_choosing`)."""
-
-    def __init__(self, zmq, poller):
-        self._zmq, self.Poller = zmq, lambda: poller
-
-    def __getattr__(self, name):
-        return getattr(self._zmq, name)
 
 
 @pytest.fixture

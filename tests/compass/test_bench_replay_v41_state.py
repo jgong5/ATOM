@@ -193,3 +193,129 @@ def test_every_op_bench_placement_of_a_verify_or_cached_prefill_point_prepares(
     placed = seen[point]
     assert placed["refused"] is None
     assert len(placed["slots"]) > 1
+
+
+def test_a_leaf_of_v41s_state_counts_it_once_a_slot_its_placements_hold(probed):
+    """V4.1's compressor states, bound on its builder: the leaf's 7 placements
+    of two rows take the 4 slot pairs 8 slots hold, its states counted once a
+    pair, its activation once a copy."""
+    _, seen = probed
+    placed = seen["ops_v41_state"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    pairs = [[0, 1], [2, 3], [4, 5], [6, 7]]
+    assert placed["slots"] == pairs + pairs[:3]
+    assert set(record["metadata"].values()) == {
+        f"attn_metadata_builder.cache.state.{f}.0"
+        for f in ("compress_kv", "compress_score")
+    }
+    assert record["footprint_bytes"] == 7 * 32 + 4 * placed["read"]
+
+
+def test_a_v41_state_field_taken_whole_counts_each_row_s_slot_once_a_layer(probed):
+    """`aten.select.int` takes a layer of V4.1's state field from the whole
+    field, `[layers, slots, ...]`, its slots strided past its layers: each row's
+    slot counts once a layer, at the 4 slot pairs 8 slots hold, and no slot
+    past the rows'."""
+    _, seen = probed
+    placed = seen["ops_v41_field"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert set(record["metadata"].values()) == {
+        f"attn_metadata_builder.cache.state.{f}" for f in ("window", "compress_score")
+    }
+    assert record["footprint_bytes"] == 7 * 32 + 4 * placed["read"]
+
+
+def test_a_v41_page_field_taken_whole_binds_it_and_counts_once_a_placement(probed):
+    """`aten.select.int` takes a layer of V4.1's page field from the whole
+    field, `[layers, pages, rows, dim]`, of the 4 PAGEs a capture's pool held:
+    it binds that field, not the state's buffer, so it counts once a placement."""
+    _, seen = probed
+    placed = seen["ops_v41_page"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert record["metadata"] == {"main_1": "attn_metadata_builder.cache.pages.main_1"}
+    assert record["footprint_bytes"] == 7 * 32 + 7 * placed["read"]
+
+
+@pytest.mark.parametrize(
+    "pool, slots",
+    [("whole", 8), ("ring", 8), ("ring", 4), ("ring0", 8)],
+)
+def test_a_v41_window_ring_reached_through_its_pool_counts_once_a_slot(
+    probed, pool, slots
+):
+    """V4.1's pool, `[rows, dim]` over its PAGEs and its state arena, as a
+    capture's 4 PAGEs held it. Taken whole with its ring's window, a decode
+    row's token is the window ring row it writes, in the arena: it counts once
+    a slot pair of the 4 that 8 slots hold. Beside a ring cut from it
+    (`ring_view`), at a leaf stating its window of 8, the ring's rows a row's
+    window reads count once a slot pair, and the whole pool's selection, top-k
+    1 a row, once a placement, none at ratio 0; whether the capture held the
+    bench's 8 state slots or 4."""
+    _, seen = probed
+    placed = seen[f"ops_v41_{pool}_pool_{slots}"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert record["metadata"]["pool"] == "attn_metadata_builder.cache.pool"
+    ring = placed["ring"]
+    pages = placed["read"] - ring
+    assert record["footprint_bytes"] == 7 * 32 + 7 * pages + 4 * ring
+
+
+@pytest.mark.parametrize("point, tokens, sets", [("verify", 12, 4), ("prefill", 32, 7)])
+def test_a_v41_window_ring_written_through_its_pool_counts_a_row_a_token(
+    probed, point, tokens, sets
+):
+    """`_launch_rope_window` and `swa_write` take V4.1's pool whole, with its
+    ring's window, and write a row a token into a request's ring, its ring's
+    rows at most: DSpark5's two verify rows of 6 tokens write 12 rows, once a
+    slot pair of the 4 that 8 slots hold, and a 32-token chunk past a cached
+    prefix its ring's 8, once a placement's slot."""
+    _, seen = probed
+    placed = seen[f"ops_v41_write_{point}"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert record["footprint_bytes"] == 7 * 16 * tokens + sets * placed["ring"]
+
+
+#: The bench tensor each KV view `v41_state_probe.kv_bound` takes binds.
+BOUND = {
+    "pages": "pages.buf.torch.bfloat16",
+    "page_bytes": "pages.buf.torch.bfloat16",
+    "state_bytes": "state.buf.torch.bfloat16",
+    "state_fp32": "state.buf.torch.float32",
+    "cursor": "cursor",
+    "pool": "pool",
+}
+
+
+@pytest.mark.parametrize("view, slots", [(v, s) for s in ("8", "2") for v in BOUND])
+def test_a_v41_kv_view_binds_the_bytes_atom_passes(probed, view, slots):
+    """A KV view of a capture's cache of 4 PAGEs, bound on the bench's of 64
+    PAGEs and 8 state slots: the page and state arenas' flat buffers, the
+    cursor history at the bytes ATOM passes there,
+    the state arena in float32 and the whole pool as before. At a capture of
+    2 slots, the state arena's 2, and the whole pool, which lies an entry
+    and more inside the bench's state arena, at the pool's start."""
+    _, seen = probed
+    assert seen["kv_bound"][slots][view] == [f"cache.{BOUND[view]}", 0]
+
+
+@pytest.mark.parametrize("slots", [8, 4, 2, 16])
+def test_a_v41_window_ring_binds_atom_s_rows_or_refuses_past_the_bench_s_slots(
+    probed, slots
+):
+    """Layer 1's window ring beside its pool, of a capture's 4 PAGEs and `slots`
+    state slots, on the bench's 8: at the rows ATOM's `ring_view` passes, the
+    pool at its start though at 4 and 2 slots it fits the bench's state arena;
+    at 16 the leaf refuses, naming both."""
+    _, seen = probed
+    placed = seen[f"ops_v41_ring_pool_{slots}"]
+    pool, (ring, at) = "attn_metadata_builder.cache.pool", placed["bound"]["ring"]
+    assert placed["bound"]["pool"] == [pool, 0]
+    if slots > 8:  # a KV slot bound to none refuses its leaf
+        assert at is None and ring.endswith("over 16 state slots; the bench holds 8")
+    else:
+        assert placed["refused"] is None and [ring, at] == [pool, 0]

@@ -7,7 +7,7 @@ from queue import Queue
 from types import SimpleNamespace
 
 import pytest
-from conftest import MockConfig, ZmqPolling
+from conftest import MockConfig
 from metrics_helpers import histogram_values_by_name
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.utils import floatToGoString
@@ -137,7 +137,9 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
     poller = SimpleNamespace(
         register=lambda *a: None, poll=lambda: [(sock, core.zmq.POLLIN)]
     )
-    monkeypatch.setattr(core, "zmq", ZmqPolling(core.zmq, poller))
+    # In the module's dict: `zmq_shim` serves `Poller` from its `__getattr__`,
+    # and a setattr's undo would leave pyzmq's class there for later tests.
+    monkeypatch.setitem(vars(core.zmq), "Poller", lambda: poller)
     engine = core.EngineCore.__new__(core.EngineCore)
     engine.label = "metrics-test"
     engine.input_queue = Queue()

@@ -7,7 +7,7 @@ cached in one ``encode_batch`` on the fast backend, past the served tokenizer's
 ``encode``. Here the processor is built on a small trained tokenizer before
 `compass_run.tokenizer` wraps it, as the API server builds its engine first, and
 requests are preprocessed on the clock owner's thread, so each charge advances
-the LP clock. The run file names the machine spec of `test_memory_readings`.
+the LP clock. The run file's host entry states `test_served_tokenizer`'s term.
 """
 
 import json
@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import transformers
-from test_memory_readings import DOCUMENT, TOKENIZER
+from test_served_tokenizer import TERM
 from tokenizers import AddedToken, Tokenizer, models, pre_tokenizers, trainers
 
 from atom.compass import run as compass_run
@@ -32,8 +32,7 @@ WORDS = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
 
 
 def _law(ids):
-    rate = TOKENIZER["encode_tokens_per_s"] * TOKENIZER["derate"]
-    return TOKENIZER["encode_fixed_s"] + ids / rate
+    return TERM["encode"]["fixed_s"] + ids / TERM["encode"]["tokens_per_s"]
 
 
 def _text(rng, n):
@@ -87,11 +86,11 @@ class _GrantAll:
 @pytest.fixture
 def rt(monkeypatch, tmp_path):
     path = tmp_path / "run.json"
-    path.write_text(json.dumps({"bound_s": 600.0, "machine": DOCUMENT}))
+    path.write_text(json.dumps({"bound_s": 600.0, "host": {"tokenizer": TERM}}))
     monkeypatch.setenv(compass_run.ENV, str(path))
     rt = LPRuntime(
         LpId("frontend"),
-        single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002),
+        single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002),
         _GrantAll(),
     )
     clock.install(rt)

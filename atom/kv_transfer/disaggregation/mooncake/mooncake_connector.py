@@ -395,6 +395,9 @@ PD_META_TIMEOUT_MS = 10_000
 # PP-prefill only: consumer tells stage-0 a request's KV is fully received from
 # every stage, so stage-0 may reuse the shared page table (see _record_release).
 MSG_RELEASE = b"release"
+# Consumer scheduler -> producer: a request finished on the consumer before it
+# asked for its write, so none will come (see _abort_unwritten).
+MSG_ABORT = b"abort"
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +463,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # and NOT at alloc: `Scheduler._is_preemptable` negates this same
         # predicate, so an earlier claim would pin every running request.
         self._awaiting_send: set[str] = set()
+        # Consumer: each producer rank's side channel, once an abort was sent
+        # on it (`_abort_unwritten`).
+        self._abort_sockets: dict[str, zmq.Socket] = {}
 
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -672,6 +678,46 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             transfer_id = self.request_id_to_transfer_id.pop(seq.id, None)
             if transfer_id is not None:
                 self.transfer_id_to_request_id.pop(transfer_id, None)
+            params = getattr(seq, "kv_transfer_params", None) or {}
+            if params.get("do_remote_prefill"):
+                # Finished before `update_state_after_alloc` asked for its
+                # write: aborted while it waited.
+                params["do_remote_prefill"] = False
+                self._abort_unwritten(params)
+
+    def _abort_unwritten(self, params: dict[str, Any]) -> None:
+        """Tell each producer rank that holds a request's KV that this consumer
+        will not ask for its write, on the side channel a write request takes.
+
+        The producer's leg of the request is over, so no abort reaches it, and
+        without this it keeps its send claim for ever. Sent here, on the step
+        loop, rather than by a worker: a DP rank whose last request is gone
+        stops building the metadata that would carry it there.
+        """
+        meta = ConnectorMetadata._build_req_meta(None, [], params)
+        notice = msgpack.dumps({"transfer_id": meta.transfer_id})
+        stages = max(1, meta.remote_pp_size)
+        for stage in range(stages):
+            for rank in range(meta.tp_size):
+                port = meta.remote_handshake_port + _port_offset(
+                    meta.remote_dp_rank,
+                    rank,
+                    meta.tp_size,
+                    stage,
+                    stages,
+                    meta.remote_dp_size,
+                )
+                addr = make_zmq_path("tcp", meta.remote_host, port)
+                sock = self._abort_sockets.get(addr)
+                if sock is None:
+                    sock = zmq.Context.instance().socket(zmq.DEALER)
+                    sock.setsockopt(zmq.LINGER, 0)
+                    # Queued, never blocking the step loop, while a producer
+                    # rank is unreachable.
+                    sock.setsockopt(zmq.SNDHWM, 0)
+                    sock.connect(addr)
+                    self._abort_sockets[addr] = sock
+                sock.send_multipart([MSG_ABORT, notice])
 
     def should_defer_free(self, seq: Sequence) -> bool:
         return str(seq.id) in self._awaiting_send
@@ -2030,6 +2076,11 @@ class MooncakeConnector(KVConnectorBase):
                         self._record_release(
                             data["transfer_id"], data.get("consumer_tp_size", 1)
                         )
+
+                    elif msg_type == MSG_ABORT:
+                        # No write request will come, so none is in flight.
+                        data = msgpack.loads(parts[2])
+                        self._abort_transfers([data["transfer_id"]])
 
                     else:
                         logger.error("Unknown message type: %s", msg_type)

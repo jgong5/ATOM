@@ -16,7 +16,9 @@ What the groups below defend:
   essential grant, and never fire once the run has finished.
 * **Generated runs**, with daemon deadlines: no reply grants past an unreleased
   message, and each LP's replies do not depend on the order in which running
-  LPs submit.
+  LPs submit. With a DP group beside them, a member asking each run of its
+  rounds in one call leaves every LP's grants and the timeline as one call a
+  round does.
 """
 
 import ast
@@ -34,6 +36,7 @@ from atom.compass.clock import (
     ClockAuthority,
     LpId,
     LpRegistry,
+    TimelineLog,
     single_engine_table,
 )
 from atom.compass.clock import authority as authority_module
@@ -295,7 +298,7 @@ def test_a_daemon_deadline_is_only_an_ner_and_never_behind_the_clock():
 
 
 def test_the_finish_grants_every_lp_infinity_once_and_then_changes_nothing():
-    table = single_engine_table(admission_path="serving", ipc_s=1.0e-4, stream_s=2.0e-3)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=1.0e-4, stream_s=2.0e-3)
     ca = ClockAuthority(table)
     engine, frontend, traffic = table.registry.ids()
     assert ca.on_request(engine, NER, INF, [], t_daemon=5.0) == []
@@ -602,3 +605,324 @@ def test_the_kept_n_grants_what_n_recomputed_at_every_request_grants():
                 assert row.row == tuple(
                     (j, n[j] + d(j, row.lp)) for j in n if j != row.lp
                 ), seed
+
+
+# --- local grants -------------------------------------------------------------
+
+AB, BA = "a->b:m", "b->a:m"
+
+
+def _ceilinged(**kw):
+    """a <-> b, a sending at 0.5 and b back at 0.25, with a timeline."""
+    table = _table(("a", "b"), [("a", "b", 0.5), ("b", "a", 0.25)])
+    return ClockAuthority(table, timeline=TimelineLog(), **kw)
+
+
+def _by_lp(ca):
+    """The authority's timeline, each LP's records in its own order."""
+    return sorted(ca.timeline.records(), key=lambda r: (str(r.lp), r.time_to))
+
+
+def _first_grant(ca, a_target, log, ahead=False):
+    """a waits in TAR(`a_target`) having sent `log`; b's NER is granted."""
+    assert ca.on_request(A, TAR, a_target, log) == []
+    return ca.on_request(B, NER, INF, [], ahead=ahead)
+
+
+@pytest.mark.parametrize(
+    "a_target, log, ceiling",
+    [
+        (1.0, [(AB, 0, 0.5)], 0.5 + 0.75),  # b's cycle, 0.25 + 0.5
+        (0.6, [(AB, 0, 0.5)], 0.6 + 0.5),  # LBTS(b), a's target plus 0.5
+        (1.0, [(AB, 0, 0.5), (AB, 1, 0.9)], 0.9),  # the arrival still unreleased
+    ],
+)
+def test_a_ceiling_is_the_least_of_lbts_the_cycle_and_the_earliest_arrival(
+    a_target, log, ceiling
+):
+    lp, g, released = _first_grant(_ceilinged(ceilings=True), a_target, log)[0]
+    assert (lp, g, released) == (B, 0.5, {AB: [(0, 0.5)]})
+    assert released.ceiling == pytest.approx(ceiling)
+    assert _first_grant(_ceilinged(), a_target, log)[0][2].ceiling is None
+
+
+def test_steps_below_the_ceiling_replay_as_the_grants_their_calls_would_have_had():
+    """b takes 0.9 and its message ahead, then a TAR to 1.0, on its own; the
+    authority records and counts them as if b had asked each time."""
+    log = [(AB, 0, 0.5), (AB, 1, 0.9)]
+    on = _ceilinged(ceilings=True)
+    ((_, _, released),) = _first_grant(on, 1.0, log, ahead=True)
+    assert released == {AB: [(0, 0.5), (1, 0.9)]} and released.ceiling == 1.25
+    steps = [(NER, INF, 0.9, 0), (TAR, 1.0, 1.0, 0)]
+    replies = on.on_request(B, TAR, 2.0, [(BA, 0, 1.25)], steps=steps)
+    assert _grants(replies) == [("a", 1.0)]
+    off = _ceilinged()
+    _first_grant(off, 1.0, log)
+    assert _grants(off.on_request(B, NER, INF, [])) == [("b", 0.9), ("a", 1.0)]
+    assert _grants(off.on_request(B, TAR, 1.0, [])) == [("b", 1.0)]
+    assert off.on_request(B, TAR, 2.0, [(BA, 0, 1.25)]) == []
+    assert _by_lp(on) == _by_lp(off)
+    assert on.grants == off.grants == {"a": 1, "b": 3}
+    assert on.requests_served == {"a": 1, "b": 2}
+    assert off.requests_served == {"a": 1, "b": 4}
+
+
+def test_a_step_out_of_bounds_or_past_a_registered_message_aborts():
+    def ceilinged():
+        ca = _ceilinged(ceilings=True)
+        _first_grant(ca, 1.0, [(AB, 0, 0.5)])  # b's ceiling: 1.25
+        return ca
+
+    for steps, needle in [
+        ([(TAR, 1.25, 1.25, 0)], "below its ceiling 1.25"),
+        ([(NER, 0.75, 0.8, 0)], "answered 0.8"),
+        ([(TAR, 0.75, 0.75, 1)], "over a log of 0"),
+    ]:
+        with pytest.raises(ClockAbort, match=needle):
+            ceilinged().on_request(B, NER, INF, [], steps=steps)
+    ca = ceilinged()
+    ca._undelivered[AB][1] = 0.95  # a message the ceiling should have kept out
+    with pytest.raises(BackdatedEvent, match=r"past \(0.95"):
+        ca.on_request(B, NER, INF, [], steps=[(TAR, 1.0, 1.0, 0)])
+    ca = _ceilinged(ceilings=True)
+    _first_grant(ca, 1.0, [(AB, 0, 0.5), (AB, 1, 0.9)], ahead=True)
+    with pytest.raises(ClockAbort, match="sent ahead of it unreached"):
+        ca.on_request(B, NER, INF, [])
+
+
+def test_a_ceiling_stops_at_the_bound_so_a_tar_past_it_aborts_as_without_one():
+    """b's ceiling, 1.25 with no bound, stops at the bound 1.0: b asks for
+    1.1, which aborts as it does without ceilings, and a step to 1.1 that b
+    reports having taken on its own aborts too."""
+    for ceilings in (False, True):
+        ca = _ceilinged(ceilings=ceilings, bound_s=1.0)
+        ((_, _, released),) = _first_grant(ca, 1.0, [(AB, 0, 0.5)])
+        assert released.ceiling == (1.0 if ceilings else None)
+        with pytest.raises(ClockAbort, match="a grant to 1.1 for b passes"):
+            ca.on_request(B, TAR, 1.1, [])
+    ca = _ceilinged(ceilings=True, bound_s=1.0)
+    _first_grant(ca, 1.0, [(AB, 0, 0.5)])
+    with pytest.raises(ClockAbort, match=r"TAR\(1.1\) answered 1.1, .* ceiling 1.0"):
+        ca.on_request(B, NER, INF, [], steps=[(TAR, 1.1, 1.1, 0)])
+
+
+def _drive_below_ceilings(seed, pick, ceilings, shuffle=0):
+    """`_drive`'s LPs, each answering its own requests below its last grant's
+    ceiling as `atom.utils.clock.LPRuntime` does, and asking for messages
+    ahead; returns each LP's grants as it sees them, its own included, the
+    authority and how many messages were sent ahead."""
+    table = _generated_table(seed)
+    ca = ClockAuthority(table, timeline=TimelineLog(), ceilings=ceilings)
+    ids = table.registry.ids()
+    own = {
+        i: {"k": 0, "g": 0.0, "received": 0}
+        | {"seq": {c.name: 0 for c in table.channels_from(i)}}
+        for i in ids
+    }
+    lp = {i: {"ceiling": -INF, "ahead": [], "log": [], "steps": []} for i in ids}
+    seen = {i: [] for i in ids}
+
+    def took(i, g, got):
+        seen[i].append((g, sorted(got)))
+        own[i].update(k=own[i]["k"] + 1, g=g, received=own[i]["received"] + len(got))
+
+    running, x, sent_ahead = list(ids), shuffle, 0
+    for _ in range(100000):
+        x = _lcg(x)
+        i = pick(sorted(running), x)
+        running.remove(i)
+        mine = lp[i]
+        while True:
+            kind, t, log, t_daemon = _request(table, i, own[i], seed)
+            mine["log"] += log
+            first = mine["ahead"][0][0] if mine["ahead"] else INF
+            to = t if kind == TAR else min(t, t_daemon, first)
+            essential = kind == TAR or t < INF or mine["ahead"]
+            if not (own[i]["g"] <= to < mine["ceiling"] and essential):
+                break
+            reached = [m for m in mine["ahead"] if m[0] <= to]
+            mine["ahead"] = mine["ahead"][len(reached) :]
+            mine["steps"].append((kind, t, to, len(mine["log"])))
+            took(i, to, [(c, s, a) for a, c, s in reached])
+        steps, log = mine["steps"], mine["log"]
+        mine["steps"], mine["log"] = [], []
+        ahead = ceilings and kind == NER
+        replies = ca.on_request(i, kind, t, log, t_daemon, None, steps, ahead)
+        for j, g, released in replies:
+            theirs = lp[j]
+            pairs = [(c, s, a) for c, r in released.items() for s, a in r]
+            reached = [(c, s, a) for a, c, s in theirs["ahead"]]
+            got = [m for m in pairs if m[2] <= g] + reached
+            theirs["ahead"] = sorted((a, c, s) for c, s, a in pairs if a > g)
+            sent_ahead += len(theirs["ahead"])
+            ceiling = getattr(released, "ceiling", None)
+            theirs["ceiling"] = -INF if ceiling is None else ceiling
+            if g == INF:
+                seen[j].append((g, sorted(got)))
+                continue
+            took(j, g, got)
+            running.append(j)
+        if any(r and r[-1][0] == INF for r in seen.values()):
+            return seen, ca, sent_ahead
+    raise AssertionError(f"seed {seed} did not finish")
+
+
+def test_local_grants_leave_every_lps_grants_and_the_timeline_as_they_are():
+    asked = answered = ahead = 0
+    for seed in SEEDS:
+        for pick in PICKS.values():
+            off, off_ca, _ = _drive_below_ceilings(seed, pick, False)
+            on, on_ca, sent = _drive_below_ceilings(seed, pick, True)
+            assert on == off, seed
+            assert on_ca.grants == off_ca.grants, seed
+            assert _by_lp(on_ca) == _by_lp(off_ca), seed
+            asked += sum(off_ca.requests_served.values())
+            answered += sum(on_ca.requests_served.values())
+            ahead += sent
+    # The LPs answered some of their own requests, some below a message ahead.
+    assert answered < asked and ahead > 0
+
+
+# --- a DP group's rounds, one call a round or each run in one call ------------
+
+GROUP = LpId("e")
+GROUP_STEPS = 4
+
+
+def _group_table(seed):
+    """`_generated_table`'s LPs, two or three, beside `e`, a DP group of two or
+    three members, each owning a channel each way to every other LP."""
+    lps = NAMES[: 2 + seed % 2]
+    members = ("m0", "m1", "m2")[: 2 + seed // 2 % 2]
+    rows, x = [], seed + 1
+    for src in lps:
+        for dst in lps:
+            x = _lcg(x)
+            if src != dst and x % 3:
+                rows.append((src, dst, "m", (0.0, 0.5, 1.0)[(x >> 8) % 3]))
+    for m in members:
+        for other in lps:
+            for src, dst in ((other, "e"), ("e", other)):
+                x = _lcg(x)
+                rows.append((src, dst, m, (0.0, 0.5, 1.0)[(x >> 8) % 3]))
+    registry = LpRegistry()
+    for lp in (*lps, "e"):
+        registry.register(LpId(lp))
+    table = ChannelTable(registry)
+    for src, dst, tag, lookahead_s in rows:
+        table.declare(
+            f"{src}->{dst}:{tag}", LpId(src), LpId(dst), lookahead_s, "inline"
+        )
+    owned = {m: [f"{s}->{d}:{m}" for s, d, tag, _ in rows if tag == m] for m in members}
+    return table, owned
+
+
+def _group_step(seed, k, base, members):
+    """Step `k` of the group from its clock `base`: each member's return and
+    pull, which every member knows, as from the group's gather."""
+    x = _lcg(seed * 7919 + k * 104729 + 17)
+    ends = {}
+    for m in members:
+        x = _lcg(x)
+        end = base + (0.0, 0.5, 1.0)[(x >> 8) % 3]
+        ends[m] = (end, end + (0.0, 0.25, 0.5)[(x >> 12) % 3])
+    return ends
+
+
+def _drive_group(seed, pick, batched, shuffle=0):
+    """`_drive`'s LPs beside `e`, whose members take `GROUP_STEPS` steps, then
+    idle. A member asks a step's rounds up to its own pull, sends, and asks the
+    rest: each run of rounds in one call when `batched`, else one round a call.
+    Returns what each LP and member saw, a member's run of rounds as its last
+    grant with every message the run released, and the authority."""
+    table, owned = _group_table(seed)
+    ca = ClockAuthority(table, timeline=TimelineLog(), members={GROUP: owned})
+    own = {
+        i.name: {"k": 0, "g": 0.0, "received": 0}
+        | {"seq": {c.name: 0 for c in table.channels_from(i)}}
+        for i in table.registry.ids()
+        if i != GROUP
+    }
+    group = {m: {"k": 0, "g": 0.0, "runs": [], "asked": [], "got": []} for m in owned}
+    logs = {m: [] for m in owned}
+    seq = {c: 0 for names in owned.values() for c in names}
+    seen = {name: [] for name in [*own, *owned]}
+    running, x = sorted(seen), shuffle
+    for _ in range(100000):
+        x = _lcg(x)
+        name = pick(sorted(running), x)
+        running.remove(name)
+        if name in own:
+            lp, member, rounds = LpId(name), None, []
+            kind, t, log, t_daemon = _request(table, lp, own[name], seed)
+        else:
+            lp, member, me = GROUP, name, group[name]
+            if not me["asked"] and not me["runs"] and me["k"] < GROUP_STEPS:
+                ends = _group_step(seed, me["k"], me["g"], owned)
+                every = sorted({t for end in ends.values() for t in end})
+                pull = ends[name][1]
+                mine = ([t for t in every if t <= pull], [t for t in every if t > pull])
+                me["runs"], me["k"] = [run for run in mine if run], me["k"] + 1
+            if not me["asked"] and me["runs"]:
+                me["asked"] = me["runs"].pop(0)
+            asked = me["asked"] if batched else me["asked"][:1]
+            kind, t, t_daemon = (TAR, asked[0], INF) if asked else (NER, INF, INF)
+            rounds, log, logs[name] = asked[1:], logs[name], []
+        for to, g, released in ca.on_request(
+            lp, kind, t, log, t_daemon, member, (), False, rounds
+        ):
+            got = [(c, s, a) for c, r in released.items() for s, a in r]
+            key = to[1] if isinstance(to, tuple) else to.name
+            if g == INF:
+                seen[key].append((g, sorted(got)))
+                continue
+            running.append(key)
+            if key in own:
+                seen[key].append((g, sorted(got)))
+                mine = own[key]
+                mine.update(k=mine["k"] + 1, g=g, received=mine["received"] + len(got))
+                continue
+            me, was = group[key], group[key]["asked"]
+            me["g"], me["got"] = g, me["got"] + got
+            me["asked"] = [r for r in was if r > g]
+            if me["asked"]:
+                continue  # one round a call: the run's next round
+            seen[key].append((g, sorted(me["got"])))
+            me["got"] = []
+            y = _lcg(seed * 31 + len(seen[key]) * 7 + ord(key[-1]))
+            for c in owned[key] if was else ():  # a run ended: send from its clock
+                y = _lcg(y)
+                if table.channel(c).source == GROUP and y % 2:
+                    logs[key].append((c, seq[c], g + table.lookahead(c)))
+                    seq[c] += 1
+        if any(r and r[-1][0] == INF for r in seen.values()):
+            return seen, ca
+    raise AssertionError(f"seed {seed} did not finish")
+
+
+def _timeline(ca):
+    """The authority's timeline, each LP's records in its own order, with each
+    record's sends sorted: the members' calls carry them in submit order."""
+    return [
+        (r.lp, r.time_from, r.time_to, r.kind, r.recovered, r.released, sorted(r.sent))
+        for r in _by_lp(ca)
+    ]
+
+
+def test_a_members_rounds_in_one_call_leave_every_grant_as_one_call_a_round():
+    calls = {False: 0, True: 0}
+    for seed in SEEDS:
+        base, base_ca = _drive_group(seed, PICKS["name order"], False)
+        for batched in (False, True):
+            runs = [_drive_group(seed, pick, batched) for pick in PICKS.values()]
+            runs += [
+                _drive_group(seed, PICKS["shuffled"], batched, shuffle=s)
+                for s in range(1, 5)
+            ]
+            for seen, ca in runs:
+                assert seen == base, (seed, batched)
+                assert ca.grants == base_ca.grants, (seed, batched)
+                assert _timeline(ca) == _timeline(base_ca), (seed, batched)
+            calls[batched] += runs[0][1].requests_served["e"]
+    # Fewer calls for the same grants.
+    assert calls[True] < calls[False]

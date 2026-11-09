@@ -12,6 +12,9 @@ A record refuses, before any table is written, when the run.json beside the
 `steps` directory its path resolves into names JIT compiles its server ran
 (`step_labels.refusal`).
 A step whose device label is cut is counted under its reason and not fitted.
+Prefill labels come from trace runs alone (`step_labels`); given none, the
+prefill vector is left out and named under `unfitted`. A trace run gives no
+decode or host label, so its record fits only prefill.
 `fit` and `fit_host` take the labelled samples, grouped into runs by their
 provenance's `run`, and each returns its laws and a report. `fit`'s report
 holds the runs it was fitted on, each vector's fit figures and hull, and, once
@@ -31,18 +34,18 @@ rank that ran the step as a dummy forward adds no row. A step that some rank
 lacks otherwise or cut, or whose ranks' rows fall to different vectors, is
 counted under `ranks` and not fitted. The law reports each step's rank label
 spread, `max / min - 1`, as its p50 and p90 under `spread`. The group's step
-is the max over its ranks, so each vector is fitted by alternating max-affine
-regression: from the fit on every rank's row, take each step's row the law
-prices highest and refit on those rows, until no step changes rank. A decode
-rung that adopts a column (below) alternates again under the vector with it,
-from its solve on those rows, each step's row at the rank that vector prices
-it as (`priced_rank`). Each
+is the max over its ranks, so each vector is fitted by max-affine regression
+(`_fit_form`): from the fit on every rank's row, each pass refits on the row
+each step's price picks, a step line-searched until it lowers the squared
+relative error, until no step changes rank or the step's ranks tie; MAD drops
+rerun it. The vector's solve, warm steps and hull read each step's row at the
+rank it prices the step as (`priced_rank`); a decode rung that adopts a
+column (below) is fitted again under it. Each
 vector reports, under `fit.all_rows`, the centre and scaled MAD of the fit on
 every rank's row, each step priced as its max over ranks, and under
-`fit.passes` the refits the alternation took (under a column, its solve on
-the base form's rows is the first), null when the picks still moved after
-`MAD_PASSES` refits. A held-out step is
-priced and banded as its costliest rank.
+`fit.passes` the passes, how they stopped, `settled` or `tie`, and the
+squared error `F`; more than `FIT_PASSES` passes refuse the fit. A held-out
+step is priced and banded as its costliest rank.
 
 Records with a host key (`dp0.key.json`, from the real runner) also give the
 host laws as a run file's `host` entry: `key`, and `laws[kind][segment]`,
@@ -64,6 +67,11 @@ beyond it, fitted on their `E` with their kind's law as a fixed part. Records
 on too few such forwards give `admit` null, so a run refuses a forward that
 admits a request rather than charge it nothing, and the report says why under
 `unfitted`.
+
+The same solver fits the host entry's ``tokenizer`` term on a recorded
+server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
+HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
+requests, ``fixed_s`` from a burst, and ``bytes`` over every request's body.
 
 Each equation is divided by its own label and the coefficients are bound to be
 non-negative. Steps whose relative residual is more than `MAD_K` scaled MADs
@@ -89,8 +97,7 @@ under the law's `draft`; it holds no `held_out`. A step with a propose label
 (`step_labels`) is fitted there on its draft label less that label, the
 draft-KV pass a middle chunk runs too, and left out when nothing remains; the
 propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`,
-or, split at a lag and maybe bounded at a token count, its `propose` and
-`near_propose` (`_proposes`).
+whatever lag the device ran at.
 A decode's draft-KV label fits the draft law's `draft_kv` vector alike. An
 output prefill's fits the draft law's prefill vector in place of its draft
 label, which, all after `forward_done_event`, fits the `propose` vector, and
@@ -167,6 +174,10 @@ MAD_K = 3.5
 #: A relative residual this small is never an outlier, however tight the rest.
 MAD_FLOOR = 0.01
 MAD_PASSES = 20
+#: Passes after which a max-affine fit whose error still falls refuses. Near a
+#: tie between ranks each line-searched pass gains little, so a fit that ends
+#: at a tie takes far more passes than one that settles.
+FIT_PASSES = 10_000
 #: A step that ran this many times its price is a one-off first touch, not scatter.
 WARM_FACTOR = 5.0
 TOKEN_BANDS = (512, 2048, 8192)
@@ -177,15 +188,12 @@ ROWMOD_CELL_STEPS = 100
 ROWMOD_GAIN = 0.1
 #: Seeded shuffles of each step's rows whose mean MAD the `rowmod` column must not beat.
 ROWMOD_SHUFFLES = 8
-#: The fraction of the unsplit `propose` vector's mean log error a split must cut.
-PROPOSE_SPLIT_GAIN = 0.1
-#: Timed propose labels a split needs: on fewer, scatter that follows no lag
-#: clears the gain.
-PROPOSE_SPLIT_STEPS = 200
-#: Steps each side of a `propose` split holds at least, for its two coefficients.
-PROPOSE_SIDE_STEPS = 10
 HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
+#: What a lone HTTP request's intake costs: per request, and per body byte.
+INTAKE_FEATURES = ("idle", "bytes")
+#: What a lone tokenizer call costs: per call, and per token.
+TOKENIZER_FEATURES = ("fixed", "tokens")
 #: What a forward that admits requests spends once, per prompt token past the
 #: prefix-cache hit and per token within it (`step_labels.admit_x`).
 ADMIT_FEATURES = ("admits", "uncached", "cached")
@@ -353,6 +361,186 @@ def fit_host(samples) -> tuple[dict, dict]:
     return host, report
 
 
+def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
+    """The ``tokenizer`` term over the lone calls (`_lone_calls`) each
+    tokenizer record in `paths` holds, beside the intake stamps in `intakes`,
+    and its report: the records' backend and fingerprint, and per kind of
+    call, ``fixed_s + tokens / tokens_per_s`` by the host-law solver on the
+    calls' wall seconds.
+    One-item ``encode_batch`` calls are ``encode``'s and several-item ones
+    their own kind. A ``decode`` with no positive slope is ``fixed_s`` alone
+    over ``tokens``, the ``[lo, hi]`` token counts its calls span. A kind the
+    calls cannot give is left out and its reason listed under the report's
+    ``unfitted``; the report gives each record's p10, p50 and p90 relative
+    residual per kind. Raises on records of two tokenizers."""
+    from scipy.spatial import QhullError
+
+    heads, rows = {}, []
+    for i, (path, intake) in enumerate(zip(paths, intakes)):
+        head, *lines = Path(path).read_text().splitlines()
+        heads[json.dumps(json.loads(head), sort_keys=True)] = None
+        for c in _lone_calls([json.loads(line) for line in lines], intake):
+            kind = c["call"] if c["items"] > 1 or c["call"] == "decode" else "encode"
+            s = (c["t_end_ns"] - c["t_start_ns"]) * 1e-9
+            rows.append((i, kind, c["tokens"], s))
+    if len(heads) != 1:
+        raise ValueError(f"the records name {len(heads)} tokenizers: {sorted(heads)}")
+    term, report = json.loads(next(iter(heads))), {"unfitted": {}}
+    for kind in ("encode", "encode_batch", "decode"):
+        got = np.array([r[2:] for r in rows if r[1] == kind and r[3] > 0])
+        record = np.array([r[0] for r in rows if r[1] == kind and r[3] > 0])
+        try:
+            if not len(got):
+                raise ValueError(f"the records hold no lone {kind} call")
+            x = np.column_stack([np.ones(len(got)), got[:, 0]])
+            coef, fitted = _host_law(x, got[:, 1], TOKENIZER_FEATURES)
+        except (ValueError, QhullError) as e:
+            report["unfitted"][kind] = str(e)
+            continue
+        if coef[1] > 0:
+            term[kind] = {"fixed_s": coef[0], "tokens_per_s": 1 / coef[1]}
+        elif kind == "decode":
+            term[kind] = {"fixed_s": coef[0], "tokens": _span(fitted, "tokens")}
+        else:
+            report["unfitted"][kind] = f"{kind}'s calls take no time per token"
+            continue
+        error = x @ coef / got[:, 1] - 1
+        fitted["records"] = {
+            str(p): np.percentile(error[record == i], [10, 50, 90]).tolist()
+            for i, p in enumerate(paths)
+            if (record == i).any()
+        }
+        report[kind] = fitted
+    return term, report
+
+
+def _span(fitted: dict, name: str) -> list:
+    """The ``[lo, hi]`` of the one feature `name` of `_host_law`'s report."""
+    if name in fitted["hull"]["equal"]:
+        return [fitted["hull"]["equal"][name]] * 2
+    (_, lo), (_, hi) = fitted["hull"]["facets"]
+    return [lo, -hi]
+
+
+def _stamps(path) -> list[tuple]:
+    """The HTTP intake stamps `path` holds (`atom.compass.run.INTAKE_RECORD`),
+    each ``(start ns, end ns, kind, size, start cpu ns, end cpu ns)``, in order
+    of start."""
+    rows = [line.split() for line in Path(path).read_text().splitlines()]
+    return sorted(
+        (int(r[3]), int(r[0]), r[2], int(r[4]), int(r[6]), int(r[5])) for r in rows
+    )
+
+
+def _requests(ev) -> tuple[list, np.ndarray]:
+    """Each request's app call among the stamps `ev`, in order, and every
+    engine send's end, sorted."""
+    apps = [e[0] for e in ev if e[2] == "app"]
+    # A request's app call is the last before its body's first read; any
+    # other, such as a health probe's, has no body.
+    calls = sorted(
+        {apps[np.searchsorted(apps, e[0]) - 1] for e in ev if e[2] == "body"}
+    )
+    return calls, np.array(sorted(e[1] for e in ev if e[2] == "send"))
+
+
+def _lone_calls(calls: list[dict], intake) -> list[dict]:
+    """The tokenizer calls among `calls` that ran lone: no other call, and no
+    request's intake (`_requests` over the stamps in `intake`) in flight from
+    the call's start to its end but, for an encode, its own."""
+    apps, sends = _requests(_stamps(intake))
+    calls = sorted(calls, key=lambda c: c["t_start_ns"])
+    start = np.array([c["t_start_ns"] for c in calls])
+    end = np.array([c["t_end_ns"] for c in calls])
+    before = np.maximum.accumulate(np.r_[-math.inf, end[:-1]])
+    after = np.r_[start[1:], math.inf]
+    arrived = np.searchsorted(apps, end, "right") - np.searchsorted(apps, start)
+    flight = np.searchsorted(apps, start) - np.searchsorted(sends, start)
+    own = np.array([c["call"] != "decode" for c in calls])
+    lone = (before < start) & (after > end) & (arrived == 0) & (flight <= own)
+    return [c for c, k in zip(calls, lone) if k]
+
+
+def _intakes(path) -> tuple[list, list, list]:
+    """The HTTP intake stamps `path` holds as each lone request's ``(body
+    bytes, CPU seconds)``, each burst's ``(body bytes, template start CPU
+    ns)`` per request, and every request's body bytes.
+
+    A request is its app call and the body, template, pool job and engine send
+    that follow it. A lone one found every earlier request sent and its own
+    sent before the next app call, with nothing else stamped between: its
+    seconds are the CPU time the loop's thread spent from the app call to the
+    send's end, less what it spent from its pool job's submit to its resume
+    (``wait``), the job's and other requests' work. A burst is a run of requests each of whose app call came
+    before the template of the one ahead of it began, the loop taking them in
+    one after another."""
+    ev = _stamps(path)
+    at = [e[0] for e in ev]
+    cpu = {e[0]: e[4] for e in ev if e[2] == "app"}
+    calls, sends = _requests(ev)
+    lone = []
+    for i, (call, after) in enumerate(zip(calls, calls[1:] + [math.inf])):
+        span = ev[np.searchsorted(at, call, "right") : np.searchsorted(at, after)]
+        between = [e for e in span if e[2] not in ("app", "recv", "wait")]
+        waits = sum(e[5] - e[4] for e in span if e[2] == "wait")
+        if np.searchsorted(sends, call) != i or [e[2] for e in between] != [
+            "body",
+            "tmpl",
+            "prep",
+            "send",
+        ]:
+            continue
+        body, *_, send = between
+        lone.append((body[3], (send[5] - cpu[call] - waits) * 1e-9))
+    # The loop renders each request's template as soon as its body is read.
+    tmpl = [e for e in ev if e[2] == "tmpl"]
+    sizes = [e[3] for e in sorted(ev, key=lambda e: e[1]) if e[2] == "body"]
+    # A template whose start finds a later request arrived and not yet rendered.
+    queued = [np.searchsorted(calls, t[0]) > k + 1 for k, t in enumerate(tmpl)]
+    bursts, run = [], []
+    for k, t in enumerate(tmpl):
+        run.append((sizes[k], t[0], t[4]))
+        if not queued[k]:
+            if len(run) > 1:
+                bursts.append(run)
+            run = []
+    return lone, bursts, sizes
+
+
+def fit_intake(paths) -> tuple[dict, dict]:
+    """The ``http_intake`` term over the intake stamps each record in `paths`
+    holds (`_intakes`), and its report: ``idle_s`` and ``per_byte_s`` by the
+    host-law solver on the lone requests' CPU seconds over their body bytes;
+    ``bytes`` spans every request's body; ``fixed_s`` the loop's CPU time per
+    request between template starts in the longest burst, less ``per_byte_s``
+    times its mean body, each gap the next request's. Raises on too few lone
+    requests or no burst."""
+    lone, bursts, bodies = [], [], []
+    for path in paths:
+        got = _intakes(path)
+        lone += got[0]
+        bursts += got[1]
+        bodies += got[2]
+    nbytes, seconds = np.array(lone, dtype=np.float64).reshape(-1, 2).T
+    x = np.column_stack([np.ones(len(nbytes)), nbytes])
+    (idle, per_byte), report = _host_law(x, seconds, INTAKE_FEATURES)
+    if not bursts:
+        raise ValueError(f"no burst among {len(lone)} lone requests")
+    sizes, starts, cpu = np.array(max(bursts, key=len), dtype=np.float64).T
+    fixed = np.diff(cpu).mean() * 1e-9 - per_byte * sizes[1:].mean()
+    report["burst"] = {
+        "requests": len(sizes),
+        "span_s": (starts[-1] - starts[0]) * 1e-9,
+    }
+    term = {
+        "fixed_s": fixed,
+        "per_byte_s": per_byte,
+        "idle_s": idle,
+        "bytes": [min(bodies), max(bodies)],
+    }
+    return term, report
+
+
 def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
     """The host law on `names` over the forwards `x` labelled `y`, the part
     `offset` of each label fixed, and its report. Raises on too few forwards or
@@ -361,9 +549,10 @@ def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
     x = np.array(x, dtype=np.float64).reshape(-1, len(names))
     if len(x) <= len(names):
         raise ValueError(f"{len(x)} forwards for {len(names)} coefficients")
-    width = 3 if np.linalg.matrix_rank(x[:, 1:]) == 2 else 2
-    if width == 2:
-        x[:, 2] = 0.0
+    width = len(names)
+    if np.linalg.matrix_rank(x[:, 1:]) < width - 1:
+        width -= 1
+        x[:, width] = 0.0
     s = _solve(x, np.array(y), list(names), np.array(offset), names[0])
     hull = _hull(x[s["keep"]][:, 1:width], names[1:width])
     return s["coef"].tolist(), {
@@ -409,42 +598,132 @@ def _solve(
     x: np.ndarray, y: np.ndarray, names: list[str], offset=0.0, kept: str = "step"
 ) -> dict:
     """Non-negative least squares on relative error, MAD-dropped until settled;
-    `offset` is a fixed part of each label's price, outside the coefficients."""
+    `offset` is a fixed part of each label's price, outside the coefficients:
+    `_fit_form` on one row per step."""
+    return _fit_form(
+        x[:, None], np.ones((len(y), 1), dtype=bool), y, names, offset, kept
+    )
+
+
+def _fit_form(
+    x: np.ndarray,
+    real: np.ndarray,
+    y: np.ndarray,
+    names: list[str],
+    offset=0.0,
+    kept: str = "step",
+) -> dict:
+    """One form fitted by max-affine regression: step `i`'s label `y[i]` is the
+    max over its ranks' rows `x[i, r]`, those `real[i, r]` holds, of their
+    price, plus `offset`, a fixed part of it outside the coefficients.
+
+    `F(c) = sum_i ((max_r x_ir.c + offset_i) / y_i - 1)^2` over the kept steps.
+    The start is the non-negative least-squares solve of every rank's row, each
+    equation divided by its label. Each pass solves on the row each step's
+    current price picks, a Gauss-Newton step on `F`, and halves it until `F`
+    falls. The passes end settled, the solve picking the rows it was solved
+    on, or at a tie between ranks, when no step that moves some price by more
+    than the square root of the float epsilon makes `F` fall; more than
+    `FIT_PASSES` passes in all raise. Steps whose residual is more than
+    `MAD_K` scaled MADs from the median are then dropped and the passes rerun
+    from there, until the kept set settles or for `MAD_PASSES` rounds.
+
+    Returns the solve's figures: `pick`, each step's rank, at a tie the rank
+    of larger features (`priced_rank`, prices folded as a run folds them);
+    `passes`, the passes over every round, the last stop and `F`; and
+    `all_rows`, the centre and scaled MAD of the start's residuals.
+    """
     from scipy.optimize import nnls
 
-    a, b = x / y[:, None], 1.0 - offset / y
+    n, width, k = x.shape
+    a, b = x / y[:, None, None], 1.0 - offset / y
+    flat = a.reshape(-1, k)
     # An intercept, a column whose name starts with `kept`, is kept whatever
     # its variance; any other constant column is not.
     vary = [
-        j for j in range(x.shape[1]) if names[j].startswith(kept) or np.ptp(x[:, j]) > 0
+        j for j in range(k) if names[j].startswith(kept) or np.ptp(x[real][:, j]) > 0
     ]
-    keep = np.ones(len(y), dtype=bool)
-    # Refitted until the kept set stops moving, so a step an outlier's pull
-    # dropped on the first pass comes back once the outlier is gone.
-    for passes in range(1, MAD_PASSES + 1):
-        cols = a[keep][:, vary]
-        norms = np.linalg.norm(cols, axis=0)
+    tol = np.finfo(np.float64).eps ** 0.5
+    steps = np.arange(n)
+
+    def solve(rows, labels):
+        norms = np.linalg.norm(rows[:, vary], axis=0)
         # A column with no non-zero kept row (a rung this pass dropped every
         # step of) sits out of this pass's solve, at coefficient 0.
         solved = norms > 0
-        cols, norms = cols[:, solved], norms[solved]
-        coef = np.zeros(x.shape[1])
-        coef[np.array(vary)[solved]] = nnls(cols / norms, b[keep])[0] / norms
-        residual = a @ coef - b
+        cols = rows[:, vary][:, solved] / norms[solved]
+        coef = np.zeros(k)
+        coef[np.array(vary)[solved]] = nnls(cols, labels)[0] / norms[solved]
+        return coef, cols
+
+    def price(c):
+        return np.where(real, (flat @ c).reshape(n, width), -np.inf)
+
+    def cost(c):
+        return float(((price(c).max(axis=1) - b)[keep] ** 2).sum())
+
+    keep = np.ones(n, dtype=bool)
+    c, cols = solve(a[real], np.broadcast_to(b[:, None], real.shape)[real])
+    start = price(c).max(axis=1) - b
+    on, passes = real, 0
+    # Refitted until the kept set stops moving, so a step an outlier's pull
+    # dropped on the first pass comes back once the outlier is gone.
+    for rounds in range(1, MAD_PASSES + 1):
+        while True:
+            pick = price(c).argmax(axis=1)
+            picked = np.zeros_like(real)
+            picked[steps, pick] = True
+            if on is not None and (on[keep] == picked[keep]).all():
+                stop = "settled"
+                break
+            if passes == FIT_PASSES:
+                raise ValueError(
+                    f"the alternation on {names} still moved after {FIT_PASSES} passes"
+                )
+            passes += 1
+            full, solved = solve(a[steps, pick][keep], b[keep])
+            if (price(full).argmax(axis=1)[keep] == pick[keep]).all():
+                c, cols, on = full, solved, picked
+            else:
+                d, f, t = full - c, cost(c), 1.0
+                moves = np.abs(price(full - c)[real & keep[:, None]]).max()
+                while cost(c + t * d) >= f and t * moves > tol:
+                    t /= 2
+                if t * moves <= tol:
+                    stop = "tie"
+                    break
+                c, cols, on = c + t * d, solved, picked if t == 1 else None
+        residual = price(c).max(axis=1) - b
         centre = np.median(residual)
         mad = 1.4826 * np.median(np.abs(residual - centre))
         moved = np.abs(residual - centre) <= max(MAD_K * mad, MAD_FLOOR)
-        if (moved == keep).all() or passes == MAD_PASSES:
+        if (moved == keep).all() or rounds == MAD_PASSES:
             break
-        keep = moved
+        keep, on = moved, None
+    if width > 1:
+        pick = [
+            priced_rank(
+                {
+                    r: (fold_seconds(v * w for v, w in zip(x[i, r], c)), tuple(x[i, r]))
+                    for r in np.flatnonzero(real[i])
+                }
+            )
+            for i in steps
+        ]
     return {
-        "coef": coef,
+        "coef": c,
         "keep": keep,
         "residual": residual,
         "centre": float(centre),
         "mad": float(mad),
-        "condition": float(np.linalg.cond(cols / norms)),
-        "zero": [names[j] for j in range(x.shape[1]) if j not in vary],
+        "condition": float(np.linalg.cond(cols)),
+        "zero": [names[j] for j in range(k) if j not in vary],
+        "pick": np.asarray(pick),
+        "passes": {"count": passes, "stop": stop, "F": cost(c)},
+        "all_rows": {
+            "centre": float(np.median(start)),
+            "mad": float(1.4826 * np.median(np.abs(start - np.median(start)))),
+        },
     }
 
 
@@ -566,8 +845,11 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
 
 
 def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
-    """`StepLinearLaw`'s hull over the non-intercept features of the fitted steps."""
-    from scipy.spatial import ConvexHull
+    """`StepLinearLaw`'s hull over the non-intercept features of the fitted steps.
+    qhull's precision checks depend on the order the points come in: where it
+    refuses them, it hulls their distinct points in sorted order, the same hull.
+    A set that spans none still raises."""
+    from scipy.spatial import ConvexHull, QhullError
 
     equal = {
         names[j]: int(points[0, j])
@@ -581,7 +863,11 @@ def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
         facets = [[-1.0, float(lo[0])], [1.0, -float(hi[0])]]
     elif vary:
         # Hulled in the unit box, where qhull's tolerances suit every feature.
-        eq = ConvexHull((x - lo) / (hi - lo)).equations
+        unit = (x - lo) / (hi - lo)
+        try:
+            eq = ConvexHull(unit).equations
+        except QhullError:
+            eq = ConvexHull(np.unique(unit, axis=0)).equations
         normals = eq[:, :-1] / (hi - lo)
         facets = np.column_stack([normals, eq[:, -1] - normals @ lo]).tolist()
     else:
@@ -625,39 +911,19 @@ def _groups(
     return groups, cut, spread
 
 
-def _slowest(groups, prefill: list[str]) -> tuple[list[tuple], dict]:
-    """Each group's row of highest price, by alternating max-affine regression per
-    vector, and per vector the error of the fit on every rank's row."""
-    rows, report = [g[0] for g in groups], {}
-    for key in sorted({g[0][1] for g in groups if len(g) > 1}):
-        names = prefill if key == "prefill" else list(DECODE)
-        at = [j for j, g in enumerate(groups) if g[0][1] == key]
-        width = max(len(groups[j]) for j in at)
-        # A dummy rank's missing row is a zero row, which prices 0, so is never a
-        # step's highest, and is left out of the fit on every rank's row.
-        pad = [(0,) * len(names)]
-        x = [[r[2] for r in groups[j]] + pad * (width - len(groups[j])) for j in at]
-        x = np.array(x, dtype=np.float64)
-        real = x[:, :, 0] > 0  # a row's first feature, the step, is 1
-        y = np.array([groups[j][0][3] for j in at])
-        coef = _solve(x[real], np.repeat(y, real.sum(axis=1)), names)["coef"]
-        error = (x @ coef).max(axis=1) / y - 1.0
-        centre = float(np.median(error))
-        mad = float(1.4826 * np.median(np.abs(error - centre)))
-        pick = None
-        for passes in range(MAD_PASSES + 1):
-            now = np.argmax(x @ coef, axis=1)
-            if pick is not None and (now == pick).all():
-                break
-            if passes == MAD_PASSES:
-                passes = None
-                break
-            pick = now
-            coef = _solve(x[np.arange(len(x)), pick], y, names)["coef"]
-        report[key] = {"all_rows": {"centre": centre, "mad": mad}, "passes": passes}
-        for j, p in zip(at, pick):
-            rows[j] = groups[j][p]
-    return rows, report
+def _fit_steps(steps: list[list[tuple]], names: list[str], design) -> dict:
+    """`_fit_form` of `steps`, each its ranks' `fit` rows, on `design(row)`, the
+    form's features of a row; with `rows`, each step's row at the rank picked.
+    A rank that ran the step as a dummy forward holds no row."""
+    width = max(map(len, steps))
+    x = np.zeros((len(steps), width, len(names)))
+    real = np.zeros((len(steps), width), dtype=bool)
+    for i, step in enumerate(steps):
+        for r, row in enumerate(step):
+            x[i, r], real[i, r] = design(row), True
+    solved = _fit_form(x, real, np.array([s[0][3] for s in steps]), names)
+    solved["rows"] = [s[p] for s, p in zip(steps, solved["pick"])]
+    return solved
 
 
 def _serial(samples, options) -> bool:
@@ -725,8 +991,6 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     prefill += ["cached_seqs"] * (form == "cached_seqs") + ["moe_rows"] * (dp > 1)
     prefill += ["serial_moe_rows"] * serial
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
-    rows, alternation = _slowest(groups, prefill)
-    ranks = {(g[0][0], g[0][4]): g for g in groups}  # a step's rows by run and step
     law = {
         "provenance": f"step_linear_fit {form} on {len(runs) * dp} real records "
         f"({', '.join(runs)})",
@@ -742,7 +1006,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     if spread:
         law["spread"] = np.percentile(spread, (50, 90)).tolist()
     keys = sorted(
-        {r[1] for r in rows},
+        {g[0][1] for g in groups},
         key=lambda k: (k != "prefill", k != EAGER, k.isdigit() and int(k)),
     )
     rungs = [k for k in keys if k != "prefill"]
@@ -755,34 +1019,49 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     else:
         solves += [(k, list(DECODE)) for k in rungs]
     for key, names in solves:
-        members = [
-            r for r in rows if r[1] == key or (key is None and r[1] != "prefill")
+        steps = [
+            g
+            for g in groups
+            if g[0][1] == key or (key is None and g[0][1] != "prefill")
         ]
-        if not members:
-            law["unfitted"][key] = f"0 steps for {len(names)} coefficients"
+        if not steps:
+            law["unfitted"][key] = (
+                "no prefill step carries a trace run's busy time"
+                if key == "prefill"
+                else f"0 steps for {len(names)} coefficients"
+            )
             continue
-        counts = np.array([r[2] for r in members], dtype=np.float64)
-        x = counts
         if key is None:
-            onehot = [[float(r[1] == k) for k in rungs] for r in members]
-            x = np.column_stack([counts[:, 1:], onehot])
-        solved = _solve(x, np.array([r[3] for r in members]), names)
+            solved = _fit_steps(
+                steps, names, lambda r: (*r[2][1:], *(r[1] == k for k in rungs))
+            )
+        else:
+            solved = _fit_steps(steps, names, lambda r: r[2])
         rowmod_k = figures = None
         if key and key.isdigit():
+            # The column and `rowmod` are chosen on the base form's rows.
+            members, base = solved["rows"], solved
+            counts = np.array([r[2] for r in members], dtype=np.float64)
             if routing:
                 chosen, figures = _moe_column(members, counts, names, routing)
                 if chosen:
-                    feature, column, solved = chosen
+                    feature, column, base = chosen
                     counts = np.column_stack([counts, column])
                     names = [*names, feature]
-            chosen = _rowmod(members, counts, int(key), solved, seed, names)
+            chosen = _rowmod(members, counts, int(key), base, seed, names)
             if chosen:
-                rowmod_k, solved, evidence = chosen
+                rowmod_k, _, evidence = chosen
                 names = [*names, "rowmod"]
-            if key in alternation and len(names) > len(DECODE):
-                solved, alternation[key]["passes"] = _settle(
-                    members, ranks, names, rowmod_k, routing, solved
+            if len(names) > len(DECODE):
+                adopted = {"coefficients": names}
+                if rowmod_k:
+                    adopted["rowmod"] = rowmod_k
+                solved = _fit_steps(
+                    steps,
+                    names,
+                    lambda r, v=adopted: _counts(v, routing, r[2], *r[5:]),
                 )
+        members = solved["rows"]
         slow = ~solved["keep"] & (solved["residual"] < 0)
         once = solved["residual"] < 1 / WARM_FACTOR - 1
         warm = np.zeros(len(members), dtype=bool)
@@ -812,10 +1091,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     raise ValueError(
                         f"{int(kept.sum())} steps for {len(features)} coefficients"
                     )
-                # The rank a run prices each step as: the base form's picks miss
-                # it on a tie, and picks that never settled may.
                 points = [
-                    _priced_row(priced, routing, ranks[r[0], r[4]])
+                    _counts(priced, routing, r[2], *r[5:])
                     for r, keep in zip(members, kept)
                     if keep
                 ]
@@ -838,8 +1115,9 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     "zero": solved["zero"],
                 },
             }
-            if k in alternation:
-                vector["fit"].update(alternation[k])
+            if max(map(len, steps)) > 1:
+                vector["fit"]["all_rows"] = solved["all_rows"]
+                vector["fit"]["passes"] = solved["passes"]
             if figures:
                 vector["fit"]["moe_column"] = figures
             if rowmod_k:
@@ -877,7 +1155,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             for s in samples
             if s.propose_s is not None
         ]:
-            law["draft"] |= _proposes(proposes)
+            law["draft"]["propose"] = _propose(proposes)
         if kvs:
             law["draft"]["draft_kv"] = _propose(kvs, "draft_kv_s")
         if any(s.view.prefill and s.draft_kv_s is not None for s in samples):
@@ -908,80 +1186,6 @@ def _propose(samples, label: str = "propose_s") -> dict:
             **fitted,
         },
     }
-
-
-def _proposes(samples) -> dict:
-    """The draft law's `propose` over `samples`, or, split at a lag, `propose`
-    over the passes the device reached at least that far behind its host and
-    `near_propose` over the rest, the lag its `lag`; and, bounded at a token
-    count, `near_propose` over those of fewer prefill tokens alone, the count
-    its `below`.
-
-    A pass's lag is its view's `start_lag_s` plus its step's target and draft-KV
-    labels. The lag runs over the powers of two of a second up to one, over the
-    steps that state one when they number at least `PROPOSE_SPLIT_STEPS`, each
-    side holding at least `PROPOSE_SIDE_STEPS` and solved as `_propose` solves.
-    The split whose vectors price those steps at the smallest mean
-    |log(price / label)| is adopted when that cuts the unsplit vector's by
-    `PROPOSE_SPLIT_GAIN`. The bound runs over the powers of two and one and a
-    half times each, below the largest prefill, with every lag again, once a
-    split is adopted: the best bounded split replaces it when that cuts its
-    error by `PROPOSE_SPLIT_GAIN` too. The errors go under `near_propose`'s
-    `fit.split`.
-    Not a scaled MAD: unsplit, the more frequent pass length sets the MAD
-    however far the rest are priced off it.
-    """
-    timed = [s for s in samples if s.view.start_lag_s is not None]
-    lags = np.array(
-        [s.view.start_lag_s + s.device_s + (s.draft_kv_s or 0) for s in timed]
-    )
-    tokens = np.array([sum_tokens(s.view.prefill) for s in timed])
-    x = np.array([(1, len(s.view.requests)) for s in timed], dtype=np.float64)
-    labels = np.array([s.propose_s for s in timed])
-
-    def error(short, below: dict, above: dict) -> float:
-        price = [x @ list(v["coefficients"].values()) for v in (below, above)]
-        return float(np.mean(np.abs(np.log(np.where(short, *price) / labels))))
-
-    def best(bounds) -> tuple | None:
-        """The (error, near, far) of the best split at any lag under `bounds`."""
-        found, seen = None, set()
-        for k in (2.0**-n for n in range(20, -1, -1)):
-            for bound in bounds:
-                short = (lags < k) & (tokens < bound)
-                if short.tobytes() in seen or (
-                    min(short.sum(), (~short).sum()) < PROPOSE_SIDE_STEPS
-                ):
-                    continue
-                seen.add(short.tobytes())
-                sides = [
-                    [s for s, m in zip(timed, short) if m == w] for w in (True, False)
-                ]
-                below, above = map(_propose, sides)
-                got = error(short, below, above)
-                if found is None or got < found[0]:
-                    below["lag"] = k
-                    if bound < math.inf:
-                        below["below"] = bound
-                    found = (got, below, above)
-        return found
-
-    whole = _propose(samples)
-    if len(timed) < PROPOSE_SPLIT_STEPS:
-        return {"propose": whole}
-    without = error(np.zeros(len(timed), dtype=bool), whole, whole)
-    split = best([math.inf])
-    if split is None or split[0] >= (1 - PROPOSE_SPLIT_GAIN) * without:
-        return {"propose": whole}
-    errors = {"error": split[0], "error_without": without}
-    top = int(tokens.max())
-    grid = [b << j for b in (2, 3) for j in range(top.bit_length()) if b << j < top]
-    bounded = best(sorted(grid))
-    if bounded is not None and bounded[0] < (1 - PROPOSE_SPLIT_GAIN) * split[0]:
-        errors["error_unbounded"], errors["error"] = split[0], bounded[0]
-        split = bounded
-    split[1]["fit"]["split"] = errors
-    return {"propose": split[2], "near_propose": split[1]}
 
 
 def token_band(tokens: int) -> str:
@@ -1042,42 +1246,6 @@ def _counts(vector: dict, routing, counts, context, tokens, dummies) -> tuple:
     moe = [f for f in MOE_COLUMNS if f in vector["coefficients"]]
     counts = (*counts, *(moe_column(f, tokens, routing, dummies) for f in moe))
     return counts + ((rowmod(context, vector["rowmod"]),) if "rowmod" in vector else ())
-
-
-def _settle(
-    members, ranks, names, rowmod_k, routing, solved
-) -> tuple[dict, int | None]:
-    """The alternation of decode rung `members`, the rows `_slowest` picked,
-    continued under the vector over `names`, which adds the columns the rung
-    adopted, from `solved` on those rows: each step's row at the rank that
-    vector prices it as (`_priced_row`), refit, until no step's row changes.
-    The last solve and how many solves under `names` it took, None when the
-    rows still moved after `MAD_PASSES` of them."""
-    vector = {"rowmod": rowmod_k} if rowmod_k else {}
-    vector["coefficients"] = dict(zip(names, map(float, solved["coef"])))
-    rows = [_counts(vector, routing, r[2], *r[5:]) for r in members]
-    groups = [ranks[r[0], r[4]] for r in members]
-    y = np.array([r[3] for r in members])
-    passes = 1
-    while (now := [_priced_row(vector, routing, g) for g in groups]) != rows:
-        if passes == MAD_PASSES:
-            return solved, None
-        rows, passes = now, passes + 1
-        solved = _solve(np.array(rows, dtype=np.float64), y, names)
-        vector["coefficients"] = dict(zip(names, map(float, solved["coef"])))
-    return solved, passes
-
-
-def _priced_row(vector: dict, routing, group) -> tuple:
-    """`_counts` of the row of `group`, a step's `fit` rows, at the rank `vector`
-    prices the step as (`priced_rank`), its terms folded as a run folds them."""
-    rows = [_counts(vector, routing, r[2], *r[5:]) for r in group]
-    c = vector["coefficients"].values()
-    price = {
-        j: (fold_seconds(x * w for x, w in zip(row, c)), r[2])
-        for j, (row, r) in enumerate(zip(rows, group))
-    }
-    return rows[priced_rank(price)]
 
 
 def held_out(samples, options=None, seed: int = 0) -> dict:

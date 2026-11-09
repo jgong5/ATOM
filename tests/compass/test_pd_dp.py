@@ -205,7 +205,7 @@ def test_decode_rank_0_may_not_log_rank_1s_write_request(tmp_path):
 
 
 TABLE = prefill_decode_table(
-    admission_path="serving",
+    admission_s=0.54e-3,
     ipc_s=PD["router_s"],
     stream_s=PD["router_s"],
     router_s=PD["router_s"],

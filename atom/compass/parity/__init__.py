@@ -6,7 +6,7 @@ run builds. This records them where both runs can be read the same way, at the
 model runner's `forward`: one JSON line per call, built before the call runs,
 because a real forward rewrites some batch fields in place. Each line carries
 the batch as the `BatchView` a simulated runner prices it from (`rows`, `rung`,
-and above DP width 1 `moe_rows` and `moe_tokens`, with an MTP drafter `draft_moe_rows` too, `draft_bs` where its later passes pad, `target_bs` where its target pads, on a split step `tbo_tokens`); a
+and above DP width 1 `moe_rows` and `moe_tokens`, with an MTP drafter `draft_moe_rows` too, `draft_bs` where its later passes pad, `draft_rows` where they run at its rows, `target_bs` where its target pads, on a split step `tbo_tokens`); a
 real runner settles that view from the `ForwardMode` its own forward settled,
 so recording adds no DP collective. Its line also carries `t_enter_ns` and `t_exit_ns`, the worker's
 monotonic clock around its forward, and is finished once the forward returns.
@@ -66,6 +66,7 @@ may then report a step where the twins' rows differ.
 """
 
 import collections
+import contextlib
 import copy
 import functools
 import hashlib
@@ -112,6 +113,11 @@ TIMESTAMPS = (
     "t_pull_ns",
     "t_put_ns",
 )
+#: Profiler ranges a trace run (`busy`) splits a forward's kernels at, on every
+#: TP rank: the target ends where `TARGET_DONE` opens, and each drafter pass is
+#: the range named `MARK` and its line field.
+MARK = "compass::"
+TARGET_DONE = MARK + "target_done"
 
 
 class StepRecord:
@@ -161,7 +167,7 @@ class StepRecord:
         per request, and as the `BatchView` `runner` prices it from: `rows`
         (query tokens, context tokens, decode), `rung`, the graph width the
         step replays or None, and `moe_rows`, the rows the DP group's MoE
-        gather carries, absent at DP width 1, and `draft_moe_rows`, `draft_bs`, `target_bs`, `moe_tokens` and `tbo_tokens`, each where the
+        gather carries, absent at DP width 1, and `draft_moe_rows`, `draft_bs`, `draft_rows`, `target_bs`, `moe_tokens` and `tbo_tokens`, each where the
         view has it. The view's mode is the one `forward` settled, stamped by
         `run_model` under `forward_mode`; without one it is `forward_mode`'s,
         which runs the DP collective itself. Each prefill window is added to its request's
@@ -265,7 +271,13 @@ class StepRecord:
             line["moe_rows"] = view.moe_rows
         if view.draft_moe_rows is not None:
             line["draft_moe_rows"] = view.draft_moe_rows
-        for field in ("draft_bs", "target_bs", "moe_tokens", "tbo_tokens"):
+        for field in (
+            "draft_bs",
+            "draft_rows",
+            "target_bs",
+            "moe_tokens",
+            "tbo_tokens",
+        ):
             if getattr(view, field) is not None:
                 line[field] = getattr(view, field)
         self.pending.append((line, window))
@@ -431,6 +443,9 @@ class StepRecording:
     device events at `run_model` entry and at the forward's exit. At
     `run_model` entry it also keeps the `ForwardMode` the forward settled,
     which the line's view is built from.
+
+    Once `allocate_kv_cache` has built a Mooncake connector, every worker
+    records that connector's KV writes (`writes`), written at `exit`.
     """
 
     _recording = False
@@ -488,6 +503,14 @@ class StepRecording:
             record_kv(self, meta)
         return super().process_kvconnector_output(meta)
 
+    def allocate_kv_cache(self, num_kvcache_blocks):
+        reply = super().allocate_kv_cache(num_kvcache_blocks)
+        from atom.compass.parity import writes
+
+        # The KV connector is built here, before any request can reach it.
+        self._writes = writes.install(self)
+        return reply
+
     def flush_pp_send(self):
         """ATOM's idle flush, stamped for the next forward when a send is pending."""
         if getattr(self, "_pp_pending_send", None):
@@ -516,17 +539,21 @@ class StepRecording:
         recorded `forward_done_event`: the target's end, sampling included."""
         if getattr(self, "_parity_record", None) is not None:
             self._stamps["target_event"] = self.device_event()
-        return call(*args)
+        with _traced(TARGET_DONE):
+            return call(*args)
 
     def _draft_pass(self, key, call, *args, **kwargs):
         """`call`, a drafter pass, between two device events kept under `key`,
         the line field that times it. The first pass's start also ends the
-        target of a forward that samples nothing."""
+        target of a forward that samples nothing. Under ATOM's profiler every TP
+        rank opens the pass's range, recording or not."""
         if getattr(self, "_parity_record", None) is None:
-            return call(*args, **kwargs)
+            with _traced(MARK + key):
+                return call(*args, **kwargs)
         start = self.device_event()
         self._stamps.setdefault("draft_event", start)
-        reply = call(*args, **kwargs)
+        with _traced(MARK + key):
+            reply = call(*args, **kwargs)
         self._stamps[key] = [start, self.device_event()]
         return reply
 
@@ -575,7 +602,19 @@ class StepRecording:
         # Reached on a clean stop and on a SIGTERM (ATOM's exit handler).
         if getattr(self, "_parity_record", None) is not None:
             self._parity_record.write()
+        if getattr(self, "_writes", None) is not None:
+            self._writes.write()
         return super().exit()
+
+
+def _traced(name: str):
+    """A profiler range named `name` while ATOM's profiler runs, else none, so
+    an untraced forward's host time pays for no range."""
+    import torch
+
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(name)
+    return contextlib.nullcontext()
 
 
 def _window(previous, launch, done, marks, wait: bool):

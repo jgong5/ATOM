@@ -34,7 +34,7 @@ def _serve(monkeypatch, out: Path, client_runs, stop: float, late=None) -> Path:
     which arrives a simulated second on and is answered a second after that.
     Then a stop at wall `stop`, and with `late`, a client that binds and asks
     at that wall time, after the finish. Returns the out_dir."""
-    run = {"admission_path": "serving", "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+    run = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
     run.update(bound_s=100.0, client_runs=None, out_dir=str(out))
     wall = [100.0]
     fake = SimpleNamespace(monotonic=lambda: wall[0], sleep=time.sleep)
@@ -63,6 +63,7 @@ def _serve(monkeypatch, out: Path, client_runs, stop: float, late=None) -> Path:
             time.sleep(0.05)
     wall[0] = stop
     authority.on_request(FRONTEND, TAR, INF, [])
+    wall[0] = stop + 1  # the hand-ins and the summary come after the finish
     if late is not None:
         wall[0] = late
         authority.on_bind(TRAFFIC)

@@ -9,7 +9,11 @@ time, plus `d_gap_ns` on a decode, and its line's host segments: `E` from the pr
 recv wait (the sampler's launch included), and `W_post` from the recv wait to the exit
 less the draft copy wait; with
 `d_target_ns`, under MTP, the target runs to `forward_done_event`, with
-`d_draft_kv_ns` on an output forward, the rest of `d_busy_ns` is draft, `W_inputs` is the part of
+`d_draft_kv_ns` on an output forward, the rest of `d_busy_ns` is draft; where
+the device reached the `propose` pass before the host's draft copy wait
+(`step_labels.host_paced_drafts`), that rest holds the device's wait for the
+host, which starting the draft at the exit already counts, so the draft is
+`d_propose_ns`, and a line without it is refused. `W_inputs` is the part of
 `W_pre` after the MTP status wait, `L_mtp` is `step_labels.mtp_copy`'s time,
 and a decode's `d_gap_ns` is the work queued ahead of its launch
 (`check`). Each forward is called at the
@@ -167,6 +171,7 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
     origin = steps[0]["t_enter_ns"]
     mtp = any("d_target_ns" in s for s in steps)
     copy = step_labels.mtp_copy(steps) if mtp else {}
+    waited = step_labels.host_paced_drafts(steps) if mtp else set()
     rec = HostDeviceRecurrence({}, (), lambda: now, stage, mtp=mtp)
     kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
     for n, s in enumerate(steps):
@@ -237,7 +242,16 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
         if "d_target_ns" in s and s["produces_output"]:
             target += s.get("d_draft_kv_ns", 0)  # it precedes forward_done_event
         own = gap + target - s.get("d_recv_ns", 0)  # the receive is a wait, not work
-        charge = rec.charge(batch, own * 1e-9, (busy - target) * 1e-9)
+        draft = busy - target
+        if s["step"] in waited:  # the rest holds the device's wait for the host
+            if "d_propose_ns" not in s:
+                raise ValueError(
+                    f"step {s['step']}'s device reached its propose pass before "
+                    "its host's draft copy wait, and it states no `d_propose_ns` "
+                    "to tell the pass from the device's wait for the host"
+                )
+            draft = s["d_propose_ns"]
+        charge = rec.charge(batch, own * 1e-9, draft * 1e-9)
         times = (now + charge - post * 1e-9, rec.ends[-1], called, now + charge, done)
         period = (s["t_exit_ns"] - last) * 1e-9
         r1_ms = None

@@ -21,7 +21,6 @@ from types import SimpleNamespace
 
 import pytest
 from aiter_stub import stubbed_aiter
-from conftest import ZmqPolling
 
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import Sequence
@@ -138,7 +137,9 @@ def _serving(engine, monkeypatch, interval=QUIET_S):
     monkeypatch.setattr(
         engine_core, "make_zmq_socket", lambda *a, **k: contextlib.nullcontext(wire)
     )
-    monkeypatch.setattr(engine_core, "zmq", ZmqPolling(engine_core.zmq, wire))
+    # In the module's dict: `zmq_shim` serves `Poller` from its `__getattr__`,
+    # and a setattr's undo would leave pyzmq's class there for later tests.
+    monkeypatch.setitem(vars(engine_core.zmq), "Poller", lambda: wire)
     threads = [
         threading.Thread(
             target=engine.process_input_sockets, args=("in", "ctl"), name=SERVED[0]

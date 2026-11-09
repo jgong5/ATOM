@@ -121,16 +121,9 @@ python3 - "$RUN" "$OUT" "${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog1
     "$PREFILL_DP" "$DECODE_DP" "${urls[@]}" <<'EOF'
 import json, re, sys
 from pathlib import Path
-from atom.compass.drive.runfile import KV_WRITE_REQ_S
 
 run, out, machine, model, store, port, prefills, decodes, dp_p, dp_d, *urls = sys.argv[1:]
 machine = json.loads(Path(machine).read_text())
-# ponytail: a spec that measured no tokenizer for the model prices it as its
-# first entry, as parity_one_node.sh does; only arrival latency reads it.
-arch = json.loads((Path(model) / "config.json").read_text())["architectures"][0]
-tokenizers = machine["host"]["tokenizers"]
-if not any(arch in entry["applies_to"] for entry in tokenizers):
-    tokenizers[0]["applies_to"].append(arch)
 # Each side's (instance, DP rank) pairs in the order the real router logged
 # registering them.
 deployment, count = {}, {"--prefill": 0, "--decode": 0}
@@ -144,8 +137,11 @@ for url, rank in re.findall(r"Registered worker (\S+)@(\d+) ", log):
     order.setdefault(side, []).append([k, int(rank)])
 Path(run).write_text(json.dumps({
     "clock_endpoint": f"tcp://127.0.0.1:{port}", "bound_s": 1e7,
-    "admission_path": "serving", "ipc_s": 2.0**-14, "stream_s": 2.0**-12,
-    "router_s": 2.0**-12, "kv_write_req_s": KV_WRITE_REQ_S, "kv_link": "intra_node",
+    # Declared, but for the node-18 HTTP transport and write request, as the
+    # law files state them.
+    "admission_s": 0.54e-3, "ipc_s": 2.0**-14, "router_s": 2.0**-12,
+    "kv_write_req_s": 106e-6, "decode_hops": {"ipc_s": 2.0**-14, "stream_s": 2.0**-12},
+    "kv_link": "intra_node",
     "replay": f"{out}/real/record", "step_stub": {}, "machine": machine, "store": store,
     "prefill_data_parallel_size": int(dp_p), "decode_data_parallel_size": int(dp_d),
     "out_dir": f"{out}/sim",
