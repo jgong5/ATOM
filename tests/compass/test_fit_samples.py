@@ -215,6 +215,7 @@ def test_each_sample_copies_its_input_s_provenance_and_the_traces_it_served(
         "engine_config": json.loads(a.joinpath("run.json").read_text())["host_key"][
             "engine"
         ],
+        "prefill_buckets": None,
         "source_root": "tree-67c176f0",
         "stack": STACK,
         "ptl": "disabled",

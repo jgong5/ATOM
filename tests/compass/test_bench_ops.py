@@ -1268,6 +1268,99 @@ def test_v4_prefill_index_leaves_take_atom_s_lists_whole_by_ratio_past_cached_to
     assert start.tolist() == [8]
 
 
+def test_a_cached_v4_prefill_repeats_gathers_and_writes_on_what_atom_passes(
+    monkeypatch,
+):
+    # A prefill of 1024 tokens over one row past 1024 cached. Bound by size,
+    # the batch-id build repeated a TBO position, 4096, into the capture's 1024
+    # tokens, the indexer's row starts gathered at another index list's rows,
+    # and the window write's state slots were a count. The aten leaves run here,
+    # as on the card. Beside no DeepSeek-V4 CSA layer, the gather keeps the
+    # name rule and the write DeepSeek-V4.1's step slots.
+    swa = "atom.model_ops.v4_kernels.state_writes:swa_write"
+    build, gather = "aten.repeat_interleave.self_Tensor", "aten.index.Tensor"
+
+    class Csa(torch.nn.Module):
+        indexer, compress_ratio = SimpleNamespace(index_topk=8), 4
+
+        def _fill_csa_paged_compress(self, *args):
+            pass
+
+    def i32(*values):
+        return torch.tensor(values, dtype=torch.int32)
+
+    def meta(slot, *shape, dtype="torch.int32"):
+        return slot, _t(list(shape), "metadata", dtype=dtype)
+
+    def prepare_model(batch):
+        md = fctx.AttentionMetaData(cu_seqlens_q=i32(0, 1024), context_lens=i32(2048))
+        vars(md).update(
+            batch_id_per_q_token=torch.zeros(1024, dtype=torch.int32),
+            kv_indices_prefix_swa=torch.full((1024,), 7, dtype=torch.int32),
+            state_slot_out=i32(5, 0, 0, 0),
+            step=SimpleNamespace(slots=i32(6, 0)),
+        )
+        context = fctx.Context(torch.arange(1024, 2048), scheduled_tokens_gpu=i32(1))
+        fctx._forward_context = fctx.ForwardContext(attn_metadata=md, context=context)
+        return torch.zeros(1024, dtype=torch.int32), None, None, None, True, False
+
+    def call(stub, op, sig, instances, n):
+        kwargs, _ = stub._copy(op, sig, instances, 0)
+        if op["op"] == swa:
+            return {}
+        return {"out": len(ops._function(op["op"])(**kwargs))}
+
+    monkeypatch.setattr(ops.Stub, "_time", call)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    rows = _t([1024], "metadata", dtype="torch.int32")
+    found = ops.leaves(
+        _graph(
+            _leaf(
+                build,
+                meta("self", 1),
+                meta("repeats", 1, dtype="torch.int64"),
+                ("output_size", 1024),
+            ),
+            _leaf(gather, meta("self", 2), ("indices", (rows,))),
+            _leaf(
+                swa,
+                meta("positions", 1024, dtype="torch.int64"),
+                meta("cu_seqlens_q", 2),
+                meta("state_slot_per_seq", 1),
+            ),
+            layers=1,
+        )["region"]
+    )
+    batch = SimpleNamespace(total_seqs_num_prefill=1, num_cached_tokens=[1024])
+    placed = SimpleNamespace(block_size=16, batch=lambda *a: batch)
+    slots = {build: "repeats", gather: "indices.0", swa: "state_slot_per_seq"}
+    got = {}
+    for v4 in (True, False):
+        runner = _Runner()
+        runner.forward_vars["ub0_positions"] = torch.tensor([4096])
+        runner.prepare_model = prepare_model
+        if v4:
+            runner.model.append(Csa())
+        records = ops.Stub(runner, 10_000).point(placed, prefill(1024, 1), 1024, found)
+        got[v4] = {
+            r["op"]: (r["metadata"][slots[r["op"]]], r.get("out", "refused" in r))
+            for r in records
+        }
+
+    assert got == {
+        True: {
+            build: ("context_lens.long", 2048),
+            gather: ("batch_id_per_q_token", 1024),
+            swa: ("state_slot_out", False),
+        },
+        False: {
+            build: ("context_lens.long", 2048),
+            gather: ("kv_indices_prefix_swa", True),
+            swa: ("step.slots", False),
+        },
+    }
+
+
 def test_v4_bf16_prefill_attention_takes_v4_s_lists_by_ratio_and_v41_s_leaf_its_own():
     # DeepSeek-V4's bf16-cache prefill attention is V4.1's sparse attention's
     # operator. On a V4 prefill past 8 cached tokens, bound by size, a CSA

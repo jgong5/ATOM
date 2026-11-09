@@ -10,9 +10,11 @@ which holds the ladder the runner replays; the scheduler's bounds
 `num_kvcache_blocks`, the KV block count the runner's `allocate_kv_cache` set;
 `enable_prefix_caching`, which a JIT sweep's plan reads
 (`atom/compass/drive/sweep_plan.py`);
-and `prefill_context_parallel_size` and `decode_context_parallel_size`, each
+`prefill_context_parallel_size` and `decode_context_parallel_size`, each
 only above 1, so a width-1 engine file is unchanged and a step linear fit
-refuses a context-parallel record by name.
+refuses a context-parallel record by name; and `prefill_buckets`, the prefill
+token-graph buckets the runner recorded, only where it recorded some, which a
+step linear fit pads prefill to.
 A simulated run also writes `dp<r>.cost.jsonl`, a line per step saying what
 its charge was made of (`_group_step_seconds` in
 `atom/compass/runner/overrides.py` says what each line holds).

@@ -101,6 +101,22 @@ def test_every_checked_in_law_stamps_the_digest_of_its_spec(name):
     assert law["machine_spec"] == law["host"]["key"]["machine_spec"] == digest(spec)
 
 
+def test_gpu40s_patched_aiter_keys_it_apart_from_crs005_whose_laws_refuse_there(
+    monkeypatch, tmp_path
+):
+    gpu40 = json.loads((ROOT / "machines" / "mi355x-gpu40.json").read_text())
+    crs005 = json.loads((ROOT / "machines" / "mi355x-crs005.json").read_text())
+    name = "deepseek-v4-pro-dpa8-ep8-mi355x-crs005-decode.json"
+    law = json.loads((ROOT / "laws" / name).read_text())
+    assert law["machine_spec"] == digest(crs005) != digest(gpu40)
+    here = {k: v for k, v in law.items() if k != "engine_config"}
+    with pytest.raises(ValueError) as refused:
+        _installed(monkeypatch, tmp_path, step_linear=here, machine=gpu40)
+    assert f"fitted on machine spec {digest(crs005)}" in str(refused.value)
+    assert f"this run's is {digest(gpu40)}" in str(refused.value)
+    assert "aiter 09d256420" in str(refused.value)
+
+
 def test_every_checked_in_law_stamps_this_trees_atom_digest():
     tree = host_key_of("/nonexistent-model", {})["atom"]
     laws = sorted((ROOT / "laws").glob("*.json"))

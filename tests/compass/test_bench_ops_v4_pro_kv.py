@@ -43,6 +43,8 @@ CONSUMER = ' --kv-transfer-config {"kv_role":"kv_consumer","kv_connector":"moonc
 COMPRESS = "aiter.ops.flydsl.kernels.fused_compress_attn:flydsl_fused_compress_attn"
 #: The prefill's index build, which writes the lists the attention reads.
 FILL = "atom.model_ops.v4_kernels.paged_prefill_indices:write_v4_paged_prefill_indices"
+#: Each layer's write of its window ring.
+SWA = "atom.model_ops.v4_kernels.state_writes:swa_write"
 
 
 def _rehearse(root, tokenizer, args, shape="--width 1"):
@@ -147,6 +149,36 @@ def test_the_prefill_index_leaves_take_the_buffers_atom_passes(rehearsed_prefill
             "kv_indices_extend": "md.kv_indices_extend+0",
             "kv_indptr_extend": "md.kv_indptr_extend+0",
         }
+
+
+@pytest.fixture(scope="module")
+def rehearsed_prefill_tbo(model_dir, tmp_path_factory):  # noqa: F811
+    """`rehearsed_prefill` under --enable-tbo, whose input preparation builds
+    each KV token's batch id."""
+    root = tmp_path_factory.mktemp("v4pro_prefill_tbo")
+    args = DPA_TP8 + PRODUCER + " --enable-tbo"
+    return _rehearse(root, model_dir, args, "--prefill 512 1")
+
+
+def test_a_cached_prefill_repeats_gathers_and_writes_on_what_atom_passes(
+    rehearsed_prefill_tbo,
+):
+    """Past cached tokens, the batch-id build repeats ATOM's context lengths,
+    widened as it widens them, and the FP8 indexer's row starts gather at
+    ATOM's batch ids, each reaching its launch; each window write takes ATOM's
+    state slots, plane rows past the slot count the harness bounds them by."""
+    taken = {
+        "aten.repeat_interleave.self_Tensor": ("bound", "repeats", "context_lens.long"),
+        "aten.index.Tensor": ("identity", "indices.0", "md.batch_id_per_q_token+0"),
+        SWA: ("identity", "state_slot_per_seq", "md.state_slot_out+0"),
+    }
+    got = set()
+    for r in rehearsed_prefill_tbo:
+        if r["op"] in taken and r["bound"].get(taken[r["op"]][1]):
+            if r["op"] != SWA:
+                assert r["verdict"] == "reaches launch", r["why"]
+            got.add((r["op"], r[taken[r["op"]][0]][taken[r["op"]][1]]))
+    assert got == {(op, name) for op, (_, _, name) in taken.items()}
 
 
 @pytest.fixture(scope="module")

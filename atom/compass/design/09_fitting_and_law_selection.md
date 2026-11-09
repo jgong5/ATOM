@@ -329,6 +329,7 @@ the fit adopted both columns, at 32 and 43 ms ([#2958](https://github.com/jgong5
 ```
 prefill:  [ 1,  tokens,  Σ_req N_Q²,  Σ_req N_Q·(ctx − N_Q) ]
           + history: Σ_req (ctx − N_Q), in `step_linear_fit`'s `history` form
+          + padding: b − tokens, where the records state their prefill buckets
 decode:   [ 1,  batch,   Σ ctx ]
 per rung: [ 1,  Σ ctx,   rung·max(ctx) − Σ ctx ]
           + n or E·(1 − (1 − K/E)^m), on a rung that adopts one (`--moe-routing E,K`),
@@ -373,6 +374,22 @@ coordinate, so a step whose `n`, or under `X` whose `m`, falls outside those its
 fitted on is priced as an extrapolation (D58). Prefill needs no such column: its gather is variable-length, so
 `moe_rows` is its real tokens. An MTP draft law's decode vectors take no MoE column until
 a data-parallel MTP record tests it there.
+
+A prefill vector adds `padding`, `b − tokens`, where the records' engine files state the
+prefill token-graph buckets their runner recorded, and states those buckets. ATOM replays
+a prefill's first layers as a token graph at `b` rows, the smallest bucket holding the
+most tokens any rank of the DP group scheduled (`BatchView.group_max_tokens`), and runs
+past the largest bucket, or on a step the group splits for two-batch overlap, eagerly,
+where `padding` is 0. On the V4.1-Flash DSpark TP2 trace runs the 2048 bucket cost the
+same at 1033 and 1830 tokens, and 0.0114 ms a padded token matches 0.0105 ms a bucket
+token. Without the column the law priced one-request output prefills of 1033 to 1314
+tokens 13 to 20% low and of 124 to 248 tokens 10 to 19% high; with it, 2.7 to 3.1% low
+and −0.2 to +10.5% high. An intercept per bucket carries only the mechanism's mean and
+left the first group 4.7 to 11.3% low ([#2976
+Ruling](https://github.com/jgong5/ATOM/issues/2976#issuecomment-6730261854)). What the
+column leaves is the MoE's content: at like tokens one request's MoE ran 1.2 to 4.2 ms
+longer on one run's prompts than on the other's, a residual no shape feature carries. A
+data-parallel step stating no `group_max_tokens` is refused; a draft law adds no column.
 
 Two constructions are load-bearing and both were originally wrong.
 

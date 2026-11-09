@@ -152,7 +152,8 @@ def batch_view(
     `is_dummy_run` batch is its `dp_dummy`, a step some rank prefills its
     `group_prefills`, and `dummies`, the group's dummy forwards as
     `dummy_ranks` sums them, its `group_dummies`: a caller that does not run
-    that collective, as a recording real run does not, passes none. A single
+    that collective, as a recording real run does not, passes none. The most
+    tokens any rank scheduled is its `group_max_tokens`. A single
     rank reads none of the
     collective's counts, though `decide` returns them for a group of one.
 
@@ -174,6 +175,7 @@ def batch_view(
     decode every rank decodes in, its inputs; a sampling prefill, its LM head.
     """
     draft_moe_rows = moe_tokens = dp_rank = draft_bs = target_bs = draft_rows = None
+    group_max_tokens = None
     drafter = getattr(runner, "drafter", None)
     if getattr(drafter, "step", None) is not None:  # `EagleProposer`'s pass
         draft_bs = int(mode.running_bs)
@@ -190,6 +192,7 @@ def batch_view(
     ) == _data_parallel_size(runner):
         dp_rank = runner.config.parallel_config.data_parallel_rank
         gathered = moe_tokens = int(mode.sync.scheduled_tokens_per_dp_rank.sum())
+        group_max_tokens = int(mode.sync.scheduled_tokens_per_dp_rank.max())
         if mode.running_tokens_are_unified:
             moe_rows = _data_parallel_size(runner) * mode.running_tokens
         else:
@@ -227,6 +230,7 @@ def batch_view(
         group_dummies=dummies if dp_rank is not None else 0,
         draft_rows=draft_rows,
         group_prefills=dp_rank is not None and not mode.running_tokens_are_unified,
+        group_max_tokens=group_max_tokens,
     )
 
 
