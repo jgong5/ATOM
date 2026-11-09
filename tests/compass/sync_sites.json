@@ -271,21 +271,21 @@
    "mechanism_why": "starting a process cannot park; the process is the engine's own, prices nothing and sends nothing"
   },
   {
-   "id": "atom/compass/run/__init__.py::_op_graphs.graph::process[0].submit(_trace, root, atom_args, arch, shape)::executor_handoff#0",
+   "id": "atom/compass/run/__init__.py::_op_graphs.lazily::process[0].submit(_trace, root, atom_args, arch, shape, **kwargs)::executor_handoff#0",
    "file": "atom/compass/run/__init__.py",
-   "symbol": "_op_graphs.graph",
+   "symbol": "_op_graphs.lazily",
    "call": "process[0].submit",
-   "expr": "process[0].submit(_trace, root, atom_args, arch, shape)",
+   "expr": "process[0].submit(_trace, root, atom_args, arch, shape, **kwargs)",
    "shape": "executor_handoff",
    "peer": "process",
-   "why": "the lookup hands a shape its store holds no graph at to its lazy-trace process",
+   "why": "the lookup hands a shape its store holds no graph at, or a DP prefill's (T, B) whose graph holding G it holds none of, to its lazy-trace process",
    "mechanism": "K9",
    "mechanism_why": "a hand-off onto the executor's queue cannot park; the wait for its result is `done.result()`'s row"
   },
   {
-   "id": "atom/compass/run/__init__.py::_op_graphs.graph::done.result()::event_wait#0",
+   "id": "atom/compass/run/__init__.py::_op_graphs.lazily::done.result()::event_wait#0",
    "file": "atom/compass/run/__init__.py",
-   "symbol": "_op_graphs.graph",
+   "symbol": "_op_graphs.lazily",
    "call": "done.result",
    "expr": "done.result()",
    "shape": "event_wait",

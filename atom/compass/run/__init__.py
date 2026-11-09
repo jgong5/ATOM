@@ -1937,13 +1937,11 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         traced, when a `symbolic` trace's two ends differ, else None."""
         began, why = time.monotonic(), None
         # `symbolic` only when set: a concrete trace's call is as before.
-        symbolically = {"symbolic": True} if symbolic else {}
+        kwargs = {"symbolic": True} if symbolic else {}
         try:
             if not process:
                 process.append(_trace_process())
-            done = process[0].submit(
-                _trace, root, atom_args, arch, shape, **symbolically
-            )
+            done = process[0].submit(_trace, root, atom_args, arch, shape, **kwargs)
             unpublished.update(done.result())
         except PerG as differ:
             why = str(differ)
