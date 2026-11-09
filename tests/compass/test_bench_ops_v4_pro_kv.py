@@ -19,6 +19,7 @@ import shutil
 import pytest
 from test_bench_ops_v41_rehearsal import HARNESS, _run
 from test_capture_v4_pro import (
+    BF16_PREFILL,
     CONFIG,
     CORE,
     DECODE,
@@ -178,3 +179,32 @@ def test_a_cached_prefill_repeats_gathers_and_writes_on_what_atom_passes(
                 assert r["verdict"] == "reaches launch", r["why"]
             got.add((r["op"], r[taken[r["op"]][0]][taken[r["op"]][1]]))
     assert got == {(op, name) for op, (_, _, name) in taken.items()}
+
+
+@pytest.fixture(scope="module")
+def rehearsed_bf16_prefill(model_dir, tmp_path_factory):  # noqa: F811
+    """The rehearsal's record of each leaf of a prefill of 512 tokens over one
+    row under the bf16 KV cache."""
+    root = tmp_path_factory.mktemp("v4pro_bf16_prefill")
+    bf16 = " -- --kv_cache_dtype bf16 --enable-dp-attention"
+    return _rehearse(root, model_dir, bf16, "--prefill 512 1")
+
+
+def test_the_bf16_cache_s_prefill_attention_takes_the_lists_of_its_layer_s_class(
+    rehearsed_bf16_prefill,
+):
+    """Each layer's prefill attention, V4.1's sparse attention's operator,
+    reaches its launch on the lists and indptrs ATOM's builder made for its
+    layer's class."""
+    cores = [r for r in rehearsed_bf16_prefill if r["op"] == BF16_PREFILL]
+    stated = [json.loads(r["leaf"])["stated"] for r in cores]
+    assert {s["compress_ratio"] for s in stated} == {4, 128}
+    for r, s in zip(cores, stated, strict=True):
+        kind = {4: "csa", 128: "hca"}[s["compress_ratio"]]
+        assert r["verdict"] == "reaches launch", r["why"]
+        assert r["identity"] == {
+            "kv_indices_prefix": f"md.kv_indices_prefix_{kind}+0",
+            "kv_indptr_prefix": f"md.kv_indptr_prefix_{kind}+0",
+            "kv_indices_extend": "md.kv_indices_extend+0",
+            "kv_indptr_extend": "md.kv_indptr_extend+0",
+        }

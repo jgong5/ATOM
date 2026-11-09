@@ -49,9 +49,11 @@ a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
 HCA decode workspace an `HCA_DECODE` slot names, or of the buffer
-`V4_METADATA` names for a DeepSeek-V4 slot, or beside a DeepSeek-V4 CSA
-layer `V4_SHARED`, or ATOM's batch-id build's repeats (`BATCH_IDS`), refused
-when it is not live, a prefill's index list whole (`V4_LISTS`), or,
+`V4_METADATA` names for a DeepSeek-V4 slot, and on a V4 prefill's step
+`V4_SHARED` for one of an operator V4.1 runs too, or beside a DeepSeek-V4
+CSA layer `V4_CSA_SHARED` for one of an operator other models run too, or
+ATOM's batch-id build's repeats (`BATCH_IDS`), refused when it is not live,
+a prefill's index list whole (`V4_LISTS`), or,
 when live, `V41_NAMES`' for a DeepSeek-V4.1 slot at its ratio (`_ratio`),
 whose step and scorer workspace are live too; a leaf of the drafter's alone
 takes what ATOM passes a drafter (`DRAFTER_NAMES`) and, of a pass of its own,
@@ -351,6 +353,15 @@ V4_METADATA = {
     (_PREFILL, "kv_indices_extend"): "kv_indices_extend",
 }
 V4_KINDS = {0: "swa", 4: "csa", 128: "hca"}
+#: DeepSeek-V4's arguments, keyed as `V4_METADATA`'s, of an operator
+#: DeepSeek-V4.1 runs too on buffers of its own (`V41_NAMES`): its prefill
+#: attention under the bf16 KV cache, passed the fp8 one's buffers. They bind
+#: as `V4_METADATA`'s on a step whose metadata holds V4's prefill lists.
+V4_SHARED = {
+    ("aiter.pa_sparse_prefill_opus.default", slot): name
+    for (op, slot), name in V4_METADATA.items()
+    if op == _PREFILL
+}
 #: DeepSeek-V4's prefill index lists, which ATOM allocates each step at the
 #: entries its rows read (`_build_paged_prefill_meta`). A capture's prefill
 #: caches nothing, so past cached tokens each is longer than the leaf's
@@ -420,7 +431,7 @@ V41_NAMES = {
 #: passes its step's (`V41_NAMES`), and its FP8 indexer's prefill row starts,
 #: `cu_committed[batch_id_per_q_token]`. Bound by size, the slots were a count
 #: and the gather's indices another index list, past the slots and the rows.
-V4_SHARED = {
+V4_CSA_SHARED = {
     (_SWA, "state_slot_per_seq"): "state_slot_out",
     ("aten.index.Tensor", "indices"): "batch_id_per_q_token",
 }
@@ -887,7 +898,7 @@ class Stub:
         # the buffers ATOM passes a slot by name, DeepSeek-V4's shared ones
         # beside its CSA layer alone
         self.names = V4_METADATA | BATCH_IDS
-        self.names |= V4_SHARED if self.csa is not None else {}
+        self.names |= V4_CSA_SHARED if self.csa is not None else {}
 
     def _prepare(self, batch) -> None:
         """`batch` prepared by ATOM's runner as its forward prepares one, no
@@ -976,7 +987,10 @@ class Stub:
                         pool, what = {field: work[field]}, "HCA workspace"
                     ratio = _ratio(op, path, self.known)
                     key = op["op"], _keyed(op["args"], path)
-                    if wanted := self.names.get(key):
+                    wanted = self.names.get(key)
+                    if "kv_indptr_extend" in named:  # a V4 prefill's step
+                        wanted = wanted or V4_SHARED.get(key)
+                    if wanted:
                         what = wanted.format(
                             ratio=ratio,
                             kind=V4_KINDS.get(ratio),

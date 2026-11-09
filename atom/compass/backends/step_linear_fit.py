@@ -145,7 +145,7 @@ from pathlib import Path
 
 import numpy as np
 
-from atom.compass.backends import step_labels
+from atom.compass.backends import json_file, step_labels
 from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.shape import (
     sum_context,
@@ -481,7 +481,9 @@ def _intakes(path) -> tuple[list, list, list]:
     lone = []
     for i, (call, after) in enumerate(zip(calls, calls[1:] + [math.inf])):
         span = ev[np.searchsorted(at, call, "right") : np.searchsorted(at, after)]
-        between = [e for e in span if e[2] not in ("app", "recv", "wait")]
+        # An output taken in or a head sent is the output's or the response's.
+        skip = ("app", "recv", "wait", "out", "head")
+        between = [e for e in span if e[2] not in skip]
         waits = sum(e[5] - e[4] for e in span if e[2] == "wait")
         if np.searchsorted(sends, call) != i or [e[2] for e in between] != [
             "body",
@@ -539,6 +541,141 @@ def fit_intake(paths) -> tuple[dict, dict]:
         "bytes": [min(bodies), max(bodies)],
     }
     return term, report
+
+
+#: The host entry's ``hops`` `fit_hops` fits (`atom.compass.run.HOPS`).
+HOPS = ("admission_s", "ipc_s", "ipc_out_s", "stream_s")
+
+
+def fit_hops(intakes, clients) -> tuple[dict, dict]:
+    """The ``hops`` term over the records whose intake stamps `intakes` names,
+    each with the engine's queue handoffs and step lines beside them
+    (``dp<r>.handoff.jsonl``, ``dp<r>.jsonl``) and its client requests'
+    ``sent`` and ``acked``, CLOCK_MONOTONIC ns, in `clients`, or the reason
+    there are none as ``missing``; and its report.
+
+    Each hop is the p10 of its messages alone on it (`_alone`) in every
+    record: ``admission_s``, a client send to its request's app call;
+    ``ipc_s``, an engine send call's return to the engine input thread's receipt,
+    inside a forward of that DP rank, since an idle engine's loop holds the GIL
+    the thread waits on; ``ipc_out_s``, an output's put on the engine's output
+    queue to the server's output thread taking its first row; ``stream_s``,
+    an SSE head's send call's return to the client's ack. A hop the records cannot give is
+    left out and its reason listed under the report's ``unfitted``."""
+    took, report = {h: [] for h in HOPS}, {"unfitted": {}}
+    for intake, client in zip(intakes, clients):
+        for hop, messages in _hop_messages(Path(intake), client).items():
+            try:
+                took[hop] += messages()
+            except ValueError as e:
+                report["unfitted"][hop] = f"{intake}: {e}"
+    term = {}
+    for hop, s in took.items():
+        if hop in report["unfitted"]:
+            continue
+        if not s:
+            report["unfitted"][hop] = "no message ran alone on it"
+            continue
+        p10, p50, p90 = np.percentile(np.array(s) * 1e-9, [10, 50, 90]).tolist()
+        term[hop] = p10
+        report[hop] = {"p10_s": p10, "p50_s": p50, "p90_s": p90, "messages": len(s)}
+    return term, report
+
+
+def _alone(sent, got, returned=None) -> tuple[np.ndarray, np.ndarray]:
+    """The arrival and ``got - sent`` of each message alone on its hop: sent
+    once every message ahead of it arrived, and arrived before the next was
+    sent. One side may miss messages the other saw, as a client misses those
+    in flight at its stop (`_paired`). With `returned`, the return of each send
+    call, made one at a time, a message is timed from it, and is not alone when
+    it arrived first. Raises on a side with no message."""
+    sent, got = np.sort(np.array(sent, np.int64)), np.sort(np.array(got, np.int64))
+    if not len(sent) or not len(got):
+        raise ValueError(f"{len(sent)} sends and {len(got)} arrivals")
+    if len(got) >= len(sent):
+        k, i = _paired(sent, got)
+    else:  # in reverse time each arrival is a send, and each send an arrival
+        i, k = _paired(-got[::-1], -sent[::-1])
+        k, i = len(sent) - 1 - k, len(got) - 1 - i
+    if returned is not None:
+        sent = np.sort(np.array(returned, np.int64))
+    took = got[i] - sent[k]
+    return got[i][took > 0], took[took > 0]
+
+
+def _paired(sent, got) -> tuple[np.ndarray, np.ndarray]:
+    """The indices into `sent` and `got`, both sorted, of each message alone:
+    exactly one arrival between its send and the next, and as many before its
+    send as at any send before it. `got` may hold arrivals whose sends `sent`
+    misses, each raising that count for good."""
+    before = np.searchsorted(got, sent, "right")
+    upto = np.searchsorted(got, np.r_[sent[1:], np.iinfo(np.int64).max], "right")
+    ahead = before - np.arange(len(sent))
+    alone = (upto - before == 1) & (ahead == np.maximum.accumulate(ahead))
+    return np.flatnonzero(alone), before[alone]
+
+
+def _hop_messages(intake: Path, client) -> dict:
+    """Each hop's alone messages' ns in the record whose intake stamps are at
+    `intake`, as a call per hop that raises on what the record cannot give;
+    `client` is as `fit_hops` takes it."""
+    ev = _stamps(intake)
+    calls, sends = _requests(ev)
+    recvs, puts, forwards = {}, [], {}
+    for path in intake.parent.glob("dp*.handoff.jsonl"):
+        rank = path.name.split(".")[0]
+        for h in json_file.read_jsonl(path):
+            if "t_recv_ns" in h:
+                recvs[h["t_recv_ns"]] = rank
+            elif h["rows"]:
+                puts.append((h["t_out_put_ns"], h["rows"]))
+        steps = json_file.read_jsonl(path.with_name(f"{rank}.jsonl"))
+        forwards[rank] = np.array(
+            sorted((s["t_enter_ns"], s["t_exit_ns"]) for s in steps)
+        )
+
+    def stepping(t, rank) -> bool:
+        enter, exit_ = forwards[rank].reshape(-1, 2).T
+        i = np.searchsorted(enter, t, "right") - 1
+        return i >= 0 and t <= exit_[i]
+
+    def of_client(field: str) -> list:
+        if "missing" in client:
+            raise ValueError(client["missing"])
+        return client[field]
+
+    def handed() -> None:
+        if not forwards:
+            raise ValueError("no engine's dp<r>.handoff.jsonl is beside it")
+
+    def ipc():
+        handed()
+        called = [e[0] for e in ev if e[2] == "send"]
+        got, took = _alone(called, list(recvs), returned=sends)
+        return [d for g, d in zip(got, took) if stepping(g, recvs[g])]
+
+    def ipc_out():
+        # From the first request on, each output timed to its first row: the
+        # server stamps each row it takes in, and the message came with its first.
+        handed()
+        if not len(sends):
+            raise ValueError("no request was sent")
+        put = sorted(p for p in puts if p[0] > sends[0])
+        rows = sorted(e[0] for e in ev if e[2] == "out" and e[0] > sends[0])
+        firsts = np.cumsum([0] + [n for _, n in put])
+        if firsts[-1] != len(rows):
+            raise ValueError(f"{len(rows)} rows taken in, not the {firsts[-1]} put")
+        return _alone([t for t, _ in put], [rows[i] for i in firsts[:-1]])[1].tolist()
+
+    heads = [e for e in ev if e[2] == "head"]
+    return {
+        "admission_s": lambda: _alone(of_client("sent"), calls)[1].tolist(),
+        "ipc_s": ipc,
+        "ipc_out_s": ipc_out,
+        "stream_s": lambda: _alone(
+            [e[0] for e in heads], of_client("acked"), [e[1] for e in heads]
+        )[1].tolist(),
+    }
 
 
 def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
