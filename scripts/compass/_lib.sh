@@ -268,17 +268,23 @@ compass_gpu_arch() {
     HIP_VISIBLE_DEVICES=$1 python -c 'import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])' 2>/dev/null
 }
 
-# compass_gpu_skips DEVICE TARGET: sets SKIP_ARGS to an --ignore for each file
-# gpu_gate_skip.txt leaves out on the first card, whose name torch reads as
-# DEVICE and whose GPU target is TARGET, and SKIP_N to the tests those files
-# collect, run from the tree being measured. A file under tests/compass goes
-# to COMPASS_LEFT instead, uncounted: the gate counts what tests/compass passes
-# on the tree. A file it cannot count fails, SKIP_WHY naming it.
+# compass_gpu_skips TARGET: sets SKIP_ARGS to an --ignore for each file
+# gpu_gate_skip.txt leaves out on GPU target TARGET, the first card's, and
+# SKIP_N to the tests those files collect, run from the tree being measured. A
+# file under tests/compass goes to COMPASS_LEFT instead, uncounted: the gate
+# counts what tests/compass passes on the tree. The line `TARGET driver-run`
+# sets NO_DRIVER_RUN. A file it cannot count fails, SKIP_WHY naming it.
 compass_gpu_skips() {
     local gpu file n
-    SKIP_ARGS=() SKIP_N=0 COMPASS_LEFT=()
+    SKIP_ARGS=() SKIP_N=0 COMPASS_LEFT=() NO_DRIVER_RUN=
     while read -r gpu file; do
-        [[ (-n $1 && $1 == *"$gpu"* || $gpu == "${2:-}") && -e $file ]] || continue
+        [ "$gpu" = "$1" ] || continue
+        if [ "$file" = driver-run ]; then
+            printf 'driver-run inputs: none on %s\n' "$gpu"
+            NO_DRIVER_RUN=1
+            continue
+        fi
+        [ -e "$file" ] || continue
         if [[ $file == tests/compass/* ]]; then
             printf 'left out on %s: %s\n' "$gpu" "$file"
             COMPASS_LEFT+=("$file")

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""`gate_gpu.sh` leaves a file `gpu_gate_skip.txt` names out on that GPU only.
+"""`gate_gpu.sh` leaves a file `gpu_gate_skip.txt` names out on that GPU target only.
 
 Each case runs the real script over a throwaway tree, as
 `test_gate_gpu_verdict_through_pipe.py` does, with a stub torch that names the
-card. The listed file's tests fail when run, standing in for a stall, and the
-baseline counts them as passes, as it counted the stalling file's.
+card's target. The listed file's tests fail when run, standing in for a stall,
+and the baseline counts them as passes, as it counted the stalling file's.
 """
 
 import os
@@ -30,7 +30,7 @@ REPO = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.skipif(BASH is None, reason="needs bash")
 
 
-def _run(tmp_path, card):
+def _run(tmp_path, target):
     root = tmp_path / "ATOM"
     # Another gate shard may be writing bytecode into __pycache__ as this copies.
     shutil.copytree(
@@ -41,7 +41,7 @@ def _run(tmp_path, card):
     files = {
         "scripts/compass/preflight.sh": _preflight(0),
         KNOWN_TXT: "\n".join(KNOWN) + "\n",
-        "scripts/compass/gpu_gate_skip.txt": "# a comment\nMI308X tests/test_stall.py\n",
+        "scripts/compass/gpu_gate_skip.txt": f"# a comment\n{target} tests/test_stall.py\n",
         "atom/__init__.py": "",
         "torch/__init__.py": _torch(),
         "tests/test_suite.py": _suite(EXPECT - 3),
@@ -58,7 +58,7 @@ def _run(tmp_path, card):
     env = {k: v for k, v in os.environ.items() if not k.startswith("COMPASS_")}
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env["PATH"]
     env["GIT_CEILING_DIRECTORIES"] = str(tmp_path)
-    env["GPU_NAME"] = card
+    env["GPU_NAME"] = "AMD Instinct MI355X"
     out = subprocess.run(
         [BASH, "-c", f"{root / GATE} 2>&1"],
         cwd=root,
@@ -72,13 +72,13 @@ def _run(tmp_path, card):
 
 
 def test_a_listed_file_is_left_out_on_its_gpu_and_off_the_expectation(tmp_path):
-    out, verdict = _run(tmp_path, "AMD Instinct MI308X")
+    out, verdict = _run(tmp_path, "gfx950")
     assert verdict == "GATE_GPU_RC=0 PASSED", out.stdout[-3000:]
-    assert "left out on MI308X: tests/test_stall.py (3 tests)" in out.stdout
+    assert "left out on gfx950: tests/test_stall.py (3 tests)" in out.stdout
     assert f"expected: {EXPECT - 3} passed" in out.stdout
 
 
 def test_a_listed_file_runs_on_another_gpu(tmp_path):
-    out, verdict = _run(tmp_path, "AMD Instinct MI355X")
+    out, verdict = _run(tmp_path, "gfx942")
     assert out.returncode == 1
     assert "first tests/test_stall.py::test_stall[0]" in verdict, verdict
