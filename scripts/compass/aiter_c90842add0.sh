@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 #
 # gpu-40's aiter: the image's aiter 41d4d8d7e with upstream aiter c90842add0's
-# csrc applied, committed, and the two modules that compile it rebuilt. Run it in
+# csrc applied, committed, and the modules that compile it rebuilt. Run it in
 # every mi355-gpu-40 cell container, after the container is created and before
 # any server starts in it:
 #
@@ -13,14 +13,15 @@
 # whose `num_local_tokens` is one short of its rows zeroes the row past its
 # stage-2 activations, and a count equal to the rows reads past `topk_ids`.
 # Its csrc, `aiter_c90842add0.patch` beside this file, applies to 41d4d8d7e
-# as is; `module_quant` and `module_moe_sorting_opus` are the modules that
-# compile those two files.
+# as is; `MODULES` are the modules that compile the files it changes.
 #
 # The commit takes a fixed author, committer, date and message, so every
 # container of the image makes the same one, `PATCHED`, which
 # `machines/mi355x-gpu40.json` pins as aiter's commit: a container that has not
 # run this reads 41d4d8d7e, and every command that checks the stack against the
-# spec refuses there. A checkout already at `PATCHED` is not committed again.
+# spec refuses there. A checkout already at `PATCHED` is not committed again,
+# and a checkout whose tracked files differ from its commit refuses, at either
+# commit: at `PATCHED` with the csrc reverted, the modules would build unpatched.
 # The modules are rebuilt for gfx950, the arch of gpu-40's cards, unless a build
 # stamp names the files a fresh process loads; the check then imports each one
 # through aiter's loader in a fresh process and requires that its file is the
@@ -49,14 +50,15 @@ PKG=$(python3 -c 'import importlib.util, os; s = importlib.util.find_spec("aiter
 ROOT=$(git -C "$PKG" rev-parse --show-toplevel) || fail "aiter at $PKG is not a git checkout"
 HEAD=$(git -C "$ROOT" rev-parse HEAD)
 
+[ "$HEAD" = "$BASE" ] || [ "$HEAD" = "$PATCHED" ] ||
+    fail "aiter at $ROOT is $HEAD, neither the image's $BASE nor $PATCHED"
+# A fresh container's layer holds the files under other stat data than the
+# image's index records, and `apply --index` refuses a stale entry.
+git -C "$ROOT" update-index -q --refresh || true
+git -C "$ROOT" diff --quiet HEAD -- ||
+    fail "aiter at $ROOT has uncommitted changes to tracked files; nothing was applied or built"
+
 if [ "$HEAD" != "$PATCHED" ]; then
-    [ "$HEAD" = "$BASE" ] ||
-        fail "aiter at $ROOT is $HEAD, neither the image's $BASE nor $PATCHED"
-    # A fresh container's layer holds the files under other stat data than the
-    # image's index records, and `apply --index` refuses a stale entry.
-    git -C "$ROOT" update-index -q --refresh || true
-    git -C "$ROOT" diff --quiet HEAD -- ||
-        fail "aiter at $ROOT has uncommitted changes to tracked files; nothing was applied"
     git -C "$ROOT" apply --index "$PATCH" || fail "the patch does not apply at $BASE"
     GIT_AUTHOR_NAME=honglie GIT_AUTHOR_EMAIL=hyi@amd.com \
         GIT_AUTHOR_DATE=2026-10-28T13:27:38Z \

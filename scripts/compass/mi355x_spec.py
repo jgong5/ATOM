@@ -9,7 +9,8 @@ no ptl directory. With COMPASS_MACHINE=mi355x-gpu40 it builds mi355-gpu-40's,
 under rocm/atom-dev nightly 20261026's stack, the first that starts
 DeepSeek-V4.1-Flash, with its aiter as `aiter_c90842add0.sh` leaves it.
 The device fragment is one DeepSeek-V4-Pro start at the nightly DPA-TP8 prefill
-side's arguments (`FLAGS`): the device, its capacity and the stack.
+side's arguments (`FLAGS`): the device, its capacity and the stack; on gpu-40,
+whose stack that start did not run, the stack is `STACK`'s.
 `probe_device.py`'s readings (`PEAKS`) add the compute and memory derates, the
 bandwidth curve, the kernel floor and the intra-node link's latency and derate.
 On crsuse2-m2m-v3-005, the network file of its rails into -013 adds the
@@ -71,7 +72,7 @@ if CRS005:
     AITER, PTL_DATE = "41d4d8d7e", "2026-10-29"
 #: On gpu-40, rocm/atom-dev nightly 20261026 (sha256 4d44267b1d5a) with its
 #: aiter 41d4d8d7e patched by `aiter_c90842add0.sh`, which commits upstream
-#: aiter c90842add0's csrc on it as 09d256420 and rebuilds the two modules that
+#: aiter c90842add0's csrc on it as 09d256420 and rebuilds the modules that
 #: compile it.
 if GPU40:
     AITER, PTL_DATE = "09d256420", "2026-10-29"
@@ -219,9 +220,14 @@ if CRS005:
     )
 
 #: On gpu-40, cards 0000:e5:00.0 and 0000:95:00.0 under nightly 20261026, its
-#: aiter unpatched: the probe runs no kernel of the two modules
-#: `aiter_c90842add0.sh` rebuilds.
+#: aiter unpatched (`PROBED_AITER`). The spec carries them to `AITER`, saying
+#: so in the peaks fragment's notes: every kernel the probe times (hipBLASLt,
+#: `aiter.gemm_a4w4`, its own Triton GEMMs) is in a module the recipe leaves
+#: byte-identical, since it rebuilds only the modules `aiter_c90842add0.sh`
+#: lists.
+PROBED_AITER = None
 if GPU40:
+    PROBED_AITER = "41d4d8d7e"
     PEAKS = (
         "2026-10-29",
         "b71c071d3",
@@ -298,6 +304,14 @@ def device_fragments() -> list[Fragment]:
         "assumed", DECLARED, "assumed", "no probe fills these", date=DATE
     )
     probed, assumed = base.peaks(PEAKS, datasheet.values, assumed)
+    if PROBED_AITER:
+        carried = (
+            f"; its record ran aiter {PROBED_AITER}, and every kernel it timed is "
+            f"byte-identical under {AITER}: aiter_c90842add0.sh rebuilds no "
+            "module that holds one"
+        )
+        notes_of = {"provenance.notes": probed.values["provenance.notes"] + carried}
+        probed = Fragment(probed.source, {**probed.values, **notes_of})
     device, stack = DEVICE, []
     if STACK:
         date, root, model, width, record = STACK

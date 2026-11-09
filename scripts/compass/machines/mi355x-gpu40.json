@@ -151,7 +151,7 @@
       "ptl",
       "peaks"
     ],
-    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at b71c071d3 | run.json's stack, one TP4 start at d698ff75e after aiter_c90842add0.sh | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples"
+    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at b71c071d3 | run.json's stack, one TP4 start at d698ff75e after aiter_c90842add0.sh | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples; its record ran aiter 41d4d8d7e, and every kernel it timed is byte-identical under 09d256420: aiter_c90842add0.sh rebuilds no module that holds one"
   },
   "device": {
     "name": "MI355X",
