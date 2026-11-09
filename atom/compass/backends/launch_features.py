@@ -13,9 +13,13 @@ the graph sets ATOM recorded in its host key's engine config under `GRAPHS`
 those sets, for a fit to check and a run to price (`HostDeviceRecurrence`).
 """
 
+import collections
+
+from atom.compass.backends.shape import sum_tokens
+
 #: The host key's engine-config field holding a recording runner's graph sets:
-#: ``architecture``, ``token``, each phase's token-graph buckets, and
-#: ``request``, each request graph's keys.
+#: ``architecture``, ``token``, each phase's token-graph buckets, ``request``,
+#: each request graph's keys, and the provider's own (`LaunchFeatures.recorded`).
 GRAPHS = "launch_graphs"
 
 
@@ -27,6 +31,11 @@ class LaunchFeatures:
     def install(self, runner) -> None:
         """Ready `runner`, a real runner just built, for `observe`."""
 
+    def recorded(self, runner) -> dict:
+        """The graph sets of `runner`'s model, once ATOM has recorded them,
+        that `predict` reads beyond `GRAPHS`' own."""
+        return {}
+
     def observe(self, runner) -> dict[str, float]:
         """Each feature's value for the step `runner` just ran."""
         return {}
@@ -37,7 +46,98 @@ class LaunchFeatures:
         return {}
 
 
-REGISTRY: dict[str, LaunchFeatures] = {}
+class DeepseekV41(LaunchFeatures):
+    """DeepSeek-V4.1's prefill launch. Its body, the layers before the
+    decoder, replays the smallest prefill token-graph bucket that holds the
+    step's tokens, or runs eagerly past the largest. Under decoder bounded
+    replay, a prefill that finishes a prompt then runs the decoder on its
+    tail, laid out for the step's `running_bs` requests: it replays the
+    decoder's request graph of that bucket, or runs eagerly where none was
+    recorded. A decode is neither: its features are 0.
+
+    `install` counts, per prefill, what replayed: the body's token graph, the
+    decoder's runs and its request graph's replays. `recorded` states the
+    decoder's request buckets, None where it does not replay. `predict` reads
+    `running_bs` off the view: `target_bs`, which ATOM's `ForwardMode.decide`
+    settles, or the requests where it pads none. A step ATOM runs eagerly for
+    a reason a view does not carry, a score workspace that does not fit one
+    band among them, is predicted otherwise and refuses its fit by name.
+    """
+
+    features = ("eager_body", "eager_tail")
+
+    def install(self, runner) -> None:
+        model, seen = _v41_model(runner), collections.Counter()
+        runner.compass_launch_seen = seen
+        body = model.early if model.replay else model.backbone
+
+        def counted(name, call):
+            def count(*args, **kwargs):
+                seen[name] += 1
+                return call(*args, **kwargs)
+
+            return count
+
+        builder = runner.attn_metadata_builder
+        prepare = builder.prepare_prefill
+
+        def prepare_prefill(*args, **kwargs):
+            # A step's counts start here. The body's token graph is made when
+            # ATOM records it (`region_graph._run_token_graph`), after
+            # `install`; the decoder's runs while recording are not a step's.
+            graph = vars(body).get("_token_graph")
+            if graph is not None and "replay" not in vars(graph):
+                graph.replay = counted("body", graph.replay)
+            seen.clear()
+            seen["prefill"] = 1
+            return prepare(*args, **kwargs)
+
+        builder.prepare_prefill = prepare_prefill
+        if model.replay:
+            model.decoder.run = counted("tail", model.decoder.run)
+            graph = model.decoder.graph
+            graph.replay = counted("tail_replays", graph.replay)
+
+    def recorded(self, runner) -> dict:
+        model = _v41_model(runner)
+        keys = model.decoder.graph.keys() if model.replay else None
+        return {"decoder": None if keys is None else sorted(map(list, keys))}
+
+    def observe(self, runner) -> dict[str, float]:
+        seen = runner.compass_launch_seen
+        prefill = bool(seen["prefill"])
+        observed = {
+            "eager_body": float(prefill and not seen["body"]),
+            "eager_tail": float(prefill and seen["tail"] > seen["tail_replays"]),
+        }
+        seen.clear()
+        return observed
+
+    def predict(self, view, graphs: dict) -> dict[str, float]:
+        if all(r.decode for r in view.requests):
+            return dict.fromkeys(self.features, 0.0)
+        tokens, decoder = sum_tokens(view.requests), graphs["decoder"]
+        tail = bool(view.produces_output) and decoder is not None
+        running_bs = view.target_bs or len(view.requests)
+        return {
+            "eager_body": float(all(n < tokens for n in graphs["token"]["prefill"])),
+            "eager_tail": float(tail and [running_bs, True] not in decoder),
+        }
+
+
+def _v41_model(runner):
+    """The V4.1 runtime model `runner` serves: the module that holds its
+    replay stages and decides whether its prefills replay the decoder."""
+    for module in runner.model.modules():
+        if hasattr(module, "decoder_replay_active"):
+            return module
+    raise ValueError(
+        f"{type(runner.model).__name__} holds no DeepSeek-V4.1 runtime model, "
+        "so its launch features cannot be observed"
+    )
+
+
+REGISTRY: dict[str, LaunchFeatures] = {"DeepseekV41ForCausalLM": DeepseekV41()}
 
 
 def provider(architecture: str | None) -> LaunchFeatures:

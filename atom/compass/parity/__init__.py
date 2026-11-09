@@ -46,7 +46,8 @@ a RapidServe engine in its `record_dir`).
 Unset, nothing is recorded. On its first step it also writes the engine its
 runner resolved to `dp<rank>.engine.json` (`README.md` says what it holds), and
 a runner with a `host_key` writes that to `dp<rank>.key.json`, with the
-graph sets ATOM recorded (`recorded_graphs`) where `launch` is written. The simulated
+graph sets ATOM recorded (`recorded_graphs`, and its launch provider's
+`recorded`) where `launch` is written. The simulated
 runner records from `NonAllocatingRunner.forward`; a real one records through
 `StepRecording`, composed into `RUNNER`, which the frontend names on a real run
 with the variable set.
@@ -371,7 +372,8 @@ def _record(runner):
             key = getattr(runner, "host_key", None)
             if key is not None:
                 if getattr(runner, "_launch", None) and runner._launch.features:
-                    graphs = {GRAPHS: recorded_graphs(runner.config)}
+                    sets = recorded_graphs(runner.config)
+                    graphs = {GRAPHS: sets | runner._launch.recorded(runner)}
                     key = {**key, "engine": {**key["engine"], **graphs}}
                 record.path.with_suffix(".key.json").write_text(json.dumps(key))
         runner._parity_record = record
