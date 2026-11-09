@@ -22,12 +22,13 @@ pytest.importorskip("triton")  # the decoder's tail gather is a Triton kernel
 import test_parity_device_window
 from test_parity_device_window import _recorded
 from test_parity_record import _config, _drive
+from test_parity_recurrence import _labelled, _law, record
 
 from atom.compass.backends.launch_features import GRAPHS, REGISTRY, stated
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_labels import Sample, label
 from atom.compass.backends.step_linear_fit import fit_host
-from atom.compass.parity import ENV, read, recorded_graphs
+from atom.compass.parity import ENV, read, recorded_graphs, recurrence
 from atom.compass.runner.overrides import HostDeviceRecurrence
 from atom.compass.runner.projection import batch_view, forward_mode
 from atom.models.deepseek_v41 import decoder_graph
@@ -319,3 +320,71 @@ def test_both_columns_are_adopted_and_priced(monkeypatch):
     rec.charge(batch, 0.01, 0.0)
     law = np.dot(host["laws"]["prefill"]["W_launch"], (1, 3500, 5))
     assert rec.segments["W_launch"] == pytest.approx(law + 70e-3, rel=0.05)
+
+
+def test_an_e_column_prices_a_busy_forward_and_leaves_an_idle_one_measured(tmp_path):
+    """`record()`'s middle chunks of 50 tokens run past a 32-token bucket: an
+    `E` column on an eager body moves the busy one's period 2 ms, and the first,
+    idle, keeps its measured wait."""
+    steps = record()
+    samples, law = _labelled(tmp_path, steps), _law()
+    bare = recurrence.priced(steps, samples, law)
+    law["host"]["key"] = {"engine": {GRAPHS: _graphs(decoder=None, buckets=(32,))}}
+    law["host"]["columns"] = {"middle": {"E": {"eager_body": 2e-3}}}
+    priced = recurrence.priced(steps, samples, law)
+
+    def residual(report):
+        return {r[0]: r[3] for r in report["failures"]}
+
+    assert residual(priced)[1] == pytest.approx(residual(bare).get(1, 0) + 2.0)
+    assert 0 not in residual(priced)
+
+
+def test_the_admission_law_is_fitted_past_the_e_column():
+    """Output prefills whose `E` is 1 ms, 5 ms more on an eager body, and 2 ms
+    and 100 ns an uncached token more where they admit a request."""
+    rng, samples, graphs = np.random.default_rng(29580), [], _graphs()
+    key = {"engine": {GRAPHS: graphs}}
+    for run in ("a", "b", "c"):
+        for i in range(120):
+            each = int(rng.integers(64, 3000))
+            view = BatchView(
+                (RequestShape(each, each, False),) * 2, produces_output=True
+            )
+            launch = V41.predict(view, graphs)
+            uncached = int(rng.integers(0, 8000)) * (i % 3 == 0)
+            admitted = (
+                (1, uncached, int(rng.integers(0, 4000))) if uncached else (0, 0, 0)
+            )
+            e = (
+                1e-3
+                + 5e-3 * launch["eager_body"]
+                + (2e-3 + 1e-7 * uncached) * (uncached > 0)
+            )
+            host = {"E": e * rng.uniform(0.995, 1.005), "W_pre": 1e-4, "W_post": 1e-4}
+            host["W_launch"] = 1e-2
+            provenance = {
+                "source": "record",
+                "run": run,
+                "requests": [i],
+                "config": key,
+            }
+            samples.append(
+                Sample(
+                    i,
+                    0,
+                    view,
+                    0.01,
+                    None,
+                    host,
+                    False,
+                    provenance,
+                    admitted=admitted,
+                    launch=launch,
+                )
+            )
+    host, _ = fit_host(samples)
+    assert host["columns"]["prefill"]["E"]["eager_body"] == pytest.approx(
+        5e-3, rel=0.05
+    )
+    assert host["admit"][:2] == pytest.approx([2e-3, 1e-7], rel=0.1)
