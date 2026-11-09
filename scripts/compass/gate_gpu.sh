@@ -188,8 +188,11 @@ if [ "$TORCH" != "$BASE_TORCH" ] || [ "$ROCM" != "$BASE_ROCM" ] || [ "$AITER" !=
     printf '         re-measured on this stack with regen_gpu_gate_baseline.sh.\n' >&2
 fi
 
-# gpu_gate_skip.txt, read for the first card's target: what it leaves out, and
-# whether that target's nodes hold the driver-run inputs below.
+# gpu_gate_skip.txt, read for the first card's target: the files whose result
+# there its pair cannot record, the kinds listed in that file's header, and
+# whether that target's nodes hold the driver-run inputs below. Each file is
+# left out of its run, and a suite file's collected tests come off the
+# expectation.
 compass_gpu_skips "$ARCH" || finish 1 "$SKIP_WHY"
 
 # The driver-run tests start ATOM's own servers on the simulated clock. Each
@@ -281,11 +284,6 @@ elif [ -d "$ROOT/tests/compass" ]; then
 else
     printf 'tests/compass: absent on this tree, so it contributes no tests.\n'
 fi
-# A file that stalls on one GPU keeps the suite from ever printing a summary,
-# and one that passes and fails at random there cannot be named in a baseline.
-# gpu_gate_skip.txt names such files per GPU target; on a matching first card
-# each is left out of its run, and a suite file's collected tests come off the
-# expectation.
 DEVICE=$(HIP_VISIBLE_DEVICES=${GPUS%%,*} python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null)
 printf 'device: %s\n' "${DEVICE:-UNKNOWN}"
 LEFT_OUT=$((SKIP_N - ${BASE_LEFT_OUT:-0}))

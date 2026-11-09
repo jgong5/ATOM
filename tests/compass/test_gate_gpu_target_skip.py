@@ -15,7 +15,7 @@ Each case runs the real script over a throwaway tree, as
 import shutil
 
 import pytest
-from test_gate_gpu_driver_run import DRIVER, _run, _tree
+from test_gate_gpu_driver_run import DRIVER, RECORD, _run, _tree
 from test_gate_gpu_verdict_through_pipe import BASH
 
 pytestmark = pytest.mark.skipif(BASH is None, reason="needs bash")
@@ -32,15 +32,23 @@ def _skip(root, *lines):
     (root / "scripts/compass/gpu_gate_skip.txt").write_text("\n".join(lines) + "\n")
 
 
+#: A tests/compass test that records its run, then fails.
+BAD = RECORD + "\n\ndef test_bad():\n    _record('bad')\n    assert 0\n"
+
+
+# With inputs the gate runs the smoke file apart from the rest of tests/compass;
+# on a driver-run target it runs tests/compass in one call.
+@pytest.mark.parametrize("more", [(), ("gfx950 driver-run",)], ids=["smoke", "one"])
 def test_a_left_out_tests_compass_file_leaves_its_run_and_not_the_expectation(
-    tmp_path,
+    tmp_path, more
 ):
     root = _tree(tmp_path)
-    (root / "tests/compass/test_bad.py").write_text("def test_bad():\n    assert 0\n")
-    _skip(root, "gfx950 tests/compass/test_bad.py")
+    (root / "tests/compass/test_bad.py").write_text(BAD)
+    _skip(root, "gfx950 tests/compass/test_bad.py", *more)
     out, verdict = _run(tmp_path, root)
     assert verdict == "GATE_GPU_RC=0 PASSED", out.stdout[-3000:]
     assert "left out on gfx950: tests/compass/test_bad.py\n" in out.stdout
+    assert "bad" not in (root / "runs.txt").read_text().split()
 
 
 def test_a_driver_run_target_sets_no_input_needs_one_card_and_accepts_its_skips(
