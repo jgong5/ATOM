@@ -1984,10 +1984,11 @@ and receives both run on the engine's step loop, and no worker takes part.
   pair is one FIFO link, and writes on different pairs never contend. FIFO per rank pair
   is measured on Mooncake TCP; under RDMA it is Compass's simplification through v1
   (owner ruling on #1179). The real sharing unit depends on the fabric:
-  - With matched rails (`ATOM_MOONCAKE_MATCHED_RAILS`, as on 005/013), a producer writes
-    through the rail engine of the consumer's HCA (`RailEnginePool.get`), so writes into
-    one decode rank share its rail across prefill engines and queue within one engine,
-    and one prefill GPU's writes stay under its cap across rails (#3051).
+  - With matched rails (`ATOM_MOONCAKE_MATCHED_RAILS`, as on the MI355X nodes crs005 and
+    crs013), a producer writes through the rail engine of the consumer's HCA
+    (`RailEnginePool.get`), so writes into one decode rank share its rail across prefill
+    engines and queue within one engine, and one prefill GPU's writes stay under its cap
+    across rails (#3051).
   - Without matched rails, it is the prefill rank's HCA set, which `_select_ib_devices`
     resolves for its GPU.
   - Either way, `MooncakeConnector._write_listener` hands each prefill rank's write
@@ -1997,7 +1998,7 @@ and receives both run on the engine's step loop, and no worker takes part.
   Effect: fan-in on a rail is priced at a lone writer's rate, so contended writes finish
   early, and decode admission and prefill's block release come early with them. It grows
   with concurrency, prefill ranks per decode rank and KV bytes. #3051 has its size on
-  005/013 and #2991 its share of TTFT at #1111's cell. Pricing rail fan-in needs every
+  those nodes and #2991 its share of TTFT at #1111's cell. Pricing rail fan-in needs every
   write into a decode rank, which its prefill ranks do not see, so decode would have to
   send prefill each write's done time, a message the real deployment never sends; #1179
   prices it after v1.
