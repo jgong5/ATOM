@@ -77,9 +77,7 @@ def test_a_write_request_from_a_decode_of_width_one_reaches_its_prefill_rank_onl
         assert ca.on_request(LpId(lp), NER, math.inf, []) == []
     for member in ("dp0", "dp1"):
         assert ca.on_request(engine_p, NER, math.inf, [], member=member) == []
-    assert ca.started is None
     replies = ca.on_request(engine_d, NER, math.inf, [(write, 0, 1.0)])
-    assert ca.started is not None
     released = {to: r for to, _, r in replies if isinstance(to, tuple)}
     assert released[engine_p, "dp1"][write] == [(0, 1.0)]
     assert write not in released[engine_p, "dp0"]

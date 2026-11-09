@@ -3,15 +3,9 @@
   "name": "mi355x-gpu40",
   "provenance": {
     "authored_by": "compass agent for jgong5",
-    "date": "2026-11-05",
+    "date": "2026-11-09",
     "origin": "mixed",
     "origins": {
-      "host.cpu.cores_physical": {
-        "origin": "probed"
-      },
-      "host.cpu.cores_logical": {
-        "origin": "probed"
-      },
       "device.name": {
         "origin": "probed",
         "model": "/shared/data/amd_int/models/DeepSeek-V4-Pro",
@@ -42,47 +36,31 @@
       },
       "device.software_pinned_to.rocm": {
         "origin": "probed",
-        "model": "/shared/data/amd_int/models/DeepSeek-V4-Pro",
-        "width": 8,
-        "source_root": "commit:b71c071d3",
-        "record": "sha256:300adea69f618f9da5fd7258c927c14000b2f247a1bad8c02bd74928b62ce787"
+        "model": "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
+        "width": 4,
+        "source_root": "commit:d698ff75e",
+        "record": "sha256:2930e1e2345ffbffe41d6a7158c1deab9ea3a3c8f5d123752588d699209e6670"
       },
       "device.software_pinned_to.aiter": {
         "origin": "probed",
-        "model": "/shared/data/amd_int/models/DeepSeek-V4-Pro",
-        "width": 8,
-        "source_root": "commit:b71c071d3",
-        "record": "sha256:300adea69f618f9da5fd7258c927c14000b2f247a1bad8c02bd74928b62ce787"
+        "model": "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
+        "width": 4,
+        "source_root": "commit:d698ff75e",
+        "record": "sha256:2930e1e2345ffbffe41d6a7158c1deab9ea3a3c8f5d123752588d699209e6670"
       },
       "device.software_pinned_to.rccl": {
         "origin": "probed",
-        "model": "/shared/data/amd_int/models/DeepSeek-V4-Pro",
-        "width": 8,
-        "source_root": "commit:b71c071d3",
-        "record": "sha256:300adea69f618f9da5fd7258c927c14000b2f247a1bad8c02bd74928b62ce787"
+        "model": "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
+        "width": 4,
+        "source_root": "commit:d698ff75e",
+        "record": "sha256:2930e1e2345ffbffe41d6a7158c1deab9ea3a3c8f5d123752588d699209e6670"
       },
       "device.software_pinned_to.torch": {
         "origin": "probed",
-        "model": "/shared/data/amd_int/models/DeepSeek-V4-Pro",
-        "width": 8,
-        "source_root": "commit:b71c071d3",
-        "record": "sha256:300adea69f618f9da5fd7258c927c14000b2f247a1bad8c02bd74928b62ce787"
-      },
-      "host.http_intake.fixed_s": {
-        "origin": "probed",
-        "model": "/shared/data/amd_int/models/DeepSeek-V4-Pro",
-        "source_root": "commit:b71c071d3",
-        "record": "sha256:163c6320f4e4793c1d153a3058649d4feb05a4cfc0ff65d30712aedfa2577373",
-        "p10": 0.0040678600071484316,
-        "p90": 0.0042950561500559375
-      },
-      "host.http_intake.per_byte_s": {
-        "origin": "probed",
         "model": "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
-        "source_root": "commit:6522636a3",
-        "record": "sha256:ca42cf60bc8759afb8fdc1c3f03449c1ac82abe01c69be13dcbcac30837aaf74",
-        "p10": 7.59695877802096e-09,
-        "p90": 8.707441989363081e-09
+        "width": 4,
+        "source_root": "commit:d698ff75e",
+        "record": "sha256:2930e1e2345ffbffe41d6a7158c1deab9ea3a3c8f5d123752588d699209e6670"
       },
       "device.memory.bandwidth_bytes_per_s": {
         "origin": "datasheet"
@@ -101,12 +79,6 @@
       },
       "interconnect.intra_node.link_bandwidth_bytes_per_s": {
         "origin": "datasheet"
-      },
-      "host.ipc.zmq_roundtrip_s": {
-        "origin": "assumed"
-      },
-      "host.ipc.shm_broadcast_s": {
-        "origin": "assumed"
       },
       "interconnect.intra_node.topology": {
         "origin": "assumed"
@@ -169,107 +141,17 @@
         "origin": "probed",
         "source_root": "commit:b71c071d3",
         "record": "sha256:020692760182d835943e2ac416f59df1abd2bb82cbe71870ce0c9f316cae436a"
-      },
-      "host.http_intake.idle_s": {
-        "origin": "probed",
-        "model": "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
-        "source_root": "commit:0cd22bcc3",
-        "record": "sha256:d90b6703f0b2c276c64fb297d715cc596acfe342cf34794002abc25e3f70cf78",
-        "p10": 0.0008107075027502436,
-        "p90": 0.0013017854022116544
-      },
-      "host.tokenizers[deepseek-v4-pro fast]": {
-        "origin": "probed",
-        "model": "/shared/data/amd_int/models/DeepSeek-V4-Pro",
-        "source_root": "tree:51d3ebe3dc638ab1b7c5d379315561895df45415",
-        "p10": {
-          "encode_fixed_s": 5.014545660789388e-06,
-          "encode_tokens_per_s": 922159.9209975092,
-          "decode_fixed_s": 9.379497620221757e-07,
-          "decode_tokens_per_s": 7540027.138309488
-        },
-        "p90": {
-          "encode_fixed_s": 5.274891335613508e-06,
-          "encode_tokens_per_s": 943663.2159021342,
-          "decode_fixed_s": 9.544734672777933e-07,
-          "decode_tokens_per_s": 7669773.6481106635
-        }
-      },
-      "host.tokenizers[deepseek-v4.1-flash fast]": {
-        "origin": "probed",
-        "model": "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
-        "source_root": "tree:51d3ebe3dc638ab1b7c5d379315561895df45415",
-        "p10": {
-          "encode_fixed_s": 5.333873294500299e-06,
-          "encode_tokens_per_s": 904995.0860915243,
-          "decode_fixed_s": 9.146640832483195e-07,
-          "decode_tokens_per_s": 7563052.499359203
-        },
-        "p90": {
-          "encode_fixed_s": 5.652676179953295e-06,
-          "encode_tokens_per_s": 919671.1514068295,
-          "decode_fixed_s": 9.497105243355169e-07,
-          "decode_tokens_per_s": 7605276.029281242
-        }
       }
     },
     "fragments": [
-      "tokenizer",
       "device",
-      "intake",
-      "lone",
+      "stack",
       "datasheet",
       "assumed",
       "ptl",
-      "peaks",
-      "idle"
+      "peaks"
     ],
-    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at b71c071d3 | one real c=256 first-turn cc-traces burst at b71c071d3 | http_intake.py lone over one V4.1-Flash cell's bodies at 6522636a3 | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples | http_intake.py idle over 64 lone requests at 0cd22bcc3"
-  },
-  "host": {
-    "cpu": {
-      "cores_physical": 128,
-      "cores_logical": 256
-    },
-    "tokenizers": [
-      {
-        "id": "deepseek-v4-pro",
-        "backend": "fast",
-        "vocab_size": 129280,
-        "fingerprint": "sha256:8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
-        "applies_to": [
-          "DeepseekV4ForCausalLM"
-        ],
-        "encode_fixed_s": 5.095851984940544e-06,
-        "encode_tokens_per_s": 928154.677576241,
-        "decode_fixed_s": 9.448314209287243e-07,
-        "decode_tokens_per_s": 7604885.925588928,
-        "derate": 1.0
-      },
-      {
-        "id": "deepseek-v4.1-flash",
-        "backend": "fast",
-        "vocab_size": 129280,
-        "fingerprint": "sha256:c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
-        "applies_to": [
-          "DeepseekV41ForCausalLM"
-        ],
-        "encode_fixed_s": 5.541538011793624e-06,
-        "encode_tokens_per_s": 912144.0796300065,
-        "decode_fixed_s": 9.358178031528548e-07,
-        "decode_tokens_per_s": 7574631.354751565,
-        "derate": 1.0
-      }
-    ],
-    "ipc": {
-      "zmq_roundtrip_s": 5e-05,
-      "shm_broadcast_s": 2e-05
-    },
-    "http_intake": {
-      "fixed_s": 0.004117017669015608,
-      "per_byte_s": 8.048014667965391e-09,
-      "idle_s": 0.001072699129032258
-    }
+    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at b71c071d3 | run.json's stack, one TP4 start at d698ff75e after aiter_c90842add0.sh | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples; its record ran aiter 41d4d8d7e, and every kernel it timed is byte-identical under 09d256420: aiter_c90842add0.sh rebuilds no module that holds one"
   },
   "device": {
     "name": "MI355X",
@@ -380,7 +262,7 @@
     "kernel_floor_s": 1.4669345021247865e-06,
     "software_pinned_to": {
       "rocm": "7.2.4",
-      "aiter": "41d4d8d7e",
+      "aiter": "09d256420",
       "rccl": "2.27.7",
       "torch": "2.10.0+rocm7.2.4.git3d3aa833"
     }

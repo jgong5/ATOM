@@ -106,7 +106,7 @@ def test_cctraces_sim_hands_pd_sim_ports_held_from_another_process(tmp_path):
     for f in bin_.iterdir():
         f.chmod(0o755)
     (tmp_path / "traces.jsonl").write_text('{"id": 0}\n')
-    (tmp_path / "run.json").write_text(json.dumps({"kv_write_req_s": 2.0**-10}))
+    (tmp_path / "run.json").write_text(json.dumps({"router_s": 2.0**-12}))
     done = subprocess.run(
         [
             "bash",
@@ -179,7 +179,7 @@ def test_cctraces_sim_holds_every_write_request_port_at_dp_above_one(tmp_path):
     for f in bin_.iterdir():
         f.chmod(0o755)
     (tmp_path / "traces.jsonl").write_text('{"id": 0}\n')
-    run = {"kv_write_req_s": 2.0**-10}
+    run = {"router_s": 2.0**-12}
     run |= {"prefill_data_parallel_size": 2, "decode_data_parallel_size": 2}
     (tmp_path / "run.json").write_text(json.dumps(run))
     done = subprocess.run(

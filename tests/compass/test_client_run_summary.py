@@ -66,7 +66,7 @@ def _serve(monkeypatch, out: Path, client_runs, served, stop=None) -> Path:
     with its client still bound after its answer. Returns the out_dir."""
     out.mkdir()
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 2.0**-10,
         "stream_s": 2.0**-9,
         "bound_s": 100.0,
@@ -220,7 +220,7 @@ def test_a_stop_after_a_client_run_leaves_that_client_runs_summary(
     LP ``+inf`` and the resigned client nothing, then writes the run summary
     from every hand-in, with no client run open no stop reason, and client
     run 0's summary not again."""
-    run = {"admission_path": "serving", "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+    run = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
     run.update(bound_s=100.0, client_runs=None, out_dir=str(tmp_path))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     authority = compass_run._RecordingAuthority(run)

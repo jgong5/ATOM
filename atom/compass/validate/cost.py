@@ -11,7 +11,7 @@ step with a law; `python -m atom.compass.validate` prices only those of the clie
 run it grades, its warmup left out, with the backend the simulated run priced with.
 
 Each step is labelled as the fit labels it, by its device time
-(`step_labels.label` under ATOM's split rule, `bound._split`, which also says
+(`step_labels.label_run` under ATOM's split rule, `bound._split`, which also says
 which steps carry no label and refuses a record without device windows), and priced by `StepLinearBackend`, `StepGridBackend` or `OpGraphBackend`. The
 error of a step is `priced / real - 1`, its target price over its target label on
 an MTP record. A step that also carries a draft label is graded again under kind
@@ -168,11 +168,13 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     `step_linear_fit.priced_rank` picks; a step the law refuses is banded as
     its rank of most tokens. Its draft is measured and priced the same way. A
     rank that ran the step as a dummy forward is priced 0 s: the step is
-    measured, priced and banded by the ranks that ran a forward. A step some
+    measured, priced and banded by the ranks that ran a forward, and a rank
+    that ran only dummy forwards adds no step. A step some
     rank lacks otherwise or cut, or whose
     ranks fall to different vectors, is counted under `cut.ranks`. Ranks whose
     records differ in length by more than the one step a stopped run leaves on
-    some ranks only are refused.
+    some ranks only are refused, and so is a record whose every rank ran only
+    dummy forwards.
     So is a record whose run.json, beside `record`, names `aiter_jit_builds`.
     """
     run = Path(record).resolve().parent / "run.json"
@@ -186,8 +188,13 @@ def cost_accuracy(record, backend, steps=None) -> dict:
             f"{record} holds rank records of {lines} lines; one run's ranks "
             "differ by at most the step a stopped run leaves on some"
         )
-    run = [step_labels.label(r, split_rule=_split)[0] for r in ranks]
-    joined, cut, _ = step_linear_fit._groups(run, "base", steps=steps)
+    run = [got for got, _ in step_labels.label_run(ranks, split_rule=_split)]
+    if not any(run):
+        raise ValueError(
+            f"{record}'s ranks ran only DP's dummy forwards: no step to price"
+        )
+    dummies = [frozenset(s["step"] for s in x if s["is_dummy_run"]) for x in records]
+    joined, cut, _ = step_linear_fit._groups(run, "base", steps=steps, dummies=dummies)
     views = [{s.step: s.view for s in rank} for rank in run]
     drafts = [{s.step: s.draft_s for s in rank} for rank in run]
     law = backend if isinstance(backend, Mapping) else None

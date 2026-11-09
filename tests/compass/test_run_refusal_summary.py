@@ -83,7 +83,7 @@ def summary(
     executor jobs given, and `scheduler` as the engine's scheduler."""
     monkeypatch.setattr(torch.distributed, "all_reduce", None)
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 0.001,
         "stream_s": 0.002,
         "bound_s": 10.0,
@@ -94,7 +94,7 @@ def summary(
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     table = compass_run.channel_table(run)
     authority = compass_run._RecordingAuthority(run)
-    authority.started = authority.finished = time.monotonic()
+    authority.finished = time.monotonic()
 
     r = runner(backend)
     for tokens in prompts:
@@ -226,7 +226,7 @@ def test_a_stub_run_reports_all_its_seconds_declared(monkeypatch, tmp_path):
     assert schedule["seconds_by_method"] == by_method(
         declared={"steps": 2, "fraction_of_predicted_seconds": pytest.approx(1.0)}
     )
-    assert out["schema_version"] == compass_run.SUMMARY_SCHEMA_VERSION == 11
+    assert out["schema_version"] == compass_run.SUMMARY_SCHEMA_VERSION == 14
     assert schedule["refusals"]["count"] == 0
     assert schedule["refusals"]["fraction_of_steps"] == 0.0
     assert out["coverage_report"] is False
@@ -257,7 +257,7 @@ def test_the_summary_counts_every_stall_diagnostic_and_says_how_the_run_ended(
     monkeypatch, tmp_path
 ):
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 0.001,
         "stream_s": 0.002,
         "bound_s": 10.0,

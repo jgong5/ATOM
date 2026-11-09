@@ -7,32 +7,32 @@ coverage kept in the JIT cache library of the server's stack.
 
 `send` plans the cell's points (`sweep_plan.plan`) from the engine files in
 ``OUT/steps`` and TRACES' traces A to B, each line one trace, counted from 0,
-with the sampling arguments client.sh's aiperf adds to every request. A record
+with the sampling arguments client.sh's aiperf adds to every request, and
+the server's two-batch overlap variables (`TBO`) to plan its splits. A record
 with no engine file for some DP rank is first sent a one-token request on each
-rank. It sends every point the library has not seen covered, writes them to
-``OUT/sweep.json`` and prints the counts; a cell with none missing sends
-nothing more.
+rank. It sends every step holding a point the library has not seen covered,
+writes the points to ``OUT/sweep.json`` and prints the counts; a cell with none
+missing sends nothing more. Under pipeline parallelism or RapidServe, where
+ATOM builds no PrefillDelayer, it plans A alone. First it refuses a server whose
+environment, read from ``/proc``, lacks a variable `pacing` sets for the ATOM
+arguments on its command line, as `compass record --sweep` starts it.
 
 A point's requests are completions of fresh token ids, each asking for its
 two output tokens and naming its DP rank, so placement needs no session
 affinity. First, and read to their end, the prompts whose KV a row reuses:
-the shared prefix, or a first turn, which the row's prompt starts with. Then,
-in this order, each group admitted before the next is sent: a blocker filling
-the engine's batched-token budget; the held requests, all at once; a second
-blocker filling the budget beside them; and each row. A budget-filling blocker
-has a step to itself, so the held requests, admitted while it runs, are
-prefilled in the step after it, and the rows queue and run as one batch in the
-next. A point sent before and still missing was not all admitted within one
-step: its first blocker spans a budget step for each request behind it, within
-half the KV pool. A row on its own prompt's chunks is one prompt, its earlier
-chunks the steps before. The DP ranks are sent in parallel, one point at a time
-each.
+the shared prefix the row's prompt starts with. Then every rank's parked
+decodes at once, each decoding before the rows follow, so the PrefillDelayer
+holds the rows until all are admitted and runs them as one batch; then the
+rows, every rank's first, each group admitted before the next is sent. A row
+on its own prompt's chunks is one prompt, its earlier chunks the steps before,
+behind a first row of the budget's rest where its context is no whole number
+of budgets. A request that fails is printed, and its point stays missing.
 
 `cover`, once the server has stopped, reads OUT's step record and adds the
 points it covers (`sweep_plan.covered`) to the library's coverage of the cell,
 ``<library>/sweep/<cell>.json``, the cell named by a digest of its planned
-points, with the points any round has sent. The cell is swept when every point is covered. It writes the points
-still missing to ``OUT/sweep.json`` and prints the counts.
+points. The cell is swept when every point is covered and B was planned. It
+writes the points still missing to ``OUT/sweep.json`` and prints the counts.
 
 The library is the one ``OUT/server.json`` names, a real server's given
 `--store`. A simulated server's is its run file's store's for this
@@ -51,11 +51,12 @@ import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from operator import attrgetter
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from atom.compass.carriers import tracestate_with
-from atom.compass.drive import jit_cache
+from atom.compass.drive import jit_cache, runfile, sweep_plan
 from atom.compass.drive.identity import _stack
 from atom.compass.drive.sweep_plan import OUTPUT_TOKENS, Point, covered, engines, plan
 from atom.compass.parity import read
@@ -63,32 +64,81 @@ from atom.compass.parity.traffic import DONE, Traffic, post
 
 #: A library's directory of cell coverage.
 COVERAGE = "sweep"
-#: Written to OUT: the library, the cell, its planned points, those sent and,
-#: after `cover`, those still missing.
+#: Written to OUT: the library, the cell, its planned points and, after
+#: `cover`, those still missing.
 STATE = "sweep.json"
 #: Simulated seconds between two groups' sends on a simulated server.
 EPS = 1e-4
 #: The token ids fresh prompts draw from, clear of every tokenizer's special
 #: tokens at either end.
 TOKENS = range(1000, 20000)
+#: The PrefillDelayer's settings a sweep server runs with: it coalesces a
+#: step's rows behind the parked decodes, released only when pending prefill
+#: tokens stop growing for 16 decode steps.
+PACING = {
+    "ATOM_ENABLE_PREFILL_DELAYER": "1",
+    "ATOM_PREFILL_DELAYER_COST_GATE": "0",
+    "ATOM_PREFILL_DELAYER_TARGET_FILL": "1.0",
+    "ATOM_PREFILL_DELAYER_STALL_TICKS": "16",
+}
+#: The variables ATOM's two-batch overlap splits a prefill step by.
+TBO = ("ATOM_TBO_PREFILL_MIN_TOKENS", "ATOM_TBO_PREFILL_TOKEN_SPLIT")
+
+
+def pacing(atom_args) -> dict[str, str]:
+    """The environment a sweep server of ATOM's arguments `atom_args` runs with:
+    `PACING`, ATOM's DP prefill balancing floor at the batched-token budget, so
+    balancing cuts no row a step admits, and at DP and PP width 1 a decode
+    interval of 1, without which ATOM builds no delayer there."""
+    engine = runfile._engine_args(atom_args)
+    floor = str(engine.max_num_batched_tokens)
+    env = PACING | {"ATOM_DP_PREFILL_BALANCE_MIN_TOKENS": floor}
+    if runfile._dp_width(atom_args) == 1 and engine.pipeline_parallel_size == 1:
+        env["ATOM_PREFILL_DECODE_INTERVAL"] = "1"
+    return env
 
 
 class _Wall:
-    """A real server: each group's requests sent at once and admitted before
-    the next group is sent, and every one read to its end."""
+    """A real server: a step's requests sent group by group, each admitted
+    before the next is sent, a parked decode once its first token came, and
+    every one read to its end; a failed request is printed, not raised."""
 
     def __init__(self, port: int) -> None:
         self.port = port
 
-    def send(self, groups: list[list[dict]]) -> None:
-        with ThreadPoolExecutor(max(1, 2 * sum(map(len, groups)))) as pool:
-            reads = []
-            for group in groups:
-                heads = [pool.submit(post, self.port, b, {}) for b in group]
-                reads += [pool.submit(list, h.result()) for h in heads]
-        for r in reads:
-            if DONE not in r.result():
-                raise RuntimeError(f"a sweep request ended before {DONE}")
+    def send(self, first, parked, groups) -> None:
+        size = len(first) + len(parked) + sum(map(len, groups))
+        with ThreadPoolExecutor(max(1, size)) as pool:
+
+            def group(bodies, token=False):
+                ready = [threading.Event() for _ in bodies]
+                ends = [pool.submit(self._read, *r, token) for r in zip(bodies, ready)]
+                for r in ready:
+                    r.wait()
+                return ends
+
+            for end in group(first):
+                end.result()
+            group(parked, token=True)
+            for bodies in groups:
+                group(bodies)
+
+    def _read(self, body: dict, ready: threading.Event, token: bool) -> None:
+        """Read the response to its end, setting `ready` once the server
+        admitted the request, with `token` once its first token came."""
+        try:
+            lines = post(self.port, body, {})
+            if token:
+                next(line for line in lines if line.startswith("data:"))
+            ready.set()
+            if DONE not in lines:
+                raise RuntimeError(f"it ended before {DONE}")
+        except Exception as e:  # noqa: BLE001 - its point stays missing
+            print(
+                f"sweep: a request failed, its point stays missing: {e}",
+                file=sys.stderr,
+            )
+        ready.set()
 
     def close(self) -> None:
         pass
@@ -96,32 +146,48 @@ class _Wall:
 
 class _Clocked(Traffic):
     """A simulated server's traffic LP: each group sent `EPS` after the one
-    before on the run's clock, and every request read to its end."""
+    before on the run's clock, a parked decode's before its first token came,
+    and every request read to its end."""
 
     def __init__(self, run: dict, port: int) -> None:
         super().__init__(run, port, [], [])
         self.rt.start_run()
         self.sent = 0
 
-    def send(self, groups: list[list[dict]]) -> None:
-        rt = self.rt
-        for group in groups:
-            at = rt.now + EPS
-            while rt.now < at:
-                rt.next_event(at)
-                self._take()
-            for body in group:
-                stamp = tracestate_with(None, *rt.stamp_send(self.http))
-                thread = threading.Thread(target=self._read, args=(body, stamp))
-                thread.daemon = True
-                thread.start()
-            self.sent += len(group)
-        while self.done < self.sent:
-            if rt.next_event(math.inf) == math.inf:
-                raise RuntimeError(
-                    f"{self.sent - self.done} sweep requests never ended"
-                )
+    def send(self, first, parked, groups) -> None:
+        self._group(first)
+        self._drain()
+        tokens = self._group(parked)
+        while not all(t.is_set() for t in tokens):
+            self._next()
+        for bodies in groups:
+            self._group(bodies)
+        self._drain()
+
+    def _group(self, bodies) -> list[threading.Event]:
+        rt, tokens = self.rt, []
+        at = rt.now + EPS
+        while bodies and rt.now < at:
+            rt.next_event(at)
             self._take()
+        for body in bodies:
+            stamp = tracestate_with(None, *rt.stamp_send(self.http))
+            tokens.append(threading.Event())
+            thread = threading.Thread(
+                target=self._read, args=(body, stamp, tokens[-1]), daemon=True
+            )
+            thread.start()
+        self.sent += len(bodies)
+        return tokens
+
+    def _next(self) -> None:
+        if self.rt.next_event(math.inf) == math.inf:
+            raise RuntimeError(f"{self.sent - self.done} sweep requests never ended")
+        self._take()
+
+    def _drain(self) -> None:
+        while self.done < self.sent:
+            self._next()
 
     def close(self) -> None:
         """Take the run's events to its +inf grant, which ends the client run,
@@ -132,11 +198,19 @@ class _Clocked(Traffic):
 
 
 def send(out, workload: dict, sender=None) -> list[Point]:
-    """Send the points of the cell `workload` and OUT's engine make that the
-    library has not seen covered, to the server ``OUT/server.json`` names, or
-    through `sender`; return them. `workload` is as `sweep_plan.plan` takes it."""
+    """Send the steps holding points of the cell `workload` and OUT's engine
+    make that the library has not seen covered, to the server
+    ``OUT/server.json`` names, or through `sender`; return those points.
+    `workload` is as `sweep_plan.plan` takes it."""
     out = Path(out)
     server = json.loads((out / "server.json").read_text())
+    argv, environ = _deployment(server["pid"])
+    wanted = pacing(argv)
+    if wrong := [f"{k}={v}" for k, v in wanted.items() if environ.get(k) != v]:
+        raise ValueError(
+            f"the server runs without {', '.join(wrong)}, which `compass record "
+            "--sweep` sets and a sweep's steps need"
+        )
     run = (
         json.loads(Path(server["run_file"]).read_text())
         if "run_file" in server
@@ -158,31 +232,33 @@ def send(out, workload: dict, sender=None) -> list[Point]:
             sender,
             lambda r: {**body, "prompt_token_ids": fresh(1), "data_parallel_rank": r},
         )
-        points = plan(out / "steps", workload)
+        engine = runfile._engine_args(argv)
+        a_only = engine.pipeline_parallel_size > 1 or engine.enable_rapidserve
+        # The plan reads its splits off this process's TBO variables.
+        for k in TBO:
+            if k in environ:
+                os.environ[k] = environ[k]
+            else:
+                os.environ.pop(k, None)
+        points = plan(out / "steps", workload, a_only)
         cell = _cell(points)
-        seen, tried = _seen(library, cell)
+        seen = _seen(library, cell)
         missing = [p for p in points if _key(p) not in seen]
         state = {
             "library": str(library),
             "cell": cell,
             "points": [_entry(p) for p in points],
-            "sent": [_key(p) for p in missing],
+            "a_only": a_only,
         }
         (out / STATE).write_text(json.dumps(state))
         print(
             f"sweep: cell {cell}: {len(points)} points planned, {len(points) - len(missing)} covered before, {len(missing)} to send"
         )
-        stated = engines(out / "steps")
-
-        def lane(rank):
-            for p in missing:
-                if p.rank == rank:
-                    yield from _phases(p, stated[rank], fresh, _key(p) in tried)
-
-        lanes = map(lane, sorted({p.rank for p in missing}))
-        for phases in itertools.zip_longest(*lanes, fillvalue=[]):
-            groups = itertools.zip_longest(*phases, fillvalue=[])
-            sender.send([[b for group in same for b in group] for same in groups])
+        stated = engines(out / "steps")[0]
+        todo = {p.step for p in missing}
+        for k, step in itertools.groupby(points, attrgetter("step")):
+            if k in todo:
+                sender.send(*_requests(list(step), stated, fresh))
     finally:
         sender.close()
     return missing
@@ -194,32 +270,31 @@ def cover(out) -> list[Point]:
     out = Path(out)
     state = json.loads((out / STATE).read_text())
     points = [
-        Point(r, tuple(map(tuple, rows)), tuple(how), held, body)
-        for r, rows, how, held, body in state["points"]
+        Point(r, tuple(map(tuple, rows)), tuple(how), held, split, step, body)
+        for r, rows, how, held, split, step, body in state["points"]
     ]
     hit, _ = covered(points, read(out / "steps"))
     path = Path(state["library"], COVERAGE, f"{state['cell']}.json")
     # ponytail: two covers of one cell at once can lose one's points; the next round sends them again.
-    seen, tried = _seen(state["library"], state["cell"])
-    seen |= {_key(p) for p in hit}
+    seen = _seen(state["library"], state["cell"]) | {_key(p) for p in hit}
     missing = [p for p in points if _key(p) not in seen]
-    tried = sorted(tried | set(state["sent"]))
-    _write(
-        path,
-        {
-            "points": len(points),
-            "covered": sorted(seen),
-            "sent": tried,
-            "swept": not missing,
-        },
-    )
+    swept = not missing and not state["a_only"]
+    _write(path, {"points": len(points), "covered": sorted(seen), "swept": swept})
     _write(out / STATE, state | {"missing": [_entry(p) for p in missing]})
     print(
         f"sweep: cell {state['cell']}: {len(hit)} of {len(points)} points covered by this record, "
         f"{len(seen)} in all, {len(missing)} missing; "
-        + ("swept" if not missing else "not swept")
+        + ("swept" if swept else "not swept")
     )
     return missing
+
+
+def _deployment(pid: int) -> tuple[list[str], dict]:
+    """The command line and environment of process `pid`, the server."""
+    proc = Path("/proc", str(pid))
+    argv = (proc / "cmdline").read_bytes().decode().split("\0")[:-1]
+    pairs = (proc / "environ").read_bytes().decode().split("\0")
+    return argv, dict(p.split("=", 1) for p in pairs if "=" in p)
 
 
 def _library(server: dict, run: dict | None) -> Path:
@@ -241,58 +316,34 @@ def _prime(steps: Path, sender, primer) -> None:
         size = json.loads(files[0].read_text())["data_parallel_size"] if files else 1
         if len(files) >= size:
             return
-        sender.send([[primer(r) for r in range(size)]])
+        sender.send([], [], [[primer(r) for r in range(size)]])
 
 
-def _phases(
-    point: Point, engine: dict, fresh, resent: bool = False
-) -> list[list[list[dict]]]:
-    """The point's requests, in groups: those whose KV a row reuses, read to
-    their end first, then the blockers, the held requests and the rows. A
-    `resent` point's first blocker spans a budget step for each request behind
-    it, within half the KV pool."""
-    body = {**point.body, "stream": True, "data_parallel_rank": point.rank}
-
-    def req(ids):
-        return {**body, "prompt_token_ids": ids}
-
-    budget = engine["max_num_batched_tokens"]
-    longest = engine["max_model_len"] - OUTPUT_TOKENS
-
-    def blockers(tokens):
-        """Prompts of `tokens` in all, none longer than the model takes, each
-        chunked on the edges of budget steps: a whole number of steps each, or
-        where the budget passes the model's length, each step's in pieces."""
-        if budget <= longest:
-            per = longest // budget * budget
-            return [req(fresh(min(per, tokens - k))) for k in range(0, tokens, per)]
-        steps = (min(budget, tokens - k) for k in range(0, tokens, budget))
-        return [
-            req(fresh(min(longest, step - k)))
-            for step in steps
-            for k in range(0, step, longest)
+def _requests(step: list[Point], engine: dict, fresh) -> tuple[list, list, list]:
+    """A step's requests: the prefixes its rows reuse, its parked decodes, and
+    its rows in groups, every rank's i-th in the i-th."""
+    first, parked, lanes = [], [], []
+    for point in step:
+        body = {**point.body, "stream": True, "data_parallel_rank": point.rank}
+        parked += [
+            {
+                **body,
+                "prompt_token_ids": fresh(1),
+                "max_tokens": sweep_plan.PARKED_TOKENS,
+            }
+            for _ in range(point.held)
         ]
-
-    first, rows = [], []
-    for (q, c), how in zip(point.rows, point.cached):
-        if how in ("prefix", "turn"):
-            before = fresh(c - q)
-            first.append(req(before))
-            rows.append([req(before + fresh(q))])
-        else:
-            rows.append([req(fresh(c))])
-    held = [req(fresh(1)) for _ in range(point.held)]
-    behind = len(held) + bool(held) + len(rows)
-    pool = engine["num_kvcache_blocks"] * engine["kv_cache_block_size"] // 2
-    steps = max(1, min(behind, pool // budget)) if resent else 1
-    main = [
-        blockers(budget * steps),
-        held,
-        blockers(budget - point.held) if held else [],
-        *rows,
-    ]
-    main = [group for group in main if group]
-    return [[first], main] if first else [main]
+        lane = []
+        for (q, c), how in zip(point.rows, point.cached):
+            ids = fresh(c)
+            if how == "prefix":
+                first.append({**body, "prompt_token_ids": ids[: c - q]})
+            elif how == "chunk" and (pad := -(c - q) % sweep_plan.budget(engine)):
+                lane.append({**body, "prompt_token_ids": fresh(pad)})
+            lane.append({**body, "prompt_token_ids": ids})
+        lanes.append(lane)
+    rows = [[r for r in group if r] for group in itertools.zip_longest(*lanes)]
+    return first, parked, rows
 
 
 def _fresh(rng: random.Random):
@@ -300,12 +351,12 @@ def _fresh(rng: random.Random):
 
 
 def _key(point: Point) -> str:
-    """What a record line matches a point by: its rank and rows."""
-    return json.dumps([point.rank, point.rows])
+    return json.dumps(sweep_plan.key(point))
 
 
 def _entry(point: Point) -> list:
-    return [point.rank, point.rows, point.cached, point.held, point.body]
+    p = point
+    return [p.rank, p.rows, p.cached, p.held, p.split, p.step, p.body]
 
 
 def _cell(points: list[Point]) -> str:
@@ -313,13 +364,10 @@ def _cell(points: list[Point]) -> str:
     return hashlib.sha256(planned.encode()).hexdigest()[:16]
 
 
-def _seen(library, cell: str) -> tuple[set[str], set[str]]:
-    """The cell's points the library has seen covered, and those sent."""
+def _seen(library, cell: str) -> set[str]:
+    """The cell's points the library has seen covered."""
     path = Path(library, COVERAGE, f"{cell}.json")
-    if not path.exists():
-        return set(), set()
-    coverage = json.loads(path.read_text())
-    return set(coverage["covered"]), set(coverage.get("sent", ()))
+    return set(json.loads(path.read_text())["covered"]) if path.exists() else set()
 
 
 def _write(path: Path, data: dict) -> None:

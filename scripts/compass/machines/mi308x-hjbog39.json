@@ -6,12 +6,6 @@
     "date": "2026-10-18",
     "origin": "mixed",
     "origins": {
-      "host.cpu.cores_physical": {
-        "origin": "probed"
-      },
-      "host.cpu.cores_logical": {
-        "origin": "probed"
-      },
       "device.name": {
         "origin": "probed",
         "model": "Qwen/Qwen3.8-27B",
@@ -68,12 +62,6 @@
         "source_root": "commit:ce625ddd9",
         "record": "sha256:e7c309168326a052460eb20e1cec1f0744415b69161e80856069339158600c52"
       },
-      "host.ipc.zmq_roundtrip_s": {
-        "origin": "assumed"
-      },
-      "host.ipc.shm_broadcast_s": {
-        "origin": "assumed"
-      },
       "device.memory.bandwidth_bytes_per_s": {
         "origin": "assumed"
       },
@@ -127,22 +115,6 @@
       },
       "device.ptl": {
         "origin": "probed"
-      },
-      "host.http_intake.fixed_s": {
-        "origin": "probed",
-        "model": "Qwen/Qwen3.8-27B",
-        "source_root": "commit:2d1d223be",
-        "record": "sha256:40da90fe439e06efa8aeb8d8b3d5a17a955c507afb6f9aa18401cbbc957739de",
-        "p10": 0.0023590643143750166,
-        "p90": 0.0026066054400923915
-      },
-      "host.http_intake.per_byte_s": {
-        "origin": "probed",
-        "model": "Qwen/Qwen3.8-27B",
-        "source_root": "commit:2d1d223be",
-        "record": "sha256:40da90fe439e06efa8aeb8d8b3d5a17a955c507afb6f9aa18401cbbc957739de",
-        "p10": 3.576250354791265e-09,
-        "p90": 5.75468059489999e-09
       },
       "interconnect.intra_node.pp.rccl.eager_threshold_bytes": {
         "origin": "probed",
@@ -227,64 +199,15 @@
         "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
         "p10": 0.38485740280609293,
         "p90": 0.7250460403446475
-      },
-      "host.tokenizers[qwen3.8-27b fast]": {
-        "origin": "probed",
-        "model": "Qwen/Qwen3.8-27B",
-        "source_root": "commit:a48f7b084f1e7c6117f4ddb9857028ea95018a36",
-        "p10": {
-          "encode_fixed_s": 1.4300296182846253e-05,
-          "encode_tokens_per_s": 652318.210911059,
-          "decode_fixed_s": 1.8899360935711552e-06,
-          "decode_tokens_per_s": 4190085.065514135
-        },
-        "p90": {
-          "encode_fixed_s": 1.5410055423647967e-05,
-          "encode_tokens_per_s": 663315.728582206,
-          "decode_fixed_s": 1.995909252850623e-06,
-          "decode_tokens_per_s": 4208875.978468032
-        }
       }
     },
     "fragments": [
-      "tokenizer",
       "device",
       "assumed",
       "ptl",
-      "intake",
       "pp"
     ],
-    "notes": "one Qwen3.8-27B TP1 start at ce625ddd9 | no probe fills these | ptl_enable | one real c=256 first-turn cc-traces burst at 2d1d223be | pp_carriers.py on two GPUs at f61652a37"
-  },
-  "host": {
-    "cpu": {
-      "cores_physical": 112,
-      "cores_logical": 224
-    },
-    "tokenizers": [
-      {
-        "id": "qwen3.8-27b",
-        "backend": "fast",
-        "vocab_size": 248077,
-        "fingerprint": "sha256:0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
-        "applies_to": [
-          "Qwen3_5ForConditionalGeneration"
-        ],
-        "encode_fixed_s": 1.4543261506474403e-05,
-        "encode_tokens_per_s": 658470.12026507,
-        "decode_fixed_s": 1.9234510038697535e-06,
-        "decode_tokens_per_s": 4195780.35883783,
-        "derate": 1.0
-      }
-    ],
-    "ipc": {
-      "zmq_roundtrip_s": 5e-05,
-      "shm_broadcast_s": 2e-05
-    },
-    "http_intake": {
-      "fixed_s": 0.002669345165336389,
-      "per_byte_s": 5.603337964226679e-09
-    }
+    "notes": "one Qwen3.8-27B TP1 start at ce625ddd9 | no probe fills these | ptl_enable | pp_carriers.py on two GPUs at f61652a37"
   },
   "device": {
     "name": "MI308X",

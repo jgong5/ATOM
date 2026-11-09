@@ -19,15 +19,18 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   ``backend`` holds the backend's ``digest`` and, for a store entry, its
   ``provenance``, with its report's as ``inputs``; a stub's, and an op graph's
   with no price list, is None, its digest over what the run file states.
-- ``--host-laws KEY``, a `host_laws` entry's params, as ``host``; without it
-  the run charges no host time.
+- ``--host-laws KEY``, a `host_laws` entry's params, as ``host``, and its
+  ``hops``, each at the run-file key of its name; without it the run charges
+  no host time and each hop its floor (`run.HOP_FLOOR_S`).
 - ``--step-linear`` and ``--host-laws`` repeat, one entry per engine config:
   the key then holds a list, each process installing its own config's entry,
+  and where their hops differ, the hops are those of the entry fitted under the
+  config ATOM's arguments resolve, as `drive.run.check` resolves one,
   and ``backend``'s digest is over every law's in any order, their provenance
   ``entries``.
 - ``--machine``, the spec; ``--store``'s root as ``store``; ``--on-refusal``;
   ``--step-roofline``; ``--padding none``, which prices a replayed graph's
-  real rows.
+  real rows; ``--local-grants``, which gives grants their ceilings.
 - Not flags: `FIXED`, and ``data_parallel_size``, read from ATOM's arguments.
   The server serves client runs until it is stopped.
 
@@ -54,27 +57,8 @@ from atom.compass.fit.publish import RANK
 
 #: Each backend flag's store kind; the step stub's coefficients are a file.
 KINDS = {run.STEP_LINEAR: Kind.STEP_LINEAR_LAW, run.STEP_GRID: Kind.STEP_GRID_BUNDLE}
-#: The API server's admission path, the lookaheads (`single_engine_table`) and
-#: a simulated-time bound past any run's. Each lookahead is a median measured
-#: on hjbog-srdc-18 by `scripts/compass/http_intake.py hops` over parity
-#: workload requests sent one at a time: ``ipc_s``, a ZMQ request's send to the
-#: engine's receipt, and ``ipc_out_s``, an engine output's put to the server's
-#: receipt, both while a long request keeps the engine decoding; ``stream_s``,
-#: an SSE response's head sent to the client reading it.
-FIXED = {
-    "admission_path": "serving",
-    "ipc_s": 107e-6,
-    "ipc_out_s": 244e-6,
-    "stream_s": 159e-6,
-    "bound_s": 1e7,
-}
-#: A prefill-decode run's write-request lookahead: decode's send call to
-#: prefill's receipt, measured on hjbog-srdc-18 by
-#: `scripts/compass/http_intake.py pd` over real TP1 1P1D runs, the p10 of the
-#: receipts that found prefill inside a forward. The hop is priced
-#: uncontended: a receipt waits on prefill's worker freeing the GIL, mostly
-#: during kernel launches, which is ATOM's to fix.
-KV_WRITE_REQ_S = 106e-6
+#: A simulated-time bound past any run's.
+FIXED = {"bound_s": 1e7}
 #: A law file's host laws and their fit report, which are not its step law.
 HOST_MEMBERS = ("host", "host_fit")
 
@@ -95,6 +79,7 @@ def add_arguments(parser) -> None:
     parser.add_argument("--on-refusal", choices=("mark", "abort"), default="mark")
     parser.add_argument("--step-roofline", action="store_true")
     parser.add_argument("--padding", choices=("none",))
+    parser.add_argument("--local-grants", action="store_true")
 
 
 def build(args, atom_args) -> dict:
@@ -109,6 +94,7 @@ def build(args, atom_args) -> dict:
         "store": str(store.root),
         "on_refusal": args.on_refusal,
         "step_roofline": args.step_roofline,
+        run.LOCAL_GRANTS: args.local_grants,
     }
     # Read as the runner and `compass fit` read it, so a spec they would
     # refuse refuses before a server starts.
@@ -159,6 +145,7 @@ def build(args, atom_args) -> dict:
     if args.host_laws:
         hosts = [_host(store, k) for k in args.host_laws]
         out["host"] = hosts if len(hosts) > 1 else hosts[0]
+        out |= _hops(hosts, atom_args)
     if args.padding:
         out["padding"] = args.padding
     return out
@@ -168,9 +155,10 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     """The run file `build` builds from `args` for one prefill and one decode
     instance, started with ATOM's arguments `prefill_args` and `decode_args`:
     each side's DP width read from its own, the router's per-request forward
-    cost the machine spec's ``interconnect.router_relay_s``, the KV transfers
-    priced on the spec's `kv_link`, ``intra_node`` for two instances on one node
-    and ``inter_node`` across two, and `KV_WRITE_REQ_S`. A price list the
+    cost the machine spec's ``interconnect.router_relay_s``, and the KV
+    transfers priced on the spec's `kv_link`, ``intra_node`` for two instances
+    on one node and ``inter_node`` across two. Its hops are the prefill side's
+    host entry's, its ``decode_hops`` the decode side's. A price list the
     prefill side names that is not the decode side's refuses."""
     out = build(args, prefill_args)
     if run.PRICE_LIST in out:
@@ -183,11 +171,28 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     del out["data_parallel_size"]
     out[run.DP_WIDTHS["P"]] = _dp_width(prefill_args)
     out[run.DP_WIDTHS["D"]] = _dp_width(decode_args)
+    if hosts := run.entries(out, "host"):
+        out[run.DECODE_HOPS] = _hops(hosts, decode_args)
     return out | {
         "router_s": run._machine(out).value("interconnect.router_relay_s"),
-        "kv_write_req_s": KV_WRITE_REQ_S,
         "kv_link": kv_link,
     }
+
+
+def _hops(hosts: list, atom_args) -> dict:
+    """The ``hops`` of the entry of `hosts` fitted under the config ATOM's
+    arguments `atom_args` resolve, as the runner takes its own; the hops every
+    entry states alike as they are, with no config resolved."""
+    host = hosts[0]
+    if any(h.get("hops") != host.get("hops") for h in hosts):
+        from atom.compass.drive.run import _config
+        from atom.compass.run.step_grid import keyed
+
+        engine = keyed(_config(atom_args))
+        host = run._fitted_here(
+            hosts, engine, lambda e: e.get("key", {}).get("engine"), "host"
+        )
+    return host.get("hops", {})
 
 
 def _dp_width(atom_args) -> int:

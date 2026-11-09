@@ -97,7 +97,7 @@ def _priced_here(monkeypatch, drafter=None):
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
     monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
     monkeypatch.setattr("atom.compass.run.modules.drafter", lambda config: None)
-    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: graph)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: graph)
     monkeypatch.setattr("atom.compass.run._file_digest", lambda *a: "sha256:m")
     monkeypatch.setattr("atom.compass.run.step_grid.keyed", lambda *a, **k: {})
     monkeypatch.setattr(project, "_each", lambda jobs: [project.cell(*j) for j in jobs])
@@ -132,8 +132,8 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
     # The assumed gfx1250 device the graphs were traced at: 256 CUs, B0.
     declared = {"capture.compute_units": 256, "capture.revision": 1}
     assert declared.items() <= doc["assumed"].items()
-    assert mi455.origin("host.ipc.zmq_roundtrip_s")["origin"] == "assumed"
-    for unread in ("host.ipc.zmq_roundtrip_s", "device.compute.bf16_flops"):
+    assert mi455.origin("interconnect.router_relay_s")["origin"] == "assumed"
+    for unread in ("interconnect.router_relay_s", "device.compute.bf16_flops"):
         assert unread not in doc["assumed"]
     # Each assumed ratio and the kernel floor read, every cell priced again at
     # 0.8 and 1.2 of it.
@@ -153,7 +153,7 @@ def test_a_cell_under_a_drafter_states_the_drafters_seconds_apart(
 ):
     mtp1 = SimpleNamespace(num_speculative_tokens=1, use_dspark=lambda: False)
     _priced_here(monkeypatch, mtp1)
-    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: drafted)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: drafted)
     line = {"rows": [[2, 900, True]] * 2, "rung": 2, "d_target_ns": 10**9}
     decode = ran(tmp_path / "mtp", [line])
 
@@ -232,7 +232,7 @@ def test_a_ratio_times_its_factor_is_capped_at_the_datasheet_and_says_so():
 def test_the_band_ranks_the_cells_again_at_each_ratio_one_at_a_time(monkeypatch):
     bf16, link = "device.compute.derate.bf16", "interconnect.intra_node.derate"
     mi455 = spec(MI455)
-    machine = MachineSpec(mi455.values | {link: 0.9}, mi455.tokenizers)
+    machine = MachineSpec(mi455.values | {link: 0.9})
 
     def rates(jobs):
         """Each cell's tokens a second, read off the spec it was priced on."""
