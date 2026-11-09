@@ -49,13 +49,15 @@ a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
 HCA decode workspace an `HCA_DECODE` slot names, or of the buffer
-`V4_METADATA` names for a DeepSeek-V4 slot, refused when it is not live, a
-prefill's index list whole (`V4_LISTS`), or,
+`V4_METADATA` names for a DeepSeek-V4 slot, or beside a DeepSeek-V4 CSA
+layer `V4_SHARED`, or ATOM's batch-id build's repeats (`BATCH_IDS`), refused
+when it is not live, a prefill's index list whole (`V4_LISTS`), or,
 when live, `V41_NAMES`' for a DeepSeek-V4.1 slot at its ratio (`_ratio`),
 whose step and scorer workspace are live too; a leaf of the drafter's alone
 takes what ATOM passes a drafter (`DRAFTER_NAMES`) and, of a pass of its own,
 the entry of ATOM's `batch_info` stating its real rows; an integer the capture
-found affine in a decode step's context is taken at the point's; a module or
+found affine in a decode step's context is taken at the point's, and the
+batch-id build's length is the point's KV tokens (`_summed`); a module or
 context key is the one each instance names, its module's meta parameters
 moved to the device and filled as `--load_dummy xavier` fills them (`_fill`),
 and a runner attribute this runner's own; a KV tensor is a view of a tensor
@@ -267,6 +269,13 @@ TOKEN_IDS = {
     ("aten.embedding.default", "indices"),
     ("aiter.masked_embedding.default", "x"),
 }
+#: ATOM's batch-id build (`build_batch_ids_device`), the one repeat its input
+#: preparation runs, past cached tokens or under TBO, by operator and slot, and
+#: what it repeats each row's id by: the row's context, `context_lens` widened
+#: to int64 as the build widens it, into their sum (`_summed`). Bound by size,
+#: a point past cached tokens repeated another int64 buffer into the length of
+#: the capture, which caches none, and its measuring process died.
+BATCH_IDS = {("aten.repeat_interleave.self_Tensor", "repeats"): "context_lens.long"}
 #: Weight slots, and a named module's tensors, a leaf reads a row a token of:
 #: RoPE's cos and sin tables, indexed by each token's position (or by each
 #: compressed position, at most one a token), never read whole.
@@ -404,6 +413,16 @@ V41_NAMES = {
     },
     ("aiter.fused_moe_.default", "num_local_tokens"): "scheduled_tokens_gpu",
     ("aiter.topk_gating_fwd.default", "num_valid_rows"): "scheduled_tokens_gpu",
+}
+#: DeepSeek-V4's arguments, keyed and bound as `V4_METADATA`'s, to operators
+#: other models run too, which a runner binds so only beside a DeepSeek-V4 CSA
+#: layer (`Stub.csa`): its window write's state slots, which DeepSeek-V4.1
+#: passes its step's (`V41_NAMES`), and its FP8 indexer's prefill row starts,
+#: `cu_committed[batch_id_per_q_token]`. Bound by size, the slots were a count
+#: and the gather's indices another index list, past the slots and the rows.
+V4_SHARED = {
+    (_SWA, "state_slot_per_seq"): "state_slot_out",
+    ("aten.index.Tensor", "indices"): "batch_id_per_q_token",
 }
 #: A drafter's arguments, keyed as `V4_METADATA`'s, that ATOM passes it from
 #: buffers no leaf of a target takes: each row's anchor among its sampled
@@ -865,6 +884,10 @@ class Stub:
             ),
             None,
         )
+        # the buffers ATOM passes a slot by name, DeepSeek-V4's shared ones
+        # beside its CSA layer alone
+        self.names = V4_METADATA | BATCH_IDS
+        self.names |= V4_SHARED if self.csa is not None else {}
 
     def _prepare(self, batch) -> None:
         """`batch` prepared by ATOM's runner as its forward prepares one, no
@@ -924,6 +947,8 @@ class Stub:
             named["num_cached_tokens"] = torch.tensor(
                 cached, dtype=torch.int32, device=device
             )
+            if (lens := named.get("context_lens")) is not None:
+                named["context_lens.long"] = lens.long()
         # a drafter's pass of rows of its own counts its real rows at the entry
         # of ATOM's `batch_info` stating them, as the drafter publishes its shape
         info = self.runner.forward_vars.get("batch_info")
@@ -951,7 +976,7 @@ class Stub:
                         pool, what = {field: work[field]}, "HCA workspace"
                     ratio = _ratio(op, path, self.known)
                     key = op["op"], _keyed(op["args"], path)
-                    if wanted := V4_METADATA.get(key):
+                    if wanted := self.names.get(key):
                         what = wanted.format(
                             ratio=ratio,
                             kind=V4_KINDS.get(ratio),
@@ -1059,6 +1084,7 @@ class Stub:
         if shape.phase != "decode" and self.paged:
             wide = [-(-max(r[i] for r in rows) // rule.block_size) for i in (0, 1)]
             found = {s: (_widened(op, wide), at) for s, (op, at) in found.items()}
+        found = {s: (_summed(op, rows), at) for s, (op, at) in found.items()}
         view = {"rows": rows, "produces_output": True}
         blocks = sum(-(-row[1] // rule.block_size) for row in rows)
         kv = _forward_kv_cache_context.kv_cache_data
@@ -1764,6 +1790,15 @@ def _widened(op, blocks) -> dict:
             stride[0] = stride[0] // blocks[0] * blocks[1]
         shape[1] = shape[1] // blocks[0] * blocks[1]
     return op
+
+
+def _summed(op, rows) -> dict:
+    """`op`, when it is the batch-id build (`BATCH_IDS`), with its length the
+    sum of `rows`' contexts, which it repeats: the point's KV tokens."""
+    repeats = op["args"].get("repeats")
+    if (op["op"], "repeats") not in BATCH_IDS or repeats.get("role") != "metadata":
+        return op
+    return {**op, "args": op["args"] | {"output_size": sum(r[1] for r in rows)}}
 
 
 def _written(op, path) -> str | None:
