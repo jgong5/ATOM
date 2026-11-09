@@ -3268,6 +3268,60 @@ def test_a_calls_kernels_are_what_two_profiles_in_a_row_name(
         assert ops._identity(None, {}) == (got, 1.0)
 
 
+GEMM, COPIED = "gemm_a8w8_blockscale", "Memcpy DtoD (Device -> Device)"
+
+
+def _timed(monkeypatch, cold_ns):
+    """`Stub._time`'s record of a leaf of one copy whose graph times `cold_ns`
+    a call."""
+    monkeypatch.setattr(ops, "_together", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    stub = ops.Stub(_Runner(), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_replay", return_value=[cold_ns] * ops.REPEATS),
+    ):
+        return stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], 1)
+
+
+@pytest.mark.parametrize(
+    "profiles, cold_ns, got",
+    [
+        # two profiles in a row recorded nothing of a GEMM its graph timed
+        ([[], [], [], [GEMM], [GEMM]], 1.0, [GEMM]),
+        ([[]] * 6, 1.0, None),
+        ([[], []], 0.0, []),  # a view: its graph is empty
+        ([[COPIED]] * 4, 1.0, []),  # a copy alone: no kernel, yet device work
+    ],
+)
+def test_a_leaf_its_graph_times_names_the_kernels_two_profiles_recorded(
+    profiles, cold_ns, got, monkeypatch
+):
+    # A profile holds the device events ROCm's profiler recorded of one call.
+    left = iter(profiles)
+    cuda = torch.autograd.DeviceType.CUDA
+    span = SimpleNamespace(start=0, elapsed_us=lambda: 1.0)
+
+    @contextlib.contextmanager
+    def profile(activities):
+        names = next(left)
+        yield SimpleNamespace(
+            events=lambda: [
+                SimpleNamespace(name=n, device_type=cuda, time_range=span)
+                for n in names
+            ]
+        )
+
+    monkeypatch.setattr("torch.profiler.profile", profile)
+
+    if got is None:
+        with pytest.raises(ValueError, match="no two profiles in a row of 4"):
+            _timed(monkeypatch, cold_ns)
+    else:
+        assert _timed(monkeypatch, cold_ns)["kernels"] == got
+
+
 def test_a_batch_takes_the_blocks_and_slots_it_is_placed_at(rule):  # noqa: F811
     line = _line([[1, 40, True], [1, 17, True]])
 

@@ -123,7 +123,10 @@ one each time after a read of `COLD` times the last-level cache outside the
 timing, the host idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
-aside, are the point's kernel identity. When `ReplayRule` refuses a batch, its
+aside, are the point's kernel identity, read from two profiles in a row that
+name the same; a profile that recorded nothing of a call whose cold graph
+timed device work missed it, and the call is profiled again, refused when no
+two profiles name its kernels. When `ReplayRule` refuses a batch, its
 leaves refuse; an error in ATOM's preparation fails the run, naming the point.
 The points run in a process of their own on each GPU, which dies when its
 device faulted (`_alive`); one that dies ends every rank, keeps the points
@@ -240,6 +243,8 @@ GRAPH_NS = 10_000_000
 #: Profiles of one call taken at most until two in a row name the same kernels:
 #: a profile can drop a call's kernel or keep a kernel launched before it.
 PROFILES = 4
+#: How the profiler's name of a memory copy's device activity starts.
+COPY = "Memcpy"
 #: Times over the last-level cache the copies' bytes pass, and the bytes read
 #: before each cold replay: just past it, part of them stays there, and an
 #: MI308X GEMM read up to 7% fast.
@@ -1325,7 +1330,8 @@ class Stub:
         activations, then copy `c mod n` with the c-th weight up to the
         leaf's occurrences when it takes one, at most K, each replay after one
         read of `flush`; and, when K is `CALLS`, warm over one, with no read;
-        with its kernels. Every rank's graph holds the most K
+        with its kernels, profiled again on every rank when any rank's named
+        none of a call its cold graph timed. Every rank's graph holds the most K
         any rank's call gives, and a leaf any rank refuses, every rank does."""
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
@@ -1379,6 +1385,10 @@ class Stub:
             cycle = [calls[i % n] for i in range(k)]
             cold = _replay(fn, cycle, self.flush)
             warm = _replay(fn, calls[:1] * k) if n > 1 and k == CALLS else None
+            # two profiles that named nothing of a call its graph timed missed it
+            if agreed(int(not kernels and any(cold)), cpu_group(), most=True):
+                forward_context._forward_context = calls[0][1]
+                kernels = _identity(fn, calls[0][0], timed=any(cold))[0]
         finally:
             forward_context._forward_context = forward_context.ForwardContext()
         medians = statistics.median(cold), warm and statistics.median(warm)
@@ -2110,18 +2120,22 @@ def _on_coordinator(name: str, fn):
     return call
 
 
-def _identity(fn, kwargs) -> tuple[list[str], float]:
-    """`_kernels` of one call of `fn` once two profiles in a row name the same
-    kernels on every rank, at most `PROFILES`; refused on every rank together
-    when no two do."""
+def _identity(fn, kwargs, timed=False) -> tuple[list[str], float]:
+    """`_kernels` of one call of `fn`, memory copies aside, once two profiles
+    in a row name the same kernels on every rank, at most `PROFILES`; refused
+    on every rank together when no two do. Of a call whose graph `timed`
+    device work, a profile that recorded none, kernel or copy, missed the
+    call and agrees with no other."""
     from atom.compass.bench.ranks import agreed, cpu_group
 
     last = None
     for _ in range(PROFILES):
         names, ns = _kernels(fn, kwargs)
-        if agreed(int(names == last), cpu_group()):
-            return names, ns
-        last = names
+        kernels = [n for n in names if not n.startswith(COPY)]
+        seen = None if timed and not names else kernels
+        if agreed(int(seen is not None and seen == last), cpu_group()):
+            return seen, ns
+        last = seen
     raise ValueError(
         f"no two profiles in a row of {PROFILES} named the same kernels; "
         f"the last named {names}"
@@ -2129,10 +2143,11 @@ def _identity(fn, kwargs) -> tuple[list[str], float]:
 
 
 def _kernels(fn, kwargs) -> tuple[list[str], float]:
-    """The kernels one call of `fn` launches, in order, and their device time
-    in ns: its device activity except memory copies, which the profiler
-    records at some calls of a leaf and misses at others; started on every
-    rank together (`_together`), once the device has finished `_together`'s
+    """The kernels one call of `fn` launches, in order, or its memory copies
+    when it launches no kernel, and the kernels' device time in ns: beside a
+    kernel its memory copies are left out, which the profiler records at
+    some calls of a leaf and misses at others; started on every rank
+    together (`_together`), once the device has finished `_together`'s
     all-reduce, which would otherwise join the call's kernels."""
     from torch.profiler import ProfilerActivity, profile
 
@@ -2142,14 +2157,12 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
         fn(**kwargs)
         torch.cuda.synchronize()
     device = [
-        e
-        for e in prof.events()
-        if e.device_type == torch.autograd.DeviceType.CUDA
-        and not e.name.startswith("Memcpy")
+        e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
     ]
     device.sort(key=lambda e: e.time_range.start)
-    ns = 1e3 * sum(e.time_range.elapsed_us() for e in device)
-    return [e.name for e in device], ns
+    kernels = [e for e in device if not e.name.startswith(COPY)]
+    ns = 1e3 * sum(e.time_range.elapsed_us() for e in kernels)
+    return [e.name for e in kernels or device], ns
 
 
 def _replay(fn, calls, flush=None) -> list[float]:
