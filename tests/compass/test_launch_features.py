@@ -142,7 +142,7 @@ def test_without_a_provider_the_fit_adopts_and_reports_nothing_new():
     )
 
 
-def test_a_column_naming_a_feature_its_provider_lacks_is_refused():
+def test_a_column_is_refused_where_it_cannot_be_priced():
     columns = {"prefill": {"W_launch": {"eager": EAGER_S}}}
     with pytest.raises(ValueError, match=r"\['eager'\], which .* LaunchFeatures"):
         HostDeviceRecurrence({}, (), lambda: 0.0, columns=columns, launch=stated({}))
@@ -151,6 +151,8 @@ def test_a_column_naming_a_feature_its_provider_lacks_is_refused():
     rec = HostDeviceRecurrence(laws, (), lambda: 0.0, columns=columns, launch=launch)
     with pytest.raises(CostRefused, match=r"no law for prefill\.W_launch\.eager"):
         rec.charge(_batch(4000), 0.01, 0.0)
+    with pytest.raises(ValueError, match="pipeline stage"):
+        HostDeviceRecurrence(laws, (), lambda: 0.0, (0, 2), columns=columns, launch=launch)
 
 
 @pytest.mark.parametrize("architectures", [[ARCH], ["OtherForCausalLM"]])

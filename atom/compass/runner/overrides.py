@@ -340,7 +340,8 @@ class HostDeviceRecurrence:
     and fitted no law for them, and `device_end` refuses a forward that admits.
     `columns[kind][segment]` prices launch features, a batch's `compass_launch`,
     which its caller sets from `predicted`; `launch`, the provider and graph
-    sets predicting them, refuses a column naming a feature it lacks.
+    sets predicting them, refuses a column naming a feature it lacks; a
+    pipeline stage refuses any column.
     """
 
     def __init__(
@@ -362,6 +363,11 @@ class HostDeviceRecurrence:
             raise ValueError(
                 f"the host laws adopt launch features {lacks}, which this model's "
                 f"launch provider, {type(launch[0]).__name__}, does not declare"
+            )
+        if self.columns and stage is not None:
+            raise ValueError(
+                "the host laws adopt launch columns, and a pipeline stage posts "
+                "its receive at a prepare end `pp_recv_posted` prices without them"
             )
         ring = 2 if stage is None else stage[1]
         self.ends = collections.deque([-math.inf] * ring, maxlen=ring)  # n-ring..n-1
