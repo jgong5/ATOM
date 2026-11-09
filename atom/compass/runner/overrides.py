@@ -338,6 +338,10 @@ class HostDeviceRecurrence:
     `compass_admitted`, adds what its admissions cost to its `E`, except on a
     pipeline stage that receives its input; None, a fit that priced them apart
     and fitted no law for them, and `device_end` refuses a forward that admits.
+    `columns[kind][segment]` prices launch features, a batch's `compass_launch`,
+    which its caller sets from `predicted`; `launch`, the provider and graph
+    sets predicting them, refuses a column naming a feature it lacks; a
+    pipeline stage refuses any column.
     """
 
     def __init__(
@@ -349,9 +353,22 @@ class HostDeviceRecurrence:
         mtp=False,
         sync=False,
         admit=ADMISSION_IN_E,
+        columns=None,
+        launch=(None, None),
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
-        self.admit = admit
+        self.admit, self.columns, self.launch = admit, columns or {}, launch
+        named = {f for v in self.columns.values() for c in v.values() for f in c}
+        if lacks := sorted(named - set(getattr(launch[0], "features", ()))):
+            raise ValueError(
+                f"the host laws adopt launch features {lacks}, which this model's "
+                f"launch provider, {type(launch[0]).__name__}, does not declare"
+            )
+        if self.columns and stage is not None:
+            raise ValueError(
+                "the host laws adopt launch columns, and a pipeline stage posts "
+                "its receive at a prepare end `pp_recv_posted` prices without them"
+            )
         ring = 2 if stage is None else stage[1]
         self.ends = collections.deque([-math.inf] * ring, maxlen=ring)  # n-ring..n-1
         self.last = None if stage is None else stage[0] == stage[1] - 1
@@ -398,6 +415,14 @@ class HostDeviceRecurrence:
         out = any(OUT_SEGMENT in v for v in self.laws.values())
         ran += (OUT_SEGMENT,) if out else ()
         missing = [f"{kind}.{s}" for s in ran if s not in {*law, *self.skip}]
+        features = getattr(batch, "compass_launch", None) or {}
+        columns = self.columns.get(kind, {})
+        missing += [
+            f"{kind}.{s}.{f}"
+            for s in ran
+            for f in columns.get(s, ())
+            if f not in features
+        ]
         a = getattr(batch, "compass_admitted", None)
         if self.admit is None and a and a[0] and not self.recv and "E" not in self.skip:
             missing.append("admit")
@@ -408,7 +433,8 @@ class HostDeviceRecurrence:
             raise CostRefused(kind, [Refusal("host", f"no law for {named}")])
         now = self.now()
         called, meta = getattr(batch, "compass_pp_host", (now, -math.inf))
-        prepared, self.segments = self.prepare_end(called, kind, x, self.admit_s(batch))
+        admit_s = self.admit_s(batch)
+        prepared, self.segments = self.prepare_end(called, kind, x, admit_s, features)
         self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)
@@ -423,6 +449,12 @@ class HostDeviceRecurrence:
         queued = launch_end if self.sync else self._exit(self.target_end)
         return max(self.target_end, queued) + draft_s
 
+    def predicted(self, view: Any) -> dict:
+        """A step's launch features by `launch`'s provider, from its
+        `BatchView` `view`; none where no law adopts a column."""
+        provider, graphs = self.launch
+        return provider.predict(view, graphs) if self.columns else {}
+
     def admit_s(self, batch: Any) -> float:
         """What `batch`'s admissions add to its `E`."""
         from atom.compass.backends.step_labels import admit_x
@@ -433,13 +465,19 @@ class HostDeviceRecurrence:
         return float(np.dot(self.admit, admit_x(a)))
 
     def prepare_end(
-        self, called: float, kind: str, x: tuple, admit_s: float = 0.0
+        self, called: float, kind: str, x: tuple, admit_s: float = 0.0, features=None
     ) -> tuple[float, dict]:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
-        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`."""
-        law = self.laws.get(kind, {})
+        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, and each column a segment
+        adopts prices `features`' value of its feature, 0 where absent."""
+        law, columns = self.laws.get(kind, {}), self.columns.get(kind, {})
+        features = features or {}
         seg = {
-            s: (float(np.dot(law.get(s, (0, 0, 0)), x)) + admit_s * (s == "E"))
+            s: (
+                float(np.dot(law.get(s, (0, 0, 0)), x))
+                + admit_s * (s == "E")
+                + sum(c * features.get(f, 0.0) for f, c in columns.get(s, {}).items())
+            )
             * (s not in self.skip)
             for s in SEGMENTS
         }
@@ -1730,6 +1768,8 @@ def _group_step_seconds(
             view = batch_view(batch, mode, runner, dummies)
         elif view.dp_rank is not None:
             view = dataclasses.replace(view, group_dummies=dummies)
+        if isinstance(host, HostDeviceRecurrence):
+            batch.compass_launch = host.predicted(view)
         cost = backend.price(view)
         if spec and not cost.draft_terms and EAGER_DP_DUMMY not in cost.treatments:
             name = type(backend).__name__
