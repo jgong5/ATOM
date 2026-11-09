@@ -201,9 +201,9 @@ def stamped(
     thread's CPU time `IDLE + PER_BYTE x bytes` and its wall that plus
     `WAIT`, besides `OTHERS` of others' work on the loop while its pool job runs,
     its pool job holding its call of `encodes`, an ``encode_batch`` inside a
-    segment tokenizer call, and a decode after its
-    send, each timed at `rates`; then calls that do not run lone, ten times
-    slower, and one burst of `burst`'s body sizes, its templates
+    segment tokenizer call (one of which another thread's decode overlaps), and
+    a decode after its send, each timed at `rates`; then calls that do not run
+    lone, ten times slower, and one burst of `burst`'s body sizes, its templates
     `FIXED + PER_BYTE x bytes` of the loop's CPU time apart."""
     calls, lines = [], [_stamp("app", 10**12 + 5, 10**12 + 5)]  # a health probe
 
@@ -230,6 +230,9 @@ def stamped(
         t += 10**9
         loop = round((IDLE + PER_BYTE * size) * 1e9) + OTHERS
         done = call(*encode, t + 20_000)
+        if encode == ("encode_batch", 7, 90_000):
+            # Another thread's call inside the segment call's own work: not lone.
+            call("decode", 1, 2, t + 21_000, thread=4)
         lines += [
             _stamp("app", t, t, cpu=(cpu, cpu)),
             _stamp("recv", t + 1100, t + 1900, 0, (cpu + 1100, cpu + 1900)),
@@ -319,13 +322,14 @@ def test_a_record_s_tokenizer_calls_and_intake_stamps_fit_the_entry_s_terms(
         {"fixed_s": SEGMENT[0], "tokens_per_s": SEGMENT[1]}, rel=1e-3
     )
     # Only the lone calls are fitted: each lone request's encode and decode, and
-    # its segment tokenizer call, lone among the calls it did not make.
+    # its segment tokenizer call, lone among the calls it did not make: not the
+    # one another thread's decode overlaps.
     fitted = {k: report["tokenizer"][k] for k in compass_run.TOKENIZER_KINDS}
     assert {k: v["samples"] + v["dropped"] for k, v in fitted.items()} == {
         "encode": 4,
         "encode_batch": 4,
         "decode": 8,
-        "segment": 5,
+        "segment": 4,
     }
     run_file(tmp_path, monkeypatch, host=host)
     assert compass_run.http_intake() == (
