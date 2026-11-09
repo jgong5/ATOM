@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""`compass measure ops` on a DeepSeek-V4-Pro DPA-TP8 rank's decode, off the
-card: its graph traced on a declared MI355X, each leaf taken through
-`ops.measure` and `Stub.point` on ATOM's own runner, KV allocation and
+"""`compass measure ops` on a DeepSeek-V4-Pro DPA-TP8 rank's decode and
+prefill, off the card: its graph traced on a declared MI355X, each leaf taken
+through `ops.measure` and `Stub.point` on ATOM's own runner, KV allocation and
 metadata builder up to its launch (`v41_ops_rehearsal.py`), at one row of
-1024 tokens.
+1024 tokens, or one row's prefill past as many.
 
 V4-Pro's KV allocation binds its planes on the runner, and its builder caches
 a view of each plane's rows for each state slot; a leaf bound to such a view
@@ -18,7 +18,17 @@ import shutil
 
 import pytest
 from test_bench_ops_v41_rehearsal import HARNESS, _run
-from test_capture_v4_pro import CONFIG, DECODE, DPA_TP8, LAYERS, QKN, trace
+from test_capture_v4_pro import (
+    BF16_PREFILL,
+    CONFIG,
+    CORE,
+    DECODE,
+    DPA_TP8,
+    LAYERS,
+    PRODUCER,
+    QKN,
+    trace,
+)
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
 
 #: The decode attention and the leaf writing its rows: the slots each takes
@@ -31,16 +41,19 @@ PLANES = {
 CONSUMER = ' --kv-transfer-config {"kv_role":"kv_consumer","kv_connector":"mooncake"}'
 #: A CSA layer's compress leaf, its attention's and its indexer's.
 COMPRESS = "aiter.ops.flydsl.kernels.fused_compress_attn:flydsl_fused_compress_attn"
+#: The prefill's index build, which writes the lists the attention reads.
+FILL = "atom.model_ops.v4_kernels.paged_prefill_indices:write_v4_paged_prefill_indices"
 
 
-def _rehearse(root, tokenizer, args):
-    """The rehearsal's record of each leaf of a decode of width 1 under the
-    engine arguments `args`, the model's tokenizer the one in `tokenizer`."""
-    done = trace(root, "--width 1" + args)
+def _rehearse(root, tokenizer, args, shape="--width 1"):
+    """The rehearsal's record of each leaf of `shape`, a decode of width 1 by
+    default, past 1024 tokens a row under the engine arguments `args`, the
+    model's tokenizer the one in `tokenizer`."""
+    done = trace(root, shape + args)
     assert done.returncode == 0, done.stderr[-4000:]
     for name in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copy(tokenizer / name, root / "model" / name)
-    point = ["--arch", "gfx950", "--width", "1", "--context", "1024"]
+    point = ["--arch", "gfx950", *shape.split(), "--context", "1024"]
     point += ["--llc-mib", "256", "--store", root / "store"]
     atom = ["--model", root / "model", "-tp", "8", *args.split()[1:]]
     atom += ["--enforce-eager", "--level", "0"]
@@ -87,3 +100,79 @@ def test_the_fp8_indexer_compressor_takes_the_scales_its_layer_was_bound(
     )
     for r in leaves:
         assert (r["bound"]["kv_cache"], r["bound"]["cache_scale"]) == layer
+
+
+@pytest.fixture(scope="module")
+def rehearsed_prefill(model_dir, tmp_path_factory):  # noqa: F811
+    """The rehearsal's record of each leaf of a prefill of 512 tokens over one
+    row, under a P/D prefill side's transfer config."""
+    root = tmp_path_factory.mktemp("v4pro_prefill")
+    return _rehearse(root, model_dir, DPA_TP8 + PRODUCER, "--prefill 512 1")
+
+
+def test_the_prefill_index_leaves_take_the_buffers_atom_passes(rehearsed_prefill):
+    """The index build takes the lists, indptrs, batch ids and state slots
+    ATOM's builder made for the step, its chunk starts the batch's cached
+    tokens, which ATOM uploads apart; each layer's attention reaches its launch
+    on the lists and indptrs of its layer's class. The build's state slots are
+    plane rows, past the slot count the harness bounds them by."""
+    held = {
+        "positions": "ctx.positions",
+        "bid_per_token": "md.batch_id_per_q_token",
+        "cu_seqlens_q_per_seq": "md.cu_seqlens_q",
+        "state_slot_per_seq": "md.state_slot_out",
+        "block_tables": "md.block_tables",
+        **{
+            f"{kind}_{part}": f"md.kv_{part}_{kind}"
+            for kind in ("extend", "prefix_swa", "prefix_csa", "prefix_hca")
+            for part in ("indptr", "indices")
+        },
+    }
+    [fill] = [r for r in rehearsed_prefill if r["op"] == FILL]
+    assert fill["bound"]["chunk_start_per_seq"] == "num_cached_tokens"
+    assert fill["identity"] == {k: f"{v}+0" for k, v in held.items()} | {
+        "chunk_start_per_seq": "?"
+    }
+    cores = [r for r in rehearsed_prefill if r["op"] == CORE["prefill"]]
+    kinds = {4: "csa", 128: "hca"}
+    assert {json.loads(r["leaf"])["stated"]["compress_ratio"] for r in cores} == set(
+        kinds
+    )
+    for r in cores:
+        kind = kinds[json.loads(r["leaf"])["stated"]["compress_ratio"]]
+        assert r["verdict"] == "reaches launch", r["why"]
+        assert r["identity"] == {
+            "kv_indices_prefix": f"md.kv_indices_prefix_{kind}+0",
+            "kv_indptr_prefix": f"md.kv_indptr_prefix_{kind}+0",
+            "kv_indices_extend": "md.kv_indices_extend+0",
+            "kv_indptr_extend": "md.kv_indptr_extend+0",
+        }
+
+
+@pytest.fixture(scope="module")
+def rehearsed_bf16_prefill(model_dir, tmp_path_factory):  # noqa: F811
+    """The rehearsal's record of each leaf of a prefill of 512 tokens over one
+    row under the bf16 KV cache."""
+    root = tmp_path_factory.mktemp("v4pro_bf16_prefill")
+    bf16 = " -- --kv_cache_dtype bf16 --enable-dp-attention"
+    return _rehearse(root, model_dir, bf16, "--prefill 512 1")
+
+
+def test_the_bf16_cache_s_prefill_attention_takes_the_lists_of_its_layer_s_class(
+    rehearsed_bf16_prefill,
+):
+    """Each layer's prefill attention, V4.1's sparse attention's operator,
+    reaches its launch on the lists and indptrs ATOM's builder made for its
+    layer's class."""
+    cores = [r for r in rehearsed_bf16_prefill if r["op"] == BF16_PREFILL]
+    stated = [json.loads(r["leaf"])["stated"] for r in cores]
+    assert {s["compress_ratio"] for s in stated} == {4, 128}
+    for r, s in zip(cores, stated, strict=True):
+        kind = {4: "csa", 128: "hca"}[s["compress_ratio"]]
+        assert r["verdict"] == "reaches launch", r["why"]
+        assert r["identity"] == {
+            "kv_indices_prefix": f"md.kv_indices_prefix_{kind}+0",
+            "kv_indptr_prefix": f"md.kv_indptr_prefix_{kind}+0",
+            "kv_indices_extend": "md.kv_indices_extend+0",
+            "kv_indptr_extend": "md.kv_indptr_extend+0",
+        }

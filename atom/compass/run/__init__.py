@@ -2209,7 +2209,9 @@ def _stamp_intake(out: _LineFile) -> None:
     ``prep``, a tokenizer pool job, and ``send``, a request handed to the
     engine, size 0; on the loop from an await's start to the coroutine's
     resume, size 0, ``recv``, each receive of the body's first read, and
-    ``wait``, the API server's tokenizer pool job, from its submit. Patches the
+    ``wait``, the API server's tokenizer pool job, from its submit; ``out``,
+    each row of an engine output its output thread took in, and
+    ``head``, an SSE response's head sent, size 0. Patches the
     classes, and every loaded module's binding of ``apply_chat_template``, for
     the rest of the process."""
     import asyncio
@@ -2265,7 +2267,19 @@ def _stamp_intake(out: _LineFile) -> None:
     async def app(self, scope, receive, send):
         if scope["type"] == "http":
             stamp("app", time.monotonic_ns(), 0, time.thread_time_ns())
+            send = heads(send)
         await handle(self, scope, receive, send)
+
+    def heads(send):
+        async def sent(message):
+            start, cpu = time.monotonic_ns(), time.thread_time_ns()
+            await send(message)
+            if message["type"] == "http.response.start":
+                kind = dict(message.get("headers", [])).get(b"content-type", b"")
+                if kind.startswith(b"text/event-stream"):
+                    stamp("head", start, 0, cpu)
+
+        return sent
 
     Request.body, Starlette.__call__ = body, app
     # The API server imports the function by name, so each binding is replaced.
@@ -2292,6 +2306,10 @@ def _stamp_intake(out: _LineFile) -> None:
 
     for cls in (CoreManager, DisaggCoreManager):
         cls.add_request = sent(cls.add_request)
+    # Each called once per row of an output, as the queue handoff counts them
+    # (`clock.PullStamps`): a streamed one's, and a finished sequence's.
+    for name in ("_mark_seq_prefill_complete", "_deliver_terminal_output"):
+        setattr(CoreManager, name, timed(getattr(CoreManager, name), "out"))
 
     class Resumed(asyncio.Future):
         def __await__(self):

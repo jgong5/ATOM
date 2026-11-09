@@ -457,7 +457,8 @@ backend's `encode_batch`, and ATOM's segment tokenizer call around its `encode_b
 `scripts/compass/http_intake.py serve` does: `app`, `body`, `tmpl`, `prep` and `send`, with
 the body's bytes, each on the wall clock and on its thread's CPU clock, and on the loop
 `wait`, from the tokenizer pool job's submit to the request's resume, and `recv`, each
-receive of the body's read. `fit host` fits both
+receive of the body's read; and `out`, each row of a streamed engine output the server's
+output thread takes in, and `head`, each SSE head sent. `fit host` fits both
 into the entry's `tokenizer` and `http_intake` terms (`05` D25) with the host laws' solver,
 drops and hulls (`09` D53, D58). Compass does not model the GIL, so no fitted term may carry
 a GIL wait
@@ -495,6 +496,26 @@ a GIL wait
   ([#2681](https://github.com/jgong5/ATOM/issues/2681)). The
   hull spans body bytes, so a law fitted on 47 KB first-turn bodies refuses a 388 KB body,
   naming the hull, rather than extrapolating.
+- `hops`: `admission_s`, `ipc_s`, `ipc_out_s` and `stream_s` (`01`, Lookahead sources),
+  each the p10 of the messages alone on its hop, sent once every message ahead of it
+  arrived and arrived before the next was sent, so none queues behind another; a client
+  misses the requests in flight at its stop, and the pairing allows for them. The pairs,
+  on one CLOCK_MONOTONIC: a client send, aiperf's `start_perf_ns`, to its request's app
+  call; an engine send call's return to the engine input thread's receipt
+  (`dp<r>.handoff.jsonl`); an output's put on the engine's output queue to the server's
+  `out` of its first row; a `head` send call's return to the client's ack, aiperf's
+  `request_ack_ns` less its `request_start_ns` from that `start_perf_ns`. A message that
+  arrived before its send call returned is left out. The client's side is the aiperf raw
+  records beside each `--client-run` export. `ipc_s` counts only receipts inside a
+  forward of the receiving DP rank, where the step loop waits on the device: an idle
+  engine's loop holds the GIL its input thread waits on, 5.25 ms on node 18 against
+  0.107 ms stepping ([#2600](https://github.com/jgong5/ATOM/issues/2600)), and between
+  forwards the step loop runs Python. The other three hops end in the server or the
+  client, which that loop does not hold.
+  `kv_write_req_s` is not fitted and stays
+  [#2603](https://github.com/jgong5/ATOM/issues/2603)'s stated p10: fitting it needs
+  decode's and prefill's records on one clock
+  ([#2714](https://github.com/jgong5/ATOM/issues/2714)).
 - A term whose calls or requests the records lack is listed unfitted; nothing falls back
   to a spec's value. A committed law file states, until `fit host` over its cell's records
   replaces them, the terms its machine's spec stated for its model, gpu-40's `per_byte_s`
