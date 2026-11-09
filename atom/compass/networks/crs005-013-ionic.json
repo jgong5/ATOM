@@ -23,12 +23,12 @@
       "interconnect.inter_node.derate": {
         "origin": "probed",
         "source_root": "commit:f371241a0",
-        "record": "sha256:4b35806ba3cd4eca3d7aee08916dac2290435d52291d645e80a51a749ca70fea",
+        "record": "sha256:dfe10eb1bf596f9a77c38cff6e3a9419cd5ff1ccf447eb1a1283a367b3eb6c91",
         "p10": 0.3716563888843095,
         "p90": 0.5117426951060756
       }
     },
-    "notes": "rdma_link.py fit BENCH RECORD at f371241a0, crsuse2-m2m-v3-005 writing into -013 over ionic_N, the rails of matched-rail Mooncake: the bench (005's GPUs into 013's, the 1P1D deployment's RDMA settings) gives the port rate read on all sixteen ports and the latency fitted per round on every GPU's writes, on its own rail and the next GPU's; one recorded 1P1D run of #975's EP-off cell at c=64 for 600 s (its prefill server log) gives the derate of its KV writes that no other write was in flight beside on their prefill rank or rail"
+    "notes": "crsuse2-m2m-v3-005 writing into -013 over ionic_N, the rails of matched-rail Mooncake. At f371241a0, the source root, rdma_link.py's bench (005's GPUs into 013's, the 1P1D deployment's RDMA settings) read the port rate on all sixteen ports and timed every GPU's writes on its own rail and the next GPU's, and one 1P1D run of #975's EP-off cell at c=64 for 600 s recorded its KV writes. rdma_link.py fit BENCH RECORD at 5f5cccf1a gives the values: the port rate, the latency fitted per round on the bench's writes, and the derate of the run's KV writes that no other write was in flight beside on their prefill rank or rail. The rate's and the latency's record is the bench's sha256; the derate's is the sha256 that fit prints over the run's writes files"
   },
   "interconnect": {
     "inter_node": {
