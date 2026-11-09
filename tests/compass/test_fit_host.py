@@ -432,3 +432,41 @@ def test_the_tokenizer_fit_reports_each_record_s_residuals_apart(tmp_path):
     assert report["decode"]["records"][str(paths[0])] == pytest.approx(
         [0, 0, 0], abs=1e-3
     )
+
+
+def test_the_segment_term_takes_what_its_stored_prefix_search_compared(tmp_path):
+    # Each lone segment tokenizer call's own work: per call, per id its
+    # encode_batch returned, and per character its stored-prefix search compared.
+    fixed, per_id, per_char = 6e-4, 1 / 4e6, 1 / 2.5e9
+    work = [(0, 0), (500, 4_000_000), (9000, 1_000_000), (120, 2_000_000)]
+    work += [(30_000, 0), (2000, 3_000_000), (64, 500_000)]
+    lines, t = [], 10**12
+    for ids, chars in work:
+        own = round((fixed + ids * per_id + chars * per_char) * 1e9)
+        batch = 1000 + 100 * ids if ids else 0
+        lines.append(
+            {"call": "segment", "tokens": 3 * ids + 10, "items": 1}
+            | {"compared_chars": chars, "thread": 3}
+            | {"t_start_ns": t, "t_end_ns": t + own + batch}
+        )
+        if ids:  # its encode_batch, inside it on its thread
+            start = t + own // 2
+            lines.append(
+                {"call": "encode_batch", "tokens": ids, "items": 2, "thread": 3}
+                | {"t_start_ns": start, "t_end_ns": start + batch}
+            )
+        t += 10**9
+    path, intake = tmp_path / "tokenizer.jsonl", tmp_path / "intake.stamps"
+    intake.write_text("")
+
+    def segment(lines):
+        path.write_text("".join(json.dumps(c) + "\n" for c in [TOKENIZER, *lines]))
+        return fit_tokenizer([path], [intake])[0]["segment"]
+
+    assert segment(lines) == pytest.approx(
+        {"fixed_s": fixed, "tokens_per_s": 1 / per_id, "chars_per_s": 1 / per_char},
+        rel=1e-3,
+    )
+    # A record without the search's characters keeps the term on ids alone.
+    lines = [{k: v for k, v in c.items() if k != "compared_chars"} for c in lines]
+    assert set(segment(lines)) == {"fixed_s", "tokens_per_s"}

@@ -119,7 +119,9 @@ that admits a request, and absent from an entry whose ``E`` laws hold them;
 optional, ``encode``, one-item calls, ``encode_batch``, a backend
 ``encode_batch`` of several items, ``decode``, and ``segment``, the segment
 tokenizer call's own work over the ids its ``encode_batch`` calls return, each ``fixed_s`` and a
-positive ``tokens_per_s``, and a ``decode`` in their place ``fixed_s`` alone over ``tokens``, the ``[lo, hi]``
+positive ``tokens_per_s``, a ``segment`` optionally also a positive ``chars_per_s`` over
+the characters its stored-prefix search compared, and a ``decode`` in their place
+``fixed_s`` alone over ``tokens``, the ``[lo, hi]``
 token counts outside which a decode is refused and charged 0 s; ``http_intake``,
 ``fixed_s`` and ``per_byte_s``, with ``idle_s`` optional and ``bytes``, the
 ``[lo, hi]`` body bytes it was fitted over, outside which an intake is refused
@@ -501,8 +503,8 @@ def _check_host(path, host: dict) -> None:
             f"{path}: host's tokenizer is {tok!r}; it takes backend, fast or slow, "
             "fingerprint, the tokenizer.json it was fitted on, and, each "
             "optional, encode, encode_batch, decode and segment, each fixed_s and a "
-            "positive tokens_per_s, a decode fixed_s and tokens, [lo, hi], in "
-            "their place"
+            "positive tokens_per_s, a segment optionally a positive chars_per_s "
+            "too, a decode fixed_s and tokens, [lo, hi], in their place"
         )
     hull = intake.get("bytes", [0, 0]) if isinstance(intake, dict) else None
     if intake is not None and not (
@@ -532,7 +534,10 @@ def _rate(term, kind: str) -> bool:
             and _seconds(dict(enumerate(hull)), {0, 1})
             and hull[0] <= hull[1]
         )
-    return _seconds(term, {"fixed_s", "tokens_per_s"}) and term["tokens_per_s"] > 0
+    search = {"chars_per_s"} if kind == "segment" else set()
+    return _seconds(term, {"fixed_s", "tokens_per_s"}, search) and all(
+        v > 0 for k, v in term.items() if k != "fixed_s"
+    )
 
 
 def _seconds(term, required: set, optional: set = frozenset()) -> bool:
@@ -2056,7 +2061,8 @@ def tokenizer(tok, config) -> None:
     entry, its engine config's among several: a term fitted on another backend
     is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
     ends the run before the server serves (`_end_before_serving`). With no
-    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer.
+    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer,
+    and its ``chars_per_s`` charges each comparison of its stored-prefix search.
 
     On a real run recording its steps (`parity.ENV`), it records instead
     (`_record_host`); with neither, `tok` is left as it is."""
@@ -2112,19 +2118,22 @@ def tokenizer(tok, config) -> None:
         )
     if "segment" in term:
         from atom.model_engine.segment_tokenizer import SegmentTokenizer
-        from atom.utils.compass_loop import wrap_segment
+        from atom.utils.compass_loop import charge, wrap_segment
 
         SegmentTokenizer._encode_cached = wrap_segment(
             SegmentTokenizer._encode_cached, term["segment"]
         )
+        if "chars_per_s" in term["segment"]:
+            _on_search(lambda n: charge(n / term["segment"]["chars_per_s"]))
 
 
 def _record_host(tok, record: Path) -> None:
     """Record, beside the step record in `record`, each call of `tok`'s
-    ``encode``, ``decode``, its Rust backend's ``encode_batch`` and ``segment`` into
-    `TOKENIZER_RECORD`, after a first line naming `tok`'s ``backend`` and the
-    ``fingerprint`` of its ``tokenizer.json``; and stamp each HTTP request's
-    intake into `INTAKE_RECORD` (`_stamp_intake`)."""
+    ``encode``, ``decode``, its Rust backend's ``encode_batch`` and ``segment``,
+    with what its stored-prefix search compared, into `TOKENIZER_RECORD`, after
+    a first line naming `tok`'s ``backend`` and the ``fingerprint`` of its
+    ``tokenizer.json``; and stamp each HTTP request's intake into
+    `INTAKE_RECORD` (`_stamp_intake`)."""
     from tokenizers import Tokenizer
 
     from atom.model_engine.segment_tokenizer import SegmentTokenizer
@@ -2145,11 +2154,22 @@ def _record_host(tok, record: Path) -> None:
             calls,
             lambda _, got: (sum(len(e.ids) for e in got), len(got)),
         )
+    _on_search(lambda n: setattr(_search, "chars", _search.chars + n))
+    encode_cached = SegmentTokenizer._encode_cached
+
+    def segment(*args, **kwargs):
+        _search.chars = 0
+        return encode_cached(*args, **kwargs)
+
     SegmentTokenizer._encode_cached = _recorded(
-        SegmentTokenizer._encode_cached,
+        segment,
         "segment",
         calls,
-        lambda _, got: (len(getattr(got, "token_ids", got)), 1),
+        lambda _, got: (
+            len(getattr(got, "token_ids", got)),
+            1,
+            {"compared_chars": _search.chars},
+        ),
     )
     _stamp_intake(_LineFile(record / INTAKE_RECORD))
 
@@ -2169,11 +2189,31 @@ class _LineFile:
 
 #: Whether this thread is inside a `_recorded` ``encode`` call.
 _in_encode = threading.local()
+#: The characters the stored-prefix search of this thread's recorded segment
+#: tokenizer call compared.
+_search = threading.local()
+
+
+def _on_search(then) -> None:
+    """Call `then` with the characters each comparison of ATOM's segment
+    tokenizer's stored-prefix search compares: what the prompt shares with one
+    stored prompt (``segment_tokenizer._shared_chars``)."""
+    from atom.model_engine import segment_tokenizer
+
+    shared_chars = segment_tokenizer._shared_chars
+
+    def compared(a, b, limit):
+        n = shared_chars(a, b, limit)
+        then(n)
+        return n
+
+    segment_tokenizer._shared_chars = compared
 
 
 def _recorded(call, kind: str, out: _LineFile, count):
     """`call`, writing to `out` per call a JSON line of `kind`, its ``tokens``
-    and ``items`` as `count(args, result)` gives them, its ``thread`` id and its
+    and ``items`` as `count(args, result)` gives them, with the fields of any
+    mapping it gives after them, its ``thread`` id and its
     start and end on the monotonic clock in ns; a call made inside a recorded
     ``encode`` call is that call's, as `compass_loop.wrap_encode_batch` charges
     it."""
@@ -2188,9 +2228,10 @@ def _recorded(call, kind: str, out: _LineFile, count):
         finally:
             _in_encode.on = False
         end = time.monotonic_ns()
-        tokens, items = count(args, got)
+        tokens, items, *more = count(args, got)
+        more = "".join(f', "{k}": {v}' for m in more for k, v in m.items())
         out.write(
-            f'{{"call": "{kind}", "tokens": {tokens}, "items": {items}, '
+            f'{{"call": "{kind}", "tokens": {tokens}, "items": {items}{more}, '
             f'"thread": {threading.get_ident()}, '
             f'"t_start_ns": {start}, "t_end_ns": {end}}}\n'
         )

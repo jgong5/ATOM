@@ -200,8 +200,9 @@ HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
 #: What a lone HTTP request's intake costs: per request, and per body byte.
 INTAKE_FEATURES = ("idle", "bytes")
-#: What a lone tokenizer call costs: per call, and per token.
-TOKENIZER_FEATURES = ("fixed", "tokens")
+#: What a lone tokenizer call costs: per call, per token, and for a segment
+#: tokenizer call per character its stored-prefix search compared.
+TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
 #: What a forward that admits requests spends once, per prompt token past the
 #: prefix-cache hit and per token within it (`step_labels.admit_x`).
 ADMIT_FEATURES = ("admits", "uncached", "cached")
@@ -385,7 +386,9 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
     and its report: the records' backend and fingerprint, and per kind of
     call, ``fixed_s + tokens / tokens_per_s`` by the host-law solver on the
     calls' wall seconds, a segment tokenizer call's less its calls', over
-    their ids (`_own_work`).
+    their ids, plus ``chars / chars_per_s`` over the characters its
+    stored-prefix search compared where every call's record holds them
+    (`_own_work`).
     One-item ``encode_batch`` calls are ``encode``'s and several-item ones
     their own kind. A ``decode`` with no positive slope is ``fixed_s`` alone
     over ``tokens``, the ``[lo, hi]`` token counts its calls span. A kind the
@@ -403,23 +406,28 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
             kind = c["call"] if c["items"] > 1 or c["call"] == "decode" else "encode"
             s = (c["t_end_ns"] - c["t_start_ns"]) * 1e-9
             rows.append((i, kind, c["tokens"], s))
-        rows += [(i, "segment", n, s) for n, s in _own_work(got, intake)]
+        rows += [(i, "segment", n, s, chars) for n, chars, s in _own_work(got, intake)]
     if len(heads) != 1:
         raise ValueError(f"the records name {len(heads)} tokenizers: {sorted(heads)}")
     term, report = json.loads(next(iter(heads))), {"unfitted": {}}
     for kind in ("encode", "encode_batch", "decode", "segment"):
-        got = np.array([r[2:] for r in rows if r[1] == kind and r[3] > 0])
+        got = np.array([r[2:4] for r in rows if r[1] == kind and r[3] > 0])
+        chars = [r[4] for r in rows if r[1] == kind and r[3] > 0 and len(r) > 4]
         record = np.array([r[0] for r in rows if r[1] == kind and r[3] > 0])
         try:
             if not len(got):
                 raise ValueError(f"the records hold no lone {kind} call")
             x = np.column_stack([np.ones(len(got)), got[:, 0]])
-            coef, fitted = _host_law(x, got[:, 1], TOKENIZER_FEATURES)
+            if len(chars) == len(got) and None not in chars:
+                x = np.column_stack([x, chars])
+            coef, fitted = _host_law(x, got[:, 1], TOKENIZER_FEATURES[: x.shape[1]])
         except (ValueError, QhullError) as e:
             report["unfitted"][kind] = str(e)
             continue
         if coef[1] > 0:
             term[kind] = {"fixed_s": coef[0], "tokens_per_s": 1 / coef[1]}
+            if len(coef) > 2 and coef[2] > 0:
+                term[kind]["chars_per_s"] = 1 / coef[2]
         elif kind == "decode":
             term[kind] = {"fixed_s": coef[0], "tokens": _span(fitted, "tokens")}
         else:
@@ -482,9 +490,10 @@ def _lone_calls(calls: list[dict], intake) -> list[dict]:
     return [c for c, k in zip(calls, lone) if k]
 
 
-def _own_work(calls: list[dict], intake) -> list[tuple[int, float]]:
+def _own_work(calls: list[dict], intake) -> list[tuple[int, int | None, float]]:
     """Each ``segment`` call among `calls` lone (`_lone_calls`) among the calls it
-    did not make, its thread's that start in its span, as the ids those returned
+    did not make, its thread's that start in its span, as the ids those returned,
+    the characters its stored-prefix search compared if its record holds them,
     and its wall seconds less theirs."""
     own, ids, made, last = {}, {}, set(), None
     for c in sorted(calls, key=lambda c: (c["thread"], c["t_start_ns"])):
@@ -496,7 +505,11 @@ def _own_work(calls: list[dict], intake) -> list[tuple[int, float]]:
         elif c["call"] == "segment":
             own[id(c)], ids[id(c)], last = end - start, 0, c
     lone = _lone_calls([c for c in calls if id(c) not in made], intake)
-    return [(ids[id(c)], own[id(c)] * 1e-9) for c in lone if c["call"] == "segment"]
+    return [
+        (ids[id(c)], c.get("compared_chars"), own[id(c)] * 1e-9)
+        for c in lone
+        if c["call"] == "segment"
+    ]
 
 
 def _intakes(path) -> tuple[list, list, list]:
