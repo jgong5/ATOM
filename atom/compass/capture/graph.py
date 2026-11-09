@@ -209,17 +209,19 @@ def _seq(regions):
 
 
 def to_json(graph: ir.Graph) -> str:
-    """The graph as JSON; one that holds G with its ``guards`` and ``hints``."""
-    applicability = graph.applicability
+    """The graph as JSON; one that holds G with its ``guards`` and ``hints``,
+    and the ``slots`` where its region holds G (`peers.slots`), which a run
+    reads to put each G in."""
+    applicability, region = graph.applicability, _json(graph.region)
     held = {}
     if getattr(applicability, "hints", None):
+        from .peers import slots
+
         held = {"guards": list(applicability.guards), "hints": applicability.hints}
+        held["slots"] = slots(region)
     return json.dumps(
-        {
-            "structure": applicability.structure,
-            "shape": applicability.shape,
-            "region": _json(graph.region),
-        }
+        {"structure": applicability.structure, "shape": applicability.shape}
+        | {"region": region}
         | held
     )
 

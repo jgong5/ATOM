@@ -1965,15 +1965,14 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         return json.loads(store.read(key).read_member("graph", rank, "json"))
 
     @functools.lru_cache(maxsize=64)
-    def held(at: str, tokens: int, seqs: int) -> tuple | None:
+    def held(at: str, tokens: int, seqs: int) -> dict | None:
         """The graph that holds G of a DP prefill of `tokens` over `seqs` at
-        structure `at`, and its G's slots (`peers.slots`), or None."""
+        structure `at`, or None."""
         text, new = symbolic_shape(tokens, seqs), (tokens, seqs) not in held_traced
         if new and atom_args is not None and read(at, text) is None:
             held_traced.add((tokens, seqs))
             lazily(Shape("prefill", tokens, seqs), symbolic=True)
-        found = read(at, text)
-        return found and (found, peers.slots(found["region"]))
+        return read(at, text)
 
     @functools.lru_cache(maxsize=64)
     def graph(
@@ -1986,9 +1985,9 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         if missing and dp > 1 and phase == "prefill" and not (draft or width or drafts):
             g = shape.gathered or dp * tokens
             if found := held(at, tokens, seqs):
-                (lo, hi), region = found[0]["hints"], found[0]["region"]
-                if lo <= g <= hi and admits(found[0]["guards"], g):
-                    return peers.at(region, found[1], g, dp)
+                (lo, hi), guards = found["hints"], found["guards"]
+                if lo <= g <= hi and admits(guards, g):
+                    return peers.at(found["region"], found["slots"], g, dp)
         if missing and atom_args is not None and shape not in traced:
             traced.add(shape)
             lazily(shape)

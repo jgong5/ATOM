@@ -130,7 +130,7 @@ class _Tracer:
         )
         self.at, self.guards, self.apart, self.traced = config, guards, apart, []
 
-    def trace(self, shapes, unsplit, symbolic=False):
+    def trace(self, shapes, unsplit, symbolic=False, warm=True):
         (shape,) = shapes
         self.traced.append((shape.gathered, symbolic))
         g = shape.gathered or DP * shape.tokens
@@ -206,7 +206,7 @@ def test_a_g_its_guards_refuse_is_traced_and_one_they_admit_is_put(lookup):
     admitted, refused = (graphs("prefill", T, 1, True, g) for g in (100, 3000))
 
     # Both ends traced once with G a symbol, then G=3000 as it is.
-    assert tracer.traced == [(T + 1, True), (TOP, True), (3000, False)]
+    assert tracer.traced == [(TOP, True), (T + 1, True), (3000, False)]
     assert admitted == _concrete(tracer, 100) and refused == _concrete(tracer, 3000)
     assert lazy["lazy_traces"] == 2 and "lazy_per_g" not in lazy
 
@@ -216,7 +216,7 @@ def test_ends_that_differ_past_sizes_trace_each_g_and_name_the_shape(lookup):
 
     final = {g: graphs("prefill", T, 1, True, g) for g in (100, 3000)}
 
-    assert tracer.traced == [(T + 1, True), (TOP, True), (100, False), (3000, False)]
+    assert tracer.traced == [(TOP, True), (T + 1, True), (100, False), (3000, False)]
     assert final == {g: _concrete(tracer, g) for g in (100, 3000)}
     # The lower end's count against the upper end's put there.
     why = f"its middle chunk at G={T + 1}: aiter.fused_moe_ at args/n: {T + 1}"

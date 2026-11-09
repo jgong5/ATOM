@@ -199,8 +199,10 @@ carries the hint and never the symbol, so in place of the fourth discipline's ce
 each peer at `max_num_batched_tokens` (`forward.Tracer.symbolic`). The two records must
 agree once G and each DP exchange's `sizes`, restated by the stand-in's split
 (`peers.split`), are put at either end; the check compares operators, not guards, since a
-guard holding a hint-derived constant differs by construction. The upper end's record is
-kept: MORI's trim guards G at most its hint. A step's G inside the hints that the guards
+guard holding a hint-derived constant differs by construction. The upper end is traced
+first, after the warm-up steps any trace runs, and the lower end follows it at the same
+(T, B) with none of its own. The upper end's record is kept, MORI's trim guarding G at most
+its hint, with the paths that hold G (`peers.slots`). A step's G inside the hints that the guards
 admit is put into the record (`peers.at`), copying only what holds G; any other G, and
 every G of a (T, B) whose ends differ (`forward.PerG`, named with the first difference in
 the run summary's `lazy_per_g`), is traced concretely as before. `trace ops --symbolic`

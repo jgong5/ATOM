@@ -59,21 +59,15 @@ def split(rows: int, local: int, dp: int) -> list[int]:
     return [local] + [each + (k < extra) for k in range(dp - 1)]
 
 
-def slots(region) -> dict:
-    """Where `region`, a graph's JSON, holds G: a trie, keyed as the JSON is,
-    of the paths to each `SYMBOL` and to the `sizes` of each exchange of
-    `SIZED` that holds G."""
-    trie = {}
-
-    def mark(path, what):
-        node = trie
-        for key in path[:-1]:
-            node = node.setdefault(key, {})
-        node[path[-1]] = what
+def slots(region) -> list[list]:
+    """Where `region`, a graph's JSON, holds G, as JSON: the path, keyed as
+    the JSON is, to each `SYMBOL`, then ``G``, and to the `sizes` of each
+    exchange of `SIZED` that holds G, then ``sizes``."""
+    found = []
 
     def walk(node, path) -> bool:
         if node == SYMBOL:
-            mark(path, _G)
+            found.append([*path, _G])
             return True
         items = node.items() if isinstance(node, dict) else ()
         items = enumerate(node) if isinstance(node, list) else items
@@ -81,26 +75,36 @@ def slots(region) -> dict:
         held = sum(walk(value, (*path, key)) for key, value in items) > 0
         op = isinstance(node, dict) and node.get("op") in SIZED
         if held and op and "sizes" in node["args"]:
-            mark((*path, "args", "sizes"), _SIZES)
+            found.append([*path, "args", "sizes", _SIZES])
         return held
 
     walk(region, ())
-    return trie
+    return found
 
 
-def at(region, held: dict, g: int, dp: int, restated: bool = True):
+def at(region, held: list, g: int, dp: int, restated: bool = True):
     """`region`, a graph's JSON holding G at the `slots` `held`, at G = `g`:
     each G `g`, and unless `restated` is false each exchange's `sizes` this
     rank's then `split`'s over the `dp` ranks. What changes is copied, the
     rest shared."""
+    trie = {}
+    for *path, what in held:
+        node = trie
+        for key in path[:-1]:
+            node = node.setdefault(key, {})
+        node[path[-1]] = what
+    return _put(region, trie, g, dp, restated)
+
+
+def _put(region, trie: dict, g: int, dp: int, restated: bool):
     node = region.copy()
-    for key, what in held.items():
+    for key, what in trie.items():
         if what == _G:
             node[key] = g
         elif what == _SIZES:
             node[key] = split(g, node[key][0], dp) if restated else node[key]
         else:
-            node[key] = at(node[key], what, g, dp, restated)
+            node[key] = _put(node[key], what, g, dp, restated)
     return node
 
 

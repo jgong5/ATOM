@@ -1646,20 +1646,25 @@ class Tracer:
         tokens, seqs = shape.tokens, shape.seqs
         top = self.config.max_num_batched_tokens
         lo, hi = hints = tokens + 1, tokens + (dp - 1) * top
-        text, ends = symbolic_shape(tokens, seqs), []
+        text = symbolic_shape(tokens, seqs)
         if self.runner is None:
             self._build()
         if dp == 1 or self.drafts:
             raise ValueError(f"{text}: only a DP prefill with no drafter holds G")
-        for g in hints:
+        # The upper end first, after warm-up steps as any trace; the lower end
+        # follows its steps at the same (T, B), with none of its own.
+        ends = {}
+        for g, warm in ((hi, True), (lo, False)):
             at = prefill(tokens, seqs, g).at(dp)
             try:
-                ends.append([*self.trace([at], [at], symbolic=True)])
+                ends[g] = [*self.trace([at], [at], symbolic=True, warm=warm)]
             except PerG:
                 raise
             except Exception as exc:  # its G are each traced instead
                 raise PerG(f"{text} at G={g}: {type(exc).__name__}: {exc}") from exc
-        low, high = ([json.loads(to_json(graph)) for graph, *_ in end] for end in ends)
+        low, high = (
+            [json.loads(to_json(graph)) for graph, *_ in ends[g]] for g in hints
+        )
         if [x["structure"] for x in low] != [y["structure"] for y in high]:
             raise PerG(f"{text} traces other graphs at G={lo} than at G={hi}")
         for x, y in zip(low, high):
@@ -1677,13 +1682,13 @@ class Tracer:
                     why = _differ(traced, put)
                     raise PerG(f"{text}, its {chunk} chunk at G={g}: {why}")
         kept = []
-        for graph, digest, declared in ends[1]:
+        for graph, digest, declared in ends[hi]:
             applies = dataclasses.replace(graph.applicability, hints=hints)
             graph = dataclasses.replace(graph, applicability=applies)
             kept.append((graph, digest, declared))
         return kept
 
-    def trace(self, shapes, unsplit=(), symbolic=False):
+    def trace(self, shapes, unsplit=(), symbolic=False, warm=True):
         """Yields, per shape of `shapes`, the graph, the model's config digest,
         what the capture declared, the operators it left out of the graph among
         it; per prefill shape, the middle chunk's and then the final one's.
@@ -1697,7 +1702,8 @@ class Tracer:
         `symbolic` traces each shape, a DP prefill, with the rows its MoE
         gathers G, a symbol at that shape's (`_Recorder.symbol`): its graph is
         keyed by `symbolic_shape` and holds the guards the trace installed on
-        G (`_guards`)."""
+        G (`_guards`). Unless `warm`, no step runs before a traced one: the
+        caller has just stepped the runner at that shape."""
         config = self.config
         dp = config.parallel_config.data_parallel_size
         if dp == 1 and (gathering := [s for s in shapes if s.gathered is not None]):
@@ -1760,7 +1766,7 @@ class Tracer:
                         # fills no deferred ids), so the traced step follows two
                         # of its own shape, which find its launching functions:
                         # no graph depends on another's.
-                        for _ in range(2):
+                        for _ in range(2 * warm):
                             runner.forward(_batch(*batch)[0])
                         recorder.start()
                         recorder.creating, recorder.on = ir.Role.METADATA, True
