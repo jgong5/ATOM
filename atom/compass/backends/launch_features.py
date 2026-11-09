@@ -47,22 +47,16 @@ class LaunchFeatures:
 
 
 class DeepseekV41(LaunchFeatures):
-    """DeepSeek-V4.1's prefill launch. Its body, the layers before the
-    decoder, replays the smallest prefill token-graph bucket that holds the
-    step's tokens, or runs eagerly past the largest. Under decoder bounded
-    replay, a prefill that finishes a prompt then runs the decoder on its
-    tail, laid out for the step's `running_bs` requests: it replays the
-    decoder's request graph of that bucket, or runs eagerly where none was
-    recorded. A decode is neither: its features are 0.
-
-    `install` counts, per prefill, what replayed: the body's token graph, the
-    decoder's runs and its request graph's replays. `recorded` states the
-    decoder's request buckets, None where it does not replay. `predict` reads
-    `running_bs` off the view: `target_bs`, which ATOM's `ForwardMode.decide`
-    settles, or the requests where it pads none. A step ATOM runs eagerly for
-    a reason a view does not carry, a score workspace that does not fit one
-    band among them, is predicted otherwise and refuses its fit by name.
-    """
+    """DeepSeek-V4.1's prefill launch: its body, the layers before the decoder,
+    replays the smallest prefill token-graph bucket holding its tokens or runs
+    eagerly past the largest; a prefill finishing a prompt then runs the
+    decoder on its tail, replaying the request graph recorded for the step's
+    `running_bs` or eagerly. A decode is neither. `install` counts what
+    replayed; `recorded` states the decoder's buckets, None where it does not
+    replay; `predict` reads `running_bs` off the view's `target_bs`, which
+    `ForwardMode.decide` settles. A step ATOM runs eagerly for a reason a view
+    does not carry, a score workspace too small for one band among them,
+    refuses its fit by name."""
 
     features = ("eager_body", "eager_tail")
 
