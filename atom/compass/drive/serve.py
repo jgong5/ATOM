@@ -80,6 +80,13 @@ TRACE_ENV = {
     "ATOM_PROFILER_PROFILE_MEMORY": "0",
     "ATOM_PROFILER_TIMEOUT": str(TRACE_STOP_S),
 }
+#: The kineto config a trace run's server reads through ``KINETO_CONFIG``,
+#: written in `out`. kineto's ROCm tracer keeps at most ROCTRACER_MAX_EVENTS
+#: rows a process, launch calls and device rows alike, and drops every later
+#: row unmarked; its default of 5,000,000 filled 149 s into a 300 s V4.1-Flash
+#: TP4 trace run (#3106). The largest value the key takes, an int32: a trace
+#: run's rows are held in host memory until its stop.
+KINETO_FILE, KINETO_CONF = "kineto.conf", "ROCTRACER_MAX_EVENTS=2147483647\n"
 #: As `cctraces_sim.sh` sets it, so a pooling client's idle connection is not
 #: closed under it; before ATOM's arguments, so one there wins.
 KEEP_ALIVE = ("--timeout-keep-alive", "1000000")
@@ -186,7 +193,8 @@ def serve(
     env["ATOM_SHUTDOWN_TIMEOUT_S"] = str(SHUTDOWN_TIMEOUT_S)
     if trace:
         argv += [PROFILER, str(out / TRACE)]
-        env.update(TRACE_ENV)
+        (out / KINETO_FILE).write_text(KINETO_CONF)
+        env.update(TRACE_ENV, KINETO_CONFIG=str((out / KINETO_FILE).absolute()))
     if run is None:
         env["HIP_VISIBLE_DEVICES"] = hip_visible(gpus)
         env |= log_more(atom_args)
