@@ -125,7 +125,11 @@ TP4 run and is refused at any other width, like any other layout field
   other inside the forward, so a rank's measured step is the group's step and its own
   cost is never seen: the observation is `y = max_r f(x_r)`. The fit minimises
   `F(c) = sum_i (max_r x_ir.c / y_i - 1)^2`, each equation divided by its target (D53),
-  under non-negative coefficients. It starts from the fit on every rank's row. Each pass
+  under non-negative coefficients. It starts from the fit on every rank's row and, per
+  feature that differs between some step's ranks, from that feature's axis scaled to the
+  labels ([#3042](https://github.com/jgong5/ATOM/issues/3042): the fit on every rank's
+  row alone settles in a local minimum on a real DP record). Each start runs the first
+  round with every step kept; the lowest `F` goes on, and its start is recorded. Each pass
   assigns each step to the rank with the largest prediction under the current
   coefficients and refits the one law on the assigned ranks' features: a Gauss-Newton
   step on `F`. A backtracking line search halves the step until `F` falls, so `F` falls
