@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 """`pd_sim.sh`, run directly or through `cctraces_sim.sh`, starts each side
 under its own flags and environment, and from what each server was started
-with, `keyed` picks that side's entry of DeepSeek-V4-Pro's two DPA8 laws.
+with, `keyed` matches that side's entry of DeepSeek-V4-Pro's two gpu-45 DPA8
+laws in every field but the indexer: each law states the fp4 index cache its
+lone servers ran, a P/D side runs fp8, so each side refuses both, naming
+`index_cache_dtype`.
 
 `python3` is stubbed on `PATH`: an API server prints its arguments and its
 environment to its log and then answers `/health`, and the clock authority only
@@ -125,6 +128,8 @@ def side_config(argv) -> SimpleNamespace:
         capture_sizes=ast.literal_eval(sizes),
         kv_cache_block_size=shared["kv_cache_block_size"],
         kv_cache_dtype=shared["kv_cache_dtype"],
+        # ATOM resolves fp8 for a side under --kv-transfer-config.
+        index_cache_dtype="fp8",
         quant_config=SimpleNamespace(compute_hash=lambda: shared["quantization"]),
         tensor_parallel_size=1,
         parallel_config=SimpleNamespace(data_parallel_size=8),
@@ -136,7 +141,7 @@ def side_config(argv) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("script", ["pd_sim.sh", "cctraces_sim.sh"])
-def test_each_side_starts_under_its_own_flags_and_picks_its_own_law(
+def test_each_side_starts_under_its_own_flags_and_refuses_its_law_for_the_indexer(
     monkeypatch, tmp_path, script
 ):
     sides = started(tmp_path, script)
@@ -154,12 +159,11 @@ def test_each_side_starts_under_its_own_flags_and_picks_its_own_law(
         for name in PERFORMANCE_KEYS & env.keys():
             monkeypatch.setenv(name, env[name])
         here = keyed(side_config(argv))
-        assert (
-            compass_run._fitted_here(LAWS, here, lambda e: e["engine_config"], "law")
-            is law
-        )
-        hosts = [e["host"] for e in LAWS]
-        assert (
-            compass_run._fitted_here(hosts, here, lambda e: e["key"]["engine"], "host")
-            is law["host"]
-        )
+        own = f"entry {LAWS.index(law)} in ['index_cache_dtype']"
+        for listed, engine, what in (
+            (LAWS, lambda e: e["engine_config"], "law"),
+            ([e["host"] for e in LAWS], lambda e: e["key"]["engine"], "host"),
+        ):
+            with pytest.raises(ValueError, match=f"no {what} entry was fitted") as no:
+                compass_run._fitted_here(listed, here, engine, what)
+            assert own in str(no.value)
