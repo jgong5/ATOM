@@ -109,19 +109,6 @@ META_8B = meta_tree(16_000_000_000)
 
 STACK = {"rocm": "7.2.4", "aiter": "f4e7c7509", "rccl": "2.22.3", "torch": "2.10.0"}
 
-TOKENIZER = {
-    "id": "qwen3-151k-bpe",
-    "backend": "fast",
-    "vocab_size": 151936,
-    "fingerprint": "sha256:" + "a" * 64,
-    "applies_to": ["Qwen3ForCausalLM"],
-    "encode_fixed_s": 3.0e-4,
-    "encode_tokens_per_s": 2.0e6,
-    "decode_fixed_s": 1.5e-4,
-    "decode_tokens_per_s": 3.0e6,
-    "derate": 0.85,
-}
-
 DOCUMENT = {
     "schema_version": 1,
     "name": "mi355x-8gpu-2node",
@@ -129,12 +116,6 @@ DOCUMENT = {
         "authored_by": "tests/compass/test_memory_readings.py",
         "date": "2026-09-22",
         "origin": "assumed",
-    },
-    "host": {
-        "cpu": {"cores_physical": 96, "cores_logical": 192},
-        "tokenizers": [TOKENIZER],
-        "ipc": {"zmq_roundtrip_s": 5.0e-5, "shm_broadcast_s": 2.0e-5},
-        "http_intake": {"fixed_s": 2.0e-3, "per_byte_s": 2.0e-8},
     },
     "device": {
         "name": "MI355X",

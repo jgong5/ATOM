@@ -3,8 +3,8 @@
 published as an `op_graph`.
 
     compass trace ops --model M [--tp N] [--width W ...] [--prefill T B ...]
-                      [--population P ...] [--arch A | --gpu I] --store S
-                      [-- ATOM args]
+                      [--whole] [--population P ...] [--arch A] [--gpu I]
+                      --store S [-- ATOM args]
 
 A shape is a decode width (`--width`), a prefill of T tokens over B sequences
 (`--prefill`), or every shape the steps of a record directory hold
@@ -20,7 +20,8 @@ replays no graph yet pads past its rows, `target_bs`, at that width. Under
 micro-batches, each a prefill at its own tokens and the group's rows of it,
 by the split `validate.bound` rebuilds from every rank's line; a population's
 prefill is traced as one forward, as it ran, where ATOM would split a step of
-its tokens. Each is traced at that concrete shape (`forward`), decoder layers folded
+its tokens, and with `--whole` each `--prefill` too. Each is traced at that
+concrete shape (`forward`), decoder layers folded
 into `Repeat` and forked streams into `Par` (`graph`).
 
 An `op_graph` is keyed by structure (`forward.structure`: the model's
@@ -37,8 +38,9 @@ configure the engine as they would a server's; `--arch` names the declared
 device, which the entry also states as its `device` condition: a store holds a
 graph per arch of one structure and shape. `--gpu` declares card I of this host
 in its place, each property and the stepping as the card reports them
-(`driverless.card`), its arch that card's: the step still runs no kernel, but
-picks the kernels it would on that card. Its members are
+(`driverless.card`), its arch that card's, which an `--arch` beside it must
+name: the step still runs no kernel, but picks the kernels it would on that
+card. Its members are
 ``graph`` (`graph.to_json`) and ``declared``, what the capture stated in place
 of a device and the operators it left out of the graph, each with why. A TP
 group's ranks run one graph, so rank 0's is the entry's. The declarations are
@@ -48,6 +50,7 @@ another misses them, and its refusal names each field that differs.
 """
 
 import argparse
+import dataclasses
 import datetime
 import json
 import pathlib
@@ -74,14 +77,18 @@ def main(argv: list[str]) -> None:
         help="a prefill of T tokens over B sequences",
     )
     p.add_argument(
+        "--whole",
+        action="store_true",
+        help="trace each --prefill as one forward where ATOM would split it",
+    )
+    p.add_argument(
         "--population",
         action="append",
         default=[],
         help="a record directory; every shape its steps hold",
     )
-    where = p.add_mutually_exclusive_group()
-    where.add_argument("--arch", default="gfx942", help="the declared device's arch")
-    where.add_argument("--gpu", type=int, help="declare this card as it reads")
+    p.add_argument("--arch", help="the declared device's arch, gfx942 by default")
+    p.add_argument("--gpu", type=int, help="declare this card as it reads")
     p.add_argument("--store", required=True, help="the artifact store")
     args = p.parse_args(argv[:split])
 
@@ -91,7 +98,9 @@ def main(argv: list[str]) -> None:
     from .forward import capture, decode, prefill
 
     read = None if args.gpu is None else driverless.card(args.gpu)
-    arch = read["arch"] if read else args.arch
+    if read and args.arch not in (None, read["arch"]):
+        raise ValueError(f"card {args.gpu} reads as {read['arch']}, not {args.arch}")
+    arch = read["arch"] if read else args.arch or "gfx942"
 
     store = a.ArtifactStore(args.store)
     shapes = [decode(w) for w in args.width] + [prefill(*s) for s in args.prefill]
@@ -100,8 +109,10 @@ def main(argv: list[str]) -> None:
     command = " ".join(["compass", "trace", "ops", *argv])
     with tempfile.TemporaryDirectory(prefix="compass-capture-") as tmpdir:
         began = time.perf_counter()  # the first shape's seconds include the build
-        # A card's reading only when read: a declared arch's call is as before.
+        # A card's reading and `--whole` only when given: any other call is as before.
         on = {"read": read} if read else {}
+        if args.whole:
+            on["whole"] = True
         captured = capture(
             args.model, args.tp, shapes, tmpdir, atom_args, arch, args.population, **on
         )
@@ -129,7 +140,8 @@ def population_steps(names, tbo=False, drafters=False):
     overlap (`tbo`, ATOM's `enable_tbo`) a DP step the group split, by the
     rule `validate.bound` agrees over every rank's line at that step
     (`bound._split`), is its two micro-batches (`step_roofline.micro_batches`),
-    each a prefill at its own tokens and the group's rows of it. With
+    each a prefill at its own tokens and the group's rows of it, its line
+    holding its own rows. With
     `drafters`, a drafter's shape follows it where they differ: a decode's
     at its rows padded to `draft_bs`, else to its rung, a sampling prefill's
     or a DP middle chunk's with `draft_bs` as its `width`. A target that
@@ -184,7 +196,8 @@ def population_steps(names, tbo=False, drafters=False):
                 for half in halves:
                     rows = [(r.query_tokens, r.decode) for r in half.requests]
                     _, tokens, seqs = step_shape(rows, None)
-                    yield prefill(tokens, seqs, half.moe_rows).at(dp), line
+                    own = {"rows": [dataclasses.astuple(r) for r in half.requests]}
+                    yield prefill(tokens, seqs, half.moe_rows).at(dp), line | own
 
 
 def publish(store, graph, model, declared, tp, atom_args, command):

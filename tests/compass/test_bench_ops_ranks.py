@@ -22,7 +22,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
-from test_bench_ops import _graph, _leaf, _Runner, _t
+from test_bench_ops import _Capture, _captures, _graph, _leaf, _Runner, _t
 from test_bench_ops_plan import CONFIG, _records, bench  # noqa: F401  the fixture
 
 from atom.compass import ir
@@ -209,7 +209,8 @@ def _measuring_rank(config, todo, refuse, rank):
     ops.Stub._copy = copying
     if (me, refuse) == (1, "call"):
         ops._function = lambda name: no if name == NEG else function(name)
-    torch.cuda.graph = lambda *a, **k: contextlib.nullcontext(graph())
+    # the rank's process ends with its launch, so nothing is undone
+    _captures(pytest.MonkeyPatch(), lambda g, **k: graph() or _Capture(g))
     records = ops.measure(config, todo[me], 10_000, rank)
     return (records, len(profiles)) if refuse == "profile" else records
 

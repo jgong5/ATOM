@@ -11,6 +11,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from test_backend_step_linear_fit import traced
 from test_op_graph import g
 from test_work import SPEC
 
@@ -106,7 +107,7 @@ def _record(directory, steps, stretch=None, idle_after=(), rank=0, group=None):
         )
         t += busy
     (directory / f"dp{rank}.jsonl").write_text(
-        "".join(json.dumps(x) + "\n" for x in lines)
+        "".join(json.dumps(traced(x)) + "\n" for x in lines)
     )
     return directory
 
@@ -116,7 +117,13 @@ def test_the_step_that_moves_the_total_is_held_out_and_the_spread_reported(tmp_p
     record = _record(tmp_path / "steps", _steps(), stretch={4: 0.2})
     report = cost_accuracy(record, LAW)
 
-    assert report["cut"] == {"exposed": 0, "mixed": 0, "unsplit": 0, "paced": 0}
+    assert report["cut"] == {
+        "exposed": 0,
+        "mixed": 0,
+        "unsplit": 0,
+        "untraced": 0,
+        "traced": 0,
+    }
     assert report["unvalidated"] == {} and report["refused"] == {}
     prefill = report["validated"]["prefill"]
     assert prefill["steps"] == 10
@@ -147,7 +154,13 @@ def test_unvalidated_and_refused_steps_are_reported_apart(tmp_path):
     record = _record(tmp_path / "steps", steps, stretch={3: 2.0})
     report = cost_accuracy(record, LAW)
 
-    assert report["cut"] == {"exposed": 0, "mixed": 0, "unsplit": 0, "paced": 0}
+    assert report["cut"] == {
+        "exposed": 0,
+        "mixed": 0,
+        "unsplit": 0,
+        "untraced": 0,
+        "traced": 0,
+    }
     (unvalidated,) = report["unvalidated"].values()
     assert unvalidated["steps"] == 1
     assert unvalidated["real_s"] == pytest.approx(2 * _price(wide[0]), rel=1e-9)
@@ -347,7 +360,8 @@ def test_a_group_step_prices_as_its_slowest_rank_against_the_group_s_time(tmp_pa
         "exposed": 0,
         "mixed": 0,
         "unsplit": 0,
-        "paced": 0,
+        "untraced": 0,
+        "traced": 0,
         "ranks": 0,
     }
     assert report["warm"] == [] and report["refused"] == {}
@@ -438,7 +452,8 @@ def test_a_peer_s_dummy_forward_is_priced_0_s_and_its_step_graded(tmp_path):
         "exposed": 0,
         "mixed": 0,
         "unsplit": 0,
-        "paced": 0,
+        "untraced": 0,
+        "traced": 0,
         "ranks": 0,
     }
     assert report["unvalidated"] == {} and report["refused"] == {}
@@ -454,6 +469,39 @@ def test_a_peer_s_dummy_forward_is_priced_0_s_and_its_step_graded(tmp_path):
     for r, s in enumerate(stopped):
         _record(tmp_path / "stopped", s, rank=r, group=stopped)
     assert cost_accuracy(tmp_path / "stopped", LAW)["cut"]["ranks"] == 1
+
+
+def test_a_rank_that_ran_only_dummy_forwards_adds_no_step(tmp_path):
+    # Rank 2, which no request reached, runs a dummy beside each of the other
+    # ranks' steps: the record grades as theirs alone does.
+    served, idle = _two_ranks(), [(None, None)] * 10 + [(None, 1)] * 10
+    for r, steps in enumerate(served):
+        _record(tmp_path / "alone", steps, rank=r, group=served)
+    ranks = [*served, idle]
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "steps", steps, rank=r, group=ranks)
+    report = cost_accuracy(tmp_path / "steps", LAW)
+
+    alone = cost_accuracy(tmp_path / "alone", LAW)
+    assert report == {**alone, "record": str(tmp_path / "steps")}
+    assert report["cut"]["ranks"] == 0
+    assert report["validated"]["decode"]["steps"] == 10
+
+    # Its last step was in flight: that step is cut, as beside a rank that served.
+    stopped = [*served, idle[:-1]]
+    for r, steps in enumerate(stopped):
+        _record(tmp_path / "stopped", steps, rank=r, group=stopped)
+    report = cost_accuracy(tmp_path / "stopped", LAW)
+    assert report["cut"]["ranks"] == 1
+    assert report["validated"]["decode"]["steps"] == 9
+
+    # No rank ran a forward: the record refuses.
+    (tmp_path / "idle").mkdir()
+    for r in range(2):
+        dummies = (tmp_path / "steps/dp2.jsonl").read_text()
+        (tmp_path / f"idle/dp{r}.jsonl").write_text(dummies)
+    with pytest.raises(ValueError, match="ranks ran only DP's dummy forwards"):
+        cost_accuracy(tmp_path / "idle", LAW)
 
 
 def test_a_group_step_is_banded_by_its_costliest_rank_not_rank_0(tmp_path):

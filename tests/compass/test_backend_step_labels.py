@@ -24,6 +24,7 @@ from test_backend_step_linear_fit import (
     _steps,
     _timed_record,
     _view,
+    traced,
 )
 from test_memory_readings import DOCUMENT, META_8B
 from test_parity_device_window import BUSY, GAP, _recorded
@@ -68,7 +69,10 @@ def _stamped(tmp_path, monkeypatch):
         runner.forward(batch)
     device.tick = BUSY // 3
     runner.exit()
-    return tmp_path / "real" / "dp0.jsonl"
+    record = tmp_path / "real" / "dp0.jsonl"
+    lines = [traced(json.loads(x)) for x in record.read_text().splitlines()]
+    record.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    return record
 
 
 def test_a_stamped_record_is_labelled_by_step_kind(tmp_path, monkeypatch):
@@ -411,13 +415,16 @@ def _dp_view(rows, rank, **group):
 #: gather pads the group's 4 real rows to 8, then a prefill step split in two.
 GROUP = [
     [
-        _dp_view(decode, rank, capture_rung=4, moe_rows=8, moe_tokens=4),
+        _dp_view(
+            decode, rank, capture_rung=4, moe_rows=8, moe_tokens=4, group_max_tokens=3
+        ),
         _dp_view(
             prefill,
             rank,
             moe_rows=900,
             moe_tokens=900,
             tbo_tokens=((300, 200), (200, 200)),
+            group_max_tokens=500,
         ),
     ]
     for rank, decode, prefill in (
@@ -509,7 +516,7 @@ def test_a_prefill_launch_the_device_held_gives_no_W_launch_label(tmp_path):
 
     assert [s.step for s in samples if "W_launch" not in s.host] == held
     assert [row["step"] for row in table if row["W_launch"] is None] == held
-    assert [samples[n].cut for n in long] == ["exposed", "paced"]
+    assert [samples[n].cut for n in long] == ["exposed", None]
     got = fit_host(samples)[0]["laws"]["middle"]["W_launch"]
     assert got == pytest.approx(HOST["middle"]["W_launch"], rel=1e-4, abs=1e-12)
 

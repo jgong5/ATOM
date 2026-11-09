@@ -9,35 +9,35 @@ from the package ``__init__``.
 import asyncio
 import heapq
 import itertools
+import math
 
 from aiperf.common.loop_scheduler import LoopScheduler
 
 
 class _Timer:
-    """A pending entry in ``LoopScheduler._handles`` that fires at clock time ``at``."""
+    """A pending entry in ``LoopScheduler._handles`` that fires at clock time ``at``.
 
-    __slots__ = ("at",)
+    ``LoopScheduler`` calls ``cancel`` as it drops the timer.
+    """
 
-    def __init__(self, at: float) -> None:
-        self.at = at
+    __slots__ = ("at", "cancel")
+
+    def __init__(self, at: float, cancel) -> None:
+        self.at, self.cancel = at, cancel
 
     def when(self) -> float:
         return self.at
-
-    def cancel(self) -> None:
-        pass
 
 
 class ClockPacedLoopScheduler(LoopScheduler):
     """``LoopScheduler`` whose pacing calls wait on ``clock``, never on the event loop's timers.
 
     ``clock`` is bound before the first phase runner is built. It has
-    ``now()``, the current time in seconds, and ``async advance_to(t)``, which
-    returns once the clock may run to ``t``; it may return earlier, at a time
-    something else is due, and the scheduler then asks again. Each grant wakes
-    every pending wait. A timer armed or capped earlier than the time the driver
-    waits for is asked for in a wait of its own, and the driver's wait stays
-    pending: cancelling it would cancel a future the clock holds.
+    ``now()``, the current time in seconds, ``wait(t)``, a future resolved once
+    the clock reaches ``t``, and ``withdraw(fut)``, which drops a wait, so it
+    asks the clock for nothing, and resolves it now. The driver waits for the
+    earliest pending timer; a timer armed or capped earlier than that wait, or
+    any timer's cancel, withdraws it, and the driver reads its timers again.
 
     The driver takes the earliest pending timer, the first armed among equals,
     from a heap of the timers armed, so a wake does not read every pending
@@ -56,9 +56,8 @@ class ClockPacedLoopScheduler(LoopScheduler):
         super().__init__(*args, **kwargs)
         self._clock = self.clock
         self._driver: asyncio.Task | None = None
-        # While the driver waits on the clock: the earliest time asked since.
-        self._waiting_for: float | None = None
-        self._asks: set[asyncio.Task] = set()
+        # While the driver waits on the clock: the time it waits for, and the wait.
+        self._wait: tuple[float, asyncio.Future] | None = None
         # (at, arming order, timer) of every timer armed, a heap.
         self._queue: list[tuple[float, int, _Timer]] = []
         self._armed = itertools.count()
@@ -66,23 +65,20 @@ class ClockPacedLoopScheduler(LoopScheduler):
     def schedule_later(self, delay_sec, coro, *, group_id=None):
         if delay_sec <= 0:
             return self.execute_async(coro)
-        timer = _Timer(self._clock.now() + delay_sec)
+        timer = _Timer(self._clock.now() + delay_sec, self._wake)
         handle_id = self._track_handle_and_return_id(timer, coro, group_id=group_id)
         heapq.heappush(self._queue, (timer.at, next(self._armed), timer))
         if self._driver is None or self._driver.done():
             self._driver = self._loop.create_task(self._drive())
-        self._ask_earlier(timer.at)
+        self._wake(timer.at)
         return handle_id
 
-    def _ask_earlier(self, at: float) -> None:
-        """Ask the clock for ``at`` beside the driver's wait for a later time."""
-        if self._waiting_for is None or at >= self._waiting_for:
-            return
-        self._waiting_for = at
-        # Not execute_async: cancel_all would cancel the wait the clock holds.
-        ask = self._loop.create_task(self._clock.advance_to(at))
-        self._asks.add(ask)
-        ask.add_done_callback(self._asks.discard)
+    def _wake(self, before: float = -math.inf) -> None:
+        """Withdraw the driver's clock wait if it waits for a time past ``before``
+        (any wait, by default), so the driver reads its timers again."""
+        if self._wait is not None and self._wait[0] > before:
+            self._clock.withdraw(self._wait[1])
+            self._wait = None
 
     def _wall_clock(self, *args, **kwargs):
         raise NotImplementedError(
@@ -117,7 +113,7 @@ class ClockPacedLoopScheduler(LoopScheduler):
             t.at -= shift
         self._queue = [(t.at, armed, t) for _, armed, t in self._queue]
         heapq.heapify(self._queue)
-        self._ask_earlier(self._clock.now() + max_delay_sec)
+        self._wake(self._clock.now() + max_delay_sec)
         return shift
 
     def _earliest(self) -> tuple:
@@ -131,14 +127,13 @@ class ClockPacedLoopScheduler(LoopScheduler):
             heapq.heappop(self._queue)
 
     async def _drive(self) -> None:
-        # A cancel never interrupts the clock wait: the clock holds that wait and
-        # wakes it at its next grant, and the loop then exits if no timer is left.
+        # Its clock wait is withdrawn, never cancelled: the clock holds that wait.
         while self._handles:
             timer, coro = self._earliest()
             if timer.at > self._clock.now():
-                self._waiting_for = timer.at
-                await self._clock.advance_to(timer.at)
-                self._waiting_for = None
+                self._wait = (timer.at, self._clock.wait(timer.at))
+                await self._wait[1]
+                self._wait = None
             else:
                 self._safe_callback([timer], coro)
             await asyncio.sleep(0)

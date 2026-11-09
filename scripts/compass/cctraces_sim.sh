@@ -46,8 +46,8 @@
 #                   compiling (atom/compass/drive/jit_cache.py); unset, no
 #                   library is touched
 #
-# A run file with `router_s` and `kv_write_req_s` makes the cell 1P1D: the
-# deployment is pd_sim.sh's, and aiperf drives its atomesh router.
+# A run file with `router_s` makes the cell 1P1D: the deployment is pd_sim.sh's,
+# and aiperf drives its atomesh router.
 #
 # It runs its own tree, as the gates do, compass-harness included. OUT_DIR gets
 # run.json (RUN_FILE plus a `workload` entry hashing the traces, the dataset
@@ -172,7 +172,7 @@ run["clock_endpoint"] = f"tcp://127.0.0.1:{ports[0]}"
 # declares more, or none (null, as `compass run` keeps one), leaves the server
 # up after aiperf.
 run["client_runs"] = 1
-if "kv_write_req_s" not in run:
+if "router_s" not in run:
     run["argv"] = ["--", "--model", os.environ["MODEL"], *os.environ["SERVER_ARGS"].split()]
 run["workload"] = {
     "dataset_sha256": sha256(traces),
@@ -183,7 +183,7 @@ run["workload"] = {
 if int(os.environ["REAL"]):
     run["env"] = {k: os.environ[k] for k in ("TRITON_CACHE_AUTOTUNING", "TRITON_CACHE_DIR")}
 (out / "run.json").write_text(json.dumps(run))
-print("1p1d" if "kv_write_req_s" in run else "tp1", *ports)
+print("1p1d" if "router_s" in run else "tp1", *ports)
 sys.stdout.close()
 select.select([os.pidfd_open(int(script))], [], [])
 EOF
