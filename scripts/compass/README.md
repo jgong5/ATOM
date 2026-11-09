@@ -1249,3 +1249,7 @@ smoke above:
   that follows: one such reset left RCCL's all-reduces above aiter's 64 MiB custom
   all-reduce cutoff slow until the node was rebooted, every prefill chunk over 6553 tokens
   37 to 60% slower on the device.
+- `python -m atom.compass.memory.check --tp 4` checks each rank's non-KV memory against the
+  real run's log. Its `non_torch` term, the driver and collective reserve, moves from start
+  to start: at c=1 rank 3 read +10.43% against the 10% gate beside that start's 10.3% spread
+  across ranks, taken as fluctuation.
