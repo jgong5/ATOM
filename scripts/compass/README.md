@@ -1243,13 +1243,18 @@ smoke above:
 - Steps 4 and 5 take `--duration 3600`, one server on the node at a time, and no CPU gate or
   simulated run shares a real run's profiling window.
 - A concurrency's first real run grades it: within 10% on throughput and TPOT and 15% on TTFT
-  it passes; otherwise two more real runs follow, and their mean grades it.
-- A real run that logs no step for 90 s while requests run or wait has hung
+  it passes; otherwise two more real runs follow, and the mean of the three grades it. No
+  checked-in command grades this yet: `python -m atom.compass.validate` and `validate.runs`
+  refuse fewer than two real runs, and
+  [#3101](https://github.com/jgong5/ATOM/issues/3101) adds it. #2147's grades came from
+  `agent_scratch/2147/r4/bin/grade.py`, which reads both exports as `validate.runs` does.
+- A real run has hung when, for 90 s while requests run or wait, its log shows neither a step
+  line nor a load report with nonzero prompt or generation throughput
   ([#2922](https://github.com/jgong5/ATOM/issues/2922)). Check the node after the GPU reset
   that follows: one such reset left RCCL's all-reduces above aiter's 64 MiB custom
   all-reduce cutoff slow until the node was rebooted, every prefill chunk over 6553 tokens
   37 to 60% slower on the device.
 - `python -m atom.compass.memory.check --tp 4` checks each rank's non-KV memory against the
   real run's log. Its `non_torch` term, the driver and collective reserve, moves from start
-  to start: at c=1 rank 3 read +10.43% against the 10% gate beside that start's 10.3% spread
+  to start: at c=1 one rank read +10.43% against the 10% gate beside that start's 10.3% spread
   across ranks, taken as fluctuation.
