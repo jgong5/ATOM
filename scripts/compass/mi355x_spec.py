@@ -306,7 +306,9 @@ def device_fragments() -> list[Fragment]:
         device = {"device": held}
         subject = {"model": model, "width": width, "source_root": f"commit:{root}"}
         subject["record"] = f"sha256:{record}"
-        how = f"run.json's stack, one TP{width} start at {root} after aiter_c90842add0.sh"
+        how = (
+            f"run.json's stack, one TP{width} start at {root} after aiter_c90842add0.sh"
+        )
         stack = [fragment("stack", pinned, "probed", how, subject, date)]
     fragments = [
         fragment("device", device, "probed", notes, SUBJECT, DATE),

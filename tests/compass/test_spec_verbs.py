@@ -607,7 +607,7 @@ def test_the_gpu40_spec_pins_nightly_20261026_with_the_recipes_aiter(monkeypatch
     document = SPEC_ROOT / "scripts" / "compass" / "machines" / "mi355x-gpu40.json"
     assert validate(json.loads(document.read_text())).ok
     recipe = SPEC_ROOT / "scripts" / "compass" / "aiter_c90842add0.sh"
-    patched = re.search(r"^PATCHED=([0-9a-f]{40})$", recipe.read_text(), re.M)
+    patched = re.search(r"^PATCHED=([0-9a-f]{40})$", recipe.read_text(), re.MULTILINE)
     pinned = {
         k: spec.value(f"device.software_pinned_to.{k}")
         for k in ("rocm", "aiter", "rccl", "torch")
