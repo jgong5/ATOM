@@ -15,7 +15,9 @@ rebuilds `moe_tokens` from every rank's line, and, when its host key's engine
 states `enable_tbo`, the caller's `split_rule`, ATOM's two-batch-overlap split
 over those lines, rebuilds `tbo_tokens`; with no rule such a line refuses.
 No line states its group's dummy forwards: a view's `group_dummies` counts the
-run's rank records whose line at its step is a dummy run (`group_dummies`).
+run's rank records whose line at its step is a dummy run (`group_dummies`), and
+its `group_max_tokens` is the most tokens their lines at its step run
+(`group_peaks`).
 A view also takes its line's `target_bs`, `draft_bs`, `draft_moe_rows` and
 `draft_rows`, the widths and rows its target and drafter ran at, which an op
 graph reads.
@@ -214,6 +216,18 @@ def group_dummies(ranks: Iterable[list[dict]]) -> Counter:
     return Counter(s["step"] for lines in ranks for s in lines if s["is_dummy_run"])
 
 
+def group_peaks(ranks: Iterable[list[dict]]) -> dict[int, int]:
+    """Per step, the most tokens any of `ranks`, one run's rank records as their
+    lines, runs at it, a dummy rank's its rows': ATOM's largest
+    `num_tokens_across_dp`."""
+    peaks: dict[int, int] = {}
+    for lines in ranks:
+        for s in lines:
+            tokens = sum(q for q, _, _ in s["rows"])
+            peaks[s["step"]] = max(tokens, peaks.get(s["step"], 0))
+    return peaks
+
+
 def _peers(path: Path) -> list[Path]:
     """The rank records of `path`'s run, itself among them: those beside it."""
     return sorted(path.parent.glob(path.name.split("dp")[0] + "dp*[0-9].jsonl"))
@@ -394,11 +408,11 @@ def label(
 
     `run` names the run in each sample's provenance, the record's `digest` by
     default; `split_rule` rebuilds an older record's split, as above. A
-    data-parallel record's `group_dummies` is read from the rank records
-    beside it.
+    data-parallel record's `group_dummies` and `group_max_tokens` are read from
+    the rank records beside it.
     """
     lines = _read(record)
-    return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None)
+    return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None, None)
 
 
 def label_run(
@@ -417,19 +431,19 @@ def label_run(
         )
     n = max(map(len, ranks), default=0)
     starts = [max(_pull(x[i]) for x in ranks if i < len(x)) for i in range(n)]
-    dummy_ranks = group_dummies(ranks)
+    dummy_ranks, peaks = group_dummies(ranks), group_peaks(ranks)
     return [
         (
             ([], [])
             if x and all(s["is_dummy_run"] for s in x)
-            else _label(r, x, run, starts, split_rule, dummy_ranks)
+            else _label(r, x, run, starts, split_rule, dummy_ranks, peaks)
         )
         for r, x in zip(records, ranks)
     ]
 
 
 def _label(
-    record, lines, run, starts, split_rule, dummy_ranks
+    record, lines, run, starts, split_rule, dummy_ranks, peaks
 ) -> tuple[list[Sample], list[dict]]:
     """`label` of `record`'s `lines`, each `E` from `starts` at the line before."""
     path = Path(record)
@@ -460,7 +474,8 @@ def _label(
         dp, tokens = "moe_rows" in s, s.get("moe_tokens")
         split = s.get("tbo_tokens")
         if dp and dummy_ranks is None:
-            dummy_ranks = group_dummies(map(read_jsonl, _peers(path)))
+            peers = [read_jsonl(p) for p in _peers(path)]
+            dummy_ranks, peaks = group_dummies(peers), group_peaks(peers)
         if dp and tokens is None:
             if ranks is None:
                 ranks = [{t["step"]: t for t in read_jsonl(p)} for p in _peers(path)]
@@ -487,6 +502,7 @@ def _label(
             moe_tokens=tokens,
             dp_rank=s["dp_rank"] if dp else None,
             group_dummies=dummy_ranks.get(s["step"], 0) if dp else 0,
+            group_max_tokens=peaks.get(s["step"]) if dp else None,
         )
         cut = None
         if view.prefill and view.decode:

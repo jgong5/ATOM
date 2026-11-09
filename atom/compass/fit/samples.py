@@ -27,15 +27,16 @@ Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
 config.json's digest; `device`, each GPU's `<name> <arch>`, as a spec states
 it; `engine_config`, `keyed`'s fields, the parallel layout among them;
-`source_root`, `<revision_kind>-<revision>`; `sampling`, the request
+`prefill_buckets`, the prefill token-graph buckets it states, where it states
+some; `source_root`, `<revision_kind>-<revision>`; `sampling`, the request
 parameters, null for a record serving no client run's request; its host key
 less its model and engine; its `stack`, the software versions run.json
 names; and its `ptl`, the cards' PTL state, `unrecorded` for a run.json that
-names none. A measurement reads the same fields but the host key and stack from its
-key, whose `engine_config` and `sampling` are JSON objects as text. A field
-that differs between inputs refuses, naming each value and the inputs holding
-it; so do a profiled record and a record whose requests carry two sets of
-request parameters.
+names none. A measurement reads the same fields but the host key, stack and
+prefill buckets from its key, whose `engine_config` and `sampling` are JSON
+objects as text. A field that differs between inputs refuses, naming each
+value and the inputs holding it; so do a profiled record and a record whose
+requests carry two sets of request parameters.
 """
 
 import dataclasses
@@ -45,6 +46,7 @@ from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, Topology
 from atom.compass.backends.shape import BatchView, RequestShape
+from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS
 from atom.compass.backends.step_labels import Sample, digest, label_run
 from atom.compass.drive import aiter_jit
 from atom.compass.drive.identity import PTL_CHANGES
@@ -133,7 +135,7 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
             samples.append(dataclasses.replace(s, provenance=traced))
     engine = json.loads((steps / "dp0.engine.json").read_text())
     host = run["host_key"]
-    return samples, {
+    config = {
         **fields,
         "engine_config": keyed_of(engine),
         "stack": run["stack"],
@@ -141,6 +143,9 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
         "sampling": json.loads(sampling[0]) if sampling else None,
         "host_key": {k: v for k, v in host.items() if k not in ("model", "engine")},
     }
+    if PREFILL_BUCKETS in engine:
+        config[PREFILL_BUCKETS] = engine[PREFILL_BUCKETS]
+    return samples, config
 
 
 def run_fields(run: dict, record="run.json") -> dict:

@@ -348,9 +348,10 @@ def _record(runner):
         record = None
         if directory and runner.rank == 0:
             directory = record_dir(directory, runner.config)
-            from atom.compass.backends.step_grid_plan import UNKEYED
+            from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, UNKEYED
             from atom.compass.backends.step_linear_fit import CONTEXT_PARALLEL
             from atom.compass.run.step_grid import keyed
+            from atom.utils.region_graph import TokenGraph
 
             pc = runner.config.parallel_config
             pp = runner.config.pipeline_parallel_size > 1
@@ -363,6 +364,8 @@ def _record(runner):
             for name in CONTEXT_PARALLEL:
                 if (width := getattr(runner.config, name, 1)) > 1:
                     engine[name] = width
+            if buckets := TokenGraph.captured_sizes("prefill"):
+                engine[PREFILL_BUCKETS] = list(buckets)
             record.path.with_suffix(".engine.json").write_text(json.dumps(engine))
             key = getattr(runner, "host_key", None)
             if key is not None:
