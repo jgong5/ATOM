@@ -34,7 +34,6 @@ from atom.compass.backends import (
     step_linear_fit,
 )
 from atom.compass.backends.step_labels import digest
-from atom.compass.parity import StepRecording
 from atom.compass.parity import _record as parity_record
 from atom.compass.runner import projection
 from atom.utils.region_graph import TokenGraph
@@ -319,31 +318,6 @@ def test_a_record_states_the_prefill_buckets_its_runner_recorded(tmp_path, monke
     path = parity_record(SimpleNamespace(rank=0, config=_config())).path
     engine = json.loads(path.with_suffix(".engine.json").read_text())
     assert engine["prefill_buckets"] == [256, 512]
-
-
-def test_a_capture_after_the_record_s_first_step_adds_the_buckets_it_recorded(
-    tmp_path, monkeypatch
-):
-    class _Base:
-        def __init__(self):
-            self.rank, self.config = 0, _config()
-
-        def capture_cudagraph(self):
-            monkeypatch.setattr(
-                TokenGraph, "captured_sizes", lambda phase=None: (256, 512)
-            )
-            return 0.0, [], 0
-
-    class _Recorded(StepRecording, _Base):
-        pass
-
-    monkeypatch.setenv("ATOM_COMPASS_PARITY_RECORD", str(tmp_path))
-    runner = _Recorded()
-    # The dynamic-chunking sweep's first forward makes the record before capture.
-    engine = parity_record(runner).path.with_suffix(".engine.json")
-    assert "prefill_buckets" not in json.loads(engine.read_text())
-    assert runner.capture_cudagraph() == (0.0, [], 0)
-    assert json.loads(engine.read_text())["prefill_buckets"] == [256, 512]
 
 
 @pytest.mark.parametrize("dp", [1, 2])

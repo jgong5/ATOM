@@ -42,9 +42,8 @@ of each DP rank writes `dp<rank>.jsonl` there, replacing any earlier file
 (pipeline stage `k` above 0: `pp<k>.dp<rank>.jsonl`, its other files alike;
 a RapidServe engine in its `record_dir`).
 Unset, nothing is recorded. On its first step it also writes the engine its
-runner resolved to `dp<rank>.engine.json` (`README.md` says what it holds),
-adding the prefill buckets a capture after that step records, and a runner with
-a `host_key` writes that to `dp<rank>.key.json`. The simulated
+runner resolved to `dp<rank>.engine.json` (`README.md` says what it holds), and
+a runner with a `host_key` writes that to `dp<rank>.key.json`. The simulated
 runner records from `NonAllocatingRunner.forward`; a real one records through
 `StepRecording`, composed into `RUNNER`, which the frontend names on a real run
 with the variable set.
@@ -513,20 +512,6 @@ class StepRecording:
 
         # The KV connector is built here, before any request can reach it.
         self._writes = writes.install(self)
-        return reply
-
-    def capture_cudagraph(self):
-        reply = super().capture_cudagraph()
-        from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS
-        from atom.utils.region_graph import TokenGraph
-
-        # A forward before capture, the dynamic-chunking sweep's, made the
-        # record and its engine file before any prefill bucket was recorded.
-        record = getattr(self, "_parity_record", None)
-        if record is not None and (buckets := TokenGraph.captured_sizes("prefill")):
-            path = record.path.with_suffix(".engine.json")
-            engine = json.loads(path.read_text())
-            path.write_text(json.dumps({**engine, PREFILL_BUCKETS: list(buckets)}))
         return reply
 
     def flush_pp_send(self):
