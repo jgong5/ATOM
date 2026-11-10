@@ -1479,6 +1479,74 @@ def test_v4_bf16_prefill_attention_takes_v4_s_lists_by_ratio_and_v41_s_leaf_its_
     }
 
 
+def test_v41_attention_takes_the_lists_atom_s_index_build_writes_for_its_pass(
+    monkeypatch,
+):
+    # V4.1's attention at ratio 2, its first layer there layer 2, over a
+    # prefill's 4 rows and over its replay's query, whose row pointers ATOM
+    # gathers at the query's rows (1, 0). ATOM's cache builds for the rows a
+    # pass's batch ids keep lists `100 k` on, off a selection the bench
+    # spreads over each row's visible rows, written on no step ATOM prepared.
+    from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep
+    from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
+
+    i32, built, taken = torch.int32, [], {}
+
+    def attention_indices(spec, step):
+        built.append((spec.layer_id, step.selected[spec.topk_owner][0, 0].tolist()))
+        n = int(step.batch_ids.ge(0).sum())
+        return [torch.arange(n * k, dtype=i32) + 100 * k for k in (1, 2, 3, 4)]
+
+    def call(stub, op, sig, instances, n):
+        taken[op["args"]["q"]["shape"][0]] = stub._copy(op, sig, instances, 0)[0]
+        return {}
+
+    monkeypatch.setattr(ops.Stub, "_time", call)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner = _Runner()
+    for layer, mode in ((2, AttentionMode.FULL), (3, AttentionMode.REUSE)):
+        runner.model.append(torch.nn.Module())
+        runner.model[-1].spec = LayerAttentionSpec(layer, 2, mode, 2, 2)
+    visible = {2: torch.tensor([600, 600, 601, 601], dtype=i32)}
+    step = BatchStep((), *(torch.zeros(4, dtype=i32),) * 4, None, visible=visible)
+    step.decoder = SimpleNamespace(
+        tail=step, tail_rows=torch.zeros(3), last=torch.zeros(1), filled_gpu=None,
+        finishing_gpu=None, query_ids=torch.tensor([-1, -1, 0, -1], dtype=i32),
+        query_ptrs=torch.tensor([1, 0], dtype=i32),
+    )  # fmt: skip
+    cache = SimpleNamespace(attention_indices=attention_indices)
+    cache.geometry = SimpleNamespace(batch_topk=lambda ratio: 8)
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        vars(fctx._forward_context.attn_metadata).update(step=step, cache=cache)
+        return out
+
+    runner.prepare_model = prepare_model
+
+    def attend(rows, *slots):
+        args = [(s, _t([n], "activation", dtype="torch.int32")) for s, n in slots]
+        q = "q", _t([rows, 2, 4], "activation")
+        leaf = _leaf("aiter.pa_sparse_prefill_opus.default", q, *args)
+        return dataclasses.replace(leaf, stated=(("compress_ratio", 2),))
+
+    prefix = "kv_indices_prefix"
+    leaves = attend(4, (prefix, 4), ("kv_indices_extend", 12))
+    leaves = leaves, attend(1, (prefix, 1), ("kv_indptr_prefix", 2))
+    found = ops.leaves(_graph(*leaves, layers=1)["region"])
+    placed = SimpleNamespace(block_size=32, batch=lambda *a: a[1:])
+    ops.Stub(runner, 10_000).point(placed, prefill(4, 1), 1196, found)
+
+    assert taken[4]["kv_indices_prefix"].tolist() == [100, 101, 102, 103]
+    assert taken[4]["kv_indices_extend"].tolist() == list(range(300, 312))
+    assert taken[1]["kv_indices_prefix"].tolist() == [100]
+    assert taken[1]["kv_indptr_prefix"].tolist() == [201, 200]
+    # each build layer 2's, its rows' 8 ids spread, the newest last
+    assert {b[0] for b in built} == {2} and step.selected == {}
+    assert built[0][1] == [74, 149, 224, 299, 374, 449, 524, 599]
+
+
 def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
     layers = {f"model.layers.{i}.attn": SimpleNamespace(layer_num=i) for i in (0, 1)}
     kv = {f"layer_{i}": SimpleNamespace(k_cache=torch.zeros(64, 16, 4)) for i in (0, 1)}
