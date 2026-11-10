@@ -10,8 +10,9 @@ differs between the two is affine in the context (`ir.Affine`), or the shape
 is refused by operator and slot.
 
 Each leaf carries its contract: its arguments by schema slot, a tensor as its
-shape, dtype, stride, role and the `is_shuffled` mark ATOM sets on a
-preshuffled weight. A tensor's role is where its storage came from:
+shape, dtype, stride, role, the `is_shuffled` mark ATOM sets on a
+preshuffled weight, and its device when ATOM holds it on the host (a copy's
+host-staged source). A tensor's role is where its storage came from:
 the model's parameters, buffers and tensor attributes are weights, what
 `allocate_kv_cache` allocated is KV, what the model's forward and the sampler
 after it allocated is an activation, and anything else (the runner's buffers,
@@ -742,7 +743,8 @@ class _Recorder(TorchDispatchMode):
                 [self._live(d) if d is ir.G else d for d in s]
                 for s in (value.shape, value.stride)
             )
-            return torch.empty_strided(shape, stride, dtype=dtype, device="cuda")
+            device = "cpu" if value.host else "cuda"
+            return torch.empty_strided(shape, stride, dtype=dtype, device=device)
         if isinstance(value, ir.ContextRef) and LAYER in value.index_names:
             value = value.bind(**{LAYER: self.layer})
         if not isinstance(value, ir.ModuleRef):
@@ -786,7 +788,8 @@ class _Recorder(TorchDispatchMode):
                 map(self._dim, value.stride())
             )
             shuffled = bool(getattr(value, "is_shuffled", False))
-            return ir.Tensor(shape, str(value.dtype), stride, role, shuffled)
+            host = value.device.type == "cpu"
+            return ir.Tensor(shape, str(value.dtype), stride, role, shuffled, host)
         if isinstance(value, torch.nn.Module) and id(value) in self.modules:
             return ir.ModuleRef(self._layered(self.modules[id(value)]))
         if isinstance(value, str) and value in self.contexts:

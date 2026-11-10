@@ -122,6 +122,29 @@ def test_every_leaf_reaches_its_launch_but_a_host_copy(rehearsed):
     assert triton
 
 
+def test_an_argument_atom_holds_on_the_host_is_built_there_bound_to_no_buffer(
+    rehearsed,
+):
+    """Each argument the capture states on the host, the sources of V4.1's
+    staged cursor and slot copies among them, is built on the host, pinned:
+    no buffer of ATOM's binds it, and its leaf reaches its launch, but the
+    cursors' copy to the host."""
+    from atom.compass.bench import ops
+
+    got, _ = rehearsed
+    hosted = [
+        (r, path)
+        for r in got["cached"]
+        for path, spec in ops._specs(json.loads(r["leaf"])["args"])
+        if spec.get("device") == "cpu"
+    ]
+    assert "aten.copy_.default" in {r["op"] for r, _ in hosted}
+    for r, path in hosted:
+        why = r["shape"], r["op"], path, r["bound"], r["why"]
+        assert path not in {*r["bound"], *r["identity"]}, why
+        assert r["verdict"] == "reaches launch" or r["op"] == HOST_COPY, why
+
+
 def test_a_prefill_whose_forward_runs_its_tail_s_rows_refuses_by_name(rehearsed):
     """Its leaves' rows cannot say which pass each runs, so none is bound."""
     got, _ = rehearsed
