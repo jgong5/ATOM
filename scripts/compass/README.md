@@ -1198,8 +1198,8 @@ store. A record without a store touches no library.
    HIP's blocking calls (`atom/compass/parity/README.md`); `compass fit host`
    names a record taken without it. Then the trace runs (below), which take no
    tool: per concurrency 16 and 4, `compass record --trace --gpu G --out
-   $R/trace/c<C> -- $ATOM` and `WAIT_S=3600 client.sh $R/trace/c<C> --traces
-   256-392 --concurrency <C> --duration 120 --stop`.
+   $R/trace/c<C> -- $ATOM` and `client.sh $R/trace/c<C> --traces 256-392
+   --concurrency <C> --duration 120 --stop`.
 3. `compass fit steps --backend step-linear --form history $R/cal/c* $R/trace/c*
    --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M $S --out
    $R/fit`, every record and trace run named before the first `--client-run`, and
@@ -1227,14 +1227,11 @@ a second trace run, and one of the two to fit the vector alone, since the fit pr
 each run by the law fitted on the others; with one trace run, every prefill term prices
 unvalidated. Leave the trace runs out of `compass fit host`: their host segments ran
 under the profiler. A higher concurrency holds more prefill steps in the same time.
-Kineto keeps at most 5,000,000 rows a process and drops later ones unmarked, so a trace
-run past that is refused at its stop where one rank filled first, and otherwise prices
-its later prefills at no busy time ([#3106](https://github.com/jgong5/ATOM/issues/3106)).
-Until [#3111](https://github.com/jgong5/ATOM/pull/3111) lifts the cap, start every
-`compass record --trace`, or `calibrate.sh`, with `KINETO_CONFIG` naming a file that
-reads `ROCTRACER_MAX_EVENTS=2000000000`. The stop then writes and reduces every row,
-which outlasts `client.sh`'s default 600 s wait, hence `WAIT_S=3600`. With the cap
-raised, take again a trace run refused at its stop.
+`compass record --trace` raises kineto's row cap, 5,000,000 rows a process by default
+([#3106](https://github.com/jgong5/ATOM/issues/3106)), and its stop writes and reduces
+every row, for which `client.sh --stop` gives a trace run an hour more. A trace run
+that lost a forward's device rows all the same is refused at its stop, naming the rank
+and forward: take it again.
 
 Developer checks, outside the `compass` path:
 - After step 2: `python -m atom.compass.parity.recurrence $R/cal/c<C>/steps`.
@@ -1365,8 +1362,8 @@ and 5 at concurrency 16 alone, with these changes:
   `AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"`:
   sampled starts leave rung 6 and above too few steps for a vector, and a step at a
   rung with none is refused.
-- The trace runs need the raised cap: the EP4 cell's 120 s runs logged 14.3M to 14.7M
-  kineto rows a rank, and each stop took about 11 min to write and reduce them
+- The EP4 cell's 120 s trace runs logged 14.3M to 14.7M kineto rows a rank, about three
+  times the default cap, and each stop took about 11 min to write and reduce them
   ([#3113](https://github.com/jgong5/ATOM/pull/3113#issuecomment-6757261953)). In their
   first 120 s, #2789's cell-B calibration records at `aeffa7d63` hold 30 prefill steps
   at c=4 and 125 at c=16.

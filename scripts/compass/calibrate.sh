@@ -34,8 +34,6 @@
 #   CAL_TRACES      the traces each record's client is given (default 256-392)
 #   DURATION_S      each record's client run's benchmark duration (default 1800)
 #   TRACE_S         each trace run's client run's benchmark duration (default 120)
-#   TRACE_WAIT_S    client.sh's WAIT_S for a trace run, the seconds its command
-#                   has to write and reduce its traces once stopped (default 3600)
 #   SERVER_ARGS     ATOM's arguments after --model (default: --max-model-len
 #                   262144)
 #   WAIT_S          seconds a server has to start (default 1800)
@@ -71,7 +69,6 @@ for r; do [[ $r =~ ^(trace )?[1-9][0-9]*( |$) ]] || bad "RECORD '$r' does not st
 for v in MODEL GPU MACHINE TRACES AIPERF_PYTHON; do [[ -n ${!v-} ]] || bad "$v is not set"; done
 MODEL=$(realpath "$MODEL") MACHINE=$(realpath "$MACHINE")
 CAL=${CAL_TRACES:-256-392} DURATION_S=${DURATION_S:-1800} WAIT_S=${WAIT_S:-1800} TRACE_S=${TRACE_S:-120}
-TRACE_WAIT_S=${TRACE_WAIT_S:-3600}
 # shellcheck disable=SC2206 # SERVER_ARGS is a word list
 ATOM_ARGS=(--model "$MODEL" ${SERVER_ARGS:---max-model-len 262144})
 CLI='from atom.compass.cli import main; main()'
@@ -119,10 +116,10 @@ step() {
 # serve NAME A-B C S SCENARIO [FLAG]: one compass record server, given FLAG,
 # writing to OUT/NAME, and one client run of traces A to B at concurrency C for
 # S seconds under SCENARIO, which stops it. A trace run's server (FLAG) loads
-# no tool, and its client waits TRACE_WAIT_S for it to leave.
+# no tool.
 serve() {
-    local name=$1 dir=$OUT/$1 pid deadline tool=(ROCP_TOOL_LIBRARIES="$TOOL") stop=()
-    [[ -n ${6-} ]] && tool=() stop=(WAIT_S="$TRACE_WAIT_S")
+    local name=$1 dir=$OUT/$1 pid deadline tool=(ROCP_TOOL_LIBRARIES="$TOOL")
+    [[ -n ${6-} ]] && tool=()
     say "$name"
     env "${tool[@]}" python3 -c "$CLI" record --gpu "$GPU" ${6:+"$6"} --out "$dir" -- "${ATOM_ARGS[@]}" >"$OUT/$name.log" 2>&1 &
     pid=$!
@@ -132,7 +129,7 @@ serve() {
         ((SECONDS < deadline)) || fail "$name" "no server after $WAIT_S s"
         sleep 1
     done
-    HARNESS_PYTHON=$AIPERF_PYTHON AIPERF_EXTRA_ARGS=$5 env "${stop[@]}" "$ROOT/scripts/compass/client.sh" "$dir" \
+    HARNESS_PYTHON=$AIPERF_PYTHON AIPERF_EXTRA_ARGS=$5 "$ROOT/scripts/compass/client.sh" "$dir" \
         --traces "$2" --concurrency "$3" --duration "$4" --stop >"$OUT/$name.client.log" 2>&1 &
     wait $! || fail "$name" "client.sh exit $?; see $OUT/$name.client.log"
     wait $pid || fail "$name" "its server exit $?; see $OUT/$name.log"

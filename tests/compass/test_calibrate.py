@@ -59,7 +59,6 @@ print(tool)
 """
 CLIENT = """#!/bin/bash
 echo "client $* $HARNESS_PYTHON [$AIPERF_EXTRA_ARGS]" >> "$LOG"
-echo "${WAIT_S-}" >"$1.wait_s"
 if [[ -n ${CLIENT_FAIL-} && $1 == *$CLIENT_FAIL* ]]; then
     mkdir -p "$1/artifacts" && echo {} >"$1/artifacts/client_run.json"
     exit 1
@@ -248,12 +247,10 @@ def test_a_trace_run_refused_at_its_stop_is_taken_again(tmp_path):
     assert log[0] == f"record --gpu 7 --trace --out {tmp_path}/o/trace2-c4"
 
 
-def test_a_trace_run_loads_no_tool_and_waits_out_its_stop(tmp_path):
+def test_every_server_but_a_trace_run_s_loads_the_tool(tmp_path):
     r, _ = _calibrate(tmp_path, "1", "trace 4")
     assert r.returncode == 0, r.stderr
     o = tmp_path / "o"
     tool = f"{o}/tool/libcompass_blocked.so"
     loaded = [(o / d / "tool").read_text() for d in ("warm", "cal1-c1", "trace2-c4")]
     assert loaded == [tool, tool, ""]
-    waits = [(o / f"{d}.wait_s").read_text().strip() for d in ("cal1-c1", "trace2-c4")]
-    assert waits == [os.environ.get("WAIT_S", ""), "3600"]
