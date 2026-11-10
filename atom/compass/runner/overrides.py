@@ -104,7 +104,6 @@ import math
 import os
 import pickle
 import sys
-import time
 from functools import partial, wraps
 from typing import Any
 
@@ -278,6 +277,9 @@ MTP_COPY = "L_mtp"
 PP_RECV_SEGMENT = "W_recv"
 #: The engine loop from a forward's exit to its next input pull: the charge's `out_s`.
 OUT_SEGMENT = "E_out"
+#: The wall seconds an op-graph run's `compass_lazy` sums: its lookups, and its
+#: backend's `price` calls, the lookups among them.
+WALLS = ("lookup_wall_seconds", "price_wall_seconds")
 #: Every segment a law may price.
 SEGMENTS = (*HOST_SEGMENTS, MTP_SEGMENT, MTP_COPY, PP_RECV_SEGMENT, OUT_SEGMENT)
 FORWARD_KINDS = ("decode", "prefill", "middle")
@@ -1736,10 +1738,10 @@ def _group_step_seconds(
     by rank, or None with one rank. `_out_s` is the host's ``out_s`` for this
     step, the seconds from its return to the engine's next input pull, or
     None; `_group_out` holds each rank's target plus its ``out_s``, for the
-    ranks with one, or None. The group's first rank, or a rank of no group,
-    adds to `_waited` the wall seconds of the step's pricing the group waited
-    on: the lookups (`compass_lazy`'s ``lookup_wall_seconds``) and the rest of
-    the pricing of the rank whose sum of the two is largest.
+    ranks with one, or None. In an op-graph run, the group's first rank, or a
+    rank of no group, adds to `_waited` the wall seconds of the step's price
+    the group waited on: the lookups and the rest of the price (`WALLS`) of
+    the rank whose sum of the two is largest.
 
     A pipeline stage runs only its own layers, so it is refused unless its
     backend states the `stage_share` it prices; any other backend prices the
@@ -1806,7 +1808,7 @@ def _group_step_seconds(
         batch.compass_admitted = admitted(batch, seen, entry)
     dummies = dummy_ranks(batch, mode)
     lazy = vars(runner).get("compass_lazy", {})
-    looked, began = lazy.get("lookup_wall_seconds", 0), time.monotonic()
+    walls = [lazy.get(k, 0) for k in WALLS]
     try:
         if view is None:
             view = batch_view(batch, mode, runner, dummies)
@@ -1829,8 +1831,8 @@ def _group_step_seconds(
         mix.record(cost)
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
         terms = (*cost.terms, *cost.draft_terms)
-    lookup_s = lazy.get("lookup_wall_seconds", 0) - looked
-    pricing_s = time.monotonic() - began - lookup_s
+    lookup_s, price_s = (lazy.get(k, 0) - w for k, w in zip(WALLS, walls))
+    pricing_s = price_s - lookup_s
     # `decide` returns the collective's rows for a group of one too.
     many = mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1
     group = dp_group() if many else None
@@ -1874,8 +1876,8 @@ def _group_step_seconds(
         group_s = targets[group.rank()]
         # The group leaves the gather when its slowest rank to price arrives.
         waited = max((r[3:] for r in rows), key=sum)
-    # The group's waits, kept once: on its first rank.
-    if group is None or group.rank() == 0:
+    # An op-graph run's group waits, kept once: on its first rank.
+    if lazy and (group is None or group.rank() == 0):
         kept = vars(runner).setdefault("_waited", [0.0, 0.0])
         kept[:] = [k + w for k, w in zip(kept, waited)]
     vars(runner)["_group_targets"] = targets

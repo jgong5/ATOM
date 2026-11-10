@@ -1880,13 +1880,15 @@ def op_graph(
     """The `OpGraphBackend` the run file `run` names for `config` on
     `machine` at EP width `ep`, with its price list when it names one; with
     `lazy`, a shape no graph holds is traced from the run file's `ATOM_ARGS`
-    when it holds them (`_op_graphs`), counted in `lazy`; with `env`, its
-    graphs are read under that performance environment (`forward.structure`)."""
+    when it holds them (`_op_graphs`), counted in `lazy`, which also sums each
+    `price` call's wall seconds, its lookups among them, as
+    ``price_wall_seconds``; with `env`, its graphs are read under that
+    performance environment (`forward.structure`)."""
     from atom.compass.backends.op_graph import OpGraphBackend
 
     drafter = getattr(config, "speculative_config", None)
     lazily = (run[ATOM_ARGS], lazy) if lazy is not None and ATOM_ARGS in run else ()
-    return OpGraphBackend(
+    backend = OpGraphBackend(
         machine,
         _op_graphs(
             run["store"], config, machine.value("device.arch"), *lazily, env=env
@@ -1902,6 +1904,20 @@ def op_graph(
         drafts=drafter.num_speculative_tokens if drafter else 0,
         block=bool(drafter) and drafter.use_dspark(),
     )
+    if lazy is None:
+        return backend
+    price = backend.price
+
+    def timed(view):
+        began = time.monotonic()
+        try:
+            return price(view)
+        finally:
+            spent = time.monotonic() - began
+            lazy["price_wall_seconds"] = lazy.get("price_wall_seconds", 0) + spent
+
+    backend.price = timed
+    return backend
 
 
 def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None):

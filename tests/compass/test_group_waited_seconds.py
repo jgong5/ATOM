@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 """A DP group leaves a step's exchange when its slowest rank to price arrives:
-the group's first rank keeps that rank's lookup wall and the rest of its
-pricing wall, and the run summary states them for each group beside the wall
-outside both.
+in an op-graph run the group's first rank keeps that rank's lookup wall and the
+rest of its price wall, and the run summary states them for each group beside
+the wall outside both.
 
-Two ranks run `forward` as `test_dp_step_max` runs them, each priced by a stub
-that first sleeps through a lookup, counted in the runner's `compass_lazy` as
-an op-graph lookup counts its wall, then sleeps through the rest of its
-pricing.
+Two ranks run `forward` as `test_dp_step_max` runs them, each priced by the
+backend `run.op_graph` builds and times, its `OpGraphBackend` a stub that sleeps
+through a lookup, counted as `_op_graphs` counts a lookup's wall, and then
+through the rest of its price.
 """
 
 import json
@@ -18,15 +18,16 @@ import torch
 from test_dp_step_max import Recording, dp2, prefill, runner  # noqa: F401
 
 from atom.compass import run as compass_run
+from atom.compass.backends import op_graph
 from atom.compass.runner.overrides import PricedSteps
 
 
 class Sleeping(Recording):
     """The stub, its price a lookup of `lookup_s` then `pricing_s` besides."""
 
-    def __init__(self, lookup_s=0.0, pricing_s=0.0):
+    def __init__(self, lazy, lookup_s=0.0, pricing_s=0.0):
         super().__init__()
-        self.lookup_s, self.pricing_s, self.lazy = lookup_s, pricing_s, None
+        self.lazy, self.lookup_s, self.pricing_s = lazy, lookup_s, pricing_s
 
     def price(self, batch_view):
         if self.lookup_s:
@@ -37,24 +38,40 @@ class Sleeping(Recording):
         return super().price(batch_view)
 
 
-def ranks(*backends):
-    out = [runner(b, dp_size=len(backends), dp_rank=r) for r, b in enumerate(backends)]
-    for r, b in zip(out, backends):
-        r.compass_lazy = b.lazy = {"lookup_wall_seconds": 0.0}
-    return out
+def ranks(monkeypatch, *sleeps):
+    """A runner per `(lookup_s, pricing_s)` in `sleeps`, one DP group, each
+    priced by `run.op_graph` over a `Sleeping` stub, and the stubs."""
+    monkeypatch.setattr(compass_run, "_op_graphs", lambda *a, **k: None)
+    config = SimpleNamespace(
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=len(sleeps)),
+        kv_cache_dtype="bf16",
+        enable_expert_parallel=False,
+    )
+    machine = SimpleNamespace(value=lambda key: "gfx950")
+    runners, stubs = [], []
+    for rank, sleep in enumerate(sleeps):
+        lazy = {"lookup_wall_seconds": 0.0}
+        stubs.append(Sleeping(lazy, *sleep))
+        monkeypatch.setattr(op_graph, "OpGraphBackend", lambda *a, **k: stubs[-1])
+        backend = compass_run.op_graph({"store": "-"}, config, machine, lazy=lazy)
+        runners.append(runner(backend, dp_size=len(sleeps), dp_rank=rank))
+        runners[-1].compass_lazy = lazy
+    return runners, stubs
 
 
-def test_the_group_keeps_its_slowest_ranks_lookups_and_pricing_once(dp2):  # noqa: F811
+def test_the_group_keeps_its_slowest_ranks_lookups_and_pricing_once(
+    dp2, monkeypatch  # noqa: F811
+):
     # Step 1 waits on rank 1's lookup, step 2 on rank 0's pricing.
-    backends = Sleeping(pricing_s=0.3), Sleeping(lookup_s=0.6)
-    first, second = ranks(*backends)
+    (first, second), stubs = ranks(monkeypatch, (0.0, 0.3), (0.6, 0.0))
     dp2(lambda: first.forward(prefill(8)), lambda: second.forward(prefill(8)))
 
     lookups, pricing = first._waited
     assert lookups >= 0.6 and pricing < 0.3
     assert not hasattr(second, "_waited")
 
-    backends[0].pricing_s, backends[1].lookup_s = 0.9, 0.3
+    stubs[0].pricing_s, stubs[1].lookup_s = 0.9, 0.3
     dp2(lambda: first.forward(prefill(8)), lambda: second.forward(prefill(8)))
 
     assert first._waited[0] == lookups
@@ -65,12 +82,21 @@ def test_the_group_keeps_its_slowest_ranks_lookups_and_pricing_once(dp2):  # noq
 
 def test_a_rank_of_no_group_keeps_its_own(monkeypatch):
     monkeypatch.setattr(torch.distributed, "all_gather", None)
-    (alone,) = ranks(Sleeping(lookup_s=0.2, pricing_s=0.1))
+    (alone,), _ = ranks(monkeypatch, (0.2, 0.1))
 
     alone.forward(prefill(8))
 
     lookups, pricing = alone._waited
     assert lookups >= 0.2 and pricing >= 0.1
+
+
+def test_a_run_with_no_op_graph_keeps_none(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "all_gather", None)
+    alone = runner(Recording())
+
+    alone.forward(prefill(8))
+
+    assert "group_waited_seconds" not in PricedSteps.priced_steps(alone)
 
 
 def test_the_run_summary_states_each_groups_waits_and_the_wall_outside_them(
