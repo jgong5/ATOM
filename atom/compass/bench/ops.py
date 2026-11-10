@@ -1223,6 +1223,9 @@ class Stub:
         decode's; at a `decode`, a context key's recurrent state counts each
         state slot a row holds."""
         need, size, shared = 1, 0, [0, 0]
+        fn, cia = _overload(op["op"]), "CompositeImplicitAutograd"
+        if fn and fn.is_view and not fn.has_kernel_for_dispatch_key(cia):
+            return 1, size, need, shared  # reads none; a composite (`reshape`) may copy
         table, ids = GATHERED.get(op["op"], (None, None))
         acts = [s for _, s in _specs(op["args"]) if s["role"] == "activation"]
         pos = op["args"].get("positions")
@@ -1292,10 +1295,6 @@ class Stub:
                 entry = _span(*rest) * itemsize
                 if name.startswith(_CACHE.format(ratio="")):
                     unit, history = shape[cut], 0  # a pointer table, at its entries
-                # a view of it reads none of it; a composite one (`reshape`) may copy
-                fn, cia = _overload(op["op"]), "CompositeImplicitAutograd"
-                if fn and fn.is_view and not fn.has_kernel_for_dispatch_key(cia):
-                    unit = history = 0
                 nbytes, need = entry * (unit + history), None
                 shared[slotted] += entry * unit
                 shared[1] += entry * history

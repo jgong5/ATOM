@@ -1948,21 +1948,22 @@ def test_a_rope_table_under_a_drafter_adds_a_row_a_position_or_token(
 @pytest.mark.parametrize(
     "name, bound, size",
     [
-        ("aiter.attend", "attn_metadata_builder.cache.indptr_buffers.1.0", 97 * 4),
+        ("aiter.attend", "attn_metadata_builder.cache.indptr_buffers.1.0", 97 * 4 + 8),
         ("aten.slice.Tensor", "attn_metadata_builder.cache.pool", 0),
-        ("aten.reshape.default", "attn_metadata_builder.cache.pool", 4 * 4),
-        ("aiter.attend", "attn_metadata_builder.cache.pool", 4 * 4),
+        ("aten.reshape.default", "attn_metadata_builder.cache.pool", 4 * 4 + 8),
+        ("aiter.attend", "attn_metadata_builder.cache.pool", 4 * 4 + 8),
     ],
 )
 def test_a_v41_pointer_table_counts_its_entries_and_a_view_none(name, bound, size):
     # DeepSeek-V4.1's KV-bound pointer table, 97 entries for 96 tokens, is read
-    # whole, not a row a block; a view of a KV tensor reads none of it, but a
-    # reshape, which may copy, reads as any other such argument: a row a block,
-    # of the batch's 4.
+    # whole, not a row a block; a view reads none of its KV tensor or its 8
+    # bytes of activation, but a reshape, which may copy, reads as any other
+    # leaf: a row a block, of the batch's 4.
     stub = ops.Stub(_Runner(), 1000)
     stub.kv["leaf", "kv"] = bound, None
     kv = {"shape": [97], "stride": [1], "dtype": "torch.int32", "role": "kv"}
-    op = {"op": name, "args": {"kv": kv}}
+    x = {"shape": [2], "stride": [1], "dtype": "torch.int32", "role": "activation"}
+    op = {"op": name, "args": {"kv": kv, "x": x}}
 
     assert stub._plan(op, [{}], {}, 4, 2, 96, "leaf", True)[1] == size
 
