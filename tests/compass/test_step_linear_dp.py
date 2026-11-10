@@ -439,19 +439,24 @@ def test_a_stated_engine_file_contradicting_the_records_own_refuses(tmp_path):
 COMPASS = Path(__file__).resolve().parents[2] / "scripts" / "compass"
 GPU45 = json.loads((COMPASS / "machines" / "mi355x-gpu45.json").read_text())
 CRS005 = json.loads((COMPASS / "machines" / "mi355x-crs005.json").read_text())
-#: Each DeepSeek-V4-Pro EP8 law pair's file stem and the spec it was fitted under.
+#: Each DeepSeek-V4-Pro EP8 law pair's file stem, the spec it was fitted under and
+#: the index cache dtype it is keyed to: the fp4 gpu-40's lone servers ran, the fp8
+#: a P/D side resolves.
 EP8_PAIRS = [
     pytest.param(
-        "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661", GPU45, id="gpu45"
+        "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661",
+        GPU45,
+        "fp4",
+        id="gpu45",
     ),
-    pytest.param("deepseek-v4-pro-dpa8-ep8-mi355x-crs005", CRS005, id="crs005"),
+    pytest.param("deepseek-v4-pro-dpa8-ep8-mi355x-crs005", CRS005, "fp8", id="crs005"),
 ]
 
 
 @pytest.mark.parametrize("side", ["prefill", "decode"])
-@pytest.mark.parametrize("stem,spec", EP8_PAIRS)
-def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
-    monkeypatch, tmp_path, stem, spec, side
+@pytest.mark.parametrize("stem,spec,index", EP8_PAIRS)
+def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off_or_the_other_indexer(
+    monkeypatch, tmp_path, stem, spec, index, side
 ):
     fitted = json.loads((COMPASS / "laws" / f"{stem}-{side}.json").read_text())
     engine = fitted["engine_config"]
@@ -462,11 +467,11 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
     run = _without_step_stub(tmp_path, step_linear=fitted, machine=spec)
     monkeypatch.setenv(compass_run.ENV, str(run))
 
-    def installed(ep):
+    def installed(ep, index=index):
         r = deployment(
             tmp_path,
             **{k: engine[k] for k in ("kv_cache_block_size", "kv_cache_dtype")},
-            index_cache_dtype=engine.get("index_cache_dtype"),
+            index_cache_dtype=index,
             quant_config=SimpleNamespace(compute_hash=lambda: engine["quantization"]),
             parallel_config=SimpleNamespace(
                 data_parallel_size=8, data_parallel_rank=0, pipeline_parallel_rank=0
@@ -487,6 +492,8 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
         ValueError, match="enable_expert_parallel True in the law and False here"
     ):
         installed(False)
+    with pytest.raises(ValueError, match="another engine config: index_cache_dtype"):
+        installed(True, {"fp4": "fp8", "fp8": "fp4"}[index])
 
 
 def _inside(hull: dict, features: tuple) -> dict:
