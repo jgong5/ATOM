@@ -147,15 +147,16 @@ def batch_view(
     gather's rows come from `mode`, the step's one `forward_mode`; a
     data-parallel runner handed a mode with no group counts is refused.
     Whether the step produces output is `ScheduledBatch.produces_output`, and
-    the TBO split is the collective's `ub_tokens_across_dp`, this rank's slot
-    in it the config's `data_parallel_rank`. A data-parallel rank's
+    the TBO split is the collective's `ub_tokens_across_dp`, a group of one's
+    too, since ATOM splits one rank's step by the same rule; a data-parallel
+    rank's slot in it is the config's `data_parallel_rank`. A data-parallel rank's
     `is_dummy_run` batch is its `dp_dummy`, a step some rank prefills its
     `group_prefills`, and `dummies`, the group's dummy forwards as
     `dummy_ranks` sums them, its `group_dummies`: a caller that does not run
     that collective, as a recording real run does not, passes none. The most
     tokens any rank scheduled is its `group_max_tokens`. A single
-    rank reads none of the
-    collective's counts, though `decide` returns them for a group of one.
+    rank reads none of the collective's other counts, though `decide` returns
+    them for a group of one.
 
     The MoE gather's rows follow `running_tokens_are_unified`, as
     `FusedMoE.forward_impl_graph` does. Every rank decoding, the padded
@@ -222,7 +223,7 @@ def batch_view(
         draft_bs=draft_bs,
         target_bs=target_bs,
         produces_output=batch.produces_output(),
-        tbo_tokens=None if dp_rank is None else mode.sync.ub_tokens_across_dp,
+        tbo_tokens=None if mode.sync is None else mode.sync.ub_tokens_across_dp,
         image_tokens=image_tokens(batch, runner),
         moe_tokens=moe_tokens,
         dp_rank=dp_rank,

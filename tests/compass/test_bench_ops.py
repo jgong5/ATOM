@@ -2018,6 +2018,49 @@ def test_a_rope_table_adds_a_row_a_token_not_its_span(monkeypatch, shape, footpr
     assert record["footprint_bytes"] == footprint
 
 
+@pytest.mark.parametrize("positions, rows", [(None, 12), (10, 10)])
+def test_a_rope_table_under_a_drafter_adds_a_row_a_position_or_token(
+    monkeypatch, positions, rows
+):
+    # Two decode rows under 5 drafts verify 12 tokens: cos and sin, 64 bytes a
+    # row, read a row at each position the call takes (a drafter's own 10),
+    # else a row a token, not a row a request.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    table = _t([1000, 32], "weight", dtype="torch.bfloat16")
+    at = [("positions", _t([positions or 1], "metadata", dtype="torch.int64"))]
+    args = [("cos", table), ("sin", table), *at[: bool(positions)]]
+    found = ops.leaves(_graph(_leaf("aiter.rope", *args), layers=1)["region"])
+    drafting = SimpleNamespace(block_size=16, drafts=5, batch=lambda v, b, s: (b, s))
+
+    [record] = ops.Stub(_Runner(), 1).point(drafting, decode(2), 20, found)
+
+    assert record["footprint_bytes"] == 128 * rows + 8 * (positions or 0)
+
+
+@pytest.mark.parametrize(
+    "name, bound, size",
+    [
+        ("aiter.attend", "attn_metadata_builder.cache.indptr_buffers.1.0", 97 * 4 + 8),
+        ("aten.slice.Tensor", "attn_metadata_builder.cache.pool", 0),
+        ("aten.reshape.default", "attn_metadata_builder.cache.pool", 4 * 4 + 8),
+        ("aiter.attend", "attn_metadata_builder.cache.pool", 4 * 4 + 8),
+    ],
+)
+def test_a_v41_pointer_table_counts_its_entries_and_a_view_none(name, bound, size):
+    # DeepSeek-V4.1's KV-bound pointer table, 97 entries for 96 tokens, is read
+    # whole, not a row a block; a view reads none of its KV tensor or its 8
+    # bytes of activation, but a reshape, which may copy, reads as any other
+    # leaf: a row a block, of the batch's 4.
+    stub = ops.Stub(_Runner(), 1000)
+    stub.kv["leaf", "kv"] = bound, None
+    kv = {"shape": [97], "stride": [1], "dtype": "torch.int32", "role": "kv"}
+    x = {"shape": [2], "stride": [1], "dtype": "torch.int32", "role": "activation"}
+    op = {"op": name, "args": {"kv": kv, "x": x}}
+
+    assert stub._plan(op, [{}], {}, 4, 2, 96, "leaf", True)[1] == size
+
+
 @pytest.mark.parametrize(
     "name, table, ids, role, n, copies, footprint",
     [
