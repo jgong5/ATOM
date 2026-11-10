@@ -23,9 +23,10 @@ prefill is traced as one forward, as it ran, where ATOM would split a step of
 its tokens, and with `--whole` each `--prefill` too. Each is traced at that
 concrete shape (`forward`), decoder layers folded
 into `Repeat` and forked streams into `Par` (`graph`). Under DP with no
-drafter, `--symbolic` then traces each prefill's (T, B) once more with G a
-symbol, published at `forward.symbolic_shape` as a run's lookup traces it
-(`forward.Tracer.symbolic`), so a run reads it for each G it admits.
+drafter, `--symbolic` then traces each prefill's (T, B) once more, at its
+width, with G a symbol, published at `forward.symbolic_shape` as a run's lookup
+traces it (`forward.Tracer.symbolic`), so a run reads it for each G it admits;
+without DP, or under a drafter, it refuses before any trace.
 
 An `op_graph` is keyed by structure (`forward.structure`: the model's
 architecture and config.json digest, `--arch`, the engine config a step law is

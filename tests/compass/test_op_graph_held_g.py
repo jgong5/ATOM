@@ -28,27 +28,34 @@ from atom.compass.runner.overrides import PricedSteps
 DP, T = 8, 64
 #: A prefill's gathered rows: off their default below and above it, and at it.
 GATHERED = (100, DP * T, 3000)
+#: The rows a sampling prefill's LM head pads its one sequence to.
+WIDE = 2
 #: The top of G's range at T: each peer at ATOM's default batch of 16384.
 TOP = T + (DP - 1) * 16384
 HELD = f"prefill T={T} B=1 G=G"
 
 
-def shape(g: int) -> str:
-    """The shape a prefill of T tokens over one sequence gathering `g` rows
-    is published at."""
-    return f"prefill T={T} B=1" + f" G={g}" * (g != DP * T)
+def shape(g: int, width: int | None = None) -> str:
+    """The shape a prefill of T tokens over one sequence gathering `g` rows,
+    its LM head padded to `width`, is published at."""
+    return (
+        f"prefill T={T} B=1" + f" W={width}" * bool(width) + f" G={g}" * (g != DP * T)
+    )
 
 
 def _record(root):
-    """A record directory of three steps: rank 0 prefills T tokens, its MoE
-    gathering each of `GATHERED` in turn, its peers idle."""
+    """A record directory of six steps: rank 0 prefills T tokens, its MoE
+    gathering each of `GATHERED` in turn, then each again with its LM head
+    padded to `WIDE`, its peers idle."""
     (root / "steps").mkdir(parents=True)
     (root / "run.json").write_text("{}")
+    steps = [(g, width) for width in (None, WIDE) for g in GATHERED]
     for rank in range(DP):
         lines = [
             {"step": n, "is_dummy_run": rank > 0, "rung": None, "moe_rows": g}
             | {"rows": [[T, T, False]] if rank == 0 else [[1, 1, False]]}
-            for n, g in enumerate(GATHERED, 1)
+            | {"target_bs": width}
+            for n, (g, width) in enumerate(steps, 1)
         ]
         text = "".join(json.dumps(line) + "\n" for line in lines)
         (root / "steps" / f"dp{rank}.jsonl").write_text(text)
@@ -99,11 +106,17 @@ def test_a_dp_prefill_s_graph_holds_g_and_each_step_s_g_puts_it_byte_for_byte(
     assert (len(spawned), lazy["lazy_traces"]) == (1, 1)
     assert "lazy_per_g" not in lazy
 
-    # Past the range's top, where MORI's trim guards G too, the step is traced.
+    # A prefill whose LM head pads holds G too, keyed by its width: one more.
     lookup = lookups[0]
+    for g in GATHERED:
+        want = json.dumps(traced[shape(g, WIDE), True]["region"])
+        assert json.dumps(lookup("prefill", T, 1, True, g, False, WIDE)) == want, g
+    assert lazy["lazy_traces"] == 2 and "lazy_per_g" not in lazy
+
+    # Past the range's top, where MORI's trim guards G too, the step is traced.
     exchange = f"{MORI}.dispatch" if ep else "atom.model_ops.moe:all_gatherv"
     past = lookup("prefill", T, 1, True, TOP + 1)
-    assert lazy["lazy_traces"] == 2
+    assert lazy["lazy_traces"] == 3
     assert {op["out"][0][0] for op in _ops(past) if op["op"] == exchange} == {TOP + 1}
 
 
@@ -147,11 +160,7 @@ class _Tracer:
         )
         for output in (False, True):
             at = forward.structure(self.at, "prefill", True, "gfx950", output, False)
-            text = (
-                forward.symbolic_shape(shape.tokens, shape.seqs)
-                if symbolic
-                else str(shape)
-            )
+            text = forward.symbolic_shape(shape) if symbolic else str(shape)
             traced = Traced(at, text, self.guards if symbolic else ())
             yield ir.Graph(traced, ir.Seq((gather, expert))), self.at.model, {}
 
@@ -239,3 +248,10 @@ def test_the_run_summary_names_each_prefill_whose_g_were_each_traced(
 
     cost = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())["cost"]
     assert cost["lazy_per_g"] == {why: 1}
+
+
+def test_symbolic_is_refused_without_dp_before_any_trace(tmp_path):
+    done = trace(tmp_path, f"--prefill {T} 1 --symbolic -- --kv_cache_dtype fp8")
+
+    assert done.returncode != 0 and "only a DP prefill" in done.stderr
+    assert "published" not in done.stdout

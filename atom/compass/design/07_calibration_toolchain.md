@@ -262,8 +262,8 @@ step, and each two-batch-overlap micro-batch, at (T, B, G), refused only when no
 captured there; a decode's G since
 [#1802](https://github.com/jgong5/ATOM/issues/1802), 2026-10-22. Revised 2026-11-09 by the
 [ruling on #2956](https://github.com/jgong5/ATOM/issues/2956#issuecomment-6742702610): where
-no graph is captured at a DP prefill's own G, a run's lazy trace takes its (T, B) once
-with G a symbol, at both ends of G's range, and the step reads that graph put at its G
+no graph is captured at a DP prefill's own G, a run's lazy trace takes its (T, B), at the
+width its LM head pads to, once with G a symbol, at both ends of G's range, and the step reads that graph put at its G
 when the two ends agree and the graph's guards admit G, else the graph traced at its G
 (`04` D18). `trace ops --symbolic` takes each prefill (T, B) of its shapes so ahead of a
 run, beside each G it captures concretely as before.

@@ -1908,8 +1908,8 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     shape. A trace from a tree with uncommitted files answers this lookup alone
     and is not published.
 
-    Under DP a prefill the store holds no graph at, with no drafter and no
-    width, reads the graph of its tokens and sequences that holds G
+    Under DP a prefill the store holds no graph at, with no drafter, reads
+    the graph of its tokens, sequences and width that holds G
     (`forward.Tracer.symbolic`, keyed by `forward.symbolic_shape`) at the
     step's G, when its hints span G and its guards admit it (`peers.at`); with
     `atom_args`, the first such step of a shape traces that graph, and when
@@ -1933,9 +1933,9 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     traced, held_traced, unpublished, process = set(), set(), {}, []
 
     def lazily(shape, symbolic=False):
-        """Trace `shape` (`_trace`), counted in `lazy`; why its G are each
-        traced, when a `symbolic` trace's two ends differ, else None."""
-        began, why = time.monotonic(), None
+        """Trace `shape` (`_trace`), counted in `lazy`; a `symbolic` trace whose
+        two ends differ is named in its ``lazy_per_g``."""
+        began = time.monotonic()
         # `symbolic` only when set: a concrete trace's call is as before.
         kwargs = {"symbolic": True} if symbolic else {}
         try:
@@ -1944,15 +1944,13 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
             done = process[0].submit(_trace, root, atom_args, arch, shape, **kwargs)
             unpublished.update(done.result())
         except PerG as differ:
-            why = str(differ)
-            lazy.setdefault("lazy_per_g", {})[why] = 1
+            lazy.setdefault("lazy_per_g", {})[str(differ)] = 1
         # An argument parser's error exits.
         except (Exception, SystemExit) as failed:
             why = f"{type(failed).__name__}: {failed}"
             raise RuntimeError(f"a lazy trace of {shape} failed: {why}") from failed
         lazy["lazy_traces"] += 1
         lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
-        return why
 
     def read(at: str, shape: str) -> dict | None:
         """The graph the store, or this lookup's unpublished traces, hold at
@@ -1965,13 +1963,13 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         return json.loads(store.read(key).read_member("graph", rank, "json"))
 
     @functools.lru_cache(maxsize=64)
-    def held(at: str, tokens: int, seqs: int) -> dict | None:
-        """The graph that holds G of a DP prefill of `tokens` over `seqs` at
+    def held(at: str, shape) -> dict | None:
+        """The graph that holds G of the DP prefill `shape`, at any G, at
         structure `at`, or None."""
-        text, new = symbolic_shape(tokens, seqs), (tokens, seqs) not in held_traced
+        text, new = symbolic_shape(shape), shape not in held_traced
         if new and atom_args is not None and read(at, text) is None:
-            held_traced.add((tokens, seqs))
-            lazily(Shape("prefill", tokens, seqs), symbolic=True)
+            held_traced.add(shape)
+            lazily(shape, symbolic=True)
         return read(at, text)
 
     @functools.lru_cache(maxsize=64)
@@ -1982,9 +1980,9 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         at = structure(config, phase, True, arch, output, draft, env)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
         missing = not store.directory_for(key).exists()
-        if missing and dp > 1 and phase == "prefill" and not (draft or width or drafts):
+        if missing and dp > 1 and phase == "prefill" and not (draft or drafts):
             g = shape.gathered or dp * tokens
-            if found := held(at, tokens, seqs):
+            if found := held(at, shape._replace(gathered=None)):
                 (lo, hi), guards = found["hints"], found["guards"]
                 if lo <= g <= hi and admits(guards, g):
                     return peers.at(found["region"], found["slots"], g, dp)
@@ -2049,7 +2047,7 @@ def _trace(root: str, atom_args, arch: str, shape, symbolic=False) -> dict:
 
     engine, kept = _engine_args(atom_args), engine_only(atom_args)
     store, tp = ArtifactStore(root), engine.tensor_parallel_size
-    what = symbolic_shape(shape.tokens, shape.seqs) if symbolic else shape
+    what = symbolic_shape(shape) if symbolic else shape
     command = f"compass run: a lazy trace of {what}"
     dirty = any(r.dirty for r in roots_for({"atom": "atom", "aiter": "aiter"}))
     unpublished = {}

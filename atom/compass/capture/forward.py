@@ -201,10 +201,10 @@ def _gathering(shape: Shape) -> Shape:
     return shape
 
 
-def symbolic_shape(tokens: int, seqs: int) -> str:
-    """The shape a DP prefill's graph that holds G (`Tracer.symbolic`) is
-    keyed by: a prefill of `tokens` over `seqs` sequences, at any G."""
-    return f"{prefill(tokens, seqs)} G={ir.G}"
+def symbolic_shape(shape: Shape) -> str:
+    """The shape the graph of the DP prefill `shape` that holds G
+    (`Tracer.symbolic`) is keyed by: its tokens, sequences and width, at any G."""
+    return f"{shape._replace(gathered=None)} G={ir.G}"
 
 
 class PerG(Exception):
@@ -1517,22 +1517,29 @@ def capture(
     micro-batches; each of their prefills runs as one forward, as it ran, this
     rank answering that it cannot split it; with `whole`, each prefill of
     `shapes` too. With `symbolic`, each prefill's (T, B) of a DP group with no
-    drafter is then traced with G a symbol, as a run's lookup traces it
-    (`Tracer.symbolic`); one whose two ends differ is named on stderr.
+    drafter, at its width, is then traced with G a symbol, as a run's lookup
+    traces it (`Tracer.symbolic`); one whose two ends differ is named on
+    stderr. Without DP, or under a drafter, `symbolic` is refused before any
+    trace.
     """
     from atom.compass.capture import population_shapes
 
     tracer = Tracer(model, tp, tmpdir, atom_args, arch, read)
+    config = tracer.config
+    if symbolic and (
+        config.parallel_config.data_parallel_size == 1 or config.speculative_config
+    ):
+        raise ValueError("--symbolic: only a DP prefill with no drafter holds G")
     ran = population_shapes(population, tracer.config.enable_tbo)
     shapes = list(dict.fromkeys([*shapes, *ran]))
     if not shapes:
         raise ValueError(f"{', '.join(population)} hold no step to trace")
     with contextlib.closing(tracer):
         yield from tracer.trace(shapes, [*ran, *shapes] if whole else ran)
-        held = (s for s in shapes if symbolic and s.phase == "prefill" and not s.width)
-        for tokens, seqs in dict.fromkeys((s.tokens, s.seqs) for s in held):
+        held = (s for s in shapes if symbolic and s.phase == "prefill")
+        for shape in dict.fromkeys(s._replace(gathered=None) for s in held):
             try:
-                yield from tracer.symbolic(prefill(tokens, seqs))
+                yield from tracer.symbolic(shape)
             except PerG as why:
                 print(f"each G traced as it is: {why}", file=sys.stderr)
 
@@ -1633,20 +1640,20 @@ class Tracer:
         self.runner = runner
 
     def symbolic(self, shape):
-        """The graphs of a DP prefill of `shape`'s tokens over its sequences
-        that hold G, the rows its MoE gathers, as `trace` yields them, each run
-        as one forward: traced with G a symbol at both ends of its range, from
-        a prefilling peer's one row past this rank's tokens to each peer at
-        `max_num_batched_tokens`. The upper end's are kept, with the guards its
-        trace installed on G (MORI's trim admits G up to its hint), once the
-        two agree with G and each exchange's `sizes` put at either end
+        """The graphs of the DP prefill `shape`, at its tokens, sequences and
+        width, that hold G, the rows its MoE gathers, as `trace` yields them,
+        each run as one forward: traced with G a symbol at both ends of its
+        range, from a prefilling peer's one row past this rank's tokens to each
+        peer at `max_num_batched_tokens`. The upper end's are kept, with the
+        guards its trace installed on G (MORI's trim admits G up to its hint),
+        once the two agree with G and each exchange's `sizes` put at either end
         (`peers.at`); else `PerG` names where they differ, and each G of the
         shape is traced as it is."""
         dp = self.config.parallel_config.data_parallel_size
         tokens, seqs = shape.tokens, shape.seqs
         top = self.config.max_num_batched_tokens
         lo, hi = hints = tokens + 1, tokens + (dp - 1) * top
-        text = symbolic_shape(tokens, seqs)
+        text = symbolic_shape(shape)
         if self.runner is None:
             self._build()
         if dp == 1 or self.drafts:
@@ -1655,7 +1662,7 @@ class Tracer:
         # follows its steps at the same (T, B), with none of its own.
         ends = {}
         for g, warm in ((hi, True), (lo, False)):
-            at = prefill(tokens, seqs, g).at(dp)
+            at = prefill(tokens, seqs, g, shape.width).at(dp)
             try:
                 ends[g] = [*self.trace([at], [at], symbolic=True, warm=warm)]
             except PerG:
@@ -1780,7 +1787,7 @@ class Tracer:
                     recorder.creating, recorder.on = None, False
                 traces.append((recorder.items, recorder.left_out))
             guards = _guards(fake_mode.shape_env, symbol) if symbol is not None else ()
-            at = symbolic_shape(shape.tokens, shape.seqs) if symbolic else str(shape)
+            at = symbolic_shape(shape) if symbolic else str(shape)
             items, left_out = traces[0]
             if len(traces) > 1:
                 items = _affine(str(shape), items, traces[1][0])
