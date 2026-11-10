@@ -167,7 +167,7 @@ def test_a_run_that_lacks_nothing_exits_0_and_needs_no_out(
     assert checked(tmp_path, *flags) == 0
 
     out = capsys.readouterr().out
-    assert out == "nothing lacking: the run meets no refusal before it serves\n"
+    assert out == "nothing lacking: every input the run reads resolves and holds\n"
     assert not (tmp_path / "out").exists()
 
 

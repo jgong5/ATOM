@@ -73,7 +73,7 @@ def report(args, atom_args) -> int:
     for name, state, refusal, made_by in lacks:
         print(f"lacking {name}: {state}\n  refused: {refusal}\n  made by: {made_by}")
     if not lacks:
-        print("nothing lacking: the run meets no refusal before it serves")
+        print("nothing lacking: every input the run reads resolves and holds")
     for line in apart:
         print(f"apart: {line}")
     return 1 if lacks else 0
