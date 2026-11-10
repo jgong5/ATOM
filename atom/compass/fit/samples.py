@@ -27,8 +27,8 @@ Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
 config.json's digest; `device`, each GPU's `<name> <arch>`, as a spec states
 it; `engine_config`, `keyed`'s fields, the parallel layout among them;
-`prefill_buckets`, the prefill token-graph buckets it states, null where it
-states none; `source_root`, `<revision_kind>-<revision>`; `sampling`, the request
+`prefill_buckets`, the prefill token-graph buckets it states
+(`step_linear_fit.stated_buckets`), null where it states none; `source_root`, `<revision_kind>-<revision>`; `sampling`, the request
 parameters, null for a record serving no client run's request; its host key
 less its model and engine; its `stack`, the software versions run.json
 names; and its `ptl`, the cards' PTL state, `unrecorded` for a run.json that
@@ -48,6 +48,7 @@ from atom.compass.artifacts import ArtifactStore, Topology
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS
 from atom.compass.backends.step_labels import Sample, digest, label_run
+from atom.compass.backends.step_linear_fit import stated_buckets
 from atom.compass.drive import aiter_jit
 from atom.compass.drive.identity import PTL_CHANGES
 from atom.compass.parity import ARRIVALS
@@ -138,7 +139,7 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
     return samples, {
         **fields,
         "engine_config": keyed_of(engine),
-        PREFILL_BUCKETS: engine.get(PREFILL_BUCKETS),
+        PREFILL_BUCKETS: stated_buckets(steps / "dp0.jsonl"),
         "stack": run["stack"],
         "ptl": run.get("ptl", UNRECORDED),
         "sampling": json.loads(sampling[0]) if sampling else None,

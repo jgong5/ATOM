@@ -17,9 +17,9 @@ takes, which `publish.inputs` loads each measurement under.
 `history` by default, joining each step's ranks at the engine config's
 `data_parallel_size`, so a record with a
 rank that gave no sample refuses; it pads prefill to the records'
-`prefill_buckets` and holds out each run on the others when
-there are two or more, as that module's command does; `--seed` fixes
-its shuffles. The law states the configuration's
+`prefill_buckets`, naming under `unfitted` records stating none, and holds
+out each run on the others when there are two or more, as that module's
+command does; `--seed` fixes its shuffles. The law states the configuration's
 `machine_spec` and `engine_config`, as that command's does, and the key holds them. The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
@@ -69,6 +69,8 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     options = {"form": form, "dp": step_linear_fit.join_width(config["engine_config"])}
     options["buckets"] = config.get("prefill_buckets")
     law, report = step_linear_fit.fit(samples, options, args.seed)
+    if options["buckets"] is None:
+        law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
     if len({s.provenance["run"] for s in samples}) > 1:
         step_linear_fit.mark_held_out(law, report, samples, options, args.seed)
     report["provenance"] = publish.runs(samples)

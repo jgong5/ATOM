@@ -398,7 +398,11 @@ fitted on is priced as an extrapolation (D58). Prefill needs no such column: its
 a data-parallel MTP record tests it there.
 
 A prefill vector adds `padding`, `b − tokens`, where the records' engine files state the
-prefill token-graph buckets their runner recorded, and states those buckets. ATOM replays
+prefill token-graph buckets their runner recorded, and states those buckets. A record whose
+engine file predates that field states them in its host key's graph sets, and the fit reads
+them there; records stating them nowhere fit no `padding`, and the law names that under
+`unfitted`. Fitted so unseen on #2958's records, the vector priced eager bodies 5 to 7% high
+and graph bodies 3 to 7% low ([#3128](https://github.com/jgong5/ATOM/issues/3128)). ATOM replays
 a prefill's first layers as a token graph at `b` rows, the smallest bucket holding the
 most tokens any rank of the DP group scheduled (`BatchView.group_max_tokens`), and runs
 past the largest bucket, or on a step the group splits for two-batch overlap, eagerly,
