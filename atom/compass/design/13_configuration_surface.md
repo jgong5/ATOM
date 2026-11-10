@@ -47,6 +47,11 @@ and the router's hop is a host transport constant (D78, D80, `05` D24, D25).
 as amended that day:** the tokenizer rates and the HTTP intake are `host_laws` terms that
 `fit host` fits from what `record` stamps, and `--host-laws` supplies them (D78, D80).
 
+**Revised 2026-11-10 by [#2899](https://github.com/jgong5/ATOM/issues/2899):** `run` reads
+the memory readings a law file carries, assumed, when its store holds none; a shipped law
+loads only at the tree its host key names, and predicts the host it timed from any CPU
+(D80, `07` D41, `09` D54).
+
 **Depends on:** `05_machine_spec_and_probes.md` D24 (the separation rule this extends),
 and every other topic, each of which contributed a flag.
 
@@ -164,17 +169,31 @@ python -m atom.entrypoints.openai_server <ATOM arguments> \
 | `--network` | the network file, by name or path, which only a run across nodes reads (`05` D25) | none: a run across nodes refuses without one |
 | `--step-linear`, `--step-stub`, `--step-grid`, `--op-graph` | the backend, exactly one kind, each named by its run-file key: a step linear law by store key or by a law file at the platform and engine config it states, which names no fit inputs, its calibration traces kept apart from the graded ones by process (#2594, the [#2698 ruling](https://github.com/jgong5/ATOM/issues/2698#issuecomment-6591251259)), a step stub's stated coefficients by file (its terms declared, never fitted), a step grid bundle by store key (`17` D103), the `op_graph` entries `--store` holds, each leaf priced first from the `price_list` the store holds at the run's model, parallel layout, platform and ATOM tree when there is one (#1715). There is no granularity or method flag. `--step-linear` repeats, one law per engine config: the run file then holds a list, and each process installs the law fitted under its own engine config and refuses when none or several were (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | **none — refuses**, as do two kinds |
 | `--store` | the artifact store keys resolve in, the configuration's `memory_readings` included (`07` D41) | **none — refuses** |
-| `--host-laws` | the host laws by store key (`09` D54), or a law file's `host` at the host key it states, so a law re-keyed to the run's ATOM tree runs there (#2594), composed by `01` D4's recurrence. Repeats, one entry per engine config, each process installing its own config's, as `--step-linear` does (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | none: the run charges no host time, tokenizer and HTTP intake included, and records that (`05` D25) |
+| `--host-laws` | the host laws by store key (`09` D54), or a law file's `host` at the host key it states, so a law re-keyed to the run's ATOM tree runs there (#2594), composed by `01` D4's recurrence; their host CPU is the host the run predicts, on whatever CPU it runs (`09` D54). Repeats, one entry per engine config, each process installing its own config's, as `--step-linear` does (the [#973 ruling](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012)) | none: the run charges no host time, tokenizer and HTTP intake included, and records that (`05` D25) |
 | `--on-refusal` | `mark`: a step the cost backend refuses charges no device time, its answered terms included, and a segment the host laws refuse 0 s; its reason is recorded, and the run continues. `abort`: stop at the first refusal; the run summary is still written. Either way a refusal makes the run a coverage report (`08` D50.1) | `mark` (`08` D50.1) |
 | `--step-roofline` | a switch, named by its run-file key `step_roofline`, with no value: the step roofline has no host bound (the owner's ruling on [#1047](https://github.com/jgong5/ATOM/issues/1047)). On, it composes `StepFallbackBackend`: the step roofline (`10` D64) prices the device time of the steps the backend refuses, with the method its inputs give it. A step grid run composes it without the switch (`17` D102) | off; `run.json` records it when on |
 | `--local-grants`, `--no-local-grants` | a switch, named by its run-file key `local_grants`, with no value. On, each grant carries a ceiling below which an LP answers its own clock calls and reports them with its next one, a DP member at its settle (`01` D3, *Local grants*). It changes how many calls a run makes, not its schedule or its step table, so the key is per-run and out of the configuration's name | on (the [#3086 ruling](https://github.com/jgong5/ATOM/pull/3086#issuecomment-6739389313)); a run file without the key runs with ceilings |
 | `--coverage` | `shape_population` keys and `record` directories the backend's coverage check reads before the run starts. An input whose engine states other scheduler bounds, capture ladder or TP size than ATOM's arguments resolve refuses, naming each field that differs and both values (the [#1294 ruling](https://github.com/jgong5/ATOM/issues/1294)); the step grid's check refuses no step, and counts those it extrapolates or declines to the roofline (`17` D99) | off; `run.json` records the check's result, or that none ran |
 | `--join` | tool-only: a deployment's run file, which `scripts/compass/deploy.sh` builds from the flags above and hands every instance; the server joins the authority it names instead of co-hosting one, and every flag above but `--out` is refused beside it (below) | off: the server co-hosts its authority |
 
-`run` reads the `memory_readings` entry for its configuration (`07` D41) and refuses when
-there is none, naming the configuration. `compass measure memory` takes it; for a device
-never measured, developer tooling states it, marked assumed, and `run.json` records that
-(`07` D38).
+`run` reads the `memory_readings` entry for its configuration (`07` D41); when its store
+holds none, it reads those the law file it prices by carries, as it reads the file's
+`host`, and refuses when neither holds them, naming the configuration. `compass measure
+memory` takes them. For a device never measured developer tooling states them (`07` D38),
+and a law file carries readings taken on its law's platform, re-keyed with it or taken
+again (`07` D41), so a host with no GPU predicts from a shipped law, which the
+[#2722 Ruling](https://github.com/jgong5/ATOM/issues/2722#issuecomment-6678010091) found
+nothing committed gave. Both are marked assumed: every term built on them is declared,
+`run.json` lists each assumption (`memory_readings_assumed`) and grading refuses the run
+(below). Its run summary states, as every run's does, its seconds by method, declared
+among them, and its refused, extrapolated and fallback steps (`08` D50.1).
+
+A shipped law and its readings load only at the tree whose `atom` digest their host key
+states: each commit of the integration branch that moves the digest re-keys the law, and
+its readings with it or takes them again (`07` D41). Another tree, a local patch to
+ATOM's Python, a release, or an older checkout given the head's laws, refuses both by
+name (T107). Like a store entry they refuse under another device, software stack, PTL
+state, torch, model, parallel layout or engine config.
 
 `--compass-clock-endpoint` names a standalone Clock Authority (`01` D3.3); absent, it is
 co-hosted in the API-server process. The tool sets it and `--compass-run`, and refuses
@@ -423,8 +442,8 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
   backend's provenance, its fitted traces and profiled inputs included, with the
   assumption of each assumed `memory_readings` member an engine read.
   `python -m atom.compass.validate` decides from them whether a client run is gradeable:
-  not when the run skipped host segments, priced with a backend
-  fitted on the traces it grades or on profiled inputs, ran the step grid without a
+  not when the run skipped host segments, read an assumed `memory_readings` member, priced
+  with a backend fitted on the traces it grades or on profiled inputs, ran the step grid without a
   coverage check, or refused a step of that client run (`08` D50.1). A backend fitted
   under another engine configuration refuses to run: that is a mismatch, not a reason.
 
@@ -491,7 +510,7 @@ have changed.
 |---|---|---|
 | D78 | Three homes. A setting is Compass's only if it would be meaningless in a real ATOM run — which keeps the surface small by construction. The machine's values live in its layers: a device datasheet, a `platform_readings` entry and a network file, the host's, the router's hop included, in host laws. The tokenizer and the HTTP intake are the `host_laws` entry's terms. | 2026-09-19; layers 2026-11-03 (#2716); tokenizer and intake 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)) |
 | D79 | Precedence is CLI > artifact > **refuse**, with no environment level. No silent default for anything that changes a predicted number. The resolved configuration is echoed into every artifact. The run file `compass run` writes is its transport to ATOM, not a config file. | 2026-09-19; run file 2026-10-13 (#851); no environment level 2026-10-14 (#851) |
-| D80 | A simulated serve is configured by `compass run`'s flags, handed to ATOM's server in a run file by `--compass-run`. One `compass` entry, the only way users reach Compass, with the toolchain's commands: `record`, `trace steps\|ops`, `measure steps\|ops\|memory\|device`, `fit steps\|ops\|host\|device` and `run`, sharing ATOM's arguments after `--`, `--out` and `--store`, one step-record format, `run.json` and the GPU refusals; no command starts the client or takes a workload. One `record` or `run` serves one instance to any number of client runs, and a record splits per client run by its requests. `run` records what grading reads, and grading decides whether a run is gradeable. The commands first listed are deprecated and removable, each with where its work went; developers' quality tooling stays outside the CLI. Non-flags audited and recorded. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); backend flags named 2026-10-14 (#952); the step roofline setting made a switch 2026-10-15 (#1047); `trace ops` per shape, `op_measurement`, `fit ops` publishes a `price_list` only 2026-10-18 (#1489); several instances started by `scripts/compass/deploy.sh`, `run --join` and `record --host` 2026-10-19 (#1031); `measure device` and `fit device`, and the platform flags in place of `--machine` on the commands that price, 2026-11-03 (#2716); `record` times the served tokenizer and stamps the HTTP intake, which `fit host` fits, 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)) |
+| D80 | A simulated serve is configured by `compass run`'s flags, handed to ATOM's server in a run file by `--compass-run`. One `compass` entry, the only way users reach Compass, with the toolchain's commands: `record`, `trace steps\|ops`, `measure steps\|ops\|memory\|device`, `fit steps\|ops\|host\|device` and `run`, sharing ATOM's arguments after `--`, `--out` and `--store`, one step-record format, `run.json` and the GPU refusals; no command starts the client or takes a workload. One `record` or `run` serves one instance to any number of client runs, and a record splits per client run by its requests. `run` records what grading reads, and grading decides whether a run is gradeable. `run` reads a law file's memory readings, assumed, when its store holds none; a shipped law and its readings load only at the tree their host key names, and its host laws predict the host they timed from any CPU. The commands first listed are deprecated and removable, each with where its work went; developers' quality tooling stays outside the CLI. Non-flags audited and recorded. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); backend flags named 2026-10-14 (#952); the step roofline setting made a switch 2026-10-15 (#1047); `trace ops` per shape, `op_measurement`, `fit ops` publishes a `price_list` only 2026-10-18 (#1489); several instances started by `scripts/compass/deploy.sh`, `run --join` and `record --host` 2026-10-19 (#1031); `measure device` and `fit device`, and the platform flags in place of `--machine` on the commands that price, 2026-11-03 (#2716); `record` times the served tokenizer and stamps the HTTP intake, which `fit host` fits, 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)); a law file's readings, the tree a shipped law loads at and the host it predicts 2026-11-10 ([#2899](https://github.com/jgong5/ATOM/issues/2899)) |
 | D81 | The resolved configuration is part of every artifact, by value and never by reference. | 2026-09-19 |
 
 ---
@@ -507,3 +526,4 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T58 | Decide whether a per-leaf backend override is worth the reproducibility cost | no demand yet |
 | ~~T96~~ | ~~Reconcile D79 and D80 with the run file the code selects a backend by (`--compass-run`, `atom/compass/run/__init__.py::runner`): D79 rejects a Compass config file, the code reads one (`17` D103)~~ — settled 2026-10-13 on #851: `compass run` takes flags only, and the run file is its internal transport (D79, D80) | needs an owner choice between describing the run file here and moving selection to flags |
 | ~~T99~~ | ~~A simulated server outlives its client (D80): `01` D3 ends a run when no essential work is left, and must end a client run there instead, the clock then waiting for the next client~~ — settled 2026-10-14 on #966: `01` D3, Client runs | needs a change to `01` D3, not yet designed |
+| T107 | Key shipped laws and their readings for a user on another tree: a local patch to ATOM's Python, a release, or an older checkout given the head's laws refuses them (D80) | left for after v1 by [#2899](https://github.com/jgong5/ATOM/issues/2899): the integration branch keys them to its own tree at each commit that moves the digest (`07` D41), and another tree needs keys of its own |
