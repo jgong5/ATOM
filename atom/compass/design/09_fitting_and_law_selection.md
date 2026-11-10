@@ -738,8 +738,9 @@ refused, unless a peer prefills (below).
 **Assumed treatment: eager decode beside prefill** (owner ruling on
 [#2660](https://github.com/jgong5/ATOM/issues/2660#issuecomment-6573151549), 2026-11-02).
 A DP group replays request graphs only on a step every rank runs alike, so a rank that
-decodes while a peer prefills runs eagerly. A 1P1D prefill side runs such a decode for
-each request its deferred output holds (#2655). The fit cuts a step whose ranks fall to
+decodes while a peer prefills runs eagerly. A 1P1D prefill side ran such a decode for
+each request its deferred output held, until #2655 had every producer report its first
+token from the forward that samples it. The fit cuts a step whose ranks fall to
 different vectors, so no law fits an `eager` vector for it. A step linear law with no
 `eager` vector and a replay step grid price it at 0 s under this treatment, counted by
 step like the dummy's: the rank waits on its prefilling peers inside the forward, and the
