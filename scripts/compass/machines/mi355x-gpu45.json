@@ -6,12 +6,6 @@
     "date": "2026-10-19",
     "origin": "mixed",
     "origins": {
-      "host.cpu.cores_physical": {
-        "origin": "probed"
-      },
-      "host.cpu.cores_logical": {
-        "origin": "probed"
-      },
       "device.name": {
         "origin": "probed",
         "model": "/models/DeepSeek-V4-Pro",
@@ -68,22 +62,6 @@
         "source_root": "commit:409bedc98",
         "record": "sha256:02618dade3d07bcaac510da11cf8a279a1fe3ef2fce72d41e88a76f2df7c32c6"
       },
-      "host.http_intake.fixed_s": {
-        "origin": "probed",
-        "model": "/models/DeepSeek-V4-Pro",
-        "source_root": "commit:19c5ab09e",
-        "record": "sha256:2397696f6df3a280660cbc95e7c8db0d61b77fba9986c3d388ccde75f2d5f574",
-        "p10": 0.0019362225299832747,
-        "p90": 0.0023826020769630186
-      },
-      "host.http_intake.per_byte_s": {
-        "origin": "probed",
-        "model": "/models/DeepSeek-V4-Pro",
-        "source_root": "commit:19c5ab09e",
-        "record": "sha256:2397696f6df3a280660cbc95e7c8db0d61b77fba9986c3d388ccde75f2d5f574",
-        "p10": 3.617351613835432e-09,
-        "p90": 5.241243893276638e-09
-      },
       "device.memory.bandwidth_bytes_per_s": {
         "origin": "datasheet"
       },
@@ -101,12 +79,6 @@
       },
       "interconnect.intra_node.link_bandwidth_bytes_per_s": {
         "origin": "datasheet"
-      },
-      "host.ipc.zmq_roundtrip_s": {
-        "origin": "assumed"
-      },
-      "host.ipc.shm_broadcast_s": {
-        "origin": "assumed"
       },
       "interconnect.intra_node.topology": {
         "origin": "assumed"
@@ -169,65 +141,16 @@
         "origin": "probed",
         "source_root": "commit:97a84124e",
         "record": "sha256:040ae2dced8e3b5aefbff28c8e6bb5f5afe016fe373e8327fb1384407e1abef0"
-      },
-      "host.tokenizers[deepseek-v4-pro fast]": {
-        "origin": "probed",
-        "model": "/models/DeepSeek-V4-Pro",
-        "source_root": "commit:88dfbb914581d743c16855b36f5edab6e9d5b809",
-        "p10": {
-          "encode_fixed_s": 6.274415314860249e-06,
-          "encode_tokens_per_s": 959926.851458146,
-          "decode_fixed_s": 9.622373485698014e-07,
-          "decode_tokens_per_s": 7326077.620210434
-        },
-        "p90": {
-          "encode_fixed_s": 6.75017874063726e-06,
-          "encode_tokens_per_s": 973736.3232658788,
-          "decode_fixed_s": 1.0026383540423067e-06,
-          "decode_tokens_per_s": 7483267.090440603
-        }
       }
     },
     "fragments": [
-      "tokenizer",
       "device",
-      "intake",
       "datasheet",
       "assumed",
       "ptl",
       "peaks"
     ],
-    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at 409bedc98 | one real c=256 first-turn cc-traces burst at 19c5ab09e | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples"
-  },
-  "host": {
-    "cpu": {
-      "cores_physical": 128,
-      "cores_logical": 256
-    },
-    "tokenizers": [
-      {
-        "id": "deepseek-v4-pro",
-        "backend": "fast",
-        "vocab_size": 129280,
-        "fingerprint": "sha256:8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
-        "applies_to": [
-          "DeepseekV4ForCausalLM"
-        ],
-        "encode_fixed_s": 6.5194501752822816e-06,
-        "encode_tokens_per_s": 968276.5240179158,
-        "decode_fixed_s": 9.82301925581818e-07,
-        "decode_tokens_per_s": 7412521.531864962,
-        "derate": 1.0
-      }
-    ],
-    "ipc": {
-      "zmq_roundtrip_s": 5e-05,
-      "shm_broadcast_s": 2e-05
-    },
-    "http_intake": {
-      "fixed_s": 0.001966482509138914,
-      "per_byte_s": 5.288974015662166e-09
-    }
+    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at 409bedc98 | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples"
   },
   "device": {
     "name": "MI355X",

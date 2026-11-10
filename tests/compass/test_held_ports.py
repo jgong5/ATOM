@@ -58,8 +58,11 @@ def test_another_process_and_a_port_draw_take_no_held_port(monkeypatch):
         )
         assert squat.stdout.split() == [str(errno.EADDRINUSE)] * 4
         monkeypatch.setattr(serve, "SERVE_PORTS", range(port, port + 2))
-        with pytest.raises(serve.ServeError, match="fewer than 1 free ports"):
-            serve._free_ports(1)
+        with (
+            pytest.raises(serve.ServeError, match="fewer than 1 free ports"),
+            serve._held_ports(1),
+        ):
+            pass
 
 
 def _zmq(stack, port):
@@ -69,7 +72,7 @@ def _zmq(stack, port):
 
 
 def _clock(stack, port):
-    table = single_engine_table(admission_path="serving", ipc_s=1e-3, stream_s=2e-3)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=1e-3, stream_s=2e-3)
     endpoint = f"tcp://127.0.0.1:{port}"
     stack.callback(clock_transport.serve(ClockAuthority(table), endpoint).close)
 

@@ -97,6 +97,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import dataclasses
 import json
 import logging
 import math
@@ -278,6 +279,9 @@ OUT_SEGMENT = "E_out"
 #: Every segment a law may price.
 SEGMENTS = (*HOST_SEGMENTS, MTP_SEGMENT, MTP_COPY, PP_RECV_SEGMENT, OUT_SEGMENT)
 FORWARD_KINDS = ("decode", "prefill", "middle")
+#: `admit` for a host entry fitted before admissions were priced apart, whose
+#: `E` laws hold them: they cost nothing on top.
+ADMISSION_IN_E = (0.0, 0.0, 0.0)
 #: The format of a simulated run's `dp<r>.cost.jsonl`, its first line.
 COST_TABLE_VERSION = 1
 
@@ -287,6 +291,29 @@ def forward_shape(batch: Any) -> tuple[str, tuple]:
     kind = "decode" if batch.total_seqs_num_prefill == 0 else "prefill"
     kind = kind if batch.produces_output() else "middle"
     return kind, (1, batch.total_tokens_num, batch.total_seqs_num)
+
+
+def admitted(batch: Any, seen: set, tokens_per_entry: int) -> tuple[int, int, int]:
+    """``(requests, uncached, cached)`` of the requests `batch` admits: those
+    a prefill row schedules for the first time, not in `seen`, which takes
+    every request the batch holds. The scheduler allocated each one's whole
+    prompt there, so its prompt is its block table's entries times
+    `tokens_per_entry`, and its prefix-cache hit is the tokens its row starts
+    from."""
+    if len(batch.block_tables) != len(batch.req_ids):
+        raise RunnerRefusal(
+            f"a batch of {len(batch.req_ids)} requests holds "
+            f"{len(batch.block_tables)} block tables, so a request's prompt "
+            "cannot be read off its own"
+        )
+    n = uncached = cached = 0
+    for i, (r, table) in enumerate(zip(batch.req_ids, batch.block_tables)):
+        if r not in seen and i < batch.total_seqs_num_prefill:
+            hit = int(batch.num_cached_tokens[i])
+            n, uncached = n + 1, uncached + len(table) * tokens_per_entry - hit
+            cached += hit
+        seen.add(r)
+    return n, uncached, cached
 
 
 class HostDeviceRecurrence:
@@ -299,21 +326,49 @@ class HostDeviceRecurrence:
     for nothing. With `mtp`, a forward's device work is its target's and then
     its draft's, and a single-stage output forward waits before launch, for
     the previous output forward's target and then `MTP_COPY`; `MTP_SEGMENT`
-    runs after that wait, before the launch. The device work an MTP
-    forward's prepare queues ahead of its launch is not charged: its device
-    starts at the later of `ends[-1]` and the prepare end, early by that work
-    when the device is still busy. With `sync`, every forward leaves no earlier than its
+    runs after that wait, before the launch. A batch's `compass_queued_s`,
+    the device work its prepare queued ahead of its launch, runs after
+    `ends[-1]`; a run sets none, so there a busy launch starts its device
+    early by that work. With `sync`, every forward leaves no earlier than its
     own device end, as one that synchronizes its stream before it returns
     does. `ends[-1]` is the last forward's device end. `laws[kind][segment]` are coefficients on `(1,
     tokens, seqs)`; `charge` says what an absent one costs. `now` reads the engine LP's clock.
     `segments` holds the seconds the last `charge` charged each segment, 0 for
-    one in `skip`.
+    one in `skip`. `admit`, coefficients on `admit_x` of a batch's
+    `compass_admitted`, adds what its admissions cost to its `E`, except on a
+    pipeline stage that receives its input; None, a fit that priced them apart
+    and fitted no law for them, and `device_end` refuses a forward that admits.
+    `columns[kind][segment]` prices launch features, a batch's `compass_launch`,
+    which its caller sets from `predicted`; `launch`, the provider and graph
+    sets predicting them, refuses a column naming a feature it lacks; a
+    pipeline stage refuses any column.
     """
 
     def __init__(
-        self, laws: dict, skip, now, stage=None, mtp=False, sync=False
+        self,
+        laws: dict,
+        skip,
+        now,
+        stage=None,
+        mtp=False,
+        sync=False,
+        admit=ADMISSION_IN_E,
+        columns=None,
+        launch=(None, None),
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
+        self.admit, self.columns, self.launch = admit, columns or {}, launch
+        named = {f for v in self.columns.values() for c in v.values() for f in c}
+        if lacks := sorted(named - set(getattr(launch[0], "features", ()))):
+            raise ValueError(
+                f"the host laws adopt launch features {lacks}, which this model's "
+                f"launch provider, {type(launch[0]).__name__}, does not declare"
+            )
+        if self.columns and stage is not None:
+            raise ValueError(
+                "the host laws adopt launch columns, and a pipeline stage posts "
+                "its receive at a prepare end `pp_recv_posted` prices without them"
+            )
         ring = 2 if stage is None else stage[1]
         self.ends = collections.deque([-math.inf] * ring, maxlen=ring)  # n-ring..n-1
         self.last = None if stage is None else stage[0] == stage[1] - 1
@@ -333,14 +388,18 @@ class HostDeviceRecurrence:
         self, batch: Any, device_s: float, draft_s: float, refuse: bool = True
     ) -> float:
         """The end of the forward's device work, launch included, for `device_s`
-        of target device time and then `draft_s` of draft, starting no earlier
-        than the batch's `compass_pp_release`; `target_end` is the target's
-        end, and `release` follows. A batch's
+        of target device time, starting no earlier than the batch's
+        `compass_pp_release` or `compass_queued_s` after `ends[-1]`, then
+        `draft_s` of draft, starting no earlier than the forward's exit, since
+        its host queues the draft before it exits; under `sync`, whose exit
+        waits for this end, no earlier than its launch's end. `target_end` is
+        the target's end, and `release` follows. A batch's
         `compass_pp_host = (called, meta)` runs the host from `called` in place
         of `now`; its launch posts the receive after `PP_RECV_SEGMENT` and
         runs the rest once `meta` is in. With any
         laws and `refuse`, a forward whose kind lacks one for a segment it runs
-        is refused, naming each ``<kind>.<segment>``, the state as it was;
+        is refused, naming each ``<kind>.<segment>``, the state as it was, as
+        is one that admits a request with `admit` None, naming ``admit``;
         without `refuse` that segment is 0. A segment in `skip` needs none, a
         middle chunk runs no `W_post`, and only an output forward under `mtp`
         runs `MTP_SEGMENT`, and on a single stage `MTP_COPY`; a stage after the
@@ -355,31 +414,71 @@ class HostDeviceRecurrence:
         ran += (PP_RECV_SEGMENT,) if self.recv else ()
         out = any(OUT_SEGMENT in v for v in self.laws.values())
         ran += (OUT_SEGMENT,) if out else ()
-        missing = [s for s in ran if s not in {*law, *self.skip}]
+        missing = [f"{kind}.{s}" for s in ran if s not in {*law, *self.skip}]
+        features = getattr(batch, "compass_launch", None) or {}
+        columns = self.columns.get(kind, {})
+        missing += [
+            f"{kind}.{s}.{f}"
+            for s in ran
+            for f in columns.get(s, ())
+            if f not in features
+        ]
+        a = getattr(batch, "compass_admitted", None)
+        if self.admit is None and a and a[0] and not self.recv and "E" not in self.skip:
+            missing.append("admit")
         if refuse and self.laws and missing:
             from atom.compass.backends.resolver import CostRefused, Refusal
 
-            named = ", ".join(f"{kind}.{s}" for s in missing)
+            named = ", ".join(missing)
             raise CostRefused(kind, [Refusal("host", f"no law for {named}")])
         now = self.now()
         called, meta = getattr(batch, "compass_pp_host", (now, -math.inf))
-        prepared, self.segments = self.prepare_end(called, kind, x)
+        admit_s = self.admit_s(batch)
+        prepared, self.segments = self.prepare_end(called, kind, x, admit_s, features)
         self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)
         output = batch.produces_output()
         launch_end = max(prepared, meta - self.segments[PP_RECV_SEGMENT]) + launch
         release = getattr(batch, "compass_pp_release", -math.inf)
-        self.target_end = max(self.ends[-1], host, release) + device_s
+        queued_end = self.ends[-1] + getattr(batch, "compass_queued_s", 0.0)
+        self.target_end = max(queued_end, host, release) + device_s
         self._held = now, launch_end, output, post
-        return max(self.target_end + draft_s, launch_end)
+        if not draft_s:
+            return max(self.target_end, launch_end)
+        queued = launch_end if self.sync else self._exit(self.target_end)
+        return max(self.target_end, queued) + draft_s
 
-    def prepare_end(self, called: float, kind: str, x: tuple) -> tuple[float, dict]:
+    def predicted(self, view: Any) -> dict:
+        """A step's launch features by `launch`'s provider, from its
+        `BatchView` `view`; none where no law adopts a column."""
+        provider, graphs = self.launch
+        return provider.predict(view, graphs) if self.columns else {}
+
+    def admit_s(self, batch: Any) -> float:
+        """What `batch`'s admissions add to its `E`."""
+        from atom.compass.backends.step_labels import admit_x
+
+        a = getattr(batch, "compass_admitted", None)
+        if not (self.admit and a) or self.recv:
+            return 0.0
+        return float(np.dot(self.admit, admit_x(a)))
+
+    def prepare_end(
+        self, called: float, kind: str, x: tuple, admit_s: float = 0.0, features=None
+    ) -> tuple[float, dict]:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
-        `PP_RECV_SEGMENT`'s too."""
-        law = self.laws.get(kind, {})
+        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, and each column a segment
+        adopts prices `features`' value of its feature, 0 where absent."""
+        law, columns = self.laws.get(kind, {}), self.columns.get(kind, {})
+        features = features or {}
         seg = {
-            s: float(np.dot(law.get(s, (0, 0, 0)), x)) * (s not in self.skip)
+            s: (
+                float(np.dot(law.get(s, (0, 0, 0)), x))
+                + admit_s * (s == "E")
+                + sum(c * features.get(f, 0.0) for f, c in columns.get(s, {}).items())
+            )
+            * (s not in self.skip)
             for s in SEGMENTS
         }
         host = max(called + seg["E"], self.ends[0]) + seg["W_pre"]
@@ -391,17 +490,28 @@ class HostDeviceRecurrence:
         """The exit less `now` of the forward `device_end` priced, its device
         work ending at `end` and its target's at `target_end`, no earlier than
         it said."""
-        now, launch_end, output, post = self._held
+        now, _, output, _ = self._held
         self.ends.append(end)
+        exit_ = self._exit(target_end, end)
+        if output and self.last is None and not self.sync:
+            self.output_end = target_end
+        return exit_ - now
+
+    def _exit(self, target_end: float, end: float = -math.inf) -> float:
+        """The exit of the forward `device_end` priced, its device work ending
+        at `end` and its target's at `target_end`: `W_post` after its launch
+        and the wait that follows it, an output forward's for the previous
+        output forward's target on a single stage or its own on the last, or
+        under `sync` for `end`."""
+        _, launch_end, output, post = self._held
         released = launch_end
         if self.sync:
             released = max(launch_end, end)
-        elif output:
-            if self.last is None:
-                released, self.output_end = max(launch_end, self.output_end), target_end
-            elif self.last:
-                released = max(launch_end, target_end)
-        return released + post - now
+        elif output and self.last is None:
+            released = max(launch_end, self.output_end)
+        elif output and self.last:
+            released = max(launch_end, target_end)
+        return released + post
 
 
 def schedulable_ladder(config: Any) -> list[int]:
@@ -549,7 +659,9 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
     after the stages before it -- on gloo and with an empty custom group
     configuration, under which aiter builds no device communicator for any
     group. A simulated TP width is refused: it starts fewer workers than the
-    TP group `apply_simulated_tp` then reports on a device group.
+    TP group `apply_simulated_tp` then reports on a device group. In a simulated
+    run the DP group then runs its small collectives over shared memory when
+    its ranks share a host (`shm_collectives`).
     """
     pc = config.parallel_config
     if config.tp_world_size != config.tensor_parallel_size:
@@ -619,6 +731,15 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
         prefill_context_model_parallel_size=pcp,
         custom_group_config={},
     )
+    from atom.compass import run
+
+    if pc.data_parallel_size > 1 and run.spec() is not None:
+        from aiter.dist.parallel_state import get_dp_group
+
+        from atom.compass.runner import shm_collectives
+
+        shm_collectives.install()
+        shm_collectives.attach(get_dp_group().cpu_group)
 
 
 def _config_field(runner: Any, name: str) -> Any:
@@ -1476,14 +1597,12 @@ class NonAllocatingRunner(
         from atom.compass.parity import record_step
         from atom.model_engine.scheduler import ScheduledBatchOutput
 
-        mode = record_step(self, batch)
+        mode, view = record_step(self, batch) or (None, None)
         record = getattr(self, "_parity_record", None)
         if record is not None and record.step == 1:
             # The record was just created, replacing an earlier run's; so is
             # the cost table, before anything this step does can stop the run.
-            record.path.with_suffix(".cost.jsonl").write_text(
-                json.dumps({"version": COST_TABLE_VERSION}) + "\n"
-            )
+            _start_cost_table(self, record)
 
         stream = getattr(self, "_token_stream", None)
         if stream is None:
@@ -1521,7 +1640,7 @@ class NonAllocatingRunner(
             )
             self._token_stream = stream
         tokens = stream.step(batch)
-        seconds = _group_step_seconds(self, batch, backend, mode)
+        seconds = _group_step_seconds(self, batch, backend, mode, view)
         out = ScheduledBatchOutput(
             **tokens,
             predicted_s=seconds,
@@ -1535,20 +1654,41 @@ class NonAllocatingRunner(
         return out
 
 
+def _start_cost_table(runner: Any, record: Any) -> None:
+    """Open `record`'s `dp<r>.cost.jsonl`, replacing an earlier run's, and
+    write its version line; the file stays open for the run, as the record's
+    own does, in `runner`'s `_cost_table`."""
+    table = record.path.with_suffix(".cost.jsonl").open("w")
+    table.write(json.dumps({"version": COST_TABLE_VERSION}) + "\n")
+    table.flush()
+    vars(runner)["_cost_table"] = table
+
+
 def _group_step_seconds(
-    runner: Any, batch: Any, backend: CostBackend, mode: Any = None
+    runner: Any,
+    batch: Any,
+    backend: CostBackend,
+    mode: Any = None,
+    view: Any = None,
 ) -> float:
     """This rank's step priced from its own batch, then its DP group target.
 
     Only TP rank 0 prices; any other TP rank of the engine charges 0 s.
 
     `mode` is the step's `ForwardMode` when the step record already settled
-    it; without one it is settled here, which runs the DP collective.
+    it; without one it is settled here, which runs the DP collective; `view`,
+    the `BatchView` the record built from it, is priced in place of a new one.
+    Under DP the group then sums its dummy forwards (`projection.dummy_ranks`),
+    which the view states as its `group_dummies`.
 
     In a run, `compass_host` composes the price, the target's device seconds
     and then the draft's (`StepCost.target_seconds`, `draft_seconds`), with
-    host time. Under DP, a `HostDeviceRecurrence`'s device end, and its output
-    mark (the device end, or under MTP the target end), are first replaced by
+    host time; a `HostDeviceRecurrence`, unless its `admit` is
+    `ADMISSION_IN_E`, reads the batch's
+    `compass_admitted`, set here first (`admitted`, over the requests this
+    runner has seen).
+    Under DP, a `HostDeviceRecurrence`'s device end, and its output mark
+    (the device end, or under MTP the target end), are first replaced by
     the group's latest, an `all_reduce(MAX)` standing in
     for a real forward's cross-rank collectives, and every rank leaves at its
     own charge. With no
@@ -1575,7 +1715,7 @@ def _group_step_seconds(
     has one reason.
 
     On the rank that keeps the parity record, each step also appends its cost
-    line to `dp<r>.cost.jsonl` beside it: the record's `step`; with a
+    line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`; with a
     `compass_host` that reports them, each of `HOST_SEGMENTS` and
     `MTP_SEGMENT` and `PP_RECV_SEGMENT`, the part of `W_launch` before a
     later stage's receive, in seconds, each 0.0 where the law has none, and `skipped`,
@@ -1586,9 +1726,14 @@ def _group_step_seconds(
     and its provenance's `method`, `validated` and `source`; and `refused`,
     the ``cost:`` reason or None. Above them, `forward` starts the file with
     `{"version": COST_TABLE_VERSION}` as the record starts, replacing an
-    earlier run's file.
+    earlier run's file, and keeps it open in `_cost_table` for the run.
     """
-    from atom.compass.runner.projection import batch_view, dp_group, forward_mode
+    from atom.compass.runner.projection import (
+        batch_view,
+        dp_group,
+        dummy_ranks,
+        forward_mode,
+    )
 
     if runner.rank != 0:
         # The engine reads TP rank 0's reply only, and the other ranks'
@@ -1609,8 +1754,23 @@ def _group_step_seconds(
     mix = vars(runner).setdefault("_priced", ProvenanceMix())
     spec = getattr(runner.config, "speculative_config", None)
     terms, refused = (), None
+    host = getattr(runner, "compass_host", None)
+    if isinstance(host, HostDeviceRecurrence) and host.admit != ADMISSION_IN_E:
+        # A block-table entry holds a block's tokens on each DCP rank.
+        entry = _config_field(runner, "kv_cache_block_size") * _config_field(
+            runner, "decode_context_parallel_size"
+        )
+        seen = vars(runner).setdefault("_admitted", set())
+        batch.compass_admitted = admitted(batch, seen, entry)
+    dummies = dummy_ranks(batch, mode)
     try:
-        cost = backend.price(batch_view(batch, mode, runner))
+        if view is None:
+            view = batch_view(batch, mode, runner, dummies)
+        elif view.dp_rank is not None:
+            view = dataclasses.replace(view, group_dummies=dummies)
+        if isinstance(host, HostDeviceRecurrence):
+            batch.compass_launch = host.predicted(view)
+        cost = backend.price(view)
         if spec and not cost.draft_terms and EAGER_DP_DUMMY not in cost.treatments:
             name = type(backend).__name__
             raise CostRefused(batch, [Refusal(name, "prices no draft")])
@@ -1625,7 +1785,6 @@ def _group_step_seconds(
         mix.record(cost)
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
         terms = (*cost.terms, *cost.draft_terms)
-    host = getattr(runner, "compass_host", None)
     # `decide` returns the collective's rows for a group of one too.
     many = mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1
     group = dp_group() if many else None
@@ -1659,8 +1818,8 @@ def _group_step_seconds(
         mine = torch.tensor([charge_s, waits, out], dtype=torch.float64)
         rows = [torch.empty_like(mine) for _ in range(group.size())]
         torch.distributed.all_gather(rows, mine, group=group)
-        top = max(r[0].item() for r in rows)
         rows = [r.tolist() for r in rows]
+        top = max(s for s, *_ in rows)
         targets = tuple(top if w else s for s, w, _ in rows)
         ends = zip(targets, (o for *_, o in rows))
         pulls = tuple(t + o for t, o in ends if not math.isnan(o)) or None
@@ -1694,8 +1853,8 @@ def _group_step_seconds(
         ],
         "refused": refused,
     }
-    with record.path.with_suffix(".cost.jsonl").open("a") as f:
-        f.write(json.dumps(line) + "\n")
+    runner._cost_table.write(json.dumps(line) + "\n")
+    runner._cost_table.flush()
     return group_s
 
 

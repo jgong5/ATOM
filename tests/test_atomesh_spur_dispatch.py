@@ -129,6 +129,14 @@ class SpurDispatchTest(unittest.TestCase):
                 sys.exit(8)
             """,
         )
+        # Idle cards, so no test reads what other jobs hold on the host's.
+        self.write_tool(
+            "amd-smi",
+            """
+            print("GPU  XCP  VRAM_USED   VRAM_FREE  VRAM_TOTAL    VRAM%")
+            print("  0    0       0 MB   294592 MB   294592 MB   0.00 %")
+            """,
+        )
         self.env = {
             "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
             "TEST_ROOT": str(self.root),

@@ -45,7 +45,8 @@ from atom.compass.backends.step_labels import BUILDS, refusal  # noqa: F401
 from atom.compass.run import _write_whole
 
 
-def _roots() -> dict[Path, object]:
+def _roots() -> dict[Path, str]:
+    """Each cache root, mapped to the compiler `NAMES` keys it by."""
     try:
         spec = importlib.util.find_spec("aiter")
     except ValueError:  # an `aiter` in sys.modules with no spec, as a stub is
@@ -59,11 +60,10 @@ def _roots() -> dict[Path, object]:
     flydsl = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR")
     flydsl = [flydsl] if flydsl else [p / "flydsl_cache" for p in package]
     inductor = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or default_cache_dir()
-    kernels = (knobs.cache.dir, inductor)
     return (
-        {p: _module for p in (Path.home() / ".aiter", *env, *package)}
-        | {Path(p): lambda parts: parts[0] if len(parts) > 1 else None for p in flydsl}
-        | {Path(p): lambda parts: _file(parts[-1]) for p in kernels}
+        {p: "aiter" for p in (Path.home() / ".aiter", *env, *package)}
+        | {Path(p): "flydsl" for p in flydsl}
+        | {Path(knobs.cache.dir): "triton", Path(inductor): "inductor"}
     )
 
 
@@ -80,17 +80,27 @@ def _module(parts: tuple[str, ...]) -> str | None:
     return parts[i + 1] if len(parts) > i + 2 else None
 
 
+#: How each compiler names the compile that wrote a path, given its parts under
+#: the compiler's root.
+NAMES = {
+    "aiter": _module,
+    "flydsl": lambda parts: parts[0] if len(parts) > 1 else None,
+    "triton": lambda parts: _file(parts[-1]),
+    "inductor": lambda parts: _file(parts[-1]),
+}
+
+
 def builds_since(since_ns: int) -> dict:
     """run.json's entry naming each aiter JIT module or compiled kernel with a
     file written at or after `since_ns`, wall clock nanoseconds; {} when none
     was."""
     built = set()
-    for root, name in _roots().items():
+    for root, compiler in _roots().items():
         for top, _, files in os.walk(root):
             for path in (Path(top, f) for f in files):
                 with suppress(FileNotFoundError):  # a temporary since renamed
                     if path.lstat().st_mtime_ns >= since_ns:
-                        built.add(name(path.relative_to(root).parts))
+                        built.add(NAMES[compiler](path.relative_to(root).parts))
     built.discard(None)
     return {BUILDS: sorted(built)} if built else {}
 

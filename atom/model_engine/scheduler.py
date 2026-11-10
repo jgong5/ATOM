@@ -25,7 +25,6 @@ import logging
 import math
 import struct
 import threading
-import time
 from collections import Counter, deque
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
@@ -61,7 +60,8 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
 )
 from atom.observability import tracing
-from atom.utils import clock, envs
+from atom.utils import envs
+from atom.utils import time_shim as time
 
 if TYPE_CHECKING:
     from atom.model_engine.prefill_delayer import PrefillDelayer
@@ -675,6 +675,9 @@ class Scheduler:
         # by `take_rejected` each EngineCore step; routed through the same
         # output_queue path as forward-finished seqs.
         self._rejected: list[Sequence] = []
+        # An aborted send handed to the connector since its last metadata,
+        # which carries the abort to the workers.
+        self._abort_awaits_meta = False
 
         # KV transfer bookkeeping
         self.finished_recving_kv_req_ids: list[int] = []
@@ -1362,7 +1365,7 @@ class Scheduler:
         if not stats.throughput_enabled:
             return
         stats.update_throughput(num_prompt_tokens, num_generation_tokens)
-        if not stats.window_expired(clock.now(time.monotonic)):
+        if not stats.window_expired(time.monotonic()):
             return
         num_running_reqs, num_waiting_reqs = self.get_request_counts()
         stats.maybe_log_throughput(
@@ -1473,7 +1476,7 @@ class Scheduler:
                 oldest_arrive = seq.arrive_time
         if oldest_arrive is None:
             return 0.0
-        return max(0.0, (clock.now(time.time) - oldest_arrive) * 1000.0)
+        return max(0.0, (time.time() - oldest_arrive) * 1000.0)
 
     def publish_kv_events(self) -> None:
         """Drain BlockManager's event log and publish as one EventBatch. Called
@@ -1710,7 +1713,7 @@ class Scheduler:
         timeout = self._save_abandon_timeout_s()
         if timeout <= 0:
             return 0
-        now = clock.now(time.monotonic)
+        now = time.monotonic()
         if now < self._next_save_reconcile_at:
             return 0
         self._next_save_reconcile_at = now + _SAVE_RECONCILE_INTERVAL_S
@@ -2053,8 +2056,11 @@ class Scheduler:
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
 
-        # Rejections may still need an empty batch to dispatch connector cleanup.
-        if not self.running and not self.waiting and not self._rejected:
+        # Rejections, and an abort handed to the connector, may still need an
+        # empty batch to dispatch connector cleanup.
+        if not (
+            self.running or self.waiting or self._rejected or self._abort_awaits_meta
+        ):
             return None
 
         # ---- Phase 1: resume partial prefills from running ----
@@ -2095,7 +2101,7 @@ class Scheduler:
         prefix_bypass_left = min(16, self.max_num_seqs)
         while (
             delayer_allows
-            and (self.delay_factor <= 0 or self._passed_delay(clock.now(time.time)))
+            and (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
@@ -2601,6 +2607,7 @@ class Scheduler:
                 self._publish_state_loads()
                 self._publish_state_stores()
                 connector_meta_output = self.kv_connector.build_connector_meta()
+                self._abort_awaits_meta = False
 
             # Freeze, per seq, whether this chunk is the last one this prefill
             # owes. Uses the pre-advance offsets so it is correct whether or not
@@ -2784,6 +2791,7 @@ class Scheduler:
             self._publish_state_loads()
             self._publish_state_stores()
             connector_meta_output = self.kv_connector.build_connector_meta()
+            self._abort_awaits_meta = False
 
         self._check_draft_writes_allocated(scheduled_seqs.values())
         decode_batch = ScheduledBatch(
@@ -2942,7 +2950,18 @@ class Scheduler:
             if seq.id == req_id:
                 seq.status = SequenceStatus.ABORTED
                 return True
-        return False
+        # Finished and parked for its send: the connector reports the send
+        # done once no transfer of the blocks can run, and refuses a later one.
+        seq = self._deferred_sequence(req_id)
+        if seq is None:
+            return False
+        abort_send = getattr(self.kv_connector, "abort_send", None)
+        if callable(abort_send):
+            abort_send(seq.id)
+            # An idle scheduler builds no metadata, so `_schedule` builds an
+            # empty batch to carry the abort to the workers.
+            self._abort_awaits_meta = True
+        return True
 
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.
@@ -4351,7 +4370,7 @@ class Scheduler:
             # terminal response with no completion tokens must keep TTFT zero.
             seq.num_finalized_tokens = num_tokens
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
-                seq.first_token_time = clock.now(time.time)
+                seq.first_token_time = time.time()
                 tracing.first_token(seq)
 
             # Counted here, not from `len(token_ids)` above: `new_tokens` is
@@ -4493,7 +4512,7 @@ class Scheduler:
                         # Stamp when the save was deferred so the reconciler
                         # can reclaim it if the completion report never
                         # arrives.
-                        seq._deferred_save_at = clock.now(time.monotonic)
+                        seq._deferred_save_at = time.monotonic()
                         self.deferred_free_blocks[seq.id] = seq
                 else:
                     self.block_manager.deallocate(seq)
@@ -5145,7 +5164,7 @@ class PrefillScheduler:
         if not stats.throughput_enabled:
             return
         stats.update_throughput(num_prompt_tokens, num_generation_tokens)
-        if not stats.window_expired(clock.now(time.monotonic)):
+        if not stats.window_expired(time.monotonic()):
             return
         num_running_reqs, num_waiting_reqs = self.get_request_counts()
         stats.maybe_log_throughput(
@@ -5321,7 +5340,7 @@ class DecodeScheduler(Scheduler):
             # this, the trailing mtp_k+1 slice reaches back into prompt tokens.
             for _ in range(self.mtp_k):
                 seq.append_token(self.eos_token_id)
-            seq.first_token_time = clock.now(time.time)
+            seq.first_token_time = time.time()
             self.prefill_done.append(seq)
 
     def _schedule(self):

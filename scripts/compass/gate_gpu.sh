@@ -6,7 +6,7 @@
 # that says "green" has not read it.
 #
 # The delta is judged on the failing node-IDS, not only on their count:
-# gpu_gate_known_failures.txt beside this script names them verbatim. "5 failed"
+# gpu_gate_known_failures.txt in the card's pair names them verbatim. "5 failed"
 # could never be checked against "the SAME 5 failed"; a list can.
 #
 # Also run per-task by any change gate_cpu.sh flags against
@@ -66,10 +66,26 @@ finish() {
 }
 printf 'verdict: the last line of stdout; if this run is piped, $? is the pipe'"'"'s\n'
 
+ROOT=$(compass_tree_root) || finish $? "the tree to measure could not be resolved; nothing was run"
+cd "$ROOT" || finish 90 "cannot cd into the tree; nothing was run"
+compass_env "$ROOT"
+export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
+
+PRE=$(dirname -- "${BASH_SOURCE[0]}")/preflight.sh
+printf '===== pre-flight (before) =====\n'
+"$PRE" || { printf 'ABORT: pre-flight failed before the run.\n' >&2; finish 91 "pre-flight failed before the run; nothing was run"; }
+
+compass_require_tree "$ROOT" || finish $? "atom does not import from this tree; nothing was run"
+compass_describe "$ROOT"
+
 # The baseline is a pair AND the tree and toolchain it was measured on. A bare
 # pair cannot distinguish a regression from drift: after a torch bump, 4728/7
 # has no reading. regen_gpu_gate_baseline.sh measures these seven constants and
 # writes them to gpu_gate_baseline.env; changing that file is a reviewed edit.
+#
+# There is one pair per GPU target, in gpu_gate_baselines/<target>/; the first
+# card's is read. BASE_LEFT_OUT, when set, counts the tests gpu_gate_skip.txt
+# left out of the baseline's run.
 #
 # BASE_ROCM is compared against torch.version.hip below, so it carries the HIP
 # runtime version, not the ROCm release.
@@ -93,11 +109,15 @@ printf 'verdict: the last line of stdout; if this run is piped, $? is the pipe'"
 # blamed tests outside tests/compass/. The tree side is now the passes of the
 # tests/compass run below, so the two are the same quantity by construction
 # rather than while a condition happens to hold.
-BASELINE=$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_baseline.env
+ARCH=$(compass_gpu_arch "${HIP_VISIBLE_DEVICES%%,*}")
+[ -n "$ARCH" ] || finish 93 "torch reads no GPU target for card ${HIP_VISIBLE_DEVICES%%,*}, so no baseline applies; nothing was run"
+PAIR=$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_baselines/$ARCH
+BASELINE=$PAIR/gpu_gate_baseline.env
 [ -r "$BASELINE" ] || {
-    printf 'FATAL: %s is missing; the gate has no baseline.\n' "$BASELINE" >&2
-    finish 93 "the baseline file is missing; nothing was run"
+    printf 'FATAL: %s is missing; measure it with regen_gpu_gate_baseline.sh on a %s card.\n' "$BASELINE" "$ARCH" >&2
+    finish 93 "no baseline for $ARCH; nothing was run"
 }
+printf 'baseline pair: %s\n' "$PAIR"
 . "$BASELINE"
 for key in BASE_PASSED BASE_FAILED BASE_COMMIT BASE_TORCH BASE_ROCM BASE_AITER BASE_COMPASS_TESTS; do
     [ -n "${!key:-}" ] || finish 93 "$(basename "$BASELINE") sets no $key; nothing was run"
@@ -106,7 +126,7 @@ done
 # The baseline's failures by name. The count above and the list here are two
 # statements of one fact, so a disagreement between them is a defect in this
 # script rather than a test result -- refuse instead of picking one.
-KNOWN_FILE=$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_known_failures.txt
+KNOWN_FILE=$PAIR/gpu_gate_known_failures.txt
 known_ids() { grep -vE '^[[:space:]]*(#|$)' "$KNOWN_FILE"; }
 [ -r "$KNOWN_FILE" ] || {
     printf 'FATAL: %s is missing; the baseline names no failures.\n' "$KNOWN_FILE" >&2
@@ -142,18 +162,6 @@ for arg in "$@"; do
     esac
 done
 
-ROOT=$(compass_tree_root) || finish $? "the tree to measure could not be resolved; nothing was run"
-cd "$ROOT" || finish 90 "cannot cd into the tree; nothing was run"
-compass_env "$ROOT"
-export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
-
-PRE=$(dirname -- "${BASH_SOURCE[0]}")/preflight.sh
-printf '===== pre-flight (before) =====\n'
-"$PRE" || { printf 'ABORT: pre-flight failed before the run.\n' >&2; finish 91 "pre-flight failed before the run; nothing was run"; }
-
-compass_require_tree "$ROOT" || finish $? "atom does not import from this tree; nothing was run"
-compass_describe "$ROOT"
-
 TORCH=$(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo UNKNOWN)
 ROCM=$(python -c 'import torch; print(torch.version.hip)' 2>/dev/null || echo UNKNOWN)
 # aiter's checkout is located without importing aiter: its import shells out to
@@ -180,14 +188,22 @@ if [ "$TORCH" != "$BASE_TORCH" ] || [ "$ROCM" != "$BASE_ROCM" ] || [ "$AITER" !=
     printf '         re-measured on this stack with regen_gpu_gate_baseline.sh.\n' >&2
 fi
 
+# gpu_gate_skip.txt, read for the first card's target: the files whose result
+# there its pair cannot record, the kinds listed in that file's header, and
+# whether that target's nodes hold the driver-run inputs below. Each file is
+# left out of its run, and a suite file's collected tests come off the
+# expectation.
+compass_gpu_skips "$ARCH" || finish 1 "$SKIP_WHY"
+
 # The driver-run tests start ATOM's own servers on the simulated clock. Each
 # skips without its inputs, and a skip is not a failure, so a gate that does not
 # set them passes without running them. On a tree whose tests read the slice
 # model, every input is set here, by default to node 18's, and a missing one
-# refuses the run by name.
+# refuses the run by name -- except on a target whose nodes hold none, where
+# no input is set, one card does and a driver-run skip is accepted.
 GPUS=$HIP_VISIBLE_DEVICES
 SMOKE=
-if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
+if [ -z "$NO_DRIVER_RUN" ] && grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
     hf_snapshot() { ls -d "${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--$1/snapshots/"*/ 2>/dev/null | head -1; }
     export ATOM_COMPASS_SLICE_MODEL=${ATOM_COMPASS_SLICE_MODEL:-$(hf_snapshot Qwen3-0.6B)}
     export ATOM_COMPASS_IMAGE_MODEL=${ATOM_COMPASS_IMAGE_MODEL:-$(hf_snapshot Qwen3.5-9B)}
@@ -259,31 +275,21 @@ compass_tests() {
     COMPASS_N=$((COMPASS_N + PASSED)) C_FAILED=$((C_FAILED + FAILED)) C_ERRORS=$((C_ERRORS + ERRORS))
 }
 if [ -f "$SMOKE" ]; then
-    compass_tests tests/compass --ignore="$SMOKE"
+    compass_tests tests/compass --ignore="$SMOKE" "${COMPASS_LEFT[@]/#/--ignore=}"
     # The tree's compass-harness ahead of the one the harness Python has installed.
     PYTHONPATH=$ROOT/compass_harness:$PYTHONPATH ATOM_COMPASS_SLICE_MODEL=$ATOM_COMPASS_CCTRACES_MODEL \
         compass_tests "$SMOKE"
 elif [ -d "$ROOT/tests/compass" ]; then
-    compass_tests tests/compass
+    compass_tests tests/compass "${COMPASS_LEFT[@]/#/--ignore=}"
 else
     printf 'tests/compass: absent on this tree, so it contributes no tests.\n'
 fi
-# A file that stalls on one GPU keeps the suite from ever printing a summary.
-# gpu_gate_skip.txt names such files per GPU; on a matching first card each is
-# left out of the suite and its collected tests come off the expectation.
 DEVICE=$(HIP_VISIBLE_DEVICES=${GPUS%%,*} python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null)
 printf 'device: %s\n' "${DEVICE:-UNKNOWN}"
-SKIP_ARGS=() SKIP_N=0
-while read -r gpu file; do
-    [[ -n $DEVICE && $DEVICE == *"$gpu"* && -e $file ]] || continue
-    n=$(python -m pytest "$file" --collect-only -q -p no:cacheprovider 2>&1 | sed -nE 's/^([0-9]+) tests? collected.*/\1/p')
-    [ -n "$n" ] || finish 1 "cannot count the tests of $file, which gpu_gate_skip.txt leaves out on $gpu"
-    printf 'left out on %s: %s (%s tests)\n' "$gpu" "$file" "$n"
-    SKIP_ARGS+=("--ignore=$file") SKIP_N=$((SKIP_N + n))
-done < <(grep -vE '^[[:space:]]*(#|$)' "$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_skip.txt")
-EXPECT_PASSED=$((BASE_PASSED + COMPASS_N - BASE_COMPASS_TESTS - SKIP_N))
-printf 'expected: %s passed = %s baseline + (%s - %s) tests/compass - %s left out\n' \
-    "$EXPECT_PASSED" "$BASE_PASSED" "$COMPASS_N" "$BASE_COMPASS_TESTS" "$SKIP_N"
+LEFT_OUT=$((SKIP_N - ${BASE_LEFT_OUT:-0}))
+EXPECT_PASSED=$((BASE_PASSED + COMPASS_N - BASE_COMPASS_TESTS - LEFT_OUT))
+printf 'expected: %s passed = %s baseline + (%s - %s) tests/compass - (%s - %s) left out here and there\n' \
+    "$EXPECT_PASSED" "$BASE_PASSED" "$COMPASS_N" "$BASE_COMPASS_TESTS" "$SKIP_N" "${BASE_LEFT_OUT:-0}"
 printf '\n'
 
 OUT=$(mktemp)
@@ -344,7 +350,9 @@ fail() { printf '%s\n' "$1" >&2; VERDICT=$((VERDICT + 1)); [ -n "$WHY" ] || WHY=
   error is not a failure -- the tests behind it did not run at all, so the
   pass count below is over a smaller suite than the baseline'"'"'s.' "$ERRORS")" \
     "$ERRORS collection/teardown error(s)"
-[ -z "$SKIPS" ] ||
+[ -z "$NO_DRIVER_RUN" ] || printf 'driver-run: %s skip line(s) accepted on %s, whose nodes hold no inputs\n' \
+    "$(grep -c . <<<"$SKIPS")" "$ARCH"
+[ -z "$SKIPS" ] || [ -n "$NO_DRIVER_RUN" ] ||
     fail "$(printf 'driver-run test(s) skipped, so not run:\n%s' "$(sed 's/^/  /' <<<"$SKIPS")")" \
         "$(grep -c . <<<"$SKIPS") driver-run skip line(s), first ${SKIPS%%$'\n'*}"
 
@@ -409,7 +417,7 @@ rm -f "$OBS_IDS" "$ERR_IDS" "$KNOWN_IDS"
     fail "$(printf '%s passed, expected %s. The difference decomposes as:
     baseline        %s   at %s
     tests/compass   %s now, %s at the baseline (delta %s)
-    left out        %s
+    left out        %s   here, less at the baseline
     expected        %s
     observed        %s
     unaccounted     %s
@@ -418,7 +426,7 @@ rm -f "$OBS_IDS" "$ERR_IDS" "$KNOWN_IDS"
   accounted for; if this tree adds tests outside tests/compass/, account for
   them here.' \
         "$PASSED" "$EXPECT_PASSED" "$BASE_PASSED" "$BASE_COMMIT" \
-        "$COMPASS_N" "$BASE_COMPASS_TESTS" "$((COMPASS_N - BASE_COMPASS_TESTS))" "$SKIP_N" \
+        "$COMPASS_N" "$BASE_COMPASS_TESTS" "$((COMPASS_N - BASE_COMPASS_TESTS))" "$LEFT_OUT" \
         "$EXPECT_PASSED" "$PASSED" "$((PASSED - EXPECT_PASSED))")" \
     "$PASSED passed, expected $EXPECT_PASSED"
 

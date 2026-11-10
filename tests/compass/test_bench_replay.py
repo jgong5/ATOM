@@ -27,11 +27,14 @@ def rule(model_dir):  # noqa: F811
     for rows of at most `max_model_len` tokens and the request parameters
     `sampling`."""
 
-    def build(model_type="llama", blocks=4096, sampling=None, max_model_len=2048):
+    def build(
+        model_type="llama", blocks=4096, sampling=None, max_model_len=2048, **engine
+    ):
         config = _config(blocks=blocks)
         config.model, config.trust_remote_code = str(model_dir), False
         config.max_model_len = max_model_len
         config.hf_config = SimpleNamespace(model_type=model_type)
+        vars(config).update(engine)
         return replay.ReplayRule(config, sampling)
 
     return build
@@ -103,6 +106,32 @@ def test_rows_hold_contiguous_blocks_of_a_fresh_pool_in_row_order(rule):
     assert not set(again.req_ids) & set(batch.req_ids)
     with pytest.raises(ValueError, match="hold 8 KV blocks .* the pool has 7"):
         rule(blocks=7).batch(line)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        _line([[1, 40, True], [1, 70, True]]),
+        _line([[64, 64, False], [16, 80, False]], False),
+    ],
+    ids=["decode", "middle-chunks"],
+)
+def test_under_expert_parallelism_a_line_rebuilds_as_it_does_without(rule, line):
+    """The bench runs a point's whole batch on every rank, as without it."""
+
+    def rebuilt(ep):
+        batch = rule(tensor_parallel_size=4, enable_expert_parallel=ep).batch(line)
+        return (
+            [list(t) for t in batch.block_tables],
+            batch.scheduled_tokens.tolist(),
+            batch.num_scheduled_tokens.tolist(),
+            batch.context_lens.tolist(),
+            batch.num_cached_tokens,
+            batch.is_final_chunk,
+            batch.total_tokens_num,
+        )
+
+    assert rebuilt(True) == rebuilt(False)
 
 
 def test_rows_sharing_blocks_hold_the_same_leading_blocks_then_their_own(rule):

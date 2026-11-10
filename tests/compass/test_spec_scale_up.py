@@ -3,14 +3,12 @@
 
 The MI455 document is built the way its spec is authored: AMD's published
 numbers as a `datasheet` fragment, and everything nobody published or measured
-(the two link latencies, the derates and the host) as an `assumed` one.
+(the two link latencies, the derates and the stack) as an `assumed` one.
 """
-
-import copy
 
 import pytest
 from test_spec_origin import saved
-from test_spec_schema import DOCUMENT, STACK, document, read, refusal_from
+from test_spec_schema import STACK, document, read, refusal_from
 from test_spec_verbs import fragment
 
 from atom.compass.spec import MachineSpec, SpecRefusal, merge, validate
@@ -43,7 +41,6 @@ DATASHEET = {
 
 #: What no source states for it: never measured, so assumed.
 ASSUMED = {
-    "host": copy.deepcopy(DOCUMENT["host"]),
     "device": {
         "memory": {"derate": 0.86},
         "compute": {"derate": {"bf16": 0.50, "fp8": 0.50, "fp4": 0.50}},
@@ -123,7 +120,7 @@ def test_the_mi455_spec_loads_with_a_fabric_wider_than_its_node():
 
 def test_the_mi455_latencies_stay_assumed_through_a_re_merge():
     first = mi455()
-    host = {"host": {"cpu": copy.deepcopy(DOCUMENT["host"]["cpu"])}}
+    ptl = {"device": {"ptl": "disabled"}}
     again = merge(
         [
             fragment(
@@ -131,11 +128,11 @@ def test_the_mi455_latencies_stay_assumed_through_a_re_merge():
                 {k: v for k, v in first.items() if k != "name"},
                 machine=MI455,
             ),
-            fragment("probe", host, machine=MI455, date="2026-10-20"),
+            fragment("probe", ptl, machine=MI455, date="2026-10-20"),
         ]
     )
     spec = MachineSpec.from_mapping(saved(again.document))
-    assert spec.origin("host.cpu.cores_physical") == {"origin": "probed"}
+    assert spec.origin("device.ptl") == {"origin": "probed"}
     assert spec.origin("device.compute.fp4_flops") == {"origin": "datasheet"}
     for path in LATENCIES:
         assert spec.origin(path) == {"origin": "assumed"}

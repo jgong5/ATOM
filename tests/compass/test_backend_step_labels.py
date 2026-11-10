@@ -17,13 +17,13 @@ import numpy as np
 import pytest
 from test_backend_step_linear_fit import (
     GAP_NS,
-    HOST,
     SPEC,
     _record,
     _rowmod_steps,
     _steps,
     _timed_record,
     _view,
+    traced,
 )
 from test_memory_readings import DOCUMENT, META_8B
 from test_parity_device_window import BUSY, GAP, _recorded
@@ -68,7 +68,10 @@ def _stamped(tmp_path, monkeypatch):
         runner.forward(batch)
     device.tick = BUSY // 3
     runner.exit()
-    return tmp_path / "real" / "dp0.jsonl"
+    record = tmp_path / "real" / "dp0.jsonl"
+    lines = [traced(json.loads(x)) for x in record.read_text().splitlines()]
+    record.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    return record
 
 
 def test_a_stamped_record_is_labelled_by_step_kind(tmp_path, monkeypatch):
@@ -103,10 +106,10 @@ def test_a_stamped_record_is_labelled_by_step_kind(tmp_path, monkeypatch):
     assert set(kinds) == {(False, False), (False, True), (True, True)}
     exposed = [row["step"] for row in table if row["launch_exposed"]]
     assert exposed and all(not samples[n].view.decode for n in exposed)
-    # The second request's first chunk follows the first's last: no request in
-    # common, so its `E` is cut as idle, as the record's first forward has none.
-    assert [s.step for s in samples if s.idle] == [4]
-    assert [s.step for s in samples if "E" not in s.host] == [0, 4]
+    # The second request's first chunk follows the first's last while the first
+    # waits to decode: the engine is busy, so only the first forward has no `E`.
+    assert [s.step for s in samples if s.idle] == []
+    assert [s.step for s in samples if "E" not in s.host] == [0]
 
 
 def test_a_rank_s_moe_rows_ride_in_each_sample_s_view(tmp_path):
@@ -411,13 +414,16 @@ def _dp_view(rows, rank, **group):
 #: gather pads the group's 4 real rows to 8, then a prefill step split in two.
 GROUP = [
     [
-        _dp_view(decode, rank, capture_rung=4, moe_rows=8, moe_tokens=4),
+        _dp_view(
+            decode, rank, capture_rung=4, moe_rows=8, moe_tokens=4, group_max_tokens=3
+        ),
         _dp_view(
             prefill,
             rank,
             moe_rows=900,
             moe_tokens=900,
             tbo_tokens=((300, 200), (200, 200)),
+            group_max_tokens=500,
         ),
     ]
     for rank, decode, prefill in (
@@ -485,40 +491,35 @@ def test_a_dp2_record_rebuilds_each_step_s_group_counts(tmp_path, monkeypatch):
     assert [s.view.moe_tokens for s in label(tmp_path / "dp0.jsonl")[0]] == [4, None]
 
 
-def test_a_prefill_launch_the_device_held_gives_no_W_launch_label(tmp_path):
-    """From step 40 on, each middle chunk's launch runs twice its device price,
-    so the device runs about half its label before the launch ends: the launch
-    waited on the device and gives no `W_launch`. The middle chunks before it,
-    the output prefills and the decodes keep theirs, and the middle chunk's
-    `W_launch` law is fitted on the launches the host ran alone. A decode and
-    an output prefill whose launches outlast all the device work queued before
-    them keep theirs too: the decode is launch-exposed, the output prefill
-    host-paced. The host clock's lead places the device: the labels are the
-    same with every host stamp a constant later."""
-    steps, held, long = _steps(14, n=80), list(range(40, 80, 4)), (39, 42)
-    scale = {}
-    for n in (*held, *long):
-        rows = steps[n][0]
-        x = (1, sum(r[0] for r in rows), len(rows))
-        kind = "decode" if n % 2 else "middle" if n % 4 == 0 else "prefill"
-        launch = float(np.dot(HOST[kind]["W_launch"], x))
-        work = sum(p for _, _, p in steps[: n + 1]) if n in long else steps[n][2]
-        scale[(n, "W_launch")] = 2 * work / launch
-    record = _timed_record(tmp_path / "dp0.jsonl", steps, scale=scale)[0]
-    samples, table = label(record)
+def test_a_dp_view_counts_its_step_s_dummy_forwards_from_every_rank_s_line(tmp_path):
+    """Step `i` of a DP4 run has `i % 4` ranks run a dummy forward. Each rank's
+    view counts them, the run's records labelled together or one alone beside
+    its peers; one rank's record reads no peer and counts none."""
+    from test_step_linear_dp import DP, _groups, _records
 
-    assert [s.step for s in samples if "W_launch" not in s.host] == held
-    assert [row["step"] for row in table if row["W_launch"] is None] == held
-    assert [samples[n].cut for n in long] == ["exposed", "paced"]
-    got = fit_host(samples)[0]["laws"]["middle"]["W_launch"]
-    assert got == pytest.approx(HOST["middle"]["W_launch"], rel=1e-4, abs=1e-12)
+    records = _records(tmp_path, _groups(0, n=24))
+    ranks = [[json.loads(x) for x in r.read_text().splitlines()] for r in records]
+    for i in range(24):
+        for r in ((i + k) % DP for k in range(1, i % DP + 1)):
+            ranks[r][i].update(is_dummy_run=True, batch=[], rows=[[1, 1, True]])
+    for record, lines in zip(records, ranks):
+        record.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    expected = {
+        (r, i): i % DP
+        for r in range(DP)
+        for i in range(24)
+        if not ranks[r][i]["is_dummy_run"]
+    }
+    together = [samples for samples, _ in label_run(records)]
+    alone = [label(r)[0] for r in records]
+    for labelled in (together, alone):
+        got = {
+            (s.rank, s.step): s.view.group_dummies for rank in labelled for s in rank
+        }
+        assert got == expected
 
-    later = tmp_path / "later" / "dp0.jsonl"
-    later.parent.mkdir()
-    lines = [json.loads(line) for line in record.read_text().splitlines()]
-    for line in lines:
-        for k in [k for k in line if k.startswith("t_")]:
-            v = line[k]
-            line[k] = [t + 10**12 for t in v] if isinstance(v, list) else v + 10**12
-    later.write_text("".join(json.dumps(line) + "\n" for line in lines))
-    assert label(later)[1] == table
+    single = tmp_path / "one"
+    single.mkdir()
+    (single / "dp1.jsonl").write_text("not a record\n")
+    one = _record(single / "dp0.jsonl", _steps(5, n=12))
+    assert {s.view.group_dummies for s in label(one)[0]} == {0}

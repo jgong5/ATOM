@@ -14,6 +14,7 @@ memory readings are measured first on the GPU ``HIP_VISIBLE_DEVICES`` names,
 under the machine spec `test_lmcache_mp_engine` reads.
 """
 
+import contextlib
 import json
 import math
 import os
@@ -71,7 +72,7 @@ class Workload(Traffic):
         rt.close()
 
 
-def run_images(out: Path, seed: str) -> dict:
+def run_images(out: Path, seed: str, machine: Path) -> dict:
     """One run in its own process tree, reading the readings in its parent's store."""
     out.mkdir()
     with held_ports(2) as (clock_port, port):
@@ -80,7 +81,7 @@ def run_images(out: Path, seed: str) -> dict:
             clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
             step_stub=CONSTANT,
             image_preprocess_s=IMAGE_S,
-            machine=json.loads(MACHINE.read_text()),
+            machine=json.loads(machine.read_text()),
             store=str(out.parent / "store"),
         )
         env = dict(
@@ -109,6 +110,14 @@ def run_images(out: Path, seed: str) -> dict:
                 )
                 traffic.run()
                 code = server.wait(timeout=120)
+            except Exception as error:
+                # A server that refuses at startup reaches the traffic LP only
+                # as a closed clock connection; its own words are in its log.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    server.wait(timeout=30)
+                tail = (out / "server.log").read_text()[-4000:]
+                error.add_note(f"the server's log ends:\n{tail}")
+                raise
             finally:
                 watchdog.cancel()
                 if server.poll() is None:
@@ -128,15 +137,16 @@ def runs(tmp_path_factory):
     from atom.compass import cli
 
     root = tmp_path_factory.mktemp("images")
+    machine = MACHINE
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("AITER_LOG_LEVEL", "WARNING")  # the readings are keyed by it
         cli.main(
-            ["measure", "memory", "--machine", str(MACHINE)]
+            ["measure", "memory", "--machine", str(machine)]
             + ["--gpu", os.environ.get("HIP_VISIBLE_DEVICES", "0")]
             + ["--store", str(root / "store"), "--out", str(root / "measure")]
             + ["--", *ARGS]
         )
-    return [run_images(root / f"seed{seed}", seed) for seed in ("1", "2")]
+    return [run_images(root / f"seed{seed}", seed, machine) for seed in ("1", "2")]
 
 
 @NEEDS_AN_IMAGE_RUN

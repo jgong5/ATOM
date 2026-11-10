@@ -148,5 +148,6 @@ enclosing symbol the way a site id does (`EngineCore.busy_loop`, or `<module>`),
 and its text must occur exactly once there; the Rust anchors name no symbol and
 must occur once in their file. Every clock read on this path is classified
 by the clock-source lint instead (`tests/compass/clock_source.py`): a
-read either goes through `atom.utils.clock.now` and returns the LP's time, or
-stays real under a `CORE_ALLOW_LIST` entry naming its site, class and reason.
+read either returns the LP's time, through `atom.utils.clock.now` or a module
+whose `time` is `atom.utils.time_shim`, or stays real under a
+`CORE_ALLOW_LIST` entry naming its site, class and reason.

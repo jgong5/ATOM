@@ -22,7 +22,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
-from test_bench_ops import _graph, _leaf, _Runner, _t
+from test_bench_ops import _Capture, _captures, _graph, _leaf, _Runner, _t
 from test_bench_ops_plan import CONFIG, _records, bench  # noqa: F401  the fixture
 
 from atom.compass import ir
@@ -209,7 +209,8 @@ def _measuring_rank(config, todo, refuse, rank):
     ops.Stub._copy = copying
     if (me, refuse) == (1, "call"):
         ops._function = lambda name: no if name == NEG else function(name)
-    torch.cuda.graph = lambda *a, **k: contextlib.nullcontext(graph())
+    # the rank's process ends with its launch, so nothing is undone
+    _captures(pytest.MonkeyPatch(), lambda g, **k: graph() or _Capture(g))
     records = ops.measure(config, todo[me], 10_000, rank)
     return (records, len(profiles)) if refuse == "profile" else records
 
@@ -265,6 +266,37 @@ def test_a_rank_whose_first_profile_names_no_kernel_profiles_as_often_as_the_oth
     ]
     # NEG: rank 1's empty profile, then two that agree; ABS: two that agree
     assert got == [([(NEG, None, ["k"]), (ABS, None, ["k"])], 3 + 2)] * 2
+
+
+def _missing_rank(config, todo, refuse, rank):
+    """`_measuring_rank`, its first two profiles at rank 1 recording nothing of
+    a call its graph times; and the rank's profiles."""
+    measure, profiles = ops.measure, []
+
+    def missing(*args):
+        named = ops._kernels
+
+        def kernels(fn, kwargs):
+            profiles.append(1)
+            names, ns = named(fn, kwargs)
+            return ([] if rank == 1 and len(profiles) < 3 else names), ns
+
+        ops._kernels = kernels
+        return measure(*args)
+
+    ops.measure = missing
+    return _measuring_rank(config, todo, refuse, rank), len(profiles)
+
+
+def test_every_rank_profiles_a_call_again_when_one_rank_s_two_profiles_missed_it():
+    config = _config(2)
+    ranks.layout(config)
+    todo = [[(decode(2), 20, _found(NEG))]] * 2
+
+    by_rank = ranks.launch(_missing_rank, config, todo, None)
+
+    got = [([(r["op"], r.get("kernels")) for r in rs], n) for rs, n in by_rank]
+    assert got == [([(NEG, ["k"])], 2 + 2)] * 2
 
 
 def test_a_rank_raising_before_its_first_cross_rank_call_ends_the_others():

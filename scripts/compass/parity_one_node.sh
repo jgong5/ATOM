@@ -153,21 +153,9 @@ serve() {
     shift
     PORT=$(compass_held_port) servers=()
     # The DP master port, the engine sockets across trees 100 above it (3 for
-    # each of four ranks) and the base port 112 above it: all free, and below
-    # the ephemeral range, so no connection's source port takes one of them
-    # before its server binds it.
-    master=$(python3 -c 'import random, socket
-low = int(open("/proc/sys/net/ipv4/ip_local_port_range").read().split()[0])
-def free(p):
-    with socket.socket() as s:
-        try:
-            s.bind(("", p))
-        except OSError:
-            return False
-    return True
-while not all(map(free, range(p := random.randrange(low // 2, low - 113), p + 113))):
-    pass
-print(p)')
+    # each of four ranks) and the base port 112 above it: all held, so no other
+    # process, nor any connection's source port, takes one of them first.
+    master=$(compass_held_port 113)
     base=$((master + 112))
     for ((k = 0; k < TREES; k++)); do
         log=$OUT/$side/server.log port=$PORT devices=() dp=()
@@ -238,15 +226,10 @@ from pathlib import Path
 
 run, out, machine, model, store, port, width, lmcache, image_s, tp, sides, pp = sys.argv[1:]
 machine = json.loads(Path(machine).read_text())
-# ponytail: a spec that measured no tokenizer for the model prices it as its
-# first entry; only arrival latency reads it. Measure the model's own to drop this.
-arch = json.loads((Path(model) / "config.json").read_text())["architectures"][0]
-tokenizers = machine["host"]["tokenizers"]
-if not any(arch in entry["applies_to"] for entry in tokenizers):
-    tokenizers[0]["applies_to"].append(arch)
 spec = {
     "clock_endpoint": f"tcp://127.0.0.1:{port}", "bound_s": 1e7,
-    "admission_path": "serving", "ipc_s": 2.0**-14, "stream_s": 2.0**-12,
+    # Declared, but for the node-18 HTTP transport, as the law files state it.
+    "admission_s": 0.54e-3, "ipc_s": 2.0**-14, "stream_s": 2.0**-12,
     "replay": f"{out}/real/record", "step_stub": {}, "machine": machine, "store": store,
     "data_parallel_size": int(width or 1), "out_dir": f"{out}/sim",
     "image_preprocess_s": float(image_s), "pipeline_parallel_size": int(pp),

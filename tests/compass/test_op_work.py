@@ -3,7 +3,8 @@
 
 The GEMM and attention leaves match hand counts at a decode and a prefill
 shape, their arguments as the Qwen3.8-27B capture records them; each other
-extractor matches a hand count on one shape; a kind with no extractor, or a
+extractor matches a hand count on one shape; a dtype view launches nothing,
+though a cast of the same tensor copies; a kind with no extractor, or a
 dtype with no operand format, is refused by name; and every leaf of the
 27B's captures at TP1 and TP2 has work that `price` prices.
 """
@@ -247,6 +248,21 @@ def test_an_aten_operator_takes_torch_s_flop_formula_and_its_boundary():
 )
 def test_a_leaf_that_launches_no_kernel_has_no_work(op):
     assert work(op, ONE, 2, "bf16") is None
+
+
+@pytest.mark.parametrize("dtype, size", [("torch.float8_e4m3fn", 1), (F32, 4)])
+def test_a_dtype_view_launches_nothing_where_a_cast_of_the_same_plane_copies(
+    dtype, size
+):
+    # V4.1's index writer reads its flat uint8 index plane as fp8 and as fp32:
+    # the same bytes, seen as other elements. A cast reads the plane and
+    # writes it anew in the new dtype.
+    plane = t([4096], "torch.uint8", role="KV")
+    view = leaf("aten.view.dtype", [[4096 // size]], self=plane, dtype=dtype)
+    cast = leaf("aten.to.dtype", [[4096]], self=plane, dtype=dtype)
+
+    assert work(view, ONE, 1, "bf16") is None
+    assert work(cast, ONE, 1, "bf16") == Work({}, 4096 + 4096 * size)
 
 
 def test_a_collective_spans_its_group():

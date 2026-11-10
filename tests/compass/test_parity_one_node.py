@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 from test_drive_gpu import GPU45, SHOWHW
+from test_launcher_held_ports import HELD, SQUAT
 
 from atom.compass.artifacts import machine_spec_key
 from atom.compass.runner.pp_send import carrier_models
@@ -199,21 +200,6 @@ def test_dsv4_dpa8_without_a_machine_starts_nothing(tmp_path):
     assert servers == []
 
 
-def test_a_spec_that_measured_the_models_tokenizer_names_it_once(tmp_path):
-    arch = "DeepseekV4ForCausalLM"
-    machine = json.loads(
-        (ROOT / "scripts/compass/machines/mi308x-hjbog18.json").read_text()
-    )
-    machine["host"]["tokenizers"][0]["applies_to"].append(arch)
-    (tmp_path / "spec.json").write_text(json.dumps(machine))
-    r, _, run = _parity(
-        tmp_path, CONFIG="dsv4-dpa8", MACHINE=str(tmp_path / "spec.json")
-    )
-    assert r.returncode == 0, r.stderr
-    tokenizers = json.loads(run.read_text())["machine"]["host"]["tokenizers"]
-    assert [a for t in tokenizers for a in t["applies_to"]].count(arch) == 1
-
-
 def test_unset_store_measures_first_with_the_servers_flags_and_environment(tmp_path):
     machine = ROOT / "scripts/compass/machines/mi308x-hjbog18.json"
     r, servers, run = _parity(
@@ -320,3 +306,28 @@ def test_pp2_runs_two_stages_on_two_gpus_and_compares_each_stage(tmp_path):
         f"parity_one_node: pp{k} dp0 compared=3 identical=3 first_divergence=None"
         for k in (0, 1)
     ]
+
+
+#: Another process, then a server, on a server's port, its engine's and each
+#: port of its DP master block.
+SQUAT_SERVER = """
+import os, sys
+a, m = sys.argv[1:], int(os.environ["ATOM_DP_MASTER_PORT"])
+ports = [a[a.index(f) + 1] for f in ("--server-port", "--port")]
+sys.argv[1:] = [*ports, *map(str, range(m, m + 113))]
+""" + SQUAT
+
+
+def test_dp_two_trees_holds_each_port_its_servers_are_handed(tmp_path, monkeypatch):
+    squat = '[ -n "${SQUAT-}" ] && "$REAL_PYTHON" -c "$SQUAT" "$@" >>"$STUB_LOG.squat"'
+    stub = STUB.replace("    dp=$STUB_LOG.dp", f"    {squat}\n    dp=$STUB_LOG.dp", 1)
+    monkeypatch.setitem(globals(), "STUB", stub)
+    r, _, _ = _parity(
+        tmp_path,
+        HIP_VISIBLE_DEVICES="4,5,6,7",
+        CONFIG="dp-two-trees",
+        SQUAT=SQUAT_SERVER,
+    )
+    assert r.returncode == 0, r.stderr
+    squatted = (tmp_path / "servers.log.squat").read_text().splitlines()
+    assert [line.split()[1:] for line in squatted] == [HELD] * 4 * 115

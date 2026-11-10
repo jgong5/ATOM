@@ -180,12 +180,14 @@ MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
         Axis.ENGINE_CONFIG: DEPENDS,
     },
     Row.HOST_LAWS: {
-        Axis.SOFTWARE_STACK: INDEPENDENT,
-        Axis.TORCH: INDEPENDENT,
+        Axis.SOFTWARE_STACK: DEPENDS,
+        Axis.TORCH: DEPENDS,
         Axis.ATOM_SRC: DEPENDS,
         Axis.MODEL: DEPENDS,
-        Axis.DEVICE: INDEPENDENT,
-        Axis.PTL: INDEPENDENT,
+        Axis.DEVICE: DEPENDS,
+        Axis.PTL: Cell(
+            False, "in the key only because the machine-spec digest is one hash"
+        ),
         Axis.HOST_CPU: DEPENDS,
         Axis.ENGINE_CONFIG: DEPENDS,
     },

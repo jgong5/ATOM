@@ -87,7 +87,7 @@ class _Frontend:
     """Stand-in for the frontend LP's runtime: hands out the scripted stamps."""
 
     me = LpId("frontend")
-    table = single_engine_table(admission_path="serving", ipc_s=0.0, stream_s=0.0)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=0.0, stream_s=0.0)
 
     def __init__(self) -> None:
         self.arrival, self.seq = 0.0, 0
@@ -333,7 +333,12 @@ def test_a_stamp_after_its_request_timed_out_leaves_later_requests_served(
 
 
 def test_a_changed_pinned_function_refuses_the_run_by_name(tmp_path):
-    shutil.copytree(Path(aiperf.__file__).parent, tmp_path / "aiperf")
+    # Another gate shard may be writing bytecode into __pycache__ as this copies.
+    shutil.copytree(
+        Path(aiperf.__file__).parent,
+        tmp_path / "aiperf",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     fingerprint.check(tmp_path)
     path = tmp_path / "aiperf" / "transports" / "aiohttp_client.py"
     text = path.read_text()

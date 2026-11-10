@@ -9,12 +9,11 @@ import logging
 from collections import OrderedDict, deque
 from collections.abc import Hashable, Iterator, Mapping
 from dataclasses import dataclass
-from time import monotonic
 
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
-from atom.utils import clock
+from atom.utils.time_shim import read_monotonic as monotonic
 
 _CHANGE_LOG_LIMIT = 4096
 
@@ -654,7 +653,7 @@ class PageUnitCheckpointStore:
         op = StateStoreOperationId(int(record.prefix_hash), self._offload_generation)
         record.pin_count += 1
         self._offload_pins[op] = _OffloadPin(
-            checkpoint_id, clock.now(monotonic), timeout_reclaimable=timeout_reclaimable
+            checkpoint_id, monotonic(), timeout_reclaimable=timeout_reclaimable
         )
         return op, record.unit_ids
 
@@ -763,7 +762,7 @@ class PageUnitCheckpointStore:
         """
         if timeout_s <= 0 or not self._offload_pins:
             return 0
-        cutoff = clock.now(monotonic) - timeout_s
+        cutoff = monotonic() - timeout_s
         stale = [
             op
             for op, pin in self._offload_pins.items()
