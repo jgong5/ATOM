@@ -1198,8 +1198,8 @@ store. A record without a store touches no library.
    HIP's blocking calls (`atom/compass/parity/README.md`); `compass fit host`
    names a record taken without it. Then the trace runs (below), which take no
    tool: per concurrency 16 and 4, `compass record --trace --gpu G --out
-   $R/trace/c<C> -- $ATOM` and `client.sh $R/trace/c<C> --traces 256-392
-   --concurrency <C> --duration 120 --stop`.
+   $R/trace/c<C> -- $ATOM` and `WAIT_S=3600 client.sh $R/trace/c<C> --traces
+   256-392 --concurrency <C> --duration 120 --stop`.
 3. `compass fit steps --backend step-linear --form history $R/cal/c* $R/trace/c*
    --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M $S --out
    $R/fit`, every record and trace run named before the first `--client-run`, and
@@ -1223,12 +1223,18 @@ steps` names `prefill` under the law's `unfitted`, as `no prefill step carries a
 run's busy time`, and step 5 refuses every prefill step. The prefill vector needs more
 steps than coefficients, spread across them, or stays unfitted with the reason named
 (`step_linear_fit.fit`); its `fit.samples` is how many it took. Its held-out band needs
-two trace runs that each fit the vector alone, since the fit prices each run by the law
-fitted on the others; with one, every prefill term prices unvalidated. Leave the trace
-runs out of `compass fit host`: their host segments ran under the profiler. A higher
-concurrency holds more prefill steps in the same time. A trace run whose ranks' traces
-disagree is refused at its stop ([#3106](https://github.com/jgong5/ATOM/issues/3106)):
-take it again.
+a second trace run, and one of the two to fit the vector alone, since the fit prices
+each run by the law fitted on the others; with one trace run, every prefill term prices
+unvalidated. Leave the trace runs out of `compass fit host`: their host segments ran
+under the profiler. A higher concurrency holds more prefill steps in the same time.
+Kineto keeps at most 5,000,000 rows a process and drops later ones unmarked, so a trace
+run past that is refused at its stop where one rank filled first, and otherwise prices
+its later prefills at no busy time ([#3106](https://github.com/jgong5/ATOM/issues/3106)).
+Until [#3111](https://github.com/jgong5/ATOM/pull/3111) lifts the cap, start every
+`compass record --trace`, or `calibrate.sh`, with `KINETO_CONFIG` naming a file that
+reads `ROCTRACER_MAX_EVENTS=2000000000`. The stop then writes and reduces every row,
+which outlasts `client.sh`'s default 600 s wait, hence `WAIT_S=3600`. With the cap
+raised, take again a trace run refused at its stop.
 
 Developer checks, outside the `compass` path:
 - After step 2: `python -m atom.compass.parity.recurrence $R/cal/c<C>/steps`.
@@ -1359,12 +1365,11 @@ and 5 at concurrency 16 alone, with these changes:
   `AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"`:
   sampled starts leave rung 6 and above too few steps for a vector, and a step at a
   rung with none is refused.
-- The trace runs stay at 120 s: a 300 s trace run of cell B's c=4 recipe was refused
-  at its stop, and a 120 s one reduced ([#3106](https://github.com/jgong5/ATOM/issues/3106)).
-  In their first 120 s, #2789's cell-B calibration records at `aeffa7d63` hold 30
-  prefill steps at c=4 and 125 at c=16; one 120 s trace run at c=4 fitted the vector
-  on its 30, with no held-out band
-  ([#2789](https://github.com/jgong5/ATOM/issues/2789#issuecomment-6740881416)).
+- The trace runs need the raised cap: the EP4 cell's 120 s runs logged 14.3M to 14.7M
+  kineto rows a rank, and each stop took about 11 min to write and reduce them
+  ([#3113](https://github.com/jgong5/ATOM/pull/3113#issuecomment-6757261953)). In their
+  first 120 s, #2789's cell-B calibration records at `aeffa7d63` hold 30 prefill steps
+  at c=4 and 125 at c=16.
 - Steps 4 and 5 take `--duration 3600`, with a calibration record between step 4's
   two real runs. A step 5 at another duration than step 4's is graded as another
   workload, and refused.

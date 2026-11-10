@@ -259,12 +259,17 @@ memory_readings(...)` line.
 
 **2. Calibration records** (GPU, alone on the node; per concurrency, its warmup
 plus 1800 s, about 35 min with the server's start and stop: 1 h 45 min in all),
-then two trace runs, the c=16 and c=4 recipes for 120 s under ATOM's profiler,
-which the prefill law fits from alone ([README](README.md#the-stage-2-cell-through-the-compass-cli-from-an-empty-store)).
+each with the blocking-call tool, then two trace runs, without it, the c=16 and c=4
+recipes for 120 s under ATOM's profiler, which the prefill law fits from alone, with
+kineto's row cap raised and a stop wait that outlasts their traces' reduction
+([README](README.md#the-stage-2-cell-through-the-compass-cli-from-an-empty-store)).
 
 ```bash
-for C in 1 4 16; do serve $R/cal/c$C 256-392 $C $REAL_PY record --gpu $G || break; done
-for C in 16 4; do D=120 serve $R/trace/c$C 256-392 $C $REAL_PY record --trace --gpu $G || break; done
+TOOL=$(PYTHONPATH=$T python3 -m atom.compass.parity.blocked $R/tool)   # the blocking-call tool
+for C in 1 4 16; do ROCP_TOOL_LIBRARIES=$TOOL serve $R/cal/c$C 256-392 $C $REAL_PY record --gpu $G || break; done
+echo ROCTRACER_MAX_EVENTS=2000000000 > $R/kineto.conf   # until #3111 raises it
+for C in 16 4; do D=120 WAIT_S=3600 KINETO_CONFIG=$R/kineto.conf \
+  serve $R/trace/c$C 256-392 $C $REAL_PY record --trace --gpu $G || break; done
 ```
 
 Writes per record `steps/dp0.jsonl` (the step record), `run.json` (with the
@@ -415,7 +420,7 @@ law's accuracy.
 | `... holds an earlier run's files`, or `client.sh` refuses its OUT | one server per `--out`, one client run per server | a fresh `--out` for every server |
 | `fit` refuses `... is not a record directory (no run.json)` | a log file matched `$R/cal/c*` | keep logs outside the record directories |
 | `fit` refuses: `[Errno 2] No such file or directory: '<record>/artifacts/client_run.json'` | a stopped calibration record under `$R/cal/` | `rm -rf` it and take it again |
-| the law's `unfitted` names `prefill`, `no prefill step carries a trace run's busy time`, and step 5 refuses every prefill step | `fit steps` was given no trace run | step 2's trace runs, named before the first `--client-run`; a trace run refused at its stop has no `steps/dp0.busy.jsonl`: `rm -rf` it and take it again |
+| the law's `unfitted` names `prefill`, `no prefill step carries a trace run's busy time`, and step 5 refuses every prefill step | `fit steps` was given no trace run | step 2's trace runs, named before the first `--client-run`; a trace run refused at its stop has no `steps/dp0.busy.jsonl`: with kineto's cap raised as step 2 raises it, `rm -rf` it and take it again; under the default cap a retake is refused again ([#3106](https://github.com/jgong5/ATOM/issues/3106)) |
 | `kill: %%: no such job` | `serve` already stopped that server, when its client run failed or ended | nothing to stop; run `jobs` first |
 | `serve: OUT exists; leave a finished run out, rm -rf a stopped one` | a loop taken again over a run it already took | leave a finished concurrency out of the loop; `rm -rf` a stopped or short run's `--out` |
 | `Triton cache error`, or `failed to map segment from shared object` | a `--tmpfs` without `exec` | the container as Environment starts it |

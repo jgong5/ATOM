@@ -43,14 +43,23 @@ def main():
                 out.joinpath("steps", "dp0.busy.jsonl").write_text("{}")
             sys.exit(0)
         signal.signal(signal.SIGTERM, stop)
+        out.joinpath("tool").write_text(os.environ.get("ROCP_TOOL_LIBRARIES", ""))
         out.joinpath("server.json").write_text(json.dumps({"pid": os.getpid()}))
         time.sleep(600)
     law = {"unfitted": {}, "decode": {"1": {"held_out": {"bands": BAND}}}}
     copy = {"token": "tok-" + argv[1], "params": law}
     out.joinpath(COPY[argv[1]] + ".json").write_text(json.dumps(copy))
 """
+BLOCKED = """import sys
+from pathlib import Path
+tool = Path(sys.argv[1], "libcompass_blocked.so")
+tool.parent.mkdir(parents=True)
+tool.write_text("")
+print(tool)
+"""
 CLIENT = """#!/bin/bash
 echo "client $* $HARNESS_PYTHON [$AIPERF_EXTRA_ARGS]" >> "$LOG"
+echo "${WAIT_S-}" >"$1.wait_s"
 if [[ -n ${CLIENT_FAIL-} && $1 == *$CLIENT_FAIL* ]]; then
     mkdir -p "$1/artifacts" && echo {} >"$1/artifacts/client_run.json"
     exit 1
@@ -72,7 +81,11 @@ def _tree(tmp_path):
     (tmp_path / "ATOM" / ".compass-commit").write_text("cafe\n")
     (tmp_path / "ATOM" / "atom" / "compass").mkdir(parents=True)
     (tmp_path / "ATOM" / "atom" / "compass" / "cli.py").write_text(CLI)
-    for d in ("atom", "atom/compass"):
+    (tmp_path / "ATOM" / "atom" / "compass" / "parity").mkdir()
+    (tmp_path / "ATOM" / "atom" / "compass" / "parity" / "blocked.py").write_text(
+        BLOCKED
+    )
+    for d in ("atom", "atom/compass", "atom/compass/parity"):
         (tmp_path / "ATOM" / d / "__init__.py").write_text("")
 
 
@@ -233,3 +246,14 @@ def test_a_trace_run_refused_at_its_stop_is_taken_again(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "calibrate: trace2-c4 was stopped; taking it again" in r.stdout
     assert log[0] == f"record --gpu 7 --trace --out {tmp_path}/o/trace2-c4"
+
+
+def test_a_trace_run_loads_no_tool_and_waits_out_its_stop(tmp_path):
+    r, _ = _calibrate(tmp_path, "1", "trace 4")
+    assert r.returncode == 0, r.stderr
+    o = tmp_path / "o"
+    tool = f"{o}/tool/libcompass_blocked.so"
+    loaded = [(o / d / "tool").read_text() for d in ("warm", "cal1-c1", "trace2-c4")]
+    assert loaded == [tool, tool, ""]
+    waits = [(o / f"{d}.wait_s").read_text().strip() for d in ("cal1-c1", "trace2-c4")]
+    assert waits == [os.environ.get("WAIT_S", ""), "3600"]
