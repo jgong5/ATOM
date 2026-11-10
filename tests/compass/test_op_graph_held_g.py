@@ -6,22 +6,26 @@ step's G into that graph, byte for byte the graph a trace at that G gives
 each exchange's `sizes`, every G of the (T, B) is traced as it is, named in
 the run summary; a G the graph's hints or guards do not admit is traced too.
 The run summary counts the lookups a graph holding G served, and the wall
-every lookup took.
+every lookup took. A graph the lookup reads from the store is read once and
+frozen out of the collector's reach, unless `ATOM_GC_FREEZE` is off.
 """
 
+import gc
 import json
 import re
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from test_artifact_store import CONDITIONS, GATES, stanza
 from test_capture_v4_pro import DPA_TP8, EP8, MORI, trace
 from test_op_graph import _counts, _run_config, _spawned, in_thread
 from test_op_graph_arch import ENGINE
 
 from atom.compass import ir
 from atom.compass import run as compass_run
-from atom.compass.artifacts import ArtifactStore, Kind, Topology
+from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
+from atom.compass.artifacts.store import Recorded
 from atom.compass.capture import forward, peers
 from atom.compass.capture.graph import Traced, to_json
 from atom.compass.run import _op_graphs
@@ -276,6 +280,70 @@ def test_the_run_summary_counts_the_lookups_a_held_graph_served(
     cost = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())["cost"]
     assert cost["held_lookups"] == 2
     assert cost["lookup_wall_seconds"] == lazy["lookup_wall_seconds"]
+
+
+@pytest.fixture
+def heap_as_found():
+    """The interpreter's frozen generation handed back after the test, as
+    `tests/test_gc_utils.py` hands it back: a freeze is process-wide."""
+    yield
+    gc.unfreeze()
+    gc.collect()
+
+
+@pytest.mark.parametrize("frozen", [True, False], ids=["freeze", "freeze_off"])
+def test_a_graph_the_lookup_reads_is_read_once_and_frozen_out_of_the_collector(
+    frozen, tmp_path, monkeypatch, heap_as_found
+):
+    monkeypatch.setenv("ATOM_GC_FREEZE", "1" if frozen else "0")
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_text("{}")
+    config = SimpleNamespace(
+        model=str(tmp_path / "model"),
+        hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=DP),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        **ENGINE,
+    )
+    at = forward.structure(config, "prefill", True, "gfx950", True, False)
+    store, rank = ArtifactStore(str(tmp_path / "store")), Topology().ranks()[0]
+    region = {"seq": [{"op": "aiter.fused_moe_", "out": [[TOP, 8]]}]}
+    # A graph at a G, and one that holds G, as `trace ops` publishes them.
+    concrete = str(forward.prefill(T, 1, 3000).at(DP))
+    symbolic = forward.symbolic_shape(forward.prefill(T, 1, None).at(DP))
+    graphs = {
+        concrete: {"region": region},
+        symbolic: {"region": region, "hints": [T + 1, TOP], "guards": [], "slots": []},
+    }
+    for shape, graph in graphs.items():
+        store.publish(
+            Key.of(Kind.OP_GRAPH, structure=at, shape=shape),
+            provenance=stanza("compass trace ops"),
+            topology=Topology(),
+            conditions=CONDITIONS,
+            gates=GATES,
+            members={member_name("graph", rank, "json"): json.dumps(graph).encode()},
+        )
+    reads, read = [], Recorded.read_member
+    monkeypatch.setattr(
+        Recorded, "read_member", lambda *a: reads.append(a[0].key) or read(*a)
+    )
+    lookup = _op_graphs(
+        str(tmp_path / "store"), config, "gfx950", ["-tp", "8"], _counts()
+    )
+    gc.collect()
+    before = gc.get_freeze_count()
+
+    got = [lookup("prefill", T, 1, True, g) for g in (3000, 100)]
+
+    # Each graph is read once, the one that holds G included.
+    assert got == [region, region] and len(reads) == 2
+    tracked = {id(o) for o in gc.get_objects()}
+    parsed = [got[0]["seq"], got[1]["seq"]]
+    assert (gc.get_freeze_count() > before) is frozen
+    assert [id(p) in tracked for p in parsed] == [not frozen] * 2
 
 
 def test_symbolic_is_refused_without_dp_before_any_trace(tmp_path):

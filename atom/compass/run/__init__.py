@@ -245,6 +245,7 @@ import atexit
 import codecs
 import contextlib
 import functools
+import gc
 import hashlib
 import json
 import math
@@ -1930,7 +1931,10 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     (`forward.PerG`) each G of the shape is traced as above instead, the
     shape and why named in `lazy`'s ``lazy_per_g``. With `lazy`, each
     lookup's wall seconds, its traces among them, are added to its
-    ``lookup_wall_seconds``."""
+    ``lookup_wall_seconds``.
+
+    Each graph read from the store is parsed once and then frozen out of the
+    collector's reach with the rest of the live heap (`parsed`)."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture import peers
     from atom.compass.capture.forward import (
@@ -1941,6 +1945,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         structure,
         symbolic_shape,
     )
+    from atom.utils import envs
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
     dp = config.parallel_config.data_parallel_size
@@ -1968,6 +1973,18 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         lazy["lazy_traces"] += 1
         lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
 
+    def parsed(key) -> dict:
+        """The graph the store holds at `key`, parsed and frozen with the rest
+        of the live heap, a collection first so no garbage is kept, as
+        `gc_utils.freeze_gc_heap` freezes the startup heap and under the same
+        `ATOM_GC_FREEZE`: this lookup's caches keep what it parses alive, and
+        every full collection walked all of it."""
+        graph = json.loads(store.read(key).read_member("graph", rank, "json"))
+        if envs.ATOM_GC_FREEZE:
+            gc.collect()
+            gc.freeze()
+        return graph
+
     def read(at: str, shape: str) -> dict | None:
         """The graph the store, or this lookup's unpublished traces, hold at
         structure `at` and `shape`, as `capture.graph.to_json` writes it."""
@@ -1976,17 +1993,19 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():
             return None
-        return json.loads(store.read(key).read_member("graph", rank, "json"))
+        return parsed(key)
 
     @functools.lru_cache(maxsize=64)
     def held(at: str, shape) -> dict | None:
         """The graph that holds G of the DP prefill `shape`, at any G, at
         structure `at`, or None."""
-        text, new = symbolic_shape(shape), shape not in held_traced
-        if new and atom_args is not None and read(at, text) is None:
+        text = symbolic_shape(shape)
+        found = read(at, text)
+        if found is None and atom_args is not None and shape not in held_traced:
             held_traced.add(shape)
             lazily(shape, symbolic=True)
-        return read(at, text)
+            found = read(at, text)
+        return found
 
     @functools.lru_cache(maxsize=64)
     def graph(
@@ -2012,7 +2031,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
             return unpublished[at, str(shape)]["region"]
         if missing:
             return missed(store, key) or None
-        return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
+        return parsed(key)["region"]
 
     if lazy is None:
         return graph
