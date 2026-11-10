@@ -88,6 +88,7 @@ label applied by hand survives a later `--apply`.
 
 ## Wiring into the workflow
 
-`.claude/agent-team.md` names this skill: an issue or PR gets its labels from
-`compass_labels.py pr <N> --apply` when it is created, and again whenever a PR
-round adds files the opening round did not touch.
+`.claude/agent-team.md` names this skill: an issue or PR gets its module and
+`dev-process` labels from `compass_labels.py pr <N> --apply` when it is
+created, and again whenever a PR round adds files the opening round did not
+touch. Its destination and workstream labels are set by hand (same file).
