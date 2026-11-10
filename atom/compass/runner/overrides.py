@@ -342,9 +342,6 @@ class HostDeviceRecurrence:
     which its caller sets from `predicted`; `launch`, the provider and graph
     sets predicting them, refuses a column naming a feature it lacks; a
     pipeline stage refuses any column.
-    `after_prefill[segment]`, coefficients on the `(1, tokens, seqs)` of an
-    output prefill, adds to that segment of the decode charged right after one
-    what it spends beyond its law; None charges none.
     """
 
     def __init__(
@@ -358,12 +355,9 @@ class HostDeviceRecurrence:
         admit=ADMISSION_IN_E,
         columns=None,
         launch=(None, None),
-        after_prefill=None,
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
         self.admit, self.columns, self.launch = admit, columns or {}, launch
-        self.after = after_prefill or {}
-        self.prefill_x = None  # the last forward's features, if an output prefill
         named = {f for v in self.columns.values() for c in v.values() for f in c}
         if lacks := sorted(named - set(getattr(launch[0], "features", ()))):
             raise ValueError(
@@ -441,7 +435,6 @@ class HostDeviceRecurrence:
         called, meta = getattr(batch, "compass_pp_host", (now, -math.inf))
         admit_s = self.admit_s(batch)
         prepared, self.segments = self.prepare_end(called, kind, x, admit_s, features)
-        self.prefill_x = x if kind == "prefill" else None
         self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)
@@ -475,21 +468,15 @@ class HostDeviceRecurrence:
         self, called: float, kind: str, x: tuple, admit_s: float = 0.0, features=None
     ) -> tuple[float, dict]:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
-        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, each column a segment
-        adopts prices `features`' value of its feature, 0 where absent, and on a
-        decode right after an output prefill, `after_prefill` on that prefill
-        joins each."""
+        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, and each column a segment
+        adopts prices `features`' value of its feature, 0 where absent."""
         law, columns = self.laws.get(kind, {}), self.columns.get(kind, {})
         features = features or {}
-        after, prev = {}, (0, 0, 0)
-        if kind == "decode" and self.prefill_x is not None:
-            after, prev = self.after, self.prefill_x
         seg = {
             s: (
                 float(np.dot(law.get(s, (0, 0, 0)), x))
                 + admit_s * (s == "E")
                 + sum(c * features.get(f, 0.0) for f, c in columns.get(s, {}).items())
-                + float(np.dot(after.get(s, (0, 0, 0)), prev))
             )
             * (s not in self.skip)
             for s in SEGMENTS

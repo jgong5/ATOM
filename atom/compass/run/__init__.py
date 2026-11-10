@@ -479,15 +479,12 @@ def _check_host(path, host: dict) -> None:
     from atom.compass.runner.overrides import ADMISSION_IN_E, FORWARD_KINDS, SEGMENTS
 
     laws, columns = host.get("laws", {}), host.get("columns", {})
-    after = host.get("after_prefill") or {}
-    keys = {"laws", "skip", "key", "admit", "hops", "columns", "after_prefill"}
     if (
-        set(host) - {*keys, *HOST_TERMS}
+        set(host) - {"laws", "skip", "key", "admit", "hops", "columns", *HOST_TERMS}
         or set(host.get("skip", ())) - set(SEGMENTS)
         or {*laws, *columns} - set(FORWARD_KINDS)
-        or {s for v in (*laws.values(), *columns.values(), after) for s in v}
-        - set(SEGMENTS)
-        or {len(c) for v in (*laws.values(), after) for c in v.values()} - {3}
+        or {s for v in (*laws.values(), *columns.values()) for s in v} - set(SEGMENTS)
+        or {len(c) for v in laws.values() for c in v.values()} - {3}
         or len(host.get("admit") or ADMISSION_IN_E) != 3
     ):
         raise ValueError(
@@ -495,9 +492,8 @@ def _check_host(path, host: dict) -> None:
             f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
             "columns, mapping them to segments to launch features' coefficients, "
             "admit, three coefficients on a forward's admissions or null, "
-            "after_prefill, segments to three coefficients on the output prefill "
-            "before a decode, key, the host key the laws were fitted under, hops, "
-            f"and the terms {' and '.join(HOST_TERMS)}"
+            "key, the host key the laws were fitted under, hops, and the terms "
+            f"{' and '.join(HOST_TERMS)}"
         )
     hops = host.get("hops", {})
     if not (_seconds(hops, set(), set(HOPS)) and all(v > 0 for v in hops.values())):
@@ -1840,7 +1836,6 @@ def runner(model_runner, tree) -> None:
             admit=host.get("admit", ADMISSION_IN_E),
             columns=host.get("columns"),
             launch=launch,
-            after_prefill=host.get("after_prefill"),
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])

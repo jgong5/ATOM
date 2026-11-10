@@ -1492,9 +1492,6 @@ stage and per DP rank, with a TP group modelled on its rank 0.
 - `W_post`: the rest of the forward, from the token read to its exit: the output and,
   under MTP, the draft.
 
-A decode right after an output prefill runs its segments longer, more after a larger
-prefill, priced apart by the host laws' `after_prefill` on that prefill (`09` D54).
-
 **The recurrence**, for forward `n`, where `now` is the clock owner's time when the
 forward is called (the previous forward's exit, or the grant that ended an idle wait) and
 `R*` is the release time of a wait rule below:
