@@ -260,7 +260,13 @@ Revised 2026-10-20 by the owner's ruling on
 data-parallel graph is keyed by its gathered rows, and the op-level backend reads a DP
 step, and each two-batch-overlap micro-batch, at (T, B, G), refused only when no graph is
 captured there; a decode's G since
-[#1802](https://github.com/jgong5/ATOM/issues/1802), 2026-10-22.
+[#1802](https://github.com/jgong5/ATOM/issues/1802), 2026-10-22. Revised 2026-11-09 by the
+[ruling on #2956](https://github.com/jgong5/ATOM/issues/2956#issuecomment-6742702610): where
+no graph is captured at a DP prefill's own G, a run's lazy trace takes its (T, B), at the
+width its LM head pads to, once with G a symbol, at both ends of G's range, and the step reads that graph put at its G
+when the two ends agree and the graph's guards admit G, else the graph traced at its G
+(`04` D18). `trace ops --symbolic` takes each prefill (T, B) of its shapes so ahead of a
+run, beside each G it captures concretely as before.
 
 | | |
 |---|---|
@@ -989,7 +995,7 @@ only, and an `op_graph` is keyed by its shape.
 | `probe_record` | `measure device`, one per node (`05` D26) | (device, software stack, PTL state, torch, host name) |
 | `platform_readings` | `fit device`, from probe records, or `--assume-from` another device's entry for a device never run (`05` D26) | (device, software stack, PTL state, torch) |
 | `shape_population` | Phase 0, `trace steps` | (model, workload, engine config, the pricing backend's digest) |
-| `op_graph` | Phase 1a, `trace ops` | (**structure**, shape, torch): the structure's discrete key and a decode width or a prefill (T, B), with its gathered rows G when they are not `dp x T` |
+| `op_graph` | Phase 1a, `trace ops`; a run's lazy trace | (**structure**, shape, torch): the structure's discrete key and a decode width or a prefill (T, B), with its gathered rows G when they are not `dp x T`, or `G=G` for a DP prefill's graph that holds G as a symbol (`04` D18) |
 | `op_measurement` | Phase 1b, `measure ops` | (model, parallel layout, platform, source-root digest, the point's digest) |
 | `price_list` | Phase 1b, `fit ops` | **(model, parallel layout, platform, source-root digest)** — a tuple, never a path |
 | `memory_readings` | Phase 2, `measure memory`; published with every reading assumed for a device never measured | (model, platform, parallel layout, engine config) |

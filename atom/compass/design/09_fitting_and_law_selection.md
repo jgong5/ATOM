@@ -197,7 +197,12 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   none pauses
   ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6702728444)): on
   crsuse2-m2m-v3-005 a pause ran `hipDeviceSynchronize` on its rank, and the peer waited
-  about 107 ms at the drafter's step-begin fence. With both ranks profiled the draft-KV
+  about 107 ms at the drafter's step-begin fence. kineto's ROCm tracer keeps at most
+  `ROCTRACER_MAX_EVENTS` rows a process and drops the rest unmarked: at its default of
+  5,000,000 every rank of a 300 s V4.1-Flash TP4 trace run stopped recording launches
+  and kernels about 150 s in. The driver sets it to its largest, and a trace that lacks a
+  forward's device rows refuses ([#3106](https://github.com/jgong5/ATOM/issues/3106)).
+  With both ranks profiled the draft-KV
   concatenation runs about 6% long; drafter labels keep that, and
   [#2945](https://github.com/jgong5/ATOM/issues/2945) finds its cause. A traced kernel
   shorter than about 4.7 us runs to that floor, so drafter labels stay 5 to 11% over
