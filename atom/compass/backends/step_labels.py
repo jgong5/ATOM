@@ -40,8 +40,14 @@ the target's, `d_target_ns` with no gap, and the draft label is the rest of
 `d_busy_ns`. A decode's draft-KV pass, `d_draft_kv_ns`, runs before
 `forward_done_event`: its device label holds it, as its draft-KV label too,
 and its draft label does not. A device event runs no earlier than the host
-records it, so the largest launch record less its device start, over the
-record, is the host clock's lead there. A decode's draft label, its `propose`
+records it, so a launch record less its device start bounds the host clock's
+lead from below, and an MTP status wait's return less the `forward_done_event`
+it waits for bounds it from above. The clocks drift apart over a record, and
+the tightest of the last `ANCHORS` status-wait bounds (of the first, before as
+many) follows them: a step's lead is the largest launch bound moved by how far
+that tightest bound moved since, leaving out any above it at its own launch,
+whose host stalled before stamping it; with no status wait, the largest launch
+bound over the record. A decode's draft label, its `propose`
 pass, is cut where the device reached the pass, placed by that lead, before
 the host's draft copy wait (`t_draft_recv_ns`) began: the host queues the pass
 just before that wait, so the window may hold the device's wait for it.
@@ -240,34 +246,50 @@ def host_kind(view: BatchView) -> str:
     return "prefill" if view.prefill else "decode"
 
 
-def _timed(lines) -> tuple[list[tuple[dict, int]], int]:
-    """Each line with a device window and its device start, gaps and busy
-    times summed; and the host clock's lead over that device clock."""
-    device, timed = 0, []
+def _timed(lines) -> list[tuple[dict, int, int, int | None]]:
+    """Each line with a device window, its device start, gaps and busy times
+    summed, the host clock's lead over that device clock there, and the
+    `forward_done_event` of the output forward before it, or None."""
+    device, timed, done = 0, [], None
     for s in lines:
         if "d_busy_ns" in s:
             start = device + s.get("d_gap_ns", 0)
             device = start + s["d_busy_ns"]
-            timed.append((s, start))
-    return timed, max(s["t_launch_ns"][0] - start for s, start in timed)
+            timed.append((s, start, done))
+            if s["produces_output"]:
+                done = None
+                if "d_target_ns" in s:
+                    done = start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0)
+    bounds = [
+        s["t_mtp_ns"][1] - d if "t_mtp_ns" in s and d is not None else None
+        for s, _, d in timed
+    ]
+    waits = [b for b in bounds if b is not None]
+    first, recent, tight = min(waits[:ANCHORS], default=0), deque(maxlen=ANCHORS), []
+    for b in bounds:
+        if b is not None:
+            recent.append(b)
+        tight.append(min(recent) if len(recent) == ANCHORS else first)
+    lows = [s["t_launch_ns"][0] - start for s, start, _ in timed]
+    margins = [t - low for t, low in zip(tight, lows) if low <= t or not waits]
+    if not margins:
+        raise ValueError("every launch bound exceeds the MTP status waits' bound")
+    gap = min(margins)
+    return [(s, start, t - gap, d) for (s, start, d), t in zip(timed, tight)]
 
 
 def mtp_copy(lines) -> dict[int, tuple[int, bool]]:
     """Per forward with an MTP status wait after an output forward that marks
     its target: the nanoseconds from that forward's `forward_done_event`, after
     its target and draft-KV pass, to the wait's return, and whether the wait
-    began before the event. The lead places the event no later than it ran, so
-    the time is an upper bound."""
-    timed, lead = _timed(lines)
-    copy, done = {}, None
-    for s, start in timed:
+    began before the event. The lead places the event no later than it ran
+    while the fastest recent status copy holds still, so the time is an upper
+    bound."""
+    copy = {}
+    for s, _, lead, done in _timed(lines):
         if "t_mtp_ns" in s and done is not None:
             m0, m1 = s["t_mtp_ns"]
             copy[s["step"]] = (m1 - done - lead, m0 < done + lead)
-        if s["produces_output"]:
-            done = None
-            if "d_target_ns" in s:
-                done = start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0)
     return copy
 
 
@@ -276,10 +298,9 @@ def host_paced_drafts(lines) -> set[int]:
     and draft-KV pass and placed by the lead, before their host's draft copy
     wait began: the host queues the pass just before that wait, so the device
     waited for it there."""
-    timed, lead = _timed(lines)
     return {
         s["step"]
-        for s, start in timed
+        for s, start, lead, _ in _timed(lines)
         if "t_draft_recv_ns" in s
         and "d_target_ns" in s
         and start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0) + lead
@@ -291,8 +312,8 @@ def _host_cut(lines) -> tuple[set[int], set[int]]:
     """The steps whose device start precedes their host launch end, and the
     MTP decodes whose device reached the propose pass before the host's draft
     copy wait."""
-    (lines_timed, _), output_end, timed = _timed(lines), None, []
-    for s, start in lines_timed:
+    output_end, timed = None, []
+    for s, start, _, _ in _timed(lines):
         bound = None
         if "t_recv_ns" in s and output_end is not None:
             bound = s["t_recv_ns"][1] - output_end
