@@ -260,8 +260,9 @@ before the event. The lead places the event no later than it ran, so the label b
 the latency from above ([#2080](https://github.com/jgong5/ATOM/issues/2080)). The clocks
 drift apart, about 1 ms in 30 minutes on the MI455 records, so a forward's lead is the
 largest launch bound moved along the tightest recent status-wait returns, leaving out any
-launch bound above them, whose host stalled before its stamp; it keeps the bound while
-the fastest status copy holds still ([#3096](https://github.com/jgong5/ATOM/issues/3096)).
+launch bound above them, which only a stalled entry stamp or drift faster than the recent
+returns follow reaches; it keeps the bound while the fastest status copy holds still
+([#3096](https://github.com/jgong5/ATOM/issues/3096)).
 A launch bound reads the host clock just before the launch's event is recorded, so no
 stall after it lifts the bound; a record without that stamp reads the launch's entry,
 after the event ([#3133](https://github.com/jgong5/ATOM/issues/3133)).
