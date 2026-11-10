@@ -6,7 +6,7 @@ run builds. This records them where both runs can be read the same way, at the
 model runner's `forward`: one JSON line per call, built before the call runs,
 because a real forward rewrites some batch fields in place. Each line carries
 the batch as the `BatchView` a simulated runner prices it from (`rows`, `rung`,
-and above DP width 1 `moe_rows` and `moe_tokens`, with an MTP drafter `draft_moe_rows` too, `draft_bs` where its later passes pad, `target_bs` where its target pads, on a split step `tbo_tokens`); a
+and above DP width 1 `moe_rows` and `moe_tokens`, with an MTP drafter `draft_moe_rows` too, `draft_bs` where its later passes pad, `draft_rows` where they run at its rows, `target_bs` where its target pads, on a split step `tbo_tokens`); a
 real runner settles that view from the `ForwardMode` its own forward settled,
 so recording adds no DP collective. Its line also carries `t_enter_ns` and `t_exit_ns`, the worker's
 monotonic clock around its forward, and is finished once the forward returns.
@@ -30,8 +30,14 @@ receive of its input is `t_pp_recv_ns`, its device part `d_recv_ns`; an idle
 never waited on, so a line is finished once its exit event has completed. A
 real runner's lines are kept in memory and written at its `exit`, so no file
 call or JSON encoding runs between its forwards; a worker that never reaches
-`exit` (SIGKILL, a native crash) leaves an empty record. A simulated runner's line is
-written as its step is recorded. Under `kv` a line carries the lmcache offload loads
+`exit` (SIGKILL, a native crash) leaves an empty record. A real line also
+carries `launch`, where its model's launch provider declares features
+(`backends.launch_features`), and `blocked_ns`, where the worker loaded the
+blocking-call tool (`blocked`): the nanoseconds its thread spent in each HIP
+call that blocked, from the launch's entry to the token copy wait's, or to
+the launch's exit on a forward with no such wait. A simulated runner's line is
+written as its step is recorded, and flushed to the file the record keeps open
+from its start, so a killed simulated worker keeps every line. Under `kv` a line carries the lmcache offload loads
 and saves the scheduler handed the worker since the previous line
 (`StepRecord.note_kv`), where any were. `compare` reads two records and names, per DP rank,
 the first step where they part; timestamps are not part of a step's decision.
@@ -42,7 +48,9 @@ of each DP rank writes `dp<rank>.jsonl` there, replacing any earlier file
 a RapidServe engine in its `record_dir`).
 Unset, nothing is recorded. On its first step it also writes the engine its
 runner resolved to `dp<rank>.engine.json` (`README.md` says what it holds), and
-a runner with a `host_key` writes that to `dp<rank>.key.json`. The simulated
+a runner with a `host_key` writes that to `dp<rank>.key.json`, with the
+graph sets ATOM recorded (`recorded_graphs`, and its launch provider's
+`recorded`) where `launch` is written. The simulated
 runner records from `NonAllocatingRunner.forward`; a real one records through
 `StepRecording`, composed into `RUNNER`, which the frontend names on a real run
 with the variable set.
@@ -65,6 +73,7 @@ may then report a step where the twins' rows differ.
 """
 
 import collections
+import contextlib
 import copy
 import functools
 import hashlib
@@ -78,6 +87,7 @@ from itertools import zip_longest
 import numpy as np
 
 from atom.compass.backends.json_file import read_json, read_jsonl
+from atom.compass.backends.launch_features import GRAPHS, architecture, provider
 from atom.compass.backends.step_labels import join_stamps
 
 ENV = "ATOM_COMPASS_PARITY_RECORD"
@@ -110,7 +120,16 @@ TIMESTAMPS = (
     "d_propose_ns",
     "t_pull_ns",
     "t_put_ns",
+    "blocked_ns",
 )
+#: Profiler ranges a trace run (`busy`) splits a forward's kernels at, on every
+#: TP rank: the target ends where `TARGET_DONE` opens, and each drafter pass is
+#: the range named `MARK` and its line field.
+MARK = "compass::"
+TARGET_DONE = MARK + "target_done"
+#: The stamps the blocking-call tool's sums are read at: a line's `blocked_ns`
+#: runs from the launch's entry to the token copy wait's, as `W_launch` does.
+BLOCKED_AT = ("t_launch_ns", "t_recv_ns")
 
 
 class StepRecord:
@@ -120,7 +139,10 @@ class StepRecord:
         name = f"pp{stage}.dp{dp_rank}" if stage else f"dp{dp_rank}"
         self.path = pathlib.Path(directory) / f"{name}.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text("")
+        # Opened once, replacing any earlier file, and kept open: on a network
+        # file system an open and a close per simulated step took most of its
+        # wall time.
+        self.file = self.path.open("w")
         # Finished lines, not yet written. Built of tuples, not lists, so a
         # full collection untracks them: a million list-built lines held made
         # each full collection 0.8 s. ponytail: the whole record is held in
@@ -157,7 +179,7 @@ class StepRecord:
         per request, and as the `BatchView` `runner` prices it from: `rows`
         (query tokens, context tokens, decode), `rung`, the graph width the
         step replays or None, and `moe_rows`, the rows the DP group's MoE
-        gather carries, absent at DP width 1, and `draft_moe_rows`, `draft_bs`, `target_bs`, `moe_tokens` and `tbo_tokens`, each where the
+        gather carries, absent at DP width 1, and `draft_moe_rows`, `draft_bs`, `draft_rows`, `target_bs`, `moe_tokens` and `tbo_tokens`, each where the
         view has it. The view's mode is the one `forward` settled, stamped by
         `run_model` under `forward_mode`; without one it is `forward_mode`'s,
         which runs the DP collective itself. Each prefill window is added to its request's
@@ -172,15 +194,18 @@ class StepRecord:
         and `t_exit_ns` read off `runner.step_clock_ns()` around it and
         `runner.step_stamps()` added; a line with a device window waits in
         `pending` until the window closes, then in `lines` until `write`. Returns `forward`'s reply, or
-        without one the mode the view was built from, so a caller pricing the
-        step need not run the collective again.
+        without one the mode the view was built from and the view, so a caller
+        pricing the step need not run the collective or build the view again.
         """
         from atom.compass.runner.projection import batch_view, forward_mode
 
-        # The view is settled after `forward`, from the fields it was handed.
-        before = copy.copy(batch)
-        before.num_scheduled_tokens = np.copy(batch.num_scheduled_tokens)
-        before.context_lens = np.copy(batch.context_lens)
+        # The view is settled after `forward`, from the fields it was handed;
+        # with no forward to rewrite them, the batch is its own.
+        before = batch
+        if forward is not None:
+            before = copy.copy(batch)
+            before.num_scheduled_tokens = np.copy(batch.num_scheduled_tokens)
+            before.context_lens = np.copy(batch.context_lens)
         rows, named = [], []
         if not batch.is_dummy_run:
             ends = np.cumsum(batch.num_scheduled_tokens)
@@ -258,7 +283,13 @@ class StepRecord:
             line["moe_rows"] = view.moe_rows
         if view.draft_moe_rows is not None:
             line["draft_moe_rows"] = view.draft_moe_rows
-        for field in ("draft_bs", "target_bs", "moe_tokens", "tbo_tokens"):
+        for field in (
+            "draft_bs",
+            "draft_rows",
+            "target_bs",
+            "moe_tokens",
+            "tbo_tokens",
+        ):
             if getattr(view, field) is not None:
                 line[field] = getattr(view, field)
         self.pending.append((line, window))
@@ -266,7 +297,7 @@ class StepRecord:
         if forward is None:  # a simulated step: priced, not timed
             self.write()
         self.step += 1
-        return mode if forward is None else reply
+        return (mode, view) if forward is None else reply
 
     def flush(self, wait: bool = False) -> None:
         """Finish the lines whose device windows have closed, in step order.
@@ -284,11 +315,11 @@ class StepRecord:
             self.pending.popleft()
 
     def write(self) -> None:
-        """Wait for every open window, then append the finished lines to the file."""
+        """Wait for every open window, then append the finished lines to the
+        file, flushed, so a worker killed after this keeps them."""
         self.flush(wait=True)
-        text = "".join(json.dumps(line) + "\n" for line in self.lines)
-        with self.path.open("a") as f:
-            f.write(text)
+        self.file.write("".join(json.dumps(line) + "\n" for line in self.lines))
+        self.file.flush()
         self.lines.clear()
 
 
@@ -297,8 +328,8 @@ def record_step(runner, batch, forward=None):
 
     With `forward`, it runs on `batch` whether or not the step is recorded,
     inside the line's timestamps when it is, and its reply is returned.
-    Without `forward`, a recorded step returns the `ForwardMode` it settled
-    and an unrecorded one None.
+    Without `forward`, a recorded step returns the `ForwardMode` it settled and
+    the `BatchView` it built from it, and an unrecorded one None.
     """
     if _record(runner) is not None:
         return runner._parity_record.add(batch, runner, forward)
@@ -329,8 +360,10 @@ def _record(runner):
         record = None
         if directory and runner.rank == 0:
             directory = record_dir(directory, runner.config)
+            from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, UNKEYED
             from atom.compass.backends.step_linear_fit import CONTEXT_PARALLEL
-            from atom.compass.run.step_grid import BOUNDS, keyed
+            from atom.compass.run.step_grid import keyed
+            from atom.utils.region_graph import TokenGraph
 
             pc = runner.config.parallel_config
             pp = runner.config.pipeline_parallel_size > 1
@@ -338,18 +371,37 @@ def _record(runner):
             record = StepRecord(directory, pc.data_parallel_rank, stage)
             # By its first step the runner has resolved its engine.
             engine = keyed(runner.config) | {
-                name: getattr(runner.config, name)
-                for name in (*BOUNDS, "num_kvcache_blocks")
+                name: getattr(runner.config, name) for name in UNKEYED
             }
             for name in CONTEXT_PARALLEL:
                 if (width := getattr(runner.config, name, 1)) > 1:
                     engine[name] = width
+            if buckets := TokenGraph.captured_sizes("prefill"):
+                engine[PREFILL_BUCKETS] = list(buckets)
             record.path.with_suffix(".engine.json").write_text(json.dumps(engine))
             key = getattr(runner, "host_key", None)
             if key is not None:
+                if getattr(runner, "_launch", None) and runner._launch.features:
+                    sets = recorded_graphs(runner.config)
+                    graphs = {GRAPHS: sets | runner._launch.recorded(runner)}
+                    key = {**key, "engine": {**key["engine"], **graphs}}
                 record.path.with_suffix(".key.json").write_text(json.dumps(key))
         runner._parity_record = record
     return runner._parity_record
+
+
+def recorded_graphs(config) -> dict:
+    """`GRAPHS`' mapping for a runner of `config` whose ATOM has recorded its
+    graphs: its model's architecture, each phase's token-graph buckets
+    (`TokenGraph.captured_sizes`) and each request graph's keys, sorted: the
+    graphs by their keys' text, since one keys by a tuple (a decode's request
+    bucket) and another by an int (a DSpark draft's `running_bs`)."""
+    from atom.utils.region_graph import ReqGraph, TokenGraph
+
+    token = {p: TokenGraph.captured_sizes(p) for p in ("prefill", "decode")}
+    keys = (sorted(g.keys()) for g in ReqGraph._live if g.keys())
+    request = sorted(keys, key=repr)
+    return {"architecture": architecture(config), "token": token, "request": request}
 
 
 def carry_response_ids() -> None:
@@ -424,12 +476,22 @@ class StepRecording:
     device events at `run_model` entry and at the forward's exit. At
     `run_model` entry it also keeps the `ForwardMode` the forward settled,
     which the line's view is built from.
+
+    Once `allocate_kv_cache` has built a Mooncake connector, every worker
+    records that connector's KV writes (`writes`), written at `exit`. A
+    launch provider that declares features is installed once built, and its
+    `observe` is the line's `launch`. The class it is composed into may set
+    `_blocked` to the blocking-call tool (`blocked.loaded`) for `blocked_ns`.
     """
 
     _recording = False
+    _blocked = None
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self._launch = provider(architecture(getattr(self, "config", None)))
+        if self._launch.features:
+            self._launch.install(self)
         self._stamps: dict = {}
         self._last_exit = None
         processor = getattr(self, "tokenID_processor", None)
@@ -481,6 +543,14 @@ class StepRecording:
             record_kv(self, meta)
         return super().process_kvconnector_output(meta)
 
+    def allocate_kv_cache(self, num_kvcache_blocks):
+        reply = super().allocate_kv_cache(num_kvcache_blocks)
+        from atom.compass.parity import writes
+
+        # The KV connector is built here, before any request can reach it.
+        self._writes = writes.install(self)
+        return reply
+
     def flush_pp_send(self):
         """ATOM's idle flush, stamped for the next forward when a send is pending."""
         if getattr(self, "_pp_pending_send", None):
@@ -488,12 +558,17 @@ class StepRecording:
         return super().flush_pp_send()
 
     def _stamped(self, key, call, *args):
-        """`call(*args)`, stamped under `key` when this forward is recorded."""
+        """`call(*args)`, stamped under `key` when this forward is recorded,
+        with the blocking-call tool's sums around it at `BLOCKED_AT`."""
         if getattr(self, "_parity_record", None) is None:
             return call(*args)
+        tool = self._blocked if key in BLOCKED_AT else None
         enter = self.step_clock_ns()
+        before = None if tool is None else tool()
         reply = call(*args)
         self._stamps[key] = (enter, self.step_clock_ns())
+        if tool is not None:
+            self._stamps[(key, "blocked")] = (before, tool())
         return reply
 
     def _pp_received(self, call, *args, **kwargs):
@@ -509,17 +584,21 @@ class StepRecording:
         recorded `forward_done_event`: the target's end, sampling included."""
         if getattr(self, "_parity_record", None) is not None:
             self._stamps["target_event"] = self.device_event()
-        return call(*args)
+        with _traced(TARGET_DONE):
+            return call(*args)
 
     def _draft_pass(self, key, call, *args, **kwargs):
         """`call`, a drafter pass, between two device events kept under `key`,
         the line field that times it. The first pass's start also ends the
-        target of a forward that samples nothing."""
+        target of a forward that samples nothing. Under ATOM's profiler every TP
+        rank opens the pass's range, recording or not."""
         if getattr(self, "_parity_record", None) is None:
-            return call(*args, **kwargs)
+            with _traced(MARK + key):
+                return call(*args, **kwargs)
         start = self.device_event()
         self._stamps.setdefault("draft_event", start)
-        reply = call(*args, **kwargs)
+        with _traced(MARK + key):
+            reply = call(*args, **kwargs)
         self._stamps[key] = [start, self.device_event()]
         return reply
 
@@ -542,6 +621,13 @@ class StepRecording:
     def step_stamps(self) -> tuple:
         """At a recorded forward's exit: its stamps, and its device window callable or None."""
         stamps, self._stamps = self._stamps, {}
+        if self._launch.features:
+            stamps["launch"] = self._launch.observe(self)
+        sums = {key: stamps.pop((key, "blocked"), None) for key in BLOCKED_AT}
+        if sums["t_launch_ns"]:
+            before, end = sums["t_launch_ns"]
+            end = sums["t_recv_ns"][0] if sums["t_recv_ns"] else end
+            stamps["blocked_ns"] = self._blocked.between(before, end)
         launch = stamps.pop("launch_event", None)
         names = {"d_target_ns": "target_event", "d_recv_ns": "recv_event"}
         marks = {k: [stamps.pop(e)] for k, e in names.items() if e in stamps}
@@ -568,7 +654,19 @@ class StepRecording:
         # Reached on a clean stop and on a SIGTERM (ATOM's exit handler).
         if getattr(self, "_parity_record", None) is not None:
             self._parity_record.write()
+        if getattr(self, "_writes", None) is not None:
+            self._writes.write()
         return super().exit()
+
+
+def _traced(name: str):
+    """A profiler range named `name` while ATOM's profiler runs, else none, so
+    an untraced forward's host time pays for no range."""
+    import torch
+
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(name)
+    return contextlib.nullcontext()
 
 
 def _window(previous, launch, done, marks, wait: bool):
@@ -660,8 +758,8 @@ def compare(real, simulated, stage: int = 0) -> dict:
     A rank's entry is None where its steps all agree, else the step index and
     both steps, None for a record that has already ended. A record with no
     steps is refused: two runs that scheduled nothing agree, and that means
-    nothing. Steps are compared and reported without timestamps or request
-    or response ids. Under `steps`, each rank's count of step pairs compared
+    nothing. Steps are compared and reported without timestamps, request
+    or response ids or a real line's `launch`. Under `steps`, each rank's count of step pairs compared
     and of identical ones.
     """
     records = {"real": read(real, stage), "simulated": read(simulated, stage)}
@@ -670,7 +768,7 @@ def compare(real, simulated, stage: int = 0) -> dict:
             raise ValueError(f"the {name} record has no steps to compare.")
         for steps in record.values():
             for step in steps:
-                for key in (*TIMESTAMPS, "request_ids", "response_ids"):
+                for key in (*TIMESTAMPS, "request_ids", "response_ids", "launch"):
                     step.pop(key, None)
     first, counts = {}, {}
     for rank in sorted(records["real"].keys() | records["simulated"].keys()):

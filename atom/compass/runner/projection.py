@@ -35,6 +35,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import torch
 
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.runner.overrides import RunnerRefusal
@@ -50,6 +51,22 @@ def dp_group() -> Any:
     from aiter.dist.parallel_state import get_dp_group
 
     return get_dp_group().cpu_group
+
+
+def dummy_ranks(batch: Any, mode: ForwardMode) -> int:
+    """How many ranks of the step's data-parallel group run a dummy forward,
+    this one among them when `batch` is its dummy; 0 on one rank.
+
+    ATOM's DP sync carries no dummy flag: a dummy reports one token, as a rank
+    decoding one request does. So the group sums each rank's `is_dummy_run`
+    over its CPU group, a collective of the simulated step's own that every
+    rank of the group runs once before pricing, as it runs `decide`'s.
+    """
+    if mode.sync is None or len(mode.sync.scheduled_tokens_per_dp_rank) < 2:
+        return 0
+    flag = torch.tensor([int(bool(batch.is_dummy_run))], dtype=torch.int32)
+    torch.distributed.all_reduce(flag, group=dp_group())
+    return int(flag.item())
 
 
 def forward_mode(batch: Any, runner: Any) -> ForwardMode:
@@ -120,7 +137,9 @@ def _data_parallel_size(runner: Any) -> int:
     return int(size)
 
 
-def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
+def batch_view(
+    batch: Any, mode: ForwardMode, runner: Any, dummies: int = 0
+) -> BatchView:
     """The projection a worker builds: it holds the batch and not the sequences.
 
     A row's kind is the convention `ModelRunner.prepare_inputs` reads: the
@@ -128,10 +147,16 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     gather's rows come from `mode`, the step's one `forward_mode`; a
     data-parallel runner handed a mode with no group counts is refused.
     Whether the step produces output is `ScheduledBatch.produces_output`, and
-    the TBO split is the collective's `ub_tokens_across_dp`, this rank's slot
-    in it the config's `data_parallel_rank`. A data-parallel rank's
-    `is_dummy_run` batch is its `dp_dummy`. A single rank reads none of the
-    collective's counts, though `decide` returns them for a group of one.
+    the TBO split is the collective's `ub_tokens_across_dp`, a group of one's
+    too, since ATOM splits one rank's step by the same rule; a data-parallel
+    rank's slot in it is the config's `data_parallel_rank`. A data-parallel rank's
+    `is_dummy_run` batch is its `dp_dummy`, a step some rank prefills its
+    `group_prefills`, and `dummies`, the group's dummy forwards as
+    `dummy_ranks` sums them, its `group_dummies`: a caller that does not run
+    that collective, as a recording real run does not, passes none. The most
+    tokens any rank scheduled is its `group_max_tokens`. A single
+    rank reads none of the collective's other counts, though `decide` returns
+    them for a group of one.
 
     The MoE gather's rows follow `running_tokens_are_unified`, as
     `FusedMoE.forward_impl_graph` does. Every rank decoding, the padded
@@ -151,6 +176,7 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     decode every rank decodes in, its inputs; a sampling prefill, its LM head.
     """
     draft_moe_rows = moe_tokens = dp_rank = draft_bs = target_bs = draft_rows = None
+    group_max_tokens = None
     drafter = getattr(runner, "drafter", None)
     if getattr(drafter, "step", None) is not None:  # `EagleProposer`'s pass
         draft_bs = int(mode.running_bs)
@@ -167,6 +193,7 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     ) == _data_parallel_size(runner):
         dp_rank = runner.config.parallel_config.data_parallel_rank
         gathered = moe_tokens = int(mode.sync.scheduled_tokens_per_dp_rank.sum())
+        group_max_tokens = int(mode.sync.scheduled_tokens_per_dp_rank.max())
         if mode.running_tokens_are_unified:
             moe_rows = _data_parallel_size(runner) * mode.running_tokens
         else:
@@ -196,12 +223,15 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
         draft_bs=draft_bs,
         target_bs=target_bs,
         produces_output=batch.produces_output(),
-        tbo_tokens=None if dp_rank is None else mode.sync.ub_tokens_across_dp,
+        tbo_tokens=None if mode.sync is None else mode.sync.ub_tokens_across_dp,
         image_tokens=image_tokens(batch, runner),
         moe_tokens=moe_tokens,
         dp_rank=dp_rank,
         dp_dummy=dp_rank is not None and bool(batch.is_dummy_run),
+        group_dummies=dummies if dp_rank is not None else 0,
         draft_rows=draft_rows,
+        group_prefills=dp_rank is not None and not mode.running_tokens_are_unified,
+        group_max_tokens=group_max_tokens,
     )
 
 
@@ -210,10 +240,12 @@ def image_tokens(batch: Any, runner: Any) -> int:
     handles them. With embedding spans, a payload still carrying pixel values
     encodes every span on this chunk, even one that fills none; a later chunk
     fills the spans it overlaps. Without spans, the image's embeddings sit at
-    the model's image token."""
+    the model's image token; a batch with no multimodal data has none."""
+    media = getattr(batch, "multimodal_data", None)
+    if not media:
+        return 0
     from atom.model_engine.multimodal_runtime import embedding_indices
 
-    media = getattr(batch, "multimodal_data", None) or {}
     count, offset = 0, 0
     for req, length, end in zip(
         batch.req_ids, batch.num_scheduled_tokens, batch.context_lens

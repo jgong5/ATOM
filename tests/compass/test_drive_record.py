@@ -5,9 +5,9 @@ client runs.
 
 A planted server stands in for ATOM's: it copies such a record to where the
 step record's variable points, answers ``/health`` once and exits. `rocm-smi`,
-`rocminfo` and the checkouts run.json's identity reads are planted as
-`test_drive_gpu.py` and `test_drive_identity.py` plant them, so run.json's
-identity is the one `identity` builds, and `fit.samples` reads it.
+`rocminfo`, ``preflight.sh`` and the checkouts run.json's identity reads are
+planted as `test_drive_gpu.py` and `test_drive_identity.py` plant them, so
+run.json's identity is the one `identity` builds, and `fit.samples` reads it.
 """
 
 import json
@@ -28,7 +28,7 @@ from test_validate_runs import _aiter
 
 from atom.compass import cli
 from atom.compass.backends.step_labels import TABLE_VERSION, label
-from atom.compass.drive import aiter_jit, identity, record, serve
+from atom.compass.drive import aiter_jit, gpu, identity, record, serve
 from atom.compass.fit.samples import load
 
 PLANTED = """\
@@ -176,10 +176,32 @@ def test_ops_profiling_dummy_weights_and_owned_flags_refuse_before_a_server_star
     assert not out.exists()
 
 
+@pytest.mark.parametrize(
+    "atoms",
+    [
+        ["-dp", "2"],
+        ["--enable-dp-attention", "-tp", "2"],
+        ["--pipeline-parallel-size=2"],
+    ],
+)
+def test_a_dp_or_pipeline_trace_run_refuses_before_a_server_starts(
+    tmp_path, monkeypatch, atoms
+):
+    monkeypatch.setattr(serve, "SERVER", (sys.executable, "-c", "pass"))
+    out = tmp_path / "out"
+    argv = ["record", "--gpu", "7", "--out", str(out), "--trace", "--", "--model", "m"]
+
+    with pytest.raises(SystemExit, match="^compass record: --trace reduces each TP"):
+        cli.main([*argv, *atoms])
+    assert not out.exists()
+
+
 @pytest.fixture
 def planted_gpu(tmp_path, monkeypatch):
-    """The planted server, `rocm-smi` listing GPU 7 free, `rocminfo`, the
-    checkouts and the model whose config.json run.json digests; returns the model."""
+    """The planted server, `rocm-smi` listing GPU 7 free, `rocminfo`, a
+    ``preflight.sh`` that passes, the checkouts and the model whose config.json
+    run.json digests; returns the model. The real ``preflight.sh``'s census
+    reads this host's load and can refuse on it."""
     steps = recorded(tmp_path / "planted", monkeypatch, key=HOST)
     monkeypatch.setenv("PLANTED_RECORD", str(steps))
     (tmp_path / "server.py").write_text(PLANTED)
@@ -198,6 +220,8 @@ def planted_gpu(tmp_path, monkeypatch):
     for tool in ("rocm-smi", "rocminfo"):
         (bindir / tool).chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    (bindir / "preflight.sh").write_text("echo PREFLIGHT_RC=0\n")
+    monkeypatch.setattr(gpu, "PREFLIGHT", bindir / "preflight.sh")
     trees = {
         m: _checkout(tmp_path / m, tag) for m, tag in (("atom", None), ("aiter", "v0"))
     }
@@ -206,9 +230,17 @@ def planted_gpu(tmp_path, monkeypatch):
     (tmp_path / "rocm" / ".info").mkdir(parents=True)
     (tmp_path / "rocm" / ".info" / "version").write_text("7.2.4\n")
     monkeypatch.setenv("ROCM_PATH", str(tmp_path / "rocm"))
-    # The record names what any process writes to Inductor's and Triton's
-    # caches while it serves: the test's own, not the ones its box shares.
-    for var in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+    # The record names what any process writes to aiter's, FlyDSL's, Inductor's
+    # and Triton's caches while it serves: the test's own, not the ones its box
+    # shares. FlyDSL's is set beside aiter's own: importing the installed aiter
+    # points FLYDSL_RUNTIME_CACHE_DIR at its jit/flydsl_cache for the rest of
+    # the process.
+    _aiter(tmp_path / "box", monkeypatch)
+    for var in (
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TRITON_CACHE_DIR",
+        "FLYDSL_RUNTIME_CACHE_DIR",
+    ):
         monkeypatch.setenv(var, str(tmp_path / var.lower()))
     (tmp_path / "model").mkdir()
     (tmp_path / "model" / "config.json").write_text('{"hidden_size": 8}')

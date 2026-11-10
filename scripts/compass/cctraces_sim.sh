@@ -40,9 +40,14 @@
 #                   deployment has left (default 600)
 #   HTTP_INTAKE     a file: a TP1 cell's server runs under http_intake.py,
 #                   which stamps each request its event loop takes in there
+#   STORE           with REAL=1, an artifact store: the server's start merges
+#                   its JIT cache library for this stack into the container's
+#                   caches, and its stop writes back what the server finished
+#                   compiling (atom/compass/drive/jit_cache.py); unset, no
+#                   library is touched
 #
-# A run file with `router_s` and `kv_write_req_s` makes the cell 1P1D: the
-# deployment is pd_sim.sh's, and aiperf drives its atomesh router.
+# A run file with `router_s` makes the cell 1P1D: the deployment is pd_sim.sh's,
+# and aiperf drives its atomesh router.
 #
 # It runs its own tree, as the gates do, compass-harness included. OUT_DIR gets
 # run.json (RUN_FILE plus a `workload` entry hashing the traces, the dataset
@@ -167,7 +172,7 @@ run["clock_endpoint"] = f"tcp://127.0.0.1:{ports[0]}"
 # declares more, or none (null, as `compass run` keeps one), leaves the server
 # up after aiperf.
 run["client_runs"] = 1
-if "kv_write_req_s" not in run:
+if "router_s" not in run:
     run["argv"] = ["--", "--model", os.environ["MODEL"], *os.environ["SERVER_ARGS"].split()]
 run["workload"] = {
     "dataset_sha256": sha256(traces),
@@ -178,7 +183,7 @@ run["workload"] = {
 if int(os.environ["REAL"]):
     run["env"] = {k: os.environ[k] for k in ("TRITON_CACHE_AUTOTUNING", "TRITON_CACHE_DIR")}
 (out / "run.json").write_text(json.dumps(run))
-print("1p1d" if "kv_write_req_s" in run else "tp1", *ports)
+print("1p1d" if "router_s" in run else "tp1", *ports)
 sys.stdout.close()
 select.select([os.pidfd_open(int(script))], [], [])
 EOF
@@ -191,6 +196,8 @@ if ((REAL)); then
     [[ $MODE == tp1 ]] || { echo "cctraces_sim: a real cell is TP1, and the run file is 1P1D" >&2; exit 2; }
     gpu=$(compass_gpus smi "$gpu")
     gpu_processes before
+    jit_since=$(date +%s%N)
+    [[ -z ${STORE:-} ]] || python3 -m atom.compass.drive.jit_cache restore "$STORE" "$gpu"
 fi
 if [[ $MODE == 1p1d ]]; then
     # pd_sim.sh takes the authority's port from its own variable; the run file
@@ -272,6 +279,7 @@ wait $server || rc=$((rc || REAL ? rc : $?))
 ((REAL)) && { kill -KILL -- -$server 2>/dev/null || true; gpu_processes after; }
 [[ $MODE == 1p1d ]] || python3 -c 'import sys; from atom.compass.drive import serve; serve.drop_compiled(sys.argv[1])' "$OUT/server.log"
 ((REAL)) && { python3 -m atom.compass.drive.aiter_jit "$OUT/run.json" "$serving_ns" || rc=$((rc ? rc : 1)); }
+((REAL)) && [[ -n ${STORE:-} ]] && { python3 -m atom.compass.drive.jit_cache save "$STORE" "$gpu" "$jit_since" || rc=$((rc ? rc : 1)); }
 # The raw records keep each response's chunks, so the export names each request
 # by its response id; once it is written, they are compressed. A run that
 # failed before aiperf wrote any has none.

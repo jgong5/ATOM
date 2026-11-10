@@ -756,6 +756,41 @@ def test_alpha_counts_the_views_it_reads_at_their_longest_row_past_the_kv_pool()
     assert report["32"]["past_pool"] == 4
 
 
+def test_the_fit_plans_a_ragged_targets_cells_and_refuses_until_they_are_measured(
+    tmp_path, run
+):
+    """At a 511-block pool rung 8's c nodes are 0, 512, 1007 and 1023, 1007
+    its KV limit at B 8. The grid record runs B 8 to c 1007 and no further. A
+    ragged view of seven rows on c 900 and one on c 1015 reads its longest row
+    in c 1007..1023, and eight rows on c 1023 hold 512 blocks: the fit plans
+    that corner from the view, so refuses until it is measured with the rows
+    sharing a block, and alpha then reads the view inside the pool."""
+    top = batch([(1, 1024, True)] * 8)
+    lines = [x for x in nodes() if x != top] + [batch([(1, 1008, True)] * 8)]
+    g = record(tmp_path, run, lines, name="g", blocks=511)
+    engine = {"g": json.loads((g / "steps/dp0.engine.json").read_text())}
+    for line in step_grid_plan.plan(DEFINITION, enumerate(lines), engine)["lines"]:
+        measured(tmp_path, run, view_of(line))
+    ragged = batch([(1, 901, True)] * 7 + [(1, 1016, True)])
+    token = measured(tmp_path, run, ragged, "ragged", 3e-3)
+    a = record(tmp_path, run, nodes() * 4 + mixed())
+    args = (a, token, *clients(g), *clients(a))
+    views = [("view", ragged)]
+    planned = step_grid_plan.plan(DEFINITION, enumerate(lines), engine, views)
+    [corner] = [view_of(x) for x in planned["lines"] if x["rows"] == top["rows"]]
+    key = measurement_key(run[2], step_grid.keyed(run[0].config), SAMPLING, corner)
+
+    with pytest.raises(SystemExit) as refused:
+        fitted(tmp_path, *args, grid="g")
+    assert corner["shared"] == 1
+    assert f"1 of the {len(planned['lines'])} planned" in str(refused.value)
+    assert str(key) in str(refused.value)
+    measured(tmp_path, run, corner)
+
+    report = fitted(tmp_path, *args, grid="g")["report"]["alpha"]["8"]
+    assert report == {"views": 1, "unread": [], "past_pool": 0}
+
+
 def test_alpha_rising_with_the_mean_context_is_fitted_and_priced(
     tmp_path, run, monkeypatch
 ):

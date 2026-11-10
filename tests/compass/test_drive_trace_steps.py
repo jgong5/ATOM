@@ -319,9 +319,6 @@ def test_a_simulated_server_serves_a_client_and_publishes_its_steps(tmp_path):
     from test_vertical_slice import Traffic, publish_entry
 
     machine = copy.deepcopy(DOCUMENT)
-    applies = machine["host"]["tokenizers"][0]["applies_to"]
-    arch = json.loads((Path(MODEL) / "config.json").read_text())["architectures"][0]
-    applies += [] if arch in applies else [arch]
     (tmp_path / "machine.json").write_text(json.dumps(machine))
     out, store = tmp_path / "out", tmp_path / "store"
     argv = ["trace", "steps", "--step-stub", str(stub(tmp_path, 1))]

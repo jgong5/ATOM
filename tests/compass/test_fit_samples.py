@@ -28,7 +28,7 @@ from atom.compass.backends.step_labels import digest, label
 from atom.compass.fit.samples import MEMBER, load
 from atom.compass.parity import ARRIVALS
 from atom.compass.parity.served import served
-from atom.compass.run.step_grid import BOUNDS
+from atom.compass.run.step_grid import keyed_of
 
 HOST = {"host_cpu": "planted cpu", "atom": "0" * 64, "model": "sha256:" + "1" * 64}
 DEVICE = {"index": 7, "name": "MI355X", "arch": "gfx950"}
@@ -50,9 +50,7 @@ def record(tmp_path, monkeypatch, name="a", groups=((0, 1), (2, 3)), **run):
     directory = tmp_path / name
     steps = recorded(directory, monkeypatch, groups, HOST)
     engine = json.loads((steps / "dp0.engine.json").read_text())
-    keyed = {
-        k: v for k, v in engine.items() if k not in (*BOUNDS, "num_kvcache_blocks")
-    }
+    keyed = keyed_of(engine)
     identity = {
         "format_version": 2,
         "argv": ["compass", "record", "--out", str(directory)],
@@ -217,6 +215,7 @@ def test_each_sample_copies_its_input_s_provenance_and_the_traces_it_served(
         "engine_config": json.loads(a.joinpath("run.json").read_text())["host_key"][
             "engine"
         ],
+        "prefill_buckets": None,
         "source_root": "atom_py-" + "0" * 64,
         "stack": STACK,
         "ptl": "disabled",

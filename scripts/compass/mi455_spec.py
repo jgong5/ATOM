@@ -2,8 +2,7 @@
 """MI455's two machine specs: A0's from probes on one MI455 node, and B0's for
 the performance machines, which no node here reaches.
 
-    python3 scripts/compass/mi455_spec.py a0 [--model M ...] [--sweep-from DOC] [--out PATH]
-    python3 scripts/compass/mi455_spec.py b0 [--out PATH]
+    python3 scripts/compass/mi455_spec.py {a0,b0} [--out PATH]
 
 MI455X's published numbers (`DATASHEET`) are both specs' peaks.
 
@@ -11,19 +10,16 @@ MI455X's published numbers (`DATASHEET`) are both specs' peaks.
 them (`PEAKS`) give each format's derate over the peaks, the bandwidth curve,
 the kernel floor and the intra-node link's latency and derate, and its record
 the device fragment (`DEVICE`): the arch, the capacity torch reads and the
-stack, beside the host's cores. No card has a ptl directory. The HTTP intake
-terms are mi355-gpu-45's, assumed, until a burst on MI455 fits them; what no
-probe fills on any machine (the IPC costs, the inter-node link's latency and
-derate, the router relay) is assumed as on mi355-gpu-45. `--model` and
-`--sweep-from` work as `mi308x_spec.py`'s do; with neither the script sweeps
-DeepSeek-V4.1-Flash's tokenizer.
+stack. No card has a ptl directory. What no probe fills on any machine (the
+inter-node link's latency and derate, the router relay) is assumed as on
+mi355-gpu-45.
 
 `mi455-b0`, device `MI455X B0`, which no card reads: each attainable value is a
 peak times the ratio mi355-gpu-45 probed, assumed, as `compass project` takes
 them for a device never run. Every derate is MI355X's, each bandwidth-curve
 point is MI355X's over its datasheet bandwidth times MI455X's, and where no
 datasheet states a value MI355X's stands (`CARRIED`): its kernel floor and
-intra-node link latency, its host and stack, and the inter-node link latency
+intra-node link latency, its stack, and the inter-node link latency
 and router relay it assumes. Its capacity is the datasheet's and its arch,
 assumed, the A0 samples'; no rate, latency or stack A0's probe read reaches it.
 
@@ -40,19 +36,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mi308x_spec as base
-from mi308x_spec import fragment, saved, swept
+from mi308x_spec import fragment
 
 from atom.compass.spec import Fragment, MachineSpec, merge, validate
 from atom.compass.validate.project import CARRIED
 
 NAME = "mi455-a0"
-base.NAME = NAME  # the shared fragment and sweep functions name this machine
+base.NAME = NAME  # the shared fragment functions name this machine
 B0 = "mi455-b0"
 MACHINES = Path(__file__).resolve().parent / "machines"
-#: The probed machine whose ratios and values B0 carries, and whose HTTP
-#: intake terms A0 carries until it has its own.
+#: The probed machine whose ratios and values B0 carries.
 MI355X = MACHINES / "mi355x-gpu45.json"
-MODEL = "/apps/perzhang/models/DeepSeek-V4.1-Flash"
 SHEET = "MI455X product page and brochure (07/26), read 2026-10-09"
 #: B0's capacity, the datasheet's 432 GB of HBM4 as GiB (`CAPACITY`).
 B0_CAPACITY = 432 * 2**30
@@ -140,9 +134,8 @@ PEAKS = (
 )
 
 #: What `PEAKS`'s record read on card 0 (the arch and the total torch reads, as
-#: an engine start reads it) and the stack it ran under; the host is the node's.
+#: an engine start reads it) and the stack it ran under.
 DEVICE = {
-    "host": {"cpu": {"cores_physical": 128, "cores_logical": 256}},
     "device": {
         "arch": "gfx1250",
         "memory": {"capacity_bytes": 309237645312},
@@ -166,7 +159,7 @@ for block, groups in DATASHEET.items():
 
 def a0_fragments() -> list[Fragment]:
     """A0's: the probe record's device, the datasheet's peaks, the probed
-    peaks, the cards' PTL state, MI355X's intake terms and the assumed rest."""
+    peaks, the cards' PTL state and the assumed rest."""
     date, root, _, record = PEAKS
     subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
     notes = f"probe_device.py's record at {root}"
@@ -175,23 +168,12 @@ def a0_fragments() -> list[Fragment]:
         "assumed", DECLARED, "assumed", "no probe fills these", date=date
     )
     probed, assumed = base.peaks(PEAKS, datasheet.values, assumed)
-    mi355x = MachineSpec.from_mapping(json.loads(MI355X.read_text()))
-    intake = {
-        "host": {
-            "http_intake": {
-                k: mi355x.value(f"host.http_intake.{k}")
-                for k in ("fixed_s", "per_byte_s")
-            }
-        }
-    }
-    carried = f"{MI355X.stem}'s, until a burst on MI455 fits them"
     ptl = {"device": {"ptl": "disabled"}}
     return [
         fragment("device", DEVICE, "probed", notes, subject, date),
         datasheet,
         assumed,
         fragment("ptl", ptl, "probed", "no card has a ptl directory", date=date),
-        fragment("intake", intake, "assumed", carried, date=date),
         probed,
     ]
 
@@ -253,7 +235,7 @@ def b0_fragments() -> list[Fragment]:
             carried,
             "assumed",
             f"{never_ran} values where no datasheet states one: its probed kernel "
-            "floor and intra-node link latency, its host and stack, and the "
+            "floor and intra-node link latency, its stack, and the "
             "inter-node link latency and router relay it assumes",
             date,
         ),
@@ -264,21 +246,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("stepping", choices=("a0", "b0"))
     parser.add_argument("--out", type=Path, help="default machines/mi455-STEPPING.json")
-    parser.add_argument(
-        "--model", action="append", help="a0; repeats; default " + MODEL
-    )
-    parser.add_argument("--sweep-from", type=Path, help="a0: a document to reuse")
     args = parser.parse_args(argv)
-    if args.stepping == "b0":
-        if args.model or args.sweep_from:
-            parser.error("b0 sweeps no tokenizer: it carries mi355-gpu-45's host")
-        fragments = b0_fragments()
-    else:
-        sweeps = [saved(args.sweep_from)] if args.sweep_from else []
-        if args.model or not sweeps:
-            sweeps += swept(args.model or [MODEL])
-        fragments = [*sweeps, *a0_fragments()]
-    merged = merge(fragments)
+    b0 = args.stepping == "b0"
+    merged = merge(b0_fragments() if b0 else a0_fragments())
     verdict = validate(merged.document)
     print(verdict)
     if not verdict.ok:

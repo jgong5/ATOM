@@ -30,8 +30,19 @@ them the same way for every line:
 - Every token of row i is the filler id `DeferredTokenStream` reports for a
   request numbered i, out of the ids `filler_token_ids` keeps for the model's
   tokenizer, as the simulated runner keeps them.
-- Under a model that keeps per-request state, row i holds state slot i of a
-  fresh pool, or that many past the slot `batch` is given.
+- Under a model that keeps per-request state, each row holds the state slots
+  ATOM's block manager gives a live request, as many as the workers'
+  `get_num_blocks` reply states (`state_slots_per_request`): one, or under a
+  GDN model's drafter of K drafts without ReplaySSM 1 + K. They are
+  contiguous, row after row, from slot 0 of a fresh pool or from the slot
+  `batch` is given.
+- Under a model whose cache keeps each state slot's position and refuses a
+  row whose state stands elsewhere, DeepSeek-V4.1's, each row's state stands
+  at its cached context, where a request that reached it leaves it:
+  `seat_states` sets that position, on each worker before each forward of the
+  step bench, ahead of its window, and before the op bench prepares each
+  placement. Only the position is set; the slot's rows and history hold what
+  they hold, as a row's KV blocks hold what the pool does.
 - A prefill line that produces output has every row on its final chunk, one
   that does not has none: a line does not say which of its chunks ends a
   prompt, and ATOM's runner samples every row of a step that produces output.
@@ -48,9 +59,11 @@ route otherwise than the recorded step did.
 """
 
 import numpy as np
+import torch
 
 from atom.compass.runner.step_output import filler_token_ids
 from atom.model_engine.block_manager import draft_kv_lookahead
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.llm_engine import InputOutputProcessor, _load_tokenizer
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import (
@@ -61,13 +74,46 @@ from atom.model_engine.sequence import (
 from atom.sampling_params import SamplingParams
 
 NAME = "fresh-contiguous"
-VERSION = 2
+VERSION = 3
+
+
+def state_slots_per_request(config) -> int:
+    """The state slots ATOM's block manager gives a live request under
+    `config`, read as it reads them: the per-request entries the workers'
+    `get_num_blocks` reply carries, one where it states none."""
+    per_req = getattr(config, "pool_entries_per_req", None) or {}
+    return int(per_req.get(STATE_SLOT_CLASS, 1)) or 1
+
+
+def seat_states(builder, batch) -> None:
+    """Each state-holding row of `batch` with its state's position at its
+    cached context, the tokens before the row's forward, in the slot it
+    commits to, where `builder`'s cache keeps that position: DeepSeek-V4.1's
+    `PagedAttentionCache`, whose first cursor column is the position. Any
+    other cache, and a dummy batch, which runs on scratch state, are left as
+    they are."""
+    cache = getattr(builder, "cache", None)
+    if cache is None or batch.is_dummy_run:
+        return
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+
+    if not isinstance(cache, PagedAttentionCache):
+        return
+    rows = np.asarray(batch.state_rows, dtype=np.int64)
+    if not rows.size:
+        return
+    cached = batch.context_lens[rows] - batch.num_scheduled_tokens[rows]
+    device = cache.cursor.device
+    slots = torch.as_tensor(batch.state_slots_committed, dtype=torch.long)
+    positions = torch.as_tensor(cached, dtype=cache.cursor.dtype)
+    cache.cursor[slots.to(device), 0] = positions.to(device)
 
 
 class ReplayRule:
     """The rule for one engine configuration: its tokenizer, block size, KV
-    pool, drafter, and whether its model keeps per-request state; and for the
-    request parameters `sampling` states, as `SamplingParams` fields."""
+    pool, drafter, whether its model keeps per-request state and the state
+    slots a request holds; and for the request parameters `sampling` states,
+    as `SamplingParams` fields."""
 
     def __init__(self, config, sampling: dict | None = None) -> None:
         self.sampling = SamplingParams(**(sampling or {}))
@@ -88,6 +134,7 @@ class ReplayRule:
             config.hf_config.model_type
             in InputOutputProcessor._per_req_cache_model_types()
         )
+        self.slots_per_row = state_slots_per_request(config)
         spec = config.speculative_config
         self.drafts = spec.num_speculative_tokens if spec else 0
         self.lookahead = draft_kv_lookahead(self.drafts)
@@ -142,7 +189,8 @@ class ReplayRule:
             seq.block_table = new_block_table([*prefix, *range(block, block + own)])
             block += own
             if self.stateful:
-                seq.state_slots = [slot + i]
+                first = slot + i * self.slots_per_row
+                seq.state_slots = list(range(first, first + self.slots_per_row))
             seqs[seq.id] = seq
         if block > self.num_blocks:
             raise ValueError(

@@ -72,7 +72,7 @@ def _zmq(stack, port):
 
 
 def _clock(stack, port):
-    table = single_engine_table(admission_path="serving", ipc_s=1e-3, stream_s=2e-3)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=1e-3, stream_s=2e-3)
     endpoint = f"tcp://127.0.0.1:{port}"
     stack.callback(clock_transport.serve(ClockAuthority(table), endpoint).close)
 

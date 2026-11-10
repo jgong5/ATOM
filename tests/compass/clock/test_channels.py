@@ -9,6 +9,8 @@ the worked example of an idle process in the middle of a chain.
 """
 
 import math
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,7 +21,8 @@ from atom.compass.clock import (
     prefill_decode_table,
     single_engine_table,
 )
-from atom.compass.clock.channels import ADMISSION_DELAY_S, ReceiveMode
+from atom.compass.clock.channels import ReceiveMode
+from atom.utils.clock import LPRuntime, channel_of
 
 T, FP, EP, FD, ED = (
     LpId(n) for n in ("traffic", "frontend-P", "engine-P", "frontend-D", "engine-D")
@@ -27,12 +30,12 @@ T, FP, EP, FD, ED = (
 
 # Distinct values for the lookaheads that have no measurement, so every entry of
 # the distance matrix names the path that produced it.
-IPC, STREAM, ROUTER, KV = 1.0e-4, 2.0e-3, 5.0e-4, 3.0e-4
+IPC, STREAM, ROUTER, KV, ADMIT = 1.0e-4, 2.0e-3, 5.0e-4, 3.0e-4, 5.4e-4
 
 
 def _pd():
     return prefill_decode_table(
-        admission_path="serving",
+        admission_s=ADMIT,
         ipc_s=IPC,
         stream_s=STREAM,
         router_s=ROUTER,
@@ -41,7 +44,7 @@ def _pd():
 
 
 def _single():
-    return single_engine_table(admission_path="serving", ipc_s=IPC, stream_s=STREAM)
+    return single_engine_table(admission_s=ADMIT, ipc_s=IPC, stream_s=STREAM)
 
 
 def _table(*lps):
@@ -68,9 +71,6 @@ def _enumerated(table, source, target):
 
 # --- the shipped tables ------------------------------------------------------
 
-ADMISSION = sorted(ADMISSION_DELAY_S.items())
-SERVING = ADMISSION_DELAY_S["serving"]
-
 
 def _whole(table):
     return {
@@ -80,13 +80,12 @@ def _whole(table):
     }
 
 
-@pytest.mark.parametrize("path, delay", ADMISSION)
-def test_the_single_engine_table_is_exactly_its_channel_list(path, delay):
-    table = single_engine_table(admission_path=path, ipc_s=IPC, stream_s=STREAM)
+def test_the_single_engine_table_is_exactly_its_channel_list():
+    table = _single()
     F, E = LpId("frontend"), LpId("engine")
     assert table.registry.ids() == (E, F, T)
     assert _whole(table) == {
-        "traffic->frontend:http": (T, F, delay, "inline"),
+        "traffic->frontend:http": (T, F, ADMIT, "inline"),
         "frontend->traffic:stream": (F, T, STREAM, "inline"),
         "frontend->engine:request#dp0": (F, E, IPC, "thread"),
         "frontend->engine:control#dp0": (F, E, IPC, "thread"),
@@ -103,19 +102,12 @@ def test_the_single_engine_table_is_exactly_its_channel_list(path, delay):
     ]
 
 
-@pytest.mark.parametrize("path, delay", ADMISSION)
-def test_the_prefill_decode_table_is_exactly_its_channel_list(path, delay):
-    table = prefill_decode_table(
-        admission_path=path,
-        ipc_s=IPC,
-        stream_s=STREAM,
-        router_s=ROUTER,
-        kv_write_req_s=KV,
-    )
+def test_the_prefill_decode_table_is_exactly_its_channel_list():
+    table = _pd()
     assert table.registry.ids() == (ED, EP, FD, FP, T)
     # Behind the router the request, the stream and the relay each carry its cost.
     assert _whole(table) == {
-        "traffic->frontend-P:http": (T, FP, delay + ROUTER, "inline"),
+        "traffic->frontend-P:http": (T, FP, ADMIT + ROUTER, "inline"),
         "frontend-D->traffic:stream": (FD, T, STREAM + ROUTER, "inline"),
         "frontend-P->frontend-D:relay": (FP, FD, ROUTER, "inline"),
         "engine-D->engine-P:kv_write_req": (ED, EP, KV, "inline"),
@@ -128,10 +120,35 @@ def test_the_prefill_decode_table_is_exactly_its_channel_list(path, delay):
     }
 
 
+def test_each_side_of_a_prefill_decode_table_takes_its_own_zmq_hops():
+    table = prefill_decode_table(
+        admission_s=ADMIT,
+        ipc_s=IPC,
+        ipc_out_s=2 * IPC,
+        decode_ipc=(3 * IPC, 4 * IPC),
+        stream_s=STREAM,
+        router_s=ROUTER,
+        kv_write_req_s=KV,
+    )
+    whole = {name: lookahead for name, (_, _, lookahead, _) in _whole(table).items()}
+    assert whole == {
+        "traffic->frontend-P:http": ADMIT + ROUTER,
+        "frontend-D->traffic:stream": STREAM + ROUTER,
+        "frontend-P->frontend-D:relay": ROUTER,
+        "engine-D->engine-P:kv_write_req": KV,
+        "frontend-P->engine-P:request#dp0": IPC,
+        "frontend-P->engine-P:control#dp0": IPC,
+        "engine-P->frontend-P:output#dp0": 2 * IPC,
+        "frontend-D->engine-D:request#dp0": 3 * IPC,
+        "frontend-D->engine-D:control#dp0": 3 * IPC,
+        "engine-D->frontend-D:output#dp0": 4 * IPC,
+    }
+
+
 def test_the_prefill_decode_table_above_dp_width_one_has_each_ranks_channels_and_each_pairs_write_request():
     one = _pd()
     table = prefill_decode_table(
-        admission_path="serving",
+        admission_s=ADMIT,
         ipc_s=IPC,
         stream_s=STREAM,
         router_s=ROUTER,
@@ -164,7 +181,7 @@ PATHS = {"http": (T, FP), "stream": (FD, T), "relay": (FP, FD)}
 
 def _pd_at(dp=1, router_in_s=None):
     return prefill_decode_table(
-        admission_path="serving",
+        admission_s=ADMIT,
         ipc_s=IPC,
         stream_s=STREAM,
         router_s=ROUTER,
@@ -180,7 +197,7 @@ def test_with_router_in_s_each_path_is_a_hop_into_the_router_lp_and_one_out():
     whole = _whole(table)
     hops = {
         "traffic->router:http": (T, R, R_IN, "thread"),
-        "router->frontend-P:http": (R, FP, SERVING + ROUTER - R_IN, "inline"),
+        "router->frontend-P:http": (R, FP, ADMIT + ROUTER - R_IN, "inline"),
         "frontend-D->router:stream": (FD, R, R_IN, "thread"),
         "router->traffic:stream": (R, T, STREAM + ROUTER - R_IN, "inline"),
         "frontend-P->router:relay": (FP, R, R_IN, "thread"),
@@ -224,7 +241,7 @@ def test_a_router_in_s_leaving_a_hop_no_lookahead_is_refused(bad):
 
 
 def test_the_prefill_decode_distances_match_the_hand_computed_paths():
-    A, S, I, R, K = SERVING + ROUTER, STREAM + ROUTER, IPC, ROUTER, KV
+    A, S, I, R, K = ADMIT + ROUTER, STREAM + ROUTER, IPC, ROUTER, KV
     expected = {
         (T, FP): A, (T, EP): A + I, (T, FD): A + R, (T, ED): A + R + I,
         (FP, T): R + S, (FP, EP): I, (FP, FD): R, (FP, ED): R + I,
@@ -242,7 +259,7 @@ def test_the_prefill_decode_distances_match_the_hand_computed_paths():
 def test_the_single_engine_distances_match_the_hand_computed_paths():
     table = _single()
     F, E = LpId("frontend"), LpId("engine")
-    assert table.distance(T, E) == pytest.approx(SERVING + IPC)
+    assert table.distance(T, E) == pytest.approx(ADMIT + IPC)
     assert table.distance(E, T) == pytest.approx(IPC + STREAM)
     assert table.distance(F, E) == IPC
 
@@ -283,6 +300,48 @@ def test_a_channel_declared_after_a_distance_was_read_is_counted():
     assert table.distance(a, c) == 0.25
     table.declare("a->c:z", a, c, 0.75, "thread")
     assert table.distance(a, c) == 0.25
+
+
+def test_a_channel_declared_after_a_lookup_is_in_the_next_one():
+    a, b, c = LpId("a"), LpId("b"), LpId("c")
+    table = _table(a, b, c)
+    table.declare("a->b:x", a, b, 1.0, "inline")
+    assert [ch.name for ch in table.channels_from(a)] == ["a->b:x"]
+    assert table.channels_into(c) == ()
+    table.declare("a->c:x", a, c, 1.0, "thread")
+    assert [ch.name for ch in table.channels_from(a)] == ["a->b:x", "a->c:x"]
+    assert [ch.name for ch in table.channels_into(c)] == ["a->c:x"]
+
+
+def _us_a_stream_lookup(others: int) -> float:
+    """`channel_of(rt, "stream")` for an LP of two channels, in a table that
+    also holds `others` channels between two other LPs: the best of three
+    passes, in microseconds a call."""
+    f, t, x, y = (LpId(n) for n in ("f", "t", "x", "y"))
+    table = _table(f, t, x, y)
+    table.declare("f->t:stream", f, t, 1.0, "inline")
+    table.declare("t->f:http", t, f, 1.0, "inline")
+    for k in range(others):
+        table.declare(f"x->y:k{k}", x, y, 1.0, "thread")
+    rt = LPRuntime(f, table, SimpleNamespace())
+    best = math.inf
+    for _ in range(3):
+        start = time.perf_counter()
+        for _ in range(200):
+            assert channel_of(rt, "stream") == "f->t:stream"
+        best = min(best, time.perf_counter() - start)
+    return best / 200 * 1e6
+
+
+def test_an_lps_lookup_costs_the_same_whatever_else_the_table_holds():
+    """A frontend looks its stream channel up for every event it streams
+    (`atom.compass.carriers.stamp_events`), so a lookup must not cost more as
+    the run's table grows."""
+    alone, among = _us_a_stream_lookup(0), _us_a_stream_lookup(2000)
+    assert among < 5 * alone + 5, (
+        f"{alone:.1f} us a lookup in a table of 2 channels, {among:.1f} us in one "
+        "of 2,002"
+    )
 
 
 def test_the_idle_process_in_the_middle_of_a_chain():
@@ -380,3 +439,37 @@ def test_every_query_refuses_an_unregistered_process():
             query(b)
     with pytest.raises(KeyError, match="b is not registered; registered: a"):
         table.distance(a, b)
+
+
+OUT = 7.0e-4
+ENGINE_TABLES = {
+    "dp2": lambda **k: single_engine_table(dp=2, **k),
+    "pp2": lambda **k: single_engine_table(pp=2, **k),
+    "rapidserve": lambda **k: single_engine_table(rapidserve=True, **k),
+    "pd": lambda **k: prefill_decode_table(router_s=ROUTER, kv_write_req_s=KV, **k),
+}
+
+
+@pytest.mark.parametrize("form", sorted(ENGINE_TABLES))
+def test_an_engine_output_to_its_frontend_takes_ipc_out_s_and_other_zmq_ipc_s(form):
+    common = {"admission_s": ADMIT, "ipc_s": IPC, "stream_s": STREAM}
+    got = _whole(ENGINE_TABLES[form](ipc_out_s=OUT, **common))
+    outs = {n for n in got if ":output#" in n}
+    assert outs and {got[n][2] for n in outs} == {OUT}
+    assert OUT not in {c[2] for n, c in got.items() if n not in outs}
+    # Without it, the output channels keep ipc_s.
+    assert _whole(ENGINE_TABLES[form](**common)) == {
+        n: (*c[:2], IPC, c[3]) if n in outs else c for n, c in got.items()
+    }
+
+
+def test_a_run_files_ipc_out_s_reaches_the_output_channel():
+    from atom.compass import run as compass_run
+
+    run = {"ipc_s": IPC, "stream_s": STREAM}
+    output = "engine->frontend:output#dp0"
+    floor = compass_run.HOP_FLOOR_S
+    assert compass_run.channel_table(run).lookahead(output) == floor
+    table = compass_run.channel_table(run | {"ipc_out_s": OUT})
+    assert table.lookahead(output) == OUT
+    assert table.lookahead("frontend->engine:request#dp0") == IPC

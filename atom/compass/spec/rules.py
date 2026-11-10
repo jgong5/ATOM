@@ -19,13 +19,13 @@ class Rule(enum.Enum):
     RANK_AGREEMENT = "ranks of one group measure one machine"
     DERATE = "a spec-peak number carries a derate"
     PINNED_STACK = "the constants are pinned to a software stack"
-    TOKENIZER_IDENTITY = "a tokenizer is probed or it is refused"
     SHAPE = "the document has the shape the schema declares"
     TOTALITY = "a spec resolves every field the document was required to state"
     ADDRESSING = "a field is asked for by the path of the field itself"
     VERSION = "the reader knows the schema version the document was written to"
     MEASURED = "a probe reports what it read, and refuses what it could not"
     BAND = "a probed number is published with the band its probe measured"
+    LAYER = "a value is stated in the layer that names what it varies with"
 
 
 #: Knobs the engine already owns, mapped to where it owns them.

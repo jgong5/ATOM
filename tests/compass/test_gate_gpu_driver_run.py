@@ -23,8 +23,10 @@ from test_gate_gpu_verdict_through_pipe import (
     EXPECT,
     GATE,
     KNOWN,
+    KNOWN_TXT,
     _preflight,
     _suite,
+    _torch,
 )
 
 REPO = Path(__file__).resolve().parents[2]
@@ -65,15 +67,20 @@ ROUTER = (
 
 def _tree(tmp_path, driver=DRIVER, smoke=SMOKE):
     root = tmp_path / "ATOM"
-    shutil.copytree(REPO / "scripts" / "compass", root / "scripts" / "compass")
+    # Another gate shard may be writing bytecode into __pycache__ as this copies.
+    shutil.copytree(
+        REPO / "scripts" / "compass",
+        root / "scripts" / "compass",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     main = _suite(EXPECT - 1, RECORD + "\n\ndef test_main():\n    _record('main')\n")
     files = {
         "scripts/compass/preflight.sh": _preflight(0),
-        "scripts/compass/gpu_gate_known_failures.txt": "\n".join(KNOWN) + "\n",
+        KNOWN_TXT: "\n".join(KNOWN) + "\n",
         "atom/__init__.py": "",
         "atom/compass/__init__.py": "",
         "atom/compass/run.py": ROUTER,
-        "torch/__init__.py": "__version__ = 1\nclass version:\n    hip = 1\n",
+        "torch/__init__.py": _torch(),
         "tests/test_suite.py": main,
         "tests/compass/test_d.py": driver,
         "tests/compass/test_cctraces_sim_smoke.py": smoke,

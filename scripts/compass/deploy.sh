@@ -21,13 +21,20 @@
 #   <router args>  `atomesh launch` arguments, as given; the script adds the
 #                  router's host and ports, --pd-disaggregation and each
 #                  instance's URL; run with --dp-aware runs the router as LP
-#                  `router`, refusing an ATOMESH not built from this tree.
-#                  run refuses --prefill and --decode, a worker more to
+#                  `router`, refusing an ATOMESH not built from this tree,
+#                  and the run file gains `router_in_s`, each hop into it,
+#                  at `ipc_s`, borrowed: Atomesh logs no receipt to measure
+#                  its own from. run refuses --prefill and --decode, a worker more to
 #                  choose, and --max-concurrent-requests and
 #                  --rate-limit-tokens-per-second, a limiter on the wall
-#                  clock; the caller switches the router's wall-clock
-#                  detectors off, as pd_sim.sh does: --disable-health-check
-#                  --disable-circuit-breaker --disable-retries
+#                  clock; it sets --request-timeout-secs (`_lib.sh`) and
+#                  refuses the caller's; the caller switches the router's
+#                  wall-clock detectors off, as pd_sim.sh does:
+#                  --disable-health-check
+#                  --disable-circuit-breaker --disable-retries. run refuses
+#                  a router LP without --disable-retries: one that retries
+#                  resends a request under the seq it was first sent with,
+#                  and the frontend refuses it as arrived twice
 #   ATOMESH        the router binary (default atomesh)
 #   SEED           the router LP's seed (default 20260707, client.sh's)
 #   WAIT_S         seconds each instance and the router have to answer, and
@@ -94,19 +101,22 @@ while (($#)); do
 done
 [[ $seen == " prefill decode router" ]] || bad "--prefill --, --decode -- and --router -- come once each, in that order"
 [[ " ${prefill[*]} ${decode[*]} " != *" --kv-transfer-config"* ]] || bad "an instance's ATOM arguments carry --kv-transfer-config, which the script fills"
+ATOMESH=${ATOMESH:-atomesh} ROUTER_LP=
+[[ $cmd == record || " ${router[*]} " != *" --dp-aware "* ]] || ROUTER_LP=$ATOMESH
 [[ $cmd == record ]] || for word in "${router[@]}"; do
     case ${word%%=*} in
     --prefill | --decode) bad "the router's arguments carry ${word%%=*}, a worker more for a simulated router to choose" ;;
     --max-concurrent-requests | --rate-limit-tokens-per-second) bad "the router's arguments carry ${word%%=*}, a limiter a simulated router leaves out" ;;
+    --request-timeout-secs) bad "the router's arguments carry ${word%%=*}, a wall-clock bound the script sets for a simulated router" ;;
     esac
 done
+[[ -z $ROUTER_LP || " ${router[*]} " == *" --disable-retries "* ]] || bad "the router's arguments carry --dp-aware but not --disable-retries: a router LP's retry resends a request under its first seq, which the frontend refuses as arrived twice"
 for path in "$(realpath -m "$OUT")" "$ROOT" "$PWD"; do
     ((${#on[@]} == 0)) || [[ $(printf %q "$path") == "$path" ]] || bad "--on's prefix may parse $path again, which a shell would split or expand"
 done
 mkdir -p "$OUT"
 [[ -z $(ls -A "$OUT") ]] || bad "$OUT holds an earlier deployment's files"
 OUT=$(realpath "$OUT")
-ATOMESH=${ATOMESH:-atomesh}
 WAIT_S=${WAIT_S:-600}
 PREFIX_S=${PREFIX_S:-60}
 KV_LINK=intra_node
@@ -116,8 +126,6 @@ compass_env "$ROOT"
 compass_require_tree "$ROOT" || exit $?
 RUN_FILE= CLOCK=
 [[ $cmd == record ]] || RUN_FILE=$OUT/run_file.json
-ROUTER_LP=
-[[ -z $RUN_FILE || " ${router[*]} " != *" --dp-aware "* ]] || ROUTER_LP=$ATOMESH
 # The ports, all held together so no two are the same: the router's and its
 # metrics', and each side's KV block. Simulated, both sides share one block of
 # write requests, one per prefill and decode rank pair, and the authority
@@ -172,7 +180,7 @@ try:
     lookaheads = "-"
     if router_lp:
         run["router"] = compass_run.router_binary(router_lp)
-        run.setdefault("router_in_s", run["ipc_s"])
+        run.setdefault("router_in_s", compass_run.hop(run, "ipc_s"))
         table = compass_run.channel_table(run)
         lookaheads = json.dumps({c.name: table.lookahead(c.name) for c in table.channels_from(compass_run.ROUTER)}, separators=(",", ":"))
 except (ValueError, OSError, ArtifactRefusal, SpecRefusal) as refused:
@@ -256,8 +264,9 @@ hosts=127.0.0.1
 for u in "$prefill_url" "$decode_url"; do u=${u#*://} && hosts+=,${u%:*}; done
 export NO_PROXY=$hosts${NO_PROXY:+,$NO_PROXY} no_proxy=$hosts${no_proxy:+,$no_proxy}
 
-ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-port "$PROMETHEUS_PORT"
-    --pd-disaggregation --prefill "$prefill_url" --decode "$decode_url" "${router[@]}")
+ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-port "$PROMETHEUS_PORT")
+[[ -z $RUN_FILE ]] || ROUTER+=(--request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S")
+ROUTER+=(--pd-disaggregation --prefill "$prefill_url" --decode "$decode_url" "${router[@]}")
 router_env=()
 [[ -z $ROUTER_LP ]] || router_env=(ATOM_COMPASS_CLOCK_ENDPOINT="$CLOCK" ATOM_COMPASS_SEED="${SEED:-20260707}" ATOM_COMPASS_ROUTER_LOOKAHEADS="$LOOKAHEADS")
 env "${router_env[@]}" "${ROUTER[@]}" >"$OUT/router.log" 2>&1 &

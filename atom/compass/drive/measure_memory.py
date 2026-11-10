@@ -8,10 +8,11 @@ ATOM's engine starts from ATOM's arguments (`EngineArgs`) on the GPUs `--gpu`
 names, through `MemoryReadingModelRunner` (under `--enable-rapidserve` its
 RapidServe form, whose decode engine writes its own readings beside prefill's),
 and stops once it has started: its weights loaded, its one warmup run, its KV
-cache sized and its graphs captured. `gpu.quiet` checks those GPUs before the
-start and, once every process of the start has exited, after it. Each rank
-writes its readings and the key it read off its resolved config, and the ranks
-must agree on the key. The entry's key is that one with the digest of the
+cache sized and its graphs captured; at DP and TP both above 1 under
+`serve.LOG_MORE`, as `compass record` starts a server. `gpu.quiet` checks those
+GPUs before the start and, once every process of the start has exited, after
+it. Each rank writes its readings and the key it read off its resolved config,
+and the ranks must agree on the key. The entry's key is that one with the digest of the
 machine spec `--machine` names; its conditions are that spec's device and
 stack, torch included. A `--gpu` whose device or PTL state is not the spec's,
 or a stack the spec does not pin, refuses before the start, so no entry
@@ -22,6 +23,10 @@ holds `memory.ENTRY_FIELDS`, its `record` the digest of the engine's log.
 as the lmcache server an offload connector reaches, so the GPU checks hold it
 to the engine's rule. SIGINT or SIGTERM to the command stops the engine's
 group as `serve` stops a server's, and publishes nothing.
+
+Each start merges the JIT cache library `--store` holds for this stack into
+the container's caches, and its stop writes back each artifact it finished
+compiling (`jit_cache`), as `compass record --store` does.
 
 Each start takes a free `ATOM_DP_MASTER_PORT`, which keys ATOM's compiled-graph
 cache, and its stop removes that directory, as a parity run's server does. A
@@ -59,7 +64,7 @@ from atom.compass.artifacts import (
     read_back,
     roots_for,
 )
-from atom.compass.drive import serve
+from atom.compass.drive import jit_cache, serve
 from atom.compass.drive.gpu import add_gpu_flag, hip_visible, quiet
 from atom.compass.drive.identity import _device, _ptl, _stack, identity
 from atom.compass.memory.check import LOG, READINGS
@@ -140,6 +145,7 @@ def main(argv: list[str], again: bool = False) -> None:
             "the start runs another stack than the machine spec "
             f"{machine.value('name')} pins: " + "; ".join(differ)
         )
+    library = jit_cache.library(args.store, stack, _device(args.gpu))
     out = Path(args.out)
     if out.exists() and any(out.iterdir()):
         raise ValueError(f"{out} holds an earlier run's files; one run per directory")
@@ -147,6 +153,7 @@ def main(argv: list[str], again: bool = False) -> None:
     env = {k: v for k, v in os.environ.items() if k not in (ENV, CLOCK_ENV, parity.ENV)}
     env[OUT_ENV] = str(out / READINGS)
     env["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
+    env |= serve.log_more(atom_args)
     if args.beside:
         env[BESIDE_ENV] = args.beside
     code = f"import sys; from {__name__} import start; start(sys.argv[1:])"
@@ -161,6 +168,9 @@ def main(argv: list[str], again: bool = False) -> None:
         env["ATOM_DP_MASTER_PORT"] = str(dp_port)
         # KFD lists an exited rank until it has freed the rank's GPU memory.
         kfd = serve._kfd()
+        # The log's creation, on the clock a cache file's mtime reads.
+        since = os.fstat(log.fileno()).st_mtime_ns
+        jit_cache.restore(library)
         engine = subprocess.Popen(
             [sys.executable, "-c", code, *atom_args],
             stdout=log,
@@ -184,6 +194,7 @@ def main(argv: list[str], again: bool = False) -> None:
             serve._stop(engine.pid, kfd)
             engine.wait()
             serve.drop_compiled(out / LOG)
+            jit_cache.save(library, since)
     if stopped:
         raise ValueError(
             f"{signal.Signals(stopped[0]).name} stopped the command; nothing is published"

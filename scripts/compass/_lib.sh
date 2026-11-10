@@ -262,6 +262,41 @@ compass_pytest_counts() {
     ERRORS=$(grep -oE '[0-9]+ errors?' <<<"$SUMMARY" | grep -oE '[0-9]+' || echo 0)
 }
 
+# compass_gpu_arch CARD: the GPU target of HIP ordinal CARD as torch reads it
+# (gfx942, gfx950, gfx1250), or nothing. The GPU gate keeps one baseline per target.
+compass_gpu_arch() {
+    HIP_VISIBLE_DEVICES=$1 python -c 'import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])' 2>/dev/null
+}
+
+# compass_gpu_skips TARGET: sets SKIP_ARGS to an --ignore for each file
+# gpu_gate_skip.txt leaves out on GPU target TARGET, the first card's, and
+# SKIP_N to the tests those files collect, run from the tree being measured. A
+# file under tests/compass goes to COMPASS_LEFT instead, uncounted: the gate
+# counts what tests/compass passes on the tree. The line `TARGET driver-run`
+# sets NO_DRIVER_RUN. A file it cannot count fails, SKIP_WHY naming it.
+compass_gpu_skips() {
+    local gpu file n
+    SKIP_ARGS=() SKIP_N=0 COMPASS_LEFT=() NO_DRIVER_RUN=
+    while read -r gpu file; do
+        [ "$gpu" = "$1" ] || continue
+        if [ "$file" = driver-run ]; then
+            printf 'driver-run inputs: none on %s\n' "$gpu"
+            NO_DRIVER_RUN=1
+            continue
+        fi
+        [ -e "$file" ] || continue
+        if [[ $file == tests/compass/* ]]; then
+            printf 'left out on %s: %s\n' "$gpu" "$file"
+            COMPASS_LEFT+=("$file")
+            continue
+        fi
+        n=$(python -m pytest "$file" --collect-only -q -p no:cacheprovider 2>&1 | sed -nE 's/^([0-9]+) tests? collected.*/\1/p')
+        [ -n "$n" ] || { SKIP_WHY="cannot count the tests of $file, which gpu_gate_skip.txt leaves out on $gpu"; return 1; }
+        printf 'left out on %s: %s (%s tests)\n' "$gpu" "$file" "$n"
+        SKIP_ARGS+=("--ignore=$file") SKIP_N=$((SKIP_N + n))
+    done < <(grep -vE '^[[:space:]]*(#|$)' "$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_skip.txt")
+}
+
 # compass_held_port [N]: the first of N ports in a row (default 1), each one
 # a free TCP port, held until this script exits, so no other process binds it
 # before its server does. A block of more than one is drawn below the
@@ -292,6 +327,13 @@ if not os.fork():
     os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
     select.select([os.pidfd_open(int(sys.argv[1]))], [], [])' $$ "${1:-1}"
 }
+
+# The router's bound on each request to a worker, its whole response
+# included, which `--request-timeout-secs` sets (default 1800 s) and the
+# clock cannot reach. A simulated stream lasts as much wall time as the run
+# takes to reach its end, past 1800 s at c=256, so a simulated launch sets
+# the bound to a year.
+COMPASS_SIM_REQUEST_TIMEOUT_S=31536000
 
 # compass_wait_up WHAT PID URL: return once URL answers; exit 1 if PID exits
 # first or WAIT_S seconds pass.

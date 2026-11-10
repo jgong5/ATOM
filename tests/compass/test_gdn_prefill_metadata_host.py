@@ -20,17 +20,17 @@ from atom.utils import CpuGpuBuffer
 
 
 def _stand_in_attr(attr):
-    """A mock for each name an importer binds, and none for a dunder:
-    `inspect` caches every module's `__file__`, and a mock there breaks the
-    real aiter's custom-op registration later in the process."""
+    """A mock for each name an importer binds, and none for a dunder, so a
+    stand-in reads as a module without `__file__` or `__all__`, not as one
+    whose metadata is a mock."""
     if attr.startswith("__"):
         raise AttributeError(attr)
     return MagicMock()
 
 
 class _AiterStandIn(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """Every `aiter` module as a stand-in. `gdn_attn` imports aiter at module
-    scope, and without a driver aiter's import raises; nothing here calls it."""
+    """Every `aiter` module as a stand-in, where aiter is not installed:
+    `gdn_attn` imports aiter at module scope, and nothing here calls it."""
 
     def find_spec(self, name, path, target=None):
         if name == "aiter" or name.startswith("aiter."):
@@ -46,11 +46,26 @@ class _AiterStandIn(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         pass
 
 
-if torch.cuda.is_available():
-    from atom.model_ops.attentions.gdn_attn import (
-        GDNStateMixin,
-        compute_causal_conv1d_metadata,
-    )
+try:
+    from aiter.ops.triton.utils._triton import arch_info as _arch_info
+except ImportError:
+    _arch_info = None
+
+if _arch_info is not None:
+    # A real import, so no engine module keeps a stand-in for a later importer
+    # to take. With no device, aiter's Triton helpers cannot probe the arch at
+    # import; nothing here launches a kernel, so they are lent one.
+    _lent = _arch_info._CACHED_ARCH is None
+    if _lent:
+        _arch_info._CACHED_ARCH = "gfx950"
+    try:
+        from atom.model_ops.attentions.gdn_attn import (
+            GDNStateMixin,
+            compute_causal_conv1d_metadata,
+        )
+    finally:
+        if _lent:
+            _arch_info._CACHED_ARCH = None
 else:
     _finder, _before = _AiterStandIn(), set(sys.modules)
     sys.meta_path.insert(0, _finder)
@@ -61,8 +76,8 @@ else:
         )
     finally:
         sys.meta_path.remove(_finder)
-        # Only the stand-ins go: an aiter imported for real before stays
-        # whole, and none of its packages keeps a stand-in bound.
+        # Only the stand-ins go: an `aiter` module already in `sys.modules`
+        # stays, and keeps none of them bound.
         for _name in [
             n for n in set(sys.modules) - _before if n.split(".")[0] == "aiter"
         ]:

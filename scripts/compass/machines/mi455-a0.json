@@ -6,12 +6,6 @@
     "date": "2026-10-29",
     "origin": "mixed",
     "origins": {
-      "host.cpu.cores_physical": {
-        "origin": "probed"
-      },
-      "host.cpu.cores_logical": {
-        "origin": "probed"
-      },
       "device.arch": {
         "origin": "probed",
         "source_root": "commit:b71c071d3",
@@ -72,12 +66,6 @@
       "interconnect.inter_node.link_bandwidth_bytes_per_s": {
         "origin": "datasheet"
       },
-      "host.ipc.zmq_roundtrip_s": {
-        "origin": "assumed"
-      },
-      "host.ipc.shm_broadcast_s": {
-        "origin": "assumed"
-      },
       "interconnect.inter_node.link_latency_s": {
         "origin": "assumed"
       },
@@ -89,12 +77,6 @@
       },
       "device.ptl": {
         "origin": "probed"
-      },
-      "host.http_intake.fixed_s": {
-        "origin": "assumed"
-      },
-      "host.http_intake.per_byte_s": {
-        "origin": "assumed"
       },
       "device.memory.bandwidth_curve": {
         "origin": "probed",
@@ -139,96 +121,16 @@
         "origin": "probed",
         "source_root": "commit:b71c071d3",
         "record": "sha256:f264727900f52ebaa1e126f69959cf49ce8595448670b1c0754a832202ce4027"
-      },
-      "host.tokenizers[deepseek-v4.1-flash fast]": {
-        "origin": "probed",
-        "model": "/apps/perzhang/models/DeepSeek-V4.1-Flash",
-        "source_root": "commit:e82211c391e436782f6aa595674d00f160af0cd1",
-        "p10": {
-          "encode_fixed_s": 6.364912448170171e-06,
-          "encode_tokens_per_s": 803429.34489508,
-          "decode_fixed_s": 9.650998663366533e-07,
-          "decode_tokens_per_s": 6054876.3592864685
-        },
-        "p90": {
-          "encode_fixed_s": 7.068226777674388e-06,
-          "encode_tokens_per_s": 849364.1611965084,
-          "decode_fixed_s": 1.0351487984509456e-06,
-          "decode_tokens_per_s": 6229618.240102019
-        }
-      },
-      "host.tokenizers[deepseek-v4-pro fast]": {
-        "origin": "probed",
-        "model": "/apps/models/DeepSeek-V4-Pro",
-        "source_root": "commit:e82211c391e436782f6aa595674d00f160af0cd1",
-        "p10": {
-          "encode_fixed_s": 8.287162868768175e-06,
-          "encode_tokens_per_s": 816047.0127414622,
-          "decode_fixed_s": 9.709067516328684e-07,
-          "decode_tokens_per_s": 6072969.658130738
-        },
-        "p90": {
-          "encode_fixed_s": 8.958297780959004e-06,
-          "encode_tokens_per_s": 826938.2307589843,
-          "decode_fixed_s": 9.92335577443202e-07,
-          "decode_tokens_per_s": 6165559.519248271
-        }
       }
     },
     "fragments": [
-      "tokenizer",
       "device",
       "datasheet",
       "assumed",
       "ptl",
-      "intake",
       "peaks"
     ],
-    "notes": "probe_device.py's record at b71c071d3 | MI455X product page and brochure (07/26), read 2026-10-09 | no probe fills these | no card has a ptl directory | mi355x-gpu45's, until a burst on MI455 fits them | probe_device.py: GEMM, read, write, copy, graph and link samples"
-  },
-  "host": {
-    "cpu": {
-      "cores_physical": 128,
-      "cores_logical": 256
-    },
-    "tokenizers": [
-      {
-        "id": "deepseek-v4.1-flash",
-        "backend": "fast",
-        "vocab_size": 129280,
-        "fingerprint": "sha256:c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
-        "applies_to": [
-          "DeepseekV41ForCausalLM"
-        ],
-        "encode_fixed_s": 6.792893112420859e-06,
-        "encode_tokens_per_s": 841465.980266578,
-        "decode_fixed_s": 9.92444763328879e-07,
-        "decode_tokens_per_s": 6150377.355438911,
-        "derate": 1.0
-      },
-      {
-        "id": "deepseek-v4-pro",
-        "backend": "fast",
-        "vocab_size": 129280,
-        "fingerprint": "sha256:8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
-        "applies_to": [
-          "DeepseekV4ForCausalLM"
-        ],
-        "encode_fixed_s": 8.601282156228165e-06,
-        "encode_tokens_per_s": 823345.6962936821,
-        "decode_fixed_s": 9.824013702498224e-07,
-        "decode_tokens_per_s": 6100938.222311888,
-        "derate": 1.0
-      }
-    ],
-    "ipc": {
-      "zmq_roundtrip_s": 5e-05,
-      "shm_broadcast_s": 2e-05
-    },
-    "http_intake": {
-      "fixed_s": 0.001966482509138914,
-      "per_byte_s": 5.288974015662166e-09
-    }
+    "notes": "probe_device.py's record at b71c071d3 | MI455X product page and brochure (07/26), read 2026-10-09 | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples"
   },
   "device": {
     "name": "MI455X",

@@ -143,6 +143,21 @@ def test_the_group_32_quant_writes_fp8_and_a_scale_byte_per_32(dequantize, writt
     assert work(op, rows((2, 2)), TP, "bf16") == Work({}, 256 + written)
 
 
+def test_the_per_group_quant_reads_its_rows_and_writes_fp8_with_a_scale_per_group():
+    # 2 rows of 64 bf16 read once and written in fp8, with an e8m0 scale for
+    # each group of 32: a DP-attention rank's quant before its MoE dispatch.
+    op = leaf(
+        "aiter.dynamic_per_group_scaled_quant.default",
+        out=t([2, 64], FP8),
+        input=t([2, 64]),
+        scales=t([2, 2], E8M0),
+        group_size=32,
+        shuffle_scale=False,
+    )
+
+    assert work(op, rows((2, 2)), TP, "bf16") == Work({}, 256 + 128 + 4)
+
+
 def test_the_dual_norm_quant_writes_both_sides_in_mxfp8():
     op = leaf(
         "aiter.ops.triton.quant.fused_mxfp8_quant:fused_dual_rmsnorm_mxfp8_quant",

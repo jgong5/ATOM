@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 """The HTTP intake probe: what it stamps on a server it runs, what its fit
-recovers, and the machine specs that state its terms."""
+recovers, and the machine specs that state its terms; and the run's ``host``
+entry, whose ``http_intake`` a simulated run charges."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -64,6 +66,236 @@ def test_serve_stamps_a_body_read_off_the_socket_once_and_each_template(tmp_path
     rows = [line.split() for line in stamps.read_text().splitlines()]
     assert [(r[2], r[4]) for r in rows] == [("body", "1234"), ("tmpl", "6")]
     assert all(int(r[0]) >= int(r[3]) for r in rows)
+
+
+#: A stand-in server that reads a body and renders a template, then prints
+#: what it opened meanwhile, whether STAMPS (its argument) exists and the file
+#: ``STAMPS.<pid>.local`` names, before it exits.
+LOCAL_SERVER = """
+import asyncio, builtins, glob, io, json, os, sys
+from starlette.requests import Request
+from .chat_encoders import apply_chat_template
+
+opened = []
+for owner in (builtins, io, os):
+    real = owner.open
+    owner.open = lambda f, *a, _real=real, **k: (opened.append(str(f)), _real(f, *a, **k))[1]
+
+async def main():
+    async def receive():
+        return {"type": "http.request", "body": b"x" * 1234}
+
+    await Request({"type": "http"}, receive).body()
+    apply_chat_template(None, None, [])
+
+if __name__ == "__main__":
+    stamps = sys.argv[1]
+    asyncio.run(main())
+    seen, named = list(opened), glob.glob(stamps + ".*.local")
+    local = [open(n).read().strip() for n in named]
+    print(json.dumps({"opened": seen, "exists": os.path.exists(stamps), "local": local}))
+"""
+
+
+def test_serve_writes_no_stamp_line_into_stamps_until_the_server_exits(tmp_path):
+    """On NFS a line written right after another waits for the first's round
+    trip; a served request's lines go to the host's own file system."""
+    server = SERVER | {"entrypoints/openai/api_server.py": LOCAL_SERVER}
+    for name, text in server.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    record, local = tmp_path / "record", tmp_path / "local"
+    record.mkdir()
+    local.mkdir()
+    stamps = record / "stamps"
+    done = subprocess.run(
+        [sys.executable, PROBE, "serve", stamps, stamps],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path), TMPDIR=str(local)),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    seen = json.loads(done.stdout)
+    # While it served, nothing under the record was opened and STAMPS held no
+    # line: they were in one file of the host's own.
+    assert not [p for p in seen["opened"] if Path(p).is_relative_to(record)]
+    assert not seen["exists"]
+    assert [Path(p).parent for p in seen["local"]] == [local]
+    # At its exit they are in STAMPS, and nothing else is left.
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    assert [(r[2], r[4]) for r in rows] == [("body", "1234"), ("tmpl", "6")]
+    assert [p.name for p in record.iterdir()] == ["stamps"]
+    assert not list(local.iterdir())
+
+
+#: A stand-in server that stamps a body and a template, then serves with
+#: uvicorn until a stop, touching READY (its argument) once it serves.
+SIGTERM_SERVER = """
+import asyncio, contextlib, pathlib, sys
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from .chat_encoders import apply_chat_template
+
+
+async def main():
+    async def receive():
+        return {"type": "http.request", "body": b"x" * 1234}
+
+    await Request({"type": "http"}, receive).body()
+    apply_chat_template(None, None, [])
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    pathlib.Path(sys.argv[1]).touch()
+    yield
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    uvicorn.run(Starlette(lifespan=lifespan), host="127.0.0.1", port=0, log_level="warning")
+"""
+
+
+def test_serve_stopped_by_sigterm_appends_its_lines_to_stamps(tmp_path):
+    """A stop SIGTERMs the server's process group. uvicorn takes the signal while
+    it serves, then raises it again, which by default ends the process before
+    any exit handler runs."""
+    import signal
+    import time
+
+    server = SERVER | {"entrypoints/openai/api_server.py": SIGTERM_SERVER}
+    for name, text in server.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    record, local, ready = tmp_path / "record", tmp_path / "local", tmp_path / "ready"
+    record.mkdir()
+    local.mkdir()
+    stamps = record / "stamps"
+    probe_server = subprocess.Popen(
+        [sys.executable, PROBE, "serve", stamps, ready],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path), TMPDIR=str(local)),
+        start_new_session=True,
+    )
+    try:
+        end = time.monotonic() + 120
+        while not ready.exists():
+            assert probe_server.poll() is None and time.monotonic() < end
+            time.sleep(0.1)
+        os.killpg(probe_server.pid, signal.SIGTERM)
+        probe_server.wait(timeout=120)
+    finally:
+        if probe_server.poll() is None:
+            os.killpg(probe_server.pid, signal.SIGKILL)
+    # It ends of the signal, as it did, and its lines are in STAMPS.
+    assert probe_server.returncode == -signal.SIGTERM
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    assert [(r[2], r[4]) for r in rows] == [("body", "1234"), ("tmpl", "6")]
+    assert [p.name for p in record.iterdir()] == ["stamps"]
+    assert not list(local.iterdir())
+
+
+#: Appends one server's lines to STAMPS as a stop does, once GO exists.
+APPEND = """
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import http_intake
+go, local, stamps, named = sys.argv[2:]
+open(local + ".waiting", "w").close()
+while not os.path.exists(go):
+    pass
+http_intake._append(local, stamps, named)
+"""
+
+
+def test_two_servers_stopping_at_once_append_every_line_whole(tmp_path):
+    """`parity_pd.sh` stops its prefill and decode servers, which share one
+    STAMPS, with one SIGTERM each, back to back."""
+    import time
+
+    stamps, go = tmp_path / "stamps", tmp_path / "go"
+    lines, appends = set(), []
+    for k in "ab":
+        local, named = tmp_path / f"{k}.stamps", tmp_path / f"stamps.{k}.local"
+        mine = [f"{k} {i} {'x' * (i % 97)}" for i in range(50_000)]
+        local.write_text("".join(f"{line}\n" for line in mine))
+        named.write_text(f"{local}\n")
+        lines |= set(mine)
+        argv = [PROBE.parent, go, local, stamps, named]
+        appends.append(
+            subprocess.Popen([sys.executable, "-c", APPEND, *map(str, argv)])
+        )
+    end = time.monotonic() + 120
+    while not all((tmp_path / f"{k}.stamps.waiting").exists() for k in "ab"):
+        assert time.monotonic() < end
+        time.sleep(0.01)
+    go.touch()
+    assert [p.wait(timeout=120) for p in appends] == [0, 0]
+    got = stamps.read_text().splitlines()
+    assert len(got) == len(lines) and set(got) == lines
+
+
+@pytest.mark.parametrize("held", ["nfs", "overlay"])
+def test_serve_refuses_a_temp_dir_on_a_network_file_system(tmp_path, held):
+    """A line written there right after another would wait for the first's
+    round trip, the wait the local file keeps out of the request's stages."""
+    for name, text in SERVER.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    shared, temp = tmp_path / "shared", tmp_path / "tmp"
+    if held == "nfs":
+        temp = shared / "tmp"
+    temp.mkdir(parents=True)
+    table = tmp_path / "mountinfo"
+    root = f"upperdir={shared / 'upper'},workdir={shared / 'work'}"
+    table.write_text(
+        f"1 0 0:40 / / rw - {'overlay overlay' if held == 'overlay' else 'ext4 /dev/sdb2'}"
+        f" rw,{root if held == 'overlay' else 'relatime'}\n"
+        f"2 1 0:48 / {shared} rw,relatime - nfs 10.0.0.1:/home rw,vers=3\n"
+    )
+    # The probe's serve with its mount table read from TABLE.
+    run = (
+        "import sys; sys.path.insert(0, sys.argv[1]); import http_intake; "
+        "http_intake.MOUNTINFO = sys.argv[2]; http_intake.serve(sys.argv[3], [])"
+    )
+    stamps = tmp_path / "stamps"
+    done = subprocess.run(
+        [sys.executable, "-c", run, str(PROBE.parent), str(table), str(stamps)],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path), TMPDIR=str(temp)),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 1
+    assert done.stderr.startswith(
+        f"the stamp lines' temp directory {temp} is on nfs (10.0.0.1:/home)"
+    )
+    assert "set TMPDIR" in done.stderr
+    assert not stamps.exists() and not list(tmp_path.glob("stamps.*.local"))
+
+
+def test_a_reader_refuses_stamps_whose_server_did_not_exit_naming_its_lines(
+    tmp_path,
+):
+    stamps, local = tmp_path / "stamps", tmp_path / "http_intake.x.stamps"
+    stamps.write_text("1000 1 app 1000 0\n")
+    named = tmp_path / "stamps.4242.local"
+    named.write_text(f"{local}\n")
+    for verb in ("idle", "lone", "fit"):
+        done = subprocess.run(
+            [sys.executable, PROBE, verb, stamps],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert done.returncode == 1
+        assert done.stderr.strip() == (
+            f"{stamps}: the server that stamped into it did not exit, so its lines "
+            f"are not in it; {named} names the file that holds them, {local}"
+        )
 
 
 def test_a_cell_with_http_intake_runs_its_server_under_the_probe(tmp_path):
@@ -156,42 +388,97 @@ def test_a_stall_on_the_loop_moves_the_fixed_term_and_not_the_per_byte_one(
     )
 
 
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39", "mi355x-gpu45"])
-def test_every_committed_spec_states_a_probed_intake_from_a_named_record(name):
-    from atom.compass.spec import MachineSpec
+def _host(monkeypatch, tmp_path, intake):
+    from atom.compass import run as compass_run
 
-    document = json.loads((TREE / f"scripts/compass/machines/{name}.json").read_text())
-    spec = MachineSpec.from_mapping(document)
-    for term in ("fixed_s", "per_byte_s"):
-        origin = spec.origin(f"host.http_intake.{term}")
-        assert origin["origin"] == "probed"
-        assert origin["record"].startswith("sha256:")
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"bound_s": 600.0, "host": {"http_intake": intake}}))
+    monkeypatch.setenv(compass_run.ENV, str(path))
+    return compass_run
 
 
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39", "mi355x-gpu45"])
-def test_every_committed_intake_band_spans_more_than_one_burst(name):
-    from atom.compass.spec import MachineSpec
+@pytest.mark.parametrize(
+    "intake",
+    [
+        {"per_byte_s": 5.6e-9, "idle_s": 1.1e-3},
+        {"fixed_s": 4.3e-3, "idle_s": 1.1e-3},
+        {"fixed_s": 4.3e-3, "per_byte_s": 5.6e-9, "derate": 1.0},
+        {"fixed_s": -4.3e-3, "per_byte_s": 5.6e-9},
+    ],
+    ids=["no-fixed", "no-per-byte", "unknown-field", "negative"],
+)
+def test_an_intake_a_charge_would_misread_is_refused(monkeypatch, tmp_path, intake):
+    compass_run = _host(monkeypatch, tmp_path, intake)
+    with pytest.raises(ValueError, match="host's http_intake is"):
+        compass_run.http_intake()
 
-    document = json.loads((TREE / f"scripts/compass/machines/{name}.json").read_text())
-    spec = MachineSpec.from_mapping(document)
-    for term in ("fixed_s", "per_byte_s"):
-        origin = spec.origin(f"host.http_intake.{term}")
-        assert origin["p10"] < origin["p90"]
 
-
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39"])
-def test_the_mi308x_specs_rebuild_byte_for_byte_from_their_own_sweeps(
-    monkeypatch, tmp_path, name
+def test_an_intake_with_no_idle_term_charges_its_fixed_one_to_a_lone_request(
+    monkeypatch, tmp_path
 ):
-    monkeypatch.setenv("COMPASS_MACHINE", name)
-    path = TREE / "scripts/compass/mi308x_spec.py"
-    loaded = importlib.util.spec_from_file_location("mi308x_spec", path)
-    script = importlib.util.module_from_spec(loaded)
-    loaded.loader.exec_module(script)
-    document = TREE / f"scripts/compass/machines/{name}.json"
-    out = tmp_path / "rebuilt.json"
-    assert script.main(["--sweep-from", str(document), "--out", str(out)]) == 0
-    assert out.read_bytes() == document.read_bytes()
+    compass_run = _host(
+        monkeypatch, tmp_path, {"fixed_s": 4.3e-3, "per_byte_s": 5.6e-9}
+    )
+    assert compass_run.http_intake() == (4.3e-3, 5.6e-9, 4.3e-3)
+
+
+def test_a_fit_at_a_given_rate_keeps_the_burst_span(tmp_path):
+    # A rate fitted elsewhere replaces the burst's own slope; the fixed term
+    # still makes the fitted gaps sum to what the burst spanned.
+    sizes = np.random.default_rng(0).integers(100, 200_000, 64).tolist()
+    stamps = tmp_path / "stamps"
+    stamps.write_text(_burst(2.1e-3, 1.8e-8, sizes))
+    span = 63 * 2.1e-3 + sum(sizes[1:]) * 1.8e-8
+    done = subprocess.run(
+        [sys.executable, PROBE, "fit", stamps, "64", "3e-8"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    got = json.loads(done.stdout)
+    assert got["per_byte_s"] == 3e-8
+    assert 63 * got["fixed_s"] + sum(sizes[1:]) * 3e-8 == pytest.approx(span)
+    assert got["fixed_s"] == pytest.approx(2.1e-3 - 1.2e-8 * np.mean(sizes[1:]))
+    assert got["rms_s"] > 1e-4
+
+
+def _lone(rates, sizes, idle_s=4e-4, t0=10**12):
+    """Stamp lines for lone requests a second apart, one pass over `sizes` per
+    rate: each request's loop time is `idle_s` plus its pass's rate per body
+    byte, half before its 2 ms pool job and half after."""
+    lines, c = [], t0
+    for rate in rates:
+        for size in sizes:
+            half = round((idle_s + rate * size) * 1e9 / 2)
+            j = c + half
+            e = j + 2_000_000
+            s = e + half
+            lines.append(
+                f"{c} 1 app {c} 0\n{c + 2} 1 body {c + 1} {size}\n"
+                f"{e} 2 prep {j} 0\n{s} 1 send {s - 50} 0\n"
+            )
+            c += 10**9
+    return "".join(lines)
+
+
+def test_lone_states_the_median_over_passes_of_each_pass_per_byte_rate(tmp_path):
+    sizes = [100_000 * (k + 1) for k in range(8)]
+    stamps = tmp_path / "stamps"
+    stamps.write_text(_lone([5e-9, 9e-9, 6e-9], sizes))
+    done = subprocess.run(
+        [sys.executable, PROBE, "lone", stamps, "3"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    got = json.loads(done.stdout)
+    assert got["passes"] == pytest.approx([5e-9, 9e-9, 6e-9])
+    assert got["per_byte_s"] == pytest.approx(6e-9)
+    assert (got["p10_s"], got["p90_s"]) == pytest.approx((5.2e-9, 8.4e-9))
+    assert (got["requests"], got["bytes"]) == (24, 3 * sum(sizes))
+    assert got["record"] == f"sha256:{hashlib.sha256(stamps.read_bytes()).hexdigest()}"
+    with pytest.raises(SystemExit, match="24 lone requests, not 5 passes"):
+        probe.lone(str(stamps), 5)
 
 
 #: The stand-in server: a Starlette app's lifespan, as uvicorn starts it, then
@@ -280,6 +567,8 @@ def test_serve_stamps_each_tokenizer_pool_job_and_engine_send(tmp_path):
             "class CoreManager:\n"
             "    def add_request(self, seqs):\n"
             "        print(seqs)\n"
+            "    def _mark_seq_prefill_complete(self, seq_id): pass\n"
+            "    def _deliver_terminal_output(self, seq): return False\n"
         ),
         "entrypoints/openai/api_server.py": (
             "from atom.model_engine.engine_core_mgr import CoreManager\n"
@@ -334,3 +623,261 @@ def test_the_idle_intake_is_the_loops_time_on_a_lone_request_less_the_bytes(
         SystemExit, match="10 engine sends, not one each after each of 11"
     ):
         probe.idle(str(stamps))
+
+
+def test_serve_stamps_each_sse_head_and_each_engine_output_taken_in(tmp_path):
+    server = SERVER | {
+        "model_engine/__init__.py": "",
+        "model_engine/engine_core_mgr.py": (
+            "class CoreManager:\n"
+            "    def add_request(self, seqs): pass\n"
+            "    def _mark_seq_prefill_complete(self, seq_id): pass\n"
+            "    def _deliver_terminal_output(self, seq): return False\n"
+        ),
+        "entrypoints/openai/api_server.py": """
+import asyncio
+from starlette.applications import Starlette
+from starlette.responses import PlainTextResponse, StreamingResponse
+from starlette.routing import Route
+from atom.model_engine.engine_core_mgr import CoreManager
+
+async def sse(request):
+    async def chunks():
+        yield "data: 1\\n\\n"
+    return StreamingResponse(chunks(), media_type="text/event-stream")
+
+async def text(request):
+    return PlainTextResponse("x")
+
+async def main():
+    app = Starlette(routes=[Route("/sse", sse), Route("/text", text)])
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    async def send(message):
+        pass
+
+    for path in ("/sse", "/text"):
+        scope = {"type": "http", "method": "GET", "path": path, "headers": []}
+        await app(scope | {"query_string": b"", "root_path": ""}, receive, send)
+    CoreManager()._mark_seq_prefill_complete(1)
+    CoreManager()._deliver_terminal_output(None)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+""",
+    }
+    for name, text in server.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    stamps = tmp_path / "stamps"
+    subprocess.run(
+        [sys.executable, PROBE, "serve", stamps],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path)),
+        check=True,
+    )
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    # The plain-text response sends a head too, and is no stream.
+    assert [r[2] for r in rows] == ["app", "head", "app", "out", "out"]
+
+
+def test_hops_pair_each_send_with_its_arrival_one_request_in_flight(tmp_path):
+    sent = [10**12 + k * 10**9 for k in range(10)]
+    hop = [10_000 * k for k in range(10)]
+    stamps, handoff = [], []
+    for s, h in zip(sent, hop):
+        # Two streamed outputs in one message, then the finished sequence, whose
+        # send stamp trails its receipt.
+        put = s + 5 * 10**6
+        stamps += [f"{s} 1 send {s - 50} 0", f"{s + 7} 1 head {s + 5} 0"]
+        got = [put + 100_000 + h + p for p in (0, 5, 10)]
+        stamps += [f"{g} 2 out {g} 0" for g in got]
+        handoff += [
+            {"t_out_put_ns": put, "t_out_sent_ns": put + 50, "rows": 2},
+            {"t_out_put_ns": put + 10, "t_out_sent_ns": got[2] + 20, "rows": 1},
+        ]
+        # Request 0 finds the engine idle, and its receipt waits.
+        idle = 5 * 10**6 if s == sent[0] else 0
+        handoff.append({"t_recv_ns": s + 200_000 + h + idle, "t_in_put_ns": 0})
+    # An output before the first request.
+    handoff.append({"t_out_put_ns": 0, "t_out_sent_ns": sent[0] - 10**9, "rows": 1})
+    admitted = [s + 7 + 400_000 + h for s, h in zip(sent, hop)]
+    paths = [tmp_path / name for name in ("stamps", "handoff", "arrivals")]
+    paths[0].write_text("\n".join(stamps[::-1]) + "\n")
+    paths[1].write_text("".join(json.dumps(line) + "\n" for line in handoff))
+    paths[2].write_text(json.dumps({"sent_ns": sent, "admitted_ns": admitted}))
+    got = probe.hops(*map(str, paths))
+    for name, median in (("request", 250e-6), ("output", 145e-6), ("stream", 445e-6)):
+        assert got[name]["median_s"] == pytest.approx(median), name
+    assert (got["request"]["p10_s"], got["request"]["p90_s"]) == pytest.approx(
+        (218e-6, 282e-6)
+    )
+    assert [got[k]["messages"] for k in ("request", "output", "stream")] == [9, 20, 10]
+    # With the step record, the request hop again over receipts 4 to 8, the
+    # ones inside a forward.
+    steps = tmp_path / "dp0.jsonl"
+    recvs = [h["t_recv_ns"] for h in handoff if "t_recv_ns" in h]
+    steps.write_text(
+        "".join(
+            json.dumps({"t_enter_ns": recvs[a] - 1, "t_exit_ns": recvs[b] + 1}) + "\n"
+            for a, b in ((6, 8), (4, 5))
+        )
+    )
+    got = probe.hops(*map(str, paths), str(steps))
+    assert got["request_forward"]["messages"] == 5
+    assert got["request_forward"]["median_s"] == pytest.approx(260e-6)
+    assert got["request"]["messages"] == 9
+    assert got["steps"] == "sha256:" + hashlib.sha256(steps.read_bytes()).hexdigest()
+    # A request the engine never received pairs nothing.
+    paths[1].write_text(
+        "".join(json.dumps(line) + "\n" for line in handoff[:2] + handoff[3:])
+    )
+    with pytest.raises(
+        SystemExit, match="request: 8 arrivals, not one after each of 9"
+    ):
+        probe.hops(*map(str, paths))
+    # Nor does a message with a row the server never took in.
+    paths[1].write_text("".join(json.dumps(line) + "\n" for line in handoff))
+    paths[0].write_text("\n".join(r for r in stamps if " out " not in r) + "\n")
+    with pytest.raises(SystemExit, match="output: 0 rows taken in, not the 30 sent"):
+        probe.hops(*map(str, paths))
+
+
+def test_a_head_the_client_read_before_its_send_returned_is_left_out(tmp_path):
+    sent = [10**12 + k * 10**9 for k in range(4)]
+    stamps = [f"{s} 1 send {s - 50} 0" for s in sent]
+    # Each head's send call takes 1 ms; the client reads the third's inside it.
+    stamps += [f"{s + 10**6} 1 head {s} 0" for s in sent]
+    admitted = [s + 10**6 + 150_000 for s in sent]
+    admitted[2] = sent[2] + 500_000
+    handoff = [{"t_recv_ns": s + 100_000, "t_in_put_ns": 0} for s in sent]
+    handoff += [{"t_out_put_ns": s + 3 * 10**6, "rows": 1} for s in sent]
+    stamps += [f"{s + 3 * 10**6 + 9} 2 out {s + 3 * 10**6 + 9} 0" for s in sent]
+    paths = [tmp_path / name for name in ("stamps", "handoff", "arrivals")]
+    paths[0].write_text("\n".join(stamps) + "\n")
+    paths[1].write_text("".join(json.dumps(line) + "\n" for line in handoff))
+    paths[2].write_text(json.dumps({"sent_ns": sent, "admitted_ns": admitted}))
+
+    stream = probe.hops(*map(str, paths))["stream"]
+
+    assert stream["messages"] == 3 and stream["median_s"] == pytest.approx(150e-6)
+
+
+def test_serve_stamps_each_kv_write_request_sent_and_received_in_a_spawned_process(
+    tmp_path,
+):
+    server = SERVER | {
+        "kv_transfer/__init__.py": "",
+        "kv_transfer/disaggregation/__init__.py": "",
+        "kv_transfer/disaggregation/mooncake/__init__.py": "",
+        "kv_transfer/disaggregation/mooncake/mooncake_connector.py": """
+import contextlib
+MSG_WRITE_REQUEST, MSG_WRITE_DONE = b"write_request", b"write_done"
+
+class Socket:
+    def __init__(self):
+        self.parts = [[b"id", MSG_WRITE_DONE, b""], [b"id", MSG_WRITE_REQUEST, b""]]
+
+    def recv_multipart(self):
+        return self.parts.pop()
+
+@contextlib.contextmanager
+def zmq_socket_ctx(path, kind, bind=None):
+    yield Socket()
+
+class MooncakeConnector:
+    def _send_on_socket(self, addr, parts, repeat=1):
+        pass
+""",
+        "worker.py": """
+from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+def work():
+    mc.MooncakeConnector()._send_on_socket("tcp://a", [mc.MSG_WRITE_REQUEST, b""])
+    mc.MooncakeConnector()._send_on_socket("tcp://a", [mc.MSG_WRITE_DONE, b""])
+    with mc.zmq_socket_ctx("tcp://*:1", "ROUTER", bind=True) as sock:
+        assert [sock.recv_multipart()[1] for _ in range(2)] == [
+            mc.MSG_WRITE_REQUEST, mc.MSG_WRITE_DONE
+        ]
+""",
+        "entrypoints/openai/api_server.py": """
+import multiprocessing
+from atom.worker import work
+
+if __name__ == "__main__":
+    p = multiprocessing.get_context("spawn").Process(target=work)
+    p.start()
+    p.join()
+    assert p.exitcode == 0
+""",
+    }
+    for name, text in server.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    stamps = tmp_path / "stamps"
+    subprocess.run(
+        [sys.executable, PROBE, "serve", stamps],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path)),
+        check=True,
+    )
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    # Only the write requests; the server process itself sent none.
+    assert [r[2] for r in rows] == ["kvsend", "kvrecv"]
+    assert int(rows[0][3]) <= int(rows[0][0]) <= int(rows[1][0])
+
+
+def test_pd_pairs_each_kv_write_request_with_its_receipt_in_order(tmp_path):
+    sent = [10**12 + k * 10**7 for k in range(10)]
+    # Each received 100 us + 10 us k after its send call started, most before
+    # that call returned.
+    got = [s + 100_000 + 10_000 * k for k, s in enumerate(sent)]
+    rows = [f"{s + 150_000} 1 kvsend {s} 0" for s in sent]
+    rows += [f"{g} 2 kvrecv {g} 0" for g in got] + [f"{sent[0]} 3 send 0 0"]
+    stamps = tmp_path / "stamps"
+    stamps.write_text("\n".join(rows[::-1]) + "\n")
+    hop = probe.pd(str(stamps))["kv_write_req"]
+    assert hop["median_s"] == pytest.approx(145e-6)
+    assert (hop["p10_s"], hop["p90_s"]) == pytest.approx((109e-6, 181e-6))
+    assert hop["messages"] == 10
+    # A write request prefill never received pairs nothing.
+    stamps.write_text("\n".join(r for r in rows if str(got[3]) not in r) + "\n")
+    with pytest.raises(
+        SystemExit, match="kv_write_req: 9 arrivals, not one after each of 10"
+    ):
+        probe.pd(str(stamps))
+
+
+def test_pd_splits_the_hop_by_prefill_s_state_at_each_receipt(tmp_path):
+    ms, base = 10**6, 10**12
+    sent = [base + k * 10 * ms for k in range(6)]
+    # Two receipts between forwards, two inside the forward's launches, two
+    # inside it after them.
+    hops_ns = [400_000, 400_000, 2 * ms, 3 * ms, 100_000, 200_000]
+    rows = [f"{s} 1 kvsend {s} 0" for s in sent]
+    rows += [f"{s + h} 2 kvrecv {s + h} 0" for s, h in zip(sent, hops_ns)]
+    stamps, steps = tmp_path / "stamps", tmp_path / "dp0.jsonl"
+    stamps.write_text("\n".join(rows) + "\n")
+    forwards = [(base - 5 * ms, base - ms, base - 4 * ms), (base + 19 * ms, base + 60 * ms, base + 38 * ms)]  # fmt: skip
+    steps.write_text(
+        "".join(
+            json.dumps({"t_enter_ns": e, "t_exit_ns": x, "t_launch_ns": [e, l]}) + "\n"
+            for e, x, l in forwards
+        )
+    )
+    out = probe.pd(str(stamps), str(steps))
+    by = out["by_state"]
+    assert {k: v["messages"] for k, v in by.items()} == {
+        "forward": 4,
+        "idle": 2,
+        "launch": 2,
+        "outside": 2,
+    }
+    assert by["idle"]["median_s"] == pytest.approx(400e-6)
+    assert by["launch"]["median_s"] == pytest.approx(2.5e-3)
+    assert by["outside"]["median_s"] == pytest.approx(150e-6)
+    assert by["forward"]["p10_s"] == pytest.approx(130e-6)
+    assert out["kv_write_req"]["messages"] == 6
+    assert out["steps"] == "sha256:" + hashlib.sha256(steps.read_bytes()).hexdigest()

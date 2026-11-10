@@ -30,29 +30,18 @@ def _script():
     return _load("mi455_spec")
 
 
-@pytest.mark.parametrize("machine, sweep", [(A0, True), (B0, False)])
-def test_each_mi455_spec_rebuilds_byte_for_byte(tmp_path, machine, sweep):
+@pytest.mark.parametrize("machine", [A0, B0])
+def test_each_mi455_spec_rebuilds_byte_for_byte(tmp_path, machine):
     out = tmp_path / machine.name
     stepping = machine.stem.removeprefix("mi455-")
-    swept = ["--sweep-from", str(machine)] if sweep else []
-    assert _script().main([stepping, *swept, "--out", str(out)]) == 0
+    assert _script().main([stepping, "--out", str(out)]) == 0
     assert out.read_bytes() == machine.read_bytes()
-
-
-def test_b0_refuses_a_tokenizer_sweep_as_its_host_is_carried(capsys):
-    with pytest.raises(SystemExit):
-        _script().main(["b0", "--sweep-from", str(A0)])
-    assert "b0 sweeps no tokenizer" in capsys.readouterr().err
 
 
 def test_each_a0_device_field_is_probed_or_the_datasheet_and_the_rest_assumed():
     a0, peaks = _spec(A0), _script().PEAKS
     origins = {label: a0.origin(label)["origin"] for label in labels(a0)}
     assert {p for p, o in origins.items() if o == "assumed"} == {
-        "host.ipc.zmq_roundtrip_s",
-        "host.ipc.shm_broadcast_s",
-        "host.http_intake.fixed_s",
-        "host.http_intake.per_byte_s",
         "interconnect.inter_node.link_latency_s",
         "interconnect.inter_node.derate",
         "interconnect.router_relay_s",
@@ -77,7 +66,6 @@ def test_each_a0_device_field_is_probed_or_the_datasheet_and_the_rest_assumed():
         assert band["p10"] <= a0.value(path) <= band["p90"]
     found, peak = peaks[2], a0.value("device.compute.fp4_flops")
     assert a0.value("device.compute.derate.fp4") == found["fp4"] / peak
-    assert origins["host.tokenizers[deepseek-v4.1-flash fast]"] == "probed"
 
 
 def test_b0_shares_a0_s_peaks_and_carries_mi355x_s_ratios_never_a0_s_readings():
@@ -114,6 +102,22 @@ def test_b0_shares_a0_s_peaks_and_carries_mi355x_s_ratios_never_a0_s_readings():
         "MI455X B0 gfx1250",
     )
     assert a0_key["software_stack"] != b0_key["software_stack"]
+
+
+def test_a_run_on_a0_charges_the_intake_the_node_s_bursts_fitted(monkeypatch, tmp_path):
+    """The frontend loop's intake a simulated run on A0 charges: its law file's
+    host entry's."""
+    from atom.compass import run as compass_run
+
+    run = tmp_path / "run.json"
+    law = SCRIPTS / "laws" / "deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json"
+    host = json.loads(law.read_text())["host"]
+    terms = host["http_intake"]
+    run.write_text(json.dumps({"bound_s": 600.0, "host": host}))
+    monkeypatch.setenv(compass_run.ENV, str(run))
+    fixed = terms["fixed_s"]
+    # No lone request was timed on the node, so the fixed term stands for idle.
+    assert compass_run.http_intake() == (fixed, terms["per_byte_s"], fixed)
 
 
 #: rocm-smi's listing of GPU 0 on the MI455 node, 2026-10-27: the series is no

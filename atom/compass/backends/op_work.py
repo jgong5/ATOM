@@ -572,6 +572,93 @@ def _index_fill(op, view, tp, kv) -> Work:
     return Work({}, index["shape"][0] * each + _bytes(index))
 
 
+def _draft_kv_tail(op, view, tp, kv) -> Work:
+    """V4.1 DSpark's draft-KV epilogue: `kv`'s rows read once and written back
+    as `_quantize` writes them, packed or rounded in place, and the stages'
+    norm weights and the positions read once. The rotary rows it reads by
+    position are left out, which only lowers M."""
+    args = op["args"]
+    rows = {"args": {"x": args["kv"], "dequantize": not args["packed"]}}
+    norms = _only("norm_weight", "positions")(op, view, tp, kv)
+    return _quantize(rows, view, tp, kv) + norms
+
+
+def _window_rows(op, view, tp, kv) -> Work:
+    """V4.1 DSpark's window gather: the ring of each of `layers` at each of
+    `slots` read and written once, and the indices."""
+    args = op["args"]
+    window = args["window"]
+    ring = math.prod(window["shape"][-2:]) * _size(window["dtype"])
+    rings = args["layers"]["shape"][0] * args["slots"]["shape"][0]
+    return Work({}, 2 * rings * ring) + _only("layers", "slots")(op, view, tp, kv)
+
+
+def _draft_indices(op, view, tp, kv) -> Work:
+    """V4.1 DSpark's block indices from each row's anchor position: the
+    positions read once, and per row its `width` positions, an int32 index
+    of every ring slot and block row for each of them, and each ring slot's
+    position written."""
+    args = op["args"]
+    positions = args["positions"]
+    ring, width, size = args["ring"], args["width"], _size(positions["dtype"])
+    each = (width + ring) * size + width * (ring + width) * _size("torch.int32")
+    return Work({}, _bytes(positions) + positions["shape"][0] * each)
+
+
+def _block_state(op, view, tp, kv) -> Work:
+    """V4.1 DSpark's block state: the anchors' and the noise's embeddings read
+    once, and each row's `width` positions written as `hc_mult` copies of the
+    embedding with an fp32 pre-mix each."""
+    args = op["args"]
+    (rows, hidden), dtype = args["anchor_embed"]["shape"], args["anchor_embed"]["dtype"]
+    copies = rows * args["width"] * args["hc_mult"]
+    written = copies * (hidden * _size(dtype) + _size("torch.float32"))
+    return _only("anchor_embed", "noise_embed")(op, view, tp, kv) + Work({}, written)
+
+
+def _block_attention(op, view, tp, kv) -> Work:
+    """DSpark's draft attention: each query of `q` attends every entry its row
+    of `topk_idxs` lists, two products of the head width per head and entry,
+    each argument read once and O written as `q`."""
+    args = op["args"]
+    q = args["q"]
+    *queries, heads, dim = q["shape"]
+    entries = math.prod(queries) * args["topk_idxs"]["shape"][-1]
+    products = Work({_fmt(q["dtype"]): 4 * heads * dim * entries}, _bytes(q))
+    return _boundary(op) + products
+
+
+def _markov(op, view, tp, kv) -> Work:
+    """DSpark's Markov head over a vocabulary shard: a GEMM of each row's
+    `markov_w1` row against the shard's `markov_w2` rows, whose output term is
+    `base_logits`, which it adds and reduces to an id rather than writes; and
+    the ids and the rows it picks and publishes read or written once."""
+    args = op["args"]
+    rows, shard = args["base_logits"]["shape"]
+    w2 = args["markov_w2"]
+    fmt, logits = _fmt(w2["dtype"]), _fmt(args["base_logits"]["dtype"])
+    picks = _only("prev_ids", "out", "packed", "embed_out")(op, view, tp, kv)
+    return gemm(rows, shard, w2["shape"][1], fmt, fmt, logits) + picks
+
+
+def _markov_argmax(op, view, tp, kv) -> Work:
+    """DSpark's Markov head over the whole vocabulary, as `_markov` prices a
+    shard's, the `markov_w1` rows it picks written as its output rather than
+    into an `embed_out`."""
+    published = _only(out=op["args"]["markov_w1"]["dtype"])(op, view, tp, kv)
+    return _markov(op, view, tp, kv) + published
+
+
+def _commit_cursors(op, view, tp, kv) -> Work:
+    """V4.1's tentative cursor commit: each of `count` requests' accepted
+    prefix's row read from `cursors` and written to its slot of `cursor`, and
+    the anchors, starts and slots read once."""
+    args = op["args"]
+    row = args["cursor"]["shape"][1] * _size(args["cursor"]["dtype"])
+    indices = _only("anchors", "starts", "slots")(op, view, tp, kv)
+    return Work({}, 2 * args["count"] * row) + indices
+
+
 def _shape(value):
     if isinstance(value, dict) and "dtype" in value:
         return value["shape"]
@@ -599,9 +686,11 @@ def _aten(op, view, tp, kv) -> Work | None:
     """Any aten operator: its boundary, each output in the dtype a meta-device
     call of it returns, and torch's flop formula when it has one. A view,
     which aliases its input, writes nothing and keeps the dtype, launches no
-    kernel; nor does an allocation."""
+    kernel; nor does a dtype view, which reads the same bytes as another
+    dtype, or an allocation. A cast, also aliased, copies when its dtype
+    differs."""
     name, args = op["op"], op["args"]
-    if name.startswith(ALLOCATIONS):
+    if name.startswith(ALLOCATIONS) or name == "aten.view.dtype":
         return None
     _, packet, overload = name.split(".")
     target = getattr(getattr(torch.ops.aten, packet), overload)
@@ -777,6 +866,7 @@ EXTRACTORS |= {
         "q", "k", read=("q_weight", "k_weight")
     ),
     "aiter.dynamic_per_token_scaled_quant.default": _only("input", "out", "scales"),
+    "aiter.dynamic_per_group_scaled_quant.default": _only("input", "out", "scales"),
     "aiter.v41_mhc_pre_delayed.default": _mhc_delayed,
     f"{V41}mhc:collapse_streams": _only("residual", "pre_mix"),
     "atom.model_ops.engram.device.gate:engram_post_wkv": _only(
@@ -817,6 +907,25 @@ EXTRACTORS |= {
             f"{V41}candidate_table:lift_candidate_selection",
         ),
         _launch,
+    ),
+}
+#: DeepSeek-V4.1's DSpark drafter's kinds: its draft-KV pass and its block.
+DSPARK = "atom.model_ops.deepseek_v41.dspark:"
+MARKOV = "atom.model_ops.dspark_markov_sample:"
+EXTRACTORS |= {
+    DSPARK + "fused_draft_kv_tail": _draft_kv_tail,
+    DSPARK + "gather_window_rows": _window_rows,
+    DSPARK + "draft_step_indices": _draft_indices,
+    DSPARK + "build_block_state": _block_state,
+    "atom.model_ops.sparse_attn_v4:_sparse_attn_triton": _block_attention,
+    MARKOV + "_launch": _markov,
+    "aiter.dspark_markov_argmax.default": _markov_argmax,
+    MARKOV + "argmax_gather": _in_place("out"),
+    "atom.spec_decode.dspark_proposer:DSparkProposer._stage_anchors": _only(
+        "next_token_ids", "rows"
+    ),
+    "atom.model_ops.attentions.deepseek_v41.speculative:_launch_commit_cursors": (
+        _commit_cursors
     ),
 }
 #: Every kind whose extractor takes the EP width, as a fifth parameter.

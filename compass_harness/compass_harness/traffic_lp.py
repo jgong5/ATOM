@@ -11,8 +11,11 @@ every stream event the Clock Authority released has been reported by a worker,
 every credit whose final event is released has had its return passed to
 aiperf (a return that comes before its final event's release waits for it, so
 the next turn is scheduled from the final arrival either way), no return is
-still inside aiperf's callback, and every task on the loop is waiting on
-something. It asks for time only while a request is open, a clock wait (a
+still inside aiperf's callback, every task on the loop is waiting on
+something, and the done callbacks of a task that ended have run: the
+scheduler's drain observer, which rechecks the system idle cap once a timer's
+task ends, is one, and the clock moving on before it would let an idle gap run
+past the cap. It asks for time only while a request is open, a clock wait (a
 pacing timer, a phase deadline, the idle watchdog) is pending or the run is
 finishing; between phases aiperf works on the wall clock and the simulation
 waits for it. While a request is open it asks for a phase deadline as a
@@ -37,6 +40,7 @@ import asyncio
 import logging
 import math
 import os
+import pickle
 
 import zmq
 import zmq.asyncio
@@ -94,6 +98,10 @@ class TrafficLP:
         self._returns: asyncio.Queue = asyncio.Queue()  # passed in order, as upstream
         self._waiters: list[tuple[float, asyncio.Future, bool]] = []
         self._passing = False  # a return is inside aiperf's callback
+        # The tasks not done at the hold's last look. The loop does not turn while
+        # the owner is in a clock call, so the next hold starts from them; None
+        # once the loop may have turned with no look.
+        self._alive: set | None = None
         self._finishing = False
         self._changed = asyncio.Event()
         self._tasks = [
@@ -130,12 +138,9 @@ class TrafficLP:
     def now(self) -> float:
         return self.rt.now
 
-    async def advance_to(self, t: float) -> None:
-        """Return at the next grant; the scheduler then reads its timers again."""
-        await self.wait(t)
-
     def wait(self, t: float, phase_deadline: bool = False) -> asyncio.Future:
-        """A clock wait for ``t``, resolved at the next grant or by ``withdraw``.
+        """A clock wait for ``t``, resolved at the grant that reaches it or by
+        ``withdraw``.
 
         A `phase_deadline` is asked for as a daemon deadline while a request
         is open, and a wait due at or past it only once it has fired.
@@ -232,16 +237,28 @@ class TrafficLP:
 
     async def _read_reports(self) -> None:
         while True:
-            report = await self._pull.recv_pyobj()
-            self._changed.set()
-            if len(report) == 1:  # a worker wrote this request's cancel
-                self._written.add(report[0])
-                continue
-            key, seq, arrival, final = report
-            # A cancelled request's seq may be dropped already, before its report.
-            if key not in self.cancelled:
-                self.rt.check_arrival(self.stream, arrival, seq)
-            self._reports[seq] = (key, final)
+            self._take(await self._pull.recv_pyobj())
+
+    def _take_queued(self) -> None:
+        """Take the reports already queued without a turn of the event loop:
+        most reach the socket while the owner is blocked in a clock call."""
+        while True:
+            try:
+                frame = self._pull.recv(zmq.NOBLOCK).result()
+            except zmq.Again:
+                return
+            self._take(pickle.loads(frame))
+
+    def _take(self, report) -> None:
+        self._changed.set()
+        if len(report) == 1:  # a worker wrote this request's cancel
+            self._written.add(report[0])
+            return
+        key, seq, arrival, final = report
+        # A cancelled request's seq may be dropped already, before its report.
+        if key not in self.cancelled:
+            self.rt.check_arrival(self.stream, arrival, seq)
+        self._reports[seq] = (key, final)
 
     async def _pass_returns(self) -> None:
         while True:
@@ -260,6 +277,7 @@ class TrafficLP:
             await self._settle()
             if not (self.open or self._waiters or self._finishing):
                 self._changed.clear()
+                self._alive = None
                 await self._changed.wait()
                 continue
             t, deadline = math.inf, math.inf
@@ -278,15 +296,20 @@ class TrafficLP:
 
     async def _settle(self) -> None:
         """Hold until every released event is reported and aiperf has caught up."""
-        for _, fut, _ in self._waiters:  # wake the scheduler to read its timers again
-            fut.set_result(None)
-        self._waiters.clear()
+        waiting = []
+        for wait in self._waiters:  # resolve the waits this grant made due
+            if wait[0] <= self.rt.now:
+                wait[1].set_result(None)
+            else:
+                waiting.append(wait)
+        self._waiters = waiting
         spins = 0
         while True:
             # A reader that raised fails the run instead of leaving the hold waiting.
             for task in self._tasks:
                 if task.done():
                     task.result()
+            self._take_queued()
             unreported, unreturned = [], []
             # A handled seq leaves the runtime's released set, so a pass scans
             # only the open events, not every event of the run. It stops at the
@@ -314,6 +337,7 @@ class TrafficLP:
                 self.closed.clear()
             if unreported or unreturned or self._passing:
                 self._changed.clear()
+                self._alive = None
                 try:
                     await asyncio.wait_for(self._changed.wait(), DIAG_S)
                 except TimeoutError:
@@ -334,8 +358,8 @@ class TrafficLP:
                         DIAG_S,
                     )
                 continue
-            ready = _ready_tasks()
-            if not ready:
+            ready, self._alive, ended = _look(self._alive)
+            if not ready and not ended:
                 if not self._caught_up:
                     return
                 for fut in self._caught_up:
@@ -360,14 +384,23 @@ class TrafficLP:
             )
 
 
-def _ready_tasks() -> list[str]:
-    """The tasks on this loop, but the current one, not waiting on a pending future."""
+def _look(alive: set | None) -> tuple[list[str], set, bool]:
+    """One look at this loop's tasks, but the current one.
+
+    Returns the names of those not waiting on a pending future, those not done,
+    and whether one of ``alive``, the tasks not done at the last look, has ended
+    since. A task that ends queues its done callbacks behind the current task,
+    so they run only on the loop's next turn; with ``alive`` None, after turns
+    of the loop no look saw, whether one has ended is unknown, and it reads as
+    one.
+    """
     me = asyncio.current_task()
+    tasks = {task for task in asyncio.all_tasks() if task is not me and not task.done()}
     # ponytail: Task._fut_waiter is private; a loop-level idle hook would not be.
-    return [
+    ready = [
         task.get_name()
-        for task in asyncio.all_tasks()
-        if task is not me
-        and not task.done()
-        and (task._fut_waiter is None or task._fut_waiter.done())
+        for task in tasks
+        if task._fut_waiter is None or task._fut_waiter.done()
     ]
+    ended = alive is None or any(task.done() for task in alive)
+    return ready, tasks, ended

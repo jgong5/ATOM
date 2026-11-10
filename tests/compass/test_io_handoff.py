@@ -150,7 +150,7 @@ def test_the_reader_buckets_an_output_by_its_steps_batch(tmp_path):
     for name, lines in (("dp0.jsonl", steps), ("dp0.handoff.jsonl", stamps)):
         (tmp_path / name).write_text("".join(json.dumps(x) + "\n" for x in lines))
 
-    rows = handoff.report(tmp_path)
+    rows = handoff.report(tmp_path, 107e-6)
 
     assert "| out | 1 | 1 | 200.0 | 200.0 | 10000 | 2.00% |" in rows
     assert "| out | 2 | 1 | 50.0 | 50.0 | 10000 | 0.50% |" in rows
@@ -160,6 +160,6 @@ def test_the_reader_buckets_an_output_by_its_steps_batch(tmp_path):
         "every p99 but queue's under 1% of its step: no",
         (
             "p10 at prompt bucket 64: recv+queue 25.0 us, recv+past pull 15.0 us; "
-            "ipc_s 61.0 us"
+            "ipc_s 107.0 us"
         ),
     ]

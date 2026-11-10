@@ -33,7 +33,9 @@ Drafter. A module with a `draft` width is a block drafter's: after the
 target, it runs once for each request that samples, on that many tokens:
 every decode row, or on a prefill one finishing row, counted as above. One
 whose `draft` is `CONTEXT` runs on the target's rows, writing the drafter's
-KV, and replays as the target's modules do.
+KV, and replays as the target's modules do. On a step that samples, a decode
+step or a prefill that produces output, that pass runs before
+`forward_done_event`, inside the target's time.
 
 Two-batch overlap. A step the data-parallel group split (`tbo_tokens`) runs
 this rank's tokens as two micro-batches, cut at the first one's token count,
@@ -50,7 +52,9 @@ seconds under its largest bound and its collectives' as `comm.latency` and
 `comm.transfer`, a fused module's under the largest of all (`work.binding`);
 ``roofline.tbo``'s is empty. A drafter's modules price the step's
 `draft_terms`, ``draft roofline.<kind>``, each at 0 s where it runs nothing,
-so a step under a drafter always states its draft.
+so a step under a drafter always states its draft; on a step that samples,
+its draft-KV pass prices among the target's terms instead, named
+``draft_kv roofline.<kind>``.
 
 Refused: a step with image tokens, since nothing here prices the vision
 encoder that fills them; any step, while the walk found a module it could not
@@ -118,6 +122,7 @@ UNCLASSIFIED = "unclassified"
 #: The `draft` of a drafter's module that runs on the target's rows.
 CONTEXT = -1
 DRAFT = "draft "
+DRAFT_KV = "draft_kv "
 
 
 @dataclasses.dataclass(frozen=True)
@@ -310,10 +315,14 @@ def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     # Pad rows all carry token 0 at position 0, so they route as one token.
     distinct = rows if real is None else min(rows, real + 1)
     routed, groups = rows * k, activated_experts(experts, k, distinct)
+    dealt = rows
     if local < experts:
         routed, groups = max_rank_load(rows, k, experts, ranks), groups / ranks
-    # Every row also runs through each shared expert the kernel holds.
-    picks, groups = routed + rows * shared, groups + shared
+        # aiter's top-k table deals each row's shared experts, pad rows too,
+        # to rank `row mod ranks`; each rank holds their weights.
+        dealt = -(-rows // ranks)
+    # The rows it is dealt also run through each shared expert it holds.
+    picks, groups = routed + dealt * shared, groups + shared
     flops = grouped_gemm(picks, 2 * inter, hidden, groups, m.act, m.fmt)
     flops += grouped_gemm(picks, hidden, inter, groups, m.act, m.fmt)
     ids = 2 * (k + shared) * ELEMENT_BYTES["fp32"]
@@ -657,13 +666,17 @@ class StepRooflineBackend(CostBackend):
         if split:
             split = self._overlapped(batch_view, refuse, target[0], target[2])
         drafts: tuple[dict, dict, dict] = ({}, {}, {})
+        kv: tuple[dict, dict, dict] = ({}, {}, {})
+        samples = bool(decode or batch_view.produces_output)
         for m, count in self.drafted.items():
-            self._add(m, count, self._at(m, batch_view, tokens), 0, refuse, drafts)
+            sums = kv if samples and m.draft == CONTEXT else drafts
+            self._add(m, count, self._at(m, batch_view, tokens), 0, refuse, sums)
         if refuse:
             reasons = dict.fromkeys(refuse)
             raise CostRefused(batch_view, [Refusal(SOURCE, r) for r in reasons])
         tbo = {"tbo": f"the layers' two micro-batches of {split} tokens overlapped"}
         terms = self._terms(target, "", f"at {tokens} tokens", tbo)
+        terms += self._terms(kv, DRAFT_KV, "of the drafter's KV pass")
         draft = self._terms(drafts, DRAFT, "of the drafter")
         return StepCost(terms, draft_terms=draft)
 
