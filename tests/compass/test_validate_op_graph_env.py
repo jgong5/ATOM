@@ -13,19 +13,24 @@ import json
 from types import SimpleNamespace
 
 from test_artifact_store import (
-    CONDITIONS,
-    GATES,
     clean_checkout,  # noqa: F401  autouse
     stanza,
 )
 from test_memory_readings import DOCUMENT
 from test_op_graph import g as gemm_leaf
-from test_op_graph_arch import ENGINE, RANK
+from test_op_graph_arch import ENGINE, RANK, run_readings
 from test_validate_main import _as_recorded, _deploy, _graded, _rows
 from test_work import CURVE, FLOOR
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
-from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
+from atom.compass.artifacts import (
+    ArtifactStore,
+    GateState,
+    Key,
+    Kind,
+    Topology,
+    member_name,
+)
 from atom.compass.backends.work import gemm, price
 from atom.compass.capture.forward import decode, prefill, structure
 from atom.compass.drive import run as drive_run
@@ -83,8 +88,8 @@ def _traced(monkeypatch, store, config, stated: dict, shapes) -> None:
                 Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape)),
                 provenance=stanza("compass trace ops"),
                 topology=Topology(),
-                conditions=CONDITIONS,
-                gates=GATES,
+                conditions=run_readings(config.model),
+                gates=GateState.of(),
                 members={member_name("graph", RANK, "json"): graph},
             )
 
