@@ -14,7 +14,7 @@ import uuid
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Lock, RLock, Thread, local
+from threading import Event, Lock, RLock, Thread, local
 
 from atom.config import Config
 from atom.model_engine.collective_rpc import (
@@ -211,6 +211,7 @@ class CoreManager:
         """
         self.label = label
         self._closed = False  # Track whether already closed
+        self._engine_failed = Event()
         self.local_engine_count = local_engine_count
         self.global_engine_count = (
             local_engine_count if global_engine_count is None else global_engine_count
@@ -676,6 +677,7 @@ class CoreManager:
                         )
                         continue
                     if request_type == EngineCoreRequestType.SHUTDOWN:
+                        self._engine_failed.set()
                         logger.debug(
                             f"{self.label} (DP {dp_rank}): output thread receive SHUTDOWN request"
                         )
@@ -1804,6 +1806,16 @@ class CoreManager:
         return any(
             proc is not None and proc.is_alive() for proc in self.engine_core_processes
         )
+
+    def is_healthy(self) -> bool:
+        """Include reported nested-worker failures, even during slow teardown."""
+        if self._closed or self._engine_failed.is_set():
+            return False
+        local_procs = [p for p in self.engine_core_processes if p is not None]
+        try:
+            return bool(local_procs) and all(p.is_alive() for p in local_procs)
+        except ValueError:  # A concurrent shutdown closed a process handle.
+            return False
 
     def finished_procs(self):
         return any(
