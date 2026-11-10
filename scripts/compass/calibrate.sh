@@ -9,7 +9,11 @@
 # history form) and `compass fit host` on those records. It plans nothing: what
 # to record is its input. A decode rung N comes from a record at concurrency N
 # that starts every trajectory at its first turn
-# (https://github.com/jgong5/ATOM/issues/1840).
+# (https://github.com/jgong5/ATOM/issues/1840). The prefill law fits from trace
+# runs alone: with none, the law's `unfitted` names prefill. `compass fit host`
+# leaves them out, since a trace run's host segments ran under the profiler.
+# Every server but a trace run's starts with the blocking-call tool, which it
+# builds into OUT/tool (atom/compass/parity/README.md).
 #
 # Usage: calibrate.sh OUT RECORD...
 #   OUT             an absent or empty directory, or one an earlier run given
@@ -17,7 +21,8 @@
 #   RECORD          one record: its concurrency, then the client's scenario,
 #                   aiperf arguments client.sh takes as AIPERF_EXTRA_ARGS, if
 #                   any, such as "8 --trajectory-start-min-ratio 0
-#                   --trajectory-start-max-ratio 0"
+#                   --trajectory-start-max-ratio 0"; or `trace` and such a
+#                   record, as "trace 16", a `compass record --trace` of it
 #   MODEL           the model directory: config.json, tokenizer and weights
 #                   (required)
 #   GPU             the one GPU, as rocm-smi and `--gpu` number it (required);
@@ -28,6 +33,7 @@
 #                   the records' clients (required)
 #   CAL_TRACES      the traces each record's client is given (default 256-392)
 #   DURATION_S      each record's client run's benchmark duration (default 1800)
+#   TRACE_S         each trace run's client run's benchmark duration (default 120)
 #   SERVER_ARGS     ATOM's arguments after --model (default: --max-model-len
 #                   262144)
 #   WAIT_S          seconds a server has to start (default 1800)
@@ -46,6 +52,8 @@
 # the tokens, the law's held-out errors per band, the `compass run` line that
 # prices by the law, and the wall time. It exits 2 on bad arguments or inputs,
 # 90 to 99 as _lib.sh's tree checks refuse, else 1 naming the step that failed.
+# A trace run's directory is trace<k>-c<C>/, done once it holds busy lines,
+# which one refused at its stop lacks.
 set -uo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -57,10 +65,10 @@ compass_describe "$ROOT"
 (($# > 1)) || bad "no OUT or no RECORD; usage: calibrate.sh OUT RECORD..."
 OUT=$1
 shift
-for r; do [[ $r =~ ^[1-9][0-9]*( |$) ]] || bad "RECORD '$r' does not start with a concurrency"; done
+for r; do [[ $r =~ ^(trace )?[1-9][0-9]*( |$) ]] || bad "RECORD '$r' does not start with a concurrency"; done
 for v in MODEL GPU MACHINE TRACES AIPERF_PYTHON; do [[ -n ${!v-} ]] || bad "$v is not set"; done
 MODEL=$(realpath "$MODEL") MACHINE=$(realpath "$MACHINE")
-CAL=${CAL_TRACES:-256-392} DURATION_S=${DURATION_S:-1800} WAIT_S=${WAIT_S:-1800}
+CAL=${CAL_TRACES:-256-392} DURATION_S=${DURATION_S:-1800} WAIT_S=${WAIT_S:-1800} TRACE_S=${TRACE_S:-120}
 # shellcheck disable=SC2206 # SERVER_ARGS is a word list
 ATOM_ARGS=(--model "$MODEL" ${SERVER_ARGS:---max-model-len 262144})
 CLI='from atom.compass.cli import main; main()'
@@ -68,7 +76,7 @@ export MODEL TRACES
 sha=$(compass_head_sha "$ROOT") ||
     bad "$ROOT is neither a git checkout nor a snapshot.sh tree, and a fit refuses it"
 inputs=$(printf '%s\n' "tree $sha" "atom ${ATOM_ARGS[*]}" "machine $MACHINE" \
-    "traces $TRACES $CAL" "duration $DURATION_S" "${@/#/record }")
+    "traces $TRACES $CAL" "duration $DURATION_S" "trace duration $TRACE_S" "${@/#/record }")
 mkdir -p "$OUT" && OUT=$(realpath "$OUT")
 if [[ -e $OUT/inputs ]]; then
     diff "$OUT/inputs" <(echo "$inputs") >&2 || bad "$OUT was started with other inputs (<) than these (>)"
@@ -105,13 +113,15 @@ step() {
     wait $! || fail "$name" "exit $?; see $OUT/$name.log"
 }
 
-# serve NAME A-B C S SCENARIO: one compass record server writing to OUT/NAME,
-# and one client run of traces A to B at concurrency C for S seconds under
-# SCENARIO, which stops it.
+# serve NAME A-B C S SCENARIO [FLAG]: one compass record server, given FLAG,
+# writing to OUT/NAME, and one client run of traces A to B at concurrency C for
+# S seconds under SCENARIO, which stops it. A trace run's server (FLAG) loads
+# no tool.
 serve() {
-    local name=$1 dir=$OUT/$1 pid deadline
+    local name=$1 dir=$OUT/$1 pid deadline tool=(ROCP_TOOL_LIBRARIES="$TOOL")
+    [[ -n ${6-} ]] && tool=()
     say "$name"
-    python3 -c "$CLI" record --gpu "$GPU" --out "$dir" -- "${ATOM_ARGS[@]}" >"$OUT/$name.log" 2>&1 &
+    env "${tool[@]}" python3 -c "$CLI" record --gpu "$GPU" ${6:+"$6"} --out "$dir" -- "${ATOM_ARGS[@]}" >"$OUT/$name.log" 2>&1 &
     pid=$!
     deadline=$((SECONDS + WAIT_S))
     until [[ -s $dir/server.json ]]; do
@@ -129,25 +139,29 @@ M=(--machine "$MACHINE" --store "$OUT/store")
 # client.sh --stop marks its export `server_stopped` once the server has
 # stopped and written run.json.
 STOPPED=(artifacts/client_run.json '"server_stopped": true')
+TOOL=$OUT/tool/libcompass_blocked.so
+todo tool "${TOOL##*/}" && step tool python3 -m atom.compass.parity.blocked "$OUT/tool"
 todo warm "${STOPPED[@]}" && serve warm 0-7 1 600 ""
 todo memory memory_readings.json &&
     step memory python3 -c "$CLI" measure memory --gpu "$GPU" "${M[@]}" --out "$OUT/memory" -- "${ATOM_ARGS[@]}"
-k=0 dirs=() runs=()
+k=0 dirs=() runs=() cal=() cal_runs=()
 for r; do
-    read -r c scenario <<<"$r"
-    name=cal$((++k))-c$c
-    if todo "$name" "${STOPPED[@]}"; then
+    read -r c scenario <<<"${r#trace }"
+    name=cal$((++k))-c$c done_file=("${STOPPED[@]}") flag= d=$DURATION_S
+    [[ $r == trace\ * ]] && name=trace$k-c$c done_file=(steps/dp0.busy.jsonl) flag=--trace d=$TRACE_S
+    if todo "$name" "${done_file[@]}"; then
         for f in fit_steps/step_linear_law.json fit_host/host_laws.json; do
             [[ -e $OUT/$f ]] && fail "$name" "$OUT/$f was fitted without it, and the store refuses a second fit of its key; calibrate into a new OUT"
         done
-        serve "$name" "$CAL" "$c" "$DURATION_S" "$scenario"
+        serve "$name" "$CAL" "$c" "$d" "$scenario" ${flag:+"$flag"}
     fi
     dirs+=("$OUT/$name") runs+=(--client-run "$OUT/$name" "$OUT/$name/artifacts/client_run.json")
+    [[ -z $flag ]] && cal+=("$OUT/$name") cal_runs+=("${runs[@]: -3}")
 done
 todo fit_steps step_linear_law.json && step fit_steps python3 -c "$CLI" fit steps \
     --backend step-linear --form history "${dirs[@]}" "${runs[@]}" "${M[@]}" --out "$OUT/fit_steps"
 todo fit_host host_laws.json &&
-    step fit_host python3 -c "$CLI" fit host "${dirs[@]}" "${runs[@]}" "${M[@]}" --out "$OUT/fit_host"
+    step fit_host python3 -c "$CLI" fit host "${cal[@]}" "${cal_runs[@]}" "${M[@]}" --out "$OUT/fit_host"
 
 token() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["token"])' "$OUT/$1"; }
 law=$(token fit_steps/step_linear_law.json) host=$(token fit_host/host_laws.json)

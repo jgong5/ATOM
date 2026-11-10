@@ -44,12 +44,6 @@ SHAPES = "--width 16 --prefill 2048 1"
 READ = "from atom.compass.capture import driverless\n"
 READ += f"driverless.card = {{0: {A0!r}}}.get\n"
 TRUTH = pathlib.Path(__file__).with_name("v41_capture_truth.py")
-#: The slots where ATOM passes the occurrences of one leaf two buffers, of
-#: which the bench binds one: a query's RoPE positions and a ratio-1 key's
-#: (#2865).
-SPLIT = {
-    ("aiter.rope_cached_positions_fwd_impl.default", "positions"),
-}
 #: A prefill whose forward runs the rows of its decoder's tail: its tail
 #: holds the whole prompt, a window of it.
 WINDOW = "--prefill 128 1"
@@ -63,6 +57,8 @@ PLANE_BOUND = {
     "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
     "atom.model_ops.deepseek_v41.indexer:_block_maxima",
 }
+#: V4.1's RoPE, over a query's heads or a ratio's index keys, one head.
+ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 #: V4.1's read of its state cursors back to the host, `.cpu()`, a copy into
 #: pageable memory, which no CUDA graph captures: `measure ops` refuses it.
 HOST_COPY = "aten.to.dtype_layout"
@@ -136,8 +132,8 @@ def test_each_leaf_takes_the_buffers_atom_s_capture_passes_it(rehearsed):
     table of its KV, and each index an aten index operator takes, is the
     buffer ATOM's own capture passes every occurrence of that leaf, or each of
     the two it passes its first and later ones (`ops.QUERIED`), by name and
-    offset, but `SPLIT`'s. aten's other leaves index nothing and launch the
-    same work on any values."""
+    offset. aten's other leaves index nothing and launch the same work on any
+    values."""
     got, truth = rehearsed
     wrong, checked = [], 0
     for r in [*got["cached"], *got["fresh"]]:
@@ -145,7 +141,7 @@ def test_each_leaf_takes_the_buffers_atom_s_capture_passes_it(rehearsed):
             slot = path.split(".")[0]
             if r["op"].startswith("aten.") and (r["op"], slot) not in ATEN_INDEX:
                 continue
-            if (r["op"], slot) in SPLIT or r["shape"] == "prefill T=128 B=1":
+            if r["shape"] == "prefill T=128 B=1":
                 continue
             want = {w for w in truth.get(r["leaf"], {}).get(path, []) if w != "?"}
             checked += bool(want)
@@ -168,3 +164,15 @@ def test_a_leaf_s_later_occurrences_take_what_atom_passes_them():
     got = [stub._copy(op, "sig", [{}], c)[0]["batch_ids"] for c in range(4)]
 
     assert [t.tolist() for t in got] == [[0, 1, 2, 3], [-1] * 4] * 2
+
+
+def test_each_rope_takes_its_query_s_or_its_ratio_s_key_positions(rehearsed):
+    """Each RoPE leaf takes the positions ATOM's capture passes it, at each
+    point: the query's and each ratio's keys' apart, a buffer a leaf."""
+    got, truth = rehearsed
+    for shape in ("decode B=16", "prefill T=2048 B=1"):
+        ropes = [r for r in got["cached"] if (r["op"], r["shape"]) == (ROPE, shape)]
+        taken = {r["leaf"]: r["identity"].get("positions") for r in ropes}
+        want = {s: truth.get(s, {}).get("positions") for s in taken}
+        assert {s: [n] for s, n in taken.items()} == want
+        assert len(set(taken.values())) == len(taken) >= 3
