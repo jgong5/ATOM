@@ -804,6 +804,45 @@ def test_a_v41_prefill_past_cached_tokens_picks_candidates_off_its_rows_blocks(
     assert units["block_tables"].shape == (1, 40)
 
 
+@pytest.mark.parametrize(
+    "arch, off, k, want",
+    [
+        ("gfx1250", False, 160, ops._TOPK),
+        ("gfx1250", False, 161, ops._PICK),
+        ("gfx950", False, 160, "its kernel on gfx950 is not known"),
+        ("gfx1250", True, 160, f"on gfx1250 under {ops.FLYDSL_OFF} is not known"),
+    ],
+)
+def test_a_v41_prefill_pick_widened_to_its_k_runs_the_top_k_aiter_dispatches_there(
+    monkeypatch, arch, off, k, want
+):
+    monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: arch)
+    monkeypatch.delenv(ops.FLYDSL_OFF, raising=False)
+    if off:
+        monkeypatch.setenv(ops.FLYDSL_OFF, "1")
+    records, I32 = [], "torch.int32"
+    monkeypatch.setattr(ops, "_journal", lambda path, got: records.extend(got) or got)
+    # the pick's HIP top-k as a prefill of 256 tokens traced it: 32 index blocks
+    pick = _leaf(
+        ops._PICK,
+        *[("logits", _t([256, 32], "activation")), ("next_n", 1)],
+        ("seqLens", _t([256], "activation", dtype=I32)),
+        ("indices", _t([256, k], "activation", dtype=I32)),
+        *[("numRows", 256), ("stride0", 32), ("stride1", 1), ("k", k)],
+    )
+    visible = list(range(1025, 1281))  # past 1024 cached tokens: 160 blocks
+    taken = _v41_index(monkeypatch, visible, [pick], prefill(256, 1), 1024)
+
+    [record], ends = records, [-(-v // 8) for v in visible]
+    if want not in (ops._TOPK, ops._PICK):
+        assert not taken and want in record["refused"]
+        return
+    [call] = taken
+    assert record["op"] == want and call["logits"].shape == (256, 160)
+    bounds = ("row_starts", "row_ends") if want == ops._TOPK else ("seqLens",)
+    assert [call[b].tolist() for b in bounds] == [ends] * len(bounds)
+
+
 def test_v41_index_leaves_rank_a_logits_plane_drawn_below_each_row_s_bound(
     monkeypatch,
 ):
