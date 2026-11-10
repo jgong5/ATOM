@@ -37,9 +37,12 @@ class _Recording(StepRecording):
         return time.monotonic_ns()
 
     @staticmethod
-    def device_event() -> torch.cuda.Event:
-        """A timing event recorded on the current stream: a real step's device stamps."""
-        event = torch.cuda.Event(enable_timing=True)
+    def device_event(event=None) -> torch.cuda.Event:
+        """`event`, or a new timing event, recorded on the current stream: a
+        real step's device stamps. torch creates a new event's device handle at
+        its first record."""
+        if event is None:
+            event = torch.cuda.Event(enable_timing=True)
         event.record()
         return event
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""A launch's bound on the host clock's lead is read just before its event is
-recorded, so a host that stalls after recording it does not lift the bound,
-and the MTP status copy's labels stay the copy's latency."""
+"""A launch's bound on the host clock's lead is read once its event exists and
+just before the event's record, so a host that stalls after the read does not
+lift the bound, and the MTP status copy's labels stay the copy's latency."""
 
 import pytest
 from test_mtp_clock_drift import COPY, DRIFT, LATE, _decodes
@@ -32,17 +32,24 @@ def test_a_stall_under_the_status_waits_margin_keeps_the_status_copy_label():
     assert waited == {n: pytest.approx(COPY * MS, abs=ANCHORS * DRIFT) for n in waited}
 
 
-def test_the_launch_is_read_before_its_event_is_recorded(tmp_path, monkeypatch):
+def test_the_launch_is_read_once_its_event_exists_and_before_its_record(
+    tmp_path, monkeypatch
+):
+    """torch creates an event at its first record: the launch's event is
+    recorded once, then the clock read, then the same event recorded again."""
     batches = _drive(tmp_path / "simulated", monkeypatch, {0: [0, 1]})[0][0]
     recorded, device = _recorded(batches[-1])
-    events = []  # the host clock once each launch's event is recorded
+    made, again = [], []  # (event, the host clock once made / before its record)
 
     class _Timed(recorded):
-        def device_event(self):
+        def device_event(self, event=None):
+            if event is not None:
+                again.append((event, self.step_clock_ns()))
+                return super().device_event(event)
             launch = self.queued == ["launch"]
             event = super().device_event()
             if launch:
-                events.append(self.step_clock_ns())
+                made.append((event, self.step_clock_ns()))
             return event
 
     device.tick = 10**12
@@ -52,6 +59,8 @@ def test_the_launch_is_read_before_its_event_is_recorded(tmp_path, monkeypatch):
         runner.forward(b)
     runner.exit()
     steps = read(tmp_path / "real")[0]
-    assert len(steps) == len(events) == len(batches)
-    for s, at in zip(steps, events):
-        assert s["t_gate_ns"][1] < s["t_launch_event_ns"] < at < s["t_launch_ns"][0]
+    assert len(steps) == len(made) == len(again) == len(batches)
+    for s, (event, t0), (recorded_again, t1) in zip(steps, made, again):
+        assert recorded_again is event
+        assert s["t_gate_ns"][1] < t0 < s["t_launch_event_ns"] < t1
+        assert t1 < s["t_launch_ns"][0]
