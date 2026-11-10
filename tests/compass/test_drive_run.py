@@ -753,8 +753,9 @@ def test_coverage_under_tbo_reads_a_step_its_dp_group_split_as_its_micro_batches
     monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
     traced = set(population_shapes([str(directory)], tbo=True))
 
-    def graph(phase, tokens, seqs, output, gathered=None):
-        if Shape(phase, tokens, seqs, gathered).at(len(ranks)) in traced:
+    def graph(phase, tokens, seqs, output, gathered=None, micro_batch=False):
+        shape = Shape(phase, tokens, seqs, gathered, None, micro_batch)
+        if shape.at(len(ranks)) in traced:
             return {"seq": [g(tokens, 64, 64)]}
 
     monkeypatch.setattr(compass_run, "_op_graphs", lambda *args, **kw: graph)

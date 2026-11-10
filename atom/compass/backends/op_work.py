@@ -761,6 +761,10 @@ EXTRACTORS = {
     "aiter._rope_rotate_activation_fp4quant.default": _only(
         "input", "positions", "out", "scale"
     ),
+    # The fp8 index query, which a P/D cell's fp8 indexer cache runs.
+    "aiter._rope_rotate_activation_fp8quant.default": _only(
+        "input", "positions", "out", "scale"
+    ),
     "aiter.batched_gemm_a8w8_mxscale.default": _batched_gemm,
     "aiter.indexer_score_topk.default": _indexer,
     "aiter.pa_sparse_prefill_fp8_opus.default": _v4_prefill,

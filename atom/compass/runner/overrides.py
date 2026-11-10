@@ -161,7 +161,8 @@ RPC_SURFACE: dict[str, bool] = {
     "flush_pp_send": True,
     "poll_forward_metrics": False,  # EngineUtilityHandler does not wait
     # EngineCore.__init__ hands the reply to its Scheduler; ATOM's own reads the
-    # prefill token graphs recorded, and this runner records none.
+    # prefill token graphs recorded, which this runner states without recording
+    # (`state_prefill_buckets`).
     "prefill_token_graphs": True,
     # Refused by `RefusedDynamicChunking`: a fit needs timed real forwards.
     "profile_dynamic_chunking": True,  # EngineCore.__init__ reads the reply
@@ -523,6 +524,34 @@ def schedulable_ladder(config: Any) -> list[int]:
     q = 1 + (spec.num_speculative_tokens if spec else 0)
     bound = min(config.max_num_seqs, config.max_num_batched_tokens // q)
     return sorted(s for s in config.capture_sizes if s <= bound)
+
+
+def state_prefill_buckets(runner: Any) -> tuple[int, ...]:
+    """State, recording none, the prefill token-graph buckets ATOM's capture
+    records (`ModelRunner._record_prefill_graphs`): `ATOM_TOKEN_GRAPH_SIZES`
+    up to `warmup_max_tokens`, when the attention builder
+    `supports_token_graph` and the runner is no disaggregated decode instance.
+    One `TokenGraph`, held on the runner, counts each among its prefill
+    recordings, so `TokenGraph.captured_sizes("prefill")` answers them, as
+    after a real capture: ATOM's `prefill_token_graphs` then has the scheduler
+    give a DP rank with no prefill of its own the group's dummy prefill, and
+    `ForwardMode.decide` pads a prefill step to its group's bucket. Returns
+    the buckets."""
+    builder = runner.attn_metadata_builder
+    if not builder.supports_token_graph or runner.config.disagg_is_decode:
+        return ()
+    from atom.utils import envs
+    from atom.utils.region_graph import TokenGraph
+
+    limit = runner.warmup_max_tokens()
+    graph = TokenGraph()
+    for n in envs.ATOM_TOKEN_GRAPH_SIZES:
+        if 0 < n <= limit:
+            # A recording's key is its tensor arguments' shapes, rows first.
+            graph._captured[("prefill", ((n,),))] = {"prefill"}
+    TokenGraph._sizes.clear()
+    vars(runner)["_prefill_token_graph"] = graph
+    return TokenGraph.captured_sizes("prefill")
 
 
 def _installed_backend(runner: Any) -> CostBackend:
@@ -1484,7 +1513,9 @@ class NonAllocatingRunner(
         `tbo_decode_graphs` is set as the base's capture sets it, so a decode
         the DP group splits replays where a real one does. An empty narrowed ladder is refused: ATOM's capture asserts
         on it, so that deployment never starts. The reply still sends `[]` for the batch sizes, since no
-        graph exists; the caller only formats it into a log line.
+        graph exists; the caller only formats it into a log line. The prefill
+        token-graph buckets the base's capture would record are stated
+        (`state_prefill_buckets`), so the scheduler and `decide` see them.
 
         `EngineCore.__init__` reaches this method only when `not enforce_eager
         and not disagg_is_decode`, so on an eager deployment the override never
@@ -1503,10 +1534,12 @@ class NonAllocatingRunner(
         self.tbo_decode_graphs = (
             self.config.enable_tbo_decode and not self._tr_hybrid_active()
         )
+        buckets = state_prefill_buckets(self)
         logger.info(
             "no cudagraph captured: there are no weights to trace; steps "
-            "dispatch on the ladder %s.",
+            "dispatch on the ladder %s and prefill token-graph buckets %s.",
             self.capture_sizes,
+            buckets,
         )
         return 0.0, [], 0
 
