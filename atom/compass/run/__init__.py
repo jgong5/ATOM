@@ -77,7 +77,8 @@ its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, and a law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
-holds at its shape and output, the run's TP and EP widths and KV cache format; capture traces
+holds at its shape and output, loaded under this process's torch, ATOM source
+and model (`_op_graphs`), the run's TP and EP widths and KV cache format; capture traces
 eager forwards, so a graph-mode run reads the eager graphs too; with
 ``price_list``, the fields of a `price_list` key ``store`` holds, loaded
 under this run's readings, it prices each leaf from it first; with
@@ -1940,8 +1941,23 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     ``lookup_wall_seconds``.
 
     Each graph read from the store is parsed once and then frozen out of the
-    collector's reach with the rest of the live heap (`parsed`)."""
-    from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
+    collector's reach with the rest of the live heap (`parsed`).
+
+    A graph the store holds, at a shape or holding G, is loaded through
+    `ArtifactStore.load` under this process's `graph_readings`, and its engine
+    config as it records it: that cell holds the tracer's own ATOM arguments,
+    which no reader restates, and the key's structure names the engine config
+    in their place."""
+    from atom.compass.artifacts import (
+        ArtifactStore,
+        Axis,
+        Conditions,
+        GateState,
+        Key,
+        Kind,
+        Row,
+        Topology,
+    )
     from atom.compass.capture import peers
     from atom.compass.capture.forward import (
         PerG,
@@ -1979,13 +1995,21 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         lazy["lazy_traces"] += 1
         lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
 
+    @functools.cache
+    def here() -> dict:
+        return graph_readings(config.model)
+
     def parsed(key) -> dict:
-        """The graph the store holds at `key`, parsed and frozen with the rest
-        of the live heap, a collection first so no garbage is kept, as
+        """The graph the store holds at `key`, loaded under `here` and the
+        engine config it records, parsed and frozen with the rest of the live
+        heap, a collection first so no garbage is kept, as
         `gc_utils.freeze_gc_heap` freezes the startup heap and under the same
         `ATOM_GC_FREEZE`: this lookup's caches keep what it parses alive, and
         every full collection walked all of it."""
-        graph = json.loads(store.read(key).read_member("graph", rank, "json"))
+        cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
+        conditions = Conditions.of(**here(), engine_config=cells[Axis.ENGINE_CONFIG])
+        entry = store.load(key, conditions=conditions, gates=GateState.of())
+        graph = json.loads(entry.read_member("graph", rank, "json"))
         if envs.ATOM_GC_FREEZE:
             gc.collect()
             gc.freeze()
@@ -2058,6 +2082,23 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
             lazy["lookup_wall_seconds"] = lazy.get("lookup_wall_seconds", 0) + spent
 
     return timed
+
+
+def graph_readings(model: str) -> dict:
+    """This process's readings, by axis, of an `op_graph` of the model `model`
+    names, less its engine config, each as `compass trace ops` takes it: its
+    torch, its ATOM source (`atom_source`) and the model's config.json; an axis
+    no op_graph depends on is unread, of a kind no entry records."""
+    import torch
+
+    from atom.compass.artifacts import Axis, Row, axes_of
+
+    unread = Reading("unread", f"no {Row.OP_GRAPH} depends on it")
+    return {a.field: unread for a in Axis if a not in axes_of(Row.OP_GRAPH)} | {
+        "torch": torch.__version__,
+        "atom_src": atom_source(),
+        "model": _file_digest(model, "config.json"),
+    }
 
 
 def _trace_process():
