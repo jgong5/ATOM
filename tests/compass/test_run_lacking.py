@@ -4,8 +4,7 @@
 The run is `test_drive_run`'s: its store and deployment, a law and host laws
 published as `test_drive_runfile` publishes them, a bundle as `bundle` does,
 and an op graph run as `op_graph_run` sets one up. ATOM's server loads a fast
-tokenizer with no tokenizer.json, which the suite's machine spec holds an
-entry for under ``Qwen3ForCausalLM``.
+tokenizer with no tokenizer.json.
 """
 
 import json
@@ -49,10 +48,9 @@ def lacked(out: str) -> list[str]:
     return re.findall(r"^lacking (.*)$", out, re.MULTILINE)
 
 
-def served(monkeypatch, config, architecture="Qwen3ForCausalLM"):
-    """`config` resolved from ATOM's arguments, a model of `architecture`, its
-    tokenizer a fast one with no tokenizer.json; no server starts."""
-    config.hf_config.architectures = [architecture]
+def served(monkeypatch, config):
+    """`config` resolved from ATOM's arguments, its tokenizer a fast one with no
+    tokenizer.json; no server starts."""
     monkeypatch.setattr(drive_run, "_config", lambda atom_args: config)
     tok = SimpleNamespace(is_fast=True, name_or_path=None)
     monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *args: tok)
@@ -63,7 +61,7 @@ def test_one_check_lists_every_missing_input_with_what_makes_it(
     tmp_path, monkeypatch, capsys
 ):
     r = deployment(tmp_path)
-    served(monkeypatch, r.config, "Qwen3MoeForCausalLM")
+    served(monkeypatch, r.config)
     shutil.rmtree(tmp_path / "store" / Kind.MEMORY_READINGS.value)
     flags = ["--step-linear", "0123456789ab", "--host-laws", "ba9876543210"]
     flags += ["--acceptance-record", str(tmp_path / "speculative")]
@@ -72,13 +70,11 @@ def test_one_check_lists_every_missing_input_with_what_makes_it(
 
     out = capsys.readouterr().out
     assert lacked(out) == [
-        "tokenizer entry: missing",
         "step linear law 0123456789ab: missing",
         "host laws ba9876543210: missing",
         "memory readings: missing",
         "acceptance record: missing",
     ]
-    assert "no tokenizer probed for 'Qwen3MoeForCausalLM'" in out
     assert "0 step_linear_law entries in" in out
     assert "made by: compass record, then compass fit host" in out
     made = f"--store {tmp_path / 'store'} -- --model {tmp_path}"
@@ -124,6 +120,33 @@ def test_check_meets_the_runner_s_own_refusal_of_a_law_from_another_engine_confi
     assert lacked(out) == ["step linear law: stale"]
     assert f"  refused: {installed.value}\n" in out
     assert "kv_cache_block_size 16 in the law and 32 here" in out
+
+
+def test_check_meets_the_server_s_refusal_of_a_tokenizer_from_another_backend(
+    tmp_path, monkeypatch, capsys
+):
+    r = deployment(tmp_path)
+    served(monkeypatch, r.config)
+    key = {**compass_run.host_key(r.config), "machine_spec": SPEC_DIGEST}
+    term = {"backend": "slow", "fingerprint": "sha256:" + "a" * 64}
+    params = {"key": key, "laws": LAWS, "tokenizer": term}
+    host = published(tmp_path, r, Kind.HOST_LAWS, host_laws_key(r), params)
+    flags = ["--step-stub", stub(tmp_path), "--host-laws", host.key.token()]
+    (tmp_path / "run_file.json").write_text(
+        json.dumps(runfile.build(*_parsed(tmp_path, *flags)))
+    )
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run_file.json"))
+    with pytest.raises(ValueError) as refused:
+        compass_run.tokenizer(llm_engine._load_tokenizer(str(tmp_path)), r.config)
+    monkeypatch.delenv(compass_run.ENV)
+
+    assert checked(tmp_path, *flags) == 1
+
+    out = capsys.readouterr().out
+    assert lacked(out) == ["host laws: stale"]
+    assert f"  refused: {refused.value}\n" in out
+    assert "fitted on the slow backend and the server loaded the fast one" in out
+    assert "made by: compass record, then compass fit host" in out
 
 
 def _parsed(tmp_path, *flags):

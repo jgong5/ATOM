@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: MIT
 """`compass run --check`: every input a run lacks, listed before any server.
 
-`lacking` resolves the run's inputs as `runfile.build` and the runner do,
-calling per input the function whose refusal the run would meet, so one
-lacking input hides no other: the machine spec; its entry for the tokenizer
-ATOM's server loads (`run.tokenizer_entry`); each store key a flag names
-(`runfile.resolve`); a step linear law and host laws held against this run's
-engine config, widths, machine spec and host key (`run.pick_fitted`,
-`run.refuse_unfitted_law`, `run.refuse_unfitted_host`); a step grid bundle's
-load; the configuration's memory readings; an op graph's price list; and an
+`lacking` resolves the run's inputs as `runfile.build`, the runner and the
+server do, calling per input the function whose refusal the run would meet,
+so one lacking input hides no other: the machine spec; each store key or law
+file a flag names (`runfile.resolve`); a step linear law and host laws held
+against this run's engine config, widths, machine spec and host key
+(`run.pick_fitted`, `run.refuse_unfitted_law`, `run.refuse_unfitted_host`),
+and the host laws' tokenizer term against the backend of the tokenizer ATOM's
+server loads (`run.tokenizer_term`); a step grid bundle's load; the
+configuration's memory readings; an op graph's price list; and an
 `--acceptance-record`. An input is missing when nothing resolves for it, and
 stale when the run refuses the entry it holds, naming each artifact axis that
 moved. A memory readings entry holds every rank's member, or the store refuses
@@ -48,8 +49,6 @@ NAMES = {
 #: The commands that make each input.
 MADE_BY = {
     "machine spec": "a developer's spec script, scripts/compass/<machine>_spec.py",
-    "tokenizer entry": "the spec script that built {spec}, run again with "
-    "--model {model} added",
     STEP_LINEAR: "compass record, then compass fit steps --backend step-linear",
     STEP_GRID: "compass trace steps, compass measure steps --grid, then compass "
     "fit steps --backend step-grid",
@@ -107,10 +106,6 @@ def lacking(args, atom_args) -> tuple[list, list]:
     store = ArtifactStore(Path(args.store).resolve())
     config, engine = drive_run._config(atom_args), runfile._engine_args(atom_args)
     run = {"machine": document, "store": str(store.root)}
-    tok = _load_tokenizer(engine.model, engine.trust_remote_code)
-    made = MADE_BY["tokenizer entry"].format(spec=document["name"], model=engine.model)
-    met("tokenizer entry", made, compass_run.tokenizer_entry, machine, tok, config)
-
     flags = {k: getattr(args, k) for k in runfile.KINDS if getattr(args, k)}
     for name, tokens in (flags | {"host": args.host_laws or []}).items():
         tokens, held = [tokens] if isinstance(tokens, str) else tokens, []
@@ -131,6 +126,8 @@ def lacking(args, atom_args) -> tuple[list, list]:
     ):
         given = run["host"], config, machine_spec_digest(machine)
         met(host, MADE_BY["host"], compass_run.refuse_unfitted_host, *given)
+        tok = _load_tokenizer(engine.model, engine.trust_remote_code)
+        met(host, MADE_BY["host"], compass_run.tokenizer_term, run, tok, config)
     grid, made = NAMES[STEP_GRID], MADE_BY[STEP_GRID]
     checked = STEP_GRID in run and (
         met(grid, made, compass_run.refuse_context_parallel, STEP_GRID, config)
