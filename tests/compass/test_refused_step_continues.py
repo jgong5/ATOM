@@ -56,7 +56,7 @@ def no_eager_rung():
 
 def run_file(tmp_path, monkeypatch, **keys):
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 0.001,
         "stream_s": 0.002,
         "bound_s": 10.0,
@@ -124,7 +124,7 @@ def finish(monkeypatch, tmp_path, run, r):
     """The engine's and the frontend's hand-ins after the finish, and the summary."""
     table = compass_run.channel_table(run)
     authority = compass_run._RecordingAuthority(run)
-    authority.started = authority.finished = time.monotonic()
+    authority.finished = time.monotonic()
     engine = LPRuntime(compass_run.ENGINE, table, None)
     engine.now = math.inf
     monkeypatch.setattr(clock, "_installed", engine)

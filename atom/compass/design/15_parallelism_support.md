@@ -178,6 +178,14 @@ transfer to DP.
   own, because the MoE segment already prices those collectives; each is a wait inside one
   LP (`01` D4, K6). With one rank both are skipped. The lockstep `all_reduce` in `DPEngineCoreProc._sync_dp_state`
   keeps its payload, the three booleans above; the step's cost is not exchanged on it.
+- **Transport.** ATOM builds both DP groups on gloo, the engine cores' (`_sync_dp_state`
+  and the prefill delayer) and the runners' (`sync_dp_metadata` and the exchanges above),
+  and gloo takes half a millisecond or more to move each call's few bytes, several times
+  a round ([#2658](https://github.com/jgong5/ATOM/issues/2658)). In a simulated run a
+  group whose ranks share a host runs its `all_reduce` and `all_gather` over shared
+  memory instead (`atom/compass/runner/shm_collectives.py`), with gloo's results bit for
+  bit; a group spanning hosts, a host other than x86 and every call that module leaves
+  to gloo keep gloo. A real run's groups are ATOM's, untouched.
 - **Two token counts.** `T_own` is the rank's own scheduled token count. `T_moe` is the
   number of rows the group's MoE gather carries, the same on every rank. With EP off, MoE
   is tensor-parallel across the whole group (`flatten_tp_across_dp` in
@@ -473,8 +481,11 @@ rendezvous and each send takes an ack.
 
 `get_pp_indices(num_hidden_layers, pp_rank, pp_size)` (`atom/models/utils.py`, used at
 `kv_transfer/offload/config.py::scale_cpu_size_for_pp`, `kv_transfer/offload/config.py::build_lmcache_metadata` and in the Mooncake connector) owns the layer
-range per stage. `ModelRunner._get_total_num_layers` already consults `get_pp_indices`
-when `pp_group.world_size > 1`.
+range per stage. `atom/models/utils.py::make_layers` already builds only that range, with a
+`PPMissingLayer` in every other slot, and the attention builder sizes a stage's pools from
+the modules its walk over the built model finds
+(`atom/model_ops/attentions/pool_layout/pool_rows.py::PoolRowsMixin.pool_rows`), so the
+engine's KV sizing counts only the layers a stage holds.
 
 **Compass calls it; it never re-derives a split.** Same rule as `14` D86 for draft KV
 layers, and for the same reason: two spellings of one count drift.
@@ -506,15 +517,15 @@ of this paragraph gave the KV share as the layer ratio. That is exactly the re-d
 the rule above forbids: it recomputed from the layer count something ATOM already holds,
 and the two spellings disagree on every hybrid.
 
-**A second spelling of this count already exists in the engine, and it is not the one to
-read.** `GDNStateMixin._init_gdn_state` (`atom/model_ops/attentions/gdn_attn.py`) sets
-`num_full_attn` by dividing `num_hidden_layers` by `full_attention_interval`, and the
-attention sizing in the same file consumes it. That count is **global**, so it cannot
-answer what a stage holds at all. It agrees at 16 on this config and not by luck:
-`Qwen3_5TextConfig.__init__` (`atom/model_config/qwen3_5.py`) fills `layer_types` *from*
-that interval when a config omits it, so anything built through ATOM's own config class is
-consistent by construction. A config carrying an explicit non-periodic `layer_types` would
-separate the two, and `layer_types` is the one that stays right.
+**The engine's own count reads the same list.** The engine's paged count for a stage is
+the full-attention modules `PoolRowsMixin.pool_rows` finds in what that stage built, and
+`atom/models/qwen3_5.py` builds each layer's kind from `config.layer_types`, so over the
+model's own layers it and `paged_layers` count the same entries. A config that omits
+`layer_types` gets one from `full_attention_interval` in `Qwen3_5TextConfig.__init__`
+(`atom/model_config/qwen3_5.py`), and both read the filled list. An earlier engine derived
+a global count from that interval instead, which could not say what a stage holds; the walk
+replaced it. The walk also gives rows to a draft that shares the pool, which `paged_layers`
+leaves out: that is `14` D86's term.
 
 Derived at `feature/atomcompass_new` `92f1fdafe` from `get_pp_indices`, with
 `VLLM_PP_LAYER_PARTITION` cleared — left set it overrides the partitioner and a layout out
@@ -586,7 +597,7 @@ receive (Q3).
 `xiaobizh_n18_cpu`, where every aiter line quoted below is byte-identical at the same
 numbers. Two aiter versions are in circulation on this project and they agree here; that
 they agree is a reading, not a guarantee. An entry does not answer across them: the
-machine-spec key pins aiter's commit (T86, closed by the owner's [ruling on #168](https://github.com/jgong5/ATOM/issues/168#issuecomment-6399062318)).
+software stack in its key pins aiter's commit (T86, closed by the owner's [ruling on #168](https://github.com/jgong5/ATOM/issues/168#issuecomment-6399062318); the stack replaced the machine-spec key 2026-11-03, [#2716](https://github.com/jgong5/ATOM/issues/2716)).
 
 **ATOM does not construct the EP group — aiter does.** No ATOM file assigns `_EP`, and
 every use site imports `get_ep_group` from `aiter.dist.parallel_state` (`moe.py::FusedMoEMethodBase._maybe_make_prepare_finalize`,
@@ -886,5 +897,5 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T66 | Measure whether the Class-C runtime constants move with PP degree | one engine startup per PP degree |
 | T67 | Measure the step-duration spread across DP ranks, and what padding to `unified_bs` costs | needs a DP2 run with per-rank step timing |
 | T78 | `qwen3_5.py::Qwen3_5Model` and `glm4_moe.py::Glm4MoeModel` declare `"intermediate_tensors": 0`, so neither model can run PP at compilation level >= 2 | upstream ATOM fix; PP comes after v1 (`16` D95), so this is on no v1 path |
-| T79 | `gdn_attn.py::GDNAttentionMetadataBuilder.sub_pool_specs` mixes a PP-local layer count with a global one; KV sizing sign-flips at PP2 | upstream ATOM fix; blocks real-model PP measurement, which comes after v1 |
+| ~~T79~~ | ~~`gdn_attn.py::GDNAttentionMetadataBuilder.sub_pool_specs` mixes a PP-local layer count with a global one; KV sizing sign-flips at PP2~~ — **closed 2026-10-30 by #2467**: both counts are now rows of the stage's module walk, `PoolRowsMixin.pool_rows` (`12_open_items.md`) | — |
 | T82 | D91 Q2's "no scheduling coupling" is contradicted by `scheduler.py::Scheduler.schedule`, which skips `_pp_inflight_token_block` seqs inside the decode admission loop | the amendment to D91 and its LP consequence is its own task; this PR registers the contradiction rather than rewriting the decision |

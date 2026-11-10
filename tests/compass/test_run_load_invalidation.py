@@ -5,8 +5,9 @@ invalidation matrix, and each refuses on its row's axes, naming the axis.
 A law is loaded as `drive.runfile` builds the run file, before a server starts,
 under the readings a run on the suite's machine document takes, with the
 engine config its key states. A graph is loaded as `run._op_graphs` looks it
-up, under this process's `graph_readings` and the engine config it records,
-the tracer's own arguments, which its key's structure names.
+up, a graph at a step's shape and a DP prefill's graph that holds G alike,
+under this process's `graph_readings` and the engine config it records, the
+tracer's own arguments, which its key's structure names.
 """
 
 import json
@@ -33,7 +34,7 @@ from atom.compass.artifacts import (
     member_name,
 )
 from atom.compass.backends import StepLinearBackend
-from atom.compass.capture.forward import structure
+from atom.compass.capture.forward import prefill, structure, symbolic_shape
 from atom.compass.fit.publish import RANK
 from atom.compass.run import _op_graphs
 from atom.compass.run.step_grid import keyed
@@ -95,37 +96,49 @@ def test_a_law_and_host_laws_fitted_under_the_run_s_readings_install(
     assert r.compass_host.laws == LAWS
 
 
-def config(tmp_path):
-    """A stand-in config of a model whose config.json is `{}`."""
+def config(tmp_path, dp=1):
+    """A stand-in config at DP width `dp` of a model whose config.json is `{}`."""
     (tmp_path / "model").mkdir()
     (tmp_path / "model" / "config.json").write_text("{}")
     return SimpleNamespace(
         model=str(tmp_path / "model"),
         hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
         tensor_parallel_size=1,
-        parallel_config=SimpleNamespace(data_parallel_size=1),
+        parallel_config=SimpleNamespace(data_parallel_size=dp),
         enable_expert_parallel=False,
         enforce_eager=True,
         **ENGINE,
     )
 
 
-def traced(tmp_path, c, conditions):
-    """A run's lookup over a store holding `c`'s `decode B=2` graph, keyed as a
-    capture keys it and handed off under `conditions`."""
+def traced(tmp_path, c, conditions, phase="decode", shape="decode B=2", graph=None):
+    """A run's lookup over a store holding `c`'s graph at a `phase` step of
+    `shape`, `graph` or else one of `REGION`, keyed as a capture keys it and
+    handed off under `conditions`."""
     store = ArtifactStore(tmp_path / "store")
-    at = structure(c, "decode", True, ARCH)
+    at = structure(c, phase, True, ARCH)
     store.publish(
-        Key.of(Kind.OP_GRAPH, structure=at, shape="decode B=2"),
+        Key.of(Kind.OP_GRAPH, structure=at, shape=shape),
         provenance=STANZA,
         topology=Topology(),
         conditions=conditions,
         gates=GateState.of(),
         members={
-            member_name("graph", RANK, "json"): json.dumps({"region": REGION}).encode()
+            member_name("graph", RANK, "json"): json.dumps(
+                graph or {"region": REGION}
+            ).encode()
         },
     )
     return _op_graphs(str(store.root), c, ARCH)
+
+
+def held(tmp_path, c, conditions):
+    """A run's lookup at DP 2 over a store holding only `c`'s graph of a
+    prefill of 4 tokens over one sequence that holds G at any G from 4 to 64,
+    keyed as a symbolic trace keys it and handed off under `conditions`."""
+    graph = {"region": REGION, "hints": [4, 64], "guards": [], "slots": []}
+    shape = symbolic_shape(prefill(4, 1))
+    return traced(tmp_path, c, conditions, "prefill", shape, graph)
 
 
 #: The axes of the op_graph row a run reads; the key's structure names the
@@ -150,3 +163,21 @@ def test_a_graph_traced_in_this_process_loads_whatever_arguments_traced_it(tmp_p
     here = run_readings(c.model)
 
     assert traced(tmp_path, c, here)("decode", 2, 2) == REGION
+
+
+@pytest.mark.parametrize("axis", READ, ids=str)
+def test_a_graph_holding_g_traced_under_other_readings_refuses_a_dp_prefill(
+    tmp_path, axis
+):
+    c = config(tmp_path, dp=2)
+    lookup = held(tmp_path, c, moved(run_readings(c.model), axis))
+
+    named = re.escape(f"`{Row.OP_GRAPH}` x `{axis}`")
+    with pytest.raises(ArtifactRefusal, match=named):
+        lookup("prefill", 4, 1)
+
+
+def test_a_graph_holding_g_traced_in_this_process_answers_a_dp_prefill(tmp_path):
+    c = config(tmp_path, dp=2)
+
+    assert held(tmp_path, c, run_readings(c.model))("prefill", 4, 1) == REGION

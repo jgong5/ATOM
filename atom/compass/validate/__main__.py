@@ -8,7 +8,8 @@ this process, refused unless its digest is the one the run summary records, and 
 step roofline below it as the run composed them, its modules built on the grid's first
 decline from the ATOM arguments the run.json's `argv` names after `--`) or `op_graph/`
 (`compass run --op-graph`'s, at the `OpGraphBackend` its run file and price list give
-under the ATOM arguments its command line served, built as `compass run` builds it) and two or more `real*/`. `cctraces_sim.sh` writes each run.json as the run file with
+under the ATOM arguments its command line served and the performance environment its
+engine file states, built as `compass run` builds it) and two or more `real*/`. `cctraces_sim.sh` writes each run.json as the run file with
 the `workload` every run must share; `record` and `run` write their own, the run file
 as `run_file`, and `client.sh` the workload in `artifacts/workload.json`; a refusal
 names each field the runs do not share. `validate.runs` decides which client run is
@@ -51,7 +52,7 @@ from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.step_linear_fit import TOKEN_BANDS, token_band
 from atom.compass.backends.step_roofline import StepFallbackBackend, StepRooflineBackend
-from atom.compass.memory.check import MemoryRefusal, parts
+from atom.compass.memory.check import MemoryRefusal, parts, place, spread
 from atom.compass.run import (
     CLIENT_DIR,
     ENGINE,
@@ -157,27 +158,35 @@ def _cost(name: str, run: Path, backend, steps: list[dict], op=False):
 
 def _memory(name: str, sim: Path, engine: str, real: Path):
     """`real`'s memory against `engine`'s hand-in in `sim`, per rank at DP width
-    above 1, where each rank hands in as `<engine>.dp<r>`."""
+    above 1, where each rank hands in as `<engine>.dp<r>`; at the TP width the
+    real rank's record states, against each TP rank's line."""
     ranks = sorted(sim.glob(LP_FILE.format(f"{engine}.dp*")))
     for hand_in in ranks or [sim / LP_FILE.format(engine)]:
         rank = f" {hand_in.stem.rsplit('.', 1)[1]}" if ranks else ""
         # The real rank's KV block count names its lines in the server log.
-        record = real / f"steps/{rank.strip()}.engine.json"
-        blocks = ranks and record.exists() and read_json(record)["num_kvcache_blocks"]
+        record = real / f"steps/{rank.strip() or 'dp0'}.engine.json"
+        stated = read_json(record) if record.exists() else {}
+        blocks = ranks and stated.get("num_kvcache_blocks")
+        tp = stated.get("tensor_parallel_size", 1)
         n = len(ranks) or 1
-        yield from _checked(f"memory {name}{rank}", hand_in, real, n, blocks)
+        yield from _checked(f"memory {name}{rank}", hand_in, real, n, blocks, tp)
 
 
-def _checked(where: str, hand_in: Path, real: Path, ranks: int, blocks=None):
+def _checked(where: str, hand_in: Path, real: Path, ranks: int, blocks=None, tp=1):
     try:
-        comparison, *_, graph = parts(hand_in, real / "server.log", ranks, blocks)
+        *compared, _, _, graph = parts(hand_in, real / "server.log", ranks, blocks, tp)
     except MemoryRefusal as e:
         yield where, "memory", e.what, "refused"
         return
-    for t in comparison.compared:
-        yield where, t.name, f"{t.relative:+.2%} ({t.delta_bytes:+,} B)", str(t.verdict)
-    for r in comparison.refused:
-        yield where, r.name, r.what, "refused"
+    for i, comparison in enumerate(compared):
+        at = f"{where} {place(i, ranks)}" if len(compared) > 1 else where
+        for t in comparison.compared:
+            value = f"{t.relative:+.2%} ({t.delta_bytes:+,} B)"
+            yield at, t.name, value, str(t.verdict)
+        for r in comparison.refused:
+            yield at, r.name, r.what, "refused"
+    for name, value in spread(compared):
+        yield where, f"{name} across TP ranks", value, "-"
     if not isinstance(graph, str):
         graph = f"reserves() {graph.reserves_relative:+.2%}, predicts() {graph.predicts_relative:+.2%}"
     yield where, "graph pool", graph, "-"
@@ -219,7 +228,9 @@ def _law(run_file: dict, real: Path) -> dict:
 
 def _op_graph(side: Path):
     """The `OpGraphBackend` a `compass run --op-graph` server at `side`
-    priced with: its run file under the ATOM arguments its command line served."""
+    priced with: its run file under the ATOM arguments its command line served,
+    its graphs read under the performance environment its engine file states,
+    as its server read them, not this process's."""
     from atom.compass import run as compass_run
     from atom.compass.drive import run as drive_run
 
@@ -229,7 +240,8 @@ def _op_graph(side: Path):
     config = drive_run._config(atom_args)
     machine = compass_run._machine(run["run_file"])
     ep = drive_run._ep_width(atom_args, machine) if config.enable_expert_parallel else 1
-    return compass_run.op_graph(run["run_file"], config, machine, ep)
+    env = read_json(side / "steps/dp0.engine.json")["env"]
+    return compass_run.op_graph(run["run_file"], config, machine, ep, env=env)
 
 
 def _warm_over_cold(run_file: dict):

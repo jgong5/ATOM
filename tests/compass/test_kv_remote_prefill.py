@@ -69,7 +69,7 @@ PROMPT = list(range(40))
 L = 2.0**-10
 KV = "engine-D->engine-P:kv_write_req"
 TABLE = prefill_decode_table(
-    admission_path="serving",
+    admission_s=0.54e-3,
     ipc_s=L,
     stream_s=L,
     router_s=L,
@@ -373,6 +373,80 @@ def test_a_write_request_for_an_unfinished_prefill_is_refused(pd, seq_factory):
     admitted(pd, [x], seq_factory, SEND)
     with pytest.raises(ValueError, match="before its prefill finished"):
         engine_step(pd.p, pd.rt_p, SEND + L, (0, SEND + L))
+
+
+# -- An abort between prefill's finish and decode's pull -----------------
+
+
+def test_an_abort_before_the_write_request_frees_prefill_at_once(pd, seq_factory):
+    """Mooncake's abort with no write request taken: the send is done at the
+    abort, reported as a write-done is, and a write request that still comes
+    is no error."""
+    total = free_blocks(pd.p)
+    (x,) = prefilled(pd, 1, R)
+
+    assert pd.p.abort_request(x.id) is True
+    engine_step(pd.p, pd.rt_p, R + TICK)
+    assert x.id in pd.p.deferred_free_blocks, "one poll in flight, as any report"
+    engine_step(pd.p, pd.rt_p, R + 2 * TICK)
+    assert pd.p.deferred_free_blocks == {}
+    assert pd.p.is_finished()
+    assert free_blocks(pd.p) == total
+
+    admitted(pd, [x], seq_factory, SEND)
+    engine_step(pd.p, pd.rt_p, SEND + L, (0, SEND + L))
+    assert pd.p.kv_connector.has_pending_work() is False, "no claim waits on it"
+
+
+@pytest.mark.parametrize("polled", [True, False], ids=["taken", "released"])
+def test_an_abort_mid_write_frees_nothing_until_the_write_is_done(
+    pd, seq_factory, polled
+):
+    """A write request already here when the abort comes is served first, as
+    Mooncake's listener takes one on arrival, whether or not prefill has
+    polled since it was released."""
+    total = free_blocks(pd.p)
+    (x,) = prefilled(pd, 1, R)
+    (y,) = admitted(pd, [x], seq_factory, SEND)
+    a = SEND + L
+    e = a + pd.model.duration_s(len(y.block_table))
+    if polled:
+        engine_step(pd.p, pd.rt_p, a, (0, a))
+    else:
+        at(pd.rt_p, a, (0, a))
+
+    assert pd.p.abort_request(x.id) is True
+    engine_step(pd.p, pd.rt_p, e - TICK)
+    engine_step(pd.p, pd.rt_p, e)
+    assert x.id in pd.p.deferred_free_blocks, "freed under a running write"
+    engine_step(pd.p, pd.rt_p, e + TICK)
+    assert pd.p.deferred_free_blocks == {}
+    assert free_blocks(pd.p) == total
+
+
+def test_a_decode_abort_before_its_write_request_frees_prefill(pd, seq_factory):
+    """Decode aborts a request it has not admitted, so it never asks for the
+    write, and prefill hears no abort: its leg of the request is over. Decode
+    tells it that no write will come, on the write request's channel, and
+    prefill's send is done at that notice's arrival, reported as a write-done
+    is."""
+    total = free_blocks(pd.p)
+    (x,) = prefilled(pd, 1, R)
+    at(pd.rt_d, SEND)
+    y = seq_factory(PROMPT, kv_transfer_params=dict(x.kv_transfer_params_output))
+    pd.d.add(y)
+
+    assert pd.d.abort_request(y.id) is True
+    a = SEND + L
+    assert pd.rt_d.send_log == [(KV, 0, a)], "the notice's arrival"
+    assert pd.d.kv_connector.has_pending_work() is False, "nothing comes back"
+
+    engine_step(pd.p, pd.rt_p, a, (0, a))
+    assert x.id in pd.p.deferred_free_blocks, "one poll in flight, as any report"
+    engine_step(pd.p, pd.rt_p, a + TICK)
+    assert pd.p.deferred_free_blocks == {}
+    assert pd.p.is_finished()
+    assert free_blocks(pd.p) == total
 
 
 #: The decode pool's block size (`MockConfig`'s), and a different one.

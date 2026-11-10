@@ -49,13 +49,13 @@ PREDICTS = "cudagraph_pool"
 EAGER_SOURCE = "config.enforce_eager"
 
 #: ATOM's declared live-tensors-per-layer coefficient, in
-#: `ModelRunner._piecewise_per_token_bytes`.
+#: `ModelRunner._token_graph_bytes_per_token`.
 #: Mirrored rather than re-derived: it is what the engine spends.
 LIVE_TENSORS_PER_LAYER = 2.8
 #: ATOM's whole-graph estimate, as a fraction of peak activations.
 ACTIVATION_FRACTION = 0.2
-#: The fraction of the utilisation budget the piecewise branch will reserve
-#: before it stops taking buckets.
+#: The fraction of the utilisation budget the piecewise branch, ATOM's
+#: TR_HYBRID token graphs, will reserve before it stops taking buckets.
 TARGET_RESERVE_FRACTION = 0.15
 
 
@@ -140,7 +140,7 @@ def reserves(
       the captured bucket count, `activation_bytes * 0.2 * n_buckets`
       (`_estimate_cudagraph_overhead`). Without it this **under-reserves** by
       that factor and so predicts more KV blocks than ATOM would.
-    - The piecewise branch drops buckets over `ATOM_PIECEWISE_DP_MAX_TOKENS`
+    - The piecewise branch drops buckets over `ATOM_TOKEN_GRAPH_DP_MAX_TOKENS`
       when `dp_size > 1` and a drafter is attached.
       `capture_token_shapes` does not, so that configuration **over-reserves**
       and predicts fewer.
@@ -163,7 +163,7 @@ def reserves(
         raise ValueError(
             "state one branch: `activations` for the whole-graph estimate "
             "or `piecewise` for the per-token one. ATOM picks between them with "
-            "`_piecewise_cg_active()`, which reads an engine this module does "
+            "`_tr_hybrid_active()`, which reads an engine this module does "
             "not import, so the caller that has the engine says which"
         )
     if piecewise is None:

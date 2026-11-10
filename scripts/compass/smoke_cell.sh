@@ -18,8 +18,7 @@
 #
 # Usage: smoke_cell.sh MODEL OUT
 #   MODEL           the model directory: config.json, tokenizer and weights
-#   OUT             an absent or empty directory, on a disk with room: the raw
-#                   exports keep every prompt
+#   OUT             an absent or empty directory, on a disk with room
 #   GPU             the one GPU, as rocm-smi and `--gpu` number it (required);
 #                   each compass command refuses it while a process is on it
 #   MACHINE         the machine spec of this node's GPUs (required)

@@ -162,7 +162,8 @@ One server and its client run, used by steps 0, 2, 3 and 5:
 
 ```bash
 # serve OUT TRACES C PYTHON COMMAND...: start a compass server writing to OUT,
-# send it one client run of D seconds (default 1800), and stop it. The server
+# send it one client run of D seconds (default 1800), or with C `sweep` the
+# JIT sweep, and stop it. The server
 # logs to OUT/server.log; the compass command's own output, empty unless it
 # refuses, goes to $R/logs/. It refuses an OUT that exists, and fails when the
 # server dies or does not answer within 30 min, or the client run fails.
@@ -178,8 +179,10 @@ serve() {
       { kill $pid 2>/dev/null; echo "serve: no server; see $log" >&2; return 1; }
     sleep 5
   done
+  local run=(--concurrency $c --duration ${D:-1800})
+  [ $c != sweep ] || run=(--sweep)
   HARNESS_PYTHON=$py $T/scripts/compass/client.sh $out --traces $traces \
-    --concurrency $c --duration ${D:-1800} --stop || { kill $pid 2>/dev/null; wait $pid; return 1; }
+    "${run[@]}" --stop || { kill $pid 2>/dev/null; wait $pid; return 1; }
   wait $pid
 }
 ```
@@ -212,12 +215,16 @@ Times were measured on node 18 for the cell in
 [PR #1336](https://github.com/jgong5/ATOM/pull/1336), at concurrencies 1, 4, 16,
 64 and 256 with a 1800 s benchmark each.
 
-**0. Warm a fresh container** (GPU, once per container; 15 min as in the smoke
-cell, and a minute more for the build below).
+**0. Sweep a fresh container** (GPU, once per container; not timed on this cell:
+a round sends one prefill step for every token count up to the budget, 16384 here,
+then designed steps whose rows queue behind parked decodes).
 
 ```bash
-rm -rf $R/warm   # a restarted container's earlier warm-up, which serve would refuse
-D=600 serve $R/warm 0-7 1 $REAL_PY record --gpu $G
+for k in 1 2 3; do
+  rm -rf $R/sweep$k   # a restarted container's earlier round, which serve would refuse
+  serve $R/sweep$k 0-392 sweep $REAL_PY record --sweep --gpu $G $S || break
+  grep -qF '"missing": []' $R/sweep$k/sweep.json && break
+done
 ```
 
 A server builds an aiter, FlyDSL or `compile_hsaco` kernel, or a Triton or Inductor one outside ATOM's compile cache, the first time it meets a variant its image did
@@ -225,10 +232,19 @@ not prebuild, such as `mha_varlen_fwd`'s for a prefill step of one new token a
 row, about 60 s inside the run, and the container keeps it for every later
 server. A record whose server built one names it in run.json's
 `aiter_jit_builds`, and grading, the fits and `validate.cost` refuse that
-record. This record takes those builds; nothing reads it. `smoke_cell.sh`
-serves the same record before its calibration, so a container it ran in is
-warm. A restarted container takes this step again (Environment), over the
-`warm/` it took before. Success: `serve` returns 0.
+record. Each round sends the server the JIT sweep of this cell for the traces
+every later step serves, the points its records' keys are selected by, and
+after the stop keeps what it compiled and the points its record covered in the
+store's JIT cache library (`scripts/compass/README.md`, the full path); nothing
+reads its record. A round sends only the steps still missing, and its last
+line says whether the cell is `swept`. `record --sweep` starts the server with
+the pacing variables those steps need, and `client.sh --sweep` refuses one
+started without them. A third round's missing points, in
+`sweep3/sweep.json`, are the residual to report. The next container on the same
+stack starts from the library, and its sweep returns at once. `smoke_cell.sh`
+serves a record before its calibration instead, so a container it ran in is
+warm only for its own traces. A restarted container takes this step again
+(Environment). Success: the last round's line reads `swept`.
 
 **1. Memory readings** (GPU, 2 to 3 min after step 0; 5 min as a fresh
 container's first start, as in
@@ -242,15 +258,24 @@ Writes a `memory_readings` entry to the store. Success: exit 0 and a `published
 memory_readings(...)` line.
 
 **2. Calibration records** (GPU, alone on the node; per concurrency, its warmup
-plus 1800 s, about 35 min with the server's start and stop: 1 h 45 min in all).
+plus 1800 s, about 35 min with the server's start and stop: 1 h 45 min in all),
+each with the blocking-call tool, then two trace runs, without it, the c=16 and c=4
+recipes for 120 s under ATOM's profiler, which the prefill law fits from alone: each
+its warmup, 120 s and a stop that writes and reduces the traces, about 11 min on
+DeepSeek-V4.1-Flash TP4
+([README](README.md#the-stage-2-cell-through-the-compass-cli-from-an-empty-store)).
 
 ```bash
-for C in 1 4 16; do serve $R/cal/c$C 256-392 $C $REAL_PY record --gpu $G || break; done
+TOOL=$(PYTHONPATH=$T python3 -m atom.compass.parity.blocked $R/tool)   # the blocking-call tool
+for C in 1 4 16; do ROCP_TOOL_LIBRARIES=$TOOL serve $R/cal/c$C 256-392 $C $REAL_PY record --gpu $G || break; done
+for C in 16 4; do D=120 serve $R/trace/c$C 256-392 $C $REAL_PY record --trace --gpu $G || break; done
 ```
 
 Writes per record `steps/dp0.jsonl` (the step record), `run.json` (with the
-engine's bounds under `engine`) and `artifacts/client_run.json`. Success:
-`client.sh` exits 0, and `run.json` and `artifacts/client_run.json` exist.
+engine's bounds under `engine`) and `artifacts/client_run.json`, and per trace
+run its traces in `trace/` and their busy time in `steps/dp0.busy.jsonl`. Success:
+`client.sh` exits 0, and `run.json` and `artifacts/client_run.json` exist, and
+for a trace run `steps/dp0.busy.jsonl`.
 
 **3. Real runs** (GPU; per run about 35 min, as in step 2: 3 h 30 min on one GPU,
 1 h 45 min on two).
@@ -273,8 +298,9 @@ real runs at once, since real runs time the host. Success as in step 2.
 ```bash
 set -o pipefail   # a fit's exit status, not tee's
 RUNS=$(for d in $R/cal/c*; do echo --client-run $d $d/artifacts/client_run.json; done)
-compass fit steps --backend step-linear --form history $R/cal/c* $RUNS $M $S --out $R/fit/steps \
-  2>&1 | tee $R/logs/fit_steps.log
+TRACE_RUNS=$(for d in $R/trace/c*; do echo --client-run $d $d/artifacts/client_run.json; done)
+compass fit steps --backend step-linear --form history $R/cal/c* $R/trace/c* $RUNS $TRACE_RUNS \
+  $M $S --out $R/fit/steps 2>&1 | tee $R/logs/fit_steps.log
 compass fit host $R/cal/c* $RUNS $M $S --out $R/fit/host 2>&1 | tee $R/logs/fit_host.log
 token() { awk '/^published / {t = $NF} END {print t}' "$1"; }
 LAW=$(token $R/logs/fit_steps.log) HOST=$(token $R/logs/fit_host.log)
@@ -283,7 +309,8 @@ LAW=$(token $R/logs/fit_steps.log) HOST=$(token $R/logs/fit_host.log)
 Each prints its token last, `published step_linear_law(...) as <token>` and
 `published host_laws(...) as <token>`, which `LAW` and `HOST` keep. Success: exit
 0, and `$R/fit/steps/step_linear_law.json` reads `"unfitted": {}`; a vector named
-there refuses every step it prices.
+there refuses every step it prices. `fit host` takes no trace run: a trace run's
+host segments ran under the profiler.
 
 **5. Simulated runs** (CPU, 2 to 4 min per concurrency).
 
@@ -392,6 +419,7 @@ law's accuracy.
 | `... holds an earlier run's files`, or `client.sh` refuses its OUT | one server per `--out`, one client run per server | a fresh `--out` for every server |
 | `fit` refuses `... is not a record directory (no run.json)` | a log file matched `$R/cal/c*` | keep logs outside the record directories |
 | `fit` refuses: `[Errno 2] No such file or directory: '<record>/artifacts/client_run.json'` | a stopped calibration record under `$R/cal/` | `rm -rf` it and take it again |
+| the law's `unfitted` names `prefill`, `no prefill step carries a trace run's busy time`, and step 5 refuses every prefill step | `fit steps` was given no trace run | step 2's trace runs, named before the first `--client-run`; a trace run refused at its stop, naming the rank and forward that lost device rows, has no `steps/dp0.busy.jsonl`: `rm -rf` it and take it again |
 | `kill: %%: no such job` | `serve` already stopped that server, when its client run failed or ended | nothing to stop; run `jobs` first |
 | `serve: OUT exists; leave a finished run out, rm -rf a stopped one` | a loop taken again over a run it already took | leave a finished concurrency out of the loop; `rm -rf` a stopped or short run's `--out` |
 | `Triton cache error`, or `failed to map segment from shared object` | a `--tmpfs` without `exec` | the container as Environment starts it |

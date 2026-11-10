@@ -127,6 +127,9 @@ KV_CACHE_READY_EVENT_TTL_S = 600.0
 # Requests whose ready event aged out are remembered up to this many, oldest
 # dropped first, so a late transfer still finds that its prefill is complete.
 KV_CACHE_READY_EXPIRED_MAX = 1 << 16
+# Aborted requests a producer rank remembers, oldest dropped first, so a write
+# request that comes for one after its blocks went back to the pool is refused.
+ABORTED_TRANSFERS_MAX = 1 << 16
 _IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
 
@@ -392,6 +395,9 @@ PD_META_TIMEOUT_MS = 10_000
 # PP-prefill only: consumer tells stage-0 a request's KV is fully received from
 # every stage, so stage-0 may reuse the shared page table (see _record_release).
 MSG_RELEASE = b"release"
+# Consumer scheduler -> producer: a request finished on the consumer before it
+# asked for its write, so none will come (see _abort_unwritten).
+MSG_ABORT = b"abort"
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +432,10 @@ class MooncakeAgentMetadata(
 
 
 class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
+    # Claimed requests aborted since the last metadata, for the workers.
+    # Class-level so a scheduler built without __init__ sends none.
+    _aborted_sends: frozenset[ReqId] = frozenset()
+
     def __init__(self, config: Config) -> None:
         kv_transfer_config = config.kv_transfer_config
         self.is_producer = (
@@ -453,6 +463,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # and NOT at alloc: `Scheduler._is_preemptable` negates this same
         # predicate, so an earlier claim would pin every running request.
         self._awaiting_send: set[str] = set()
+        # Consumer: each producer rank's side channel, once an abort was sent
+        # on it (`_abort_unwritten`).
+        self._abort_sockets: dict[str, zmq.Socket] = {}
 
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -530,6 +543,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
         self._reqs_need_recv.clear()
         self._reqs_need_save.clear()
+        meta.reqs_not_processed = set(self._aborted_sends)
+        self._aborted_sends = frozenset()
         return meta
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
@@ -663,12 +678,59 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             transfer_id = self.request_id_to_transfer_id.pop(seq.id, None)
             if transfer_id is not None:
                 self.transfer_id_to_request_id.pop(transfer_id, None)
+            params = getattr(seq, "kv_transfer_params", None) or {}
+            if params.get("do_remote_prefill"):
+                # Finished before `update_state_after_alloc` asked for its
+                # write: aborted while it waited.
+                params["do_remote_prefill"] = False
+                self._abort_unwritten(params)
+
+    def _abort_unwritten(self, params: dict[str, Any]) -> None:
+        """Tell each producer rank that holds a request's KV that this consumer
+        will not ask for its write, on the side channel a write request takes.
+
+        The producer's leg of the request is over, so no abort reaches it, and
+        without this it keeps its send claim for ever. Sent here, on the step
+        loop, rather than by a worker: a DP rank whose last request is gone
+        stops building the metadata that would carry it there.
+        """
+        meta = ConnectorMetadata._build_req_meta(None, [], params)
+        notice = msgpack.dumps({"transfer_id": meta.transfer_id})
+        stages = max(1, meta.remote_pp_size)
+        for stage in range(stages):
+            for rank in range(meta.tp_size):
+                port = meta.remote_handshake_port + _port_offset(
+                    meta.remote_dp_rank,
+                    rank,
+                    meta.tp_size,
+                    stage,
+                    stages,
+                    meta.remote_dp_size,
+                )
+                addr = make_zmq_path("tcp", meta.remote_host, port)
+                sock = self._abort_sockets.get(addr)
+                if sock is None:
+                    sock = zmq.Context.instance().socket(zmq.DEALER)
+                    sock.setsockopt(zmq.LINGER, 0)
+                    # Queued, never blocking the step loop, while a producer
+                    # rank is unreachable.
+                    sock.setsockopt(zmq.SNDHWM, 0)
+                    sock.connect(addr)
+                    self._abort_sockets[addr] = sock
+                sock.send_multipart([MSG_ABORT, notice])
 
     def should_defer_free(self, seq: Sequence) -> bool:
         return str(seq.id) in self._awaiting_send
 
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))
+
+    def abort_send(self, req_id) -> None:
+        """Ask the workers to report an aborted request's send once none of its
+        writes runs. Not under PP prefill: each stage writes its own layers
+        and sees only its own, so the claim waits for the decode's release."""
+        if self.pp_size == 1 and str(req_id) in self._awaiting_send:
+            self._aborted_sends |= {req_id}
 
     def source_blocks_released(self, seq: Sequence) -> None:
         """No block-lifetime state remains after the send claim is retired."""
@@ -922,6 +984,10 @@ class MooncakeConnector(KVConnectorBase):
         self._completed_prefills_cv = threading.Condition(self._completed_prefills_lock)
         self._transfer_refcount: dict[ReqId, int] = {}
         self._transfer_refcount_lock = threading.Lock()
+        # Under _completion_lock: write requests taken and not yet served, per
+        # transfer, and the transfers whose request was aborted, oldest first.
+        self._writes_in_flight: dict[TransferId, int] = {}
+        self._aborted_transfers: dict[TransferId, None] = {}
 
         # --- Consumer: pending receive tracking ---
         self._pending_recv: set[ReqId] = set()
@@ -1521,6 +1587,8 @@ class MooncakeConnector(KVConnectorBase):
                     meta.local_slot_index,
                     req_id,
                 )
+            if metadata.reqs_not_processed:
+                self._abort_transfers(metadata.reqs_not_processed)
             return
 
         # Consumer: send write requests to producer
@@ -1989,7 +2057,7 @@ class MooncakeConnector(KVConnectorBase):
                                 logger.exception(
                                     "[PRODUCER] adopting a landing partition failed"
                                 )
-                        self._send_executor.submit(self._execute_transfer, request_data)
+                        self._send_executor.submit(self._serve_write, request_data)
 
                     elif msg_type == MSG_LANDING_CREDIT:
                         try:
@@ -2008,6 +2076,11 @@ class MooncakeConnector(KVConnectorBase):
                         self._record_release(
                             data["transfer_id"], data.get("consumer_tp_size", 1)
                         )
+
+                    elif msg_type == MSG_ABORT:
+                        # No write request will come, so none is in flight.
+                        data = msgpack.loads(parts[2])
+                        self._abort_transfers([data["transfer_id"]])
 
                     else:
                         logger.error("Unknown message type: %s", msg_type)
@@ -2041,6 +2114,55 @@ class MooncakeConnector(KVConnectorBase):
                 "[PRODUCER] acknowledging write request %s failed",
                 request_data["request_id"],
             )
+
+    def _serve_write(self, request_data: dict) -> None:
+        """Serve a write request on a send worker, unless its request was
+        aborted; the last one in flight for an aborted request reports its send."""
+        transfer_id = request_data.get("transfer_id", request_data["request_id"])
+        with self._completion_lock:
+            aborted = transfer_id in self._aborted_transfers
+            if not aborted:
+                in_flight = self._writes_in_flight.get(transfer_id, 0)
+                self._writes_in_flight[transfer_id] = in_flight + 1
+        if aborted:
+            logger.warning(
+                "[PRODUCER] refusing a write request for transfer_id=%s: its "
+                "request was aborted and its blocks may be another's now",
+                transfer_id,
+            )
+            self._notify_transfer_result(request_data, success=False)
+            return
+        try:
+            self._execute_transfer(request_data)
+        finally:
+            with self._completion_lock:
+                left = self._writes_in_flight.pop(transfer_id) - 1
+                if left:
+                    self._writes_in_flight[transfer_id] = left
+                elif transfer_id in self._aborted_transfers:
+                    self._release_aborted(transfer_id)
+
+    def _abort_transfers(self, transfer_ids) -> None:
+        """Refuse every later write request for these aborted requests, and
+        report each one's send now unless a write of it is in flight."""
+        with self._completion_lock:
+            for transfer_id in transfer_ids:
+                self._aborted_transfers[transfer_id] = None
+                if len(self._aborted_transfers) > ABORTED_TRANSFERS_MAX:
+                    del self._aborted_transfers[next(iter(self._aborted_transfers))]
+                if transfer_id not in self._writes_in_flight:
+                    self._release_aborted(transfer_id)
+
+    def _release_aborted(self, transfer_id: TransferId) -> None:
+        """Report an aborted request's send, unless this rank already did.
+        Caller holds ``_completion_lock``."""
+        with self._completed_prefills_lock:
+            held = self._completed_prefills.pop(transfer_id, None) is not None
+            self._kv_cache_ready_events.pop(transfer_id, None)
+        with self._transfer_refcount_lock:
+            self._transfer_refcount.pop(transfer_id, None)
+        if held:
+            self.done_sending.add(transfer_id)
 
     def _record_release(self, transfer_id: TransferId, consumer_tp_size: int) -> None:
         """Count a consumer-rank release; free the shared page after all ranks.

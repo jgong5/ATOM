@@ -214,11 +214,53 @@ def rope_quant_window(
     for a byte pool (FP8 values then codes, `V41PoolGeometry.window_bytes`)
     and a row index for a `[rows, head_dim]` BF16 one.
     """
-    tokens, heads, dim = query.shape
-    kv_half = ring is not None or qat is not None or values is not None
     pool, step, window = ring or (None, None, None)
-    byte_ring = pool is not None and pool.dtype == torch.uint8
     query_values, query_scales = query_fp8 or (None, None)
+    _launch_rope_window(
+        query,
+        kv,
+        cos,
+        sin,
+        positions,
+        rope_dim=rope_dim,
+        qat=qat,
+        values=values,
+        scales=scales,
+        query_values=query_values,
+        query_scales=query_scales,
+        pool=pool,
+        batch_ids=None if step is None else step.batch_ids,
+        cu_seqlens_q=None if step is None else step.cu_seqlens_q,
+        slots=None if step is None else step.slots,
+        window=window,
+    )
+
+
+def _launch_rope_window(
+    query,
+    kv,
+    cos,
+    sin,
+    positions,
+    *,
+    rope_dim,
+    qat,
+    values,
+    scales,
+    query_values,
+    query_scales,
+    pool,
+    batch_ids,
+    cu_seqlens_q,
+    slots,
+    window,
+):
+    """`rope_quant_window`'s launch, its `ring` as the pool, the step's fields
+    it reads and the window: no `BatchStep`. `pool` None writes no ring."""
+    tokens, heads, dim = query.shape
+    write_ring = pool is not None
+    kv_half = write_ring or qat is not None or values is not None
+    byte_ring = write_ring and pool.dtype == torch.uint8
     _rope_window_kernel[(tokens, heads + kv_half)](
         query,
         kv if kv_half else query,
@@ -233,9 +275,9 @@ def rope_quant_window(
         query_values,
         None if query_scales is None else query_scales.view(torch.uint8),
         pool,
-        None if step is None else step.batch_ids,
-        None if step is None else step.cu_seqlens_q,
-        None if step is None else step.slots,
+        batch_ids,
+        cu_seqlens_q,
+        slots,
         0 if window is None else window.ring_start,
         kv.stride(0) if kv_half else 0,
         HEADS=heads,
@@ -249,6 +291,6 @@ def rope_quant_window(
         PACKED_RING=byte_ring,
         EMIT_QAT=qat is not None,
         EMIT_PACKED=values is not None,
-        EMIT_QUERY_FP8=query_fp8 is not None,
-        WRITE_RING=ring is not None,
+        EMIT_QUERY_FP8=query_values is not None,
+        WRITE_RING=write_ring,
     )

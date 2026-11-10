@@ -7,14 +7,13 @@ observations.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
 import numpy as np
 from prometheus_client import Gauge, Histogram
 
 from atom.metrics.histogram import LATENCY_BUCKETS
-from atom.utils import clock
+from atom.utils import time_shim as time
 
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TOKEN_BUCKETS = (
@@ -130,7 +129,7 @@ class SchedulerMetrics:
         if received_at is None:
             if getattr(seq, "queue_timing", None) is not None:
                 return
-            received_at = clock.now(time.perf_counter)
+            received_at = time.perf_counter()
         seq.queue_timing = RequestQueueTiming(
             received_at=received_at,
             is_pd=bool(
@@ -144,14 +143,14 @@ class SchedulerMetrics:
         key = str(seq.id)
         if key in self._loads:
             return
-        self._loads[key] = (seq, clock.now(time.perf_counter))
+        self._loads[key] = (seq, time.perf_counter())
 
     def finish_kv_wait(self, req_id, *, succeeded: bool) -> None:
         pending = self._loads.pop(str(req_id), None)
         if pending is None:
             return
         seq, started = pending
-        now = clock.now(time.perf_counter)
+        now = time.perf_counter()
         timing = getattr(seq, "queue_timing", None)
         if timing is not None and succeeded and timing.is_pd:
             self.pd_transfer.observe(now - started)
@@ -166,13 +165,13 @@ class SchedulerMetrics:
                 or str(req_id)
             ),
             sequence_id=str(req_id),
-            started_at=str(clock.now(time.time)),
+            started_at=str(time.time()),
         ).set(int(tokens))
 
     def record_forward(self, batch, seqs) -> None:
         if batch.is_dummy_run or not batch.req_ids:
             return
-        now = clock.now(time.perf_counter)
+        now = time.perf_counter()
         context_lens = getattr(batch, "context_lens", None)
         for i, req_id in enumerate(batch.req_ids):
             seq = seqs[req_id]

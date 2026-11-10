@@ -306,7 +306,7 @@ joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* sui
   (`max|diff| = 0.001953125`, exactly 2⁻⁹, against `atol=rtol=1e-3`), plus
   `tests/test_dcp_merge_ops.py::test_row_view_matches_output_slicing_bitwise`, a
   `torch.equal` with **no tolerance at all** — a tolerance bump would not move it. All five
-  node-ids are on file verbatim in `scripts/compass/gpu_gate_known_failures.txt` and compared
+  node-ids are on file verbatim in `scripts/compass/gpu_gate_baselines/gfx950/gpu_gate_known_failures.txt` and compared
   by name, so "5 failed" is checked against "the *same* 5 failed". A review record that
   claims "green" instead of citing the delta has not read the baseline. The pass count moves
   by construction — the superset includes `tests/compass/`, so every test this phase adds
@@ -419,8 +419,8 @@ is not resolvable from a checkout, which is the same defect as naming a script t
 the tree. The commits carrying P0.2's measurements are `9c8df1328` and `b963c9411`, landed as
 `947d5b282`; the ones that supersede them are on this branch. P0.1's GPU re-measurement has
 an **in-tree** record, because a plan of record cannot cite one that is not: the five failing
-node-ids verbatim in `scripts/compass/gpu_gate_known_failures.txt`, and the pair, the tree and
-the toolchain as the `BASE_*` constants, now `scripts/compass/gpu_gate_baseline.env`, which
+node-ids verbatim in `scripts/compass/gpu_gate_baselines/gfx950/gpu_gate_known_failures.txt`, and the pair, the tree and
+the toolchain as the `BASE_*` constants, now one `gpu_gate_baseline.env` per GPU target under `scripts/compass/gpu_gate_baselines/`, which
 `scripts/compass/regen_gpu_gate_baseline.sh` rewrites with the list on a new image. P0.2's own task
 record predates that measurement and contains neither `4779` nor `fe9ea043c`; it is a source
 for the superseded 4730 / 5 above and for nothing else.
@@ -681,7 +681,9 @@ alone.
   stay frozen, `1dedbac561b6` (#2036) and `af1ea3021902` (#2070), and the spec they read
   is the before side of the method error.
 - **Cells**, each TP4 with DSpark5 (`14`): `-tp 4 --kv_cache_dtype bf16
-  --index-cache-dtype fp8 --method dspark --num-speculative-tokens 5 --level 0`. Cell A
+  --index-cache-dtype fp8 --method dspark --num-speculative-tokens 5
+  --spec-decode-acceptance-length 3 --level 0` on the real and the simulated runs alike
+  ([ruling](https://github.com/jgong5/ATOM/pull/2683#issuecomment-6578751421)). Cell A
   adds whole-expert EP4, `--enable-expert-parallel`; cell B shards the routed experts
   across TP. Each runs concurrency 1, 4, 16, 64 and 256 on cc-traces 0 to 255, three real
   rounds at `--duration 3600` as #975 ran them; traces 256 to 392 calibrate (`08` D50).

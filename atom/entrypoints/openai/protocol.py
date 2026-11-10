@@ -4,7 +4,6 @@
 """Pydantic request/response models for the OpenAI-compatible API."""
 
 import json
-import time
 from typing import Annotated, Any
 
 from pydantic import (
@@ -16,7 +15,7 @@ from pydantic import (
     ValidationError,
 )
 
-from atom.utils import clock
+from atom.utils import time_shim as time
 
 # ============================================================================
 # Constants
@@ -394,7 +393,7 @@ class ModelCard(BaseModel):
 
     id: str
     object: str = "model"
-    created: int = Field(default_factory=lambda: int(clock.now(time.time)))
+    created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "atom"
 
 

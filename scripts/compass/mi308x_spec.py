@@ -1,36 +1,25 @@
 # SPDX-License-Identifier: MIT
-"""An MI308X machine spec, from the tokenizers swept here and one real start.
+"""An MI308X machine spec, from one real start and the probes named below.
 
-    python3 scripts/compass/mi308x_spec.py [--model M ...] [--sweep-from DOC] [--out PATH]
+    python3 scripts/compass/mi308x_spec.py [--out PATH]
 
-Run on hjbog-srdc-18, or on hjbog-srdc-39 with COMPASS_MACHINE=mi308x-hjbog39,
-in a container that has the models' files: each tokenizer
-fragment carries this host's core counts, and the merge refuses it if they are
-not the ones the device fragment recorded there. `--model` repeats: each
-distinct tokenizer the models load is swept once, and its entry applies to the
-architectures of every model that loads it. The device fragment is what
-ATOM's own `ModelRunner` read at one engine start (Qwen3.8-27B, TP1, CUDA
-graphs and prefix caching on, `--max-model-len 262144`): the device, its
-capacity and the stack; every field no probe fills is assumed, on either host.
-One real burst on each host adds the HTTP intake terms (`INTAKE`), two of each
-host's GPUs the PP send carriers (`PP`), and on node 18 `probe_device.py`'s
-readings (`PEAKS`) the compute and memory derates, the bandwidth curve, the
-kernel floor and the intra-node link's latency and derate; there 64 lone
-requests add the idle intake (`IDLE`). An engine start's memory readings are `compass measure memory`'s,
-not the spec's. One fragment per probe or origin. Writes the merged document to `--out` when
-`validate` passes, then prints `explain`'s rows for the host, device and
-interconnect blocks, grouped by origin.
-`--sweep-from` takes the tokenizer sweeps from a document this script wrote;
-given `--model` as well, it sweeps only those models' tokenizers and adds them.
+Builds hjbog-srdc-18's spec, or with COMPASS_MACHINE=mi308x-hjbog39
+hjbog-srdc-39's. The device fragment is what ATOM's own `ModelRunner` read at
+one engine start (Qwen3.8-27B, TP1, CUDA graphs and prefix caching on,
+`--max-model-len 262144`): the device, its capacity and the stack; every field
+no probe fills is assumed, on either host. Two of each host's GPUs add the PP
+send carriers (`PP`), and on node 18 `probe_device.py`'s readings (`PEAKS`)
+the compute and memory derates, the bandwidth curve, the kernel floor and the
+intra-node link's latency and derate. An engine start's memory readings are
+`compass measure memory`'s, not the spec's. One fragment per probe or origin.
+Writes the merged document to `--out` when `validate` passes, then prints
+`explain`'s rows for the device and interconnect blocks, grouped by origin.
 """
 
 import argparse
-import datetime
 import json
 import os
-import statistics
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,35 +28,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import probe_device
 
-from atom.compass.spec import (
-    Fragment,
-    MachineSpec,
-    SpecRefusal,
-    explain,
-    merge,
-    tokenizer_fragment,
-    tokenizer_sweep,
-    validate,
-)
+from atom.compass.spec import Fragment, MachineSpec, explain, merge, validate
 from atom.compass.spec.bands import refuse_unbanded
 
 NAME = os.environ.get("COMPASS_MACHINE", "mi308x-hjbog18")
-#: The model whose tokenizer is swept when no `--model` is given.
-MODEL = "Qwen/Qwen3.8-27B"
 AUTHOR = "compass agent for jgong5"
-#: Token counts swept, one to past the 204,288-token p90 prompt of cc-traces.
-LENGTHS = tuple(4**k for k in range(10))
-#: The worst relative residual a tokenizer fit may leave at any swept length.
-#: Encode costs more per token past 64k tokens than below it, so a
-#: fixed-plus-linear law holds it only to about 20% on node 18 and about 35% on
-#: mi355-gpu-45; the bound leaves room for that and still refuses a sweep of the
-#: wrong shape.
-BOUND = 0.40
-#: Sweeps the bound accepts per probe: the entry states each rate's median over
-#: them, and its p10 and p90. On a loaded host a sweep can break the bound at
-#: one length; it is printed and swept again, up to as many times.
-SWEEPS = 10
-
 #: The total ATOM's `ModelRunner` read at one engine start on card 7 of node 18,
 #: at commit 0f045543d, and on card 5 of hjbog-srdc-39 at commit ce625ddd9.
 TOTAL = 206141652992
@@ -94,51 +59,6 @@ RECORD = {
 #: What the start ran: the model, the width, the tree and the run's record.
 SUBJECT = {"model": "Qwen/Qwen3.8-27B", "width": 1, "source_root": f"commit:{COMMIT}"}
 SUBJECT["record"] = f"sha256:{RECORD}"
-
-#: The API server's event loop taking in one HTTP request: `http_intake.py`'s
-#: fit over one real c=256 first-turn cc-traces burst on Qwen3.8-27B TP1 at the
-#: commit named, the record its stamp file (hjbog-srdc-39's, from the probe's
-#: forerunner, less each request's second, cached body read). The band is each
-#: term's p10 and p90 over the host's bursts, each fitted alone: on node 18 six
-#: at 19c5ab09e, stamp files sha256 2b6b7f54, 27267eee, bb06dfdb, dc719c11,
-#: 84077607 and e2b24133; on hjbog-srdc-39 the record and five more from the
-#: forerunner on GPU 4 on 2026-10-18, d72108b4, d0a06a7c, c43f09c8, fdd7795f
-#: and 537a94ba.
-INTAKE = {
-    "mi308x-hjbog18": (
-        "2026-10-18",
-        "19c5ab09e",
-        {"fixed_s": 0.0026078916675536866, "per_byte_s": 5.082586258228853e-09},
-        {
-            "fixed_s": (0.0023905681113767967, 0.002818263790208814),
-            "per_byte_s": (3.728040935451147e-09, 6.552659606331298e-09),
-        },
-        "dc719c11dd8c45b777cdc1c7fb32ea387adab0f6046aa73b667db6d2b912fd1a",
-    ),
-    "mi308x-hjbog39": (
-        "2026-10-18",
-        "2d1d223be",
-        {"fixed_s": 0.002669345165336389, "per_byte_s": 5.603337964226679e-09},
-        {
-            "fixed_s": (0.0023590643143750166, 0.0026066054400923915),
-            "per_byte_s": (3.576250354791265e-09, 5.75468059489999e-09),
-        },
-        "40da90fe439e06efa8aeb8d8b3d5a17a955c507afb6f9aa18401cbbc957739de",
-    ),
-}[NAME]
-#: The intake of a request that finds no other on the loop, on node 18:
-#: `http_intake.py idle` less `INTAKE`'s per-byte rate, over 64 lone requests
-#: (`floor`'s run, GPU 0, 2026-10-20) at the commit named, the record its stamp
-#: file; the band is the p10 and p90 over those requests.
-IDLE = {
-    "mi308x-hjbog18": (
-        "2026-10-20",
-        "dee1854db",
-        0.0008174736867329385,
-        (0.0007076265928628138, 0.0010018610641255089),
-        "eaaf420687a928940f535d8a3d4e8d449e896c7c155516fad1e3fcacab90d44c",
-    ),
-}.get(NAME)
 
 #: A pipeline stage's send, per carrier, fitted by `scripts/compass/pp_carriers.py`
 #: pooled at the commit named over six of its probe records, on hjbog-srdc-39
@@ -279,7 +199,6 @@ PEAKS = {
 }.get(NAME)
 
 DEVICE = {
-    "host": {"cpu": {"cores_physical": 112, "cores_logical": 224}},
     "device": {
         "name": "MI308X",
         "arch": "gfx942",
@@ -295,9 +214,6 @@ DEVICE = {
 #: bandwidth curve ends at the derated bandwidth, and the rest are the schema's
 #: example values. Where `PEAKS` is stated, its fields replace these.
 DECLARED = {
-    "host": {
-        "ipc": {"zmq_roundtrip_s": 5.0e-5, "shm_broadcast_s": 2.0e-5},
-    },
     "device": {
         "memory": {
             "bandwidth_bytes_per_s": 5.3e12,
@@ -346,34 +262,12 @@ def fragment(
     return Fragment.from_mapping(document, source)
 
 
-def intake(
-    model: str, date: str, root: str, terms: dict, band: dict, record: str
-) -> Fragment:
-    """The HTTP intake terms one burst of `model` at commit `root` fitted, and
-    each term's band over the host's bursts."""
-    subject = {"model": model, "source_root": f"commit:{root}"}
-    subject["record"] = f"sha256:{record}"
-    how = f"one real c=256 first-turn cc-traces burst at {root}"
-    body = {"host": {"http_intake": terms}}
-    band = {f"host.http_intake.{k}": v for k, v in band.items()}
-    return fragment("intake", body, "probed", how, subject, date, band)
-
-
 def device_fragments() -> list[Fragment]:
     """The fragments the engine start and any other probe filled, and the
     assumed rest."""
     notes = f"one Qwen3.8-27B TP1 start at {COMMIT}"
     ptl = {"device": {"ptl": PTL}}
     probes = [fragment("ptl", ptl, "probed", "ptl_enable", date="2026-10-18")]
-    probes.append(intake("Qwen/Qwen3.8-27B", *INTAKE))
-    if IDLE:
-        date, root, value, band, record = IDLE
-        subject = {"model": "Qwen/Qwen3.8-27B", "source_root": f"commit:{root}"}
-        subject["record"] = f"sha256:{record}"
-        body = {"host": {"http_intake": {"idle_s": value}}}
-        band = {"host.http_intake.idle_s": band}
-        how = f"http_intake.py idle over 64 lone requests at {root}"
-        probes.append(fragment("idle", body, "probed", how, subject, date, band))
     if PP:
         date, root, carriers, band, record = PP
         subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
@@ -409,100 +303,11 @@ def peaks(readings: tuple, stated: dict, assumed: Fragment) -> tuple:
     return probed, Fragment(assumed.source, kept)
 
 
-def swept(models: list[str]) -> list[Fragment]:
-    """Each distinct tokenizer the servers of `models` load, swept once; its
-    entry applies to the architectures of every model that loads it."""
-    from transformers import PretrainedConfig
-
-    from atom.compass.run import _fingerprint
-    from atom.model_engine.llm_engine import _load_tokenizer
-
-    loaded: dict[tuple, tuple] = {}
-    for model in models:
-        tok = _load_tokenizer(model)
-        key = (_fingerprint(tok), tok.is_fast)
-        applies = loaded.setdefault(key, (model, tok, []))[2]
-        for name in PretrainedConfig.get_config_dict(model)[0]["architectures"]:
-            if name not in applies:
-                applies.append(name)
-    return [_swept_once(*found) for found in loaded.values()]
-
-
-def _swept_once(model: str, tok, applies_to: list[str]) -> Fragment:
-    """The tokenizer `tok` the server of `model` loads, swept over this tree's
-    own source."""
-    from atom.compass.artifacts.provenance import git_tree_root
-    from atom.compass.run import _fingerprint
-
-    root = git_tree_root("atom", str(ROOT))
-    text = "\n".join(p.read_text() for p in sorted((ROOT / "atom").rglob("*.py")))
-    runs, refused = [], 0
-    while len(runs) < SWEEPS:
-        try:
-            runs.append(
-                tokenizer_sweep(
-                    tok, text, LENGTHS, bound=BOUND, clock=time.perf_counter
-                )
-            )
-        except SpecRefusal as refusal:
-            refused += 1
-            print(f"sweep {len(runs) + refused} refused: {refusal.what}")
-            if refused > SWEEPS:
-                raise
-    rates = {k: [r[k] for r in runs] for k in runs[0]}
-    cut = {
-        k: statistics.quantiles(v, n=10, method="inclusive") for k, v in rates.items()
-    }
-    entry = {
-        "id": Path(model).name.lower(),
-        "backend": "fast" if tok.is_fast else "slow",
-        "vocab_size": len(tok),
-        "fingerprint": _fingerprint(tok),
-        "applies_to": applies_to,
-        **{k: statistics.median(v) for k, v in rates.items()},
-        # Measured on the host it describes, so nothing is taken off it.
-        "derate": 1.0,
-    }
-    return tokenizer_fragment(
-        [entry],
-        machine=NAME,
-        authored_by=AUTHOR,
-        date=datetime.datetime.now(datetime.timezone.utc).date().isoformat(),
-        origin="probed",
-        subject={
-            "model": model,
-            "source_root": f"{root.revision_kind}:{root.revision}",
-        },
-        source="tokenizer",
-        band={
-            "p10": {k: c[0] for k, c in cut.items()},
-            "p90": {k: c[8] for k, c in cut.items()},
-        },
-    )
-
-
-def saved(path: Path) -> Fragment:
-    """The tokenizer fragment a written document carries, in place of a new
-    sweep: its core counts and tokenizers, each with the origin it records."""
-    document = json.loads(path.read_text())
-    stanza = document["provenance"]
-    origins = {
-        label: found
-        for label, found in stanza["origins"].items()
-        if label.startswith(("host.cpu.", "host.tokenizers["))
-    }
-    stanza = {"authored_by": stanza["authored_by"], "date": stanza["date"]}
-    stanza |= {"origin": "mixed", "origins": origins}
-    host = {key: document["host"][key] for key in ("cpu", "tokenizers")}
-    body = {"schema_version": 1, "name": NAME, "provenance": stanza, "host": host}
-    return Fragment.from_mapping(body, "tokenizer")
-
-
 def report(merged) -> str:
     """`explain`'s rows grouped by origin."""
     spec = MachineSpec.from_mapping(merged.document)
     groups: dict[str, list[str]] = {}
-    for block in ("host", "device", "interconnect"):
+    for block in ("device", "interconnect"):
         for row in explain(spec, block, origin=merged).contributions:
             groups.setdefault(row.origin["origin"], []).append(f"  {row}")
     lines = [line for origin, rows in groups.items() for line in (f"{origin}:", *rows)]
@@ -511,16 +316,11 @@ def report(merged) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--model", action="append", help="repeats; default " + MODEL)
     parser.add_argument(
         "--out", type=Path, default=ROOT / "scripts/compass/machines" / f"{NAME}.json"
     )
-    parser.add_argument("--sweep-from", type=Path, help="a document to reuse")
     args = parser.parse_args(argv)
-    sweeps = [saved(args.sweep_from)] if args.sweep_from else []
-    if args.model or not sweeps:
-        sweeps += swept(args.model or [MODEL])
-    merged = merge([*sweeps, *device_fragments()])
+    merged = merge(device_fragments())
     verdict = validate(merged.document)
     print(verdict)
     if not verdict.ok:
