@@ -16,8 +16,8 @@ output's token copy (`t_recv_ns`, only on a forward that reaches it; off a
 pipeline, a runner that does not defer its output reads its own tokens under
 `t_read_ns` instead), and with
 a drafter its MTP status (`t_mtp_ns`) and draft copy (`t_draft_recv_ns`). Its device
-window is `d_busy_ns`, from an event recorded at the launch's entry to one
-recorded at the forward's exit (`d_target_ns` to one recorded just after
+window is `d_busy_ns`, from an event recorded at the launch's entry, the clock
+read just before it under `t_launch_event_ns`, to one recorded at the forward's exit (`d_target_ns` to one recorded just after
 `postprocess` records `forward_done_event`, less the drafter's `compute_draft_kv`
 pass before it, or on a forward that samples nothing, to the start of its first
 drafter pass, that one or `propose_draft_token_ids`); `d_draft_kv_ns` and
@@ -106,6 +106,7 @@ TIMESTAMPS = (
     "t_exit_ns",
     "t_gate_ns",
     "t_launch_ns",
+    "t_launch_event_ns",
     "t_recv_ns",
     "t_read_ns",
     "t_mtp_ns",
@@ -613,6 +614,9 @@ class StepRecording:
         if getattr(self, "_parity_record", None) is not None:
             from atom.utils.forward_context import get_forward_context
 
+            # Read before the event is recorded, so no host stall between the
+            # two moves it past the event.
+            self._stamps["t_launch_event_ns"] = self.step_clock_ns()
             self._stamps["launch_event"] = self.device_event()
             context = get_forward_context().context
             self._stamps["forward_mode"] = getattr(context, "forward_mode", None)
