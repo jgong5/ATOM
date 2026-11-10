@@ -40,11 +40,9 @@ READ = "from atom.compass.capture import driverless\n"
 READ += f"driverless.card = {{0: {A0!r}}}.get\n"
 TRUTH = pathlib.Path(__file__).with_name("v41_capture_truth.py")
 #: The slots where ATOM passes the occurrences of one leaf two buffers, of
-#: which the bench binds one: a query's RoPE positions and a ratio-1 key's
-#: (#2865), and the decoder tail's batch ids and its layer 39's queries'
-#: (#2867).
+#: which the bench binds one: the decoder tail's batch ids and its layer 39's
+#: queries' (#2867).
 SPLIT = {
-    ("aiter.rope_cached_positions_fwd_impl.default", "positions"),
     ("atom.model_ops.attentions.deepseek_v41.indices:_launch_indices", "batch_ids"),
     ("atom.model_ops.attentions.deepseek_v41.indices:_launch_indptr_scan", "batch_ids"),
 }
@@ -61,6 +59,8 @@ PLANE_BOUND = {
     "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
     "atom.model_ops.deepseek_v41.indexer:_block_maxima",
 }
+#: V4.1's RoPE, over a query's heads or a ratio's index keys, one head.
+ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 #: V4.1's read of its state cursors back to the host, `.cpu()`, a copy into
 #: pageable memory, which no CUDA graph captures: `measure ops` refuses it.
 HOST_COPY = "aten.to.dtype_layout"
@@ -149,3 +149,15 @@ def test_each_leaf_takes_the_buffers_atom_s_capture_passes_it(rehearsed):
             if want and want != {name}:
                 wrong.append((r["shape"], r["op"], path, name, want))
     assert checked and wrong == []
+
+
+def test_each_rope_takes_its_query_s_or_its_ratio_s_key_positions(rehearsed):
+    """Each RoPE leaf takes the positions ATOM's capture passes it, at each
+    point: the query's and each ratio's keys' apart, a buffer a leaf."""
+    got, truth = rehearsed
+    for shape in ("decode B=16", "prefill T=2048 B=1"):
+        ropes = [r for r in got["cached"] if (r["op"], r["shape"]) == (ROPE, shape)]
+        taken = {r["leaf"]: r["identity"].get("positions") for r in ropes}
+        want = {s: truth.get(s, {}).get("positions") for s in taken}
+        assert {s: [n] for s, n in taken.items()} == want
+        assert len(set(taken.values())) == len(taken) >= 3
