@@ -1930,10 +1930,11 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     its two ends differ (`forward.PerG`) each G of the shape is traced as
     above instead, the shape and why named in `lazy`'s ``lazy_per_g``.
 
-    A graph the store holds is loaded through `ArtifactStore.load` under this
-    process's `graph_readings`, and its engine config as it records it: that
-    cell holds the tracer's own ATOM arguments, which no reader restates, and
-    the key's structure names the engine config in their place."""
+    A graph the store holds, at a shape or holding G, is loaded through
+    `ArtifactStore.load` under this process's `graph_readings`, and its engine
+    config as it records it: that cell holds the tracer's own ATOM arguments,
+    which no reader restates, and the key's structure names the engine config
+    in their place."""
     from atom.compass.artifacts import (
         ArtifactStore,
         Axis,
@@ -1980,6 +1981,18 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         lazy["lazy_traces"] += 1
         lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
 
+    @functools.cache
+    def here() -> dict:
+        return graph_readings(config.model)
+
+    def load(key) -> dict:
+        """The graph the store holds at `key`, as `capture.graph.to_json`
+        writes it, loaded under `here` and the engine config it records."""
+        cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
+        conditions = Conditions.of(**here(), engine_config=cells[Axis.ENGINE_CONFIG])
+        entry = store.load(key, conditions=conditions, gates=GateState.of())
+        return json.loads(entry.read_member("graph", rank, "json"))
+
     def read(at: str, shape: str) -> dict | None:
         """The graph the store, or this lookup's unpublished traces, hold at
         structure `at` and `shape`, as `capture.graph.to_json` writes it."""
@@ -1988,7 +2001,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():
             return None
-        return json.loads(store.read(key).read_member("graph", rank, "json"))
+        return load(key)
 
     @functools.lru_cache(maxsize=64)
     def held(at: str, shape) -> dict | None:
@@ -1999,10 +2012,6 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
             held_traced.add(shape)
             lazily(shape, symbolic=True)
         return read(at, text)
-
-    @functools.cache
-    def here() -> dict:
-        return graph_readings(config.model)
 
     @functools.lru_cache(maxsize=64)
     def graph(
@@ -2026,10 +2035,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
             return unpublished[at, str(shape)]["region"]
         if missing:
             return missed(store, key) or None
-        cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
-        conditions = Conditions.of(**here(), engine_config=cells[Axis.ENGINE_CONFIG])
-        entry = store.load(key, conditions=conditions, gates=GateState.of())
-        return json.loads(entry.read_member("graph", rank, "json"))["region"]
+        return load(key)["region"]
 
     return graph
 
