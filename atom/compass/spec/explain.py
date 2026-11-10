@@ -6,18 +6,16 @@ supplied it and its origin; nothing is summed, since a summed check once hid
 three errors, two of which cancelled. A spec-peak number is shown with its
 derate and the derated value beside it.
 
-A term is a field or block by dotted path. Tokenizer rates explain per entry
-and per rate.
+A term is a field or block by dotted path.
 """
 
 from dataclasses import dataclass
 from typing import Any
 
-from .fields import BY_PATH, SCHEMA, Kind
-from .machine import MachineSpec, entry_label
+from .fields import BY_PATH, SCHEMA
+from .machine import MachineSpec
 from .merge import Merge
 from .rules import Rule, SpecRefusal
-from .tokenizers import ENTRY_FIELDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,23 +84,6 @@ def _rows(spec: MachineSpec, path: str, origin: Merge | None) -> list[Contributi
     field = BY_PATH[path]
     value = spec.values[path]
     derate = spec.values.get(field.derate) if field.peak else None
-    if field.kind is Kind.TOKENIZERS:
-        rows = []
-        for entry in spec.tokenizers.entries:
-            label = entry_label(entry.key.id, entry.key.backend.value)
-            for rate in ENTRY_FIELDS:
-                if rate.kind is not Kind.QUANTITY:
-                    continue
-                rows.append(
-                    _row(
-                        f"{label}.{rate.path}",
-                        getattr(entry, rate.path),
-                        entry.derate if rate.peak else None,
-                        _supplied(origin, label, path),
-                        spec.origin(label),
-                    )
-                )
-        return rows
     document = path in ("name", "schema_version") or path.startswith("provenance.")
     found = None if document else spec.origin(path)
     return [_row(path, value, derate, _supplied(origin, path), found)]

@@ -16,7 +16,7 @@ from atom.utils.clock import LPRuntime
 
 def _run(tmp_path, monkeypatch) -> dict:
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 0.001,
         "stream_s": 0.002,
         "bound_s": 10.0,
@@ -33,7 +33,7 @@ def test_the_summary_names_its_schema_version_and_the_tree_that_ran(
 ):
     run = _run(tmp_path, monkeypatch)
     authority = compass_run._RecordingAuthority(run)
-    authority.started = authority.finished = time.monotonic()
+    authority.finished = time.monotonic()
     monkeypatch.setattr(compass_run, "_authority", authority)
     table = compass_run.channel_table(run)
     compass_run._hand_in(run, compass_run.ENGINE.name, [])
@@ -72,7 +72,7 @@ def test_the_summary_names_the_router_binary_and_keeps_it_out_of_the_configurati
     }
     run["router"] = router
     authority = compass_run._RecordingAuthority(run)
-    authority.started = authority.finished = time.monotonic()
+    authority.finished = time.monotonic()
     compass_run._hand_in(run, compass_run.ENGINE.name, [])
     compass_run._hand_in(run, compass_run.FRONTEND.name, [])
     compass_run._write_summary(run, authority)

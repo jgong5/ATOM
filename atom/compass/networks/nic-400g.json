@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "name": "nic-400g",
+  "provenance": {
+    "authored_by": "compass agent for jgong5",
+    "date": "2026-11-03",
+    "origin": "assumed",
+    "notes": "no probe fills these: one 400 Gb/s NIC's line rate between the prefill and the decode node, with the schema's example latency and derate; the MI308X specs and gpu-40's and gpu-45's MI355X specs assume it"
+  },
+  "interconnect": {
+    "inter_node": {
+      "link_bandwidth_bytes_per_s": 5.0e10,
+      "link_latency_s": 5.0e-6,
+      "derate": 0.8
+    }
+  }
+}

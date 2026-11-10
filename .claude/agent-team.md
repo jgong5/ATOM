@@ -25,7 +25,8 @@ own `gh` login. Ownership is the assignee:
 - **Scope.** A `run` acts only on issues and PRs assigned to its own `gh`
   login: claim, review, develop and land all stay inside that set. Every
   other open issue and PR belongs to someone else; `status` may report
-  them, nothing else touches them. One exception: in a stack that holds
+  them, nothing else touches them, except the item's ruler's `verdict`
+  (`verdict.md`). One exception: in a stack that holds
   another owner's PR, linking, unstacking and base PATCHes may name it,
   since they land and push nothing.
 - **Assignee on creation.** Every issue and PR gets an assignee when it is
@@ -42,10 +43,12 @@ own `gh` login. Ownership is the assignee:
   owner's run stops touching them, the new owner's run takes them over
   (recreating the worktree from the PR branch). A push rejected during the overlap is
   fetched and merged, never forced.
-- **`need human`** is removed by the assignee of the issue or PR that
-  carries it, except an escalation
-  about a design decision (a D-numbered decision, a design document, a new
-  hook point in ATOM): only @jgong5 removes that one.
+- **Rulers.** An escalation about a design decision (a D-numbered decision,
+  a document under `atom/compass/design/`, a new hook point in ATOM) opens
+  with `Needs ruling from @jgong5:`, so @jgong5 rules it whoever the
+  assignee is. Any other escalation follows `rules.md` (Escalations). A
+  design item whose ruler is not @jgong5 is handed to @jgong5 through
+  `verdict`, not ruled.
 
 ## Environment requirements
 

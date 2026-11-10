@@ -24,6 +24,11 @@ from its first draft pass on: its prices are its `draft_terms`, named
 rows run at the step's width: its first pass runs the rows' tokens unpadded.
 A target that replays no graph yet pads past its rows (`target_bs`) is read
 at that width, `W=`: an eager decode's model, a sampling prefill's LM head.
+A block drafter (`block`) runs its draft-KV pass between its target's forward
+and the sampling on a step that samples: that step also reads the pass's
+graph, `graph(..., draft=KV)`, at the target's shape, and prices it among the
+target's terms, named ``draft_kv op.<kind>``, since the step's output waits
+for it.
 
 Each leaf is one pricing unit, `max(t0, F / peak, M / BW(M), t_comm)` over its
 work (`op_work.work`): its own tensors at the captured shape, the state it
@@ -106,6 +111,9 @@ TBO = "op.tbo"
 NONE = "; no successor: the analytical law is the last op-level source"
 #: The prefix of a drafter's terms.
 DRAFT = "draft "
+#: The prefix of a block drafter's draft-KV pass's terms on a step that
+#: samples, and what its graph's structure adds to its drafter's.
+DRAFT_KV, KV = "draft_kv ", "kv"
 #: The leaves a backend keeps; past it, it forgets them all and every price
 #: it kept across steps.
 KEPT = 1 << 16
@@ -284,6 +292,7 @@ class OpGraphBackend(CostBackend):
         split_send_recv: bool = False,
         price_list: CostSource | None = None,
         drafts: int = 0,
+        block: bool = False,
     ) -> None:
         self.machine = machine
         self.graph = graph
@@ -294,6 +303,7 @@ class OpGraphBackend(CostBackend):
         self.padded = padded
         self.split_send_recv = split_send_recv
         self.drafts = drafts
+        self.block = block
         self.name = machine.values.get("name", "")
         self._stated_as: dict[str, str] = {}
         # By leaf object: the leaf, the text of what its price reads of it, and
@@ -322,9 +332,11 @@ class OpGraphBackend(CostBackend):
             drafted_at, drafted = (
                 self._region(batch_view, draft=True) if self.drafts else (None, None)
             )
+            samples = batch_view.decode or batch_view.produces_output
+            kv = self.block and samples and self._region(batch_view, draft=KV)[1]
             # A price list's bound reads each step's context, so its steps
             # compose afresh.
-            graph = None if bound else (at, id(region), drafted_at, id(drafted))
+            graph = None if bound else (at, id(region), drafted_at, id(drafted), id(kv))
             if graph in self._graphs:
                 # The other leaves' prices read nothing of a step.
                 missed: list[Refusal] = []
@@ -338,6 +350,11 @@ class OpGraphBackend(CostBackend):
                     return cost
             self._live = [] if graph else None
             priced = self._priced(region, batch_view, refused, bound)
+            if kv:
+                priced += [
+                    (DRAFT_KV + p[0], *p[1:])
+                    for p in self._priced(kv, batch_view, refused, bound)
+                ]
             if self.drafts:
                 bound = self.resolver and self._bound(batch_view, draft=True)
                 priced += [
@@ -392,7 +409,7 @@ class OpGraphBackend(CostBackend):
             if len(composed) >= COMPOSED:
                 composed.clear()
             composed[_same(live)] = cost
-            self._graphs[graph] = ((region, drafted), live, composed)
+            self._graphs[graph] = ((region, drafted, kv), live, composed)
         return cost
 
     def describe(self) -> str:
@@ -453,11 +470,12 @@ class OpGraphBackend(CostBackend):
             wide = (*wide[:5], wide[5] * b / width)
         return bound, wide, both, (frozenset(counts), frozenset(wides))
 
-    def _region(self, view: BatchView, draft: bool = False) -> tuple[str, dict]:
+    def _region(self, view: BatchView, draft: bool | str = False) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
         with `draft`, its drafter's, a decode's at its rows, at `draft_moe_rows`,
         its later passes at `draft_bs`; else a target that pads past its rows
-        without a replay at `target_bs`."""
+        without a replay at `target_bs`, as a block drafter's draft-KV pass in
+        its step is read (`draft` is `KV`)."""
         if view.image_tokens:
             reason = IMAGES
         else:
@@ -469,14 +487,15 @@ class OpGraphBackend(CostBackend):
                 reason = f"a step that {exc}"
             else:
                 output = any(d for _, d in rows) or view.produces_output
-                width = self.padded and (view.draft_bs if draft else view.target_bs)
-                if draft and shape[0] == "decode":
+                own = draft is True  # the drafter's passes, not its draft-KV pass
+                width = self.padded and (view.draft_bs if own else view.target_bs)
+                if own and shape[0] == "decode":
                     shape = ("decode", len(rows), width or shape[2])
                     width = None
                 none = "" if output else " that produces no output"
-                gathered = view.draft_moe_rows if draft else view.moe_rows
+                gathered = view.draft_moe_rows if own else view.moe_rows
                 g = () if gathered is None else (gathered,)
-                drafted = {"draft": True} if draft else {}
+                drafted = {"draft": draft} if draft else {}
                 # A DP middle chunk runs its drafter's propose too.
                 if (output or self.dp > 1) and width and width != shape[2]:
                     drafted["width"] = width
@@ -499,8 +518,9 @@ class OpGraphBackend(CostBackend):
                             *shape,
                             "".join(f" gathering {n} rows" for n in g),
                             none,
-                            " for its drafter" * draft
-                            + f", {'its later passes at' if draft else 'padded to'} {width}"
+                            " for its drafter" * bool(draft)
+                            + "'s draft-KV pass" * (draft == KV)
+                            + f", {'its later passes at' if own else 'padded to'} {width}"
                             * ("width" in drafted),
                             region or "",
                         )

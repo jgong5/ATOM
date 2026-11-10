@@ -18,8 +18,10 @@ its own stamp in the body, after the seq:
 ``{"compass_cancel": <seq>, "kv_transfer_params": {"compass": "a:<arrival>;s:<seq>"}}``.
 """
 
-import json
 import re
+from typing import Any
+
+import msgspec
 
 from atom.utils.clock import channel_of
 
@@ -94,34 +96,46 @@ def sse_stamp(line: str) -> tuple[float, int] | None:
     return _parse(_COMMENT, line, "SSE comment")
 
 
-def _relayed(body: bytes) -> dict | None:
-    """`body` parsed, when it is a JSON object whose ``kv_transfer_params`` is one."""
-    try:
-        doc = json.loads(body)
-    except ValueError:
-        return None
-    if isinstance(doc, dict) and isinstance(doc.get("kv_transfer_params"), dict):
-        return doc
-    return None
+class _Params(msgspec.Struct):
+    compass: Any = None
+
+
+class _Relayed(msgspec.Struct):
+    kv_transfer_params: _Params | None = None
+
+
+# A relayed body carries the prompt's ids, beside its ``kv_transfer_params`` from
+# prefill and inside it to decode. Reading or writing the stamp decodes neither:
+# `_STAMP` reads the one entry, `_MEMBERS` leaves each member's value as its text.
+_STAMP = msgspec.json.Decoder(_Relayed)
+_MEMBERS = msgspec.json.Decoder(dict[str, msgspec.Raw])
+_ENCODE = msgspec.json.Encoder()
 
 
 def relay_stamp(body: bytes) -> tuple[float, int] | None:
     """The ``(arrival, seq)`` a JSON request body's ``kv_transfer_params`` carries;
     None without one."""
-    doc = _relayed(body)
-    value = None if doc is None else doc["kv_transfer_params"].get("compass")
+    try:
+        params = _STAMP.decode(body).kv_transfer_params
+    except msgspec.DecodeError:
+        return None
+    value = None if params is None else params.compass
     return None if value is None else _parse(_ENTRY, value, "kv_transfer_params entry")
 
 
 def with_relay_stamp(body: bytes, stamp) -> bytes:
     """`body` with ``stamp()``'s ``(arrival, seq)`` in its ``kv_transfer_params``;
-    `body` itself, and `stamp` not called, when it has no such object."""
-    doc = _relayed(body)
-    if doc is None:
+    `body` itself, and `stamp` not called, when it has no such object. Every
+    other value keeps its JSON text."""
+    try:
+        doc = _MEMBERS.decode(body)
+        params = _MEMBERS.decode(doc["kv_transfer_params"])
+    except (msgspec.DecodeError, KeyError):
         return body
     arrival, seq = stamp()
-    doc["kv_transfer_params"]["compass"] = f"a:{arrival!r};s:{seq}"
-    return json.dumps(doc).encode()
+    params["compass"] = f"a:{arrival!r};s:{seq}"
+    doc["kv_transfer_params"] = msgspec.Raw(_ENCODE.encode(params))
+    return _ENCODE.encode(doc)
 
 
 _CANCEL = re.compile(

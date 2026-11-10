@@ -19,6 +19,10 @@ at the op level, `measure ops` records each point's kernel identity, and a leaf 
 no same-kernel bracket is declined by the price list and answered by the leaf's analytical
 law, counted (D60).
 
+**Revised 2026-11-03 by [#2716](https://github.com/jgong5/ATOM/issues/2716):** host laws
+key the device, the software stack and torch in place of the machine-spec digest, as
+`07`'s artifact key table keys them (D54, `07` D41).
+
 **Scope.** How measurements become a model: objective, feature construction, outlier
 handling, guards, and how a functional form is chosen and shown to be right. This is a
 separate concern from the toolchain that produces the data and from the protocol that
@@ -89,12 +93,17 @@ In place over 2,174 measured decode steps: **0.73% median**, per rung 0.46 / 0.4
 Twelve sequences cost *less* per step than one. A model assuming monotone growth in batch
 is wrong in direction, not just in magnitude.
 
-### Under DP and EP: one per-rank law per engine config
+### Under TP, DP and EP: one per-rank law per engine config
 
 Owner's DP ruling, 2026-10-01
 ([#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)). The step linear law covers
 DP and EP with a **per-rank** law: it prices one rank's step, and the group's device end is
 the `max` over ranks (`15` D90).
+
+Under TP the law prices TP rank 0's step at the width its engine config states, the
+TP collectives inside it; the other TP ranks charge nothing. A law fitted at TP4 prices a
+TP4 run and is refused at any other width, like any other layout field
+([#2490](https://github.com/jgong5/ATOM/issues/2490)).
 
 - **Key.** The engine config, the one source of the parallel layout (owner ruling on
   [#973](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012), 2026-10-16):
@@ -112,14 +121,31 @@ the `max` over ranks (`15` D90).
   TP1-only full-engine calibration of `07` D38; with EP off the MoE segment does not,
   since `flatten_tp_across_dp` shards every expert `dp` ways; with EP on it does, each
   rank running its own experts whole on the rows MORI delivers.
-- **The fit: alternating max-affine regression.** The ranks wait for each other inside the
-  forward, so a rank's measured step is the group's step and its own cost is never seen:
-  the observation is `y = max_r f(x_r)`. The fit alternates two moves until no step
-  changes rank: assign each step to the rank with the largest prediction under the
-  current coefficients, then refit the one law on the assigned ranks' features, each
-  equation divided by its target (D53). This is the least-squares partition heuristic for
-  max-affine fitting (Magnani and Boyd, 2009), with the ranks in place of the affine
-  pieces and one coefficient vector shared by all of them.
+- **The fit: line-searched alternating max-affine regression.** The ranks wait for each
+  other inside the forward, so a rank's measured step is the group's step and its own
+  cost is never seen: the observation is `y = max_r f(x_r)`. The fit minimises
+  `F(c) = sum_i (max_r x_ir.c / y_i - 1)^2`, each equation divided by its target (D53),
+  under non-negative coefficients. It starts from the fit on every rank's row and, per
+  feature that differs between some step's ranks, from that feature's axis scaled to the
+  labels ([#3042](https://github.com/jgong5/ATOM/issues/3042): the fit on every rank's
+  row alone settles in a local minimum on a real DP record). Each start runs the first
+  round with every step kept; the lowest `F` goes on, and its start is recorded. Each pass
+  assigns each step to the rank with the largest prediction under the current
+  coefficients and refits the one law on the assigned ranks' features: a Gauss-Newton
+  step on `F`. A backtracking line search halves the step until `F` falls, so `F` falls
+  on every pass and the passes cannot cycle. They end settled, the refit assigning
+  each step the rank it was fitted on, or at a tie between ranks, when no step larger
+  than a numerical tolerance (the square root of the float epsilon, on the relative
+  prices) lowers `F`. MAD drops are its outer loop. A pass cap reached refuses the fit.
+  This is the least-squares partition heuristic for max-affine fitting (Magnani and Boyd,
+  2009), with the ranks in place of the affine pieces and one coefficient vector shared
+  by all of them, damped so that it descends.
+- **Each vector on the rows it prices.** Owner's decision on
+  [#2904](https://github.com/jgong5/ATOM/issues/2904), 2026-11-06: a DP vector is solved,
+  hulled and warm-cut on the rows it prices itself, the rank `priced_rank` picks under
+  it; a decode rung that adopts a MoE column or `rowmod` is fitted again under it, from
+  every rank's row. One entry, `step_linear_fit._fit_form`, fits a form and returns its
+  vector with those rows.
 
 ### The label: device time per step kind, and the host laws beside it
 
@@ -142,7 +168,7 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
 | step kind | label | cut |
 |---|---|---|
 | decode | device gap + busy window | launch-exposed |
-| output prefill, middle chunk | busy window | host-paced |
+| output prefill, middle chunk | a trace run's busy time, per pass | no trace run |
 
 - **Decode.** The gap is device work between forwards that no other term carries; leaving
   it out charged decode about 0.29% short on #824's c=1 record (#841). A forward whose
@@ -153,19 +179,51 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   No launch-exposed cut: under an eager launch the device starts the first kernel while the host still
   launches the rest, so device start precedes launch end on every eager forward, and the
   cut would leave prefill unpriced.
-- **Host-paced prefill.** A prefill forward whose exit event ran less than 8% of its label
-  after the host recorded it is cut as host-paced and counted apart: the device had caught
-  up with the host's launch, so its window holds device idle between launches and only
-  bounds its device time. A device event runs no earlier than the host records it, so the
-  largest launch record less its device start, over the record, places device times on the
-  host clock. On the DSpark TP2 records the share falls in two clusters, host-paced output
-  prefills at 0 to 4.3% and device-paced forwards from 11%; a traced run's kernel busy time
-  confirms the split ([#1983](https://github.com/jgong5/ATOM/issues/1983)). The 8% share is
-  interim: [#2072](https://github.com/jgong5/ATOM/issues/2072) labels every prefill pass
-  with traced busy time instead.
-- **Accepted approximation.** A host bubble inside a device-paced prefill forward stays in its device
-  time. Same-host parity absorbs it through `01` D4's `end = max(target_end,
-  launch_end)`; skipping a host segment or pricing another host does not.
+- **Traced prefill.** Owner ruling on
+  [#2072](https://github.com/jgong5/ATOM/issues/2072#issuecomment-6380112358), 2026-10-24,
+  replacing [#1983](https://github.com/jgong5/ATOM/issues/1983)'s interim cut of
+  host-paced prefills: a window holds the device's idle between launches the host paced,
+  so every prefill pass, target and draft, is labelled with busy time from a **trace run**,
+  a second run of the record's recipe and client under ATOM's kineto profiler on every TP
+  rank, without Python stacks (`07` D38, Phase 1c). Per forward and pass, split at
+  `forward_done_event`, busy time is the union of the pass's kernels plus each gap before
+  one of them: whole where that kernel was already queued when the gap opened, else capped
+  at the trace's median such queued gap. Copies on ATOM's copy stream, the stream that runs
+  no kernel, are left out: the host waits for them and no kernel does, and `01` keeps the
+  copy stream off the timeline
+  ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6707000151)). A TP
+  collective, the target's or the drafter's, counts from its last rank's start, and each
+  pass's busy time is its largest over the ranks. Every rank is profiled throughout and
+  none pauses
+  ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6702728444)): on
+  crsuse2-m2m-v3-005 a pause ran `hipDeviceSynchronize` on its rank, and the peer waited
+  about 107 ms at the drafter's step-begin fence. kineto's ROCm tracer keeps at most
+  `ROCTRACER_MAX_EVENTS` rows a process and drops the rest unmarked: at its default of
+  5,000,000 every rank of a 300 s V4.1-Flash TP4 trace run stopped recording launches
+  and kernels about 150 s in. The driver sets it to its largest, and a trace that lacks a
+  forward's device rows refuses ([#3106](https://github.com/jgong5/ATOM/issues/3106)).
+  With both ranks profiled the draft-KV
+  concatenation runs about 6% long; drafter labels keep that, and
+  [#2945](https://github.com/jgong5/ATOM/issues/2945) finds its cause. A traced kernel
+  shorter than about 4.7 us runs to that floor, so drafter labels stay 5 to 11% over
+  unprofiled time until [#2415](https://github.com/jgong5/ATOM/issues/2415) subtracts each
+  kernel's floor ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6460474362)).
+  No cut, threshold or interval. The
+  prefill device law fits from trace runs only, and a fit given none names its prefill
+  vector unfitted; a trace run's decodes and host segments are profiled, so it gives no
+  decode or host label, and an ordinary record fits the decode and host laws. A trace run
+  under DP refuses. Checked-in laws keep their labels until refitted, and a refit needs a
+  trace run. A DP law's prefill vector keeps its window labels at a refit, its provenance
+  naming them and the tree it was fitted at, until [#3010](https://github.com/jgong5/ATOM/issues/3010)
+  gives DP ranks a trace run ([Ruling](https://github.com/jgong5/ATOM/issues/2853#issuecomment-6717057158)).
+  On Run 4B's TP0 trace the busy time of device-paced forwards sat within 0.6%
+  of the window per target pass and the final's draft at +2.3%, where copy-stream copies
+  ran past the window's last event; the capped gaps added none of a host-paced final's
+  busy time ([#2072](https://github.com/jgong5/ATOM/issues/2072#issuecomment-6387348851)).
+- **Profiler check.** On each trace run, a law fitted on ordinary records prices the busy
+  time of the forwards no kernel of which waited on its launch, per kind and pass, so a
+  pass the profiler slows reads apart. On Run 4B, traced with Python stacks, the final's
+  draft read 9% over such a law, its target within 1%.
 
 The R1 wait's exit, a host time at which a known device event has completed, anchors the
 host and device clocks to each other. With MTP the label splits at
@@ -178,6 +236,20 @@ before it too: its target label holds it, and the draft law's prefill vector, wh
 prices a middle chunk's pass as draft, prices it among the target's terms, as the
 draft law's `output_prefill_kv` states; the output prefill's draft label, all after
 the event, fits the `propose` vector ([#2100](https://github.com/jgong5/ATOM/issues/2100)).
+The pass replays one draft graph at any prefill length, yet on the DeepSeek-V4.1-Flash
+DSpark TP4 records its window ran about three times as long when the device reached it a
+few milliseconds behind the host's return from the R1 wait, where the host queues it, as
+when the device ran further behind, after a long prefill or a middle chunk
+([#2492](https://github.com/jgong5/ATOM/issues/2492)). That extra window is host time
+([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6684001197), 2026-11-06):
+a trace run's busy time leaves it out, so the propose labels fit one `propose` vector, and
+one unsplit law priced trace runs A and B's host-paced propose busy within 2.4%. The
+recurrence starts the draft no earlier than the forward's exit, before which the host
+queues it (`01` D4, [#2917](https://github.com/jgong5/ATOM/issues/2917)). On an ordinary
+record a decode's draft label, its `propose` pass, is cut where the device reached the
+pass, placed on the host clock by the lead, before the host's draft copy wait began: the
+host queues the pass just before that wait, so the window may hold the device's wait for
+it.
 
 **Host laws** price the host segments of `01` D4: `E`, `W_pre`, `W_launch` and
 `W_post`, each linear in `(1, tokens, seqs)`, fitted separately for decode, output
@@ -194,16 +266,45 @@ the latency from above ([#2080](https://github.com/jgong5/ATOM/issues/2080)).
 On a record that stamps the engine's input pulls (`dp<r>.pulls.jsonl`), every kind also
 fits `E_out`, from a forward's exit to the pull after it, and `E` runs from that pull to
 the next entry ([#1480](https://github.com/jgong5/ATOM/issues/1480)).
+A record whose engine wrote each stamp as it came holds in its `E` the loop's own write
+of the pull stamp, which no unrecorded run makes. On the DeepSeek-V4.1-Flash DSpark TP4
+records kept on NFS it blocked about 1 ms in most forwards after one that put an output,
+and in none after one that put none, such as an output prefill after a middle chunk or
+an idle engine, so their `E` laws charge it to every forward; records taken since hold
+their stamps until the engine stops (`01` D4, *Measured, not hooked*;
+[#2726](https://github.com/jgong5/ATOM/issues/2726)).
 Under DP, `E` runs from the latest pull over the group before the same forward, as `01`
 D4 places it ([#1893](https://github.com/jgong5/ATOM/issues/1893)).
+The first time ATOM's scheduler schedules a request, a prefill row, it allocates the whole
+prompt inside `schedule()`: it walks the prefix-cache hit and takes a fresh block for
+each block past it. So a forward that admits requests carries their admission in its
+`E`, which grows with their prompts, and its kind's `E` law is fitted without it. A
+further law, `admit`, linear in `(admits, uncached, cached)`, 1 for a forward that
+admits and its requests' tokens past the hit and within it, prices what those forwards' `E`
+spends beyond their kind's law, pooled over every kind: one scheduler admits for all
+of them. On the DeepSeek-V4.1-Flash DSpark TP4 records the admission ran about 26 ns a
+token past the hit and 10 ns a token within it, all of it `schedule()`'s CPU time
+([#2620](https://github.com/jgong5/ATOM/issues/2620)). A further request in the same
+forward adds its tokens and about 0.13 ms, against 0.66 ms for the first, in a probed
+simulated run; the records hold too few such forwards to fit that part, so it is left
+unpriced ([#2705](https://github.com/jgong5/ATOM/issues/2705)). Records with too few admitting
+forwards fit no `admit`, and a run refuses a forward that admits a request; an
+entry fitted before `admit` existed, whose `E` laws hold the admissions, charges
+none apart.
 They use the step linear law's solver: D53's relative error and MAD drops, D57's report, D58's hull. An
 `E` sample whose gap spans an idle engine is cut as idle and counted apart.
-An output prefill or middle chunk the host did not pace whose launch ends after its device
-ran a fifth of its label, placed on the host clock by the lead, waited on the device inside
-the launch: it gives no `W_launch` sample, since the recurrence's `end = max(start + D, launch_end)`
-charges that wait as `D`. On the DeepSeek-V4-Pro DPA8 MI355X records, pooling such launches
-priced a c=1 middle chunk's launch at 1.83 s against 0.13 s measured
-([#2256](https://github.com/jgong5/ATOM/issues/2256)).
+`W_launch` is the host's launch time: its wall time less the launch thread's time inside
+HIP's blocking calls, the stream, event and device synchronizes and the synchronous copies
+and frees, which a recording real runner reads from a rocprofiler-sdk tool at the launch's
+entry and at the token copy wait's (`parity/blocked.py`). Inside a launch ATOM blocks only
+where it departs from its design, which is filed under `atom-issue` with its residual, as
+DeepSeek-V4-Pro's TBO split reading its KV total off the device is
+([#2413](https://github.com/jgong5/ATOM/issues/2413),
+[#2984](https://github.com/jgong5/ATOM/issues/2984)). A launch that waits for HIP queue
+space, or on an async copy from pageable memory, stays in the label
+([#3071](https://github.com/jgong5/ATOM/issues/3071)). A record without the stamp labels
+`W_launch` by its wall time, and the fit's report names it
+([Ruling on #2980](https://github.com/jgong5/ATOM/issues/2980#issuecomment-6729555447)).
 A forward whose `W_launch` its kind's fit drops above the law paid a first-use JIT
 compile, on a decode only past five times its price, since a decode's launch
 of a millisecond or so drops on host noise. It and the forward after it, whose period
@@ -212,11 +313,27 @@ recurrence's priced grade charges both and grades neither, and reports their cou
 the time their charges leave out: a compile is cold-start cost, measured and reported as
 D62 treats leading warmth, never charged
 ([#1983](https://github.com/jgong5/ATOM/issues/1983)).
+A model whose launch takes another path from step to step, a graph replayed or run eagerly,
+names those paths as features of its launch provider (`backends/launch_features.py`), keyed
+by architecture; a model without one fits as above. A recording real runner writes the
+provider's `observe` on each line and the graph sets ATOM recorded in its key's engine
+config; the fit refuses a step the provider `predict`s otherwise, and offers each host law
+each feature as a column under D55's MoE-column rule, a feature at a time while it lowers
+the held-out error, with every feature a column of the JIT cut's solve. A run prices an
+adopted column from `predict` under the graph sets its host laws' key states, a simulated
+runner recording none, and refuses a column whose feature the provider lacks
+([Ruling on #2958](https://github.com/jgong5/ATOM/issues/2958#issuecomment-6729555201)).
+DeepSeek-V4.1's provider (`launch_features.DeepseekV41`) declares an eager body and an eager
+decoder tail. On four records of [#2218](https://github.com/jgong5/ATOM/issues/2218)'s TP2
+DSpark recipe with prefill token graphs to 3072 tokens, an output prefill's launch ran 11 ms at
+p50 with both replayed, 43 ms with an eager body, 55 ms with an eager tail and 91 ms with both;
+the fit adopted both columns, at 32 and 43 ms ([#2958](https://github.com/jgong5/ATOM/issues/2958)).
 
-- **Key:** the host CPU, the `atom` source digest, the model, the engine config and the
-  machine-spec digest (`07` D41). A mismatch refuses. There is no transfer mode: the MI455 projection prices no host floor
+- **Key:** the host CPU, the `atom` source digest, the model, the engine config, the
+  device, the software stack and torch (`07` D41). A mismatch refuses. There is no transfer mode: the MI455 projection prices no host floor
   (`08` D50.2).
-- **Home:** beside the step linear law, not in the machine spec's `host.*` (`05` D25).
+- **Home:** beside the step linear law; the entry also holds the tokenizer and HTTP
+  intake terms (`05` D25), which the machine spec no longer states.
 - **Use:** the runner composes them with any backend's device time by `01` D4's
   recurrence; no backend adds them to its own price.
 
@@ -227,10 +344,67 @@ D62 treats leading warmth, never charged
 ```
 prefill:  [ 1,  tokens,  Σ_req N_Q²,  Σ_req N_Q·(ctx − N_Q) ]
           + history: Σ_req (ctx − N_Q), in `step_linear_fit`'s `history` form
+          + padding: b − tokens, where the records state their prefill buckets
 decode:   [ 1,  batch,   Σ ctx ]
 per rung: [ 1,  Σ ctx,   rung·max(ctx) − Σ ctx ]
+          + n or E·(1 − (1 − K/E)^m), on a rung that adopts one (`--moe-routing E,K`),
+            m = n with the step's DP dummy forwards counted as one token
           + rowmod(k), on a rung that adopts one (D61)
 ```
+
+A decode rung may adopt one MoE column over `n`, the real tokens the step's MoE runs on:
+the DP group's gathered tokens (`BatchView.moe_tokens`), a rank's own on one rank. The
+gather pads every rank to the rung, and a pad row reaches no expert since
+[#2340](https://github.com/jgong5/ATOM/pull/2340), and before it only the one expert set
+of token 0, so a decode step's MoE work follows the group's real tokens, not the rung. An
+uneven spread over the ranks leaves them well below the rung's rows: a 1P1D decode side at
+about 11 rows over 8 ranks decodes at rung 4 with 13 real of 32 gathered rows (p50), where
+lone decode servers at rung 4 run 26, and a rung-only vector fitted on the lone servers
+prices that side 10% high at rung 4 and 14% at rung 8. The candidates are `n` itself,
+`moe_tokens`, for the GEMM rows, and `moe_experts`, `X = E·(1 − (1 − K/E)^m)`, the routed
+experts `m` tokens reach in expectation, each routed to `K` of `E`
+(`work.activated_experts`), for the expert weights read. `m` is `n` with a step's DP dummy
+forwards counted as one token: a rank with no work runs one dummy row, token 0 at position
+0, which reaches the gate where a pad row does not, and every dummy's row is the same, so
+`d` dummies read one token's experts and `m = n − (d − 1)` for `d ≥ 1`. Under a drafter a
+dummy runs `mtp_k + 1` rows, and `m` merges one row per dummy until a data-parallel MTP
+record tests a MoE column there. A record states
+`d` in its ranks' lines (`is_dummy_run`); a simulated step sums it over the DP group's CPU
+group, since ATOM's DP sync carries no dummy flag, a dummy reporting one token as a rank
+decoding one request does (`BatchView.group_dummies`,
+[#2536](https://github.com/jgong5/ATOM/issues/2536)). Nothing assumes decode is memory-
+or compute-bound; the data picks. Each of the three forms, no column, `n` and `X`, is solved
+with each record held out of the rung's steps, and its held-out error is the magnitude of
+each held-out record's p50 error, averaged with the record's steps as weights. A rung adopts
+the form of smallest held-out error, none on a tie; a rung that adopts neither column keeps
+its three columns, and a rung of one record has no held-out error to pick by. No bar vetoes
+the pick: a veto counts the records a column pushes out of a bar and none it brings in (at
+the crs005 decode law's rung 8, `X` brings 9,442 steps inside its records' own dispersion
+and pushes 2,015 out), and a bar read from another machine's law is a rule for one refit
+([#2735](https://github.com/jgong5/ATOM/issues/2735#issuecomment-6607642403)).
+Two columns at once were tried and refused: on the small
+rungs `n` and `X` are nearly collinear, and the non-negative solve kept one of the two at
+every rung ([#2493](https://github.com/jgong5/ATOM/issues/2493)). The column is a hull
+coordinate, so a step whose `n`, or under `X` whose `m`, falls outside those its rung was
+fitted on is priced as an extrapolation (D58). Prefill needs no such column: its gather is variable-length, so
+`moe_rows` is its real tokens. An MTP draft law's decode vectors take no MoE column until
+a data-parallel MTP record tests it there.
+
+A prefill vector adds `padding`, `b − tokens`, where the records' engine files state the
+prefill token-graph buckets their runner recorded, and states those buckets. ATOM replays
+a prefill's first layers as a token graph at `b` rows, the smallest bucket holding the
+most tokens any rank of the DP group scheduled (`BatchView.group_max_tokens`), and runs
+past the largest bucket, or on a step the group splits for two-batch overlap, eagerly,
+where `padding` is 0. On the V4.1-Flash DSpark TP2 trace runs the 2048 bucket cost the
+same at 1033 and 1830 tokens, and 0.0114 ms a padded token matches 0.0105 ms a bucket
+token. Without the column the law priced one-request output prefills of 1033 to 1314
+tokens 13 to 20% low and of 124 to 248 tokens 10 to 19% high; with it, 2.7 to 3.1% low
+and −0.2 to +10.5% high. An intercept per bucket carries only the mechanism's mean and
+left the first group 4.7 to 11.3% low ([#2976
+Ruling](https://github.com/jgong5/ATOM/issues/2976#issuecomment-6730261854)). What the
+column leaves is the MoE's content: at like tokens one request's MoE ran 1.2 to 4.2 ms
+longer on one run's prompts than on the other's, a residual no shape feature carries. A
+data-parallel step stating no `group_max_tokens` is refused; a draft law adds no column.
 
 Two constructions are load-bearing and both were originally wrong.
 
@@ -333,6 +507,12 @@ decode rung with none. Outside the continuous domain, the fitted hull, it extrap
 above. A term is `validated` only inside a second hull, the steps `step_linear_fit`
 priced with a law fitted on the other records, whose errors per band it writes into the
 law beside that hull; a law without one prices every term unvalidated.
+
+A vector fitted on another subject, which the law states under `declared`, prices
+`declared` terms with that note, never validated ([owner ruling on #2660](https://github.com/jgong5/ATOM/issues/2660#issuecomment-6575668068),
+2026-11-02). The prefill side's records, the crs005 prefill law's own and #975's warm pass,
+hold 2 fittable rung-2 decode steps for 3 coefficients, so that law prices rung 2, about
+one step a run, by the crs005 decode law's rung-2 vector: a median 8% high on the 12.
 
 And the dimensions are **workload-dependent** — 0.6B batches ran at raggedness 2.82–3.85,
 27B at 1.11–1.42 — so:
@@ -525,7 +705,12 @@ MoE segment is priced under independent uniform routing over the experts, at eve
 granularity, from `T_moe` with EP on or off (`15` D90); the analytical laws price it in
 expectation, under EP at the expected maximum rank load (`10` D64). Real
 routing is data-dependent (`15` D92 Q2) and no feature carries it, so whatever skew a
-capture's routing has is folded into the fitted MoE terms. `max` over ranks is the
+capture's routing has is folded into the fitted MoE terms; a step linear decode rung's MoE
+column (D55) prices the real tokens, or the experts uniform routing has them reach in
+expectation. The gate's skew is invisible at step granularity, so it stays this treatment
+and is counted in the error budget: each record's held-out p50 at a decode rung, under each
+MoE form, is written with the law (`fit.moe_column`) and reported, not gated; a cell's cost
+accuracy (`08`) grades what the skew leaves. `max` over ranks is the
 per-layer critical path, by construction with EP off and under this treatment with EP on
 (`15` D90); where routing is not uniform under EP, `max` underestimates the step.
 Stage 3 keeps this treatment at EP8 (owner ruling on
@@ -533,7 +718,9 @@ Stage 3 keeps this treatment at EP8 (owner ruling on
 the step linear law fitted under the EP8 engine config absorbs MORI dispatch and combine
 through its prefill `moe_rows` term and its intercepts, and no received-rows feature is
 fitted. A decode vector needs no `moe_rows` term, since at a replayed rung `T_moe` is
-fixed by the rung and the rung's intercept holds it. The measured received-row
+fixed by the rung and the rung's intercept holds it; the real tokens among those rows
+are another matter, since a pad row reaches no expert, and a rung's MoE column fits them
+(D55). The measured received-row
 imbalance, whose size `15` D90 states, is reported beside the law's accuracy
 ([#1108](https://github.com/jgong5/ATOM/issues/1108)).
 
@@ -546,6 +733,19 @@ Both price such a dummy at 0 s under this treatment, which the run summary count
 step, instead of refusing it: in real records its device time is its busiest peer's
 (p50 0.999 at DP2, 0.9999 at DPA8 EP8), and the group's device-end max (`15`, #1267)
 already charges the peer. A decode step that replays no graph and is no dummy is still
+refused, unless a peer prefills (below).
+
+**Assumed treatment: eager decode beside prefill** (owner ruling on
+[#2660](https://github.com/jgong5/ATOM/issues/2660#issuecomment-6573151549), 2026-11-02).
+A DP group replays request graphs only on a step every rank runs alike, so a rank that
+decodes while a peer prefills runs eagerly. A 1P1D prefill side runs such a decode for
+each request its deferred output holds (#2655). The fit cuts a step whose ranks fall to
+different vectors, so no law fits an `eager` vector for it. A step linear law with no
+`eager` vector and a replay step grid price it at 0 s under this treatment, counted by
+step like the dummy's: the rank waits on its prefilling peers inside the forward, and the
+group's device-end max already charges the slowest. It assumes, unchecked, that such a
+decode ends before its slowest prefilling peer; device busy times cannot show it, since
+under DP every rank's is the group's. Any other decode step that replays no graph is still
 refused.
 
 **Suspected treatments to check before fitting:** raggedness (workload-dependent, and it
@@ -592,14 +792,14 @@ choice that must be visible.
 | # | Decision | Date |
 |---|---|---|
 | D53 | Fit relative error, not absolute seconds. MAD outlier test on the same relative residuals. | 2026-09-18 |
-| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by alternating max-affine regression. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes and host-paced prefills cut; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), are fitted beside it, keyed by host CPU, `atom` digest, model and engine config, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); host-paced prefill cut 2026-10-24 (#1983); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080); output prefill draft-KV pass 2026-10-25 (#2100); a prefill launch the device held gives no `W_launch` 2026-10-26 (#2256) |
-| D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61). | 2026-09-18; revised 2026-10-14 (#941) |
+| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under TP, DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by line-searched alternating max-affine regression, each vector on the rows it prices. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes cut and a decode's `propose` label cut where the device reached the pass before the host's draft copy wait, and on prefill a trace run's busy time per pass; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), and `admit`, `(admits, uncached, cached)` over every kind, on what a forward's `E` spends admitting requests, which its kind's `E` is fitted without, are fitted beside it, keyed by host CPU, `atom` digest, model, engine config, device, software stack and torch, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); machine-spec digest in the host-law key 2026-10-16 (#952); host-paced prefill cut 2026-10-24 (#1983); traced prefill 2026-10-24 (#2072); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080); output prefill draft-KV pass 2026-10-25 (#2100); a prefill launch the device held gives no `W_launch` 2026-10-26 (#2256); TP above 1 2026-10-30 (#2490); a short output prefill's propose pass split off 2026-10-31 (#2492), at the device's lag 2026-11-01 (#2572); a forward's admissions priced apart, `admit` 2026-11-02 (#2620), its intercept once a forward 2026-11-03 (#2705); device, software stack and torch in place of the machine-spec digest 2026-11-03 (#2716); the propose pass unsplit on trace runs 2026-11-06 (#2072); a decode's host-paced `propose` label cut 2026-11-06 (#2917); line-searched alternation, each vector on the rows it prices, 2026-11-06 (#2904); host-law columns from a model's launch features, the recorded graph sets in the host key, 2026-11-09 (#3068); `W_launch` less the launch thread's blocking HIP calls, the held cut gone, 2026-11-09 (#3069) |
+| D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61), and, given the model's routing, one MoE column, the step's real MoE tokens `n` or the experts `X` they reach, the step's DP dummy forwards counted in `X` as one token: the form of smallest step-weighted held-out error, no column among them, adopted with no bar. | 2026-09-18; revised 2026-10-14 (#941), 2026-11-01 (MoE column, #2493) and 2026-11-03 (no bar, #2735; dummies in `X`, #2536) |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |
-| D58 | Refuse rather than fall back on a step kind with no samples. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box; an out-of-hull step is priced `estimated` and unvalidated, its source naming the extrapolation, not refused, and graded by cost accuracy as well as reported apart. The step linear law refuses a discrete value it has no vector for, extrapolates outside its fitted hull, and is validated only inside the hull of its held-out steps. | 2026-09-18; revised 2026-10-11 (#765), 2026-10-14 (#952) and 2026-10-23 (#2011) |
+| D58 | Refuse rather than fall back on a step kind with no samples. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box; an out-of-hull step is priced `estimated` and unvalidated, its source naming the extrapolation, not refused, and graded by cost accuracy as well as reported apart. The step linear law refuses a discrete value it has no vector for, extrapolates outside its fitted hull, and is validated only inside the hull of its held-out steps; a vector it states `declared`, fitted on another subject, prices declared terms. | 2026-09-18; revised 2026-10-11 (#765), 2026-10-14 (#952), 2026-10-23 (#2011) and 2026-11-02 (#2660) |
 | D59 | A family is validated on independently gathered data, never by LOO. Rank at least three candidates and report all held-out errors. A law that fits one axis is tested on a second before it ships. | 2026-09-18 |
 | D60 | Laws are piecewise over dispatch bands read from recorded kernel identity. A query with no same-band bracket refuses. At the op level `measure ops` records each point's kernels and `fit ops` interpolates only between same-kernel neighbours, and across neither gap beside a hidden band or a point with a held-out error over 5%, holding out no point whose neighbours are one coordinate away on each side, one row's bytes for a collective whose ranks move the same rows (one byte for `all_gatherv`, `reduce_scatterv` and MORI); a declined leaf falls to its analytical law, counted. An interpolated leaf is validated inside a held-out bracket on each line it interpolates along. | 2026-09-18; op level 2026-10-18 (#1489); declined lines 2026-10-19 (#1493), per gap 2026-10-25 (#2107); adjacent neighbours 2026-10-20 (#1746), a collective's 2026-10-22 (#1908); validated brackets 2026-10-23 (#2011) |
-| D61 | Treatments are stated and the calibration population matched; an assumed treatment is a property of the query, recorded in the run summary. Decode row order, worth 1.77× at a fixed multiset, is a decode feature, `rowmod(k)` in scheduled order, adopted per rung by a four-condition rule. Uniform routing of the MoE segment under DP and EP is an assumed treatment, at every granularity. | 2026-09-18; revised 2026-10-01, 2026-10-14 (#941, #952) |
+| D61 | Treatments are stated and the calibration population matched; an assumed treatment is a property of the query, recorded in the run summary. Decode row order, worth 1.77× at a fixed multiset, is a decode feature, `rowmod(k)` in scheduled order, adopted per rung by a four-condition rule. Uniform routing of the MoE segment under DP and EP is an assumed treatment, at every granularity; a decode rung's MoE column counts experts under it, and the skew it cannot see is counted in the error budget, each record's held-out p50 per rung reported, not gated. An eager DP dummy, and a decode that replays no graph while a peer prefills, are priced 0 s under assumed treatments of their own. | 2026-09-18; revised 2026-10-01, 2026-10-14 (#941, #952), 2026-10-22 (#1959), 2026-11-01 (#2493), 2026-11-02 (#2660) and 2026-11-03 (#2735) |
 | D62 | Leading warmth is measured and reported, never charged. Error is reported stratified by the axes the law is linear in. | 2026-09-18 |
 
 ---

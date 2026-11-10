@@ -11,6 +11,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,7 @@ from test_run_step_grid import (
     publish,
     readings,
 )
+from test_vertical_slice import _run_file
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import (
@@ -45,6 +47,7 @@ from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.step_linear import UNIFORM_ROUTING
 from atom.compass.backends.step_roofline import StepFallbackBackend
 from atom.compass.backends.step_stub import Coefficients
+from atom.compass.clock import NER, LpId
 from atom.compass.detect import scenario
 from atom.compass.detect.determinism import CONFIGURATION_PREFIX
 from atom.compass.drive import run as drive_run
@@ -280,6 +283,39 @@ def test_the_fixed_keys_and_the_dp_width_from_atoms_arguments(tmp_path, atom, wi
     assert run["client_runs"] is None
 
 
+@pytest.mark.parametrize(
+    "flags, on",
+    [((), True), (("--local-grants",), True), (("--no-local-grants",), False)],
+)
+def test_local_grants_are_on_unless_the_command_turns_them_off(tmp_path, flags, on):
+    stub = tmp_path / "stub.json"
+    stub.write_text(json.dumps(dataclasses.asdict(Coefficients())))
+
+    run = build(tmp_path, "--step-stub", str(stub), *flags)
+
+    assert run[compass_run.LOCAL_GRANTS] is on
+
+
+@pytest.mark.parametrize(
+    "key, ceilings", [({}, True), ({"local_grants": False}, False)]
+)
+def test_a_run_file_without_the_key_gives_grants_their_ceilings(
+    tmp_path, key, ceilings
+):
+    run = json.loads(_run_file(tmp_path, **key).read_text())
+    authority = compass_run._RecordingAuthority(run)
+
+    replies = authority.on_request(LpId("traffic"), NER, math.inf, [])
+    for lp in (compass_run.ENGINE, compass_run.FRONTEND):
+        replies += authority.on_request(lp, NER, 1.0, [])
+
+    assert [(i, g) for i, g, _ in replies] == [
+        (compass_run.ENGINE, 1.0),
+        (compass_run.FRONTEND, 1.0),
+    ]
+    assert all((r.ceiling is not None) is ceilings for _, _, r in replies)
+
+
 def test_a_machine_file_that_is_no_spec_refuses_before_any_entry_is_read(tmp_path):
     with pytest.raises(SpecRefusal):
         build(tmp_path, "--step-grid", "0123456789ab", machine={"device": {}})
@@ -447,7 +483,7 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
     lps = {lp.name for lp in table.registry.ids()}
     assert lps == {"traffic", "frontend-P", "engine-P", "frontend-D", "engine-D"}
     write = [f"engine-D->engine-P:kv_write_req#dp0.dp{p}" for p in (0, 1)]
-    assert [table.lookahead(c) for c in write] == [runfile.KV_WRITE_REQ_S] * 2
+    assert [table.lookahead(c) for c in write] == [compass_run.HOP_FLOOR_S] * 2
     relay = table.lookahead("frontend-P->frontend-D:relay")
     assert relay == run["router_s"]
 

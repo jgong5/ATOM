@@ -83,8 +83,15 @@ LAW_SPECS = {
     "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json": "mi308x-hjbog39.json",
     "deepseek-v4-pro-dpa8-mi355x-gpu45-prefill.json": "mi355x-gpu45.json",
     "deepseek-v4-pro-dpa8-mi355x-gpu45-decode.json": "mi355x-gpu45.json",
+    "deepseek-v4-pro-dpa8-mi355x-crs005-prefill.json": "mi355x-crs005.json",
+    "deepseek-v4-pro-dpa8-mi355x-crs005-decode.json": "mi355x-crs005.json",
     "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-prefill.json": "mi355x-gpu45.json",
     "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-decode.json": "mi355x-gpu45.json",
+    "deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json": "mi355x-crs005.json",
+    "deepseek-v4-pro-dpa8-ep8-mi355x-crs005-decode.json": "mi355x-crs005.json",
+    "deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json": "mi455-a0.json",
+    "deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json": "mi455-a0.json",
+    "deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json": "mi355x-gpu40.json",
 }
 
 
@@ -93,6 +100,22 @@ def test_every_checked_in_law_stamps_the_digest_of_its_spec(name):
     law = json.loads((ROOT / "laws" / name).read_text())
     spec = json.loads((ROOT / "machines" / LAW_SPECS[name]).read_text())
     assert law["machine_spec"] == law["host"]["key"]["machine_spec"] == digest(spec)
+
+
+def test_gpu40s_patched_aiter_keys_it_apart_from_crs005_whose_laws_refuse_there(
+    monkeypatch, tmp_path
+):
+    gpu40 = json.loads((ROOT / "machines" / "mi355x-gpu40.json").read_text())
+    crs005 = json.loads((ROOT / "machines" / "mi355x-crs005.json").read_text())
+    name = "deepseek-v4-pro-dpa8-ep8-mi355x-crs005-decode.json"
+    law = json.loads((ROOT / "laws" / name).read_text())
+    assert law["machine_spec"] == digest(crs005) != digest(gpu40)
+    here = {k: v for k, v in law.items() if k != "engine_config"}
+    with pytest.raises(ValueError) as refused:
+        _installed(monkeypatch, tmp_path, step_linear=here, machine=gpu40)
+    assert f"fitted on machine spec {digest(crs005)}" in str(refused.value)
+    assert f"this run's is {digest(gpu40)}" in str(refused.value)
+    assert "aiter 09d256420" in str(refused.value)
 
 
 def test_every_checked_in_law_stamps_this_trees_atom_digest():
@@ -358,7 +381,7 @@ def edited(path: str, value) -> dict:
         ("interconnect.intra_node.link_latency_s", 3e-06),
         ("device.memory.derate", 0.8),
         ("device.memory.capacity_bytes", 1),
-        ("host.cpu.cores_physical", 96),
+        ("interconnect.router_relay_s", 1e-3),
         ("provenance.notes", "re-probed"),
     ],
 )
