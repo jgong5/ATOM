@@ -1292,8 +1292,10 @@ class Stub:
                 entry = _span(*rest) * itemsize
                 if name.startswith(_CACHE.format(ratio="")):
                     unit, history = shape[cut], 0  # a pointer table, at its entries
-                if getattr(_overload(op["op"]), "is_view", False):
-                    unit = history = 0  # a view of it reads none of it
+                # a view of it reads none of it; a composite one (`reshape`) may copy
+                fn, cia = _overload(op["op"]), "CompositeImplicitAutograd"
+                if fn and fn.is_view and not fn.has_kernel_for_dispatch_key(cia):
+                    unit = history = 0
                 nbytes, need = entry * (unit + history), None
                 shared[slotted] += entry * unit
                 shared[1] += entry * history
@@ -1715,8 +1717,7 @@ def _writes(name: str) -> set[str]:
     # `fill_deferred_decode_ids`, DeepSeek-V4's index builders) write what
     # ATOM's forward writes from the prepared metadata, which later leaves
     # read; one that writes other values needs its writes named here
-    target = _overload(name)
-    args = target._schema.arguments if target else []
+    args = target._schema.arguments if (target := _overload(name)) else []
     return {a.name for a in args if a.alias_info and a.alias_info.is_write}
 
 
