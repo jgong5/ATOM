@@ -120,7 +120,14 @@ own `gh` login. Ownership is the assignee:
   labels from the `compass-labels` skill
   (`.claude/skills/compass-labels/SKILL.md`): run
   `compass_labels.py pr <N> --apply` when it is created, and again whenever a
-  PR round adds files the opening round did not touch.
+  PR round adds files the opening round did not touch. Whoever opens an issue
+  also gives it one destination label (`M3`, `backlog`, or the `e2e-stage*` it
+  belongs to) and one workstream label (`adoption: ux`, `adoption: advice`,
+  `adoption: profiling`, `adoption: upstream`, `scale: scenarios`,
+  `scale: models`, `scale: systems`, `quality: accuracy`, `quality: speed`,
+  `quality: maintenance`), each describing the issue's main purpose; a PR
+  copies both from the issue it delivers. Work that is not planned now carries
+  `backlog`, not a title suffix.
 - **Inline comments.** `pr_state.py` and the issue-comments endpoint do not
   show inline comments (`pulls/<n>/comments`), and owners review with them.
   Read both endpoints before acting on a PR, and answer every inline
