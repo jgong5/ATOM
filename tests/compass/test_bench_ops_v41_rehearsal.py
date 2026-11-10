@@ -20,10 +20,15 @@ import subprocess
 import sys
 
 import pytest
+import torch
+from test_bench_ops import _Runner
 from test_capture_mi455_cells import A0, TREE, _trace
 from v41_ops_rehearsal import ATEN_INDEX
 from test_capture_v41_flash import ARGS, EP4
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
+
+from atom.compass.bench import ops
+from atom.utils import forward_context as fctx
 
 HARNESS = pathlib.Path(__file__).with_name("v41_ops_rehearsal.py")
 #: The cells' engine arguments past the model and TP, as their card run starts
@@ -41,12 +46,9 @@ READ += f"driverless.card = {{0: {A0!r}}}.get\n"
 TRUTH = pathlib.Path(__file__).with_name("v41_capture_truth.py")
 #: The slots where ATOM passes the occurrences of one leaf two buffers, of
 #: which the bench binds one: a query's RoPE positions and a ratio-1 key's
-#: (#2865), and the decoder tail's batch ids and its layer 39's queries'
-#: (#2867).
+#: (#2865).
 SPLIT = {
     ("aiter.rope_cached_positions_fwd_impl.default", "positions"),
-    ("atom.model_ops.attentions.deepseek_v41.indices:_launch_indices", "batch_ids"),
-    ("atom.model_ops.attentions.deepseek_v41.indices:_launch_indptr_scan", "batch_ids"),
 }
 #: A prefill whose forward runs the rows of its decoder's tail: its tail
 #: holds the whole prompt, a window of it.
@@ -131,8 +133,9 @@ def test_a_prefill_whose_forward_runs_its_tail_s_rows_refuses_by_name(rehearsed)
 
 def test_each_leaf_takes_the_buffers_atom_s_capture_passes_it(rehearsed):
     """Each argument a kernel leaf takes of ATOM's metadata, and each integer
-    table of its KV, and each index an aten index operator takes, is the one
-    buffer ATOM's own capture passes every occurrence of that leaf, by name and
+    table of its KV, and each index an aten index operator takes, is the
+    buffer ATOM's own capture passes every occurrence of that leaf, or each of
+    the two it passes its first and later ones (`ops.QUERIED`), by name and
     offset, but `SPLIT`'s. aten's other leaves index nothing and launch the
     same work on any values."""
     got, truth = rehearsed
@@ -146,6 +149,22 @@ def test_each_leaf_takes_the_buffers_atom_s_capture_passes_it(rehearsed):
                 continue
             want = {w for w in truth.get(r["leaf"], {}).get(path, []) if w != "?"}
             checked += bool(want)
-            if want and want != {name}:
-                wrong.append((r["shape"], r["op"], path, name, want))
+            names = {name, r["later"].get(path, name)}
+            if want and want != names:
+                wrong.append((r["shape"], r["op"], path, names, want))
     assert checked and wrong == []
+
+
+def test_a_leaf_s_later_occurrences_take_what_atom_passes_them():
+    """Copies of a leaf that runs twice alternate its occurrences' buffers:
+    the tail's batch ids, then its layer 39's queries'."""
+    stub = ops.Stub(_Runner(), 10_000)
+    tail = torch.arange(4, dtype=torch.int32)
+    stub.placed = [(fctx.ForwardContext(), {("sig", "batch_ids"): ("tail", tail)})]
+    stub.later = {(0, "sig", "batch_ids"): ("queries", torch.full_like(tail, -1))}
+    spec = {"shape": [4], "stride": [1], "dtype": "torch.int32", "role": "metadata"}
+    op = {"op": "scan", "args": {"batch_ids": spec}, "occurrences": 2}
+
+    got = [stub._copy(op, "sig", [{}], c)[0]["batch_ids"] for c in range(4)]
+
+    assert [t.tolist() for t in got] == [[0, 1, 2, 3], [-1] * 4] * 2
