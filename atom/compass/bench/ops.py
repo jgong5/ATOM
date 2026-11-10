@@ -470,9 +470,11 @@ PAGE_WIDE = {
 #: The arches on which aiter's decode top-k (`top_k_per_row_decode`) runs
 #: FlyDSL's one-block kernel (`_TOPK`) for every call its signature check
 #: takes, k no wider than the logits, as no FlyDSL decode gate of the arch's
-#: precedes it, unless `FLYDSL_OFF`, which no `op_graph` key states, is set.
+#: precedes it, unless `FLYDSL_OFF`, which no `op_graph` key states, holds
+#: one of the values aiter reads as off.
 ONE_BLOCK = ("gfx1250",)
 FLYDSL_OFF = "AITER_DISABLE_FLYDSL_TOPK_DECODE"
+FLYDSL_OFF_VALUES = ("1", "true", "True", "yes", "YES")
 #: DeepSeek-V4.1's FP8 index tables an earlier leaf of its forward writes, by
 #: the operator and slot that read them (`_written`): the page-wide scorer's
 #: tile table (`tiles`); the blocks each row keeps of the candidate pick
@@ -1093,9 +1095,9 @@ class Stub:
             return _journal(
                 self.journal,
                 [
-                    {"shape": str(shape), "context": context, "op": op["op"]}
-                    | {"leaf": sig, "refused": why}
-                    for sig, (op, _) in found.items()
+                    {"shape": str(shape), "context": context}
+                    | {"op": json.loads(sig)["op"], "leaf": sig, "refused": why}
+                    for sig in found
                 ],
             )
 
@@ -1182,8 +1184,11 @@ class Stub:
         for sig, (op, inst) in found.items():
             n, size, _, (by_block, by_slot) = plans[sig]
             names = {p: m[0] for (s, p), m in self.placed[0][1].items() if s == sig}
-            record = {"shape": str(shape), "context": context, "op": op["op"]}
+            # the graph's operator, and the one timed in its place if another
+            leaf = json.loads(sig)["op"]
+            record = {"shape": str(shape), "context": context, "op": leaf}
             record |= {"leaf": sig, "metadata": names, "rows": rows}
+            record |= {"timed": op["op"]} if op["op"] != leaf else {}
             record |= {"exchange": ex} if (ex := exchange(op)) else {}
             try:
                 if "refuses" in op:  # its operator at its width (`_dispatched`)
@@ -1845,8 +1850,9 @@ def _dispatched(op) -> dict:
     width = args["logits"]["shape"][1] if op["op"] == _PICK else None
     if width is None or "k" not in args or args["k"] > width:
         return op
-    if (arch := device_arch()) not in ONE_BLOCK or FLYDSL_OFF in os.environ:
-        off = f" under {FLYDSL_OFF}" * (FLYDSL_OFF in os.environ)
+    off = os.environ.get(FLYDSL_OFF) in FLYDSL_OFF_VALUES
+    if (arch := device_arch()) not in ONE_BLOCK or off:
+        off = f" under {FLYDSL_OFF}={os.environ[FLYDSL_OFF]}" if off else ""
         why = f"aiter's decode top-k of k {args['k']} on logits {width} wide"
         return op | {"refuses": f"{why}: its kernel on {arch}{off} is not known"}
     named = {"seqLens": "row_ends", "numRows": "num_rows"}

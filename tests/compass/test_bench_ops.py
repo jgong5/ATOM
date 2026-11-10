@@ -804,25 +804,16 @@ def test_a_v41_prefill_past_cached_tokens_picks_candidates_off_its_rows_blocks(
     assert units["block_tables"].shape == (1, 40)
 
 
-@pytest.mark.parametrize(
-    "arch, off, k, want",
-    [
-        ("gfx1250", False, 160, ops._TOPK),
-        ("gfx1250", False, 161, ops._PICK),
-        ("gfx950", False, 160, "its kernel on gfx950 is not known"),
-        ("gfx1250", True, 160, "gfx1250 under AITER_DISABLE_FLYDSL_TOPK_DECODE is"),
-    ],
-)
-def test_a_v41_prefill_pick_widened_to_its_k_runs_the_top_k_aiter_dispatches_there(
-    monkeypatch, arch, off, k, want
-):
+def _pick(monkeypatch, arch, k, env=None):
+    """V4.1's pick's HIP top-k of k as a prefill of 256 tokens traced it, 32
+    index blocks, on `arch` with aiter's FlyDSL switch at `env`; and the list
+    each point's records go to."""
     monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: arch)
     monkeypatch.delenv("AITER_DISABLE_FLYDSL_TOPK_DECODE", raising=False)
-    if off:
-        monkeypatch.setenv("AITER_DISABLE_FLYDSL_TOPK_DECODE", "1")
+    if env:
+        monkeypatch.setenv("AITER_DISABLE_FLYDSL_TOPK_DECODE", env)
     records, I32 = [], "torch.int32"
     monkeypatch.setattr(ops, "_journal", lambda path, got: records.extend(got) or got)
-    # the pick's HIP top-k as a prefill of 256 tokens traced it: 32 index blocks
     pick = _leaf(
         ops._PICK,
         *[("logits", _t([256, 32], "activation")), ("next_n", 1)],
@@ -830,17 +821,55 @@ def test_a_v41_prefill_pick_widened_to_its_k_runs_the_top_k_aiter_dispatches_the
         ("indices", _t([256, k], "activation", dtype=I32)),
         *[("numRows", 256), ("stride0", 32), ("stride1", 1), ("k", k)],
     )
+    return pick, records
+
+
+@pytest.mark.parametrize(
+    "arch, env, k, want",
+    [
+        ("gfx1250", None, 160, ops._TOPK),
+        ("gfx1250", "0", 160, ops._TOPK),  # which aiter reads as on
+        ("gfx1250", None, 161, ops._PICK),
+        ("gfx950", None, 160, "its kernel on gfx950 is not known"),
+        ("gfx1250", "1", 160, "gfx1250 under AITER_DISABLE_FLYDSL_TOPK_DECODE=1 is"),
+    ],
+)
+def test_a_v41_prefill_pick_widened_to_its_k_runs_the_top_k_aiter_dispatches_there(
+    monkeypatch, arch, env, k, want
+):
+    pick, records = _pick(monkeypatch, arch, k, env)
     visible = list(range(1025, 1281))  # past 1024 cached tokens: 160 blocks
     taken = _v41_index(monkeypatch, visible, [pick], prefill(256, 1), 1024)
 
     [record], ends = records, [-(-v // 8) for v in visible]
+    assert record["op"] == ops._PICK  # the graph's
     if want not in (ops._TOPK, ops._PICK):
         assert not taken and want in record["refused"]
         return
     [call] = taken
-    assert record["op"] == want and call["logits"].shape == (256, 160)
+    assert record.get("timed", ops._PICK) == want
+    assert call["logits"].shape == (256, 160)
     bounds = ("row_starts", "row_ends") if want == ops._TOPK else ("seqLens",)
     assert [call[b].tolist() for b in bounds] == [ends] * len(bounds)
+
+
+def test_a_v41_prefill_pick_s_points_either_side_of_its_k_fit_one_family_by_context(
+    monkeypatch,
+):
+    from atom.compass.fit import ops as fit_ops
+
+    pick, records = _pick(monkeypatch, "gfx1250", 128)
+    # 64 and 96 index blocks on HIP's kernel, flat there; 160 and 288 on
+    # FlyDSL's one-block, which moves with them
+    for context in (256, 512, 1024, 2048):
+        [call] = _v41_index(monkeypatch, [1] * 256, [pick], prefill(256, 1), context)
+        width, one_block = call["logits"].shape[1], "row_starts" in call
+        records[-1] |= {"kernels": ["one_block" if one_block else "hip"]}
+        records[-1] |= {"cold_ns": 100.0 * width if one_block else 3000.0}
+
+    [family] = fit_ops.fit(records)["families"].values()
+    assert family["dims"] == ["T", "B", "context"]
+    assert {k for _, _, (k,) in family["points"]} == {"hip", "one_block"}
 
 
 def test_v41_index_leaves_rank_a_logits_plane_drawn_below_each_row_s_bound(
