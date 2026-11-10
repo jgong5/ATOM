@@ -1906,8 +1906,9 @@ def op_graph(
 def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or of its drafter's part (`draft`, a block drafter's
-    draft-KV pass where it is `forward.KV`), or when it holds none
+    that does not, of a two-batch-overlap micro-batch (`micro_batch`), or of
+    its drafter's part (`draft`, a block drafter's draft-KV pass where it is
+    `forward.KV`), or when it holds none
     `forward.missed`'s text, None for no text; under DP, at the rows the
     step's MoE gathers; a prefill's drafter at the `width` its later passes
     pad to; keyed under the performance environment `env` when given, else
@@ -1987,10 +1988,17 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
 
     @functools.lru_cache(maxsize=64)
     def graph(
-        phase, tokens, seqs, output=True, gathered=None, draft=False, width=None
+        phase,
+        tokens,
+        seqs,
+        output=True,
+        gathered=None,
+        draft=False,
+        width=None,
+        micro_batch=False,
     ) -> dict | str | None:
-        shape = Shape(phase, tokens, seqs, gathered, width).at(dp, drafts)
-        at = structure(config, phase, True, arch, output, draft, env)
+        shape = Shape(phase, tokens, seqs, gathered, width, micro_batch).at(dp, drafts)
+        at = structure(config, phase, True, arch, output, draft, env, micro_batch)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
         missing = not store.directory_for(key).exists()
         if missing and dp > 1 and phase == "prefill" and not (draft or drafts):
