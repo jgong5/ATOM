@@ -180,8 +180,8 @@ python -m atom.entrypoints.openai_server <ATOM arguments> \
 holds none, it reads those the law file it prices by carries, as it reads the file's
 `host`, and refuses when neither holds them, naming the configuration. `compass measure
 memory` takes them. For a device never measured developer tooling states them (`07` D38),
-and a law file carries readings taken on its law's platform, re-keyed with it (`07` D41),
-so a host with no GPU predicts from a shipped law, which the
+and a law file carries readings taken on its law's platform, re-keyed with it or taken
+again (`07` D41), so a host with no GPU predicts from a shipped law, which the
 [#2722 Ruling](https://github.com/jgong5/ATOM/issues/2722#issuecomment-6678010091) found
 nothing committed gave. Both are marked assumed: every term built on them is declared,
 `run.json` lists each assumption (`memory_readings_assumed`) and grading refuses the run
@@ -189,10 +189,11 @@ nothing committed gave. Both are marked assumed: every term built on them is dec
 among them, and its refused, extrapolated and fallback steps (`08` D50.1).
 
 A shipped law and its readings load only at the tree whose `atom` digest their host key
-states, which each commit of the integration branch that moves the digest re-keys them
-to; another tree, a local patch to ATOM's Python, a release, or an older checkout given
-the head's laws, refuses both by name (T107). Like a store entry they refuse under
-another device, software stack, PTL state, torch, model, parallel layout or engine config.
+states: each commit of the integration branch that moves the digest re-keys the law, and
+its readings with it or takes them again (`07` D41). Another tree, a local patch to
+ATOM's Python, a release, or an older checkout given the head's laws, refuses both by
+name (T107). Like a store entry they refuse under another device, software stack, PTL
+state, torch, model, parallel layout or engine config.
 
 `--compass-clock-endpoint` names a standalone Clock Authority (`01` D3.3); absent, it is
 co-hosted in the API-server process. The tool sets it and `--compass-run`, and refuses
@@ -525,4 +526,4 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T58 | Decide whether a per-leaf backend override is worth the reproducibility cost | no demand yet |
 | ~~T96~~ | ~~Reconcile D79 and D80 with the run file the code selects a backend by (`--compass-run`, `atom/compass/run/__init__.py::runner`): D79 rejects a Compass config file, the code reads one (`17` D103)~~ — settled 2026-10-13 on #851: `compass run` takes flags only, and the run file is its internal transport (D79, D80) | needs an owner choice between describing the run file here and moving selection to flags |
 | ~~T99~~ | ~~A simulated server outlives its client (D80): `01` D3 ends a run when no essential work is left, and must end a client run there instead, the clock then waiting for the next client~~ — settled 2026-10-14 on #966: `01` D3, Client runs | needs a change to `01` D3, not yet designed |
-| T107 | Key shipped laws and their readings for a user on another tree: a local patch to ATOM's Python, a release, or an older checkout given the head's laws refuses them (D80) | left for after v1 by [#2899](https://github.com/jgong5/ATOM/issues/2899): the integration branch re-keys them at each commit that moves the digest, and another tree needs keys of its own |
+| T107 | Key shipped laws and their readings for a user on another tree: a local patch to ATOM's Python, a release, or an older checkout given the head's laws refuses them (D80) | left for after v1 by [#2899](https://github.com/jgong5/ATOM/issues/2899): the integration branch keys them to its own tree at each commit that moves the digest (`07` D41), and another tree needs keys of its own |

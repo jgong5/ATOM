@@ -16,6 +16,10 @@ activations are that entry's reading too, and no geometry form stands in for one
 coefficient is not derivable from geometry within 25%
 ([#705](https://github.com/jgong5/ATOM/issues/705)), so the reading is its source (D16).
 
+**Revised 2026-11-10 by [#2899](https://github.com/jgong5/ATOM/issues/2899):** a run whose
+store holds no `memory_readings` entry reads the assumed readings of the law file it prices
+by, and refuses with neither (D15; `07` D41).
+
 **Depends on:** `02_model_runner_and_cost_backend.md` (the runner that must answer
 `get_num_blocks` and `allocate_kv_cache`).
 
