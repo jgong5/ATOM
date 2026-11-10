@@ -9,7 +9,7 @@ rather than loudly when a replacement gets it wrong.
 
 **Tokens are one step late.** `tokenIDProcessor.is_deferred_out` is true
 whenever the pipeline is a single stage, which is the ordinary case, except on
-a P/D producer whose model keeps recurrent state. The real
+a P/D producer. The real
 runner starts an asynchronous copy of this step's sampled ids to the host and
 reports the copy the *previous* step started, so the reply carries the previous
 batch's request ids and the previous batch's tokens with the deferred flag set.
