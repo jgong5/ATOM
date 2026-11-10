@@ -3058,6 +3058,17 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     for key in ("held_lookups", "lookup_wall_seconds"):
         if value := total(key):
             summary["cost"][key] = value
+    # Each DP group's wall waited on lookups, on the rest of pricing, and on
+    # neither, by the engine of its first rank.
+    waited = {}
+    for n, h in hand_ins.items():
+        if w := h.get("priced", {}).get("group_waited_seconds"):
+            gone = since.get(n, {}).get("priced", {}).get("group_waited_seconds")
+            lookups, pricing = (a - b for a, b in zip(w, gone or (0, 0)))
+            rest = wall - lookups - pricing
+            waited[n] = {"lookups": lookups, "pricing": pricing, "rest": rest}
+    if waited:
+        summary["cost"]["group_waited_seconds"] = waited
     schedule = summary["schedule"]
     schedule["predicted_seconds"] = seconds
     # How the seconds were obtained: reported, never gated.
