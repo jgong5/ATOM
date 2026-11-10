@@ -783,7 +783,9 @@ join at. Records that ran before a run wrote that file, or wrote it without
 `--engine FILE`. `atom/compass/backends/step_labels.py` states the label
 and what is cut, and the command writes each record's labels beside it for
 reading, `dp0.cost.jsonl`; the module's docstring states how outliers are
-dropped. The written law also carries, per vector, its samples, warm and dropped
+dropped. A prefill step's label is a trace run's busy time, which `calib_capture.sh`
+does not take ([below](#the-stage-2-cell-through-the-compass-cli-from-an-empty-store)).
+The written law also carries, per vector, its samples, warm and dropped
 counts and condition number, and names any vector it could not fit under
 `unfitted`. `--moe-routing E,K`, the model's routed experts and top-k, lets each
 decode rung adopt one column over its steps' real MoE tokens, the tokens or the
@@ -1214,23 +1216,43 @@ store. A record without a store touches no library.
    `ROCP_TOOL_LIBRARIES` naming the tool `python -m atom.compass.parity.blocked
    $R/tool` prints, so its launches' `W_launch` labels leave out their time in
    HIP's blocking calls (`atom/compass/parity/README.md`); `compass fit host`
-   names a record taken without it.
-3. `compass fit steps --backend step-linear --form history $R/cal/c* --client-run
-   $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M $S --out $R/fit` and
-   `compass fit host` on the same inputs; each prints its store token.
-   Steps 1 to 3, after a warm record, are `calibrate.sh $R/cal 1 4 16` with
+   names a record taken without it. Then the trace runs (below), which take no
+   tool: per concurrency 16 and 4, `compass record --trace --gpu G --out
+   $R/trace/c<C> -- $ATOM` and `client.sh $R/trace/c<C> --traces 256-392
+   --concurrency <C> --duration 120 --stop`.
+3. `compass fit steps --backend step-linear --form history $R/cal/c* $R/trace/c*
+   --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M $S --out
+   $R/fit`, every record and trace run named before the first `--client-run`, and
+   `compass fit host` on the calibration records alone; each prints its store token.
+   Steps 1 to 3, after a warm record, are `calibrate.sh $R/cal 1 4 16 "trace 16" "trace 4"` with
    `MODEL`, `GPU`, `MACHINE`, `TRACES` and `AIPERF_PYTHON` set, its store
    `$R/cal/store`; it prints the tokens, the law's held-out errors per band
    and the `compass run` line of step 5. A RECORD after its concurrency names
    the client's scenario, such as `"8 --trajectory-start-min-ratio 0
    --trajectory-start-max-ratio 0"`, the first-turn record that gives the law
-   its decode rung 8.
+   its decode rung 8; `trace` before one makes it a trace run of that recipe.
 4. Real runs: per concurrency, two `compass record --gpu G --out
    $R/cell/c<C>/real<k> -- $ATOM`, each with `client.sh $R/cell/c<C>/real<k>
    --traces 0-255 --concurrency <C> --stop`, at most two GPUs at once.
 5. `compass run --step-linear LAW --host-laws HOST $M $S --out
    $R/cell/c<C>/step_linear -- $ATOM`, with `client.sh $R/cell/c<C>/step_linear
    --traces 0-255 --concurrency <C> --stop`.
+
+**The trace runs.** Only a trace run labels a prefill step: without one, `compass fit
+steps` names `prefill` under the law's `unfitted`, as `no prefill step carries a trace
+run's busy time`, and step 5 refuses every prefill step. The prefill vector needs more
+steps than coefficients, spread across them, or stays unfitted with the reason named
+(`step_linear_fit.fit`); its `fit.samples` is how many it took. Its held-out band needs
+a second trace run, and one of the two to fit the vector alone, since the fit prices
+each run by the law fitted on the others; with one trace run, every prefill term prices
+unvalidated. Leave the trace runs out of `compass fit host`: their host segments ran
+under the profiler. A higher concurrency holds more prefill steps in the same time.
+`compass record --trace` raises kineto's row cap, 5,000,000 rows a process by default
+([#3106](https://github.com/jgong5/ATOM/issues/3106)), and a run that lost device rows
+all the same is refused at its stop, naming each rank's first forward without them:
+take it again. Its stop writes and reduces every row, within `client.sh`'s `WAIT_S` plus
+serve's `TRACE_STOP_S`, 4200 s by default, so keep a trace run short enough to stop
+inside that.
 
 Developer checks, outside the `compass` path:
 - After step 2: `python -m atom.compass.parity.recurrence $R/cal/c<C>/steps`.
@@ -1361,6 +1383,13 @@ and 5 at concurrency 16 alone, with these changes:
   `AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"`:
   sampled starts leave rung 6 and above too few steps for a vector, and a step at a
   rung with none is refused.
+- The trace runs stay at 120 s for their stop's cost: the EP4 cell's passed the default
+  row cap 41 to 49 s in and logged 14.3M to 14.7M rows a rank, and each stop, SIGTERM
+  to exit, took about 11 min: c=4's 671 s for 121 s traced, about 46 us a row a rank
+  ([#3113](https://github.com/jgong5/ATOM/pull/3113#issuecomment-6759346059),
+  [#3111](https://github.com/jgong5/ATOM/pull/3111)). At c=4's rate the default 4200 s
+  covers about 750 s traced. In their first 120 s, #2789's cell-B calibration records
+  at `aeffa7d63` hold 30 prefill steps at c=4 and 125 at c=16.
 - Steps 4 and 5 take `--duration 3600`, with a calibration record between step 4's
   two real runs. A step 5 at another duration than step 4's is graded as another
   workload, and refused.
