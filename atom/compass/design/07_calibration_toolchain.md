@@ -452,13 +452,23 @@ term. Host time is `09` D54's host laws, composed by `01` D4's recurrence.
 and the [#2681 transition](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6591319181)).
 A `record` server times each tokenizer call it serves, `encode`, `decode` and the Rust
 backend's `encode_batch`, and ATOM's segment tokenizer call around its `encode_batch`,
-`segment`, with its tokens, its items, its thread, the backend and the loaded
+`segment`, with the characters its stored-prefix search compared, each with its tokens,
+its items, its thread, the backend and the loaded
 `tokenizer.json`'s fingerprint, and stamps each HTTP request's intake where
 `scripts/compass/http_intake.py serve` does: `app`, `body`, `tmpl`, `prep` and `send`, with
 the body's bytes, each on the wall clock and on its thread's CPU clock, and on the loop
 `wait`, from the tokenizer pool job's submit to the request's resume, and `recv`, each
 receive of the body's read; and `out`, each row of a streamed engine output the server's
-output thread takes in, and `head`, each SSE head sent. `fit host` fits both
+output thread takes in, and `head`, each SSE head sent. The lines reach the record at the
+server's stop, its exit or the SIGTERM a stop sends: until then they are in files in the
+server's temp directory, which `steps/<name>.local` names, since on NFS a line written right
+after another waits for the first's round trip inside the stage it stamps
+([#2870](https://github.com/jgong5/ATOM/issues/2870)); a temp directory on NFS or CIFS
+refuses. A server that died first leaves the `.local` file, naming a path inside its
+container, and `fit host` refuses the record: copy the file into `steps/` with
+`podman cp` and delete the `.local` file while that container runs. A tmpfs `/tmp`, as
+QUICKSTART's container mounts, goes with the container's stop, and the record is taken
+again. `fit host` fits both
 into the entry's `tokenizer` and `http_intake` terms (`05` D25) with the host laws' solver,
 drops and hulls (`09` D53, D58). Compass does not model the GIL, so no fitted term may carry
 a GIL wait
@@ -478,8 +488,10 @@ a GIL wait
   kind's refusal leaves the others fitted; with no positive slope over its tokens it is
   `fixed_s` alone, priced inside its token hull. `segment`, the segment tokenizer call's
   own work, is its wall less the calls it makes, those on its thread that start inside it,
-  over the ids they return; it is lone among the calls it does not make
-  ([#2618](https://github.com/jgong5/ATOM/issues/2618)).
+  over the ids they return and, where every call's record holds them, the characters its
+  stored-prefix search compared, else listed unfitted as `tokenizer.segment.chars_per_s`;
+  it is lone among the calls it does not make
+  ([#2618](https://github.com/jgong5/ATOM/issues/2618), [#3083](https://github.com/jgong5/ATOM/issues/3083)).
 - `http_intake`: on the loop thread's CPU time. `per_byte_s` and `idle_s` from requests
   that found no other intake on the loop, each the loop's CPU time from its app call to
   its send's end less its `wait`, which holds the loop's work for other streams while the

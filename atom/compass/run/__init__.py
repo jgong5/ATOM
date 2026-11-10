@@ -100,9 +100,10 @@ ends the run there, which still writes the summary),
 ``client_runs`` (optional: how many client runs the server serves, one traffic
 LP after another, 1 when absent and ``null`` for no limit; each ends when no
 essential work is left, and the last one's end finishes the run),
-``local_grants`` (optional, ``true`` or ``false``: with ``true`` the authority
-gives each grant a ceiling, below which the LP answers its own clock calls and
-reports them with its next one, `ClockAuthority`; the step table is the same),
+``local_grants`` (optional, ``true``, the default, or ``false``: with ``true``
+the authority gives each grant a ceiling, below which the LP answers its own
+clock calls and reports them with its next one, a DP member at its settle,
+`ClockAuthority`; the step table is the same),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -122,13 +123,16 @@ states, which the run takes as its own, since it records no graphs;
 optional, ``encode``, one-item calls, ``encode_batch``, a backend
 ``encode_batch`` of several items, ``decode``, and ``segment``, the segment
 tokenizer call's own work over the ids its ``encode_batch`` calls return, each ``fixed_s`` and a
-positive ``tokens_per_s``, and a ``decode`` in their place ``fixed_s`` alone over ``tokens``, the ``[lo, hi]``
+positive ``tokens_per_s``, a ``segment`` optionally also a positive ``chars_per_s`` over
+the characters its stored-prefix search compared, and a ``decode`` in their place
+``fixed_s`` alone over ``tokens``, the ``[lo, hi]``
 token counts outside which a decode is refused and charged 0 s; ``http_intake``,
 ``fixed_s`` and ``per_byte_s``, with ``idle_s`` optional and ``bytes``, the
 ``[lo, hi]`` body bytes it was fitted over, outside which an intake is refused
 and charged 0 s; a term an entry lacks, or every term with no entry, is
 charged 0 s and the run summary names it, a kind of tokenizer call as
-``tokenizer.<kind>``, under ``uncharged_host_terms``; ``hops``, the
+``tokenizer.<kind>`` and a ``segment`` without ``chars_per_s`` as
+``tokenizer.segment.chars_per_s``, under ``uncharged_host_terms``; ``hops``, the
 `HOPS` `runfile` writes to the run file; a list of them as ``step_linear``'s),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
@@ -236,6 +240,8 @@ not find it naming its endpoint's port is refused.
 """
 
 import ast
+import atexit
+import codecs
 import contextlib
 import functools
 import hashlib
@@ -248,6 +254,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -430,6 +437,9 @@ _sigterm_at_ready: list = []
 #: The files a recorded real run's frontend writes beside its step record:
 #: each served tokenizer call, and each HTTP request's intake stamps.
 TOKENIZER_RECORD, INTAKE_RECORD = "tokenizer.jsonl", "intake.stamps"
+#: Beside one of those, ``<name>.local`` names the file its lines are in until
+#: the server's stop moves them there (`_LineFile`).
+LOCAL = ".local"
 #: This server's ``host`` entry among several, which `tokenizer` resolves.
 _frontend_host: dict | None = None
 
@@ -509,8 +519,8 @@ def _check_host(path, host: dict) -> None:
             f"{path}: host's tokenizer is {tok!r}; it takes backend, fast or slow, "
             "fingerprint, the tokenizer.json it was fitted on, and, each "
             "optional, encode, encode_batch, decode and segment, each fixed_s and a "
-            "positive tokens_per_s, a decode fixed_s and tokens, [lo, hi], in "
-            "their place"
+            "positive tokens_per_s, a segment optionally a positive chars_per_s "
+            "too, a decode fixed_s and tokens, [lo, hi], in their place"
         )
     hull = intake.get("bytes", [0, 0]) if isinstance(intake, dict) else None
     if intake is not None and not (
@@ -540,7 +550,10 @@ def _rate(term, kind: str) -> bool:
             and _seconds(dict(enumerate(hull)), {0, 1})
             and hull[0] <= hull[1]
         )
-    return _seconds(term, {"fixed_s", "tokens_per_s"}) and term["tokens_per_s"] > 0
+    search = {"chars_per_s"} if kind == "segment" else set()
+    return _seconds(term, {"fixed_s", "tokens_per_s"}, search) and all(
+        v > 0 for k, v in term.items() if k != "fixed_s"
+    )
 
 
 def _seconds(term, required: set, optional: set = frozenset()) -> bool:
@@ -1069,7 +1082,7 @@ class _RecordingAuthority(ClockAuthority):
             shutil.rmtree(d)
         table = channel_table(run)
         count = run.get("client_runs", 1)
-        local = run.get(LOCAL_GRANTS, False)
+        local = run.get(LOCAL_GRANTS, True)
         if not isinstance(local, bool):
             raise TypeError(
                 f"the run file's {LOCAL_GRANTS} is {local!r}; it is true, which "
@@ -2075,7 +2088,8 @@ def tokenizer(tok, config) -> None:
     entry, its engine config's among several: a term fitted on another backend
     is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
     ends the run before the server serves (`_end_before_serving`). With no
-    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer.
+    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer,
+    and its ``chars_per_s`` charges each comparison of its stored-prefix search.
 
     On a real run recording its steps (`parity.ENV`), it records instead
     (`_record_host`); with neither, `tok` is left as it is."""
@@ -2131,19 +2145,22 @@ def tokenizer(tok, config) -> None:
         )
     if "segment" in term:
         from atom.model_engine.segment_tokenizer import SegmentTokenizer
-        from atom.utils.compass_loop import wrap_segment
+        from atom.utils.compass_loop import charge, wrap_segment
 
         SegmentTokenizer._encode_cached = wrap_segment(
             SegmentTokenizer._encode_cached, term["segment"]
         )
+        if "chars_per_s" in term["segment"]:
+            _on_search(lambda n: charge(n / term["segment"]["chars_per_s"]))
 
 
 def _record_host(tok, record: Path) -> None:
     """Record, beside the step record in `record`, each call of `tok`'s
-    ``encode``, ``decode``, its Rust backend's ``encode_batch`` and ``segment`` into
-    `TOKENIZER_RECORD`, after a first line naming `tok`'s ``backend`` and the
-    ``fingerprint`` of its ``tokenizer.json``; and stamp each HTTP request's
-    intake into `INTAKE_RECORD` (`_stamp_intake`)."""
+    ``encode``, ``decode``, its Rust backend's ``encode_batch`` and ``segment``,
+    with what its stored-prefix search compared, into `TOKENIZER_RECORD`, after
+    a first line naming `tok`'s ``backend`` and the ``fingerprint`` of its
+    ``tokenizer.json``; and stamp each HTTP request's intake into
+    `INTAKE_RECORD` (`_stamp_intake`)."""
     from tokenizers import Tokenizer
 
     from atom.model_engine.segment_tokenizer import SegmentTokenizer
@@ -2164,35 +2181,162 @@ def _record_host(tok, record: Path) -> None:
             calls,
             lambda _, got: (sum(len(e.ids) for e in got), len(got)),
         )
+    _on_search(lambda n: setattr(_search, "chars", _search.chars + n))
+    encode_cached = SegmentTokenizer._encode_cached
+
+    def segment(*args, **kwargs):
+        _search.chars = 0
+        return encode_cached(*args, **kwargs)
+
     SegmentTokenizer._encode_cached = _recorded(
-        SegmentTokenizer._encode_cached,
+        segment,
         "segment",
         calls,
-        lambda _, got: (len(getattr(got, "token_ids", got)), 1),
+        lambda _, got: (
+            len(getattr(got, "token_ids", got)),
+            1,
+            {"compared_chars": _search.chars},
+        ),
     )
     _stamp_intake(_LineFile(record / INTAKE_RECORD))
 
 
 class _LineFile:
-    """A file of lines, each written whole and flushed as it is written, from
-    any thread."""
+    """A file of lines at `path`, each written whole and flushed as it is
+    written, from any thread, into a file in the temp directory, which
+    ``<path>.local`` names until `move`, at the server's stop, moves them to
+    `path`. On NFS a line written right after another waits for the first's
+    round trip, inside the request stage the line stamps, so a temp directory
+    on a network file system refuses (`_local_dir`)."""
 
     def __init__(self, path) -> None:
-        self.file = open(path, "w", buffering=1)  # noqa: SIM115
-        self.lock = threading.Lock()
+        self.path = Path(path)
+        fd, self.local = tempfile.mkstemp(
+            prefix=f"compass.{self.path.name}.", dir=_local_dir()
+        )
+        self.file = os.fdopen(fd, "w", buffering=1)
+        self.lock = threading.RLock()  # a SIGTERM's move may interrupt a write
+        self.path.unlink(missing_ok=True)
+        self.path.with_name(self.path.name + LOCAL).write_text(f"{self.local}\n")
+        _line_files.append(self)
+        _move_at_stop()
 
     def write(self, line: str) -> None:
         with self.lock:
-            self.file.write(line)
+            if not self.file.closed:
+                self.file.write(line)
+
+    def move(self) -> None:
+        """Move the lines to `path`; a line written after is dropped."""
+        with self.lock:
+            self.file.close()
+        shutil.copyfile(self.local, self.path)
+        self.path.with_name(self.path.name + LOCAL).unlink()
+        os.remove(self.local)
+
+
+#: The `_LineFile`s not yet moved to their record.
+_line_files: list[_LineFile] = []
+#: The SIGTERM handler `_move_at_stop` found, once it has set its own.
+_sigterm_moving: list = []
+#: The mount table `_local_dir` reads, and the file systems it refuses.
+MOUNTINFO, NETWORK_FS = "/proc/self/mountinfo", ("nfs", "nfs4", "cifs", "smb3")
+
+
+def _move_line_files() -> None:
+    """Move each `_LineFile`'s lines to its record, as the server stops."""
+    while _line_files:
+        _line_files.pop().move()
+
+
+def _move_at_stop() -> None:
+    """Move the line files into their records at the process's exit, and at a
+    SIGTERM, a stop's signal: uvicorn takes it while it serves and raises it
+    again once it has stopped, after putting back the handler it found, which
+    by default ends the process before any exit handler runs."""
+    atexit.unregister(_move_line_files)
+    atexit.register(_move_line_files)
+    if _sigterm_moving or threading.current_thread() is not threading.main_thread():
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+    if previous in (signal.SIG_IGN, None):  # None: not set from Python
+        return
+    signal.signal(signal.SIGTERM, functools.partial(_stop_moving, previous))
+    _sigterm_moving.append(previous)
+
+
+def _stop_moving(previous, signum, frame) -> None:
+    """A SIGTERM: move the line files, then `previous` takes it, the default
+    delivered again so that the process ends of the signal as it would have."""
+    try:
+        _move_line_files()
+    finally:
+        signal.signal(signum, previous)
+        if callable(previous):
+            previous(signum, frame)
+        else:
+            os.kill(os.getpid(), signum)
+
+
+def _local_dir() -> str:
+    """The temp directory, refused when `MOUNTINFO` puts it, or the upper
+    directory of the overlay holding it, on a network file system."""
+    where = os.path.realpath(tempfile.gettempdir())
+    point, fs, source, options = _mount(where)
+    upper = dict(o.partition("=")[::2] for o in options.split(",")).get("upperdir")
+    if fs not in NETWORK_FS and upper and _mount(upper)[0] != point:
+        _, fs, source, _ = _mount(upper)
+    if fs in NETWORK_FS:
+        raise ValueError(
+            f"the stamp lines' temp directory {where} is on {fs} ({source}), where "
+            "a line written right after another waits for the first's round trip; "
+            "set TMPDIR to a directory on this host's own disk or a tmpfs"
+        )
+    return where
+
+
+def _mount(path: str) -> tuple[str, str, str, str]:
+    """The mount point, file system, source and options of the mount
+    `MOUNTINFO` lists as holding `path`."""
+    held = ("", "", "", "")
+    with open(MOUNTINFO) as table:
+        for line in table:
+            left, _, right = line.partition(" - ")
+            point = codecs.decode(left.split()[4], "unicode_escape")
+            fs, source, options = (right.split() + ["", "", ""])[:3]
+            inside = path == point or path.startswith(point.rstrip("/") + "/")
+            if inside and len(point) >= len(held[0]):
+                held = (point, fs, source, options)
+    return held
 
 
 #: Whether this thread is inside a `_recorded` ``encode`` call.
 _in_encode = threading.local()
+#: The characters the stored-prefix search of this thread's recorded segment
+#: tokenizer call compared.
+_search = threading.local()
+
+
+def _on_search(then) -> None:
+    """Call `then` with the characters each comparison of ATOM's segment
+    tokenizer's stored-prefix search compares: what the prompt shares with one
+    stored prompt (``segment_tokenizer._shared_chars``)."""
+    from atom.model_engine import segment_tokenizer
+
+    shared_chars = segment_tokenizer._shared_chars
+
+    def compared(a, b, limit):
+        n = shared_chars(a, b, limit)
+        then(n)
+        return n
+
+    segment_tokenizer._shared_chars = compared
 
 
 def _recorded(call, kind: str, out: _LineFile, count):
     """`call`, writing to `out` per call a JSON line of `kind`, its ``tokens``
-    and ``items`` as `count(args, result)` gives them, its ``thread`` id and its
+    and ``items`` as `count(args, result)` gives them, with the fields of any
+    mapping it gives after them, its ``thread`` id and its
     start and end on the monotonic clock in ns; a call made inside a recorded
     ``encode`` call is that call's, as `compass_loop.wrap_encode_batch` charges
     it."""
@@ -2207,9 +2351,10 @@ def _recorded(call, kind: str, out: _LineFile, count):
         finally:
             _in_encode.on = False
         end = time.monotonic_ns()
-        tokens, items = count(args, got)
+        tokens, items, *more = count(args, got)
+        more = "".join(f', "{k}": {v}' for m in more for k, v in m.items())
         out.write(
-            f'{{"call": "{kind}", "tokens": {tokens}, "items": {items}, '
+            f'{{"call": "{kind}", "tokens": {tokens}, "items": {items}{more}, '
             f'"thread": {threading.get_ident()}, '
             f'"t_start_ns": {start}, "t_end_ns": {end}}}\n'
         )
@@ -2709,7 +2854,9 @@ def frontend_done(llm_engine) -> bool:
     hand in the frontend's refusals, at a stop with the signal that ended it.
     With the authority co-hosted, then write the step table and the run summary;
     at a stop, after the early end's writer, which has written its own if an LP
-    handed in before the stop, so the summary left counts every hand-in."""
+    handed in before the stop, so the summary left counts every hand-in. A
+    recorded real run's served lines move into its record first (`_LineFile`)."""
+    _move_line_files()
     rt = clock.installed()
     stop = None if rt is None else getattr(rt.loop, "stopped", None)
     if rt is None or (rt.now != math.inf and stop is None):
@@ -2847,6 +2994,12 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
             for h in entries(run, "host") or []
             for k in TOKENIZER_KINDS
             if k not in h.get("tokenizer", {k: None})
+        }
+        | {
+            "tokenizer.segment.chars_per_s"
+            for h in entries(run, "host") or []
+            if "segment" in h.get("tokenizer", {})
+            and "chars_per_s" not in h["tokenizer"]["segment"]
         }
     )
     summary["unmeasured_hops"] = sorted(k for k, v in hops(run).items() if v is None)

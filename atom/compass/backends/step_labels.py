@@ -66,12 +66,10 @@ A step's host labels are its segments: `E` from the previous forward's exit,
 cut as idle after an idle engine (`busy_gaps`); `W_pre` to the launch, less
 the staging gate's wait; `W_launch` from the launch to the token copy wait,
 the sampler's launch included, or to the launch's end on a forward with no
-such wait, and none on a prefill the host did not pace whose launch ends
-after its device ran `HELD_SHARE` of its device window, placed by the lead:
-that launch waited on the device; `W_post` from that wait's end to the exit,
-less the draft copy wait, and a middle chunk has none. A prefill is host-paced
-when its exit event ran less than `PACED_SHARE` of its device window after the
-host recorded it. With an MTP status wait,
+such wait, less the time its line's `blocked_ns` states the launch thread
+spent in HIP's blocking calls, there waiting on the device; a line without
+`blocked_ns` gives its wall time; `W_post` from that wait's end to the exit,
+less the draft copy wait, and a middle chunk has none. With an MTP status wait,
 `W_pre` ends at it and `W_inputs` runs from it to the launch. On a later
 pipeline stage, `W_recv` runs from the launch to the receive of its input.
 Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
@@ -114,15 +112,6 @@ ANCHORS = 32
 CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced")
 #: The directory beside a trace run's `steps` its traces are in (`parity.busy`).
 TRACE = "trace"
-#: A prefill's exit event running less than this share of its device window after
-#: its host record makes it host-paced: between the two clusters the DSpark TP2
-#: records show, host-paced output prefills at 0 to 4.3%, device-paced at 11% up.
-PACED_SHARE = 0.08
-#: A prefill whose launch ends after its device ran more than this share of its
-#: device window waited on the device inside the launch. On the DeepSeek-V4-Pro
-#: DPA8 MI355X records, launches over 0.5 s end past it on 99.5%, shorter ones
-#: before it on 99.2%.
-HELD_SHARE = 0.2
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
 TABLE_VERSION = 1
 #: run.json's entry naming the JIT modules and kernels its server compiled while
@@ -163,6 +152,8 @@ class Sample:
     `admitted` is `(requests, uncached, cached)` of the requests it admits
     (`admissions`). `launch` is its line's, what its launch ran per launch
     feature (`launch_features`), empty on a line that states none.
+    `blocked` is the seconds its `W_launch` left out per blocking HIP call
+    that blocked, from its line's `blocked_ns`; None on a line without it.
     `after` is, on a decode, the view of the output prefill that ran just
     before it on its rank; None elsewhere.
     """
@@ -181,6 +172,7 @@ class Sample:
     draft_kv_s: float | None = None
     admitted: tuple = (0, 0, 0)
     launch: dict = field(default_factory=dict)
+    blocked: dict | None = None
     after: BatchView | None = None
 
 
@@ -298,12 +290,11 @@ def host_paced_drafts(lines) -> set[int]:
     }
 
 
-def _host_cut(lines) -> tuple[set[int], set[int], set[int]]:
-    """The steps whose device start precedes their host launch end, the
-    prefill steps the host did not pace whose launch the device held, and the
+def _host_cut(lines) -> tuple[set[int], set[int]]:
+    """The steps whose device start precedes their host launch end, and the
     MTP decodes whose device reached the propose pass before the host's draft
     copy wait."""
-    (lines_timed, lead), output_end, timed = _timed(lines), None, []
+    (lines_timed, _), output_end, timed = _timed(lines), None, []
     for s, start in lines_timed:
         bound = None
         if "t_recv_ns" in s and output_end is not None:
@@ -327,23 +318,7 @@ def _host_cut(lines) -> tuple[set[int], set[int], set[int]]:
         if start + min(recent, default=first) < s["t_launch_ns"][1]:
             exposed.add(s["step"])
     decodes = {s["step"] for s, _, _ in timed if all(r[2] for r in s["rows"])}
-    early = decodes & host_paced_drafts(lines)
-    paced = {
-        s["step"]
-        for s, start, _ in timed
-        if not all(r[2] for r in s["rows"])
-        and start + s["d_busy_ns"] + lead - s["t_exit_ns"]
-        < PACED_SHARE * s.get("d_target_ns", s["d_busy_ns"])
-    }
-    held = {
-        s["step"]
-        for s, start, _ in timed
-        if not all(r[2] for r in s["rows"])
-        and s["step"] not in paced
-        and s["t_launch_ns"][1] - start - lead
-        > HELD_SHARE * s.get("d_target_ns", s["d_busy_ns"])
-    }
-    return exposed, held, early
+    return exposed, decodes & host_paced_drafts(lines)
 
 
 def join_stamps(steps: list[dict], path) -> None:
@@ -463,7 +438,7 @@ def _label(
             f"{record} has no device windows (`d_busy_ns`); a fit labels a step "
             "by its device time"
         )
-    (exposed, held, early), traced = _host_cut(lines), _traced(path)
+    (exposed, early), traced = _host_cut(lines), _traced(path)
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
@@ -542,9 +517,9 @@ def _label(
         g0, g1 = s.get("t_gate_ns", (l0, l0))
         r0, r1 = s.get("t_recv_ns", (l1, l1))
         m0, m1 = s.get("t_mtp_ns", (l0, l0))
+        blocked = s.get("blocked_ns")
         host = {"W_pre": g0 - enter + m0 - g1}
-        if s["step"] not in held:
-            host["W_launch"] = r0 - l0
+        host["W_launch"] = r0 - l0 - sum((blocked or {}).values())
         if "t_mtp_ns" in s:
             host["W_inputs"] = l0 - m1
         if "t_pp_recv_ns" in s:
@@ -582,6 +557,7 @@ def _label(
                 None if cut or draft_kv is None else draft_kv * 1e-9,
                 admits[i],
                 s.get("launch", {}),
+                None if blocked is None else {k: v * 1e-9 for k, v in blocked.items()},
                 prefill if host_kind(view) == "decode" else None,
             )
         )
