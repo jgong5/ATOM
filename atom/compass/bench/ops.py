@@ -82,8 +82,9 @@ first of size above one, each the span of the others, as the batch's rows,
 or its blocks when the model keeps no
 per-request state, or, of a decode attention leaf that states its layer's
 window and compress ratio, the plane rows the batch's blocks hold at that
-ratio, a RoPE table's (`TABLES`), a weight or a tensor of a module it names,
-as many rows as the point's tokens, a table a leaf gathers by token ids
+ratio, a pointer table's (`_CACHE`) its entries, a view operator's none, a
+RoPE table's (`TABLES`), a weight or a tensor of a module it names, a row a
+position its call takes, else a token, a table a leaf gathers by token ids
 (`GATHERED`) as many rows as its ids, aiter's top-k scratch (`TOPK_WORKSPACE`)
 the bytes it launches with, but none of the multi-block path's one cached
 buffer, which every copy launches and the point's footprint counts once, the
@@ -229,7 +230,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 27
+PROTOCOL = 28
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -284,8 +285,8 @@ TOKEN_IDS = {
 #: the capture, which caches none, and its measuring process died.
 BATCH_IDS = {("aten.repeat_interleave.self_Tensor", "repeats"): "context_lens.long"}
 #: Weight slots, and a named module's tensors, a leaf reads a row a token of:
-#: RoPE's cos and sin tables, indexed by each token's position (or by each
-#: compressed position, at most one a token), never read whole.
+#: RoPE's cos and sin tables, indexed by each position its call takes, at most
+#: one a token, or without them each token's, never read whole.
 TABLES = {"cos_cache", "sin_cache", "cos", "sin"}
 #: A weight slot a leaf reads a row a token id of, and the slot of the ids, by
 #: operator: the embedding and DeepSeek-V4's hash routing table.
@@ -648,14 +649,23 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     (`draft`, as `forward.structure` keys it). A prefill that produces none
     runs its target's leaves less the LM head and the sampler, so the
     target's points at output cover both. A miss where the store holds the
-    shape under another engine config refuses naming what differs."""
+    shape under another engine config refuses naming what differs. A
+    two-batch-overlap micro-batch's `shape` reads its own graph."""
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture.forward import missed, structure
 
-    at = structure(config, shape.phase, device=arch, output=output, draft=draft)
+    at = structure(
+        config,
+        shape.phase,
+        device=arch,
+        output=output,
+        draft=draft,
+        micro_batch=shape.micro_batch,
+    )
     key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
     if not store.directory_for(key).exists() and (why := missed(store, key)):
         part = " that produces no output" * (not output)
+        part += " as a two-batch-overlap micro-batch" * shape.micro_batch
         part += " for its drafter" * bool(draft) + "'s draft-KV pass" * (draft == KV)
         raise ArtifactRefusal(
             Rule.RESOLUTION,
@@ -1142,9 +1152,10 @@ class Stub:
         room = [pool // blocks]
         room += [t.k_cache.shape[0] // taken for t in kv.values() if _stateful(t)]
         self.context, self.unplanned, self.once = _split(context)[0], {}, {}
+        tokens = sum(row[0] for row in rows)  # a drafter's rows verify its drafts
         plans = {
             s: self._plan(
-                op, i, kv, blocks, len(rows), shape.tokens, s, shape.phase == "decode"
+                op, i, kv, blocks, len(rows), tokens, s, shape.phase == "decode"
             )
             for s, (op, i) in found.items()
         }
@@ -1226,13 +1237,19 @@ class Stub:
         decode's; at a `decode`, a context key's recurrent state counts each
         state slot a row holds."""
         need, size, shared = 1, 0, [0, 0]
+        fn, cia = _overload(op["op"]), "CompositeImplicitAutograd"
+        if fn and fn.is_view and not fn.has_kernel_for_dispatch_key(cia):
+            return 1, size, need, shared  # reads none; a composite (`reshape`) may copy
         table, ids = GATHERED.get(op["op"], (None, None))
         acts = [s for _, s in _specs(op["args"]) if s["role"] == "activation"]
+        pos = op["args"].get("positions")
+        pos = pos.get("shape") if isinstance(pos, dict) else None
+        rope = pos[-1] if pos else tokens or rows  # a RoPE table's rows
         for slot, s in _specs(op["args"]):
             itemsize = _dtype(s["dtype"]).itemsize
             nbytes = _span(s["shape"], s["stride"]) * itemsize
             if s["role"] == "weight" and (slot in TABLES or slot == table):
-                read = tokens or rows
+                read = rope
                 if slot == table:  # a row an id
                     read = torch.Size(op["args"][ids]["shape"]).numel()
                 entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
@@ -1290,6 +1307,8 @@ class Stub:
                 cut = _widest(shape, stride)
                 rest = shape[:cut] + shape[cut + 1 :], stride[:cut] + stride[cut + 1 :]
                 entry = _span(*rest) * itemsize
+                if name.startswith(_CACHE.format(ratio="")):
+                    unit, history = shape[cut], 0  # a pointer table, at its entries
                 nbytes, need = entry * (unit + history), None
                 shared[slotted] += entry * unit
                 shared[1] += entry * history
@@ -1319,7 +1338,7 @@ class Stub:
                 tables = {id(getattr(module, name, None)) for name in sorted(TABLES)}
                 for t in _own(module):
                     if id(t) in tables:  # a RoPE table, a row a token
-                        size += t.nbytes // t.shape[0] * min(tokens or rows, len(t))
+                        size += t.nbytes // t.shape[0] * min(rope, len(t))
                     # ponytail: a first dim of the pool's blocks is a view of
                     # the KV pool (DeepSeek-V4's Indexer), read at the batch's
                     elif t.dim() and t.shape[0] == pool:
@@ -1714,13 +1733,16 @@ def _writes(name: str) -> set[str]:
     # `fill_deferred_decode_ids`, DeepSeek-V4's index builders) write what
     # ATOM's forward writes from the prepared metadata, which later leaves
     # read; one that writes other values needs its writes named here
+    args = target._schema.arguments if (target := _overload(name)) else []
+    return {a.name for a in args if a.alias_info and a.alias_info.is_write}
+
+
+def _overload(name: str):
+    """The `torch.ops` overload `name` names; None for a lifted function."""
     target = torch.ops
     for attr in [] if ":" in name else name.split("."):
         target = getattr(target, attr, None)
-    if not isinstance(target, torch._ops.OpOverload):
-        return set()
-    args = target._schema.arguments
-    return {a.name for a in args if a.alias_info and a.alias_info.is_write}
+    return target if isinstance(target, torch._ops.OpOverload) else None
 
 
 def _keyed(args, path) -> str:
