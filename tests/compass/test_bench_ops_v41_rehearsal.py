@@ -64,6 +64,10 @@ ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 #: V4.1's read of its state cursors back to the host, `.cpu()`, a copy into
 #: pageable memory, which no CUDA graph captures: `measure ops` refuses it.
 HOST_COPY = "aten.to.dtype_layout"
+#: What V4.1's step holds on the host and passes a leaf, by operator and slot:
+#: the source of each copy of its staged cursors and slots, and a fill's value
+#: that is a Python number.
+HOSTED = {("aten.copy_.default", "src"), ("aten.fill_.Tensor", "value")}
 
 
 def _run(script, *argv, cwd=TREE):
@@ -125,10 +129,9 @@ def test_every_leaf_reaches_its_launch_but_a_host_copy(rehearsed):
 def test_an_argument_atom_holds_on_the_host_is_built_there_bound_to_no_buffer(
     rehearsed,
 ):
-    """Each argument the capture states on the host, the sources of V4.1's
-    staged cursor and slot copies among them, is built on the host, pinned:
-    no buffer of ATOM's binds it, and its leaf reaches its launch, but the
-    cursors' copy to the host."""
+    """The capture states on the host what ATOM holds there, and nothing else;
+    each such argument is built on the host, pinned: no buffer of ATOM's binds
+    it, and its leaf reaches its launch."""
     from atom.compass.bench import ops
 
     got, _ = rehearsed
@@ -138,11 +141,11 @@ def test_an_argument_atom_holds_on_the_host_is_built_there_bound_to_no_buffer(
         for path, spec in ops._specs(json.loads(r["leaf"])["args"])
         if spec.get("device") == "cpu"
     ]
-    assert "aten.copy_.default" in {r["op"] for r, _ in hosted}
+    assert {(r["op"], path) for r, path in hosted} == HOSTED
     for r, path in hosted:
         why = r["shape"], r["op"], path, r["bound"], r["why"]
         assert path not in {*r["bound"], *r["identity"]}, why
-        assert r["verdict"] == "reaches launch" or r["op"] == HOST_COPY, why
+        assert r["verdict"] == "reaches launch", why
 
 
 def test_a_prefill_whose_forward_runs_its_tail_s_rows_refuses_by_name(rehearsed):

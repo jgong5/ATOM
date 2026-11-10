@@ -872,7 +872,10 @@ def _patches(recorder):
       that unwinds a frame, on every function.
     * `CpuGpuBuffer.__init__` (ATOM's own) allocates its host side and that
       side's numpy view outside the fake mode, unpinned (pinning is a driver
-      allocation); its device side is ATOM's `zeros_like`, faked.
+      allocation); its device side is ATOM's `zeros_like`, faked. torch
+      caches the constructors a default device places at their first call,
+      made here before that patch: cached under it, they would leave every
+      later `torch.zeros` of ATOM's on the host, not on the runner's device.
     * GDN's causal-conv1d metadata is host arithmetic over the staged
       `cu_seqlens`, and it runs outside the fake mode too.
     * A GDN prefill under ReplaySSM parks the cursors of its live state
@@ -912,6 +915,7 @@ def _patches(recorder):
     from aiter.ops import topk
     from flydsl.compiler import jit_function as fly
     from torch._subclasses.fake_tensor import unset_fake_temporarily
+    from torch.utils import _device
     from torch.utils._python_dispatch import _disable_current_modes
     from triton.compiler.compiler import CompiledKernel
     from triton.runtime.jit import JITFunction
@@ -1008,6 +1012,7 @@ def _patches(recorder):
         with patch.object(recorder, "counted", live):
             return attach(builder, md, num_reqs, is_prefill)
 
+    _device._device_constructors()  # cached while `torch.zeros` is torch's
     unpatched = [
         (fly.JitFunction, "__call__", fly.JitFunction.__call__),
         (fly, "_compile_impl", fly._compile_impl),
