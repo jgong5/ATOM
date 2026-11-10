@@ -872,8 +872,10 @@ in the `cached_seqs` form on the lone prefill cells and on the prefill side of o
 `deploy.sh record` cell, #975's cell at c=1 over traces 256 to 392, seed 20260707
 ([#2853](https://github.com/jgong5/ATOM/issues/2853)); its other vectors but rung 2, and its
 host laws, are the lone cells' fit. The pair's lone cells ran the fp4 indexer and its 1P1D
-cells the fp8 one, so neither law states `index_cache_dtype`, and each reads as fp8
-([#2998](https://github.com/jgong5/ATOM/issues/2998)).
+cells the fp8 one. Each law is keyed to the fp8 a P/D side resolves, without a refit: it
+states no `index_cache_dtype`, which then reads as `kv_cache_dtype`'s fp8, so a server that
+resolves fp4 refuses it. Its provenance states the gap that interleaved fp8 and fp4 lone cells
+measured ([#3073](https://github.com/jgong5/ATOM/issues/3073#issuecomment-6757202887)).
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by
@@ -906,8 +908,8 @@ vectors, the prefill law's rung-1 vector among them, and its host laws are the o
 lone cells alone, and its `sources` names the records each came from. The prefill law's rung-2
 vector is not: it is the decode law's, stating `declared`, since no prefill-side record decodes at
 rung 2, which the 1P1D prefill side reaches at c=64 ([#2878](https://github.com/jgong5/ATOM/issues/2878)).
-Host keys as above; the indexer as the crs005 DPA-TP8 pair's, its lone cells fp4 and its 1P1D
-cells fp8, so neither law states it.
+Host keys and the fp8 indexer key as the crs005 DPA-TP8 pair's, its lone cells fp4 and its 1P1D
+cells fp8; the gap between the two is unmeasured on this pair.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json` is DeepSeek-V4.1-Flash's
 law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed

@@ -450,11 +450,13 @@ EP8_PAIRS = [
 
 @pytest.mark.parametrize("side", ["prefill", "decode"])
 @pytest.mark.parametrize("stem,spec", EP8_PAIRS)
-def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
+def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off_or_the_other_indexer(
     monkeypatch, tmp_path, stem, spec, side
 ):
     fitted = json.loads((COMPASS / "laws" / f"{stem}-{side}.json").read_text())
     engine = fitted["engine_config"]
+    # A law that states no index cache dtype is keyed to its KV cache's.
+    index = engine.get("index_cache_dtype", engine["kv_cache_dtype"])
     for key in PERFORMANCE_KEYS:
         monkeypatch.delenv(key, raising=False)
     for key, value in engine["env"].items():
@@ -462,11 +464,11 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
     run = _without_step_stub(tmp_path, step_linear=fitted, machine=spec)
     monkeypatch.setenv(compass_run.ENV, str(run))
 
-    def installed(ep):
+    def installed(ep, index=index):
         r = deployment(
             tmp_path,
             **{k: engine[k] for k in ("kv_cache_block_size", "kv_cache_dtype")},
-            index_cache_dtype=engine.get("index_cache_dtype"),
+            index_cache_dtype=index,
             quant_config=SimpleNamespace(compute_hash=lambda: engine["quantization"]),
             parallel_config=SimpleNamespace(
                 data_parallel_size=8, data_parallel_rank=0, pipeline_parallel_rank=0
@@ -487,6 +489,8 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
         ValueError, match="enable_expert_parallel True in the law and False here"
     ):
         installed(False)
+    with pytest.raises(ValueError, match="another engine config: index_cache_dtype"):
+        installed(True, {"fp4": "fp8", "fp8": "fp4"}[index])
 
 
 def _inside(hull: dict, features: tuple) -> dict:
