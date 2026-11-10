@@ -215,7 +215,7 @@ def test_each_sample_copies_its_input_s_provenance_and_the_traces_it_served(
         "engine_config": json.loads(a.joinpath("run.json").read_text())["host_key"][
             "engine"
         ],
-        "prefill_buckets": None,
+        "prefill_buckets": [],
         "source_root": "atom_py-" + "0" * 64,
         "stack": STACK,
         "ptl": "disabled",

@@ -20,7 +20,8 @@ replays no graph yet pads past its rows, `target_bs`, at that width. Under
 micro-batches, each a prefill at its own tokens and the group's rows of it,
 by the split `validate.bound` rebuilds from every rank's line; a population's
 prefill is traced as one forward, as it ran, where ATOM would split a step of
-its tokens, and with `--whole` each `--prefill` too. Each is traced at that
+its tokens, a micro-batch's MoE on one stream as under overlap, and with
+`--whole` each `--prefill` too. Each is traced at that
 concrete shape (`forward`), decoder layers folded
 into `Repeat` and forked streams into `Par` (`graph`). Under DP with no
 drafter, `--symbolic` then traces each prefill's (T, B) once more, at its
@@ -32,8 +33,8 @@ An `op_graph` is keyed by structure (`forward.structure`: the model's
 architecture and config.json digest, `--arch`, the engine config a step law is
 keyed by less its ladder, which holds ATOM's engine arguments and this
 process's performance environment (`run.step_grid.keyed`), the TP width, the DP
-and EP widths when set, the phase, the mode and whether the step produces
-output) and by shape, which
+and EP widths when set, the phase, the mode, whether the step produces
+output and whether it is a two-batch-overlap micro-batch) and by shape, which
 names the rows a DP group's MoE gathers only off its default, every rank at
 this one's tokens (`forward.Shape`):
 a prefill shape is published twice, as a middle chunk, which samples nothing,
@@ -152,8 +153,8 @@ def population_steps(names, tbo=False, drafters=False):
     overlap (`tbo`, ATOM's `enable_tbo`) a DP step the group split, by the
     rule `validate.bound` agrees over every rank's line at that step
     (`bound._split`), is its two micro-batches (`step_roofline.micro_batches`),
-    each a prefill at its own tokens and the group's rows of it, its line
-    holding its own rows. With
+    each a prefill at its own tokens and the group's rows of it, marked a
+    micro-batch (`forward.Shape`), its line holding its own rows. With
     `drafters`, a drafter's shape follows it where they differ: a decode's
     at its rows padded to `draft_bs`, else to its rung, a sampling prefill's
     or a DP middle chunk's with `draft_bs` as its `width`. A target that
@@ -209,7 +210,8 @@ def population_steps(names, tbo=False, drafters=False):
                     rows = [(r.query_tokens, r.decode) for r in half.requests]
                     _, tokens, seqs = step_shape(rows, None)
                     own = {"rows": [dataclasses.astuple(r) for r in half.requests]}
-                    yield prefill(tokens, seqs, half.moe_rows).at(dp), line | own
+                    shape = prefill(tokens, seqs, half.moe_rows).at(dp)
+                    yield shape._replace(micro_batch=True), line | own
 
 
 def publish(store, graph, model, declared, tp, atom_args, command):
