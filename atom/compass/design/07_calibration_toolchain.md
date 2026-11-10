@@ -1060,11 +1060,11 @@ own Python moves either: one engine start serves every tree the law reaches, a r
 README's principle 10 allows where it is stated, here as `assumed`, which makes their terms
 declared. A commit that moves what a start under the law's engine config holds, through
 the code a reading reads (Phase 2), takes them again on that platform or drops them, so a
-run refuses until someone does. Two commits moved what a start holds, both measured in
-DeepSeek-V4.1-Flash's graph pool at TP4 EP4 DSpark5 on MI355X, its KV block count
-unmoved. [#2861](https://github.com/jgong5/ATOM/pull/2861) raised ATOM's default prefill
-token buckets from 3072 to 7168 tokens, taking a start at the default from 2.94 to 7.78 GB
-per GPU; the key reads the buckets only off their default
+run refuses until someone does. The measured cases are DeepSeek-V4.1-Flash's graph pool
+at TP4 EP4 DSpark5 on MI355X, its KV block count unmoved.
+[#2861](https://github.com/jgong5/ATOM/pull/2861) raised ATOM's default prefill token
+buckets from 3072 to 7168 tokens, taking a start at the default from 2.94 to 7.78 GB per
+GPU; the key reads the buckets only off their default
 (`atom/compass/run/step_grid.py::keyed`), so that commit stated the old ones in the
 V4.1-Flash laws' engine config, as their readings' key would, and a start under it holds
 what it did. [#2873](https://github.com/jgong5/ATOM/pull/2873)'s recordings, keeping no

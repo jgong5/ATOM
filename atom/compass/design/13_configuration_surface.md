@@ -183,7 +183,7 @@ memory` takes them. For a device never measured developer tooling states them (`
 and a law file carries readings taken on its law's platform, re-keyed with it (`07` D41),
 so a host with no GPU predicts from a shipped law, which the
 [#2722 Ruling](https://github.com/jgong5/ATOM/issues/2722#issuecomment-6678010091) found
-nothing committed allowed. Both are marked assumed: every term built on them is declared,
+nothing committed gave. Both are marked assumed: every term built on them is declared,
 `run.json` lists each assumption (`memory_readings_assumed`) and grading refuses the run
 (below). Its run summary states, as every run's does, its seconds by method, declared
 among them, and its refused, extrapolated and fallback steps (`08` D50.1).

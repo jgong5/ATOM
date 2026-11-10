@@ -331,11 +331,11 @@ the fit adopted both columns, at 32 and 43 ms ([#2958](https://github.com/jgong5
   config, the device, the software stack and torch (`07` D41). A mismatch refuses, but
   for the host CPU: a run takes it from the laws it prices by and predicts that host from
   any CPU, since the CPU it runs on moves only its wall time, never a predicted second
-  (`01` D4). Keyed by the CPU it ran on, a run refused every CPU but the one its laws timed: the
-  Intel Xeon Platinum 8480C for the shipped Qwen3.8-27B TP1 MI308X law, the AMD EPYC 9575F
-  for the DeepSeek-V4-Pro laws. Nothing transfers: a prediction for another host needs
-  that host's records. There is no transfer mode: the MI455 projection prices no host
-  floor (`08` D50.2).
+  (`01` D4). Keyed by the CPU it ran on, a run refused every CPU but the one its laws
+  timed: on 2026-11-10, the Intel Xeon Platinum 8480C for the shipped Qwen3.8-27B TP1
+  MI308X law and the AMD EPYC 9575F for the DeepSeek-V4-Pro laws. Nothing transfers: a
+  prediction for another host needs that host's records. There is no transfer mode: the
+  MI455 projection prices no host floor (`08` D50.2).
 - **Home:** beside the step linear law; the entry also holds the tokenizer and HTTP
   intake terms (`05` D25), which the machine spec no longer states.
 - **Use:** the runner composes them with any backend's device time by `01` D4's
