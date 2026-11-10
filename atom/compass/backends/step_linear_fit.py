@@ -122,13 +122,12 @@ label less the draft-KV label.
 On an MTP record both prefill vectors, the target's and the draft's, add
 `seqs` and `out` (`StepLinearLaw`).
 
-Records stating the prefill token-graph buckets their runner recorded fit a
-prefill vector that adds `padding` and states them (`StepLinearLaw`). A record
-states them in its engine file (`PREFILL_BUCKETS`), empty where its runner
-recorded none, or, where that file predates the field, in its host key's graph
-sets (`stated_buckets`); every record states the same buckets, or none does.
-`--engine` states them for a record that states none. Records stating them
-nowhere fit no `padding`, and the law names that under `unfitted`.
+Records whose engine files state the prefill token-graph buckets their runner
+recorded (`PREFILL_BUCKETS`) fit a prefill vector that adds `padding` and
+states them (`StepLinearLaw`); every record states the same buckets, or none
+does. A record whose engine file predates the field states them in its host
+key's graph sets (`stated_buckets`); `--engine` states them for one that
+states none. Records stating them nowhere fit no `padding`, named under `unfitted`.
 The draft law adds none: #2976 measured the target's token graph alone.
 
 Forms (`FORMS`): `base`, the features `StepLinearLaw` always prices; `history`,
@@ -225,10 +224,7 @@ TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
 #: prefix-cache hit and per token within it (`step_labels.admit_x`).
 ADMIT_FEATURES = ("admits", "uncached", "cached")
 #: Why a law fitted on records stating their prefill buckets nowhere has no `padding`.
-NO_BUCKETS = (
-    "the records state no prefill token-graph buckets, in their engine files or "
-    "host keys, so prefill steps are priced without their token graph's padding"
-)
+NO_BUCKETS = "no record states prefill buckets, so the prefill vector adds no padding"
 
 
 def _rung_key(rung: int | None) -> str:
@@ -1747,10 +1743,8 @@ def engine_config(records) -> dict:
 
 
 def stated_buckets(record) -> list | None:
-    """The prefill token-graph buckets the record `record` (`dp<r>.jsonl`) says
-    its runner recorded: its engine file's (`PREFILL_BUCKETS`), else its host
-    key's graph sets' (`launch_features.GRAPHS`), which a record whose engine
-    file predates that field may state; None where it states neither."""
+    """The prefill token-graph buckets the record `record` (`dp<r>.jsonl`) states:
+    its engine file's, else its host key's graph sets'; None where neither does."""
     engine = Path(record).with_suffix(".engine.json")
     raw = json.loads(engine.read_text()) if engine.exists() else {}
     if PREFILL_BUCKETS in raw:
@@ -1849,22 +1843,24 @@ def main(argv=None) -> None:
         ):
             raise ValueError(f"{record} is not fitted: {built}")
     owns = [Path(r).with_suffix(".engine.json") for r in args.records]
-    buckets = {r: stated_buckets(r) for r in args.records}
+    stated = {r: stated_buckets(r) for r in args.records}
     if args.engine:
-        raw = json.loads(Path(args.engine).read_text())
-        engine = keyed_of(raw)
+        engine = keyed_of(json.loads(Path(args.engine).read_text()))
         for own in owns:
-            held = keyed_of(json.loads(own.read_text()) if own.exists() else {})
+            raw = json.loads(own.read_text()) if own.exists() else {}
+            held = keyed_of(raw)
             refuse_context_parallel(held, str(own))
             if differ := [k for k, v in held.items() if engine.get(k, v) != v]:
                 raise ValueError(f"{own} contradicts {args.engine} in {differ}")
-        buckets = {r: b for r, b in buckets.items() if b is not None}
-        buckets = {args.engine: raw.get(PREFILL_BUCKETS), **buckets}
+        given = json.loads(Path(args.engine).read_text()).get(PREFILL_BUCKETS)
+        stated = {args.engine: given} | {
+            r: b for r, b in stated.items() if b is not None
+        }
     else:
         engine = engine_config(args.records)
     dp = join_width(engine)
     options = {"form": args.form, "dp": dp, "moe_routing": args.moe_routing}
-    options["buckets"] = recorded_buckets(buckets)
+    options["buckets"] = recorded_buckets(stated)
     samples, tables = label_records(args.records, dp)
     for record, table in tables.items():
         step_labels.write_table(record, table)

@@ -18,8 +18,9 @@ takes, which `publish.inputs` loads each measurement under.
 `data_parallel_size`, so a record with a
 rank that gave no sample refuses; it pads prefill to the records'
 `prefill_buckets`, naming under `unfitted` records stating none, and holds
-out each run on the others when there are two or more, as that module's
-command does; `--seed` fixes its shuffles. The law states the configuration's
+out each run on the others when
+there are two or more, as that module's command does; `--seed` fixes
+its shuffles. The law states the configuration's
 `machine_spec` and `engine_config`, as that command's does, and the key holds them. The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
