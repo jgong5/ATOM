@@ -17,9 +17,8 @@ step's rows each hold `--context` tokens, under a drafter verifying as many
 more as it drafts, and a prefill's rows, split as the capture split them,
 follow `--context` cached tokens each, none when it is not given; there
 the planes of DeepSeek-V4.1's FP8 indexer, which the capture sized to its own
-rows' KV blocks, are as wide as the point's rows' (`PAGE_WIDE`), and a
-top-k there runs the kernel aiter dispatches at that width (`_dispatched`),
-or refuses. Rows the KV
+rows' KV blocks, are as wide as the point's rows' (`PAGE_WIDE`), a top-k on
+aiter's kernel at that width (`_dispatched`). Rows the KV
 pool cannot hold at once are ragged (`point_rows`), and the point records its
 rows; under `--plan` over ragged decode steps a decode point
 the pool cannot hold refuses instead, past the first round (`RAGGED`).
@@ -229,8 +228,8 @@ from atom.utils.arg_parser import FlexibleArgumentParser
 
 PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
-#: copies a graph reads, what a capture waits for, what a replay follows or
-#: the operator a point times change.
+#: copies a graph reads, what a capture waits for or what a replay follows
+#: change, or the operator a point times does.
 PROTOCOL = 28
 WARMUPS = 3
 REPEATS = 20
@@ -1837,9 +1836,9 @@ def _widened(op, blocks) -> dict:
 
 def _dispatched(op) -> dict:
     """`op`, aiter's HIP decode top-k (`_PICK`) once its logits are k wide, as
-    aiter dispatches it on the arch `graph` read the leaf's graph at, this
-    device's: FlyDSL's one-block kernel on `ONE_BLOCK`'s, called as aiter's
-    decode wrapper calls it, each row bound `seqLens`; else marked refused."""
+    aiter dispatches it on this device's arch, the one `graph` read its graph
+    at: FlyDSL's one-block kernel on `ONE_BLOCK`'s, called as aiter's decode
+    wrapper calls it, each row bound `seqLens`; else marked refused."""
     from atom.compass.capture.forward import device_arch
 
     args = op["args"]
@@ -1850,12 +1849,10 @@ def _dispatched(op) -> dict:
         off = f" under {FLYDSL_OFF}" * (FLYDSL_OFF in os.environ)
         why = f"aiter's decode top-k of k {args['k']} on logits {width} wide"
         return op | {"refuses": f"{why}: its kernel on {arch}{off} is not known"}
-    hip = ("logits", "seqLens", "seqLens", "indices", "values", "numRows")
-    one_block = ("logits", "row_starts", "row_ends", "indices", "values", "num_rows")
-    both = ("stride0", "stride1", "k", "stable", "next_n")
-    called = zip(one_block + both, hip + both)
-    called = {slot: copy.deepcopy(args.get(was)) for slot, was in called}
-    called |= {"is_decode": True, "plane_width": None, "packed_rows": False}
+    named = {"seqLens": "row_ends", "numRows": "num_rows"}
+    called = {named.get(s, s): v for s, v in args.items() if s != "workspace"}
+    called |= {"row_starts": copy.deepcopy(args["seqLens"]), "is_decode": True}
+    called |= {"values": args.get("values"), "plane_width": None, "packed_rows": False}
     return op | {"op": _TOPK, "args": called}
 
 
