@@ -347,8 +347,8 @@ it carries Mooncake's KV transfer between the prefill and the decode node (`01` 
 
 ### Schema rules
 
-1. **No default for a memory reading.** A configuration with no `memory_readings` entry
-   **refuses and names it** (`07` D38). These are the terms with no law behind them; a
+1. **No default for a memory reading.** A configuration with no `memory_readings` entry,
+   and no law file's (`07` D41), **refuses and names it** (`07` D38). These are the terms with no law behind them; a
    silent default is the worst kind of wrong.
 2. **`derate` is mandatory wherever a spec-peak number appears**, so nobody can quietly
    use a datasheet FLOP as an achievable one. The peak is the datasheet's, and the
