@@ -1354,10 +1354,8 @@ smoke above:
   `memory_readings` that `compass measure memory` takes at the same tree and settings.
 - Steps 4 and 5 take `--duration 3600`, one server on the node at a time. Step 4 runs three
   spaced rounds, each at c=1, 4, 16 and 64 in turn.
-- Each concurrency is graded on the mean of its three real runs: within 10% on throughput and
-  TPOT and 15% on TTFT, with the real spread beside it. `python -m atom.compass.validate`
-  grades each metric against the spread instead; no checked-in command grades the mean yet,
-  and [#3101](https://github.com/jgong5/ATOM/issues/3101) adds it.
+- `python -m atom.compass.validate` grades each concurrency's simulated run against its three
+  real runs, with throughput and TPOT targets of 10% and TTFT's of 15%, beside the real spread.
 - A real run has hung when, for 90 s while requests run or wait, its log shows neither a step
   line nor a load report with nonzero prompt or generation throughput
   ([#2922](https://github.com/jgong5/ATOM/issues/2922)). Check the node after the GPU reset
@@ -1365,7 +1363,7 @@ smoke above:
   all-reduce cutoff slow until the node was rebooted, every prefill chunk over 6553 tokens
   37 to 60% slower on the device.
 - `python -m atom.compass.memory.check --tp 4` checks each rank's non-KV memory against the
-  real run's log; the cell is graded on the mean of the three runs' readings. The `non_torch`
-  term, the driver and collective reserve, moves from start to start: one rank alone read
-  +10.43% against the 10% gate twice, beside its start's 10.3% spread across ranks, while the
-  mean stayed within 2.3%.
+  real run's log; a concurrency's memory is graded on the mean of its 12 readings, three runs
+  of four ranks. The `non_torch` term, the driver and collective reserve, moves from start to
+  start: one rank alone read +10.43% against the 10% gate twice, beside its start's 10.3%
+  spread across ranks, while the mean stayed within 2.3%.
