@@ -31,7 +31,14 @@ and as queued once its latest rank's launch call returned. Each pass's busy
 time is its largest over the ranks.
 
 A trace directory not named ``rank_<r>``, a DP or a pipeline run's, refuses:
-per-rank busy time under DP is not reduced.
+per-rank busy time under DP is not reduced. So does a trace that lacks a
+forward's device rows: a forward with no kernel, or a launch call naming a
+kernel whose device row the trace does not hold. kineto keeps at most
+ROCTRACER_MAX_EVENTS rows a process, launch calls and device rows alike, and
+drops every later row unmarked; on a TP4 trace run its default of 5,000,000
+filled 149 s in on rank 0 and 156 s in on the others, and a run whose ranks
+all fill at once agrees on every forward after it, each with no kernel and
+no busy time (#3106).
 """
 
 import gzip
@@ -89,10 +96,12 @@ def events(path):
 
 
 def forwards(path) -> list[dict]:
-    """One rank's forwards: each its ``tokens`` and its ``kernels``, each
+    """One rank's forwards: each its ``tokens``, its ``kernels``, each
     (start, end, launch return, pass, its drafter pass's line field or None,
-    name), in start order."""
+    name), in start order, and ``lost``, its launch calls that name a kernel
+    whose device row the trace does not hold."""
     ranges, runs, marks, launches, kernels, computes = [], [], [], {}, [], set()
+    named, rows = [], set()
     for e in events(path):
         cat, ts = e.get("cat"), e.get("ts")
         if cat == "user_annotation":
@@ -105,8 +114,11 @@ def forwards(path) -> list[dict]:
                 marks.append(span)
         elif cat in RUNTIME and "correlation" in e.get("args", {}):
             launches[e["args"]["correlation"]] = (ts, ts + e["dur"])
+            if "kernel" in e["args"]:
+                named.append((ts, e["args"]["correlation"]))
         elif cat in GPU:
             stream = e["args"].get("stream")
+            rows.add(e["args"]["correlation"])
             kernels.append(
                 (ts, ts + e["dur"], e["args"]["correlation"], e["name"], stream)
             )
@@ -126,6 +138,7 @@ def forwards(path) -> list[dict]:
                 "end": min(done or [m[0] for m in drafts] or [f1 + 1]),
                 "drafts": drafts,
                 "kernels": [],
+                "lost": 0,
             }
         )
     for start, stop, corr, name, stream in kernels:
@@ -140,9 +153,33 @@ def forwards(path) -> list[dict]:
         part = "target" if launch < f["end"] and not inside else "draft"
         key = next((m[len(MARK) :] for m in inside), None)
         f["kernels"].append((launch, start, stop, queued, part, key, name))
+    for launch, corr in named:
+        i = bisect_right(starts, launch) - 1
+        if corr not in rows and i >= 0 and out[i]["run"] <= launch <= ranges[i][1]:
+            out[i]["lost"] += 1
     for f in out:
         f["kernels"] = sorted(k[1:] for k in f["kernels"])
     return out
+
+
+def _whole(dirs, ranks: list[list[dict]]) -> None:
+    """Refuse a trace that lacks a forward's device rows, naming each such
+    rank's first and its count."""
+    gaps = []
+    for d, fs in zip(dirs, ranks):
+        bad = [i for i, f in enumerate(fs) if f["lost"] or not f["kernels"]]
+        if bad:
+            at = (fs[bad[0]]["run"] - fs[0]["run"]) / 1e6
+            gaps.append(
+                f"{d.name} from forward {bad[0]}, {at:.1f} s in ({len(bad)} of "
+                f"{len(fs)})"
+            )
+    if gaps:
+        raise ValueError(
+            "a rank's trace lacks device rows of its forwards: "
+            f"{'; '.join(gaps)}. kineto drops every row past "
+            "ROCTRACER_MAX_EVENTS unmarked (#3106)"
+        )
 
 
 def _align(ranks: list[list[dict]]) -> None:
@@ -218,6 +255,7 @@ def reduce(out) -> Path:
             f"the ranks' forwards ({[len(fs) for fs in ranks]}) are not the "
             f"record's {len(lines)} lines with their tokens"
         )
+    _whole(dirs, ranks)
     _align(ranks)
     per_rank = [busy(fs) for fs in ranks]
     rows = []
