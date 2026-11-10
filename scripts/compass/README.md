@@ -1364,11 +1364,11 @@ and 5 at concurrency 16 alone, with these changes:
   sampled starts leave rung 6 and above too few steps for a vector, and a step at a
   rung with none is refused.
 - The trace runs stay at 120 s for their stop's cost: the EP4 cell's passed the default
-  row cap 41 to 49 s in and logged 14.3M to 14.7M rows a rank, and each stop took about
-  11 min, about 4.4 s of labelling per traced second
-  ([#3113](https://github.com/jgong5/ATOM/pull/3113#issuecomment-6757261953),
-  [#3111](https://github.com/jgong5/ATOM/pull/3111)). At that rate the default 4200 s
-  covers about 950 s traced. In their first 120 s, #2789's cell-B calibration records
+  row cap 41 to 49 s in and logged 14.3M to 14.7M rows a rank, and each stop, SIGTERM
+  to exit, took about 11 min: c=4's 671 s for 121 s traced, about 46 us a row a rank
+  ([#3113](https://github.com/jgong5/ATOM/pull/3113#issuecomment-6759346059),
+  [#3111](https://github.com/jgong5/ATOM/pull/3111)). At c=4's rate the default 4200 s
+  covers about 750 s traced. In their first 120 s, #2789's cell-B calibration records
   at `aeffa7d63` hold 30 prefill steps at c=4 and 125 at c=16.
 - Steps 4 and 5 take `--duration 3600`, with a calibration record between step 4's
   two real runs. A step 5 at another duration than step 4's is graded as another
