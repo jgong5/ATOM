@@ -72,12 +72,6 @@ beyond it, fitted on their `E` with their kind's law as a fixed part. Records
 on too few such forwards give `admit` null, so a run refuses a forward that
 admits a request rather than charge it nothing, and the report says why under
 `unfitted`.
-A decode whose forward before it was an output prefill (`Sample.after`) is left
-out of each decode law that also fits `after_prefill[segment]`, seconds on that
-prefill's `(1, tokens, seqs)`, on what those decodes spend beyond the law, its
-price, launch columns included, a fixed part (`_after_prefill`). A segment
-with too few of them to fit the term keeps them in its law, with no term, and
-the report says why under `unfitted`.
 
 Under a launch provider that declares features (`launch_features`), a step it
 predicts otherwise than its line observed refuses, naming it; each host law
@@ -303,27 +297,17 @@ def _features(
     return rows, cut
 
 
-def _host_x(view) -> tuple[int, int, int]:
-    return 1, sum_tokens(view.requests), len(view.requests)
+def _host_x(s) -> tuple[int, int, int]:
+    return 1, sum_tokens(s.view.requests), len(s.view.requests)
 
 
 def _host_rows(samples) -> list[tuple]:
-    """(kind, segment, (1, tokens, seqs), seconds, run, launch, after) per host
-    label of each sample, but the `E` of one that admits requests; `after` is
-    `_host_x` of the output prefill before a decode (`Sample.after`), else None."""
+    """(kind, segment, (1, tokens, seqs), seconds, run, launch) per host label
+    of each sample, but the `E` of one that admits requests."""
     rows = []
     for s in samples:
-        after = None if s.after is None else _host_x(s.after)
         rows += [
-            (
-                host_kind(s.view),
-                k,
-                _host_x(s.view),
-                v,
-                s.provenance["run"],
-                s.launch,
-                after,
-            )
+            (host_kind(s.view), k, _host_x(s), v, s.provenance["run"], s.launch)
             for k, v in s.host.items()
             if k != "E" or not s.admitted[0]
         ]
@@ -347,9 +331,7 @@ def _admit_rows(samples, host) -> list[tuple]:
         for s in samples
         if s.admitted[0]
         and s.host.get("E", 0) > 0
-        and (
-            base := _host_price(host, host_kind(s.view), "E", _host_x(s.view), s.launch)
-        )
+        and (base := _host_price(host, host_kind(s.view), "E", _host_x(s), s.launch))
         is not None
     ]
 
@@ -412,24 +394,22 @@ def fit_host(samples) -> tuple[dict, dict]:
         for segment in HOST_SEGMENTS[: 3 if kind == "middle" else 4] + tuple(extra):
             members = [r for r in rows if r[:2] == (kind, segment) and r[3] > 0]
             try:
-                coef, fitted, adopted = _segment_law(members, launch)
+                adopted, figures = _launch_columns(members, launch.features)
+                columns = [(f, [r[5][f] for r in members]) for f in adopted]
+                coef, fitted = _host_law(
+                    [r[2] for r in members],
+                    [r[3] for r in members],
+                    HOST_FEATURES,
+                    columns=columns,
+                )
             except (ValueError, QhullError) as e:
                 report["unfitted"][f"{kind}.{segment}"] = str(e).splitlines()[0]
                 continue
-            if any(r[6] is not None for r in members):
-                try:
-                    (coef, fitted, adopted), term = _after_prefill(members, launch)
-                except (ValueError, QhullError) as e:
-                    why = str(e).splitlines()[0]
-                    report["unfitted"][f"after_prefill.{segment}"] = why
-                else:
-                    host.setdefault("after_prefill", {})[segment] = term[0]
-                    report[f"after_prefill.{segment}"] = term[1]
             host["laws"].setdefault(kind, {})[segment] = coef[: len(HOST_FEATURES)]
             if adopted:
                 c = dict(zip(adopted, coef[len(HOST_FEATURES) :]))
                 host.setdefault("columns", {}).setdefault(kind, {})[segment] = c
-            report[f"{kind}.{segment}"] = fitted
+            report[f"{kind}.{segment}"] = fitted | figures
     a, base, labels = list(zip(*_admit_rows(kept, host))) or [(), (), ()]
     try:
         host["admit"], report["admit"] = _host_law(a, labels, ADMIT_FEATURES, base)
@@ -437,31 +417,6 @@ def fit_host(samples) -> tuple[dict, dict]:
         host["admit"] = None  # a run refuses a forward that admits a request
         report["unfitted"]["admit"] = str(e).splitlines()[0]
     return host, report
-
-
-def _segment_law(members, launch) -> tuple[list, dict, list[str]]:
-    """The host law over `members` (`_host_rows`), the launch features of
-    `launch`'s provider it adopts (`_launch_columns`) as columns after its
-    `HOST_FEATURES` coefficients, its report and those features."""
-    adopted, figures = _launch_columns(members, launch.features)
-    columns = [(f, [r[5][f] for r in members]) for f in adopted]
-    coef, fitted = _host_law(
-        [r[2] for r in members], [r[3] for r in members], HOST_FEATURES, columns=columns
-    )
-    return coef, fitted | figures, adopted
-
-
-def _after_prefill(members, launch) -> tuple[tuple, tuple]:
-    """A decode segment's `_segment_law` over `members`, its `_host_rows` rows,
-    but those after an output prefill, and its `after_prefill` term over those,
-    the law's price, columns included, a fixed part: `_host_law`'s answer.
-    Raises as they do."""
-    plain = [r for r in members if r[6] is None]
-    after = [r for r in members if r[6] is not None]
-    law = _segment_law(plain, launch)
-    base = [float(np.dot(law[0], [*r[2], *(r[5][f] for f in law[2])])) for r in after]
-    x, y = [r[6] for r in after], [r[3] for r in after]
-    return law, _host_law(x, y, HOST_FEATURES, base)
 
 
 def _blocked(samples) -> tuple[dict, list[str]]:
@@ -890,7 +845,7 @@ def _jit(samples, features=()) -> set[tuple]:
         if len(members) <= len(HOST_FEATURES) + len(features):
             continue
         x = np.array(
-            [(*_host_x(m.view), *(m.launch[f] for f in features)) for m in members],
+            [(*_host_x(m), *(m.launch[f] for f in features)) for m in members],
             dtype=np.float64,
         )
         if np.linalg.matrix_rank(x[:, 1:3]) < 2:
@@ -1688,17 +1643,12 @@ def host_held_out(samples) -> dict:
     for run in dict.fromkeys(s.provenance["run"] for s in samples):
         others = [s for s in samples if s.provenance["run"] != run]
         host = fit_host(others)[0]
-        admit, terms = host.get("admit"), host.get("after_prefill", {})
+        admit = host.get("admit")
         mine = [s for s in samples if s.provenance["run"] == run]
-        rows = []
-        for kind, segment, x, seconds, _, launch, after in _host_rows(mine):
-            price = _host_price(host, kind, segment, x, launch)
-            band = f"{kind} {segment}"
-            if after is not None and (t := terms.get(segment)) and price is not None:
-                band, price = f"after_prefill {segment}", price + float(
-                    np.dot(t, after)
-                )
-            rows.append((band, price, seconds))
+        rows = [
+            (f"{kind} {segment}", _host_price(host, kind, segment, x, launch), seconds)
+            for kind, segment, x, seconds, _, launch in _host_rows(mine)
+        ]
         rows += [
             ("admit E", admit and base + float(np.dot(admit, a)), e)
             for a, base, e in _admit_rows(mine, host)
