@@ -11,7 +11,7 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   ``--step-grid KEY``, the store's root and a `step_grid_bundle` entry's key;
   ``--op-graph``, ``true``, and as ``price_list`` the fields of the
   `price_list` key this run's model, parallel layout, machine spec and ATOM
-  tree name, when ``--store`` holds one there.
+  source name, when ``--store`` holds one there.
   A KEY is the token `Key.token` prints, resolved under ``--store``; for
   ``--step-linear`` and ``--host-laws`` a law file `step_linear_fit` writes
   may stand in: its law less ``host`` and ``host_fit``, or its ``host``, each
@@ -50,10 +50,8 @@ from atom.compass.artifacts import (
     ArtifactStore,
     Key,
     Kind,
-    git_tree_root,
     machine_spec_digest,
     member_name,
-    module_root,
 )
 from atom.compass.fit.publish import RANK
 
@@ -227,9 +225,8 @@ def _backend(entry) -> dict:
 
 def _price_list_key(atom_args, machine) -> Key:
     """The `price_list` key of the model and parallel layout ATOM's arguments
-    serve, on `machine`, from this ATOM tree."""
+    serve, on `machine`, from this ATOM source."""
     engine = _engine_args(atom_args)
-    tree = git_tree_root("atom", module_root("atom"))
     return Key.of(
         Kind.PRICE_LIST,
         model=run._file_digest(engine.model, "config.json"),
@@ -241,7 +238,7 @@ def _price_list_key(atom_args, machine) -> Key:
         enable_dp_attention=engine.enable_dp_attention,
         decode_context_parallel_size=engine.decode_context_parallel_size,
         machine_spec=machine_spec_digest(machine),
-        source_root=f"{tree.revision_kind}-{tree.revision}",
+        source_root=run.source_root(),
     )
 
 

@@ -28,8 +28,9 @@ its `dp0.engine.json` and the requests it served: `model`, the served
 config.json's digest; `device`, each GPU's `<name> <arch>`, as a spec states
 it; `engine_config`, `keyed`'s fields, the parallel layout among them;
 `prefill_buckets`, those `step_linear_fit.stated_buckets` reads, null where it
-states none; `source_root`, `<revision_kind>-<revision>`; `sampling`, the request
-parameters, null for a record serving no client run's request; its host key
+states none; `source_root`, its host key's ``atom`` as `source_root` writes
+it; `sampling`, the request parameters, null for a record serving no client
+run's request; its host key
 less its model and engine; its `stack`, the software versions run.json
 names; and its `ptl`, the cards' PTL state, `unrecorded` for a run.json that
 names none. A measurement reads the same fields but the host key, stack and
@@ -53,6 +54,7 @@ from atom.compass.drive import aiter_jit
 from atom.compass.drive.identity import PTL_CHANGES
 from atom.compass.parity import ARRIVALS
 from atom.compass.parity.served import served
+from atom.compass.run import source_root
 from atom.compass.run.step_grid import keyed_of
 from atom.compass.validate.bound import _split
 
@@ -150,7 +152,7 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
 def run_fields(run: dict, record="run.json") -> dict:
     """The `model`, `device` and `source_root` a run.json's identity states.
     A run on a tree with uncommitted files refuses, naming `record`: its
-    source root names the tree's HEAD, which is not the code that ran."""
+    provenance names the tree's HEAD, which is not the code that ran."""
     if dirty := run["source"].get("dirty"):
         raise ValueError(
             f"{record} ran with {dirty} uncommitted files in its source tree; "
@@ -161,7 +163,7 @@ def run_fields(run: dict, record="run.json") -> dict:
         "device": ", ".join(
             sorted({" ".join(str(gpu[f]) for f in CARD) for gpu in run["device"]})
         ),
-        "source_root": f"{run['source']['revision_kind']}-{run['source']['revision']}",
+        "source_root": source_root(run["host_key"]["atom"]),
     }
 
 
