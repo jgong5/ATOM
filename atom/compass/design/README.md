@@ -53,6 +53,7 @@ Added later, from the evidence and the owner's rulings, and not in the original 
 | **8** | **Every claim carries its measurement.** A number without a source is a defect. | Several "known" constants turned out to be one data point. |
 | **9** | **Model ATOM as it is meant to run.** An ATOM functional or performance bug gets no price term, probe field, host segment or planner rule. It is filed against ATOM under the [`atom-issue`](https://github.com/jgong5/ATOM/issues?q=label%3Aatom-issue) label for ATOM's side to fix, and the residual it leaves is stated in the named result of the task that found it. | Measured gaps that were ATOM's own: PP's gloo round trip before the RCCL receive and its serial RCCL parts ([#1559 Ruling](https://github.com/jgong5/ATOM/issues/1559#issuecomment-6266312440)), and gluon `pa_decode` running a 128- or 256-token split faster than its neighbours ([#1752 Ruling](https://github.com/jgong5/ATOM/issues/1752#issuecomment-6306960229)). |
 | **10** | **No algorithm that serves one refit, machine move or task enters the code.** A rule the code applies holds for every fit, machine and task it can meet. The one expedient is reusing costly measurements, such as a law re-keyed without a refit or a vector fitted on another subject, and it is stated where used: in the law's provenance or the vector's `declared` note. | `step_linear_fit --reference` let the gpu-45 decode law's held-out band veto the crs005 decode law's MoE column, a bar borrowed from another machine for one refit; it left the code by the [#2727 Ruling](https://github.com/jgong5/ATOM/issues/2727#issuecomment-6602866038) ([#2735](https://github.com/jgong5/ATOM/issues/2735)). |
+| **11** | **Compass does not model CPU cache state, in any host term.** A host term that costs more after an idle gap, or after other work evicts its data, keeps those samples in its fit, and the task that finds it states the residual. | Host terms that moved with it: the decode right after an output prefill runs its `W_inputs` longer ([#2218](https://github.com/jgong5/ATOM/issues/2218)), and a tokenizer decode 1 ms or more after its thread's previous call takes 2.8 to 9 times the pooled law's price ([#2919](https://github.com/jgong5/ATOM/issues/2919), [its Ruling](https://github.com/jgong5/ATOM/issues/2919#issuecomment-6768687256)). |
 
 ---
 
@@ -85,7 +86,7 @@ one most often assumed to be the second.
 
 ### Not modelled at all
 
-Fragmentation. Neighbour contention. The GIL. CPU cache state carried across steps. A device that
+Fragmentation. Neighbour contention. The GIL. CPU cache state, in any host term (principle 11). A device that
 has never been measured (except by the analytical projection, whose peaks carried from a probed
 device make its terms declared). See **Scope and non-goals** below for where each is recorded.
 
@@ -375,7 +376,7 @@ Stated here so they are not discovered at review.
 | Neighbour contention. Compass models a **dedicated** device, so it will not predict an OOM a shared box produces | `03` D14 |
 | Memory fragmentation — not modelled, not planned, and nobody models it | `03` D16 |
 | The GIL. Host terms are fitted on lone calls and on the CPU clock, so none carries a wait for it; the waits a lone call still holds are a stated residual | `07` D38, Phase 1c |
-| CPU cache state carried across steps. An output prefill evicts the worker's input-prep data from the core's L3, so the decode right after it runs its `W_inputs` longer, while its `E` runs more scheduling work; the decode host law keeps those decodes, and their residual is stated | [#2218](https://github.com/jgong5/ATOM/issues/2218) |
+| CPU cache state, in any host term (principle 11). An output prefill evicts the worker's input-prep data from the core's L3, so the decode right after it runs its `W_inputs` longer, while its `E` runs more scheduling work; the decode host law keeps those decodes, and their residual is stated. A tokenizer decode costs more the longer its thread sat idle since its previous call; the tokenizer law keeps those calls, and each cell's residual is stated | [#2218](https://github.com/jgong5/ATOM/issues/2218), [#2919](https://github.com/jgong5/ATOM/issues/2919#issuecomment-6768687256) |
 | **Cancellation** — `status` is `"completed"` on all 1,697 subagent wrappers in both corpora. There is nothing to replay. | `06` D35 |
 | Serving *decisions* as a simulated subsystem — a simple serving simulation is planned for a later phase of Compass, not this one | — |
 
