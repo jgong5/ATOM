@@ -392,8 +392,9 @@ a data-parallel MTP record tests it there.
 
 A prefill vector adds `padding`, `b − tokens`, where the records' engine files state the
 prefill token-graph buckets their runner recorded, and states those buckets. A record whose
-engine file predates that field states them in its host key's graph sets, and the fit reads
-them there; records stating them nowhere fit no `padding`, and the law names that under
+engine file predates that field states them in its host key only where its runner wrote graph
+sets there, and the fit reads them there; records stating them nowhere, which may come from a
+runner that captured no prefill graph, fit no `padding`, and the law names that under
 `unfitted`. Fitted so unseen on #2958's records, the vector priced eager bodies 5 to 7% high
 and graph bodies 3 to 7% low ([#3128](https://github.com/jgong5/ATOM/issues/3128)). ATOM replays
 a prefill's first layers as a token graph at `b` rows, the smallest bucket holding the

@@ -120,8 +120,9 @@ Records whose engine files state the prefill token-graph buckets their runner
 recorded (`PREFILL_BUCKETS`) fit a prefill vector that adds `padding` and
 states them (`StepLinearLaw`); every record states the same buckets, or none
 does. A record whose engine file predates the field states them in its host
-key's graph sets (`stated_buckets`); `--engine` states them for one that
-states none. Records stating them nowhere fit no `padding`, named under `unfitted`.
+key only where its runner wrote graph sets there (`stated_buckets`); `--engine`
+states them for one that states none. Records stating them nowhere fit no
+`padding`, named under `unfitted`.
 The draft law adds none: #2976 measured the target's token graph alone.
 
 Forms (`FORMS`): `base`, the features `StepLinearLaw` always prices; `history`,
