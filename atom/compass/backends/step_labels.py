@@ -111,7 +111,9 @@ from pathlib import Path
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.shape import BatchView, RequestShape
 
-#: Token copy wait exits whose tightest bound is a step's host clock lead.
+#: The recent bounds whose tightest places a step on the host clock, of either
+#: window: token copy wait exits for the launch-exposed cut, MTP status-wait
+#: returns for the lead.
 ANCHORS = 32
 #: Why a device label is cut: a launch-exposed decode, mixed rows, no MTP target
 #: end, a prefill with no traced busy time, a trace run's decode.
