@@ -393,6 +393,7 @@ _INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
 _SCAN = f"{_INDPTRS}:_launch_indptr_scan"
 _INDICES = f"{_INDPTRS}:_launch_indices"
 _FUSED = "atom.model_ops.v4_kernels.fused_compress:_launch_fused_compress"
+_ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 _FROM = ("replay_start", "cached_until")
 _SWA = "atom.model_ops.v4_kernels.state_writes:swa_write"
 _GATHER = "atom.model_ops.attentions.token_layout.gather:gather_rows"
@@ -414,10 +415,8 @@ V41_NAMES = {
     (f"{_INDPTRS}:_launch_window_rows", "eptr"): f"{_CACHE.format(ratio=0)}.1",
     (_FUSED, "state_slot_mapping"): "step.slots",
     (_SWA, "state_slot_per_seq"): "step.slots",
-    ("aiter.rope_cached_positions_fwd_impl.default", "positions"): (
-        "step.positions",
-        "step.plans.{ratio}.key_rope_positions_gpu",
-    ),
+    (_ROPE, "positions", "query"): "step.positions",
+    (_ROPE, "positions", "key"): "step.plans.{ratio}.key_rope_positions_gpu",
     ("aten.index_select.default", "index", "kv"): "step.slots",
     ("aten.index_select.default", "index", "metadata"): "plan.last",
     ("aten.index.Tensor", "indices"): "plan.query_ptrs",
@@ -1127,6 +1126,12 @@ class Stub:
             and "out_logits" in op["args"]
             and (op["args"].get("context_lens") or {}).get("role") != "activation"
         }
+        # and by the rows each compress plan holds, as many as its keys' RoPE's
+        self.known |= {
+            ("compressed", op["args"]["plan_gpu"]["shape"][0]): op["args"]["ratio"]
+            for op, _ in found.values()
+            if op["op"] == _FUSED
+        }
         bind = {
             (s, path): (spec, _named(op, path, spec, held, self.known) or held)
             for s, (op, _) in found.items()
@@ -1504,10 +1509,13 @@ class Stub:
                 out = self._tensor(value, meta.get((sig, path)), fresh)
                 # V4.1's FP8 plane a top-k or block maxima ranks: ATOM's scorer
                 # writes it first, which here no leaf has, or a scorer timed
-                # before has, off its own random inputs
+                # before has, off its own random inputs. Placements share one
+                # clone of it, which ATOM's preparation leaves unchanged, so
+                # each copy draws on a plane of its own
                 if self.paged and path == "logits" and value["role"] == "metadata":
                     bound = PAGE_WIDE.get(op["op"], ("",))[0]
                     if (ends := meta.get((sig, bound), ("", None))[1]) is not None:
+                        out = out if fresh else _clone(out)
                         _scores(out, ends, value)
                 return out
             if isinstance(value, str) and value.startswith("torch."):
@@ -1787,7 +1795,8 @@ def _ratio(op, path, known=None):
     `ratios` (DeepSeek-V4.1's indptr scan, a table a ratio); else the ratio
     `known` gives the rows a page holds at it (`rows_per_page`, V4.1's index
     build, 0 when it takes no selection) or the width of the logits it reads
-    (`stride0`, V4.1's top-k, its scorer's)."""
+    (`stride0`, V4.1's top-k, its scorer's), or a RoPE's positions the rows its
+    compress plan holds (`compressed`)."""
     args, (slot, *rest) = op["args"], path.split(".")
     listed = args.get("ratios")
     if rest and isinstance(args.get(slot), list) and isinstance(listed, list):
@@ -1798,6 +1807,8 @@ def _ratio(op, path, known=None):
         ratio = ratio if args["selected"] else 0
     if ratio is None and known and "stride0" in args:
         ratio = known.get(("stride0", args["stride0"]))
+    if ratio is None and known and (op["op"], path) == (_ROPE, "positions"):
+        ratio = known.get(("compressed", args[path]["shape"][-1]))
     return ratio
 
 
@@ -1806,6 +1817,8 @@ def _named(op, path, spec, pool, known=None) -> dict | None:
     `known` one, of `spec`'s dtype, its shape and stride first if any; or None."""
     key = op["op"], _keyed(op["args"], path)
     role = (op["args"].get("self") or {}).get("role")
+    if op["op"] == _ROPE:  # over one head a ratio's index keys, over more a query
+        role = "key" if op["args"]["input"]["shape"][-2] == 1 else "query"
     wanted = V41_NAMES.get((*key, role), V41_NAMES.get(key, ()))
     wanted = wanted if isinstance(wanted, tuple) else (wanted,)
     ratio = _ratio(op, path, known)

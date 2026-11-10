@@ -85,9 +85,9 @@ one most often assumed to be the second.
 
 ### Not modelled at all
 
-Fragmentation. Neighbour contention. The GIL. A device that has never been measured (except by the
-analytical projection, whose peaks carried from a probed device make its terms declared). See **Scope and non-goals**
-below for where each is recorded.
+Fragmentation. Neighbour contention. The GIL. CPU cache state carried across steps. A device that
+has never been measured (except by the analytical projection, whose peaks carried from a probed
+device make its terms declared). See **Scope and non-goals** below for where each is recorded.
 
 ---
 
@@ -375,6 +375,7 @@ Stated here so they are not discovered at review.
 | Neighbour contention. Compass models a **dedicated** device, so it will not predict an OOM a shared box produces | `03` D14 |
 | Memory fragmentation — not modelled, not planned, and nobody models it | `03` D16 |
 | The GIL. Host terms are fitted on lone calls and on the CPU clock, so none carries a wait for it; the waits a lone call still holds are a stated residual | `07` D38, Phase 1c |
+| CPU cache state carried across steps. An output prefill evicts the worker's input-prep data from the core's L3, so the decode right after it runs its `W_inputs` longer, while its `E` runs more scheduling work; the decode host law keeps those decodes, and their residual is stated | [#2218](https://github.com/jgong5/ATOM/issues/2218) |
 | **Cancellation** — `status` is `"completed"` on all 1,697 subagent wrappers in both corpora. There is nothing to replay. | `06` D35 |
 | Serving *decisions* as a simulated subsystem — a simple serving simulation is planned for a later phase of Compass, not this one | — |
 
@@ -556,7 +557,7 @@ The documents use these precisely; a reader will bounce off without them.
 | Doc | Title | What it settles |
 |---|---|---|
 | [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced stamp each direction, audited for minimality: a `tracestate` entry in, an SSE comment line per event out. The timeline rides carriers Atomesh already forwards, so it needs no change. Tokenizer cost is a queue, not a constant. |
-| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two gates: a CPU gate over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU gate, a superset less the files that stall or fail at random on its GPU (`gpu_gate_skip.txt`), judged as a **delta** against a recorded baseline per GPU target (`gpu_gate_baselines/<target>/gpu_gate_baseline.env`, every failing node-id on file in `gpu_gate_known_failures.txt` beside it, both rewritten by `regen_gpu_gate_baseline.sh`). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible if stable; sensitivity is deferred. |
+| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two gates: a CPU gate over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU gate, a superset less the files its GPU target's pair cannot record (`gpu_gate_skip.txt`, under `08`'s GPU-gate row), judged as a **delta** against a recorded baseline per GPU target (`gpu_gate_baselines/<target>/gpu_gate_baseline.env`, every failing node-id on file in `gpu_gate_known_failures.txt` beside it, both rewritten by `regen_gpu_gate_baseline.sh`). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible if stable; sensitivity is deferred. |
 | [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. The metrics push and refresh are daemon timers on simulated time. |
 
 ### Part V — Cross-cutting

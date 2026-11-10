@@ -902,6 +902,31 @@ def test_v41_index_leaves_rank_a_logits_plane_drawn_below_each_row_s_bound(
             assert row[:n].ne(0).all() and row[n:].eq(0).all()
 
 
+def test_each_copy_of_a_v41_index_leaf_ranks_a_logits_plane_of_its_own():
+    # V4.1's FP8 plane, which ATOM's preparation leaves as it was, at three
+    # placements of decode B=2: they share one clone of it
+    runner = _Runner()
+    geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(2, 64)
+    runner.forward_vars["ends"] = torch.tensor([50, 20])
+    plane, ends = _t([2, 64], "metadata"), _t([2], "metadata", dtype="torch.int64")
+    top_k = _leaf(ops._TOPK, ("logits", plane), ("row_ends", ends))
+    maxima = _leaf(ops._MAXIMA, ("logits", plane), ("visible", ends))
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(top_k, maxima, layers=1)["region"])
+    for p in range(3):
+        stub._prepare((4 * p, 2 * p))
+
+    # copy c at placement c, each drawn below each row's bound
+    for sig, (op, instances) in stub.leaves.items():
+        planes = [stub._copy(op, sig, instances, c)[0]["logits"] for c in range(3)]
+        assert len({plane.data_ptr() for plane in planes}) == 3
+        for plane in planes:
+            assert plane[0, :50].ne(0).all() and plane[1, :20].ne(0).all()
+            assert plane[0, 50:].eq(0).all() and plane[1, 20:].eq(0).all()
+
+
 def test_an_embedding_reads_the_token_ids_atom_prepared():
     runner = _Runner()
     # An index buffer whose name holds the slot's, which the name rule picks.
