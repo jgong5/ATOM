@@ -245,6 +245,7 @@ import atexit
 import codecs
 import contextlib
 import functools
+import gc
 import hashlib
 import json
 import math
@@ -266,7 +267,7 @@ from pathlib import Path
 import numpy as np
 
 import atom
-from atom.compass.artifacts import provenance
+from atom.compass.artifacts import Reading, provenance
 from atom.compass.clock import (
     TAR,
     ClockAbort,
@@ -339,6 +340,8 @@ PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
 SUMMARY_SCHEMA_VERSION = 14
+#: The reading kind of ATOM's source as `atom_digest` reads it.
+ATOM_PY = "atom_py"
 #: The terms of a ``host`` entry the frontend charges, each 0 s where it is absent.
 HOST_TERMS = ("http_intake", "tokenizer")
 #: The kinds of call a ``tokenizer`` term prices, each 0 s where it is absent.
@@ -367,6 +370,9 @@ COMPASS_ONLY = {
     },
     "utils/zmq_shim.py": {"_Socket", "_ChannelSocket", "_Context"},
 }
+#: The module `pip install -e .` writes (setuptools_scm) and git ignores: no
+#: commit holds it, so the host-law key leaves it out.
+INSTALL_WRITTEN = Path("_version.py")
 #: The run-file key of each backend a flag names (`atom.compass.drive.runfile`).
 STEP_STUB, STEP_LINEAR, STEP_GRID = "step_stub", "step_linear", "step_grid"
 OP_GRAPH, PRICE_LIST = "op_graph", "price_list"
@@ -1906,8 +1912,9 @@ def op_graph(
 def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or of its drafter's part (`draft`, a block drafter's
-    draft-KV pass where it is `forward.KV`), or when it holds none
+    that does not, of a two-batch-overlap micro-batch (`micro_batch`), or of
+    its drafter's part (`draft`, a block drafter's draft-KV pass where it is
+    `forward.KV`), or when it holds none
     `forward.missed`'s text, None for no text; under DP, at the rows the
     step's MoE gathers; a prefill's drafter at the `width` its later passes
     pad to; keyed under the performance environment `env` when given, else
@@ -1924,10 +1931,16 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     Under DP a prefill the store holds no graph at, with no drafter, reads
     the graph of its tokens, sequences and width that holds G
     (`forward.Tracer.symbolic`, keyed by `forward.symbolic_shape`) at the
-    step's G, when its hints span G and its guards admit it (`peers.at`); with
-    `atom_args`, the first such step of a shape traces that graph, and when
-    its two ends differ (`forward.PerG`) each G of the shape is traced as
-    above instead, the shape and why named in `lazy`'s ``lazy_per_g``."""
+    step's G, when its hints span G and its guards admit it (`peers.at`),
+    counted in `lazy`'s ``held_lookups``; with `atom_args`, the first such
+    step of a shape traces that graph, and when its two ends differ
+    (`forward.PerG`) each G of the shape is traced as above instead, the
+    shape and why named in `lazy`'s ``lazy_per_g``. With `lazy`, each
+    lookup's wall seconds, its traces among them, are added to its
+    ``lookup_wall_seconds``.
+
+    Each graph read from the store is parsed once and then frozen out of the
+    collector's reach with the rest of the live heap (`parsed`)."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture import peers
     from atom.compass.capture.forward import (
@@ -1938,6 +1951,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         structure,
         symbolic_shape,
     )
+    from atom.utils import envs
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
     dp = config.parallel_config.data_parallel_size
@@ -1965,6 +1979,18 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         lazy["lazy_traces"] += 1
         lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
 
+    def parsed(key) -> dict:
+        """The graph the store holds at `key`, parsed and frozen with the rest
+        of the live heap, a collection first so no garbage is kept, as
+        `gc_utils.freeze_gc_heap` freezes the startup heap and under the same
+        `ATOM_GC_FREEZE`: this lookup's caches keep what it parses alive, and
+        every full collection walked all of it."""
+        graph = json.loads(store.read(key).read_member("graph", rank, "json"))
+        if envs.ATOM_GC_FREEZE:
+            gc.collect()
+            gc.freeze()
+        return graph
+
     def read(at: str, shape: str) -> dict | None:
         """The graph the store, or this lookup's unpublished traces, hold at
         structure `at` and `shape`, as `capture.graph.to_json` writes it."""
@@ -1973,24 +1999,33 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
         if not store.directory_for(key).exists():
             return None
-        return json.loads(store.read(key).read_member("graph", rank, "json"))
+        return parsed(key)
 
     @functools.lru_cache(maxsize=64)
     def held(at: str, shape) -> dict | None:
         """The graph that holds G of the DP prefill `shape`, at any G, at
         structure `at`, or None."""
-        text, new = symbolic_shape(shape), shape not in held_traced
-        if new and atom_args is not None and read(at, text) is None:
+        text = symbolic_shape(shape)
+        found = read(at, text)
+        if found is None and atom_args is not None and shape not in held_traced:
             held_traced.add(shape)
             lazily(shape, symbolic=True)
-        return read(at, text)
+            found = read(at, text)
+        return found
 
     @functools.lru_cache(maxsize=64)
     def graph(
-        phase, tokens, seqs, output=True, gathered=None, draft=False, width=None
+        phase,
+        tokens,
+        seqs,
+        output=True,
+        gathered=None,
+        draft=False,
+        width=None,
+        micro_batch=False,
     ) -> dict | str | None:
-        shape = Shape(phase, tokens, seqs, gathered, width).at(dp, drafts)
-        at = structure(config, phase, True, arch, output, draft, env)
+        shape = Shape(phase, tokens, seqs, gathered, width, micro_batch).at(dp, drafts)
+        at = structure(config, phase, True, arch, output, draft, env, micro_batch)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
         missing = not store.directory_for(key).exists()
         if missing and dp > 1 and phase == "prefill" and not (draft or drafts):
@@ -1998,6 +2033,8 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
             if found := held(at, shape._replace(gathered=None)):
                 (lo, hi), guards = found["hints"], found["guards"]
                 if lo <= g <= hi and admits(guards, g):
+                    if lazy is not None:
+                        lazy["held_lookups"] = lazy.get("held_lookups", 0) + 1
                     return peers.at(found["region"], found["slots"], g, dp)
         if missing and atom_args is not None and shape not in traced:
             traced.add(shape)
@@ -2007,9 +2044,20 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
             return unpublished[at, str(shape)]["region"]
         if missing:
             return missed(store, key) or None
-        return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
+        return parsed(key)["region"]
 
-    return graph
+    if lazy is None:
+        return graph
+
+    def timed(*args, **kwargs):
+        began = time.monotonic()
+        try:
+            return graph(*args, **kwargs)
+        finally:
+            spent = time.monotonic() - began
+            lazy["lookup_wall_seconds"] = lazy.get("lookup_wall_seconds", 0) + spent
+
+    return timed
 
 
 def _trace_process():
@@ -2627,10 +2675,36 @@ def host_key(config) -> dict:
 def host_key_of(model: str, engine: dict) -> dict:
     """`host_key` for the model `model` names and the engine config `engine`
     that `keyed` gave, for a process that holds no resolved config."""
+    return {
+        "host_cpu": host_cpu(),
+        "atom": atom_digest(),
+        "model": _file_digest(model, "config.json"),
+        "engine": engine,
+    }
+
+
+def atom_source(digest: str | None = None) -> Reading:
+    """ATOM's source as every artifact reads it: `atom_digest`, here or as a
+    record's run.json ``host_key.atom`` states it in `digest`, a reading of
+    kind `ATOM_PY`."""
+    return Reading(ATOM_PY, atom_digest() if digest is None else digest)
+
+
+def source_root(digest: str | None = None) -> str:
+    """The ``source_root`` a key holds for `atom_source`, ``<kind>-<value>``."""
+    reading = atom_source(digest)
+    return f"{reading.kind}-{reading.value}"
+
+
+def atom_digest() -> str:
+    """The sha256 of ATOM's Python modules here, less `COMPASS_ONLY` and
+    `INSTALL_WRITTEN`."""
     root = Path(atom.__file__).parent
     digest = hashlib.sha256()
     for path in sorted(root.rglob("*.py")):
         relative = path.relative_to(root)
+        if relative == INSTALL_WRITTEN:
+            continue
         skip = next(
             (v for k, v in COMPASS_ONLY.items() if relative.is_relative_to(k)), ()
         )
@@ -2646,12 +2720,7 @@ def host_key_of(model: str, engine: dict) -> dict:
             if node is doc or names & skip:
                 del lines[prev.end_lineno if prev else 0 : node.end_lineno]
         digest.update(f"{relative}\0".encode() + b"".join(lines))
-    return {
-        "host_cpu": host_cpu(),
-        "atom": digest.hexdigest(),
-        "model": _file_digest(model, "config.json"),
-        "engine": engine,
-    }
+    return digest.hexdigest()
 
 
 def _file_digest(name: str, filename: str) -> str | None:
@@ -3011,6 +3080,10 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     # Each DP prefill whose G were each traced, and why, by the engines that did.
     if per_g := counted("lazy_per_g"):
         summary["cost"]["lazy_per_g"] = dict(per_g)
+    # The DP prefill lookups a graph holding G served, and every lookup's wall.
+    for key in ("held_lookups", "lookup_wall_seconds"):
+        if value := total(key):
+            summary["cost"][key] = value
     schedule = summary["schedule"]
     schedule["predicted_seconds"] = seconds
     # How the seconds were obtained: reported, never gated.
