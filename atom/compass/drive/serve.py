@@ -85,7 +85,10 @@ TRACE_ENV = {
 #: rows a process, launch calls and device rows alike, and drops every later
 #: row unmarked; its default of 5,000,000 filled 149 s into a 300 s V4.1-Flash
 #: TP4 trace run (#3106). The largest value the key takes, an int32: a trace
-#: run's rows are held in host memory until its stop.
+#: run's rows are held in host memory until its stop. A 120 s V4.1-Flash TP4
+#: trace run then holds about 14.5M rows a rank, and its command leaves about
+#: 11 min after SIGTERM, once it has written and reduced them; `client.sh`
+#: --stop allows a trace run `TRACE_STOP_S` more for that.
 KINETO_FILE, KINETO_CONF = "kineto.conf", "ROCTRACER_MAX_EVENTS=2147483647\n"
 #: As `cctraces_sim.sh` sets it, so a pooling client's idle connection is not
 #: closed under it; before ATOM's arguments, so one there wins.
