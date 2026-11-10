@@ -1228,10 +1228,11 @@ each run by the law fitted on the others; with one trace run, every prefill term
 unvalidated. Leave the trace runs out of `compass fit host`: their host segments ran
 under the profiler. A higher concurrency holds more prefill steps in the same time.
 `compass record --trace` raises kineto's row cap, 5,000,000 rows a process by default
-([#3106](https://github.com/jgong5/ATOM/issues/3106)), and its stop writes and reduces
-every row, for which `client.sh --stop` gives a trace run an hour more. A trace run
-that lost a forward's device rows all the same is refused at its stop, naming the rank
-and forward: take it again.
+([#3106](https://github.com/jgong5/ATOM/issues/3106)), and a run that lost device rows
+all the same is refused at its stop, naming each rank's first forward without them:
+take it again. Its stop writes and reduces every row, within `client.sh`'s `WAIT_S` plus
+serve's `TRACE_STOP_S`, 4200 s by default, so keep a trace run short enough to stop
+inside that.
 
 Developer checks, outside the `compass` path:
 - After step 2: `python -m atom.compass.parity.recurrence $R/cal/c<C>/steps`.
@@ -1362,11 +1363,13 @@ and 5 at concurrency 16 alone, with these changes:
   `AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"`:
   sampled starts leave rung 6 and above too few steps for a vector, and a step at a
   rung with none is refused.
-- The EP4 cell's 120 s trace runs logged 14.3M to 14.7M kineto rows a rank, about three
-  times the default cap, and each stop took about 11 min to write and reduce them
-  ([#3113](https://github.com/jgong5/ATOM/pull/3113#issuecomment-6757261953)). In their
-  first 120 s, #2789's cell-B calibration records at `aeffa7d63` hold 30 prefill steps
-  at c=4 and 125 at c=16.
+- The trace runs stay at 120 s for their stop's cost: the EP4 cell's passed the default
+  row cap 41 to 49 s in and logged 14.3M to 14.7M rows a rank, and each stop took about
+  11 min, about 4.4 s of labelling per traced second
+  ([#3113](https://github.com/jgong5/ATOM/pull/3113#issuecomment-6757261953),
+  [#3111](https://github.com/jgong5/ATOM/pull/3111)). At that rate the default 4200 s
+  covers about 950 s traced. In their first 120 s, #2789's cell-B calibration records
+  at `aeffa7d63` hold 30 prefill steps at c=4 and 125 at c=16.
 - Steps 4 and 5 take `--duration 3600`, with a calibration record between step 4's
   two real runs. A step 5 at another duration than step 4's is graded as another
   workload, and refused.

@@ -260,8 +260,9 @@ memory_readings(...)` line.
 **2. Calibration records** (GPU, alone on the node; per concurrency, its warmup
 plus 1800 s, about 35 min with the server's start and stop: 1 h 45 min in all),
 each with the blocking-call tool, then two trace runs, without it, the c=16 and c=4
-recipes for 120 s under ATOM's profiler, which the prefill law fits from alone; each
-stop takes minutes to write and reduce the traces
+recipes for 120 s under ATOM's profiler, which the prefill law fits from alone: each
+its warmup, 120 s and a stop that writes and reduces the traces, about 11 min on
+DeepSeek-V4.1-Flash TP4
 ([README](README.md#the-stage-2-cell-through-the-compass-cli-from-an-empty-store)).
 
 ```bash
