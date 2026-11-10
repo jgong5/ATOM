@@ -1490,10 +1490,13 @@ class Stub:
                 out = self._tensor(value, meta.get((sig, path)), fresh)
                 # V4.1's FP8 plane a top-k or block maxima ranks: ATOM's scorer
                 # writes it first, which here no leaf has, or a scorer timed
-                # before has, off its own random inputs
+                # before has, off its own random inputs. Placements share one
+                # clone of it, which ATOM's preparation leaves unchanged, so
+                # each copy draws on a plane of its own
                 if self.paged and path == "logits" and value["role"] == "metadata":
                     bound = PAGE_WIDE.get(op["op"], ("",))[0]
                     if (ends := meta.get((sig, bound), ("", None))[1]) is not None:
+                        out = out if fresh else _clone(out)
                         _scores(out, ends, value)
                 return out
             if isinstance(value, str) and value.startswith("torch."):
