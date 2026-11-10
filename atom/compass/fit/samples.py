@@ -27,8 +27,8 @@ Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
 config.json's digest; `device`, each GPU's `<name> <arch>`, as a spec states
 it; `engine_config`, `keyed`'s fields, the parallel layout among them;
-`prefill_buckets`, the prefill token-graph buckets it states
-(`step_linear_fit.stated_buckets`), null where it states none; `source_root`, `<revision_kind>-<revision>`; `sampling`, the request
+`prefill_buckets`, those `step_linear_fit.stated_buckets` reads, null where it
+states none; `source_root`, `<revision_kind>-<revision>`; `sampling`, the request
 parameters, null for a record serving no client run's request; its host key
 less its model and engine; its `stack`, the software versions run.json
 names; and its `ptl`, the cards' PTL state, `unrecorded` for a run.json that

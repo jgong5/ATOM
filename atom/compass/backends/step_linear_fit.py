@@ -1766,9 +1766,8 @@ def recorded_buckets(stated: dict) -> tuple[int, ...] | None:
     refuse, naming each."""
     held: dict = {}
     for where, buckets in stated.items():
-        held.setdefault(buckets if buckets is None else tuple(buckets), []).append(
-            where
-        )
+        stated_as = None if buckets is None else tuple(buckets)
+        held.setdefault(stated_as, []).append(where)
     if len(held) > 1:
         raise ValueError(
             "the records state other prefill buckets: "
