@@ -1924,10 +1924,13 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     Under DP a prefill the store holds no graph at, with no drafter, reads
     the graph of its tokens, sequences and width that holds G
     (`forward.Tracer.symbolic`, keyed by `forward.symbolic_shape`) at the
-    step's G, when its hints span G and its guards admit it (`peers.at`); with
-    `atom_args`, the first such step of a shape traces that graph, and when
-    its two ends differ (`forward.PerG`) each G of the shape is traced as
-    above instead, the shape and why named in `lazy`'s ``lazy_per_g``."""
+    step's G, when its hints span G and its guards admit it (`peers.at`),
+    counted in `lazy`'s ``held_lookups``; with `atom_args`, the first such
+    step of a shape traces that graph, and when its two ends differ
+    (`forward.PerG`) each G of the shape is traced as above instead, the
+    shape and why named in `lazy`'s ``lazy_per_g``. With `lazy`, each
+    lookup's wall seconds, its traces among them, are added to its
+    ``lookup_wall_seconds``."""
     from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
     from atom.compass.capture import peers
     from atom.compass.capture.forward import (
@@ -1998,6 +2001,8 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
             if found := held(at, shape._replace(gathered=None)):
                 (lo, hi), guards = found["hints"], found["guards"]
                 if lo <= g <= hi and admits(guards, g):
+                    if lazy is not None:
+                        lazy["held_lookups"] = lazy.get("held_lookups", 0) + 1
                     return peers.at(found["region"], found["slots"], g, dp)
         if missing and atom_args is not None and shape not in traced:
             traced.add(shape)
@@ -2009,7 +2014,18 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
             return missed(store, key) or None
         return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
 
-    return graph
+    if lazy is None:
+        return graph
+
+    def timed(*args, **kwargs):
+        began = time.monotonic()
+        try:
+            return graph(*args, **kwargs)
+        finally:
+            spent = time.monotonic() - began
+            lazy["lookup_wall_seconds"] = lazy.get("lookup_wall_seconds", 0) + spent
+
+    return timed
 
 
 def _trace_process():
@@ -3011,6 +3027,10 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     # Each DP prefill whose G were each traced, and why, by the engines that did.
     if per_g := counted("lazy_per_g"):
         summary["cost"]["lazy_per_g"] = dict(per_g)
+    # The DP prefill lookups a graph holding G served, and every lookup's wall.
+    for key in ("held_lookups", "lookup_wall_seconds"):
+        if value := total(key):
+            summary["cost"][key] = value
     schedule = summary["schedule"]
     schedule["predicted_seconds"] = seconds
     # How the seconds were obtained: reported, never gated.

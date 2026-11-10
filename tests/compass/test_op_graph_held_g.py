@@ -5,6 +5,8 @@ step's G into that graph, byte for byte the graph a trace at that G gives
 (`forward.Tracer.symbolic`, `peers.at`). Where the two ends differ but for
 each exchange's `sizes`, every G of the (T, B) is traced as it is, named in
 the run summary; a G the graph's hints or guards do not admit is traced too.
+The run summary counts the lookups a graph holding G served, and the wall
+every lookup took.
 """
 
 import json
@@ -248,6 +250,32 @@ def test_the_run_summary_names_each_prefill_whose_g_were_each_traced(
 
     cost = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())["cost"]
     assert cost["lazy_per_g"] == {why: 1}
+
+
+def test_the_run_summary_counts_the_lookups_a_held_graph_served(
+    lookup, monkeypatch, tmp_path
+):
+    graphs, lazy, tracer = lookup(guards=("G <= 600",))
+
+    # G=100 and 200 are put into the graph that holds G; G=3000 is traced.
+    for g in (100, 200, 3000):
+        graphs("prefill", T, 1, True, g)
+
+    assert tracer.traced == [(TOP, True), (T + 1, True), (3000, False)]
+    assert lazy["held_lookups"] == 2
+    assert lazy["lookup_wall_seconds"] >= lazy["lazy_trace_wall_seconds"] > 0
+    run = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+    run.update(bound_s=100.0, client_runs=None, out_dir=str(tmp_path))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    authority = compass_run._RecordingAuthority(run)
+    worker = SimpleNamespace(compass_lazy=lazy)
+    compass_run._hand_in(run, "engine", [], priced=PricedSteps.priced_steps(worker))
+    compass_run._hand_in(run, "frontend", [])
+    compass_run._write_summary(run, authority, ended=True)
+
+    cost = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())["cost"]
+    assert cost["held_lookups"] == 2
+    assert cost["lookup_wall_seconds"] == lazy["lookup_wall_seconds"]
 
 
 def test_symbolic_is_refused_without_dp_before_any_trace(tmp_path):
