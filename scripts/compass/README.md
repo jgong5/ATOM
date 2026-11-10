@@ -947,6 +947,24 @@ first-turn records served under expert parallel here with no
 first six concurrencies came first; a record that still built a Triton variant was taken
 again.
 
+`scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json` is cell A's law
+on mi355-gpu-40, keyed by `machines/mi355x-gpu40.json` (aiter `09d256420`,
+`aiter_c90842add0.sh` run in the container): the `history` form with host laws, fitted by
+`compass fit steps` and `compass fit host` on records at ATOM 1227c0f25 in nightly 20261026,
+on cards 4-7, with the [stage-4 smoke](#a-stage-4-cell-smoked-on-mi355x)'s `$ATOM` and
+`--enable-expert-parallel`
+([#2846](https://github.com/jgong5/ATOM/issues/2846)). The records are four 1800 s
+calibration records of traces 256 to 392, at concurrency 1, 4 and 16 and from each
+trajectory's first turn at 16, and two 120 s trace runs, the c=16 and c=4 recipes, from
+which the prefill vector is fitted. `KINETO_CONFIG` named a file holding
+`ROCTRACER_MAX_EVENTS=2000000000`, so no rank's trace dropped rows, and `client.sh` ran under
+`WAIT_S=3600` for their stops. Its host laws fit the tokenizer, the segment tokenizer's own
+work with `chars_per_s`, the HTTP intake and the hops on those calibration records, under
+the labels before `blocked_ns`: the records carry none, and a prefill launch the device held
+gave no `W_launch` label. A warm record came
+first, and a record that built a Triton variant, or held a decode stall near a server change
+on cards 0-3, was taken again.
+
 A simulated run prices by a checked-in law when the law file stands in for both tokens:
 `compass run --step-linear LAW --host-laws LAW $M $S --out D -- $ATOM`, `LAW` a file in
 `scripts/compass/laws/` (or any law file `step_linear_fit` writes), and `$S` the store that
