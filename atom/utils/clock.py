@@ -1086,11 +1086,12 @@ def settle_before_collectives() -> None:
     `torch.distributed` collective whose tensors are all on the CPU, or that
     has none: it returns at the latest arrival. A device collective returns
     once enqueued, so it settles nothing. A collective this has wrapped is
-    left as it is, so a process that calls this again wraps nothing twice."""
+    left as it is, so a process that calls this again wraps nothing twice;
+    the wrap names what it wraps as its ``__wrapped__``."""
     import torch.distributed as dist
 
     def settled(fn):
-        if getattr(fn, "settles", False):
+        if getattr(fn, "settles", None) is True:
             return fn
 
         def call(*args, **kwargs):
@@ -1103,7 +1104,7 @@ def settle_before_collectives() -> None:
                 rt.settle()
             return fn(*args, **kwargs)
 
-        call.settles = True
+        call.settles, call.__wrapped__ = True, fn
         return call
 
     for name in COLLECTIVES:
