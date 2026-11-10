@@ -229,7 +229,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 26
+PROTOCOL = 27
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -1239,7 +1239,7 @@ class Stub:
                 # one a decode compressor writes its row to, and a row view
                 # holding a state arena past its pages (`_state`) one row a
                 # request
-                unit = rows if self.slots else blocks
+                unit, history = rows if self.slots else blocks, 0
                 name = self.kv.get((sig, slot), ("",))[0]
                 slotted = int(name in self.state)
                 stated = op.get("stated", {})
@@ -1252,8 +1252,8 @@ class Stub:
                     # of which a request reads at most its indexer's top-k
                     if top := stated.get("index_topk"):
                         unit = min(unit, rows * top)
-                elif window and decode and self.state.get(name):
-                    unit = 0  # a decode reads its window from the ring alone
+                elif window and self.state.get(name):
+                    unit = 0  # its window is read from the ring alone
                 if self.state.get(name):
                     # its window rings: a ring cut from it (`ring_view`), smaller
                     # than the widest of it a leaf stating its window takes, read
@@ -1269,6 +1269,13 @@ class Stub:
                     if nbytes < widest if window else writes:
                         reach = acts[0]["shape"][0] + rows * ((window or 1) - 1)
                         unit, slotted = min(reach, rows * self.ring), 1
+                    elif window and not decode:
+                        # ponytail: a prefill's prefix reads each request's
+                        # history through it too, the window less one at most
+                        # its cached tokens, by slot; a leaf of fewer rows, a
+                        # bounded-replay tail, none: its window starts there
+                        if acts[0]["shape"][0] >= (tokens or rows):
+                            history = rows * min(window - 1, self.context or 0)
                 # an entry is the span of its other dims: a view may be strided
                 # by a whole state slot or by every layer's block, and a field
                 # laid out layers first, `[layers, slots, ...]`, is read a slot
@@ -1278,8 +1285,9 @@ class Stub:
                 cut = _widest(shape, stride)
                 rest = shape[:cut] + shape[cut + 1 :], stride[:cut] + stride[cut + 1 :]
                 entry = _span(*rest) * itemsize
-                nbytes, need = entry * unit, None
-                shared[slotted] += nbytes
+                nbytes, need = entry * (unit + history), None
+                shared[slotted] += entry * unit
+                shared[1] += entry * history
             if slot == "workspace" and op["op"] in TOPK_WORKSPACE:
                 try:  # not the byte captured; a query that raises refuses the leaf
                     scratch, cached = self._workspace(op)

@@ -1192,10 +1192,14 @@ store. A record without a store touches no library.
 1. `compass measure memory --gpu G $M $S --out $R/mem -- $ATOM`.
 2. Calibration, alone on the node: per concurrency 1, 4 and 16,
    `compass record --gpu G --out $R/cal/c<C> -- $ATOM` and `client.sh $R/cal/c<C>
-   --traces 256-392 --concurrency <C> --stop`. Then the trace runs (below): per
-   concurrency 16 and 4, `compass record --trace --gpu G --out $R/trace/c<C> --
-   $ATOM` and `client.sh $R/trace/c<C> --traces 256-392 --concurrency <C>
-   --duration 120 --stop`.
+   --traces 256-392 --concurrency <C> --stop`, each server started with
+   `ROCP_TOOL_LIBRARIES` naming the tool `python -m atom.compass.parity.blocked
+   $R/tool` prints, so its launches' `W_launch` labels leave out their time in
+   HIP's blocking calls (`atom/compass/parity/README.md`); `compass fit host`
+   names a record taken without it. Then the trace runs (below), which take no
+   tool: per concurrency 16 and 4, `compass record --trace --gpu G --out
+   $R/trace/c<C> -- $ATOM` and `client.sh $R/trace/c<C> --traces 256-392
+   --concurrency <C> --duration 120 --stop`.
 3. `compass fit steps --backend step-linear --form history $R/cal/c* $R/trace/c*
    --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M $S --out
    $R/fit`, every record and trace run named before the first `--client-run`, and

@@ -23,6 +23,13 @@ A 1P1D decode instance also writes `transfers.jsonl` (`transfers` in
 `dp<r>.tp<t>.writes.jsonl` too, a line per KV write it served or write-done it
 received (`writes.py` says what each line holds).
 
+A real run's lines also state the time each launch blocked in HIP, `blocked_ns`,
+which `W_launch` leaves out (`atom/compass/backends/step_labels.py`), when the
+run starts with `ROCP_TOOL_LIBRARIES` naming the blocking-call tool:
+`python -m atom.compass.parity.blocked DIR` builds it into `DIR` with `g++`
+against ROCm's rocprofiler-sdk and prints its path (`blocked.py` says what it
+times). A trace run takes no host labels, so it needs no tool.
+
 Compare two records with
 
 ```

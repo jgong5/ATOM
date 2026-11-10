@@ -30,7 +30,8 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   ``entries``.
 - ``--machine``, the spec; ``--store``'s root as ``store``; ``--on-refusal``;
   ``--step-roofline``; ``--padding none``, which prices a replayed graph's
-  real rows; ``--local-grants``, which gives grants their ceilings.
+  real rows; ``--local-grants``, on unless ``--no-local-grants``, which gives
+  grants their ceilings.
 - Not flags: `FIXED`, and ``data_parallel_size``, read from ATOM's arguments.
   The server serves client runs until it is stopped.
 
@@ -38,6 +39,7 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
 which `scripts/compass/deploy.sh` hands its clock authority and both instances.
 """
 
+import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -79,7 +81,9 @@ def add_arguments(parser) -> None:
     parser.add_argument("--on-refusal", choices=("mark", "abort"), default="mark")
     parser.add_argument("--step-roofline", action="store_true")
     parser.add_argument("--padding", choices=("none",))
-    parser.add_argument("--local-grants", action="store_true")
+    parser.add_argument(
+        "--local-grants", action=argparse.BooleanOptionalAction, default=True
+    )
 
 
 def build(args, atom_args) -> dict:

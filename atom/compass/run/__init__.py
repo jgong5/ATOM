@@ -100,9 +100,10 @@ ends the run there, which still writes the summary),
 ``client_runs`` (optional: how many client runs the server serves, one traffic
 LP after another, 1 when absent and ``null`` for no limit; each ends when no
 essential work is left, and the last one's end finishes the run),
-``local_grants`` (optional, ``true`` or ``false``: with ``true`` the authority
-gives each grant a ceiling, below which the LP answers its own clock calls and
-reports them with its next one, `ClockAuthority`; the step table is the same),
+``local_grants`` (optional, ``true``, the default, or ``false``: with ``true``
+the authority gives each grant a ceiling, below which the LP answers its own
+clock calls and reports them with its next one, a DP member at its settle,
+`ClockAuthority`; the step table is the same),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -1077,7 +1078,7 @@ class _RecordingAuthority(ClockAuthority):
             shutil.rmtree(d)
         table = channel_table(run)
         count = run.get("client_runs", 1)
-        local = run.get(LOCAL_GRANTS, False)
+        local = run.get(LOCAL_GRANTS, True)
         if not isinstance(local, bool):
             raise TypeError(
                 f"the run file's {LOCAL_GRANTS} is {local!r}; it is true, which "
