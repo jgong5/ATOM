@@ -57,7 +57,8 @@ from atom.compass.artifacts import (
     Row,
     Topology,
     axes_of,
-    machine_spec_digest,
+    keyed_platform,
+    machine_platform,
     member_name,
     rows_for,
 )
@@ -76,10 +77,13 @@ from atom.utils.clock import LPRuntime
 
 KEY = {
     "model": "Qwen/Qwen3.5-27B",
-    "device": "MI355X",
     "engine_config": "replay-mns48",
     "grid": "s2-sparse-margin0.25",
     "source_root": "tree-67c176f0",
+    "device": "MI355X",
+    "software_stack": "rocm 7.2.4 / aiter 9205e1059 / rccl 2.27.7",
+    "ptl": "disabled",
+    "torch": "2.10.0+rocm7.2.4.git3d3aa833",
 }
 BOUNDS = {"max_num_seqs": 48, "max_num_batched_tokens": 8192, "max_model_len": 2048}
 BUNDLE = {
@@ -316,7 +320,9 @@ def test_the_key_is_its_fields_never_a_path(monkeypatch, tmp_path, fields, named
 
     with pytest.raises(ArtifactRefusal, match=re.escape(named)) as refused:
         compass_run.runner(r, META_8B)
-    assert "(model, device, engine_config, grid, source_root)" in str(refused.value)
+    assert "(model, engine_config, grid, source_root, device, software_stack, ptl, " + (
+        "torch)"
+    ) in str(refused.value)
 
 
 def test_a_key_with_no_bundle_refuses_naming_it(monkeypatch, tmp_path):
@@ -388,20 +394,20 @@ def test_the_runs_readings_take_the_stack_from_the_spec_and_the_host_cpu_as_host
     assert read.reading(Axis.HOST_CPU).value == host
 
 
-#: The suite's machine document's digest, as a law fitted on it is keyed.
-SPEC_DIGEST = machine_spec_digest(MachineSpec.from_mapping(DOCUMENT))
+#: The suite's machine document's platform, as a law fitted on it is keyed.
+PLATFORM = machine_platform(MachineSpec.from_mapping(DOCUMENT))
 
 
 def host_laws_key(r) -> dict:
     """A `host_laws` key from the values `run.host_key` reads and the spec's
-    digest."""
+    platform."""
     host = compass_run.host_key(r.config)
     return {
         "host_cpu": host["host_cpu"],
         "atom_src": host["atom"],
         "model": host["model"],
         "engine_config": json.dumps(host["engine"], sort_keys=True),
-        "machine_spec": SPEC_DIGEST,
+        **keyed_platform(Kind.HOST_LAWS, PLATFORM),
     }
 
 
@@ -412,14 +418,14 @@ MEASURED = {k: KEY[k] for k in ("model", "engine_config", "source_root")}
 NEW_KINDS = {
     Kind.STEP_MEASUREMENT: {
         **MEASURED,
-        "device": KEY["device"],
+        **keyed_platform(Kind.STEP_MEASUREMENT, PLATFORM),
         "sampling": "uniform-s7",
         "step_kind": "decode",
         "view": "sha256:5e1f",
     },
     Kind.STEP_LINEAR_LAW: {
         **MEASURED,
-        "machine_spec": SPEC_DIGEST,
+        **keyed_platform(Kind.STEP_LINEAR_LAW, PLATFORM),
         "form": "fixed+tokens+seqs",
     },
     Kind.HOST_LAWS: None,
@@ -709,7 +715,8 @@ def test_host_laws_fitted_under_another_engine_config_refuse_naming_the_field(
         monkeypatch.delenv(name, raising=False)
     key = compass_run.host_key(deployment(tmp_path).config)
     laws = {"decode": {"E": [0.001, 0.0, 0.0]}}
-    _run_file(tmp_path, host={"laws": laws, "key": key | {"machine_spec": SPEC_DIGEST}})
+    host = key | keyed_platform(Kind.HOST_LAWS, PLATFORM)
+    _run_file(tmp_path, host={"laws": laws, "key": host})
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     monkeypatch.setenv(compass_run.NOW_ENV, str(tmp_path / "now.bin"))
     table = compass_run.channel_table(compass_run.spec())

@@ -4,8 +4,9 @@ checked against the resolved ATOM config before the first step.
 
 The run file's ``step_grid`` is the store's root and the bundle's key fields:
 
-    {"store": <root directory>, "model": ..., "device": ...,
-     "engine_config": ..., "grid": ..., "source_root": ...}
+    {"store": <root directory>, "model": ..., "engine_config": ..., "grid": ...,
+     "source_root": ..., "device": ..., "software_stack": ..., "ptl": ...,
+     "torch": ...}
 
 A bundle prices a TP group's whole step, so a run reads one member at any
 width, ``params.dp0of1.pp0of1.pcp0of1.tp0of1.json``, the one `compass fit
@@ -71,7 +72,7 @@ from atom.compass.artifacts import (
     Kind,
     Row,
     Topology,
-    machine_spec_key,
+    machine_platform,
 )
 from atom.compass.backends.step_grid import StepGrid, StepGridBackend
 from atom.compass.backends.step_grid_fit import VALUE
@@ -181,14 +182,13 @@ def conditions(config, machine) -> Conditions:
 
 
 def readings(machine, **inputs) -> Conditions:
-    """The readings a run on `machine` takes: the stack, torch included, and the
-    device the spec states, and this host's CPU; `inputs` state the ATOM source,
-    the model and the engine config."""
+    """The readings a run on `machine` takes: the platform the spec states, and
+    this host's CPU; `inputs` state the ATOM source, the model and the engine
+    config."""
     from atom.compass.run import host_cpu
 
     return Conditions.of(
-        **machine_spec_key(machine).values,
-        torch=machine.value("device.software_pinned_to.torch"),
+        **machine_platform(machine),
         host_cpu=host_cpu(),
         **inputs,
     )

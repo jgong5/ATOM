@@ -15,6 +15,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+import torch
 from test_artifact_invalidation import STANZA, moved
 from test_backend_step_linear import law
 from test_drive_runfile import LAWS, build, host_laws, install
@@ -118,7 +119,7 @@ def traced(tmp_path, c, conditions, phase="decode", shape="decode B=2", graph=No
     store = ArtifactStore(tmp_path / "store")
     at = structure(c, phase, True, ARCH)
     store.publish(
-        Key.of(Kind.OP_GRAPH, structure=at, shape=shape),
+        Key.of(Kind.OP_GRAPH, structure=at, shape=shape, torch=torch.__version__),
         provenance=STANZA,
         topology=Topology(),
         conditions=conditions,

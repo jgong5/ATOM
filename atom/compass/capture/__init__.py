@@ -229,6 +229,7 @@ def publish(store, graph, model, declared, tp, atom_args, command):
         a.Kind.OP_GRAPH,
         structure=applicability.structure,
         shape=applicability.shape,
+        torch=torch.__version__,
     )
     roots = a.roots_for({"atom": "atom", "aiter": "aiter"})
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()

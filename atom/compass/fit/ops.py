@@ -9,8 +9,8 @@ ops` published it. A `--plan` run resumed into a DIR keeps the rounds earlier
 runs wrote there, so DIR lists every run's points. A point a `--plan` run
 found already in S is in no round's ops.jsonl: pass the directory that
 measured it too. Every point
-must name one `price_list` key, its model, parallel layout, machine-spec
-digest and source root, and one torch; the price list is published at that key
+must name one `price_list` key, its model, parallel layout, platform and source
+root; the price list is published at that key
 under the readings the points ran under.
 
 A leaf's family is its signature with the integers that follow the shape
@@ -134,16 +134,15 @@ def read(store, dirs) -> tuple[list[dict], dict, dict]:
             rank = entry.topology.ranks()[0]
             points[key] = json.loads(entry.read_member("point", rank, "json"))
             fields = {k: v for k, v in key.values.items() if k != "point"}
-            torch = publish.platform(config)["torch"]
-            named.setdefault(json.dumps([fields, torch], sort_keys=True), d)
+            named.setdefault(json.dumps(fields, sort_keys=True), d)
     if not points:
         raise ValueError("these directories list no measured point")
     if len(named) > 1:
         raise ValueError(
-            f"the points name {len(named)} price lists, by (key fields, torch): "
+            f"the points name {len(named)} price lists, by key fields: "
             + "; ".join(f"{k} in {d}" for k, d in named.items())
         )
-    return list(points.values()), config, json.loads(next(iter(named)))[0]
+    return list(points.values()), config, json.loads(next(iter(named)))
 
 
 def _walk(x, f, n):

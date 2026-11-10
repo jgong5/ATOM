@@ -96,7 +96,12 @@ def backend(config, tmp_path):
                 micro_batch=shape.micro_batch,
             )
             store.publish(
-                Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape)),
+                Key.of(
+                    Kind.OP_GRAPH,
+                    structure=at,
+                    shape=str(shape),
+                    torch=torch.__version__,
+                ),
                 provenance=stanza("compass trace ops"),
                 topology=Topology(),
                 conditions=run_readings(config.model),

@@ -136,8 +136,8 @@ the rest; two in a row that die having finished no point fail the run.
 
 DIR gets run.json, the run's identity, and ops.jsonl, one line per point. S
 gets each measured point as an `op_measurement`, keyed by the model, the
-parallel layout, the digest of the machine spec of the device, stack and PTL
-state run.json reads, the source root and the point.
+parallel layout, the device, stack, PTL state and torch run.json reads, the
+source root and the point.
 
 `--plan` measures, in rounds, the points the steps of record directories call
 for (`record`'s or `trace steps`' output), under `--enable-tbo` a step its DP
@@ -662,7 +662,7 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
         draft=draft,
         micro_batch=shape.micro_batch,
     )
-    key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
+    key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape), torch=torch.__version__)
     if not store.directory_for(key).exists() and (why := missed(store, key)):
         part = " that produces no output" * (not output)
         part += " as a two-batch-overlap micro-batch" * shape.micro_batch
@@ -2538,12 +2538,12 @@ def _fields(held):
 def keys(config, run: dict):
     """The `op_measurement` key of a point, `(shape, context, leaf)`, measured
     under `config` on the platform `run` reads."""
-    from atom.compass.artifacts.keys import LAYOUT, platform_key
+    from atom.compass.artifacts.keys import LAYOUT, keyed_platform, platform_of
     from atom.compass.fit.samples import run_fields
     from atom.compass.run.memory import key_fields
 
     fields = run_fields(run)
-    platform = platform_key(fields["device"], run["stack"], run["ptl"]).canonical()
+    platform = platform_of(fields["device"], run["stack"], run["ptl"])
     layout = {k: v for k, v in key_fields(config).items() if k in LAYOUT}
 
     def key(shape, context, leaf) -> Key:
@@ -2552,7 +2552,7 @@ def keys(config, run: dict):
             Kind.OP_MEASUREMENT,
             model=fields["model"],
             **layout,
-            machine_spec="sha256:" + hashlib.sha256(platform.encode()).hexdigest(),
+            **keyed_platform(Kind.OP_MEASUREMENT, platform),
             source_root=fields["source_root"],
             point="sha256:" + hashlib.sha256(point).hexdigest(),
         )

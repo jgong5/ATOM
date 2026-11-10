@@ -343,7 +343,12 @@ def test_a_dp_drafter_beside_a_prefilling_peer_gathers_the_step_s_rows(
     root, graphs = capture(1, tmp_path_factory, dp=2)
     [target] = [key for key in graphs if not key.endswith(" draft")]
     store, rank = ArtifactStore(str(root / "store")), Topology().ranks()[0]
-    key = Key.of(Kind.OP_GRAPH, structure=f"{target} draft", shape="decode B=2 G=20")
+    key = Key.of(
+        Kind.OP_GRAPH,
+        structure=f"{target} draft",
+        shape="decode B=2 G=20",
+        torch=torch.__version__,
+    )
     drafter = json.loads(store.read(key).read_member("graph", rank, "json"))
 
     # Its first pass gathers this rank's 4 verified tokens and the peer's 16.
@@ -371,7 +376,7 @@ def _lookup(tmp_path, dp, stored, *lazily):
     for (phase, shape, draft), region in stored.items():
         at = structure(config, phase, True, "gfx950", True, draft)
         store.publish(
-            Key.of(Kind.OP_GRAPH, structure=at, shape=shape),
+            Key.of(Kind.OP_GRAPH, structure=at, shape=shape, torch=torch.__version__),
             provenance=stanza("compass trace ops"),
             topology=Topology(),
             conditions=run_readings(config.model),

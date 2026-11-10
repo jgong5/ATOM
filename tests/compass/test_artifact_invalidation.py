@@ -32,6 +32,7 @@ import pytest
 
 from atom.compass.artifacts import (
     MATRIX,
+    PLATFORM,
     ArtifactRefusal,
     ArtifactStore,
     Axis,
@@ -53,6 +54,7 @@ from atom.compass.artifacts import (
     axes_of,
     differences,
     fingerprint,
+    keyed_platform,
     member_name,
     rows_for,
     verify,
@@ -105,31 +107,39 @@ BASE = Conditions.of(
     engine_config="cudagraph=piecewise,level=3",
 )
 
+#: The platform `BASE` reads, as a key states it.
+STATED = {a.field: BASE.reading(a).value for a in PLATFORM}
+
 #: A key per row of the matrix. The three `machine_spec` rows share one key,
 #: because they are three facets of one artifact and that is the point of them.
 KEY_OF: dict[Row, Key] = {
-    Row.OP_GRAPH: Key.of(Kind.OP_GRAPH, structure="qwen3-moe-48L", shape="decode B=2"),
+    Row.OP_GRAPH: Key.of(
+        Kind.OP_GRAPH,
+        structure="qwen3-moe-48L",
+        shape="decode B=2",
+        **keyed_platform(Kind.OP_GRAPH, STATED),
+    ),
     Row.PRICE_LIST: Key.of(
         Kind.PRICE_LIST,
         model="Qwen/Qwen3-32B",
-        machine_spec="sha256:mi308x",
+        **keyed_platform(Kind.PRICE_LIST, STATED),
         source_root=ATOM_ROOT.revision,
         **LAYOUT,
     ),
     Row.MEMORY_READINGS: Key.of(
         Kind.MEMORY_READINGS,
         model="Qwen/Qwen3-32B",
-        machine_spec="sha256:mi308x",
+        **keyed_platform(Kind.MEMORY_READINGS, STATED),
         **LAYOUT,
         engine_config="cudagraph=piecewise,level=3",
     ),
     Row.MACHINE_SPEC_CAPACITY: Key.of(
-        Kind.MACHINE_SPEC, device="MI308X-80CU", software_stack="rocm7.2.4", ptl="x"
+        Kind.MACHINE_SPEC, **keyed_platform(Kind.MACHINE_SPEC, STATED)
     ),
     Row.STEP_GRID_BUNDLE: Key.of(
         Kind.STEP_GRID_BUNDLE,
         model="Qwen/Qwen3-32B",
-        device="MI308X-80CU",
+        **keyed_platform(Kind.STEP_GRID_BUNDLE, STATED),
         engine_config="replay-mns48",
         grid="s2-sparse-margin0.25",
         source_root=ATOM_ROOT.revision,
@@ -237,7 +247,7 @@ def test_host_laws_published_on_one_host_cpu_refuse_another_naming_it(tmp_path):
         atom_src="0f1e2d3c",
         model="sha256:191e0af2",
         engine_config="{}",
-        machine_spec="sha256:5ec0",
+        **keyed_platform(Kind.HOST_LAWS, STATED),
     )
     publish(store, key)
     with pytest.raises(ArtifactRefusal) as refused:
@@ -638,7 +648,12 @@ def test_a_refusal_says_which_key_missed_where_a_count_does_not(tmp_path):
     no_graph = Resolution("step 41")
     store.answer(KEY_OF[Row.PRICE_LIST], no_graph, conditions=BASE, gates=GATES)
     store.answer(
-        Key.of(Kind.OP_GRAPH, structure="never-traced", shape="decode B=2"),
+        Key.of(
+            Kind.OP_GRAPH,
+            structure="never-traced",
+            shape="decode B=2",
+            **keyed_platform(Kind.OP_GRAPH, STATED),
+        ),
         no_graph,
         conditions=BASE,
         gates=GATES,

@@ -26,7 +26,7 @@ from test_bench_replay import _line, rule  # noqa: F401  the rule fixture
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
 
 from atom.compass import cli, ir
-from atom.compass.artifacts import ArtifactStore, Kind, machine_spec_digest
+from atom.compass.artifacts import ArtifactStore, Kind, keyed_platform, machine_platform
 from atom.compass.bench import measure, ops
 from atom.compass.capture import driverless
 from atom.compass.capture.forward import decode, prefill
@@ -3514,7 +3514,8 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
 
     at = key("decode B=2", 9, "a")
     assert at.kind is Kind.OP_MEASUREMENT
-    assert at.values["machine_spec"] == machine_spec_digest(spec)
+    platform = keyed_platform(Kind.OP_MEASUREMENT, machine_platform(spec))
+    assert platform.items() <= at.values.items()
     assert at.values["source_root"] == "atom_py-a"
     assert store.directory_for(at).exists()
     assert not store.directory_for(key("decode B=2", 9, "b")).exists()

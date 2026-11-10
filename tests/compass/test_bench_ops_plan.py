@@ -893,6 +893,7 @@ def _publish_graph(store, config, arch, shape):
         Kind.OP_GRAPH,
         structure=structure(config, shape.phase, device=arch),
         shape=str(shape),
+        torch=torch.__version__,
     )
     leaf = _leaf(f"aiter.{arch}", ("x", _t([shape.seqs, 8], "activation")))
     store.publish(
@@ -1255,7 +1256,12 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     def publish(store, graph, model, declared, tp, atom_args, command):
         at = graph.applicability
         published.append((at.structure, tp))
-        key = Key.of(Kind.OP_GRAPH, structure=at.structure, shape=str(at.shape))
+        key = Key.of(
+            Kind.OP_GRAPH,
+            structure=at.structure,
+            shape=str(at.shape),
+            torch=torch.__version__,
+        )
         store.publish(
             key,
             provenance=stanza("compass trace ops"),

@@ -92,7 +92,9 @@ def store(tmp_path, monkeypatch):
                 m.setenv(k, v)
             at = structure(_v4(tmp_path, **fields), "decode")
         store.publish(
-            Key.of(Kind.OP_GRAPH, structure=at, shape="decode B=2"),
+            Key.of(
+                Kind.OP_GRAPH, structure=at, shape="decode B=2", torch=torch.__version__
+            ),
             provenance=stanza("compass trace ops"),
             topology=Topology(),
             conditions=run_readings(str(tmp_path / "model")),

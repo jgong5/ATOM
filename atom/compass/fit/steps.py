@@ -20,8 +20,8 @@ rank that gave no sample refuses; it pads prefill to the records'
 `prefill_buckets`, naming under `unfitted` records stating none, and holds
 out each run on the others when
 there are two or more, as that module's command does; `--seed` fixes
-its shuffles. The law states the configuration's
-`machine_spec` and `engine_config`, as that command's does, and the key holds them. The report's
+its shuffles. The law states, as `platform`, the platform fields of its key,
+and `engine_config`, as that command's does, and the key holds them. The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
 
@@ -52,7 +52,7 @@ import dataclasses
 import json
 from pathlib import Path
 
-from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind
+from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind, keyed_platform
 from atom.compass.backends import step_grid_fit, step_linear_fit
 from atom.compass.bench import measure
 from atom.compass.fit import publish
@@ -75,9 +75,9 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     if len({s.provenance["run"] for s in samples}) > 1:
         step_linear_fit.mark_held_out(law, report, samples, options, args.seed)
     report["provenance"] = publish.runs(samples)
-    law["machine_spec"] = config["machine_spec"]
+    law["platform"] = keyed_platform(Kind.STEP_LINEAR_LAW, config["platform"])
     law["engine_config"] = config["engine_config"]
-    return {"form": form, "machine_spec": law["machine_spec"]}, law, report
+    return {"form": form, **law["platform"]}, law, report
 
 
 def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
@@ -104,10 +104,11 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
     ]
     grid = measure.grid_plan(args, read, ragged)
     planned = grid["plan"]
-    fields = ("model", "device", "source_root")
+    fields = {f: config[f] for f in ("model", "source_root")}
+    fields |= keyed_platform(Kind.STEP_MEASUREMENT, config["platform"])
     keys = [
         measure.measurement_key(
-            {f: config[f] for f in fields},
+            fields,
             engine,
             sampling,
             measure.view_of(line),
@@ -131,7 +132,8 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
     report["provenance"] = publish.runs(samples) + [
         {**grid["provenance"], "profiled": False}
     ]
-    return {"device": config["device"], "grid": grid["grid"]}, bundle, report
+    grid_key = keyed_platform(Kind.STEP_GRID_BUNDLE, config["platform"])
+    return {**grid_key, "grid": grid["grid"]}, bundle, report
 
 
 #: Each backend's name, to the kind it publishes, its label sources and its fit.

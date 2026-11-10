@@ -25,11 +25,10 @@ from test_backend_step_linear_fit import (
     _view,
     traced,
 )
-from test_memory_readings import DOCUMENT, META_8B
+from test_memory_readings import META_8B, spec_file
 from test_parity_device_window import BUSY, GAP, _recorded
 from test_parity_record import _config, _drive
 
-from atom.compass.artifacts import machine_spec_digest
 from atom.compass.backends import (
     BatchView,
     RequestShape,
@@ -52,7 +51,6 @@ from atom.compass.backends.step_linear_fit import (
 )
 from atom.compass.parity import ENV, StepRecord
 from atom.compass.runner import projection
-from atom.compass.spec import MachineSpec
 
 KEY = {"host_cpu": "planted cpu", "atom": "0" * 64, "model": None, "engine": {}}
 
@@ -226,8 +224,8 @@ def test_the_command_s_laws_load_in_a_run_file(tmp_path, monkeypatch):
             *records,
             "--out",
             str(tmp_path / "law.json"),
-            "--machine-spec",
-            machine_spec_digest(MachineSpec.from_mapping(DOCUMENT)),
+            "--machine",
+            spec_file(tmp_path),
         ]
     )
     law = json.loads((tmp_path / "law.json").read_text())
@@ -265,8 +263,7 @@ def test_host_laws_fitted_under_a_stated_engine_load_at_that_engine(
     ]
     stated = tmp_path / "stated.engine.json"
     stated.write_text(json.dumps(key["engine"]))
-    spec = machine_spec_digest(MachineSpec.from_mapping(DOCUMENT))
-    out = ["--out", str(tmp_path / "law.json"), "--machine-spec", spec]
+    out = ["--out", str(tmp_path / "law.json"), "--machine", spec_file(tmp_path)]
     main([*records, *out, "--engine", str(stated)])
     law = json.loads((tmp_path / "law.json").read_text())
     assert law["host"]["key"]["engine"] == law["engine_config"] == key["engine"]

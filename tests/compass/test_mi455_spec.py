@@ -10,7 +10,7 @@ import pytest
 from test_probe_device import SCRIPTS, _load
 from test_spec_origin import labels
 
-from atom.compass.artifacts import machine_spec_key
+from atom.compass.artifacts import machine_platform
 from atom.compass.drive import identity, measure_memory
 from atom.compass.spec import MachineSpec
 
@@ -96,7 +96,7 @@ def test_b0_shares_a0_s_peaks_and_carries_mi355x_s_ratios_never_a0_s_readings():
         "device.software_pinned_to.rocm",
     ):
         assert b0.value(path) == mi355x.value(path) != a0.value(path)
-    a0_key, b0_key = (machine_spec_key(s).values for s in (a0, b0))
+    a0_key, b0_key = (machine_platform(s) for s in (a0, b0))
     assert (a0_key["device"], b0_key["device"]) == (
         "MI455X gfx1250",
         "MI455X B0 gfx1250",

@@ -72,8 +72,8 @@ optional, the lookahead of the channels it names, `HOP_FLOOR_S` where absent,
 which the run summary names under ``unmeasured_hops``), one of ``step_stub`` (a
 `Coefficients` mapping,
 priced by `StepStubBackend`), ``step_linear`` (a `StepLinearLaw` mapping,
-priced by `StepLinearBackend`; its ``machine_spec`` digest and
-its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
+priced by `StepLinearBackend`; its ``platform``, the platform fields of its key,
+and its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, and a law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
@@ -111,8 +111,8 @@ image of a chat request; without it a request with an image is refused),
 on ``(1, tokens, seqs)``; with any laws, a forward whose kind has none for a
 segment it runs and ``skip`` does not name is refused, that segment costing 0 s
 (`HostDeviceRecurrence.device_end`); ``key``, the `host_key` they were
-fitted under and the ``machine_spec`` digest of the spec of the platform they
-were fitted on, which a run with laws must match; ``admit``, coefficients on
+fitted under and the platform fields of their store key, which a run with
+laws must match; ``admit``, coefficients on
 a forward's admissions, which add to its ``E``, or null to refuse a forward
 that admits a request, and absent from an entry whose ``E`` laws hold them;
 ``skip``, segments zeroed for a what-if run, which the graders refuse;
@@ -1609,7 +1609,7 @@ def runner(model_runner, tree) -> None:
     run = spec()
     if run is None:
         return
-    from atom.compass.artifacts import machine_spec_digest, machine_spec_key
+    from atom.compass.artifacts import Kind, keyed_platform, machine_platform
     from atom.compass.backends.geometry import Parallelism
     from atom.compass.backends.launch_features import GRAPHS, stated
     from atom.compass.backends.step_linear import StepLinearBackend, StepLinearLaw
@@ -1725,14 +1725,20 @@ def runner(model_runner, tree) -> None:
             + " and ".join(f"{name} {width}" for name, width in cp.items())
         )
     machine = _machine(run)
-    platform = machine_spec_digest(machine)
-    fitted_on = run.get(STEP_LINEAR, {}).get("machine_spec")
-    if STEP_LINEAR in run and fitted_on != platform:
-        raise ValueError(
-            f"the step linear law was fitted on machine spec {fitted_on} and this "
-            f"run's is {platform}, {machine_spec_key(machine)}; a law measured "
-            "on one platform is no evidence about another"
-        )
+    platform = machine_platform(machine)
+    if STEP_LINEAR in run:
+        fitted_on = run[STEP_LINEAR].get("platform") or {}
+        differ = [
+            f"{f} {fitted_on.get(f)!r} in the law and {v!r} here"
+            for f, v in keyed_platform(Kind.STEP_LINEAR_LAW, platform).items()
+            if fitted_on.get(f) != v
+        ]
+        if differ:
+            raise ValueError(
+                "the step linear law was fitted on another platform: "
+                + "; ".join(differ)
+                + "; a law measured on one platform is no evidence about another"
+            )
     bundle = None
     if STEP_GRID in run:
         from atom.compass.run.step_grid import load
@@ -1807,7 +1813,10 @@ def runner(model_runner, tree) -> None:
             model_runner.compass_block_file = _block_file(now)
         slot = np.memmap(now, np.float64, "r", shape=(1,))
         host = run.get("host", {})
-        ours = host.get("laws") and {**host_key(config), "machine_spec": platform}
+        ours = host.get("laws") and {
+            **host_key(config),
+            **keyed_platform(Kind.HOST_LAWS, platform),
+        }
         theirs = host.get("key") or {}
         launch = stated(theirs)
         if ours and launch[1] is not None:
@@ -2020,7 +2029,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         structure `at` and `shape`, as `capture.graph.to_json` writes it."""
         if (at, shape) in unpublished:
             return unpublished[at, shape]
-        key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
+        key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape, torch=here()["torch"])
         if not store.directory_for(key).exists():
             return None
         return parsed(key)
@@ -2050,7 +2059,9 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     ) -> dict | str | None:
         shape = Shape(phase, tokens, seqs, gathered, width, micro_batch).at(dp, drafts)
         at = structure(config, phase, True, arch, output, draft, env, micro_batch)
-        key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
+        key = Key.of(
+            Kind.OP_GRAPH, structure=at, shape=str(shape), torch=here()["torch"]
+        )
         missing = not store.directory_for(key).exists()
         if missing and dp > 1 and phase == "prefill" and not (draft or drafts):
             g = shape.gathered or dp * tokens

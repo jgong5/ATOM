@@ -75,7 +75,10 @@ def store(tmp_path, config, monkeypatch):
     for arch in ARCHES:
         _device(monkeypatch, driverless._props(arch))
         key = Key.of(
-            Kind.OP_GRAPH, structure=structure(config, "decode"), shape="decode B=2"
+            Kind.OP_GRAPH,
+            structure=structure(config, "decode"),
+            shape="decode B=2",
+            torch=torch.__version__,
         )
         store.publish(
             key,

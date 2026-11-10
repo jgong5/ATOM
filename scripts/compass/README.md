@@ -791,7 +791,7 @@ and `buffers` terms of `peak_torch` with the storage bytes the start loaded.
 
 ## The step linear law from real cells — `step_linear_fit`
 
-`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K] [--engine FILE]`
+`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine SPEC [--form FORM] [--moe-routing E,K] [--engine FILE]`
 fits the law a run file's `step_linear` key holds (`atom/compass/backends/step_linear.py`) from
 the step records of real cells, `OUT_DIR/steps/dp0.jsonl` of `REAL=1
 cctraces_sim.sh` runs, each with the `dp0.engine.json` the run wrote beside it,
@@ -811,9 +811,10 @@ experts they reach (`atom/compass/backends/step_linear.py`), by the rule the
 module's docstring states, and records under the vector's `fit.moe_column` what
 the rule read; a law refitted without it adopts none.
 
-`DIGEST` is the `machine_spec_digest` of the capture host's spec in
-`scripts/compass/machines/`, which a run's spec must match, printed by
-`PYTHONPATH=$T python -c 'import json, sys; from atom.compass.artifacts import machine_spec_digest as d; from atom.compass.spec import MachineSpec as M; print(d(M.from_mapping(json.load(open(sys.argv[1])))))' SPEC.json`.
+`SPEC` is the capture host's spec in `scripts/compass/machines/`: the law, as
+`platform`, and its host key state the device, software stack, PTL state and
+torch it states, each as far as its kind's key holds it, and a run's spec must
+match them.
 
 Calibration cells replay traces the graded cells do not: `FIRST_SESSION=256
 SESSIONS=137` against graded traces 0 to 255, by the
@@ -841,9 +842,9 @@ with aiperf's scenario warmup, captured one at a time on one card of
 hjbog-srdc-39 at ae5bab999 in the same image after a warm cell nothing reads.
 Those records stamp the engine's input pulls, so every kind carries `E_out`,
 `E` runs from the pull and `W_launch` ends at the token read. The host key is the one those records carry. The law
-and its host key state `machine_spec`, the digest `machine_spec_digest` gives
-`scripts/compass/machines/mi308x-hjbog39.json`, so it refuses under any other
-spec's device, software stack or PTL state. Its name states that PTL state
+states the platform of `scripts/compass/machines/mi308x-hjbog39.json`, so it
+refuses under any other spec's device, software stack, PTL state or torch; its
+host key states that platform less the PTL state. Its name states that PTL state
 rather than the host it was captured on.
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-gpu45-{prefill,decode}.json`

@@ -11,7 +11,7 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   loaded through `ArtifactStore.load` under `law_readings`;
   ``--step-grid KEY``, the store's root and a `step_grid_bundle` entry's key;
   ``--op-graph``, ``true``, and as ``price_list`` the fields of the
-  `price_list` key this run's model, parallel layout, machine spec and ATOM
+  `price_list` key this run's model, parallel layout, platform and ATOM
   source name, when ``--store`` holds one there.
   A KEY is the token `Key.token` prints, resolved under ``--store``; for
   ``--step-linear`` and ``--host-laws`` a law file `step_linear_fit` writes
@@ -52,7 +52,8 @@ from atom.compass.artifacts import (
     GateState,
     Key,
     Kind,
-    machine_spec_digest,
+    keyed_platform,
+    machine_platform,
     member_name,
 )
 from atom.compass.fit.publish import RANK
@@ -272,7 +273,7 @@ def _price_list_key(atom_args, machine) -> Key:
         enable_expert_parallel=engine.enable_expert_parallel,
         enable_dp_attention=engine.enable_dp_attention,
         decode_context_parallel_size=engine.decode_context_parallel_size,
-        machine_spec=machine_spec_digest(machine),
+        **keyed_platform(Kind.PRICE_LIST, machine_platform(machine)),
         source_root=run.source_root(),
     )
 
