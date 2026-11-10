@@ -35,7 +35,8 @@ lacks otherwise or cut, or whose ranks' rows fall to different vectors, is
 counted under `ranks` and not fitted. The law reports each step's rank label
 spread, `max / min - 1`, as its p50 and p90 under `spread`. The group's step
 is the max over its ranks, so each vector is fitted by max-affine regression
-(`_fit_form`): from the fit on every rank's row, each pass refits on the row
+(`_fit_form`): from the fit on every rank's row and from each feature's axis,
+the lowest after a first round going on, each pass refits on the row
 each step's price picks, a step line-searched until it lowers the squared
 relative error, until no step changes rank or the step's ranks tie; MAD drops
 rerun it. The vector's solve, warm steps and hull read each step's row at the
@@ -43,7 +44,7 @@ rank it prices the step as (`priced_rank`); a decode rung that adopts a
 column (below) is fitted again under it. Each
 vector reports, under `fit.all_rows`, the centre and scaled MAD of the fit on
 every rank's row, each step priced as its max over ranks, and under
-`fit.passes` the passes, how they stopped, `settled` or `tie`, and the
+`fit.passes` the start, passes, how they stopped, `settled` or `tie`, and the
 squared error `F`; more than `FIT_PASSES` passes refuse the fit. A held-out
 step is priced and banded as its costliest rank.
 
@@ -59,7 +60,11 @@ fitted for a kind whose samples carry it: `W_inputs` and `L_mtp`, on an MTP
 record, and `W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
 solve drops above the law paid a first-use JIT compile (`_jit`): it and the
 forward after it, whose period takes up the stall, are left out of every host
-law; the report lists the JIT forwards per run under `jit_steps`.
+law; the report lists the JIT forwards per run under `jit_steps`. A `W_launch`
+label leaves out the time its launch spent in HIP's blocking calls, which the
+report states per run and kind under `blocked` (`_blocked`); it names under
+`unstamped` the runs whose records state none, so their `W_launch` labels are
+wall times.
 A forward's `E` that admits requests (`step_labels.admissions`) is left out of
 its kind's law: the law then prices the engine loop alone, and `admit`, seconds
 on `step_labels.admit_x`, prices what the forwards of every kind that admit spend
@@ -205,8 +210,9 @@ HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
 #: What a lone HTTP request's intake costs: per request, and per body byte.
 INTAKE_FEATURES = ("idle", "bytes")
-#: What a lone tokenizer call costs: per call, and per token.
-TOKENIZER_FEATURES = ("fixed", "tokens")
+#: What a lone tokenizer call costs: per call, per token, and for a segment
+#: tokenizer call per character its stored-prefix search compared.
+TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
 #: What a forward that admits requests spends once, per prompt token past the
 #: prefix-cache hit and per token within it (`step_labels.admit_x`).
 ADMIT_FEATURES = ("admits", "uncached", "cached")
@@ -376,6 +382,7 @@ def fit_host(samples) -> tuple[dict, dict]:
     rows = _host_rows(kept)
     host = {"key": json.loads(keys[0]), "laws": {}}
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
+    report["blocked"], report["unstamped"] = _blocked(samples)
     report["jit_steps"] = {}
     for run, _, n in sorted(jit):
         report["jit_steps"].setdefault(run, []).append(n)
@@ -409,19 +416,51 @@ def fit_host(samples) -> tuple[dict, dict]:
     return host, report
 
 
+def _blocked(samples) -> tuple[dict, list[str]]:
+    """Per run whose lines state `blocked_ns` and kind, its launches, those
+    that blocked in a HIP call, their blocked ms at p50 and p90, and each
+    call's blocked ms in all; and the runs whose lines state none, so their
+    `W_launch` labels are wall times."""
+    runs: dict = {}
+    for s in samples:
+        if "W_launch" in s.host:
+            runs.setdefault(s.provenance["run"], []).append(s)
+    blocked = {}
+    for run, launches in runs.items():
+        if all(s.blocked is None for s in launches):
+            continue
+        for kind in HOST_KINDS:
+            mine = [s.blocked or {} for s in launches if host_kind(s.view) == kind]
+            ms = [sum(b.values()) * 1e3 for b in mine if b]
+            calls: dict = {}
+            for b in mine:
+                for call, seconds in b.items():
+                    calls[call] = calls.get(call, 0.0) + seconds * 1e3
+            blocked.setdefault(run, {})[kind] = {
+                "launches": len(mine),
+                "blocked": len(ms),
+                "ms": np.percentile(ms, (50, 90)).tolist() if ms else None,
+                "calls": calls,
+            }
+    return blocked, sorted(runs.keys() - blocked.keys())
+
+
 def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
     """The ``tokenizer`` term over the lone calls (`_lone_calls`) each
     tokenizer record in `paths` holds, beside the intake stamps in `intakes`,
     and its report: the records' backend and fingerprint, and per kind of
     call, ``fixed_s + tokens / tokens_per_s`` by the host-law solver on the
     calls' wall seconds, a segment tokenizer call's less its calls', over
-    their ids (`_own_work`).
+    their ids, plus ``chars / chars_per_s`` over the characters its
+    stored-prefix search compared where every call's record holds them
+    (`_own_work`).
     One-item ``encode_batch`` calls are ``encode``'s and several-item ones
     their own kind. A ``decode`` with no positive slope is ``fixed_s`` alone
     over ``tokens``, the ``[lo, hi]`` token counts its calls span. A kind the
     calls cannot give is left out and its reason listed under the report's
-    ``unfitted``; the report gives each record's p10, p50 and p90 relative
-    residual per kind. Raises on records of two tokenizers."""
+    ``unfitted``, a ``segment`` without ``chars_per_s`` as
+    ``segment.chars_per_s``; the report gives each record's p10, p50 and p90
+    relative residual per kind. Raises on records of two tokenizers."""
     from scipy.spatial import QhullError
 
     heads, rows = {}, []
@@ -433,23 +472,36 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
             kind = c["call"] if c["items"] > 1 or c["call"] == "decode" else "encode"
             s = (c["t_end_ns"] - c["t_start_ns"]) * 1e-9
             rows.append((i, kind, c["tokens"], s))
-        rows += [(i, "segment", n, s) for n, s in _own_work(got, intake)]
+        rows += [(i, "segment", n, s, chars) for n, chars, s in _own_work(got, intake)]
     if len(heads) != 1:
         raise ValueError(f"the records name {len(heads)} tokenizers: {sorted(heads)}")
     term, report = json.loads(next(iter(heads))), {"unfitted": {}}
     for kind in ("encode", "encode_batch", "decode", "segment"):
-        got = np.array([r[2:] for r in rows if r[1] == kind and r[3] > 0])
+        got = np.array([r[2:4] for r in rows if r[1] == kind and r[3] > 0])
+        chars = [r[4] for r in rows if r[1] == kind and r[3] > 0 and len(r) > 4]
         record = np.array([r[0] for r in rows if r[1] == kind and r[3] > 0])
         try:
             if not len(got):
                 raise ValueError(f"the records hold no lone {kind} call")
             x = np.column_stack([np.ones(len(got)), got[:, 0]])
-            coef, fitted = _host_law(x, got[:, 1], TOKENIZER_FEATURES)
+            if len(chars) == len(got) and None not in chars:
+                x = np.column_stack([x, chars])
+            coef, fitted = _host_law(x, got[:, 1], TOKENIZER_FEATURES[: x.shape[1]])
         except (ValueError, QhullError) as e:
             report["unfitted"][kind] = str(e)
             continue
         if coef[1] > 0:
             term[kind] = {"fixed_s": coef[0], "tokens_per_s": 1 / coef[1]}
+            if len(coef) > 2 and coef[2] > 0:
+                term[kind]["chars_per_s"] = 1 / coef[2]
+            elif kind == "segment":
+                lack = chars.count(None)
+                report["unfitted"]["segment.chars_per_s"] = (
+                    f"{lack} of {len(chars)} lone segment calls' records hold no "
+                    "compared_chars"
+                    if lack
+                    else "the records give no time per compared character"
+                )
         elif kind == "decode":
             term[kind] = {"fixed_s": coef[0], "tokens": _span(fitted, "tokens")}
         else:
@@ -512,9 +564,10 @@ def _lone_calls(calls: list[dict], intake) -> list[dict]:
     return [c for c, k in zip(calls, lone) if k]
 
 
-def _own_work(calls: list[dict], intake) -> list[tuple[int, float]]:
+def _own_work(calls: list[dict], intake) -> list[tuple[int, int | None, float]]:
     """Each ``segment`` call among `calls` lone (`_lone_calls`) among the calls it
-    did not make, its thread's that start in its span, as the ids those returned
+    did not make, its thread's that start in its span, as the ids those returned,
+    the characters its stored-prefix search compared if its record holds them,
     and its wall seconds less theirs."""
     own, ids, made, last = {}, {}, set(), None
     for c in sorted(calls, key=lambda c: (c["thread"], c["t_start_ns"])):
@@ -526,7 +579,11 @@ def _own_work(calls: list[dict], intake) -> list[tuple[int, float]]:
         elif c["call"] == "segment":
             own[id(c)], ids[id(c)], last = end - start, 0, c
     lone = _lone_calls([c for c in calls if id(c) not in made], intake)
-    return [(ids[id(c)], own[id(c)] * 1e-9) for c in lone if c["call"] == "segment"]
+    return [
+        (ids[id(c)], c.get("compared_chars"), own[id(c)] * 1e-9)
+        for c in lone
+        if c["call"] == "segment"
+    ]
 
 
 def _intakes(path) -> tuple[list, list, list]:
@@ -859,14 +916,17 @@ def _fit_form(
     falls. The passes end settled, the solve picking the rows it was solved
     on, or at a tie between ranks, when no step that moves some price by more
     than the square root of the float epsilon makes `F` fall; more than
-    `FIT_PASSES` passes in all raise. Steps whose residual is more than
+    `FIT_PASSES` passes in all raise. Each feature that differs between some
+    step's ranks is a start too, its axis scaled to the labels: the first
+    round runs from each start, every step kept, and the lowest `F` goes on.
+    Steps whose residual is more than
     `MAD_K` scaled MADs from the median are then dropped and the passes rerun
     from there, until the kept set settles or for `MAD_PASSES` rounds.
 
     Returns the solve's figures: `pick`, each step's rank, at a tie the rank
     of larger features (`priced_rank`, prices folded as a run folds them);
-    `passes`, the passes over every round, the last stop and `F`; and
-    `all_rows`, the centre and scaled MAD of the start's residuals.
+    `passes`, its start, the passes over every round, the last stop and `F`;
+    and `all_rows`, the centre and scaled MAD of the first start's residuals.
     """
     from scipy.optimize import nnls
 
@@ -900,17 +960,15 @@ def _fit_form(
     keep = np.ones(n, dtype=bool)
     c, cols = solve(a[real], np.broadcast_to(b[:, None], real.shape)[real])
     start = price(c).max(axis=1) - b
-    on, passes = real, 0
-    # Refitted until the kept set stops moving, so a step an outlier's pull
-    # dropped on the first pass comes back once the outlier is gone.
-    for rounds in range(1, MAD_PASSES + 1):
+
+    def alternate(c, cols, on, passes):
+        """Passes from `c` over the kept steps until settled or at a tie."""
         while True:
             pick = price(c).argmax(axis=1)
             picked = np.zeros_like(real)
             picked[steps, pick] = True
             if on is not None and (on[keep] == picked[keep]).all():
-                stop = "settled"
-                break
+                return c, cols, on, passes, "settled"
             if passes == FIT_PASSES:
                 raise ValueError(
                     f"the alternation on {names} still moved after {FIT_PASSES} passes"
@@ -925,9 +983,28 @@ def _fit_form(
                 while cost(c + t * d) >= f and t * moves > tol:
                     t /= 2
                 if t * moves <= tol:
-                    stop = "tie"
-                    break
+                    return c, cols, on, passes, "tie"
                 c, cols, on = c + t * d, solved, picked if t == 1 else None
+
+    # Each feature that differs between some step's ranks starts from its axis,
+    # scaled by the median of each step's label over its largest value of it.
+    starts = {"all_rows": (c, real)}
+    top = np.where(real[..., None], x, -np.inf).max(axis=1)
+    low = np.where(real[..., None], x, np.inf).min(axis=1)
+    for j in np.flatnonzero((top > low).any(axis=0)):
+        lit = top[:, j] > 0
+        axis = np.zeros(k)
+        axis[j] = np.median((y - offset)[lit] / top[lit, j])
+        starts[names[j]] = (axis, None)
+    # Each start's first round keeps every step; the lowest `F` wins.
+    ends = {s: alternate(c0, cols, on, 0) for s, (c0, on) in starts.items()}
+    first = min(ends, key=lambda s: cost(ends[s][0]))
+    c, cols, on, passes, stop = ends[first]
+    # Refitted until the kept set stops moving, so a step an outlier's pull
+    # dropped on the first pass comes back once the outlier is gone.
+    for rounds in range(1, MAD_PASSES + 1):
+        if rounds > 1:
+            c, cols, on, passes, stop = alternate(c, cols, on, passes)
         residual = price(c).max(axis=1) - b
         centre = np.median(residual)
         mad = 1.4826 * np.median(np.abs(residual - centre))
@@ -935,6 +1012,7 @@ def _fit_form(
         if (moved == keep).all() or rounds == MAD_PASSES:
             break
         keep, on = moved, None
+    pick = np.zeros(n, dtype=int)
     if width > 1:
         pick = [
             priced_rank(
@@ -954,7 +1032,7 @@ def _fit_form(
         "condition": float(np.linalg.cond(cols)),
         "zero": [names[j] for j in range(k) if j not in vary],
         "pick": np.asarray(pick),
-        "passes": {"count": passes, "stop": stop, "F": cost(c)},
+        "passes": {"start": first, "count": passes, "stop": stop, "F": cost(c)},
         "all_rows": {
             "centre": float(np.median(start)),
             "mad": float(1.4826 * np.median(np.abs(start - np.median(start)))),
