@@ -810,16 +810,16 @@ def test_a_v41_prefill_past_cached_tokens_picks_candidates_off_its_rows_blocks(
         ("gfx1250", False, 160, ops._TOPK),
         ("gfx1250", False, 161, ops._PICK),
         ("gfx950", False, 160, "its kernel on gfx950 is not known"),
-        ("gfx1250", True, 160, f"on gfx1250 under {ops.FLYDSL_OFF} is not known"),
+        ("gfx1250", True, 160, "gfx1250 under AITER_DISABLE_FLYDSL_TOPK_DECODE is"),
     ],
 )
 def test_a_v41_prefill_pick_widened_to_its_k_runs_the_top_k_aiter_dispatches_there(
     monkeypatch, arch, off, k, want
 ):
     monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: arch)
-    monkeypatch.delenv(ops.FLYDSL_OFF, raising=False)
+    monkeypatch.delenv("AITER_DISABLE_FLYDSL_TOPK_DECODE", raising=False)
     if off:
-        monkeypatch.setenv(ops.FLYDSL_OFF, "1")
+        monkeypatch.setenv("AITER_DISABLE_FLYDSL_TOPK_DECODE", "1")
     records, I32 = [], "torch.int32"
     monkeypatch.setattr(ops, "_journal", lambda path, got: records.extend(got) or got)
     # the pick's HIP top-k as a prefill of 256 tokens traced it: 32 index blocks
