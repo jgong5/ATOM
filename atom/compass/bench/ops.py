@@ -261,7 +261,7 @@ PROG = "compass measure ops"
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 30
+PROTOCOL = 31
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -1044,10 +1044,11 @@ class Stub:
         picks = [m for m, s in spec.items() if getattr(s, "produces_candidates", 0)]
         self.picker = next((m for m in picks if hasattr(m, "topk_blocks")), None)
         # its first attention layer at each ratio, whose lists its index build
-        # writes (`_lists`), and each pass's window reach (`_prepare`)
+        # writes (`_lists`), each pass's window reach and, by leaf, the pass
+        # copy and ratio its lists were built on (`_prepare`)
         specs = {s for s in spec.values() if hasattr(s, "index_group_start")}
         self.specs = {s.ratio: s for s in sorted(specs, key=lambda s: -s.layer_id)}
-        self.reach = {}
+        self.reach, self.selections = {}, {}
         # a DeepSeek-V4 CSA layer: its forward writes the top-k section of the
         # CSA index buffer, and `_prepare` runs none
         self.csa = next(
@@ -1109,7 +1110,7 @@ class Stub:
         # the step's own its width, its window reach: the ring rows its index
         # build lists each request below its window split, from its floor
         # (`_window_split`), none on a replay's tail
-        self.lists, self.reach = {}, {}
+        self.lists, self.reach, self.selections = {}, {}, {}
         for rows, (step, _) in passes.items():
             if hasattr(step, "request_floors"):
                 split = np.maximum(step.request_positions, step.request_cached_until)
@@ -1195,6 +1196,7 @@ class Stub:
                         if listed is not None:  # as its index build writes it
                             step = passes.get(at, passes[None])[0]
                             pool = self._lists(md.cache, step, ratio, listed, live)
+                            self.selections[sig] = self.lists[id(step)], ratio
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
@@ -1300,6 +1302,19 @@ class Stub:
                 raise ValueError("a pointer table gathered at no replay's queries")
             built = built[rows.long()]
         return {f"attention_indices.{ratio}.{i}": built}
+
+    def _selected(self, sig) -> int | None:
+        """The pool rows the selection on leaf `sig`'s lists (`_lists`) names
+        for its pass: each row's ids, a request's apart, none of a padding
+        row's; None where the leaf took no lists."""
+        own, ratio = self.selections.get(sig, (None, None))
+        chosen = own and own.selected.get(self.specs[ratio].topk_owner)
+        if chosen is None:
+            return None
+        ids = chosen.reshape(len(own.batch_ids), -1).long()
+        rows = own.batch_ids.long()[:, None].expand_as(ids)
+        kept = (ids >= 0) & (rows >= 0)
+        return (rows[kept] << 32 | ids[kept]).unique().numel()
 
     def point(self, rule, shape, context, found) -> list[dict]:
         """Each leaf of `found` timed at `shape` on `point_rows`, or every leaf
@@ -1505,9 +1520,11 @@ class Stub:
                     # per `ratio` tokens; its window rows are left out
                     unit = blocks * self.runner.config.kv_cache_block_size // ratio
                     slotted = 0
-                    # of which a request reads at most its indexer's top-k
+                    # of which a request reads at most its indexer's top-k; a
+                    # leaf on V4.1's lists, the rows their selection names
                     if top := stated.get("index_topk"):
-                        unit = min(unit, rows * top)
+                        chosen = self._selected(sig)
+                        unit = min(unit, rows * top if chosen is None else chosen)
                 elif window and self.state.get(name):
                     unit = 0  # its window is read from the ring alone
                 if self.state.get(name):
