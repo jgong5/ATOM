@@ -2266,6 +2266,7 @@ def _kernels(fn, kwargs) -> tuple[list[str], list, float]:
     named = kernels or device
     return [e["name"] for e in named], [e["args"].get("grid") for e in named], ns
 
+
 def _replay(fn, calls, flush=None) -> list[float]:
     """Each timed replay of one graph of `calls`, in ns per call, each started
     on every rank together (`_together`) after one read of `flush` when

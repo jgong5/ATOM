@@ -3359,6 +3359,7 @@ def test_a_calls_kernels_are_what_two_profiles_in_a_row_name(
     # ROCm's profiler, under load, can drop a call's kernel from its profile and
     # keep the barrier's all-reduce in its place
     left = iter(profiles)
+
     def kernels(fn, kwargs):
         names = next(left)
         return names, [None] * len(names), 1.0

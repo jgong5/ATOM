@@ -279,8 +279,9 @@ def _missing_rank(config, todo, refuse, rank):
 
         def kernels(fn, kwargs):
             profiles.append(1)
-            names, ns = named(fn, kwargs)
-            return ([] if rank == 1 and len(profiles) < 3 else names), ns
+            names, grids, ns = named(fn, kwargs)
+            missed = rank == 1 and len(profiles) < 3
+            return ([] if missed else names), ([] if missed else grids), ns
 
         ops._kernels = kernels
         return measure(*args)

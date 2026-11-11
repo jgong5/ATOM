@@ -199,14 +199,18 @@ def _fit_with_ops(tmp_path, spec, ops_dir):
     cli.main(list(map(str, argv)))
 
 
-def test_fit_steps_ops_needs_the_profiler_s_floor_its_spec_states(tmp_path, measured):
+def test_fit_steps_ops_needs_the_profiler_s_floor_its_spec_states(
+    tmp_path, measured  # noqa: F811
+):
     ops_dir, _ = measured("ops", [_point(2, 10.0)])
 
     with pytest.raises(SystemExit, match="profiler_floor_s` is declared .* no value"):
         _fit_with_ops(tmp_path, DOCUMENT, ops_dir)
 
 
-def test_fit_steps_ops_refuses_points_another_configuration_ran(tmp_path, measured):
+def test_fit_steps_ops_refuses_points_another_configuration_ran(
+    tmp_path, measured  # noqa: F811
+):
     ops_dir, _ = measured("ops", [_point(2, 10.0)])
     floored = DOCUMENT | {"device": DOCUMENT["device"] | {"profiler_floor_s": FLOOR}}
 

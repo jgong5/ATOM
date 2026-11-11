@@ -14,7 +14,8 @@ give, the params and the report; a flag only another backend reads refuses.
 The entry is published under the readings a run on the spec `--machine` names
 takes, which `publish.inputs` loads each measurement under. `--ops` names
 `measure ops --out` directories whose points take the profiler's floor out
-of a trace run's drafter labels (`publish.inputs`).
+of a trace run's drafter labels (`publish.inputs`); the report's `floor` counts
+the steps each refusal left without a label, by the label's busy line field.
 
 `step-linear` takes real runs only and fits `step_linear_fit.FORMS`' `--form`,
 `history` by default, joining each step's ranks at the engine config's
@@ -53,6 +54,7 @@ targets', naming the targets'. `--sessions A:B` keeps the `--grid` lines
 import copy
 import dataclasses
 import json
+from collections import Counter
 from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind
@@ -209,6 +211,11 @@ def main(argv: list[str]) -> None:
     target_args.client_run = [c for c in args.client_run if Path(c[0]) not in grid_only]
     samples, config = publish.inputs(target_args, sources, args.ops)
     fields, params, report = fit(samples, config, args)
+    if args.ops:
+        refused = [
+            f"{f}: {w}" for s in samples for f, ws in s.floor.items() for w in ws
+        ]
+        report["floor"] = dict(Counter(refused).most_common())
     key = Key.of(
         kind,
         **{f: config[f] for f in ("model", "source_root")},
