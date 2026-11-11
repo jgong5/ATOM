@@ -2887,9 +2887,12 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                 if store.directory_for(at := key(shape, context, sig)).exists():
                     entry = store.read(at)
                     held = entry.read_member("point", entry.topology.ranks()[0], "json")
-                    # a point a store held from before its record kept the mark
+                    # the asking shape's mark alone: the point's key holds no TBO
+                    # switch, and a store may hold it from before records kept one
+                    point = json.loads(held)
+                    point.pop("micro_batch", None)
                     mark = {"micro_batch": True} if shape.micro_batch else {}
-                    done[str(shape), context, sig] = json.loads(held) | mark
+                    done[str(shape), context, sig] = point | mark
                 else:
                     found[sig] = op, instances
             todo += [(shape, context, found)] if found else []
