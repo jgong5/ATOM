@@ -29,15 +29,13 @@ from atom.compass.artifacts import (
     ArtifactRefusal,
     ArtifactStore,
     GateState,
-    Key,
-    Kind,
     Topology,
     member_name,
 )
 from atom.compass.backends import CostRefused
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.bench import ops
-from atom.compass.capture import driverless
+from atom.compass.capture import driverless, graph_key
 from atom.compass.capture.forward import decode, structure
 from atom.compass.run import _op_graphs
 from atom.compass.run.step_grid import keyed
@@ -92,9 +90,7 @@ def store(tmp_path, monkeypatch):
                 m.setenv(k, v)
             at = structure(_v4(tmp_path, **fields), "decode")
         store.publish(
-            Key.of(
-                Kind.OP_GRAPH, structure=at, shape="decode B=2", torch=torch.__version__
-            ),
+            graph_key(at, "decode B=2"),
             provenance=stanza("compass trace ops"),
             topology=Topology(),
             conditions=run_readings(str(tmp_path / "model")),

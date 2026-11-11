@@ -117,6 +117,7 @@ KEY_OF: dict[Row, Key] = {
         Kind.OP_GRAPH,
         structure="qwen3-moe-48L",
         shape="decode B=2",
+        source_root=ATOM_ROOT.revision,
         **keyed_platform(Kind.OP_GRAPH, STATED),
     ),
     Row.PRICE_LIST: Key.of(
@@ -650,9 +651,7 @@ def test_a_refusal_says_which_key_missed_where_a_count_does_not(tmp_path):
     store.answer(
         Key.of(
             Kind.OP_GRAPH,
-            structure="never-traced",
-            shape="decode B=2",
-            **keyed_platform(Kind.OP_GRAPH, STATED),
+            **{**KEY_OF[Row.OP_GRAPH].values, "structure": "never-traced"},
         ),
         no_graph,
         conditions=BASE,

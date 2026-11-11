@@ -57,8 +57,11 @@ stream. Both micro-batches' segments go on the two streams in ATOM's order
 With a `price_list`, a source named `LISTED` (`fit.ops.PriceList` in a run),
 each leaf outside a `resource_bound` `Par` resolves through a `Resolver`: the
 price list, asked ``(leaf, bound, work)`` with `bound` the step's or
-micro-batch's (`_bound`), then its roofline. A `resource_bound` `Par` prices
-its branches' summed work, so its leaves take no price of their own.
+micro-batch's (`_bound`) at the rows the leaf ran (`_ran_at`), or the list of
+each it may have run at where it leads with a padded prefill's T that is also
+a count of its width (`_ran_at_each`), then its roofline. A `resource_bound`
+`Par` prices its branches' summed work, so its leaves take no price of their
+own.
 
 Terms. One per op kind, ``op.<kind>``, and ``par.resource_bound``, each
 the fold of its prices in run order. A term is `declared`, its note naming
@@ -264,10 +267,10 @@ def gathered_off_default(
 
 
 def _ran_at(leaf: dict, bound: tuple) -> tuple:
-    """`bound` at the rows `leaf` ran: a padded target's (`_bound`) at its
-    width where an activation, metadata or output of the leaf leads with the
-    width's counts and none with the rows', at both (`_bound`) where it leads
-    with both's, else at its rows."""
+    """`bound` at the rows `leaf` ran: a padded target's or drafter's
+    (`_bound`) at its width where an activation, metadata or output of the
+    leaf leads with the width's counts and none with the rows', at both
+    (`_bound`) where it leads with both's, else at its rows."""
     if len(bound) != 4:
         return bound
     rows, wide, both, (counts, wides) = bound
@@ -275,6 +278,20 @@ def _ran_at(leaf: dict, bound: tuple) -> tuple:
     shapes = [a["shape"] for a in args if a["role"] in ("activation", "metadata")]
     leads = {n for s in shapes + leaf["out"] for n in s[:1]}
     return (both if leads & counts else wide) if leads & wides else rows
+
+
+def _ran_at_each(leaf: dict, bound: tuple) -> list:
+    """`_ran_at`'s bound, then, where a padded prefill's T is also a count of
+    its width, each other bound `leaf` may have run at: that T its rows'
+    count alone, or its width's alone."""
+    each = [_ran_at(leaf, bound)]
+    if len(bound) == 4 and bound[0][0] == "prefill":
+        *at, (counts, wides) = bound
+        t = {at[0][1]} & wides
+        for sets in ((counts - t, wides), (counts, wides - t)):
+            if (got := _ran_at(leaf, (*at, sets))) not in each:
+                each.append(got)
+    return each
 
 
 class OpGraphBackend(CostBackend):
@@ -434,11 +451,19 @@ class OpGraphBackend(CostBackend):
         them at its rows, G `draft_rows`, a capture's MoE gathering this rank's
         rows at every peer. A leaf with both counts is asked at its rows'
         T and B and the smaller G: on a drafter its rows carry the first
-        pass's G, above a later pass's."""
+        pass's G, above a later pass's. A block drafter's pass on a decode
+        that replayed a rung runs its block at the rung: the width's counts
+        are its block's, the rung's rows and their `drafts` tokens each, on
+        this rank and gathered over the DP group, and none is its rows', so
+        a leaf that leads with its rows alone or beside the target's tokens,
+        as its anchors do, is asked at its rows."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
         width = self.padded and (view.draft_bs if draft else view.target_bs)
+        block = draft and self.block and phase == "decode"
+        if block:
+            width = self.padded and view.capture_rung
         if draft and self.drafts > 1 and view.draft_rows:
             width = b
         ran = phase == "decode" and width or t
@@ -459,7 +484,10 @@ class OpGraphBackend(CostBackend):
             counts = {b * j for j in k}
             wides = {width * j for j in k} | {self.dp * width * k[-1]}
         wide, both = (phase, ran, width, *bound[3:]), bound
-        if draft:
+        if block:
+            tokens = width * self.drafts
+            counts, wides = set(), {width, tokens, self.dp * tokens}
+        elif draft:
             padded = self.dp * width
             later = view.draft_rows or padded
             counts, wides = counts | {gathered}, {width, padded, later}
@@ -686,8 +714,9 @@ class OpGraphBackend(CostBackend):
         if w is None:
             return None
         if bound:
+            each = _ran_at_each(leaf, bound)
             try:
-                got = self.resolver.resolve((leaf, _ran_at(leaf, bound), w))
+                got = self.resolver.resolve((leaf, each if each[1:] else each[0], w))
             except CostRefused as exc:
                 refused.extend(exc.declined)
                 return None

@@ -583,19 +583,3 @@ def test_an_op_graph_entry_takes_its_torch_from_the_reading_it_recorded(tmp_path
         f"MOVED op_graph {entry.directory.name} -> {key.token()}"
     )
     assert ArtifactStore(tmp_path / "new").read(key).key == key
-
-
-def test_a_graph_missed_under_another_torch_names_the_torch_it_was_traced_under(
-    tmp_path,
-):
-    from atom.compass.capture.forward import missed
-
-    at = 'qwen3 decode gfx950 {"level": 0} output'
-    store = ArtifactStore(tmp_path)
-    traced = Key.of(Kind.OP_GRAPH, structure=at, shape="decode B=2", torch="2.10.0")
-    publish(store, traced)
-    here = Key.of(Kind.OP_GRAPH, structure=at, shape="decode B=2", torch="2.11.0")
-    assert missed(store, here) == (
-        "; a graph the store holds at this shape and structure was traced under "
-        "torch '2.10.0'"
-    )

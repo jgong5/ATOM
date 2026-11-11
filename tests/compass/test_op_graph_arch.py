@@ -18,13 +18,11 @@ from atom.compass.artifacts import (
     Axis,
     Conditions,
     GateState,
-    Key,
-    Kind,
     Topology,
     member_name,
 )
 from atom.compass.bench import ops
-from atom.compass.capture import driverless
+from atom.compass.capture import driverless, graph_key
 from atom.compass.capture.forward import decode, structure
 from atom.compass.run import _op_graphs, graph_readings
 
@@ -74,12 +72,7 @@ def store(tmp_path, config, monkeypatch):
     store = ArtifactStore(str(tmp_path / "store"))
     for arch in ARCHES:
         _device(monkeypatch, driverless._props(arch))
-        key = Key.of(
-            Kind.OP_GRAPH,
-            structure=structure(config, "decode"),
-            shape="decode B=2",
-            torch=torch.__version__,
-        )
+        key = graph_key(structure(config, "decode"), "decode B=2")
         store.publish(
             key,
             provenance=stanza("compass trace ops"),
