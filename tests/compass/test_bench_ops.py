@@ -1537,10 +1537,11 @@ def test_v41_attention_takes_the_lists_atom_s_index_build_writes_for_its_pass(
     from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep
     from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
 
-    i32, built, taken = torch.int32, [], {}
+    i32, built, fills, taken = torch.int32, [], [], {}
 
     def attention_indices(spec, step):
         built.append((spec.layer_id, step.selected[spec.topk_owner][0, 0].tolist()))
+        fills.append((id(step), step.indptrs, step.indptr_buffers))
         n = int(step.batch_ids.ge(0).sum())
         return [torch.arange(n * k, dtype=i32) + 100 * k for k in (1, 2, 3, 4)]
 
@@ -1556,6 +1557,7 @@ def test_v41_attention_takes_the_lists_atom_s_index_build_writes_for_its_pass(
         runner.model[-1].spec = LayerAttentionSpec(layer, 2, mode, 2, 2)
     visible = {2: torch.tensor([600, 600, 601, 601], dtype=i32)}
     step = BatchStep((), *(torch.zeros(4, dtype=i32),) * 4, None, visible=visible)
+    step.indptrs, step.indptr_buffers = {2: "another pass's"}, {2: "its own"}
     step.decoder = SimpleNamespace(
         tail=step, tail_rows=torch.zeros(3), last=torch.zeros(1), filled_gpu=None,
         finishing_gpu=None, query_ids=torch.tensor([-1, -1, 0, -1], dtype=i32),
@@ -1592,6 +1594,9 @@ def test_v41_attention_takes_the_lists_atom_s_index_build_writes_for_its_pass(
     # each build layer 2's, its rows' 8 ids spread from 0, the newest last
     assert {b[0] for b in built} == {2} and step.selected == {}
     assert built[0][1] == [0, 86, 172, 257, 343, 428, 514, 599]
+    # one copy a pass, its indptrs filled afresh into the cache's buffers
+    assert len({f[0] for f in fills}) == 2
+    assert all(f[1:] == ({}, None) for f in fills)
 
 
 def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():

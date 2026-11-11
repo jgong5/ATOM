@@ -249,7 +249,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 29
+PROTOCOL = 30
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -1194,21 +1194,28 @@ class Stub:
 
     def _lists(self, cache, step, ratio, i, live) -> dict[str, torch.Tensor]:
         """Item `i` of DeepSeek-V4.1's index build (`LISTS`) for the pass
-        `step`, by name, as its first attention layer at `ratio` builds it
-        afresh, a replay's queries' build: off its scorer's selection, where
-        none wrote one spread over each row's visible rows (`_candidates`); a
-        pointer table taken as an activation, the queries', at their rows."""
+        `step`, by name, as its first attention layer at `ratio` builds it on
+        the pass's own copy of `step`, a replay's queries' build: its indptrs
+        filled once, into the cache's buffers its pointer tables name, off its
+        scorer's selection, where none wrote one spread over each row's visible
+        rows (`_candidates`); a pointer table taken as an activation, the
+        queries', at their rows."""
         spec = self.specs.get(ratio)
         if spec is None:
             raise ValueError(f"no attention layer of the model runs ratio {ratio}")
-        if (id(step), ratio) not in self.lists:  # once a pass and ratio
-            chosen = dict(step.selected)
-            if ratio and spec.topk_owner not in chosen:
-                top = cache.geometry.batch_topk(ratio)
-                chosen[spec.topk_owner] = _candidates(step.visible[ratio], top)[None]
-            own = dataclasses.replace(step, group_indices={}, selected=chosen)
-            self.lists[id(step), ratio] = cache.attention_indices(spec, own)
-        built = self.lists[id(step), ratio][i]
+        own = self.lists.get(id(step))
+        if own is None:
+            own = self.lists[id(step)] = dataclasses.replace(
+                step,
+                indptrs={},
+                indptr_buffers=None,
+                group_indices={},
+                selected=dict(step.selected),
+            )
+        if ratio and spec.topk_owner not in own.selected:
+            top = cache.geometry.batch_topk(ratio)
+            own.selected[spec.topk_owner] = _candidates(step.visible[ratio], top)[None]
+        built = cache.attention_indices(spec, own)[i]
         if i % 2:  # as `QueryRows.indices` gathers it
             if (rows := live.get("plan.query_ptrs")) is None:
                 raise ValueError("a pointer table gathered at no replay's queries")
