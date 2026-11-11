@@ -8,10 +8,13 @@ beside an idle peer: each prefill's drafter runs its later pass at its batch,
 4, which `OpGraphBackend` asks at the rows that pass gathers, its batch on
 each rank, 8, not at the rows its first pass gathers. The plan's points there
 price the step's drafter as measured, and `--coverage` reads them where the
-run does.
+run does. Where a prompt's T is that batch too, a leaf that leads with it is
+measured at each G it may have run at, and `--coverage` asks it at each B
+and G the run does.
 """
 
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -22,8 +25,9 @@ from test_bench_ops_plan import bench  # noqa: F401  a fixture
 from test_work import SPEC
 
 from atom.compass.backends import BatchView, RequestShape
-from atom.compass.backends.op_graph import OpGraphBackend
+from atom.compass.backends.op_graph import LISTED, OpGraphBackend
 from atom.compass.backends.provenance import Method
+from atom.compass.backends.resolver import CostRefused
 from atom.compass.bench import ops
 from atom.compass.capture.forward import prefill
 from atom.compass.fit import ops as fit_ops
@@ -131,4 +135,75 @@ def test_a_dp_drafter_s_later_pass_is_measured_at_the_g_a_run_asks_it_at(
     assert report["by part"] == {
         "target": {"steps": 2, "covered": 2},
         "draft": {"steps": 2, "covered": 2},
+    }
+
+
+def test_a_dp_drafter_s_leaf_whose_t_is_its_batch_is_measured_and_asked_at_each_g(
+    bench, tmp_path, monkeypatch  # noqa: F811
+):
+    # A prompt of 4 tokens whose later pass runs at its batch, 4, on rank 0 of
+    # two: a drafter's leaf that leads with 4 ran at its rows and their gather,
+    # every rank's 4 tokens, or at that batch and its gather, 8 rows. The plan
+    # measures it at each G; the run prices the first pass, read at its T
+    # alone, and declines the head, later pass and sampler, whose families
+    # read B, there 1 or 4; coverage leaves out those, by the run's reason.
+    step = {"rows": [[4, 4, False]], "produces_output": True, "draft_bs": 4}
+    step |= {"moe_rows": 8, "draft_moe_rows": 8}
+    monkeypatch.setattr(ops, "graph", _sharing)
+    decode = {"rows": [[3, 1000, True], [3, 3000, True]], "rung": 2}
+    record = _ranks(tmp_path / "steps", [decode, step], [{"is_dummy_run": True}])
+    store, root, key, run = bench
+    out = tmp_path / "out"
+    out.mkdir()
+    args = SimpleNamespace(plan=[record], store=root, llc_mib=256)
+
+    ops.plan(store, key, DP, run, args, "compass measure ops --plan", out)
+
+    records = [json.loads(x) for x in (out / "plan.jsonl").read_text().splitlines()]
+    four = {
+        op: {
+            r["shape"]
+            for r in records
+            if r["op"] == op
+            and r["shape"].startswith("prefill")
+            and json.loads(r["leaf"])["args"]["x"]["shape"][0] == 4
+        }
+        for op in ("aiter.propose", "aiter.step")
+    }
+    assert four == {
+        "aiter.propose": {"prefill T=4 B=1", "prefill T=4 B=1 W=4 G=8"},
+        "aiter.step": {"prefill T=4 B=1 W=4", "prefill T=4 B=1 W=4 G=8"},
+    }
+    params = fit_ops.fit([r for r in records if "refused" not in r])
+    fit_ops.held_out(params)
+
+    def graph(phase, t, b, output, *_, draft=False, width=None):
+        shape = prefill(t, b, None, width)
+        return _sharing(store, DP, shape, None, output, draft)["region"]
+
+    listed = fit_ops.PriceList(params)
+    backend = OpGraphBackend(SPEC, graph, kv="bf16", dp=2, drafts=2, price_list=listed)
+    fields = ("moe_rows", "draft_moe_rows", "draft_bs")
+    view = BatchView(
+        (RequestShape(4, 4, False),),
+        produces_output=True,
+        **{f: step[f] for f in fields},
+    )
+    with pytest.raises(CostRefused) as refused:
+        backend.price(view)
+    declined = dict(
+        r.reason.split(": ", 1) for r in refused.value.declined if r.source == LISTED
+    )
+    ran = "it leads with its T, a count of its width too, so it ran at "
+    assert declined == {
+        f"aiter.{op}": ran + "T=4 B=1 or T=4 B=4 G=8"
+        for op in ("head", "step", "sample")
+    }
+    report = ops.coverage(store, root, DP, [record], records, "gfx942")
+    assert report["by part"] == {
+        "target": {"steps": 2, "covered": 2},
+        "draft": {"steps": 2, "covered": 1},
+    }
+    assert report["left out, by leaf kind"] == {
+        f"draft {op}": {re.sub(r"\d+", "#", why): 1} for op, why in declined.items()
     }
