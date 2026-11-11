@@ -2577,7 +2577,7 @@ def test_a_warm_call_takes_its_cold_call_s_occurrence_on_that_one_s_first_copy(
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         stub._time(op, "sig", [{}], copies)
