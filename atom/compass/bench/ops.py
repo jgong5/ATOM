@@ -2975,11 +2975,10 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     leaf at its tokens, and one of a kind that depends on context over its
     rows' cached tokens too (`_bracket_cached`); and `fit ops`' price list of
     `records` prices it at the step, as `compass run --coverage` asks it, a
-    drafter's leaf at the G a run asks it at (`_drafter_at`). A
+    drafter's leaf at the batch and G a run asks it at (`_drafter_at`). A
     decode leaf is read at the rows it ran, its shape's T: of a drafter's own
     decode shape past its step's, a leaf its width's graphs hold at that
-    width, as `--plan` measures it, and one a run asks at its later passes'
-    G at their batch. A prefill leaf is asked at the B it ran,
+    width, as `--plan` measures it. A prefill leaf is asked at the B it ran,
     its shape's W where it leads with that and not with its T or B
     (`fit.ops.ran_counts`). The graphs are `arch`'s; a part's graph
     the store does not hold leaves the step out, by its refusal."""
