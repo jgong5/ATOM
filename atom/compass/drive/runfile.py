@@ -228,17 +228,16 @@ def _model_digest(model: str) -> str:
 
 def _hops(hosts: list, atom_args) -> dict:
     """The ``hops`` of the entry of `hosts` fitted under the config ATOM's
-    arguments `atom_args` resolve, as the runner takes its own; the hops every
-    entry states alike as they are, with no config resolved."""
+    arguments `atom_args` resolve, picked as the runner picks its own
+    (`run.pick_fitted`); the hops every entry states alike as they are, with no
+    config resolved."""
     host = hosts[0]
     if any(h.get("hops") != host.get("hops") for h in hosts):
         from atom.compass.drive.run import _config
-        from atom.compass.run.step_grid import keyed
 
-        engine = keyed(_config(atom_args))
-        host = run._fitted_here(
-            hosts, engine, lambda e: e.get("key", {}).get("engine"), "host"
-        )
+        picked = {"host": hosts}
+        run.pick_fitted(picked, "host", _config(atom_args))
+        host = picked["host"]
     return host.get("hops", {})
 
 

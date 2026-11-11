@@ -2319,16 +2319,13 @@ def tokenizer(tok, config) -> None:
 
 def tokenizer_term(run: dict, tok, config) -> tuple[dict, dict | None]:
     """This server's ``host`` entry in the run file `run`, its engine config's
-    among several, and that entry's ``tokenizer`` term, None when it states
-    none: a term fitted on another backend than the one `tok`, the tokenizer
-    ATOM's server loaded, runs on is refused."""
-    host = run.get("host", {})
-    if isinstance(host, list):
-        from atom.compass.run.step_grid import keyed
-
-        host = _fitted_here(
-            host, keyed(config), lambda e: e.get("key", {}).get("engine"), "host"
-        )
+    among several as the runner picks its own (`pick_fitted`), and that entry's
+    ``tokenizer`` term, None when it states none: a term fitted on another
+    backend than the one `tok`, the tokenizer ATOM's server loaded, runs on is
+    refused."""
+    picked = {"host": run.get("host", {})}
+    pick_fitted(picked, "host", config)
+    host = picked["host"]
     term = host.get("tokenizer")
     if term is None:
         return host, None
