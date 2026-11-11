@@ -160,9 +160,10 @@ shape of more than one row on ragged rows too (`_means`): the first at the
 context, the rest sharing a mean, each `GRID`th of it from the least the rows
 hold; and each prefill family (`_family`), under a speculative drafter each
 leaf of its own prefill shape past a step's that the step's graphs do not
-hold too, at its rows padded to its W, and under DP a leaf of the drafter's
-alone at the G a run asks it at, its later passes' (`_drafter_at`), over a
-ladder of their token counts, chunk remainders among them,
+hold too, at its rows padded to its W, and under DP each leaf of a prefill's
+drafter's graphs a run asks at its later passes' G at that G (`_drafter_at`),
+and at its shape only where its target runs it too, over a ladder of their
+token counts, chunk remainders among them,
 its shapes that state the rows a DP group gathers apart, as `fit ops` prices them,
 one of a kind that depends on context at each at the most cached tokens of
 steps of its rows, and over a ladder of them once those points and the fresh
@@ -2680,6 +2681,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     round by round, numbered on from the last round `out` holds, and after
     each round write every point held, a measured one with its store token, to
     plan.jsonl in `out`."""
+    from atom.compass.artifacts import ArtifactRefusal
     from atom.compass.capture.forward import decode
     from atom.compass.runner.overrides import schedulable_ladder
 
@@ -2694,7 +2696,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             if part == DRAFT and shape != reads[0][1]:
                 own[shape].add(output)
             if part == DRAFT and shape.phase == "prefill":
-                draft_lines.setdefault(shape, line)
+                draft_lines.setdefault(shape, (line, set()))[1].add(output)
     steps = [(reads[0][1], line) for line, reads in steps]
     contexts = [
         c for s, line in steps if s.phase == "decode" for c in _rows(line, s.seqs)
@@ -2723,13 +2725,25 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             continue
         width = graphs[decode(s.seqs)]
         graphs[s] = {sig: leaf for sig, leaf in graphs[s].items() if sig not in width}
-    # a leaf of a prefill's drafter's alone that a run asks at another G than
-    # its shape's, its later passes' under DP, is a point at that G
-    for s, line in draft_lines.items():
-        for sig, (op, _) in list(graphs[s].items()):
-            if op.get("drafted") and (at := _drafter_at(s, op, line, config)) != s:
-                graphs.setdefault(at, {})[sig] = graphs[s].pop(sig)
-                prefills.add(at)
+    # a leaf of a prefill's drafter's graphs a run asks at another G than its
+    # shape's, its later passes' under DP (`_drafter_at`), is a point at that
+    # G, and at its shape only while its target runs it too
+    moved = set()
+    for s, (line, outputs) in draft_lines.items():
+        if line.get("draft_moe_rows") is None:  # no DP gather, no other G
+            continue
+        try:  # a step whose drafter's graph is missing is refused by a run too
+            drafter = leaves_at(store, config, s, None, outputs)
+        except ArtifactRefusal:
+            continue
+        for sig, (op, _) in drafter.items():
+            if (at := _drafter_at(s, op, line, config)) != s:
+                leaf = graphs[s][sig]
+                if leaf[0].get("drafted"):
+                    del graphs[s][sig]
+                graphs.setdefault(at, {})[sig] = leaf
+                moved.add(at)
+    prefills |= moved
     # a run resumed into `out` keeps the rounds an earlier one wrote there
     rounds = [int(d.name[5:]) for d in out.glob("round*") if d.name[5:].isdigit()]
     first = max(rounds, default=-1) + 1
@@ -2786,8 +2800,10 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     for shape in sorted(prefills, key=str):  # G and W are None or a count
         for sig, (op, _) in graphs[shape].items():
             fam, tokens = _family(shape, None, op["op"], sig, dependent)
-            # `fit ops` keeps a shape that states G apart from one that does not
-            seen[fam, not shape.gathered].setdefault(tokens, (shape, op["op"], sig))
+            # `fit ops` keeps a shape that states G apart from one that does
+            # not, and a drafter's pass's G from its step's
+            apart = fam, not shape.gathered, shape in moved
+            seen[apart].setdefault(tokens, (shape, op["op"], sig))
 
     def cached_ladder(top_only: bool) -> dict:
         """The points of each prefill family over its rows' cached tokens, of
@@ -2807,7 +2823,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                         want[shape, c].add(fam)
         return want
 
-    for (fam, _), at in seen.items():
+    for (fam, *_), at in seen.items():
         for tokens in _ladder(at):
             want[at[tokens][0], None].add(fam)
     for point, fams in cached_ladder(top_only=True).items():
