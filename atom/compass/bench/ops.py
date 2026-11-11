@@ -268,7 +268,7 @@ CLEAR_S, CLEAR_SLACK = 3.0, 256 << 20
 #: The byte boundary each weight a leaf cycles starts on: PyTorch's caching
 #: allocator's block size, where an ATOM parameter allocated alone starts.
 #: aiter's Mega-MHC launcher aborts the process on an `hc_scale` that is not
-#: 16-byte aligned, as every second of three-float slices packed back to back is.
+#: 16-byte aligned, as three in four three-float slices packed back to back are.
 WEIGHT_ALIGN = 512
 #: The release waits since a point last recorded them: seconds, and how many
 #: ended at `CLEAR_S`.
