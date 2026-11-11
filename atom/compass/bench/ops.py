@@ -156,8 +156,10 @@ kind those show depends on context (`_dependent`) over a ladder (`_ladder`)
 of the steps' row contexts, and, when some step's rows are ragged, at a
 shape of more than one row on ragged rows too (`_means`): the first at the
 context, the rest sharing a mean, each `GRID`th of it from the least the rows
-hold; and each prefill family
-(`_family`) over a ladder of their token counts, chunk remainders among them,
+hold; and each prefill family (`_family`), under a speculative drafter each
+leaf of its own prefill shape past a step's that the step's graphs do not
+hold too, at its rows padded to its W, over a ladder of their token counts,
+chunk remainders among them,
 its shapes that state the rows a DP group gathers apart, as `fit ops` prices them,
 one of a kind that depends on context at each at the most cached tokens of
 steps of its rows, and over a ladder of them once those points and the fresh
@@ -686,20 +688,21 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     return json.loads(store.read(key).read_member("graph", RANK, "json"))
 
 
-def leaves_at(
-    store, config, shape, arch=None, own=False
-) -> dict[str, tuple[dict, list]]:
+def leaves_at(store, config, shape, arch=None, own=()) -> dict[str, tuple[dict, list]]:
     """Each leaf (`leaves`) of `shape`'s `graph` and, under a speculative
     drafter, of each graph of the drafter's (`DRAFTED`) the store holds there,
     the capture having kept no other; one of a drafter's graphs alone is
-    marked ``drafted``. With `own`, `shape` is a drafter's own decode shape
-    past its step's (`parts`), where a capture keeps the drafter's graph
-    alone: its leaves."""
+    marked ``drafted``. With `own`, `shape` is a drafter's own shape past its
+    step's (`parts`), where a capture keeps a decode's drafter's graph alone:
+    the leaves of the drafter's graphs there at each output (`graph`'s
+    `output`) `own` holds, as its steps read them."""
     from atom.compass.artifacts import ArtifactRefusal
 
     if own:
-        found = leaves(graph(store, config, shape, arch, True, True)["region"])
-        target = set()
+        found, target = {}, set()
+        for output in sorted(own):
+            region = graph(store, config, shape, arch, output, True)["region"]
+            leaves(region, None, found)
     else:
         found = leaves(graph(store, config, shape, arch)["region"])
         target, drafter = set(found), getattr(config, "speculative_config", None)
@@ -1187,10 +1190,12 @@ class Stub:
         self.written, self.later = {}, {}
         self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
         ladder = contextlib.nullcontext
-        if shape.phase == "decode" and shape.tokens < shape.seqs:
-            # a drafter's own shape is prepared padded to its B, as the
-            # capture's runner pads it: a block drafter's passes run there
-            width = np.array([shape.seqs], dtype=np.int32)
+        if shape.width or shape.phase == "decode" and shape.tokens < shape.seqs:
+            # a step that pads past its rows is prepared padded, as the
+            # capture's runner pads it: to its W, where a prefill's LM head
+            # and its drafter's later passes run, or, a drafter's own decode
+            # shape, to its B, where a block drafter's passes run
+            width = np.array([shape.width or shape.seqs], dtype=np.int32)
             ladder = functools.partial(
                 patch.object, self.runner, "capture_sizes_np", width
             )
@@ -1718,12 +1723,12 @@ def point_rows(
     decode of fewer rows than its B, a drafter's own shape past its step's,
     holds those rows alone, its step padded to B (`Stub.point`); a
     prefill row its query tokens, the capture's split, past `context` cached
-    ones. When they need more than the
-    `pool`'s KV blocks, the first keeps its context and each other shares what
-    it leaves, as the rows of a ragged step do. A ragged decode point's rows
-    (`_split`) are its first row's context and, past it, rows of at least a
-    token each that hold its mean; None when they need more than the pool, as
-    a decode point's are when `uncut`."""
+    ones, its step padded to its W where it states one. When they need more
+    than the `pool`'s KV blocks, the first keeps its context and each other
+    shares what it leaves, as the rows of a ragged step do. A ragged decode
+    point's rows (`_split`) are its first row's context and, past it, rows of
+    at least a token each that hold its mean; None when they need more than
+    the pool, as a decode point's are when `uncut`."""
     decode = shape.phase == "decode"
     context, mean = _split(context)
     seqs = min(shape.tokens, shape.seqs) if decode else shape.seqs
@@ -2654,15 +2659,15 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     from atom.compass.runner.overrides import schedulable_ladder
 
     steps = parts(args.plan, config)
-    # a drafter's own decode shapes, past their steps': a leaf their width's
-    # graphs hold is that width's point. G and W are None or a count
-    own = {
-        shape
-        for _, reads in steps
-        for part, shape, *_ in reads
-        if part == DRAFT and shape.phase == "decode" and shape != reads[0][1]
-    }
-    own = sorted(own, key=str)
+    # a drafter's own shapes, past their steps', and the outputs its graph is
+    # read at: a leaf a decode's width's graphs hold is that width's point,
+    # and a prefill's family (`_family`) states no W, so a leaf its step's
+    # graphs hold is the step's. G and W are None or a count
+    own = defaultdict(set)
+    for _, reads in steps:
+        for part, shape, output, _ in reads[1:]:
+            if part == DRAFT and shape != reads[0][1]:
+                own[shape].add(output)
     steps = [(reads[0][1], line) for line, reads in steps]
     contexts = [
         c for s, line in steps if s.phase == "decode" for c in _rows(line, s.seqs)
@@ -2679,11 +2684,16 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         if s.phase == "prefill":
             prefills.add(s)
             cached[s.seqs] += _cached(line)
+    # one that is a step's shape too is measured whole, as that step's
+    own = {s: outputs for s, outputs in own.items() if s not in prefills}
     # first, so a graph only `trace ops --population` traces refuses before any point
-    widths = {decode(s.seqs) for s in own}
+    widths = {decode(s.seqs) for s in own if s.phase == "decode"}
     shapes = prefills | set(own) | widths
     _load(store, config, args.store, shapes, graphs, None, atom_args, args.plan, own)
     for s in own:
+        if s.phase == "prefill":
+            prefills.add(s)
+            continue
         width = graphs[decode(s.seqs)]
         graphs[s] = {sig: leaf for sig, leaf in graphs[s].items() if sig not in width}
     # a run resumed into `out` keeps the rounds an earlier one wrote there
@@ -2725,7 +2735,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     r = r | {"token": key(r["shape"], r["context"], r["leaf"]).token()}
                 lines.write(json.dumps(r) + "\n")
 
-    decodes = [*rungs, *own]
+    decodes = [*rungs, *sorted((s for s in own if s.phase == "decode"), key=str)]
     measure_round(
         {(s, c): None for s in decodes for c in (min(contexts), max(contexts))}, 0
     )
@@ -3295,23 +3305,24 @@ def _load(
     arch=None,
     atom_args=(),
     records=(),
-    own=(),
+    own=None,
 ) -> None:
     """Each of `shapes`' leaves (`leaves_at`, a drafter's own at a shape `own`
-    holds) into `graphs`, its op_graph captured first when the store has none
-    (`_capture`, naming the record directories `records` the shapes are of)."""
+    maps to its outputs) into `graphs`, its op_graph captured first when the
+    store has none (`_capture`, naming the record directories `records` the
+    shapes are of)."""
     from atom.compass.artifacts import ArtifactRefusal
 
-    missing = []
+    own, missing = own or {}, []
     for shape in sorted(shapes - graphs.keys(), key=str):  # G and W: None or a count
         try:
-            graphs[shape] = leaves_at(store, config, shape, arch, shape in own)
+            graphs[shape] = leaves_at(store, config, shape, arch, own.get(shape, ()))
         except ArtifactRefusal:
             missing.append(shape)
     if missing:
         _capture(config, missing, root, arch, atom_args, records)
     for shape in missing:
-        graphs[shape] = leaves_at(store, config, shape, arch, shape in own)
+        graphs[shape] = leaves_at(store, config, shape, arch, own.get(shape, ()))
 
 
 def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
