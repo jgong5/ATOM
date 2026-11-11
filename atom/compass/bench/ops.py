@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """`compass measure ops`: each leaf of an `op_graph` timed alone on one device, cold.
 
-    compass measure ops (--width W | --prefill T B)... [--context C] --llc-mib M
-        --gpu G --store S --out DIR -- <ATOM args>
+    compass measure ops (--width W | --prefill T B)... [--context C] [--drafter]
+        --llc-mib M --gpu G --store S --out DIR -- <ATOM args>
     compass measure ops --plan RECORD [--plan RECORD]... --llc-mib M --gpu G
         --store S --out DIR -- <ATOM args>
     compass measure ops --coverage RECORD [--coverage RECORD]... --store S
@@ -11,7 +11,9 @@
 Each shape names the `op_graph` `compass trace ops` published in S for the
 model and TP width ATOM's arguments resolve, and under a speculative drafter
 each graph of the drafter's part of a step S holds at that shape (`DRAFTED`,
-`leaves_at`), timed on the target's batch. A point is one leaf of those graphs,
+`leaves_at`), timed on the target's batch; with `--drafter` those alone, the
+points a trace run's drafter kernels take their own lengths from
+(`step_labels.Floor`). A point is one leaf of those graphs,
 its instances grouped (`leaves`), at the shape and `--context`: a decode
 step's rows each hold `--context` tokens, under a drafter verifying as many
 more as it drafts, and a prefill's rows, split as the capture split them,
@@ -558,6 +560,8 @@ def main(argv: list[str]) -> None:
         raise ValueError("name a shape: --width or --prefill, or --plan")
     if shapes and args.plan:
         raise ValueError("--plan places every point; name no --width or --prefill")
+    if args.drafter and args.plan:
+        raise ValueError("--drafter times a named shape's drafter graphs; name one")
     if args.context is None and any(s.phase == "decode" for s in shapes):
         raise ValueError("a decode shape needs --context, each row's tokens")
     engine = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
@@ -582,7 +586,10 @@ def main(argv: list[str]) -> None:
         )
     _eager(config)
     store = ArtifactStore(args.store)
-    todo = [(s, args.context, leaves_at(store, config, s)) for s in shapes]
+    todo = [
+        (s, args.context, leaves_at(store, config, s, drafter=args.drafter))
+        for s in shapes
+    ]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "engine.json").write_text(json.dumps(keyed(config)))
@@ -638,6 +645,11 @@ def _parser() -> argparse.ArgumentParser:
         help="a record directory whose steps the planned points cover",
     )
     p.add_argument(
+        "--drafter",
+        action="store_true",
+        help="each shape's drafter graphs alone",
+    )
+    p.add_argument(
         "--llc-mib",
         type=int,
         required=True,
@@ -691,14 +703,15 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
 
 
 def leaves_at(
-    store, config, shape, arch=None, own=False
+    store, config, shape, arch=None, own=False, drafter=False
 ) -> dict[str, tuple[dict, list]]:
     """Each leaf (`leaves`) of `shape`'s `graph` and, under a speculative
     drafter, of each graph of the drafter's (`DRAFTED`) the store holds there,
     the capture having kept no other; one of a drafter's graphs alone is
     marked ``drafted``. With `own`, `shape` is a drafter's own decode shape
     past its step's (`parts`), where a capture keeps the drafter's graph
-    alone: its leaves."""
+    alone: its leaves. With `drafter`, those a drafter's graph holds alone,
+    each as it is without it."""
     from atom.compass.artifacts import ArtifactRefusal
 
     if own:
@@ -706,13 +719,17 @@ def leaves_at(
         target = set()
     else:
         found = leaves(graph(store, config, shape, arch)["region"])
-        target, drafter = set(found), getattr(config, "speculative_config", None)
-        for output, draft in DRAFTED if drafter else ():
+        target, held = set(found), set()
+        spec = getattr(config, "speculative_config", None)
+        for output, draft in DRAFTED if spec else ():
             try:
                 region = graph(store, config, shape, arch, output, draft)["region"]
             except ArtifactRefusal:
                 continue
+            held |= leaves(region).keys()
             leaves(region, None, found)
+        if drafter:
+            found = {sig: leaf for sig, leaf in found.items() if sig in held}
     for sig, (op, _) in found.items():
         if sig not in target:
             op["drafted"] = True

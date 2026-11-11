@@ -7,7 +7,9 @@ request to its stop, and each rank wrote ``OUT/trace/rank_<r>/`` one gzipped
 chrome trace. `reduce` writes ``OUT/steps/dp0.busy.jsonl``: per line of the
 record, its ``step`` and ``b_target_ns``, and on an MTP record ``b_draft_ns``
 and, for each drafter pass `PASSES` names that the line times, its busy time
-under that pass's ``b_`` name. `step_labels` labels a prefill pass by them.
+under that pass's ``b_`` name. `step_labels` labels a prefill pass by them;
+`drafter` hands it each drafter pass's busy time and kernels per rank, from
+which it subtracts the profiler's floor.
 
 The n-th ``ATOM::forward`` range on each rank is the record's n-th line, its
 ``tokens=`` the line's; the ranks and the record must agree on both. A
@@ -98,8 +100,9 @@ def events(path):
 def forwards(path) -> list[dict]:
     """One rank's forwards: each its ``tokens``, its ``kernels``, each
     (start, end, launch return, pass, its drafter pass's line field or None,
-    name), in start order, and ``lost``, its launch calls that name a kernel
-    whose device row the trace does not hold."""
+    name, grid), in start order, the grid None for a copy, a memory set or a
+    kernel replayed from a graph, and ``lost``, its launch calls that name a
+    kernel whose device row the trace does not hold."""
     ranges, runs, marks, launches, kernels, computes = [], [], [], {}, [], set()
     named, rows = [], set()
     for e in events(path):
@@ -119,8 +122,9 @@ def forwards(path) -> list[dict]:
         elif cat in GPU:
             stream = e["args"].get("stream")
             rows.add(e["args"]["correlation"])
+            grid = e["args"].get("grid")
             kernels.append(
-                (ts, ts + e["dur"], e["args"]["correlation"], e["name"], stream)
+                (ts, ts + e["dur"], e["args"]["correlation"], e["name"], stream, grid)
             )
             if cat == "kernel":
                 computes.add(stream)
@@ -141,7 +145,7 @@ def forwards(path) -> list[dict]:
                 "lost": 0,
             }
         )
-    for start, stop, corr, name, stream in kernels:
+    for start, stop, corr, name, stream, grid in kernels:
         if stream not in computes:
             continue
         launch, queued = launches.get(corr, (None, None))
@@ -152,7 +156,7 @@ def forwards(path) -> list[dict]:
         inside = [m[2] for m in f["drafts"] if m[0] <= launch <= m[1]]
         part = "target" if launch < f["end"] and not inside else "draft"
         key = next((m[len(MARK) :] for m in inside), None)
-        f["kernels"].append((launch, start, stop, queued, part, key, name))
+        f["kernels"].append((launch, start, stop, queued, part, key, name, grid))
     for launch, corr in named:
         i = bisect_right(starts, launch) - 1
         if corr not in rows and i >= 0 and out[i]["run"] <= launch <= ranges[i][1]:
@@ -208,7 +212,7 @@ def _walk(kernels):
     """Per kernel in start order: its passes, the union it adds, and the gap
     before it with whether it was queued when the gap opened."""
     end = None
-    for start, stop, queued, part, key, _ in kernels:
+    for start, stop, queued, part, key, *_ in kernels:
         gap = start - end if end is not None and start > end else 0.0
         was = end is not None and queued is not None and queued <= end
         add = stop - max(start, end) if end is not None else stop - start
@@ -232,9 +236,9 @@ def busy(fs: list[dict]) -> list[dict]:
     return out
 
 
-def reduce(out) -> Path:
-    """Write the trace run in `out`'s busy lines beside its record; return
-    their path."""
+def _ranks(out) -> tuple[list[dict], list[list[dict]]]:
+    """The trace run in `out`'s record lines and each rank's forwards, whole
+    and with their collectives aligned."""
     out = Path(out)
     dirs = sorted((out / TRACE).iterdir())
     if not dirs or any(not re.fullmatch(r"rank_\d+", d.name) for d in dirs):
@@ -257,6 +261,13 @@ def reduce(out) -> Path:
         )
     _whole(dirs, ranks)
     _align(ranks)
+    return lines, ranks
+
+
+def reduce(out) -> Path:
+    """Write the trace run in `out`'s busy lines beside its record; return
+    their path."""
+    lines, ranks = _ranks(out)
     per_rank = [busy(fs) for fs in ranks]
     rows = []
     for i, s in enumerate(lines):
@@ -271,6 +282,33 @@ def reduce(out) -> Path:
             if key in s:
                 row["b" + key[1:]] = got[key]
         rows.append(row)
-    path = (out / RECORD).with_suffix(".busy.jsonl")
+    path = (Path(out) / RECORD).with_suffix(".busy.jsonl")
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
     return path
+
+
+def drafter(out) -> list[list[tuple[dict, list]]]:
+    """Per line of the trace run in `out`'s record, per rank: the busy ns of
+    each drafter part `reduce` times on it, ``draft`` and each of `PASSES` the
+    line times, and the draft's kernels, each (its pass's line field or None,
+    name, grid, recorded ns), the grid None as `forwards` holds it; a line
+    with no drafter has neither."""
+    lines, ranks = _ranks(out)
+    per_rank = [busy(fs) for fs in ranks]
+    got = []
+    for i, s in enumerate(lines):
+        parts = ["draft", *(p for p in PASSES if p in s)] if "d_target_ns" in s else []
+        got.append(
+            [
+                (
+                    {p: r[i].get(p, 0) for p in parts},
+                    [
+                        (k[4], k[5], k[6], (k[1] - k[0]) * 1e3)
+                        for k in fs[i]["kernels"]
+                        if parts and k[3] == "draft"
+                    ],
+                )
+                for fs, r in zip(ranks, per_rank)
+            ]
+        )
+    return got

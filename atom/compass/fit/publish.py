@@ -46,6 +46,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.artifacts.keys import platform_key
 from atom.compass.backends.json_file import read_json
+from atom.compass.backends.step_labels import Floor
 from atom.compass.fit.samples import UNRECORDED, load
 from atom.compass.run.step_grid import readings as run_readings
 from atom.compass.spec import MachineSpec
@@ -53,6 +54,16 @@ from atom.compass.validate.runs import SIDES, named_by_prefill
 
 #: The rank a fit whose key states no layout writes at.
 RANK = Topology().ranks()[0]
+#: The engine fields the `measure ops` points a trace run's drafter kernels take
+#: their own lengths from share with its records: what changes a kernel.
+SAME_OPS = (
+    "tensor_parallel_size",
+    "data_parallel_size",
+    "enable_dp_attention",
+    "enable_expert_parallel",
+    "kv_cache_dtype",
+    "speculative",
+)
 
 
 def ranks(key) -> tuple:
@@ -89,10 +100,17 @@ def parser(prog: str, description: str) -> argparse.ArgumentParser:
     return p
 
 
-def inputs(args, sources) -> tuple[list, dict]:
+def inputs(args, sources, ops=()) -> tuple[list, dict]:
     """The samples of `args`' inputs, records each with its client runs and,
     where `sources` holds `replay`, step measurements, and their configuration;
-    a fit taking only `sources` refuses any other input."""
+    a fit taking only `sources` refuses any other input. With `ops`, `measure
+    ops --out` directories read as `fit ops` reads them, a trace run's drafter
+    labels lose the profiler's floor (`step_labels.Floor`), the spec's
+    `device.profiler_floor_s`, each kernel's own length from their points,
+    which refuse unless they ran the records' model, platform, source root
+    and `SAME_OPS`."""
+    from atom.compass.fit import ops as fit_ops
+
     runs = {Path(i): [] for i in args.inputs if (Path(i) / "run.json").is_file()}
     tokens = [i for i in args.inputs if Path(i) not in runs]
     if tokens and "replay" not in sources:
@@ -115,7 +133,12 @@ def inputs(args, sources) -> tuple[list, dict]:
         )
     store = ArtifactStore(args.store)
     measurements = [store.key_from_token(Kind.STEP_MEASUREMENT, t) for t in tokens]
-    samples, config = load(runs, measurements, args.store)
+    spec = MachineSpec.from_mapping(json.loads(Path(args.machine).read_text()))
+    floor = None
+    if ops:
+        points, measured, keyed = fit_ops.read(store, map(Path, ops))
+        floor = Floor(spec.value("device.profiler_floor_s"), points)
+    samples, config = load(runs, measurements, args.store, floor)
     if args.ptl:
         if config.get("ptl") != UNRECORDED:
             raise ValueError(
@@ -123,7 +146,6 @@ def inputs(args, sources) -> tuple[list, dict]:
                 f"none, and these carry {config.get('ptl')!r}"
             )
         config["ptl"] = args.ptl
-    spec = MachineSpec.from_mapping(json.loads(Path(args.machine).read_text()))
     torch = spec.value("device.software_pinned_to.torch")
     stated = {**machine_spec_key(spec).values, "torch": torch}
     ran = platform(config) if runs else stated
@@ -137,6 +159,18 @@ def inputs(args, sources) -> tuple[list, dict]:
             "the records ran on another platform than --machine states: "
             + "; ".join(differ)
         )
+    if ops:
+        want = {"model": config["model"], "machine_spec": machine_spec_digest(spec)}
+        want["source_root"] = config["source_root"]
+        got = {k: keyed.get(k) for k in want}
+        want |= {k: config["engine_config"].get(k) for k in SAME_OPS}
+        got |= {k: measured["engine_config"].get(k) for k in SAME_OPS}
+        differ = [f"{k} {got[k]!r}, not {v!r}" for k, v in want.items() if got[k] != v]
+        if differ:
+            raise ValueError(
+                "the --ops points ran under another configuration than the "
+                "records: " + "; ".join(differ)
+            )
     here = run_readings(
         spec,
         atom_src=Reading(*config["source_root"].split("-", 1)),

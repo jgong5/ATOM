@@ -8,7 +8,8 @@ client runs its server served (`parity.served`). Its ranks are labelled
 together by `step_labels.label_run` under ATOM's two-batch-overlap split rule
 (`validate.bound._split`), and a sample's provenance gains the
 `traces` its step served and whether run.json says it was `profiled`.
-A DP rank no request reached writes a line per dummy forward it runs, and gives
+Under a `step_labels.Floor` a trace run's drafter labels lose the profiler's
+floor. A DP rank no request reached writes a line per dummy forward it runs, and gives
 no sample; its file still counts in the run's digest. An empty
 rank file lost its lines, and refuses.
 A record whose run.json names `aiter_jit_builds` or `ptl_changes` refuses,
@@ -69,14 +70,15 @@ UNRECORDED = "unrecorded"
 
 
 def load(
-    records: Mapping, measurements: Sequence = (), store=None
+    records: Mapping, measurements: Sequence = (), store=None, floor=None
 ) -> tuple[list[Sample], dict]:
     """The samples of `records`, {record directory: the client runs its server
-    served}, and of the `measurements` keys in the store at `store`, in run
-    digest, DP rank and step order; and the configuration they state."""
+    served}, labelled under `floor`, and of the `measurements` keys in the
+    store at `store`, in run digest, DP rank and step order; and the
+    configuration they state."""
     samples, configs = [], {}
     for directory, client_runs in records.items():
-        got, configs[str(directory)] = _record(Path(directory), client_runs)
+        got, configs[str(directory)] = _record(Path(directory), client_runs, floor)
         samples += got
     for key in measurements:
         got, configs[str(key)] = _measurement(ArtifactStore(store), key)
@@ -94,7 +96,7 @@ def load(
     return samples, one
 
 
-def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
+def _record(directory: Path, client_runs, floor=None) -> tuple[list[Sample], dict]:
     run = json.loads((directory / "run.json").read_text())
     if run["format_version"] != FORMAT_VERSION:
         raise ValueError(
@@ -131,7 +133,7 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
     traces = {(s["dp_rank"], s["step"]): s["traces"] for s in _steps(record)}
     files = sorted(steps.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
     name, samples = ", ".join(map(digest, files)), []
-    for got, _ in label_run(files, name, _split):
+    for got, _ in label_run(files, name, _split, floor):
         for s in got:
             at = traces[s.rank, s.step]
             traced = {**s.provenance, "traces": at, "profiled": run["profiled"]}
