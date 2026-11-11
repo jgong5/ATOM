@@ -1360,9 +1360,7 @@ cost exchange stays on, so the delayer's reduce keeps its shape. The floor reach
 `_prefill_room` only: admission still stops taking new rows once a rank's step cost
 reaches the target (the `_tick_cost < _tick_cost_limit` guard in `Scheduler`'s prefill
 admission), so a designed step puts its costly row last, or gives every rank a first row
-of about one cost, which leaves each rank under the target after it. Balancing's
-truncation of a fractional cost ([#2695](https://github.com/jgong5/ATOM/issues/2695)) is
-ATOM's to fix; the sweep does not need it.
+of about one cost, which leaves each rank under the target after it.
 
 **Two segments.** The ranks share one walk: each token count runs once per container,
 its rank chosen by the count. The ranks write one set of cache roots, so one compile
