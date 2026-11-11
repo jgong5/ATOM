@@ -37,7 +37,9 @@ as that leaf writes it (`Stub._index`), and the logits plane its scorer
 writes, which a top-k or the pick's block maxima ranks (`PAGE_WIDE`), is
 each copy's own, drawn for a top-k or block maxima as an activation is,
 below each row's bound (`_scores`). A `Stub` calls each leaf from its
-contract: an activation is random at its shape, dtype and stride, except such
+contract: a tensor the capture states on the host is built there on every
+copy, as an activation is, pinned (`_host`); an
+activation is random at its shape, dtype and stride, except such
 a table, the placement's, a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
 experts' ids ATOM fuses into them (`_route`), the `NM_OUTPUT` slot at
@@ -1021,6 +1023,8 @@ class Stub:
                     live = live | {"scheduled_tokens_gpu": info.gpu[i : i + 1]}
             for path, spec in _specs(op["args"]):
                 index = self.paged and _written(op, path)
+                if spec.get("device") == "cpu":  # `_copy` builds it on the host
+                    continue
                 if spec["role"] == "metadata" or index:
                     token = (op["op"], path) in TOKEN_IDS
                     pool = {"input_ids": input_ids} if token else live
@@ -1508,6 +1512,8 @@ class Stub:
                 return seq(
                     build(f"{path}.{i}", v, old and old[i]) for i, v in enumerate(value)
                 )
+            if isinstance(value, dict) and value.get("device") == "cpu":
+                return _host(value, self.runner.device.type != "cpu")
             if path == ids:  # copy c's own rows of the one table
                 out = self._tensor(value, meta.get((sig, path)), True)
                 n, rows = out.numel(), op["args"][table]["shape"][0]
@@ -1648,6 +1654,8 @@ class Stub:
                     build(f"{path}.{i}", v, o)
                     for i, (v, o) in enumerate(zip(value, old))
                 )
+            if isinstance(value, dict) and value.get("device") == "cpu":
+                return old  # the copy's own, built on the host
             if isinstance(value, dict) and value.get("role") == "weight":
                 return self._weight(value, c, op["occurrences"])
             if isinstance(value, dict) and self._routed(value, sig, path, drafted):
@@ -2528,6 +2536,17 @@ def _random(spec, device) -> torch.Tensor:
     else:
         flat = torch.zeros(n, device=device, dtype=dtype)
     return flat.as_strided(spec["shape"], spec["stride"])
+
+
+def _host(spec, pinned) -> torch.Tensor:
+    """`spec` on the host, drawn as `_random` draws it, in pinned memory when
+    `pinned`: a CUDA graph replays a copy from pinned memory only, and a
+    capture cannot tell pinned from pageable."""
+    drawn = _random(spec, "cpu")
+    out = torch.empty_strided(
+        drawn.shape, drawn.stride(), dtype=drawn.dtype, device="cpu", pin_memory=pinned
+    )
+    return out.copy_(drawn)
 
 
 def _scores(plane, ends, spec) -> None:
