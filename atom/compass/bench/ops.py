@@ -427,8 +427,9 @@ V4_LISTS = {
 #: DeepSeek-V4.1's arguments, keyed as `V4_METADATA`'s, and the buffers ATOM
 #: passes each (`_named`), at the leaf's ratio (`_ratio`), as `_bound` names
 #: them: the paged cache's, the pass's step (`step.`), the decoder plan
-#: (`plan.`), the scorer workspace (`workspace.`), the forward context; or
-#: past one, its first row (`.0`) or it widened to int64 (`.long`).
+#: (`plan.`), the scorer workspace (`workspace.`), the forward context or the
+#: runner's buffers; or past one, its first row (`.0`) or it widened to int64
+#: (`.long`).
 _CACHE = "attn_metadata_builder.cache.indptr_buffers.{ratio}"
 _STAGED = "attn_metadata_builder.cache._cursor_staging.gpu"
 _LOGITS = (
@@ -468,6 +469,11 @@ V41_NAMES = {
     ("aten.index_select.default", "index", "kv"): "step.slots",
     ("aten.index_select.default", "index", "metadata"): "plan.last",
     ("aten.index.Tensor", "indices"): "plan.query_ptrs",
+    # the tables a replay's queries take their pointers from at its last
+    # layer's ratio, `pptr[query_ptrs]` then `eptr[query_ptrs]`: the first binds
+    ("aten.index.Tensor", "self", "kv"): (f"{_CACHE}.0", f"{_CACHE}.1"),
+    # the sampler's request of each draft row, a search of its drafts' counts
+    ("aten.searchsorted.Tensor", "sorted_sequence"): "cu_num_draft_tokens",
     ("aten.index_put_.default", "indices"): ("plan.tail_rows", "plan.last_rows"),
     # the cursor write, `cursor[step.slots[:n].long()] = staged[:n]`, whose
     # values at one row are the staging's first, its unit dim dropped
@@ -1348,6 +1354,11 @@ class Stub:
             for op, _ in found.values()
             if op["op"] == _FUSED
         }
+        # and its last layer's, whose tables a replay's queries take their
+        # pointers from (`QueryRows.indices`)
+        model = self.runner.model
+        if (last := getattr(model, "last_layer", None)) is not None:
+            self.known |= {("queries", None): model.topology[last].ratio}
         bind = {
             (s, path): (spec, _named(op, path, spec, held, self.known) or held)
             for s, (op, _) in found.items()
@@ -2054,7 +2065,8 @@ def _ratio(op, path, known=None):
     `known` gives the rows a page holds at it (`rows_per_page`, V4.1's index
     build, 0 when it takes no selection) or the width of the logits it reads
     (`stride0`, V4.1's top-k, its scorer's), or a RoPE's positions the rows its
-    compress plan holds (`compressed`)."""
+    compress plan holds (`compressed`), or aten's index its table its model's
+    last layer's (`queries`), where a replay's queries take their pointers."""
     args, (slot, *rest) = op["args"], path.split(".")
     listed = args.get("ratios")
     if rest and isinstance(args.get(slot), list) and isinstance(listed, list):
@@ -2067,6 +2079,8 @@ def _ratio(op, path, known=None):
         ratio = known.get(("stride0", args["stride0"]))
     if ratio is None and known and (op["op"], path) == (_ROPE, "positions"):
         ratio = known.get(("compressed", args[path]["shape"][-1]))
+    if ratio is None and known and (op["op"], path) == ("aten.index.Tensor", "self"):
+        ratio = known.get(("queries", None))
     return ratio
 
 

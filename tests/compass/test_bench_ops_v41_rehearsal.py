@@ -66,6 +66,11 @@ HOST_COPY = "aten.to.dtype_layout"
 #: the source of each copy of its staged cursors and slots, and a fill's value
 #: that is a Python number.
 HOSTED = {("aten.copy_.default", "src"), ("aten.fill_.Tensor", "value")}
+#: aten's leaves of V4.1 whose table, not an index, is bound by name: the
+#: sampler's search of each request's draft counts, and the gather of a
+#: replay's queries' pointers.
+SEARCH = "aten.searchsorted.Tensor", "sorted_sequence"
+GATHER = "aten.index.Tensor", "self"
 
 
 def _run(script, *argv, cwd=TREE):
@@ -177,6 +182,22 @@ def test_each_leaf_takes_the_buffers_atom_s_capture_passes_it(rehearsed):
     assert checked and wrong == []
 
 
+def test_a_searched_or_gathered_table_is_one_atom_s_capture_passes(rehearsed):
+    """The sampler's search takes its drafts' counts at a decode, and the
+    queries' pointer gather, passed the prefix table and then the extend table
+    at the last layer's ratio, one of them at a prefill, cached or not."""
+    got, truth = rehearsed
+    taken = [
+        (r["shape"], (r["op"], slot), name, truth[r["leaf"]][slot])
+        for r in [*got["cached"], *got["fresh"]]
+        for slot, name in r["identity"].items()
+        if (r["op"], slot) in (SEARCH, GATHER) and r["shape"] != "prefill T=128 B=1"
+    ]
+    assert all(name in want for *_, name, want in taken), taken
+    shapes = {(s, leaf) for s, leaf, *_ in taken}
+    assert {("decode B=16", SEARCH), ("prefill T=2048 B=1", GATHER)} <= shapes
+
+
 def test_a_leaf_s_later_occurrences_take_what_atom_passes_them():
     """Copies of a leaf that runs twice alternate its occurrences' buffers:
     the tail's batch ids, then its layer 39's queries'."""
@@ -228,3 +249,14 @@ def test_the_cursor_write_s_values_are_its_staging_s_first_rows(shape):
     op = {"op": "aten.index_put_.default", "args": {"self": {"role": "kv"}}}
     _, view = ops._kv(spec, "values", ops._named(op, "values", spec, held) or held)
     assert (view.data_ptr(), list(view.shape)) == (staged.data_ptr(), shape)
+
+
+def test_the_queries_pointer_gather_takes_its_last_layer_s_prefix_table():
+    """At the ratio the last layer runs, not the first ratio's by layout."""
+    cache = "attn_metadata_builder.cache.indptr_buffers"
+    held = {f"{cache}.{n // 2}.{n % 2}": torch.zeros(129).int() for n in range(6)}
+    spec = {"shape": [129], "stride": [1], "dtype": "torch.int32", "role": "kv"}
+    op = {"op": GATHER[0], "args": {"self": spec}}
+    known = {("rows_per_page", 64): 1, ("rows_per_page", 2): 2, ("queries", None): 2}
+    pool = ops._named(op, "self", spec, held, known) or held
+    assert ops._kv(spec, "self", pool)[0] == f"{cache}.2.0"
