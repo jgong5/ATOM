@@ -34,8 +34,8 @@ forward writes is written from ids spread over each token's compressed rows
 leaf of its forward writes (`_WRITTEN`) is written for the reading leaf's pass
 as that leaf writes it (`Stub._index`), and the logits plane its scorer
 writes, which a top-k or the pick's block maxima ranks (`PAGE_WIDE`), is
-drawn as an activation is, below each row's bound, on every copy
-(`_scores`). A `Stub` calls each leaf from its
+each copy's own, drawn for a top-k or block maxima as an activation is,
+below each row's bound (`_scores`). A `Stub` calls each leaf from its
 contract: an activation is random at its shape, dtype and stride, except such
 a table, the placement's, a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
@@ -1550,6 +1550,10 @@ class Stub:
                     if (ends := meta.get((sig, bound), ("", None))[1]) is not None:
                         out = out if fresh else _clone(out)
                         _scores(out, ends, value)
+                # and each copy of the scorer writes a plane of its own
+                written = self.paged and value["role"] == "metadata"
+                if written and (op["op"], path) == (_LOGITS, "out_logits"):
+                    out = out if fresh else _clone(out)
                 return out
             if isinstance(value, str) and value.startswith("torch."):
                 return getattr(torch, value[6:], value)
