@@ -645,7 +645,7 @@ LATER += [
     _at(_later(b), f"prefill T={t} B={b}", b * 1e3) for t, b in ((60, 1), (80, 2))
 ]
 LATER += [_at(_later(4), f"prefill T={t} B=1 W=4", 4e3) for t in (60, 4)]
-EITHER = "a count it leads with is both its rows' and its width's, so it ran at "
+EITHER = "it leads with its T, a count of its width too, so it ran at "
 
 
 def test_fit_ops_leaves_out_by_name_a_point_that_ran_its_leaf_at_either_b():
@@ -699,7 +699,7 @@ def test_a_leaf_over_a_prompt_s_tokens_keeps_its_t_is_w_point_and_prices_there(
     tokens, width
 ):
     # 10 ns a token, flat over a decode's context, at 60 and 80 tokens and at 4
-    # padded to 4: its family reads its T alone, which either B leaves at 4
+    # padded to 4: its family reads its T alone, so either B prices it alike
     points = [_at(_tokens(2), "decode B=2", 20.0, c) for c in (1000, 3000)]
     points += [_at(_tokens(n), f"prefill T={n} B=1", n * 10.0) for n in (60, 80)]
     points += [_at(_tokens(4), "prefill T=4 B=1 W=4", 40.0)]

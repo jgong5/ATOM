@@ -320,9 +320,10 @@ def test_coverage_leaves_out_a_prompt_whose_t_is_its_w_where_a_run_declines_it(
     bench, tmp_path, monkeypatch  # noqa: F811
 ):
     # Beside prompts of one row padded to 4 and to 8, one of 4 tokens padded to
-    # 4, whose leaves lead with its T and its W alike: those of a family that
-    # reads B, its LM head, attention, drafter's later pass and sampler, ran
-    # at 1 row or 4 and are left out; its GEMM and first pass read T alone
+    # 4, whose leaves lead with its T and its W alike: its LM head, drafter's
+    # later pass and sampler, whose families read B, ran at 1 row or 4; its
+    # attention, whose point there the fit left out, is below its measured T
+    # at either; its GEMM and first pass read T alone and stay covered
     padded = [
         PROMPT | {"rows": [[t, t, False]], "target_bs": w, "draft_bs": w}
         for t, w in ((40, 4), (60, 8), (4, 4))
@@ -330,14 +331,21 @@ def test_coverage_leaves_out_a_prompt_whose_t_is_its_w_where_a_run_declines_it(
 
     _, report = _plan_mtp(bench, tmp_path, monkeypatch, *padded)
 
-    why = "a count it leads with is both its rows' and its width's, so it ran at "
+    records = (tmp_path / "out" / "plan.jsonl").read_text().splitlines()
+    fitted = fit_ops.fit([r for r in map(json.loads, records) if "refused" not in r])
+    left = {(p["shape"], p["op"]) for p in fitted["left_out"]}
+    assert left == {
+        ("prefill T=4 B=1 W=4", f"aiter.{op}")
+        for op in ("attn", "head", "step", "sample")
+    }
+    why = "it leads with its T, a count of its width too, so it ran at "
     why += "T=# B=# or T=# B=#"
     assert report["by part"] == {
         "target": {"steps": 4, "covered": 3},
         "draft": {"steps": 4, "covered": 3},
     }
     assert report["left out, by leaf kind"] == {
-        "aiter.attn": {why: 1},
+        "aiter.attn": {"T = # is outside the measured # to #": 1},
         "aiter.head": {why: 1},
         "draft aiter.sample": {why: 1},
         "draft aiter.step": {why: 1},

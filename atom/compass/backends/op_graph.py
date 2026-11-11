@@ -266,14 +266,7 @@ def gathered_off_default(
     return None if gathered == dp * rows else gathered
 
 
-def _leads(leaf: dict) -> set:
-    """The counts an activation, metadata or output of `leaf` leads with."""
-    args = _tensors(list(leaf["args"].values()))
-    shapes = [a["shape"] for a in args if a["role"] in ("activation", "metadata")]
-    return {n for s in shapes + leaf["out"] for n in s[:1]}
-
-
-def _ran_at(leaf: dict, bound: tuple, leads: set | None = None) -> tuple:
+def _ran_at(leaf: dict, bound: tuple) -> tuple:
     """`bound` at the rows `leaf` ran: a padded target's or drafter's
     (`_bound`) at its width where an activation, metadata or output of the
     leaf leads with the width's counts and none with the rows', at both
@@ -281,22 +274,23 @@ def _ran_at(leaf: dict, bound: tuple, leads: set | None = None) -> tuple:
     if len(bound) != 4:
         return bound
     rows, wide, both, (counts, wides) = bound
-    leads = _leads(leaf) if leads is None else leads
+    args = _tensors(list(leaf["args"].values()))
+    shapes = [a["shape"] for a in args if a["role"] in ("activation", "metadata")]
+    leads = {n for s in shapes + leaf["out"] for n in s[:1]}
     return (both if leads & counts else wide) if leads & wides else rows
 
 
 def _ran_at_each(leaf: dict, bound: tuple) -> list:
-    """`_ran_at`'s bound, then, where `leaf` leads with a padded prefill's T
-    that is also a count of its width, each other bound it may have run at:
-    that T its rows' count alone, or its width's alone."""
-    if len(bound) != 4:
-        return [bound]
-    *at, (counts, wides) = bound
-    leads, prefill, each = _leads(leaf), at[0][0] == "prefill", []
-    either = leads & counts & wides & {at[0][1]} if prefill else set()
-    for sets in ((counts, wides), (counts, wides - either), (counts - either, wides)):
-        if (got := _ran_at(leaf, (*at, sets), leads)) not in each:
-            each.append(got)
+    """`_ran_at`'s bound, then, where a padded prefill's T is also a count of
+    its width, each other bound `leaf` may have run at: that T its rows'
+    count alone, or its width's alone."""
+    each = [_ran_at(leaf, bound)]
+    if len(bound) == 4 and bound[0][0] == "prefill":
+        *at, (counts, wides) = bound
+        t = {at[0][1]} & wides
+        for sets in ((counts - t, wides), (counts, wides - t)):
+            if (got := _ran_at(leaf, (*at, sets))) not in each:
+                each.append(got)
     return each
 
 

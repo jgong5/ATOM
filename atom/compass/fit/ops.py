@@ -338,14 +338,11 @@ def fit(points) -> dict:
 
 
 def _either(counts) -> str:
-    """Why a leaf that may have run at each of `counts`, which read it at two
-    places in its family, is read at none of them."""
+    """Why a leaf that may have run at each of `counts` is read at none."""
     ran = " or ".join(
         " ".join(f"{k}={v}" for k, v in n.items() if v is not None) for n in counts
     )
-    return (
-        f"a count it leads with is both its rows' and its width's, so it ran at {ran}"
-    )
+    return f"it leads with its T, a count of its width too, so it ran at {ran}"
 
 
 def interpolate(points: dict, at: tuple, dims):
@@ -461,9 +458,8 @@ class PriceList(CostSource):
     a decode step's rows' mean context over its B in `PERMILLE` of their max,
     where the family was measured on ragged rows; a collective's family
     (`bench.ops.exchange`) at its message bytes. A leaf asked at the list of
-    bounds it may have run at (`op_graph._ran_at_each`) is answered where they
-    all read it, and declined, naming them, where they read it at two places
-    in its family. It also
+    bounds it may have run at (`op_graph._ran_at_each`) takes the answer they
+    all give, and is declined, naming them, where they differ. It also
     declines inside a gap the fit declined, and prefill rows whose cached
     tokens from that mean to their max cross into another kernel. An answer
     between points is validated when every line it interpolates along holds
@@ -482,31 +478,16 @@ class PriceList(CostSource):
         self._index = functools.cache(self._index)
 
     def price(self, request: tuple) -> CostTerm | Refusal:
-        (leaf, bound, _), kind = request, request[0]["op"]
-        each, asked = bound if isinstance(bound, list) else [bound], []
-        for b in each:
-            if (got := self._asked(leaf, b)) not in asked:
-                asked.append(got)
-        if asked[1:]:
-            return self.refuse(
-                f"{kind}: " + _either(dict(zip("TBG", b[1:4])) for b in each)
-            )
-        if isinstance(asked[0], str):
-            return self.refuse(f"{kind}: {asked[0]}")
-        got = self._lookup(*asked[0])
-        if isinstance(got, str):
-            return self.refuse(f"{kind}: {got}")
-        method = Method.MEASURED if got[1] else Method.ESTIMATED
-        return CostTerm(
-            f"op.{kind}", got[0] * 1e-9, Provenance(method, validated=got[2])
-        )
-
-    def _asked(self, leaf: dict, bound: tuple) -> tuple | str:
-        """The family, coordinates and top context `leaf` at `bound` is looked
-        up at, or why it is not."""
         from atom.compass.bench.ops import exchange, signature
 
-        phase, *counts, last = bound
+        if isinstance(request[1], list):  # each bound it may have run at
+            leaf, bounds, work = request
+            got = [self.price((leaf, b, work)) for b in bounds]
+            if all(g == got[0] for g in got):
+                return got[0]
+            ran = _either(dict(zip("TBG", b[1:4])) for b in bounds)
+            return self.refuse(f"{leaf['op']}: {ran}")
+        (leaf, (phase, *counts, last), _), kind = request, request[0]["op"]
         at = dict(zip(("T", "B", "G", "context"), counts))
         shape = phase if at["G"] is None else f"{phase} G={at['G']}"
         if ex := exchange(leaf):  # a collective: its family over its message bytes
@@ -515,13 +496,19 @@ class PriceList(CostSource):
         else:
             name = self._family(shape, signature(leaf))
         if name is None:
-            return "no point of its signature was measured"
+            return self.refuse(f"{kind}: no point of its signature was measured")
         dims, top = self.params["families"][name]["dims"], None
         if phase == "decode":
             at["mean"] = PERMILLE * last / at["context"]
         elif dims[-1:] == ["context"] and last != at["context"]:
             top = last
-        return name, tuple(at[d] for d in dims), top
+        got = self._lookup(name, tuple(at[d] for d in dims), top)
+        if isinstance(got, str):
+            return self.refuse(f"{kind}: {got}")
+        method = Method.MEASURED if got[1] else Method.ESTIMATED
+        return CostTerm(
+            f"op.{kind}", got[0] * 1e-9, Provenance(method, validated=got[2])
+        )
 
     def _family(self, shape: str, sig: str) -> str | None:
         """The family of a leaf of signature `sig` at `shape`, or None."""
