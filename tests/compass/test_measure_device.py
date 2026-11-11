@@ -9,6 +9,7 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
+from test_artifact_invalidation import STANZA
 
 from atom.compass import cli
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
@@ -63,6 +64,7 @@ def node(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(measure_device, "_ptl", lambda gpus: "disabled")
     monkeypatch.setattr(measure_device, "_stack", lambda: STACK)
+    monkeypatch.setattr(measure_device, "roots_for", lambda m: STANZA.source_roots)
     monkeypatch.setattr(measure_device.socket, "gethostname", lambda: "mi355-gpu-40")
     showbus = {f"card{g}": {"PCI Bus": bus.upper()} for g, bus in BUS.items()}
     monkeypatch.setattr(measure_device, "smi", lambda *a: json.dumps(showbus))
