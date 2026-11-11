@@ -348,6 +348,29 @@ class _LockstepRank:
         self.barrier.wait()
 
 
+def _v4_pro_dp8(monkeypatch, slack, **config):
+    """A maker of DeepSeek-V4-Pro DP 8 rank schedulers as #975's prefill side
+    runs them: the default balancing weight and floor, a 16384-token budget and
+    a 256-token chunk grid. A delayer's reduce goes to its group's all_reduce."""
+    monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", "360000")
+    monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_SLACK", str(slack))
+    monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_MIN_TOKENS", "4096")
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda buf, op, group: group.all_reduce(buf)
+    )
+    config = {
+        "max_num_seqs": 8,
+        "num_kvcache_blocks": 256,
+        "kv_cache_block_size": 256,
+        "max_model_len": 65536,
+        "max_num_batched_tokens": 16384,
+        "enable_dp_attention": True,
+        "parallel_config": SimpleNamespace(data_parallel_size=8),
+        **config,
+    }
+    return lambda: Scheduler(MockConfig(**config))
+
+
 def test_the_costliest_rank_runs_whole_when_its_cost_is_fractional(
     monkeypatch, seq_factory
 ):
@@ -355,26 +378,12 @@ def test_the_costliest_rank_runs_whole_when_its_cost_is_fractional(
     run each step's first tick through real delayers, one thread a rank: no row
     is cut, the costliest rank's last row included, whose cost ends in .5 in
     15 of the 32 steps."""
-    monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", "360000")
-    monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_SLACK", "7")
-    monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_MIN_TOKENS", "4096")
-    monkeypatch.setattr(
-        torch.distributed, "all_reduce", lambda buf, op, group: group.all_reduce(buf)
-    )
-    config = {
-        "max_num_seqs": 8,
-        "num_kvcache_blocks": 128,
-        "kv_cache_block_size": 256,
-        "max_model_len": 32768,
-        "max_num_batched_tokens": 16384,
-        "enable_dp_attention": True,
-        "parallel_config": SimpleNamespace(data_parallel_size=8),
-    }
+    make = _v4_pro_dp8(monkeypatch, 7)
     cut = {}
     for k, line in enumerate(_SLACK7_ROW2.strip().splitlines()):
         rows = [[1 + (3 * k + r) % 16, int(n)] for r, n in enumerate(line.split())]
         bufs, barrier = [None] * 8, threading.Barrier(8, timeout=60)
-        scheds = [Scheduler(MockConfig(**config)) for _ in rows]
+        scheds = [make() for _ in rows]
         for r, sched in enumerate(scheds):
             group = _LockstepRank(r, bufs, barrier)
             sched.set_prefill_delayer(
@@ -388,3 +397,26 @@ def test_the_costliest_rank_runs_whole_when_its_cost_is_fractional(
         if ran != rows:
             cut[k] = {r: (rows[r], ran[r]) for r in range(8) if ran[r] != rows[r]}
     assert not cut
+
+
+@pytest.mark.parametrize("start, left", [(32768, 4313), (32768, 10821), (0, 5001)])
+def test_a_rank_prefilling_alone_takes_its_odd_final_chunk_whole(
+    monkeypatch, seq_factory, start, left
+):
+    """#2829's probe: a rank prefilling alone sets the target to its own cost,
+    which ends in .5 for an odd chunk. The `left` tokens after `start` cached
+    ones run in one forward, not cut to the grid with the rest a forward later."""
+    sched = _v4_pro_dp8(monkeypatch, 0.1, enable_prefix_caching=True)()
+    group = _LockstepRank(0, [None], threading.Barrier(1))
+    sched.set_prefill_delayer(
+        PrefillDelayer(1, group, 16384, exchange_prefill_costs=True)
+    )
+    prefix = list(range(100, 100 + start))
+    if start:
+        bm, cached = sched.block_manager, seq_factory(prefix, block_size=256)
+        bm.allocate(cached, 0)
+        bm.hash_blocks(cached, start)
+        bm.deallocate(cached)
+    sched.add(seq_factory(prefix + list(range(50000, 50000 + left)), block_size=256))
+    batch, _ = sched.schedule()
+    assert [int(t) for t in batch.num_scheduled_tokens] == [left]
