@@ -927,6 +927,26 @@ def test_each_copy_of_a_v41_index_leaf_ranks_a_logits_plane_of_its_own():
             assert plane[0, 50:].eq(0).all() and plane[1, 20:].eq(0).all()
 
 
+def test_each_copy_of_a_v41_index_scorer_writes_a_logits_plane_of_its_own():
+    # V4.1's FP8 plane, which ATOM's preparation leaves as it was, at three
+    # placements of decode B=2: they share one clone of it
+    runner = _Runner()
+    geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(2, 64)
+    scorer = _leaf(ops._LOGITS, ("out_logits", _t([2, 64], "metadata")))
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(scorer, layers=1)["region"])
+    for p in range(3):
+        stub._prepare((4 * p, 2 * p))
+    [(sig, (op, instances))] = stub.leaves.items()
+    assert len({m[sig, "out_logits"][1].data_ptr() for _, m in stub.placed}) == 1
+
+    # copy c at placement c
+    planes = [stub._copy(op, sig, instances, c)[0]["out_logits"] for c in range(3)]
+    assert len({plane.data_ptr() for plane in planes}) == 3
+
+
 def test_an_embedding_reads_the_token_ids_atom_prepared():
     runner = _Runner()
     # An index buffer whose name holds the slot's, which the name rule picks.
