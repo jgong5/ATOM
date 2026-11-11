@@ -16,7 +16,7 @@ import pytest
 import torch
 from test_capture_ir import _ops, _record
 from test_dp_step_max import runner
-from test_op_graph import g
+from test_op_graph import g, in_thread
 from test_op_graph_drafter import _lookup
 from test_work import SPEC
 
@@ -25,6 +25,7 @@ from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.work import gemm, price
 from atom.compass.capture import population_shapes
+from atom.compass.capture.forward import Shape
 from atom.compass.runner import projection
 from atom.utils.forward_context import ForwardMode
 from atom.utils.tbo import ubatching
@@ -193,10 +194,11 @@ def test_the_run_s_lookup_reads_a_prefill_s_drafter_at_its_width(monkeypatch, tm
 def test_a_run_traces_a_prefill_s_drafter_no_graph_holds_at_its_width(
     monkeypatch, tmp_path
 ):
-    from atom.compass.bench import ops
+    from atom.compass import run
 
     traced, lazy = [], {"lazy_traces": 0, "lazy_trace_wall_seconds": 0}
-    monkeypatch.setattr(ops, "_child", lambda *a: traced.append(a[-1]) or {})
+    in_thread(monkeypatch)
+    monkeypatch.setattr(run, "_trace", lambda *a: traced.append(a[-1]) or {})
     stored = {
         ("prefill", "prefill T=9 B=3 W=4", False): g(9, 64, 64),
         ("prefill", "prefill T=9 B=3", True): g(3000, 64, 64),
@@ -208,7 +210,7 @@ def test_a_run_traces_a_prefill_s_drafter_no_graph_holds_at_its_width(
         OpGraphBackend(SPEC, lookup, kv="bf16", drafts=1).price(view)
 
     # A shape, not its text: the capture's cut sets `running_bs` from its width.
-    assert traced == [("prefill", 9, 3, None, 4)] and traced[0].width == 4
+    assert traced == [Shape("prefill", 9, 3, None, 4)] and traced[0].width == 4
     assert lazy["lazy_traces"] == 1
 
 

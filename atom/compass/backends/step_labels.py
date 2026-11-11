@@ -15,7 +15,12 @@ rebuilds `moe_tokens` from every rank's line, and, when its host key's engine
 states `enable_tbo`, the caller's `split_rule`, ATOM's two-batch-overlap split
 over those lines, rebuilds `tbo_tokens`; with no rule such a line refuses.
 No line states its group's dummy forwards: a view's `group_dummies` counts the
-run's rank records whose line at its step is a dummy run (`group_dummies`).
+run's rank records whose line at its step is a dummy run (`group_dummies`), and
+its `group_max_tokens` is the most tokens their lines at its step run
+(`group_peaks`).
+A view also takes its line's `target_bs`, `draft_bs`, `draft_moe_rows` and
+`draft_rows`, the widths and rows its target and drafter ran at, which an op
+graph reads.
 
 A decode step's device label is its device busy time, `d_busy_ns`, plus the
 device work queued since the previous forward's exit, `d_gap_ns`. A decode step
@@ -35,8 +40,17 @@ the target's, `d_target_ns` with no gap, and the draft label is the rest of
 `d_busy_ns`. A decode's draft-KV pass, `d_draft_kv_ns`, runs before
 `forward_done_event`: its device label holds it, as its draft-KV label too,
 and its draft label does not. A device event runs no earlier than the host
-records it, so the largest launch record less its device start, over the
-record, is the host clock's lead there.
+records it, so a launch record less its device start bounds the host clock's
+lead from below, and an MTP status wait's return less the `forward_done_event`
+it waits for bounds it from above. The clocks drift apart over a record, and
+the tightest of the last `ANCHORS` status-wait bounds (of the first, before as
+many) follows them: a step's lead is the largest launch bound moved by how far
+that tightest bound moved since, leaving out any above it at its own launch,
+whose host stalled before stamping it; with no status wait, the largest launch
+bound over the record. A decode's draft label, its `propose`
+pass, is cut where the device reached the pass, placed by that lead, before
+the host's draft copy wait (`t_draft_recv_ns`) began: the host queues the pass
+just before that wait, so the window may hold the device's wait for it.
 
 A prefill step's labels are a trace run's busy time per pass (`parity.busy`),
 which a trace run's record joins from `dp<r>.busy.jsonl` beside it: the device
@@ -54,21 +68,14 @@ A record without device windows is refused. A step mixing prefill and decode
 rows is cut. A step of an MTP record without `d_target_ns` is cut as
 `unsplit`: its device label would hold a draft the law prices again.
 
-An output forward's view takes `start_lag_s`: its device start, placed by the
-lead, less the exit of its token copy wait (`t_recv_ns`, else `t_read_ns`,
-else its launch's end). A trace run's states none: its host ran under the
-profiler.
-
 A step's host labels are its segments: `E` from the previous forward's exit,
 cut as idle after an idle engine (`busy_gaps`); `W_pre` to the launch, less
 the staging gate's wait; `W_launch` from the launch to the token copy wait,
 the sampler's launch included, or to the launch's end on a forward with no
-such wait, and none on a prefill the host did not pace whose launch ends
-after its device ran `HELD_SHARE` of its device window, placed by the lead:
-that launch waited on the device; `W_post` from that wait's end to the exit,
-less the draft copy wait, and a middle chunk has none. A prefill is host-paced
-when its exit event ran less than `PACED_SHARE` of its device window after the
-host recorded it. With an MTP status wait,
+such wait, less the time its line's `blocked_ns` states the launch thread
+spent in HIP's blocking calls, there waiting on the device; a line without
+`blocked_ns` gives its wall time; `W_post` from that wait's end to the exit,
+less the draft copy wait, and a middle chunk has none. With an MTP status wait,
 `W_pre` ends at it and `W_inputs` runs from it to the launch. On a later
 pipeline stage, `W_recv` runs from the launch to the receive of its input.
 Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
@@ -98,28 +105,21 @@ import itertools
 import json
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.shape import BatchView, RequestShape
 
-#: Token copy wait exits whose tightest bound is a step's host clock lead.
+#: The recent bounds whose tightest places a step on the host clock, of either
+#: window: token copy wait exits for the launch-exposed cut, MTP status-wait
+#: returns for the lead.
 ANCHORS = 32
 #: Why a device label is cut: a launch-exposed decode, mixed rows, no MTP target
 #: end, a prefill with no traced busy time, a trace run's decode.
 CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced")
 #: The directory beside a trace run's `steps` its traces are in (`parity.busy`).
 TRACE = "trace"
-#: A prefill's exit event running less than this share of its device window after
-#: its host record makes it host-paced: between the two clusters the DSpark TP2
-#: records show, host-paced output prefills at 0 to 4.3%, device-paced at 11% up.
-PACED_SHARE = 0.08
-#: A prefill whose launch ends after its device ran more than this share of its
-#: device window waited on the device inside the launch. On the DeepSeek-V4-Pro
-#: DPA8 MI355X records, launches over 0.5 s end past it on 99.5%, shorter ones
-#: before it on 99.2%.
-HELD_SHARE = 0.2
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
 TABLE_VERSION = 1
 #: run.json's entry naming the JIT modules and kernels its server compiled while
@@ -143,7 +143,9 @@ class Sample:
     """One real forward, labelled.
 
     `device_s` is its device label, None when cut, and `cut` names why (`CUTS`).
-    `draft_s` is its draft label, None when cut or on a step with no draft.
+    `draft_s` is its draft label, None when cut, on a step with no draft, or
+    on a decode whose device reached its `propose` pass before the host's
+    draft copy wait.
     `propose_s` is its propose label, the part of `draft_s` that is the
     `propose` pass, on a prefill step that produces output; None elsewhere.
     `draft_kv_s` is its draft-KV label, the part of `device_s` that is the
@@ -156,7 +158,10 @@ class Sample:
     `dummies` holds the steps its rank ran as a DP dummy forward, which give no
     sample: the same set on each of the rank's samples.
     `admitted` is `(requests, uncached, cached)` of the requests it admits
-    (`admissions`).
+    (`admissions`). `launch` is its line's, what its launch ran per launch
+    feature (`launch_features`), empty on a line that states none.
+    `blocked` is the seconds its `W_launch` left out per blocking HIP call
+    that blocked, from its line's `blocked_ns`; None on a line without it.
     """
 
     step: int
@@ -172,6 +177,8 @@ class Sample:
     dummies: frozenset = frozenset()
     draft_kv_s: float | None = None
     admitted: tuple = (0, 0, 0)
+    launch: dict = field(default_factory=dict)
+    blocked: dict | None = None
 
 
 def admissions(lines: list[dict]) -> list[tuple[int, int, int]]:
@@ -211,6 +218,18 @@ def group_dummies(ranks: Iterable[list[dict]]) -> Counter:
     return Counter(s["step"] for lines in ranks for s in lines if s["is_dummy_run"])
 
 
+def group_peaks(ranks: Iterable[list[dict]]) -> dict[int, int]:
+    """Per step, the most tokens any of `ranks`, one run's rank records as their
+    lines, runs at it, a dummy rank's its rows': ATOM's largest
+    `num_tokens_across_dp`."""
+    peaks: dict[int, int] = {}
+    for lines in ranks:
+        for s in lines:
+            tokens = sum(q for q, _, _ in s["rows"])
+            peaks[s["step"]] = max(tokens, peaks.get(s["step"], 0))
+    return peaks
+
+
 def _peers(path: Path) -> list[Path]:
     """The rank records of `path`'s run, itself among them: those beside it."""
     return sorted(path.parent.glob(path.name.split("dp")[0] + "dp*[0-9].jsonl"))
@@ -229,42 +248,74 @@ def host_kind(view: BatchView) -> str:
     return "prefill" if view.prefill else "decode"
 
 
-def _timed(lines) -> tuple[list[tuple[dict, int]], int]:
-    """Each line with a device window and its device start, gaps and busy
-    times summed; and the host clock's lead over that device clock."""
-    device, timed = 0, []
+def _timed(lines) -> list[tuple[dict, int, int, int | None]]:
+    """Each line with a device window, its device start, gaps and busy times
+    summed, the host clock's lead over that device clock there, and the
+    `forward_done_event` of the output forward before it, or None."""
+    device, timed, done = 0, [], None
     for s in lines:
         if "d_busy_ns" in s:
             start = device + s.get("d_gap_ns", 0)
             device = start + s["d_busy_ns"]
-            timed.append((s, start))
-    return timed, max(s["t_launch_ns"][0] - start for s, start in timed)
+            timed.append((s, start, done))
+            if s["produces_output"]:
+                done = None
+                if "d_target_ns" in s:
+                    done = start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0)
+    bounds = [
+        s["t_mtp_ns"][1] - d if "t_mtp_ns" in s and d is not None else None
+        for s, _, d in timed
+    ]
+    waits = [b for b in bounds if b is not None]
+    first, recent, tight = min(waits[:ANCHORS], default=0), deque(maxlen=ANCHORS), []
+    for b in bounds:
+        if b is not None:
+            recent.append(b)
+        tight.append(min(recent) if len(recent) == ANCHORS else first)
+    lows = [s["t_launch_ns"][0] - start for s, start, _ in timed]
+    margins = [t - low for t, low in zip(tight, lows) if low <= t or not waits]
+    if not margins:
+        raise ValueError("every launch bound exceeds the MTP status waits' bound")
+    gap = min(margins)
+    return [(s, start, t - gap, d) for (s, start, d), t in zip(timed, tight)]
 
 
 def mtp_copy(lines) -> dict[int, tuple[int, bool]]:
     """Per forward with an MTP status wait after an output forward that marks
     its target: the nanoseconds from that forward's `forward_done_event`, after
     its target and draft-KV pass, to the wait's return, and whether the wait
-    began before the event. The lead places the event no later than it ran, so
-    the time is an upper bound."""
-    timed, lead = _timed(lines)
-    copy, done = {}, None
-    for s, start in timed:
+    began before the event. The lead places the event no later than it ran
+    while the fastest recent status copy holds still, so the time is an upper
+    bound."""
+    copy = {}
+    for s, _, lead, done in _timed(lines):
         if "t_mtp_ns" in s and done is not None:
             m0, m1 = s["t_mtp_ns"]
             copy[s["step"]] = (m1 - done - lead, m0 < done + lead)
-        if s["produces_output"]:
-            done = None
-            if "d_target_ns" in s:
-                done = start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0)
     return copy
+
+
+def host_paced_drafts(lines) -> set[int]:
+    """The steps whose device reached their `propose` pass, after their target
+    and draft-KV pass and placed by the lead, before their host's draft copy
+    wait began: the host queues the pass just before that wait, so the device
+    waited for it there."""
+    return {
+        s["step"]
+        for s, start, lead, _ in _timed(lines)
+        if "t_draft_recv_ns" in s
+        and "d_target_ns" in s
+        and start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0) + lead
+        < s["t_draft_recv_ns"][0]
+    }
 
 
 def _host_cut(lines) -> tuple[set[int], set[int]]:
     """The steps whose device start precedes their host launch end, and the
-    prefill steps the host did not pace whose launch the device held."""
-    (lines_timed, lead), output_end, timed = _timed(lines), None, []
-    for s, start in lines_timed:
+    MTP decodes whose device reached the propose pass before the host's draft
+    copy wait."""
+    output_end, timed = None, []
+    for s, start, _, _ in _timed(lines):
         bound = None
         if "t_recv_ns" in s and output_end is not None:
             bound = s["t_recv_ns"][1] - output_end
@@ -286,22 +337,8 @@ def _host_cut(lines) -> tuple[set[int], set[int]]:
             recent.append(bound)
         if start + min(recent, default=first) < s["t_launch_ns"][1]:
             exposed.add(s["step"])
-    paced = {
-        s["step"]
-        for s, start, _ in timed
-        if not all(r[2] for r in s["rows"])
-        and start + s["d_busy_ns"] + lead - s["t_exit_ns"]
-        < PACED_SHARE * s.get("d_target_ns", s["d_busy_ns"])
-    }
-    held = {
-        s["step"]
-        for s, start, _ in timed
-        if not all(r[2] for r in s["rows"])
-        and s["step"] not in paced
-        and s["t_launch_ns"][1] - start - lead
-        > HELD_SHARE * s.get("d_target_ns", s["d_busy_ns"])
-    }
-    return exposed, held
+    decodes = {s["step"] for s, _, _ in timed if all(r[2] for r in s["rows"])}
+    return exposed, decodes & host_paced_drafts(lines)
 
 
 def join_stamps(steps: list[dict], path) -> None:
@@ -371,11 +408,11 @@ def label(
 
     `run` names the run in each sample's provenance, the record's `digest` by
     default; `split_rule` rebuilds an older record's split, as above. A
-    data-parallel record's `group_dummies` is read from the rank records
-    beside it.
+    data-parallel record's `group_dummies` and `group_max_tokens` are read from
+    the rank records beside it.
     """
     lines = _read(record)
-    return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None)
+    return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None, None)
 
 
 def label_run(
@@ -394,19 +431,19 @@ def label_run(
         )
     n = max(map(len, ranks), default=0)
     starts = [max(_pull(x[i]) for x in ranks if i < len(x)) for i in range(n)]
-    dummy_ranks = group_dummies(ranks)
+    dummy_ranks, peaks = group_dummies(ranks), group_peaks(ranks)
     return [
         (
             ([], [])
             if x and all(s["is_dummy_run"] for s in x)
-            else _label(r, x, run, starts, split_rule, dummy_ranks)
+            else _label(r, x, run, starts, split_rule, dummy_ranks, peaks)
         )
         for r, x in zip(records, ranks)
     ]
 
 
 def _label(
-    record, lines, run, starts, split_rule, dummy_ranks
+    record, lines, run, starts, split_rule, dummy_ranks, peaks
 ) -> tuple[list[Sample], list[dict]]:
     """`label` of `record`'s `lines`, each `E` from `starts` at the line before."""
     path = Path(record)
@@ -421,9 +458,7 @@ def _label(
             f"{record} has no device windows (`d_busy_ns`); a fit labels a step "
             "by its device time"
         )
-    (exposed, held), traced = _host_cut(lines), _traced(path)
-    timed, lead = _timed(lines)
-    placed = {s["step"]: start + lead for s, start in timed}
+    (exposed, early), traced = _host_cut(lines), _traced(path)
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
@@ -439,7 +474,8 @@ def _label(
         dp, tokens = "moe_rows" in s, s.get("moe_tokens")
         split = s.get("tbo_tokens")
         if dp and dummy_ranks is None:
-            dummy_ranks = group_dummies(map(read_jsonl, _peers(path)))
+            peers = [read_jsonl(p) for p in _peers(path)]
+            dummy_ranks, peaks = group_dummies(peers), group_peaks(peers)
         if dp and tokens is None:
             if ranks is None:
                 ranks = [{t["step"]: t for t in read_jsonl(p)} for p in _peers(path)]
@@ -453,20 +489,20 @@ def _label(
                         "rebuild it"
                     )
                 split = split_rule(group)
-        lag = None
-        if s["produces_output"] and not traced:
-            returned = s.get("t_recv_ns", s.get("t_read_ns", s["t_launch_ns"]))[1]
-            lag = (placed[s["step"]] - returned) * 1e-9
         view = BatchView(
             tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
             capture_rung=s["rung"],
             moe_rows=s.get("moe_rows"),
+            draft_moe_rows=s.get("draft_moe_rows"),
+            draft_bs=s.get("draft_bs"),
+            draft_rows=s.get("draft_rows"),
+            target_bs=s.get("target_bs"),
             produces_output=s["produces_output"],
             tbo_tokens=None if split is None else tuple(map(tuple, split)),
             moe_tokens=tokens,
             dp_rank=s["dp_rank"] if dp else None,
             group_dummies=dummy_ranks.get(s["step"], 0) if dp else 0,
-            start_lag_s=lag,
+            group_max_tokens=peaks.get(s["step"]) if dp else None,
         )
         cut = None
         if view.prefill and view.decode:
@@ -500,9 +536,9 @@ def _label(
         g0, g1 = s.get("t_gate_ns", (l0, l0))
         r0, r1 = s.get("t_recv_ns", (l1, l1))
         m0, m1 = s.get("t_mtp_ns", (l0, l0))
+        blocked = s.get("blocked_ns")
         host = {"W_pre": g0 - enter + m0 - g1}
-        if s["step"] not in held:
-            host["W_launch"] = r0 - l0
+        host["W_launch"] = r0 - l0 - sum((blocked or {}).values())
         if "t_mtp_ns" in s:
             host["W_inputs"] = l0 - m1
         if "t_pp_recv_ns" in s:
@@ -534,11 +570,13 @@ def _label(
                 host,
                 idle,
                 provenance,
-                None if cut else draft,
+                None if cut or s["step"] in early else draft,
                 None if cut or propose is None else propose * 1e-9,
                 dummies,
                 None if cut or draft_kv is None else draft_kv * 1e-9,
                 admits[i],
+                s.get("launch", {}),
+                None if blocked is None else {k: v * 1e-9 for k, v in blocked.items()},
             )
         )
         gap_ns = s.get("d_gap_ns")

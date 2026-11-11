@@ -6,7 +6,7 @@
     python3 scripts/compass/http_intake.py floor STAMPS ARRIVALS
     python3 scripts/compass/http_intake.py idle STAMPS [PER_BYTE_S]
     python3 scripts/compass/http_intake.py lone STAMPS [PASSES]
-    python3 scripts/compass/http_intake.py hops STAMPS HANDOFF ARRIVALS
+    python3 scripts/compass/http_intake.py hops STAMPS HANDOFF ARRIVALS [STEPS]
     python3 scripts/compass/http_intake.py pd STAMPS [STEPS]
 
 `serve` runs `atom.entrypoints.openai.api_server` as ``python3 -m`` does and
@@ -21,7 +21,12 @@ streamed output, `_deliver_terminal_output` per finished sequence) and `head` an
 SSE response's head sent to the client, all size 0. Every process the server
 spawns stamps into STAMPS too: `kvsend`, a Mooncake KV write request sent
 (`MooncakeConnector._send_on_socket`), and `kvrecv`, one the prefill's listener
-received, both size 0.
+received, both size 0. While it serves, the lines go to a file in the temp
+directory, which ``STAMPS.<pid>.local`` names, and at its stop, its exit or a
+SIGTERM, they are appended to STAMPS: on NFS a line written right after another
+waits for the first's round trip, inside the stage it stamps, so a temp
+directory on NFS or CIFS refuses. Every other verb refuses STAMPS while such a
+file names lines not yet appended; the server that died first left them there.
 
 `floor` reads the transport from client send to ASGI app call off a server
 `serve` ran and the parity workload's real-run ARRIVALS
@@ -42,8 +47,11 @@ bytes and the sha256 as JSON.
 input thread's receipt, from request 1 on, as request 0 (sent alone, or the
 long one) finds the engine idle; ``output``, each engine output's put on the engine's
 output queue to the server's output thread taking it in; ``stream``, each SSE
-head sent to the client reading it (ARRIVALS' ``admitted_ns``). Prints each hop's median, p10,
-p90 and N, and the three inputs' sha256, as JSON.
+head sent to the client reading it (ARRIVALS' ``admitted_ns``), paired on the head's send
+call and timed from its return, a head the client read first left out. Prints each hop's median, p10,
+p90 and N, and the three inputs' sha256, as JSON. With STEPS, the engine's step
+record (``dp0.jsonl``), it adds ``request_forward``, the request hop over the
+receipts inside a forward, and the record's sha256.
 `pd` reads a prefill and a decode server's shared STAMPS (`parity_pd.sh` with
 HTTP_INTAKE): ``kv_write_req``, each write request's send call on decode to prefill's
 receipt, its median, p10, p90 and N, and the sha256, as JSON. With STEPS, prefill's
@@ -61,14 +69,22 @@ bursts. With PER_BYTE_S, that is the slope, and `fixed_s` keeps the span at
 it. Prints the terms, a gap's rms residual, N, bytes and sha256 as JSON.
 """
 
+import atexit
+import codecs
 import contextlib
+import fcntl
+import functools
+import glob
 import hashlib
 import importlib.abc
 import importlib.machinery
 import json
 import os
 import runpy
+import shutil
+import signal
 import sys
+import tempfile
 import threading
 import time
 from multiprocessing import spawn
@@ -84,9 +100,29 @@ def serve(stamps: str, args: list[str]) -> None:
     runpy.run_module(main, run_name="__main__", alter_sys=True)
 
 
-def install(stamps: str) -> None:
-    """Stamp into `stamps` in this process and every process it spawns."""
-    out = open(stamps, "a", buffering=1)  # noqa: SIM115
+def install(stamps: str, local: str | None = None) -> None:
+    """Stamp into `stamps` in this process and every process it spawns, each
+    line into `local` as it is written. With no `local`, a new file in the
+    temp directory (`_local_dir`), which ``<stamps>.<pid>.local`` names until
+    this process's stop, its exit or a SIGTERM, appends its lines to `stamps`.
+    uvicorn takes a SIGTERM while it serves and raises it again once it has
+    stopped, after putting back the handler it found, which by default ends
+    the process before any exit handler runs."""
+    stamps = os.path.abspath(stamps)
+    if local is None:
+        fd, local = tempfile.mkstemp(
+            prefix="http_intake.", suffix=".stamps", dir=_local_dir()
+        )
+        os.close(fd)
+        named = f"{stamps}.{os.getpid()}.local"
+        Path(named).write_text(f"{local}\n")
+        atexit.register(_append, local, stamps, named)
+        previous = signal.getsignal(signal.SIGTERM)
+        main = threading.current_thread() is threading.main_thread()
+        if main and previous not in (signal.SIG_IGN, None):
+            stop = functools.partial(_stopped, previous, local, stamps, named)
+            signal.signal(signal.SIGTERM, stop)
+    out = open(local, "a", buffering=1)  # noqa: SIM115
 
     def stamp(kind: str, start: int, size: int) -> None:
         now, thread = time.monotonic_ns(), threading.get_ident()
@@ -213,18 +249,93 @@ def install(stamps: str) -> None:
     sys.meta_path.insert(0, Patcher())
     # A spawned process installs this before it runs anything else.
     line, here = spawn.get_command_line, os.path.dirname(os.path.abspath(__file__))
-    stamps = os.path.abspath(stamps)
 
     def get_command_line(**kwds) -> list[str]:
         argv = line(**kwds)
         i = argv.index("-c") + 1
         argv[i] = (
             f"import sys; sys.path.insert(0, {here!r}); import http_intake; "
-            f"http_intake.install({stamps!r}); {argv[i]}"
+            f"http_intake.install({stamps!r}, {local!r}); {argv[i]}"
         )
         return argv
 
     spawn.get_command_line = get_command_line
+
+
+def _append(local: str, stamps: str, named: str) -> None:
+    """Append the lines in `local` to `stamps` under an exclusive lock, so that
+    no other server's lines land inside one, then remove `local` and the file
+    `named` that names it; once only."""
+    if not os.path.exists(named):
+        return
+    with open(local, "rb") as lines, open(stamps, "ab") as out:
+        fcntl.flock(out, fcntl.LOCK_EX)
+        shutil.copyfileobj(lines, out)
+        out.flush()
+    os.remove(named)
+    os.remove(local)
+
+
+def _stopped(previous, local: str, stamps: str, named: str, signum, frame) -> None:
+    """A SIGTERM: append the lines (`_append`), then `previous` takes it, the
+    default delivered again so that the process ends of the signal."""
+    try:
+        _append(local, stamps, named)
+    finally:
+        signal.signal(signum, previous)
+        if callable(previous):
+            previous(signum, frame)
+        else:
+            os.kill(os.getpid(), signum)
+
+
+#: The mount table `_local_dir` reads, and the file systems it refuses.
+MOUNTINFO, NETWORK_FS = "/proc/self/mountinfo", ("nfs", "nfs4", "cifs", "smb3")
+
+
+def _local_dir() -> str:
+    """The temp directory, refused when `MOUNTINFO` puts it, or the upper
+    directory of the overlay holding it, on a network file system: a line
+    written there right after another waits for the first's round trip."""
+    where = os.path.realpath(tempfile.gettempdir())
+    point, fs, source, options = _mount(where)
+    upper = dict(o.partition("=")[::2] for o in options.split(",")).get("upperdir")
+    if fs not in NETWORK_FS and upper and _mount(upper)[0] != point:
+        _, fs, source, _ = _mount(upper)
+    if fs in NETWORK_FS:
+        raise SystemExit(
+            f"the stamp lines' temp directory {where} is on {fs} ({source}), where "
+            "a line written right after another waits for the first's round trip; "
+            "set TMPDIR to a directory on this host's own disk or a tmpfs"
+        )
+    return where
+
+
+def _mount(path: str) -> tuple[str, str, str, str]:
+    """The mount point, file system, source and options of the mount
+    `MOUNTINFO` lists as holding `path`."""
+    held = ("", "", "", "")
+    with open(MOUNTINFO) as table:
+        for line in table:
+            left, _, right = line.partition(" - ")
+            point = codecs.decode(left.split()[4], "unicode_escape")
+            fs, source, options = (right.split() + ["", "", ""])[:3]
+            inside = path == point or path.startswith(point.rstrip("/") + "/")
+            if inside and len(point) >= len(held[0]):
+                held = (point, fs, source, options)
+    return held
+
+
+def unstopped(stamps: str) -> None:
+    """Refuse `stamps` while a ``<stamps>.<pid>.local`` names lines a server
+    stamping into it has not appended: one that did not exit."""
+    named = sorted(glob.glob(f"{glob.escape(stamps)}.*.local"))
+    if named:
+        raise SystemExit(
+            f"{stamps}: the server that stamped into it did not exit, so its lines "
+            f"are not in it; {named[0]} names the file that holds them, "
+            f"{Path(named[0]).read_text().strip()}"
+        )
 
 
 def fit(stamps: str, n: int = 256, per_byte: float | None = None) -> dict:
@@ -344,9 +455,11 @@ def lone(stamps: str, passes: int = 1) -> dict:
     }
 
 
-def _hop(sent, got, name: str, alone: bool = True) -> dict:
+def _hop(sent, got, name: str, alone: bool = True, returned=None) -> dict:
     """Message k's ``got[k] - sent[k]``, in order; with `alone`, no message
-    is sent before the one ahead of it arrives."""
+    is sent before the one ahead of it arrives; with `returned`, each send
+    call's return, message k is timed from it, and left out when it arrived
+    first."""
     sent, got = sorted(sent), sorted(got)
     after = sent[1:] + [float("inf")] if alone else [float("inf")] * len(sent)
     if len(got) != len(sent) or not all(
@@ -355,17 +468,20 @@ def _hop(sent, got, name: str, alone: bool = True) -> dict:
         raise SystemExit(
             f"{name}: {len(got)} arrivals, not one after each of {len(sent)} sends"
         )
-    p10, median, p90 = np.percentile((np.array(got) - sent) / 1e9, [10, 50, 90])
-    return {"median_s": median, "p10_s": p10, "p90_s": p90, "messages": len(sent)}
+    took = np.array(got) - sorted(sent if returned is None else returned)
+    took = took[took > 0]
+    p10, median, p90 = np.percentile(took / 1e9, [10, 50, 90])
+    return {"median_s": median, "p10_s": p10, "p90_s": p90, "messages": len(took)}
 
 
-def hops(stamps: str, handoff: str, arrivals: str) -> dict:
+def hops(stamps: str, handoff: str, arrivals: str, steps: str | None = None) -> dict:
     data, handoff_data = Path(stamps).read_bytes(), Path(handoff).read_bytes()
     sent_data = Path(arrivals).read_bytes()
     rows = [line.split() for line in data.decode().splitlines()]
     sends = [int(r[0]) for r in rows if r[2] == "send"]
     outs = [int(r[3]) for r in rows if r[2] == "out"]
     heads = [int(r[0]) for r in rows if r[2] == "head"]
+    head_calls = [int(r[3]) for r in rows if r[2] == "head"]
     lines = [json.loads(line) for line in handoff_data.decode().splitlines()]
     recvs = [h["t_recv_ns"] for h in lines if "t_recv_ns" in h]
     # Outputs put from the first request on, each timed from its put: the
@@ -383,14 +499,29 @@ def hops(stamps: str, handoff: str, arrivals: str) -> dict:
         )
     got = [outs[i] for i in starts[:-1]]
     admitted = json.loads(sent_data)["admitted_ns"]
-    return {
-        "request": _hop(sorted(sends)[1:], sorted(recvs)[1:], "request"),
+    sent, recvs = sorted(sends)[1:], sorted(recvs)[1:]
+    out = {
+        "request": _hop(sent, recvs, "request"),
         "output": _hop([t for t, _ in put], got, "output", alone=False),
-        "stream": _hop(heads, admitted, "stream"),
+        "stream": _hop(head_calls, admitted, "stream", returned=heads),
         "record": f"sha256:{hashlib.sha256(data).hexdigest()}",
         "handoff": f"sha256:{hashlib.sha256(handoff_data).hexdigest()}",
         "arrivals": f"sha256:{hashlib.sha256(sent_data).hexdigest()}",
     }
+    if steps is None:
+        return out
+    # A receipt between forwards waits on the step loop's GIL.
+    steps_data = Path(steps).read_bytes()
+    lines = [json.loads(line) for line in steps_data.decode().splitlines()]
+    fw = np.array(sorted((s["t_enter_ns"], s["t_exit_ns"]) for s in lines))
+    got = np.array(recvs)
+    i = np.searchsorted(fw[:, 0], got, "right") - 1
+    inside = (i >= 0) & (got <= fw[i, 1])
+    out["request_forward"] = _hop(
+        np.array(sent)[inside].tolist(), got[inside].tolist(), "request_forward"
+    )
+    out["steps"] = f"sha256:{hashlib.sha256(steps_data).hexdigest()}"
+    return out
 
 
 def pd(stamps: str, steps: str | None = None) -> dict:
@@ -428,6 +559,8 @@ def pd(stamps: str, steps: str | None = None) -> dict:
 
 if __name__ == "__main__":
     verb, stamps, *rest = sys.argv[1:]
+    if verb != "serve":
+        unstopped(stamps)
     if verb == "serve":
         serve(stamps, rest)
     elif verb == "floor":

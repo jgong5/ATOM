@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "name": "mi455x-scale-out",
+  "provenance": {
+    "authored_by": "compass agent for jgong5",
+    "date": "2026-11-03",
+    "origin": "mixed",
+    "origins": {
+      "interconnect.inter_node.link_bandwidth_bytes_per_s": {"origin": "datasheet"},
+      "interconnect.inter_node.link_latency_s": {"origin": "assumed"},
+      "interconnect.inter_node.derate": {"origin": "assumed"}
+    },
+    "notes": "MI455X product page and brochure (07/26), read 2026-10-09: one GPU's NICs' scale-out rate per direction | no probe fills the latency and derate: nic-400g's, which the MI355X specs assume"
+  },
+  "interconnect": {
+    "inter_node": {
+      "link_bandwidth_bytes_per_s": 3.0e11,
+      "link_latency_s": 5.0e-6,
+      "derate": 0.8
+    }
+  }
+}

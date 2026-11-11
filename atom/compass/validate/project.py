@@ -46,7 +46,6 @@ from atom.compass.artifacts import (
     Key,
     Kind,
     Provenance,
-    Reading,
     Topology,
     machine_spec_key,
     member_name,
@@ -61,7 +60,6 @@ PROG = "compass project"
 #: What a projected device takes from the probed one as it stands, no
 #: datasheet stating it.
 CARRIED = (
-    "host.",
     "device.kernel_floor_s",
     "device.software_pinned_to.",
     "interconnect.intra_node.link_latency_s",
@@ -100,7 +98,7 @@ def projected(target: MachineSpec, source: MachineSpec) -> MachineSpec:
         },
     }
     values["name"] = f"{target.values['name']} at {source.values['name']} ratios"
-    echo = MachineSpec(values, source.tokenizers).echo()
+    echo = MachineSpec(values).echo()
     return MachineSpec.from_mapping(echo)
 
 
@@ -193,7 +191,7 @@ def scaled(machine: MachineSpec, path: str, factor: float):
         values[path] = min(machine.value(path) * factor, 1.0)
     else:
         capped, values[path] = False, machine.value(path) * factor
-    return MachineSpec(values, machine.tokenizers), capped
+    return MachineSpec(values), capped
 
 
 def band(machine: MachineSpec, assumed: dict, jobs: list, base: dict) -> dict:
@@ -248,21 +246,20 @@ def projection(machine: MachineSpec, cells: dict) -> dict:
 
 def publish(store: str, document: dict, cells: dict, machine, command: str):
     """Publish `document` in `store` as a `projection`, keyed by its model,
-    spec, ATOM tree and cells."""
+    spec, ATOM source and cells."""
     import torch
 
-    from atom.compass.run import host_cpu
+    from atom.compass.run import atom_source, host_cpu, source_root
 
     model = next(iter(cells.values()))[1]["model"]
     roots = roots_for({"atom": "atom", "aiter": "aiter"})
-    atom = next(r for r in roots if r.name == "atom")
     engines = json.dumps([c["engine"] for _, c in cells.values()], sort_keys=True)
     identity = json.dumps([[c["steps"], c["engine"]] for _, c in cells.values()])
     key = Key.of(
         Kind.PROJECTION,
         model=model,
         spec=machine.digest(),
-        source_root=f"{atom.revision_kind}-{atom.revision}",
+        source_root=source_root(),
         cells=f"sha256:{hashlib.sha256(identity.encode()).hexdigest()}",
     )
     rank = Topology().ranks()[0]
@@ -275,7 +272,7 @@ def publish(store: str, document: dict, cells: dict, machine, command: str):
         conditions=Conditions.of(
             **machine_spec_key(machine).values,
             torch=torch.__version__,
-            atom_src=Reading.of_source_root(atom),
+            atom_src=atom_source(),
             model=model,
             host_cpu=host_cpu(),
             engine_config=engines,

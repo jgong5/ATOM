@@ -94,6 +94,7 @@ def ops_placements(
     slots=8,
     ratio=2,
     reach=0,
+    query=None,
 ):
     """The op bench's placements of a V4.1 `point` under `rule`, a two-row
     decode by default, at `context`, over `test_bench_ops`'s state-only leaf
@@ -111,8 +112,10 @@ def ops_placements(
     window, as `_launch_rope_window` and `swa_write` take it; at `ring`, that
     and layer 1's window ring cut from it (`ring_view`), as
     `pa_sparse_prefill_opus` takes both, stating its window of 8, compress
-    `ratio` and, past ratio 0, top-k 1. Its activation is a row a token, and
-    the bytes its ring rows read a call, `reach` rows, are kept too."""
+    `ratio` and, past ratio 0, top-k 1, or at `prefix` the pool alone stating
+    them. Its activation is a row a token, `query` rows if given, and the
+    bytes its ring rows read a call, `reach` rows, are kept too, and each
+    pool view's name and offset from ATOM's on the bench, or refusal and None."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -172,8 +175,9 @@ def ops_placements(
             states = [("pool", capture.pool)]
             states += [("ring", capture.ring_view(1))] if pool == "ring" else []
         dtyped = [(f, _t(t.shape, "kv", t.stride(), str(t.dtype))) for f, t in states]
-        leaf = _leaf("v41.states", ("kv", _t([tokens, 4], "activation")), *dtyped)
-        if pool == "ring":  # two rows' blocks hold 32 rows at ratio 2
+        query = query or tokens
+        leaf = _leaf("v41.states", ("kv", _t([query, 4], "activation")), *dtyped)
+        if pool in ("ring", "prefix"):  # two rows' blocks hold 32 rows at ratio 2
             runner.config.kv_cache_block_size = BLOCK
             top = ("index_topk", 1 if ratio else None)
             stated = ("window_size", 8), ("compress_ratio", ratio), top
@@ -186,22 +190,57 @@ def ops_placements(
             given = ("window", Reduced(cls, tuple(vars(window).items())))
             leaf = dataclasses.replace(leaf, args=(*leaf.args, given))
         if pool:  # its `reach` ring rows; beside a ring at a ratio, top-k 1 a row
-            pages = point.seqs if pool == "ring" and ratio else 0
+            pages = point.seqs if pool != "whole" and ratio else 0
             ring = reach * capture.pool[0].nbytes
             read = ring + pages * capture.pool[0].nbytes
-        llc = 3 * (16 * tokens + read)  # 7 copies of the activation and the states
+        llc = 3 * (16 * query + read)  # 7 copies of the activation and the states
     found = ops.leaves(_graph(leaf, layers=1)["region"])
     real, replay.seat_states = replay.seat_states, seat
-    refused, got = None, []
+    refused, got, stub = None, [], ops.Stub(runner, llc)
     try:
-        got = ops.Stub(runner, llc).point(rule, point, context, found)
+        got = stub.point(rule, point, context, found)
         refused = next((r["refused"] for r in got if "refused" in r), None)
     except (ValueError, RuntimeError) as error:
         refused = str(error)
     finally:
         replay.seat_states = real
     kept = {"slots": runner.batches, "refused": refused, "got": got}
+    if pool:
+        atom = {"pool": built.cache.pool, "ring": built.cache.ring_view(1)}
+        kept["bound"] = {
+            p: [n, v if v is None else v.data_ptr() - atom[p].data_ptr()]
+            for (_, p), (n, v) in stub.kv.items()
+        }
     return kept | {"read": read, "ring": ring}
+
+
+def kv_bound(slots):
+    """Each KV view a capture's cache of 4 PAGEs and `slots` state slots
+    passes, as `ops._kv` binds it on `cache_of`'s as `ops._runner` holds it:
+    the name it binds and how far its first byte lies from that view there."""
+    import torch
+
+    from atom.compass.bench import ops
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+
+    bench = cache_of()
+    capture = PagedAttentionCache(bench.geometry, 4, slots, "cpu")
+    held = ops._bound("cache", bench, set(), torch.device("cpu"))
+    views = {
+        "pages": lambda c: c.pages.buf.view(torch.bfloat16),
+        "page_bytes": lambda c: c.page_bytes.view(-1),
+        "state_bytes": lambda c: c.state_bytes.view(-1),
+        "state_fp32": lambda c: c.state.buf.view(torch.float32),
+        "cursor": lambda c: c.cursor[:, 1:],
+        "pool": lambda c: c.pool,
+    }
+    out = {}
+    for case, view in views.items():
+        t = view(capture)
+        spec = {"shape": [*t.shape], "stride": [*t.stride()], "dtype": str(t.dtype)}
+        name, got = ops._kv(spec, "self", held)
+        out[case] = [name, got.data_ptr() - view(bench).data_ptr()]
+    return out
 
 
 def main(root: pathlib.Path) -> None:
@@ -324,7 +363,7 @@ def main(root: pathlib.Path) -> None:
     # the ring rows a call reaches: a row a token written, a window of 8 a row
     # read; a ring a request at most, of 8 rows, or 13 under DSpark5
     seated = {"seat": replay.seat_states, "v41": True}
-    for pool, slots in (("whole", 8), ("ring", 8), ("ring", 4), ("ring", 16)):
+    for pool, slots in (("whole", 8), *(("ring", n) for n in (8, 4, 2, 16))):
         reach = 2 if pool == "whole" else 16
         seen[f"ops_v41_{pool}_pool_{slots}"] = ops_placements(
             plain, replay.seat_states, v41=True, pool=pool, slots=slots, reach=reach
@@ -338,6 +377,14 @@ def main(root: pathlib.Path) -> None:
     seen["ops_v41_write_prefill"] = ops_placements(
         plain, point=prefill(32, 1), context=128, pool="whole", reach=8, **seated
     )
+    # a cached prefill's prefix reads each row's 7 history ring rows through the
+    # pool; a bounded-replay tail's, 16 query rows of the forward's 32, none
+    cut = {"point": prefill(32, 2), "context": 96, "pool": "prefix", **seated}
+    for case, ratio, query in (("prefix0", 0, 32), ("prefix2", 2, 32), ("tail", 2, 16)):
+        seen[f"ops_v41_{case}"] = ops_placements(
+            plain, ratio=ratio, query=query, reach=14 * (query == 32), **cut
+        )
+    seen["kv_bound"] = {slots: kv_bound(slots) for slots in (8, 2)}
 
     from atom.compass.bench.runner import BenchModelRunner
     from atom.compass.parity.runner import RecordingModelRunner

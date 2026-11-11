@@ -47,7 +47,6 @@ class Kind(enum.Enum):
     QUANTITY = "quantity"
     DERATE = "derate"
     NAMES = "names"
-    TOKENIZERS = "tokenizers"
     ORIGIN = "origin"
     SUBJECT = "subject"
     ORIGINS = "origins"
@@ -63,8 +62,7 @@ SUBJECT = {
     "source_root": Kind.TEXT,
     "record": Kind.TEXT,
 }
-#: A probed number's spread over its probe's records: the p10 and the p90, two
-#: numbers, or for a tokenizer entry two mappings from each rate to one.
+#: A probed number's spread over its probe's records: the p10 and the p90.
 BAND = ("p10", "p90")
 
 
@@ -124,16 +122,6 @@ FIELDS = (
     Field("provenance.origins", Kind.ORIGINS, required=False),
     Field("provenance.fragments", Kind.NAMES, required=False),
     Field("provenance.notes", Kind.TEXT, required=False),
-    Field("host.cpu.cores_physical", Kind.COUNT),
-    Field("host.cpu.cores_logical", Kind.COUNT),
-    Field("host.tokenizers", Kind.TOKENIZERS),
-    Field("host.ipc.zmq_roundtrip_s", Kind.QUANTITY),
-    Field("host.ipc.shm_broadcast_s", Kind.QUANTITY),
-    # The frontend event loop's time to take in one HTTP request.
-    Field("host.http_intake.fixed_s", Kind.QUANTITY),
-    Field("host.http_intake.per_byte_s", Kind.QUANTITY),
-    # The same for a request that finds no other intake on the loop.
-    Field("host.http_intake.idle_s", Kind.QUANTITY, required=False),
     Field("device.name", Kind.TEXT),
     Field("device.arch", Kind.TEXT),
     Field("device.count_per_node", Kind.COUNT),
@@ -215,20 +203,6 @@ def _refuse(path: str, wanted: str, value: object) -> None:
     )
 
 
-def _detached(value: object) -> object:
-    """A document value copied, so the document cannot move it afterwards.
-
-    A list of names gets this from `tuple`, because what it holds is scalars
-    and the constructor is the whole copy. A tokenizer entry holds mappings and
-    lists, so the same guarantee is a walk.
-    """
-    if isinstance(value, Mapping):
-        return {key: _detached(item) for key, item in value.items()}
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        return [_detached(item) for item in value]
-    return value
-
-
 def origin(value: object, path: str, *, of_a_field: bool = False) -> str:
     """An origin as written, or a refusal; one field's origin is never `mixed`."""
     allowed = ORIGINS[:-1] if of_a_field else ORIGINS
@@ -272,21 +246,11 @@ def _band(entry: Mapping, where: str) -> dict:
     """An entry's `BAND`, both ends or neither, each `p10` at most its `p90`."""
     if not set(BAND) & set(entry):
         return {}
-    low, high = entry.get("p10"), entry.get("p90")
-    pairs = [(low, high)]
-    if (
-        isinstance(low, Mapping)
-        and isinstance(high, Mapping)
-        and low.keys() == high.keys()
-    ):
-        pairs = [(low[rate], high[rate]) for rate in low]
-    for pair in pairs:
-        number = all(
-            isinstance(e, int | float) and not isinstance(e, bool) for e in pair
-        )
-        if not number or pair[0] > pair[1]:
-            _refuse(where, "a band, a `p10` at most its `p90`", entry)
-    return {end: _detached(entry[end]) for end in BAND}
+    pair = entry.get("p10"), entry.get("p90")
+    number = all(isinstance(e, int | float) and not isinstance(e, bool) for e in pair)
+    if not number or pair[0] > pair[1]:
+        _refuse(where, "a band, a `p10` at most its `p90`", entry)
+    return {end: entry[end] for end in BAND}
 
 
 def check(field: Field, value: object, path: str) -> object:
@@ -355,6 +319,3 @@ def check(field: Field, value: object, path: str) -> object:
             if not isinstance(name, str) or not name.strip():
                 _refuse(path, "a list of non-empty strings", value)
         return tuple(value)
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        _refuse(path, f"a list of {kind.value} entries", value)
-    return tuple(_detached(entry) for entry in value)

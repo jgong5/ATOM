@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 """`compass measure ops` rehearsed off the card, each leaf up to its launch.
 
-    python v41_ops_rehearsal.py OUT [--kinds] <measure ops args> -- <ATOM args>
+    python v41_ops_rehearsal.py OUT [--kinds] [--drafter] [--arch ARCH]
+        <measure ops args> -- <ATOM args>
 
 `measure ops`' own arguments but `--gpu` and `--out`. The process declares
-card 0 of the MI455 A0 node as it read (`test_capture_mi455_cells.A0`) and
-ATOM's TP group in itself (`driverless.group`), then runs `ops.measure` on
+card 0 of the MI455 A0 node as it read (`test_capture_mi455_cells.A0`), or
+with `--arch` the device a capture declares for ARCH (`driverless.DEVICES`),
+and ATOM's TP group in itself (`driverless.group`), then runs `ops.measure` on
 the graphs of the store, one rank, in a capture's fake mode
 (`driverless_mode`, the capture's `_patches`): ATOM's runner is built as the
 bench builds it, its KV pool sized from that card's memory, all free past the
@@ -17,17 +19,21 @@ memory, which no graph capture copies, refuses, and each Triton launch types
 and keys its arguments as Triton does, a tensor as an aligned pointer, and
 launches nothing. A FlyDSL launch and a compiled operator's are not typed.
 With `--kinds` a graph keeps its first leaf of each operator, as a card run of
-one leaf an op kind takes them.
+one leaf an op kind takes them. With `--drafter` a shape's leaves are those of
+its drafter's graphs alone (`ops.leaves_at`).
 
 The fake mode stands in for the device where the bench reads it: the
 runner's checkpoint is ATOM's empty dummy, as a capture's is; a router's
-expert ids are drawn on the host and their loads not counted; no tensor
+expert ids are drawn on the host and their loads not counted; DeepSeek-V4's
+CSA top-k ids, which the bench draws on the device's generator, are not drawn,
+and its index buffer keeps the values ATOM prepared; no tensor
 equals another, so each placement clones its metadata; DeepSeek-V4.1's state
 cursors read back zeros and its check of them has no values to judge, as in
 a capture. OUT gets one record a leaf: its point, its verdict (`LAUNCH` with
 the kernels it launched, `REFUSED` with the reason, or `UNTOLD`, which a fake
 tensor's missing values stopped), the buffers its KV and metadata arguments
-bound, and each one's identity (`identity`).
+bound, each one's identity (`identity`), and that of each its later
+occurrences take apart (`later`, `ops.QUERIED`).
 """
 
 import contextlib
@@ -279,11 +285,17 @@ def main(out, argv) -> None:
 
     from atom.compass.capture import driverless, forward
 
-    driverless.install(tempfile.mkdtemp(), A0["arch"], A0)
+    if "--arch" in argv:
+        at = argv.index("--arch")
+        driverless.install(tempfile.mkdtemp(), argv[at + 1])
+        argv = argv[:at] + argv[at + 2 :]
+    else:
+        driverless.install(tempfile.mkdtemp(), A0["arch"], A0)
 
     import torch
     from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
+    from triton.runtime import jit as triton_jit
 
     from atom.compass.artifacts import ArtifactStore
     from atom.compass.bench import ops, ranks
@@ -292,20 +304,23 @@ def main(out, argv) -> None:
     from atom.config import set_current_atom_config
     from atom.model_engine.model_runner import DeviceMemoryReadings, ModelRunner
     from atom.utils import h2d
-    from triton.runtime import jit as triton_jit
 
-    kinds = "--kinds" in argv
-    argv = [a for a in argv if a != "--kinds"]
+    kinds, drafter = "--kinds" in argv, "--drafter" in argv
+    argv = [a for a in argv if a not in ("--kinds", "--drafter")]
     cut = argv.index("--")
     args = ops._parser().parse_args([*argv[:cut], "--gpu", "0", "--out", out])
     shapes = [decode(w) for w in args.width] + [prefill(*s) for s in args.prefill]
     config = atom_config([*argv[cut + 1 :], "--load_dummy", "empty"])
     ranks.layout(config)
     store, keep = ArtifactStore(args.store), first_of_each if kinds else dict
-    todo = [
-        (s, args.context, keep(ops.leaves(ops.graph(store, config, s)["region"])))
-        for s in shapes
-    ]
+
+    def found(shape):
+        if not drafter:
+            return ops.leaves(ops.graph(store, config, shape)["region"])
+        held = ops.leaves_at(store, config, shape).items()
+        return {sig: leaf for sig, leaf in held if leaf[0].get("drafted")}
+
+    todo = [(s, args.context, keep(found(s))) for s in shapes]
     pc = config.parallel_config
     driverless.group(config.tensor_parallel_size, pc.data_parallel_size)
     set_current_atom_config(config)
@@ -320,8 +335,10 @@ def main(out, argv) -> None:
     deep, prepare, time_ = ops._deep, ops.Stub._prepare, ops.Stub._time
     journal = ops._journal
     # by the id of each metadata view's clone, the live view it cloned; by
-    # leaf and slot, the identity and staged values of what placement 0 bound
-    sources, bound, seen = {}, {}, {}
+    # leaf and slot, the identity and staged values of what placement 0 bound;
+    # by leaf, and by slot, the identity of what its later occurrences take
+    # there (`ops.QUERIED`)
+    sources, bound, seen, later = {}, {}, {}, {}
 
     def cloning(x, memo, clones=None):
         out = deep(x, memo, clones)
@@ -342,6 +359,10 @@ def main(out, argv) -> None:
             spec = dict(ops._specs(stub.leaves[sig][0]["args"]))[path]
             if spec["role"] == "metadata" or str(live.dtype) in INTEGERS:
                 bound[sig, path] = identity(live, pool), values(live, hosts)
+        later.clear()  # none on a bench that binds every occurrence alike
+        for (_, sig, path), (_, view) in getattr(stub, "later", {}).items():
+            live = sources.get(id(view), (None, view))[1]
+            later.setdefault(sig, {})[path] = identity(live, pool)
 
     def timing(stub, op, sig, instances, n):
         held = {p: v for (s, p), (_, v) in bound.items() if s == sig and v}
@@ -358,6 +379,7 @@ def main(out, argv) -> None:
     def journaled(path, records):
         for r in records:
             r["identity"] = seen.get(r["leaf"], {})
+            r["later_identity"] = later.get(r["leaf"], {})
         return journal(path, records)
 
     def launching(name):
@@ -419,6 +441,7 @@ def main(out, argv) -> None:
             (ops.Stub, "_prepare", preparing),
             (ops.Stub, "_time", timing),
             (ops, "uniform_ids", host_draw),
+            (ops.Stub, "_top_k", lambda *a: None),
             (ranks, "cpu_group", lambda: None),
             (torch, "bincount", uncounted),
             (torch, "equal", lambda a, b: False),
@@ -439,6 +462,7 @@ def main(out, argv) -> None:
             | {"verdict": state, "why": why, "kernels": kernels}
             | {"bound": r.get("metadata", {})}
             | {"identity": r.get("identity", {})}
+            | {"later": r.get("later_identity", {})}
         )
     pathlib.Path(out).write_text(json.dumps(records, indent=1))
 

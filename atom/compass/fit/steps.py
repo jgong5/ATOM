@@ -16,7 +16,9 @@ takes, which `publish.inputs` loads each measurement under.
 `step-linear` takes real runs only and fits `step_linear_fit.FORMS`' `--form`,
 `history` by default, joining each step's ranks at the engine config's
 `data_parallel_size`, so a record with a
-rank that gave no sample refuses; it holds out each run on the others when
+rank that gave no sample refuses; it pads prefill to the records'
+`prefill_buckets`, naming under `unfitted` records stating none, and holds
+out each run on the others when
 there are two or more, as that module's command does; `--seed` fixes
 its shuffles. The law states the configuration's
 `machine_spec` and `engine_config`, as that command's does, and the key holds them. The report's
@@ -24,11 +26,12 @@ provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
 
 `step-grid` plans again over `--grid`'s inputs, record directories and
-`shape_population` tokens, with the nodes and margin `--grid-definition`
-states, as `measure steps` plans, and reads each planned point's
-`step_measurement` by its batch view under its targets' configuration,
-whichever replay or plan measured it; a planned point the store does not hold
-refuses, naming each, and no other measurement is read as a point. Its targets
+`shape_population` tokens, and over its ragged targets, with the nodes and
+margin `--grid-definition` states, as `measure steps` plans, and reads each
+planned point's `step_measurement` by its batch view under its targets'
+configuration, whichever replay or plan measured it; a planned point the store
+does not hold refuses, naming each, and no other measurement is read as a
+point. Its targets
 are records and the tokens of `measure steps`' replayed batches (`TARGET`); a
 planned point named as one refuses, and a ragged one (`measure steps
 --ragged`) fits the decode lookup's alpha, not the residual. `step_grid_fit.bundle` fits the bundle,
@@ -45,6 +48,7 @@ targets', naming the targets'. `--sessions A:B` keeps the `--grid` lines
 """
 
 import copy
+import dataclasses
 import json
 from pathlib import Path
 
@@ -64,7 +68,10 @@ TARGETS = ("the targets'", "the targets' sampling is")
 def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     form = args.form or "history"
     options = {"form": form, "dp": step_linear_fit.join_width(config["engine_config"])}
+    options["buckets"] = config.get("prefill_buckets")
     law, report = step_linear_fit.fit(samples, options, args.seed)
+    if options["buckets"] is None:
+        law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
     if len({s.provenance["run"] for s in samples}) > 1:
         step_linear_fit.mark_held_out(law, report, samples, options, args.seed)
     report["provenance"] = publish.runs(samples)
@@ -82,7 +89,20 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
         )
     store = ArtifactStore(args.store)
     engine, sampling = config["engine_config"], config["sampling"]
-    _, grid = measure.grid_plan(args, args.grid, store, engine, sampling, TARGETS)
+    read = measure.read_inputs(args, args.grid, store, engine, sampling, TARGETS)
+    ragged = [
+        (
+            s.provenance["run"],
+            {
+                "rows": [dataclasses.astuple(r) for r in s.view.requests],
+                "rung": s.view.capture_rung,
+                "produces_output": s.view.produces_output,
+            },
+        )
+        for s in samples
+        if s.provenance["source"] == "ragged"
+    ]
+    grid = measure.grid_plan(args, read, ragged)
     planned = grid["plan"]
     fields = ("model", "device", "source_root")
     keys = [

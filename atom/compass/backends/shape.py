@@ -53,7 +53,7 @@ replayed nothing.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 def _refuse_shadowing(owner: type, cls: type) -> None:
@@ -212,9 +212,9 @@ class BatchView:
     the step samples, which a pure middle prefill chunk does not; None when
     the caller did not say.
     `tbo_tokens` is the two-batch-overlap split the data-parallel group
-    agreed: per micro-batch, each rank's token count. It is None when the
-    step is not split, and on one rank. `dp_rank` is this rank's slot in the
-    data-parallel group's counts, `tbo_tokens`' among them; None on one rank
+    agreed, a group of one included: per micro-batch, each rank's token
+    count. It is None when the step is not split. `dp_rank` is this rank's
+    slot in the data-parallel group's counts, `tbo_tokens`' among them; None on one rank
     or when the caller did not say. `dp_dummy` says the step is a DP rank's
     dummy forward, run because a peer has work and this rank has none; False
     on one rank. `group_dummies` counts the ranks of the data-parallel group
@@ -223,16 +223,12 @@ class BatchView:
     and reaches the MoE gate, and every dummy runs the same rows, from token 0
     at position 0, so the group's dummies route alike.
     `group_prefills` says some rank of the data-parallel group
-    prefills at this step; False on one rank. `image_tokens` counts the scheduled
-    tokens whose embedding the step's vision encoder supplies; a backend that
-    has no basis for pricing that encoder refuses a step with any.
-    `start_lag_s` is, on a step that produces output, how far behind its host
-    the device starts it: its device start less the host's return from the
-    wait on the previous output's tokens, where the host queues a drafter's
-    propose pass, in seconds, negative when the device started first; None
-    when the caller did not say. It is a timeline's, not the batch's: the
-    runner's host clock or a record's stamps supply it, and two views that
-    differ only in it are equal.
+    prefills at this step; False on one rank. `group_max_tokens` is the most
+    tokens any rank of the group scheduled at this step, which ATOM picks the
+    step's prefill token-graph bucket by (`ForwardMode._pad_to_token_graph`),
+    never fewer than this rank's; None on one rank. `image_tokens` counts the
+    scheduled tokens whose embedding the step's vision encoder supplies; a
+    backend that has no basis for pricing that encoder refuses a step with any.
 
     What this does not do is make the collapsed form unreachable: one row is
     a legal batch, and a one-row batch is `tokens x history` by construction.
@@ -254,7 +250,7 @@ class BatchView:
     group_prefills: bool = False
     draft_rows: int | None = None
     group_dummies: int = 0
-    start_lag_s: float | None = field(default=None, compare=False)
+    group_max_tokens: int | None = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -272,6 +268,12 @@ class BatchView:
         for row in rows:
             if not isinstance(row, RequestShape):
                 raise TypeError(f"not a request shape: {row!r}")
+        peak = self.group_max_tokens
+        if peak is not None and peak < sum_tokens(rows):
+            raise ValueError(
+                f"group max tokens {peak} is fewer than the {sum_tokens(rows)} "
+                "this rank scheduled"
+            )
         if self.capture_rung is None:
             return
         decode = self.decode

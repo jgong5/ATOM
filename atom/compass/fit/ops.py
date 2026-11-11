@@ -21,7 +21,9 @@ shape's token or sequence count or one more. Any other integer names the leaf:
 the GEMMs of a decode step differ in N and K and share a family per weight.
 
 A family's dimensions are the shape's counts its masked integers follow, a
-decode's B always, the rows its MoE gathers, ``G``, when the shape states them
+decode's B always, at its T where it states one (a drafter's own leaves at the
+rows they ran, the step padded to B), the rows its MoE gathers, ``G``, when the
+shape states them
 (a shape that states no ``G`` gathers every rank's T, and is another family), and,
 for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
@@ -259,6 +261,8 @@ def fit(points) -> dict:
         for p in members:
             name = family(p["shape"], p["leaf"], free_of[skel])
             at_p = shape_counts(p["shape"]) | {"context": _context(p)}
+            if p["shape"].startswith("decode") and "T" in at_p:
+                at_p["B"] = at_p.pop("T")  # a drafter's own rows, padded to B
             moves = dependent.get(p["op"], True)
             if "T" in at_p:
                 moves = dependent.get(("prefill", p["op"]), moves)

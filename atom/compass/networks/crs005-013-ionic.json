@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "name": "crs005-013-ionic",
+  "provenance": {
+    "authored_by": "compass agent for jgong5",
+    "date": "2026-11-08",
+    "origin": "probed",
+    "origins": {
+      "interconnect.inter_node.link_bandwidth_bytes_per_s": {
+        "origin": "probed",
+        "source_root": "commit:f371241a0",
+        "record": "sha256:8c5a2b561e898c28f51605e5069c4a98cbe362db40a8f734a83cb74423f88103",
+        "p10": 50000000000.0,
+        "p90": 50000000000.0
+      },
+      "interconnect.inter_node.link_latency_s": {
+        "origin": "probed",
+        "source_root": "commit:f371241a0",
+        "record": "sha256:8c5a2b561e898c28f51605e5069c4a98cbe362db40a8f734a83cb74423f88103",
+        "p10": 2.950775364256114e-05,
+        "p90": 6.060598291460931e-05
+      },
+      "interconnect.inter_node.derate": {
+        "origin": "probed",
+        "source_root": "commit:f371241a0",
+        "record": "sha256:dfe10eb1bf596f9a77c38cff6e3a9419cd5ff1ccf447eb1a1283a367b3eb6c91",
+        "p10": 0.3716563888843095,
+        "p90": 0.5117426951060756
+      }
+    },
+    "notes": "crsuse2-m2m-v3-005 writing into -013 over ionic_N, the rails of matched-rail Mooncake. At f371241a0, the source root, rdma_link.py's bench (005's GPUs into 013's, the 1P1D deployment's RDMA settings) read the port rate on all sixteen ports and timed every GPU's writes on its own rail and the next GPU's, and one 1P1D run of #975's EP-off cell at c=64 for 600 s recorded its KV writes. rdma_link.py fit BENCH RECORD at 5f5cccf1a gives the values: the port rate, the latency fitted per round on the bench's writes, and the derate of the run's KV writes that no other write was in flight beside on their prefill rank or rail. The rate's and the latency's record is the bench's sha256; the derate's is the sha256 that fit prints over the run's writes files"
+  },
+  "interconnect": {
+    "inter_node": {
+      "link_bandwidth_bytes_per_s": 50000000000.0,
+      "link_latency_s": 3.008648854934795e-05,
+      "derate": 0.46939086521217643
+    }
+  }
+}

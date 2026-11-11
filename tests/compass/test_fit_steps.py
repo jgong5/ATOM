@@ -109,7 +109,7 @@ def law_key(form="history") -> Key:
         Kind.STEP_LINEAR_LAW,
         model=HOST["model"],
         engine_config=json.dumps(ENGINE, sort_keys=True),
-        source_root="tree-67c176f0",
+        source_root="atom_py-" + HOST["atom"],
         form=form,
         machine_spec=DIGEST,
     )
@@ -210,7 +210,7 @@ def test_the_entry_s_readings_are_the_ones_its_records_state(tmp_path):
             "stated", "rocm 7.2.4 / aiter f4e7c7509 / rccl 2.22.3"
         ),
         Axis.TORCH: Reading("stated", "2.10.0"),
-        Axis.ATOM_SRC: Reading("tree", "67c176f0"),
+        Axis.ATOM_SRC: Reading("atom_py", HOST["atom"]),
         Axis.MODEL: Reading("stated", HOST["model"]),
         Axis.DEVICE: Reading("stated", "MI355X gfx950"),
         Axis.PTL: Reading("stated", "disabled"),

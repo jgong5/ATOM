@@ -39,11 +39,12 @@ from types import SimpleNamespace
 import pytest
 import zmq
 from aiter_stub import stubbed_aiter
+from test_vertical_slice import _run_file
 
 from atom.compass import clock_transport
 from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
-from atom.compass.clock import LpId, single_engine_table
+from atom.compass.clock import NER, PARK, TAR, LpId, single_engine_table
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import SequenceStatus
 from atom.utils import clock, get_open_zmq_ipc_path, make_zmq_socket, zmq_shim
@@ -56,7 +57,7 @@ with stubbed_aiter():
     from atom.model_engine.engine_core_mgr import CoreManager
 
 TREE = Path(__file__).resolve().parents[2]
-TABLE = single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002)
+TABLE = single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002)
 SIGNALS = pytest.mark.parametrize(
     "sig", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"]
 )
@@ -222,7 +223,7 @@ def _serve(tmp_path, script, *argv):
                 {
                     "clock_endpoint": f"tcp://127.0.0.1:{clock_port}",
                     "bound_s": 100.0,
-                    "admission_path": "serving",
+                    "admission_s": 0.54e-3,
                     "ipc_s": 2.0**-10,
                     "stream_s": 2.0**-9,
                     "out_dir": str(tmp_path),
@@ -393,7 +394,7 @@ def test_an_engine_has_the_handler_it_set_aside_at_ready_back_as_it_leaves(
     back once the engine leaves its loop, or its construction if that raises,
     and ATOM's `_send_ready_signal` is its own again."""
     run = {"clock_endpoint": "", "bound_s": 100.0, "out_dir": str(tmp_path)}
-    run |= {"admission_path": "serving", "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
+    run |= {"admission_s": 0.54e-3, "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
     (tmp_path / "run.json").write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     monkeypatch.setattr(compass_run, "_member", None)
@@ -445,7 +446,7 @@ def test_an_engine_stopped_holding_a_read_request_hands_in_no_straggler(
     stop's ``+inf`` one has released it."""
     endpoint, request = f"inproc:{uuid.uuid4().hex}", "frontend->engine:request#dp0"
     run = {"clock_endpoint": endpoint, "bound_s": 100.0, "out_dir": str(tmp_path)}
-    run |= {"admission_path": "serving", "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
+    run |= {"admission_s": 0.54e-3, "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
     (tmp_path / "run.json").write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     monkeypatch.setattr(compass_run, "_member", None)
@@ -491,6 +492,33 @@ def test_an_engine_stopped_holding_a_read_request_hands_in_no_straggler(
     ctx.destroy(linger=0)
 
 
+@pytest.mark.parametrize("held_by", ["a call naming a later round", "a park"])
+def test_a_stop_hands_a_dp_member_what_was_held_for_it(tmp_path, held_by):
+    """Request 0 reaches dp0 at 0.25 and a round grants it while dp0 waits, in a
+    call that named a later round or parked; then the frontend stops. dp0's one
+    reply, the stop's ``+inf``, carries request 0, whose release row its round's
+    grant wrote once."""
+    req0 = "frontend->engine:request#dp0"
+    run = json.loads(_run_file(tmp_path, data_parallel_size=2).read_text())
+    ca = compass_run._RecordingAuthority(run)
+    engine, inf = compass_run.ENGINE, math.inf
+    ca.on_request(LpId("traffic"), NER, inf, [])
+    ca.on_request(compass_run.FRONTEND, NER, inf, [(req0, 0, 0.25)])
+    if held_by == "a park":
+        replies = ca.on_request(engine, PARK, inf, [], member="dp0")
+        replies += ca.on_request(engine, NER, inf, [], member="dp1")
+    else:  # dp0 returns at 0.5, dp1 at 0.3
+        replies = ca.on_request(engine, TAR, 0.3, [], member="dp0", rounds=[0.5])
+        replies += ca.on_request(engine, TAR, 0.3, [], member="dp1")
+    replies += ca.on_request(compass_run.FRONTEND, TAR, inf, [])  # the stop
+
+    dp0 = [(g, released) for to, g, released, *_ in replies if to == (engine, "dp0")]
+    assert [(g, {c: r for c, r in held.items() if r}) for g, held in dp0] == [
+        (inf, {req0: [(0, 0.25)]})
+    ]
+    assert [r.time_to for r in ca.steps.rows if r.channel == req0] == [0.25]
+
+
 def test_an_engine_whose_input_thread_reads_shutdown_first_takes_the_released_request(
     monkeypatch, tmp_path
 ):
@@ -500,71 +528,89 @@ def test_an_engine_whose_input_thread_reads_shutdown_first_takes_the_released_re
     takes the request first, then leaves on SHUTDOWN, and the engine hands in."""
     endpoint, request = f"inproc:{uuid.uuid4().hex}", "frontend->engine:request#dp0"
     run = {"clock_endpoint": endpoint, "bound_s": 100.0, "out_dir": str(tmp_path)}
-    run |= {"admission_path": "serving", "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
+    run |= {"admission_s": 0.54e-3, "ipc_s": 0.001, "stream_s": 0.002}  # TABLE
     (tmp_path / "run.json").write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
     monkeypatch.setattr(compass_run, "_member", None)
     server = clock_transport.serve(compass_run._RecordingAuthority(run), endpoint)
     ctx = zmq_shim._Context()
-    conn = clock_transport.connect(compass_run.FRONTEND, endpoint)
-    frontend = compass_run._StoppingClock(compass_run.FRONTEND, TABLE, conn)
-    addrs = [get_open_zmq_ipc_path() for _ in range(2)]
-    monkeypatch.setattr(clock, "_installed", frontend)
-    clock.name_endpoints(0, *addrs, "")
-    mgr = CoreManager.__new__(CoreManager)
-    mgr.input_sockets, mgr.control_sockets = (
-        [make_zmq_socket(ctx, a, zmq.ROUTER, bind=True)] for a in addrs
-    )
-    mgr._control_send_lock = threading.Lock()
-
-    said = {"refused_commands": [], "priced_steps": {}, "predicted_memory": {}}
-    workers = SimpleNamespace(call_func=lambda name, wait_out: said[name])
-
-    # The loop runs on a thread here, so a hang fails the test instead of
-    # holding it; only the main thread may set a signal handler.
-    monkeypatch.setattr(signal, "signal", lambda sig, handler: signal.SIG_DFL)
-
-    def engine_loop():
-        with compass_run.engine_loop(SimpleNamespace(runner_mgr=workers)):
-            while not clock.idle(lambda: math.inf):
-                pass
-
-    owner = threading.Thread(target=engine_loop, daemon=True)
-    connection = clock_transport.connect(compass_run.ENGINE, endpoint)
-    rt = LPRuntime(compass_run.ENGINE, TABLE, connection, owner=owner)
-    monkeypatch.setattr(clock, "_installed", rt)
-    clock.name_endpoints(0, *addrs, "")
-    engine = EngineCore.__new__(EngineCore)
-    engine.label, engine.input_queue = "engine", queue.Queue()
-    reader = threading.Thread(
-        target=engine.process_input_sockets, args=addrs, daemon=True
-    )
-    reader.start()
-    assert mgr.input_sockets[0].raw.poll(5000) and mgr.control_sockets[0].raw.poll(5000)
-    mgr.engine_core_identities = [mgr.input_sockets[0].recv_multipart()[0]]
-    mgr.control_identities = [mgr.control_sockets[0].recv_multipart()[0]]
-    frontend.start_run()
-    rt.start_run()
-    add = (EngineCoreRequestType.ADD, [SimpleNamespace(id=7)])
-    mgr._send_request(0, pickle.dumps(add))
-    deadline = time.monotonic() + 10
-    while 0 not in rt.arrived[request]:
-        assert time.monotonic() < deadline, "request 0 not read in 10 wall seconds"
-        time.sleep(0.01)
-    frontend.end_run()  # the stop, as the frontend's event loop makes it
-    mgr._send_control(0, pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
-    reader.join(1)  # SHUTDOWN reaches the input thread before the engine asks
-    owner.start()
-    owner.join(10)
-    reader.join(10)
     try:
-        assert not owner.is_alive(), "the engine never took the released request"
-        assert not reader.is_alive()
-        taken = [engine.input_queue.get_nowait()[0] for _ in range(2)]
-        assert taken[0].id == 7
-        assert taken[1].status == SequenceStatus.EXIT_ENGINE
-        hand_in = tmp_path / compass_run.LP_FILE.format("engine")
-        assert json.loads(hand_in.read_text())["refusals"] == []
+        conn = clock_transport.connect(compass_run.FRONTEND, endpoint)
+        frontend = compass_run._StoppingClock(compass_run.FRONTEND, TABLE, conn)
+        addrs = [get_open_zmq_ipc_path() for _ in range(2)]
+        monkeypatch.setattr(clock, "_installed", frontend)
+        clock.name_endpoints(0, *addrs, "")
+        mgr = CoreManager.__new__(CoreManager)
+        mgr.input_sockets, mgr.control_sockets = (
+            [make_zmq_socket(ctx, a, zmq.ROUTER, bind=True)] for a in addrs
+        )
+        mgr._control_send_lock = threading.Lock()
+
+        said = {"refused_commands": [], "priced_steps": {}, "predicted_memory": {}}
+        workers = SimpleNamespace(call_func=lambda name, wait_out: said[name])
+
+        # The loop runs on a thread here, so a hang fails the test instead of
+        # holding it; only the main thread may set a signal handler.
+        monkeypatch.setattr(signal, "signal", lambda sig, handler: signal.SIG_DFL)
+
+        def engine_loop():
+            with compass_run.engine_loop(SimpleNamespace(runner_mgr=workers)):
+                while not clock.idle(lambda: math.inf):
+                    pass
+
+        owner = threading.Thread(target=engine_loop, daemon=True)
+        connection = clock_transport.connect(compass_run.ENGINE, endpoint)
+        rt = LPRuntime(compass_run.ENGINE, TABLE, connection, owner=owner)
+        monkeypatch.setattr(clock, "_installed", rt)
+        clock.name_endpoints(0, *addrs, "")
+        engine = EngineCore.__new__(EngineCore)
+        engine.label, engine.input_queue = "engine", queue.Queue()
+        reader = threading.Thread(
+            target=engine.process_input_sockets, args=addrs, daemon=True
+        )
+        reader.start()
+        try:
+            assert mgr.input_sockets[0].raw.poll(5000)
+            assert mgr.control_sockets[0].raw.poll(5000)
+            mgr.engine_core_identities = [mgr.input_sockets[0].recv_multipart()[0]]
+            mgr.control_identities = [mgr.control_sockets[0].recv_multipart()[0]]
+            frontend.start_run()
+            rt.start_run()
+            add = (EngineCoreRequestType.ADD, [SimpleNamespace(id=7)])
+            mgr._send_request(0, pickle.dumps(add))
+            deadline = time.monotonic() + 10
+            while 0 not in rt.arrived[request]:
+                assert (
+                    time.monotonic() < deadline
+                ), "request 0 not read in 10 wall seconds"
+                time.sleep(0.01)
+            frontend.end_run()  # the stop, as the frontend's event loop makes it
+            mgr._send_control(0, pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+            reader.join(1)  # SHUTDOWN reaches the input thread before the engine asks
+            owner.start()
+            owner.join(10)
+            reader.join(10)
+            assert not owner.is_alive(), "the engine never took the released request"
+            assert not reader.is_alive()
+            taken = [engine.input_queue.get_nowait()[0] for _ in range(2)]
+            assert taken[0].id == 7
+            assert taken[1].status == SequenceStatus.EXIT_ENGINE
+            hand_in = tmp_path / compass_run.LP_FILE.format("engine")
+            assert json.loads(hand_in.read_text())["refusals"] == []
+        finally:
+            # An input thread that a failure left polling, once connected,
+            # leaves on a SHUTDOWN neither run holds back: sent after the stop,
+            # read once the engine's run ends.
+            if reader.is_alive() and hasattr(mgr, "control_identities"):
+                if frontend.in_run:
+                    frontend.end_run()
+                rt.end_run()
+                shutdown = (EngineCoreRequestType.SHUTDOWN, None)
+                mgr._send_control(0, pickle.dumps(shutdown))
+                reader.join(10)
     finally:
+        # A context left to the garbage collector can hang the session in
+        # `Context.term`, so every path past its creation closes it and the
+        # server, a refused stop in the `finally` above included.
         server.close()
         ctx.destroy(linger=0)

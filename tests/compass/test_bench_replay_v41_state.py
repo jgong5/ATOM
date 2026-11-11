@@ -241,7 +241,7 @@ def test_a_v41_page_field_taken_whole_binds_it_and_counts_once_a_placement(probe
 
 @pytest.mark.parametrize(
     "pool, slots",
-    [("whole", 8), ("ring", 8), ("ring", 4), ("ring", 16), ("ring0", 8)],
+    [("whole", 8), ("ring", 8), ("ring", 4), ("ring0", 8)],
 )
 def test_a_v41_window_ring_reached_through_its_pool_counts_once_a_slot(
     probed, pool, slots
@@ -253,7 +253,7 @@ def test_a_v41_window_ring_reached_through_its_pool_counts_once_a_slot(
     (`ring_view`), at a leaf stating its window of 8, the ring's rows a row's
     window reads count once a slot pair, and the whole pool's selection, top-k
     1 a row, once a placement, none at ratio 0; whether the capture held the
-    bench's 8 state slots or 4 or 16."""
+    bench's 8 state slots or 4."""
     _, seen = probed
     placed = seen[f"ops_v41_{pool}_pool_{slots}"]
     [record] = placed["got"]
@@ -278,3 +278,61 @@ def test_a_v41_window_ring_written_through_its_pool_counts_a_row_a_token(
     [record] = placed["got"]
     assert placed["refused"] is None and record["placements"] == 7
     assert record["footprint_bytes"] == 7 * 16 * tokens + sets * placed["ring"]
+
+
+@pytest.mark.parametrize("case, rows", [("prefix0", 32), ("prefix2", 32), ("tail", 16)])
+def test_a_v41_cached_prefill_reads_its_history_through_its_pool_once_a_slot(
+    probed, case, rows
+):
+    """A two-row prefill past 96 cached tokens, its attention taking V4.1's
+    pool alone, stating its window of 8: each row's prefix reads there the 7
+    ring rows before its first token, once a slot pair of the 4 that 8 slots
+    hold, and its selection, top-k 1 a row, once a placement, none at ratio 0.
+    A bounded-replay tail's, 16 query rows of the 32, reads no ring row."""
+    _, seen = probed
+    placed = seen[f"ops_v41_{case}"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    ring, pages = placed["ring"], placed["read"] - placed["ring"]
+    assert record["footprint_bytes"] == 7 * 16 * rows + 7 * pages + 4 * ring
+
+
+#: The bench tensor each KV view `v41_state_probe.kv_bound` takes binds.
+BOUND = {
+    "pages": "pages.buf.torch.bfloat16",
+    "page_bytes": "pages.buf.torch.bfloat16",
+    "state_bytes": "state.buf.torch.bfloat16",
+    "state_fp32": "state.buf.torch.float32",
+    "cursor": "cursor",
+    "pool": "pool",
+}
+
+
+@pytest.mark.parametrize("view, slots", [(v, s) for s in ("8", "2") for v in BOUND])
+def test_a_v41_kv_view_binds_the_bytes_atom_passes(probed, view, slots):
+    """A KV view of a capture's cache of 4 PAGEs, bound on the bench's of 64
+    PAGEs and 8 state slots: the page and state arenas' flat buffers, the
+    cursor history at the bytes ATOM passes there,
+    the state arena in float32 and the whole pool as before. At a capture of
+    2 slots, the state arena's 2, and the whole pool, which lies an entry
+    and more inside the bench's state arena, at the pool's start."""
+    _, seen = probed
+    assert seen["kv_bound"][slots][view] == [f"cache.{BOUND[view]}", 0]
+
+
+@pytest.mark.parametrize("slots", [8, 4, 2, 16])
+def test_a_v41_window_ring_binds_atom_s_rows_or_refuses_past_the_bench_s_slots(
+    probed, slots
+):
+    """Layer 1's window ring beside its pool, of a capture's 4 PAGEs and `slots`
+    state slots, on the bench's 8: at the rows ATOM's `ring_view` passes, the
+    pool at its start though at 4 and 2 slots it fits the bench's state arena;
+    at 16 the leaf refuses, naming both."""
+    _, seen = probed
+    placed = seen[f"ops_v41_ring_pool_{slots}"]
+    pool, (ring, at) = "attn_metadata_builder.cache.pool", placed["bound"]["ring"]
+    assert placed["bound"]["pool"] == [pool, 0]
+    if slots > 8:  # a KV slot bound to none refuses its leaf
+        assert at is None and ring.endswith("over 16 state slots; the bench holds 8")
+    else:
+        assert placed["refused"] is None and [ring, at] == [pool, 0]

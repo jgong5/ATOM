@@ -27,15 +27,17 @@ Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
 config.json's digest; `device`, each GPU's `<name> <arch>`, as a spec states
 it; `engine_config`, `keyed`'s fields, the parallel layout among them;
-`source_root`, `<revision_kind>-<revision>`; `sampling`, the request
-parameters, null for a record serving no client run's request; its host key
+`prefill_buckets`, those `step_linear_fit.stated_buckets` reads, null where it
+states none; `source_root`, its host key's ``atom`` as `source_root` writes
+it; `sampling`, the request parameters, null for a record serving no client
+run's request; its host key
 less its model and engine; its `stack`, the software versions run.json
 names; and its `ptl`, the cards' PTL state, `unrecorded` for a run.json that
-names none. A measurement reads the same fields but the host key and stack from its
-key, whose `engine_config` and `sampling` are JSON objects as text. A field
-that differs between inputs refuses, naming each value and the inputs holding
-it; so do a profiled record and a record whose requests carry two sets of
-request parameters.
+names none. A measurement reads the same fields but the host key, stack and
+prefill buckets from its key, whose `engine_config` and `sampling` are JSON
+objects as text. A field that differs between inputs refuses, naming each
+value and the inputs holding it; so do a profiled record and a record whose
+requests carry two sets of request parameters.
 """
 
 import dataclasses
@@ -45,11 +47,14 @@ from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, Topology
 from atom.compass.backends.shape import BatchView, RequestShape
+from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS
 from atom.compass.backends.step_labels import Sample, digest, label_run
+from atom.compass.backends.step_linear_fit import stated_buckets
 from atom.compass.drive import aiter_jit
 from atom.compass.drive.identity import PTL_CHANGES
 from atom.compass.parity import ARRIVALS
 from atom.compass.parity.served import served
+from atom.compass.run import source_root
 from atom.compass.run.step_grid import keyed_of
 from atom.compass.validate.bound import _split
 
@@ -136,6 +141,7 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
     return samples, {
         **fields,
         "engine_config": keyed_of(engine),
+        PREFILL_BUCKETS: stated_buckets(steps / "dp0.jsonl"),
         "stack": run["stack"],
         "ptl": run.get("ptl", UNRECORDED),
         "sampling": json.loads(sampling[0]) if sampling else None,
@@ -146,7 +152,7 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
 def run_fields(run: dict, record="run.json") -> dict:
     """The `model`, `device` and `source_root` a run.json's identity states.
     A run on a tree with uncommitted files refuses, naming `record`: its
-    source root names the tree's HEAD, which is not the code that ran."""
+    provenance names the tree's HEAD, which is not the code that ran."""
     if dirty := run["source"].get("dirty"):
         raise ValueError(
             f"{record} ran with {dirty} uncommitted files in its source tree; "
@@ -157,7 +163,7 @@ def run_fields(run: dict, record="run.json") -> dict:
         "device": ", ".join(
             sorted({" ".join(str(gpu[f]) for f in CARD) for gpu in run["device"]})
         ),
-        "source_root": f"{run['source']['revision_kind']}-{run['source']['revision']}",
+        "source_root": source_root(run["host_key"]["atom"]),
     }
 
 
