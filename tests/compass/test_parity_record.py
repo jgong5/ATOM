@@ -53,7 +53,9 @@ PROMPT, BUDGET, BLOCK = 200, 64, 16
 #: The capture ladder every runner here replays decode steps from.
 LADDER = [1, 2, 4, 8]
 #: An attention builder that runs every decode from a graph, as ATOM's base does.
-GRAPHABLE = SimpleNamespace(step_needs_eager=lambda batch: False)
+GRAPHABLE = SimpleNamespace(
+    step_needs_eager=lambda batch: False, supports_token_graph=False
+)
 
 
 def _prompt(i):
@@ -489,6 +491,7 @@ def _engine(blocks):
         "max_model_len": 2048,
         "num_kvcache_blocks": blocks,
         "enable_prefix_caching": False,
+        "prefill_buckets": [],
     }
 
 

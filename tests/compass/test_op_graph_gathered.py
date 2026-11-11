@@ -55,8 +55,8 @@ RESPLIT_TBO = ((3, 1, 1, 1, 1, 1, 1, 6), (4, 0, 0, 0, 0, 0, 0, 8))
 STORED = [
     Shape("prefill", 7, 1, 27),
     Shape("prefill", 7, 1),
-    Shape("prefill", 3, 1, 15),
-    Shape("prefill", 4, 1, 12),
+    Shape("prefill", 3, 1, 15, micro_batch=True),
+    Shape("prefill", 4, 1, 12, micro_batch=True),
     Shape("decode", 4, 4),
     Shape("decode", 1, 1, 27),
 ]
@@ -87,7 +87,14 @@ def backend(config, tmp_path):
     store = ArtifactStore(str(tmp_path / "store"))
     for shape in STORED:
         for output in (True, False) if shape.phase == "prefill" else (True,):
-            at = structure(config, shape.phase, True, "gfx950", output)
+            at = structure(
+                config,
+                shape.phase,
+                True,
+                "gfx950",
+                output,
+                micro_batch=shape.micro_batch,
+            )
             store.publish(
                 Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape)),
                 provenance=stanza("compass trace ops"),
