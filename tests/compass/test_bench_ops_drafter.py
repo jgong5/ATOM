@@ -297,6 +297,25 @@ def test_a_drafter_s_own_prefill_shape_that_is_a_step_s_is_measured_whole(
     }
 
 
+def test_coverage_asks_a_padded_prompt_s_leaves_at_its_width_as_a_run_does(
+    bench, tmp_path, monkeypatch  # noqa: F811
+):
+    # Prompts of one row padded to 4 and to 8, and none at its row: the LM
+    # head, the drafter's later pass and its sampler hold points at W alone.
+    padded = [
+        PROMPT | {"rows": [[t, t, False]], "target_bs": w, "draft_bs": w}
+        for t, w in ((40, 4), (60, 8))
+    ]
+
+    _, report = _plan_mtp(bench, tmp_path, monkeypatch, *padded)
+
+    assert report["by part"] == {
+        "target": {"steps": 3, "covered": 3},
+        "draft": {"steps": 3, "covered": 3},
+    }
+    assert report["left out, by leaf kind"] == {}
+
+
 class _Padding(_Runner):
     """`_Runner` keeping, for each batch it prepares, the ladder its step pads
     to, ATOM's under `--enforce-eager` unless the bench pads it."""
