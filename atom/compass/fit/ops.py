@@ -25,7 +25,8 @@ and not with its T or B, at W as its B, where `OpGraphBackend` asks such a
 leaf; W is no count of any other leaf's, so points at two widths stay apart.
 Where W is that prefill's T too, a leaf that leads with it may have run at
 either B: a point its family reads at two places is left out, named in the
-params' ``left_out``, and a run declines such a leaf there.
+params' ``left_out``, and a run prices such a leaf there where either B gives
+one answer.
 
 A family's dimensions are the shape's counts its masked integers follow, a
 decode's B always, at its T where it states one (a drafter's own leaves at the
