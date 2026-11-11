@@ -14,9 +14,9 @@ each graph of the drafter's part of a step S holds at that shape (`DRAFTED`,
 `leaves_at`), timed on the target's batch; with `--drafter` those alone, the
 points a trace run's drafter kernels take their own lengths from
 (`step_labels.Floor`). A point is one leaf of those graphs,
-its instances grouped (`leaves`), a kernel's layers among them when they
-differ only in where each views one KV pool from (`signature`), at the shape
-and `--context`: a decode
+its instances grouped (`leaves`), a call's layers among them when they
+differ only in a string that names their layer or, a kernel's, in where each
+views one KV pool from (`signature`), at the shape and `--context`: a decode
 step's rows each hold `--context` tokens, under a drafter verifying as many
 more as it drafts, and a prefill's rows, split as the capture split them,
 follow `--context` cached tokens each, none when it is not given; there
@@ -249,6 +249,7 @@ from atom.compass.artifacts import (
 from atom.compass.backends.op_graph import DRAFT, DRAFT_KV, KV, PERMILLE
 from atom.compass.bench.routing import uniform_ids
 from atom.compass.drive.gpu import add_gpu_flag
+from atom.compass.run.modules import LAYER
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 PROG = "compass measure ops"
@@ -779,17 +780,33 @@ def _ref(value) -> bool:
 
 def signature(op: dict) -> str:
     """A leaf's identity across instances: its operator, arguments and outputs,
-    a context key or module path by its kind alone, a kernel's KV argument
-    without the size its pool sets (`_kv_unsized`), and what the capture
-    states beside its arguments when it states anything."""
+    a context key or module path by its kind alone, and so a string that names
+    a layer (`_unnamed`), a kernel's KV argument without the size its pool
+    sets (`_kv_unsized`), and what the capture states beside its arguments
+    when it states anything."""
     kernel = not op["op"].startswith("aten.")
     args = {
-        s: {k: None for k in v} if _ref(v) else _kv_unsized(v) if kernel else v
+        s: _kv_unsized(_unnamed(v)) if kernel else _unnamed(v)
         for s, v in op["args"].items()
     }
     leaf = {"op": op["op"], "args": args, "out": op["out"]}
     leaf |= {"stated": op["stated"]} if "stated" in op else {}
     return json.dumps(leaf, sort_keys=True, separators=(",", ":"))
+
+
+def _unnamed(value):
+    """`value`, an argument, less the name of where its call runs: a context
+    key or module path by its kind alone, and a string that holds a layer's
+    path (`run.modules.LAYER`) as ``{"layer": None}``. A kernel reaches a
+    layer's state by a context key, which the capture records as one, so such
+    a string only names the call, as the ``prefix`` ATOM passes for a trace
+    marker (`mark_trace`) does; a string that holds no layer's path, a mode a
+    kernel runs in among them, stays as it is."""
+    if _ref(value):
+        return {k: None for k in value}
+    if isinstance(value, str) and LAYER.search(value):
+        return {"layer": None}
+    return value
 
 
 def _kv_unsized(value):
