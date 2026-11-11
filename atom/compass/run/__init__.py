@@ -77,8 +77,8 @@ its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, and a law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
-holds at its shape and output, loaded under this process's torch, ATOM source
-and model (`_op_graphs`), the run's TP and EP widths and KV cache format; capture traces
+holds at its shape and output, traced under this process's torch and ATOM source
+and loaded under them and its model (`_op_graphs`), the run's TP and EP widths and KV cache format; capture traces
 eager forwards, so a graph-mode run reads the eager graphs too; with
 ``price_list``, the fields of a `price_list` key ``store`` holds, loaded
 under this run's readings, it prices each leaf from it first; with
@@ -1977,22 +1977,22 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     Each graph read from the store is parsed once and then frozen out of the
     collector's reach with the rest of the live heap (`parsed`).
 
-    A graph the store holds, at a shape or holding G, is loaded through
-    `ArtifactStore.load` under this process's `graph_readings`, and its engine
-    config as it records it: that cell holds the tracer's own ATOM arguments,
-    which no reader restates, and the key's structure names the engine config
-    in their place."""
+    A graph is looked up at the ATOM source and torch this process traces
+    under (`capture.graph_key`), so one traced under another of either is a
+    miss like any other. One the store holds, at a shape or holding G, is
+    loaded through `ArtifactStore.load` under this process's `graph_readings`,
+    and its engine config as it records it: that cell holds the tracer's own
+    ATOM arguments, which no reader restates, and the key's structure names
+    the engine config in their place."""
     from atom.compass.artifacts import (
         ArtifactStore,
         Axis,
         Conditions,
         GateState,
-        Key,
-        Kind,
         Row,
         Topology,
     )
-    from atom.compass.capture import peers
+    from atom.compass.capture import graph_key, peers
     from atom.compass.capture.forward import (
         PerG,
         Shape,
@@ -2054,7 +2054,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         structure `at` and `shape`, as `capture.graph.to_json` writes it."""
         if (at, shape) in unpublished:
             return unpublished[at, shape]
-        key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
+        key = graph_key(at, shape)
         if not store.directory_for(key).exists():
             return None
         return parsed(key)
@@ -2084,7 +2084,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     ) -> dict | str | None:
         shape = Shape(phase, tokens, seqs, gathered, width, micro_batch).at(dp, drafts)
         at = structure(config, phase, True, arch, output, draft, env, micro_batch)
-        key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
+        key = graph_key(at, str(shape))
         missing = not store.directory_for(key).exists()
         if missing and dp > 1 and phase == "prefill" and not (draft or drafts):
             g = shape.gathered or dp * tokens
@@ -2121,16 +2121,14 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
 def graph_readings(model: str) -> dict:
     """This process's readings, by axis, of an `op_graph` of the model `model`
     names, less its engine config, each as `compass trace ops` takes it: its
-    torch, its ATOM source (`atom_source`) and the model's config.json; an axis
-    no op_graph depends on is unread, of a kind no entry records."""
-    import torch
-
+    torch and ATOM source (`capture.traced_under`) and the model's config.json;
+    an axis no op_graph depends on is unread, of a kind no entry records."""
     from atom.compass.artifacts import Axis, Row, axes_of
+    from atom.compass.capture import traced_under
 
     unread = Reading("unread", f"no {Row.OP_GRAPH} depends on it")
     return {a.field: unread for a in Axis if a not in axes_of(Row.OP_GRAPH)} | {
-        "torch": torch.__version__,
-        "atom_src": atom_source(),
+        **traced_under(),
         "model": _file_digest(model, "config.json"),
     }
 
@@ -2319,16 +2317,13 @@ def tokenizer(tok, config) -> None:
 
 def tokenizer_term(run: dict, tok, config) -> tuple[dict, dict | None]:
     """This server's ``host`` entry in the run file `run`, its engine config's
-    among several, and that entry's ``tokenizer`` term, None when it states
-    none: a term fitted on another backend than the one `tok`, the tokenizer
-    ATOM's server loaded, runs on is refused."""
-    host = run.get("host", {})
-    if isinstance(host, list):
-        from atom.compass.run.step_grid import keyed
-
-        host = _fitted_here(
-            host, keyed(config), lambda e: e.get("key", {}).get("engine"), "host"
-        )
+    among several as the runner picks its own (`pick_fitted`), and that entry's
+    ``tokenizer`` term, None when it states none: a term fitted on another
+    backend than the one `tok`, the tokenizer ATOM's server loaded, runs on is
+    refused."""
+    picked = {"host": run.get("host", {})}
+    pick_fitted(picked, "host", config)
+    host = picked["host"]
     term = host.get("tokenizer")
     if term is None:
         return host, None

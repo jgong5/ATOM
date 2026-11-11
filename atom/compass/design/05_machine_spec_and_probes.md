@@ -226,6 +226,7 @@ device:
       fp8:                     3.25e15
       fp4:                     6.0e15
   kernel_floor_s:              2.0e-6   # optional: an empty kernel, replayed in a graph
+  profiler_floor_s:            4.1e-6   # optional: an empty kernel queued under a trace run's profiler
   # no memory readings, activations included: they are `compass measure memory`'s
   # entries (07 D38, Phase 2)
 interconnect:
@@ -325,6 +326,7 @@ mapping so a reader can follow the term into ATOM's code without guessing. The
 | `intra_node.domain_devices` | the link a collective group rides (`10` D66) | MI455X's UALoE fabric joins 72 GPUs across compute trays of 4 (#504), so a TP8 or EP8 group spans two trays without touching the NICs; `count_per_node` alone would send it over `inter_node` |
 | `memory.bandwidth_curve` | `BW(M)` in the analytical price (`10` D64) | the attainable bandwidth depends on the bytes moved; one rate would price a small transfer at the large-transfer rate (#1392) |
 | `kernel_floor_s` | `t0` in the analytical price (`10` D64) | the device's floor on one kernel, below which no pricing unit runs (#1392); the host's launch time is a host law, not this (`10` D64) |
+| `profiler_floor_s` | a trace run's drafter labels (`09` D54) | a kernel queued behind another under the trace run's profiler records at least this; drafter labels sat 5 to 11% over unprofiled time until each kernel's excess left them ([#2415](https://github.com/jgong5/ATOM/issues/2415)) |
 | `*.link_setup_s` | a rank pair's first KV write (`01` D6) | on node 18 Mooncake TCP a pair's first write of 2 to 7 blocks took 9.0 to 28.1 ms longer than its later writes ([#1172](https://github.com/jgong5/ATOM/issues/1172)); absent is zero |
 | every `derate` | the analytical price (`10` D64) | no kernel reaches spec peak; the attainable fraction is probed on the device (D26), compute per format, and assumed only where carried from a probed device (`10` D69) |
 
@@ -493,6 +495,7 @@ intake the same way (`07` D38, Phase 1c).
 | `device-compute` | `compute.attainable_flops`, one per format | per format (BF16, FP8, FP4 where the device has it), the best large-GEMM rate the vendor library reaches, recorded as a rate, which a run divides by the datasheet's `*_flops` (#1392) |
 | `device-bandwidth` | `memory.bandwidth_curve` | read-only, write-only and STREAM copy sweeps over transfer sizes; the curve is the per-size maximum of the three, so it bounds any mix of reads and writes ([#1575](https://github.com/jgong5/ATOM/issues/1575)); `memory.derate` is derived from it (schema rule 2) |
 | `kernel-floor` | `kernel_floor_s` | an empty kernel replayed in a graph, so the host's launch time is not in it |
+| `profiler-floor` | `profiler_floor_s` | empty kernels queued behind a spin under ATOM's kineto profiler as a trace run runs it, the length it records for each |
 | `host-link` | `host_link.*` | the device-to-host copy an lmcache server's stores and loads ride, its latency and the bandwidth a copy reaches |
 
 **Class 2 — N GPUs of the target type.** `measure device` runs both, `pp-carriers` under
