@@ -456,6 +456,9 @@ def test_a_c10d_leaf_runs_on_its_coordinator_s_group_whatever_torch_named_it():
         )
 
 
+GATHERV = "atom.model_ops.moe:all_gatherv"
+
+
 def _gatherv_rank(config, todo, rank):
     """`_measuring_rank` measuring a DP all-gather of two tensors, captured at
     rank 0's 13 rows of `sizes` [13, 1], on aiter's DP group of both ranks,
@@ -474,7 +477,7 @@ def _gatherv_rank(config, todo, rank):
         sys.modules["aiter.dist.parallel_state"].get_dp_group = lambda: dp
         sys.modules["atom.model_ops.moe"] = SimpleNamespace(all_gatherv=gatherv)
         x = ("x", (_t([13, 8], "activation"), _t([13, 6], "activation")))
-        leaf = _leaf(ops.GATHERV, x, ("sizes", [13, 1]))
+        leaf = _leaf(GATHERV, x, ("sizes", [13, 1]))
         found = ops.leaves(_graph(leaf, layers=1)["region"])
         return measure(config, [(prefill(13, 1), None, found)], llc, rank)
 
@@ -488,7 +491,7 @@ def test_each_rank_s_dp_all_gather_sends_its_own_rows_of_the_captured_sizes():
 
     by_rank = ranks.launch(_gatherv_rank, config, [[], []])
 
-    assert [_leaves(records) for records, _ in by_rank] == [[(ops.GATHERV, None)]] * 2
+    assert [_leaves(records) for records, _ in by_rank] == [[(GATHERV, None)]] * 2
     assert [shapes for _, shapes in by_rank] == [
         {((13, 8), (13, 6))},
         {((1, 8), (1, 6))},
