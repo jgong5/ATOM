@@ -7,7 +7,8 @@ A key used to state `machine_spec`, the digest of one spec's device, software
 stack and PTL state; it now states each platform field its kind's row marks,
 by value. A digest is read back as the platform of the spec in `MACHINES` it
 names, and an entry or law whose digest names none is listed and left as it
-is.
+is. Specs that differ in torch alone share a digest, which then names only the
+fields they agree on: an entry or law whose kind keys torch is listed.
 
 `--store OLD NEW` republishes every entry of the store OLD into NEW at its key
 of today, its members, provenance, gates and fingerprints as they are, its
@@ -58,7 +59,7 @@ OLD = "machine_spec"
 def platforms(machines: Path = MACHINES) -> dict[str, dict]:
     """Each spec's platform in `machines`, by the digest a key stated for it:
     the sha256 of its canonical `machine_spec` key, its device, software stack
-    and PTL state."""
+    and PTL state. Specs sharing a digest leave it the fields they agree on."""
     found = {}
     for path in sorted(machines.glob("*.json")):
         platform = machine_platform(
@@ -68,7 +69,9 @@ def platforms(machines: Path = MACHINES) -> dict[str, dict]:
         canonical = json.dumps(
             {"kind": OLD, "key": old}, sort_keys=True, separators=(",", ":")
         )
-        found["sha256:" + hashlib.sha256(canonical.encode()).hexdigest()] = platform
+        digest = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+        agreed = found.get(digest, platform)
+        found[digest] = {f: v for f, v in platform.items() if agreed.get(f) == v}
     return found
 
 
@@ -90,15 +93,16 @@ def law(path: Path, known: dict) -> str:
         return (
             f"LISTED {path.name}: its digests {sorted(map(str, digests))} name no spec"
         )
-    platform = known[document[OLD]]
-    document = _swap(
-        document, {"platform": keyed_platform(Kind.STEP_LINEAR_LAW, platform)}
-    )
-    if "host" in document:
-        key = document["host"]["key"]
-        document["host"]["key"] = _swap(
-            key, keyed_platform(Kind.HOST_LAWS, known[key[OLD]])
+    try:
+        step = keyed_platform(Kind.STEP_LINEAR_LAW, known[document[OLD]])
+        host = "host" in document and keyed_platform(
+            Kind.HOST_LAWS, known[document["host"]["key"][OLD]]
         )
+    except KeyError as field:
+        return f"LISTED {path.name}: the specs its digests name differ in {field}"
+    document = _swap(document, {"platform": step})
+    if host:
+        document["host"]["key"] = _swap(document["host"]["key"], host)
     path.write_text(json.dumps(document) + "\n")
     return f"MOVED {path.name}"
 
@@ -123,7 +127,10 @@ def entry(directory: Path, known: dict, into: ArtifactStore) -> str:
     values = {k: v for k, v in stated.items() if k != OLD}
     missing = [f for f in KEY_FIELDS[kind] if f not in values and f not in platform]
     if missing:
-        return f"LISTED {where}: no reading of {', '.join(missing)}"
+        why = (
+            "the specs its digest names differ in" if OLD in stated else "no reading of"
+        )
+        return f"LISTED {where}: {why} {', '.join(missing)}"
     values |= {f: platform[f] for f in KEY_FIELDS[kind] if f not in values}
     unread = Reading("unread", "no row of this kind depends on it")
     conditions = Conditions.of(**{a.field: cells.get(a.field, unread) for a in Axis})

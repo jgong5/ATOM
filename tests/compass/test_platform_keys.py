@@ -13,6 +13,7 @@ moves a law or a store entry keyed by a machine-spec digest to these keys.
 
 import copy
 import hashlib
+import importlib.util
 import json
 import re
 import shutil
@@ -511,6 +512,28 @@ def test_a_law_keyed_by_a_digest_is_rewritten_to_its_platform_and_an_unknown_lis
     ]
     assert json.loads((tmp_path / LAW_NAME).read_text()) == LAW
     assert json.loads((tmp_path / "stray.json").read_text()) == stray
+
+
+def test_a_law_whose_digest_names_specs_differing_in_torch_is_listed(tmp_path):
+    spec = importlib.util.spec_from_file_location("migrate_keys", MIGRATE)
+    migrate_keys = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migrate_keys)
+    other = copy.deepcopy(N39)
+    other["device"]["software_pinned_to"]["torch"] = "2.11.0"
+    machines = tmp_path / "machines"
+    machines.mkdir()
+    for name, document in (("a.json", N39), ("b.json", other)):
+        (machines / name).write_text(json.dumps(document))
+    (tmp_path / LAW_NAME).write_text(json.dumps(keyed_by_digest(LAW, N39)))
+
+    known = migrate_keys.platforms(machines)
+
+    assert known == {
+        digest(N39): {k: v for k, v in platform(N39).items() if k != "torch"}
+    }
+    assert migrate_keys.law(tmp_path / LAW_NAME, known) == (
+        f"LISTED {LAW_NAME}: the specs its digests name differ in 'torch'"
+    )
 
 
 def test_a_store_entry_keyed_by_a_digest_is_republished_at_its_platform_key(tmp_path):
