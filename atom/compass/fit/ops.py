@@ -16,9 +16,13 @@ under the readings the points ran under.
 A leaf's family is its signature with the integers that follow the shape
 masked. Among the points of one phase whose signatures match with every
 integer masked, an integer position follows the shape when it holds one value
-at each shape, a value not the same at every shape, and that value is the
-shape's token or sequence count or one more. Any other integer names the leaf:
-the GEMMs of a decode step differ in N and K and share a family per weight.
+at each shape, a value not the same at every shape, and that value is a count
+the point ran its leaf at or one more (`ran_counts`). Any other integer names
+the leaf: the GEMMs of a decode step differ in N and K and share a family per
+weight. A prefill that states a width ``W`` past its rows, where a padded step
+runs its LM head and its drafter's later passes, ran a leaf that leads with W,
+and not with its T or B, at W as its B, where `OpGraphBackend` asks such a
+leaf; W is no count of any other leaf's, so points at two widths stay apart.
 
 A family's dimensions are the shape's counts its masked integers follow, a
 decode's B always, at its T where it states one (a drafter's own leaves at the
@@ -76,7 +80,7 @@ from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, Key, Kind
 from atom.compass.backends.cost import CostTerm
-from atom.compass.backends.op_graph import LISTED, PERMILLE, band
+from atom.compass.backends.op_graph import LISTED, PERMILLE, _ran_at, band
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostSource
 from atom.compass.fit import publish
@@ -189,6 +193,19 @@ def shape_counts(shape: str) -> dict:
     return {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", shape)}
 
 
+def ran_counts(shape: str, leaf: dict) -> dict:
+    """The counts a point at `shape` ran `leaf` at: `shape`'s, less the width
+    ``W`` it states past its rows; a prefill's W, where a padded step runs its
+    LM head and its drafter's later passes, is the B of a leaf that leads with
+    W and not with its T or B, as `OpGraphBackend` asks such a leaf
+    (`op_graph._ran_at`)."""
+    n = shape_counts(shape)
+    width = n.pop("W", None)
+    if width is None or shape.startswith("decode"):
+        return n
+    return _ran_at(leaf, (n, n | {"B": width}, n, ({n["T"], n["B"]}, {width})))
+
+
 def _context(p) -> int:
     """A point's context: a decode point's ``context``, its longest row's; a
     prefill point's rows' mean cached tokens (`band`), else its ``context``,
@@ -231,36 +248,33 @@ def fit(points) -> dict:
         else:
             groups.setdefault(skeleton(p["shape"], p["leaf"]), []).append(p)
     for skel, members in groups.items():
+        sigs = [json.loads(p["leaf"]) for p in members]
+        ran = [ran_counts(p["shape"], sig) for p, sig in zip(members, sigs)]
         at: dict[str, list] = {}
-        for p in members:
-            at.setdefault(p["shape"], []).append(_ints(json.loads(p["leaf"])))
-        counts = {
-            s: {int(c) + d for c in re.findall(r"=(\d+)", s) for d in (0, 1)}
-            for s in at
-        }
+        for p, sig, counts in zip(members, sigs, ran):
+            at.setdefault(p["shape"], []).append((_ints(sig), counts))
+        each = [got for vs in at.values() for got in vs]
         free_of[skel] = [
             i
-            for i in range(len(next(iter(at.values()))[0]))
-            if all(len({v[i] for v in vs}) == 1 for vs in at.values())
-            and all(vs[0][i] in counts[s] for s, vs in at.items())
-            and len({vs[0][i] for vs in at.values()}) > 1
+            for i in range(len(each[0][0]))
+            if all(len({v[i] for v, _ in vs}) == 1 for vs in at.values())
+            and all(any(v[i] - c in (0, 1) for c in n.values()) for v, n in each)
+            and len({vs[0][0][i] for vs in at.values()}) > 1
         ]
         follows = {
-            n
+            k
             for i in free_of[skel]
-            for n in ("T", "B")
-            if all(
-                vs[0][i] - shape_counts(s).get(n, -9) in (0, 1) for s, vs in at.items()
-            )
+            for k in ("T", "B")
+            if all(v[i] - n.get(k, -9) in (0, 1) for v, n in each)
         }
         ragged = {
             family(p["shape"], p["leaf"], free_of[skel])
             for p in members
             if _split(p["context"])[1]
         }
-        for p in members:
+        for p, counts in zip(members, ran):
             name = family(p["shape"], p["leaf"], free_of[skel])
-            at_p = shape_counts(p["shape"]) | {"context": _context(p)}
+            at_p = counts | {"context": _context(p)}
             if p["shape"].startswith("decode") and "T" in at_p:
                 at_p["B"] = at_p.pop("T")  # a drafter's own rows, padded to B
             moves = dependent.get(p["op"], True)
