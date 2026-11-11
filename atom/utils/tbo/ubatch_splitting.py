@@ -490,9 +490,11 @@ def split_attn_metadata(
     ub_total_kv = None
     if attn_metadata.has_cached:
         if ub_cu_seqlens_k is not None and ub_num_reqs > 0:
-            ub_total_kv = int(ub_cu_seqlens_k[ub_num_reqs].item())
+            cu_k = _get_tbo_cpu_lens(attn_metadata, "cu_seqlens_k")
+            ub_total_kv = int(cu_k[req_end] - cu_k[req_start])
         elif ub_context_lens is not None and ub_num_reqs > 0:
-            ub_total_kv = int(ub_context_lens[:ub_num_reqs].sum().item())
+            ctx_k = _get_tbo_cpu_lens(attn_metadata, "context_lens")
+            ub_total_kv = int(ctx_k[req_start:req_end].sum())
         else:
             ub_total_kv = 0
 
