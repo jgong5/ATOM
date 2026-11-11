@@ -205,9 +205,15 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   With both ranks profiled the draft-KV
   concatenation runs about 6% long; drafter labels keep that, and
   [#2945](https://github.com/jgong5/ATOM/issues/2945) finds its cause. A traced kernel
-  shorter than about 4.7 us runs to that floor, so drafter labels stay 5 to 11% over
-  unprofiled time until [#2415](https://github.com/jgong5/ATOM/issues/2415) subtracts each
-  kernel's floor ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6460474362)).
+  queued behind another and shorter than the profiler's floor, the spec's
+  `device.profiler_floor_s` (`05`), runs to that floor, which held drafter labels 5 to 11%
+  over unprofiled time ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6460474362)).
+  `fit steps --ops` takes it out ([#2415](https://github.com/jgong5/ATOM/issues/2415)): each
+  drafter kernel recorded under twice the floor loses its recorded length, up to the floor,
+  less its own, the `warm_ns` of the `measure ops` points that launch it alone, found by its
+  name and grid, or, replayed from a graph and so gridless, by its name at its pass's shape.
+  A kernel no point gives alone, as one launched beside others, keeps its recorded
+  length, named in the fit's report.
   No cut, threshold or interval. The
   prefill device law fits from trace runs only, and a fit given none names its prefill
   vector unfitted; a trace run's decodes and host segments are profiled, so it gives no

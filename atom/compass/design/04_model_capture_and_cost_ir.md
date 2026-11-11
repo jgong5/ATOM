@@ -1145,7 +1145,7 @@ leaf: `try_mrope_qk_fused` launches mrope's tiled kernel at B >= 128.
 
 Owner's [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811), 2026-10-20, as
 [#1867](https://github.com/jgong5/ATOM/pull/1867) built it. An `op_graph` is keyed by its
-structure and its shape (`07` D41); a DP prefill's graph that holds G (D18) by the shape
+structure, its shape, and the ATOM source and torch it was traced under (`07` D41); a DP prefill's graph that holds G (D18) by the shape
 `prefill T=<T> B=<B> G=G`, ` W=<W>` before G where its LM head pads, its hints and guards in its graph member. The structure (`capture.forward.structure`) is the
 model's architecture, the device arch, the config.json digest, the engine config the
 step law is keyed by less its ladder (`run.step_grid.keyed`, `09` D54), the TP width and
@@ -1166,8 +1166,8 @@ cache dtype ATOM resolves for a P/D side and for a plain start at gfx950
 (`atom/config.py::Config.__post_init__`), and each run reads its own.
 
 A run, or `measure ops`, that finds no graph at its key where the store holds one at
-the same shape and otherwise the same structure refuses, naming each engine field that
-differs, a performance variable by its own name (`run.step_grid.differ`, which the step
+the same shape and otherwise the same structure refuses, naming the ATOM source or torch
+it was traced under and each engine field that differs, a performance variable by its own name (`run.step_grid.differ`, which the step
 law's engine check shares). Every key moved with #1867, so a store is traced again in the
 environment its reader runs in.
 
