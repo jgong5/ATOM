@@ -780,6 +780,33 @@ def test_v41_index_leaves_take_the_tables_atom_s_forward_writes_for_their_step(
     assert pick["row_starts"].tolist() == pick["row_ends"].tolist() == [7, 3]
 
 
+def test_the_v41_candidate_lift_leaves_its_selection_as_built_past_twice_the_kept(
+    monkeypatch,
+):
+    from atom.model_ops.deepseek_v41.candidate_table import (
+        lift_candidate_selection_reference as lift,
+    )
+
+    I32 = "torch.int32"
+    leaf = _leaf(
+        "atom.model_ops.deepseek_v41.candidate_table:lift_candidate_selection",
+        ("selected", _t([2, 16], "activation", dtype=I32)),
+        ("candidates", _t([2, 4], "activation", dtype=I32)),
+        ("rows_per_block", 8),
+    )
+    # rows seeing 64 and 20 compressed rows: 8 blocks of 8, twice the 4 the
+    # pick keeps, and 3
+    [call] = _v41_index(monkeypatch, [64, 20], (leaf,), decode(2), 64)
+
+    # the lift rewrites its selection in place, and the bench calls a copy
+    # again: each call reads the columns the copy was built with
+    built = call["selected"].clone()
+    lift(call["selected"], call["candidates"], rows_per_block=8)
+    assert torch.equal(call["selected"], built)
+    # 4 of the first row's 8 blocks from block 0, its newest last
+    assert call["candidates"].tolist() == [[0, 3, 5, 7], [0, 1, 2, -1]]
+
+
 def test_a_v41_prefill_past_cached_tokens_picks_candidates_off_its_rows_blocks(
     monkeypatch,
 ):
@@ -1562,9 +1589,9 @@ def test_v41_attention_takes_the_lists_atom_s_index_build_writes_for_its_pass(
     assert taken[4]["kv_indices_extend"].tolist() == list(range(300, 312))
     assert taken[1]["kv_indices_prefix"].tolist() == [100]
     assert taken[1]["kv_indptr_prefix"].tolist() == [201, 200]
-    # each build layer 2's, its rows' 8 ids spread, the newest last
+    # each build layer 2's, its rows' 8 ids spread from 0, the newest last
     assert {b[0] for b in built} == {2} and step.selected == {}
-    assert built[0][1] == [74, 149, 224, 299, 374, 449, 524, 599]
+    assert built[0][1] == [0, 86, 172, 257, 343, 428, 514, 599]
 
 
 def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
