@@ -71,7 +71,11 @@ and a runner attribute this runner's own; a KV tensor is a view of a tensor
 ATOM's KV allocation bound, on the runner or a metadata builder (`_bound`),
 but no view a builder cut from the runner's (`_cut_from`),
 of its layout or `V41_NAMES`' (`_kv`), refused when none is, whose
-name the point records, the same on every copy; an object is rebuilt from its class
+name the point records, the same on every copy, and a DeepSeek-V4.1 indptr
+table (`_CACHE`) a leaf other than its scan reads filled, before the leaf is
+timed, for its pass as its forward's first reader fills it
+(`PagedAttentionCache.indptrs`), the leaf refused by name where its cache
+fills none; an object is rebuilt from its class
 and state as the capture's replay rebuilds one, its tensors built as any other
 argument's, its activations fresh on every copy, a lifted call's sequence a tuple.
 A leaf whose operator cannot run, or that copies to the host, refuses by name.
@@ -239,7 +243,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 28
+PROTOCOL = 29
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -882,6 +886,8 @@ class Stub:
         # by placement, leaf and slot, what a leaf's later occurrences take
         # where ATOM passes them a buffer of their own (`QUERIED`)
         self.later = {}
+        # by leaf, the cache and pass step whose indptrs it reads (`_prepare`)
+        self.fills = {}
         self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, {}
         # `once`: by leaf, the bytes of a buffer every copy launches
         self.written, self.unplanned, self.once = {}, {}, {}
@@ -1016,6 +1022,16 @@ class Stub:
                     i = counts[rows]
                     live = live | {"scheduled_tokens_gpu": info.gpu[i : i + 1]}
             for path, spec in _specs(op["args"]):
+                bound = meta.get((sig, path), ("",))[0]
+                if op["op"] != _SCAN and bound.startswith(_CACHE.format(ratio="")):
+                    # read as the leaf's pass fills it (`point`); the cache's,
+                    # which every pass shares (`rows_of`), holds what the last
+                    # scan this process timed wrote, or nothing
+                    cache = getattr(md, "cache", None)
+                    if hasattr(cache, "indptrs"):
+                        self.fills[sig] = cache, passes.get(at, passes[None])[0]
+                    else:
+                        meta[sig, path] = f"no pass here fills {path} {bound}", None
                 index = self.paged and _written(op, path)
                 if spec.get("device") == "cpu":  # `_copy` builds it on the host
                     continue
@@ -1196,7 +1212,7 @@ class Stub:
         }
         need = max(p for _, _, p, _ in plans.values())
         self.leaves, self.placed, self.clones = found, [], {}
-        self.written, self.later = {}, {}
+        self.written, self.later, self.fills = {}, {}, {}
         self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
         ladder = contextlib.nullcontext
         if shape.width or shape.phase == "decode" and shape.tokens < shape.seqs:
@@ -1234,6 +1250,11 @@ class Stub:
             record |= {"later": later} if later else {}
             record |= {"exchange": ex} if (ex := exchange(op)) else {}
             try:
+                if sig in self.fills:  # as its pass's first reader fills them
+                    cache, step = self.fills[sig]
+                    cache.indptrs(
+                        dataclasses.replace(step, indptrs={}, indptr_buffers=None)
+                    )
                 record |= self._time(op, sig, inst, n)
                 # a KV argument is one view every copy reads at its placement:
                 # its bytes count once a placement, a slot's once however many
