@@ -376,8 +376,7 @@ def _record(runner):
             for name in CONTEXT_PARALLEL:
                 if (width := getattr(runner.config, name, 1)) > 1:
                     engine[name] = width
-            if buckets := TokenGraph.captured_sizes("prefill"):
-                engine[PREFILL_BUCKETS] = list(buckets)
+            engine[PREFILL_BUCKETS] = list(TokenGraph.captured_sizes("prefill"))
             record.path.with_suffix(".engine.json").write_text(json.dumps(engine))
             key = getattr(runner, "host_key", None)
             if key is not None:

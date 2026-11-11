@@ -34,10 +34,10 @@ forward writes is written from ids spread over each token's compressed rows
 leaf of its forward writes (`_WRITTEN`) is written for the reading leaf's pass
 as that leaf writes it (`Stub._index`), and the logits plane its scorer
 writes, which a top-k or the pick's block maxima ranks (`PAGE_WIDE`), is
-drawn as an activation is, below each row's bound, on every copy
-(`_scores`); its sparse attention's index lists are those its index build
-writes for the leaf's pass, off a selection spread over each row's visible
-rows (`Stub._lists`). A `Stub` calls each leaf from its
+each copy's own, drawn for a top-k or block maxima as an activation is,
+below each row's bound (`_scores`); its sparse attention's index lists are
+those its index build writes for the leaf's pass, off a selection spread over
+each row's visible rows (`Stub._lists`). A `Stub` calls each leaf from its
 contract: an activation is random at its shape, dtype and stride, except such
 a table, the placement's, a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
@@ -59,7 +59,10 @@ a prefill's index list whole (`V4_LISTS`), or,
 when live, `V41_NAMES`' for a DeepSeek-V4.1 slot at its ratio (`_ratio`),
 whose step and scorer workspace are live too; a leaf of the drafter's alone
 takes what ATOM passes a drafter (`DRAFTER_NAMES`) and, of a pass of its own,
-the entry of ATOM's `batch_info` stating its real rows; an integer the capture
+the entry of ATOM's `batch_info` stating its real rows; a leaf of a replaying
+prefill's tail rows that runs more than once takes, on a copy past its first
+occurrence (copy c mod its occurrences), what layer 39 passes a `QUERIED`
+slot; an integer the capture
 found affine in a decode step's context is taken at the point's, and the
 batch-id build's length is the point's KV tokens (`_summed`); a module or
 context key is the one each instance names, its module's meta parameters
@@ -450,6 +453,14 @@ DRAFTER_NAMES = {
     ("aten.gather.default", "index"): "zero_spec_counts",
     ("aten.index.Tensor", "indices"): "plan.tail_rows",
 }
+#: DeepSeek-V4.1's arguments, keyed as `V4_METADATA`'s, that a replaying
+#: prefill's layer 39 passes, at its tail's rows, a buffer of its own: its
+#: indptr scan and index group's build, which the tail's layers run once a
+#: forward, memoized on the tail's step, and layer 39 runs again over its
+#: queries (`QueryRows.indices`), whose batch ids are -1 but at each
+#: finishing request's last row. A leaf of the tail's rows that runs more
+#: than once binds its later occurrences the buffer named (`Stub.later`).
+QUERIED = {(op, "batch_ids"): "plan.query_ids" for op in (_SCAN, _INDICES)}
 #: DeepSeek-V4.1's FP8 prefill leaves whose logits plane holds the compressed rows
 #: of each KV block the step's longest row reaches (`PagedAttentionCache.
 #: unit_tiles`), and the tile table's build, which reads as many block-table
@@ -662,14 +673,23 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     (`draft`, as `forward.structure` keys it). A prefill that produces none
     runs its target's leaves less the LM head and the sampler, so the
     target's points at output cover both. A miss where the store holds the
-    shape under another engine config refuses naming what differs."""
+    shape under another engine config refuses naming what differs. A
+    two-batch-overlap micro-batch's `shape` reads its own graph."""
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture.forward import missed, structure
 
-    at = structure(config, shape.phase, device=arch, output=output, draft=draft)
+    at = structure(
+        config,
+        shape.phase,
+        device=arch,
+        output=output,
+        draft=draft,
+        micro_batch=shape.micro_batch,
+    )
     key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
     if not store.directory_for(key).exists() and (why := missed(store, key)):
         part = " that produces no output" * (not output)
+        part += " as a two-batch-overlap micro-batch" * shape.micro_batch
         part += " for its drafter" * bool(draft) + "'s draft-KV pass" * (draft == KV)
         raise ArtifactRefusal(
             Rule.RESOLUTION,
@@ -862,6 +882,9 @@ class Stub:
         self.slots = runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
         self.per_row = state_slots_per_request(runner.config)
         self.built, self.leaves, self.placed = {}, {}, []
+        # by placement, leaf and slot, what a leaf's later occurrences take
+        # where ATOM passes them a buffer of their own (`QUERIED`)
+        self.later = {}
         self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, {}
         # `once`: by leaf, the bytes of a buffer every copy launches
         self.written, self.unplanned, self.once = {}, {}, {}
@@ -1057,6 +1080,15 @@ class Stub:
                         if field in writes:
                             clones = self.written.setdefault(op["op"], {})
                         meta[sig, path] = name, _deep(view, {}, clones)
+                        later = QUERIED.get(key)  # live where a decoder plan is
+                        if (
+                            later in live
+                            and op["occurrences"] > 1
+                            and at == plan.tail_rows.numel()
+                        ):
+                            name, view = _meta(spec, path, {later: live[later]})
+                            here = len(self.placed), sig, path
+                            self.later[here] = name, _deep(view, {}, clones)
                     except ValueError as error:  # the leaf refuses, not the step
                         meta[sig, path] = str(error), None
         # one clone across placements of what none changed: a leaf may cache
@@ -1200,7 +1232,8 @@ class Stub:
         self.context, self.unplanned, self.once = _split(context)[0], {}, {}
         tokens = sum(row[0] for row in rows)  # a drafter's rows verify its drafts
         self.leaves, self.placed, self.clones = found, [], {}
-        self.written, plans, p, need = {}, None, 0, 1
+        self.written, self.later = {}, {}
+        plans, p, need = None, 0, 1
         ladder = contextlib.nullcontext
         if shape.phase == "decode" and shape.tokens < shape.seqs:
             # a drafter's own shape is prepared padded to its B, as the
@@ -1239,8 +1272,10 @@ class Stub:
         for sig, (op, inst) in found.items():
             n, size, _, (by_block, by_slot) = plans[sig]
             names = {p: m[0] for (s, p), m in self.placed[0][1].items() if s == sig}
+            later = {k[2]: m[0] for k, m in self.later.items() if k[:2] == (0, sig)}
             record = {"shape": str(shape), "context": context, "op": op["op"]}
             record |= {"leaf": sig, "metadata": names, "rows": rows}
+            record |= {"later": later} if later else {}
             record |= {"exchange": ex} if (ex := exchange(op)) else {}
             try:
                 record |= self._time(op, sig, inst, n)
@@ -1558,7 +1593,10 @@ class Stub:
                 whole = _random({**value, "shape": [2 * n], "stride": [1]}, device)
                 return whole.as_strided(value["shape"], value["stride"])
             if isinstance(value, dict):
-                out = self._tensor(value, meta.get((sig, path)), fresh)
+                taken = meta.get((sig, path))
+                if c % op.get("occurrences", 1):  # a later one's own (`QUERIED`)
+                    taken = self.later.get((p, sig, path), taken)
+                out = self._tensor(value, taken, fresh)
                 # V4.1's FP8 plane a top-k or block maxima ranks: ATOM's scorer
                 # writes it first, which here no leaf has, or a scorer timed
                 # before has, off its own random inputs. Placements share one
@@ -1569,6 +1607,10 @@ class Stub:
                     if (ends := meta.get((sig, bound), ("", None))[1]) is not None:
                         out = out if fresh else _clone(out)
                         _scores(out, ends, value)
+                # and each copy of the scorer writes a plane of its own
+                written = self.paged and value["role"] == "metadata"
+                if written and (op["op"], path) == (_LOGITS, "out_logits"):
+                    out = out if fresh else _clone(out)
                 return out
             if isinstance(value, str) and value.startswith("torch."):
                 return getattr(torch, value[6:], value)
