@@ -75,7 +75,9 @@ argument's, its activations fresh on every copy, a lifted call's sequence a tupl
 A leaf whose operator cannot run, or that copies to the host, refuses by name.
 On one GPU at a DP-attention layout, the runner is one DP rank's own, TP 1 and DP 1, the
 graphs read and the keys written keep the layout, and a collective leaf
-refuses: it is measured across the layout's ranks.
+refuses: it is measured across the layout's ranks, where a DP all-gather's
+`x` holds each rank's own `sizes` entry's rows, the capture's being rank 0's
+(`_own_rows`).
 A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 
@@ -1135,7 +1137,9 @@ class Stub:
         if shape.phase != "decode" and self.paged:
             wide = [-(-max(r[i] for r in rows) // rule.block_size) for i in (0, 1)]
             found = {s: (_widened(op, wide), at) for s, (op, at) in found.items()}
-        found = {s: (_summed(op, rows), at) for s, (op, at) in found.items()}
+        found = {
+            s: (_own_rows(_summed(op, rows)), at) for s, (op, at) in found.items()
+        }
         view = {"rows": rows, "produces_output": True}
         blocks = sum(-(-row[1] // rule.block_size) for row in rows)
         kv = _forward_kv_cache_context.kv_cache_data
@@ -1898,6 +1902,24 @@ def _summed(op, rows) -> dict:
     if (op["op"], "repeats") not in BATCH_IDS or repeats.get("role") != "metadata":
         return op
     return {**op, "args": op["args"] | {"output_size": sum(r[1] for r in rows)}}
+
+
+def _own_rows(op) -> dict:
+    """`op`, when it is the DP all-gather (`GATHERV`), with each tensor of its
+    `x` holding this DP rank's `sizes` entry's rows: the capture records rank
+    0's call, and aiter fails a rank whose rows are not its entry."""
+    if op["op"] != GATHERV:
+        return op
+    from aiter.dist.parallel_state import get_dp_group
+
+    rows = op["args"]["sizes"][get_dp_group().rank_in_group]
+
+    def own(t):
+        return {**t, "shape": [rows, *t["shape"][1:]]}
+
+    x = op["args"]["x"]
+    x = [own(t) for t in x] if isinstance(x, list) else own(x)
+    return {**op, "args": op["args"] | {"x": x}}
 
 
 def _written(op, path) -> str | None:
@@ -3030,8 +3052,10 @@ COLLECTIVES = (
     "_c10d_functional.broadcast.",
     "_c10d_functional.reduce_scatter",
 )
+#: The DP all-gather, whose `x` holds the calling rank's rows (`_own_rows`).
+GATHERV = "atom.model_ops.moe:all_gatherv"
 #: Lifted collectives every ATOM caller passes aiter's DP group.
-DP_GROUP = ("atom.model_ops.moe:all_gatherv", "atom.model_ops.moe:reduce_scatterv")
+DP_GROUP = (GATHERV, "atom.model_ops.moe:reduce_scatterv")
 
 
 def exchange(op: dict) -> list | None:
