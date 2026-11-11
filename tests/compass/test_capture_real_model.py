@@ -200,7 +200,7 @@ TP2_ONLY_OPS = (
 ROW_PARALLEL = "atom/model_ops/layernorm.py:944 in _forward_fused_allreduce"
 VOCAB_EMBEDDING = "atom/model_ops/embed_head.py:178 in forward"
 VOCAB_LM_HEAD = "atom/model_ops/embed_head.py:269 in forward"
-SAMPLER = "atom/model_engine/model_runner.py:3389 in postprocess"
+SAMPLER = "atom/model_engine/model_runner.py:3387 in postprocess"
 
 # Where a free symbol stops being free, each as the value it takes and the
 # innermost ATOM frames it takes it through. Three, and in an order: a symbol
@@ -505,10 +505,10 @@ EXPECTED_HOST_RESOLUTIONS = {
     "atom/model_ops/attentions/backends.py:671 in _build_mrope_decode_positions": 1,
     "atom/model_ops/attentions/backends.py:714 in prepare_cu_seqlens_q": 1,
     "atom/model_ops/attentions/backends.py:715 in prepare_cu_seqlens_q": 3,
-    "atom/model_engine/model_runner.py:522 in prepare_input_ids": 3,
-    "atom/model_engine/model_runner.py:608 in _stage_input_ids": 1,
-    "atom/model_engine/model_runner.py:611 in _stage_input_ids": 1,
-    "atom/model_engine/model_runner.py:2698 in prepare_sample": 1,
+    "atom/model_engine/model_runner.py:520 in prepare_input_ids": 3,
+    "atom/model_engine/model_runner.py:606 in _stage_input_ids": 1,
+    "atom/model_engine/model_runner.py:609 in _stage_input_ids": 1,
+    "atom/model_engine/model_runner.py:2696 in prepare_sample": 1,
     "atom/model_ops/sampler.py:48 in _apply_greedy_tokens": 1,
     "atom/utils/forward_context.py:318 in decide": 1,
     "atom/utils/h2d.py:51 in _count": WIDTH_COUNTED_COPIES,

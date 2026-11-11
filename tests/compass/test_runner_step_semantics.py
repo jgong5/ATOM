@@ -359,10 +359,10 @@ def test_a_pipeline_stage_reports_the_step_it_ran(run):
 def test_a_single_stage_defers_exactly_when_atoms_token_processor_does(
     run, monkeypatch, deferred
 ):
-    """ATOM's `tokenIDProcessor` clears `is_deferred_out` under PP and on a P/D
-    producer whose model keeps recurrent state (a GDN hybrid), and the stream
-    the first predicted step builds takes that answer. So a single-stage
-    producer of such a model reports the decode it ran, not the one before."""
+    """ATOM's `tokenIDProcessor` clears `is_deferred_out` under PP and on every
+    P/D producer, and the stream the first predicted step builds takes that
+    answer. So a single-stage producer reports the step it ran, not the one
+    before."""
     from atom.model_engine import llm_engine
 
     monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *_: None)

@@ -224,17 +224,15 @@ class tokenIDProcessor:
         # The scheduler never speculates for a P/D producer, though the runner
         # keeps its drafter loaded: every decode it runs is q=1.
         self.is_pd_producer = _kv_config_has_producer(kv_cfg)
-        # P/D hands off prompt-end state plus the first sampled token. Deferred
-        # output makes the producer decode once more to surface that token, so
-        # the consumer applies T0 to a state that already has it. Only a
-        # recurrent state notices -- a paged write lands at T0's own position,
-        # so repeating it is idempotent.
-        hands_off_recurrent_state = (
-            self.is_pd_producer and runner.attn_family.has_recurrent_state
-        )
-        self.is_deferred_out = (
-            not self.is_pipeline_parallel and not hands_off_recurrent_state
-        )
+        # P/D hands off prompt-end state plus the first sampled token (T0), and
+        # a producer releases a request only once T0 reaches the host. Deferred
+        # output surfaces T0 at the rank's next forward that samples: another
+        # request's output prefill, or one more decode of the held request when
+        # nothing else is scheduled. A forward of middle chunks samples nothing,
+        # so the request waits while the rank prefills others (#2655: a median
+        # 14 s). That extra decode also makes a recurrent state apply T0 twice.
+        # So every producer reports T0 from the forward that samples it.
+        self.is_deferred_out = not self.is_pipeline_parallel and not self.is_pd_producer
 
         self.runner = runner
         device = runner.device
@@ -2577,8 +2575,8 @@ class ModelRunner:
         """Whether this forward scores drafts with the rejection sampler.
 
         A P/D producer keeps the drafter only to write its context KV; the
-        scheduler never pads drafts for it, so its decodes (the step that
-        surfaces a deferred T0) are q=1 and have nothing to verify.
+        scheduler never pads drafts for it, so its decodes are q=1 and have
+        nothing to verify.
         """
         return (
             not is_prefill
