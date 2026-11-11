@@ -4,7 +4,8 @@ split a prefill step under two-batch overlap: each reads the step as its two
 micro-batches at their own rows, as `trace ops --population` traces it and
 `OpGraphBackend` prices it, and the plan refuses a graph only that call traces
 before it traces or measures anything. A micro-batch's point keeps its mark in
-its record, and the plan densifies such points at the micro-batch's own graph.
+its record, and the plan densifies such points, measured or held in its store,
+at the micro-batch's own graph.
 The bench and graphs are `test_bench_ops_plan`'s stand-ins.
 """
 
@@ -135,24 +136,46 @@ def _switching(fn, config, todo, llc):
     return got
 
 
+def _unmarked(fn, config, todo, llc):
+    """`_switching` as measured before a record kept a micro-batch's mark."""
+    got = _switching(fn, config, todo, llc)
+    return [{k: v for k, v in r.items() if k != "micro_batch"} for r in got]
+
+
+@pytest.mark.parametrize("held", [False, True])
 def test_a_plan_densifies_a_micro_batch_s_points_at_its_own_graph(
-    bench, tmp_path, split, monkeypatch  # noqa: F811
+    bench, tmp_path, split, monkeypatch, held  # noqa: F811
 ):
     """The store holds the graphs of the record's shapes and of any shape that
     states no gather, which `trace ops --prefill` traces: at a micro-batch's
-    gather only the micro-batch's own, so a whole step's there refuses."""
-    held, stand_in = set(population_shapes([split], True)), ops.graph
+    gather only the micro-batch's own, so a whole step's there refuses. With
+    `held` it also holds rounds 0 to 2's points, unmarked, which the plan reads
+    back."""
+    graphs, stand_in = set(population_shapes([split], True)), ops.graph
 
     def graph(store, config, shape, arch=None):
-        if shape.gathered and shape not in held:
+        if shape.gathered and shape not in graphs:
             raise ArtifactRefusal(Rule.RESOLUTION, f"no op_graph holds {shape}", "")
         return stand_in(store, config, shape, arch)
 
     monkeypatch.setattr(ops, "graph", graph)
-    monkeypatch.setattr(ops, "_child", _switching)
     # what the `trace ops` call of a refusal names
     monkeypatch.setattr(CONFIG, "model", "m", raising=False)
     monkeypatch.setattr(forward, "device_arch", lambda: "gfx942")
+    if held:  # a plan that stopped once it published round 2
+        publish = ops.publish
+
+        def stopped(*args):
+            publish(*args)
+            if args[-1].name == "round2":
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(ops, "publish", stopped)
+        monkeypatch.setattr(ops, "_child", _unmarked)
+        with pytest.raises(KeyboardInterrupt):
+            _plan(bench, tmp_path, split)
+        monkeypatch.setattr(ops, "publish", publish)
+    monkeypatch.setattr(ops, "_child", _switching)
 
     records = _plan(bench, tmp_path, split)
 
