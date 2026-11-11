@@ -152,13 +152,15 @@ class Shape(NamedTuple):
     `tokens` its rows, fewer than `seqs` padded to a rung of `seqs`; under DP
     `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`;
     and `width`, the batch a step that replays no graph pads to past its
-    rows, None at its rows."""
+    rows, None at its rows. `micro_batch` marks a two-batch-overlap
+    micro-batch, which its structure names (`structure`), not its text."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
     seqs: int
     gathered: int | None = None
     width: int | None = None
+    micro_batch: bool = False
 
     def __str__(self) -> str:
         text = f"{self.phase} T={self.tokens} B={self.seqs}"
@@ -288,6 +290,7 @@ def structure(
     output: bool = True,
     draft: bool = False,
     env: dict | None = None,
+    micro_batch: bool = False,
 ) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the arch of `device`, else
@@ -299,7 +302,9 @@ def structure(
     `config`'s unless `eager` names it, ``no output`` unless the step produces
     output (`output`), and ``draft`` for the drafter's part of the step
     (`draft`), ``draft kv`` for a block drafter's draft-KV pass on a step that
-    samples (`draft` is `KV`)."""
+    samples (`draft` is `KV`). ``micro-batch`` follows the mode for a
+    two-batch-overlap micro-batch (`micro_batch`), which ATOM runs otherwise
+    than a whole step of its shape."""
     from atom.compass.run import _file_digest
     from atom.compass.run.step_grid import keyed
 
@@ -314,6 +319,7 @@ def structure(
     widths = f"tp={tp}" + (f" dp={dp}" if dp > 1 else "")
     widths += f" ep={tp * dp}" if config.enable_expert_parallel else ""
     key = f"{arch} {device} {digest} {engine} {widths} {phase} {mode}"
+    key = f"{key} micro-batch" if micro_batch else key
     key = key if output else f"{key} no output"
     key = f"{key} draft" if draft else key
     return f"{key} {KV}" if draft == KV else key
@@ -887,7 +893,9 @@ def _patches(recorder):
       drafter's runner reads back the last step's MTP status and draft ids).
       Otherwise such a read raises.
     * ATOM's MoE wrappers run their bodies, not their fakes: inside are the
-      collectives, the streams and the expert kernels.
+      collectives, the streams and the expert kernels. A two-batch-overlap
+      micro-batch's MoE runs on one stream, as under overlap, where
+      `tbo_active()` turns the dual-stream MoE off.
     * The checkpoint's weights iterator yields nothing: ATOM's dummy load still
       runs it, which would open every shard, or download them for a hub name.
     * No KV connector is built (`get_kvconnector` answers none): under a P/D
@@ -958,6 +966,7 @@ def _patches(recorder):
     conv1d, tolist = gdn_attn.compute_causal_conv1d_metadata, torch.Tensor.tolist
     attach = gdn_attn.GDNStateMixin._attach_replayssm
     fake_tolist, sync = FakeTensor.tolist, ubatching.sync_dp_metadata
+    dual_stream = module_dispatch_ops._dual_stream_is_active
 
     def landed(tensor):
         if not (recorder.lands or getattr(recorder.runner, "drafter", None)):
@@ -996,6 +1005,9 @@ def _patches(recorder):
             f"{recorder.shape} runs two micro-batches under --enable-tbo, which "
             "one op_graph cannot hold"
         )
+
+    def one_stream_in_micro_batch(moe, num_tokens):
+        return not recorder.shape.micro_batch and dual_stream(moe, num_tokens)
 
     def host_conv1d(*args, **kwargs):
         with unset_fake_temporarily():
@@ -1044,6 +1056,7 @@ def _patches(recorder):
             "maybe_dual_stream_forward",
             module_dispatch_ops.maybe_dual_stream_forward,
         ),
+        (module_dispatch_ops, "_dual_stream_is_active", one_stream_in_micro_batch),
         (rejection_sampler, "_synthetic_generator", lambda device: torch.Generator()),
         *_mono(recorder, unpatched),
     ):
@@ -1522,8 +1535,9 @@ def capture(
 
     The steps of the record directories `population` are shapes too
     (`population_shapes`), under two-batch overlap a split one's two
-    micro-batches; each of their prefills runs as one forward, as it ran, this
-    rank answering that it cannot split it; with `whole`, each prefill of
+    micro-batches, each keyed as one (`structure`); each of their prefills
+    runs as one forward, as it ran, this rank answering that it cannot split
+    it; with `whole`, each prefill of
     `shapes` too. With `symbolic`, each prefill's (T, B) of a DP group with no
     drafter, at its width, is then traced with G a symbol, as a run's lookup
     traces it (`Tracer.symbolic`); one whose two ends differ is named on
@@ -1658,7 +1672,7 @@ class Tracer:
         (`peers.at`); else `PerG` names where they differ, and each G of the
         shape is traced as it is."""
         dp = self.config.parallel_config.data_parallel_size
-        tokens, seqs = shape.tokens, shape.seqs
+        tokens = shape.tokens
         top = self.config.max_num_batched_tokens
         lo, hi = hints = tokens + 1, tokens + (dp - 1) * top
         text = symbolic_shape(shape)
@@ -1670,7 +1684,7 @@ class Tracer:
         # follows its steps at the same (T, B), with none of its own.
         ends = {}
         for g, warm in ((hi, True), (lo, False)):
-            at = prefill(tokens, seqs, g, shape.width).at(dp)
+            at = shape._replace(gathered=g).at(dp)
             try:
                 ends[g] = [*self.trace([at], [at], symbolic=True, warm=warm)]
             except PerG:
@@ -1808,7 +1822,13 @@ class Tracer:
                     skip = shape.tokens < shape.seqs or shape.width and not output
                 if skip:
                     continue
-                key = structure(config, shape.phase, output=output, draft=draft)
+                key = structure(
+                    config,
+                    shape.phase,
+                    output=output,
+                    draft=draft,
+                    micro_batch=shape.micro_batch,
+                )
                 crossing, traced = [], Traced(key, at, guards)
                 graph = build(part, traced, crossing)
                 gone = [*left_out, *(("step-crossing", op) for op in crossing)]

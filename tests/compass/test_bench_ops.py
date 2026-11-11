@@ -859,6 +859,26 @@ def test_each_copy_of_a_v41_index_leaf_ranks_a_logits_plane_of_its_own():
             assert plane[0, 50:].eq(0).all() and plane[1, 20:].eq(0).all()
 
 
+def test_each_copy_of_a_v41_index_scorer_writes_a_logits_plane_of_its_own():
+    # V4.1's FP8 plane, which ATOM's preparation leaves as it was, at three
+    # placements of decode B=2: they share one clone of it
+    runner = _Runner()
+    geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(2, 64)
+    scorer = _leaf(ops._LOGITS, ("out_logits", _t([2, 64], "metadata")))
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(scorer, layers=1)["region"])
+    for p in range(3):
+        stub._prepare((4 * p, 2 * p))
+    [(sig, (op, instances))] = stub.leaves.items()
+    assert len({m[sig, "out_logits"][1].data_ptr() for _, m in stub.placed}) == 1
+
+    # copy c at placement c
+    planes = [stub._copy(op, sig, instances, c)[0]["out_logits"] for c in range(3)]
+    assert len({plane.data_ptr() for plane in planes}) == 3
+
+
 def test_an_embedding_reads_the_token_ids_atom_prepared():
     runner = _Runner()
     # An index buffer whose name holds the slot's, which the name rule picks.
@@ -1948,6 +1968,49 @@ def test_a_rope_table_adds_a_row_a_token_not_its_span(monkeypatch, shape, footpr
     # call, 7 copies past twice 1000 bytes; 6 prefill tokens 800 and 3 copies.
     # By span, the tables' 128000 bytes would make one copy.
     assert record["footprint_bytes"] == footprint
+
+
+@pytest.mark.parametrize("positions, rows", [(None, 12), (10, 10)])
+def test_a_rope_table_under_a_drafter_adds_a_row_a_position_or_token(
+    monkeypatch, positions, rows
+):
+    # Two decode rows under 5 drafts verify 12 tokens: cos and sin, 64 bytes a
+    # row, read a row at each position the call takes (a drafter's own 10),
+    # else a row a token, not a row a request.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    table = _t([1000, 32], "weight", dtype="torch.bfloat16")
+    at = [("positions", _t([positions or 1], "metadata", dtype="torch.int64"))]
+    args = [("cos", table), ("sin", table), *at[: bool(positions)]]
+    found = ops.leaves(_graph(_leaf("aiter.rope", *args), layers=1)["region"])
+    drafting = SimpleNamespace(block_size=16, drafts=5, batch=lambda v, b, s: (b, s))
+
+    [record] = ops.Stub(_Runner(), 1).point(drafting, decode(2), 20, found)
+
+    assert record["footprint_bytes"] == 128 * rows + 8 * (positions or 0)
+
+
+@pytest.mark.parametrize(
+    "name, bound, size",
+    [
+        ("aiter.attend", "attn_metadata_builder.cache.indptr_buffers.1.0", 97 * 4 + 8),
+        ("aten.slice.Tensor", "attn_metadata_builder.cache.pool", 0),
+        ("aten.reshape.default", "attn_metadata_builder.cache.pool", 4 * 4 + 8),
+        ("aiter.attend", "attn_metadata_builder.cache.pool", 4 * 4 + 8),
+    ],
+)
+def test_a_v41_pointer_table_counts_its_entries_and_a_view_none(name, bound, size):
+    # DeepSeek-V4.1's KV-bound pointer table, 97 entries for 96 tokens, is read
+    # whole, not a row a block; a view reads none of its KV tensor or its 8
+    # bytes of activation, but a reshape, which may copy, reads as any other
+    # leaf: a row a block, of the batch's 4.
+    stub = ops.Stub(_Runner(), 1000)
+    stub.kv["leaf", "kv"] = bound, None
+    kv = {"shape": [97], "stride": [1], "dtype": "torch.int32", "role": "kv"}
+    x = {"shape": [2], "stride": [1], "dtype": "torch.int32", "role": "activation"}
+    op = {"op": name, "args": {"kv": kv, "x": x}}
+
+    assert stub._plan(op, [{}], {}, 4, 2, 96, "leaf", True)[1] == size
 
 
 @pytest.mark.parametrize(
@@ -3453,7 +3516,7 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
         "device": [{"index": 6, "name": name, "arch": arch}],
         "stack": stack,
         "ptl": spec.values.get("device.ptl", "disabled"),
-        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu"},
+        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu", "atom": "a"},
         "source": {"revision_kind": "tree", "revision": "a" * 40},
     }
     layout = {"dp": 1, "pp": 1, "pcp": 1, "tp": 1, "decode_context_parallel_size": 1}
@@ -3472,7 +3535,7 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
     at = key("decode B=2", 9, "a")
     assert at.kind is Kind.OP_MEASUREMENT
     assert at.values["machine_spec"] == machine_spec_digest(spec)
-    assert at.values["source_root"] == "tree-" + "a" * 40
+    assert at.values["source_root"] == "atom_py-a"
     assert store.directory_for(at).exists()
     assert not store.directory_for(key("decode B=2", 9, "b")).exists()
     lines = [json.loads(x) for x in (tmp_path / "ops.jsonl").read_text().splitlines()]

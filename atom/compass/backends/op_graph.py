@@ -47,7 +47,8 @@ composes host time.
 Two-batch overlap. A step the data-parallel group split (`tbo_tokens`) runs
 this rank's tokens as two micro-batches (`step_roofline.micro_batches`), each
 priced from the graph at its own prefill shape and the group's rows of it
-(`moe_rows`), the second with the step's output and the first with none.
+(`moe_rows`), the second with the step's output and the first with none,
+each traced as a micro-batch (`forward.structure`).
 Each graph's prices in run order fall into segments that alternate streams: an
 MoE exchange of activations rides the comm stream, everything else the compute
 stream. Both micro-batches' segments go on the two streams in ATOM's order
@@ -470,12 +471,15 @@ class OpGraphBackend(CostBackend):
             wide = (*wide[:5], wide[5] * b / width)
         return bound, wide, both, (frozenset(counts), frozenset(wides))
 
-    def _region(self, view: BatchView, draft: bool | str = False) -> tuple[str, dict]:
+    def _region(
+        self, view: BatchView, draft: bool | str = False, micro_batch: bool = False
+    ) -> tuple[str, dict]:
         """The graph the step reads, by its shape and output, and its region;
         with `draft`, its drafter's, a decode's at its rows, at `draft_moe_rows`,
         its later passes at `draft_bs`; else a target that pads past its rows
         without a replay at `target_bs`, as a block drafter's draft-KV pass in
-        its step is read (`draft` is `KV`)."""
+        its step is read (`draft` is `KV`). With `micro_batch`, a
+        two-batch-overlap micro-batch's."""
         if view.image_tokens:
             reason = IMAGES
         else:
@@ -496,6 +500,7 @@ class OpGraphBackend(CostBackend):
                 gathered = view.draft_moe_rows if own else view.moe_rows
                 g = () if gathered is None else (gathered,)
                 drafted = {"draft": draft} if draft else {}
+                micro = {"micro_batch": True} if micro_batch else {}
                 # A DP middle chunk runs its drafter's propose too.
                 if (output or self.dp > 1) and width and width != shape[2]:
                     drafted["width"] = width
@@ -508,7 +513,7 @@ class OpGraphBackend(CostBackend):
                         "sampler"
                     )
                 elif isinstance(
-                    region := self.graph(*shape, output, *g, **drafted), dict
+                    region := self.graph(*shape, output, *g, **drafted, **micro), dict
                 ):
                     return "{} T={} B={}".format(*shape) + at + none, region
                 else:
@@ -518,7 +523,8 @@ class OpGraphBackend(CostBackend):
                             *shape,
                             "".join(f" gathering {n} rows" for n in g),
                             none,
-                            " for its drafter" * bool(draft)
+                            " as a two-batch-overlap micro-batch" * micro_batch
+                            + " for its drafter" * bool(draft)
                             + "'s draft-KV pass" * (draft == KV)
                             + f", {'its later passes at' if own else 'padded to'} {width}"
                             * ("width" in drafted),
@@ -550,7 +556,7 @@ class OpGraphBackend(CostBackend):
         for k, half in enumerate(halves):
             output = k == 1 and view.produces_output
             half = replace(half, produces_output=output)
-            shape, region = self._region(half)
+            shape, region = self._region(half, micro_batch=True)
             at.append(shape)
             bound = self.resolver and self._bound(half)
             run = [0.0]
