@@ -517,6 +517,34 @@ def test_a_price_list_prices_a_collective_between_two_measured_sizes(rows, at, p
         assert got.seconds == pytest.approx(priced)
 
 
+V4_DECODE = "aiter.mla:mla_decode_fwd_v4_nm"
+
+
+def _layer(base):
+    """DeepSeek-V4's decode attention over 4 rows in a layer whose view of the
+    one KV pool starts at row `base`, as its `op_graph` holds it."""
+    q = {"shape": [4, 8, 64], "stride": [512, 64, 1], "dtype": BF16}
+    kv = {"shape": [4096 - base, 64], "stride": [64, 1], "dtype": BF16}
+    args = {"q": q | {"role": "activation"}, "kv_buffer": kv | {"role": "kv"}}
+    return {"op": V4_DECODE, "args": args, "out": []}
+
+
+def test_each_layer_s_attention_prices_from_the_point_one_layer_s_view_measured():
+    # measured on the first layer's view at two contexts, its time moving
+    points = [
+        {"shape": "decode B=4", "context": c, "op": V4_DECODE, "cold_ns": ns}
+        | {"leaf": bench.signature(_layer(0)), "kernels": ["mla"]}
+        for c, ns in ((1024, 10e3), (4096, 40e3))
+    ]
+    params = ops.fit(points)
+    ops.held_out(params)
+    at = ("decode", None, 4, None, 4096, 4096)
+
+    got = [ops.PriceList(params).price((_layer(b), at, 0)) for b in (0, 64, 128)]
+
+    assert [getattr(g, "seconds", g) for g in got] == [pytest.approx(40e-6)] * 3
+
+
 @pytest.mark.parametrize(
     "mean, priced",
     [

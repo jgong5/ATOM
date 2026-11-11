@@ -14,7 +14,9 @@ each graph of the drafter's part of a step S holds at that shape (`DRAFTED`,
 `leaves_at`), timed on the target's batch; with `--drafter` those alone, the
 points a trace run's drafter kernels take their own lengths from
 (`step_labels.Floor`). A point is one leaf of those graphs,
-its instances grouped (`leaves`), at the shape and `--context`: a decode
+its instances grouped (`leaves`), a kernel's layers among them when they
+differ only in where each views one KV pool from (`signature`), at the shape
+and `--context`: a decode
 step's rows each hold `--context` tokens, under a drafter verifying as many
 more as it drafts, and a prefill's rows, split as the capture split them,
 follow `--context` cached tokens each, none when it is not given; there
@@ -54,7 +56,8 @@ view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
 HCA decode workspace an `HCA_DECODE` slot names, or of the buffer
 `V4_METADATA` names for a DeepSeek-V4 slot, and on a V4 prefill's step
-`V4_SHARED` for one of an operator V4.1 runs too, or beside a DeepSeek-V4
+`V4_SHARED` for one of an operator V4.1 runs too and `V4_PREFILL` for one
+ATOM passes another buffer there than at a decode, or beside a DeepSeek-V4
 CSA layer `V4_CSA_SHARED` for one of an operator other models run too, or
 ATOM's batch-id build's repeats (`BATCH_IDS`), refused when it is not live,
 a prefill's index list whole (`V4_LISTS`), or,
@@ -388,6 +391,19 @@ V4_SHARED = {
     ("aiter.pa_sparse_prefill_opus.default", slot): name
     for (op, slot), name in V4_METADATA.items()
     if op == _PREFILL
+}
+#: DeepSeek-V4's arguments, keyed as `V4_METADATA`'s, that ATOM passes from
+#: other buffers on a prefill's step than on a decode's: its CSA top-k
+#: translate writes each token's top-k into the layer's prefill list, at that
+#: list's indptr past the token's window prefix, where a decode passes the
+#: decode list and its indptr. They bind as `V4_SHARED`'s. Bound by size, a
+#: prefill's took the extend list's indptr, which ends past the list it wrote,
+#: and the measuring process died.
+_PACK = "atom.model_ops.v4_kernels.csa_translate_pack:csa_translate_pack"
+V4_PREFILL = {
+    (_PACK, "kv_indptr_csa"): "kv_indptr_prefix_csa",
+    (_PACK, "kv_indices_csa"): "kv_indices_prefix_csa",
+    (_PACK, "skip_prefix_len_per_token"): "skip_prefix_len_csa",
 }
 #: DeepSeek-V4's prefill index lists, which ATOM allocates each step at the
 #: entries its rows read (`_build_paged_prefill_meta`). A capture's prefill
@@ -760,12 +776,36 @@ def _ref(value) -> bool:
 
 def signature(op: dict) -> str:
     """A leaf's identity across instances: its operator, arguments and outputs,
-    a context key or module path by its kind alone, and what the capture
+    a context key or module path by its kind alone, a kernel's KV argument
+    without the size its pool sets (`_kv_unsized`), and what the capture
     states beside its arguments when it states anything."""
-    args = {s: {k: None for k in v} if _ref(v) else v for s, v in op["args"].items()}
+    kernel = not op["op"].startswith("aten.")
+    args = {
+        s: {k: None for k in v} if _ref(v) else _kv_unsized(v) if kernel else v
+        for s, v in op["args"].items()
+    }
     leaf = {"op": op["op"], "args": args, "out": op["out"]}
     leaf |= {"stated": op["stated"]} if "stated" in op else {}
     return json.dumps(leaf, sort_keys=True, separators=(",", ":"))
+
+
+def _kv_unsized(value):
+    """`value`, an argument, with each KV tensor in it sized None along its
+    widest-strided dimension, the one a pool sizes (`_widest`). A kernel
+    reaches its KV by index, and DeepSeek-V4's layers each view one pool from
+    a base row of their own on, so that size is where a layer starts in the
+    pool: `_kv` binds the view by its layout alone, and a kernel's work
+    (`op_work`) leaves out the KV it reaches by index. An aten operator's KV
+    argument is its whole operand, which `signature` keeps."""
+    if isinstance(value, list):
+        return [_kv_unsized(v) for v in value]
+    if isinstance(value, dict) and "object" in value:
+        return value | {"state": _kv_unsized(value["state"])}
+    if isinstance(value, dict) and value.get("role") == "kv" and value.get("shape"):
+        shape = list(value["shape"])
+        shape[_widest(shape, value["stride"])] = None
+        return value | {"shape": shape}
+    return value
 
 
 def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
@@ -1070,7 +1110,7 @@ class Stub:
                     key = op["op"], _keyed(op["args"], path)
                     wanted = self.names.get(key)
                     if "kv_indptr_extend" in named:  # a V4 prefill's step
-                        wanted = wanted or V4_SHARED.get(key)
+                        wanted = wanted or V4_SHARED.get(key) or V4_PREFILL.get(key)
                     if wanted:
                         what = wanted.format(
                             ratio=ratio,
