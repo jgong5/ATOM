@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from atom.compass.artifacts import Kind, keyed_platform, machine_platform
 from atom.compass.backends import (
     BatchView,
     CostRefused,
@@ -34,6 +35,7 @@ from atom.compass.backends.step_linear_fit import (
     main,
     mark_held_out,
 )
+from atom.compass.spec import MachineSpec
 from atom.compass.validate.cost import cost_accuracy
 
 PREFILL = {"step": 0.02, "tokens": 6e-5, "query_square": 2e-10, "query_cached": 3e-10}
@@ -42,10 +44,24 @@ DECODE = {
     "2": {"step": 0.021, "context": 1e-7, "graph_padding": 4e-8},
     "4": {"step": 0.022, "context": 1.2e-7, "graph_padding": 3e-8},
 }
-#: A committed machine spec, which keys the laws the command writes here.
-SPEC = (
-    "--machine",
-    str(Path(__file__).parents[2] / "scripts/compass/machines/mi308x-hjbog39.json"),
+
+
+def platform_arg(document: dict) -> tuple[str, str]:
+    """`--platform` for the platform the machine spec `document` states."""
+    platform = machine_platform(MachineSpec.from_mapping(document))
+    kinds = (Kind.STEP_LINEAR_LAW, Kind.HOST_LAWS)
+    return "--platform", json.dumps(
+        {k.value: keyed_platform(k, platform) for k in kinds}
+    )
+
+
+#: A committed machine spec's platform, which keys the laws the command writes here.
+SPEC = platform_arg(
+    json.loads(
+        (
+            Path(__file__).parents[2] / "scripts/compass/machines/mi308x-hjbog39.json"
+        ).read_text()
+    )
 )
 
 

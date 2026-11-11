@@ -13,7 +13,7 @@ import re
 
 import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
-from test_backend_step_linear_fit import _steps, _timed_record
+from test_backend_step_linear_fit import _steps, _timed_record, platform_arg
 from test_fit_samples import DEVICE, SOURCE, edit, idle_rank
 from test_memory_readings import DOCUMENT, STACK, spec_file
 from test_parity_served import SAMPLING
@@ -132,7 +132,7 @@ def test_the_law_published_is_the_one_step_linear_fits_command_writes_less_its_h
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     law_file = str(tmp_path / "law.json")
     step_linear_fit.main(
-        [*map(str, paths), "--form", form, "--machine", spec_file(tmp_path)]
+        [*map(str, paths), "--form", form, *platform_arg(DOCUMENT)]
         + ["--out", law_file]
     )
     written = json.loads((tmp_path / "law.json").read_text())

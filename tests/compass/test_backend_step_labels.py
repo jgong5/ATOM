@@ -23,9 +23,10 @@ from test_backend_step_linear_fit import (
     _steps,
     _timed_record,
     _view,
+    platform_arg,
     traced,
 )
-from test_memory_readings import META_8B, spec_file
+from test_memory_readings import DOCUMENT, META_8B
 from test_parity_device_window import BUSY, GAP, _recorded
 from test_parity_record import _config, _drive
 
@@ -224,8 +225,7 @@ def test_the_command_s_laws_load_in_a_run_file(tmp_path, monkeypatch):
             *records,
             "--out",
             str(tmp_path / "law.json"),
-            "--machine",
-            spec_file(tmp_path),
+            *platform_arg(DOCUMENT),
         ]
     )
     law = json.loads((tmp_path / "law.json").read_text())
@@ -263,7 +263,7 @@ def test_host_laws_fitted_under_a_stated_engine_load_at_that_engine(
     ]
     stated = tmp_path / "stated.engine.json"
     stated.write_text(json.dumps(key["engine"]))
-    out = ["--out", str(tmp_path / "law.json"), "--machine", spec_file(tmp_path)]
+    out = ["--out", str(tmp_path / "law.json"), *platform_arg(DOCUMENT)]
     main([*records, *out, "--engine", str(stated)])
     law = json.loads((tmp_path / "law.json").read_text())
     assert law["host"]["key"]["engine"] == law["engine_config"] == key["engine"]

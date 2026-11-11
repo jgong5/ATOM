@@ -21,8 +21,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from conftest import MockConfig
+from test_backend_step_linear_fit import platform_arg
 from test_dp_step_max import dp2  # noqa: F401  the dp2 fixture
-from test_memory_readings import spec_file
+from test_memory_readings import DOCUMENT
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run
@@ -579,7 +580,7 @@ def test_a_context_parallel_record_states_its_width_and_the_step_linear_fit_refu
     with pytest.raises(ValueError) as refused:
         step_linear_fit.main(
             [str(record), "--out", str(tmp_path / "law.json")]
-            + ["--machine", spec_file(tmp_path)]
+            + [*platform_arg(DOCUMENT)]
         )
     assert str(refused.value) == (
         "the records' engine config states prefill_context_parallel_size 2, and "

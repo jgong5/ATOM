@@ -12,6 +12,7 @@ variables. No device: the run file's machine spec states the arch.
 import json
 from types import SimpleNamespace
 
+import torch
 from test_artifact_store import (
     clean_checkout,  # noqa: F401  autouse
     stanza,
@@ -85,7 +86,12 @@ def _traced(monkeypatch, store, config, stated: dict, shapes) -> None:
         for shape in shapes:
             at = structure(config, shape.phase, True, MACHINE["device"]["arch"])
             store.publish(
-                Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape)),
+                Key.of(
+                    Kind.OP_GRAPH,
+                    structure=at,
+                    shape=str(shape),
+                    torch=torch.__version__,
+                ),
                 provenance=stanza("compass trace ops"),
                 topology=Topology(),
                 conditions=run_readings(config.model),

@@ -791,7 +791,7 @@ and `buffers` terms of `peak_torch` with the storage bytes the start loaded.
 
 ## The step linear law from real cells — `step_linear_fit`
 
-`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine SPEC [--form FORM] [--moe-routing E,K] [--engine FILE]`
+`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --platform JSON [--form FORM] [--moe-routing E,K] [--engine FILE]`
 fits the law a run file's `step_linear` key holds (`atom/compass/backends/step_linear.py`) from
 the step records of real cells, `OUT_DIR/steps/dp0.jsonl` of `REAL=1
 cctraces_sim.sh` runs, each with the `dp0.engine.json` the run wrote beside it,
@@ -811,10 +811,11 @@ experts they reach (`atom/compass/backends/step_linear.py`), by the rule the
 module's docstring states, and records under the vector's `fit.moe_column` what
 the rule read; a law refitted without it adopts none.
 
-`SPEC` is the capture host's spec in `scripts/compass/machines/`: the law, as
-`platform`, and its host key state the device, software stack, PTL state and
-torch it states, each as far as its kind's key holds it, and a run's spec must
-match them.
+`JSON` is the platform of the capture host's spec in `scripts/compass/machines/`:
+the law, as `platform`, and its host key state its device, software stack, PTL
+state and torch, each as far as its kind's key holds it, and a run's spec must
+match them. The backend package reads no spec, so it is printed by
+`PYTHONPATH=$T python -c 'import json, sys; from atom.compass.artifacts import Kind, keyed_platform as k, machine_platform as m; from atom.compass.spec import MachineSpec as M; p = m(M.from_mapping(json.load(open(sys.argv[1])))); print(json.dumps({x.value: k(x, p) for x in (Kind.STEP_LINEAR_LAW, Kind.HOST_LAWS)}))' SPEC.json`.
 
 Calibration cells replay traces the graded cells do not: `FIRST_SESSION=256
 SESSIONS=137` against graded traces 0 to 255, by the
