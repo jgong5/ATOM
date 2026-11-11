@@ -1137,9 +1137,7 @@ class Stub:
         if shape.phase != "decode" and self.paged:
             wide = [-(-max(r[i] for r in rows) // rule.block_size) for i in (0, 1)]
             found = {s: (_widened(op, wide), at) for s, (op, at) in found.items()}
-        found = {
-            s: (_own_rows(_summed(op, rows)), at) for s, (op, at) in found.items()
-        }
+        found = {s: (_own_rows(_summed(op, rows)), at) for s, (op, at) in found.items()}
         view = {"rows": rows, "produces_output": True}
         blocks = sum(-(-row[1] // rule.block_size) for row in rows)
         kv = _forward_kv_cache_context.kv_cache_data
