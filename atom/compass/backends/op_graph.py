@@ -264,10 +264,10 @@ def gathered_off_default(
 
 
 def _ran_at(leaf: dict, bound: tuple) -> tuple:
-    """`bound` at the rows `leaf` ran: a padded target's (`_bound`) at its
-    width where an activation, metadata or output of the leaf leads with the
-    width's counts and none with the rows', at both (`_bound`) where it leads
-    with both's, else at its rows."""
+    """`bound` at the rows `leaf` ran: a padded target's or drafter's
+    (`_bound`) at its width where an activation, metadata or output of the
+    leaf leads with the width's counts and none with the rows', at both
+    (`_bound`) where it leads with both's, else at its rows."""
     if len(bound) != 4:
         return bound
     rows, wide, both, (counts, wides) = bound
@@ -434,11 +434,19 @@ class OpGraphBackend(CostBackend):
         them at its rows, G `draft_rows`, a capture's MoE gathering this rank's
         rows at every peer. A leaf with both counts is asked at its rows'
         T and B and the smaller G: on a drafter its rows carry the first
-        pass's G, above a later pass's."""
+        pass's G, above a later pass's. A block drafter's pass on a decode
+        that replayed a rung runs its block at the rung: the width's counts
+        are its block's, the rung's rows and their `drafts` tokens each, on
+        this rank and gathered over the DP group, and none is its rows', so
+        a leaf that leads with its rows alone or beside the target's tokens,
+        as its anchors do, is asked at its rows."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
         width = self.padded and (view.draft_bs if draft else view.target_bs)
+        block = draft and self.block and phase == "decode"
+        if block:
+            width = self.padded and view.capture_rung
         if draft and self.drafts > 1 and view.draft_rows:
             width = b
         ran = phase == "decode" and width or t
@@ -459,7 +467,10 @@ class OpGraphBackend(CostBackend):
             counts = {b * j for j in k}
             wides = {width * j for j in k} | {self.dp * width * k[-1]}
         wide, both = (phase, ran, width, *bound[3:]), bound
-        if draft:
+        if block:
+            tokens = width * self.drafts
+            counts, wides = set(), {width, tokens, self.dp * tokens}
+        elif draft:
             padded = self.dp * width
             later = view.draft_rows or padded
             counts, wides = counts | {gathered}, {width, padded, later}

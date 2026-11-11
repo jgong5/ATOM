@@ -76,7 +76,9 @@ argument's, its activations fresh on every copy, a lifted call's sequence a tupl
 A leaf whose operator cannot run, or that copies to the host, refuses by name.
 On one GPU at a DP-attention layout, the runner is one DP rank's own, TP 1 and DP 1, the
 graphs read and the keys written keep the layout, and a collective leaf
-refuses: it is measured across the layout's ranks.
+refuses: it is measured across the layout's ranks, where a DP all-gather's
+`x` holds each rank's own `sizes` entry's rows, the capture's being rank 0's
+(`_own_rows`).
 A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 
@@ -157,8 +159,10 @@ kind those show depends on context (`_dependent`) over a ladder (`_ladder`)
 of the steps' row contexts, and, when some step's rows are ragged, at a
 shape of more than one row on ragged rows too (`_means`): the first at the
 context, the rest sharing a mean, each `GRID`th of it from the least the rows
-hold; and each prefill family
-(`_family`) over a ladder of their token counts, chunk remainders among them,
+hold; and each prefill family (`_family`), under a speculative drafter each
+leaf of its own prefill shape past a step's that the step's graphs do not
+hold too, at its rows padded to its W, over a ladder of their token counts,
+chunk remainders among them,
 its shapes that state the rows a DP group gathers apart, as `fit ops` prices them,
 one of a kind that depends on context at each at the most cached tokens of
 steps of its rows, and over a ladder of them once those points and the fresh
@@ -269,7 +273,7 @@ CLEAR_S, CLEAR_SLACK = 3.0, 256 << 20
 #: The byte boundary each weight a leaf cycles starts on: PyTorch's caching
 #: allocator's block size, where an ATOM parameter allocated alone starts.
 #: aiter's Mega-MHC launcher aborts the process on an `hc_scale` that is not
-#: 16-byte aligned, as every second of three-float slices packed back to back is.
+#: 16-byte aligned, as three in four three-float slices packed back to back are.
 WEIGHT_ALIGN = 512
 #: The release waits since a point last recorded them: seconds, and how many
 #: ended at `CLEAR_S`.
@@ -695,20 +699,21 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     return json.loads(store.read(key).read_member("graph", RANK, "json"))
 
 
-def leaves_at(
-    store, config, shape, arch=None, own=False
-) -> dict[str, tuple[dict, list]]:
+def leaves_at(store, config, shape, arch=None, own=()) -> dict[str, tuple[dict, list]]:
     """Each leaf (`leaves`) of `shape`'s `graph` and, under a speculative
     drafter, of each graph of the drafter's (`DRAFTED`) the store holds there,
     the capture having kept no other; one of a drafter's graphs alone is
-    marked ``drafted``. With `own`, `shape` is a drafter's own decode shape
-    past its step's (`parts`), where a capture keeps the drafter's graph
-    alone: its leaves."""
+    marked ``drafted``. With `own`, `shape` is a drafter's own shape past its
+    step's (`parts`), where a capture keeps a decode's drafter's graph alone:
+    the leaves of the drafter's graphs there at each output (`graph`'s
+    `output`) `own` holds, as its steps read them."""
     from atom.compass.artifacts import ArtifactRefusal
 
     if own:
-        found = leaves(graph(store, config, shape, arch, True, True)["region"])
-        target = set()
+        found, target = {}, set()
+        for output in sorted(own):
+            region = graph(store, config, shape, arch, output, True)["region"]
+            leaves(region, None, found)
     else:
         found = leaves(graph(store, config, shape, arch)["region"])
         target, drafter = set(found), getattr(config, "speculative_config", None)
@@ -1144,7 +1149,7 @@ class Stub:
         if shape.phase != "decode" and self.paged:
             wide = [-(-max(r[i] for r in rows) // rule.block_size) for i in (0, 1)]
             found = {s: (_widened(op, wide), at) for s, (op, at) in found.items()}
-        found = {s: (_summed(op, rows), at) for s, (op, at) in found.items()}
+        found = {s: (_own_rows(_summed(op, rows)), at) for s, (op, at) in found.items()}
         view = {"rows": rows, "produces_output": True}
         blocks = sum(-(-row[1] // rule.block_size) for row in rows)
         kv = _forward_kv_cache_context.kv_cache_data
@@ -1196,10 +1201,12 @@ class Stub:
         self.written, self.later = {}, {}
         self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
         ladder = contextlib.nullcontext
-        if shape.phase == "decode" and shape.tokens < shape.seqs:
-            # a drafter's own shape is prepared padded to its B, as the
-            # capture's runner pads it: a block drafter's passes run there
-            width = np.array([shape.seqs], dtype=np.int32)
+        if shape.width or shape.phase == "decode" and shape.tokens < shape.seqs:
+            # a step that pads past its rows is prepared padded, as the
+            # capture's runner pads it: to its W, where a prefill's LM head
+            # and its drafter's later passes run, or, a drafter's own decode
+            # shape, to its B, where a block drafter's passes run
+            width = np.array([shape.width or shape.seqs], dtype=np.int32)
             ladder = functools.partial(
                 patch.object, self.runner, "capture_sizes_np", width
             )
@@ -1732,12 +1739,12 @@ def point_rows(
     decode of fewer rows than its B, a drafter's own shape past its step's,
     holds those rows alone, its step padded to B (`Stub.point`); a
     prefill row its query tokens, the capture's split, past `context` cached
-    ones. When they need more than the
-    `pool`'s KV blocks, the first keeps its context and each other shares what
-    it leaves, as the rows of a ragged step do. A ragged decode point's rows
-    (`_split`) are its first row's context and, past it, rows of at least a
-    token each that hold its mean; None when they need more than the pool, as
-    a decode point's are when `uncut`."""
+    ones, its step padded to its W where it states one. When they need more
+    than the `pool`'s KV blocks, the first keeps its context and each other
+    shares what it leaves, as the rows of a ragged step do. A ragged decode
+    point's rows (`_split`) are its first row's context and, past it, rows of
+    at least a token each that hold its mean; None when they need more than
+    the pool, as a decode point's are when `uncut`."""
     decode = shape.phase == "decode"
     context, mean = _split(context)
     seqs = min(shape.tokens, shape.seqs) if decode else shape.seqs
@@ -1938,6 +1945,24 @@ def _summed(op, rows) -> dict:
     return {**op, "args": op["args"] | {"output_size": sum(r[1] for r in rows)}}
 
 
+def _own_rows(op) -> dict:
+    """`op`, when it is the DP all-gather (`GATHERV`), with each tensor of its
+    `x` holding this DP rank's `sizes` entry's rows: the capture records rank
+    0's call, and aiter fails a rank whose rows are not its entry."""
+    if op["op"] != GATHERV:
+        return op
+    from aiter.dist.parallel_state import get_dp_group
+
+    rows = op["args"]["sizes"][get_dp_group().rank_in_group]
+
+    def own(t):
+        return {**t, "shape": [rows, *t["shape"][1:]]}
+
+    x = op["args"]["x"]
+    x = [own(t) for t in x] if isinstance(x, list) else own(x)
+    return {**op, "args": op["args"] | {"x": x}}
+
+
 def _written(op, path) -> str | None:
     """Which index table of `_WRITTEN` `op`'s `path` takes: a scorer's on a
     plane its row bounds ATOM stages bound, the page-wide one, its tile table
@@ -1956,12 +1981,16 @@ def _written(op, path) -> str | None:
 def _candidates(ends, k) -> torch.Tensor:
     """`[rows, k]` int32 blocks each row of `ends` visible blocks keeps, as V4.1's
     candidate pick keeps them, ascending: every one when it sees no more
-    than `k`, -1 past them; else `k`, the newest, which the pick pins, last."""
-    # ponytail: the rest spread evenly; the pick keeps the blocks its scores
-    # peak in, which no placement has
+    than `k`, -1 past them; else `k` spread evenly from block 0 up to the
+    newest, which the pick pins, last."""
+    # ponytail: the pick keeps the blocks its scores peak in, which no placement
+    # has. Block 0 first: the candidate lift rewrites its selection, zeros
+    # (`_random`), in place through the first block, and a copy called again
+    # reads what it wrote; through any other block it walks past the list
     run, seen = torch.arange(k, device=ends.device), ends.long()[:, None]
     kept = torch.where(run < seen, run, -1)
-    return torch.where(seen > k, (run + 1) * seen // k - 1, kept).int()
+    spread = seen - 1 - (k - 1 - run) * (seen - 1) // max(k - 1, 1)
+    return torch.where(seen > k, spread, kept).int()
 
 
 def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:
@@ -2692,15 +2721,15 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     from atom.compass.runner.overrides import schedulable_ladder
 
     steps = parts(args.plan, config)
-    # a drafter's own decode shapes, past their steps': a leaf their width's
-    # graphs hold is that width's point. G and W are None or a count
-    own = {
-        shape
-        for _, reads in steps
-        for part, shape, *_ in reads
-        if part == DRAFT and shape.phase == "decode" and shape != reads[0][1]
-    }
-    own = sorted(own, key=str)
+    # a drafter's own shapes, past their steps', and the outputs its graph is
+    # read at: a leaf a decode's width's graphs hold is that width's point,
+    # and a prefill's family (`_family`) states no W, so a leaf its step's
+    # graphs hold is the step's. G and W are None or a count
+    own = defaultdict(set)
+    for _, reads in steps:
+        for part, shape, output, _ in reads[1:]:
+            if part == DRAFT and shape != reads[0][1]:
+                own[shape].add(output)
     steps = [(reads[0][1], line) for line, reads in steps]
     contexts = [
         c for s, line in steps if s.phase == "decode" for c in _rows(line, s.seqs)
@@ -2717,11 +2746,16 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         if s.phase == "prefill":
             prefills.add(s)
             cached[s.seqs] += _cached(line)
+    # one that is a step's shape too is measured whole, as that step's
+    own = {s: outputs for s, outputs in own.items() if s not in prefills}
     # first, so a graph only `trace ops --population` traces refuses before any point
-    widths = {decode(s.seqs) for s in own}
+    widths = {decode(s.seqs) for s in own if s.phase == "decode"}
     shapes = prefills | set(own) | widths
     _load(store, config, args.store, shapes, graphs, None, atom_args, args.plan, own)
     for s in own:
+        if s.phase == "prefill":
+            prefills.add(s)
+            continue
         width = graphs[decode(s.seqs)]
         graphs[s] = {sig: leaf for sig, leaf in graphs[s].items() if sig not in width}
     # a run resumed into `out` keeps the rounds an earlier one wrote there
@@ -2763,7 +2797,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     r = r | {"token": key(r["shape"], r["context"], r["leaf"]).token()}
                 lines.write(json.dumps(r) + "\n")
 
-    decodes = [*rungs, *own]
+    decodes = [*rungs, *sorted((s for s in own if s.phase == "decode"), key=str)]
     measure_round(
         {(s, c): None for s in decodes for c in (min(contexts), max(contexts))}, 0
     )
@@ -3068,8 +3102,10 @@ COLLECTIVES = (
     "_c10d_functional.broadcast.",
     "_c10d_functional.reduce_scatter",
 )
+#: The DP all-gather, whose `x` holds the calling rank's rows (`_own_rows`).
+GATHERV = "atom.model_ops.moe:all_gatherv"
 #: Lifted collectives every ATOM caller passes aiter's DP group.
-DP_GROUP = ("atom.model_ops.moe:all_gatherv", "atom.model_ops.moe:reduce_scatterv")
+DP_GROUP = (GATHERV, "atom.model_ops.moe:reduce_scatterv")
 
 
 def exchange(op: dict) -> list | None:
@@ -3333,23 +3369,24 @@ def _load(
     arch=None,
     atom_args=(),
     records=(),
-    own=(),
+    own=None,
 ) -> None:
     """Each of `shapes`' leaves (`leaves_at`, a drafter's own at a shape `own`
-    holds) into `graphs`, its op_graph captured first when the store has none
-    (`_capture`, naming the record directories `records` the shapes are of)."""
+    maps to its outputs) into `graphs`, its op_graph captured first when the
+    store has none (`_capture`, naming the record directories `records` the
+    shapes are of)."""
     from atom.compass.artifacts import ArtifactRefusal
 
-    missing = []
+    own, missing = own or {}, []
     for shape in sorted(shapes - graphs.keys(), key=str):  # G and W: None or a count
         try:
-            graphs[shape] = leaves_at(store, config, shape, arch, shape in own)
+            graphs[shape] = leaves_at(store, config, shape, arch, own.get(shape, ()))
         except ArtifactRefusal:
             missing.append(shape)
     if missing:
         _capture(config, missing, root, arch, atom_args, records)
     for shape in missing:
-        graphs[shape] = leaves_at(store, config, shape, arch, shape in own)
+        graphs[shape] = leaves_at(store, config, shape, arch, own.get(shape, ()))
 
 
 def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
