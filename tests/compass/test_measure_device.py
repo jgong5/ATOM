@@ -103,17 +103,23 @@ def node(monkeypatch, tmp_path):
     monkeypatch.setattr(pp_probe, "probe", lambda: [{"carrier": "rccl"}])
     monkeypatch.setattr(pp_probe, "fit", lambda s: CARRIERS)
 
-    class Done:
-        returncode = 0
+    class Probe:
+        pid = 2**22 + 7  # above any pid_max, so no live process is in its group
 
-    def run(argv, env, stdout, stderr, check):
-        seen["pairs"].append(env["HIP_VISIBLE_DEVICES"])
-        seen.setdefault("argv", []).append(argv)
-        measure_device.child(*argv[-2:])
-        seen["exited"] = [["4180497"]] * 2
-        return Done
+        def __init__(self, argv, env, stdout, stderr, start_new_session):
+            seen["pairs"].append(env["HIP_VISIBLE_DEVICES"])
+            seen.setdefault("argv", []).append(argv)
+            measure_device.child(*argv[-2:])
+            seen["exited"] = [[str(self.pid)]] * 2
 
-    started = SimpleNamespace(run=run, STDOUT=subprocess.STDOUT)
+        def wait(self):
+            return 0
+
+    def gone(group, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(serve.os, "killpg", gone)
+    started = SimpleNamespace(Popen=Probe, STDOUT=subprocess.STDOUT)
     monkeypatch.setattr(measure_device, "subprocess", started)
     return seen
 
