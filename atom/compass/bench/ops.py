@@ -253,9 +253,10 @@ from atom.compass.drive.gpu import add_gpu_flag
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 PROG = "compass measure ops"
-#: The timing protocol's version; it changes whenever a count below, the
-#: copies a graph reads, what a capture waits for or what a replay follows
-#: change, or the operator a point times does.
+#: The timing protocol's version; it changes whenever the operator a point
+#: times, a count below, the copies a graph reads, what a capture waits for or
+#: what a replay follows
+#: change.
 PROTOCOL = 30
 WARMUPS = 3
 REPEATS = 20
