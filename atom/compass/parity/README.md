@@ -13,7 +13,7 @@ which holds the ladder the runner replays; the scheduler's bounds
 `prefill_context_parallel_size` and `decode_context_parallel_size`, each
 only above 1, so a width-1 engine file is unchanged and a step linear fit
 refuses a context-parallel record by name; and `prefill_buckets`, the prefill
-token-graph buckets the runner recorded, only where it recorded some, which a
+token-graph buckets the runner recorded, empty where it recorded none, which a
 step linear fit pads prefill to.
 A simulated run also writes `dp<r>.cost.jsonl`, a line per step saying what
 its charge was made of (`_group_step_seconds` in
@@ -22,6 +22,13 @@ A 1P1D decode instance also writes `transfers.jsonl` (`transfers` in
 `__init__.py` says what it joins). On a real Mooncake P/D side, every worker writes
 `dp<r>.tp<t>.writes.jsonl` too, a line per KV write it served or write-done it
 received (`writes.py` says what each line holds).
+
+A real run's lines also state the time each launch blocked in HIP, `blocked_ns`,
+which `W_launch` leaves out (`atom/compass/backends/step_labels.py`), when the
+run starts with `ROCP_TOOL_LIBRARIES` naming the blocking-call tool:
+`python -m atom.compass.parity.blocked DIR` builds it into `DIR` with `g++`
+against ROCm's rocprofiler-sdk and prints its path (`blocked.py` says what it
+times). A trace run takes no host labels, so it needs no tool.
 
 Compare two records with
 

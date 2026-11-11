@@ -36,6 +36,8 @@ TERM = {
 }
 #: `TERM` with the segment tokenizer call's own work.
 FULL = TERM | {"segment": {"fixed_s": 9.0e-4, "tokens_per_s": 4.0e6}}
+#: `FULL` with the segment tokenizer's stored-prefix search too.
+SEARCHED = FULL | {"segment": FULL["segment"] | {"chars_per_s": 2.5e9}}
 
 
 class _Tokenizer:
@@ -224,6 +226,63 @@ def test_a_segment_tokenizer_call_is_charged_its_own_work_over_the_ids_it_encode
     )
 
 
+def test_a_segment_tokenizer_call_is_charged_each_stored_prompt_its_search_compares(
+    monkeypatch, tmp_path, rt
+):
+    from tokenizers import AddedToken, Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    from atom.model_engine import segment_tokenizer
+
+    cls = segment_tokenizer.SegmentTokenizer
+    monkeypatch.setattr(cls, "_encode_cached", vars(cls)["_encode_cached"])
+    monkeypatch.setattr(
+        segment_tokenizer, "_shared_chars", segment_tokenizer._shared_chars
+    )
+    # Every prompt takes the cache unchecked, and its first two characters bucket it.
+    monkeypatch.setattr(segment_tokenizer, "_MIN_CACHED_CHARS", 0)
+    monkeypatch.setattr(segment_tokenizer, "_VERIFY_FIRST", 0)
+    monkeypatch.setattr(segment_tokenizer, "_PREFIX_KEY_CHARS", 2)
+    # Only the search costs anything.
+    free = {"fixed_s": 0.0, "tokens_per_s": 1e30}
+    term = TERM | {"encode": free, "encode_batch": free}
+    term["segment"] = free | {"chars_per_s": 100.0}
+    _run_file(monkeypatch, tmp_path, {"host": {"tokenizer": term}})
+    backend = Tokenizer(WordLevel({"a": 0, "b": 1, "c": 2, "d": 3}, unk_token="a"))
+    backend.pre_tokenizer = Whitespace()
+    backend.add_special_tokens([AddedToken("<sep>", special=True)])
+    tok = PreTrainedTokenizerFast(tokenizer_object=backend)
+    seg = cls.maybe_create(tok, 1 << 20)  # the engine is built before the wrap
+    compass_run.tokenizer(tok, None)
+
+    def cost(prompt):
+        start = rt.now
+        assert seg.encode(prompt).tolist() == backend.encode(prompt).ids
+        return rt.now - start
+
+    # Each prompt is compared with every prompt this run's own tokenizer stored
+    # in its bucket, "a a<sep>" (8 characters) shared with each: none, one, two;
+    # and none in another bucket.
+    prompts = ("a a<sep>b<sep>", "a a<sep>c<sep>", "a a<sep>d", "b b<sep>a<sep>")
+    assert [cost(p) for p in prompts] == pytest.approx([0, 8 / 100, 16 / 100, 0])
+
+
+@pytest.mark.parametrize(
+    "term",
+    [
+        FULL | {"segment": FULL["segment"] | {"chars_per_s": 0.0}},
+        FULL | {"encode": FULL["encode"] | {"chars_per_s": 2.5e9}},
+    ],
+    ids=["zero-search-rate", "search-rate-off-segment"],
+)
+def test_a_search_rate_is_a_segment_term_s_and_positive(monkeypatch, tmp_path, term):
+    _run_file(monkeypatch, tmp_path, {"host": {"tokenizer": term}})
+    with pytest.raises(ValueError, match="host's tokenizer is"):
+        compass_run.spec()
+
+
 class _LoadedFrom(_Tokenizer):
     """A fast tokenizer loaded from a model directory, as ``from_pretrained``
     records it."""
@@ -285,15 +344,22 @@ def test_a_server_charges_the_entry_fitted_under_its_engine_config(
     "host, named",
     [
         (None, ["http_intake", "tokenizer"]),
-        ({"tokenizer": FULL}, ["http_intake"]),
+        ({"tokenizer": SEARCHED}, ["http_intake"]),
         (
-            {"tokenizer": {k: v for k, v in FULL.items() if k != "encode_batch"}},
+            {"tokenizer": {k: v for k, v in SEARCHED.items() if k != "encode_batch"}},
             ["http_intake", "tokenizer.encode_batch"],
         ),
         ({"tokenizer": TERM}, ["http_intake", "tokenizer.segment"]),
-        ({"tokenizer": FULL, "http_intake": {"fixed_s": 0.0, "per_byte_s": 0.0}}, []),
+        (
+            {"tokenizer": FULL, "http_intake": {"fixed_s": 0.0, "per_byte_s": 0.0}},
+            ["tokenizer.segment.chars_per_s"],
+        ),
+        (
+            {"tokenizer": SEARCHED, "http_intake": {"fixed_s": 0.0, "per_byte_s": 0.0}},
+            [],
+        ),
     ],
-    ids=["no-entry", "no-intake", "no-batch", "no-segment", "both"],
+    ids=["no-entry", "no-intake", "no-batch", "no-segment", "no-search", "both"],
 )
 def test_the_summary_names_each_term_the_run_charged_nothing_for(
     monkeypatch, tmp_path, host, named
