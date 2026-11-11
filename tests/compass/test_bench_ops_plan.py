@@ -32,6 +32,7 @@ from atom.compass.artifacts import ArtifactStore, Topology, member_name
 from atom.compass.bench import ops
 from atom.compass.capture import driverless, forward, graph_key
 from atom.compass.capture.forward import decode, prefill, structure
+from atom.compass.capture.graph import Traced, build, to_json
 from atom.compass.fit import ops as fit_ops
 from atom.compass.run import memory, step_grid
 from atom.compass.runner.overrides import schedulable_ladder
@@ -345,6 +346,43 @@ def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
     report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["by phase"] == {"prefill": {"steps": 2, "covered": covered}}
+
+
+def test_layers_that_view_one_kv_pool_from_rows_of_their_own_plan_one_point(
+    bench, tmp_path, monkeypatch
+):
+    """DeepSeek-V4's layers each view one KV pool from a base row of their own
+    on, so one layer's attention leaf differs from the next one's only in its
+    view's rows: the plan measures one point for both, over cached tokens too."""
+
+    def graph(store, config, shape, arch=None):
+        rows = shape.tokens if shape.phase == "prefill" else shape.seqs
+        q = ("q", _t([rows, 8], "activation"))
+        layers = [
+            _leaf("aiter.attn", q, ("kv", _t([4096 - base, 8], "kv")))
+            for base in (0, 64)
+        ]
+        traced = Traced(f"x tp=1 {shape.phase} eager", str(shape))
+        return json.loads(to_json(build(list(enumerate(layers)), traced)))
+
+    monkeypatch.setattr(ops, "graph", graph)
+    monkeypatch.setattr(ops, "_child", _moving_bench)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[100, 2100, False]], None),
+        ([[100, 3100, False]], None),
+    )
+
+    records = _plan(bench, tmp_path, plan)
+
+    points = [(r["shape"], json.dumps(r["context"])) for r in records]
+    assert len(points) == len(set(points))
+    assert {r["context"] for r in records if r["shape"].startswith("prefill")} == {
+        None,
+        2000,
+        3000,
+    }
 
 
 @pytest.mark.parametrize(
