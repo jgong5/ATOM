@@ -178,8 +178,8 @@ class Sample:
     `blocked` is the seconds its `W_launch` left out per blocking HIP call
     that blocked, from its line's `blocked_ns`; None on a line without it.
     `floor` names, per busy line field of a drafter part, why the profiler's
-    floor left a kernel of it at its recorded length (`Floor.term`); empty
-    without a `Floor` or with every term known.
+    floor left a kernel of it at its recorded length (`Floor.term`); empty on
+    a cut step, without `floored` or with every term known.
     """
 
     step: int
@@ -472,18 +472,16 @@ def _pull(step: dict) -> int:
 
 
 def label(
-    record, run: str | None = None, split_rule=None, floored=None
+    record, run: str | None = None, split_rule=None
 ) -> tuple[list[Sample], list[dict]]:
     """The record's samples, in step order, and its table's rows.
 
     `run` names the run in each sample's provenance, the record's `digest` by
-    default; `split_rule` rebuilds an older record's split, as above;
-    `floored` gives a trace run's record its drafter busy lines less the
-    profiler's floor (`parity.busy.floored`). A
+    default; `split_rule` rebuilds an older record's split, as above. A
     data-parallel record's `group_dummies` and `group_max_tokens` are read from
     the rank records beside it.
     """
-    lines = _read(record, floored)
+    lines = _read(record)
     return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None, None)
 
 
@@ -491,9 +489,11 @@ def label_run(
     records, run: str | None = None, split_rule=None, floored=None
 ) -> list[tuple[list[Sample], list[dict]]]:
     """`label` of each of `records`, one run's DP ranks, with each `E` from the
-    latest pull over the ranks before the same forward. A rank that ran only
-    DP's dummy forwards gives no sample and no row. Ranks whose line counts
-    differ by more than the forward a stopped server leaves on some refuse."""
+    latest pull over the ranks before the same forward, a trace run's drafter
+    labels under `floored`, its busy lines less the profiler's floor
+    (`parity.busy.floored`). A rank that ran only DP's dummy forwards gives no
+    sample and no row. Ranks whose line counts differ by more than the forward
+    a stopped server leaves on some refuse."""
     ranks = [_read(r, floored) for r in records]
     counts = {Path(r).name: len(x) for r, x in zip(records, ranks) if x}
     if counts and max(counts.values()) - min(counts.values()) > 1:
@@ -649,7 +649,7 @@ def _label(
                 admits[i],
                 s.get("launch", {}),
                 None if blocked is None else {k: v * 1e-9 for k, v in blocked.items()},
-                s.get("floor", {}),
+                {} if cut else s.get("floor", {}),
             )
         )
         gap_ns = s.get("d_gap_ns")

@@ -14,8 +14,9 @@ give, the params and the report; a flag only another backend reads refuses.
 The entry is published under the readings a run on the spec `--machine` names
 takes, which `publish.inputs` loads each measurement under. `--ops` names
 `measure ops --out` directories whose points take the profiler's floor out
-of a trace run's drafter labels (`publish.inputs`); the report's `floor` counts
-the steps each refusal left without a label, by the label's busy line field.
+of a trace run's drafter labels (`publish.inputs`); the report's `floor`
+counts, per kernel the floor could not place and per label field, the steps
+the fit labels whose label keeps that kernel's recorded length.
 
 `step-linear` takes real runs only and fits `step_linear_fit.FORMS`' `--form`,
 `history` by default, joining each step's ranks at the engine config's

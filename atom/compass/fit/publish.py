@@ -64,6 +64,8 @@ SAME_OPS = (
     "enable_dp_attention",
     "enable_expert_parallel",
     "kv_cache_dtype",
+    "kv_cache_block_size",
+    "index_cache_dtype",
     "speculative",
 )
 
