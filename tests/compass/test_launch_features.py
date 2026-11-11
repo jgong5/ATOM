@@ -6,7 +6,8 @@ launches eagerly, 40 ms dearer. A recording runner writes what it observed on
 each line and the graph sets in its key, which labelling and the fit's main
 keep; `fit_host` refuses a step it predicts otherwise and adopts the column
 where the held-out error falls; a run's forward and the recurrence grade price
-it from `predict`. With no provider, nothing moves.
+it from `predict`; the runner, the server and the run file pick a host entry by
+its key less the sets. With no provider, nothing moves.
 """
 
 import dataclasses
@@ -22,7 +23,16 @@ from test_memory_readings import META_8B
 from test_parity_device_window import _recorded
 from test_parity_record import _config, _drive
 from test_parity_recurrence import _labelled, _law, record
+from test_run_hops import model, parsed
 from test_run_step_grid import deployment, publish, run_file
+from test_served_tokenizer import (
+    PROMPT_TOKENS,
+    TERM,
+    _charges,
+    _run_file,
+    _Tokenizer,
+    rt,  # noqa: F401  the rt fixture
+)
 
 from atom.compass import run as compass_run
 from atom.compass.backends.launch_features import (
@@ -40,7 +50,9 @@ from atom.compass.backends.step_linear_fit import (
     label_records,
     main,
 )
+from atom.compass.drive import runfile
 from atom.compass.parity import ENV, compare, read, recurrence
+from atom.compass.run.step_grid import keyed
 from atom.compass.runner.overrides import (
     FORWARD_KINDS,
     HOST_SEGMENTS,
@@ -263,6 +275,45 @@ def test_a_run_prices_a_column_under_the_sets_its_host_laws_key_states(
         assert batch.total_tokens_num > BUCKET
         r.forward(batch)
         assert r.compass_host.segments["W_launch"] == pytest.approx(1e-4 + EAGER_S)
+
+
+def test_the_server_and_the_run_file_take_the_host_entry_the_runner_takes(
+    tmp_path, monkeypatch, rt  # noqa: F811
+):
+    """Two host entries, each fitted under its own engine config by a runner
+    that stated its graph sets in the key, which a simulated run's config never
+    states: the run file's hops and the server's tokenizer and intake terms
+    come from the entry the runner takes, the one fitted under this run's."""
+    flags = []
+    for i, block in enumerate((16, 32)):
+        r = deployment(tmp_path, kv_cache_block_size=block)
+        encode = {"fixed_s": i + 1.0, "tokens_per_s": 1e6}
+        host = {
+            "key": {"engine": {**keyed(r.config), GRAPHS: SETS}},
+            "hops": {"ipc_s": (i + 1) * 1e-4},
+            "tokenizer": TERM | {"encode": encode},
+            "http_intake": {"fixed_s": (i + 1) * 1e-3, "per_byte_s": 0.0},
+        }
+        (tmp_path / f"law{i}.json").write_text(json.dumps({"host": host}))
+        flags += ["--host-laws", str(tmp_path / f"law{i}.json")]
+    # This run's ATOM arguments resolve the second deployment's config.
+    monkeypatch.setattr("atom.compass.drive.run._config", lambda atom_args: r.config)
+    run = runfile.build(parsed(tmp_path, *flags), model(tmp_path))
+    _run_file(monkeypatch, tmp_path, run | {"out_dir": str(tmp_path)})
+    monkeypatch.setattr(compass_run, "_frontend_host", None)
+    tok = _Tokenizer()
+    compass_run.tokenizer(tok, r.config)
+    taken = {**run}
+    compass_run.pick_fitted(taken, "host", r.config)
+    entry = taken["host"]
+
+    assert entry == run["host"][1]
+    assert run["ipc_s"] == entry["hops"]["ipc_s"]
+    assert compass_run.http_intake()[0] == entry["http_intake"]["fixed_s"]
+    encode = entry["tokenizer"]["encode"]
+    assert _charges(tok, rt)[0] == pytest.approx(
+        encode["fixed_s"] + PROMPT_TOKENS / encode["tokens_per_s"]
+    )
 
 
 def test_the_recurrence_grade_prices_a_column_on_each_step_it_predicts(tmp_path):

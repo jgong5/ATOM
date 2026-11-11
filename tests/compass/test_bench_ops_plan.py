@@ -28,9 +28,9 @@ from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
 from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
 from atom.compass import capture, cli, ir
-from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
+from atom.compass.artifacts import ArtifactStore, Topology, member_name
 from atom.compass.bench import ops
-from atom.compass.capture import driverless, forward
+from atom.compass.capture import driverless, forward, graph_key
 from atom.compass.capture.forward import decode, prefill, structure
 from atom.compass.capture.graph import Traced, build, to_json
 from atom.compass.fit import ops as fit_ops
@@ -927,11 +927,7 @@ def test_an_integer_activation_indexes_a_dimension_of_one():
 
 def _publish_graph(store, config, arch, shape):
     """A graph of `shape` keyed on `arch`, its one leaf named for the arch."""
-    key = Key.of(
-        Kind.OP_GRAPH,
-        structure=structure(config, shape.phase, device=arch),
-        shape=str(shape),
-    )
+    key = graph_key(structure(config, shape.phase, device=arch), str(shape))
     leaf = _leaf(f"aiter.{arch}", ("x", _t([shape.seqs, 8], "activation")))
     store.publish(
         key,
@@ -1293,7 +1289,7 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     def publish(store, graph, model, declared, tp, atom_args, command):
         at = graph.applicability
         published.append((at.structure, tp))
-        key = Key.of(Kind.OP_GRAPH, structure=at.structure, shape=str(at.shape))
+        key = graph_key(at.structure, str(at.shape))
         store.publish(
             key,
             provenance=stanza("compass trace ops"),
