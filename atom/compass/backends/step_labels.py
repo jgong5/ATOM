@@ -64,10 +64,11 @@ without busy time is cut as `untraced`. A trace run, a record with its busy
 lines beside it or whose run directory holds `TRACE`, ran under a profiler: its
 decode steps are cut as `traced` and its steps carry no host labels.
 
-Given a `Floor`, a trace run's drafter labels, the draft's and its passes', lose
-what the profiler added to each drafter kernel shorter than the profiler's
-floor (`floored`): queued behind another, such a kernel records the floor, so
-its term is its recorded length, up to the floor, less its own. A kernel's own
+Given `floored`, a trace run's drafter labels, the draft's and its passes',
+lose what the profiler added to each drafter kernel shorter than the profiler's
+floor (`parity.busy.floored` under a `Floor`): queued behind another, such a
+kernel records the floor, so its term is its recorded length, up to the floor,
+less its own (`Floor.term`). A kernel's own
 length is the median `warm_ns` of the `compass measure ops` points that launch
 it alone, at its grid on any shape, or, replayed from a graph, which states no
 grid, at its pass's shape, as `capture.population_steps` places the step: the
@@ -139,13 +140,6 @@ TABLE_VERSION = 1
 #: run.json's entry naming the JIT modules and kernels its server compiled while
 #: it served (`atom.compass.drive.aiter_jit`); a server that compiled none has none.
 BUILDS = "aiter_jit_builds"
-#: A trace run's drafter part, as `parity.busy.drafter` names it, and its label's
-#: busy line field.
-DRAFTER = {
-    "draft": "b_draft_ns",
-    "d_propose_ns": "b_propose_ns",
-    "d_draft_kv_ns": "b_draft_kv_ns",
-}
 
 
 def refusal(run: dict) -> str | None:
@@ -217,8 +211,8 @@ class Floor:
         self._at, self._known = defaultdict(list), {}
         for p in points:
             grids = p.get("grids") or [None] * len(p["kernels"])
-            keys = {(k, json.dumps(g)) for k, g in zip(p["kernels"], grids) if g}
-            for key in keys | {(k, p["shape"]) for k in p["kernels"]}:
+            keys = [(k, json.dumps(g)) for k, g in zip(p["kernels"], grids) if g]
+            for key in dict.fromkeys(keys + [(k, p["shape"]) for k in p["kernels"]]):
                 self._at[key].append(p)
 
     def term(self, name: str, grid, ns: float, shape: str) -> float | str:
@@ -445,44 +439,7 @@ def busy_gaps(lines: list[dict]) -> list[bool]:
     return [n > 0 for n in itertools.accumulate(opened[:-1])]
 
 
-def floored(record, floor: Floor) -> list[dict]:
-    """Per line of the trace run's `record`, each drafter part's busy time
-    less its kernels' known terms (`Floor.term`) on each rank, at its largest
-    rank, by its busy line field; and under ``floor`` why a term is not known,
-    per field."""
-    from atom.compass.capture import population_steps
-    from atom.compass.parity.busy import drafter
-
-    run = Path(record).parent.parent
-    if not (run / TRACE).is_dir():
-        raise ValueError(
-            f"{record} is a trace run's record whose run directory holds no "
-            f"{TRACE}/, from which the profiler's floor reads each drafter kernel"
-        )
-    shapes = defaultdict(list)
-    for shape, line in population_steps([run], drafters=True):
-        shapes[line["step"]].append(str(shape))
-    rows = []
-    for s, ranks in zip(read_jsonl(record), drafter(run)):
-        at, best, why = shapes[s["step"]], {}, defaultdict(set)
-        for parts, kernels in ranks:
-            got = dict(parts)
-            for key, name, grid, ns in kernels:
-                shape = at[0] if key == "d_draft_kv_ns" else at[-1]
-                term = floor.term(name, grid, ns, shape)
-                for part in {"draft", key} & got.keys():
-                    if isinstance(term, str):
-                        why[DRAFTER[part]].add(term)
-                    else:
-                        got[part] -= term
-            for part, ns in got.items():
-                best[DRAFTER[part]] = max(best.get(DRAFTER[part], ns), ns)
-        row = {f: round(ns) for f, ns in best.items()}
-        rows.append(row | {"floor": {f: sorted(t) for f, t in why.items()}})
-    return rows
-
-
-def _read(record, floor: Floor | None = None) -> list[dict]:
+def _read(record, floored=None) -> list[dict]:
     path = Path(record)
     lines = read_jsonl(path)
     if (pulls := path.with_suffix(".pulls.jsonl")).exists():
@@ -491,8 +448,8 @@ def _read(record, floor: Floor | None = None) -> list[dict]:
         got = {b.pop("step"): b for b in read_jsonl(busy)}
         for s in lines:
             s.update(got.get(s["step"], {}))
-        if floor is not None:
-            for s, row in zip(lines, floored(path, floor)):
+        if floored is not None:
+            for s, row in zip(lines, floored(path)):
                 s.update(row)
     elif _traced(path):
         raise ValueError(
@@ -515,28 +472,29 @@ def _pull(step: dict) -> int:
 
 
 def label(
-    record, run: str | None = None, split_rule=None, floor: Floor | None = None
+    record, run: str | None = None, split_rule=None, floored=None
 ) -> tuple[list[Sample], list[dict]]:
     """The record's samples, in step order, and its table's rows.
 
     `run` names the run in each sample's provenance, the record's `digest` by
-    default; `split_rule` rebuilds an older record's split, as above; `floor`
-    takes the profiler's floor out of a trace run's drafter labels. A
+    default; `split_rule` rebuilds an older record's split, as above;
+    `floored` gives a trace run's record its drafter busy lines less the
+    profiler's floor (`parity.busy.floored`). A
     data-parallel record's `group_dummies` and `group_max_tokens` are read from
     the rank records beside it.
     """
-    lines = _read(record, floor)
+    lines = _read(record, floored)
     return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None, None)
 
 
 def label_run(
-    records, run: str | None = None, split_rule=None, floor: Floor | None = None
+    records, run: str | None = None, split_rule=None, floored=None
 ) -> list[tuple[list[Sample], list[dict]]]:
     """`label` of each of `records`, one run's DP ranks, with each `E` from the
     latest pull over the ranks before the same forward. A rank that ran only
     DP's dummy forwards gives no sample and no row. Ranks whose line counts
     differ by more than the forward a stopped server leaves on some refuse."""
-    ranks = [_read(r, floor) for r in records]
+    ranks = [_read(r, floored) for r in records]
     counts = {Path(r).name: len(x) for r, x in zip(records, ranks) if x}
     if counts and max(counts.values()) - min(counts.values()) > 1:
         raise ValueError(

@@ -27,6 +27,7 @@ from.
 
 import argparse
 import datetime
+import functools
 import json
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from atom.compass.artifacts.keys import platform_key
 from atom.compass.backends.json_file import read_json
 from atom.compass.backends.step_labels import Floor
 from atom.compass.fit.samples import UNRECORDED, load
+from atom.compass.parity import busy
 from atom.compass.run.step_grid import readings as run_readings
 from atom.compass.spec import MachineSpec
 from atom.compass.validate.runs import SIDES, named_by_prefill
@@ -105,7 +107,7 @@ def inputs(args, sources, ops=()) -> tuple[list, dict]:
     where `sources` holds `replay`, step measurements, and their configuration;
     a fit taking only `sources` refuses any other input. With `ops`, `measure
     ops --out` directories read as `fit ops` reads them, a trace run's drafter
-    labels lose the profiler's floor (`step_labels.Floor`), the spec's
+    labels lose the profiler's floor (`parity.busy.floored`), the spec's
     `device.profiler_floor_s`, each kernel's own length from their points,
     which refuse unless they ran the records' model, platform, source root
     and `SAME_OPS`."""
@@ -134,11 +136,12 @@ def inputs(args, sources, ops=()) -> tuple[list, dict]:
     store = ArtifactStore(args.store)
     measurements = [store.key_from_token(Kind.STEP_MEASUREMENT, t) for t in tokens]
     spec = MachineSpec.from_mapping(json.loads(Path(args.machine).read_text()))
-    floor = None
+    floored = None
     if ops:
         points, measured, keyed = fit_ops.read(store, map(Path, ops))
         floor = Floor(spec.value("device.profiler_floor_s"), points)
-    samples, config = load(runs, measurements, args.store, floor)
+        floored = functools.partial(busy.floored, floor=floor)
+    samples, config = load(runs, measurements, args.store, floored)
     if args.ptl:
         if config.get("ptl") != UNRECORDED:
             raise ValueError(

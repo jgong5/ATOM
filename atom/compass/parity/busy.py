@@ -7,9 +7,9 @@ request to its stop, and each rank wrote ``OUT/trace/rank_<r>/`` one gzipped
 chrome trace. `reduce` writes ``OUT/steps/dp0.busy.jsonl``: per line of the
 record, its ``step`` and ``b_target_ns``, and on an MTP record ``b_draft_ns``
 and, for each drafter pass `PASSES` names that the line times, its busy time
-under that pass's ``b_`` name. `step_labels` labels a prefill pass by them;
-`drafter` hands it each drafter pass's busy time and kernels per rank, from
-which it subtracts the profiler's floor.
+under that pass's ``b_`` name. `step_labels` labels a prefill pass by them, and
+under a `step_labels.Floor` by `floored`'s: each drafter part's busy time on
+each rank less the terms of its kernels (`drafter`), at its largest rank.
 
 The n-th ``ATOM::forward`` range on each rank is the record's n-th line, its
 ``tokens=`` the line's; the ranks and the record must agree on both. A
@@ -48,6 +48,7 @@ import json
 import re
 import statistics
 from bisect import bisect_right
+from collections import defaultdict
 from pathlib import Path
 
 from atom.compass.backends.json_file import read_jsonl
@@ -67,6 +68,9 @@ COLLECTIVE = re.compile(
 )
 #: The drafter passes a busy line times apart, by their record line field.
 PASSES = ("d_propose_ns", "d_draft_kv_ns")
+#: Each drafter part `drafter` times, by the busy line field of its label.
+LABELS = {"draft": "b_draft_ns", "d_propose_ns": "b_propose_ns"}
+LABELS["d_draft_kv_ns"] = "b_draft_kv_ns"
 #: Characters read from a trace at a time.
 CHUNK = 1 << 24
 _SKIP = re.compile(r"[\s,]*")
@@ -312,3 +316,41 @@ def drafter(out) -> list[list[tuple[dict, list]]]:
             ]
         )
     return got
+
+
+def floored(record, floor) -> list[dict]:
+    """Per line of the trace run's `record`, each drafter part's busy time
+    less its kernels' known terms under `floor` (`step_labels.Floor.term`) on
+    each rank, at its largest rank, by its busy line field; and under
+    ``floor`` why a term is not known, per field. A kernel's shape is its
+    pass's, as `capture.population_steps` places the step: the draft-KV pass
+    at the step's, the rest of the draft at its drafter's."""
+    from atom.compass.capture import population_steps
+
+    run = Path(record).parent.parent
+    if not (run / TRACE).is_dir():
+        raise ValueError(
+            f"{record} is a trace run's record whose run directory holds no "
+            f"{TRACE}/, from which the profiler's floor reads each drafter kernel"
+        )
+    shapes = defaultdict(list)
+    for shape, line in population_steps([run], drafters=True):
+        shapes[line["step"]].append(str(shape))
+    rows = []
+    for s, ranks in zip(read_jsonl(record), drafter(run)):
+        at, best, why = shapes[s["step"]], {}, defaultdict(set)
+        for parts, kernels in ranks:
+            got = dict(parts)
+            for key, name, grid, ns in kernels:
+                shape = at[0] if key == "d_draft_kv_ns" else at[-1]
+                term = floor.term(name, grid, ns, shape)
+                for part in [p for p in ("draft", key) if p in got]:
+                    if isinstance(term, str):
+                        why[LABELS[part]].add(term)
+                    else:
+                        got[part] -= term
+            for part, ns in got.items():
+                best[LABELS[part]] = max(best.get(LABELS[part], ns), ns)
+        row = {f: round(ns) for f, ns in best.items()}
+        rows.append(row | {"floor": {f: sorted(t) for f, t in why.items()}})
+    return rows

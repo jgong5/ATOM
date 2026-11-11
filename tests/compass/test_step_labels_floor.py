@@ -102,7 +102,7 @@ def _run(tmp_path):
 
 def _labels(record, points):
     floor = Floor(FLOOR, [p | {"warm_ns": OWN[p["kernels"][0]]} for p in points])
-    [([s], _)] = label_run([record], floor=floor)
+    [([s], _)] = label_run([record], floored=lambda r: busy.floored(r, floor))
     return s
 
 
