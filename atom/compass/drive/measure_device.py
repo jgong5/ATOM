@@ -36,6 +36,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import time
 from functools import partial
 from pathlib import Path
 
@@ -51,7 +52,7 @@ from atom.compass.artifacts import (
     platform_of,
     roots_for,
 )
-from atom.compass.drive import device_probe, pp_probe
+from atom.compass.drive import device_probe, pp_probe, serve
 from atom.compass.drive.gpu import add_gpu_flag, hip_visible, smi
 from atom.compass.drive.identity import _device, _ptl, _stack
 from atom.compass.spec import SpecRefusal
@@ -145,7 +146,10 @@ def _idle(bdfs: list[str], ptl: str) -> list[dict]:
 
 def _child(out: Path, task: str, gpus: tuple[int, ...]) -> dict:
     """What `child(task, ...)` wrote, run in a process that sees `gpus`; under
-    torchrun, two ranks, for ``pp``."""
+    torchrun, two ranks, for ``pp``. It returns once KFD lists no process it
+    did not list before, or after `serve.STOP_GRACE_S`: KFD lists an exited
+    process until it has freed its GPU memory."""
+    kfd = serve._kfd()
     path = out / f"{task}-{'-'.join(map(str, gpus))}.json"
     argv = [sys.executable, "-m", MODULE, task, str(path)]
     if task == "pp":
@@ -157,6 +161,10 @@ def _child(out: Path, task: str, gpus: tuple[int, ...]) -> dict:
         done = subprocess.run(
             argv, env=env, stdout=f, stderr=subprocess.STDOUT, check=False
         )
+    for _ in range(int(serve.STOP_GRACE_S / serve.POLL_S)):
+        if not serve._kfd() - kfd:
+            break
+        time.sleep(serve.POLL_S)
     if done.returncode:
         raise ValueError(
             f"the {task} probe on GPUs {gpus} exited {done.returncode}; see {log}"

@@ -13,7 +13,7 @@ from test_artifact_invalidation import STANZA
 
 from atom.compass import cli
 from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
-from atom.compass.drive import device_probe, measure_device, pp_probe
+from atom.compass.drive import device_probe, measure_device, pp_probe, serve
 from atom.compass.spec import SpecRefusal
 from atom.compass.spec.rules import Rule
 
@@ -55,8 +55,13 @@ def samples(card: int, formats) -> dict:
 def node(monkeypatch, tmp_path):
     """A node of eight MI355X cards, each idle unless named in `busy`; the
     probes the command starts run here, each recording the HIP devices it
-    saw and the formats it was asked for; no MXFP4 GEMM runs on `no_fp4`."""
-    seen = {"pairs": [], "busy": {}, "no_fp4": set()}
+    saw and the formats it was asked for; no MXFP4 GEMM runs on `no_fp4`. KFD
+    lists each probe's process, on every card, for two polls after it exits."""
+    seen = {"pairs": [], "busy": {}, "no_fp4": set(), "exited": []}
+    monkeypatch.setattr(serve, "POLL_S", 0.001)
+    monkeypatch.setattr(
+        serve, "_kfd", lambda: set(seen["exited"] and seen["exited"].pop())
+    )
     monkeypatch.setattr(
         measure_device,
         "_device",
@@ -76,7 +81,7 @@ def node(monkeypatch, tmp_path):
             {
                 "bdf": b,
                 "vram_used": seen["busy"].get(b, 2**20),
-                "processes": [],
+                "processes": [p for listed in seen["exited"] for p in listed],
                 "ptl": "disabled",
             }
             for b in bdfs
@@ -105,6 +110,7 @@ def node(monkeypatch, tmp_path):
         seen["pairs"].append(env["HIP_VISIBLE_DEVICES"])
         seen.setdefault("argv", []).append(argv)
         measure_device.child(*argv[-2:])
+        seen["exited"] = [["4180497"]] * 2
         return Done
 
     started = SimpleNamespace(run=run, STDOUT=subprocess.STDOUT)
