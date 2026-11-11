@@ -236,12 +236,14 @@ def _arg(value):
     if isinstance(value, ir.Symbol):
         return {"symbol": value.name}
     if isinstance(value, ir.Tensor):
+        marks = {"is_shuffled": True} if value.shuffled else {}
+        marks |= {"device": "cpu"} if value.host else {}  # none: on the device
         return {
             "shape": _arg(value.shape),
             "dtype": value.dtype,
             "stride": _arg(value.stride),
             "role": value.role.value,
-        } | ({"is_shuffled": True} if value.shuffled else {})
+        } | marks
     if isinstance(value, ir.ContextRef):
         kind = "module" if isinstance(value, ir.ModuleRef) else "context"
         return {kind: value.key}
