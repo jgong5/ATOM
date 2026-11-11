@@ -139,6 +139,9 @@ V41_SCORERS = (
     ),
     "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
 )
+#: DeepSeek-V4.1's RoPE, which its index keys take at their ratio's compress
+#: plan's positions: with no drafter both ratios' plans hold as many rows.
+V41_ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 #: Where a drafter's step ends its target's work: ATOM records `forward_done_event`.
 CUT = "forward_done_event"
 
@@ -1260,12 +1263,15 @@ def _v41(recorder, hf):
     its indexer's scorers (`V41_SCORERS`) the `compress_ratio` and
     `index_candidates`, the most entries it scores where an earlier layer
     chose its candidates, else None: read off the layer `layer_name` names
-    and the model's config `hf`.
+    and the model's config `hf`. Its index keys' RoPE (`V41_ROPE`) states
+    their indexer's `compress_ratio`; its query's, on the step's positions
+    at every ratio, states none.
     """
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.models.deepseek_v41.attention import Indexer
 
     bodies = {name: _implementation(name) for name in V41_OPENED}
-    attend = bodies["v41_attention"]
+    attend, project_keys = bodies["v41_attention"], Indexer.project_keys
 
     def attention(hidden, layer_name, *args, **kwargs):
         attn = recorder.contexts[layer_name][0].attn
@@ -1282,6 +1288,11 @@ def _v41(recorder, hf):
         with patch.object(recorder, "stated", stated):
             return attend(hidden, layer_name, *args, **kwargs)
 
+    def keys(indexer, *args):
+        ratio = {V41_ROPE: (("compress_ratio", indexer.spec.ratio),)}
+        with patch.object(recorder, "stated", recorder.stated | ratio):
+            return project_keys(indexer, *args)
+
     bodies["v41_attention"] = attention
     recorder.lands = True
     stack = contextlib.ExitStack()
@@ -1290,6 +1301,7 @@ def _v41(recorder, hf):
     stack.enter_context(
         patch.object(PagedAttentionCache, "_report_stale_state", lambda *a: None)
     )
+    stack.enter_context(patch.object(Indexer, "project_keys", keys))
     return stack
 
 
