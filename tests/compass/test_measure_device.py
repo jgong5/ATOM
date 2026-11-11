@@ -5,6 +5,8 @@ same node and platform, a busy card and cards on two PTL states refuse before
 any probe runs."""
 
 import json
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -103,7 +105,8 @@ def node(monkeypatch, tmp_path):
         measure_device.child(*argv[-2:])
         return Done
 
-    monkeypatch.setattr(measure_device.subprocess, "run", run)
+    started = SimpleNamespace(run=run, STDOUT=subprocess.STDOUT)
+    monkeypatch.setattr(measure_device, "subprocess", started)
     return seen
 
 
