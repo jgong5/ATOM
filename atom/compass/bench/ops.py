@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """`compass measure ops`: each leaf of an `op_graph` timed alone on one device, cold.
 
-    compass measure ops (--width W | --prefill T B)... [--context C] --llc-mib M
-        --gpu G --store S --out DIR -- <ATOM args>
+    compass measure ops (--width W | --prefill T B)... [--context C] [--drafter]
+        --llc-mib M --gpu G --store S --out DIR -- <ATOM args>
     compass measure ops --plan RECORD [--plan RECORD]... --llc-mib M --gpu G
         --store S --out DIR -- <ATOM args>
     compass measure ops --coverage RECORD [--coverage RECORD]... --store S
@@ -11,7 +11,9 @@
 Each shape names the `op_graph` `compass trace ops` published in S for the
 model and TP width ATOM's arguments resolve, and under a speculative drafter
 each graph of the drafter's part of a step S holds at that shape (`DRAFTED`,
-`leaves_at`), timed on the target's batch. A point is one leaf of those graphs,
+`leaves_at`), timed on the target's batch; with `--drafter` those alone, the
+points a trace run's drafter kernels take their own lengths from
+(`step_labels.Floor`). A point is one leaf of those graphs,
 its instances grouped (`leaves`), at the shape and `--context`: a decode
 step's rows each hold `--context` tokens, under a drafter verifying as many
 more as it drafts, and a prefill's rows, split as the capture split them,
@@ -136,10 +138,12 @@ timing, the host idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
 aside, are the point's kernel identity, read from two profiles in a row that
-name the same; a profile that recorded nothing of a call whose cold graph
-timed device work missed it, and the call is profiled again, refused when no
-two profiles name its kernels. When `ReplayRule` refuses a batch, its
-leaves refuse; an error in ATOM's preparation fails the run, naming the point.
+name the same, and the point records each one's grid (`grids`), by which
+`step_labels` finds a traced kernel's own length; a profile that recorded
+nothing of a call whose cold graph timed device work missed it, and the call
+is profiled again, refused when no two profiles name its kernels. When
+`ReplayRule` refuses a batch, its leaves refuse; an error in ATOM's
+preparation fails the run, naming the point.
 The points run in a process of their own on each GPU, which dies when its
 device faulted (`_alive`); one that dies ends every rank, keeps the points
 every rank finished, the point it was measuring refuses, and new ones measure
@@ -259,6 +263,8 @@ GRAPH_NS = 10_000_000
 PROFILES = 4
 #: How the profiler's name of a memory copy's device activity starts.
 COPY = "Memcpy"
+#: The chrome trace categories of a profile's device activity.
+DEVICE = ("kernel", "gpu_memset", "gpu_memcpy")
 #: Times over the last-level cache the copies' bytes pass, and the bytes read
 #: before each cold replay: just past it, part of them stays there, and an
 #: MI308X GEMM read up to 7% fast.
@@ -564,6 +570,8 @@ def main(argv: list[str]) -> None:
         raise ValueError("name a shape: --width or --prefill, or --plan")
     if shapes and args.plan:
         raise ValueError("--plan places every point; name no --width or --prefill")
+    if args.drafter and args.plan:
+        raise ValueError("--drafter times a named shape's drafter graphs; name one")
     if args.context is None and any(s.phase == "decode" for s in shapes):
         raise ValueError("a decode shape needs --context, each row's tokens")
     engine = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
@@ -588,7 +596,10 @@ def main(argv: list[str]) -> None:
         )
     _eager(config)
     store = ArtifactStore(args.store)
-    todo = [(s, args.context, leaves_at(store, config, s)) for s in shapes]
+    todo = [
+        (s, args.context, leaves_at(store, config, s, drafter=args.drafter))
+        for s in shapes
+    ]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "engine.json").write_text(json.dumps(keyed(config)))
@@ -642,6 +653,11 @@ def _parser() -> argparse.ArgumentParser:
         default=[],
         metavar="RECORD",
         help="a record directory whose steps the planned points cover",
+    )
+    p.add_argument(
+        "--drafter",
+        action="store_true",
+        help="each shape's drafter graphs alone",
     )
     p.add_argument(
         "--llc-mib",
@@ -699,14 +715,17 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     return json.loads(store.read(key).read_member("graph", RANK, "json"))
 
 
-def leaves_at(store, config, shape, arch=None, own=()) -> dict[str, tuple[dict, list]]:
+def leaves_at(
+    store, config, shape, arch=None, own=(), drafter=False
+) -> dict[str, tuple[dict, list]]:
     """Each leaf (`leaves`) of `shape`'s `graph` and, under a speculative
     drafter, of each graph of the drafter's (`DRAFTED`) the store holds there,
     the capture having kept no other; one of a drafter's graphs alone is
     marked ``drafted``. With `own`, `shape` is a drafter's own shape past its
     step's (`parts`), where a capture keeps a decode's drafter's graph alone:
     the leaves of the drafter's graphs there at each output (`graph`'s
-    `output`) `own` holds, as its steps read them."""
+    `output`) `own` holds, as its steps read them. With `drafter`, only the
+    leaves some graph of the drafter's holds, each as the whole shape has it."""
     from atom.compass.artifacts import ArtifactRefusal
 
     if own:
@@ -716,13 +735,17 @@ def leaves_at(store, config, shape, arch=None, own=()) -> dict[str, tuple[dict, 
             leaves(region, None, found)
     else:
         found = leaves(graph(store, config, shape, arch)["region"])
-        target, drafter = set(found), getattr(config, "speculative_config", None)
-        for output, draft in DRAFTED if drafter else ():
+        target, held = set(found), set()
+        spec = getattr(config, "speculative_config", None)
+        for output, draft in DRAFTED if spec else ():
             try:
                 region = graph(store, config, shape, arch, output, draft)["region"]
             except ArtifactRefusal:
                 continue
+            held |= leaves(region).keys()
             leaves(region, None, found)
+        if drafter:
+            found = {sig: leaf for sig, leaf in found.items() if sig in held}
     for sig, (op, _) in found.items():
         if sig not in target:
             op["drafted"] = True
@@ -1458,7 +1481,7 @@ class Stub:
             forward_context._forward_context = calls[0][1]
             with refused_together():
                 fn(**calls[0][0])  # compiles and tunes outside the graphs
-            kernels, ns = _identity(fn, calls[0][0])
+            kernels, grids, ns = _identity(fn, calls[0][0])
             k = min(CALLS, max(int(GRAPH_NS // ns), 1)) if ns else CALLS
             # a collective's call holds its wait on the last rank to arrive,
             # whose own call is the shortest: every graph takes its calls
@@ -1480,7 +1503,7 @@ class Stub:
             # two profiles that named nothing of a call its graph timed missed it
             if agreed(int(not kernels and any(cold)), cpu_group(), most=True):
                 forward_context._forward_context = calls[0][1]
-                kernels = _identity(fn, calls[0][0], timed=any(cold))[0]
+                kernels, grids = _identity(fn, calls[0][0], timed=any(cold))[:2]
         finally:
             forward_context._forward_context = forward_context.ForwardContext()
         medians = statistics.median(cold), warm and statistics.median(warm)
@@ -1489,6 +1512,7 @@ class Stub:
             scratch["workspace_bytes"] = calls[0][0]["workspace"].nbytes
         return scratch | {
             "kernels": kernels,
+            "grids": grids,
             "cold_ns": medians[0],
             "warm_ns": medians[1],
             "warm_over_cold": medians[1] / medians[0] if warm and medians[0] else None,
@@ -2256,21 +2280,22 @@ def _on_coordinator(name: str, fn):
     return call
 
 
-def _identity(fn, kwargs, timed=False) -> tuple[list[str], float]:
-    """`_kernels` of one call of `fn`, memory copies aside, once two profiles
-    in a row name the same kernels on every rank, at most `PROFILES`; refused
-    on every rank together when no two do. Of a call whose graph `timed`
-    device work, a profile that recorded none, kernel or copy, missed the
-    call and agrees with no other."""
+def _identity(fn, kwargs, timed=False) -> tuple[list[str], list, float]:
+    """`_kernels` of one call of `fn`, memory copies aside, with their grids,
+    once two profiles in a row name the same kernels on every rank, at most
+    `PROFILES`; refused on every rank together when no two do. Of a call whose
+    graph `timed` device work, a profile that recorded none, kernel or copy,
+    missed the call and agrees with no other."""
     from atom.compass.bench.ranks import agreed, cpu_group
 
     last = None
     for _ in range(PROFILES):
-        names, ns = _kernels(fn, kwargs)
-        kernels = [n for n in names if not n.startswith(COPY)]
+        names, grids, ns = _kernels(fn, kwargs)
+        kept = [(n, g) for n, g in zip(names, grids) if not n.startswith(COPY)]
+        kernels = [n for n, _ in kept]
         seen = None if timed and not names else kernels
         if agreed(int(seen is not None and seen == last), cpu_group()):
-            return seen, ns
+            return seen, [g for _, g in kept], ns
         last = seen
     raise ValueError(
         f"no two profiles in a row of {PROFILES} named the same kernels; "
@@ -2278,13 +2303,15 @@ def _identity(fn, kwargs, timed=False) -> tuple[list[str], float]:
     )
 
 
-def _kernels(fn, kwargs) -> tuple[list[str], float]:
+def _kernels(fn, kwargs) -> tuple[list[str], list, float]:
     """The kernels one call of `fn` launches, in order, or its memory copies
-    when it launches no kernel, and the kernels' device time in ns: beside a
-    kernel its memory copies are left out, which the profiler records at
-    some calls of a leaf and misses at others; started on every rank
-    together (`_together`), once the device has finished `_together`'s
-    all-reduce, which would otherwise join the call's kernels."""
+    when it launches no kernel, each one's grid, and the kernels' device time
+    in ns: beside a kernel its memory copies are left out, which the profiler
+    records at some calls of a leaf and misses at others; started on every
+    rank together (`_together`), once the device has finished `_together`'s
+    all-reduce, which would otherwise join the call's kernels. Kineto states
+    a launch's grid in the profile's chrome trace alone, so all three are
+    read from it; a memory set or copy has no grid."""
     from torch.profiler import ProfilerActivity, profile
 
     _together()
@@ -2292,13 +2319,15 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         fn(**kwargs)
         torch.cuda.synchronize()
-    device = [
-        e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
-    ]
-    device.sort(key=lambda e: e.time_range.start)
-    kernels = [e for e in device if not e.name.startswith(COPY)]
-    ns = 1e3 * sum(e.time_range.elapsed_us() for e in kernels)
-    return [e.name for e in kernels or device], ns
+    with tempfile.TemporaryDirectory() as tmp:
+        prof.export_chrome_trace(f"{tmp}/trace.json")
+        events = json.loads(Path(tmp, "trace.json").read_text())["traceEvents"]
+    device = [e for e in events if e.get("cat") in DEVICE]
+    device.sort(key=lambda e: e["ts"])
+    kernels = [e for e in device if not e["name"].startswith(COPY)]
+    ns = 1e3 * sum(e["dur"] for e in kernels)
+    named = kernels or device
+    return [e["name"] for e in named], [e["args"].get("grid") for e in named], ns
 
 
 def _replay(fn, calls, flush=None) -> list[float]:

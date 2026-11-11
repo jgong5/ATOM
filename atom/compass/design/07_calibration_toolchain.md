@@ -420,7 +420,8 @@ fresh ones in kernels or time ([#1706](https://github.com/jgong5/ATOM/issues/170
 1.0%, its repeats spreading 0.4% ([#1620](https://github.com/jgong5/ATOM/issues/1620)); attention's context features chosen per kind by data, under
 [#941](https://github.com/jgong5/ATOM/issues/941)'s rule. MoE leaves run on independent
 uniform routing. Each point records the kernels the leaf launched there, its kernel
-identity.
+identity, and each one's grid, by which a trace run's drafter kernel finds its own length
+(`09` D54, [#2415](https://github.com/jgong5/ATOM/issues/2415)).
 
 **The price.** `fit ops` publishes a `price_list`: per leaf, piecewise-linear
 interpolation between same-kernel neighbours only, as `09` D60 requires. A query at a

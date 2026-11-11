@@ -387,7 +387,7 @@ def test_a_leaf_timed_after_a_copy_into_its_metadata_reads_the_prepared_values(
     stub = ops.Stub(runner, 5_000)
     with (
         patch.object(ops, "_function", side_effect=function),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
     ):
         upload, timed = stub.point(placed, decode(2), 20, found)
 
@@ -483,7 +483,7 @@ def test_measure_times_a_point_atom_prepared_and_runs_no_forward(monkeypatch):
     )
     monkeypatch.setattr(ops, "_runner", lambda config, rank: runner)
     monkeypatch.setattr("atom.compass.bench.replay.ReplayRule", lambda c: placed)
-    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], [None], 1.0))
     timed = []
     monkeypatch.setattr(
         ops, "_replay", lambda fn, calls, *_: timed.append(calls) or [1.0] * ops.REPEATS
@@ -1651,7 +1651,7 @@ def test_a_kv_argument_is_a_view_of_the_runner_s_kv_and_its_copies_cycle_placeme
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         got = {
@@ -1917,7 +1917,7 @@ def test_a_kv_leaf_past_its_cold_copies_counts_each_copy_s_activations_once(
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         [record] = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
@@ -2162,7 +2162,7 @@ def test_a_gathered_table_s_copies_read_disjoint_rows_of_one_table(
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         [record] = ops.Stub(_Runner(), 1000).point(placed, decode(2), 20, found)
@@ -2213,7 +2213,7 @@ def test_a_slot_named_as_a_v4_hca_workspace_field_is_a_view_of_that_field(
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         got = ops.Stub(runner, 1000).point(placed, decode(2), 20, found)
@@ -2245,7 +2245,7 @@ def test_a_call_cycles_a_weight_per_occurrence_on_the_cold_copies_inputs():
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         n, *_ = stub._plan(gemm, [{}], {}, 4, 2)
@@ -2324,7 +2324,7 @@ def test_a_call_that_fills_a_graph_alone_cycles_no_second_weight():
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], ops.GRAPH_NS * 2)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], ops.GRAPH_NS * 2)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         record = stub._time(gemm, "sig", [{}], 1)
@@ -2358,7 +2358,7 @@ def test_a_copy_past_the_cold_ones_takes_its_own_cold_copy_s_inputs_and_is_logge
         return [1.0] * ops.REPEATS
 
     with (
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         [record] = stub.point(placed, decode(2), 20, found)
@@ -2386,7 +2386,7 @@ def test_a_leaf_that_occurs_once_takes_a_weight_per_cache_sized_copy(monkeypatch
     placed = SimpleNamespace(
         block_size=16, batch=lambda view, block, slot: (block, slot)
     )
-    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], [None], 1.0))
     graphs = []
     monkeypatch.setattr(
         ops,
@@ -2516,7 +2516,7 @@ def test_every_cold_and_warm_graph_holds_calls_calls_at_any_copies(copies):
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         record = stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], copies)
@@ -2547,7 +2547,7 @@ def test_a_long_call_fills_a_graph_to_graph_ns_and_has_no_warm_graph(
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], call_ns)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], call_ns)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         record = stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], 8)
@@ -2623,7 +2623,7 @@ def test_each_cold_replay_follows_one_read_of_cold_caches_and_a_warm_one_none(
     )
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
     ):
         stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], 8)
 
@@ -2668,7 +2668,7 @@ def test_a_capture_waits_for_the_driver_to_clear_a_release_and_a_capped_wait_is_
     stub.placed = [(fctx.ForwardContext(), {})]
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
     ):
         record = stub._time({"op": "x", "args": {"n": 1}}, "sig", [{}], 8)
 
@@ -2706,7 +2706,7 @@ def test_copies_past_the_cache_sized_ones_cycle_instances_on_their_activations(
     stub = ops.Stub(runner, 600)
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         [record] = stub.point(placed, decode(2), 20, found)
@@ -2765,7 +2765,7 @@ def test_a_graph_over_placements_reads_one_clone_of_metadata_none_changed(
     stub = ops.Stub(runner, 5_000)
     with (
         patch.object(ops, "_function", return_value=call),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
     ):
         [record] = stub.point(placed, decode(2), 20, found)
 
@@ -2949,7 +2949,7 @@ def test_a_capture_that_fails_refuses_its_leaf_and_the_next_draws_its_activation
     monkeypatch.setattr(torch, "randn", draw)
     monkeypatch.setattr(ops, "_end_capture", world["capturing"].discard, raising=False)
     monkeypatch.setattr(ops, "_function", function)
-    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], [None], 1.0))
     monkeypatch.setattr(ops.time, "sleep", lambda s: None)
     time = ops.Stub._time
     _, [_, point] = _measuring(monkeypatch)
@@ -3158,7 +3158,7 @@ def test_the_decode_top_k_launches_the_scratch_aiter_sizes_for_its_rows_stride_a
     with (
         patch.object(topk, "topk_ob_workspace_size", side_effect=size),
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         record = stub._time(op, "sig", [{}], 2)
@@ -3230,7 +3230,7 @@ def test_the_prefill_top_k_launches_the_workspace_aiter_builds_for_its_path(
         patch.object(torch.cuda, "current_stream", lambda device: stream),
         patch.object(topk, "persistent_alloc", lambda device: contextlib.nullcontext()),
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         record = stub._time(op, "sig", [{}], 2)
@@ -3310,7 +3310,7 @@ def test_a_top_k_leaf_whose_size_query_raises_refuses_and_its_point_is_timed(
     monkeypatch.setattr(topk, "topk_ob_workspace_size", query)
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
     monkeypatch.setattr(ops, "_function", lambda name: lambda **kwargs: None)
-    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], [None], 1.0))
     monkeypatch.setattr(
         ops, "_replay", lambda fn, calls, flush=None: [1.0] * ops.REPEATS
     )
@@ -3378,16 +3378,31 @@ def test_a_multi_block_top_k_leaf_counts_aiter_s_one_buffer_once(
     assert (record["copies"], record["footprint_bytes"]) == (copies, footprint)
 
 
+def _profiled(events):
+    """A profile whose chrome trace holds `events`, each (category, name, start)
+    of 1 us."""
+    trace = [
+        {"cat": c, "name": n, "ts": t, "dur": 1.0, "args": {}} for c, n, t in events
+    ]
+    text = json.dumps({"traceEvents": trace})
+    return SimpleNamespace(
+        export_chrome_trace=lambda path: pathlib.Path(path).write_text(text)
+    )
+
+
+def _device(names):
+    """`names` as a profile's device activity in start order, a copy's as a copy."""
+    return [
+        ("gpu_memcpy" if n.startswith(ops.COPY) else "kernel", n, i)
+        for i, n in enumerate(names)
+    ]
+
+
 def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
     monkeypatch,
 ):
     # The same leaf at two contexts of one width, cold time flat: the profiler
     # recorded its device-to-device copy at one and missed it at the other.
-    cuda, cpu = torch.autograd.DeviceType.CUDA, torch.autograd.DeviceType.CPU
-
-    def event(name, start, device=cuda):
-        span = SimpleNamespace(start=start, elapsed_us=lambda: 1.0)
-        return SimpleNamespace(name=name, device_type=device, time_range=span)
 
     profiled = {
         2436: [
@@ -3400,17 +3415,14 @@ def test_a_copy_the_profiler_misses_at_one_context_does_not_change_the_kind(
 
     @contextlib.contextmanager
     def profile(activities):
-        names = profiled[context]
-        yield SimpleNamespace(
-            events=lambda: [event("aten::copy_", -1, cpu)]
-            + [event(n, -i) for i, n in enumerate(names)]
-        )
+        names = profiled[context][::-1]
+        yield _profiled([("cpu_op", "aten::copy_", -1), *_device(names)])
 
     monkeypatch.setattr("torch.profiler.profile", profile)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     records = []
     for context in profiled:
-        kernels, _ = ops._kernels(lambda: None, {})
+        kernels, _, _ = ops._kernels(lambda: None, {})
         records.append(
             {"shape": "decode B=2", "context": context, "op": "aiter.attn"}
             | {"leaf": "l", "kernels": kernels, "cold_ns": 31_700.0}
@@ -3430,7 +3442,7 @@ def test_the_barriers_all_reduce_ends_before_a_calls_kernels_are_profiled(
     @contextlib.contextmanager
     def profile(activities):
         order.append("profile")
-        yield SimpleNamespace(events=list)
+        yield _profiled([])
 
     monkeypatch.setattr("torch.profiler.profile", profile)
     monkeypatch.setattr(ops, "_together", lambda: order.append("all-reduce"))
@@ -3456,13 +3468,18 @@ def test_a_calls_kernels_are_what_two_profiles_in_a_row_name(
     # ROCm's profiler, under load, can drop a call's kernel from its profile and
     # keep the barrier's all-reduce in its place
     left = iter(profiles)
-    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (next(left), 1.0))
+
+    def kernels(fn, kwargs):
+        names = next(left)
+        return names, [None] * len(names), 1.0
+
+    monkeypatch.setattr(ops, "_kernels", kernels)
 
     if got is None:
         with pytest.raises(ValueError, match="no two profiles in a row of 4"):
             ops._identity(None, {})
     else:
-        assert ops._identity(None, {}) == (got, 1.0)
+        assert ops._identity(None, {}) == (got, [None] * len(got), 1.0)
 
 
 GEMM, COPIED = "gemm_a8w8_blockscale", "Memcpy DtoD (Device -> Device)"
@@ -3497,18 +3514,10 @@ def test_a_leaf_its_graph_times_names_the_kernels_two_profiles_recorded(
 ):
     # A profile holds the device events ROCm's profiler recorded of one call.
     left = iter(profiles)
-    cuda = torch.autograd.DeviceType.CUDA
-    span = SimpleNamespace(start=0, elapsed_us=lambda: 1.0)
 
     @contextlib.contextmanager
     def profile(activities):
-        names = next(left)
-        yield SimpleNamespace(
-            events=lambda: [
-                SimpleNamespace(name=n, device_type=cuda, time_range=span)
-                for n in names
-            ]
-        )
+        yield _profiled(_device(next(left)))
 
     monkeypatch.setattr("torch.profiler.profile", profile)
 
