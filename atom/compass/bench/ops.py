@@ -14,7 +14,9 @@ each graph of the drafter's part of a step S holds at that shape (`DRAFTED`,
 `leaves_at`), timed on the target's batch; with `--drafter` those alone, the
 points a trace run's drafter kernels take their own lengths from
 (`step_labels.Floor`). A point is one leaf of those graphs,
-its instances grouped (`leaves`), at the shape and `--context`: a decode
+its instances grouped (`leaves`), a kernel's layers among them when they
+differ only in where each views one KV pool from (`signature`), at the shape
+and `--context`: a decode
 step's rows each hold `--context` tokens, under a drafter verifying as many
 more as it drafts, and a prefill's rows, split as the capture split them,
 follow `--context` cached tokens each, none when it is not given; there
@@ -54,7 +56,8 @@ view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
 HCA decode workspace an `HCA_DECODE` slot names, or of the buffer
 `V4_METADATA` names for a DeepSeek-V4 slot, and on a V4 prefill's step
-`V4_SHARED` for one of an operator V4.1 runs too, or beside a DeepSeek-V4
+`V4_SHARED` for one of an operator V4.1 runs too and `V4_PREFILL` for one
+ATOM passes another buffer there than at a decode, or beside a DeepSeek-V4
 CSA layer `V4_CSA_SHARED` for one of an operator other models run too, or
 ATOM's batch-id build's repeats (`BATCH_IDS`), refused when it is not live,
 a prefill's index list whole (`V4_LISTS`), or,
@@ -163,6 +166,9 @@ refusing one only that call traces:
 every leaf at every rung of ATOM's decode ladder, and under a speculative
 drafter each leaf of its own decode shape past a step's (`parts`) that the
 graphs at its width, its B, do not hold, at its rows padded to that width,
+and under DP each leaf of a decode's drafter's graphs a run asks at its
+later passes' G at that G and the rows it ran there (`_drafter_at`), in
+place of its own shape's point,
 at the steps' lowest and highest row context (`_rows`); then each leaf of a
 kind those show depends on context (`_dependent`) over a ladder (`_ladder`)
 of the steps' row contexts, and, when some step's rows are ragged, at a
@@ -171,9 +177,9 @@ context, the rest sharing a mean, each `GRID`th of it from the least the rows
 hold; and each prefill family (`_family`), under a speculative drafter each
 leaf of its own prefill shape past a step's that the step's graphs do not
 hold too, at its rows padded to its W, and under DP each leaf of a prefill's
-drafter's graphs a run asks at its later passes' G at that G (`_drafter_at`),
-and at its shape only where its target runs it too, over a ladder of their
-token counts, chunk remainders among them,
+drafter's graphs at each G a run asks it at, its later passes' among them
+(`_drafter_at`), and at its shape only where its target runs it too or a run
+asks it there, over a ladder of their token counts, chunk remainders among them,
 its shapes that state the rows a DP group gathers apart, as `fit ops` prices them,
 one of a kind that depends on context at each at the most cached tokens of
 steps of its rows, and over a ladder of them once those points and the fresh
@@ -388,6 +394,19 @@ V4_SHARED = {
     ("aiter.pa_sparse_prefill_opus.default", slot): name
     for (op, slot), name in V4_METADATA.items()
     if op == _PREFILL
+}
+#: DeepSeek-V4's arguments, keyed as `V4_METADATA`'s, that ATOM passes from
+#: other buffers on a prefill's step than on a decode's: its CSA top-k
+#: translate writes each token's top-k into the layer's prefill list, at that
+#: list's indptr past the token's window prefix, where a decode passes the
+#: decode list and its indptr. They bind as `V4_SHARED`'s. Bound by size, a
+#: prefill's took the extend list's indptr, which ends past the list it wrote,
+#: and the measuring process died.
+_PACK = "atom.model_ops.v4_kernels.csa_translate_pack:csa_translate_pack"
+V4_PREFILL = {
+    (_PACK, "kv_indptr_csa"): "kv_indptr_prefix_csa",
+    (_PACK, "kv_indices_csa"): "kv_indices_prefix_csa",
+    (_PACK, "skip_prefix_len_per_token"): "skip_prefix_len_csa",
 }
 #: DeepSeek-V4's prefill index lists, which ATOM allocates each step at the
 #: entries its rows read (`_build_paged_prefill_meta`). A capture's prefill
@@ -760,12 +779,36 @@ def _ref(value) -> bool:
 
 def signature(op: dict) -> str:
     """A leaf's identity across instances: its operator, arguments and outputs,
-    a context key or module path by its kind alone, and what the capture
+    a context key or module path by its kind alone, a kernel's KV argument
+    without the size its pool sets (`_kv_unsized`), and what the capture
     states beside its arguments when it states anything."""
-    args = {s: {k: None for k in v} if _ref(v) else v for s, v in op["args"].items()}
+    kernel = not op["op"].startswith("aten.")
+    args = {
+        s: {k: None for k in v} if _ref(v) else _kv_unsized(v) if kernel else v
+        for s, v in op["args"].items()
+    }
     leaf = {"op": op["op"], "args": args, "out": op["out"]}
     leaf |= {"stated": op["stated"]} if "stated" in op else {}
     return json.dumps(leaf, sort_keys=True, separators=(",", ":"))
+
+
+def _kv_unsized(value):
+    """`value`, an argument, with each KV tensor in it sized None along its
+    widest-strided dimension, the one a pool sizes (`_widest`). A kernel
+    reaches its KV by index, and DeepSeek-V4's layers each view one pool from
+    a base row of their own on, so that size is where a layer starts in the
+    pool: `_kv` binds the view by its layout alone, and a kernel's work
+    (`op_work`) leaves out the KV it reaches by index. An aten operator's KV
+    argument is its whole operand, which `signature` keeps."""
+    if isinstance(value, list):
+        return [_kv_unsized(v) for v in value]
+    if isinstance(value, dict) and "object" in value:
+        return value | {"state": _kv_unsized(value["state"])}
+    if isinstance(value, dict) and value.get("role") == "kv" and value.get("shape"):
+        shape = list(value["shape"])
+        shape[_widest(shape, value["stride"])] = None
+        return value | {"shape": shape}
+    return value
 
 
 def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
@@ -1070,7 +1113,7 @@ class Stub:
                     key = op["op"], _keyed(op["args"], path)
                     wanted = self.names.get(key)
                     if "kv_indptr_extend" in named:  # a V4 prefill's step
-                        wanted = wanted or V4_SHARED.get(key)
+                        wanted = wanted or V4_SHARED.get(key) or V4_PREFILL.get(key)
                     if wanted:
                         what = wanted.format(
                             ratio=ratio,
@@ -2769,7 +2812,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         for part, shape, output, _ in reads[1:]:
             if part == DRAFT and shape != reads[0][1]:
                 own[shape].add(output)
-            if part == DRAFT and shape.phase == "prefill":
+            if part == DRAFT:
                 draft_lines.setdefault(shape, (line, set()))[1].add(output)
     steps = [(reads[0][1], line) for line, reads in steps]
     contexts = [
@@ -2789,9 +2832,10 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             cached[s.seqs] += _cached(line)
     # one that is a step's shape too is measured whole, as that step's
     own = {s: outputs for s, outputs in own.items() if s not in prefills}
-    # first, so a graph only `trace ops --population` traces refuses before any point
+    # first, so a graph only `trace ops --population` traces refuses before any
+    # point; the rungs too, which a decode's drafter's leaf below may join
     widths = {decode(s.seqs) for s in own if s.phase == "decode"}
-    shapes = prefills | set(own) | widths
+    shapes = prefills | set(own) | widths | set(rungs)
     _load(store, config, args.store, shapes, graphs, None, atom_args, args.plan, own)
     for s in own:
         if s.phase == "prefill":
@@ -2799,10 +2843,13 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             continue
         width = graphs[decode(s.seqs)]
         graphs[s] = {sig: leaf for sig, leaf in graphs[s].items() if sig not in width}
-    # a leaf of a prefill's drafter's graphs a run asks at another G than its
-    # shape's, its later passes' under DP (`_drafter_at`), is a point at that
-    # G, and at its shape only while its target runs it too
-    moved = set()
+    # a leaf of a drafter's graphs is a point at each shape a run asks it at
+    # (`_drafter_at`), its later passes' under DP among them: a prefill's at
+    # their G, a decode's at their batch and G; and at its own shape only
+    # while its target runs it too or a run asks it there; a rung keeps each
+    # leaf, and a decode's own shape holds none its width does (above): such
+    # a leaf moves as its drafter's graph holds it
+    moved = {}  # ordered as found, not by a per-process string hash
     for s, (line, outputs) in draft_lines.items():
         if line.get("draft_moe_rows") is None:  # no DP gather, no other G
             continue
@@ -2810,14 +2857,17 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             drafter = leaves_at(store, config, s, None, outputs)
         except ArtifactRefusal:
             continue
+        held = {} if s in rungs else graphs.get(s, {})
         for sig, (op, _) in drafter.items():
-            if (at := _drafter_at(s, op, line, config)) != s:
-                leaf = graphs[s][sig]
-                if leaf[0].get("drafted"):
-                    del graphs[s][sig]
-                graphs.setdefault(at, {})[sig] = leaf
-                moved.add(at)
-    prefills |= moved
+            ats = [at for _, at in _drafter_at(s, op, line, config)] or [s]
+            leaf = held.get(sig, drafter[sig])
+            if s not in ats and leaf[0].get("drafted"):
+                held.pop(sig, None)
+            for at in ats:
+                if at != s:
+                    graphs.setdefault(at, {})[sig] = leaf
+                    moved[at] = None
+    prefills |= {s for s in moved if s.phase == "prefill"}
     # a run resumed into `out` keeps the rounds an earlier one wrote there
     rounds = [int(d.name[5:]) for d in out.glob("round*") if d.name[5:].isdigit()]
     first = max(rounds, default=-1) + 1
@@ -2857,7 +2907,10 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     r = r | {"token": key(r["shape"], r["context"], r["leaf"]).token()}
                 lines.write(json.dumps(r) + "\n")
 
-    decodes = [*rungs, *sorted((s for s in own if s.phase == "decode"), key=str)]
+    decodes = [
+        *rungs,
+        *sorted({s for s in [*own, *moved] if s.phase == "decode"}, key=str),
+    ]
     measure_round(
         {(s, c): None for s in decodes for c in (min(contexts), max(contexts))}, 0
     )
@@ -2966,7 +3019,8 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     leaf at its tokens, and one of a kind that depends on context over its
     rows' cached tokens too (`_bracket_cached`); and `fit ops`' price list of
     `records` prices it at the step, as `compass run --coverage` asks it, a
-    prefill's drafter's leaf at the G a run asks it at (`_drafter_at`). A
+    drafter's leaf under DP at each batch and G a run asks it at
+    (`_drafter_at`). A
     decode leaf is read at the rows it ran, its shape's T: of a drafter's own
     decode shape past its step's, a leaf its width's graphs hold at that
     width, as `--plan` measures it. A prefill leaf is asked at the B it ran,
@@ -3020,12 +3074,18 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
             if isinstance(found := families(shape, output, draft, own), str):
                 whys[f"{part}op_graph"], found = found, []
             for name, fam, tokens, op, at in found:
-                if part == DRAFT:
-                    at = _drafter_at(at, op, line, config)
+                asked = _drafter_at(at, op, line, config) if part == DRAFT else []
+                if decoding and asked and (moved := asked[0][1]) != at:
+                    # a decode's family names its shape, G among it
+                    at = moved
+                    fam, tokens = _family(at, None, name, signature(op), dependent)
                 bound = (*at[:4], mean, top)
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
                     bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
+                elif asked:  # a prefill's drafter's leaf at each bound a run asks
+                    each = [(*b, mean, top) for b, _ in asked]
+                    bound = each if each[1:] else each[0]
                 elif at.width:  # a padded prefill's leaf at each B it may have run
                     ran = ran_counts(str(at), op)
                     each = [(*at[:2], n["B"], *bound[3:]) for n in ran]
@@ -3090,31 +3150,53 @@ def parts(names, config) -> list:
     return steps
 
 
-def _drafter_at(shape, op: dict, line: dict, config):
-    """`shape`, a prefill its drafter's graph is read at, at the G a run asks
-    that graph's leaf `op` at on the step `line` records, as
-    `OpGraphBackend._bound` asks it. Under DP the drafter's first pass
+def _drafter_at(shape, op: dict, line: dict, config) -> list:
+    """Each bound ``(phase, T, B, G)`` a run asks the drafter's graph's leaf
+    `op` at, on the step `line` records, as `OpGraphBackend._bound` and
+    `op_graph._ran_at_each` ask it, with the shape the leaf ran at there,
+    `shape` or another; none with no DP gather or no batch for the later
+    passes, where `shape` states it. Under DP the drafter's first pass
     gathers `draft_moe_rows`, and its later passes run at `draft_bs`, or at
-    its B where they gather `draft_rows`, gathering that or their batch on
-    every rank: a leaf that leads with their batch or gather, and not with
-    `shape`'s T or B or the first gather, is asked at their gather; one that
-    leads with both at the fewer of the two gathers, off its default; any
-    other at `shape`'s G."""
-    from atom.compass.backends.op_graph import _ran_at, gathered_off_default
+    the step's rows where they gather `draft_rows`, gathering that or their
+    batch on every rank: a leaf that leads with their batch or gather, and
+    not with the step's counts or the first gather, is asked at their batch
+    and gather, a decode's shape their batch too; one that leads with both
+    at the step's tokens and rows and the fewer of the two gathers, off its
+    default; any other at `shape`'s. The step's counts are a prefill's
+    tokens and rows, and a decode's rows, which are its tokens, or, past a
+    batch wider than them, their tokens up to a draft each and one. Where a
+    prefill's T is one of the later passes' counts too, a leaf that leads
+    with it is asked at each of those it may have run at."""
+    from atom.compass.backends.op_graph import _ran_at_each, gathered_off_default
+    from atom.compass.capture.forward import decode
 
     gathered, rows = line.get("draft_moe_rows"), line.get("draft_rows")
-    if shape.phase == "decode" or gathered is None:
-        return shape
-    t, b = shape.tokens, shape.seqs
-    drafts = config.speculative_config.num_speculative_tokens
-    width = b if drafts > 1 and rows else line.get("draft_bs")
+    if gathered is None:
+        return []
+    n, drafts = len(line["rows"]), config.speculative_config.num_speculative_tokens
+    width = n if drafts > 1 and rows else line.get("draft_bs")
     if not width:
-        return shape
+        return []
     dp = config.parallel_config.data_parallel_size
     later = rows or dp * width
-    low = gathered_off_default("prefill", t, min(gathered, later), dp)
-    sets = frozenset({t, b, gathered}), frozenset({width, dp * width, later})
-    return shape._replace(gathered=_ran_at(op, (shape.gathered, later, low, sets)))
+    t, wide, counts = shape.tokens, shape._replace(gathered=later), {shape.tokens, n}
+    if shape.phase == "decode":
+        t, wide = n, decode(width, later)
+        counts = {n} if width == n else {n * j for j in range(1, drafts + 2)}
+    low = gathered_off_default(shape.phase, t, min(gathered, later), dp, drafts)
+    sets = frozenset(counts | {gathered}), frozenset({width, dp * width, later})
+    both = shape._replace(tokens=t, gathered=low)
+    # a prefill's later passes run on its own shape, asked at their batch
+    each = _ran_at_each(
+        op,
+        (
+            (shape.phase, t, n, shape.gathered, shape),
+            (shape.phase, wide.tokens, width, later, wide),
+            (shape.phase, t, n, low, both),
+            sets,
+        ),
+    )
+    return [(reading[:4], reading[4]) for reading in each]
 
 
 def _rows(line, rung: int) -> tuple[int, int]:
