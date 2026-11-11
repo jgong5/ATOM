@@ -1265,6 +1265,11 @@ a second trace run, and one of the two to fit the vector alone, since the fit pr
 each run by the law fitted on the others; with one trace run, every prefill term prices
 unvalidated. Leave the trace runs out of `compass fit host`: their host segments ran
 under the profiler. A higher concurrency holds more prefill steps in the same time.
+Under a speculative drafter, `compass fit steps --ops DIR...` takes the profiler's
+floor, `--machine`'s `device.profiler_floor_s` (`probe_device.py`), out of the trace
+runs' drafter labels, each kernel's own length from `compass measure ops --drafter` at
+the trace runs' step shapes, traced first by `compass trace ops`; the fit's report
+names each kernel no point gave its own length.
 `compass record --trace` raises kineto's row cap, 5,000,000 rows a process by default
 ([#3106](https://github.com/jgong5/ATOM/issues/3106)), and a run that lost device rows
 all the same is refused at its stop, naming each rank's first forward without them:

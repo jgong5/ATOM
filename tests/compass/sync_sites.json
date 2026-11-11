@@ -4160,6 +4160,18 @@
    "mechanism_why": "inside the real forward, which the simulated runner replaces whole"
   },
   {
+   "id": "atom/compass/drive/device_probe.py::_profiled::torch.cuda.synchronize()::device_sync#0",
+   "file": "atom/compass/drive/device_probe.py",
+   "symbol": "_profiled",
+   "call": "torch.cuda.synchronize",
+   "expr": "torch.cuda.synchronize()",
+   "shape": "device_sync",
+   "peer": "none",
+   "why": "the device probe waits for its empty kernels to finish inside the profiler, so the profile holds each one's recorded length",
+   "mechanism": "K9",
+   "mechanism_why": "in compass's device probe, a measuring command which is no LP, on idle cards it refuses otherwise; a GPU command serves no simulated run"
+  },
+  {
    "id": "atom/compass/drive/device_probe.py::_timed::end.synchronize()::device_sync#0",
    "file": "atom/compass/drive/device_probe.py",
    "symbol": "_timed",

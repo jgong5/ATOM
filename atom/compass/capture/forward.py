@@ -337,9 +337,10 @@ def _engine(text: str):
 
 
 def missed(store, key) -> str:
-    """For an `op_graph` `key` `store` holds no entry at, each engine field
-    (`step_grid.differ`) in which a graph it holds at the key's shape and
-    otherwise the key's structure differs, as text; "" when it holds none."""
+    """For an `op_graph` `key` `store` holds no entry at, each field in which
+    a graph it holds at the key's shape and otherwise the key's structure
+    differs, as text: the ATOM source or torch it was traced under, then each
+    engine field (`step_grid.differ`); "" when it holds none."""
     from atom.compass.artifacts.store import ENTRY_FILE
     from atom.compass.run.step_grid import differ
 
@@ -350,10 +351,16 @@ def missed(store, key) -> str:
         if there.get("shape") == key.values["shape"]:
             at = _engine(there.get("structure", ""))
             if at and (at[0], at[2]) == (head, tail):
-                named.append(", ".join(differ(at[1], here, "the graph")))
+                fields = [
+                    f"{name} {there.get(name)!r} in the graph and {value!r} here"
+                    for name, value in key.fields
+                    if name not in ("structure", "shape") and there.get(name) != value
+                ]
+                if engine := differ(at[1], here, "the graph"):
+                    fields.append(f"engine config: {', '.join(engine)}")
+                named.append(", ".join(fields))
     return "".join(
-        f"; a graph the store holds at this shape and structure differs in engine "
-        f"config: {n}"
+        f"; a graph the store holds at this shape and structure differs in {n}"
         for n in named
     )
 

@@ -26,12 +26,11 @@ from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass.artifacts import (
     ArtifactStore,
     GateState,
-    Key,
-    Kind,
     Topology,
     member_name,
 )
 from atom.compass.backends.work import gemm, price
+from atom.compass.capture import graph_key
 from atom.compass.capture.forward import decode, prefill, structure
 from atom.compass.drive import run as drive_run
 from atom.compass.run import OP_GRAPH
@@ -85,7 +84,7 @@ def _traced(monkeypatch, store, config, stated: dict, shapes) -> None:
         for shape in shapes:
             at = structure(config, shape.phase, True, MACHINE["device"]["arch"])
             store.publish(
-                Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape)),
+                graph_key(at, str(shape)),
                 provenance=stanza("compass trace ops"),
                 topology=Topology(),
                 conditions=run_readings(config.model),
