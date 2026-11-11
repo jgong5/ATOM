@@ -212,7 +212,8 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   drafter kernel recorded under twice the floor loses its recorded length, up to the floor,
   less its own, the `warm_ns` of the `measure ops` points that launch it alone, found by its
   name and grid, or, replayed from a graph and so gridless, by its name at its pass's shape.
-  A kernel no point gives alone leaves its parts unlabelled, named.
+  A kernel no point gives alone, as one launched beside others, keeps its recorded
+  length, named in the fit's report.
   No cut, threshold or interval. The
   prefill device law fits from trace runs only, and a fit given none names its prefill
   vector unfitted; a trace run's decodes and host segments are profiled, so it gives no

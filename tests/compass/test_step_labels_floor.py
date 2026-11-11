@@ -124,7 +124,7 @@ def test_each_drafter_kernel_under_the_floor_loses_its_term(tmp_path):
     assert (after.cut, after.floor) == (None, {})
 
 
-def test_a_kernel_no_point_launches_alone_leaves_its_parts_unlabelled(tmp_path):
+def test_a_kernel_no_point_launches_alone_keeps_its_recorded_length_named(tmp_path):
     record = _run(tmp_path)
     [([before], _)] = label_run([record])
 
@@ -132,21 +132,23 @@ def test_a_kernel_no_point_launches_alone_leaves_its_parts_unlabelled(tmp_path):
 
     why = [f"no measured point launches p1 alone at {SHAPE}"]
     assert after.floor == {"b_propose_ns": why, "b_draft_ns": why}
-    assert (after.propose_s, after.draft_s) == (None, None)
+    # P1 keeps its 4 us: the propose pass loses P3's term alone
+    assert before.propose_s - after.propose_s == pytest.approx(1.0e-6)
+    assert before.draft_s - after.draft_s == pytest.approx(1.0e-6)
     assert before.draft_kv_s - after.draft_kv_s == pytest.approx(2.5e-6)
 
 
-def test_a_draft_kv_kernel_launched_beside_others_is_named_and_cuts_its_step(
-    tmp_path,
-):
+def test_a_kernel_launched_beside_others_is_named_not_split(tmp_path):
     record = _run(tmp_path)
+    [([before], _)] = label_run([record])
     beside = POINTS[0] | {"kernels": ["kv1", "kv0"], "grids": [[4, 1, 1]] * 2}
 
     after = _labels(record, [beside, *POINTS[1:]])
 
     why = ["kv1 at grid [4, 1, 1] launches beside other kernels in kv"]
     assert after.floor == {"b_draft_kv_ns": why, "b_draft_ns": why}
-    assert (after.cut, after.device_s, after.draft_kv_s) == ("floor", None, None)
+    assert (after.draft_kv_s, after.device_s) == (before.draft_kv_s, before.device_s)
+    assert before.propose_s - after.propose_s == pytest.approx(2.0e-6)
 
 
 def test_a_point_records_each_kernel_s_grid_where_its_profile_states_one(

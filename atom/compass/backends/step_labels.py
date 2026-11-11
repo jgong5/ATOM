@@ -73,10 +73,9 @@ it alone, at its grid on any shape, or, replayed from a graph, which states no
 grid, at its pass's shape, as `capture.population_steps` places the step: the
 draft-KV pass at the step's shape, the rest of the draft at its drafter's. The
 profiler adds less than the floor to any kernel, so one recorded at twice the
-floor or more is past it. A part one of whose kernels no point gives its own
-length, or only a point launching it among other kernels, has no label, and
-its sample names why under `floor`; an output prefill whose draft-KV pass has
-none is cut as `floor`.
+floor or more is past it. A kernel no point gives its own length, or only a
+point launching it among other kernels, keeps its recorded length, and its
+sample names it under `floor` for each label holding it.
 
 A record without device windows is refused. A step mixing prefill and decode
 rows is cut. A step of an MTP record without `d_target_ns` is cut as
@@ -131,9 +130,8 @@ from atom.compass.backends.shape import BatchView, RequestShape
 #: returns for the lead.
 ANCHORS = 32
 #: Why a device label is cut: a launch-exposed decode, mixed rows, no MTP target
-#: end, a prefill with no traced busy time, a trace run's decode, an output
-#: prefill whose draft-KV pass the profiler's floor gives no label.
-CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced", "floor")
+#: end, a prefill with no traced busy time, a trace run's decode.
+CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced")
 #: The directory beside a trace run's `steps` its traces are in (`parity.busy`).
 TRACE = "trace"
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
@@ -185,8 +183,9 @@ class Sample:
     feature (`launch_features`), empty on a line that states none.
     `blocked` is the seconds its `W_launch` left out per blocking HIP call
     that blocked, from its line's `blocked_ns`; None on a line without it.
-    `floor` names, per busy line field of a drafter part the profiler's floor
-    gives no label, why (`Floor.term`); empty without a `Floor`.
+    `floor` names, per busy line field of a drafter part, why the profiler's
+    floor left a kernel of it at its recorded length (`Floor.term`); empty
+    without a `Floor` or with every term known.
     """
 
     step: int
@@ -448,9 +447,9 @@ def busy_gaps(lines: list[dict]) -> list[bool]:
 
 def floored(record, floor: Floor) -> list[dict]:
     """Per line of the trace run's `record`, each drafter part's busy time
-    less its kernels' terms (`Floor.term`) on each rank, at its largest rank,
-    by its busy line field, None where a term is not known; and under
-    ``floor`` why, per such field."""
+    less its kernels' known terms (`Floor.term`) on each rank, at its largest
+    rank, by its busy line field; and under ``floor`` why a term is not known,
+    per field."""
     from atom.compass.capture import population_steps
     from atom.compass.parity.busy import drafter
 
@@ -478,7 +477,7 @@ def floored(record, floor: Floor) -> list[dict]:
                         got[part] -= term
             for part, ns in got.items():
                 best[DRAFTER[part]] = max(best.get(DRAFTER[part], ns), ns)
-        row = {f: None if f in why else round(ns) for f, ns in best.items()}
+        row = {f: round(ns) for f, ns in best.items()}
         rows.append(row | {"floor": {f: sorted(t) for f, t in why.items()}})
     return rows
 
@@ -628,8 +627,6 @@ def _label(
             cut = "traced"
         elif view.prefill and "b_target_ns" not in s:
             cut = "untraced"
-        elif view.produces_output and "b_draft_kv_ns" in s.get("floor", {}):
-            cut = "floor"
         elif mtp and "d_target_ns" not in s:
             cut = "unsplit"
         gap = 0 if view.prefill else s.get("d_gap_ns", 0)
