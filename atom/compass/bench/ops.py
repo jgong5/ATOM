@@ -2968,8 +2968,9 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     decode leaf is read at the rows it ran, its shape's T: of a drafter's own
     decode shape past its step's, a leaf its width's graphs hold at that
     width, as `--plan` measures it. A prefill leaf is asked at the B it ran,
-    its shape's W where it leads with that and not with its T or B
-    (`fit.ops.ran_counts`). The graphs are `arch`'s; a part's graph
+    its shape's W where it leads with that and not with its T or B, and at
+    either where W is its T too (`fit.ops.ran_counts`). The graphs are
+    `arch`'s; a part's graph
     the store does not hold leaves the step out, by its refusal."""
     from atom.compass.artifacts import ArtifactRefusal
     from atom.compass.backends.op_graph import band
@@ -3023,8 +3024,10 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
                     bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
-                elif at.width:  # a padded prefill's leaf at the B it ran
-                    bound = (*at[:2], ran_counts(str(at), op)["B"], *bound[3:])
+                elif at.width:  # a padded prefill's leaf at each B it may have run
+                    ran = ran_counts(str(at), op)
+                    each = [(*at[:2], n["B"], *bound[3:]) for n in ran]
+                    bound = each if each[1:] else each[0]
                 moves = dependent.get(name, True)
                 cut = _cut(fam)
                 if cut and cut[0] in cuts:
