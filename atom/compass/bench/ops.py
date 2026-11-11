@@ -21,7 +21,8 @@ step's rows each hold `--context` tokens, under a drafter verifying as many
 more as it drafts, and a prefill's rows, split as the capture split them,
 follow `--context` cached tokens each, none when it is not given; there
 the planes of DeepSeek-V4.1's FP8 indexer, which the capture sized to its own
-rows' KV blocks, are as wide as the point's rows' (`PAGE_WIDE`). Rows the KV
+rows' KV blocks, are as wide as the point's rows' (`PAGE_WIDE`), a top-k on
+aiter's kernel at that width (`_dispatched`). Rows the KV
 pool cannot hold at once are ragged (`point_rows`), and the point records its
 rows; under `--plan` over ragged decode steps a decode point
 the pool cannot hold refuses instead, past the first round (`RAGGED`).
@@ -256,8 +257,9 @@ from atom.compass.run.modules import LAYER
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 PROG = "compass measure ops"
-#: The timing protocol's version; it changes whenever a count below, the
-#: copies a graph reads, what a capture waits for or what a replay follows
+#: The timing protocol's version; it changes whenever the operator a point
+#: times, a count below, the copies a graph reads, what a capture waits for or
+#: what a replay follows
 #: change.
 PROTOCOL = 30
 WARMUPS = 3
@@ -524,6 +526,14 @@ PAGE_WIDE = {
     _MAXIMA: ("visible", "logits", "maxima", "blocks"),
     f"{_V41}.unit_table:unit_table": ("block_tables", "block_tables"),
 }
+#: The arches on which aiter's decode top-k (`top_k_per_row_decode`) runs
+#: FlyDSL's one-block kernel (`_TOPK`) for every call its signature check
+#: takes, k no wider than the logits, as no FlyDSL decode gate of the arch's
+#: precedes it, unless `FLYDSL_OFF`, which no `op_graph` key states, holds
+#: one of the values aiter reads as off.
+ONE_BLOCK = ("gfx1250",)
+FLYDSL_OFF = "AITER_DISABLE_FLYDSL_TOPK_DECODE"
+FLYDSL_OFF_VALUES = ("1", "true", "True", "yes", "YES")
 #: DeepSeek-V4.1's FP8 index tables an earlier leaf of its forward writes, by
 #: the operator and slot that read them (`_written`): the page-wide scorer's
 #: tile table (`tiles`); the blocks each row keeps of the candidate pick
@@ -1300,9 +1310,9 @@ class Stub:
             return _journal(
                 self.journal,
                 [
-                    {"shape": str(shape), "context": context, "op": op["op"]}
-                    | {"leaf": sig, "refused": why}
-                    for sig, (op, _) in found.items()
+                    {"shape": str(shape), "context": context}
+                    | {"op": json.loads(sig)["op"], "leaf": sig, "refused": why}
+                    for sig in found
                 ],
             )
 
@@ -1402,13 +1412,18 @@ class Stub:
             n, size, _, (by_block, by_slot) = plans[sig]
             names = {p: m[0] for (s, p), m in self.placed[0][1].items() if s == sig}
             later = {k[2]: m[0] for k, m in self.later.items() if k[:2] == (0, sig)}
-            record = {"shape": str(shape), "context": context, "op": op["op"]}
+            # the graph's operator, and the one timed in its place if another
+            leaf = json.loads(sig)["op"]
+            record = {"shape": str(shape), "context": context, "op": leaf}
             record |= {"leaf": sig, "metadata": names, "rows": rows}
             record |= {"later": later} if later else {}
+            record |= {"timed": op["op"]} if op["op"] != leaf else {}
             record |= {"exchange": ex} if (ex := exchange(op)) else {}
             # its text leaves a micro-batch's mark out, which `_densify` reads back
             record |= {"micro_batch": True} if shape.micro_batch else {}
             try:
+                if "refuses" in op:  # its operator at its width (`_dispatched`)
+                    raise ValueError(op["refuses"])
                 if sig in self.fills:  # as its pass's first reader fills them
                     cache, step = self.fills[sig]
                     cache.indptrs(
@@ -2081,7 +2096,8 @@ def _named(op, path, spec, pool, known=None) -> dict | None:
 def _widened(op, blocks) -> dict:
     """`op` with the slots and integers `PAGE_WIDE` names for it as wide as
     `blocks[1]` KV blocks rather than the capture's `blocks[0]`: an integer,
-    a tensor's columns, and its row stride where that is its columns."""
+    a tensor's columns, and its row stride where that is its columns; the
+    operator aiter dispatches at that width (`_dispatched`)."""
     bound, *wide = PAGE_WIDE.get(op["op"], (None,))
     if blocks[0] == blocks[1] or bound is None or _written(op, bound) == "context":
         return op
@@ -2095,7 +2111,30 @@ def _widened(op, blocks) -> dict:
         if stride[0] == shape[1]:
             stride[0] = stride[0] // blocks[0] * blocks[1]
         shape[1] = shape[1] // blocks[0] * blocks[1]
-    return op
+    return _dispatched(op)
+
+
+def _dispatched(op) -> dict:
+    """`op`, aiter's HIP decode top-k (`_PICK`) once its logits are k wide, as
+    aiter dispatches it on this device's arch, the one `graph` read its graph
+    at: FlyDSL's one-block kernel on `ONE_BLOCK`'s, called as aiter's decode
+    wrapper calls it, each row bound `seqLens`; else marked refused."""
+    from atom.compass.capture.forward import device_arch
+
+    args = op["args"]
+    width = args["logits"]["shape"][1] if op["op"] == _PICK else None
+    if width is None or "k" not in args or args["k"] > width:
+        return op
+    off = os.environ.get(FLYDSL_OFF) in FLYDSL_OFF_VALUES
+    if (arch := device_arch()) not in ONE_BLOCK or off:
+        off = f" under {FLYDSL_OFF}={os.environ[FLYDSL_OFF]}" if off else ""
+        why = f"aiter's decode top-k of k {args['k']} on logits {width} wide"
+        return op | {"refuses": f"{why}: its kernel on {arch}{off} is not known"}
+    named = {"seqLens": "row_ends", "numRows": "num_rows"}
+    called = {named.get(s, s): v for s, v in args.items() if s != "workspace"}
+    called |= {"row_starts": copy.deepcopy(args["seqLens"]), "is_decode": True}
+    called |= {"values": args.get("values"), "plane_width": None, "packed_rows": False}
+    return op | {"op": _TOPK, "args": called}
 
 
 def _summed(op, rows) -> dict:
