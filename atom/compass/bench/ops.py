@@ -12,7 +12,9 @@ Each shape names the `op_graph` `compass trace ops` published in S for the
 model and TP width ATOM's arguments resolve, and under a speculative drafter
 each graph of the drafter's part of a step S holds at that shape (`DRAFTED`,
 `leaves_at`), timed on the target's batch. A point is one leaf of those graphs,
-its instances grouped (`leaves`), at the shape and `--context`: a decode
+its instances grouped (`leaves`), a kernel's layers among them when they
+differ only in where each views one KV pool from (`signature`), at the shape
+and `--context`: a decode
 step's rows each hold `--context` tokens, under a drafter verifying as many
 more as it drafts, and a prefill's rows, split as the capture split them,
 follow `--context` cached tokens each, none when it is not given; there
@@ -721,12 +723,36 @@ def _ref(value) -> bool:
 
 def signature(op: dict) -> str:
     """A leaf's identity across instances: its operator, arguments and outputs,
-    a context key or module path by its kind alone, and what the capture
+    a context key or module path by its kind alone, a kernel's KV argument
+    without the size its pool sets (`_kv_unsized`), and what the capture
     states beside its arguments when it states anything."""
-    args = {s: {k: None for k in v} if _ref(v) else v for s, v in op["args"].items()}
+    kernel = not op["op"].startswith("aten.")
+    args = {
+        s: {k: None for k in v} if _ref(v) else _kv_unsized(v) if kernel else v
+        for s, v in op["args"].items()
+    }
     leaf = {"op": op["op"], "args": args, "out": op["out"]}
     leaf |= {"stated": op["stated"]} if "stated" in op else {}
     return json.dumps(leaf, sort_keys=True, separators=(",", ":"))
+
+
+def _kv_unsized(value):
+    """`value`, an argument, with each KV tensor in it sized None along its
+    widest-strided dimension, the one a pool sizes (`_widest`). A kernel
+    reaches its KV by index, and DeepSeek-V4's layers each view one pool from
+    a base row of their own on, so that size is where a layer starts in the
+    pool: `_kv` binds the view by its layout alone, and a kernel's work
+    (`op_work`) leaves out the KV it reaches by index. An aten operator's KV
+    argument is its whole operand, which `signature` keeps."""
+    if isinstance(value, list):
+        return [_kv_unsized(v) for v in value]
+    if isinstance(value, dict) and "object" in value:
+        return value | {"state": _kv_unsized(value["state"])}
+    if isinstance(value, dict) and value.get("role") == "kv" and value.get("shape"):
+        shape = list(value["shape"])
+        shape[_widest(shape, value["stride"])] = None
+        return value | {"shape": shape}
+    return value
 
 
 def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
