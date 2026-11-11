@@ -297,6 +297,61 @@ def test_a_drafter_s_own_prefill_shape_that_is_a_step_s_is_measured_whole(
     }
 
 
+def test_coverage_asks_a_padded_prompt_s_leaves_at_its_width_as_a_run_does(
+    bench, tmp_path, monkeypatch  # noqa: F811
+):
+    # Prompts of one row padded to 4 and to 8, and none at its row: the LM
+    # head, the drafter's later pass and its sampler hold points at W alone.
+    padded = [
+        PROMPT | {"rows": [[t, t, False]], "target_bs": w, "draft_bs": w}
+        for t, w in ((40, 4), (60, 8))
+    ]
+
+    _, report = _plan_mtp(bench, tmp_path, monkeypatch, *padded)
+
+    assert report["by part"] == {
+        "target": {"steps": 3, "covered": 3},
+        "draft": {"steps": 3, "covered": 3},
+    }
+    assert report["left out, by leaf kind"] == {}
+
+
+def test_coverage_leaves_out_a_prompt_whose_t_is_its_w_where_a_run_declines_it(
+    bench, tmp_path, monkeypatch  # noqa: F811
+):
+    # Beside prompts of one row padded to 4 and to 8, one of 4 tokens padded to
+    # 4, whose leaves lead with its T and its W alike: its LM head, drafter's
+    # later pass and sampler, whose families read B, ran at 1 row or 4; its
+    # attention, whose point there the fit left out, is below its measured T
+    # at either; its GEMM and first pass read T alone and stay covered
+    padded = [
+        PROMPT | {"rows": [[t, t, False]], "target_bs": w, "draft_bs": w}
+        for t, w in ((40, 4), (60, 8), (4, 4))
+    ]
+
+    _, report = _plan_mtp(bench, tmp_path, monkeypatch, *padded)
+
+    records = (tmp_path / "out" / "plan.jsonl").read_text().splitlines()
+    fitted = fit_ops.fit([r for r in map(json.loads, records) if "refused" not in r])
+    left = {(p["shape"], p["op"]) for p in fitted["left_out"]}
+    assert left == {
+        ("prefill T=4 B=1 W=4", f"aiter.{op}")
+        for op in ("attn", "head", "step", "sample")
+    }
+    why = "it leads with its T, a count of its width too, so it ran at "
+    why += "T=# B=# or T=# B=#"
+    assert report["by part"] == {
+        "target": {"steps": 4, "covered": 3},
+        "draft": {"steps": 4, "covered": 3},
+    }
+    assert report["left out, by leaf kind"] == {
+        "aiter.attn": {"T = # is outside the measured # to #": 1},
+        "aiter.head": {why: 1},
+        "draft aiter.sample": {why: 1},
+        "draft aiter.step": {why: 1},
+    }
+
+
 class _Padding(_Runner):
     """`_Runner` keeping, for each batch it prepares, the ladder its step pads
     to, ATOM's under `--enforce-eager` unless the bench pads it."""
