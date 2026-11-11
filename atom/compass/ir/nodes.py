@@ -10,8 +10,8 @@
 An `Op` holds its arguments by schema slot, which is what calling it again
 needs: a tensor as a `Tensor` (shape, dtype, stride, role, preshuffled mark),
 a module as a `ModuleRef`, an integer affine in a decode step's context as an
-`Affine`, any other object as pickle reduces it (`Reduced`), anything else as
-its value.
+`Affine`, the rows a DP group's MoE gathers as the symbol `G`, any other object
+as pickle reduces it (`Reduced`), anything else as its value.
 
 An operator's cost-deciding per-step state (block tables, context lengths) is
 ambient, not an argument, so an `Op` names where to find it again
@@ -27,7 +27,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .shapes import as_shape, as_shapes
+from .shapes import Symbol, as_shape, as_shapes
 
 
 class NodeKind(enum.Enum):
@@ -187,9 +187,9 @@ class Op(Region):
 
     `args` holds each argument by its slot, in the order the operator takes
     them: a `Tensor`, a `ModuleRef`, a `ContextRef`, an `Affine`, a `Reduced`
-    object, a number, str, bytes, enum member, `None` or a tuple of those. Anything else, a live
-    symbolic value among it, is refused by its type, without being asked
-    anything.
+    object, a `Symbol`, a number, str, bytes, enum member, `None` or a tuple of
+    those. Anything else, a live symbolic value among it, is refused by its
+    type, without being asked anything.
 
     `stated` holds, by name, values of those types the capture states about
     the operator beside its arguments: what it reads without being passed it,
@@ -234,18 +234,15 @@ def _as_args(args: Any) -> tuple[tuple[str, Any], ...]:
 
 
 def _as_value(slot: str, value: Any) -> Any:
-    if value is None or isinstance(
-        value,
-        (bool, int, float, str, bytes, enum.Enum, Tensor, ContextRef, Affine, Reduced),
-    ):
+    held = (bool, int, float, str, bytes, enum.Enum, Tensor, ContextRef, Affine)
+    if value is None or isinstance(value, (*held, Reduced, Symbol)):
         return value
     if isinstance(value, tuple):
         return tuple(_as_value(slot, item) for item in value)
     raise TypeError(
         f"argument {slot!r} is a {type(value).__name__}. An argument is a Tensor, "
-        "ModuleRef, ContextRef, Affine, Reduced, number, str, bytes, enum member, "
-        "None, or a "
-        "tuple of those."
+        "ModuleRef, ContextRef, Affine, Reduced, Symbol, number, str, bytes, enum "
+        "member, None, or a tuple of those."
     )
 
 

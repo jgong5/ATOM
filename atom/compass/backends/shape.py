@@ -212,9 +212,9 @@ class BatchView:
     the step samples, which a pure middle prefill chunk does not; None when
     the caller did not say.
     `tbo_tokens` is the two-batch-overlap split the data-parallel group
-    agreed: per micro-batch, each rank's token count. It is None when the
-    step is not split, and on one rank. `dp_rank` is this rank's slot in the
-    data-parallel group's counts, `tbo_tokens`' among them; None on one rank
+    agreed, a group of one included: per micro-batch, each rank's token
+    count. It is None when the step is not split. `dp_rank` is this rank's
+    slot in the data-parallel group's counts, `tbo_tokens`' among them; None on one rank
     or when the caller did not say. `dp_dummy` says the step is a DP rank's
     dummy forward, run because a peer has work and this rank has none; False
     on one rank. `group_dummies` counts the ranks of the data-parallel group

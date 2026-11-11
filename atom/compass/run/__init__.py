@@ -77,7 +77,8 @@ its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, and a law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
-holds at its shape and output, the run's TP and EP widths and KV cache format; capture traces
+holds at its shape and output, loaded under this process's torch, ATOM source
+and model (`_op_graphs`), the run's TP and EP widths and KV cache format; capture traces
 eager forwards, so a graph-mode run reads the eager graphs too; with
 ``price_list``, the fields of a `price_list` key ``store`` holds, loaded
 under this run's readings, it prices each leaf from it first; with
@@ -100,9 +101,10 @@ ends the run there, which still writes the summary),
 ``client_runs`` (optional: how many client runs the server serves, one traffic
 LP after another, 1 when absent and ``null`` for no limit; each ends when no
 essential work is left, and the last one's end finishes the run),
-``local_grants`` (optional, ``true`` or ``false``: with ``true`` the authority
-gives each grant a ceiling, below which the LP answers its own clock calls and
-reports them with its next one, `ClockAuthority`; the step table is the same),
+``local_grants`` (optional, ``true``, the default, or ``false``: with ``true``
+the authority gives each grant a ceiling, below which the LP answers its own
+clock calls and reports them with its next one, a DP member at its settle,
+`ClockAuthority`; the step table is the same),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -122,13 +124,16 @@ states, which the run takes as its own, since it records no graphs;
 optional, ``encode``, one-item calls, ``encode_batch``, a backend
 ``encode_batch`` of several items, ``decode``, and ``segment``, the segment
 tokenizer call's own work over the ids its ``encode_batch`` calls return, each ``fixed_s`` and a
-positive ``tokens_per_s``, and a ``decode`` in their place ``fixed_s`` alone over ``tokens``, the ``[lo, hi]``
+positive ``tokens_per_s``, a ``segment`` optionally also a positive ``chars_per_s`` over
+the characters its stored-prefix search compared, and a ``decode`` in their place
+``fixed_s`` alone over ``tokens``, the ``[lo, hi]``
 token counts outside which a decode is refused and charged 0 s; ``http_intake``,
 ``fixed_s`` and ``per_byte_s``, with ``idle_s`` optional and ``bytes``, the
 ``[lo, hi]`` body bytes it was fitted over, outside which an intake is refused
 and charged 0 s; a term an entry lacks, or every term with no entry, is
 charged 0 s and the run summary names it, a kind of tokenizer call as
-``tokenizer.<kind>``, under ``uncharged_host_terms``; ``hops``, the
+``tokenizer.<kind>`` and a ``segment`` without ``chars_per_s`` as
+``tokenizer.segment.chars_per_s``, under ``uncharged_host_terms``; ``hops``, the
 `HOPS` `runfile` writes to the run file; a list of them as ``step_linear``'s),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
@@ -148,7 +153,8 @@ calls, a frontend's its executor's refused jobs and its refused clock calls.
 An engine's also holds what its worker's steps cost, for the summary's
 predicted seconds and their shares by method (`backends.cost.GROUPS`), and
 its counts of steps extrapolated and of steps a fallback priced, and of its
-lazy traces with their wall seconds, which the summary's cost half totals.
+lazy traces with their wall seconds, which the summary's cost half totals,
+with each DP prefill whose G it traced one by one (`_op_graphs`).
 It holds the memory the worker predicts too, for
 ``python -m atom.compass.memory.check``, with the assumption a
 `memory_readings` member it read states, which `compass run` records, and
@@ -236,8 +242,11 @@ not find it naming its endpoint's port is refused.
 """
 
 import ast
+import atexit
+import codecs
 import contextlib
 import functools
+import gc
 import hashlib
 import json
 import math
@@ -248,6 +257,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -258,7 +268,7 @@ from pathlib import Path
 import numpy as np
 
 import atom
-from atom.compass.artifacts import provenance
+from atom.compass.artifacts import Reading, provenance
 from atom.compass.clock import (
     TAR,
     ClockAbort,
@@ -331,6 +341,8 @@ PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
 SUMMARY_SCHEMA_VERSION = 14
+#: The reading kind of ATOM's source as `atom_digest` reads it.
+ATOM_PY = "atom_py"
 #: The terms of a ``host`` entry the frontend charges, each 0 s where it is absent.
 HOST_TERMS = ("http_intake", "tokenizer")
 #: The kinds of call a ``tokenizer`` term prices, each 0 s where it is absent.
@@ -359,6 +371,9 @@ COMPASS_ONLY = {
     },
     "utils/zmq_shim.py": {"_Socket", "_ChannelSocket", "_Context"},
 }
+#: The module `pip install -e .` writes (setuptools_scm) and git ignores: no
+#: commit holds it, so the host-law key leaves it out.
+INSTALL_WRITTEN = Path("_version.py")
 #: The run-file key of each backend a flag names (`atom.compass.drive.runfile`).
 STEP_STUB, STEP_LINEAR, STEP_GRID = "step_stub", "step_linear", "step_grid"
 OP_GRAPH, PRICE_LIST = "op_graph", "price_list"
@@ -430,6 +445,9 @@ _sigterm_at_ready: list = []
 #: The files a recorded real run's frontend writes beside its step record:
 #: each served tokenizer call, and each HTTP request's intake stamps.
 TOKENIZER_RECORD, INTAKE_RECORD = "tokenizer.jsonl", "intake.stamps"
+#: Beside one of those, ``<name>.local`` names the file its lines are in until
+#: the server's stop moves them there (`_LineFile`).
+LOCAL = ".local"
 #: This server's ``host`` entry among several, which `tokenizer` resolves.
 _frontend_host: dict | None = None
 
@@ -505,8 +523,8 @@ def _check_host(path, host: dict) -> None:
             f"{path}: host's tokenizer is {tok!r}; it takes backend, fast or slow, "
             "fingerprint, the tokenizer.json it was fitted on, and, each "
             "optional, encode, encode_batch, decode and segment, each fixed_s and a "
-            "positive tokens_per_s, a decode fixed_s and tokens, [lo, hi], in "
-            "their place"
+            "positive tokens_per_s, a segment optionally a positive chars_per_s "
+            "too, a decode fixed_s and tokens, [lo, hi], in their place"
         )
     hull = intake.get("bytes", [0, 0]) if isinstance(intake, dict) else None
     if intake is not None and not (
@@ -536,7 +554,10 @@ def _rate(term, kind: str) -> bool:
             and _seconds(dict(enumerate(hull)), {0, 1})
             and hull[0] <= hull[1]
         )
-    return _seconds(term, {"fixed_s", "tokens_per_s"}) and term["tokens_per_s"] > 0
+    search = {"chars_per_s"} if kind == "segment" else set()
+    return _seconds(term, {"fixed_s", "tokens_per_s"}, search) and all(
+        v > 0 for k, v in term.items() if k != "fixed_s"
+    )
 
 
 def _seconds(term, required: set, optional: set = frozenset()) -> bool:
@@ -1065,7 +1086,7 @@ class _RecordingAuthority(ClockAuthority):
             shutil.rmtree(d)
         table = channel_table(run)
         count = run.get("client_runs", 1)
-        local = run.get(LOCAL_GRANTS, False)
+        local = run.get(LOCAL_GRANTS, True)
         if not isinstance(local, bool):
             raise TypeError(
                 f"the run file's {LOCAL_GRANTS} is {local!r}; it is true, which "
@@ -1892,8 +1913,9 @@ def op_graph(
 def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or of its drafter's part (`draft`, a block drafter's
-    draft-KV pass where it is `forward.KV`), or when it holds none
+    that does not, of a two-batch-overlap micro-batch (`micro_batch`), or of
+    its drafter's part (`draft`, a block drafter's draft-KV pass where it is
+    `forward.KV`), or when it holds none
     `forward.missed`'s text, None for no text; under DP, at the rows the
     step's MoE gathers; a prefill's drafter at the `width` its later passes
     pad to; keyed under the performance environment `env` when given, else
@@ -1905,46 +1927,178 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     (`_trace`), its count and wall seconds added to `lazy`'s ``lazy_traces``
     and ``lazy_trace_wall_seconds``; a trace that fails raises, naming the
     shape. A trace from a tree with uncommitted files answers this lookup alone
-    and is not published."""
-    from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
-    from atom.compass.capture.forward import Shape, missed, structure
+    and is not published.
+
+    Under DP a prefill the store holds no graph at, with no drafter, reads
+    the graph of its tokens, sequences and width that holds G
+    (`forward.Tracer.symbolic`, keyed by `forward.symbolic_shape`) at the
+    step's G, when its hints span G and its guards admit it (`peers.at`),
+    counted in `lazy`'s ``held_lookups``; with `atom_args`, the first such
+    step of a shape traces that graph, and when its two ends differ
+    (`forward.PerG`) each G of the shape is traced as above instead, the
+    shape and why named in `lazy`'s ``lazy_per_g``. With `lazy`, each
+    lookup's wall seconds, its traces among them, are added to its
+    ``lookup_wall_seconds``.
+
+    Each graph read from the store is parsed once and then frozen out of the
+    collector's reach with the rest of the live heap (`parsed`).
+
+    A graph the store holds, at a shape or holding G, is loaded through
+    `ArtifactStore.load` under this process's `graph_readings`, and its engine
+    config as it records it: that cell holds the tracer's own ATOM arguments,
+    which no reader restates, and the key's structure names the engine config
+    in their place."""
+    from atom.compass.artifacts import (
+        ArtifactStore,
+        Axis,
+        Conditions,
+        GateState,
+        Key,
+        Kind,
+        Row,
+        Topology,
+    )
+    from atom.compass.capture import peers
+    from atom.compass.capture.forward import (
+        PerG,
+        Shape,
+        admits,
+        missed,
+        structure,
+        symbolic_shape,
+    )
+    from atom.utils import envs
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
     dp = config.parallel_config.data_parallel_size
     drafter = getattr(config, "speculative_config", None)
     drafts = drafter.num_speculative_tokens if drafter else 0
-    traced, unpublished, process = set(), {}, []
+    traced, held_traced, unpublished, process = set(), set(), {}, []
+
+    def lazily(shape, symbolic=False):
+        """Trace `shape` (`_trace`), counted in `lazy`; a `symbolic` trace whose
+        two ends differ is named in its ``lazy_per_g``."""
+        began = time.monotonic()
+        # `symbolic` only when set: a concrete trace's call is as before.
+        kwargs = {"symbolic": True} if symbolic else {}
+        try:
+            if not process:
+                process.append(_trace_process())
+            done = process[0].submit(_trace, root, atom_args, arch, shape, **kwargs)
+            unpublished.update(done.result())
+        except PerG as differ:
+            lazy.setdefault("lazy_per_g", {})[str(differ)] = 1
+        # An argument parser's error exits.
+        except (Exception, SystemExit) as failed:
+            why = f"{type(failed).__name__}: {failed}"
+            raise RuntimeError(f"a lazy trace of {shape} failed: {why}") from failed
+        lazy["lazy_traces"] += 1
+        lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
+
+    @functools.cache
+    def here() -> dict:
+        return graph_readings(config.model)
+
+    def parsed(key) -> dict:
+        """The graph the store holds at `key`, loaded under `here` and the
+        engine config it records, parsed and frozen with the rest of the live
+        heap, a collection first so no garbage is kept, as
+        `gc_utils.freeze_gc_heap` freezes the startup heap and under the same
+        `ATOM_GC_FREEZE`: this lookup's caches keep what it parses alive, and
+        every full collection walked all of it."""
+        cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
+        conditions = Conditions.of(**here(), engine_config=cells[Axis.ENGINE_CONFIG])
+        entry = store.load(key, conditions=conditions, gates=GateState.of())
+        graph = json.loads(entry.read_member("graph", rank, "json"))
+        if envs.ATOM_GC_FREEZE:
+            gc.collect()
+            gc.freeze()
+        return graph
+
+    def read(at: str, shape: str) -> dict | None:
+        """The graph the store, or this lookup's unpublished traces, hold at
+        structure `at` and `shape`, as `capture.graph.to_json` writes it."""
+        if (at, shape) in unpublished:
+            return unpublished[at, shape]
+        key = Key.of(Kind.OP_GRAPH, structure=at, shape=shape)
+        if not store.directory_for(key).exists():
+            return None
+        return parsed(key)
+
+    @functools.lru_cache(maxsize=64)
+    def held(at: str, shape) -> dict | None:
+        """The graph that holds G of the DP prefill `shape`, at any G, at
+        structure `at`, or None."""
+        text = symbolic_shape(shape)
+        found = read(at, text)
+        if found is None and atom_args is not None and shape not in held_traced:
+            held_traced.add(shape)
+            lazily(shape, symbolic=True)
+            found = read(at, text)
+        return found
 
     @functools.lru_cache(maxsize=64)
     def graph(
-        phase, tokens, seqs, output=True, gathered=None, draft=False, width=None
+        phase,
+        tokens,
+        seqs,
+        output=True,
+        gathered=None,
+        draft=False,
+        width=None,
+        micro_batch=False,
     ) -> dict | str | None:
-        shape = Shape(phase, tokens, seqs, gathered, width).at(dp, drafts)
-        at = structure(config, phase, True, arch, output, draft, env)
+        shape = Shape(phase, tokens, seqs, gathered, width, micro_batch).at(dp, drafts)
+        at = structure(config, phase, True, arch, output, draft, env, micro_batch)
         key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
         missing = not store.directory_for(key).exists()
+        if missing and dp > 1 and phase == "prefill" and not (draft or drafts):
+            g = shape.gathered or dp * tokens
+            if found := held(at, shape._replace(gathered=None)):
+                (lo, hi), guards = found["hints"], found["guards"]
+                if lo <= g <= hi and admits(guards, g):
+                    if lazy is not None:
+                        lazy["held_lookups"] = lazy.get("held_lookups", 0) + 1
+                    return peers.at(found["region"], found["slots"], g, dp)
         if missing and atom_args is not None and shape not in traced:
             traced.add(shape)
-            began = time.monotonic()
-            try:
-                if not process:
-                    process.append(_trace_process())
-                done = process[0].submit(_trace, root, atom_args, arch, shape)
-                unpublished.update(done.result())
-            # An argument parser's error exits.
-            except (Exception, SystemExit) as failed:
-                why = f"{type(failed).__name__}: {failed}"
-                raise RuntimeError(f"a lazy trace of {shape} failed: {why}") from failed
-            lazy["lazy_traces"] += 1
-            lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
+            lazily(shape)
             missing = not store.directory_for(key).exists()
         if (at, str(shape)) in unpublished:
-            return unpublished[at, str(shape)]
+            return unpublished[at, str(shape)]["region"]
         if missing:
             return missed(store, key) or None
-        return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
+        return parsed(key)["region"]
 
-    return graph
+    if lazy is None:
+        return graph
+
+    def timed(*args, **kwargs):
+        began = time.monotonic()
+        try:
+            return graph(*args, **kwargs)
+        finally:
+            spent = time.monotonic() - began
+            lazy["lookup_wall_seconds"] = lazy.get("lookup_wall_seconds", 0) + spent
+
+    return timed
+
+
+def graph_readings(model: str) -> dict:
+    """This process's readings, by axis, of an `op_graph` of the model `model`
+    names, less its engine config, each as `compass trace ops` takes it: its
+    torch, its ATOM source (`atom_source`) and the model's config.json; an axis
+    no op_graph depends on is unread, of a kind no entry records."""
+    import torch
+
+    from atom.compass.artifacts import Axis, Row, axes_of
+
+    unread = Reading("unread", f"no {Row.OP_GRAPH} depends on it")
+    return {a.field: unread for a in Axis if a not in axes_of(Row.OP_GRAPH)} | {
+        "torch": torch.__version__,
+        "atom_src": atom_source(),
+        "model": _file_digest(model, "config.json"),
+    }
 
 
 def _trace_process():
@@ -1976,30 +2130,35 @@ def _tracer(model: str, tp: int, atom_args: tuple, arch: str):
     return tmpdir, Tracer(model, tp, tmpdir.name, atom_args, arch)
 
 
-def _trace(root: str, atom_args, arch: str, shape) -> dict:
+def _trace(root: str, atom_args, arch: str, shape, symbolic=False) -> dict:
     """Trace `shape` as `compass trace ops` traces a record's step, a prefill
-    as one forward, from ATOM's arguments `atom_args` less the server's, on a
+    as one forward, or with `symbolic` a DP prefill's graphs that hold G
+    (`forward.Tracer.symbolic`, which raises `forward.PerG` where they
+    cannot), from ATOM's arguments `atom_args` less the server's, on a
     declared `arch`, in this process's tracer (`_tracer`), its KV pool the one
     a capture of `shape` alone allocates; and publish each graph in the store
     at `root`, one another engine of the run published first aside. From a
     tree with uncommitted files, which may run but not publish, return each
-    graph's region by its structure and shape instead; else return an empty
-    dict."""
+    graph by its structure and shape instead, as `capture.graph.to_json`
+    writes it; else return an empty dict."""
     from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, Rule, roots_for
     from atom.compass.capture import publish
+    from atom.compass.capture.forward import symbolic_shape
     from atom.compass.capture.graph import to_json
     from atom.compass.drive.runfile import _engine_args, engine_only
 
     engine, kept = _engine_args(atom_args), engine_only(atom_args)
     store, tp = ArtifactStore(root), engine.tensor_parallel_size
-    command = f"compass run: a lazy trace of {shape}"
+    what = symbolic_shape(shape) if symbolic else shape
+    command = f"compass run: a lazy trace of {what}"
     dirty = any(r.dirty for r in roots_for({"atom": "atom", "aiter": "aiter"}))
     unpublished = {}
     _, tracer = _tracer(engine.model, tp, tuple(kept), arch)
-    for graph, model, declared in tracer.trace([shape], [shape]):
+    graphs = tracer.symbolic(shape) if symbolic else tracer.trace([shape], [shape])
+    for graph, model, declared in graphs:
         if dirty:
             at = graph.applicability
-            unpublished[at.structure, at.shape] = json.loads(to_json(graph))["region"]
+            unpublished[at.structure, at.shape] = json.loads(to_json(graph))
             continue
         try:
             publish(store, graph, model, declared, tp, kept, command)
@@ -2070,7 +2229,8 @@ def tokenizer(tok, config) -> None:
     entry, its engine config's among several: a term fitted on another backend
     is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
     ends the run before the server serves (`_end_before_serving`). With no
-    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer.
+    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer,
+    and its ``chars_per_s`` charges each comparison of its stored-prefix search.
 
     On a real run recording its steps (`parity.ENV`), it records instead
     (`_record_host`); with neither, `tok` is left as it is."""
@@ -2126,19 +2286,22 @@ def tokenizer(tok, config) -> None:
         )
     if "segment" in term:
         from atom.model_engine.segment_tokenizer import SegmentTokenizer
-        from atom.utils.compass_loop import wrap_segment
+        from atom.utils.compass_loop import charge, wrap_segment
 
         SegmentTokenizer._encode_cached = wrap_segment(
             SegmentTokenizer._encode_cached, term["segment"]
         )
+        if "chars_per_s" in term["segment"]:
+            _on_search(lambda n: charge(n / term["segment"]["chars_per_s"]))
 
 
 def _record_host(tok, record: Path) -> None:
     """Record, beside the step record in `record`, each call of `tok`'s
-    ``encode``, ``decode``, its Rust backend's ``encode_batch`` and ``segment`` into
-    `TOKENIZER_RECORD`, after a first line naming `tok`'s ``backend`` and the
-    ``fingerprint`` of its ``tokenizer.json``; and stamp each HTTP request's
-    intake into `INTAKE_RECORD` (`_stamp_intake`)."""
+    ``encode``, ``decode``, its Rust backend's ``encode_batch`` and ``segment``,
+    with what its stored-prefix search compared, into `TOKENIZER_RECORD`, after
+    a first line naming `tok`'s ``backend`` and the ``fingerprint`` of its
+    ``tokenizer.json``; and stamp each HTTP request's intake into
+    `INTAKE_RECORD` (`_stamp_intake`)."""
     from tokenizers import Tokenizer
 
     from atom.model_engine.segment_tokenizer import SegmentTokenizer
@@ -2159,35 +2322,162 @@ def _record_host(tok, record: Path) -> None:
             calls,
             lambda _, got: (sum(len(e.ids) for e in got), len(got)),
         )
+    _on_search(lambda n: setattr(_search, "chars", _search.chars + n))
+    encode_cached = SegmentTokenizer._encode_cached
+
+    def segment(*args, **kwargs):
+        _search.chars = 0
+        return encode_cached(*args, **kwargs)
+
     SegmentTokenizer._encode_cached = _recorded(
-        SegmentTokenizer._encode_cached,
+        segment,
         "segment",
         calls,
-        lambda _, got: (len(getattr(got, "token_ids", got)), 1),
+        lambda _, got: (
+            len(getattr(got, "token_ids", got)),
+            1,
+            {"compared_chars": _search.chars},
+        ),
     )
     _stamp_intake(_LineFile(record / INTAKE_RECORD))
 
 
 class _LineFile:
-    """A file of lines, each written whole and flushed as it is written, from
-    any thread."""
+    """A file of lines at `path`, each written whole and flushed as it is
+    written, from any thread, into a file in the temp directory, which
+    ``<path>.local`` names until `move`, at the server's stop, moves them to
+    `path`. On NFS a line written right after another waits for the first's
+    round trip, inside the request stage the line stamps, so a temp directory
+    on a network file system refuses (`_local_dir`)."""
 
     def __init__(self, path) -> None:
-        self.file = open(path, "w", buffering=1)  # noqa: SIM115
-        self.lock = threading.Lock()
+        self.path = Path(path)
+        fd, self.local = tempfile.mkstemp(
+            prefix=f"compass.{self.path.name}.", dir=_local_dir()
+        )
+        self.file = os.fdopen(fd, "w", buffering=1)
+        self.lock = threading.RLock()  # a SIGTERM's move may interrupt a write
+        self.path.unlink(missing_ok=True)
+        self.path.with_name(self.path.name + LOCAL).write_text(f"{self.local}\n")
+        _line_files.append(self)
+        _move_at_stop()
 
     def write(self, line: str) -> None:
         with self.lock:
-            self.file.write(line)
+            if not self.file.closed:
+                self.file.write(line)
+
+    def move(self) -> None:
+        """Move the lines to `path`; a line written after is dropped."""
+        with self.lock:
+            self.file.close()
+        shutil.copyfile(self.local, self.path)
+        self.path.with_name(self.path.name + LOCAL).unlink()
+        os.remove(self.local)
+
+
+#: The `_LineFile`s not yet moved to their record.
+_line_files: list[_LineFile] = []
+#: The SIGTERM handler `_move_at_stop` found, once it has set its own.
+_sigterm_moving: list = []
+#: The mount table `_local_dir` reads, and the file systems it refuses.
+MOUNTINFO, NETWORK_FS = "/proc/self/mountinfo", ("nfs", "nfs4", "cifs", "smb3")
+
+
+def _move_line_files() -> None:
+    """Move each `_LineFile`'s lines to its record, as the server stops."""
+    while _line_files:
+        _line_files.pop().move()
+
+
+def _move_at_stop() -> None:
+    """Move the line files into their records at the process's exit, and at a
+    SIGTERM, a stop's signal: uvicorn takes it while it serves and raises it
+    again once it has stopped, after putting back the handler it found, which
+    by default ends the process before any exit handler runs."""
+    atexit.unregister(_move_line_files)
+    atexit.register(_move_line_files)
+    if _sigterm_moving or threading.current_thread() is not threading.main_thread():
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+    if previous in (signal.SIG_IGN, None):  # None: not set from Python
+        return
+    signal.signal(signal.SIGTERM, functools.partial(_stop_moving, previous))
+    _sigterm_moving.append(previous)
+
+
+def _stop_moving(previous, signum, frame) -> None:
+    """A SIGTERM: move the line files, then `previous` takes it, the default
+    delivered again so that the process ends of the signal as it would have."""
+    try:
+        _move_line_files()
+    finally:
+        signal.signal(signum, previous)
+        if callable(previous):
+            previous(signum, frame)
+        else:
+            os.kill(os.getpid(), signum)
+
+
+def _local_dir() -> str:
+    """The temp directory, refused when `MOUNTINFO` puts it, or the upper
+    directory of the overlay holding it, on a network file system."""
+    where = os.path.realpath(tempfile.gettempdir())
+    point, fs, source, options = _mount(where)
+    upper = dict(o.partition("=")[::2] for o in options.split(",")).get("upperdir")
+    if fs not in NETWORK_FS and upper and _mount(upper)[0] != point:
+        _, fs, source, _ = _mount(upper)
+    if fs in NETWORK_FS:
+        raise ValueError(
+            f"the stamp lines' temp directory {where} is on {fs} ({source}), where "
+            "a line written right after another waits for the first's round trip; "
+            "set TMPDIR to a directory on this host's own disk or a tmpfs"
+        )
+    return where
+
+
+def _mount(path: str) -> tuple[str, str, str, str]:
+    """The mount point, file system, source and options of the mount
+    `MOUNTINFO` lists as holding `path`."""
+    held = ("", "", "", "")
+    with open(MOUNTINFO) as table:
+        for line in table:
+            left, _, right = line.partition(" - ")
+            point = codecs.decode(left.split()[4], "unicode_escape")
+            fs, source, options = (right.split() + ["", "", ""])[:3]
+            inside = path == point or path.startswith(point.rstrip("/") + "/")
+            if inside and len(point) >= len(held[0]):
+                held = (point, fs, source, options)
+    return held
 
 
 #: Whether this thread is inside a `_recorded` ``encode`` call.
 _in_encode = threading.local()
+#: The characters the stored-prefix search of this thread's recorded segment
+#: tokenizer call compared.
+_search = threading.local()
+
+
+def _on_search(then) -> None:
+    """Call `then` with the characters each comparison of ATOM's segment
+    tokenizer's stored-prefix search compares: what the prompt shares with one
+    stored prompt (``segment_tokenizer._shared_chars``)."""
+    from atom.model_engine import segment_tokenizer
+
+    shared_chars = segment_tokenizer._shared_chars
+
+    def compared(a, b, limit):
+        n = shared_chars(a, b, limit)
+        then(n)
+        return n
+
+    segment_tokenizer._shared_chars = compared
 
 
 def _recorded(call, kind: str, out: _LineFile, count):
     """`call`, writing to `out` per call a JSON line of `kind`, its ``tokens``
-    and ``items`` as `count(args, result)` gives them, its ``thread`` id and its
+    and ``items`` as `count(args, result)` gives them, with the fields of any
+    mapping it gives after them, its ``thread`` id and its
     start and end on the monotonic clock in ns; a call made inside a recorded
     ``encode`` call is that call's, as `compass_loop.wrap_encode_batch` charges
     it."""
@@ -2202,9 +2492,10 @@ def _recorded(call, kind: str, out: _LineFile, count):
         finally:
             _in_encode.on = False
         end = time.monotonic_ns()
-        tokens, items = count(args, got)
+        tokens, items, *more = count(args, got)
+        more = "".join(f', "{k}": {v}' for m in more for k, v in m.items())
         out.write(
-            f'{{"call": "{kind}", "tokens": {tokens}, "items": {items}, '
+            f'{{"call": "{kind}", "tokens": {tokens}, "items": {items}{more}, '
             f'"thread": {threading.get_ident()}, '
             f'"t_start_ns": {start}, "t_end_ns": {end}}}\n'
         )
@@ -2425,10 +2716,36 @@ def host_key(config) -> dict:
 def host_key_of(model: str, engine: dict) -> dict:
     """`host_key` for the model `model` names and the engine config `engine`
     that `keyed` gave, for a process that holds no resolved config."""
+    return {
+        "host_cpu": host_cpu(),
+        "atom": atom_digest(),
+        "model": _file_digest(model, "config.json"),
+        "engine": engine,
+    }
+
+
+def atom_source(digest: str | None = None) -> Reading:
+    """ATOM's source as every artifact reads it: `atom_digest`, here or as a
+    record's run.json ``host_key.atom`` states it in `digest`, a reading of
+    kind `ATOM_PY`."""
+    return Reading(ATOM_PY, atom_digest() if digest is None else digest)
+
+
+def source_root(digest: str | None = None) -> str:
+    """The ``source_root`` a key holds for `atom_source`, ``<kind>-<value>``."""
+    reading = atom_source(digest)
+    return f"{reading.kind}-{reading.value}"
+
+
+def atom_digest() -> str:
+    """The sha256 of ATOM's Python modules here, less `COMPASS_ONLY` and
+    `INSTALL_WRITTEN`."""
     root = Path(atom.__file__).parent
     digest = hashlib.sha256()
     for path in sorted(root.rglob("*.py")):
         relative = path.relative_to(root)
+        if relative == INSTALL_WRITTEN:
+            continue
         skip = next(
             (v for k, v in COMPASS_ONLY.items() if relative.is_relative_to(k)), ()
         )
@@ -2444,12 +2761,7 @@ def host_key_of(model: str, engine: dict) -> dict:
             if node is doc or names & skip:
                 del lines[prev.end_lineno if prev else 0 : node.end_lineno]
         digest.update(f"{relative}\0".encode() + b"".join(lines))
-    return {
-        "host_cpu": host_cpu(),
-        "atom": digest.hexdigest(),
-        "model": _file_digest(model, "config.json"),
-        "engine": engine,
-    }
+    return digest.hexdigest()
 
 
 def _file_digest(name: str, filename: str) -> str | None:
@@ -2704,7 +3016,9 @@ def frontend_done(llm_engine) -> bool:
     hand in the frontend's refusals, at a stop with the signal that ended it.
     With the authority co-hosted, then write the step table and the run summary;
     at a stop, after the early end's writer, which has written its own if an LP
-    handed in before the stop, so the summary left counts every hand-in."""
+    handed in before the stop, so the summary left counts every hand-in. A
+    recorded real run's served lines move into its record first (`_LineFile`)."""
+    _move_line_files()
     rt = clock.installed()
     stop = None if rt is None else getattr(rt.loop, "stopped", None)
     if rt is None or (rt.now != math.inf and stop is None):
@@ -2804,6 +3118,13 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     summary = RunSummary.of(
         record, wall, *lazy, diagnostics=diagnostics, refusals=tally
     ).as_record()
+    # Each DP prefill whose G were each traced, and why, by the engines that did.
+    if per_g := counted("lazy_per_g"):
+        summary["cost"]["lazy_per_g"] = dict(per_g)
+    # The DP prefill lookups a graph holding G served, and every lookup's wall.
+    for key in ("held_lookups", "lookup_wall_seconds"):
+        if value := total(key):
+            summary["cost"][key] = value
     schedule = summary["schedule"]
     schedule["predicted_seconds"] = seconds
     # How the seconds were obtained: reported, never gated.
@@ -2842,6 +3163,12 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
             for h in entries(run, "host") or []
             for k in TOKENIZER_KINDS
             if k not in h.get("tokenizer", {k: None})
+        }
+        | {
+            "tokenizer.segment.chars_per_s"
+            for h in entries(run, "host") or []
+            if "segment" in h.get("tokenizer", {})
+            and "chars_per_s" not in h["tokenizer"]["segment"]
         }
     )
     summary["unmeasured_hops"] = sorted(k for k, v in hops(run).items() if v is None)
