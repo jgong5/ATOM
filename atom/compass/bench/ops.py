@@ -1334,6 +1334,8 @@ class Stub:
             record |= {"leaf": sig, "metadata": names, "rows": rows}
             record |= {"later": later} if later else {}
             record |= {"exchange": ex} if (ex := exchange(op)) else {}
+            # its text leaves a micro-batch's mark out, which `_densify` reads back
+            record |= {"micro_batch": True} if shape.micro_batch else {}
             try:
                 if sig in self.fills:  # as its pass's first reader fills them
                     cache, step = self.fills[sig]
@@ -2904,7 +2906,12 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                 if store.directory_for(at := key(shape, context, sig)).exists():
                     entry = store.read(at)
                     held = entry.read_member("point", entry.topology.ranks()[0], "json")
-                    done[str(shape), context, sig] = json.loads(held)
+                    # the asking shape's mark alone: the point's key holds no TBO
+                    # switch, and a store may hold it from before records kept one
+                    point = json.loads(held)
+                    point.pop("micro_batch", None)
+                    mark = {"micro_batch": True} if shape.micro_batch else {}
+                    done[str(shape), context, sig] = point | mark
                 else:
                     found[sig] = op, instances
             todo += [(shape, context, found)] if found else []
@@ -3481,7 +3488,10 @@ def _densify(families, tried: set) -> dict:
             if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
                 continue
             tried.add((fam, mid))
-            shape = _shape(record["shape"])
+            # a micro-batch's leaves are read off its own graph, as its record marks
+            shape = _shape(record["shape"])._replace(
+                micro_batch=record.get("micro_batch", False)
+            )
             if isinstance(fam, tuple):  # over cached tokens at one token count
                 new = json.dumps([*json.loads(fam[0]), mid], sort_keys=True)
                 want[shape, mid].add(new)
