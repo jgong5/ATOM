@@ -384,8 +384,10 @@ V4_LISTS = {
 #: DeepSeek-V4.1's arguments, keyed as `V4_METADATA`'s, and the buffers ATOM
 #: passes each (`_named`), at the leaf's ratio (`_ratio`), as `_bound` names
 #: them: the paged cache's, the pass's step (`step.`), the decoder plan
-#: (`plan.`), the scorer workspace (`workspace.`), the forward context.
+#: (`plan.`), the scorer workspace (`workspace.`), the forward context; or
+#: past one, its first row (`.0`) or it widened to int64 (`.long`).
 _CACHE = "attn_metadata_builder.cache.indptr_buffers.{ratio}"
+_STAGED = "attn_metadata_builder.cache._cursor_staging.gpu"
 _LOGITS = (
     "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
     "flydsl_fp8_paged_mqa_logits_gfx1250"
@@ -424,6 +426,10 @@ V41_NAMES = {
     ("aten.index_select.default", "index", "metadata"): "plan.last",
     ("aten.index.Tensor", "indices"): "plan.query_ptrs",
     ("aten.index_put_.default", "indices"): ("plan.tail_rows", "plan.last_rows"),
+    # the cursor write, `cursor[step.slots[:n].long()] = staged[:n]`, whose
+    # values at one row are the staging's first, its unit dim dropped
+    ("aten.index_put_.default", "indices", "kv"): "step.slots.long",
+    ("aten.index_put_.default", "values", "kv"): (_STAGED, f"{_STAGED}.0"),
     (_GATHER, "rows"): ("plan.tail_rows", "plan.last"),
     **{
         (fn, f"{field}_state"): f"attn_metadata_builder.cache.state.compress_{field}"
@@ -1864,6 +1870,10 @@ def _named(op, path, spec, pool, known=None) -> dict | None:
     ratio = _ratio(op, path, known)
     ratios = [ratio] if ratio is not None else sorted(set((known or {}).values()))
     names = [w.format(ratio=r) for w in wanted for r in ratios or [None]]
+    for n in names:  # past a buffer: its first row, or it widened to int64
+        base, _, last = n.rpartition(".")
+        if n not in pool and base in pool and last in ("0", "long"):
+            pool = pool | {n: pool[base][0] if last == "0" else pool[base].long()}
     held = {
         n: pool[n] for n in names if n in pool and str(pool[n].dtype) == spec["dtype"]
     }

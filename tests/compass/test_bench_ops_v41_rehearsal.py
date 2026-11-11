@@ -176,3 +176,29 @@ def test_each_rope_takes_its_query_s_or_its_ratio_s_key_positions(rehearsed):
         want = {s: truth.get(s, {}).get("positions") for s in taken}
         assert {s: [n] for s, n in taken.items()} == want
         assert len(set(taken.values())) == len(taken) >= 3
+
+
+def test_the_cursor_write_takes_its_staged_cursors_at_its_step_s_slots(rehearsed):
+    """V4.1's cursor write, `cursor[step.slots[:n].long()] = staged[:n]`:
+    its values are the staged cursors ATOM's capture passes it, and its index,
+    a cast no buffer holds, its step's slots widened to int64."""
+    got, truth = rehearsed
+    cursor = "aten.index_put_.default", "attn_metadata_builder.cache.cursor"
+    writes = [r for r in got["cached"] if (r["op"], r["bound"].get("self")) == cursor]
+    assert writes
+    for r in writes:
+        taken = r["identity"]["values"], r["bound"]["indices.0"]
+        assert taken == (*truth[r["leaf"]]["values"], "step.slots.long")
+
+
+@pytest.mark.parametrize("shape", [[4], [2, 4]], ids=["one_row", "two_rows"])
+def test_the_cursor_write_s_values_are_its_staging_s_first_rows(shape):
+    """One row is the first, its unit dim dropped as `cursor[i] = staged[:1]`
+    drops it."""
+    staged, slots = torch.zeros(64, 4, dtype=torch.int64), torch.zeros(64).long()
+    cache = "attn_metadata_builder.cache"
+    held = {f"{cache}._cursor_staging.gpu": staged, f"{cache}._reset_slots": slots}
+    spec = {"shape": shape, "stride": [4, 1][-len(shape) :], "dtype": "torch.int64"}
+    op = {"op": "aten.index_put_.default", "args": {"self": {"role": "kv"}}}
+    _, view = ops._kv(spec, "values", ops._named(op, "values", spec, held) or held)
+    assert (view.data_ptr(), list(view.shape)) == (staged.data_ptr(), shape)
