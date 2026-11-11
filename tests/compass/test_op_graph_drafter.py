@@ -32,7 +32,6 @@ from test_work import SPEC
 from atom.compass.artifacts import (
     ArtifactStore,
     GateState,
-    Key,
     Kind,
     Topology,
     member_name,
@@ -42,7 +41,7 @@ from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import gemm, price
-from atom.compass.capture import population_shapes
+from atom.compass.capture import graph_key, population_shapes
 from atom.compass.capture.forward import structure
 from atom.compass.run import _op_graphs
 from atom.compass.runner import projection
@@ -343,7 +342,7 @@ def test_a_dp_drafter_beside_a_prefilling_peer_gathers_the_step_s_rows(
     root, graphs = capture(1, tmp_path_factory, dp=2)
     [target] = [key for key in graphs if not key.endswith(" draft")]
     store, rank = ArtifactStore(str(root / "store")), Topology().ranks()[0]
-    key = Key.of(Kind.OP_GRAPH, structure=f"{target} draft", shape="decode B=2 G=20")
+    key = graph_key(f"{target} draft", "decode B=2 G=20")
     drafter = json.loads(store.read(key).read_member("graph", rank, "json"))
 
     # Its first pass gathers this rank's 4 verified tokens and the peer's 16.
@@ -371,7 +370,7 @@ def _lookup(tmp_path, dp, stored, *lazily):
     for (phase, shape, draft), region in stored.items():
         at = structure(config, phase, True, "gfx950", True, draft)
         store.publish(
-            Key.of(Kind.OP_GRAPH, structure=at, shape=shape),
+            graph_key(at, shape),
             provenance=stanza("compass trace ops"),
             topology=Topology(),
             conditions=run_readings(config.model),

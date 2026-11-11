@@ -29,7 +29,8 @@ CSA top-k ids, which the bench draws on the device's generator, are not drawn,
 and its index buffer keeps the values ATOM prepared; no tensor
 equals another, so each placement clones its metadata; DeepSeek-V4.1's state
 cursors read back zeros and its check of them has no values to judge, as in
-a capture. OUT gets one record a leaf: its point, its verdict (`LAUNCH` with
+a capture; a host tensor allocated pinned, which a fake one cannot say it is,
+reads as pinned. OUT gets one record a leaf: its point, its verdict (`LAUNCH` with
 the kernels it launched, `REFUSED` with the reason, or `UNTOLD`, which a fake
 tensor's missing values stopped), the buffers its KV and metadata arguments
 bound, each one's identity (`identity`), and that of each its later
@@ -245,6 +246,8 @@ def _pageable(value) -> bool:
 
     if not torch.is_tensor(value) or value.device.type != "cpu":
         return False
+    if getattr(value, "pinned", False):  # allocated pinned (`main`'s `pinning`)
+        return False
     try:
         return not value.is_pinned()
     except RuntimeError:  # a fake host tensor holds no memory to ask
@@ -382,6 +385,14 @@ def main(out, argv) -> None:
             r["later_identity"] = later.get(r["leaf"], {})
         return journal(path, records)
 
+    empty_strided = torch.empty_strided
+
+    def pinning(*args, pin_memory=False, **kwargs):
+        out = empty_strided(*args, pin_memory=pin_memory, **kwargs)
+        if pin_memory:  # a fake tensor cannot say it is
+            out.pinned = True
+        return out
+
     def launching(name):
         fn = function(name)  # found, or the leaf refuses
 
@@ -438,6 +449,7 @@ def main(out, argv) -> None:
             (triton_jit.JITFunction, "run", typed),
             (ops, "_deep", cloning),
             (ops, "_journal", journaled),
+            (torch, "empty_strided", pinning),
             (ops.Stub, "_prepare", preparing),
             (ops.Stub, "_time", timing),
             (ops, "uniform_ids", host_draw),

@@ -10,9 +10,12 @@ import pathlib
 
 import pytest
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
+from test_op_work import leaf, t
 
 from atom.compass import cli, run
 from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, GateState, Key, Kind
+from atom.compass.backends import BatchView, RequestShape
+from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.bench import ops as bench
 from atom.compass.capture.peers import MORI
 from atom.compass.fit import ops, publish
@@ -549,3 +552,84 @@ def test_a_family_with_ragged_points_leaves_out_a_uniform_point_the_pool_cut(
         assert got.reason == priced
     else:
         assert got.seconds == pytest.approx(priced)
+
+
+def _later(rows):
+    """A drafter's later pass over `rows` rows."""
+    return leaf("aiter.step", x=t([rows, 8]))
+
+
+def _mixed(rows, width):
+    """A product of `rows` rows broadcast across `width`."""
+    out = [[width, rows, 64]]
+    return leaf("aten.mul.Tensor", out, self=t([rows, 64]), other=t([width, 1, 64]))
+
+
+def _at(op, shape, ns, context=None, kernel="k"):
+    """`measure ops`'s point of the leaf `op` at `shape`."""
+    point = {"shape": shape, "context": context, "op": op["op"], "cold_ns": ns}
+    return point | {"leaf": bench.signature(op), "kernels": [kernel]}
+
+
+def _priced(points, step, graph, drafts=0):
+    """`step`'s terms, the region `graph(draft, width)` gives each part priced
+    by the fit of `points`."""
+    params = ops.fit(points)
+    ops.held_out(params)
+    backend = OpGraphBackend(
+        SPEC,
+        lambda *_, draft=False, width=None: graph(draft, width),
+        kv="bf16",
+        drafts=drafts,
+        price_list=ops.PriceList(params),
+    )
+    cost = backend.price(step)
+    return {term.name: term.seconds for term in (*cost.terms, *cost.draft_terms)}
+
+
+@pytest.mark.parametrize(
+    "queries, width, kernel, priced",
+    [
+        ((60,), None, "k", 1e-6),
+        ((40, 40), None, "k", 2e-6),
+        ((60,), 4, "k", 4e-6),
+        ((60,), 4, "k4", 4e-6),
+    ],
+    ids=["one-row", "two-rows", "padded-to-4", "padded-to-4-on-its-own-kernel"],
+)
+def test_a_drafter_s_later_pass_at_a_prefill_s_width_prices_from_its_width_s_point(
+    queries, width, kernel, priced
+):
+    # 1 us a row and flat over a decode's context, measured at a prompt's rows,
+    # 1 and 2, and at 4, the width a prompt of one row padded its later pass to,
+    # there on the rows' kernel or on one of its own
+    points = [_at(_later(2), "decode B=2", 2e3, c) for c in (1000, 3000)]
+    points += [_at(_later(1), "prefill T=60 B=1", 1e3)]
+    points += [_at(_later(2), "prefill T=80 B=2", 2e3)]
+    points += [_at(_later(4), "prefill T=60 B=1 W=4", 4e3, kernel=kernel)]
+    prompts = tuple(RequestShape(q, q, False) for q in queries)
+    step = BatchView(prompts, produces_output=True, draft_bs=width)
+
+    got = _priced(
+        points,
+        step,
+        lambda draft, _: _later(width or len(queries)) if draft else {"seq": []},
+        drafts=2,
+    )
+
+    assert got == {"draft op.aiter.step.price_list": pytest.approx(priced)}
+
+
+@pytest.mark.parametrize("width, priced", [(4, 1e-6), (8, 2e-6)])
+def test_a_leaf_over_a_prefill_s_rows_and_its_width_is_priced_at_each_width_apart(
+    width, priced
+):
+    # A prompt of one row whose LM head pads to 4 or 8: a leaf over both its
+    # row and that width is read at its rows, and each width is its own point
+    points = [_at(_mixed(1, w), f"prefill T=60 B=1 W={w}", w * 250) for w in (4, 8)]
+    prompt = (RequestShape(60, 60, False),)
+    step = BatchView(prompt, produces_output=True, target_bs=width)
+
+    got = _priced(points, step, lambda _, at: _mixed(1, at))
+
+    assert got == {"op.aten.mul.Tensor.price_list": pytest.approx(priced)}

@@ -108,7 +108,13 @@ BASE = Conditions.of(
 #: A key per row of the matrix. The three `machine_spec` rows share one key,
 #: because they are three facets of one artifact and that is the point of them.
 KEY_OF: dict[Row, Key] = {
-    Row.OP_GRAPH: Key.of(Kind.OP_GRAPH, structure="qwen3-moe-48L", shape="decode B=2"),
+    Row.OP_GRAPH: Key.of(
+        Kind.OP_GRAPH,
+        structure="qwen3-moe-48L",
+        shape="decode B=2",
+        source_root=ATOM_ROOT.revision,
+        torch="2.10.0+rocm7.2.4",
+    ),
     Row.PRICE_LIST: Key.of(
         Kind.PRICE_LIST,
         model="Qwen/Qwen3-32B",
@@ -638,7 +644,10 @@ def test_a_refusal_says_which_key_missed_where_a_count_does_not(tmp_path):
     no_graph = Resolution("step 41")
     store.answer(KEY_OF[Row.PRICE_LIST], no_graph, conditions=BASE, gates=GATES)
     store.answer(
-        Key.of(Kind.OP_GRAPH, structure="never-traced", shape="decode B=2"),
+        Key.of(
+            Kind.OP_GRAPH,
+            **{**KEY_OF[Row.OP_GRAPH].values, "structure": "never-traced"},
+        ),
         no_graph,
         conditions=BASE,
         gates=GATES,
