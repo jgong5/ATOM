@@ -37,7 +37,7 @@ writes, which a top-k or the pick's block maxima ranks (`PAGE_WIDE`), is
 drawn as an activation is, below each row's bound, on every copy
 (`_scores`). A `Stub` calls each leaf from its
 contract: a tensor the capture states on the host is built there on every
-copy, as an activation is, pinned as ATOM stages one (`_host`); an
+copy, as an activation is, pinned (`_host`); an
 activation is random at its shape, dtype and stride, except such
 a table, the placement's, a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
@@ -2419,8 +2419,8 @@ def _random(spec, device) -> torch.Tensor:
 
 def _host(spec, pinned) -> torch.Tensor:
     """`spec` on the host, drawn as `_random` draws it, in pinned memory when
-    `pinned`: ATOM stages what it copies to a device there (`CpuGpuBuffer`),
-    and no CUDA graph captures a copy from pageable memory."""
+    `pinned`: a CUDA graph replays a copy from pinned memory only, and a
+    capture cannot tell pinned from pageable."""
     drawn = _random(spec, "cpu")
     out = torch.empty_strided(
         drawn.shape, drawn.stride(), dtype=drawn.dtype, device="cpu", pin_memory=pinned
