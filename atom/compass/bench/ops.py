@@ -710,8 +710,8 @@ def leaves_at(
     the capture having kept no other; one of a drafter's graphs alone is
     marked ``drafted``. With `own`, `shape` is a drafter's own decode shape
     past its step's (`parts`), where a capture keeps the drafter's graph
-    alone: its leaves. With `drafter`, those a drafter's graph holds alone,
-    each as it is without it."""
+    alone: its leaves. With `drafter`, only the leaves some graph of the
+    drafter's holds, each as the whole shape has it."""
     from atom.compass.artifacts import ArtifactRefusal
 
     if own:
