@@ -545,6 +545,33 @@ def test_each_layer_s_attention_prices_from_the_point_one_layer_s_view_measured(
     assert [getattr(g, "seconds", g) for g in got] == [pytest.approx(40e-6)] * 3
 
 
+V4_WRITE = "atom.model_ops.v4_kernels.state_writes:swa_write"
+
+
+def _write(layer):
+    """DeepSeek-V4's window write of 4 rows in layer `layer`, which ATOM passes
+    that layer's name, as its `op_graph` holds it."""
+    kv = {"shape": [4, 512], "stride": [512, 1], "dtype": BF16, "role": "activation"}
+    args = {"kv": kv, "prefix": f"layers.{layer}.attn.swa_write"}
+    return {"op": V4_WRITE, "args": args, "out": []}
+
+
+def test_each_layer_s_write_prices_from_the_point_one_layer_s_call_measured():
+    # measured on the first layer's call at two contexts
+    points = [
+        {"shape": "decode B=4", "context": c, "op": V4_WRITE, "cold_ns": 5e3}
+        | {"leaf": bench.signature(_write(0)), "kernels": ["swa"]}
+        for c in (1024, 4096)
+    ]
+    params = ops.fit(points)
+    ops.held_out(params)
+    at = ("decode", None, 4, None, 4096, 4096)
+
+    got = [ops.PriceList(params).price((_write(n), at, 0)) for n in (0, 1, 60)]
+
+    assert [getattr(g, "seconds", g) for g in got] == [pytest.approx(5e-6)] * 3
+
+
 @pytest.mark.parametrize(
     "mean, priced",
     [

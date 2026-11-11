@@ -386,6 +386,39 @@ def test_layers_that_view_one_kv_pool_from_rows_of_their_own_plan_one_point(
 
 
 @pytest.mark.parametrize(
+    "slot, values, leaves",
+    [
+        ("prefix", ("layers.0.attn.swa_write", "layers.1.attn.swa_write"), 1),
+        ("quant_mode", ("group_fp8", "per_row_fp8"), 2),
+    ],
+)
+def test_layers_whose_calls_differ_only_in_a_string_plan_one_point_per_mode(
+    bench, tmp_path, monkeypatch, slot, values, leaves
+):
+    """DeepSeek-V4 passes each layer's window write the layer's name, which no
+    kernel reads, so one layer's leaf differs from the next one's only there:
+    the plan measures one point for both. A string that picks how a kernel
+    runs, a quantization mode, keeps its calls apart."""
+
+    def graph(store, config, shape, arch=None):
+        rows = shape.tokens if shape.phase == "prefill" else shape.seqs
+        kv = ("kv", _t([rows, 8], "activation"))
+        calls = [_leaf("atom.swa_write", kv, (slot, value)) for value in values]
+        traced = Traced(f"x tp=1 {shape.phase} eager", str(shape))
+        return json.loads(to_json(build(list(enumerate(calls)), traced)))
+
+    monkeypatch.setattr(ops, "graph", graph)
+    plan = _records(
+        tmp_path / "plan", ([[1, 1000, True]], 2), ([[100, 2100, False]], None)
+    )
+
+    records = _plan(bench, tmp_path, plan)
+
+    points = [(r["shape"], json.dumps(r["context"])) for r in records]
+    assert {points.count(p) for p in points} == {leaves}
+
+
+@pytest.mark.parametrize(
     "max_model_len, at_8000", [(8100, {40, 100}), (8150, {40, 100, 150})]
 )
 def test_a_plan_places_no_cached_prefill_point_past_max_model_len(
