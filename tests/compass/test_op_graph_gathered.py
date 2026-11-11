@@ -26,8 +26,6 @@ from test_work import SPEC
 from atom.compass.artifacts import (
     ArtifactStore,
     GateState,
-    Key,
-    Kind,
     Topology,
     member_name,
 )
@@ -35,7 +33,7 @@ from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import activated_experts, gemm, price
-from atom.compass.capture import population_shapes
+from atom.compass.capture import graph_key, population_shapes
 from atom.compass.capture.forward import Shape, structure
 from atom.compass.capture.forward import prefill as prefill_shape
 from atom.compass.run import _op_graphs
@@ -96,7 +94,7 @@ def backend(config, tmp_path):
                 micro_batch=shape.micro_batch,
             )
             store.publish(
-                Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape)),
+                graph_key(at, str(shape)),
                 provenance=stanza("compass trace ops"),
                 topology=Topology(),
                 conditions=run_readings(config.model),

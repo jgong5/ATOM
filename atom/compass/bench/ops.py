@@ -666,9 +666,11 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     (`draft`, as `forward.structure` keys it). A prefill that produces none
     runs its target's leaves less the LM head and the sampler, so the
     target's points at output cover both. A miss where the store holds the
-    shape under another engine config refuses naming what differs. A
+    shape under another engine config, or traced under another ATOM source or
+    torch (`capture.graph_key`), refuses naming what differs. A
     two-batch-overlap micro-batch's `shape` reads its own graph."""
     from atom.compass.artifacts import ArtifactRefusal, Rule
+    from atom.compass.capture import graph_key
     from atom.compass.capture.forward import missed, structure
 
     at = structure(
@@ -679,14 +681,15 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
         draft=draft,
         micro_batch=shape.micro_batch,
     )
-    key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
+    key = graph_key(at, str(shape))
     if not store.directory_for(key).exists() and (why := missed(store, key)):
         part = " that produces no output" * (not output)
         part += " as a two-batch-overlap micro-batch" * shape.micro_batch
         part += " for its drafter" * bool(draft) + "'s draft-KV pass" * (draft == KV)
         raise ArtifactRefusal(
             Rule.RESOLUTION,
-            f"no op_graph holds {shape}{part} under this engine config{why}",
+            f"no op_graph holds {shape}{part} under this engine config, ATOM "
+            f"source and torch{why}",
             "compass trace ops captures one under this process's environment",
         )
     return json.loads(store.read(key).read_member("graph", RANK, "json"))
