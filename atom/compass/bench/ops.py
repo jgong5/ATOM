@@ -160,8 +160,9 @@ shape of more than one row on ragged rows too (`_means`): the first at the
 context, the rest sharing a mean, each `GRID`th of it from the least the rows
 hold; and each prefill family (`_family`), under a speculative drafter each
 leaf of its own prefill shape past a step's that the step's graphs do not
-hold too, at its rows padded to its W, over a ladder of their token counts,
-chunk remainders among them,
+hold too, at its rows padded to its W, and under DP a leaf of the drafter's
+alone at the G a run asks it at, its later passes' (`_drafter_at`), over a
+ladder of their token counts, chunk remainders among them,
 its shapes that state the rows a DP group gathers apart, as `fit ops` prices them,
 one of a kind that depends on context at each at the most cached tokens of
 steps of its rows, and over a ladder of them once those points and the fresh
@@ -2687,11 +2688,13 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     # read at: a leaf a decode's width's graphs hold is that width's point,
     # and a prefill's family (`_family`) states no W, so a leaf its step's
     # graphs hold is the step's. G and W are None or a count
-    own = defaultdict(set)
-    for _, reads in steps:
+    own, draft_lines = defaultdict(set), {}
+    for line, reads in steps:
         for part, shape, output, _ in reads[1:]:
             if part == DRAFT and shape != reads[0][1]:
                 own[shape].add(output)
+            if part == DRAFT and shape.phase == "prefill":
+                draft_lines.setdefault(shape, line)
     steps = [(reads[0][1], line) for line, reads in steps]
     contexts = [
         c for s, line in steps if s.phase == "decode" for c in _rows(line, s.seqs)
@@ -2720,6 +2723,13 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             continue
         width = graphs[decode(s.seqs)]
         graphs[s] = {sig: leaf for sig, leaf in graphs[s].items() if sig not in width}
+    # a leaf of a prefill's drafter's alone that a run asks at another G than
+    # its shape's, its later passes' under DP, is a point at that G
+    for s, line in draft_lines.items():
+        for sig, (op, _) in list(graphs[s].items()):
+            if op.get("drafted") and (at := _drafter_at(s, op, line, config)) != s:
+                graphs.setdefault(at, {})[sig] = graphs[s].pop(sig)
+                prefills.add(at)
     # a run resumed into `out` keeps the rounds an earlier one wrote there
     rounds = [int(d.name[5:]) for d in out.glob("round*") if d.name[5:].isdigit()]
     first = max(rounds, default=-1) + 1
@@ -2865,7 +2875,8 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     highest context (`_rows`), any other decode leaf at its width, a prefill
     leaf at its tokens, and one of a kind that depends on context over its
     rows' cached tokens too (`_bracket_cached`); and `fit ops`' price list of
-    `records` prices it at the step, as `compass run --coverage` asks it. A
+    `records` prices it at the step, as `compass run --coverage` asks it, a
+    prefill's drafter's leaf at the G a run asks it at (`_drafter_at`). A
     decode leaf is read at the rows it ran, its shape's T: of a drafter's own
     decode shape past its step's, a leaf its width's graphs hold at that
     width, as `--plan` measures it. The graphs are `arch`'s; a part's graph
@@ -2916,6 +2927,8 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
             if isinstance(found := families(shape, output, draft, own), str):
                 whys[f"{part}op_graph"], found = found, []
             for name, fam, tokens, op, at in found:
+                if part == DRAFT:
+                    at = _drafter_at(at, op, line, config)
                 bound = (*at[:4], mean, top)
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
@@ -2980,6 +2993,33 @@ def parts(names, config) -> list:
     return steps
 
 
+def _drafter_at(shape, op: dict, line: dict, config):
+    """`shape`, a prefill its drafter's graph is read at, at the G a run asks
+    that graph's leaf `op` at on the step `line` records, as
+    `OpGraphBackend._bound` asks it. Under DP the drafter's first pass
+    gathers `draft_moe_rows`, and its later passes run at `draft_bs`, or at
+    its B where they gather `draft_rows`, gathering that or their batch on
+    every rank: a leaf that leads with their batch or gather, and not with
+    `shape`'s T or B or the first gather, is asked at their gather; one that
+    leads with both at the fewer of the two gathers, off its default; any
+    other at `shape`'s G."""
+    from atom.compass.backends.op_graph import _ran_at, gathered_off_default
+
+    gathered, rows = line.get("draft_moe_rows"), line.get("draft_rows")
+    if shape.phase == "decode" or gathered is None:
+        return shape
+    t, b = shape.tokens, shape.seqs
+    drafts = config.speculative_config.num_speculative_tokens
+    width = b if drafts > 1 and rows else line.get("draft_bs")
+    if not width:
+        return shape
+    dp = config.parallel_config.data_parallel_size
+    later = rows or dp * width
+    low = gathered_off_default("prefill", t, min(gathered, later), dp)
+    sets = frozenset({t, b, gathered}), frozenset({width, dp * width, later})
+    return shape._replace(gathered=_ran_at(op, (shape.gathered, later, low, sets)))
+
+
 def _rows(line, rung: int) -> tuple[int, int]:
     """A step's lowest and highest row context: at least 1, the least over
     `k`, the powers of two up to the rung, of `rowmod(k)` per row of the
@@ -3033,13 +3073,15 @@ def _ladder(values) -> list:
 
 
 def _shape(text: str):
-    """The `Shape` whose `str` is `text`, each count read by its name."""
+    """The `Shape` whose `str` is `text`, each count read by its name; a
+    prefill's G may be the rows its drafter's later passes gather, fewer than
+    its T (`_drafter_at`)."""
     from atom.compass.capture.forward import decode, prefill
     from atom.compass.fit.ops import shape_counts
 
     n = shape_counts(text)
     if text.startswith("prefill"):
-        return prefill(n["T"], n["B"], n.get("G"), n.get("W"))
+        return prefill(n["T"], n["B"], None, n.get("W"))._replace(gathered=n.get("G"))
     return decode(n["B"], n.get("G"), n.get("T"))._replace(width=n.get("W"))
 
 
