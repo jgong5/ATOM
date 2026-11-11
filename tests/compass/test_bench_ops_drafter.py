@@ -24,7 +24,12 @@ import pytest
 import torch
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_bench_ops import TREE, _graph, _leaf, _Runner, _t
-from test_bench_ops_plan import CONFIG, _graph_at, bench  # noqa: F401  a fixture
+from test_bench_ops_plan import (
+    CONFIG,
+    _bench,
+    _graph_at,
+    bench,  # noqa: F401  a fixture
+)
 from test_bench_ops_ranks import _sig
 from test_capture_ir import MAIN
 from test_capture_v41_flash import CONFIG as V41
@@ -83,10 +88,23 @@ def _records(path, *steps):
     return str(path)
 
 
+def _moving_anchor_bench(fn, config, todo, llc):
+    """`_bench`, the drafter's anchors timed as its attention is, by their
+    longest row's context, their kernel switching at 3500 tokens: past the
+    ragged step's rows, short of the padded step's one row."""
+    got = _bench(fn, config, todo, llc)
+    for r in got:
+        if r["op"] == "aiter.anchor":
+            n = ops._split(r["context"])[0]
+            r.update(kernels=[f"anchor{int(n >= 3500)}"], cold_ns=n * 1e3)
+    return got
+
+
 def test_a_plan_measures_a_drafter_s_parts_and_coverage_reads_each_step_s(
     bench, tmp_path, monkeypatch  # noqa: F811
 ):
     monkeypatch.setattr(ops, "graph", _parted)
+    monkeypatch.setattr(ops, "_child", _moving_anchor_bench)
     steps = _records(
         tmp_path / "steps",
         ([[2, 1000, True], [2, 3000, True]], 2, True),
@@ -111,6 +129,14 @@ def test_a_plan_measures_a_drafter_s_parts_and_coverage_reads_each_step_s(
     anchors = {r["shape"] for r in records if r["op"] == "aiter.anchor"}
     assert anchors == rungs | {"decode T=1 B=2"} and rungs <= shapes
     assert {r["shape"] for r in records if r["op"] == "aiter.cut"} == {"decode T=1 B=2"}
+    # The anchors move with context: a shape of more than one row takes ragged
+    # points of them, one of one row none, its row being its rows' mean.
+    ragged = {
+        r["shape"]
+        for r in records
+        if r["op"] == "aiter.anchor" and isinstance(r["context"], list)
+    }
+    assert ragged == {"decode B=2", "decode B=4"}
     assert {r["op"] for r in records} == {
         "aiter.attn",
         "aiter.gemm",
@@ -122,7 +148,9 @@ def test_a_plan_measures_a_drafter_s_parts_and_coverage_reads_each_step_s(
     # Each step reads its target's and its drafter's graphs; one that samples
     # also its draft-KV pass's; a middle chunk its drafter's alone. The padded
     # decode's drafter is read at its own shape, each leaf at the rows it ran:
-    # its cut, measured there alone, at its one row.
+    # its cut, measured there alone, at its one row, and its anchors at that
+    # row's context, past their kernel's switch, which the rung's two rows, a
+    # pad among them, would reach back across.
     assert report["by part"] == {
         "target": {"steps": 5, "covered": 5},
         "draft": {"steps": 5, "covered": 5},
