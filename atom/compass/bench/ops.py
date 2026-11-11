@@ -1918,12 +1918,16 @@ def _written(op, path) -> str | None:
 def _candidates(ends, k) -> torch.Tensor:
     """`[rows, k]` int32 blocks each row of `ends` visible blocks keeps, as V4.1's
     candidate pick keeps them, ascending: every one when it sees no more
-    than `k`, -1 past them; else `k`, the newest, which the pick pins, last."""
-    # ponytail: the rest spread evenly; the pick keeps the blocks its scores
-    # peak in, which no placement has
+    than `k`, -1 past them; else `k` spread evenly from block 0 up to the
+    newest, which the pick pins, last."""
+    # ponytail: the pick keeps the blocks its scores peak in, which no placement
+    # has. Block 0 first: the candidate lift rewrites its selection, zeros
+    # (`_random`), in place through the first block, and a copy called again
+    # reads what it wrote; through any other block it walks past the list
     run, seen = torch.arange(k, device=ends.device), ends.long()[:, None]
     kept = torch.where(run < seen, run, -1)
-    return torch.where(seen > k, (run + 1) * seen // k - 1, kept).int()
+    spread = seen - 1 - (k - 1 - run) * (seen - 1) // max(k - 1, 1)
+    return torch.where(seen > k, spread, kept).int()
 
 
 def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:
