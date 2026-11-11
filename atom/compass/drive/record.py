@@ -21,6 +21,14 @@ Beside them the frontend writes ``steps/tokenizer.jsonl``, each call of the
 served tokenizer with its tokens and its start and end, under a line naming
 the tokenizer's backend and fingerprint, and ``steps/intake.stamps``, each HTTP
 request's intake stamps with its body's bytes (`atom.compass.run.tokenizer`).
+Until the server stops, their lines are in files in its temp directory, which
+``steps/<name>.local`` names; the stop, the server's exit or the SIGTERM a stop
+sends, moves them into ``steps/``. A temp directory on NFS or CIFS refuses. A
+server that died first leaves the ``.local`` file, naming a path inside the
+server's container, and `compass fit host` refuses the record: while that
+container runs, ``podman cp <container>:<path> <out>/steps/<name>``, then delete
+the ``.local`` file. A container whose ``/tmp`` is a tmpfs, as the quickstart's
+is, loses the file at its stop, and the record is taken again.
 One record spans the server's lifetime, every
 client run it served included; `parity.served` splits it per client run.
 

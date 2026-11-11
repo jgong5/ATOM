@@ -35,7 +35,8 @@ lacks otherwise or cut, or whose ranks' rows fall to different vectors, is
 counted under `ranks` and not fitted. The law reports each step's rank label
 spread, `max / min - 1`, as its p50 and p90 under `spread`. The group's step
 is the max over its ranks, so each vector is fitted by max-affine regression
-(`_fit_form`): from the fit on every rank's row, each pass refits on the row
+(`_fit_form`): from the fit on every rank's row and from each feature's axis,
+the lowest after a first round going on, each pass refits on the row
 each step's price picks, a step line-searched until it lowers the squared
 relative error, until no step changes rank or the step's ranks tie; MAD drops
 rerun it. The vector's solve, warm steps and hull read each step's row at the
@@ -43,7 +44,7 @@ rank it prices the step as (`priced_rank`); a decode rung that adopts a
 column (below) is fitted again under it. Each
 vector reports, under `fit.all_rows`, the centre and scaled MAD of the fit on
 every rank's row, each step priced as its max over ranks, and under
-`fit.passes` the passes, how they stopped, `settled` or `tie`, and the
+`fit.passes` the start, passes, how they stopped, `settled` or `tie`, and the
 squared error `F`; more than `FIT_PASSES` passes refuse the fit. A held-out
 step is priced and banded as its costliest rank.
 
@@ -59,7 +60,11 @@ fitted for a kind whose samples carry it: `W_inputs` and `L_mtp`, on an MTP
 record, and `W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
 solve drops above the law paid a first-use JIT compile (`_jit`): it and the
 forward after it, whose period takes up the stall, are left out of every host
-law; the report lists the JIT forwards per run under `jit_steps`.
+law; the report lists the JIT forwards per run under `jit_steps`. A `W_launch`
+label leaves out the time its launch spent in HIP's blocking calls, which the
+report states per run and kind under `blocked` (`_blocked`); it names under
+`unstamped` the runs whose records state none, so their `W_launch` labels are
+wall times.
 A forward's `E` that admits requests (`step_labels.admissions`) is left out of
 its kind's law: the law then prices the engine loop alone, and `admit`, seconds
 on `step_labels.admit_x`, prices what the forwards of every kind that admit spend
@@ -67,6 +72,11 @@ beyond it, fitted on their `E` with their kind's law as a fixed part. Records
 on too few such forwards give `admit` null, so a run refuses a forward that
 admits a request rather than charge it nothing, and the report says why under
 `unfitted`.
+
+Under a launch provider that declares features (`launch_features`), a step it
+predicts otherwise than its line observed refuses, naming it; each host law
+adopts features as columns (`_launch_columns`), their coefficients under the
+entry's `columns[kind][segment]`, and `_jit` solves `W_launch` with every one.
 
 The same solver fits the host entry's ``tokenizer`` term on a recorded
 server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
@@ -109,8 +119,10 @@ On an MTP record both prefill vectors, the target's and the draft's, add
 Records whose engine files state the prefill token-graph buckets their runner
 recorded (`PREFILL_BUCKETS`) fit a prefill vector that adds `padding` and
 states them (`StepLinearLaw`); every record states the same buckets, or none
-does. A record whose runner recorded none, or that predates the field, states
-none and fits no `padding`; `--engine` states them in place of its own file.
+does. A record whose engine file predates the field states them in its host
+key only where its runner wrote graph sets there (`stated_buckets`); `--engine`
+states them for one that states none. Records stating them nowhere fit no
+`padding`, named under `unfitted`.
 The draft law adds none: #2976 measured the target's token graph alone.
 
 Forms (`FORMS`): `base`, the features `StepLinearLaw` always prices; `history`,
@@ -152,7 +164,7 @@ from pathlib import Path
 
 import numpy as np
 
-from atom.compass.backends import json_file, step_labels
+from atom.compass.backends import json_file, launch_features, step_labels
 from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.shape import (
     sum_context,
@@ -200,11 +212,14 @@ HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
 #: What a lone HTTP request's intake costs: per request, and per body byte.
 INTAKE_FEATURES = ("idle", "bytes")
-#: What a lone tokenizer call costs: per call, and per token.
-TOKENIZER_FEATURES = ("fixed", "tokens")
+#: What a lone tokenizer call costs: per call, per token, and for a segment
+#: tokenizer call per character its stored-prefix search compared.
+TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
 #: What a forward that admits requests spends once, per prompt token past the
 #: prefix-cache hit and per token within it (`step_labels.admit_x`).
 ADMIT_FEATURES = ("admits", "uncached", "cached")
+#: Why a law fitted on records stating their prefill buckets nowhere has no `padding`.
+NO_BUCKETS = "no record states prefill buckets, so the prefill vector adds no padding"
 
 
 def _rung_key(rung: int | None) -> str:
@@ -288,27 +303,37 @@ def _host_x(s) -> tuple[int, int, int]:
 
 
 def _host_rows(samples) -> list[tuple]:
-    """(kind, segment, (1, tokens, seqs), seconds) per host label of each
-    sample, but the `E` of one that admits requests."""
+    """(kind, segment, (1, tokens, seqs), seconds, run, launch) per host label
+    of each sample, but the `E` of one that admits requests."""
     rows = []
     for s in samples:
         rows += [
-            (host_kind(s.view), k, _host_x(s), v)
+            (host_kind(s.view), k, _host_x(s), v, s.provenance["run"], s.launch)
             for k, v in s.host.items()
             if k != "E" or not s.admitted[0]
         ]
     return rows
 
 
-def _admit_rows(samples, laws) -> list[tuple]:
+def _host_price(host, kind, segment, x, launch) -> float | None:
+    """What the host entry `host` prices a `kind` forward's `segment` at `x`
+    that launched `launch`, its columns included; None with no law."""
+    c = host["laws"].get(kind, {}).get(segment)
+    columns = host.get("columns", {}).get(kind, {}).get(segment, {})
+    priced = sum(v * launch[f] for f, v in columns.items())
+    return None if c is None else float(np.dot(c, x)) + priced
+
+
+def _admit_rows(samples, host) -> list[tuple]:
     """(`admit_x` of admitted, `E` its kind's law prices, `E`) per sample
     that admits requests, has a positive `E` and a kind with an `E` law."""
     return [
-        (step_labels.admit_x(s.admitted), float(np.dot(c, _host_x(s))), s.host["E"])
+        (step_labels.admit_x(s.admitted), base, s.host["E"])
         for s in samples
         if s.admitted[0]
         and s.host.get("E", 0) > 0
-        and (c := laws.get(host_kind(s.view), {}).get("E")) is not None
+        and (base := _host_price(host, host_kind(s.view), "E", _host_x(s), s.launch))
+        is not None
     ]
 
 
@@ -346,7 +371,14 @@ def fit_host(samples) -> tuple[dict, dict]:
             f"the records carry {len(keys)} host keys ({' / '.join(keys)}); "
             "host laws are fitted under one"
         )
-    jit = _jit(samples)
+    launch, graphs = launch_features.stated(json.loads(keys[0]))
+    for s in samples:
+        if (predicted := launch.predict(s.view, graphs)) != s.launch:
+            raise ValueError(
+                f"{s.provenance['run']} step {s.step} launched {s.launch}, and "
+                f"its launch provider predicts {predicted}"
+            )
+    jit = _jit(samples, launch.features)
     after = {(run, rank, n + 1) for run, rank, n in sorted(jit)}
     kept = [
         s for s in samples if (s.provenance["run"], s.rank, s.step) not in jit | after
@@ -354,6 +386,7 @@ def fit_host(samples) -> tuple[dict, dict]:
     rows = _host_rows(kept)
     host = {"key": json.loads(keys[0]), "laws": {}}
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
+    report["blocked"], report["unstamped"] = _blocked(samples)
     report["jit_steps"] = {}
     for run, _, n in sorted(jit):
         report["jit_steps"].setdefault(run, []).append(n)
@@ -362,15 +395,23 @@ def fit_host(samples) -> tuple[dict, dict]:
         for segment in HOST_SEGMENTS[: 3 if kind == "middle" else 4] + tuple(extra):
             members = [r for r in rows if r[:2] == (kind, segment) and r[3] > 0]
             try:
+                adopted, figures = _launch_columns(members, launch.features)
+                columns = [(f, [r[5][f] for r in members]) for f in adopted]
                 coef, fitted = _host_law(
-                    [r[2] for r in members], [r[3] for r in members], HOST_FEATURES
+                    [r[2] for r in members],
+                    [r[3] for r in members],
+                    HOST_FEATURES,
+                    columns=columns,
                 )
             except (ValueError, QhullError) as e:
                 report["unfitted"][f"{kind}.{segment}"] = str(e).splitlines()[0]
                 continue
-            host["laws"].setdefault(kind, {})[segment] = coef
-            report[f"{kind}.{segment}"] = fitted
-    a, base, labels = list(zip(*_admit_rows(kept, host["laws"]))) or [(), (), ()]
+            host["laws"].setdefault(kind, {})[segment] = coef[: len(HOST_FEATURES)]
+            if adopted:
+                c = dict(zip(adopted, coef[len(HOST_FEATURES) :]))
+                host.setdefault("columns", {}).setdefault(kind, {})[segment] = c
+            report[f"{kind}.{segment}"] = fitted | figures
+    a, base, labels = list(zip(*_admit_rows(kept, host))) or [(), (), ()]
     try:
         host["admit"], report["admit"] = _host_law(a, labels, ADMIT_FEATURES, base)
     except (ValueError, QhullError) as e:
@@ -379,44 +420,92 @@ def fit_host(samples) -> tuple[dict, dict]:
     return host, report
 
 
+def _blocked(samples) -> tuple[dict, list[str]]:
+    """Per run whose lines state `blocked_ns` and kind, its launches, those
+    that blocked in a HIP call, their blocked ms at p50 and p90, and each
+    call's blocked ms in all; and the runs whose lines state none, so their
+    `W_launch` labels are wall times."""
+    runs: dict = {}
+    for s in samples:
+        if "W_launch" in s.host:
+            runs.setdefault(s.provenance["run"], []).append(s)
+    blocked = {}
+    for run, launches in runs.items():
+        if all(s.blocked is None for s in launches):
+            continue
+        for kind in HOST_KINDS:
+            mine = [s.blocked or {} for s in launches if host_kind(s.view) == kind]
+            ms = [sum(b.values()) * 1e3 for b in mine if b]
+            calls: dict = {}
+            for b in mine:
+                for call, seconds in b.items():
+                    calls[call] = calls.get(call, 0.0) + seconds * 1e3
+            blocked.setdefault(run, {})[kind] = {
+                "launches": len(mine),
+                "blocked": len(ms),
+                "ms": np.percentile(ms, (50, 90)).tolist() if ms else None,
+                "calls": calls,
+            }
+    return blocked, sorted(runs.keys() - blocked.keys())
+
+
 def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
     """The ``tokenizer`` term over the lone calls (`_lone_calls`) each
     tokenizer record in `paths` holds, beside the intake stamps in `intakes`,
     and its report: the records' backend and fingerprint, and per kind of
     call, ``fixed_s + tokens / tokens_per_s`` by the host-law solver on the
-    calls' wall seconds.
+    calls' wall seconds, a segment tokenizer call's less its calls', over
+    their ids, plus ``chars / chars_per_s`` over the characters its
+    stored-prefix search compared where every call's record holds them
+    (`_own_work`).
     One-item ``encode_batch`` calls are ``encode``'s and several-item ones
     their own kind. A ``decode`` with no positive slope is ``fixed_s`` alone
     over ``tokens``, the ``[lo, hi]`` token counts its calls span. A kind the
     calls cannot give is left out and its reason listed under the report's
-    ``unfitted``; the report gives each record's p10, p50 and p90 relative
-    residual per kind. Raises on records of two tokenizers."""
+    ``unfitted``, a ``segment`` without ``chars_per_s`` as
+    ``segment.chars_per_s``; the report gives each record's p10, p50 and p90
+    relative residual per kind. Raises on records of two tokenizers."""
     from scipy.spatial import QhullError
 
     heads, rows = {}, []
     for i, (path, intake) in enumerate(zip(paths, intakes)):
         head, *lines = Path(path).read_text().splitlines()
         heads[json.dumps(json.loads(head), sort_keys=True)] = None
-        for c in _lone_calls([json.loads(line) for line in lines], intake):
+        got = [json.loads(line) for line in lines]
+        for c in _lone_calls([c for c in got if c["call"] != "segment"], intake):
             kind = c["call"] if c["items"] > 1 or c["call"] == "decode" else "encode"
             s = (c["t_end_ns"] - c["t_start_ns"]) * 1e-9
             rows.append((i, kind, c["tokens"], s))
+        rows += [(i, "segment", n, s, chars) for n, chars, s in _own_work(got, intake)]
     if len(heads) != 1:
         raise ValueError(f"the records name {len(heads)} tokenizers: {sorted(heads)}")
     term, report = json.loads(next(iter(heads))), {"unfitted": {}}
-    for kind in ("encode", "encode_batch", "decode"):
-        got = np.array([r[2:] for r in rows if r[1] == kind and r[3] > 0])
+    for kind in ("encode", "encode_batch", "decode", "segment"):
+        got = np.array([r[2:4] for r in rows if r[1] == kind and r[3] > 0])
+        chars = [r[4] for r in rows if r[1] == kind and r[3] > 0 and len(r) > 4]
         record = np.array([r[0] for r in rows if r[1] == kind and r[3] > 0])
         try:
             if not len(got):
                 raise ValueError(f"the records hold no lone {kind} call")
             x = np.column_stack([np.ones(len(got)), got[:, 0]])
-            coef, fitted = _host_law(x, got[:, 1], TOKENIZER_FEATURES)
+            if len(chars) == len(got) and None not in chars:
+                x = np.column_stack([x, chars])
+            coef, fitted = _host_law(x, got[:, 1], TOKENIZER_FEATURES[: x.shape[1]])
         except (ValueError, QhullError) as e:
             report["unfitted"][kind] = str(e)
             continue
         if coef[1] > 0:
             term[kind] = {"fixed_s": coef[0], "tokens_per_s": 1 / coef[1]}
+            if len(coef) > 2 and coef[2] > 0:
+                term[kind]["chars_per_s"] = 1 / coef[2]
+            elif kind == "segment":
+                lack = chars.count(None)
+                report["unfitted"]["segment.chars_per_s"] = (
+                    f"{lack} of {len(chars)} lone segment calls' records hold no "
+                    "compared_chars"
+                    if lack
+                    else "the records give no time per compared character"
+                )
         elif kind == "decode":
             term[kind] = {"fixed_s": coef[0], "tokens": _span(fitted, "tokens")}
         else:
@@ -477,6 +566,28 @@ def _lone_calls(calls: list[dict], intake) -> list[dict]:
     own = np.array([c["call"] != "decode" for c in calls])
     lone = (before < start) & (after > end) & (arrived == 0) & (flight <= own)
     return [c for c, k in zip(calls, lone) if k]
+
+
+def _own_work(calls: list[dict], intake) -> list[tuple[int, int | None, float]]:
+    """Each ``segment`` call among `calls` lone (`_lone_calls`) among the calls it
+    did not make, its thread's that start in its span, as the ids those returned,
+    the characters its stored-prefix search compared if its record holds them,
+    and its wall seconds less theirs."""
+    own, ids, made, last = {}, {}, set(), None
+    for c in sorted(calls, key=lambda c: (c["thread"], c["t_start_ns"])):
+        start, end = c["t_start_ns"], c["t_end_ns"]
+        if last and last["thread"] == c["thread"] and start < last["t_end_ns"]:
+            own[id(last)] -= end - start
+            ids[id(last)] += c["tokens"]
+            made.add(id(c))
+        elif c["call"] == "segment":
+            own[id(c)], ids[id(c)], last = end - start, 0, c
+    lone = _lone_calls([c for c in calls if id(c) not in made], intake)
+    return [
+        (ids[id(c)], c.get("compared_chars"), own[id(c)] * 1e-9)
+        for c in lone
+        if c["call"] == "segment"
+    ]
 
 
 def _intakes(path) -> tuple[list, list, list]:
@@ -696,19 +807,21 @@ def _hop_messages(intake: Path, client) -> dict:
     }
 
 
-def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
+def _host_law(x, y, names, offset=0.0, columns=()) -> tuple[list, dict]:
     """The host law on `names` over the forwards `x` labelled `y`, the part
     `offset` of each label fixed, and its report. Raises on too few forwards or
-    no hull; with the last feature in a fixed proportion to the one before on
-    every forward, the last gets zero."""
+    no hull; with the last of `names` in a fixed proportion to the one before on
+    every forward, it gets zero. Each of `columns`, (feature, values), follows."""
     x = np.array(x, dtype=np.float64).reshape(-1, len(names))
-    if len(x) <= len(names):
-        raise ValueError(f"{len(x)} forwards for {len(names)} coefficients")
+    if len(x) <= (k := len(names) + len(columns)):
+        raise ValueError(f"{len(x)} forwards for {k} coefficients")
     width = len(names)
     if np.linalg.matrix_rank(x[:, 1:]) < width - 1:
         width -= 1
         x[:, width] = 0.0
-    s = _solve(x, np.array(y), list(names), np.array(offset), names[0])
+    wide = np.column_stack([x, *(v for _, v in columns)])
+    names = [*names, *(f for f, _ in columns)]
+    s = _solve(wide, np.array(y), names, np.array(offset), names[0])
     hull = _hull(x[s["keep"]][:, 1:width], names[1:width])
     return s["coef"].tolist(), {
         "hull": hull,
@@ -718,11 +831,11 @@ def _host_law(x, y, names, offset=0.0) -> tuple[list, dict]:
     }
 
 
-def _jit(samples) -> set[tuple]:
+def _jit(samples, features=()) -> set[tuple]:
     """(run, rank, step) of each forward whose `W_launch` the fit of its kind
     drops above its law, a first-use JIT compile; on a decode, whose launch
     of a millisecond or so drops on host noise, only past `WARM_FACTOR` times
-    its price."""
+    its price. Each launch feature of `features` is a column of that fit."""
     jit = set()
     for kind in HOST_KINDS:
         members = [
@@ -730,16 +843,16 @@ def _jit(samples) -> set[tuple]:
             for s in samples
             if host_kind(s.view) == kind and s.host.get("W_launch", 0) > 0
         ]
-        if len(members) <= len(HOST_FEATURES):
+        if len(members) <= len(HOST_FEATURES) + len(features):
             continue
         x = np.array(
-            [(1, sum_tokens(m.view.requests), len(m.view.requests)) for m in members],
+            [(*_host_x(m), *(m.launch[f] for f in features)) for m in members],
             dtype=np.float64,
         )
-        if np.linalg.matrix_rank(x[:, 1:]) < 2:
+        if np.linalg.matrix_rank(x[:, 1:3]) < 2:
             x[:, 2] = 0.0
         y = np.array([m.host["W_launch"] for m in members])
-        solved = _solve(x, y, list(HOST_FEATURES))
+        solved = _solve(x, y, [*HOST_FEATURES, *features])
         floor = 1 / WARM_FACTOR - 1 if kind == "decode" else 0.0
         jit |= {
             (m.provenance["run"], m.rank, m.step)
@@ -747,6 +860,34 @@ def _jit(samples) -> set[tuple]:
             if not keep and r < floor
         }
     return jit
+
+
+def _launch_columns(members, features) -> tuple[list[str], dict]:
+    """The `features` host-law `members` (`_host_rows`) adopt as columns, in
+    order, and the report's `launch_columns`: each round's held-out error per
+    design tried (`_held_out_error`, each run held out). A round adds the
+    feature of least error while it is below the last design's. Members of one
+    run adopt none."""
+    if not features:
+        return [], {}
+    x = np.array([r[2] for r in members], dtype=np.float64).reshape(-1, 3)
+    if np.linalg.matrix_rank(x[:, 1:]) < 2:
+        x[:, 2] = 0.0
+    y, cell = np.array([r[3] for r in members]), np.array([r[4] for r in members])
+
+    def error(names):
+        values = [[r[5][f] for r in members] for f in names]
+        design = np.column_stack([x, *values])
+        return _held_out_error(_folds(design, y, cell, [*HOST_FEATURES, *names]))
+
+    adopted, rounds = [], [{"none": error([])}]
+    while rounds[0]["none"] is not None and len(adopted) < len(features):
+        last = min(rounds[-1].values())
+        rounds.append({f: error([*adopted, f]) for f in features if f not in adopted})
+        if not min(rounds[-1].values()) < last:
+            break
+        adopted.append(min(rounds[-1], key=rounds[-1].get))
+    return adopted, {"launch_columns": {"adopted": adopted, "held_out": rounds}}
 
 
 def _solve(
@@ -779,14 +920,17 @@ def _fit_form(
     falls. The passes end settled, the solve picking the rows it was solved
     on, or at a tie between ranks, when no step that moves some price by more
     than the square root of the float epsilon makes `F` fall; more than
-    `FIT_PASSES` passes in all raise. Steps whose residual is more than
+    `FIT_PASSES` passes in all raise. Each feature that differs between some
+    step's ranks is a start too, its axis scaled to the labels: the first
+    round runs from each start, every step kept, and the lowest `F` goes on.
+    Steps whose residual is more than
     `MAD_K` scaled MADs from the median are then dropped and the passes rerun
     from there, until the kept set settles or for `MAD_PASSES` rounds.
 
     Returns the solve's figures: `pick`, each step's rank, at a tie the rank
     of larger features (`priced_rank`, prices folded as a run folds them);
-    `passes`, the passes over every round, the last stop and `F`; and
-    `all_rows`, the centre and scaled MAD of the start's residuals.
+    `passes`, its start, the passes over every round, the last stop and `F`;
+    and `all_rows`, the centre and scaled MAD of the first start's residuals.
     """
     from scipy.optimize import nnls
 
@@ -820,17 +964,15 @@ def _fit_form(
     keep = np.ones(n, dtype=bool)
     c, cols = solve(a[real], np.broadcast_to(b[:, None], real.shape)[real])
     start = price(c).max(axis=1) - b
-    on, passes = real, 0
-    # Refitted until the kept set stops moving, so a step an outlier's pull
-    # dropped on the first pass comes back once the outlier is gone.
-    for rounds in range(1, MAD_PASSES + 1):
+
+    def alternate(c, cols, on, passes):
+        """Passes from `c` over the kept steps until settled or at a tie."""
         while True:
             pick = price(c).argmax(axis=1)
             picked = np.zeros_like(real)
             picked[steps, pick] = True
             if on is not None and (on[keep] == picked[keep]).all():
-                stop = "settled"
-                break
+                return c, cols, on, passes, "settled"
             if passes == FIT_PASSES:
                 raise ValueError(
                     f"the alternation on {names} still moved after {FIT_PASSES} passes"
@@ -845,9 +987,28 @@ def _fit_form(
                 while cost(c + t * d) >= f and t * moves > tol:
                     t /= 2
                 if t * moves <= tol:
-                    stop = "tie"
-                    break
+                    return c, cols, on, passes, "tie"
                 c, cols, on = c + t * d, solved, picked if t == 1 else None
+
+    # Each feature that differs between some step's ranks starts from its axis,
+    # scaled by the median of each step's label over its largest value of it.
+    starts = {"all_rows": (c, real)}
+    top = np.where(real[..., None], x, -np.inf).max(axis=1)
+    low = np.where(real[..., None], x, np.inf).min(axis=1)
+    for j in np.flatnonzero((top > low).any(axis=0)):
+        lit = top[:, j] > 0
+        axis = np.zeros(k)
+        axis[j] = np.median((y - offset)[lit] / top[lit, j])
+        starts[names[j]] = (axis, None)
+    # Each start's first round keeps every step; the lowest `F` wins.
+    ends = {s: alternate(c0, cols, on, 0) for s, (c0, on) in starts.items()}
+    first = min(ends, key=lambda s: cost(ends[s][0]))
+    c, cols, on, passes, stop = ends[first]
+    # Refitted until the kept set stops moving, so a step an outlier's pull
+    # dropped on the first pass comes back once the outlier is gone.
+    for rounds in range(1, MAD_PASSES + 1):
+        if rounds > 1:
+            c, cols, on, passes, stop = alternate(c, cols, on, passes)
         residual = price(c).max(axis=1) - b
         centre = np.median(residual)
         mad = 1.4826 * np.median(np.abs(residual - centre))
@@ -855,6 +1016,7 @@ def _fit_form(
         if (moved == keep).all() or rounds == MAD_PASSES:
             break
         keep, on = moved, None
+    pick = np.zeros(n, dtype=int)
     if width > 1:
         pick = [
             priced_rank(
@@ -874,7 +1036,7 @@ def _fit_form(
         "condition": float(np.linalg.cond(cols)),
         "zero": [names[j] for j in range(k) if j not in vary],
         "pick": np.asarray(pick),
-        "passes": {"count": passes, "stop": stop, "F": cost(c)},
+        "passes": {"start": first, "count": passes, "stop": stop, "F": cost(c)},
         "all_rows": {
             "centre": float(np.median(start)),
             "mad": float(1.4826 * np.median(np.abs(start - np.median(start)))),
@@ -895,6 +1057,13 @@ def _folds(design, y, cell, names) -> dict:
     return out
 
 
+def _held_out_error(folds: dict) -> float | None:
+    """`_folds`' held-out error: the mean of each record's held-out p50 error's
+    magnitude, weighted by its rows; None with no record held out."""
+    rows = sum(n for n, _ in folds.values())
+    return sum(n * abs(p) for n, p in folds.values()) / rows if rows else None
+
+
 def _moe_column(members, x, names, routing) -> tuple:
     """The MoE column decode rung `members` adopts, or None, and the figures the
     rule read, as the vector records them under `fit.moe_column`.
@@ -903,11 +1072,10 @@ def _moe_column(members, x, names, routing) -> tuple:
     forms are no column and each of `MOE_COLUMNS` over the steps' real MoE
     tokens, `moe_experts` under `routing` and with each step's group dummies
     as one token (`moe_column`). Each form is solved with each record
-    held out of the rung's rows, and its held-out error is the mean over the
-    records of the held-out p50 error's magnitude, weighted by the record's
-    steps. The form of smallest held-out error is picked, no column on a tie,
-    and a picked column is adopted, returned as (feature, column, solve). A
-    rung of one record has no held-out error and adopts none.
+    held out of the rung's rows, its held-out error `_held_out_error`'s. The
+    form of smallest held-out error is picked, no column on a tie, and a
+    picked column is adopted, returned as (feature, column, solve). A rung of
+    one record has no held-out error and adopts none.
     """
     cell = np.array([r[0] for r in members])
     y = np.array([r[3] for r in members])
@@ -917,12 +1085,8 @@ def _moe_column(members, x, names, routing) -> tuple:
         forms[feature] = (np.column_stack([x, column]), [*names, feature])
     held, error = {}, {}
     for form, (design, wide) in forms.items():
-        folds = _folds(design, y, cell, wide)
-        held[form] = folds
-        steps = sum(n for n, _ in folds.values())
-        error[form] = (
-            sum(n * abs(p) for n, p in folds.values()) / steps if steps else None
-        )
+        held[form] = _folds(design, y, cell, wide)
+        error[form] = _held_out_error(held[form])
     picked = min(error, key=error.get) if held["none"] else None
     adopted = None if picked in (None, "none") else picked
     figures = {
@@ -1480,16 +1644,15 @@ def host_held_out(samples) -> dict:
     for run in dict.fromkeys(s.provenance["run"] for s in samples):
         others = [s for s in samples if s.provenance["run"] != run]
         host = fit_host(others)[0]
-        laws, admit = host["laws"], host.get("admit")
+        admit = host.get("admit")
         mine = [s for s in samples if s.provenance["run"] == run]
         rows = [
-            (f"{kind} {segment}", c and float(np.dot(c, x)), seconds)
-            for kind, segment, x, seconds in _host_rows(mine)
-            for c in [laws.get(kind, {}).get(segment)]
+            (f"{kind} {segment}", _host_price(host, kind, segment, x, launch), seconds)
+            for kind, segment, x, seconds, _, launch in _host_rows(mine)
         ]
         rows += [
             ("admit E", admit and base + float(np.dot(admit, a)), e)
-            for a, base, e in _admit_rows(mine, laws)
+            for a, base, e in _admit_rows(mine, host)
         ]
         for band, price, seconds in rows:
             if seconds > 0:
@@ -1530,22 +1693,35 @@ def engine_config(records) -> dict:
     return held[0]
 
 
-def recorded_buckets(files) -> tuple[int, ...]:
-    """The prefill token-graph buckets the engine files `files` state
-    (`PREFILL_BUCKETS`), empty when none states any. Files stating two sets, or
-    some stating them and others not, refuse, naming each."""
+def stated_buckets(record) -> list | None:
+    """The prefill token-graph buckets the record `record` (`dp<r>.jsonl`) states:
+    its engine file's, else its host key's graph sets'; None where neither does."""
+    engine = Path(record).with_suffix(".engine.json")
+    raw = json.loads(engine.read_text()) if engine.exists() else {}
+    if PREFILL_BUCKETS in raw:
+        return raw[PREFILL_BUCKETS]
+    key = Path(record).with_suffix(".key.json")
+    graphs = launch_features.stated(key.exists() and json.loads(key.read_text()))[1]
+    return None if graphs is None else graphs["token"]["prefill"]
+
+
+def recorded_buckets(stated: dict) -> tuple[int, ...] | None:
+    """The prefill token-graph buckets `stated`, {where: buckets or None}, states,
+    None when none states any. Two sets, or some stating them and others not,
+    refuse, naming each."""
     held: dict = {}
-    for file in files:
-        buckets = json.loads(Path(file).read_text()).get(PREFILL_BUCKETS) or ()
-        held.setdefault(tuple(buckets), []).append(str(file))
+    for where, buckets in stated.items():
+        stated_as = None if buckets is None else tuple(buckets)
+        held.setdefault(stated_as, []).append(where)
     if len(held) > 1:
         raise ValueError(
-            "the engine files state other prefill buckets: "
+            "the records state other prefill buckets: "
             + "; ".join(
-                f"{list(b) or 'none'} in {', '.join(f)}" for b, f in held.items()
+                f"{'none' if b is None else list(b)} in {', '.join(f)}"
+                for b, f in held.items()
             )
         )
-    return next(iter(held), ())
+    return next(iter(held), None)
 
 
 def refuse_context_parallel(engine: dict, where: str) -> None:
@@ -1618,18 +1794,21 @@ def main(argv=None) -> None:
         ):
             raise ValueError(f"{record} is not fitted: {built}")
     owns = [Path(r).with_suffix(".engine.json") for r in args.records]
+    stated = {r: stated_buckets(r) for r in args.records}
     if args.engine:
         engine = keyed_of(json.loads(Path(args.engine).read_text()))
-        stated = [args.engine]
         for own in owns:
             raw = json.loads(own.read_text()) if own.exists() else {}
             held = keyed_of(raw)
             refuse_context_parallel(held, str(own))
             if differ := [k for k, v in held.items() if engine.get(k, v) != v]:
                 raise ValueError(f"{own} contradicts {args.engine} in {differ}")
-            stated += [own] * (PREFILL_BUCKETS in raw)
+        given = json.loads(Path(args.engine).read_text()).get(PREFILL_BUCKETS)
+        stated = {args.engine: given} | {
+            r: b for r, b in stated.items() if b is not None
+        }
     else:
-        engine, stated = engine_config(args.records), owns
+        engine = engine_config(args.records)
     dp = join_width(engine)
     options = {"form": args.form, "dp": dp, "moe_routing": args.moe_routing}
     options["buckets"] = recorded_buckets(stated)
@@ -1637,16 +1816,24 @@ def main(argv=None) -> None:
     for record, table in tables.items():
         step_labels.write_table(record, table)
     law, report = fit(samples, options)
+    if options["buckets"] is None:
+        law["unfitted"]["padding"] = NO_BUCKETS
     if any(s.provenance["config"] for s in samples):
         law["host"], law["host_fit"] = fit_host(samples)
     law["machine_spec"] = args.machine_spec
     law["engine_config"] = engine
     if "host" in law:
-        law["host"]["key"] |= {"machine_spec": args.machine_spec, "engine": engine}
+        stated = law["host"]["key"]["engine"]  # its graph sets stay
+        graphs = {k: v for k, v in stated.items() if k == launch_features.GRAPHS}
+        law["host"]["key"] |= {
+            "machine_spec": args.machine_spec,
+            "engine": engine | graphs,
+        }
     if len(args.records) > dp:
         mark_held_out(law, report, samples, options)
     Path(args.out).write_text(json.dumps(law) + "\n")
     print(f"cut: {json.dumps(law['cut'])}")
+    print(f"unfitted: {json.dumps(law['unfitted'])}")
     for name, vector in [("prefill", law.get("prefill"))] + list(law["decode"].items()):
         if vector:
             print(

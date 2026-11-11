@@ -13,8 +13,9 @@ roots: each point is planned once, on the rank its place in the walk names.
   tokens `ModelRunner.warmup_max_tokens` gives one forward, each one row, in
   rounds of one count a rank, from rank 0 up. A round that two-batch overlap
   would split leaves its last rank without a row, since a rank with no
-  prefill vetoes the split and a split step runs its halves, not the count. A
-  count past the longest prompt runs as several rows behind one parked decode.
+  prefill vetoes the split and a split step runs its halves, not the count;
+  at DP width 1 nothing vetoes it, and the count is planned split. A count
+  past the longest prompt runs as several rows behind one parked decode.
 - B: lockstep steps, one point a rank, its rows queued behind 1 to 16 parked
   decodes. Two rows whose first is 1 to 16 tokens long, so the second row's
   offset in the batch takes every residue mod 16, by every count of parked
@@ -44,9 +45,10 @@ or the workload's (no prompt longer than its longest). Whether two-batch
 overlap splits a step is ATOM's prefill rule over the step's ranks
 (`atom.compass.validate.bound._split`), under this process's
 ``ATOM_TBO_PREFILL_MIN_TOKENS`` and ``ATOM_TBO_PREFILL_TOKEN_SPLIT``, which
-must be the server's. A step-record line covers an A point when it is any
-rank's unsplit step of the point's token count, and a B point when its
-prefill rows are the point's, in batch order, and its split is the point's.
+must be the server's. A step-record line covers an unsplit A point when it
+is any rank's unsplit step of the point's token count, and any other point
+when its prefill rows are the point's, in batch order, and its split is the
+point's.
 """
 
 import itertools
@@ -94,9 +96,9 @@ class Point:
     row how the context before its query was computed: '' none, 'chunk' its
     own prompt's earlier chunks, 'prefix' another request sharing that many
     leading tokens of its prompt. `held` decodes, each a one-token prompt, are
-    parked on the rank before the step. `split` is None for an A point, whose
-    step two-batch overlap does not split, else whether it splits the B
-    point's step. `step` is the A round
+    parked on the rank before the step. `split` is None for an A point whose
+    step two-batch overlap does not split, True for one it splits at DP
+    width 1, and for a B point whether it splits the step. `step` is the A round
     or B step it is sent in. `body` is the sampling arguments every one of
     these requests sends.
     """
@@ -111,8 +113,8 @@ class Point:
 
 
 def key(point: Point) -> tuple:
-    """What a record line covers `point` by: an A point's token count, a B
-    point's split and rows."""
+    """What a record line covers `point` by: an unsplit A point's token
+    count, any other point's split and rows."""
     if point.split is None:
         return None, sum(q for q, _ in point.rows)
     return point.split, point.rows
@@ -217,9 +219,8 @@ def _rows(t: int, cap: int) -> tuple:
 
 def _splits(engine: dict, ranks: int, step) -> bool:
     """Whether two-batch overlap splits a step whose ranks, from 0 up, run
-    `step`'s rows, one rows tuple a rank, and the ranks past them none. At DP
-    width 1 no record line states a split, so none is planned."""
-    if not engine["enable_tbo"] or ranks == 1:
+    `step`'s rows, one rows tuple a rank, and the ranks past them none."""
+    if not engine["enable_tbo"]:
         return False
     lines = [{"rows": [(q, c, False) for q, c in rows]} for rows in step]
     return _split(lines + [{"rows": []}] * (ranks - len(lines))) is not None
@@ -248,9 +249,11 @@ def plan(engine, workload: dict, a_only: bool = False) -> list[Point]:
     counts = [(r, h) for r, h in counts if _fits(e, r, h)]
     points, step, i = [], 0, 0
     while i < len(counts):
-        n = ranks - _splits(e, ranks, [r for r, _ in counts[i : i + ranks]])
+        split = _splits(e, ranks, [r for r, _ in counts[i : i + ranks]])
+        # One rank has no peer to veto its split: the count runs split.
+        n, split = (ranks - split, None) if ranks > 1 else (1, split or None)
         points += [
-            Point(rank, r, ("",) * len(r), h, None, step, body)
+            Point(rank, r, ("",) * len(r), h, split, step, body)
             for rank, (r, h) in enumerate(counts[i : i + n])
         ]
         i, step = i + n, step + 1
@@ -337,7 +340,7 @@ def _chunks(design, b: int) -> int:
 def covered(points, steps: dict[int, list[dict]]) -> tuple[list, list]:
     """`points` split into those `steps` holds and those it lacks, each in
     order. `steps` is a record as `atom.compass.parity.read` gives it; a line
-    that is no DP dummy step holds the B point of its prefill rows and split, a
+    that is no DP dummy step holds the point of its prefill rows and split, a
     ``tbo_tokens`` field, and unsplit the A point of its prefill tokens."""
     ran = set()
     for lines in steps.values():

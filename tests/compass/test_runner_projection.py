@@ -52,7 +52,9 @@ STEPS = 20
 LADDER = [0, 1, 2, 4, 8]
 
 #: An attention builder that runs every decode from a graph, as ATOM's base does.
-GRAPHABLE = SimpleNamespace(step_needs_eager=lambda batch: False)
+GRAPHABLE = SimpleNamespace(
+    step_needs_eager=lambda batch: False, supports_token_graph=False
+)
 
 
 class Step(NamedTuple):

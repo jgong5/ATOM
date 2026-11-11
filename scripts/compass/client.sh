@@ -14,7 +14,8 @@
 #                    (default 1800)
 #   --stop           then SIGTERM the command that started the server, wait
 #                    WAIT_S (default 600) for it to write OUT/run.json and leave,
-#                    and set the export's server_stopped
+#                    a trace run's (OUT/trace) serve.TRACE_STOP_S more, and set
+#                    the export's server_stopped
 #   --sweep          in place of aiperf, send the JIT sweep of the cell the
 #                    server's engine and traces A to B make, then after the
 #                    stop keep the points its record covers in the server's
@@ -95,16 +96,25 @@ unset ATOM_COMPASS_RUN ATOM_COMPASS_CLOCK_ENDPOINT
 
 stop_server() {
     # The command that started the server is its parent.
-    local stat command deadline
+    local stat command deadline allow=${WAIT_S:-600} more
     stat=$(cat "/proc/$pid/stat" 2>/dev/null) || fail "stop: the server, process $pid, has left"
     read -r _ command _ <<<"${stat##*\) }"
     [[ $(tr '\0' ' ' <"/proc/$command/cmdline") == *compass* ]] ||
         fail "stop: process $command, the server's parent, is no compass command"
+    # A trace run's command first writes every rank's trace, which serve gives
+    # TRACE_STOP_S, then reduces them (parity.busy). With every profiler row
+    # kept, a 120 s V4.1-Flash TP4 trace run's command left about 11 min after
+    # SIGTERM: 178 s to export, 445 s to reduce (#3106).
+    if [[ -d $OUT/trace ]]; then
+        more=$(cd / && python3 -c 'from atom.compass.drive.serve import TRACE_STOP_S as s; print(s)') ||
+            fail "stop: cannot read serve's TRACE_STOP_S"
+        allow=$((allow + more))
+    fi
     kill -TERM "$command" || fail "stop: SIGTERM to process $command failed"
-    deadline=$((SECONDS + ${WAIT_S:-600}))
+    deadline=$((SECONDS + allow))
     # Until it has exited; a zombie has.
     while stat=$(cat "/proc/$command/stat" 2>/dev/null) && [[ ${stat##*\) } != Z* ]]; do
-        ((SECONDS < deadline)) || fail "stop: the command, process $command, is up ${WAIT_S:-600} s after SIGTERM"
+        ((SECONDS < deadline)) || fail "stop: the command, process $command, is up $allow s after SIGTERM"
         sleep 1
     done
     [[ -s $OUT/run.json ]] || fail "stop: the command left without writing $OUT/run.json"

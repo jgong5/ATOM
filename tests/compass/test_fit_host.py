@@ -104,6 +104,23 @@ def test_a_record_whose_server_built_an_aiter_module_refuses_naming_it(tmp_path)
     assert not (tmp_path / "store").exists()
 
 
+def test_a_record_whose_server_did_not_exit_refuses_naming_its_lines(tmp_path):
+    a = record(tmp_path / "a", 19)
+    stamped(a)
+    stamps = a / "steps" / compass_run.INTAKE_RECORD
+    local = tmp_path / "compass.intake.stamps.x"
+    stamps.rename(local)
+    stamps.with_name(stamps.name + compass_run.LOCAL).write_text(f"{local}\n")
+
+    named = (
+        f"{a}: its server did not exit, so steps/intake.stamps does not hold its "
+        f"lines; steps/intake.stamps.local names the file that holds them, {local}"
+    )
+    with pytest.raises(SystemExit, match=re.escape(named)):
+        fit(tmp_path, "fit host", a, *clients(a))
+    assert not (tmp_path / "store").exists()
+
+
 def test_records_with_pull_stamps_give_every_kind_an_E_out_law_a_run_prices(
     tmp_path, monkeypatch
 ):
@@ -168,6 +185,11 @@ ENCODES = [
     ("encode", 1, 40_000),
     ("encode_batch", 5, 20_000),
 ]
+#: The planted segment tokenizer term: the call's own work over the ids its
+#: encode_batch returned, half before that call and half after it.
+SEGMENT = (6e-4, 4e6)
+#: The two pool threads the lone requests' jobs alternate between.
+POOL = (3, 5)
 #: The planted intake terms, on the loop thread's CPU clock.
 IDLE, PER_BYTE, FIXED = 1.1e-3, 8.8e-9, 4.3e-3
 #: What the wall clock holds of an intake past its CPU time: GIL waits.
@@ -198,16 +220,27 @@ def stamped(
     recorded server writes. A lone request per body size in `lone`, its loop
     thread's CPU time `IDLE + PER_BYTE x bytes` and its wall that plus
     `WAIT`, besides `OTHERS` of others' work on the loop while its pool job runs,
-    its pool job holding its call of `encodes` and a decode after its
-    send, each timed at `rates`; then calls that do not run lone, ten times
-    slower, and one burst of `burst`'s body sizes, its templates
-    `FIXED + PER_BYTE x bytes` of the loop's CPU time apart."""
+    its pool job, on one `POOL` thread and then the other, holding its call of
+    `encodes`, an ``encode_batch`` inside a segment tokenizer call (one of
+    which another thread's decode overlaps), and a decode after its send, each
+    timed at `rates`; then calls that do not run lone, ten times slower, and one
+    burst of `burst`'s body sizes, its templates `FIXED + PER_BYTE x bytes` of
+    the loop's CPU time apart."""
     calls, lines = [], [_stamp("app", 10**12 + 5, 10**12 + 5)]  # a health probe
 
-    def call(kind, items, tokens, start, slow=1.0) -> int:
+    def call(kind, items, tokens, start, slow=1.0, thread=3, segment=True) -> int:
+        if kind == "encode_batch" and segment:
+            # The segment tokenizer's, inside its call on the same thread.
+            half = round(slow * (SEGMENT[0] + tokens / SEGMENT[1]) * 5e8)
+            end = call(kind, items, tokens, start + half, slow, thread, False) + half
+            calls.append(
+                {"call": "segment", "tokens": 3 * tokens, "items": 1, "thread": thread}
+                | {"t_start_ns": start, "t_end_ns": end}
+            )
+            return end
         end = start + round(slow * _seconds(rates, kind, items, tokens) * 1e9)
         calls.append(
-            {"call": kind, "tokens": tokens, "items": items, "thread": 3}
+            {"call": kind, "tokens": tokens, "items": items, "thread": thread}
             | {"t_start_ns": start, "t_end_ns": end}
         )
         return end
@@ -217,7 +250,11 @@ def stamped(
     for k, (size, encode) in enumerate(zip(sizes, encodes)):
         t += 10**9
         loop = round((IDLE + PER_BYTE * size) * 1e9) + OTHERS
-        done = call(*encode, t + 20_000)
+        # The pool runs the jobs on rotating threads.
+        done = call(*encode, t + 20_000, thread=POOL[k % 2])
+        if encode == ("encode_batch", 7, 90_000):
+            # Another thread's call inside the segment call's own work: not lone.
+            call("decode", 1, 2, t + 21_000, thread=4)
         lines += [
             _stamp("app", t, t, cpu=(cpu, cpu)),
             _stamp("recv", t + 1100, t + 1900, 0, (cpu + 1100, cpu + 1900)),
@@ -246,6 +283,9 @@ def stamped(
     lines += [_stamp("send", y + 3000, y + 4000)]
     call("decode", 1, 4, y + 10**6, slow=10)
     call("decode", 1, 4, y + 10**6 + 500, slow=10)
+    # A segment tokenizer call while another pool thread's encode runs.
+    call("encode", 1, 9000, y + 5 * 10**6, slow=10, thread=4)
+    call("encode_batch", 4, 30_000, y + 6 * 10**6, slow=10)
     t = y + 10**9
     gaps = [round((FIXED + PER_BYTE * size) * 1e9) for size in burst]
     cpus = cpu + np.cumsum([0] + gaps[1:])
@@ -298,12 +338,20 @@ def test_a_record_s_tokenizer_calls_and_intake_stamps_fit_the_entry_s_terms(
     )
     report = member(tmp_path / "store", host_laws_key(key), "report")
     assert not _unfitted(report) and report["http_intake"]["burst"]["requests"] == 4
-    # Only the lone calls are fitted: each lone request's encode and decode.
-    fitted = {k: report["tokenizer"][k] for k in ("encode", "encode_batch", "decode")}
+    # The segment tokenizer call's own work: its wall less its encode_batch's,
+    # over the ids that returned.
+    assert tok["segment"] == pytest.approx(
+        {"fixed_s": SEGMENT[0], "tokens_per_s": SEGMENT[1]}, rel=1e-3
+    )
+    # Only the lone calls are fitted: each lone request's encode and decode, and
+    # its segment tokenizer call, lone among the calls it did not make, those on
+    # its own thread: not the one another thread's decode overlaps.
+    fitted = {k: report["tokenizer"][k] for k in compass_run.TOKENIZER_KINDS}
     assert {k: v["samples"] + v["dropped"] for k, v in fitted.items()} == {
         "encode": 4,
         "encode_batch": 4,
         "decode": 8,
+        "segment": 4,
     }
     run_file(tmp_path, monkeypatch, host=host)
     assert compass_run.http_intake() == (
@@ -348,7 +396,7 @@ def test_the_intake_hull_spans_bodies_past_the_lone_requests_both_ways(tmp_path)
             {"http_intake": "0 forwards for 2 coefficients"}
             | {
                 f"tokenizer.{k}": f"the records hold no lone {k} call"
-                for k in ("encode", "encode_batch", "decode")
+                for k in compass_run.TOKENIZER_KINDS
             },
         ),
         (
@@ -377,8 +425,14 @@ def test_a_term_the_records_cannot_give_is_left_out_and_listed_unfitted(
 
 def _unfitted(report) -> dict:
     """The report's unfitted terms but the hops, which these records, with no
-    queue handoffs or client records, cannot give (`test_fit_hops.py`)."""
-    return {k: v for k, v in report["unfitted"].items() if k.split(".")[0] != "hops"}
+    queue handoffs or client records, cannot give (`test_fit_hops.py`), and the
+    segment term's search rate, which `stamped` records without
+    ``compared_chars`` cannot give."""
+    return {
+        k: v
+        for k, v in report["unfitted"].items()
+        if k.split(".")[0] != "hops" and k != "tokenizer.segment.chars_per_s"
+    }
 
 
 def test_the_tokenizer_fit_reports_each_record_s_residuals_apart(tmp_path):
@@ -401,3 +455,64 @@ def test_the_tokenizer_fit_reports_each_record_s_residuals_apart(tmp_path):
     assert report["decode"]["records"][str(paths[0])] == pytest.approx(
         [0, 0, 0], abs=1e-3
     )
+
+
+def test_the_segment_term_takes_what_its_stored_prefix_search_compared(tmp_path):
+    # Each lone segment tokenizer call's own work: per call, per id its
+    # encode_batch returned, and per character its stored-prefix search compared.
+    fixed, per_id, per_char = 6e-4, 1 / 4e6, 1 / 2.5e9
+    work = [(0, 0), (500, 4_000_000), (9000, 1_000_000), (120, 2_000_000)]
+    work += [(30_000, 0), (2000, 3_000_000), (64, 500_000)]
+    lines, t = [], 10**12
+    for ids, chars in work:
+        own = round((fixed + ids * per_id + chars * per_char) * 1e9)
+        batch = 1000 + 100 * ids if ids else 0
+        lines.append(
+            {"call": "segment", "tokens": 3 * ids + 10, "items": 1}
+            | {"compared_chars": chars, "thread": 3}
+            | {"t_start_ns": t, "t_end_ns": t + own + batch}
+        )
+        if ids:  # its encode_batch, inside it on its thread
+            start = t + own // 2
+            lines.append(
+                {"call": "encode_batch", "tokens": ids, "items": 2, "thread": 3}
+                | {"t_start_ns": start, "t_end_ns": start + batch}
+            )
+        t += 10**9
+    path, intake = tmp_path / "tokenizer.jsonl", tmp_path / "intake.stamps"
+    intake.write_text("")
+
+    def segment(lines):
+        path.write_text("".join(json.dumps(c) + "\n" for c in [TOKENIZER, *lines]))
+        term, report = fit_tokenizer([path], [intake])
+        return term["segment"], report["unfitted"].get("segment.chars_per_s")
+
+    assert segment(lines) == (
+        pytest.approx(
+            {"fixed_s": fixed, "tokens_per_s": 1 / per_id, "chars_per_s": 1 / per_char},
+            rel=1e-3,
+        ),
+        None,
+    )
+
+    # A call whose record lacks the characters keeps the term on ids alone,
+    # and the search rate is listed unfitted, naming how many lack them.
+    def without(lines, k):
+        cut = [c for c in lines if c["call"] == "segment"][:k]
+        return [
+            {n: v for n, v in c.items() if n != "compared_chars" or c not in cut}
+            for c in lines
+        ]
+
+    for k in (3, len(work)):
+        term, why = segment(without(lines, k))
+        assert set(term) == {"fixed_s", "tokens_per_s"}
+        assert (
+            why
+            == f"{k} of {len(work)} lone segment calls' records hold no compared_chars"
+        )
+    # Searches that compared nothing give the rate no time either.
+    zero = [c | {"compared_chars": 0} if c["call"] == "segment" else c for c in lines]
+    term, why = segment(zero)
+    assert set(term) == {"fixed_s", "tokens_per_s"}
+    assert why == "the records give no time per compared character"

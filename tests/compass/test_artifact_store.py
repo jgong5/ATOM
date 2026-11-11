@@ -132,7 +132,13 @@ def price_key(tp: int = 2, **layout: object) -> Key:
 
 
 def graph_key(structure: str = "qwen3-moe-48L") -> Key:
-    return Key.of(Kind.OP_GRAPH, structure=structure, shape="decode B=2")
+    return Key.of(
+        Kind.OP_GRAPH,
+        structure=structure,
+        shape="decode B=2",
+        source_root=ATOM_ROOT.revision,
+        torch="2.10.0+rocm7.2.4",
+    )
 
 
 def members_for(topology: Topology, stem: str, extension: str) -> dict[str, bytes]:
@@ -198,7 +204,7 @@ def test_a_model_name_with_a_separator_is_not_a_path():
     assert price_key().values["model"] == "Qwen/Qwen3-32B"
     for suspect in ("/abs/prices", "../prices", "prices.jsonl", pathlib.Path("p")):
         with pytest.raises(ArtifactRefusal):
-            Key.of(Kind.OP_GRAPH, structure=suspect, shape="decode B=2")
+            graph_key(suspect)
 
 
 def test_two_keys_never_share_a_directory(tmp_path):

@@ -18,6 +18,7 @@ import pytest
 from test_backend_step_roofline import MACHINE, ROOFLINE, STACK
 from test_op_graph import g
 from test_op_work import leaf, t
+from test_op_work_v4_attention import decode as v4_decode
 from test_work import SPEC
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
@@ -27,6 +28,7 @@ from atom.compass.backends.op_graph import DRAFT_KV, OpGraphBackend
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.step_roofline import CONTEXT, Module, StepRooflineBackend
 from atom.compass.backends.work import Work, price
+from atom.compass.bench.ops import signature
 from atom.compass.run.step_grid import BUCKETS
 from atom.compass.validate import bound
 
@@ -308,6 +310,40 @@ def test_each_measured_point_is_its_cold_time_over_its_leafs_price(tmp_path):
         text := bound.ops_text(r)
     )
     assert "2 priced above their measured time" in text
+
+
+FILL = "aten.index_fill_.int_Scalar"
+
+
+def test_a_point_keyed_by_its_signature_prices_as_its_leaf(tmp_path):
+    """A point's leaf is the `signature` `measure ops` keys it by, which sizes
+    no KV view of a kernel's along its pool: a kernel's work reads none, and
+    an aten operator over KV state, whose work reads the whole operand, keeps
+    it whole."""
+    rows = [[1, 300, True], [1, 9, True]]
+    attn = v4_decode(window_size=4, compress_ratio=4, index_topk=16)
+    state, index = t([10, 6], "torch.float32", role="kv"), t([2], "torch.int64")
+    fill = leaf(FILL, [[10, 6]], self=state, dim=0, index=index, value=0)
+
+    def priced(op):
+        view = BatchView(tuple(RequestShape(*r) for r in rows), produces_output=True)
+        return price(op_work.work(op, view, 1, "fp8"), SPEC) * 1e9
+
+    out = plan(
+        tmp_path,
+        [
+            point(op, "decode B=2", rows, 2 * priced(op)) | {"leaf": signature(op)}
+            for op in (attn, fill)
+        ],
+    )
+
+    r = bound.ops(out, SPEC, 1, "fp8")
+
+    assert r["refused"] == {}
+    assert {k: q["median"] for k, q in r["measured_over_analytical"].items()} == {
+        f"{attn['op']} decode": pytest.approx(2),
+        f"{FILL} decode": pytest.approx(2),
+    }
 
 
 def test_main_reports_an_ops_run_and_refuses_one_of_another_engine(

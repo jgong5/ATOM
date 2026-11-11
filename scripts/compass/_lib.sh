@@ -263,20 +263,33 @@ compass_pytest_counts() {
 }
 
 # compass_gpu_arch CARD: the GPU target of HIP ordinal CARD as torch reads it
-# (gfx942, gfx950), or nothing. The GPU gate keeps one baseline per target.
+# (gfx942, gfx950, gfx1250), or nothing. The GPU gate keeps one baseline per target.
 compass_gpu_arch() {
     HIP_VISIBLE_DEVICES=$1 python -c 'import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])' 2>/dev/null
 }
 
-# compass_gpu_skips DEVICE: sets SKIP_ARGS to an --ignore for each file
-# gpu_gate_skip.txt leaves out on DEVICE, torch's name for the first card, and
+# compass_gpu_skips TARGET: sets SKIP_ARGS to an --ignore for each file
+# gpu_gate_skip.txt leaves out on GPU target TARGET, the first card's, and
 # SKIP_N to the tests those files collect, run from the tree being measured. A
-# file it cannot count fails, SKIP_WHY naming it.
+# file under tests/compass goes to COMPASS_LEFT instead, uncounted: the gate
+# counts what tests/compass passes on the tree. The line `TARGET driver-run`
+# sets NO_DRIVER_RUN. A file it cannot count fails, SKIP_WHY naming it.
 compass_gpu_skips() {
     local gpu file n
-    SKIP_ARGS=() SKIP_N=0
+    SKIP_ARGS=() SKIP_N=0 COMPASS_LEFT=() NO_DRIVER_RUN=
     while read -r gpu file; do
-        [[ -n $1 && $1 == *"$gpu"* && -e $file ]] || continue
+        [ "$gpu" = "$1" ] || continue
+        if [ "$file" = driver-run ]; then
+            printf 'driver-run inputs: none on %s\n' "$gpu"
+            NO_DRIVER_RUN=1
+            continue
+        fi
+        [ -e "$file" ] || continue
+        if [[ $file == tests/compass/* ]]; then
+            printf 'left out on %s: %s\n' "$gpu" "$file"
+            COMPASS_LEFT+=("$file")
+            continue
+        fi
         n=$(python -m pytest "$file" --collect-only -q -p no:cacheprovider 2>&1 | sed -nE 's/^([0-9]+) tests? collected.*/\1/p')
         [ -n "$n" ] || { SKIP_WHY="cannot count the tests of $file, which gpu_gate_skip.txt leaves out on $gpu"; return 1; }
         printf 'left out on %s: %s (%s tests)\n' "$gpu" "$file" "$n"

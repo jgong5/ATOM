@@ -29,10 +29,12 @@ CSA top-k ids, which the bench draws on the device's generator, are not drawn,
 and its index buffer keeps the values ATOM prepared; no tensor
 equals another, so each placement clones its metadata; DeepSeek-V4.1's state
 cursors read back zeros and its check of them has no values to judge, as in
-a capture. OUT gets one record a leaf: its point, its verdict (`LAUNCH` with
+a capture; a host tensor allocated pinned, which a fake one cannot say it is,
+reads as pinned. OUT gets one record a leaf: its point, its verdict (`LAUNCH` with
 the kernels it launched, `REFUSED` with the reason, or `UNTOLD`, which a fake
 tensor's missing values stopped), the buffers its KV and metadata arguments
-bound, and each one's identity (`identity`).
+bound, each one's identity (`identity`), and that of each its later
+occurrences take apart (`later`, `ops.QUERIED`).
 """
 
 import contextlib
@@ -244,6 +246,8 @@ def _pageable(value) -> bool:
 
     if not torch.is_tensor(value) or value.device.type != "cpu":
         return False
+    if getattr(value, "pinned", False):  # allocated pinned (`main`'s `pinning`)
+        return False
     try:
         return not value.is_pinned()
     except RuntimeError:  # a fake host tensor holds no memory to ask
@@ -334,8 +338,10 @@ def main(out, argv) -> None:
     deep, prepare, time_ = ops._deep, ops.Stub._prepare, ops.Stub._time
     journal = ops._journal
     # by the id of each metadata view's clone, the live view it cloned; by
-    # leaf and slot, the identity and staged values of what placement 0 bound
-    sources, bound, seen = {}, {}, {}
+    # leaf and slot, the identity and staged values of what placement 0 bound;
+    # by leaf, and by slot, the identity of what its later occurrences take
+    # there (`ops.QUERIED`)
+    sources, bound, seen, later = {}, {}, {}, {}
 
     def cloning(x, memo, clones=None):
         out = deep(x, memo, clones)
@@ -356,6 +362,10 @@ def main(out, argv) -> None:
             spec = dict(ops._specs(stub.leaves[sig][0]["args"]))[path]
             if spec["role"] == "metadata" or str(live.dtype) in INTEGERS:
                 bound[sig, path] = identity(live, pool), values(live, hosts)
+        later.clear()  # none on a bench that binds every occurrence alike
+        for (_, sig, path), (_, view) in getattr(stub, "later", {}).items():
+            live = sources.get(id(view), (None, view))[1]
+            later.setdefault(sig, {})[path] = identity(live, pool)
 
     def timing(stub, op, sig, instances, n):
         held = {p: v for (s, p), (_, v) in bound.items() if s == sig and v}
@@ -372,7 +382,16 @@ def main(out, argv) -> None:
     def journaled(path, records):
         for r in records:
             r["identity"] = seen.get(r["leaf"], {})
+            r["later_identity"] = later.get(r["leaf"], {})
         return journal(path, records)
+
+    empty_strided = torch.empty_strided
+
+    def pinning(*args, pin_memory=False, **kwargs):
+        out = empty_strided(*args, pin_memory=pin_memory, **kwargs)
+        if pin_memory:  # a fake tensor cannot say it is
+            out.pinned = True
+        return out
 
     def launching(name):
         fn = function(name)  # found, or the leaf refuses
@@ -430,6 +449,7 @@ def main(out, argv) -> None:
             (triton_jit.JITFunction, "run", typed),
             (ops, "_deep", cloning),
             (ops, "_journal", journaled),
+            (torch, "empty_strided", pinning),
             (ops.Stub, "_prepare", preparing),
             (ops.Stub, "_time", timing),
             (ops, "uniform_ids", host_draw),
@@ -454,6 +474,7 @@ def main(out, argv) -> None:
             | {"verdict": state, "why": why, "kernels": kernels}
             | {"bound": r.get("metadata", {})}
             | {"identity": r.get("identity", {})}
+            | {"later": r.get("later_identity", {})}
         )
     pathlib.Path(out).write_text(json.dumps(records, indent=1))
 

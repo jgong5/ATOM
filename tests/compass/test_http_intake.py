@@ -68,6 +68,236 @@ def test_serve_stamps_a_body_read_off_the_socket_once_and_each_template(tmp_path
     assert all(int(r[0]) >= int(r[3]) for r in rows)
 
 
+#: A stand-in server that reads a body and renders a template, then prints
+#: what it opened meanwhile, whether STAMPS (its argument) exists and the file
+#: ``STAMPS.<pid>.local`` names, before it exits.
+LOCAL_SERVER = """
+import asyncio, builtins, glob, io, json, os, sys
+from starlette.requests import Request
+from .chat_encoders import apply_chat_template
+
+opened = []
+for owner in (builtins, io, os):
+    real = owner.open
+    owner.open = lambda f, *a, _real=real, **k: (opened.append(str(f)), _real(f, *a, **k))[1]
+
+async def main():
+    async def receive():
+        return {"type": "http.request", "body": b"x" * 1234}
+
+    await Request({"type": "http"}, receive).body()
+    apply_chat_template(None, None, [])
+
+if __name__ == "__main__":
+    stamps = sys.argv[1]
+    asyncio.run(main())
+    seen, named = list(opened), glob.glob(stamps + ".*.local")
+    local = [open(n).read().strip() for n in named]
+    print(json.dumps({"opened": seen, "exists": os.path.exists(stamps), "local": local}))
+"""
+
+
+def test_serve_writes_no_stamp_line_into_stamps_until_the_server_exits(tmp_path):
+    """On NFS a line written right after another waits for the first's round
+    trip; a served request's lines go to the host's own file system."""
+    server = SERVER | {"entrypoints/openai/api_server.py": LOCAL_SERVER}
+    for name, text in server.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    record, local = tmp_path / "record", tmp_path / "local"
+    record.mkdir()
+    local.mkdir()
+    stamps = record / "stamps"
+    done = subprocess.run(
+        [sys.executable, PROBE, "serve", stamps, stamps],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path), TMPDIR=str(local)),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    seen = json.loads(done.stdout)
+    # While it served, nothing under the record was opened and STAMPS held no
+    # line: they were in one file of the host's own.
+    assert not [p for p in seen["opened"] if Path(p).is_relative_to(record)]
+    assert not seen["exists"]
+    assert [Path(p).parent for p in seen["local"]] == [local]
+    # At its exit they are in STAMPS, and nothing else is left.
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    assert [(r[2], r[4]) for r in rows] == [("body", "1234"), ("tmpl", "6")]
+    assert [p.name for p in record.iterdir()] == ["stamps"]
+    assert not list(local.iterdir())
+
+
+#: A stand-in server that stamps a body and a template, then serves with
+#: uvicorn until a stop, touching READY (its argument) once it serves.
+SIGTERM_SERVER = """
+import asyncio, contextlib, pathlib, sys
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from .chat_encoders import apply_chat_template
+
+
+async def main():
+    async def receive():
+        return {"type": "http.request", "body": b"x" * 1234}
+
+    await Request({"type": "http"}, receive).body()
+    apply_chat_template(None, None, [])
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    pathlib.Path(sys.argv[1]).touch()
+    yield
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    uvicorn.run(Starlette(lifespan=lifespan), host="127.0.0.1", port=0, log_level="warning")
+"""
+
+
+def test_serve_stopped_by_sigterm_appends_its_lines_to_stamps(tmp_path):
+    """A stop SIGTERMs the server's process group. uvicorn takes the signal while
+    it serves, then raises it again, which by default ends the process before
+    any exit handler runs."""
+    import signal
+    import time
+
+    server = SERVER | {"entrypoints/openai/api_server.py": SIGTERM_SERVER}
+    for name, text in server.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    record, local, ready = tmp_path / "record", tmp_path / "local", tmp_path / "ready"
+    record.mkdir()
+    local.mkdir()
+    stamps = record / "stamps"
+    probe_server = subprocess.Popen(
+        [sys.executable, PROBE, "serve", stamps, ready],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path), TMPDIR=str(local)),
+        start_new_session=True,
+    )
+    try:
+        end = time.monotonic() + 120
+        while not ready.exists():
+            assert probe_server.poll() is None and time.monotonic() < end
+            time.sleep(0.1)
+        os.killpg(probe_server.pid, signal.SIGTERM)
+        probe_server.wait(timeout=120)
+    finally:
+        if probe_server.poll() is None:
+            os.killpg(probe_server.pid, signal.SIGKILL)
+    # It ends of the signal, as it did, and its lines are in STAMPS.
+    assert probe_server.returncode == -signal.SIGTERM
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    assert [(r[2], r[4]) for r in rows] == [("body", "1234"), ("tmpl", "6")]
+    assert [p.name for p in record.iterdir()] == ["stamps"]
+    assert not list(local.iterdir())
+
+
+#: Appends one server's lines to STAMPS as a stop does, once GO exists.
+APPEND = """
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import http_intake
+go, local, stamps, named = sys.argv[2:]
+open(local + ".waiting", "w").close()
+while not os.path.exists(go):
+    pass
+http_intake._append(local, stamps, named)
+"""
+
+
+def test_two_servers_stopping_at_once_append_every_line_whole(tmp_path):
+    """`parity_pd.sh` stops its prefill and decode servers, which share one
+    STAMPS, with one SIGTERM each, back to back."""
+    import time
+
+    stamps, go = tmp_path / "stamps", tmp_path / "go"
+    lines, appends = set(), []
+    for k in "ab":
+        local, named = tmp_path / f"{k}.stamps", tmp_path / f"stamps.{k}.local"
+        mine = [f"{k} {i} {'x' * (i % 97)}" for i in range(50_000)]
+        local.write_text("".join(f"{line}\n" for line in mine))
+        named.write_text(f"{local}\n")
+        lines |= set(mine)
+        argv = [PROBE.parent, go, local, stamps, named]
+        appends.append(
+            subprocess.Popen([sys.executable, "-c", APPEND, *map(str, argv)])
+        )
+    end = time.monotonic() + 120
+    while not all((tmp_path / f"{k}.stamps.waiting").exists() for k in "ab"):
+        assert time.monotonic() < end
+        time.sleep(0.01)
+    go.touch()
+    assert [p.wait(timeout=120) for p in appends] == [0, 0]
+    got = stamps.read_text().splitlines()
+    assert len(got) == len(lines) and set(got) == lines
+
+
+@pytest.mark.parametrize("held", ["nfs", "overlay"])
+def test_serve_refuses_a_temp_dir_on_a_network_file_system(tmp_path, held):
+    """A line written there right after another would wait for the first's
+    round trip, the wait the local file keeps out of the request's stages."""
+    for name, text in SERVER.items():
+        (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "atom" / name).write_text(text)
+    shared, temp = tmp_path / "shared", tmp_path / "tmp"
+    if held == "nfs":
+        temp = shared / "tmp"
+    temp.mkdir(parents=True)
+    table = tmp_path / "mountinfo"
+    root = f"upperdir={shared / 'upper'},workdir={shared / 'work'}"
+    table.write_text(
+        f"1 0 0:40 / / rw - {'overlay overlay' if held == 'overlay' else 'ext4 /dev/sdb2'}"
+        f" rw,{root if held == 'overlay' else 'relatime'}\n"
+        f"2 1 0:48 / {shared} rw,relatime - nfs 10.0.0.1:/home rw,vers=3\n"
+    )
+    # The probe's serve with its mount table read from TABLE.
+    run = (
+        "import sys; sys.path.insert(0, sys.argv[1]); import http_intake; "
+        "http_intake.MOUNTINFO = sys.argv[2]; http_intake.serve(sys.argv[3], [])"
+    )
+    stamps = tmp_path / "stamps"
+    done = subprocess.run(
+        [sys.executable, "-c", run, str(PROBE.parent), str(table), str(stamps)],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path), TMPDIR=str(temp)),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 1
+    assert done.stderr.startswith(
+        f"the stamp lines' temp directory {temp} is on nfs (10.0.0.1:/home)"
+    )
+    assert "set TMPDIR" in done.stderr
+    assert not stamps.exists() and not list(tmp_path.glob("stamps.*.local"))
+
+
+def test_a_reader_refuses_stamps_whose_server_did_not_exit_naming_its_lines(
+    tmp_path,
+):
+    stamps, local = tmp_path / "stamps", tmp_path / "http_intake.x.stamps"
+    stamps.write_text("1000 1 app 1000 0\n")
+    named = tmp_path / "stamps.4242.local"
+    named.write_text(f"{local}\n")
+    for verb in ("idle", "lone", "fit"):
+        done = subprocess.run(
+            [sys.executable, PROBE, verb, stamps],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert done.returncode == 1
+        assert done.stderr.strip() == (
+            f"{stamps}: the server that stamped into it did not exit, so its lines "
+            f"are not in it; {named} names the file that holds them, {local}"
+        )
+
+
 def test_a_cell_with_http_intake_runs_its_server_under_the_probe(tmp_path):
     # The script is executed as a program, as a user runs it, with a python3
     # stand-in that records the server's arguments and exits before it is ready.

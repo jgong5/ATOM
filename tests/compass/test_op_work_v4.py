@@ -4,8 +4,9 @@
 Each extractor matches a hand count on one shape, the MoE's in expectation
 under uniform routing; the whole attention as one leaf is refused by name;
 every leaf of the nightly DPA-TP8 captures, EP off and EP8, has work that
-prices, the attention's own kernels among them; and the op-level backend
-prices a V4-Pro decode step and a prefill step. Under `ATOM_USE_TRITON_MOE`
+prices, the attention's own kernels among them, and so does every leaf of a
+P/D side's, whose indexer cache is fp8; and the op-level backend prices a
+V4-Pro decode step and a prefill step. Under `ATOM_USE_TRITON_MOE`
 every leaf prices too, the experts at bf16 at EP off, fp8 at EP8, and fp4
 under `ATOM_USE_TRITON_MOE_A4W4`.
 """
@@ -18,7 +19,7 @@ from math import comb
 import pytest
 import test_capture_v4_pro
 from test_capture_ir import _ops
-from test_capture_v4_pro import DPA_TP8, EP8, SHAPES, capture
+from test_capture_v4_pro import DPA_TP8, EP8, FP8_QUERY, PRODUCER, SHAPES, capture
 from test_op_work import BF16, I32, ONE, _view, leaf, rows, t
 from test_work import machine
 
@@ -383,6 +384,24 @@ def test_v4_pro_s_moe_leaves_take_the_run_s_ep_width(tmp_path_factory):
         assert op["args"]["num_ep_ranks"] == 8
         assert [c.ranks for c in work(op, view, 1, "fp8", 8).comm] == [8]
         assert work(op, view, 1, "fp8", 1).comm == ()
+
+
+def test_every_leaf_of_a_v4_pro_p_d_side_prices_its_fp8_index_query(tmp_path_factory):
+    # P/D pins the indexer cache to fp8, whose query quant is a kind of its own.
+    graphs = capture(tmp_path_factory, "--width 2 --prefill 512 2" + DPA_TP8 + PRODUCER)
+    kinds = set()
+    for shape, (graph, _) in graphs.items():
+        view = _view(shape)
+        for op, _ in leaves(graph["region"]).values():
+            kinds.add(op["op"])
+            w = work(op, view, 1, "fp8")
+            assert w is None or price(w, SPEC) > 0, op["op"]
+
+        # Each capture's graph is its step's that samples.
+        backend = OpGraphBackend(SPEC, lambda *s, g=graph: g["region"], kv="fp8")
+        assert backend.price(replace(view, produces_output=True)).seconds > 0
+
+    assert FP8_QUERY in kinds
 
 
 @pytest.mark.parametrize(

@@ -161,7 +161,8 @@ RPC_SURFACE: dict[str, bool] = {
     "flush_pp_send": True,
     "poll_forward_metrics": False,  # EngineUtilityHandler does not wait
     # EngineCore.__init__ hands the reply to its Scheduler; ATOM's own reads the
-    # prefill token graphs recorded, and this runner records none.
+    # prefill token graphs recorded, which this runner states without recording
+    # (`state_prefill_buckets`).
     "prefill_token_graphs": True,
     # Refused by `RefusedDynamicChunking`: a fit needs timed real forwards.
     "profile_dynamic_chunking": True,  # EngineCore.__init__ reads the reply
@@ -338,6 +339,10 @@ class HostDeviceRecurrence:
     `compass_admitted`, adds what its admissions cost to its `E`, except on a
     pipeline stage that receives its input; None, a fit that priced them apart
     and fitted no law for them, and `device_end` refuses a forward that admits.
+    `columns[kind][segment]` prices launch features, a batch's `compass_launch`,
+    which its caller sets from `predicted`; `launch`, the provider and graph
+    sets predicting them, refuses a column naming a feature it lacks; a
+    pipeline stage refuses any column.
     """
 
     def __init__(
@@ -349,9 +354,22 @@ class HostDeviceRecurrence:
         mtp=False,
         sync=False,
         admit=ADMISSION_IN_E,
+        columns=None,
+        launch=(None, None),
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
-        self.admit = admit
+        self.admit, self.columns, self.launch = admit, columns or {}, launch
+        named = {f for v in self.columns.values() for c in v.values() for f in c}
+        if lacks := sorted(named - set(getattr(launch[0], "features", ()))):
+            raise ValueError(
+                f"the host laws adopt launch features {lacks}, which this model's "
+                f"launch provider, {type(launch[0]).__name__}, does not declare"
+            )
+        if self.columns and stage is not None:
+            raise ValueError(
+                "the host laws adopt launch columns, and a pipeline stage posts "
+                "its receive at a prepare end `pp_recv_posted` prices without them"
+            )
         ring = 2 if stage is None else stage[1]
         self.ends = collections.deque([-math.inf] * ring, maxlen=ring)  # n-ring..n-1
         self.last = None if stage is None else stage[0] == stage[1] - 1
@@ -398,6 +416,14 @@ class HostDeviceRecurrence:
         out = any(OUT_SEGMENT in v for v in self.laws.values())
         ran += (OUT_SEGMENT,) if out else ()
         missing = [f"{kind}.{s}" for s in ran if s not in {*law, *self.skip}]
+        features = getattr(batch, "compass_launch", None) or {}
+        columns = self.columns.get(kind, {})
+        missing += [
+            f"{kind}.{s}.{f}"
+            for s in ran
+            for f in columns.get(s, ())
+            if f not in features
+        ]
         a = getattr(batch, "compass_admitted", None)
         if self.admit is None and a and a[0] and not self.recv and "E" not in self.skip:
             missing.append("admit")
@@ -408,7 +434,8 @@ class HostDeviceRecurrence:
             raise CostRefused(kind, [Refusal("host", f"no law for {named}")])
         now = self.now()
         called, meta = getattr(batch, "compass_pp_host", (now, -math.inf))
-        prepared, self.segments = self.prepare_end(called, kind, x, self.admit_s(batch))
+        admit_s = self.admit_s(batch)
+        prepared, self.segments = self.prepare_end(called, kind, x, admit_s, features)
         self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)
@@ -423,6 +450,12 @@ class HostDeviceRecurrence:
         queued = launch_end if self.sync else self._exit(self.target_end)
         return max(self.target_end, queued) + draft_s
 
+    def predicted(self, view: Any) -> dict:
+        """A step's launch features by `launch`'s provider, from its
+        `BatchView` `view`; none where no law adopts a column."""
+        provider, graphs = self.launch
+        return provider.predict(view, graphs) if self.columns else {}
+
     def admit_s(self, batch: Any) -> float:
         """What `batch`'s admissions add to its `E`."""
         from atom.compass.backends.step_labels import admit_x
@@ -433,13 +466,19 @@ class HostDeviceRecurrence:
         return float(np.dot(self.admit, admit_x(a)))
 
     def prepare_end(
-        self, called: float, kind: str, x: tuple, admit_s: float = 0.0
+        self, called: float, kind: str, x: tuple, admit_s: float = 0.0, features=None
     ) -> tuple[float, dict]:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
-        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`."""
-        law = self.laws.get(kind, {})
+        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, and each column a segment
+        adopts prices `features`' value of its feature, 0 where absent."""
+        law, columns = self.laws.get(kind, {}), self.columns.get(kind, {})
+        features = features or {}
         seg = {
-            s: (float(np.dot(law.get(s, (0, 0, 0)), x)) + admit_s * (s == "E"))
+            s: (
+                float(np.dot(law.get(s, (0, 0, 0)), x))
+                + admit_s * (s == "E")
+                + sum(c * features.get(f, 0.0) for f, c in columns.get(s, {}).items())
+            )
             * (s not in self.skip)
             for s in SEGMENTS
         }
@@ -485,6 +524,34 @@ def schedulable_ladder(config: Any) -> list[int]:
     q = 1 + (spec.num_speculative_tokens if spec else 0)
     bound = min(config.max_num_seqs, config.max_num_batched_tokens // q)
     return sorted(s for s in config.capture_sizes if s <= bound)
+
+
+def state_prefill_buckets(runner: Any) -> tuple[int, ...]:
+    """State, recording none, the prefill token-graph buckets ATOM's capture
+    records (`ModelRunner._record_prefill_graphs`): `ATOM_TOKEN_GRAPH_SIZES`
+    up to `warmup_max_tokens`, when the attention builder
+    `supports_token_graph` and the runner is no disaggregated decode instance.
+    One `TokenGraph`, held on the runner, counts each among its prefill
+    recordings, so `TokenGraph.captured_sizes("prefill")` answers them, as
+    after a real capture: ATOM's `prefill_token_graphs` then has the scheduler
+    give a DP rank with no prefill of its own the group's dummy prefill, and
+    `ForwardMode.decide` pads a prefill step to its group's bucket. Returns
+    the buckets."""
+    builder = runner.attn_metadata_builder
+    if not builder.supports_token_graph or runner.config.disagg_is_decode:
+        return ()
+    from atom.utils import envs
+    from atom.utils.region_graph import TokenGraph
+
+    limit = runner.warmup_max_tokens()
+    graph = TokenGraph()
+    for n in envs.ATOM_TOKEN_GRAPH_SIZES:
+        if 0 < n <= limit:
+            # A recording's key is its tensor arguments' shapes, rows first.
+            graph._captured[("prefill", ((n,),))] = {"prefill"}
+    TokenGraph._sizes.clear()
+    vars(runner)["_prefill_token_graph"] = graph
+    return TokenGraph.captured_sizes("prefill")
 
 
 def _installed_backend(runner: Any) -> CostBackend:
@@ -1446,7 +1513,9 @@ class NonAllocatingRunner(
         `tbo_decode_graphs` is set as the base's capture sets it, so a decode
         the DP group splits replays where a real one does. An empty narrowed ladder is refused: ATOM's capture asserts
         on it, so that deployment never starts. The reply still sends `[]` for the batch sizes, since no
-        graph exists; the caller only formats it into a log line.
+        graph exists; the caller only formats it into a log line. The prefill
+        token-graph buckets the base's capture would record are stated
+        (`state_prefill_buckets`), so the scheduler and `decide` see them.
 
         `EngineCore.__init__` reaches this method only when `not enforce_eager
         and not disagg_is_decode`, so on an eager deployment the override never
@@ -1465,10 +1534,12 @@ class NonAllocatingRunner(
         self.tbo_decode_graphs = (
             self.config.enable_tbo_decode and not self._tr_hybrid_active()
         )
+        buckets = state_prefill_buckets(self)
         logger.info(
             "no cudagraph captured: there are no weights to trace; steps "
-            "dispatch on the ladder %s.",
+            "dispatch on the ladder %s and prefill token-graph buckets %s.",
             self.capture_sizes,
+            buckets,
         )
         return 0.0, [], 0
 
@@ -1730,6 +1801,8 @@ def _group_step_seconds(
             view = batch_view(batch, mode, runner, dummies)
         elif view.dp_rank is not None:
             view = dataclasses.replace(view, group_dummies=dummies)
+        if isinstance(host, HostDeviceRecurrence):
+            batch.compass_launch = host.predicted(view)
         cost = backend.price(view)
         if spec and not cost.draft_terms and EAGER_DP_DUMMY not in cost.treatments:
             name = type(backend).__name__

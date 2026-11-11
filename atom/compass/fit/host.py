@@ -13,7 +13,9 @@ intake stamps the recorded server wrote beside its steps
 (`step_linear_fit.fit_intake`); and from those stamps, the engine's queue
 handoffs and step lines, and the aiperf raw records beside each client run's
 export (`client_run.RAW`, gzipped or not), its ``hops``
-(`step_linear_fit.fit_hops`). A term the records cannot give, or a kind of
+(`step_linear_fit.fit_hops`). A record whose server did not exit refuses: its
+server's lines are where ``steps/<name>.local`` names (`atom.compass.run.LOCAL`),
+not in its steps. A term the records cannot give, or a kind of
 tokenizer call as ``tokenizer.<kind>`` or a hop as ``hops.<hop>``, is left out
 and its reason listed under the report's ``unfitted``. The host key gains the
 configuration's `machine_spec`, which a run's spec must match; the entry is
@@ -34,7 +36,7 @@ from atom.compass.backends.step_linear_fit import (
 )
 from atom.compass.fit import publish
 from atom.compass.parity.client_run import RAW
-from atom.compass.run import INTAKE_RECORD, TOKENIZER_RECORD
+from atom.compass.run import INTAKE_RECORD, LOCAL, TOKENIZER_RECORD
 from atom.compass.validate.runs import SIDES
 
 PROG = "compass fit host"
@@ -56,6 +58,14 @@ def host_laws(samples, records=(), client_runs=()) -> tuple[dict, dict]:
             "which the real runner writes beside its record; host laws are "
             "fitted on real runs only"
         )
+    for name in (TOKENIZER_RECORD, INTAKE_RECORD):
+        for r in records:
+            if (named := Path(r) / "steps" / (name + LOCAL)).is_file():
+                raise ValueError(
+                    f"{r}: its server did not exit, so steps/{name} does not hold "
+                    f"its lines; steps/{name + LOCAL} names the file that holds "
+                    f"them, {named.read_text().strip()}"
+                )
     host, report = fit_host(samples)
     stamped = [r for r in records if (Path(r) / "steps" / INTAKE_RECORD).is_file()]
     steps = [Path(r) / "steps" / INTAKE_RECORD for r in stamped]

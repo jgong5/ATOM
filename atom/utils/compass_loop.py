@@ -322,6 +322,9 @@ def charge(d: float) -> None:
 #: Whether this thread is inside a `wrap_encode` call, which charges the backend
 #: calls its ``encode`` makes.
 _in_encode = threading.local()
+#: The ids the ``encode_batch`` calls this thread charged returned, over which a
+#: segment tokenizer call's own work is charged.
+_encoded = threading.local()
 
 
 def _price(rate, tokens: int) -> float:
@@ -361,8 +364,22 @@ def wrap_encode_batch(encode_batch, one, several):
         encodings = encode_batch(*args, **kwargs)
         if not getattr(_in_encode, "on", False):
             tokens = sum(len(e.ids) for e in encodings)
+            _encoded.ids = getattr(_encoded, "ids", 0) + tokens
             charge(_price(one if len(encodings) == 1 else several, tokens))
         return encodings
+
+    return charged
+
+
+def wrap_segment(encode_cached, rate):
+    """The segment tokenizer call, charging its own work: `_price` of `rate`, a
+    ``tokenizer.segment``, over the ids its ``encode_batch`` calls returned."""
+
+    def charged(*args, **kwargs):
+        _encoded.ids = 0
+        got = encode_cached(*args, **kwargs)
+        charge(_price(rate, _encoded.ids))
+        return got
 
     return charged
 

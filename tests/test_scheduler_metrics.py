@@ -134,14 +134,12 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
     )
     sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(frames))
     monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
-    monkeypatch.setattr(
-        core.zmq,
-        "Poller",
-        lambda: SimpleNamespace(
-            register=lambda *a: None,
-            poll=lambda: [(sock, core.zmq.POLLIN)],
-        ),
+    poller = SimpleNamespace(
+        register=lambda *a: None, poll=lambda: [(sock, core.zmq.POLLIN)]
     )
+    # In the module's dict: `zmq_shim` serves `Poller` from its `__getattr__`,
+    # and a setattr's undo would leave pyzmq's class there for later tests.
+    monkeypatch.setitem(vars(core.zmq), "Poller", lambda: poller)
     engine = core.EngineCore.__new__(core.EngineCore)
     engine.label = "metrics-test"
     engine.input_queue = Queue()

@@ -110,7 +110,7 @@ def _setup(tmp_path):
                 f"atom/compass/artifacts/{name}": (artifacts / name).read_text()
                 for name in ("provenance.py", "rules.py")
             },
-            f"{COMPASS}/gpu_gate_skip.txt": "MI308X tests/test_stall.py\n",
+            f"{COMPASS}/gpu_gate_skip.txt": f"{ARCH} tests/test_stall.py\n",
             "torch/__init__.py": _torch(ARCH),
             "aiter/__init__.py": "raise RuntimeError('aiter was executed')\n",
             **suite,
@@ -176,7 +176,7 @@ def test_the_gate_passes_against_the_baseline_it_regenerates(tmp_path):
     gate = _run(tmp_path, root, f"{root / COMPASS}/gate_gpu.sh")
     assert gate.stdout.splitlines()[-1] == "GATE_GPU_RC=0 PASSED", gate.stdout
     assert "toolchain differs" not in gate.stdout
-    assert "left out on MI308X: tests/test_stall.py (3 tests)" in gate.stdout
+    assert f"left out on {ARCH}: tests/test_stall.py (3 tests)" in gate.stdout
 
 
 # id: (exit status, text the refusal carries, how the setup changes)

@@ -78,13 +78,39 @@ def model(tmp_path, *more):
     return ["--model", str(tmp_path), *more]
 
 
-@pytest.mark.parametrize("law", sorted(p.name for p in LAWS.glob("*.json")))
+#: Law files whose ``host.hops`` `compass fit host` fitted on their own records
+#: (#3036), which carry their cell's hops rather than node 18's.
+FITTED_HOPS = {"deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json"}
+
+
+@pytest.mark.parametrize(
+    "law", sorted(p.name for p in LAWS.glob("*.json") if p.name not in FITTED_HOPS)
+)
 def test_each_law_file_builds_the_lookaheads_a_run_charged_before(tmp_path, law):
     args = parsed(tmp_path, "--host-laws", str(LAWS / law))
 
     run = runfile.build(args, model(tmp_path))
 
     assert lookaheads(run) == pytest.approx(SINGLE)
+    assert None not in compass_run.hops(run).values()
+
+
+@pytest.mark.parametrize("law", sorted(FITTED_HOPS))
+def test_a_law_file_with_fitted_hops_builds_its_own_lookaheads(tmp_path, law):
+    hops = json.loads((LAWS / law).read_text())["host"]["hops"]
+    args = parsed(tmp_path, "--host-laws", str(LAWS / law))
+
+    run = runfile.build(args, model(tmp_path))
+
+    assert lookaheads(run) == pytest.approx(
+        {
+            "traffic->frontend:http": hops["admission_s"],
+            "frontend->traffic:stream": hops["stream_s"],
+            "frontend->engine:request#dp0": hops["ipc_s"],
+            "frontend->engine:control#dp0": hops["ipc_s"],
+            "engine->frontend:output#dp0": hops["ipc_out_s"],
+        }
+    )
     assert None not in compass_run.hops(run).values()
 
 

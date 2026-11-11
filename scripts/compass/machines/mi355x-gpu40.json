@@ -3,7 +3,7 @@
   "name": "mi355x-gpu40",
   "provenance": {
     "authored_by": "compass agent for jgong5",
-    "date": "2026-10-29",
+    "date": "2026-11-09",
     "origin": "mixed",
     "origins": {
       "device.name": {
@@ -36,31 +36,31 @@
       },
       "device.software_pinned_to.rocm": {
         "origin": "probed",
-        "model": "/shared/data/amd_int/models/DeepSeek-V4-Pro",
-        "width": 8,
-        "source_root": "commit:b71c071d3",
-        "record": "sha256:300adea69f618f9da5fd7258c927c14000b2f247a1bad8c02bd74928b62ce787"
+        "model": "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
+        "width": 4,
+        "source_root": "commit:d698ff75e",
+        "record": "sha256:2930e1e2345ffbffe41d6a7158c1deab9ea3a3c8f5d123752588d699209e6670"
       },
       "device.software_pinned_to.aiter": {
         "origin": "probed",
-        "model": "/shared/data/amd_int/models/DeepSeek-V4-Pro",
-        "width": 8,
-        "source_root": "commit:b71c071d3",
-        "record": "sha256:300adea69f618f9da5fd7258c927c14000b2f247a1bad8c02bd74928b62ce787"
+        "model": "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
+        "width": 4,
+        "source_root": "commit:d698ff75e",
+        "record": "sha256:2930e1e2345ffbffe41d6a7158c1deab9ea3a3c8f5d123752588d699209e6670"
       },
       "device.software_pinned_to.rccl": {
         "origin": "probed",
-        "model": "/shared/data/amd_int/models/DeepSeek-V4-Pro",
-        "width": 8,
-        "source_root": "commit:b71c071d3",
-        "record": "sha256:300adea69f618f9da5fd7258c927c14000b2f247a1bad8c02bd74928b62ce787"
+        "model": "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
+        "width": 4,
+        "source_root": "commit:d698ff75e",
+        "record": "sha256:2930e1e2345ffbffe41d6a7158c1deab9ea3a3c8f5d123752588d699209e6670"
       },
       "device.software_pinned_to.torch": {
         "origin": "probed",
-        "model": "/shared/data/amd_int/models/DeepSeek-V4-Pro",
-        "width": 8,
-        "source_root": "commit:b71c071d3",
-        "record": "sha256:300adea69f618f9da5fd7258c927c14000b2f247a1bad8c02bd74928b62ce787"
+        "model": "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
+        "width": 4,
+        "source_root": "commit:d698ff75e",
+        "record": "sha256:2930e1e2345ffbffe41d6a7158c1deab9ea3a3c8f5d123752588d699209e6670"
       },
       "device.memory.bandwidth_bytes_per_s": {
         "origin": "datasheet"
@@ -145,12 +145,13 @@
     },
     "fragments": [
       "device",
+      "stack",
       "datasheet",
       "assumed",
       "ptl",
       "peaks"
     ],
-    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at b71c071d3 | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples"
+    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at b71c071d3 | run.json's stack, one TP4 start at d698ff75e after aiter_c90842add0.sh | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples; its record ran aiter 41d4d8d7e, and every kernel it timed is byte-identical under 09d256420: aiter_c90842add0.sh rebuilds no module that holds one"
   },
   "device": {
     "name": "MI355X",
@@ -261,7 +262,7 @@
     "kernel_floor_s": 1.4669345021247865e-06,
     "software_pinned_to": {
       "rocm": "7.2.4",
-      "aiter": "41d4d8d7e",
+      "aiter": "09d256420",
       "rccl": "2.27.7",
       "torch": "2.10.0+rocm7.2.4.git3d3aa833"
     }

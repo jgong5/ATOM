@@ -21,6 +21,7 @@ the run, and the next client binds the same LP.
 
 A `KeyError` or `ValueError` from the authority refuses the request: the
 requester's `recv` raises it as the same type, and the server goes on serving.
+A ``REPORT`` waits for no reply, so its refusal ends the run as below.
 A `ClockAbort`, such as `BackdatedEvent`, ends the run: its refusal goes to
 every bound address's slot, waiting or not, and answers every later request.
 Any other exception from the authority, or while framing a reply, ends the run
@@ -57,6 +58,7 @@ from .wire import (
     GRANT,
     REFUSALS,
     REFUSED,
+    REPORT,
     REQUESTS,
     MalformedMessage,
     decode,
@@ -176,6 +178,8 @@ class _Server:
                             lp, kind, t, log, t_daemon, member, *steps_ahead_rounds
                         )
                     except (KeyError, ValueError) as refused:
+                        if kind == REPORT:
+                            raise  # its sender reads no refusal
                         replies = [(address, encode(_refusal(refused)))]
                     else:
                         # Outside the refusing branch: a grant that cannot be

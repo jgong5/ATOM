@@ -20,11 +20,13 @@ from .nodes import (
     Seq,
     Tensor,
 )
+from .shapes import G, Symbol
 
 __all__ = [
     "Affine",
     "Applicability",
     "ContextRef",
+    "G",
     "Graph",
     "JoinPolicy",
     "ModuleRef",
@@ -35,5 +37,6 @@ __all__ = [
     "Repeat",
     "Role",
     "Seq",
+    "Symbol",
     "Tensor",
 ]

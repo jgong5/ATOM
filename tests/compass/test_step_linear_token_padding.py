@@ -309,9 +309,8 @@ def test_fit_steps_refuses_records_of_which_only_some_state_buckets(tmp_path):
 def test_a_record_states_the_prefill_buckets_its_runner_recorded(tmp_path, monkeypatch):
     monkeypatch.setenv("ATOM_COMPASS_PARITY_RECORD", str(tmp_path / "none"))
     path = parity_record(SimpleNamespace(rank=0, config=_config())).path
-    assert "prefill_buckets" not in json.loads(
-        path.with_suffix(".engine.json").read_text()
-    )
+    engine = json.loads(path.with_suffix(".engine.json").read_text())
+    assert engine["prefill_buckets"] == []
 
     monkeypatch.setattr(TokenGraph, "captured_sizes", lambda phase=None: (256, 512))
     monkeypatch.setenv("ATOM_COMPASS_PARITY_RECORD", str(tmp_path / "some"))

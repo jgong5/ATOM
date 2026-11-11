@@ -38,8 +38,10 @@ def fragment(
     name: str, found: dict, peaks: dict, author: str, date: str, subject: dict
 ) -> dict:
     """The fragment `readings` make on machine `name`, whose spec-peak numbers
-    `peaks` holds by path, every field probed on `subject`."""
+    `peaks` holds by path, every field probed on `subject`; a banded field
+    the readings lack, as a record taken before its probe does, is left out."""
     curve = found["bandwidth_curve"]
+    banded = [path for path in BANDED if path in found]
     values = {
         **{
             f"device.compute.derate.{f}": found[f] / peaks[f"device.compute.{peak}"]
@@ -51,10 +53,10 @@ def fragment(
         / peaks["device.memory.bandwidth_bytes_per_s"],
         "interconnect.intra_node.derate": found["link"]
         / peaks["interconnect.intra_node.link_bandwidth_bytes_per_s"],
-        **{path: found[path][0] for path in BANDED},
+        **{path: found[path][0] for path in banded},
     }
     origins = {path: {"origin": "probed", **subject} for path in values}
-    for path in BANDED:
+    for path in banded:
         origins[path] |= {"p10": found[path][1], "p90": found[path][2]}
     document = {
         "schema_version": 1,

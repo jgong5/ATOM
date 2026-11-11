@@ -155,23 +155,58 @@ def test_a_law_stating_key_refuses_by_name():
         StepLinearLaw(dict(law(), key=[8, 1]))
 
 
-@pytest.mark.parametrize("cap", [20, 4, 3])
+@pytest.mark.parametrize("cap", [20, 7, 6])
 def test_the_fit_records_its_passes_and_a_cap_reached_refuses_it(
     tmp_path, monkeypatch, cap
 ):
+    """Rung 4 settles in 4 passes from every rank's row, the start that goes
+    on; a start from a feature's axis takes 7, and its cap refuses the fit."""
     from atom.compass.backends import step_linear_fit
 
     monkeypatch.setattr(step_linear_fit, "FIT_PASSES", cap)
     records = _records(tmp_path, _groups(0))
-    if cap < 4:
-        with pytest.raises(ValueError, match="still moved after 3 passes"):
+    if cap < 7:
+        with pytest.raises(ValueError, match="still moved after 6 passes"):
             _fit(records, dp=DP)
         return
     law_ = _fit(records, dp=DP)
     assert law_["prefill"]["fit"]["passes"]["count"] == 1
     passes = law_["decode"]["4"]["fit"]["passes"]
-    assert (passes["count"], passes["stop"]) == (4, "settled")
+    assert (passes["start"], passes["count"], passes["stop"]) == (
+        "all_rows",
+        4,
+        "settled",
+    )
     assert passes["F"] == pytest.approx(0.0, abs=1e-20)
+
+
+#: Two ranks' (context, graph_padding) in units of 800 tokens, six steps
+#: labelled by `DECODE`, on which the alternation from the fit on every rank's
+#: row settles with `context` near zero.
+CORNER = (
+    ((2, 3), (9, 5)),
+    ((9, 4), (8, 3)),
+    ((8, 9), (1, 2)),
+    ((9, 1), (1, 3)),
+    ((8, 4), (8, 4)),
+    ((1, 1), (8, 3)),
+)
+
+
+def test_a_fit_that_settles_from_every_rank_s_row_above_a_feature_s_start_goes_on_from_that_start(
+    tmp_path,
+):
+    """From the fit on every rank's row the alternation settles at `F` above
+    zero; from the `context` axis it reaches the per-rank law."""
+    groups = []
+    for ranks in CORNER:
+        views = [_decode_step(8, 800 * c, 800 * p) for c, p in ranks]
+        groups.append((views, max(_price(v) for v in views)))
+
+    vector = _fit(_records(tmp_path, groups), dp=2)["decode"]["8"]
+    assert vector["coefficients"] == pytest.approx(DECODE, rel=1e-6)
+    assert vector["fit"]["passes"]["start"] == "context"
+    assert vector["fit"]["passes"]["F"] == pytest.approx(0.0, abs=1e-20)
 
 
 #: A rank's wide rows and another's one tall row cost about the same.
@@ -404,19 +439,24 @@ def test_a_stated_engine_file_contradicting_the_records_own_refuses(tmp_path):
 COMPASS = Path(__file__).resolve().parents[2] / "scripts" / "compass"
 GPU45 = json.loads((COMPASS / "machines" / "mi355x-gpu45.json").read_text())
 CRS005 = json.loads((COMPASS / "machines" / "mi355x-crs005.json").read_text())
-#: Each DeepSeek-V4-Pro EP8 law pair's file stem and the spec it was fitted under.
+#: Each DeepSeek-V4-Pro EP8 law pair's file stem, the spec it was fitted under and
+#: the index cache dtype it is keyed to: the fp4 gpu-40's lone servers ran, the fp8
+#: a P/D side resolves.
 EP8_PAIRS = [
     pytest.param(
-        "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661", GPU45, id="gpu45"
+        "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661",
+        GPU45,
+        "fp4",
+        id="gpu45",
     ),
-    pytest.param("deepseek-v4-pro-dpa8-ep8-mi355x-crs005", CRS005, id="crs005"),
+    pytest.param("deepseek-v4-pro-dpa8-ep8-mi355x-crs005", CRS005, "fp8", id="crs005"),
 ]
 
 
 @pytest.mark.parametrize("side", ["prefill", "decode"])
-@pytest.mark.parametrize("stem,spec", EP8_PAIRS)
-def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
-    monkeypatch, tmp_path, stem, spec, side
+@pytest.mark.parametrize("stem,spec,index", EP8_PAIRS)
+def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off_or_the_other_indexer(
+    monkeypatch, tmp_path, stem, spec, index, side
 ):
     fitted = json.loads((COMPASS / "laws" / f"{stem}-{side}.json").read_text())
     engine = fitted["engine_config"]
@@ -427,11 +467,11 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
     run = _without_step_stub(tmp_path, step_linear=fitted, machine=spec)
     monkeypatch.setenv(compass_run.ENV, str(run))
 
-    def installed(ep):
+    def installed(ep, index=index):
         r = deployment(
             tmp_path,
             **{k: engine[k] for k in ("kv_cache_block_size", "kv_cache_dtype")},
-            index_cache_dtype=engine.get("index_cache_dtype"),
+            index_cache_dtype=index,
             quant_config=SimpleNamespace(compute_hash=lambda: engine["quantization"]),
             parallel_config=SimpleNamespace(
                 data_parallel_size=8, data_parallel_rank=0, pipeline_parallel_rank=0
@@ -452,6 +492,8 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
         ValueError, match="enable_expert_parallel True in the law and False here"
     ):
         installed(False)
+    with pytest.raises(ValueError, match="another engine config: index_cache_dtype"):
+        installed(True, {"fp4": "fp8", "fp8": "fp4"}[index])
 
 
 def _inside(hull: dict, features: tuple) -> dict:

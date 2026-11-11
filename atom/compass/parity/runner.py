@@ -9,7 +9,12 @@ import time
 
 import torch
 
-from atom.compass.parity import StepRecording, key_memory_formats_by_name, record_step
+from atom.compass.parity import (
+    StepRecording,
+    blocked,
+    key_memory_formats_by_name,
+    record_step,
+)
 from atom.compass.run import host_key
 from atom.model_engine.model_runner import ModelRunner, RapidServeModelRunner
 
@@ -17,12 +22,14 @@ key_memory_formats_by_name()
 
 
 class _Recording(StepRecording):
-    """`StepRecording` on this worker's clocks, with the host key read at startup."""
+    """`StepRecording` on this worker's clocks, with the host key read at
+    startup, and the blocking-call tool where HIP's initialization loaded it."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Read once at startup, so no forward pays for it.
         self.host_key = host_key(self.config)
+        self._blocked = blocked.loaded()
 
     @staticmethod
     def step_clock_ns() -> int:

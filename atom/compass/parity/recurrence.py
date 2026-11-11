@@ -60,6 +60,7 @@ from atom.compass.backends import (
     CostRefused,
     StepLinearBackend,
     StepLinearLaw,
+    launch_features,
     step_labels,
 )
 from atom.compass.backends.shape import sum_tokens
@@ -295,11 +296,13 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     device time, target then draft, by `law`'s step linear law
     (`StepLinearBackend` on its `step_labels` sample's view, from `samples`),
     and its host segments by the law's host laws, `law["host"]["laws"]`, its
-    `E` with what its admissions cost (`law["host"]["admit"]`), graded
-    against the same measured period. After each forward the engine
+    `E` with what its admissions cost (`law["host"]["admit"]`), and its
+    launch columns (`law["host"]["columns"]`) on the features its sample's view
+    predicts under the host key's graph sets, graded against the same
+    measured period. After each forward the engine
     runs its `E_out` before the next call. An idle forward's `E`, the first's
     too, stays measured from the last pull or exit, admissions and all: it
-    holds the wait for an arrival, which no law prices. Steps in `warm` are charged and not graded,
+    holds the wait for an arrival, which no law or column prices. Steps in `warm` are charged and not graded,
     as is a forward whose period ran more than `WARM_FACTOR` times its charge,
     a one-off first touch the laws do not price; so are steps the law
     refuses, charged 0 s of device time as a run charges them and counted per
@@ -313,28 +316,40 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     clock, exit_, out_s, prev, rows, refused = [0.0], 0.0, 0.0, None, [], {}
     apart, uncharged = {*jit, *(n + 1 for n in jit)}, 0.0
     admit = law["host"].get("admit", ADMISSION_IN_E)
-    rec = HostDeviceRecurrence({}, (), lambda: clock[0], mtp=mtp, admit=admit)
+    columns = law["host"].get("columns") or {}
+    launch = launch_features.stated(law["host"].get("key"))
+    rec = HostDeviceRecurrence(
+        {}, (), lambda: clock[0], mtp=mtp, admit=admit, columns=columns, launch=launch
+    )
     kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
     admits = step_labels.admissions(steps)
     for s, kind, admitted in zip(steps, kinds, admits):
         if (view := views.get(s["step"])) is None:
             raise ValueError(f"step {s['step']} has no labelled sample to price")
-        rec.laws = hosts
+        rec.laws, rec.columns = hosts, columns
         last = prev["t_exit_ns"] if prev else s["t_enter_ns"]
         if kind == "idle":
             pull = prev.get("t_pull_ns", last) if prev else last
             e = [(s["t_enter_ns"] - pull) * 1e-9, 0, 0]
             rec.laws = {k: {**v, "E": e} for k, v in hosts.items()}
+            rec.columns = {
+                k: {g: c for g, c in v.items() if g != "E"}
+                for k, v in rec.columns.items()
+            }
         batch = SimpleNamespace(
             total_tokens_num=sum_tokens(view.requests),
             total_seqs_num=len(view.requests),
             total_seqs_num_prefill=len(view.prefill),
             produces_output=lambda out=s["produces_output"]: out,
             compass_admitted=None if kind == "idle" else admitted,
+            compass_launch=rec.predicted(view),
         )
         clock[0] = exit_ + out_s
         shape = forward_shape(batch)
-        queued = rec.ends[1] - rec.prepare_end(clock[0], *shape, rec.admit_s(batch))[0]
+        prepared = rec.prepare_end(
+            clock[0], *shape, rec.admit_s(batch), batch.compass_launch
+        )
+        queued = rec.ends[1] - prepared[0]
         graded = s["step"] not in {*warm, *apart}
         try:
             cost = backend.price(view)

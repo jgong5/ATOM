@@ -92,7 +92,7 @@ def test_a_leaf_a_price_list_leaves_to_the_roofline_keeps_its_parts():
 
 def test_a_listed_price_and_an_overlapped_step_hold_no_part():
     listed = backend(g(2, 64, 64), price_list=FLAT).price(DECODE)
-    tbo = OpGraphBackend(SECOND, lambda *shape: layers(), kv="bf16").price(SPLIT)
+    tbo = OpGraphBackend(SECOND, lambda *shape, **_: layers(), kv="bf16").price(SPLIT)
     split = BatchView(
         (RequestShape(4, 4, False), RequestShape(3, 10, False)),
         produces_output=True,

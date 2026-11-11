@@ -24,6 +24,7 @@ import pytest
 from test_drive_identity import GIT
 from test_drive_record import planted_gpu  # noqa: F401
 from test_parity_record import _config, _Runner
+from test_tbo_forward_mode import ModelRunner
 
 from atom.compass import cli
 from atom.compass.drive import sweep, sweep_plan
@@ -43,14 +44,21 @@ BUDGET = 256
 
 
 @pytest.fixture
-def paced():
+def paced(request):
     """A process whose environment is the one `compass record --sweep` gives
-    the server of ATOM's default arguments."""
-    env = os.environ | sweep.pacing([])
+    the server of ATOM's default arguments, and any variables the test adds."""
+    env = os.environ | sweep.pacing([]) | getattr(request, "param", {})
     sleeper = [sys.executable, "-c", "import time; time.sleep(600)"]
     with subprocess.Popen(sleeper, env=env) as process:
         yield process.pid
         process.kill()
+
+
+class _TboRunner(_Runner):
+    """The simulated runner, with `ModelRunner`'s own answer to whether a step
+    can split for two-batch overlap."""
+
+    _local_tbo_eligibility = ModelRunner._local_tbo_eligibility
 
 
 class Engine:
@@ -58,11 +66,11 @@ class Engine:
     with the PrefillDelayer `compass record --sweep` sets unless not `delayer`.
     Each group of rows reaches it a step after the one before."""
 
-    def __init__(self, directory, monkeypatch, delayer=True):
+    def __init__(self, directory, monkeypatch, delayer=True, tbo=False):
         monkeypatch.setenv(ENV, str(directory))
-        config = _config(budget=BUDGET, enable_prefix_caching=True)
-        config.max_num_seqs = 32
-        self.scheduler, self.runner = Scheduler(config), _Runner(config)
+        config = _config(budget=BUDGET, enable_prefix_caching=True, enable_tbo=tbo)
+        config.max_num_seqs, config.prefill_context_parallel_size = 32, 1
+        self.scheduler, self.runner = Scheduler(config), _TboRunner(config)
         if delayer:
             self.scheduler.set_prefill_delayer(
                 PrefillDelayer(
@@ -110,12 +118,12 @@ class Engine:
         pass
 
 
-def _round(tmp_path, monkeypatch, k, library, pid, delayer=True):
+def _round(tmp_path, monkeypatch, k, library, pid, delayer=True, tbo=False):
     out = tmp_path / f"round{k}"
     out.mkdir()
     server = {"url": "", "library": str(library), "pid": pid}
     (out / "server.json").write_text(json.dumps(server))
-    engine = Engine(out / "steps", monkeypatch, delayer)
+    engine = Engine(out / "steps", monkeypatch, delayer, tbo)
     sent = send(out, WORKLOAD, engine)
     return sent, cover(out), engine
 
@@ -152,6 +160,28 @@ def test_rounds_send_the_steps_still_missing_until_the_cell_is_swept(
     sent, missing, engine = _round(tmp_path, monkeypatch, 3, library, paced)
     assert (sent, missing) == ([], [])
     assert [len(b["prompt_token_ids"]) for b in engine.sent] == [1]
+
+
+@pytest.mark.parametrize(
+    "paced", [{"ATOM_TBO_PREFILL_MIN_TOKENS": "128"}], indirect=True
+)
+def test_one_rank_under_tbo_runs_each_count_past_the_minimum_split_and_says_so(
+    tmp_path, monkeypatch, paced
+):
+    monkeypatch.setattr(sweep_plan, "SLOTS", 4)
+    monkeypatch.setattr(sweep_plan, "PARKED_TOKENS", 32)
+    # `send` copies the server's TBO variables into this process.
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "128")
+    monkeypatch.delenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", raising=False)
+    library = tmp_path / "library"
+    planned, missing, _ = _round(tmp_path, monkeypatch, 1, library, paced, tbo=True)
+    # A group of one has no peer to veto a split: A's counts from the minimum
+    # are planned split, and the record states each split, so one round
+    # covers every point.
+    a = planned[:BUDGET]
+    assert [sum(q for q, _ in p.rows) for p in a] == list(range(1, BUDGET + 1))
+    assert [p.split for p in a] == [None] * 127 + [True] * (BUDGET - 127)
+    assert any(p.split for p in planned[BUDGET:]) and missing == []
 
 
 def test_a_steps_requests_park_decodes_reuse_prefixes_and_fill_before_a_cut():

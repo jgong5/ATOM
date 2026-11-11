@@ -188,14 +188,22 @@ if [ "$TORCH" != "$BASE_TORCH" ] || [ "$ROCM" != "$BASE_ROCM" ] || [ "$AITER" !=
     printf '         re-measured on this stack with regen_gpu_gate_baseline.sh.\n' >&2
 fi
 
+# gpu_gate_skip.txt, read for the first card's target: the files whose result
+# there its pair cannot record, the kinds listed in that file's header, and
+# whether that target's nodes hold the driver-run inputs below. Each file is
+# left out of its run, and a suite file's collected tests come off the
+# expectation.
+compass_gpu_skips "$ARCH" || finish 1 "$SKIP_WHY"
+
 # The driver-run tests start ATOM's own servers on the simulated clock. Each
 # skips without its inputs, and a skip is not a failure, so a gate that does not
 # set them passes without running them. On a tree whose tests read the slice
 # model, every input is set here, by default to node 18's, and a missing one
-# refuses the run by name.
+# refuses the run by name -- except on a target whose nodes hold none, where
+# no input is set, one card does and a driver-run skip is accepted.
 GPUS=$HIP_VISIBLE_DEVICES
 SMOKE=
-if grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
+if [ -z "$NO_DRIVER_RUN" ] && grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/compass"; then
     hf_snapshot() { ls -d "${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qwen--$1/snapshots/"*/ 2>/dev/null | head -1; }
     export ATOM_COMPASS_SLICE_MODEL=${ATOM_COMPASS_SLICE_MODEL:-$(hf_snapshot Qwen3-0.6B)}
     export ATOM_COMPASS_IMAGE_MODEL=${ATOM_COMPASS_IMAGE_MODEL:-$(hf_snapshot Qwen3.5-9B)}
@@ -267,22 +275,17 @@ compass_tests() {
     COMPASS_N=$((COMPASS_N + PASSED)) C_FAILED=$((C_FAILED + FAILED)) C_ERRORS=$((C_ERRORS + ERRORS))
 }
 if [ -f "$SMOKE" ]; then
-    compass_tests tests/compass --ignore="$SMOKE"
+    compass_tests tests/compass --ignore="$SMOKE" "${COMPASS_LEFT[@]/#/--ignore=}"
     # The tree's compass-harness ahead of the one the harness Python has installed.
     PYTHONPATH=$ROOT/compass_harness:$PYTHONPATH ATOM_COMPASS_SLICE_MODEL=$ATOM_COMPASS_CCTRACES_MODEL \
         compass_tests "$SMOKE"
 elif [ -d "$ROOT/tests/compass" ]; then
-    compass_tests tests/compass
+    compass_tests tests/compass "${COMPASS_LEFT[@]/#/--ignore=}"
 else
     printf 'tests/compass: absent on this tree, so it contributes no tests.\n'
 fi
-# A file that stalls on one GPU keeps the suite from ever printing a summary,
-# and one that passes and fails at random there cannot be named in a baseline.
-# gpu_gate_skip.txt names such files per GPU; on a matching first card each is
-# left out of the suite and its collected tests come off the expectation.
 DEVICE=$(HIP_VISIBLE_DEVICES=${GPUS%%,*} python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null)
 printf 'device: %s\n' "${DEVICE:-UNKNOWN}"
-compass_gpu_skips "$DEVICE" || finish 1 "$SKIP_WHY"
 LEFT_OUT=$((SKIP_N - ${BASE_LEFT_OUT:-0}))
 EXPECT_PASSED=$((BASE_PASSED + COMPASS_N - BASE_COMPASS_TESTS - LEFT_OUT))
 printf 'expected: %s passed = %s baseline + (%s - %s) tests/compass - (%s - %s) left out here and there\n' \
@@ -347,7 +350,9 @@ fail() { printf '%s\n' "$1" >&2; VERDICT=$((VERDICT + 1)); [ -n "$WHY" ] || WHY=
   error is not a failure -- the tests behind it did not run at all, so the
   pass count below is over a smaller suite than the baseline'"'"'s.' "$ERRORS")" \
     "$ERRORS collection/teardown error(s)"
-[ -z "$SKIPS" ] ||
+[ -z "$NO_DRIVER_RUN" ] || printf 'driver-run: %s skip line(s) accepted on %s, whose nodes hold no inputs\n' \
+    "$(grep -c . <<<"$SKIPS")" "$ARCH"
+[ -z "$SKIPS" ] || [ -n "$NO_DRIVER_RUN" ] ||
     fail "$(printf 'driver-run test(s) skipped, so not run:\n%s' "$(sed 's/^/  /' <<<"$SKIPS")")" \
         "$(grep -c . <<<"$SKIPS") driver-run skip line(s), first ${SKIPS%%$'\n'*}"
 
