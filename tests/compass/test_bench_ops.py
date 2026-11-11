@@ -2040,6 +2040,94 @@ def test_a_v41_pointer_table_counts_its_entries_and_a_view_none(name, bound, siz
     assert stub._plan(op, [{}], {}, 4, 2, 96, "leaf", True)[1] == size
 
 
+def test_a_v41_attention_reads_its_pass_s_indptrs_whatever_was_timed_before_it(
+    monkeypatch,
+):
+    # V4.1's attention at ratio 1 over a prefill's 4 rows and over its replay
+    # tail's 2, the first a padding row, each reading the cache's indptrs as
+    # KV. A scan timed first writes -7 there, as another pass's scan would;
+    # each attention reads the selection of 2 a row ATOM's first reader of
+    # its pass fills. A cache that fills none refuses the leaf by name.
+    from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep
+
+    i32, cache = torch.int32, f"{ops._CACHE.format(ratio=1)}"
+
+    class Cache:
+        """`PagedAttentionCache.indptrs`, into a step's own buffers or these."""
+
+        def __init__(self):
+            pair = torch.zeros(9, dtype=i32), torch.zeros(9, dtype=i32)
+            self.indptr_buffers = {1: pair}
+
+        def indptrs(self, step):
+            if not step.indptrs:
+                buffers = step.indptr_buffers or self.indptr_buffers
+                step.indptrs = {
+                    r: (p[: step.width + 1], e[: step.width + 1], 2)
+                    for r, (p, e) in buffers.items()
+                }
+                for p, _, _ in step.indptrs.values():
+                    p[0], p[1:] = 0, (step.batch_ids >= 0).cumsum(0) * 2
+            return step.indptrs
+
+    taken, held = {}, {"cache": Cache()}
+
+    def call(stub, op, sig, instances, n):
+        kwargs = stub._copy(op, sig, instances, 0)[0]
+        if op["op"] == ops._SCAN:
+            kwargs["pptrs"][0].fill_(-7)
+        else:
+            taken[op["args"]["q"]["shape"][0]] = kwargs["kv_indptr_prefix"].tolist()
+        return {}
+
+    monkeypatch.setattr(ops.Stub, "_time", call)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner = _Runner()
+    pair = held["cache"].indptr_buffers[1]
+    runner.kv_held = {f"{cache}.{i}": t for i, t in enumerate(pair)}
+
+    def step(*ids):
+        ids = torch.tensor(ids, dtype=i32)
+        return BatchStep((), *(torch.zeros_like(ids),) * 3, ids, None)
+
+    main, tail = step(0, 1, 2, 3), step(-1, 0)
+    main.decoder = SimpleNamespace(
+        tail=tail, tail_rows=torch.zeros(2), last=torch.zeros(1),
+        query_ids=tail.batch_ids, filled_gpu=None, finishing_gpu=None,
+    )  # fmt: skip
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        vars(fctx._forward_context.attn_metadata).update(step=main, **held)
+        return out
+
+    runner.prepare_model = prepare_model
+
+    def kv(n):
+        return _t([n], "kv", dtype="torch.int32")
+
+    def attend(rows):
+        ptrs = [(f"kv_indptr_{s}", kv(rows + 1)) for s in ("prefix", "extend")]
+        q = "q", _t([rows, 2], "activation")
+        leaf = _leaf("aiter.pa_sparse_prefill_opus.default", q, *ptrs)
+        return dataclasses.replace(leaf, stated=(("compress_ratio", 1),))
+
+    scan = _leaf(ops._SCAN, ("pptrs", (kv(5),)), ("eptrs", (kv(5),)), ("ratios", (1,)))
+    found = ops.leaves(_graph(scan, attend(4), attend(2), layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda *a: a[1:])
+    got = ops.Stub(runner, 1).point(placed, prefill(4, 1), None, found)
+
+    assert taken == {4: [0, 2, 4, 6, 8], 2: [0, 0, 2]}
+    assert {r["metadata"]["kv_indptr_prefix"] for r in got[1:]} == {f"{cache}.0"}
+
+    held["cache"] = SimpleNamespace()
+    got = ops.Stub(runner, 1).point(placed, prefill(4, 1), None, found)
+
+    why = f"no pass here fills kv_indptr_prefix {cache}.0"
+    assert [r.get("refused") for r in got] == [None] + [f"ValueError: {why}"] * 2
+
+
 @pytest.mark.parametrize(
     "name, table, ids, role, n, copies, footprint",
     [
