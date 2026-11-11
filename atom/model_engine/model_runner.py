@@ -2575,8 +2575,8 @@ class ModelRunner:
         """Whether this forward scores drafts with the rejection sampler.
 
         A P/D producer keeps the drafter only to write its context KV; the
-        scheduler never pads drafts for it, so its decodes (the step that
-        surfaces a deferred T0) are q=1 and have nothing to verify.
+        scheduler never pads drafts for it, so its decodes are q=1 and have
+        nothing to verify.
         """
         return (
             not is_prefill
