@@ -3,7 +3,7 @@
   "name": "mi355x-crs005",
   "provenance": {
     "authored_by": "compass agent for jgong5",
-    "date": "2026-11-08",
+    "date": "2026-11-11",
     "origin": "mixed",
     "origins": {
       "device.name": {
@@ -133,6 +133,13 @@
         "source_root": "commit:f6e1fa77d",
         "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
       },
+      "device.profiler_floor_s": {
+        "origin": "probed",
+        "source_root": "commit:0bdc17c90",
+        "record": "sha256:933a0d26bfeed09e301a6582acddc40da10119a5c5146e853fef982dcfa01cdb",
+        "p10": 3.878999999999906e-06,
+        "p90": 4.03900000000067e-06
+      },
       "interconnect.inter_node.link_bandwidth_bytes_per_s": {
         "origin": "probed",
         "source_root": "commit:f371241a0",
@@ -161,9 +168,10 @@
       "assumed",
       "ptl",
       "peaks",
+      "profiler",
       "crs005-013-ionic"
     ],
-    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at f6e1fa77d | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples | crsuse2-m2m-v3-005 writing into -013 over ionic_N, the rails of matched-rail Mooncake. At f371241a0, the source root, rdma_link.py's bench (005's GPUs into 013's, the 1P1D deployment's RDMA settings) read the port rate on all sixteen ports and timed every GPU's writes on its own rail and the next GPU's, and one 1P1D run of #975's EP-off cell at c=64 for 600 s recorded its KV writes. rdma_link.py fit BENCH RECORD at 5f5cccf1a gives the values: the port rate, the latency fitted per round on the bench's writes, and the derate of the run's KV writes that no other write was in flight beside on their prefill rank or rail. The rate's and the latency's record is the bench's sha256; the derate's is the sha256 that fit prints over the run's writes files"
+    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at f6e1fa77d | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples | probe_device.py: empty kernels queued under a trace run's profiler | crsuse2-m2m-v3-005 writing into -013 over ionic_N, the rails of matched-rail Mooncake. At f371241a0, the source root, rdma_link.py's bench (005's GPUs into 013's, the 1P1D deployment's RDMA settings) read the port rate on all sixteen ports and timed every GPU's writes on its own rail and the next GPU's, and one 1P1D run of #975's EP-off cell at c=64 for 600 s recorded its KV writes. rdma_link.py fit BENCH RECORD at 5f5cccf1a gives the values: the port rate, the latency fitted per round on the bench's writes, and the derate of the run's KV writes that no other write was in flight beside on their prefill rank or rail. The rate's and the latency's record is the bench's sha256; the derate's is the sha256 that fit prints over the run's writes files"
   },
   "device": {
     "name": "MI355X",
@@ -272,6 +280,7 @@
       }
     },
     "kernel_floor_s": 1.5658164620399475e-06,
+    "profiler_floor_s": 3.9590000000007426e-06,
     "software_pinned_to": {
       "rocm": "7.2.4",
       "aiter": "41d4d8d7e",

@@ -27,13 +27,12 @@ from atom.compass import run as compass_run
 from atom.compass.artifacts import (
     ArtifactStore,
     GateState,
-    Key,
     Kind,
     Topology,
     member_name,
 )
 from atom.compass.artifacts.store import Recorded
-from atom.compass.capture import forward, peers
+from atom.compass.capture import forward, graph_key, peers
 from atom.compass.capture.graph import Traced, to_json
 from atom.compass.run import _op_graphs
 from atom.compass.runner.overrides import PricedSteps
@@ -326,7 +325,7 @@ def test_a_graph_the_lookup_reads_is_read_once_and_frozen_out_of_the_collector(
     }
     for shape, graph in graphs.items():
         store.publish(
-            Key.of(Kind.OP_GRAPH, structure=at, shape=shape),
+            graph_key(at, shape),
             provenance=stanza("compass trace ops"),
             topology=Topology(),
             conditions=run_readings(config.model),

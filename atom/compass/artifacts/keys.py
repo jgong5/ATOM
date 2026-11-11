@@ -84,7 +84,9 @@ KEY_FIELDS: Mapping[Kind, tuple[str, ...]] = {
     # `workload` is the digest of the requests its steps name; `backend` the
     # pricing backend's digest, so another backend addresses another entry.
     Kind.SHAPE_POPULATION: ("model", "workload", "engine_config", "backend"),
-    Kind.OP_GRAPH: ("structure", "shape"),
+    # The ATOM source and torch it was traced under, so a graph traced under
+    # another of either is another entry.
+    Kind.OP_GRAPH: ("structure", "shape", "source_root", "torch"),
     # `point` is the digest of the shape, context and leaf one measurement took.
     Kind.OP_MEASUREMENT: ("model", *LAYOUT, "machine_spec", "source_root", "point"),
     Kind.PRICE_LIST: ("model", *LAYOUT, "machine_spec", "source_root"),
