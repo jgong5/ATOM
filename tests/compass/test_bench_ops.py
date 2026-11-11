@@ -2050,25 +2050,19 @@ def test_a_v41_attention_reads_its_pass_s_indptrs_whatever_was_timed_before_it(
     # its pass fills. A cache that fills none refuses the leaf by name.
     from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep
 
-    i32, cache = torch.int32, f"{ops._CACHE.format(ratio=1)}"
+    i32, cache = torch.int32, ops._CACHE.format(ratio=1)
 
     class Cache:
-        """`PagedAttentionCache.indptrs`, into a step's own buffers or these."""
+        """`PagedAttentionCache.indptrs`' fill: into a step's own buffers, or
+        these, which ATOM's allocation bound."""
 
         def __init__(self):
             pair = torch.zeros(9, dtype=i32), torch.zeros(9, dtype=i32)
             self.indptr_buffers = {1: pair}
 
         def indptrs(self, step):
-            if not step.indptrs:
-                buffers = step.indptr_buffers or self.indptr_buffers
-                step.indptrs = {
-                    r: (p[: step.width + 1], e[: step.width + 1], 2)
-                    for r, (p, e) in buffers.items()
-                }
-                for p, _, _ in step.indptrs.values():
-                    p[0], p[1:] = 0, (step.batch_ids >= 0).cumsum(0) * 2
-            return step.indptrs
+            for p, _ in (step.indptr_buffers or self.indptr_buffers).values():
+                p[0], p[1 : step.width + 1] = 0, (step.batch_ids >= 0).cumsum(0) * 2
 
     taken, held = {}, {"cache": Cache()}
 
