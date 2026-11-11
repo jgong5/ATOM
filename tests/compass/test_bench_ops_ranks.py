@@ -477,7 +477,7 @@ def _gatherv_rank(config, todo, rank):
         sys.modules["aiter.dist.parallel_state"].get_dp_group = lambda: dp
         sys.modules["atom.model_ops.moe"] = SimpleNamespace(all_gatherv=gatherv)
         x = ("x", (_t([13, 8], "activation"), _t([13, 6], "activation")))
-        leaf = _leaf(GATHERV, x, ("sizes", [13, 1]))
+        leaf = _leaf(GATHERV, x, ("sizes", (13, 1)))
         found = ops.leaves(_graph(leaf, layers=1)["region"])
         return measure(config, [(prefill(13, 1), None, found)], llc, rank)
 
