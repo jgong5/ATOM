@@ -171,9 +171,9 @@ context, the rest sharing a mean, each `GRID`th of it from the least the rows
 hold; and each prefill family (`_family`), under a speculative drafter each
 leaf of its own prefill shape past a step's that the step's graphs do not
 hold too, at its rows padded to its W, and under DP each leaf of a prefill's
-drafter's graphs a run asks at its later passes' G at that G (`_drafter_at`),
-and at its shape only where its target runs it too, over a ladder of their
-token counts, chunk remainders among them,
+drafter's graphs at each G a run asks it at, its later passes' among them
+(`_drafter_at`), and at its shape only where its target runs it too or a run
+asks it there, over a ladder of their token counts, chunk remainders among them,
 its shapes that state the rows a DP group gathers apart, as `fit ops` prices them,
 one of a kind that depends on context at each at the most cached tokens of
 steps of its rows, and over a ladder of them once those points and the fresh
@@ -2797,9 +2797,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             continue
         width = graphs[decode(s.seqs)]
         graphs[s] = {sig: leaf for sig, leaf in graphs[s].items() if sig not in width}
-    # a leaf of a prefill's drafter's graphs a run asks at another G than its
-    # shape's, its later passes' under DP (`_drafter_at`), is a point at that
-    # G, and at its shape only while its target runs it too
+    # a leaf of a prefill's drafter's graphs is a point at each G a run asks
+    # it at (`_drafter_at`), its later passes' under DP among them, and at its
+    # shape's only while its target runs it too or a run asks it there
     moved = set()
     for s, (line, outputs) in draft_lines.items():
         if line.get("draft_moe_rows") is None:  # no DP gather, no other G
@@ -2809,12 +2809,15 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         except ArtifactRefusal:
             continue
         for sig, (op, _) in drafter.items():
-            if (at := _drafter_at(s, op, line, config)) != s:
-                leaf = graphs[s][sig]
-                if leaf[0].get("drafted"):
-                    del graphs[s][sig]
-                graphs.setdefault(at, {})[sig] = leaf
-                moved.add(at)
+            asked = _drafter_at(s, op, line, config)
+            ats = [s._replace(gathered=g) for *_, g in asked] or [s]
+            leaf = graphs[s][sig]
+            if s not in ats and leaf[0].get("drafted"):
+                del graphs[s][sig]
+            for at in ats:
+                if at != s:
+                    graphs.setdefault(at, {})[sig] = leaf
+                    moved.add(at)
     prefills |= moved
     # a run resumed into `out` keeps the rounds an earlier one wrote there
     rounds = [int(d.name[5:]) for d in out.glob("round*") if d.name[5:].isdigit()]
@@ -2964,7 +2967,8 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     leaf at its tokens, and one of a kind that depends on context over its
     rows' cached tokens too (`_bracket_cached`); and `fit ops`' price list of
     `records` prices it at the step, as `compass run --coverage` asks it, a
-    prefill's drafter's leaf at the G a run asks it at (`_drafter_at`). A
+    prefill's drafter's leaf under DP at each B and G a run asks it at
+    (`_drafter_at`). A
     decode leaf is read at the rows it ran, its shape's T: of a drafter's own
     decode shape past its step's, a leaf its width's graphs hold at that
     width, as `--plan` measures it. A prefill leaf is asked at the B it ran,
@@ -3018,12 +3022,13 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
             if isinstance(found := families(shape, output, draft, own), str):
                 whys[f"{part}op_graph"], found = found, []
             for name, fam, tokens, op, at in found:
-                if part == DRAFT:
-                    at = _drafter_at(at, op, line, config)
                 bound = (*at[:4], mean, top)
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
                     bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
+                elif part == DRAFT and (asked := _drafter_at(at, op, line, config)):
+                    each = [(*b, mean, top) for b in asked]
+                    bound = each if each[1:] else each[0]
                 elif at.width:  # a padded prefill's leaf at each B it may have run
                     ran = ran_counts(str(at), op)
                     each = [(*at[:2], n["B"], *bound[3:]) for n in ran]
@@ -3088,31 +3093,36 @@ def parts(names, config) -> list:
     return steps
 
 
-def _drafter_at(shape, op: dict, line: dict, config):
-    """`shape`, a prefill its drafter's graph is read at, at the G a run asks
-    that graph's leaf `op` at on the step `line` records, as
-    `OpGraphBackend._bound` asks it. Under DP the drafter's first pass
-    gathers `draft_moe_rows`, and its later passes run at `draft_bs`, or at
-    its B where they gather `draft_rows`, gathering that or their batch on
-    every rank: a leaf that leads with their batch or gather, and not with
-    `shape`'s T or B or the first gather, is asked at their gather; one that
-    leads with both at the fewer of the two gathers, off its default; any
-    other at `shape`'s G."""
-    from atom.compass.backends.op_graph import _ran_at, gathered_off_default
+def _drafter_at(shape, op: dict, line: dict, config) -> list:
+    """Each ``(phase, T, B, G)`` a run asks the leaf `op` of the drafter's
+    graph at `shape`, a prefill, at on the step `line` records, as
+    `OpGraphBackend._bound` and `op_graph._ran_at_each` ask it; none on a
+    decode, or with no DP gather or no batch for the later passes, where
+    `shape` states it. Under DP the drafter's first pass gathers
+    `draft_moe_rows`, and its later passes run at `draft_bs`, or at its B
+    where they gather `draft_rows`, gathering that or their batch on every
+    rank: a leaf that leads with their batch or gather, and not with
+    `shape`'s T or B or the first gather, is asked at their batch and
+    gather; one that leads with both at `shape`'s B and the fewer of the two
+    gathers, off its default; any other at `shape`'s B and G. Where `shape`'s
+    T is one of their counts too, a leaf that leads with it is asked at each
+    of those it may have run at."""
+    from atom.compass.backends.op_graph import _ran_at_each, gathered_off_default
 
     gathered, rows = line.get("draft_moe_rows"), line.get("draft_rows")
     if shape.phase == "decode" or gathered is None:
-        return shape
+        return []
     t, b = shape.tokens, shape.seqs
     drafts = config.speculative_config.num_speculative_tokens
     width = b if drafts > 1 and rows else line.get("draft_bs")
     if not width:
-        return shape
+        return []
     dp = config.parallel_config.data_parallel_size
     later = rows or dp * width
     low = gathered_off_default("prefill", t, min(gathered, later), dp)
     sets = frozenset({t, b, gathered}), frozenset({width, dp * width, later})
-    return shape._replace(gathered=_ran_at(op, (shape.gathered, later, low, sets)))
+    wide, both = ("prefill", t, width, later), ("prefill", t, b, low)
+    return _ran_at_each(op, (("prefill", t, b, shape.gathered), wide, both, sets))
 
 
 def _rows(line, rung: int) -> tuple[int, int]:
