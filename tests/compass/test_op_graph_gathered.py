@@ -12,18 +12,25 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_artifact_store import CONDITIONS, GATES, stanza
+from test_artifact_store import stanza
 from test_capture_ir import _decoder
 from test_capture_v4_pro import DPA_TP8, EP8, MOE, MORI, _rows, capture, trace
 from test_dp_step_max import prefill, runner
 from test_moe_gather_rows import decode
 from test_op_graph import by_name, g
-from test_op_graph_arch import ENGINE
+from test_op_graph_arch import ENGINE, run_readings
 from test_op_work import ONE, leaf, t
 from test_op_work_v4 import close, experts, moe
 from test_work import SPEC
 
-from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
+from atom.compass.artifacts import (
+    ArtifactStore,
+    GateState,
+    Key,
+    Kind,
+    Topology,
+    member_name,
+)
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
@@ -48,8 +55,8 @@ RESPLIT_TBO = ((3, 1, 1, 1, 1, 1, 1, 6), (4, 0, 0, 0, 0, 0, 0, 8))
 STORED = [
     Shape("prefill", 7, 1, 27),
     Shape("prefill", 7, 1),
-    Shape("prefill", 3, 1, 15),
-    Shape("prefill", 4, 1, 12),
+    Shape("prefill", 3, 1, 15, micro_batch=True),
+    Shape("prefill", 4, 1, 12, micro_batch=True),
     Shape("decode", 4, 4),
     Shape("decode", 1, 1, 27),
 ]
@@ -80,13 +87,20 @@ def backend(config, tmp_path):
     store = ArtifactStore(str(tmp_path / "store"))
     for shape in STORED:
         for output in (True, False) if shape.phase == "prefill" else (True,):
-            at = structure(config, shape.phase, True, "gfx950", output)
+            at = structure(
+                config,
+                shape.phase,
+                True,
+                "gfx950",
+                output,
+                micro_batch=shape.micro_batch,
+            )
             store.publish(
                 Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape)),
                 provenance=stanza("compass trace ops"),
                 topology=Topology(),
-                conditions=CONDITIONS,
-                gates=GATES,
+                conditions=run_readings(config.model),
+                gates=GateState.of(),
                 members={
                     member_name("graph", RANK, "json"): json.dumps(
                         {"region": g(4096 * gathered(shape), 64, 64)}

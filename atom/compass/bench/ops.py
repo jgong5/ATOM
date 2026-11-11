@@ -82,8 +82,9 @@ first of size above one, each the span of the others, as the batch's rows,
 or its blocks when the model keeps no
 per-request state, or, of a decode attention leaf that states its layer's
 window and compress ratio, the plane rows the batch's blocks hold at that
-ratio, a RoPE table's (`TABLES`), a weight or a tensor of a module it names,
-as many rows as the point's tokens, a table a leaf gathers by token ids
+ratio, a pointer table's (`_CACHE`) its entries, a view operator's none, a
+RoPE table's (`TABLES`), a weight or a tensor of a module it names, a row a
+position its call takes, else a token, a table a leaf gathers by token ids
 (`GATHERED`) as many rows as its ids, aiter's top-k scratch (`TOPK_WORKSPACE`)
 the bytes it launches with, but none of the multi-block path's one cached
 buffer, which every copy launches and the point's footprint counts once, the
@@ -123,7 +124,10 @@ one each time after a read of `COLD` times the last-level cache outside the
 timing, the host idle `REST` times a replay's device time after each replay;
 a repeat is the replay's device time over K, and a graph that captured no
 kernel times 0. The kernels one eager call of copy 0 launches, memory copies
-aside, are the point's kernel identity. When `ReplayRule` refuses a batch, its
+aside, are the point's kernel identity, read from two profiles in a row that
+name the same; a profile that recorded nothing of a call whose cold graph
+timed device work missed it, and the call is profiled again, refused when no
+two profiles name its kernels. When `ReplayRule` refuses a batch, its
 leaves refuse; an error in ATOM's preparation fails the run, naming the point.
 The points run in a process of their own on each GPU, which dies when its
 device faulted (`_alive`); one that dies ends every rank, keeps the points
@@ -226,7 +230,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 26
+PROTOCOL = 28
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -240,6 +244,8 @@ GRAPH_NS = 10_000_000
 #: Profiles of one call taken at most until two in a row name the same kernels:
 #: a profile can drop a call's kernel or keep a kernel launched before it.
 PROFILES = 4
+#: How the profiler's name of a memory copy's device activity starts.
+COPY = "Memcpy"
 #: Times over the last-level cache the copies' bytes pass, and the bytes read
 #: before each cold replay: just past it, part of them stays there, and an
 #: MI308X GEMM read up to 7% fast.
@@ -279,8 +285,8 @@ TOKEN_IDS = {
 #: the capture, which caches none, and its measuring process died.
 BATCH_IDS = {("aten.repeat_interleave.self_Tensor", "repeats"): "context_lens.long"}
 #: Weight slots, and a named module's tensors, a leaf reads a row a token of:
-#: RoPE's cos and sin tables, indexed by each token's position (or by each
-#: compressed position, at most one a token), never read whole.
+#: RoPE's cos and sin tables, indexed by each position its call takes, at most
+#: one a token, or without them each token's, never read whole.
 TABLES = {"cos_cache", "sin_cache", "cos", "sin"}
 #: A weight slot a leaf reads a row a token id of, and the slot of the ids, by
 #: operator: the embedding and DeepSeek-V4's hash routing table.
@@ -387,6 +393,7 @@ _INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
 _SCAN = f"{_INDPTRS}:_launch_indptr_scan"
 _INDICES = f"{_INDPTRS}:_launch_indices"
 _FUSED = "atom.model_ops.v4_kernels.fused_compress:_launch_fused_compress"
+_ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 _FROM = ("replay_start", "cached_until")
 _SWA = "atom.model_ops.v4_kernels.state_writes:swa_write"
 _GATHER = "atom.model_ops.attentions.token_layout.gather:gather_rows"
@@ -408,10 +415,8 @@ V41_NAMES = {
     (f"{_INDPTRS}:_launch_window_rows", "eptr"): f"{_CACHE.format(ratio=0)}.1",
     (_FUSED, "state_slot_mapping"): "step.slots",
     (_SWA, "state_slot_per_seq"): "step.slots",
-    ("aiter.rope_cached_positions_fwd_impl.default", "positions"): (
-        "step.positions",
-        "step.plans.{ratio}.key_rope_positions_gpu",
-    ),
+    (_ROPE, "positions", "query"): "step.positions",
+    (_ROPE, "positions", "key"): "step.plans.{ratio}.key_rope_positions_gpu",
     ("aten.index_select.default", "index", "kv"): "step.slots",
     ("aten.index_select.default", "index", "metadata"): "plan.last",
     ("aten.index.Tensor", "indices"): "plan.query_ptrs",
@@ -644,14 +649,23 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     (`draft`, as `forward.structure` keys it). A prefill that produces none
     runs its target's leaves less the LM head and the sampler, so the
     target's points at output cover both. A miss where the store holds the
-    shape under another engine config refuses naming what differs."""
+    shape under another engine config refuses naming what differs. A
+    two-batch-overlap micro-batch's `shape` reads its own graph."""
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture.forward import missed, structure
 
-    at = structure(config, shape.phase, device=arch, output=output, draft=draft)
+    at = structure(
+        config,
+        shape.phase,
+        device=arch,
+        output=output,
+        draft=draft,
+        micro_batch=shape.micro_batch,
+    )
     key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
     if not store.directory_for(key).exists() and (why := missed(store, key)):
         part = " that produces no output" * (not output)
+        part += " as a two-batch-overlap micro-batch" * shape.micro_batch
         part += " for its drafter" * bool(draft) + "'s draft-KV pass" * (draft == KV)
         raise ArtifactRefusal(
             Rule.RESOLUTION,
@@ -1113,6 +1127,12 @@ class Stub:
             and "out_logits" in op["args"]
             and (op["args"].get("context_lens") or {}).get("role") != "activation"
         }
+        # and by the rows each compress plan holds, as many as its keys' RoPE's
+        self.known |= {
+            ("compressed", op["args"]["plan_gpu"]["shape"][0]): op["args"]["ratio"]
+            for op, _ in found.values()
+            if op["op"] == _FUSED
+        }
         bind = {
             (s, path): (spec, _named(op, path, spec, held, self.known) or held)
             for s, (op, _) in found.items()
@@ -1132,9 +1152,10 @@ class Stub:
         room = [pool // blocks]
         room += [t.k_cache.shape[0] // taken for t in kv.values() if _stateful(t)]
         self.context, self.unplanned, self.once = _split(context)[0], {}, {}
+        tokens = sum(row[0] for row in rows)  # a drafter's rows verify its drafts
         plans = {
             s: self._plan(
-                op, i, kv, blocks, len(rows), shape.tokens, s, shape.phase == "decode"
+                op, i, kv, blocks, len(rows), tokens, s, shape.phase == "decode"
             )
             for s, (op, i) in found.items()
         }
@@ -1216,13 +1237,19 @@ class Stub:
         decode's; at a `decode`, a context key's recurrent state counts each
         state slot a row holds."""
         need, size, shared = 1, 0, [0, 0]
+        fn, cia = _overload(op["op"]), "CompositeImplicitAutograd"
+        if fn and fn.is_view and not fn.has_kernel_for_dispatch_key(cia):
+            return 1, size, need, shared  # reads none; a composite (`reshape`) may copy
         table, ids = GATHERED.get(op["op"], (None, None))
         acts = [s for _, s in _specs(op["args"]) if s["role"] == "activation"]
+        pos = op["args"].get("positions")
+        pos = pos.get("shape") if isinstance(pos, dict) else None
+        rope = pos[-1] if pos else tokens or rows  # a RoPE table's rows
         for slot, s in _specs(op["args"]):
             itemsize = _dtype(s["dtype"]).itemsize
             nbytes = _span(s["shape"], s["stride"]) * itemsize
             if s["role"] == "weight" and (slot in TABLES or slot == table):
-                read = tokens or rows
+                read = rope
                 if slot == table:  # a row an id
                     read = torch.Size(op["args"][ids]["shape"]).numel()
                 entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
@@ -1234,7 +1261,7 @@ class Stub:
                 # one a decode compressor writes its row to, and a row view
                 # holding a state arena past its pages (`_state`) one row a
                 # request
-                unit = rows if self.slots else blocks
+                unit, history = rows if self.slots else blocks, 0
                 name = self.kv.get((sig, slot), ("",))[0]
                 slotted = int(name in self.state)
                 stated = op.get("stated", {})
@@ -1247,8 +1274,8 @@ class Stub:
                     # of which a request reads at most its indexer's top-k
                     if top := stated.get("index_topk"):
                         unit = min(unit, rows * top)
-                elif window and decode and self.state.get(name):
-                    unit = 0  # a decode reads its window from the ring alone
+                elif window and self.state.get(name):
+                    unit = 0  # its window is read from the ring alone
                 if self.state.get(name):
                     # its window rings: a ring cut from it (`ring_view`), smaller
                     # than the widest of it a leaf stating its window takes, read
@@ -1264,6 +1291,13 @@ class Stub:
                     if nbytes < widest if window else writes:
                         reach = acts[0]["shape"][0] + rows * ((window or 1) - 1)
                         unit, slotted = min(reach, rows * self.ring), 1
+                    elif window and not decode:
+                        # ponytail: a prefill's prefix reads each request's
+                        # history through it too, the window less one at most
+                        # its cached tokens, by slot; a leaf of fewer rows, a
+                        # bounded-replay tail, none: its window starts there
+                        if acts[0]["shape"][0] >= (tokens or rows):
+                            history = rows * min(window - 1, self.context or 0)
                 # an entry is the span of its other dims: a view may be strided
                 # by a whole state slot or by every layer's block, and a field
                 # laid out layers first, `[layers, slots, ...]`, is read a slot
@@ -1273,8 +1307,11 @@ class Stub:
                 cut = _widest(shape, stride)
                 rest = shape[:cut] + shape[cut + 1 :], stride[:cut] + stride[cut + 1 :]
                 entry = _span(*rest) * itemsize
-                nbytes, need = entry * unit, None
-                shared[slotted] += nbytes
+                if name.startswith(_CACHE.format(ratio="")):
+                    unit, history = shape[cut], 0  # a pointer table, at its entries
+                nbytes, need = entry * (unit + history), None
+                shared[slotted] += entry * unit
+                shared[1] += entry * history
             if slot == "workspace" and op["op"] in TOPK_WORKSPACE:
                 try:  # not the byte captured; a query that raises refuses the leaf
                     scratch, cached = self._workspace(op)
@@ -1301,7 +1338,7 @@ class Stub:
                 tables = {id(getattr(module, name, None)) for name in sorted(TABLES)}
                 for t in _own(module):
                     if id(t) in tables:  # a RoPE table, a row a token
-                        size += t.nbytes // t.shape[0] * min(tokens or rows, len(t))
+                        size += t.nbytes // t.shape[0] * min(rope, len(t))
                     # ponytail: a first dim of the pool's blocks is a view of
                     # the KV pool (DeepSeek-V4's Indexer), read at the batch's
                     elif t.dim() and t.shape[0] == pool:
@@ -1325,7 +1362,8 @@ class Stub:
         activations, then copy `c mod n` with the c-th weight up to the
         leaf's occurrences when it takes one, at most K, each replay after one
         read of `flush`; and, when K is `CALLS`, warm over one, with no read;
-        with its kernels. Every rank's graph holds the most K
+        with its kernels, profiled again on every rank when any rank's named
+        none of a call its cold graph timed. Every rank's graph holds the most K
         any rank's call gives, and a leaf any rank refuses, every rank does."""
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
@@ -1379,6 +1417,10 @@ class Stub:
             cycle = [calls[i % n] for i in range(k)]
             cold = _replay(fn, cycle, self.flush)
             warm = _replay(fn, calls[:1] * k) if n > 1 and k == CALLS else None
+            # two profiles that named nothing of a call its graph timed missed it
+            if agreed(int(not kernels and any(cold)), cpu_group(), most=True):
+                forward_context._forward_context = calls[0][1]
+                kernels = _identity(fn, calls[0][0], timed=any(cold))[0]
         finally:
             forward_context._forward_context = forward_context.ForwardContext()
         medians = statistics.median(cold), warm and statistics.median(warm)
@@ -1472,10 +1514,13 @@ class Stub:
                 out = self._tensor(value, meta.get((sig, path)), fresh)
                 # V4.1's FP8 plane a top-k or block maxima ranks: ATOM's scorer
                 # writes it first, which here no leaf has, or a scorer timed
-                # before has, off its own random inputs
+                # before has, off its own random inputs. Placements share one
+                # clone of it, which ATOM's preparation leaves unchanged, so
+                # each copy draws on a plane of its own
                 if self.paged and path == "logits" and value["role"] == "metadata":
                     bound = PAGE_WIDE.get(op["op"], ("",))[0]
                     if (ends := meta.get((sig, bound), ("", None))[1]) is not None:
+                        out = out if fresh else _clone(out)
                         _scores(out, ends, value)
                 return out
             if isinstance(value, str) and value.startswith("torch."):
@@ -1688,13 +1733,16 @@ def _writes(name: str) -> set[str]:
     # `fill_deferred_decode_ids`, DeepSeek-V4's index builders) write what
     # ATOM's forward writes from the prepared metadata, which later leaves
     # read; one that writes other values needs its writes named here
+    args = target._schema.arguments if (target := _overload(name)) else []
+    return {a.name for a in args if a.alias_info and a.alias_info.is_write}
+
+
+def _overload(name: str):
+    """The `torch.ops` overload `name` names; None for a lifted function."""
     target = torch.ops
     for attr in [] if ":" in name else name.split("."):
         target = getattr(target, attr, None)
-    if not isinstance(target, torch._ops.OpOverload):
-        return set()
-    args = target._schema.arguments
-    return {a.name for a in args if a.alias_info and a.alias_info.is_write}
+    return target if isinstance(target, torch._ops.OpOverload) else None
 
 
 def _keyed(args, path) -> str:
@@ -1755,7 +1803,8 @@ def _ratio(op, path, known=None):
     `ratios` (DeepSeek-V4.1's indptr scan, a table a ratio); else the ratio
     `known` gives the rows a page holds at it (`rows_per_page`, V4.1's index
     build, 0 when it takes no selection) or the width of the logits it reads
-    (`stride0`, V4.1's top-k, its scorer's)."""
+    (`stride0`, V4.1's top-k, its scorer's), or a RoPE's positions the rows its
+    compress plan holds (`compressed`)."""
     args, (slot, *rest) = op["args"], path.split(".")
     listed = args.get("ratios")
     if rest and isinstance(args.get(slot), list) and isinstance(listed, list):
@@ -1766,6 +1815,8 @@ def _ratio(op, path, known=None):
         ratio = ratio if args["selected"] else 0
     if ratio is None and known and "stride0" in args:
         ratio = known.get(("stride0", args["stride0"]))
+    if ratio is None and known and (op["op"], path) == (_ROPE, "positions"):
+        ratio = known.get(("compressed", args[path]["shape"][-1]))
     return ratio
 
 
@@ -1774,6 +1825,8 @@ def _named(op, path, spec, pool, known=None) -> dict | None:
     `known` one, of `spec`'s dtype, its shape and stride first if any; or None."""
     key = op["op"], _keyed(op["args"], path)
     role = (op["args"].get("self") or {}).get("role")
+    if op["op"] == _ROPE:  # over one head a ratio's index keys, over more a query
+        role = "key" if op["args"]["input"]["shape"][-2] == 1 else "query"
     wanted = V41_NAMES.get((*key, role), V41_NAMES.get(key, ()))
     wanted = wanted if isinstance(wanted, tuple) else (wanted,)
     ratio = _ratio(op, path, known)
@@ -2110,18 +2163,22 @@ def _on_coordinator(name: str, fn):
     return call
 
 
-def _identity(fn, kwargs) -> tuple[list[str], float]:
-    """`_kernels` of one call of `fn` once two profiles in a row name the same
-    kernels on every rank, at most `PROFILES`; refused on every rank together
-    when no two do."""
+def _identity(fn, kwargs, timed=False) -> tuple[list[str], float]:
+    """`_kernels` of one call of `fn`, memory copies aside, once two profiles
+    in a row name the same kernels on every rank, at most `PROFILES`; refused
+    on every rank together when no two do. Of a call whose graph `timed`
+    device work, a profile that recorded none, kernel or copy, missed the
+    call and agrees with no other."""
     from atom.compass.bench.ranks import agreed, cpu_group
 
     last = None
     for _ in range(PROFILES):
         names, ns = _kernels(fn, kwargs)
-        if agreed(int(names == last), cpu_group()):
-            return names, ns
-        last = names
+        kernels = [n for n in names if not n.startswith(COPY)]
+        seen = None if timed and not names else kernels
+        if agreed(int(seen is not None and seen == last), cpu_group()):
+            return seen, ns
+        last = seen
     raise ValueError(
         f"no two profiles in a row of {PROFILES} named the same kernels; "
         f"the last named {names}"
@@ -2129,10 +2186,11 @@ def _identity(fn, kwargs) -> tuple[list[str], float]:
 
 
 def _kernels(fn, kwargs) -> tuple[list[str], float]:
-    """The kernels one call of `fn` launches, in order, and their device time
-    in ns: its device activity except memory copies, which the profiler
-    records at some calls of a leaf and misses at others; started on every
-    rank together (`_together`), once the device has finished `_together`'s
+    """The kernels one call of `fn` launches, in order, or its memory copies
+    when it launches no kernel, and the kernels' device time in ns: beside a
+    kernel its memory copies are left out, which the profiler records at
+    some calls of a leaf and misses at others; started on every rank
+    together (`_together`), once the device has finished `_together`'s
     all-reduce, which would otherwise join the call's kernels."""
     from torch.profiler import ProfilerActivity, profile
 
@@ -2142,14 +2200,12 @@ def _kernels(fn, kwargs) -> tuple[list[str], float]:
         fn(**kwargs)
         torch.cuda.synchronize()
     device = [
-        e
-        for e in prof.events()
-        if e.device_type == torch.autograd.DeviceType.CUDA
-        and not e.name.startswith("Memcpy")
+        e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
     ]
     device.sort(key=lambda e: e.time_range.start)
-    ns = 1e3 * sum(e.time_range.elapsed_us() for e in device)
-    return [e.name for e in device], ns
+    kernels = [e for e in device if not e.name.startswith(COPY)]
+    ns = 1e3 * sum(e.time_range.elapsed_us() for e in kernels)
+    return [e.name for e in kernels or device], ns
 
 
 def _replay(fn, calls, flush=None) -> list[float]:
