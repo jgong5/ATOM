@@ -23,6 +23,9 @@ weight. A prefill that states a width ``W`` past its rows, where a padded step
 runs its LM head and its drafter's later passes, ran a leaf that leads with W,
 and not with its T or B, at W as its B, where `OpGraphBackend` asks such a
 leaf; W is no count of any other leaf's, so points at two widths stay apart.
+Where W is that prefill's T too, a leaf that leads with it may have run at
+either B: a point its family reads at two places is left out, named in the
+params' ``left_out``, and a run declines such a leaf there.
 
 A family's dimensions are the shape's counts its masked integers follow, a
 decode's B always, at its T where it states one (a drafter's own leaves at the
@@ -80,7 +83,7 @@ from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, Key, Kind
 from atom.compass.backends.cost import CostTerm
-from atom.compass.backends.op_graph import LISTED, PERMILLE, _ran_at, band
+from atom.compass.backends.op_graph import LISTED, PERMILLE, _ran_at_each, band
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostSource
 from atom.compass.fit import publish
@@ -193,17 +196,20 @@ def shape_counts(shape: str) -> dict:
     return {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", shape)}
 
 
-def ran_counts(shape: str, leaf: dict) -> dict:
-    """The counts a point at `shape` ran `leaf` at: `shape`'s, less the width
-    ``W`` it states past its rows; a prefill's W, where a padded step runs its
-    LM head and its drafter's later passes, is the B of a leaf that leads with
-    W and not with its T or B, as `OpGraphBackend` asks such a leaf
-    (`op_graph._ran_at`)."""
+def ran_counts(shape: str, leaf: dict) -> list[dict]:
+    """Each set of counts a point at `shape` may have run `leaf` at: `shape`'s,
+    less the width ``W`` it states past its rows; a prefill's W, where a padded
+    step runs its LM head and its drafter's later passes, is the B of a leaf
+    that leads with W and not with its T or B, as `OpGraphBackend` asks such a
+    leaf (`op_graph._ran_at`). Where W is the prefill's T too, a leaf that
+    leads with it ran at either B (`op_graph._ran_at_each`)."""
     n = shape_counts(shape)
     width = n.pop("W", None)
     if width is None or shape.startswith("decode"):
-        return n
-    return _ran_at(leaf, (n, n | {"B": width}, n, ({n["T"], n["B"]}, {width})))
+        return [n]
+    rows, sets = ("prefill", n["T"], n["B"]), ({n["T"], n["B"]}, {width})
+    each = _ran_at_each(leaf, (rows, rows[:2] + (width,), rows, sets))
+    return [n | {"B": b} for _, _, b in each]
 
 
 def _context(p) -> int:
@@ -225,13 +231,15 @@ def fit(points) -> dict:
     ranks' row counts can differ (``all_gatherv``, ``reduce_scatterv``, MORI's
     dispatch and combine), so a step may hold between two points' rows;
     ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad
-    every rank to the same rows and keep it."""
+    every rank to the same rows and keep it; and ``left_out``, each point
+    whose leaf may have run at two places in its family (`ran_counts`), by
+    its shape, operator and why."""
     from atom.compass.bench.ops import DP_GROUP, _dependent, _split
     from atom.compass.capture.peers import MORI
 
     dependent = _dependent(points)
     groups: dict[str, list] = {}
-    free_of, families = {}, {}
+    free_of, families, left_out = {}, {}, []
     for p in points:
         if "exchange" in p:  # a collective: one family over its message bytes
             fam, nbytes = p["exchange"]
@@ -258,23 +266,27 @@ def fit(points) -> dict:
             i
             for i in range(len(each[0][0]))
             if all(len({v[i] for v, _ in vs}) == 1 for vs in at.values())
-            and all(any(v[i] - c in (0, 1) for c in n.values()) for v, n in each)
+            and all(
+                any(v[i] - c in (0, 1) for n in ns for c in n.values())
+                for v, ns in each
+            )
             and len({vs[0][0][i] for vs in at.values()}) > 1
         ]
+        # a point that may have run its leaf at either B follows either
         follows = {
             k
             for i in free_of[skel]
             for k in ("T", "B")
-            if all(v[i] - n.get(k, -9) in (0, 1) for v, n in each)
+            if all(any(v[i] - n.get(k, -9) in (0, 1) for n in ns) for v, ns in each)
         }
         ragged = {
             family(p["shape"], p["leaf"], free_of[skel])
             for p in members
             if _split(p["context"])[1]
         }
-        for p, counts in zip(members, ran):
+        for p, ns in zip(members, ran):
             name = family(p["shape"], p["leaf"], free_of[skel])
-            at_p = counts | {"context": _context(p)}
+            at_p = ns[0] | {"context": _context(p)}
             if p["shape"].startswith("decode") and "T" in at_p:
                 at_p["B"] = at_p.pop("T")  # a drafter's own rows, padded to B
             moves = dependent.get(p["op"], True)
@@ -296,6 +308,11 @@ def fit(points) -> dict:
                 dims.append("mean")
                 at_p["mean"] = mean or PERMILLE
             dims += ["context"] if moves else []
+            if len({tuple(n.get(d) for d in dims) for n in ns}) > 1:
+                left_out.append(
+                    {"shape": p["shape"], "op": p["op"], "why": _either(ns)}
+                )
+                continue
             f = families.setdefault(name, {"op": p["op"], "dims": dims, "points": {}})
             got = f["points"].setdefault(tuple(at_p[d] for d in dims), [])
             got.append((p["cold_ns"], p["kernels"]))
@@ -317,7 +334,18 @@ def fit(points) -> dict:
         if "row_bytes" in f:
             one = f["row_bytes"]
             f["row_bytes"] = one.pop() if len(one) == 1 else None
-    return {"free": free_of, "families": families}
+    return {"free": free_of, "families": families, "left_out": left_out}
+
+
+def _either(counts) -> str:
+    """Why a leaf that may have run at each of `counts`, which read it at two
+    places in its family, is read at none of them."""
+    ran = " or ".join(
+        " ".join(f"{k}={v}" for k, v in n.items() if v is not None) for n in counts
+    )
+    return (
+        f"a count it leads with is both its rows' and its width's, so it ran at {ran}"
+    )
 
 
 def interpolate(points: dict, at: tuple, dims):
@@ -432,7 +460,10 @@ class PriceList(CostSource):
     a decode step's rows' max, a prefill's rows' mean cached tokens; ``mean``
     a decode step's rows' mean context over its B in `PERMILLE` of their max,
     where the family was measured on ragged rows; a collective's family
-    (`bench.ops.exchange`) at its message bytes. It also
+    (`bench.ops.exchange`) at its message bytes. A leaf asked at the list of
+    bounds it may have run at (`op_graph._ran_at_each`) is answered where they
+    all read it, and declined, naming them, where they read it at two places
+    in its family. It also
     declines inside a gap the fit declined, and prefill rows whose cached
     tokens from that mean to their max cross into another kernel. An answer
     between points is validated when every line it interpolates along holds
@@ -451,9 +482,31 @@ class PriceList(CostSource):
         self._index = functools.cache(self._index)
 
     def price(self, request: tuple) -> CostTerm | Refusal:
+        (leaf, bound, _), kind = request, request[0]["op"]
+        each, asked = bound if isinstance(bound, list) else [bound], []
+        for b in each:
+            if (got := self._asked(leaf, b)) not in asked:
+                asked.append(got)
+        if asked[1:]:
+            return self.refuse(
+                f"{kind}: " + _either(dict(zip("TBG", b[1:4])) for b in each)
+            )
+        if isinstance(asked[0], str):
+            return self.refuse(f"{kind}: {asked[0]}")
+        got = self._lookup(*asked[0])
+        if isinstance(got, str):
+            return self.refuse(f"{kind}: {got}")
+        method = Method.MEASURED if got[1] else Method.ESTIMATED
+        return CostTerm(
+            f"op.{kind}", got[0] * 1e-9, Provenance(method, validated=got[2])
+        )
+
+    def _asked(self, leaf: dict, bound: tuple) -> tuple | str:
+        """The family, coordinates and top context `leaf` at `bound` is looked
+        up at, or why it is not."""
         from atom.compass.bench.ops import exchange, signature
 
-        (leaf, (phase, *counts, last), _), kind = request, request[0]["op"]
+        phase, *counts, last = bound
         at = dict(zip(("T", "B", "G", "context"), counts))
         shape = phase if at["G"] is None else f"{phase} G={at['G']}"
         if ex := exchange(leaf):  # a collective: its family over its message bytes
@@ -462,19 +515,13 @@ class PriceList(CostSource):
         else:
             name = self._family(shape, signature(leaf))
         if name is None:
-            return self.refuse(f"{kind}: no point of its signature was measured")
+            return "no point of its signature was measured"
         dims, top = self.params["families"][name]["dims"], None
         if phase == "decode":
             at["mean"] = PERMILLE * last / at["context"]
         elif dims[-1:] == ["context"] and last != at["context"]:
             top = last
-        got = self._lookup(name, tuple(at[d] for d in dims), top)
-        if isinstance(got, str):
-            return self.refuse(f"{kind}: {got}")
-        method = Method.MEASURED if got[1] else Method.ESTIMATED
-        return CostTerm(
-            f"op.{kind}", got[0] * 1e-9, Provenance(method, validated=got[2])
-        )
+        return name, tuple(at[d] for d in dims), top
 
     def _family(self, shape: str, sig: str) -> str | None:
         """The family of a leaf of signature `sig` at `shape`, or None."""

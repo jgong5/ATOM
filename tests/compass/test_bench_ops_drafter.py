@@ -316,6 +316,34 @@ def test_coverage_asks_a_padded_prompt_s_leaves_at_its_width_as_a_run_does(
     assert report["left out, by leaf kind"] == {}
 
 
+def test_coverage_leaves_out_a_prompt_whose_t_is_its_w_where_a_run_declines_it(
+    bench, tmp_path, monkeypatch  # noqa: F811
+):
+    # Beside prompts of one row padded to 4 and to 8, one of 4 tokens padded to
+    # 4, whose leaves lead with its T and its W alike: those of a family that
+    # reads B, its LM head, attention, drafter's later pass and sampler, ran
+    # at 1 row or 4 and are left out; its GEMM and first pass read T alone
+    padded = [
+        PROMPT | {"rows": [[t, t, False]], "target_bs": w, "draft_bs": w}
+        for t, w in ((40, 4), (60, 8), (4, 4))
+    ]
+
+    _, report = _plan_mtp(bench, tmp_path, monkeypatch, *padded)
+
+    why = "a count it leads with is both its rows' and its width's, so it ran at "
+    why += "T=# B=# or T=# B=#"
+    assert report["by part"] == {
+        "target": {"steps": 4, "covered": 3},
+        "draft": {"steps": 4, "covered": 3},
+    }
+    assert report["left out, by leaf kind"] == {
+        "aiter.attn": {why: 1},
+        "aiter.head": {why: 1},
+        "draft aiter.sample": {why: 1},
+        "draft aiter.step": {why: 1},
+    }
+
+
 class _Padding(_Runner):
     """`_Runner` keeping, for each batch it prepares, the ladder its step pads
     to, ATOM's under `--enforce-eager` unless the bench pads it."""
