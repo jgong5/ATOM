@@ -2448,6 +2448,36 @@ def test_a_long_call_fills_a_graph_to_graph_ns_and_has_no_warm_graph(
     assert (record["warm_ns"] is None) == (calls < ops.CALLS)
 
 
+@pytest.mark.parametrize("queried, copies", [(True, 4), (True, 3), (False, 3)])
+def test_a_warm_call_takes_its_cold_call_s_occurrence_on_that_one_s_first_copy(
+    queried, copies
+):
+    # copies alternate the tail's batch ids, 0..3, and layer 39's, -1 (`QUERIED`)
+    stub = ops.Stub(_Runner(), 10_000)
+    tail = torch.arange(4, dtype=torch.int32)
+    stub.placed = [(fctx.ForwardContext(), {("sig", "batch_ids"): ("tail", tail)})]
+    if queried:
+        stub.later = {(0, "sig", "batch_ids"): ("q", torch.full_like(tail, -1))}
+    spec = {"shape": [4], "stride": [1], "dtype": "torch.int32", "role": "metadata"}
+    op = {"op": "scan", "args": {"batch_ids": spec}, "occurrences": 2}
+    graphs = []
+
+    def replay(fn, calls, flush=None):
+        graphs.append([(id(c), c[0]["batch_ids"][0].item()) for c in calls])
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        stub._time(op, "sig", [{}], copies)
+
+    cold, warm = ([b for _, b in g] for g in graphs)
+    assert warm == cold and (-1 in cold) == queried
+    assert len({c for c, _ in graphs[1]}) == 1 + queried
+
+
 def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
     # Replay i takes i + 1 ms on a stand-in clock; the host idles `REST` of that
     # after every replay, warmups included, which keeps a leaf off the lower

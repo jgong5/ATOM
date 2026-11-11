@@ -386,7 +386,7 @@ reads: one weight can read a few percent off another of the same spec
 ([#1580](https://github.com/jgong5/ATOM/issues/1580)). Copies past the cache-sized count
 reuse that count's activations, so they hold no memory beyond the weights. The prototype's
 mrope reading, 3.3% to 11.5% under the same call timed where ATOM's decode step makes it,
-was the fixed replay cost at two call counts (above), not warm caches. The warm-over-cold ratio, the same point replayed on one copy, is reported per point
+was the fixed replay cost at two call counts (above), not warm caches. The warm-over-cold ratio, the same point replayed on one copy, one an occurrence where ATOM passes later occurrences a buffer of their own, is reported per point
 as a diagnostic and prices nothing. A graph under K calls has no copy floor and no warm
 graph: its 10 ms of calls pass the last-level cache many times over, so warm over cold
 reads about 1. The card's PTL state is read and keyed as

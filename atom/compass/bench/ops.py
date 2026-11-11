@@ -117,7 +117,8 @@ again, it and the metadata views cloned once each, and only where they differ
 from the last placement's; a view an operator writes (`_writes`) has clones
 apart, which only that operator's leaves share. A KV argument
 places a leaf's copies as a context key does. A second graph runs
-copy 0 K times, warm; with one copy, or K under `CALLS`, there is none.
+copy 0 K times, warm, or call c on copy c mod N mod the occurrences where
+later ones take a `QUERIED` slot; with one copy, or K under `CALLS`, none.
 Before each capture, and once the runner sized its KV pool, the memory the
 bench freed goes back to the driver, and the bench waits, at most `CLEAR_S`,
 until the card's VRAM in use falls by it (`_release`); a point records the
@@ -233,7 +234,7 @@ PROG = "compass measure ops"
 #: The timing protocol's version; it changes whenever a count below, the
 #: copies a graph reads, what a capture waits for or what a replay follows
 #: change.
-PROTOCOL = 28
+PROTOCOL = 29
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -1386,7 +1387,8 @@ class Stub:
         sized to the cache (`cold_copies`) each on copy `c mod m`'s
         activations, then copy `c mod n` with the c-th weight up to the
         leaf's occurrences when it takes one, at most K, each replay after one
-        read of `flush`; and, when K is `CALLS`, warm over one, with no read;
+        read of `flush`; and, when K is `CALLS`, warm over one, or one an
+        occurrence where later ones take a `QUERIED` buffer, with no read;
         with its kernels, profiled again on every rank when any rank's named
         none of a call its cold graph timed. Every rank's graph holds the most K
         any rank's call gives, and a leaf any rank refuses, every rank does."""
@@ -1441,7 +1443,10 @@ class Stub:
             n = len(calls)
             cycle = [calls[i % n] for i in range(k)]
             cold = _replay(fn, cycle, self.flush)
-            warm = _replay(fn, calls[:1] * k) if n > 1 and k == CALLS else None
+            # warm: call i on its cold call's occurrence's first copy (`QUERIED`)
+            o = op["occurrences"] if any(s == sig for _, s, _ in self.later) else 1
+            warm = [calls[i % n % o] for i in range(k)]
+            warm = _replay(fn, warm) if n > 1 and k == CALLS else None
             # two profiles that named nothing of a call its graph timed missed it
             if agreed(int(not kernels and any(cold)), cpu_group(), most=True):
                 forward_context._forward_context = calls[0][1]
