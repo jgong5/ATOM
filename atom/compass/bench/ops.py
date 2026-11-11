@@ -2807,7 +2807,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     # runs it too; a rung keeps each leaf, and a decode's own shape holds
     # none its width does (above): such a leaf moves as its drafter's graph
     # holds it
-    moved = set()
+    moved = {}  # ordered as found, not by a per-process string hash
     for s, (line, outputs) in draft_lines.items():
         if line.get("draft_moe_rows") is None:  # no DP gather, no other G
             continue
@@ -2822,7 +2822,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                 if leaf[0].get("drafted"):
                     held.pop(sig, None)
                 graphs.setdefault(at, {})[sig] = leaf
-                moved.add(at)
+                moved[at] = None
     prefills |= {s for s in moved if s.phase == "prefill"}
     # a run resumed into `out` keeps the rounds an earlier one wrote there
     rounds = [int(d.name[5:]) for d in out.glob("round*") if d.name[5:].isdigit()]
