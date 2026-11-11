@@ -59,8 +59,8 @@ from atom.compass.artifacts import (
     Key,
     Kind,
     Provenance,
-    machine_spec_digest,
-    machine_spec_key,
+    keyed_platform,
+    machine_platform,
     read_back,
     roots_for,
 )
@@ -118,7 +118,7 @@ def main(argv: list[str], again: bool = False) -> None:
             )
     model = serve._model(atom_args)
     machine = MachineSpec.from_mapping(json.loads(Path(args.machine).read_text()))
-    stated = machine_spec_key(machine).values
+    stated = machine_platform(machine)
     other = [
         f"GPU {gpu['index']} is {gpu['name']} {gpu['arch']}"
         for gpu in _device(args.gpu)
@@ -261,8 +261,9 @@ def _publish(out: Path, ranks: dict, readable: str, machine, store, command) -> 
         r["readings"]["driver_and_collective_reserve_bytes"] for r in ranks.values()
     ]
     across_ranks("non_torch", reserve)
+    platform = machine_platform(machine)
     key = Key.of(
-        Kind.MEMORY_READINGS, machine_spec=machine_spec_digest(machine), **fields
+        Kind.MEMORY_READINGS, **keyed_platform(Kind.MEMORY_READINGS, platform), **fields
     )
     members = {name: json.dumps(r["readings"]).encode() for name, r in ranks.items()}
     ArtifactStore(store).publish(
@@ -273,11 +274,7 @@ def _publish(out: Path, ranks: dict, readable: str, machine, store, command) -> 
             roots_for({"atom": "atom", "aiter": "aiter"}),
         ),
         topology=read_back(min(ranks))[1].topology,
-        conditions=memory.conditions(
-            fields,
-            **machine_spec_key(machine).values,
-            torch=machine.value("device.software_pinned_to.torch"),
-        ),
+        conditions=memory.conditions(fields, **platform),
         gates=GateState.of(),
         members=members,
     )

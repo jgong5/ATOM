@@ -39,6 +39,7 @@ from atom.compass.artifacts import (
     Topology,
     git_described_root,
     git_tree_root,
+    keyed_platform,
     member_name,
     module_root,
     provenance,
@@ -121,11 +122,20 @@ LAYOUT = {
 }
 
 
+#: The platform the keys here state.
+ON = {
+    "device": "MI308X gfx942",
+    "software_stack": "rocm 7.2.4 / aiter f4e7c7509 / rccl 2.22.3",
+    "ptl": "disabled",
+    "torch": "2.10.0",
+}
+
+
 def price_key(tp: int = 2, **layout: object) -> Key:
     return Key.of(
         Kind.PRICE_LIST,
         model="Qwen/Qwen3-32B",
-        machine_spec="sha256:mi308x",
+        **keyed_platform(Kind.PRICE_LIST, ON),
         source_root=ATOM_ROOT.revision,
         **{**LAYOUT, "tp": tp, **layout},
     )
@@ -137,7 +147,7 @@ def graph_key(structure: str = "qwen3-moe-48L") -> Key:
         structure=structure,
         shape="decode B=2",
         source_root=ATOM_ROOT.revision,
-        torch="2.10.0+rocm7.2.4",
+        torch=ON["torch"],
     )
 
 
@@ -168,7 +178,7 @@ def test_a_price_list_asked_for_by_path_is_refused_by_name(tmp_path):
         Key.of(
             Kind.PRICE_LIST,
             model="Qwen/Qwen3-32B",
-            machine_spec="sha256:mi308x",
+            **keyed_platform(Kind.PRICE_LIST, ON),
             source_root="/measurements/prices.json",
             **LAYOUT,
         )
@@ -220,17 +230,23 @@ def test_two_keys_never_share_a_directory(tmp_path):
         (
             Kind.STEP_MEASUREMENT,
             (
-                "(model, device, engine_config, source_root, sampling, "
-                "step_kind, view)"
+                "(model, engine_config, source_root, sampling, step_kind, view, "
+                "device, software_stack, ptl, torch)"
             ),
         ),
         (
             Kind.STEP_LINEAR_LAW,
-            "(model, machine_spec, engine_config, source_root, form)",
+            (
+                "(model, engine_config, source_root, form, device, software_stack, "
+                "ptl, torch)"
+            ),
         ),
         (
             Kind.HOST_LAWS,
-            "(host_cpu, atom_src, model, engine_config, machine_spec)",
+            (
+                "(host_cpu, atom_src, model, engine_config, device, software_stack, "
+                "torch)"
+            ),
         ),
     ],
 )

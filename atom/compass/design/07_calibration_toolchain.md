@@ -1247,8 +1247,8 @@ Consequences worth noting:
   `W_launch` is time spent launching into the HIP runtime, and `W_post` and `L_mtp` wait
   on a device-to-host copy. PTL does not: it moves the device clock, not host time, so
   their key does not carry it. Torch invalidates them, and their key carries it:
-  `W_pre`, `W_launch` and `W_post` run through torch. A run does not yet check torch for
-  host laws ([#2475](https://github.com/jgong5/ATOM/issues/2475)). Their tokenizer and
+  `W_pre`, `W_launch` and `W_post` run through torch. A run checks the torch of their
+  host key as it checks the rest of it ([#2717](https://github.com/jgong5/ATOM/issues/2717)). Their tokenizer and
   HTTP intake terms time the host too, so its CPU invalidates them, where the spec's
   tokenizer row left the host CPU out on T53's assumption, now retired (D38, Phase 1c).
   `step_measurement` and `step_linear_law` hold device time, so the host CPU does not

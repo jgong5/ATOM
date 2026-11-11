@@ -40,7 +40,7 @@ from atom.compass.artifacts import (
     Kind,
     Provenance,
     Topology,
-    machine_spec_key,
+    machine_platform,
     member_name,
     roots_for,
 )
@@ -113,8 +113,7 @@ def publish(out, run: dict, command: str) -> Key:
         ),
         topology=topology,
         conditions=Conditions.of(
-            **machine_spec_key(machine).values,
-            torch=machine.value("device.software_pinned_to.torch"),
+            **machine_platform(machine),
             atom_src=compass_run.atom_source(host["atom"]),
             model=host["model"],
             host_cpu=host["host_cpu"],

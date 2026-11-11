@@ -72,8 +72,8 @@ optional, the lookahead of the channels it names, `HOP_FLOOR_S` where absent,
 which the run summary names under ``unmeasured_hops``), one of ``step_stub`` (a
 `Coefficients` mapping,
 priced by `StepStubBackend`), ``step_linear`` (a `StepLinearLaw` mapping,
-priced by `StepLinearBackend`; its ``machine_spec`` digest and
-its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
+priced by `StepLinearBackend`; its ``platform``, the platform fields of its key,
+and its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, and a law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
@@ -111,8 +111,8 @@ image of a chat request; without it a request with an image is refused),
 on ``(1, tokens, seqs)``; with any laws, a forward whose kind has none for a
 segment it runs and ``skip`` does not name is refused, that segment costing 0 s
 (`HostDeviceRecurrence.device_end`); ``key``, the `host_key` they were
-fitted under and the ``machine_spec`` digest of the spec of the platform they
-were fitted on, which a run with laws must match; ``admit``, coefficients on
+fitted under and the platform fields of their store key, which a run with
+laws must match; ``admit``, coefficients on
 a forward's admissions, which add to its ``E``, or null to refuse a forward
 that admits a request, and absent from an entry whose ``E`` laws hold them;
 ``skip``, segments zeroed for a what-if run, which the graders refuse;
@@ -458,9 +458,9 @@ def pick_fitted(run: dict, name: str, config) -> None:
 def refuse_unfitted_law(run: dict, config) -> None:
     """Refuse the run file's step linear law where `config` is not what it was
     fitted under: its engine config, which states its tensor-parallel width,
-    context-parallel width 1, and its machine spec, which the run file's must
-    be."""
-    from atom.compass.artifacts import machine_spec_digest, machine_spec_key
+    context-parallel width 1, and its platform, which the run file's machine
+    spec must state."""
+    from atom.compass.artifacts import Kind, keyed_platform, machine_platform
     from atom.compass.run.step_grid import differ, keyed
 
     law = run[STEP_LINEAR]
@@ -475,13 +475,17 @@ def refuse_unfitted_law(run: dict, config) -> None:
             + "; ".join(named)
         )
     refuse_context_parallel(STEP_LINEAR, config)
-    machine = _machine(run)
-    here = machine_spec_digest(machine)
-    if (fitted_on := law.get("machine_spec")) != here:
+    fitted_on = law.get("platform") or {}
+    here = keyed_platform(Kind.STEP_LINEAR_LAW, machine_platform(_machine(run)))
+    if named := [
+        f"{f} {fitted_on.get(f)!r} in the law and {v!r} here"
+        for f, v in here.items()
+        if fitted_on.get(f) != v
+    ]:
         raise ValueError(
-            f"the step linear law was fitted on machine spec {fitted_on} and this "
-            f"run's is {here}, {machine_spec_key(machine)}; a law measured "
-            "on one platform is no evidence about another"
+            "the step linear law was fitted on another platform: "
+            + "; ".join(named)
+            + "; a law measured on one platform is no evidence about another"
         )
 
 
@@ -501,13 +505,17 @@ def refuse_context_parallel(name: str, config) -> None:
         )
 
 
-def refuse_unfitted_host(host: dict, config, platform: str) -> None:
+def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     """Refuse the run file's host laws `host` when fitted under another host
-    key than this run's, on the machine spec of digest `platform`, the graph
-    sets their key states taken as this run's, which records none."""
+    key than this run's, on `platform` (`machine_platform`), the graph sets
+    their key states taken as this run's, which records none."""
+    from atom.compass.artifacts import Kind, keyed_platform
     from atom.compass.backends.launch_features import GRAPHS, stated
 
-    ours = host.get("laws") and {**host_key(config), "machine_spec": platform}
+    ours = host.get("laws") and {
+        **host_key(config),
+        **keyed_platform(Kind.HOST_LAWS, platform),
+    }
     theirs = host.get("key") or {}
     launch = stated(theirs)
     if ours and launch[1] is not None:
@@ -1701,7 +1709,7 @@ def runner(model_runner, tree) -> None:
     run = spec()
     if run is None:
         return
-    from atom.compass.artifacts import machine_spec_digest
+    from atom.compass.artifacts import machine_platform
     from atom.compass.backends.geometry import Parallelism
     from atom.compass.backends.launch_features import stated
     from atom.compass.backends.step_linear import StepLinearBackend, StepLinearLaw
@@ -1781,7 +1789,7 @@ def runner(model_runner, tree) -> None:
             stage_share=share,
         )
     machine = _machine(run)
-    platform = machine_spec_digest(machine)
+    platform = machine_platform(machine)
     bundle = None
     if STEP_GRID in run:
         from atom.compass.run.step_grid import load
