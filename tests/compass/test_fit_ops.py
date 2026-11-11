@@ -15,7 +15,9 @@ from test_op_work import leaf, t
 from atom.compass import cli, run
 from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, GateState, Key, Kind
 from atom.compass.backends import BatchView, RequestShape
-from atom.compass.backends.op_graph import OpGraphBackend
+from atom.compass.backends.op_graph import LISTED, OpGraphBackend
+from atom.compass.backends.provenance import Refusal
+from atom.compass.backends.resolver import CostRefused
 from atom.compass.bench import ops as bench
 from atom.compass.capture.peers import MORI
 from atom.compass.fit import ops, publish
@@ -515,6 +517,34 @@ def test_a_price_list_prices_a_collective_between_two_measured_sizes(rows, at, p
         assert got.seconds == pytest.approx(priced)
 
 
+V4_DECODE = "aiter.mla:mla_decode_fwd_v4_nm"
+
+
+def _layer(base):
+    """DeepSeek-V4's decode attention over 4 rows in a layer whose view of the
+    one KV pool starts at row `base`, as its `op_graph` holds it."""
+    q = {"shape": [4, 8, 64], "stride": [512, 64, 1], "dtype": BF16}
+    kv = {"shape": [4096 - base, 64], "stride": [64, 1], "dtype": BF16}
+    args = {"q": q | {"role": "activation"}, "kv_buffer": kv | {"role": "kv"}}
+    return {"op": V4_DECODE, "args": args, "out": []}
+
+
+def test_each_layer_s_attention_prices_from_the_point_one_layer_s_view_measured():
+    # measured on the first layer's view at two contexts, its time moving
+    points = [
+        {"shape": "decode B=4", "context": c, "op": V4_DECODE, "cold_ns": ns}
+        | {"leaf": bench.signature(_layer(0)), "kernels": ["mla"]}
+        for c, ns in ((1024, 10e3), (4096, 40e3))
+    ]
+    params = ops.fit(points)
+    ops.held_out(params)
+    at = ("decode", None, 4, None, 4096, 4096)
+
+    got = [ops.PriceList(params).price((_layer(b), at, 0)) for b in (0, 64, 128)]
+
+    assert [getattr(g, "seconds", g) for g in got] == [pytest.approx(40e-6)] * 3
+
+
 @pytest.mark.parametrize(
     "mean, priced",
     [
@@ -633,3 +663,77 @@ def test_a_leaf_over_a_prefill_s_rows_and_its_width_is_priced_at_each_width_apar
     got = _priced(points, step, lambda _, at: _mixed(1, at))
 
     assert got == {"op.aten.mul.Tensor.price_list": pytest.approx(priced)}
+
+
+#: A drafter's later pass, 1 us a row and flat over a decode's context, at a
+#: prompt's rows, 1 and 2, and at 4, the width a prompt of 60 tokens and one of
+#: 4, its T, padded its later pass to: there it ran 1 row or 4.
+LATER = [_at(_later(2), "decode B=2", 2e3, c) for c in (1000, 3000)]
+LATER += [
+    _at(_later(b), f"prefill T={t} B={b}", b * 1e3) for t, b in ((60, 1), (80, 2))
+]
+LATER += [_at(_later(4), f"prefill T={t} B=1 W=4", 4e3) for t in (60, 4)]
+EITHER = "it leads with its T, a count of its width too, so it ran at "
+
+
+def test_fit_ops_leaves_out_by_name_a_point_that_ran_its_leaf_at_either_b():
+    params = ops.fit(LATER)
+
+    prefill = [f for name, f in params["families"].items() if "prefill" in name]
+    assert [(f["dims"], sorted(c for c, *_ in f["points"])) for f in prefill] == [
+        (["B"], [[1], [2], [4]])
+    ]
+    assert params["left_out"] == [
+        {
+            "shape": "prefill T=4 B=1 W=4",
+            "op": "aiter.step",
+            "why": EITHER + "T=4 B=1 or T=4 B=4",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "queries, width, priced",
+    [((60,), None, 1e-6), ((40, 40), None, 2e-6), ((60,), 4, 4e-6), ((4,), 4, None)],
+    ids=["one-row", "two-rows", "padded-to-4", "t-is-its-w"],
+)
+def test_a_prefill_whose_t_is_its_w_declines_its_later_pass_and_blends_no_width(
+    queries, width, priced
+):
+    prompts = tuple(RequestShape(q, q, False) for q in queries)
+    step = BatchView(prompts, produces_output=True, draft_bs=width)
+    rows = width or len(queries)
+
+    def graph(draft, _):
+        return _later(rows) if draft else {"seq": []}
+
+    if priced is None:
+        with pytest.raises(CostRefused) as refused:
+            _priced(LATER, step, graph, drafts=2)
+        why = "aiter.step: " + EITHER + "T=4 B=1 or T=4 B=4"
+        assert Refusal(LISTED, why) in refused.value.declined
+    else:
+        got = _priced(LATER, step, graph, drafts=2)
+        assert got == {"draft op.aiter.step.price_list": pytest.approx(priced)}
+
+
+def _tokens(n):
+    """A leaf over a prompt's `n` tokens."""
+    return leaf("aiter.embed", x=t([n, 8]))
+
+
+@pytest.mark.parametrize("tokens, width", [(60, None), (4, 4)], ids=["60", "4-of-4"])
+def test_a_leaf_over_a_prompt_s_tokens_keeps_its_t_is_w_point_and_prices_there(
+    tokens, width
+):
+    # 10 ns a token, flat over a decode's context, at 60 and 80 tokens and at 4
+    # padded to 4: its family reads its T alone, so either B prices it alike
+    points = [_at(_tokens(2), "decode B=2", 20.0, c) for c in (1000, 3000)]
+    points += [_at(_tokens(n), f"prefill T={n} B=1", n * 10.0) for n in (60, 80)]
+    points += [_at(_tokens(4), "prefill T=4 B=1 W=4", 40.0)]
+    prompt = (RequestShape(tokens, tokens, False),)
+    step = BatchView(prompt, produces_output=True, target_bs=width)
+
+    got = _priced(points, step, lambda *_: _tokens(tokens))
+
+    assert got == {"op.aiter.embed.price_list": pytest.approx(tokens * 1e-8)}

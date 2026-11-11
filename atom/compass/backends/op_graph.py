@@ -57,8 +57,11 @@ stream. Both micro-batches' segments go on the two streams in ATOM's order
 With a `price_list`, a source named `LISTED` (`fit.ops.PriceList` in a run),
 each leaf outside a `resource_bound` `Par` resolves through a `Resolver`: the
 price list, asked ``(leaf, bound, work)`` with `bound` the step's or
-micro-batch's (`_bound`), then its roofline. A `resource_bound` `Par` prices
-its branches' summed work, so its leaves take no price of their own.
+micro-batch's (`_bound`) at the rows the leaf ran (`_ran_at`), or the list of
+each it may have run at where it leads with a padded prefill's T that is also
+a count of its width (`_ran_at_each`), then its roofline. A `resource_bound`
+`Par` prices its branches' summed work, so its leaves take no price of their
+own.
 
 Terms. One per op kind, ``op.<kind>``, and ``par.resource_bound``, each
 the fold of its prices in run order. A term is `declared`, its note naming
@@ -275,6 +278,20 @@ def _ran_at(leaf: dict, bound: tuple) -> tuple:
     shapes = [a["shape"] for a in args if a["role"] in ("activation", "metadata")]
     leads = {n for s in shapes + leaf["out"] for n in s[:1]}
     return (both if leads & counts else wide) if leads & wides else rows
+
+
+def _ran_at_each(leaf: dict, bound: tuple) -> list:
+    """`_ran_at`'s bound, then, where a padded prefill's T is also a count of
+    its width, each other bound `leaf` may have run at: that T its rows'
+    count alone, or its width's alone."""
+    each = [_ran_at(leaf, bound)]
+    if len(bound) == 4 and bound[0][0] == "prefill":
+        *at, (counts, wides) = bound
+        t = {at[0][1]} & wides
+        for sets in ((counts - t, wides), (counts, wides - t)):
+            if (got := _ran_at(leaf, (*at, sets))) not in each:
+                each.append(got)
+    return each
 
 
 class OpGraphBackend(CostBackend):
@@ -697,8 +714,9 @@ class OpGraphBackend(CostBackend):
         if w is None:
             return None
         if bound:
+            each = _ran_at_each(leaf, bound)
             try:
-                got = self.resolver.resolve((leaf, _ran_at(leaf, bound), w))
+                got = self.resolver.resolve((leaf, each if each[1:] else each[0], w))
             except CostRefused as exc:
                 refused.extend(exc.declined)
                 return None
