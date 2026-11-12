@@ -30,9 +30,11 @@ is `keyed`, as JSON: the ladder the runner replays (none under
 DP widths, DP attention, expert parallelism, TBO, the MoE backend, EPLB and
 DeepSeek-V4.1 decoder SWA bounded replay when
 off ATOM's default, the index cache's dtype where ATOM resolved it apart from
-the KV cache's, the performance environment, ATOM's prefill token buckets
-in it when off ATOM's default too, and, under speculation, its
-method and draft width. Loading refuses, naming what differs:
+the KV cache's, MiniMax-M3's indexer-only context parallelism when on, the
+model config's ``--hf-overrides`` when it states any, the performance
+environment, ATOM's prefill token buckets, vocabulary-embedding replication
+and MXFP8 shared-expert fusion in it when off ATOM's default too, and, under
+speculation, its method and draft width. Loading refuses, naming what differs:
 
 - a run at data-parallel width above one, since every bundle is measured at one;
 - a keyed condition, the grid's graph mode, a timing scope other than the
@@ -96,14 +98,25 @@ OFF_DEFAULT = (
 DERIVED = {"index_cache_dtype": "kv_cache_dtype"}
 #: ATOM's prefill token buckets, an environment variable `keyed` the same way.
 BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
+#: ATOM's environment variables `keyed` states only where ATOM reads them off
+#: their default: `BUCKETS`, vocabulary-embedding replication (GLM-5.2's whole
+#: embedding, with no all-reduce after it) and the fusion of MiniMax-M3.1's
+#: MXFP8 shared expert into its MXFP4 MoE.
+ENV_OFF_DEFAULT = (
+    BUCKETS,
+    "ATOM_REPLICATE_VOCAB_EMBED",
+    "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4",
+)
 
 
 def keyed(config, ladder: bool = True) -> dict:
     """The conditions a bundle is measured under, as the resolved config holds them,
-    `OFF_DEFAULT` only where it is off its default, and the performance
-    environment of this process less the client's and the device selection,
-    `BUCKETS` in it only off ATOM's default, and under speculation its method
-    and draft width; the ladder only with `ladder`."""
+    `OFF_DEFAULT` only where it is off its default, MiniMax-M3's indexer-only
+    context parallelism only when on, the model config's overrides only when
+    it states some, and the performance environment of this process less the
+    client's and the device selection, `ENV_OFF_DEFAULT` in it only off ATOM's
+    default, and under speculation its method and draft width; the ladder only
+    with `ladder`."""
     from atom.config import Config
 
     spec = getattr(config, "speculative_config", None)
@@ -116,6 +129,11 @@ def keyed(config, ladder: bool = True) -> dict:
             default = getattr(config, DERIVED[name])
         if (value := getattr(config, name, None)) not in (None, default):
             drafts[name] = value
+    if getattr(getattr(config, "dcp_config", None), "indexer_dcp_only", False):
+        drafts["indexer_dcp_only"] = True
+    # ATOM applies them to the model config after it reads config.json.
+    if overrides := getattr(config, "hf_overrides", None):
+        drafts["hf_overrides"] = overrides
     return drafts | {
         "kv_cache_block_size": config.kv_cache_block_size,
         "kv_cache_dtype": config.kv_cache_dtype,
@@ -132,24 +150,28 @@ def keyed(config, ladder: bool = True) -> dict:
 
 def keyed_env() -> dict:
     """This process's performance environment as `keyed` states it: less the
-    client's variables and the device selection, `BUCKETS` in it only off
-    ATOM's default."""
+    client's variables and the device selection, `ENV_OFF_DEFAULT` in it only
+    off ATOM's default."""
     return {
         k: v
-        for k, v in sorted((performance_env() | _buckets_off_default()).items())
+        for k, v in sorted((performance_env() | _env_off_default()).items())
         if not (k.startswith("AIPERF_") or k.endswith("_VISIBLE_DEVICES"))
     }
 
 
-def _buckets_off_default() -> dict:
-    """`BUCKETS` as this process sets it when ATOM reads it off its default, else
-    nothing: ATOM states the default only inside its reader, run here unset."""
+def _env_off_default() -> dict:
+    """Each of `ENV_OFF_DEFAULT` that ATOM reads off its default, as this
+    process sets it: ATOM states each default only inside its reader, run here
+    unset."""
     from atom.utils import envs
 
-    read = envs.environment_variables[BUCKETS]
     unset = SimpleNamespace(getenv=lambda _, default=None: default)
-    off = read() != FunctionType(read.__code__, read.__globals__ | {"os": unset})()
-    return {BUCKETS: os.environ[BUCKETS]} if off else {}
+    off = {}
+    for name in ENV_OFF_DEFAULT:
+        read = envs.environment_variables[name]
+        if read() != FunctionType(read.__code__, read.__globals__ | {"os": unset})():
+            off[name] = os.environ[name]
+    return off
 
 
 def differ(there: dict, here: dict, where: str) -> list[str]:

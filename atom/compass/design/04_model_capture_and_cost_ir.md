@@ -1148,12 +1148,15 @@ the parallel layout, TBO, speculation when it is on, `moe_backend`, `eplb_enable
 `enable_decoder_swa_bounded_replay` when
 they are off ATOM's default, the `index_cache_dtype` ATOM resolved where it differs
 from `kv_cache_dtype` (the [ruling on #2981](https://github.com/jgong5/ATOM/issues/2981)),
-and the performance environment
+MiniMax-M3's indexer-only context parallelism (`dcp_config.indexer_dcp_only`) when it
+is on, `--hf-overrides` when it states any, and the performance environment
 (`atom.benchmarks.results.metadata.PERFORMANCE_KEYS`) less the client's `AIPERF_*`
 variables and the device selection; ATOM's Triton expert and GEMM switches
 (`ATOM_USE_TRITON_MOE`, `ATOM_USE_TRITON_MOE_A4W4`, `ATOM_USE_TRITON_MOE_DECODE`,
 `ATOM_USE_TRITON_GEMM`) are in it, and ATOM's prefill token buckets
-(`ATOM_TOKEN_GRAPH_SIZES`) only when ATOM reads them off its default. One store holds V4-Pro graphs of one shape that
+(`ATOM_TOKEN_GRAPH_SIZES`), vocabulary-embedding replication
+(`ATOM_REPLICATE_VOCAB_EMBED`) and MXFP8 shared-expert fusion
+(`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4`) only when ATOM reads them off its default. One store holds V4-Pro graphs of one shape that
 differ only in `kv_cache_dtype`, only in `ATOM_USE_TRITON_MOE`, or only in the index
 cache dtype ATOM resolves for a P/D side and for a plain start at gfx950
 (`atom/config.py::Config.__post_init__`), and each run reads its own.
