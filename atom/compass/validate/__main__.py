@@ -35,6 +35,11 @@ each side costed at the law fitted under its engine config and checked against i
 engine's hand-in, `lp-engine-P.json` or `lp-engine-D.json`, at DP width above 1
 each rank's (`lp-engine-P.dp0.json`, a row per rank); `validate.runs` grades its
 schedule per side, its end to end once.
+
+`python -m atom.compass.validate --curves OUT ARM...` draws instead each ARM's
+points, a directory each, as InferenceX draws agentic results: real and
+simulated curves as charts in OUT, and a verdict per point and metric, as
+`validate.curves` states.
 """
 
 from __future__ import annotations
@@ -68,7 +73,7 @@ from atom.compass.run import (
     refuse_renamed_keys,
 )
 from atom.compass.run.step_grid import keyed_of, read
-from atom.compass.validate import cost, runs
+from atom.compass.validate import cost, curves, runs
 
 BANDS = [token_band(edge) for edge in (0, *TOKEN_BANDS)]
 #: Cost rows' verdict per report group: the graded ones carry the gate.
@@ -417,8 +422,11 @@ def rows(cell) -> list[tuple]:
 
 
 def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["--curves"]:
+        return curves.main(argv[1:])
     print("cell | result | metric | value | verdict")
-    for cell in sys.argv[1:] if argv is None else argv:
+    for cell in argv:
         for row in rows(cell):
             print(" | ".join((Path(cell).name, *row)))
 
