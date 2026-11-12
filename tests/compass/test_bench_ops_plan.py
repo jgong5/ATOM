@@ -28,10 +28,11 @@ from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
 from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
 from atom.compass import capture, cli, ir
-from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
+from atom.compass.artifacts import ArtifactStore, Topology, member_name
 from atom.compass.bench import ops
-from atom.compass.capture import driverless, forward
+from atom.compass.capture import driverless, forward, graph_key
 from atom.compass.capture.forward import decode, prefill, structure
+from atom.compass.capture.graph import Traced, build, to_json
 from atom.compass.fit import ops as fit_ops
 from atom.compass.run import memory, step_grid
 from atom.compass.runner.overrides import schedulable_ladder
@@ -345,6 +346,76 @@ def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
     report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
 
     assert report["by phase"] == {"prefill": {"steps": 2, "covered": covered}}
+
+
+def test_layers_that_view_one_kv_pool_from_rows_of_their_own_plan_one_point(
+    bench, tmp_path, monkeypatch
+):
+    """DeepSeek-V4's layers each view one KV pool from a base row of their own
+    on, so one layer's attention leaf differs from the next one's only in its
+    view's rows: the plan measures one point for both, over cached tokens too."""
+
+    def graph(store, config, shape, arch=None):
+        rows = shape.tokens if shape.phase == "prefill" else shape.seqs
+        q = ("q", _t([rows, 8], "activation"))
+        layers = [
+            _leaf("aiter.attn", q, ("kv", _t([4096 - base, 8], "kv")))
+            for base in (0, 64)
+        ]
+        traced = Traced(f"x tp=1 {shape.phase} eager", str(shape))
+        return json.loads(to_json(build(list(enumerate(layers)), traced)))
+
+    monkeypatch.setattr(ops, "graph", graph)
+    monkeypatch.setattr(ops, "_child", _moving_bench)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[100, 2100, False]], None),
+        ([[100, 3100, False]], None),
+    )
+
+    records = _plan(bench, tmp_path, plan)
+
+    points = [(r["shape"], json.dumps(r["context"])) for r in records]
+    assert len(points) == len(set(points))
+    assert {r["context"] for r in records if r["shape"].startswith("prefill")} == {
+        None,
+        2000,
+        3000,
+    }
+
+
+@pytest.mark.parametrize(
+    "slot, values, leaves",
+    [
+        ("prefix", ("layers.0.attn.swa_write", "layers.1.attn.swa_write"), 1),
+        ("quant_mode", ("group_fp8", "per_row_fp8"), 2),
+    ],
+)
+def test_layers_whose_calls_differ_only_in_a_string_plan_one_point_per_mode(
+    bench, tmp_path, monkeypatch, slot, values, leaves
+):
+    """DeepSeek-V4 passes each layer's window write the layer's name, which no
+    kernel reads, so one layer's leaf differs from the next one's only there:
+    the plan measures one point for both. A string that picks how a kernel
+    runs, a quantization mode, keeps its calls apart."""
+
+    def graph(store, config, shape, arch=None):
+        rows = shape.tokens if shape.phase == "prefill" else shape.seqs
+        kv = ("kv", _t([rows, 8], "activation"))
+        calls = [_leaf("atom.swa_write", kv, (slot, value)) for value in values]
+        traced = Traced(f"x tp=1 {shape.phase} eager", str(shape))
+        return json.loads(to_json(build(list(enumerate(calls)), traced)))
+
+    monkeypatch.setattr(ops, "graph", graph)
+    plan = _records(
+        tmp_path / "plan", ([[1, 1000, True]], 2), ([[100, 2100, False]], None)
+    )
+
+    records = _plan(bench, tmp_path, plan)
+
+    points = [(r["shape"], json.dumps(r["context"])) for r in records]
+    assert {points.count(p) for p in points} == {leaves}
 
 
 @pytest.mark.parametrize(
@@ -889,11 +960,7 @@ def test_an_integer_activation_indexes_a_dimension_of_one():
 
 def _publish_graph(store, config, arch, shape):
     """A graph of `shape` keyed on `arch`, its one leaf named for the arch."""
-    key = Key.of(
-        Kind.OP_GRAPH,
-        structure=structure(config, shape.phase, device=arch),
-        shape=str(shape),
-    )
+    key = graph_key(structure(config, shape.phase, device=arch), str(shape))
     leaf = _leaf(f"aiter.{arch}", ("x", _t([shape.seqs, 8], "activation")))
     store.publish(
         key,
@@ -1255,7 +1322,7 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     def publish(store, graph, model, declared, tp, atom_args, command):
         at = graph.applicability
         published.append((at.structure, tp))
-        key = Key.of(Kind.OP_GRAPH, structure=at.structure, shape=str(at.shape))
+        key = graph_key(at.structure, str(at.shape))
         store.publish(
             key,
             provenance=stanza("compass trace ops"),

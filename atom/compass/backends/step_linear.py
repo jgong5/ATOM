@@ -30,8 +30,8 @@ over its ranks. Its parallel layout is its `engine_config`'s, which a run
 checks; a law stating `key` is refused. A backend built for a data-parallel
 width above 1 names `UNIFORM_ROUTING` among every step's treatments: the MoE
 segment is priced as if routing spread tokens evenly over the experts, which
-no feature carries. A run refuses a law whose
-`machine_spec` is not its spec's `machine_spec_digest`, naming both.
+no feature carries. A run refuses a law whose `platform` differs from the one
+its spec states in any field, naming each and both values.
 
 A decode vector may add one MoE column over `n`, the real tokens the step's
 MoE runs on: a data-parallel group's gathered tokens (`BatchView.moe_tokens`),
@@ -94,7 +94,7 @@ output by its prefill vector, whose terms there are the target's too.
 The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
 
     {"provenance": "<what it was fitted on>",
-     "machine_spec": "sha256:<hex>",
+     "platform": {"device": ..., "software_stack": ..., "ptl": ..., "torch": ...},
      "prefill": VECTOR,   # with a padding column, its "buckets"
      "decode": {"eager": VECTOR, "1": VECTOR, "2": VECTOR, ...},
      "moe_routing": {"experts": E, "top_k": K},   # with a moe_experts column

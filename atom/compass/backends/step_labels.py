@@ -40,8 +40,14 @@ the target's, `d_target_ns` with no gap, and the draft label is the rest of
 `d_busy_ns`. A decode's draft-KV pass, `d_draft_kv_ns`, runs before
 `forward_done_event`: its device label holds it, as its draft-KV label too,
 and its draft label does not. A device event runs no earlier than the host
-records it, so the largest launch record less its device start, over the
-record, is the host clock's lead there. A decode's draft label, its `propose`
+records it, so a launch record less its device start bounds the host clock's
+lead from below, and an MTP status wait's return less the `forward_done_event`
+it waits for bounds it from above. The clocks drift apart over a record, and
+the tightest of the last `ANCHORS` status-wait bounds (of the first, before as
+many) follows them: a step's lead is the largest launch bound moved by how far
+that tightest bound moved since, leaving out any above it at its own launch,
+whose host stalled before stamping it; with no status wait, the largest launch
+bound over the record. A decode's draft label, its `propose`
 pass, is cut where the device reached the pass, placed by that lead, before
 the host's draft copy wait (`t_draft_recv_ns`) began: the host queues the pass
 just before that wait, so the window may hold the device's wait for it.
@@ -57,6 +63,20 @@ holds the device's idle between launches the host paced, so a prefill step
 without busy time is cut as `untraced`. A trace run, a record with its busy
 lines beside it or whose run directory holds `TRACE`, ran under a profiler: its
 decode steps are cut as `traced` and its steps carry no host labels.
+
+Given `floored`, a trace run's drafter labels, the draft's and its passes',
+lose what the profiler added to each drafter kernel shorter than the profiler's
+floor (`parity.busy.floored` under a `Floor`): queued behind another, such a
+kernel records the floor, so its term is its recorded length, up to the floor,
+less its own (`Floor.term`). A kernel's own
+length is the median `warm_ns` of the `compass measure ops` points that launch
+it alone, at its grid on any shape, or, replayed from a graph, which states no
+grid, at its pass's shape, as `capture.population_steps` places the step: the
+draft-KV pass at the step's shape, the rest of the draft at its drafter's. The
+profiler adds less than the floor to any kernel, so one recorded at twice the
+floor or more is past it. A kernel no point gives its own length, or only a
+point launching it among other kernels, keeps its recorded length, and its
+sample names it under `floor` for each label holding it.
 
 A record without device windows is refused. A step mixing prefill and decode
 rows is cut. A step of an MTP record without `d_target_ns` is cut as
@@ -97,6 +117,7 @@ import bisect
 import hashlib
 import itertools
 import json
+import statistics
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -105,7 +126,9 @@ from pathlib import Path
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.shape import BatchView, RequestShape
 
-#: Token copy wait exits whose tightest bound is a step's host clock lead.
+#: The recent bounds whose tightest places a step on the host clock, of either
+#: window: token copy wait exits for the launch-exposed cut, MTP status-wait
+#: returns for the lead.
 ANCHORS = 32
 #: Why a device label is cut: a launch-exposed decode, mixed rows, no MTP target
 #: end, a prefill with no traced busy time, a trace run's decode.
@@ -154,6 +177,9 @@ class Sample:
     feature (`launch_features`), empty on a line that states none.
     `blocked` is the seconds its `W_launch` left out per blocking HIP call
     that blocked, from its line's `blocked_ns`; None on a line without it.
+    `floor` names, per busy line field of a drafter part, why the profiler's
+    floor left a kernel of it at its recorded length (`Floor.term`); empty on
+    a cut step, without `floored` or with every term known.
     """
 
     step: int
@@ -171,6 +197,55 @@ class Sample:
     admitted: tuple = (0, 0, 0)
     launch: dict = field(default_factory=dict)
     blocked: dict | None = None
+    floor: dict = field(default_factory=dict)
+
+
+class Floor:
+    """What a trace run's profiler adds to a drafter kernel shorter than its
+    floor: the floor, `seconds`, a machine spec's `device.profiler_floor_s`,
+    and the measured points of `compass measure ops`, each a kernel's own
+    length, held by kernel and grid and by kernel and shape."""
+
+    def __init__(self, seconds: float, points) -> None:
+        self.seconds = seconds
+        self._at, self._known = defaultdict(list), {}
+        for p in points:
+            grids = p.get("grids") or [None] * len(p["kernels"])
+            keys = [(k, json.dumps(g)) for k, g in zip(p["kernels"], grids) if g]
+            for key in dict.fromkeys(keys + [(k, p["shape"]) for k in p["kernels"]]):
+                self._at[key].append(p)
+
+    def term(self, name: str, grid, ns: float, shape: str) -> float | str:
+        """The ns the profiler added to one kernel recorded `ns` long: its
+        recorded length, up to the floor, less its own (`own`), none at or
+        past the floor; or why its own length is not known."""
+        floor = self.seconds * 1e9
+        if ns >= 2 * floor:
+            return 0.0
+        own = self.own(name, grid, shape)
+        return own if isinstance(own, str) else max(0.0, min(ns, floor) - own)
+
+    def own(self, name: str, grid, shape: str) -> float | str:
+        """A kernel's own length in ns: the median `warm_ns` of the points
+        that launch it alone, at `grid`, or with none at `shape`; or why
+        there is none, naming the points that launch it among others."""
+        at = shape if grid is None else json.dumps(grid)
+        if (name, at) not in self._known:
+            where = shape if grid is None else f"grid {grid}"
+            self._known[name, at] = self._own(self._at.get((name, at), []), name, where)
+        return self._known[name, at]
+
+    @staticmethod
+    def _own(found: list, name: str, where: str) -> float | str:
+        alone = [p["warm_ns"] for p in found if p["kernels"] == [name]]
+        if timed := [ns for ns in alone if ns is not None]:
+            return statistics.median(timed)
+        if alone:
+            return f"{name} at {where}: its points timed no warm replay"
+        if found:
+            ops = ", ".join(sorted({p["op"] for p in found}))
+            return f"{name} at {where} launches beside other kernels in {ops}"
+        return f"no measured point launches {name} alone at {where}"
 
 
 def admissions(lines: list[dict]) -> list[tuple[int, int, int]]:
@@ -240,34 +315,50 @@ def host_kind(view: BatchView) -> str:
     return "prefill" if view.prefill else "decode"
 
 
-def _timed(lines) -> tuple[list[tuple[dict, int]], int]:
-    """Each line with a device window and its device start, gaps and busy
-    times summed; and the host clock's lead over that device clock."""
-    device, timed = 0, []
+def _timed(lines) -> list[tuple[dict, int, int, int | None]]:
+    """Each line with a device window, its device start, gaps and busy times
+    summed, the host clock's lead over that device clock there, and the
+    `forward_done_event` of the output forward before it, or None."""
+    device, timed, done = 0, [], None
     for s in lines:
         if "d_busy_ns" in s:
             start = device + s.get("d_gap_ns", 0)
             device = start + s["d_busy_ns"]
-            timed.append((s, start))
-    return timed, max(s["t_launch_ns"][0] - start for s, start in timed)
+            timed.append((s, start, done))
+            if s["produces_output"]:
+                done = None
+                if "d_target_ns" in s:
+                    done = start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0)
+    bounds = [
+        s["t_mtp_ns"][1] - d if "t_mtp_ns" in s and d is not None else None
+        for s, _, d in timed
+    ]
+    waits = [b for b in bounds if b is not None]
+    first, recent, tight = min(waits[:ANCHORS], default=0), deque(maxlen=ANCHORS), []
+    for b in bounds:
+        if b is not None:
+            recent.append(b)
+        tight.append(min(recent) if len(recent) == ANCHORS else first)
+    lows = [s["t_launch_ns"][0] - start for s, start, _ in timed]
+    margins = [t - low for t, low in zip(tight, lows) if low <= t or not waits]
+    if not margins:
+        raise ValueError("every launch bound exceeds the MTP status waits' bound")
+    gap = min(margins)
+    return [(s, start, t - gap, d) for (s, start, d), t in zip(timed, tight)]
 
 
 def mtp_copy(lines) -> dict[int, tuple[int, bool]]:
     """Per forward with an MTP status wait after an output forward that marks
     its target: the nanoseconds from that forward's `forward_done_event`, after
     its target and draft-KV pass, to the wait's return, and whether the wait
-    began before the event. The lead places the event no later than it ran, so
-    the time is an upper bound."""
-    timed, lead = _timed(lines)
-    copy, done = {}, None
-    for s, start in timed:
+    began before the event. The lead places the event no later than it ran
+    while the fastest recent status copy holds still, so the time is an upper
+    bound."""
+    copy = {}
+    for s, _, lead, done in _timed(lines):
         if "t_mtp_ns" in s and done is not None:
             m0, m1 = s["t_mtp_ns"]
             copy[s["step"]] = (m1 - done - lead, m0 < done + lead)
-        if s["produces_output"]:
-            done = None
-            if "d_target_ns" in s:
-                done = start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0)
     return copy
 
 
@@ -276,10 +367,9 @@ def host_paced_drafts(lines) -> set[int]:
     and draft-KV pass and placed by the lead, before their host's draft copy
     wait began: the host queues the pass just before that wait, so the device
     waited for it there."""
-    timed, lead = _timed(lines)
     return {
         s["step"]
-        for s, start in timed
+        for s, start, lead, _ in _timed(lines)
         if "t_draft_recv_ns" in s
         and "d_target_ns" in s
         and start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0) + lead
@@ -291,8 +381,8 @@ def _host_cut(lines) -> tuple[set[int], set[int]]:
     """The steps whose device start precedes their host launch end, and the
     MTP decodes whose device reached the propose pass before the host's draft
     copy wait."""
-    (lines_timed, _), output_end, timed = _timed(lines), None, []
-    for s, start in lines_timed:
+    output_end, timed = None, []
+    for s, start, _, _ in _timed(lines):
         bound = None
         if "t_recv_ns" in s and output_end is not None:
             bound = s["t_recv_ns"][1] - output_end
@@ -349,7 +439,7 @@ def busy_gaps(lines: list[dict]) -> list[bool]:
     return [n > 0 for n in itertools.accumulate(opened[:-1])]
 
 
-def _read(record) -> list[dict]:
+def _read(record, floored=None) -> list[dict]:
     path = Path(record)
     lines = read_jsonl(path)
     if (pulls := path.with_suffix(".pulls.jsonl")).exists():
@@ -358,6 +448,9 @@ def _read(record) -> list[dict]:
         got = {b.pop("step"): b for b in read_jsonl(busy)}
         for s in lines:
             s.update(got.get(s["step"], {}))
+        if floored is not None:
+            for s, row in zip(lines, floored(path)):
+                s.update(row)
     elif _traced(path):
         raise ValueError(
             f"{record} is a trace run's record with no {busy.name}; its own "
@@ -393,13 +486,15 @@ def label(
 
 
 def label_run(
-    records, run: str | None = None, split_rule=None
+    records, run: str | None = None, split_rule=None, floored=None
 ) -> list[tuple[list[Sample], list[dict]]]:
     """`label` of each of `records`, one run's DP ranks, with each `E` from the
-    latest pull over the ranks before the same forward. A rank that ran only
-    DP's dummy forwards gives no sample and no row. Ranks whose line counts
-    differ by more than the forward a stopped server leaves on some refuse."""
-    ranks = [_read(r) for r in records]
+    latest pull over the ranks before the same forward, a trace run's drafter
+    labels under `floored`, its busy lines less the profiler's floor
+    (`parity.busy.floored`). A rank that ran only DP's dummy forwards gives no
+    sample and no row. Ranks whose line counts differ by more than the forward
+    a stopped server leaves on some refuse."""
+    ranks = [_read(r, floored) for r in records]
     counts = {Path(r).name: len(x) for r, x in zip(records, ranks) if x}
     if counts and max(counts.values()) - min(counts.values()) > 1:
         raise ValueError(
@@ -554,6 +649,7 @@ def _label(
                 admits[i],
                 s.get("launch", {}),
                 None if blocked is None else {k: v * 1e-9 for k, v in blocked.items()},
+                {} if cut else s.get("floor", {}),
             )
         )
         gap_ns = s.get("d_gap_ns")

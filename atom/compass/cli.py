@@ -40,6 +40,10 @@ COMMANDS = {
         "atom.compass.drive.measure_memory",
         "an engine start's memory readings [GPU]",
     ),
+    "measure device": (
+        "atom.compass.drive.measure_device",
+        "one node's probe record: its cards' attainable rates and floors [GPU]",
+    ),
     "fit steps": ("atom.compass.fit.steps", "a step-level backend's fit"),
     "fit ops": (
         "atom.compass.fit.ops",

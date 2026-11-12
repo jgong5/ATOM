@@ -3,7 +3,7 @@
 
 """The step linear law fitted from real step records.
 
-    python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K] [--engine FILE]
+    python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --platform JSON [--form FORM] [--moe-routing E,K] [--engine FILE]
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
@@ -53,9 +53,10 @@ host laws as a run file's `host` entry: `key`, and `laws[kind][segment]`,
 seconds on `(1, tokens, seqs)`, fitted on the samples' host labels. They take
 the step linear law's solver, MAD drops and hulls; `seqs` in a fixed
 proportion to `tokens` on every sample (equal, or a decode under MTP, where
-each row computes its drafts too) gets zero. Two keys refuse. The law and the
-host key state the `--machine-spec` digest, which a run's spec must match, and
-the host key's `engine` is the law's `engine_config`. A segment outside `HOST_SEGMENTS` is
+each row computes its drafts too) gets zero. Two keys refuse. The law, as
+`platform`, and the host key state the platform fields `--platform` gives for
+their kinds, `step_linear_law` and `host_laws`, which a run's spec must match,
+and the host key's `engine` is the law's `engine_config`. A segment outside `HOST_SEGMENTS` is
 fitted for a kind whose samples carry it: `W_inputs` and `L_mtp`, on an MTP
 record, and `W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
 solve drops above the law paid a first-use JIT compile (`_jit`): it and the
@@ -1757,6 +1758,25 @@ def _routing_arg(value: str) -> tuple[int, int]:
     return experts, top_k
 
 
+#: The kinds `--platform` states platform fields for: the law's and its host laws'.
+PLATFORM_KINDS = ("step_linear_law", "host_laws")
+
+
+def _platform_arg(value: str) -> dict:
+    """`--platform`'s JSON object, an object of platform fields per kind."""
+    try:
+        given = json.loads(value)
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not JSON") from None
+    if not isinstance(given, dict) or not all(
+        isinstance(given.get(k), dict) for k in PLATFORM_KINDS
+    ):
+        raise argparse.ArgumentTypeError(
+            f"{value!r} states no object for each of {', '.join(PLATFORM_KINDS)}"
+        )
+    return given
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         prog="python -m atom.compass.backends.step_linear_fit",
@@ -1775,10 +1795,11 @@ def main(argv=None) -> None:
         "steps' real MoE tokens, or the experts they reach, as a column",
     )
     parser.add_argument(
-        "--machine-spec",
+        "--platform",
         required=True,
-        help="the machine_spec_digest of the spec of the platform the records ran "
-        "on, which keys the law and its host laws",
+        type=_platform_arg,
+        help="the platform the records ran on, as the law's and its host laws' "
+        'keys state it: {"step_linear_law": {...}, "host_laws": {...}}',
     )
     parser.add_argument(
         "--engine",
@@ -1820,13 +1841,13 @@ def main(argv=None) -> None:
         law["unfitted"]["padding"] = NO_BUCKETS
     if any(s.provenance["config"] for s in samples):
         law["host"], law["host_fit"] = fit_host(samples)
-    law["machine_spec"] = args.machine_spec
+    law["platform"] = args.platform["step_linear_law"]
     law["engine_config"] = engine
     if "host" in law:
         stated = law["host"]["key"]["engine"]  # its graph sets stay
         graphs = {k: v for k, v in stated.items() if k == launch_features.GRAPHS}
         law["host"]["key"] |= {
-            "machine_spec": args.machine_spec,
+            **args.platform["host_laws"],
             "engine": engine | graphs,
         }
     if len(args.records) > dp:

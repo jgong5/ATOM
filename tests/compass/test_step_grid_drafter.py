@@ -43,7 +43,14 @@ from test_fit_steps import planted_roots  # noqa: F401
 from test_parity_served import SAMPLING
 from test_run_step_grid import deployment, readings
 
-from atom.compass.artifacts import ArtifactStore, Axis, GateState, Topology, member_name
+from atom.compass.artifacts import (
+    PLATFORM,
+    ArtifactStore,
+    Axis,
+    GateState,
+    Topology,
+    member_name,
+)
 from atom.compass.backends import (
     BatchView,
     CostRefused,
@@ -308,8 +315,8 @@ def flash(tmp_path):
     here = readings(r)
     configuration = {
         "model": here.reading(Axis.MODEL).value,
-        "device": "MI355X gfx950",
         "source_root": "{0.kind}-{0.value}".format(here.reading(Axis.ATOM_SRC)),
+        **{a.field: here.reading(a).value for a in PLATFORM},
     }
     return r, here, configuration
 

@@ -2,16 +2,21 @@
 """`compass fit steps`: a step-level backend fitted on labelled samples and published.
 
     compass fit steps --backend step-linear [--form FORM] [--seed S] RECORD...
-        --client-run RECORD EXPORT... --machine M --store ROOT --out DIR
+        --client-run RECORD EXPORT... [--ops DIR...] --machine M --store ROOT
+        --out DIR
     compass fit steps --backend step-grid --grid INPUT... --grid-definition FILE
         [--sessions A:B] [--seed S] TARGET... --client-run INPUT EXPORT...
-        --machine M --store ROOT --out DIR
+        [--ops DIR...] --machine M --store ROOT --out DIR
 
 Each backend in `BACKENDS` states the kind it publishes, the label sources it
 takes and its fit, which returns the key fields the configuration does not
 give, the params and the report; a flag only another backend reads refuses.
 The entry is published under the readings a run on the spec `--machine` names
-takes, which `publish.inputs` loads each measurement under.
+takes, which `publish.inputs` loads each measurement under. `--ops` names
+`measure ops --out` directories whose points take the profiler's floor out
+of a trace run's drafter labels (`publish.inputs`); the report's `floor`
+counts, per kernel the floor could not place and per label field, the steps
+the fit labels whose label keeps that kernel's recorded length.
 
 `step-linear` takes real runs only and fits `step_linear_fit.FORMS`' `--form`,
 `history` by default, joining each step's ranks at the engine config's
@@ -20,8 +25,8 @@ rank that gave no sample refuses; it pads prefill to the records'
 `prefill_buckets`, naming under `unfitted` records stating none, and holds
 out each run on the others when
 there are two or more, as that module's command does; `--seed` fixes
-its shuffles. The law states the configuration's
-`machine_spec` and `engine_config`, as that command's does, and the key holds them. The report's
+its shuffles. The law states, as `platform`, the platform fields of its key,
+and `engine_config`, as that command's does, and the key holds them. The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
 
@@ -50,9 +55,10 @@ targets', naming the targets'. `--sessions A:B` keeps the `--grid` lines
 import copy
 import dataclasses
 import json
+from collections import Counter
 from pathlib import Path
 
-from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind
+from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind, keyed_platform
 from atom.compass.backends import step_grid_fit, step_linear_fit
 from atom.compass.bench import measure
 from atom.compass.fit import publish
@@ -75,9 +81,9 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     if len({s.provenance["run"] for s in samples}) > 1:
         step_linear_fit.mark_held_out(law, report, samples, options, args.seed)
     report["provenance"] = publish.runs(samples)
-    law["machine_spec"] = config["machine_spec"]
+    law["platform"] = keyed_platform(Kind.STEP_LINEAR_LAW, config["platform"])
     law["engine_config"] = config["engine_config"]
-    return {"form": form, "machine_spec": law["machine_spec"]}, law, report
+    return {"form": form, **law["platform"]}, law, report
 
 
 def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
@@ -104,10 +110,11 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
     ]
     grid = measure.grid_plan(args, read, ragged)
     planned = grid["plan"]
-    fields = ("model", "device", "source_root")
+    fields = {f: config[f] for f in ("model", "source_root")}
+    fields |= keyed_platform(Kind.STEP_MEASUREMENT, config["platform"])
     keys = [
         measure.measurement_key(
-            {f: config[f] for f in fields},
+            fields,
             engine,
             sampling,
             measure.view_of(line),
@@ -131,7 +138,8 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
     report["provenance"] = publish.runs(samples) + [
         {**grid["provenance"], "profiled": False}
     ]
-    return {"device": config["device"], "grid": grid["grid"]}, bundle, report
+    grid_key = keyed_platform(Kind.STEP_GRID_BUNDLE, config["platform"])
+    return {**grid_key, "grid": grid["grid"]}, bundle, report
 
 
 #: Each backend's name, to the kind it publishes, its label sources and its fit.
@@ -168,6 +176,14 @@ def main(argv: list[str]) -> None:
         help="the --grid lines measure steps --sessions A:B keeps",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--ops",
+        nargs="+",
+        default=(),
+        metavar="DIR",
+        help="measure ops --out directories giving a trace run's drafter kernels "
+        "their own lengths",
+    )
     args = parser.parse_args(argv)
     if args.backend == "step-stub":
         raise ValueError(STUB)
@@ -196,8 +212,13 @@ def main(argv: list[str]) -> None:
     grid_only = {Path(n) for n in args.grid or ()} - {Path(i) for i in args.inputs}
     target_args = copy.copy(args)
     target_args.client_run = [c for c in args.client_run if Path(c[0]) not in grid_only]
-    samples, config = publish.inputs(target_args, sources)
+    samples, config = publish.inputs(target_args, sources, args.ops)
     fields, params, report = fit(samples, config, args)
+    if args.ops:
+        refused = [
+            f"{f}: {w}" for s in samples for f, ws in s.floor.items() for w in ws
+        ]
+        report["floor"] = dict(Counter(refused).most_common())
     key = Key.of(
         kind,
         **{f: config[f] for f in ("model", "source_root")},

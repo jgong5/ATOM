@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """A run loads each `step_linear_law` and `op_graph` it reads through the
-invalidation matrix, and each refuses on its row's axes, naming the axis.
+invalidation matrix, and each refuses on its row's axes its key does not state,
+naming the axis.
 
 A law is loaded as `drive.runfile` builds the run file, before a server starts,
 under the readings a run on the suite's machine document takes, with the
@@ -13,6 +14,7 @@ tracer's own arguments, which its key's structure names.
 import json
 import re
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from test_artifact_invalidation import STANZA, moved
@@ -21,6 +23,7 @@ from test_drive_runfile import LAWS, build, host_laws, install
 from test_op_graph_arch import ENGINE, run_readings
 from test_run_step_grid import NEW_KINDS, deployment, readings
 
+from atom.compass import capture
 from atom.compass.artifacts import (
     ArtifactRefusal,
     ArtifactStore,
@@ -34,6 +37,7 @@ from atom.compass.artifacts import (
     member_name,
 )
 from atom.compass.backends import StepLinearBackend
+from atom.compass.capture import graph_key
 from atom.compass.capture.forward import prefill, structure, symbolic_shape
 from atom.compass.fit.publish import RANK
 from atom.compass.run import _op_graphs
@@ -113,12 +117,15 @@ def config(tmp_path, dp=1):
 
 def traced(tmp_path, c, conditions, phase="decode", shape="decode B=2", graph=None):
     """A run's lookup over a store holding `c`'s graph at a `phase` step of
-    `shape`, `graph` or else one of `REGION`, keyed as a capture keys it and
-    handed off under `conditions`."""
+    `shape`, `graph` or else one of `REGION`, keyed as a capture under
+    `conditions` keys it and handed off under them."""
     store = ArtifactStore(tmp_path / "store")
     at = structure(c, phase, True, ARCH)
+    under = {a.field: conditions.reading(a) for a in (Axis.ATOM_SRC, Axis.TORCH)}
+    with patch.object(capture, "traced_under", lambda: under):
+        key = graph_key(at, shape)
     store.publish(
-        Key.of(Kind.OP_GRAPH, structure=at, shape=shape),
+        key,
         provenance=STANZA,
         topology=Topology(),
         conditions=conditions,
@@ -141,9 +148,11 @@ def held(tmp_path, c, conditions):
     return traced(tmp_path, c, conditions, "prefill", shape, graph)
 
 
-#: The axes of the op_graph row a run reads; the key's structure names the
-#: engine config.
-READ = [a for a in axes_of(Row.OP_GRAPH) if a is not Axis.ENGINE_CONFIG]
+#: The axes of the op_graph row a run reads that its key does not state: the
+#: key's structure names the engine config, and a graph traced under another
+#: ATOM source or torch is another key (`test_op_graph_traced_under`).
+KEYED = (Axis.ENGINE_CONFIG, Axis.ATOM_SRC, Axis.TORCH)
+READ = [a for a in axes_of(Row.OP_GRAPH) if a not in KEYED]
 
 
 @pytest.mark.parametrize("axis", READ, ids=str)

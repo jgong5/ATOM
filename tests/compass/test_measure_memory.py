@@ -55,7 +55,8 @@ from atom.compass.artifacts import (
     Kind,
     Row,
     Topology,
-    machine_spec_digest,
+    keyed_platform,
+    machine_platform,
     member_name,
 )
 from atom.compass.drive import aiter_jit, gpu, jit_cache, measure_memory, serve
@@ -111,9 +112,8 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
             record,
         )
     copy_ = json.loads((tmp_path / "out" / "memory_readings.json").read_text())
-    assert copy_["key"]["tp"] == 2 and copy_["key"]["machine_spec"] == (
-        machine_spec_digest(MACHINE)
-    )
+    assert copy_["key"]["tp"] == 2
+    assert copy_["key"]["software_stack"] == machine_platform(MACHINE)["software_stack"]
     assert len(copy_["members"]) == 2
 
 
@@ -241,7 +241,7 @@ def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypat
 
     key = Key.of(
         Kind.MEMORY_READINGS,
-        machine_spec=machine_spec_digest(MACHINE),
+        **keyed_platform(Kind.MEMORY_READINGS, machine_platform(MACHINE)),
         **memory.key_fields(r.config),
     )
     cells = dict(
@@ -800,7 +800,7 @@ def test_a_key_stating_another_layout_than_its_members_publishes_nothing(tmp_pat
     key = Key.of(
         Kind.MEMORY_READINGS,
         model="sha256:" + "a" * 64,
-        machine_spec=machine_spec_digest(MACHINE),
+        **keyed_platform(Kind.MEMORY_READINGS, machine_platform(MACHINE)),
         dp=1,
         pp=1,
         pcp=1,
