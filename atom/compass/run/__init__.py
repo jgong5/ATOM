@@ -224,6 +224,16 @@ has the connector factory build ``lmcache_mp`` as Compass's
 (`atom.compass.kv.lmcache_mp`), whose scheduler half sends each transfer to LP
 ``lmcache`` from the step loop.
 
+A deployment that offloads KV through ATOM's in-process ``lmcache_offload``
+needs an ``lmcache_offload`` entry, which `atom.compass.kv.lmcache_offload`
+states, and a run file with one needs such a deployment, at DP and pipeline
+width 1. `engine(config)` then has the connector factory build it as Compass's,
+whose scheduler half keeps each TP rank's CPU tier and prices the tier's
+lookups and copies from the entry. Each such engine's hand-in holds
+``offload``, and the summary carries it over the client run's steps, with the
+GPU and CPU hit rates: prefix-cache hits and tier loads over the prompt tokens
+the prefix cache counted.
+
 The API server's ``--compass-clock-endpoint`` sets `CLOCK_ENV`: the authority
 is not co-hosted but served by `authority`, its own process started before the
 engines (``python -m atom.compass.run``), and every LP connects to that
@@ -1595,6 +1605,7 @@ def engine(config):
         from atom.compass.kv.lmcache_mp import substitute
 
         substitute()
+    _offload_tier(config, run)
     utils.LP_OF_RANK = dict.fromkeys(range(pc.data_parallel_size), lp)
     _member = f"dp{pc.data_parallel_rank}" if pc.data_parallel_size > 1 else None
     name = lp.name if _member is None else f"{lp.name}.{_member}"
@@ -1603,7 +1614,7 @@ def engine(config):
         # Under the clock's wrap, so a call settles before it waits on its peers.
         shm_collectives.install()
     clock.settle_before_collectives()
-    if _member is not None and _offloads_to_lmcache_mp(config.kv_transfer_config):
+    if _member is not None and _offloads(config.kv_transfer_config, "lmcache_mp"):
         _park_before_dispatch()
     rt = _runtime(lp, run, _member, _PublishedClock)
     inner = _ignoring_sigterm_from_ready(_named(_start_on_leaving(rt)))
@@ -1643,9 +1654,9 @@ def _ignoring_sigterm_from_ready(inner):
         EngineCore._send_ready_signal = ready
 
 
-def _offloads_to_lmcache_mp(kv) -> bool:
-    """Whether a KV transfer config offloads to the lmcache MP server, on its
-    own or as one connector of a ``multi``."""
+def _offloads(kv, connector: str) -> bool:
+    """Whether a KV transfer config offloads KV through `connector`, on its own
+    or as one connector of a ``multi``."""
     if not kv:
         return False
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -1654,7 +1665,37 @@ def _offloads_to_lmcache_mp(kv) -> bool:
         return KVConnectorFactory.canonical_name(c.get("kv_connector", "moriio"))
 
     subs = kv.get("connectors", []) if name(kv) == "multi" else [kv]
-    return any(name(c) == "lmcache_mp" for c in subs)
+    return any(name(c) == connector for c in subs)
+
+
+def _offload_tier(config, run: dict) -> None:
+    """Have the connector factory build ``lmcache_offload`` as Compass's
+    (`atom.compass.kv.lmcache_offload`) when this deployment offloads through
+    it; refuse a deployment and a run file that disagree on whether it does,
+    an entry the connector cannot read, and a deployment above DP or pipeline
+    width 1, whose ranks' tiers this does not join."""
+    from atom.compass.kv import lmcache_offload
+
+    offloads = _offloads(config.kv_transfer_config, "lmcache_offload")
+    if offloads != (lmcache_offload.ENTRY in run):
+        raise ValueError(
+            f"this deployment {'offloads' if offloads else 'offloads no'} KV "
+            f"through lmcache_offload and the run file "
+            f"{'has no' if offloads else 'has an'} {lmcache_offload.ENTRY} entry"
+        )
+    if not offloads:
+        return
+    widths = {
+        "data_parallel_size": config.parallel_config.data_parallel_size,
+        "pipeline_parallel_size": getattr(config, "pipeline_parallel_size", 1),
+    }
+    if wide := [f"{k} {v}" for k, v in widths.items() if v > 1]:
+        raise ValueError(
+            f"lmcache_offload is simulated at DP and pipeline width 1; this "
+            f"deployment runs {', '.join(wide)}"
+        )
+    lmcache_offload.check_entry(run[lmcache_offload.ENTRY])
+    lmcache_offload.substitute()
 
 
 def _park_before_dispatch() -> None:
@@ -2877,7 +2918,10 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     `LPRuntime.paid`. An engine whose offload
     scheduler keeps lookup counters hands in ``lookups``: its tier lookups,
     the prefetches among them, and the deferred prefetches it stopped
-    waiting for. A speculative engine hands in ``speculative``, `_acceptance`."""
+    waiting for. A speculative engine hands in ``speculative``, `_acceptance`.
+    An engine whose ``lmcache_offload`` is simulated hands in ``offload``:
+    `OffloadShell.offload_statistics`, and under ``cache`` its prefix cache's
+    counters (`EngineStats.cache_statistics`)."""
     said = _workers_say(engine_core)
     rt = clock.installed()
     lp = rt.me.name if _member is None else f"{rt.me.name}.{_member}"
@@ -2894,6 +2938,10 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     scheduler = getattr(engine_core, "scheduler", None)
     if getattr(getattr(scheduler, "engine_stats", None), "spec_enabled", False):
         sections = sections | {"speculative": _acceptance(scheduler, run)}
+    for half in getattr(kv, "_connectors", None) or [kv]:
+        if callable(tier := getattr(half, "offload_statistics", None)):
+            cache = scheduler.engine_stats.cache_statistics()
+            sections = sections | {"offload": tier() | {"cache": cache}}
     _hand_in(run, lp, reasons, client_run, **said, **sections)
 
 
@@ -3248,7 +3296,44 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
             }
     if speculative:
         summary["speculative"] = speculative
+    # Each offloading engine's tier and copies over these steps, and the hit
+    # rates ATOM's counters give: prefix-cache hits and tier loads, each over
+    # the prompt tokens its prefix cache counted.
+    offload = {}
+    for n, h in hand_ins.items():
+        if "offload" in h:
+            seen = _counted_since(h["offload"], since.get(n, {}).get("offload", {}))
+            full = seen["cache"]["full_tokens"]
+            gpu, cpu = (
+                seen["cache"]["cached_tokens"],
+                seen["connector"]["loaded_tokens"],
+            )
+            offload[n] = seen | {
+                "gpu_hit_rate": gpu / full if full else None,
+                "cpu_hit_rate": cpu / full if full else None,
+            }
+    if offload:
+        summary["offload"] = offload
     return summary
+
+
+#: Counters of an ``offload`` hand-in that are levels, not counts: reported as
+#: they stand, never less an earlier client run's.
+OFFLOAD_LEVELS = frozenset(
+    {"held_chunks", "loads_pending", "saves_pending", "blocks_waiting_for_store"}
+)
+
+
+def _counted_since(now: dict, then: dict) -> dict:
+    """`now`'s counts less `then`'s, nested alike; a level as it stands."""
+    return {
+        k: (
+            _counted_since(v, then.get(k, {}))
+            if isinstance(v, dict)
+            else v if k in OFFLOAD_LEVELS else v - then.get(k, 0)
+        )
+        for k, v in now.items()
+    }
 
 
 def authority(endpoint: str) -> None:
