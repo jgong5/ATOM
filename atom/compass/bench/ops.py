@@ -119,7 +119,9 @@ copies: N built ones: M, the least count whose bytes pass `COLD` times the
 last-level cache, raised for a context key to its I instances (at most K),
 then, up to the leaf's occurrences when it takes a weight other than a
 gathered table (at most K), copy
-c mod N with the c-th weights on that copy's other arguments.
+c mod N with the c-th weights on that copy's other arguments. Of a leaf whose
+later occurrences take a `QUERIED` slot, M and N round up to a multiple of its
+occurrences, and K past them down, so each occurrence takes as many calls.
 Copy c < N takes fresh activations below M and copy c mod M's from there,
 weight c mod the more of M and the leaf's occurrences, a gathered table's one
 weight, its ids rows c n to (c + 1) n of one seeded permutation of the table's
@@ -261,7 +263,7 @@ PROG = "compass measure ops"
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 30
+PROTOCOL = 31
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -1413,6 +1415,9 @@ class Stub:
             n, size, _, (by_block, by_slot) = plans[sig]
             names = {p: m[0] for (s, p), m in self.placed[0][1].items() if s == sig}
             later = {k[2]: m[0] for k, m in self.later.items() if k[:2] == (0, sig)}
+            if later:  # as many copies of each occurrence, cold ones too
+                o, m = op["occurrences"], self.cold_copies[sig]
+                n, self.cold_copies[sig] = -(-n // o) * o, -(-m // o) * o
             # the graph's operator, and the one timed in its place if another
             leaf = json.loads(sig)["op"]
             record = {"shape": str(shape), "context": context, "op": leaf}
@@ -1599,7 +1604,9 @@ class Stub:
         occurrence where later ones take a `QUERIED` buffer, with no read;
         with its kernels, profiled again on every rank when any rank's named
         none of a call its cold graph timed. Every rank's graph holds the most K
-        any rank's call gives, and a leaf any rank refuses, every rank does."""
+        any rank's call gives, and a leaf any rank refuses, every rank does; K
+        past a leaf's occurrences, where later ones take a `QUERIED` buffer, a
+        multiple of them."""
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
 
@@ -1638,6 +1645,9 @@ class Stub:
             # a collective's call holds its wait on the last rank to arrive,
             # whose own call is the shortest: every graph takes its calls
             k = agreed(k, cpu_group(), most=True)
+            # past its occurrences, as many calls of each (`QUERIED`)
+            o = op["occurrences"] if any(s == sig for _, s, _ in self.later) else 1
+            k -= k % o if k > o else 0
             n = min(n, k)
             with refused_together():
                 calls += [
@@ -1652,7 +1662,6 @@ class Stub:
             cycle = [calls[i % n] for i in range(k)]
             cold = _replay(fn, cycle, self.flush)
             # warm: call i on its cold call's occurrence's first copy (`QUERIED`)
-            o = op["occurrences"] if any(s == sig for _, s, _ in self.later) else 1
             warm = [calls[i % n % o] for i in range(k)]
             warm = _replay(fn, warm) if n > 1 and k == CALLS else None
             # two profiles that named nothing of a call its graph timed missed it
