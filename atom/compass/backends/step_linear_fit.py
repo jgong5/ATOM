@@ -4,6 +4,11 @@
 """The step linear law fitted from real step records.
 
     python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --platform JSON [--form FORM] [--moe-routing E,K] [--engine FILE]
+    python -m atom.compass.backends.step_linear_fit offload LOG... --out ENTRY
+
+The second form fits a run file's ``lmcache_offload`` entry, beside the law of
+an arm whose records ran the connector, on those runs' server logs
+(`fit_offload`).
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
@@ -160,8 +165,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import itertools
 import json
 import math
+import re
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -711,6 +719,80 @@ def fit_hops(intakes, clients) -> tuple[dict, dict]:
         term[hop] = p10
         report[hop] = {"p10_s": p10, "p50_s": p50, "p90_s": p90, "messages": len(s)}
     return term, report
+
+
+#: ATOM's offload worker line naming its rank and a chunk's tokens and bytes.
+OFFLOAD_WORKER = re.compile(
+    r"offload worker rank=(\d+):.*? chunk=(\d+) gpu_staging_chunk_bytes=(\d+)"
+)
+#: ATOM's per-copy line under `OFFLOAD_PROFILE`: the chunks it copied and the
+#: milliseconds the worker thread spent on it.
+OFFLOAD_COPY = re.compile(
+    r"\[OFFLOAD-(SAVE|LOAD)-PROF\] .*? chunks=(\d+) .*? total_ms=([\d.]+)"
+)
+OFFLOAD_PERF = "[OFFLOAD-PERF] "
+
+
+def fit_offload(logs) -> tuple[dict, dict]:
+    """The run file's ``lmcache_offload`` entry, fitted on the server logs of
+    real runs `logs`, each at `OFFLOAD_PROFILE` (`atom.compass.kv.lmcache_offload`),
+    and its report.
+
+    ``chunk_size`` and ``chunk_bytes`` are what each worker logs at its start,
+    and ``tensor_parallel_size`` how many workers logged; logs that differ in
+    any refuse. ``store_s`` and ``load_s`` are fitted by the host-law solver on
+    each copy that moved a chunk: the worker thread's seconds for it on
+    ``(1, chunks)``. ``lookup_s`` is fitted on the scheduler's counters, which
+    it logs a minute apart: per minute with a lookup, the seconds its lookups
+    took on ``(lookups, chunks)``, chunks counted as the prompt tokens they
+    asked over the chunk size. The entry's ``fit`` holds the logs and the
+    report."""
+    workers, copies, lookups = {}, {"SAVE": [], "LOAD": []}, []
+    for log in logs:
+        perf = []
+        for line in Path(log).read_text(errors="replace").splitlines():
+            if m := OFFLOAD_WORKER.search(line):
+                workers.setdefault(log, {})[int(m[1])] = (int(m[2]), int(m[3]))
+            elif (m := OFFLOAD_COPY.search(line)) and int(m[2]):
+                copies[m[1]].append((1, int(m[2]), float(m[3]) * 1e-3))
+            elif OFFLOAD_PERF in line:
+                said = line.partition(OFFLOAD_PERF)[2].partition(" | ")[0]
+                perf.append(json.loads(said))
+        for a, b in itertools.pairwise(perf):
+            d = {k: b.get(k, 0) - a.get(k, 0) for k in b}
+            if d.get("lookup_n", 0) > 0:
+                lookups.append(
+                    (d["lookup_n"], d["lookup_prompt_tokens"], d["lookup_us"])
+                )
+    stated = {
+        (len(ranks), *geometry)
+        for ranks in workers.values()
+        for geometry in ranks.values()
+    }
+    if len(stated) != 1 or len(workers) != len(logs):
+        raise ValueError(
+            f"the logs state (workers, chunk, chunk bytes) {sorted(stated)}, and "
+            f"{len(logs) - len(workers)} state none; an entry is fitted on one"
+        )
+    [(tp, chunk, chunk_bytes)] = sorted(stated)
+    entry = {
+        "chunk_size": chunk,
+        "tensor_parallel_size": tp,
+        "chunk_bytes": chunk_bytes,
+    }
+    report = {}
+    for name, kind in (("store_s", "SAVE"), ("load_s", "LOAD")):
+        rows = np.array(copies[kind], dtype=np.float64).reshape(-1, 3)
+        entry[name], report[name] = _host_law(
+            rows[:, :2], rows[:, 2], ["fixed", "chunks"]
+        )
+    rows = np.array(lookups, dtype=np.float64).reshape(-1, 3)
+    x = np.column_stack([rows[:, 0], rows[:, 1] / chunk])
+    entry["lookup_s"], report["lookup_s"] = _host_law(
+        x, rows[:, 2] * 1e-6, ["lookups", "chunks"]
+    )
+    entry["fit"] = {"logs": [str(log) for log in logs], **report}
+    return entry, report
 
 
 def _alone(sent, got, returned=None) -> tuple[np.ndarray, np.ndarray]:
@@ -1790,7 +1872,27 @@ def _platform_arg(value: str) -> dict:
     return given
 
 
+def offload_main(argv) -> None:
+    """``offload LOG... --out ENTRY``: write `fit_offload`'s entry, and print
+    each term with its fit."""
+    parser = argparse.ArgumentParser(
+        prog="python -m atom.compass.backends.step_linear_fit offload",
+        description=fit_offload.__doc__.split("\n\n")[0],
+    )
+    parser.add_argument("logs", nargs="+", help="real server logs at OFFLOAD_PROFILE")
+    parser.add_argument("--out", required=True, help="where the entry is written")
+    args = parser.parse_args(argv)
+    entry, report = fit_offload(args.logs)
+    Path(args.out).write_text(json.dumps(entry) + "\n")
+    for name, fit in report.items():
+        print(f"{name}: {json.dumps(entry[name])} {json.dumps(fit)}")
+
+
 def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["offload"]:
+        offload_main(argv[1:])
+        return
     parser = argparse.ArgumentParser(
         prog="python -m atom.compass.backends.step_linear_fit",
         description=__doc__.split("\n\n")[0],
