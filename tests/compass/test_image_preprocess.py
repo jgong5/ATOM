@@ -2,14 +2,18 @@
 """A chat request's images on the simulated clock.
 
 The frontend's media preparation is a tokenizer-station job charged the run
-file's ``image_preprocess_s`` per image; a remote image URL, or an image in a
-run with no price, is refused by name. A step whose scheduled tokens carry
+file's ``image_preprocess_s`` per image, which `compass run
+--image-preprocess-s` states; a remote image URL, or an image in a run with no
+price, is refused by name. A step whose scheduled tokens carry
 image embeddings states how many, and the fitted backends refuse it.
 """
 
 import base64
+import dataclasses
 import inspect
 import io
+import json
+import math
 import urllib.request
 from types import SimpleNamespace
 
@@ -22,10 +26,12 @@ from test_backend_step_grid import replay
 from test_backend_step_linear import backend
 from test_backend_step_roofline import fallback, roofline
 from test_dp_step_max import BLOCK, runner
+from test_drive_runfile import build
 
 from atom.compass import run as compass_run
 from atom.compass.backends import BatchView, RequestShape, StepStubBackend
 from atom.compass.backends.resolver import CostRefused
+from atom.compass.backends.step_stub import Coefficients
 from atom.compass.runner import projection
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import ChatMessage
@@ -125,6 +131,60 @@ def test_a_load_outside_any_run_is_neither_charged_nor_refused(priced, monkeypat
     priced(None)
     monkeypatch.setattr(clock, "_installed", None)
     assert MediaLoader().load_image(_png()).size == (4, 4)
+
+
+# --- the price compass run states -------------------------------------------
+
+
+def _stub_run(tmp_path, *flags):
+    """The run file `compass run --step-stub S <flags>` builds."""
+    stub = tmp_path / "stub.json"
+    stub.write_text(json.dumps(dataclasses.asdict(Coefficients())))
+    return build(tmp_path, "--step-stub", str(stub), *flags)
+
+
+def _served(tmp_path, monkeypatch, *flags):
+    """`_stub_run`'s run file, read back as the server's frontend reads it."""
+    (tmp_path / "run_file.json").write_text(json.dumps(_stub_run(tmp_path, *flags)))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run_file.json"))
+    return compass_run.spec()
+
+
+def test_compass_run_s_image_preprocess_s_prices_each_image_at_its_value(
+    loop, priced, monkeypatch, tmp_path
+):
+    run = _served(tmp_path, monkeypatch, "--image-preprocess-s", "0.25")
+    priced(run.get(compass_run.IMAGE_PREPROCESS))
+
+    (ids, _), done, ex = _prepare(loop, _png(), _png())
+
+    assert ids == [IMAGE_ID, IMAGE_ID, 5, 6]
+    assert done == pytest.approx(0.5)
+    assert ex.refusals == [] and loop.rt.refusals == []
+
+
+def test_compass_run_without_image_preprocess_s_refuses_every_image_by_name(
+    loop, priced, monkeypatch, tmp_path
+):
+    run = _served(tmp_path, monkeypatch)
+    priced(run.get(compass_run.IMAGE_PREPROCESS))
+
+    with pytest.raises(Refused) as refused:
+        _prepare(loop, _png())
+
+    why = "an image with no image_preprocess_s in the run file"
+    assert refused.value.args[0] == ("media", why)
+    assert loop.rt.refusals == [f"media:{why}"]
+
+
+@pytest.mark.parametrize("seconds", [0, -0.25, math.nan, math.inf])
+def test_an_image_preprocess_s_not_finite_and_positive_refuses_at_build(
+    tmp_path, seconds
+):
+    with pytest.raises(ValueError, match="finite, positive") as refused:
+        _stub_run(tmp_path, "--image-preprocess-s", str(seconds))
+
+    assert str(refused.value).startswith(f"--image-preprocess-s {float(seconds)}:")
 
 
 # --- a step that carries image tokens ---------------------------------------

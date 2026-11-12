@@ -4,7 +4,8 @@ reach it until it is stopped, with run.json recording what grading reads.
 
     compass run <backend> --machine M --store S [--host-laws KEY|LAW]
         [--coverage INPUT...] [--on-refusal mark|abort] [--step-roofline]
-        [--acceptance-record RECORD] --out D -- <ATOM args>
+        [--image-preprocess-s SECONDS] [--acceptance-record RECORD] --out D
+        -- <ATOM args>
 
     compass run --join RUN_FILE --out D -- <ATOM args>
 

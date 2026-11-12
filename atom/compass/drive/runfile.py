@@ -33,6 +33,9 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   ``--step-roofline``; ``--padding none``, which prices a replayed graph's
   real rows; ``--local-grants``, on unless ``--no-local-grants``, which gives
   grants their ceilings.
+- ``--image-preprocess-s SECONDS``, finite and positive, as
+  ``image_preprocess_s``: the seconds the frontend charges to prepare each
+  image of a chat request; without it the run refuses every image.
 - Not flags: `FIXED`, and ``data_parallel_size``, read from ATOM's arguments.
   The server serves client runs until it is stopped.
 
@@ -43,6 +46,7 @@ which `scripts/compass/deploy.sh` hands its clock authority and both instances.
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -85,6 +89,13 @@ def add_arguments(parser) -> None:
     parser.add_argument("--padding", choices=("none",))
     parser.add_argument(
         "--local-grants", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--image-preprocess-s",
+        dest=run.IMAGE_PREPROCESS,
+        type=float,
+        metavar="SECONDS",
+        help="seconds the frontend takes to prepare one image of a chat request",
     )
 
 
@@ -145,6 +156,13 @@ def build(args, atom_args) -> dict:
         out |= _hops(hosts, atom_args)
     if args.padding:
         out["padding"] = args.padding
+    if (seconds := getattr(args, run.IMAGE_PREPROCESS)) is not None:
+        if not (math.isfinite(seconds) and seconds > 0):
+            raise ValueError(
+                f"--image-preprocess-s {seconds}: preparing an image takes a "
+                "finite, positive number of seconds"
+            )
+        out[run.IMAGE_PREPROCESS] = seconds
     return out
 
 
