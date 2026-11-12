@@ -1063,9 +1063,9 @@ M3-Agentic stage (`16` D95.1).
 **A real and a simulated run take the same client: the defaults of agentx-harness's
 `agentx` scenario**, which InferenceX ran the submission under. 3600 s, seed 42, a
 trajectory start between 0.25 and 0.75, every cc-trace at full length rather than the
-256k-capped corpus `scripts/compass/client.sh` reads for the base scenario, 10 warmup
-requests per lane with 1800 s grace, a per-trace idle cap of 300 s, a system idle cap of
-10 s, server token counts, and the chat template applied. The trajectory start draws each
+corpus's 256k-capped copy, 10 warmup requests per lane with 1800 s grace, a per-trace
+idle cap of 300 s, a system idle cap of 10 s, server token counts, and the chat template
+applied. The trajectory start draws each
 lane's starting instant uniformly from that share of its trace's span, seeded by seed,
 trace and lane; warmup primes the conversation there and the profile resumes at the next
 turn (agentx-harness `timing/trajectory_source.py`).
@@ -1080,17 +1080,16 @@ turn (agentx-harness `timing/trajectory_source.py`).
   `CompassAgenticReplay._arm_system_idle_watchdog` already runs the system cap; #3261
   replaces the strategy's refusal of `trace_idle_gap_cap_seconds`. Both timers of T75 are
   then on the clock.
-- **Warmup** requests are excluded by request id on both sides (D27); a simulated run's
-  grace runs on the Compass clock (`ClockPhaseRunner`).
+- **Warmup** requests are excluded by request id on both sides (D27).
 - **One option differs, and it sends nothing to the model:** aiperf's server-metrics
   scrape, which `agentx` leaves on and InferenceX takes its hit rates from.
   `CompassAgenticReplay` refuses it, since D34 leaves how the scrape's process reaches the
-  clock undesigned; `08` D45.1 says where a simulated run's hit rates come from.
+  clock undesigned; `08` D45.1 records what that leaves open for the hit rates.
 
 ### Open issues
 
-- The warmup barrier's drain polls `asyncio.sleep` in aiperf's runner, which the
-  `LoopScheduler` rebind does not reach (T74's class). Whether a simulated warmup ends as a
+- The warmup barrier's drain polls `asyncio.sleep` in aiperf's runner, outside the
+  `LoopScheduler` rebind. Whether a simulated warmup, its 1800 s grace included, ends as a
   real one does shows first in #3261's pair.
 
 ---

@@ -471,8 +471,8 @@ Eagle3 path a stage prices.
 
 **Priced at step level, from records, by the drafter's own vectors:** a draft forward,
 charged once per serial pass at that pass's rows; propose; and draft KV, the pass
-`EagleProposer.compute_draft_kv` makes over a middle chunk. The draft forward replaces the
-draft law's per-rung decode vector, which prices a whole draft at once
+`EagleProposer.compute_draft_kv` makes over a step of middle chunks only. The draft
+forward replaces the draft law's per-rung decode vector, which prices a whole draft at once
 (`backends/step_linear.py`), so a record carries each serial pass apart, where today all of
 a step's passes land in one `d_propose_ns` (`parity/__init__.py`).
 
@@ -491,10 +491,10 @@ That closes the Eagle case of [#2672](https://github.com/jgong5/ATOM/issues/2672
 asked each such form to run or be refused. The step roofline lays out no Eagle3 pass, so an
 Eagle3 step it prices is refused by name (`cost:<backend>: prices no draft`, D83).
 
-A law and a readings entry name the draft by method and `K` only (`run/step_grid.py::keyed`'s
-`speculative`) beside the target's `config.json` digest, so two Eagle3 drafts of one target
-would share a key. The stage runs one draft; [#3276](https://github.com/jgong5/ATOM/issues/3276)
-keys the draft checkpoint too.
+A law and a readings entry name the draft by method and `K` only
+(`run/step_grid.py::keyed`'s `speculative`) beside the target's `config.json` digest, so
+two Eagle3 drafts of one target would share a key. The stage runs one draft;
+[#3276](https://github.com/jgong5/ATOM/issues/3276) keys the draft checkpoint too.
 
 ---
 
