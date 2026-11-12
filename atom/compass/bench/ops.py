@@ -194,11 +194,14 @@ of a family, or of a prefill leaf's token count over cached tokens, that
 launched different kernels or, at a decode width, either side of a point off
 the line through theirs, or, on rows alike, whose cold times differ where the
 leaf's kind steps under one kernel between two adjacent contexts at some width
-(`_densify`), until they are adjacent; a collective's message bytes bend as a
-decode width does; and then, at the rows of each prefill family of a kind that
-depends on context, each token count its leaf's families at other rows hold
-between its own least and most, at each of its cached-token counts
-(`_filled`), densifying again after. DIR gets each round's ops.jsonl in `round<n>`, a run
+(`_densify`), until they are adjacent, two token counts of a prefill leaf at a
+cached-token count only where they launched different kernels at each count both
+hold and halving placed that count at neither; a collective's message bytes bend
+as a decode width does; and then, at the rows of each prefill family of a kind
+that depends on context, each token count its leaf's families at other rows hold
+between its own least and most, at each of its cached-token counts but those
+halving over cached tokens placed on one token count's line (`_filled`),
+densifying again after. DIR gets each round's ops.jsonl in `round<n>`, a run
 resumed into DIR numbering on from the last round there, and after each round
 every point held, a measured one with its store token, in plan.jsonl.
 
@@ -3550,18 +3553,23 @@ def _bracket(ats, kernels, lo, hi) -> str:
 
 
 def _bracket_cached(cuts: dict, tokens, lo, hi) -> str:
-    """`_bracket` over two axes: '' if `lo` to `hi` cached tokens lie on or
-    between two of `cuts`' cached-token counts, and `tokens` on or between two
-    points of each count from the one to the other, every point of one kernel;
-    else why not."""
-    cached = sorted(cuts)
-    if (band := _band(cached, lo, hi)) is None:
+    """`_bracket` over two axes, token counts first, as `fit ops` reads them:
+    '' if `tokens` lies on or between two token counts of `cuts`' points, and
+    `lo` to `hi` cached tokens on or between two of each one's cached-token
+    counts, every point of one kernel; else why not."""
+    lines = defaultdict(dict)
+    for c, (ats, ks) in cuts.items():
+        for t, k in zip(ats, ks):
+            lines[t][c] = k
+    held = sorted(lines)
+    if (band := _band(held, tokens, tokens)) is None:
         return "outside the measured range"
     kernels = set()
-    for ats, ks in (cuts[c] for c in cached[band]):
-        if (inner := _band(ats, tokens, tokens)) is None:
+    for line in (lines[t] for t in held[band]):
+        cached = sorted(line)
+        if (inner := _band(cached, lo, hi)) is None:
             return "outside the measured range"
-        kernels.update(ks[inner])
+        kernels.update(line[c] for c in cached[inner])
     return "between two kernels" if len(kernels) > 1 else ""
 
 
@@ -3585,7 +3593,12 @@ def _densify(families, tried: set) -> dict:
     the farther's step holds fewer rows (a drafter's collective over its
     anchors or its block, whose bytes do not follow its step's). A collective's
     family is `_bent` too, each message size at the mean of its readings, as
-    `fit ops` merges them."""
+    `fit ops` merges them. Two token counts of a prefill leaf over cached
+    tokens are halved only where they launched different kernels at every
+    cached-token count both hold, at a count halving placed at neither: a
+    switch that moves with cached tokens, as one at a fixed sum of the two
+    does, is halved over cached tokens at each token count alone, where `fit
+    ops` reads it after the token count."""
     from atom.compass.capture.forward import decode, prefill
 
     steps = {
@@ -3600,6 +3613,16 @@ def _densify(families, tried: set) -> dict:
         if cut := _cut(fam):
             for tokens, kernels, record in points:
                 across[cut[0], tokens].append((cut[1], kernels, record))
+
+    def moves(base, c, a, b) -> bool:
+        """Whether token counts `a` and `b` at `c` cached tokens hold no switch
+        of T alone: halving over cached tokens placed `c` at either, or some
+        count both hold launched one kernel at both."""
+        if ((base, a), c) in tried or ((base, b), c) in tried:
+            return True
+        at_a, at_b = ({x: k for x, k, _ in across[base, t]} for t in (a, b))
+        return any(x in at_b and at_a[x] == at_b[x] for x in at_a)
+
     want = defaultdict(set)
     for fam, points in [*families.items(), *across.items()]:
         points = sorted(points, key=lambda p: p[0])
@@ -3613,9 +3636,12 @@ def _densify(families, tried: set) -> dict:
             bent = _bent([*at]) if len(sizes) > 2 else ()  # no line under three
         else:
             bent = _bent(points, () if ragged else steps) if decoding else ()
+        cut = isinstance(fam, str) and _cut(fam)
         for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
             mid = (a + b) // 2
             if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
+                continue
+            if cut and moves(*cut, a, b):
                 continue
             tried.add((fam, mid))
             # a micro-batch's leaves are read off its own graph, as its record marks
@@ -3643,9 +3669,12 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
     """The points of each prefill family over cached tokens (`_cut`) at its
     rows that its leaf's families at any rows hold the token count of, between
     its own least and most, at each cached-token count its own points hold
-    that its first row has room for under `max_model_len`, unless `tried`.
-    `fit ops` reads such a leaf over T, then its rows: a step's rows are
-    bracketed only where the token counts either side of it hold them."""
+    but one that halving over cached tokens placed at every token count
+    holding it (`_densify`), which reads that count's switch alone, and that
+    its first row has room for under `max_model_len`, unless `tried`. `fit
+    ops` reads such a leaf over T, then its rows, then cached tokens: a step's
+    rows are bracketed only where the token counts either side of it hold
+    them."""
     from atom.compass.capture.forward import prefill
     from atom.compass.fit.ops import skeleton
 
@@ -3660,7 +3689,7 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
     for base, at in held.items():
         rows, tokens = json.loads(base)[1], [t for t, _ in at]
         for t in sorted(axis[skeletons[base]]):
-            for c in sorted({c for _, c in at}):
+            for c in sorted({c for u, c in at if ((base, u), c) not in tried}):
                 fam = json.dumps([*json.loads(base), c], sort_keys=True)
                 if (
                     not min(tokens) < t < max(tokens)
