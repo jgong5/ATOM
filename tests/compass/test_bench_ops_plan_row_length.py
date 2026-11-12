@@ -8,6 +8,7 @@ tile does. The plan ends, and `fit ops` prices what it measured.
 The bench and graphs are `test_bench_ops_plan`'s stand-ins.
 """
 
+import json
 from itertools import pairwise
 
 import pytest
@@ -110,4 +111,27 @@ def test_coverage_reads_a_switch_at_a_fixed_row_length_t_first_as_fit_ops_does(
     assert report["by phase"] == {"prefill": {"steps": 4, "covered": 3}}
     assert report["left out, by leaf kind"] == {
         "aiter.attn": {"between two kernels": 1}
+    }
+
+
+def test_two_token_counts_are_not_halved_at_a_count_halving_placed_on_their_lines():
+    def point(tokens, context):
+        leaf = json.dumps({"args": {"q": {"shape": [tokens, 8]}}, "op": "aiter.attn"})
+        record = {"shape": f"prefill T={tokens} B=1", "context": context}
+        record |= {"op": "aiter.attn", "leaf": leaf, "kernels": [f"t{tokens}"]}
+        return record | {"cold_ns": 1e3 * (tokens + (context or 0))}
+
+    # 100 and 200 launch other kernels at every cached count both hold.
+    records = [point(t, c) for t in (100, 200) for c in (None, 500, 1000)]
+    families = ops._families(records, ops._dependent(records))
+    (base,) = {ops._cut(fam)[0] for fam in families}
+    # Halving over cached tokens placed 500 at each, as it can at two token
+    # counts whose switches lie apart.
+    tried = {((base, t), 500) for t in (100, 200)}
+
+    want = ops._densify(families, tried)
+
+    assert {(shape.tokens, context) for shape, context in want} == {
+        (150, None),
+        (150, 1000),
     }

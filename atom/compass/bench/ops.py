@@ -194,11 +194,12 @@ the line through theirs, or, on rows alike, whose cold times differ where the
 leaf's kind steps under one kernel between two adjacent contexts at some width
 (`_densify`), until they are adjacent, two token counts of a prefill leaf at a
 cached-token count only where they launched different kernels at each count both
-hold; a collective's message bytes bend as a decode width does; and then, at the
-rows of each prefill family of a kind that depends on context, each token count
-its leaf's families at other rows hold between its own least and most, at each
-of its cached-token counts but one halving placed at one token count's alone
-(`_filled`), densifying again after. DIR gets each round's ops.jsonl in `round<n>`, a run
+hold and halving placed that count at neither; a collective's message bytes bend
+as a decode width does; and then, at the rows of each prefill family of a kind
+that depends on context, each token count its leaf's families at other rows hold
+between its own least and most, at each of its cached-token counts but those
+halving over cached tokens placed on one token count's line (`_filled`),
+densifying again after. DIR gets each round's ops.jsonl in `round<n>`, a run
 resumed into DIR numbering on from the last round there, and after each round
 every point held, a measured one with its store token, in plan.jsonl.
 
@@ -3583,9 +3584,10 @@ def _densify(families, tried: set) -> dict:
     family is `_bent` too, each message size at the mean of its readings, as
     `fit ops` merges them. Two token counts of a prefill leaf over cached
     tokens are halved only where they launched different kernels at every
-    cached-token count both hold: a switch that moves with cached tokens, as
-    one at a fixed sum of the two does, is halved over cached tokens at each
-    token count alone, where `fit ops` reads it after the token count."""
+    cached-token count both hold, at a count halving placed at neither: a
+    switch that moves with cached tokens, as one at a fixed sum of the two
+    does, is halved over cached tokens at each token count alone, where `fit
+    ops` reads it after the token count."""
     from atom.compass.capture.forward import decode, prefill
 
     steps = {
@@ -3656,11 +3658,12 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
     """The points of each prefill family over cached tokens (`_cut`) at its
     rows that its leaf's families at any rows hold the token count of, between
     its own least and most, at each cached-token count its own points hold
-    that its first row has room for under `max_model_len`, unless `tried`,
-    and none halving over cached tokens placed at each token count holding it
-    (`_densify`): that count reads one token count's switch. `fit ops` reads
-    such a leaf over T, then its rows, then cached tokens: a step's rows are
-    bracketed only where the token counts either side of it hold them."""
+    but one that halving over cached tokens placed at every token count
+    holding it (`_densify`), which reads that count's switch alone, and that
+    its first row has room for under `max_model_len`, unless `tried`. `fit
+    ops` reads such a leaf over T, then its rows, then cached tokens: a step's
+    rows are bracketed only where the token counts either side of it hold
+    them."""
     from atom.compass.capture.forward import prefill
     from atom.compass.fit.ops import skeleton
 
