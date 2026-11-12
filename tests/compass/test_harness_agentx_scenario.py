@@ -135,6 +135,39 @@ def test_agentx_replays_every_trace_with_the_scenario_defaults(agentx):
     )
 
 
+def test_the_base_scenario_sends_the_arguments_stage_4_graded(tmp_path):
+    """Without --agentx, aiperf takes the arguments a stage 4 c=4 600 s run
+    recorded in its workload."""
+    out, env = _setup(tmp_path, SIM)
+    args = ["--traces", "0-3", "--concurrency", "4", "--duration", "600"]
+    done = _client(out, *args, env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    workload = json.loads((out / "artifacts/workload.json").read_text())
+    assert workload["aiperf_args"] == [
+        "--endpoint-type",
+        "chat",
+        "--custom-dataset-type",
+        "weka_trace",
+        "--concurrency",
+        "4",
+        "--benchmark-duration",
+        "600",
+        "--random-seed",
+        "20260707",
+        "--scenario",
+        "inferencex-agentx-mvp",
+        "--unsafe-override",
+        "--streaming",
+        "--use-server-token-count",
+        "--extra-inputs",
+        "ignore_eos:true",
+        "--no-server-metrics",
+        "--no-gpu-telemetry",
+        "--ui",
+        "none",
+    ]
+
+
 @pytest.mark.parametrize(
     "args, refusal",
     [
