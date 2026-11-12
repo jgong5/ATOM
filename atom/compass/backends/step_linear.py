@@ -22,8 +22,10 @@ Last, a prefill vector may add `padding`, the rows its token graph runs past
 the step's tokens (`token_padding`): ATOM replays a prefill's first layers at
 the smallest of the vector's `buckets`, the prefill token-graph buckets the
 runner recorded, that holds the most tokens any rank of the data-parallel group
-scheduled. A data-parallel step it pads stating no `group_max_tokens` is
-refused, and a vector with a `padding` coefficient states its `buckets`.
+scheduled. A data-parallel step stating no `group_max_tokens` is refused unless
+its group split it for two-batch overlap or runs it eagerly for an attention
+backend (`token_padding`), and a vector with a `padding` coefficient states its
+`buckets`.
 
 A law prices one rank's step; the runner takes the group's step as the max
 over its ranks. Its parallel layout is its `engine_config`'s, which a run

@@ -227,10 +227,10 @@ class BatchView:
     tokens any rank of the group scheduled at this step, which ATOM picks the
     step's prefill token-graph bucket by (`ForwardMode._pad_to_token_graph`),
     never fewer than this rank's; None on one rank. `group_needs_eager` says
-    an attention backend of some rank of the group, a group of one's own
-    included, refuses a graph for this step
-    (`DPSyncResult.any_rank_needs_eager`), so the group runs it eagerly and
-    replays no token graph for its prefill. `image_tokens` counts the
+    the attention backend of some rank of the group, a group of one included,
+    refuses a graph for this step (`DPSyncResult.any_rank_needs_eager`), so
+    the group runs it eagerly and replays no token graph for its prefill.
+    `image_tokens` counts the
     scheduled tokens whose embedding the step's vision encoder supplies; a
     backend that has no basis for pricing that encoder refuses a step with any.
 
