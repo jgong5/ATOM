@@ -838,6 +838,68 @@ def test_dummy_weights_are_refused(tmp_path, flag, capsys):
     assert not any(tmp_path.iterdir())
 
 
+#: ATOM's arguments for an engine start, each read by `EngineArgs`.
+ENGINE_ARGV = ["--model", "m", "-tp", "4", "--kv_cache_dtype", "fp8"]
+
+
+def built_from(argv, monkeypatch):
+    """The model and keywords `measure_memory.start` builds its engine from,
+    given ATOM's arguments `argv`; the engine is a stand-in that starts nothing."""
+    from atom.model_engine import llm_engine
+
+    built = []
+
+    class Engine:
+        def __init__(self, model, **kwargs):
+            built.append((model, kwargs))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(llm_engine, "LLMEngine", Engine)
+    measure_memory.start(argv)
+    return built
+
+
+def test_a_start_takes_the_server_flags_record_passes_and_builds_without_them(
+    monkeypatch,
+):
+    from atom.entrypoints.openai import api_server
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    class Parsing(Exception):
+        pass
+
+    def parse_args(parser, *args, **kwargs):
+        raise Parsing(parser)
+
+    with monkeypatch.context() as m, pytest.raises(Parsing) as server:
+        m.setattr(FlexibleArgumentParser, "parse_args", parse_args)
+        api_server.main()
+    engine = EngineArgs.add_cli_args(FlexibleArgumentParser())._actions
+    frontend = [
+        [a.option_strings[0], *(["1"] if a.nargs != 0 else [])]
+        for a in server.value.args[0]._actions
+        if a.dest not in {e.dest for e in engine}
+        and set(a.option_strings).isdisjoint(serve.OWNED)
+    ]
+    assert ["--default-chat-template-kwargs", "1"] in frontend
+    served = ENGINE_ARGV + [arg for flag in frontend for arg in flag]
+    assert built_from(served, monkeypatch) == built_from(ENGINE_ARGV, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "flag", [["--max-num-sqes", "8"], ["--compass-run", "run.json"]]
+)
+def test_a_start_refuses_a_flag_neither_the_engine_nor_record_takes(
+    flag, monkeypatch, capsys
+):
+    with pytest.raises(SystemExit):
+        built_from(ENGINE_ARGV + flag, monkeypatch)
+    assert f"unrecognized arguments: {' '.join(flag)}" in capsys.readouterr().err
+
+
 # --- a run reading its configuration's entry ---------------------------------
 
 

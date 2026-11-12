@@ -27,7 +27,9 @@ The fake mode stands in for the device where the bench reads it: the
 runner's checkpoint is ATOM's empty dummy, as a capture's is; a router's
 expert ids are drawn on the host and their loads not counted; DeepSeek-V4's
 CSA top-k ids, which the bench draws on the device's generator, are not drawn,
-and its index buffer keeps the values ATOM prepared; no tensor
+and its index buffer keeps the values ATOM prepared; DeepSeek-V4.1's FP8 index
+plane's row bounds, which the bench reads back, are what ATOM staged, or, a
+kernel's (a candidate list's), the plane's width; no tensor
 equals another, so each placement clones its metadata; DeepSeek-V4.1's state
 cursors read back zeros and its check of them has no values to judge, as in
 a capture; a host tensor allocated pinned, which a fake one cannot say it is,
@@ -347,8 +349,8 @@ def main(out, argv) -> None:
     # by the id of each metadata view's clone, the live view it cloned; by
     # leaf and slot, the identity and staged values of what placement 0 bound;
     # by leaf, and by slot, the identity of what its later occurrences take
-    # there (`ops.QUERIED`)
-    sources, bound, seen, later = {}, {}, {}, {}
+    # there (`ops.QUERIED`); by the id of each view, its staged values
+    sources, bound, seen, later, read = {}, {}, {}, {}, {}
 
     def cloning(x, memo, clones=None):
         out = deep(x, memo, clones)
@@ -369,10 +371,16 @@ def main(out, argv) -> None:
             spec = dict(ops._specs(stub.leaves[sig][0]["args"]))[path]
             if spec["role"] == "metadata" or str(live.dtype) in INTEGERS:
                 bound[sig, path] = identity(live, pool), values(live, hosts)
+                read[id(view)] = bound[sig, path][1]
         later.clear()  # none on a bench that binds every occurrence alike
         for (_, sig, path), (_, view) in getattr(stub, "later", {}).items():
             live = sources.get(id(view), (None, view))[1]
             later.setdefault(sig, {})[path] = identity(live, pool)
+
+    def reached(ends, width):  # a plane's row bounds, else every column a row
+        got = read.get(id(ends))
+        got = [width] * ends.numel() if got is None else list(_flat(got))
+        return [min(max(v, 0), width) for v in got]
 
     def timing(stub, op, sig, instances, n):
         held = {p: v for (s, p), (_, v) in bound.items() if s == sig and v}
@@ -456,6 +464,7 @@ def main(out, argv) -> None:
             (triton_jit.JITFunction, "run", typed),
             (ops, "_deep", cloning),
             (ops, "_journal", journaled),
+            (ops, "_reached", reached),
             (torch, "empty_strided", pinning),
             (ops.Stub, "_prepare", preparing),
             (ops.Stub, "_time", timing),

@@ -104,7 +104,8 @@ window and compress ratio, the plane rows the batch's blocks hold at that
 ratio, a pointer table's (`_CACHE`) its entries, a view operator's none, a
 RoPE table's (`TABLES`), a weight or a tensor of a module it names, a row a
 position its call takes, else a token, a table a leaf gathers by token ids
-(`GATHERED`) as many rows as its ids, aiter's top-k scratch (`TOPK_WORKSPACE`)
+(`GATHERED`) as many rows as its ids, V4.1's FP8 index plane (`Stub._plane`)
+the columns below its rows' bounds, aiter's top-k scratch (`TOPK_WORKSPACE`)
 the bytes it launches with, but none of the multi-block path's one cached
 buffer, which every copy launches and the point's footprint counts once, the
 other tensors of each module it names,
@@ -116,7 +117,8 @@ a drafter is one a token. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
 copies: N built ones: M, the least count whose bytes pass `COLD` times the
-last-level cache, raised for a context key to its I instances (at most K),
+last-level cache, but for that plane where its copies' buffers pass it twice,
+raised for a context key to its I instances (at most K),
 then, up to the leaf's occurrences when it takes a weight other than a
 gathered table (at most K), copy
 c mod N with the c-th weights on that copy's other arguments. Of a leaf whose
@@ -266,7 +268,7 @@ PROG = "compass measure ops"
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 31
+PROTOCOL = 32
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -432,8 +434,9 @@ V4_LISTS = {
 #: DeepSeek-V4.1's arguments, keyed as `V4_METADATA`'s, and the buffers ATOM
 #: passes each (`_named`), at the leaf's ratio (`_ratio`), as `_bound` names
 #: them: the paged cache's, the pass's step (`step.`), the decoder plan
-#: (`plan.`), the scorer workspace (`workspace.`), the forward context; or
-#: past one, its first row (`.0`) or it widened to int64 (`.long`).
+#: (`plan.`), the scorer workspace (`workspace.`), the forward context or the
+#: runner's buffers; or past one, its first row (`.0`) or it widened to int64
+#: (`.long`).
 _CACHE = "attn_metadata_builder.cache.indptr_buffers.{ratio}"
 _STAGED = "attn_metadata_builder.cache._cursor_staging.gpu"
 _LOGITS = (
@@ -473,6 +476,11 @@ V41_NAMES = {
     ("aten.index_select.default", "index", "kv"): "step.slots",
     ("aten.index_select.default", "index", "metadata"): "plan.last",
     ("aten.index.Tensor", "indices"): "plan.query_ptrs",
+    # the tables a replay's queries take their pointers from at its last
+    # layer's ratio, `pptr[query_ptrs]` then `eptr[query_ptrs]`: the first binds
+    ("aten.index.Tensor", "self", "kv"): (f"{_CACHE}.0", f"{_CACHE}.1"),
+    # the sampler's request of each draft row, a search of its drafts' counts
+    ("aten.searchsorted.Tensor", "sorted_sequence"): "cu_num_draft_tokens",
     ("aten.index_put_.default", "indices"): ("plan.tail_rows", "plan.last_rows"),
     # the cursor write, `cursor[step.slots[:n].long()] = staged[:n]`, whose
     # values at one row are the staging's first, its unit dim dropped
@@ -1049,10 +1057,11 @@ class Stub:
         picks = [m for m, s in spec.items() if getattr(s, "produces_candidates", 0)]
         self.picker = next((m for m in picks if hasattr(m, "topk_blocks")), None)
         # its first attention layer at each ratio, whose lists its index build
-        # writes (`_lists`), and each pass's window reach (`_prepare`)
+        # writes (`_lists`), each pass's window reach and, by leaf, the pass
+        # and ratio its lists were built for (`_prepare`)
         specs = {s for s in spec.values() if hasattr(s, "index_group_start")}
         self.specs = {s.ratio: s for s in sorted(specs, key=lambda s: -s.layer_id)}
-        self.reach = {}
+        self.reach, self.selections = {}, {}
         # a DeepSeek-V4 CSA layer: its forward writes the top-k section of the
         # CSA index buffer, and `_prepare` runs none
         self.csa = next(
@@ -1114,7 +1123,7 @@ class Stub:
         # the step's own its width, its window reach: the ring rows its index
         # build lists each request below its window split, from its floor
         # (`_window_split`), none on a replay's tail
-        self.lists, self.reach = {}, {}
+        self.lists, self.reach, self.selections = {}, {}, {}
         for rows, (step, _) in passes.items():
             if hasattr(step, "request_floors"):
                 split = np.maximum(step.request_positions, step.request_cached_until)
@@ -1200,6 +1209,7 @@ class Stub:
                         if listed is not None:  # as its index build writes it
                             step = passes.get(at, passes[None])[0]
                             pool = self._lists(md.cache, step, ratio, listed, live)
+                            self.selections[sig] = md.cache, step, ratio, plan
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
@@ -1306,6 +1316,19 @@ class Stub:
             built = built[rows.long()]
         return {f"attention_indices.{ratio}.{i}": built}
 
+    def _selected(self, sig) -> int | None:
+        """The pool rows the selection on leaf `sig`'s lists (`_lists`) names
+        for its pass, worked out on the host off the pass's requests
+        (`_spread`), a replay's queries each tail request's last row
+        (`lay_out_tail`); None where the leaf took no lists or no selection."""
+        cache, step, ratio, plan = self.selections.get(sig, (None, None, 0, None))
+        if not ratio:
+            return None
+        spans = [(s.position, s.length) for s in step.requests]
+        if plan is not None and step.batch_ids is plan.query_ids:
+            spans = [(p + n - 1, 1) for p, n in spans]
+        return _spread(tuple(spans), ratio, cache.geometry.batch_topk(ratio))
+
     def point(self, rule, shape, context, found) -> list[dict]:
         """Each leaf of `found` timed at `shape` on `point_rows`, or every leaf
         refused when `rule` refuses the batch."""
@@ -1354,6 +1377,11 @@ class Stub:
             for op, _ in found.values()
             if op["op"] == _FUSED
         }
+        # and its last layer's, whose tables a replay's queries take their
+        # pointers from (`QueryRows.indices`)
+        model = self.runner.model
+        if (last := getattr(model, "last_layer", None)) is not None:
+            self.known |= {("queries", None): model.topology[last].ratio}
         bind = {
             (s, path): (spec, _named(op, path, spec, held, self.known) or held)
             for s, (op, _) in found.items()
@@ -1479,7 +1507,7 @@ class Stub:
         by blocks and by state slots; `tokens` defaults to `rows`, a
         decode's; at a `decode`, a context key's recurrent state counts each
         state slot a row holds."""
-        need, size, shared = 1, 0, [0, 0]
+        need, size, shared, most = 1, 0, [0, 0], CALLS
         fn, cia = _overload(op["op"]), "CompositeImplicitAutograd"
         if fn and fn.is_view and not fn.has_kernel_for_dispatch_key(cia):
             return 1, size, need, shared  # reads none; a composite (`reshape`) may copy
@@ -1497,6 +1525,9 @@ class Stub:
                     read = torch.Size(op["args"][ids]["shape"]).numel()
                 entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
                 nbytes = entry * min(read, s["shape"][0])
+            if plane := self._plane(op, sig, slot):  # buffers: 2 * COLD * llc
+                reach, _, k, held = plane
+                nbytes, most = reach * itemsize, k * self._cold(held * itemsize // 2)
             if s["role"] == "kv":
                 # ponytail: its widest-strided dim taken as blocks or state slots,
                 # or plane rows when the leaf states its layer's attention geometry;
@@ -1514,9 +1545,11 @@ class Stub:
                     # per `ratio` tokens; its window rows are left out
                     unit = blocks * self.runner.config.kv_cache_block_size // ratio
                     slotted = 0
-                    # of which a request reads at most its indexer's top-k
+                    # of which a request reads at most its indexer's top-k; a
+                    # leaf on V4.1's lists, the rows their selection names
                     if top := stated.get("index_topk"):
-                        unit = min(unit, rows * top)
+                        chosen = self._selected(sig)
+                        unit = min(unit, rows * top if chosen is None else chosen)
                 elif window and self.state.get(name):
                     unit = 0  # its window is read from the ring alone
                 if self.state.get(name):
@@ -1588,7 +1621,7 @@ class Stub:
                         need = None
                     else:
                         size += t.nbytes
-        n = self._cold(size)
+        n = min(self._cold(size), most)
         if need is None:  # cycle over every instance's state, which is held anyway
             n = min(CALLS, max(n, len(instances)))
         return n, size, need or -(-n // len(instances)), shared
@@ -1596,6 +1629,23 @@ class Stub:
     def _cold(self, size) -> int:
         """Copies of `size` bytes a call whose bytes pass `COLD` times the cache."""
         return min(CALLS, COLD * self.llc // size + 1) if size else 1
+
+    def _plane(self, op, sig, path):
+        """V4.1's FP8 index plane at `op`'s `path` (`PAGE_WIDE`), or None: the
+        columns below its rows' bounds, all where none is bound; its copies'
+        starts apart, its widest row's to a `WEIGHT_ALIGN` boundary; k, the
+        copies a buffer holds, none reaching another's columns; its elements."""
+        bound, plane = PAGE_WIDE.get(op["op"], ("", ""))[:2]
+        spec = op["args"][path] if self.paged and path == plane else {}
+        if spec.get("role") != "metadata" or not plane.endswith("logits"):
+            return None  # nor the pick's top-k's, on block maxima, an activation
+        ends = self.placed[0][1].get((sig, bound), ("", None))[1]
+        (rows, width), size = spec["shape"], _dtype(spec["dtype"]).itemsize
+        reach = [width] * rows if ends is None else _reached(ends, width)
+        cols = -(-max(reach) * size // WEIGHT_ALIGN) * WEIGHT_ALIGN // size
+        k = spec["stride"][0] // max(cols, 1) or 1
+        held = _span(spec["shape"], spec["stride"]) + (k - 1) * cols
+        return sum(reach), cols, k, held
 
     def _time(self, op, sig, instances, n) -> dict:
         """`op` timed in a graph of K calls, `CALLS` or as many as fill
@@ -1773,15 +1823,16 @@ class Stub:
                 # before has, off its own random inputs. Placements share one
                 # clone of it, which ATOM's preparation leaves unchanged, so
                 # each copy draws on a plane of its own
+                if plane := self._plane(op, sig, path):  # a scorer's too
+                    _, cols, k, held = plane
+                    if (sig, c // k) not in self.built:
+                        self.built[sig, c // k] = out.new_zeros(held)
+                    whole = self.built[sig, c // k]
+                    out = whole.as_strided(out.shape, out.stride(), c % k * cols)
                 if self.paged and path == "logits" and value["role"] == "metadata":
                     bound = PAGE_WIDE.get(op["op"], ("",))[0]
                     if (ends := meta.get((sig, bound), ("", None))[1]) is not None:
-                        out = out if fresh else _clone(out)
                         _scores(out, ends, value)
-                # and each copy of the scorer writes a plane of its own
-                written = self.paged and value["role"] == "metadata"
-                if written and (op["op"], path) == (_LOGITS, "out_logits"):
-                    out = out if fresh else _clone(out)
                 return out
             if isinstance(value, str) and value.startswith("torch."):
                 return getattr(torch, value[6:], value)
@@ -2068,7 +2119,8 @@ def _ratio(op, path, known=None):
     build, 0 when it takes no selection) or the width of the logits it reads
     (`stride0`, V4.1's top-k, its scorer's), or, in a graph captured before
     V4.1's key RoPE stated its ratio, a RoPE's positions the rows its compress
-    plan holds (`compressed`)."""
+    plan holds (`compressed`), or aten's index its table its model's last
+    layer's (`queries`), where a replay's queries take their pointers."""
     args, (slot, *rest) = op["args"], path.split(".")
     listed = args.get("ratios")
     if rest and isinstance(args.get(slot), list) and isinstance(listed, list):
@@ -2081,6 +2133,8 @@ def _ratio(op, path, known=None):
         ratio = known.get(("stride0", args["stride0"]))
     if ratio is None and known and (op["op"], path) == (_ROPE, "positions"):
         ratio = known.get(("compressed", args[path]["shape"][-1]))
+    if ratio is None and known and (op["op"], path) == ("aten.index.Tensor", "self"):
+        ratio = known.get(("queries", None))
     return ratio
 
 
@@ -2206,6 +2260,21 @@ def _candidates(ends, k) -> torch.Tensor:
     kept = torch.where(run < seen, run, -1)
     spread = seen - 1 - (k - 1 - run) * (seen - 1) // max(k - 1, 1)
     return torch.where(seen > k, spread, kept).int()
+
+
+@functools.lru_cache(maxsize=64)
+def _spread(spans, ratio, k) -> int:
+    """The pool rows `_candidates` keeps at `ratio` over the rows of `spans`,
+    `(first position, rows)` a request, a request's apart: each row seeing
+    `(position + 1) // ratio`, as ATOM stages `visible`. On the host, where a
+    capture's fake mode holds a selection with no values."""
+    run, named = np.arange(k), 0
+    for start, rows in spans:
+        seen = (np.arange(start, start + rows)[:, None] + 1) // ratio
+        spread = seen - 1 - (k - 1 - run) * (seen - 1) // max(k - 1, 1)
+        kept = np.where(seen > k, spread, np.where(run < seen, run, -1))
+        named += np.unique(kept[kept >= 0]).size
+    return named
 
 
 def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:
@@ -2767,6 +2836,10 @@ def _scores(plane, ends, spec) -> None:
     drawn = _random(spec, plane.device)
     below = torch.arange(plane.shape[-1], device=plane.device) < ends.reshape(-1, 1)
     plane.copy_(torch.where(below, drawn, plane))
+
+
+def _reached(ends, width) -> list[int]:  # each row's columns below its bound
+    return ends.reshape(-1).clamp(0, width).tolist()
 
 
 def _clone(t) -> torch.Tensor:

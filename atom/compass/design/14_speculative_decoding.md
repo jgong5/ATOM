@@ -491,10 +491,11 @@ That closes the Eagle case of [#2672](https://github.com/jgong5/ATOM/issues/2672
 asked each such form to run or be refused. The step roofline lays out no Eagle3 pass, so an
 Eagle3 step it prices is refused by name (`cost:<backend>: prices no draft`, D83).
 
-A law and a readings entry name the draft by method and `K` only
-(`run/step_grid.py::keyed`'s `speculative`) beside the target's `config.json` digest, so
-two Eagle3 drafts of one target would share a key. The stage runs one draft;
-[#3276](https://github.com/jgong5/ATOM/issues/3276) keys the draft checkpoint too.
+A law and a readings entry name the draft by method and `K`
+(`run/step_grid.py::keyed`'s `speculative`) beside the target's `config.json` digest, and
+by its own `config.json` digest where that is not the target's (`draft_model`,
+[#3276](https://github.com/jgong5/ATOM/issues/3276)), so two Eagle3 drafts of one target
+key apart. A draft read from the target's checkpoint keys by method and `K` alone.
 
 ---
 
