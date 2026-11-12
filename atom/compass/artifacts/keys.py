@@ -95,6 +95,8 @@ OWN_FIELDS: Mapping[Kind, tuple[str, ...]] = {
     # `spec` is the whole machine spec's digest, which moves with any value it
     # prices by; `cells` the digest of each cell's step records and engine.
     Kind.PROJECTION: ("model", "spec", "source_root", "cells"),
+    # The node's host name, so one node publishes one record per platform.
+    Kind.PROBE_RECORD: ("host",),
 }
 
 #: What keys each artifact: its own fields, then each platform axis a row of

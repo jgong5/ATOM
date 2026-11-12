@@ -31,11 +31,13 @@ from atom.compass.bench import ops
 from atom.utils import forward_context as fctx
 
 HARNESS = pathlib.Path(__file__).with_name("v41_ops_rehearsal.py")
+#: The cells' drafter.
+DRAFTER = " --method dspark --num-speculative-tokens 5"
+DRAFTER += " --spec-decode-acceptance-length 3"
 #: The cells' engine arguments past the model and TP, as their card run starts
 #: them.
-CELL = ARGS + (
-    " --method dspark --num-speculative-tokens 5"
-    " --spec-decode-acceptance-length 3 --gpu-memory-utilization 0.9"
+CELL = f"{ARGS}{DRAFTER}" + (
+    " --gpu-memory-utilization 0.9"
     " --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384"
     " --block-size 16 --max-num-seqs 64 --max-model-len 262144"
     " --cudagraph-capture-sizes [1,2,3,4,5,6,7,8,12,16,24,32,40,48,56,64]"
@@ -228,3 +230,33 @@ def test_the_cursor_write_s_values_are_its_staging_s_first_rows(shape):
     op = {"op": "aten.index_put_.default", "args": {"self": {"role": "kv"}}}
     _, view = ops._kv(spec, "values", ops._named(op, "values", spec, held) or held)
     assert (view.data_ptr(), list(view.shape)) == (staged.data_ptr(), shape)
+
+
+@pytest.fixture(scope="module")
+def undrafted(model_dir, tmp_path_factory):  # noqa: F811
+    """Cell B's decode B=16 with no drafter, traced; what its capture passes
+    each leaf; and the rehearsal's record of its RoPE leaves alone, no compress
+    leaf beside them, at 8192 tokens a row."""
+    root, cell = tmp_path_factory.mktemp("v41_undrafted"), CELL.replace(DRAFTER, "")
+    _trace(root, f"--width 16{cell}", ("--arch", "gfx1250", "--gpu", "0"), READ)
+    model, cell = root / "model", cell.split()[1:]
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(model_dir / name, model / name)
+    _run(TRUTH, root / "truth.json", model, 4, "--width", "16", "--", *cell)
+    atom = ["--model", model, "-tp", "4", "--enforce-eager", "--level", "0", *cell]
+    point = ["--width", "16", "--context", "8192", "--only", ROPE, "--llc-mib", "512"]
+    _run(HARNESS, root / "got.json", *point, "--store", root / "store", "--", *atom)
+    return [json.loads((root / f).read_text()) for f in ("got.json", "truth.json")]
+
+
+def test_each_rope_alone_takes_its_positions_at_a_decode_with_no_drafter(undrafted):
+    """With no drafter both ratios' compress plans hold a row a request, so only
+    the ratio the capture states tells their keys' RoPEs apart: each RoPE leaf,
+    with no compress leaf beside it, takes the positions ATOM's capture passes
+    it, the query's and each ratio's keys' apart, a buffer a leaf."""
+    got, truth = undrafted
+    taken = {r["leaf"]: r["identity"].get("positions") for r in got}
+    want = {s: truth.get(s, {}).get("positions") for s in taken}
+    assert {s: [n] for s, n in taken.items()} == want
+    assert {(r["op"], r["verdict"]) for r in got} == {(ROPE, "reaches launch")}
+    assert len(set(taken.values())) == len(taken) == 3
