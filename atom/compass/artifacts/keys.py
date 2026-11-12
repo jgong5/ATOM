@@ -97,6 +97,7 @@ OWN_FIELDS: Mapping[Kind, tuple[str, ...]] = {
     Kind.PROJECTION: ("model", "spec", "source_root", "cells"),
     # The node's host name, so one node publishes one record per platform.
     Kind.PROBE_RECORD: ("host",),
+    Kind.PLATFORM_READINGS: (),
 }
 
 #: What keys each artifact: its own fields, then each platform axis a row of

@@ -26,9 +26,6 @@ Each cell also states its projected seconds per phase by the roofline part that
 set them (`bound.gate`). Its `band` re-prices every cell at each carried value
 a price read times each of its factors, one at a time (`band`), and ranks the
 cells again.
-
-`projected` is the method that makes SPEC for a device that never ran, applied
-to one that did, for `validate.bound --ratios-from`.
 """
 
 import argparse
@@ -52,54 +49,13 @@ from atom.compass.artifacts import (
     roots_for,
 )
 from atom.compass.backends.cost import fold_parts, fold_seconds
+from atom.compass.fit.device import BANDWIDTH, CURVE
 from atom.compass.spec import MachineSpec
 
 from . import bound
 
 PROG = "compass project"
-#: What a projected device takes from the probed one as it stands, no
-#: datasheet stating it.
-CARRIED = (
-    "device.kernel_floor_s",
-    "device.software_pinned_to.",
-    "interconnect.intra_node.link_latency_s",
-    "interconnect.inter_node.link_latency_s",
-    "interconnect.router_relay_s",
-)
-CURVE = "device.memory.bandwidth_curve"
 FLOOR = "device.kernel_floor_s"
-BANDWIDTH = "device.memory.bandwidth_bytes_per_s"
-
-
-def projected(target: MachineSpec, source: MachineSpec) -> MachineSpec:
-    """`target` at `source`'s probed ratios: target's peaks and what names it,
-    source's derates and its bandwidth curve over its datasheet bandwidth
-    times target's, and source's values where no datasheet states one
-    (`CARRIED`), each assumed. A compute format source states no derate for is
-    left out, so a price that reads its rate is refused."""
-
-    def taken(path: str) -> bool:
-        return "derate" in path.split(".") or path == CURVE or path.startswith(CARRIED)
-
-    scale = target.value(BANDWIDTH) / source.value(BANDWIDTH)
-    values = {p: v for p, v in target.values.items() if not taken(p)}
-    values |= {p: v for p, v in source.values.items() if taken(p)}
-    values[CURVE] = [[size, rate * scale] for size, rate in source.value(CURVE)]
-    for fmt in ("bf16", "fp8", "fp4"):
-        if f"device.compute.derate.{fmt}" not in values:
-            values.pop(f"device.compute.{fmt}_flops", None)
-    kept = target.values["provenance.origins"].items()
-    values["provenance.origins"] = {
-        **{p: o for p, o in kept if p in values and not taken(p)},
-        **{
-            p: {"origin": "assumed"}
-            for p in source.values["provenance.origins"]
-            if taken(p)
-        },
-    }
-    values["name"] = f"{target.values['name']} at {source.values['name']} ratios"
-    echo = MachineSpec(values).echo()
-    return MachineSpec.from_mapping(echo)
 
 
 class Reads:

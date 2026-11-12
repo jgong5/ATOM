@@ -124,6 +124,10 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
         "when a fit published its entry, for the entry's provenance; a fit runs "
         "offline on recorded steps and never inside a simulated run"
     ),
+    "atom/compass/fit/device.py": (
+        "when fit device published its entry, for the entry's provenance and "
+        "date; it runs offline on probe records and never inside a simulated run"
+    ),
     "atom/compass/drive/identity.py": (
         "a command's phase boundaries in run.json, which are wall and monotonic "
         "time by definition; the tool process reads them, and no simulated time"
