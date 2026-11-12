@@ -66,7 +66,10 @@ received, or a RapidServe engine's) has no digest: its first step names it,
 its request id its key, so its response id still follows it. A 1P1D
 deployment's two records join on prefill's request id (`transfers`).
 Prefix caching is not covered: the worker never sees a cached prefix, so parity
-runs need caching off or the same cache hits in both runs. Requests of one
+runs need caching off or the same cache hits in both runs. Nor is an lmcache
+offload load: a prefill window that starts where the last load handed for its
+request ended, and the request's last window ended where that load began, is
+digested on from there, the loaded tokens left out as a cached prefix's are. Requests of one
 record with one prompt are named in the order their final chunks are scheduled:
 the first by the digest, the n-th after it by `<digest>.<n>`. A run that
 schedules them in the other order names them the other way round, and `compare`
@@ -158,6 +161,8 @@ class StepRecord:
         self.pending: collections.deque[tuple] = collections.deque()
         # Offload decisions handed to the worker, not yet on a line.
         self.kv: list[tuple] = []
+        # Request id -> (start, end) of the last offload load handed for it.
+        self.loaded: dict[int, tuple[int, int]] = {}
 
     def note_kv(self, meta) -> None:
         """Keep each lmcache offload load and save `meta` hands the worker:
@@ -165,9 +170,9 @@ class StepRecord:
         ``[request id, "save", tokens already saved, tokens computed]``."""
         for req in getattr(meta, "requests", ()):
             if (ls := req.load_spec) is not None:
-                self.kv.append(
-                    (req.req_id, "load", ls.hbm_cached_tokens, ls.lmcache_cached_tokens)
-                )
+                span = (ls.hbm_cached_tokens, ls.lmcache_cached_tokens)
+                self.kv.append((req.req_id, "load", *span))
+                self.loaded[req.req_id] = span
             if (ss := req.save_spec) is not None:
                 self.kv.append(
                     (req.req_id, "save", ss.skip_leading_tokens, len(req.token_ids))
@@ -231,6 +236,11 @@ class StepRecord:
                 digest, end = self.prompts.pop(
                     req_id, (hashlib.blake2b(digest_size=8), start)
                 )
+                # A load filled [end, start) from the offload tier.
+                span = self.loaded.get(req_id)
+                if span is not None and span[0] <= end < start <= span[1]:
+                    end = start
+                    del self.loaded[req_id]
                 # A forward the scheduler backed off below where the prefill
                 # resumed recomputes the rows between: digested once already.
                 replay = batch.replaying.get(i)

@@ -16,6 +16,7 @@ import math
 from types import SimpleNamespace
 
 import pytest
+import test_parity_record as parity_test
 from conftest import atom_config_double
 from test_dp_step_max import runner
 from test_memory_readings import DOCUMENT
@@ -23,6 +24,7 @@ from test_run_refusal_summary import STAGE1
 from test_runner_control_refusals import Worker
 from transformers import PretrainedConfig
 
+from atom.compass import parity
 from atom.compass import run as compass_run
 from atom.compass.backends import StepStubBackend
 from atom.compass.backends.step_linear_fit import fit_offload
@@ -37,6 +39,7 @@ from atom.compass.kv.lmcache_offload import (
     Tier,
     chunk_keys,
 )
+from atom.compass.parity import read
 from atom.compass.runner.overrides import NonAllocatingRunner, RunnerRefusal
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import (
@@ -46,6 +49,11 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload.hybrid.m3.connector import (
     M3OffloadConnector,
     M3OffloadScheduler,
+)
+from atom.kv_transfer.offload.metadata import (
+    LMCacheOffloadMetadata,
+    LMCacheReqMeta,
+    LoadSpec,
 )
 from atom.model_engine.engine_stats import EngineStats
 from atom.utils import clock, forward_context
@@ -307,6 +315,45 @@ def test_compass_run_writes_the_entry_its_flag_names(tmp_path):
         + ["--lmcache-offload", str(tmp_path / "entry.json")]
     )
     assert runfile.build(args, ["--model", str(tmp_path)])[ENTRY] == _entry()
+
+
+@pytest.mark.usefixtures("unpriced")
+def test_a_window_resuming_past_an_offload_load_keeps_its_prompt_key(
+    tmp_path, monkeypatch
+):
+    """The tier filled [64, 128) between request 0's first and third windows:
+    the record digests on past it, leaving the loaded tokens out, as a
+    cached prefix's are; a load that ends elsewhere still refuses."""
+    batches = parity_test._drive(tmp_path / "source", monkeypatch, {0: [0]})[0][0]
+    [req_id] = batches[0].req_ids
+    monkeypatch.setenv(parity.ENV, str(tmp_path / "record"))
+    meta = LMCacheOffloadMetadata()
+    meta.add_request(
+        LMCacheReqMeta(
+            req_id,
+            parity_test._prompt(0)[:128],
+            [0],
+            load_spec=LoadSpec(64, 128, can_load=True),
+            load_operation=LoadOperationId(req_id, 0),
+        )
+    )
+    loaded = parity_test._Runner(parity_test._config())
+    loaded.forward(batches[0])
+    parity.record_kv(loaded, meta)
+    for batch in batches[2:]:
+        loaded.forward(batch)
+    loaded._parity_record.write()
+    tokens = parity_test._prompt(0)
+    [line] = [s for s in read(tmp_path / "record")[0] if s.get("kv")]
+    assert line["kv"] == [
+        [parity_test._key(tokens[:64] + tokens[128:]), "load", 64, 128]
+    ]
+    elsewhere = parity_test._Runner(parity_test._config())
+    elsewhere.forward(batches[0])
+    meta.requests[0].load_spec = LoadSpec(64, 112, can_load=True)
+    parity.record_kv(elsewhere, meta)
+    with pytest.raises(ValueError, match="starts at token 128, not at 64"):
+        elsewhere.forward(batches[2])
 
 
 def _slru(slots):
