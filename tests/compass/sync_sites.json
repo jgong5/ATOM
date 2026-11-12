@@ -5222,9 +5222,33 @@
    "expr": "probe.wait()",
    "shape": "event_wait",
    "peer": "process",
-   "why": "compass measure device waits for one card's probe to finish before it checks the cards and starts the next",
+   "why": "compass measure device reaps a probe process once its session is stopped, before it checks the cards and starts the next",
    "mechanism": "K9",
    "mechanism_why": "in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so the bound stays real"
+  },
+  {
+   "id": "atom/compass/drive/measure_device.py::_child::probe.poll()::poll#0",
+   "file": "atom/compass/drive/measure_device.py",
+   "symbol": "_child",
+   "call": "probe.poll",
+   "expr": "probe.poll()",
+   "shape": "poll",
+   "peer": "process",
+   "why": "compass measure device asks whether a probe process has exited while it waits for the probe or for SIGINT or SIGTERM",
+   "mechanism": "K9",
+   "mechanism_why": "a process poll returns at once and cannot park; in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so the bound stays real"
+  },
+  {
+   "id": "atom/compass/drive/measure_device.py::_child::time.sleep(serve.POLL_S)::sleep#0",
+   "file": "atom/compass/drive/measure_device.py",
+   "symbol": "_child",
+   "call": "time.sleep",
+   "expr": "time.sleep(serve.POLL_S)",
+   "shape": "sleep",
+   "peer": "process",
+   "why": "compass measure device's half-second cadence between its checks on a probe process",
+   "mechanism": "K9",
+   "mechanism_why": "in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so its cadence no simulated clock reads"
   },
   {
    "id": "atom/compass/kv/lmcache_mp.py::LMCacheMPShell._send::sock.send_multipart([pickle.dumps((ch, *rt.stamp_send(ch))), *frames])::p2p#0",

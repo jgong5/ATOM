@@ -32,10 +32,12 @@ import datetime
 import json
 import math
 import os
+import signal
 import socket
 import statistics
 import subprocess
 import sys
+import time
 from functools import partial
 from pathlib import Path
 
@@ -100,7 +102,10 @@ def main(argv: list[str]) -> None:
         # ponytail: one card at a time, 10-15 min a card; disjoint pairs could
         # run at once if a card's rates are shown unmoved by a busy neighbour.
         cards[str(gpu)] = _child(out, "pair", (gpu, gpus[(i + 1) % len(gpus)]))
-    pp = _child(out, "pp", gpus[:2]) if args.pp else None
+    pp = None
+    if args.pp:
+        checks.append(_idle(bdfs, ptl))
+        pp = _child(out, "pp", gpus[:2])
     checks.append(_idle(bdfs, ptl))
     record = {
         "host": key.values["host"],
@@ -147,7 +152,9 @@ def _child(out: Path, task: str, gpus: tuple[int, ...]) -> dict:
     """What `child(task, ...)` wrote, run in a process that sees `gpus`; under
     torchrun, two ranks, for ``pp``. It returns once `serve._stop` finds the
     process's session gone and KFD listing no process it did not list
-    before: KFD lists an exited process until it has freed its GPU memory."""
+    before: KFD lists an exited process until it has freed its GPU memory.
+    SIGINT and SIGTERM end the wait, never the stop: the process runs in its
+    own session, so a command that ends first leaves it running."""
     kfd = serve._kfd()
     path = out / f"{task}-{'-'.join(map(str, gpus))}.json"
     argv = [sys.executable, "-m", MODULE, task, str(path)]
@@ -156,12 +163,19 @@ def _child(out: Path, task: str, gpus: tuple[int, ...]) -> dict:
         argv[1:1] = run
     env = os.environ | {"HIP_VISIBLE_DEVICES": hip_visible(gpus)}
     log = path.with_suffix(".log")
-    with log.open("w") as f:
+    with log.open("w") as f, serve._stop_signals() as stopped:
         probe = subprocess.Popen(
             argv, env=env, stdout=f, stderr=subprocess.STDOUT, start_new_session=True
         )
-        code = probe.wait()
-    serve._stop(probe.pid, kfd)
+        try:
+            while not stopped and probe.poll() is None:
+                time.sleep(serve.POLL_S)
+        finally:
+            serve._stop(probe.pid, kfd)
+            code = probe.wait()
+    if stopped:
+        name = signal.Signals(stopped[0]).name
+        raise ValueError(f"{name} stopped the command; nothing is published")
     if code:
         raise ValueError(f"the {task} probe on GPUs {gpus} exited {code}; see {log}")
     return json.loads(path.read_text())
