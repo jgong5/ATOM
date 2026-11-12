@@ -40,13 +40,17 @@ the target's, `d_target_ns` with no gap, and the draft label is the rest of
 `d_busy_ns`. A decode's draft-KV pass, `d_draft_kv_ns`, runs before
 `forward_done_event`: its device label holds it, as its draft-KV label too,
 and its draft label does not. A device event runs no earlier than the host
-records it, so a launch record less its device start bounds the host clock's
-lead from below, and an MTP status wait's return less the `forward_done_event`
-it waits for bounds it from above. The clocks drift apart over a record, and
-the tightest of the last `ANCHORS` status-wait bounds (of the first, before as
+records it, so the host clock read just before a launch's entry event is
+recorded (`t_launch_event_ns`) less the event's device start bounds the host
+clock's lead from below, and an MTP status wait's return less the
+`forward_done_event` it waits for bounds it from above. A record without that
+read takes the launch's entry stamp, read after the event, so a host stall
+between the two lifts its bound. The clocks drift apart over a record, and the
+tightest of the last `ANCHORS` status-wait bounds (of the first, before as
 many) follows them: a step's lead is the largest launch bound moved by how far
 that tightest bound moved since, leaving out any above it at its own launch,
-whose host stalled before stamping it; with no status wait, the largest launch
+which only a stalled entry stamp or drift faster than the anchors follow
+reaches; with no status wait, the largest launch
 bound over the record. A decode's draft label, its `propose`
 pass, is cut where the device reached the pass, placed by that lead, before
 the host's draft copy wait (`t_draft_recv_ns`) began: the host queues the pass
@@ -339,7 +343,9 @@ def _timed(lines) -> list[tuple[dict, int, int, int | None]]:
         if b is not None:
             recent.append(b)
         tight.append(min(recent) if len(recent) == ANCHORS else first)
-    lows = [s["t_launch_ns"][0] - start for s, start, _ in timed]
+    lows = [
+        s.get("t_launch_event_ns", s["t_launch_ns"][0]) - start for s, start, _ in timed
+    ]
     margins = [t - low for t, low in zip(tight, lows) if low <= t or not waits]
     if not margins:
         raise ValueError("every launch bound exceeds the MTP status waits' bound")

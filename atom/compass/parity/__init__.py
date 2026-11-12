@@ -16,8 +16,9 @@ output's token copy (`t_recv_ns`, only on a forward that reaches it; off a
 pipeline, a runner that does not defer its output reads its own tokens under
 `t_read_ns` instead), and with
 a drafter its MTP status (`t_mtp_ns`) and draft copy (`t_draft_recv_ns`). Its device
-window is `d_busy_ns`, from an event recorded at the launch's entry to one
-recorded at the forward's exit (`d_target_ns` to one recorded just after
+window is `d_busy_ns`, from an event recorded at the launch's entry, the clock
+read under `t_launch_event_ns` once the event exists and just before its record,
+to one recorded at the forward's exit (`d_target_ns` to one recorded just after
 `postprocess` records `forward_done_event`, less the drafter's `compute_draft_kv`
 pass before it, or on a forward that samples nothing, to the start of its first
 drafter pass, that one or `propose_draft_token_ids`); `d_draft_kv_ns` and
@@ -106,6 +107,7 @@ TIMESTAMPS = (
     "t_exit_ns",
     "t_gate_ns",
     "t_launch_ns",
+    "t_launch_event_ns",
     "t_recv_ns",
     "t_read_ns",
     "t_mtp_ns",
@@ -467,8 +469,9 @@ class StepRecording:
     ATOM's `ModelRunner.__init__` warms up with a forward over a fabricated
     batch, which the simulated runner declines, so recording starts once
     construction returns. The class it is composed into supplies
-    `step_clock_ns`, the clock its lines are timed by, and `device_event`,
-    which records a timing event on the current stream and returns it.
+    `step_clock_ns`, the clock its lines are timed by, and
+    `device_event(event=None)`, which records `event`, or a new timing event,
+    on the current stream and returns it.
 
     A recorded forward is also stamped inside: around `_gate_staging_reuse`,
     `run_model` and the instance's `tokenID_processor.recv_async_output`, with
@@ -612,7 +615,12 @@ class StepRecording:
         if getattr(self, "_parity_record", None) is not None:
             from atom.utils.forward_context import get_forward_context
 
-            self._stamps["launch_event"] = self.device_event()
+            # The event is recorded once to create it, then again just after
+            # the read: neither a stall nor the event's creation comes between
+            # the read and the record that places the launch.
+            event = self.device_event()
+            self._stamps["t_launch_event_ns"] = self.step_clock_ns()
+            self._stamps["launch_event"] = self.device_event(event)
             context = get_forward_context().context
             self._stamps["forward_mode"] = getattr(context, "forward_mode", None)
         return self._stamped("t_launch_ns", super().run_model, *args)

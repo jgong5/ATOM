@@ -583,8 +583,8 @@ def _record_last_stage(tmp_path, monkeypatch, pp):
             return next(self.clock)
 
         @staticmethod
-        def device_event():
-            return _Event()
+        def device_event(event=None):
+            return event or _Event()
 
     monkeypatch.setenv(ENV, str(tmp_path / "real"))
     runner = _Recorded(0, config)

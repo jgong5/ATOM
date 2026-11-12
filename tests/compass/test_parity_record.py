@@ -728,8 +728,10 @@ def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
         step_clock_ns = staticmethod(time.monotonic_ns)
 
         @staticmethod
-        def device_event():
-            return SimpleNamespace(query=lambda: True, elapsed_time=lambda _: 1.0)
+        def device_event(event=None):
+            return event or SimpleNamespace(
+                query=lambda: True, elapsed_time=lambda _: 1.0
+            )
 
     monkeypatch.setenv(ENV, str(tmp_path / "real"))
     runners = [_Recorded(rank) for rank in (0, 1)]
