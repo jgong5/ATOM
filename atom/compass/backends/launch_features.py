@@ -139,7 +139,9 @@ class DeepseekV4(LaunchFeatures):
     through ATOM's `UBatchWrapper`, unless it is a decode replaying a graph
     recorded split (`capture_rung`). `install` counts the wrapper's split
     runs, `_run_ubatches`, found on the class so that a module forwarding
-    unknown names to the wrapper is not taken for it; a model built without
+    unknown names to the wrapper is not taken for it, from the start of each
+    launch (`run_model`): ATOM records its graphs after the runner is built,
+    a bucket that splits through the same path. A model built without
     two-batch overlap has no wrapper."""
 
     features = ("split",)
@@ -151,12 +153,10 @@ class DeepseekV4(LaunchFeatures):
                 module._run_ubatches = functools.partial(
                     _split, seen, module._run_ubatches
                 )
+        runner.run_model = functools.partial(_launch, seen, runner.run_model)
 
     def observe(self, runner) -> dict[str, float]:
-        seen = runner.compass_launch_seen
-        observed = {"split": float(seen["split"] > 0)}
-        seen.clear()
-        return observed
+        return {"split": float(runner.compass_launch_seen["split"] > 0)}
 
     def predict(self, view, graphs: dict) -> dict[str, float]:
         split = view.tbo_tokens is not None and view.capture_rung is None
@@ -166,6 +166,11 @@ class DeepseekV4(LaunchFeatures):
 def _split(seen, run, *args, **kwargs):
     seen["split"] += 1
     return run(*args, **kwargs)
+
+
+def _launch(seen, run_model, *args, **kwargs):
+    seen.clear()
+    return run_model(*args, **kwargs)
 
 
 REGISTRY: dict[str, LaunchFeatures] = {

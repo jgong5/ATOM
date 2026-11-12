@@ -4,7 +4,8 @@
 A recording runner of a model ATOM wraps in its `UBatchWrapper` writes on each
 line whether the wrapper ran the step's micro-batches, and `fit_host` holds
 `predict` to it: the split `ForwardMode.decide` settles, less a decode that
-replays a graph recorded split. On planted middle chunks a split launch costs
+replays a graph recorded split, and a graph ATOM records once the runner is
+built splits no step. On planted middle chunks a split launch costs
 2.5 times a plain one: without the provider the JIT cut names every split,
 with it none, and the fit adopts the column, which a run prices.
 """
@@ -39,14 +40,13 @@ class _Model(nn.Module):
         return "one batch"
 
 
-@pytest.mark.parametrize("decode_graphs", [False, True])
-def test_a_recording_runner_writes_each_split_atom_ran_and_the_fit_agrees(
-    tmp_path, monkeypatch, decode_graphs
-):
-    """Three prompts of 200 tokens under a budget of 64, a prefill split from
-    40 tokens; a decode of three requests splits, and replays a graph recorded
-    split under `decode_graphs`."""
-    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "40")
+def _record(tmp_path, monkeypatch, decode_graphs, split_from, captured=0):
+    """Three prompts of 200 tokens under a budget of 64, recorded by a runner of
+    a V4-shaped model: a prefill splits from `split_from` tokens, a decode of
+    three requests splits and replays a graph recorded split under
+    `decode_graphs`, and ATOM records `captured` graphs of a bucket that splits
+    once the runner is built. Its lines and labelled samples."""
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", str(split_from))
     batches = _drive(tmp_path / "simulated", monkeypatch, {0: [0, 1, 2]})[0][0]
     recorded, device = _recorded(batches[-1])
     context = SimpleNamespace(ubatch_slices=None)
@@ -91,12 +91,23 @@ def test_a_recording_runner_writes_each_split_atom_ran_and_the_fit_agrees(
     runner = recorded(0, config)
     runner.tbo_decode_graphs = decode_graphs
     runner.host_key = {"engine": {"ladder": [1, 2, 4, 8]}}
+    # `capture_cudagraph`'s warm-up and recording, which call the model itself.
+    context.ubatch_slices = ("a bucket recorded split",)
+    for _ in range(captured):
+        runner.model(None, None)
+    context.ubatch_slices = None
     for batch in batches:
         runner.forward(batch)
     device.tick = 10**9
     runner.exit()
+    return read(tmp_path / "real")[0], label(str(tmp_path / "real" / "dp0.jsonl"))[0]
 
-    lines = read(tmp_path / "real")[0]
+
+@pytest.mark.parametrize("decode_graphs", [False, True])
+def test_a_recording_runner_writes_each_split_atom_ran_and_the_fit_agrees(
+    tmp_path, monkeypatch, decode_graphs
+):
+    lines, samples = _record(tmp_path, monkeypatch, decode_graphs, split_from=40)
     for line in lines:
         rows = line["rows"]
         if all(decode for *_, decode in rows):
@@ -109,7 +120,17 @@ def test_a_recording_runner_writes_each_split_atom_ran_and_the_fit_agrees(
     assert bool(replayed) == decode_graphs
     key = json.loads((tmp_path / "real" / "dp0.key.json").read_text())
     assert key["engine"][GRAPHS]["architecture"] == ARCH
-    fit_host(label(str(tmp_path / "real" / "dp0.jsonl"))[0])  # each as it launched
+    fit_host(samples)  # each step predicted as it launched
+
+
+def test_a_graph_atom_records_after_the_runner_is_built_reaches_no_line(
+    tmp_path, monkeypatch
+):
+    """No step launches a split, prefills under the bar and split decodes
+    replaying: ATOM's recording of two split buckets beforehand reaches none."""
+    lines, samples = _record(tmp_path, monkeypatch, True, split_from=10**5, captured=2)
+    assert [line["launch"] for line in lines] == [{"split": 0.0}] * len(lines)
+    fit_host(samples)
 
 
 def _middle(tokens, split):
