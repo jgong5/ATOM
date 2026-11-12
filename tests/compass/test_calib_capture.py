@@ -4,15 +4,16 @@ profiling phase starts, never on a GPU that holds a process.
 
 `cctraces_sim.sh` and `rocm-smi` are stubbed, so these run with no GPU: the stub
 cell runs a process named as aiperf's controller is, which writes no step, as a
-server writes its record only at its exit. WARMUP_S seconds in, it logs its
-profiling phase's start to aiperf.log, each line led by its time, and ends
-DURATION_S (default 60) seconds later with status 0 and its export. As aiperf
-does, SIGINT ends it with status 0 and its export, and it logs the signal;
-SIGTERM ends it with 143. With IN_WARMUP set it exits 1 in its warmup, with no
-export. With IN_GRACE set its duration has passed: it logs so, and ends 5 s
-after the cell's log reads that its duration ended, with status 0 and its
-export, or on SIGINT with status 1; with no such line within 40 s it exits 2.
-The cell exits with its status, as cctraces_sim.sh exits with aiperf's.
+server writes its record only at its exit. Into aiperf.log, each line led by
+its time, it logs its warmup's start and, WARMUP_S seconds later, its profiling
+phase's, and ends DURATION_S (default 60) seconds after that with status 0 and
+its export. As aiperf does, SIGINT ends it with status 0 and its export, and
+it logs the signal; SIGTERM ends it with 143. With IN_WARMUP set it exits 1 in
+its warmup, with no export. With IN_GRACE set its duration has passed: it logs
+so, and ends 5 s after the cell's log reads that its duration ended, with
+status 0 and its export, or on SIGINT with status 1; with no such line within
+40 s it exits 2. The cell exits with its status, as cctraces_sim.sh exits with
+aiperf's.
 """
 
 import json
@@ -39,6 +40,7 @@ def stop(*_):
     export()
     sys.exit(1 if os.environ.get("IN_GRACE") else 0)
 signal.signal(signal.SIGINT, stop)
+print(time.time(), "Phase warmup (warmup) started", flush=True)
 time.sleep(float(os.environ.get("WARMUP_S", 0)))
 os.environ.get("IN_WARMUP") and sys.exit(1)
 print(time.time(), "Phase profiling (profiling) started", flush=True)
