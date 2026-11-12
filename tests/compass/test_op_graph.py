@@ -1243,7 +1243,7 @@ def _published(tmp_path, root=None):
     """The fields of a `price_list` key holding `FLAT`, published under the
     readings a run on the suite's machine document takes from this ATOM
     source, or from the ATOM source `root`."""
-    from atom.compass.artifacts import Key, Kind
+    from atom.compass.artifacts import Key, Kind, keyed_platform, machine_platform
     from atom.compass.fit.publish import publish
     from atom.compass.run import _machine, atom_source
     from atom.compass.run.step_grid import readings
@@ -1261,7 +1261,7 @@ def _published(tmp_path, root=None):
         decode_context_parallel_size=1,
         enable_expert_parallel=False,
         enable_dp_attention=False,
-        machine_spec="sha256:" + "1" * 64,
+        **keyed_platform(Kind.PRICE_LIST, machine_platform(machine)),
         source_root="tree-" + "a" * 40,
     )
     args = SimpleNamespace(store=str(tmp_path / "store"), out=str(tmp_path), ptl=None)

@@ -4,14 +4,15 @@
 The table below is the whole of artifact identity. An entry is addressed by the
 values that decide what it contains and by nothing else -- not by where someone
 put the file, and not by a name a script composed. `price_list` is the row that
-earns the rule: it is keyed by **(model, parallel layout, machine-spec digest,
+earns the rule: it is keyed by **(model, parallel layout, platform,
 source-root digest)**, and a bare or merged price file states no layout, so it
 silently prices nothing while looking layered.
 
-The machine-spec digest (`machine_spec_digest`) is the digest of the spec's own
-key, its device, software stack and PTL state, so an entry keyed by it that was
-measured on one platform does not answer on another, and a spec edit outside
-those three (an interconnect field, a re-probed constant) moves no key.
+The platform (`PLATFORM`) is the device, the software stack, the PTL state and
+torch, each by value. A kind keys each of them its row of the invalidation
+matrix marks and no other (`KEY_FIELDS`), so an entry measured on one platform
+does not answer on another, a host law keys no PTL state, and nothing outside
+those four moves a key.
 
 The parallel layout (`LAYOUT`) is the rank widths (`AXES`) plus the settings
 that change kernels and groups at a fixed rank count: the switches
@@ -41,7 +42,6 @@ key inside itself. The path is a place, never the authority on what lives
 there.
 """
 
-import enum
 import hashlib
 import json
 import os
@@ -49,28 +49,9 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from .matrix import MATRIX, ROWS_OF, Axis, Kind
 from .naming import AXES
 from .rules import ArtifactRefusal, Rule
-
-
-class Kind(enum.Enum):
-    """The artifacts this store holds. There are no others."""
-
-    MACHINE_SPEC = "machine_spec"
-    SHAPE_POPULATION = "shape_population"
-    OP_GRAPH = "op_graph"
-    OP_MEASUREMENT = "op_measurement"
-    PRICE_LIST = "price_list"
-    MEMORY_READINGS = "memory_readings"
-    STEP_MEASUREMENT = "step_measurement"
-    STEP_LINEAR_LAW = "step_linear_law"
-    HOST_LAWS = "host_laws"
-    STEP_GRID_BUNDLE = "step_grid_bundle"
-    PROJECTION = "projection"
-
-    def __str__(self) -> str:
-        return self.value
-
 
 #: The layout switches: a `bool` each, and no other field takes one.
 SWITCHES = ("enable_expert_parallel", "enable_dp_attention")
@@ -78,50 +59,56 @@ SWITCHES = ("enable_expert_parallel", "enable_dp_attention")
 #: and groups at a fixed rank count.
 LAYOUT = (*AXES, *SWITCHES, "decode_context_parallel_size")
 
-#: What keys each artifact, in the order a key reads.
-KEY_FIELDS: Mapping[Kind, tuple[str, ...]] = {
-    Kind.MACHINE_SPEC: ("device", "software_stack", "ptl"),
+#: The platform axes a key states by value, in the order a key reads them.
+PLATFORM = (Axis.DEVICE, Axis.SOFTWARE_STACK, Axis.PTL, Axis.TORCH)
+
+#: What keys each artifact besides its platform, in the order a key reads.
+OWN_FIELDS: Mapping[Kind, tuple[str, ...]] = {
+    Kind.MACHINE_SPEC: (),
     # `workload` is the digest of the requests its steps name; `backend` the
     # pricing backend's digest, so another backend addresses another entry.
     Kind.SHAPE_POPULATION: ("model", "workload", "engine_config", "backend"),
-    Kind.OP_GRAPH: ("structure", "shape"),
+    # The ATOM source it was traced under, and torch from its row, so a graph
+    # traced under another of either is another entry.
+    Kind.OP_GRAPH: ("structure", "shape", "source_root"),
     # `point` is the digest of the shape, context and leaf one measurement took.
-    Kind.OP_MEASUREMENT: ("model", *LAYOUT, "machine_spec", "source_root", "point"),
-    Kind.PRICE_LIST: ("model", *LAYOUT, "machine_spec", "source_root"),
+    Kind.OP_MEASUREMENT: ("model", *LAYOUT, "source_root", "point"),
+    Kind.PRICE_LIST: ("model", *LAYOUT, "source_root"),
     # The engine config as `run.memory.key_fields` reads it, as sorted JSON.
-    Kind.MEMORY_READINGS: ("model", "machine_spec", *LAYOUT, "engine_config"),
+    Kind.MEMORY_READINGS: ("model", *LAYOUT, "engine_config"),
     # `view` is the digest of the batch view the step was measured as.
     Kind.STEP_MEASUREMENT: (
         "model",
-        "device",
         "engine_config",
         "source_root",
         "sampling",
         "step_kind",
         "view",
     ),
-    Kind.STEP_LINEAR_LAW: (
-        "model",
-        "machine_spec",
-        "engine_config",
-        "source_root",
-        "form",
-    ),
+    Kind.STEP_LINEAR_LAW: ("model", "engine_config", "source_root", "form"),
     # The values `run.host_key` reads, the engine config as its sorted JSON
-    # since a key holds only strings and numbers, and the machine-spec digest.
-    Kind.HOST_LAWS: ("host_cpu", "atom_src", "model", "engine_config", "machine_spec"),
+    # since a key holds only strings and numbers.
+    Kind.HOST_LAWS: ("host_cpu", "atom_src", "model", "engine_config"),
     # `engine_config` names the one the grid was planned for; `grid` names
     # the grid definition with its margin.
-    Kind.STEP_GRID_BUNDLE: (
-        "model",
-        "device",
-        "engine_config",
-        "grid",
-        "source_root",
-    ),
+    Kind.STEP_GRID_BUNDLE: ("model", "engine_config", "grid", "source_root"),
     # `spec` is the whole machine spec's digest, which moves with any value it
     # prices by; `cells` the digest of each cell's step records and engine.
     Kind.PROJECTION: ("model", "spec", "source_root", "cells"),
+}
+
+#: What keys each artifact: its own fields, then each platform axis a row of
+#: the kind's marks.
+KEY_FIELDS: Mapping[Kind, tuple[str, ...]] = {
+    kind: (
+        *own,
+        *(
+            axis.field
+            for axis in PLATFORM
+            if any(MATRIX[row][axis].depends for row in ROWS_OF[kind])
+        ),
+    )
+    for kind, own in OWN_FIELDS.items()
 }
 
 #: The incident each kind's refusal quotes, where there is one to quote.
@@ -265,33 +252,31 @@ class Key:
 NO_PTL = "disabled"
 
 
-def platform_key(device: str, stack: Mapping[str, str], ptl: str) -> Key:
-    """The machine-spec key of `device`, `<name> <arch>`, running `stack`,
-    {component: version} as a spec pins it: its ROCm, AITER and RCCL, in that
-    order; its torch is an axis of its own; with its cards' PTL state `ptl`. A
-    spec's key and the readings of a record taken on it are both this join."""
+def platform_of(device: str, stack: Mapping[str, str], ptl: str) -> dict:
+    """The platform of `device`, `<name> <arch>`, running `stack`, {component:
+    version} as a spec pins it, with its cards' PTL state `ptl`, by field: the
+    device, the software stack as its ROCm, AITER and RCCL in that order, the
+    PTL state and torch."""
     from atom.compass.spec.fields import PINNED
 
     pins = " / ".join(f"{c} {stack[c]}" for c in PINNED if c != "torch")
-    return Key.of(Kind.MACHINE_SPEC, device=device, software_stack=pins, ptl=ptl)
+    return dict(zip((a.field for a in PLATFORM), (device, pins, ptl, stack["torch"])))
 
 
-def machine_spec_key(machine) -> Key:
-    """A `MachineSpec`'s own key: the `platform_key` of the device, the
-    software stack and the PTL state it states, `NO_PTL` when it states none."""
+def machine_platform(machine) -> dict:
+    """The platform a `MachineSpec` states, `NO_PTL` where it states no PTL state."""
     from atom.compass.spec.fields import PINNED
 
-    return platform_key(
+    return platform_of(
         f"{machine.value('device.name')} {machine.value('device.arch')}",
         {c: machine.value(f"device.software_pinned_to.{c}") for c in PINNED},
         machine.values.get("device.ptl", NO_PTL),
     )
 
 
-def machine_spec_digest(machine) -> str:
-    """What an artifact measured on `machine` is keyed by: its key's digest."""
-    canonical = machine_spec_key(machine).canonical()
-    return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+def keyed_platform(kind: Kind, platform: Mapping[str, object]) -> dict:
+    """The fields of `platform` a `kind` key states: the axes its row marks."""
+    return {a.field: platform[a.field] for a in PLATFORM if a.field in KEY_FIELDS[kind]}
 
 
 def refuse_not_a_key(given: object) -> None:

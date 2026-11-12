@@ -31,8 +31,26 @@ import enum
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from .keys import Kind
 from .rules import ArtifactRefusal, Rule
+
+
+class Kind(enum.Enum):
+    """The artifacts this store holds. There are no others."""
+
+    MACHINE_SPEC = "machine_spec"
+    SHAPE_POPULATION = "shape_population"
+    OP_GRAPH = "op_graph"
+    OP_MEASUREMENT = "op_measurement"
+    PRICE_LIST = "price_list"
+    MEMORY_READINGS = "memory_readings"
+    STEP_MEASUREMENT = "step_measurement"
+    STEP_LINEAR_LAW = "step_linear_law"
+    HOST_LAWS = "host_laws"
+    STEP_GRID_BUNDLE = "step_grid_bundle"
+    PROJECTION = "projection"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 class Axis(enum.Enum):
@@ -185,9 +203,7 @@ MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
         Axis.ATOM_SRC: DEPENDS,
         Axis.MODEL: DEPENDS,
         Axis.DEVICE: DEPENDS,
-        Axis.PTL: Cell(
-            False, "in the key only because the machine-spec digest is one hash"
-        ),
+        Axis.PTL: INDEPENDENT,
         Axis.HOST_CPU: DEPENDS,
         Axis.ENGINE_CONFIG: DEPENDS,
     },

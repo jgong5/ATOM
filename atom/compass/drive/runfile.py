@@ -11,7 +11,7 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   loaded through `ArtifactStore.load` under `law_readings`;
   ``--step-grid KEY``, the store's root and a `step_grid_bundle` entry's key;
   ``--op-graph``, ``true``, and as ``price_list`` the fields of the
-  `price_list` key this run's model, parallel layout, machine spec and ATOM
+  `price_list` key this run's model, parallel layout, platform and ATOM
   source name, when ``--store`` holds one there.
   A KEY is the token `Key.token` prints, resolved under ``--store``; for
   ``--step-linear`` and ``--host-laws`` a law file `step_linear_fit` writes
@@ -52,7 +52,8 @@ from atom.compass.artifacts import (
     GateState,
     Key,
     Kind,
-    machine_spec_digest,
+    keyed_platform,
+    machine_platform,
     member_name,
 )
 from atom.compass.fit.publish import RANK
@@ -117,24 +118,11 @@ def build(args, atom_args) -> dict:
             out["backend"] = _stated({run.OP_GRAPH: True})
     else:
         name = next(k for k in KINDS if getattr(args, k))
-        tokens, laws, backends = getattr(args, name), [], []
-        for token in [tokens] if isinstance(tokens, str) else tokens:
-            if name == run.STEP_LINEAR and (law := _law_file(token)) is not None:
-                laws.append({k: v for k, v in law.items() if k not in HOST_MEMBERS})
-                backends.append(_stated(laws[-1]))
-                continue
-            key = store.key_from_token(KINDS[name], token)
-            if name == run.STEP_GRID:
-                entry = store.read(key)
-                laws.append({"store": str(store.root), **key.values})
-            else:
-                conditions = law_readings(key, machine, atom_args)
-                entry = store.load(key, conditions=conditions, gates=GateState.of())
-                engine_config = json.loads(key.values["engine_config"])
-                laws.append(
-                    {**_member(entry, "params"), "engine_config": engine_config}
-                )
-            backends.append(_backend(entry))
+        tokens = getattr(args, name)
+        tokens = [tokens] if isinstance(tokens, str) else tokens
+        resolved = [resolve(store, name, t, machine, atom_args) for t in tokens]
+        laws = [law for law, _ in resolved]
+        backends = [backend for _, backend in resolved]
         out[name], out["backend"] = laws[0], backends[0]
         if len(laws) > 1:
             digests = " ".join(sorted(b["digest"] for b in backends)).encode()
@@ -150,12 +138,35 @@ def build(args, atom_args) -> dict:
                 },
             }
     if args.host_laws:
-        hosts = [_host(store, k) for k in args.host_laws]
+        hosts = [
+            resolve(store, "host", k, machine, atom_args)[0] for k in args.host_laws
+        ]
         out["host"] = hosts if len(hosts) > 1 else hosts[0]
         out |= _hops(hosts, atom_args)
     if args.padding:
         out["padding"] = args.padding
     return out
+
+
+def resolve(store, name: str, token: str, machine, atom_args) -> tuple:
+    """The run file's `name` value for `token`, with its ``backend``, as
+    `build` takes each: a step linear law from a law file, else the params of
+    the entry `token` names, loaded under `law_readings`, with its key's
+    engine config; a bundle's key; host laws as `_host` reads them, which have
+    no backend."""
+    if name == "host":
+        return _host(store, token), None
+    if name == run.STEP_LINEAR and (law := _law_file(token)) is not None:
+        law = {k: v for k, v in law.items() if k not in HOST_MEMBERS}
+        return law, _stated(law)
+    key = store.key_from_token(KINDS[name], token)
+    if name == run.STEP_GRID:
+        return {"store": str(store.root), **key.values}, _backend(store.read(key))
+    conditions = law_readings(key, machine, atom_args)
+    entry = store.load(key, conditions=conditions, gates=GateState.of())
+    engine_config = json.loads(key.values["engine_config"])
+    law = {**_member(entry, "params"), "engine_config": engine_config}
+    return law, _backend(entry)
 
 
 def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
@@ -218,17 +229,16 @@ def _model_digest(model: str) -> str:
 
 def _hops(hosts: list, atom_args) -> dict:
     """The ``hops`` of the entry of `hosts` fitted under the config ATOM's
-    arguments `atom_args` resolve, as the runner takes its own; the hops every
-    entry states alike as they are, with no config resolved."""
+    arguments `atom_args` resolve, picked as the runner picks its own
+    (`run.pick_fitted`); the hops every entry states alike as they are, with no
+    config resolved."""
     host = hosts[0]
     if any(h.get("hops") != host.get("hops") for h in hosts):
         from atom.compass.drive.run import _config
-        from atom.compass.run.step_grid import keyed
 
-        engine = keyed(_config(atom_args))
-        host = run._fitted_here(
-            hosts, engine, lambda e: e.get("key", {}).get("engine"), "host"
-        )
+        picked = {"host": hosts}
+        run.pick_fitted(picked, "host", _config(atom_args))
+        host = picked["host"]
     return host.get("hops", {})
 
 
@@ -272,7 +282,7 @@ def _price_list_key(atom_args, machine) -> Key:
         enable_expert_parallel=engine.enable_expert_parallel,
         enable_dp_attention=engine.enable_dp_attention,
         decode_context_parallel_size=engine.decode_context_parallel_size,
-        machine_spec=machine_spec_digest(machine),
+        **keyed_platform(Kind.PRICE_LIST, machine_platform(machine)),
         source_root=run.source_root(),
     )
 

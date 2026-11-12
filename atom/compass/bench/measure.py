@@ -40,7 +40,7 @@ origin `plan`, the digest of the plan, which `<out>/plan.json` holds, and the
 point that is also a replayed view is measured once, as that replay alone: its
 origin, sources and traces are the replay's, and it names no plan.
 
-A measurement's key is the configuration (model, device,
+A measurement's key is the configuration (model, platform,
 `keyed` engine, source root, `--sampling`), the step kind and the view's
 digest, so a view the store holds is not measured again and a stopped
 invocation resumes; a held entry taken under other readings than this run's
@@ -75,6 +75,7 @@ from atom.compass.artifacts import (
     Kind,
     Provenance,
     Topology,
+    keyed_platform,
     member_name,
     roots_for,
 )
@@ -84,7 +85,7 @@ from atom.compass.backends.step_linear_fit import token_band
 from atom.compass.bench import ragged
 from atom.compass.drive.gpu import add_gpu_flag, hip_visible, kfd_pid, quiet
 from atom.compass.drive.identity import identity, phase
-from atom.compass.fit.publish import conditions
+from atom.compass.fit.publish import conditions, platform
 from atom.compass.fit.samples import MEMBER, run_fields
 from atom.compass.parity.served import served
 from atom.compass.run import _write_whole
@@ -126,10 +127,9 @@ def main(argv: list[str]) -> None:
     command = [*PROG.split(), *argv]
     run, phases = identity(engine_file, config.model, command, args.gpu), {}
     configuration = run_fields(run)
-    readings = conditions(
-        {**configuration, "engine_config": engine}
-        | {k: run[k] for k in ("stack", "host_key", "ptl")}
-    )
+    stated = configuration | {k: run[k] for k in ("stack", "host_key", "ptl")}
+    readings = conditions({**stated, "engine_config": engine})
+    configuration |= keyed_platform(Kind.STEP_MEASUREMENT, platform(stated))
     todo = _todo(points, configuration, engine, sampling, store, readings)
     held = len(points) - len(todo)
     print(f"{len(points)} distinct batches, {held} in the store", flush=True)
@@ -186,8 +186,8 @@ def _todo(points, configuration, engine, sampling, store, readings) -> list:
 
 
 def measurement_key(configuration: dict, engine: dict, sampling, view: dict) -> Key:
-    """The key of `view`'s measurement under `configuration` (model, device,
-    source root), `engine`, `keyed`'s fields, and `sampling`."""
+    """The key of `view`'s measurement under `configuration` (model, source
+    root, platform), `engine`, `keyed`'s fields, and `sampling`."""
     return Key.of(
         Kind.STEP_MEASUREMENT,
         **configuration,

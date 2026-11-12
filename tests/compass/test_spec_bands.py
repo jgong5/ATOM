@@ -11,7 +11,7 @@ from test_pp_carriers import TRUTH, _samples, probe, script
 from test_spec_origin import labels, saved, three_origins
 from test_spec_verbs import fragment
 
-from atom.compass.artifacts import machine_spec_digest
+from atom.compass.artifacts import machine_platform
 from atom.compass.spec import MachineSpec, SpecRefusal, merge
 from atom.compass.spec.bands import refuse_unbanded
 from atom.compass.spec.rules import Rule
@@ -60,7 +60,7 @@ def test_a_band_beside_each_probed_number_publishes_and_moves_no_value():
     refuse_unbanded(banded)
     for label in labels(plain):
         assert banded.value(label) == plain.value(label), label
-    assert machine_spec_digest(banded) == machine_spec_digest(plain)
+    assert machine_platform(banded) == machine_platform(plain)
     rate = banded.origin(BANDWIDTH)
     assert (rate["p10"], rate["p90"]) == (4.0e12, 1.6e13)
 

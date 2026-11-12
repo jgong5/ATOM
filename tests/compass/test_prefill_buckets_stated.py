@@ -11,7 +11,9 @@ publishes the same law. No device.
 import json
 
 import pytest
-from test_fit_steps import DIGEST, LINEAR, clients, fit, law_key, member, record
+from test_backend_step_linear_fit import platform_arg
+from test_fit_steps import LINEAR, clients, fit, law_key, member, record
+from test_memory_readings import DOCUMENT
 from test_step_linear_token_padding import BUCKETS
 
 from atom.compass.backends import step_linear_fit
@@ -43,7 +45,7 @@ def _laws(tmp_path, a, b, *args) -> tuple[dict, dict]:
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     out = tmp_path / "law.json"
     step_linear_fit.main(
-        [*map(str, paths), "--form", "history", "--machine-spec", DIGEST]
+        [*map(str, paths), "--form", "history", *platform_arg(DOCUMENT)]
         + ["--out", str(out), *args]
     )
     written = json.loads(out.read_text())
@@ -69,7 +71,7 @@ def test_a_record_whose_engine_file_predates_its_buckets_reads_them_off_its_host
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     out = tmp_path / "engine_law.json"
     step_linear_fit.main(
-        [*map(str, paths), "--form", "history", "--machine-spec", DIGEST]
+        [*map(str, paths), "--form", "history", *platform_arg(DOCUMENT)]
         + ["--out", str(out), "--engine", str(stated)]
     )
     assert json.loads(out.read_text())["prefill"] == written["prefill"]
@@ -93,7 +95,7 @@ def test_records_stating_their_buckets_nowhere_fit_no_padding_and_the_law_says_s
     paths = [d / "steps/dp0.jsonl" for d in (a, b)]
     out = tmp_path / "engine_law.json"
     step_linear_fit.main(
-        [*map(str, paths), "--machine-spec", DIGEST, "--out", str(out)]
+        [*map(str, paths), *platform_arg(DOCUMENT), "--out", str(out)]
         + ["--engine", str(stated)]
     )
     law = json.loads(out.read_text())
