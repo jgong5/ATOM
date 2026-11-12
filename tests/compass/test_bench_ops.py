@@ -1669,10 +1669,11 @@ def test_v41_attention_takes_the_lists_atom_s_index_build_writes_for_its_pass(
 
 def test_a_v41_attention_reads_the_pool_rows_its_pass_s_selection_names():
     # V4.1's attention at ratio 2, top-k 8, over a prefill's 4 rows of one
-    # request, seeing 600 and 601 rows, and over its replay's query, the third.
-    # The bench spreads each row's 8 over its own visible rows: the prefill's
-    # lists name 12 of the pool's rows of 16 bytes, the query's its 8.
-    from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep
+    # request from position 1199, seeing 600 and 601 rows, and over its
+    # replay's query, the last. The bench spreads each row's 8 over its own
+    # visible rows: the prefill's lists name 12 of the pool's rows of 16
+    # bytes, the query's its 8.
+    from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
     from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
 
     i32, runner = torch.int32, _Runner()
@@ -1680,11 +1681,12 @@ def test_a_v41_attention_reads_the_pool_rows_its_pass_s_selection_names():
     runner.model.append(torch.nn.Module())
     runner.model[-1].spec = LayerAttentionSpec(2, 2, AttentionMode.FULL, 2, 2)
     visible = {2: torch.tensor([600, 600, 601, 601], dtype=i32)}
-    step = BatchStep((), *(torch.zeros(4, dtype=i32),) * 4, None, visible=visible)
+    spans = (RequestSpan(0, 1199, 0, 4, 0),)
+    step = BatchStep(spans, *(torch.zeros(4, dtype=i32),) * 4, None, visible=visible)
     step.decoder = SimpleNamespace(
         tail=step, tail_rows=torch.zeros(3), last=torch.zeros(1), filled_gpu=None,
-        finishing_gpu=None, query_ids=torch.tensor([-1, -1, 0, -1], dtype=i32),
-        query_ptrs=torch.tensor([2, 0], dtype=i32),
+        finishing_gpu=None, query_ids=torch.tensor([-1, -1, -1, 0], dtype=i32),
+        query_ptrs=torch.tensor([3, 0], dtype=i32),
     )  # fmt: skip
     lists = [torch.zeros(4, dtype=i32)] * 4
     cache = SimpleNamespace(attention_indices=lambda *_: lists)
@@ -1714,6 +1716,19 @@ def test_a_v41_attention_reads_the_pool_rows_its_pass_s_selection_names():
         op["args"]["q"]["shape"][0]: stub._plan(op, i, {}, 99, 1, None, s)[3][0]
         for s, (op, i) in stub.leaves.items()
     } == {4: 12 * 16, 1: 8 * 16}
+
+
+@pytest.mark.parametrize("spans", [((1199, 4),), ((0, 3), (8190, 6)), ((9000, 300),)])
+def test_the_host_s_spread_counts_the_rows_the_bench_s_candidates_keep(spans):
+    # `_spread` off each request's (first position, rows), against the ids
+    # `_candidates` keeps over the rows' visible rows, a request's apart
+    ratio, k = 4, 16
+    positions = torch.cat([torch.arange(p, p + n) for p, n in spans])
+    ids = ops._candidates((positions + 1) // ratio, k).long()
+    batch = torch.cat([torch.full((n,), i) for i, (_, n) in enumerate(spans)])
+    kept = ids >= 0
+    named = (batch[:, None].expand_as(ids)[kept] << 32 | ids[kept]).unique()
+    assert ops._spread(spans, ratio, k) == named.numel()
 
 
 def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():

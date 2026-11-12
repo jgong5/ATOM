@@ -1045,7 +1045,7 @@ class Stub:
         self.picker = next((m for m in picks if hasattr(m, "topk_blocks")), None)
         # its first attention layer at each ratio, whose lists its index build
         # writes (`_lists`), each pass's window reach and, by leaf, the pass
-        # copy and ratio its lists were built on (`_prepare`)
+        # and ratio its lists were built for (`_prepare`)
         specs = {s for s in spec.values() if hasattr(s, "index_group_start")}
         self.specs = {s.ratio: s for s in sorted(specs, key=lambda s: -s.layer_id)}
         self.reach, self.selections = {}, {}
@@ -1196,7 +1196,7 @@ class Stub:
                         if listed is not None:  # as its index build writes it
                             step = passes.get(at, passes[None])[0]
                             pool = self._lists(md.cache, step, ratio, listed, live)
-                            self.selections[sig] = self.lists[id(step)], ratio
+                            self.selections[sig] = md.cache, step, ratio, plan
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
@@ -1305,16 +1305,16 @@ class Stub:
 
     def _selected(self, sig) -> int | None:
         """The pool rows the selection on leaf `sig`'s lists (`_lists`) names
-        for its pass: each row's ids, a request's apart, none of a padding
-        row's; None where the leaf took no lists."""
-        own, ratio = self.selections.get(sig, (None, None))
-        chosen = own and own.selected.get(self.specs[ratio].topk_owner)
-        if chosen is None:
+        for its pass, worked out on the host off the pass's requests
+        (`_spread`), a replay's queries each tail request's last row
+        (`lay_out_tail`); None where the leaf took no lists or no selection."""
+        cache, step, ratio, plan = self.selections.get(sig, (None, None, 0, None))
+        if not ratio:
             return None
-        ids = chosen.reshape(len(own.batch_ids), -1).long()
-        rows = own.batch_ids.long()[:, None].expand_as(ids)
-        kept = (ids >= 0) & (rows >= 0)
-        return (rows[kept] << 32 | ids[kept]).unique().numel()
+        spans = [(s.position, s.length) for s in step.requests]
+        if plan is not None and step.batch_ids is plan.query_ids:
+            spans = [(p + n - 1, 1) for p, n in spans]
+        return _spread(tuple(spans), ratio, cache.geometry.batch_topk(ratio))
 
     def point(self, rule, shape, context, found) -> list[dict]:
         """Each leaf of `found` timed at `shape` on `point_rows`, or every leaf
@@ -2209,6 +2209,21 @@ def _candidates(ends, k) -> torch.Tensor:
     kept = torch.where(run < seen, run, -1)
     spread = seen - 1 - (k - 1 - run) * (seen - 1) // max(k - 1, 1)
     return torch.where(seen > k, spread, kept).int()
+
+
+@functools.lru_cache(maxsize=64)
+def _spread(spans, ratio, k) -> int:
+    """The pool rows `_candidates` keeps at `ratio` over the rows of `spans`,
+    `(first position, rows)` a request, a request's apart: each row seeing
+    `(position + 1) // ratio`, as ATOM stages `visible`. On the host, where a
+    capture's fake mode holds a selection with no values."""
+    run, named = np.arange(k), 0
+    for start, rows in spans:
+        seen = (np.arange(start, start + rows)[:, None] + 1) // ratio
+        spread = seen - 1 - (k - 1 - run) * (seen - 1) // max(k - 1, 1)
+        kept = np.where(seen > k, spread, np.where(run < seen, run, -1))
+        named += np.unique(kept[kept >= 0]).size
+    return named
 
 
 def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:
