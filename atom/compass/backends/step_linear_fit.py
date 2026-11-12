@@ -104,8 +104,8 @@ out and named under `unfitted`; `StepLinearBackend` refuses its steps.
 
 On an MTP record a step also carries a draft label (`step_labels`). `fit` fits
 the steps that carry one on their draft labels the same way, and writes that law
-under the law's `draft`, whose vectors `mark_held_out` gives `held_out` as it
-gives the law's, on the steps each is fitted on. A step with a propose label
+under the law's `draft`; it holds no `held_out` unless its records time a
+serial drafter's passes (below). A step with a propose label
 (`step_labels`) is fitted there on its draft label less that label, the
 draft-KV pass a middle chunk runs too, and left out when nothing remains; the
 propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`,
@@ -122,7 +122,9 @@ draft law's `forward` vector instead, each pass a sample at its own features
 (`serial_passes`), with `passes` the count every such step ran, and its
 `propose` vector on what each decode's draft label holds past its passes; the
 draft law's prefill vector then fits the middle chunks alone, whose draft is
-the draft-KV pass, and it has no decode or `draft_kv` vector.
+the draft-KV pass, and it has no decode or `draft_kv` vector. `mark_held_out`
+gives each of that draft law's vectors `held_out` as it gives the law's, on
+the steps each is fitted on.
 
 Records whose engine files state the prefill token-graph buckets their runner
 recorded (`PREFILL_BUCKETS`) fit a prefill vector that adds `padding` and
@@ -1675,9 +1677,10 @@ def mark_held_out(
 ):
     """Write the held-out errors: under each of `law`'s vectors, as `held_out`,
     the hull of the rank rows `_held_out` priced its steps by, their errors per
-    band; under `report`'s `held_out`, each run's errors per band. Its draft
-    law's vectors alike, on the steps they are fitted on, their bands named
-    `draft` (`_mark_passes`); `draft` says `law` is one."""
+    band; under `report`'s `held_out`, each run's errors per band. A draft
+    law fitted on a serial drafter's passes, its vectors alike, on the steps
+    each is fitted on, their bands named `draft` (`_mark_passes`); `draft`
+    says `law` is a draft law."""
     from scipy.spatial import QhullError
 
     rows = [
@@ -1701,7 +1704,7 @@ def mark_held_out(
         except (ValueError, QhullError):
             continue
         vector["held_out"] = {"hull": hull, "bands": _bands(mine)}
-    if "draft" not in law:
+    if "forward" not in law.get("draft", {}):
         return
     serial = [s for s in samples if s.passes_s]
     drafts, mine = _draft_samples(samples), {"held_out": {}}

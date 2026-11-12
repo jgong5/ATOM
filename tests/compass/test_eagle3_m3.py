@@ -232,6 +232,30 @@ M3 = os.environ.get("ATOM_COMPASS_M3_MODEL")
 EAGLE3 = os.environ.get("ATOM_COMPASS_M3_EAGLE3")
 
 
+def _publish_remapped(store, machine, argv, env) -> None:
+    """`publish_entry`, keyed after ATOM's runner remaps the quantization
+    config's layer names for the model class, as the runner reads the key:
+    MiniMax-M3's remap moves its quantization hash."""
+    from unittest import mock
+
+    from test_memory_readings import publish_readings
+
+    from atom.compass.drive import run as drive_run
+    from atom.model_engine.model_runner import support_model_arch_dict
+    from atom.utils import resolve_obj_by_qualname
+
+    with mock.patch.dict(os.environ, env, clear=True):
+        config = drive_run._config(argv)
+        arch = config.hf_config.architectures[0]
+        model = resolve_obj_by_qualname(support_model_arch_dict[arch])
+        config.quant_config.remap_layer_name(
+            config.hf_config,
+            packed_modules_mapping=getattr(model, "packed_modules_mapping", {}),
+            quant_exclude_name_mapping=getattr(model, "quant_exclude_name_mapping", {}),
+        )
+        publish_readings(store, config, document=machine)
+
+
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
     """MiniMax-M3 at TP4 with its EAGLE3 drafter, the stage's draft width and
@@ -252,6 +276,7 @@ def runs(tmp_path_factory):
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(test_dp_slice, "MODEL", M3)
         mp.setattr(test_dp_slice, "CONSTANT", STUB)
+        mp.setattr(test_dp_slice, "publish_entry", _publish_remapped)
         return [
             test_dp_slice.run_dp_slice(
                 root / f"seed{s}", s, flags, dp=1, machine=copy.deepcopy(MACHINE)
