@@ -96,7 +96,7 @@ A serial drafter's draft law may hold a `forward` vector over the prefill
 vector's base features, with `passes`, the draft forwards its `propose` runs.
 On a decode and on a prefill step that produces output it prices the draft
 as each of those forwards at its own rows (`serial_passes`), named
-`draft.pass<i>.<feature>`, plus its `propose` vector, the rest of the propose,
+`draft.pass<i>.<feature>`, plus its `propose` vector, the rest of the draft,
 over `[1, seqs]`; there neither its decode vectors nor its prefill vector
 price the draft, which on a middle chunk is the draft-KV pass its prefill
 vector prices.
@@ -456,7 +456,7 @@ class StepLinearBackend(CostBackend):
 
     def _serial(self, law: StepLinearLaw, batch_view: BatchView, what: str):
         """A serial draft's terms: each draft forward at its rows, then the
-        rest of its propose; on a decode, apart, its draft-KV pass's."""
+        rest of its draft; on a decode, apart, its draft-KV pass's."""
         terms, kv, seqs = [], [], (1, len(batch_view.requests))
         for i, counts in enumerate(serial_passes(batch_view, law.passes)):
             terms += self._priced(law, law.forward, f"pass{i}", counts, what)

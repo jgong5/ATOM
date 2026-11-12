@@ -1518,7 +1518,7 @@ def _draft_samples(samples) -> list:
     """The samples the draft law's prefill and decode vectors are fitted on,
     each labelled with its draft label (`_draft_kv`). Under a serial drafter
     whose records time its passes, only the middle chunks: its decodes' and
-    output prefills' drafts are its passes and the rest of its propose."""
+    output prefills' drafts are its passes and the rest of their draft."""
     serial = any(s.passes_s for s in samples)
     return [
         dataclasses.replace(
