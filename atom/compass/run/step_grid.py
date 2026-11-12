@@ -162,12 +162,11 @@ def quantization(config) -> str:
     layer names remapped to the model's modules as `ModelRunner.__init__` remaps
     them before it builds: on a copy where the runner has not, and as it is
     where the packed modules the remap leaves on it say it has, since a second
-    remap can rename a name again. A config naming no layer has none to remap."""
-    from atom.config import QuantizationConfig
-
+    remap can rename a name again. A config naming no layer, or with no remap,
+    has none to apply."""
     held = config.quant_config
     if (
-        isinstance(held, QuantizationConfig)
+        hasattr(held, "remap_layer_name")
         and not hasattr(held, "packed_modules_mapping")
         and any(getattr(held, name) for name in LAYERS)
     ):
