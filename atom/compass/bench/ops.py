@@ -1057,10 +1057,11 @@ class Stub:
         picks = [m for m, s in spec.items() if getattr(s, "produces_candidates", 0)]
         self.picker = next((m for m in picks if hasattr(m, "topk_blocks")), None)
         # its first attention layer at each ratio, whose lists its index build
-        # writes (`_lists`), and each pass's window reach (`_prepare`)
+        # writes (`_lists`), each pass's window reach and, by leaf, the pass
+        # and ratio its lists were built for (`_prepare`)
         specs = {s for s in spec.values() if hasattr(s, "index_group_start")}
         self.specs = {s.ratio: s for s in sorted(specs, key=lambda s: -s.layer_id)}
-        self.reach = {}
+        self.reach, self.selections = {}, {}
         # a DeepSeek-V4 CSA layer: its forward writes the top-k section of the
         # CSA index buffer, and `_prepare` runs none
         self.csa = next(
@@ -1122,7 +1123,7 @@ class Stub:
         # the step's own its width, its window reach: the ring rows its index
         # build lists each request below its window split, from its floor
         # (`_window_split`), none on a replay's tail
-        self.lists, self.reach = {}, {}
+        self.lists, self.reach, self.selections = {}, {}, {}
         for rows, (step, _) in passes.items():
             if hasattr(step, "request_floors"):
                 split = np.maximum(step.request_positions, step.request_cached_until)
@@ -1208,6 +1209,7 @@ class Stub:
                         if listed is not None:  # as its index build writes it
                             step = passes.get(at, passes[None])[0]
                             pool = self._lists(md.cache, step, ratio, listed, live)
+                            self.selections[sig] = md.cache, step, ratio, plan
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
@@ -1313,6 +1315,19 @@ class Stub:
                 raise ValueError("a pointer table gathered at no replay's queries")
             built = built[rows.long()]
         return {f"attention_indices.{ratio}.{i}": built}
+
+    def _selected(self, sig) -> int | None:
+        """The pool rows the selection on leaf `sig`'s lists (`_lists`) names
+        for its pass, worked out on the host off the pass's requests
+        (`_spread`), a replay's queries each tail request's last row
+        (`lay_out_tail`); None where the leaf took no lists or no selection."""
+        cache, step, ratio, plan = self.selections.get(sig, (None, None, 0, None))
+        if not ratio:
+            return None
+        spans = [(s.position, s.length) for s in step.requests]
+        if plan is not None and step.batch_ids is plan.query_ids:
+            spans = [(p + n - 1, 1) for p, n in spans]
+        return _spread(tuple(spans), ratio, cache.geometry.batch_topk(ratio))
 
     def point(self, rule, shape, context, found) -> list[dict]:
         """Each leaf of `found` timed at `shape` on `point_rows`, or every leaf
@@ -1530,9 +1545,11 @@ class Stub:
                     # per `ratio` tokens; its window rows are left out
                     unit = blocks * self.runner.config.kv_cache_block_size // ratio
                     slotted = 0
-                    # of which a request reads at most its indexer's top-k
+                    # of which a request reads at most its indexer's top-k; a
+                    # leaf on V4.1's lists, the rows their selection names
                     if top := stated.get("index_topk"):
-                        unit = min(unit, rows * top)
+                        chosen = self._selected(sig)
+                        unit = min(unit, rows * top if chosen is None else chosen)
                 elif window and self.state.get(name):
                     unit = 0  # its window is read from the ring alone
                 if self.state.get(name):
@@ -2243,6 +2260,21 @@ def _candidates(ends, k) -> torch.Tensor:
     kept = torch.where(run < seen, run, -1)
     spread = seen - 1 - (k - 1 - run) * (seen - 1) // max(k - 1, 1)
     return torch.where(seen > k, spread, kept).int()
+
+
+@functools.lru_cache(maxsize=64)
+def _spread(spans, ratio, k) -> int:
+    """The pool rows `_candidates` keeps at `ratio` over the rows of `spans`,
+    `(first position, rows)` a request, a request's apart: each row seeing
+    `(position + 1) // ratio`, as ATOM stages `visible`. On the host, where a
+    capture's fake mode holds a selection with no values."""
+    run, named = np.arange(k), 0
+    for start, rows in spans:
+        seen = (np.arange(start, start + rows)[:, None] + 1) // ratio
+        spread = seen - 1 - (k - 1 - run) * (seen - 1) // max(k - 1, 1)
+        kept = np.where(seen > k, spread, np.where(run < seen, run, -1))
+        named += np.unique(kept[kept >= 0]).size
+    return named
 
 
 def _meta(spec, slot, live, what="metadata") -> tuple[str, torch.Tensor]:
