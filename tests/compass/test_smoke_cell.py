@@ -3,9 +3,11 @@
 step named, and the cell's verdict last.
 
 It runs from a copy in a stub tree: `atom.compass.cli` logs each command, a
-`record` or `run` writes server.json and waits for the SIGTERM `client.sh
---stop` sends, then exits 3 when STOP_FAIL is in its words, and a fit prints a
-store token; FAIL, matched against a command's words, makes it refuse.
+`record` or `run` writes server.json and the tool its environment loads and
+waits for the SIGTERM `client.sh --stop` sends, then exits 3 when STOP_FAIL is
+in its words, and a fit prints a store token, `fit steps` writing its law with
+UNFITTED as its unfitted vectors; FAIL, matched against a command's words,
+makes it refuse. `atom.compass.parity.blocked` logs the tool it builds.
 `atom.compass.validate` prints a verdict row and a warmup row per run;
 `client.sh` logs its arguments and its Python, and exits 1 without stopping its
 server when CLIENT_FAIL is in its OUT. A command whose words hold HANG, or
@@ -45,9 +47,20 @@ def main():
         rc = 3 if os.environ.get("STOP_FAIL") and os.environ["STOP_FAIL"] in words else 0
         stop = lambda *_: (out.joinpath("run.json").write_text("{}"), sys.exit(rc))
         signal.signal(signal.SIGTERM, stop)
+        out.joinpath("loaded").write_text(os.environ.get("ROCP_TOOL_LIBRARIES", ""))
         out.joinpath("server.json").write_text(json.dumps({"pid": os.getpid()}))
         time.sleep(600)
+    if argv[:2] == ["fit", "steps"]:
+        law = {"params": {"unfitted": json.loads(os.environ.get("UNFITTED", "{}"))}}
+        out.joinpath("step_linear_law.json").write_text(json.dumps(law))
     print("published key as tok-" + argv[1])
+"""
+BLOCKED = """import os, sys
+from pathlib import Path
+open(os.environ["LOG"], "a").write(f"blocked {sys.argv[1]}\\n")
+"blocked" in os.environ.get("FAIL", "") and sys.exit("refused")
+Path(sys.argv[1]).mkdir()
+Path(sys.argv[1], "libcompass_blocked.so").touch()
 """
 VALIDATE = """import os, sys
 "validate" in os.environ.get("FAIL", "") and sys.exit("refused")
@@ -76,11 +89,12 @@ def _smoke(tmp_path, use="0", stamp=True, **env):
     (scripts / "client.sh").chmod(0o755)
     if stamp:
         (tree / ".compass-commit").write_text("cafe\n")
-    for module, text in {"cli": CLI, "validate/__main__": VALIDATE}.items():
+    stubs = {"cli": CLI, "validate/__main__": VALIDATE, "parity/blocked": BLOCKED}
+    for module, text in stubs.items():
         path = tree / "atom" / "compass" / f"{module}.py"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-    for d in ("atom", "atom/compass", "atom/compass/validate"):
+    for d in ("atom", "atom/compass", "atom/compass/validate", "atom/compass/parity"):
         (tree / d / "__init__.py").write_text("")
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -125,16 +139,23 @@ def test_the_path_runs_in_order_and_ends_with_the_cell_s_verdict(tmp_path):
     r, log, o = _smoke(tmp_path)
     assert r.returncode == 0, r.stderr
     machine = f"--machine {tmp_path}/spec.json --store {o}/store"
-    cal = f"{o}/calibration --client-run {o}/calibration {o}/calibration/artifacts/client_run.json"
+    run = {
+        d: f"--client-run {o}/{d} {o}/{d}/artifacts/client_run.json"
+        for d in ("calibration", "trace")
+    }
     client = "--concurrency 1 --duration 600 --stop"
     assert log == [
+        f"blocked {o}/tool",
         f"measure memory --gpu 7 {machine} --out {o}/memory",
         f"record --gpu 7 --out {o}/warm",
         f"client {o}/warm --traces 0-7 {client} /real/python",
         f"record --gpu 7 --out {o}/calibration",
         f"client {o}/calibration --traces 353-360 {client} /real/python",
-        f"fit steps --backend step-linear --form history {cal} {machine} --out {o}/fit_steps",
-        f"fit host {cal} {machine} --out {o}/fit_host",
+        f"record --gpu 7 --trace --out {o}/trace",
+        f"client {o}/trace --traces 353-360 {client} /real/python",
+        f"fit steps --backend step-linear --form history {o}/calibration {o}/trace "
+        f"{run['calibration']} {run['trace']} {machine} --out {o}/fit_steps",
+        f"fit host {o}/calibration {run['calibration']} {machine} --out {o}/fit_host",
         f"record --gpu 7 --out {o}/cell/real1",
         f"client {o}/cell/real1 --traces 0-7 {client} /real/python",
         f"record --gpu 7 --out {o}/cell/real2",
@@ -158,14 +179,16 @@ def test_a_gpu_rocm_smi_reads_busy_runs_and_rocm_smi_is_never_read(tmp_path):
 @pytest.mark.parametrize(
     "fail, step, ran",
     [
-        ("measure memory", "memory", 1),
-        ("warm", "warm", 2),
-        ("calibration", "calibration", 4),
-        ("fit steps", "fit_steps", 6),
-        ("fit host", "fit_host", 7),
-        ("real2", "real2", 10),
-        ("step_linear", "step_linear", 12),
-        ("validate", "grade", 13),
+        ("blocked", "tool", 1),
+        ("measure memory", "memory", 2),
+        ("warm", "warm", 3),
+        ("calibration", "calibration", 5),
+        ("--trace", "trace", 7),
+        ("fit steps", "fit_steps", 9),
+        ("fit host", "fit_host", 10),
+        ("real2", "real2", 13),
+        ("step_linear", "step_linear", 15),
+        ("validate", "grade", 16),
     ],
 )
 def test_a_failed_step_is_named_and_ends_the_run(tmp_path, fail, step, ran):
@@ -173,6 +196,33 @@ def test_a_failed_step_is_named_and_ends_the_run(tmp_path, fail, step, ran):
     assert r.returncode == 1
     assert f"smoke_cell: step {step} failed:" in r.stderr
     assert len(log) == ran
+
+
+def test_the_calibration_server_alone_loads_the_blocking_call_tool(tmp_path):
+    r, _, o = _smoke(tmp_path)
+    assert r.returncode == 0, r.stderr
+    servers = ("warm", "calibration", "trace", *(f"cell/{run}" for run in RUNS))
+    loaded = {d: (o / d / "loaded").read_text() for d in servers}
+    tool = f"{o}/tool/libcompass_blocked.so"
+    assert loaded == {d: "" for d in servers} | {"calibration": tool}
+
+
+def test_trace_s_sets_the_trace_run_s_duration_alone(tmp_path):
+    r, log, o = _smoke(tmp_path, TRACE_S="120")
+    assert r.returncode == 0, r.stderr
+    clients = [line.split() for line in log if line.startswith("client")]
+    durations = {c[1]: c[c.index("--duration") + 1] for c in clients}
+    assert durations.pop(f"{o}/trace") == "120"
+    assert len(durations) == 5 and set(durations.values()) == {"600"}
+
+
+def test_a_law_that_leaves_a_vector_unfitted_fails_before_the_real_runs(tmp_path):
+    why = "no prefill step carries a trace run's busy time"
+    r, log, _ = _smoke(tmp_path, UNFITTED=json.dumps({"prefill": why}))
+    assert r.returncode == 1
+    assert "smoke_cell: step fit_steps failed: the law leaves unfitted" in r.stderr
+    assert why in r.stderr
+    assert log[-1].startswith("fit steps")
 
 
 def test_a_cell_that_is_a_coverage_report_fails_its_grade(tmp_path):
@@ -217,7 +267,7 @@ def test_a_failed_client_run_stops_its_server_and_names_its_step(tmp_path):
     r, log, o = _smoke(tmp_path, CLIENT_FAIL="real1")
     assert r.returncode == 1
     assert "smoke_cell: step real1 failed: client.sh exit 1" in r.stderr
-    assert len(log) == 9
+    assert len(log) == 12
     pid = json.loads((o / "cell" / "real1" / "server.json").read_text())["pid"]
     assert not _alive(pid)
 
@@ -226,7 +276,7 @@ def test_a_server_that_exits_non_zero_names_its_step(tmp_path):
     r, log, _ = _smoke(tmp_path, STOP_FAIL="real2")
     assert r.returncode == 1
     assert "smoke_cell: step real2 failed: its server exit 3" in r.stderr
-    assert len(log) == 11
+    assert len(log) == 14
 
 
 @pytest.mark.parametrize("hang", ["measure memory", "fit host", "client.sh"])

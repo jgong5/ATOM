@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# QUICKSTART.md's path end to end at concurrency 1 on one GPU, in about an hour:
-# `compass measure memory`; a calibration `compass record` serving cc-traces 353
-# on; `compass fit steps` (step linear, history form) and `compass fit host` on
-# it; two real `compass record` runs and one `compass run`, serving traces 0 on;
-# then the cell graded by `python -m atom.compass.validate`. Each server serves
-# one `client.sh` run, with its warmup, which stops it. The fits run before the
-# real runs, so a failed fit costs no more GPU time.
+# QUICKSTART.md's path end to end at concurrency 1 on one GPU: `compass measure
+# memory`; a calibration `compass record` serving cc-traces 353 on, its server
+# with the blocking-call tool (atom/compass/parity/README.md), and a trace run of
+# the same recipe, `compass record --trace`; `compass fit steps` (step linear,
+# history form) on both and `compass fit host` on the calibration record, since
+# the prefill vector fits from a trace run alone and a trace run's host segments
+# ran under the profiler; two real `compass record` runs and one `compass run`,
+# serving traces 0 on; then the cell graded by `python -m atom.compass.validate`.
+# Each server serves one `client.sh` run, with its warmup, which stops it. The
+# fits run before the real runs, so a failed fit, or a law that leaves a vector
+# unfitted and so refuses every step it prices, costs no more GPU time.
 # Before calibration, a record nothing reads, warm/, serves the cell's traces
 # once, so that it takes the aiter JIT builds a fresh container meets while
 # serving, which grading, the fits and `validate.cost` refuse in a record
@@ -30,6 +34,7 @@
 #   N_TRACES        traces each client is given (default 8): 353 on for
 #                   calibration, 0 on for the cell
 #   DURATION_S      each client run's benchmark duration (default 600)
+#   TRACE_S         the trace run's client run's duration (default DURATION_S)
 #   SERVER_ARGS     ATOM's arguments after --model (default: --max-model-len
 #                   262144)
 #   WAIT_S          seconds a server has to start (default 1800)
@@ -53,6 +58,7 @@ MACHINE=$(realpath "${MACHINE:?MACHINE names the machine spec of the GPUs}")
 : "${HARNESS_PYTHON:?HARNESS_PYTHON names the Python with compass-harness}"
 : "${AIPERF_PYTHON:?AIPERF_PYTHON names the Python without compass-harness}"
 N=${N_TRACES:-8} DURATION_S=${DURATION_S:-600} WAIT_S=${WAIT_S:-1800}
+TRACE_S=${TRACE_S:-$DURATION_S}
 # shellcheck disable=SC2206 # SERVER_ARGS is a word list
 ATOM_ARGS=(--model "$MODEL" ${SERVER_ARGS:---max-model-len 262144})
 CLI='from atom.compass.cli import main; main()'
@@ -82,7 +88,8 @@ step() {
 }
 
 # serve NAME DIR A-B PYTHON COMMAND...: one compass server writing to DIR, one
-# client run of traces A to B under PYTHON, which stops the server.
+# client run of traces A to B for DURATION_S seconds under PYTHON, which stops
+# the server. A variable assigned before `serve` holds for both.
 serve() {
     local name=$1 dir=$2 traces=$3 python=$4 pid deadline
     shift 4
@@ -106,12 +113,19 @@ token() { awk '/^published / {t = $NF} END {print t}' "$1"; }
 
 M=(--machine "$MACHINE" --store "$OUT/store")
 CAL=353-$((352 + N)) CELL=0-$((N - 1))
+step tool python3 -m atom.compass.parity.blocked "$OUT/tool"
 step memory python3 -c "$CLI" measure memory --gpu "$GPU" "${M[@]}" --out "$OUT/memory" -- "${ATOM_ARGS[@]}"
 serve warm "$OUT/warm" "$CELL" "$AIPERF_PYTHON" record --gpu "$GPU"
-serve calibration "$OUT/calibration" "$CAL" "$AIPERF_PYTHON" record --gpu "$GPU"
+ROCP_TOOL_LIBRARIES=$OUT/tool/libcompass_blocked.so \
+    serve calibration "$OUT/calibration" "$CAL" "$AIPERF_PYTHON" record --gpu "$GPU"
+DURATION_S=$TRACE_S serve trace "$OUT/trace" "$CAL" "$AIPERF_PYTHON" record --gpu "$GPU" --trace
 RUNS=(--client-run "$OUT/calibration" "$OUT/calibration/artifacts/client_run.json")
+TRACE=(--client-run "$OUT/trace" "$OUT/trace/artifacts/client_run.json")
 step fit_steps python3 -c "$CLI" fit steps --backend step-linear --form history \
-    "$OUT/calibration" "${RUNS[@]}" "${M[@]}" --out "$OUT/fit_steps"
+    "$OUT/calibration" "$OUT/trace" "${RUNS[@]}" "${TRACE[@]}" "${M[@]}" --out "$OUT/fit_steps"
+unfitted=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["params"]["unfitted"] or "")' \
+    "$OUT/fit_steps/step_linear_law.json") || fail fit_steps "its law cannot be read; see $OUT/fit_steps.log"
+[[ -z $unfitted ]] || fail fit_steps "the law leaves unfitted, so refusing every step they price: $unfitted"
 step fit_host python3 -c "$CLI" fit host "$OUT/calibration" "${RUNS[@]}" "${M[@]}" --out "$OUT/fit_host"
 LAW=$(token "$OUT/fit_steps.log") HOST=$(token "$OUT/fit_host.log")
 for k in 1 2; do
