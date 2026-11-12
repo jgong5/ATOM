@@ -32,7 +32,8 @@ DeepSeek-V4.1 decoder SWA bounded replay when
 off ATOM's default, the index cache's dtype where ATOM resolved it apart from
 the KV cache's, the performance environment, ATOM's prefill token buckets
 in it when off ATOM's default too, and, under speculation, its
-method and draft width. Loading refuses, naming what differs:
+method and draft width, and the digest of the draft's config.json where it is
+not the target's. Loading refuses, naming what differs:
 
 - a run at data-parallel width above one, since every bundle is measured at one;
 - a keyed condition, the grid's graph mode, a timing scope other than the
@@ -96,6 +97,9 @@ OFF_DEFAULT = (
 DERIVED = {"index_cache_dtype": "kv_cache_dtype"}
 #: ATOM's prefill token buckets, an environment variable `keyed` the same way.
 BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
+#: The digest of a drafter's config.json, keyed only where it is not the
+#: target's, which every key already holds as its model's.
+DRAFT = "draft_model"
 
 
 def keyed(config, ladder: bool = True) -> dict:
@@ -103,11 +107,12 @@ def keyed(config, ladder: bool = True) -> dict:
     `OFF_DEFAULT` only where it is off its default, and the performance
     environment of this process less the client's and the device selection,
     `BUCKETS` in it only off ATOM's default, and under speculation its method
-    and draft width; the ladder only with `ladder`."""
+    and draft width, and `DRAFT` (`_draft`); the ladder only with `ladder`."""
     from atom.config import Config
 
     spec = getattr(config, "speculative_config", None)
     drafts = {"speculative": [spec.method, spec.num_speculative_tokens]} if spec else {}
+    drafts |= _draft(config, spec) if spec else {}
     if ladder:
         drafts["ladder"] = [] if config.enforce_eager else schedulable_ladder(config)
     for name in OFF_DEFAULT:
@@ -128,6 +133,19 @@ def keyed(config, ladder: bool = True) -> dict:
         "enable_tbo_decode": config.enable_tbo_decode,
         "env": keyed_env(),
     }
+
+
+def _draft(config, spec) -> dict:
+    """`DRAFT` as the drafter `spec` reads it: the digest of its checkpoint's
+    config.json, the target's when it names none, as ATOM loads it, stated only
+    where that is not the target's config.json."""
+    from atom.compass.run import _file_digest
+
+    draft, target = (
+        _file_digest(model, "config.json")
+        for model in (getattr(spec, "model", None) or config.model, config.model)
+    )
+    return {DRAFT: draft} if draft != target else {}
 
 
 def keyed_env() -> dict:
