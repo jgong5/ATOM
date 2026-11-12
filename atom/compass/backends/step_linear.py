@@ -92,6 +92,14 @@ step it adds the drafter's draft-KV pass, which runs before
 `forward_done_event`, so its terms are the target's. A draft law with
 `output_prefill_kv` true prices that pass on a prefill step that produces
 output by its prefill vector, whose terms there are the target's too.
+A serial drafter's draft law may hold a `forward` vector over the prefill
+vector's base features, with `passes`, the draft forwards its `propose` runs.
+On a decode and on a prefill step that produces output it prices the draft
+as each of those forwards at its own rows (`serial_passes`), named
+`draft.pass<i>.<feature>`, plus its `propose` vector, the rest of the propose,
+over `[1, seqs]`; there neither its decode vectors nor its prefill vector
+price the draft, which on a middle chunk is the draft-KV pass its prefill
+vector prices.
 
 The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
 
@@ -103,7 +111,8 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
      "draft": {"provenance": ..., "prefill": VECTOR, "decode": {...},
                "propose": VECTOR, "draft_kv": VECTOR,
                "short_propose": VECTOR,     # with "below": tokens
-               "output_prefill_kv": true}}   # all four optional
+               "output_prefill_kv": true,
+               "forward": VECTOR}}          # with "passes": K; all five optional
 
     VECTOR = {"coefficients": {<feature>: seconds, ...},
               "hull": HULL,
@@ -133,6 +142,7 @@ from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import (
     IMAGES,
     BatchView,
+    RequestShape,
     sum_context,
     sum_query_cached,
     sum_query_square,
@@ -252,6 +262,21 @@ def rowmod(context, k: int) -> int:
     return max(sum(context[r::k]) for r in range(min(k, len(context))))
 
 
+def serial_passes(view: BatchView, passes: int) -> list[tuple]:
+    """The `PREFILL` features of each of a serial drafter's `passes` draft
+    forwards over `view`'s step: the first runs the step's own rows; each
+    later one a row a request, at its context, run at `view.draft_bs` rows
+    where the drafter pads them to a draft graph's batch."""
+    first = view.requests
+    later = tuple(RequestShape(1, r.context_tokens, True) for r in first)
+    rows = len(later) if view.draft_bs is None else view.draft_bs
+
+    def features(shapes, tokens):
+        return (1, tokens, sum_query_square(shapes), sum_query_cached(shapes))
+
+    return [features(first, sum_tokens(first))] + [features(later, rows)] * (passes - 1)
+
+
 class StepLinearLaw:
     """A prefill vector, a decode vector per rung, each with its hull."""
 
@@ -303,6 +328,12 @@ class StepLinearLaw:
             "draft_kv", PROPOSE, law["draft_kv"]
         )
         self.output_prefill_kv = bool(law.get("output_prefill_kv"))
+        self.forward = law.get("forward") and _Vector(
+            "forward", PREFILL, law["forward"]
+        )
+        self.passes = self.forward and int(law["forward"]["passes"])
+        if self.forward and self.passes < 1:
+            raise ValueError(f"the forward vector states {self.passes} passes")
 
 
 class StepLinearBackend(CostBackend):
@@ -347,6 +378,8 @@ class StepLinearBackend(CostBackend):
         """`law`'s terms for the step, named for `what`, and apart its draft-KV
         pass's, which are the target's."""
         prefill, decode = batch_view.prefill, batch_view.decode
+        if law.forward and (decode or batch_view.produces_output):
+            return self._serial(law, batch_view, what)
         if prefill:
             vector, kind = law.prefill, "prefill"
             if vector is None:
@@ -418,6 +451,18 @@ class StepLinearBackend(CostBackend):
                 propose = law.short_propose
             terms += self._priced(law, propose, "propose", seqs, what)
         if decode and law.draft_kv is not None:
+            kv = self._priced(law, law.draft_kv, "draft_kv", seqs, what)
+        return terms, kv
+
+    def _serial(self, law: StepLinearLaw, batch_view: BatchView, what: str):
+        """A serial draft's terms: each draft forward at its rows, then the
+        rest of its propose; on a decode, apart, its draft-KV pass's."""
+        terms, kv, seqs = [], [], (1, len(batch_view.requests))
+        for i, counts in enumerate(serial_passes(batch_view, law.passes)):
+            terms += self._priced(law, law.forward, f"pass{i}", counts, what)
+        if law.propose is not None:
+            terms += self._priced(law, law.propose, "propose", seqs, what)
+        if batch_view.decode and law.draft_kv is not None:
             kv = self._priced(law, law.draft_kv, "draft_kv", seqs, what)
         return terms, kv
 

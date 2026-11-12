@@ -26,7 +26,8 @@ drafter pass, that one or `propose_draft_token_ids`); `d_draft_kv_ns` and
 entry and exit, on a forward that runs it; under a serial drafter
 `d_draft_passes_ns` times each draft forward `propose_draft_token_ids` runs, one
 a pass, from a device event where the drafter points its context at that pass
-(`_publish_draft_shape`) to the next one's, the last to the propose's exit; and `d_gap_ns`, from the previous forward's
+(`_publish_draft_shape`) to the next one's, the last to the propose's exit;
+and `d_gap_ns`, from the previous forward's
 exit event to this launch's entry event, absent on the first line; summed in
 order they lay every forward on one device timeline. A later pipeline stage's
 receive of its input is `t_pp_recv_ns`, its device part `d_recv_ns`; an idle
@@ -86,7 +87,7 @@ import os
 import pathlib
 import sys
 import time
-from itertools import zip_longest
+from itertools import pairwise, zip_longest
 
 import numpy as np
 
@@ -669,9 +670,7 @@ class StepRecording:
                 marks[key] = [end, launch, start]
             done, previous = self.device_event(), self._last_exit
             self._last_exit = done
-            window = functools.partial(
-                _window, previous, launch, done, marks, bounds
-            )
+            window = functools.partial(_window, previous, launch, done, marks, bounds)
         return stamps, window
 
     def exit(self):
@@ -706,7 +705,7 @@ def _window(previous, launch, done, marks, bounds, wait: bool):
         fields[key] = round(ms * 1e6)
     if bounds:
         fields[DRAFT_PASSES] = [
-            round(a.elapsed_time(b) * 1e6) for a, b in zip(bounds, bounds[1:])
+            round(a.elapsed_time(b) * 1e6) for a, b in pairwise(bounds)
         ]
     if previous is not None:
         fields["d_gap_ns"] = round(previous.elapsed_time(launch) * 1e6)
