@@ -1342,7 +1342,8 @@ class Stub:
             and "out_logits" in op["args"]
             and (op["args"].get("context_lens") or {}).get("role") != "activation"
         }
-        # and by the rows each compress plan holds, as many as its keys' RoPE's
+        # and by the rows each compress plan holds, as many as its keys' RoPE's,
+        # for a key RoPE captured before it stated its ratio
         self.known |= {
             ("compressed", op["args"]["plan_gpu"]["shape"][0]): op["args"]["ratio"]
             for op, _ in found.values()
@@ -2053,8 +2054,9 @@ def _ratio(op, path, known=None):
     `ratios` (DeepSeek-V4.1's indptr scan, a table a ratio); else the ratio
     `known` gives the rows a page holds at it (`rows_per_page`, V4.1's index
     build, 0 when it takes no selection) or the width of the logits it reads
-    (`stride0`, V4.1's top-k, its scorer's), or a RoPE's positions the rows its
-    compress plan holds (`compressed`)."""
+    (`stride0`, V4.1's top-k, its scorer's), or, in a graph captured before
+    V4.1's key RoPE stated its ratio, a RoPE's positions the rows its compress
+    plan holds (`compressed`)."""
     args, (slot, *rest) = op["args"], path.split(".")
     listed = args.get("ratios")
     if rest and isinstance(args.get(slot), list) and isinstance(listed, list):
