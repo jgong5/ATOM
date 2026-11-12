@@ -1555,9 +1555,9 @@ def _forward(samples) -> dict:
     """The draft law's `forward` vector over `samples`' passes, each a sample
     at its features (`serial_passes`), solved and hulled as a step vector is,
     with `passes`, how many each holds; samples holding other counts refuse."""
-    passes = {len(s.passes_s) for s in samples}
+    passes = sorted({len(s.passes_s) for s in samples})
     if len(passes) != 1:
-        raise ValueError(f"the records' steps ran {sorted(passes)} draft passes")
+        raise ValueError(f"the records' steps ran {passes} draft passes")
     (k,) = passes
     x = [c for s in samples for c in serial_passes(s.view, k)]
     y = [p for s in samples for p in s.passes_s]
