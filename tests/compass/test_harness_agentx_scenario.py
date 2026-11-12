@@ -135,9 +135,9 @@ def test_agentx_replays_every_trace_with_the_scenario_defaults(agentx):
     )
 
 
-def test_the_base_scenario_sends_the_arguments_stage_4_graded(tmp_path):
-    """Without --agentx, aiperf takes the arguments a stage 4 c=4 600 s run
-    recorded in its workload."""
+def test_the_base_mode_sends_the_arguments_its_graded_runs_recorded(tmp_path):
+    """Without --agentx, aiperf takes the arguments a graded c=4 600 s
+    base-mode run recorded in its ``workload.json``."""
     out, env = _setup(tmp_path, SIM)
     args = ["--traces", "0-3", "--concurrency", "4", "--duration", "600"]
     done = _client(out, *args, env=env)
