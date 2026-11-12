@@ -105,17 +105,31 @@ class _HipHostAllocator:
         self._free(ptr)
 
 
+def _torch_hip_runtime() -> str:
+    """The one `libamdhip64` file this process maps: torch's, since its
+    import. OSError when it maps none or several."""
+    with open("/proc/self/maps") as maps:
+        names = {"".join(line.split(maxsplit=5)[5:]).strip() for line in maps}
+    hip = [n for n in sorted(names) if os.path.basename(n).startswith("libamdhip64.so")]
+    if len(hip) != 1:
+        raise OSError(f"libamdhip64 files mapped: {hip}")
+    return hip[0]
+
+
 def _host_allocator():
     """The page-locked allocator a shard is copied into, or None to register
-    the checkpoint mapping in place (`ATOM_ENGRAM_UVA_COPY=0`, or no HIP
-    runtime to call)."""
+    the checkpoint mapping in place (`ATOM_ENGRAM_UVA_COPY=0`, or no single
+    HIP runtime of torch's to bind: one loaded by name can be a second
+    runtime, whose page-locked memory torch's copies fault on)."""
     if not envs.ATOM_ENGRAM_UVA_COPY or not torch.version.hip:
         return None
     try:
-        return _HipHostAllocator(
-            ctypes.CDLL("libamdhip64.so"), ctypes.CDLL(None, use_errno=True)
+        hip = ctypes.CDLL(_torch_hip_runtime(), mode=os.RTLD_NOLOAD)
+        return _HipHostAllocator(hip, ctypes.CDLL(None, use_errno=True))
+    except OSError as e:
+        logger.info(
+            "engram: torch's HIP runtime not bound, registering in place: %s", e
         )
-    except OSError:
         return None
 
 
@@ -439,9 +453,7 @@ _HBM_BOUNCE_BYTES = 1 << 30
 
 
 def _bounce(nbytes: int) -> torch.Tensor:
-    """`nbytes` page-locked by torch's own allocator, not `_HipHostAllocator`:
-    that loads HIP by name, which can be a second HIP runtime beside torch's,
-    to which its memory is pageable -- an H2D copy from it faulted on MI455.
+    """`nbytes` page-locked by torch's own allocator.
     `device="cpu"`: under the CUDA default device the model is built with, a
     bare `pin_memory=True` asks for a CUDA tensor and raises.
     """
