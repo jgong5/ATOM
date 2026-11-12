@@ -23,7 +23,10 @@ recorded at the forward's exit (`d_target_ns` to one recorded just after
 pass before it, or on a forward that samples nothing, to the start of its first
 drafter pass, that one or `propose_draft_token_ids`); `d_draft_kv_ns` and
 `d_propose_ns` time those two drafter passes, each between device events at its
-entry and exit, on a forward that runs it; and `d_gap_ns`, from the previous forward's
+entry and exit, on a forward that runs it; under a serial drafter
+`d_draft_passes_ns` times each draft forward `propose_draft_token_ids` runs, one
+a pass, from a device event where the drafter points its context at that pass
+(`_publish_draft_shape`) to the next one's, the last to the propose's exit; and `d_gap_ns`, from the previous forward's
 exit event to this launch's entry event, absent on the first line; summed in
 order they lay every forward on one device timeline. A later pipeline stage's
 receive of its input is `t_pp_recv_ns`, its device part `d_recv_ns`; an idle
@@ -89,7 +92,7 @@ import numpy as np
 
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.launch_features import GRAPHS, architecture, provider
-from atom.compass.backends.step_labels import join_stamps
+from atom.compass.backends.step_labels import DRAFT_PASSES, join_stamps
 
 ENV = "ATOM_COMPASS_PARITY_RECORD"
 #: The file in a real run's record directory holding when its workload was sent
@@ -119,6 +122,7 @@ TIMESTAMPS = (
     "d_recv_ns",
     "d_draft_kv_ns",
     "d_propose_ns",
+    DRAFT_PASSES,
     "t_pull_ns",
     "t_put_ns",
     "blocked_ns",
@@ -533,6 +537,11 @@ class StepRecording:
             self.drafter.compute_draft_kv = functools.partial(
                 self._draft_pass, "d_draft_kv_ns", draft_kv
             )
+            publish = getattr(self.drafter, "_publish_draft_shape", None)
+            if publish is not None and not self.drafter.is_block_drafter:
+                self.drafter._publish_draft_shape = functools.partial(
+                    self._serial_pass, publish
+                )
         self._recording = True
 
     def forward(self, batch):
@@ -604,6 +613,13 @@ class StepRecording:
         self._stamps[key] = [start, self.device_event()]
         return reply
 
+    def _serial_pass(self, call, *args, **kwargs):
+        """`call`, a serial drafter pointing its context at its next pass,
+        after a device event where that pass starts."""
+        if getattr(self, "_parity_record", None) is not None:
+            self._stamps.setdefault("pass_events", []).append(self.device_event())
+        return call(*args, **kwargs)
+
     def propose_draft_token_ids(self, *args, **kwargs):
         call = super().propose_draft_token_ids
         return self._draft_pass("d_propose_ns", call, *args, **kwargs)
@@ -634,9 +650,13 @@ class StepRecording:
         names = {"d_target_ns": "target_event", "d_recv_ns": "recv_event"}
         marks = {k: [stamps.pop(e)] for k, e in names.items() if e in stamps}
         first = stamps.pop("draft_event", None)
+        starts = stamps.pop("pass_events", [])
         passes = {
             k: stamps.pop(k) for k in ("d_draft_kv_ns", "d_propose_ns") if k in stamps
         }
+        # Each serial pass runs to the next one's start, the last to the propose's exit.
+        propose = passes.get("d_propose_ns")
+        bounds = [*starts, propose[1]] if starts and propose else []
         if "d_target_ns" in marks and "d_draft_kv_ns" in passes:
             # It sampled after its draft-KV pass, the first drafter pass a
             # forward runs, and that pass is not the target's work.
@@ -649,7 +669,9 @@ class StepRecording:
                 marks[key] = [end, launch, start]
             done, previous = self.device_event(), self._last_exit
             self._last_exit = done
-            window = functools.partial(_window, previous, launch, done, marks)
+            window = functools.partial(
+                _window, previous, launch, done, marks, bounds
+            )
         return stamps, window
 
     def exit(self):
@@ -671,8 +693,9 @@ def _traced(name: str):
     return contextlib.nullcontext()
 
 
-def _window(previous, launch, done, marks, wait: bool):
-    """The device window's fields once `done` has completed, polled, else None."""
+def _window(previous, launch, done, marks, bounds, wait: bool):
+    """The device window's fields once `done` has completed, polled, else None;
+    with `bounds`, `DRAFT_PASSES`, the time between each two of them."""
     while not done.query():
         if not wait:
             return None
@@ -681,6 +704,10 @@ def _window(previous, launch, done, marks, wait: bool):
     for key, (event, *less) in marks.items():
         ms = launch.elapsed_time(event) - (less[0].elapsed_time(less[1]) if less else 0)
         fields[key] = round(ms * 1e6)
+    if bounds:
+        fields[DRAFT_PASSES] = [
+            round(a.elapsed_time(b) * 1e6) for a, b in zip(bounds, bounds[1:])
+        ]
     if previous is not None:
         fields["d_gap_ns"] = round(previous.elapsed_time(launch) * 1e6)
     return fields

@@ -52,6 +52,8 @@ bound over the record. A decode's draft label, its `propose`
 pass, is cut where the device reached the pass, placed by that lead, before
 the host's draft copy wait (`t_draft_recv_ns`) began: the host queues the pass
 just before that wait, so the window may hold the device's wait for it.
+Under a serial drafter a decode's line also times each draft forward of that
+pass (`DRAFT_PASSES`), which stand and are cut with its draft label.
 
 A prefill step's labels are a trace run's busy time per pass (`parity.busy`),
 which a trace run's record joins from `dp<r>.busy.jsonl` beside it: the device
@@ -137,6 +139,8 @@ CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced")
 #: The directory beside a trace run's `steps` its traces are in (`parity.busy`).
 TRACE = "trace"
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
+#: The line key timing each pass of a serial drafter's `propose`.
+DRAFT_PASSES = "d_draft_passes_ns"
 TABLE_VERSION = 1
 #: run.json's entry naming the JIT modules and kernels its server compiled while
 #: it served (`atom.compass.drive.aiter_jit`); a server that compiled none has none.
@@ -178,6 +182,9 @@ class Sample:
     feature (`launch_features`), empty on a line that states none.
     `blocked` is the seconds its `W_launch` left out per blocking HIP call
     that blocked, from its line's `blocked_ns`; None on a line without it.
+    `passes_s` holds the seconds of each pass a serial drafter's `propose`
+    ran, from its line's `d_draft_passes_ns`, on a decode whose draft label
+    stands; None elsewhere.
     `floor` names, per busy line field of a drafter part, why the profiler's
     floor left a kernel of it at its recorded length (`Floor.term`); empty on
     a cut step, without `floored` or with every term known.
@@ -199,6 +206,7 @@ class Sample:
     launch: dict = field(default_factory=dict)
     blocked: dict | None = None
     floor: dict = field(default_factory=dict)
+    passes_s: tuple | None = None
 
 
 class Floor:
@@ -591,7 +599,9 @@ def _label(
             cut = "unsplit"
         gap = 0 if view.prefill else s.get("d_gap_ns", 0)
         device = None if cut else (gap + s["d_busy_ns"]) * 1e-9
-        draft = propose = draft_kv = None
+        draft = propose = draft_kv = passes = None
+        if not (cut or view.prefill or s["step"] in early or DRAFT_PASSES not in s):
+            passes = tuple(p * 1e-9 for p in s[DRAFT_PASSES])
         if "d_target_ns" in s:  # an MTP record: the target alone, no gap
             target = s["d_target_ns"]
             if view.produces_output:  # the pass precedes forward_done_event
@@ -652,6 +662,7 @@ def _label(
                 s.get("launch", {}),
                 None if blocked is None else {k: v * 1e-9 for k, v in blocked.items()},
                 {} if cut else s.get("floor", {}),
+                passes,
             )
         )
         gap_ns = s.get("d_gap_ns")
