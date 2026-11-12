@@ -138,16 +138,16 @@ class DeepseekV4(LaunchFeatures):
     group splits (`BatchView.tbo_tokens`) launches each micro-batch in turn
     through ATOM's `UBatchWrapper`, unless it is a decode replaying a graph
     recorded split (`capture_rung`). `install` counts the wrapper's split
-    runs; a model built without two-batch overlap has no wrapper."""
+    runs, `_run_ubatches`, found on the class so that a module forwarding
+    unknown names to the wrapper is not taken for it; a model built without
+    two-batch overlap has no wrapper."""
 
     features = ("split",)
 
     def install(self, runner) -> None:
-        from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
-
         seen = runner.compass_launch_seen = collections.Counter()
         for module in runner.model.modules():
-            if isinstance(module, UBatchWrapper):
+            if callable(getattr(type(module), "_run_ubatches", None)):
                 module._run_ubatches = functools.partial(
                     _split, seen, module._run_ubatches
                 )
