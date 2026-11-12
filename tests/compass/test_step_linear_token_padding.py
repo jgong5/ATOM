@@ -339,6 +339,7 @@ def test_the_projection_states_the_groups_largest_rank(dp):
         scheduled_tokens_per_dp_rank=np.array([100, 600][:dp]),
         ub_tokens_across_dp=None,
         max_bs_across_dp=1,
+        any_rank_needs_eager=False,
     )
     mode = SimpleNamespace(
         use_cudagraph=False,

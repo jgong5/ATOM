@@ -409,8 +409,9 @@ runner that captured no prefill graph, fit no `padding`, and the law names that 
 and graph bodies 3 to 7% low ([#3128](https://github.com/jgong5/ATOM/issues/3128)). ATOM replays
 a prefill's first layers as a token graph at `b` rows, the smallest bucket holding the
 most tokens any rank of the DP group scheduled (`BatchView.group_max_tokens`), and runs
-past the largest bucket, or on a step the group splits for two-batch overlap, eagerly,
-where `padding` is 0. On the V4.1-Flash DSpark TP2 trace runs the 2048 bucket cost the
+past the largest bucket, on a step the group splits for two-batch overlap, or on one an
+attention backend refuses a graph for (`BatchView.group_needs_eager`), eagerly, where
+`padding` is 0. On the V4.1-Flash DSpark TP2 trace runs the 2048 bucket cost the
 same at 1033 and 1830 tokens, and 0.0114 ms a padded token matches 0.0105 ms a bucket
 token. Without the column the law priced one-request output prefills of 1033 to 1314
 tokens 13 to 20% low and of 124 to 248 tokens 10 to 19% high; with it, 2.7 to 3.1% low

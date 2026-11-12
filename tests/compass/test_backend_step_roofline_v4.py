@@ -297,7 +297,9 @@ def test_the_batch_view_states_the_real_tokens_among_the_gathered_rows():
     r = runner(None, dp_size=2)
     r.drafter = None
     sync = SimpleNamespace(
-        scheduled_tokens_per_dp_rank=torch.tensor([3, 2]), ub_tokens_across_dp=None
+        scheduled_tokens_per_dp_rank=torch.tensor([3, 2]),
+        ub_tokens_across_dp=None,
+        any_rank_needs_eager=False,
     )
     mode = SimpleNamespace(
         sync=sync,
@@ -318,6 +320,7 @@ def test_a_rank_s_view_names_its_own_slot_of_the_split():
     sync = SimpleNamespace(
         scheduled_tokens_per_dp_rank=torch.tensor([7, 7]),
         ub_tokens_across_dp=((4, 3), (3, 4)),
+        any_rank_needs_eager=False,
     )
     mode = SimpleNamespace(
         sync=sync, running_tokens_are_unified=False, use_cudagraph=False, running_bs=1
