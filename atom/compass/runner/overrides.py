@@ -1481,7 +1481,7 @@ class NonAllocatingRunner(
                     "runner simulates only 'compass', 'lmcache_mp' and "
                     "'lmcache_offload', and an unset kv_connector means 'moriio'."
                 )
-        for name in simulated.keys() & set(names):
+        for name in sorted(simulated.keys() & set(names)):
             simulated[name].substitute()
         set_kv_cache_data({}, self.config, num_blocks=num_kvcache_blocks)
         self.config.num_kvcache_blocks = num_kvcache_blocks

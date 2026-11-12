@@ -773,7 +773,7 @@ def fit_offload(logs) -> tuple[dict, dict]:
             f"the logs state (workers, chunk, chunk bytes) {sorted(stated)}, and "
             f"{len(logs) - len(workers)} state none; an entry is fitted on one"
         )
-    [(tp, chunk, chunk_bytes)] = stated
+    [(tp, chunk, chunk_bytes)] = sorted(stated)
     entry = {
         "chunk_size": chunk,
         "tensor_parallel_size": tp,

@@ -204,18 +204,17 @@ class Tier:
         placed; how many were placed."""
         self._expire(now)
         placed = 0
-        while placed < len(keys):
-            if self.free:
-                self.free, placed = self.free - 1, placed + 1
-                continue
-            victims = self.policy.get_evict_candidates(self.chunks, num_candidates=1)
-            if not victims:
-                self.counts["store_cut"] += 1
-                break
-            for key in victims:
-                del self.chunks[key]
-            self.free += len(victims)
-            self.counts["evicted"] += len(victims)
+        for _ in keys:
+            if not self.free:
+                victims = self.policy.get_evict_candidates(self.chunks, 1)
+                if not victims:
+                    self.counts["store_cut"] += 1
+                    break
+                for key in victims:
+                    del self.chunks[key]
+                self.free += len(victims)
+                self.counts["evicted"] += len(victims)
+            self.free, placed = self.free - 1, placed + 1
         for key in keys[:placed]:
             if key in self.chunks:
                 self.free += 1
