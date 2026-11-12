@@ -1088,9 +1088,11 @@ turn (agentx-harness `timing/trajectory_source.py`).
 
 ### Open issues
 
-- The warmup barrier's drain polls `asyncio.sleep` in aiperf's runner, outside the
-  `LoopScheduler` rebind. Whether a simulated warmup, its 1800 s grace included, ends as a
-  real one does shows first in #3261's pair.
+- ~~The warmup barrier's drain polls `asyncio.sleep` in aiperf's runner, outside the
+  `LoopScheduler` rebind.~~ Settled by #3261: with the poll on the wall clock, the traffic
+  LP granted the drain's 1800 s grace while the poll slept, so a simulated warmup ended
+  at its grace; `ClockPhaseRunner._wait_for_accelerated_warmup_wire_drain` polls on the
+  clock instead.
 
 ---
 
