@@ -1004,9 +1004,7 @@ def test_behind_the_router_lp_requests_cancels_and_the_stream_cross_it(
     assert published[1] == (_key(0), 2.0 + ADMIT, 1, "cancel")
 
 
-def test_behind_a_plain_router_a_cancel_goes_to_frontend_p_s_url(
-    tmp_path, monkeypatch
-):
+def test_behind_a_plain_router_a_cancel_goes_to_frontend_p_s_url(tmp_path, monkeypatch):
     """Behind a PD router that is no LP, which answers a cancel 400, aiperf's
     cancel of a request open at the grace deadline, 2.0, is stamped on the
     request's channel to frontend-P and published with frontend-P's URL."""
