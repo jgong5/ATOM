@@ -94,6 +94,13 @@ refuses: it is measured across the layout's ranks, where a DP all-gather's
 (`_own_rows`).
 A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
+MORI's dispatch and combine are methods of a handle no graph holds: each is
+called at MORI's entry point on the handle ATOM builds for the model's MoE,
+with the leaf's arguments, and, since neither runs twice in a row, timed
+through graphs that keep MORI's order (`_Mori`): a combine alone on one
+dispatch's rows, their count restored before each call, less that restore;
+a dispatch as rounds of it and a combine, less that combine alone. The point
+records each graph's median (`parts_ns`), and its kernels are the leaf's own.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, a KV
 argument's as many entries of its widest-strided dimension, on a tie the
@@ -257,6 +264,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.op_graph import DRAFT, DRAFT_KV, KV, PERMILLE
 from atom.compass.bench.routing import uniform_ids
+from atom.compass.capture.peers import MORI
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.compass.run.modules import LAYER
 from atom.utils.arg_parser import FlexibleArgumentParser
@@ -1030,6 +1038,8 @@ class Stub:
         )
         self.shared = self.topk.get("topk_ids")
         self.loads = []
+        # what ATOM builds for MORI's exchange, once a MORI leaf asks (`_mori`)
+        self.mori = None
         # DeepSeek-V4.1's compress ratios by the rows a page holds at each
         geometry = getattr(runner, "attn_metadata_builder", None)
         geometry = getattr(geometry, "geometry", None)
@@ -1609,7 +1619,9 @@ class Stub:
         none of a call its cold graph timed. Every rank's graph holds the most K
         any rank's call gives, and a leaf any rank refuses, every rank does; K
         past a leaf's occurrences, where later ones take a `QUERIED` buffer, a
-        multiple of them."""
+        multiple of them. A MORI leaf is timed at MORI's entry point through
+        graphs of its own (`_Mori`), each one's median kept (`parts_ns`); a
+        combine's routing is its first copy's."""
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
 
@@ -1623,7 +1635,12 @@ class Stub:
                 "a copy to pageable host memory, which ATOM allocates and no "
                 "CUDA graph captures"
             )
-        fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
+        if op["op"].startswith(MORI):  # a method of a handle no graph holds
+            with refused_together():
+                fn = self._mori(op)
+        else:
+            fn = _function(op["op"])
+        m = self.cold_copies.get(sig, n)
         self.loads, self.built = [], {}
         if self.flush is None:
             self.flush = torch.empty(
@@ -1663,10 +1680,10 @@ class Stub:
                     calls.append(self._reweigh(op, sig, calls[c % n], c))
             n = len(calls)
             cycle = [calls[i % n] for i in range(k)]
-            cold = _replay(fn, cycle, self.flush)
+            cold, parts = _timed(fn, cycle, self.flush)
             # warm: call i on its cold call's occurrence's first copy (`QUERIED`)
             warm = [calls[i % n % o] for i in range(k)]
-            warm = _replay(fn, warm) if n > 1 and k == CALLS else None
+            warm = _timed(fn, warm)[0] if n > 1 and k == CALLS else None
             # two profiles that named nothing of a call its graph timed missed it
             if agreed(int(not kernels and any(cold)), cpu_group(), most=True):
                 forward_context._forward_context = calls[0][1]
@@ -1674,9 +1691,11 @@ class Stub:
         finally:
             forward_context._forward_context = forward_context.ForwardContext()
         medians = statistics.median(cold), warm and statistics.median(warm)
-        scratch = {}
+        scratch = {} if parts is None else {"parts_ns": parts}
         if op["op"] in TOPK_WORKSPACE:
             scratch["workspace_bytes"] = calls[0][0]["workspace"].nbytes
+        if isinstance(fn, _Mori) and fn.combines:  # every copy on the first's routing
+            self.loads = self.loads[:1]
         return scratch | {
             "kernels": kernels,
             "grids": grids,
@@ -1842,6 +1861,51 @@ class Stub:
         if out.shape[1] > k:
             out[:, k:] = self.shared[: len(out), k:]
         return out
+
+    def _mori(self, op) -> "_Mori":
+        """`_Mori` for the MORI leaf `op` on the handle ATOM builds for the
+        model's first MoE layer, as its loader's `init_prepare_finalize`
+        builds it, once; refused by name where ATOM builds none, or one for
+        another EP width, hidden size or count of experts a token than the
+        leaf states."""
+        from atom.model_ops.moe import FusedMoEMethodBase
+
+        if self.mori is None:
+            name, layer = next(
+                (
+                    (name, m)
+                    for name, m in self.modules.items()
+                    if isinstance(getattr(m, "quant_method", None), FusedMoEMethodBase)
+                ),
+                (None, None),
+            )
+            if layer is None:
+                raise ValueError(
+                    "the model has no MoE layer to build MORI's handle for"
+                )
+            method = layer.quant_method
+            made = FusedMoEMethodBase._maybe_make_prepare_finalize(
+                method.moe,
+                method.get_fused_moe_quant_config(layer),
+                method.routed_rows_wire,
+            )
+            if not getattr(made, "_mori_ops", None):
+                raise ValueError(
+                    f"ATOM builds {type(made).__name__} for {name}, not MORI"
+                )
+            self.mori = made, method.moe.in_dtype
+        made, dtype = self.mori
+        handle, args = made._mori_ops[0], op["args"]
+        c = handle.config
+        built = c.world_size, c.hidden_dim, c.num_experts_per_token
+        stated = args["num_ep_ranks"], args["input"]["shape"][1]
+        stated += (args["indices"]["shape"][1],)
+        if built != stated:
+            raise ValueError(
+                f"ATOM builds MORI's handle for (EP ranks, hidden, experts a "
+                f"token) {built}, and the leaf states {stated}"
+            )
+        return _Mori(op, handle, dtype)
 
     def _reweigh(self, op, sig, like, c):
         """Copy `like` of `op`'s call with the c-th weight of each weight
@@ -2477,6 +2541,106 @@ def _on_coordinator(name: str, fn):
     return call
 
 
+class _Mori:
+    """MORI's dispatch or combine leaf `op`, called at MORI's entry point on
+    `handle`, the one ATOM builds for the model's MoE (`Stub._mori`), with the
+    leaf's arguments, its stated EP width aside. A dispatch reserves rows in
+    its peers' buffers and adds the rows each received to a count there; a
+    combine reduces onto the last dispatch's routing, copies as many rows as
+    the count holds, zeroes it and meets every rank at a barrier. A dispatch
+    that follows another before a combine can reserve rows a peer has not
+    yet released, and a combine after a combine copies no rows, so a call
+    (`__call__`) keeps the leaf's own (`own`) in MORI's order (`before`,
+    `after`):
+
+    * a dispatch's call is a round: it, then a combine of its rows from a
+      buffer as ATOM's experts write one, of `dtype`;
+    * a combine's call first fills the count of one dispatch back in
+      (`_restore`): the first call's, made at once, and again after a round.
+      A combine's own dispatch sends zeros at the handle's format, as many
+      rows as the combine's ids, and every copy reduces onto its routing.
+
+    `parts` are the graphs the leaf is timed by, each signed: a combine, its
+    calls less the fill alone (`fill`); a dispatch, its rounds less a combine
+    of its first copy's rows after the fill (`alone`), plus the fill."""
+
+    def __init__(self, op, handle, dtype):
+        self.handle, self.dtype = handle, dtype
+        self.combines = op["op"].endswith(".combine")
+        # the last dispatch's count; the ids and count a combine restores
+        self.received = self.routed = self.out = None
+        self.parts = [("combine", 1, self), ("fill", -1, self.fill)]
+        if not self.combines:
+            self.parts = [("round", 1, self), ("combine", -1, self.alone)]
+            self.parts.append(("fill", 1, self.fill))
+
+    def __call__(self, **kwargs):
+        self.before(**kwargs)
+        self.own(**kwargs)
+        self.after(**kwargs)
+
+    def before(self, **kwargs):
+        if self.combines:
+            self._restore(kwargs)
+
+    def own(self, **kwargs):
+        if self.combines:
+            self.handle.combine(**self._called(kwargs) | {"indices": self.routed[0]})
+        else:
+            self._dispatch(kwargs)
+
+    def after(self, **kwargs):
+        if not self.combines:
+            self._combine(kwargs, kwargs["indices"])
+
+    def alone(self, **kwargs):
+        self._restore(kwargs)
+        self._combine(kwargs, self.routed[0])
+
+    def fill(self, **kwargs):
+        """The count zeroed, as a combine leaves it for the next dispatch."""
+        self.received.fill_(0)
+
+    def _dispatch(self, kwargs):
+        self.received = self.handle.dispatch(**self._called(kwargs))[-1]
+        self.routed = None  # its routing is the one a combine now reduces onto
+
+    def _restore(self, kwargs):
+        if self.routed is None:
+            sent = self._sent(kwargs) if self.combines else kwargs
+            self._dispatch(sent)
+            self.routed = sent["indices"], int(self.received)
+        self.received.fill_(self.routed[1])
+
+    @staticmethod
+    def _called(kwargs) -> dict:
+        return {k: v for k, v in kwargs.items() if k != "num_ep_ranks"}
+
+    def _sent(self, kwargs) -> dict:
+        """The dispatch whose rows a combine's `kwargs` reduce: its ids, and
+        zeros at the handle's format, its scales by their byte size."""
+        c, ids = self.handle.config, kwargs["indices"]
+        zeros = functools.partial(torch.zeros, device=ids.device)
+        scales = None
+        if c.scale_dim:
+            scales = zeros(len(ids), c.scale_dim, dtype=BITS[c.scale_type_size])
+        return kwargs | {
+            "input": zeros(len(ids), c.hidden_dim, dtype=c.data_type),
+            "weights": zeros(ids.shape, dtype=torch.float32),
+            "scales": scales,
+        }
+
+    def _combine(self, kwargs, indices):
+        """A combine onto `indices` of the experts' output for every rank's
+        rows, the most a rank receives, at the dispatch's launch counts."""
+        c, device = self.handle.config, indices.device
+        rows = len(indices) * c.world_size
+        if self.out is None or len(self.out) < rows:
+            self.out = torch.zeros(rows, c.hidden_dim, dtype=self.dtype, device=device)
+        launch = {k: kwargs[k] for k in ("block_num", "warp_per_block") if k in kwargs}
+        self.handle.combine(self.out, None, indices, **launch)
+
+
 def _identity(fn, kwargs, timed=False) -> tuple[list[str], list, float]:
     """`_kernels` of one call of `fn`, memory copies aside, with their grids,
     once two profiles in a row name the same kernels on every rank, at most
@@ -2508,14 +2672,20 @@ def _kernels(fn, kwargs) -> tuple[list[str], list, float]:
     rank together (`_together`), once the device has finished `_together`'s
     all-reduce, which would otherwise join the call's kernels. Kineto states
     a launch's grid in the profile's chrome trace alone, so all three are
-    read from it; a memory set or copy has no grid."""
+    read from it; a memory set or copy has no grid. Of a MORI leaf, its own
+    call alone, with MORI's order kept around the profile (`_Mori`)."""
     from torch.profiler import ProfilerActivity, profile
 
+    mori = isinstance(fn, _Mori)
+    if mori:
+        fn.before(**kwargs)
     _together()
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        fn(**kwargs)
+        (fn.own if mori else fn)(**kwargs)
         torch.cuda.synchronize()
+    if mori:
+        fn.after(**kwargs)
     with tempfile.TemporaryDirectory() as tmp:
         prof.export_chrome_trace(f"{tmp}/trace.json")
         events = json.loads(Path(tmp, "trace.json").read_text())["traceEvents"]
@@ -2525,6 +2695,17 @@ def _kernels(fn, kwargs) -> tuple[list[str], list, float]:
     ns = 1e3 * sum(e["dur"] for e in kernels)
     named = kernels or device
     return [e["name"] for e in named], [e["args"].get("grid") for e in named], ns
+
+
+def _timed(fn, calls, flush=None) -> tuple[list[float], dict | None]:
+    """Each timed replay of one graph of `calls` (`_replay`); of a MORI leaf,
+    timed through several graphs (`_Mori.parts`), each replay's signed sum
+    over them, and each graph's median by name."""
+    if not isinstance(fn, _Mori):
+        return _replay(fn, calls, flush), None
+    got = {name: (sign, _replay(part, calls, flush)) for name, sign, part in fn.parts}
+    times = [sum(sign * t[i] for sign, t in got.values()) for i in range(REPEATS)]
+    return times, {name: statistics.median(t) for name, (_, t) in got.items()}
 
 
 def _replay(fn, calls, flush=None) -> list[float]:

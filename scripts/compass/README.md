@@ -1128,6 +1128,20 @@ the decode): decode readings taken on 005 sized the simulated decode 79 to 80 KV
 blocks per rank above every real decode on 013
 ([ruling](https://github.com/jgong5/ATOM/issues/1111#issuecomment-6659985920)).
 
+### The EP8 cell under the op-level backend
+
+The EP8 cell runs under the op-level backend by the DPA-TP8 cell's chain
+([#1498](https://github.com/jgong5/ATOM/issues/1498)), each command with the EP8
+cell's ATOM arguments and `MORI_SHMEM_HEAP_SIZE=16G` above, and is graded on the EP8
+cell's real runs. Its graphs, points and price list key expert parallelism, so one
+store holds them beside the EP-off cell's. Each MoE layer exchanges its rows through
+two leaves the EP-off graphs lack, MORI's dispatch and combine. Like every
+collective, only the `measure ops` run on all eight GPUs measures them, and the
+one-GPU runs refuse them: each rank calls them at MORI's entry point on the handle
+ATOM builds for the model's first MoE layer, a point records each graph it was timed
+by under `parts_ns` (`atom/compass/bench/ops.py`), and `fit ops` prices them over
+their message bytes.
+
 ### The inter-node link — `rdma_link.py`
 
 `rdma_link.py` times Mooncake writes from 005's GPUs into 013's over the
