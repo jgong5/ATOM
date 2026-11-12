@@ -119,8 +119,10 @@ On an MTP record both prefill vectors, the target's and the draft's, add
 Records whose engine files state the prefill token-graph buckets their runner
 recorded (`PREFILL_BUCKETS`) fit a prefill vector that adds `padding` and
 states them (`StepLinearLaw`); every record states the same buckets, or none
-does. A record whose runner recorded none, or that predates the field, states
-none and fits no `padding`; `--engine` states them in place of its own file.
+does. A record whose engine file predates the field states them in its host
+key only where its runner wrote graph sets there (`stated_buckets`); `--engine`
+states them for one that states none. Records stating them nowhere fit no
+`padding`, named under `unfitted`.
 The draft law adds none: #2976 measured the target's token graph alone.
 
 Forms (`FORMS`): `base`, the features `StepLinearLaw` always prices; `history`,
@@ -216,6 +218,8 @@ TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
 #: What a forward that admits requests spends once, per prompt token past the
 #: prefix-cache hit and per token within it (`step_labels.admit_x`).
 ADMIT_FEATURES = ("admits", "uncached", "cached")
+#: Why a law fitted on records stating their prefill buckets nowhere has no `padding`.
+NO_BUCKETS = "no record states prefill buckets, so the prefill vector adds no padding"
 
 
 def _rung_key(rung: int | None) -> str:
@@ -1689,22 +1693,35 @@ def engine_config(records) -> dict:
     return held[0]
 
 
-def recorded_buckets(files) -> tuple[int, ...]:
-    """The prefill token-graph buckets the engine files `files` state
-    (`PREFILL_BUCKETS`), empty when none states any. Files stating two sets, or
-    some stating them and others not, refuse, naming each."""
+def stated_buckets(record) -> list | None:
+    """The prefill token-graph buckets the record `record` (`dp<r>.jsonl`) states:
+    its engine file's, else its host key's graph sets'; None where neither does."""
+    engine = Path(record).with_suffix(".engine.json")
+    raw = json.loads(engine.read_text()) if engine.exists() else {}
+    if PREFILL_BUCKETS in raw:
+        return raw[PREFILL_BUCKETS]
+    key = Path(record).with_suffix(".key.json")
+    graphs = launch_features.stated(key.exists() and json.loads(key.read_text()))[1]
+    return None if graphs is None else graphs["token"]["prefill"]
+
+
+def recorded_buckets(stated: dict) -> tuple[int, ...] | None:
+    """The prefill token-graph buckets `stated`, {where: buckets or None}, states,
+    None when none states any. Two sets, or some stating them and others not,
+    refuse, naming each."""
     held: dict = {}
-    for file in files:
-        buckets = json.loads(Path(file).read_text()).get(PREFILL_BUCKETS) or ()
-        held.setdefault(tuple(buckets), []).append(str(file))
+    for where, buckets in stated.items():
+        stated_as = None if buckets is None else tuple(buckets)
+        held.setdefault(stated_as, []).append(where)
     if len(held) > 1:
         raise ValueError(
-            "the engine files state other prefill buckets: "
+            "the records state other prefill buckets: "
             + "; ".join(
-                f"{list(b) or 'none'} in {', '.join(f)}" for b, f in held.items()
+                f"{'none' if b is None else list(b)} in {', '.join(f)}"
+                for b, f in held.items()
             )
         )
-    return next(iter(held), ())
+    return next(iter(held), None)
 
 
 def refuse_context_parallel(engine: dict, where: str) -> None:
@@ -1777,18 +1794,21 @@ def main(argv=None) -> None:
         ):
             raise ValueError(f"{record} is not fitted: {built}")
     owns = [Path(r).with_suffix(".engine.json") for r in args.records]
+    stated = {r: stated_buckets(r) for r in args.records}
     if args.engine:
         engine = keyed_of(json.loads(Path(args.engine).read_text()))
-        stated = [args.engine]
         for own in owns:
             raw = json.loads(own.read_text()) if own.exists() else {}
             held = keyed_of(raw)
             refuse_context_parallel(held, str(own))
             if differ := [k for k, v in held.items() if engine.get(k, v) != v]:
                 raise ValueError(f"{own} contradicts {args.engine} in {differ}")
-            stated += [own] * (PREFILL_BUCKETS in raw)
+        given = json.loads(Path(args.engine).read_text()).get(PREFILL_BUCKETS)
+        stated = {args.engine: given} | {
+            r: b for r, b in stated.items() if b is not None
+        }
     else:
-        engine, stated = engine_config(args.records), owns
+        engine = engine_config(args.records)
     dp = join_width(engine)
     options = {"form": args.form, "dp": dp, "moe_routing": args.moe_routing}
     options["buckets"] = recorded_buckets(stated)
@@ -1796,6 +1816,8 @@ def main(argv=None) -> None:
     for record, table in tables.items():
         step_labels.write_table(record, table)
     law, report = fit(samples, options)
+    if options["buckets"] is None:
+        law["unfitted"]["padding"] = NO_BUCKETS
     if any(s.provenance["config"] for s in samples):
         law["host"], law["host_fit"] = fit_host(samples)
     law["machine_spec"] = args.machine_spec
@@ -1811,6 +1833,7 @@ def main(argv=None) -> None:
         mark_held_out(law, report, samples, options)
     Path(args.out).write_text(json.dumps(law) + "\n")
     print(f"cut: {json.dumps(law['cut'])}")
+    print(f"unfitted: {json.dumps(law['unfitted'])}")
     for name, vector in [("prefill", law.get("prefill"))] + list(law["decode"].items()):
         if vector:
             print(

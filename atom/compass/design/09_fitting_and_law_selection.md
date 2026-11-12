@@ -197,7 +197,12 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   none pauses
   ([Ruling](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6702728444)): on
   crsuse2-m2m-v3-005 a pause ran `hipDeviceSynchronize` on its rank, and the peer waited
-  about 107 ms at the drafter's step-begin fence. With both ranks profiled the draft-KV
+  about 107 ms at the drafter's step-begin fence. kineto's ROCm tracer keeps at most
+  `ROCTRACER_MAX_EVENTS` rows a process and drops the rest unmarked: at its default of
+  5,000,000 every rank of a 300 s V4.1-Flash TP4 trace run stopped recording launches
+  and kernels about 150 s in. The driver sets it to its largest, and a trace that lacks a
+  forward's device rows refuses ([#3106](https://github.com/jgong5/ATOM/issues/3106)).
+  With both ranks profiled the draft-KV
   concatenation runs about 6% long; drafter labels keep that, and
   [#2945](https://github.com/jgong5/ATOM/issues/2945) finds its cause. A traced kernel
   shorter than about 4.7 us runs to that floor, so drafter labels stay 5 to 11% over
@@ -395,7 +400,12 @@ fitted on is priced as an extrapolation (D58). Prefill needs no such column: its
 a data-parallel MTP record tests it there.
 
 A prefill vector adds `padding`, `b − tokens`, where the records' engine files state the
-prefill token-graph buckets their runner recorded, and states those buckets. ATOM replays
+prefill token-graph buckets their runner recorded, and states those buckets. A record whose
+engine file predates that field states them in its host key only where its runner wrote graph
+sets there, and the fit reads them there; records stating them nowhere, which may come from a
+runner that captured no prefill graph, fit no `padding`, and the law names that under
+`unfitted`. Fitted so unseen on #2958's records, the vector priced eager bodies 5 to 7% high
+and graph bodies 3 to 7% low ([#3128](https://github.com/jgong5/ATOM/issues/3128)). ATOM replays
 a prefill's first layers as a token graph at `b` rows, the smallest bucket holding the
 most tokens any rank of the DP group scheduled (`BatchView.group_max_tokens`), and runs
 past the largest bucket, or on a step the group splits for two-batch overlap, eagerly,

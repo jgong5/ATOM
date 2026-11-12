@@ -50,7 +50,7 @@ from atom.compass.run.step_grid import keyed_of
 TREE = Path(__file__).resolve().parents[2]
 #: run.json's identity, as `serve` writes it once its server stops.
 IDENTITY = {
-    "host_key": {"model": "sha256:c0f1", "host_cpu": "a host CPU"},
+    "host_key": {"model": "sha256:c0f1", "host_cpu": "a host CPU", "atom": "5ca1"},
     "source": {"revision_kind": "tree", "revision": "5ca1ab1e"},
 }
 #: The default step stub and a constant one, each its own backend.
@@ -237,7 +237,6 @@ def test_a_population_loads_under_its_runs_readings_and_not_another_engine(
     key = trace_steps.publish(out, run, "compass trace steps")
 
     stated = json.loads((out / serve.STEPS / "dp0.engine.json").read_text())
-    source = IDENTITY["source"]
     # The row reads the source, the model and the engine config; the rest is any.
     readings = Conditions.of(
         software_stack="any",
@@ -245,7 +244,7 @@ def test_a_population_loads_under_its_runs_readings_and_not_another_engine(
         device="any",
         ptl="any",
         host_cpu="any",
-        atom_src=Reading(source["revision_kind"], source["revision"]),
+        atom_src=Reading("atom_py", IDENTITY["host_key"]["atom"]),
         model=IDENTITY["host_key"]["model"],
         engine_config=json.dumps(keyed_of(stated), sort_keys=True),
     )

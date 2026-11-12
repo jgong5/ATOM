@@ -7,11 +7,12 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
 
 - The backend, exactly one, each flag named by its `run` run-file key:
   ``--step-stub FILE``, the stated `Coefficients`; ``--step-linear KEY``, a
-  `step_linear_law` entry's params with its key's ``engine_config``;
+  `step_linear_law` entry's params with its key's ``engine_config``, the entry
+  loaded through `ArtifactStore.load` under `law_readings`;
   ``--step-grid KEY``, the store's root and a `step_grid_bundle` entry's key;
   ``--op-graph``, ``true``, and as ``price_list`` the fields of the
   `price_list` key this run's model, parallel layout, machine spec and ATOM
-  tree name, when ``--store`` holds one there.
+  source name, when ``--store`` holds one there.
   A KEY is the token `Key.token` prints, resolved under ``--store``; for
   ``--step-linear`` and ``--host-laws`` a law file `step_linear_fit` writes
   may stand in: its law less ``host`` and ``host_fit``, or its ``host``, each
@@ -48,14 +49,14 @@ from types import SimpleNamespace
 from atom.compass import run
 from atom.compass.artifacts import (
     ArtifactStore,
+    GateState,
     Key,
     Kind,
-    git_tree_root,
     machine_spec_digest,
     member_name,
-    module_root,
 )
 from atom.compass.fit.publish import RANK
+from atom.compass.run.step_grid import readings
 
 #: Each backend flag's store kind; the step stub's coefficients are a file.
 KINDS = {run.STEP_LINEAR: Kind.STEP_LINEAR_LAW, run.STEP_GRID: Kind.STEP_GRID_BUNDLE}
@@ -123,10 +124,12 @@ def build(args, atom_args) -> dict:
                 backends.append(_stated(laws[-1]))
                 continue
             key = store.key_from_token(KINDS[name], token)
-            entry = store.read(key)
             if name == run.STEP_GRID:
+                entry = store.read(key)
                 laws.append({"store": str(store.root), **key.values})
             else:
+                conditions = law_readings(key, machine, atom_args)
+                entry = store.load(key, conditions=conditions, gates=GateState.of())
                 engine_config = json.loads(key.values["engine_config"])
                 laws.append(
                     {**_member(entry, "params"), "engine_config": engine_config}
@@ -183,6 +186,36 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     }
 
 
+def law_readings(key: Key, machine, atom_args):
+    """The readings a run on `machine` from this ATOM source, serving the model
+    ATOM's arguments `atom_args` name, loads the `step_linear_law` at `key`
+    under: its engine config as `key` states it, the one the runner then holds
+    the resolved config to."""
+    return readings(
+        machine,
+        atom_src=run.atom_source(),
+        model=_model_digest(_engine_args(atom_args).model),
+        engine_config=key.values["engine_config"],
+    )
+
+
+def _model_digest(model: str) -> str:
+    """`run._file_digest` of the config.json of the model `model` names, found
+    or fetched as ATOM's loader finds it, so a hub id with no local copy reads
+    the one its server will load; one it cannot find or fetch refuses."""
+    from transformers.utils import cached_file
+
+    try:
+        why = cached_file(model, "config.json") is None and "there is none"
+    except OSError as error:
+        why = error
+    if why:
+        raise ValueError(
+            f"--model {model}: its config.json is neither local nor fetchable: {why}"
+        )
+    return run._file_digest(model, "config.json")
+
+
 def _hops(hosts: list, atom_args) -> dict:
     """The ``hops`` of the entry of `hosts` fitted under the config ATOM's
     arguments `atom_args` resolve, as the runner takes its own; the hops every
@@ -227,12 +260,11 @@ def _backend(entry) -> dict:
 
 def _price_list_key(atom_args, machine) -> Key:
     """The `price_list` key of the model and parallel layout ATOM's arguments
-    serve, on `machine`, from this ATOM tree."""
+    serve, on `machine`, from this ATOM source."""
     engine = _engine_args(atom_args)
-    tree = git_tree_root("atom", module_root("atom"))
     return Key.of(
         Kind.PRICE_LIST,
-        model=run._file_digest(engine.model, "config.json"),
+        model=_model_digest(engine.model),
         dp=engine.data_parallel_size,
         pp=engine.pipeline_parallel_size,
         pcp=engine.prefill_context_parallel_size,
@@ -241,7 +273,7 @@ def _price_list_key(atom_args, machine) -> Key:
         enable_dp_attention=engine.enable_dp_attention,
         decode_context_parallel_size=engine.decode_context_parallel_size,
         machine_spec=machine_spec_digest(machine),
-        source_root=f"{tree.revision_kind}-{tree.revision}",
+        source_root=run.source_root(),
     )
 
 
