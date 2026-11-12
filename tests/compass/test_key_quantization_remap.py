@@ -28,6 +28,10 @@ from atom.compass.run.step_grid import keyed
 from atom.compass.spec import MachineSpec
 
 QWEN35 = pathlib.Path(__file__).with_name("qwen3_5_35b_a3b_fp8_config.json")
+#: Kimi-K2.5-MXFP4's config.json, its excludes cut to the text model's first
+#: layer and the projector: its model class holds its packed modules in a
+#: property, which its text model type replaces in the remap.
+KIMI_K25 = pathlib.Path(__file__).with_name("kimi_k2_5_mxfp4_config.json")
 #: MiniMax-M3's published MXFP4 checkpoint as ATOM serves it, cut as
 #: test_run_modules_minimax_m3 cuts it: the VL architecture, whose excludes
 #: name the text model under ``language_model.`` and its projections unpacked,
@@ -82,15 +86,14 @@ def built(config):
     return held
 
 
-@pytest.fixture(params=["MiniMax-M3", "Qwen3.5"])
+@pytest.fixture(params=["MiniMax-M3", "Qwen3.5", "Kimi-K2.5"])
 def unbuilt(request, tmp_path, monkeypatch):
-    """A TP4 server's config of MiniMax-M3's MXFP4 checkpoint, or of
-    Qwen3.5-35B-A3B's FP8 one, as `compass run` resolves it, unbuilt."""
-    if request.param == "MiniMax-M3":
+    """A TP4 server's config of MiniMax-M3's MXFP4 checkpoint, Qwen3.5-35B-A3B's
+    FP8 one or Kimi-K2.5's MXFP4 one, as `compass run` resolves it, unbuilt."""
+    model = {"Qwen3.5": QWEN35, "Kimi-K2.5": KIMI_K25}.get(request.param)
+    if model is None:
         model = tmp_path / "m3.json"
         model.write_text(json.dumps(M3_VL))
-    else:
-        model = QWEN35
     return served(tmp_path, monkeypatch, "gfx950", model, "-tp", "4")
 
 

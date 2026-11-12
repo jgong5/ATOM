@@ -59,10 +59,10 @@ the grading process: the run checked it against its own as it started, and its
 summary records the digest of the bundle it priced with.
 """
 
-import copy
 import functools
 import json
 import os
+import pickle
 import tempfile
 from collections.abc import Mapping
 from types import FunctionType, SimpleNamespace
@@ -104,7 +104,7 @@ BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
 #: The quantization config's lists of layer names, which its runner remaps.
 LAYERS = ("layer_pattern_specs", "exclude_layers")
 LAYERS += tuple(f"online_{name}" for name in LAYERS)
-#: The arch `remapping` declares: what it reads is a class constant on any arch.
+#: The arch `remapped` declares: what it reads is a class constant on any arch.
 REMAP_ARCH = "gfx950"
 #: The digest of a drafter's config.json, keyed only where it is not the
 #: target's, which every key already holds as its model's.
@@ -160,7 +160,7 @@ def _draft(config, spec) -> dict:
 def quantization(config) -> str:
     """The hash of `config`'s quantization config as its runner holds it, its
     layer names remapped to the model's modules as `ModelRunner.__init__` remaps
-    them before it builds: on a copy where the runner has not, and as it is
+    them before it builds: by `remapped` where the runner has not, and as it is
     where the packed modules the remap leaves on it say it has, since a second
     remap can rename a name again. A config naming no layer, or with no remap,
     has none to apply."""
@@ -170,33 +170,35 @@ def quantization(config) -> str:
         and not hasattr(held, "packed_modules_mapping")
         and any(getattr(held, name) for name in LAYERS)
     ):
-        held = copy.deepcopy(held)
-        architecture = config.hf_config.architectures[0]
-        held.remap_layer_name(config.hf_config, **remapping(architecture))
+        return remapped(pickle.dumps((held, config.hf_config)))
     return held.compute_hash()
 
 
 @functools.cache
-def remapping(architecture: str) -> dict:
-    """The keywords `ModelRunner.__init__` remaps with for the model class of
-    `architecture`, read in a process of its own: the class's module imports
-    aiter, whose probes need a device, here `REMAP_ARCH`."""
+def remapped(pickled: bytes) -> str:
+    """The hash of the quantization config `pickled` with its model's config,
+    remapped as `ModelRunner.__init__` remaps it, in a process of its own: the
+    model class's module imports aiter, whose probes need a device, here
+    `REMAP_ARCH`, and a class may hold its packed modules in a property."""
     from atom.compass.bench.ops import _child
 
-    return _child(_remapping, architecture)
+    return _child(_remapped, pickled)
 
 
-def _remapping(architecture: str) -> dict:
+def _remapped(pickled: bytes) -> str:
     from atom.compass.capture import driverless
 
     with tempfile.TemporaryDirectory(prefix="compass-remap-") as tmpdir:
-        driverless.install(tmpdir, REMAP_ARCH)
+        driverless.install(tmpdir, REMAP_ARCH)  # before anything imports aiter
+        quant, hf_config = pickle.loads(pickled)
         from atom.model_engine.model_runner import support_model_arch_dict
         from atom.utils import resolve_obj_by_qualname
 
-        cls = resolve_obj_by_qualname(support_model_arch_dict[architecture])
+        arch = hf_config.architectures[0]
+        cls = resolve_obj_by_qualname(support_model_arch_dict[arch])
     names = ("packed_modules_mapping", "quant_exclude_name_mapping")
-    return {name: getattr(cls, name, {}) for name in names}
+    quant.remap_layer_name(hf_config, **{n: getattr(cls, n, {}) for n in names})
+    return quant.compute_hash()
 
 
 def keyed_env() -> dict:
