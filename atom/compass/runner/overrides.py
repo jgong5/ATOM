@@ -1515,7 +1515,8 @@ class NonAllocatingRunner(
         on it, so that deployment never starts. The reply still sends `[]` for the batch sizes, since no
         graph exists; the caller only formats it into a log line. The prefill
         token-graph buckets the base's capture would record are stated
-        (`state_prefill_buckets`), so the scheduler and `decide` see them.
+        (`state_prefill_buckets`), so the scheduler and `decide` see them, and
+        the run file's step linear law is held to them (`run.refuse_other_buckets`).
 
         `EngineCore.__init__` reaches this method only when `not enforce_eager
         and not disagg_is_decode`, so on an eager deployment the override never
@@ -1535,6 +1536,9 @@ class NonAllocatingRunner(
             self.config.enable_tbo_decode and not self._tr_hybrid_active()
         )
         buckets = state_prefill_buckets(self)
+        from atom.compass import run
+
+        run.refuse_other_buckets(self.config, buckets)
         logger.info(
             "no cudagraph captured: there are no weights to trace; steps "
             "dispatch on the ladder %s and prefill token-graph buckets %s.",

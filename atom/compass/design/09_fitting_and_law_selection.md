@@ -109,7 +109,11 @@ TP4 run and is refused at any other width, like any other layout field
   [#973](https://github.com/jgong5/ATOM/issues/973#issuecomment-6210598012), 2026-10-16):
   a law at one layout is no evidence about another (`15` D89), so a run under another
   engine config refuses it, naming each field that differs. A law stating `(dp, ep)`
-  is refused, and no store key holding the engine config states `parallel`.
+  is refused, and no store key holding the engine config states `parallel`. The engine
+  config states ATOM's prefill token-graph buckets only off ATOM's default, which moves, so
+  a run whose runner records them also refuses a law whose engine config states none and
+  whose prefill vector (D55) states none or others
+  ([#2862 Ruling](https://github.com/jgong5/ATOM/issues/2862#issuecomment-6785244480)).
 - **Features.** The rank's own batch features (D55), plus two the group decides: the
   DP-unified rung every rank shares, settled by `ForwardMode.decide`, and the MoE row
   count, which the MoE terms read alone. That count is `T_moe` (`BatchView.moe_rows`)
