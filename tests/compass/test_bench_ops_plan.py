@@ -489,11 +489,11 @@ def test_a_planned_prefill_attention_leaf_holds_a_step_s_rows_either_side_of_its
     "tokens, lo, hi, why",
     [
         (120, 0, 1000, ""),  # fresh to 1000 cached, both of one kernel
-        (120, 1000, 2000, "between two kernels"),  # 1000 and 2000 differ
+        (120, 1000, 2000, "outside the measured range"),  # 100 holds no 2000
         (120, 1000, 1000, ""),
         (200, 0, 0, "outside the measured range"),  # past the token counts
         (120, 1000, 5000, "outside the measured range"),  # past the cached counts
-        (60, 1000, 1000, "outside the measured range"),  # 1000 holds no 60
+        (60, 1000, 1000, "between two kernels"),  # 40 holds 0 and 2000, apart
     ],
 )
 def test_a_cached_bracket_holds_between_counts_and_tokens_of_one_kernel(
