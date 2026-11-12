@@ -18,7 +18,9 @@
 #   --agentx         in place of --traces, the defaults of agentx-harness's
 #                    agentx scenario, which InferenceX's agentic submissions
 #                    run, as flags on the base scenario: every trace in TRACES
-#                    (the full-length corpus, not its 256k-capped copy), seed
+#                    (the scenario's is the full-length corpus; a warmup
+#                    request longer than the server's context aborts aiperf's
+#                    run, so a shorter context takes the 256k-capped copy), seed
 #                    42, a trajectory start between 0.25 and 0.75 of each
 #                    trace, 10 warmup requests per lane with 1800 s grace, a
 #                    per-trace idle cap of 300 s, a system idle cap of 10 s and
