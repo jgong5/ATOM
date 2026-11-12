@@ -45,6 +45,11 @@ concrete.
 last step of v1; stage 3c's projection stays frozen as the before side of the method error
 (D95).
 
+**Revised 2026-11-12 by the owner's rulings on
+[#3256](https://github.com/jgong5/ATOM/issues/3256) and
+[#3257](https://github.com/jgong5/ATOM/issues/3257):** *Stage M3-Agentic* simulates ATOM's
+MiniMax-M3 AgentX submission on MI355X and grades it point by point (D95.1).
+
 **Scope.** How the work is organised, allocated and gated; what happens first; and what
 each stage must produce. It is **detailed through M2**. Work after v1 is listed, not
 planned — see *After v1*. Phase 0b's answers can still reshape Waves 4–6, and the plan
@@ -144,6 +149,45 @@ part of v1, added after that
   the nightly configurations run, not projected across width.
 - Target dates live outside the design; the plan stays sized in lines of code, per
   *What this plan does not contain*.
+
+---
+
+## D95.1. The M3-Agentic stage: MiniMax-M3's AgentX submission on MI355X
+
+Owner rulings of 2026-11-12, on [#3256](https://github.com/jgong5/ATOM/issues/3256) for
+the stage and on [#3257](https://github.com/jgong5/ATOM/issues/3257) for its design. The
+stage is named for the model; it is not the retired milestone M3 of D95.
+
+- **Target.** Compass reproduces every point of ATOM's MiniMax-M3 AgentX submission to
+  InferenceX on MI355X, entry `minimaxm3-fp4-mi355x-atom-agentic-mtp` as InferenceX run
+  [37598205362](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37598205362)
+  ran it. #3256 holds its arms, their arguments and concurrencies, and InferenceX's values;
+  this document does not copy them. The 8k/1k and disaggregated MiniMax-M3 entries are out
+  of scope, and MiniMax-M3.1 until ATOM's InferenceX entry for it lands.
+- **The real curve is this branch's ATOM** serving the submission's arguments on
+  mi355-gpu-40, three spaced rounds per point (`08` D45). The submission's own image is
+  not run again and InferenceX's published points are not drawn: Compass grades a
+  simulated run against real runs of its own tree.
+- **Platform.** gpu-40 on `scripts/compass/machines/mi355x-gpu40.json`'s stack (nightly
+  20261026), not InferenceX's nightly 20261007; each registration states it.
+- **One frozen commit.** Calibration and every graded run use the commit frozen at
+  #3266's first registration. A later ATOM change re-keys the laws
+  ([#2350](https://github.com/jgong5/ATOM/issues/2350)), so moving needs a new
+  registration.
+- **What Compass adds for it:** EAGLE3 (`14` D87.1), ATOM's `lmcache_offload` connector
+  (`03` D13.1), InferenceX's `agentx` client (`06` D35.1) and the overlap criterion that
+  grades each point (`08` D45.1).
+- **Memory readings per point.** `--max-num-seqs` is twice the concurrency, and a
+  readings entry is keyed by the scheduler's bounds (`run/memory.py::key_fields`), so
+  each point takes its own entry.
+- **Laws per arm:** one step linear law each for TP4, TP4 with indexer CP and TP2,
+  fitted on records from that arm's points. The LMCache arms reuse the TP2 and the TP4
+  indexer-CP laws with the offload terms of `03` D13.1. A law's key holds the capture
+  ladder (`run/step_grid.py::keyed`), which ATOM clips at `--max-num-seqs`, so how one
+  law serves its arm's other points is
+  [#3275](https://github.com/jgong5/ATOM/issues/3275)'s ruling. An indexer-CP arm's law
+  waits on #3054's indexer-CP key, without which its runs would read a law fitted
+  without indexer CP.
 
 ---
 
@@ -738,6 +782,32 @@ still open at exit loses `e2e-stage4`:
 | **S4.20** | The step grid graded on the MI455 cells ([#2153](https://github.com/jgong5/ATOM/issues/2153)) | `scripts/compass/` | ~10 | S4.19 and the issues it cuts, S4.9, S4.10 |
 | **S4.21** | `measure ops` on MI455 ([#2154](https://github.com/jgong5/ATOM/issues/2154)) | `bench/` | 30–80 | S4.15, GPU queue |
 | **S4.22** | The op-level empirical backend graded on the MI455 cells (`08` D50.3; [#2155](https://github.com/jgong5/ATOM/issues/2155)) | `scripts/compass/` | ~10 | S4.21, S3d.10, S3d.11, S4.9, S4.10 |
+
+### Stage M3-Agentic — MiniMax-M3's AgentX submission on MI355X
+
+Tracked on [#3256](https://github.com/jgong5/ATOM/issues/3256) and ruled there and on
+#3257 on 2026-11-12 (D95.1). Every issue carries `M3-Agentic`; #3256 holds the stage's
+coordination on gpu-40 and the work outside the stage that it waits on.
+
+| ID | Task | Module | Effort | Depends on |
+|---|---|---|---|---|
+| **MA.1** | The design text ([#3257](https://github.com/jgong5/ATOM/issues/3257)) | design | 200–300 design text | — |
+| **MA.2** | MiniMax-M3 served on gpu-40 with the submission's arguments, every arm ([#3258](https://github.com/jgong5/ATOM/issues/3258)) | none, results on the issue | 0 | GPU queue |
+| **MA.3** | `compass run --check` on gpu-40's platform lacking only the stage's own records ([#3259](https://github.com/jgong5/ATOM/issues/3259)) | none, results on the issue | 0 | — |
+| **MA.4** | A fractional forced acceptance length through record, fit and run ([#3260](https://github.com/jgong5/ATOM/issues/3260)) | `runner/` | up to 50 | — |
+| **MA.5** | The `agentx` client, its per-trace idle cap on the Compass clock (`06` D35.1; [#3261](https://github.com/jgong5/ATOM/issues/3261)) | `compass_harness/`, `scripts/compass/` | 100–200 | MA.1 |
+| **MA.6** | EAGLE3 run, recorded and priced (`14` D87.1; [#3262](https://github.com/jgong5/ATOM/issues/3262)) | `runner/`, `backends/`, `run/` | 150–300 | MA.1 |
+| **MA.7** | The `lmcache_offload` connector simulated (`03` D13.1; [#3263](https://github.com/jgong5/ATOM/issues/3263)) | `kv/`, `run/`, `backends/` | 300–500 | MA.1 |
+| **MA.8** | Real and simulated curves drawn, with a verdict per point (`08` D45.1; [#3264](https://github.com/jgong5/ATOM/issues/3264)) | `validate/` | 150–250 | MA.1 |
+| **MA.9** | The small case, TP4 at concurrency 1 and 4 for 600 s ([#3265](https://github.com/jgong5/ATOM/issues/3265)) | none, results on the issue | 0 | MA.2–MA.6 |
+| **MA.10** | Calibration: memory readings at every point, a law per arm and the offload terms ([#3266](https://github.com/jgong5/ATOM/issues/3266)) | `scripts/compass/laws/` | ~10 | MA.9, MA.7, #3054 |
+| **MA.11** | Cell A, TP4 ([#3267](https://github.com/jgong5/ATOM/issues/3267)) | `scripts/compass/` | ~10 | MA.10, MA.8 |
+| **MA.12** | Cell B, TP4 with indexer CP ([#3268](https://github.com/jgong5/ATOM/issues/3268)) | `scripts/compass/` | ~10 | MA.10, MA.8, #3054 |
+| **MA.13** | Cell C, TP2 ([#3269](https://github.com/jgong5/ATOM/issues/3269)) | `scripts/compass/` | ~10 | MA.10, MA.8 |
+| **MA.14** | Cell D, TP2 with LMCache ([#3270](https://github.com/jgong5/ATOM/issues/3270)) | `scripts/compass/` | ~10 | MA.10, MA.8, MA.7 |
+| **MA.15** | Cell E, TP4 with indexer CP and LMCache ([#3271](https://github.com/jgong5/ATOM/issues/3271)) | `scripts/compass/` | ~10 | MA.10, MA.8, MA.7, #3054 |
+
+**Exit:** MA.11 to MA.15 closed, each with a chart that meets `08` D45.1 at every point.
 
 ---
 

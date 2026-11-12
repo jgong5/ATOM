@@ -2338,8 +2338,9 @@ PCP, DP across hosts, `engine_driven`, more than one server) stand as they are. 
 stand-in refuses a server flag or request type it does not model, by name, and the shell
 refuses a server URL that `RequestClientFactory` hands to gRPC (`grpc://`,
 `grpc+unix://`), a carrier with no wrapped socket, by its scheme. A `multi`
-connector runs only when each sub-connector is simulated (`compass` and `lmcache_mp`);
-`ATOM_KV_OFFLOAD=lmcache` (in-process, no server) and `mooncake_store` stay refused.
+connector runs only when each sub-connector is simulated (`compass`, `lmcache_mp`, and
+`lmcache_offload`, which `ATOM_KV_OFFLOAD=lmcache` selects, by `03` D13.1);
+`mooncake_store` stays refused.
 
 **Acceptance**, per #1076's ruling:
 
