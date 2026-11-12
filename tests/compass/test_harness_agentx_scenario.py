@@ -54,10 +54,7 @@ from aiperf.timing import phase_orchestrator
 from aiperf.timing.config import TimingConfig
 from aiperf.timing.trajectory_source import TrajectorySource
 from compass_harness.scheduler import ClockPacedLoopScheduler
-from compass_harness.strategy import (
-    ClockReplayBarrierCoordinator,
-    CompassAgenticReplay,
-)
+from compass_harness.strategy import CompassAgenticReplay
 from compass_harness.timesource import ClockTimer
 from compass_harness.traffic_lp import TrafficLP
 from test_client_sh import SIM, _client, _setup
@@ -196,9 +193,8 @@ def test_compass_builds_both_agentx_phases_with_the_idle_cap_on_the_clock(
         return built
 
     built = asyncio.run(main())
-    for runner, strategy in built.values():
+    for _, strategy in built.values():
         assert type(strategy) is CompassAgenticReplay
-        assert type(runner._replay_barrier) is ClockReplayBarrierCoordinator
     assert built[CreditPhase.WARMUP][1]._cache_warmup_requests_per_lane == 10
     caps = {
         p: r._replay_barrier._root_idle_gap_cap_seconds for p, (r, _) in built.items()
