@@ -347,11 +347,11 @@ def test_a_mori_exchange_at_gathered_rows_spans_the_ep_width(call):
     assert c.ranks == DP
 
 
-def test_a_gather_s_pad_rows_activate_experts_as_one_token():
+def test_a_gather_s_pad_rows_route_to_no_expert():
     # Sixteen rows gathered over the group, five of them real tokens.
     padded = BatchView(
         (RequestShape(1, 9, True),), capture_rung=2, moe_rows=16, moe_tokens=5
     )
-    hit = activated_experts(16, 2, 6)
+    hit = activated_experts(16, 2, 5)
 
-    close(work(moe(16, 16), padded, 1, "bf16"), experts(16, 32, hit))
+    close(work(moe(16, 16), padded, 1, "bf16"), experts(16, 10, hit))

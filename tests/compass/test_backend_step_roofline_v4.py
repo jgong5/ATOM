@@ -125,11 +125,11 @@ def test_the_routed_experts_and_their_exchange_by_hand(spec):
     assert _price([fp4], step, spec)["roofline.moe"] == pytest.approx(
         _module(experts, spec) + gather + scatter
     )
-    # A graph's pad rows all carry one token: 6 real tokens and the pad reach
-    # the experts, every row still computed.
+    # A gather's pad rows route to no expert: its 6 real tokens reach the
+    # experts, the exchanges still moving every row.
     padded = BatchView(step.requests, moe_rows=rows, moe_tokens=6)
-    hit7 = activated_experts(8, 2, 7)
-    experts = Work({"bf16": 2 * 20 * (32 + 16) * 32}, hit7 * 816 + rows * 144)
+    hit6 = activated_experts(8, 2, 6)
+    experts = Work({"bf16": 2 * 12 * (32 + 16) * 32}, hit6 * 816 + 6 * 144)
     assert _price([ep_off], padded, spec)["roofline.moe"] == pytest.approx(
         _module(experts, spec) + gather + scatter
     )
