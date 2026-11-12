@@ -974,6 +974,42 @@ def test_each_copy_of_a_v41_index_scorer_writes_a_logits_plane_of_its_own():
     assert len({plane.data_ptr() for plane in planes}) == 3
 
 
+@pytest.mark.parametrize(
+    "bounds, copies, buffers",
+    [([100, 120, 110, 120], 11, 2), ([1000, 20, 20, 20], 2, 2)],
+    ids=["rows_alike", "one_long_row"],
+)
+def test_a_v41_plane_counts_and_copies_the_columns_below_its_rows_bounds(
+    bounds, copies, buffers
+):
+    # a top-k's FP8 plane, [4, 1024] float32, beside its 32-byte bounds, at
+    # twice a cache of 20000 bytes: 8 copies of rows alike share a buffer,
+    # 128 columns apart, but a row 1000 long's buffers bound its copies
+    runner = _Runner()
+    geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(4, 1024)
+    runner.forward_vars["ends"] = torch.tensor(bounds)
+    plane, ends = _t([4, 1024], "metadata"), _t([4], "metadata", dtype="torch.int64")
+    top_k = _leaf(ops._TOPK, ("logits", plane), ("row_ends", ends))
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(top_k, layers=1)["region"])
+    stub._prepare((0, 0))
+    [(sig, (op, instances))] = stub.leaves.items()
+
+    n, size, _, _ = stub._plan(op, instances, {}, 4, 4, sig=sig, decode=True)
+    planes = [stub._copy(op, sig, instances, c)[0]["logits"] for c in range(n)]
+
+    assert (n, size) == (copies, 4 * sum(bounds) + 32)
+    assert len({p.untyped_storage().data_ptr() for p in planes}) == buffers
+    reach = list(enumerate(bounds))
+    assert all(p[r, :b].ne(0).all() for p in planes for r, b in reach)
+    for c, p in enumerate(planes):  # no copy reaches another's columns
+        for r, b in reach:
+            p[r, :b] = c
+    assert all(p[r, :b].eq(c).all() for c, p in enumerate(planes) for r, b in reach)
+
+
 def test_an_embedding_reads_the_token_ids_atom_prepared():
     runner = _Runner()
     # An index buffer whose name holds the slot's, which the name rule picks.
