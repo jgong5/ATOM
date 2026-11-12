@@ -20,7 +20,8 @@ its `group_max_tokens` is the most tokens their lines at its step run
 (`group_peaks`).
 A view also takes its line's `target_bs`, `draft_bs`, `draft_moe_rows` and
 `draft_rows`, the widths and rows its target and drafter ran at, which an op
-graph reads.
+graph reads, and its `group_needs_eager`, which a line states only where it is
+true, so a record written before the field reads false throughout.
 
 A decode step's device label is its device busy time, `d_busy_ns`, plus the
 device work queued since the previous forward's exit, `d_gap_ns`. A decode step
@@ -575,6 +576,7 @@ def _label(
             dp_rank=s["dp_rank"] if dp else None,
             group_dummies=dummy_ranks.get(s["step"], 0) if dp else 0,
             group_max_tokens=peaks.get(s["step"]) if dp else None,
+            group_needs_eager=s.get("group_needs_eager", False),
         )
         cut = None
         if view.prefill and view.decode:

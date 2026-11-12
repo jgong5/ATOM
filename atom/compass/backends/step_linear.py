@@ -22,8 +22,8 @@ Last, a prefill vector may add `padding`, the rows its token graph runs past
 the step's tokens (`token_padding`): ATOM replays a prefill's first layers at
 the smallest of the vector's `buckets`, the prefill token-graph buckets the
 runner recorded, that holds the most tokens any rank of the data-parallel group
-scheduled. A data-parallel step stating no `group_max_tokens` is refused, and a
-vector with a `padding` coefficient states its `buckets`.
+scheduled. A data-parallel step it pads stating no `group_max_tokens` is
+refused, and a vector with a `padding` coefficient states its `buckets`.
 
 A law prices one rank's step; the runner takes the group's step as the max
 over its ranks. Its parallel layout is its `engine_config`'s, which a run
@@ -226,11 +226,12 @@ def moe_column(
 def token_padding(view: BatchView, buckets: tuple[int, ...]) -> int | None:
     """The rows `view`'s prefill token graph runs past its tokens: the smallest
     of `buckets`, ascending, that holds its group's `group_max_tokens` (on one
-    rank its own tokens), less its own; 0 past the largest and on a step the
-    group split for two-batch overlap, both of which ATOM runs eagerly
+    rank its own tokens), less its own; 0 past the largest, on a step the
+    group split for two-batch overlap and on one an attention backend refuses
+    a graph for (`group_needs_eager`), all of which ATOM runs eagerly
     (`ForwardMode._pad_to_token_graph`). None for a data-parallel view
     stating no `group_max_tokens`."""
-    if view.tbo_tokens:
+    if view.tbo_tokens or view.group_needs_eager:
         return 0
     tokens = sum_tokens(view.requests)
     peak = tokens if view.moe_rows is None else view.group_max_tokens
