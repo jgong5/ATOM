@@ -1718,10 +1718,14 @@ def test_a_v41_attention_reads_the_pool_rows_its_pass_s_selection_names():
     } == {4: 12 * 16, 1: 8 * 16}
 
 
-@pytest.mark.parametrize("spans", [((1199, 4),), ((0, 3), (8190, 6)), ((9000, 300),)])
+@pytest.mark.parametrize(
+    "spans",
+    [((1199, 4),), ((0, 3), (8190, 6)), ((1199, 4), (1199, 4)), ((9000, 300),)],
+)
 def test_the_host_s_spread_counts_the_rows_the_bench_s_candidates_keep(spans):
     # `_spread` off each request's (first position, rows), against the ids
-    # `_candidates` keeps over the rows' visible rows, a request's apart
+    # `_candidates` keeps over the rows' visible rows, a request's apart: two
+    # requests at the same rows name theirs twice
     ratio, k = 4, 16
     positions = torch.cat([torch.arange(p, p + n) for p, n in spans])
     ids = ops._candidates((positions + 1) // ratio, k).long()
