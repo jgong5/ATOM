@@ -7,7 +7,8 @@
 # Usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop]
 #        client.sh OUT --sweep --traces A-B --stop
 #   OUT              the server's --out, whose server.json names its URL and,
-#                    for a simulated server, its run file
+#                    for a simulated server, its run file; a deploy.sh OUT's
+#                    prefill/server.json names its prefill instance's URL
 #   --traces A-B     TRACES' traces A to B, each counted from 0
 #   --concurrency C  aiperf --concurrency
 #   --duration S     aiperf --benchmark-duration, seconds on the server's clock
@@ -92,7 +93,7 @@ curl -sf --max-time 10 "$url/health" >/dev/null || fail "server: $url/health doe
 compass_env "$ROOT"
 export PYTHONPATH=$ROOT:$ROOT/compass_harness
 compass_require_tree "$ROOT" || exit $?
-unset ATOM_COMPASS_RUN ATOM_COMPASS_CLOCK_ENDPOINT
+unset ATOM_COMPASS_RUN ATOM_COMPASS_CLOCK_ENDPOINT COMPASS_HARNESS_PREFILL_URL
 
 stop_server() {
     # The command that started the server is its parent.
@@ -143,6 +144,14 @@ print(*(p.value for p in e(group="aiperf.plugins")))') ||
 if [[ -n $run_file ]]; then
     [[ $plugins == *compass_harness* ]] || fail "harness: the server is simulated, and $HARNESS_PYTHON has no compass-harness installed"
     export ATOM_COMPASS_RUN=$run_file
+    # deploy.sh's prefill instance: behind a router that is no LP, the traffic
+    # LP posts each cancel there (compass_harness/traffic_lp.py).
+    if [[ -s $OUT/prefill/server.json ]]; then
+        COMPASS_HARNESS_PREFILL_URL=$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1]))["url"])' "$OUT/prefill/server.json") ||
+            fail "server: $OUT/prefill/server.json names no url"
+        export COMPASS_HARNESS_PREFILL_URL
+    fi
     aiperf=(-m aiperf)
 else
     [[ $plugins != *compass_harness* ]] || fail "harness: the server is real, and $HARNESS_PYTHON has compass-harness installed"
