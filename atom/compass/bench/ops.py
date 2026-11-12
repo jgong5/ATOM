@@ -117,7 +117,7 @@ a drafter is one a token. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
 copies: N built ones: M, the least count whose bytes pass `COLD` times the
-last-level cache, but for that plane where its copies' buffers pass it,
+last-level cache, but for that plane where its copies' buffers pass it twice,
 raised for a context key to its I instances (at most K),
 then, up to the leaf's occurrences when it takes a weight other than a
 gathered table (at most K), copy
@@ -265,7 +265,7 @@ PROG = "compass measure ops"
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 31
+PROTOCOL = 32
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -1496,9 +1496,9 @@ class Stub:
                     read = torch.Size(op["args"][ids]["shape"]).numel()
                 entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
                 nbytes = entry * min(read, s["shape"][0])
-            if plane := self._plane(op, sig, slot):  # its copies' buffers too
+            if plane := self._plane(op, sig, slot):  # buffers: 2 * COLD * llc
                 reach, _, k, held = plane
-                nbytes, most = reach * itemsize, k * self._cold(held * itemsize)
+                nbytes, most = reach * itemsize, k * self._cold(held * itemsize // 2)
             if s["role"] == "kv":
                 # ponytail: its widest-strided dim taken as blocks or state slots,
                 # or plane rows when the leaf states its layer's attention geometry;
