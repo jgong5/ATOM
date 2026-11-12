@@ -145,6 +145,10 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
         "when measure memory published its entry, for the entry's provenance; it "
         "starts a real engine and never runs inside a simulated run"
     ),
+    "atom/compass/drive/measure_device.py": (
+        "when measure device published its record, for the entry's provenance; "
+        "it probes real devices and never runs inside a simulated run"
+    ),
     "atom/compass/drive/pp_probe.py": (
         "the PP carrier probe's send and receive stamps, on the monotonic clock "
         "both its ranks share; it times two real devices and never runs inside "

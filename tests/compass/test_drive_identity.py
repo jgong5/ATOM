@@ -273,7 +273,10 @@ def test_a_ptl_watch_names_each_change_from_when_its_file_exists(
             if (tmp_path / "read").exists():
                 break
             time.sleep(0.01)
-        enable[1].write_text("enabled\n")
+        # Renamed over whole, so no reading finds the file empty, as on sysfs.
+        staged = enable[1].with_name("ptl_enable.new")
+        staged.write_text("enabled\n")
+        staged.replace(enable[1])
 
     assert [(c["from"], c["to"]) for c in changes] == [("disabled", to)]
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", changes[0]["at"])

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """`compass measure ops` rehearsed off the card, each leaf up to its launch.
 
-    python v41_ops_rehearsal.py OUT [--kinds] [--drafter] [--arch ARCH]
-        <measure ops args> -- <ATOM args>
+    python v41_ops_rehearsal.py OUT [--kinds] [--drafter] [--only OP]
+        [--arch ARCH] <measure ops args> -- <ATOM args>
 
 `measure ops`' own arguments but `--gpu` and `--out`. The process declares
 card 0 of the MI455 A0 node as it read (`test_capture_mi455_cells.A0`), or
@@ -20,7 +20,8 @@ and keys its arguments as Triton does, a tensor as an aligned pointer, and
 launches nothing. A FlyDSL launch and a compiled operator's are not typed.
 With `--kinds` a graph keeps its first leaf of each operator, as a card run of
 one leaf an op kind takes them. With `--drafter` a shape's leaves are those of
-its drafter's graphs alone (`ops.leaves_at`).
+its drafter's graphs alone (`ops.leaves_at`). With `--only` they are OP's
+alone, as a round of `measure ops --plan` keeps the families it wants.
 
 The fake mode stands in for the device where the bench reads it: the
 runner's checkpoint is ATOM's empty dummy, as a capture's is; a router's
@@ -310,8 +311,11 @@ def main(out, argv) -> None:
     from atom.model_engine.model_runner import DeviceMemoryReadings, ModelRunner
     from atom.utils import h2d
 
-    kinds, drafter = "--kinds" in argv, "--drafter" in argv
+    kinds, drafter, only = "--kinds" in argv, "--drafter" in argv, None
     argv = [a for a in argv if a not in ("--kinds", "--drafter")]
+    if "--only" in argv:
+        at = argv.index("--only")
+        only, argv = argv[at + 1], argv[:at] + argv[at + 2 :]
     cut = argv.index("--")
     args = ops._parser().parse_args([*argv[:cut], "--gpu", "0", "--out", out])
     shapes = [decode(w) for w in args.width] + [prefill(*s) for s in args.prefill]
@@ -325,7 +329,10 @@ def main(out, argv) -> None:
         held = ops.leaves_at(store, config, shape).items()
         return {sig: leaf for sig, leaf in held if leaf[0].get("drafted")}
 
-    todo = [(s, args.context, keep(found(s))) for s in shapes]
+    def of(found):
+        return {s: leaf for s, leaf in found.items() if only in (None, leaf[0]["op"])}
+
+    todo = [(s, args.context, of(keep(found(s)))) for s in shapes]
     pc = config.parallel_config
     driverless.group(config.tensor_parallel_size, pc.data_parallel_size)
     set_current_atom_config(config)
