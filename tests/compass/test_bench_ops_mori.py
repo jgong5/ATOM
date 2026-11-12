@@ -85,24 +85,25 @@ class _Handle:
     """MORI's handle as its kernels keep state: a dispatch refuses to follow one
     no combine has followed, and adds the rows its peers sent to the count; a
     combine reduces onto the last dispatch's ids, copies the counted rows of
-    its input and zeroes the count."""
+    its input and zeroes the count. It sends rows in `wire`, built for HIDDEN
+    values a row, which a packed wire holds in fewer columns."""
 
-    config = SimpleNamespace(
-        world_size=RANKS,
-        hidden_dim=HIDDEN,
-        num_experts_per_token=TOP_K,
-        data_type=torch.float8_e4m3fn,
-        scale_dim=2,
-        scale_type_size=4,
-    )
-
-    def __init__(self, device):
-        self.device, self.count = device, _Count(device)
+    def __init__(self, device, wire=torch.float8_e4m3fn, columns=HIDDEN):
+        self.config = SimpleNamespace(
+            world_size=RANKS,
+            hidden_dim=HIDDEN,
+            num_experts_per_token=TOP_K,
+            data_type=wire,
+            scale_dim=2,
+            scale_type_size=4,
+        )
+        self.device, self.count, self.columns = device, _Count(device), columns
         self.ids, self.open, self.sent, self.routed = None, False, [], []
 
     def dispatch(self, input, weights, scales, indices, **launch):
         assert not self.open, "a dispatch before the last one's combine"
-        assert input.shape == (ROWS, HIDDEN) and input.dtype == torch.float8_e4m3fn
+        assert input.shape == (ROWS, self.columns)
+        assert input.dtype == self.config.data_type
         assert weights.shape == (ROWS, TOP_K) and weights.dtype == torch.float32
         assert scales.shape == (ROWS, 2) and scales.element_size() == 4
         assert ((0 <= indices) & (indices < EXPERTS)).all()
@@ -279,3 +280,21 @@ def test_no_mori_handle_refuses_naming_what_atom_builds(monkeypatch):
     stub, _ = _stub(monkeypatch, None, moe=False)
     with pytest.raises(ValueError, match="no MoE layer"):
         _time(stub, DISPATCH, _Device())
+
+
+@pytest.mark.parametrize("op", [DISPATCH, COMBINE], ids=["dispatch", "combine"])
+def test_a_packed_fp4_wire_holds_two_values_a_column(monkeypatch, op):
+    # ATOM_MORI_FP4_DISPATCH: ATOM builds the handle for the hidden size, and
+    # the dispatch sends its rows as float4_e2m1fn_x2, two values a column.
+    device, fp4 = _Device(), torch.float4_e2m1fn_x2
+    handle = _Handle(device, fp4, HIDDEN // 2)
+    stub, _ = _stub(monkeypatch, SimpleNamespace(_mori_ops=[handle]))
+    packed = _spec([ROWS, HIDDEN // 2], "torch.float4_e2m1fn_x2")
+    leaf = op["op"].rsplit(".", 1)[1]
+    if leaf == "dispatch":
+        op = {**op, "args": op["args"] | {"input": packed}}
+
+    record = _time(stub, op, device)
+
+    assert record["cold_ns"] == COST[leaf]
+    assert {(t.shape, t.dtype) for t in handle.sent} == {((ROWS, HIDDEN // 2), fp4)}

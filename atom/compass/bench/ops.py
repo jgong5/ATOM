@@ -597,6 +597,8 @@ SNAPSHOTS = "v_cache"
 SEED = 0
 #: An integer dtype of each element size, which compares a tensor's bits.
 BITS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+#: The values an element of a packed dtype holds, by dtype; one elsewhere.
+PACKED = {torch.float4_e2m1fn_x2: 2}
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
 RANK = Topology().ranks()[0]
 #: The runner's metadata builders the KV allocation may bind on: DeepSeek-V4.1's
@@ -1867,7 +1869,7 @@ class Stub:
         model's first MoE layer, as its loader's `init_prepare_finalize`
         builds it, once; refused by name where ATOM builds none, or one for
         another EP width, hidden size or count of experts a token than the
-        leaf states."""
+        leaf states, its hidden size the values a row of its `input` holds."""
         from atom.model_ops.moe import FusedMoEMethodBase
 
         if self.mori is None:
@@ -1896,10 +1898,10 @@ class Stub:
             self.mori = made, method.moe.in_dtype
         made, dtype = self.mori
         handle, args = made._mori_ops[0], op["args"]
-        c = handle.config
+        c, sent = handle.config, args["input"]
         built = c.world_size, c.hidden_dim, c.num_experts_per_token
-        stated = args["num_ep_ranks"], args["input"]["shape"][1]
-        stated += (args["indices"]["shape"][1],)
+        hidden = sent["shape"][1] * PACKED.get(_dtype(sent["dtype"]), 1)
+        stated = args["num_ep_ranks"], hidden, args["indices"]["shape"][1]
         if built != stated:
             raise ValueError(
                 f"ATOM builds MORI's handle for (EP ranks, hidden, experts a "
@@ -2618,14 +2620,17 @@ class _Mori:
 
     def _sent(self, kwargs) -> dict:
         """The dispatch whose rows a combine's `kwargs` reduce: its ids, and
-        zeros at the handle's format, its scales by their byte size."""
+        zero bits at the handle's format, a packed one's values packed, its
+        scales by their byte size."""
         c, ids = self.handle.config, kwargs["indices"]
         zeros = functools.partial(torch.zeros, device=ids.device)
         scales = None
         if c.scale_dim:
             scales = zeros(len(ids), c.scale_dim, dtype=BITS[c.scale_type_size])
+        width = c.hidden_dim // PACKED.get(c.data_type, 1)
+        sent = zeros(len(ids), width, dtype=BITS[c.data_type.itemsize])
         return kwargs | {
-            "input": zeros(len(ids), c.hidden_dim, dtype=c.data_type),
+            "input": sent.view(c.data_type),
             "weights": zeros(ids.shape, dtype=torch.float32),
             "scales": scales,
         }
