@@ -10,6 +10,7 @@ terms. The tier tests drive one rank's tier under ATOM's SLRU policy, and the
 fit test fits an entry on log lines written here.
 """
 
+import argparse
 import json
 import math
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from atom.compass.backends import StepStubBackend
 from atom.compass.backends.step_linear_fit import fit_offload
 from atom.compass.clock import ClockAuthority
 from atom.compass.clock_transport import connect, serve
+from atom.compass.drive import runfile
 from atom.compass.kv import SimulatedKVConnector
 from atom.compass.kv.lmcache_offload import (
     ENTRY,
@@ -290,6 +292,21 @@ def test_the_compass_runner_builds_the_worker_half_that_moves_nothing(monkeypatc
     runner_.config = _config({"kv_connector": "mooncake"})
     with pytest.raises(RunnerRefusal, match="'lmcache_mp' and 'lmcache_offload'"):
         runner_.allocate_kv_cache(100)
+
+
+def test_compass_run_writes_the_entry_its_flag_names(tmp_path):
+    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
+    (tmp_path / "stub.json").write_text(json.dumps({"decode_step": 0.01}))
+    (tmp_path / "entry.json").write_text(json.dumps(_entry()))
+    parser = argparse.ArgumentParser()
+    runfile.add_arguments(parser)
+    args = parser.parse_args(
+        ["--step-stub", str(tmp_path / "stub.json")]
+        + ["--machine", str(tmp_path / "machine.json")]
+        + ["--store", str(tmp_path / "store")]
+        + ["--lmcache-offload", str(tmp_path / "entry.json")]
+    )
+    assert runfile.build(args, ["--model", str(tmp_path)])[ENTRY] == _entry()
 
 
 def _slru(slots):
