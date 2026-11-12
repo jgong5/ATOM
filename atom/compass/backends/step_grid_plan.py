@@ -38,7 +38,9 @@ B nodes at the previous rung + 1, at the rung, and at each B between them that
 a step on the rung reaches past the rung's KV limit; its c nodes add each B
 node's KV limit, `block size * (num_kvcache_blocks // B) - N_Q - lookahead`,
 and `max_model_len - N_Q`; the decode grid records that pool, with the
-lookahead, which a lookup extrapolates past, and the draft width K.
+lookahead, which a lookup extrapolates past, and the draft width K. Both
+`max_model_len` nodes are also less the lookahead, which a row's blocks hold
+in the `ceil(max_model_len / block size)` columns of ATOM's block table.
 
 It then plans every corner of each step's cell, widened by `margin` nodes on
 every axis and to `margin` rungs either side, each such rung at all its B
@@ -47,12 +49,12 @@ row's cached context, which the lookup also reads; and, on any rung between
 two planned rungs, its B nodes at its c nodes spanning those planned, since a
 bundle whose measured rungs skip one of the ladder's does not load. A point
 that is no batch the target runs is not planned: B above `max_num_seqs`, T
-above `max_num_batched_tokens`, T not a multiple of B or below it, c + N_Q
-above `max_model_len`, or more KV blocks than the block count. B rows hold
-B * ceil((c + N_Q + lookahead) / block size) blocks; past the count, a
-decode point's rows share the fewest leading blocks that bring them into it,
-as a server's prefix cache lets rows share, and its line states them as
-`shared`; they are full blocks of the cached context, so at most
+above `max_num_batched_tokens`, T not a multiple of B or below it, c + N_Q +
+lookahead above `max_model_len`, or more KV blocks than the block count.
+B rows hold B * ceil((c + N_Q + lookahead) / block size) blocks; past the
+count, a decode point's rows share the fewest leading blocks that bring them
+into it, as a server's prefix cache lets rows share, and its line states them
+as `shared`; they are full blocks of the cached context, so at most
 floor(c / block size).
 
 `plan` also takes ragged views (`measure steps --ragged`), named lines as the
@@ -206,8 +208,8 @@ def _infeasible(target: dict, b: int, t: int, c: int, prefill: bool) -> str:
         (t < b, f"T {t} is below B {b}, under one token a row"),
         (t % b, f"N_Q = T/B = {t}/{b} is not an integer"),
         (
-            c + n_q > target["max_model_len"],
-            f"c + N_Q {c + n_q} is above max_model_len",
+            held > target["max_model_len"],
+            f"c + N_Q + lookahead {held} is above max_model_len",
         ),
         (
             blocks > target["num_kvcache_blocks"],
@@ -234,15 +236,16 @@ def _layout(definition: dict, b_nodes: dict) -> dict:
     nodes past a bound dropped and the bounds added: the token budget T's top,
     ``max_num_seqs`` B's and ``max_model_len`` less the budget c's for
     prefill; per decode rung, each B node's KV limit and ``max_model_len``
-    less the decode width as c nodes, and the KV pool they come from."""
+    less the decode width as c nodes, and the KV pool they come from; both
+    ``max_model_len`` nodes less the lookahead too."""
     budget = definition["max_num_batched_tokens"]
     tops = {
         "B": definition["max_num_seqs"],
         "T": budget,
-        "c": definition["max_model_len"] - budget,
+        "c": definition["max_model_len"] - budget - definition["lookahead"],
     }
     drafts, ahead = definition["draft_width"], definition["lookahead"]
-    c, top = definition["decode"]["c"], definition["max_model_len"] - drafts - 1
+    c, top = definition["decode"]["c"], definition["max_model_len"] - drafts - 1 - ahead
     return {
         **({"draft_width": drafts} if drafts else {}),
         "graph_mode": "replay",
@@ -333,10 +336,11 @@ def plan(definition: dict, steps, engines: dict, views=()) -> dict:
     odd = [n for n in counts if type(n) is not int or n < 0]
     if odd:
         raise ValueError(f"the grid definition's or engine's {odd[0]!r} is not a count")
-    if definition["max_model_len"] < definition["max_num_batched_tokens"]:
+    room = definition["max_model_len"] - definition["lookahead"]
+    if room < definition["max_num_batched_tokens"]:
         raise ValueError(
-            "the engine's max_model_len is below its max_num_batched_tokens, so "
-            "prefill's top c node, max_model_len less the token budget, would "
+            "the engine's max_model_len is below its max_num_batched_tokens and "
+            "lookahead, so prefill's top c node, max_model_len less both, would "
             "be negative"
         )
     margin = definition["margin"]
