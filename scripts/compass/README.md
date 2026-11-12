@@ -1175,9 +1175,13 @@ pin processes that run at once to cores with `taskset`.
   run's prefill side holds far more shapes than its decode side, whose steps pad to the
   ladder's rungs. A store refuses a second publish of one key, so trace each record into a
   store of its own, then copy into `S` each entry it lacks, once no other process
-  publishes into `S`. A trace builds the model without its weights, and a graph keys
-  `config.json`'s digest, not its path: a container that does not mount the model, such as
-  a CPU gate container, traces from a copy of the model's directory less its weight files.
+  publishes into `S`. For the same reason a trace cut short cannot be resumed into its
+  store: split a record whose trace would run for hours, a c=64 or 256 prefill side, by
+  step into part records, every rank's line of a step in one part, and trace each part
+  into a store of its own; together the parts hold the record's shapes. A trace builds
+  the model without its weights, and a graph keys `config.json`'s digest, not its path: a
+  container that does not mount the model, such as a CPU gate container, traces from a
+  copy of the model's directory less its weight files.
 - **Points.** `compass measure ops --plan REC --llc-mib 256 --gpu G --store S --out O --
   <side's ATOM args> --enforce-eager --level 0 --cudagraph-capture-sizes "[R]"`, over each
   side's plan record, with that side's Mooncake variables, the node's own `ATOM_HOST_IP`,
