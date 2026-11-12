@@ -180,11 +180,13 @@ stage is named for the model; it is not the retired milestone M3 of D95.
 - **Memory readings per point.** `--max-num-seqs` is twice the concurrency, and a
   readings entry is keyed by the scheduler's bounds (`run/memory.py::key_fields`), so
   each point takes its own entry.
-- **Laws per arm:** one step linear law each for TP4, TP4 with indexer CP and TP2,
-  fitted on records from that arm's points. The LMCache arms reuse the TP2 and the TP4
-  indexer-CP laws with the offload terms of `03` D13.1. A law's key holds the capture
-  ladder (`run/step_grid.py::keyed`), which ATOM clips at `--max-num-seqs`, so how one
-  law serves its arm's other points is
+- **Laws per arm:** one step linear law each for TP4, TP4 with indexer CP and TP2. The
+  TP4 law is fitted on records from its own arm's points; the TP2 law on records from the
+  TP2 arm's and the TP2 LMCache arm's points, and the TP4 indexer-CP law on records from
+  its own arm's and the TP4 indexer-CP LMCache arm's, so each pools records with the tier
+  off and on. The LMCache arms reuse those two laws with the offload terms of `03` D13.1.
+  A law's key holds the capture ladder (`run/step_grid.py::keyed`), which ATOM clips at
+  `--max-num-seqs`, so how one law serves the other points it covers is
   [#3275](https://github.com/jgong5/ATOM/issues/3275)'s ruling. An indexer-CP arm's law
   waits on #3054's indexer-CP key, without which its runs would read a law fitted
   without indexer CP.
