@@ -76,8 +76,9 @@ admits a request rather than charge it nothing, and the report says why under
 
 Under a launch provider that declares features (`launch_features`), a step it
 predicts otherwise than its line observed refuses, naming it; each host law
-adopts features as columns (`_launch_columns`), their coefficients under the
-entry's `columns[kind][segment]`, and `_jit` solves `W_launch` with every one.
+adopts features as columns on their held-out error per launch path
+(`_launch_columns`), their coefficients under the entry's
+`columns[kind][segment]`, and `_jit` solves `W_launch` with every one.
 
 The same solver fits the host entry's ``tokenizer`` term on a recorded
 server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
@@ -866,20 +867,24 @@ def _jit(samples, features=()) -> set[tuple]:
 def _launch_columns(members, features) -> tuple[list[str], dict]:
     """The `features` host-law `members` (`_host_rows`) adopt as columns, in
     order, and the report's `launch_columns`: each round's held-out error per
-    design tried (`_held_out_error`, each run held out). A round adds the
-    feature of least error while it is below the last design's. Members of one
-    run adopt none."""
+    design tried (`_held_out_error`, each run held out, its p50 taken per
+    launch path, its members of one value of every feature). One p50 over all
+    of a run's members is its commonest path's, which a column a rarer path
+    needs barely moves. A round adds the feature of least error while it is
+    below the last design's. Members of one run adopt none."""
     if not features:
         return [], {}
     x = np.array([r[2] for r in members], dtype=np.float64).reshape(-1, 3)
     if np.linalg.matrix_rank(x[:, 1:]) < 2:
         x[:, 2] = 0.0
     y, cell = np.array([r[3] for r in members]), np.array([r[4] for r in members])
+    paths = [[r[5][f] for f in features] for r in members]
+    path = np.unique(paths, axis=0, return_inverse=True)[1]
 
     def error(names):
         values = [[r[5][f] for r in members] for f in names]
         design = np.column_stack([x, *values])
-        return _held_out_error(_folds(design, y, cell, [*HOST_FEATURES, *names]))
+        return _held_out_error(_folds(design, y, cell, [*HOST_FEATURES, *names], path))
 
     adopted, rounds = [], [{"none": error([])}]
     while rounds[0]["none"] is not None and len(adopted) < len(features):
@@ -1045,22 +1050,30 @@ def _fit_form(
     }
 
 
-def _folds(design, y, cell, names) -> dict:
+def _folds(design, y, cell, names, path=None) -> dict:
     """Per record of `cell` beside which another holds rows, (its rows, the p50
-    error on them of the solve of `design` on the other records' rows)."""
+    error on them of the solve of `design` on the other records' rows); given
+    `path`, a value per row, the same per record and value, keyed by both."""
     out = {}
     for c in sorted(set(cell.tolist())):
         other = cell != c
         if other.any():
             coef = _solve(design[other], y[other], names)["coef"]
             error = design[~other] @ coef / y[~other] - 1.0
-            out[c] = (int((~other).sum()), float(np.median(error)))
+            if path is None:
+                out[c] = (int((~other).sum()), float(np.median(error)))
+                continue
+            held = path[~other]
+            for p in sorted(set(held.tolist())):
+                mine = error[held == p]
+                out[c, p] = (len(mine), float(np.median(mine)))
     return out
 
 
 def _held_out_error(folds: dict) -> float | None:
-    """`_folds`' held-out error: the mean of each record's held-out p50 error's
-    magnitude, weighted by its rows; None with no record held out."""
+    """`_folds`' held-out error: the mean of each held-out p50 error's
+    magnitude, a record's or a record's path's, weighted by its rows; None
+    with no record held out."""
     rows = sum(n for n, _ in folds.values())
     return sum(n * abs(p) for n, p in folds.values()) / rows if rows else None
 
