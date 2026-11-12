@@ -5,7 +5,7 @@
 server do, calling per input the function whose refusal the run would meet,
 so one lacking input hides no other: the machine spec; each store key or law
 file a flag names (`runfile.resolve`); a step linear law and host laws held
-against this run's engine config, widths, machine spec and host key
+against this run's engine config, widths, platform and host key
 (`run.pick_fitted`, `run.refuse_unfitted_law`, `run.refuse_unfitted_host`),
 and the host laws' tokenizer term against the backend of the tokenizer ATOM's
 server loads (`run.tokenizer_term`); a step grid bundle's load; the
@@ -33,7 +33,7 @@ from atom.compass.artifacts import (
     ArtifactRefusal,
     ArtifactStore,
     Rule,
-    machine_spec_digest,
+    machine_platform,
 )
 from atom.compass.drive import runfile, serve
 from atom.compass.run import OP_GRAPH, PRICE_LIST, STEP_GRID, STEP_LINEAR
@@ -124,7 +124,7 @@ def lacking(args, atom_args) -> tuple[list, list]:
     if "host" in run and met(
         host, MADE_BY["host"], compass_run.pick_fitted, run, "host", config
     ):
-        given = run["host"], config, machine_spec_digest(machine)
+        given = run["host"], config, machine_platform(machine)
         met(host, MADE_BY["host"], compass_run.refuse_unfitted_host, *given)
         tok = _load_tokenizer(engine.model, engine.trust_remote_code)
         met(host, MADE_BY["host"], compass_run.tokenizer_term, run, tok, config)

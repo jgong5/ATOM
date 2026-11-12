@@ -13,9 +13,9 @@ requests renamed as prefill's record names them, as grading renames them.
 inputs ran on: records whose device, software stack, PTL state or torch is not
 the one it states refuse, naming each and both values. `--ptl` states the PTL
 state of records that carry none, and refuses for records that carry one; the
-report records it as `stated_ptl`. The configuration gains its
-`machine_spec_digest`, which a fit's key and params state, and `readings`,
-those a run on the spec takes with the inputs' source root, model and engine,
+report records it as `stated_ptl`. The configuration gains `platform`, the
+one the inputs ran on, whose fields the fit's row marks its key and params
+state, and `readings`, those a run on the spec takes with the inputs' source root, model and engine,
 under which each measurement is loaded.
 
 `publish` hands off one store entry whose members are `params`, what a run
@@ -40,12 +40,12 @@ from atom.compass.artifacts import (
     Provenance,
     Reading,
     Topology,
-    machine_spec_digest,
-    machine_spec_key,
+    keyed_platform,
+    machine_platform,
     member_name,
+    platform_of,
     roots_for,
 )
-from atom.compass.artifacts.keys import platform_key
 from atom.compass.backends.json_file import read_json
 from atom.compass.backends.step_labels import Floor
 from atom.compass.fit.samples import UNRECORDED, load
@@ -151,8 +151,7 @@ def inputs(args, sources, ops=()) -> tuple[list, dict]:
                 f"none, and these carry {config.get('ptl')!r}"
             )
         config["ptl"] = args.ptl
-    torch = spec.value("device.software_pinned_to.torch")
-    stated = {**machine_spec_key(spec).values, "torch": torch}
+    stated = machine_platform(spec)
     ran = platform(config) if runs else stated
     differ = [
         f"{axis} {ran[axis]!r} in the records and {stated[axis]!r} in {args.machine}"
@@ -165,7 +164,7 @@ def inputs(args, sources, ops=()) -> tuple[list, dict]:
             + "; ".join(differ)
         )
     if ops:
-        want = {"model": config["model"], "machine_spec": machine_spec_digest(spec)}
+        want = {"model": config["model"], **keyed_platform(Kind.OP_MEASUREMENT, stated)}
         want["source_root"] = config["source_root"]
         got = {k: keyed.get(k) for k in want}
         want |= {k: config["engine_config"].get(k) for k in SAME_OPS}
@@ -186,7 +185,7 @@ def inputs(args, sources, ops=()) -> tuple[list, dict]:
         store.load(key, conditions=here, gates=GateState.of())
     return samples, {
         **config,
-        "machine_spec": machine_spec_digest(spec),
+        "platform": ran,
         "readings": here,
     }
 
@@ -203,11 +202,8 @@ def runs(samples) -> list[dict]:
 
 
 def platform(config) -> dict:
-    """The device, software-stack, PTL and torch readings `config`, the inputs'
-    configuration, states, the first three joined as a machine spec's key."""
-    stack = config["stack"]
-    key = platform_key(config["device"], stack, config["ptl"])
-    return {**key.values, "torch": stack["torch"]}
+    """The platform `config`, the inputs' configuration, states."""
+    return platform_of(config["device"], config["stack"], config["ptl"])
 
 
 def conditions(config) -> Conditions:

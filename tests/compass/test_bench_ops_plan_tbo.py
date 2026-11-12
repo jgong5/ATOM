@@ -3,8 +3,11 @@
 split a prefill step under two-batch overlap: each reads the step as its two
 micro-batches at their own rows, as `trace ops --population` traces it and
 `OpGraphBackend` prices it, and the plan refuses a graph only that call traces
-before it traces or measures anything. The bench and graphs are
-`test_bench_ops_plan`'s stand-ins.
+before it traces or measures anything. A micro-batch's point keeps its mark in
+its record, and the plan densifies such points, measured or held in its store,
+at the micro-batch's own graph; a plan without TBO that reads them back
+densifies at its own steps' graphs.
+The bench and graphs are `test_bench_ops_plan`'s stand-ins.
 """
 
 import json
@@ -12,11 +15,12 @@ from types import SimpleNamespace
 
 import pytest
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
+from test_bench_ops import _measuring
 from test_bench_ops_plan import CONFIG, _bench, _plan, bench  # noqa: F401  a fixture
 
 from atom.compass.artifacts import ArtifactRefusal, Rule
 from atom.compass.bench import ops
-from atom.compass.capture import forward
+from atom.compass.capture import forward, population_shapes
 
 #: Rank 0 prefills 9000 tokens, past the 8192-token bar, and rank 1 100: each
 #: cuts its own at the midpoint, each micro-batch gathering both ranks' rows of
@@ -107,3 +111,128 @@ def test_a_plan_refuses_a_micro_batch_no_graph_holds_before_tracing_or_measuring
     call += f" {split} --store {root} -- --enable-tbo"
     assert refused.value.remedy == f"trace it with {call}"
     assert _bench.calls == 0
+
+
+def test_a_micro_batch_s_measured_point_keeps_its_mark_in_its_record(monkeypatch):
+    _, todo = _measuring(monkeypatch)
+    half = forward.prefill(4, 1)._replace(micro_batch=True)
+
+    got = ops.measure(None, [(half, None, todo[1][2])], 10_000)
+
+    assert [(r["shape"], r.get("micro_batch")) for r in got] == [
+        ("prefill T=4 B=1", True)
+    ] * 2
+
+
+def _switching(fn, config, todo, llc):
+    """`_bench` with prefill attention's kernel switching at 1000 cached tokens,
+    between the 50 and the 4500 the micro-batches' rows cache, and each
+    micro-batch's record marked as `Stub.point` marks it."""
+    got = []
+    for point in todo:
+        for r in _bench(fn, config, [point], llc):
+            if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
+                r["kernels"] = [f"p{int((r['context'] or 0) >= 1000)}"]
+            got.append(r | ({"micro_batch": True} if point[0].micro_batch else {}))
+    return got
+
+
+def _unmarked(fn, config, todo, llc):
+    """`_switching` as measured before a record kept a micro-batch's mark."""
+    got = _switching(fn, config, todo, llc)
+    return [{k: v for k, v in r.items() if k != "micro_batch"} for r in got]
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_a_plan_densifies_a_micro_batch_s_points_at_its_own_graph(
+    bench, tmp_path, split, monkeypatch, held  # noqa: F811
+):
+    """The store holds the graphs of the record's shapes and of any shape that
+    states no gather, which `trace ops --prefill` traces: at a micro-batch's
+    gather only the micro-batch's own, so a whole step's there refuses. With
+    `held` it also holds rounds 0 to 2's points, unmarked, which the plan reads
+    back."""
+    graphs, stand_in = set(population_shapes([split], True)), ops.graph
+
+    def graph(store, config, shape, arch=None):
+        if shape.gathered and shape not in graphs:
+            raise ArtifactRefusal(Rule.RESOLUTION, f"no op_graph holds {shape}", "")
+        return stand_in(store, config, shape, arch)
+
+    monkeypatch.setattr(ops, "graph", graph)
+    # what the `trace ops` call of a refusal names
+    monkeypatch.setattr(CONFIG, "model", "m", raising=False)
+    monkeypatch.setattr(forward, "device_arch", lambda: "gfx942")
+    if held:  # a plan that stopped once it published round 2
+        publish = ops.publish
+
+        def stopped(*args):
+            publish(*args)
+            if args[-1].name == "round2":
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(ops, "publish", stopped)
+        monkeypatch.setattr(ops, "_child", _unmarked)
+        with pytest.raises(KeyboardInterrupt):
+            _plan(bench, tmp_path, split)
+        monkeypatch.setattr(ops, "publish", publish)
+    monkeypatch.setattr(ops, "_child", _switching)
+
+    records = _plan(bench, tmp_path, split)
+
+    # Rank 1's micro-batch's attention, halved over cached tokens to the switch.
+    attn = {
+        r["context"]
+        for r in records
+        if r["op"] == "aiter.attn" and r["shape"] == "prefill T=50 B=1 G=4550"
+    }
+    assert {999, 1000} <= attn
+
+
+def _whole(path):
+    """A record whose ranks prefill 4500 fresh tokens and 50 past 5000 cached,
+    each under the bar: with no TBO its steps are `prefill T=4500 B=1 G=4550`
+    and `prefill T=50 B=1 G=4550`, the texts of `split`'s micro-batches."""
+    steps = path / "whole" / "steps"
+    steps.mkdir(parents=True)
+    (steps.parent / "run.json").write_text("{}")
+    ranks = ([[4500, 4500, False]], 1000), ([[50, 5050, False]], 3000)
+    for rank, (rows, context) in enumerate(ranks):
+        prefill = {"step": 0, "rows": rows, "moe_rows": 4550, "rung": None}
+        decode = {"step": 1, "rows": [[1, context, True]], "moe_rows": 2, "rung": 1}
+        lines = (json.dumps(s | {"is_dummy_run": False}) for s in (prefill, decode))
+        (steps / f"dp{rank}.jsonl").write_text("\n".join(lines) + "\n")
+    return str(steps.parent)
+
+
+def test_a_plan_without_tbo_densifies_a_point_a_tbo_plan_stored_at_its_own_graph(
+    bench, tmp_path, split, monkeypatch  # noqa: F811
+):
+    """A point's key holds no TBO switch, so a plan without `--enable-tbo` reads
+    back the points a plan under it stored at its micro-batches' texts; a
+    graph's structure does, so it holds no micro-batch's graph."""
+    monkeypatch.setattr(CONFIG, "model", "m", raising=False)
+    monkeypatch.setattr(forward, "device_arch", lambda: "gfx942")
+    monkeypatch.setattr(ops, "_child", _switching)
+    (tmp_path / "tbo").mkdir()
+    stored = _plan(bench, tmp_path / "tbo", split)
+    assert any(r.get("micro_batch") for r in stored)
+    monkeypatch.setattr(CONFIG, "enable_tbo", False)
+    whole = _whole(tmp_path)
+    graphs, stand_in = set(population_shapes([whole], False)), ops.graph
+
+    def graph(store, config, shape, arch=None):
+        if shape.micro_batch or shape.gathered and shape not in graphs:
+            raise ArtifactRefusal(Rule.RESOLUTION, f"no op_graph holds {shape}", "")
+        return stand_in(store, config, shape, arch)
+
+    monkeypatch.setattr(ops, "graph", graph)
+
+    records = _plan(bench, tmp_path, whole)
+
+    attn = {
+        r["context"]
+        for r in records
+        if r["op"] == "aiter.attn" and r["shape"] == "prefill T=50 B=1 G=4550"
+    }
+    assert {999, 1000} <= attn

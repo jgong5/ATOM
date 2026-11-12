@@ -18,11 +18,11 @@ from test_drive_run import bundle, op_graph_run, recorded, stub, unstarted
 from test_drive_runfile import LAWS, host_laws, install, published, step_linear
 from test_memory_readings import DOCUMENT
 from test_run_load_invalidation import fitted
-from test_run_step_grid import SPEC_DIGEST, deployment, host_laws_key, readings
+from test_run_step_grid import PLATFORM, deployment, host_laws_key, readings
 from test_step_grid_plan import MIXED, SHORT, located, measured, plan
 
 from atom.compass import run as compass_run
-from atom.compass.artifacts import Axis, Kind
+from atom.compass.artifacts import Axis, Kind, keyed_platform
 from atom.compass.backends.step_roofline import UNCLASSIFIED, Module
 from atom.compass.bench import ops
 from atom.compass.drive import run as drive_run
@@ -90,7 +90,7 @@ def test_a_stale_law_names_each_axis_and_stale_host_laws_each_field(
     served(monkeypatch, r.config)
     law = fitted(tmp_path, r, moved(readings(r), Axis.ATOM_SRC)).key.token()
     key = {**compass_run.host_key(r.config), "atom": "0" * 64}
-    key["machine_spec"] = SPEC_DIGEST
+    key |= keyed_platform(Kind.HOST_LAWS, PLATFORM)
     params = {"key": key, "laws": LAWS}
     host = published(tmp_path, r, Kind.HOST_LAWS, host_laws_key(r), params)
 
@@ -127,7 +127,7 @@ def test_check_meets_the_server_s_refusal_of_a_tokenizer_from_another_backend(
 ):
     r = deployment(tmp_path)
     served(monkeypatch, r.config)
-    key = {**compass_run.host_key(r.config), "machine_spec": SPEC_DIGEST}
+    key = compass_run.host_key(r.config) | keyed_platform(Kind.HOST_LAWS, PLATFORM)
     term = {"backend": "slow", "fingerprint": "sha256:" + "a" * 64}
     params = {"key": key, "laws": LAWS, "tokenizer": term}
     host = published(tmp_path, r, Kind.HOST_LAWS, host_laws_key(r), params)

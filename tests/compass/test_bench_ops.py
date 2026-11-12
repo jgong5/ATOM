@@ -26,7 +26,7 @@ from test_bench_replay import _line, rule  # noqa: F401  the rule fixture
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
 
 from atom.compass import cli, ir
-from atom.compass.artifacts import ArtifactStore, Kind, machine_spec_digest
+from atom.compass.artifacts import ArtifactStore, Kind, keyed_platform, machine_platform
 from atom.compass.bench import measure, ops
 from atom.compass.capture import driverless
 from atom.compass.capture.forward import decode, prefill
@@ -831,6 +831,74 @@ def test_a_v41_prefill_past_cached_tokens_picks_candidates_off_its_rows_blocks(
     assert units["block_tables"].shape == (1, 40)
 
 
+def _pick(monkeypatch, arch, k, env=None):
+    """V4.1's pick's HIP top-k of k as a prefill of 256 tokens traced it, 32
+    index blocks, on `arch` with aiter's FlyDSL switch at `env`; and the list
+    each point's records go to."""
+    monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: arch)
+    monkeypatch.delenv("AITER_DISABLE_FLYDSL_TOPK_DECODE", raising=False)
+    if env:
+        monkeypatch.setenv("AITER_DISABLE_FLYDSL_TOPK_DECODE", env)
+    records, I32 = [], "torch.int32"
+    monkeypatch.setattr(ops, "_journal", lambda path, got: records.extend(got) or got)
+    pick = _leaf(
+        ops._PICK,
+        *[("logits", _t([256, 32], "activation")), ("next_n", 1)],
+        ("seqLens", _t([256], "activation", dtype=I32)),
+        ("indices", _t([256, k], "activation", dtype=I32)),
+        *[("numRows", 256), ("stride0", 32), ("stride1", 1), ("k", k)],
+    )
+    return pick, records
+
+
+@pytest.mark.parametrize(
+    "arch, env, k, want",
+    [
+        ("gfx1250", None, 160, ops._TOPK),
+        ("gfx1250", "0", 160, ops._TOPK),  # which aiter reads as on
+        ("gfx1250", None, 161, ops._PICK),
+        ("gfx950", None, 160, "its kernel on gfx950 is not known"),
+        ("gfx1250", "1", 160, "gfx1250 under AITER_DISABLE_FLYDSL_TOPK_DECODE=1 is"),
+    ],
+)
+def test_a_v41_prefill_pick_widened_to_its_k_runs_the_top_k_aiter_dispatches_there(
+    monkeypatch, arch, env, k, want
+):
+    pick, records = _pick(monkeypatch, arch, k, env)
+    visible = list(range(1025, 1281))  # past 1024 cached tokens: 160 blocks
+    taken = _v41_index(monkeypatch, visible, [pick], prefill(256, 1), 1024)
+
+    [record], ends = records, [-(-v // 8) for v in visible]
+    assert record["op"] == ops._PICK  # the graph's
+    if want not in (ops._TOPK, ops._PICK):
+        assert not taken and want in record["refused"]
+        return
+    [call] = taken
+    assert record.get("timed", ops._PICK) == want
+    assert call["logits"].shape == (256, 160)
+    bounds = ("row_starts", "row_ends") if want == ops._TOPK else ("seqLens",)
+    assert [call[b].tolist() for b in bounds] == [ends] * len(bounds)
+
+
+def test_a_v41_prefill_pick_s_points_either_side_of_its_k_fit_one_family_by_context(
+    monkeypatch,
+):
+    from atom.compass.fit import ops as fit_ops
+
+    pick, records = _pick(monkeypatch, "gfx1250", 128)
+    # 64 and 96 index blocks on HIP's kernel, flat there; 160 and 288 on
+    # FlyDSL's one-block, which moves with them
+    for context in (256, 512, 1024, 2048):
+        [call] = _v41_index(monkeypatch, [1] * 256, [pick], prefill(256, 1), context)
+        width, one_block = call["logits"].shape[1], "row_starts" in call
+        records[-1] |= {"kernels": ["one_block" if one_block else "hip"]}
+        records[-1] |= {"cold_ns": 100.0 * width if one_block else 3000.0}
+
+    [family] = fit_ops.fit(records)["families"].values()
+    assert family["dims"] == ["T", "B", "context"]
+    assert {k for _, _, (k,) in family["points"]} == {"hip", "one_block"}
+
+
 def test_v41_index_leaves_rank_a_logits_plane_drawn_below_each_row_s_bound(
     monkeypatch,
 ):
@@ -1524,6 +1592,79 @@ def test_v4_bf16_prefill_attention_takes_v4_s_lists_by_ratio_and_v41_s_leaf_its_
         for r in (4, 128)
         for i, part in enumerate(("prefix", "extend"))
     }
+
+
+def test_v41_attention_takes_the_lists_atom_s_index_build_writes_for_its_pass(
+    monkeypatch,
+):
+    # V4.1's attention at ratio 2, its first layer there layer 2, over a
+    # prefill's 4 rows and over its replay's query, whose row pointers ATOM
+    # gathers at the query's rows (1, 0). ATOM's cache builds for the rows a
+    # pass's batch ids keep lists `100 k` on, off a selection the bench
+    # spreads over each row's visible rows, written on no step ATOM prepared.
+    from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep
+    from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
+
+    i32, built, fills, taken = torch.int32, [], [], {}
+
+    def attention_indices(spec, step):
+        built.append((spec.layer_id, step.selected[spec.topk_owner][0, 0].tolist()))
+        fills.append((id(step), step.indptrs, step.indptr_buffers))
+        n = int(step.batch_ids.ge(0).sum())
+        return [torch.arange(n * k, dtype=i32) + 100 * k for k in (1, 2, 3, 4)]
+
+    def call(stub, op, sig, instances, n):
+        taken[op["args"]["q"]["shape"][0]] = stub._copy(op, sig, instances, 0)[0]
+        return {}
+
+    monkeypatch.setattr(ops.Stub, "_time", call)
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner = _Runner()
+    for layer, mode in ((2, AttentionMode.FULL), (3, AttentionMode.REUSE)):
+        runner.model.append(torch.nn.Module())
+        runner.model[-1].spec = LayerAttentionSpec(layer, 2, mode, 2, 2)
+    visible = {2: torch.tensor([600, 600, 601, 601], dtype=i32)}
+    step = BatchStep((), *(torch.zeros(4, dtype=i32),) * 4, None, visible=visible)
+    step.indptrs, step.indptr_buffers = {2: "another pass's"}, {2: "its own"}
+    step.decoder = SimpleNamespace(
+        tail=step, tail_rows=torch.zeros(3), last=torch.zeros(1), filled_gpu=None,
+        finishing_gpu=None, query_ids=torch.tensor([-1, -1, 0, -1], dtype=i32),
+        query_ptrs=torch.tensor([1, 0], dtype=i32),
+    )  # fmt: skip
+    cache = SimpleNamespace(attention_indices=attention_indices)
+    cache.geometry = SimpleNamespace(batch_topk=lambda ratio: 8)
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        vars(fctx._forward_context.attn_metadata).update(step=step, cache=cache)
+        return out
+
+    runner.prepare_model = prepare_model
+
+    def attend(rows, *slots):
+        args = [(s, _t([n], "activation", dtype="torch.int32")) for s, n in slots]
+        q = "q", _t([rows, 2, 4], "activation")
+        leaf = _leaf("aiter.pa_sparse_prefill_opus.default", q, *args)
+        return dataclasses.replace(leaf, stated=(("compress_ratio", 2),))
+
+    prefix = "kv_indices_prefix"
+    leaves = attend(4, (prefix, 4), ("kv_indices_extend", 12))
+    leaves = leaves, attend(1, (prefix, 1), ("kv_indptr_prefix", 2))
+    found = ops.leaves(_graph(*leaves, layers=1)["region"])
+    placed = SimpleNamespace(block_size=32, batch=lambda *a: a[1:])
+    ops.Stub(runner, 10_000).point(placed, prefill(4, 1), 1196, found)
+
+    assert taken[4]["kv_indices_prefix"].tolist() == [100, 101, 102, 103]
+    assert taken[4]["kv_indices_extend"].tolist() == list(range(300, 312))
+    assert taken[1]["kv_indices_prefix"].tolist() == [100]
+    assert taken[1]["kv_indptr_prefix"].tolist() == [201, 200]
+    # each build layer 2's, its rows' 8 ids spread from 0, the newest last
+    assert {b[0] for b in built} == {2} and step.selected == {}
+    assert built[0][1] == [0, 86, 172, 257, 343, 428, 514, 599]
+    # one copy a pass, its indptrs filled afresh into the cache's buffers
+    assert len({f[0] for f in fills}) == 2
+    assert all(f[1:] == ({}, None) for f in fills)
 
 
 def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
@@ -2555,6 +2696,36 @@ def test_a_long_call_fills_a_graph_to_graph_ns_and_has_no_warm_graph(
     assert graphs == [calls] * (2 if calls == ops.CALLS else 1)
     assert (record["copies"], record["calls"]) == (copies, calls)
     assert (record["warm_ns"] is None) == (calls < ops.CALLS)
+
+
+@pytest.mark.parametrize("queried, copies", [(True, 4), (True, 3), (False, 3)])
+def test_a_warm_call_takes_its_cold_call_s_occurrence_on_that_one_s_first_copy(
+    queried, copies
+):
+    # copies alternate the tail's batch ids, 0..3, and layer 39's, -1 (`QUERIED`)
+    stub = ops.Stub(_Runner(), 10_000)
+    tail = torch.arange(4, dtype=torch.int32)
+    stub.placed = [(fctx.ForwardContext(), {("sig", "batch_ids"): ("tail", tail)})]
+    if queried:
+        stub.later = {(0, "sig", "batch_ids"): ("q", torch.full_like(tail, -1))}
+    spec = {"shape": [4], "stride": [1], "dtype": "torch.int32", "role": "metadata"}
+    op = {"op": "scan", "args": {"batch_ids": spec}, "occurrences": 2}
+    graphs = []
+
+    def replay(fn, calls, flush=None):
+        graphs.append([(id(c), c[0]["batch_ids"][0].item()) for c in calls])
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        stub._time(op, "sig", [{}], copies)
+
+    cold, warm = ([b for _, b in g] for g in graphs)
+    assert warm == cold and (-1 in cold) == queried
+    assert len({c for c, _ in graphs[1]}) == 1 + queried
 
 
 def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
@@ -3652,7 +3823,8 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
 
     at = key("decode B=2", 9, "a")
     assert at.kind is Kind.OP_MEASUREMENT
-    assert at.values["machine_spec"] == machine_spec_digest(spec)
+    platform = keyed_platform(Kind.OP_MEASUREMENT, machine_platform(spec))
+    assert platform.items() <= at.values.items()
     assert at.values["source_root"] == "atom_py-a"
     assert store.directory_for(at).exists()
     assert not store.directory_for(key("decode B=2", 9, "b")).exists()

@@ -25,7 +25,7 @@ from test_op_graph import FLAT
 from test_run_step_grid import (
     KEY,
     NEW_KINDS,
-    SPEC_DIGEST,
+    PLATFORM,
     deployment,
     host_laws_key,
     publish,
@@ -41,6 +41,7 @@ from atom.compass.artifacts import (
     Key,
     Kind,
     Topology,
+    keyed_platform,
     member_name,
 )
 from atom.compass.backends import StepGridBackend, StepLinearBackend, StepStubBackend
@@ -78,7 +79,7 @@ def published(tmp_path, r, kind, key, params, report=REPORT):
 
 
 def host_laws(tmp_path, r):
-    key = {**compass_run.host_key(r.config), "machine_spec": SPEC_DIGEST}
+    key = {**compass_run.host_key(r.config), **keyed_platform(Kind.HOST_LAWS, PLATFORM)}
     return published(
         tmp_path, r, Kind.HOST_LAWS, host_laws_key(r), {"key": key, "laws": LAWS}
     )
@@ -366,7 +367,10 @@ def planted_pair(tmp_path, monkeypatch):
         key = {**NEW_KINDS[Kind.STEP_LINEAR_LAW], "engine_config": engine}
         params = {**law(), "provenance": name}
         fitted = published(tmp_path, r, Kind.STEP_LINEAR_LAW, key, params)
-        host = {**compass_run.host_key(r.config), "machine_spec": SPEC_DIGEST}
+        host = {
+            **compass_run.host_key(r.config),
+            **keyed_platform(Kind.HOST_LAWS, PLATFORM),
+        }
         laws = {**LAWS, "prefill": {"E": [i, 0, 0]}}
         params = {"key": host, "laws": laws}
         hosts = published(tmp_path, r, Kind.HOST_LAWS, host_laws_key(r), params)
@@ -502,7 +506,7 @@ def price_list_key(tmp_path, **layout):
         "decode_context_parallel_size": 1,
         "enable_expert_parallel": False,
         "enable_dp_attention": False,
-        "machine_spec": SPEC_DIGEST,
+        **keyed_platform(Kind.PRICE_LIST, PLATFORM),
         "source_root": compass_run.source_root(),
         **layout,
     }

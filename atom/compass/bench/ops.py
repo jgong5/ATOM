@@ -14,14 +14,15 @@ each graph of the drafter's part of a step S holds at that shape (`DRAFTED`,
 `leaves_at`), timed on the target's batch; with `--drafter` those alone, the
 points a trace run's drafter kernels take their own lengths from
 (`step_labels.Floor`). A point is one leaf of those graphs,
-its instances grouped (`leaves`), a kernel's layers among them when they
-differ only in where each views one KV pool from (`signature`), at the shape
-and `--context`: a decode
+its instances grouped (`leaves`), a call's layers among them when they
+differ only in a string that names their layer or, a kernel's, in where each
+views one KV pool from (`signature`), at the shape and `--context`: a decode
 step's rows each hold `--context` tokens, under a drafter verifying as many
 more as it drafts, and a prefill's rows, split as the capture split them,
 follow `--context` cached tokens each, none when it is not given; there
 the planes of DeepSeek-V4.1's FP8 indexer, which the capture sized to its own
-rows' KV blocks, are as wide as the point's rows' (`PAGE_WIDE`). Rows the KV
+rows' KV blocks, are as wide as the point's rows' (`PAGE_WIDE`), a top-k on
+aiter's kernel at that width (`_dispatched`). Rows the KV
 pool cannot hold at once are ragged (`point_rows`), and the point records its
 rows; under `--plan` over ragged decode steps a decode point
 the pool cannot hold refuses instead, past the first round (`RAGGED`).
@@ -39,7 +40,9 @@ leaf of its forward writes (`_WRITTEN`) is written for the reading leaf's pass
 as that leaf writes it (`Stub._index`), and the logits plane its scorer
 writes, which a top-k or the pick's block maxima ranks (`PAGE_WIDE`), is
 each copy's own, drawn for a top-k or block maxima as an activation is,
-below each row's bound (`_scores`). A `Stub` calls each leaf from its
+below each row's bound (`_scores`); its sparse attention's index lists are
+those its index build writes for the leaf's pass, off a selection spread over
+each row's visible rows (`Stub._lists`). A `Stub` calls each leaf from its
 contract: a tensor the capture states on the host is built there on every
 copy, as an activation is, pinned (`_host`); an
 activation is random at its shape, dtype and stride, except such
@@ -130,7 +133,8 @@ again, it and the metadata views cloned once each, and only where they differ
 from the last placement's; a view an operator writes (`_writes`) has clones
 apart, which only that operator's leaves share. A KV argument
 places a leaf's copies as a context key does. A second graph runs
-copy 0 K times, warm; with one copy, or K under `CALLS`, there is none.
+copy 0 K times, warm, or call c on copy c mod N mod the occurrences where
+later ones take a `QUERIED` slot; with one copy, or K under `CALLS`, none.
 Before each capture, and once the runner sized its KV pool, the memory the
 bench freed goes back to the driver, and the bench waits, at most `CLEAR_S`,
 until the card's VRAM in use falls by it (`_release`); a point records the
@@ -154,8 +158,8 @@ the rest; two in a row that die having finished no point fail the run.
 
 DIR gets run.json, the run's identity, and ops.jsonl, one line per point. S
 gets each measured point as an `op_measurement`, keyed by the model, the
-parallel layout, the digest of the machine spec of the device, stack and PTL
-state run.json reads, the source root and the point.
+parallel layout, the device, stack, PTL state and torch run.json reads, the
+source root and the point.
 
 `--plan` measures, in rounds, the points the steps of record directories call
 for (`record`'s or `trace steps`' output), under `--enable-tbo` a step its DP
@@ -249,13 +253,15 @@ from atom.compass.artifacts import (
 from atom.compass.backends.op_graph import DRAFT, DRAFT_KV, KV, PERMILLE
 from atom.compass.bench.routing import uniform_ids
 from atom.compass.drive.gpu import add_gpu_flag
+from atom.compass.run.modules import LAYER
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 PROG = "compass measure ops"
-#: The timing protocol's version; it changes whenever a count below, the
-#: copies a graph reads, what a capture waits for or what a replay follows
+#: The timing protocol's version; it changes whenever the operator a point
+#: times, a count below, the copies a graph reads, what a capture waits for or
+#: what a replay follows
 #: change.
-PROTOCOL = 29
+PROTOCOL = 30
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -421,8 +427,10 @@ V4_LISTS = {
 #: DeepSeek-V4.1's arguments, keyed as `V4_METADATA`'s, and the buffers ATOM
 #: passes each (`_named`), at the leaf's ratio (`_ratio`), as `_bound` names
 #: them: the paged cache's, the pass's step (`step.`), the decoder plan
-#: (`plan.`), the scorer workspace (`workspace.`), the forward context.
+#: (`plan.`), the scorer workspace (`workspace.`), the forward context; or
+#: past one, its first row (`.0`) or it widened to int64 (`.long`).
 _CACHE = "attn_metadata_builder.cache.indptr_buffers.{ratio}"
+_STAGED = "attn_metadata_builder.cache._cursor_staging.gpu"
 _LOGITS = (
     "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
     "flydsl_fp8_paged_mqa_logits_gfx1250"
@@ -461,6 +469,10 @@ V41_NAMES = {
     ("aten.index_select.default", "index", "metadata"): "plan.last",
     ("aten.index.Tensor", "indices"): "plan.query_ptrs",
     ("aten.index_put_.default", "indices"): ("plan.tail_rows", "plan.last_rows"),
+    # the cursor write, `cursor[step.slots[:n].long()] = staged[:n]`, whose
+    # values at one row are the staging's first, its unit dim dropped
+    ("aten.index_put_.default", "indices", "kv"): "step.slots.long",
+    ("aten.index_put_.default", "values", "kv"): (_STAGED, f"{_STAGED}.0"),
     (_GATHER, "rows"): ("plan.tail_rows", "plan.last"),
     **{
         (fn, f"{field}_state"): f"attn_metadata_builder.cache.state.compress_{field}"
@@ -514,6 +526,14 @@ PAGE_WIDE = {
     _MAXIMA: ("visible", "logits", "maxima", "blocks"),
     f"{_V41}.unit_table:unit_table": ("block_tables", "block_tables"),
 }
+#: The arches on which aiter's decode top-k (`top_k_per_row_decode`) runs
+#: FlyDSL's one-block kernel (`_TOPK`) for every call its signature check
+#: takes, k no wider than the logits, as no FlyDSL decode gate of the arch's
+#: precedes it, unless `FLYDSL_OFF`, which no `op_graph` key states, holds
+#: one of the values aiter reads as off.
+ONE_BLOCK = ("gfx1250",)
+FLYDSL_OFF = "AITER_DISABLE_FLYDSL_TOPK_DECODE"
+FLYDSL_OFF_VALUES = ("1", "true", "True", "yes", "YES")
 #: DeepSeek-V4.1's FP8 index tables an earlier leaf of its forward writes, by
 #: the operator and slot that read them (`_written`): the page-wide scorer's
 #: tile table (`tiles`); the blocks each row keeps of the candidate pick
@@ -530,6 +550,17 @@ _WRITTEN = {
         (f"{_V41}.candidate_table:{f}", "candidates"): "ids"
         for f in ("candidate_block_table", "lift_candidate_selection")
     },
+}
+#: DeepSeek-V4.1's sparse attention over its BF16 pool, by slot: the item of
+#: what its forward's index build returns (`PagedAttentionCache.
+#: attention_indices`, `(prefix, pptr, second, sptr)`) an activation slot
+#: takes, a list or, at a bounded replay's queries, a pointer table.
+_ATTEND = "aiter.pa_sparse_prefill_opus.default"
+LISTS = {
+    (_ATTEND, "kv_indices_prefix"): 0,
+    (_ATTEND, "kv_indptr_prefix"): 1,
+    (_ATTEND, "kv_indices_extend"): 2,
+    (_ATTEND, "kv_indptr_extend"): 3,
 }
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
@@ -779,17 +810,33 @@ def _ref(value) -> bool:
 
 def signature(op: dict) -> str:
     """A leaf's identity across instances: its operator, arguments and outputs,
-    a context key or module path by its kind alone, a kernel's KV argument
-    without the size its pool sets (`_kv_unsized`), and what the capture
-    states beside its arguments when it states anything."""
+    a context key or module path by its kind alone, and so a string that names
+    a layer (`_unnamed`), a kernel's KV argument without the size its pool
+    sets (`_kv_unsized`), and what the capture states beside its arguments
+    when it states anything."""
     kernel = not op["op"].startswith("aten.")
     args = {
-        s: {k: None for k in v} if _ref(v) else _kv_unsized(v) if kernel else v
+        s: _kv_unsized(_unnamed(v)) if kernel else _unnamed(v)
         for s, v in op["args"].items()
     }
     leaf = {"op": op["op"], "args": args, "out": op["out"]}
     leaf |= {"stated": op["stated"]} if "stated" in op else {}
     return json.dumps(leaf, sort_keys=True, separators=(",", ":"))
+
+
+def _unnamed(value):
+    """`value`, an argument, less the name of where its call runs: a context
+    key or module path by its kind alone, and a string that holds a layer's
+    path (`run.modules.LAYER`) as ``{"layer": None}``. A kernel reaches a
+    layer's state by a context key, which the capture records as one, so such
+    a string only names the call, as the ``prefix`` ATOM passes for a trace
+    marker (`mark_trace`) does; a string that holds no layer's path, a mode a
+    kernel runs in among them, stays as it is."""
+    if _ref(value):
+        return {k: None for k in value}
+    if isinstance(value, str) and LAYER.search(value):
+        return {"layer": None}
+    return value
 
 
 def _kv_unsized(value):
@@ -996,6 +1043,11 @@ class Stub:
         spec = {m: getattr(m, "spec", None) for m in self.modules.values()}
         picks = [m for m, s in spec.items() if getattr(s, "produces_candidates", 0)]
         self.picker = next((m for m in picks if hasattr(m, "topk_blocks")), None)
+        # its first attention layer at each ratio, whose lists its index build
+        # writes (`_lists`), and each pass's window reach (`_prepare`)
+        specs = {s for s in spec.values() if hasattr(s, "index_group_start")}
+        self.specs = {s.ratio: s for s in sorted(specs, key=lambda s: -s.layer_id)}
+        self.reach = {}
         # a DeepSeek-V4 CSA layer: its forward writes the top-k section of the
         # CSA index buffer, and `_prepare` runs none
         self.csa = next(
@@ -1053,6 +1105,15 @@ class Stub:
             | ({} if count is None else {"scheduled_tokens_gpu": count})
             for rows, (step, count) in passes.items()
         }
+        # each V4.1 pass's index builds (`_lists`) and, by the rows it runs,
+        # the step's own its width, its window reach: the ring rows its index
+        # build lists each request below its window split, from its floor
+        # (`_window_split`), none on a replay's tail
+        self.lists, self.reach = {}, {}
+        for rows, (step, _) in passes.items():
+            if hasattr(step, "request_floors"):
+                split = np.maximum(step.request_positions, step.request_cached_until)
+                self.reach[rows or step.width] = split - step.request_floors
         # DeepSeek-V4's persistent HCA decode workspace, one per device: a slot
         # of `HCA_DECODE` named as one of its fields is a view of that field
         hca = sys.modules.get("atom.model_ops.v4_kernels.hca_persist")
@@ -1103,7 +1164,9 @@ class Stub:
                 index = self.paged and _written(op, path)
                 if spec.get("device") == "cpu":  # `_copy` builds it on the host
                     continue
-                if spec["role"] == "metadata" or index:
+                act = self.specs and spec["role"] == "activation"
+                listed = LISTS.get((op["op"], path)) if act else None
+                if spec["role"] == "metadata" or index or listed is not None:
                     token = (op["op"], path) in TOKEN_IDS
                     pool = {"input_ids": input_ids} if token else live
                     what, field = "metadata", path.split(".")[0]
@@ -1129,11 +1192,14 @@ class Stub:
                         if index:  # as the forward's first reader writes it
                             step = passes.get(at, passes[None])[0]
                             pool = self._index(md.cache, step, index, ratio)
+                        if listed is not None:  # as its index build writes it
+                            step = passes.get(at, passes[None])[0]
+                            pool = self._lists(md.cache, step, ratio, listed, live)
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
-                        if what in V4_LISTS:  # at the point's rows, not the capture's
-                            view = pool[what]
+                        if what in V4_LISTS or listed is not None:
+                            view = pool[name]  # whole, as ATOM passes it
                         # leaves share a view's clone: DeepSeek-V4's decode
                         # leaves view 2.7 GB of it at a placement. What an
                         # operator writes is cloned apart, or a leaf timed
@@ -1205,6 +1271,36 @@ class Stub:
         bound = cache.candidate_blocks(step, spec.layer_id, spec.ratio)
         return {f"step.candidate_blocks.{spec.layer_id}.{kind}": getattr(bound, kind)}
 
+    def _lists(self, cache, step, ratio, i, live) -> dict[str, torch.Tensor]:
+        """Item `i` of DeepSeek-V4.1's index build (`LISTS`) for the pass
+        `step`, by name, as its first attention layer at `ratio` builds it on
+        the pass's own copy of `step`, a replay's queries' build: its indptrs
+        filled once, into the cache's buffers its pointer tables name, off its
+        scorer's selection, where none wrote one spread over each row's visible
+        rows (`_candidates`); a pointer table taken as an activation, the
+        queries', at their rows."""
+        spec = self.specs.get(ratio)
+        if spec is None:
+            raise ValueError(f"no attention layer of the model runs ratio {ratio}")
+        own = self.lists.get(id(step))
+        if own is None:
+            own = self.lists[id(step)] = dataclasses.replace(
+                step,
+                indptrs={},
+                indptr_buffers=None,
+                group_indices={},
+                selected=dict(step.selected),
+            )
+        if ratio and spec.topk_owner not in own.selected:
+            top = cache.geometry.batch_topk(ratio)
+            own.selected[spec.topk_owner] = _candidates(step.visible[ratio], top)[None]
+        built = cache.attention_indices(spec, own)[i]
+        if i % 2:  # as `QueryRows.indices` gathers it
+            if (rows := live.get("plan.query_ptrs")) is None:
+                raise ValueError("a pointer table gathered at no replay's queries")
+            built = built[rows.long()]
+        return {f"attention_indices.{ratio}.{i}": built}
+
     def point(self, rule, shape, context, found) -> list[dict]:
         """Each leaf of `found` timed at `shape` on `point_rows`, or every leaf
         refused when `rule` refuses the batch."""
@@ -1214,9 +1310,9 @@ class Stub:
             return _journal(
                 self.journal,
                 [
-                    {"shape": str(shape), "context": context, "op": op["op"]}
-                    | {"leaf": sig, "refused": why}
-                    for sig, (op, _) in found.items()
+                    {"shape": str(shape), "context": context}
+                    | {"op": json.loads(sig)["op"], "leaf": sig, "refused": why}
+                    for sig in found
                 ],
             )
 
@@ -1273,16 +1369,9 @@ class Stub:
         room += [t.k_cache.shape[0] // taken for t in kv.values() if _stateful(t)]
         self.context, self.unplanned, self.once = _split(context)[0], {}, {}
         tokens = sum(row[0] for row in rows)  # a drafter's rows verify its drafts
-        plans = {
-            s: self._plan(
-                op, i, kv, blocks, len(rows), tokens, s, shape.phase == "decode"
-            )
-            for s, (op, i) in found.items()
-        }
-        need = max(p for _, _, p, _ in plans.values())
         self.leaves, self.placed, self.clones = found, [], {}
         self.written, self.later, self.fills = {}, {}, {}
-        self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
+        plans, p, need = None, 0, 1
         ladder = contextlib.nullcontext
         if shape.width or shape.phase == "decode" and shape.tokens < shape.seqs:
             # a step that pads past its rows is prepared padded, as the
@@ -1293,7 +1382,8 @@ class Stub:
             ladder = functools.partial(
                 patch.object, self.runner, "capture_sizes_np", width
             )
-        for p in range(max(min(need, *room), 1)):
+        # its leaves planned once the first placement's passes tell their reach
+        while p < max(min(need, *room), 1):
             slot = p * taken
             if self.slots >= taken:  # past the state slots, take them again
                 slot %= self.slots - self.slots % taken
@@ -1309,16 +1399,32 @@ class Stub:
             except Exception as error:
                 error.add_note(f"measuring {shape} at context {context}")
                 raise
+            if plans is None:
+                decode = shape.phase == "decode"
+                plans = {
+                    s: self._plan(op, i, kv, blocks, len(rows), tokens, s, decode)
+                    for s, (op, i) in found.items()
+                }
+                need = max(n for _, _, n, _ in plans.values())
+            p += 1
+        self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
         got = []
         for sig, (op, inst) in found.items():
             n, size, _, (by_block, by_slot) = plans[sig]
             names = {p: m[0] for (s, p), m in self.placed[0][1].items() if s == sig}
             later = {k[2]: m[0] for k, m in self.later.items() if k[:2] == (0, sig)}
-            record = {"shape": str(shape), "context": context, "op": op["op"]}
+            # the graph's operator, and the one timed in its place if another
+            leaf = json.loads(sig)["op"]
+            record = {"shape": str(shape), "context": context, "op": leaf}
             record |= {"leaf": sig, "metadata": names, "rows": rows}
             record |= {"later": later} if later else {}
+            record |= {"timed": op["op"]} if op["op"] != leaf else {}
             record |= {"exchange": ex} if (ex := exchange(op)) else {}
+            # its text leaves a micro-batch's mark out, which `_densify` reads back
+            record |= {"micro_batch": True} if shape.micro_batch else {}
             try:
+                if "refuses" in op:  # its operator at its width (`_dispatched`)
+                    raise ValueError(op["refuses"])
                 if sig in self.fills:  # as its pass's first reader fills them
                     cache, step = self.fills[sig]
                     cache.indptrs(
@@ -1421,12 +1527,11 @@ class Stub:
                         reach = acts[0]["shape"][0] + rows * ((window or 1) - 1)
                         unit, slotted = min(reach, rows * self.ring), 1
                     elif window and not decode:
-                        # ponytail: a prefill's prefix reads each request's
-                        # history through it too, the window less one at most
-                        # its cached tokens, by slot; a leaf of fewer rows, a
-                        # bounded-replay tail, none: its window starts there
-                        if acts[0]["shape"][0] >= (tokens or rows):
-                            history = rows * min(window - 1, self.context or 0)
+                        # a prefill's prefix reads each request's history
+                        # through it too, by slot: the window reach of the
+                        # pass of its rows, the window less one at most
+                        reach = self.reach.get(_pass_rows(op), ())
+                        history = int(np.minimum(reach, window - 1).sum())
                 # an entry is the span of its other dims: a view may be strided
                 # by a whole state slot or by every layer's block, and a field
                 # laid out layers first, `[layers, slots, ...]`, is read a slot
@@ -1490,7 +1595,8 @@ class Stub:
         sized to the cache (`cold_copies`) each on copy `c mod m`'s
         activations, then copy `c mod n` with the c-th weight up to the
         leaf's occurrences when it takes one, at most K, each replay after one
-        read of `flush`; and, when K is `CALLS`, warm over one, with no read;
+        read of `flush`; and, when K is `CALLS`, warm over one, or one an
+        occurrence where later ones take a `QUERIED` buffer, with no read;
         with its kernels, profiled again on every rank when any rank's named
         none of a call its cold graph timed. Every rank's graph holds the most K
         any rank's call gives, and a leaf any rank refuses, every rank does."""
@@ -1545,7 +1651,10 @@ class Stub:
             n = len(calls)
             cycle = [calls[i % n] for i in range(k)]
             cold = _replay(fn, cycle, self.flush)
-            warm = _replay(fn, calls[:1] * k) if n > 1 and k == CALLS else None
+            # warm: call i on its cold call's occurrence's first copy (`QUERIED`)
+            o = op["occurrences"] if any(s == sig for _, s, _ in self.later) else 1
+            warm = [calls[i % n % o] for i in range(k)]
+            warm = _replay(fn, warm) if n > 1 and k == CALLS else None
             # two profiles that named nothing of a call its graph timed missed it
             if agreed(int(not kernels and any(cold)), cpu_group(), most=True):
                 forward_context._forward_context = calls[0][1]
@@ -1929,11 +2038,12 @@ def _passes(fc) -> dict:
 
 
 def _pass_rows(op) -> int | None:
-    """The rows a leaf runs: its positions', its batch ids' or first activation's."""
+    """The rows a leaf runs: its positions', its batch ids', its row pointers'
+    (`kv_indptr_prefix`) less one, or its first activation's."""
     specs = dict(_specs(op["args"]))
-    for slot in ("positions", "batch_ids"):
+    for slot, end in (("positions", 0), ("batch_ids", 0), ("kv_indptr_prefix", 1)):
         if slot in specs:
-            return specs[slot]["shape"][-1]
+            return specs[slot]["shape"][-1] - end
     shape = next((s["shape"] for s in specs.values() if s["role"] == "activation"), [])
     return shape[1] if shape[:1] == [1] and len(shape) > 2 else (shape or [None])[0]
 
@@ -1974,6 +2084,10 @@ def _named(op, path, spec, pool, known=None) -> dict | None:
     ratio = _ratio(op, path, known)
     ratios = [ratio] if ratio is not None else sorted(set((known or {}).values()))
     names = [w.format(ratio=r) for w in wanted for r in ratios or [None]]
+    for n in names:  # past a buffer: its first row, or it widened to int64
+        base, _, last = n.rpartition(".")
+        if n not in pool and base in pool and last in ("0", "long"):
+            pool = pool | {n: pool[base][0] if last == "0" else pool[base].long()}
     held = {
         n: pool[n] for n in names if n in pool and str(pool[n].dtype) == spec["dtype"]
     }
@@ -1984,7 +2098,8 @@ def _named(op, path, spec, pool, known=None) -> dict | None:
 def _widened(op, blocks) -> dict:
     """`op` with the slots and integers `PAGE_WIDE` names for it as wide as
     `blocks[1]` KV blocks rather than the capture's `blocks[0]`: an integer,
-    a tensor's columns, and its row stride where that is its columns."""
+    a tensor's columns, and its row stride where that is its columns; the
+    operator aiter dispatches at that width (`_dispatched`)."""
     bound, *wide = PAGE_WIDE.get(op["op"], (None,))
     if blocks[0] == blocks[1] or bound is None or _written(op, bound) == "context":
         return op
@@ -1998,7 +2113,30 @@ def _widened(op, blocks) -> dict:
         if stride[0] == shape[1]:
             stride[0] = stride[0] // blocks[0] * blocks[1]
         shape[1] = shape[1] // blocks[0] * blocks[1]
-    return op
+    return _dispatched(op)
+
+
+def _dispatched(op) -> dict:
+    """`op`, aiter's HIP decode top-k (`_PICK`) once its logits are k wide, as
+    aiter dispatches it on this device's arch, the one `graph` read its graph
+    at: FlyDSL's one-block kernel on `ONE_BLOCK`'s, called as aiter's decode
+    wrapper calls it, each row bound `seqLens`; else marked refused."""
+    from atom.compass.capture.forward import device_arch
+
+    args = op["args"]
+    width = args["logits"]["shape"][1] if op["op"] == _PICK else None
+    if width is None or "k" not in args or args["k"] > width:
+        return op
+    off = os.environ.get(FLYDSL_OFF) in FLYDSL_OFF_VALUES
+    if (arch := device_arch()) not in ONE_BLOCK or off:
+        off = f" under {FLYDSL_OFF}={os.environ[FLYDSL_OFF]}" if off else ""
+        why = f"aiter's decode top-k of k {args['k']} on logits {width} wide"
+        return op | {"refuses": f"{why}: its kernel on {arch}{off} is not known"}
+    named = {"seqLens": "row_ends", "numRows": "num_rows"}
+    called = {named.get(s, s): v for s, v in args.items() if s != "workspace"}
+    called |= {"row_starts": copy.deepcopy(args["seqLens"]), "is_decode": True}
+    called |= {"values": args.get("values"), "plane_width": None, "packed_rows": False}
+    return op | {"op": _TOPK, "args": called}
 
 
 def _summed(op, rows) -> dict:
@@ -2718,12 +2856,12 @@ def _fields(held):
 def keys(config, run: dict):
     """The `op_measurement` key of a point, `(shape, context, leaf)`, measured
     under `config` on the platform `run` reads."""
-    from atom.compass.artifacts.keys import LAYOUT, platform_key
+    from atom.compass.artifacts.keys import LAYOUT, keyed_platform, platform_of
     from atom.compass.fit.samples import run_fields
     from atom.compass.run.memory import key_fields
 
     fields = run_fields(run)
-    platform = platform_key(fields["device"], run["stack"], run["ptl"]).canonical()
+    platform = platform_of(fields["device"], run["stack"], run["ptl"])
     layout = {k: v for k, v in key_fields(config).items() if k in LAYOUT}
 
     def key(shape, context, leaf) -> Key:
@@ -2732,7 +2870,7 @@ def keys(config, run: dict):
             Kind.OP_MEASUREMENT,
             model=fields["model"],
             **layout,
-            machine_spec="sha256:" + hashlib.sha256(platform.encode()).hexdigest(),
+            **keyed_platform(Kind.OP_MEASUREMENT, platform),
             source_root=fields["source_root"],
             point="sha256:" + hashlib.sha256(point).hexdigest(),
         )
@@ -2889,7 +3027,12 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                 if store.directory_for(at := key(shape, context, sig)).exists():
                     entry = store.read(at)
                     held = entry.read_member("point", entry.topology.ranks()[0], "json")
-                    done[str(shape), context, sig] = json.loads(held)
+                    # the asking shape's mark alone: the point's key holds no TBO
+                    # switch, and a store may hold it from before records kept one
+                    point = json.loads(held)
+                    point.pop("micro_batch", None)
+                    mark = {"micro_batch": True} if shape.micro_batch else {}
+                    done[str(shape), context, sig] = point | mark
                 else:
                     found[sig] = op, instances
             todo += [(shape, context, found)] if found else []
@@ -3466,7 +3609,10 @@ def _densify(families, tried: set) -> dict:
             if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
                 continue
             tried.add((fam, mid))
-            shape = _shape(record["shape"])
+            # a micro-batch's leaves are read off its own graph, as its record marks
+            shape = _shape(record["shape"])._replace(
+                micro_batch=record.get("micro_batch", False)
+            )
             if isinstance(fam, tuple):  # over cached tokens at one token count
                 new = json.dumps([*json.loads(fam[0]), mid], sort_keys=True)
                 want[shape, mid].add(new)
