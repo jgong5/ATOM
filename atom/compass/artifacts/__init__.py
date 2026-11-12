@@ -7,8 +7,8 @@ refusals, plus the answer to a ninth: an artifact that is still read after the
 thing it was measured against has moved.
 
 * **A key is a tuple, never a path** (`keys`). The artifacts and what keys
-  each one; a `price_list` is `(model, parallel layout, machine-spec digest,
-  source-root digest)`, because a bare or merged price file states no layout
+  each one; a `price_list` is `(model, parallel layout, platform, source-root
+  digest)`, because a bare or merged price file states no layout
   and silently prices nothing.
 * **One naming function** (`naming`). Write and read sides call it, per-rank
   files carry every axis's coordinates, and the suffix is applied at width one
@@ -17,7 +17,7 @@ thing it was measured against has moved.
   tree `git archive` would ship, aiter's by `git describe --tags --always
   --dirty`, the call the GPU gate makes on aiter's checkout. A root with
   uncommitted files may run but not publish (`store`); an aiter bump refuses
-  through the machine-spec key, which pins aiter's commit.
+  through the software stack a key states, which pins aiter's commit.
 * **A handed-off entry is immutable** (`store`). **The physical form is a
   directory convention** -- no index, no manifest -- and publishing is a rename
   onto a name that must not exist, so an overwrite is impossible rather than
@@ -49,7 +49,15 @@ from .fingerprints import (
     verify,
 )
 from .gates import Gate, GateState
-from .keys import KEY_FIELDS, Key, Kind, machine_spec_digest, machine_spec_key
+from .keys import (
+    KEY_FIELDS,
+    PLATFORM,
+    Key,
+    Kind,
+    keyed_platform,
+    machine_platform,
+    platform_of,
+)
 from .matrix import MATRIX, ROWS_OF, Axis, Cell, Row, axes_of, rows_for
 from .naming import AXES, RankCoords, Topology, member_name, read_back
 from .provenance import (
@@ -70,6 +78,7 @@ __all__ = [
     "AXES",
     "KEY_FIELDS",
     "MATRIX",
+    "PLATFORM",
     "REQUIRED_ROOTS",
     "REVISION_KINDS",
     "ROWS_OF",
@@ -103,10 +112,11 @@ __all__ = [
     "fingerprint",
     "git_described_root",
     "git_tree_root",
-    "machine_spec_digest",
-    "machine_spec_key",
+    "keyed_platform",
+    "machine_platform",
     "member_name",
     "module_root",
+    "platform_of",
     "read_back",
     "roots_for",
     "rows_for",

@@ -20,8 +20,15 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from test_backend_step_linear_fit import ENGINE, SPEC, _engine_file, _record
-from test_fit_steps import DIGEST, LINEAR, clients, fit, law_key, member, record
+from test_backend_step_linear_fit import (
+    ENGINE,
+    SPEC,
+    _engine_file,
+    _record,
+    platform_arg,
+)
+from test_fit_steps import LINEAR, clients, fit, law_key, member, record
+from test_memory_readings import DOCUMENT
 from test_parity_record import _config
 from test_step_linear_draft import _mtp_record
 
@@ -287,7 +294,7 @@ def test_the_published_law_pads_to_the_records_buckets_as_the_command_does(tmp_p
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     out = tmp_path / "law.json"
     step_linear_fit.main(
-        [*map(str, paths), "--form", "history", "--machine-spec", DIGEST]
+        [*map(str, paths), "--form", "history", *platform_arg(DOCUMENT)]
         + ["--out", str(out)]
     )
     written = json.loads(out.read_text())
@@ -309,9 +316,8 @@ def test_fit_steps_refuses_records_of_which_only_some_state_buckets(tmp_path):
 def test_a_record_states_the_prefill_buckets_its_runner_recorded(tmp_path, monkeypatch):
     monkeypatch.setenv("ATOM_COMPASS_PARITY_RECORD", str(tmp_path / "none"))
     path = parity_record(SimpleNamespace(rank=0, config=_config())).path
-    assert "prefill_buckets" not in json.loads(
-        path.with_suffix(".engine.json").read_text()
-    )
+    engine = json.loads(path.with_suffix(".engine.json").read_text())
+    assert engine["prefill_buckets"] == []
 
     monkeypatch.setattr(TokenGraph, "captured_sizes", lambda phase=None: (256, 512))
     monkeypatch.setenv("ATOM_COMPASS_PARITY_RECORD", str(tmp_path / "some"))

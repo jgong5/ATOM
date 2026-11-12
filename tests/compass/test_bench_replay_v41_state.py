@@ -297,6 +297,17 @@ def test_a_v41_cached_prefill_reads_its_history_through_its_pool_once_a_slot(
     assert record["footprint_bytes"] == 7 * 16 * rows + 7 * pages + 4 * ring
 
 
+def test_a_v41_replay_tail_wider_than_its_forward_reads_no_ring_row(probed):
+    """The same prefill's bounded-replay tail laid out 48 rows wide, as ATOM
+    lays one out a window a request: its leaf, of the tail's 48 rows, past the
+    forward's 32, reads no ring row, each window starting at the tail."""
+    _, seen = probed
+    placed = seen["ops_v41_wide_tail"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert record["footprint_bytes"] == 7 * 16 * 48 + 7 * placed["read"]
+
+
 #: The bench tensor each KV view `v41_state_probe.kv_bound` takes binds.
 BOUND = {
     "pages": "pages.buf.torch.bfloat16",

@@ -11,9 +11,9 @@ import pytest
 from test_backend_step_labels import pulled
 from test_fit_samples import edit
 from test_fit_steps import (  # noqa: F401
-    DIGEST,
     ENGINE,
     HOST,
+    PLATFORM,
     clients,
     fit,
     member,
@@ -25,7 +25,7 @@ from test_memory_readings import META_8B
 from test_run_step_grid import B37, decode, deployment, publish, run_file
 
 from atom.compass import run as compass_run
-from atom.compass.artifacts import Key, Kind
+from atom.compass.artifacts import Key, Kind, keyed_platform
 from atom.compass.backends.step_labels import digest
 from atom.compass.backends.step_linear_fit import (
     fit_host,
@@ -44,7 +44,7 @@ def host_laws_key(key) -> Key:
         atom_src=key["atom"],
         model=key["model"],
         engine_config=json.dumps(key["engine"], sort_keys=True),
-        machine_spec=DIGEST,
+        **keyed_platform(Kind.HOST_LAWS, PLATFORM),
     )
 
 
@@ -63,7 +63,8 @@ def test_the_host_laws_published_are_fit_hosts_and_a_run_file_carrying_them_runs
     # last bits depend on the order of its samples.
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     laws, report = fit_host(label_records(paths)[0])
-    assert host == {**laws, "key": {**laws["key"], "machine_spec": DIGEST}}
+    platform = keyed_platform(Kind.HOST_LAWS, PLATFORM)
+    assert host == {**laws, "key": {**laws["key"], **platform}}
     # Records with no tokenizer calls or intake stamps give none of these terms.
     report["unfitted"].update(
         tokenizer=f"no record holds steps/{compass_run.INTAKE_RECORD}",

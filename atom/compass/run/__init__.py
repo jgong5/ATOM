@@ -72,12 +72,13 @@ optional, the lookahead of the channels it names, `HOP_FLOOR_S` where absent,
 which the run summary names under ``unmeasured_hops``), one of ``step_stub`` (a
 `Coefficients` mapping,
 priced by `StepStubBackend`), ``step_linear`` (a `StepLinearLaw` mapping,
-priced by `StepLinearBackend`; its ``machine_spec`` digest and
-its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
+priced by `StepLinearBackend`; its ``platform``, the platform fields of its key,
+and its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, and a law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
-holds at its shape and output, the run's TP and EP widths and KV cache format; capture traces
+holds at its shape and output, traced under this process's torch and ATOM source
+and loaded under them and its model (`_op_graphs`), the run's TP and EP widths and KV cache format; capture traces
 eager forwards, so a graph-mode run reads the eager graphs too; with
 ``price_list``, the fields of a `price_list` key ``store`` holds, loaded
 under this run's readings, it prices each leaf from it first; with
@@ -110,8 +111,8 @@ image of a chat request; without it a request with an image is refused),
 on ``(1, tokens, seqs)``; with any laws, a forward whose kind has none for a
 segment it runs and ``skip`` does not name is refused, that segment costing 0 s
 (`HostDeviceRecurrence.device_end`); ``key``, the `host_key` they were
-fitted under and the ``machine_spec`` digest of the spec of the platform they
-were fitted on, which a run with laws must match; ``admit``, coefficients on
+fitted under and the platform fields of their store key, which a run with
+laws must match; ``admit``, coefficients on
 a forward's admissions, which add to its ``E``, or null to refuse a forward
 that admits a request, and absent from an entry whose ``E`` laws hold them;
 ``skip``, segments zeroed for a what-if run, which the graders refuse;
@@ -152,7 +153,8 @@ calls, a frontend's its executor's refused jobs and its refused clock calls.
 An engine's also holds what its worker's steps cost, for the summary's
 predicted seconds and their shares by method (`backends.cost.GROUPS`), and
 its counts of steps extrapolated and of steps a fallback priced, and of its
-lazy traces with their wall seconds, which the summary's cost half totals.
+lazy traces with their wall seconds, which the summary's cost half totals,
+with each DP prefill whose G it traced one by one (`_op_graphs`).
 It holds the memory the worker predicts too, for
 ``python -m atom.compass.memory.check``, with the assumption a
 `memory_readings` member it read states, which `compass run` records, and
@@ -244,6 +246,7 @@ import atexit
 import codecs
 import contextlib
 import functools
+import gc
 import hashlib
 import json
 import math
@@ -265,7 +268,7 @@ from pathlib import Path
 import numpy as np
 
 import atom
-from atom.compass.artifacts import provenance
+from atom.compass.artifacts import Reading, provenance
 from atom.compass.clock import (
     TAR,
     ClockAbort,
@@ -338,6 +341,8 @@ PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
 SUMMARY_SCHEMA_VERSION = 14
+#: The reading kind of ATOM's source as `atom_digest` reads it.
+ATOM_PY = "atom_py"
 #: The terms of a ``host`` entry the frontend charges, each 0 s where it is absent.
 HOST_TERMS = ("http_intake", "tokenizer")
 #: The kinds of call a ``tokenizer`` term prices, each 0 s where it is absent.
@@ -366,6 +371,9 @@ COMPASS_ONLY = {
     },
     "utils/zmq_shim.py": {"_Socket", "_ChannelSocket", "_Context"},
 }
+#: The module `pip install -e .` writes (setuptools_scm) and git ignores: no
+#: commit holds it, so the host-law key leaves it out.
+INSTALL_WRITTEN = Path("_version.py")
 #: The run-file key of each backend a flag names (`atom.compass.drive.runfile`).
 STEP_STUB, STEP_LINEAR, STEP_GRID = "step_stub", "step_linear", "step_grid"
 OP_GRAPH, PRICE_LIST = "op_graph", "price_list"
@@ -425,6 +433,106 @@ def _fitted_here(listed: list, here: dict, engine, what: str) -> dict:
         f"entry {i} in {_differ(engine(e), here)}" for i, e in enumerate(listed)
     )
     raise ValueError(f"no {what} entry was fitted under this engine config: {named}")
+
+
+def pick_fitted(run: dict, name: str, config) -> None:
+    """Replace the run file's `name` entries, a step linear law's or host
+    laws', when a list, by the one fitted under `config`'s engine config
+    (`_fitted_here`), host laws' read less the graph sets their key states."""
+    if not isinstance(run.get(name), list):
+        return
+    from atom.compass.backends.launch_features import GRAPHS
+    from atom.compass.run.step_grid import keyed
+
+    engines = {
+        STEP_LINEAR: lambda e: e.get("engine_config"),
+        "host": lambda e: {
+            k: v
+            for k, v in (e.get("key", {}).get("engine") or {}).items()
+            if k != GRAPHS
+        },
+    }
+    run[name] = _fitted_here(run[name], keyed(config), engines[name], name)
+
+
+def refuse_unfitted_law(run: dict, config) -> None:
+    """Refuse the run file's step linear law where `config` is not what it was
+    fitted under: its engine config, which states its tensor-parallel width,
+    context-parallel width 1, and its platform, which the run file's machine
+    spec must state."""
+    from atom.compass.artifacts import Kind, keyed_platform, machine_platform
+    from atom.compass.run.step_grid import differ, keyed
+
+    law = run[STEP_LINEAR]
+    if "engine_config" not in law:
+        raise ValueError(
+            "the step linear law states no engine_config, the engine config "
+            "it was fitted under, so no run can check its parallel layout"
+        )
+    if named := differ(law["engine_config"], keyed(config), "the law"):
+        raise ValueError(
+            "the step linear law was fitted under another engine config: "
+            + "; ".join(named)
+        )
+    refuse_context_parallel(STEP_LINEAR, config)
+    fitted_on = law.get("platform") or {}
+    here = keyed_platform(Kind.STEP_LINEAR_LAW, machine_platform(_machine(run)))
+    if named := [
+        f"{f} {fitted_on.get(f)!r} in the law and {v!r} here"
+        for f, v in here.items()
+        if fitted_on.get(f) != v
+    ]:
+        raise ValueError(
+            "the step linear law was fitted on another platform: "
+            + "; ".join(named)
+            + "; a law measured on one platform is no evidence about another"
+        )
+
+
+def refuse_context_parallel(name: str, config) -> None:
+    """Refuse a context-parallel `config` for the run file's `name`, a law or a
+    bundle: neither's engine config states a context-parallel width."""
+    cp = {
+        width: getattr(config, width)
+        for width in ("prefill_context_parallel_size", "decode_context_parallel_size")
+        if getattr(config, width) != 1
+    }
+    if cp:
+        raise ValueError(
+            f"the run file's {name} is measured at context-parallel width 1 and "
+            "states no context-parallel width, and this run has "
+            + " and ".join(f"{width} {n}" for width, n in cp.items())
+        )
+
+
+def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
+    """Refuse the run file's host laws `host` when fitted under another host
+    key than this run's, on `platform` (`machine_platform`), the graph sets
+    their key states taken as this run's, which records none."""
+    from atom.compass.artifacts import Kind, keyed_platform
+    from atom.compass.backends.launch_features import GRAPHS, stated
+
+    ours = host.get("laws") and {
+        **host_key(config),
+        **keyed_platform(Kind.HOST_LAWS, platform),
+    }
+    theirs = host.get("key") or {}
+    launch = stated(theirs)
+    if ours and launch[1] is not None:
+        ours["engine"] = {**ours["engine"], GRAPHS: launch[1]}
+    if ours and theirs != ours:
+        differ = [k for k in ours if theirs.get(k) != ours[k]]
+        if isinstance(engine := theirs.get("engine"), dict):
+            mine = ours["engine"]
+            differ = [k for k in differ if k != "engine"] + [
+                f"engine.{n}"
+                for n in sorted(mine.keys() | engine.keys())
+                if engine.get(n) != mine.get(n)
+            ]
+        raise ValueError(
+            f"the run file's host laws were fitted under another {differ}; "
+            f"this run's key is {ours}, and theirs is {theirs}"
+        )
 
 
 _authority: "_RecordingAuthority | None" = None
@@ -1601,9 +1709,9 @@ def runner(model_runner, tree) -> None:
     run = spec()
     if run is None:
         return
-    from atom.compass.artifacts import machine_spec_digest, machine_spec_key
+    from atom.compass.artifacts import machine_platform
     from atom.compass.backends.geometry import Parallelism
-    from atom.compass.backends.launch_features import GRAPHS, stated
+    from atom.compass.backends.launch_features import stated
     from atom.compass.backends.step_linear import StepLinearBackend, StepLinearLaw
     from atom.compass.backends.step_roofline import (
         StepFallbackBackend,
@@ -1622,19 +1730,8 @@ def runner(model_runner, tree) -> None:
     config = model_runner.config
     tp = config.tensor_parallel_size
     refuse_renamed_keys(run, "the run file")
-    engines = {
-        STEP_LINEAR: lambda e: e.get("engine_config"),
-        "host": lambda e: {
-            k: v
-            for k, v in (e.get("key", {}).get("engine") or {}).items()
-            if k != GRAPHS
-        },
-    }
-    for name, engine in engines.items():
-        if isinstance(run.get(name), list):
-            from atom.compass.run.step_grid import keyed
-
-            run[name] = _fitted_here(run[name], keyed(config), engine, name)
+    for name in (STEP_LINEAR, "host"):
+        pick_fitted(run, name, config)
     backends = (STEP_STUB, STEP_LINEAR, STEP_GRID, OP_GRAPH)
     keys = [k for k in backends if k in run]
     if len(keys) != 1:
@@ -1659,24 +1756,11 @@ def runner(model_runner, tree) -> None:
         replay = ReplayHost(Path(run["replay"]) / side, dp_rank, stage)
     if STEP_LINEAR in run:
         # A law prices a rank at the tensor-parallel width its engine config states.
+        refuse_unfitted_law(run, config)
         # Under DP-attention every rank runs at TP 1, and experts shard over the group.
         dpa = config.enable_dp_attention
         dp = config.parallel_config.data_parallel_size if dpa else 1
-        law = run[STEP_LINEAR]
-        backend = StepLinearBackend(StepLinearLaw(law), dp)
-        if "engine_config" in law:
-            from atom.compass.run.step_grid import differ, keyed
-
-            if named := differ(law["engine_config"], keyed(config), "the law"):
-                raise ValueError(
-                    "the step linear law was fitted under another engine "
-                    "config: " + "; ".join(named)
-                )
-        else:
-            raise ValueError(
-                "the step linear law states no engine_config, the engine config "
-                "it was fitted under, so no run can check its parallel layout"
-            )
+        backend = StepLinearBackend(StepLinearLaw(run[STEP_LINEAR]), dp)
     elif STEP_STUB in run:
         # A pipeline stage is priced for its own span of the stack, the span
         # ATOM's `make_layers` builds it from.
@@ -1704,31 +1788,13 @@ def runner(model_runner, tree) -> None:
             stack_layers=end - start,
             stage_share=share,
         )
-    # Neither a law's nor a bundle's engine config states a context-parallel width.
-    cp = {
-        name: getattr(config, name)
-        for name in ("prefill_context_parallel_size", "decode_context_parallel_size")
-        if getattr(config, name) != 1
-    }
-    if cp and keys[0] in (STEP_LINEAR, STEP_GRID):
-        raise ValueError(
-            f"the run file's {keys[0]} is measured at context-parallel width 1 and "
-            "states no context-parallel width, and this run has "
-            + " and ".join(f"{name} {width}" for name, width in cp.items())
-        )
     machine = _machine(run)
-    platform = machine_spec_digest(machine)
-    fitted_on = run.get(STEP_LINEAR, {}).get("machine_spec")
-    if STEP_LINEAR in run and fitted_on != platform:
-        raise ValueError(
-            f"the step linear law was fitted on machine spec {fitted_on} and this "
-            f"run's is {platform}, {machine_spec_key(machine)}; a law measured "
-            "on one platform is no evidence about another"
-        )
+    platform = machine_platform(machine)
     bundle = None
     if STEP_GRID in run:
         from atom.compass.run.step_grid import load
 
+        refuse_context_parallel(STEP_GRID, config)
         backend, bundle = load(run[STEP_GRID], config, machine)
     if "store" not in run:
         raise ValueError(
@@ -1799,24 +1865,8 @@ def runner(model_runner, tree) -> None:
             model_runner.compass_block_file = _block_file(now)
         slot = np.memmap(now, np.float64, "r", shape=(1,))
         host = run.get("host", {})
-        ours = host.get("laws") and {**host_key(config), "machine_spec": platform}
-        theirs = host.get("key") or {}
-        launch = stated(theirs)
-        if ours and launch[1] is not None:
-            ours["engine"] = {**ours["engine"], GRAPHS: launch[1]}
-        if ours and theirs != ours:
-            differ = [k for k in ours if theirs.get(k) != ours[k]]
-            if isinstance(engine := theirs.get("engine"), dict):
-                mine = ours["engine"]
-                differ = [k for k in differ if k != "engine"] + [
-                    f"engine.{n}"
-                    for n in sorted(mine.keys() | engine.keys())
-                    if engine.get(n) != mine.get(n)
-                ]
-            raise ValueError(
-                f"the run file's host laws were fitted under another {differ}; "
-                f"this run's key is {ours}, and theirs is {theirs}"
-            )
+        refuse_unfitted_host(host, config, platform)
+        launch = stated(host.get("key"))
         pp = getattr(config, "pipeline_parallel_size", 1)
         stage = (config.parallel_config.pipeline_parallel_rank, pp) if pp > 1 else None
         # A drafter's runner waits for the last output's MTP status when it
@@ -1905,8 +1955,9 @@ def op_graph(
 def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None):
     """The region of the eager `op_graph` of `config` on an `arch` device the
     store at `root` holds at a shape, of a step that produces output or one
-    that does not, or of its drafter's part (`draft`, a block drafter's
-    draft-KV pass where it is `forward.KV`), or when it holds none
+    that does not, of a two-batch-overlap micro-batch (`micro_batch`), or of
+    its drafter's part (`draft`, a block drafter's draft-KV pass where it is
+    `forward.KV`), or when it holds none
     `forward.missed`'s text, None for no text; under DP, at the rows the
     step's MoE gathers; a prefill's drafter at the `width` its later passes
     pad to; keyed under the performance environment `env` when given, else
@@ -1918,46 +1969,176 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     (`_trace`), its count and wall seconds added to `lazy`'s ``lazy_traces``
     and ``lazy_trace_wall_seconds``; a trace that fails raises, naming the
     shape. A trace from a tree with uncommitted files answers this lookup alone
-    and is not published."""
-    from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology
-    from atom.compass.capture.forward import Shape, missed, structure
+    and is not published.
+
+    Under DP a prefill the store holds no graph at, with no drafter, reads
+    the graph of its tokens, sequences and width that holds G
+    (`forward.Tracer.symbolic`, keyed by `forward.symbolic_shape`) at the
+    step's G, when its hints span G and its guards admit it (`peers.at`),
+    counted in `lazy`'s ``held_lookups``; with `atom_args`, the first such
+    step of a shape traces that graph, and when its two ends differ
+    (`forward.PerG`) each G of the shape is traced as above instead, the
+    shape and why named in `lazy`'s ``lazy_per_g``. With `lazy`, each
+    lookup's wall seconds, its traces among them, are added to its
+    ``lookup_wall_seconds``.
+
+    Each graph read from the store is parsed once and then frozen out of the
+    collector's reach with the rest of the live heap (`parsed`).
+
+    A graph is looked up at the ATOM source and torch this process traces
+    under (`capture.graph_key`), so one traced under another of either is a
+    miss like any other. One the store holds, at a shape or holding G, is
+    loaded through `ArtifactStore.load` under this process's `graph_readings`,
+    and its engine config as it records it: that cell holds the tracer's own
+    ATOM arguments, which no reader restates, and the key's structure names
+    the engine config in their place."""
+    from atom.compass.artifacts import (
+        ArtifactStore,
+        Axis,
+        Conditions,
+        GateState,
+        Row,
+        Topology,
+    )
+    from atom.compass.capture import graph_key, peers
+    from atom.compass.capture.forward import (
+        PerG,
+        Shape,
+        admits,
+        missed,
+        structure,
+        symbolic_shape,
+    )
+    from atom.utils import envs
 
     store, rank = ArtifactStore(root), Topology().ranks()[0]
     dp = config.parallel_config.data_parallel_size
     drafter = getattr(config, "speculative_config", None)
     drafts = drafter.num_speculative_tokens if drafter else 0
-    traced, unpublished, process = set(), {}, []
+    traced, held_traced, unpublished, process = set(), set(), {}, []
+
+    def lazily(shape, symbolic=False):
+        """Trace `shape` (`_trace`), counted in `lazy`; a `symbolic` trace whose
+        two ends differ is named in its ``lazy_per_g``."""
+        began = time.monotonic()
+        # `symbolic` only when set: a concrete trace's call is as before.
+        kwargs = {"symbolic": True} if symbolic else {}
+        try:
+            if not process:
+                process.append(_trace_process())
+            done = process[0].submit(_trace, root, atom_args, arch, shape, **kwargs)
+            unpublished.update(done.result())
+        except PerG as differ:
+            lazy.setdefault("lazy_per_g", {})[str(differ)] = 1
+        # An argument parser's error exits.
+        except (Exception, SystemExit) as failed:
+            why = f"{type(failed).__name__}: {failed}"
+            raise RuntimeError(f"a lazy trace of {shape} failed: {why}") from failed
+        lazy["lazy_traces"] += 1
+        lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
+
+    @functools.cache
+    def here() -> dict:
+        return graph_readings(config.model)
+
+    def parsed(key) -> dict:
+        """The graph the store holds at `key`, loaded under `here` and the
+        engine config it records, parsed and frozen with the rest of the live
+        heap, a collection first so no garbage is kept, as
+        `gc_utils.freeze_gc_heap` freezes the startup heap and under the same
+        `ATOM_GC_FREEZE`: this lookup's caches keep what it parses alive, and
+        every full collection walked all of it."""
+        cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
+        conditions = Conditions.of(**here(), engine_config=cells[Axis.ENGINE_CONFIG])
+        entry = store.load(key, conditions=conditions, gates=GateState.of())
+        graph = json.loads(entry.read_member("graph", rank, "json"))
+        if envs.ATOM_GC_FREEZE:
+            gc.collect()
+            gc.freeze()
+        return graph
+
+    def read(at: str, shape: str) -> dict | None:
+        """The graph the store, or this lookup's unpublished traces, hold at
+        structure `at` and `shape`, as `capture.graph.to_json` writes it."""
+        if (at, shape) in unpublished:
+            return unpublished[at, shape]
+        key = graph_key(at, shape)
+        if not store.directory_for(key).exists():
+            return None
+        return parsed(key)
+
+    @functools.lru_cache(maxsize=64)
+    def held(at: str, shape) -> dict | None:
+        """The graph that holds G of the DP prefill `shape`, at any G, at
+        structure `at`, or None."""
+        text = symbolic_shape(shape)
+        found = read(at, text)
+        if found is None and atom_args is not None and shape not in held_traced:
+            held_traced.add(shape)
+            lazily(shape, symbolic=True)
+            found = read(at, text)
+        return found
 
     @functools.lru_cache(maxsize=64)
     def graph(
-        phase, tokens, seqs, output=True, gathered=None, draft=False, width=None
+        phase,
+        tokens,
+        seqs,
+        output=True,
+        gathered=None,
+        draft=False,
+        width=None,
+        micro_batch=False,
     ) -> dict | str | None:
-        shape = Shape(phase, tokens, seqs, gathered, width).at(dp, drafts)
-        at = structure(config, phase, True, arch, output, draft, env)
-        key = Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape))
+        shape = Shape(phase, tokens, seqs, gathered, width, micro_batch).at(dp, drafts)
+        at = structure(config, phase, True, arch, output, draft, env, micro_batch)
+        key = graph_key(at, str(shape))
         missing = not store.directory_for(key).exists()
+        if missing and dp > 1 and phase == "prefill" and not (draft or drafts):
+            g = shape.gathered or dp * tokens
+            if found := held(at, shape._replace(gathered=None)):
+                (lo, hi), guards = found["hints"], found["guards"]
+                if lo <= g <= hi and admits(guards, g):
+                    if lazy is not None:
+                        lazy["held_lookups"] = lazy.get("held_lookups", 0) + 1
+                    return peers.at(found["region"], found["slots"], g, dp)
         if missing and atom_args is not None and shape not in traced:
             traced.add(shape)
-            began = time.monotonic()
-            try:
-                if not process:
-                    process.append(_trace_process())
-                done = process[0].submit(_trace, root, atom_args, arch, shape)
-                unpublished.update(done.result())
-            # An argument parser's error exits.
-            except (Exception, SystemExit) as failed:
-                why = f"{type(failed).__name__}: {failed}"
-                raise RuntimeError(f"a lazy trace of {shape} failed: {why}") from failed
-            lazy["lazy_traces"] += 1
-            lazy["lazy_trace_wall_seconds"] += time.monotonic() - began
+            lazily(shape)
             missing = not store.directory_for(key).exists()
         if (at, str(shape)) in unpublished:
-            return unpublished[at, str(shape)]
+            return unpublished[at, str(shape)]["region"]
         if missing:
             return missed(store, key) or None
-        return json.loads(store.read(key).read_member("graph", rank, "json"))["region"]
+        return parsed(key)["region"]
 
-    return graph
+    if lazy is None:
+        return graph
+
+    def timed(*args, **kwargs):
+        began = time.monotonic()
+        try:
+            return graph(*args, **kwargs)
+        finally:
+            spent = time.monotonic() - began
+            lazy["lookup_wall_seconds"] = lazy.get("lookup_wall_seconds", 0) + spent
+
+    return timed
+
+
+def graph_readings(model: str) -> dict:
+    """This process's readings, by axis, of an `op_graph` of the model `model`
+    names, less its engine config, each as `compass trace ops` takes it: its
+    torch and ATOM source (`capture.traced_under`) and the model's config.json;
+    an axis no op_graph depends on is unread, of a kind no entry records."""
+    from atom.compass.artifacts import Axis, Row, axes_of
+    from atom.compass.capture import traced_under
+
+    unread = Reading("unread", f"no {Row.OP_GRAPH} depends on it")
+    return {a.field: unread for a in Axis if a not in axes_of(Row.OP_GRAPH)} | {
+        **traced_under(),
+        "model": _file_digest(model, "config.json"),
+    }
 
 
 def _trace_process():
@@ -1989,30 +2170,35 @@ def _tracer(model: str, tp: int, atom_args: tuple, arch: str):
     return tmpdir, Tracer(model, tp, tmpdir.name, atom_args, arch)
 
 
-def _trace(root: str, atom_args, arch: str, shape) -> dict:
+def _trace(root: str, atom_args, arch: str, shape, symbolic=False) -> dict:
     """Trace `shape` as `compass trace ops` traces a record's step, a prefill
-    as one forward, from ATOM's arguments `atom_args` less the server's, on a
+    as one forward, or with `symbolic` a DP prefill's graphs that hold G
+    (`forward.Tracer.symbolic`, which raises `forward.PerG` where they
+    cannot), from ATOM's arguments `atom_args` less the server's, on a
     declared `arch`, in this process's tracer (`_tracer`), its KV pool the one
     a capture of `shape` alone allocates; and publish each graph in the store
     at `root`, one another engine of the run published first aside. From a
     tree with uncommitted files, which may run but not publish, return each
-    graph's region by its structure and shape instead; else return an empty
-    dict."""
+    graph by its structure and shape instead, as `capture.graph.to_json`
+    writes it; else return an empty dict."""
     from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, Rule, roots_for
     from atom.compass.capture import publish
+    from atom.compass.capture.forward import symbolic_shape
     from atom.compass.capture.graph import to_json
     from atom.compass.drive.runfile import _engine_args, engine_only
 
     engine, kept = _engine_args(atom_args), engine_only(atom_args)
     store, tp = ArtifactStore(root), engine.tensor_parallel_size
-    command = f"compass run: a lazy trace of {shape}"
+    what = symbolic_shape(shape) if symbolic else shape
+    command = f"compass run: a lazy trace of {what}"
     dirty = any(r.dirty for r in roots_for({"atom": "atom", "aiter": "aiter"}))
     unpublished = {}
     _, tracer = _tracer(engine.model, tp, tuple(kept), arch)
-    for graph, model, declared in tracer.trace([shape], [shape]):
+    graphs = tracer.symbolic(shape) if symbolic else tracer.trace([shape], [shape])
+    for graph, model, declared in graphs:
         if dirty:
             at = graph.applicability
-            unpublished[at.structure, at.shape] = json.loads(to_json(graph))["region"]
+            unpublished[at.structure, at.shape] = json.loads(to_json(graph))
             continue
         try:
             publish(store, graph, model, declared, tp, kept, command)
@@ -2102,26 +2288,14 @@ def tokenizer(tok, config) -> None:
     from atom.utils.compass_loop import wrap_decode, wrap_encode, wrap_encode_batch
 
     try:
-        host = run.get("host", {})
-        if isinstance(host, list):
-            from atom.compass.run.step_grid import keyed
-
-            host = _frontend_host = _fitted_here(
-                host, keyed(config), lambda e: e.get("key", {}).get("engine"), "host"
-            )
-        term = host.get("tokenizer")
-        if term is None:
-            return
-        backend = "fast" if tok.is_fast else "slow"
-        if term["backend"] != backend:
-            raise ValueError(
-                f"the host laws' tokenizer was fitted on the {term['backend']} "
-                f"backend and the server loaded the {backend} one, which runs an "
-                "order of magnitude apart on one tokenizer.json"
-            )
+        host, term = tokenizer_term(run, tok, config)
     except BaseException as e:
         _end_before_serving(run, e)
         raise
+    if isinstance(run.get("host"), list):
+        _frontend_host = host
+    if term is None:
+        return
     if (loaded := _fingerprint(tok)) not in (None, term["fingerprint"]):
         warnings.warn(
             f"the host laws' tokenizer was fitted on {term['fingerprint']}, but "
@@ -2147,6 +2321,28 @@ def tokenizer(tok, config) -> None:
         )
         if "chars_per_s" in term["segment"]:
             _on_search(lambda n: charge(n / term["segment"]["chars_per_s"]))
+
+
+def tokenizer_term(run: dict, tok, config) -> tuple[dict, dict | None]:
+    """This server's ``host`` entry in the run file `run`, its engine config's
+    among several as the runner picks its own (`pick_fitted`), and that entry's
+    ``tokenizer`` term, None when it states none: a term fitted on another
+    backend than the one `tok`, the tokenizer ATOM's server loaded, runs on is
+    refused."""
+    picked = {"host": run.get("host", {})}
+    pick_fitted(picked, "host", config)
+    host = picked["host"]
+    term = host.get("tokenizer")
+    if term is None:
+        return host, None
+    backend = "fast" if tok.is_fast else "slow"
+    if term["backend"] != backend:
+        raise ValueError(
+            f"the host laws' tokenizer was fitted on the {term['backend']} "
+            f"backend and the server loaded the {backend} one, which runs an "
+            "order of magnitude apart on one tokenizer.json"
+        )
+    return host, term
 
 
 def _record_host(tok, record: Path) -> None:
@@ -2570,10 +2766,36 @@ def host_key(config) -> dict:
 def host_key_of(model: str, engine: dict) -> dict:
     """`host_key` for the model `model` names and the engine config `engine`
     that `keyed` gave, for a process that holds no resolved config."""
+    return {
+        "host_cpu": host_cpu(),
+        "atom": atom_digest(),
+        "model": _file_digest(model, "config.json"),
+        "engine": engine,
+    }
+
+
+def atom_source(digest: str | None = None) -> Reading:
+    """ATOM's source as every artifact reads it: `atom_digest`, here or as a
+    record's run.json ``host_key.atom`` states it in `digest`, a reading of
+    kind `ATOM_PY`."""
+    return Reading(ATOM_PY, atom_digest() if digest is None else digest)
+
+
+def source_root(digest: str | None = None) -> str:
+    """The ``source_root`` a key holds for `atom_source`, ``<kind>-<value>``."""
+    reading = atom_source(digest)
+    return f"{reading.kind}-{reading.value}"
+
+
+def atom_digest() -> str:
+    """The sha256 of ATOM's Python modules here, less `COMPASS_ONLY` and
+    `INSTALL_WRITTEN`."""
     root = Path(atom.__file__).parent
     digest = hashlib.sha256()
     for path in sorted(root.rglob("*.py")):
         relative = path.relative_to(root)
+        if relative == INSTALL_WRITTEN:
+            continue
         skip = next(
             (v for k, v in COMPASS_ONLY.items() if relative.is_relative_to(k)), ()
         )
@@ -2589,12 +2811,7 @@ def host_key_of(model: str, engine: dict) -> dict:
             if node is doc or names & skip:
                 del lines[prev.end_lineno if prev else 0 : node.end_lineno]
         digest.update(f"{relative}\0".encode() + b"".join(lines))
-    return {
-        "host_cpu": host_cpu(),
-        "atom": digest.hexdigest(),
-        "model": _file_digest(model, "config.json"),
-        "engine": engine,
-    }
+    return digest.hexdigest()
 
 
 def _file_digest(name: str, filename: str) -> str | None:
@@ -2951,6 +3168,13 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     summary = RunSummary.of(
         record, wall, *lazy, diagnostics=diagnostics, refusals=tally
     ).as_record()
+    # Each DP prefill whose G were each traced, and why, by the engines that did.
+    if per_g := counted("lazy_per_g"):
+        summary["cost"]["lazy_per_g"] = dict(per_g)
+    # The DP prefill lookups a graph holding G served, and every lookup's wall.
+    for key in ("held_lookups", "lookup_wall_seconds"):
+        if value := total(key):
+            summary["cost"][key] = value
     schedule = summary["schedule"]
     schedule["predicted_seconds"] = seconds
     # How the seconds were obtained: reported, never gated.

@@ -11,13 +11,20 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_artifact_store import CONDITIONS, GATES, stanza
+from test_artifact_store import CONDITIONS, stanza
 
-from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
+from atom.compass.artifacts import (
+    ArtifactStore,
+    Axis,
+    Conditions,
+    GateState,
+    Topology,
+    member_name,
+)
 from atom.compass.bench import ops
-from atom.compass.capture import driverless
+from atom.compass.capture import driverless, graph_key
 from atom.compass.capture.forward import decode, structure
-from atom.compass.run import _op_graphs
+from atom.compass.run import _op_graphs, graph_readings
 
 ARCHES = ("gfx942", "gfx950")
 RANK = Topology().ranks()[0]
@@ -30,6 +37,13 @@ ENGINE = {
     "enable_tbo": False,
     "enable_tbo_decode": False,
 }
+
+
+def run_readings(model: str) -> Conditions:
+    """The readings a run in this process loads an `op_graph` of the model at
+    `model` under, its engine-config cell `CONDITIONS`'."""
+    engine = CONDITIONS.reading(Axis.ENGINE_CONFIG)
+    return Conditions.of(**graph_readings(model), engine_config=engine)
 
 
 def _device(monkeypatch, props):
@@ -58,15 +72,13 @@ def store(tmp_path, config, monkeypatch):
     store = ArtifactStore(str(tmp_path / "store"))
     for arch in ARCHES:
         _device(monkeypatch, driverless._props(arch))
-        key = Key.of(
-            Kind.OP_GRAPH, structure=structure(config, "decode"), shape="decode B=2"
-        )
+        key = graph_key(structure(config, "decode"), "decode B=2")
         store.publish(
             key,
             provenance=stanza("compass trace ops"),
             topology=Topology(),
-            conditions=CONDITIONS,
-            gates=GATES,
+            conditions=run_readings(config.model),
+            gates=GateState.of(),
             members={
                 member_name("graph", RANK, "json"): json.dumps(
                     {"region": {"op": arch}}

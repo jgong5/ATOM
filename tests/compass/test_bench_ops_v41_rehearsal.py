@@ -20,10 +20,15 @@ import subprocess
 import sys
 
 import pytest
+import torch
+from test_bench_ops import _Runner
 from test_capture_mi455_cells import A0, TREE, _trace
 from v41_ops_rehearsal import ATEN_INDEX
 from test_capture_v41_flash import ARGS, EP4
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
+
+from atom.compass.bench import ops
+from atom.utils import forward_context as fctx
 
 HARNESS = pathlib.Path(__file__).with_name("v41_ops_rehearsal.py")
 #: The cells' engine arguments past the model and TP, as their card run starts
@@ -39,15 +44,6 @@ SHAPES = "--width 16 --prefill 2048 1"
 READ = "from atom.compass.capture import driverless\n"
 READ += f"driverless.card = {{0: {A0!r}}}.get\n"
 TRUTH = pathlib.Path(__file__).with_name("v41_capture_truth.py")
-#: The slots where ATOM passes the occurrences of one leaf two buffers, of
-#: which the bench binds one: a query's RoPE positions and a ratio-1 key's
-#: (#2865), and the decoder tail's batch ids and its layer 39's queries'
-#: (#2867).
-SPLIT = {
-    ("aiter.rope_cached_positions_fwd_impl.default", "positions"),
-    ("atom.model_ops.attentions.deepseek_v41.indices:_launch_indices", "batch_ids"),
-    ("atom.model_ops.attentions.deepseek_v41.indices:_launch_indptr_scan", "batch_ids"),
-}
 #: A prefill whose forward runs the rows of its decoder's tail: its tail
 #: holds the whole prompt, a window of it.
 WINDOW = "--prefill 128 1"
@@ -61,9 +57,15 @@ PLANE_BOUND = {
     "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
     "atom.model_ops.deepseek_v41.indexer:_block_maxima",
 }
+#: V4.1's RoPE, over a query's heads or a ratio's index keys, one head.
+ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 #: V4.1's read of its state cursors back to the host, `.cpu()`, a copy into
 #: pageable memory, which no CUDA graph captures: `measure ops` refuses it.
 HOST_COPY = "aten.to.dtype_layout"
+#: What V4.1's step holds on the host and passes a leaf, by operator and slot:
+#: the source of each copy of its staged cursors and slots, and a fill's value
+#: that is a Python number.
+HOSTED = {("aten.copy_.default", "src"), ("aten.fill_.Tensor", "value")}
 
 
 def _run(script, *argv, cwd=TREE):
@@ -122,6 +124,28 @@ def test_every_leaf_reaches_its_launch_but_a_host_copy(rehearsed):
     assert triton
 
 
+def test_an_argument_atom_holds_on_the_host_is_built_there_bound_to_no_buffer(
+    rehearsed,
+):
+    """The capture states on the host what ATOM holds there, and nothing else;
+    each such argument is built on the host, pinned: no buffer of ATOM's binds
+    it, and its leaf reaches its launch."""
+    from atom.compass.bench import ops
+
+    got, _ = rehearsed
+    hosted = [
+        (r, path)
+        for r in got["cached"]
+        for path, spec in ops._specs(json.loads(r["leaf"])["args"])
+        if spec.get("device") == "cpu"
+    ]
+    assert {(r["op"], path) for r, path in hosted} == HOSTED
+    for r, path in hosted:
+        why = r["shape"], r["op"], path, r["bound"], r["why"]
+        assert path not in {*r["bound"], *r["identity"]}, why
+        assert r["verdict"] == "reaches launch", why
+
+
 def test_a_prefill_whose_forward_runs_its_tail_s_rows_refuses_by_name(rehearsed):
     """Its leaves' rows cannot say which pass each runs, so none is bound."""
     got, _ = rehearsed
@@ -131,10 +155,11 @@ def test_a_prefill_whose_forward_runs_its_tail_s_rows_refuses_by_name(rehearsed)
 
 def test_each_leaf_takes_the_buffers_atom_s_capture_passes_it(rehearsed):
     """Each argument a kernel leaf takes of ATOM's metadata, and each integer
-    table of its KV, and each index an aten index operator takes, is the one
-    buffer ATOM's own capture passes every occurrence of that leaf, by name and
-    offset, but `SPLIT`'s. aten's other leaves index nothing and launch the
-    same work on any values."""
+    table of its KV, and each index an aten index operator takes, is the
+    buffer ATOM's own capture passes every occurrence of that leaf, or each of
+    the two it passes its first and later ones (`ops.QUERIED`), by name and
+    offset. aten's other leaves index nothing and launch the same work on any
+    values."""
     got, truth = rehearsed
     wrong, checked = [], 0
     for r in [*got["cached"], *got["fresh"]]:
@@ -142,10 +167,64 @@ def test_each_leaf_takes_the_buffers_atom_s_capture_passes_it(rehearsed):
             slot = path.split(".")[0]
             if r["op"].startswith("aten.") and (r["op"], slot) not in ATEN_INDEX:
                 continue
-            if (r["op"], slot) in SPLIT or r["shape"] == "prefill T=128 B=1":
+            if r["shape"] == "prefill T=128 B=1":
                 continue
             want = {w for w in truth.get(r["leaf"], {}).get(path, []) if w != "?"}
             checked += bool(want)
-            if want and want != {name}:
-                wrong.append((r["shape"], r["op"], path, name, want))
+            names = {name, r["later"].get(path, name)}
+            if want and want != names:
+                wrong.append((r["shape"], r["op"], path, names, want))
     assert checked and wrong == []
+
+
+def test_a_leaf_s_later_occurrences_take_what_atom_passes_them():
+    """Copies of a leaf that runs twice alternate its occurrences' buffers:
+    the tail's batch ids, then its layer 39's queries'."""
+    stub = ops.Stub(_Runner(), 10_000)
+    tail = torch.arange(4, dtype=torch.int32)
+    stub.placed = [(fctx.ForwardContext(), {("sig", "batch_ids"): ("tail", tail)})]
+    stub.later = {(0, "sig", "batch_ids"): ("queries", torch.full_like(tail, -1))}
+    spec = {"shape": [4], "stride": [1], "dtype": "torch.int32", "role": "metadata"}
+    op = {"op": "scan", "args": {"batch_ids": spec}, "occurrences": 2}
+
+    got = [stub._copy(op, "sig", [{}], c)[0]["batch_ids"] for c in range(4)]
+
+    assert [t.tolist() for t in got] == [[0, 1, 2, 3], [-1] * 4] * 2
+
+
+def test_each_rope_takes_its_query_s_or_its_ratio_s_key_positions(rehearsed):
+    """Each RoPE leaf takes the positions ATOM's capture passes it, at each
+    point: the query's and each ratio's keys' apart, a buffer a leaf."""
+    got, truth = rehearsed
+    for shape in ("decode B=16", "prefill T=2048 B=1"):
+        ropes = [r for r in got["cached"] if (r["op"], r["shape"]) == (ROPE, shape)]
+        taken = {r["leaf"]: r["identity"].get("positions") for r in ropes}
+        want = {s: truth.get(s, {}).get("positions") for s in taken}
+        assert {s: [n] for s, n in taken.items()} == want
+        assert len(set(taken.values())) == len(taken) >= 3
+
+
+def test_the_cursor_write_takes_its_staged_cursors_at_its_step_s_slots(rehearsed):
+    """V4.1's cursor write, `cursor[step.slots[:n].long()] = staged[:n]`:
+    its values are the staged cursors ATOM's capture passes it, and its index,
+    a cast no buffer holds, its step's slots widened to int64."""
+    got, truth = rehearsed
+    cursor = "aten.index_put_.default", "attn_metadata_builder.cache.cursor"
+    writes = [r for r in got["cached"] if (r["op"], r["bound"].get("self")) == cursor]
+    assert writes
+    for r in writes:
+        taken = r["identity"]["values"], r["bound"]["indices.0"]
+        assert taken == (*truth[r["leaf"]]["values"], "step.slots.long")
+
+
+@pytest.mark.parametrize("shape", [[4], [2, 4]], ids=["one_row", "two_rows"])
+def test_the_cursor_write_s_values_are_its_staging_s_first_rows(shape):
+    """One row is the first, its unit dim dropped as `cursor[i] = staged[:1]`
+    drops it."""
+    staged, slots = torch.zeros(64, 4, dtype=torch.int64), torch.zeros(64).long()
+    cache = "attn_metadata_builder.cache"
+    held = {f"{cache}._cursor_staging.gpu": staged, f"{cache}._reset_slots": slots}
+    spec = {"shape": shape, "stride": [4, 1][-len(shape) :], "dtype": "torch.int64"}
+    op = {"op": "aten.index_put_.default", "args": {"self": {"role": "kv"}}}
+    _, view = ops._kv(spec, "values", ops._named(op, "values", spec, held) or held)
+    assert (view.data_ptr(), list(view.shape)) == (staged.data_ptr(), shape)

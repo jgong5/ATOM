@@ -211,34 +211,44 @@ def test_measuring_one_record_twice_publishes_each_view_once_and_then_nothing(ru
     assert Bench.started == [] and by_view(store).keys() == held.keys()
 
 
-def test_a_held_entry_taken_under_other_readings_refuses_naming_it(run):
+@pytest.mark.parametrize(
+    "moved",
+    [
+        lambda identity: identity["stack"].update(aiter="v9.9.9"),
+        lambda identity: identity.update(ptl="enabled"),
+    ],
+    ids=["aiter", "ptl"],
+)
+def test_a_run_on_another_platform_measures_its_batches_again_at_its_own_keys(
+    run, moved
+):
     rec = str(run.record)
     store = run(rec, "--sample", "all", *run.named(rec))
-    run.identity["stack"]["aiter"] = "v9.9.9"
+    held = len(entries(store))
+    moved(run.identity)
+    Bench.started.clear()
+    run(rec, "--sample", "all", *run.named(rec))
+    assert Bench.started and len(entries(store)) == 2 * held
+
+
+def test_a_held_entry_recording_other_readings_refuses_naming_it_and_a_fresh_store(
+    run,
+):
+    rec = str(run.record)
+    store = run(rec, "--sample", "all", *run.named(rec))
+    for place in (store.root / "step_measurement").iterdir():
+        path = place / "entry.json"
+        document = json.loads(path.read_text())
+        cells = document["fingerprints"]["step_measurement"]["cells"]
+        cells["software_stack"]["value"] = "v9.9.9"
+        path.chmod(0o644)
+        path.write_text(json.dumps(document))
     Bench.started.clear()
     tokens = "|".join(key.token() for key, _ in entries(store))
-    with pytest.raises(
-        SystemExit, match=rf"other readings than this run's:\n({tokens}): .*v9\.9\.9"
-    ):
-        run(rec, "--sample", "all", *run.named(rec))
-    assert Bench.started == []
-
-
-def test_a_held_entry_taken_under_other_readings_names_a_fresh_store(run):
-    rec = str(run.record)
-    run(rec, "--sample", "all", *run.named(rec))
-    run.identity["stack"]["aiter"] = "v9.9.9"
-    with pytest.raises(SystemExit, match="measure into a fresh --store"):
-        run(rec, "--sample", "all", *run.named(rec))
-
-
-def test_a_held_entry_measured_on_cards_of_another_ptl_state_refuses(run):
-    rec = str(run.record)
-    run.identity["ptl"] = "enabled"
-    run(rec, "--sample", "all", *run.named(rec))
-    run.identity["ptl"] = "disabled"
-    Bench.started.clear()
-    with pytest.raises(SystemExit, match=r"other readings than this run's:\n.*enabled"):
+    told = (
+        rf"other readings than this run's:\n({tokens}): .*v9\.9\.9(.|\n)*fresh --store"
+    )
+    with pytest.raises(SystemExit, match=told):
         run(rec, "--sample", "all", *run.named(rec))
     assert Bench.started == []
 

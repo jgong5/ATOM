@@ -75,7 +75,7 @@ def g(m, n, k):
 
 
 def backend(region, machine=SPEC, kv="bf16", **kwargs):
-    return OpGraphBackend(machine, lambda *shape: region, kv=kv, **kwargs)
+    return OpGraphBackend(machine, lambda *shape, **_: region, kv=kv, **kwargs)
 
 
 def by_name(cost):
@@ -503,7 +503,7 @@ def layers(*lead, count=3):
 def test_a_split_step_lays_both_micro_batches_on_the_compute_and_comm_streams():
     asked = []
 
-    def graph(*at):
+    def graph(*at, **_):
         asked.append(at)
         return layers()
 
@@ -521,9 +521,9 @@ def test_a_split_step_lays_both_micro_batches_on_the_compute_and_comm_streams():
 
 def test_a_gather_of_token_ids_runs_inline_on_the_compute_stream():
     ids = leaf(GATHER, [[2, 1]], x=t([1, 1], role="metadata"))
-    cost = OpGraphBackend(SECOND, lambda *at: layers(ids, count=1), kv="bf16").price(
-        SPLIT
-    )
+    cost = OpGraphBackend(
+        SECOND, lambda *at, **_: layers(ids, count=1), kv="bf16"
+    ).price(SPLIT)
 
     assert by_name(cost) == {"op.tbo": overlap([[(4, 4), (2, 2), (4, 4), (2, 2)]])}
 
@@ -566,11 +566,11 @@ def test_a_micro_batch_whose_exchange_shares_a_par_is_refused(join):
     dual = {"par": [routed, g(1, 8, 8)], "join": join}
 
     with pytest.raises(CostRefused, match="runs an MoE exchange beside a second"):
-        OpGraphBackend(SECOND, lambda *at: dual, kv="bf16").price(SPLIT)
+        OpGraphBackend(SECOND, lambda *at, **_: dual, kv="bf16").price(SPLIT)
 
 
 def test_micro_batches_whose_graphs_exchange_unalike_are_refused():
-    def graph(phase, tokens, seqs, output, gathered):
+    def graph(phase, tokens, seqs, output, gathered, **_):
         return layers(count=tokens - 2)
 
     with pytest.raises(CostRefused, match="change streams 3 and 7 times"):
@@ -578,7 +578,7 @@ def test_micro_batches_whose_graphs_exchange_unalike_are_refused():
 
 
 def test_a_leaf_one_micro_batch_refuses_is_named_before_the_stream_count():
-    def graph(phase, tokens, seqs, output, gathered):
+    def graph(phase, tokens, seqs, output, gathered, **_):
         exchange = "atom.model_ops.moe:foo" if tokens == 3 else GATHER
         return {"seq": [g(1, 8, 8), leaf(exchange, [[2, 8]], x=t([1, 8])), g(1, 8, 8)]}
 
@@ -593,7 +593,7 @@ def test_a_leaf_one_micro_batch_refuses_is_named_before_the_stream_count():
 def test_the_first_micro_batch_issues_first_on_each_stream():
     gather = leaf(GATHER, [[2, 8]], x=t([1, 8]))
 
-    def graph(phase, tokens, seqs, output, gathered):
+    def graph(phase, tokens, seqs, output, gathered, **_):
         compute, exchange = {3: (1, 10), 4: (10, 1)}[tokens]
         return {"seq": [g(1, 8, 8)] * compute + [gather] * exchange}
 
@@ -614,7 +614,7 @@ def test_a_mori_dispatch_with_an_unset_argument_rides_the_comm_stream():
         indices=t([1, 2]),
     )
     region = {"seq": [g(1, 8, 8), dispatch, g(1, 8, 8)]}
-    cost = OpGraphBackend(SECOND, lambda *at: region, kv="bf16").price(SPLIT)
+    cost = OpGraphBackend(SECOND, lambda *at, **_: region, kv="bf16").price(SPLIT)
 
     assert by_name(cost) == {"op.tbo": overlap([[(1, 1), (1, 1), (1, 1)]])}
 
@@ -625,7 +625,7 @@ def test_an_exchange_two_pars_deep_is_refused():
     nested = {"par": [inner, g(1, 8, 8)], "join": "max"}
 
     with pytest.raises(CostRefused, match="runs an MoE exchange beside a second"):
-        OpGraphBackend(SECOND, lambda *at: nested, kv="bf16").price(SPLIT)
+        OpGraphBackend(SECOND, lambda *at, **_: nested, kv="bf16").price(SPLIT)
 
 
 def test_each_micro_batch_s_attention_prices_at_its_own_rows():
@@ -633,7 +633,7 @@ def test_each_micro_batch_s_attention_prices_at_its_own_rows():
         SPLIT, requests=(RequestShape(4, 40_000, False), RequestShape(3, 90_000, False))
     )
     attn = leaf(ATTENTION, [[4, 6144]], q=t([4, 24, 256]), k=t([4, 4, 256]))
-    cost = OpGraphBackend(SPEC, lambda *at: attn, kv="bf16").price(split)
+    cost = OpGraphBackend(SPEC, lambda *at, **_: attn, kv="bf16").price(split)
     each = [price(work(attn, h, 1, "bf16"), SPEC) for h in micro_batches(split)]
 
     assert each[0] != each[1]
@@ -1021,7 +1021,7 @@ def test_each_micro_batch_of_a_split_step_prices_at_its_own_shape():
         ]
     )
 
-    def graph(phase, tokens, seqs, output, gathered):
+    def graph(phase, tokens, seqs, output, gathered, **_):
         return {"seq": [g(tokens, 8, 8)]}
 
     cost = OpGraphBackend(SECOND, graph, kv="bf16", dp=2, price_list=params)
@@ -1044,7 +1044,7 @@ def test_a_split_step_the_list_prices_in_part_is_a_roofline_carrying_why(
     # roofline, a second
     params = listed(*[pt(g(rows, 8, 8), shape, ns, c) for c in (0, 8)])
 
-    def graph(phase, tokens, seqs, output, gathered):
+    def graph(phase, tokens, seqs, output, gathered, **_):
         return {"seq": [g(tokens, 8, 8)]}
 
     cost = OpGraphBackend(SECOND, graph, kv="bf16", dp=2, price_list=params)
@@ -1177,7 +1177,7 @@ def test_a_split_step_of_measured_and_validated_leaves_is_validated(ts, validate
         *[pt(g(t, 8, 8), f"prefill T={t} B=1", t * 1e9, c) for t in ts for c in (0, 8)]
     )
 
-    def graph(phase, tokens, seqs, output, gathered):
+    def graph(phase, tokens, seqs, output, gathered, **_):
         return {"seq": [g(tokens, 8, 8)]}
 
     cost = OpGraphBackend(SECOND, graph, kv="bf16", dp=2, price_list=params)
@@ -1241,15 +1241,14 @@ def test_a_prefill_kind_measured_at_one_row_count_prices_another():
 
 def _published(tmp_path, root=None):
     """The fields of a `price_list` key holding `FLAT`, published under the
-    readings a run on the suite's machine document takes from this tree, or
-    from the tree `root`."""
-    from atom.compass.artifacts import Key, Kind, Reading, git_tree_root, module_root
+    readings a run on the suite's machine document takes from this ATOM
+    source, or from the ATOM source `root`."""
+    from atom.compass.artifacts import Key, Kind, keyed_platform, machine_platform
     from atom.compass.fit.publish import publish
-    from atom.compass.run import _machine
+    from atom.compass.run import _machine, atom_source
     from atom.compass.run.step_grid import readings
 
-    tree = git_tree_root("atom", module_root("atom"))
-    source = Reading("tree", root) if root else Reading.of_source_root(tree)
+    source = atom_source(root)
     machine = _machine({"machine": DOCUMENT})
     conditions = readings(machine, atom_src=source, model="m", engine_config="{}")
     key = Key.of(
@@ -1262,7 +1261,7 @@ def _published(tmp_path, root=None):
         decode_context_parallel_size=1,
         enable_expert_parallel=False,
         enable_dp_attention=False,
-        machine_spec="sha256:" + "1" * 64,
+        **keyed_platform(Kind.PRICE_LIST, machine_platform(machine)),
         source_root="tree-" + "a" * 40,
     )
     args = SimpleNamespace(store=str(tmp_path / "store"), out=str(tmp_path), ptl=None)

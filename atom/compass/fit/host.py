@@ -18,8 +18,8 @@ server's lines are where ``steps/<name>.local`` names (`atom.compass.run.LOCAL`)
 not in its steps. A term the records cannot give, or a kind of
 tokenizer call as ``tokenizer.<kind>`` or a hop as ``hops.<hop>``, is left out
 and its reason listed under the report's ``unfitted``. The host key gains the
-configuration's `machine_spec`, which a run's spec must match; the entry is
-keyed by that host key's values and holds the run file's `host` entry as its
+fields of the configuration's platform a `host_laws` key states, which a run's
+spec must match; the entry is keyed by that host key's values and holds the run file's `host` entry as its
 params.
 """
 
@@ -27,7 +27,7 @@ import gzip
 import json
 from pathlib import Path
 
-from atom.compass.artifacts import Key, Kind
+from atom.compass.artifacts import Key, Kind, keyed_platform
 from atom.compass.backends.step_linear_fit import (
     fit_hops,
     fit_host,
@@ -124,14 +124,14 @@ def main(argv: list[str]) -> None:
     samples, config = publish.inputs(args, ("record",))
     host, report = host_laws(samples, args.inputs, args.client_run)
     k = host["key"]
-    k["machine_spec"] = config["machine_spec"]
+    k |= keyed_platform(Kind.HOST_LAWS, config["platform"])
     key = Key.of(
         Kind.HOST_LAWS,
+        **keyed_platform(Kind.HOST_LAWS, k),
         host_cpu=k["host_cpu"],
         atom_src=k["atom"],
         model=k["model"],
         engine_config=json.dumps(k["engine"], sort_keys=True),
-        machine_spec=k["machine_spec"],
     )
     command = " ".join([PROG, *argv])
     publish.publish(args, command, key, publish.conditions(config), host, report)
