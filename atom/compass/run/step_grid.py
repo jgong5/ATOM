@@ -26,7 +26,8 @@ definition and the residual's sources, which loading does not read.
 
 Its publisher states the readings `conditions` takes. The engine-config reading
 is `keyed`, as JSON: the ladder the runner replays (none under
-``enforce_eager``), the KV block size and dtype, the quantization, the TP and
+``enforce_eager``), the KV block size and dtype, the quantization with its
+layer names as the model's runner remaps them (`quantization`), the TP and
 DP widths, DP attention, expert parallelism, TBO, the MoE backend, EPLB and
 DeepSeek-V4.1 decoder SWA bounded replay when
 off ATOM's default, the index cache's dtype where ATOM resolved it apart from
@@ -57,8 +58,11 @@ the grading process: the run checked it against its own as it started, and its
 summary records the digest of the bundle it priced with.
 """
 
+import copy
+import functools
 import json
 import os
+import tempfile
 from collections.abc import Mapping
 from types import FunctionType, SimpleNamespace
 
@@ -96,6 +100,11 @@ OFF_DEFAULT = (
 DERIVED = {"index_cache_dtype": "kv_cache_dtype"}
 #: ATOM's prefill token buckets, an environment variable `keyed` the same way.
 BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
+#: The quantization config's lists of layer names, which its runner remaps.
+LAYERS = ("layer_pattern_specs", "exclude_layers")
+LAYERS += tuple(f"online_{name}" for name in LAYERS)
+#: The arch `remapping` declares: what it reads is a class constant on any arch.
+REMAP_ARCH = "gfx950"
 
 
 def keyed(config, ladder: bool = True) -> dict:
@@ -119,7 +128,7 @@ def keyed(config, ladder: bool = True) -> dict:
     return drafts | {
         "kv_cache_block_size": config.kv_cache_block_size,
         "kv_cache_dtype": config.kv_cache_dtype,
-        "quantization": config.quant_config.compute_hash(),
+        "quantization": quantization(config),
         "tensor_parallel_size": config.tensor_parallel_size,
         "data_parallel_size": config.parallel_config.data_parallel_size,
         "enable_dp_attention": config.enable_dp_attention,
@@ -128,6 +137,49 @@ def keyed(config, ladder: bool = True) -> dict:
         "enable_tbo_decode": config.enable_tbo_decode,
         "env": keyed_env(),
     }
+
+
+def quantization(config) -> str:
+    """The hash of `config`'s quantization config as its runner holds it, its
+    layer names remapped to the model's modules as `ModelRunner.__init__` remaps
+    them before it builds: on a copy where the runner has not, and as it is
+    where the packed modules the remap leaves on it say it has, since a second
+    remap can rename a name again. A config naming no layer has none to remap."""
+    from atom.config import QuantizationConfig
+
+    held = config.quant_config
+    if (
+        isinstance(held, QuantizationConfig)
+        and not hasattr(held, "packed_modules_mapping")
+        and any(getattr(held, name) for name in LAYERS)
+    ):
+        held = copy.deepcopy(held)
+        architecture = config.hf_config.architectures[0]
+        held.remap_layer_name(config.hf_config, **remapping(architecture))
+    return held.compute_hash()
+
+
+@functools.cache
+def remapping(architecture: str) -> dict:
+    """The keywords `ModelRunner.__init__` remaps with for the model class of
+    `architecture`, read in a process of its own: the class's module imports
+    aiter, whose probes need a device, here `REMAP_ARCH`."""
+    from atom.compass.bench.ops import _child
+
+    return _child(_remapping, architecture)
+
+
+def _remapping(architecture: str) -> dict:
+    from atom.compass.capture import driverless
+
+    with tempfile.TemporaryDirectory(prefix="compass-remap-") as tmpdir:
+        driverless.install(tmpdir, REMAP_ARCH)
+        from atom.model_engine.model_runner import support_model_arch_dict
+        from atom.utils import resolve_obj_by_qualname
+
+        cls = resolve_obj_by_qualname(support_model_arch_dict[architecture])
+    names = ("packed_modules_mapping", "quant_exclude_name_mapping")
+    return {name: getattr(cls, name, {}) for name in names}
 
 
 def keyed_env() -> dict:
