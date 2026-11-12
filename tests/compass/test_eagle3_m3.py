@@ -17,6 +17,7 @@ anywhere.
 import copy
 import json
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -77,7 +78,7 @@ def _eagle_record(path, steps):
         elif i % 3 == 0:
             line["produces_output"] = False
             draft = round(_dot(DRAFT_KV, serial_passes(view, 1)[0]) * 1e9)
-        else:  # an output prefill's draft, not fitted under a serial drafter
+        else:  # an output prefill's draft, not fitted under an EAGLE3 drafter
             draft = target
         line["d_target_ns"], line["d_busy_ns"] = target, target + draft
     path.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
@@ -179,11 +180,10 @@ def test_each_draft_vector_is_held_out_by_run(tmp_path):
     assert all(t.provenance.validated for t in terms)
 
 
-def test_a_record_times_each_serial_draft_pass(tmp_path, monkeypatch):
-    """A serial drafter's propose points its context at each pass it runs; the
-    recording runner records a device event there, and each line of a forward
-    that proposes carries each pass's device time, the last to the propose's
-    end. A decode's label carries them where its draft label stands."""
+def _serial_record(tmp_path, monkeypatch, method):
+    """A record of `_drive`'s batches by a serial drafter of `method` whose
+    propose points its context at each of three passes, the first running
+    `KV` of device work and the other two `PROPOSE`, and those batches."""
     batches = _drive(tmp_path / "simulated", monkeypatch, {0: [0, 1]})[0][0]
     recorded, device = _recorded(batches[-1], drafter="eagle")
     base = recorded.__mro__[2]
@@ -191,7 +191,7 @@ def test_a_record_times_each_serial_draft_pass(tmp_path, monkeypatch):
     class _Serial(base):
         def __init__(self, rank, config):
             super().__init__(rank, config)
-            self.drafter.is_block_drafter = False
+            self.drafter.speculative_config = SimpleNamespace(method=method)
             self.drafter._publish_draft_shape = lambda *a, **k: None
 
         def propose_draft_token_ids(self, batch, align_only=False):
@@ -199,17 +199,25 @@ def test_a_record_times_each_serial_draft_pass(tmp_path, monkeypatch):
                 getattr(self.drafter, "_publish_draft_shape", lambda: None)()
                 self.queued.append(work)
 
-    class _Eagle(recorded, _Serial):
+    class _Drafted(recorded, _Serial):
         pass
 
     device.tick = 10**12
     monkeypatch.setenv(ENV, str(tmp_path / "real"))
-    runner = _Eagle(0, _config())
+    runner = _Drafted(0, _config())
     for b in batches:
         runner.forward(b)
     runner.exit()
+    return read(tmp_path / "real")[0], batches
 
-    lines = read(tmp_path / "real")[0]
+
+def test_a_record_times_each_eagle3_draft_pass(tmp_path, monkeypatch):
+    """An EAGLE3 drafter's propose points its context at each pass it runs;
+    the recording runner records a device event there, and each line of a
+    forward that proposes carries each pass's device time, the last to the
+    propose's end. A decode's label carries them where its draft label stands."""
+    lines, batches = _serial_record(tmp_path, monkeypatch, "eagle3")
+
     outputs = [b.produces_output() for b in batches]
     assert any(outputs) and not all(outputs)
     for line, output in zip(lines, outputs):
@@ -224,6 +232,17 @@ def test_a_record_times_each_serial_draft_pass(tmp_path, monkeypatch):
     for s in decodes:
         assert s.passes_s == pytest.approx((KV * 1e-9, PROPOSE * 1e-9, PROPOSE * 1e-9))
     assert all(s.passes_s is None for s in samples if s.view.prefill)
+
+
+def test_a_serial_mtp_record_times_its_propose_whole(tmp_path, monkeypatch):
+    """Serial MTP runs through the same proposer and points its context at
+    each pass too; its record times the propose whole, so its draft law keeps
+    its per-rung vectors."""
+    lines, batches = _serial_record(tmp_path, monkeypatch, "mtp")
+
+    proposed = [line for line, b in zip(lines, batches) if b.produces_output()]
+    assert proposed and all("d_propose_ns" in line for line in proposed)
+    assert not any(DRAFT_PASSES in line for line in lines)
 
 
 # --- with a driver -----------------------------------------------------------

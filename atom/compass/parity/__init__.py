@@ -23,7 +23,7 @@ recorded at the forward's exit (`d_target_ns` to one recorded just after
 pass before it, or on a forward that samples nothing, to the start of its first
 drafter pass, that one or `propose_draft_token_ids`); `d_draft_kv_ns` and
 `d_propose_ns` time those two drafter passes, each between device events at its
-entry and exit, on a forward that runs it; under a serial drafter
+entry and exit, on a forward that runs it; under an EAGLE3 drafter
 `d_draft_passes_ns` times each draft forward `propose_draft_token_ids` runs, one
 a pass, from a device event where the drafter points its context at that pass
 (`_publish_draft_shape`) to the next one's, the last to the propose's exit;
@@ -538,8 +538,9 @@ class StepRecording:
             self.drafter.compute_draft_kv = functools.partial(
                 self._draft_pass, "d_draft_kv_ns", draft_kv
             )
+            spec = getattr(self.drafter, "speculative_config", None)
             publish = getattr(self.drafter, "_publish_draft_shape", None)
-            if publish is not None and not self.drafter.is_block_drafter:
+            if publish is not None and getattr(spec, "method", None) == "eagle3":
                 self.drafter._publish_draft_shape = functools.partial(
                     self._serial_pass, publish
                 )
@@ -615,7 +616,7 @@ class StepRecording:
         return reply
 
     def _serial_pass(self, call, *args, **kwargs):
-        """`call`, a serial drafter pointing its context at its next pass,
+        """`call`, an EAGLE3 drafter pointing its context at its next pass,
         after a device event where that pass starts."""
         if getattr(self, "_parity_record", None) is not None:
             self._stamps.setdefault("pass_events", []).append(self.device_event())
@@ -655,7 +656,7 @@ class StepRecording:
         passes = {
             k: stamps.pop(k) for k in ("d_draft_kv_ns", "d_propose_ns") if k in stamps
         }
-        # Each serial pass runs to the next one's start, the last to the propose's exit.
+        # Each draft pass runs to the next one's start, the last to the propose's exit.
         propose = passes.get("d_propose_ns")
         bounds = [*starts, propose[1]] if starts and propose else []
         if "d_target_ns" in marks and "d_draft_kv_ns" in passes:

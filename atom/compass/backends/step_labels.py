@@ -52,7 +52,7 @@ bound over the record. A decode's draft label, its `propose`
 pass, is cut where the device reached the pass, placed by that lead, before
 the host's draft copy wait (`t_draft_recv_ns`) began: the host queues the pass
 just before that wait, so the window may hold the device's wait for it.
-Under a serial drafter a decode's line also times each draft forward of that
+Under an EAGLE3 drafter a decode's line also times each draft forward of that
 pass (`DRAFT_PASSES`), which stand and are cut with its draft label.
 
 A prefill step's labels are a trace run's busy time per pass (`parity.busy`),
@@ -139,7 +139,7 @@ CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced")
 #: The directory beside a trace run's `steps` its traces are in (`parity.busy`).
 TRACE = "trace"
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
-#: The line key timing each pass of a serial drafter's `propose`.
+#: The line key timing each pass of an EAGLE3 drafter's `propose`.
 DRAFT_PASSES = "d_draft_passes_ns"
 TABLE_VERSION = 1
 #: run.json's entry naming the JIT modules and kernels its server compiled while
@@ -182,7 +182,7 @@ class Sample:
     feature (`launch_features`), empty on a line that states none.
     `blocked` is the seconds its `W_launch` left out per blocking HIP call
     that blocked, from its line's `blocked_ns`; None on a line without it.
-    `passes_s` holds the seconds of each pass a serial drafter's `propose`
+    `passes_s` holds the seconds of each pass an EAGLE3 drafter's `propose`
     ran, from its line's `d_draft_passes_ns`, on a decode whose draft label
     stands; None elsewhere.
     `floor` names, per busy line field of a drafter part, why the profiler's

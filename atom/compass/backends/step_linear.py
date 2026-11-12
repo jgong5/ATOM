@@ -112,7 +112,7 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
                "propose": VECTOR, "draft_kv": VECTOR,
                "short_propose": VECTOR,     # with "below": tokens
                "output_prefill_kv": true,
-               "forward": VECTOR}}          # with "passes": K; all five optional
+               "forward": VECTOR}}          # with "passes": K; each optional
 
     VECTOR = {"coefficients": {<feature>: seconds, ...},
               "hull": HULL,

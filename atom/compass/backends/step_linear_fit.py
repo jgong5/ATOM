@@ -106,7 +106,7 @@ out and named under `unfitted`; `StepLinearBackend` refuses its steps.
 On an MTP record a step also carries a draft label (`step_labels`). `fit` fits
 the steps that carry one on their draft labels the same way, and writes that law
 under the law's `draft`; it holds no `held_out` unless its records time a
-serial drafter's passes (below). A step with a propose label
+EAGLE3 drafter's passes (below). A step with a propose label
 (`step_labels`) is fitted there on its draft label less that label, the
 draft-KV pass a middle chunk runs too, and left out when nothing remains; the
 propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`,
@@ -118,7 +118,7 @@ sets the draft law's `output_prefill_kv`. The target's vectors fit the device
 label less the draft-KV label.
 On an MTP record both prefill vectors, the target's and the draft's, add
 `seqs` and `out` (`StepLinearLaw`).
-Records whose decodes time a serial drafter's passes (`passes_s`) fit the
+Records whose decodes time an EAGLE3 drafter's passes (`passes_s`) fit the
 draft law's `forward` vector instead, each pass a sample at its own features
 (`serial_passes`), with `passes` the count every such step ran, and its
 `propose` vector on what each decode's draft label holds past its passes; the
@@ -1526,7 +1526,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
 
 def _draft_options(options, serial: bool) -> dict:
     """`options` for the draft law, which adopts no MoE column and no padding;
-    under a serial drafter whose records time its passes, the `base` form: its
+    under an EAGLE3 drafter whose records time its passes, the `base` form: its
     prefill vector fits the middle chunks alone, each one request's chunk at
     the step's token budget, whose `history` is its `query_cached` over it."""
     drafted = {**(options or {}), "moe_routing": None, "buckets": None}
@@ -1535,7 +1535,7 @@ def _draft_options(options, serial: bool) -> dict:
 
 def _draft_samples(samples) -> list:
     """The samples the draft law's prefill and decode vectors are fitted on,
-    each labelled with its draft label (`_draft_kv`). Under a serial drafter
+    each labelled with its draft label (`_draft_kv`). Under an EAGLE3 drafter
     whose records time its passes, only the middle chunks: its decodes' and
     output prefills' drafts are its passes and the rest of their draft."""
     serial = any(s.passes_s for s in samples)
@@ -1697,7 +1697,7 @@ def mark_held_out(
     """Write the held-out errors: under each of `law`'s vectors, as `held_out`,
     the hull of the rank rows `_held_out` priced its steps by, their errors per
     band; under `report`'s `held_out`, each run's errors per band. A draft
-    law fitted on a serial drafter's passes, its vectors alike, on the steps
+    law fitted on an EAGLE3 drafter's passes, its vectors alike, on the steps
     each is fitted on, their bands named `draft` (`_mark_passes`); `draft`
     says `law` is a draft law."""
     from scipy.spatial import QhullError
