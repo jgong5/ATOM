@@ -122,7 +122,8 @@ draft law's `forward` vector instead, each pass a sample at its own features
 (`serial_passes`), with `passes` the count every such step ran, and its
 `propose` vector on what each decode's draft label holds past its passes; the
 draft law's prefill vector then fits the middle chunks alone, whose draft is
-the draft-KV pass, and it has no decode or `draft_kv` vector. `mark_held_out`
+the draft-KV pass, in the `base` form, and it has no decode or `draft_kv`
+vector. `mark_held_out`
 gives each of that draft law's vectors `held_out` as it gives the law's, on
 the steps each is fitted on.
 
@@ -1491,7 +1492,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             "decode": {},
         }
     elif drafts:
-        law["draft"] = fit(drafts, _unrouted(options), seed, draft=True)[0]
+        drafted = _draft_options(options, bool(serial))
+        law["draft"] = fit(drafts, drafted, seed, draft=True)[0]
     if serial:
         law["draft"]["forward"] = _forward(serial)
         law["draft"]["propose"] = _propose(_rest(serial))
@@ -1509,9 +1511,13 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     return law, report
 
 
-def _unrouted(options) -> dict:
-    """`options` for the draft law, which adopts no MoE column and no padding."""
-    return {**(options or {}), "moe_routing": None, "buckets": None}
+def _draft_options(options, serial: bool) -> dict:
+    """`options` for the draft law, which adopts no MoE column and no padding;
+    under a serial drafter whose records time its passes, the `base` form: its
+    prefill vector fits the middle chunks alone, each one request's chunk at
+    the step's token budget, whose `history` is its `query_cached` over it."""
+    drafted = {**(options or {}), "moe_routing": None, "buckets": None}
+    return {**drafted, "form": "base"} if serial else drafted
 
 
 def _draft_samples(samples) -> list:
@@ -1709,7 +1715,8 @@ def mark_held_out(
     serial = [s for s in samples if s.passes_s]
     drafts, mine = _draft_samples(samples), {"held_out": {}}
     if len({s.provenance["run"] for s in drafts}) > 1:
-        mark_held_out(law["draft"], mine, drafts, _unrouted(options), seed, True)
+        drafted = _draft_options(options, True)
+        mark_held_out(law["draft"], mine, drafts, drafted, seed, True)
     if len({s.provenance["run"] for s in serial}) > 1:
         _mark_passes(law["draft"], mine, serial)
     for run, bands in mine["held_out"].items():
