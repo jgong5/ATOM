@@ -3610,7 +3610,7 @@ def _densify(families, tried: set) -> dict:
         if ((base, a), c) in tried or ((base, b), c) in tried:
             return True
         at_a, at_b = ({x: k for x, k, _ in across[base, t]} for t in (a, b))
-        return any(at_a[x] == at_b[x] for x in at_a.keys() & at_b.keys())
+        return any(x in at_b and at_a[x] == at_b[x] for x in at_a)
 
     want = defaultdict(set)
     for fam, points in [*families.items(), *across.items()]:
