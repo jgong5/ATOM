@@ -243,14 +243,16 @@ def test_a_prefix_that_never_starts_the_decode_fails_in_prefix_s(
     tmp_path, planted, on  # noqa: F811
 ):
     env, _ = planted
-    env |= {"PLANTED_ON_HANG": "start", "PREFIX_S": "2", "WAIT_S": "30"}
-    start = time.monotonic()
+    # The prefix's hang outlasts PREFIX_S and ends within WAIT_S, starting a
+    # decode that exits at once: a deploy.sh that waited out WAIT_S for its
+    # process id would fail naming that exit instead.
+    env |= {"PLANTED_ON_HANG": "start", "PREFIX_S": "2", "WAIT_S": "600"}
+    env["PLANTED_FAIL"] = "decode"
 
     done = _run(_record(tmp_path, on), env, tmp_path)
 
     assert done.returncode == 1
     assert "deploy: the decode instance wrote no process id in 2 s" in done.stderr
-    assert time.monotonic() - start < 20
 
 
 def test_a_decode_that_exits_at_once_fails_the_deployment_before_the_prefill_answers(
@@ -258,21 +260,21 @@ def test_a_decode_that_exits_at_once_fails_the_deployment_before_the_prefill_ans
 ):
     env, _ = planted
     env["PLANTED_FAIL"] = "decode"
-    # The prefill instance's command starts 30 s late.
+    # The prefill instance's command, a child of deploy.sh, starts only once
+    # deploy.sh has exited.
     bindir = tmp_path / "bin"
     (bindir / "python3").rename(bindir / "python3-planted")
     (bindir / "python3").write_text(
-        '#!/bin/sh\ncase "$*" in *"/prefill --"*) sleep 30 ;; esac\n'
+        '#!/bin/sh\ncase "$*" in *"/prefill --"*)\n'
+        '    while kill -0 "$PPID" 2>/dev/null; do sleep 0.1; done ;;\nesac\n'
         'exec "$(dirname "$0")/python3-planted" "$@"\n'
     )
     (bindir / "python3").chmod(0o755)
-    start = time.monotonic()
 
     done = _run(_record(tmp_path, on), env, tmp_path)
 
     assert done.returncode == 1
     assert "deploy: the decode instance exited before it answered" in done.stderr
-    assert time.monotonic() - start < 20
 
 
 def test_a_stop_whose_prefix_hangs_gives_up_after_prefix_s(
