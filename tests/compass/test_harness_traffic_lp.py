@@ -75,10 +75,12 @@ from compass_harness.strategy import ClockPhaseRunner
 from compass_harness.timesource import ClockTimer
 from compass_harness.traffic_lp import (
     HTTP,
+    PREFILL_URL_ENV,
     STREAM,
     SendAfterCancel,
     TrafficLP,
     UnansweredRequests,
+    UnroutedCancel,
 )
 from compass_harness.transport import addresses, credit_key
 
@@ -1001,6 +1003,92 @@ def test_behind_the_router_lp_requests_cancels_and_the_stream_cross_it(
     assert (http, stream) == ("traffic->router:http", "router->traffic:stream")
     assert sent == [http, http]
     assert published[1] == (_key(0), 2.0 + ADMIT, 1, "cancel")
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:8010", None])
+def test_behind_a_plain_router_a_cancel_goes_to_frontend_p_s_url(
+    url, tmp_path, monkeypatch
+):
+    """Behind a PD router that is no LP, which answers a cancel 400, aiperf's
+    cancel of a request open at the grace deadline, 2.0, is stamped on the
+    request's channel to frontend-P and published with frontend-P's URL. With
+    no URL named, the cancel fails the run by name and publishes nothing,
+    where frontend-P would wait for it forever."""
+    pd = {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10}
+    endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
+    server = clock_transport.serve(
+        ClockAuthority(prefill_decode_table(**RUN, **pd)), endpoint
+    )
+    run_file = tmp_path / "run.json"
+    run_file.write_text(
+        json.dumps({"clock_endpoint": endpoint, "bound_s": 1e6, **RUN, **pd})
+    )
+    monkeypatch.setenv(RUN_ENV, str(run_file))
+    monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / "lp"))
+    monkeypatch.setenv(PREFILL_URL_ENV, url or "")
+    stream = "frontend-D->traffic:stream"
+    monkeypatch.setattr(
+        traffic_lp, "LPRuntime", lambda *_: ScriptedRuntime([(2.0, set())], stream)
+    )
+
+    async def main():
+        traffic = TrafficLP.from_env()
+        stamps, reports = addresses(str(tmp_path / "lp"))
+        sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+        sub.connect(stamps)
+        sub.subscribe(b"")
+        await traffic.subscribed(1)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(reports)
+        published = []
+
+        async def on_return(worker_id, ret):
+            pass
+
+        held = traffic.hold(on_return)
+
+        async def worker():
+            while True:
+                published.append(await sub.recv_pyobj())
+                if len(published[-1]) > 3:  # the cancel
+                    push.send_pyobj((_key(0),))
+                    await held("w", SimpleNamespace(credit=_credit(0), error=None))
+
+        reader = asyncio.ensure_future(worker())
+        traffic.send(_key(0))
+        while traffic.now() < 2.0:
+            await traffic.wait(2.0)
+        try:
+            await traffic.cancel()
+        except UnroutedCancel as refused:
+            with pytest.raises(UnroutedCancel) as failed:
+                await asyncio.wait_for(traffic.done, 5)
+            assert failed.value is refused
+            return traffic.http, published, refused
+        else:
+            traffic.finish()
+            await asyncio.wait_for(traffic.done, 5)
+            return traffic.http, published, None
+        finally:
+            reader.cancel()
+            push.close(linger=0)
+            sub.close(linger=0)
+
+    try:
+        http, published, refused = _run(main())
+    finally:
+        server.close()
+    assert http == "traffic->frontend-P:http"
+    if url:
+        assert refused is None
+        assert published[1] == (_key(0), 2.0 + ADMIT, 1, "cancel", url)
+    else:
+        assert [p for p in published if len(p) > 3] == []
+        assert str(refused) == (
+            f"requests [{_key(0)}] are cancelled on {http}, and {PREFILL_URL_ENV} "
+            "names no URL for frontend-P: the router in front of it answers a "
+            "cancel 400, and frontend-P would wait for each one forever"
+        )
 
 
 def test_a_1p1d_hold_settles_the_frontend_d_stream(tmp_path):

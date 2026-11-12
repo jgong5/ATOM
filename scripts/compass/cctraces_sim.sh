@@ -214,6 +214,9 @@ if [[ $MODE == 1p1d ]]; then
     [[ " $SERVER_ARGS ${PREFILL_ARGS:-} ${DECODE_ARGS:-} " == *" --enable-dp-attention "* ]] && export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
     PREFILL_PORT=$PORT bash "$ROOT/scripts/compass/pd_sim.sh" "$OUT/run.json" >"$OUT/pd_sim.log" 2>&1 &
     ready=("pd_sim: ready" "$OUT/pd_sim.log")
+    # Behind a router that is no LP, the traffic LP posts each cancel to the
+    # prefill server (compass_harness/traffic_lp.py).
+    export COMPASS_HARNESS_PREFILL_URL=http://127.0.0.1:$PORT
     PORT=$ROUTER_PORT
 else
     compass=(--compass-run "$OUT/run.json")

@@ -29,7 +29,11 @@ When aiperf cancels the requests in flight at its grace deadline, the traffic
 LP closes them at that time (`cancel`): each one's cancel is a stamped request
 of its own, which its worker sends and the frontend answers by hanging the
 cancelled request up at the cancel's arrival. Behind a PD router the router LP
-answers it and hands it on to the frontend that holds the request.
+answers it and hands it on to the frontend that holds the request. A PD router
+that is no LP answers a cancel 400, as a chat request it cannot read, so behind
+one, where the HTTP channel leads to frontend-P, each cancel goes to
+frontend-P's own URL, from ``PREFILL_URL_ENV``; a cancel there with none named
+fails the run by name, where frontend-P would wait for it forever.
 
 A request that errors mid-stream never reports the events after its last read.
 When released events stay unreported for ``DIAG_S`` wall seconds while an
@@ -41,6 +45,7 @@ import logging
 import math
 import os
 import pickle
+from typing import NoReturn
 
 import zmq
 import zmq.asyncio
@@ -56,6 +61,10 @@ from compass_harness.transport import addresses, credit_key
 HTTP = "traffic->frontend:http"
 STREAM = "frontend->traffic:stream"
 TRAFFIC = LpId("traffic")
+#: The HTTP channel behind a PD router that is no LP, and the variable naming
+#: the URL of frontend-P, where a cancel on that channel goes.
+PREFILL_HTTP = "traffic->frontend-P:http"
+PREFILL_URL_ENV = "COMPASS_HARNESS_PREFILL_URL"
 #: Loop turns the hold waits for aiperf to block before it says so in the log.
 SPIN_DIAG = 100_000
 
@@ -70,6 +79,10 @@ class SendAfterCancel(RuntimeError):
     """A request sent after `TrafficLP.cancel` closed others."""
 
 
+class UnroutedCancel(RuntimeError):
+    """A cancel on `PREFILL_HTTP` with no URL for frontend-P."""
+
+
 class TrafficLP:
     def __init__(
         self,
@@ -77,8 +90,11 @@ class TrafficLP:
         prefix: str,
         http: str = HTTP,
         stream: str = STREAM,
+        cancel_url: str | None = None,
     ) -> None:
+        # cancel_url: where each cancel goes, if not to its request's URL.
         self.rt, self.http, self.stream = rt, http, stream
+        self.cancel_url = cancel_url
         stamps, reports = addresses(prefix)
         ctx = zmq.asyncio.Context.instance()
         self._pub = ctx.socket(zmq.XPUB)
@@ -131,6 +147,7 @@ class TrafficLP:
             os.environ[ADDRESS_ENV],
             http.name,
             stream.name,
+            os.environ.get(PREFILL_URL_ENV) if http.name == PREFILL_HTTP else None,
         )
 
     # ---- the clock ClockPacedLoopScheduler paces on ----
@@ -167,16 +184,13 @@ class TrafficLP:
         later is never reported and the hold would wait for it forever.
         """
         if self.cancelled:
-            refused = SendAfterCancel(
-                f"request {key} sent after a cancel closed requests "
-                f"{sorted(self.cancelled)}: their stream seqs released later on "
-                f"{self.stream} are never reported, so the hold would wait forever"
+            self._fail(
+                SendAfterCancel(
+                    f"request {key} sent after a cancel closed requests "
+                    f"{sorted(self.cancelled)}: their stream seqs released later on "
+                    f"{self.stream} are never reported, so the hold would wait forever"
+                )
             )
-            failed = asyncio.get_running_loop().create_future()
-            failed.set_exception(refused)
-            self._tasks.append(failed)  # the hold raises it, failing `done`
-            self._changed.set()
-            raise refused
         arrival, seq = self.rt.stamp_send(self.http)
         self.open[key] = None
         self._pub.send_pyobj((key, arrival, seq))
@@ -186,24 +200,43 @@ class TrafficLP:
         """aiperf cancels what is in flight: close every open request.
 
         Once aiperf has caught up with the clock, stamps one cancel per open
-        request, publishes it for the worker that sent the request, and returns
-        once every one is written. The hold passes each closed request's return
-        before the next clock call; its stream events still to come are dropped.
+        request, publishes it for the worker that sent the request, with
+        `cancel_url` when set, and returns once every one is written. The hold
+        passes each closed request's return before the next clock call; its
+        stream events still to come are dropped.
         """
         fut = asyncio.get_running_loop().create_future()
         self._caught_up.append(fut)
         self._changed.set()
         await fut
         keys = list(self.open)
+        if keys and self.http == PREFILL_HTTP and not self.cancel_url:
+            self._fail(
+                UnroutedCancel(
+                    f"requests {keys} are cancelled on {self.http}, and "
+                    f"{PREFILL_URL_ENV} names no URL for frontend-P: the router "
+                    "in front of it answers a cancel 400, and frontend-P would "
+                    "wait for each one forever"
+                )
+            )
         self.open.clear()
         self.cancelled.update(keys)
         self.closed.update(dict.fromkeys(keys))
+        to = (self.cancel_url,) if self.cancel_url else ()
         for key in keys:
             arrival, seq = self.rt.stamp_send(self.http)
-            self._pub.send_pyobj((key, arrival, seq, "cancel"))
+            self._pub.send_pyobj((key, arrival, seq, "cancel", *to))
         while not self._written.issuperset(keys):
             self._changed.clear()
             await self._changed.wait()
+
+    def _fail(self, error: Exception) -> NoReturn:
+        """Fail the run with `error`, here and in `done`, which the hold fails."""
+        failed = asyncio.get_running_loop().create_future()
+        failed.set_exception(error)
+        self._tasks.append(failed)
+        self._changed.set()
+        raise error
 
     def hold(self, callback):
         """aiperf's return callback, behind the hold."""

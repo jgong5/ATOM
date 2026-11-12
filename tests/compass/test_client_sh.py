@@ -180,6 +180,25 @@ def test_a_run_file_makes_the_client_simulated(tmp_path, simulated):
     }
 
 
+@pytest.mark.parametrize("deployed", [True, False])
+def test_a_deploy_sh_out_names_its_prefill_instance_to_aiperf(tmp_path, deployed):
+    """Behind a router that is no LP the traffic LP posts each cancel to the
+    prefill instance, whose URL a deploy.sh OUT's prefill/server.json names;
+    the caller's own value never reaches aiperf."""
+    out, env = _setup(tmp_path, SIM)
+    if deployed:
+        (out / "prefill").mkdir()
+        server = {"url": "http://10.0.0.5:8010", "pid": 1}
+        (out / "prefill/server.json").write_text(json.dumps(server))
+    stale = {"COMPASS_HARNESS_PREFILL_URL": "http://stale:1"}
+    done = _client(out, *GOOD, env=env | stale)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+    _, aiperf_env, _ = json.loads((tmp_path / "seen.json").read_text())
+    named = aiperf_env.get("COMPASS_HARNESS_PREFILL_URL")
+    assert named == ("http://10.0.0.5:8010" if deployed else None)
+
+
 #: The nightly's client arguments and aiperf timeouts client.sh has no default for.
 NIGHTLY = (
     "--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75"
