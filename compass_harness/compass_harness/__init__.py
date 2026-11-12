@@ -43,7 +43,7 @@ REBIND = {
         ("asyncio", "compass_harness.timesource:ClockAsyncio"),
         (
             "ReplayBarrierCoordinator",
-            "compass_harness.strategy:ClockReplayBarrierCoordinator",
+            "compass_harness.scheduler:ClockReplayBarrierCoordinator",
         ),
     ),
     "aiperf.timing.manager": (

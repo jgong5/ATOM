@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: MIT
 """The ``agentic_replay`` timing strategy this package registers, and the phase
-runner and replay barrier the import hook puts in aiperf."""
+runner the import hook puts in the orchestrator."""
 
 import asyncio
 
 from aiperf.timing.phase.runner import PhaseRunner
-from aiperf.timing.replay_dependencies import ReplayBarrierCoordinator
 from aiperf.timing.strategies.agentic_replay import AgenticReplayStrategy
 
 from compass_harness.scheduler import ClockPacedLoopScheduler
@@ -73,26 +72,6 @@ class CompassAgenticReplay(AgenticReplayStrategy):
             self._system_idle_watchdog = ClockTimer(
                 delay_seconds, self._run_system_idle_watchdog
             )
-
-
-class ClockReplayBarrierCoordinator(ReplayBarrierCoordinator):
-    """``ReplayBarrierCoordinator`` whose per-trace idle cap times out on the Compass clock."""
-
-    def _arm_root_idle_watchdog(self, root_id, state) -> None:
-        """Upstream's idle recheck of one trace's tree, on the Compass clock
-        instead of ``loop.call_later``."""
-        cap = self._root_idle_gap_cap_seconds
-        if (
-            cap is None
-            or cap < 0
-            or self._scheduler is None
-            or state.idle_watchdog is not None
-        ):
-            return
-        state.idle_watchdog = ClockTimer(
-            0.0 if state.idle_cap_expired else cap,
-            lambda: self._enforce_root_idle_cap(root_id),
-        )
 
 
 async def _clock_sleep(delay: float) -> None:
