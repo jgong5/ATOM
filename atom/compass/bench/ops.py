@@ -3601,9 +3601,14 @@ def _densify(families, tried: set) -> dict:
             for tokens, kernels, record in points:
                 across[cut[0], tokens].append((cut[1], kernels, record))
 
-    def moves(base, a, b) -> bool:
-        at_a, at_b = ({c: k for c, k, _ in across[base, t]} for t in (a, b))
-        return any(at_a[c] == at_b[c] for c in at_a.keys() & at_b.keys())
+    def moves(base, c, a, b) -> bool:
+        """Whether token counts `a` and `b` at `c` cached tokens hold no switch
+        of T alone: halving over cached tokens placed `c` at either, or some
+        count both hold launched one kernel at both."""
+        if ((base, a), c) in tried or ((base, b), c) in tried:
+            return True
+        at_a, at_b = ({x: k for x, k, _ in across[base, t]} for t in (a, b))
+        return any(at_a[x] == at_b[x] for x in at_a.keys() & at_b.keys())
 
     want = defaultdict(set)
     for fam, points in [*families.items(), *across.items()]:
@@ -3623,7 +3628,7 @@ def _densify(families, tried: set) -> dict:
             mid = (a + b) // 2
             if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
                 continue
-            if cut and moves(cut[0], a, b):
+            if cut and moves(*cut, a, b):
                 continue
             tried.add((fam, mid))
             # a micro-batch's leaves are read off its own graph, as its record marks

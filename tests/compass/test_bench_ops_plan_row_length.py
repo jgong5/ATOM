@@ -3,7 +3,8 @@
 kernels switch at a fixed row length, its tokens and cached tokens summed, as
 DeepSeek-V4's `indexer_score_topk` does: such a switch crosses each line of
 the leaf's points at its own place, along T at a cached-token count and along
-cached tokens at a T. The plan ends, and `fit ops` prices what it measured.
+cached tokens at a T. Another of its kernels switches at a token count, as a
+tile does. The plan ends, and `fit ops` prices what it measured.
 The bench and graphs are `test_bench_ops_plan`'s stand-ins.
 """
 
@@ -21,8 +22,11 @@ from test_bench_ops_plan import (  # noqa: F401  a fixture
 
 from atom.compass.bench import ops
 
-#: The row lengths the stand-in attention switches kernels at.
-SWITCHES = (2500, 6200)
+#: The row lengths the stand-in attention's first kernel switches at, and the
+#: token count its second switches at, whatever its cached tokens.
+SWITCHES, TILE = (2500, 6200), 120
+#: The steps' token counts and cached tokens, as the plan ladders them.
+TOKENS, CACHED = {40, 100, 150, 400, 1000}, {0, 2000, 3000, 6000, 8000}
 #: Points a plan measures at most before the test calls it endless: one that
 #: halves a switch along T at each cached count, and over cached tokens at
 #: each T, opens new pairs on the other line every round.
@@ -30,14 +34,16 @@ ENDLESS = 2000
 
 
 def _row_length_bench(fn, config, todo, llc):
-    """`_bench` with prefill attention's kernel picked by its row's length,
-    its tokens and cached tokens summed, and its time growing with it."""
+    """`_bench` with prefill attention's kernels picked by its row's length,
+    its tokens and cached tokens summed, and by its tokens, and its time
+    growing with its row's length."""
     got = _bench(fn, config, todo, llc)
     for r in got:
         if r["op"] == "aiter.attn" and r["shape"].startswith("prefill"):
             shape = ops._shape(r["shape"])
             n = shape.tokens // shape.seqs + (r["context"] or 0)
-            r["kernels"] = [f"p{sum(n >= k for k in SWITCHES)}"]
+            tile = f"t{int(shape.tokens >= TILE)}"
+            r["kernels"] = [f"p{sum(n >= k for k in SWITCHES)}", tile]
             r["cold_ns"] = n * 1e3
     _row_length_bench.points += len(got)
     assert _row_length_bench.points < ENDLESS, "the plan does not end"
@@ -67,18 +73,24 @@ def test_a_plan_over_a_switch_at_a_fixed_row_length_ends_adjacent_at_each_t(plan
             shape = ops._shape(r["shape"])
             attn.setdefault(shape.tokens, {})[r["context"] or 0] = r["kernels"]
 
-    # The steps' token counts only: none halved where the switch moves.
-    assert set(attn) == {40, 100, 150, 400, 1000}
+    # Token counts halved only where T alone switches kernels, to 119 | 120 at
+    # each of the steps' cached tokens.
+    assert TOKENS | {119, 120} <= set(attn)
+    assert all(t in TOKENS or 100 < t < 150 for t in attn)
+    assert {(attn[119][c][1], attn[120][c][1]) for c in CACHED} == {("t0", "t1")}
     for tokens, line in attn.items():
         cached = sorted(line)
         # Each count holds the steps' ladder of cached tokens.
-        assert {0, 2000, 3000, 6000, 8000} <= set(cached)
+        assert CACHED <= set(cached)
         # Each switch's two counts are adjacent along cached tokens, at its row length.
         switched = [(a, b) for a, b in pairwise(cached) if line[a] != line[b]]
         assert all(b - a == 1 for a, b in switched), (tokens, switched)
         assert [b + tokens for _, b in switched] == [
             k for k in SWITCHES if 0 < k - tokens <= 8000
         ]
+        # A step's count holds them alone: the fill takes them to no other step's.
+        others = TOKENS - {tokens} if tokens in TOKENS else ()
+        assert not [(t, b) for _, b in switched for t in others if b in attn[t]]
 
 
 def test_coverage_reads_a_switch_at_a_fixed_row_length_t_first_as_fit_ops_does(
@@ -86,10 +98,10 @@ def test_coverage_reads_a_switch_at_a_fixed_row_length_t_first_as_fit_ops_does(
 ):
     graded = _records(
         tmp_path / "graded",
-        ([[120, 2120, False]], None),  # between 100 and 150 at 2000 cached
-        ([[120, 2220, False]], None),  # 2100 cached, a count 400 halved at alone
-        ([[100, 2495, False]], None),  # at 100, just before its switch at 2400
-        ([[120, 2505, False]], None),  # 2385 cached: 100 and 150 read either side
+        ([[140, 2140, False]], None),  # between 125 and 150 at 2000 cached
+        ([[140, 2240, False]], None),  # 2100 cached, a count 400 halved at alone
+        ([[150, 2495, False]], None),  # at 150, just before its switch at 2350
+        ([[140, 2505, False]], None),  # 2365 cached: 125 and 150 read either side
     )
     store, root, _, _ = bench
 
