@@ -1004,11 +1004,32 @@ def test_behind_the_router_lp_requests_cancels_and_the_stream_cross_it(
     assert published[1] == (_key(0), 2.0 + ADMIT, 1, "cancel")
 
 
-def test_behind_a_plain_router_a_cancel_goes_to_frontend_p_s_url(tmp_path, monkeypatch):
-    """Behind a PD router that is no LP, which answers a cancel 400, aiperf's
-    cancel of a request open at the grace deadline, 2.0, is stamped on the
-    request's channel to frontend-P and published with frontend-P's URL."""
+#: frontend-P's URL, as a launcher names it.
+PREFILL_URL = "http://127.0.0.1:8010"
+
+
+@pytest.mark.parametrize(
+    "router_in_s, channels, to",
+    [
+        (
+            None,
+            ("traffic->frontend-P:http", "frontend-D->traffic:stream"),
+            (PREFILL_URL,),
+        ),
+        (2.0**-14, ("traffic->router:http", "router->traffic:stream"), ()),
+    ],
+    ids=["plain-router", "router-lp"],
+)
+def test_only_behind_a_plain_router_a_cancel_carries_frontend_p_s_url(
+    router_in_s, channels, to, tmp_path, monkeypatch
+):
+    """With frontend-P's URL named, aiperf's cancel of a request open at the
+    grace deadline, 2.0, is stamped on the request's channel and published with
+    that URL behind a PD router that is no LP, which answers a cancel 400, and
+    without it behind the router LP, which hands it on."""
     pd = {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10}
+    if router_in_s is not None:
+        pd["router_in_s"] = router_in_s
     endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
     server = clock_transport.serve(
         ClockAuthority(prefill_decode_table(**RUN, **pd)), endpoint
@@ -1017,11 +1038,10 @@ def test_behind_a_plain_router_a_cancel_goes_to_frontend_p_s_url(tmp_path, monke
     run_file.write_text(
         json.dumps({"clock_endpoint": endpoint, "bound_s": 1e6, **RUN, **pd})
     )
-    url = "http://127.0.0.1:8010"
     monkeypatch.setenv(RUN_ENV, str(run_file))
     monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / "lp"))
-    monkeypatch.setenv(PREFILL_URL_ENV, url)
-    stream = "frontend-D->traffic:stream"
+    monkeypatch.setenv(PREFILL_URL_ENV, PREFILL_URL)
+    stream = channels[1]
     monkeypatch.setattr(
         traffic_lp, "LPRuntime", lambda *_: ScriptedRuntime([(2.0, set())], stream)
     )
@@ -1064,8 +1084,8 @@ def test_behind_a_plain_router_a_cancel_goes_to_frontend_p_s_url(tmp_path, monke
         http, published = _run(main())
     finally:
         server.close()
-    assert http == "traffic->frontend-P:http"
-    assert published[1] == (_key(0), 2.0 + ADMIT, 1, "cancel", url)
+    assert http == channels[0]
+    assert published[1] == (_key(0), 2.0 + ADMIT, 1, "cancel", *to)
 
 
 def test_a_1p1d_hold_settles_the_frontend_d_stream(tmp_path):
