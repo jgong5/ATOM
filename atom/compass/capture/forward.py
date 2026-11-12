@@ -10,8 +10,9 @@ differs between the two is affine in the context (`ir.Affine`), or the shape
 is refused by operator and slot.
 
 Each leaf carries its contract: its arguments by schema slot, a tensor as its
-shape, dtype, stride, role and the `is_shuffled` mark ATOM sets on a
-preshuffled weight. A tensor's role is where its storage came from:
+shape, dtype, stride, role, the `is_shuffled` mark ATOM sets on a
+preshuffled weight, and its device when ATOM holds it on the host (a copy's
+host-staged source). A tensor's role is where its storage came from:
 the model's parameters, buffers and tensor attributes are weights, what
 `allocate_kv_cache` allocated is KV, what the model's forward and the sampler
 after it allocated is an activation, and anything else (the runner's buffers,
@@ -336,9 +337,10 @@ def _engine(text: str):
 
 
 def missed(store, key) -> str:
-    """For an `op_graph` `key` `store` holds no entry at, each engine field
-    (`step_grid.differ`) in which a graph it holds at the key's shape and
-    otherwise the key's structure differs, as text; "" when it holds none."""
+    """For an `op_graph` `key` `store` holds no entry at, each field in which
+    a graph it holds at the key's shape and otherwise the key's structure
+    differs, as text: the ATOM source or torch it was traced under, then each
+    engine field (`step_grid.differ`); "" when it holds none."""
     from atom.compass.artifacts.store import ENTRY_FILE
     from atom.compass.run.step_grid import differ
 
@@ -349,10 +351,16 @@ def missed(store, key) -> str:
         if there.get("shape") == key.values["shape"]:
             at = _engine(there.get("structure", ""))
             if at and (at[0], at[2]) == (head, tail):
-                named.append(", ".join(differ(at[1], here, "the graph")))
+                fields = [
+                    f"{name} {there.get(name)!r} in the graph and {value!r} here"
+                    for name, value in key.fields
+                    if name not in ("structure", "shape") and there.get(name) != value
+                ]
+                if engine := differ(at[1], here, "the graph"):
+                    fields.append(f"engine config: {', '.join(engine)}")
+                named.append(", ".join(fields))
     return "".join(
-        f"; a graph the store holds at this shape and structure differs in engine "
-        f"config: {n}"
+        f"; a graph the store holds at this shape and structure differs in {n}"
         for n in named
     )
 
@@ -748,7 +756,8 @@ class _Recorder(TorchDispatchMode):
                 [self._live(d) if d is ir.G else d for d in s]
                 for s in (value.shape, value.stride)
             )
-            return torch.empty_strided(shape, stride, dtype=dtype, device="cuda")
+            device = "cpu" if value.host else "cuda"
+            return torch.empty_strided(shape, stride, dtype=dtype, device=device)
         if isinstance(value, ir.ContextRef) and LAYER in value.index_names:
             value = value.bind(**{LAYER: self.layer})
         if not isinstance(value, ir.ModuleRef):
@@ -792,7 +801,8 @@ class _Recorder(TorchDispatchMode):
                 map(self._dim, value.stride())
             )
             shuffled = bool(getattr(value, "is_shuffled", False))
-            return ir.Tensor(shape, str(value.dtype), stride, role, shuffled)
+            host = value.device.type == "cpu"
+            return ir.Tensor(shape, str(value.dtype), stride, role, shuffled, host)
         if isinstance(value, torch.nn.Module) and id(value) in self.modules:
             return ir.ModuleRef(self._layered(self.modules[id(value)]))
         if isinstance(value, str) and value in self.contexts:
@@ -875,7 +885,10 @@ def _patches(recorder):
       that unwinds a frame, on every function.
     * `CpuGpuBuffer.__init__` (ATOM's own) allocates its host side and that
       side's numpy view outside the fake mode, unpinned (pinning is a driver
-      allocation); its device side is ATOM's `zeros_like`, faked.
+      allocation); its device side is ATOM's `zeros_like`, faked. torch
+      caches the constructors a default device places at their first call,
+      made here before that patch: cached under it, they would leave every
+      later `torch.zeros` of ATOM's on the host, not on the runner's device.
     * GDN's causal-conv1d metadata is host arithmetic over the staged
       `cu_seqlens`, and it runs outside the fake mode too.
     * A GDN prefill under ReplaySSM parks the cursors of its live state
@@ -917,6 +930,7 @@ def _patches(recorder):
     from aiter.ops import topk
     from flydsl.compiler import jit_function as fly
     from torch._subclasses.fake_tensor import unset_fake_temporarily
+    from torch.utils import _device
     from torch.utils._python_dispatch import _disable_current_modes
     from triton.compiler.compiler import CompiledKernel
     from triton.runtime.jit import JITFunction
@@ -1017,6 +1031,7 @@ def _patches(recorder):
         with patch.object(recorder, "counted", live):
             return attach(builder, md, num_reqs, is_prefill)
 
+    _device._device_constructors()  # cached while `torch.zeros` is torch's
     unpatched = [
         (fly.JitFunction, "__call__", fly.JitFunction.__call__),
         (fly, "_compile_impl", fly._compile_impl),

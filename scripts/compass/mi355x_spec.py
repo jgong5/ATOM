@@ -12,7 +12,9 @@ The device fragment is one DeepSeek-V4-Pro start at the nightly DPA-TP8 prefill
 side's arguments (`FLAGS`): the device, its capacity and the stack; on gpu-40,
 whose stack that start did not run, the stack is `STACK`'s.
 `probe_device.py`'s readings (`PEAKS`) add the compute and memory derates, the
-bandwidth curve, the kernel floor and the intra-node link's latency and derate.
+bandwidth curve, the kernel floor and the intra-node link's latency and derate;
+on crsuse2-m2m-v3-005 a later record of its own adds the profiler floor
+(`PROFILER`).
 On crsuse2-m2m-v3-005, the network file of its rails into -013 adds the
 inter-node link (`NETWORK`). The peaks are the datasheet's; the rest is
 assumed. An engine start's memory readings are `compass measure memory`'s, not
@@ -273,6 +275,18 @@ if GPU40:
         "020692760182d835943e2ac416f59df1abd2bb82cbe71870ce0c9f316cae436a",
     )
 
+#: On 005, cards 0002:00:01.0 and 0002:00:02.0 under the stack `DEVICE` pins,
+#: the profiler floor of a later `probe_device.py` record than `PEAKS`'s: (date,
+#: ATOM commit, its median, p10 and p90, the record's sha256).
+PROFILER = None
+if CRS005:
+    PROFILER = (
+        "2026-11-11",
+        "0bdc17c90",
+        (3.9590000000007426e-06, 3.878999999999906e-06, 4.03900000000067e-06),
+        "933a0d26bfeed09e301a6582acddc40da10119a5c5146e853fef982dcfa01cdb",
+    )
+
 #: On 005, the network file of its rails into 013, which `rdma_link.py fit
 #: BENCH RECORD` published; its notes say what each value was read from.
 NETWORK = None
@@ -332,6 +346,13 @@ def device_fragments() -> list[Fragment]:
         fragment("ptl", ptl, "probed", "no card has a ptl directory", date=PTL_DATE),
         probed,
     ]
+    if PROFILER:
+        date, root, (floor, low, high), record = PROFILER
+        subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
+        body = {"device": {"profiler_floor_s": floor}}
+        how = "probe_device.py: empty kernels queued under a trace run's profiler"
+        band = {"device.profiler_floor_s": (low, high)}
+        fragments.append(fragment("profiler", body, "probed", how, subject, date, band))
     if NETWORK:
         network = json.loads(NETWORK.read_text()) | {"name": NAME}
         fragments.append(Fragment.from_mapping(network, NETWORK.stem))

@@ -31,8 +31,27 @@ import enum
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from .keys import Kind
 from .rules import ArtifactRefusal, Rule
+
+
+class Kind(enum.Enum):
+    """The artifacts this store holds. There are no others."""
+
+    MACHINE_SPEC = "machine_spec"
+    SHAPE_POPULATION = "shape_population"
+    OP_GRAPH = "op_graph"
+    OP_MEASUREMENT = "op_measurement"
+    PRICE_LIST = "price_list"
+    MEMORY_READINGS = "memory_readings"
+    STEP_MEASUREMENT = "step_measurement"
+    STEP_LINEAR_LAW = "step_linear_law"
+    HOST_LAWS = "host_laws"
+    STEP_GRID_BUNDLE = "step_grid_bundle"
+    PROJECTION = "projection"
+    PROBE_RECORD = "probe_record"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 class Axis(enum.Enum):
@@ -75,6 +94,7 @@ class Row(enum.Enum):
     STEP_GRID_BUNDLE = "step grid bundle"
     SHAPE_POPULATION = "shape_population"
     PROJECTION = "projection"
+    PROBE_RECORD = "probe_record"
 
     @property
     def field(self) -> str:
@@ -185,9 +205,7 @@ MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
         Axis.ATOM_SRC: DEPENDS,
         Axis.MODEL: DEPENDS,
         Axis.DEVICE: DEPENDS,
-        Axis.PTL: Cell(
-            False, "in the key only because the machine-spec digest is one hash"
-        ),
+        Axis.PTL: INDEPENDENT,
         Axis.HOST_CPU: DEPENDS,
         Axis.ENGINE_CONFIG: DEPENDS,
     },
@@ -221,6 +239,17 @@ MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
         Axis.HOST_CPU: INDEPENDENT,
         Axis.ENGINE_CONFIG: DEPENDS,
     },
+    # Vendor kernels timed on the cards; no model, engine or ATOM engine code.
+    Row.PROBE_RECORD: {
+        Axis.SOFTWARE_STACK: DEPENDS,
+        Axis.TORCH: Cell(True, "Triton, torch._scaled_mm"),
+        Axis.ATOM_SRC: INDEPENDENT,
+        Axis.MODEL: INDEPENDENT,
+        Axis.DEVICE: DEPENDS,
+        Axis.PTL: DEPENDS,
+        Axis.HOST_CPU: INDEPENDENT,
+        Axis.ENGINE_CONFIG: INDEPENDENT,
+    },
 }
 
 #: Which rows decide a kind's validity. `machine_spec` is its capacity and
@@ -237,6 +266,7 @@ ROWS_OF: Mapping[Kind, tuple[Row, ...]] = {
     Kind.STEP_GRID_BUNDLE: (Row.STEP_GRID_BUNDLE,),
     Kind.SHAPE_POPULATION: (Row.SHAPE_POPULATION,),
     Kind.PROJECTION: (Row.PROJECTION,),
+    Kind.PROBE_RECORD: (Row.PROBE_RECORD,),
 }
 
 

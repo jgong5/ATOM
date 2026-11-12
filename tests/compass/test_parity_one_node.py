@@ -17,7 +17,7 @@ import pytest
 from test_drive_gpu import GPU45, SHOWHW
 from test_launcher_held_ports import HELD, SQUAT
 
-from atom.compass.artifacts import machine_spec_key
+from atom.compass.artifacts import machine_platform
 from atom.compass.runner.pp_send import carrier_models
 from atom.compass.spec import MachineSpec
 
@@ -298,7 +298,7 @@ def test_pp2_runs_two_stages_on_two_gpus_and_compares_each_stage(tmp_path):
     assert spec["machine"]["name"] == json.loads(machine.read_text())["name"]
     # Node 18's cards read PTL enabled, and a stage send is priced on each carrier.
     stated = MachineSpec.from_mapping(spec["machine"])
-    assert machine_spec_key(stated).values["ptl"] == "enabled"
+    assert machine_platform(stated)["ptl"] == "enabled"
     assert set(carrier_models(stated)) == {"rccl", "gloo"}
     compares = (tmp_path / "servers.log.compare").read_text().splitlines()
     assert [c.rsplit(" --stage ", 1)[1] for c in compares] == ["0", "1"]

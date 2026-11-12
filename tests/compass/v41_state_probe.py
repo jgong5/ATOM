@@ -95,6 +95,7 @@ def ops_placements(
     ratio=2,
     reach=0,
     query=None,
+    tail=0,
 ):
     """The op bench's placements of a V4.1 `point` under `rule`, a two-row
     decode by default, at `context`, over `test_bench_ops`'s state-only leaf
@@ -115,7 +116,9 @@ def ops_placements(
     `ratio` and, past ratio 0, top-k 1, or at `prefix` the pool alone stating
     them. Its activation is a row a token, `query` rows if given, and the
     bytes its ring rows read a call, `reach` rows, are kept too, and each
-    pool view's name and offset from ATOM's on the bench, or refusal and None."""
+    pool view's name and offset from ATOM's on the bench, or refusal and None.
+    With `tail`, the step publishes a bounded replay's tail `tail` rows wide,
+    each request's window starting at its first row (`_publish_decoder`)."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -141,6 +144,14 @@ def ops_placements(
         def prepare_model(self, batch):
             self.batches.append(list(batch.state_slots_committed))
             metadata, positions = prepared(built, batch)
+            step = metadata.step
+            if tail:
+                floors = step.request_positions.astype(np.int32)
+                step.decoder = SimpleNamespace(
+                    tail=dataclasses.replace(step, request_floors=floors),
+                    tail_rows=torch.zeros(tail), last=torch.zeros(point.seqs),
+                    query_ids=step.batch_ids, filled_gpu=None, finishing_gpu=None,
+                )  # fmt: skip
             fctx._forward_context = fctx.ForwardContext(
                 attn_metadata=metadata, context=fctx.Context(positions=positions)
             )
@@ -384,6 +395,8 @@ def main(root: pathlib.Path) -> None:
         seen[f"ops_v41_{case}"] = ops_placements(
             plain, ratio=ratio, query=query, reach=14 * (query == 32), **cut
         )
+    # nor a tail laid out 48 rows wide, past the forward's 32
+    seen["ops_v41_wide_tail"] = ops_placements(plain, query=48, tail=48, **cut)
     seen["kv_bound"] = {slots: kv_bound(slots) for slots in (8, 2)}
 
     from atom.compass.bench.runner import BenchModelRunner

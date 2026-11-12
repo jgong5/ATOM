@@ -47,7 +47,7 @@ from atom.compass.artifacts import (
     Kind,
     Provenance,
     Topology,
-    machine_spec_key,
+    machine_platform,
     member_name,
     roots_for,
 )
@@ -246,7 +246,7 @@ def projection(machine: MachineSpec, cells: dict) -> dict:
 
 def publish(store: str, document: dict, cells: dict, machine, command: str):
     """Publish `document` in `store` as a `projection`, keyed by its model,
-    spec, ATOM source and cells."""
+    spec, ATOM source, cells and this process's torch."""
     import torch
 
     from atom.compass.run import atom_source, host_cpu, source_root
@@ -261,6 +261,7 @@ def publish(store: str, document: dict, cells: dict, machine, command: str):
         spec=machine.digest(),
         source_root=source_root(),
         cells=f"sha256:{hashlib.sha256(identity.encode()).hexdigest()}",
+        torch=torch.__version__,
     )
     rank = Topology().ranks()[0]
     ArtifactStore(store).publish(
@@ -270,8 +271,7 @@ def publish(store: str, document: dict, cells: dict, machine, command: str):
         ),
         topology=Topology(),
         conditions=Conditions.of(
-            **machine_spec_key(machine).values,
-            torch=torch.__version__,
+            **{**machine_platform(machine), "torch": torch.__version__},
             atom_src=atom_source(),
             model=model,
             host_cpu=host_cpu(),
