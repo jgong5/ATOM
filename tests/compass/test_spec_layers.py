@@ -17,7 +17,7 @@ MACHINES = ROOT / "scripts" / "compass" / "machines"
 LAYERS = {
     "mi308x-hjbog18": ("mi308x", "nic-400g"),
     "mi308x-hjbog39": ("mi308x", "nic-400g"),
-    "mi355x-crs005": ("mi355x", "nic-400g"),
+    "mi355x-crs005": ("mi355x", "crs005-013-ionic"),
     "mi355x-gpu40": ("mi355x", "nic-400g"),
     "mi355x-gpu45": ("mi355x", "nic-400g"),
     "mi455-a0": ("mi455x-a0", "mi455x-scale-out"),

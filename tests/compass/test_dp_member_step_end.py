@@ -324,6 +324,73 @@ def test_a_member_returns_at_its_own_pull_with_what_arrived_before_it(
     ctx.destroy(linger=0)
 
 
+def test_a_member_steps_through_rounds_granted_ahead_at_its_collective(
+    monkeypatch, collectives
+):
+    # Under local grants dp1 returns at its pull, 15 us after its release,
+    # owing the rounds to dp0's pull 31 us later, within the engine's shortest
+    # cycle, two IPC hops of 61 us: the authority grants them at dp1's return.
+    targets = (0.0625, 0.0625 + 2.0**-15)
+    pulls = (targets[0] + 2.0**-16, targets[1] + 2.0**-16)
+    endpoint = f"inproc:test-dp-ahead-{uuid.uuid4().hex}"
+    members = compass_run._members(TABLE, 2)
+    authority = ClockAuthority(TABLE, members=members, ceilings=True)
+    server = clock_transport.serve(authority, endpoint)
+    clock_transport.connect(LpId("traffic"), endpoint).send(
+        (NER, math.inf, [], math.inf)
+    )
+    ctx, address = zmq.Context(), f"inproc://dp-ahead-{uuid.uuid4().hex}"
+    push, pull = ctx.socket(zmq.PUSH), ctx.socket(zmq.PULL)
+    push.bind(address)
+    pull.connect(address)
+    returned, intake = [], queue.Queue()
+
+    def frontend():  # sends at 0.05, then idles: nothing bounds dp1's ceiling
+        rt = LPRuntime(FRONTEND, TABLE, clock_transport.connect(FRONTEND, endpoint))
+        rt.start_run()
+        rt.advance_to(0.05)
+        WrappedSocket(rt, push, REQUEST).send(b"0.05")
+        rt.next_event(math.inf)
+
+    def dp0():
+        rt = LPRuntime(ENGINE, TABLE, clock_transport.connect(ENGINE, endpoint, "dp0"))
+        rt.start_run()
+        rt.advance_group((*targets, *pulls), pulls[1])
+        returned.append(rt.now)
+        rt.next_event(math.inf)
+
+    rt = LPRuntime(ENGINE, TABLE, clock_transport.connect(ENGINE, endpoint, "dp1"))
+    rt.start_run()
+    monkeypatch.setattr(clock, "_installed", rt)
+    clock.settle_before_collectives()
+    sock = WrappedSocket(rt, pull, REQUEST)
+
+    def receive():
+        intake.put(sock.recv())
+        rt.back_at_wait_point()
+
+    threads = [_thread(receive), _thread(frontend), _thread(dp0)]
+    reply = SimpleNamespace(
+        predicted_s=targets[0], out_s=2.0**-16, group_targets=targets, group_out=pulls
+    )
+
+    clock.charge(reply)
+
+    assert (rt.now, rt.owed) == (pulls[0], [targets[1], pulls[1]])
+    assert rt.owed_ceiling == pulls[0] + 2.0**-13
+    assert intake.get(timeout=10) == b"0.05"
+    dist.all_reduce(None)
+    # Stepped through on its own and reported, with no reply to wait for.
+    assert collectives == [pulls[1]]
+    assert rt.paid == {"rounds": 2, "ahead": 2, "reports": 1}
+    rt.next_event(math.inf)
+    for t in threads:
+        t.join(timeout=10)
+    assert returned == [pulls[1]] and authority.grants["engine"] == 4
+    server.close()
+    ctx.destroy(linger=0)
+
+
 def test_each_rank_gathers_its_pull_beside_its_release(dp2):  # noqa: F811
     ranks = [runner(StepStubBackend(), dp_size=2, dp_rank=r) for r in (0, 1)]
     for r, (charge_s, out_s) in zip(ranks, [(0.05, 0.002), (0.001, None)]):

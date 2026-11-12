@@ -7,14 +7,16 @@
 # Usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop]
 #        client.sh OUT --sweep --traces A-B --stop
 #   OUT              the server's --out, whose server.json names its URL and,
-#                    for a simulated server, its run file
+#                    for a simulated server, its run file; a deploy.sh OUT's
+#                    prefill/server.json names its prefill instance's URL
 #   --traces A-B     TRACES' traces A to B, each counted from 0
 #   --concurrency C  aiperf --concurrency
 #   --duration S     aiperf --benchmark-duration, seconds on the server's clock
 #                    (default 1800)
 #   --stop           then SIGTERM the command that started the server, wait
 #                    WAIT_S (default 600) for it to write OUT/run.json and leave,
-#                    and set the export's server_stopped
+#                    a trace run's (OUT/trace) serve.TRACE_STOP_S more, and set
+#                    the export's server_stopped
 #   --sweep          in place of aiperf, send the JIT sweep of the cell the
 #                    server's engine and traces A to B make, then after the
 #                    stop keep the points its record covers in the server's
@@ -91,20 +93,29 @@ curl -sf --max-time 10 "$url/health" >/dev/null || fail "server: $url/health doe
 compass_env "$ROOT"
 export PYTHONPATH=$ROOT:$ROOT/compass_harness
 compass_require_tree "$ROOT" || exit $?
-unset ATOM_COMPASS_RUN ATOM_COMPASS_CLOCK_ENDPOINT
+unset ATOM_COMPASS_RUN ATOM_COMPASS_CLOCK_ENDPOINT COMPASS_HARNESS_PREFILL_URL
 
 stop_server() {
     # The command that started the server is its parent.
-    local stat command deadline
+    local stat command deadline allow=${WAIT_S:-600} more
     stat=$(cat "/proc/$pid/stat" 2>/dev/null) || fail "stop: the server, process $pid, has left"
     read -r _ command _ <<<"${stat##*\) }"
     [[ $(tr '\0' ' ' <"/proc/$command/cmdline") == *compass* ]] ||
         fail "stop: process $command, the server's parent, is no compass command"
+    # A trace run's command first writes every rank's trace, which serve gives
+    # TRACE_STOP_S, then reduces them (parity.busy). With every profiler row
+    # kept, a 120 s V4.1-Flash TP4 trace run's command left about 11 min after
+    # SIGTERM: 178 s to export, 445 s to reduce (#3106).
+    if [[ -d $OUT/trace ]]; then
+        more=$(cd / && python3 -c 'from atom.compass.drive.serve import TRACE_STOP_S as s; print(s)') ||
+            fail "stop: cannot read serve's TRACE_STOP_S"
+        allow=$((allow + more))
+    fi
     kill -TERM "$command" || fail "stop: SIGTERM to process $command failed"
-    deadline=$((SECONDS + ${WAIT_S:-600}))
+    deadline=$((SECONDS + allow))
     # Until it has exited; a zombie has.
     while stat=$(cat "/proc/$command/stat" 2>/dev/null) && [[ ${stat##*\) } != Z* ]]; do
-        ((SECONDS < deadline)) || fail "stop: the command, process $command, is up ${WAIT_S:-600} s after SIGTERM"
+        ((SECONDS < deadline)) || fail "stop: the command, process $command, is up $allow s after SIGTERM"
         sleep 1
     done
     [[ -s $OUT/run.json ]] || fail "stop: the command left without writing $OUT/run.json"
@@ -133,6 +144,14 @@ print(*(p.value for p in e(group="aiperf.plugins")))') ||
 if [[ -n $run_file ]]; then
     [[ $plugins == *compass_harness* ]] || fail "harness: the server is simulated, and $HARNESS_PYTHON has no compass-harness installed"
     export ATOM_COMPASS_RUN=$run_file
+    # deploy.sh's prefill instance: behind a router that is no LP, the traffic
+    # LP posts each cancel there (compass_harness/traffic_lp.py).
+    if [[ -s $OUT/prefill/server.json ]]; then
+        COMPASS_HARNESS_PREFILL_URL=$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1]))["url"])' "$OUT/prefill/server.json") ||
+            fail "server: $OUT/prefill/server.json names no url"
+        export COMPASS_HARNESS_PREFILL_URL
+    fi
     aiperf=(-m aiperf)
 else
     [[ $plugins != *compass_harness* ]] || fail "harness: the server is real, and $HARNESS_PYTHON has compass-harness installed"

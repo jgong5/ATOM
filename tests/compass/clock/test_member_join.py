@@ -21,6 +21,11 @@ groups below defend:
   grant and the timeline as one call a round does, and is answered once, at
   its last round, with what each round released to it; a queued round that
   cannot join is refused as a call would be.
+* **Rounds granted ahead.** With ceilings, the rounds a returned member owes
+  below the ceiling are granted at its return, each its own grant, and what
+  they release to it goes ahead in its reply; the LP's ``N`` stays at the
+  member's clock until it reports them, and a request that does not report
+  exactly them aborts the run.
 """
 
 import math
@@ -30,6 +35,7 @@ import pytest
 
 from atom.compass.clock import (
     NER,
+    REPORT,
     TAR,
     ChannelTable,
     ClockAbort,
@@ -361,3 +367,98 @@ def test_a_queued_round_that_cannot_join_is_refused_as_a_call_would_be():
     again = "engine: dp0 called again before dp1 called"
     with pytest.raises(ClockAbort, match="^" + re.escape(again)):
         ca.on_request(ENGINE, NER, INF, [], member="dp0")
+
+
+# --- rounds granted ahead -------------------------------------------------------
+
+OUT0, OUT1 = (f"engine->frontend:output#{rank}" for rank in RANKS)
+
+
+def _granted_ahead(dp0_pull, ceilings=True):
+    """A step of rounds 2.0, 2.5 and `dp0_pull`, in which dp1 returns at 2.0
+    owing the rest and dp0 at its pull, each asking its rounds in one call,
+    while the frontend waits in TAR(3.5). The engine's shortest cycle is 2.0,
+    so the ceiling of dp1's return is 4.0. Returns each member's replies, the
+    frontend's grant if it had one, and the authority."""
+    ca = ClockAuthority(
+        _dp_table(("engine", "engine")),
+        timeline=TimelineLog(),
+        members={ENGINE: {rank: _own(rank) for rank in RANKS}},
+        ceilings=ceilings,
+    )
+    log = [(REQ0, 0, 1.5), (REQ0, 1, 2.9), (REQ1, 0, 1.5), (REQ1, 1, 2.4)]
+    assert ca.on_request(FRONTEND, TAR, 3.5, log) == []
+    replies = ca.on_request(ENGINE, TAR, 2.0, [], member="dp0", rounds=[2.5, dp0_pull])
+    replies += ca.on_request(ENGINE, TAR, 2.0, [], member="dp1")
+    return replies, ca
+
+
+def test_a_returned_members_rounds_below_the_ceiling_are_granted_at_its_return():
+    replies, ca = _granted_ahead(3.0)
+    assert [(to[1], g, released) for to, g, released in replies] == [
+        ("dp0", 3.0, {REQ0: [(0, 1.5), (1, 2.9)]}),
+        # dp1's reply carries what rounds 2.5 and 3.0 release to it, ahead.
+        ("dp1", 2.0, {REQ1: [(0, 1.5), (1, 2.4)]}),
+    ]
+    assert [r[2].ceiling for r in replies] == [None, 4.0]
+    # Each round is still its own grant, as when dp1 asks them itself.
+    _, asked = _granted_ahead(3.0, ceilings=False)
+    asked.on_request(ENGINE, TAR, 2.5, [], member="dp1", rounds=[3.0])
+    engine = [[r for r in a.timeline.records() if r.lp == ENGINE] for a in (ca, asked)]
+    assert engine[0] == engine[1] and len(engine[0]) == ca.grants["engine"] == 3
+
+
+def test_the_lp_promises_no_later_than_its_member_until_the_member_reports():
+    replies, ca = _granted_ahead(3.0)
+    (engine,) = [row for row in ca.lp_table() if row.lp == ENGINE]
+    assert (engine.now, engine.n) == (3.0, 2.0)
+    # The frontend's 3.5 waits on dp1's send stamped at its own 2.0, which a
+    # floor at the engine's clock, 3.0 plus 1.0, would refuse.
+    assert not [to for to, _, _ in replies if to == FRONTEND]
+    steps = [(TAR, 2.5, 2.5, 1), (TAR, 3.0, 3.0, 1)]
+    report = ca.on_request(
+        ENGINE, REPORT, 3.0, [(OUT1, 0, 3.0)], member="dp1", steps=steps
+    )
+    assert report == [(FRONTEND, 3.5, {OUT0: [], OUT1: [(0, 3.0)]})]
+    assert ca.requests_served["engine"] == 3
+
+
+def test_a_member_reports_its_steps_with_its_call_for_the_rounds_left():
+    replies, ca = _granted_ahead(5.0)
+    assert replies[-1][1:] == (2.0, {REQ1: [(0, 1.5), (1, 2.4)]})
+    assert replies[-1][2].ceiling == 4.0  # 5.0 is not granted ahead
+    steps = [(TAR, 2.5, 2.5, 0)]
+    got = ca.on_request(ENGINE, TAR, 5.0, [], member="dp1", steps=steps)
+    assert [(to, g) for to, g, _ in got] == [(FRONTEND, 3.5)]
+    got = ca.on_request(FRONTEND, TAR, 10.0, [])
+    assert [(to[1], g, released) for to, g, released in got] == [
+        ("dp0", 5.0, {REQ0: [(0, 1.5), (1, 2.9)]}),
+        ("dp1", 5.0, {REQ1: []}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "kind, t, steps, needle",
+    [
+        (TAR, 4.0, [], "dp1 sent TAR before reporting the rounds [2.5, 3.0]"),
+        (REPORT, 2.5, [(TAR, 2.5, 2.5, 0)], "dp1 sent REPORT before reporting"),
+        (REPORT, 3.0, [(TAR, 3.0, 3.0, 0)], "dp1 stepped on its own to TAR(3.0)"),
+        (REPORT, 3.0, [(NER, 2.5, 2.5, 0)], "dp1 stepped on its own to NER(2.5)"),
+        (REPORT, 2.5, [(TAR, 2.5, 2.5, 0), (TAR, 3.0, 3.0, 0)], "dp1 reported its"),
+    ],
+    ids=["unreported", "partly", "skipped", "ner", "behind"],
+)
+def test_a_member_that_does_not_report_exactly_its_rounds_aborts(
+    kind, t, steps, needle
+):
+    _, ca = _granted_ahead(3.0)
+    with pytest.raises(ClockAbort, match="^engine: " + re.escape(needle)):
+        ca.on_request(ENGINE, kind, t, [], member="dp1", steps=steps)
+
+
+def test_a_report_comes_only_from_a_member_rounds_were_granted_ahead_of():
+    _, ca = _granted_ahead(3.0)
+    with pytest.raises(ClockAbort, match="dp0 reported its clock at 3.0, but no"):
+        ca.on_request(ENGINE, REPORT, 3.0, [], member="dp0")
+    with pytest.raises(ValueError, match="frontend sent REPORT; only a member"):
+        _joined().on_request(FRONTEND, REPORT, 1.0, [])

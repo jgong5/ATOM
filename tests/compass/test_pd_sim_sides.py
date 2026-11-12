@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 """`pd_sim.sh`, run directly or through `cctraces_sim.sh`, starts each side
 under its own flags and environment, and from what each server was started
-with, `keyed` picks that side's entry of DeepSeek-V4-Pro's two DPA8 laws.
+with, `keyed` picks that side's entry of DeepSeek-V4-Pro's crs005 DPA8 law
+pair, keyed to the fp8 index cache a P/D side runs, and refuses both gpu-45
+laws, which state the fp4 their lone servers ran, naming `index_cache_dtype`.
+Under fp4 the same flags pick the gpu-45 pair, and the crs005 pair refuses
+them, naming it too.
 
 `python3` is stubbed on `PATH`: an API server prints its arguments and its
 environment to its log and then answers `/health`, and the clock authority only
@@ -25,14 +29,20 @@ from atom.compass.run.step_grid import keyed
 from tests.compass.held_ports import held_ports
 
 TREE = Path(__file__).resolve().parents[2]
-LAWS = [
-    json.loads(
-        (
-            TREE / f"scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-gpu45-{side}.json"
-        ).read_text()
-    )
-    for side in ("prefill", "decode")
-]
+#: DeepSeek-V4-Pro's two DPA8 law pairs, prefill then decode, by the index
+#: cache dtype each is keyed to.
+LAWS = {
+    index: [
+        json.loads(
+            (
+                TREE
+                / f"scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-{machine}-{side}.json"
+            ).read_text()
+        )
+        for side in ("prefill", "decode")
+    ]
+    for index, machine in (("fp8", "crs005"), ("fp4", "gpu45"))
+}
 PREFILL_ENV = {"ATOM_NUMA_BIND": "1", "GPU_MAX_HW_QUEUES": "5"}
 #: Outside `PERFORMANCE_KEYS`, so `keyed` reads none of it.
 DECODE_ENV = {"PD_SIM_DECODE_ONLY": "7"}
@@ -112,10 +122,10 @@ def started(tmp_path, script) -> dict:
     return sides
 
 
-def side_config(argv) -> SimpleNamespace:
+def side_config(argv, index: str) -> SimpleNamespace:
     """The engine config `keyed` reads: the side's own flags over the layout
-    both laws share."""
-    shared = LAWS[1]["engine_config"]
+    every law shares, its index cache `index`."""
+    shared = LAWS["fp8"][1]["engine_config"]
     flag = "--cudagraph-capture-sizes"
     sizes = argv[argv.index(flag) + 1] if flag in argv else DEFAULT_SIZES
     return SimpleNamespace(
@@ -125,6 +135,7 @@ def side_config(argv) -> SimpleNamespace:
         capture_sizes=ast.literal_eval(sizes),
         kv_cache_block_size=shared["kv_cache_block_size"],
         kv_cache_dtype=shared["kv_cache_dtype"],
+        index_cache_dtype=index,
         quant_config=SimpleNamespace(compute_hash=lambda: shared["quantization"]),
         tensor_parallel_size=1,
         parallel_config=SimpleNamespace(data_parallel_size=8),
@@ -136,7 +147,7 @@ def side_config(argv) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("script", ["pd_sim.sh", "cctraces_sim.sh"])
-def test_each_side_starts_under_its_own_flags_and_picks_its_own_law(
+def test_each_side_starts_under_its_own_flags_and_picks_its_law_by_the_indexer(
     monkeypatch, tmp_path, script
 ):
     sides = started(tmp_path, script)
@@ -148,18 +159,24 @@ def test_each_side_starts_under_its_own_flags_and_picks_its_own_law(
     )
     assert DECODE_ENV.items() <= d_env.items() and not DECODE_ENV.keys() & p_env.keys()
 
-    for law, (argv, env) in zip(LAWS, sides.values()):
+    for i, (argv, env) in enumerate(sides.values()):
         for name in PERFORMANCE_KEYS:
             monkeypatch.delenv(name, raising=False)
         for name in PERFORMANCE_KEYS & env.keys():
             monkeypatch.setenv(name, env[name])
-        here = keyed(side_config(argv))
-        assert (
-            compass_run._fitted_here(LAWS, here, lambda e: e["engine_config"], "law")
-            is law
-        )
-        hosts = [e["host"] for e in LAWS]
-        assert (
-            compass_run._fitted_here(hosts, here, lambda e: e["key"]["engine"], "host")
-            is law["host"]
-        )
+        # A P/D side resolves fp8 under --kv-transfer-config, a lone server fp4.
+        for index, other in (("fp8", "fp4"), ("fp4", "fp8")):
+            here = keyed(side_config(argv, index))
+            for entry, engine, what in (
+                (lambda law: law, lambda e: e["engine_config"], "law"),
+                (lambda law: law["host"], lambda e: e["key"]["engine"], "host"),
+            ):
+                own, refusing = (
+                    [entry(law) for law in LAWS[k]] for k in (index, other)
+                )
+                assert compass_run._fitted_here(own, here, engine, what) is own[i]
+                with pytest.raises(
+                    ValueError, match=f"no {what} entry was fitted"
+                ) as no:
+                    compass_run._fitted_here(refusing, here, engine, what)
+                assert f"entry {i} in ['index_cache_dtype']" in str(no.value)

@@ -125,11 +125,11 @@ def test_the_routed_experts_and_their_exchange_by_hand(spec):
     assert _price([fp4], step, spec)["roofline.moe"] == pytest.approx(
         _module(experts, spec) + gather + scatter
     )
-    # A graph's pad rows all carry one token: 6 real tokens and the pad reach
-    # the experts, every row still computed.
+    # A gather's pad rows route to no expert: its 6 real tokens reach the
+    # experts, the exchanges still moving every row.
     padded = BatchView(step.requests, moe_rows=rows, moe_tokens=6)
-    hit7 = activated_experts(8, 2, 7)
-    experts = Work({"bf16": 2 * 20 * (32 + 16) * 32}, hit7 * 816 + rows * 144)
+    hit6 = activated_experts(8, 2, 6)
+    experts = Work({"bf16": 2 * 12 * (32 + 16) * 32}, hit6 * 816 + 6 * 144)
     assert _price([ep_off], padded, spec)["roofline.moe"] == pytest.approx(
         _module(experts, spec) + gather + scatter
     )
@@ -297,7 +297,9 @@ def test_the_batch_view_states_the_real_tokens_among_the_gathered_rows():
     r = runner(None, dp_size=2)
     r.drafter = None
     sync = SimpleNamespace(
-        scheduled_tokens_per_dp_rank=torch.tensor([3, 2]), ub_tokens_across_dp=None
+        scheduled_tokens_per_dp_rank=torch.tensor([3, 2]),
+        ub_tokens_across_dp=None,
+        any_rank_needs_eager=False,
     )
     mode = SimpleNamespace(
         sync=sync,
@@ -318,6 +320,7 @@ def test_a_rank_s_view_names_its_own_slot_of_the_split():
     sync = SimpleNamespace(
         scheduled_tokens_per_dp_rank=torch.tensor([7, 7]),
         ub_tokens_across_dp=((4, 3), (3, 4)),
+        any_rank_needs_eager=False,
     )
     mode = SimpleNamespace(
         sync=sync, running_tokens_are_unified=False, use_cudagraph=False, running_bs=1

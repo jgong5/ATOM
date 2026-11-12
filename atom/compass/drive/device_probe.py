@@ -31,6 +31,13 @@ no host time is in it.
   its largest point over SPEC's bandwidth is ``memory.derate``.
 - Kernel floor: `GRAPH` empty kernels captured in one graph, replayed `REPS`
   times; ``kernel_floor_s`` is the median per kernel, with its p10 and p90.
+- Profiler floor: `GRAPH` empty kernels launched one after another behind a
+  spin under ATOM's kineto profiler as `compass record --trace` runs it, CPU
+  and CUDA activities with no shapes, stacks or memory; ``profiler_floor_s`` is
+  the median length the profiler records for one, with its p10 and p90: a
+  kernel queued behind another and shorter than it runs to it there. The
+  kernel floor's samples are not this probe's: under no profiler the kernels
+  run back to back at their own length.
 - Link: one kernel per card passes a counter `ROUNDS` times through the other
   card's memory; half a round trip is ``link_latency_s``, with its p10 and p90
   over `REPS` runs. A `LINK_BYTES` copy from card 0 to card 1 over SPEC's link
@@ -85,6 +92,7 @@ FORMATS = {"bf16": "bf16_flops", "fp8": "fp8_flops", "fp4": "fp4_flops"}
 #: The fields read with a band, and each one's sample list in the record.
 BANDED = {
     "device.kernel_floor_s": "floor",
+    "device.profiler_floor_s": "profiler_floor",
     "interconnect.intra_node.link_latency_s": "one_hop",
 }
 
@@ -377,6 +385,7 @@ def probe(torch, formats) -> dict:
         for _ in range(GRAPH):
             torch.cuda._sleep(0)
     floor = [t / GRAPH for t in _timed(torch, graph.replay)]
+    profiled = _profiled(torch)
 
     near = torch.empty(LINK_BYTES, dtype=torch.uint8, device="cuda:0")
     far = torch.empty_like(near, device="cuda:1")
@@ -405,9 +414,26 @@ def probe(torch, formats) -> dict:
         "capacity_bytes": capacity,
         **streams,
         "floor": floor,
+        "profiler_floor": profiled,
         "link": link,
         "one_hop": [t / ROUNDS / 2 for t in trips[1:]],
     }
+
+
+def _profiled(torch) -> list[float]:
+    """The seconds the kineto profiler, run as a trace run runs it, records for
+    each of `GRAPH` empty kernels launched one after another behind a spin."""
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        torch.cuda._sleep(SPIN)
+        for _ in range(GRAPH):
+            torch.cuda._sleep(0)
+        torch.cuda.synchronize()
+    device = torch.autograd.DeviceType.CUDA
+    ran = [e.time_range for e in prof.events() if e.device_type == device]
+    ran.sort(key=lambda r: r.start)
+    return [r.elapsed_us() / 1e6 for r in ran[1:]]  # the spin starts first
 
 
 def rates(record: dict) -> dict:
@@ -420,7 +446,8 @@ def readings(record: dict) -> dict:
     """The attainable values a record's samples give: each format's best
     median rate over shapes and libraries, the running maximum over sizes of
     the fastest kind's median rate, the link's median rate, and each banded
-    field's median, p10 and p90."""
+    field's median, p10 and p90, of those the record samples: one taken
+    before the profiler floor's probe has none."""
     med = statistics.median
 
     def band(samples):
@@ -441,4 +468,5 @@ def readings(record: dict) -> dict:
     best = itertools.accumulate((max(r[n] for r in kinds.values()) for n in sizes), max)
     found["bandwidth_curve"] = [[n, r] for n, r in zip(sizes, best)]
     found["link"] = med(record["link"])
-    return found | {path: band(record[key]) for path, key in BANDED.items()}
+    banded = {path: key for path, key in BANDED.items() if key in record}
+    return found | {path: band(record[key]) for path, key in banded.items()}

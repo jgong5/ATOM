@@ -47,6 +47,10 @@ stage 4 grades DeepSeek-V4.1-Flash on MI455's A0 sample cards in two cells of it
 no ranking gate (D50); the bound is checked on their records at A0's probed spec, and the
 method's error compares the frozen projection's spec with A0's on those records (D50.2).
 
+**Revised 2026-11-12 by the owner's ruling on
+[#3257](https://github.com/jgong5/ATOM/issues/3257):** the M3-Agentic stage grades each
+point by its overlap with the real curve (D45.1), its arms a set of their own (D50).
+
 **Scope.** What counts as evidence: which results are reported, how each is measured, what
 tolerance applies and where that tolerance comes from, and what invalidates a run.
 Acceptance is paired simulated and real execution of cc-traces proper, so every rule here
@@ -89,7 +93,7 @@ that subset is genuinely green.
 | Gate | What runs | Measured result |
 |---|---|---|
 | **CPU gate** — per task, and green is the bar | Every test file outside `tests/plugin/` and `scripts/compass/cpu_gate_exclude.txt`. Driven by `scripts/compass/gate_cpu.sh`; no driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` were both in the gate at `236abfd9a`, and each reached `rocminfo` when run *alone* (`no tests collected, 1 error`, rc=2, each, measured in `xiaobizh_n18_cpu`); inside the gate they module-skipped on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | Green, `GATE_CPU_RC=0`, read at `bdd244c57` in `xiaobizh_n18_cpu`. The counts are not restated here, because they move with every test the gate gains or loses: `gate_cpu.sh` prints them under the `commit:` line of the tree it ran, and `scripts/compass/README.md` says what the gate runs. |
-| **GPU gate**, a superset — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`, less any file `scripts/compass/gpu_gate_skip.txt` names for the GPU it runs on (a file that stalls there, or passes and fails at random), whose collected tests come off the expectation. | The commit, its counts and the toolchain it ran under are in `scripts/compass/gpu_gate_baselines/<GPU target>/gpu_gate_baseline.env`, one pair per GPU target, and every failing node-id is on file verbatim in the same directory's `gpu_gate_known_failures.txt` and compared by name, so "N failed" is checked against "the *same* N failed". `scripts/compass/regen_gpu_gate_baseline.sh` rewrites both from two runs that pass the same count and fail the same node-ids, so a new image or GPU is re-baselined by one command. |
+| **GPU gate**, a superset — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`, less any file `scripts/compass/gpu_gate_skip.txt` names for the GPU target it runs on: a file whose result on that target its pair cannot record. A suite file's collected tests come off the expectation; a `tests/compass` file only leaves its run. A target whose nodes hold no driver-run inputs has one line saying so, and there the gate sets none, needs one card and accepts a driver-run skip. | The commit, its counts and the toolchain it ran under are in `scripts/compass/gpu_gate_baselines/<GPU target>/gpu_gate_baseline.env`, one pair per GPU target, and every failing node-id is on file verbatim in the same directory's `gpu_gate_known_failures.txt` and compared by name, so "N failed" is checked against "the *same* N failed". `scripts/compass/regen_gpu_gate_baseline.sh` rewrites both from two runs that pass the same count and fail the same node-ids, so a new image or GPU is re-baselined by one command. |
 
 `test_dp_metadata.py`, `test_dp_sync_layout.py`
 and `test_forward_mode.py` were once excluded and were re-measured CPU-green (`16`); prose
@@ -292,6 +296,49 @@ when a need appears (`12` T101). What it measured, re-pricing prefill and re-sim
 
 At ×0.97 the 63-chunk streak splits back into the real run's exact **42 + 7 + 15**,
 breaking where the real run breaks (213.7 vs 213.1 s; 230.6 vs 231.2 s).
+
+---
+
+## D45.1. Overlap: a simulated point lies on the real curve
+
+Owner ruling on [#3257](https://github.com/jgong5/ATOM/issues/3257), 2026-11-12, for the
+M3-Agentic stage (`16` D95.1), whose exit is a simulated curve that lies on the real one.
+
+### Decision
+
+**At every point, each metric's simulated value lies inside the real rounds' min-to-max
+band, or within a stated distance of their mean:**
+
+| Metric | Distance from the real rounds' mean |
+|---|---|
+| throughput per GPU, p90 interactivity, median TPOT | 5% |
+| p90 TTFT | 10% |
+| GPU hit rate, CPU hit rate | 2 percentage points |
+
+- **The real curve** is this branch's ATOM on gpu-40, three spaced rounds per point (D45),
+  not InferenceX's published values. A point is one arm at one concurrency, and its
+  simulated value is one run (D50, *Repeats*).
+- **The metrics are InferenceX's**, as its agentic results code computes them at the
+  submission's commit
+  ([`request_metrics.py`](https://github.com/SemiAnalysisAI/InferenceX/blob/4b94f096b74191b8af6b7c89e50e0b6bc69f7aba/inferencex-e2e/infx/results/agentic/request_metrics.py));
+  #3264 computes them from client exports and draws both curves on InferenceX's axes.
+- **The hit rates** are its ATOM adapter's
+  ([`backends/atom.py`](https://github.com/SemiAnalysisAI/InferenceX/blob/4b94f096b74191b8af6b7c89e50e0b6bc69f7aba/inferencex-e2e/infx/results/agentic/backends/atom.py)):
+  the changes across the profiling window of `atom:prefix_cache_cached_tokens` (GPU) and
+  `atom:lmcache_loaded_tokens` (CPU), each over that of `atom:prefix_cache_full_tokens`. A
+  simulated run's counters are ATOM's own, kept by its real prefix cache and the
+  connector's real scheduler half (`03` D13.1).
+- **A point passes when every metric does.** For the stage's cells this is D45's gate made
+  concrete: the band is the real spread at that point, and the distance keeps a narrow
+  band from failing a value near the mean. The verdict prints each band beside its pass,
+  so a pass on a band wider than its distance shows, as D45 asks of a spread that swamps
+  its target.
+
+### Open issues
+
+- A simulated run's client export carries no server metrics: `CompassAgenticReplay`
+  refuses aiperf's scrape (`06` D35.1). #3264, which reads a real run's hit rates from
+  that export, needs the simulated run's counters across the same window from elsewhere.
 
 ---
 
@@ -605,6 +652,7 @@ P0b.3). The sets, each driven by cc-traces:
 | **Stage 2**, M2's first gate | Qwen3.8-27B on MI308X | TP1, aggregated | 1, 4, 16; 64 and 256 dropped on a real-side limit (below) |
 | **M2** | DeepSeek-V4-Pro, 1P+1D on the MI355X pair | the four nightly configurations of [`recipes/mesh/DeepSeek-V4.md`](../../../recipes/mesh/DeepSeek-V4.md) as written, expert parallelism off: TP, DPA, TP MTP3, DPA MTP1 | each configuration's benchmark concurrencies in that recipe |
 | **Stage 4**, the last step of v1 | DeepSeek-V4.1-Flash on MI455, one 4-card node per cell | TP4 DSpark5, aggregated: A with whole-expert EP4, B with the routed experts sharded across TP | 1, 4, 16, 64, 256 on traces 0 to 255; traces 256 to 392 calibrate |
+| **M3-Agentic** (`16` D95.1) | MiniMax-M3 MXFP4 on MI355X, mi355-gpu-40 | the arms of ATOM's AgentX submission, as [#3256](https://github.com/jgong5/ATOM/issues/3256) states them, EAGLE3 in each | each arm's concurrencies there, graded at every point by D45.1 |
 
 M2's flags and concurrencies are the recipe's; this document does not copy them. Stage 4's
 cells and flags are the owner's ([#2138](https://github.com/jgong5/ATOM/issues/2138)),
@@ -837,12 +885,13 @@ claims there are not.
 |---|---|---|
 | D44 | Three separable results — cost accuracy, schedule agreement, end-to-end — reported side by side. Aggregate latency is never the judgement. | 2026-09-18 |
 | D45 | Noise-floor first: the real-vs-real spread is the tolerance. A metric is admissible if stable; sensitivity, tested against the ×0.97 counterfactual, is deferred until a need appears. | 2026-09-18; revised 2026-10-16 (#1025) |
+| D45.1 | Overlap, ruled by the owner for the M3-Agentic stage: at every point each simulated value lies inside the real rounds' min-to-max band, or within 5% of their mean for throughput per GPU, p90 interactivity and median TPOT, 10% for p90 TTFT, and 2 points for the GPU and CPU hit rates; InferenceX's metric definitions, against this branch's ATOM on gpu-40. | 2026-11-12 (#3257) |
 | D46 | Three metric families ordered by robustness, as an extensible registry: counting invariants (preemptions and prefill tokens graded against the real spread, prefill tokens over the requests both runs issued; every other count reported, not gated), distributional (weighted most), event timing (most diagnostic). Policy agreement is a regression guard, not a discriminator. | 2026-09-18; revised 2026-10-11 (#743) and 2026-10-13 (#897) |
 | D47 | Cost accuracy on the real run's own step sequence; report totals, held-out-worst, and median per step together. Graded: every answered step with no declared term, at every backend, under #627's 5% gate; validated and unvalidated steps reported beside, not gated; declared steps apart. | 2026-09-18; revised 2026-10-23 (#2011) |
 | D48 | Memory per term, never as a sum. The gate is whether the top-1 configuration choice survives, not the byte error. | 2026-09-18 |
 | D49 | Seven hygiene refusals, each with a prior incident behind it. An op-level leaf is not extrapolated: with no same-kernel bracket it falls to its analytical law. An out-of-hull step is graded and also reported apart. | 2026-09-18; op-level leaf 2026-10-18 (#1489); out-of-hull graded 2026-10-23 (#2011) |
 | D50.1 | A step is refused only when some term is still unanswered after method fallback, its reasons listed per term; a fall-through and an answer of any method are not refusals, and the priced seconds are reported by method (analytical, declared, measured, estimated, unvalidated) with their steps and share of predicted seconds. Each unanswered term costs 0 s, and a step the cost backend refuses charges no device time, its answered terms included; the run continues, `--on-refusal abort` stops at the first, and the summary is written either way. Any refusal, of any source, makes the run a coverage report: no refused-seconds fraction, no threshold, and no answered step invalidates a run, whatever its method or share. No validated share refuses or makes a coverage report. | 2026-09-19; revised 2026-10-11 (#765, and again to drop the analytical cap); 2026-10-14 (#952); 2026-10-23 (#2011); 2026-10-26 (#2294) |
-| D50 | Everything registered and hashed before evaluation; the case set never shrinks, though the owner dropped stage 2's 64 and 256, whose aiperf warmup cannot finish within a capture's window (#1590). One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The cells are stage 2's Qwen3.8-27B TP1 on MI308X and M2's four nightly P/D configurations of DeepSeek-V4-Pro on MI355X at their concurrencies, then the DPA two at EP8; stage 4's two DeepSeek-V4.1-Flash TP4 DSpark5 cells on MI455, with and without EP4, graded with no ranking gate. M2's ranking gate: the same best configuration as hardware at each concurrency, and rank correlation across all cells, per end-to-end metric, each inside its real-vs-real spread, with Spearman's ρ also at least 0.9. DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01, 2026-10-09, 2026-10-10, 2026-10-20, 2026-10-25 and 2026-10-27 (#2138) |
+| D50 | Everything registered and hashed before evaluation; the case set never shrinks, though the owner dropped stage 2's 64 and 256, whose aiperf warmup cannot finish within a capture's window (#1590). One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The cells are stage 2's Qwen3.8-27B TP1 on MI308X and M2's four nightly P/D configurations of DeepSeek-V4-Pro on MI355X at their concurrencies, then the DPA two at EP8; stage 4's two DeepSeek-V4.1-Flash TP4 DSpark5 cells on MI455, with and without EP4, graded with no ranking gate; the M3-Agentic stage's MiniMax-M3 arms on gpu-40, graded point by point by D45.1. M2's ranking gate: the same best configuration as hardware at each concurrency, and rank correlation across all cells, per end-to-end metric, each inside its real-vs-real spread, with Spearman's ρ also at least 0.9. DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01, 2026-10-09, 2026-10-10, 2026-10-20, 2026-10-25 and 2026-10-27 (#2138), 2026-11-12 (#3257) |
 | D50.2 | The MI455 projection is sound, not graded: on every measured step, at both granularities, the analytical price at attainable peaks probed on the device, composed by the IR's own joins, is at most the measured time, with measured over analytical per op kind and phase reported beside it; every MI455 input is sourced or marked assumed: the A0 samples' peaks probed on their node since stage 4, the frozen projection's the datasheet times MI355X's probed ratios, and the B0 machines' too until a B0 node is probed; the method's error, the same A0 records bounded at the frozen spec and at A0's probed spec, and before them MI308X to MI355X on Qwen3.8-27B, and the configuration ranking are reported, not gated. Replaces the bound first stated at the spec's peaks with derates at 1, and the method that carried implementation efficiencies onto the target. | 2026-10-09; revised 2026-10-17 (#1392), 2026-10-25 and 2026-10-27 (#2138), 2026-10-28 (#2141) |
 | D50.3 | The op-level empirical backend is graded by this protocol as the step-level backends are, on the same real runs: Qwen3.8-27B TP1 on MI308X on #974's runs, then M2's cells with the ranking gate. Faster than real is gated; 5× is reported. Reported, not gated: the analytical fallback's share of priced seconds, the per-step composed-over-measured gap per phase and op kind, the step-level backend's table beside it, and warm-over-cold. | 2026-10-18 (#1489) |
 | D51 | Measure a saturated cell early. Account cold costs once; report the simulator's own per-step CPU cost alongside the ratio. | 2026-09-18 |

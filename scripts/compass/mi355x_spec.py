@@ -7,13 +7,18 @@ Builds mi355-gpu-45's spec, or with COMPASS_MACHINE=mi355x-crs005
 crsuse2-m2m-v3-005's, which -013 shares: the same cards, VBIOS and driver, and
 no ptl directory. With COMPASS_MACHINE=mi355x-gpu40 it builds mi355-gpu-40's,
 under rocm/atom-dev nightly 20261026's stack, the first that starts
-DeepSeek-V4.1-Flash.
+DeepSeek-V4.1-Flash, with its aiter as `aiter_c90842add0.sh` leaves it.
 The device fragment is one DeepSeek-V4-Pro start at the nightly DPA-TP8 prefill
-side's arguments (`FLAGS`): the device, its capacity and the stack.
+side's arguments (`FLAGS`): the device, its capacity and the stack; on gpu-40,
+whose stack that start did not run, the stack is `STACK`'s.
 `probe_device.py`'s readings (`PEAKS`) add the compute and memory derates, the
-bandwidth curve, the kernel floor and the intra-node link's latency and derate.
-The peaks are the datasheet's; the rest is assumed. An engine start's memory
-readings are `compass measure memory`'s, not the spec's.
+bandwidth curve, the kernel floor and the intra-node link's latency and derate;
+on crsuse2-m2m-v3-005 a later record of its own adds the profiler floor
+(`PROFILER`).
+On crsuse2-m2m-v3-005, the network file of its rails into -013 adds the
+inter-node link (`NETWORK`). The peaks are the datasheet's; the rest is
+assumed. An engine start's memory readings are `compass measure memory`'s, not
+the spec's.
 """
 
 import argparse
@@ -67,9 +72,26 @@ SUBJECT["record"] = f"sha256:{RECORD}"
 AITER, PTL_DATE = "9205e1059", "2026-10-18"
 if CRS005:
     AITER, PTL_DATE = "41d4d8d7e", "2026-10-29"
-#: On gpu-40, rocm/atom-dev nightly 20261026 (sha256 4d44267b1d5a).
+#: On gpu-40, rocm/atom-dev nightly 20261026 (sha256 4d44267b1d5a) with its
+#: aiter 41d4d8d7e patched by `aiter_c90842add0.sh`, which commits upstream
+#: aiter c90842add0's csrc on it as 09d256420 and rebuilds the modules that
+#: compile it.
 if GPU40:
-    AITER, PTL_DATE = "41d4d8d7e", "2026-10-29"
+    AITER, PTL_DATE = "09d256420", "2026-10-29"
+
+#: Where the stack is read when the device start ran another: gpu-40's start
+#: above ran the image's aiter, so its stack is the one `compass record` read
+#: at a later start in a container `aiter_c90842add0.sh` built, run.json's
+#: `stack`: (date, ATOM commit, model, TP width, run.json's sha256).
+STACK = None
+if GPU40:
+    STACK = (
+        "2026-11-09",
+        "d698ff75e",
+        "/shared/data/amd_int/models/DeepSeek-V4.1-Flash",
+        4,
+        "2930e1e2345ffbffe41d6a7158c1deab9ea3a3c8f5d123752588d699209e6670",
+    )
 
 DEVICE = {
     "device": {
@@ -199,8 +221,15 @@ if CRS005:
         "ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1",
     )
 
-#: On gpu-40, cards 0000:e5:00.0 and 0000:95:00.0 under nightly 20261026.
+#: On gpu-40, cards 0000:e5:00.0 and 0000:95:00.0 under nightly 20261026, its
+#: aiter unpatched (`PROBED_AITER`). The spec carries them to `AITER`, saying
+#: so in the peaks fragment's notes: every kernel the probe times (hipBLASLt,
+#: `aiter.gemm_a4w4`, its own Triton GEMMs) is in a module the recipe leaves
+#: byte-identical, since it rebuilds only the modules `aiter_c90842add0.sh`
+#: lists.
+PROBED_AITER = None
 if GPU40:
+    PROBED_AITER = "41d4d8d7e"
     PEAKS = (
         "2026-10-29",
         "b71c071d3",
@@ -246,14 +275,35 @@ if GPU40:
         "020692760182d835943e2ac416f59df1abd2bb82cbe71870ce0c9f316cae436a",
     )
 
+#: On 005, cards 0002:00:01.0 and 0002:00:02.0 under the stack `DEVICE` pins,
+#: the profiler floor of a later `probe_device.py` record than `PEAKS`'s: (date,
+#: ATOM commit, its median, p10 and p90, the record's sha256).
+PROFILER = None
+if CRS005:
+    PROFILER = (
+        "2026-11-11",
+        "0bdc17c90",
+        (3.9590000000007426e-06, 3.878999999999906e-06, 4.03900000000067e-06),
+        "933a0d26bfeed09e301a6582acddc40da10119a5c5146e853fef982dcfa01cdb",
+    )
+
+#: On 005, the network file of its rails into 013, which `rdma_link.py fit
+#: BENCH RECORD` published; its notes say what each value was read from.
+NETWORK = None
+if CRS005:
+    NETWORK = Path(__file__).resolve().parents[2] / "atom/compass/networks"
+    NETWORK /= "crs005-013-ionic.json"
+
 #: No probe fills these: mi308x_spec's assumed values less what the datasheet
-#: states and what `PEAKS` fills. Its inter-node link is one 400 Gb/s NIC's
-#: line rate here too.
+#: states and what `PEAKS` and `NETWORK` fill. Its inter-node link is one
+#: 400 Gb/s NIC's line rate here too.
 DECLARED = copy.deepcopy(base.DECLARED)
 for block, groups in DATASHEET.items():
     for group, values in groups.items():
         for key in values:
             DECLARED[block][group].pop(key, None)
+if NETWORK:
+    del DECLARED["interconnect"]["inter_node"]
 
 
 def device_fragments() -> list[Fragment]:
@@ -268,13 +318,45 @@ def device_fragments() -> list[Fragment]:
         "assumed", DECLARED, "assumed", "no probe fills these", date=DATE
     )
     probed, assumed = base.peaks(PEAKS, datasheet.values, assumed)
-    return [
-        fragment("device", DEVICE, "probed", notes, SUBJECT, DATE),
+    if PROBED_AITER:
+        carried = (
+            f"; its record ran aiter {PROBED_AITER}, and every kernel it timed is "
+            f"byte-identical under {AITER}: aiter_c90842add0.sh rebuilds no "
+            "module that holds one"
+        )
+        notes_of = {"provenance.notes": probed.values["provenance.notes"] + carried}
+        probed = Fragment(probed.source, {**probed.values, **notes_of})
+    device, stack = DEVICE, []
+    if STACK:
+        date, root, model, width, record = STACK
+        held = dict(DEVICE["device"])
+        pinned = {"device": {"software_pinned_to": held.pop("software_pinned_to")}}
+        device = {"device": held}
+        subject = {"model": model, "width": width, "source_root": f"commit:{root}"}
+        subject["record"] = f"sha256:{record}"
+        how = (
+            f"run.json's stack, one TP{width} start at {root} after aiter_c90842add0.sh"
+        )
+        stack = [fragment("stack", pinned, "probed", how, subject, date)]
+    fragments = [
+        fragment("device", device, "probed", notes, SUBJECT, DATE),
+        *stack,
         datasheet,
         assumed,
         fragment("ptl", ptl, "probed", "no card has a ptl directory", date=PTL_DATE),
         probed,
     ]
+    if PROFILER:
+        date, root, (floor, low, high), record = PROFILER
+        subject = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
+        body = {"device": {"profiler_floor_s": floor}}
+        how = "probe_device.py: empty kernels queued under a trace run's profiler"
+        band = {"device.profiler_floor_s": (low, high)}
+        fragments.append(fragment("profiler", body, "probed", how, subject, date, band))
+    if NETWORK:
+        network = json.loads(NETWORK.read_text()) | {"name": NAME}
+        fragments.append(Fragment.from_mapping(network, NETWORK.stem))
+    return fragments
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -3,21 +3,31 @@
 
 Each record directory holds one of `test_backend_step_linear_fit.py`'s planted
 timed records as `steps/dp0.jsonl`, its host key and engine file beside it,
-and a run.json written by hand as `test_fit_samples.py` writes one. The store
+or a data-parallel group's ranks as `test_step_linear_moe_column.py` plants
+them, and a run.json written by hand as `test_fit_samples.py` writes one. The store
 is a fresh directory; the entry's provenance names planted trees, since git
 cannot name a read-only checkout in every container.
 """
 
 import json
 import re
-from pathlib import Path
 
 import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
-from test_backend_step_linear_fit import _steps, _timed_record
+from test_backend_step_linear_fit import _steps, _timed_record, platform_arg
 from test_fit_samples import DEVICE, SOURCE, edit, idle_rank
-from test_memory_readings import DOCUMENT, STACK
+from test_memory_readings import DOCUMENT, STACK, spec_file
 from test_parity_served import SAMPLING
+from test_step_linear_moe_column import (
+    DP,
+    EXPERTS,
+    FULL,
+    ROUTING,
+    RUNG,
+    SPARSE,
+    _groups,
+    _records,
+)
 
 from atom.compass import cli
 from atom.compass.artifacts import (
@@ -27,7 +37,8 @@ from atom.compass.artifacts import (
     Kind,
     Reading,
     Row,
-    machine_spec_digest,
+    keyed_platform,
+    machine_platform,
 )
 from atom.compass.backends import StepLinearLaw, step_linear_fit
 from atom.compass.backends.step_labels import digest
@@ -52,8 +63,8 @@ HOST = {
     "engine": ENGINE,
 }
 LINEAR = ("--backend", "step-linear")
-#: The digest of the run files' machine spec, the one every fit here names.
-DIGEST = machine_spec_digest(MachineSpec.from_mapping(DOCUMENT))
+#: The platform of the run files' machine spec, the one every fit here names.
+PLATFORM = machine_platform(MachineSpec.from_mapping(DOCUMENT))
 
 
 @pytest.fixture(autouse=True)
@@ -62,25 +73,31 @@ def planted_roots(monkeypatch):
 
 
 def record(directory, seed, key=HOST, keyed=True, stack=STACK, trace="trace"):
-    """`directory`, a record of `_steps(seed)`; without `keyed`, no host key
-    beside it. Every request is named, and `directory/client.json` is the
-    export of one client run sending them all, each from trace `<trace>.<k>`,
-    `k` its first step's index over 100."""
+    """`directory`, a record of `_steps(seed)` (`as_record`); without `keyed`,
+    no host key beside it."""
     steps = directory / "steps"
     steps.mkdir(parents=True)
-    path = steps / "dp0.jsonl"
-    _timed_record(path, _steps(seed), key=key if keyed else None)
-    lines = [json.loads(x) for x in path.read_text().splitlines()]
-    sent = {}
-    for i, line in enumerate(lines):
-        line["named"] = [[r[0], f"r{r[0]}"] for r in line["batch"]]
-        for r in line["batch"]:
-            at = {"trace": f"{trace}.{i // 100}", "sampling": SAMPLING}
-            sent.setdefault(f"r{r[0]}", at)
-    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
-    (directory / "client.json").write_text(json.dumps({"requests": sent}))
+    _timed_record(steps / "dp0.jsonl", _steps(seed), key=key if keyed else None)
+    return as_record(directory, key, stack, trace)
+
+
+def as_record(directory, key=HOST, stack=STACK, trace="trace"):
+    """`directory`, whose `steps/` holds each rank's lines, as a record under the
+    host key `key`, each rank's engine file its engine. Every request is named,
+    and `directory/client.json` is the export of one client run sending them
+    all, each from trace `<trace>.<k>`, `k` its first step's index over 100."""
     engine = {**key["engine"], **dict.fromkeys(BOUNDS, 4096), "num_kvcache_blocks": 900}
-    (steps / "dp0.engine.json").write_text(json.dumps(engine))
+    sent = {}
+    for path in sorted((directory / "steps").glob("dp*[0-9].jsonl")):
+        lines = [json.loads(x) for x in path.read_text().splitlines()]
+        for i, line in enumerate(lines):
+            line["named"] = [[r[0], f"r{r[0]}"] for r in line["batch"]]
+            for r in line["batch"]:
+                at = {"trace": f"{trace}.{i // 100}", "sampling": SAMPLING}
+                sent.setdefault(f"r{r[0]}", at)
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+        path.with_suffix(".engine.json").write_text(json.dumps(engine))
+    (directory / "client.json").write_text(json.dumps({"requests": sent}))
     run = {
         "format_version": 2,
         "argv": ["compass", "record", "--out", str(directory)],
@@ -98,20 +115,19 @@ def record(directory, seed, key=HOST, keyed=True, stack=STACK, trace="trace"):
 def fit(tmp_path, command, *args):
     """`compass <command> <args>` on the run files' machine spec, publishing to
     `tmp_path/store`."""
-    machine, store, out = (str(tmp_path / f) for f in ("spec.json", "store", "out"))
-    Path(machine).write_text(json.dumps(DOCUMENT))
-    tail = ["--machine", machine, "--store", store, "--out", out]
+    store, out = (str(tmp_path / f) for f in ("store", "out"))
+    tail = ["--machine", spec_file(tmp_path), "--store", store, "--out", out]
     cli.main([*command.split(), *map(str, args), *tail])
 
 
-def law_key(form="history") -> Key:
+def law_key(form="history", engine=ENGINE) -> Key:
     return Key.of(
         Kind.STEP_LINEAR_LAW,
         model=HOST["model"],
-        engine_config=json.dumps(ENGINE, sort_keys=True),
-        source_root="tree-67c176f0",
+        engine_config=json.dumps(engine, sort_keys=True),
+        source_root="atom_py-" + HOST["atom"],
         form=form,
-        machine_spec=DIGEST,
+        **keyed_platform(Kind.STEP_LINEAR_LAW, PLATFORM),
     )
 
 
@@ -133,7 +149,8 @@ def test_the_law_published_is_the_one_step_linear_fits_command_writes_less_its_h
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     law_file = str(tmp_path / "law.json")
     step_linear_fit.main(
-        [*map(str, paths), "--form", form, "--machine-spec", DIGEST, "--out", law_file]
+        [*map(str, paths), "--form", form, *platform_arg(DOCUMENT)]
+        + ["--out", law_file]
     )
     written = json.loads((tmp_path / "law.json").read_text())
     assert law == {k: v for k, v in written.items() if k not in ("host", "host_fit")}
@@ -146,6 +163,38 @@ def test_the_law_published_is_the_one_step_linear_fits_command_writes_less_its_h
         "params": law,
         "report": report,
     }
+
+
+def test_a_routed_law_is_the_one_step_linear_fits_command_writes_with_the_routing(
+    tmp_path,
+):
+    # Two runs of a group of `DP` ranks priced by a law whose rung adopts the
+    # experts column: one run's ranks all full, the other's mostly idle.
+    key = {**HOST, "engine": {**ENGINE, "data_parallel_size": DP}}
+    runs = []
+    for name, seed, others in (("full", 0, FULL), ("sparse", 1, SPARSE)):
+        (tmp_path / name).mkdir()
+        _records(tmp_path / name / "steps", _groups(seed, 200, others))
+        runs.append(as_record(tmp_path / name, key))
+    routing = ("--moe-routing", ",".join(map(str, ROUTING)))
+    fit(tmp_path, "fit steps", *LINEAR, *routing, *runs, *clients(*runs))
+
+    law = member(tmp_path / "store", law_key(engine=key["engine"]), "params")
+    # The samples come in run order, a run named by its ranks' digests.
+    ranks = sorted(
+        (sorted((d / "steps").glob("dp*[0-9].jsonl")) for d in runs),
+        key=lambda files: ", ".join(map(digest, files)),
+    )
+    law_file = str(tmp_path / "law.json")
+    step_linear_fit.main(
+        [str(f) for files in ranks for f in files]
+        + ["--form", "history", *routing, *platform_arg(DOCUMENT), "--out", law_file]
+    )
+    written = json.loads((tmp_path / "law.json").read_text())
+    assert law == {k: v for k, v in written.items() if k not in ("host", "host_fit")}
+    assert law["moe_routing"] == {"experts": ROUTING[0], "top_k": ROUTING[1]}
+    assert list(law["decode"][str(RUNG)]["coefficients"]) == list(EXPERTS)
+    StepLinearLaw(law)
 
 
 def test_step_linear_fits_the_history_form_unless_told_another(tmp_path):
@@ -210,7 +259,7 @@ def test_the_entry_s_readings_are_the_ones_its_records_state(tmp_path):
             "stated", "rocm 7.2.4 / aiter f4e7c7509 / rccl 2.22.3"
         ),
         Axis.TORCH: Reading("stated", "2.10.0"),
-        Axis.ATOM_SRC: Reading("tree", "67c176f0"),
+        Axis.ATOM_SRC: Reading("atom_py", HOST["atom"]),
         Axis.MODEL: Reading("stated", HOST["model"]),
         Axis.DEVICE: Reading("stated", "MI355X gfx950"),
         Axis.PTL: Reading("stated", "disabled"),
@@ -314,6 +363,16 @@ def test_sessions_refuse_off_step_grid_and_an_unnamed_grid_input_refuses_under_t
 
     with pytest.raises(SystemExit, match=re.escape(named.format(b=b))):
         fit(tmp_path, "fit steps", "--backend", backend, a, *grid, *sessions)
+    assert not (tmp_path / "store").exists()
+
+
+def test_the_routing_refuses_off_step_linear(tmp_path):
+    a = record(tmp_path / "a", 19)
+    routed = ("--backend", "step-grid", "--moe-routing", "64,4")
+
+    named = "--moe-routing is read by step-linear, not step-grid"
+    with pytest.raises(SystemExit, match=re.escape(named)):
+        fit(tmp_path, "fit steps", *routed, a, *clients(a))
     assert not (tmp_path / "store").exists()
 
 

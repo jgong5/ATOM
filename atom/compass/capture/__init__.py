@@ -3,8 +3,8 @@
 published as an `op_graph`.
 
     compass trace ops --model M [--tp N] [--width W ...] [--prefill T B ...]
-                      [--whole] [--population P ...] [--arch A] [--gpu I]
-                      --store S [-- ATOM args]
+                      [--whole] [--population P ...] [--symbolic] [--arch A]
+                      [--gpu I] --store S [-- ATOM args]
 
 A shape is a decode width (`--width`), a prefill of T tokens over B sequences
 (`--prefill`), or every shape the steps of a record directory hold
@@ -20,18 +20,24 @@ replays no graph yet pads past its rows, `target_bs`, at that width. Under
 micro-batches, each a prefill at its own tokens and the group's rows of it,
 by the split `validate.bound` rebuilds from every rank's line; a population's
 prefill is traced as one forward, as it ran, where ATOM would split a step of
-its tokens, and with `--whole` each `--prefill` too. Each is traced at that
+its tokens, a micro-batch's MoE on one stream as under overlap, and with
+`--whole` each `--prefill` too. Each is traced at that
 concrete shape (`forward`), decoder layers folded
-into `Repeat` and forked streams into `Par` (`graph`).
+into `Repeat` and forked streams into `Par` (`graph`). Under DP with no
+drafter, `--symbolic` then traces each prefill's (T, B) once more, at its
+width, with G a symbol, published at `forward.symbolic_shape` as a run's lookup
+traces it (`forward.Tracer.symbolic`), so a run reads it for each G it admits;
+without DP, or under a drafter, it refuses before any trace.
 
 An `op_graph` is keyed by structure (`forward.structure`: the model's
 architecture and config.json digest, `--arch`, the engine config a step law is
 keyed by less its ladder, which holds ATOM's engine arguments and this
 process's performance environment (`run.step_grid.keyed`), the TP width, the DP
-and EP widths when set, the phase, the mode and whether the step produces
-output) and by shape, which
+and EP widths when set, the phase, the mode, whether the step produces
+output and whether it is a two-batch-overlap micro-batch), by shape, which
 names the rows a DP group's MoE gathers only off its default, every rank at
-this one's tokens (`forward.Shape`):
+this one's tokens (`forward.Shape`), and by the ATOM source and torch it was
+traced under (`graph_key`):
 a prefill shape is published twice, as a middle chunk, which samples nothing,
 and as a final one. ATOM's engine arguments after `--`
 configure the engine as they would a server's; `--arch` names the declared
@@ -45,13 +51,15 @@ card. Its members are
 of a device and the operators it left out of the graph, each with why. A TP
 group's ranks run one graph, so rank 0's is the entry's. The declarations are
 process-global, so a process runs one capture, of every shape it was given.
-Trace in the environment of the run or bench that reads the graphs: a reader in
-another misses them, and its refusal names each field that differs.
+Trace in the environment, ATOM source and torch of the run or bench that reads
+the graphs: a reader under another misses them, and its refusal names each
+field that differs.
 """
 
 import argparse
 import dataclasses
 import datetime
+import functools
 import json
 import pathlib
 import tempfile
@@ -87,6 +95,11 @@ def main(argv: list[str]) -> None:
         default=[],
         help="a record directory; every shape its steps hold",
     )
+    p.add_argument(
+        "--symbolic",
+        action="store_true",
+        help="under DP, also trace each prefill's (T, B) with G a symbol",
+    )
     p.add_argument("--arch", help="the declared device's arch, gfx942 by default")
     p.add_argument("--gpu", type=int, help="declare this card as it reads")
     p.add_argument("--store", required=True, help="the artifact store")
@@ -109,10 +122,13 @@ def main(argv: list[str]) -> None:
     command = " ".join(["compass", "trace", "ops", *argv])
     with tempfile.TemporaryDirectory(prefix="compass-capture-") as tmpdir:
         began = time.perf_counter()  # the first shape's seconds include the build
-        # A card's reading and `--whole` only when given: any other call is as before.
+        # A card's reading, `--whole` and `--symbolic` only when given: any
+        # other call is as before.
         on = {"read": read} if read else {}
         if args.whole:
             on["whole"] = True
+        if args.symbolic:
+            on["symbolic"] = True
         captured = capture(
             args.model, args.tp, shapes, tmpdir, atom_args, arch, args.population, **on
         )
@@ -140,8 +156,8 @@ def population_steps(names, tbo=False, drafters=False):
     overlap (`tbo`, ATOM's `enable_tbo`) a DP step the group split, by the
     rule `validate.bound` agrees over every rank's line at that step
     (`bound._split`), is its two micro-batches (`step_roofline.micro_batches`),
-    each a prefill at its own tokens and the group's rows of it, its line
-    holding its own rows. With
+    each a prefill at its own tokens and the group's rows of it, marked a
+    micro-batch (`forward.Shape`), its line holding its own rows. With
     `drafters`, a drafter's shape follows it where they differ: a decode's
     at its rows padded to `draft_bs`, else to its rung, a sampling prefill's
     or a DP middle chunk's with `draft_bs` as its `width`. A target that
@@ -197,13 +213,44 @@ def population_steps(names, tbo=False, drafters=False):
                     rows = [(r.query_tokens, r.decode) for r in half.requests]
                     _, tokens, seqs = step_shape(rows, None)
                     own = {"rows": [dataclasses.astuple(r) for r in half.requests]}
-                    yield prefill(tokens, seqs, half.moe_rows).at(dp), line | own
+                    shape = prefill(tokens, seqs, half.moe_rows).at(dp)
+                    yield shape._replace(micro_batch=True), line | own
+
+
+@functools.cache
+def traced_under() -> dict:
+    """This process's ATOM source (`run.atom_source`) and torch, by axis: what
+    every `op_graph` it traces is keyed and fingerprinted under, and every one
+    it reads is looked up under. Read once, as a process traces and reads
+    under the code it imported."""
+    import torch
+
+    from atom.compass.artifacts import Reading
+    from atom.compass.run import atom_source
+
+    return {"atom_src": atom_source(), "torch": Reading.stated(torch.__version__)}
+
+
+def graph_key(structure: str, shape: str):
+    """The key of the `op_graph` at `structure` and `shape` traced under this
+    process's ATOM source and torch (`traced_under`): a graph traced under
+    another of either is another entry, which a lookup here misses."""
+    from atom.compass import artifacts as a
+    from atom.compass.run import source_root
+
+    under = traced_under()
+    return a.Key.of(
+        a.Kind.OP_GRAPH,
+        structure=structure,
+        shape=shape,
+        source_root=source_root(under["atom_src"].value),
+        torch=under["torch"].value,
+    )
 
 
 def publish(store, graph, model, declared, tp, atom_args, command):
-    """Publish `graph` of `model` at TP `tp` as one `op_graph` in `store`."""
-    import torch
-
+    """Publish `graph` of `model` at TP `tp` as one `op_graph` in `store`, at
+    its `graph_key`."""
     from atom.compass import artifacts as a
     from atom.compass.artifacts.keys import NO_PTL
     from atom.compass.run import host_cpu
@@ -211,11 +258,7 @@ def publish(store, graph, model, declared, tp, atom_args, command):
     from .graph import to_json
 
     applicability = graph.applicability
-    key = a.Key.of(
-        a.Kind.OP_GRAPH,
-        structure=applicability.structure,
-        shape=applicability.shape,
-    )
+    key = graph_key(applicability.structure, applicability.shape)
     roots = a.roots_for({"atom": "atom", "aiter": "aiter"})
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     rank = next(iter(a.Topology().ranks()))
@@ -225,8 +268,7 @@ def publish(store, graph, model, declared, tp, atom_args, command):
         topology=a.Topology(),
         conditions=a.Conditions.of(
             software_stack=a.Reading.of_source_root(roots[1]),
-            torch=torch.__version__,
-            atom_src=a.Reading.of_source_root(roots[0]),
+            **traced_under(),
             model=model,
             device=declared["arch"],
             ptl=NO_PTL,

@@ -456,9 +456,12 @@ frames. The CA completes each round of the LP only when every member has asked i
 2. One request kind per round: TAR with equal `T` on every member, or NER with `t`
    and `t_daemon` each the minimum over members. Unequal `T` or mixed kinds are refused.
 3. Every member's send log is merged before any grant is computed, so the LP's promised
-   time never rises on a partial request.
+   time never rises on a partial request. Under local grants a group's rounds below its
+   ceiling are granted before the members that owe them report, and the LP's `N` stays
+   at the least clock among those members until each has (#2993, *Local grants* below).
 4. One common grant `G`; each member is released only the messages on its own channels.
-5. A member never advances time alone; a lone call only ships its send log.
+5. A member never advances time alone, but through rounds granted ahead of it under
+   local grants; a lone call only ships its send log.
 
 With `lmcache_mp` above DP width 1, a park request amends rules 1, 2 and 5 (D6.1).
 
@@ -478,8 +481,9 @@ any other ends at its own seconds, as a real idle rank's forward returns on its 
 takes in arrivals there before `_sync_dp_state`; the pulls join the ends as rounds
 (`group_out`). Each member asks every distinct round, ascending: those up to its own pull
 in one TAR call, which returns at its pull (its own end where there is no `out_s`), and
-the rest, which it owes, in one more call when it pays them (#2820). Each round is still
-its own grant, and a call's one reply releases what each of its rounds released to the
+the rest, which it owes, in one more call when it pays them (#2820); under local grants
+those below the ceiling of the grant it returned at are granted ahead, and it steps
+through them and reports them when it pays (#2993). Each round is still its own grant, and a call's one reply releases what each of its rounds released to the
 member. Until the owed rounds are paid its sends are stamped at its own end; a TAR before
 the last owed round and any NER are refused; and every host collective on its clock owner
 thread, a `torch.distributed` collective whose tensors are all on the CPU or that has none,
@@ -633,8 +637,10 @@ recovery (below) grants one LP at a time: a single global event loop across proc
 correct, serialized, no parallelism. That is why zero-lookahead couplings stay inside one
 LP (partition principle, above).
 
-**Local grants** (`compass run --local-grants`, the owner's ruling (c) on
-[#2542](https://github.com/jgong5/ATOM/issues/2542#issuecomment-6539617449)). A grant to an
+**Local grants** (on by default, `compass run --no-local-grants` turns them off; the
+owner's ruling (c) on
+[#2542](https://github.com/jgong5/ATOM/issues/2542#issuecomment-6539617449) and the
+[#3086 ruling](https://github.com/jgong5/ATOM/pull/3086#issuecomment-6739389313)). A grant to an
 LP without members, other than a recovery's, also carries a ceiling: the least of
 `LBTS(i)`, `G` plus the LP's shortest cycle `min over j of D(i->j) + D(j->i)`, its
 earliest unreleased arrival, and the bound on simulated time. Nothing reaches the LP below
@@ -645,10 +651,23 @@ each such step with its next request, with how many of that request's logged sen
 preceded it; the CA keeps `N[i]` at the last grant meanwhile. The CA replays each step as
 the grant its own request would have had: it registers the sends made before it, records
 the reply with what it releases and counts the grant, so the step table and the grant
-counts are those of a run without the flag, which is why the run-file key is per-run. An
+counts are those of a run with local grants off, which is why the run-file key is per-run. An
 NER may ask for its messages ahead: every message registered for it below the ceiling goes
 with the grant, and the owner releases each in the step that reaches it. A step outside
 the LP's clock and ceiling, or past a message registered for it since, aborts the run.
+
+A DP group's LP gets its ceiling at a grant at which some members return while others
+still ask later rounds (#2993): the least of `LBTS(i)`, `G` plus the LP's shortest cycle,
+and the bound. The CA grants each later round below it at once, each its own grant, the
+returned members standing in it, as they owe it, and holds each such member's reply until
+the last of them, so that it carries what those rounds release to the member beside the
+ceiling. When it pays its owed rounds, the member steps its own clock through those below
+the ceiling, releasing each message in the step that reaches it, and reports the steps
+with its send log: in its call for the rounds left, or with none left in a `REPORT` that
+waits for no reply. Until it has, the LP's `N` is no later than that member's clock, as
+its sends are stamped there and not yet logged. No step is replayed, since each round was
+granted, and a request from such a member that does not report exactly those rounds
+aborts the run.
 
 #### Invariants
 
@@ -1963,18 +1982,28 @@ and receives both run on the engine's step loop, and no worker takes part.
   and no worker ever sends or receives across LPs. A prefill-side local timer would not
   do: when decode posts depends on its own admission, which prefill cannot know, and
   assuming "at once" frees prefill's blocks early exactly when decode is congested.
-- **Ceiling.** FIFO per rank pair is measured on Mooncake TCP only; for RDMA it is an
-  assumption. Under RDMA the real sharing unit is each prefill rank's NIC: its worker
-  writes through the HCA set `_select_ib_devices` resolves for its GPU, and
-  `MooncakeConnector._write_listener` hands every write request, from any decode rank,
-  to one `_send_executor` of `send_worker_count` (`num_worker_threads`) threads. Writes
-  on different rank pairs do not contend here. At decode DP width one a prefill rank's
-  NIC carries only the one decode rank's writes, so both ends still compute the same `c`
-  under any sharing discipline. Above that, `c` depends on other decode ranks' writes,
-  which this decode rank never sees, so a per-prefill-rank model cannot keep both ends
-  computing `c` without a message: decode would need Mooncake's own write-done notice
-  (`MooncakeConnector._send_write_done` to the consumer's `_notification_listener`) as a
-  prefill-to-decode channel (#1179).
+- **Ceiling: per-pair links are a simplification under RDMA.** Each prefill-decode rank
+  pair is one FIFO link, and writes on different pairs never contend. FIFO per rank pair
+  is measured on Mooncake TCP and kept under RDMA through v1 by the owner ruling on
+  #1179. The real sharing unit depends on the fabric:
+  - With matched rails (`ATOM_MOONCAKE_MATCHED_RAILS`, as on the MI355X nodes crs005 and
+    crs013), a producer writes through the rail engine of the consumer's HCA
+    (`RailEnginePool.get`), so writes into one decode rank share its rail across prefill
+    engines and queue within one engine, and one prefill GPU's writes stay under its cap
+    across rails (#3051).
+  - Without matched rails, it is the prefill rank's HCA set, which `_select_ib_devices`
+    resolves for its GPU.
+  - Either way, `MooncakeConnector._write_listener` hands each prefill rank's write
+    requests, from any decode rank, to one `_send_executor` of `send_worker_count`
+    (`num_worker_threads`) threads.
+
+  Effect: fan-in on a rail is priced at a lone writer's rate, so contended writes finish
+  early, and decode admission and prefill's block release come early with them. It grows
+  with concurrency, prefill ranks per decode rank and KV bytes. #3051 has its size on
+  those nodes and #2991 its share of TTFT at #1111's cell. Pricing rail fan-in needs every
+  write into a decode rank, which its prefill ranks do not see, so decode would have to
+  send prefill each write's done time, a message the real deployment never sends; #1179
+  prices it after v1.
 - It must still emit the `kv_transfer_params` blob that Atomesh relays, so
   `AtomAdapter` works unmodified. The router hard-errors if it is absent
   (`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`). The two backends emit
@@ -2048,9 +2077,10 @@ two differ the code is right.
 
 ### Cons / open issues
 
-- The transfer model is now **unvalidated** — a real RDMA baseline is needed at least
-  once to fit `latency` and `bandwidth`, or the numbers are assumed rather than
-  measured. This is a calibration task, not a simulator task, but it must be named.
+- A link's `latency` and `bandwidth` are as good as its network spec, whose provenance
+  says per value whether it came from a datasheet, was assumed or was probed; a link no
+  probe fills prices every transfer on assumed or datasheet numbers. #3051 probed the
+  MI355X rails between crs005 and crs013 (`atom/compass/networks/crs005-013-ionic.json`).
 - Mooncake requires **all** `(pp_rank, tp_rank)` pairs to report before a request
   completes (`mooncake_connector.py::MooncakeConnector._record_write_done`). The
   simulated write is one event per request, priced on the whole block table, so ranks
@@ -2308,8 +2338,9 @@ PCP, DP across hosts, `engine_driven`, more than one server) stand as they are. 
 stand-in refuses a server flag or request type it does not model, by name, and the shell
 refuses a server URL that `RequestClientFactory` hands to gRPC (`grpc://`,
 `grpc+unix://`), a carrier with no wrapped socket, by its scheme. A `multi`
-connector runs only when each sub-connector is simulated (`compass` and `lmcache_mp`);
-`ATOM_KV_OFFLOAD=lmcache` (in-process, no server) and `mooncake_store` stay refused.
+connector runs only when each sub-connector is simulated (`compass`, `lmcache_mp`, and
+`lmcache_offload`, which `ATOM_KV_OFFLOAD=lmcache` selects, by `03` D13.1);
+`mooncake_store` stays refused.
 
 **Acceptance**, per #1076's ruling:
 
@@ -2745,7 +2776,7 @@ Ordered by how much they could cost.
 | D0 | Fresh design; prior branches referenced at the design level only, not as a code-port plan | 2026-09-17 |
 | D1 | Keep ATOM's multi-process / multi-thread topology; additive changes only | 2026-09-17 |
 | D2 | "Two nodes" means true PD disaggregation, realised as two containers on one physical node | 2026-09-17 |
-| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP a round only after every rank has asked it; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares | 2026-09-18; revised 2026-09-28, 2026-10-02, 2026-10-14 (#966) and 2026-11-08 (#2820) |
+| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP a round only after every rank has asked it or, under local grants below a ceiling, owes it; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares | 2026-09-18; revised 2026-09-28, 2026-10-02, 2026-10-14 (#966), 2026-11-08 (#2820) and 2026-11-09 (#2993) |
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
 | D3.2 | Always-on causality detectors: a straggler check against the receiver's last drain (fails the run); a stall the CA cannot see prints one diagnostic after 30 wall seconds and keeps waiting, never aborting; clock-source CI lint | 2026-09-19; revised 2026-09-28 |
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for multi-container runs (1P+1D in M1 and M2) | 2026-09-19 |
@@ -2754,7 +2785,7 @@ Ordered by how much they could cost.
 | D4 | Every synchronization site maps to one of the PDES mechanisms K1-K9, none undecided; the boundary is the LP, not the process; a DP member's step is one TAR at its own release from the group's device end, the `max` over ranks by an `all_reduce(MAX)` (with no host time, an output rank's at the `max` of the step seconds), exchanged inside the forward by K6 waits with no cost, and the lockstep `all_reduce` is K1 for its own cost; handler threads stay and TSO delivery runs them at their message's timestamp. A forward's K1 charge is one recurrence per runner over the backend's device busy time and host segments (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs` after R1), with wait rules R1, R4 and R6 to R8; after the return the engine LP advances the host's `out_s` (`E_out`) to its input pull, a DP member's pull joining the group rounds; `host.skip` makes a what-if; ATOM's bugs, its sync stalls included, are fixed in ATOM and listed under the `atom-issue` label | 2026-09-18; revised 2026-09-28, 2026-10-01, 2026-10-11 (#815), 2026-10-16 (#829, #1267), 2026-10-18 (#1345), 2026-10-19 (#1409) and 2026-10-21 (#1859) |
 | D5 | Every timer and clock read the CA can reach runs on the LP clock, except the out-of-band control-command reply deadline; only what it cannot reach is configured or left real; metric cadence is virtual time (revising `11` D72); the profiler and RL control commands are refused by the simulated runner with a reply, counted, and make the run a coverage report; a synchronous command from the frontend's clock owner is refused by the frontend | 2026-09-18; revised 2026-09-28, 2026-10-09, 2026-10-14, 2026-10-15 |
 | D5.1 | The simulated run uses stdlib asyncio, not uvloop: only a Python event loop can host virtual time | 2026-09-28 |
-| D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only; a rank pair's writes queue on its link | 2026-09-18; revised 2026-09-28; link sharing 2026-10-16 (#1157); first-write setup 2026-10-16 (#1172) |
+| D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only; a rank pair's writes queue on its link | 2026-09-18; revised 2026-09-28; link sharing 2026-10-16 (#1157); first-write setup 2026-10-16 (#1172); per-pair links kept under RDMA 2026-11-09 (#1179) |
 | D6.1 | The lmcache MP server is LP `lmcache`, a Compass stand-in on the real ZMQ channels with a content index and two stations; a store or load completes as a stamped reply that the step loop takes in timestamp order; a blocking lookup is a request and reply whose wait is an idle point; inside a DP group each member parks before its forward, amending member join rules 1, 2 and 5, and the last park releases every member at the group's time | 2026-10-16 (#1087, #1162) |
 | D7 | Atomesh gets no virtual clock: mesh-only mode; in 1P1D the router is one segment of a channel, not an LP, and its relay latency is that channel's lookahead; its bounds are configured (health check and circuit breaker off, `--worker-request-timeout-secs` set large); timestamps ride carriers it already relays; under `--dp-aware`, or with several instances per role, the router is LP `router`, handling requests, prefill responses and stream events in timestamp order (#449, #1085) | 2026-09-18; revised 2026-09-30, 2026-10-15, 2026-10-16 |
 | D8 | Arrivals are messages in transit, covered by the send and receive counts for closed and open workloads alike; the arrival timestamp rides the `tracestate` header | 2026-09-18; revised 2026-09-28 |

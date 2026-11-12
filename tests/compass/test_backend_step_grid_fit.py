@@ -36,6 +36,7 @@ from test_parity_served import SAMPLING
 from test_run_step_grid import deployment, readings
 
 from atom.compass.artifacts import (
+    PLATFORM,
     ArtifactStore,
     Axis,
     GateState,
@@ -135,8 +136,8 @@ def run(tmp_path):
     here = readings(r)
     configuration = {
         "model": here.reading(Axis.MODEL).value,
-        "device": "MI355X gfx950",
         "source_root": "{0.kind}-{0.value}".format(here.reading(Axis.ATOM_SRC)),
+        **{a.field: here.reading(a).value for a in PLATFORM},
     }
     return r, here, configuration
 
@@ -164,13 +165,14 @@ def record(
     (directory / "client.json").write_text(json.dumps(export))
     engine = {**step_grid.keyed(r.config), **BOUNDS, "num_kvcache_blocks": blocks}
     (path.parent / "dp0.engine.json").write_text(json.dumps(engine))
-    kind, revision = configuration["source_root"].split("-", 1)
+    atom = configuration["source_root"].split("-", 1)[1]
     run_json = {
         "format_version": 2,
         "argv": ["compass", "record", "--out", str(directory)],
-        "source": {**SOURCE, "revision": revision, "revision_kind": kind},
+        "source": SOURCE,
         "host_key": {
             **HOST,
+            "atom": atom,
             "model": configuration["model"],
             "engine": step_grid.keyed(r.config),
         },

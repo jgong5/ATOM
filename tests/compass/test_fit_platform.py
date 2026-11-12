@@ -40,7 +40,7 @@ from atom.compass.artifacts import (
     Key,
     Kind,
     Row,
-    machine_spec_key,
+    machine_platform,
 )
 from atom.compass.drive import identity as drive
 from atom.compass.run import step_grid
@@ -155,6 +155,6 @@ def test_the_readings_are_the_spec_s_whatever_order_run_json_lists_the_stack(
 
     entry = ArtifactStore(tmp_path / "store").read(law_key())
     cells = dict(entry.fingerprints[Row.STEP_LINEAR_LAW].cells)
-    stated = machine_spec_key(MachineSpec.from_mapping(DOCUMENT)).values
+    stated = machine_platform(MachineSpec.from_mapping(DOCUMENT))
     assert cells[Axis.SOFTWARE_STACK].value == stated["software_stack"]
     assert cells[Axis.DEVICE].value == stated["device"]

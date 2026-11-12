@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """`compass measure ops` rehearsed off the card, each leaf up to its launch.
 
-    python v41_ops_rehearsal.py OUT [--kinds] [--drafter] [--arch ARCH]
-        <measure ops args> -- <ATOM args>
+    python v41_ops_rehearsal.py OUT [--kinds] [--drafter] [--only OP]
+        [--arch ARCH] <measure ops args> -- <ATOM args>
 
 `measure ops`' own arguments but `--gpu` and `--out`. The process declares
 card 0 of the MI455 A0 node as it read (`test_capture_mi455_cells.A0`), or
@@ -20,7 +20,8 @@ and keys its arguments as Triton does, a tensor as an aligned pointer, and
 launches nothing. A FlyDSL launch and a compiled operator's are not typed.
 With `--kinds` a graph keeps its first leaf of each operator, as a card run of
 one leaf an op kind takes them. With `--drafter` a shape's leaves are those of
-its drafter's graphs alone (`ops.leaves_at`).
+its drafter's graphs alone (`ops.leaves_at`). With `--only` they are OP's
+alone, as a round of `measure ops --plan` keeps the families it wants.
 
 The fake mode stands in for the device where the bench reads it: the
 runner's checkpoint is ATOM's empty dummy, as a capture's is; a router's
@@ -29,10 +30,12 @@ CSA top-k ids, which the bench draws on the device's generator, are not drawn,
 and its index buffer keeps the values ATOM prepared; no tensor
 equals another, so each placement clones its metadata; DeepSeek-V4.1's state
 cursors read back zeros and its check of them has no values to judge, as in
-a capture. OUT gets one record a leaf: its point, its verdict (`LAUNCH` with
+a capture; a host tensor allocated pinned, which a fake one cannot say it is,
+reads as pinned. OUT gets one record a leaf: its point, its verdict (`LAUNCH` with
 the kernels it launched, `REFUSED` with the reason, or `UNTOLD`, which a fake
 tensor's missing values stopped), the buffers its KV and metadata arguments
-bound, and each one's identity (`identity`).
+bound, each one's identity (`identity`), and that of each its later
+occurrences take apart (`later`, `ops.QUERIED`).
 """
 
 import contextlib
@@ -244,6 +247,8 @@ def _pageable(value) -> bool:
 
     if not torch.is_tensor(value) or value.device.type != "cpu":
         return False
+    if getattr(value, "pinned", False):  # allocated pinned (`main`'s `pinning`)
+        return False
     try:
         return not value.is_pinned()
     except RuntimeError:  # a fake host tensor holds no memory to ask
@@ -304,8 +309,11 @@ def main(out, argv) -> None:
     from atom.model_engine.model_runner import DeviceMemoryReadings, ModelRunner
     from atom.utils import h2d
 
-    kinds, drafter = "--kinds" in argv, "--drafter" in argv
+    kinds, drafter, only = "--kinds" in argv, "--drafter" in argv, None
     argv = [a for a in argv if a not in ("--kinds", "--drafter")]
+    if "--only" in argv:
+        at = argv.index("--only")
+        only, argv = argv[at + 1], argv[:at] + argv[at + 2 :]
     cut = argv.index("--")
     args = ops._parser().parse_args([*argv[:cut], "--gpu", "0", "--out", out])
     shapes = [decode(w) for w in args.width] + [prefill(*s) for s in args.prefill]
@@ -319,7 +327,10 @@ def main(out, argv) -> None:
         held = ops.leaves_at(store, config, shape).items()
         return {sig: leaf for sig, leaf in held if leaf[0].get("drafted")}
 
-    todo = [(s, args.context, keep(found(s))) for s in shapes]
+    def of(found):
+        return {s: leaf for s, leaf in found.items() if only in (None, leaf[0]["op"])}
+
+    todo = [(s, args.context, of(keep(found(s)))) for s in shapes]
     pc = config.parallel_config
     driverless.group(config.tensor_parallel_size, pc.data_parallel_size)
     set_current_atom_config(config)
@@ -334,8 +345,10 @@ def main(out, argv) -> None:
     deep, prepare, time_ = ops._deep, ops.Stub._prepare, ops.Stub._time
     journal = ops._journal
     # by the id of each metadata view's clone, the live view it cloned; by
-    # leaf and slot, the identity and staged values of what placement 0 bound
-    sources, bound, seen = {}, {}, {}
+    # leaf and slot, the identity and staged values of what placement 0 bound;
+    # by leaf, and by slot, the identity of what its later occurrences take
+    # there (`ops.QUERIED`)
+    sources, bound, seen, later = {}, {}, {}, {}
 
     def cloning(x, memo, clones=None):
         out = deep(x, memo, clones)
@@ -356,6 +369,10 @@ def main(out, argv) -> None:
             spec = dict(ops._specs(stub.leaves[sig][0]["args"]))[path]
             if spec["role"] == "metadata" or str(live.dtype) in INTEGERS:
                 bound[sig, path] = identity(live, pool), values(live, hosts)
+        later.clear()  # none on a bench that binds every occurrence alike
+        for (_, sig, path), (_, view) in getattr(stub, "later", {}).items():
+            live = sources.get(id(view), (None, view))[1]
+            later.setdefault(sig, {})[path] = identity(live, pool)
 
     def timing(stub, op, sig, instances, n):
         held = {p: v for (s, p), (_, v) in bound.items() if s == sig and v}
@@ -372,7 +389,16 @@ def main(out, argv) -> None:
     def journaled(path, records):
         for r in records:
             r["identity"] = seen.get(r["leaf"], {})
+            r["later_identity"] = later.get(r["leaf"], {})
         return journal(path, records)
+
+    empty_strided = torch.empty_strided
+
+    def pinning(*args, pin_memory=False, **kwargs):
+        out = empty_strided(*args, pin_memory=pin_memory, **kwargs)
+        if pin_memory:  # a fake tensor cannot say it is
+            out.pinned = True
+        return out
 
     def launching(name):
         fn = function(name)  # found, or the leaf refuses
@@ -430,6 +456,7 @@ def main(out, argv) -> None:
             (triton_jit.JITFunction, "run", typed),
             (ops, "_deep", cloning),
             (ops, "_journal", journaled),
+            (torch, "empty_strided", pinning),
             (ops.Stub, "_prepare", preparing),
             (ops.Stub, "_time", timing),
             (ops, "uniform_ids", host_draw),
@@ -454,6 +481,7 @@ def main(out, argv) -> None:
             | {"verdict": state, "why": why, "kernels": kernels}
             | {"bound": r.get("metadata", {})}
             | {"identity": r.get("identity", {})}
+            | {"later": r.get("later_identity", {})}
         )
     pathlib.Path(out).write_text(json.dumps(records, indent=1))
 

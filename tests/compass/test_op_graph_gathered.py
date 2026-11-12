@@ -12,23 +12,28 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_artifact_store import CONDITIONS, GATES, stanza
+from test_artifact_store import stanza
 from test_capture_ir import _decoder
 from test_capture_v4_pro import DPA_TP8, EP8, MOE, MORI, _rows, capture, trace
 from test_dp_step_max import prefill, runner
 from test_moe_gather_rows import decode
 from test_op_graph import by_name, g
-from test_op_graph_arch import ENGINE
+from test_op_graph_arch import ENGINE, run_readings
 from test_op_work import ONE, leaf, t
 from test_op_work_v4 import close, experts, moe
 from test_work import SPEC
 
-from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
+from atom.compass.artifacts import (
+    ArtifactStore,
+    GateState,
+    Topology,
+    member_name,
+)
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import activated_experts, gemm, price
-from atom.compass.capture import population_shapes
+from atom.compass.capture import graph_key, population_shapes
 from atom.compass.capture.forward import Shape, structure
 from atom.compass.capture.forward import prefill as prefill_shape
 from atom.compass.run import _op_graphs
@@ -48,8 +53,8 @@ RESPLIT_TBO = ((3, 1, 1, 1, 1, 1, 1, 6), (4, 0, 0, 0, 0, 0, 0, 8))
 STORED = [
     Shape("prefill", 7, 1, 27),
     Shape("prefill", 7, 1),
-    Shape("prefill", 3, 1, 15),
-    Shape("prefill", 4, 1, 12),
+    Shape("prefill", 3, 1, 15, micro_batch=True),
+    Shape("prefill", 4, 1, 12, micro_batch=True),
     Shape("decode", 4, 4),
     Shape("decode", 1, 1, 27),
 ]
@@ -80,13 +85,20 @@ def backend(config, tmp_path):
     store = ArtifactStore(str(tmp_path / "store"))
     for shape in STORED:
         for output in (True, False) if shape.phase == "prefill" else (True,):
-            at = structure(config, shape.phase, True, "gfx950", output)
+            at = structure(
+                config,
+                shape.phase,
+                True,
+                "gfx950",
+                output,
+                micro_batch=shape.micro_batch,
+            )
             store.publish(
-                Key.of(Kind.OP_GRAPH, structure=at, shape=str(shape)),
+                graph_key(at, str(shape)),
                 provenance=stanza("compass trace ops"),
                 topology=Topology(),
-                conditions=CONDITIONS,
-                gates=GATES,
+                conditions=run_readings(config.model),
+                gates=GateState.of(),
                 members={
                     member_name("graph", RANK, "json"): json.dumps(
                         {"region": g(4096 * gathered(shape), 64, 64)}
@@ -102,7 +114,9 @@ def view(batch, counts, split=None, unified=False, rung=None):
     r = runner(None, dp_size=DP)
     r.drafter = None
     sync = SimpleNamespace(
-        scheduled_tokens_per_dp_rank=torch.tensor(counts), ub_tokens_across_dp=split
+        scheduled_tokens_per_dp_rank=torch.tensor(counts),
+        ub_tokens_across_dp=split,
+        any_rank_needs_eager=False,
     )
     mode = SimpleNamespace(
         sync=sync,
@@ -333,11 +347,11 @@ def test_a_mori_exchange_at_gathered_rows_spans_the_ep_width(call):
     assert c.ranks == DP
 
 
-def test_a_gather_s_pad_rows_activate_experts_as_one_token():
+def test_a_gather_s_pad_rows_route_to_no_expert():
     # Sixteen rows gathered over the group, five of them real tokens.
     padded = BatchView(
         (RequestShape(1, 9, True),), capture_rung=2, moe_rows=16, moe_tokens=5
     )
-    hit = activated_experts(16, 2, 6)
+    hit = activated_experts(16, 2, 5)
 
-    close(work(moe(16, 16), padded, 1, "bf16"), experts(16, 32, hit))
+    close(work(moe(16, 16), padded, 1, "bf16"), experts(16, 10, hit))

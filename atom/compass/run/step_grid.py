@@ -4,8 +4,9 @@ checked against the resolved ATOM config before the first step.
 
 The run file's ``step_grid`` is the store's root and the bundle's key fields:
 
-    {"store": <root directory>, "model": ..., "device": ...,
-     "engine_config": ..., "grid": ..., "source_root": ...}
+    {"store": <root directory>, "model": ..., "engine_config": ..., "grid": ...,
+     "source_root": ..., "device": ..., "software_stack": ..., "ptl": ...,
+     "torch": ...}
 
 A bundle prices a TP group's whole step, so a run reads one member at any
 width, ``params.dp0of1.pp0of1.pcp0of1.tp0of1.json``, the one `compass fit
@@ -69,12 +70,9 @@ from atom.compass.artifacts import (
     GateState,
     Key,
     Kind,
-    Reading,
     Row,
     Topology,
-    git_tree_root,
-    machine_spec_key,
-    module_root,
+    machine_platform,
 )
 from atom.compass.backends.step_grid import StepGrid, StepGridBackend
 from atom.compass.backends.step_grid_fit import VALUE
@@ -128,11 +126,18 @@ def keyed(config, ladder: bool = True) -> dict:
         "enable_expert_parallel": config.enable_expert_parallel,
         "enable_tbo": config.enable_tbo,
         "enable_tbo_decode": config.enable_tbo_decode,
-        "env": {
-            k: v
-            for k, v in sorted((performance_env() | _buckets_off_default()).items())
-            if not (k.startswith("AIPERF_") or k.endswith("_VISIBLE_DEVICES"))
-        },
+        "env": keyed_env(),
+    }
+
+
+def keyed_env() -> dict:
+    """This process's performance environment as `keyed` states it: less the
+    client's variables and the device selection, `BUCKETS` in it only off
+    ATOM's default."""
+    return {
+        k: v
+        for k, v in sorted((performance_env() | _buckets_off_default()).items())
+        if not (k.startswith("AIPERF_") or k.endswith("_VISIBLE_DEVICES"))
     }
 
 
@@ -164,27 +169,26 @@ def differ(there: dict, here: dict, where: str) -> list[str]:
 
 
 def conditions(config, machine) -> Conditions:
-    """This run's readings: `readings` of this process's ATOM tree, the served
-    config.json and `keyed`."""
-    from atom.compass.run import _file_digest
+    """This run's readings: `readings` of this process's ATOM source, the
+    served config.json and `keyed`."""
+    from atom.compass.run import _file_digest, atom_source
 
     return readings(
         machine,
-        atom_src=Reading.of_source_root(git_tree_root("atom", module_root("atom"))),
+        atom_src=atom_source(),
         model=_file_digest(config.model, "config.json"),
         engine_config=json.dumps(keyed(config), sort_keys=True),
     )
 
 
 def readings(machine, **inputs) -> Conditions:
-    """The readings a run on `machine` takes: the stack, torch included, and the
-    device the spec states, and this host's CPU; `inputs` state the ATOM tree,
-    the model and the engine config."""
+    """The readings a run on `machine` takes: the platform the spec states, and
+    this host's CPU; `inputs` state the ATOM source, the model and the engine
+    config."""
     from atom.compass.run import host_cpu
 
     return Conditions.of(
-        **machine_spec_key(machine).values,
-        torch=machine.value("device.software_pinned_to.torch"),
+        **machine_platform(machine),
         host_cpu=host_cpu(),
         **inputs,
     )

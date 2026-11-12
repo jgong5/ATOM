@@ -10,11 +10,13 @@ time (`d_busy_ns`) the known law's price. The fitted law is read by
 import json
 import re
 import shutil
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from atom.compass.artifacts import Kind, keyed_platform, machine_platform
 from atom.compass.backends import (
     BatchView,
     CostRefused,
@@ -33,6 +35,7 @@ from atom.compass.backends.step_linear_fit import (
     main,
     mark_held_out,
 )
+from atom.compass.spec import MachineSpec
 from atom.compass.validate.cost import cost_accuracy
 
 PREFILL = {"step": 0.02, "tokens": 6e-5, "query_square": 2e-10, "query_cached": 3e-10}
@@ -41,7 +44,25 @@ DECODE = {
     "2": {"step": 0.021, "context": 1e-7, "graph_padding": 4e-8},
     "4": {"step": 0.022, "context": 1.2e-7, "graph_padding": 3e-8},
 }
-SPEC = ("--machine-spec", "sha256:" + "0" * 64)
+
+
+def platform_arg(document: dict) -> tuple[str, str]:
+    """`--platform` for the platform the machine spec `document` states."""
+    platform = machine_platform(MachineSpec.from_mapping(document))
+    kinds = (Kind.STEP_LINEAR_LAW, Kind.HOST_LAWS)
+    return "--platform", json.dumps(
+        {k.value: keyed_platform(k, platform) for k in kinds}
+    )
+
+
+#: A committed machine spec's platform, which keys the laws the command writes here.
+SPEC = platform_arg(
+    json.loads(
+        (
+            Path(__file__).parents[2] / "scripts/compass/machines/mi308x-hjbog39.json"
+        ).read_text()
+    )
+)
 
 
 def _price(rows, rung, history=0.0):
@@ -804,17 +825,17 @@ def test_a_run_refuses_host_laws_fitted_under_another_key(tmp_path, monkeypatch)
     from test_run_step_grid import deployment, publish, run_file
 
     from atom.compass import run as compass_run
-    from atom.compass.artifacts import machine_spec_digest
+    from atom.compass.artifacts import Kind, keyed_platform, machine_platform
     from atom.compass.spec import MachineSpec
 
     laws = {"decode": {"E": [1e-4, 0.0, 0.0]}}
-    spec = machine_spec_digest(MachineSpec.from_mapping(DOCUMENT))
+    spec = machine_platform(MachineSpec.from_mapping(DOCUMENT))
     cases = (("same", {}), ("other", {"host_cpu": "another cpu"}), ("none", None))
     for name, other in cases:
         (tmp_path / name).mkdir()
         r = deployment(tmp_path / name)
         publish(tmp_path / name, r)
-        key = dict(compass_run.host_key(r.config), machine_spec=spec)
+        key = compass_run.host_key(r.config) | keyed_platform(Kind.HOST_LAWS, spec)
         host = {"laws": laws}
         if other is not None:
             host["key"] = dict(key, **other)
