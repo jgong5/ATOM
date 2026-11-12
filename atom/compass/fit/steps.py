@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 """`compass fit steps`: a step-level backend fitted on labelled samples and published.
 
-    compass fit steps --backend step-linear [--form FORM] [--seed S] RECORD...
-        --client-run RECORD EXPORT... [--ops DIR...] --machine M --store ROOT
-        --out DIR
+    compass fit steps --backend step-linear [--form FORM] [--moe-routing E,K]
+        [--seed S] RECORD... --client-run RECORD EXPORT... [--ops DIR...]
+        --machine M --store ROOT --out DIR
     compass fit steps --backend step-grid --grid INPUT... --grid-definition FILE
         [--sessions A:B] [--seed S] TARGET... --client-run INPUT EXPORT...
         [--ops DIR...] --machine M --store ROOT --out DIR
@@ -25,7 +25,10 @@ rank that gave no sample refuses; it pads prefill to the records'
 `prefill_buckets`, naming under `unfitted` records stating none, and holds
 out each run on the others when
 there are two or more, as that module's command does; `--seed` fixes
-its shuffles. The law states, as `platform`, the platform fields of its key,
+its shuffles. With `--moe-routing E,K`, the model's routed experts and top-k,
+the law states them as `moe_routing`, and each decode rung may adopt a MoE
+column over them, as that command's `--moe-routing` fits it. The law states,
+as `platform`, the platform fields of its key,
 and `engine_config`, as that command's does, and the key holds them. The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
@@ -74,6 +77,7 @@ TARGETS = ("the targets'", "the targets' sampling is")
 def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     form = args.form or "history"
     options = {"form": form, "dp": step_linear_fit.join_width(config["engine_config"])}
+    options["moe_routing"] = args.moe_routing
     options["buckets"] = config.get("prefill_buckets")
     law, report = step_linear_fit.fit(samples, options, args.seed)
     if options["buckets"] is None:
@@ -150,6 +154,7 @@ BACKENDS = {
 #: The flags only one backend reads, each to that backend.
 OWN = {
     "form": "step-linear",
+    "moe_routing": "step-linear",
     "grid": "step-grid",
     "grid_definition": "step-grid",
     "sessions": "step-grid",
@@ -161,6 +166,13 @@ def main(argv: list[str]) -> None:
     parser.add_argument("--backend", required=True, help=", ".join(BACKENDS))
     parser.add_argument(
         "--form", choices=step_linear_fit.FORMS, help="history by default"
+    )
+    parser.add_argument(
+        "--moe-routing",
+        metavar="E,K",
+        type=step_linear_fit._routing_arg,
+        help="the model's routed experts and top-k, over which each decode rung "
+        "may adopt a MoE column",
     )
     parser.add_argument(
         "--grid",
