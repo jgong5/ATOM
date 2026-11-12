@@ -1191,6 +1191,17 @@ class Stub:
                     elif v41 := _named(op, path, spec, live, self.known):
                         pool = v41
                     try:
+                        rope = (op["op"], path, ratio) == (_ROPE, "positions", None)
+                        if (
+                            rope
+                            and self.pages
+                            and op["args"]["input"]["shape"][-2] == 1
+                        ):
+                            raise ValueError(  # a key's, over one head
+                                "its graph states no compress ratio, and no one "
+                                f"compress plan here holds its {spec['shape'][-1]} "
+                                "rows: trace its shape again"
+                            )
                         if index:  # as the forward's first reader writes it
                             step = passes.get(at, passes[None])[0]
                             pool = self._index(md.cache, step, index, ratio)
@@ -1345,11 +1356,14 @@ class Stub:
             and (op["args"].get("context_lens") or {}).get("role") != "activation"
         }
         # and by the rows each compress plan holds, as many as its keys' RoPE's,
-        # for a key RoPE captured before it stated its ratio
+        # for a key RoPE captured before it stated its ratio: rows that no one
+        # ratio's plan here holds tell none, and `_prepare` refuses that key
+        ratios = defaultdict(set)
+        for op, _ in found.values():
+            if op["op"] == _FUSED:
+                ratios[op["args"]["plan_gpu"]["shape"][0]].add(op["args"]["ratio"])
         self.known |= {
-            ("compressed", op["args"]["plan_gpu"]["shape"][0]): op["args"]["ratio"]
-            for op, _ in found.values()
-            if op["op"] == _FUSED
+            ("compressed", n): r.pop() for n, r in ratios.items() if len(r) == 1
         }
         bind = {
             (s, path): (spec, _named(op, path, spec, held, self.known) or held)
