@@ -6,7 +6,8 @@ run builds. This records them where both runs can be read the same way, at the
 model runner's `forward`: one JSON line per call, built before the call runs,
 because a real forward rewrites some batch fields in place. Each line carries
 the batch as the `BatchView` a simulated runner prices it from (`rows`, `rung`,
-and above DP width 1 `moe_rows` and `moe_tokens`, with an MTP drafter `draft_moe_rows` too, `draft_bs` where its later passes pad, `draft_rows` where they run at its rows, `target_bs` where its target pads, on a split step `tbo_tokens`); a
+and above DP width 1 `moe_rows` and `moe_tokens`, with an MTP drafter `draft_moe_rows` too, `draft_bs` where its later passes pad, `draft_rows` where they run at its rows, `target_bs` where its target pads, on a split step `tbo_tokens`, and
+`group_needs_eager`, true, on a step an attention backend refuses a graph for); a
 real runner settles that view from the `ForwardMode` its own forward settled,
 so recording adds no DP collective. Its line also carries `t_enter_ns` and `t_exit_ns`, the worker's
 monotonic clock around its forward, and is finished once the forward returns.
@@ -180,7 +181,7 @@ class StepRecord:
         (query tokens, context tokens, decode), `rung`, the graph width the
         step replays or None, and `moe_rows`, the rows the DP group's MoE
         gather carries, absent at DP width 1, and `draft_moe_rows`, `draft_bs`, `draft_rows`, `target_bs`, `moe_tokens` and `tbo_tokens`, each where the
-        view has it. The view's mode is the one `forward` settled, stamped by
+        view has it, and `group_needs_eager` where it is true. The view's mode is the one `forward` settled, stamped by
         `run_model` under `forward_mode`; without one it is `forward_mode`'s,
         which runs the DP collective itself. Each prefill window is added to its request's
         digest; the line holding a request's final chunk names it under
@@ -292,6 +293,8 @@ class StepRecord:
         ):
             if getattr(view, field) is not None:
                 line[field] = getattr(view, field)
+        if view.group_needs_eager:
+            line["group_needs_eager"] = True
         self.pending.append((line, window))
         self.flush()
         if forward is None:  # a simulated step: priced, not timed

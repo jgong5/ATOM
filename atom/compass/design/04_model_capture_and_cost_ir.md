@@ -1067,7 +1067,14 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   sized as V4's, states the same three of its layer, and its indexer's scorers
   (`capture.forward.V41_SCORERS`: gfx1250's FlyDSL one and gfx950's Triton one) its
   `compress_ratio` and `index_candidates`, the most entries it scores where an earlier
-  layer chose its candidates, else null (#2344).
+  layer chose its candidates, else null (#2344). Its index keys' RoPE
+  (`capture.forward.V41_ROPE`, under `Indexer.project_keys`) states their indexer's
+  `compress_ratio`: their positions are that ratio's compress plan's, which
+  `bench.ops.V41_NAMES` binds, and at a decode with no drafter both ratios' plans hold
+  a row a request, so the leaf's shape cannot tell them apart
+  ([#3141](https://github.com/jgong5/ATOM/issues/3141)). The indexer query's RoPE, on
+  the step's positions at every ratio, states none. In a graph captured before,
+  `measure ops` takes a key's ratio from the compress leaf whose plan holds as many rows.
 
 Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers,
 DeepSeek-V4's attention and V4.1's guarded ops aside, below), so its ambient reads stay

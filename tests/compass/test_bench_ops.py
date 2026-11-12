@@ -2728,6 +2728,53 @@ def test_a_warm_call_takes_its_cold_call_s_occurrence_on_that_one_s_first_copy(
     assert len({c for c, _ in graphs[1]}) == 1 + queried
 
 
+@pytest.mark.parametrize(
+    "call_ns, copies, calls, other",
+    [(1.0, 12, ops.CALLS, ops.CALLS), (ops.GRAPH_NS // 11, 10, 10, 11)],
+)
+def test_each_occurrence_of_a_queried_leaf_takes_as_many_copies_and_calls(
+    monkeypatch, call_ns, copies, calls, other
+):
+    # Two leaves of two occurrences, 200 bytes a call: 11 copies pass twice
+    # 1000 bytes. The scan's later occurrence takes its own ids, all -1
+    # (`QUERIED`): its copies round up to 12, each on activations of its own,
+    # and where 11 calls fill `GRAPH_NS`, its calls down to 10, so each
+    # occurrence takes half the calls. The other, with no later binding,
+    # keeps 11 copies and its calls.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    args = ("ids", _t([25], "activation")), ("x", _t([25], "activation"))
+    leaves = _leaf("aiter.scan", *args), _leaf("aiter.other", *args)
+    found = ops.leaves(_graph(*leaves, layers=2)["region"])
+    [sig] = [s for s, (op, _) in found.items() if op["op"] == "aiter.scan"]
+    queries, prepare = torch.full((25,), -1.0), ops.Stub._prepare
+
+    def preparing(stub, batch):
+        prepare(stub, batch)
+        stub.later[len(stub.placed) - 1, sig, "ids"] = ("queries", queries)
+
+    monkeypatch.setattr(ops.Stub, "_prepare", preparing)
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    graphs = []
+
+    def replay(fn, calls, flush=None):
+        graphs.append([kwargs for kwargs, _ in calls])
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], call_ns)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        scan, rest = ops.Stub(_Runner(), 1000).point(placed, decode(2), 20, found)
+
+    taken = [bool((kwargs["ids"] == -1).all()) for kwargs in graphs[0]]
+    assert scan["later"] == {"ids": "queries"} and "later" not in rest
+    assert (taken.count(False), taken.count(True)) == (calls // 2, calls // 2)
+    assert len({id(kwargs["x"]) for kwargs in graphs[0]}) == copies
+    got = [(r["copies"], r["calls"], r["footprint_bytes"]) for r in (scan, rest)]
+    assert got == [(copies, calls, copies * 200), (11, other, 11 * 200)]
+
+
 def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
     # Replay i takes i + 1 ms on a stand-in clock; the host idles `REST` of that
     # after every replay, warmups included, which keeps a leaf off the lower

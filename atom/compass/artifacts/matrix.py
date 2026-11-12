@@ -48,6 +48,7 @@ class Kind(enum.Enum):
     HOST_LAWS = "host_laws"
     STEP_GRID_BUNDLE = "step_grid_bundle"
     PROJECTION = "projection"
+    PROBE_RECORD = "probe_record"
 
     def __str__(self) -> str:
         return self.value
@@ -93,6 +94,7 @@ class Row(enum.Enum):
     STEP_GRID_BUNDLE = "step grid bundle"
     SHAPE_POPULATION = "shape_population"
     PROJECTION = "projection"
+    PROBE_RECORD = "probe_record"
 
     @property
     def field(self) -> str:
@@ -237,6 +239,17 @@ MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
         Axis.HOST_CPU: INDEPENDENT,
         Axis.ENGINE_CONFIG: DEPENDS,
     },
+    # Vendor kernels timed on the cards; no model, engine or ATOM engine code.
+    Row.PROBE_RECORD: {
+        Axis.SOFTWARE_STACK: DEPENDS,
+        Axis.TORCH: Cell(True, "Triton, torch._scaled_mm"),
+        Axis.ATOM_SRC: INDEPENDENT,
+        Axis.MODEL: INDEPENDENT,
+        Axis.DEVICE: DEPENDS,
+        Axis.PTL: DEPENDS,
+        Axis.HOST_CPU: INDEPENDENT,
+        Axis.ENGINE_CONFIG: INDEPENDENT,
+    },
 }
 
 #: Which rows decide a kind's validity. `machine_spec` is its capacity and
@@ -253,6 +266,7 @@ ROWS_OF: Mapping[Kind, tuple[Row, ...]] = {
     Kind.STEP_GRID_BUNDLE: (Row.STEP_GRID_BUNDLE,),
     Kind.SHAPE_POPULATION: (Row.SHAPE_POPULATION,),
     Kind.PROJECTION: (Row.PROJECTION,),
+    Kind.PROBE_RECORD: (Row.PROBE_RECORD,),
 }
 
 
