@@ -18,9 +18,10 @@ rows when built with `padded=False` (the run file's ``padding: none``).
 Attention runs over the real rows, a pad row holding no context. The LM head
 runs on the rows that sample: each prefill row's last token and every decode
 token, none on a step that produces no output. Routed experts run on the
-rows the data-parallel group's gather carries (`moe_rows`), and under expert
-parallelism on the busiest rank's expected share of them; a graph's pad rows
-route as one token.
+real rows among those the data-parallel group's gather carries (`moe_rows`,
+`moe_tokens`), and under expert parallelism on the busiest rank's expected
+share of them (`routing_rows`): a gather's pad rows route to no expert. On
+one rank a graph's pad rows route as one token.
 
 A prefill that replays its decoder runs a module with a `replay` on each
 request that finishes its prompt, on its last `replay` rows, which attend
@@ -294,14 +295,27 @@ def _mla_up(m: Module, view: BatchView, decoded: int) -> Work:
     return work
 
 
+def routing_rows(view: BatchView, rows: int) -> tuple[int, int]:
+    """Of `rows` rows a data-parallel gather carries, those routed to experts
+    and the distinct tokens among them; all `rows` where the view states no
+    `moe_tokens`. A padded gather's pad rows route to no expert, and the
+    group's dummy forwards (`group_dummies`) each route one row, token 0 at
+    position 0, so together they reach one token's experts."""
+    if view.moe_tokens is None:
+        return rows, rows
+    dummies = max(view.group_dummies - 1, 0)
+    return min(rows, view.moe_tokens), min(rows, view.moe_tokens - dummies)
+
+
 def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     """The exchange before the routed experts, the experts, and the exchange
     after, routing uniform and independent.
 
-    The experts run on the gathered rows, or under expert parallelism on the
-    busiest rank's expected share, in one kernel: it reads each expert a row
-    reaches once, weights and scales, and its routes' share of the rows'
-    input, output, top-k ids and weights; the gate-up output never leaves it.
+    The experts run on the gathered rows that route, or under expert
+    parallelism on the busiest rank's expected share, in one kernel: it reads
+    each expert a row reaches once, weights and scales, and its routes' share
+    of the rows' input, output, top-k ids and weights; the gate-up output
+    never leaves it.
     On one data-parallel rank the output is all-reduced over the module's
     `ranks`, 1 where its block leaves that to the next norm. Over a group, the
     hidden states and router logits are gathered and the output scattered
@@ -311,13 +325,15 @@ def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     experts, local, k, inter, hidden, ranks, dp, _, held = m.dims[:9]
     shared = m.dims[9] if len(m.dims) > 9 else 0
     rows, act = view.moe_rows if dp > 1 else tokens, ELEMENT_BYTES[ACT]
-    real = view.moe_tokens if dp > 1 else sum_tokens(view.requests)
-    # Pad rows all carry token 0 at position 0, so they route as one token.
-    distinct = rows if real is None else min(rows, real + 1)
-    routed, groups = rows * k, activated_experts(experts, k, distinct)
+    if dp > 1:
+        real, distinct = routing_rows(view, rows)
+    else:
+        # A graph's pad rows all carry token 0 at position 0: one token.
+        real, distinct = rows, min(rows, sum_tokens(view.requests) + 1)
+    routed, groups = real * k, activated_experts(experts, k, distinct)
     dealt = rows
     if local < experts:
-        routed, groups = max_rank_load(rows, k, experts, ranks), groups / ranks
+        routed, groups = max_rank_load(real, k, experts, ranks), groups / ranks
         # aiter's top-k table deals each row's shared experts, pad rows too,
         # to rank `row mod ranks`; each rank holds their weights.
         dealt = -(-rows // ranks)

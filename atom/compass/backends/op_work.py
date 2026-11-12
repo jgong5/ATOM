@@ -25,12 +25,13 @@ the tensor-parallel group unless the leaf states its group size. A kind with
 no extractor, or a leaf its extractor cannot price, is refused by name.
 
 DeepSeek-V4's MoE takes the step roofline's expectation under independent
-uniform routing: the routed experts run the rows the leaf holds, under expert
-parallelism the busiest rank's expected share, at the format the op quantizes
-its rows to, and read each activated expert once; a DP exchange's group width
-is read off its own shapes. ATOM's Triton experts run as aiter's grouped
-GEMMs, each priced so, at the activation format its kind names; their
-expert-parallel width is the run's `ep`, the experts `ep` times a rank's.
+uniform routing: the routed experts run the rows the leaf holds but a gather's
+pad rows, under expert parallelism the busiest rank's expected share, at the
+format the op quantizes its rows to, and read each activated expert once; a DP
+exchange's group width is read off its own shapes. ATOM's Triton experts run
+as aiter's grouped GEMMs, each priced so, at the activation format its kind
+names; their expert-parallel width is the run's `ep`, the experts `ep` times a
+rank's.
 
 DeepSeek-V4.1's sparse attention and indexer scorers read their entries at the
 geometry their leaf states, over the queries the leaf holds (`_last`): a
@@ -51,7 +52,12 @@ from torch.utils.flop_counter import flop_registry
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView
-from atom.compass.backends.step_roofline import Module, _index_scores, _sparse_products
+from atom.compass.backends.step_roofline import (
+    Module,
+    _index_scores,
+    _sparse_products,
+    routing_rows,
+)
 from atom.compass.backends.step_roofline import _work as module_work
 from atom.compass.backends.work import (
     ELEMENT_BYTES,
@@ -264,17 +270,15 @@ def _dp_exchange(op, view, tp, kv) -> Work:
 
 
 def _routing(view, tokens, k, experts, ranks):
-    """The routes and activated experts of `tokens` each routed to `k` of
-    `experts` spread over `ranks`, an expectation under uniform routing: the
-    busiest rank's expected share under expert parallelism. A DP gather's pad
-    rows (`moe_tokens` real among them) all carry token 0, so they activate
-    experts as one token."""
-    real = view.moe_tokens
-    distinct = tokens if real is None else min(tokens, real + 1)
+    """The routes and activated experts of `tokens` rows, those a DP gather
+    routes (`routing_rows`) each routed to `k` of `experts` spread over
+    `ranks`, an expectation under uniform routing: the busiest rank's expected
+    share under expert parallelism."""
+    real, distinct = routing_rows(view, tokens)
     groups = activated_experts(experts, k, distinct)
     if ranks == 1:
-        return tokens * k, groups
-    return max_rank_load(tokens, k, experts, ranks), groups / ranks
+        return real * k, groups
+    return max_rank_load(real, k, experts, ranks), groups / ranks
 
 
 def _fused_moe(op, view, tp, kv, ep) -> Work:
