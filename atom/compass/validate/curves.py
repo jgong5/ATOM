@@ -60,14 +60,15 @@ SERVER_METRICS = "artifacts/server_metrics_export.json"
 ENGINE_RECORD = "steps/dp0.engine.json"
 SIMULATED = (STEP_LINEAR, STEP_GRID, OP_GRAPH)
 CONCURRENCY = "phases.profiling.concurrency"
-#: Each judged metric's distance from the real runs' mean, and whether in points.
+#: Each judged metric's distance from the real runs' mean: a percentage of the
+#: mean, or, where True, percentage points.
 LIMITS = {
-    "throughput per GPU": (0.05, False),
-    "p90 interactivity": (0.05, False),
-    "p90 TTFT": (0.10, False),
-    "median TPOT": (0.05, False),
-    "GPU hit rate": (0.02, True),
-    "CPU hit rate": (0.02, True),
+    "throughput per GPU": (5, False),
+    "p90 interactivity": (5, False),
+    "p90 TTFT": (10, False),
+    "median TPOT": (5, False),
+    "GPU hit rate": (2, True),
+    "CPU hit rate": (2, True),
 }
 REPORTED = ("p90 E2E-normalized interactivity",)
 #: Each drawn quantity's axis label and the factor from its value to that axis.
@@ -246,16 +247,17 @@ def judge(name: str, real: dict, simulated: float | None) -> tuple[str, str]:
         )
     limit, in_points = LIMITS[name]
     if in_points:
-        off, text = abs(simulated - mean), f"{abs(simulated - mean) * 100:.2f} points"
+        off = abs(simulated - mean) * 100
+        text = f"{off:.2f} points"
         bounds = f"simulated {simulated:.2%}; real mean {mean:.2%}, band {lo:.2%} to {hi:.2%}"
-        what = f"{limit * 100:g} points"
+        what = f"{limit} points"
     else:
-        off, text = abs(simulated / mean - 1), f"{simulated / mean - 1:+.2%}"
+        off, text = abs(simulated / mean - 1) * 100, f"{simulated / mean - 1:+.2%}"
         bounds = (
             f"simulated {simulated:.4g}; real mean {mean:.4g}, band {lo:.4g} to {hi:.4g}"
             f" ({lo / mean - 1:+.2%} to {hi / mean - 1:+.2%})"
         )
-        what = f"{limit:.0%}"
+        what = f"{limit}%"
     inside, near = lo <= simulated <= hi, off <= limit
     verdict = (
         ("pass: in band" if near else f"pass: in band, past {what} of mean")
