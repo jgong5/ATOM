@@ -384,26 +384,27 @@ def test_each_rank_s_error_is_split_out_naming_its_card(tmp_path):
     slow = {i: 1.02 for i in range(0, 20, 2)}
     for r, steps in enumerate(ranks):
         _record(tmp_path / "steps", steps, stretch=slow, rank=r, group=ranks)
-    gpus = [{"index": i, "bus": f"0000:{i:02x}:00.0"} for i in (3, 11)]
+    # Two GPUs a rank, as a DP record at TP 2 runs.
+    gpus = [{"index": i, "bus": f"0000:{i:02x}:00.0"} for i in (3, 4, 11, 12)]
     (tmp_path / "run.json").write_text(json.dumps({"device": gpus}))
     report = cost_accuracy(tmp_path / "steps", LAW)
 
     for kind in ("prefill", "decode"):
         rank0, rank1 = report["ranks"][kind].values()
         assert rank0 == {
-            "buses": ["0000:03:00.0"],
+            "buses": ["0000:03:00.0", "0000:04:00.0"],
             "steps": 5,
             "on_totals": pytest.approx(0.0, abs=1e-9),
             "median": pytest.approx(0.0, abs=1e-9),
         }
         assert rank1 == {
-            "buses": ["0000:0b:00.0"],
+            "buses": ["0000:0b:00.0", "0000:0c:00.0"],
             "steps": 5,
             "on_totals": pytest.approx(1 / 1.02 - 1, abs=1e-6),
             "median": pytest.approx(1 / 1.02 - 1, abs=1e-6),
         }
         assert list(report["ranks"][kind]) == [0, 1]
-    assert "  dp1 | 0000:0b:00.0 | 5 | -1.96% | -1.96%" in _text(report)
+    assert "  dp1 | 0000:0b:00.0, 0000:0c:00.0 | 5 | -1.96% | -1.96%" in _text(report)
 
     # A run.json that names no bus, as one written before it named any.
     (tmp_path / "run.json").write_text(json.dumps({"device": [{"index": 3}] * 2}))

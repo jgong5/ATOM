@@ -6,8 +6,7 @@ mix of them.
 The device and the stack are recorded as a machine spec states them: each GPU's
 name and arch, the cards' one PTL state, and ROCm's version, aiter's commit,
 RCCL's version and torch's. Each GPU also names its card's PCI bus, which no
-key or fit reads: Compass does not model a card's own speed, and the bus lets
-a cost report name the card each DP rank ran on.
+key or fit reads; a cost report names by it the cards each DP rank ran on.
 
 It holds no workload: no command starts the client, and which requests a server
 served is read from its step record.

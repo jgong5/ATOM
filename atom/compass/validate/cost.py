@@ -57,9 +57,8 @@ over the terms, they are the composed step over the measured one.
 On a record of several DP ranks it gives, per kind and per rank, the graded
 steps that rank was priced as, their error on totals and the median per step,
 with the PCI buses of the rank's cards that the run.json beside the record
-names (`identity._device`): Compass does not model a card's own speed, so a law
-prices the card mix of its records, and this split states what a rank's card
-leaves. ATOM runs DP rank r on the r-th equal slice of the GPUs its server
+names (`identity._device`): a law prices the card mix of its records, and this
+split states what a rank's card leaves. ATOM runs DP rank r on the r-th equal slice of the GPUs its server
 saw; a run.json that names no bus, as one written before it named any, leaves
 each rank's cards unnamed.
 """
