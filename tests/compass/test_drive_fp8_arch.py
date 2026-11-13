@@ -24,6 +24,7 @@ from test_check_fp8_arch import FP8, machine, worker
 from test_drive_run import stub
 from test_drive_runfile import build
 from test_drive_serve import PLANTED, planted  # noqa: F401  a fixture
+from test_drive_trace_steps import plant_module
 from test_key_quantization_remap import QWEN35
 from test_run_hops import entry
 
@@ -59,7 +60,7 @@ def test_a_simulated_server_keys_fp8_as_its_machine_s_worker_does(
 ):
     monkeypatch.setenv("PLANTED_EXIT", "late:0")
     monkeypatch.delenv("GPU_ARCHS", raising=False)
-    (planted / "planted.py").write_text(PARSED + textwrap.indent(PLANTED, "    "))
+    plant_module(planted, monkeypatch, PARSED + textwrap.indent(PLANTED, "    "))
     config = worker(planted, monkeypatch, arch, QWEN35, *TP4)
     run = {"bound_s": 1.0, "machine": machine(arch)}
 

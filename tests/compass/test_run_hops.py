@@ -145,9 +145,11 @@ def test_each_side_of_a_prefill_decode_run_takes_the_hops_fitted_under_its_confi
     hops_d = {"admission_s": 9e-3, "ipc_s": 5e-4, "ipc_out_s": 6e-4, "stream_s": 7e-4}
     laws = [entry(tmp_path, "p.json", p, hops_p), entry(tmp_path, "d.json", d, hops_d)]
     sides = {"P": model(tmp_path, "-dp", "1"), "D": model(tmp_path)}
-    configs = {tuple(sides["P"]): p.config, tuple(sides["D"]): d.config}
+    # Each side's config as resolved on the machine's arch, the only one stated.
+    gfx = DOCUMENT["device"]["arch"]
+    configs = {(tuple(sides["P"]), gfx): p.config, (tuple(sides["D"]), gfx): d.config}
     monkeypatch.setattr(
-        "atom.compass.drive.run._config", lambda a, arch: configs[tuple(a)]
+        "atom.compass.drive.run._config", lambda a, arch: configs[tuple(a), arch]
     )
 
     for order in (laws, laws[::-1]):
