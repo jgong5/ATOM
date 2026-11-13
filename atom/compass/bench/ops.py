@@ -1762,7 +1762,6 @@ class Stub:
             "release_wait_s": _waited.pop("s", 0.0),
             "release_capped": _waited.pop("capped", 0),
             "routing": _routing(self.loads) if self.loads else None,
-            "routed_rows": self.routed if self.loads else None,
         }
 
     def _copy(self, op, sig, instances, c, like=None):
@@ -1901,8 +1900,7 @@ class Stub:
         point stating its real MoE rows, ids of as many rows as its MoE runs
         are routed past the real rows to -1, as ATOM routes a pad row: the
         real ones spread evenly over the ranks, first in each rank's block of
-        the gather. The copy's real rows' expert loads go to `loads`, and the
-        rows its ids hold to `routed`."""
+        the gather. The copy's real rows' expert loads go to `loads`."""
         moe = self.draft_moe if drafted else self.moe
         if len(moe) > 1:
             raise ValueError(
@@ -1916,7 +1914,6 @@ class Stub:
         out[:, :k] = ids
         if out.shape[1] > k:
             out[:, k:] = self.shared[: len(out), k:]
-        self.routed = len(out)
         if self.real and len(out) == self.real[2]:
             real, dp, rows = self.real
             pad = torch.ones(rows, dtype=torch.bool, device=device)
@@ -1992,6 +1989,21 @@ def _alive(device) -> None:
         torch.cuda.synchronize(device)
     except Exception:  # noqa: BLE001 - any error here is the device's
         os._exit(1)
+
+
+def routed_rows(leaf: dict) -> int | None:
+    """The rows of the expert ids a routed leaf reads or writes (`Stub._route`):
+    its first two-dimensional int32 or int64 activation or metadata argument's;
+    None where it has none."""
+    for _, spec in _specs(leaf["args"]):
+        ids = spec["dtype"] in ("torch.int32", "torch.int64")
+        if (
+            ids
+            and spec["role"] in ("activation", "metadata")
+            and len(spec["shape"]) == 2
+        ):
+            return spec["shape"][0]
+    return None
 
 
 def _routing(loads) -> dict:
@@ -3186,9 +3198,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                         fam = _family(shape, at, op["op"], sig, dependent)[0]
                         want[shape, at].add(fam)
     # each rung's routed leaves at the real rows its steps' MoE ran (`_real`), on
-    # a ladder from one row's tokens: a leaf whose ids are all the rows its MoE
-    # runs, as round 0 routed them, not a drafter's
-    if routed := [(k, r) for k, r in done.items() if r.get("routed_rows")]:
+    # a ladder from one row's tokens: a leaf round 0 routed whose ids are all the
+    # rows its MoE runs, not a drafter's
+    if routed := [(k, r) for k, r in done.items() if r.get("routing")]:
         dp = config.parallel_config.data_parallel_size
         spec = config.speculative_config
         row = (spec.num_speculative_tokens if spec else 0) + 1
@@ -3199,8 +3211,8 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         for (text, context, sig), r in routed:
             shape = _shape(text)
             full = dp * shape.tokens * row
-            drafted = shape in real and graphs[shape][sig][0].get("drafted")
-            if shape not in real or r["routed_rows"] != full or drafted:
+            op = shape in real and graphs[shape][sig][0]
+            if not op or routed_rows(op) != full or op.get("drafted"):
                 continue
             for n in _ladder({row, *real[shape]}):
                 if n < full:

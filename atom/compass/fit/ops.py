@@ -36,7 +36,7 @@ not read them, as attention does not, is read at any ``G``
 (a shape that states no ``G`` gathers every rank's T, and is another family),
 ``R``, the real rows of a padded decode's MoE, where some point of the family
 states them (`measure ops`' ``R=``), a point stating none at every row its ids
-route (``routed_rows``), and,
+route (`bench.ops.routed_rows`), and,
 for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
 a prefill's B and the context: a decode point's ``context``, its longest
@@ -239,7 +239,7 @@ def fit(points) -> dict:
     every rank to the same rows and keep it; and ``left_out``, each point
     whose leaf may have run at two places in its family (`ran_counts`), by
     its shape, operator and why."""
-    from atom.compass.bench.ops import DP_GROUP, _dependent, _split
+    from atom.compass.bench.ops import DP_GROUP, _dependent, _split, routed_rows
     from atom.compass.capture.peers import MORI
 
     dependent = _dependent(points)
@@ -310,7 +310,8 @@ def fit(points) -> dict:
             dims += ["G"] if "G" in follows else []
             if name in real_rows:  # a padded decode's MoE: its real rows, or all routed
                 dims.append("R")
-                at_p["R"] = shape_counts(p["shape"]).get("R", p.get("routed_rows"))
+                real = shape_counts(p["shape"]).get("R")
+                at_p["R"] = real or routed_rows(json.loads(p["leaf"]))
             if moves and "T" not in at_p:  # a decode point, read at its mean too
                 # a uniform point whose rows the KV pool cut holds a mean its
                 # context does not name: a family with ragged points leaves it out

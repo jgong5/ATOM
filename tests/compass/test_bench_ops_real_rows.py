@@ -50,13 +50,12 @@ def test_a_point_routes_each_rank_s_rows_past_its_real_ones_to_no_expert():
     assert (stub._route(_spec([4, 2]), 0) >= 0).all()
 
 
-def test_a_point_records_the_rows_its_ids_route_and_draws_its_real_rows_alone():
+def test_each_copy_routes_its_real_rows_alone_and_records_their_loads():
     stub = _stub((16, 2))
     stub.real = (2, 1, 4)  # one rank's two real rows of its rung of 4
 
     record, copies = _timed(stub, MOE, 3)
 
-    assert record["routed_rows"] == 4
     for c in copies:
         assert (c["topk_ids"][2:] == -1).all() and (c["topk_ids"][:2] >= 0).all()
     assert record["routing"]["activated"] == [
@@ -102,8 +101,8 @@ def _routed_graph(dp):
 
 
 def _routed_bench(fn, config, todo, llc):
-    """A device timing the MoE leaf a microsecond per real row, every other
-    leaf at a microsecond, and recording the rows the MoE's ids hold."""
+    """A device timing the MoE leaf a microsecond per real row, as routed, and
+    every other leaf at a microsecond."""
     got = []
     for shape, context, found in todo:
         for sig, (op, _) in found.items():
@@ -111,7 +110,7 @@ def _routed_bench(fn, config, todo, llc):
             point |= {"leaf": sig, "kernels": ["k"], "cold_ns": 1e3}
             if op["op"] == FUSED:
                 rows = op["args"]["topk_ids"]["shape"][0]
-                point |= {"routed_rows": rows, "cold_ns": 1e3 * (shape.real or rows)}
+                point |= {"routing": {"seed": 0}, "cold_ns": 1e3 * (shape.real or rows)}
             got.append(point)
     return got
 
