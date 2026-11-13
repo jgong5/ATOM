@@ -8,7 +8,8 @@
 #
 # Usage: deploy.sh OUT run|record <flags> --prefill [<own>] -- <ATOM args> --decode [<own>] -- <ATOM args> --router -- <router args>
 #   OUT            the deployment's directory, absent or empty
-#   <flags>        run: `compass run`'s run-file flags: the backend, --machine,
+#   <flags>        run: `compass run`'s run-file flags: the backend, --device,
+#                  --ptl, --network across nodes,
 #                  --store, ... (atom/compass/drive/runfile.py); record: the
 #                  `compass record` flags both instances take, e.g. --gpu
 #   <own>          that instance's own `compass record` flags, e.g. --gpu, or

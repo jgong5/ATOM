@@ -2,16 +2,15 @@
 """`compass fit steps`: a step-level backend fitted on labelled samples and published.
 
     compass fit steps --backend step-linear [--form FORM] [--seed S] RECORD...
-        --client-run RECORD EXPORT... [--ops DIR...] --machine M --store ROOT
-        --out DIR
+        --client-run RECORD EXPORT... [--ops DIR...] --store ROOT --out DIR
     compass fit steps --backend step-grid --grid INPUT... --grid-definition FILE
         [--sessions A:B] [--seed S] TARGET... --client-run INPUT EXPORT...
-        [--ops DIR...] --machine M --store ROOT --out DIR
+        [--ops DIR...] --store ROOT --out DIR
 
 Each backend in `BACKENDS` states the kind it publishes, the label sources it
 takes and its fit, which returns the key fields the configuration does not
 give, the params and the report; a flag only another backend reads refuses.
-The entry is published under the readings a run on the spec `--machine` names
+The entry is published under the readings a run on the inputs' platform
 takes, which `publish.inputs` loads each measurement under. `--ops` names
 `measure ops --out` directories whose points take the profiler's floor out
 of a trace run's drafter labels (`publish.inputs`); the report's `floor`

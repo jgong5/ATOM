@@ -46,31 +46,21 @@ from atom.compass.artifacts import (
     roots_for,
 )
 from atom.compass.spec import MachineSpec
-from atom.compass.spec.layers import ROOT, datasheet
+from atom.compass.spec.layers import (
+    BANDWIDTH,
+    CURVE,
+    FORMATS,
+    RANK,
+    RATES,
+    RATIO_CURVE,
+    READINGS_HEADER,
+    ROOT,
+    datasheet,
+    readings,
+)
 
 PROG = "compass fit device"
-RANK = Topology().ranks()[0]
-FORMATS = ("bf16", "fp8", "fp4")
-CURVE = "device.memory.bandwidth_curve"
-BANDWIDTH = "device.memory.bandwidth_bytes_per_s"
 PP = "interconnect.intra_node.pp"
-#: Each rate a measured entry holds, to the datasheet peak it attains and the
-#: ratio an assumed entry holds in its place.
-RATES = {
-    **{
-        f"device.compute.attainable_flops.{f}": (
-            f"device.compute.{f}_flops",
-            f"device.compute.derate.{f}",
-        )
-        for f in FORMATS
-    },
-    "interconnect.intra_node.attainable_bandwidth_bytes_per_s": (
-        "interconnect.intra_node.link_bandwidth_bytes_per_s",
-        "interconnect.intra_node.derate",
-    ),
-}
-#: An assumed entry's bandwidth curve, over its source's datasheet bandwidth.
-RATIO_CURVE = "device.memory.bandwidth_derate_curve"
 #: What a projected spec takes from the probed one as it stands, no
 #: datasheet stating it.
 CARRIED = (
@@ -80,7 +70,7 @@ CARRIED = (
     "interconnect.inter_node.link_latency_s",
     "interconnect.router_relay_s",
 )
-HEADER = ("schema_version", "name", "provenance")
+HEADER = READINGS_HEADER
 
 
 def fold(records: Mapping[str, dict]) -> tuple[dict, dict]:
@@ -88,7 +78,7 @@ def fold(records: Mapping[str, dict]) -> tuple[dict, dict]:
     record's document by its token."""
     flat = {token: _flat(r["readings"]) for token, r in records.items()}
     values, origins = {}, {}
-    for path in sorted({p for readings in flat.values() for p in readings}):
+    for path in sorted({p for held in flat.values() for p in held}):
         stating = {t: r[path] for t, r in flat.items() if path in r}
         origins[path] = {"origin": "probed", "record": ", ".join(stating)}
         if path == CURVE:
@@ -186,23 +176,28 @@ def _records(store: ArtifactStore, tokens: list[str]) -> tuple[dict, dict]:
     return records, platforms[tokens[0]]
 
 
-def _source(store: ArtifactStore, device: str, ptl: str) -> tuple[Key, dict]:
-    """The one `platform_readings` entry `store` holds for `device` at `ptl`,
-    and its document."""
-    folder = store.root / Kind.PLATFORM_READINGS.value
-    keys = [
-        Key.of(Kind.PLATFORM_READINGS, **json.loads(p.read_text())["key"])
-        for p in sorted(folder.glob("[!.]*/entry.json"))
-    ]
-    found = [k for k in keys if k.values["device"] == device and k.values["ptl"] == ptl]
-    if len(found) != 1:
-        listed = "".join(f"; {k} as {k.token()}" for k in found)
+def assumed_entry(
+    store: ArtifactStore, device: str, ptl: str, stack: str | None = None
+) -> tuple[Key, dict, object]:
+    """The one measured `platform_readings` entry `store` holds for the device
+    named `device` at `ptl` and `stack` (`layers.readings`), its document as a
+    device never run takes it, `assumed`'s readings every one assumed, and the
+    datasheet stating `device`."""
+    source = _named(device)
+    found, document = readings(store, _device(source), ptl, stack)
+    if document["provenance"]["origin"] != "probed":
         raise ValueError(
-            f"{store.root} holds {len(found)} platform_readings entries for "
-            f"{device} at PTL {ptl}{listed}; --assume-from takes exactly one"
+            f"{found} as {found.token()} is assumed itself; assume from a "
+            "measured entry, whose rates its datasheet divides"
         )
-    body = store.read(found[0]).read_member("readings", RANK, "json")
-    return found[0], json.loads(body)
+    measured = {k: v for k, v in document.items() if k not in HEADER}
+    values = assumed(measured, source.values)
+    provenance = document["provenance"] | {
+        "origin": "assumed",
+        "origins": {p: {"origin": "assumed"} for p in values},
+    }
+    header = {k: document[k] for k in HEADER}
+    return found, header | values | {"provenance": provenance}, source
 
 
 def _named(device: str):
@@ -228,18 +223,11 @@ def main(argv: list[str]) -> None:
     if args.assume_from:
         if args.records or not (args.device and args.ptl):
             raise ValueError("--assume-from takes --device and --ptl and no RECORD")
-        source = _named(args.assume_from)
-        found, document = _source(store, _device(source), args.ptl)
-        if document["provenance"]["origin"] != "probed":
-            raise ValueError(
-                f"{found} as {found.token()} is assumed itself; assume from a "
-                "measured entry, whose rates its datasheet divides"
-            )
-        readings = {k: v for k, v in document.items() if k not in HEADER}
-        values = assumed(readings, source.values)
+        found, document, source = assumed_entry(store, args.assume_from, args.ptl)
+        values = {k: v for k, v in document.items() if k not in HEADER}
         target = datasheet(args.device)
         platform = found.values | {"device": _device(target)}
-        origins = {p: {"origin": "assumed"} for p in values}
+        origins = document["provenance"]["origins"]
         notes = (
             f"no {platform['device']} card ran: {found} as {found.token()} over "
             f"the {source.name} datasheet; the stack and torch are that entry's"

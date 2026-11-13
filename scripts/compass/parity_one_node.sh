@@ -137,7 +137,7 @@ if [[ -z ${STORE:-} ]]; then
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
     ATOM_DP_MASTER_PORT=$(compass_held_port) python3 -c \
         "from atom.compass.cli import main; main()" measure memory \
-        --gpu "$gpus" --machine "$MACHINE" \
+        --gpu "$gpus" \
         ${LM_FLAGS:+--beside "lmcache server $LM_FLAGS"} \
         --store "$STORE" --out "$OUT/memory" -- --model "$MODEL" -tp "$TP" \
         $PPA $DPA $MEASURE_DP $SERVER_ARGS

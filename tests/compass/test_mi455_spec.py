@@ -11,7 +11,6 @@ from test_probe_device import SCRIPTS, _load
 from test_spec_origin import labels
 
 from atom.compass.artifacts import machine_platform
-from atom.compass.drive import identity, measure_memory
 from atom.compass.spec import MachineSpec
 
 MACHINES = SCRIPTS / "machines"
@@ -118,51 +117,3 @@ def test_a_run_on_a0_charges_the_intake_the_node_s_bursts_fitted(monkeypatch, tm
     fixed = terms["fixed_s"]
     # No lone request was timed on the node, so the fixed term stands for idle.
     assert compass_run.http_intake() == (fixed, terms["per_byte_s"], fixed)
-
-
-#: rocm-smi's listing of GPU 0 on the MI455 node, 2026-10-27: the series is no
-#: brand, so the PCI device id names the model.
-MI455_CARD = {
-    "Card Series": "AMD Radeon Graphics",
-    "Card Model": "0x75c7",
-    "Card Vendor": "Advanced Micro Devices, Inc. [AMD/ATI]",
-    "Card SKU": "M4500001",
-    "Subsystem ID": "0x75c1",
-    "Device Rev": "0x00",
-    "Node ID": "2",
-    "GUID": "25919",
-    "GFX Version": "gfx1250",
-}
-
-
-def test_measure_memory_on_an_a0_card_passes_a0_s_checks_and_refuses_b0_s_device(
-    monkeypatch, tmp_path
-):
-    """What `compass measure memory` checks before it starts an engine, on the
-    A0 card's listing and its stack: A0's spec passes the device, PTL and stack
-    checks and stops at the next, an output directory holding files; B0's
-    refuses at the device."""
-    listing = {"card0": {**MI455_CARD, "PCI Bus": "0001:04:00.0"}}
-    monkeypatch.setattr(identity, "smi", lambda *args: json.dumps(listing))
-    monkeypatch.setattr(identity, "PCI", str(tmp_path))  # no card has a ptl directory
-    pinned = _spec(A0).values
-    stack = {
-        c: pinned[f"device.software_pinned_to.{c}"]
-        for c in ("rocm", "aiter", "rccl", "torch")
-    }
-    monkeypatch.setattr(measure_memory, "_stack", lambda: stack)
-    out = tmp_path / "out"
-    out.mkdir()
-    (out / "earlier.log").touch()
-
-    def refused(machine):
-        argv = ["--gpu", "0", "--machine", str(machine), "--store", str(tmp_path)]
-        with pytest.raises(ValueError) as raised:
-            measure_memory.main([*argv, "--out", str(out), "--", "--model", "m"])
-        return str(raised.value)
-
-    assert refused(A0) == f"{out} holds an earlier run's files; one run per directory"
-    assert refused(B0) == (
-        f"GPU 0 is MI455X gfx1250, and {B0} states MI455X B0 gfx1250; "
-        "name the machine spec of the device the start runs on"
-    )

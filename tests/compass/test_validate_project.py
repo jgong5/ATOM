@@ -8,6 +8,7 @@ priced at another's probed ratios, the method's error on its own records.
 import json
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_backend_step_roofline import STACK
@@ -30,6 +31,11 @@ MI308X, MI355X, MI455 = (
 
 def spec(path):
     return MachineSpec.from_mapping(json.loads(path.read_text()))
+
+
+def on_mi455(store, directory) -> list[str]:
+    """The platform flags of MI455's B0 spec, its readings in `store`."""
+    return platforms.flags(store, json.loads(MI455.read_text()), directory)
 
 
 def ran(path, lines):
@@ -68,17 +74,25 @@ def test_a_projected_device_keeps_its_peaks_at_the_others_probed_ratios():
     assert mi455 | {"name": None} == spec(MI455).values | {"name": None}
 
 
-def test_bound_ratios_from_prices_records_at_the_projected_spec(monkeypatch, tmp_path):
+def test_bound_ratios_from_prices_records_at_the_other_devices_ratios(
+    monkeypatch, tmp_path
+):
     rec = ran(tmp_path / "rec", LINES[:3])
     reports = []
     monkeypatch.setattr(bound, "text", lambda r: reports.append(r) or "")
-    for more in ([], ["--ratios-from", str(MI308X)]):
-        _main(monkeypatch, tmp_path, [rec], more=["--machine", str(MI355X), *more])
+    mi308x = MACHINES / "mi308x-hjbog39.json"
+    platforms.flags(tmp_path / "store", json.loads(mi308x.read_text()), tmp_path)
+    mi355x = json.loads(MI355X.read_text())
+    for more in ([], ["--ratios-from", "MI308X"]):
+        _main(monkeypatch, tmp_path, [rec], more=more, document=mi355x)
 
     own, at_ratios = (r["step"]["analytical_s"]["prefill"]["total"] for r in reports)
-    machine = device.projected(spec(MI355X), spec(MI308X))
+    machine = device.projected(spec(MI355X), spec(mi308x))
     direct = bound.gate([rec], {"step": StepRooflineBackend(machine, STACK)})
-    assert at_ratios == direct["step"]["analytical_s"]["prefill"]["total"] != own
+    assert at_ratios == pytest.approx(
+        direct["step"]["analytical_s"]["prefill"]["total"]
+    )
+    assert at_ratios != own
 
 
 def _priced_here(monkeypatch, drafter=None):
@@ -112,7 +126,7 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
     decode = ran(tmp_path / "decode", LINES[:1])
     prefill = ran(tmp_path / "prefill", LINES[1:2])
     store = tmp_path / "store"
-    argv = ["--model", "m", "--machine", str(MI455), "--store", str(store)]
+    argv = ["--model", "m", *on_mi455(store, tmp_path), "--store", str(store)]
     project.main([*argv, "--", str(decode), "--enable-tbo", "--", str(prefill)])
 
     token = capsys.readouterr().out.split()[-1]
@@ -176,7 +190,8 @@ def test_main_reads_a_records_atom_arguments_from_its_run_json(monkeypatch, tmp_
     line += ["--enable-tbo", "--tool-call-parser", "qwen3"]
     (served / "run.json").write_text(json.dumps({"argv": line}))
     (bare / "run.json").write_text(json.dumps({"argv": ["compass", "record"]}))
-    argv = ["--model", "m", "--machine", str(MI455), "--store", str(tmp_path / "s")]
+    argv = ["--model", "m", *on_mi455(tmp_path / "s", tmp_path)]
+    argv += ["--store", str(tmp_path / "s")]
 
     with pytest.raises(ValueError) as refused:
         project.main([*argv, str(served), str(bare)])
@@ -203,10 +218,11 @@ def test_a_record_naming_a_draft_model_is_refused_naming_the_dash_form(tmp_path,
     )
 
 
-def test_main_refuses_cells_of_two_models_and_a_run_with_no_cell(monkeypatch):
+def test_main_refuses_cells_of_two_models_and_a_run_with_no_cell(monkeypatch, tmp_path):
     two = [{"model": "sha256:a"}, {"model": "sha256:b"}]
     monkeypatch.setattr(project, "_each", lambda jobs: two)
-    argv = ["--model", "m", "--machine", str(MI455), "--store", "s"]
+    store = tmp_path / "s"
+    argv = ["--model", "m", *on_mi455(store, tmp_path), "--store", str(store)]
 
     with pytest.raises(ValueError, match="different models"):
         project.main([*argv, "--", "a", "--", "b"])

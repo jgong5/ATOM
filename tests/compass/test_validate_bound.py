@@ -14,6 +14,7 @@ import json
 import math
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_backend_step_roofline import MACHINE, ROOFLINE, STACK
 from test_op_graph import g
@@ -206,7 +207,7 @@ def test_an_mtp_record_is_measured_by_its_target(tmp_path):
     assert refused == Refusal(bound.SOURCE, bound.UNSPLIT)
 
 
-def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1):
+def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1, document=ROOFLINE):
     config = SimpleNamespace(
         tensor_parallel_size=tp,
         kv_cache_dtype="bf16",
@@ -221,9 +222,9 @@ def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1):
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
     monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
     monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: graph)
-    spec = tmp_path / "spec.json"
-    spec.write_text(json.dumps(ROOFLINE))
-    argv = ["--model", "m", "--machine", str(spec), "--store", "s", *more]
+    store = tmp_path / "store"
+    platform = platforms.flags(store, document, tmp_path)
+    argv = ["--model", "m", *platform, "--store", str(store), *more]
     argv += map(str, records)
     bound.main(argv)
 

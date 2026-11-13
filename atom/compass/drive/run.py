@@ -2,20 +2,22 @@
 """`compass run`: one simulated instance's server, serving whatever client runs
 reach it until it is stopped, with run.json recording what grading reads.
 
-    compass run <backend> --machine M --store S [--host-laws KEY|LAW]
-        [--coverage INPUT...] [--on-refusal mark|abort] [--step-roofline]
-        [--acceptance-record RECORD] --out D -- <ATOM args>
+    compass run <backend> --device DEV --ptl PTL [--stack STACK] --store S
+        [--host-laws KEY|LAW] [--coverage INPUT...] [--on-refusal mark|abort]
+        [--step-roofline] [--acceptance-record RECORD] --out D -- <ATOM args>
 
     compass run --join RUN_FILE --out D -- <ATOM args>
 
-    compass run <backend> --machine M --store S [--host-laws KEY] ... --check
-        -- <ATOM args>
+    compass run <backend> --device DEV --ptl PTL --store S [--host-laws KEY]
+        ... --check -- <ATOM args>
 
-`runfile` builds the run file from the flags, the backend exactly one with no
-default, and `serve` starts the server simulated from it with the step record
-on. `--out` holds what `serve` writes and what the run writes there: each DP
-rank's step record and cost lines, the step table, the run summary and each
-LP's hand-in.
+`runfile` builds the run file from the flags, the platform composed from
+`--device`'s datasheet and the readings `--store` holds for it at `--ptl` and
+at the stack the backend's and host laws' entries state, or `--stack` where
+they state none (`runfile.spec`), the backend exactly one with no default, and
+`serve` starts the server simulated from it with the step record on. `--out`
+holds what `serve` writes and what the run writes there: each DP rank's step
+record and cost lines, the step table, the run summary and each LP's hand-in.
 
 `--join` names a deployment's run file in place of every flag but `--out`: the
 server joins the clock authority its ``clock_endpoint`` names, which writes the

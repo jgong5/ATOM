@@ -41,7 +41,7 @@
 # The capture exits 1 naming each cell left without artifacts/client_run.json
 # or without that identity.
 #   compass fit steps --backend step-linear OUT_DIR/c<C>... --client-run OUT_DIR/c<C> \
-#       OUT_DIR/c<C>/artifacts/client_run.json... --machine SPEC --store S --out D
+#       OUT_DIR/c<C>/artifacts/client_run.json... --store S --out D
 set -uo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 

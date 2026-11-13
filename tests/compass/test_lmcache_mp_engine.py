@@ -569,7 +569,7 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(
     monkeypatch.setenv("ATOM_KV_OFFLOAD_EXTRA_CONFIG", json.dumps(extra))
     gpu = os.environ.get("HIP_VISIBLE_DEVICES", "0")
     cli.main(
-        ["measure", "memory", "--gpu", gpu, "--machine", str(machine)]
+        ["measure", "memory", "--gpu", gpu]
         + ["--beside", shlex.join(["lmcache", "server", *flags])]
         + ["--store", str(tmp_path / "store"), "--out", str(tmp_path / "measure")]
         + ["--", *ATOM_ARGS]

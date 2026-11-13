@@ -2,15 +2,16 @@
 """`compass project`: real runs' steps priced on a device none of them ran on,
 at step and op level, published as a `projection`.
 
-    compass project --model M [--tp N] --machine SPEC --store S RECORD...
-        [-- RECORD [ATOM args] ...]
+    compass project --model M [--tp N] --device DEV --ptl PTL [--stack STACK]
+        --store S RECORD... [-- RECORD [ATOM args] ...]
 
-A cell is a real run's directory, its step record in `steps/`, and the ATOM
+SPEC is the machine spec composed from DEV's datasheet and the readings S
+holds for it at PTL (`layers.compose`), assumed for a device never run. A cell
+is a real run's directory, its step record in `steps/`, and the ATOM
 arguments it ran under: after `--` in the command line its run.json holds,
 less the server's and `--model`, as `--model` names the model here; for a
 record whose run.json names none, or a `--draft-model`, those in its own
-`-- RECORD` group. Its
-steps are priced as `validate.bound` prices them,
+`-- RECORD` group. Its steps are priced as `validate.bound` prices them,
 on SPEC, the op_graphs S holds for SPEC's arch; nothing is compared with the
 measured time, which is another device's. Each cell is priced in a process of
 its own, since a build declares one engine per process.
@@ -51,6 +52,7 @@ from atom.compass.artifacts import (
 from atom.compass.backends.cost import fold_parts, fold_seconds
 from atom.compass.fit.device import BANDWIDTH, CURVE
 from atom.compass.spec import MachineSpec
+from atom.compass.spec.layers import compose
 
 from . import bound
 
@@ -319,18 +321,20 @@ def main(argv: list[str]) -> None:
     )
     p.add_argument("--model", required=True, help="a model name or directory")
     p.add_argument("--tp", type=int, default=1, help="tensor-parallel width")
-    p.add_argument("--machine", required=True, help="the machine spec priced on")
+    p.add_argument("--device", required=True, help="the datasheet, SKU or path")
+    p.add_argument("--ptl", required=True, choices=("enabled", "disabled"))
+    p.add_argument("--stack", help="the readings' stack and torch, of several")
     p.add_argument(
         "--store",
         required=True,
-        help="the artifact store: op_graphs in, projection out",
+        help="the artifact store: op_graphs and readings in, projection out",
     )
     args = p.parse_args(argv[: cuts[0] if cuts else len(argv)])
     groups = [argv[i + 1 : j] for i, j in zip(cuts, [*cuts[1:], len(argv)])]
     if not all(groups) or not (args.records or groups):
         p.error("name each cell: RECORD, or -- RECORD [ATOM args]")
     groups = [[r, *recorded(r)] for r in args.records] + groups
-    echo = json.loads(Path(args.machine).read_text())
+    echo = compose(args.device, ArtifactStore(args.store), args.ptl, args.stack).echo()
     jobs = [(args.model, args.tp, echo, args.store, g[0], g[1:]) for g in groups]
     results = _each(jobs)
     cells = {g[0]: (g[1:], c) for g, c in zip(groups, results)}
