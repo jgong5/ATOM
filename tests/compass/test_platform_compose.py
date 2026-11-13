@@ -34,9 +34,10 @@ from atom.compass.artifacts.keys import NO_PTL
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.drive import runfile
 from atom.compass.fit import publish
+from atom.compass.fit.device import compose
 from atom.compass.fit.samples import load
 from atom.compass.spec import MachineSpec, SpecRefusal
-from atom.compass.spec.layers import compose, datasheet
+from atom.compass.spec.layers import datasheet
 
 #: Each committed spec of one node's readings.
 ONE_NODE = sorted(p.stem for p in (SCRIPTS / "machines").glob("*.json"))

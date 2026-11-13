@@ -59,9 +59,10 @@ from atom.compass.artifacts import (
     machine_platform,
     member_name,
 )
+from atom.compass.fit.device import compose
 from atom.compass.fit.publish import RANK
 from atom.compass.run.step_grid import readings
-from atom.compass.spec.layers import compose, stack_of
+from atom.compass.spec.layers import stack_of
 
 #: Each backend flag's store kind; the step stub's coefficients are a file.
 KINDS = {run.STEP_LINEAR: Kind.STEP_LINEAR_LAW, run.STEP_GRID: Kind.STEP_GRID_BUNDLE}
@@ -99,7 +100,7 @@ def add_arguments(parser) -> None:
 
 
 def spec(args, store: ArtifactStore, across: bool = False):
-    """The machine spec `args`' platform flags compose (`layers.compose`), at
+    """The machine spec `args`' platform flags compose (`fit.device.compose`), at
     the stack and torch the entries the run prices with state, else at
     `--stack`; entries and `--stack` that state two refuse, naming each.
     `--network` is for a run across nodes (`across`), which refuses without

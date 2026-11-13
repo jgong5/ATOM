@@ -7,7 +7,7 @@ measured device time on every measured step, at step and at op level.
         RECORD... [-- ATOM args]
 
 The spec is DEV's datasheet with the readings S holds for it at PTL
-(`layers.compose`). A RECORD is a real run's directory, its step record in
+(`fit.device.compose`). A RECORD is a real run's directory, its step record in
 `steps/`. Each forward
 there that is not a DP dummy run is priced at step level by the step roofline,
 over the modules `run.modules.walk` reads off the meta build ATOM's arguments
@@ -526,8 +526,8 @@ def main(argv: list[str]) -> None:
     args = p.parse_args(argv[:cut])
 
     from atom.compass.artifacts import ArtifactStore
-    from atom.compass.fit.device import assumed_entry
-    from atom.compass.spec.layers import compose, composed, datasheet
+    from atom.compass.fit.device import assumed_entry, compose
+    from atom.compass.spec.layers import composed, datasheet
 
     store = ArtifactStore(args.store)
     if args.ratios_from:

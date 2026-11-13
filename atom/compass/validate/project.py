@@ -6,7 +6,7 @@ at step and op level, published as a `projection`.
         --store S RECORD... [-- RECORD [ATOM args] ...]
 
 SPEC is the machine spec composed from DEV's datasheet and the readings S
-holds for it at PTL (`layers.compose`), assumed for a device never run. A cell
+holds for it at PTL (`fit.device.compose`), assumed for a device never run. A cell
 is a real run's directory, its step record in `steps/`, and the ATOM
 arguments it ran under: after `--` in the command line its run.json holds,
 less the server's and `--model`, as `--model` names the model here; for a
@@ -50,9 +50,8 @@ from atom.compass.artifacts import (
     roots_for,
 )
 from atom.compass.backends.cost import fold_parts, fold_seconds
-from atom.compass.fit.device import BANDWIDTH, CURVE
+from atom.compass.fit.device import BANDWIDTH, CURVE, compose
 from atom.compass.spec import MachineSpec
-from atom.compass.spec.layers import compose
 
 from . import bound
 

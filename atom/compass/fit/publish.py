@@ -49,10 +49,11 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.json_file import read_json
 from atom.compass.backends.step_labels import Floor
+from atom.compass.fit.device import readings
 from atom.compass.fit.samples import UNRECORDED, load, run_fields
 from atom.compass.parity import busy
 from atom.compass.run import host_cpu
-from atom.compass.spec.layers import readings, stack_of
+from atom.compass.spec.layers import stack_of
 from atom.compass.validate.runs import SIDES, named_by_prefill
 
 #: What a trace run's profiler adds to a kernel shorter than it.

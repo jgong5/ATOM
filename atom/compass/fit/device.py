@@ -24,6 +24,10 @@ torch, every field assumed. None, or several, refuse, listing them.
 
 `--out` gets a readable copy of the entry, ``platform_readings.json``, with
 its key and token. `projected` is the same rule on two machine specs.
+
+A command that prices reads its platform through `compose`: the datasheet
+it names, the one entry S holds for that device (`readings`), and, across
+nodes, a network file, composed by `layers.composed`.
 """
 
 import argparse
@@ -50,16 +54,19 @@ from atom.compass.spec.layers import (
     BANDWIDTH,
     CURVE,
     FORMATS,
-    RANK,
     RATES,
     RATIO_CURVE,
     READINGS_HEADER,
     ROOT,
+    composed,
     datasheet,
-    readings,
+    network,
+    stack_of,
 )
 
 PROG = "compass fit device"
+#: The rank a readings entry's one member is written at.
+RANK = Topology().ranks()[0]
 PP = "interconnect.intra_node.pp"
 #: What a projected spec takes from the probed one as it stands, no
 #: datasheet stating it.
@@ -176,11 +183,61 @@ def _records(store: ArtifactStore, tokens: list[str]) -> tuple[dict, dict]:
     return records, platforms[tokens[0]]
 
 
+def readings(
+    store: ArtifactStore, device: str, ptl: str, stack: str | None = None
+) -> tuple[Key, dict]:
+    """The one `platform_readings` entry `store` holds for `device`, `<name>
+    <arch>`, at PTL state `ptl` and, when given, at `stack` (`stack_of`), and
+    its document; none or several refuse, listing each."""
+    folder = store.root / Kind.PLATFORM_READINGS.value
+    keys = [
+        Key.of(Kind.PLATFORM_READINGS, **json.loads(p.read_text())["key"])
+        for p in sorted(folder.glob("[!.]*/entry.json"))
+    ]
+    found = [
+        k
+        for k in keys
+        if (k.values["device"], k.values["ptl"]) == (device, ptl)
+        and stack in (None, stack_of(k.values))
+    ]
+    if len(found) != 1:
+        at = f" at {stack}" if stack else ""
+        listed = "".join(f"; {stack_of(k.values)} as {k.token()}" for k in found)
+        remedy = (
+            "--stack names one"
+            if found
+            else "compass measure device on each node and compass fit device "
+            "publish one"
+        )
+        raise ValueError(
+            f"{store.root} holds {len(found)} platform_readings entries for "
+            f"{device} at PTL {ptl}{at}{listed}; {remedy}"
+        )
+    body = store.read(found[0]).read_member("readings", RANK, "json")
+    return found[0], json.loads(body)
+
+
+def compose(
+    device: str | Path,
+    store: ArtifactStore,
+    ptl: str,
+    stack: str | None = None,
+    network_file: str | Path | None = None,
+) -> MachineSpec:
+    """The machine spec of the datasheet `device` names, by SKU or path, the
+    one readings entry `store` holds for it at `ptl` and `stack` (`readings`),
+    and the network file `network_file` names, when it names one."""
+    sheet = datasheet(device)
+    key, document = readings(store, _device(sheet), ptl, stack)
+    net = None if network_file is None else network(network_file)
+    return composed(sheet, key, document, net)
+
+
 def assumed_entry(
     store: ArtifactStore, device: str, ptl: str, stack: str | None = None
 ) -> tuple[Key, dict, object]:
     """The one measured `platform_readings` entry `store` holds for the device
-    named `device` at `ptl` and `stack` (`layers.readings`), its document as a
+    named `device` at `ptl` and `stack` (`readings`), its document as a
     device never run takes it, `assumed`'s readings every one assumed, and the
     datasheet stating `device`."""
     source = _named(device)
