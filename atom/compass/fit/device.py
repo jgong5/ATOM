@@ -67,15 +67,6 @@ PROG = "compass fit device"
 #: The rank a readings entry's one member is written at.
 RANK = Topology().ranks()[0]
 PP = "interconnect.intra_node.pp"
-#: What a spec at another device's ratios takes from that device's spec as it
-#: stands, no datasheet stating it.
-CARRIED = (
-    "device.kernel_floor_s",
-    "device.software_pinned_to.",
-    "interconnect.intra_node.link_latency_s",
-    "interconnect.inter_node.link_latency_s",
-    "interconnect.router_relay_s",
-)
 
 
 def fold(records: Mapping[str, dict]) -> tuple[dict, dict]:

@@ -383,9 +383,8 @@ it carries Mooncake's KV transfer between the prefill and the decode node (`01` 
    on: in a readings entry, the probe records it folded. A probed number, a quantity or a
    byte count, also records its band, `p10` and `p90`: in a probe record the spread over
    the probe's repeated samples, in a readings entry the span of every folded record's
-   band. Readers use the value, never the band. A document that states a probed number
-   without its band is refused by name before it is written
-   (`spec/bands.py::refuse_unbanded`). A count or a text is read, not sampled, and so is
+   band. Readers use the value, never the band. A readings entry states the band of each
+   probed number it folds (`fit/device.py::fold`). A count or a text is read, not sampled, and so is
    a field the table marks `exact`, the device's capacity: those carry no band. An
    `assumed` field's notes say why it was chosen, and a document that states a method in
    place of an origin is refused by name. The origin is not the method: the term that
