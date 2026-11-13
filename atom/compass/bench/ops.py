@@ -181,8 +181,8 @@ and under DP each leaf of a decode's drafter's graphs a run asks at its
 later passes' G at that G and the rows it ran there (`_drafter_at`), in
 place of its own shape's point,
 at the steps' lowest and highest row context (`_rows`); then each rung's
-routed leaf whose ids are every row its MoE runs, a drafter's aside, at the
-real rows its steps' MoE ran (`_real`) on a ladder from one row's tokens; then
+routed leaf whose ids are every row its MoE runs, a drafter's aside, at each
+count of real rows its steps' MoE ran (`_real`) and at one row's tokens; then
 each leaf of a
 kind those show depends on context (`_dependent`) over a ladder (`_ladder`)
 of the steps' row contexts, and, when some step's rows are ragged, at a
@@ -3197,9 +3197,11 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     for at in [c, *((c, m) for m in means)]:
                         fam = _family(shape, at, op["op"], sig, dependent)[0]
                         want[shape, at].add(fam)
-    # each rung's routed leaves at the real rows its steps' MoE ran (`_real`), on
-    # a ladder from one row's tokens: a leaf round 0 routed whose ids are all the
-    # rows its MoE runs, not a drafter's
+    # each rung's routed leaves at each count of real rows its steps' MoE ran
+    # (`_real`) and at one row's tokens, at the least context unless their kind
+    # depends on it: a leaf round 0 routed whose ids are all the rows its MoE
+    # runs, not a drafter's. A ladder's points read over `fit ops`' 5% off the
+    # line through their neighbours, the time bending under one kernel
     if routed := [(k, r) for k, r in done.items() if r.get("routing")]:
         dp = config.parallel_config.data_parallel_size
         spec = config.speculative_config
@@ -3214,7 +3216,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             op = shape in real and graphs[shape][sig][0]
             if not op or routed_rows(op) != full or op.get("drafted"):
                 continue
-            for n in _ladder({row, *real[shape]}):
+            if context != min(contexts) and not dependent.get(r["op"], True):
+                continue
+            for n in sorted({row, *real[shape]}):
                 if n < full:
                     at = shape._replace(real=n)
                     graphs.setdefault(at, {})[sig] = graphs[shape][sig]
