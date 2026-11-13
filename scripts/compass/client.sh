@@ -23,8 +23,10 @@
 #                    run, so a shorter context takes the 256k-capped copy), seed
 #                    42, a trajectory start between 0.25 and 0.75 of each
 #                    trace, 10 warmup requests per lane with 1800 s grace, a
-#                    per-trace idle cap of 300 s, a system idle cap of 10 s and
-#                    the chat template applied
+#                    per-trace idle cap of 300 s, a system idle cap of 10 s,
+#                    the chat template applied, and against a real server
+#                    aiperf's scrape of its /metrics, which InferenceX takes
+#                    hit rates from
 #   --stop           then SIGTERM the command that started the server, wait
 #                    WAIT_S (default 600) for it to write OUT/run.json and leave,
 #                    a trace run's (OUT/trace) serve.TRACE_STOP_S more, and set
@@ -52,7 +54,8 @@
 # warmup. OUT/client/ holds the traces aiperf is given, each a file
 # named by its line in TRACES, aiperf's dataset and its log; OUT/artifacts/
 # aiperf's artifacts at --export-level raw, its raw records with no payload
-# and gzipped (profile_export_raw.jsonl.gz), and the client run's export,
+# and gzipped (profile_export_raw.jsonl.gz), that scrape's export
+# (server_metrics_export.json) where it ran, and the client run's export,
 # client_run.json (atom/compass/parity/client_run.py), and its workload,
 # workload.json, as cctraces_sim.sh writes it into run.json, so
 # `python -m atom.compass.validate` grades the two in one cell. One client run per OUT:
@@ -199,13 +202,24 @@ n=$(find "$OUT/client/traces" -type f | wc -l)
 ((n == last - first + 1)) || fail "traces: $TRACES holds $n of traces $first to $last"
 read -rd '' -a extra <<<"${AIPERF_EXTRA_ARGS-}" || :
 [[ " ${extra[*]} " =~ \ --random-seed[\ =] ]] && seed=() || seed=(--random-seed "${random_seed:-20260707}")
-# What aiperf sends: all but paths, the URL and the export level, as cctraces_sim.sh
-# hashes them into its run.json's workload.
+# aiperf's scrape of the server's /metrics changes what aiperf writes, not what
+# it sends. Base mode turns it off in the hashed arguments, as its graded runs
+# recorded them; --agentx leaves it out of them, as the export level, so a real
+# and a simulated run hash alike: on against a real server, as InferenceX's
+# agentx client runs it, off against a simulated one, whose compass-harness
+# refuses it.
+hashed_scrape=(--no-server-metrics) scrape=()
+if ((agentx)); then
+    hashed_scrape=()
+    [[ -z $run_file ]] || scrape=(--no-server-metrics)
+fi
+# What aiperf sends: all but paths, the URL, the export level and the scrape
+# --agentx sets, as cctraces_sim.sh hashes them into its run.json's workload.
 args=(--endpoint-type chat --custom-dataset-type weka_trace
     --concurrency "$c" --benchmark-duration "$duration"
     "${seed[@]}" --scenario inferencex-agentx-mvp --unsafe-override
     --streaming --use-server-token-count --extra-inputs ignore_eos:true
-    --no-server-metrics --no-gpu-telemetry --ui none "${agentx_args[@]}" "${extra[@]}")
+    "${hashed_scrape[@]}" --no-gpu-telemetry --ui none "${agentx_args[@]}" "${extra[@]}")
 
 # Each request carries X-Session-ID, as the nightly's agentic cell sends it: a
 # dp_sticky router keys off it, and a server alone ignores it. The raw records
@@ -216,7 +230,8 @@ trap 'set +e; kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
 (cd "$OUT/client" && AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true \
     AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true exec "$HARNESS_PYTHON" "${aiperf[@]}" \
     profile --url "${url#http://}" --model "$MODEL" --tokenizer "$MODEL" \
-    --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" --export-level raw "${args[@]}") \
+    --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" "${scrape[@]}" \
+    --export-level raw "${args[@]}") \
     >"$OUT/client/aiperf.log" 2>&1 &
 # The coverage check wants a first token or a request's end in the duration's
 # last 5%. A request in flight across that window, which aiperf cancels at the

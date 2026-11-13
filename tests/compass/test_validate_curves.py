@@ -19,6 +19,7 @@ import json
 
 import pytest
 
+from atom.compass.carriers import EPOCH_NS
 from atom.compass.validate import curves
 from atom.compass.validate.__main__ import main
 
@@ -337,3 +338,106 @@ def test_a_point_with_no_real_run_is_refused_not_dropped(tmp_path):
     _point(arm / "c4", 4, real=(), step_linear=1.0)
     with pytest.raises(ValueError, match=r"c4 holds 0 real\*/ and \['step_linear'\]"):
         main(["--curves", str(tmp_path / "out"), str(arm)])
+
+
+def _sent() -> float:
+    """When `RECORDS` sent its earliest record, the warmup's, on the Compass
+    clock: aiperf's stamp less the epoch."""
+    return (B - EPOCH_NS) / 1e9
+
+
+def _counted(run, **series):
+    """`run` with each engine's `hit_counters` series given, `[t, cached, full,
+    loaded]` samples, in its first client run's summary; by default `HITS`
+    around `RECORDS`' earliest send."""
+    t = _sent()
+    hits = series or {lp: [[t + dt, *v] for dt, *v in s] for lp, s in HITS.items()}
+    (run / curves.SUMMARY).parent.mkdir()
+    (run / curves.SUMMARY).write_text(json.dumps({"hit_counters": hits}))
+    return run
+
+
+#: Two engines' series, each sample's time from the earliest send. Across the
+#: window they change by `SERVER_METRICS`' totals: 41900 cached, 60000 full and
+#: 6000 loaded tokens. dp0's admissions before the send, and in a step ending
+#: at it, are outside; dp1's sample in force at the send is 2 s old.
+HITS = {
+    "engine-dp0": [
+        [-60.0, 0, 0, 0],
+        [-0.5, 700, 7000, 0],
+        [0.0, 900, 9000, 100],
+        [0.25, 20900, 30000, 1100],
+        [5.0, 30900, 49000, 2600],
+    ],
+    "engine-dp1": [[-60.0, 0, 0, 0], [-2.0, 4000, 6000, 0], [3.0, 15900, 26000, 3500]],
+}
+
+
+def test_a_simulated_run_s_rates_equal_aiperf_s_on_the_same_counter_values(tmp_path):
+    real = curves.metrics(_run(tmp_path / "real1", 4))
+    simulated = _counted(_run(tmp_path / "step_linear", 4, server=False))
+    mine = curves.metrics(simulated, simulated=True)
+    server = SERVER_METRICS["metrics"]
+    full = curves._counter(server, "prefix_cache_full_tokens")
+    assert full == 60000
+    for name, stem in (
+        ("GPU hit rate", "prefix_cache_cached_tokens"),
+        ("CPU hit rate", "lmcache_loaded_tokens"),
+    ):
+        assert mine[name] == real[name] == curves._counter(server, stem) / full, name
+    # A real run reads the export, not counters beside it.
+    assert curves.metrics(_counted(_run(tmp_path / "real2", 4, server=False))) == (
+        real | {"GPU hit rate": None, "CPU hit rate": None}
+    )
+
+
+def test_warmup_s_admissions_count_as_in_aiperf_s_real_export(tmp_path):
+    run = _run(tmp_path / "step_linear", 4, server=False)
+    t = _sent()
+    _counted(
+        run,
+        engine=[
+            [t - 30, 0, 0, 0],
+            # Before the client's first send, the warmup's, and in a step
+            # ending at it: outside.
+            [t - 1, 1000, 2000, 0],
+            [t, 3000, 4000, 0],
+            # A warmup admission, before the first profiling send at t + 1.
+            [t + 0.5, 5000, 7000, 500],
+            [t + 9, 9000, 12000, 1500],
+        ],
+    )
+    got = curves.metrics(run, simulated=True)
+    assert got["GPU hit rate"] == 6000 / 8000 and got["CPU hit rate"] == 1500 / 8000
+
+
+def test_a_simulated_run_without_its_counters_has_no_hit_rates(tmp_path):
+    run = _run(tmp_path / "step_linear", 4)
+    # The aiperf export beside it is not its source.
+    assert curves.metrics(run, simulated=True)["GPU hit rate"] is None
+    _counted(run, engine=[[_sent() + 1, 1, 2, 0]])
+    got = curves.metrics(run, simulated=True)
+    assert got["GPU hit rate"] is None and got["CPU hit rate"] is None
+
+
+def test_a_point_s_hit_rates_are_judged_when_its_simulated_run_holds_its_counters(
+    tmp_path, capsys
+):
+    arm = tmp_path / "tp4"
+    _point(arm / "c4", 4, step_linear=1.01, step_grid=1.2)
+    _counted(arm / "c4" / "step_linear")
+    found = curves.points(arm)
+    assert found[0]["step_linear"]["GPU hit rate"] == 41900 / 60000
+    table = {(r[1], r[2]): r[3:] for r in curves.rows(found)}
+    value = (
+        "simulated 69.83%; real mean 69.83%, band 69.83% to 69.83%;"
+        " off mean 0.00 points, limit 2 points"
+    )
+    assert table["step_linear", "GPU hit rate"] == (value, "pass: in band")
+    assert table["step_linear", "CPU hit rate"][1] == "pass: in band"
+    assert table["step_linear", "point"] == ("3 real runs", "pass")
+    # The other backend's run holds no counters: refused, as before.
+    assert table["step_grid", "GPU hit rate"][1] == "refused"
+    main(["--curves", str(tmp_path / "out"), str(arm)])
+    verdicts = _table(capsys.readouterr().out)
+    assert verdicts["tp4", 4, "step_linear", "point"] == ("3 real runs", "pass")

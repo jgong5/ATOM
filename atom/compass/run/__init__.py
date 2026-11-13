@@ -2970,6 +2970,54 @@ def _acceptance(scheduler, run: dict) -> dict:
     }
 
 
+#: The methods ATOM's engine loops run a step through: a pipeline head's, and
+#: every other engine's.
+STEP_METHODS = ("_pp_head_step", "_process_engine_step")
+
+
+def _hit_counters(scheduler) -> list:
+    """``cached_tokens`` and ``full_tokens`` (`EngineStats.cache_statistics`)
+    and the KV connector's ``loaded_tokens``, 0 with none, read as ATOM's
+    ``/metrics`` reads them (`EngineUtilityHandler.collect_metrics`)."""
+    cache = scheduler.engine_stats.cache_statistics()
+    kv = getattr(scheduler, "kv_connector", None)
+    tier = kv.get_statistics() if hasattr(kv, "get_statistics") else {}
+    return [cache["cached_tokens"], cache["full_tokens"], tier.get("loaded_tokens", 0)]
+
+
+def _sample_hit_counters(engine_core) -> list | None:
+    """The series of `engine_core`'s hit counters on its LP clock, cumulative
+    from the server's start: ``[t, *_hit_counters]`` at the run's start, and
+    after each step that changed one, through its `STEP_METHODS`, wrapped on
+    this engine alone. None for an engine with no scheduler statistics."""
+    scheduler = getattr(engine_core, "scheduler", None)
+    if getattr(scheduler, "engine_stats", None) is None:
+        return None
+    rt = clock.installed()
+    series = [[rt.now, *_hit_counters(scheduler)]]
+
+    def sampled(step):
+        @functools.wraps(step)
+        def stepped(*args, **kwargs):
+            out = step(*args, **kwargs)
+            if (now := _hit_counters(scheduler)) != series[-1][1:]:
+                series.append([rt.now, *now])
+            return out
+
+        return stepped
+
+    for name in STEP_METHODS:
+        if hasattr(engine_core, name):
+            setattr(engine_core, name, sampled(getattr(engine_core, name)))
+    return series
+
+
+def _in_force_from(series: list, t: float) -> list:
+    """`series`' samples from the one in force at `t`, the last at or before
+    it, on."""
+    return [s for s in series if s[0] <= t][-1:] + [s for s in series if s[0] > t]
+
+
 def _block_file(now: Path) -> Path:
     """Where the engine whose clock file is `now` publishes its planned KV block
     and the state slot and staging row a transfer moves (`publish_transfer`)."""
@@ -2990,7 +3038,8 @@ def engine_loop(engine_core):
     seconds unless one died. A dead worker reaches the engine as a bare
     `SystemExit`, so its ``ended:`` reason carries what each worker rank wrote
     it raised. Under ``step_grid`` the workers are asked for the bundle
-    before the loop, so a run that ends early still hands it in.
+    before the loop, so a run that ends early still hands it in. In a run the
+    engine hands in ``hit_counters`` too (`_sample_hit_counters`).
 
     In a run the engine ignores SIGTERM until it has handed in: ATOM's handler
     would stop the workers inside a clock call, before they say what their
@@ -3022,6 +3071,8 @@ def engine_loop(engine_core):
             bundle = workers.call_func("step_grid_bundle", wait_out=True)
             sections["step_grid"] = bundle
         if run is not None:
+            if (series := _sample_hit_counters(engine_core)) is not None:
+                sections["hit_counters"] = series
             clock.installed().client_run_ended = lambda k: _engine_hand_in(
                 run, engine_core, sections, k
             )
@@ -3170,7 +3221,8 @@ def _write_summary(run: dict, a: _RecordingAuthority, ended: bool = False) -> No
 
 def _write_client_run(run: dict, a: _RecordingAuthority, k: int, hand_ins=None):
     """Write client run `k`'s summary from the hand-ins at its end, those in its
-    directory unless given, less those at client run ``k - 1``'s end."""
+    directory unless given, less those at client run ``k - 1``'s end, and
+    under ``hit_counters`` each engine's from the sample in force at its start."""
     out = Path(run["out_dir"])
     here = out / CLIENT_DIR.format(k)
     if hand_ins is None:
@@ -3179,6 +3231,13 @@ def _write_client_run(run: dict, a: _RecordingAuthority, k: int, hand_ins=None):
     record = a.ended[k]
     summary = _summary(run, a, record, a.wall(k), hand_ins, since)
     summary["client_run"] = {"index": k, "start": record.start, "end": record.end}
+    hits = {
+        n: _in_force_from(h["hit_counters"], record.start)
+        for n, h in hand_ins.items()
+        if "hit_counters" in h
+    }
+    if hits:
+        summary["hit_counters"] = hits
     here.mkdir(exist_ok=True)
     _write_whole(here / SUMMARY_FILE, json.dumps(summary, sort_keys=True, indent=1))
 

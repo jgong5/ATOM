@@ -32,7 +32,9 @@ a gather's pad rows too, at the format the op quantizes its rows to, and read
 each activated expert once; a DP exchange's group width is read off its own
 shapes. ATOM's Triton experts run as aiter's grouped GEMMs, each priced so, at
 the activation format its kind names; their expert-parallel width is the run's
-`ep`, the experts `ep` times a rank's.
+`ep`, the experts `ep` times a rank's. On one rank a leaf's real rows are at
+most the view's tokens: the op-level backend hands a `ROUTED` leaf of a
+drafter's pass that does not run the step's tokens the view of its own rows.
 
 DeepSeek-V4.1's sparse attention and indexer scorers read their entries at the
 geometry their leaf states, over the queries the leaf holds (`_last`): a
@@ -950,6 +952,8 @@ EXTRACTORS |= {
 }
 #: Every kind whose extractor takes the EP width, as a fifth parameter.
 SHARDED = {n for n, f in EXTRACTORS.items() if len(inspect.signature(f).parameters) > 4}
+#: Every kind whose experts run the rows that route (`_routing`).
+ROUTED = {n for n, f in EXTRACTORS.items() if f is _fused_moe} | EXPERTS.keys()
 
 
 def work(

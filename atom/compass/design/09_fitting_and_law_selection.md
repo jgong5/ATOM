@@ -248,10 +248,22 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   of the window per target pass and the final's draft at +2.3%, where copy-stream copies
   ran past the window's last event; the capped gaps added none of a host-paced final's
   busy time ([#2072](https://github.com/jgong5/ATOM/issues/2072#issuecomment-6387348851)).
-- **Profiler check.** On each trace run, a law fitted on ordinary records prices the busy
-  time of the forwards no kernel of which waited on its launch, per kind and pass, so a
-  pass the profiler slows reads apart. On Run 4B, traced with Python stacks, the final's
-  draft read 9% over such a law, its target within 1%.
+- **Profiler check.** A measurement run by hand, which no fit, trace run or record
+  computes: a law fitted on ordinary records prices a trace run's busy time on the
+  forwards no kernel of which waited on its launch, per kind and pass, so a pass the
+  profiler slows reads apart. An ordinary record's prefill is cut `untraced`, so that law
+  is fitted on its windows, which hold the idle of the forwards the host paced. It is run
+  when the profiler setup, the machine or the model changes, or when a cell's prefill
+  grade misses; it refuses nothing, and that grade
+  ([#3028](https://github.com/jgong5/ATOM/issues/3028)) is the gate on trace-run prefill
+  labels ([Ruling](https://github.com/jgong5/ATOM/issues/3029#issuecomment-6849552961)). A
+  measurement names the windows its law was fitted on. On Run 4B, traced with Python
+  stacks, the final's draft read 9% over such a law, its target within 1%. On #2086's two
+  DeepSeek-V4.1-Flash DSpark5 TP2 trace runs on crsuse2-m2m-v3-005, a law fitted on the
+  ordinary records' windows less the host-paced ones priced the finals' after-event draft
+  12.9% under busy time at p50, their propose pass 9.2% under and their draft-KV pass 5.6%
+  under, their target 3.1% over and the middles within 0.5%
+  ([#2086](https://github.com/jgong5/ATOM/pull/2086#issuecomment-6707575848)).
 
 The R1 wait's exit, a host time at which a known device event has completed, anchors the
 host and device clocks to each other. With MTP the label splits at

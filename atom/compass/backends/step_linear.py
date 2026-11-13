@@ -126,7 +126,9 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
 `coefficients` names every feature of its kind, `step` for the intercept.
 `equal` holds each feature that was constant over the fit and the value a step
 must have; `facets` bound the remaining non-intercept features, in the order
-above, as `a . x + c <= 0` inside: the rows of qhull's `ConvexHull.equations`.
+above, as `a . x + c <= 0` inside: the rows of qhull's `ConvexHull.equations`,
+and two opposed rows holding each feature that was an affine function of
+another over the fit to it.
 """
 
 from __future__ import annotations

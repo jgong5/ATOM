@@ -23,11 +23,16 @@ phase or name none. A percentile interpolates linearly between ranks.
 - p90 interactivity, one over the p90 inter-token latency; p90 E2E-normalized
   interactivity, one over the p90 of each request's latency per output token;
 - GPU and CPU hit rates: the changes of `atom:prefix_cache_cached_tokens` and
-  of `atom:lmcache_loaded_tokens` across the profiling window, each over that
-  of `atom:prefix_cache_full_tokens`, summed over every series aiperf's
-  `artifacts/server_metrics_export.json` holds. A simulated run's client
-  scrapes no server metrics, so its hit rates have no value unless its
-  artifacts hold that export.
+  of `atom:lmcache_loaded_tokens` across aiperf's profiling window, each over
+  that of `atom:prefix_cache_full_tokens`, summed over every series aiperf's
+  `artifacts/server_metrics_export.json` holds; on a real `--agentx` run that
+  window starts at the scrape before warmup. A simulated run's client scrapes
+  no server metrics, so a simulated run's are the changes of the same counters
+  of its own engines, ATOM's `cached_tokens`, `loaded_tokens` and
+  `full_tokens`, summed over the series `client-0/summary.json` holds under
+  `hit_counters`: from each one's sample in force when the earliest record,
+  warmup's included, was sent, its `request_start_ns` on the Compass clock, to
+  its last. Without them a run's hit rates have no value.
 
 A judged metric of a simulated run passes at its point when its value lies
 inside the real runs' min-to-max band, or within `LIMITS` of their mean:
@@ -52,11 +57,14 @@ from pathlib import Path
 from statistics import fmean
 
 from atom.compass.backends.json_file import read_json, read_jsonl
-from atom.compass.run import OP_GRAPH, STEP_GRID, STEP_LINEAR
+from atom.compass.carriers import EPOCH_NS
+from atom.compass.run import CLIENT_DIR, OP_GRAPH, STEP_GRID, STEP_LINEAR, SUMMARY_FILE
 from atom.compass.validate.runs import CLIENT_RUN
 
 RECORDS = "artifacts/profile_export.jsonl"
 SERVER_METRICS = "artifacts/server_metrics_export.json"
+#: A simulated run's graded client run's summary.
+SUMMARY = f"{CLIENT_DIR.format(0)}/{SUMMARY_FILE}"
 ENGINE_RECORD = "steps/dp0.engine.json"
 SIMULATED = (STEP_LINEAR, STEP_GRID, OP_GRAPH)
 CONCURRENCY = "phases.profiling.concurrency"
@@ -146,12 +154,35 @@ def _counter(metrics: dict, stem: str) -> float | None:
     return total if found else None
 
 
-def metrics(run) -> dict:
-    """InferenceX's metrics of the run directory `run`, None where it has none."""
+def _hit_counters(run: Path, sent: list[dict]) -> list | None:
+    """The changes of a simulated run's cached, full and loaded tokens, summed
+    over its engines' `hit_counters`, from each one's sample in force at the
+    earliest send of the records `sent`, of any phase, to its last; None
+    without them."""
+    path = run / SUMMARY
+    series = (read_json(path).get("hit_counters") if path.is_file() else None) or {}
+    starts = [
+        int(t) for r in sent if (t := r.get("metadata", {}).get("request_start_ns"))
+    ]
+    if not series or not starts:
+        return None
+    opened = (min(starts) - EPOCH_NS) / 1e9
+    change = [0, 0, 0]
+    for samples in series.values():
+        if not (before := [s for s in samples if s[0] <= opened]):
+            return None
+        change = [c + b - a for c, a, b in zip(change, before[-1][1:], samples[-1][1:])]
+    return change
+
+
+def metrics(run, simulated: bool = False) -> dict:
+    """InferenceX's metrics of the run directory `run`, None where it has none;
+    the hit rates from its own counters when `simulated`."""
     run = Path(run)
+    sent = read_jsonl(run / RECORDS)
     rs = [
         r
-        for r in read_jsonl(run / RECORDS)
+        for r in sent
         if not r.get("error")
         and r.get("metadata", {}).get("benchmark_phase") in (None, "profiling")
     ]
@@ -174,9 +205,19 @@ def metrics(run) -> dict:
     duration = (max(ends) - min(starts)) / 1e9 if starts and ends else 0
     engine = read_json(run / ENGINE_RECORD)
     gpus = engine["tensor_parallel_size"] * (engine.get("data_parallel_size") or 1)
-    path = run / SERVER_METRICS
-    server = (read_json(path).get("metrics") if path.is_file() else None) or {}
-    full = _counter(server, "prefix_cache_full_tokens")
+    if simulated:
+        gpu, full, cpu = _hit_counters(run, sent) or (None, None, None)
+    else:
+        path = run / SERVER_METRICS
+        server = (read_json(path).get("metrics") if path.is_file() else None) or {}
+        gpu, full, cpu = (
+            _counter(server, k)
+            for k in (
+                "prefix_cache_cached_tokens",
+                "prefix_cache_full_tokens",
+                "lmcache_loaded_tokens",
+            )
+        )
     return {
         "concurrency": read_json(run / CLIENT_RUN)["arguments"][CONCURRENCY],
         "throughput per GPU": (
@@ -186,8 +227,8 @@ def metrics(run) -> dict:
         "p90 E2E-normalized interactivity": _inverse(percentile(per_token, 90)),
         "p90 TTFT": percentile(ttft, 90),
         "median TPOT": percentile(itl, 50),
-        "GPU hit rate": _rate(_counter(server, "prefix_cache_cached_tokens"), full),
-        "CPU hit rate": _rate(_counter(server, "lmcache_loaded_tokens"), full),
+        "GPU hit rate": _rate(gpu, full),
+        "CPU hit rate": _rate(cpu, full),
     }
 
 
@@ -212,7 +253,7 @@ def point(directory) -> dict:
             f"{directory}'s runs were given different client arguments: {odd}"
         )
     return {"real": {r.name: metrics(r) for r in real}} | {
-        s.name: metrics(s) for s in simulated
+        s.name: metrics(s, simulated=True) for s in simulated
     }
 
 

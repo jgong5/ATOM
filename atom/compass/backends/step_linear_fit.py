@@ -90,7 +90,8 @@ adopts features as columns on their held-out error per launch path
 The same solver fits the host entry's ``tokenizer`` term on a recorded
 server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
 HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
-requests, ``fixed_s`` from a burst, and ``bytes`` over every request's body.
+requests, ``fixed_s`` from a burst or else ``idle_s``, and ``bytes`` over every
+request's body.
 
 Each equation is divided by its own label and the coefficients are bound to be
 non-negative. Steps whose relative residual is more than `MAD_K` scaled MADs
@@ -669,8 +670,9 @@ def fit_intake(paths) -> tuple[dict, dict]:
     host-law solver on the lone requests' CPU seconds over their body bytes;
     ``bytes`` spans every request's body; ``fixed_s`` the loop's CPU time per
     request between template starts in the longest burst, less ``per_byte_s``
-    times its mean body, each gap the next request's. Raises on too few lone
-    requests or no burst."""
+    times its mean body, each gap the next request's, or ``idle_s`` where that
+    is negative or there is no burst, the report's ``fixed_s_is_idle_s`` saying
+    which. Raises on too few lone requests."""
     lone, bursts, bodies = [], [], []
     for path in paths:
         got = _intakes(path)
@@ -680,21 +682,25 @@ def fit_intake(paths) -> tuple[dict, dict]:
     nbytes, seconds = np.array(lone, dtype=np.float64).reshape(-1, 2).T
     x = np.column_stack([np.ones(len(nbytes)), nbytes])
     (idle, per_byte), report = _host_law(x, seconds, INTAKE_FEATURES)
+    term = {"per_byte_s": per_byte, "idle_s": idle, "bytes": [min(bodies), max(bodies)]}
     if not bursts:
-        raise ValueError(f"no burst among {len(lone)} lone requests")
+        report["fixed_s_is_idle_s"] = f"no burst among {len(lone)} lone requests"
+        return {"fixed_s": idle, **term}, report
     sizes, starts, cpu = np.array(max(bursts, key=len), dtype=np.float64).T
-    fixed = np.diff(cpu).mean() * 1e-9 - per_byte * sizes[1:].mean()
+    gap, body = np.diff(cpu).mean() * 1e-9, sizes[1:].mean()
+    fixed = gap - per_byte * body
+    if fixed < 0:
+        report["fixed_s_is_idle_s"] = (
+            f"the longest burst's {len(sizes) - 1} later requests take {gap:.3g} s "
+            f"of the loop's CPU each, less than per_byte_s {per_byte:.3g} times "
+            f"their mean body of {body:.0f} B, so fixed_s would be {fixed:.3g} s"
+        )
+        return {"fixed_s": idle, **term}, report
     report["burst"] = {
         "requests": len(sizes),
         "span_s": (starts[-1] - starts[0]) * 1e-9,
     }
-    term = {
-        "fixed_s": fixed,
-        "per_byte_s": per_byte,
-        "idle_s": idle,
-        "bytes": [min(bodies), max(bodies)],
-    }
-    return term, report
+    return {"fixed_s": fixed, **term}, report
 
 
 #: The host entry's ``hops`` `fit_hops` fits (`atom.compass.run.HOPS`).
@@ -1209,8 +1215,9 @@ def _held_out_error(folds: dict) -> float | None:
 
 
 def _moe_column(steps, routing) -> tuple:
-    """The vector decode rung `steps` adopts with a MoE column, or None, and the
-    figures the rule read, as the vector records them under `fit.moe_column`.
+    """The vector decode rung `steps` adopts with a MoE column, or None, the
+    figures the rule read, as the vector records them under `fit.moe_column`,
+    and the held-out folds of the form adopted, a column or none.
 
     `steps` are the rung's steps, each its ranks' `fit` rows. The forms are no
     column and each of `MOE_COLUMNS` over the steps' real MoE tokens,
@@ -1240,14 +1247,16 @@ def _moe_column(steps, routing) -> tuple:
             for form in forms
         },
     }
-    return (None if adopted is None else forms[adopted]), figures
+    vector = None if adopted is None else forms[adopted]
+    return vector, figures, held[adopted or "none"]
 
 
-def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing):
+def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing, folds):
     """The `rowmod(k)` column decode rung `rung` adopts, or None.
 
     `steps` are the rung's steps, each its ranks' `fit` rows, `vector` the
-    rung's form without the column and `base` its `_fit_vector`.
+    rung's form without the column, `base` its `_fit_vector` and `folds` its
+    `_max_affine_folds`, fitted here when None.
     `k` runs over the powers of two up to the rung. A `k` qualifies when its
     fit cuts `base`'s scaled MAD by `ROWMOD_GAIN`, the mean MAD of the same
     fit over `ROWMOD_SHUFFLES` shuffles of each rank's rows, by `seed`, does
@@ -1276,16 +1285,18 @@ def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing):
             mads.append(_fit_vector(moved, wide(k), routing)["mad"])
         return float(np.mean(mads))
 
-    def p50(v):
-        return [p for _, p in _max_affine_folds(steps, v, routing).values()]
+    def p50(folds):
+        return [p for _, p in folds.values()]
 
-    without, best, k = p50(vector), None, 2
+    if folds is None:
+        folds = _max_affine_folds(steps, vector, routing)
+    without, best, k = p50(folds), None, 2
     target = (1.0 - ROWMOD_GAIN) * base["mad"]
     while k <= rung:
         solved = _fit_vector(steps, wide(k), routing)
         if solved["mad"] < min(target, best[1]["mad"] if best else target):
             shuffled = shuffled_mad(k)
-            held = p50(wide(k))
+            held = p50(_max_affine_folds(steps, wide(k), routing))
             if shuffled >= target and all(
                 abs(w) <= abs(o) for w, o in zip(held, without)
             ):
@@ -1301,11 +1312,13 @@ def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing):
     return best
 
 
-def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
+def _hull(points: np.ndarray, names: tuple[str, ...], affine: bool = True) -> dict:
     """`StepLinearLaw`'s hull over the non-intercept features of the fitted steps.
     qhull's precision checks depend on the order the points come in: where it
     refuses them, it hulls their distinct points in sorted order, the same hull.
-    A set that spans none still raises."""
+    A set that spans none still raises. A feature affine in an earlier one on
+    the set is held to it by two opposed facets, as a constant one is by
+    `equal`, unless `affine` is false: then qhull refuses that flat set."""
     from scipy.spatial import ConvexHull, QhullError
 
     equal = {
@@ -1321,10 +1334,26 @@ def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
     elif vary:
         # Hulled in the unit box, where qhull's tolerances suit every feature.
         unit = (x - lo) / (hi - lo)
-        try:
-            eq = ConvexHull(unit).equations
-        except QhullError:
-            eq = ConvexHull(np.unique(unit, axis=0)).equations
+        mirror = (hi - x) / (hi - lo)  # an affine feature equals another's unit or this
+        tied = {}  # a feature: the earlier one it is held to, and the sign
+        for i, j in itertools.combinations(range(len(vary)), 2) if affine else ():
+            for sign, other in ((1.0, unit), (-1.0, mirror)):
+                if j not in tied and np.array_equal(unit[:, j], other[:, i]):
+                    tied[j] = (i, sign)
+        free = [j for j in range(len(vary)) if j not in tied]
+        if len(free) == 1:
+            hulled = np.array([[-1.0, 0.0], [1.0, -1.0]])
+        else:
+            try:
+                hulled = ConvexHull(unit[:, free]).equations
+            except QhullError:
+                hulled = ConvexHull(np.unique(unit[:, free], axis=0)).equations
+        eq = np.zeros((len(hulled), len(vary) + 1))
+        eq[:, free], eq[:, -1] = hulled[:, :-1], hulled[:, -1]
+        for j, (i, sign) in tied.items():  # u_j = u_i, or u_j = 1 - u_i
+            tie = np.zeros(len(vary) + 1)
+            tie[[j, i, -1]] = np.array([1.0, -sign, min(sign, 0.0)]) / 2**0.5
+            eq = np.vstack([eq, tie, -tie])
         normals = eq[:, :-1] / (hi - lo)
         facets = np.column_stack([normals, eq[:, -1] - normals @ lo]).tolist()
     else:
@@ -1509,14 +1538,14 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             )
         else:
             solved = _fit_steps(steps, names, lambda r: r[2])
-        rowmod_k = figures = None
+        rowmod_k = figures = folds = None
         if key and key.isdigit():
             vector = {"coefficients": names}
             if routing:
-                chosen, figures = _moe_column(steps, routing)
+                chosen, figures, folds = _moe_column(steps, routing)
                 if chosen:
                     vector, solved = chosen, _fit_vector(steps, chosen, routing)
-            chosen = _rowmod(steps, int(key), vector, solved, seed, routing)
+            chosen = _rowmod(steps, int(key), vector, solved, seed, routing, folds)
             if chosen:
                 rowmod_k, solved, evidence = chosen
             names = [*vector["coefficients"], *["rowmod"] * bool(rowmod_k)]

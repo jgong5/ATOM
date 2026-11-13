@@ -1084,7 +1084,9 @@ turn (agentx-harness `timing/trajectory_source.py`).
 - **One option differs, and it sends nothing to the model:** aiperf's server-metrics
   scrape, which `agentx` leaves on and InferenceX takes its hit rates from.
   `CompassAgenticReplay` refuses it, since D34 leaves how the scrape's process reaches the
-  clock undesigned; `08` D45.1 records what that leaves open for the hit rates.
+  clock undesigned. A real run scrapes (#3332), the option outside the hashed arguments so
+  both sides hash alike; a simulated run's hit rates are its engines' own counters across
+  the client run, warmup included, as aiperf's real export reads them (`08` D45.1).
 
 ### Open issues
 

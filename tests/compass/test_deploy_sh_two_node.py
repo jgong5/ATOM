@@ -56,7 +56,7 @@ def _gone(pid: int) -> bool:
     for _ in range(150):
         try:
             stat = Path(f"/proc/{pid}/stat").read_text()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):  # reaped before or mid-read
             return True
         if stat.rsplit(")", 1)[1].split()[0] == "Z":
             return True

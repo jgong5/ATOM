@@ -14,7 +14,6 @@ summary into its out_dir; the summary after a refused step is the one
 
 import dataclasses
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,7 +24,7 @@ from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_capture_v4_pro import CONFIG as V4_PRO
 from test_dp_step_max import runner
 from test_drive_runfile import build, price_list_key, published
-from test_drive_trace_steps import IDENTITY
+from test_drive_trace_steps import IDENTITY, plant_module
 from test_memory_readings import ASSUMED, DOCUMENT, READINGS
 from test_op_graph import BENT, GEMM, g, listed, pt
 from test_op_work_v4 import MORI
@@ -125,8 +124,7 @@ def refused_summary(directory, monkeypatch):
 def plant(tmp_path, monkeypatch, steps, summary) -> None:
     """Serve from the planted server, which writes the record `steps` and
     client run 0's summary `summary`."""
-    (tmp_path / "planted.py").write_text(PLANTED)
-    monkeypatch.setattr(serve, "SERVER", (sys.executable, str(tmp_path / "planted.py")))
+    plant_module(tmp_path, monkeypatch, PLANTED)
     monkeypatch.setattr(serve, "identity", lambda *args: IDENTITY)
     monkeypatch.setenv("PLANTED_RECORD", str(steps))
     monkeypatch.setenv("PLANTED_SUMMARY", str(summary))

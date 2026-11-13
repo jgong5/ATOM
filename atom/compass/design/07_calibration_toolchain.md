@@ -444,9 +444,7 @@ no rank pausing (`09` D54).
 `atom/compass/parity/busy.py` reduces its traces to each forward's busy time per pass,
 which labels prefill (`09` D54); its decodes and host segments are profiled and label
 nothing. On every rank the recorder marks where a forward's target ends and where each
-drafter pass runs with profiler ranges, opened only while the profiler runs. Every
-trace run carries `09`'s
-profiler check.
+drafter pass runs with profiler ranges, opened only while the profiler runs.
 
 **Revised 2026-10-18 by the owner's ruling on
 [#1489](https://github.com/jgong5/ATOM/issues/1489):** Phase 1c produces nothing the
@@ -515,7 +513,10 @@ a GIL wait
   Its `recv` stretches stay in: the transport parses the request's own body as the read
   awaits it, and on a loaded loop serves other streams there too
   ([#2919](https://github.com/jgong5/ATOM/issues/2919)). `fixed_s` is the loop's CPU time per
-  request in the records' longest burst of served bodies, at that `per_byte_s`. No first-turn cell is recorded: cc-traces sessions
+  request in the records' longest burst of served bodies, at that `per_byte_s`. With no
+  burst, or one whose requests take less of the loop than that `per_byte_s` charges their
+  bodies, which would leave `fixed_s` negative, `fixed_s` is `idle_s` and the report says
+  why ([#3368](https://github.com/jgong5/ATOM/issues/3368), [#3384](https://github.com/jgong5/ATOM/issues/3384)). No first-turn cell is recorded: cc-traces sessions
   begin mid-conversation, so the longest burst is a client run's start. A burst alone would
   underprice later turns: on mi355-gpu-40 a V4.1-Flash
   first-turn body takes 5.64 to 5.80 ns a byte to parse and template, and the c=16 cell's
