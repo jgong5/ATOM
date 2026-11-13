@@ -34,8 +34,8 @@ no calibration, fitting, reuse judgement or version management, and reaches prof
 comes first, and no skill: `scripts/compass/ADVICE.md`, linked both ways with
 `QUICKSTART.md` and #2893's page, gives each step one command and its expected output and
 states D108's limits, exact enough for an agent. An agent shows the user a printed
-calibration's GPU time, starts it in the background only on the user's yes, and reruns
-`compass advice` later rather than waiting.
+calibration's GPU time, starts it in the background only on the user's yes, reruns
+`compass advice` later rather than waiting, and adds no judgement of its own.
 
 **Reason.** A calibration spends GPU hours and a search CPU minutes: apart, each half is
 built and replaced alone, and a rerun takes up whatever calibration has finished; a guide
@@ -158,9 +158,9 @@ is stated in the run's provenance.
    later source change measured again until #2311 settles who judges "moves step costs".
    Failing: *calibrate*.
 3. **Enough coverage**: the law's calibrated range holds the batch shapes the search
-   needs, a vector for every decode rung of the capture ladder included, judged by a
-   pre-run coverage check for step linear laws beside `run --coverage`'s for the step
-   grid and the op graph. Failing: *calibrate*, the missing shapes and rungs listed.
+   needs, a vector for every decode rung of the capture ladder included, judged by
+   `compass run --coverage`, which gains a step linear check beside the step grid's and
+   the op graph's. Failing: *calibrate*, the missing shapes and rungs listed.
 4. **Accurate enough**: the law's held-out error is within the acceptance targets (T114).
    Failing: *calibrate*.
 
@@ -354,7 +354,8 @@ and #2683 Rulings.
   the space file, no search, profiling or view code branching on it; whatever MiniMax-M3
   forces to change is filed as a defect; an op-family split only where the op-level
   backend prices the cell (#3126 records MiniMax-M3's sparse layers as missing at op
-  level).
+  level). Its CPU time, the machine stated, is set against an InferenceX-style sweep's GPU
+  time, 3600 s a point plus the measured start cost.
 - **The showcase validation**, an `08` D50 set registered and frozen before it runs: at
   the recommended point's concurrency, the recommended configuration and the runner-up
   (D110) each run real three times on the development nodes, spaced (`08` D45), 3600 s
