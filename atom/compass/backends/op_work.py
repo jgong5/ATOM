@@ -25,13 +25,13 @@ the tensor-parallel group unless the leaf states its group size. A kind with
 no extractor, or a leaf its extractor cannot price, is refused by name.
 
 DeepSeek-V4's MoE takes the step roofline's expectation under independent
-uniform routing: the routed experts run the rows the leaf holds but a gather's
-pad rows, under expert parallelism the busiest rank's expected share, at the
-format the op quantizes its rows to, and read each activated expert once; a DP
-exchange's group width is read off its own shapes. ATOM's Triton experts run
-as aiter's grouped GEMMs, each priced so, at the activation format its kind
-names; their expert-parallel width is the run's `ep`, the experts `ep` times a
-rank's.
+uniform routing: the routed experts run the rows the leaf holds but its pad
+rows, a gather's or a graph's, under expert parallelism the busiest rank's
+expected share, at the format the op quantizes its rows to, and read each
+activated expert once; a DP exchange's group width is read off its own
+shapes. ATOM's Triton experts run as aiter's grouped GEMMs, each priced so, at
+the activation format its kind names; their expert-parallel width is the run's
+`ep`, the experts `ep` times a rank's.
 
 DeepSeek-V4.1's sparse attention and indexer scorers read their entries at the
 geometry their leaf states, over the queries the leaf holds (`_last`): a
@@ -270,10 +270,11 @@ def _dp_exchange(op, view, tp, kv) -> Work:
 
 
 def _routing(view, tokens, k, experts, ranks):
-    """The routes and activated experts of `tokens` rows, those a DP gather
-    routes (`routing_rows`) each routed to `k` of `experts` spread over
-    `ranks`, an expectation under uniform routing: the busiest rank's expected
-    share under expert parallelism."""
+    """The routes and activated experts of `tokens` rows, those that route
+    (`routing_rows`: a DP gather's real rows, one rank's own tokens) each
+    routed to `k` of `experts` spread over `ranks`, an expectation under
+    uniform routing: the busiest rank's expected share under expert
+    parallelism."""
     real, distinct = routing_rows(view, tokens)
     groups = activated_experts(experts, k, distinct)
     if ranks == 1:

@@ -86,7 +86,7 @@ def test_a_prefill_step_up_projects_each_context_by_hand(spec):
 
 
 @BOUND
-def test_a_fused_shared_expert_takes_every_row_by_hand(spec):
+def test_a_fused_shared_expert_takes_every_row_the_experts_run_by_hand(spec):
     group = Module("experts", "moe", EP_OFF + (1,), "fp4", ranks=2)
     deferred = Module("experts", "moe", EP_OFF[:6] + (1, 0, 816, 1), "fp4")
     # The gathered 10 rows each reach 2 routed experts and the shared one,
@@ -100,10 +100,10 @@ def test_a_fused_shared_expert_takes_every_row_by_hand(spec):
         _module(experts, spec) + gather + scatter
     )
     # One data-parallel rank whose block leaves the reduce to the next norm:
-    # its graph's 8 rows, 3 decode tokens and the pad reaching 2 routed
-    # experts each, every row the shared one, and no all-reduce.
-    hit = activated_experts(8, 2, 4) + 1
-    experts = Work({"bf16": 2 * 24 * (32 + 16) * 32}, hit * 816 + 8 * (128 + 24))
+    # of its graph's 8 rows, its 3 decode tokens alone reach 2 routed experts
+    # each and the shared one, a pad row none, and no all-reduce.
+    hit = activated_experts(8, 2, 3) + 1
+    experts = Work({"bf16": 2 * 9 * (32 + 16) * 32}, hit * 816 + 3 * (128 + 24))
     one = BatchView((RequestShape(1, 4, True),) * 3, capture_rung=8)
     assert _price([deferred], one, spec)["roofline.moe"] == pytest.approx(
         _module(experts, spec)
