@@ -30,8 +30,9 @@ one answer.
 
 A family's dimensions are the shape's counts its masked integers follow, a
 decode's B always, at its T where it states one (a drafter's own leaves at the
-rows they ran, the step padded to B), the rows its MoE gathers, ``G``, when the
-shape states them
+rows they ran, the step padded to B), the rows its MoE gathers, ``G``, where
+every point states them and its masked integers follow them: a leaf that does
+not read them, as attention does not, is read at any ``G``
 (a shape that states no ``G`` gathers every rank's T, and is another family), and,
 for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
@@ -276,7 +277,7 @@ def fit(points) -> dict:
         follows = {
             k
             for i in free_of[skel]
-            for k in ("T", "B")
+            for k in ("T", "B", "G")
             if all(any(v[i] - n.get(k, -9) in (0, 1) for n in ns) for v, ns in each)
         }
         ragged = {
@@ -297,7 +298,7 @@ def fit(points) -> dict:
                 dims = [d for d in ("T", "B") if d in follows or moves]
                 if "B" not in dims and dependent.get(("rows", p["op"]), False):
                     dims.append("B")
-            dims += ["G"] if "G" in at_p else []
+            dims += ["G"] if "G" in follows else []
             if moves and "T" not in at_p:  # a decode point, read at its mean too
                 # a uniform point whose rows the KV pool cut holds a mean its
                 # context does not name: a family with ragged points leaves it out
