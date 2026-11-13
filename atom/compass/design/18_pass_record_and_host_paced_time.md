@@ -54,7 +54,7 @@ without a drafter runs the target alone.
 | every model | `target` | `d_target_ns` | `ModelRunner.run_model`, then on an output forward `ModelRunner.postprocess` up to `forward_done_event` | no | entry |
 | block, serial | `draft_kv` | `d_draft_kv_ns` | `Drafter.compute_draft_kv`, which `ModelRunner.forward` calls once `run_model` returns | no | entry |
 | block | `propose` | `d_propose_ns` | `ModelRunner.propose_draft_token_ids`, up to its draft copy wait | no | exit |
-| serial | `propose` | `d_propose_ns`, up to the first draft step | `ModelRunner.propose_draft_token_ids`, up to `EagleProposer.propose`'s first draft step | no | exit |
+| serial | `propose` | `d_propose_ns` less the summed `d_draft_passes_ns` | `ModelRunner.propose_draft_token_ids`, up to `EagleProposer.propose`'s first draft step | no | exit |
 | serial | `draft_step` | `d_draft_passes_ns` | `EagleProposer.propose`, one step from its `_publish_draft_shape` call to the next step's, the last up to the draft copy wait | yes | exit |
 
 An **entry** pass is enqueued before the forward reads its tokens, so the recurrence
@@ -92,7 +92,10 @@ Where the events sit:
   (`recv_draft_token_ids`, `t_draft_recv_ns`). The wait is for the previous forward's
   draft copy (`tokenIDProcessor.prepare_draft_ids`); this pass's device work is all on
   the stream before it, so its end event moves there from the call's return. A forward
-  that reaches no such wait ends it at the call's return.
+  that reaches no such wait ends it at the call's return. `d_propose_ns` keeps the
+  whole draft under every flavor; under the serial flavor the `propose` pass ends at
+  the first draft step's start, and its label is `d_propose_ns` less the summed
+  `d_draft_passes_ns`, as `step_linear_fit` derives that prologue today (`_rest`).
 - `draft_step`: at each `_publish_draft_shape` entry (`StepRecording._serial_pass`),
   under every serial flavor; today the recorder times them under EAGLE3 alone.
 
@@ -174,6 +177,15 @@ counts the call under `blocked` only where the device had not finished. A device
 context synchronize, a synchronous copy and a free count always. `blocked_ns`, which
 `W_launch` subtracts, keeps every call's time as today.
 
+Under the mono DSpark flavor this excludes every output forward's `target`, `draft_kv`
+and `propose`: `V4MonoSession.write_draft_context`, inside the draft-KV call, reads the
+request segments to the host (`cu_seqlens.tolist()`), a synchronization its bring-up
+pays on purpose, and `consume_draft_context` and `forward_draft_block`, inside the
+propose call, read anchors the same way. Each read waits for the target's graph, after
+which the device idles while the host queues the rest, so the windows hold host time.
+Those passes take labels once ATOM drops the reads, an ATOM change filed under
+`atom-issue` like any wait in a launch ([principle 9](README.md#design-principles)).
+
 #### Settled: the draft-KV pass and the sampler
 
 The ruling's open point. `ModelRunner.forward` calls `Drafter.compute_draft_kv` once
@@ -223,12 +235,24 @@ Per pass:
 | `draft_kv`, middle chunk; `propose` | exit | exit | `max(target_end, exit)` | start + `D` |
 | `draft_step` | exit | exit | the previous pass's end | start + `D` |
 
-The simulated runner takes the target's kind from the `ForwardMode` it settles, as ATOM
-does: single where `run_model` replays a request graph (`use_cudagraph`, not under a
-token-graph decode), multi otherwise. A drafter pass starts at or after the exit, so its
-kind moves nothing there: the serial steps sum to the draft's `D`, and the draft starts
-no earlier than the exit as `01` D4 rules
-([#2917](https://github.com/jgong5/ATOM/issues/2917)).
+**The target's kind is predicted, and a fit checks it.** A simulated run counts no
+launch, so the target's kind comes from the step's view, by the model's launch provider
+(`backends.launch_features`), as the provider predicts its launch features. By default a
+step is single where its view replays a request graph (`capture_rung` set) and the
+record's graph sets (`parity.recorded_graphs`) hold no decode token-graph bucket, which
+a token-graph decode records; multi otherwise. A model whose request graph runs
+otherwise states it in its provider: DeepSeek-V4's mono request graph
+(`deepseek_v4/mono/engine.py`, its graph's `replay`) runs `engine.session.forward`
+eagerly, or one graph per lane, where `V4MonoEngine.prepare_step` settles `use_graph`
+false on host state no view carries. On a record with the pass record, a fit refuses a
+step whose counted kind differs from the predicted one, naming the step and both kinds,
+as `step_linear_fit.fit_host` refuses a step whose launch features differ from `predict`.
+So no step is labelled multi and charged single, nor started after a `W_graph` no record
+measured.
+
+A drafter pass starts at or after the exit, so its kind moves nothing there: the serial
+steps sum to the draft's `D`, and the draft starts no earlier than the exit as `01` D4
+rules ([#2917](https://github.com/jgong5/ATOM/issues/2917)).
 
 Against today's recurrence, a single target starts `W_graph` later, a multi target ends
 no earlier than its launch end, and the check stops feeding an MTP decode's `d_gap_ns`
@@ -258,17 +282,24 @@ A record without the pass record keeps every law fitted on it valid:
 - **`target`**: its kind from `rung`, single where it is set; `E = h0`, the launch's
   entry, single or multi; `L` the same when single, and when multi the token copy wait's
   entry, or `run_model`'s return on a forward that reads none. `d1` is `d_target_ns`'s
-  end, or on a plain record `d_busy_ns`'s, at the exit event. G reads `blocked_ns`,
-  which spans the same call. Host laws fitted on such records carry no `W_graph`.
+  end, or on a plain record `d_busy_ns`'s, at the exit event. Host laws fitted on such
+  records carry no `W_graph`.
+- **G** reads `blocked_ns`, which spans the `target`'s call but sums every hooked call,
+  whether it waited or found its work done. So on an old record G counts only the calls
+  that count always: device and context synchronizes, synchronous copies and frees. An
+  event or stream synchronize there stays uncounted, as it would where its query found
+  the device done, and G's report gives their count and time per record.
 - **`draft_kv`**: its window `d_draft_kv_ns`, standing with the target's.
 - **`propose`**: multi, `L = t_draft_recv_ns[0]`, `F` the target's end with its draft-KV
   pass (`start + d_target_ns + d_draft_kv_ns`). The rule is then `host_paced_drafts`.
 - **`draft_step`**: no host stamps; each stands or falls with its `propose`, as today.
 
-`rung` is also set on a token-graph decode, which no record states, so an old record
-of an engine run under TR_HYBRID reads its decodes single; a record with the pass
-record reads the launch count instead. Each law's provenance names the `E` its labels
-took (`launch` or `graph`), and a fit given records of both kinds refuses, naming them.
+An old record's kind is the default prediction, with no count to check it: `rung` is
+also set on a token-graph decode, and an old record states its graph sets only under a
+provider that declares launch features, so one run under TR_HYBRID reads its decodes
+single; a record with the pass record has its count checked. Each law's provenance
+names the `E` its labels took (`launch` or `graph`), and a fit given records of both
+kinds refuses, naming them.
 
 ### Assumptions and their report items
 
@@ -282,7 +313,7 @@ The fit's report gives each per record and pass.
 | D | A multi pass the host paced ends by `max(start + D, L')`. | On each multi pass the rule excludes: `d1 + lead - L'`, how far past the host's boundary its device ended, p50 and p90. |
 | E | A trace's graph-internal gaps are worth the cap. | Per trace run and pass: the gaps inside a graph launch opened before it returned, their count and their sum whole and at the cap, as shares of the pass's busy time. |
 | F | A trace labels prefill only, its profiler error small there. | `09`'s profiler check, per pass, on prefill. |
-| G | A call that waits on the device excludes its pass. | The share G excludes, the APIs that waited, and their time p50 and p90. |
+| G | A call that waits on the device excludes its pass. | The share G excludes, the APIs that waited, and their time p50 and p90; on an old record, the event and stream synchronizes it left uncounted. |
 
 Beside them, the **excluded share**: per record and pass, steps, single, multi,
 labelled, excluded by `F < L` and by G, on MTP and plain records.
@@ -301,8 +332,9 @@ recurrence's.
 | `draft_kv`, output forward (empty under serial) | multi in every flavor today | entry, inside `target` | its call's `h0` | its call's `h1` | its window, standing with the `target`'s | inside `D_target` |
 | `draft_kv`, middle chunk | multi | entry, whose next boundary is the exit | — | — | trace busy, the draft's | `max(target_end, exit)` |
 | sampler | the `target`'s tail | entry | — | — | in the `target`'s | inside `D_target` |
-| `propose`, block, replayed (`DraftGraph.run`; the mono session's registered capture) | single | exit | `g.entry` | `g.entry` | `d1 - max(F, E)`, `F` its start event | `max(target_end, exit)` |
-| `propose`, block, eager (no graph at its batch; mono with none registered) | multi | exit | its `h0` | the draft copy wait's entry | `d1 - F` if `F >= L`, else excluded | `max(target_end, exit)` |
+| `propose`, block, replayed (`DraftGraph.run`) | single | exit | `g.entry` | `g.entry` | `d1 - max(F, E)`, `F` its start event | `max(target_end, exit)` |
+| `propose`, block, eager (no graph at its batch) | multi | exit | its `h0` | the draft copy wait's entry | `d1 - F` if `F >= L`, else excluded | `max(target_end, exit)` |
+| `propose`, block, mono (`MonoDSparkProposer`) | by its launches | exit | as its kind | as its kind | excluded by G on every step, as are the output forward's `target` and `draft_kv` (*Settled: G*) | `max(target_end, exit)` |
 | `propose`, serial, to the first step | multi | exit | its `h0` | step 0's `h0` | the same | `max(target_end, exit)` |
 | `draft_step` 0, serial (the draft model, eager, over the target's stream) | multi | exit | its `h0` | step 1's `h0`, or the draft copy wait's entry | the same | the previous pass's end |
 | `draft_step` 1 on, serial | single where `DraftGraph.run` replays, else multi | exit | `g.entry`, else its `h0` | `g.entry`, else the next `h0` or the draft copy wait's entry | by its kind | the previous pass's end |
@@ -333,14 +365,19 @@ What `plan` cuts. Old records stay labelled, by their rule, at every step.
    entry and return, and queries before a synchronize (G); `parity/blocked.py` reads
    them; `parity.StepRecording` writes the pass record per registered pass, records the
    target's end on every output forward, moves the `propose` end event to the draft copy
-   wait, and stamps draft steps under every serial flavor; `parity/README.md`. One GPU
-   session: the overhead against a record without it, then new records of #2072's and
-   #2415's DeepSeek-V4.1-Flash DSpark TP2 recipes, mono on and off, and of one without
-   a drafter, which every later item's named result reads.
+   wait, and stamps draft steps under every serial flavor; `parity._record` writes the
+   graph sets (`recorded_graphs`) on every record, not only under a provider that
+   declares launch features; `parity/README.md`. One GPU session: the overhead against
+   a record without it, then new records of #2072's and #2415's DeepSeek-V4.1-Flash
+   DSpark TP2 recipes, mono on and off, of
+   [#3256](https://github.com/jgong5/ATOM/issues/3256)'s MiniMax-M3 EAGLE3 recipe for
+   the serial flavor, and of one without a drafter, which every later item's named
+   result reads.
 3. **The labels**: `step_labels` applies *The rule* with one lead and reads old records
-   by theirs; `step_linear_fit` reports *Assumptions and their report items* and the
-   excluded share, and refuses a fit mixing old and new records. CPU only, on item 2's
-   records.
+   by theirs; `launch_features` predicts the target's kind; `step_linear_fit` reports
+   *Assumptions and their report items* and the excluded share, and refuses a fit mixing
+   old and new records or holding a step whose counted kind differs from the predicted
+   one. CPU only, on item 2's records.
 4. **Trace runs**: `parity.busy` iterates the registry's passes and takes #3312's cap,
    folding #3312 in; it reports E. CPU only.
 5. **The recurrence and the host laws**: `step_linear_fit.fit_host` fits `W_graph`;
@@ -359,4 +396,4 @@ Items 2 to 5 follow item 1; items 3 and 5 read item 2's records for their named 
 
 | # | Decision | Date |
 |---|---|---|
-| D107 | Every device label and the recurrence count each host-paced wait once, by one rule over one record per pass. A Compass registry lists per drafter flavor each pass's line key, enqueuing method, per-step flag and anchor (entry or exit). The record gives each pass its host call's `h0` and `h1` at its events, its graph launches (a count, the last's entry and return) and its device events. A call of one graph launch is single, `E = L = g.entry`; any other is multi, `E, L = h0, h1`; `F` the device end before it. The label is `d1 - max(F, E)` when single or `F >= L`, else excluded, and a call that waited on the device excludes its pass; a single pass reports its in-call wait bound. The sampler is the target's tail; on an output forward the draft-KV pass sits inside the target, standing with it; on a middle chunk it is the draft's first pass. One lead, the launch bound moved along the tightest upper bounds. The recurrence ends each pass at `max(max(prev_end, E') + D, L')`, adding `W_graph`; trace runs label prefill only, per kernel, graph-internal gaps before the launch's return at #3312's cap; old records keep their rule. Assumptions A to G each carry a report item. | 2026-11-13 ([#2986](https://github.com/jgong5/ATOM/issues/2986#issuecomment-6841897073)) |
+| D107 | Every device label and the recurrence count each host-paced wait once, by one rule over one record per pass. A Compass registry lists per drafter flavor each pass's line key, enqueuing method, per-step flag and anchor (entry or exit). The record gives each pass its host call's `h0` and `h1` at its events, its graph launches (a count, the last's entry and return) and its device events. A call of one graph launch is single, `E = L = g.entry`; any other is multi, `E, L = h0, h1`; `F` the device end before it. The label is `d1 - max(F, E)` when single or `F >= L`, else excluded, and a call that waited on the device excludes its pass; a single pass reports its in-call wait bound. The target's kind is predicted from the step's view by the model's launch provider, and a fit refuses a step whose counted kind differs; on an old record G counts only the calls that always wait. The sampler is the target's tail; on an output forward the draft-KV pass sits inside the target, standing with it; on a middle chunk it is the draft's first pass. One lead, the launch bound moved along the tightest upper bounds. The recurrence ends each pass at `max(max(prev_end, E') + D, L')`, adding `W_graph`; trace runs label prefill only, per kernel, graph-internal gaps before the launch's return at #3312's cap; old records keep their rule. Assumptions A to G each carry a report item. | 2026-11-13 ([#2986](https://github.com/jgong5/ATOM/issues/2986#issuecomment-6841897073)) |

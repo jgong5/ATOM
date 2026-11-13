@@ -180,9 +180,11 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       or estimated                                  |
   |                       Cost IR: Seq/Repeat/Par, opaque leaves        |
   |                       fitting, law selection, hull guard            |
+  |                       pass registry, pass record, one label rule    |
+  |                       for host-paced device time                    |
   |                       spec-decode: draft/verify structures,         |
   |                       acceptance inputs, draft KV                   |
-  |                                       docs 02,03,04,09,10,14,17     |
+  |                                    docs 02,03,04,09,10,14,17,18     |
   +=====================================================================+
   |  L2  EXECUTION        CompassModelRunner (the seam)                 |
   |                       simulated KV connector                        |
