@@ -1030,6 +1030,15 @@ memory against that side's hand-in (`lp-engine-P.json`, `lp-engine-D.json`); end
 end once, from the deployment's export. The export names decode's response ids, so
 prefill's side is split through decode's `transfers.jsonl` (`parity.transfers`).
 
+## Curves and a verdict per point — `python -m atom.compass.validate --curves`
+
+`PYTHONPATH=$T python -m atom.compass.validate --curves OUT ARM...` reads each ARM's
+points, a directory per concurrency holding two or more `real*/` runs and a simulated run
+per backend, computes InferenceX's agentic metrics from each run's client export, draws
+the real and simulated curves on InferenceX's axes as PNG files in OUT, and prints a
+verdict per point and metric. The `validate.curves` docstring states the metrics, the
+limits and the charts.
+
 ## A 1P1D deployment across crsuse2-m2m-v3-005 and -013
 
 `deploy.sh` runs from a GPU container on 005, which holds the prefill instance
@@ -1240,9 +1249,10 @@ store. A record without a store touches no library.
    tool: per concurrency 16 and 4, `compass record --trace --gpu G --out
    $R/trace/c<C> -- $ATOM` and `client.sh $R/trace/c<C> --traces 256-392
    --concurrency <C> --duration 120 --stop`.
-3. `compass fit steps --backend step-linear --form history $R/cal/c* $R/trace/c*
-   --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M $S --out
-   $R/fit`, every record and trace run named before the first `--client-run`, and
+3. `compass fit steps --backend step-linear --form history --model $MODEL $R/cal/c*
+   $R/trace/c* --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M
+   $S --out $R/fit`, every record and trace run named before the first `--client-run`,
+   `--model` naming the model directory, whose config gives a MoE model's routing, and
    `compass fit host` on the calibration records alone; each prints its store token.
    Steps 1 to 3, after a warm record, are `calibrate.sh $R/cal 1 4 16 "trace 16" "trace 4"` with
    `MODEL`, `GPU`, `MACHINE`, `TRACES` and `AIPERF_PYTHON` set, its store

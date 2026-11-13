@@ -27,8 +27,9 @@ no extractor, or a leaf its extractor cannot price, is refused by name.
 DeepSeek-V4's MoE takes the step roofline's expectation under independent
 uniform routing: the routed experts run the rows the leaf holds but its pad
 rows, a gather's or a graph's, under expert parallelism the busiest rank's
-expected share, at the format the op quantizes its rows to, and read each
-activated expert once; a DP exchange's group width is read off its own
+expected share, a fused shared expert every row aiter's top-k table deals it,
+a gather's pad rows too, at the format the op quantizes its rows to, and read
+each activated expert once; a DP exchange's group width is read off its own
 shapes. ATOM's Triton experts run as aiter's grouped GEMMs, each priced so, at
 the activation format its kind names; their expert-parallel width is the run's
 `ep`, the experts `ep` times a rank's.
@@ -283,29 +284,39 @@ def _routing(view, tokens, k, experts, ranks):
 
 
 def _fused_moe(op, view, tp, kv, ep) -> Work:
-    """The routed experts on `hidden_states`' rows, each route through one
-    expert's gate-up and down products, routed as `_routing` says. Under
-    expert parallelism `w1` holds this rank's share of `ep` times its experts.
+    """The experts on `hidden_states`' rows, each route through one expert's
+    gate-up and down products. Every `topk_ids` column is the router's,
+    routed as `_routing` says, unless the leaf states its layer's `top_k` and
+    `fused_shared_experts`: then only the first `top_k` are, and aiter's top-k
+    table gives each fused shared expert every row a gather carries, pad rows
+    too, or on one rank the step's own tokens (`routing_rows`), under expert
+    parallelism dealt to rank `row mod ep`, which holds them all; the columns
+    past both reach no expert. Under expert parallelism `w1` holds this rank's
+    share of `ep` times its routed experts, and its fused shared ones.
 
     With a nonzero `quant_type` the op quantizes `hidden_states` to the
     weights' format inside it, so both products run at that format; otherwise
     at `hidden_states`'. M is the leaf's boundary: each activated expert's
     weights and scales read once, and the rows' tensors at the share of rows
-    this rank runs, at least its routes over `k`."""
-    args = op["args"]
+    this rank runs, at least its routes over the top k and the rows it is
+    dealt."""
+    args, stated = op["args"], op.get("stated", {})
     (rows, hidden), k = args["hidden_states"]["shape"], args["topk_ids"]["shape"][1]
     local, up = args["w1"]["shape"][:2]
-    routed, groups = _routing(view, rows, k, local * ep, ep)
+    top, shared = stated.get("top_k", k), stated.get("fused_shared_experts", 0)
+    routed, groups = _routing(view, rows, top, (local - shared) * ep, ep)
+    own = rows if view.moe_rows is not None else routing_rows(view, rows)[0]
+    dealt = -(-own // ep) if shared else 0
+    picks, groups = routed + dealt * shared, groups + shared
     b = _fmt(args["w1"]["dtype"])
     a = b if args.get("quant_type") else _fmt(args["hidden_states"]["dtype"])
-    flops = grouped_gemm(routed, up, hidden, groups, a, b)
-    flops += grouped_gemm(routed, hidden, up // 2, groups, a, b)
+    flops = grouped_gemm(picks, up, hidden, groups, a, b)
+    flops += grouped_gemm(picks, hidden, up // 2, groups, a, b)
     held = ("w1", "w2", "w1_scale", "w2_scale", "bias1", "bias2")
     weights = sum(_bytes(t) for s in held for t in _tensors(args.get(s)))
     io = _boundary(op).bytes - weights
-    return Work(
-        flops.flops_by_format, weights * groups / local + io * routed / (rows * k)
-    )
+    ran = max(routed / top, dealt)
+    return Work(flops.flops_by_format, weights * groups / local + io * ran / rows)
 
 
 def _experts(act: str):

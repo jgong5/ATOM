@@ -815,17 +815,54 @@ def _gpu(arg: Any) -> bool:
     return isinstance(arg, (str, torch.device)) and torch.device(arg).type == "cuda"
 
 
+@contextlib.contextmanager
+def gathers_by_shape():
+    """A process group's gather of a meta tensor answers with its shape.
+
+    A hook that re-quantizes a sharded weight first gathers it whole across
+    its group: online quantization does, to a per-token target on a
+    row-parallel layer (`LinearBase.online_quantize_weight`). A meta shard has
+    no bytes to send, and the collective refuses it. Here it gets a meta
+    tensor of the gathered shape, its size along the gathered dim times the
+    group's width, and no collective runs; a gather of real bytes runs as
+    before.
+    """
+    from aiter.dist.parallel_state import GroupCoordinator
+
+    gather = GroupCoordinator.all_gather
+
+    def by_shape(group, input_, use_custom=False, dim=-1):
+        if not input_.is_meta:
+            return gather(group, input_, use_custom, dim)
+        shape = list(input_.shape)
+        shape[dim] *= group.world_size
+        return input_.new_empty(shape)
+
+    GroupCoordinator.all_gather = by_shape
+    try:
+        yield
+    finally:
+        GroupCoordinator.all_gather = gather
+
+
 def process_weights_after_loading(tree: torch.nn.Module) -> None:
     """Run on a meta tree the post-load hooks `load_model` runs after a load.
 
     The same walk, parent first: each module's own hook, then its quant
     method's. The hooks re-lay weights (an MXFP4 MoE pads its expert scales),
-    so the storages they leave are the ones a real start holds. The loader's
-    `init_prepare_finalize` is not run: it sets up an MoE's dispatch and holds
-    no weight. A hook that fails on the meta device refuses the start by name.
+    so the storages they leave are the ones a real start holds; a gather
+    across a process group answers with its shape (`gathers_by_shape`). The
+    loader's `init_prepare_finalize` is not run: it sets up an MoE's dispatch
+    and holds no weight. A hook that fails on the meta device refuses the
+    start by name.
     """
     if not isinstance(tree, torch.nn.Module):
         return
+    with gathers_by_shape():
+        _run_post_load_hooks(tree)
+
+
+def _run_post_load_hooks(tree: torch.nn.Module) -> None:
     from atom.model_ops.base_config import QuantizeMethodBase
 
     for name, module in tree.named_modules():
