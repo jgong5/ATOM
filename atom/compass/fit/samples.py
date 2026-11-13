@@ -17,9 +17,10 @@ naming them, and so does one whose `source` counts uncommitted files.
 
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
-does (`rows`, `rung`, `produces_output`), its device seconds (`seconds`),
-under a drafter the target's, and the drafter's (`draft_seconds`), its
-`origin` (`replay`, `plan` or `ragged`) and the `traces` the batch came from.
+does (`rows`, `rung`, `produces_output`, and `group_needs_eager` where the
+bench ran it eagerly), its device seconds (`seconds`), under a drafter the
+target's, and the drafter's (`draft_seconds`), its `origin` (`replay`,
+`plan` or `ragged`) and the `traces` the batch came from.
 Its sample's provenance holds its `source`, the origin, its `run`, the entry's
 digest, those `traces`, and `profiled` false: the bench times a
 replay unprofiled.
@@ -181,6 +182,7 @@ def _measurement(store: ArtifactStore, key) -> tuple[Sample, dict]:
             tuple(RequestShape(q, c, bool(d)) for q, c, d in m["rows"]),
             capture_rung=m["rung"],
             produces_output=m["produces_output"],
+            group_needs_eager=m.get("group_needs_eager", False),
         )
         provenance = {
             "source": m["origin"],

@@ -48,7 +48,9 @@ refuses, naming it. Its member `MEMBER` holds the view, `seconds` (the median
 of the bench's kept repeats, under a drafter of their target's parts, and
 `draft_seconds` that of their drafter's parts), the repeats, the protocol,
 the replay rule, the origin, the inputs it came from (`sources`) and the
-`traces` their lines served. A batch the rule or the bench refuses is not
+`traces` their lines served, and `group_needs_eager`, true, where the bench
+ran the batch eagerly because an attention backend refused it a graph, as a
+step-record line states it. A batch the rule or the bench refuses is not
 published; the command measures the rest, then fails naming each. `<out>`
 also holds run.json, with the warm-up's and the measuring's boundaries, the
 engine file and the GPU checks.
@@ -559,6 +561,8 @@ def _measure(bench, config, sampling, store, command, readings, todo) -> list[st
             "sources": sorted(point["sources"]),
             "traces": sorted(point["traces"]),
         } | ({"plan": point["plan"]} if "plan" in point else {})
+        if got.get("group_needs_eager"):
+            member["group_needs_eager"] = True
         roots = roots or roots_for({"atom": "atom", "aiter": "aiter"})
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         store.publish(
