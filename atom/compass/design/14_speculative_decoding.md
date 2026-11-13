@@ -390,8 +390,9 @@ Concretely, for acceptance cells:
    simulated run draws the acceptance it is fed: `tests/compass/test_run_measured_acceptance.py`
    turns a record's histograms into the rates ATOM is handed and has the run summary name
    the record, and `tests/compass/test_speculative_step.py` holds the histogram ATOM's
-   scheduler draws within four standard errors of the stated rates, its draws fixed by a
-   seed. A cell's run summary names its acceptance input and record (`run._acceptance`).
+   scheduler counts from `DeferredTokenStream`'s draws within four standard errors of the
+   stated rates, the draws fixed by a seed. A cell's run summary names its acceptance input
+   with its method, and its record when the input is measured (`run._acceptance`).
 5. **Schedule agreement (`08` D44's second result) is graded more loosely for speculative
    cells than for dense ones**, and the artifact says so. Two runs whose acceptance
    histograms match can still diverge in *which* request accepted what, and that
