@@ -474,10 +474,10 @@ def test_a_real_and_a_simulated_agentx_run_write_one_workload(tmp_path):
         done = _client(out, *AGENTX, env=env)
         assert done.returncode == 0, done.stdout + done.stderr
         (cell / name).symlink_to(out)
-    real, simulated = ((cell / n / WORKLOAD).read_text() for n in runs)
-    assert real == simulated
     # A run's run.json names no workload; client.sh's workload.json states it.
     assert _odd_workloads(cell, {n: {} for n in runs}) == {}
+    real, simulated = ((cell / n / WORKLOAD).read_text() for n in runs)
+    assert real == simulated
 
 
 def test_both_clients_strip_payloads_and_gzip_the_raw_records_once_exported(tmp_path):
