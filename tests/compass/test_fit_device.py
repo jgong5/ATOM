@@ -2,8 +2,10 @@
 """`compass fit device` through `cli.main`, on probe records `compass measure
 device` published with its probes stood in for: two nodes' records fold into
 one `platform_readings` entry, rates kept as rates; records of two stacks and
-a second fit to one key refuse; `--assume-from` states a measured entry's
-ratios for a device never run, and refuses several entries to take from."""
+a second fit to one key refuse; `fold` takes each field's median over the
+records stating it; `--assume-from` states a measured entry's ratios for a
+device never run, takes the entry at the PTL state named, and refuses several
+entries to take from."""
 
 import json
 
@@ -19,7 +21,7 @@ from test_measure_device import (  # noqa: F401  the node fixture
 
 from atom.compass import cli
 from atom.compass.artifacts import ArtifactStore, Key, Kind
-from atom.compass.drive import measure_device
+from atom.compass.drive import device_probe, measure_device
 from atom.compass.fit import device
 from atom.compass.spec.layers import datasheet
 
@@ -29,6 +31,7 @@ LINK = "interconnect.intra_node.attainable_bandwidth_bytes_per_s"
 FLOOR = "device.kernel_floor_s"
 CURVE = "device.memory.bandwidth_curve"
 RCCL = "interconnect.intra_node.pp.rccl.latency_s"
+EAGER = "eager_threshold_bytes"
 
 
 @pytest.fixture
@@ -203,3 +206,58 @@ def test_assume_from_with_several_source_entries_refuses_listing_them(nodes, tmp
     assert "holds 2 platform_readings entries for MI355X gfx950 at PTL disabled" in held
     assert all(f"as {k}" in held for k in keys)
     assert not list((tmp_path / "store" / "platform_readings").glob("MI455X*"))
+
+
+def test_fold_takes_each_fields_median_over_the_records_stating_it():
+    # Three records whose values and curves differ; two hold the carriers, so a
+    # byte count's median falls between their values and stays one of them.
+    def record(bf16, curve, *carrier):
+        pp = {device.PP: {"rccl": dict(zip(("latency_s", EAGER), carrier))}}
+        return {"readings": {BF16: bf16, CURVE: curve} | (pp if carrier else {})}
+
+    values, origins = device.fold(
+        {
+            "a": record(
+                [1e15, 0.9e15, 1.1e15], [[4096, 1e12], [8192, 1e12]], 1e-5, 65536
+            ),
+            "b": record(
+                [2e15, 1.5e15, 2e15], [[4096, 3e12], [8192, 3e12]], 3e-5, 131073
+            ),
+            "c": record([9e15, 8e15, 9.5e15], [[4096, 2e12], [8192, 5e12]]),
+        }
+    )
+    assert values[BF16] == 2e15
+    assert origins[BF16] == {
+        "origin": "probed",
+        "record": "a, b, c",
+        "p10": 0.9e15,
+        "p90": 9.5e15,
+    }
+    assert values[CURVE] == [[4096, 2e12], [8192, 3e12]]
+    eager = f"{device.PP}.rccl.{EAGER}"
+    assert (values[eager], origins[eager]["record"]) == (65536, "a, b")
+    assert values[RCCL] == pytest.approx(2e-5)
+
+
+def test_assume_from_takes_the_source_at_the_ptl_state_named(
+    nodes, monkeypatch, tmp_path
+):
+    gpu40, _ = nodes("mi355-gpu-40", "0,1")
+    source = fit(tmp_path, gpu40)
+    # crs005's entry for the same device and stack, its cards at PTL enabled.
+    monkeypatch.setattr(measure_device, "_ptl", lambda gpus: "enabled")
+    stubbed = device_probe.cards
+    monkeypatch.setattr(
+        device_probe,
+        "cards",
+        lambda bdfs: [c | {"ptl": "enabled"} for c in stubbed(bdfs)],
+    )
+    monkeypatch.setattr(measure_device.socket, "gethostname", lambda: "crs005")
+    measure(tmp_path, "0,1")
+    enabled = Key.of(Kind.PROBE_RECORD, host="crs005", **PLATFORM | {"ptl": "enabled"})
+    assert fit(tmp_path, enabled.token())["key"]["ptl"] == "enabled"
+    b0 = ("--device", "mi455x-b0", "--assume-from", "MI355X", "--ptl", "disabled")
+    entry = fit(tmp_path, *b0)
+    assert entry["key"]["ptl"] == "disabled"
+    peak = datasheet("mi355x").values["device.compute.bf16_flops"]
+    assert entry["device.compute.derate.bf16"] == source[BF16] / peak
