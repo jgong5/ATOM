@@ -109,6 +109,4 @@ def test_a_drafter_that_samples_nothing_or_gathers_routes_as_the_step_does(view)
     # a gather's real rows are its own. Neither is told apart by pass.
     cost = backend({"seq": [moe(9, 16)] * 3}, drafts=2)
 
-    assert by_name(cost.price(view))[MOE] == pytest.approx(
-        seconds(*[routed(9, 9)] * 3)
-    )
+    assert by_name(cost.price(view))[MOE] == pytest.approx(seconds(*[routed(9, 9)] * 3))
