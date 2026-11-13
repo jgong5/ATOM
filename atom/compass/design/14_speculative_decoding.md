@@ -21,11 +21,17 @@ cells state `--spec-decode-acceptance-length 3` on their real and simulated runs
 place of rates measured from the real run; contract 3 stays unbuilt (D84, *Milestone
 placement*).
 
+**Revised 2026-11-12 by the owner's ruling on
+[#3257](https://github.com/jgong5/ATOM/issues/3257):** the M3-Agentic stage prices
+MiniMax-M3's EAGLE3, a Llama draft stack with its own KV pool, at step level by the
+drafter's own vectors, its acceptance forced on both runs (D87.1).
+
 **Scope.** What speculative decoding — Eagle3, DSpark, and MTP heads — changes for a
 simulator, and why one of those changes is different in kind from everything else in this
 design. The draft paths it prices are DeepSeek-V4-Pro's serial MTP, in M2's MI355X cells,
-and DeepSeek-V4.1-Flash's DSpark5, in stage 4's MI455 cells (D87, *Milestone placement*);
-Eagle3 is described because ATOM carries it, and is not on M2's path.
+DeepSeek-V4.1-Flash's DSpark5, in stage 4's MI455 cells (D87, *Milestone placement*), and
+MiniMax-M3's EAGLE3, in the M3-Agentic stage's MI355X cells (D87.1). Eagle3 is not on M2's
+path.
 
 ---
 
@@ -449,6 +455,50 @@ measured rates (input 1) to a simulated run whose ATOM arguments state none.
 
 ---
 
+## D87.1. EAGLE3, as MiniMax-M3 serves it
+
+Owner ruling on [#3257](https://github.com/jgong5/ATOM/issues/3257), 2026-11-12, for the
+M3-Agentic stage (`16` D95.1), whose every arm serves MiniMax-M3 with `--method eagle3
+--draft-model Inferact/MiniMax-M3-EAGLE3-GQA --num-speculative-tokens 3`. It is the first
+Eagle3 path a stage prices.
+
+| Item | In ATOM | For this topic |
+|---|---|---|
+| draft model | the checkpoint's `LlamaForCausalLMEagle3`, which `SpeculativeConfig.hf_config_override` maps to `Eagle3LlamaModel` (`atom/models/eagle3_llama.py`): one Llama decoder layer behind an `fc` that folds three of the target's hidden states, the layers MiniMax-M3's `get_eagle3_aux_hidden_state_layers` names (`atom/models/minimax_m3/model.py`) | a Llama draft stack, not serial MTP |
+| draft steps | `EagleProposer.propose` runs `K` serial passes: the first over the step's whole token stream, `K+1` rows a sequence on a decode, each later one over one row a sequence through its `DraftGraph`; every pass ends in the drafter's LM head and argmax | one draft forward per serial pass (D85) |
+| draft weights | the whole draft checkpoint: its embedding and LM head are its own, not the target's | D86's weight term counts all of it |
+| draft KV | its own pool: `EagleProposer._build_draft_model` asks `draft_kv_builder`, whose answer for the draft's MHA backend is a pool of its own (`DRAFT_OWNS_KV_POOL`), and `DraftKvBuilder.sub_pool_specs` declares a row for its layer, merged by name into the target's paged class on the target's block ids (D86) | memory readings are taken with it, and the simulated draft KV block count is ATOM's |
+
+**Priced at step level, from records, by the drafter's own vectors:** a draft forward,
+charged once per serial pass at that pass's rows; propose; and draft KV, the pass
+`EagleProposer.compute_draft_kv` makes over a step of middle chunks only. The draft
+forward replaces the draft law's per-rung decode vector, which prices a whole draft at once
+(`backends/step_linear.py`), so a record carries each serial pass apart, where today all of
+a step's passes land in one `d_propose_ns` (`parity/__init__.py`).
+
+**Acceptance is forced** through `--spec-decode-acceptance-length 2.78` on the real and the
+simulated runs alike, D84's input 3 as stage 4's exit cells state theirs. At 2.78 and
+`K = 3` the minimum-variance schedule accepts one draft on every verify row and a second
+with probability 0.78, never the third, on both sides; the summary names the input
+`declared`. Stage 4 forced only integers, so
+[#3260](https://github.com/jgong5/ATOM/issues/3260) shows a fractional length holds through
+record, fit and simulated run.
+
+**It runs at level 0 by scenario**, the level
+[#2712](https://github.com/jgong5/ATOM/issues/2712) defines: a MiniMax-M3 scenario with its
+EAGLE3 drafter built on the meta device runs under the step stub and passes `check_run`.
+That closes the Eagle case of [#2672](https://github.com/jgong5/ATOM/issues/2672), which
+asked each such form to run or be refused. The step roofline lays out no Eagle3 pass, so an
+Eagle3 step it prices is refused by name (`cost:<backend>: prices no draft`, D83).
+
+A law and a readings entry name the draft by method and `K`
+(`run/step_grid.py::keyed`'s `speculative`) beside the target's `config.json` digest, and
+by its own `config.json` digest where that is not the target's (`draft_model`,
+[#3276](https://github.com/jgong5/ATOM/issues/3276)), so two Eagle3 drafts of one target
+key apart. A draft read from the target's checkpoint keys by method and `K` alone.
+
+---
+
 ## Open issues
 
 - **`ATOM_ENABLE_RELAXED_MTP` changes acceptance semantics**, not just its rate —
@@ -479,6 +529,7 @@ measured rates (input 1) to a simulated run whose ATOM arguments state none.
 | D85 | No new cost form. Drop the separate decode form and price every step with the general one; non-speculative decode is the `N_Q = 1` case. | 2026-09-19 |
 | D86 | Draft weights are Class A; draft KV comes from ATOM's own pool declarations (`ModelRunner._sub_pool_specs`), and its layer count is never re-derived. | 2026-09-19; revised 2026-10-29 (#2437) |
 | D87 | A speculative throughput result is **conditional on its acceptance input**, and the run summary names its method. Mean AL and the accepted-count histogram are gated; per-step realisation and within-sequence correlation are **not reproduced and not claimed**. Schedule agreement is graded more loosely for speculative cells. Predicting acceptance itself is explicitly not attempted. A cell whose two runs state the same AL is acceptance evidence. | 2026-09-19; revised 2026-11-02 (#2683) |
+| D87.1 | MiniMax-M3's EAGLE3, ruled by the owner: a Llama draft stack with its own draft KV pool, declared by `draft_kv_builder`; priced at step level from records by the drafter's own vectors, a draft forward per serial pass, propose and draft KV; acceptance forced through `--spec-decode-acceptance-length` on both runs; at level 0 by scenario, closing #2672's Eagle case. | 2026-11-12 (#3257) |
 
 ---
 

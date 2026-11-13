@@ -295,6 +295,18 @@
    "mechanism_why": "a wait inside the engine's LP on the engine's own trace process: never reported to the clock authority and carries no cost; the step is priced from the traced graph, and the run summary reports the wait as lazy_trace_wall_seconds"
   },
   {
+   "id": "atom/compass/runner/overrides.py::gathers_by_shape.by_shape::gather(group, input_, use_custom, dim)::collective#0",
+   "file": "atom/compass/runner/overrides.py",
+   "symbol": "gathers_by_shape.by_shape",
+   "call": "gather",
+   "expr": "gather(group, input_, use_custom, dim)",
+   "shape": "collective",
+   "peer": "process",
+   "why": "aiter's own gather across a process group, for a tensor that holds bytes, while the post-load hooks run on a simulated start's meta tree; that tree holds none, so its gathers are answered by shape",
+   "mechanism": "K9",
+   "mechanism_why": "at startup, inside the worker's model build, before the engine's step loop: outside the simulated window"
+  },
+  {
    "id": "atom/compass/runner/overrides.py::_group_step_seconds::torch.distributed.all_gather(rows, mine, group=group)::collective#0",
    "file": "atom/compass/runner/overrides.py",
    "symbol": "_group_step_seconds",
@@ -5200,6 +5212,55 @@
    "why": "compass measure memory reaps the engine process once its session is killed",
    "mechanism": "K9",
    "mechanism_why": "in the measuring command, which is no LP, around a real engine start it makes; a GPU command serves no simulated run, so the bound stays real"
+  },
+  {
+   "id": "atom/compass/drive/measure_device.py::_child::subprocess.Popen( argv, env=env, stdout=f, stderr=subprocess.STDOUT, start_new_session=True )::thread_start#0",
+   "file": "atom/compass/drive/measure_device.py",
+   "symbol": "_child",
+   "call": "subprocess.Popen",
+   "expr": "subprocess.Popen( argv, env=env, stdout=f, stderr=subprocess.STDOUT, start_new_session=True )",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "none",
+   "why": "compass measure device starts each card's probe, and the PP carriers' torchrun, in a process of its own session that sees the cards it probes",
+   "mechanism": "K9",
+   "mechanism_why": "starting a process cannot park; in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so the bound stays real"
+  },
+  {
+   "id": "atom/compass/drive/measure_device.py::_child::probe.wait()::event_wait#0",
+   "file": "atom/compass/drive/measure_device.py",
+   "symbol": "_child",
+   "call": "probe.wait",
+   "expr": "probe.wait()",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "compass measure device reaps a probe process once its session is stopped, before it checks the cards and starts the next",
+   "mechanism": "K9",
+   "mechanism_why": "in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so the bound stays real"
+  },
+  {
+   "id": "atom/compass/drive/measure_device.py::_child::probe.poll()::poll#0",
+   "file": "atom/compass/drive/measure_device.py",
+   "symbol": "_child",
+   "call": "probe.poll",
+   "expr": "probe.poll()",
+   "shape": "poll",
+   "peer": "process",
+   "why": "compass measure device asks whether a probe process has exited while it waits for the probe or for SIGINT or SIGTERM",
+   "mechanism": "K9",
+   "mechanism_why": "a process poll returns at once and cannot park; in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so the bound stays real"
+  },
+  {
+   "id": "atom/compass/drive/measure_device.py::_child::time.sleep(serve.POLL_S)::sleep#0",
+   "file": "atom/compass/drive/measure_device.py",
+   "symbol": "_child",
+   "call": "time.sleep",
+   "expr": "time.sleep(serve.POLL_S)",
+   "shape": "sleep",
+   "peer": "process",
+   "why": "compass measure device's half-second cadence between its checks on a probe process",
+   "mechanism": "K9",
+   "mechanism_why": "in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so its cadence no simulated clock reads"
   },
   {
    "id": "atom/compass/kv/lmcache_mp.py::LMCacheMPShell._send::sock.send_multipart([pickle.dumps((ch, *rt.stamp_send(ch))), *frames])::p2p#0",

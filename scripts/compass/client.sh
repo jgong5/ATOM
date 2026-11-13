@@ -2,16 +2,29 @@
 # SPDX-License-Identifier: MIT
 #
 # One client run against a `compass record` or `compass run` server: aiperf
-# with cctraces_sim.sh's arguments over traces A to B, then the run's export.
+# with cctraces_sim.sh's arguments over traces A to B, or with InferenceX's
+# agentx client over every trace, then the run's export.
 #
 # Usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop]
+#        client.sh OUT --agentx --concurrency C [--duration S] [--stop]
 #        client.sh OUT --sweep --traces A-B --stop
 #   OUT              the server's --out, whose server.json names its URL and,
-#                    for a simulated server, its run file
+#                    for a simulated server, its run file; a deploy.sh OUT's
+#                    prefill/server.json names its prefill instance's URL
 #   --traces A-B     TRACES' traces A to B, each counted from 0
 #   --concurrency C  aiperf --concurrency
 #   --duration S     aiperf --benchmark-duration, seconds on the server's clock
-#                    (default 1800)
+#                    (default 1800, 3600 with --agentx)
+#   --agentx         in place of --traces, the defaults of agentx-harness's
+#                    agentx scenario, which InferenceX's agentic submissions
+#                    run, as flags on the base scenario: every trace in TRACES
+#                    (the scenario's is the full-length corpus; a warmup
+#                    request longer than the server's context aborts aiperf's
+#                    run, so a shorter context takes the 256k-capped copy), seed
+#                    42, a trajectory start between 0.25 and 0.75 of each
+#                    trace, 10 warmup requests per lane with 1800 s grace, a
+#                    per-trace idle cap of 300 s, a system idle cap of 10 s and
+#                    the chat template applied
 #   --stop           then SIGTERM the command that started the server, wait
 #                    WAIT_S (default 600) for it to write OUT/run.json and leave,
 #                    a trace run's (OUT/trace) serve.TRACE_STOP_S more, and set
@@ -50,12 +63,12 @@
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
-USAGE="usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop] | OUT --sweep --traces A-B --stop"
+USAGE="usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop] | OUT --agentx --concurrency C [--duration S] [--stop] | OUT --sweep --traces A-B --stop"
 bad() { echo "client: $1; $USAGE" >&2; exit 2; }
 fail() { echo "client: $1" >&2; exit 1; }
 ROOT=$(compass_tree_root) || exit $?
 (($#)) && [[ $1 != -* ]] || bad "no OUT"
-OUT=$1 duration=1800 stop=0 sweep=0
+OUT=$1 stop=0 sweep=0 agentx=0
 shift
 while (($#)); do
     case $1 in
@@ -68,11 +81,16 @@ while (($#)); do
     --duration) [[ ${2-} =~ ^[1-9][0-9]*$ ]] || bad "--duration takes whole seconds"; duration=$2; shift ;;
     --stop) stop=1 ;;
     --sweep) sweep=1 ;;
+    --agentx) agentx=1 ;;
     *) bad "unknown argument $1" ;;
     esac
     shift
 done
-if ((sweep)); then
+if ((agentx)); then
+    ((!sweep)) && [[ -z ${first-} ]] || bad "--agentx takes every trace, and neither --traces nor --sweep"
+    [[ -n ${c-} ]] || bad "--concurrency is required"
+    need=(MODEL TRACES HARNESS_PYTHON)
+elif ((sweep)); then
     [[ -n ${first-} ]] && ((stop)) || bad "--sweep takes --traces and --stop"
     need=(TRACES)
 else
@@ -80,6 +98,18 @@ else
     need=(MODEL TRACES HARNESS_PYTHON)
 fi
 for v in "${need[@]}"; do [[ -n ${!v-} ]] || bad "$v is not set"; done
+# The agentx scenario's defaults, as flags on the base scenario: the scenario
+# itself arrived in a later agentx-harness than the one compass-harness pins.
+agentx_args=()
+if ((agentx)); then
+    last=$(awk 'END {print NR - 1}' "$TRACES") || fail "traces: cannot read $TRACES"
+    ((last >= 0)) || fail "traces: $TRACES holds no trace"
+    first=0 duration=${duration:-3600} random_seed=42
+    agentx_args=(--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75
+        --warmup-requests-per-lane 10 --agentic-warmup-grace-period 1800
+        --trace-idle-gap-cap-seconds 300 --system-idle-gap-cap-seconds 10 --apply-chat-template)
+fi
+duration=${duration:-1800}
 
 [[ -s $OUT/server.json ]] || fail "server: no $OUT/server.json; a compass record or compass run --out $OUT writes it once its server answers"
 OUT=$(realpath "$OUT")
@@ -92,7 +122,7 @@ curl -sf --max-time 10 "$url/health" >/dev/null || fail "server: $url/health doe
 compass_env "$ROOT"
 export PYTHONPATH=$ROOT:$ROOT/compass_harness
 compass_require_tree "$ROOT" || exit $?
-unset ATOM_COMPASS_RUN ATOM_COMPASS_CLOCK_ENDPOINT
+unset ATOM_COMPASS_RUN ATOM_COMPASS_CLOCK_ENDPOINT COMPASS_HARNESS_PREFILL_URL
 
 stop_server() {
     # The command that started the server is its parent.
@@ -143,6 +173,14 @@ print(*(p.value for p in e(group="aiperf.plugins")))') ||
 if [[ -n $run_file ]]; then
     [[ $plugins == *compass_harness* ]] || fail "harness: the server is simulated, and $HARNESS_PYTHON has no compass-harness installed"
     export ATOM_COMPASS_RUN=$run_file
+    # deploy.sh's prefill instance: behind a router that is no LP, the traffic
+    # LP posts each cancel there (compass_harness/traffic_lp.py).
+    if [[ -s $OUT/prefill/server.json ]]; then
+        COMPASS_HARNESS_PREFILL_URL=$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1]))["url"])' "$OUT/prefill/server.json") ||
+            fail "server: $OUT/prefill/server.json names no url"
+        export COMPASS_HARNESS_PREFILL_URL
+    fi
     aiperf=(-m aiperf)
 else
     [[ $plugins != *compass_harness* ]] || fail "harness: the server is real, and $HARNESS_PYTHON has compass-harness installed"
@@ -160,14 +198,14 @@ awk -v d="$OUT/client/traces" -v first="$first" -v last="$last" '
 n=$(find "$OUT/client/traces" -type f | wc -l)
 ((n == last - first + 1)) || fail "traces: $TRACES holds $n of traces $first to $last"
 read -rd '' -a extra <<<"${AIPERF_EXTRA_ARGS-}" || :
-[[ " ${extra[*]} " =~ \ --random-seed[\ =] ]] && seed=() || seed=(--random-seed 20260707)
+[[ " ${extra[*]} " =~ \ --random-seed[\ =] ]] && seed=() || seed=(--random-seed "${random_seed:-20260707}")
 # What aiperf sends: all but paths, the URL and the export level, as cctraces_sim.sh
 # hashes them into its run.json's workload.
 args=(--endpoint-type chat --custom-dataset-type weka_trace
     --concurrency "$c" --benchmark-duration "$duration"
     "${seed[@]}" --scenario inferencex-agentx-mvp --unsafe-override
     --streaming --use-server-token-count --extra-inputs ignore_eos:true
-    --no-server-metrics --no-gpu-telemetry --ui none "${extra[@]}")
+    --no-server-metrics --no-gpu-telemetry --ui none "${agentx_args[@]}" "${extra[@]}")
 
 # Each request carries X-Session-ID, as the nightly's agentic cell sends it: a
 # dp_sticky router keys off it, and a server alone ignores it. The raw records

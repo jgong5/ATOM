@@ -56,6 +56,9 @@ engine file and the GPU checks.
 The bench holds the largest KV pool its inputs' engines state, whatever this
 device's own budget gives, so every batch they ran, and every point planned
 for that pool, fits it.
+
+The API server's flags `compass record` serves with (`measure_memory.FRONTEND`)
+are taken and dropped; any other flag ATOM's engine lacks refuses.
 """
 
 import argparse
@@ -297,18 +300,22 @@ def atom_config(atom_args, server: bool = False):
     """ATOM's `Config` for its arguments, as `LLMEngine` resolves one and
     `CoreManager` rewrites it under DP attention, each TP rank a DP rank of TP 1.
     With `server`, `atom_args` are a server's, whose own flags pass unread, and
-    no tokenizer loads; otherwise any flag the engine does not define refuses,
-    and the config gets the tokenizer's ids and the end-of-sequence id apart
-    from the stop ids."""
+    no tokenizer loads; otherwise the server's flags `compass record` passes it
+    (`measure_memory.FRONTEND`) are taken and dropped, any other flag the engine
+    does not define refuses, and the config gets the tokenizer's ids and the
+    end-of-sequence id apart from the stop ids."""
     import dataclasses
 
     from atom.compass.bench.ranks import layout
+    from atom.compass.drive.measure_memory import FRONTEND
     from atom.compass.drive.runfile import _engine_args
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
     from atom.model_engine.llm_engine import _load_tokenizer
 
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
+    for flag, kind in FRONTEND.items():
+        parser.add_argument(flag, **kind)
     parsed = _engine_args(atom_args) if server else parser.parse_args(atom_args)
     engine_args = EngineArgs.from_cli_args(parsed)
     names = {f.name for f in dataclasses.fields(Config)}

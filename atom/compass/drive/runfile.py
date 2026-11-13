@@ -29,6 +29,8 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   config ATOM's arguments resolve, as `drive.run.check` resolves one,
   and ``backend``'s digest is over every law's in any order, their provenance
   ``entries``.
+- ``--lmcache-offload FILE``, the ``lmcache_offload`` entry
+  `step_linear_fit`'s offload form writes, at that key.
 - ``--machine``, the spec; ``--store``'s root as ``store``; ``--on-refusal``;
   ``--step-roofline``; ``--padding none``, which prices a replayed graph's
   real rows; ``--local-grants``, on unless ``--no-local-grants``, which gives
@@ -77,6 +79,9 @@ def add_arguments(parser) -> None:
     backend.add_argument("--op-graph", dest=run.OP_GRAPH, action="store_true")
     parser.add_argument(
         "--host-laws", metavar="KEY", action="append", help="a token or law file"
+    )
+    parser.add_argument(
+        "--lmcache-offload", metavar="FILE", help="the lmcache_offload entry"
     )
     parser.add_argument("--machine", required=True, help="the machine spec")
     parser.add_argument("--store", required=True, help="the artifact store's root")
@@ -145,6 +150,8 @@ def build(args, atom_args) -> dict:
         out |= _hops(hosts, atom_args)
     if args.padding:
         out["padding"] = args.padding
+    if entry := getattr(args, "lmcache_offload", None):
+        out["lmcache_offload"] = json.loads(Path(entry).read_text())
     return out
 
 
