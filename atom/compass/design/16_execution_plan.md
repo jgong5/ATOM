@@ -4,7 +4,7 @@
 interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
 written against it yet; implementation follows the execution plan in `16`.
 
-**Depends on:** all of `01`–`15`, and `17`. This document turns those topics' decisions,
+**Depends on:** all of `01`–`15`, `17` and `18`. This document turns those topics' decisions,
 and the register of open items in [`12_open_items.md`](12_open_items.md), into work that
 can be allocated. Neither is counted here. The register is owned by `12`, restated once on
 `README.md`'s front page, and it moves as tasks land; a third copy in a document that does
@@ -49,6 +49,9 @@ last step of v1; stage 3c's projection stays frozen as the before side of the me
 [#3256](https://github.com/jgong5/ATOM/issues/3256) and
 [#3257](https://github.com/jgong5/ATOM/issues/3257):** *Stage M3-Agentic* simulates ATOM's
 MiniMax-M3 AgentX submission on MI355X and grades it point by point (D95.1).
+
+**Revised 2026-11-13 by [#3355](https://github.com/jgong5/ATOM/issues/3355):** *After v1*
+lists adoption (`18`) and the order its work runs in.
 
 **Scope.** How the work is organised, allocated and gated; what happens first; and what
 each stage must produce. It is **detailed through M2**. Work after v1 is listed, not
@@ -825,6 +828,12 @@ Listed so it is not mistaken for an omission; each is re-planned when v1 lands.
   an optional recipe (`17` D100).
 - Width transfer (T21) as a claim.
 - The upstream RFC for ATOM-core edits.
+- Adoption (`18`), its tasks cut from [#3355](https://github.com/jgong5/ATOM/issues/3355):
+  first with no GPU compute, on DeepSeek-V4-Pro's laws that pass `18` D111, the search,
+  the reuse check, the record list, the per-request split, the views and the guide's
+  draft; then on GPUs, `calibrate.sh`'s store and status, the development calibration and
+  the guide walked through; last, the op-family split once #1498 closes. The move to
+  MiniMax-M3 starts whenever `18` D116's conditions hold, its steps in D116's order.
 
 ---
 

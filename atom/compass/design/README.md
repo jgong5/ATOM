@@ -2,7 +2,7 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header.
-**Decisions D0–D106, with no gaps, and their sub-decisions** are indexed at the end of this
+**Decisions D0–D116, with no gaps, and their sub-decisions** are indexed at the end of this
 file. The TODOs are registered in **`12_open_items.md`**, with the load-bearing assumptions
 and the cross-cutting issues. Implementation follows the execution plan in `16`.
 
@@ -165,7 +165,9 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       device datasheets, network files; the spec    |
   |                       a run composes from them and its readings     |
   |                       flags, precedence, the `compass` entry        |
-  |                                                docs 07, 05, 13      |
+  |                       advice: a space searched, with its dashboard  |
+  |                       each run's per-request split and report       |
+  |                                                docs 07, 05, 13, 18  |
   +=====================================================================+
   |  L4  WORKLOAD         clock client  |  compass stamps on the wire   |
   |                       per-harness adapter (out of tree)             |
@@ -234,6 +236,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L5 | The calibration phases, the measurement bench and the recommended flow | [`07_calibration_toolchain.md`](07_calibration_toolchain.md) | D36–D43 |
 | L5 | The JIT sweep and the per-stack cache library that warm a container before a graded run | [`07`](07_calibration_toolchain.md) | D106 |
 | L5 | Machine spec layers, their schema, `measure device` and `fit device` | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
+| L5 | `compass advice`, a user's configuration space searched with calibration kept apart; each run's per-request split and report; the dashboard | [`18_adoption.md`](18_adoption.md) | D107–D116 |
 | L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
 | — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D45.1, D50.1, D50.2, D50.3) |
 | L5 | Configuration surface: flags, precedence, the `compass` commands with their inputs and outputs | [`13_configuration_surface.md`](13_configuration_surface.md) | D78–D81 |
@@ -586,6 +589,12 @@ The documents use these precisely; a reader will bounce off without them.
 |---|---|---|
 | [`16`](16_execution_plan.md) | The Execution Plan | Tasks are a **pool**, capped at 5 in flight, with context durable in the task's GitHub issue and PR rather than in an agent. Phase 0 de-risks five assumptions before any build work. Effort in lines of code, not dates. Detailed through Wave 3, deliberately sketched beyond. |
 
+### Part VIII — How a user searches, after v1
+
+| Doc | Title | What it settles |
+|---|---|---|
+| [`18`](18_adoption.md) | Adoption | One `compass advice` command checks a space the user writes, simulates every candidate whose law exists and recommends a configuration; calibration stays apart, reached through the store, and calibrated data is reused only under the reuse requirements. Every run writes its per-request split and a report. Developed on DeepSeek-V4-Pro, shown on MiniMax-M3. |
+
 ---
 
 ## Decision map
@@ -608,6 +617,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D88 – D94 | `15` Parallelism Support (TP, DP, PP, EP) |
 | D95 (+ D95.1) | `16` The Execution Plan |
 | D96 – D105 | `17` Step Grid Backend |
+| D107 – D116 | `18` Adoption |
 
 ### Headline decisions
 
@@ -627,6 +637,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D36 | Two axes: a backend's granularity, step-level or op-level, and each term's method, analytical, declared, measured or estimated; fallback runs only along method inside one granularity. Compass models a device it has been measured on |
 | D37 | The tool tells the user what to measure: the backend that needs a measurement plans it |
 | D45 | The real-vs-real spread is the tolerance; a metric must be stable, and sensitivity is deferred |
+| D108 | One `compass advice` command searches a user's configuration space by simulation and recommends a configuration; the calibration it lacks stays apart (D107) |
 | D3.2 | Always-on causality detectors: a straggler, checked on receipt and at each drain, fails the run rather than warning; a stall the Clock Authority cannot see waits for ever and prints one `DIAG_S` diagnostic, never aborting; a CI clock-source lint |
 | D3.3 | The Clock Authority ships two deployment forms from one implementation: co-hosted by default, standalone for multi-container runs |
 | D43.1 | ATOM's suite is a merge gate on every Compass change, unmodified, in two gates: a CPU gate (every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free as a batch, held to green) per change, a GPU gate, a superset less the files `gpu_gate_skip.txt` names for its GPU, judged as a delta per wave against `gate_gpu.sh`'s recorded baseline, by an equality on a per-tree expectation rather than "no worse than". The CPU gate **exits 98** rather than reporting "GPU not required" when it cannot tell |
