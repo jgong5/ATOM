@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 """`compass fit steps`: a step-level backend fitted on labelled samples and published.
 
-    compass fit steps --backend step-linear [--form FORM] [--moe-routing E,K]
-        [--seed S] RECORD... --client-run RECORD EXPORT... [--ops DIR...]
-        --machine M --store ROOT --out DIR
+    compass fit steps --backend step-linear [--form FORM]
+        [--moe-routing E,K | --model DIR] [--seed S] RECORD...
+        --client-run RECORD EXPORT... [--ops DIR...] --machine M --store ROOT
+        --out DIR
     compass fit steps --backend step-grid --grid INPUT... --grid-definition FILE
         [--sessions A:B] [--seed S] TARGET... --client-run INPUT EXPORT...
         [--ops DIR...] --machine M --store ROOT --out DIR
@@ -27,7 +28,10 @@ out each run on the others when
 there are two or more, as that module's command does; `--seed` fixes
 its shuffles. With `--moe-routing E,K`, the model's routed experts and top-k,
 the law states them as `moe_routing`, and each decode rung may adopt a MoE
-column over them, as that command's `--moe-routing` fits it. The law states,
+column over them, as that command's `--moe-routing` fits it. `--model DIR`
+reads them from the model directory the records served, as ATOM loads its
+config, and refuses one whose config.json is not the records'; a model that
+names no routed experts gives none. The law states,
 as `platform`, the platform fields of its key,
 and `engine_config`, as that command's does, and the key holds them. The report's
 provenance names each run with every trace its steps served. A step stub's
@@ -66,18 +70,48 @@ from atom.compass.backends import step_grid_fit, step_linear_fit
 from atom.compass.bench import measure
 from atom.compass.fit import publish
 from atom.compass.fit.samples import MEMBER
+from atom.compass.run import _file_digest
 
 PROG = "compass fit steps"
 STUB = "a step stub's coefficients are stated, not fitted; a run takes their file"
 #: What a `--grid` input's engine and sampling are compared with, as a refusal
 #: names each.
 TARGETS = ("the targets'", "the targets' sampling is")
+#: The names a model's config gives its routed experts and its top-k by, as
+#: ATOM's models read them, the first one set taken.
+EXPERTS = ("n_routed_experts", "num_local_experts", "num_experts")
+TOP_K = ("num_experts_per_tok", "num_experts_per_token")
+
+
+def _model_routing(model: str, served: str) -> tuple[int, int] | None:
+    """The routed experts and top-k of the model directory `model`'s config as
+    ATOM loads it, None for a model naming no routed experts; refused unless
+    its config.json is `served`, the records' digest of theirs."""
+    from atom.config import get_hf_config
+
+    if (digest := _file_digest(model, "config.json")) != served:
+        raise ValueError(
+            f"--model {model} holds config.json {digest}; the records served {served}"
+        )
+    config = get_hf_config(model)
+    experts, top_k = (
+        next((v for v in (getattr(config, n, None) for n in names) if v), None)
+        for names in (EXPERTS, TOP_K)
+    )
+    if experts and not top_k:
+        raise ValueError(
+            f"--model {model} names {experts} routed experts and no top-k "
+            f"({', '.join(TOP_K)})"
+        )
+    return (experts, top_k) if experts else None
 
 
 def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     form = args.form or "history"
     options = {"form": form, "dp": step_linear_fit.join_width(config["engine_config"])}
-    options["moe_routing"] = args.moe_routing
+    options["moe_routing"] = args.moe_routing or (
+        args.model and _model_routing(args.model, config["model"])
+    )
     options["buckets"] = config.get("prefill_buckets")
     law, report = step_linear_fit.fit(samples, options, args.seed)
     if options["buckets"] is None:
@@ -155,6 +189,7 @@ BACKENDS = {
 OWN = {
     "form": "step-linear",
     "moe_routing": "step-linear",
+    "model": "step-linear",
     "grid": "step-grid",
     "grid_definition": "step-grid",
     "sessions": "step-grid",
@@ -167,12 +202,19 @@ def main(argv: list[str]) -> None:
     parser.add_argument(
         "--form", choices=step_linear_fit.FORMS, help="history by default"
     )
-    parser.add_argument(
+    routing = parser.add_mutually_exclusive_group()
+    routing.add_argument(
         "--moe-routing",
         metavar="E,K",
         type=step_linear_fit._routing_arg,
         help="the model's routed experts and top-k, over which each decode rung "
         "may adopt a MoE column",
+    )
+    routing.add_argument(
+        "--model",
+        metavar="DIR",
+        help="the model directory the records served, whose config gives the "
+        "routing --moe-routing states",
     )
     parser.add_argument(
         "--grid",

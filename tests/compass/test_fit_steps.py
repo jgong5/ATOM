@@ -9,6 +9,7 @@ is a fresh directory; the entry's provenance names planted trees, since git
 cannot name a read-only checkout in every container.
 """
 
+import hashlib
 import json
 import re
 
@@ -373,6 +374,101 @@ def test_the_routing_refuses_off_step_linear(tmp_path):
     named = "--moe-routing is read by step-linear, not step-grid"
     with pytest.raises(SystemExit, match=re.escape(named)):
         fit(tmp_path, "fit steps", *routed, a, *clients(a))
+    assert not (tmp_path / "store").exists()
+
+
+#: A MoE model's config.json, as DeepSeek's names its routed experts and top-k.
+MOE = {"model_type": "deepseek_v3", "n_routed_experts": 64, "num_experts_per_tok": 4}
+
+
+def kimi(**text) -> dict:
+    """A Kimi-K3 config.json, whose text config states `text`, as Kimi's names
+    its routed experts and top-k."""
+    return {
+        "model_type": "kimi_k3",
+        "text_config": {"model_type": "kimi_linear", **text},
+    }
+
+
+def model(directory, config) -> tuple:
+    """`directory`, a model directory whose config.json states `config`, and
+    the host key of a record that served it."""
+    directory.mkdir()
+    text = json.dumps(config)
+    (directory / "config.json").write_text(text)
+    return directory, {
+        **HOST,
+        "model": "sha256:" + hashlib.sha256(text.encode()).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize(
+    "config, routing",
+    [
+        (MOE, (64, 4)),
+        (
+            {"model_type": "mixtral", "num_local_experts": 8, "num_experts_per_tok": 2},
+            (8, 2),
+        ),
+        (
+            {"model_type": "qwen3_moe", "num_experts": 128, "num_experts_per_tok": 8},
+            (128, 8),
+        ),
+        (kimi(num_experts=32, num_experts_per_token=4), (32, 4)),
+        ({"model_type": "llama"}, None),
+    ],
+)
+def test_the_law_states_the_routing_the_served_model_s_config_names(
+    tmp_path, config, routing
+):
+    m, key = model(tmp_path / "m", config)
+    a = record(tmp_path / "a", 19, key=key)
+    fit(tmp_path, "fit steps", *LINEAR, "--model", m, a, *clients(a))
+
+    law = json.loads((tmp_path / "out/step_linear_law.json").read_text())["params"]
+    stated = routing and {"experts": routing[0], "top_k": routing[1]}
+    assert law.get("moe_routing") == stated
+
+
+@pytest.mark.parametrize(
+    "served, config, named",
+    [
+        (
+            HOST,
+            MOE,
+            "--model {m} holds config.json {digest}; the records served {served}",
+        ),
+        (
+            None,
+            kimi(num_experts=32),
+            "--model {m} names 32 routed experts and no top-k",
+        ),
+    ],
+)
+def test_a_model_the_records_did_not_serve_or_with_no_top_k_refuses(
+    tmp_path, served, config, named
+):
+    m, key = model(tmp_path / "m", config)
+    a = record(tmp_path / "a", 19, key=served or key)
+
+    named = named.format(m=m, digest=key["model"], served=HOST["model"])
+    with pytest.raises(SystemExit, match=re.escape(named)):
+        fit(tmp_path, "fit steps", *LINEAR, "--model", m, a, *clients(a))
+    assert not (tmp_path / "store").exists()
+
+
+def test_the_model_refuses_beside_the_routing_and_off_step_linear(tmp_path, capsys):
+    m, key = model(tmp_path / "m", MOE)
+    a = record(tmp_path / "a", 19, key=key)
+
+    with pytest.raises(SystemExit):
+        both = ("--moe-routing", "64,4", "--model", m)
+        fit(tmp_path, "fit steps", *LINEAR, *both, a, *clients(a))
+    assert "--model: not allowed with argument --moe-routing" in capsys.readouterr().err
+    grid = ("--backend", "step-grid", "--model", m)
+    named = "--model is read by step-linear, not step-grid"
+    with pytest.raises(SystemExit, match=re.escape(named)):
+        fit(tmp_path, "fit steps", *grid, a, *clients(a))
     assert not (tmp_path / "store").exists()
 
 
