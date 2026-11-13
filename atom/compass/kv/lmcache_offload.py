@@ -11,7 +11,9 @@ nothing; a `multi` that lists it builds `MultiShell`
 `OffloadShell` wraps ATOM's `LMCacheOffloadConnectorScheduler`, with the layout
 its config selects, built with `Lookup` in place of LMCache's lookup client;
 a layout whose worker keeps a state tier beside its chunks is refused, so it
-is dense's or MiniMax-M3's `M3OffloadScheduler`. It keeps one ATOM worker
+is dense's or MiniMax-M3's `M3OffloadScheduler`. It refuses to start when
+LMCache's lookup client factory raises, where ATOM's scheduler half would run
+with no lookup client and look nothing up. It keeps one ATOM worker
 connector of that layout per TP rank, with no device, whose LMCache engine is
 the rank's `Engine` over the rank's `Tier`. Each load and save that
 `build_connector_meta` hands a rank waits on the rank's load or save queue, as
@@ -41,7 +43,7 @@ unpins a chunk pinned longer than ``pin_timeout_sec``, checking every
 
 The run file's `ENTRY` holds ``chunk_size``, ``tensor_parallel_size`` and
 ``chunk_bytes``, as the deployment it was fitted on logged them, and the
-three priced terms (`atom.compass.backends.step_linear_fit.fit_offload`). A
+priced terms `TERMS` names (`atom.compass.backends.step_linear_fit.fit_offload`). A
 deployment of another chunk size or TP width is refused, and so is an LMCache
 config with a tier or a lookup this does not model (`UNMODELLED`). Importing
 this module loads no third-party package; using it loads lmcache, numpy and
@@ -65,6 +67,17 @@ logger = logging.getLogger(__name__)
 ENTRY = "lmcache_offload"
 #: The entry's priced terms, each ``[fixed, per chunk]`` seconds.
 TERMS = ("lookup_s", "store_s", "load_s")
+#: A tier's counts, each reported from zero.
+COUNTS = (
+    "stored",
+    "evicted",
+    "duplicates",
+    "store_cut",
+    "forced_unpins",
+    "lookups",
+    "lookup_chunks",
+    "hit_chunks",
+)
 #: The entry's fields the deployment must match.
 MATCHED = ("chunk_size", "tensor_parallel_size")
 #: The layouts whose worker stores chunks alone, `DenseOffloadConnector`'s.
@@ -168,7 +181,7 @@ class Tier:
         self.lookups: dict[str, list[bytes]] = {}
         self.pinned: dict[bytes, _Chunk] = {}
         self.pin_timeout_s, self.check_s, self.next_check = pin_timeout_s, check_s, 0.0
-        self.counts = collections.Counter()
+        self.counts = collections.Counter(dict.fromkeys(COUNTS, 0))
 
     def lookup(self, keys: list[bytes], lookup_id: str, now: float) -> int:
         """Pin the held prefix of `keys` under `lookup_id`, touch it last chunk
@@ -381,10 +394,15 @@ class OffloadShell:
             for _ in range(world)
         ]
         factory = vars(LookupClientFactory)["create_lookup_client"]
+        raised = []
 
         def lookup(cfg, meta, *args):
-            ids = cfg.get_lookup_server_worker_ids(meta.use_mla, meta.world_size)
-            return Lookup(self, ids or range(meta.world_size))
+            try:
+                ids = cfg.get_lookup_server_worker_ids(meta.use_mla, meta.world_size)
+                return Lookup(self, ids or range(meta.world_size))
+            except Exception as e:
+                raised.append(e)
+                raise
 
         # The scheduler half builds its lookup client once, here.
         LookupClientFactory.create_lookup_client = staticmethod(lookup)
@@ -392,6 +410,13 @@ class OffloadShell:
             self._inner = LMCacheOffloadConnectorScheduler(config)
         finally:
             LookupClientFactory.create_lookup_client = factory
+        if not isinstance(self._inner._impl._lookup_client, Lookup):
+            why = f"raised {raised[0]!r}" if raised else "did not build it"
+            raise RuntimeError(  # noqa: TRY004 - a refusal, not a type error
+                "lmcache_offload's scheduler half has no simulated lookup client "
+                "and would look nothing up: LMCache's "
+                f"LookupClientFactory.create_lookup_client {why}"
+            ) from next(iter(raised), None)
         self._ranks = []
         for k, tier in enumerate(self._tiers):
             rank = _build_worker(config)
@@ -405,7 +430,10 @@ class OffloadShell:
         ]
         self._due: list = []  # (end, order, rank, kind, request)
         self._order = itertools.count()
-        self._copied = {kind: collections.Counter() for kind in ("load", "save")}
+        self._copied = {
+            kind: collections.Counter(copies=0, chunks=0, seconds=0.0, waited=0.0)
+            for kind in ("load", "save")
+        }
         self._tp = KVOutputAggregator(world_size=world)
         self._held = None  # what the ranks reported at the previous call
 
@@ -497,7 +525,9 @@ class OffloadShell:
     def offload_statistics(self) -> dict:
         """ATOM's counters, rank 0's priced copies, and the tiers' counts
         summed over the ranks, with what rank 0's tier holds."""
-        tiers = sum((t.counts for t in self._tiers), collections.Counter())
+        tiers = collections.Counter()
+        for tier in self._tiers:
+            tiers.update(tier.counts)  # `+` would drop the zeros
         return {
             "connector": self._inner.get_statistics(),
             "copies": {kind: dict(c) for kind, c in self._copied.items()},

@@ -245,8 +245,13 @@ def test_a_saved_prefix_is_looked_up_on_every_rank_and_loaded_at_its_priced_end(
     # The load released the lookup's pins on every rank.
     assert [len(t.pinned) for t in shell._tiers] == [0, 0]
     said = shell.offload_statistics()
+    # Nothing was evicted, and the counts say so.
     assert said["tier"] == {
         "stored": 8,
+        "evicted": 0,
+        "duplicates": 0,
+        "store_cut": 0,
+        "forced_unpins": 0,
         "lookups": 2,
         "lookup_chunks": 10,
         "hit_chunks": 8,
@@ -260,6 +265,43 @@ def test_a_saved_prefix_is_looked_up_on_every_rank_and_loaded_at_its_priced_end(
     }
     assert LoadOperationId("b", 0) not in shell._inner._impl._load_inflight_tokens
     engine.finish()
+
+
+def test_a_shell_that_has_done_nothing_reports_every_count_as_zero(
+    tmp_path, monkeypatch
+):
+    engine = Engine(tmp_path, monkeypatch)
+    said = engine.shell.offload_statistics()
+    assert said["tier"] == {
+        "stored": 0,
+        "evicted": 0,
+        "duplicates": 0,
+        "store_cut": 0,
+        "forced_unpins": 0,
+        "lookups": 0,
+        "lookup_chunks": 0,
+        "hit_chunks": 0,
+        "held_chunks": 0,
+    }
+    nothing = {"copies": 0, "chunks": 0, "seconds": 0.0, "waited": 0.0}
+    assert said["copies"] == {"load": nothing, "save": nothing}
+    engine.finish()
+
+
+def test_a_lookup_client_factory_that_raises_refuses_the_start(tmp_path, monkeypatch):
+    """ATOM's scheduler half catches the factory's error and runs with no
+    lookup client, which would look nothing up; the simulated start refuses."""
+    from lmcache.v1.config import LMCacheEngineConfig
+
+    def newer(self, *args):
+        raise TypeError("get_lookup_server_worker_ids() takes 2 arguments")
+
+    monkeypatch.setattr(LMCacheEngineConfig, "get_lookup_server_worker_ids", newer)
+    with pytest.raises(
+        RuntimeError, match="LookupClientFactory.create_lookup_client raised TypeError"
+    ) as refused:
+        Engine(tmp_path, monkeypatch)
+    assert isinstance(refused.value.__cause__, TypeError)
 
 
 def test_a_deployment_and_its_run_file_agree_on_the_tier(tmp_path, monkeypatch):
