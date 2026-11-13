@@ -18,6 +18,7 @@ from test_key_index_cache_dtype import V41, V41_SERVER, served
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass.run.step_grid import keyed
+from atom.quant_spec import LayerQuantConfig
 from atom.utils import envs
 
 BOUND = (
@@ -64,6 +65,13 @@ LEFT_OUT = {
 }
 #: A value no config holds.
 OTHER = object()
+#: Another value for each layer list of the quantization config, which `keyed`
+#: reads through ATOM's remap of its layer names: a pattern is a (name, spec)
+#: pair and an exclude a name, and `OTHER` is neither.
+NAMED = {
+    "quant_config.layer_pattern_specs": [("model.layers.0.mlp", LayerQuantConfig())],
+    "quant_config.exclude_layers": ["model.layers.0.mlp"],
+}
 
 
 def other(value):
@@ -102,7 +110,8 @@ def changes(config, monkeypatch):
             yield name, holding(config, name, other(value))
             continue
         for field in names(value):
-            owner = holding(value, field, other(getattr(value, field)))
+            held = NAMED.get(f"{name}.{field}", other(getattr(value, field)))
+            owner = holding(value, field, held)
             changed = holding(config, name, owner)
             if name == "hf_config" and field in config.hf_overrides:
                 stated = config.hf_overrides | {field: getattr(owner, field)}
