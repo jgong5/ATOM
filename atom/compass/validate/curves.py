@@ -23,17 +23,16 @@ phase or name none. A percentile interpolates linearly between ranks.
 - p90 interactivity, one over the p90 inter-token latency; p90 E2E-normalized
   interactivity, one over the p90 of each request's latency per output token;
 - GPU and CPU hit rates: the changes of `atom:prefix_cache_cached_tokens` and
-  of `atom:lmcache_loaded_tokens` across the profiling window, each over that
-  of `atom:prefix_cache_full_tokens`, summed over every series aiperf's
-  `artifacts/server_metrics_export.json` holds. A simulated run's client
-  scrapes no server metrics, so a simulated run's are the changes of the same
-  counters of its own engines, ATOM's `cached_tokens`, `loaded_tokens` and
+  of `atom:lmcache_loaded_tokens` across aiperf's profiling window, each over
+  that of `atom:prefix_cache_full_tokens`, summed over every series aiperf's
+  `artifacts/server_metrics_export.json` holds; on a real `--agentx` run that
+  window starts at the scrape before warmup. A simulated run's client scrapes
+  no server metrics, so a simulated run's are the changes of the same counters
+  of its own engines, ATOM's `cached_tokens`, `loaded_tokens` and
   `full_tokens`, summed over the series `client-0/summary.json` holds under
-  `hit_counters`: from each one's sample in force when the earliest record of
-  the profiling phase, or naming none, was sent, its `request_start_ns` on the
-  Compass clock, to its last. A sample is stamped at its step's end, so a step
-  that began before that send and ended after it falls inside. Without them a
-  run's hit rates have no value.
+  `hit_counters`: from each one's sample in force when the earliest record,
+  warmup's included, was sent, its `request_start_ns` on the Compass clock, to
+  its last. Without them a run's hit rates have no value.
 
 A judged metric of a simulated run passes at its point when its value lies
 inside the real runs' min-to-max band, or within `LIMITS` of their mean:
@@ -158,7 +157,8 @@ def _counter(metrics: dict, stem: str) -> float | None:
 def _hit_counters(run: Path, sent: list[dict]) -> list | None:
     """The changes of a simulated run's cached, full and loaded tokens, summed
     over its engines' `hit_counters`, from each one's sample in force at the
-    earliest send of the records `sent` to its last; None without them."""
+    earliest send of the records `sent`, of any phase, to its last; None
+    without them."""
     path = run / SUMMARY
     series = (read_json(path).get("hit_counters") if path.is_file() else None) or {}
     starts = [
@@ -179,12 +179,13 @@ def metrics(run, simulated: bool = False) -> dict:
     """InferenceX's metrics of the run directory `run`, None where it has none;
     the hit rates from its own counters when `simulated`."""
     run = Path(run)
-    sent = [
+    sent = read_jsonl(run / RECORDS)
+    rs = [
         r
-        for r in read_jsonl(run / RECORDS)
-        if r.get("metadata", {}).get("benchmark_phase") in (None, "profiling")
+        for r in sent
+        if not r.get("error")
+        and r.get("metadata", {}).get("benchmark_phase") in (None, "profiling")
     ]
-    rs = [r for r in sent if not r.get("error")]
     ttft, itl = (
         [v / 1000 for v in _positive(_metric(r, k) for r in rs)]
         for k in ("time_to_first_token", "inter_token_latency")

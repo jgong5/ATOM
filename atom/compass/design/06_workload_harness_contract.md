@@ -1086,7 +1086,7 @@ turn (agentx-harness `timing/trajectory_source.py`).
   `CompassAgenticReplay` refuses it, since D34 leaves how the scrape's process reaches the
   clock undesigned. A real run scrapes (#3332), the option outside the hashed arguments so
   both sides hash alike; a simulated run's hit rates are its engines' own counters across
-  the client's profiling window (`08` D45.1).
+  the client run, warmup included, as aiperf's real export reads them (`08` D45.1).
 
 ### Open issues
 

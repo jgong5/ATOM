@@ -324,7 +324,7 @@ band, or within a stated distance of their mean:**
   #3264 computes them from client exports and draws both curves on InferenceX's axes.
 - **The hit rates** are its ATOM adapter's
   ([`backends/atom.py`](https://github.com/SemiAnalysisAI/InferenceX/blob/4b94f096b74191b8af6b7c89e50e0b6bc69f7aba/inferencex-e2e/infx/results/agentic/backends/atom.py)):
-  the changes across the profiling window of `atom:prefix_cache_cached_tokens` (GPU) and
+  the changes across aiperf's profiling window of `atom:prefix_cache_cached_tokens` (GPU) and
   `atom:lmcache_loaded_tokens` (CPU), each over that of `atom:prefix_cache_full_tokens`. A
   simulated run's counters are ATOM's own, kept by its real prefix cache and the
   connector's real scheduler half (`03` D13.1).
@@ -333,15 +333,15 @@ band, or within a stated distance of their mean:**
   engine records `cached_tokens`, `full_tokens` and `loaded_tokens` on its clock after
   every step that changed one, into the client run's summary (#3347), and `validate
   --curves` takes their change, summed over engines, from each one's sample in force
-  when the profiling phase's first request was sent to its last. aiperf stamps that send
-  on the Compass clock plus an epoch, `atom/compass/carriers.py::EPOCH_NS`, which the
-  harness and `validate` share. A real run keeps aiperf's scrape (#3332). Residuals,
-  stated per point:
+  when the client's first request, warmup's included, was sent to its last. Warmup's
+  admissions count because they do on the real side: aiperf's export of a real
+  `--agentx` run starts its profiling window at the scrape before warmup (owner ruling
+  on [#3326](https://github.com/jgong5/ATOM/issues/3326), 2026-11-13, option (a)).
+  aiperf stamps that send on the Compass clock plus an epoch,
+  `atom/compass/carriers.py::EPOCH_NS`, which the harness and `validate` share. A real
+  run keeps aiperf's scrape (#3332). Residuals, stated per point:
   - a real edge is a snapshot up to about 2 s old (one engine push plus one exporter
     refresh), so the admissions of those 2 s at each edge fall on the other side;
-  - a simulated sample is stamped at its step's end, so a step that began before the
-    first send and ended after it falls inside; it holds no warmup admission while the
-    warmup waits for every request to return, as the `agentx` warmup does;
   - a real server renders a scrape about every 400 ms, which a simulated one never does,
     and the TTFT and TPOT rows compare across that load.
 - **A point passes when every metric does.** For the stage's cells this is D45's gate made
@@ -902,7 +902,7 @@ claims there are not.
 |---|---|---|
 | D44 | Three separable results — cost accuracy, schedule agreement, end-to-end — reported side by side. Aggregate latency is never the judgement. | 2026-09-18 |
 | D45 | Noise-floor first: the real-vs-real spread is the tolerance. A metric is admissible if stable; sensitivity, tested against the ×0.97 counterfactual, is deferred until a need appears. | 2026-09-18; revised 2026-10-16 (#1025) |
-| D45.1 | Overlap, ruled by the owner for the M3-Agentic stage: at every point each simulated value lies inside the real rounds' min-to-max band, or within 5% of their mean for throughput per GPU, p90 interactivity and median TPOT, 10% for p90 TTFT, and 2 points for the GPU and CPU hit rates; InferenceX's metric definitions, against this branch's ATOM on gpu-40. A simulated run's hit rates are its engines' own counters across the client's profiling window. | 2026-11-12 (#3257); simulated hit rates 2026-11-13 (#3326) |
+| D45.1 | Overlap, ruled by the owner for the M3-Agentic stage: at every point each simulated value lies inside the real rounds' min-to-max band, or within 5% of their mean for throughput per GPU, p90 interactivity and median TPOT, 10% for p90 TTFT, and 2 points for the GPU and CPU hit rates; InferenceX's metric definitions, against this branch's ATOM on gpu-40. A simulated run's hit rates are its engines' own counters across the client run, warmup included, as aiperf's real export reads them. | 2026-11-12 (#3257); simulated hit rates 2026-11-13 (#3326) |
 | D46 | Three metric families ordered by robustness, as an extensible registry: counting invariants (preemptions and prefill tokens graded against the real spread, prefill tokens over the requests both runs issued; every other count reported, not gated), distributional (weighted most), event timing (most diagnostic). Policy agreement is a regression guard, not a discriminator. | 2026-09-18; revised 2026-10-11 (#743) and 2026-10-13 (#897) |
 | D47 | Cost accuracy on the real run's own step sequence; report totals, held-out-worst, and median per step together. Graded: every answered step with no declared term, at every backend, under #627's 5% gate; validated and unvalidated steps reported beside, not gated; declared steps apart. | 2026-09-18; revised 2026-10-23 (#2011) |
 | D48 | Memory per term, never as a sum. The gate is whether the top-1 configuration choice survives, not the byte error. | 2026-09-18 |
