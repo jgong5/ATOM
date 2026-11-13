@@ -1,0 +1,209 @@
+# SPDX-License-Identifier: MIT
+"""Whether a DP-attention MoE fuses its shared expert into aiter's top-k table
+changes its `op_graph`: fused, the fused-MoE leaf takes the shared expert's id
+in each row; unfused, the shared MLP runs beside it. ATOM decides it from
+``ATOM_FUSE_SHARED_EXPERT``, ``ATOM_DISABLE_MORI_EP``, whether mori imports and
+the all-to-all backend (`model_ops/topK.py`), and for an MXFP8 shared expert
+beside MXFP4 routed ones from ``ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4``. Each
+changed alone where it flips ATOM's decision keys the graph apart, and a run,
+or `measure ops`, under one refuses a graph traced under the other, naming it;
+a server at ATOM's defaults keys as before.
+
+No device: aiter's arch probe answers a declared arch.
+"""
+
+import importlib.util
+import pathlib
+from importlib.machinery import ModuleSpec
+from types import SimpleNamespace
+
+import pytest
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
+from test_key_index_cache_dtype import served
+
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
+from atom.compass import capture
+from atom.compass import run as compass_run
+from atom.compass.artifacts import ArtifactRefusal, ArtifactStore
+from atom.compass.bench import ops
+from atom.compass.capture.forward import decode, structure
+from atom.compass.capture.graph import Traced
+from atom.compass.ir import Graph, Op
+from atom.compass.run.step_grid import BUCKETS, keyed
+
+V3 = pathlib.Path(__file__).with_name("deepseek_v3_config.json")
+ARCH = "gfx950"
+#: Eager, the mode a run reads its graphs in, so `measure ops` reads the same.
+DPA_TP8 = ("-tp", "8", "--kv_cache_dtype", "fp8", "--enable-dp-attention")
+DPA_TP8 += ("--enforce-eager",)
+FUSE = "ATOM_FUSE_SHARED_EXPERT"
+MORI_EP = "ATOM_DISABLE_MORI_EP"
+MXFP8 = "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4"
+#: The field `keyed` states where mori does not import.
+MORI = "mori_imports"
+FIND_SPEC = importlib.util.find_spec
+#: Each input changed alone from a DP-attention server with mori and
+#: `ATOM_FUSE_SHARED_EXPERT=0`, whose MoE ATOM does not fuse: ATOM's arguments,
+#: the environment (None unsets a variable), whether mori imports, and the
+#: field a refusal names with its value there and here.
+CHANGES = {
+    "fuse-default": ((), {FUSE: None}, True, (f"env {FUSE}", "0", None)),
+    "mori-ep-off": (
+        (),
+        {MORI_EP: "1"},
+        True,
+        (f"env {MORI_EP}", None, "1"),
+    ),
+    "no-mori": ((), {}, False, (MORI, None, False)),
+    "rccl": (
+        ("--all2all-backend", "rccl"),
+        {},
+        True,
+        ("moe_all2all_backend", None, "rccl"),
+    ),
+    "none": (
+        ("--all2all-backend", "none"),
+        {},
+        True,
+        ("moe_all2all_backend", None, "none"),
+    ),
+}
+
+
+def server(tmp_path, monkeypatch, args=(), env=None, mori=True):
+    """A DP-attention V3 server's config on `ARCH`, ATOM's own fusion switch
+    at 0, with ATOM's arguments `args`, the variables `env` set or unset, and
+    mori importing or not (`mori`), each held while the test reads the key."""
+    for name in (*PERFORMANCE_KEYS, BUCKETS, FUSE, MORI_EP, MXFP8):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in ({FUSE: "0"} | (env or {})).items():
+        if value is not None:
+            monkeypatch.setenv(name, value)
+    spec = ModuleSpec("mori", None) if mori else None
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *a, **k: spec if name == "mori" else FIND_SPEC(name, *a, **k),
+    )
+    return served(tmp_path, monkeypatch, ARCH, V3, *DPA_TP8, *args)
+
+
+def on_arch(monkeypatch) -> None:
+    """aiter's Triton arch as `ARCH`: no device to probe at import, and
+    nothing here launches a kernel."""
+    from aiter.ops.triton.utils._triton import arch_info
+
+    monkeypatch.setattr(arch_info, "_CACHED_ARCH", arch_info._CACHED_ARCH or ARCH)
+
+
+def fuses(monkeypatch, config, quant=None) -> bool:
+    """Whether ATOM fuses the shared expert of `config`'s first MoE layer, as
+    `FusedMoE` asks it, under `config`'s quantization or `quant`."""
+    on_arch(monkeypatch)
+    from atom.model_ops.topK import (
+        is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config as fusion,
+    )
+    from atom.model_ops.utils import _has_module
+
+    monkeypatch.setattr("atom.config._current_atom_config", config)
+    layer = "model.layers.3.mlp"
+    # ATOM probes whether mori imports once a process: here at each call.
+    _has_module.cache_clear()
+    try:
+        held = quant or config.quant_config
+        return fusion(held, f"{layer}.shared_experts", f"{layer}.experts")
+    finally:
+        _has_module.cache_clear()
+
+
+def mxfp8_beside_mxfp4(monkeypatch):
+    """A quantization config stating MXFP8 for each shared expert and MXFP4 for
+    each routed one, as MiniMax-M3.1's MXFP4 export does."""
+    on_arch(monkeypatch)
+    import aiter
+
+    from atom.quant_spec import LayerQuantConfig
+
+    mx = aiter.QuantType.per_1x32
+    specs = {
+        True: LayerQuantConfig(quant_type=mx, quant_dtype=aiter.dtypes.fp8),
+        False: LayerQuantConfig(quant_type=mx, quant_dtype=aiter.dtypes.fp4x2),
+    }
+
+    def get_layer_quant_config(prefix, check_children=False):
+        return specs["shared" in prefix]
+
+    return SimpleNamespace(get_layer_quant_config=get_layer_quant_config)
+
+
+def published(store, config, leaf):
+    """`config`'s decode B=4 graph of one leaf `leaf`, published at the key
+    `trace ops` gives it in this process."""
+    at = structure(config, "decode", True, ARCH)
+    graph = Graph(Traced(at, "decode B=4"), Op(leaf, "opaque_leaf", (), ()))
+    model = compass_run._file_digest(config.model, "config.json")
+    return capture.publish(store, graph, model, {"arch": ARCH}, 8, [], "trace ops")
+
+
+@pytest.mark.parametrize("change", CHANGES.values(), ids=CHANGES)
+def test_each_input_that_flips_atom_s_fusion_keys_the_graph_apart(
+    tmp_path, monkeypatch, change
+):
+    args, env, mori, _ = change
+    base = server(tmp_path, monkeypatch)
+    unfused, at = fuses(monkeypatch, base), structure(base, "decode", device=ARCH)
+    changed = server(tmp_path, monkeypatch, args, env, mori)
+
+    assert (unfused, fuses(monkeypatch, changed)) == (False, True)
+    assert structure(changed, "decode", device=ARCH) != at
+
+
+@pytest.mark.parametrize("traced", ["base", "changed"])
+@pytest.mark.parametrize("change", CHANGES.values(), ids=CHANGES)
+def test_a_reader_under_one_refuses_a_graph_traced_under_the_other_naming_it(
+    tmp_path, monkeypatch, change, traced
+):
+    args, env, mori, (field, *values) = change
+    sides = {"base": ((), None, True), "changed": (args, env, mori)}
+    [read] = sides.keys() - {traced}
+    store = ArtifactStore(tmp_path / "store")
+    published(store, server(tmp_path, monkeypatch, *sides[traced]), "aiter.traced")
+    reader = server(tmp_path, monkeypatch, *sides[read])
+    there, here = values if traced == "base" else values[::-1]
+    named = f"{field} {there!r} in the graph and {here!r} here"
+
+    with pytest.raises(ArtifactRefusal) as bench:
+        ops.graph(store, reader, decode(4), ARCH)
+    assert named in str(bench.value)
+    assert named in compass_run._op_graphs(str(store.root), reader, ARCH)(
+        "decode", 4, 4
+    )
+
+
+def test_an_mxfp8_shared_expert_fused_into_mxfp4_keys_the_graph_apart(
+    tmp_path, monkeypatch
+):
+    # At ATOM's own fusion switch's default the DP-attention gate passes, and
+    # the dtypes differ: ATOM fuses only under the MXFP8 switch.
+    quant = mxfp8_beside_mxfp4(monkeypatch)
+    base = server(tmp_path, monkeypatch, env={FUSE: None})
+    unfused = fuses(monkeypatch, base, quant)
+    at = structure(base, "decode", device=ARCH)
+    store = ArtifactStore(tmp_path / "store")
+    published(store, base, "aiter.traced")
+    changed = server(tmp_path, monkeypatch, env={FUSE: None, MXFP8: "1"})
+
+    assert (unfused, fuses(monkeypatch, changed, quant)) == (False, True)
+    assert structure(changed, "decode", device=ARCH) != at
+    with pytest.raises(ArtifactRefusal) as bench:
+        ops.graph(store, changed, decode(4), ARCH)
+    assert f"env {MXFP8} None in the graph and '1' here" in str(bench.value)
+
+
+def test_a_server_at_atom_s_defaults_keys_as_before(tmp_path, monkeypatch):
+    unset = keyed(server(tmp_path, monkeypatch, env={FUSE: None}))
+    spelled = server(tmp_path, monkeypatch, env={FUSE: "1", MORI_EP: "0", MXFP8: "0"})
+
+    assert unset["env"] == {}
+    assert not {MORI, "moe_all2all_backend"} & unset.keys()
+    assert keyed(spelled) == unset
