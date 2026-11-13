@@ -9,10 +9,18 @@ The worker's config is parsed here with aiter's arch probe and fp8 dtype
 answering its arch, as on its device; `compass measure memory` publishes the
 readings under its key.
 
+The check builds its config where its machine's device is declared, a process
+of its own, so a config class a model's remote code defines comes back from
+there.
+
 No device: the check declares its machine's.
 """
 
 import json
+import os
+import pathlib
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -34,6 +42,15 @@ PTPC_FP8 = (
 FP8 = {"gfx950": torch.float8_e4m3fn, "gfx942": torch.float8_e4m3fnuz}
 #: A device of each arch.
 DEVICES = {"gfx950": "MI355X", "gfx942": "MI308X"}
+TREE = pathlib.Path(__file__).resolve().parents[2]
+QWEN = pathlib.Path(__file__).with_name("qwen3_0_6b_config.json")
+#: The config class of a checkpoint that ships its own, which ATOM loads only
+#: under --trust-remote-code.
+REMOTE = (
+    "from transformers import Qwen3Config\n\n\n"
+    "class TinyConfig(Qwen3Config):\n"
+    '    model_type = "tiny_remote"\n'
+)
 
 
 def machine(arch):
@@ -74,3 +91,30 @@ def test_a_check_finds_the_readings_its_machine_s_worker_keys(
 
     assert lacked(capsys.readouterr().out) == []
     assert exited.value.code == 0
+
+
+def test_a_check_reads_the_config_of_a_model_with_remote_code(tmp_path):
+    model = tmp_path / "tiny"
+    model.mkdir()
+    config = json.loads(QWEN.read_text()) | {"model_type": "tiny_remote"}
+    config["auto_map"] = {"AutoConfig": "configuration_tiny.TinyConfig"}
+    (model / "config.json").write_text(json.dumps(config))
+    (model / "configuration_tiny.py").write_text(REMOTE)
+    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
+    flags = ["--step-stub", stub(tmp_path), "--machine", str(tmp_path / "machine.json")]
+    flags += ["--store", str(tmp_path / "store"), "--check"]
+    atom = ["--model", str(model), "--trust-remote-code"]
+    # A command of its own, as the check runs: no remote code is loaded in it.
+    cli = [sys.executable, "-c", "from atom.compass.cli import main; main()", "run"]
+    env = dict(os.environ, PYTHONPATH=str(TREE))
+    env["HF_MODULES_CACHE"] = str(tmp_path / "modules")
+
+    done = subprocess.run(
+        [*cli, *flags, "--", *atom],
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert lacked(done.stdout) == ["memory readings: missing"], done.stderr[-3000:]

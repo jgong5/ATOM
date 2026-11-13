@@ -359,8 +359,13 @@ def _config(atom_args, arch: str | None = None):
     """ATOM's `Config` for a server's arguments, as the server runs it; with
     `arch`, as it runs on a device of that arch (`_declared`)."""
     if arch is not None:
+        from transformers.dynamic_module_utils import init_hf_modules
+
         from atom.compass.bench.ops import _child
 
+        # A model's remote code loads in the child, which writes it to
+        # transformers' module cache; its config classes load here from there.
+        init_hf_modules()
         return _child(_declared, atom_args, arch)
     from atom.compass.bench.measure import atom_config
 
