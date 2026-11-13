@@ -155,9 +155,7 @@ def test_a_reader_under_one_refuses_a_graph_traced_under_the_other_naming_it(
 
 def test_a_server_at_atom_s_defaults_keys_as_before(tmp_path, monkeypatch):
     unset = keyed(server(tmp_path, monkeypatch, env={FUSE: None}))
-    spelled = server(
-        tmp_path, monkeypatch, env={FUSE: "1", MORI_EP: "0"}
-    )
+    spelled = server(tmp_path, monkeypatch, env={FUSE: "1", MORI_EP: "0"})
 
     assert unset["env"] == {}
     assert not {MORI, "moe_all2all_backend"} & unset.keys()
