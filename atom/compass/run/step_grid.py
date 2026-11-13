@@ -28,11 +28,12 @@ Its publisher states the readings `conditions` takes. The engine-config reading
 is `keyed`, as JSON: the ladder the runner replays (none under
 ``enforce_eager``), the KV block size and dtype, the quantization with its
 layer names as the model's runner remaps them (`quantization`), the TP and
-DP widths, DP attention, expert parallelism, TBO, the MoE backend, EPLB and
-DeepSeek-V4.1 decoder SWA bounded replay when
+DP widths, DP attention, expert parallelism, TBO, the MoE backend, the
+all-to-all backend, EPLB and DeepSeek-V4.1 decoder SWA bounded replay when
 off ATOM's default, the index cache's dtype where ATOM resolved it apart from
-the KV cache's, the performance environment, ATOM's prefill token buckets
-in it when off ATOM's default too, and, under speculation, its
+the KV cache's, whether mori imports where it does not, the performance
+environment, each variable of `READ_OFF_DEFAULT` in it when ATOM reads it off
+its default too, and, under speculation, its
 method and draft width, and the digest of the draft's config.json where it is
 not the target's. Loading refuses, naming what differs:
 
@@ -60,6 +61,7 @@ summary records the digest of the bundle it priced with.
 """
 
 import functools
+import importlib.util
 import json
 import os
 import pickle
@@ -93,6 +95,7 @@ MEMBER = ("params", Topology().ranks()[0], "json")
 #: value of the field it names there. None, a field left unresolved, is default.
 OFF_DEFAULT = (
     "moe_backend",
+    "moe_all2all_backend",
     "eplb_enable",
     "enable_decoder_swa_bounded_replay",
     "index_cache_dtype",
@@ -101,6 +104,14 @@ OFF_DEFAULT = (
 DERIVED = {"index_cache_dtype": "kv_cache_dtype"}
 #: ATOM's prefill token buckets, an environment variable `keyed` the same way.
 BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
+#: ATOM's environment variables keyed only where ATOM reads them off their
+#: default: `BUCKETS`, and the two that decide, with the all-to-all backend and
+#: whether mori imports (`MORI`), whether a DP-attention MoE fuses its shared
+#: expert into aiter's top-k table (`model_ops/topK.py`).
+READ_OFF_DEFAULT = (BUCKETS, "ATOM_FUSE_SHARED_EXPERT", "ATOM_DISABLE_MORI_EP")
+#: Whether mori, the all-to-all ATOM selects by default, imports: keyed only
+#: where it does not, so keys written where it imports do not move.
+MORI = "mori_imports"
 #: The quantization config's lists of layer names, which its runner remaps.
 LAYERS = ("layer_pattern_specs", "exclude_layers")
 LAYERS += tuple(f"online_{name}" for name in LAYERS)
@@ -113,10 +124,11 @@ DRAFT = "draft_model"
 
 def keyed(config, ladder: bool = True) -> dict:
     """The conditions a bundle is measured under, as the resolved config holds them,
-    `OFF_DEFAULT` only where it is off its default, and the performance
-    environment of this process less the client's and the device selection,
-    `BUCKETS` in it only off ATOM's default, and under speculation its method
-    and draft width, and `DRAFT` (`_draft`); the ladder only with `ladder`."""
+    `OFF_DEFAULT` only where it is off its default, `MORI` only where mori does
+    not import, and the performance environment of this process less the
+    client's and the device selection (`keyed_env`), and under speculation its
+    method and draft width, and `DRAFT` (`_draft`); the ladder only with
+    `ladder`."""
     from atom.config import Config
 
     spec = getattr(config, "speculative_config", None)
@@ -124,6 +136,8 @@ def keyed(config, ladder: bool = True) -> dict:
     drafts |= _draft(config, spec) if spec else {}
     if ladder:
         drafts["ladder"] = [] if config.enforce_eager else schedulable_ladder(config)
+    if importlib.util.find_spec("mori") is None:
+        drafts[MORI] = False
     for name in OFF_DEFAULT:
         default = Config.__dataclass_fields__[name].default
         if name in DERIVED:
@@ -203,24 +217,27 @@ def _remapped(pickled: bytes) -> str:
 
 def keyed_env() -> dict:
     """This process's performance environment as `keyed` states it: less the
-    client's variables and the device selection, `BUCKETS` in it only off
-    ATOM's default."""
+    client's variables and the device selection, each of `READ_OFF_DEFAULT` in
+    it only where ATOM reads it off its default."""
     return {
         k: v
-        for k, v in sorted((performance_env() | _buckets_off_default()).items())
+        for k, v in sorted((performance_env() | _off_default()).items())
         if not (k.startswith("AIPERF_") or k.endswith("_VISIBLE_DEVICES"))
     }
 
 
-def _buckets_off_default() -> dict:
-    """`BUCKETS` as this process sets it when ATOM reads it off its default, else
-    nothing: ATOM states the default only inside its reader, run here unset."""
+def _off_default() -> dict:
+    """Each of `READ_OFF_DEFAULT` as this process sets it where ATOM reads it off
+    its default: ATOM states each default only inside its reader, run here unset."""
     from atom.utils import envs
 
-    read = envs.environment_variables[BUCKETS]
     unset = SimpleNamespace(getenv=lambda _, default=None: default)
-    off = read() != FunctionType(read.__code__, read.__globals__ | {"os": unset})()
-    return {BUCKETS: os.environ[BUCKETS]} if off else {}
+    readers = {name: envs.environment_variables[name] for name in READ_OFF_DEFAULT}
+    return {
+        name: os.environ[name]
+        for name, read in readers.items()
+        if read() != FunctionType(read.__code__, read.__globals__ | {"os": unset})()
+    }
 
 
 def differ(there: dict, here: dict, where: str) -> list[str]:

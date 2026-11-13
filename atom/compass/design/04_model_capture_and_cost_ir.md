@@ -1151,16 +1151,19 @@ model's architecture, the device arch, the config.json digest, the engine config
 step law is keyed by less its ladder (`run.step_grid.keyed`, `09` D54), the TP width and
 the DP and EP widths when set, the phase, the mode, and whether the step produces
 output. That engine config holds the KV block size and dtype, the quantization's hash,
-the parallel layout, TBO, speculation when it is on, `moe_backend`, `eplb_enable` and
-`enable_decoder_swa_bounded_replay` when
+the parallel layout, TBO, speculation when it is on, `moe_backend`,
+`moe_all2all_backend`, `eplb_enable` and `enable_decoder_swa_bounded_replay` when
 they are off ATOM's default, the `index_cache_dtype` ATOM resolved where it differs
 from `kv_cache_dtype` (the [ruling on #2981](https://github.com/jgong5/ATOM/issues/2981)),
-and the performance environment
+whether `mori` imports where it does not, and the performance environment
 (`atom.benchmarks.results.metadata.PERFORMANCE_KEYS`) less the client's `AIPERF_*`
 variables and the device selection; ATOM's Triton expert and GEMM switches
 (`ATOM_USE_TRITON_MOE`, `ATOM_USE_TRITON_MOE_A4W4`, `ATOM_USE_TRITON_MOE_DECODE`,
 `ATOM_USE_TRITON_GEMM`) are in it, and ATOM's prefill token buckets
-(`ATOM_TOKEN_GRAPH_SIZES`) only when ATOM reads them off its default. One store holds V4-Pro graphs of one shape that
+(`ATOM_TOKEN_GRAPH_SIZES`), `ATOM_FUSE_SHARED_EXPERT` and `ATOM_DISABLE_MORI_EP`
+only when ATOM reads them off their default. The last two, with the all-to-all
+backend and `mori`, decide whether a DP-attention MoE fuses its shared expert into
+aiter's top-k table, which changes its graph ([#3333](https://github.com/jgong5/ATOM/issues/3333)). One store holds V4-Pro graphs of one shape that
 differ only in `kv_cache_dtype`, only in `ATOM_USE_TRITON_MOE`, or only in the index
 cache dtype ATOM resolves for a P/D side and for a plain start at gfx950
 (`atom/config.py::Config.__post_init__`), and each run reads its own.
