@@ -84,8 +84,6 @@ GATED = {
     "declared": "not gated",
 }
 GATED_COUNTS = {"preemptions", "prefill tokens"}
-#: A deployment side's engine LP, whose hand-in its memory is checked against.
-HAND_IN = {"prefill": "engine-P", "decode": "engine-D"}
 #: Where `client.sh` states the workload of the client run it drove.
 WORKLOAD = "artifacts/workload.json"
 
@@ -412,7 +410,7 @@ def rows(cell) -> list[tuple]:
             steps, _traces, warmup = runs.graded(side, r, whole)
             out += _warmup(name, warmup)
             out += _cost(name, side, backend, steps, op)
-            out += _memory(name, sim, HAND_IN.get(side.name, ENGINE.name), side)
+            out += _memory(name, sim, runs.HAND_IN.get(side.name, ENGINE.name), side)
     out += _warm_over_cold(run_file) if op else ()
     for side in runs.sides(sim):
         name = " ".join(side.relative_to(cell).parts)

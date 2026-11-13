@@ -91,6 +91,16 @@ from the simulated cell to each real run. The families:
   and p50, request and output-token throughput. Distance `|a / b - 1|`.
   `ungradeable` where the real spread exceeds the target (15% TTFT, 10% the
   others); else `within target` where every result is inside it.
+- acceptance, per side whose engines verified drafts: the mean acceptance
+  length, one more than the drafts a verify row accepted, and each accepted
+  count's share of the verify rows, from none to the draft width. Each run's
+  histogram is over every step its server ran, summed over DP ranks: a real
+  run's as each rank's engine writes it at its stop (`ACCEPTANCE_FILE`), a
+  simulated run's from its run summary's `speculative` entries of the side's
+  engine LP (`HAND_IN`). Distance: the mean's `|a / b - 1|`, a share's
+  `|a - b|`, since a share a run never drew is 0. Refused where some runs'
+  side verified drafts and others' did not, where the runs drafted different
+  widths, and where a real side lacks a DP rank's histogram.
 
 Every metric is `inside the real spread` where each result is at most the
 spread, else `outside`.
@@ -115,6 +125,7 @@ from atom.compass.drive import aiter_jit
 from atom.compass.parity import ARRIVALS, read, transfers
 from atom.compass.parity.served import served
 from atom.compass.run import (
+    ACCEPTANCE_FILE,
     CLIENT_DIR,
     ENGINE,
     LP_FILE,
@@ -128,6 +139,10 @@ EXPORT = "artifacts/profile_export_aiperf.json"
 CLIENT_RUN = "artifacts/client_run.json"
 #: A deployment's sides, each its servers' directory in it.
 SIDES = ("prefill", "decode")
+#: The engine LP each side hands in as, its memory and acceptance with it; a
+#: single server's is `ENGINE`.
+HAND_IN = {"prefill": f"{ENGINE.name}-P", "decode": f"{ENGINE.name}-D"}
+MEAN_LENGTH = "mean acceptance length"
 TARGET = {"ttft": 0.15}
 DEFAULT_TARGET = 0.10
 ASSUMED = "its engines read assumed memory_readings members: {}"
@@ -229,6 +244,35 @@ def _distributions(steps) -> dict:
         "context tokens": [sum(c for _, c, _ in s["rows"]) for s in steps],
         "cached fraction": cached,
     }
+
+
+def _accepted(side, cell, simulated) -> tuple | None:
+    """The draft widths and the accepted-draft histogram of `side` of `cell`,
+    over every step its server ran and summed over its DP ranks; None where its
+    engines draft nothing. A simulated run's come from its run summary's
+    `speculative` entries of the side's engine LP, a real run's from each
+    rank's `ACCEPTANCE_FILE`; a real side lacking a rank's is refused."""
+    if simulated:
+        path = Path(cell) / SUMMARY_FILE
+        said = read_json(path).get("speculative", {}) if path.is_file() else {}
+        lp = ENGINE.name if Path(side) == Path(cell) else HAND_IN[Path(side).name]
+        held = [h for n, h in said.items() if n.split(".")[0] == lp]
+    else:
+        steps = Path(side) / "steps"
+        files = {p.name: p for p in steps.glob(ACCEPTANCE_FILE.format("*"))}
+        ranks = {ACCEPTANCE_FILE.format(p.stem[2:]) for p in steps.glob("dp*[0-9].jsonl")}
+        if files and (missing := sorted(ranks - set(files))):
+            raise ValueError(
+                f"{side} holds no {', '.join(missing)}, and its record holds "
+                "those DP ranks' steps"
+            )
+        held = [read_json(files[n]) for n in sorted(files)]
+    if not held:
+        return None
+    counts = collections.Counter()
+    for h in held:
+        counts.update({int(a): n for a, n in h["distribution"].items()})
+    return {h["draft_tokens"] for h in held}, counts
 
 
 def _end_to_end(export) -> dict:
@@ -414,6 +458,7 @@ def _read(cell, whole, simulated=False) -> dict:
             "counts": _counts(steps, export),
             "distributions": _distributions(steps),
             "requests": _requests(steps),
+            "acceptance": _accepted(side, cell, simulated),
         }
     # A run graded whole states its arguments in run.json.
     client = {} if traces is None else read_json(Path(cell) / CLIENT_RUN)
@@ -447,6 +492,45 @@ def _grade(family, name, real, simulated, d=None) -> dict:
         verdict = "outside"
     out["verdict"] = verdict
     return out
+
+
+def _grade_acceptance(cells, held: list, at: str) -> dict:
+    """The acceptance family of side `at`, "" a single server's, from `held`,
+    each of `cells`' `_accepted`, the simulated run's last: empty where no
+    run's engines verified a draft."""
+    rows = [h and h[1].total() for h in held]
+    if not any(rows):
+        return {}
+    side = f"{at.strip()} side" if at else "server"
+    if not all(rows):
+        each = dict(zip(map(str, cells), rows))
+        raise ValueError(
+            f"the runs' {side}s differ in whether they verified drafts; "
+            f"verify rows each: {each}"
+        )
+    if len(set().union(*(h[0] for h in held))) > 1:
+        widths = {str(c): sorted(h[0]) for c, h in zip(cells, held)}
+        raise ValueError(f"the runs' {side}s drafted different widths: {widths}")
+    *real, simulated = (_acceptance(*h) for h in held)
+    return {
+        name: _grade(
+            "acceptance",
+            name,
+            [r[name] for r in real],
+            simulated[name],
+            DISTANCE["end to end" if name == MEAN_LENGTH else "counts"],
+        )
+        for name in simulated
+    }
+
+
+def _acceptance(widths, counts) -> dict:
+    """The mean acceptance length and each accepted count's share of the verify
+    rows, of histogram `counts` drafted at the one width in `widths`."""
+    (width,), rows = widths, counts.total()
+    mean = 1 + sum(a * n for a, n in counts.items()) / rows
+    shares = {f"share accepting {a}": counts[a] / rows for a in range(width + 1)}
+    return {MEAN_LENGTH: mean} | shares
 
 
 def grade(real_cells, simulated_cell) -> dict:
@@ -515,6 +599,9 @@ def grade(real_cells, simulated_cell) -> dict:
             report[family + at] = every(
                 family, [t[family] for t in theirs], mine[family]
             )
+        held = [t["acceptance"] for t in theirs] + [mine["acceptance"]]
+        if accepted := _grade_acceptance(cells, held, at):
+            report["acceptance" + at] = accepted
         counts = report["counts" + at]
         totals = {k: counts["prefill tokens"][k] for k in ("real", "simulated")}
         requests = [t["requests"] for t in theirs], mine["requests"]
