@@ -38,9 +38,9 @@ comes first, and no skill: `scripts/compass/ADVICE.md`, linked both ways with
 `QUICKSTART.md` and #2893's page, gives each step one command and its expected output,
 has a section on filling the space file (D109) and states D108's limits, exact enough
 that an agent following it fills the DeepSeek-V4-Pro template's space file from the
-recipes D115 names. An agent shows the user a printed calibration's GPU time, starts it in the
-background only on the user's yes, reruns `compass advice` later rather than waiting, and
-adds no judgement of its own.
+recipes D115 names. An agent shows the user a printed calibration's GPU time, starts it
+in the background only on the user's yes, reruns `compass advice` later rather than
+waiting, and adds no judgement of its own.
 
 **Reason.** A calibration spends GPU hours and a search CPU minutes: apart, each half is
 built and replaced alone, and a rerun takes up whatever calibration has finished; a guide
@@ -127,7 +127,8 @@ point counts both sides' GPUs (T110).
   no other dominates on both.
 - **Recommendation**: the most throughput per GPU, InferenceX's, among points that meet
   the SLO, its interactivity bound on P90 interactivity, and have no refusal.
-  **Runner-up**: at its concurrency, another configuration's point chosen by the same rule.
+  **Runner-up**: at its concurrency, another configuration's point chosen by the same
+  rule.
 - **A point with a refusal** is a coverage report (`08` D50.1), out of the frontier,
   recommendation and runner-up, listed with what it lacks and the command that
   calibrates it.
