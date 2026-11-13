@@ -1,0 +1,17 @@
+arm | concurrency | run | metric | value | verdict
+tp4 | 1 | step_linear | throughput per GPU (tok/s/GPU) | simulated 7232; real mean 7226, band 7208 to 7245 (-0.25% to +0.25%); off mean +0.08%, limit 5% | pass: in band
+tp4 | 1 | step_linear | p90 interactivity (tok/s/user) | simulated 461.4; real mean 491.8, band 485.8 to 497.7 (-1.21% to +1.21%); off mean -6.18%, limit 5% | fail
+tp4 | 1 | step_linear | p90 TTFT (s) | simulated 0.6317; real mean 0.6922, band 0.6465 to 0.7379 (-6.60% to +6.60%); off mean -8.74%, limit 10% | pass: within 10% of mean
+tp4 | 1 | step_linear | median TPOT (ms) | simulated 1.861; real mean 1.863, band 1.857 to 1.869 (-0.34% to +0.34%); off mean -0.11%, limit 5% | pass: in band
+tp4 | 1 | step_linear | GPU hit rate | no value in ['real1', 'real2', 'simulated'] | refused
+tp4 | 1 | step_linear | CPU hit rate | no value in ['real1', 'real2', 'simulated'] | refused
+tp4 | 1 | step_linear | p90 E2E-normalized interactivity (tok/s/user) | simulated 130.9; real mean 128.9, band 125.8 to 132 | not judged
+tp4 | 1 | step_linear | point | 2 real runs | fail: p90 interactivity
+tp4 | 4 | step_linear | throughput per GPU (tok/s/GPU) | simulated 6716; real mean 7074, band 6946 to 7202 (-1.81% to +1.81%); off mean -5.06%, limit 5% | fail
+tp4 | 4 | step_linear | p90 interactivity (tok/s/user) | simulated 402.1; real mean 399.7, band 395 to 404.3 (-1.16% to +1.16%); off mean +0.62%, limit 5% | pass: in band
+tp4 | 4 | step_linear | p90 TTFT (s) | simulated 0.6857; real mean 0.7807, band 0.7723 to 0.789 (-1.07% to +1.07%); off mean -12.16%, limit 10% | fail
+tp4 | 4 | step_linear | median TPOT (ms) | simulated 1.809; real mean 1.797, band 1.797 to 1.797 (-0.01% to +0.01%); off mean +0.70%, limit 5% | pass: within 5% of mean
+tp4 | 4 | step_linear | GPU hit rate | no value in ['real1', 'real2', 'simulated'] | refused
+tp4 | 4 | step_linear | CPU hit rate | no value in ['real1', 'real2', 'simulated'] | refused
+tp4 | 4 | step_linear | p90 E2E-normalized interactivity (tok/s/user) | simulated 236.6; real mean 227.9, band 227.4 to 228.4 | not judged
+tp4 | 4 | step_linear | point | 2 real runs | fail: throughput per GPU, p90 TTFT
