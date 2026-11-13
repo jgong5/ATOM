@@ -234,16 +234,17 @@ def _law(run_file: dict, real: Path) -> dict:
 def _op_graph(side: Path):
     """The `OpGraphBackend` a `compass run --op-graph` server at `side`
     priced with: its run file under the ATOM arguments its command line served,
-    its graphs read under the performance environment its engine file states,
-    as its server read them, not this process's."""
+    resolved on its machine's device arch, its graphs read under the
+    performance environment its engine file states, as its server read them,
+    not this process's."""
     from atom.compass import run as compass_run
     from atom.compass.drive import run as drive_run
 
     run = read_json(side / "run.json")
     why = "an op graph is read under the ones its server ran"
     atom_args = _atom_args(side, run, why)
-    config = drive_run._config(atom_args)
     machine = compass_run._machine(run["run_file"])
+    config = drive_run._config(atom_args, machine.value("device.arch"))
     ep = drive_run._ep_width(atom_args, machine) if config.enable_expert_parallel else 1
     env = read_json(side / "steps/dp0.engine.json")["env"]
     return compass_run.op_graph(run["run_file"], config, machine, ep, env=env)
