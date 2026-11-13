@@ -157,6 +157,20 @@ TP4 run and is refused at any other width, like any other layout field
 
 ### The label: device time per step kind, and the host laws beside it
 
+**Replaced in part by [`18`](18_pass_record_and_host_paced_time.md) D107**: one pass
+record and one rule take the place of this section's decode cuts (the launch-exposed
+cut, the MTP decode label without its gap, the `propose` label's host-paced cut and the
+trace-run decode cut) and restate *Traced prefill*'s gap rule per kernel. That rule's
+cap is the rank's median queued gap, and [#3312](https://github.com/jgong5/ATOM/issues/3312)
+([PR #3357](https://github.com/jgong5/ATOM/pull/3357)) leaves gaps of one rounding step,
+2 ns or less, out of the median: on #2415's trace run it moves from 0.98 ns to 8.12 us.
+*Traced prefill*'s "the capped gaps added none of a host-paced final's busy time" was
+read at a cap of 0.001 us ([#2072](https://github.com/jgong5/ATOM/issues/2072#issuecomment-6387348851));
+at #3312's cap an output prefill's target on #2415's run gains 1.35 ms at p50
+([PR #3357's review](https://github.com/jgong5/ATOM/pull/3357#issuecomment-6844685877)).
+The code applies the rules below, the cap as `parity.busy.busy` takes it, until the
+implementation `18`'s *Summary* cuts lands, and that implementation rewrites them here.
+
 Owner ruling on [#815](https://github.com/jgong5/ATOM/issues/815), 2026-10-11, superseding
 ruling 2 of
 [#627's 2026-10-10 plan](https://github.com/jgong5/ATOM/issues/627#issuecomment-6096543740).

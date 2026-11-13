@@ -1451,6 +1451,13 @@ missed event cost.
 
 ### A forward's charge: host and device, composed per runner
 
+**Replaced in part by [`18`](18_pass_record_and_host_paced_time.md) D107**, which
+starts and ends every pass by one rule: a target that replays one graph starts at its
+graph launch, after a new `W_graph`; one launched otherwise ends no earlier than its
+launch end; and the check no longer feeds an MTP decode's gap as `compass_queued_s`.
+The code applies the recurrence below until the implementation `18`'s *Summary* cuts
+lands, and that implementation rewrites it here.
+
 Owner ruling on [#815](https://github.com/jgong5/ATOM/issues/815), 2026-10-11. It
 supersedes ruling 2 of
 [#627's 2026-10-10 plan](https://github.com/jgong5/ATOM/issues/627#issuecomment-6096543740),

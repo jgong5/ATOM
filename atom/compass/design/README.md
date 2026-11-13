@@ -2,7 +2,7 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header.
-**Decisions D0–D106, with no gaps, and their sub-decisions** are indexed at the end of this
+**Decisions D0–D107, with no gaps, and their sub-decisions** are indexed at the end of this
 file. The TODOs are registered in **`12_open_items.md`**, with the load-bearing assumptions
 and the cross-cutting issues. Implementation follows the execution plan in `16`.
 
@@ -180,9 +180,11 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       or estimated                                  |
   |                       Cost IR: Seq/Repeat/Par, opaque leaves        |
   |                       fitting, law selection, hull guard            |
+  |                       pass registry, pass record, one label rule    |
+  |                       for host-paced device time                    |
   |                       spec-decode: draft/verify structures,         |
   |                       acceptance inputs, draft KV                   |
-  |                                       docs 02,03,04,09,10,14,17     |
+  |                                    docs 02,03,04,09,10,14,17,18     |
   +=====================================================================+
   |  L2  EXECUTION        CompassModelRunner (the seam)                 |
   |                       simulated KV connector                        |
@@ -230,6 +232,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L3 | Fitting, law selection, hull guard | [`09_fitting_and_law_selection.md`](09_fitting_and_law_selection.md) | D53–D62 |
 | L3 | Analytical laws, the step roofline | [`10_analytical_laws.md`](10_analytical_laws.md) | D63–D70 |
 | L3 | Step grid backend (step-level), a stage-2 candidate | [`17`](17_step_grid_backend.md) | D96–D105 |
+| L3 | The pass record and the one label rule for host-paced device time | [`18`](18_pass_record_and_host_paced_time.md) | D107 |
 | L4 | Harness contract, wire fields, adapter | [`06_workload_harness_contract.md`](06_workload_harness_contract.md) | D27–D35 (+ D35.1) |
 | L5 | The calibration phases, the measurement bench and the recommended flow | [`07_calibration_toolchain.md`](07_calibration_toolchain.md) | D36–D43 |
 | L5 | The JIT sweep and the per-stack cache library that warm a container before a graded run | [`07`](07_calibration_toolchain.md) | D106 |
@@ -557,6 +560,7 @@ The documents use these precisely; a reader will bounce off without them.
 |---|---|---|
 | [`07`](07_calibration_toolchain.md) | Calibration and Benchmarking Toolchain | The phases and the commands that run them; the backend that needs a measurement plans it; the step bench is `EngineCore` without its scheduler, with one window for every step; the op bench times each leaf from its contract, cold, at points ATOM's runner prepares without a forward, and `fit ops` interpolates only between same-kernel neighbours. One recommended flow per half, steps and ops. The minimal recipe: one full-engine run at TP1, plus one TP2 transfer test, plus an engine start per configuration (`measure memory`). Four classes of communication pricing. The artifact store, its keys and its invalidation matrix. A constructed JIT sweep and a per-stack cache library warm a container before a graded run. |
 | [`09`](09_fitting_and_law_selection.md) | Fitting and Law Selection | How measurements become a model: fit relative error, per-rung decode, hull guards not bounding boxes, and why leave-one-out cannot choose a family. Owns coverage geometry for every other document. |
+| [`18`](18_pass_record_and_host_paced_time.md) | One Pass Record and One Rule for Host-Paced Device Time | A registry of each drafter flavor's passes; a record of when the host enqueued each pass; one rule that labels every pass and starts it in the recurrence, so a host-paced wait is counted once. Replaces `09` D54's decode cuts and part of `01` D4's recurrence. |
 
 ### Part IV — How it is driven and judged
 
@@ -608,6 +612,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D88 – D94 | `15` Parallelism Support (TP, DP, PP, EP) |
 | D95 (+ D95.1) | `16` The Execution Plan |
 | D96 – D105 | `17` Step Grid Backend |
+| D107 | `18` One Pass Record and One Rule for Host-Paced Device Time |
 
 ### Headline decisions
 
