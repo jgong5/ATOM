@@ -205,8 +205,8 @@ calibration #3355 keeps outside the search.
    *measure* is *missing readings*, with the `compass measure memory` command
    `compass run --check` prints for it (`atom/compass/drive/lacking.py::MADE_BY`): a
    readings entry keys the scheduler's bounds and the KV offload
-   (`atom/compass/run/memory.py::key_fields`), which a law's key does not, so each
-   MiniMax-M3 point and S5, whose law is S2's, take their own. The check runs the reuse
+   (`atom/compass/run/memory.py::key_fields`), so each MiniMax-M3 point takes its own, and
+   S5 its own beside S2's law, whose key holds no connector. The check runs the reuse
    check (D112), `compass run --check`, which on 1P1D resolves each side as
    `scripts/compass/deploy.sh` does, and a start with no traffic, for what only a start
    shows: arguments ATOM rejects, a model that does not fit memory, a configuration
@@ -388,17 +388,19 @@ would answer as fitted at the head, the re-validation #2311 designs.
   or `nohup`, its exit trap unchanged. A 1P1D calibration (`deploy.sh record`, a fit per
   side) waits until a 1P1D configuration needs a new law.
 - **A readings gap is measured**: `compass measure memory` for the point, the command
-  `compass run --check` prints, into the shared store, or into a new one where an entry
-  measured at another tree holds the key.
+  `compass run --check` prints, into the store its candidate's law is read from, the
+  shared one for a checked-in law.
 - **No top-up in place.** A store entry is immutable, a second publish at its key
   refused, and `calibrate.sh` takes no record once a fit has run: a configuration lacking
   coverage is calibrated again, old records with new, in a new output directory and into
   that calibration's own store. Every configuration that borrows its law, as S5 borrows
   S2's (D116) and MiniMax-M3's LMCache arms their base arms' (D117), has its readings
   measured into that store too, `compass advice` printing them with the calibration
-  command. The reuse check looks a candidate up in the latest store holding all its
-  store inputs, a new calibration's before the shared one, and the candidate's runs read
-  that store; `compass run` keeps its one `--store`.
+  command. A readings key holds no ATOM digest, so after an ATOM change an entry measured
+  before it still holds its key: a calibration or a readings measure that meets one
+  publishes into a new store too. The reuse check looks a candidate up in the latest
+  store holding all its store inputs, a new one before the shared one, and the
+  candidate's runs read that store; `compass run` keeps its one `--store`.
 - **Timing.** Each calibration records each step's wall time (the warm record, `measure
   memory`, each record, the trace runs, `fit steps`, `fit host`) and its node-hours.
 
@@ -499,7 +501,7 @@ workload, so its grade is not cited.
 | S1 | one node, 8 GPUs | TP8 | MTP3 | off | off | `recipes/DeepSeek-V4-Agentic-InferenceX.md`, TP | calibrated anew (D113) |
 | S2 | one node | DPA8 | MTP3 | on | off | the same, DP attention | calibrated anew (D113) |
 | S5 | one node | DPA8 | MTP3 | on | on | the same, DP attention with LMCache | S2's step and host laws; its own readings, whose key holds the KV offload |
-| P1 | 1P1D, 16 GPUs | TP8 / TP8 | off | off | off | `recipes/mesh/DeepSeek-V4.md`, pure TP; nightly `ds-v4-1p1d-tp8` | M2's TP law in the crsuse2-m2m-v3-005 store, if it passes D112 |
+| P1 | 1P1D, 16 GPUs | TP8 / TP8 | off | off | off | `recipes/mesh/DeepSeek-V4.md`, pure TP; nightly `ds-v4-1p1d-tp8` | M2's TP law from the crsuse2-m2m-v3-005 store, checked in re-keyed, if it passes D112 |
 | P3 | 1P1D | DPA8 / DPA8 | off | prefill | off | `recipes/mesh/DeepSeek-V4.md`, DPA | the shipped crs005 and gpu45 pairs under `scripts/compass/laws/`, if they pass D112 |
 
 The configurations cut from it, each one switch alone (S3, S4, P2, P4 to P7), can come
@@ -719,7 +721,7 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | D110 | The user provides the space file, by hand or through an agent following the guide; it names the shared store and, for a frozen search, its commit; it expands deterministically into candidates, each naming its ATOM basis and departures; the templates live in `scripts/compass/spaces/`, no default; it is the search's input, not a level of `13` D79's precedence. | 2026-11-13 (#3355, #3363) |
 | D111 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. | 2026-11-13 (#3355) |
 | D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage and held-out error within the acceptance targets; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose commit is not the head's, the remote tip or a frozen one, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363) |
-| D113 | The step linear backend lists a configuration's missing records as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
+| D113 | The step linear backend lists a configuration's missing records as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
 | D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355) |
 | D115 | Two static views reading files only: the search's dashboard, each point marked by grading state and method shares, and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell. | 2026-11-13 (#3355, #3363) |
 | D116 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355) |
