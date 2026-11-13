@@ -203,7 +203,10 @@ as a decode width does; and then, at the rows of each prefill family of a kind
 that depends on context, each token count its leaf's families at other rows hold
 between its own least and most, at each of its cached-token counts but those
 halving over cached tokens placed on one token count's line (`_filled`),
-densifying again after. DIR gets each round's ops.jsonl in `round<n>`, a run
+densifying again after. A family whose shapes state the rows a DP group gathers
+is halved over its tokens or filled only at such a shape some point sits at,
+as `trace ops` traces one only at a record's step (`_stating_g`). DIR gets
+each round's ops.jsonl in `round<n>`, a run
 resumed into DIR numbering on from the last round there, and after each round
 every point held, a measured one with its store token, in plan.jsonl.
 
@@ -3155,9 +3158,8 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     for shape in sorted(prefills, key=str):  # G and W are None or a count
         for sig, (op, _) in graphs[shape].items():
             fam, tokens = _family(shape, None, op["op"], sig, dependent)
-            # `fit ops` keeps a shape that states G apart from one that does
-            # not, and a drafter's pass's G from its step's
-            apart = fam, not shape.gathered, shape in moved
+            # `fit ops` keeps a drafter's pass's G from its step's
+            apart = fam, shape in moved
             seen[apart].setdefault(tokens, (shape, op["op"], sig))
 
     def cached_ladder(top_only: bool) -> dict:
@@ -3554,7 +3556,8 @@ def _family(shape, context, op: str, sig: str, dependent: dict):
     a prefill leaf over its tokens, at its rows unless its kind's prefill
     points show it does not move with them, and at its rows and cached tokens
     when its kind depends on context, as its prefill points read it, else its
-    decode points, else by default; a collective over its message bytes
+    decode points, else by default, a shape that states G apart from one that
+    does not, as `fit ops` keeps them; a collective over its message bytes
     (`exchange`)."""
     if op.startswith(COLLECTIVES):
         return tuple(exchange(json.loads(sig)))
@@ -3562,10 +3565,11 @@ def _family(shape, context, op: str, sig: str, dependent: dict):
         context, mean = _split(context)
         return json.dumps([str(shape), sig] + ([mean] if mean else [])), context
     leaf = _abstract(json.loads(sig), shape.tokens)
+    head = "prefill" if shape.gathered is None else "prefill G"
     if not dependent.get(("prefill", op), dependent.get(op, True)):
         rows = shape.seqs if dependent.get(("rows", op), True) else None
-        return json.dumps(["prefill", rows, leaf], sort_keys=True), shape.tokens
-    fam = ["prefill", shape.seqs, leaf, context or 0]
+        return json.dumps([head, rows, leaf], sort_keys=True), shape.tokens
+    fam = [head, shape.seqs, leaf, context or 0]
     return json.dumps(fam, sort_keys=True), shape.tokens
 
 
@@ -3671,9 +3675,12 @@ def _densify(families, tried: set) -> dict:
     cached-token count both hold, at a count halving placed at neither: a
     switch that moves with cached tokens, as one at a fixed sum of the two
     does, is halved over cached tokens at each token count alone, where `fit
-    ops` reads it after the token count."""
+    ops` reads it after the token count. A prefill family whose shapes state G
+    is halved over its tokens only at a shape some point sits at
+    (`_stating_g`)."""
     from atom.compass.capture.forward import decode, prefill
 
+    stating = _stating_g(families)
     steps = {
         p[2]["op"]
         for points in families.values()
@@ -3733,8 +3740,10 @@ def _densify(families, tried: set) -> dict:
                 want[step, other["context"]].add(fam)
             elif shape.phase == "decode":
                 want[shape, (mid, *ragged) if ragged else mid].add(fam)
-            else:
+            elif shape.gathered is None:
                 want[prefill(mid, shape.seqs), record["context"]].add(fam)
+            elif step := stating.get((mid, shape.seqs)):
+                want[step, record["context"]].add(fam)
     return want
 
 
@@ -3747,21 +3756,29 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
     its first row has room for under `max_model_len`, unless `tried`. `fit
     ops` reads such a leaf over T, then its rows, then cached tokens: a step's
     rows are bracketed only where the token counts either side of it hold
-    them."""
+    them. A family whose shapes state G reads the token counts of families
+    whose shapes state G, as `fit ops` does, and is filled only at a shape
+    some point sits at (`_stating_g`)."""
     from atom.compass.capture.forward import prefill
     from atom.compass.fit.ops import skeleton
 
     held, skeletons, axis = defaultdict(set), {}, defaultdict(set)
+    stating = _stating_g(families)
     for fam, points in families.items():
         if cut := _cut(fam):
+            head = json.loads(cut[0])[0]
             for tokens, _, record in points:
                 held[cut[0]].add((tokens, cut[1]))
-                skeletons[cut[0]] = skeleton(record["shape"], record["leaf"])
+                skeletons[cut[0]] = skeleton(record["shape"], record["leaf"]), head
                 axis[skeletons[cut[0]]].add(tokens)
     want = defaultdict(set)
     for base, at in held.items():
-        rows, tokens = json.loads(base)[1], [t for t, _ in at]
+        head, rows, _ = json.loads(base)
+        tokens = [t for t, _ in at]
         for t in sorted(axis[skeletons[base]]):
+            shape = prefill(t, rows) if head == "prefill" else stating.get((t, rows))
+            if shape is None:
+                continue
             for c in sorted({c for u, c in at if ((base, u), c) not in tried}):
                 fam = json.dumps([*json.loads(base), c], sort_keys=True)
                 if (
@@ -3772,8 +3789,25 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
                 ):
                     continue
                 tried.add((fam, t))
-                want[prefill(t, rows), c or None].add(fam)
+                want[shape, c or None].add(fam)
     return want
+
+
+def _stating_g(families) -> dict:
+    """Each prefill shape stating G that a point of `families` sits at, by its
+    T and B, a micro-batch as its record marks: `trace ops` traces a shape
+    stating G only at a record's step, so a plan asks one only where its graph
+    is held."""
+    found = {}
+    for points in families.values():
+        for *_, record in points:
+            shape = _shape(record["shape"])
+            if shape.phase == "prefill" and shape.gathered is not None:
+                mark = record.get("micro_batch", False)
+                found.setdefault(
+                    (shape.tokens, shape.seqs), shape._replace(micro_batch=mark)
+                )
+    return found
 
 
 def _bent(points, steps=()) -> set:
