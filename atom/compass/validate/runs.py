@@ -260,7 +260,9 @@ def _accepted(side, cell, simulated) -> tuple | None:
     else:
         steps = Path(side) / "steps"
         files = {p.name: p for p in steps.glob(ACCEPTANCE_FILE.format("*"))}
-        ranks = {ACCEPTANCE_FILE.format(p.stem[2:]) for p in steps.glob("dp*[0-9].jsonl")}
+        ranks = {
+            ACCEPTANCE_FILE.format(p.stem[2:]) for p in steps.glob("dp*[0-9].jsonl")
+        }
         if files and (missing := sorted(ranks - set(files))):
             raise ValueError(
                 f"{side} holds no {', '.join(missing)}, and its record holds "

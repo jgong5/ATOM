@@ -61,11 +61,13 @@ def _idle(monkeypatch, k):
 
 def _stopped(monkeypatch, side, scheduler, rank=0):
     """Give `side`'s record the histogram DP rank `rank`'s engine, of
-    `scheduler`, writes as SIGTERM stops it."""
-    monkeypatch.setenv(parity.ENV, str(side / "steps"))
+    `scheduler`, writes as SIGTERM stops it; a runner built after it records
+    nothing."""
     scheduler.config.parallel_config = SimpleNamespace(data_parallel_rank=rank)
     engine = SimpleNamespace(scheduler=scheduler)
-    compass_run._stop_recording(engine, lambda *_: None, signal.SIGTERM, None)
+    with monkeypatch.context() as patch:
+        patch.setenv(parity.ENV, str(side / "steps"))
+        compass_run._stop_recording(engine, lambda *_: None, signal.SIGTERM, None)
 
 
 def _summarized(monkeypatch, cell, schedulers) -> dict:
