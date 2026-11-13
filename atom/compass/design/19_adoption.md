@@ -160,8 +160,8 @@ development nodes are crsuse2-m2m-v3-005 and -013.
    compass advice at C -> the recommendation and the runner-up (D111)
    an 08 D50 set registered -> each run real three times, spaced, 3600 s
      -> each cell graded by 08 D44; the real order against the simulated one
-     -> beside each grade: its 08 D45.1 verdict once #3326 gives hit rates,
-        and the M3-Agentic stage's verdict on gpu-40, as another platform
+     -> beside each grade, not gated: its 08 D45.1 verdict, and the
+        M3-Agentic stage's verdict on gpu-40, as another platform
 ```
 
 ---
@@ -598,11 +598,11 @@ development nodes.
   each as the `agentx` workload runs. Each cell is graded by `08` D44, and their real
   order by throughput per GPU, InferenceX's, is compared with the simulated one: it
   matches, or the gap lies within the real runs' spread and is reported undetermined.
-  Once #3326 gives a simulated run its hit rates, each point also reports its `08` D45.1
-  verdict beside its grade, reported and not gated, to compare with the M3-Agentic
-  stage's step linear verdicts; until then D45.1 cannot judge a simulated point, which has
-  no hit rates (its *Open issues*). The M3-Agentic stage's verdict on the same arm at the
-  same concurrency stands beside too, labelled as another platform. The simulation is not
+  Each point also reports its `08` D45.1 verdict beside its grade, reported and not
+  gated, to compare with the M3-Agentic stage's step linear verdicts, a simulated run's
+  hit rates being its engines' own counters across the client run (`08` D45.1, #3326).
+  The M3-Agentic stage's verdict on the same arm at the same concurrency stands beside
+  too, labelled as another platform. The simulation is not
   compared with InferenceX's published results. How calibration and grading divide the
   traces is T112.
 
@@ -643,8 +643,8 @@ which the owner's ruling on #1108, recorded in #1527, rules out.
 ## Dependencies
 
 No spike and no sync issue: no decision waits on a measurement, and none needs an
-interface only the upstream has. Other issues settle what decisions leave to them: #3326
-a simulated run's hit rates (D117's overlap verdict); #3275 how one law serves an arm's
+interface only the upstream has. Other issues settle what decisions leave to them: #3275
+how one law serves an arm's
 points (T113); #3054 and #3265 MiniMax-M3's move (D117); #2311 who judges a change that
 moves step costs (D112); #3122 readings re-keyed with a law, and trees other than the
 head (D112); #1498 the op-family split's inputs on DeepSeek-V4-Pro (D114).
@@ -706,7 +706,7 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
     run directory or its cell's `grades.json`; a part with no data says so (7).
 11. The showcase calibrates and runs at one frozen commit, prices by the step linear law
     alone, grades both cells by `08` D44 with their order compared, and reports each
-    point's `08` D45.1 verdict beside its grade once #3326 lands (8).
+    point's `08` D45.1 verdict beside its grade, not gated (8).
 
 ---
 
@@ -723,7 +723,7 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355) |
 | D115 | Two static views reading files only: the search's dashboard, each point marked by grading state and method shares, and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell. | 2026-11-13 (#3355, #3363) |
 | D116 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355) |
-| D117 | Moved to MiniMax-M3 once its Compass features land and #3265 passes, calibrated on the development nodes from #3256's arms at one frozen commit, where its simulations and validation runs run too, every point priced by the step linear law alone; the showcase validation runs the recommended configuration and the runner-up real, graded by `08` D44, their real order compared with the simulated one, each point's `08` D45.1 verdict beside its grade once #3326 lands. Amends `08` D50. | 2026-11-13 (#3355, #3363) |
+| D117 | Moved to MiniMax-M3 once its Compass features land and #3265 passes, calibrated on the development nodes from #3256's arms at one frozen commit, where its simulations and validation runs run too, every point priced by the step linear law alone; the showcase validation runs the recommended configuration and the runner-up real, graded by `08` D44, their real order compared with the simulated one, each point's `08` D45.1 verdict beside its grade, not gated. Amends `08` D50. | 2026-11-13 (#3355, #3363) |
 
 ---
 
