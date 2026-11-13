@@ -380,7 +380,7 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
   - *Layout.* The deployment directory is a cell's `real<k>/`, or its simulated run's:
 
     ```
-    server.json run.json   the deployment's
+    server.json run.json report.html   the deployment's, with its per-request split (18 D113)
     run_file.json          its one run file; simulated
     prefill/ decode/       each instance's --out: server.json, run.json, steps/, logs
     prefill.sh decode.sh prefill.pid decode.pid   each instance's command, and the process id it writes first

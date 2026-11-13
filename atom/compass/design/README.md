@@ -593,7 +593,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`18`](18_adoption.md) | Adoption | One `compass advice` command checks a space the user writes, simulates every candidate whose law exists and recommends a configuration; calibration stays apart, reached through the store, and calibrated data is reused only under the reuse requirements. Every run writes its per-request split and a report. Developed on DeepSeek-V4-Pro, shown on MiniMax-M3. |
+| [`18`](18_adoption.md) | Adoption | One `compass advice` command checks a space the user provides, simulates every candidate whose law exists and recommends a configuration; calibration stays apart, reached through the store, and calibrated data is reused only under the reuse requirements. Every run writes its per-request split and a report. Developed on DeepSeek-V4-Pro, shown on MiniMax-M3. |
 
 ---
 
