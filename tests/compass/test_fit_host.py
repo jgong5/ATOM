@@ -216,6 +216,7 @@ def stamped(
     burst=(),
     rates=(ENCODE, BATCH, DECODE),
     encodes=ENCODES,
+    fixed=FIXED,
 ):
     """`directory`'s steps with the tokenizer calls and HTTP intake stamps a
     recorded server writes. A lone request per body size in `lone`, its loop
@@ -225,7 +226,7 @@ def stamped(
     `encodes`, an ``encode_batch`` inside a segment tokenizer call (one of
     which another thread's decode overlaps), and a decode after its send, each
     timed at `rates`; then calls that do not run lone, ten times slower, and one
-    burst of `burst`'s body sizes, its templates `FIXED + PER_BYTE x bytes` of
+    burst of `burst`'s body sizes, its templates `fixed + PER_BYTE x bytes` of
     the loop's CPU time apart."""
     calls, lines = [], [_stamp("app", 10**12 + 5, 10**12 + 5)]  # a health probe
 
@@ -288,7 +289,7 @@ def stamped(
     call("encode", 1, 9000, y + 5 * 10**6, slow=10, thread=4)
     call("encode_batch", 4, 30_000, y + 6 * 10**6, slow=10)
     t = y + 10**9
-    gaps = [round((FIXED + PER_BYTE * size) * 1e9) for size in burst]
+    gaps = [round((fixed + PER_BYTE * size) * 1e9) for size in burst]
     cpus = cpu + np.cumsum([0] + gaps[1:])
     starts = t + 10**6 + np.cumsum([0] + [g + WAIT for g in gaps[1:]])
     for k, (size, start, c) in enumerate(zip(burst, starts, cpus)):
@@ -422,6 +423,30 @@ def test_a_term_the_records_cannot_give_is_left_out_and_listed_unfitted(
     assert _unfitted(report) == unfitted
     left = {t.split(".")[-1] for t in unfitted}
     assert not left & (set(host) | set(host.get("tokenizer", {})))
+
+
+def test_a_burst_closer_than_per_byte_s_prices_leaves_the_intake_unfitted_and_runnable(
+    tmp_path, monkeypatch
+):
+    # A burst of megabyte bodies whose requests run closer together than the
+    # lone requests' per_byte_s prices their bodies: fixed_s would be negative,
+    # which a run refuses at start.
+    a = record(tmp_path / "a", 19)
+    stamped(a, burst=(900_000, 1_000_000, 1_100_000), fixed=-3e-3)
+    fit(tmp_path, "fit host", a, *clients(a))
+
+    host = member(tmp_path / "store", host_laws_key(HOST), "params")
+    report = member(tmp_path / "store", host_laws_key(HOST), "report")
+    assert "http_intake" not in host and "http_intake" not in report
+    assert _unfitted(report) == {
+        "http_intake": "the longest burst's 2 later requests take 0.00624 s of the "
+        "loop's CPU each, less than per_byte_s 8.8e-09 times their mean body of "
+        "1050000 B, so fixed_s would be -0.003 s"
+    }
+    # The entry stays usable: a run file carrying it passes the run's check of
+    # its host entry, and the frontend charges no intake.
+    run_file(tmp_path, monkeypatch, host=host)
+    assert compass_run.http_intake() is None
 
 
 def _unfitted(report) -> dict:

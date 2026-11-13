@@ -670,7 +670,8 @@ def fit_intake(paths) -> tuple[dict, dict]:
     ``bytes`` spans every request's body; ``fixed_s`` the loop's CPU time per
     request between template starts in the longest burst, less ``per_byte_s``
     times its mean body, each gap the next request's. Raises on too few lone
-    requests or no burst."""
+    requests, no burst, or a burst whose gaps fall short of what ``per_byte_s``
+    charges its bodies, which leaves ``fixed_s`` negative."""
     lone, bursts, bodies = [], [], []
     for path in paths:
         got = _intakes(path)
@@ -683,7 +684,14 @@ def fit_intake(paths) -> tuple[dict, dict]:
     if not bursts:
         raise ValueError(f"no burst among {len(lone)} lone requests")
     sizes, starts, cpu = np.array(max(bursts, key=len), dtype=np.float64).T
-    fixed = np.diff(cpu).mean() * 1e-9 - per_byte * sizes[1:].mean()
+    gap, body = np.diff(cpu).mean() * 1e-9, sizes[1:].mean()
+    fixed = gap - per_byte * body
+    if fixed < 0:
+        raise ValueError(
+            f"the longest burst's {len(sizes) - 1} later requests take {gap:.3g} s "
+            f"of the loop's CPU each, less than per_byte_s {per_byte:.3g} times "
+            f"their mean body of {body:.0f} B, so fixed_s would be {fixed:.3g} s"
+        )
     report["burst"] = {
         "requests": len(sizes),
         "span_s": (starts[-1] - starts[0]) * 1e-9,
