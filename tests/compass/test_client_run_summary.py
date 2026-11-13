@@ -258,7 +258,7 @@ def test_a_stop_after_a_client_run_leaves_that_client_runs_summary(
     assert client_run.read_text() == written
 
 
-#: The steps an engine takes over two client runs, split at 1.0: each the
+#: The steps an engine takes over two client runs: each the
 #: prefill it admits, as `EngineStats.update_cache`'s cached, full, compressed,
 #: wanted and reusable tokens, or None; the tokens a tier load it completes
 #: brings; and its forward's seconds.
@@ -266,11 +266,14 @@ STEPS = (
     ((64, 256, 64, 64, 192), 0, 0.25),
     (None, 0, 0.25),  # a decode: no counter moves
     (None, 128, 0.25),  # a tier load lands
-    ((128, 512, 128, 128, 448), 0, 0.25),  # ends at client run 0's end
+    ((128, 512, 128, 128, 448), 0, 0.25),  # client run 0's last sample
     (None, 0, 0.25),
     ((192, 320, 192, 192, 256), 64, 0.25),
 )
-END_0 = 1.0
+#: Where client run 0 ends: on its last sample, at 1.0, and after it, at the
+#: decode ending at 1.25. Client run 1 opens with the 1.0 sample either way.
+ENDS_0 = (1.0, 1.25)
+IN_FORCE = 1.0
 #: The samples' times without a tier and with one, whose load adds 0.75.
 SAMPLED = {False: [0.0, 0.25, 1.0, 1.5], True: [0.0, 0.25, 0.75, 1.0, 1.5]}
 
@@ -318,22 +321,22 @@ class _Engine:
         loaded = self.loaded if self.tier else 0
         self.atom.append([self.rt.now, c["cached_tokens"], c["full_tokens"], loaded])
 
-    def serve(self) -> list:
-        """Both client runs, each handed in at its end as its marked grant
-        does, client run 0's summary written at its end and client run 1's
-        at the finish; the summaries' ``hit_counters``."""
+    def serve(self, end_0: float = 1.0) -> list:
+        """Both client runs, split at `end_0`, each handed in at its end as its
+        marked grant does, client run 0's summary written at its end and
+        client run 1's at the finish; the summaries' ``hit_counters``."""
         with compass_run.engine_loop(self.core):
-            while self.rt.now < END_0:
+            while self.rt.now < end_0:
                 self.step()
             self.rt.client_run_ended(0)
             compass_run._hand_in(self.run, "frontend", [], 0)
             a = self.authority
-            a.ended.append(ClientRun(0, 0.0, END_0, ((compass_run.ENGINE, END_0),), {}))
+            a.ended.append(ClientRun(0, 0.0, end_0, ((compass_run.ENGINE, end_0),), {}))
             compass_run._write_client_run(self.run, a, 0)
             for _ in STEPS[len(self.atom) :]:
                 self.step()
             end = self.rt.now
-            a.ended.append(ClientRun(1, END_0, end, ((compass_run.ENGINE, end),), {}))
+            a.ended.append(ClientRun(1, end_0, end, ((compass_run.ENGINE, end),), {}))
             self.rt.now = math.inf  # the finish
         compass_run._hand_in(self.run, "frontend", [], None)
         compass_run._write_summary(self.run, a)
@@ -344,25 +347,27 @@ class _Engine:
         ]
 
 
-@pytest.mark.parametrize("method", compass_run.STEP_METHODS)
+@pytest.mark.parametrize("end_0", ENDS_0)
+@pytest.mark.parametrize("method", ("_pp_head_step", "_process_engine_step"))
 @pytest.mark.parametrize("tier", [True, False], ids=["tier", "no-tier"])
 def test_an_engine_samples_its_hit_counters_after_each_step_that_moved_one(
-    monkeypatch, tmp_path, method, tier
+    monkeypatch, tmp_path, method, tier, end_0
 ):
     """Every engine samples, its connector's ``loaded_tokens`` 0 with none, at
     its run's start and after each step that moved a counter, each sample
     ATOM's counters after that step at the engine's clock; client run 1's
-    open with the sample in force at its start, one at that very time."""
+    open with the sample in force at its start, taken at that very time or
+    before it."""
     engine = _Engine(
         monkeypatch, tmp_path, method, tier, EngineStats(enable_prefix_caching=True)
     )
-    runs = engine.serve()
-    print(f"\n{method} tier={tier}:", json.dumps(runs))
+    runs = engine.serve(end_0)
+    print(f"\n{method} tier={tier} end_0={end_0}:", json.dumps(runs))
     atom = {s[0]: s for s in [[0.0, 0, 0, 0], *engine.atom]}
     series = [atom[t] for t in SAMPLED[tier]]
     assert [list(r) for r in runs] == [["engine"], ["engine"]]
-    assert runs[0]["engine"] == [s for s in series if s[0] <= END_0]
-    assert runs[1]["engine"] == [s for s in series if s[0] >= END_0]
+    assert runs[0]["engine"] == [s for s in series if s[0] <= IN_FORCE]
+    assert runs[1]["engine"] == [s for s in series if s[0] >= IN_FORCE]
     assert runs[1]["engine"][-1] == engine.atom[-1]
 
 
