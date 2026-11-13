@@ -27,7 +27,7 @@ from atom.compass.bench import ops
 from atom.compass.capture.forward import decode, structure
 from atom.compass.capture.graph import Traced
 from atom.compass.ir import Graph, Op
-from atom.compass.run.step_grid import MORI, READ_OFF_DEFAULT, keyed
+from atom.compass.run.step_grid import BUCKETS, keyed
 
 V3 = pathlib.Path(__file__).with_name("deepseek_v3_config.json")
 ARCH = "gfx950"
@@ -35,6 +35,9 @@ ARCH = "gfx950"
 DPA_TP8 = ("-tp", "8", "--kv_cache_dtype", "fp8", "--enable-dp-attention")
 DPA_TP8 += ("--enforce-eager",)
 FUSE = "ATOM_FUSE_SHARED_EXPERT"
+MORI_EP = "ATOM_DISABLE_MORI_EP"
+#: The field `keyed` states where mori does not import.
+MORI = "mori_imports"
 FIND_SPEC = importlib.util.find_spec
 #: Each input changed alone from a DP-attention server with mori and
 #: `ATOM_FUSE_SHARED_EXPERT=0`, whose MoE ATOM does not fuse: ATOM's arguments,
@@ -44,9 +47,9 @@ CHANGES = {
     "fuse-default": ((), {FUSE: None}, True, (f"env {FUSE}", "0", None)),
     "mori-ep-off": (
         (),
-        {"ATOM_DISABLE_MORI_EP": "1"},
+        {MORI_EP: "1"},
         True,
-        ("env ATOM_DISABLE_MORI_EP", None, "1"),
+        (f"env {MORI_EP}", None, "1"),
     ),
     "no-mori": ((), {}, False, (MORI, None, False)),
     "rccl": (
@@ -68,7 +71,7 @@ def server(tmp_path, monkeypatch, args=(), env=None, mori=True):
     """A DP-attention V3 server's config on `ARCH`, ATOM's own fusion switch
     at 0, with ATOM's arguments `args`, the variables `env` set or unset, and
     mori importing or not (`mori`), each held while the test reads the key."""
-    for name in (*PERFORMANCE_KEYS, *READ_OFF_DEFAULT):
+    for name in (*PERFORMANCE_KEYS, BUCKETS, FUSE, MORI_EP):
         monkeypatch.delenv(name, raising=False)
     for name, value in ({FUSE: "0"} | (env or {})).items():
         if value is not None:
@@ -153,7 +156,7 @@ def test_a_reader_under_one_refuses_a_graph_traced_under_the_other_naming_it(
 def test_a_server_at_atom_s_defaults_keys_as_before(tmp_path, monkeypatch):
     unset = keyed(server(tmp_path, monkeypatch, env={FUSE: None}))
     spelled = server(
-        tmp_path, monkeypatch, env={FUSE: "1", "ATOM_DISABLE_MORI_EP": "0"}
+        tmp_path, monkeypatch, env={FUSE: "1", MORI_EP: "0"}
     )
 
     assert unset["env"] == {}
