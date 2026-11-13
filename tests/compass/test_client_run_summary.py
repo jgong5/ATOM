@@ -11,10 +11,17 @@ workers and the frontend's executor count from the server's start, and a
 summary takes each hand-in less the one at the previous client run's end, so
 it matches the summary a fresh server writes for the same client run. A stop
 after a client run writes the run summary and leaves that client run's alone.
+
+An engine in a run samples ATOM's prefix-cache and tier-load counters on its
+clock after each step that moved one, and a client run's summary carries them
+from the sample in force at its start; those tests step an engine core by hand
+on a runtime with no authority, its scheduler's `EngineStats` ATOM's own.
 """
 
 import json
+import logging
 import math
+import re
 import time
 from collections import Counter
 from pathlib import Path
@@ -24,7 +31,9 @@ import pytest
 from test_dp_slice import _deployment
 
 from atom.compass import run as compass_run
+from atom.compass.clock import ClientRun
 from atom.compass.clock_transport import connect
+from atom.model_engine.engine_stats import EngineStats
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
 from atom.utils.distributed import utils
@@ -247,3 +256,143 @@ def test_a_stop_after_a_client_run_leaves_that_client_runs_summary(
     assert summary["schedule"]["predicted_seconds"] == 0.75
     assert summary["schedule"]["refusals"]["reasons"] == []
     assert client_run.read_text() == written
+
+
+#: The steps an engine takes over two client runs, split at 1.0: each the
+#: prefill it admits, as `EngineStats.update_cache`'s cached, full, compressed,
+#: wanted and reusable tokens, or None; the tokens a tier load it completes
+#: brings; and its forward's seconds.
+STEPS = (
+    ((64, 256, 64, 64, 192), 0, 0.25),
+    (None, 0, 0.25),  # a decode: no counter moves
+    (None, 128, 0.25),  # a tier load lands
+    ((128, 512, 128, 128, 448), 0, 0.25),  # ends at client run 0's end
+    (None, 0, 0.25),
+    ((192, 320, 192, 192, 256), 64, 0.25),
+)
+END_0 = 1.0
+#: The samples' times without a tier and with one, whose load adds 0.75.
+SAMPLED = {False: [0.0, 0.25, 1.0, 1.5], True: [0.0, 0.25, 0.75, 1.0, 1.5]}
+
+
+class _Engine:
+    """An engine core in a run whose `method` takes the next of `STEPS` as
+    ATOM's does, admitting, then forwarding on its clock, then taking a load's
+    completion, on an engine runtime with no authority; with `tier` its KV
+    connector counts ``loaded_tokens``, without one it has none. `atom` holds
+    ATOM's counters after each step, at the engine's clock."""
+
+    def __init__(self, monkeypatch, tmp_path, method, tier, stats) -> None:
+        run = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+        run.update(bound_s=100.0, client_runs=2, out_dir=str(tmp_path))
+        (tmp_path / "run.json").write_text(json.dumps(run))
+        monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+        for module, name in [(compass_run, "_authority"), (compass_run, "_member")]:
+            monkeypatch.setattr(module, name, None)
+        self.run, self.method, self.stats = run, method, stats
+        self.authority = compass_run._RecordingAuthority(run)
+        self.rt = LPRuntime(compass_run.ENGINE, compass_run.channel_table(run), None)
+        monkeypatch.setattr(clock, "_installed", self.rt)
+        self.loaded = 0
+        kv = SimpleNamespace(get_statistics=lambda: {"loaded_tokens": self.loaded})
+        workers = {"refused_commands": [], "priced_steps": {}, "predicted_memory": {}}
+        self.core = SimpleNamespace(
+            runner_mgr=SimpleNamespace(call_func=lambda name, wait_out: workers[name]),
+            scheduler=SimpleNamespace(
+                engine_stats=stats, kv_connector=kv if tier else None
+            ),
+            **{method: self._step},
+        )
+        self.steps, self.tier, self.atom = iter(STEPS), tier, []
+
+    def _step(self) -> None:
+        prefill, loaded, seconds = next(self.steps)
+        if prefill:
+            self.stats.update_cache(*prefill)
+        self.rt.now += seconds
+        self.loaded += loaded
+
+    def step(self) -> None:
+        getattr(self.core, self.method)()
+        c = self.stats.cache_statistics()
+        loaded = self.loaded if self.tier else 0
+        self.atom.append([self.rt.now, c["cached_tokens"], c["full_tokens"], loaded])
+
+    def serve(self) -> list:
+        """Both client runs, each handed in at its end as its marked grant
+        does, client run 0's summary written at its end and client run 1's
+        at the finish; the summaries' ``hit_counters``."""
+        with compass_run.engine_loop(self.core):
+            while self.rt.now < END_0:
+                self.step()
+            self.rt.client_run_ended(0)
+            compass_run._hand_in(self.run, "frontend", [], 0)
+            a = self.authority
+            a.ended.append(ClientRun(0, 0.0, END_0, ((compass_run.ENGINE, END_0),), {}))
+            compass_run._write_client_run(self.run, a, 0)
+            for _ in STEPS[len(self.atom) :]:
+                self.step()
+            end = self.rt.now
+            a.ended.append(ClientRun(1, END_0, end, ((compass_run.ENGINE, end),), {}))
+            self.rt.now = math.inf  # the finish
+        compass_run._hand_in(self.run, "frontend", [], None)
+        compass_run._write_summary(self.run, a)
+        out = Path(self.run["out_dir"])
+        return [
+            _read(out / f"client-{k}" / compass_run.SUMMARY_FILE)["hit_counters"]
+            for k in (0, 1)
+        ]
+
+
+@pytest.mark.parametrize("method", compass_run.STEP_METHODS)
+@pytest.mark.parametrize("tier", [True, False], ids=["tier", "no-tier"])
+def test_an_engine_samples_its_hit_counters_after_each_step_that_moved_one(
+    monkeypatch, tmp_path, method, tier
+):
+    """Every engine samples, its connector's ``loaded_tokens`` 0 with none, at
+    its run's start and after each step that moved a counter, each sample
+    ATOM's counters after that step at the engine's clock; client run 1's
+    open with the sample in force at its start, one at that very time."""
+    engine = _Engine(
+        monkeypatch, tmp_path, method, tier, EngineStats(enable_prefix_caching=True)
+    )
+    runs = engine.serve()
+    print(f"\n{method} tier={tier}:", json.dumps(runs))
+    atom = {s[0]: s for s in [[0.0, 0, 0, 0], *engine.atom]}
+    series = [atom[t] for t in SAMPLED[tier]]
+    assert [list(r) for r in runs] == [["engine"], ["engine"]]
+    assert runs[0]["engine"] == [s for s in series if s[0] <= END_0]
+    assert runs[1]["engine"] == [s for s in series if s[0] >= END_0]
+    assert runs[1]["engine"][-1] == engine.atom[-1]
+
+
+def test_each_cache_stats_line_its_engine_logs_is_a_sample_in_order(
+    monkeypatch, tmp_path, caplog
+):
+    """ATOM's cumulative ``[Cache Stats]`` line, logged here at each prefill,
+    states the cached and full tokens of a sample, in order."""
+    stats = EngineStats(enable_prefix_caching=True, cache_log_interval=1)
+    engine = _Engine(monkeypatch, tmp_path, "_process_engine_step", True, stats)
+    with caplog.at_level(logging.INFO, "atom"):
+        runs = engine.serve()
+    line = re.compile(r"\[Cache Stats +\] .*Cached/Reusable: (\d+)/\d+, .* of (\d+)")
+    logged = [
+        [int(g) for g in m.groups()] for m in map(line.search, caplog.messages) if m
+    ]
+    print("\nlogged:", logged)
+    assert len(logged) == sum(1 for prefill, _, _ in STEPS if prefill)
+    samples = iter(s[1:3] for s in runs[0]["engine"] + runs[1]["engine"][1:])
+    assert all(any(s == said for s in samples) for said in logged)
+
+
+def test_a_real_run_s_engine_samples_nothing(monkeypatch):
+    """With no run file the engine's step is ATOM's own, unwrapped."""
+    monkeypatch.delenv(compass_run.ENV, raising=False)
+    monkeypatch.setattr(clock, "_installed", None)
+    step = lambda: None
+    core = SimpleNamespace(
+        scheduler=SimpleNamespace(engine_stats=EngineStats(enable_prefix_caching=True)),
+        _process_engine_step=step,
+    )
+    with compass_run.engine_loop(core):
+        assert core._process_engine_step is step
