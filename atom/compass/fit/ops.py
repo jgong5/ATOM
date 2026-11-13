@@ -34,9 +34,10 @@ rows they ran, the step padded to B), the rows its MoE gathers, ``G``, where
 every point states them and its masked integers follow them: a leaf that does
 not read them, as attention does not, is read at any ``G``
 (a shape that states no ``G`` gathers every rank's T, and is another family),
-``R``, the real rows of a padded decode's MoE, where some point of the family
-states them (`measure ops`' ``R=``), a point stating none at every row its ids
-route (`bench.ops.routed_rows`), and,
+``pad``, the pad rows of a padded decode's MoE, where some point of the family
+states its real rows (`measure ops`' ``R=``): the rows its ids route
+(`bench.ops.routed_rows`) less those, 0 at a point stating none, so a family
+over every rung lines its every-row points up along B, and,
 for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
 a prefill's B and the context: a decode point's ``context``, its longest
@@ -289,7 +290,7 @@ def fit(points) -> dict:
             for p in members
             if _split(p["context"])[1]
         }
-        real_rows = {
+        padded = {
             family(p["shape"], p["leaf"], free_of[skel])
             for p in members
             if "R" in shape_counts(p["shape"])
@@ -308,10 +309,11 @@ def fit(points) -> dict:
                 if "B" not in dims and dependent.get(("rows", p["op"]), False):
                     dims.append("B")
             dims += ["G"] if "G" in follows else []
-            if name in real_rows:  # a padded decode's MoE: its real rows, or all routed
-                dims.append("R")
+            if name in padded:  # a padded decode's MoE: its pad rows, 0 at every row
+                dims.append("pad")
                 real = shape_counts(p["shape"]).get("R")
-                at_p["R"] = real or routed_rows(json.loads(p["leaf"]))
+                rows = routed_rows(json.loads(p["leaf"]))
+                at_p["pad"] = 0 if real is None else rows - real
             if moves and "T" not in at_p:  # a decode point, read at its mean too
                 # a uniform point whose rows the KV pool cut holds a mean its
                 # context does not name: a family with ragged points leaves it out
@@ -470,9 +472,9 @@ class PriceList(CostSource):
     at the step's count of each of its dimensions, ``context`` the bound's:
     a decode step's rows' max, a prefill's rows' mean cached tokens; ``mean``
     a decode step's rows' mean context over its B in `PERMILLE` of their max,
-    where the family was measured on ragged rows; ``R`` the real rows a
-    decode's MoE runs, the bound's last, or, where it states none, every row
-    the family's points at its other counts route; a collective's family
+    where the family was measured on ragged rows; ``pad`` the rows a decode's
+    MoE leaf routes less the real ones the bound states last, 0 where it
+    states none; a collective's family
     (`bench.ops.exchange`) at its message bytes. A leaf asked at the list of
     bounds it may have run at (`op_graph._ran_at_each`) takes the answer they
     all give, and is declined, naming them, where they differ. It also
@@ -494,7 +496,7 @@ class PriceList(CostSource):
         self._index = functools.cache(self._index)
 
     def price(self, request: tuple) -> CostTerm | Refusal:
-        from atom.compass.bench.ops import exchange, signature
+        from atom.compass.bench.ops import exchange, routed_rows, signature
 
         if isinstance(request[1], list):  # each bound it may have run at
             leaf, bounds, work = request
@@ -514,12 +516,9 @@ class PriceList(CostSource):
         if name is None:
             return self.refuse(f"{kind}: no point of its signature was measured")
         dims, top = self.params["families"][name]["dims"], None
-        if "R" in dims:  # real rows the step states, or every row routed
-            lead = tuple(at[d] for d in dims[: dims.index("R")])
-            every = self._index(name).get(lead, [None])[-1]
-            at["R"] = real[0] if real and real[0] is not None else every
-            if at["R"] is None:
-                return self.refuse(f"{kind}: no point at {lead} routes every row")
+        if "pad" in dims:  # the rows it routes past the step's real ones
+            stated = real[0] if real else None
+            at["pad"] = 0 if stated is None else routed_rows(leaf) - stated
         if phase == "decode":
             at["mean"] = PERMILLE * last / at["context"]
         elif dims[-1:] == ["context"] and last != at["context"]:

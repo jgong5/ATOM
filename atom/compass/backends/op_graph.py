@@ -283,13 +283,14 @@ def gathered_off_default(
     return None if gathered == dp * rows else gathered
 
 
-def _real(view: BatchView) -> int | None:
+def real_rows(own: int, gathered: int | None, tokens: int | None, dummies: int):
     """The real rows a decode step's MoE runs, its others pad rows that route
-    to no expert: its DP group's tokens, the group's dummy forwards' rows as
-    one (`moe_tokens`), None where a DP step states none; else its own."""
-    if view.moe_rows is None:
-        return sum(r.query_tokens for r in view.requests)
-    return view.moe_tokens and view.moe_tokens - max(view.group_dummies - 1, 0)
+    to no expert: where its DP group's MoE gathers `gathered` rows, the group's
+    `tokens` with its `dummies` dummy forwards' rows as one, every dummy
+    running the same row, or None where it states no tokens; else its `own`."""
+    if gathered is None:
+        return own
+    return tokens and tokens - max(dummies - 1, 0)
 
 
 def _ran_at(leaf: dict, bound: tuple) -> tuple:
@@ -523,7 +524,7 @@ class OpGraphBackend(CostBackend):
         this rank and gathered over the DP group, and none is its rows', so
         a leaf that leads with its rows alone or beside the target's tokens,
         as its anchors do, is asked at its rows. Last, a decode's target
-        states the real rows its MoE runs (`_real`), and any other None."""
+        states the real rows its MoE runs (`real_rows`), and any other None."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
@@ -542,7 +543,9 @@ class OpGraphBackend(CostBackend):
         bound = (phase, t, b, g, mean, top)
         if phase == "decode":  # its max, then its mean over B: a pad row holds none
             bound = (phase, t, b, g, top, sum(c for _, c in rows) / b)
-        bound += (_real(view) if phase == "decode" and not draft else None,)
+        own = sum(r.query_tokens for r in view.requests)
+        real = real_rows(own, view.moe_rows, view.moe_tokens, view.group_dummies)
+        bound += (real if phase == "decode" and not draft else None,)
         if not width:
             return bound
         if ran == t:

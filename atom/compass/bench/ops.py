@@ -3514,12 +3514,12 @@ def _rows(line, rung: int) -> tuple[int, int]:
 
 
 def _real(line) -> int | None:
-    """A decode step's real MoE rows as its line states them: where it states
-    the rows its DP group's MoE gathers, the group's tokens (`moe_tokens`), or
-    None; else its own."""
-    if line.get("moe_rows") is not None:
-        return line.get("moe_tokens")
-    return sum(row[0] for row in line["rows"])
+    """A decode step's real MoE rows (`op_graph.real_rows`), as its line and
+    its group's dummy forwards at its step (`group_dummies`) state them."""
+    from atom.compass.backends.op_graph import real_rows
+
+    own, dummies = sum(row[0] for row in line["rows"]), line.get("group_dummies", 0)
+    return real_rows(own, line.get("moe_rows"), line.get("moe_tokens"), dummies)
 
 
 def _mean(line, rung: int) -> int:

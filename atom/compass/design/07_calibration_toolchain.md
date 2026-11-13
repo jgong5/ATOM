@@ -429,8 +429,9 @@ bends between counts 3 or 4 apart by up to 9% under one kernel
 ([#3399](https://github.com/jgong5/ATOM/pull/3399)): a point states them as `R`, routes
 each row past them to no expert, the real ones spread evenly over the DP ranks and first in
 each rank's block of the gather, and on one rank its batch holds them alone, padded to the
-rung. `fit ops` interpolates such a family along `R`, and a run asks it at the step's real
-rows: the DP group's tokens with its dummy forwards' rows as one, or one rank's own. A
+rung. `fit ops` interpolates such a family along its pad rows, the rows its ids route less
+`R`, 0 at every row, and a run asks it at the step's real rows: the DP group's tokens with its
+dummy forwards' rows as one, or one rank's own. A
 drafter's routed leaves stay at every row. Each point records the kernels the leaf launched there, its kernel
 identity, and each one's grid, by which a trace run's drafter kernel finds its own length
 (`09` D54, [#2415](https://github.com/jgong5/ATOM/issues/2415)).
