@@ -183,8 +183,9 @@ request segments to the host (`cu_seqlens.tolist()`), a synchronization its brin
 pays on purpose, and `consume_draft_context` and `forward_draft_block`, inside the
 propose call, read anchors the same way. Each read waits for the target's graph, after
 which the device idles while the host queues the rest, so the windows hold host time.
-Those passes take labels once ATOM drops the reads, an ATOM change filed under
-`atom-issue` like any wait in a launch ([principle 9](README.md#design-principles)).
+Those passes take labels once ATOM drops the reads,
+[#3361](https://github.com/jgong5/ATOM/issues/3361) under `atom-issue`, like any wait in
+a launch ([principle 9](README.md#design-principles)).
 
 #### Settled: the draft-KV pass and the sampler
 
