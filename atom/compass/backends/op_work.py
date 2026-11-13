@@ -25,14 +25,14 @@ the tensor-parallel group unless the leaf states its group size. A kind with
 no extractor, or a leaf its extractor cannot price, is refused by name.
 
 DeepSeek-V4's MoE takes the step roofline's expectation under independent
-uniform routing: the routed experts run the rows the leaf holds but a gather's
-pad rows, under expert parallelism the busiest rank's expected share, a fused
-shared expert every row aiter's top-k table deals it, at the format the op
-quantizes its rows to, and read each activated expert once; a DP
-exchange's group width is read off its own shapes. ATOM's Triton experts run
-as aiter's grouped GEMMs, each priced so, at the activation format its kind
-names; their expert-parallel width is the run's `ep`, the experts `ep` times a
-rank's.
+uniform routing: the routed experts run the rows the leaf holds but its pad
+rows, a gather's or a graph's, under expert parallelism the busiest rank's
+expected share, a fused shared expert every row aiter's top-k table deals it,
+a gather's pad rows too, at the format the op quantizes its rows to, and read
+each activated expert once; a DP exchange's group width is read off its own
+shapes. ATOM's Triton experts run as aiter's grouped GEMMs, each priced so, at
+the activation format its kind names; their expert-parallel width is the run's
+`ep`, the experts `ep` times a rank's.
 
 DeepSeek-V4.1's sparse attention and indexer scorers read their entries at the
 geometry their leaf states, over the queries the leaf holds (`_last`): a
@@ -271,10 +271,11 @@ def _dp_exchange(op, view, tp, kv) -> Work:
 
 
 def _routing(view, tokens, k, experts, ranks):
-    """The routes and activated experts of `tokens` rows, those a DP gather
-    routes (`routing_rows`) each routed to `k` of `experts` spread over
-    `ranks`, an expectation under uniform routing: the busiest rank's expected
-    share under expert parallelism."""
+    """The routes and activated experts of `tokens` rows, those that route
+    (`routing_rows`: a DP gather's real rows, one rank's own tokens) each
+    routed to `k` of `experts` spread over `ranks`, an expectation under
+    uniform routing: the busiest rank's expected share under expert
+    parallelism."""
     real, distinct = routing_rows(view, tokens)
     groups = activated_experts(experts, k, distinct)
     if ranks == 1:
@@ -287,11 +288,11 @@ def _fused_moe(op, view, tp, kv, ep) -> Work:
     gate-up and down products. Every `topk_ids` column is the router's,
     routed as `_routing` says, unless the leaf states its layer's `top_k` and
     `fused_shared_experts`: then only the first `top_k` are, and aiter's top-k
-    table gives every row, a gather's pad rows too, each fused shared expert,
-    under expert parallelism dealt to rank `row mod ep`, which holds them all;
-    the columns past both reach no expert. Under expert parallelism `w1`
-    holds this rank's share of `ep` times its routed experts, and its fused
-    shared ones.
+    table gives each fused shared expert every row a gather carries, pad rows
+    too, or on one rank the step's own tokens (`routing_rows`), under expert
+    parallelism dealt to rank `row mod ep`, which holds them all; the columns
+    past both reach no expert. Under expert parallelism `w1` holds this rank's
+    share of `ep` times its routed experts, and its fused shared ones.
 
     With a nonzero `quant_type` the op quantizes `hidden_states` to the
     weights' format inside it, so both products run at that format; otherwise
@@ -304,7 +305,8 @@ def _fused_moe(op, view, tp, kv, ep) -> Work:
     local, up = args["w1"]["shape"][:2]
     top, shared = stated.get("top_k", k), stated.get("fused_shared_experts", 0)
     routed, groups = _routing(view, rows, top, (local - shared) * ep, ep)
-    dealt = -(-rows // ep) if shared else 0
+    own = rows if view.moe_rows is not None else routing_rows(view, rows)[0]
+    dealt = -(-own // ep) if shared else 0
     picks, groups = routed + dealt * shared, groups + shared
     b = _fmt(args["w1"]["dtype"])
     a = b if args.get("quant_type") else _fmt(args["hidden_states"]["dtype"])
