@@ -5,7 +5,8 @@
 to 2026-11-13, and the owner's rulings on its design PR #3363
 ([first](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6845852318),
 [second](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6851839086),
-[third](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957)). No code implements it yet: its tasks are cut from *Summary* after v1.
+[third](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957),
+[fourth](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216)). No code implements it yet: its tasks are cut from *Summary* after v1.
 
 **Depends on:** `07` (the store, D37), `08` (D44, D45, D45.1, D50, D50.1), `13` (D79,
 D80), `16` (D95.1), and the M3-Agentic stage's `03` D13.1, `06` D35.1 and `14` D87.1.
@@ -15,6 +16,7 @@ D80), `16` (D95.1), and the M3-Agentic stage's `03` D13.1, `06` D35.1 and `14` D
 | `13` D79: precedence has no level but CLI and artifact, and no Compass config file | not amended, as argued: the space file is the search's input, as traces are a client's, and each run takes its flags from `compass advice` | D110 |
 | `13` D80: no command starts the client or takes a workload | `compass advice` does both | D109 |
 | `13` D80: a prefill or decode `run` refuses without `--join` | not under `--check`, which resolves the side as `deploy.sh` does | D109 |
+| `13` D80: what `run --check` lists | a step linear law's scheduled decode rungs with no vector, too | D112 |
 | `13` D80: what `run`, `record` and `deploy.sh` write | each writes its per-request split and `report.html` when its run ends | D114, D115 |
 | `08` D50: the cell matrix | a MiniMax-M3 showcase set: the recommended configuration and the runner-up | D117 |
 
@@ -42,7 +44,8 @@ development nodes are crsuse2-m2m-v3-005 and -013.
                a finished point skipped
    3 results   each point's metrics from its client export (D111): the frontier,
                the SLO filter, the recommendation, the runner-up, the result table
-               and the recommendation's text; dashboard.html (D115)
+               with each point's extrapolated share (D112) and the recommendation's
+               text; dashboard.html (D115)
    |
    v
  OUT: dashboard.html, the recommendation, the result table, runs/<config>-c<n>/
@@ -74,29 +77,33 @@ development nodes are crsuse2-m2m-v3-005 and -013.
 
 ```
  the ATOM digest of the tree atom resolves under, against the head's: the
-   digest of the integration branch's tip on its remote, or of the commit
-   SPACE freezes (D110)
+   digest of the integration branch's tip as last fetched, or of the commit
+   SPACE freezes (D110), computed where the check runs
      another digest -> refused, both digests named (requirement 1)
      the head's     -> each input by its key (07 D41), its ATOM digest
                        against the tree's (D112)
 
- the candidate's law                         verdict
+ the candidate's law, before the search      verdict
    none at its key                           calibrate
    a store entry at another digest           calibrate, or in development
                                              checked in re-keyed
    re-keyed past a change moving costs (2)   calibrate
-   shapes or decode rungs uncovered (3)      calibrate, the gaps listed
+   a scheduled decode rung with no vector (3)
+                                             calibrate, the rungs listed
    held-out error past the bar (4, T114)     calibrate
    otherwise                                 reuse
  each point's readings
    none at its key, or another digest        measure
    otherwise                                 reuse
+ each point, after the search
+   steps outside a vector's hull (3)         extrapolated, never refused;
+                                             its share reported
 ```
 
 ### 4. A recalibration and the configurations that borrow its law
 
 ```
- the reuse check: S2's law lacks coverage (D112, requirement 3)
+ the reuse check: S2's law lacks a decode rung (D112, requirement 3)
    |
    v
  compass advice prints together (D113):
@@ -156,7 +163,9 @@ development nodes are crsuse2-m2m-v3-005 and -013.
    the environment check on the development nodes: each arm served once
    the template: the arms kept, at every concurrency; SPACE freezes commit C
    calibration at C, step linear laws alone: TP4, TP4 with indexer CP and TP2,
-     pooling the LMCache arms' records if they came up; readings per point
+     pooling the LMCache arms' records if they came up; readings per point;
+     a step past the records extrapolated and its share reported; the step
+     grid revisited only on the M3-Agentic stage's grades
    compass advice at C -> the recommendation and the runner-up (D111)
    an 08 D50 set registered -> each run real three times, spaced, 3600 s
      -> each cell graded by 08 D44; the real order against the simulated one
@@ -199,18 +208,19 @@ calibration #3355 keeps outside the search.
 **Rule.** `compass advice SPACE OUT` is a `compass` subcommand whose steps are its own:
 
 1. **Check.** Expand SPACE (D110) and give each candidate one state: *searchable*;
-   *missing a law*, with the `calibrate.sh` command of D113's record list;
-   *calibrating*, with its `status` file's progress; or *refused*, with ATOM's or
-   Compass's refusal verbatim. A searchable candidate's point whose readings D112 answers
-   *measure* is *missing readings*, with the `compass measure memory` command
-   `compass run --check` prints for it (`atom/compass/drive/lacking.py::MADE_BY`): a
-   readings entry keys the scheduler's bounds and the KV offload
-   (`atom/compass/run/memory.py::key_fields`), so each MiniMax-M3 point takes its own, and
-   S5 its own beside S2's law, whose key holds no connector. The check runs the reuse
-   check (D112), `compass run --check`, which on 1P1D resolves each side as
-   `scripts/compass/deploy.sh` does, and a start with no traffic, for what only a start
-   shows: arguments ATOM rejects, a model that does not fit memory, a configuration
-   Compass refuses, such as `--enable-dynamic-chunking`. It never calibrates.
+   *missing a law*, the reuse check's *calibrate*, a law absent or short of a decode
+   rung, with the `calibrate.sh` command of D113's record list; *calibrating*, with its
+   `status` file's progress; or *refused*, with ATOM's or Compass's refusal verbatim. A
+   searchable candidate's point whose readings D112 answers *measure* is *missing
+   readings*, with the `compass measure memory` command `compass run --check` prints for
+   it (`atom/compass/drive/lacking.py::MADE_BY`): a readings entry keys the scheduler's
+   bounds and the KV offload (`atom/compass/run/memory.py::key_fields`), so each
+   MiniMax-M3 point takes its own, and S5 its own beside S2's law, whose key holds no
+   connector. The check runs the reuse check (D112), `compass run --check`, which on 1P1D
+   resolves each side as `scripts/compass/deploy.sh` does, and a start with no traffic,
+   for what only a start shows: arguments ATOM rejects, a model that does not fit memory,
+   a configuration Compass refuses, such as `--enable-dynamic-chunking`. It never
+   calibrates.
 2. **Simulate.** Each searchable point, a fresh server per point (`13` D80): `compass
    run`, or `deploy.sh run` on 1P1D, driven by one `client.sh` run, points in parallel
    over the host's cores and ports, a failed one retried and then listed with its
@@ -294,7 +304,8 @@ point counts both sides' GPUs (T110).
   calibrates it.
 - **The result table**, a row per point: configuration, concurrency, both throughputs,
   both interactivities, P90 TTFT, P90 end-to-end latency, SLO met, on the frontier,
-  grading state, pricing-method shares under `08` D50.1's names, refusal reason.
+  grading state, pricing-method shares under `08` D50.1's names, extrapolated share of
+  steps (D112), refusal reason.
 - **The recommendation's text**: its metrics, the runner-up and the gap, its confidence
   (grading state, method shares, extrapolated share of steps), its laws' sources, every
   point left out with its reason; each number in it is in the table.
@@ -324,16 +335,21 @@ the run's provenance.
    ATOM digest of the tree `atom` resolves under
    (`atom/compass/run/__init__.py::atom_digest`, the sha256 of ATOM's Python less
    Compass's own code, which every key reads) with the head's: the digest of the `atom/`
-   the integration branch's tip holds on its remote, read when the check runs, or of the
-   commit the space file freezes (D110), which must be one of that branch's. A tree whose
-   digest differs, as an older checkout, a release or a local patch may, is *refused*,
-   both digests named, the only requirement that refuses: only the head is supported,
-   other trees waiting for after v1 (#3122). A tree that differs from the head only
-   outside ATOM's Python, a Compass code task's own included, reads every key the head
-   reads, and passes. Each input's ATOM digest (a step law's `source_root`, host laws'
-   `atom`, readings' `atom_src`) is then held against the tree's. A law with no entry at
-   its key is *calibrate*; readings with none, or measured at another digest, *measure*,
-   since they re-key with a law only under #3122's design.
+   the integration branch's tip holds, or the commit the space file freezes (D110), which
+   must be one of that branch's. It computes that digest where it runs, in the GPU
+   container, over the `atom/` that `git archive` ships from the clone the tree belongs
+   to, at the integration branch's remote-tracking ref, which the guide fetches on the
+   host before a search, or at the frozen commit: git reads the local repository, which
+   needs git in the container, as the ATOM images carry it, and no network. It names the
+   commit it took as the head, so a stale fetch shows, and refuses by name a tree with no
+   repository to read. A tree whose digest differs, as an older checkout, a release or a
+   local patch may, is *refused*, both digests named, the only requirement that refuses:
+   only the head is supported, other trees waiting for after v1 (#3122). A tree that
+   differs from the head only outside ATOM's Python, a Compass code task's own included,
+   reads every key the head reads, and passes. Each input's ATOM digest (a step law's
+   `source_root`, host laws' `atom`, readings' `atom_src`) is then held against the
+   tree's. A law with no entry at its key is *calibrate*; readings with none, or measured
+   at another digest, *measure*, since they re-key with a law only under #3122's design.
 2. **Not invalidated**: no ATOM change since the calibration moves step costs or memory,
    and only then is a law re-keyed onto the new tree (README principle 10, #2594); a
    change that moves memory takes the readings again, as #2861's token buckets moved
@@ -348,30 +364,47 @@ the run's provenance.
    provenance naming its law's; the showcase fits all its laws at one frozen commit (D117)
    and measures again after a later source change, until #2311 settles who judges "moves
    step costs" and how. Failing: *calibrate*.
-3. **Enough coverage**: the law's calibrated range holds the batch shapes the search
-   needs, a vector for every decode rung of the capture ladder included, judged by
-   `compass run --coverage`, which gains a step linear check beside the step grid's and
-   the op graph's. Failing: *calibrate*, the missing shapes and rungs listed.
+3. **Enough coverage**, judged in two parts, as the
+   [fourth ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216) has
+   it. Before the search, from the configuration alone: the law has a decode vector for
+   every rung the capture ladder schedules
+   (`atom/compass/runner/overrides.py::schedulable_ladder`), and for the eager rung where
+   the scheduler's bound passes the widest captured size, since the law refuses a decode
+   step at a rung it has no vector for (`atom/compass/backends/step_linear.py`); `compass
+   run --check` names each such rung. Failing: *calibrate*, the rungs listed. After the
+   search, each point reports its extrapolated share of steps from its own simulated
+   steps: a step outside a vector's hull, such as a context past the law's longest record,
+   is priced by that vector and never refused, counted apart (`08` D49), and its point is
+   no coverage report (`08` D50.1). No priced run is added before the search, and a shape
+   outside the records that is no rung, such as that context, reaches no record list this
+   round.
 4. **Accurate enough**: the law's held-out error is within the acceptance targets (T114).
    Failing: *calibrate*.
 
 **Reason.** Each requirement guards one way a reused law stops matching the subject it was
-fitted on, and one check outside the search gives every caller one answer. A law fitted
-at an older tree and a user on one miss a key alike; only the head's digest, read from the
-integration branch apart from both, tells which is behind. Readings are measured, not
-calibrated: a law's records take hours, and a second law at a borrowed law's key is
-refused by the store. **Basis.** The owner on #3355 and #3363, the
-[third ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957) telling the head by ATOM's digest; `07` D41, D43; README principle 10; #2594, under which
-`compass run` takes a law file's step law and host laws at the key the file states
-(`atom/compass/drive/runfile.py::resolve`); #2899's head-only rule; `13` D80, under which
-a backend fitted under another engine configuration refuses to run.
+fitted on, and one check outside the search gives every caller one answer. A law fitted at
+an older tree and a user on one miss a key alike; only the head's digest, read from the
+integration branch apart from both, tells which is behind. A point the search has not run
+has no steps, and a law's own records lie inside its hulls, so only its rungs can be judged
+before a run. Readings are measured, not calibrated: a law's records take hours, and a
+second law at a borrowed law's key is refused by the store. **Basis.** The owner on #3355
+and #3363: the [third ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957)
+tells the head by ATOM's digest, the
+[fourth](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216) judges coverage in
+two parts; `07` D41, D43; `atom/compass/backends/step_linear.py`, which refuses a rung with
+no vector and extrapolates outside a hull; README principle 10; #2594, under which `compass
+run` takes a law file's step law and host laws at the key the file states
+(`atom/compass/drive/runfile.py::resolve`); #2899's head-only rule; `13` D80, under which a
+backend fitted under another engine configuration refuses to run.
 
 **Rejected.** Comparing commits to tell the head: it also refuses every tree that differs
 from the head only outside ATOM's Python, most trees and a Compass code task's own among
 them, though each reads the head's keys; in the week to `671e2ac9d`, 250 integration
 commits moved the tree and 8 moved the digest (`07` D41). A re-keyed copy of a store law
 published at the head's key: it would answer as fitted at the head, the re-validation
-#2311 designs.
+#2311 designs. A priced run per point before the search, `trace steps` and the coverage
+check as `07` D37 answers a new workload: it adds a run per point beside the search's own,
+which the fourth ruling rules out.
 
 ---
 
@@ -379,7 +412,7 @@ published at the head's key: it would answer as fitted at the head, the re-valid
 
 **Rule.**
 
-- **The record list.** For a configuration missing a law or lacking coverage, the step
+- **The record list.** For a configuration missing a law or a decode rung, the step
   linear backend derives the records from the configuration alone: from its capture
   ladder, the concurrencies and the decode rungs, each recorded from every trajectory's
   first turn (#1840), and the trace runs. `compass advice` prints them as one
@@ -397,14 +430,14 @@ published at the head's key: it would answer as fitted at the head, the re-valid
   shared one for a checked-in law.
 - **No top-up in place.** A store entry is immutable, a second publish at its key
   refused, and `calibrate.sh` takes no record once a fit has run: a configuration lacking
-  coverage is calibrated again, old records with new, in a new output directory and into
-  that calibration's own store. Every configuration that borrows its law, as S5 borrows
-  S2's (D116) and MiniMax-M3's LMCache arms their base arms' (D117), has its readings
-  measured into that store too, `compass advice` printing them with the calibration
-  command. A readings key holds no ATOM digest, so after an ATOM change an entry measured
-  before it still holds its key: a calibration or a readings measure that meets one
-  publishes into a new store too. The reuse check looks a candidate up in the latest
-  store holding all its store inputs, a new one before the shared one, and the
+  a decode rung is calibrated again, old records with new, in a new output directory and
+  into that calibration's own store. Every configuration that borrows its law, as S5
+  borrows S2's (D116) and MiniMax-M3's LMCache arms their base arms' (D117), has its
+  readings measured into that store too, `compass advice` printing them with the
+  calibration command. A readings key holds no ATOM digest, so after an ATOM change an
+  entry measured before it still holds its key: a calibration or a readings measure that
+  meets one publishes into a new store too. The reuse check looks a candidate up in the
+  latest store holding all its store inputs, a new one before the shared one, and the
   candidate's runs read that store; `compass run` keeps its one `--store`.
 - **Timing.** Each calibration records each step's wall time (the warm record, `measure
   memory`, each record, the trace runs, `fit steps`, `fit host`) and its node-hours.
@@ -471,15 +504,17 @@ search's or profiling's code.
   mi355-gpu-40, as another platform; never InferenceX's MiniMax-M3 points. ATOM's
   Benchmark Dashboard (`.github/dashboard/index.html`) is tried first (T111).
 - **The per-run report**, `report.html`, which every run, simulated or real, writes into
-  its directory when it ends: the run (configuration, machine, ATOM tree, law sources from
-  `run.json`, workload); headline metrics by #3264's code, as the dashboard computes them,
-  and the speed ratio; trust, from `summary.json` (method shares of seconds, refusals,
-  extrapolated and fallback steps as shares of steps, whether it is a coverage report);
-  a graded cell's grades, from the `grades.json` that `python -m atom.compass.validate
-  CELL...` writes into each cell it grades, the table it prints; the per-request split,
-  beside the real run's when the cell has one; the op-family split on op-level runs. Each
-  number comes from a file in the run directory or its cell's `grades.json`, a part with
-  no data says so, and the page changes none of the run's results.
+  its directory when it ends: the run (configuration, machine, ATOM tree, law sources
+  from `run.json`, workload); headline metrics by #3264's code, as the dashboard computes
+  them, and the speed ratio; trust, from `summary.json` (method shares of seconds,
+  refusals, extrapolated and fallback steps as shares of steps, whether it is a coverage
+  report); a graded cell's grades, from the `grades.json` that `python -m
+  atom.compass.validate CELL...` writes into each cell it grades, the table it prints,
+  rendering again the `report.html` of each run in that cell, since a run writes its own
+  before grading; the per-request split, beside the real run's when the cell has one; the
+  op-family split on op-level runs. Each number comes from a file in the run directory or
+  its cell's `grades.json`, a part with no data says so, and the page changes none of the
+  run's results.
 
 **Reason.** A static page travels with its run; reading files keeps the views apart from
 the code they show (D108); two marks keep an ungraded or guessed number from reading as
@@ -510,25 +545,10 @@ workload, so its grade is not cited.
 | P3 | 1P1D | DPA8 / DPA8 | off | prefill | off | `recipes/mesh/DeepSeek-V4.md`, DPA | the shipped crs005 and gpu45 pairs under `scripts/compass/laws/`, if they pass D112 |
 
 The configurations cut from it, each one switch alone (S3, S4, P2, P4 to P7), can come
-back. Arguments and environment follow the basis recipe, except:
-
-- `--max-num-seqs 512` everywhere, not the single-node recipe's twice the concurrency:
-  one value keeps one memory-readings entry per configuration.
-- Prefix caching on everywhere, as the single-node recipe and the agentic workload have
-  it; the 1P1D recipe turns it off. It is in no law's key, so whether M2's laws, fitted
-  with it off, serve is D112's accuracy requirement.
-- `--gpu-memory-utilization` 0.9 on one node; 0.75 on each decode side, the development
-  nodes' Mooncake dmabuf limit; on the prefill side 0.72 for P3, whose eight DPA ranks'
-  gathered MoE rows pass 65,536 at 0.75 and run aiter's MoE workspace out of memory
-  ([#975 Ruling](https://github.com/jgong5/ATOM/issues/975#issuecomment-6565403459)), and
-  0.75 for P1 unless its calibration runs out of memory. No law keys on it.
-- MTP3's acceptance length stated as 2.49, InferenceX's golden
-  `deepseek-v4-pro__mtp__native__default-default.yaml` (thinking on) and the single-node
-  recipe's, by `--spec-decode-acceptance-length` on real and simulated runs alike
-  ([#2683 Ruling](https://github.com/jgong5/ATOM/pull/2683#issuecomment-6578751421)).
-- No `--block-size`: ATOM forces 256 on any DeepSeek-V4 checkpoint (`atom/config.py`).
-- Capture sizes: ATOM's default on one node; on 1P1D the shipped DPA laws' ladders, so
-  those laws can pass the key check.
+back. Each configuration's arguments and environment follow its basis recipe, with the
+departures and their reasons #3355's template states; the template's space file carries
+both (D110). Prefix caching, on everywhere there, is in no law's key, so whether M2's
+laws, fitted with it off, serve is D112's accuracy requirement.
 
 Each configuration with a law runs at 1, 2, 4, 8, 16, 32, 64, 128 and 256 clients, no
 higher: the held-out traces are 0 to 255, and reusing sessions is T27's. S5 offloads
@@ -542,8 +562,8 @@ built; real DP ranks draw the same uniforms each step where simulated ones draw 
 **Reason.** DeepSeek-V4-Pro has a store and shipped laws on the development nodes, so the
 tool is built while MiniMax-M3's support lands (D117); the template runs every path of the
 tool, a reused law and a new one included, and S1 against S2 puts the agentic workload's
-best-known trade-off on its frontier. **Basis.** The owner on #3355; `16` D95; the #975
-and #2683 Rulings.
+best-known trade-off on its frontier. **Basis.** The owner on #3355, whose template states
+each departure and cites the #975 and #2683 Rulings it rests on; `16` D95.
 
 **Rejected.** Developing on MiniMax-M3 from the start: the Compass features it needs were
 still landing under #3256, while DeepSeek-V4-Pro already had a store and laws on the
@@ -584,8 +604,14 @@ development nodes.
   records end near 255k tokens a request while the submission serves contexts to 1048576:
   the search runs with no step roofline (D109), while every step grid run composes one
   below its grid (`17` D102), and the coverage check (D112) and the record list (D113) are
-  the step linear law's. A step past the law's records is D112's coverage case: calibrated
-  again with the missing shapes listed, or a coverage report.
+  the step linear law's. The `agentx` client sends every cc-trace at full length (`06`
+  D35.1), so a step past the law's records is priced by extrapolation, never refused,
+  counted apart and shown as its point's extrapolated share (`08` D49), unless the
+  calibration records it. If the M3-Agentic stage's grading shows the step linear law
+  failing `08` D45.1 where the step grid passes, on a cell the showcase runs, the
+  showcase's pricing is a design change before the showcase runs (the
+  [fourth ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216),
+  correcting the second's last sentence).
 - **The showcase run**: `compass advice` on that template, the model differing only in
   the space file, no search, profiling or view code branching on it; whatever MiniMax-M3
   forces to change is filed as a defect; an op-family split only where the op-level
@@ -610,25 +636,27 @@ development nodes.
 stage builds what Compass needs, so the search is shown on a space users deploy; a law is
 keyed to its platform and host; the recommendation against its runner-up is the choice a
 user acts on, and their order is what real runs confirm. **Basis.** The owner on #3355 and
-#3363, the second ruling settling the pricing and the overlap verdict; `16` D95.1; `08`
-D44, D45, D45.1; `14` D87.1; `03` D13.1; `06` D35.1; `17` D102.
+#3363, the second ruling settling the pricing and the overlap verdict and the fourth what a
+step past the law's records costs and when the pricing is reopened; `16` D95.1; `08` D44,
+D45, D45.1, D49; `14` D87.1; `03` D13.1; `06` D35.1; `17` D102.
 
 **Rejected.** Pricing with the step grid beside the step linear law, as #3256's ruling has
 the M3-Agentic stage do: it reaches the step roofline the search runs without, and the
-coverage check and record list that complete a law are the step linear law's.
+coverage check and record list that complete a law are the step linear law's; the stage's
+grades reopen it.
 
 ---
 
 ## Simpler alternative
 
-A guide over the commands that exist, with no `compass advice`: `compass run --check`
-per candidate (`atom/compass/drive/lacking.py`), which lists each missing or stale input
-with the command that makes it; `compass run` and one `client.sh` run per point; and
-`python -m atom.compass.validate --curves` for the curves. It fails #3355: the search is
-not one command; `--check` has no step linear coverage check and no accuracy bar, so
-reuse requirements 3 and 4 go unjudged; `--check` refuses a prefill or decode side's
-arguments (`13` D80), so no 1P1D candidate is checked; and a user step needs `python -m`,
-which the owner's ruling on #1108, recorded in #1527, rules out.
+A guide over the commands that exist, with no `compass advice`: `compass run --check` per
+candidate (`atom/compass/drive/lacking.py`), which lists each missing or stale input with
+the command that makes it; `compass run` and one `client.sh` run per point; and `python
+-m atom.compass.validate --curves` for the curves. It fails #3355: the search is not one
+command; `--check` holds no law's decode rungs against the ladder and has no accuracy
+bar, so reuse requirements 3 and 4 go unjudged; `--check` refuses a prefill or decode
+side's arguments (`13` D80), so no 1P1D candidate is checked; and a user step needs
+`python -m`, which the owner's ruling on #1108, recorded in #1527, rules out.
 
 ---
 
@@ -643,8 +671,9 @@ which the owner's ruling on #1108, recorded in #1527, rules out.
 ## Dependencies
 
 No spike and no sync issue: no decision waits on a measurement, and none needs an
-interface only the upstream has. Other issues settle what decisions leave to them: #3275
-how one law serves an arm's
+interface only the upstream has. Other issues settle what decisions leave to them: #3256's
+grading, which reopens the showcase's pricing if it fails the step linear law where the
+step grid passes on a cell the showcase runs (D117); #3275 how one law serves an arm's
 points (T113); #3054 and #3265 MiniMax-M3's move (D117); #2311 who judges a change that
 moves step costs (D112); #3122 readings re-keyed with a law, and trees other than the
 head (D112); #1498 the op-family split's inputs on DeepSeek-V4-Pro (D114).
@@ -669,11 +698,11 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | Where | Change | Decisions |
 |---|---|---|
 | `atom/compass/advice/` (new), `atom/compass/cli.py` | `compass advice`: the space file, the check's states, the simulation, the results, `dashboard.html` | D109, D110, D111, D115 |
-| `atom/compass/drive/reuse.py` (new), `drive/lacking.py`, `drive/run.py`, `run/__init__.py::atom_digest` | the reuse check, the head's digest taken over the `atom/` a commit holds; `run --check` on a P/D side, resolved as `deploy.sh` does; `run --coverage` for a step linear law | D109, D112 |
+| `atom/compass/drive/reuse.py` (new), `drive/lacking.py`, `drive/run.py`, `run/__init__.py::atom_digest` | the reuse check, the head's digest taken over the `atom/` a commit holds; `run --check` on a P/D side, resolved as `deploy.sh` does, and naming a step linear law's scheduled decode rungs with no vector | D109, D112 |
 | `atom/compass/backends/step_linear_plan.py` (new), beside `step_grid_plan.py` | the record list | D113 |
 | `scripts/compass/calibrate.sh` | `STORE`, a GPU list, `status`, per-step timing | D113 |
 | `atom/compass/report/` (new), called where `run`, `record` and `deploy.sh` stop | the per-request split, the op-family split, `report.html` | D114, D115 |
-| `atom/compass/validate/__main__.py`, `validate/curves.py` | `grades.json` in each graded cell; a 1P1D point's GPUs over both sides | D115, D111 |
+| `atom/compass/validate/__main__.py`, `validate/curves.py` | `grades.json` in each graded cell, its runs' `report.html` rendered again; a 1P1D point's GPUs over both sides | D115, D111 |
 | `scripts/compass/spaces/` (new) | the DeepSeek-V4-Pro and MiniMax-M3 templates | D110, D116, D117 |
 | `scripts/compass/ADVICE.md` (new), `QUICKSTART.md` | the guide, linked both ways | D108 |
 | `scripts/compass/laws/` | P1's law, checked in re-keyed if it passes D112 | D112, D116 |
@@ -687,8 +716,9 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
    calibrating with its progress, or refused verbatim; every point missing readings
    carries its `measure memory` command; the search calibrates nothing (2).
 3. Each reuse verdict names its requirement: a tree whose ATOM digest differs from the
-   head's refused with both digests, a key mismatch, an invalidation, a coverage gap with
-   its shapes and rungs, and an accuracy miss once T114 sets the bar (3).
+   head's refused with both digests, a key mismatch, an invalidation, a scheduled decode
+   rung with no vector listed before the search, and an accuracy miss once T114 sets the
+   bar; after the search each point reports its extrapolated share of steps (3).
 4. A recalibration is printed with its borrowers' readings commands, and both run on the
    new store (4).
 5. A 1P1D candidate is checked per side as `deploy.sh` resolves it, simulated by
@@ -703,10 +733,12 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 9. A request's split segments sum to its end-to-end latency within the clock's
    resolution; an op-level run's families reconcile with its predicted time (7).
 10. The dashboard and each report read files only; each number on a report comes from its
-    run directory or its cell's `grades.json`; a part with no data says so (7).
+    run directory or its cell's `grades.json`, a graded cell's reports rendered again by
+    grading; a part with no data says so (7).
 11. The showcase calibrates and runs at one frozen commit, prices by the step linear law
-    alone, grades both cells by `08` D44 with their order compared, and reports each
-    point's `08` D45.1 verdict beside its grade, not gated (8).
+    alone, a step past its records extrapolated and its share reported, grades both cells
+    by `08` D44 with their order compared, and reports each point's `08` D45.1 verdict
+    beside its grade, not gated (8).
 
 ---
 
@@ -718,12 +750,12 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | D109 | `compass advice SPACE OUT` checks each candidate (searchable, missing a law, calibrating, refused) and each point's readings (missing readings, with the `measure memory` command `run --check` prints), simulates each searchable point on a fresh server with no step roofline, and writes the results; it never calibrates, and runs at the integration head, on the target machine type, in a GPU container. Amends `13` D80: it starts the client and takes a workload, and `run --check` resolves a prefill or decode side. | 2026-11-13 (#3355, #3363) |
 | D110 | The user provides the space file, by hand or through an agent following the guide; it names the shared store and, for a frozen search, its commit; it expands deterministically into candidates, each naming its ATOM basis and departures; the templates live in `scripts/compass/spaces/`, no default; it is the search's input, not a level of `13` D79's precedence. | 2026-11-13 (#3355, #3363) |
 | D111 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. | 2026-11-13 (#3355) |
-| D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage and held-out error within the acceptance targets; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose ATOM digest is not the head's, the remote tip's or a frozen commit's, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363; the head by ATOM's digest, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957)) |
-| D113 | The step linear backend lists a configuration's missing records as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
+| D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage (a decode vector for every scheduled rung before the search, each point's extrapolated share reported after it) and held-out error within the acceptance targets; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose ATOM digest is not the head's, the remote tip's or a frozen commit's, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363; the head by ATOM's digest, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957); coverage in two parts, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216)) |
+| D113 | The step linear backend lists a configuration's missing records, for a missing law or decode rung, as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
 | D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355) |
-| D115 | Two static views reading files only: the search's dashboard, each point marked by grading state and method shares, and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell. | 2026-11-13 (#3355, #3363) |
+| D115 | Two static views reading files only: the search's dashboard, each point marked by grading state and method shares, and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell, which renders the cell's reports again. | 2026-11-13 (#3355, #3363) |
 | D116 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355) |
-| D117 | Moved to MiniMax-M3 once its Compass features land and #3265 passes, calibrated on the development nodes from #3256's arms at one frozen commit, where its simulations and validation runs run too, every point priced by the step linear law alone; the showcase validation runs the recommended configuration and the runner-up real, graded by `08` D44, their real order compared with the simulated one, each point's `08` D45.1 verdict beside its grade, not gated. Amends `08` D50. | 2026-11-13 (#3355, #3363) |
+| D117 | Moved to MiniMax-M3 once its Compass features land and #3265 passes, calibrated on the development nodes from #3256's arms at one frozen commit, where its simulations and validation runs run too, every point priced by the step linear law alone, a step past its records extrapolated and reported, and the pricing reopened if #3256's grading fails the law where the step grid passes ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216)); the showcase validation runs the recommended configuration and the runner-up real, graded by `08` D44, their real order compared with the simulated one, each point's `08` D45.1 verdict beside its grade, not gated. Amends `08` D50. | 2026-11-13 (#3355, #3363) |
 
 ---
 
