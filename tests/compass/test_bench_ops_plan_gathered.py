@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """`compass measure ops --plan` over prefill steps whose shapes state the rows
 their DP group's MoE gathers, G, which `fit ops` keeps apart from a shape that
-states none: a filled or halved point lands in the family its steps are priced
-from, and `fit ops` reads a leaf that does not read G at any G.
+states none: a filled point lands in the family its steps are priced from, on
+its own points' graph, the plan reads no graph of a shape stating none, and
+`fit ops` reads a leaf that does not read G at any G.
 The bench and graphs are `test_bench_ops_plan`'s stand-ins.
 """
 
@@ -57,6 +58,24 @@ def test_a_fill_beside_points_that_state_g_prices_a_step_that_states_g_between_t
     assert got.seconds == pytest.approx(1050e-6)
 
 
+def test_a_fill_stating_g_reads_its_own_points_graph_not_a_drafter_s_beside_it():
+    at = {t: prefill(t, 1, t + PEERS) for t in (40, 60, 100)}
+    # a DP drafter's later pass at T = 60, gathering its batch of 4 on two
+    # ranks: its graph there holds the drafter's leaf alone
+    x = {"shape": [4, 8], "stride": [8, 1], "dtype": "torch.bfloat16"}
+    step = {"op": "aiter.step", "args": {"x": x}, "out": [[4, 8]]}
+    later = {"shape": "prefill T=60 B=1 G=8", "context": None, "op": "aiter.step"}
+    records = [later | {"leaf": ops.signature(step), "kernels": ["s"], "cold_ns": 4e3}]
+    records += [_point(at[t], c) for t in (40, 100) for c in (None, 2000)]
+    records.append(_point(at[60], None) | {"micro_batch": True})
+    families = ops._families(records, ops._dependent(records))
+
+    want = ops._filled(families, set(), 1 << 20)
+
+    # the micro-batch's own graph, which its attention point was read off
+    assert set(want) == {(at[60]._replace(micro_batch=True), 2000)}
+
+
 def _gathering(path, *steps):
     """A record directory of `steps`, each `(rows, rung)`, a prefill's group
     gathering `PEERS` rows past its own."""
@@ -76,6 +95,13 @@ def test_a_plan_over_steps_that_state_g_asks_no_shape_that_states_none(
     bench, tmp_path, monkeypatch  # noqa: F811
 ):
     monkeypatch.setattr(ops, "_child", _moving_bench)
+    read, stand_in = set(), ops.graph
+
+    def graph(store, config, shape, arch=None):
+        read.add(str(shape))
+        return stand_in(store, config, shape, arch)
+
+    monkeypatch.setattr(ops, "graph", graph)
     plan = _gathering(
         tmp_path / "plan",
         ([[1, 1000, True], [1, 3000, True]], 2),
@@ -86,11 +112,11 @@ def test_a_plan_over_steps_that_state_g_asks_no_shape_that_states_none(
         ([[75, 75, False], [75, 75, False]], None),  # and at T = 150
     )
 
-    records = _plan(bench, tmp_path, plan)
+    _plan(bench, tmp_path, plan)
 
     # B = 1 holds no step at T = 60, nor B = 2 at T = 100, and GEMM switches
     # kernels at T = 100: no shape stating G but a step's has a graph
-    assert {r["shape"] for r in records if r["shape"].startswith("prefill")} == {
+    assert {s for s in read if s.startswith("prefill")} == {
         "prefill T=40 B=1 G=47",
         "prefill T=100 B=1 G=107",
         "prefill T=150 B=1 G=157",
