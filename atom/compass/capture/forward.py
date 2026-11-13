@@ -144,6 +144,8 @@ V41_SCORERS = (
 V41_ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 #: Where a drafter's step ends its target's work: ATOM records `forward_done_event`.
 CUT = "forward_done_event"
+#: aiter's fused-MoE leaves, as its op and as ATOM's wrapper of it.
+FUSED_MOES = ("aiter.fused_moe_.default", "aiter.rocm_aiter_fused_moe.default")
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
@@ -906,6 +908,10 @@ def _patches(recorder):
       collectives, the streams and the expert kernels. A two-batch-overlap
       micro-batch's MoE runs on one stream, as under overlap, where
       `tbo_active()` turns the dual-stream MoE off.
+    * The aiter fused-MoE leaves (`FUSED_MOES`) of a layer whose top-k ids
+      aiter's table widens with its fused shared experts (`LEGACY_AITER`)
+      state the layer's `top_k` and `fused_shared_experts`: the ids' width
+      does not tell the router's columns from those.
     * The checkpoint's weights iterator yields nothing: ATOM's dummy load still
       runs it, which would open every shard, or download them for a hub name.
     * No KV connector is built (`get_kvconnector` answers none): under a P/D
@@ -941,6 +947,7 @@ def _patches(recorder):
     from atom.model_loader import loader
     from atom.model_ops import module_dispatch_ops, moe, rejection_sampler
     from atom.model_ops.attentions import gdn_attn
+    from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
     from atom.utils import CpuGpuBuffer, forward_context
     from atom.utils.tbo import ubatching
     from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
@@ -1019,6 +1026,16 @@ def _patches(recorder):
     def one_stream_in_micro_batch(moe, num_tokens):
         return not recorder.shape.micro_batch and dual_stream(moe, num_tokens)
 
+    def moe_forward(hidden_states, router_logits, layer_name):
+        layer = recorder.contexts[layer_name]
+        if layer.expert_layout.mode is not SharedExpertMode.LEGACY_AITER:
+            return moe.moe_forward(hidden_states, router_logits, layer_name)
+        shared = layer.num_fused_shared_experts
+        counts = ("top_k", layer.top_k), ("fused_shared_experts", shared)
+        stated = recorder.stated | dict.fromkeys(FUSED_MOES, counts)
+        with patch.object(recorder, "stated", stated):
+            return moe.moe_forward(hidden_states, router_logits, layer_name)
+
     def host_conv1d(*args, **kwargs):
         with unset_fake_temporarily():
             return conv1d(*args, **kwargs)
@@ -1060,7 +1077,7 @@ def _patches(recorder):
         (UBatchWrapper, "_run_ubatches", micro_batches),
         (topk, "topk_ob_workspace_size", lambda *a: 0),
         (topk, "topk_mb_workspace_size", lambda *a: 0),
-        (torch.ops.aiter, "moe_forward", moe.moe_forward),
+        (torch.ops.aiter, "moe_forward", moe_forward),
         (
             torch.ops.aiter,
             "maybe_dual_stream_forward",
