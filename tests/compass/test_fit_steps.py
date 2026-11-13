@@ -415,6 +415,13 @@ def model(directory, config) -> tuple:
             (128, 8),
         ),
         (kimi(num_experts=32, num_experts_per_token=4), (32, 4)),
+        (
+            {
+                "model_type": "minimax_m3_vl",
+                "text_config": {"num_local_experts": 16, "num_experts_per_tok": 4},
+            },
+            (16, 4),
+        ),
         ({"model_type": "llama"}, None),
     ],
 )

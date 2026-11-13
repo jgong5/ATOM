@@ -84,16 +84,19 @@ TOP_K = ("num_experts_per_tok", "num_experts_per_token")
 
 
 def _model_routing(model: str, served: str) -> tuple[int, int] | None:
-    """The routed experts and top-k of the model directory `model`'s config as
-    ATOM loads it, None for a model naming no routed experts; refused unless
-    its config.json is `served`, the records' digest of theirs."""
-    from atom.config import get_hf_config
+    """The routed experts and top-k the model directory `model` states, read
+    from its config as ATOM's `Config` loads it, in its text config where it
+    has one; None for a model naming no routed experts. Refused unless its
+    config.json is `served`, the records' digest of theirs."""
+    from atom.config import _normalize_minimax_m3_text_config, get_hf_config
 
     if (digest := _file_digest(model, "config.json")) != served:
         raise ValueError(
             f"--model {model} holds config.json {digest}; the records served {served}"
         )
     config = get_hf_config(model)
+    _normalize_minimax_m3_text_config(config)
+    config = getattr(config, "text_config", config)
     experts, top_k = (
         next((v for v in (getattr(config, n, None) for n in names) if v), None)
         for names in (EXPERTS, TOP_K)
