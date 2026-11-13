@@ -3,12 +3,14 @@
 
 On one rank ATOM runs the experts on the step's own tokens alone: a graph's
 pad rows route to no expert and take no fused shared expert, while the
-output's all-reduce still moves every row. Each is checked against a count by
-hand.
+output's all-reduce still moves every row, and a leaf narrower than the step
+routes its own rows. Each is checked against a count by hand.
 """
 
 import pytest
 from test_backend_step_roofline_v4 import BOUND, EP2, _module, _price
+from test_op_work import rows
+from test_op_work_fused_shared import fused, priced
 from test_op_work_v4 import close, experts, moe, triton
 
 from atom.compass.backends import BatchView, RequestShape
@@ -49,6 +51,24 @@ def test_the_op_level_experts_route_only_the_step_s_own_tokens():
     hit = activated_experts(16, 2, 3)
 
     close(work(moe(8, 16), PADDED, 1, "bf16"), experts(8, 6, hit))
+
+
+def test_an_op_level_leaf_narrower_than_the_step_routes_its_own_rows():
+    # A leaf of 8 rows under a prefill of 512 tokens, as a replayed prefill's
+    # decoder runs each finishing request's last rows: its 8 rows route.
+    prefill = rows((300, 300), (212, 212), decode=False)
+    hit = activated_experts(16, 2, 8)
+
+    close(work(moe(8, 16), prefill, 1, "bf16"), experts(8, 16, hit))
+
+
+def test_an_op_level_fused_shared_expert_takes_only_the_step_s_own_tokens():
+    # The leaf states its top 2 and one fused shared expert: the 3 tokens'
+    # 6 routes and the shared expert on the 3, over the experts they reach
+    # and the shared one; the 5 pad rows take neither.
+    hit = activated_experts(16, 2, 3) + 1
+
+    close(work(fused(8, 17, 3), PADDED, 1, "bf16"), priced(8, 9, hit, 3, 3))
 
 
 def test_the_op_level_experts_under_expert_parallelism_take_the_tokens_share():
