@@ -1314,11 +1314,13 @@ def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing, fold
     return best
 
 
-def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
+def _hull(points: np.ndarray, names: tuple[str, ...], affine: bool = True) -> dict:
     """`StepLinearLaw`'s hull over the non-intercept features of the fitted steps.
     qhull's precision checks depend on the order the points come in: where it
     refuses them, it hulls their distinct points in sorted order, the same hull.
-    A set that spans none still raises."""
+    A set that spans none still raises. A feature affine in an earlier one on
+    the set is held to it by two opposed facets, as a constant one is by
+    `equal`, unless `affine` is false: then qhull refuses that flat set."""
     from scipy.spatial import ConvexHull, QhullError
 
     equal = {
@@ -1334,10 +1336,26 @@ def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
     elif vary:
         # Hulled in the unit box, where qhull's tolerances suit every feature.
         unit = (x - lo) / (hi - lo)
-        try:
-            eq = ConvexHull(unit).equations
-        except QhullError:
-            eq = ConvexHull(np.unique(unit, axis=0)).equations
+        mirror = (hi - x) / (hi - lo)  # an affine feature equals another's unit or this
+        tied = {}  # a feature: the earlier one it is held to, and the sign
+        for i, j in itertools.combinations(range(len(vary)), 2) if affine else ():
+            for sign, other in ((1.0, unit), (-1.0, mirror)):
+                if j not in tied and np.array_equal(unit[:, j], other[:, i]):
+                    tied[j] = (i, sign)
+        free = [j for j in range(len(vary)) if j not in tied]
+        if len(free) == 1:
+            hulled = np.array([[-1.0, 0.0], [1.0, -1.0]])
+        else:
+            try:
+                hulled = ConvexHull(unit[:, free]).equations
+            except QhullError:
+                hulled = ConvexHull(np.unique(unit[:, free], axis=0)).equations
+        eq = np.zeros((len(hulled), len(vary) + 1))
+        eq[:, free], eq[:, -1] = hulled[:, :-1], hulled[:, -1]
+        for j, (i, sign) in tied.items():  # u_j = u_i, or u_j = 1 - u_i
+            tie = np.zeros(len(vary) + 1)
+            tie[[j, i, -1]] = np.array([1.0, -sign, min(sign, 0.0)]) / 2**0.5
+            eq = np.vstack([eq, tie, -tie])
         normals = eq[:, :-1] / (hi - lo)
         facets = np.column_stack([normals, eq[:, -1] - normals @ lo]).tolist()
     else:
