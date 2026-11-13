@@ -257,8 +257,9 @@ search's or profiling's code.
   graded cell's grades); the per-request split, beside the real run's when the cell has
   one; the op-family split on op-level runs. Each number comes from a file in the run
   directory, a part with no data says so, and the page changes none of the run's results.
-  ATOM's own report (`.github/scripts/atomesh/observability/export_report.py`) plots
-  Prometheus series, which need `/metrics` sampled on the simulated clock, deferred.
+  ATOM's own report (`.github/scripts/atomesh/observability/export_report.py`) is not
+  used: it plots Prometheus series, which need `/metrics` sampled on the simulated clock,
+  deferred.
 
 **Reason.** A static page travels with its run; reading files keeps the views apart from
 the code they show (D107); two marks keep an ungraded or guessed number from reading as
@@ -348,8 +349,9 @@ and #2683 Rulings.
   that cannot be priced is a grey coverage report. How one law serves points whose
   `--max-num-seqs` differs is #3275's ruling (T113).
 - **Calibration** as `16` D95.1's, after the environment check: a base law each for TP4,
-  TP4 with indexer CP and TP2, pooling its LMCache arm's records and `03` D13.1's offload
-  terms only if that arm comes up; a readings entry per point; each step timed (D112).
+  TP4 with indexer CP and TP2, the last two pooling their LMCache arms' records, with `03`
+  D13.1's offload terms, only if those arms come up; a readings entry per point; each step
+  timed (D112).
 - **The showcase run**: `compass advice` on that template, the model differing only in
   the space file, no search, profiling or view code branching on it; whatever MiniMax-M3
   forces to change is filed as a defect; an op-family split only where the op-level
