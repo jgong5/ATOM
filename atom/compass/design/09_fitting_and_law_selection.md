@@ -149,6 +149,12 @@ TP4 run and is refused at any other width, like any other layout field
 
 ### The label: device time per step kind, and the host laws beside it
 
+**Replaced in part by [`18`](18_pass_record_and_host_paced_time.md) D107**: one pass
+record and one rule take the place of this section's decode cuts, the launch-exposed
+cut, the MTP decode label without its gap, the `propose` label's host-paced cut and the
+trace-run decode cut. The code applies the rules below until the implementation `18`'s
+*Summary* cuts lands, and that implementation rewrites them here.
+
 Owner ruling on [#815](https://github.com/jgong5/ATOM/issues/815), 2026-10-11, superseding
 ruling 2 of
 [#627's 2026-10-10 plan](https://github.com/jgong5/ATOM/issues/627#issuecomment-6096543740).
