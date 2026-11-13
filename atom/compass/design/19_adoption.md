@@ -4,8 +4,8 @@
 [#3355](https://github.com/jgong5/ATOM/issues/3355), which the owner took from 2026-11-10
 to 2026-11-13, and the owner's rulings on its design PR #3363
 ([first](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6845852318),
-[second](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6851839086)). No code
-implements it yet: its tasks are cut from *Summary* after v1.
+[second](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6851839086),
+[third](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957)). No code implements it yet: its tasks are cut from *Summary* after v1.
 
 **Depends on:** `07` (the store, D37), `08` (D44, D45, D45.1, D50, D50.1), `13` (D79,
 D80), `16` (D95.1), and the M3-Agentic stage's `03` D13.1, `06` D35.1 and `14` D87.1.
@@ -73,12 +73,12 @@ development nodes are crsuse2-m2m-v3-005 and -013.
 ### 3. The reuse check's verdicts
 
 ```
- the commit of the tree atom resolves under, with no uncommitted file
-   against the head: the integration branch's tip on its remote, or the
-   commit SPACE freezes (D110)
-     another commit -> refused, both commits named (requirement 1)
-     the head       -> each input by its key (07 D41), against this tree's
-                       ATOM digest (D112)
+ the ATOM digest of the tree atom resolves under, against the head's: the
+   digest of the integration branch's tip on its remote, or of the commit
+   SPACE freezes (D110)
+     another digest -> refused, both digests named (requirement 1)
+     the head's     -> each input by its key (07 D41), its ATOM digest
+                       against the tree's (D112)
 
  the candidate's law                         verdict
    none at its key                           calibrate
@@ -249,16 +249,16 @@ It states the model, the machine, the shared store (D113), the workload (traces 
 concurrencies), the SLO, the ATOM arguments every candidate shares, the dimensions
 searched with their values, exclusions, arguments that vary with the concurrency, as
 MiniMax-M3's `--max-num-seqs` is twice it, and, for a search frozen at one commit as the
-showcase is, that commit (D112). It expands into the product of the dimensions less the
-exclusions, always into the same candidates in the same order, and refuses by name an
-unknown field, contradictory values or an empty expansion. Each candidate names its ATOM
-basis, the recipe its arguments follow, and each departure with its reason. Its format is
-T108's. The two templates, D116's and D117's, are space files in `scripts/compass/spaces/`,
-beside `laws/` and `machines/`; `compass advice` reads the SPACE it is given and falls
-back on neither. The file is the search's input, as traces are a client's: each
-candidate's run takes `compass run`'s flags and ATOM's arguments from `compass advice`,
-so the file adds no level to `13` D79's precedence and is not the Compass config file D79
-rejects.
+showcase is, that commit, whose ATOM digest stands for the head's (D112). It expands into
+the product of the dimensions less the exclusions, always into the same candidates in the
+same order, and refuses by name an unknown field, contradictory values or an empty
+expansion. Each candidate names its ATOM basis, the recipe its arguments follow, and each
+departure with its reason. Its format is T108's. The two templates, D116's and D117's,
+are space files in `scripts/compass/spaces/`, beside `laws/` and `machines/`; `compass
+advice` reads the SPACE it is given and falls back on neither. The file is the search's
+input, as traces are a client's: each candidate's run takes `compass run`'s flags and
+ATOM's arguments from `compass advice`, so the file adds no level to `13` D79's
+precedence and is not the Compass config file D79 rejects.
 
 **Reason.** The user, not Compass, knows what they would deploy; a template shows the
 shape, and an agent saves the user copying arguments by hand; the frozen commit has to be
@@ -320,16 +320,18 @@ and each point's readings one, *reuse*, *measure* or *refused*, naming the requi
 that failed; `compass advice` calls it and judges nothing. A reused input is stated in
 the run's provenance.
 
-1. **Same key**, as `07` D41 keys each kind, at the head's tree. The check compares the
-   commit of the tree `atom` resolves under (`scripts/compass/_lib.sh::compass_head_sha`:
-   git's, or a `snapshot.sh` tree's stamp), with no uncommitted file, as a publish
-   requires (`07` D41), against the head: the integration branch's tip on its remote,
-   read when the check runs, or the commit the space file freezes (D110), which must be
-   one of that branch's. Another commit, an older checkout, a release or a local patch,
-   is *refused*, both commits named, the only requirement that refuses: only the head is
-   supported, other trees waiting for after v1 (#3122). At the head, each input's ATOM
-   digest (`atom/compass/run/__init__.py::atom_digest`: a step law's `source_root`, host
-   laws' `atom`, readings' `atom_src`) is held against this tree's. A law with no entry at
+1. **Same key**, as `07` D41 keys each kind, at the head's ATOM. The check compares the
+   ATOM digest of the tree `atom` resolves under
+   (`atom/compass/run/__init__.py::atom_digest`, the sha256 of ATOM's Python less
+   Compass's own code, which every key reads) with the head's: the digest of the `atom/`
+   the integration branch's tip holds on its remote, read when the check runs, or of the
+   commit the space file freezes (D110), which must be one of that branch's. A tree whose
+   digest differs, as an older checkout, a release or a local patch may, is *refused*,
+   both digests named, the only requirement that refuses: only the head is supported,
+   other trees waiting for after v1 (#3122). A tree that differs from the head only
+   outside ATOM's Python, a Compass code task's own included, reads every key the head
+   reads, and passes. Each input's ATOM digest (a step law's `source_root`, host laws'
+   `atom`, readings' `atom_src`) is then held against the tree's. A law with no entry at
    its key is *calibrate*; readings with none, or measured at another digest, *measure*,
    since they re-key with a law only under #3122's design.
 2. **Not invalidated**: no ATOM change since the calibration moves step costs or memory,
@@ -355,18 +357,21 @@ the run's provenance.
 
 **Reason.** Each requirement guards one way a reused law stops matching the subject it was
 fitted on, and one check outside the search gives every caller one answer. A law fitted
-at an older tree and a user on one miss a key alike; only the head's commit, read apart
-from both, tells which is behind. Readings are measured, not calibrated: a law's records
-take hours, and a second law at a borrowed law's key is refused by the store. **Basis.**
-The owner on #3355 and #3363; `07` D41, D43; README principle 10; #2594, under which
+at an older tree and a user on one miss a key alike; only the head's digest, read from the
+integration branch apart from both, tells which is behind. Readings are measured, not
+calibrated: a law's records take hours, and a second law at a borrowed law's key is
+refused by the store. **Basis.** The owner on #3355 and #3363, the
+[third ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957) telling the head by ATOM's digest; `07` D41, D43; README principle 10; #2594, under which
 `compass run` takes a law file's step law and host laws at the key the file states
 (`atom/compass/drive/runfile.py::resolve`); #2899's head-only rule; `13` D80, under which
 a backend fitted under another engine configuration refuses to run.
 
-**Rejected.** Comparing ATOM digests to tell the head, the tree's against the tip's: it
-refuses exactly where a key would miss, but passes an older checkout that #3355 refuses by
-name (*Low confidence*). A re-keyed copy of a store law published at the head's key: it
-would answer as fitted at the head, the re-validation #2311 designs.
+**Rejected.** Comparing commits to tell the head: it also refuses every tree that differs
+from the head only outside ATOM's Python, most trees and a Compass code task's own among
+them, though each reads the head's keys; in the week to `671e2ac9d`, 250 integration
+commits moved the tree and 8 moved the digest (`07` D41). A re-keyed copy of a store law
+published at the head's key: it would answer as fitted at the head, the re-validation
+#2311 designs.
 
 ---
 
@@ -629,13 +634,6 @@ which the owner's ruling on #1108, recorded in #1527, rules out.
 
 ## Low confidence
 
-- **D112 tells the head by commit.** #3355 refuses an older checkout, a release and a
-  local patch by name, and a commit comparison refuses each. Comparing the tree's ATOM
-  digest with the tip's is about as strong: every key reads that digest (`07` D41), so it
-  refuses exactly where a key would miss, and it passes a tree that differs from the head
-  only outside ATOM's Python. A Compass code task's own tree is such a tree: the commit
-  rule refuses it, so a task whose named result runs the check takes it only once landed.
-  Only the owner's reading of "the head" settles which rule holds.
 - **D110's space file is not the config file `13` D79 rejects.** It is argued as the
   search's input, as traces are a client's; jgong5 judges the argument, as the owner's
   first ruling on #3363 asks, and no measurement bears on it.
@@ -671,7 +669,7 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | Where | Change | Decisions |
 |---|---|---|
 | `atom/compass/advice/` (new), `atom/compass/cli.py` | `compass advice`: the space file, the check's states, the simulation, the results, `dashboard.html` | D109, D110, D111, D115 |
-| `atom/compass/drive/reuse.py` (new), `drive/lacking.py`, `drive/run.py` | the reuse check; `run --check` on a P/D side, resolved as `deploy.sh` does; `run --coverage` for a step linear law | D109, D112 |
+| `atom/compass/drive/reuse.py` (new), `drive/lacking.py`, `drive/run.py`, `run/__init__.py::atom_digest` | the reuse check, the head's digest taken over the `atom/` a commit holds; `run --check` on a P/D side, resolved as `deploy.sh` does; `run --coverage` for a step linear law | D109, D112 |
 | `atom/compass/backends/step_linear_plan.py` (new), beside `step_grid_plan.py` | the record list | D113 |
 | `scripts/compass/calibrate.sh` | `STORE`, a GPU list, `status`, per-step timing | D113 |
 | `atom/compass/report/` (new), called where `run`, `record` and `deploy.sh` stop | the per-request split, the op-family split, `report.html` | D114, D115 |
@@ -688,9 +686,9 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 2. Every candidate is searchable, missing a law with its `calibrate.sh` command,
    calibrating with its progress, or refused verbatim; every point missing readings
    carries its `measure memory` command; the search calibrates nothing (2).
-3. Each reuse verdict names its requirement: a tree at another commit refused with both
-   commits, a key mismatch, an invalidation, a coverage gap with its shapes and rungs,
-   and an accuracy miss once T114 sets the bar (3).
+3. Each reuse verdict names its requirement: a tree whose ATOM digest differs from the
+   head's refused with both digests, a key mismatch, an invalidation, a coverage gap with
+   its shapes and rungs, and an accuracy miss once T114 sets the bar (3).
 4. A recalibration is printed with its borrowers' readings commands, and both run on the
    new store (4).
 5. A 1P1D candidate is checked per side as `deploy.sh` resolves it, simulated by
@@ -720,7 +718,7 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | D109 | `compass advice SPACE OUT` checks each candidate (searchable, missing a law, calibrating, refused) and each point's readings (missing readings, with the `measure memory` command `run --check` prints), simulates each searchable point on a fresh server with no step roofline, and writes the results; it never calibrates, and runs at the integration head, on the target machine type, in a GPU container. Amends `13` D80: it starts the client and takes a workload, and `run --check` resolves a prefill or decode side. | 2026-11-13 (#3355, #3363) |
 | D110 | The user provides the space file, by hand or through an agent following the guide; it names the shared store and, for a frozen search, its commit; it expands deterministically into candidates, each naming its ATOM basis and departures; the templates live in `scripts/compass/spaces/`, no default; it is the search's input, not a level of `13` D79's precedence. | 2026-11-13 (#3355, #3363) |
 | D111 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. | 2026-11-13 (#3355) |
-| D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage and held-out error within the acceptance targets; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose commit is not the head's, the remote tip or a frozen one, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363) |
+| D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage and held-out error within the acceptance targets; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose ATOM digest is not the head's, the remote tip's or a frozen commit's, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363; the head by ATOM's digest, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957)) |
 | D113 | The step linear backend lists a configuration's missing records as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
 | D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355) |
 | D115 | Two static views reading files only: the search's dashboard, each point marked by grading state and method shares, and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell. | 2026-11-13 (#3355, #3363) |
