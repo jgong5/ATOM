@@ -23,7 +23,7 @@ holds for it at `--ptl` is taken by `assumed`, and published for the device
 torch, every field assumed. None, or several, refuse, listing them.
 
 `--out` gets a readable copy of the entry, ``platform_readings.json``, with
-its key and token. `projected` is the same rule on two machine specs.
+its key and token.
 
 A command that prices reads its platform through `compose`: the datasheet
 it names, the one entry S holds for that device (`readings`), and, across
@@ -53,7 +53,6 @@ from atom.compass.spec import MachineSpec
 from atom.compass.spec.layers import (
     BANDWIDTH,
     CURVE,
-    FORMATS,
     RATES,
     RATIO_CURVE,
     READINGS_HEADER,
@@ -68,8 +67,8 @@ PROG = "compass fit device"
 #: The rank a readings entry's one member is written at.
 RANK = Topology().ranks()[0]
 PP = "interconnect.intra_node.pp"
-#: What a projected spec takes from the probed one as it stands, no
-#: datasheet stating it.
+#: What a spec at another device's ratios takes from that device's spec as it
+#: stands, no datasheet stating it.
 CARRIED = (
     "device.kernel_floor_s",
     "device.software_pinned_to.",
@@ -77,7 +76,6 @@ CARRIED = (
     "interconnect.inter_node.link_latency_s",
     "interconnect.router_relay_s",
 )
-HEADER = READINGS_HEADER
 
 
 def fold(records: Mapping[str, dict]) -> tuple[dict, dict]:
@@ -131,37 +129,6 @@ def assumed(readings: Mapping, sheet: Mapping) -> dict:
         else:
             out[path] = value
     return out
-
-
-def projected(target: MachineSpec, source: MachineSpec) -> MachineSpec:
-    """`target` at `source`'s probed ratios: target's peaks and what names it,
-    source's derates and its bandwidth curve over its datasheet bandwidth
-    times target's, and source's values where no datasheet states one
-    (`CARRIED`), each assumed. A compute format source states no derate for is
-    left out, so a price that reads its rate is refused."""
-
-    def taken(path: str) -> bool:
-        return "derate" in path.split(".") or path == CURVE or path.startswith(CARRIED)
-
-    scale = target.value(BANDWIDTH) / source.value(BANDWIDTH)
-    values = {p: v for p, v in target.values.items() if not taken(p)}
-    values |= {p: v for p, v in source.values.items() if taken(p)}
-    values[CURVE] = [[size, rate * scale] for size, rate in source.value(CURVE)]
-    for fmt in FORMATS:
-        if f"device.compute.derate.{fmt}" not in values:
-            values.pop(f"device.compute.{fmt}_flops", None)
-    kept = target.values["provenance.origins"].items()
-    values["provenance.origins"] = {
-        **{p: o for p, o in kept if p in values and not taken(p)},
-        **{
-            p: {"origin": "assumed"}
-            for p in source.values["provenance.origins"]
-            if taken(p)
-        },
-    }
-    values["name"] = f"{target.values['name']} at {source.values['name']} ratios"
-    echo = MachineSpec(values).echo()
-    return MachineSpec.from_mapping(echo)
 
 
 def _records(store: ArtifactStore, tokens: list[str]) -> tuple[dict, dict]:
@@ -247,13 +214,13 @@ def assumed_entry(
             f"{found} as {found.token()} is assumed itself; assume from a "
             "measured entry, whose rates its datasheet divides"
         )
-    measured = {k: v for k, v in document.items() if k not in HEADER}
+    measured = {k: v for k, v in document.items() if k not in READINGS_HEADER}
     values = assumed(measured, source.values)
     provenance = document["provenance"] | {
         "origin": "assumed",
         "origins": {p: {"origin": "assumed"} for p in values},
     }
-    header = {k: document[k] for k in HEADER}
+    header = {k: document[k] for k in READINGS_HEADER}
     return found, header | values | {"provenance": provenance}, source
 
 
@@ -281,7 +248,7 @@ def main(argv: list[str]) -> None:
         if args.records or not (args.device and args.ptl):
             raise ValueError("--assume-from takes --device and --ptl and no RECORD")
         found, document, source = assumed_entry(store, args.assume_from, args.ptl)
-        values = {k: v for k, v in document.items() if k not in HEADER}
+        values = {k: v for k, v in document.items() if k not in READINGS_HEADER}
         target = datasheet(args.device)
         platform = found.values | {"device": _device(target)}
         origins = document["provenance"]["origins"]

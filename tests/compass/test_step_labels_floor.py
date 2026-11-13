@@ -18,7 +18,7 @@ from test_bench_ops import _graph, _leaf, _t, _timed
 from test_bench_ops_drafter import DRAFTING
 from test_bench_ops_plan import _graph_at
 from test_fit_ops import LAYOUT, _point, measured  # noqa: F401  a fixture
-from test_fit_samples import DEVICE, SOURCE
+from test_fit_samples import DEVICE, SOURCE, edit
 from test_fit_steps import HOST, LINEAR, clients, planted_roots, record  # noqa: F401
 from test_memory_readings import DOCUMENT, STACK
 from test_parity_recurrence import MS, line
@@ -321,6 +321,18 @@ def test_fit_steps_ops_needs_the_profiler_s_floor_its_readings_state(
 
     with pytest.raises(SystemExit, match="states no device.profiler_floor_s"):
         _fit_with_ops(tmp_path, DOCUMENT, ops_dir)
+
+
+def test_fit_steps_ops_on_records_with_no_ptl_state_asks_for_ptl(
+    tmp_path, measured  # noqa: F811
+):
+    ops_dir, _ = measured("ops", [_point(2, 10.0)])
+    a = record(tmp_path / "a", 19)
+    edit(a / "run.json", lambda r: r.pop("ptl"))
+    tail = ["--ops", ops_dir, "--store", tmp_path / "store", "--out", tmp_path / "o"]
+
+    with pytest.raises(SystemExit, match="the records carry no PTL state; --ptl"):
+        cli.main(list(map(str, ["fit", "steps", *LINEAR, a, *clients(a), *tail])))
 
 
 def test_fit_steps_ops_refuses_points_another_configuration_ran(

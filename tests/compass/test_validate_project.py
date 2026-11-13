@@ -18,15 +18,13 @@ from test_validate_bound import LINES, _main, drafted, graph, record
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends.step_roofline import StepRooflineBackend
 from atom.compass.fit import device
-from atom.compass.spec import MachineSpec, SpecRefusal
+from atom.compass.spec import MachineSpec
 from atom.compass.validate import bound, project
 
 MACHINES = SCRIPTS / "machines"
 #: MI455's B0 spec is MI355X's probed ratios on MI455X's datasheet, for a
 #: device no engine has run on.
-MI308X, MI355X, MI455 = (
-    MACHINES / f"{name}.json" for name in ("mi308x-hjbog18", "mi355x-gpu45", "mi455-b0")
-)
+MI355X, MI455 = (MACHINES / f"{name}.json" for name in ("mi355x-gpu45", "mi455-b0"))
 
 
 def spec(path):
@@ -45,35 +43,6 @@ def ran(path, lines):
     return path
 
 
-def test_a_projected_device_keeps_its_peaks_at_the_others_probed_ratios():
-    mi355x, mi308x = spec(MI355X), spec(MI308X)
-    p = device.projected(mi355x, mi308x)
-
-    for path in ("device.arch", "device.compute.bf16_flops", project.BANDWIDTH):
-        assert p.value(path) == mi355x.value(path)
-    for path in (
-        "device.compute.derate.bf16",
-        "device.memory.derate",
-        "device.kernel_floor_s",
-        "interconnect.intra_node.link_latency_s",
-    ):
-        assert (p.value(path), p.origin(path)["origin"]) == (
-            mi308x.value(path),
-            "assumed",
-        )
-    scale = mi355x.value(project.BANDWIDTH) / mi308x.value(project.BANDWIDTH)
-    for (size, rate), (at, probed) in zip(
-        p.value(project.CURVE), mi308x.value(project.CURVE)
-    ):
-        assert (size, rate) == (at, pytest.approx(probed * scale))
-    # MI308X probed no FP4 rate, so a price that reads one is refused.
-    with pytest.raises(SpecRefusal, match="fp4_flops"):
-        p.value("device.compute.fp4_flops")
-    # MI455's spec is the same method applied to MI355X.
-    mi455 = device.projected(spec(MI455), mi355x).values
-    assert mi455 | {"name": None} == spec(MI455).values | {"name": None}
-
-
 def test_bound_ratios_from_prices_records_at_the_other_devices_ratios(
     monkeypatch, tmp_path
 ):
@@ -87,7 +56,18 @@ def test_bound_ratios_from_prices_records_at_the_other_devices_ratios(
         _main(monkeypatch, tmp_path, [rec], more=more, document=mi355x)
 
     own, at_ratios = (r["step"]["analytical_s"]["prefill"]["total"] for r in reports)
-    machine = device.projected(spec(MI355X), spec(mi308x))
+    # MI355X's peaks at MI308X's derates, MI308X's curve at MI355X's bandwidth,
+    # and MI308X's values no datasheet states.
+    target, probed = spec(MI355X), spec(mi308x)
+
+    def taken(path):
+        return "derate" in path.split(".") or path.startswith(device.CARRIED)
+
+    values = {p: v for p, v in target.values.items() if not taken(p)}
+    values |= {p: v for p, v in probed.values.items() if taken(p)}
+    scale = target.value(project.BANDWIDTH) / probed.value(project.BANDWIDTH)
+    values[project.CURVE] = [[s, r * scale] for s, r in probed.value(project.CURVE)]
+    machine = MachineSpec(values)
     direct = bound.gate([rec], {"step": StepRooflineBackend(machine, STACK)})
     assert at_ratios == pytest.approx(
         direct["step"]["analytical_s"]["prefill"]["total"]

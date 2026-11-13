@@ -52,12 +52,14 @@ from atom.compass.backends.step_labels import Floor
 from atom.compass.fit.device import readings
 from atom.compass.fit.samples import UNRECORDED, load, run_fields
 from atom.compass.parity import busy
-from atom.compass.run import host_cpu
+from atom.compass.run import step_grid
 from atom.compass.spec.layers import stack_of
 from atom.compass.validate.runs import SIDES, named_by_prefill
 
 #: What a trace run's profiler adds to a kernel shorter than it.
 FLOOR = "device.profiler_floor_s"
+#: The refusal of records that carry no PTL state when no `--ptl` states it.
+NO_PTL = "the records carry no PTL state; --ptl states their cards' state"
 #: The rank a fit whose key states no layout writes at.
 RANK = Topology().ranks()[0]
 #: The engine fields the `measure ops` points a trace run's drafter kernels take
@@ -153,9 +155,7 @@ def inputs(args, sources, ops=()) -> tuple[list, dict]:
             )
         config["ptl"] = args.ptl
     elif config.get("ptl") == UNRECORDED:
-        raise ValueError(
-            "the records carry no PTL state; --ptl states their cards' state"
-        )
+        raise ValueError(NO_PTL)
     ran = platform(config) if runs else _keyed(measurements)
     if ops:
         want = {"model": config["model"], **keyed_platform(Kind.OP_MEASUREMENT, ran)}
@@ -169,9 +169,8 @@ def inputs(args, sources, ops=()) -> tuple[list, dict]:
                 "the --ops points ran under another configuration than the "
                 "records: " + "; ".join(differ)
             )
-    here = Conditions.of(
-        **ran,
-        host_cpu=host_cpu(),
+    here = step_grid.readings(
+        ran,
         atom_src=Reading(*config["source_root"].split("-", 1)),
         model=config["model"],
         engine_config=json.dumps(config["engine_config"], sort_keys=True),
@@ -187,11 +186,14 @@ def inputs(args, sources, ops=()) -> tuple[list, dict]:
 
 def _floor(store, runs, measurements, ptl) -> float:
     """`FLOOR` in the readings `store` holds at the platform the inputs ran
-    on: the first record's, its PTL state `ptl` where it records none, else the
-    step measurements'; `load` holds every other input to it."""
+    on: the first record's, its PTL state `ptl` where it records none (`NO_PTL`
+    with neither), else the step measurements'; `load` holds every other input
+    to it."""
     if runs:
         run = json.loads((next(iter(runs)) / "run.json").read_text())
         device = run_fields(run)["device"]
+        if "ptl" not in run and ptl is None:
+            raise ValueError(NO_PTL)
         on = platform_of(device, run["stack"], run.get("ptl", ptl))
     else:
         on = _keyed(measurements)

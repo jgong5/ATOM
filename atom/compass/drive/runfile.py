@@ -259,7 +259,7 @@ def law_readings(key: Key, machine, atom_args):
     under: its engine config as `key` states it, the one the runner then holds
     the resolved config to."""
     return readings(
-        machine,
+        machine_platform(machine),
         atom_src=run.atom_source(),
         model=_model_digest(_engine_args(atom_args).model),
         engine_config=key.values["engine_config"],
