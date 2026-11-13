@@ -162,11 +162,12 @@ is stated in the run's provenance.
    (D117) stands for the head.
 2. **Not invalidated**: no ATOM change since the calibration moves step costs or memory,
    and only then is a law re-keyed onto the new tree (README principle 10, #2594), its
-   readings with it; a change that moves memory takes the readings again, as #2861's token
-   buckets moved DeepSeek-V4.1's graph pool. A search may mix laws fitted at different
-   commits and re-keyed by principle 10's expedient, each point's provenance naming the
-   commit its law was fitted at and saying re-keyed, not re-validated; the showcase's laws
-   are all fitted at its one frozen commit (D117). Failing: *calibrate*.
+   readings with it under #3122's design; a change that moves memory takes the readings
+   again, as #2861's token buckets moved DeepSeek-V4.1's graph pool. A search may mix laws
+   fitted at different commits and so re-keyed, each point's provenance naming the commit
+   its law was fitted at and saying re-keyed, not re-validated; the showcase fits all its
+   laws at one frozen commit (D117) and measures again after a later source change,
+   until #2311 settles who judges "moves step costs" and how. Failing: *calibrate*.
 3. **Enough coverage**: the law's calibrated range holds the batch shapes the search
    needs, a vector for every decode rung of the capture ladder included, judged by
    `compass run --coverage`, which gains a step linear check beside the step grid's and
@@ -204,9 +205,9 @@ run.
   that calibration's own store. Every configuration that borrows its law, as S5 borrows
   S2's (D116) and MiniMax-M3's LMCache arms their base arms' (D117), has its readings
   measured into that store too, `compass advice` printing them with the calibration
-  command. The reuse check looks a candidate up in its latest calibration's store, then in
-  the shared one, and the candidate's runs read the one store holding all its inputs;
-  `compass run` keeps its one `--store`.
+  command. The reuse check looks a candidate up in the latest store holding all its
+  inputs, a new calibration's before the shared one, and the candidate's runs read that
+  store; `compass run` keeps its one `--store`.
 - **Timing.** Each calibration records each step's wall time (the warm record, `measure
   memory`, each record, the trace runs, `fit steps`, `fit host`) and its node-hours.
 
