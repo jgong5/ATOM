@@ -1006,7 +1006,8 @@ since calibration replays traces no cell is graded on (the
 cell's record (`OUT_DIR/steps` of a `REAL=1 cctraces_sim.sh` run) with a law
 file as `step_linear_fit` writes it, and prints the error per kind, per decode rung
 and per prefill token band; a record of several DP ranks is joined on step index,
-each step priced and banded as its slowest rank. The module's docstring states what each figure is.
+each step priced and banded as its slowest rank, and the error is also given per rank
+with its cards' PCI buses where `run.json` names them. The module's docstring states what each figure is.
 Grade a law only on cells whose traces its calibration cells do not replay.
 
 ## Schedule and end-to-end grades — `validate.runs`
