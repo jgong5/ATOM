@@ -1209,8 +1209,9 @@ def _held_out_error(folds: dict) -> float | None:
 
 
 def _moe_column(steps, routing) -> tuple:
-    """The vector decode rung `steps` adopts with a MoE column, or None, and the
-    figures the rule read, as the vector records them under `fit.moe_column`.
+    """The vector decode rung `steps` adopts with a MoE column, or None, the
+    figures the rule read, as the vector records them under `fit.moe_column`,
+    and the held-out folds of the form adopted, a column or none.
 
     `steps` are the rung's steps, each its ranks' `fit` rows. The forms are no
     column and each of `MOE_COLUMNS` over the steps' real MoE tokens,
@@ -1240,14 +1241,16 @@ def _moe_column(steps, routing) -> tuple:
             for form in forms
         },
     }
-    return (None if adopted is None else forms[adopted]), figures
+    vector = None if adopted is None else forms[adopted]
+    return vector, figures, held[adopted or "none"]
 
 
-def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing):
+def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing, folds):
     """The `rowmod(k)` column decode rung `rung` adopts, or None.
 
     `steps` are the rung's steps, each its ranks' `fit` rows, `vector` the
-    rung's form without the column and `base` its `_fit_vector`.
+    rung's form without the column, `base` its `_fit_vector` and `folds` its
+    `_max_affine_folds`, fitted here when None.
     `k` runs over the powers of two up to the rung. A `k` qualifies when its
     fit cuts `base`'s scaled MAD by `ROWMOD_GAIN`, the mean MAD of the same
     fit over `ROWMOD_SHUFFLES` shuffles of each rank's rows, by `seed`, does
@@ -1276,16 +1279,18 @@ def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing):
             mads.append(_fit_vector(moved, wide(k), routing)["mad"])
         return float(np.mean(mads))
 
-    def p50(v):
-        return [p for _, p in _max_affine_folds(steps, v, routing).values()]
+    def p50(folds):
+        return [p for _, p in folds.values()]
 
-    without, best, k = p50(vector), None, 2
+    if folds is None:
+        folds = _max_affine_folds(steps, vector, routing)
+    without, best, k = p50(folds), None, 2
     target = (1.0 - ROWMOD_GAIN) * base["mad"]
     while k <= rung:
         solved = _fit_vector(steps, wide(k), routing)
         if solved["mad"] < min(target, best[1]["mad"] if best else target):
             shuffled = shuffled_mad(k)
-            held = p50(wide(k))
+            held = p50(_max_affine_folds(steps, wide(k), routing))
             if shuffled >= target and all(
                 abs(w) <= abs(o) for w, o in zip(held, without)
             ):
@@ -1509,14 +1514,14 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             )
         else:
             solved = _fit_steps(steps, names, lambda r: r[2])
-        rowmod_k = figures = None
+        rowmod_k = figures = folds = None
         if key and key.isdigit():
             vector = {"coefficients": names}
             if routing:
-                chosen, figures = _moe_column(steps, routing)
+                chosen, figures, folds = _moe_column(steps, routing)
                 if chosen:
                     vector, solved = chosen, _fit_vector(steps, chosen, routing)
-            chosen = _rowmod(steps, int(key), vector, solved, seed, routing)
+            chosen = _rowmod(steps, int(key), vector, solved, seed, routing, folds)
             if chosen:
                 rowmod_k, solved, evidence = chosen
             names = [*vector["coefficients"], *["rowmod"] * bool(rowmod_k)]

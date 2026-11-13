@@ -289,6 +289,29 @@ def test_a_rung_of_one_record_has_no_held_out_error_and_adopts_none(cells):
     assert list(vector["coefficients"]) == list(BASE)
 
 
+def test_a_routed_rung_fits_each_fold_of_the_form_it_adopts_once(cells, monkeypatch):
+    """Both records hold enough steps at the rung for `rowmod` to hold each
+    out without its column: it takes the experts column's folds the column
+    was chosen on, and the law is the one it writes fitting them again."""
+    from atom.compass.backends import step_linear_fit
+
+    folds, fitted = step_linear_fit._max_affine_folds, []
+
+    def counted(steps, vector, routing):
+        fitted.append(tuple(vector["coefficients"]))
+        return folds(steps, vector, routing)
+
+    monkeypatch.setattr(step_linear_fit, "_max_affine_folds", counted)
+    full, sparse = cells
+    law = _routed(full + sparse)[0]
+    assert law["decode"][str(RUNG)]["fit"]["moe_column"]["adopted"] == "moe_experts"
+    assert fitted.count(tuple(EXPERTS)) == 1
+    rowmod, fitted[:] = step_linear_fit._rowmod, []
+    monkeypatch.setattr(step_linear_fit, "_rowmod", lambda *a: rowmod(*a[:-1], None))
+    assert json.dumps(_routed(full + sparse)[0]) == json.dumps(law)
+    assert fitted.count(tuple(EXPERTS)) == 2
+
+
 def test_a_rung_law_fitted_on_full_ranks_prices_idle_ranks_high_and_the_routed_one_does_not(
     cells, tmp_path
 ):
