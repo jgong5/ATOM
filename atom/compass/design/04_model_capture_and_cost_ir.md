@@ -1160,10 +1160,10 @@ whether `mori` imports where it does not, and the performance environment
 variables and the device selection; ATOM's Triton expert and GEMM switches
 (`ATOM_USE_TRITON_MOE`, `ATOM_USE_TRITON_MOE_A4W4`, `ATOM_USE_TRITON_MOE_DECODE`,
 `ATOM_USE_TRITON_GEMM`) are in it, and ATOM's prefill token buckets
-(`ATOM_TOKEN_GRAPH_SIZES`), `ATOM_FUSE_SHARED_EXPERT` and `ATOM_DISABLE_MORI_EP`
-only when ATOM reads them off their default. The last two, with the all-to-all
-backend and `mori`, decide whether a DP-attention MoE fuses its shared expert into
-aiter's top-k table, which changes its graph ([#3333](https://github.com/jgong5/ATOM/issues/3333)). One store holds V4-Pro graphs of one shape that
+(`ATOM_TOKEN_GRAPH_SIZES`), `ATOM_FUSE_SHARED_EXPERT`, `ATOM_DISABLE_MORI_EP` and
+`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4` only when ATOM reads them off their default.
+The last three, with the all-to-all backend and `mori`, decide whether a MoE fuses
+its shared expert into aiter's top-k table, which changes its graph ([#3333](https://github.com/jgong5/ATOM/issues/3333)). One store holds V4-Pro graphs of one shape that
 differ only in `kv_cache_dtype`, only in `ATOM_USE_TRITON_MOE`, or only in the index
 cache dtype ATOM resolves for a P/D side and for a plain start at gfx950
 (`atom/config.py::Config.__post_init__`), and each run reads its own.

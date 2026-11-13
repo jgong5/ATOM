@@ -59,9 +59,6 @@ LEFT_OUT = {
         "set by `--hf-overrides`, which neither `keyed` nor the digest reads: #3055"
     ),
     "ATOM_REPLICATE_VOCAB_EMBED": "picks GLM-5.2's embedding path: #3056",
-    "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4": (
-        "fuses MiniMax-M3.1's shared expert into its MoE: #3056"
-    ),
 }
 #: A value no config holds.
 OTHER = object()

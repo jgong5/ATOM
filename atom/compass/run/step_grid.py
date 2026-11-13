@@ -105,10 +105,16 @@ DERIVED = {"index_cache_dtype": "kv_cache_dtype"}
 #: ATOM's prefill token buckets, an environment variable `keyed` the same way.
 BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
 #: ATOM's environment variables keyed only where ATOM reads them off their
-#: default: `BUCKETS`, and the two that decide, with the all-to-all backend and
-#: whether mori imports (`MORI`), whether a DP-attention MoE fuses its shared
-#: expert into aiter's top-k table (`model_ops/topK.py`).
-READ_OFF_DEFAULT = (BUCKETS, "ATOM_FUSE_SHARED_EXPERT", "ATOM_DISABLE_MORI_EP")
+#: default: `BUCKETS`, and the three that decide, with the all-to-all backend
+#: and whether mori imports (`MORI`), whether a MoE fuses its shared expert
+#: into aiter's top-k table (`model_ops/topK.py`): two under DP attention, and
+#: one for an MXFP8 shared expert beside MXFP4 routed ones.
+READ_OFF_DEFAULT = (
+    BUCKETS,
+    "ATOM_FUSE_SHARED_EXPERT",
+    "ATOM_DISABLE_MORI_EP",
+    "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4",
+)
 #: Whether mori, the all-to-all ATOM selects by default, imports: keyed only
 #: where it does not, so keys written where it imports do not move.
 MORI = "mori_imports"
