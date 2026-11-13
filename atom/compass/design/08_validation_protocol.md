@@ -53,7 +53,7 @@ point by its overlap with the real curve (D45.1), its arms a set of their own (D
 
 **Revised 2026-11-13 by [#3355](https://github.com/jgong5/ATOM/issues/3355):** the
 adoption showcase grades the configuration its MiniMax-M3 search recommends and the
-runner-up, a set of their own, and compares their order (D50, `18` D116).
+runner-up, a set of their own, and compares their order (D50, `19` D117).
 
 **Scope.** What counts as evidence: which results are reported, how each is measured, what
 tolerance applies and where that tolerance comes from, and what invalidates a run.
@@ -657,7 +657,7 @@ P0b.3). The sets, each driven by cc-traces:
 | **M2** | DeepSeek-V4-Pro, 1P+1D on the MI355X pair | the four nightly configurations of [`recipes/mesh/DeepSeek-V4.md`](../../../recipes/mesh/DeepSeek-V4.md) as written, expert parallelism off: TP, DPA, TP MTP3, DPA MTP1 | each configuration's benchmark concurrencies in that recipe |
 | **Stage 4**, the last step of v1 | DeepSeek-V4.1-Flash on MI455, one 4-card node per cell | TP4 DSpark5, aggregated: A with whole-expert EP4, B with the routed experts sharded across TP | 1, 4, 16, 64, 256 on traces 0 to 255; traces 256 to 392 calibrate |
 | **M3-Agentic** (`16` D95.1) | MiniMax-M3 MXFP4 on MI355X, mi355-gpu-40 | the arms of ATOM's AgentX submission, as [#3256](https://github.com/jgong5/ATOM/issues/3256) states them, EAGLE3 in each | each arm's concurrencies there, graded at every point by D45.1 |
-| **Adoption showcase** (`18` D116), after v1 | MiniMax-M3 MXFP4 on MI355X, crsuse2-m2m-v3-005 and -013 | the configuration `compass advice` recommends and the runner-up, registered before their real runs | the recommended point's concurrency, each cell graded by D44 and their real order compared with the simulated one |
+| **Adoption showcase** (`19` D117), after v1 | MiniMax-M3 MXFP4 on MI355X, crsuse2-m2m-v3-005 and -013 | the configuration `compass advice` recommends and the runner-up, registered before their real runs | the recommended point's concurrency, each cell graded by D44 and their real order compared with the simulated one |
 
 M2's flags and concurrencies are the recipe's; this document does not copy them. Stage 4's
 cells and flags are the owner's ([#2138](https://github.com/jgong5/ATOM/issues/2138)),
@@ -709,7 +709,7 @@ results alone. Stage 4 has no ranking gate either, by the owner's ruling on #213
 MI455 cell is graded by D44's results and by the speed floor of `README.md`, faster than
 real, with 5× reported. The adoption showcase has none either: it compares the order of its
 two configurations by throughput per GPU, an order inside their real spread reported
-undetermined (`18` D116).
+undetermined (`19` D117).
 
 ### The DP cells
 

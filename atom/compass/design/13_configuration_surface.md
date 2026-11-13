@@ -54,7 +54,7 @@ as amended that day:** the tokenizer rates and the HTTP intake are `host_laws` t
 **Revised 2026-11-13 by [#3355](https://github.com/jgong5/ATOM/issues/3355):** `advice`
 searches a user's space, starting clients and taking a workload; `run --check` resolves a
 prefill or decode side; and every run writes a per-request split and `report.html` when
-it ends (D80, `18` D108, D113, D114).
+it ends (D80, `19` D109, D114, D115).
 
 **Depends on:** `05_machine_spec_and_probes.md` D24 (the separation rule this extends),
 and every other topic, each of which contributed a flag.
@@ -207,7 +207,7 @@ half is the op-level backend's, built by stage 3d (`16` Stage 3d). Each command 
 `project`, `advice` and the two `device` verbs runs one of `07` D38's phases or fits what a
 phase measured; `project` prices real runs' steps on a device none of them ran on (`08`
 D50.2), `measure device` and `fit device` fill a platform's readings (`05` D26), and
-`advice` searches a user's configuration space by simulation (`18` D108).
+`advice` searches a user's configuration space by simulation (`19` D109).
 
 **Users reach Compass only through these commands.** What developers use to check its
 quality stays outside the CLI: grading (`python -m atom.compass.validate`, `08`), the
@@ -264,7 +264,7 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
 
 | Command | Phase (`07` D38) | Device | Reads | Writes |
 |---|---|---|---|---|
-| `record` | 1c's real runs | GPU | ATOM's arguments; the requests clients send | `--out`: the step record with its cost lines; each served tokenizer call and each request's intake stamps (`07` D38, Phase 1c); `run.json` with the engine's bounds as ATOM resolved them; logs; when it stops, the per-request split and `report.html` (`18` D113, D114) |
+| `record` | 1c's real runs | GPU | ATOM's arguments; the requests clients send | `--out`: the step record with its cost lines; each served tokenizer call and each request's intake stamps (`07` D38, Phase 1c); `run.json` with the engine's bounds as ATOM resolved them; logs; when it stops, the per-request split and `report.html` (`19` D114, D115) |
 | `trace steps` | 0 | none | `run`'s inputs | `--store`: one `shape_population`, keyed by the backend that priced it; `--out`: what `run` writes |
 | `trace ops` | 1a | none; with `--gpu`, card G's properties and stepping read, no kernel run | the model at `--tp` under ATOM's engine arguments after `--` (`--enable-dp-attention` traces one DP rank, its peers splitting the rest of the rows the step's MoE gathers, a population step's `moe_rows`), on a declared `--arch` (`gfx942` by default), or with `--gpu` on card G declared as it reads, keyed by its arch; each decode width `--width` names and prefill of T tokens over B sequences `--prefill` names, with `--whole` each traced as one forward where ATOM would split it; with `--population`, every step of a record directory from `record` or `trace steps --out`, under `--enable-tbo` a step its DP group split as its two micro-batches, each prefill traced as one forward, refusing a `shape_population` key; with `--symbolic`, each prefill (T, B), at its width, traced again with the rows its MoE gathers a symbol, as a run traces it lazily (`04` D18), refused without DP or under a drafter; at least one shape | `--store`: one `op_graph` per shape (`07` D38, Phase 1a) |
 | `measure steps` | 1c, on the bench | GPU | its `<batches>`, and `--grid`'s inputs | `--store`: one `step_measurement` per distinct batch |
@@ -275,16 +275,16 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
 | `fit steps` | from 1c's measurements | none | `record` directories, each with the exports of the client runs its server served, and `step_measurement` entries, as the backend accepts; `--ops`, `measure ops --out` directories whose points take the profiler's floor out of a trace run's drafter labels; for `step-linear`, `--moe-routing E,K`, the model's routed experts and top-k, over which each decode rung may adopt a MoE column (`09` D55), or `--model DIR`, the model directory the records served, whose config states them as ATOM loads it, refused unless its config.json is the records' | `--store`: a `step_linear_law` or a step grid bundle, with its report; `--out`: a readable copy |
 | `fit host` | from real runs | none | `record` directories only, each with the exports of the client runs its server served | `--store`: `host_laws`, its `tokenizer` and `http_intake` terms included, with its report listing each term it left unfitted |
 | `fit ops` | from 1b's measurements | none | `measure ops` `--out` directories, whose `op_measurement` entries it reads from `--store` | `--store`: a `price_list`, interpolating only between same-kernel neighbours |
-| `run` | a simulated serve | none | a backend, the platform's datasheet, readings entry and, for a run across nodes, network file, the configuration's `memory_readings`, ATOM's arguments; the requests clients send | `--out`: the step record with its cost lines, the step table, the run summary, `run.json` with the run file and what grading reads (below), logs; when it stops, the per-request split and `report.html` (`18` D113, D114) |
+| `run` | a simulated serve | none | a backend, the platform's datasheet, readings entry and, for a run across nodes, network file, the configuration's `memory_readings`, ATOM's arguments; the requests clients send | `--out`: the step record with its cost lines, the step table, the run summary, `run.json` with the run file and what grading reads (below), logs; when it stops, the per-request split and `report.html` (`19` D114, D115) |
 | `project` | none: real runs' steps priced on another device (`08` D50.2) | none | the target's datasheet and readings entry, assumed for a device never run; record directories, each under the ATOM arguments after `--` in its `run.json`'s command line, less the server's and `--model`, or, for a `run.json` naming none, those in its own `-- RECORD` group; the `op_graph`s `--store` holds for the spec's arch | `--store`: one `projection`, keyed as `07` D41 states |
-| `advice` | none: a search by simulation (`18` D108) | none | a space file; the store it names and its calibrations' stores; the traces | OUT: each point's run directory, the result table, the recommendation, `dashboard.html` |
+| `advice` | none: a search by simulation (`19` D109) | none | a space file; the store it names and its calibrations' stores; the traces | OUT: each point's run directory, the result table, the recommendation, `dashboard.html` |
 
 **Shared by every command:**
 
 - **ATOM's arguments after `--`**, verbatim: Compass defines no model flags (D78). A
   command records the configuration ATOM resolved, read back from the engine, never from
   a first parse of the command line (D81).
-- **No command but `advice` starts the client or takes a workload** (`18` D108). A
+- **No command but `advice` starts the client or takes a workload** (`19` D109). A
   client started apart drives a `record`, `trace steps` or `run` server. `measure steps`
   keeps `--sessions A:B`, inclusive and counted from 0, as a filter on the batches it reads.
 - **Two output layers.** Raw outputs, records and logs go to `--out` and are evidence, not
@@ -367,7 +367,7 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
     step table and the summaries, its own engine's memory readings included. A prefill
     or decode `run` without `--join` refuses, as it shares a clock with its peer, except
     under `--check`, which starts no server and resolves the side as the script does
-    (`18` D108).
+    (`19` D109).
   - *The deployment's `server.json`.* Once the router answers, the deployment
     directory holds a `server.json` as `serve` writes one, naming the router's URL and
     the process id of a child of the script that lives as long as the script, and
@@ -376,11 +376,11 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
     on until the stop.
     SIGTERM to the script stops each instance, the router and the authority, and
     writes the deployment's `run.json`: the script's command line, the run file and the
-    router's command; and its per-request split and `report.html` (`18` D113, D114).
+    router's command; and its per-request split and `report.html` (`19` D114, D115).
   - *Layout.* The deployment directory is a cell's `real<k>/`, or its simulated run's:
 
     ```
-    server.json run.json report.html   the deployment's, with its per-request split (18 D113)
+    server.json run.json report.html   the deployment's, with its per-request split (19 D114)
     run_file.json          its one run file; simulated
     prefill/ decode/       each instance's --out: server.json, run.json, steps/, logs
     prefill.sh decode.sh prefill.pid decode.pid   each instance's command, and the process id it writes first
@@ -471,7 +471,7 @@ Audited, because an absent flag is a decision and should be a visible one:
 | the simulated arrival timeline | per request, on the wire, not per run (`06` D28) |
 | virtual-clock enable/disable | there is no simulated run without one. A switch would create an untested second configuration. |
 | per-term memory overrides | a memory term comes from the machine spec or a `memory_readings` entry, where it is echoed and fingerprinted |
-| a workload, the client's settings | no command but `advice`, which takes them from its space file (`18` D109), starts the client: a client started apart sends them, and grading reads which traces it served from the client run |
+| a workload, the client's settings | no command but `advice`, which takes them from its space file (`19` D110), starts the client: a client started apart sends them, and grading reads which traces it served from the client run |
 | acceptance rate for speculative decoding | **ATOM's own flag** — `--spec-decode-acceptance-length` / `--spec-decode-acceptance-rate` already exist (`14` D83) |
 | thread-pool widths | ATOM's, per `05` D24 |
 | the run file's lookaheads and bound | the bound is fixed in code (`atom/compass/drive/runfile.py::FIXED`); the hops come from the `host_laws` entry's `hops`, each a floor where no entry states it (`01`, Lookahead sources); a deployment's `router_s`, the router's hop, is an assumed constant, a host transport cost and no network's (`05` D25), and a router LP's `router_in_s` borrows `ipc_s`, since Atomesh logs no receipt to measure it from; `run` always drives the API server, so there is no admission path to choose |

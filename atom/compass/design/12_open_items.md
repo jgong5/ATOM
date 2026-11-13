@@ -209,17 +209,17 @@ M-f `14`; M-g `01` D3.5.
 | ~~T95~~ | ~~A later trial, not this design: extrapolate the step grid's out-of-cell steps as #627's ruling 3 has the step linear law do, by one algorithm only (extending the nearest complete cell's interpolation), its terms estimated and unvalidated with the algorithm and the distance named in `source`, reported apart, which is not a refusal. It includes extrapolation within rounding distance: a step outside every complete cell, and every T98 simplex, only by integer or block rounding is answered by extrapolation that far, and a farther one declined. It would answer out-of-cell steps, which the step grid now declines; decided after the step grid's stage-2 evaluation shows how often steps fall outside complete cells (`17` D102)~~ — ruled 2026-10-18 on #1464 and #1465: the step grid extrapolates past its residual's hull and a decode cell past the KV pool, and other out-of-cell steps fall to the step roofline (`17` D99, D100, D102) |
 | T98 | Interpolate the step grid's steps whose cell has a corner past a limit, and its prefill steps cached past the top c node, each in the simplex of measured points holding it, those points measured where the cell's edges cross the feasible boundary. Taken up when the pre-run coverage check finds steps the boundary nodes miss, the prefill steps past the top c node counted on a run with prefix caching; #830's counts find none on #740's records, which hold neither kind. Until then a decode one extrapolates past the KV pool and a prefill one falls to the step roofline (`17` D98, D99, D102) |
 
-### Topic 18 — adoption
+### Topic 19 — adoption
 
 | # | Item |
 |---|---|
-| T108 | The space file's format: every field, its values and its default, the arguments that vary with the concurrency included (`18` D109) |
-| T109 | The per-request split's file format; ATOM's `atom-benchmark/v1` request records are a candidate (`18` D113) |
-| T110 | A 1P1D point's GPUs over both sides from #3264's code, which counts TP times DP from one engine record; a simulated run's hit rates stay `08` D45.1's open issue (`18` D110) |
-| T111 | Whether ATOM's Benchmark Dashboard (`.github/dashboard/index.html`) can show both marks and the recommended point, or the dashboard is a page of Compass's own (`18` D114) |
-| T112 | How MiniMax-M3's calibration and grading divide the traces: the `agentx` workload takes all 393 (`06` D35.1), a grader refuses a backend fitted on the traces it grades (`13` D80), and the M3-Agentic stage has stated neither yet (`18` D116) |
-| T113 | How one law serves an arm's points whose `--max-num-seqs` differs: [#3275](https://github.com/jgong5/ATOM/issues/3275)'s ruling (`18` D116, `16` D95.1) |
-| T114 | Which of a law's held-out errors `18` D111's requirement 4 bounds, against which acceptance target: a fit reports each band's errors by percentile, while `08` D47 grades totals, the worst held out and the median step under #627's 5% gate; a bar is measured before the reuse check refuses on it |
+| T108 | The space file's format: every field, its values and its default, the arguments that vary with the concurrency included (`19` D110) |
+| T109 | The per-request split's file format; ATOM's `atom-benchmark/v1` request records are a candidate (`19` D114) |
+| T110 | A 1P1D point's GPUs over both sides from #3264's code, which counts TP times DP from one engine record; a simulated run's hit rates stay `08` D45.1's open issue (`19` D111) |
+| T111 | Whether ATOM's Benchmark Dashboard (`.github/dashboard/index.html`) can show both marks and the recommended point, or the dashboard is a page of Compass's own (`19` D115) |
+| T112 | How MiniMax-M3's calibration and grading divide the traces: the `agentx` workload takes all 393 (`06` D35.1), a grader refuses a backend fitted on the traces it grades (`13` D80), and the M3-Agentic stage has stated neither yet (`19` D117) |
+| T113 | How one law serves an arm's points whose `--max-num-seqs` differs: [#3275](https://github.com/jgong5/ATOM/issues/3275)'s ruling (`19` D117, `16` D95.1) |
+| T114 | Which of a law's held-out errors `19` D112's requirement 4 bounds, against which acceptance target: a fit reports each band's errors by percentile, while `08` D47 grades totals, the worst held out and the median step under #627's 5% gate; a bar is measured before the reuse check refuses on it |
 
 ### Topics 02, 01 — gaps now closed
 

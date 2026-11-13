@@ -1,4 +1,4 @@
-# ATOM Compass — Design Topic 18: Adoption, a User's Configuration Space Searched
+# ATOM Compass — Design Topic 19: Adoption, a User's Configuration Space Searched
 
 **Status:** drafted 2026-11-13 by an AI assistant from the decisions of the design issue
 [#3355](https://github.com/jgong5/ATOM/issues/3355), which the owner took from 2026-11-10
@@ -19,26 +19,26 @@ is tracked apart.
 
 | Touches | How | Decision |
 |---|---|---|
-| `13` D79: precedence has no level but CLI and artifact, and no Compass config file | not amended, as argued: the space file is the search's input, as traces are a client's, and each run takes its flags from `compass advice` | D109 |
-| `13` D80: no command starts the client or takes a workload | `compass advice` does both | D108 |
-| `13` D80: a prefill or decode `run` refuses without `--join` | not under `--check`, which resolves the side as `deploy.sh` does | D108 |
-| `13` D80: what `run`, `record` and `deploy.sh` write | each writes its per-request split and `report.html` when its run ends | D113, D114 |
-| `08` D50: the cell matrix | a MiniMax-M3 showcase set: the recommended configuration and the runner-up | D116 |
+| `13` D79: precedence has no level but CLI and artifact, and no Compass config file | not amended, as argued: the space file is the search's input, as traces are a client's, and each run takes its flags from `compass advice` | D110 |
+| `13` D80: no command starts the client or takes a workload | `compass advice` does both | D109 |
+| `13` D80: a prefill or decode `run` refuses without `--join` | not under `--check`, which resolves the side as `deploy.sh` does | D109 |
+| `13` D80: what `run`, `record` and `deploy.sh` write | each writes its per-request split and `report.html` when its run ends | D114, D115 |
+| `08` D50: the cell matrix | a MiniMax-M3 showcase set: the recommended configuration and the runner-up | D117 |
 
 ---
 
-## D107. Fitting apart from searching
+## D108. Fitting apart from searching
 
 **Rule.** A candidate, one configuration of the user's space, is simulated once its law
 exists; fitting and searching meet only through the artifact store and a calibration's
-`status` file (D112). The search consumes laws and calls the reuse check (D111); it owns
+`status` file (D113). The search consumes laws and calls the reuse check (D112); it owns
 no calibration, fitting, reuse judgement or version management, and reaches profiling
-(D113) and the views (D114) only through files in each run's directory. A user guide
+(D114) and the views (D115) only through files in each run's directory. A user guide
 comes first, and no skill: `scripts/compass/ADVICE.md`, linked both ways with
 `QUICKSTART.md` and #2893's page, gives each step one command and its expected output,
-has a section on filling the space file (D109) and states D108's limits, exact enough
+has a section on filling the space file (D110) and states D109's limits, exact enough
 that an agent following it fills the DeepSeek-V4-Pro template's space file from the
-recipes D115 names. An agent shows the user a printed calibration's GPU time, starts it
+recipes D116 names. An agent shows the user a printed calibration's GPU time, starts it
 in the background only on the user's yes, reruns `compass advice` later rather than
 waiting, and adds no judgement of its own.
 
@@ -51,14 +51,14 @@ removed `compass-onboard`.
 
 ---
 
-## D108. `compass advice`: one command, three steps
+## D109. `compass advice`: one command, three steps
 
 **Rule.** `compass advice SPACE OUT` is a `compass` subcommand whose steps are its own:
 
-1. **Check.** Expand SPACE (D109) and give each candidate one state: *searchable*;
-   *missing a law*, with the `calibrate.sh` command of D112's record list;
+1. **Check.** Expand SPACE (D110) and give each candidate one state: *searchable*;
+   *missing a law*, with the `calibrate.sh` command of D113's record list;
    *calibrating*, with its `status` file's progress; or *refused*, with ATOM's or
-   Compass's refusal verbatim. It runs the reuse check (D111), `compass run --check`,
+   Compass's refusal verbatim. It runs the reuse check (D112), `compass run --check`,
    which on 1P1D resolves each side as `scripts/compass/deploy.sh` does, and a start with
    no traffic, for what only a start shows: arguments ATOM rejects, a model that does not
    fit memory, a configuration Compass refuses, such as `--enable-dynamic-chunking`. It
@@ -69,11 +69,11 @@ removed `compass-onboard`.
    listed with its reason, a finished one skipped. No `--step-roofline`: a refusal means
    a calibration is missing, and the law is completed, as stages 3 (#975, #2660) and 4
    (#2544) completed theirs.
-3. **Results.** D110's, with D114's dashboard; a changed SLO reruns this step only.
+3. **Results.** D111's, with D115's dashboard; a changed SLO reruns this step only.
 
 OUT holds `dashboard.html`, the recommendation, the result table and
 `runs/<config>-c<concurrency>/`, each point's run directory. The search runs at the
-integration head (D111); on the target machine type, since host laws key on the host's
+integration head (D112); on the target machine type, since host laws key on the host's
 CPU and another CPU is refused by name until #3122's code task; in a GPU container with
 no GPU compute, since a simulation imports aiter, which needs a ROCm driver (no GPU at
 all is #2893's). It wraps the commands it runs, so no user step needs `python -m` (the
@@ -89,12 +89,12 @@ meets the prefix cache an earlier one left (`03` D13). **Basis.** The owner on #
 
 ---
 
-## D109. The space file
+## D110. The space file
 
 **Rule.** The user provides the space, by hand or through an agent that fills it from a
-recipe or from the user's real-run arguments by following the guide, not a skill (D107);
+recipe or from the user's real-run arguments by following the guide, not a skill (D108);
 Compass ships none as a default. It states the model, the machine, the shared store
-(D112), the workload (traces and concurrencies), the SLO, the ATOM arguments every
+(D113), the workload (traces and concurrencies), the SLO, the ATOM arguments every
 candidate shares, the dimensions searched with their values, exclusions, and arguments
 that vary with the concurrency, as MiniMax-M3's `--max-num-seqs` is twice it. It expands
 into the product of the dimensions less the exclusions, always into the same candidates
@@ -105,13 +105,13 @@ a client's: each candidate's run takes `compass run`'s flags and ATOM's argument
 `compass advice`, so the file adds no level to `13` D79's precedence and is not the
 Compass config file D79 rejects.
 
-**Reason.** The user, not Compass, knows what they would deploy; a template (D115, D116)
+**Reason.** The user, not Compass, knows what they would deploy; a template (D116, D117)
 shows the shape, and an agent saves the user copying arguments by hand. **Basis.** The
 owner on #3355 and #3363; `13` D79.
 
 ---
 
-## D110. Results: the frontier, the recommendation, the runner-up
+## D111. Results: the frontier, the recommendation, the runner-up
 
 **Rule.** A point's metrics come from its client export. InferenceX's are computed by
 #3264's code (`atom/compass/validate/curves.py`), which follows InferenceX's
@@ -147,7 +147,7 @@ owner on #3355; #3264, landed by #3325; `08` D45.1, D50.1.
 
 ---
 
-## D111. Calibrated data is reused only when every requirement holds
+## D112. Calibrated data is reused only when every requirement holds
 
 **Rule.** Laws, memory readings and platform readings, in a store or under
 `scripts/compass/laws/`, serve a candidate only when every requirement below holds. The
@@ -159,14 +159,14 @@ is stated in the run's provenance.
    the candidate's key: *calibrate*. Another tree, an older checkout, a release or a local
    patch, is *refused* by name, the only requirement that refuses: only the head is
    supported, other trees waiting for after v1 (#3122), and the showcase's frozen commit
-   (D116) stands for the head.
+   (D117) stands for the head.
 2. **Not invalidated**: no ATOM change since the calibration moves step costs or memory,
    and only then is a law re-keyed onto the new tree (README principle 10, #2594), its
    readings with it; a change that moves memory takes the readings again, as #2861's token
    buckets moved DeepSeek-V4.1's graph pool. A search may mix laws fitted at different
    commits and re-keyed by principle 10's expedient, each point's provenance naming the
    commit its law was fitted at and saying re-keyed, not re-validated; the showcase's laws
-   are all fitted at its one frozen commit (D116). Failing: *calibrate*.
+   are all fitted at its one frozen commit (D117). Failing: *calibrate*.
 3. **Enough coverage**: the law's calibrated range holds the batch shapes the search
    needs, a vector for every decode rung of the capture ladder included, judged by
    `compass run --coverage`, which gains a step linear check beside the step grid's and
@@ -182,7 +182,7 @@ run.
 
 ---
 
-## D112. Calibrating what the search lacks
+## D113. Calibrating what the search lacks
 
 **Rule.**
 
@@ -202,7 +202,7 @@ run.
   refused, and `calibrate.sh` takes no record once a fit has run: a configuration lacking
   coverage is calibrated again, old records with new, in a new output directory and into
   that calibration's own store. Every configuration that borrows its law, as S5 borrows
-  S2's (D115) and MiniMax-M3's LMCache arms their base arms' (D116), has its readings
+  S2's (D116) and MiniMax-M3's LMCache arms their base arms' (D117), has its readings
   measured into that store too, `compass advice` printing them with the calibration
   command. The reuse check looks a candidate up in its latest calibration's store, then in
   the shared one, and the candidate's runs read the one store holding all its inputs;
@@ -219,7 +219,7 @@ refuse a second publish.
 
 ---
 
-## D113. Profiling: the per-request split and the op-family split
+## D114. Profiling: the per-request split and the op-family split
 
 **Rule.**
 
@@ -248,7 +248,7 @@ only and is not in the tree.
 
 ---
 
-## D114. The dashboard and the per-run report
+## D115. The dashboard and the per-run report
 
 **Rule.** Two static HTML views, served by no server, reading files and never calling the
 search's or profiling's code.
@@ -277,12 +277,12 @@ search's or profiling's code.
   deferred.
 
 **Reason.** A static page travels with its run; reading files keeps the views apart from
-the code they show (D107); two marks keep an ungraded or guessed number from reading as
+the code they show (D108); two marks keep an ungraded or guessed number from reading as
 measured. **Basis.** The owner on #3355; `08` D50.1; `11`, which owns `/metrics`.
 
 ---
 
-## D115. The development template: DeepSeek-V4-Pro on MI355X, ungraded
+## D116. The development template: DeepSeek-V4-Pro on MI355X, ungraded
 
 **Rule.** The search, profiling and views are developed on DeepSeek-V4-Pro (the original
 checkpoint) on MI355X under the agentic cc-traces workload, on the development nodes, from
@@ -293,11 +293,11 @@ workload, so its grade is not cited.
 
 | # | Deployment | Parallelism | MTP | TBO | LMCache | ATOM basis | Law |
 |---|---|---|---|---|---|---|---|
-| S1 | one node, 8 GPUs | TP8 | MTP3 | off | off | `recipes/DeepSeek-V4-Agentic-InferenceX.md`, TP | calibrated anew (D112) |
-| S2 | one node | DPA8 | MTP3 | on | off | the same, DP attention | calibrated anew (D112) |
+| S1 | one node, 8 GPUs | TP8 | MTP3 | off | off | `recipes/DeepSeek-V4-Agentic-InferenceX.md`, TP | calibrated anew (D113) |
+| S2 | one node | DPA8 | MTP3 | on | off | the same, DP attention | calibrated anew (D113) |
 | S5 | one node | DPA8 | MTP3 | on | on | the same, DP attention with LMCache | S2's step and host laws; its own readings, whose key holds the KV offload |
-| P1 | 1P1D, 16 GPUs | TP8 / TP8 | off | off | off | `recipes/mesh/DeepSeek-V4.md`, pure TP; nightly `ds-v4-1p1d-tp8` | M2's TP law in the crsuse2-m2m-v3-005 store, if it passes D111 |
-| P3 | 1P1D | DPA8 / DPA8 | off | prefill | off | `recipes/mesh/DeepSeek-V4.md`, DPA | the shipped crs005 and gpu45 pairs under `scripts/compass/laws/`, if they pass D111 |
+| P1 | 1P1D, 16 GPUs | TP8 / TP8 | off | off | off | `recipes/mesh/DeepSeek-V4.md`, pure TP; nightly `ds-v4-1p1d-tp8` | M2's TP law in the crsuse2-m2m-v3-005 store, if it passes D112 |
+| P3 | 1P1D | DPA8 / DPA8 | off | prefill | off | `recipes/mesh/DeepSeek-V4.md`, DPA | the shipped crs005 and gpu45 pairs under `scripts/compass/laws/`, if they pass D112 |
 
 The configurations cut from it, each one switch alone (S3, S4, P2, P4 to P7), can come
 back. Arguments and environment follow the basis recipe, except:
@@ -306,7 +306,7 @@ back. Arguments and environment follow the basis recipe, except:
   one value keeps one memory-readings entry per configuration.
 - Prefix caching on everywhere, as the single-node recipe and the agentic workload have
   it; the 1P1D recipe turns it off. It is in no law's key, so whether M2's laws, fitted
-  with it off, serve is D111's accuracy requirement.
+  with it off, serve is D112's accuracy requirement.
 - `--gpu-memory-utilization` 0.9 on one node; 0.75 on each decode side, the development
   nodes' Mooncake dmabuf limit; on the prefill side 0.72 for P3, whose eight DPA ranks'
   gathered MoE rows pass 65,536 at 0.75 and run aiter's MoE workspace out of memory
@@ -330,14 +330,14 @@ not built; real DP ranks draw the same uniforms each step where simulated ones d
 (read in the code, not measured).
 
 **Reason.** DeepSeek-V4-Pro has a store and shipped laws on the development nodes, so the
-tool is built while MiniMax-M3's support lands (D116); the template runs every path of the
+tool is built while MiniMax-M3's support lands (D117); the template runs every path of the
 tool, a reused law and a new one included, and S1 against S2 puts the agentic workload's
 best-known trade-off on its frontier. **Basis.** The owner on #3355; `16` D95; the #975
 and #2683 Rulings.
 
 ---
 
-## D116. MiniMax-M3: the move, its template and the showcase
+## D117. MiniMax-M3: the move, its template and the showcase
 
 **Rule.**
 
@@ -364,7 +364,7 @@ and #2683 Rulings.
 - **Calibration** as `16` D95.1's, after the environment check: a base law each for TP4,
   TP4 with indexer CP and TP2, the last two pooling their LMCache arms' records, with `03`
   D13.1's offload terms, only if those arms come up; a readings entry per point; each step
-  timed (D112).
+  timed (D113).
 - **The showcase run**: `compass advice` on that template, the model differing only in
   the space file, no search, profiling or view code branching on it; whatever MiniMax-M3
   forces to change is filed as a defect; an op-family split only where the op-level
@@ -373,7 +373,7 @@ and #2683 Rulings.
   time, 3600 s a point plus the measured start cost.
 - **The showcase validation**, an `08` D50 set registered and frozen before it runs: at
   the recommended point's concurrency, the recommended configuration and the runner-up
-  (D110) each run real three times on the development nodes, spaced (`08` D45), 3600 s
+  (D111) each run real three times on the development nodes, spaced (`08` D45), 3600 s
   each as the `agentx` workload runs. Each cell is graded by `08` D44, and their real
   order by throughput per GPU, InferenceX's, is compared with the simulated one: it
   matches, or the gap lies within the real runs' spread and is reported undetermined. `08`
@@ -394,19 +394,19 @@ user acts on, and their order is what real runs confirm. **Basis.** The owner on
 
 | # | Decision | Date |
 |---|---|---|
-| D107 | Fitting apart from searching: a candidate is simulated once its law exists; the halves meet only through the store and a calibration's `status` file, the search owning no calibration, fitting, reuse judgement or version management. A user guide, `scripts/compass/ADVICE.md`, exact enough that an agent following it fills the DeepSeek-V4-Pro template's space file, and no skill; an agent starts a calibration only on the user's yes. | 2026-11-13 ([#3355](https://github.com/jgong5/ATOM/issues/3355), [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6845852318)) |
-| D108 | `compass advice SPACE OUT` checks each candidate (searchable, missing a law, calibrating, refused), simulates each searchable one at each concurrency on a fresh server with no step roofline, and writes the results; it never calibrates, and runs at the integration head, on the target machine type, in a GPU container. Amends `13` D80: it starts the client and takes a workload, and `run --check` resolves a prefill or decode side. | 2026-11-13 (#3355) |
-| D109 | The user provides the space file, by hand or through an agent following the guide, and it names the shared store; it expands deterministically into candidates, each naming its ATOM basis and departures; it is the search's input, not a level of `13` D79's precedence. | 2026-11-13 (#3355, #3363) |
-| D110 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. | 2026-11-13 (#3355) |
-| D111 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage and held-out error within the acceptance targets; the verdict is reuse, calibrate, or refused for a tree other than the integration head. A search may mix laws fitted at different commits and re-keyed to the head, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363) |
-| D112 | The step linear backend lists a configuration's missing records as one `calibrate.sh` command, which publishes into `STORE` and reports each step in `status`; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, and each candidate runs on the one store holding its inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
-| D113 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355) |
-| D114 | Two static views reading files only: the search's dashboard, each point marked by grading state and method shares, and every run's `report.html`. | 2026-11-13 (#3355) |
-| D115 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355) |
-| D116 | Moved to MiniMax-M3 once its Compass features land and #3265 passes, calibrated on the development nodes from #3256's arms at one frozen commit, where its simulations and validation runs run too; the showcase validation runs the recommended configuration and the runner-up real, graded by `08` D44, their real order compared with the simulated one. Amends `08` D50. | 2026-11-13 (#3355, #3363) |
+| D108 | Fitting apart from searching: a candidate is simulated once its law exists; the halves meet only through the store and a calibration's `status` file, the search owning no calibration, fitting, reuse judgement or version management. A user guide, `scripts/compass/ADVICE.md`, exact enough that an agent following it fills the DeepSeek-V4-Pro template's space file, and no skill; an agent starts a calibration only on the user's yes. | 2026-11-13 ([#3355](https://github.com/jgong5/ATOM/issues/3355), [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6845852318)) |
+| D109 | `compass advice SPACE OUT` checks each candidate (searchable, missing a law, calibrating, refused), simulates each searchable one at each concurrency on a fresh server with no step roofline, and writes the results; it never calibrates, and runs at the integration head, on the target machine type, in a GPU container. Amends `13` D80: it starts the client and takes a workload, and `run --check` resolves a prefill or decode side. | 2026-11-13 (#3355) |
+| D110 | The user provides the space file, by hand or through an agent following the guide, and it names the shared store; it expands deterministically into candidates, each naming its ATOM basis and departures; it is the search's input, not a level of `13` D79's precedence. | 2026-11-13 (#3355, #3363) |
+| D111 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. | 2026-11-13 (#3355) |
+| D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage and held-out error within the acceptance targets; the verdict is reuse, calibrate, or refused for a tree other than the integration head. A search may mix laws fitted at different commits and re-keyed to the head, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363) |
+| D113 | The step linear backend lists a configuration's missing records as one `calibrate.sh` command, which publishes into `STORE` and reports each step in `status`; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, and each candidate runs on the one store holding its inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
+| D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355) |
+| D115 | Two static views reading files only: the search's dashboard, each point marked by grading state and method shares, and every run's `report.html`. | 2026-11-13 (#3355) |
+| D116 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355) |
+| D117 | Moved to MiniMax-M3 once its Compass features land and #3265 passes, calibrated on the development nodes from #3256's arms at one frozen commit, where its simulations and validation runs run too; the showcase validation runs the recommended configuration and the runner-up real, graded by `08` D44, their real order compared with the simulated one. Amends `08` D50. | 2026-11-13 (#3355, #3363) |
 
 ---
 
 ## Open items
 
-T108 to T114, registered in [`12_open_items.md`](12_open_items.md) under *Topic 18*.
+T108 to T114, registered in [`12_open_items.md`](12_open_items.md) under *Topic 19*.
