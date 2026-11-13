@@ -1249,9 +1249,10 @@ store. A record without a store touches no library.
    tool: per concurrency 16 and 4, `compass record --trace --gpu G --out
    $R/trace/c<C> -- $ATOM` and `client.sh $R/trace/c<C> --traces 256-392
    --concurrency <C> --duration 120 --stop`.
-3. `compass fit steps --backend step-linear --form history $R/cal/c* $R/trace/c*
-   --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M $S --out
-   $R/fit`, every record and trace run named before the first `--client-run`, and
+3. `compass fit steps --backend step-linear --form history --model $MODEL $R/cal/c*
+   $R/trace/c* --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M
+   $S --out $R/fit`, every record and trace run named before the first `--client-run`,
+   `--model` naming the model directory, whose config gives a MoE model's routing, and
    `compass fit host` on the calibration records alone; each prints its store token.
    Steps 1 to 3, after a warm record, are `calibrate.sh $R/cal 1 4 16 "trace 16" "trace 4"` with
    `MODEL`, `GPU`, `MACHINE`, `TRACES` and `AIPERF_PYTHON` set, its store
