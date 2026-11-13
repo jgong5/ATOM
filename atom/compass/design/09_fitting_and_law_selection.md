@@ -343,9 +343,11 @@ data-parallel group splits for two-batch overlap launches each micro-batch in tu
 ATOM's `UBatchWrapper`, unless it is a decode replaying a graph recorded split. On
 [#3069](https://github.com/jgong5/ATOM/issues/3069)'s DPA8 c=256 record a split middle chunk of
 16k tokens or more launched in 357 ms at p50, its blocked time left out, against 140 ms for a
-plain one. The JIT cut named all 2,448 split launches; with the column in its solve it names 12,
-six of them a rank's first split, a compile. That record is one run, so no host law adopts the
-column from it ([#3114](https://github.com/jgong5/ATOM/issues/3114)).
+plain one, and the JIT cut named all 2,448 split launches. Fitted with a second run of the recipe
+whose lines carry the provider's `observe`, that record's `launch` restated from each line's
+split, the cut names 0.3% of split middle chunks against 0.5% of plain ones, the middle chunk
+and output prefill laws adopt the column at 193 and 197 ms, and a split middle chunk is priced
+6.1% low at p50 ([#3114](https://github.com/jgong5/ATOM/issues/3114)).
 
 - **Key:** the host CPU, the `atom` source digest, the model, the engine config, the
   device, the software stack and torch (`07` D41). A mismatch refuses. There is no transfer mode: the MI455 projection prices no host floor
