@@ -444,9 +444,7 @@ no rank pausing (`09` D54).
 `atom/compass/parity/busy.py` reduces its traces to each forward's busy time per pass,
 which labels prefill (`09` D54); its decodes and host segments are profiled and label
 nothing. On every rank the recorder marks where a forward's target ends and where each
-drafter pass runs with profiler ranges, opened only while the profiler runs. Every
-trace run carries `09`'s
-profiler check.
+drafter pass runs with profiler ranges, opened only while the profiler runs.
 
 **Revised 2026-10-18 by the owner's ruling on
 [#1489](https://github.com/jgong5/ATOM/issues/1489):** Phase 1c produces nothing the
