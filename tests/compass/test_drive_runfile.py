@@ -488,7 +488,8 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
 
     assert "data_parallel_size" not in run
     assert compass_run._widths(run) == (2, 1)
-    assert run["router_s"] == runfile.ROUTER_RELAY_S
+    # No host laws state the router's hop: it takes the floor.
+    assert run["router_s"] is None
     assert run["kv_link"] == "inter_node"
     table = compass_run.channel_table(run)
     lps = {lp.name for lp in table.registry.ids()}
@@ -496,7 +497,7 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
     write = [f"engine-D->engine-P:kv_write_req#dp0.dp{p}" for p in (0, 1)]
     assert [table.lookahead(c) for c in write] == [compass_run.HOP_FLOOR_S] * 2
     relay = table.lookahead("frontend-P->frontend-D:relay")
-    assert relay == run["router_s"]
+    assert relay == compass_run.HOP_FLOOR_S
 
 
 def price_list_key(tmp_path, **layout):

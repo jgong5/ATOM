@@ -49,7 +49,6 @@ ASSUMED = {
     "interconnect": {
         "intra_node": {"link_latency_s": 2.0e-6, "derate": 0.89},
         "inter_node": {"link_latency_s": 5.0e-6, "derate": 0.80},
-        "router_relay_s": 1.5e-3,
     },
 }
 

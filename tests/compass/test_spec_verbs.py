@@ -72,7 +72,6 @@ LINKS = {
             "link_latency_s": 5.0e-6,
             "derate": 0.80,
         },
-        "router_relay_s": 1.5e-3,
     }
 }
 
@@ -524,7 +523,7 @@ def test_the_node_18_fragments_validate_and_explain_splits_measured_from_declare
     measured, declared = script.report(merged).split("assumed:")
     for field in ("device.memory.capacity_bytes", "device.ptl"):
         assert field in measured and field not in declared
-    for field in ("interconnect.router_relay_s", "inter_node.link_latency_s"):
+    for field in ("interconnect.inter_node.derate", "inter_node.link_latency_s"):
         assert field in declared and field not in measured
 
 

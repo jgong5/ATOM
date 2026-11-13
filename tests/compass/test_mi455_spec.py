@@ -43,7 +43,6 @@ def test_each_a0_device_field_is_probed_or_the_datasheet_and_the_rest_assumed():
     assert {p for p, o in origins.items() if o == "assumed"} == {
         "interconnect.inter_node.link_latency_s",
         "interconnect.inter_node.derate",
-        "interconnect.router_relay_s",
     }
     device = {o for p, o in origins.items() if p.startswith("device.")}
     assert device == {"probed", "datasheet"}

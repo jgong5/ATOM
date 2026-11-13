@@ -83,9 +83,6 @@
       },
       "interconnect.inter_node.link_latency_s": {
         "origin": "assumed"
-      },
-      "interconnect.router_relay_s": {
-        "origin": "assumed"
       }
     },
     "fragments": [
@@ -94,7 +91,7 @@
       "ratios",
       "carried"
     ],
-    "notes": "MI455X product page and brochure (07/26), read 2026-10-09; its 432 GB of HBM4 as GiB, since MI355X's 288 GB reads 288 GiB less 16 MiB at a real start and MI308X's 192 GB reads 192 GiB less 16 MiB | the B0 performance machines, which no card here reads: MI455X named for their stepping, at the arch the A0 samples read | no B0 card ran: mi355x-gpu45's derates, and its bandwidth curve over its datasheet bandwidth times MI455X's | no B0 card ran: mi355x-gpu45's values where no datasheet states one: its probed kernel floor and intra-node link latency, its stack, and the inter-node link latency and router relay it assumes"
+    "notes": "MI455X product page and brochure (07/26), read 2026-10-09; its 432 GB of HBM4 as GiB, since MI355X's 288 GB reads 288 GiB less 16 MiB at a real start and MI308X's 192 GB reads 192 GiB less 16 MiB | the B0 performance machines, which no card here reads: MI455X named for their stepping, at the arch the A0 samples read | no B0 card ran: mi355x-gpu45's derates, and its bandwidth curve over its datasheet bandwidth times MI455X's | no B0 card ran: mi355x-gpu45's values where no datasheet states one: its probed kernel floor and intra-node link latency, its stack, and the inter-node link latency it assumes"
   },
   "device": {
     "name": "MI455X B0",
@@ -221,7 +218,6 @@
       "link_bandwidth_bytes_per_s": 300000000000.0,
       "link_latency_s": 5e-06,
       "derate": 0.8
-    },
-    "router_relay_s": 0.0015
+    }
   }
 }
