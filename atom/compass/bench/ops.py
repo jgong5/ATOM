@@ -3305,8 +3305,9 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 whys[f"{part}op_graph"], found = found, []
             for name, fam, tokens, op, at in found:
                 asked = _drafter_at(at, op, line, config) if part == DRAFT else []
-                if decoding and asked and (moved := asked[0][1]) != at:
-                    # a decode's family names its shape, G among it
+                if asked and (moved := asked[0][1]) != at:
+                    # a family names G: a decode's its shape, a prefill's
+                    # whether its shape states one
                     at = moved
                     fam, tokens = _family(at, None, name, signature(op), dependent)
                 bound = (*at[:4], mean, top)
