@@ -225,14 +225,25 @@ def _run(d, concurrency, scale=1.0, server=True, tp=4, **arguments):
     return d
 
 
-def _point(d, concurrency, real=(1.0, 1.04, 0.97), **simulated):
+def _point(d, concurrency, real=(1.0, 1.04, 0.97), tp=4, **simulated):
     """A point of real runs at `real` scales and each simulated backend's run
-    at its scale, with no server metrics, as a simulated client scrapes none."""
+    at its scale, with no server metrics, as a simulated client scrapes none,
+    all at TP `tp`."""
     for k, scale in enumerate(real, start=1):
-        _run(d / f"real{k}", concurrency, scale)
+        _run(d / f"real{k}", concurrency, scale, tp=tp)
     for backend, scale in simulated.items():
-        _run(d / backend, concurrency, scale, server=False)
+        _run(d / backend, concurrency, scale, server=False, tp=tp)
     return d
+
+
+def arms(root) -> tuple:
+    """The test's two arms under `root`: TP4 at c=1 and c=4, the latter priced
+    by two backends, and TP2 at c=2."""
+    tp4, tp2 = root / "tp4", root / "tp2"
+    _point(tp4 / "c4", 4, step_linear=1.01, step_grid=1.2)
+    _point(tp4 / "c1", 1, step_linear=0.99)
+    _point(tp2 / "c2", 2, tp=2, step_linear=1.06)
+    return tp4, tp2
 
 
 def _table(out: str) -> dict:
@@ -258,10 +269,7 @@ def test_a_run_with_no_server_metrics_has_no_hit_rates(tmp_path):
 
 
 def test_one_command_draws_each_arm_and_both_and_judges_every_point(tmp_path, capsys):
-    tp4, tp2 = tmp_path / "tp4", tmp_path / "tp2"
-    _point(tp4 / "c4", 4, step_linear=1.01, step_grid=1.2)
-    _point(tp4 / "c1", 1, step_linear=0.99)
-    _point(tp2 / "c2", 2, step_linear=1.06)
+    tp4, tp2 = arms(tmp_path)
     out = tmp_path / "charts"
     main(["--curves", str(out), str(tp4), str(tp2)])
     for name in ("tp4.png", "tp2.png", "arms.png"):
@@ -320,4 +328,12 @@ def test_a_point_is_refused_without_two_real_runs_or_one_set_of_arguments(tmp_pa
     with pytest.raises(
         ValueError, match=r"different client arguments: \['phases.profiling.duration'\]"
     ):
+        main(["--curves", str(tmp_path / "out"), str(arm)])
+
+
+def test_a_point_with_no_real_run_is_refused_not_dropped(tmp_path):
+    arm = tmp_path / "arm"
+    _point(arm / "c1", 1, step_linear=1.0)
+    _point(arm / "c4", 4, real=(), step_linear=1.0)
+    with pytest.raises(ValueError, match=r"c4 holds 0 real\*/ and \['step_linear'\]"):
         main(["--curves", str(tmp_path / "out"), str(arm)])

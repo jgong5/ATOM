@@ -217,11 +217,13 @@ def point(directory) -> dict:
 
 
 def points(arm) -> list[dict]:
-    """The points of the ARM directory `arm`, by concurrency."""
+    """The points of the ARM directory `arm`, by concurrency: each directory in
+    it holding a real or a simulated run, every one of them refused by `point`
+    unless it holds both."""
     found = [
         point(d)
         for d in sorted(Path(arm).iterdir())
-        if d.is_dir() and any(d.glob("real*"))
+        if any(d.glob("real*")) or any((d / s).is_dir() for s in SIMULATED)
     ]
     at = [next(iter(p["real"].values()))["concurrency"] for p in found]
     if not found or len(set(at)) < len(at):
