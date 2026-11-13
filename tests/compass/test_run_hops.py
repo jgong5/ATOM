@@ -202,6 +202,16 @@ def test_an_entry_with_no_router_hop_charges_its_floor_and_lists_it(tmp_path):
     assert compass_run.hops(run)["ipc_s"] == 1e-4
 
 
+def test_a_router_lp_whose_router_hop_is_the_floor_refuses(tmp_path):
+    run = runfile.prefill_decode(
+        parsed(tmp_path), model(tmp_path), model(tmp_path), "intra_node"
+    )
+    run["router_in_s"] = compass_run.hop(run, "ipc_s")
+
+    with pytest.raises(ValueError, match="0 < router_in_s < router_s"):
+        compass_run.channel_table(run)
+
+
 def test_without_host_laws_every_hop_takes_the_floor(tmp_path):
     single = runfile.build(parsed(tmp_path), model(tmp_path))
     pd = runfile.prefill_decode(
