@@ -26,6 +26,11 @@ placement*).
 MiniMax-M3's EAGLE3, a Llama draft stack with its own KV pool, at step level by the
 drafter's own vectors, its acceptance forced on both runs (D87.1).
 
+**Revised 2026-11-13 by the owner's ruling on
+[#3345](https://github.com/jgong5/ATOM/issues/3345#issuecomment-6849660042):** no cell grades
+its mean acceptance length or accepted-count histogram; tests check once that a simulated
+run draws the acceptance it is fed (D87).
+
 **Scope.** What speculative decoding — Eagle3, DSpark, and MTP heads — changes for a
 simulator, and why one of those changes is different in kind from everything else in this
 design. The draft paths it prices are DeepSeek-V4-Pro's serial MTP, in M2's MI355X cells,
@@ -139,7 +144,7 @@ tag one with [#1541](https://github.com/jgong5/ATOM/issues/1541). An eager DP du
 
 ### What still flows through ATOM's real code
 
-Everything downstream of the value: `SpecStats` accumulation, the bonus-token bookkeeping,
+Everything downstream of the value: `EngineStats` accumulation, the bonus-token bookkeeping,
 the anchor gather, and the scheduler's `max_tokens` interaction
 (`tests/test_scheduler_mtp_max_tokens.py`). The stated acceptance enters at the same
 point the kernel's output would, so the *consequences* of an acceptance are ATOM's, not a
@@ -232,8 +237,8 @@ of its own to lose (*Milestone placement*).
 For contract 2, the flow:
 
 ```
-  real run  --->  SpecStats.distribution       (dict: accepted_count -> occurrences,
-                  scheduler.py)                 maintained per sequence per step)
+  real run  --->  EngineStats.distribution     (dict: accepted_count -> occurrences,
+                  engine_stats.py)              maintained per sequence per step)
                         |
                         v
             per-position unconditional rates    P(first i+1 all accepted)
@@ -242,7 +247,7 @@ For contract 2, the flow:
   simulated run  --->  speculative_config.synthetic_acceptance_rates
 ```
 
-`SpecStats` already tracks exactly the histogram this needs — `distribution` is keyed
+`EngineStats` already tracks exactly the histogram this needs — `distribution` is keyed
 `0..mtp_k` — so the conversion is a cumulative sum and nothing more.
 
 ### The transport for a list does not exist yet
@@ -366,25 +371,27 @@ bound. Compass runs ATOM's sizing and never re-derives the count — which is `0
 
 Concretely, for acceptance cells:
 
-1. Run the real side. Record `SpecStats.distribution`.
+1. Run the real side. Record `EngineStats.distribution`.
 2. Give the simulated side the real side's acceptance: for M2's MTP cells, the measured
    per-position rates (D84 input 1); for stage 4's, the same
    `--spec-decode-acceptance-length` the real side ran with (D84 input 3,
    *Milestone placement*).
-3. Report the three results of `08` D44 as usual — **plus** an acceptance-agreement check
-   between the two sides, at the right strength — which is weaker than exact agreement,
-   for the reason D84 gives. What is checkable:
+3. Report the three results of `08` D44 as usual. Acceptance agreement between the two
+   sides is weaker than exact, for the reason D84 gives, and no cell grades it:
 
    | Quantity | Expectation | Status |
    |---|---|---|
-   | mean acceptance length | agrees to sampling error over the run | **checkable; a gate** |
-   | the accepted-count histogram (`SpecStats.distribution`) | agrees in distribution | **checkable; a gate** |
+   | mean acceptance length | agrees to sampling error over the run | **checked by tests, not graded per cell** |
+   | the accepted-count histogram (`EngineStats.distribution`) | agrees in distribution | **checked by tests, not graded per cell** |
    | per-step realisation — which sequence accepted what on step *k* | **does not agree, and is not expected to** | not a result |
    | within-sequence temporal correlation | **not reproduced** by a rate-based feed | not a result |
 
-4. **If the two aggregate rows disagree materially, the plumbing is wrong, not the cost
-   model** — rates were mis-converted, the seed was not set, or the wrong input was fed.
-   That is a refusal, not a finding.
+4. **The two aggregate rows are plumbing, and tests check it once for every cell.** A
+   simulated run draws the acceptance it is fed: `tests/compass/test_run_measured_acceptance.py`
+   turns a record's histograms into the rates ATOM is handed and has the run summary name
+   the record, and `tests/compass/test_speculative_step.py` holds the histogram ATOM's
+   scheduler draws within four standard errors of the stated rates, its draws fixed by a
+   seed. A cell's run summary names its acceptance input and record (`run._acceptance`).
 5. **Schedule agreement (`08` D44's second result) is graded more loosely for speculative
    cells than for dense ones**, and the artifact says so. Two runs whose acceptance
    histograms match can still diverge in *which* request accepted what, and that
@@ -528,7 +535,7 @@ key apart. A draft read from the target's checkpoint keys by method and `K` alon
 | D84 | Feed the **measured per-position distribution**, not the mean - the minimum-variance schedule matches an aggregate and not a schedule. Contracts 1 and 2 (stated or measured statistical rates) are the design; contract 3 (per-request per-token lists) is recorded and not built. Transport for a list does not exist today and needs an ATOM flag (T63). Three acceptance inputs, measured, estimated and declared; the summary reports the method, which propagates into no cost term; input 3 is not acceptance evidence unless the real run states the same AL. Contract 3 stays unbuilt after #2574 measured the per-request gap; stage 4's exit cells state AL 3 on both runs instead. | 2026-09-19; revised 2026-10-14 (#952), 2026-11-02 (#2683) |
 | D85 | No new cost form. Drop the separate decode form and price every step with the general one; non-speculative decode is the `N_Q = 1` case. | 2026-09-19 |
 | D86 | Draft weights are Class A; draft KV comes from ATOM's own pool declarations (`ModelRunner._sub_pool_specs`), and its layer count is never re-derived. | 2026-09-19; revised 2026-10-29 (#2437) |
-| D87 | A speculative throughput result is **conditional on its acceptance input**, and the run summary names its method. Mean AL and the accepted-count histogram are gated; per-step realisation and within-sequence correlation are **not reproduced and not claimed**. Schedule agreement is graded more loosely for speculative cells. Predicting acceptance itself is explicitly not attempted. A cell whose two runs state the same AL is acceptance evidence. | 2026-09-19; revised 2026-11-02 (#2683) |
+| D87 | A speculative throughput result is **conditional on its acceptance input**, and the run summary names its method. Mean AL and the accepted-count histogram are checked by tests of the plumbing, not graded per cell; per-step realisation and within-sequence correlation are **not reproduced and not claimed**. Schedule agreement is graded more loosely for speculative cells. Predicting acceptance itself is explicitly not attempted. A cell whose two runs state the same AL is acceptance evidence. | 2026-09-19; revised 2026-11-02 (#2683), 2026-11-13 (#3345) |
 | D87.1 | MiniMax-M3's EAGLE3, ruled by the owner: a Llama draft stack with its own draft KV pool, declared by `draft_kv_builder`; priced at step level from records by the drafter's own vectors, a draft forward per serial pass, propose and draft KV; acceptance forced through `--spec-decode-acceptance-length` on both runs; at level 0 by scenario, closing #2672's Eagle case. | 2026-11-12 (#3257) |
 
 ---
