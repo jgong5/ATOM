@@ -1060,7 +1060,15 @@ and it accounts for the gap a synthetic decode step shows between them, about 10
 [#828](https://github.com/jgong5/ATOM/issues/828)'s gap on real runs, 18 to 20%, is
 larger and stays open. The band one key
 leaves: same-key cards agree within 0.6% with PTL off; with PTL on, 3 to 5% per card
-plus 1 to 2% run-to-run remains.
+plus 1 to 2% run-to-run remains. That band is MI308X's, on a synthetic decode step.
+MI355X's cards spread wider with PTL disabled: crsuse2-m2m-v3-005's eight run a
+DeepSeek-V4-Pro 16384-token prefill chunk at 0.6% under to 1.1% over the crs005
+prefill law across 1P1D rounds of [#975](https://github.com/jgong5/ATOM/issues/975)'s cell ([#2992](https://github.com/jgong5/ATOM/issues/2992)),
+and crsuse2-m2m-v3-013's ranks run a one-row decode step 0.6 to 1.4% apart, part of
+it their contexts' mix ([#3048](https://github.com/jgong5/ATOM/issues/3048)). Neither enters a key or a fit:
+a law prices the card mix of its records, and `validate.cost` states each DP rank's
+error with its cards' PCI buses, which `run.json` records (README, principle 12;
+[#3048 Ruling](https://github.com/jgong5/ATOM/issues/3048#issuecomment-6851366020)).
 
 ### Four rules
 

@@ -377,6 +377,45 @@ def test_a_group_step_prices_as_its_slowest_rank_against_the_group_s_time(tmp_pa
     assert all(total > sum(_price(rows) for rows, _ in s) for s in ranks)
 
 
+def test_each_rank_s_error_is_split_out_naming_its_card(tmp_path):
+    # Rank 1's card runs 2% over the law: every step it is the slowest rank
+    # of, the even ones, both ranks wait the longer time.
+    ranks = _two_ranks()
+    slow = {i: 1.02 for i in range(0, 20, 2)}
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "steps", steps, stretch=slow, rank=r, group=ranks)
+    gpus = [{"index": i, "bus": f"0000:{i:02x}:00.0"} for i in (3, 11)]
+    (tmp_path / "run.json").write_text(json.dumps({"device": gpus}))
+    report = cost_accuracy(tmp_path / "steps", LAW)
+
+    for kind in ("prefill", "decode"):
+        rank0, rank1 = report["ranks"][kind].values()
+        assert rank0 == {
+            "buses": ["0000:03:00.0"],
+            "steps": 5,
+            "on_totals": pytest.approx(0.0, abs=1e-9),
+            "median": pytest.approx(0.0, abs=1e-9),
+        }
+        assert rank1 == {
+            "buses": ["0000:0b:00.0"],
+            "steps": 5,
+            "on_totals": pytest.approx(1 / 1.02 - 1, abs=1e-6),
+            "median": pytest.approx(1 / 1.02 - 1, abs=1e-6),
+        }
+        assert list(report["ranks"][kind]) == [0, 1]
+    assert "  dp1 | 0000:0b:00.0 | 5 | -1.96% | -1.96%" in _text(report)
+
+    # A run.json that names no bus, as one written before it named any.
+    (tmp_path / "run.json").write_text(json.dumps({"device": [{"index": 3}] * 2}))
+    report = cost_accuracy(tmp_path / "steps", LAW)
+    assert report["ranks"]["decode"][1]["buses"] is None
+    assert "  dp1 | unrecorded | 5 |" in _text(report)
+
+    # One rank: no split.
+    _record(tmp_path / "alone", _steps(), stretch=slow)
+    assert cost_accuracy(tmp_path / "alone", LAW)["ranks"] == {}
+
+
 def test_a_group_step_is_validated_by_the_rank_it_is_priced_as(tmp_path):
     # Step 10's cheaper rank 1 lies below the held-out hull; rank 0 prices it.
     ranks = _two_ranks()
