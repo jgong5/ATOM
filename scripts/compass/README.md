@@ -1128,6 +1128,39 @@ the decode): decode readings taken on 005 sized the simulated decode 79 to 80 KV
 blocks per rank above every real decode on 013
 ([ruling](https://github.com/jgong5/ATOM/issues/1111#issuecomment-6659985920)).
 
+### The MTP cells
+
+The TP MTP3 cell is the TP cell
+[as registered](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6841658964), and the
+DPA MTP1 cell the DPA-TP8 cell
+[as registered](https://github.com/jgong5/ATOM/issues/975#issuecomment-6570682669), each with
+the recipe's drafter flags on both sides: `--method mtp --num-speculative-tokens 3` and `1`.
+A prefill instance keeps its drafter under a transfer config, as a decode instance does.
+
+- **Real runs.** `deploy.sh record`, as the base cell's. At its engine's stop, each
+  decode DP rank's record gains its accepted-draft histogram,
+  `steps/dp<r>.acceptance.json`. A decode killed rather than stopped writes none, and
+  its run cannot give a simulated run its acceptance.
+- **Acceptance.** A simulated drafter draws its accepted drafts from a stated
+  acceptance, and the runner refuses one that states none, on either side. An MTP
+  cell's simulated run states the rates its paired real run's decode histograms
+  give: `compass run --acceptance-record` hands them to ATOM as
+  `--spec-decode-acceptance-rates`, and the run summary names the input `measured`.
+- **Host laws.** The engine config that keys host laws states the drafter and its
+  draft width (`run.step_grid.keyed`'s `speculative`), and a simulated start refuses
+  laws fitted under another (`run.refuse_unfitted_host`). So no base cell's laws serve
+  its MTP cell: each MTP side needs laws fitted on records of its own configuration.
+- **Graphs.** `compass trace ops` under the drafter flags publishes, beside each
+  target graph, its drafter's, whose structure ends in `draft`, from one model build.
+  Both are keyed by the speculative engine config, so no base cell's graph serves an
+  MTP cell.
+- **Points.** An `op_measurement` key holds the model, the parallel layout, the
+  platform, the source root and the point, its shape, context and leaf, but no engine
+  config: a point a base cell measured at the same source root and platform is the
+  MTP cell's wherever its leaf runs at that shape and signature. `measure ops --plan`
+  over an MTP record plans the drafter's leaves beside the target's
+  (`atom/compass/bench/ops.py`).
+
 ### The inter-node link — `rdma_link.py`
 
 `rdma_link.py` times Mooncake writes from 005's GPUs into 013's over the
