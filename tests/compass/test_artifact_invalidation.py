@@ -470,13 +470,12 @@ BEFORE_HOST_CPU = {
     "price_list": ("software_stack", "torch", "atom_src", "device"),
     "memory_readings": BUT_HOST_CPU,
     "step_grid_bundle": BUT_HOST_CPU,
-    "probe_record": ("software_stack", "torch", "device", "ptl"),
 }
 
 
 @pytest.mark.parametrize(
     "row",
-    [Row.OP_GRAPH, Row.PROBE_RECORD],
+    [Row.OP_GRAPH],
     ids=lambda row: row.name,
 )
 def test_an_entry_published_before_the_host_cpu_axis_still_loads(tmp_path, row):

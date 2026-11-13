@@ -75,8 +75,6 @@ class Axis(enum.Enum):
 
 
 class Row(enum.Enum):
-    """The rows."""
-
     OP_GRAPH = "op_graph"
     PRICE_LIST = "price_list"
     MEMORY_READINGS = "memory_readings"
