@@ -26,7 +26,14 @@
 #                    simulated run sees the first prefill server's and
 #                    allocates nothing
 #   ATOMESH          the router binary (default atomesh), on both runs
-#   MACHINE          machine spec (default scripts/compass/machines/mi308x-hjbog18.json)
+#   DEVICE PTL       the GPUs' datasheet, by SKU or path, and their PTL state, as
+#                    `compass run --device` and `--ptl` take them (required
+#                    without HTTP_INTAKE)
+#   READINGS         artifact store holding the GPUs' platform_readings, which
+#                    the run file's machine block is composed from (required
+#                    without HTTP_INTAKE)
+#   STACK            the readings' stack, as `compass run --stack` takes it, when
+#                    READINGS holds several
 #   STORE            artifact store holding the simulated configuration's memory
 #                    readings, taken by `compass measure memory` (required
 #                    without HTTP_INTAKE)
@@ -56,6 +63,7 @@ PREFILL_DP=${PREFILL_DP:-2} DECODE_DP=${DECODE_DP:-2}
 dp_args() { if (($1 > 1)); then echo "-tp $1 --enable-dp-attention"; else echo "-tp 1"; fi; }
 mkdir -p "$OUT/real/record" "$OUT/sim"
 OUT=$(realpath "$OUT")
+[[ -n ${HTTP_INTAKE:-} ]] || compass_machine "$OUT/sim/machine.json"
 pids=()
 trap 'kill -KILL -- "${pids[@]/#/-}" 2>/dev/null || true' EXIT
 ROUTER_PORT=$(compass_held_port)
@@ -116,7 +124,7 @@ for record in "$OUT"/real/record/*/; do cp "$OUT/real/record/arrivals.json" "$re
 
 RUN=$OUT/sim/run.json
 CLOCK_PORT=$(compass_held_port)
-python3 - "$RUN" "$OUT" "${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}" \
+python3 - "$RUN" "$OUT" "$OUT/sim/machine.json" \
     "$MODEL" "$STORE" "$CLOCK_PORT" "${#prefill_gpus[@]}" "${#decode_gpus[@]}" \
     "$PREFILL_DP" "$DECODE_DP" "${urls[@]}" <<'EOF'
 import json, re, sys

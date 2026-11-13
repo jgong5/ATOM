@@ -871,8 +871,7 @@ def test_the_run_takes_its_readings_off_the_entry(tmp_path, monkeypatch):
 
 # --- the named result: an entry gives what the spec gave ---------------------
 
-#: Qwen3.8-27B at TP1 on node 18's MI308X, as one start read it
-#: (`scripts/compass/mi308x_spec.py`), as a rank's member.
+#: Qwen3.8-27B at TP1 on node 18's MI308X, as one start read it, as a rank's member.
 MI308X_READINGS = {
     "capacity_bytes": 206_141_652_992,
     "driver_and_collective_reserve_bytes": 1_249_902_592,
@@ -895,7 +894,7 @@ FROM_THE_SPEC = {
 
 
 def test_the_mi308x_entry_gives_the_readings_its_spec_gave():
-    path = CONFIG_JSON.parents[2] / "scripts/compass/machines/mi308x-hjbog18.json"
+    path = CONFIG_JSON.parents[2] / "tests/compass/machines/mi308x-hjbog18.json"
     spec = MachineSpec.from_mapping(json.loads(path.read_text()))
     entry = MemoryReadings.from_member(MI308X_READINGS, "memory_readings mi308x")
     model = ModelTerms.from_tree(

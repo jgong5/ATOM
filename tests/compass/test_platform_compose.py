@@ -10,6 +10,7 @@ fit of step measurements alone keyed by the platform their keys state."""
 import argparse
 import dataclasses
 import json
+from pathlib import Path
 
 import platforms
 import pytest
@@ -27,7 +28,6 @@ from test_measure_device import (  # noqa: F401  the node fixture
     node,
 )
 from test_memory_readings import DOCUMENT
-from test_probe_device import SCRIPTS
 
 from atom.compass.artifacts import ArtifactStore
 from atom.compass.artifacts.keys import NO_PTL
@@ -39,8 +39,9 @@ from atom.compass.fit.samples import load
 from atom.compass.spec import MachineSpec, SpecRefusal
 from atom.compass.spec.layers import datasheet
 
+MACHINES = Path(__file__).resolve().parent / "machines"
 #: Each committed spec of one node's readings.
-ONE_NODE = sorted(p.stem for p in (SCRIPTS / "machines").glob("*.json"))
+ONE_NODE = sorted(p.stem for p in MACHINES.glob("*.json"))
 #: What leaves the spec: the document's header, the scale-out network, which
 #: only a run across nodes reads, and the router's hop.
 MOVED = (
@@ -145,7 +146,7 @@ def test_an_assumed_entry_composes_its_ratios_on_its_own_datasheet(
 
 @pytest.mark.parametrize("name", ONE_NODE)
 def test_a_run_file_s_machine_block_equals_its_one_node_spec(tmp_path, name):
-    document = json.loads((SCRIPTS / "machines" / f"{name}.json").read_text())
+    document = json.loads((MACHINES / f"{name}.json").read_text())
     flags = platforms.flags(tmp_path / "store", document, tmp_path)
 
     run = runfile.build(parsed(tmp_path, *stub(tmp_path), *flags), model(tmp_path))

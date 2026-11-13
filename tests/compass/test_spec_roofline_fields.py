@@ -16,7 +16,7 @@ from test_spec_schema import document, refusal_from
 from atom.compass.spec import MachineSpec, explain, validate
 from atom.compass.spec.rules import Rule
 
-MACHINES = pathlib.Path(__file__).resolve().parents[2] / "scripts/compass/machines"
+MACHINES = pathlib.Path(__file__).resolve().parents[2] / "tests/compass/machines"
 CURVE = [[4096, 1.1e11], [1048576, 3.0e12], [4294967296, 6.4e12]]
 
 
@@ -120,7 +120,7 @@ def test_each_machine_file_reads_the_new_fields_with_their_origins(machine):
         "device.memory.bandwidth_curve",
         "device.kernel_floor_s",
     ]
-    # Node 18's, the MI355X hosts' and MI455 A0's are probe_device.py's
+    # Node 18's, the MI355X hosts' and MI455 A0's are probed
     # readings; the others are still assumed.
     probed = (
         "mi308x-hjbog18",

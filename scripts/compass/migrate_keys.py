@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 """Move artifacts keyed by a machine-spec digest to keys that state their platform.
 
-    python3 scripts/compass/migrate_keys.py [--store OLD NEW] [--laws DIR]
+    python3 scripts/compass/migrate_keys.py --machines DIR [--store OLD NEW] [--laws DIR]
 
 A key used to state `machine_spec`, the digest of one spec's device, software
 stack and PTL state; it now states each platform field its kind's row marks,
-by value. A digest is read back as the platform of the spec in `MACHINES` it
+by value. A digest is read back as the platform of the spec in `--machines` it
 names, and an entry or law whose digest names none is listed and left as it
 is. Specs that differ in torch alone share a digest, which then names only the
 fields they agree on: an entry or law whose kind keys torch is listed.
@@ -51,12 +51,11 @@ from atom.compass.artifacts import (
 )
 from atom.compass.spec import MachineSpec
 
-MACHINES = Path(__file__).resolve().parent / "machines"
 #: The key field that stated the digest.
 OLD = "machine_spec"
 
 
-def platforms(machines: Path = MACHINES) -> dict[str, dict]:
+def platforms(machines: Path) -> dict[str, dict]:
     """Each spec's platform in `machines`, by the digest a key stated for it:
     the sha256 of its canonical `machine_spec` key, its device, software stack
     and PTL state. Specs sharing a digest leave it the fields they agree on."""
@@ -107,7 +106,7 @@ def law(path: Path, known: dict) -> str:
     return f"MOVED {path.name}"
 
 
-def entry(directory: Path, known: dict, into: ArtifactStore) -> str:
+def entry(directory: Path, known: dict, into: ArtifactStore, machines: Path) -> str:
     """Republish the entry in `directory` into `into` at its key of today."""
     raw = (directory / "entry.json").read_bytes()
     document = json.loads(raw)
@@ -120,7 +119,7 @@ def entry(directory: Path, known: dict, into: ArtifactStore) -> str:
     }
     if OLD in stated:
         if stated[OLD] not in known:
-            return f"LISTED {where}: digest {stated[OLD]} names no spec in {MACHINES}"
+            return f"LISTED {where}: digest {stated[OLD]} names no spec in {machines}"
         platform = known[stated[OLD]]
     else:
         platform = {name: read.value for name, read in cells.items()}
@@ -159,15 +158,16 @@ def entry(directory: Path, known: dict, into: ArtifactStore) -> str:
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--machines", type=Path, required=True, metavar="DIR")
     p.add_argument("--store", nargs=2, metavar=("OLD", "NEW"))
     p.add_argument("--laws", type=Path, metavar="DIR")
     args = p.parse_args(argv)
-    known, lines = platforms(), []
+    known, lines = platforms(args.machines), []
     if args.store:
         old, into = Path(args.store[0]), ArtifactStore(args.store[1])
         for directory in sorted(old.glob("*/[!.]*")):
             if (directory / "entry.json").is_file():
-                lines.append(entry(directory, known, into))
+                lines.append(entry(directory, known, into, args.machines))
     for path in sorted(args.laws.glob("*.json")) if args.laws else ():
         lines.append(law(path, known))
     for line in lines:

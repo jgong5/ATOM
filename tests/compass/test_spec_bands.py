@@ -3,11 +3,9 @@
 reader still reads the one value."""
 
 import json
-import math
 import pathlib
 
 import pytest
-from test_pp_carriers import TRUTH, _samples, probe, script
 from test_spec_origin import labels, saved, three_origins
 from test_spec_verbs import fragment
 
@@ -101,33 +99,5 @@ def test_only_a_probed_field_states_a_band():
 
 @pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39", "mi355x-gpu45"])
 def test_every_checked_in_spec_publishes_its_probed_numbers_with_a_band(name):
-    path = ROOT / "scripts" / "compass" / "machines" / f"{name}.json"
+    path = ROOT / "tests" / "compass" / "machines" / f"{name}.json"
     refuse_unbanded(MachineSpec.from_mapping(json.loads(path.read_text())))
-
-
-def test_the_pooled_probe_states_each_fields_band_over_its_records(tmp_path):
-    """Two runs' wakes differ: the band runs from a tenth to nine tenths of the
-    way between their own fits, and a field both fit alike has no width."""
-    runs = []
-    for k, level in enumerate((1e-4, 2e-4)):
-        samples = _samples(TRUTH)
-        for b in probe.BLOCKS:
-            done = b + level * -math.expm1(-b / 0.5)
-            stamps = {"send": 0.0, "done": done, "post": b, "end": done}
-            samples.append(
-                {"carrier": "gloo", "bytes": 8, "late": True, "block": b} | stamps
-            )
-        runs.append(tmp_path / f"run{k}.json")
-        runs[-1].write_text(json.dumps({"samples": samples}) + "\n")
-    script.main(str(tmp_path / "pooled.json"), *map(str, runs))
-    pooled = json.loads((tmp_path / "pooled.json").read_text())
-    for carrier, fields in pooled["carriers"].items():
-        stated = {k for k, v in fields.items() if not isinstance(v, list)}
-        assert set(pooled["band"][carrier]) == stated
-    one, two = (probe.fit(json.loads(r.read_text())["samples"]) for r in runs)
-    one, two = one["gloo"]["wake_s"], two["gloo"]["wake_s"]
-    assert one < two
-    band = [one + 0.1 * (two - one), one + 0.9 * (two - one)]
-    assert pooled["band"]["gloo"]["wake_s"] == pytest.approx(band)
-    low, high = pooled["band"]["rccl"]["per_byte_s"]
-    assert low == high == pytest.approx(pooled["carriers"]["rccl"]["per_byte_s"])

@@ -6,13 +6,13 @@ priced at another's probed ratios, the method's error on its own records.
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import platforms
 import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_backend_step_roofline import STACK
-from test_probe_device import SCRIPTS
 from test_validate_bound import LINES, _main, drafted, graph, record
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
@@ -21,7 +21,7 @@ from atom.compass.fit import device
 from atom.compass.spec import MachineSpec
 from atom.compass.validate import bound, project
 
-MACHINES = SCRIPTS / "machines"
+MACHINES = Path(__file__).resolve().parent / "machines"
 #: MI455's B0 spec is MI355X's probed ratios on MI455X's datasheet, for a
 #: device no engine has run on.
 MI355X, MI455 = (MACHINES / f"{name}.json" for name in ("mi355x-gpu45", "mi455-b0"))

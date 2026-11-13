@@ -29,7 +29,7 @@ CARD = {
     "PCI Bus": "0000:0A:00.0",
 }
 ARGV = ["compass", "record", "--gpu", "7", "--out", "d", "--", "--model", "m"]
-MACHINES = Path(__file__).parents[2] / "scripts/compass/machines"
+MACHINES = Path(__file__).parents[2] / "tests/compass/machines"
 
 pytestmark = pytest.mark.skipif(GIT is None, reason="needs git")
 

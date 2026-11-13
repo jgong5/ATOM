@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """`gate_gpu.sh` runs the driver-run tests, once, with their inputs.
 
-The driver-run tests skip without the slice model, the image model, the machine
-spec and a router built at the tree's commit, and a skip used to count as
+The driver-run tests skip without the slice model, the image model and a router
+built at the tree's commit, and a skip used to count as
 accounted. On a tree whose tests read the slice model the gate now sets each
 input, refuses by name when one is missing, runs tests/compass once on every card
 named and the rest of the suite on the first card, and fails on a driver-run skip.
@@ -185,10 +185,6 @@ def test_the_speculative_models_reach_the_tests(tmp_path):
         (
             {"COMPASS_AIPERF_PYTHON": "/nonexistent"},
             "COMPASS_AIPERF_PYTHON /nonexistent",
-        ),
-        (
-            {"ATOM_COMPASS_SLICE_MACHINE": "/nonexistent.json"},
-            "ATOM_COMPASS_SLICE_MACHINE",
         ),
         (
             {"ATOMESH": "/x/atomesh-old"},

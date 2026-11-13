@@ -437,8 +437,9 @@ def test_a_stated_engine_file_contradicting_the_records_own_refuses(tmp_path):
 
 
 COMPASS = Path(__file__).resolve().parents[2] / "scripts" / "compass"
-GPU45 = json.loads((COMPASS / "machines" / "mi355x-gpu45.json").read_text())
-CRS005 = json.loads((COMPASS / "machines" / "mi355x-crs005.json").read_text())
+MACHINES = Path(__file__).resolve().parent / "machines"
+GPU45 = json.loads((MACHINES / "mi355x-gpu45.json").read_text())
+CRS005 = json.loads((MACHINES / "mi355x-crs005.json").read_text())
 #: Each DeepSeek-V4-Pro EP8 law pair's file stem, the spec it was fitted under and
 #: the index cache dtype it is keyed to: the fp4 gpu-40's lone servers ran, the fp8
 #: a P/D side resolves.
