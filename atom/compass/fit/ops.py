@@ -33,7 +33,10 @@ decode's B always, at its T where it states one (a drafter's own leaves at the
 rows they ran, the step padded to B), the rows its MoE gathers, ``G``, where
 every point states them and its masked integers follow them: a leaf that does
 not read them, as attention does not, is read at any ``G``
-(a shape that states no ``G`` gathers every rank's T, and is another family), and,
+(a shape that states no ``G`` gathers every rank's T, and is another family),
+``R``, the real rows of a padded decode's MoE, where some point of the family
+states them (`measure ops`' ``R=``), a point stating none at every row its ids
+route (``routed_rows``), and,
 for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
 a prefill's B and the context: a decode point's ``context``, its longest
@@ -203,9 +206,10 @@ def ran_counts(shape: str, leaf: dict) -> list[dict]:
     step runs its LM head and its drafter's later passes, is the B of a leaf
     that leads with W and not with its T or B, as `OpGraphBackend` asks such a
     leaf (`op_graph._ran_at`). Where W is the prefill's T too, a leaf that
-    leads with it ran at either B (`op_graph._ran_at_each`)."""
+    leads with it ran at either B (`op_graph._ran_at_each`). The real MoE rows
+    ``R`` a point states are none of its counts."""
     n = shape_counts(shape)
-    width = n.pop("W", None)
+    width, _ = n.pop("W", None), n.pop("R", None)
     if width is None or shape.startswith("decode"):
         return [n]
     rows, sets = ("prefill", n["T"], n["B"]), ({n["T"], n["B"]}, {width})
@@ -285,6 +289,11 @@ def fit(points) -> dict:
             for p in members
             if _split(p["context"])[1]
         }
+        real_rows = {
+            family(p["shape"], p["leaf"], free_of[skel])
+            for p in members
+            if "R" in shape_counts(p["shape"])
+        }
         for p, ns in zip(members, ran):
             name = family(p["shape"], p["leaf"], free_of[skel])
             at_p = ns[0] | {"context": _context(p)}
@@ -299,6 +308,9 @@ def fit(points) -> dict:
                 if "B" not in dims and dependent.get(("rows", p["op"]), False):
                     dims.append("B")
             dims += ["G"] if "G" in follows else []
+            if name in real_rows:  # a padded decode's MoE: its real rows, or all routed
+                dims.append("R")
+                at_p["R"] = shape_counts(p["shape"]).get("R", p.get("routed_rows"))
             if moves and "T" not in at_p:  # a decode point, read at its mean too
                 # a uniform point whose rows the KV pool cut holds a mean its
                 # context does not name: a family with ragged points leaves it out
@@ -457,7 +469,9 @@ class PriceList(CostSource):
     at the step's count of each of its dimensions, ``context`` the bound's:
     a decode step's rows' max, a prefill's rows' mean cached tokens; ``mean``
     a decode step's rows' mean context over its B in `PERMILLE` of their max,
-    where the family was measured on ragged rows; a collective's family
+    where the family was measured on ragged rows; ``R`` the real rows a
+    decode's MoE runs, the bound's last, or, where it states none, every row
+    the family's points at its other counts route; a collective's family
     (`bench.ops.exchange`) at its message bytes. A leaf asked at the list of
     bounds it may have run at (`op_graph._ran_at_each`) takes the answer they
     all give, and is declined, naming them, where they differ. It also
@@ -488,8 +502,8 @@ class PriceList(CostSource):
                 return got[0]
             ran = _either(dict(zip("TBG", b[1:4])) for b in bounds)
             return self.refuse(f"{leaf['op']}: {ran}")
-        (leaf, (phase, *counts, last), _), kind = request, request[0]["op"]
-        at = dict(zip(("T", "B", "G", "context"), counts))
+        leaf, (phase, t, b, g, context, last, *real), _ = request
+        kind, at = leaf["op"], {"T": t, "B": b, "G": g, "context": context}
         shape = phase if at["G"] is None else f"{phase} G={at['G']}"
         if ex := exchange(leaf):  # a collective: its family over its message bytes
             name, at["bytes"] = ex
@@ -499,6 +513,12 @@ class PriceList(CostSource):
         if name is None:
             return self.refuse(f"{kind}: no point of its signature was measured")
         dims, top = self.params["families"][name]["dims"], None
+        if "R" in dims:  # real rows the step states, or every row routed
+            lead = tuple(at[d] for d in dims[: dims.index("R")])
+            every = self._index(name).get(lead, [None])[-1]
+            at["R"] = real[0] if real and real[0] is not None else every
+            if at["R"] is None:
+                return self.refuse(f"{kind}: no point at {lead} routes every row")
         if phase == "decode":
             at["mean"] = PERMILLE * last / at["context"]
         elif dims[-1:] == ["context"] and last != at["context"]:

@@ -419,7 +419,17 @@ the rows' cached tokens, once its points at the most cached tokens still differ 
 fresh ones in kernels or time ([#1706](https://github.com/jgong5/ATOM/issues/1706)): a ladder twice as wide missed a same-kernel attention midpoint by
 1.0%, its repeats spreading 0.4% ([#1620](https://github.com/jgong5/ATOM/issues/1620)); attention's context features chosen per kind by data, under
 [#941](https://github.com/jgong5/ATOM/issues/941)'s rule. MoE leaves run on independent
-uniform routing. Each point records the kernels the leaf launched there, its kernel
+uniform routing. A padded decode's MoE runs real rows and pad rows that ATOM routes to no
+expert, 13 real of 32 gathered at p50 on a 1P1D DPA-TP8 decode side at rung 4, where the
+rung-4 leaf prices 0.55 of its every-row time
+([#3239](https://github.com/jgong5/ATOM/issues/3239#issuecomment-6861371586)). So each
+rung's routed leaf, whose ids are every row its MoE runs, is measured too at the real rows
+its steps' MoE ran, on a ladder from one row's tokens: a point states them as `R`, routes
+each row past them to no expert, the real ones spread evenly over the DP ranks and first in
+each rank's block of the gather, and on one rank its batch holds them alone, padded to the
+rung. `fit ops` interpolates such a family along `R`, and a run asks it at the step's real
+rows: the DP group's tokens with its dummy forwards' rows as one, or one rank's own. A
+drafter's routed leaves stay at every row. Each point records the kernels the leaf launched there, its kernel
 identity, and each one's grid, by which a trace run's drafter kernel finds its own length
 (`09` D54, [#2415](https://github.com/jgong5/ATOM/issues/2415)).
 

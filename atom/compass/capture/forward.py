@@ -158,7 +158,10 @@ class Shape(NamedTuple):
     `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`;
     and `width`, the batch a step that replays no graph pads to past its
     rows, None at its rows. `micro_batch` marks a two-batch-overlap
-    micro-batch, which its structure names (`structure`), not its text."""
+    micro-batch, which its structure names (`structure`), not its text.
+    `real` is how many of a padded decode's MoE rows are real, the rest pad
+    rows that route to no expert, None at all of them: a `measure ops` point
+    states it, and a graph is read at its shape without it."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
@@ -166,13 +169,15 @@ class Shape(NamedTuple):
     gathered: int | None = None
     width: int | None = None
     micro_batch: bool = False
+    real: int | None = None
 
     def __str__(self) -> str:
         text = f"{self.phase} T={self.tokens} B={self.seqs}"
         if self.phase == "decode" and self.tokens == self.seqs:
             text = f"decode B={self.seqs}"
         text += f" W={self.width}" * bool(self.width)
-        return text if self.gathered is None else f"{text} G={self.gathered}"
+        text += "" if self.gathered is None else f" G={self.gathered}"
+        return text + ("" if self.real is None else f" R={self.real}")
 
     def at(self, dp: int, drafts: int = 0) -> "Shape":
         """This shape in a DP group of `dp` under a drafter of `drafts`:

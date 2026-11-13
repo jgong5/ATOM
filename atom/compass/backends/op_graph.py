@@ -283,6 +283,15 @@ def gathered_off_default(
     return None if gathered == dp * rows else gathered
 
 
+def _real(view: BatchView) -> int | None:
+    """The real rows a decode step's MoE runs, its others pad rows that route
+    to no expert: its DP group's tokens, the group's dummy forwards' rows as
+    one (`moe_tokens`), None where a DP step states none; else its own."""
+    if view.moe_rows is None:
+        return sum(r.query_tokens for r in view.requests)
+    return view.moe_tokens and view.moe_tokens - max(view.group_dummies - 1, 0)
+
+
 def _ran_at(leaf: dict, bound: tuple) -> tuple:
     """`bound` at the rows `leaf` ran: a padded target's or drafter's
     (`_bound`) at its width where an activation, metadata or output of the
@@ -513,7 +522,8 @@ class OpGraphBackend(CostBackend):
         are its block's, the rung's rows and their `drafts` tokens each, on
         this rank and gathered over the DP group, and none is its rows', so
         a leaf that leads with its rows alone or beside the target's tokens,
-        as its anchors do, is asked at its rows."""
+        as its anchors do, is asked at its rows. Last, a decode's target
+        states the real rows its MoE runs (`_real`), and any other None."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
@@ -532,6 +542,7 @@ class OpGraphBackend(CostBackend):
         bound = (phase, t, b, g, mean, top)
         if phase == "decode":  # its max, then its mean over B: a pad row holds none
             bound = (phase, t, b, g, top, sum(c for _, c in rows) / b)
+        bound += (_real(view) if phase == "decode" and not draft else None,)
         if not width:
             return bound
         if ran == t:
@@ -553,7 +564,7 @@ class OpGraphBackend(CostBackend):
             g = gathered_off_default(phase, t, low, self.dp, self.drafts)
             both = (phase, t, b, g, *bound[4:])
         if phase == "decode":
-            wide = (*wide[:5], wide[5] * b / width)
+            wide = (*wide[:5], wide[5] * b / width, *wide[6:])
         return bound, wide, both, (frozenset(counts), frozenset(wides))
 
     def _region(
