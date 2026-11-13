@@ -38,15 +38,16 @@ is the max over its ranks, so each vector is fitted by max-affine regression
 (`_fit_form`): from the fit on every rank's row and from each feature's axis,
 the lowest after a first round going on, each pass refits on the row
 each step's price picks, a step line-searched until it lowers the squared
-relative error, until no step changes rank or the step's ranks tie; MAD drops
-rerun it. The vector's solve, warm steps and hull read each step's row at the
+relative error, until no step changes rank, the step's ranks tie or the passes
+reach `FIT_PASSES`; MAD drops rerun it, short of that limit. The vector's solve, warm steps and hull read each step's row at the
 rank it prices the step as (`priced_rank`); so does each form a decode rung
 chooses among, MoE column and `rowmod` (below), and each held-out fold
 that chooses, which prices a step as the max over its ranks. Each
 vector reports, under `fit.all_rows`, the centre and scaled MAD of the fit on
 every rank's row, each step priced as its max over ranks, and under
-`fit.passes` the start, passes, how they stopped, `settled` or `tie`, and the
-squared error `F`; more than `FIT_PASSES` passes refuse the fit. A held-out
+`fit.passes` the start, passes, how they stopped, `settled`, `tie` or `limit`,
+and the squared error `F`; a fit at the limit keeps the vector it reached, the
+lowest `F` its passes found. A held-out
 step is priced and banded as its costliest rank.
 
 Records with a host key (`dp0.key.json`, from the real runner) also give the
@@ -197,9 +198,11 @@ MAD_K = 3.5
 #: A relative residual this small is never an outlier, however tight the rest.
 MAD_FLOOR = 0.01
 MAD_PASSES = 20
-#: Passes after which a max-affine fit whose error still falls refuses. Near a
-#: tie between ranks each line-searched pass gains little, so a fit that ends
-#: at a tie takes far more passes than one that settles.
+#: Passes after which a max-affine fit whose error still falls ends, at stop
+#: `limit`, keeping the vector it reached: every pass lowers the error, so that
+#: is the best it found. Near a tie between ranks each line-searched pass gains
+#: little, so a fit that ends at a tie takes far more passes than one that
+#: settles.
 FIT_PASSES = 10_000
 #: A step that ran this many times its price is a one-off first touch, not scatter.
 WARM_FACTOR = 5.0
@@ -926,13 +929,15 @@ def _fit_form(
     current price picks, a Gauss-Newton step on `F`, and halves it until `F`
     falls. The passes end settled, the solve picking the rows it was solved
     on, or at a tie between ranks, when no step that moves some price by more
-    than the square root of the float epsilon makes `F` fall; more than
-    `FIT_PASSES` passes in all raise. Each feature that differs between some
-    step's ranks is a start too, its axis scaled to the labels: the first
-    round runs from each start, every step kept, and the lowest `F` goes on.
+    than the square root of the float epsilon makes `F` fall, or at the
+    limit, `FIT_PASSES` passes in all, keeping the vector they reached. Each
+    feature that differs between some step's ranks is a start too, its axis
+    scaled to the labels: the first round runs from each start, every step
+    kept, and the lowest `F` goes on, a start at the limit included.
     Steps whose residual is more than
     `MAD_K` scaled MADs from the median are then dropped and the passes rerun
-    from there, until the kept set settles or for `MAD_PASSES` rounds.
+    from there, until the kept set settles, for `MAD_PASSES` rounds, or until
+    the passes reach the limit.
 
     Returns the solve's figures: `pick`, each step's rank, at a tie the rank
     of larger features (`priced_rank`, prices folded as a run folds them);
@@ -973,7 +978,8 @@ def _fit_form(
     start = price(c).max(axis=1) - b
 
     def alternate(c, cols, on, passes):
-        """Passes from `c` over the kept steps until settled or at a tie."""
+        """Passes from `c` over the kept steps until settled, at a tie or at
+        the limit."""
         while True:
             pick = price(c).argmax(axis=1)
             picked = np.zeros_like(real)
@@ -981,9 +987,7 @@ def _fit_form(
             if on is not None and (on[keep] == picked[keep]).all():
                 return c, cols, on, passes, "settled"
             if passes == FIT_PASSES:
-                raise ValueError(
-                    f"the alternation on {names} still moved after {FIT_PASSES} passes"
-                )
+                return c, cols, on, passes, "limit"
             passes += 1
             full, solved = solve(a[steps, pick][keep], b[keep])
             if (price(full).argmax(axis=1)[keep] == pick[keep]).all():
@@ -1020,7 +1024,7 @@ def _fit_form(
         centre = np.median(residual)
         mad = 1.4826 * np.median(np.abs(residual - centre))
         moved = np.abs(residual - centre) <= max(MAD_K * mad, MAD_FLOOR)
-        if (moved == keep).all() or rounds == MAD_PASSES:
+        if stop == "limit" or (moved == keep).all() or rounds == MAD_PASSES:
             break
         keep, on = moved, None
     pick = np.zeros(n, dtype=int)
