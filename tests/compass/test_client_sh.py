@@ -29,6 +29,7 @@ from test_parity_client_run import ARGUMENTS, CONFIG, PARAMETERS, raw, sse
 from test_smoke_cell import _alive
 
 from atom.compass.parity.client_run import NAME, RAW
+from atom.compass.validate.__main__ import WORKLOAD, _odd_workloads
 
 TREE = Path(__file__).resolve().parents[2]
 SCRIPT = TREE / "scripts/compass/client.sh"
@@ -435,6 +436,48 @@ def test_its_workload_is_the_one_cctraces_sim_writes_for_the_same_cell(tmp_path,
     )
     run = json.loads((tmp_path / "cell" / "run.json").read_text())
     assert workload == run["workload"]
+
+
+#: A real server's server.json: no run file.
+REAL = {k: SIM[k] for k in ("url", "pid")}
+AGENTX = ["--agentx", "--concurrency", "3"]
+
+
+@pytest.mark.parametrize("agentx", [True, False], ids=["agentx", "base"])
+@pytest.mark.parametrize("server", [SIM, REAL], ids=["simulated", "real"])
+def test_only_agentx_against_a_real_server_leaves_aiperfs_scrape_on(
+    tmp_path, agentx, server
+):
+    """aiperf scrapes the server's /metrics unless given --no-server-metrics.
+    --agentx gives it a simulated server's client alone, whose compass-harness
+    refuses the scrape, and out of the hashed arguments; base mode gives it
+    both clients, in them, as its graded runs recorded."""
+    out, env = _setup(tmp_path, server)
+    done = _client(out, *(AGENTX if agentx else GOOD), env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    argv = json.loads((tmp_path / "seen.json").read_text())[0]
+    scraped = agentx and server is REAL
+    assert argv.count("--no-server-metrics") == (0 if scraped else 1)
+    hashed = json.loads((out / "artifacts/workload.json").read_text())["aiperf_args"]
+    assert ("--no-server-metrics" in hashed) is not agentx
+
+
+def test_a_real_and_a_simulated_agentx_run_write_one_workload(tmp_path):
+    """The cell grader refuses a cell whose runs ran different workloads; a
+    real and a simulated --agentx run differ only in aiperf's scrape, which
+    changes what it writes, not what it sends."""
+    cell, runs = tmp_path / "cell", {"real1": REAL, "step_linear": SIM}
+    cell.mkdir()
+    for name, server in runs.items():
+        (tmp_path / name).mkdir()
+        out, env = _setup(tmp_path / name, server)
+        done = _client(out, *AGENTX, env=env)
+        assert done.returncode == 0, done.stdout + done.stderr
+        (cell / name).symlink_to(out)
+    # A run's run.json names no workload; client.sh's workload.json states it.
+    assert _odd_workloads(cell, {n: {} for n in runs}) == {}
+    real, simulated = ((cell / n / WORKLOAD).read_text() for n in runs)
+    assert real == simulated
 
 
 def test_both_clients_strip_payloads_and_gzip_the_raw_records_once_exported(tmp_path):
