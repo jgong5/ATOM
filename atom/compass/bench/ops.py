@@ -3216,14 +3216,13 @@ def _coverage_main(argv: list[str], atom_args: list[str]) -> dict:
     if arch not in driverless.DEVICES:
         declared = sorted(driverless.DEVICES)
         raise ValueError(f"no declared device for {arch}; declared: {declared}")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # aiter asks rocminfo for an arch at import, which the config reaches.
-        driverless._declare_arch(tmpdir, arch)
-        config = atom_config(atom_args)
-        ranks.layout(config)
-        _eager(config)
-        names = args.coverage
-        return coverage(store, args.store, config, names, records, arch, atom_args)
+    # aiter resolves its arch and fp8 dtype at import; the config holds the dtype.
+    driverless.import_aiter_on(arch)
+    config = atom_config(atom_args)
+    ranks.layout(config)
+    _eager(config)
+    names = args.coverage
+    return coverage(store, args.store, config, names, records, arch, atom_args)
 
 
 def _eager(config) -> None:
