@@ -100,14 +100,37 @@ def test_a_block_drafter_s_block_routes_its_sequences_drafts_each():
     )
 
 
+@pytest.mark.parametrize(
+    "rows",
+    [((2, 2, False),), ((2, 2, False), (4, 90, True))],
+    ids=["prompt", "prompt_and_decode"],
+)
+def test_a_block_drafter_prices_a_sampling_row_shorter_than_its_block(rows):
+    # A finishing prompt of 2 tokens under a block of 3: the block runs 3
+    # rows for it, as for every sequence the step samples.
+    view = BatchView(tuple(RequestShape(*r) for r in rows), produces_output=True)
+    block = 3 * len(rows)
+    cost = backend({"seq": [moe(block) for _ in range(3)]}, drafts=3, block=True)
+
+    assert by_name(cost.price(view))[MOE] == pytest.approx(
+        ran(*[(moe(block), tokens(len(rows), 3))] * 3)
+    )
+
+
 #: Two passes of one region, a repeat: its leaf runs in both.
 SHARED = {"repeat": moe(9), "count": 2, "index": "l0", "start": 0, "step": 1}
+#: Two passes whose experts run as different kinds.
+UNLIKE = [moe(9), moe(4) | {"op": "aiter.rocm_aiter_fused_moe.default"}]
 
 
 @pytest.mark.parametrize(
     "drafter, count",
-    [({"seq": [moe(9), moe(4), moe(4)]}, 3), (SHARED, 2)],
-    ids=["uneven", "shared"],
+    [
+        ({"seq": [moe(9), moe(4), moe(4)]}, 3),
+        ({"seq": UNLIKE}, 2),
+        (SHARED, 2),
+    ],
+    ids=["uneven", "unlike", "shared"],
 )
 def test_an_mtp_drafter_whose_passes_its_graph_does_not_tell_apart_is_refused(
     drafter, count

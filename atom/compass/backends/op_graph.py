@@ -465,20 +465,31 @@ class OpGraphBackend(CostBackend):
         runs, on one rank on a step that samples: a block drafter's every one,
         its block `drafts` tokens a row; an MTP drafter's after its first
         pass, a token a row. Each of its `drafts` passes runs its model once,
-        so its routed leaves in run order fall into `drafts` runs alike, the
-        first its first pass's; one whose do not, or whose runs share a leaf,
-        is refused."""
+        so its routed leaves in run order fall into `drafts` runs of the same
+        kinds, the first its first pass's; one whose do not, or whose runs
+        share a leaf, is refused. A routed leaf reads only a row's queries, so
+        a row shorter than its pass's queries keeps that many tokens of
+        context."""
         leaves = [leaf for leaf in _run(region) if leaf["op"] in ROUTED]
-        first, odd = (0, 0) if self.block else divmod(len(leaves), self.drafts)
+        first = 0 if self.block else len(leaves) // self.drafts
         later = {id(leaf): leaf for leaf in leaves[first:]}
-        if odd or any(id(leaf) in later for leaf in leaves[:first]):
+        kinds = [leaf["op"] for leaf in leaves]
+        if not self.block and (
+            kinds != kinds[:first] * self.drafts
+            or any(id(leaf) in later for leaf in leaves[:first])
+        ):
             reason = (
                 f"an MTP drafter's graph whose {len(leaves)} routed leaves do "
                 f"not run as its {self.drafts} passes alike, each its own"
             )
             raise CostRefused(view, [Refusal(SOURCE, reason)])
         tokens = self.drafts if self.block else 1
-        rows = tuple(replace(r, query_tokens=tokens) for r in view.requests)
+        rows = tuple(
+            replace(
+                r, query_tokens=tokens, context_tokens=max(r.context_tokens, tokens)
+            )
+            for r in view.requests
+        )
         return dict.fromkeys(later, replace(view, requests=rows))
 
     def _bound(self, view: BatchView, draft: bool = False) -> tuple:
