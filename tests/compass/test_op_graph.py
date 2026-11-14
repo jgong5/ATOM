@@ -1250,7 +1250,8 @@ def _published(tmp_path, root=None):
 
     source = atom_source(root)
     machine = _machine({"machine": DOCUMENT})
-    conditions = readings(machine, atom_src=source, model="m", engine_config="{}")
+    platform = machine_platform(machine)
+    conditions = readings(platform, atom_src=source, model="m", engine_config="{}")
     key = Key.of(
         Kind.PRICE_LIST,
         model="sha256:" + "0" * 64,

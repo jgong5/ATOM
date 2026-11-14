@@ -141,7 +141,7 @@ def runs(tmp_path_factory):
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("AITER_LOG_LEVEL", "WARNING")  # the readings are keyed by it
         cli.main(
-            ["measure", "memory", "--machine", str(machine)]
+            ["measure", "memory"]
             + ["--gpu", os.environ.get("HIP_VISIBLE_DEVICES", "0")]
             + ["--store", str(root / "store"), "--out", str(root / "measure")]
             + ["--", *ARGS]

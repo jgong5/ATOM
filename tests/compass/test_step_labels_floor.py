@@ -11,13 +11,14 @@ import json
 import pathlib
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_bench_ops import _graph, _leaf, _t, _timed
 from test_bench_ops_drafter import DRAFTING
 from test_bench_ops_plan import _graph_at
 from test_fit_ops import LAYOUT, _point, measured  # noqa: F401  a fixture
-from test_fit_samples import DEVICE, SOURCE
+from test_fit_samples import DEVICE, SOURCE, edit
 from test_fit_steps import HOST, LINEAR, clients, planted_roots, record  # noqa: F401
 from test_memory_readings import DOCUMENT, STACK
 from test_parity_recurrence import MS, line
@@ -233,9 +234,8 @@ def _fit_traced(tmp_path, ops_dir):
     a, lines = _traced_record(tmp_path / "a", 19)
     b = _drafted(tmp_path / "b", 20)[0]
     floored = DOCUMENT | {"device": DOCUMENT["device"] | {"profiler_floor_s": FLOOR}}
-    machine = tmp_path / "spec.json"
-    machine.write_text(json.dumps(floored))
-    tail = ["--machine", machine, "--store", tmp_path / "store"]
+    platforms.flags(tmp_path / "store", floored, tmp_path)
+    tail = ["--store", tmp_path / "store"]
     tail += ["--out", tmp_path / "o", "--ops", ops_dir]
     cli.main(list(map(str, ["fit", "steps", *LINEAR, a, b, *clients(a, b), *tail])))
     return lines
@@ -304,24 +304,35 @@ def test_the_probe_reads_the_profiler_s_floor_and_a_record_before_it_has_none():
 
 
 def _fit_with_ops(tmp_path, spec, ops_dir):
-    """`compass fit steps` of one planted record under `spec`, taking its
-    drafter kernels' own lengths from `ops_dir`."""
+    """`compass fit steps` of one planted record, `spec`'s readings in the
+    store, taking its drafter kernels' own lengths from `ops_dir`."""
     a = record(tmp_path / "a", 19)
-    machine = tmp_path / "spec.json"
-    machine.write_text(json.dumps(spec))
-    tail = ["--machine", machine, "--store", tmp_path / "store"]
+    platforms.flags(tmp_path / "store", spec, tmp_path)
+    tail = ["--store", tmp_path / "store"]
     tail += ["--out", tmp_path / "o"]
     argv = ["fit", "steps", *LINEAR, a, *clients(a), "--ops", ops_dir, *tail]
     cli.main(list(map(str, argv)))
 
 
-def test_fit_steps_ops_needs_the_profiler_s_floor_its_spec_states(
+def test_fit_steps_ops_needs_the_profiler_s_floor_its_readings_state(
     tmp_path, measured  # noqa: F811
 ):
     ops_dir, _ = measured("ops", [_point(2, 10.0)])
 
-    with pytest.raises(SystemExit, match="profiler_floor_s` is declared .* no value"):
+    with pytest.raises(SystemExit, match="states no device.profiler_floor_s"):
         _fit_with_ops(tmp_path, DOCUMENT, ops_dir)
+
+
+def test_fit_steps_ops_on_records_with_no_ptl_state_asks_for_ptl(
+    tmp_path, measured  # noqa: F811
+):
+    ops_dir, _ = measured("ops", [_point(2, 10.0)])
+    a = record(tmp_path / "a", 19)
+    edit(a / "run.json", lambda r: r.pop("ptl"))
+    tail = ["--ops", ops_dir, "--store", tmp_path / "store", "--out", tmp_path / "o"]
+
+    with pytest.raises(SystemExit, match="the records carry no PTL state; --ptl"):
+        cli.main(list(map(str, ["fit", "steps", *LINEAR, a, *clients(a), *tail])))
 
 
 def test_fit_steps_ops_refuses_points_another_configuration_ran(

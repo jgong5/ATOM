@@ -58,6 +58,7 @@ from atom.compass.artifacts import (
     keyed_platform,
     machine_platform,
     member_name,
+    platform_of,
 )
 from atom.compass.drive import aiter_jit, gpu, jit_cache, measure_memory, serve
 from atom.compass.drive.gpu import GpuRefusal
@@ -68,6 +69,7 @@ from atom.compass.run import memory
 from atom.compass.spec import MachineSpec, SpecRefusal
 
 MACHINE = MachineSpec.from_mapping(copy.deepcopy(DOCUMENT))
+PLATFORM = machine_platform(MACHINE)
 #: One TP2 rank's readings beside `READINGS[2]`: a rank need not read as another.
 RANK1 = dict(READINGS[2], persistent_forward_buffer_bytes=125_000_000)
 #: GPU 5 as rocm-smi names it on the suite's machine document's device.
@@ -103,7 +105,7 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
     r = tp2(tmp_path)
     record = started(tmp_path / "out", r.config, [READINGS[2], RANK1])
 
-    measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c")
+    measure_memory.publish(tmp_path / "out", PLATFORM, tmp_path / "store", "c")
 
     for rank, held in enumerate([READINGS[2], RANK1]):
         read = memory.load(tmp_path / "store", r.config, MACHINE, rank)
@@ -168,9 +170,7 @@ def a_start(tmp_path, monkeypatch, stack):
     monkeypatch.setattr(measure_memory, "hip_visible", {(5,): "2"}.get)
     monkeypatch.setattr(measure_memory, "_stack", lambda: stack)
     monkeypatch.setattr(measure_memory, "identity", lambda *a: {"stack": stack})
-    machine = tmp_path / "machine.json"
-    machine.write_text(json.dumps(DOCUMENT))
-    flags = ["--gpu", "5", "--machine", str(machine), "--store", str(tmp_path / "s")]
+    flags = ["--gpu", "5", "--store", str(tmp_path / "s")]
     return r, [*flags, "--out", str(out), "--", "--model", r.config.model]
 
 
@@ -234,7 +234,7 @@ def test_a_start_at_dp_and_tp_above_1_logs_each_line_s_process(
         runners_logged(tmp_path / "out" / measure_memory.LOG, tmp_path / "cache")
 
 
-def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypatch):
+def test_the_command_publishes_under_the_stack_its_start_runs(tmp_path, monkeypatch):
     r, argv = a_start(tmp_path, monkeypatch, STACK)
 
     measure_memory.main(argv)
@@ -253,25 +253,11 @@ def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypat
     assert json.loads((tmp_path / "out" / "run.json").read_text()) == {"stack": STACK}
 
 
-@pytest.mark.parametrize(
-    "gpus, asked, cards",
-    [
-        ("5", (5,), [dict(MI355X, name="MI308X", arch="gfx942")]),
-        (
-            "4,5",
-            (4, 5),
-            [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")],
-        ),
-    ],
-)
-def test_a_start_on_another_device_than_the_spec_states_refuses_naming_both(
-    tmp_path, monkeypatch, gpus, asked, cards
-):
+def test_a_start_on_cards_of_two_devices_refuses_naming_both(tmp_path, monkeypatch):
     # Only the GPUs `--gpu` names have cards; asking about any others raises.
-    monkeypatch.setattr(measure_memory, "_device", {asked: cards}.__getitem__)
-    machine = tmp_path / "machine.json"
-    machine.write_text(json.dumps(DOCUMENT))
-    flags = ["--gpu", gpus, "--machine", str(machine), "--store", str(tmp_path / "s")]
+    cards = [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")]
+    monkeypatch.setattr(measure_memory, "_device", {(4, 5): cards}.__getitem__)
+    flags = ["--gpu", "4,5", "--store", str(tmp_path / "s")]
 
     with pytest.raises(ValueError) as refused:
         measure_memory.main(
@@ -279,28 +265,29 @@ def test_a_start_on_another_device_than_the_spec_states_refuses_naming_both(
         )
 
     assert str(refused.value) == (
-        f"GPU 5 is MI308X gfx942, and {machine} states MI355X gfx950; "
-        "name the machine spec of the device the start runs on"
+        "the cards are MI308X gfx942 and MI355X gfx950; start on one device"
     )
     assert not (tmp_path / "out").exists() and not (tmp_path / "s").exists()
 
 
-def test_a_start_under_another_stack_than_the_spec_pins_refuses_before_it_starts(
+def test_a_start_publishes_under_the_device_ptl_and_stack_its_cards_read(
     tmp_path, monkeypatch
 ):
     other = dict(STACK, aiter="9205e1059", torch="2.9.1")
-    _, argv = a_start(tmp_path, monkeypatch, other)
+    r, argv = a_start(tmp_path, monkeypatch, other)
+    mi308x = dict(MI355X, name="MI308X", arch="gfx942")
+    monkeypatch.setattr(measure_memory, "_device", lambda gpus: [mi308x])
+    monkeypatch.setattr(measure_memory, "_ptl", lambda gpus: "enabled")
 
-    with pytest.raises(ValueError) as refused:
-        measure_memory.main(argv)
+    measure_memory.main(argv)
 
-    assert str(refused.value) == (
-        "the start runs another stack than the machine spec mi355x-8gpu-2node "
-        "pins: aiter '9205e1059' in the start and 'f4e7c7509' in the spec; "
-        "torch '2.9.1' in the start and '2.10.0' in the spec"
+    platform = platform_of("MI308X gfx942", other, "enabled")
+    key = Key.of(
+        Kind.MEMORY_READINGS,
+        **keyed_platform(Kind.MEMORY_READINGS, platform),
+        **memory.key_fields(r.config),
     )
-    assert not (tmp_path / "hip").exists(), "the engine started"
-    assert not (tmp_path / "out").exists() and not (tmp_path / "s").exists()
+    assert ArtifactStore(tmp_path / "s").directory_for(key).is_dir()
 
 
 def test_the_engine_session_starts_the_command_beside_before_the_engine(
@@ -780,7 +767,7 @@ def test_ranks_whose_reserves_spread_past_the_limit_publish_nothing(tmp_path):
     started(tmp_path / "out", r.config, [READINGS[2], crowded])
 
     with pytest.raises(SpecRefusal, match="spread"):
-        measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c")
+        measure_memory.publish(tmp_path / "out", PLATFORM, tmp_path / "store", "c")
     assert not (tmp_path / "store").exists()
 
 
@@ -793,7 +780,7 @@ def test_ranks_that_read_two_configurations_publish_nothing(tmp_path):
     one.write_text(json.dumps(held))
 
     with pytest.raises(ValueError, match="the ranks read 2 keys"):
-        measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c")
+        measure_memory.publish(tmp_path / "out", PLATFORM, tmp_path / "store", "c")
 
 
 def test_a_key_stating_another_layout_than_its_members_publishes_nothing(tmp_path):
@@ -829,7 +816,7 @@ def test_a_key_stating_another_layout_than_its_members_publishes_nothing(tmp_pat
     "flag", ["--load_dummy", "--load-dummy=random", "--load_d", "--load-dum"]
 )
 def test_dummy_weights_are_refused(tmp_path, flag, capsys):
-    argv = ["measure", "memory", "--gpu", "0", "--machine", "m", "--store", "s"]
+    argv = ["measure", "memory", "--gpu", "0", "--store", "s"]
     with pytest.raises(SystemExit) as refused:
         cli.main([*argv, "--out", str(tmp_path), "--", "--model", "x", flag])
     assert "dummy weights are not yet shown to read as a real load" in str(

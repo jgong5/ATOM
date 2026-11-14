@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
-"""The platform `compass fit`'s records ran on, against the machine spec its
-`--machine` names: run.json states the device and the stack as the spec does,
+"""The platform `compass fit`'s records ran on, which keys what it fits:
+run.json states the device and the stack as a spec of that platform pins them,
 so a law fitted from a record of that platform loads under a run's readings of
-the spec, and records from another device, stack or torch refuse at the fit.
+the spec, and records from another device, stack or torch key another.
 
 The records are `test_fit_steps.py`'s. The first test's run.json is what
 `drive.identity` writes in compass-next:nightly-20261013 on hjbog-srdc-18's
@@ -13,7 +13,6 @@ can have; its law loads under `test_run_step_grid.py`'s deployment.
 
 import json
 import os
-import re
 from pathlib import Path
 
 import pytest
@@ -95,7 +94,7 @@ def test_a_law_fitted_from_identity_s_record_loads_under_the_spec_it_ran_on(
     (a / "run.json").write_text(json.dumps(run))
     path, n39 = spec("mi308x-hjbog39")
     store, out = tmp_path / "store", tmp_path / "out"
-    flags = [a, *clients(a), "--machine", path, "--store", store, "--out", out]
+    flags = [a, *clients(a), "--store", store, "--out", out]
     cli.main(["fit", "steps", "--backend", "step-linear", *map(str, flags)])
     copy = json.loads((out / "step_linear_law.json").read_text())
     law = Key.of(Kind.STEP_LINEAR_LAW, **copy["key"])
@@ -113,38 +112,33 @@ def test_a_law_fitted_from_identity_s_record_loads_under_the_spec_it_ran_on(
     assert "aiter f4e7c7509" in str(refused.value)
 
 
-@pytest.mark.parametrize("command", ["fit steps --backend step-linear", "fit host"])
 @pytest.mark.parametrize(
-    "change, named",
+    "command, kind",
+    [("fit steps --backend step-linear", "step_linear_law"), ("fit host", "host_laws")],
+)
+@pytest.mark.parametrize(
+    "change, field, value",
     [
-        (
-            lambda r: r["device"][0].update(name="MI300X"),
-            "device 'MI300X gfx950' in the records and 'MI355X gfx950'",
-        ),
+        (lambda r: r["device"][0].update(name="MI300X"), "device", "MI300X gfx950"),
         (
             lambda r: r["stack"].update(aiter="9205e1059"),
-            (
-                "software_stack 'rocm 7.2.4 / aiter 9205e1059 / rccl 2.22.3' in the "
-                "records and 'rocm 7.2.4 / aiter f4e7c7509 / rccl 2.22.3'"
-            ),
+            "software_stack",
+            "rocm 7.2.4 / aiter 9205e1059 / rccl 2.22.3",
         ),
-        (
-            lambda r: r["stack"].update(torch="2.9.0"),
-            "torch '2.9.0' in the records and '2.10.0'",
-        ),
+        (lambda r: r["stack"].update(torch="2.9.0"), "torch", "2.9.0"),
     ],
     ids=["device", "aiter", "torch"],
 )
-def test_records_from_another_platform_than_the_spec_refuse_naming_it(
-    tmp_path, command, change, named
+def test_a_fit_keys_the_platform_its_records_ran_on(
+    tmp_path, command, kind, change, field, value
 ):
     a = record(tmp_path / "a", 19)
     edit(a / "run.json", change)
 
-    in_spec = f"{named} in {tmp_path / 'spec.json'}"
-    with pytest.raises(SystemExit, match=re.escape(in_spec)):
-        fit(tmp_path, command, a, *clients(a))
-    assert not (tmp_path / "store").exists()
+    fit(tmp_path, command, a, *clients(a))
+
+    copy = json.loads((tmp_path / "out" / f"{kind}.json").read_text())
+    assert copy["key"][field] == value
 
 
 def test_the_readings_are_the_spec_s_whatever_order_run_json_lists_the_stack(

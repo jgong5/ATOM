@@ -16,6 +16,7 @@ import math
 import threading
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from huggingface_hub import constants
 from test_artifact_invalidation import STANZA
@@ -94,12 +95,12 @@ def step_linear(tmp_path, r):
     return published(tmp_path, r, Kind.STEP_LINEAR_LAW, key, law())
 
 
-def build(tmp_path, *flags, atom=(), machine=DOCUMENT):
-    """The run file of `flags`, with the suite's machine and the store."""
-    (tmp_path / "machine.json").write_text(json.dumps(machine))
+def build(tmp_path, *flags, atom=(), machine=DOCUMENT, platform=None):
+    """The run file of `flags`, with the suite's machine, or the `platform`
+    flags, and the store."""
     parser = argparse.ArgumentParser()
     runfile.add_arguments(parser)
-    common = ["--machine", str(tmp_path / "machine.json")]
+    common = platform or platforms.flags(tmp_path / "store", machine, tmp_path)
     args = parser.parse_args([*common, "--store", str(tmp_path / "store"), *flags])
     return runfile.build(args, ["--model", str(tmp_path), *atom])
 
@@ -225,25 +226,28 @@ def test_a_step_stub_file_is_stated_with_its_digest(monkeypatch, tmp_path):
     assert run["backend"] == {"digest": digest, "provenance": None}
 
 
-MACHINE_AND_STORE = ["--machine", "m", "--store", "s"]
+PLATFORM_AND_STORE = ["--device", "d", "--ptl", "disabled", "--store", "s"]
 
 
 @pytest.mark.parametrize(
     "flags,named",
     [
         (
-            MACHINE_AND_STORE,
+            PLATFORM_AND_STORE,
             "one of the arguments --step-stub --step-linear --step-grid",
         ),
-        ([*MACHINE_AND_STORE, "--step-grid", "a", "--step-linear", "b"], "not allowed"),
+        (
+            [*PLATFORM_AND_STORE, "--step-grid", "a", "--step-linear", "b"],
+            "not allowed",
+        ),
         (
             ["--step-grid", "a"],
-            "the following arguments are required: --machine, --store",
+            "the following arguments are required: --device, --ptl, --store",
         ),
     ],
-    ids=["no-backend", "two-backends", "no-machine-or-store"],
+    ids=["no-backend", "two-backends", "no-platform-or-store"],
 )
-def test_the_flags_refuse_without_one_backend_a_machine_and_a_store(
+def test_the_flags_refuse_without_one_backend_a_platform_and_a_store(
     capsys, flags, named
 ):
     parser = argparse.ArgumentParser()
@@ -321,9 +325,11 @@ def test_a_run_file_without_the_key_gives_grants_their_ceilings(
     assert all((r.ceiling is not None) is ceilings for _, _, r in replies)
 
 
-def test_a_machine_file_that_is_no_spec_refuses_before_any_entry_is_read(tmp_path):
+def test_a_datasheet_that_is_no_datasheet_refuses_before_any_entry_is_read(tmp_path):
+    (tmp_path / "sheet.json").write_text(json.dumps({"device": {}}))
+    platform = ["--device", str(tmp_path / "sheet.json"), "--ptl", "disabled"]
     with pytest.raises(SpecRefusal):
-        build(tmp_path, "--step-grid", "0123456789ab", machine={"device": {}})
+        build(tmp_path, "--step-grid", "0123456789ab", platform=platform)
 
 
 def test_padding_none_prices_real_rows_under_the_step_roofline(monkeypatch, tmp_path):
@@ -472,10 +478,10 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
 ):
     stub = tmp_path / "stub.json"
     stub.write_text(json.dumps(dataclasses.asdict(Coefficients())))
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     parser = argparse.ArgumentParser()
     runfile.add_arguments(parser)
-    flags = ["--step-stub", str(stub), "--machine", str(tmp_path / "machine.json")]
+    flags = ["--step-stub", str(stub), *platforms.network(DOCUMENT, tmp_path)]
+    flags += platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
     args = parser.parse_args([*flags, "--store", str(tmp_path / "store")])
     model = ["--model", str(tmp_path)]
 
@@ -485,7 +491,7 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
 
     assert "data_parallel_size" not in run
     assert compass_run._widths(run) == (2, 1)
-    assert run["router_s"] == DOCUMENT["interconnect"]["router_relay_s"]
+    assert run["router_s"] == runfile.ROUTER_RELAY_S
     assert run["kv_link"] == "inter_node"
     table = compass_run.channel_table(run)
     lps = {lp.name for lp in table.registry.ids()}
@@ -570,10 +576,9 @@ def test_a_prefill_decode_op_graph_whose_sides_name_two_price_lists_refuses(
 ):
     r = deployment(tmp_path)
     published(tmp_path, r, Kind.PRICE_LIST, price_list_key(tmp_path), {})
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     parser = argparse.ArgumentParser()
     runfile.add_arguments(parser)
-    flags = ["--op-graph", "--machine", str(tmp_path / "machine.json")]
+    flags = ["--op-graph", *platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)]
     args = parser.parse_args([*flags, "--store", str(tmp_path / "store")])
     model = ["--model", str(tmp_path)]
 

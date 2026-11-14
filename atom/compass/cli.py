@@ -62,8 +62,8 @@ COMMANDS = {
 }
 OPS = "the op-level half of the toolchain is not built yet"
 MACHINE = (
-    "machine specs are maintained by developers, one per supported machine; "
-    "pass one with --machine"
+    "compass measure device and compass fit device publish a platform's readings, "
+    "and the commands that price name it with --device and --ptl"
 )
 #: Each command that refuses, to why and where its work is.
 REFUSED = {

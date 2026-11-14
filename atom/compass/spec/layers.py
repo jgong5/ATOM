@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """The layers a person writes: a device datasheet per SKU, and a network file
-per scale-out network.
+per scale-out network; and `composed`, the one machine spec a command reads
+from a datasheet, a `platform_readings` entry's document and, across nodes, a
+network file.
 
 Each is a document holding its own layer's fields at their machine-spec paths,
 under the header every spec document has. A field of another layer is refused
@@ -8,6 +10,15 @@ by name, as is a value whose origin the document does not record, and a
 document with no notes to say where its values came from. A datasheet is named
 by its file's stem under `atom/compass/devices/`, a network file by its stem
 under `atom/compass/networks/`, or either by path.
+
+`composed` takes the datasheet's fields as they stand and the readings
+entry's as follows: a measured entry's rate over the datasheet peak it attains is
+that peak's derate, an assumed entry's ratio is the derate as it stands, and
+the bandwidth curve is a measured entry's as it stands, or an assumed entry's
+ratio curve times the datasheet's bandwidth; the memory derate is the curve's
+largest point over that bandwidth. A peak the entry gives no derate for is
+left out. The entry's key states the stack, torch and PTL state; the spec
+pins them, so a reader keys what it priced on by the spec it read.
 """
 
 import json
@@ -16,8 +27,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .fields import BY_PATH, check
+from .fields import BAND, BY_PATH, SCHEMA, check
 from .machine import (
+    MachineSpec,
     _check_domain,
     _stated,
     _survey,
@@ -28,6 +40,28 @@ from .machine import (
 from .rules import Rule, SpecRefusal
 
 ROOT = Path(__file__).resolve().parents[1]
+FORMATS = ("bf16", "fp8", "fp4")
+CURVE = "device.memory.bandwidth_curve"
+BANDWIDTH = "device.memory.bandwidth_bytes_per_s"
+#: Each rate a measured entry holds, to the datasheet peak it attains and the
+#: derate it composes into, which an assumed entry holds in its place.
+RATES = {
+    **{
+        f"device.compute.attainable_flops.{f}": (
+            f"device.compute.{f}_flops",
+            f"device.compute.derate.{f}",
+        )
+        for f in FORMATS
+    },
+    "interconnect.intra_node.attainable_bandwidth_bytes_per_s": (
+        "interconnect.intra_node.link_bandwidth_bytes_per_s",
+        "interconnect.intra_node.derate",
+    ),
+}
+#: An assumed entry's bandwidth curve, over its source's datasheet bandwidth.
+RATIO_CURVE = "device.memory.bandwidth_derate_curve"
+#: What a readings document states about itself.
+READINGS_HEADER = ("schema_version", "name", "provenance")
 #: What every layer document states about itself.
 HEADER = (
     "schema_version",
@@ -123,3 +157,66 @@ def _read(kind: str, fields: tuple, directory: Path, name_or_path) -> Layer:
     own = {f: values[f] for f in fields if f in values}
     origins = {f: field_origin(values, f, holder) for f in own}
     return Layer(values["name"], values["provenance.notes"], own, origins)
+
+
+def stack_of(fields: Mapping) -> str:
+    """The stack and torch a key's `fields` state, as `--stack` names them."""
+    return f"{fields['software_stack']} / torch {fields['torch']}"
+
+
+def composed(
+    sheet: Layer, key: Any, document: Mapping, net: Layer | None = None
+) -> MachineSpec:
+    """The machine spec of the datasheet `sheet`, the readings entry at `key`,
+    an artifact store's `Key`, whose document is `document`, and the network
+    file `net`."""
+    stated = document["provenance"]["origins"]
+    values, origins = dict(sheet.values), dict(sheet.origins)
+    for path, value in document.items():
+        if path in READINGS_HEADER:
+            continue
+        origin = stated[path]
+        if path in RATES:
+            peak, path = RATES[path]
+            if peak not in sheet.values:
+                continue
+            value = value / sheet.values[peak]
+            origin = {
+                k: v / sheet.values[peak] if k in BAND else v for k, v in origin.items()
+            }
+        elif path == RATIO_CURVE:
+            path = CURVE
+            value = [[size, r * sheet.values[BANDWIDTH]] for size, r in value]
+        elif BY_PATH[path].of and BY_PATH[path].of not in sheet.values:
+            continue  # an assumed derate of a peak this datasheet omits
+        values[path], origins[path] = value, origin
+    if CURVE in values:
+        values["device.memory.derate"] = values[CURVE][-1][1] / values[BANDWIDTH]
+        origins["device.memory.derate"] = origins[CURVE]
+    for field in SCHEMA:
+        if field.of and field.path not in values:
+            values.pop(field.of, None)
+            origins.pop(field.of, None)
+    pinned = dict(p.split(" ", 1) for p in key.values["software_stack"].split(" / "))
+    entry = {"origin": document["provenance"]["origin"]}
+    for component, version in (pinned | {"torch": key.values["torch"]}).items():
+        values[f"device.software_pinned_to.{component}"] = version
+        origins[f"device.software_pinned_to.{component}"] = entry
+    values["device.ptl"], origins["device.ptl"] = key.values["ptl"], entry
+    notes = (
+        f"composed from the device datasheet {sheet.name} and {key} as {key.token()}"
+    )
+    if net is not None:
+        values |= net.values
+        origins |= net.origins
+        notes += f", across nodes on the network file {net.name}"
+    values |= {
+        "schema_version": 1,
+        "name": f"{sheet.name} at {key.token()}",
+        "provenance.authored_by": "compass",
+        "provenance.date": document["provenance"]["date"],
+        "provenance.origin": "mixed",
+        "provenance.origins": origins,
+        "provenance.notes": notes,
+    }
+    return MachineSpec.from_mapping(MachineSpec(values).echo())

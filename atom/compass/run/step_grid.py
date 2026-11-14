@@ -279,24 +279,20 @@ def conditions(config, machine) -> Conditions:
     from atom.compass.run import _file_digest, atom_source
 
     return readings(
-        machine,
+        machine_platform(machine),
         atom_src=atom_source(),
         model=_file_digest(config.model, "config.json"),
         engine_config=json.dumps(keyed(config), sort_keys=True),
     )
 
 
-def readings(machine, **inputs) -> Conditions:
-    """The readings a run on `machine` takes: the platform the spec states, and
-    this host's CPU; `inputs` state the ATOM source, the model and the engine
-    config."""
+def readings(platform: Mapping, **inputs) -> Conditions:
+    """The readings a run on `platform` takes, the device, stack, PTL state
+    and torch a spec or a run's inputs state, with this host's CPU; `inputs`
+    state the ATOM source, the model and the engine config."""
     from atom.compass.run import host_cpu
 
-    return Conditions.of(
-        **machine_platform(machine),
-        host_cpu=host_cpu(),
-        **inputs,
-    )
+    return Conditions.of(**platform, host_cpu=host_cpu(), **inputs)
 
 
 def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:

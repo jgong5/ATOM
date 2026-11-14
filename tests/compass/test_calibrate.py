@@ -101,7 +101,6 @@ def _calibrate(tmp_path, *records, **env):
         "LOG": str(log),
         "GPU": "7",
         "MODEL": str(tmp_path / "m"),
-        "MACHINE": str(tmp_path / "spec.json"),
         "TRACES": "/cc/traces.jsonl",
         "AIPERF_PYTHON": "/real/python",
         **env,
@@ -124,7 +123,7 @@ def test_the_steps_run_in_order_and_print_the_tokens_and_the_run_line(tmp_path):
     r, log = _calibrate(tmp_path, "1", FIRST_TURN)
     assert r.returncode == 0, r.stderr
     o, client = tmp_path / "o", "--duration 1800 --stop /real/python"
-    machine = f"--machine {tmp_path}/spec.json --store {o}/store"
+    store = f"--store {o}/store"
     cal = f"{o}/cal1-c1 {o}/cal2-c8"
     runs = " ".join(
         f"--client-run {o}/{d} {o}/{d}/artifacts/client_run.json"
@@ -133,13 +132,13 @@ def test_the_steps_run_in_order_and_print_the_tokens_and_the_run_line(tmp_path):
     assert log == [
         f"record --gpu 7 --out {o}/warm",
         f"client {o}/warm --traces 0-7 --concurrency 1 --duration 600 --stop /real/python []",
-        f"measure memory --gpu 7 {machine} --out {o}/memory",
+        f"measure memory --gpu 7 {store} --out {o}/memory",
         f"record --gpu 7 --out {o}/cal1-c1",
         f"client {o}/cal1-c1 --traces 256-392 --concurrency 1 {client} []",
         f"record --gpu 7 --out {o}/cal2-c8",
         f"client {o}/cal2-c8 --traces 256-392 --concurrency 8 {client} [{FIRST_TURN[2:]}]",
-        f"fit steps --backend step-linear --form history --model {tmp_path}/m {cal} {runs} {machine} --out {o}/fit_steps",
-        f"fit host {cal} {runs} {machine} --out {o}/fit_host",
+        f"fit steps --backend step-linear --form history --model {tmp_path}/m {cal} {runs} {store} --out {o}/fit_steps",
+        f"fit host {cal} {runs} {store} --out {o}/fit_host",
     ]
     assert (
         "memory_readings tok-memory, step_linear_law tok-steps, host_laws tok-host"
@@ -147,7 +146,8 @@ def test_the_steps_run_in_order_and_print_the_tokens_and_the_run_line(tmp_path):
     )
     assert "decode rung 1 | 9 | -1.2% | +0.1% | +2.0%" in r.stdout
     compass = tmp_path / "ATOM" / "scripts" / "compass" / "compass"
-    run = f"{compass} run --step-linear tok-steps --host-laws tok-host {machine} --out DIR"
+    run = f"{compass} run --step-linear tok-steps --host-laws tok-host"
+    run += f" --device DATASHEET --ptl PTL {store} --out DIR"
     assert f"{run} -- --model {tmp_path}/m --max-model-len 262144" in r.stdout
 
 
@@ -219,7 +219,7 @@ def test_trace_runs_go_to_fit_steps_alone(tmp_path):
     r, log = _calibrate(tmp_path, "1", "trace 16", "trace 4")
     assert r.returncode == 0, r.stderr
     o, client = tmp_path / "o", "--stop /real/python []"
-    machine = f"--machine {tmp_path}/spec.json --store {o}/store"
+    store = f"--store {o}/store"
     dirs = ("cal1-c1", "trace2-c16", "trace3-c4")
     runs = [f"--client-run {o}/{d} {o}/{d}/artifacts/client_run.json" for d in dirs]
     inputs = " ".join([*(f"{o}/{d}" for d in dirs), *runs])
@@ -230,8 +230,8 @@ def test_trace_runs_go_to_fit_steps_alone(tmp_path):
         f"client {o}/trace2-c16 --traces 256-392 --concurrency 16 --duration 120 {client}",
         f"record --gpu 7 --trace --out {o}/trace3-c4",
         f"client {o}/trace3-c4 --traces 256-392 --concurrency 4 --duration 120 {client}",
-        f"fit steps --backend step-linear --form history --model {tmp_path}/m {inputs} {machine} --out {o}/fit_steps",
-        f"fit host {o}/cal1-c1 {runs[0]} {machine} --out {o}/fit_host",
+        f"fit steps --backend step-linear --form history --model {tmp_path}/m {inputs} {store} --out {o}/fit_steps",
+        f"fit host {o}/cal1-c1 {runs[0]} {store} --out {o}/fit_host",
     ]
 
 
