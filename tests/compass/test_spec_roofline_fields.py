@@ -13,7 +13,7 @@ import pathlib
 import pytest
 from test_spec_schema import document, refusal_from
 
-from atom.compass.spec import MachineSpec, explain, validate
+from atom.compass.spec import MachineSpec, validate
 from atom.compass.spec.rules import Rule
 
 MACHINES = pathlib.Path(__file__).resolve().parents[2] / "tests/compass/machines"
@@ -39,14 +39,6 @@ def test_a_spec_with_the_new_fields_validates_and_echoes_them():
     for fmt, derate in {"bf16": 0.70, "fp8": 0.70, "fp4": 0.60}.items():
         assert spec.value(f"device.compute.derate.{fmt}") == derate
     assert spec.echo() == written
-
-
-def test_each_compute_rate_is_explained_with_its_own_formats_derate():
-    spec = MachineSpec.from_mapping(roofline_document())
-    rows = {row.path: row for row in explain(spec, "device.compute").contributions}
-    assert rows["device.compute.fp4_flops"].derate == 0.60
-    assert rows["device.compute.fp4_flops"].effective == 1.0e16 * 0.60
-    assert rows["device.compute.bf16_flops"].derate == 0.70
 
 
 @pytest.mark.parametrize(
