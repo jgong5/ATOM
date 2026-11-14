@@ -679,11 +679,12 @@ def _picker(k):
     return picker
 
 
-def _v41_index(monkeypatch, visible, leaves, shape, context):
+def _v41_index(monkeypatch, visible, leaves, shape, context, fp4=False):
     """Each of `leaves`' first call at `shape` and `context` on V4.1's FP8
-    plane, a PAGE of 32 tokens 4 index blocks at ratio 1, under a pick of 4
-    candidate blocks, its step's rows seeing `visible` on blocks 3, 1 and 0, 2;
-    ATOM's cache binds its tables by its kernels' torch twins."""
+    plane, or its FP4 one, a PAGE of 32 tokens 4 index blocks at ratio 1,
+    under a pick of 4 candidate blocks, its step's rows seeing `visible` on
+    blocks 3, 1 and 0, 2; ATOM's cache binds its tables by its kernels' torch
+    twins."""
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
         V41PoolGeometry,
     )
@@ -702,6 +703,10 @@ def _v41_index(monkeypatch, visible, leaves, shape, context):
     runner = _Runner()
     runner.model.append(_picker(4))
     geometry = V41PoolGeometry(1, ((0, 1),), 32, 4, 512, 32, layer_ratios=(1,))
+    if fp4:  # whole 128-dim K tiles on 8-row pages
+        geometry = dataclasses.replace(
+            geometry, index_dim=128, index_block_rows=8, index_fp4=True
+        )
     runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
     runner.forward_vars["logits"] = torch.zeros(128)
     runner.forward_vars["block_tables"] = torch.zeros(64, dtype=i32)
@@ -778,6 +783,48 @@ def test_v41_index_leaves_take_the_tables_atom_s_forward_writes_for_their_step(
     assert listed["context_lens"].tolist() == [26, 20]
     assert its["row_starts"].tolist() == its["row_ends"].tolist() == [26, 20]
     assert pick["row_starts"].tolist() == pick["row_ends"].tolist() == [7, 3]
+
+
+def test_v41_fp4_candidate_leaves_take_the_tables_atom_s_forward_writes(monkeypatch):
+    I32 = "torch.int32"
+    ends, stated = _t([2], "activation", dtype=I32), _t([2], "metadata", dtype=I32)
+
+    def scorer(table, bounds):  # FP4's, at decode B=2
+        return _leaf(
+            ops._FP4,
+            ("block_tables", table),
+            ("context_lens", None),
+            ("row_ends", bounds),
+            ("max_seq_len", 32),
+        )
+
+    def top_k(starts, packed):
+        return _leaf(
+            ops._TOPK,
+            ("logits", _t([2, 32], "metadata")),
+            *[("row_starts", starts), ("row_ends", ends), ("packed_rows", packed)],
+        )
+
+    picked = "atom.model_ops.deepseek_v41.candidate_table:candidate_block_table"
+    picked = _leaf(picked, ("candidates", _t([2, 4], "activation", dtype=I32)))
+    # a candidate list's scorer and top-k; the pick's top-k, on packed rows its
+    # starts ATOM stages; the kept blocks' table build; a whole-context scorer
+    listed = scorer(_t([2, 4], "activation", dtype=I32), ends)
+    leaves = listed, top_k(ends, False), top_k(stated, True), picked
+    leaves += (scorer(_t([2, 2], "metadata", dtype=I32), stated),)
+    # rows seeing 50 and 20 compressed rows: 7 and 3 blocks of 8
+    listed, its, pick, kept, paged = _v41_index(
+        monkeypatch, [50, 20], leaves, decode(2), 64, fp4=True
+    )
+
+    assert kept["candidates"].tolist() == [[0, 2, 4, 6], [0, 1, 2, -1]]
+    assert listed["block_tables"].tolist() == [[12, 14, 4, 6], [0, 1, 2, 0]]
+    assert listed["row_ends"].tolist() == [26, 20]
+    assert its["row_starts"].tolist() == its["row_ends"].tolist() == [26, 20]
+    assert pick["row_ends"].tolist() == [7, 3]
+    # what ATOM stages stays as it binds: no index table
+    assert pick["row_starts"].tolist() == paged["row_ends"].tolist() == [50, 20]
+    assert paged["block_tables"].tolist() == [[3, 1], [0, 2]]
 
 
 def test_the_v41_candidate_lift_leaves_its_selection_as_built_past_twice_the_kept(

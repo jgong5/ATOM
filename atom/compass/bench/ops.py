@@ -268,7 +268,7 @@ PROG = "compass measure ops"
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 32
+PROTOCOL = 33
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -547,15 +547,21 @@ PAGE_WIDE = {
 ONE_BLOCK = ("gfx1250",)
 FLYDSL_OFF = "AITER_DISABLE_FLYDSL_TOPK_DECODE"
 FLYDSL_OFF_VALUES = ("1", "true", "True", "yes", "YES")
-#: DeepSeek-V4.1's FP8 index tables an earlier leaf of its forward writes, by
-#: the operator and slot that read them (`_written`): the page-wide scorer's
-#: tile table (`tiles`); the blocks each row keeps of the candidate pick
-#: (`ids`) and a candidate list's tile table (`table`) and row bounds
-#: (`context`), its scorer's and its top-k's; and the pick's top-k's row
-#: bounds (`ends`), there where its logits, the block maxima, are an activation.
+#: DeepSeek-V4.1's index tables an earlier leaf of its forward writes, by
+#: the operator and slot that read them (`_written`): the FP8 page-wide
+#: scorer's tile table (`tiles`); the blocks each row keeps of the candidate
+#: pick (`ids`) and a candidate list's tile table (`table`) and row bounds
+#: (`context`), its scorer's, the FP8 or FP4 one's, and its top-k's; and the
+#: pick's top-k's row bounds (`ends`), there where its logits, the block
+#: maxima, are an activation (FP8) or packed rows (FP4).
+_FP4 = (
+    "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4:flydsl_pa_mqa_logits_fp4"
+)
 _WRITTEN = {
     (_LOGITS, "kv_indices"): "tiles",
     (_LOGITS, "context_lens"): "context",
+    (_FP4, "block_tables"): "table",
+    (_FP4, "row_ends"): "context",
     (_TOPK, "row_starts"): "context",
     (_TOPK, "row_ends"): "context",
     (_PICK, "seqLens"): "context",
@@ -1175,7 +1181,7 @@ class Stub:
                         self.fills[sig] = cache, passes.get(at, passes[None])[0]
                     else:
                         meta[sig, path] = f"no pass here fills {path} {bound}", None
-                index = self.paged and _written(op, path)
+                index = bool(self.pages) and _written(op, path)
                 if spec.get("device") == "cpu":  # `_copy` builds it on the host
                     continue
                 act = self.specs and spec["role"] == "activation"
@@ -2233,18 +2239,23 @@ def _own_rows(op) -> dict:
 
 
 def _written(op, path) -> str | None:
-    """Which index table of `_WRITTEN` `op`'s `path` takes: a scorer's on a
-    plane its row bounds ATOM stages bound, the page-wide one, its tile table
-    (`tiles`), else a candidate list's (`table`); an activation row bound the
-    pick's (`ends`) under a top-k of activation logits, else a candidate
-    list's (`context`); None for a row bound ATOM stages, or another slot."""
+    """Which index table of `_WRITTEN` `op`'s `path` takes: a scorer's on
+    activation row bounds a candidate list's (`table`), else on FP8 the
+    page-wide one's (`tiles`); an activation row bound the pick's (`ends`)
+    under a top-k of activation logits or of packed rows, else a candidate
+    list's (`context`); None for a table or row bound ATOM stages, or another
+    slot."""
     kind = _WRITTEN.get((op["op"], path))
     role = {s: v.get("role") for s, v in op["args"].items() if isinstance(v, dict)}
-    if kind == "tiles" and role.get("context_lens") != "metadata":
+    bound = role.get("context_lens") or role.get("row_ends")
+    if kind in ("tiles", "table") and bound == "activation":
         return "table"
+    if kind == "table":  # FP4's PAGE table, which ATOM stages
+        return None
     if kind == "context" and role.get(path) != "activation":
         return None
-    return "ends" if kind == "context" and role.get("logits") == "activation" else kind
+    picks = role.get("logits") == "activation" or op["args"].get("packed_rows")
+    return "ends" if kind == "context" and picks else kind
 
 
 def _candidates(ends, k) -> torch.Tensor:
