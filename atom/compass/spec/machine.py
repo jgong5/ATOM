@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """The machine spec: one document read against the field table, and its readers.
 
-The spec is held as a flat map from dotted path to checked value, so merging and
-validating are per-field operations.
+The spec is held as a flat map from dotted path to checked value, so composing
+and validating are per-field operations.
 
 **The schema is closed.** A key with no row in the field table is refused where
 it sits. The stated version is read first, so a document written to a later
@@ -42,8 +42,8 @@ def field_origin(values: Mapping[str, Any], label: str, holder: str) -> dict:
         raise SpecRefusal(
             Rule.TOTALITY,
             f"{holder} is `mixed` and records no origin for `{label}`",
-            "rebuild it with `merge`, which writes `provenance.origins`; a "
-            "document of several origins cannot say which one a field has",
+            "record each field's origin in `provenance.origins`; a document "
+            "of several origins cannot say which one a field has",
         )
     return {"origin": stated, **values.get("provenance.subject", {})}
 

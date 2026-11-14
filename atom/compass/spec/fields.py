@@ -17,7 +17,7 @@ spec's digest cannot move when the caller's document does.
 quantity is a positive real, a derate is a fraction in (0, 1], and a bandwidth
 curve is `[bytes, bytes per second]` points, both rising with the bytes.
 
-Every field is required except the provenance fields `merge` fills in,
+Every field is required except the optional provenance fields,
 `fp4_flops` and its derate, the bandwidth curve, the kernel and profiler
 floors, the pipeline send terms, a link's `link_setup_s` (zero when absent), the
 `inter_node` link, which only a run across nodes reads, the router's hop, the
@@ -26,8 +26,8 @@ absent). An engine start's memory readings are no field here: `compass measure
 memory` publishes them per configuration, as a `memory_readings` entry.
 
 **Every field says where it came from.** `provenance.origin` is one of
-`ORIGINS`. A document of several origins says `mixed`, and `merge` writes
-`provenance.origins`: one entry per field, holding the field's origin and, on
+`ORIGINS`. A document of several origins says `mixed` and states
+`provenance.origins`, as `layers.composed` writes it: one entry per field, holding the field's origin and, on
 a probed field, the subject the probe ran on (`SUBJECT`).
 """
 

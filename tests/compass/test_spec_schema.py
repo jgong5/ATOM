@@ -47,7 +47,7 @@ import sys
 import pytest
 
 from atom.compass import spec as spec_package
-from atom.compass.spec import Fragment, MachineSpec, SpecRefusal
+from atom.compass.spec import MachineSpec, SpecRefusal
 from atom.compass.spec.fields import FIELDS, SCHEMA, SCHEMA_VERSION, Kind
 from atom.compass.spec.rules import DEPLOYMENT_OWNED, Rule
 
@@ -356,14 +356,6 @@ BREAKAGES = {
     ),
 }
 
-#: The same rule named by the verbs other than the reader, each driven through
-#: the verb that declines. Not part of the edit-then-read claim below, which is
-#: about what this reader goes on to read; here only so the partition covers
-#: every site the package has rather than the reader's share of them.
-ELSEWHERE = {
-    "a fragment that is not a mapping": lambda: Fragment.from_mapping([1, 2], "p"),
-}
-
 
 def _spec_modules():
     # The one walk over the package: every check below that reads its source
@@ -589,12 +581,12 @@ def test_every_rule_is_named_by_at_least_one_site():
 def test_every_site_that_declines_a_document_is_driven_here():
     # A table written by hand that quietly covers six of seven sites passes for
     # a reason nobody stated, so the set is read out of the package's source
-    # instead of counted. A site added later is red here until it is placed on
-    # one side of the partition or the other.
+    # instead of counted. A site added later is red here until a breakage
+    # drives it.
     driven = {
         _site_of(lambda make=make: MachineSpec.from_mapping(make()))
         for make in BREAKAGES.values()
-    } | {_site_of(declines) for declines in ELSEWHERE.values()}
+    }
     assert driven == _sites_naming("SHAPE")
 
 
