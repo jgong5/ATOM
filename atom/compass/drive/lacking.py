@@ -8,15 +8,18 @@ so one lacking input hides no other: the platform, its datasheet and readings
 file a flag names (`runfile.resolve`); a step linear law and host laws held
 against this run's engine config, widths, platform and host key
 (`run.pick_fitted`, `run.refuse_unfitted_law`, `run.refuse_unfitted_host`),
-and the host laws' tokenizer term against the backend of the tokenizer ATOM's
-server loads (`run.tokenizer_term`); a step grid bundle's load; the
-configuration's memory readings; an op graph's price list; and an
-`--acceptance-record`. An input is missing when nothing resolves for it, and
-stale when the run refuses the entry it holds, naming each artifact axis that
-moved. A memory readings entry holds every rank's member, or the store refuses
-it, so rank 0's load stands for each rank's. Each is held to ATOM's config as
-a server resolves it on the machine spec's device arch, whatever device this
-host has (`run._config`).
+and the step linear law's decode vectors against the rungs this configuration
+schedules (`uncovered_rungs`); the host laws' tokenizer term against the
+backend of the tokenizer ATOM's server loads (`run.tokenizer_term`); a step
+grid bundle's load; the configuration's memory readings; an op graph's price
+list; and an `--acceptance-record`. An input is missing when nothing resolves
+for it, and stale when the run refuses the entry it holds, naming each artifact
+axis that moved, or refuses steps it would price, as a step linear law's
+coverage is where a rung the run schedules has no vector. A memory readings
+entry holds every rank's member, or the store refuses it, so rank 0's load
+stands for each rank's. Each is held to ATOM's config as a server resolves it
+on the machine spec's device arch, whatever device this host has
+(`run._config`).
 
 A prefill or decode instance's run reads a network file across nodes, as
 `deploy.sh run` hands it one, and its readings command takes the ATOM
@@ -42,8 +45,10 @@ from atom.compass.artifacts import (
     Rule,
     machine_platform,
 )
+from atom.compass.backends.step_linear import EAGER
 from atom.compass.drive import runfile, serve
 from atom.compass.run import OP_GRAPH, PRICE_LIST, STEP_GRID, STEP_LINEAR
+from atom.compass.runner.overrides import schedulable_bound, schedulable_ladder
 from atom.compass.spec import SpecRefusal
 
 #: Each store input by its run-file key.
@@ -130,6 +135,16 @@ def lacking(args, atom_args, real=None) -> tuple[list, list]:
         law, MADE_BY[STEP_LINEAR], compass_run.pick_fitted, run, STEP_LINEAR, config
     ):
         met(law, MADE_BY[STEP_LINEAR], compass_run.refuse_unfitted_law, run, config)
+        if rungs := uncovered_rungs(run[STEP_LINEAR], config):
+            whose = (
+                " in the law or its draft law" if "draft" in run[STEP_LINEAR] else ""
+            )
+            refusal = (
+                f"no decode vector{whose} for rung{'s' * (len(rungs) > 1)} "
+                f"{', '.join(map(str, rungs))}, which this configuration "
+                "schedules; the law refuses a decode step at each"
+            )
+            lacks.append((law, "stale (coverage)", refusal, MADE_BY[STEP_LINEAR]))
     if "host" in run and met(
         host, MADE_BY["host"], compass_run.pick_fitted, run, "host", config
     ):
@@ -185,6 +200,21 @@ def _state(refused) -> str:
         return "missing"
     axes = AXIS.findall(str(refused))
     return f"stale ({', '.join(axes)})" if axes else "stale"
+
+
+def uncovered_rungs(law: dict, config) -> list:
+    """Each decode rung `config` schedules that the step linear `law` has no
+    vector for, or its draft law, whose decode vectors price a decode's draft
+    unless it states a `forward` vector: each rung of the capture ladder
+    (`schedulable_ladder`), ascending, then `EAGER` where the scheduler's bound
+    passes the widest of them, as on an eager runner, which captures none. A
+    step outside a vector's hull is priced, not refused, so no context counts."""
+    ladder = [] if config.enforce_eager else schedulable_ladder(config)
+    eager = [EAGER] if schedulable_bound(config) > max(ladder, default=0) else []
+    draft = law.get("draft")
+    laws = [law] + ([draft] if draft and "forward" not in draft else [])
+    vectors = [{str(rung) for rung in each.get("decode", {})} for each in laws]
+    return [r for r in ladder + eager if any(str(r) not in v for v in vectors)]
 
 
 def _coverage(report: dict) -> str:
