@@ -55,21 +55,24 @@ def _graded(directory, law, steps=None) -> dict:
 
 
 def _same(got: dict, expected: dict) -> None:
-    """`got` and `expected`, `FIGURES` per kind, hold the same kinds and figures."""
+    """`got`, a fold's figures, holds `expected`'s kinds, each with its
+    `FIGURES` and, but a draft, 0 steps refused."""
     assert set(got) == set(expected)
     for kind, figures in expected.items():
-        assert got[kind] == pytest.approx(figures, rel=1e-9), kind
+        mine = {f: got[kind][f] for f in FIGURES}
+        assert mine == pytest.approx(figures, rel=1e-9), kind
+        assert got[kind].get("refused") == (None if kind == "draft" else 0), kind
 
 
-def _fits(tmp_path, write) -> tuple[dict, list]:
-    """The law the command writes on one record per seed of `BIAS`, each
-    `write(path, seed)` in its own directory, and the records."""
+def _fits(tmp_path, write, *flags) -> tuple[dict, list]:
+    """The law the command writes, given `flags`, on one record per seed of
+    `BIAS`, each `write(path, seed)` in its own directory, and the records."""
     records = []
     for seed in BIAS:
         (tmp_path / f"r{seed}").mkdir()
         records.append(write(tmp_path / f"r{seed}" / "dp0.jsonl", seed))
     out = tmp_path / "law.json"
-    main([*map(str, records), "--out", str(out), *SPEC])
+    main([*map(str, records), "--out", str(out), *SPEC, *flags])
     return json.loads(out.read_text()), records
 
 
@@ -102,6 +105,51 @@ def test_each_held_out_run_states_its_figures_as_the_cost_check_grades_it(
         assert slow[kind]["on_totals"] == pytest.approx(1 / BIAS[2] - 1, abs=0.01)
         assert slow[kind]["median"] == pytest.approx(1 / BIAS[2] - 1, abs=0.01)
     assert StepLinearLaw(law)
+
+
+@pytest.mark.parametrize(
+    "moved", [{4}, {None, 2, 4}], ids=["part of its decodes", "all of them"]
+)
+def test_the_steps_a_fold_s_law_refuses_are_stated_beside_its_figures(
+    tmp_path, capsys, moved
+):
+    """The third run alone decodes at rung 8 the steps it ran at a rung of
+    `moved`: the law fitted on the two others has no vector for them, and its
+    figures grade the rest and count those refused."""
+
+    def write(path, seed):
+        steps = _jittered(seed)
+        if seed == 2:
+            steps = [
+                (rows, 8 if i in DECODES and r in moved else r, s)
+                for i, (rows, r, s) in enumerate(steps)
+            ]
+        return _record(path, steps)
+
+    law, records = _fits(tmp_path, write)
+    fold = _fit(records[:2])
+    report = cost_accuracy(records[2].parent, fold)
+    assert "8" in law["decode"] and set(report["refused"]) == {"decode rung 8"}
+    refused = report["refused"]["decode rung 8"]["steps"]
+
+    figures = law["figures"][digest(records[2])]
+    decode = figures.pop("decode")
+    assert decode.pop("refused") == refused > 0
+    graded = _graded(records[2].parent, fold)
+    assert ("decode" in graded) == (moved == {4})
+    if "decode" in graded:
+        assert decode == pytest.approx(graded.pop("decode"), rel=1e-9)
+    else:
+        assert decode == {**dict.fromkeys(FIGURES), "steps": 0}
+    _same(figures, graded)
+    for record in records[:2]:
+        assert {k: f["refused"] for k, f in law["figures"][digest(record)].items()} == {
+            "prefill": 0,
+            "decode": 0,
+        }
+    line = f"{digest(records[2])} | decode | {decode['steps']} | "
+    printed = [p for p in capsys.readouterr().out.splitlines() if p.startswith(line)]
+    assert printed[-1].endswith(f" | {refused}")
 
 
 def test_a_dp_run_is_graded_at_each_step_s_costliest_rank(tmp_path, monkeypatch):
@@ -139,6 +187,7 @@ def test_a_law_s_sources_are_each_folded_with_their_own_records_form_and_options
     law["sources"] = {
         "three": {"runs": [0, 1, 2], "vectors": ["prefill", "host"]},
         "two": {"runs": [0, 1], "vectors": rungs},
+        "shipped": {"runs": [0, 1, 2], "vectors": ["host"]},
     }
     del law["figures"]
     file = tmp_path / "law.json"
@@ -174,19 +223,35 @@ def test_a_law_s_sources_are_each_folded_with_their_own_records_form_and_options
     with pytest.raises(ValueError, match="in one and not the other") as refused:
         figures(*records, source="two")
     assert str(refused.value).endswith(f"[{digest(records[2])!r}]")
+    with pytest.raises(ValueError, match="source shipped prices none of the"):
+        figures(*records, source="shipped")
+    assert "figures" not in json.loads(file.read_text())["sources"]["shipped"]
 
 
-def test_the_figures_command_restates_the_figures_the_fit_wrote(tmp_path):
-    law, records = _fits(tmp_path, _plain)
+@pytest.mark.parametrize(
+    "fitted",
+    [(), ("--form", "history", "--moe-routing", "64,4")],
+    ids=["base", "history, routed"],
+)
+def test_the_figures_command_restates_the_figures_the_fit_wrote(tmp_path, fitted):
+    """A law with no sources is folded under the form and routing it states,
+    whatever `--form` and `--moe-routing` default to; a flag that contradicts
+    them refuses."""
+    law, records = _fits(tmp_path, _plain, *fitted)
     file = tmp_path / "law.json"
-    file.write_text(json.dumps({**law, "figures": {}}))
+    argv = ["figures", *map(str, records), "--law", str(file)]
 
-    main(["figures", *map(str, records), "--law", str(file)])
-    assert json.loads(file.read_text()) == law
+    for flags in ((), fitted):
+        file.write_text(json.dumps({**law, "figures": {}}))
+        main([*argv, *flags])
+        assert json.loads(file.read_text()) == law
+    for flags in (("--form", "shared"), ("--moe-routing", "64,2")):
+        with pytest.raises(ValueError, match="folded as it was fitted"):
+            main([*argv, *flags])
     del law["runs"]
     file.write_text(json.dumps(law))
     with pytest.raises(ValueError, match="states no runs to hold the records to"):
-        main(["figures", *map(str, records), "--law", str(file)])
+        main(argv)
 
 
 def test_the_law_states_the_atom_its_records_ran_at_whatever_its_host_key_is_re_keyed_to(

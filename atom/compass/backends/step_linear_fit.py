@@ -177,8 +177,9 @@ measured at it. A vector whose held-out steps span no hull gets none.
 The law and its report also state, under `figures`, per held-out run and kind
 (`prefill`, `decode`, and `draft` for a drafter's draft), `FIGURES` of that run's
 own steps priced by the law fitted on the others, as `validate.cost` grades a
-run, a step that law has no vector for entering none (`fold_figures`); the
-command prints them. A law fitted
+run, a step that law has no vector for entering none; under `prefill` and
+`decode`, `refused` counts those steps, their drafts refused with them
+(`fold_figures`). The command prints them. A law fitted
 on records with a host key states the ATOM digest they ran at, the key's
 ``atom``, as `records_atom`, which re-keying the host key leaves as it is.
 """
@@ -1860,16 +1861,27 @@ def _vector_of(view) -> str:
 
 def _figures(ranks, law: dict, vectors=None) -> dict:
     """Per kind, `FIGURES` of the steps of `ranks`, one run's ranks' samples,
-    priced by `law` as `validate.cost` grades a run (`accuracy.run_accuracy`);
-    with `vectors`, only the steps a vector it names prices (`_vector_of`), each
+    priced by `law` as `validate.cost` grades a run (`accuracy.run_accuracy`),
+    and under `prefill` and `decode`, as `refused`, the steps of the kind `law`
+    refused, a kind with none graded stating 0 steps and no other figure; with
+    `vectors`, only the steps a vector it names prices (`_vector_of`), each
     with its draft."""
     from atom.compass.backends.accuracy import run_accuracy
 
     steps = None
     if vectors is not None:
         steps = {s.step for r in ranks for s in r if _vector_of(s.view) in vectors}
-    graded = run_accuracy(ranks, law, steps)["graded"]
-    return {kind: {f: g[f] for f in FIGURES} for kind, g in graded.items()}
+    report = run_accuracy(ranks, law, steps)
+    figures = {k: {f: g[f] for f in FIGURES} for k, g in report["graded"].items()}
+    refused = dict.fromkeys(("prefill", "decode"), 0)
+    # A band names its kind first: "prefill tokens ..." or "decode rung ...".
+    for band, r in report["refused"].items():
+        refused[band.split()[0]] += r["steps"]
+    none = {**dict.fromkeys(FIGURES), "steps": 0}
+    for kind, n in refused.items():
+        if kind in figures or n:
+            figures.setdefault(kind, dict(none))["refused"] = n
+    return figures
 
 
 def fold_figures(folds, vectors=None) -> dict:
@@ -2173,14 +2185,22 @@ def _labelled(args) -> tuple[list, dict, dict, dict]:
 
 
 def _figures_table(figures: dict) -> str:
-    """`fold_figures`' figures, a line per held-out run and kind."""
-    lines = ["run | kind | steps | on totals | held-out step | holding it out | median"]
+    """`fold_figures`' figures, a line per held-out run and kind, `-` where a
+    kind states no figure."""
+
+    def show(value, percent=False) -> str:
+        if value is None:
+            return "-"
+        return f"{value:+.2%}" if percent else str(value)
+
+    head = "run | kind | steps | on totals | held-out step | holding it out | median"
+    lines = [f"{head} | refused"]
     for run, kinds in figures.items():
         for kind, f in kinds.items():
-            held = "-" if f["held_out"] is None else f"{f['held_out']:+.2%}"
             lines.append(
-                f"{run} | {kind} | {f['steps']} | {f['on_totals']:+.2%} | "
-                f"{f['held_out_step']} | {held} | {f['median']:+.2%}"
+                f"{run} | {kind} | {f['steps']} | {show(f['on_totals'], True)} | "
+                f"{show(f['held_out_step'])} | {show(f['held_out'], True)} | "
+                f"{show(f['median'], True)} | {show(f.get('refused'))}"
             )
     return "\n".join(lines)
 
@@ -2189,17 +2209,21 @@ def figures_main(argv) -> None:
     """``figures RECORD... --law LAW [--source NAME]``: write `fold_figures`'
     figures on the records into the law file LAW, and print them.
 
-    The records are folded under `--form`, `--moe-routing` and their engine
-    config as the command fits them, and must be the runs LAW states under
-    `runs`. A law whose `sources` splits its vectors takes one source's at a
-    time: `--source` names it, the records must be its `runs`, and the
-    figures, of the steps its `vectors` price, go under it."""
+    The records must be the runs LAW states under `runs`, and are folded under
+    their engine config as the command fits them, and under the `form` and
+    `moe_routing` LAW states, a `--form` or `--moe-routing` that contradicts
+    them refusing. A law whose `sources` splits its vectors takes one source's
+    at a time: `--source` names it, the records must be its `runs`, they are
+    folded under `--form` and `--moe-routing`, as its provenance states them,
+    and the figures, of the steps its `vectors` price, go under it; a source
+    whose vectors price none of the records' steps refuses."""
     parser = _records_parser(
         "python -m atom.compass.backends.step_linear_fit figures",
         figures_main.__doc__.split("\n\n")[0],
     )
     parser.add_argument("--law", required=True, help="the law file written into")
     parser.add_argument("--source", help="the entry of the law's sources folded")
+    parser.set_defaults(form=None)
     args = parser.parse_args(argv)
     law = json.loads(Path(args.law).read_text())
     into, vectors, runs = law, None, law.get("runs")
@@ -2214,6 +2238,17 @@ def figures_main(argv) -> None:
         into = sources[args.source]
         vectors = into["vectors"]
         runs = runs and [runs[i] for i in into["runs"]]
+        args.form = args.form or "base"
+    else:
+        stated = {"form": law["form"], "moe_routing": _law_routing(law)}
+        for name, value in stated.items():
+            if (flag := getattr(args, name)) not in (None, value):
+                raise ValueError(
+                    f"{args.law} states {name} {value}, and --"
+                    f"{name.replace('_', '-')} gives {flag}: a law with no "
+                    "sources is folded as it was fitted"
+                )
+        args.form, args.moe_routing = stated["form"], stated["moe_routing"]
     if runs is None:
         raise ValueError(f"{args.law} states no runs to hold the records to")
     samples, _, options, _ = _labelled(args)
@@ -2222,6 +2257,11 @@ def figures_main(argv) -> None:
         raise ValueError(
             f"the records' runs are not the {len(runs)} runs {args.law} states "
             f"for them; these are in one and not the other: {differ}"
+        )
+    if vectors is not None and not any(_vector_of(s.view) in vectors for s in samples):
+        raise ValueError(
+            f"{args.law}'s source {args.source} prices none of the records' "
+            f"steps: its vectors are {vectors}"
         )
     into["figures"] = fold_figures(_fold_laws(samples, options, 0), vectors)
     Path(args.law).write_text(json.dumps(law) + "\n")
