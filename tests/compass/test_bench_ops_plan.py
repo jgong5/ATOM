@@ -1185,7 +1185,9 @@ def test_a_child_that_dies_costs_the_plan_only_the_point_it_was_measuring(
         for d in dead
     ]
     assert [r for r in records if "refused" not in r] == [
-        r for r in whole if {k: r[k] for k in r if k != "token"} not in dead
+        r
+        for r in whole
+        if {k: r[k] for k in r if k not in ("token", "layout")} not in dead
     ]
     monkeypatch.setattr(ops, "_child", _bench)
     again = _plan(bench, tmp_path, population)  # the next plan retries them

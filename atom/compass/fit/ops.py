@@ -4,14 +4,14 @@
     compass fit ops DIR... --store S --out D
 
 Each DIR is a `measure ops --out` directory; each point its ops.jsonl, or with
-`--plan` each round's, lists as measured is read back from S, where `measure
-ops` published it. A `--plan` run resumed into a DIR keeps the rounds earlier
-runs wrote there, so DIR lists every run's points. A point a `--plan` run
-found already in S is in no round's ops.jsonl: pass the directory that
-measured it too. Every point
-must name one `price_list` key, its model, parallel layout, platform and source
-root; the price list is published at that key
-under the readings the points ran under.
+`--plan` each round's and its plan.jsonl, lists as measured is read back from
+S, where `measure ops` published it. A `--plan` run resumed into a DIR keeps
+the rounds earlier runs wrote there, so DIR lists every run's points, and its
+plan.jsonl lists the points it found already in S, measured at any layout
+when their leaf runs on no process group (`bench.ops.point_key`). Every point must
+name one model, platform and source root, and every line one parallel layout,
+the layout of the run that listed it: the price list is published at that
+`price_list` key under the readings the points ran under.
 
 A leaf's family is its signature with the integers that follow the shape
 masked. Among the points of one phase whose signatures match with every
@@ -131,26 +131,36 @@ def main(argv: list[str]) -> None:
 
 def read(store, dirs) -> tuple[list[dict], dict, dict]:
     """The measured points the ops.jsonl of `dirs` list, a `--plan` run's in
-    each round<n>, as `store` holds them, their configuration, and the
-    `price_list` key fields they name."""
-    points, named, config = {}, {}, None
+    each round<n> and its plan.jsonl, as `store` holds them, their
+    configuration, and the `price_list` key fields they name: their model,
+    platform and source root at the layout each line states."""
+    points, keys, named, config = {}, {}, {}, None
     for d in dirs:
         run = json.loads((d / "run.json").read_text())
         engine = json.loads((d / "engine.json").read_text())
         config = {**run_fields(run, d / "run.json"), "engine_config": engine}
         config |= {k: run[k] for k in ("stack", "host_key", "ptl")}
         lines = sorted(d.glob("round*/ops.jsonl")) or [d / "ops.jsonl"]
+        lines += [d / "plan.jsonl"] if (d / "plan.jsonl").is_file() else []
         for line in itertools.chain(*(f.read_text().splitlines() for f in lines)):
             record = json.loads(line)
             if "refused" in record:
                 continue
-            # ponytail: a token is a scan of the kind's folder; index it if a
-            # campaign's thousands of points make the fit slow
-            key = store.key_from_token(Kind.OP_MEASUREMENT, record["token"])
-            entry = store.read(key)
-            rank = entry.topology.ranks()[0]
-            points[key] = json.loads(entry.read_member("point", rank, "json"))
-            fields = {k: v for k, v in key.values.items() if k != "point"}
+            if "layout" not in record:
+                raise ValueError(
+                    f"{d} lists {record['op']} at {record['shape']} with no "
+                    "parallel layout: list it again by a `measure ops --plan` "
+                    "run, whose plan.jsonl names each point it finds in the store"
+                )
+            if (token := record["token"]) not in keys:
+                # ponytail: a token is a scan of the kind's folder; index it if
+                # a campaign's thousands of points make the fit slow
+                keys[token] = key = store.key_from_token(Kind.OP_MEASUREMENT, token)
+                entry = store.read(key)
+                rank = entry.topology.ranks()[0]
+                points[key] = json.loads(entry.read_member("point", rank, "json"))
+            fields = {k: v for k, v in keys[token].values.items() if k != "point"}
+            fields |= record["layout"]
             named.setdefault(json.dumps(fields, sort_keys=True), d)
     if not points:
         raise ValueError("these directories list no measured point")
