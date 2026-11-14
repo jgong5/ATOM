@@ -224,14 +224,18 @@ transfer to DP.
   EP8 diagnostic cells.
 - **Why `max` is the critical path here.** Under DP-attention a layer's barrier-delimited
   segments are the local segment and the MoE segment. With EP off the MoE segment is
-  rank-invariant by construction (above). With EP on its priced cost is rank-invariant
-  under uniform routing: every rank is priced at the expected maximum rank load (`10` D64).
+  rank-invariant by construction (above). With EP on the experts' priced cost is
+  rank-invariant under uniform routing: every rank is priced at the expected maximum rank
+  load (`10` D64). MORI's exchange is priced at each rank's own real rows, so it joins the
+  rank-variant part: the IntraNode dispatch ends on every rank only once each peer has
+  finished its whole send, at the latest peer's local segment plus its own send, and the
+  combine reads a rank's own rows after its barrier, before that rank's next local segment.
   When one segment is rank-invariant the sum of per-segment maxima equals the max of
   per-rank sums.
-  Rank 0 at attention 3 per layer and rank 1 at 1, both at MoE `c`, give
+  Rank 0 at attention 3 per layer and rank 1 at 1, both at experts `c`, give
   `max(3 + c, 1 + c) = max(3, 1) + c`. A gap between the two, such as 240 against 360 over
-  60 layers for attention 3 / MoE 1 against 1 / 3, needs MoE cost to differ across ranks,
-  which only non-uniform routing under EP produces.
+  60 layers for attention 3 / experts 1 against 1 / 3, needs the experts' cost to differ
+  across ranks, which only non-uniform routing under EP produces.
 - **Non-uniform routing is a stated limit.** Real routing is data-dependent (D92 Q2).
   With EP off it changes the MoE cost equally on every rank. With EP on it loads ranks
   unevenly: on #1106's cells the busiest rank's received rows over the group mean, per
