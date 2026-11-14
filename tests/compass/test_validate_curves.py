@@ -16,6 +16,7 @@ by 4 GPUs; `backends.atom.AtomBackend.populate` gives the hit rates.
 """
 
 import json
+from statistics import fmean
 
 import pytest
 
@@ -338,6 +339,50 @@ def test_a_point_with_no_real_run_is_refused_not_dropped(tmp_path):
     _point(arm / "c4", 4, real=(), step_linear=1.0)
     with pytest.raises(ValueError, match=r"c4 holds 0 real\*/ and \['step_linear'\]"):
         main(["--curves", str(tmp_path / "out"), str(arm)])
+
+
+#: `RECORDS`' input and output tokens a second, from the first profiling
+#: request's start to the last one's end, at scale 1.
+TOKENS_PER_S = (127300 + 693) / 11.65
+
+
+def _deployment(d, concurrency, scale=1.0, server=True, prefill=(1, 8), decode=(1, 8)):
+    """`_run` laid out as `deploy.sh` writes a deployment: the client's
+    `artifacts/` beside `prefill/` and `decode/`, each side's engine record at
+    its (tensor parallel, data parallel) in its own `steps/`, and none beside
+    them."""
+    _run(d, concurrency, scale, server)
+    (d / curves.ENGINE_RECORD).unlink()
+    (d / "steps").rmdir()
+    for side, (tp, dp) in (("prefill", prefill), ("decode", decode)):
+        (d / side / "steps").mkdir(parents=True)
+        engine = {"tensor_parallel_size": tp, "data_parallel_size": dp}
+        (d / side / curves.ENGINE_RECORD).write_text(json.dumps(engine))
+    return d
+
+
+def test_a_deployment_counts_its_prefill_side_s_gpus_plus_its_decode_side_s(
+    tmp_path, capsys
+):
+    pd, single, real = tmp_path / "pd", tmp_path / "tp8", (1.0, 1.04, 0.97)
+    # A DPA8 prefill beside a TP4 decode: 8 + 4 GPUs, neither side's twice.
+    sides = {"prefill": (1, 8), "decode": (4, 1)}
+    for k, scale in enumerate(real, start=1):
+        _deployment(pd / "c256" / f"real{k}", 256, scale, **sides)
+    _deployment(pd / "c256" / "step_linear", 256, server=False, **sides)
+    _point(single / "c256", 256, real, tp=8, step_linear=1.0)
+    main(["--curves", str(tmp_path / "out"), str(pd), str(single)])
+    table = _table(capsys.readouterr().out)
+    for arm, gpus in (("pd", 12), ("tp8", 8)):
+        value = table[arm, 256, "step_linear", "throughput per GPU (tok/s/GPU)"][0]
+        mine, theirs = TOKENS_PER_S / gpus, fmean(TOKENS_PER_S / s / gpus for s in real)
+        assert value.startswith(f"simulated {mine:.4g}; real mean {theirs:.4g},"), arm
+
+
+def test_a_deployment_differs_from_a_single_node_run_only_by_its_gpus(tmp_path):
+    got = curves.metrics(_deployment(tmp_path / "real1", 256, prefill=(8, 1)))
+    assert got["throughput per GPU"] == pytest.approx(TOKENS_PER_S / 16, rel=1e-12)
+    assert got == curves.metrics(_run(tmp_path / "tp16", 256, tp=16))
 
 
 def _sent() -> float:
