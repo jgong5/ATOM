@@ -8,7 +8,8 @@ to 2026-11-13, and the owner's rulings on its design PR #3363
 [third](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957),
 [fourth](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216),
 [fifth](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6869501859),
-[sixth](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927)). No code implements it yet: its tasks are cut from *Summary* after v1.
+[sixth](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927)). Its code tasks are cut from *Summary* by
+[#3355's plan](https://github.com/jgong5/ATOM/issues/3355#issuecomment-6878189760).
 
 **Depends on:** `07` (the store, D37), `08` (D44, D45, D45.1, D50, D50.1), `13` (D79,
 D80), `16` (D95.1), and the M3-Agentic stage's `03` D13.1, `06` D35.1 and `14` D87.1.
@@ -268,7 +269,7 @@ one commit as the showcase is, that commit, whose ATOM digest stands for the hea
 (D112). It expands into the product of the dimensions less the exclusions, always into
 the same candidates in the same order, and refuses by name an unknown field,
 contradictory values or an empty expansion. Each candidate names its ATOM basis, the
-recipe its arguments follow, and each departure with its reason. Its format is T108's.
+recipe its arguments follow, and each departure with its reason. Its format follows.
 The two templates, D116's and D117's, are space files in `scripts/compass/spaces/`,
 beside `laws/`; `compass advice` reads the SPACE it is given and falls
 back on neither. The file is the search's input, as traces are a client's: each
@@ -276,15 +277,65 @@ candidate's run takes `compass run`'s flags and ATOM's arguments from `compass a
 so the file adds no level to `13` D79's precedence and is not the Compass config file D79
 rejects.
 
+**The format.** One JSON object, as the law and machine files beside the templates are. A
+field not listed here, or a key given twice in one object, is refused by name.
+
+| Field | Values | Default |
+|---|---|---|
+| `model` | ATOM's `--model`, every instance's first argument | required |
+| `machine` | `device`; `ptl`, `enabled` or `disabled`; `stack`; `network`: `compass run`'s platform flags | `stack` and `network` unset |
+| `store` | the shared store (D113), an absolute path | required |
+| `commit` | the frozen commit, 7 to 40 hex digits (D112) | unset: the integration head |
+| `workload` | `traces`, a traces file's absolute path; `select`, `A-B` or `agentx`, as `client.sh`'s `--traces A-B` or `--agentx`; `concurrency`, distinct positive integers; `duration_s`, as `client.sh`'s `--duration` | `traces`, `select` and `concurrency` required; `duration_s` `client.sh`'s |
+| `slo` | `min_interactivity_p90`, tokens a second per user, and `max_ttft_p90_s`, seconds, each positive (D111) | required; a bound left out bounds nothing |
+| `common` | a block every candidate takes | none |
+| `dimensions` | each dimension's name to its values, each value's name to a block; names of letters, digits, `.` and `_` | required, with at least one dimension and one value each |
+| `exclude` | a list of objects, each naming a value of some dimensions; a combination holding every one of them is left out | none |
+
+A block's fields are all optional: `basis`, the recipe its arguments follow; `deployment`,
+`single` or `1p1d`, `single` when no block names one; `args`, each ATOM long flag to its
+value, a string, a number, or `true` for a bare flag; `env`, each environment variable to
+its value; `per_concurrency`, each ATOM long flag to a positive integer, its value at a
+point that integer times the point's concurrency, as MiniMax-M3's `--max-num-seqs` is 2;
+`departures`, each argument, by its long flag, or variable that departs from the basis to
+its reason, the flag read as an argument is and written with dashes; and, on a 1P1D
+candidate, `prefill` and `decode`, each holding one side's `args`, `env` and
+`per_concurrency`.
+
+**The expansion.** Each combination of the dimensions' values that no exclusion names is a
+candidate, named by its values joined with `-`, the first dimension varying slowest and each
+dimension's values in the file's order. A candidate takes `common`'s block, then each of its
+values' blocks in the dimensions' order; an instance's arguments are `--model`, then each
+block's, a side's after its own block's. It is refused, naming both blocks, when two of
+them set one thing apart: an argument, which ATOM's parser reads with `--a_b` as `--a-b`
+and `--no-x` as `--x`'s negation, a variable, a departure's reason, the basis or the
+deployment; or an argument both fixed and varying with the concurrency. It is refused when
+no block names its basis, and when a block gives a single-node candidate a side. An
+excluded combination is never judged. A point is a candidate at one concurrency, in the
+workload's order, named `<candidate>-c<concurrency>`. A setting that holds only for some
+combination of values is written in one value of one dimension, as D116's template writes
+each configuration as one value of one dimension. `compass advice` writes the expansion
+into OUT's `candidates.json`: the space file's path, its model, machine, store, commit,
+workload and SLO; each candidate with its values, deployment, basis, departures and each
+instance's arguments, variables and per-concurrency factors; and each point with each
+instance's arguments and variables.
+
 **Reason.** The user, not Compass, knows what they would deploy; a template shows the
 shape, and an agent saves the user copying arguments by hand; the frozen commit has to be
-stated before the calibration it governs, which precedes the search. **Basis.** The owner
+stated before the calibration it governs, which precedes the search. A setting given twice
+is refused rather than one overriding the other, so what a candidate runs is what its
+blocks say. **Basis.** The owner
 on #3355 and #3363, the [sixth ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927) settling that the file is no config file;
-`13` D79; `08` D50, whose registration freezes a set before evaluation.
+`13` D79; `08` D50, whose registration freezes a set before evaluation; `client.sh`'s
+`--traces`, `--agentx` and `--duration`; `atom/utils/arg_parser.py::FlexibleArgumentParser`,
+which reads both spellings of a long flag.
 
 **Rejected.** A shipped default space, the DeepSeek-V4-Pro template, that the command falls
 back on: a default is the silent answer `13` D79 refuses, and it would search a space the
-user never chose.
+user never chose. YAML, as #3355 sketched the file: the law and machine files beside the
+templates are JSON, which the standard library parses. A block keyed by a combination of values: a
+value of one dimension already holds a whole configuration, and a setting then has one
+source to trace it to.
 
 ---
 
@@ -776,7 +827,7 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 |---|---|---|
 | D108 | Fitting apart from searching: a candidate is simulated once its law exists; the halves meet only through the store and a calibration's `status` file, the search owning no calibration, fitting, reuse judgement or version management. A user guide, `scripts/compass/ADVICE.md`, exact enough that an agent following it fills the DeepSeek-V4-Pro template's space file, and no skill; an agent starts a calibration only on the user's yes. | 2026-11-13 ([#3355](https://github.com/jgong5/ATOM/issues/3355), [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6845852318)) |
 | D109 | `compass advice SPACE OUT` checks each candidate (searchable, missing a law, calibrating, refused) and each point's readings (missing readings, with the `measure memory` command `run --check` prints), simulates each searchable point on a fresh server with no step roofline, and writes the results; it never calibrates, and runs at the integration head, on the target machine type, in a GPU container. Amends `13` D80: it starts the client and takes a workload, and `run --check` resolves a prefill or decode side. | 2026-11-13 (#3355, #3363) |
-| D110 | The user provides the space file, by hand or through an agent following the guide from what the user asks for, a recipe or real-run arguments; it names the shared store and, for a frozen search, its commit; it expands deterministically into candidates, each naming its ATOM basis and departures; the templates live in `scripts/compass/spaces/`, no default; it is the search's input, not a level of `13` D79's precedence nor the config file it rejects. | 2026-11-13 (#3355, #3363); D79 settled 2026-11-14 ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927)) |
+| D110 | The user provides the space file, by hand or through an agent following the guide from what the user asks for, a recipe or real-run arguments; it names the shared store and, for a frozen search, its commit; it expands deterministically into candidates, each naming its ATOM basis and departures; the templates live in `scripts/compass/spaces/`, no default; it is the search's input, not a level of `13` D79's precedence nor the config file it rejects. Its format: one JSON object, the dimensions' product less the exclusions, each candidate `common`'s block and its values', two blocks setting one thing apart refused. | 2026-11-13 (#3355, #3363); D79 settled 2026-11-14 ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927)); the format 2026-11-14 (#3448) |
 | D111 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. | 2026-11-13 (#3355) |
 | D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage (a decode vector for every scheduled rung before the search, each point's extrapolated share reported after it) and `08` D47's three figures on each leave-one-run-out fold within #627's 5% gate, a law at the head past it refused; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose ATOM digest is not the head's, the remote tip's or a frozen commit's, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363; the head by ATOM's digest, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957); coverage in two parts, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216); the accuracy bar, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6869501859)) |
 | D113 | The step linear backend lists a configuration's missing records, for a missing law or decode rung, as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |

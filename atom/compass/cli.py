@@ -59,6 +59,10 @@ COMMANDS = {
         "atom.compass.validate.project",
         "real runs' steps priced analytically on another device, published as a projection",
     ),
+    "advice": (
+        "atom.compass.advice.__main__",
+        "a space file's candidates and their points, written into OUT",
+    ),
 }
 OPS = "the op-level half of the toolchain is not built yet"
 #: Each command that refuses, to why and where its work is.

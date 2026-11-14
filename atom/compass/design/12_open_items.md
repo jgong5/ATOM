@@ -213,7 +213,7 @@ M-f `14`; M-g `01` D3.5.
 
 | # | Item |
 |---|---|
-| T108 | The space file's format: every field, its values and its default, the arguments that vary with the concurrency included (`19` D110) |
+| ~~T108~~ | ~~The space file's format: every field, its values and its default, the arguments that vary with the concurrency included (`19` D110)~~ — settled 2026-11-14 by [#3448](https://github.com/jgong5/ATOM/issues/3448): `19` D110 states every field, its values and its default, and the expansion |
 | T109 | The per-request split's file format; ATOM's `atom-benchmark/v1` request records are a candidate (`19` D114) |
 | T110 | A 1P1D point's GPUs over both sides from #3264's code, which counts TP times DP from one engine record (`19` D111) |
 | T111 | Whether ATOM's Benchmark Dashboard (`.github/dashboard/index.html`) can show both marks and the recommended point, or the dashboard is a page of Compass's own (`19` D115) |
