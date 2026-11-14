@@ -152,7 +152,7 @@ def stored(
 ):
     """`held`'s step law, else `law`'s, in the store at `tmp_path / store`, its
     records at `atom`, else at the head's digest, under `conditions`; with
-    `host`, its host laws beside it."""
+    `host`, its host laws beside it, keyed to the CPU `held` states."""
     held = held or law(r)
     key = {
         "model": compass_run._file_digest(r.config.model, "config.json"),
@@ -165,7 +165,8 @@ def stored(
     entry = publish(tmp_path, r, Kind.STEP_LINEAR_LAW, key, step, conditions, store)
     if host:
         params = {"key": held["host"]["key"], "laws": HOST_LAWS}
-        publish(tmp_path, r, Kind.HOST_LAWS, host_laws_key(r), params, None, store)
+        key = host_laws_key(r) | {"host_cpu": held["host"]["key"]["host_cpu"]}
+        publish(tmp_path, r, Kind.HOST_LAWS, key, params, None, store)
     return f"{entry.key.kind} {entry.key.token()} in {tmp_path / store}"
 
 
@@ -390,6 +391,44 @@ def test_a_calibration_store_holding_every_input_at_its_key_is_looked_up_whateve
     found = verdicts(judged, "law")
     assert [(v["verdict"], v["requirement"]) for v in found] == [verdict] * 2
     assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
+
+
+@pytest.mark.parametrize(
+    "case, looked_up, verdict, named, readings_verdict",
+    [
+        ("host laws of another CPU", "b", ("refused", 1), "on another CPU", "reuse"),
+        ("past 5% with no readings", "b", ("refused", 4), "run at the head", "measure"),
+        ("an older store holding every input", "a", ("reuse", None), "", "reuse"),
+    ],
+)
+def test_with_no_store_holding_every_input_the_latest_whose_law_is_refused_is_looked_up(
+    tmp_path, searched, case, looked_up, verdict, named, readings_verdict
+):
+    r = searched
+    # "a", if anything, holds every input; "b", published into later, a law refused.
+    a, b = (tmp_path / f"out/cal/{name}/store" for name in "ab")
+    if case == "an older store holding every input":
+        platforms.flags(a, DOCUMENT, tmp_path)
+        stored(tmp_path, r, store=a.relative_to(tmp_path))
+        publish_readings(a, r.config)
+    platforms.flags(b, DOCUMENT, tmp_path)
+    if case == "past 5% with no readings":
+        stored(tmp_path, r, store=b.relative_to(tmp_path), held=past(r)[0])
+    else:
+        held = law(r)
+        held["host"]["key"]["host_cpu"] = "another CPU"
+        stored(tmp_path, r, store=b.relative_to(tmp_path), held=held)
+        publish_readings(b, r.config)
+
+    judged = advise(tmp_path)
+
+    store = str(tmp_path / f"out/cal/{looked_up}/store")
+    assert judged["candidates"]["a"]["store"] == store
+    found = verdicts(judged, "law")
+    assert [(v["verdict"], v["requirement"]) for v in found] == [verdict] * 2
+    assert store in found[0]["reason"] and named in found[0]["reason"]
+    readings_found = {v["verdict"] for v in verdicts(judged, "readings")}
+    assert readings_found == {readings_verdict}
 
 
 def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, at_head):
