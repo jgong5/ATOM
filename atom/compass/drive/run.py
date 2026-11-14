@@ -9,7 +9,7 @@ reach it until it is stopped, with run.json recording what grading reads.
     compass run --join RUN_FILE --out D -- <ATOM args>
 
     compass run <backend> --device DEV --ptl PTL --store S [--host-laws KEY]
-        ... --check -- <ATOM args>
+        ... --check [prefill|decode] -- <ATOM args>
 
 `runfile` builds the run file from the flags, the platform composed from
 `--device`'s datasheet and the readings `--store` holds for it at `--ptl` and
@@ -24,7 +24,8 @@ server joins the clock authority its ``clock_endpoint`` names, which writes the
 step table, the run summary and the hand-ins in its ``out_dir``, and grading
 reads them there. `scripts/compass/deploy.sh` builds that file, starts the
 authority and joins each instance to it. A prefill or a decode instance shares a
-clock with its peer, so it refuses without `--join`.
+clock with its peer, so it refuses without `--join`, but under `--check` with
+its side named.
 
 `--coverage` names record directories and `shape_population` tokens whose steps
 the backend's coverage check reads before the server starts: the step grid's
@@ -43,6 +44,17 @@ has no check, and refuses `--coverage`.
 
 `--check` starts no server: it lists every input the run lacks and the command
 that makes each, exiting 1 when one is lacking (`lacking`); it takes no `--out`.
+`--check prefill` or `--check decode` checks that side of a deployment, its
+flags and ATOM arguments as `deploy.sh run` takes them, so `--network` names a
+deployment across nodes. Its ATOM arguments gain the `--kv-transfer-config` the
+script adds, the side's KV role on the simulated connector, and it reads the
+environment the script starts the side in, `AITER_LOG_LEVEL` set when unset
+(`compass_env`), so it resolves the config the side's instance runs. A
+`--kv-transfer-config` among them refuses, as the script refuses one. The
+readings command it prints takes Mooncake's connector in the simulated one's
+place, as `deploy.sh record` starts the side: a real start has no clock to
+build the simulated one on. It names `AITER_LOG_LEVEL` when the check set it,
+since the readings key holds it.
 
 `--acceptance-record` names a speculative `compass record` directory: its
 histograms' rates (`measured`) go to ATOM as ``--spec-decode-acceptance-rates``,
@@ -61,6 +73,7 @@ member an engine read states, empty when every one was measured.
 
 import argparse
 import json
+import os
 import re
 import tempfile
 from collections import Counter, defaultdict
@@ -89,6 +102,13 @@ SHAPING = (*BOUNDS, "ladder", "tensor_parallel_size")
 #: A number standing alone in a reason, which `op_coverage` masks so one cause
 #: at many steps' counts is one reason; a kernel's name keeps its digits.
 NUMBER = r"(?<![\w.])\d+(?:\.\d+)?"
+#: The KV role `scripts/compass/deploy.sh` gives each side's instance.
+ROLES = {"prefill": "kv_producer", "decode": "kv_consumer"}
+#: The connector a side runs on: `deploy.sh run`'s simulated one, and the one
+#: a real start of it takes, `deploy.sh record`'s.
+SIMULATED, REAL = "compass", "mooncake"
+#: The ATOM argument naming a side's connector, which deploy.sh adds.
+KV_FLAG = "--kv-transfer-config"
 
 
 def main(argv: list[str]) -> None:
@@ -108,6 +128,13 @@ def main(argv: list[str]) -> None:
             f"--coverage: --{key.replace('_', '-')} has no coverage check; only "
             "--step-grid's and --op-graph's steps are checked"
         )
+    if args.check in ROLES:
+        serve._refuse(atom_args)
+        # deploy.sh starts each side under `compass_env` (scripts/compass/_lib.sh).
+        env = {} if "AITER_LOG_LEVEL" in os.environ else {"AITER_LOG_LEVEL": "WARNING"}
+        os.environ.update(env)
+        sides = [side_args(args.check, atom_args, c) for c in (SIMULATED, REAL)]
+        raise SystemExit(lacking.report(args, *sides, env))
     runfile.pd_side(atom_args, refuse=True)
     if args.check:
         serve._refuse(atom_args)
@@ -164,11 +191,29 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--check",
-        action="store_true",
-        help="list every input the run lacks, and start no server",
+        nargs="?",
+        const=True,
+        choices=tuple(ROLES),
+        help="list every input the run lacks, and start no server; of that side "
+        "of a deploy.sh deployment when one is named",
     )
     p.add_argument("--out", help="an empty directory for the run's files and logs")
     return p
+
+
+def side_args(side: str, atom_args, connector: str) -> list[str]:
+    """ATOM's arguments `atom_args` of a deployment's `side`, as deploy.sh takes
+    them, with the `KV_FLAG` it adds: the side's KV role on `connector`. One
+    among them refuses, as the script refuses it; the one added overrides
+    another spelling, as the script's does."""
+    for arg in atom_args:
+        if arg.startswith(KV_FLAG):
+            raise ValueError(
+                f"{arg} is among the {side} side's ATOM arguments; --check {side} "
+                f"adds its {KV_FLAG}, as deploy.sh does"
+            )
+    kv = {"kv_role": ROLES[side], "kv_connector": connector}
+    return [*atom_args, KV_FLAG, json.dumps(kv)]
 
 
 def measured(record, atom_args, ranks: int) -> list[float]:
