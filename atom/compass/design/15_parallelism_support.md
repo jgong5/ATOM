@@ -214,8 +214,11 @@ transfer to DP.
   included, and `T_moe` is the group's sum of them. Either way the group dispatches
   `T_moe` rows, so `T_moe` is the MoE row count with EP on too, and `BatchView.moe_rows`
   carries it unchanged (`atom/compass/runner/projection.py`, `batch_view`). MORI sends a
-  row to every rank that holds one of its routed experts; under uniform routing a rank
-  receives `T_moe x reach / dp` rows, `reach` being the ranks one row reaches: 4.42 for
+  row to every rank that holds one of its routed experts, so a pad row, routed to none,
+  to no rank (`EpDispatchIntraNodeKernel` skips an id below 0; the low-latency `AsyncLL`
+  kernels send it to rank 0, [#3404](https://github.com/jgong5/ATOM/issues/3404)); under
+  uniform routing a rank receives `R x reach / dp` rows, `R` the real rows among `T_moe`
+  (`BatchView.moe_tokens`), `reach` being the ranks one row reaches: 4.42 for
   DeepSeek-V4-Pro's 6 routed experts of 384 over 8 ranks, 4.43 measured. These readings
   are [#1106](https://github.com/jgong5/ATOM/issues/1106#issuecomment-6236367874)'s
   EP8 diagnostic cells.
