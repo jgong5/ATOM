@@ -955,8 +955,8 @@ def _runner(config, rank: int):
     blocks a rank has room for, sized by ATOM with the parameters' bytes held
     on the device and then freed for the weights each leaf builds, and with
     the MORI exchange ATOM's loader builds before it, MORI's heap with it, in
-    its `mori` (`_exchange`) where its MoE exchanges through MORI; the runner
-    attributes the allocation set are in its `kv_held`, and by path each
+    its `mori` (`_prepare_finalize`) where its MoE exchanges through MORI;
+    the runner attributes the allocation set are in its `kv_held`, and by path each
     tensor it bound on a metadata builder (`BUILDERS`, `_bound`) but a view the
     builder cut from one of the runner's (`_cut_from`); and, when
     the runner defers its output, one sampled-id handoff to the host on ATOM's
@@ -999,7 +999,7 @@ def _runner(config, rank: int):
     held = torch.empty(nbytes, dtype=torch.uint8, device=runner.device)
     # as ATOM's loader, before the pool is sized: built at the first MORI
     # leaf instead, the heap took room the pool left the leaves' weights
-    runner.mori = _exchange(dict(runner.model.named_modules()), mori_only=True)
+    runner.mori = _prepare_finalize(dict(runner.model.named_modules()), mori_only=True)
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     del held
     _release()  # the pool takes the room the hold had
@@ -1028,7 +1028,7 @@ def _runner(config, rank: int):
     return runner
 
 
-def _exchange(modules: dict, mori_only: bool = False):
+def _prepare_finalize(modules: dict, mori_only: bool = False):
     """What ATOM's loader (`init_prepare_finalize`) builds for the exchange of
     the first MoE layer in `modules`: the layer's name, what it built and the
     dtype the layer's rows enter in; building MORI's exchange builds MORI's
@@ -2013,7 +2013,7 @@ class Stub:
         builds it, once; refused by name where ATOM builds none, or one for
         another EP width, hidden size or count of experts a token than the
         leaf states, its hidden size the values a row of its `input` holds."""
-        self.mori = self.mori or _exchange(self.modules)
+        self.mori = self.mori or _prepare_finalize(self.modules)
         if self.mori is None:
             raise ValueError("the model has no MoE layer to build MORI's handle for")
         name, made, dtype = self.mori
