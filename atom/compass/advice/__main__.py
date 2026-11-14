@@ -11,8 +11,11 @@ readings (`check.check`); and `check.STATES`, each candidate's state and each
 of its points', every command that makes what one lacks, after a start of each
 point that could be searched (`check.states`). It prints the head the check
 took, or why the tree is refused, then each candidate with its ATOM basis,
-each departure with its reason, its verdicts and its state. It reads SPACE
-alone, and writes nothing when SPACE refuses.
+each departure with its reason, its verdicts and its state. Then each
+searchable point is simulated into its run directory under `simulate.RUNS`, a
+finished one skipped, and `simulate.SIMULATED` gets each point's outcome
+(`simulate.simulate`), printed with the CPU seconds the points took. It reads
+SPACE alone, and writes nothing when SPACE refuses.
 """
 
 import argparse
@@ -20,6 +23,7 @@ import json
 import sys
 from pathlib import Path
 
+from atom.compass.advice import simulate
 from atom.compass.advice.check import REUSE, STATES, check, lines, state_lines, states
 from atom.compass.advice.space import expand
 from atom.compass.cli import refusing
@@ -58,6 +62,9 @@ def main(argv: list[str]) -> None:
         v["state"] == "searchable" for s in found.values() for v in s["points"].values()
     )
     print(f"{searchable} points searchable, each state in {args.out / STATES}")
+    outcome = simulate.simulate(expansion, judged, found, args.out)
+    print(f"each simulated point in {args.out / simulate.SIMULATED}:")
+    print("\n".join(simulate.lines(outcome)))
     candidates, points = len(expansion["candidates"]), len(expansion["points"])
     print(f"{candidates} candidates and {points} points in {written}")
 

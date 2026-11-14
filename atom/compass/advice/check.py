@@ -202,6 +202,18 @@ def _start(machine, candidate, point, verdicts, store, at: Path) -> str | None:
     """Start `point` of `candidate` with no traffic, on `machine` from `store`
     under the laws its `verdicts` name, into `at`: None once it answers, else
     why not."""
+    try:
+        command, env = serving(machine, candidate, point, verdicts, store, at)
+    except ValueError as refused:
+        return str(refused)
+    return _started(command, env, at)
+
+
+def serving(machine, candidate, point, verdicts, store, at: Path) -> tuple[list, dict]:
+    """The command that serves `point` of `candidate` on `machine` from
+    `store`, under the laws its `verdicts` name, into `at`, and the variables
+    it runs under: `compass run`, or `deploy.sh run` on 1P1D. A ValueError
+    says why `deploy.sh` cannot start a 1P1D point."""
     flags = ["--device", machine["device"], "--ptl", machine["ptl"], "--store", store]
     flags += ["--stack", machine["stack"]] if machine.get("stack") else []
     for flag, i in (("--step-linear", 0), ("--host-laws", 1)):
@@ -210,13 +222,12 @@ def _start(machine, candidate, point, verdicts, store, at: Path) -> str | None:
     sides = point["instances"]
     if candidate["deployment"] == "single":
         (one,) = sides.values()
-        command = [COMPASS, "run", *flags, "--out", at, "--", *one["args"]]
-        return _started(command, one["env"], at)
+        return [COMPASS, "run", *flags, "--out", at, "--", *one["args"]], one["env"]
     prefill, decode = sides["prefill"]["env"], sides["decode"]["env"]
     words = [w for k in prefill if k not in decode for w in ("-u", k)]
     words += [f"{k}={v}" for k, v in decode.items() if prefill.get(k) != v]
     if spaced := [w for w in words if len(w.split()) != 1]:
-        return (
+        raise ValueError(
             "deploy.sh takes the decode side's own variables as one --on prefix "
             f"split on whitespace, and {', '.join(spaced)} holds whitespace"
         )
@@ -225,14 +236,14 @@ def _start(machine, candidate, point, verdicts, store, at: Path) -> str | None:
         # A local prefix starts the decode apart, so the KV link is inter_node.
         flags, on = flags + ["--network", network], ["--on", " ".join(["env", *words])]
     elif words:
-        return (
+        raise ValueError(
             "deploy.sh starts both sides of a deployment on one node under one "
             f"environment, and the decode side's differs from the prefill side's "
             f"by {' '.join(words)}"
         )
     command = [DEPLOY, at, "run", *flags, "--prefill", "--", *sides["prefill"]["args"]]
     command += ["--decode", *on, "--", *sides["decode"]["args"], "--router", "--"]
-    return _started(command, prefill, at)
+    return command, prefill
 
 
 def _started(command: list, env: dict, at: Path) -> str | None:
