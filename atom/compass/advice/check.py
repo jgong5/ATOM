@@ -233,7 +233,7 @@ def _started(command: list, env: dict, at: Path) -> str | None:
     the first error raised in each log under `at`."""
     shutil.rmtree(at, ignore_errors=True)
     at.parent.mkdir(parents=True, exist_ok=True)
-    log, deadline = at.with_name(at.name + ".log"), time.monotonic() + START_S
+    log = at.with_name(at.name + ".log")
     with log.open("w") as written:
         server = subprocess.Popen(
             list(map(str, command)),
@@ -244,7 +244,9 @@ def _started(command: list, env: dict, at: Path) -> str | None:
             start_new_session=True,
         )
     ready = at / serve.READY_FILE
-    while server.poll() is None and not ready.is_file() and time.monotonic() < deadline:
+    for _ in range(int(START_S / serve.POLL_S)):
+        if server.poll() is not None or ready.is_file():
+            break
         time.sleep(serve.POLL_S)
     answered, left = ready.is_file(), server.poll() is not None
     server.terminate()

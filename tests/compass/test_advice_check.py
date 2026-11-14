@@ -14,6 +14,7 @@ under ``STUB_STALL``, never answers.
 import itertools
 import json
 import shlex
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from test_run_step_grid import DOCUMENT, deployment
 from atom.compass import cli
 from atom.compass import run as compass_run
 from atom.compass.advice import check
+from atom.compass.artifacts import Kind
 from atom.compass.drive import reuse
 from atom.compass.drive import run as drive_run
 
@@ -304,10 +306,10 @@ def test_a_1p1d_start_takes_the_decode_side_s_own_variables_in_a_local_prefix(
 def test_a_1p1d_side_missing_readings_is_measured_on_the_connector_a_real_start_takes(
     tmp_path, stubbed, monkeypatch
 ):
-    # The law is keyed under the AITER_LOG_LEVEL a side runs under; the
-    # readings the fixture published are not.
+    # The law is keyed under the AITER_LOG_LEVEL a side runs under.
     monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
     law_file(tmp_path, law(stubbed))
+    shutil.rmtree(tmp_path / "store" / Kind.MEMORY_READINGS.value)
 
     found = advise(tmp_path, {"p": {"deployment": "1p1d", "env": {"STUB_BOTH": "1"}}})
 
