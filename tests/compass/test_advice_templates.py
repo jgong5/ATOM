@@ -18,18 +18,30 @@ SPACE = ROOT / "scripts/compass/spaces/deepseek-v4-pro-mi355x-crs005.json"
 #: The shipped DPA8 pair whose capture ladders the 1P1D configurations take.
 LAW = "scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-crs005-{}.json"
 CONCURRENCY = [1, 2, 4, 8, 16, 32, 64, 128, 256]
-#: Each instance's ATOM arguments that ATOM's parser reads off its defaults,
-#: but `--model` and the capture sizes, and its environment.
-ONE_NODE = {
+#: Each instance's ATOM arguments the template states, by the name ATOM's
+#: parser reads each under, but `--model` and the capture sizes, and its
+#: environment.
+COMMON = {
     "tensor_parallel_size": 8,
     "kv_cache_dtype": "fp8",
+    "enable_prefix_caching": True,
+    "max_num_seqs": 512,
+}
+ONE_NODE = {
+    **COMMON,
     "index_cache_dtype": "fp4",
     "method": "mtp",
     "num_speculative_tokens": 3,
     "spec_decode_acceptance_length": 2.49,
+    "gpu_memory_utilization": 0.9,
+    "max_num_batched_tokens": 16384,
+    "attn_prefill_chunk_size": 16384,
+    "state_checkpoint_interval_tokens": 8192,
+    "level": 3,
+    "cudagraph_mode": "FULL",
 }
 DPA = {"enable_dp_attention": True, "enable_tbo": "prefill"}
-MESH = {"tensor_parallel_size": 8, "kv_cache_dtype": "fp8", "trust_remote_code": True}
+MESH = {**COMMON, "trust_remote_code": True}
 MOE = {"AITER_BF16_FP8_MOE_BOUND": "0", "ATOM_MOE_GU_ITLV": "1"}
 TBO = {**MOE, "GPU_MAX_HW_QUEUES": "5", "ATOM_NUMA_BIND": "1"}
 DP = {
@@ -94,18 +106,20 @@ def test_the_template_expands_into_its_five_configurations_at_1_to_256_clients(
 
 
 def test_atom_reads_each_instance_as_the_template_states_it(expansion):
-    defaults = parsed([])
-    atom_ladder = parse_size_list(defaults.pop("cudagraph_capture_sizes"))
+    atom_ladder = parse_size_list(parsed([])["cudagraph_capture_sizes"])
     for point in expansion["points"]:
         for side, instance in point["instances"].items():
             args, env = INSTANCES[point["candidate"]][side]
             given = parsed(instance["args"])
-            sizes = parse_size_list(given.pop("cudagraph_capture_sizes"))
-            off = {k: v for k, v in given.items() if v != defaults[k]}
+            sizes = parse_size_list(given["cudagraph_capture_sizes"])
+            written = {
+                w[2:].replace("-", "_") for w in instance["args"] if w[:2] == "--"
+            }
 
-            assert off == {"model": expansion["model"], **args}
-            assert given["enable_prefix_caching"] and given["max_num_seqs"] == 512
-            assert "--block-size" not in instance["args"]
+            # Each argument the template states is written, ATOM's default or not.
+            assert written - {"model", "cudagraph_capture_sizes"} == args.keys()
+            assert {name: given[name] for name in args} == args
+            assert given["model"] == expansion["model"]
             # ATOM's own on a single node, the shipped pair's on each 1P1D side.
             assert sizes == (atom_ladder if side == "server" else law(side)["ladder"])
             assert instance["env"] == env
@@ -128,8 +142,9 @@ def test_p3_keys_its_environment_as_the_shipped_crs005_pair(expansion, monkeypat
 def test_compass_advice_reads_no_space_it_is_not_given(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
+    # OUT alone: refused for want of SPACE, never read as the template.
     with pytest.raises(SystemExit) as refused:
-        cli.main(["advice"])
+        cli.main(["advice", str(tmp_path / "out")])
 
     assert refused.value.code == 2
     assert not any(tmp_path.iterdir())
