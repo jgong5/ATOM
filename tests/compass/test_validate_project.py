@@ -16,6 +16,7 @@ from test_validate_bound import LINES, _main, drafted, graph, record
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends.step_roofline import StepRooflineBackend
+from atom.compass.fit import device
 from atom.compass.spec import MachineSpec, SpecRefusal
 from atom.compass.validate import bound, project
 
@@ -40,7 +41,7 @@ def ran(path, lines):
 
 def test_a_projected_device_keeps_its_peaks_at_the_others_probed_ratios():
     mi355x, mi308x = spec(MI355X), spec(MI308X)
-    p = project.projected(mi355x, mi308x)
+    p = device.projected(mi355x, mi308x)
 
     for path in ("device.arch", "device.compute.bf16_flops", project.BANDWIDTH):
         assert p.value(path) == mi355x.value(path)
@@ -63,7 +64,7 @@ def test_a_projected_device_keeps_its_peaks_at_the_others_probed_ratios():
     with pytest.raises(SpecRefusal, match="fp4_flops"):
         p.value("device.compute.fp4_flops")
     # MI455's spec is the same method applied to MI355X.
-    mi455 = project.projected(spec(MI455), mi355x).values
+    mi455 = device.projected(spec(MI455), mi355x).values
     assert mi455 | {"name": None} == spec(MI455).values | {"name": None}
 
 
@@ -75,7 +76,7 @@ def test_bound_ratios_from_prices_records_at_the_projected_spec(monkeypatch, tmp
         _main(monkeypatch, tmp_path, [rec], more=["--machine", str(MI355X), *more])
 
     own, at_ratios = (r["step"]["analytical_s"]["prefill"]["total"] for r in reports)
-    machine = project.projected(spec(MI355X), spec(MI308X))
+    machine = device.projected(spec(MI355X), spec(MI308X))
     direct = bound.gate([rec], {"step": StepRooflineBackend(machine, STACK)})
     assert at_ratios == direct["step"]["analytical_s"]["prefill"]["total"] != own
 

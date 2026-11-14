@@ -183,7 +183,7 @@ def main(argv: list[str], again: bool = False) -> None:
         (out / LOG).open("w") as log,
     ):
         env["ATOM_DP_MASTER_PORT"] = str(dp_port)
-        # KFD lists an exited rank until it has freed the rank's GPU memory.
+        # KFD lists an exited rank until the driver releases it.
         kfd = serve._kfd()
         # The log's creation, on the clock a cache file's mtime reads.
         since = os.fstat(log.fileno()).st_mtime_ns

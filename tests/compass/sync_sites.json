@@ -5263,6 +5263,18 @@
    "mechanism_why": "in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so its cadence no simulated clock reads"
   },
   {
+   "id": "atom/compass/drive/measure_device.py::_freed::time.sleep(serve.POLL_S)::sleep#0",
+   "file": "atom/compass/drive/measure_device.py",
+   "symbol": "_freed",
+   "call": "time.sleep",
+   "expr": "time.sleep(serve.POLL_S)",
+   "shape": "sleep",
+   "peer": "none",
+   "why": "compass measure device's half-second cadence while it waits, up to SETTLE_S, for the driver to free an exited probe's memory before the next check",
+   "mechanism": "K9",
+   "mechanism_why": "in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so its cadence no simulated clock reads"
+  },
+  {
    "id": "atom/compass/kv/lmcache_mp.py::LMCacheMPShell._send::sock.send_multipart([pickle.dumps((ch, *rt.stamp_send(ch))), *frames])::p2p#0",
    "file": "atom/compass/kv/lmcache_mp.py",
    "symbol": "LMCacheMPShell._send",

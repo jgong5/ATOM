@@ -20,7 +20,7 @@ that samples a block drafter's draft-KV pass, `d_draft_kv_ns`, which runs
 before `forward_done_event`. On an MTP record only the target's price is
 compared, that pass's included; the drafter's is reported apart.
 With `--ratios-from`, the prices are --machine's datasheet peaks at the other
-spec's probed ratios (`project.projected`): run on a device's own records,
+spec's probed ratios (`fit.device.projected`): run on a device's own records,
 the report is the error of projecting it from the other.
 
 A data-parallel step (one with `moe_rows`) is read off every rank's line at
@@ -517,9 +517,8 @@ def main(argv: list[str]) -> None:
     )
     args = p.parse_args(argv[:cut])
 
+    from atom.compass.fit.device import projected
     from atom.compass.spec import MachineSpec
-
-    from .project import projected
 
     def spec(path):
         return MachineSpec.from_mapping(json.loads(Path(path).read_text()))
