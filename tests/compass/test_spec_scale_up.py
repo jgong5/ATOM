@@ -2,16 +2,15 @@
 """The FP4 matrix-core rate and the scale-up fabric's width, on the MI455 spec.
 
 The MI455 document is built the way its spec is authored: AMD's published
-numbers as a `datasheet` fragment, and everything nobody published or measured
-(the two link latencies, the derates and the stack) as an `assumed` one.
+numbers as `datasheet` fields, and everything nobody published or measured
+(the two link latencies, the derates and the stack) as `assumed` ones.
 """
 
 import pytest
-from test_spec_origin import saved
+from test_spec_origin import mixed
 from test_spec_schema import STACK, document, read, refusal_from
-from test_spec_verbs import fragment
 
-from atom.compass.spec import MachineSpec, SpecRefusal, merge, validate
+from atom.compass.spec import MachineSpec, SpecRefusal, validate
 from atom.compass.spec.rules import Rule
 
 MI455 = "mi455x-72gpu"
@@ -61,13 +60,8 @@ LATENCIES = (
 
 def mi455():
     """The MI455 spec as a file holds it."""
-    return saved(
-        merge(
-            [
-                fragment("datasheet", DATASHEET, machine=MI455, origin="datasheet"),
-                fragment("assumed", ASSUMED, machine=MI455, origin="assumed"),
-            ]
-        ).document
+    return mixed(
+        MI455, ({"origin": "datasheet"}, DATASHEET), ({"origin": "assumed"}, ASSUMED)
     )
 
 
@@ -113,26 +107,6 @@ def test_the_mi455_spec_loads_with_a_fabric_wider_than_its_node():
     assert spec.value("device.count_per_node") == 4
     assert spec.value("interconnect.intra_node.domain_devices") == 72
     assert spec.value("device.compute.fp4_flops") == 40.265e15
-    assert spec.origin("device.compute.fp4_flops") == {"origin": "datasheet"}
-    for path in LATENCIES:
-        assert spec.origin(path) == {"origin": "assumed"}
-
-
-def test_the_mi455_latencies_stay_assumed_through_a_re_merge():
-    first = mi455()
-    ptl = {"device": {"ptl": "disabled"}}
-    again = merge(
-        [
-            fragment(
-                "mi455.json",
-                {k: v for k, v in first.items() if k != "name"},
-                machine=MI455,
-            ),
-            fragment("probe", ptl, machine=MI455, date="2026-10-20"),
-        ]
-    )
-    spec = MachineSpec.from_mapping(saved(again.document))
-    assert spec.origin("device.ptl") == {"origin": "probed"}
     assert spec.origin("device.compute.fp4_flops") == {"origin": "datasheet"}
     for path in LATENCIES:
         assert spec.origin(path) == {"origin": "assumed"}

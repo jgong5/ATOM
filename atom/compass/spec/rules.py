@@ -15,10 +15,8 @@ class Rule(enum.Enum):
     """The rules a spec is read against, and the one a probe is held to."""
 
     SEPARATION = "the spec describes the machine, not the deployment"
-    ONE_MACHINE = "one spec describes one host"
     RANK_AGREEMENT = "ranks of one group measure one machine"
     DERATE = "a spec-peak number carries a derate"
-    PINNED_STACK = "the constants are pinned to a software stack"
     SHAPE = "the document has the shape the schema declares"
     TOTALITY = "a spec resolves every field the document was required to state"
     VERSION = "the reader knows the schema version the document was written to"

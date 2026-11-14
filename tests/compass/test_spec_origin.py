@@ -1,9 +1,8 @@
 """Where each field of a machine spec came from, and that it survives a save.
 
-A spec is merged from fragments of different origins, written to a file and
-read back, sometimes merged again with next week's probe. Each test here goes
-through that save: what a merge knew and did not write down is what these
-check for.
+A spec of several origins records each field's in `provenance.origins`. Each
+test here reads a document as a file holds it, so what a writer knew and did
+not write down is what these check for.
 """
 
 import copy
@@ -11,13 +10,13 @@ import json
 
 import pytest
 from test_spec_schema import DOCUMENT
-from test_spec_verbs import CLASS1, LINKS, fragment
 
-from atom.compass.spec import MachineSpec, SpecRefusal, merge
+from atom.compass.spec import MachineSpec, SpecRefusal
 from atom.compass.spec.fields import SCHEMA
 from atom.compass.spec.rules import Rule
 
 CARD = {"model": "Qwen/Qwen3.8-27B", "width": 1, "source_root": "commit:983e42973"}
+LATENCY = "interconnect.inter_node.link_latency_s"
 
 
 def saved(document):
@@ -35,24 +34,54 @@ def labels(spec):
             yield path
 
 
+def flat(body, prefix=""):
+    """A document body as its fields' dotted paths, each to its value."""
+    fields = {}
+    for key, value in body.items():
+        if isinstance(value, dict):
+            fields |= flat(value, f"{prefix}{key}.")
+        else:
+            fields[prefix + key] = value
+    return fields
+
+
+def mixed(name, *parts):
+    """The saved document of machine `name` holding each `(entry, body)` part's
+    fields, written dotted, and recording `entry` as the origin of each; a later
+    part's field replaces an earlier one's."""
+    values, origins = {}, {}
+    for entry, body in parts:
+        values |= flat(body)
+        origins |= dict.fromkeys(flat(body), entry)
+    provenance = {
+        "authored_by": "a person",
+        "date": "2026-09-18",
+        "origin": "mixed",
+        "origins": origins,
+    }
+    return saved({"schema_version": 1, "name": name, "provenance": provenance} | values)
+
+
 def three_origins():
-    """Probed and assumed fragments of one machine, the probes of two subjects."""
-    return [
-        fragment(
-            "ptl", {"device": {"ptl": "disabled"}}, subject={"model": "Qwen/Qwen3-8B"}
-        ),
-        fragment("class1", CLASS1, subject=CARD),
-        fragment("links", LINKS, origin="assumed"),
-    ]
+    """A saved spec of one machine whose fields have each origin: the device
+    probed on two subjects, a latency from a datasheet, the rest assumed."""
+    return mixed(
+        DOCUMENT["name"],
+        ({"origin": "probed", **CARD}, {"device": DOCUMENT["device"]}),
+        ({"origin": "probed", "model": "Qwen/Qwen3-8B"}, {"device.ptl": "disabled"}),
+        ({"origin": "assumed"}, {"interconnect": DOCUMENT["interconnect"]}),
+        ({"origin": "datasheet"}, {LATENCY: 5.0e-6}),
+    )
 
 
 def test_a_saved_spec_answers_origin_for_every_field():
-    spec = MachineSpec.from_mapping(saved(merge(three_origins()).document))
+    spec = MachineSpec.from_mapping(three_origins())
     assert spec.value("provenance.origin") == "mixed"
     answered = {label: spec.origin(label)["origin"] for label in labels(spec)}
-    assert set(answered.values()) == {"probed", "assumed"}
+    assert set(answered.values()) == {"probed", "datasheet", "assumed"}
     capacity = "device.memory.capacity_bytes"
     assert spec.origin(capacity) == {"origin": "probed", **CARD}
+    assert spec.origin(LATENCY) == {"origin": "datasheet"}
     assert spec.origin("interconnect.intra_node.derate") == {"origin": "assumed"}
     assert spec.origin("device.ptl") == {
         "origin": "probed",
@@ -60,56 +89,14 @@ def test_a_saved_spec_answers_origin_for_every_field():
     }
 
 
-def test_a_field_two_fragments_agree_on_is_assumed_only_if_both_assumed_it():
-    links = fragment("links", LINKS, origin="assumed")
-    probed = fragment("probe", {"interconnect": {"router_relay_s": 1.5e-3}})
-    sheet = fragment(
-        "datasheet",
-        {"interconnect": {"inter_node": {"link_latency_s": 5.0e-6}}},
-        origin="datasheet",
-    )
-    fragments = [*three_origins()[:2], probed, sheet, links]
-    document = saved(merge(fragments).document)
-    spec = MachineSpec.from_mapping(document)
-    assert spec.origin("interconnect.router_relay_s") == {"origin": "probed"}
-    assert spec.origin("interconnect.inter_node.link_latency_s") == {
-        "origin": "datasheet"
-    }
-    assert spec.origin("interconnect.inter_node.link_bandwidth_bytes_per_s") == {
-        "origin": "assumed"
-    }
-
-
-def test_a_saved_spec_merged_again_keeps_each_fields_origin():
-    first = saved(merge(three_origins()).document)
-    week_later = {"interconnect": {"inter_node": {"link_latency_s": 5.0e-6}}}
-    again = merge(
-        [
-            fragment("machine.json", {k: v for k, v in first.items() if k != "name"}),
-            fragment("probe", week_later, date="2026-09-25"),
-        ]
-    )
-    spec = MachineSpec.from_mapping(saved(again.document))
-    assert spec.origin("interconnect.inter_node.link_latency_s") == {"origin": "probed"}
-    assert spec.origin("interconnect.intra_node.link_latency_s") == {
-        "origin": "assumed"
-    }
-    capacity = "device.memory.capacity_bytes"
-    assert spec.origin(capacity) == {"origin": "probed", **CARD}
-
-
 def test_a_mixed_document_without_its_map_is_refused_by_name():
-    document = saved(merge(three_origins()).document)
+    document = three_origins()
     del document["provenance"]["origins"]
     spec = MachineSpec.from_mapping(document)
     with pytest.raises(SpecRefusal) as refused:
         spec.origin("device.memory.capacity_bytes")
     assert refused.value.rule is Rule.TOTALITY
     assert "records no origin for `device.memory.capacity_bytes`" in str(refused.value)
-    with pytest.raises(SpecRefusal, match="records no origin"):
-        merge(
-            [fragment("machine.json", {"device": document["device"]}, origin="mixed")]
-        )
 
 
 def test_a_document_of_one_origin_answers_without_the_map():
@@ -126,12 +113,13 @@ def test_a_document_of_one_origin_answers_without_the_map():
     "stated", ["guessed", "transferred-from:mi300x-8gpu", "transferred-from:", "", 7]
 )
 def test_an_origin_nobody_defined_is_refused(stated):
+    stanza = dict(DOCUMENT["provenance"], origin=stated)
     with pytest.raises(SpecRefusal, match="which is not an origin"):
-        fragment("class1", CLASS1, origin=stated)
+        MachineSpec.from_mapping(dict(DOCUMENT, provenance=stanza))
 
 
 def test_one_field_is_never_mixed_and_only_a_probed_one_has_a_subject():
-    document = saved(merge(three_origins()).document)
+    document = three_origins()
     origins = document["provenance"]["origins"]
     for entry, wanted in (
         ({"origin": "mixed"}, "which is not an origin"),
@@ -144,12 +132,13 @@ def test_one_field_is_never_mixed_and_only_a_probed_one_has_a_subject():
         )
         with pytest.raises(SpecRefusal, match=wanted):
             MachineSpec.from_mapping(broken)
+    stanza = dict(DOCUMENT["provenance"], origin="assumed", subject={"model": "m"})
     with pytest.raises(SpecRefusal, match="state it on a probed document only"):
-        fragment("links", LINKS, origin="assumed", subject={"model": "m"})
+        MachineSpec.from_mapping(dict(DOCUMENT, provenance=stanza))
 
 
 def test_origin_of_a_host_field_is_refused_as_of_any_unknown_path():
-    spec = MachineSpec.from_mapping(saved(merge(three_origins()).document))
+    spec = MachineSpec.from_mapping(three_origins())
     for path in ("host.http_intake.fixed_s", "device.memory.colour"):
         with pytest.raises(SpecRefusal, match="not a field of this schema"):
             spec.origin(path)
