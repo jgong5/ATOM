@@ -13,7 +13,10 @@ driver assigns the host, 127.0.0.1 unless the command names another, its ports
 and the run file, and
 refuses them, and the clock endpoint flag, among ATOM's arguments; an op graph
 run's file also holds ATOM's arguments, from which its engines trace a shape
-the store lacks (`run.ATOM_ARGS`). Each start
+the store lacks (`run.ATOM_ARGS`). A simulated server whose run file names
+a machine starts under `on_arch`, which imports aiter as on that machine's
+device first, so the server resolves its config, an FP8 quantization's dtype
+among it, as there, whatever device this host has. Each start
 takes a free `ATOM_DP_MASTER_PORT`: the port keys ATOM's compiled-graph cache,
 and the first start that loads that cache autotunes every graph's kernels
 again, whose configs stay loaded and read in `non_torch`. No later start loads
@@ -53,10 +56,12 @@ from atom.compass.backends.step_labels import TRACE
 from atom.compass.drive import jit_cache
 from atom.compass.drive.gpu import KFD, hip_visible, quiet
 from atom.compass.drive.identity import _device, _stack, identity
-from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _write_whole
+from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _machine, _write_whole
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 SERVER = (sys.executable, "-m", "atom.entrypoints.openai.api_server")
+#: What a simulated server runs `SERVER`'s program under, before the arch.
+ON_ARCH = ("-m", "atom.compass.drive.on_arch")
 HOST = "127.0.0.1"
 #: Flags ATOM's arguments may not carry, in either spelling ATOM's parser
 #: accepts or any abbreviation argparse expands: the driver assigns the host,
@@ -212,6 +217,8 @@ def serve(
             run = {**run, "out_dir": str(out), "clock_endpoint": endpoint}
         run_file.write_text(json.dumps(run))
         argv += ["--compass-run", str(run_file)]
+        if "machine" in run:
+            argv[1:1] = [*ON_ARCH, _machine(run).value("device.arch")]
         ready |= {"clock_endpoint": run["clock_endpoint"], "run_file": str(run_file)}
     with held, _stop_signals() as stopped, quiet(gpus, out) if gpus else nullcontext():
         kfd = _kfd() if gpus else None

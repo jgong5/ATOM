@@ -29,6 +29,8 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   config ATOM's arguments resolve, as `drive.run.check` resolves one,
   and ``backend``'s digest is over every law's in any order, their provenance
   ``entries``.
+- ``--lmcache-offload FILE``, the ``lmcache_offload`` entry
+  `step_linear_fit`'s offload form writes, at that key.
 - ``--device``, ``--ptl``, ``--stack`` and ``--network``, the platform
   flags, whose spec `spec` composes, as ``machine``; ``--store``'s root as
   ``store``; ``--on-refusal``;
@@ -85,6 +87,9 @@ def add_arguments(parser) -> None:
     backend.add_argument("--op-graph", dest=run.OP_GRAPH, action="store_true")
     parser.add_argument(
         "--host-laws", metavar="KEY", action="append", help="a token or law file"
+    )
+    parser.add_argument(
+        "--lmcache-offload", metavar="FILE", help="the lmcache_offload entry"
     )
     parser.add_argument("--device", required=True, help="the datasheet, SKU or path")
     parser.add_argument("--ptl", required=True, choices=("enabled", "disabled"))
@@ -198,9 +203,11 @@ def build(args, atom_args, across: bool = False) -> dict:
             resolve(store, "host", k, machine, atom_args)[0] for k in args.host_laws
         ]
         out["host"] = hosts if len(hosts) > 1 else hosts[0]
-        out |= _hops(hosts, atom_args)
+        out |= _hops(hosts, atom_args, machine.value("device.arch"))
     if args.padding:
         out["padding"] = args.padding
+    if entry := getattr(args, "lmcache_offload", None):
+        out["lmcache_offload"] = json.loads(Path(entry).read_text())
     return out
 
 
@@ -246,7 +253,8 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     out[run.DP_WIDTHS["P"]] = _dp_width(prefill_args)
     out[run.DP_WIDTHS["D"]] = _dp_width(decode_args)
     if hosts := run.entries(out, "host"):
-        out[run.DECODE_HOPS] = _hops(hosts, decode_args)
+        arch = run._machine(out).value("device.arch")
+        out[run.DECODE_HOPS] = _hops(hosts, decode_args, arch)
     return out | {
         "router_s": ROUTER_RELAY_S,
         "kv_link": kv_link,
@@ -283,17 +291,17 @@ def _model_digest(model: str) -> str:
     return run._file_digest(model, "config.json")
 
 
-def _hops(hosts: list, atom_args) -> dict:
+def _hops(hosts: list, atom_args, arch: str) -> dict:
     """The ``hops`` of the entry of `hosts` fitted under the config ATOM's
-    arguments `atom_args` resolve, picked as the runner picks its own
-    (`run.pick_fitted`); the hops every entry states alike as they are, with no
-    config resolved."""
+    arguments `atom_args` resolve on a device of `arch`, picked as the runner
+    picks its own (`run.pick_fitted`); the hops every entry states alike as
+    they are, with no config resolved."""
     host = hosts[0]
     if any(h.get("hops") != host.get("hops") for h in hosts):
         from atom.compass.drive.run import _config
 
         picked = {"host": hosts}
-        run.pick_fitted(picked, "host", _config(atom_args))
+        run.pick_fitted(picked, "host", _config(atom_args, arch))
         host = picked["host"]
     return host.get("hops", {})
 

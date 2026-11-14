@@ -3,8 +3,9 @@
 #
 # QUICKSTART.md's path end to end at concurrency 1 on one GPU, in about an hour:
 # `compass measure memory`; a calibration `compass record` serving cc-traces 353
-# on; `compass fit steps` (step linear, history form) and `compass fit host` on
-# it; two real `compass record` runs and one `compass run`, serving traces 0 on;
+# on; `compass fit steps` (step linear, history form, MODEL's MoE routing) and
+# `compass fit host` on it; two real `compass record` runs and one `compass
+# run`, serving traces 0 on;
 # then the cell graded by `python -m atom.compass.validate`. Each server serves
 # one `client.sh` run, with its warmup, which stops it. The fits run before the
 # real runs, so a failed fit costs no more GPU time.
@@ -120,7 +121,7 @@ serve warm "$OUT/warm" "$CELL" "$AIPERF_PYTHON" record --gpu "$GPU"
 serve calibration "$OUT/calibration" "$CAL" "$AIPERF_PYTHON" record --gpu "$GPU"
 RUNS=(--client-run "$OUT/calibration" "$OUT/calibration/artifacts/client_run.json")
 step fit_steps python3 -c "$CLI" fit steps --backend step-linear --form history \
-    "$OUT/calibration" "${RUNS[@]}" "${M[@]}" --out "$OUT/fit_steps"
+    --model "$MODEL" "$OUT/calibration" "${RUNS[@]}" "${M[@]}" --out "$OUT/fit_steps"
 step fit_host python3 -c "$CLI" fit host "$OUT/calibration" "${RUNS[@]}" "${M[@]}" --out "$OUT/fit_host"
 LAW=$(token "$OUT/fit_steps.log") HOST=$(token "$OUT/fit_host.log")
 for k in 1 2; do

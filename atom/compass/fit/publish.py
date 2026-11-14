@@ -73,6 +73,7 @@ SAME_OPS = (
     "kv_cache_block_size",
     "index_cache_dtype",
     "speculative",
+    "draft_model",
 )
 
 

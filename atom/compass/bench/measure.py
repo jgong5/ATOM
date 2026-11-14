@@ -48,7 +48,9 @@ refuses, naming it. Its member `MEMBER` holds the view, `seconds` (the median
 of the bench's kept repeats, under a drafter of their target's parts, and
 `draft_seconds` that of their drafter's parts), the repeats, the protocol,
 the replay rule, the origin, the inputs it came from (`sources`) and the
-`traces` their lines served. A batch the rule or the bench refuses is not
+`traces` their lines served, and `group_needs_eager`, true, where the bench
+ran the batch eagerly because an attention backend refused it a graph, as a
+step-record line states it. A batch the rule or the bench refuses is not
 published; the command measures the rest, then fails naming each. `<out>`
 also holds run.json, with the warm-up's and the measuring's boundaries, the
 engine file and the GPU checks.
@@ -56,6 +58,9 @@ engine file and the GPU checks.
 The bench holds the largest KV pool its inputs' engines state, whatever this
 device's own budget gives, so every batch they ran, and every point planned
 for that pool, fits it.
+
+The API server's flags `compass record` serves with (`measure_memory.FRONTEND`)
+are taken and dropped; any other flag ATOM's engine lacks refuses.
 """
 
 import argparse
@@ -297,18 +302,22 @@ def atom_config(atom_args, server: bool = False):
     """ATOM's `Config` for its arguments, as `LLMEngine` resolves one and
     `CoreManager` rewrites it under DP attention, each TP rank a DP rank of TP 1.
     With `server`, `atom_args` are a server's, whose own flags pass unread, and
-    no tokenizer loads; otherwise any flag the engine does not define refuses,
-    and the config gets the tokenizer's ids and the end-of-sequence id apart
-    from the stop ids."""
+    no tokenizer loads; otherwise the server's flags `compass record` passes it
+    (`measure_memory.FRONTEND`) are taken and dropped, any other flag the engine
+    does not define refuses, and the config gets the tokenizer's ids and the
+    end-of-sequence id apart from the stop ids."""
     import dataclasses
 
     from atom.compass.bench.ranks import layout
+    from atom.compass.drive.measure_memory import FRONTEND
     from atom.compass.drive.runfile import _engine_args
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
     from atom.model_engine.llm_engine import _load_tokenizer
 
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
+    for flag, kind in FRONTEND.items():
+        parser.add_argument(flag, **kind)
     parsed = _engine_args(atom_args) if server else parser.parse_args(atom_args)
     engine_args = EngineArgs.from_cli_args(parsed)
     names = {f.name for f in dataclasses.fields(Config)}
@@ -559,6 +568,8 @@ def _measure(bench, config, sampling, store, command, readings, todo) -> list[st
             "sources": sorted(point["sources"]),
             "traces": sorted(point["traces"]),
         } | ({"plan": point["plan"]} if "plan" in point else {})
+        if got.get("group_needs_eager"):
+            member["group_needs_eager"] = True
         roots = roots or roots_for({"atom": "atom", "aiter": "aiter"})
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         store.publish(
