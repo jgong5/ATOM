@@ -271,6 +271,38 @@ def test_a_law_s_sources_are_each_folded_with_their_own_records_form_and_options
     assert written["sources"]["two"]["figures"] == two
 
 
+def test_a_source_whose_steps_the_fit_cuts_refuses_rather_than_grading_none(
+    tmp_path,
+):
+    """Records that ran no trace give no prefill busy time, so the fit cuts
+    every step a prefill source prices: that source refuses, naming the cut,
+    and writes no figures; a decode source of the same records is folded."""
+    law, records = _fits(tmp_path, _plain)
+    for record in records:
+        lines = [json.loads(line) for line in record.read_text().splitlines()]
+        untraced = [{k: v for k, v in x.items() if k[:2] != "b_"} for x in lines]
+        record.write_text("".join(json.dumps(x) + "\n" for x in untraced))
+    rungs = [f"decode {k}" for k in law["decode"]]
+    law["runs"] = list(map(digest, records))
+    law["sources"] = {
+        "prefill": {"runs": [0, 1, 2], "vectors": ["prefill"]},
+        "decode": {"runs": [0, 1, 2], "vectors": rungs},
+    }
+    del law["figures"]
+    file = tmp_path / "law.json"
+    file.write_text(json.dumps(law))
+    argv = ["figures", *map(str, records), "--law", str(file), "--source"]
+
+    cut = "its vectors are ['prefill'], and the fit cuts each step they price: "
+    with pytest.raises(ValueError, match=re.escape(f"uncut steps: {cut}{{'untraced'")):
+        main([*argv, "prefill"])
+    assert "figures" not in json.loads(file.read_text())["sources"]["prefill"]
+    main([*argv, "decode"])
+    folded = json.loads(file.read_text())["sources"]["decode"]["figures"]
+    assert list(folded) == law["runs"]
+    assert all(set(kinds) == {"decode"} for kinds in folded.values())
+
+
 @pytest.mark.parametrize(
     "fitted",
     [(), ("--form", "history", "--moe-routing", "64,4")],
