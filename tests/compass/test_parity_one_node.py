@@ -15,26 +15,39 @@ from pathlib import Path
 
 import pytest
 from test_drive_gpu import GPU45, SHOWHW
+from test_launcher_held_ports import HELD, SQUAT
 
-from atom.compass.artifacts import machine_spec_key
+from atom.compass.artifacts import machine_platform
 from atom.compass.runner.pp_send import carrier_models
 from atom.compass.spec import MachineSpec
 
 ROOT = Path(__file__).resolve().parents[2]
 STUB = """#!/bin/bash
+await() { for _ in {1..600}; do [ -e "$1" ] && return; sleep 0.1; done; exit 1; }
+# The simulated run file names a machine: its servers start under on_arch.
+[ "$2" = atom.compass.drive.on_arch ] && shift 3
 case "$1 $2" in
 "-m atom.entrypoints.openai.api_server")
+    # As a real DP pair's group handshake orders them: rank 1 starts after rank 0,
+    # and rank 0 listens only once rank 1 is up.
+    dp=$STUB_LOG.dp${ATOM_DP_MASTER_PORT-}
+    case "$*" in *"--data-parallel-rank 1"*) await "$dp.0" ;; esac
     echo "$* GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES-} ATOM_NUMA_BIND=${ATOM_NUMA_BIND-}" >> "$STUB_LOG"
     echo "${HIP_VISIBLE_DEVICES-} ${ATOM_DP_MASTER_PORT-}" >> "$STUB_LOG.env"
+    case "$*" in
+    *"--data-parallel-rank 0"*) touch "$dp.0" && await "$dp.1" ;;
+    *"--data-parallel-rank 1"*) touch "$dp.1" ;;
+    esac
     if [ -n "${TREE1_EXITS-}" ]; then
         case "$*" in *"--data-parallel-rank 1"*) exit 1 ;; esac
         exec sleep 60
     fi
     echo "Uvicorn running"
-    case "$*" in *--compass-run*) exit 0 ;; esac
+    # A simulated server's run ends after its traffic.
+    case "$*" in *--compass-run*) await "$STUB_LOG.sent"; exit 0 ;; esac
     exec sleep 60 ;;
 "-m atom.compass.parity.traffic")
-    [ -n "${ATOM_COMPASS_RUN-}" ] && exit 0
+    [ -n "${ATOM_COMPASS_RUN-}" ] && touch "$STUB_LOG.sent" && exit 0
     mkdir -p "$5" && echo '{"sent_ns": [0], "admitted_ns": [2000000]}' > "$5/arrivals.json"
     exit 0 ;;
 "-m atom.compass.parity")
@@ -189,21 +202,6 @@ def test_dsv4_dpa8_without_a_machine_starts_nothing(tmp_path):
     assert servers == []
 
 
-def test_a_spec_that_measured_the_models_tokenizer_names_it_once(tmp_path):
-    arch = "DeepseekV4ForCausalLM"
-    machine = json.loads(
-        (ROOT / "scripts/compass/machines/mi308x-hjbog18.json").read_text()
-    )
-    machine["host"]["tokenizers"][0]["applies_to"].append(arch)
-    (tmp_path / "spec.json").write_text(json.dumps(machine))
-    r, _, run = _parity(
-        tmp_path, CONFIG="dsv4-dpa8", MACHINE=str(tmp_path / "spec.json")
-    )
-    assert r.returncode == 0, r.stderr
-    tokenizers = json.loads(run.read_text())["machine"]["host"]["tokenizers"]
-    assert [a for t in tokenizers for a in t["applies_to"]].count(arch) == 1
-
-
 def test_unset_store_measures_first_with_the_servers_flags_and_environment(tmp_path):
     machine = ROOT / "scripts/compass/machines/mi308x-hjbog18.json"
     r, servers, run = _parity(
@@ -302,7 +300,7 @@ def test_pp2_runs_two_stages_on_two_gpus_and_compares_each_stage(tmp_path):
     assert spec["machine"]["name"] == json.loads(machine.read_text())["name"]
     # Node 18's cards read PTL enabled, and a stage send is priced on each carrier.
     stated = MachineSpec.from_mapping(spec["machine"])
-    assert machine_spec_key(stated).values["ptl"] == "enabled"
+    assert machine_platform(stated)["ptl"] == "enabled"
     assert set(carrier_models(stated)) == {"rccl", "gloo"}
     compares = (tmp_path / "servers.log.compare").read_text().splitlines()
     assert [c.rsplit(" --stage ", 1)[1] for c in compares] == ["0", "1"]
@@ -310,3 +308,28 @@ def test_pp2_runs_two_stages_on_two_gpus_and_compares_each_stage(tmp_path):
         f"parity_one_node: pp{k} dp0 compared=3 identical=3 first_divergence=None"
         for k in (0, 1)
     ]
+
+
+#: Another process, then a server, on a server's port, its engine's and each
+#: port of its DP master block.
+SQUAT_SERVER = """
+import os, sys
+a, m = sys.argv[1:], int(os.environ["ATOM_DP_MASTER_PORT"])
+ports = [a[a.index(f) + 1] for f in ("--server-port", "--port")]
+sys.argv[1:] = [*ports, *map(str, range(m, m + 113))]
+""" + SQUAT
+
+
+def test_dp_two_trees_holds_each_port_its_servers_are_handed(tmp_path, monkeypatch):
+    squat = '[ -n "${SQUAT-}" ] && "$REAL_PYTHON" -c "$SQUAT" "$@" >>"$STUB_LOG.squat"'
+    stub = STUB.replace("    dp=$STUB_LOG.dp", f"    {squat}\n    dp=$STUB_LOG.dp", 1)
+    monkeypatch.setitem(globals(), "STUB", stub)
+    r, _, _ = _parity(
+        tmp_path,
+        HIP_VISIBLE_DEVICES="4,5,6,7",
+        CONFIG="dp-two-trees",
+        SQUAT=SQUAT_SERVER,
+    )
+    assert r.returncode == 0, r.stderr
+    squatted = (tmp_path / "servers.log.squat").read_text().splitlines()
+    assert [line.split()[1:] for line in squatted] == [HELD] * 4 * 115

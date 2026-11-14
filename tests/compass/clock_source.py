@@ -53,16 +53,29 @@ import os
 from collections import Counter
 from dataclasses import dataclass
 
-#: The calls that return real seconds. An asyncio timer is not one: it runs on
-#: the event loop's clock, which a simulated run replaces. The `_ns` forms are
-#: the same machine clocks in different units, and a number divided by a
+#: The calls that return real seconds: the wall, monotonic and performance
+#: clocks, the process and thread CPU clocks, and `datetime.datetime`'s current
+#: time however it is asked for. CPU seconds are real seconds too: a step
+#: charged its own CPU time has machine time in it all the same. The `_ns` forms
+#: are the same machine clocks in different units, and a number divided by a
 #: billion after the fact is not distinguishable from one taken in seconds, so
 #: they are listed beside them rather than under them.
+#:
+#: **What is left out, and why.** An asyncio timer, `loop.time()` included, runs
+#: on the event loop's clock, which a simulated run replaces. `time.sleep` waits
+#: and reads nothing. `time.localtime`, `time.gmtime`, `time.ctime`,
+#: `time.strftime` and `datetime.date.today` read the machine clock and hand
+#: back a calendar date or a string, which no record adds up as seconds without
+#: a conversion call a reviewer sees. `os.times` and `resource.getrusage` read
+#: CPU seconds and have not been tried. A call through `atom.utils.time_shim`
+#: resolves to the shim and not to `time`, so a module that imports the shim as
+#: `time` reads the simulated clock at every clock call: the shim exposes no
+#: real read.
 #:
 #: **Every entry is the fully qualified name, because the comparison is exact.**
 #: A tail match would hand the whole list to any receiver whose attribute
 #: happens to be spelled the same -- `self.time.monotonic()`, `row.datetime.now()`,
-#: a `time` imported from somewhere that is not the standard library. The two
+#: a `time` imported from somewhere that is not the standard library. The
 #: `datetime` entries are written out to `datetime.datetime` for the same
 #: reason; `from datetime import datetime` resolves to exactly that, so the
 #: short spelling costs nothing and the long one cannot be reached by accident.
@@ -75,8 +88,13 @@ CLOCK_READS = (
     "time.perf_counter_ns",
     "time.clock_gettime",
     "time.clock_gettime_ns",
+    "time.process_time",
+    "time.process_time_ns",
+    "time.thread_time",
+    "time.thread_time_ns",
     "datetime.datetime.now",
     "datetime.datetime.utcnow",
+    "datetime.datetime.today",
 )
 
 #: Files whose real-clock reads are deliberate, and why. A path matches on whole
@@ -85,8 +103,10 @@ CLOCK_READS = (
 #: does not collect the exemption.
 DEFAULT_ALLOW_LIST: dict[str, str] = {
     "atom/compass/run/__init__.py": (
-        "the run summary's wall seconds, from the run's start to its finish, "
-        "and each lazy trace's: the speed result, which no simulated time reads"
+        "the run summary's wall seconds, each client run's from its client's "
+        "first request to its end, and each lazy trace's: the speed result, "
+        "which no simulated time reads; and a recorded real run's tokenizer-call "
+        "and HTTP intake stamps, which a simulated run never installs"
     ),
     "atom/compass/parity/runner.py": (
         "a real runner's step timestamps; a simulated run runs its own runner "
@@ -125,6 +145,15 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
         "when measure memory published its entry, for the entry's provenance; it "
         "starts a real engine and never runs inside a simulated run"
     ),
+    "atom/compass/drive/measure_device.py": (
+        "when measure device published its record, for the entry's provenance; "
+        "it probes real devices and never runs inside a simulated run"
+    ),
+    "atom/compass/drive/pp_probe.py": (
+        "the PP carrier probe's send and receive stamps, on the monotonic clock "
+        "both its ranks share; it times two real devices and never runs inside "
+        "a simulated run"
+    ),
     "atom/compass/validate/project.py": (
         "when compass project published its projection, for the entry's "
         "provenance; it prices recorded steps offline and never runs inside a "
@@ -160,6 +189,10 @@ _SAVE_LEASE = (
     "lmcache_mp scheduler overrides it to release nothing, and every other "
     "offload backend is refused"
 )
+_TRACE = (
+    "a request's OpenTelemetry span times, exported only when tracing is "
+    "configured; no simulated result reads them"
+)
 _COMPILE = "torch.compile at startup, before the simulated window"
 _LOAD = "loads or warms up the model at startup, before the simulated window"
 _WORKER_RPC = (
@@ -180,7 +213,8 @@ _CONTROL_DEADLINE = (
 #: kept one is not excused by it. K8 stays real on purpose, out of the clock
 #: authority's reach; K9 is outside the model -- outside the simulated window,
 #: in code a simulated run replaces, or a timing only a log line reads. Every
-#: other read takes the LP clock through `atom.utils.clock.now`.
+#: other read takes the LP clock through `atom.utils.clock.now` or
+#: `atom.utils.time_shim`.
 # fmt: off
 _KEPT_REAL = (
     ("atom/model_engine/async_proc.py", "exit", "time.monotonic",
@@ -287,6 +321,14 @@ _KEPT_REAL = (
                 ("record_kv_cache_ready", "monotonic", 1), ("_record_write_ack", "monotonic", 1),
                 ("_report_held_failures", "monotonic", 1), ("start_load_kv", "monotonic", 1),
                 ("_write_listener", "monotonic", 1), ("_write_mla_slot", "monotonic", 1))),
+            ("disaggregation/moriio/moriio_connector.py", (
+                ("_accept_write_request", "monotonic", 1),
+                ("_collect_write_reports", "time", 1), ("_finish_write", "monotonic", 1),
+                ("_forget_finished_writes", "monotonic", 1), ("_hold_failure", "monotonic", 1),
+                ("_issue_ready_reads", "monotonic", 1),
+                ("_report_held_failures", "monotonic", 1), ("_request_write", "time", 1),
+                ("_service_write_requests", "monotonic", 1),
+                ("_service_write_requests", "time", 1), ("start_load_kv", "monotonic", 1))),
             ("offload/mooncake_store/client.py", (
                 ("__init__", "monotonic", 1), ("__init__", "time", 1),
                 ("seconds", "monotonic", 1), ("seconds", "time", 1))),
@@ -306,6 +348,8 @@ _KEPT_REAL = (
         )
         for scope, call, n in scopes
     ),
+    ("atom/model_engine/segment_tokenizer.py", "_encode_cached", "time.perf_counter",
+     "K9", _LOG_ONLY, 2),
     ("atom/model_loader/expert_staging.py", "_ensure_staging", "time.perf_counter",
      "K9", _LOAD, 2),
     ("atom/model_loader/loader.py", "load_model", "time.perf_counter", "K9", _LOAD, 2),
@@ -319,6 +363,9 @@ _KEPT_REAL = (
     ("atom/spec_decode/drafter.py", "warmup_draft_graphs", "time.time", "K9", _LOAD, 2),
     ("atom/model_ops/eplb.py", "_execute_runtime_rebalance", "time.perf_counter",
      "K9", "moves expert weights inside the real forward, which a simulated run replaces", 4),
+    ("atom/observability/tracing.py", "now", "time.perf_counter_ns", "K9", _TRACE, 1),
+    ("atom/observability/tracing.py", "enqueue", "time.perf_counter_ns", "K9", _TRACE, 1),
+    ("atom/observability/tracing.py", "enqueue", "time.time_ns", "K9", _TRACE, 1),
     ("atom/rollout/weight_sync.py", "load_weights_via_ipc", "time.time",
      "K9", "pushes real weights to the GPU, which a simulated run never holds", 2),
     ("atom/utils/__init__.py", "shutdown_all_processes", "time.monotonic",
@@ -393,13 +440,13 @@ class ClockSourceLint:
         if self.allowed(path) is not None:
             return ()
         tree = ast.parse(source, filename=path)
-        origins = _origins(tree)
+        origins, imported = _origins(tree)
         spans = scopes(tree)
         found = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            call = _resolve(_dotted(node.func), origins)
+            call = _resolve(_dotted(node.func), origins, imported)
             if call in CLOCK_READS:
                 found.append(
                     ClockRead(path, node.lineno, call, scope_at(spans, node.lineno))
@@ -499,25 +546,35 @@ def _dotted(node) -> str | None:
     return ".".join(reversed(parts))
 
 
-def _origins(tree) -> dict[str, str]:
-    """Local name -> the dotted name it stands for: imports, and aliases of them.
+def _origins(tree) -> tuple[dict[str, str], set[str]]:
+    """Local name -> the dotted name it stands for: imports, and aliases of them;
+    and the local names whose origin is an import.
 
     An alias is an assignment whose right-hand side is a dotted name, and it is
     recorded whole -- `self._clock = time.perf_counter` binds `self._clock`, not
     `self` -- so that the call it enables resolves the same way an import does.
     The first binding a name gets is the one kept: a name assigned twice says
     two things, and the check is not an interpreter.
+
+    A relative import keeps its leading dots, so a sibling module that happens
+    to be called `time` resolves to `.time` and never to the standard library.
     """
     origins: dict[str, str] = {}
+    imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                origins.setdefault(alias.asname or alias.name.split(".")[0], alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module:
+                name = alias.asname or alias.name.split(".")[0]
+                if name not in origins:
+                    origins[name] = alias.name
+                    imported.add(name)
+        elif isinstance(node, ast.ImportFrom):
+            package = "." * node.level + (f"{node.module}." if node.module else "")
             for alias in node.names:
-                origins.setdefault(
-                    alias.asname or alias.name, f"{node.module}.{alias.name}"
-                )
+                name = alias.asname or alias.name
+                if name not in origins:
+                    origins[name] = package + alias.name
+                    imported.add(name)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             source = _dotted(node.value)
             if source is None:
@@ -527,10 +584,12 @@ def _origins(tree) -> dict[str, str]:
                 name = _dotted(target)
                 if name is not None and name != source:
                     origins.setdefault(name, source)
-    return origins
+    return origins, imported
 
 
-def _resolve(call: str | None, origins: dict[str, str]) -> str | None:
+def _resolve(
+    call: str | None, origins: dict[str, str], imported: set[str]
+) -> str | None:
     """Rewrite a call's head through the imports and aliases that introduced it.
 
     An alias can stand on an alias, and `ast.walk` does not visit the bindings
@@ -539,6 +598,11 @@ def _resolve(call: str | None, origins: dict[str, str]) -> str | None:
     legitimately stand for one that contains it -- `from datetime import
     datetime` binds `datetime` to `datetime.datetime` -- and expanding that a
     second time would grow the name instead of resolving it.
+
+    A name an import binds is the end of the chain: what it stands for is a
+    module's own name, not a local one. `import time as wall` beside
+    `from atom.utils import time_shim as time` makes `wall.monotonic` the
+    standard library's read, not the shim's.
     """
     if call is None:
         return None
@@ -549,6 +613,7 @@ def _resolve(call: str | None, origins: dict[str, str]) -> str | None:
             if call in expanded:
                 return call
             expanded.add(call)
+            final = call in imported
         else:
             head, _, rest = call.partition(".")
             head_origin = origins.get(head)
@@ -556,8 +621,9 @@ def _resolve(call: str | None, origins: dict[str, str]) -> str | None:
                 return call
             expanded.add(head)
             origin = f"{head_origin}.{rest}" if rest else head_origin
-        if origin == call:
-            return call
+            final = head in imported
+        if origin == call or final:
+            return origin
         call = origin
 
 

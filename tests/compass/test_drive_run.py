@@ -14,7 +14,6 @@ summary into its out_dir; the summary after a refused step is the one
 
 import dataclasses
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,7 +24,7 @@ from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_capture_v4_pro import CONFIG as V4_PRO
 from test_dp_step_max import runner
 from test_drive_runfile import build, price_list_key, published
-from test_drive_trace_steps import IDENTITY
+from test_drive_trace_steps import IDENTITY, plant_module
 from test_memory_readings import ASSUMED, DOCUMENT, READINGS
 from test_op_graph import BENT, GEMM, g, listed, pt
 from test_op_work_v4 import MORI
@@ -56,7 +55,8 @@ from atom.compass.backends.provenance import Method, Provenance
 from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.backends.work import Work
-from atom.compass.capture.forward import structure
+from atom.compass.capture import population_shapes
+from atom.compass.capture.forward import Shape, structure
 from atom.compass.clock import RefusalTally
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import serve, trace_steps
@@ -90,7 +90,7 @@ def bundle(tmp_path, monkeypatch, member, **config):
     backend = loaded(tmp_path, member)
     bounds = {k: ENGINE[k] for k in ("max_num_seqs", "max_num_batched_tokens")}
     r = deployment(tmp_path, **{**bounds, **config}, capture_sizes=LADDER)
-    monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args, arch=None: r.config)
     return Key.of(Kind.STEP_GRID_BUNDLE, **KEY).token(), backend
 
 
@@ -124,8 +124,7 @@ def refused_summary(directory, monkeypatch):
 def plant(tmp_path, monkeypatch, steps, summary) -> None:
     """Serve from the planted server, which writes the record `steps` and
     client run 0's summary `summary`."""
-    (tmp_path / "planted.py").write_text(PLANTED)
-    monkeypatch.setattr(serve, "SERVER", (sys.executable, str(tmp_path / "planted.py")))
+    plant_module(tmp_path, monkeypatch, PLANTED)
     monkeypatch.setattr(serve, "identity", lambda *args: IDENTITY)
     monkeypatch.setenv("PLANTED_RECORD", str(steps))
     monkeypatch.setenv("PLANTED_SUMMARY", str(summary))
@@ -247,6 +246,19 @@ def test_a_prefill_or_a_decode_instance_refuses_before_its_server_starts(
     assert not (tmp_path / "out").exists()
 
 
+def test_run_and_trace_steps_refuse_a_decode_instance_with_one_message(tmp_path):
+    kv = json.dumps({"kv_connector": "compass", "kv_role": "kv_consumer"})
+    atom = ["--kv-transfer-config", kv]
+    argv = flags(tmp_path, "--step-stub", stub(tmp_path), atom=atom)
+
+    with pytest.raises(ValueError) as ran:
+        drive_run.main(argv)
+    with pytest.raises(ValueError) as traced:
+        trace_steps.main(argv)
+    assert str(traced.value) == str(ran.value)
+    assert "makes this a decode instance" in str(ran.value)
+
+
 def test_run_json_records_the_summarys_refusals_the_roofline_and_the_backend(
     tmp_path, monkeypatch
 ):
@@ -302,6 +314,60 @@ def test_a_covered_run_starts_and_records_its_check_over_a_record_and_a_populati
     provenance = handed["backend"] | {"memory_readings_assumed": []}
     assert written["provenance"] == provenance
     assert handed["step_grid"]["grid"] == KEY["grid"]
+
+
+def beside_an_idle_rank(directory, idle):
+    """Move `directory`'s record, served by DP rank 0, to rank ``1 - idle``,
+    and write rank `idle` as a DP rank no request reached: at each served step,
+    the dummy forward it runs to keep step with its group."""
+    steps = directory / serve.STEPS
+    lines = [json.loads(x) for x in (steps / "dp0.jsonl").open()]
+    engine = (steps / "dp0.engine.json").read_text()
+    dummy = {"is_dummy_run": True, "batch": [], "named": []}
+    for rank in (0, 1):
+        own = {"dp_rank": rank, **(dummy if rank == idle else {})}
+        written = "".join(json.dumps(line | own) + "\n" for line in lines)
+        (steps / f"dp{rank}.jsonl").write_text(written)
+        (steps / f"dp{rank}.engine.json").write_text(engine)
+
+
+def test_coverage_counts_each_dp_rank_s_served_steps_by_name_and_no_dummy_run(
+    tmp_path, monkeypatch
+):
+    # Two DP ranks in each input, one idle: the record's rank 1 and the
+    # population's rank 0.
+    monkeypatch.setattr(
+        trace_steps, "roots_for", lambda modules: (ATOM_ROOT, AITER_ROOT)
+    )
+    directory = recorded(tmp_path, monkeypatch, MIXED)
+    served = recorded(tmp_path, monkeypatch, SHORT)
+    planned = plan(directory / serve.STEPS, served / serve.STEPS)
+    points = located(tmp_path, planned)
+    member = measured(planned, points, drop=("decode", points["decode"][0]))
+    token, backend = bundle(tmp_path, monkeypatch, member)
+    beside_an_idle_rank(directory, idle=1)
+    beside_an_idle_rank(served, idle=0)
+    run = build(tmp_path, "--step-stub", stub(tmp_path)) | {"data_parallel_size": 2}
+    population = trace_steps.publish(served, run, "compass trace steps").token()
+    (tmp_path / "authority").mkdir()
+    summary = tmp_path / "authority" / compass_run.SUMMARY_FILE
+    summary.write_text(json.dumps({"schedule": {"refusals": RefusalTally().record()}}))
+    plant(tmp_path, monkeypatch, directory / serve.STEPS, summary)
+
+    inputs = [str(directory), population]
+    drive_run.main(flags(tmp_path, "--step-grid", token, "--coverage", *inputs))
+
+    named = [
+        (f"{name} dp{rank} step {line['step']}", line)
+        for name, record, rank in ((inputs[0], directory, 0), (population, served, 1))
+        for line in map(json.loads, (record / serve.STEPS / f"dp{rank}.jsonl").open())
+    ]
+    declined = refusing(backend, named)
+    assert 0 < len(declined) < len(named)
+    coverage = json.loads((tmp_path / "out" / serve.RUN_JSON).read_text())["coverage"]
+    assert coverage["steps"] == len(named)
+    assert [d["step"] for d in coverage["declined"]] == declined
+    assert coverage["covered"] == len(named) - len(declined)
 
 
 #: The planted server, which also hands in the engine's memory as
@@ -480,8 +546,8 @@ def op_graph_run(tmp_path, monkeypatch, steps, price_list):
     graph `decode_gemm`."""
     bounds = {k: ENGINE[k] for k in ("max_num_seqs", "max_num_batched_tokens")}
     r = deployment(tmp_path, **bounds, capture_sizes=LADDER)
-    monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
-    monkeypatch.setattr(compass_run, "_op_graphs", lambda *args: decode_gemm)
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args, arch=None: r.config)
+    monkeypatch.setattr(compass_run, "_op_graphs", lambda *args, **kw: decode_gemm)
     if price_list:
         key = price_list_key(tmp_path)
         published(tmp_path, r, Kind.PRICE_LIST, key, price_list.params)
@@ -566,10 +632,10 @@ def test_coverage_of_a_v4_pro_ep8_run_asks_its_price_list_at_atom_s_ep_width(
     r = deployment(
         tmp_path, **bounds, capture_sizes=LADDER, enable_expert_parallel=True
     )
-    monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args, arch=None: r.config)
     kinds = ("aiter.fused_moe_.default", MORI + "dispatch", MORI + "combine")
     region = {"seq": [{"op": kind, "args": {}} for kind in kinds]}
-    monkeypatch.setattr(compass_run, "_op_graphs", lambda *args: lambda *s: region)
+    monkeypatch.setattr(compass_run, "_op_graphs", lambda *a, **kw: lambda *s: region)
     asked = Asked()
     monkeypatch.setattr(compass_run, "_price_list", lambda *args: asked)
     widths = set()
@@ -604,15 +670,11 @@ def test_coverage_of_a_v4_pro_dpa_run_reads_graphs_at_the_widths_its_ranks_run(
     atom += ["--max-num-seqs", "8", "--max-num-batched-tokens", "64"]
     atom += ["--max-model-len", "2048", "--cudagraph-capture-sizes", str(LADDER)]
     directory = recorded(tmp_path, monkeypatch, SHORT)
-    # Reading the quantization imports aiter, which a process with no driver
-    # cannot do; the build that reads the EP width does it in its own process.
-    quant = SimpleNamespace(compute_hash=lambda: "fp8", exclude_layers=[])
-    monkeypatch.setattr("atom.config.QuantizationConfig", lambda *args: quant)
     kinds = ("aiter.fused_moe_.default", MORI + "dispatch", MORI + "combine")
     region = {"seq": [{"op": kind, "args": {}} for kind in kinds]}
     structures = []
 
-    def graphs(root, config, arch):
+    def graphs(root, config, arch, env=None):
         structures.append(structure(config, "decode", True, arch))
         return lambda *shape: region
 
@@ -635,3 +697,68 @@ def test_coverage_of_a_v4_pro_dpa_run_reads_graphs_at_the_widths_its_ranks_run(
     assert asked.kinds == set(kinds)
     assert widths == {(kind, 1, 8) for kind in kinds}
     assert [s.endswith(" tp=1 dp=8 ep=8 decode eager") for s in structures] == [True]
+
+
+#: Each rank's lines, each its rows, the rows its MoE gathers and whether it is
+#: a dummy run. At step 0 each of two DP ranks prefills 9000 tokens, past the
+#: 8192-token bar the test sets, so the group splits it: at the token midpoint,
+#: or on a request boundary, each rank its own way round. At step 1 rank 1 runs
+#: a dummy, which cannot split, so rank 0 runs whole.
+FIRST, SECOND = [6000, 6000, False], [3000, 3000, False]
+GROUP = [
+    [([FIRST, SECOND], 18000, False), ([[9000, 9000, False]], 9001, False)],
+    [([SECOND, FIRST], 18000, False), ([[1, 1, True]], 9001, True)],
+]
+#: One rank, in no DP group, prefilling as much: it runs whole.
+ALONE = [[([FIRST, SECOND], None, False)]]
+
+
+@pytest.mark.parametrize(
+    "token_split,ranks",
+    [("1", GROUP), ("0", GROUP), ("1", ALONE)],
+    ids=["midpoint", "request", "one-rank"],
+)
+def test_coverage_under_tbo_reads_a_step_its_dp_group_split_as_its_micro_batches(
+    tmp_path, monkeypatch, token_split, ranks
+):
+    # The store holds the graphs `trace ops --population` traces from the
+    # record, all priced.
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
+    monkeypatch.setenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", token_split)
+    directory = tmp_path / "record"
+    (directory / serve.STEPS).mkdir(parents=True)
+    (directory / serve.RUN_JSON).write_text(json.dumps(IDENTITY))
+    for rank, steps in enumerate(ranks):
+        lines = [
+            {"step": n, "dp_rank": rank, "is_dummy_run": dummy, "rows": rows}
+            | {"rung": None, "produces_output": True}
+            | ({} if gathered is None else {"moe_rows": gathered})
+            for n, (rows, gathered, dummy) in enumerate(steps)
+        ]
+        path = directory / serve.STEPS / f"dp{rank}.jsonl"
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+        engine = ENGINE | {"tensor_parallel_size": 1}
+        path.with_suffix(".engine.json").write_text(json.dumps(engine))
+    bounds = {k: ENGINE[k] for k in ("max_num_seqs", "max_num_batched_tokens")}
+    dp = SimpleNamespace(data_parallel_size=len(ranks), data_parallel_rank=0)
+    r = deployment(
+        tmp_path, **bounds, capture_sizes=LADDER, enable_tbo=True, parallel_config=dp
+    )
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args, arch=None: r.config)
+    traced = set(population_shapes([str(directory)], tbo=True))
+
+    def graph(phase, tokens, seqs, output, gathered=None, micro_batch=False):
+        shape = Shape(phase, tokens, seqs, gathered, None, micro_batch)
+        if shape.at(len(ranks)) in traced:
+            return {"seq": [g(tokens, 64, 64)]}
+
+    monkeypatch.setattr(compass_run, "_op_graphs", lambda *args, **kw: graph)
+    monkeypatch.setattr(compass_run, "_price_list", lambda *args: Asked())
+    run = {"store": str(tmp_path / "store"), "machine": DOCUMENT}
+    run |= {compass_run.OP_GRAPH: True, compass_run.PRICE_LIST: {}}
+
+    report = drive_run.check([str(directory)], run, ["--model", str(tmp_path)])
+
+    served = sum(not dummy for steps in ranks for *_, dummy in steps)
+    assert report["left out, by leaf kind"] == {}
+    assert report["by phase"] == {"prefill": {"steps": served, "covered": served}}

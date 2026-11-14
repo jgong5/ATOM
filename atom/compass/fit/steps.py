@@ -1,72 +1,130 @@
 # SPDX-License-Identifier: MIT
 """`compass fit steps`: a step-level backend fitted on labelled samples and published.
 
-    compass fit steps --backend step-linear [--form FORM] [--seed S] RECORD...
-        --client-run RECORD EXPORT... --machine M --store ROOT --out DIR
+    compass fit steps --backend step-linear [--form FORM]
+        [--moe-routing E,K | --model DIR] [--seed S] RECORD...
+        --client-run RECORD EXPORT... [--ops DIR...] --machine M --store ROOT
+        --out DIR
     compass fit steps --backend step-grid --grid INPUT... --grid-definition FILE
         [--sessions A:B] [--seed S] TARGET... --client-run INPUT EXPORT...
-        --machine M --store ROOT --out DIR
+        [--ops DIR...] --machine M --store ROOT --out DIR
 
 Each backend in `BACKENDS` states the kind it publishes, the label sources it
 takes and its fit, which returns the key fields the configuration does not
 give, the params and the report; a flag only another backend reads refuses.
 The entry is published under the readings a run on the spec `--machine` names
-takes, which `publish.inputs` loads each measurement under.
+takes, which `publish.inputs` loads each measurement under. `--ops` names
+`measure ops --out` directories whose points take the profiler's floor out
+of a trace run's drafter labels (`publish.inputs`); the report's `floor`
+counts, per kernel the floor could not place and per label field, the steps
+the fit labels whose label keeps that kernel's recorded length.
 
 `step-linear` takes real runs only and fits `step_linear_fit.FORMS`' `--form`,
 `history` by default, joining each step's ranks at the engine config's
 `data_parallel_size`, so a record with a
-rank that gave no sample refuses; it holds out each run on the others when
+rank that gave no sample refuses; it pads prefill to the records'
+`prefill_buckets`, naming under `unfitted` records stating none, and holds
+out each run on the others when
 there are two or more, as that module's command does; `--seed` fixes
-its shuffles. The law states the configuration's
-`machine_spec` and `engine_config`, as that command's does, and the key holds them. The report's
+its shuffles. With `--moe-routing E,K`, the model's routed experts and top-k,
+the law states them as `moe_routing`, and each decode rung may adopt a MoE
+column over them, as that command's `--moe-routing` fits it. `--model DIR`
+reads them from the model directory the records served, as ATOM loads its
+config, and refuses one whose config.json is not the records'; a model that
+names no routed experts gives none. The law states,
+as `platform`, the platform fields of its key,
+and `engine_config`, as that command's does, and the key holds them. The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
 
 `step-grid` plans again over `--grid`'s inputs, record directories and
-`shape_population` tokens, with the nodes and margin `--grid-definition`
-states, as `measure steps` plans, and reads each planned point's
-`step_measurement` by its batch view under its targets' configuration,
-whichever replay or plan measured it; a planned point the store does not hold
-refuses, naming each, and no other measurement is read as a point. Its targets
+`shape_population` tokens, and over its ragged targets, with the nodes and
+margin `--grid-definition` states, as `measure steps` plans, and reads each
+planned point's `step_measurement` by its batch view under its targets'
+configuration, whichever replay or plan measured it; a planned point the store
+does not hold refuses, naming each, and no other measurement is read as a
+point. Its targets
 are records and the tokens of `measure steps`' replayed batches (`TARGET`); a
 planned point named as one refuses, and a ragged one (`measure steps
 --ragged`) fits the decode lookup's alpha, not the residual. `step_grid_fit.bundle` fits the bundle,
 keyed by the grid definition's digest; `--seed` fixes its held-out split. The
 report's provenance names each target run with every trace it served, and the
-plan with the `--grid` inputs it read and the traces their lines served.
+plan with the `--grid` inputs it read and the traces their lines served; the
+plan states it was not profiled, as the measurements at its points were not.
 
 A `--grid` input is read with the client runs a `--client-run` names for it,
 and one no `--client-run` names refuses, as `measure steps` refuses to plan
-over it. `--sessions A:B` keeps the `--grid` lines `measure steps --sessions
-A:B` keeps.
+over it; so does one that ran under another engine or sampling than the
+targets', naming the targets'. `--sessions A:B` keeps the `--grid` lines
+`measure steps --sessions A:B` keeps.
 """
 
 import copy
+import dataclasses
 import json
+from collections import Counter
 from pathlib import Path
 
-from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind
+from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind, keyed_platform
 from atom.compass.backends import step_grid_fit, step_linear_fit
-from atom.compass.backends.step_grid_plan import plan
 from atom.compass.bench import measure
 from atom.compass.fit import publish
 from atom.compass.fit.samples import MEMBER
+from atom.compass.run import _file_digest
 
 PROG = "compass fit steps"
 STUB = "a step stub's coefficients are stated, not fitted; a run takes their file"
+#: What a `--grid` input's engine and sampling are compared with, as a refusal
+#: names each.
+TARGETS = ("the targets'", "the targets' sampling is")
+#: The names a model's config gives its routed experts and its top-k by, as
+#: ATOM's models read them, the first one set taken.
+EXPERTS = ("n_routed_experts", "num_local_experts", "num_experts")
+TOP_K = ("num_experts_per_tok", "num_experts_per_token")
+
+
+def _model_routing(model: str, served: str) -> tuple[int, int] | None:
+    """The routed experts and top-k the model directory `model` states, read
+    from its config as ATOM's `Config` loads it, in its text config where it
+    has one; None for a model naming no routed experts. Refused unless its
+    config.json is `served`, the records' digest of theirs."""
+    from atom.config import _normalize_minimax_m3_text_config, get_hf_config
+
+    if (digest := _file_digest(model, "config.json")) != served:
+        raise ValueError(
+            f"--model {model} holds config.json {digest}; the records served {served}"
+        )
+    config = get_hf_config(model)
+    _normalize_minimax_m3_text_config(config)
+    config = getattr(config, "text_config", config)
+    experts, top_k = (
+        next((v for v in (getattr(config, n, None) for n in names) if v), None)
+        for names in (EXPERTS, TOP_K)
+    )
+    if experts and not top_k:
+        raise ValueError(
+            f"--model {model} names {experts} routed experts and no top-k "
+            f"({', '.join(TOP_K)})"
+        )
+    return (experts, top_k) if experts else None
 
 
 def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     form = args.form or "history"
     options = {"form": form, "dp": step_linear_fit.join_width(config["engine_config"])}
+    options["moe_routing"] = args.moe_routing or (
+        args.model and _model_routing(args.model, config["model"])
+    )
+    options["buckets"] = config.get("prefill_buckets")
     law, report = step_linear_fit.fit(samples, options, args.seed)
+    if options["buckets"] is None:
+        law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
     if len({s.provenance["run"] for s in samples}) > 1:
         step_linear_fit.mark_held_out(law, report, samples, options, args.seed)
     report["provenance"] = publish.runs(samples)
-    law["machine_spec"] = config["machine_spec"]
+    law["platform"] = keyed_platform(Kind.STEP_LINEAR_LAW, config["platform"])
     law["engine_config"] = config["engine_config"]
-    return {"form": form, "machine_spec": law["machine_spec"]}, law, report
+    return {"form": form, **law["platform"]}, law, report
 
 
 def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
@@ -77,18 +135,27 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
             "targets are records and replayed batches"
         )
     store = ArtifactStore(args.store)
-    definition = json.loads(Path(args.grid_definition).read_text())
     engine, sampling = config["engine_config"], config["sampling"]
-    read = {}
-    for n in args.grid:
-        runs = [e for r, e in args.client_run if Path(r) == Path(n)]
-        read[n] = measure._read(n, store, runs, args.sessions, engine, sampling)
-    steps = [(f"{n} step {x['step']}", x) for n in args.grid for x in read[n][1]]
-    planned = plan(definition, steps, {f"{n} dp0": read[n][2] for n in args.grid})
-    fields = ("model", "device", "source_root")
+    read = measure.read_inputs(args, args.grid, store, engine, sampling, TARGETS)
+    ragged = [
+        (
+            s.provenance["run"],
+            {
+                "rows": [dataclasses.astuple(r) for r in s.view.requests],
+                "rung": s.view.capture_rung,
+                "produces_output": s.view.produces_output,
+            },
+        )
+        for s in samples
+        if s.provenance["source"] == "ragged"
+    ]
+    grid = measure.grid_plan(args, read, ragged)
+    planned = grid["plan"]
+    fields = {f: config[f] for f in ("model", "source_root")}
+    fields |= keyed_platform(Kind.STEP_MEASUREMENT, config["platform"])
     keys = [
         measure.measurement_key(
-            {f: config[f] for f in fields},
+            fields,
             engine,
             sampling,
             measure.view_of(line),
@@ -107,18 +174,13 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
     ]
     points = [json.loads(entry.read_member(*MEMBER)) for entry in entries]
     bundle, report = step_grid_fit.bundle(
-        definition, planned, points, samples, args.seed
+        grid["definition"], planned, points, samples, args.seed
     )
     report["provenance"] = publish.runs(samples) + [
-        {
-            "source": "plan",
-            "run": measure._digest(planned),
-            "inputs": sorted({source for source, *_ in read.values()}),
-            "traces": sorted({t for _, x in steps for t in x["traces"]}),
-        }
+        {**grid["provenance"], "profiled": False}
     ]
-    fields = {"device": config["device"], "grid": measure._digest(definition)}
-    return fields, bundle, report
+    grid_key = keyed_platform(Kind.STEP_GRID_BUNDLE, config["platform"])
+    return {**grid_key, "grid": grid["grid"]}, bundle, report
 
 
 #: Each backend's name, to the kind it publishes, its label sources and its fit.
@@ -129,6 +191,8 @@ BACKENDS = {
 #: The flags only one backend reads, each to that backend.
 OWN = {
     "form": "step-linear",
+    "moe_routing": "step-linear",
+    "model": "step-linear",
     "grid": "step-grid",
     "grid_definition": "step-grid",
     "sessions": "step-grid",
@@ -140,6 +204,20 @@ def main(argv: list[str]) -> None:
     parser.add_argument("--backend", required=True, help=", ".join(BACKENDS))
     parser.add_argument(
         "--form", choices=step_linear_fit.FORMS, help="history by default"
+    )
+    routing = parser.add_mutually_exclusive_group()
+    routing.add_argument(
+        "--moe-routing",
+        metavar="E,K",
+        type=step_linear_fit._routing_arg,
+        help="the model's routed experts and top-k, over which each decode rung "
+        "may adopt a MoE column",
+    )
+    routing.add_argument(
+        "--model",
+        metavar="DIR",
+        help="the model directory the records served, whose config gives the "
+        "routing --moe-routing states",
     )
     parser.add_argument(
         "--grid",
@@ -155,6 +233,14 @@ def main(argv: list[str]) -> None:
         help="the --grid lines measure steps --sessions A:B keeps",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--ops",
+        nargs="+",
+        default=(),
+        metavar="DIR",
+        help="measure ops --out directories giving a trace run's drafter kernels "
+        "their own lengths",
+    )
     args = parser.parse_args(argv)
     if args.backend == "step-stub":
         raise ValueError(STUB)
@@ -183,8 +269,13 @@ def main(argv: list[str]) -> None:
     grid_only = {Path(n) for n in args.grid or ()} - {Path(i) for i in args.inputs}
     target_args = copy.copy(args)
     target_args.client_run = [c for c in args.client_run if Path(c[0]) not in grid_only]
-    samples, config = publish.inputs(target_args, sources)
+    samples, config = publish.inputs(target_args, sources, args.ops)
     fields, params, report = fit(samples, config, args)
+    if args.ops:
+        refused = [
+            f"{f}: {w}" for s in samples for f, ws in s.floor.items() for w in ws
+        ]
+        report["floor"] = dict(Counter(refused).most_common())
     key = Key.of(
         kind,
         **{f: config[f] for f in ("model", "source_root")},

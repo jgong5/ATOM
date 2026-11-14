@@ -49,9 +49,9 @@ from atom.compass.carriers import (
 from atom.compass.clock import LpId
 from atom.compass.clock_transport import connect
 from atom.compass.detect.scenario import check_run
-from atom.compass.drive.serve import _free_ports
 from atom.compass.parity.traffic import Traffic
 from atom.utils.clock import LPRuntime, channel_of
+from tests.compass.held_ports import held_ports
 
 MESH = TREE / "atom" / "mesh"
 WALL_S = 120.0
@@ -73,7 +73,7 @@ RANKS = [(0, 0), (0, 1), (1, 0), (0, 0)]
 
 
 @pytest.fixture(scope="module")
-def atomesh():
+def atomesh(tmp_path_factory):
     resolved = shutil.which("cargo") and subprocess.run(
         ["cargo", "metadata", "--format-version", "1"],
         cwd=MESH,
@@ -86,7 +86,31 @@ def atomesh():
     subprocess.run(
         ["cargo", "build", "--bin", "atomesh"], cwd=MESH, check=True, timeout=1800
     )
-    return Path(os.environ.get("CARGO_TARGET_DIR", MESH / "target")) / "debug/atomesh"
+    # Any later cargo call in atom/mesh, such as another gate shard's `cargo
+    # test`, re-links target/debug/atomesh to the binary it built, with other
+    # dependency features, and the path is missing while it does. The tests
+    # start a copy in their own directory instead, which no cargo call touches.
+    built = Path(os.environ.get("CARGO_TARGET_DIR", MESH / "target")) / "debug/atomesh"
+    return Path(shutil.copy(built, tmp_path_factory.mktemp("atomesh")))
+
+
+def test_a_later_cargo_call_leaves_the_binary_the_tests_start_alone(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    # A stand-in cargo whose build and test each re-link target/debug/atomesh,
+    # as cargo does, to a new binary that prints the command that linked it.
+    (tmp_path / "cargo").write_text(
+        '#!/bin/sh\n[ "$1" = metadata ] && exit 0\nd=$CARGO_TARGET_DIR/debug\n'
+        'mkdir -p "$d" && rm -f "$d/atomesh" &&\n'
+        'printf "#!/bin/sh\\necho %s\\n" "$1" >"$d/atomesh" && chmod +x "$d/atomesh"\n'
+    )
+    (tmp_path / "cargo").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(tmp_path / "target"))
+    binary = atomesh.__wrapped__(tmp_path_factory)
+    subprocess.run(["cargo", "test"], check=True)
+    started = subprocess.run([binary], capture_output=True, text=True, check=True)
+    assert started.stdout == "build\n"
 
 
 class Frontend:
@@ -244,79 +268,95 @@ def run_router_lp(
 ) -> list:
     """One run in `out`; each request's (prefill, decode) rank, in order."""
     out.mkdir()
-    run_file = _run_file(
-        out, data_parallel_size=2, step_stub=CONSTANT, router_in_s=2.0**-14, **PD
-    )
-    run = json.loads(run_file.read_text())
-    table = compass_run.channel_table(run)
-    lookaheads = {
-        c.name: table.lookahead(c.name) for c in table.channels_from(compass_run.ROUTER)
-    }
-    endpoint = run["clock_endpoint"]
-    errors, procs, frontends = [], [], {}
-    try:
-        authority = _launch(
+    with held_ports(3) as (clock_port, router_port, metrics_port):
+        run_file = _run_file(
             out,
-            "authority",
-            [sys.executable, "-m", "atom.compass.run", "--compass-run", str(run_file)]
-            + ["--compass-clock-endpoint", endpoint],
-            PYTHONHASHSEED=hash_seed,
-            PYTHONPATH=str(TREE),
+            clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
+            data_parallel_size=2,
+            step_stub=CONSTANT,
+            router_in_s=2.0**-14,
+            **PD,
         )
-        procs.append(authority)
-        host, port = endpoint.removeprefix("tcp://").rsplit(":", 1)
-        _retry(
-            "clock", authority, lambda: socket.create_connection((host, port)).close()
-        )
-        frontends = {s: Frontend(run, s, delay) for s in "PD"}
-        idle = [
-            threading.Thread(
-                target=_idle, args=(run, f"engine-{s}", f"dp{r}", errors), daemon=True
+        run = json.loads(run_file.read_text())
+        table = compass_run.channel_table(run)
+        lookaheads = {
+            c.name: table.lookahead(c.name)
+            for c in table.channels_from(compass_run.ROUTER)
+        }
+        endpoint = run["clock_endpoint"]
+        errors, procs, frontends = [], [], {}
+        try:
+            authority = _launch(
+                out,
+                "authority",
+                [sys.executable, "-m", "atom.compass.run", "--compass-run"]
+                + [str(run_file), "--compass-clock-endpoint", endpoint],
+                PYTHONHASHSEED=hash_seed,
+                PYTHONPATH=str(TREE),
             )
-            for s in "PD"
-            for r in range(2)
-        ]
-        for t in idle:
-            t.start()
-        router_port, metrics_port = _free_ports(2)
-        router = _launch(
-            out,
-            "router",
-            [str(atomesh), "launch", "--host", "127.0.0.1", "--port", str(router_port)]
-            + ["--pd-disaggregation", "--prefill", frontends["P"].url]
-            + ["--decode", frontends["D"].url, "--policy", policy, "--dp-aware"]
-            + ["--backend", "atom", "--disable-health-check"]
-            + ["--disable-circuit-breaker", "--disable-retries"]
-            + ["--prometheus-port", str(metrics_port), "--log-level", "info"],
-            ATOM_COMPASS_CLOCK_ENDPOINT=endpoint,
-            ATOM_COMPASS_SEED="20260707",
-            ATOM_COMPASS_ROUTER_LOOKAHEADS=json.dumps(lookaheads),
-        )
-        procs.append(router)
-        deadline = time.monotonic() + WALL_S
-        while True:
-            try:
-                urllib.request.urlopen(f"http://127.0.0.1:{router_port}/v1/models")
-                break
-            except OSError:
-                assert router.poll() is None, (out / "router.log").read_text()
-                assert time.monotonic() < deadline, f"no router in {WALL_S} s"
-                time.sleep(0.5)
-        bodies = [
-            {"model": "m", "prompt": f"request {i}", "max_tokens": n, "stream": True}
-            for i, (_, n) in enumerate(WORKLOAD)
-        ]
-        offsets = [t for t, _ in WORKLOAD]
-        DelayedTraffic(run, router_port, bodies, offsets, delay=delay).run()
-        for t in [*idle, *(f.owner for f in frontends.values())]:
-            t.join(WALL_S)
-        assert authority.wait(WALL_S) == 0, (out / "authority.log").read_text()
-    finally:
-        for p in procs:
-            if p.poll() is None:
-                p.kill()
-        for f in frontends.values():
-            f.http.shutdown()
+            procs.append(authority)
+            host, port = endpoint.removeprefix("tcp://").rsplit(":", 1)
+            _retry(
+                "clock",
+                authority,
+                lambda: socket.create_connection((host, port)).close(),
+            )
+            frontends = {s: Frontend(run, s, delay) for s in "PD"}
+            idle = [
+                threading.Thread(
+                    target=_idle,
+                    args=(run, f"engine-{s}", f"dp{r}", errors),
+                    daemon=True,
+                )
+                for s in "PD"
+                for r in range(2)
+            ]
+            for t in idle:
+                t.start()
+            router = _launch(
+                out,
+                "router",
+                [str(atomesh), "launch", "--host", "127.0.0.1", "--port"]
+                + [str(router_port), "--pd-disaggregation"]
+                + ["--prefill", frontends["P"].url]
+                + ["--decode", frontends["D"].url, "--policy", policy, "--dp-aware"]
+                + ["--backend", "atom", "--disable-health-check"]
+                + ["--disable-circuit-breaker", "--disable-retries"]
+                + ["--prometheus-port", str(metrics_port), "--log-level", "info"],
+                ATOM_COMPASS_CLOCK_ENDPOINT=endpoint,
+                ATOM_COMPASS_SEED="20260707",
+                ATOM_COMPASS_ROUTER_LOOKAHEADS=json.dumps(lookaheads),
+            )
+            procs.append(router)
+            deadline = time.monotonic() + WALL_S
+            while True:
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{router_port}/v1/models")
+                    break
+                except OSError:
+                    assert router.poll() is None, (out / "router.log").read_text()
+                    assert time.monotonic() < deadline, f"no router in {WALL_S} s"
+                    time.sleep(0.5)
+            bodies = [
+                {
+                    "model": "m",
+                    "prompt": f"request {i}",
+                    "max_tokens": n,
+                    "stream": True,
+                }
+                for i, (_, n) in enumerate(WORKLOAD)
+            ]
+            offsets = [t for t, _ in WORKLOAD]
+            DelayedTraffic(run, router_port, bodies, offsets, delay=delay).run()
+            for t in [*idle, *(f.owner for f in frontends.values())]:
+                t.join(WALL_S)
+            assert authority.wait(WALL_S) == 0, (out / "authority.log").read_text()
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+            for f in frontends.values():
+                f.http.shutdown()
     errors += [e for f in frontends.values() for e in f.errors]
     if errors:
         raise errors[0]
@@ -360,25 +400,26 @@ def test_random_picks_the_same_ranks_from_one_seed_under_any_host_delay(
 def test_power_of_two_is_refused_by_name(atomesh, tmp_path):
     # A clock that accepts the bind and never answers: the refusal comes first.
     clock = socket.create_server(("127.0.0.1", 0))
-    router_port, metrics_port = _free_ports(2)
-    router = _launch(
-        tmp_path,
-        "router",
-        [str(atomesh), "launch", "--host", "127.0.0.1", "--port", str(router_port)]
-        + ["--pd-disaggregation", "--prefill", "http://127.0.0.1:9"]
-        + ["--decode", "http://127.0.0.1:9", "--policy", "power_of_two", "--dp-aware"]
-        + ["--backend", "atom", "--prometheus-port", str(metrics_port)],
-        ATOM_COMPASS_CLOCK_ENDPOINT=f"tcp://127.0.0.1:{clock.getsockname()[1]}",
-        ATOM_COMPASS_SEED="1",
-        ATOM_COMPASS_ROUTER_LOOKAHEADS="{}",
-    )
-    try:
-        code = router.wait(30)
-    except subprocess.TimeoutExpired:
-        router.kill()
-        code = "still running after 30 s"
-    finally:
-        clock.close()
+    with held_ports(2) as (router_port, metrics_port):
+        router = _launch(
+            tmp_path,
+            "router",
+            [str(atomesh), "launch", "--host", "127.0.0.1", "--port", str(router_port)]
+            + ["--pd-disaggregation", "--prefill", "http://127.0.0.1:9"]
+            + ["--decode", "http://127.0.0.1:9", "--policy", "power_of_two"]
+            + ["--dp-aware", "--backend", "atom"]
+            + ["--prometheus-port", str(metrics_port)],
+            ATOM_COMPASS_CLOCK_ENDPOINT=f"tcp://127.0.0.1:{clock.getsockname()[1]}",
+            ATOM_COMPASS_SEED="1",
+            ATOM_COMPASS_ROUTER_LOOKAHEADS="{}",
+        )
+        try:
+            code = router.wait(30)
+        except subprocess.TimeoutExpired:
+            router.kill()
+            code = "still running after 30 s"
+        finally:
+            clock.close()
     log = (tmp_path / "router.log").read_text()
     assert code == 1, log
     assert "policy power_of_two is refused" in log

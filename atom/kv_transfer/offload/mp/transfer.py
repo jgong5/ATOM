@@ -9,7 +9,6 @@ stops the engine instead of releasing memory the server may still use.
 from __future__ import annotations
 
 import logging
-import time
 from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -26,7 +25,7 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
 )
 from atom.kv_transfer.offload.mp.deployment import _extra_config
-from atom.utils import clock
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
@@ -37,7 +36,7 @@ _OPERATION_TOMBSTONE_LIMIT = 4096
 class _PendingLoad:
     completion: LoadCompletionId
     future: Any | None
-    started_at: float = field(default_factory=lambda: clock.now(time.monotonic))
+    started_at: float = field(default_factory=lambda: time.monotonic())
 
 
 @dataclass
@@ -46,7 +45,7 @@ class _PendingSave:
     future: Any | None
     start: int
     end: int
-    started_at: float = field(default_factory=lambda: clock.now(time.monotonic))
+    started_at: float = field(default_factory=lambda: time.monotonic())
 
 
 _DEFAULT_TRANSFER_DEADLINE_S = 1200.0
@@ -84,7 +83,7 @@ def _enforce_transfer_deadline(
 ) -> None:
     """Raise ``LMCacheTransferUnprovable`` once a transfer outlives the bound."""
 
-    elapsed = clock.now(time.monotonic) - started_at
+    elapsed = time.monotonic() - started_at
     if elapsed < deadline_s:
         return
     message = (

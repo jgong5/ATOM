@@ -19,9 +19,10 @@ class CompassAgenticReplay(AgenticReplayStrategy):
     watchdog onto the clock. It refuses, by name, the options whose timing the
     Compass clock does not reach: a second live phase runner, the prefill slot
     released by a first token the traffic LP does not hold, cancellation on a
-    wall-clock timer, the per-trace idle cap (a real-clock timer outside the
-    scheduler), the accelerated warmup (its drain polls on the wall clock),
-    and the collectors that poll on the wall clock.
+    wall-clock timer, and the collectors that poll on the wall clock. It also
+    refuses the accelerated warmup bounded by a duration, which no client run
+    here has checked against a real one; the one bounded by a request count
+    per lane runs, its drain on the clock (``ClockPhaseRunner``).
     """
 
     def __init__(self, *, config, scheduler, run=None, **kwargs) -> None:
@@ -49,13 +50,6 @@ class CompassAgenticReplay(AgenticReplayStrategy):
                     bool(config.request_cancellation.rate),
                 ),
                 (
-                    "trace_idle_gap_cap_seconds",
-                    getattr(
-                        cfg.get_default_dataset(), "trace_idle_gap_cap_seconds", None
-                    )
-                    is not None,
-                ),
-                (
                     "accelerated warmup (--agentic-cache-warmup-duration)",
                     self._cache_warmup_duration is not None,
                 ),
@@ -80,13 +74,31 @@ class CompassAgenticReplay(AgenticReplayStrategy):
             )
 
 
+async def _clock_sleep(delay: float) -> None:
+    """``asyncio.sleep`` on the Compass clock."""
+    woken = asyncio.get_running_loop().create_future()
+    timer = ClockTimer(delay, lambda: woken.done() or woken.set_result(None))
+    try:
+        await woken
+    finally:
+        timer.cancel()
+
+
 class ClockPhaseRunner(PhaseRunner):
     """``PhaseRunner`` whose sending and grace deadlines fall on the Compass clock.
 
     So does the drain after the cancel, through ``ClockAsyncio``: it ends early
     only once no branch work is pending, so a run whose subagent children are
-    still tracked drains for the full timeout, real or simulated.
+    still tracked drains for the full timeout, real or simulated. So does the
+    accelerated warmup's drain, which polls for its last request's return.
     """
+
+    async def _wait_for_accelerated_warmup_wire_drain(self) -> None:
+        """Upstream's poll for the warmup's requests to return, each 0.1 s
+        sleep on the Compass clock: on the wall clock, the clock would reach
+        the drain's grace deadline while the poll sleeps."""
+        while self._progress.in_flight > 0:
+            await _clock_sleep(0.1)
 
     async def _wait_for_event_with_timeout(
         self, *, name, event, timeout, task_to_cancel, set_event_on_timeout=False
@@ -108,7 +120,9 @@ class ClockPhaseRunner(PhaseRunner):
         wake = asyncio.get_running_loop().create_future()
         # ponytail: Event._waiters is private; Event.set resolves each of them.
         event._waiters.append(wake)
-        deadline = ClockTimer(timeout, lambda: wake.done() or wake.set_result(None))
+        deadline = ClockTimer(
+            timeout, lambda: wake.done() or wake.set_result(None), phase_deadline=True
+        )
         try:
             await wake
         finally:

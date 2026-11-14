@@ -11,11 +11,32 @@ written against it yet; implementation follows the execution plan in `16`.
 [#952](https://github.com/jgong5/ATOM/issues/952):** acceptance is a stated input carrying
 a method, reported in the run summary and propagated into no cost term (D83, D84, D87).
 
+**Revised 2026-10-27 by the owner's rulings on
+[#2138](https://github.com/jgong5/ATOM/issues/2138):** stage 4 prices DeepSeek-V4.1-Flash's
+DSpark5 on MI455, a second draft path beside V4-Pro's serial MTP (*Milestone placement*).
+
+**Revised 2026-11-02 by the owner's ruling on
+[#2683](https://github.com/jgong5/ATOM/pull/2683#issuecomment-6578751421):** stage 4's exit
+cells state `--spec-decode-acceptance-length 3` on their real and simulated runs alike, in
+place of rates measured from the real run; contract 3 stays unbuilt (D84, *Milestone
+placement*).
+
+**Revised 2026-11-12 by the owner's ruling on
+[#3257](https://github.com/jgong5/ATOM/issues/3257):** the M3-Agentic stage prices
+MiniMax-M3's EAGLE3, a Llama draft stack with its own KV pool, at step level by the
+drafter's own vectors, its acceptance forced on both runs (D87.1).
+
+**Revised 2026-11-13 by the owner's ruling on
+[#3345](https://github.com/jgong5/ATOM/issues/3345#issuecomment-6849660042):** no cell grades
+its mean acceptance length or accepted-count histogram; tests check once that a simulated
+run draws the acceptance it is fed (D87).
+
 **Scope.** What speculative decoding — Eagle3, DSpark, and MTP heads — changes for a
 simulator, and why one of those changes is different in kind from everything else in this
-design. The draft path it prices is DeepSeek-V4-Pro's serial MTP, in M2 (D87, *Milestone
-placement*); Eagle3 and DSpark are described because ATOM carries them, and are not on
-M2's path.
+design. The draft paths it prices are DeepSeek-V4-Pro's serial MTP, in M2's MI355X cells,
+DeepSeek-V4.1-Flash's DSpark5, in stage 4's MI455 cells (D87, *Milestone placement*), and
+MiniMax-M3's EAGLE3, in the M3-Agentic stage's MI355X cells (D87.1). Eagle3 is not on M2's
+path.
 
 ---
 
@@ -123,7 +144,7 @@ tag one with [#1541](https://github.com/jgong5/ATOM/issues/1541). An eager DP du
 
 ### What still flows through ATOM's real code
 
-Everything downstream of the value: `SpecStats` accumulation, the bonus-token bookkeeping,
+Everything downstream of the value: `EngineStats` accumulation, the bonus-token bookkeeping,
 the anchor gather, and the scheduler's `max_tokens` interaction
 (`tests/test_scheduler_mtp_max_tokens.py`). The stated acceptance enters at the same
 point the kernel's output would, so the *consequences* of an acceptance are ATOM's, not a
@@ -195,18 +216,29 @@ built now.**
 
 Rationale: per-step accepted-token counts are too heavy to carry for a 300-second,
 multi-thousand-request replay, and the statistics are a good trade for what they cost.
-Contract 2 is the one to use for acceptance cells; contract 1 is what makes *"what if the
-draft head reaches AL 3.0"* answerable at all.
+Contract 2 is the one to use for M2's MTP acceptance cells; contract 1 is what makes
+*"what if the draft head reaches AL 3.0"* answerable at all, and stage 4's exit cells use
+it, one stated length on the real and simulated runs alike (D87, *Milestone placement*).
 
 Contract 3 stays on the shelf rather than being rejected: it is the only way to close the
 correlation gap above, and if a result ever turns out to depend on it, the transport is
 the same additive-field mechanism `06` D28 already defines.
 
+A graded result did come to depend on it. On stage 4's c=16 smoke cell, the simulated run
+drawing per step from rates measured on one real run read TPOT 10% to 15% below both real
+runs, because a real request keeps its own acceptance level and per-step draws lose it;
+with each request's real decode-row count it read 2% above
+([#2574](https://github.com/jgong5/ATOM/issues/2574)). Contract 3 was built to close that
+gap ([#2683](https://github.com/jgong5/ATOM/pull/2683)) and closed unmerged: a graded cell
+instead fixes the acceptance length on both runs through ATOM's flag, so the real run
+accepts by the same synthetic schedule the simulated run draws, and no request has a level
+of its own to lose (*Milestone placement*).
+
 For contract 2, the flow:
 
 ```
-  real run  --->  SpecStats.distribution       (dict: accepted_count -> occurrences,
-                  scheduler.py)                 maintained per sequence per step)
+  real run  --->  EngineStats.distribution     (dict: accepted_count -> occurrences,
+                  engine_stats.py)              maintained per sequence per step)
                         |
                         v
             per-position unconditional rates    P(first i+1 all accepted)
@@ -215,7 +247,7 @@ For contract 2, the flow:
   simulated run  --->  speculative_config.synthetic_acceptance_rates
 ```
 
-`SpecStats` already tracks exactly the histogram this needs — `distribution` is keyed
+`EngineStats` already tracks exactly the histogram this needs — `distribution` is keyed
 `0..mtp_k` — so the conversion is a cumulative sum and nothing more.
 
 ### The transport for a list does not exist yet
@@ -248,16 +280,17 @@ Small, useful to ATOM independently of Compass, and it is the same shape of ask 
 
 | # | Input | When | Method |
 |---|---|---|---|
-| 1 | measured per-position rates from a paired real run | acceptance cells | `measured` |
+| 1 | measured per-position rates from a paired real run | M2's MTP acceptance cells | `measured` |
 | 2 | measured mean AL, expanded by the min-variance schedule | a real run exists but only its mean was recorded | `estimated` |
-| 3 | a stated AL from a datasheet or a published figure | exploration, day zero, a draft head that does not exist yet | `declared` |
+| 3 | a stated AL from a datasheet or a published figure | exploration, day zero, a draft head that does not exist yet; stage 4's exit cells, whose real runs state the same AL | `declared` |
 
 The run summary reports the input's method. It propagates into no cost term: a step's
 terms carry the methods their own inputs give them, whatever the acceptance input's.
 
 Input 3 is legitimate and is what makes *"what if the draft head reaches AL 3.0"* a question
-Compass can answer. It is **not** legitimate in an acceptance run, and `08`'s hygiene
-refusals gain a row saying so.
+Compass can answer. It is **not** legitimate in an acceptance run whose real side drafted
+without it, and `08`'s hygiene refusals gain a row saying so; D87 gives the row and when a
+stated AL is evidence.
 
 ---
 
@@ -303,21 +336,29 @@ Draft models add:
 | Term | Source |
 |---|---|
 | **draft weights** | Class A, exact from the draft's own HF config. `_MTP_CONFIG` (`config.py`) names the architecture and the `n_predict` attribute per model type. |
-| **draft KV layers** | `model_runner.py::ModelRunner._num_draft_kv_layers` — **the single source of truth, and it is already called out as such in the code.** A draft with a real layer stack (Eagle3, standalone DSpark) needs one slot per layer; serial MTP declares `num_nextn_predict_layers`. |
+| **draft KV** | `model_runner.py::ModelRunner._sub_pool_specs`, the declarations `get_num_blocks` sizes the pools from: the target builder's `sub_pool_specs()`, plus `draft_kv_builder.sub_pool_specs()` when the draft owns a pool. No `ModelRunner` method counts draft layers; each builder declares what it holds. A builder on the module walk (`atom/model_ops/attentions/pool_layout/pool_rows.py::PoolRowsMixin`) buys one row per draft attention module it holds, so a real layer stack (Eagle3, standalone DSpark) gets one per layer and serial MTP one per MTP layer. DeepSeek-V4's and V4.1's builders take the draft layers from the config instead (*Milestone placement*). |
 
 Two properties inherited rather than designed, both consequences of `03` D13's decision to
 run ATOM's real block accounting:
 
 1. **Whether draft KV shares the target's pool or owns its own is already decided by
-   ATOM**, per `_get_total_num_layers` and the `eagle3_draft_builder` split. Compass
-   reads the outcome; it does not model the policy.
-2. **Eagle3 draft KV merged onto the target's block ids by name** is `03`'s existing
-   statement, and it holds unchanged.
+   ATOM**: only an Eagle3 draft and a standalone DSpark draft ask
+   (`atom/spec_decode/draft_kv.py::draft_kv_builder`, from `EagleProposer._build_draft_model`
+   and `DSparkProposer._build_draft_model`), and for them the backend the draft's own config
+   resolves to answers through `DRAFT_OWNS_KV_POOL`. Serial MTP and a DSpark draft inside
+   the target's checkpoint always join the target's pool. `ModelRunner.draft_shares_kv_pool`
+   reports the outcome. Compass runs that choice as ATOM makes it; it does not model the
+   policy.
+2. **A draft's own pool rides the target's block ids**: `DraftKvBuilder.sub_pool_specs`
+   declares it in the target's paged class (`page_pool`), and specs sharing a name merge in
+   `plan_pools`. That is `03`'s statement of Eagle3 draft KV merged by name, unchanged.
 
-**The one thing to be careful about:** the code comment on `_num_draft_kv_layers` records
-that two independent spellings of this count *"silently disagreed for the standalone DSpark
-draft, sizing 1 slot while allocating 5"*. Compass must call the method, never re-derive
-the count — which is `07` Phase 0's "never reimplement" rule applying to memory.
+**The one thing to be careful about:** two config-derived spellings of the draft's layer
+count once silently disagreed for the standalone DSpark draft, sizing 1 slot while
+allocating 5. ATOM's walk-based builders now size and bind from one assignment,
+`PoolRowsMixin.pool_rows`, so a module the sizing did not count raises `KeyError` when
+bound. Compass runs ATOM's sizing and never re-derives the count — which is `07` Phase 0's
+"never reimplement" rule applying to memory.
 
 ---
 
@@ -330,22 +371,28 @@ the count — which is `07` Phase 0's "never reimplement" rule applying to memor
 
 Concretely, for acceptance cells:
 
-1. Run the real side. Record `SpecStats.distribution`.
-2. Feed the measured per-position rates to the simulated side (D84 input 1).
-3. Report the three results of `08` D44 as usual — **plus** an acceptance-agreement check
-   between the two sides, at the right strength — which is weaker than exact agreement,
-   for the reason D84 gives. What is checkable:
+1. Run the real side. Record `EngineStats.distribution`.
+2. Give the simulated side the real side's acceptance: for M2's MTP cells, the measured
+   per-position rates (D84 input 1); for stage 4's, the same
+   `--spec-decode-acceptance-length` the real side ran with (D84 input 3,
+   *Milestone placement*).
+3. Report the three results of `08` D44 as usual. Acceptance agreement between the two
+   sides is weaker than exact, for the reason D84 gives, and no cell grades it:
 
    | Quantity | Expectation | Status |
    |---|---|---|
-   | mean acceptance length | agrees to sampling error over the run | **checkable; a gate** |
-   | the accepted-count histogram (`SpecStats.distribution`) | agrees in distribution | **checkable; a gate** |
+   | mean acceptance length | agrees to sampling error over the run | **checked by tests, not graded per cell** |
+   | the accepted-count histogram (`EngineStats.distribution`) | agrees in distribution | **checked by tests, not graded per cell** |
    | per-step realisation — which sequence accepted what on step *k* | **does not agree, and is not expected to** | not a result |
    | within-sequence temporal correlation | **not reproduced** by a rate-based feed | not a result |
 
-4. **If the two aggregate rows disagree materially, the plumbing is wrong, not the cost
-   model** — rates were mis-converted, the seed was not set, or the wrong input was fed.
-   That is a refusal, not a finding.
+4. **The two aggregate rows are plumbing, and tests check it once for every cell.** A
+   simulated run draws the acceptance it is fed: `tests/compass/test_run_measured_acceptance.py`
+   turns a record's histograms into the rates ATOM is handed and has the run summary name
+   the record, and `tests/compass/test_speculative_step.py` holds the histogram ATOM's
+   scheduler counts from `DeferredTokenStream`'s draws within four standard errors of the
+   stated rates, the draws fixed by a seed. A cell's run summary names its acceptance input
+   with its method, and its record when the input is measured (`run._acceptance`).
 5. **Schedule agreement (`08` D44's second result) is graded more loosely for speculative
    cells than for dense ones**, and the artifact says so. Two runs whose acceptance
    histograms match can still diverge in *which* request accepted what, and that
@@ -363,8 +410,10 @@ Concretely, for acceptance cells:
   will achieve on a workload. Nothing in this design attempts that, and a result that
   appeared to show it would be an artifact of the input.
 
-A new hygiene refusal for `08` D49: **a speculative acceptance cell run on input 3
-(declared acceptance) is not acceptance evidence.** It is exploration.
+A new hygiene refusal for `08` D49: **a speculative acceptance cell whose simulated run
+takes input 3 (declared acceptance) while its real run drafts unforced is not acceptance
+evidence.** It is exploration. A cell whose two runs state the same length, as stage 4's
+do, is evidence for the claim above.
 
 ### Milestone placement
 
@@ -381,12 +430,80 @@ on Qwen3.8-27B and the claim on Kimi-K3, was retired with those milestones.
 | draft steps | `hf_config_override` sets `num_nextn_predict_layers` to 1; the one `MTPBlock` runs `mtp_k` times, `K = --num-speculative-tokens`, 3 or 1 in the nightly cells | one draft structure per drafting step (D85); T60 is the serial case |
 | draft forward | `MTPBlock` subclasses V4's `Block` (the target's attention and MoE classes), adds `e_proj`, `h_proj`, three norms and its own `hc_head` parameters, and reads the target's un-reduced mHC residual | traced and priced like any structure (D85) |
 | draft weights | the MTP block only: `DeepseekV4MTP.share_with_target` binds the embedding and LM head to the target's | D86's weight term excludes both |
-| draft KV | one slot (`_num_draft_kv_layers` returns `num_nextn_predict_layers`) in the target's pool, at index `n_layers` (`mtp_start_layer_idx`) | D86 as written: call the method |
+| draft KV | in the target's pool, since serial MTP never asks for one of its own (`EagleProposer._build_draft_model` calls `draft_kv_builder` for Eagle3 only). `DeepseekV4AttentionMetadataBuilder` lays its pool out from `hf_config.compress_ratios`, one entry per layer, those past `num_hidden_layers` the MTP blocks: V4-Pro's single MTP entry is ratio 0, so its KV is a sliding window in each request's slot (the STATE class), bound at layer id `n_layers` (`DeepseekV4MTPModel.mtp_start_layer_idx`) | D86: the target builder's `sub_pool_specs()` declares it |
 
 **Every M2 MTP cell is an acceptance cell.** Its per-position rates are measured from the
 paired real run, input 1 of D84 (`16` W4.7), and never declared. Input 1 needs T63's
 transport, so T63 is on M2's path. For MTP1 the curve has one position and the mean
 carries it whole; MTP3 is where its shape matters.
+
+**Stage 4 prices DeepSeek-V4.1-Flash's DSpark5** on MI455 (`16` *Stage 4*), the only
+draft path ATOM serves V4.1 with: `deepseek_v41/config.py::validate_speculative_config`
+refuses any method but DSpark with five draft tokens, a draft checkpoint other than the
+target's, and relaxed verification.
+
+| Item | In ATOM | For this topic |
+|---|---|---|
+| draft model | `DeepseekV41DSpark` (`atom/models/deepseek_v41/dspark.py`), its `mtp.*` stages loaded from the target checkpoint | a block drafter, not serial MTP |
+| draft steps | one pass through the draft stages drafts all `K = 5` positions; a Markov head then samples them in turn, and a confidence head scores them | one draft structure per step (D85); its terms are priced apart from the target's, at op level by [#2345](https://github.com/jgong5/ATOM/issues/2345) and at step level by [#2346](https://github.com/jgong5/ATOM/issues/2346) |
+| draft forward | `DraftBlock` and `DraftAttention` subclass V4.1's `Block` and `Attention`, with window-only attention and the draft's own routed-expert count (`dspark_n_routed_experts`) | traced and priced like any structure (D85) |
+| draft weights | the draft stages only: `share_with_target` binds the embedding and LM head to the target's | D86's weight term excludes both |
+| draft KV | in the target's pool: `validate_speculative_config` requires the target checkpoint, so `DSparkProposer._build_draft_model` builds the draft from it and never calls `draft_kv_builder`. Under a speculative config `DeepseekV41MetadataBuilder` adds `num_nextn_predict_layers` window-only layers to the backbone's, each a sliding window in the request's STATE entry (`V41PoolGeometry.state_fields`) | D86: the target builder's `sub_pool_specs()` declares it |
+| verification | the cells set no confidence schedule (`DSparkConfig.confidence_schedule` is off by default), so every verify step carries the full block, real and simulated (D83) | no truncation to model |
+
+**Stage 4's exit cells state their acceptance**: `--spec-decode-acceptance-length 3`, near
+the 3.13 measured on the c=16 smoke cell, in the ATOM arguments of the real runs
+(`compass record`) and the simulated runs (`compass run`) alike
+([ruling](https://github.com/jgong5/ATOM/pull/2683#issuecomment-6578751421)). At length 3
+the minimum-variance schedule (D84) accepts two of the five drafts on every verify row, on
+both sides, so the cell grades time at one acceptance and the summary names its input
+`declared`. Another length is set the same way, one value of the flag passed to both
+commands. `compass run --acceptance-record` stays a tool: it feeds a speculative record's
+measured rates (input 1) to a simulated run whose ATOM arguments state none.
+
+---
+
+## D87.1. EAGLE3, as MiniMax-M3 serves it
+
+Owner ruling on [#3257](https://github.com/jgong5/ATOM/issues/3257), 2026-11-12, for the
+M3-Agentic stage (`16` D95.1), whose every arm serves MiniMax-M3 with `--method eagle3
+--draft-model Inferact/MiniMax-M3-EAGLE3-GQA --num-speculative-tokens 3`. It is the first
+Eagle3 path a stage prices.
+
+| Item | In ATOM | For this topic |
+|---|---|---|
+| draft model | the checkpoint's `LlamaForCausalLMEagle3`, which `SpeculativeConfig.hf_config_override` maps to `Eagle3LlamaModel` (`atom/models/eagle3_llama.py`): one Llama decoder layer behind an `fc` that folds three of the target's hidden states, the layers MiniMax-M3's `get_eagle3_aux_hidden_state_layers` names (`atom/models/minimax_m3/model.py`) | a Llama draft stack, not serial MTP |
+| draft steps | `EagleProposer.propose` runs `K` serial passes: the first over the step's whole token stream, `K+1` rows a sequence on a decode, each later one over one row a sequence through its `DraftGraph`; every pass ends in the drafter's LM head and argmax | one draft forward per serial pass (D85) |
+| draft weights | the whole draft checkpoint: its embedding and LM head are its own, not the target's | D86's weight term counts all of it |
+| draft KV | its own pool: `EagleProposer._build_draft_model` asks `draft_kv_builder`, whose answer for the draft's MHA backend is a pool of its own (`DRAFT_OWNS_KV_POOL`), and `DraftKvBuilder.sub_pool_specs` declares a row for its layer, merged by name into the target's paged class on the target's block ids (D86) | memory readings are taken with it, and the simulated draft KV block count is ATOM's |
+
+**Priced at step level, from records, by the drafter's own vectors:** a draft forward,
+charged once per serial pass at that pass's rows; propose; and draft KV, the pass
+`EagleProposer.compute_draft_kv` makes over a step of middle chunks only. The draft
+forward replaces the draft law's per-rung decode vector, which prices a whole draft at once
+(`backends/step_linear.py`), so a record carries each serial pass apart, where today all of
+a step's passes land in one `d_propose_ns` (`parity/__init__.py`).
+
+**Acceptance is forced** through `--spec-decode-acceptance-length 2.78` on the real and the
+simulated runs alike, D84's input 3 as stage 4's exit cells state theirs. At 2.78 and
+`K = 3` the minimum-variance schedule accepts one draft on every verify row and a second
+with probability 0.78, never the third, on both sides; the summary names the input
+`declared`. Stage 4 forced only integers, so
+[#3260](https://github.com/jgong5/ATOM/issues/3260) shows a fractional length holds through
+record, fit and simulated run.
+
+**It runs at level 0 by scenario**, the level
+[#2712](https://github.com/jgong5/ATOM/issues/2712) defines: a MiniMax-M3 scenario with its
+EAGLE3 drafter built on the meta device runs under the step stub and passes `check_run`.
+That closes the Eagle case of [#2672](https://github.com/jgong5/ATOM/issues/2672), which
+asked each such form to run or be refused. The step roofline lays out no Eagle3 pass, so an
+Eagle3 step it prices is refused by name (`cost:<backend>: prices no draft`, D83).
+
+A law and a readings entry name the draft by method and `K`
+(`run/step_grid.py::keyed`'s `speculative`) beside the target's `config.json` digest, and
+by its own `config.json` digest where that is not the target's (`draft_model`,
+[#3276](https://github.com/jgong5/ATOM/issues/3276)), so two Eagle3 drafts of one target
+key apart. A draft read from the target's checkpoint keys by method and `K` alone.
 
 ---
 
@@ -399,8 +516,9 @@ carries it whole; MTP3 is where its shape matters.
   different acceptance semantics will compare as one. Recorded as **T59**.
 - **The DSpark hang of `04` T52 was observed in this subsystem** (`dspark_scheduler.py::schedule_prefix_lengths_tensor`,
   while the function was written; the landed function builds that value with `torch.full_like`, which avoids the call that hung).
-  Root-causing it is already a gating task (`16` P0.7). DSpark is not the draft path M2
-  prices, so the hang is not on this topic's path to M2.
+  Root-causing it is already a gating task (`16` P0.7). Stage 4 prices DSpark5
+  (`16` *Stage 4*), so DSpark is on this topic's path to M2; whether the hang gates any of
+  stage 4's work is T52's question.
 - **Whether a draft forward's cost transfers across `K`** is untested. A serial MTP reusing
   one layer `mtp_k` times should be linear in `K`; a real draft stack need not be. One
   measurement at two values of `K` settles it. Recorded as **T60**.
@@ -415,10 +533,11 @@ carries it whole; MTP3 is where its shape matters.
 |---|---|---|
 | D82 | Spec decode changes four things; three are routine and acceptance is different in kind, because it is a behaviour Compass cannot compute. | 2026-09-19 |
 | D83 | Acceptance is a **stated input**, carrying a method, supplied through ATOM's existing `--spec-decode-acceptance-*` flags. The sampler splits: its **cost** is traced and priced like any op, its **value** (`num_bonus_tokens`) needs a ~15-line device-free host draw, because the synthetic sampler is a Triton kernel and no kernel runs. Compass builds no acceptance *model*. | 2026-09-19 |
-| D84 | Feed the **measured per-position distribution**, not the mean - the minimum-variance schedule matches an aggregate and not a schedule. Contracts 1 and 2 (stated or measured statistical rates) are the design; contract 3 (per-request per-token lists) is recorded and not built. Transport for a list does not exist today and needs an ATOM flag (T63). Three acceptance inputs, measured, estimated and declared; the summary reports the method, which propagates into no cost term; input 3 is not acceptance evidence. | 2026-09-19; revised 2026-10-14 (#952) |
+| D84 | Feed the **measured per-position distribution**, not the mean - the minimum-variance schedule matches an aggregate and not a schedule. Contracts 1 and 2 (stated or measured statistical rates) are the design; contract 3 (per-request per-token lists) is recorded and not built. Transport for a list does not exist today and needs an ATOM flag (T63). Three acceptance inputs, measured, estimated and declared; the summary reports the method, which propagates into no cost term; input 3 is not acceptance evidence unless the real run states the same AL. Contract 3 stays unbuilt after #2574 measured the per-request gap; stage 4's exit cells state AL 3 on both runs instead. | 2026-09-19; revised 2026-10-14 (#952), 2026-11-02 (#2683) |
 | D85 | No new cost form. Drop the separate decode form and price every step with the general one; non-speculative decode is the `N_Q = 1` case. | 2026-09-19 |
-| D86 | Draft weights are Class A; draft KV layers come from `_num_draft_kv_layers()` and are never re-derived. | 2026-09-19 |
-| D87 | A speculative throughput result is **conditional on its acceptance input**, and the run summary names its method. Mean AL and the accepted-count histogram are gated; per-step realisation and within-sequence correlation are **not reproduced and not claimed**. Schedule agreement is graded more loosely for speculative cells. Predicting acceptance itself is explicitly not attempted. | 2026-09-19 |
+| D86 | Draft weights are Class A; draft KV comes from ATOM's own pool declarations (`ModelRunner._sub_pool_specs`), and its layer count is never re-derived. | 2026-09-19; revised 2026-10-29 (#2437) |
+| D87 | A speculative throughput result is **conditional on its acceptance input**, and the run summary names its method. Mean AL and the accepted-count histogram are checked by tests of the plumbing, not graded per cell; per-step realisation and within-sequence correlation are **not reproduced and not claimed**. Schedule agreement is graded more loosely for speculative cells. Predicting acceptance itself is explicitly not attempted. A cell whose two runs state the same AL is acceptance evidence. | 2026-09-19; revised 2026-11-02 (#2683), 2026-11-13 (#3345) |
+| D87.1 | MiniMax-M3's EAGLE3, ruled by the owner: a Llama draft stack with its own draft KV pool, declared by `draft_kv_builder`; priced at step level from records by the drafter's own vectors, a draft forward per serial pass, propose and draft KV; acceptance forced through `--spec-decode-acceptance-length` on both runs; at level 0 by scenario, closing #2672's Eagle case. | 2026-11-12 (#3257) |
 
 ---
 

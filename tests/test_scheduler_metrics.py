@@ -134,14 +134,12 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
     )
     sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(frames))
     monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
-    monkeypatch.setattr(
-        core.zmq,
-        "Poller",
-        lambda: SimpleNamespace(
-            register=lambda *a: None,
-            poll=lambda: [(sock, core.zmq.POLLIN)],
-        ),
+    poller = SimpleNamespace(
+        register=lambda *a: None, poll=lambda: [(sock, core.zmq.POLLIN)]
     )
+    # In the module's dict: `zmq_shim` serves `Poller` from its `__getattr__`,
+    # and a setattr's undo would leave pyzmq's class there for later tests.
+    monkeypatch.setitem(vars(core.zmq), "Poller", lambda: poller)
     engine = core.EngineCore.__new__(core.EngineCore)
     engine.label = "metrics-test"
     engine.input_queue = Queue()
@@ -456,9 +454,12 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
         call_func=lambda name, *a, **k: dispatched.append(name)
     )
     proc.pp_transport = SimpleNamespace(
-        send_metadata=lambda _: None, recv_tokens=lambda **_: None
+        send_metadata=lambda _: None, recv_completion=lambda **_: None
     )
     proc._poll_kv_transfer_progress = lambda: None
+    # Dynamic chunking off, as it is for any pp_size == 1 deployment: the head
+    # step polls for a calibrated model, and this double answers that poll.
+    proc._dynamic_chunking_enabled = False
     proc._pp_head_step()
     proc._pp_head_step()  # full pipeline: collect only; no second submission
     assert dispatched == ["forward", "flush_pp_send"]

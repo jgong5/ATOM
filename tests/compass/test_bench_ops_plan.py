@@ -9,8 +9,6 @@ read back from a real store.
 
 import json
 import os
-import re
-import subprocess
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -18,15 +16,21 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from test_artifact_store import CONDITIONS, GATES, stanza
+from test_artifact_store import (
+    CONDITIONS,
+    GATES,
+    clean_checkout,  # noqa: F401  autouse
+    stanza,
+)
 from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
 from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
 from atom.compass import capture, cli, ir
-from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
+from atom.compass.artifacts import ArtifactStore, Topology, member_name
 from atom.compass.bench import ops
-from atom.compass.capture import forward
-from atom.compass.capture.forward import decode, structure
+from atom.compass.capture import driverless, forward, graph_key
+from atom.compass.capture.forward import decode, prefill, structure
+from atom.compass.capture.graph import Traced, build, to_json
 from atom.compass.fit import ops as fit_ops
 from atom.compass.run import memory, step_grid
 from atom.compass.runner.overrides import schedulable_ladder
@@ -41,6 +45,7 @@ CONFIG = SimpleNamespace(
     max_num_batched_tokens=8192,
     max_model_len=262144,
     speculative_config=None,
+    enable_tbo=False,
 )
 
 
@@ -105,7 +110,7 @@ def bench(tmp_path, monkeypatch):
         "device": [{"index": 6, "name": spec.value("device.name")}],
         "stack": {c: spec.value(f"device.software_pinned_to.{c}") for c in PINNED},
         "ptl": "disabled",
-        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu"},
+        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu", "atom": "a"},
         "source": {"revision_kind": "tree", "revision": "a" * 40},
     }
     run["device"][0]["arch"] = spec.value("device.arch")
@@ -143,7 +148,9 @@ def test_a_plan_densifies_each_leaf_to_adjacent_points_where_its_kernel_switches
 
     records = _plan(bench, tmp_path, population)
 
-    assert ops._dependent(records) == {"aiter.attn": True, "aiter.gemm": False}
+    rows = ("rows", "aiter.attn")  # read at T = 60, which B = 2 holds
+    dependent = {"aiter.attn": True, "aiter.gemm": False, rows: False}
+    assert ops._dependent(records) == dependent
     at = {}
     for r in records:
         if isinstance(r["context"], list):  # a ragged decode point
@@ -163,9 +170,11 @@ def test_a_plan_densifies_each_leaf_to_adjacent_points_where_its_kernel_switches
     )
     assert tokens[:2] == [40, 60] and tokens[-1] == 150
     assert {99, 100} <= set(tokens) and len(tokens) < 12
-    # Attention depends on context, so its prefill points keep their rows.
+    # Attention depends on context, so its prefill points keep their rows, B = 1
+    # at every T inside its range that B = 2 holds.
     assert at["aiter.attn", "prefill"] == {
         "prefill T=40 B=1",
+        "prefill T=60 B=1",
         "prefill T=150 B=1",
         "prefill T=60 B=2",
     }
@@ -337,6 +346,76 @@ def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
     assert report["by phase"] == {"prefill": {"steps": 2, "covered": covered}}
 
 
+def test_layers_that_view_one_kv_pool_from_rows_of_their_own_plan_one_point(
+    bench, tmp_path, monkeypatch
+):
+    """DeepSeek-V4's layers each view one KV pool from a base row of their own
+    on, so one layer's attention leaf differs from the next one's only in its
+    view's rows: the plan measures one point for both, over cached tokens too."""
+
+    def graph(store, config, shape, arch=None):
+        rows = shape.tokens if shape.phase == "prefill" else shape.seqs
+        q = ("q", _t([rows, 8], "activation"))
+        layers = [
+            _leaf("aiter.attn", q, ("kv", _t([4096 - base, 8], "kv")))
+            for base in (0, 64)
+        ]
+        traced = Traced(f"x tp=1 {shape.phase} eager", str(shape))
+        return json.loads(to_json(build(list(enumerate(layers)), traced)))
+
+    monkeypatch.setattr(ops, "graph", graph)
+    monkeypatch.setattr(ops, "_child", _moving_bench)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[100, 2100, False]], None),
+        ([[100, 3100, False]], None),
+    )
+
+    records = _plan(bench, tmp_path, plan)
+
+    points = [(r["shape"], json.dumps(r["context"])) for r in records]
+    assert len(points) == len(set(points))
+    assert {r["context"] for r in records if r["shape"].startswith("prefill")} == {
+        None,
+        2000,
+        3000,
+    }
+
+
+@pytest.mark.parametrize(
+    "slot, values, leaves",
+    [
+        ("prefix", ("layers.0.attn.swa_write", "layers.1.attn.swa_write"), 1),
+        ("quant_mode", ("group_fp8", "per_row_fp8"), 2),
+    ],
+)
+def test_layers_whose_calls_differ_only_in_a_string_plan_one_point_per_mode(
+    bench, tmp_path, monkeypatch, slot, values, leaves
+):
+    """DeepSeek-V4 passes each layer's window write the layer's name, which no
+    kernel reads, so one layer's leaf differs from the next one's only there:
+    the plan measures one point for both. A string that picks how a kernel
+    runs, a quantization mode, keeps its calls apart."""
+
+    def graph(store, config, shape, arch=None):
+        rows = shape.tokens if shape.phase == "prefill" else shape.seqs
+        kv = ("kv", _t([rows, 8], "activation"))
+        calls = [_leaf("atom.swa_write", kv, (slot, value)) for value in values]
+        traced = Traced(f"x tp=1 {shape.phase} eager", str(shape))
+        return json.loads(to_json(build(list(enumerate(calls)), traced)))
+
+    monkeypatch.setattr(ops, "graph", graph)
+    plan = _records(
+        tmp_path / "plan", ([[1, 1000, True]], 2), ([[100, 2100, False]], None)
+    )
+
+    records = _plan(bench, tmp_path, plan)
+
+    points = [(r["shape"], json.dumps(r["context"])) for r in records]
+    assert {points.count(p) for p in points} == {leaves}
+
+
 @pytest.mark.parametrize(
     "max_model_len, at_8000", [(8100, {40, 100}), (8150, {40, 100, 150})]
 )
@@ -368,15 +447,51 @@ def test_a_plan_places_no_cached_prefill_point_past_max_model_len(
     assert attn == at_8000
 
 
+def test_a_planned_prefill_attention_leaf_holds_a_step_s_rows_either_side_of_its_t(
+    bench, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ops, "_child", _moving_bench)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 40, False]], None),
+        ([[100, 2100, False]], None),
+        ([[150, 3150, False]], None),
+        ([[30, 1030, False], [30, 3030, False]], None),  # B = 2 at T = 60
+        ([[75, 75, False], [75, 75, False]], None),  # and at T = 150
+    )
+    records = _plan(bench, tmp_path, plan)
+
+    attn = {
+        (ops._shape(r["shape"]).seqs, ops._shape(r["shape"]).tokens, r["context"])
+        for r in records
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill")
+    }
+    # Each B at each T another B holds inside its own range, at its contexts.
+    assert {(1, 60, c) for c in (None, 2000, 3000)} <= attn
+    assert {(2, 100, c) for c in (None, 2000, 3000)} <= attn
+    assert (2, 40, None) not in attn  # below B = 2's least T
+    graded = _records(
+        tmp_path / "graded",
+        ([[50, 1050, False]], None),  # B = 1 between 40 and 60
+        ([[60, 1060, False], [60, 2060, False]], None),  # B = 2 between 100 and 150
+    )
+    store, root, _, _ = bench
+
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
+
+    assert report["by phase"] == {"prefill": {"steps": 2, "covered": 2}}
+
+
 @pytest.mark.parametrize(
     "tokens, lo, hi, why",
     [
         (120, 0, 1000, ""),  # fresh to 1000 cached, both of one kernel
-        (120, 1000, 2000, "between two kernels"),  # 1000 and 2000 differ
+        (120, 1000, 2000, "outside the measured range"),  # 100 holds no 2000
         (120, 1000, 1000, ""),
         (200, 0, 0, "outside the measured range"),  # past the token counts
         (120, 1000, 5000, "outside the measured range"),  # past the cached counts
-        (60, 1000, 1000, "outside the measured range"),  # 1000 holds no 60
+        (60, 1000, 1000, "between two kernels"),  # 40 holds 0 and 2000, apart
     ],
 )
 def test_a_cached_bracket_holds_between_counts_and_tokens_of_one_kernel(
@@ -656,6 +771,71 @@ def test_a_plan_over_rows_alike_measures_no_ragged_point(bench, tmp_path):
 
 
 @pytest.mark.parametrize(
+    "rows, cut",
+    [
+        ([[1, 1000, True], [1, 4000, True]], None),
+        ([[1, 3000, True], [1, 3000, True]], [[1, 600, True], [1, 416, True]]),
+    ],
+    ids=["planned-ragged", "planned-uniform"],
+)
+def test_a_uniform_decode_point_past_the_pool_refuses_only_past_round_0_of_a_plan_over_ragged_rows(
+    bench, tmp_path, monkeypatch, rows, cut
+):
+    monkeypatch.delenv(ops.RAGGED, raising=False)
+    envs = []
+
+    def child(fn, config, todo, llc):
+        envs.append(os.environ.get(ops.RAGGED))
+        return _bench(fn, config, todo, llc)
+
+    monkeypatch.setattr(ops, "_child", child)
+    _plan(bench, tmp_path, _records(tmp_path / "plan", (rows, 2)))
+    # each measuring process times a point under the environment the plan gave it
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    placed = SimpleNamespace(
+        block_size=16, batch=lambda view, block, slot: (block, slot)
+    )
+    x = ("self", _t([2, 3], "activation"))
+    neg, gather = (
+        ops.leaves(_graph(_leaf(name, x), layers=1)["region"])
+        for name in (
+            "aten.neg.default",
+            "_c10d_functional.all_gather_into_tensor.default",
+        )
+    )
+
+    def point(env, found):
+        with patch.dict(os.environ, {ops.RAGGED: env} if env else {}):
+            # 38 blocks a row at 600 tokens, 64 in the pool
+            return ops.Stub(_Runner(), 10_000).point(placed, decode(2), 600, found)
+
+    pooled = [[1, 600, True], [1, 416, True]]
+    # Round 0, whose points `_dependent` reads for the kinds that move with
+    # context, cuts its points in either plan.
+    [first] = point(envs[0], neg)
+    assert first["rows"] == pooled
+    env = envs[-1]  # a plan over rows alike measures one round
+    assert set(envs[1:]) <= {env}
+    [record] = point(env, neg)
+    [collective] = point(env, gather)
+    mixed = point(env, neg | gather)
+
+    if cut:
+        assert record["rows"] == cut
+        assert [r["rows"] for r in mixed] == [cut, cut]
+    else:
+        assert record["refused"] == "its rows need more than the pool's 64 KV blocks"
+        # one leaf that is not a collective refuses the point
+        assert all("refused" in r for r in mixed) and len(mixed) == 2
+    # a collective's family is over its message bytes: the pool cuts it either way
+    assert collective["rows"] == pooled
+    # a prefill point past the pool is cut in either plan: 4 blocks a row, 4 in it
+    rows = ops.point_rows(prefill(51, 2), 30, 4, 16, uncut=bool(env))
+    assert rows == [[26, 56, False], [25, 25, False]]
+
+
+@pytest.mark.parametrize(
     "points, rows",
     [
         # one token count at three row counts, its time growing with them
@@ -778,11 +958,7 @@ def test_an_integer_activation_indexes_a_dimension_of_one():
 
 def _publish_graph(store, config, arch, shape):
     """A graph of `shape` keyed on `arch`, its one leaf named for the arch."""
-    key = Key.of(
-        Kind.OP_GRAPH,
-        structure=structure(config, shape.phase, device=arch),
-        shape=str(shape),
-    )
+    key = graph_key(structure(config, shape.phase, device=arch), str(shape))
     leaf = _leaf(f"aiter.{arch}", ("x", _t([shape.seqs, 8], "activation")))
     store.publish(
         key,
@@ -839,33 +1015,24 @@ def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
 
 
 @pytest.fixture(autouse=True)
-def _declared_arch_ends_with_its_test(monkeypatch):
-    """`--coverage` declares the plan's arch to the whole process, in its
-    environment and Triton's driver; each test's declaration ends with it."""
-    import triton
-
-    monkeypatch.setattr(triton.runtime.driver, "_active", triton.runtime.driver._active)
-    with patch.dict(os.environ):
-        yield
+def declared(monkeypatch):
+    """The arches `--coverage` imports aiter on, in turn: a process imports
+    aiter once, and this one is the test run's, so an import is only recorded."""
+    arches = []
+    monkeypatch.setattr(driverless, "import_aiter_on", arches.append)
+    return arches
 
 
 def test_coverage_declares_the_plan_s_arch_to_aiter_before_it_builds_the_config(
-    tmp_path, monkeypatch, model_config  # noqa: F811
+    tmp_path, monkeypatch, model_config, declared  # noqa: F811
 ):
-    """ATOM's config imports aiter, which asks `GPU_ARCHS` and `rocminfo` for
-    the arch; with no driver, `rocminfo` names none."""
+    """ATOM's config holds aiter's fp8 dtype, which aiter resolves at import
+    from the device it finds; with no driver, none."""
     model_config.pipeline_parallel_size = model_config.prefill_context_parallel_size = 1
-    driverless_bin = tmp_path / "bin"
-    driverless_bin.mkdir()
-    (driverless_bin / "rocminfo").write_text("#!/bin/sh\nexit 0\n")
-    (driverless_bin / "rocminfo").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{driverless_bin}:{os.environ['PATH']}")
     asked = []
 
     def atom_config(args):
-        found = subprocess.run(["rocminfo"], capture_output=True, text=True, check=True)
-        listing = found.stdout
-        asked.append((re.findall(r"\bgfx\w+", listing), os.environ.get("GPU_ARCHS")))
+        asked.append(list(declared))
         return model_config
 
     monkeypatch.setattr("atom.compass.bench.measure.atom_config", atom_config)
@@ -880,7 +1047,7 @@ def test_coverage_declares_the_plan_s_arch_to_aiter_before_it_builds_the_config(
     argv = ["--coverage", graded, "--store", str(store.root), "--out", str(out)]
     report = ops._coverage_main(argv, [])
 
-    assert asked == [(["gfx950"], "gfx950")]
+    assert asked == [["gfx950"]]
     assert report["steps"] == 1
 
 
@@ -1133,7 +1300,7 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     config.max_num_seqs, config.max_model_len = 4, CONFIG.max_model_len
     published = []
 
-    def trace(model, tp, shapes, tmpdir, atom_args, arch, population=()):
+    def trace(model, tp, shapes, tmpdir, atom_args, arch, population=(), read=None):
         traced = forward._config(model, tp, atom_args)
         for shape in shapes:
             at = structure(traced, shape.phase, device=arch)
@@ -1144,7 +1311,7 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     def publish(store, graph, model, declared, tp, atom_args, command):
         at = graph.applicability
         published.append((at.structure, tp))
-        key = Key.of(Kind.OP_GRAPH, structure=at.structure, shape=str(at.shape))
+        key = graph_key(at.structure, str(at.shape))
         store.publish(
             key,
             provenance=stanza("compass trace ops"),
@@ -1172,6 +1339,9 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     monkeypatch.setattr(step_grid, "keyed", KEYED)
     monkeypatch.setattr(ops, "_child", child)
     monkeypatch.setattr(forward, "device_arch", lambda: "gfx942")
+    # The plan's capture reads its first GPU's card as the arch's device.
+    card = {"arch": "gfx942", "revision": 0, "props": vars(driverless._props("gfx942"))}
+    monkeypatch.setattr(driverless, "card", lambda index: {"index": index, **card})
     steps = ([[1, 1000, True]], 1), ([[40, 40, False]], None)
     args = SimpleNamespace(
         plan=[_records(tmp_path / "plan", *steps)], store=root, llc_mib=256
@@ -1273,3 +1443,65 @@ def test_coverage_leaves_out_a_step_inside_a_gap_the_fit_declines(
     assert report["left out, by leaf kind"] == {"aiter.gemm": {"the fit declined T": 1}}
     gaps = [d[2:4] for f in params["families"].values() for d in f["declined"]]
     assert gaps == [[122, 400]]
+
+
+def test_a_filled_prefill_point_leaves_its_row_within_max_model_len(
+    bench, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ops, "_child", _moving_bench)
+    monkeypatch.setattr(CONFIG, "max_model_len", 8100)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 8040, False]], None),  # B = 1 at 8000 cached tokens
+        ([[200, 200, False]], None),
+        ([[75, 75, False], [75, 75, False]], None),  # B = 2 at T = 150
+    )
+    records = _plan(bench, tmp_path, plan)
+
+    attn = {
+        (ops._shape(r["shape"]).seqs, ops._shape(r["shape"]).tokens, r["context"])
+        for r in records
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill")
+    }
+    # B = 1 fills T = 150 fresh; at 8000 cached, its row of 8150 has no room.
+    assert (1, 150, None) in attn and (1, 40, 8000) in attn
+    assert (1, 150, 8000) not in attn
+
+
+def _refusing_bench(fn, config, todo, llc):
+    """`_moving_bench` refusing prefill attention at B = 1, T = 60."""
+    got = []
+    for r in _moving_bench(fn, config, todo, llc):
+        if r["op"] == "aiter.attn" and r["shape"] == "prefill T=60 B=1":
+            r = {k: r[k] for k in ("shape", "context", "op", "leaf")}
+            r["refused"] = "the bench refuses it"
+        got.append(r)
+    return got
+
+
+def test_a_filled_prefill_point_the_bench_refuses_is_asked_once(
+    bench, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ops, "_child", _refusing_bench)
+    asked, filled = [], ops._filled
+
+    def counted(families, tried, max_model_len):
+        want = filled(families, tried, max_model_len)
+        asked.extend(p for p in want if p == (prefill(60, 1), None))
+        # A plan that asks a refused point again asks it every round, forever.
+        assert len(asked) < 2, "the refused point is asked again"
+        return want
+
+    monkeypatch.setattr(ops, "_filled", counted)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[40, 40, False]], None),
+        ([[100, 100, False]], None),
+        ([[30, 30, False], [30, 30, False]], None),  # B = 2 at T = 60
+    )
+    records = _plan(bench, tmp_path, plan)
+
+    refused = [(r["shape"], r["context"]) for r in records if "refused" in r]
+    assert refused == [("prefill T=60 B=1", None)] and len(asked) == 1

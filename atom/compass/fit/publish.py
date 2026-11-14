@@ -13,9 +13,9 @@ requests renamed as prefill's record names them, as grading renames them.
 inputs ran on: records whose device, software stack, PTL state or torch is not
 the one it states refuse, naming each and both values. `--ptl` states the PTL
 state of records that carry none, and refuses for records that carry one; the
-report records it as `stated_ptl`. The configuration gains its
-`machine_spec_digest`, which a fit's key and params state, and `readings`,
-those a run on the spec takes with the inputs' source root, model and engine,
+report records it as `stated_ptl`. The configuration gains `platform`, the
+one the inputs ran on, whose fields the fit's row marks its key and params
+state, and `readings`, those a run on the spec takes with the inputs' source root, model and engine,
 under which each measurement is loaded.
 
 `publish` hands off one store entry whose members are `params`, what a run
@@ -27,6 +27,7 @@ from.
 
 import argparse
 import datetime
+import functools
 import json
 from pathlib import Path
 
@@ -39,20 +40,35 @@ from atom.compass.artifacts import (
     Provenance,
     Reading,
     Topology,
-    machine_spec_digest,
-    machine_spec_key,
+    keyed_platform,
+    machine_platform,
     member_name,
+    platform_of,
     roots_for,
 )
-from atom.compass.artifacts.keys import platform_key
 from atom.compass.backends.json_file import read_json
+from atom.compass.backends.step_labels import Floor
 from atom.compass.fit.samples import UNRECORDED, load
+from atom.compass.parity import busy
 from atom.compass.run.step_grid import readings as run_readings
 from atom.compass.spec import MachineSpec
 from atom.compass.validate.runs import SIDES, named_by_prefill
 
 #: The rank a fit whose key states no layout writes at.
 RANK = Topology().ranks()[0]
+#: The engine fields the `measure ops` points a trace run's drafter kernels take
+#: their own lengths from share with its records: what changes a kernel.
+SAME_OPS = (
+    "tensor_parallel_size",
+    "data_parallel_size",
+    "enable_dp_attention",
+    "enable_expert_parallel",
+    "kv_cache_dtype",
+    "kv_cache_block_size",
+    "index_cache_dtype",
+    "speculative",
+    "draft_model",
+)
 
 
 def ranks(key) -> tuple:
@@ -89,10 +105,17 @@ def parser(prog: str, description: str) -> argparse.ArgumentParser:
     return p
 
 
-def inputs(args, sources) -> tuple[list, dict]:
+def inputs(args, sources, ops=()) -> tuple[list, dict]:
     """The samples of `args`' inputs, records each with its client runs and,
     where `sources` holds `replay`, step measurements, and their configuration;
-    a fit taking only `sources` refuses any other input."""
+    a fit taking only `sources` refuses any other input. With `ops`, `measure
+    ops --out` directories read as `fit ops` reads them, a trace run's drafter
+    labels lose the profiler's floor (`parity.busy.floored`), the spec's
+    `device.profiler_floor_s`, each kernel's own length from their points,
+    which refuse unless they ran the records' model, platform, source root
+    and `SAME_OPS`."""
+    from atom.compass.fit import ops as fit_ops
+
     runs = {Path(i): [] for i in args.inputs if (Path(i) / "run.json").is_file()}
     tokens = [i for i in args.inputs if Path(i) not in runs]
     if tokens and "replay" not in sources:
@@ -115,7 +138,13 @@ def inputs(args, sources) -> tuple[list, dict]:
         )
     store = ArtifactStore(args.store)
     measurements = [store.key_from_token(Kind.STEP_MEASUREMENT, t) for t in tokens]
-    samples, config = load(runs, measurements, args.store)
+    spec = MachineSpec.from_mapping(json.loads(Path(args.machine).read_text()))
+    floored = None
+    if ops:
+        points, measured, keyed = fit_ops.read(store, map(Path, ops))
+        floor = Floor(spec.value("device.profiler_floor_s"), points)
+        floored = functools.partial(busy.floored, floor=floor)
+    samples, config = load(runs, measurements, args.store, floored)
     if args.ptl:
         if config.get("ptl") != UNRECORDED:
             raise ValueError(
@@ -123,9 +152,7 @@ def inputs(args, sources) -> tuple[list, dict]:
                 f"none, and these carry {config.get('ptl')!r}"
             )
         config["ptl"] = args.ptl
-    spec = MachineSpec.from_mapping(json.loads(Path(args.machine).read_text()))
-    torch = spec.value("device.software_pinned_to.torch")
-    stated = {**machine_spec_key(spec).values, "torch": torch}
+    stated = machine_platform(spec)
     ran = platform(config) if runs else stated
     differ = [
         f"{axis} {ran[axis]!r} in the records and {stated[axis]!r} in {args.machine}"
@@ -137,12 +164,29 @@ def inputs(args, sources) -> tuple[list, dict]:
             "the records ran on another platform than --machine states: "
             + "; ".join(differ)
         )
-    here = spec_readings(spec, config)
+    if ops:
+        want = {"model": config["model"], **keyed_platform(Kind.OP_MEASUREMENT, stated)}
+        want["source_root"] = config["source_root"]
+        got = {k: keyed.get(k) for k in want}
+        want |= {k: config["engine_config"].get(k) for k in SAME_OPS}
+        got |= {k: measured["engine_config"].get(k) for k in SAME_OPS}
+        differ = [f"{k} {got[k]!r}, not {v!r}" for k, v in want.items() if got[k] != v]
+        if differ:
+            raise ValueError(
+                "the --ops points ran under another configuration than the "
+                "records: " + "; ".join(differ)
+            )
+    here = run_readings(
+        spec,
+        atom_src=Reading(*config["source_root"].split("-", 1)),
+        model=config["model"],
+        engine_config=json.dumps(config["engine_config"], sort_keys=True),
+    )
     for key in measurements:
         store.load(key, conditions=here, gates=GateState.of())
     return samples, {
         **config,
-        "machine_spec": machine_spec_digest(spec),
+        "platform": ran,
         "readings": here,
     }
 
@@ -159,11 +203,8 @@ def runs(samples) -> list[dict]:
 
 
 def platform(config) -> dict:
-    """The device, software-stack, PTL and torch readings `config`, the inputs'
-    configuration, states, the first three joined as a machine spec's key."""
-    stack = config["stack"]
-    key = platform_key(config["device"], stack, config["ptl"])
-    return {**key.values, "torch": stack["torch"]}
+    """The platform `config`, the inputs' configuration, states."""
+    return platform_of(config["device"], config["stack"], config["ptl"])
 
 
 def conditions(config) -> Conditions:
@@ -173,17 +214,6 @@ def conditions(config) -> Conditions:
         atom_src=Reading(*config["source_root"].split("-", 1)),
         model=config["model"],
         host_cpu=config["host_key"]["host_cpu"],
-        engine_config=json.dumps(config["engine_config"], sort_keys=True),
-    )
-
-
-def spec_readings(spec, config) -> Conditions:
-    """The readings a run on `spec` takes, with the source root, model and
-    engine `config`, the inputs' configuration, states."""
-    return run_readings(
-        spec,
-        atom_src=Reading(*config["source_root"].split("-", 1)),
-        model=config["model"],
         engine_config=json.dumps(config["engine_config"], sort_keys=True),
     )
 

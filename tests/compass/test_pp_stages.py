@@ -119,7 +119,7 @@ def test_a_pipeline_meets_the_run_properties_and_uses_every_stage_channel(pipeli
 
 
 def test_the_stages_join_the_head_with_a_positive_lookahead_each_way():
-    table = single_engine_table(admission_path="serving", ipc_s=IPC, stream_s=IPC, pp=4)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=IPC, stream_s=IPC, pp=4)
     head, *rest = [LpId(f"engine-pp{k}") for k in range(4)]
     assert set(table.registry.ids()) == {
         LpId("traffic"),
@@ -132,11 +132,11 @@ def test_the_stages_join_the_head_with_a_positive_lookahead_each_way():
     # Two downstream stages hear of each other only through the head.
     assert table.distance(rest[0], rest[1]) == 2 * IPC
     with pytest.raises(ValueError, match="ipc_s is 0.0"):
-        single_engine_table(admission_path="serving", ipc_s=0.0, stream_s=IPC, pp=2)
+        single_engine_table(admission_s=0.54e-3, ipc_s=0.0, stream_s=IPC, pp=2)
 
 
 def test_a_stage_names_its_channels_by_the_index_its_frontend_gives_it(monkeypatch):
-    table = single_engine_table(admission_path="serving", ipc_s=IPC, stream_s=IPC, pp=2)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=IPC, stream_s=IPC, pp=2)
     rt = LPRuntime(LpId("engine-pp1"), table, None)
     monkeypatch.setattr(clock, "_installed", rt)
     pc = SimpleNamespace(
@@ -151,7 +151,7 @@ def test_a_stage_names_its_channels_by_the_index_its_frontend_gives_it(monkeypat
         disagg_p2d_addr="",
         disagg_d2p_addr="",
     )
-    relay = clock.relay_queue(0)
+    relay = clock.relay_queue(SimpleNamespace(data_parallel_rank=0))
     clock.name_endpoints(0, "in", "ctl", "out", config)
     assert relay.wsock.ch == "engine-pp1->frontend:output#dp1"
     assert [rt.endpoints[a] for a in ("in", "ctl", "out", "m1")] == [
@@ -182,7 +182,7 @@ def test_a_pipeline_whose_machine_states_no_send_carrier_is_refused_by_name(
 def _two_stage_table(*rows) -> str:
     """A PP2 step table: the head's forward 0 starts at 1.0, and `rows`."""
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": IPC,
         "stream_s": IPC,
         "pipeline_parallel_size": 2,
@@ -294,7 +294,7 @@ def _computed(i=None, row=None) -> list[str]:
     """`stage_timelines` on `ROWS`, with `row` in place of row `i`; each stage
     runs one layer of two."""
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": IPC6,
         "stream_s": IPC6,
         "pipeline_parallel_size": 2,

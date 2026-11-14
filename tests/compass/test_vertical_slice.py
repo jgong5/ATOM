@@ -19,18 +19,18 @@ import http.client
 import json
 import math
 import os
-import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
-from test_memory_readings import DOCUMENT, META_8B, TOKENIZER, publish_readings
+from test_memory_readings import DOCUMENT, META_8B, publish_readings
 
 from atom.compass import run as compass_run
 from atom.compass.backends.step_stub import Coefficients
@@ -40,9 +40,9 @@ from atom.compass.clock_transport import connect
 from atom.compass.detect.determinism import CONFIGURATION_PREFIX
 from atom.compass.detect.scenario import check_run
 from atom.compass.drive import run as drive_run
-from atom.compass.drive.serve import _free_ports
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
+from tests.compass.held_ports import held_ports
 
 MODEL = os.environ.get("ATOM_COMPASS_SLICE_MODEL")
 NEEDS_A_RUN = pytest.mark.skipif(
@@ -54,6 +54,13 @@ NEEDS_A_RUN = pytest.mark.skipif(
 TREE = Path(__file__).resolve().parents[2]
 TRAFFIC = LpId("traffic")
 HTTP, STREAM = "traffic->frontend:http", "frontend->traffic:stream"
+#: The served tokenizer's charge, as the slice's `host` entry states it.
+TOKENIZER = {
+    "backend": "fast",
+    "fingerprint": "sha256:" + "a" * 64,
+    "encode": {"fixed_s": 3.0e-4, "tokens_per_s": 2.0e6},
+    "decode": {"fixed_s": 1.5e-4, "tokens_per_s": 3.0e6},
+}
 SCRAPE_S = 16.0
 WALL_S = 600.0
 MAX_TOKENS = 4
@@ -64,12 +71,6 @@ CONSTANT = dataclasses.asdict(Coefficients.constant(2.0**-9, 2.0**-11))
 
 class UnansweredRequests(AssertionError):
     """The run finished with requests that never had their final response."""
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _retry(what, server, attempt):
@@ -206,10 +207,13 @@ class Traffic:
 
 
 def _run_file(out: Path, **overrides) -> Path:
+    """`out`'s run file with `overrides`. Its default clock endpoint is
+    in-process and takes no port; a run whose authority another process serves
+    names one on a held port."""
     run = {
-        "clock_endpoint": f"tcp://127.0.0.1:{_free_port()}",
+        "clock_endpoint": f"inproc:{uuid.uuid4().hex}",
         "bound_s": 600.0,
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 2.0**-14,
         "stream_s": 2.0**-12,
         "step_stub": dataclasses.asdict(Coefficients()),
@@ -235,39 +239,44 @@ def publish_entry(store, machine, argv, env) -> None:
 def run_slice(out: Path, seed: str) -> dict:
     """One run in its own process tree; its step table, summary and request times."""
     out.mkdir()
-    clock_port, port = _free_ports(2)
-    endpoint = f"tcp://127.0.0.1:{clock_port}"
-    run_file = _run_file(out, clock_endpoint=endpoint, step_stub=CONSTANT)
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=seed,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
-    )
-    args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
-    args += ["--enforce-eager", "--max-model-len", "2048"]
-    publish_entry(out / "store", DOCUMENT, args, env)
-    with open(out / "server.log", "w") as log:
-        server = subprocess.Popen(
-            [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
-            + ["--compass-run", str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
+    with held_ports(2) as (clock_port, port):
+        endpoint = f"tcp://127.0.0.1:{clock_port}"
+        run_file = _run_file(
+            out,
+            clock_endpoint=endpoint,
+            step_stub=CONSTANT,
+            host={"tokenizer": TOKENIZER},
         )
-        # A run that hangs ends here: the clock's socket closes with the server.
-        watchdog = threading.Timer(WALL_S, server.kill)
-        watchdog.start()
-        try:
-            traffic = Traffic(json.loads(run_file.read_text()), port, server)
-            traffic.run()
-            code = server.wait(timeout=120)
-        finally:
-            watchdog.cancel()
-            if server.poll() is None:
-                server.kill()
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
+        )
+        args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
+        args += ["--enforce-eager", "--max-model-len", "2048"]
+        publish_entry(out / "store", DOCUMENT, args, env)
+        with open(out / "server.log", "w") as log:
+            server = subprocess.Popen(
+                [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
+                + ["--compass-run", str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            # A run that hangs ends here: the clock's socket closes with the server.
+            watchdog = threading.Timer(WALL_S, server.kill)
+            watchdog.start()
+            try:
+                traffic = Traffic(json.loads(run_file.read_text()), port, server)
+                traffic.run()
+                code = server.wait(timeout=120)
+            finally:
+                watchdog.cancel()
+                if server.poll() is None:
+                    server.kill()
     tail = (out / "server.log").read_text()[-4000:]
     assert code == 0, f"the server exited {code} after the finish:\n{tail}"
     return {
@@ -325,8 +334,8 @@ def test_the_served_tokenizer_charges_the_request_its_encode_and_decode(runs):
     output = _release(table, "frontend", "engine->frontend:output#dp0", 1)
     decode = _release(table, "traffic", STREAM, 0) - output - run["stream_s"]
     print(f"\nrequest 0: encode {encode!r} s, first frame's decode {decode!r} s")
-    assert encode >= TOKENIZER["encode_fixed_s"]
-    assert decode >= TOKENIZER["decode_fixed_s"]
+    assert encode >= TOKENIZER["encode"]["fixed_s"]
+    assert decode >= TOKENIZER["decode"]["fixed_s"]
 
 
 # --- without a driver: the bootstrap off, and its refusals -------------------

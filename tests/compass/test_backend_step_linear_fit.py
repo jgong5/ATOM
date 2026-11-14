@@ -9,11 +9,14 @@ time (`d_busy_ns`) the known law's price. The fitted law is read by
 
 import json
 import re
+import shutil
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from atom.compass.artifacts import Kind, keyed_platform, machine_platform
 from atom.compass.backends import (
     BatchView,
     CostRefused,
@@ -24,6 +27,7 @@ from atom.compass.backends import (
 )
 from atom.compass.backends.step_labels import BUILDS, label
 from atom.compass.backends.step_linear_fit import (
+    _fit_form,
     _solve,
     fit,
     fit_host,
@@ -32,6 +36,7 @@ from atom.compass.backends.step_linear_fit import (
     main,
     mark_held_out,
 )
+from atom.compass.spec import MachineSpec
 from atom.compass.validate.cost import cost_accuracy
 
 PREFILL = {"step": 0.02, "tokens": 6e-5, "query_square": 2e-10, "query_cached": 3e-10}
@@ -40,7 +45,25 @@ DECODE = {
     "2": {"step": 0.021, "context": 1e-7, "graph_padding": 4e-8},
     "4": {"step": 0.022, "context": 1.2e-7, "graph_padding": 3e-8},
 }
-SPEC = ("--machine-spec", "sha256:" + "0" * 64)
+
+
+def platform_arg(document: dict) -> tuple[str, str]:
+    """`--platform` for the platform the machine spec `document` states."""
+    platform = machine_platform(MachineSpec.from_mapping(document))
+    kinds = (Kind.STEP_LINEAR_LAW, Kind.HOST_LAWS)
+    return "--platform", json.dumps(
+        {k.value: keyed_platform(k, platform) for k in kinds}
+    )
+
+
+#: A committed machine spec's platform, which keys the laws the command writes here.
+SPEC = platform_arg(
+    json.loads(
+        (
+            Path(__file__).parents[2] / "scripts/compass/machines/mi308x-hjbog39.json"
+        ).read_text()
+    )
+)
 
 
 def _price(rows, rung, history=0.0):
@@ -94,6 +117,20 @@ def _engine_file(record, engine=ENGINE):
     record.with_suffix(".engine.json").write_text(json.dumps(engine))
 
 
+def traced(line: dict) -> dict:
+    """`line` with a trace run's busy time per pass, its windows', on a prefill:
+    the label a prefill fits by."""
+    if "d_busy_ns" not in line or all(r[2] for r in line["rows"]):
+        return line
+    busy = {"b_target_ns": line.get("d_target_ns", line["d_busy_ns"])}
+    if "d_target_ns" in line:
+        busy["b_draft_ns"] = line["d_busy_ns"] - line["d_target_ns"]
+    for key in ("d_propose_ns", "d_draft_kv_ns"):
+        if key in line:
+            busy["b" + key[1:]] = line[key]
+    return {**line, **busy}
+
+
 def _record(path, steps, stretch=None):
     """Write `steps` as a real record whose device busy time is each step's price.
 
@@ -123,7 +160,7 @@ def _record(path, steps, stretch=None):
             }
         )
         t += busy
-    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    path.write_text("".join(json.dumps(traced(line)) + "\n" for line in lines))
     _engine_file(path)
     return path
 
@@ -258,6 +295,53 @@ def test_a_rung_a_mad_pass_drops_entirely_gets_coefficient_zero():
     assert np.isfinite(solved["coef"]).all()
 
 
+def test_a_fit_at_the_pass_limit_ends_there_with_the_vector_it_reached(monkeypatch):
+    """Each step's label is the max of two ranks' prices under (1, 2, 3), one
+    label doubled. Unlimited, the passes settle at that law at the 4th and a
+    MAD round drops the doubled step. Limited to one pass, the first round
+    ends at the limit: the fit keeps the vector that pass reached, its `F`
+    the one recorded and below the start's, and runs no MAD round."""
+    from scipy.optimize import nnls
+
+    from atom.compass.backends import step_linear_fit
+
+    rng = np.random.default_rng(0)
+    x = np.ones((60, 2, 3))
+    x[..., 1] = rng.uniform(0, 1, (60, 2))
+    x[..., 2] = rng.uniform(0, 1, (60, 2))
+    y = (x @ [1.0, 2.0, 3.0]).max(axis=1)
+    y[7] *= 2.0
+    real = np.ones((60, 2), dtype=bool)
+    names = ["step", "context", "graph_padding"]
+
+    def cost(c):
+        return float((((x @ c).max(axis=1) / y - 1) ** 2).sum())
+
+    settled = _fit_form(x, real, y, names)
+    passes = settled["passes"]
+    assert (passes["start"], passes["count"], passes["stop"]) == (
+        "all_rows",
+        4,
+        "settled",
+    )
+    assert settled["coef"] == pytest.approx([1.0, 2.0, 3.0], rel=1e-9)
+    assert np.flatnonzero(~settled["keep"]).tolist() == [7]
+
+    monkeypatch.setattr(step_linear_fit, "FIT_PASSES", 1)
+    limited = _fit_form(x, real, y, names)
+    passes = limited["passes"]
+    assert (passes["start"], passes["count"], passes["stop"]) == (
+        "all_rows",
+        1,
+        "limit",
+    )
+    assert limited["keep"].all()
+    assert passes["F"] == pytest.approx(cost(limited["coef"]), rel=1e-9)
+    start = nnls((x / y[:, None, None]).reshape(-1, 3), np.ones(120))[0]
+    assert passes["F"] < cost(start)
+    assert limited["coef"] != pytest.approx([1.0, 2.0, 3.0], rel=1e-3)
+
+
 def test_the_command_writes_a_law_a_run_file_can_carry(tmp_path, capsys):
     records = [str(_record(tmp_path / f"dp0-{s}.jsonl", _steps(s))) for s in (6, 7)]
     main([*records, "--out", str(tmp_path / "law.json"), *SPEC])
@@ -305,7 +389,9 @@ def test_a_law_with_prefill_too_thin_to_fit_loads_and_refuses_prefill(tmp_path, 
     steps = [s for i, s in enumerate(steps) if i not in prefill[kept:]]
     law = _fit([_record(tmp_path / "dp0.jsonl", steps)])
 
-    assert law["unfitted"] == {"prefill": f"{kept} steps for 4 coefficients"}
+    why = f"{kept} steps for 4 coefficients"
+    why = why if kept else "no prefill step carries a trace run's busy time"
+    assert law["unfitted"] == {"prefill": why}
     backend = StepLinearBackend(StepLinearLaw(law))
     with pytest.raises(CostRefused, match="no prefill vector"):
         backend.price(_view([(100, 100, False)]))
@@ -363,18 +449,22 @@ HOST = {
         "W_launch": [1e-4, 2e-6, 0.0],
         "W_post": [1.5e-4, 4e-6, 0.0],
     },
+    # A prefill row past the first is a request the forward admits: what they
+    # add to `E` is `HOST_ADMIT`'s, its intercept once.
     "prefill": {
-        "E": [4e-4, 2e-8, 5e-5],
+        "E": [4e-4, 2e-8, 0.0],
         "W_pre": [6e-4, 1e-7, 8e-5],
         "W_launch": [2e-4, 3e-8, 2e-5],
         "W_post": [3e-4, 1e-9, 6e-5],
     },
     "middle": {
-        "E": [5e-4, 3e-8, 4e-5],
+        "E": [5e-4, 3e-8, 0.0],
         "W_pre": [7e-4, 9e-8, 7e-5],
         "W_launch": [2.5e-4, 2e-8, 3e-5],
     },
 }
+#: A forward's `E` if it admits requests, per prompt token past the hit and in it.
+HOST_ADMIT = [3e-4, 2e-8, 1e-9]
 KEY = {"host_cpu": "test cpu", "atom": "0" * 64, "model": None, "engine": {}}
 IDLE_NS = 10**9
 #: Device work between forwards, which a decode's label takes and a prefill's does not.
@@ -404,6 +494,10 @@ def _timed_record(path, steps, idle_after=(), key=KEY, gap=0, scale=None):
         kind = "decode" if not prefill else "prefill" if output else "middle"
         x = (1, sum(r[0] for r in rows), len(rows))
         ns = {k: round(float(np.dot(c, x)) * 1e9) for k, c in HOST[kind].items()}
+        # Its rows past the first are requests it admits, each its only prefill row.
+        new = [(q, n - q) for q, n, d in rows[1:] if not d]
+        a = (len(new), sum(u for u, _ in new), sum(c for _, c in new))
+        ns["E"] += round(float(np.dot(HOST_ADMIT, (min(a[0], 1), *a[1:]))) * 1e9)
         ns = {k: round(v * (scale or {}).get((i, k), 1)) for k, v in ns.items()}
         enter = t + ns["E"]
         g0 = enter + ns["W_pre"] // 2
@@ -440,7 +534,7 @@ def _timed_record(path, steps, idle_after=(), key=KEY, gap=0, scale=None):
             output_end = device_end
         line["t_exit_ns"] = t
         lines.append(line)
-    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    path.write_text("".join(json.dumps(traced(line)) + "\n" for line in lines))
     if key is not None:
         path.with_suffix(".key.json").write_text(json.dumps(key))
     _engine_file(path, ENGINE | (key or {}).get("engine", {}))
@@ -478,32 +572,56 @@ def test_device_busy_time_and_host_laws_are_recovered_from_a_timed_record(tmp_pa
         for segment, c in segments.items():
             got = host["laws"][kind][segment]
             assert got == pytest.approx(c, rel=1e-4, abs=1e-12), f"{kind}.{segment}"
+    assert host["admit"] == pytest.approx(HOST_ADMIT, rel=1e-4, abs=1e-12)
 
 
-def test_a_prefill_whose_exit_ran_under_the_paced_share_after_its_host_record_is_cut(
-    tmp_path,
-):
-    """Output prefill 2's exit event runs 7% of its label after the host records
-    it, prefill 6's 9%: the host paced 2, the device 6. On this MTP record
-    prefill 10's runs 6% of its window, 12% of its target label: the device
-    paced it. The host clock reads 1000 s ahead of the device's."""
-    record, _ = _timed_record(tmp_path / "dp0.jsonl", _steps(14, n=40))
+def test_a_prefill_pass_is_labelled_by_a_trace_run_s_busy_time_alone(tmp_path):
+    """On this MTP record a prefill step without busy lines is cut untraced,
+    and the fit names the prefill vector unfitted. In a trace run, whose run
+    directory holds its traces, the busy lines label each prefill pass, each
+    decode is cut as traced and no step has host labels, and its `steps`
+    directory copied alone labels the same; without its busy lines it
+    refuses."""
+    (tmp_path / "steps").mkdir()
+    record, _ = _timed_record(tmp_path / "steps" / "dp0.jsonl", _steps(14, n=40))
     lines = [json.loads(x) for x in record.read_text().splitlines()]
     for s in lines:
-        for k in [k for k in s if k.startswith("t_")]:
-            s[k] = np.add(s[k], 10**12).tolist()
-        s["d_target_ns"] = s["d_busy_ns"] // (2 if s["step"] == 10 else 1)
-    end = lines[0]["t_launch_ns"][0]  # the first forward's device start
-    for s in lines:
-        end += s.get("d_gap_ns", 0) + s["d_busy_ns"]
-        share = {2: 0.07, 6: 0.09, 10: 0.06}.get(s["step"])
-        if share:
-            s["t_exit_ns"] = end - round(share * s["d_busy_ns"])
+        for k in [k for k in s if k[:2] == "b_"]:
+            del s[k]
+        s["d_target_ns"], s["d_propose_ns"] = s["d_busy_ns"] // 2, s["d_busy_ns"] // 8
     record.write_text("".join(json.dumps(s) + "\n" for s in lines))
+    prefill = {s["step"] for s in lines if not s["rows"][0][2]}
 
-    cut = {s.step: s.cut for s in label(record)[0]}
-    assert cut[2] == "paced" and cut[6] is None
-    assert [n for n, c in cut.items() if c] == [2]
+    got = label(record)[0]
+    assert {s.cut for s in got if s.step in prefill} == {"untraced"}
+    assert all(s.host for s in got)
+    why = "no prefill step carries a trace run's busy time"
+    assert _fit([record])["unfitted"]["prefill"] == why
+
+    busy = {n: (1000 + n, 200 + n, 50 + n) for n in prefill}
+    record.with_suffix(".busy.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {"step": n, "b_target_ns": t, "b_draft_ns": d, "b_propose_ns": p}
+            )
+            + "\n"
+            for n, (t, d, p) in busy.items()
+        )
+    )
+    (tmp_path / "trace").mkdir()
+    got = label(record)[0]
+    assert all(s.host == {} for s in got)
+    assert {s.cut for s in got if s.step not in prefill} == {"traced"}
+    for s in (s for s in got if s.step in prefill):
+        t, d, p = (x * 1e-9 for x in busy[s.step])
+        assert (s.cut, s.device_s, s.draft_s) == (None, t, d)
+        assert s.propose_s == (p if s.view.produces_output else None)
+    copied = tmp_path / "copied" / "steps"
+    shutil.copytree(record.parent, copied)
+    assert label(copied / record.name)[0] == got
+    record.with_suffix(".busy.jsonl").unlink()
+    with pytest.raises(ValueError, match="trace run's record with no dp0.busy.jsonl"):
+        label(record)
 
 
 def test_a_launch_a_first_use_compile_stalls_is_named_and_left_out_with_the_next(
@@ -569,7 +687,7 @@ def test_the_command_writes_host_laws_a_run_file_takes_and_scores_them_held_out(
 
     law = json.loads((tmp_path / "law.json").read_text())
     StepLinearLaw(law)
-    assert set(law["host"]) == {"key", "laws"}
+    assert set(law["host"]) == {"key", "laws", "admit"}
     assert {len(c) for s in law["host"]["laws"].values() for c in s.values()} == {3}
     out = capsys.readouterr().out
     assert "held out, host laws" in out and "host decode W_post | " in out
@@ -755,17 +873,17 @@ def test_a_run_refuses_host_laws_fitted_under_another_key(tmp_path, monkeypatch)
     from test_run_step_grid import deployment, publish, run_file
 
     from atom.compass import run as compass_run
-    from atom.compass.artifacts import machine_spec_digest
+    from atom.compass.artifacts import Kind, keyed_platform, machine_platform
     from atom.compass.spec import MachineSpec
 
     laws = {"decode": {"E": [1e-4, 0.0, 0.0]}}
-    spec = machine_spec_digest(MachineSpec.from_mapping(DOCUMENT))
+    spec = machine_platform(MachineSpec.from_mapping(DOCUMENT))
     cases = (("same", {}), ("other", {"host_cpu": "another cpu"}), ("none", None))
     for name, other in cases:
         (tmp_path / name).mkdir()
         r = deployment(tmp_path / name)
         publish(tmp_path / name, r)
-        key = dict(compass_run.host_key(r.config), machine_spec=spec)
+        key = compass_run.host_key(r.config) | keyed_platform(Kind.HOST_LAWS, spec)
         host = {"laws": laws}
         if other is not None:
             host["key"] = dict(key, **other)
@@ -1045,7 +1163,7 @@ def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
     args = [record, "--out", str(tmp_path / "law.json"), *SPEC]
 
     (tmp_path / "out/run.json").write_text(json.dumps({BUILDS: ["mha_varlen_fwd"]}))
-    named = f"{record} is not fitted: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    named = f"{record} is not fitted: its server ran a JIT compile of ['mha_varlen_fwd'] while"
     with pytest.raises(ValueError, match=re.escape(named)):
         main(args)
     assert not (steps / "dp0.cost.jsonl").exists()
@@ -1142,3 +1260,29 @@ def test_a_dp_step_a_peer_ran_as_a_dummy_is_fitted_on_the_ranks_that_ran_it(tmp_
     assert sum(v["fit"]["samples"] for v in fitted) == 120
     assert fitted[0]["coefficients"] == pytest.approx(dp.PREFILL, rel=1e-6)
     assert fitted[1]["coefficients"] == pytest.approx(dp.DECODE, rel=1e-6)
+
+
+def test_a_routed_dp_law_is_held_out_with_each_step_s_dummy_forwards(tmp_path):
+    """Three DP runs whose idle ranks run dummy forwards: each run, held out of
+    a fit on the other two, is priced with its steps' dummies reaching one
+    token's experts, so the held-out errors are nil, and each step's costliest
+    rank lies inside their hull."""
+    import test_step_linear_moe_column as moe
+
+    runs = [
+        moe._dummy_records(tmp_path / f"run{s}", moe._dummy_groups(s, 120))
+        for s in (0, 1, 2)
+    ]
+    law, samples, options = moe._routed([r for run in runs for r in run])
+    report = {"held_out": {}}
+    mark_held_out(law, report, samples, options)
+
+    vector = law["decode"][str(moe.RUNG)]
+    band = vector["held_out"]["bands"][f"decode rung {moe.RUNG}"]
+    assert band["steps"] == 360
+    assert max(abs(band["p10"]), abs(band["p90"])) < 1e-6
+    assert len(report["held_out"]) == 3
+    backend = StepLinearBackend(StepLinearLaw(law), moe.DP)
+    views = [vs[0] for vs, _ in moe._dummy_groups(0, 120)]  # rank 0 always works
+    validated = {t.provenance.validated for v in views for t in backend.price(v).terms}
+    assert validated == {True}

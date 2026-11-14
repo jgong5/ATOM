@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "name": "mi455x-b0",
+  "provenance": {
+    "authored_by": "compass agent for jgong5",
+    "date": "2026-11-03",
+    "origin": "mixed",
+    "origins": {
+      "device.name": {"origin": "assumed"},
+      "device.arch": {"origin": "assumed"},
+      "device.count_per_node": {"origin": "datasheet"},
+      "device.memory.capacity_bytes": {"origin": "datasheet"},
+      "device.memory.bandwidth_bytes_per_s": {"origin": "datasheet"},
+      "device.compute.bf16_flops": {"origin": "datasheet"},
+      "device.compute.fp8_flops": {"origin": "datasheet"},
+      "device.compute.fp4_flops": {"origin": "datasheet"},
+      "interconnect.intra_node.topology": {"origin": "datasheet"},
+      "interconnect.intra_node.domain_devices": {"origin": "datasheet"},
+      "interconnect.intra_node.link_bandwidth_bytes_per_s": {"origin": "datasheet"}
+    },
+    "notes": "MI455X product page and brochure (07/26), read 2026-10-09: dense matrix-core peaks, HBM4 bandwidth, the four GPUs of a compute tray and the 72 its switched UALoE fabric joins, and one GPU's scale-up rate per direction; its 432 GB of HBM4 as GiB, since MI355X's 288 GB reads 288 GiB less 16 MiB at a real start and MI308X's 192 GB reads 192 GiB less 16 MiB | the B0 performance machines, which no card here reads: MI455X named for their stepping, at the arch the A0 samples read"
+  },
+  "device": {
+    "name": "MI455X B0",
+    "arch": "gfx1250",
+    "count_per_node": 4,
+    "memory": {
+      "capacity_bytes": 463856467968,
+      "bandwidth_bytes_per_s": 23.3e12
+    },
+    "compute": {
+      "bf16_flops": 5.033e15,
+      "fp8_flops": 20.133e15,
+      "fp4_flops": 40.265e15
+    }
+  },
+  "interconnect": {
+    "intra_node": {
+      "topology": "switched",
+      "domain_devices": 72,
+      "link_bandwidth_bytes_per_s": 1.8e12
+    }
+  }
+}

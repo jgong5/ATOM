@@ -4,296 +4,44 @@
     HIP_VISIBLE_DEVICES=a,b python3 scripts/compass/probe_device.py SPEC OUT
 
 SPEC is the machine file the peaks belong to. Card 0 runs the one-card probes,
-cards 0 and 1 the link. Every sample is device time between two events queued
-behind a spin kernel, so no host time is in it.
-
-- Compute: per format, the median of `REPS` GEMMs ``x @ w.T``, x m by k and
-  w n by k, at each of `SHAPES`, BF16 through `torch.matmul`, FP8 through
-  `torch._scaled_mm`, and FP4 where SPEC states ``fp4_flops``: MXFP4, two
-  values a byte and a power-of-two scale per 32 along k, through both
-  `torch._scaled_mm` (hipBLASLt) and `aiter.gemm_a4w4` with w pre-shuffled,
-  as aiter's own tests call it. The best rate over shapes and libraries, over
-  SPEC's ``*_flops``, is the format's derate. Each GEMM follows a spin, so the
-  rate is a burst's: with PTL enabled a sustained GEMM slows within a second
-  or two.
-- Bandwidth: per kind in `KINDS` (read-only, write-only, copy) and per size
-  in `SIZES` of bytes moved, a graph of up to `GRAPH` kernels through
-  consecutive slices of one zeroed `2 * POOL`-byte buffer (a copy reads one
-  half and writes the other), replayed `REPS` times. Kernels that together fit
-  in the last-level cache run warm, as small operators do, and larger ones
-  from HBM. The kernels are Triton: `copy_` reaches about 2 TB/s on MI308X, a
-  kernel about 3.6. At each size the fastest kind's median rate bounds any mix
-  of reads and writes; the running maximum of it over sizes is
-  ``memory.bandwidth_curve``, so noise on the plateau keeps it monotone, and
-  its largest point over SPEC's bandwidth is ``memory.derate``.
-- Kernel floor: `GRAPH` empty kernels captured in one graph, replayed `REPS`
-  times; ``kernel_floor_s`` is the median per kernel, with its p10 and p90.
-- Link: one kernel per card passes a counter `ROUNDS` times through the other
-  card's memory; half a round trip is ``link_latency_s``, with its p10 and p90
-  over `REPS` runs. A `LINK_BYTES` copy from card 0 to card 1 over SPEC's link
-  bandwidth is ``intra_node.derate``.
-
-The run is refused unless every card is idle (under `IDLE_BYTES` of VRAM used,
-0% busy) and reads SPEC's ``device.ptl`` from
-``ptl/ptl_enable`` under its sysfs device (`NO_PTL` where it has none). OUT
-is the record: the cards, the stack (ROCm, aiter's commit, RCCL and torch),
-every sample and this file's text; the fragment
-printed names its sha256.
+cards 0 and 1 the link; `atom/compass/drive/device_probe.py` holds the probes,
+what each one samples, and the cards they refuse. OUT is the record: the cards,
+the stack (ROCm, aiter's commit, RCCL and torch), the capacity torch reads on
+card 0, every sample and the text of this file and of the probes' module; the
+fragment printed names its sha256.
 """
 
 import datetime
 import hashlib
-import itertools
 import json
-import math
-import statistics
 import sys
-import time
-from functools import partial
 from pathlib import Path
-
-import triton
-import triton.language as tl
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from atom.compass.artifacts.keys import NO_PTL
-from atom.compass.spec import Fragment, MachineSpec, SpecRefusal
-from atom.compass.spec.rules import Rule
-
-#: GEMM shapes (m, n, k), every format timed at each: hipBLASLt's rate moves by
-#: up to 2.7x between neighbouring large shapes, and each format peaks at another.
-SHAPES = tuple(itertools.product((8192, 10240, 12288, 16384), repeat=3))
-SIZES = tuple(2**k for k in range(12, 33))  # 4 KiB to 4 GiB moved
-POOL, COPY_BLOCK = 2**31, 4096  # bytes in each copy half, floats a program
-#: Each bandwidth kind: whether its kernel reads, and whether it writes.
-KINDS = {"read": (True, False), "write": (False, True), "copy": (True, True)}
-GRAPH, ROUNDS, LINK_BYTES = 1000, 1000, 2**30
-REPS = 20
-SPIN = 10**7  # device cycles a sample waits behind, well past its host calls
-IDLE_BYTES = 2**30
-DRM = "/sys/class/drm"
-#: Each format's derate, by the spec-peak number it is taken over.
-FORMATS = {"bf16": "bf16_flops", "fp8": "fp8_flops", "fp4": "fp4_flops"}
-#: The fields read with a band, and each one's sample list in the record.
-BANDED = {
-    "device.kernel_floor_s": "floor",
-    "interconnect.intra_node.link_latency_s": "one_hop",
-}
-
-
-@triton.jit
-def _pingpong(mine, theirs, rounds, serve: tl.constexpr):
-    """Write `theirs`, on the other card, then wait to see `mine` written
-    back, `rounds` times; the side that does not serve answers each round."""
-    for i in range(1, rounds + 1):
-        if serve:
-            tl.atomic_xchg(theirs, i, sem="release", scope="sys")
-        seen = tl.atomic_add(mine, 0, sem="acquire", scope="sys")
-        while seen < i:
-            seen = tl.atomic_add(mine, 0, sem="acquire", scope="sys")
-        if not serve:
-            tl.atomic_xchg(theirs, i, sem="release", scope="sys")
-
-
-@triton.jit
-def _stream(src, dst, n, BLOCK: tl.constexpr, READ: tl.constexpr, WRITE: tl.constexpr):
-    """Copy `n` floats, `BLOCK` a program, or only read or only write them. A
-    read alone stores the negative floats of a zeroed `src`: none."""
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    x = tl.zeros([BLOCK], tl.float32)
-    if READ:
-        x = tl.load(src + offs, mask=offs < n)
-    tl.store(dst + offs, x, mask=(offs < n) & ((x < 0) | WRITE))
-
-
-def cards(bdfs: list[str], drm: str = DRM) -> list[dict]:
-    """Each card's sysfs reading by PCI address: VRAM used, busy and PTL."""
-    found = {}
-    for card in Path(drm).glob("card[0-9]*"):
-        device = card / "device"
-        if "-" not in card.name and device.exists():
-            found[device.resolve().name] = device
-    out = []
-    for bdf in bdfs:
-        device = found[bdf]
-        ptl = device / "ptl" / "ptl_enable"
-        out.append(
-            {
-                "bdf": bdf,
-                "vram_used": int((device / "mem_info_vram_used").read_text()),
-                "busy": int((device / "gpu_busy_percent").read_text()),
-                "ptl": ptl.read_text().strip() if ptl.exists() else NO_PTL,
-            }
-        )
-    return out
-
-
-def refuse_unfit(read: list[dict], ptl: str) -> None:
-    """Refuse cards that hold other work or disagree with the spec's PTL."""
-    wrong = [
-        f"{c['bdf']} (ptl {c['ptl']}, {c['vram_used']} B used, {c['busy']}% busy)"
-        for c in read
-        if c["ptl"] != ptl or c["vram_used"] > IDLE_BYTES or c["busy"]
-    ]
-    if wrong:
-        raise SpecRefusal(
-            Rule.MEASURED,
-            f"cards {', '.join(wrong)} are not idle cards with PTL {ptl}",
-            "pick idle cards whose ptl_enable is the spec's `device.ptl`; a peak "
-            "read beside a neighbour or under another PTL state is not this "
-            "machine's",
-        )
-
-
-def _timed(torch, fn, reps: int = REPS) -> list[float]:
-    """Device seconds of `reps` calls of `fn`, each behind a spin."""
-    out = []
-    for _ in range(reps):
-        torch.cuda._sleep(SPIN)
-        start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-        start.record()
-        fn()
-        end.record()
-        end.synchronize()
-        out.append(start.elapsed_time(end) / 1e3)
-    return out
-
-
-def _fp4(torch, rows: int, k: int):
-    """An MXFP4 operand of `rows` by `k` random values and its unit scales."""
-    cuda = {"dtype": torch.uint8, "device": "cuda"}
-    packed = torch.randint(0, 256, (rows, k // 2), **cuda)
-    scales = torch.full((rows, k // 32), 127, **cuda)  # 2**0 in E8M0
-    return packed.view(torch.float4_e2m1fn_x2), scales.view(torch.float8_e8m0fnu)
-
-
-def _a4w4(x, w):
-    """aiter's MXFP4 GEMM of bf16 `x` and `w`, quantised per 1x32 with shuffled
-    scales and `w` pre-shuffled, as aiter's own tests call it."""
-    import aiter
-    from aiter.ops.shuffle import shuffle_weight
-
-    quant = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-    (x4, sx), (w4, sw) = quant(x, shuffle=True), quant(w, shuffle=True)
-    w4 = shuffle_weight(w4, layout=(16, 16))
-    return partial(aiter.gemm_a4w4, x4, w4, sx, sw, bpreshuffle=True)
-
-
-def probe(torch, formats) -> dict:
-    """Every sample, on visible cards 0 and 1, GEMMs in `formats`; FP4 also
-    through aiter, under ``aiter``."""
-    torch.cuda.set_device(0)
-    fp8 = torch.float8_e4m3fn
-    if torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx942"):
-        fp8 = torch.float8_e4m3fnuz
-    one = torch.ones((), device="cuda")
-    gemm = {f: {} for f in formats}
-    aiter = {"fp4": {}} if "fp4" in formats else {}
-    for m, n, k in SHAPES:
-        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-        w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-        scaled = partial(torch._scaled_mm, out_dtype=torch.bfloat16)
-        calls = {
-            "bf16": partial(torch.matmul, x, w.T),
-            "fp8": partial(scaled, x.to(fp8), w.to(fp8).T, one, one),
-        }
-        if "fp4" in formats:
-            (x4, sx), (w4, sw) = _fp4(torch, m, k), _fp4(torch, n, k)
-            calls["fp4"] = partial(scaled, x4, w4.T, sx, sw)
-        timings = [(gemm[f], calls[f]) for f in formats]
-        if aiter:
-            timings.append((aiter["fp4"], _a4w4(x, w)))
-        for samples, call in timings:
-            samples[f"{m}x{n}x{k}"] = _timed(torch, call)
-            time.sleep(1)  # let a PTL card recover before the next burst
-    pool = torch.zeros(2 * POOL // 4, device="cuda")
-    streams = {kind: {} for kind in KINDS}
-    for (kind, (read, write)), size in itertools.product(KINDS.items(), SIZES):
-        src, dst = pool.chunk(2) if read and write else (pool, pool)
-        n, k = size // 4 // (read + write), min(GRAPH, 2 * POOL // size)
-        grid, flags = (triton.cdiv(n, COPY_BLOCK),), (COPY_BLOCK, read, write)
-        _stream[grid](src, dst, n, *flags, num_warps=8)  # compiles uncaptured
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            for i in range(k):
-                _stream[grid](src[i * n :], dst[i * n :], n, *flags, num_warps=8)
-        streams[kind][size] = [t / k for t in _timed(torch, graph.replay)]
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for _ in range(GRAPH):
-            torch.cuda._sleep(0)
-    floor = [t / GRAPH for t in _timed(torch, graph.replay)]
-
-    near = torch.empty(LINK_BYTES, dtype=torch.uint8, device="cuda:0")
-    far = torch.empty_like(near, device="cuda:1")
-    far.copy_(near)  # also maps each card's memory into the other
-    near.copy_(far)
-    link = [LINK_BYTES / t for t in _timed(torch, partial(far.copy_, near))]
-    mine = torch.zeros(1, dtype=torch.int32, device="cuda:0")
-    theirs = torch.zeros(1, dtype=torch.int32, device="cuda:1")
-    serve = partial(_pingpong[(1,)], mine, theirs, ROUNDS, serve=True, num_warps=1)
-    trips = []
-    for _ in range(REPS + 1):  # the first compiles both kernels
-        mine.zero_()
-        theirs.zero_()
-        torch.cuda.synchronize(0)
-        torch.cuda.synchronize(1)
-        with torch.cuda.device(1):
-            _pingpong[(1,)](theirs, mine, ROUNDS, serve=False, num_warps=1)
-        trips += _timed(torch, serve, reps=1)
-        torch.cuda.synchronize(1)
-    return {
-        "gemm": gemm,
-        "aiter": aiter,
-        **streams,
-        "floor": floor,
-        "link": link,
-        "one_hop": [t / ROUNDS / 2 for t in trips[1:]],
-    }
-
-
-def rates(record: dict) -> dict:
-    """Each bandwidth kind's median rate per size, bytes moved a second."""
-    med = statistics.median
-    return {k: {int(n): int(n) / med(t) for n, t in record[k].items()} for k in KINDS}
-
-
-def readings(record: dict) -> dict:
-    """The attainable values a record's samples give: each format's best
-    median rate over shapes and libraries, the running maximum over sizes of
-    the fastest kind's median rate, the link's median rate, and each banded
-    field's median, p10 and p90."""
-    med = statistics.median
-
-    def band(samples):
-        cut = statistics.quantiles(samples, n=10, method="inclusive")
-        return [med(samples), cut[0], cut[8]]
-
-    libraries = (record["gemm"], record.get("aiter", {}))
-    found = {
-        f: max(
-            2 * math.prod(map(int, s.split("x"))) / med(t)
-            for gemm in libraries
-            for s, t in gemm.get(f, {}).items()
-        )
-        for f in record["gemm"]
-    }
-    kinds = rates(record)
-    sizes = sorted(kinds["copy"])
-    best = itertools.accumulate((max(r[n] for r in kinds.values()) for n in sizes), max)
-    found["bandwidth_curve"] = [[n, r] for n, r in zip(sizes, best)]
-    found["link"] = med(record["link"])
-    return found | {path: band(record[key]) for path, key in BANDED.items()}
+from atom.compass.drive import device_probe
+from atom.compass.drive.device_probe import (
+    BANDED,
+    FORMATS,
+    cards,
+    probe,
+    readings,
+    refuse_unfit,
+)
+from atom.compass.drive.gpu import kfd_pid
+from atom.compass.spec import Fragment, MachineSpec
 
 
 def fragment(
     name: str, found: dict, peaks: dict, author: str, date: str, subject: dict
 ) -> dict:
     """The fragment `readings` make on machine `name`, whose spec-peak numbers
-    `peaks` holds by path, every field probed on `subject`."""
+    `peaks` holds by path, every field probed on `subject`; a banded field
+    the readings lack, as a record taken before its probe does, is left out."""
     curve = found["bandwidth_curve"]
+    banded = [path for path in BANDED if path in found]
     values = {
         **{
             f"device.compute.derate.{f}": found[f] / peaks[f"device.compute.{peak}"]
@@ -305,10 +53,10 @@ def fragment(
         / peaks["device.memory.bandwidth_bytes_per_s"],
         "interconnect.intra_node.derate": found["link"]
         / peaks["interconnect.intra_node.link_bandwidth_bytes_per_s"],
-        **{path: found[path][0] for path in BANDED},
+        **{path: found[path][0] for path in banded},
     }
     origins = {path: {"origin": "probed", **subject} for path in values}
-    for path in BANDED:
+    for path in banded:
         origins[path] |= {"p10": found[path][1], "p90": found[path][2]}
     document = {
         "schema_version": 1,
@@ -337,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
     from atom.compass.drive.identity import _stack
 
     spec_path, out = (Path(a) for a in (argv or sys.argv[1:]))
+    kfd_pid()  # this process's KFD entry, taken before torch opens a card
     spec = MachineSpec.from_mapping(json.loads(spec_path.read_text()))
     ptl = spec.values.get("device.ptl", NO_PTL)
     props = [torch.cuda.get_device_properties(i) for i in (0, 1)]
@@ -350,7 +99,11 @@ def main(argv: list[str] | None = None) -> int:
         f for f, peak in FORMATS.items() if f"device.compute.{peak}" in spec.values
     ]
     record |= probe(torch, stated)
-    record["source"] = Path(__file__).read_text()
+    for name, error in record.get("failed", {}).items():
+        print(f"{name} failed: {error}", file=sys.stderr)
+    record["source"] = "".join(
+        Path(f).read_text() for f in (__file__, device_probe.__file__)
+    )
     out.write_text(json.dumps(record) + "\n")
     root = git_tree_root("atom", str(ROOT))
     subject = {"source_root": f"{root.revision_kind}:{root.revision}"}

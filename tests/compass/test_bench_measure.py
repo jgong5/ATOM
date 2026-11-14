@@ -3,7 +3,8 @@
 
 Inputs are `test_fit_samples.py`'s record, whose step record ATOM's
 `Scheduler` drove through `test_parity_record.py`'s runner and which served
-two client runs, and that record's lines published as a `shape_population`.
+the client runs of `RUNS`, and that record's lines published as a
+`shape_population`.
 The bench is a fake in `Bench`'s place, on the record's engine, whose result
 is the batch's token count in microseconds; run.json's identity is the
 record's, so a measurement states the record's configuration; the GPU checks
@@ -186,7 +187,7 @@ def test_measuring_one_record_twice_publishes_each_view_once_and_then_nothing(ru
         assert member["seconds"] == 1e-6 * sum(q for q, *_ in member["rows"])
         assert member["repeats"] and member["statistic"] == "median"
         assert member["protocol"] == window.PROTOCOL
-        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 1}
+        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 3}
         assert member["origin"] == "replay"
         assert member["sources"] == [
             measure.file_digest(run.record / "steps/dp0.jsonl")
@@ -210,26 +211,44 @@ def test_measuring_one_record_twice_publishes_each_view_once_and_then_nothing(ru
     assert Bench.started == [] and by_view(store).keys() == held.keys()
 
 
-def test_a_held_entry_taken_under_other_readings_refuses_naming_it(run):
+@pytest.mark.parametrize(
+    "moved",
+    [
+        lambda identity: identity["stack"].update(aiter="v9.9.9"),
+        lambda identity: identity.update(ptl="enabled"),
+    ],
+    ids=["aiter", "ptl"],
+)
+def test_a_run_on_another_platform_measures_its_batches_again_at_its_own_keys(
+    run, moved
+):
     rec = str(run.record)
     store = run(rec, "--sample", "all", *run.named(rec))
-    run.identity["stack"]["aiter"] = "v9.9.9"
+    held = len(entries(store))
+    moved(run.identity)
+    Bench.started.clear()
+    run(rec, "--sample", "all", *run.named(rec))
+    assert Bench.started and len(entries(store)) == 2 * held
+
+
+def test_a_held_entry_recording_other_readings_refuses_naming_it_and_a_fresh_store(
+    run,
+):
+    rec = str(run.record)
+    store = run(rec, "--sample", "all", *run.named(rec))
+    for place in (store.root / "step_measurement").iterdir():
+        path = place / "entry.json"
+        document = json.loads(path.read_text())
+        cells = document["fingerprints"]["step_measurement"]["cells"]
+        cells["software_stack"]["value"] = "v9.9.9"
+        path.chmod(0o644)
+        path.write_text(json.dumps(document))
     Bench.started.clear()
     tokens = "|".join(key.token() for key, _ in entries(store))
-    with pytest.raises(
-        SystemExit, match=rf"other readings than this run's:\n({tokens}): .*v9\.9\.9"
-    ):
-        run(rec, "--sample", "all", *run.named(rec))
-    assert Bench.started == []
-
-
-def test_a_held_entry_measured_on_cards_of_another_ptl_state_refuses(run):
-    rec = str(run.record)
-    run.identity["ptl"] = "enabled"
-    run(rec, "--sample", "all", *run.named(rec))
-    run.identity["ptl"] = "disabled"
-    Bench.started.clear()
-    with pytest.raises(SystemExit, match=r"other readings than this run's:\n.*enabled"):
+    told = (
+        rf"other readings than this run's:\n({tokens}): .*v9\.9\.9(.|\n)*fresh --store"
+    )
+    with pytest.raises(SystemExit, match=told):
         run(rec, "--sample", "all", *run.named(rec))
     assert Bench.started == []
 
@@ -347,7 +366,7 @@ def test_grid_points_are_measured_with_origin_plan_and_new_shapes_add_only_their
     lines = read(run.record / "steps")[0]
     engine = {"r": json.loads((run.record / "steps/dp0.engine.json").read_text())}
 
-    def prefill(d, steps, e):
+    def prefill(d, steps, e, views=()):
         """The plan of the prefill steps alone."""
         return plan(d, [(n, s) for n, s in steps if not s["rows"][0][2]], e)
 
@@ -571,11 +590,14 @@ def test_a_trace_two_exports_give_two_sessions_refuses_in_either_order(run, give
         run(str(run.record), "--sample", "all", "--sessions", "0:4", *named)
 
 
-def test_a_deployment_above_tensor_parallel_1_refuses_naming_the_skew_issue(run):
+def test_a_deployment_above_tensor_parallel_1_measures_a_record_that_states_it(run):
+    engine = run.record / "steps/dp0.engine.json"
+    stated = json.loads(engine.read_text()) | {"tensor_parallel_size": 2}
+    engine.write_text(json.dumps(stated))
     run.config.tensor_parallel_size = 2
-    with pytest.raises(SystemExit, match=r"tensor parallel size 2: .*\(#1188\)"):
-        run(str(run.record), "--sample", "all", *run.named(run.record))
-    assert Bench.started == []
+    store = run(str(run.record), "--sample", "all", *run.named(run.record))
+    assert Bench.started[0].tensor_parallel_size == 2
+    assert set(by_view(store)) == views(read(run.record / "steps")[0])
 
 
 @pytest.mark.parametrize(
@@ -683,6 +705,61 @@ def test_ragged_measures_the_views_composed_from_each_drawn_decode_view(run):
             measure.file_digest(run.record / "steps/dp0.jsonl")
         ]
         assert member["traces"] == sorted({t for s in split for t in s["traces"]})
+
+
+def test_ragged_composes_across_the_rungs_of_the_ladder_the_record_states(
+    run, monkeypatch
+):
+    rec = str(run.record)
+    ladder = json.loads((run.record / "steps/dp0.engine.json").read_text())["ladder"]
+    given, compose = [], measure.ragged.compose
+    monkeypatch.setattr(
+        measure.ragged, "compose", lambda *a: given.append(a[-1]) or compose(*a)
+    )
+
+    run(rec, "--sample", "2", "--seed", "3", "--ragged", *run.named(rec))
+
+    assert given and all(g == ladder for g in given)
+
+
+def test_ragged_under_grid_also_plans_the_cells_of_the_views_it_composes(
+    run, monkeypatch, capsys
+):
+    """Each composed view, here a drawn seed with its first row on 999 cached,
+    past every row the record ran, has its cells planned on the record's
+    nodes, its longest row's among them, and measured; the views' tokens are
+    the lines printed `measured ragged`."""
+    monkeypatch.setattr(
+        measure.ragged,
+        "compose",
+        lambda seed, *_: [{**seed, "rows": [[1, 1000, True], *seed["rows"][1:]]}],
+    )
+    rec = str(run.record)
+    definition = run.tmp / "definition.json"
+    definition.write_text(json.dumps(DEFINITION))
+    grid = ["--grid", rec, "--grid-definition", str(definition)]
+    store = run(rec, "--sample", "2", "--seed", "3", "--ragged", *grid, *run.named(rec))
+
+    held = entries(store)
+    composed = [
+        (key.values["view"], {k: m[k] for k in measure.VIEW})
+        for key, m in held
+        if m["origin"] == "ragged"
+    ]
+    named = [(str(s["step"]), s) for s in read(run.record / "steps")[0]]
+    engine = {"r": json.loads((run.record / "steps/dp0.engine.json").read_text())}
+    planned = json.loads((run.tmp / "out/plan.json").read_text())["lines"]
+    assert planned == plan(DEFINITION, named, engine, composed)["lines"]
+    assert len(planned) > len(plan(DEFINITION, named, engine)["lines"])
+    digests = {measure._digest(measure.view_of(x)) for x in planned}
+    assert set(by_view(store)) == digests | {v for v, _ in composed}
+    printed = [
+        x.split()[5].rstrip(":")
+        for x in capsys.readouterr().out.splitlines()
+        if x.startswith("measured ragged ")
+    ]
+    tokens = [key.token() for key, m in held if m["origin"] == "ragged"]
+    assert sorted(printed) == sorted(tokens) != []
 
 
 def test_ragged_without_a_replayed_input_refuses(run):
@@ -860,4 +937,58 @@ def test_run_and_measure_steps_lay_out_dp_attention_alike(
         pc = config.parallel_config
         assert (config.tensor_parallel_size, pc.data_parallel_size) == (1, 2)
     with pytest.raises(SystemExit):
-        measure.atom_config([*atom_args, "--timeout-keep-alive", "5"])
+        measure.atom_config([*atom_args, "--compass-run", "run.json"])
+
+
+#: The API server's flags `compass record` passes it, as MiniMax-M3's
+#: submission serves with them.
+SERVED = [
+    "--default-chat-template-kwargs",
+    '{"thinking_mode":"enabled"}',
+    "--tool-call-parser",
+    "minimax_m3",
+    "--timeout-keep-alive",
+    "600",
+    "--disable-uvicorn-access-log",
+    "--chat-template",
+    "template.jinja",
+    "--request-log",
+    "requests.jsonl",
+]
+
+
+@pytest.fixture
+def config_of(monkeypatch, model_dir):  # noqa: F811
+    """`measure.atom_config` of `-tp 4` on `model_dir` and the arguments given."""
+
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+
+    def config_of(*argv):
+        return measure.atom_config(["--model", str(model_dir), "-tp", "4", *argv])
+
+    return config_of
+
+
+def test_measure_steps_takes_the_server_flags_record_passes_and_resolves_without_them(
+    config_of,
+):
+    assert vars(config_of(*SERVED)) == vars(config_of())
+
+
+@pytest.mark.parametrize(
+    "argv, error",
+    [
+        (["--max-num-sqes", "8"], "unrecognized arguments: --max-num-sqes 8"),
+        (["--timeout-keep-alive", "soon"], "invalid int value: 'soon'"),
+    ],
+)
+def test_measure_steps_refuses_a_misspelled_engine_flag_and_a_value_the_server_refuses(
+    config_of, argv, error, capsys
+):
+    with pytest.raises(SystemExit):
+        config_of(*SERVED[:2], *argv)
+    assert error in capsys.readouterr().err

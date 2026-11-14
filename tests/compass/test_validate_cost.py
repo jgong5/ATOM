@@ -8,13 +8,16 @@ is read by `parity.read` and priced by `StepLinearBackend.price`.
 
 import json
 import re
+from types import SimpleNamespace
 
 import pytest
+from test_backend_step_linear_fit import traced
 from test_op_graph import g
 from test_work import SPEC
 
 from atom.compass.backends import (
     CostTerm,
+    Granularity,
     Method,
     Provenance,
     StepGrid,
@@ -23,8 +26,9 @@ from atom.compass.backends import (
 from atom.compass.backends.op_graph import LISTED, OpGraphBackend
 from atom.compass.backends.resolver import CostSource
 from atom.compass.backends.step_grid_residual import Residual
+from atom.compass.backends.step_roofline import StepFallbackBackend
 from atom.compass.drive.aiter_jit import BUILDS
-from atom.compass.validate.cost import cost_accuracy, main
+from atom.compass.validate.cost import _text, cost_accuracy, declined_text, main
 
 # Prefill hull: tokens 100-1000, Sum N_Q^2 1e4-1e6, Sum N_Q (N_KV - N_Q) 0-1e7.
 BOX = [[-1, 0, 0, 100], [1, 0, 0, -1000], [0, -1, 0, 1e4], [0, 1, 0, -1e6]]
@@ -103,7 +107,7 @@ def _record(directory, steps, stretch=None, idle_after=(), rank=0, group=None):
         )
         t += busy
     (directory / f"dp{rank}.jsonl").write_text(
-        "".join(json.dumps(x) + "\n" for x in lines)
+        "".join(json.dumps(traced(x)) + "\n" for x in lines)
     )
     return directory
 
@@ -113,7 +117,13 @@ def test_the_step_that_moves_the_total_is_held_out_and_the_spread_reported(tmp_p
     record = _record(tmp_path / "steps", _steps(), stretch={4: 0.2})
     report = cost_accuracy(record, LAW)
 
-    assert report["cut"] == {"exposed": 0, "mixed": 0, "unsplit": 0, "paced": 0}
+    assert report["cut"] == {
+        "exposed": 0,
+        "mixed": 0,
+        "unsplit": 0,
+        "untraced": 0,
+        "traced": 0,
+    }
     assert report["unvalidated"] == {} and report["refused"] == {}
     prefill = report["validated"]["prefill"]
     assert prefill["steps"] == 10
@@ -144,7 +154,13 @@ def test_unvalidated_and_refused_steps_are_reported_apart(tmp_path):
     record = _record(tmp_path / "steps", steps, stretch={3: 2.0})
     report = cost_accuracy(record, LAW)
 
-    assert report["cut"] == {"exposed": 0, "mixed": 0, "unsplit": 0, "paced": 0}
+    assert report["cut"] == {
+        "exposed": 0,
+        "mixed": 0,
+        "unsplit": 0,
+        "untraced": 0,
+        "traced": 0,
+    }
     (unvalidated,) = report["unvalidated"].values()
     assert unvalidated["steps"] == 1
     assert unvalidated["real_s"] == pytest.approx(2 * _price(wide[0]), rel=1e-9)
@@ -170,6 +186,18 @@ def test_the_command_prints_the_report(tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert "holding out step 4 " in out and "law planted" in out
+
+
+def test_the_command_prints_a_refused_row_s_reasons(tmp_path, capsys):
+    # A law with no decode vector refuses the record's ten decode steps.
+    record = _record(tmp_path / "steps", _steps())
+    law = tmp_path / "law.json"
+    law.write_text(json.dumps({**LAW, "decode": {}}))
+    main([str(record), str(law)])
+
+    (line,) = [x for x in capsys.readouterr().out.splitlines() if "refused" in x]
+    assert line.startswith("refused decode rung 1: 10 steps, real ")
+    assert line.endswith('; reasons {"step-linear: no decode vector for rung 1": 10}')
 
 
 def test_a_one_off_slow_step_is_named_warm_mid_record_and_enters_no_total(
@@ -237,6 +265,54 @@ def test_a_leading_slow_step_is_judged_by_the_law_s_scatter_not_the_record_s(
     assert [w["step"] for w in cost_accuracy(record, law)["warm"]] == [0]
 
 
+def _grid(wrapped):
+    """`_steps()`'s step grid, bare or the first backend of a fallback."""
+    from test_validate_step_grid import _bundle  # it imports this module
+
+    member = _bundle(_steps())
+    grid = StepGridBackend(StepGrid(member["grid"]), Residual(member["residual"]), "b")
+    if not wrapped:
+        return grid
+    roofline = SimpleNamespace(granularity=Granularity.STEP, describe=lambda: "stub")
+    return StepFallbackBackend(grid, roofline)
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "under a fallback"])
+def test_a_step_grid_grades_a_slow_leading_stretch_its_own_scatter_would_drop(
+    tmp_path, wrapped
+):
+    # Decode steps 10 to 13 ran 3% slow, the next six at their price: the stretch
+    # leads slow by the record's own exact scatter, which no grid fit names warm.
+    steps = _steps()
+    record = _record(tmp_path / "steps", steps, {i: 1.03 for i in range(10, 14)})
+    report = cost_accuracy(record, _grid(wrapped))
+
+    assert report["warm"] == []
+    priced = sum(_price(rows) for rows, _ in steps[10:])
+    real = priced + 0.03 * sum(_price(rows) for rows, _ in steps[10:14])
+    graded = report["graded"]["decode"]
+    assert graded["steps"] == 10
+    assert graded["on_totals"] == pytest.approx(priced / real - 1, rel=1e-6)
+
+    # A step-linear law recording no `fit.mad` drops the same stretch.
+    law = cost_accuracy(record, LAW)
+    assert [w["step"] for w in law["warm"]] == [10, 11, 12, 13]
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "under a fallback"])
+def test_a_step_grid_step_above_the_warm_factor_is_named_warm_leading_or_not(
+    tmp_path, wrapped
+):
+    steps = _steps()
+    record = _record(tmp_path / "steps", steps, {10: 6.0, 15: 6.0})
+    report = cost_accuracy(record, _grid(wrapped))
+
+    assert [w["step"] for w in report["warm"]] == [10, 15]
+    assert report["warm"][0]["real_s"] == pytest.approx(6 * _price(steps[10][0]))
+    assert report["graded"]["decode"]["steps"] == 8
+    assert report["graded"]["decode"]["on_totals"] == pytest.approx(0.0, abs=1e-9)
+
+
 def test_a_law_without_held_out_errors_reports_every_priced_step_unvalidated(tmp_path):
     record = _record(tmp_path / "steps", _steps())
     bare = json.loads(json.dumps(LAW))
@@ -284,7 +360,8 @@ def test_a_group_step_prices_as_its_slowest_rank_against_the_group_s_time(tmp_pa
         "exposed": 0,
         "mixed": 0,
         "unsplit": 0,
-        "paced": 0,
+        "untraced": 0,
+        "traced": 0,
         "ranks": 0,
     }
     assert report["warm"] == [] and report["refused"] == {}
@@ -298,6 +375,46 @@ def test_a_group_step_prices_as_its_slowest_rank_against_the_group_s_time(tmp_pa
     total = sum(report["validated"][k]["real_s"] for k in ("prefill", "decode"))
     assert total == pytest.approx(slowest, rel=1e-9)
     assert all(total > sum(_price(rows) for rows, _ in s) for s in ranks)
+
+
+def test_each_rank_s_error_is_split_out_naming_its_card(tmp_path):
+    # Rank 1's card runs 2% over the law: every step it is the slowest rank
+    # of, the even ones, both ranks wait the longer time.
+    ranks = _two_ranks()
+    slow = {i: 1.02 for i in range(0, 20, 2)}
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "steps", steps, stretch=slow, rank=r, group=ranks)
+    # Two GPUs a rank, as a DP record at TP 2 runs.
+    gpus = [{"index": i, "bus": f"0000:{i:02x}:00.0"} for i in (3, 4, 11, 12)]
+    (tmp_path / "run.json").write_text(json.dumps({"device": gpus}))
+    report = cost_accuracy(tmp_path / "steps", LAW)
+
+    for kind in ("prefill", "decode"):
+        rank0, rank1 = report["ranks"][kind].values()
+        assert rank0 == {
+            "buses": ["0000:03:00.0", "0000:04:00.0"],
+            "steps": 5,
+            "on_totals": pytest.approx(0.0, abs=1e-9),
+            "median": pytest.approx(0.0, abs=1e-9),
+        }
+        assert rank1 == {
+            "buses": ["0000:0b:00.0", "0000:0c:00.0"],
+            "steps": 5,
+            "on_totals": pytest.approx(1 / 1.02 - 1, abs=1e-6),
+            "median": pytest.approx(1 / 1.02 - 1, abs=1e-6),
+        }
+        assert list(report["ranks"][kind]) == [0, 1]
+    assert "  dp1 | 0000:0b:00.0, 0000:0c:00.0 | 5 | -1.96% | -1.96%" in _text(report)
+
+    # A run.json that names no bus, as one written before it named any.
+    (tmp_path / "run.json").write_text(json.dumps({"device": [{"index": 3}] * 2}))
+    report = cost_accuracy(tmp_path / "steps", LAW)
+    assert report["ranks"]["decode"][1]["buses"] is None
+    assert "  dp1 | unrecorded | 5 |" in _text(report)
+
+    # One rank: no split.
+    _record(tmp_path / "alone", _steps(), stretch=slow)
+    assert cost_accuracy(tmp_path / "alone", LAW)["ranks"] == {}
 
 
 def test_a_group_step_is_validated_by_the_rank_it_is_priced_as(tmp_path):
@@ -327,6 +444,21 @@ def test_a_group_step_is_validated_by_the_rank_it_is_priced_as(tmp_path):
         _record(tmp_path / "tie", steps, rank=r, group=ranks)
     report = cost_accuracy(tmp_path / "tie", law)
     assert report["unvalidated"]["decode"]["steps"] == 1
+
+
+def test_a_group_step_is_counted_extrapolated_by_the_rank_it_is_priced_as(tmp_path):
+    # Step 10's cheaper rank 1 lies below the fitted hull; rank 0 prices it.
+    ranks = _two_ranks()
+    ranks[1][10] = ([(1, 50, True)], 1)
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "cheaper", steps, rank=r, group=ranks)
+    assert cost_accuracy(tmp_path / "cheaper", LAW)["extrapolated"] == 0
+
+    # Now rank 1 prices step 10, above the hull.
+    ranks[1][10] = ([(1, 200_000, True)], 1)
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "costlier", steps, rank=r, group=ranks)
+    assert cost_accuracy(tmp_path / "costlier", LAW)["extrapolated"] == 1
 
 
 def test_ranks_differing_by_more_than_a_trailing_step_refuse_naming_their_lengths(
@@ -360,7 +492,8 @@ def test_a_peer_s_dummy_forward_is_priced_0_s_and_its_step_graded(tmp_path):
         "exposed": 0,
         "mixed": 0,
         "unsplit": 0,
-        "paced": 0,
+        "untraced": 0,
+        "traced": 0,
         "ranks": 0,
     }
     assert report["unvalidated"] == {} and report["refused"] == {}
@@ -376,6 +509,39 @@ def test_a_peer_s_dummy_forward_is_priced_0_s_and_its_step_graded(tmp_path):
     for r, s in enumerate(stopped):
         _record(tmp_path / "stopped", s, rank=r, group=stopped)
     assert cost_accuracy(tmp_path / "stopped", LAW)["cut"]["ranks"] == 1
+
+
+def test_a_rank_that_ran_only_dummy_forwards_adds_no_step(tmp_path):
+    # Rank 2, which no request reached, runs a dummy beside each of the other
+    # ranks' steps: the record grades as theirs alone does.
+    served, idle = _two_ranks(), [(None, None)] * 10 + [(None, 1)] * 10
+    for r, steps in enumerate(served):
+        _record(tmp_path / "alone", steps, rank=r, group=served)
+    ranks = [*served, idle]
+    for r, steps in enumerate(ranks):
+        _record(tmp_path / "steps", steps, rank=r, group=ranks)
+    report = cost_accuracy(tmp_path / "steps", LAW)
+
+    alone = cost_accuracy(tmp_path / "alone", LAW)
+    assert report == {**alone, "record": str(tmp_path / "steps")}
+    assert report["cut"]["ranks"] == 0
+    assert report["validated"]["decode"]["steps"] == 10
+
+    # Its last step was in flight: that step is cut, as beside a rank that served.
+    stopped = [*served, idle[:-1]]
+    for r, steps in enumerate(stopped):
+        _record(tmp_path / "stopped", steps, rank=r, group=stopped)
+    report = cost_accuracy(tmp_path / "stopped", LAW)
+    assert report["cut"]["ranks"] == 1
+    assert report["validated"]["decode"]["steps"] == 9
+
+    # No rank ran a forward: the record refuses.
+    (tmp_path / "idle").mkdir()
+    for r in range(2):
+        dummies = (tmp_path / "steps/dp2.jsonl").read_text()
+        (tmp_path / f"idle/dp{r}.jsonl").write_text(dummies)
+    with pytest.raises(ValueError, match="ranks ran only DP's dummy forwards"):
+        cost_accuracy(tmp_path / "idle", LAW)
 
 
 def test_a_group_step_is_banded_by_its_costliest_rank_not_rank_0(tmp_path):
@@ -419,7 +585,7 @@ def test_the_command_refuses_a_record_whose_server_built_an_aiter_module(
     assert "holding out step 4 " in capsys.readouterr().out
 
     (tmp_path / "run.json").write_text(json.dumps({BUILDS: ["mha_varlen_fwd"]}))
-    named = f"{record} is not costed: aiter ran a JIT build of ['mha_varlen_fwd'] while"
+    named = f"{record} is not costed: its server ran a JIT compile of ['mha_varlen_fwd'] while"
     with pytest.raises(ValueError, match=re.escape(named)):
         main([str(record), str(law)])
 
@@ -438,7 +604,9 @@ def test_the_command_refuses_the_record_named_from_inside_it_or_by_a_link(
     law.write_text(json.dumps(LAW))
     monkeypatch.chdir(record)
 
-    named = f"{spelling} is not costed: aiter ran a JIT build of ['mha_varlen_fwd']"
+    named = (
+        f"{spelling} is not costed: its server ran a JIT compile of ['mha_varlen_fwd']"
+    )
     with pytest.raises(ValueError, match=re.escape(named)):
         main([spelling, str(law)])
 
@@ -529,3 +697,24 @@ def test_one_validated_and_one_out_of_hull_step_grade_together(tmp_path):
     graded = report["graded"]["prefill"]
     assert graded["steps"] == 2
     assert graded["on_totals"] == pytest.approx((a + b) / (a + 2 * b) - 1, rel=1e-6)
+
+
+def test_the_command_prints_the_steps_its_law_extrapolated(tmp_path, capsys):
+    # Decode steps 2 to 9 lie past the hull's context of `PAST`.
+    law = tmp_path / "law.json"
+    law.write_text(json.dumps(_past_hull("step-linear")))
+    main([str(_record(tmp_path / "steps", _steps())), str(law)])
+    assert "extrapolated: 8 steps" in capsys.readouterr().out.splitlines()
+
+
+def test_the_command_s_text_names_each_fallback_row(tmp_path):
+    """A law prices every step itself; a step grid falls to the step roofline
+    below it for the one decode step it holds no measurement of."""
+    from test_validate_step_grid import _below, _bundle  # it imports this module
+
+    report = cost_accuracy(
+        _record(tmp_path / "steps", _steps()), _below(_bundle(_steps(), missing={15}))
+    )
+    (row,) = report["fallback"].values()
+    line = f"fallback decode rung 1: {declined_text(row)}"
+    assert line in _text(report).splitlines()

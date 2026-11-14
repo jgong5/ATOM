@@ -3,8 +3,9 @@
 #
 # QUICKSTART.md's path end to end at concurrency 1 on one GPU, in about an hour:
 # `compass measure memory`; a calibration `compass record` serving cc-traces 353
-# on; `compass fit steps` (step linear, history form) and `compass fit host` on
-# it; two real `compass record` runs and one `compass run`, serving traces 0 on;
+# on; `compass fit steps` (step linear, history form, MODEL's MoE routing) and
+# `compass fit host` on it; two real `compass record` runs and one `compass
+# run`, serving traces 0 on;
 # then the cell graded by `python -m atom.compass.validate`. Each server serves
 # one `client.sh` run, with its warmup, which stops it. The fits run before the
 # real runs, so a failed fit costs no more GPU time.
@@ -18,10 +19,9 @@
 #
 # Usage: smoke_cell.sh MODEL OUT
 #   MODEL           the model directory: config.json, tokenizer and weights
-#   OUT             an absent or empty directory, on a disk with room: the raw
-#                   exports keep every prompt
+#   OUT             an absent or empty directory, on a disk with room
 #   GPU             the one GPU, as rocm-smi and `--gpu` number it (required);
-#                   it must read 0% use and 0% VRAM
+#                   each compass command refuses it while a process is on it
 #   MACHINE         the machine spec of this node's GPUs (required)
 #   TRACES          a cc-traces traces.jsonl (required, as client.sh takes it)
 #   HARNESS_PYTHON  the Python with agentx-harness and compass-harness, for the
@@ -63,16 +63,13 @@ mkdir -p "$OUT" && OUT=$(realpath "$OUT")
 # Every path is absolute from here, and nothing resolves `atom` from $PWD.
 cd / || exit 1
 start=$SECONDS
-# A failed step stops whatever server is still up before the script exits.
+# Any exit, a failed step's or a SIGTERM's, stops what is still running: each
+# step and client run runs in the background, as a job this trap reaches.
 trap 'kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
 fail() { echo "smoke_cell: step $1 failed: $2" >&2; exit 1; }
 say() { echo "smoke_cell: $1 $(date -u +%FT%TZ)"; }
 
-# The compass commands check each start for processes on the GPU; this checks
-# its use and VRAM too, once, before the first.
 [[ ${GPU-} =~ ^[0-9]+$ ]] || fail gpu "GPU names one GPU as rocm-smi numbers it, not '${GPU-}'"
-busy=$(rocm-smi --showuse --showmemuse | awk -v g="GPU[$GPU]" 'index($0, g) == 1 && /use \(%\)|VRAM%/ && $NF != "0"')
-[[ -z $busy ]] || fail gpu "rocm-smi GPU $GPU is not idle: $busy"
 compass_head_sha "$ROOT" >/dev/null ||
     fail tree "$ROOT is neither a git checkout nor a snapshot.sh tree, and a fit refuses it"
 
@@ -81,7 +78,8 @@ step() {
     local name=$1
     shift
     say "$name"
-    "$@" >"$OUT/$name.log" 2>&1 || fail "$name" "exit $?; see $OUT/$name.log"
+    "$@" >"$OUT/$name.log" 2>&1 &
+    wait $! || fail "$name" "exit $?; see $OUT/$name.log"
 }
 
 # serve NAME DIR A-B PYTHON COMMAND...: one compass server writing to DIR, one
@@ -99,8 +97,8 @@ serve() {
         sleep 1
     done
     HARNESS_PYTHON=$python "$ROOT/scripts/compass/client.sh" "$dir" --traces "$traces" \
-        --concurrency 1 --duration "$DURATION_S" --stop >"$OUT/$name.client.log" 2>&1 ||
-        fail "$name" "client.sh exit $?; see $OUT/$name.client.log"
+        --concurrency 1 --duration "$DURATION_S" --stop >"$OUT/$name.client.log" 2>&1 &
+    wait $! || fail "$name" "client.sh exit $?; see $OUT/$name.client.log"
     wait $pid || fail "$name" "its server exit $?; see $OUT/$name.log"
 }
 
@@ -114,7 +112,7 @@ serve warm "$OUT/warm" "$CELL" "$AIPERF_PYTHON" record --gpu "$GPU"
 serve calibration "$OUT/calibration" "$CAL" "$AIPERF_PYTHON" record --gpu "$GPU"
 RUNS=(--client-run "$OUT/calibration" "$OUT/calibration/artifacts/client_run.json")
 step fit_steps python3 -c "$CLI" fit steps --backend step-linear --form history \
-    "$OUT/calibration" "${RUNS[@]}" "${M[@]}" --out "$OUT/fit_steps"
+    --model "$MODEL" "$OUT/calibration" "${RUNS[@]}" "${M[@]}" --out "$OUT/fit_steps"
 step fit_host python3 -c "$CLI" fit host "$OUT/calibration" "${RUNS[@]}" "${M[@]}" --out "$OUT/fit_host"
 LAW=$(token "$OUT/fit_steps.log") HOST=$(token "$OUT/fit_host.log")
 for k in 1 2; do

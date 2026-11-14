@@ -41,7 +41,7 @@ with stubbed_aiter():
     from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
 INF = float("inf")
-TABLE = single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002)
+TABLE = single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002)
 STEP_S = 0.01
 STEPS = 3  # steps per request
 #: 64 requests, Poisson at 8 per second: the schedule the arrival barrier spun on.
@@ -101,6 +101,7 @@ class Scheduler:
     """Runs every waiting request in each step, `STEPS` steps per request."""
 
     prefill_delayer = None
+    dummy_prefill = False
     metrics = SimpleNamespace(record_forward=lambda batch, seqs: None)
 
     def __init__(self):
@@ -265,7 +266,7 @@ def test_a_real_recording_stamps_the_first_pull_and_put_after_each_reply(
     )
     with compass_run.engine(config):
         engine = Engine(SimpleNamespace())
-        engine.output_queue = clock.relay_queue(3)
+        engine.output_queue = clock.relay_queue(SimpleNamespace(data_parallel_rank=3))
     enqueue = engine.runner_mgr.enqueue
 
     def step(msg):  # the request's last step is followed by the shutdown
@@ -279,7 +280,8 @@ def test_a_real_recording_stamps_the_first_pull_and_put_after_each_reply(
     )
     engine.utility_handler.push_metrics = lambda: None
 
-    EngineCore.busy_loop(engine)
+    with compass_run.engine_loop(engine):  # whose end writes the stamps
+        EngineCore.busy_loop(engine)
 
     lines = (tmp_path / "dp3.pulls.jsonl").read_text().splitlines()
     stamps = [next(iter(json.loads(line).items())) for line in lines]

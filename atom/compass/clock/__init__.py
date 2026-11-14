@@ -23,12 +23,14 @@ package, not inside it.
 from .authority import (
     NER,
     PARK,
+    REPORT,
     TAR,
     BackdatedEvent,
     ClientRun,
     ClockAbort,
     ClockAuthority,
     LpRow,
+    Released,
 )
 from .channels import (
     Channel,
@@ -51,6 +53,7 @@ from .registry import LpRegistry
 __all__ = [
     "NER",
     "PARK",
+    "REPORT",
     "SPEED_TARGET_RATIO",
     "TAR",
     "BackdatedEvent",
@@ -64,6 +67,7 @@ __all__ = [
     "LpRegistry",
     "LpRow",
     "RefusalTally",
+    "Released",
     "RunSummary",
     "TimelineLog",
     "TimelineRecord",

@@ -25,6 +25,17 @@ from atom.compass.capture import forward, population_shapes
 from atom.compass.capture.graph import Fork, Join, Traced, build
 
 TREE = pathlib.Path(__file__).resolve().parents[2]
+#: The console script's `main` in a fresh interpreter, publishing under this
+#: checkout's source roots counted clean, as the `clean_checkout` fixture in
+#: test_artifact_store.py does in-process, by wrapping the same two resolvers.
+MAIN = (
+    "import dataclasses, sys; from atom.compass.artifacts import provenance as p; "
+    "c = lambda f: lambda *a, **k: (lambda r: dataclasses.replace(r, dirty=0) "
+    "if r.dirty else r)(f(*a, **k)); "
+    "p.git_tree_root, p.git_described_root = "
+    "c(p.git_tree_root), c(p.git_described_root); "
+    "from atom.compass.cli import main; main(sys.argv[1:])"
+)
 CONFIG = pathlib.Path(__file__).with_name("qwen3_5_27b_config.json")
 LAYER_TYPES = json.loads(CONFIG.read_text())["text_config"]["layer_types"]
 ATTENTION = {
@@ -186,7 +197,7 @@ def capture(tp, shapes, tmp_path_factory):
         [
             sys.executable,
             "-c",
-            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            MAIN,
             *argv,
         ],
         capture_output=True,
@@ -470,3 +481,14 @@ def test_tp2_leaves_its_stand_ins_copies_out_and_says_so(tmp_path_factory):
         left_out[op["why"]].append(op["op"])
     assert set(left_out) == {"h2d", "host", "stand-in", "step-crossing"}
     assert left_out["stand-in"].count("aten.copy_.default") == 2
+
+
+def test_one_function_in_two_files_has_two_sites():
+    source = "import sys\n\ndef embed():\n    return sys._getframe()\n"
+    sites = []
+    for name in ("one.py", "two.py"):
+        scope = {}
+        exec(compile(source, name, "exec"), scope)  # noqa: S102
+        sites.append(forward._where(scope["embed"]()))
+
+    assert sites == ["one.py:4 in embed", "two.py:4 in embed"]

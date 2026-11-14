@@ -11,7 +11,7 @@ step with a law; `python -m atom.compass.validate` prices only those of the clie
 run it grades, its warmup left out, with the backend the simulated run priced with.
 
 Each step is labelled as the fit labels it, by its device time
-(`step_labels.label` under ATOM's split rule, `bound._split`, which also says
+(`step_labels.label_run` under ATOM's split rule, `bound._split`, which also says
 which steps carry no label and refuses a record without device windows), and priced by `StepLinearBackend`, `StepGridBackend` or `OpGraphBackend`. The
 error of a step is `priced / real - 1`, its target price over its target label on
 an MTP record. A step that also carries a draft label is graded again under kind
@@ -29,16 +29,20 @@ that records none; for the grid, outside its residual's held-out hull). A step
 with a declared term is reported apart, in no graded figure; a draft is
 grouped by its draft terms alike. A step that ran more
 than `step_linear_fit.WARM_FACTOR` times its price is warm, a one-off first touch the
-law does not model: it is named with its seconds and enters no figure. So are
-the steps that lead a vector's priced steps, each slower than its price by more
-than `step_linear_fit.MAD_K` scaled MADs of the errors the law's vector was fitted
-on, as the fit names them; of that vector's errors here if the law records no
-`fit.mad`, as the grid never does. A step the backend declines is counted with
-its real seconds and its reasons, the most frequent named: under `fallback` for
-the grid, since its run prices the step by the step roofline below it, and under
-`refused` for a law, since a run grading takes has nothing below the law, or
-under `fallback` when the run's file composes the step roofline below it. A step
-it extrapolated, past its support domain, is counted too. An answer of any
+law does not model: it is named with its seconds and enters no figure. So are,
+under a law or an op graph, the steps that lead a vector's priced steps, each
+slower than its price by more than `step_linear_fit.MAD_K` scaled MADs of the
+errors the law's vector was fitted on, as the fit names them; of that vector's
+errors here if the law records no `fit.mad` or the backend is an op graph. A step
+grid, bare or below a fallback, has no such rule: its bundle's points are measured
+after the bench warm-up and its fit names no warm step, so only a step above that
+factor is warm. A step the backend declines is counted
+under `refused` with its real seconds and its reasons, the most frequent named.
+A step whose priced rank a fallback answered after a source declined it
+(`StepCost.refusals`), as the step roofline below a step grid answers, is
+graded by its terms and also counted under `fallback`, with what declined it.
+A step whose priced rank the backend extrapolated, past its support domain, is
+counted under `extrapolated`. An answer of any
 method but an estimated one outside its hull is validated, as the run summary
 groups seconds: an op graph's analytical and measured leaves are, its
 interpolated ones only inside a held-out bracket on each line they interpolate
@@ -49,6 +53,14 @@ Per kind the report also gives the priced seconds of those steps by method
 ``op.<kind>`` and ``op.<kind>.price_list`` terms together, the term's seconds
 over the measured ones: on totals, and the p10, p50 and p90 per step. Summed
 over the terms, they are the composed step over the measured one.
+
+On a record of several DP ranks it gives, per kind and per rank, the graded
+steps that rank was priced as, their error on totals and the median per step,
+with the PCI buses of the rank's cards that the run.json beside the record
+names (`identity._device`): a law prices the card mix of its records, and this
+split states what a rank's card leaves. ATOM runs DP rank r on the r-th equal slice of the GPUs its server
+saw; a run.json that names no bus, as one written before it named any, leaves
+each rank's cards unnamed.
 """
 
 from __future__ import annotations
@@ -74,6 +86,7 @@ from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.cost import group as method_group
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band
+from atom.compass.backends.step_roofline import StepFallbackBackend
 from atom.compass.drive import aiter_jit
 from atom.compass.validate.bound import _split
 
@@ -87,10 +100,16 @@ GRADED = {
 }
 
 
+def _is_grid(backend) -> bool:
+    """Whether `backend` is a step grid, bare or the first one a fallback asks."""
+    first = backend.first if isinstance(backend, StepFallbackBackend) else backend
+    return isinstance(first, StepGridBackend)
+
+
 def _leading_slow(priced: list[tuple], law: dict | None) -> set[int]:
     """Steps leading their vector's (vector, band, step, seconds, price) rows, each
     slow by the scatter `law` fitted the vector on, or by the scatter here where
-    `law` records none or is None, as for a step grid."""
+    `law` records none or is None, as for an op graph."""
     out = set()
     for key in sorted({p[0] for p in priced}):
         mine = [p for p in priced if p[0] == key]
@@ -145,12 +164,35 @@ def _summary(steps: list[tuple]) -> dict:
     }
 
 
-def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
+def _cards(run: dict | None, ranks: list[int]) -> dict:
+    """The PCI buses of each DP rank's cards in `ranks`, rank r the r-th of
+    as many equal slices of the GPUs `run`, the record's run.json, names; None
+    for each when it names no bus or its GPUs do not split so."""
+    gpus = (run or {}).get("device", [])
+    span, rest = divmod(len(gpus), len(ranks))
+    if not span or rest or any("bus" not in g for g in gpus):
+        return dict.fromkeys(ranks)
+    return {
+        r: [g["bus"] for g in gpus[r * span : (r + 1) * span]] or None for r in ranks
+    }
+
+
+def _rank(rows: list[tuple], buses: list[str] | None) -> dict:
+    """The (real, priced) rows of the graded steps one rank was priced as."""
+    real, priced = np.array(rows).T
+    return {
+        "buses": buses,
+        "steps": len(rows),
+        "on_totals": float(priced.sum() / real.sum() - 1.0),
+        "median": float(np.median(priced / real - 1.0)),
+    }
+
+
+def cost_accuracy(record, backend, steps=None) -> dict:
     """The report for `backend`, a `CostBackend` or a law mapping
     `StepLinearLaw` reads, on the record directory `record`: on its steps whose
     numbers are in `steps`, every step when None. Its ``backend`` names the
-    law's provenance, or the backend's `describe()` line. With `fallback` a
-    step the backend declines is a fallback's, as a step grid's always is.
+    law's provenance, or the backend's `describe()` line.
 
     The ranks' records (`dp0.jsonl` up) are joined as `step_linear_fit` joins
     them: a step is its ranks' lines of one step index, measured as the
@@ -158,15 +200,20 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
     `step_linear_fit.priced_rank` picks; a step the law refuses is banded as
     its rank of most tokens. Its draft is measured and priced the same way. A
     rank that ran the step as a dummy forward is priced 0 s: the step is
-    measured, priced and banded by the ranks that ran a forward. A step some
+    measured, priced and banded by the ranks that ran a forward, and a rank
+    that ran only dummy forwards adds no step. A step some
     rank lacks otherwise or cut, or whose
     ranks fall to different vectors, is counted under `cut.ranks`. Ranks whose
     records differ in length by more than the one step a stopped run leaves on
-    some ranks only are refused.
+    some ranks only are refused, and so is a record whose every rank ran only
+    dummy forwards.
     So is a record whose run.json, beside `record`, names `aiter_jit_builds`.
+    On several ranks, the report's ``ranks`` holds per kind and rank number
+    the graded steps that rank was priced as (`_rank`), with its cards' buses.
     """
     run = Path(record).resolve().parent / "run.json"
-    if run.is_file() and (built := aiter_jit.refusal(read_json(run))):
+    identity = read_json(run) if run.is_file() else None
+    if identity is not None and (built := aiter_jit.refusal(identity)):
         raise ValueError(f"{record} is not costed: {built}")
     ranks = sorted(Path(record).glob("dp*[0-9].jsonl"))
     records = [read_jsonl(r) for r in ranks]
@@ -176,46 +223,50 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
             f"{record} holds rank records of {lines} lines; one run's ranks "
             "differ by at most the step a stopped run leaves on some"
         )
-    run = [step_labels.label(r, split_rule=_split)[0] for r in ranks]
-    joined, cut, _ = step_linear_fit._groups(run, "base", steps=steps)
+    run = [got for got, _ in step_labels.label_run(ranks, split_rule=_split)]
+    if not any(run):
+        raise ValueError(
+            f"{record}'s ranks ran only DP's dummy forwards: no step to price"
+        )
+    dummies = [frozenset(s["step"] for s in x if s["is_dummy_run"]) for x in records]
+    joined, cut, _ = step_linear_fit._groups(run, "base", steps=steps, dummies=dummies)
     views = [{s.step: s.view for s in rank} for rank in run]
     drafts = [{s.step: s.draft_s for s in rank} for rank in run]
     law = backend if isinstance(backend, Mapping) else None
     if law is not None:
         backend = StepLinearBackend(StepLinearLaw(law))
+    grid = _is_grid(backend)
     groups = {g: {} for g in ("graded", "validated", "unvalidated", "declared")}
     declined: dict[str, dict] = {}
+    fell: dict[str, dict] = {}
     warm, priced, extrapolated = [], [], 0
     for group in joined:
-        key, _, seconds, step, _ = next(iter(group.values()))
+        key, _, seconds, step, *_ = next(iter(group.values()))
         try:
             costs = {i: backend.price(views[i][step]) for i in group}
         except CostRefused as refused:
             band = _band(key, max((r[1] for r in group.values()), key=lambda c: c[1]))
-            r = declined.setdefault(
-                band, {"steps": 0, "real_s": 0.0, "reasons": Counter()}
-            )
-            r["steps"] += 1
-            r["real_s"] += seconds
-            why = "; ".join(f"{d.source}: {d.reason}" for d in refused.declined)
-            r["reasons"][why] += 1
+            _count(declined, band, seconds, refused.declined)
             continue
         top = step_linear_fit.priced_rank(
             {i: (c.target_seconds, group[i][1]) for i, c in costs.items()}
         )
-        terms = [t for c in costs.values() for t in c.terms]
-        extrapolated += any(t.provenance.extrapolated for t in terms)
+        extrapolated += any(t.provenance.extrapolated for t in costs[top].terms)
         band, price = _band(key, group[top][1]), costs[top].target_seconds
+        # Each term of a fallback's answer carries what declined the step.
+        if costs[top].refusals:
+            _count(fell, band, seconds, dict.fromkeys(costs[top].refusals))
         labels = [drafts[i][step] for i in group]
         draft = None
         if None not in labels:
             mine = costs[top].draft_terms
             draft = (min(labels), costs[top].draft_seconds, _group(mine))
         target = _group(costs[top].terms)
-        priced.append((key, band, step, seconds, price, target, draft, costs[top]))
-    leading = _leading_slow(priced, law)
+        priced.append((key, band, step, seconds, price, target, draft, costs[top], top))
+    leading = set() if grid else _leading_slow(priced, law)
     parts: dict[str, list] = {}
-    for key, band, step, seconds, price, target, draft, cost in priced:
+    by_rank: dict[str, dict] = {}
+    for key, band, step, seconds, price, target, draft, cost, top in priced:
         if step in leading or seconds > WARM_FACTOR * price:
             warm.append(
                 {
@@ -229,6 +280,8 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
         kind = "prefill" if key == "prefill" else "decode"
         for group in GRADED[target]:
             groups[group].setdefault(kind, []).append((band, step, seconds, price))
+        if "graded" in GRADED[target]:
+            by_rank.setdefault(kind, {}).setdefault(top, []).append((seconds, price))
         parts.setdefault(kind, []).append((seconds, cost))
         if draft is not None:
             for group in GRADED[draft[2]]:
@@ -240,9 +293,18 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
             kind: _summary(rows) for kind, rows in sorted(kinds.items(), reverse=True)
         }
     report["warm"] = warm
-    grid = isinstance(backend, StepGridBackend) or fallback
-    report["fallback"], report["refused"] = (declined, {}) if grid else ({}, declined)
+    report["fallback"], report["refused"] = fell, declined
     report["extrapolated"] = extrapolated
+    number = [int(r.name[2:-6]) for r in ranks]
+    cards = _cards(identity, number)
+    report["ranks"] = {
+        kind: {
+            number[i]: _rank(rows, cards[number[i]])
+            for i, rows in sorted(mine.items(), key=lambda m: number[m[0]])
+        }
+        for kind, mine in sorted(by_rank.items(), reverse=True)
+        if len(ranks) > 1
+    }
     report["methods"], report["terms"] = {}, {}
     for kind, priced_steps in sorted(parts.items(), reverse=True):
         real, methods, terms = np.array([s for s, _ in priced_steps]), Counter(), {}
@@ -264,6 +326,14 @@ def cost_accuracy(record, backend, steps=None, fallback=False) -> dict:
             for name, s in sorted(terms.items())
         }
     return report
+
+
+def _count(into: dict, band: str, seconds: float, refusals) -> None:
+    """Count a step of `seconds` in `band` of `into`, with its `refusals`."""
+    r = into.setdefault(band, {"steps": 0, "real_s": 0.0, "reasons": Counter()})
+    r["steps"] += 1
+    r["real_s"] += seconds
+    r["reasons"]["; ".join(f"{d.source}: {d.reason}" for d in refusals)] += 1
 
 
 def _validated(term) -> bool:
@@ -316,13 +386,24 @@ def _text(report: dict) -> str:
                     f"  {band} | {b['steps']} | {b['p10']:+.1%} | {b['p50']:+.1%}"
                     f" | {b['p90']:+.1%} | {b['within_10pct']:.1%}"
                 )
+    for kind, ranks in report["ranks"].items():
+        out.append(f"\n{kind} by priced rank")
+        out.append("  rank | cards | steps | on totals | median")
+        for rank, r in ranks.items():
+            cards = ", ".join(r["buses"]) if r["buses"] else "unrecorded"
+            out.append(
+                f"  dp{rank} | {cards} | {r['steps']} | {r['on_totals']:+.2%}"
+                f" | {r['median']:+.2%}"
+            )
     for w in report["warm"]:
         out.append(
             f"\nwarm step {w['step']} ({w['band']}): real {w['real_s']:.2f} s,"
             f" priced {w['priced_s']:.2f} s"
         )
-    for band, r in report["refused"].items():
-        out.append(f"\nrefused {band}: {declined_text(r)}")
+    for kind in ("fallback", "refused"):
+        for band, r in report[kind].items():
+            out.append(f"\n{kind} {band}: {declined_text(r)}")
+    out.append(f"\nextrapolated: {report['extrapolated']} steps")
     return "\n".join(out)
 
 

@@ -12,7 +12,7 @@ import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_backend_step_roofline import STACK
 from test_probe_device import SCRIPTS
-from test_validate_bound import LINES, _main, graph, record
+from test_validate_bound import LINES, _main, drafted, graph, record
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends.step_roofline import StepRooflineBackend
@@ -20,8 +20,10 @@ from atom.compass.spec import MachineSpec, SpecRefusal
 from atom.compass.validate import bound, project
 
 MACHINES = SCRIPTS / "machines"
+#: MI455's B0 spec is MI355X's probed ratios on MI455X's datasheet, for a
+#: device no engine has run on.
 MI308X, MI355X, MI455 = (
-    MACHINES / f"{name}.json" for name in ("mi308x-hjbog18", "mi355x-gpu45", "mi455")
+    MACHINES / f"{name}.json" for name in ("mi308x-hjbog18", "mi355x-gpu45", "mi455-b0")
 )
 
 
@@ -78,21 +80,24 @@ def test_bound_ratios_from_prices_records_at_the_projected_spec(monkeypatch, tmp
     assert at_ratios == direct["step"]["analytical_s"]["prefill"]["total"] != own
 
 
-def _priced_here(monkeypatch):
-    """Each cell priced in this process, by the stack and graphs `_main` uses."""
+def _priced_here(monkeypatch, drafter=None):
+    """Each cell priced in this process, by the stack and graphs `_main` uses,
+    under `drafter`, a speculative config."""
     config = SimpleNamespace(
         model="m",
         tensor_parallel_size=1,
         kv_cache_dtype="bf16",
         enable_tbo=False,
         enable_tbo_decode=False,
-        speculative_config=None,
+        enable_expert_parallel=False,
+        speculative_config=drafter,
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
     tree = SimpleNamespace(modules=list)
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
-    monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree: STACK)
-    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: graph)
+    monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
+    monkeypatch.setattr("atom.compass.run.modules.drafter", lambda config: None)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: graph)
     monkeypatch.setattr("atom.compass.run._file_digest", lambda *a: "sha256:m")
     monkeypatch.setattr("atom.compass.run.step_grid.keyed", lambda *a, **k: {})
     monkeypatch.setattr(project, "_each", lambda jobs: [project.cell(*j) for j in jobs])
@@ -127,8 +132,8 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
     # The assumed gfx1250 device the graphs were traced at: 256 CUs, B0.
     declared = {"capture.compute_units": 256, "capture.revision": 1}
     assert declared.items() <= doc["assumed"].items()
-    assert mi455.origin("host.ipc.zmq_roundtrip_s")["origin"] == "assumed"
-    for unread in ("host.ipc.zmq_roundtrip_s", "device.compute.bf16_flops"):
+    assert mi455.origin("interconnect.router_relay_s")["origin"] == "assumed"
+    for unread in ("interconnect.router_relay_s", "device.compute.bf16_flops"):
         assert unread not in doc["assumed"]
     # Each assumed ratio and the kernel floor read, every cell priced again at
     # 0.8 and 1.2 of it.
@@ -141,6 +146,22 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
         base = doc["cells"][str(prefill)][level]["tokens_per_s"]
         slower = doc["band"]["device.compute.derate.bf16"]["0.8"]["tokens_per_s"]
         assert slower[level][str(prefill)] < base
+
+
+def test_a_cell_under_a_drafter_states_the_drafters_seconds_apart(
+    monkeypatch, tmp_path
+):
+    mtp1 = SimpleNamespace(num_speculative_tokens=1, use_dspark=lambda: False)
+    _priced_here(monkeypatch, mtp1)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: drafted)
+    line = {"rows": [[2, 900, True]] * 2, "rung": 2, "d_target_ns": 10**9}
+    decode = ran(tmp_path / "mtp", [line])
+
+    cell = project.cell("m", 1, json.loads(MI455.read_text()), "s", str(decode), [])
+
+    op = cell["levels"]["op"]
+    # The drafter costs more than the target, and is not in its seconds.
+    assert op["draft_s"]["decode"] > op["analytical_s"]["decode"]["total"] > 0
 
 
 def test_main_reads_a_records_atom_arguments_from_its_run_json(monkeypatch, tmp_path):
@@ -211,7 +232,7 @@ def test_a_ratio_times_its_factor_is_capped_at_the_datasheet_and_says_so():
 def test_the_band_ranks_the_cells_again_at_each_ratio_one_at_a_time(monkeypatch):
     bf16, link = "device.compute.derate.bf16", "interconnect.intra_node.derate"
     mi455 = spec(MI455)
-    machine = MachineSpec(mi455.values | {link: 0.9}, mi455.tokenizers)
+    machine = MachineSpec(mi455.values | {link: 0.9})
 
     def rates(jobs):
         """Each cell's tokens a second, read off the spec it was priced on."""

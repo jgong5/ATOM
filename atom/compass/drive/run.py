@@ -2,11 +2,14 @@
 """`compass run`: one simulated instance's server, serving whatever client runs
 reach it until it is stopped, with run.json recording what grading reads.
 
-    compass run <backend> --machine M --store S [--host-laws KEY]
+    compass run <backend> --machine M --store S [--host-laws KEY|LAW]
         [--coverage INPUT...] [--on-refusal mark|abort] [--step-roofline]
         [--acceptance-record RECORD] --out D -- <ATOM args>
 
     compass run --join RUN_FILE --out D -- <ATOM args>
+
+    compass run <backend> --machine M --store S [--host-laws KEY] ... --check
+        -- <ATOM args>
 
 `runfile` builds the run file from the flags, the backend exactly one with no
 default, and `serve` starts the server simulated from it with the step record
@@ -24,15 +27,20 @@ clock with its peer, so it refuses without `--join`.
 `--coverage` names record directories and `shape_population` tokens whose steps
 the backend's coverage check reads before the server starts: the step grid's
 is `step_grid_plan.coverage`, over the bundle `step_grid.load` loads under the
-config ATOM's arguments resolve. An input whose DP rank's engine file (a
+config ATOM's arguments resolve on the machine spec's device arch (`_config`).
+An input whose DP rank's engine file (a
 record's `steps/dp<r>.engine.json`, a population's `engine` member) states
 another `SHAPING` field than that config refuses first, naming each field and
 both values. The check refuses no step: it counts those the grid extrapolates
 and those that fall to the step roofline below it, naming each with the grid's
 reasons. The op graph's is `op_coverage`, over the backend `run.op_graph`
 builds from the run file: a step is covered when its price list prices every
-leaf, and a run file that names no price list refuses. Another backend has no
-check, and refuses `--coverage`.
+leaf, a step its DP group splits under `--enable-tbo` read as its two
+micro-batches, and a run file that names no price list refuses. Another backend
+has no check, and refuses `--coverage`.
+
+`--check` starts no server: it lists every input the run lacks and the command
+that makes each, exiting 1 when one is lacking (`lacking`); it takes no `--out`.
 
 `--acceptance-record` names a speculative `compass record` directory: its
 histograms' rates (`measured`) go to ATOM as ``--spec-decode-acceptance-rates``,
@@ -57,13 +65,12 @@ import re
 import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
-from types import SimpleNamespace
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactStore, Kind
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.step_grid_plan import BOUNDS, coverage
-from atom.compass.drive import runfile, serve
+from atom.compass.drive import lacking, runfile, serve
 from atom.compass.run import (
     OP_GRAPH,
     PRICE_LIST,
@@ -72,6 +79,7 @@ from atom.compass.run import (
     STEP_STUB,
     step_grid,
 )
+from atom.compass.validate.bound import _split
 
 PROG = "compass run"
 #: The engine fields that shape a step's batches: the scheduler's bounds, the
@@ -86,29 +94,26 @@ NUMBER = r"(?<![\w.])\d+(?:\.\d+)?"
 def main(argv: list[str]) -> None:
     cut = argv.index("--") if "--" in argv else len(argv)
     atom_args = argv[cut + 1 :]
-    transfer = runfile._engine_args(atom_args).kv_transfer_config
-    side = compass_run._pd_side(
-        SimpleNamespace(kv_transfer_config=json.loads(transfer))
-    )
     joining = argparse.ArgumentParser(prog=PROG, add_help=False)
     joining.add_argument("--join")
     if joining.parse_known_args(argv[:cut])[0].join:
+        side = runfile.pd_side(atom_args)
         join(_joining_parser().parse_args(argv[:cut]), atom_args, side)
         return
-    args = _parser().parse_args(argv[:cut])
+    parser = _parser()
+    args = parser.parse_args(argv[:cut])
     if args.coverage and not (getattr(args, STEP_GRID) or getattr(args, OP_GRAPH)):
         key = next(k for k in (STEP_STUB, STEP_LINEAR) if getattr(args, k))
         raise ValueError(
             f"--coverage: --{key.replace('_', '-')} has no coverage check; only "
             "--step-grid's and --op-graph's steps are checked"
         )
-    if side is not None:
-        raise ValueError(
-            f"--kv-transfer-config {transfer} makes this a "
-            f"{'prefill' if side == 'P' else 'decode'} instance, which shares a "
-            "clock with its peer: join its deployment's authority with --join, as "
-            "scripts/compass/deploy.sh does"
-        )
+    runfile.pd_side(atom_args, refuse=True)
+    if args.check:
+        serve._refuse(atom_args)
+        raise SystemExit(lacking.report(args, atom_args))
+    if not args.out:
+        parser.error("the following arguments are required: --out")
     run = runfile.build(args, atom_args)
     if record := args.acceptance_record:
         atom_args = with_measured_rates(record, atom_args, run["data_parallel_size"])
@@ -154,8 +159,11 @@ def _parser() -> argparse.ArgumentParser:
         help="a speculative record directory whose acceptance the run draws from",
     )
     p.add_argument(
-        "--out", required=True, help="an empty directory for the run's files and logs"
+        "--check",
+        action="store_true",
+        help="list every input the run lacks, and start no server",
     )
+    p.add_argument("--out", help="an empty directory for the run's files and logs")
     return p
 
 
@@ -224,19 +232,20 @@ def joined_atom_args(run: dict, atom_args, side) -> list[str]:
 def check(inputs, run: dict, atom_args) -> dict:
     """The coverage of the steps `inputs` hold by the step grid or the op
     graph's price list the run file `run` names, loaded under the config
-    `atom_args` resolve; an input that ran under other `SHAPING` fields
-    refuses."""
-    store, config = ArtifactStore(run["store"]), _config(atom_args)
-    here = step_grid.keyed(config) | {name: getattr(config, name) for name in BOUNDS}
-    steps = [s for name in inputs for s in _steps(name, store, here)]
+    `atom_args` resolve on its machine's device arch; an input that ran under
+    other `SHAPING` fields refuses."""
+    if run.get(OP_GRAPH) and PRICE_LIST not in run:
+        raise ValueError(
+            "--coverage: the store holds no price_list at this run's key, so "
+            "the op graph prices every leaf by its roofline and no step is "
+            "covered; compass fit ops publishes one"
+        )
     machine = compass_run._machine(run)
+    store = ArtifactStore(run["store"])
+    config = _config(atom_args, machine.value("device.arch"))
+    here = step_grid.keyed(config) | {name: getattr(config, name) for name in BOUNDS}
+    steps = [s for name in inputs for s in _steps(name, store, here, config.enable_tbo)]
     if run.get(OP_GRAPH):
-        if PRICE_LIST not in run:
-            raise ValueError(
-                "--coverage: the store holds no price_list at this run's key, so "
-                "the op graph prices every leaf by its roofline and no step is "
-                "covered; compass fit ops publishes one"
-            )
         # ATOM's MoE shards no experts without expert parallelism.
         ep = _ep_width(atom_args, machine) if config.enable_expert_parallel else 1
         backend = compass_run.op_graph(run, config, machine, ep)
@@ -270,14 +279,26 @@ def op_coverage(backend, steps) -> dict:
     per kind per step so a kind's counts sum to steps. A step is covered
     when the list prices each leaf the backend asks it for; a leaf it declines,
     on a line the fit declined among them, goes to the roofline and leaves its
-    step out. A step the backend refuses is left out under ``step refused``."""
+    step out. A step the backend refuses is left out under ``step refused``.
+    A line's `tbo_tokens`, the two-batch-overlap split its data-parallel
+    group agreed, makes the step its rank's (`dp_rank`) two micro-batches.
+    Its `target_bs`, `draft_bs`, `draft_moe_rows` and `draft_rows` read its
+    target and its drafter at the widths and rows they ran at, as a simulated
+    run reads them."""
     by_phase, out = defaultdict(Counter), defaultdict(Counter)
     for _, line in steps:
+        split = line.get("tbo_tokens")
         view = BatchView(
             tuple(RequestShape(*row) for row in line["rows"]),
             capture_rung=line["rung"],
             moe_rows=line.get("moe_rows"),
+            draft_moe_rows=line.get("draft_moe_rows"),
+            draft_bs=line.get("draft_bs"),
+            draft_rows=line.get("draft_rows"),
+            target_bs=line.get("target_bs"),
             produces_output=line["produces_output"],
+            tbo_tokens=split and tuple(map(tuple, split)),
+            dp_rank=split and line.get("dp_rank"),
         )
         try:
             cost = backend.price(view)
@@ -306,10 +327,13 @@ def op_coverage(backend, steps) -> dict:
     }
 
 
-def _steps(name: str, store, here: dict) -> list:
+def _steps(name: str, store, here: dict, tbo: bool) -> list:
     """The steps of the record directory or `shape_population` token `name`,
     less DP's dummy runs, each named `<name> dp<r> step <n>`; a rank whose
-    engine states other `SHAPING` fields than `here` refuses, naming each."""
+    engine states other `SHAPING` fields than `here` refuses, naming each.
+    Whatever a line states, its `tbo_tokens` is, on a data-parallel step under
+    two-batch overlap (`tbo`, ATOM's `enable_tbo`), the split `bound._split`
+    agrees over every rank's line at that step, else None."""
     path = Path(name)
     if (path / serve.RUN_JSON).is_file():
         records = {
@@ -335,19 +359,49 @@ def _steps(name: str, store, here: dict) -> list:
                     f"{k} {ran.get(k)!r} there, {here[k]!r} here" for k in differ
                 )
             )
-    return [
-        (f"{name} dp{rank} step {line['step']}", line)
+    at = {
+        rank: {s["step"]: s for s in map(json.loads, text.splitlines())}
         for rank, (text, _) in sorted(records.items())
-        for line in map(json.loads, text.splitlines())
+    }
+    # One rank is no DP group; dummy runs join the split, and a step some rank
+    # lacks splits none, as `trace ops --population` reads it.
+    every = set.intersection(*map(set, at.values())) if tbo and len(at) > 1 else ()
+    splits = {n: _split([r[n] for r in at.values()]) for n in every}
+    return [
+        (f"{name} dp{rank} step {n}", line | {"tbo_tokens": splits.get(n)})
+        for rank, steps in at.items()
+        for n, line in steps.items()
         if not line["is_dummy_run"]
     ]
 
 
-def _config(atom_args):
-    """ATOM's `Config` for a server's arguments, as the server runs it."""
+def _config(atom_args, arch: str | None = None):
+    """ATOM's `Config` for a server's arguments, as the server runs it; with
+    `arch`, as it runs on a device of that arch (`_declared`)."""
+    if arch is not None:
+        from transformers.dynamic_module_utils import init_hf_modules
+
+        from atom.compass.bench.ops import _child
+
+        # A model's remote code loads in the child, which writes it to
+        # transformers' module cache; its config classes load here from there.
+        init_hf_modules()
+        return _child(_declared, atom_args, arch)
     from atom.compass.bench.measure import atom_config
 
     return atom_config(atom_args, server=True)
+
+
+def _declared(atom_args, arch: str):
+    """`_config` of `atom_args` in a process that declares a device of `arch`
+    before aiter loads: aiter resolves its fp8 dtype at import from the device
+    it finds, ``uint8`` where it finds none, and ATOM's quantization config
+    holds that dtype, which its hash keys."""
+    from atom.compass.capture import driverless
+
+    with tempfile.TemporaryDirectory(prefix="compass-run-config-") as tmpdir:
+        driverless.install(tmpdir, arch)
+        return _config(atom_args)
 
 
 def write_grading(out, report, side=None) -> None:

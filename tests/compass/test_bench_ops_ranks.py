@@ -21,7 +21,8 @@ from typing import ClassVar
 import pytest
 import torch
 import torch.distributed as dist
-from test_bench_ops import _graph, _leaf, _Runner, _t
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
+from test_bench_ops import _Capture, _captures, _graph, _leaf, _Runner, _t
 from test_bench_ops_plan import CONFIG, _records, bench  # noqa: F401  the fixture
 
 from atom.compass import ir
@@ -175,7 +176,8 @@ def _measuring_rank(config, todo, refuse, rank):
     def kernels(fn, kwargs):
         ops._together()
         profiles.append(1)
-        return ([] if (me, refuse, len(profiles)) == (1, "profile", 1) else ["k"]), 1.0
+        names = [] if (me, refuse, len(profiles)) == (1, "profile", 1) else ["k"]
+        return names, [None] * len(names), 1.0
 
     ops._kernels = kernels
     ops._together = dist.barrier
@@ -208,7 +210,8 @@ def _measuring_rank(config, todo, refuse, rank):
     ops.Stub._copy = copying
     if (me, refuse) == (1, "call"):
         ops._function = lambda name: no if name == NEG else function(name)
-    torch.cuda.graph = lambda *a, **k: contextlib.nullcontext(graph())
+    # the rank's process ends with its launch, so nothing is undone
+    _captures(pytest.MonkeyPatch(), lambda g, **k: graph() or _Capture(g))
     records = ops.measure(config, todo[me], 10_000, rank)
     return (records, len(profiles)) if refuse == "profile" else records
 
@@ -264,6 +267,38 @@ def test_a_rank_whose_first_profile_names_no_kernel_profiles_as_often_as_the_oth
     ]
     # NEG: rank 1's empty profile, then two that agree; ABS: two that agree
     assert got == [([(NEG, None, ["k"]), (ABS, None, ["k"])], 3 + 2)] * 2
+
+
+def _missing_rank(config, todo, refuse, rank):
+    """`_measuring_rank`, its first two profiles at rank 1 recording nothing of
+    a call its graph times; and the rank's profiles."""
+    measure, profiles = ops.measure, []
+
+    def missing(*args):
+        named = ops._kernels
+
+        def kernels(fn, kwargs):
+            profiles.append(1)
+            names, grids, ns = named(fn, kwargs)
+            missed = rank == 1 and len(profiles) < 3
+            return ([] if missed else names), ([] if missed else grids), ns
+
+        ops._kernels = kernels
+        return measure(*args)
+
+    ops.measure = missing
+    return _measuring_rank(config, todo, refuse, rank), len(profiles)
+
+
+def test_every_rank_profiles_a_call_again_when_one_rank_s_two_profiles_missed_it():
+    config = _config(2)
+    ranks.layout(config)
+    todo = [[(decode(2), 20, _found(NEG))]] * 2
+
+    by_rank = ranks.launch(_missing_rank, config, todo, None)
+
+    got = [([(r["op"], r.get("kernels")) for r in rs], n) for rs, n in by_rank]
+    assert got == [([(NEG, ["k"])], 2 + 2)] * 2
 
 
 def test_a_rank_raising_before_its_first_cross_rank_call_ends_the_others():
@@ -423,6 +458,48 @@ def test_a_c10d_leaf_runs_on_its_coordinator_s_group_whatever_torch_named_it():
         )
 
 
+GATHERV = "atom.model_ops.moe:all_gatherv"
+
+
+def _gatherv_rank(config, todo, rank):
+    """`_measuring_rank` measuring a DP all-gather of two tensors, captured at
+    rank 0's 13 rows of `sizes` [13, 1], on aiter's DP group of both ranks,
+    failing as aiter's does where a rank's rows are not its entry; with the
+    shapes of every `x` it took."""
+    measure, shapes = ops.measure, set()
+
+    def gatherv(x, sizes, group):
+        shapes.add(tuple(tuple(t.shape) for t in x))
+        if any(len(t) != sizes[group.rank_in_group] for t in x):
+            raise AssertionError("all_gatherv input rows differ from this rank's size")
+        return [t.new_empty(sum(sizes), *t.shape[1:]) for t in x]
+
+    def on_dp_group(config, todo, llc, rank):
+        dp = SimpleNamespace(rank_in_group=dist.get_rank())
+        sys.modules["aiter.dist.parallel_state"].get_dp_group = lambda: dp
+        sys.modules["atom.model_ops.moe"] = SimpleNamespace(all_gatherv=gatherv)
+        x = ("x", (_t([13, 8], "activation"), _t([13, 6], "activation")))
+        leaf = _leaf(GATHERV, x, ("sizes", (13, 1)))
+        found = ops.leaves(_graph(leaf, layers=1)["region"])
+        return measure(config, [(prefill(13, 1), None, found)], llc, rank)
+
+    ops.measure = on_dp_group
+    return _measuring_rank(config, todo, None, rank), shapes
+
+
+def test_each_rank_s_dp_all_gather_sends_its_own_rows_of_the_captured_sizes():
+    config = _config(2, dp_attention=True)
+    ranks.layout(config)
+
+    by_rank = ranks.launch(_gatherv_rank, config, [[], []])
+
+    assert [_leaves(records) for records, _ in by_rank] == [[(GATHERV, None)]] * 2
+    assert [shapes for _, shapes in by_rank] == [
+        {((13, 8), (13, 6))},
+        {((1, 8), (1, 6))},
+    ]
+
+
 def _gather(rows):
     x = ("x", _t([rows, 8], "activation"))
     return ir.Op(GATHER, "declared", (x, ("use_cag", True)), ((8 * rows, 8),))
@@ -447,6 +524,7 @@ def test_a_collective_is_one_family_over_its_bytes_across_decode_and_prefill(
         graph = _gather_graph(None, None, decode(width))
         [(sig, (op, _))] = ops.leaves(graph["region"]).items()
         point = {"shape": str(decode(width)), "context": 20, "op": GATHER}
+        point |= {"exchange": ops.exchange(op)}
         records.append(point | {"leaf": sig, "kernels": ["ag"], "cold_ns": 1.0})
     graded = _records(
         tmp_path / "graded",
@@ -465,6 +543,38 @@ def test_a_collective_is_one_family_over_its_bytes_across_decode_and_prefill(
     assert report["left out, by leaf kind"] == {
         GATHER: {"outside the measured range": 1}
     }
+
+
+def test_coverage_leaves_out_a_collective_step_in_a_gap_the_fit_declines(
+    bench,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+):
+    # Measured at decode widths 1, 2 and 4 (256, 512 and 1024 bytes), one
+    # kernel: 512 reads 33% off the line from 256 to 1024, so a prefill of 3
+    # tokens (768 bytes) lies in a gap the fit declines; a decode of 2 is 512.
+    monkeypatch.setattr(ops, "graph", _gather_graph)
+    store, root, _, _ = bench
+    records = []
+    for width, ns in ((1, 1.0), (2, 3.0), (4, 4.0)):
+        graph = _gather_graph(None, None, decode(width))
+        [(sig, (op, _))] = ops.leaves(graph["region"]).items()
+        point = {"shape": str(decode(width)), "context": 20, "op": GATHER}
+        point |= {"exchange": ops.exchange(op), "leaf": sig}
+        records.append(point | {"kernels": ["ag"], "cold_ns": ns})
+    graded = _records(
+        tmp_path / "graded",
+        ([[3, 3, False]], None),
+        ([[1, 30, True], [1, 9000, True]], 2),
+    )
+
+    report = ops.coverage(store, root, CONFIG, [graded], records, "gfx942")
+
+    assert report["by phase"] == {
+        "prefill": {"steps": 1, "covered": 0},
+        "decode": {"steps": 1, "covered": 1},
+    }
+    assert report["left out, by leaf kind"] == {GATHER: {"the fit declined bytes": 1}}
 
 
 def _sig(rows):
@@ -630,7 +740,7 @@ def _dpa_main(argv, bench, tmp_path, monkeypatch, config):  # noqa: F811
     graph = _graph(_gather(2), _leaf(NEG, x), layers=1)
     monkeypatch.setattr(ops, "graph", lambda *a: graph)
     monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
-    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], 1.0))
+    monkeypatch.setattr(ops, "_kernels", lambda fn, kwargs: (["k"], [None], 1.0))
     monkeypatch.setattr(ops, "_replay", lambda fn, calls, *_: [1.0] * ops.REPEATS)
     argv += ["--width", "2", "--context", "20", "--llc-mib", "1", "--gpu", "0"]
     argv += ["--store", root, "--out", str(tmp_path / "out")]

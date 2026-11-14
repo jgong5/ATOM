@@ -25,16 +25,25 @@ the tensor-parallel group unless the leaf states its group size. A kind with
 no extractor, or a leaf its extractor cannot price, is refused by name.
 
 DeepSeek-V4's MoE takes the step roofline's expectation under independent
-uniform routing: the routed experts run the rows the leaf holds, under expert
-parallelism the busiest rank's expected share, at the format the op quantizes
-its rows to, and read each activated expert once; a DP exchange's group width
-is read off its own shapes. ATOM's Triton experts run as aiter's grouped
-GEMMs, each priced so, at the activation format its kind names; their
-expert-parallel width is the run's `ep`, the experts `ep` times a rank's.
+uniform routing: the routed experts run the rows the leaf holds but its pad
+rows, a gather's or a graph's, under expert parallelism the busiest rank's
+expected share, a fused shared expert every row aiter's top-k table deals it,
+a gather's pad rows too, at the format the op quantizes its rows to, and read
+each activated expert once; a DP exchange's group width is read off its own
+shapes. ATOM's Triton experts run as aiter's grouped GEMMs, each priced so, at
+the activation format its kind names; their expert-parallel width is the run's
+`ep`, the experts `ep` times a rank's. On one rank a leaf's real rows are at
+most the view's tokens: the op-level backend hands a `ROUTED` leaf of a
+drafter's pass that does not run the step's tokens the view of its own rows.
+
+DeepSeek-V4.1's sparse attention and indexer scorers read their entries at the
+geometry their leaf states, over the queries the leaf holds (`_last`): a
+replayed prefill's decoder layers run each finishing request's last rows.
 """
 
 from __future__ import annotations
 
+import bisect
 import inspect
 import math
 from dataclasses import replace
@@ -46,7 +55,12 @@ from torch.utils.flop_counter import flop_registry
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView
-from atom.compass.backends.step_roofline import Module, _index_scores, _sparse_products
+from atom.compass.backends.step_roofline import (
+    Module,
+    _index_scores,
+    _sparse_products,
+    routing_rows,
+)
 from atom.compass.backends.step_roofline import _work as module_work
 from atom.compass.backends.work import (
     ELEMENT_BYTES,
@@ -149,6 +163,19 @@ def _pass(view, q) -> tuple:
     return rows
 
 
+def _last(view, q) -> tuple:
+    """The view's rows as a leaf of Q `q` runs them: each row's last `n`
+    queries, `n` the most whose sum `q`'s rows hold, every query a row has
+    when they hold them all: a bounded replay's tail of a prefill, its last
+    layer's last row, a drafter's later pass."""
+    rows, held = view.requests, q["shape"][0]
+    top = max(r.query_tokens for r in rows)
+    n = bisect.bisect_right(
+        range(1, top + 1), held, key=lambda n: sum(min(r.query_tokens, n) for r in rows)
+    )
+    return tuple(replace(r, query_tokens=min(r.query_tokens, max(n, 1))) for r in rows)
+
+
 def _attention(op, view, tp, kv) -> Work:
     """Causal attention over the pass's rows (`_pass`): Q read and O written,
     each row's K and V over its context read once in the KV cache's format
@@ -204,6 +231,12 @@ def _all_reduce(op, view, tp, kv) -> Work:
     return _boundary(op) + allreduce(tp, _bytes(op["args"]["tensor"]))
 
 
+def _fused_all_reduce_norm(op, view, tp, kv) -> Work:
+    """An all-reduce of `inp` fused with the residual add and RMSNorm after
+    it: the all-reduce's bytes, and each tensor read and written once."""
+    return _boundary(op) + allreduce(tp, _bytes(op["args"]["inp"]))
+
+
 def _all_gather(op, view, tp, kv) -> Work:
     gathered = math.prod(op["out"][0]) * _size(op["args"]["input"]["dtype"])
     return _boundary(op) + allgather(op["args"]["group_size"], gathered)
@@ -227,53 +260,65 @@ def _all_to_all(op, view, tp, kv) -> Work:
 def _dp_exchange(op, view, tp, kv) -> Work:
     """The data-parallel group's gather of the MoE's input, or reduce-scatter
     of its output: the larger side holds every rank's rows, the smaller this
-    rank's, and the group is `sizes` long or their ratio wide."""
-    x, out = op["args"]["x"], op["out"][0]
-    rows = sorted((x["shape"][0], out[0]))
+    rank's, and the group is `sizes` long or their ratio wide. A gather of
+    routed rows moves several tensors of one height in the one collective."""
+    xs, out = op["args"]["x"], op["out"][0]
+    xs = xs if isinstance(xs, (list, tuple)) else [xs]
+    rows = sorted((xs[0]["shape"][0], out[0]))
     ranks = len(op["args"].get("sizes") or ()) or rows[1] // rows[0]
-    every = rows[1] * math.prod(x["shape"][1:]) * _size(x["dtype"])
-    collective = allgather if out[0] > x["shape"][0] else reduce_scatter
+    row = sum(math.prod(x["shape"][1:]) * _size(x["dtype"]) for x in xs)
+    every = rows[1] * row
+    collective = allgather if out[0] > xs[0]["shape"][0] else reduce_scatter
     return _boundary(op) + collective(ranks, every)
 
 
 def _routing(view, tokens, k, experts, ranks):
-    """The routes and activated experts of `tokens` each routed to `k` of
-    `experts` spread over `ranks`, an expectation under uniform routing: the
-    busiest rank's expected share under expert parallelism. A DP gather's pad
-    rows (`moe_tokens` real among them) all carry token 0, so they activate
-    experts as one token."""
-    real = view.moe_tokens
-    distinct = tokens if real is None else min(tokens, real + 1)
+    """The routes and activated experts of `tokens` rows, those that route
+    (`routing_rows`: a DP gather's real rows, one rank's own tokens) each
+    routed to `k` of `experts` spread over `ranks`, an expectation under
+    uniform routing: the busiest rank's expected share under expert
+    parallelism."""
+    real, distinct = routing_rows(view, tokens)
     groups = activated_experts(experts, k, distinct)
     if ranks == 1:
-        return tokens * k, groups
-    return max_rank_load(tokens, k, experts, ranks), groups / ranks
+        return real * k, groups
+    return max_rank_load(real, k, experts, ranks), groups / ranks
 
 
 def _fused_moe(op, view, tp, kv, ep) -> Work:
-    """The routed experts on `hidden_states`' rows, each route through one
-    expert's gate-up and down products, routed as `_routing` says. Under
-    expert parallelism `w1` holds this rank's share of `ep` times its experts.
+    """The experts on `hidden_states`' rows, each route through one expert's
+    gate-up and down products. Every `topk_ids` column is the router's,
+    routed as `_routing` says, unless the leaf states its layer's `top_k` and
+    `fused_shared_experts`: then only the first `top_k` are, and aiter's top-k
+    table gives each fused shared expert every row a gather carries, pad rows
+    too, or on one rank the step's own tokens (`routing_rows`), under expert
+    parallelism dealt to rank `row mod ep`, which holds them all; the columns
+    past both reach no expert. Under expert parallelism `w1` holds this rank's
+    share of `ep` times its routed experts, and its fused shared ones.
 
     With a nonzero `quant_type` the op quantizes `hidden_states` to the
     weights' format inside it, so both products run at that format; otherwise
     at `hidden_states`'. M is the leaf's boundary: each activated expert's
     weights and scales read once, and the rows' tensors at the share of rows
-    this rank runs, at least its routes over `k`."""
-    args = op["args"]
+    this rank runs, at least its routes over the top k and the rows it is
+    dealt."""
+    args, stated = op["args"], op.get("stated", {})
     (rows, hidden), k = args["hidden_states"]["shape"], args["topk_ids"]["shape"][1]
     local, up = args["w1"]["shape"][:2]
-    routed, groups = _routing(view, rows, k, local * ep, ep)
+    top, shared = stated.get("top_k", k), stated.get("fused_shared_experts", 0)
+    routed, groups = _routing(view, rows, top, (local - shared) * ep, ep)
+    own = rows if view.moe_rows is not None else routing_rows(view, rows)[0]
+    dealt = -(-own // ep) if shared else 0
+    picks, groups = routed + dealt * shared, groups + shared
     b = _fmt(args["w1"]["dtype"])
     a = b if args.get("quant_type") else _fmt(args["hidden_states"]["dtype"])
-    flops = grouped_gemm(routed, up, hidden, groups, a, b)
-    flops += grouped_gemm(routed, hidden, up // 2, groups, a, b)
+    flops = grouped_gemm(picks, up, hidden, groups, a, b)
+    flops += grouped_gemm(picks, hidden, up // 2, groups, a, b)
     held = ("w1", "w2", "w1_scale", "w2_scale", "bias1", "bias2")
     weights = sum(_bytes(t) for s in held for t in _tensors(args.get(s)))
     io = _boundary(op).bytes - weights
-    return Work(
-        flops.flops_by_format, weights * groups / local + io * routed / (rows * k)
-    )
+    ran = max(routed / top, dealt)
+    return Work(flops.flops_by_format, weights * groups / local + io * ran / rows)
 
 
 def _experts(act: str):
@@ -350,9 +395,9 @@ def _mhc(residual):
 
 def _launch(op, view, tp, kv) -> Work:
     """One launch at the kernel floor."""
-    # ponytail: V4's index builds write each row's window and compressed
-    # entries, which scale with its context through V4's geometry, and the
-    # leaf does not state that geometry; the floor is their lower bound.
+    # ponytail: V4's and V4.1's index builds write each row's window and
+    # compressed entries, which scale with its context through the model's
+    # geometry, and the leaf does not state it; the floor is their lower bound.
     return Work()
 
 
@@ -435,20 +480,21 @@ def _stated(op, *names) -> list:
     return [stated[name] for name in names]
 
 
-def _v4_decode(q, *slots, out=None):
+def _v4_decode(q, *slots, out=None, queries=_pass):
     """V4's decode attention: `_only`'s `q`, `slots` and outputs, and the KV
     entries each row reads at the window, compression ratio and top-k its
     leaf states, as the step roofline counts them: two products of `q`'s head
     width per head and entry, at the wider of Q's and the KV cache's formats,
     and each entry read once at that width in the KV format. The rotary
-    part's products and bytes are left out, which only lowers both."""
+    part's products and bytes are left out, which only lowers both. The view's
+    rows are as `queries` says `q` runs them."""
     boundary = _only(q, *slots, out=out)
 
     def extract(op, view, tp, kv) -> Work:
         geometry = _stated(op, "window_size", "compress_ratio", "index_topk")
         x = op["args"][q]
         _, heads, dim = x["shape"]
-        fmt, rows = _fmt(x["dtype"]), _pass(view, x)
+        fmt, rows = _fmt(x["dtype"]), queries(view, x)
         work = _sparse_products(rows, heads, dim, fmt, kv, *geometry)
         return boundary(op, view, tp, kv) + work
 
@@ -460,13 +506,175 @@ def _indexer(op, view, tp, kv) -> Work:
     against every compressed entry before it at the ratio the leaf states, as
     the step roofline counts them: one product of the index head width per
     index head, at fp4 when the leaf takes `q_scale`, else at `q_quant`'s
-    format, and each entry read once at that width and format."""
+    format, and each entry read once at that width and format. `q_quant` is
+    rows first and heads by packed width last, a query axis between them or
+    not."""
     (ratio,) = _stated(op, "compress_ratio")
     q = op["args"]["q_quant"]
     fmt = "fp4" if op["args"].get("q_scale") else _fmt(q["dtype"])
-    _, heads, packed = q["shape"]
+    heads, packed = q["shape"][-2:]
     dim = int(packed * _size(q["dtype"]) / ELEMENT_BYTES[fmt])
     return _boundary(op) + _index_scores(_pass(view, q), ratio, heads, dim, fmt)
+
+
+def _v41_scores(q):
+    """V4.1's indexer scorer: `q` and the head weights read once, and each
+    query `q` holds (`_last`) scored at its format against the compressed
+    entries before it at the ratio the leaf states, at most the candidates it
+    states where an earlier layer chose them (`_index_scores`). The logits
+    plane it writes is left out, which only lowers M."""
+
+    def extract(op, view, tp, kv) -> Work:
+        ratio, cap = _stated(op, "compress_ratio", "index_candidates")
+        x = op["args"][q]
+        *_, heads, dim = x["shape"]
+        scores = _index_scores(_last(view, x), ratio, heads, dim, _fmt(x["dtype"]), cap)
+        return _only(q, "weights")(op, view, tp, kv) + scores
+
+    return extract
+
+
+def _mhc_delayed(op, view, tp, kv) -> Work:
+    """V4.1's delayed hyper-connection seam: each tensor argument read once,
+    the outputs written at a byte an element, which only lowers M, and each
+    row's widened residual projected onto the `hc_base` mixes."""
+    args = op["args"]
+    *rows, copies, width = args["residual"]["shape"]
+    mixes = math.prod(args["hc_base"]["shape"])
+    flops = 2 * math.prod(rows) * copies * width * mixes
+    outs = ["torch.float8_e4m3fn"] * len(op["out"])
+    return _boundary(op, outs=outs) + Work({_fmt(args["residual"]["dtype"]): flops})
+
+
+def _quantize(op, view, tp, kv) -> Work:
+    """ATOM's group-32 fp8 quant: `x` read once and its values written in fp8
+    with an e8m0 scale per 32, or in its own format where it only rounds them
+    (`dequantize`)."""
+    x = op["args"]["x"]
+    each = _size(x["dtype"]) if op["args"].get("dequantize") else 1 + 1 / 32
+    return Work({}, _bytes(x) + math.prod(x["shape"]) * each)
+
+
+def _mx(*slots, read=()):
+    """Each of `slots` read once and written once in mxfp8, a byte an element
+    and an e8m0 scale per 32, and `read` read once."""
+
+    def extract(op, view, tp, kv) -> Work:
+        args = op["args"]
+        values = sum(math.prod(args[s]["shape"]) for s in slots)
+        moved = sum(_bytes(args[s]) for s in (*slots, *read))
+        return Work({}, moved + values * (1 + 1 / 32))
+
+    return extract
+
+
+def _gather_rows(op, view, tp, kv) -> Work:
+    """`rows`' rows of each of `tensors` along `dim`, each read and written
+    once, and the row indices."""
+    args = op["args"]
+    count, dim = args["rows"]["shape"][0], args["dim"]
+    row = sum(
+        math.prod(t["shape"][dim + 1 :]) * _size(t["dtype"])
+        for t in _tensors(args["tensors"])
+    )
+    return Work({}, 2 * count * row + _bytes(args["rows"]))
+
+
+def _index_fill(op, view, tp, kv) -> Work:
+    """A fill of `self`'s slices along `dim` that `index` names: each slice
+    written once, and the index read."""
+    args = op["args"]
+    target, index = args["self"], args["index"]
+    shape = target["shape"]
+    each = math.prod(shape) // shape[args["dim"] % len(shape)] * _size(target["dtype"])
+    return Work({}, index["shape"][0] * each + _bytes(index))
+
+
+def _draft_kv_tail(op, view, tp, kv) -> Work:
+    """V4.1 DSpark's draft-KV epilogue: `kv`'s rows read once and written back
+    as `_quantize` writes them, packed or rounded in place, and the stages'
+    norm weights and the positions read once. The rotary rows it reads by
+    position are left out, which only lowers M."""
+    args = op["args"]
+    rows = {"args": {"x": args["kv"], "dequantize": not args["packed"]}}
+    norms = _only("norm_weight", "positions")(op, view, tp, kv)
+    return _quantize(rows, view, tp, kv) + norms
+
+
+def _window_rows(op, view, tp, kv) -> Work:
+    """V4.1 DSpark's window gather: the ring of each of `layers` at each of
+    `slots` read and written once, and the indices."""
+    args = op["args"]
+    window = args["window"]
+    ring = math.prod(window["shape"][-2:]) * _size(window["dtype"])
+    rings = args["layers"]["shape"][0] * args["slots"]["shape"][0]
+    return Work({}, 2 * rings * ring) + _only("layers", "slots")(op, view, tp, kv)
+
+
+def _draft_indices(op, view, tp, kv) -> Work:
+    """V4.1 DSpark's block indices from each row's anchor position: the
+    positions read once, and per row its `width` positions, an int32 index
+    of every ring slot and block row for each of them, and each ring slot's
+    position written."""
+    args = op["args"]
+    positions = args["positions"]
+    ring, width, size = args["ring"], args["width"], _size(positions["dtype"])
+    each = (width + ring) * size + width * (ring + width) * _size("torch.int32")
+    return Work({}, _bytes(positions) + positions["shape"][0] * each)
+
+
+def _block_state(op, view, tp, kv) -> Work:
+    """V4.1 DSpark's block state: the anchors' and the noise's embeddings read
+    once, and each row's `width` positions written as `hc_mult` copies of the
+    embedding with an fp32 pre-mix each."""
+    args = op["args"]
+    (rows, hidden), dtype = args["anchor_embed"]["shape"], args["anchor_embed"]["dtype"]
+    copies = rows * args["width"] * args["hc_mult"]
+    written = copies * (hidden * _size(dtype) + _size("torch.float32"))
+    return _only("anchor_embed", "noise_embed")(op, view, tp, kv) + Work({}, written)
+
+
+def _block_attention(op, view, tp, kv) -> Work:
+    """DSpark's draft attention: each query of `q` attends every entry its row
+    of `topk_idxs` lists, two products of the head width per head and entry,
+    each argument read once and O written as `q`."""
+    args = op["args"]
+    q = args["q"]
+    *queries, heads, dim = q["shape"]
+    entries = math.prod(queries) * args["topk_idxs"]["shape"][-1]
+    products = Work({_fmt(q["dtype"]): 4 * heads * dim * entries}, _bytes(q))
+    return _boundary(op) + products
+
+
+def _markov(op, view, tp, kv) -> Work:
+    """DSpark's Markov head over a vocabulary shard: a GEMM of each row's
+    `markov_w1` row against the shard's `markov_w2` rows, whose output term is
+    `base_logits`, which it adds and reduces to an id rather than writes; and
+    the ids and the rows it picks and publishes read or written once."""
+    args = op["args"]
+    rows, shard = args["base_logits"]["shape"]
+    w2 = args["markov_w2"]
+    fmt, logits = _fmt(w2["dtype"]), _fmt(args["base_logits"]["dtype"])
+    picks = _only("prev_ids", "out", "packed", "embed_out")(op, view, tp, kv)
+    return gemm(rows, shard, w2["shape"][1], fmt, fmt, logits) + picks
+
+
+def _markov_argmax(op, view, tp, kv) -> Work:
+    """DSpark's Markov head over the whole vocabulary, as `_markov` prices a
+    shard's, the `markov_w1` rows it picks written as its output rather than
+    into an `embed_out`."""
+    published = _only(out=op["args"]["markov_w1"]["dtype"])(op, view, tp, kv)
+    return _markov(op, view, tp, kv) + published
+
+
+def _commit_cursors(op, view, tp, kv) -> Work:
+    """V4.1's tentative cursor commit: each of `count` requests' accepted
+    prefix's row read from `cursors` and written to its slot of `cursor`, and
+    the anchors, starts and slots read once."""
+    args = op["args"]
+    row = args["cursor"]["shape"][1] * _size(args["cursor"]["dtype"])
+    indices = _only("anchors", "starts", "slots")(op, view, tp, kv)
+    return Work({}, 2 * args["count"] * row) + indices
 
 
 def _shape(value):
@@ -496,9 +704,11 @@ def _aten(op, view, tp, kv) -> Work | None:
     """Any aten operator: its boundary, each output in the dtype a meta-device
     call of it returns, and torch's flop formula when it has one. A view,
     which aliases its input, writes nothing and keeps the dtype, launches no
-    kernel; nor does an allocation."""
+    kernel; nor does a dtype view, which reads the same bytes as another
+    dtype, or an allocation. A cast, also aliased, copies when its dtype
+    differs."""
     name, args = op["op"], op["args"]
-    if name.startswith(ALLOCATIONS):
+    if name.startswith(ALLOCATIONS) or name == "aten.view.dtype":
         return None
     _, packet, overload = name.split(".")
     target = getattr(getattr(torch.ops.aten, packet), overload)
@@ -567,6 +777,10 @@ EXTRACTORS = {
         "o", "positions", "x_fp8", "x_scale"
     ),
     "aiter._rope_rotate_activation_fp4quant.default": _only(
+        "input", "positions", "out", "scale"
+    ),
+    # The fp8 index query, which a P/D cell's fp8 indexer cache runs.
+    "aiter._rope_rotate_activation_fp8quant.default": _only(
         "input", "positions", "out", "scale"
     ),
     "aiter.batched_gemm_a8w8_mxscale.default": _batched_gemm,
@@ -642,6 +856,7 @@ EXTRACTORS = {
     "aten.embedding.default": _gather("weight"),
     "aten.index.Tensor": _gather("self"),
     "aiter.all_reduce_.default": _all_reduce,
+    "aiter.fused_allreduce_rmsnorm_.default": _fused_all_reduce_norm,
     "_c10d_functional.all_gather_into_tensor.default": _all_gather,
     "_c10d_functional.broadcast.default": _broadcast,
     "_c10d_functional.wait_tensor.default": lambda op, view, tp, kv: None,
@@ -656,8 +871,89 @@ EXTRACTORS = {
     "atom.model_ops.decode_input_ids:fill_deferred_decode_ids": _in_place(),
     "atom.utils.block_convert:kv_indices_generate_triton": _kv_indices,
 }
+#: DeepSeek-V4.1's kinds, gfx1250's and gfx950's. What a lifted leaf writes
+#: past its arguments, and the tables and planes it reads by index, are left
+#: out, which only lowers M.
+V41 = "atom.model_ops.deepseek_v41."
+V41_INDICES = "atom.model_ops.attentions.deepseek_v41.indices:"
+TOPK = "aiter.ops.flydsl.topk.topk_per_row:"
+EXTRACTORS |= {
+    "aten.index_fill_.int_Scalar": _index_fill,
+    "aiter.gemm_a8w8_blockscale.default": _gemm(
+        "XQ", "WQ", "dtype", ("x_scale", "w_scale")
+    ),
+    "aiter.router_logits.default": _gemm("x", "weight"),
+    "atom.model_ops.blockscale:quantize_fp8": _quantize,
+    "aiter.ops.triton.quant.fused_mxfp8_quant:fused_dual_rmsnorm_mxfp8_quant": _mx(
+        "q", "k", read=("q_weight", "k_weight")
+    ),
+    "aiter.dynamic_per_token_scaled_quant.default": _only("input", "out", "scales"),
+    "aiter.dynamic_per_group_scaled_quant.default": _only("input", "out", "scales"),
+    "aiter.v41_mhc_pre_delayed.default": _mhc_delayed,
+    f"{V41}mhc:collapse_streams": _only("residual", "pre_mix"),
+    "atom.model_ops.engram.device.gate:engram_post_wkv": _only(
+        "hidden", "kv", "weight"
+    ),
+    "aiter.rope_cached_positions_fwd_impl.default": _only(
+        "input", "output", "positions"
+    ),
+    f"{V41}rope_window:_launch_rope_window": _only("query", "kv", "positions"),
+    f"{V4}fused_compress:_launch_fused_compress": _only(
+        "kv_in", "score_in", "ape", "rms_weight", "state_slot_mapping", "latent_out"
+    ),
+    f"{V41}index_write:write_index_rows": _only("keys", "plan"),
+    f"{V4}indexer_weights:scale_indexer_weights": _only("weights", "q_scale"),
+    "aiter.pa_sparse_prefill_opus.default": _v4_decode(
+        "q", "attn_sink", "out", queries=_last
+    ),
+    **dict.fromkeys(
+        (
+            FLYDSL + "mqa_logits.fp8_paged_mqa_logits_gfx1250:"
+            "flydsl_fp8_paged_mqa_logits_gfx1250",
+            "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
+        ),
+        _v41_scores("q_fp8"),
+    ),
+    f"{V41}indexer:_block_maxima": _only("visible", "maxima"),
+    TOPK + "flydsl_radix_topk_one_block": _only("row_starts", "row_ends", "indices"),
+    TOPK + "flydsl_top_k_per_row_decode": _only("seq_lens", "indices"),
+    "aiter._top_k_per_row_decode.default": _only("seqLens", "indices"),
+    "atom.model_ops.attentions.token_layout.gather:gather_rows": _gather_rows,
+    **dict.fromkeys(
+        (
+            V41_INDICES + "_launch_indptr_scan",
+            V41_INDICES + "_launch_indices",
+            V41_INDICES + "_launch_window_rows",
+            f"{V41}unit_table:unit_table",
+            f"{V41}candidate_table:candidate_block_table",
+            f"{V41}candidate_table:lift_candidate_selection",
+        ),
+        _launch,
+    ),
+}
+#: DeepSeek-V4.1's DSpark drafter's kinds: its draft-KV pass and its block.
+DSPARK = "atom.model_ops.deepseek_v41.dspark:"
+MARKOV = "atom.model_ops.dspark_markov_sample:"
+EXTRACTORS |= {
+    DSPARK + "fused_draft_kv_tail": _draft_kv_tail,
+    DSPARK + "gather_window_rows": _window_rows,
+    DSPARK + "draft_step_indices": _draft_indices,
+    DSPARK + "build_block_state": _block_state,
+    "atom.model_ops.sparse_attn_v4:_sparse_attn_triton": _block_attention,
+    MARKOV + "_launch": _markov,
+    "aiter.dspark_markov_argmax.default": _markov_argmax,
+    MARKOV + "argmax_gather": _in_place("out"),
+    "atom.spec_decode.dspark_proposer:DSparkProposer._stage_anchors": _only(
+        "next_token_ids", "rows"
+    ),
+    "atom.model_ops.attentions.deepseek_v41.speculative:_launch_commit_cursors": (
+        _commit_cursors
+    ),
+}
 #: Every kind whose extractor takes the EP width, as a fifth parameter.
 SHARDED = {n for n, f in EXTRACTORS.items() if len(inspect.signature(f).parameters) > 4}
+#: Every kind whose experts run the rows that route (`_routing`).
+ROUTED = {n for n, f in EXTRACTORS.items() if f is _fused_moe} | EXPERTS.keys()
 
 
 def work(

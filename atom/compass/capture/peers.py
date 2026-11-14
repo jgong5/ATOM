@@ -5,12 +5,11 @@ A capture runs one rank, rank 0. Where ATOM reads its peers, two rules answer:
 
 * Every peer scheduled what this rank did, but for its token count: the peers
   split evenly the rows the shape's MoE gathers (`Shape.gathered`) less this
-  rank's, the first of them a prefill, as a decode gathering other than every
-  rank's count has a prefilling peer, or each schedules this rank's count when
-  the shape states none. The step's one DP all-gather (`sync_dp_metadata`), the
-  per-rank counts built from it and the sizes read off them (`DPMetadata.make`,
-  `get_sizes_across_dp`) run on the host with these rows. A drafter's pass
-  all-reduces its own count (`DPMetadata.num_tokens_across_dp`): its first
+  rank's (`split`), the first of them a prefill, as a decode gathering other
+  than every rank's count has a prefilling peer, or each schedules this rank's
+  count when the shape states none. The step's one DP all-gather
+  (`sync_dp_metadata`) runs on the host with these rows. A drafter's pass
+  all-reduces its own count (`DPMetadata.gather_running_tokens`): its first
   pass, the target's stream, takes the step's counts; a later one, a row a
   sequence, this rank's at every peer.
 * What the DP group gathers for the MoE, or MORI dispatches to this rank, is
@@ -19,6 +18,8 @@ A capture runs one rank, rank 0. Where ATOM reads its peers, two rules answer:
   drafter's later pass, a row a sequence, takes this rank's rows at every peer.
   The DP reduce-scatter gives back this rank's rows; MORI's combine gives back
   its buffer of `max_num_tokens_per_dp_rank` rows, which ATOM's finalize slices.
+  In a symbolic trace the gathered rows are G, the recorder's symbol, where
+  they are its hint (`forward._Recorder.rows`).
 
 Each exchange is one `declared` op named `module:qualname` for the function
 ATOM calls (`atom.model_ops.moe:all_gatherv`,
@@ -26,11 +27,16 @@ ATOM calls (`atom.model_ops.moe:all_gatherv`,
 ones ATOM passed by that function's parameter names, the group aside; MORI's
 also state the EP width ATOM built their handle for, `num_ep_ranks`, which
 their rows no longer give.
+
+A graph that holds G is put at a G by `at`: G's slots take it, and each DP
+exchange that holds G takes the `sizes` the first rule gives each rank there,
+which ATOM keeps in numpy, where no symbol reaches.
 """
 
 import inspect
 import types
 
+import numpy as np
 import torch
 from torch.utils import _pytree
 
@@ -38,6 +44,68 @@ from atom.compass import ir
 
 #: MORI's dispatch-and-combine handle, whose two calls the EP exchanges are.
 MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp"
+#: The DP exchanges whose `sizes` hold each rank's rows, this rank's first.
+SIZED = ("atom.model_ops.moe:all_gatherv", "atom.model_ops.moe:reduce_scatterv")
+#: G in a graph's JSON (`graph.to_json`).
+SYMBOL = {"symbol": ir.G.name}
+#: What `slots` marks a path to: G itself, or an exchange's `sizes`.
+_G, _SIZES = "G", "sizes"
+
+
+def split(rows: int, local: int, dp: int) -> list[int]:
+    """Each rank's rows of the `rows` a DP group of `dp` gathers, this rank's
+    `local` first: the peers split the rest evenly, the first ones a row more."""
+    each, extra = divmod(rows - local, dp - 1)
+    return [local] + [each + (k < extra) for k in range(dp - 1)]
+
+
+def slots(region) -> list[list]:
+    """Where `region`, a graph's JSON, holds G, as JSON: the path, keyed as
+    the JSON is, to each `SYMBOL`, then ``G``, and to the `sizes` of each
+    exchange of `SIZED` that holds G, then ``sizes``."""
+    found = []
+
+    def walk(node, path) -> bool:
+        if node == SYMBOL:
+            found.append([*path, _G])
+            return True
+        items = node.items() if isinstance(node, dict) else ()
+        items = enumerate(node) if isinstance(node, list) else items
+        # Every item walked: each may hold a slot of its own.
+        held = sum(walk(value, (*path, key)) for key, value in items) > 0
+        op = isinstance(node, dict) and node.get("op") in SIZED
+        if held and op and "sizes" in node["args"]:
+            found.append([*path, "args", "sizes", _SIZES])
+        return held
+
+    walk(region, ())
+    return found
+
+
+def at(region, held: list, g: int, dp: int, restated: bool = True):
+    """`region`, a graph's JSON holding G at the `slots` `held`, at G = `g`:
+    each G `g`, and unless `restated` is false each exchange's `sizes` this
+    rank's then `split`'s over the `dp` ranks. What changes is copied, the
+    rest shared."""
+    trie = {}
+    for *path, what in held:
+        node = trie
+        for key in path[:-1]:
+            node = node.setdefault(key, {})
+        node[path[-1]] = what
+    return _put(region, trie, g, dp, restated)
+
+
+def _put(region, trie: dict, g: int, dp: int, restated: bool):
+    node = region.copy()
+    for key, what in trie.items():
+        if what == _G:
+            node[key] = g
+        elif what == _SIZES:
+            node[key] = split(g, node[key][0], dp) if restated else node[key]
+        else:
+            node[key] = _put(node[key], what, g, dp, restated)
+    return node
 
 
 def _declared(recorder, name, fn, kind=ir.NodeKind.DECLARED, stated=None):
@@ -70,8 +138,7 @@ def patches(recorder):
     from atom.utils.forward_context import DPMetadata
     from atom.utils.tbo import ubatching
 
-    sync, make = ubatching.sync_dp_metadata, DPMetadata.make
-    sizes = DPMetadata.get_sizes_across_dp
+    sync = ubatching.sync_dp_metadata
     dp = get_dp_group().world_size
 
     def on_host(fn, *args, **kwargs):
@@ -84,15 +151,15 @@ def patches(recorder):
         for slot in gathered:
             slot.copy_(local)
         if (rows := recorder.shape.gathered) is not None:
-            each, extra = divmod(rows - int(local[0]), dp - 1)
-            for k, slot in enumerate(gathered[1:]):
-                slot[0] = each + (k < extra)
+            for slot, n in zip(gathered[1:], split(rows, int(local[0]), dp)[1:]):
+                slot[0] = n
             gathered[1][2] = 1  # is_prefill
         counts.clear()
         counts[int(local[0])] = [int(slot[0]) for slot in gathered]
 
-    def num_tokens_across_dp(rows, dp_size, dp_rank):
-        return torch.tensor(counts.get(rows, [rows] * dp_size), dtype=torch.int32)
+    def gather_running_tokens(parallel_config, running_tokens):
+        each = [running_tokens] * parallel_config.data_parallel_size
+        return np.array(counts.get(running_tokens, each), dtype=np.int32)
 
     def sync_dp_metadata(**kwargs):
         gather, dist.all_gather = dist.all_gather, peers
@@ -102,7 +169,9 @@ def patches(recorder):
             dist.all_gather = gather
 
     def rows(x, height):
-        return x.new_empty((height, *x.shape[1:]))
+        if isinstance(x, (list, tuple)):
+            return [rows(t, height) for t in x]
+        return x.new_empty((recorder.rows(height), *x.shape[1:]))
 
     # `sizes` holds this rank's count in slot 0.
     def all_gatherv(x, sizes, group):
@@ -111,23 +180,13 @@ def patches(recorder):
     def reduce_scatterv(x, sizes, group):
         return rows(x, sizes[0])
 
-    def all_gather_with_padding(x, use_cag=True):
-        return rows(x, dp * x.shape[0]), x.shape[0]
-
     def reduce_scatter_with_unpadding(x, local_tokens):
         return rows(x, local_tokens)
 
-    gathers = (
-        all_gatherv,
-        reduce_scatterv,
-        all_gather_with_padding,
-        reduce_scatter_with_unpadding,
-    )
+    gathers = (all_gatherv, reduce_scatterv, reduce_scatter_with_unpadding)
     return [
         (ubatching, "sync_dp_metadata", sync_dp_metadata),
-        (DPMetadata, "make", staticmethod(lambda *a, **k: on_host(make, *a, **k))),
-        (DPMetadata, "get_sizes_across_dp", lambda self: on_host(sizes, self)),
-        (DPMetadata, "num_tokens_across_dp", staticmethod(num_tokens_across_dp)),
+        (DPMetadata, "gather_running_tokens", staticmethod(gather_running_tokens)),
         *(
             (moe, f.__name__, _declared(recorder, f"{moe.__name__}:{f.__name__}", f))
             for f in gathers
@@ -161,6 +220,7 @@ def install_mori(recorder):
         def _dispatch(self, input, weights, scales, indices, **kwargs):
             rows, k = input.shape[0], indices.shape[1]
             n = sum(recorder.counts.get(rows, [rows] * dp)) * group.world_size // dp
+            n = recorder.rows(n)
             return (
                 input.new_empty((n, input.shape[1])),
                 weights.new_empty((n, k)),

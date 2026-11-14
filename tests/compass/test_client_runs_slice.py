@@ -35,7 +35,7 @@ from test_vertical_slice import (
 )
 
 from atom.compass import run as compass_run
-from atom.compass.drive.serve import _free_ports
+from tests.compass.held_ports import held_ports
 
 PROMPTS = ("one request through the slice", "a second client with its own prompt")
 
@@ -57,42 +57,42 @@ def serve(out: Path, prompts) -> list[dict]:
     run's summary, and its stream events and request times less its start."""
     out.mkdir()
     overrides = {"client_runs": len(prompts)} if len(prompts) > 1 else {}
-    clock_port, port = _free_ports(2)
-    endpoint = f"tcp://127.0.0.1:{clock_port}"
-    run_file = _run_file(out, clock_endpoint=endpoint, **overrides)
-    env = dict(
-        os.environ,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        ATOM_DETOKENIZER_DELTA_REUSE="off",
-    )
-    args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
-    args += ["--enforce-eager", "--max-model-len", "2048"]
-    publish_entry(out / "store", DOCUMENT, args, env)
-    with open(out / "server.log", "w") as log:
-        server = subprocess.Popen(
-            [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
-            + ["--compass-run", str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
+    with held_ports(2) as (clock_port, port):
+        endpoint = f"tcp://127.0.0.1:{clock_port}"
+        run_file = _run_file(out, clock_endpoint=endpoint, **overrides)
+        env = dict(
+            os.environ,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            ATOM_DETOKENIZER_DELTA_REUSE="off",
         )
-        watchdog = threading.Timer(WALL_S, server.kill)
-        watchdog.start()
-        clients = []
-        try:
-            for prompt in prompts:
-                run = json.loads(run_file.read_text())
-                traffic = Prompted(prompt, run, port, server)
-                start = traffic.rt.now
-                traffic.run()
-                clients.append((start, traffic))
-            code = server.wait(timeout=120)
-        finally:
-            watchdog.cancel()
-            if server.poll() is None:
-                server.kill()
+        args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
+        args += ["--enforce-eager", "--max-model-len", "2048"]
+        publish_entry(out / "store", DOCUMENT, args, env)
+        with open(out / "server.log", "w") as log:
+            server = subprocess.Popen(
+                [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
+                + ["--compass-run", str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            watchdog = threading.Timer(WALL_S, server.kill)
+            watchdog.start()
+            clients = []
+            try:
+                for prompt in prompts:
+                    run = json.loads(run_file.read_text())
+                    traffic = Prompted(prompt, run, port, server)
+                    start = traffic.rt.now
+                    traffic.run()
+                    clients.append((start, traffic))
+                code = server.wait(timeout=120)
+            finally:
+                watchdog.cancel()
+                if server.poll() is None:
+                    server.kill()
     tail = (out / "server.log").read_text()[-4000:]
     assert code == 0, f"the server exited {code} after the finish:\n{tail}"
     return [

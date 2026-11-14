@@ -16,7 +16,7 @@ import pytest
 import torch
 from test_capture_ir import _ops, _record
 from test_dp_step_max import runner
-from test_op_graph import g
+from test_op_graph import g, in_thread
 from test_op_graph_drafter import _lookup
 from test_work import SPEC
 
@@ -25,6 +25,7 @@ from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.work import gemm, price
 from atom.compass.capture import population_shapes
+from atom.compass.capture.forward import Shape
 from atom.compass.runner import projection
 from atom.utils.forward_context import ForwardMode
 from atom.utils.tbo import ubatching
@@ -51,6 +52,7 @@ def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True, dr
         context_lens=[c for _, c, _ in rows],
         req_ids=list(range(len(rows))),
         produces_output=lambda: output,
+        final_prefill_requests=lambda: prefill,
         is_dummy_run=False,
     )
 
@@ -59,10 +61,11 @@ def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True, dr
         return SimpleNamespace(
             max_bs_across_dp=max([len(rows), *(b for b, _, _ in peers)]),
             any_rank_has_prefill=bool(prefill) or any(p for *_, p in peers),
+            prefill_across_dp=(bool(prefill), *(p for *_, p in peers)),
             any_rank_needs_eager=False,
             max_seqlen_q_across_dp=None,
             tbo_collective_active=False,
-            num_tokens_across_dp=torch.tensor(counts),
+            scheduled_tokens_per_dp_rank=torch.tensor(counts),
             ub_tokens_across_dp=None,
         )
 
@@ -74,11 +77,11 @@ def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True, dr
         enforce_eager=eager,
         step_needs_eager=False,
         capture_sizes=np.array([0] if eager else LADDER, dtype=np.int32),
-        captured_tokens=None,
         is_block_drafter=False,
         tbo_on=False,
         local_tbo=(False, False, 0, 0),
         max_seqlen_q=3,
+        running_tokens_per_dp_rank=np.zeros(1 + len(peers), dtype=np.int32),
     )
     r = runner(None, dp_size=1 + len(peers))
     step = object() if step else None
@@ -191,10 +194,11 @@ def test_the_run_s_lookup_reads_a_prefill_s_drafter_at_its_width(monkeypatch, tm
 def test_a_run_traces_a_prefill_s_drafter_no_graph_holds_at_its_width(
     monkeypatch, tmp_path
 ):
-    from atom.compass.bench import ops
+    from atom.compass import run
 
     traced, lazy = [], {"lazy_traces": 0, "lazy_trace_wall_seconds": 0}
-    monkeypatch.setattr(ops, "_child", lambda *a: traced.append(a[-1]) or {})
+    in_thread(monkeypatch)
+    monkeypatch.setattr(run, "_trace", lambda *a: traced.append(a[-1]) or {})
     stored = {
         ("prefill", "prefill T=9 B=3 W=4", False): g(9, 64, 64),
         ("prefill", "prefill T=9 B=3", True): g(3000, 64, 64),
@@ -206,7 +210,7 @@ def test_a_run_traces_a_prefill_s_drafter_no_graph_holds_at_its_width(
         OpGraphBackend(SPEC, lookup, kv="bf16", drafts=1).price(view)
 
     # A shape, not its text: the capture's cut sets `running_bs` from its width.
-    assert traced == [("prefill", 9, 3, None, 4)] and traced[0].width == 4
+    assert traced == [Shape("prefill", 9, 3, None, 4)] and traced[0].width == 4
     assert lazy["lazy_traces"] == 1
 
 

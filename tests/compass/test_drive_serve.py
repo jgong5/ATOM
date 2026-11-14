@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 """The server driver's lifecycle, against a planted server command that records
 its arguments, starts a child and answers ``/health``; the GPU checks run with
-`test_drive_gpu.py`'s planted ``rocm-smi`` and ``rocminfo``. A refusal test's
-planted server exits at once, so a refusal that regresses fails the test
-rather than hanging it.
+`test_drive_gpu.py`'s planted ``rocm-smi``, ``rocminfo`` and ``preflight.sh``,
+in this process and in a driver's own. A refusal test's planted server exits
+at once, so a refusal that regresses fails the test rather than hanging it.
 """
 
 import json
@@ -20,12 +20,13 @@ from pathlib import Path
 
 import pytest
 from test_drive_gpu import FREE, GPU45, LISTING, _kfd, _plant
+from test_launcher_held_ports import HELD, _squat
 
 from atom.compass.drive import gpu as drive_gpu
 from atom.compass.drive import serve
 from atom.compass.drive.gpu import GpuRefusal
+from atom.compass.memory.check import recorded
 from atom.compass.run import ENV
-from atom.utils import backends
 
 TREE = Path(__file__).resolve().parents[2]
 PLANTED = """\
@@ -65,13 +66,15 @@ if when == "late":
 server.serve_forever()
 """
 #: Starts `serve` on GPU 7 in a process of its own: the planted server, the
-#: directory, then ATOM's arguments.
+#: directory, then ATOM's arguments. The fixture's planted `preflight.sh` comes
+#: in `PLANTED_PREFLIGHT`, since the real one's census reads this host's load.
 DRIVE = """\
-import sys
-from atom.compass.drive import serve
+import os, sys
+from atom.compass.drive import gpu, serve
 serve.SERVER = (sys.executable, sys.argv[1])
 serve.identity = lambda *args: {"identity": "planted"}
 serve.KFD = serve.Path(sys.argv[2], "kfd")
+gpu.PREFLIGHT = serve.Path(os.environ["PLANTED_PREFLIGHT"])
 serve.serve(sys.argv[3:], sys.argv[2], (7,))
 """
 ARGS = ["--model", "m", "-tp", "2", "--kv-transfer-config", '{"kv_role": "x"}']
@@ -84,6 +87,7 @@ def planted(tmp_path, monkeypatch):
     records what it is called with and whether the server's child, in its
     process group, still runs."""
     _plant(tmp_path, monkeypatch, FREE)
+    monkeypatch.setenv("PLANTED_PREFLIGHT", str(drive_gpu.PREFLIGHT))
     (tmp_path / "planted.py").write_text(PLANTED)
     monkeypatch.setattr(serve, "SERVER", (sys.executable, str(tmp_path / "planted.py")))
     monkeypatch.setenv("PLANTED_DIR", str(tmp_path))
@@ -101,7 +105,7 @@ def planted(tmp_path, monkeypatch):
 def _running(pid) -> bool:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # reaped before or mid-read
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
@@ -156,7 +160,7 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_its_ranks_used(
     planted, monkeypatch
 ):
     root = planted / "home/.cache/atom"
-    monkeypatch.setattr(backends, "VLLM_CACHE_ROOT", str(root))
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(root))
     mine = root / "torch_compile_cache/0123456789"
     other = root / "torch_compile_cache/9876543210"
     other.mkdir(parents=True)
@@ -169,6 +173,99 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_its_ranks_used(
 
     assert not mine.exists()
     assert other.exists() and configured.exists()
+
+
+#: Four runners of a DP2 TP2 engine, forked once ATOM's logger is set up under
+#: this process's environment, each logging through it what the readers of an
+#: engine's log read: its ranks, a compiled-graph directory it used under
+#: `RUNNERS_CACHE`, its warmup and its Memory budget line, at non_torch
+#: 10.<dp><tp> GB. Writes the environment's ATOM_LOG_MORE to `RUNNERS_SEEN`.
+RUNNERS = """\
+import os
+from atom.utils import logger
+with open(os.environ["RUNNERS_SEEN"], "w") as f:
+    f.write(os.environ.get("ATOM_LOG_MORE", "unset"))
+cache = os.path.join(os.environ["RUNNERS_CACHE"], "torch_compile_cache")
+for dp, tp in ((0, 0), (0, 1), (1, 0), (1, 1)):
+    if os.fork() == 0:
+        used = os.path.join(cache, f"dp{dp}tp{tp}", "rank_0", "backbone")
+        os.makedirs(used)
+        logger.info("ModelRunner rank=%d, dp_rank_local=%d, pp_rank=0", tp, dp)
+        logger.info("Using cache directory: %s for vLLM's torch.compile", used)
+        logger.info("Model Runner%d/2: warmup_model 2.2 seconds with 1 reqs 64 tokens", tp)
+        logger.info("Memory budget: peak_torch=3.87GB, non_torch=10.%d%dGB", dp, tp)
+        os._exit(0)
+for _ in range(4):
+    os.wait()
+"""
+
+
+def runners_logged(log: Path, cache: Path) -> None:
+    """Assert `log` was written as `RUNNERS` writes it under ATOM_LOG_MORE:
+    `memory.check` reads each DP rank's TP lines in TP order, and the stop
+    removed every directory the runners used."""
+    for dp in (0, 1):
+        runs, _ = recorded(log, 2, tp=2, dp=dp)
+        read = [r.by_name()["non_torch"].nbytes for r in runs]
+        assert read == [round(float(f"10.{dp}{tp}") * (1 << 30)) for tp in (0, 1)]
+    assert not any((cache / "torch_compile_cache").iterdir())
+
+
+@pytest.mark.parametrize(
+    "widths, seen",
+    [
+        (["-dp", "2", "-tp", "2"], "1"),
+        (["--data_parallel_size=2", "--tensor-parallel-size", "2"], "1"),
+        (["-tp", "2"], "unset"),
+        (["-dp", "2"], "unset"),
+        (["-dp", "2", "-tp", "2", "--enable_dp_attention"], "unset"),
+    ],
+)
+def test_a_server_at_dp_and_tp_above_1_logs_each_line_s_process(
+    planted, monkeypatch, widths, seen
+):
+    (planted / "planted.py").write_text(RUNNERS + PLANTED)
+    monkeypatch.delenv("ATOM_LOG_MORE", raising=False)
+    monkeypatch.setenv("RUNNERS_SEEN", str(planted / "seen"))
+    monkeypatch.setenv("RUNNERS_CACHE", str(planted / "cache"))
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(planted / "cache"))
+    monkeypatch.setenv("PLANTED_EXIT", "late:0")
+    out = planted / "out"
+
+    serve.serve(["--model", "m", *widths], out, (7,))
+
+    assert (planted / "seen").read_text() == seen
+    if seen == "1":
+        runners_logged(out / serve.LOG_FILE, planted / "cache")
+
+
+#: The stop's cache removal in a process of its own: what it imports, then,
+#: after it, the root ATOM's backends module derives its cache directories from.
+DROP_ALONE = """\
+import sys
+from atom.compass.drive import serve
+loaded = set(sys.modules)
+serve.drop_compiled(sys.argv[1])
+assert set(sys.modules) == loaded, sorted(set(sys.modules) - loaded)
+from atom.utils.backends import VLLM_CACHE_ROOT
+assert serve.CACHE_ROOT == VLLM_CACHE_ROOT, (serve.CACHE_ROOT, VLLM_CACHE_ROOT)
+"""
+
+
+def test_the_stop_imports_no_module_and_removes_under_atom_s_cache_root(tmp_path):
+    """No import, so no HIP context in the calling process, which
+    `HIP_VISIBLE_DEVICES` does not narrow and the other side's GPU check sees."""
+    used = tmp_path / ".cache/atom/torch_compile_cache/0123456789/rank_0/backbone"
+    used.mkdir(parents=True)
+    log = tmp_path / serve.LOG_FILE
+    log.write_text(f"Using cache directory: {used} for vLLM's torch.compile\n")
+    env = dict(os.environ, PYTHONPATH=str(TREE), HOME=str(tmp_path))
+    drop = [sys.executable, "-c", DROP_ALONE, str(log)]
+    done = subprocess.run(
+        drop, env=env, capture_output=True, text=True, timeout=300, check=False
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    assert not used.parents[1].exists()
 
 
 def test_a_simulated_server_gets_its_run_file_and_clock_and_no_gpu_check(
@@ -441,6 +538,98 @@ def test_no_port_a_server_draws_is_in_deploy_sh_s_range_or_mooncake_s(
     monkeypatch.setattr(serve, "PORT_RANGE", tmp_path / "range")
     mooncake, deploy = range(15000, 17001), serve.below_ephemeral(serve.DEPLOY_PORTS)
 
-    drawn = [p for _ in range(250) for p in serve._free_ports(4)]
+    drawn = []
+    for _ in range(250):
+        with serve._held_ports(4) as ports:
+            drawn += ports
 
     assert not [p for p in drawn if p in mooncake or p in deploy]
+
+
+#: A planted server whose one worker, on SIGTERM, blocks `BLOCKED_S` before it
+#: writes its step record and exits, as a worker in a Mooncake sync write does.
+#: The server stops it as ATOM's runner manager does: it waits
+#: ATOM_SHUTDOWN_TIMEOUT_S, as ATOM reads it, then kills it.
+RECORDED = """\
+import http.server, os, signal, subprocess, sys, time
+from atom.utils import envs
+d, record = os.environ["PLANTED_DIR"], os.environ["ATOM_COMPASS_PARITY_RECORD"]
+os.makedirs(record)
+open(record + "/dp0.engine.json", "w").close()
+worker = subprocess.Popen([sys.executable, "-c", os.environ["PLANTED_WORKER"], record])
+while not os.path.exists(record + "/dp0.jsonl"):
+    time.sleep(0.05)
+with open(d + "/child", "w") as f:
+    f.write(str(worker.pid))
+
+def stop(*_):
+    try:
+        worker.wait(timeout=envs.ATOM_SHUTDOWN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        worker.kill()
+    os._exit(0)
+
+signal.signal(signal.SIGTERM, stop)
+
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+port = int(sys.argv[sys.argv.index("--server-port") + 1])
+http.server.HTTPServer(("127.0.0.1", port), Health).serve_forever()
+"""
+BLOCKED_S = 7
+WORKER = f"""\
+import signal, sys, time
+steps = sys.argv[1] + "/dp0.jsonl"
+
+def stop(*_):
+    time.sleep({BLOCKED_S})
+    with open(steps, "a") as f:
+        f.write('{{"step": 0}}\\n')
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, stop)
+open(steps, "w").close()
+time.sleep(600)
+"""
+
+
+def test_a_worker_blocked_past_atom_s_default_wait_at_the_stop_keeps_its_record(
+    planted, monkeypatch
+):
+    """The named result: the worker blocks 7 s at SIGTERM, past ATOM's 5 s
+    default wait, and its step record still holds its line after the stop."""
+    monkeypatch.delenv("ATOM_SHUTDOWN_TIMEOUT_S", raising=False)
+    (planted / "recorded.py").write_text(RECORDED)
+    out = planted / "out"
+    env = dict(os.environ, PYTHONPATH=str(TREE), PLANTED_WORKER=WORKER)
+    driver = subprocess.Popen(
+        [sys.executable, "-c", DRIVE, str(planted / "recorded.py"), str(out), *ARGS],
+        env=env,
+    )
+    _ready(out, driver, 600, 0.05)
+    driver.send_signal(signal.SIGTERM)
+    assert driver.wait(timeout=serve.STOP_GRACE_S) == 0
+    lines = (out / serve.STEPS / "dp0.jsonl").read_text().splitlines()
+    assert lines == ['{"step": 0}']
+
+
+def test_each_port_a_server_is_handed_is_held_from_another_process_first(
+    planted, monkeypatch
+):
+    monkeypatch.setenv("PLANTED_EXIT", "late:0")
+    popen, squatted = subprocess.Popen, []
+
+    def squatting(argv, **kwargs):
+        if argv[:2] == list(serve.SERVER):
+            ports = [argv[argv.index(flag) + 1] for flag in ("--server-port", "--port")]
+            run = json.loads(Path(argv[argv.index("--compass-run") + 1]).read_text())
+            ports += [run["clock_endpoint"].rsplit(":", 1)[1]]
+            squatted.extend(_squat(*ports, kwargs["env"]["ATOM_DP_MASTER_PORT"]))
+        return popen(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", squatting)
+    serve.serve(ARGS, planted / "out", run={})
+    assert squatted == [HELD] * 4

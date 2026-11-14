@@ -65,6 +65,8 @@ def pack_rows(values, scales):
 def _write_window(
     values,
     scales,
+    values_stride,
+    scales_stride,
     pool,
     positions,
     batches,
@@ -96,32 +98,64 @@ def _write_window(
     slot = tl.load(slots + batch).to(tl.int64)
     row = ring_start + slot * SLOT_BYTES + (pos % WINDOW) * (D + D // 32)
     d = tl.arange(0, BLOCK)
-    v = tl.load(values + t * D + d, d < D, other=0)
-    s = tl.load(scales + t * (D // 32) + d, d < D // 32, other=127)
+    v = tl.load(values + t * values_stride + d, d < D, other=0)
+    s = tl.load(scales + t * scales_stride + d, d < D // 32, other=127)
     tl.store(pool + row + d, v, (d < D) & keep)
     tl.store(pool + row + D + d, s, (d < D // 32) & keep)
 
 
 def write_packed_window(values, scales, pool, step, window, dim, cached_until=None):
-    """`cached_until`: as `swa_write`'s, per request the position below which
-    its ring keeps the rows it holds; None writes every row."""
+    """`values` / `scales`: a token's FP8 bytes and E8M0 codes, rows of any
+    stride. `cached_until`: as `swa_write`'s, per request the position below
+    which its ring keeps the rows it holds; None writes every row."""
     if step.width:
-        _write_window[(step.width,)](
-            values.view(torch.uint8),
-            scales.view(torch.uint8),
+        _launch_write_window(
+            values,
+            scales,
             pool,
             step.positions,
             step.batch_ids,
             step.cu_seqlens_q,
             step.slots,
-            window.ring_start,
-            step.positions if cached_until is None else cached_until,
-            cached_until is not None,
-            window.slot_rows,
-            window.ring_slots,
-            dim,
-            triton.next_power_of_2(dim),
+            window,
+            cached_until,
+            dim=dim,
         )
+
+
+def _launch_write_window(
+    values,
+    scales,
+    pool,
+    positions,
+    batch_ids,
+    cu_seqlens_q,
+    slots,
+    window,
+    cached_until,
+    *,
+    dim,
+):
+    """`write_packed_window`'s launch, from the step's fields it reads: no
+    `BatchStep`, whose per-request host state the kernel does not read."""
+    _write_window[(positions.numel(),)](
+        values.view(torch.uint8),
+        scales.view(torch.uint8),
+        values.stride(-2),
+        scales.stride(-2),
+        pool,
+        positions,
+        batch_ids,
+        cu_seqlens_q,
+        slots,
+        window.ring_start,
+        positions if cached_until is None else cached_until,
+        cached_until is not None,
+        window.slot_rows,
+        window.ring_slots,
+        dim,
+        triton.next_power_of_2(dim),
+    )
 
 
 @triton.jit(do_not_specialize=["first", "end", "CAPACITY"])

@@ -20,22 +20,28 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_artifact_store import CONDITIONS, GATES, stanza
+from test_artifact_store import stanza
 from test_backend_step_linear import _installed, view
-from test_capture_ir import TREE, _ops, _record
+from test_capture_ir import MAIN, TREE, _ops, _record
 from test_dp_step_max import runner
 from test_memory_readings import WORKER
 from test_op_graph import FLAT, GEMM, MIDDLE, _engine, by_name, g
-from test_op_graph_arch import ENGINE
+from test_op_graph_arch import ENGINE, run_readings
 from test_work import SPEC
 
-from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
+from atom.compass.artifacts import (
+    ArtifactStore,
+    GateState,
+    Kind,
+    Topology,
+    member_name,
+)
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import gemm, price
-from atom.compass.capture import forward, population_shapes
+from atom.compass.capture import graph_key, population_shapes
 from atom.compass.capture.forward import structure
 from atom.compass.run import _op_graphs
 from atom.compass.runner import projection
@@ -85,7 +91,7 @@ def capture(drafts, tmp_path_factory, shape=("--width", "2"), dp=1):
         [
             sys.executable,
             "-c",
-            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            MAIN,
             *argv,
         ],
         capture_output=True,
@@ -205,15 +211,6 @@ def test_a_run_prices_a_middle_chunk_s_draft_kv_pass_from_its_own_graph(
     assert {t.name: t.seconds for t in cost.draft_terms} == drafted(1)
 
 
-def test_a_block_drafter_is_refused_by_name_before_any_step():
-    class DSparkProposer:
-        is_block_drafter = True
-
-    runner = SimpleNamespace(drafter=DSparkProposer())
-    with pytest.raises(ValueError, match="DSparkProposer writes its draft KV before"):
-        forward._drafter(runner, None)
-
-
 FINAL = BatchView((RequestShape(9, 9, False),), produces_output=True)
 
 
@@ -266,7 +263,9 @@ def test_a_step_under_a_drafter_with_no_draft_to_price_is_refused_by_name(
 
 
 def test_a_run_file_op_graph_under_a_drafter_prices_its_drafts(monkeypatch, tmp_path):
-    drafter = SimpleNamespace(method="mtp", num_speculative_tokens=2)
+    drafter = SimpleNamespace(
+        method="mtp", num_speculative_tokens=2, use_dspark=lambda: False
+    )
     monkeypatch.setitem(WORKER, "speculative_config", drafter)
 
     assert _installed(monkeypatch, tmp_path, op_graph=True).drafts == 2
@@ -297,7 +296,11 @@ def dp_view(width, rung, dp, counts=None):
     r.drafter = SimpleNamespace(is_block_drafter=False, mtp_k=1)
     counts = torch.tensor(counts or [2 * width] * dp)
     mode = SimpleNamespace(
-        sync=SimpleNamespace(num_tokens_across_dp=counts, ub_tokens_across_dp=None),
+        sync=SimpleNamespace(
+            scheduled_tokens_per_dp_rank=counts,
+            ub_tokens_across_dp=None,
+            any_rank_needs_eager=False,
+        ),
         running_tokens_are_unified=True,
         running_tokens=2 * rung,
         running_bs=rung,
@@ -341,7 +344,7 @@ def test_a_dp_drafter_beside_a_prefilling_peer_gathers_the_step_s_rows(
     root, graphs = capture(1, tmp_path_factory, dp=2)
     [target] = [key for key in graphs if not key.endswith(" draft")]
     store, rank = ArtifactStore(str(root / "store")), Topology().ranks()[0]
-    key = Key.of(Kind.OP_GRAPH, structure=f"{target} draft", shape="decode B=2 G=20")
+    key = graph_key(f"{target} draft", "decode B=2 G=20")
     drafter = json.loads(store.read(key).read_member("graph", rank, "json"))
 
     # Its first pass gathers this rank's 4 verified tokens and the peer's 16.
@@ -369,11 +372,11 @@ def _lookup(tmp_path, dp, stored, *lazily):
     for (phase, shape, draft), region in stored.items():
         at = structure(config, phase, True, "gfx950", True, draft)
         store.publish(
-            Key.of(Kind.OP_GRAPH, structure=at, shape=shape),
+            graph_key(at, shape),
             provenance=stanza("compass trace ops"),
             topology=Topology(),
-            conditions=CONDITIONS,
-            gates=GATES,
+            conditions=run_readings(config.model),
+            gates=GateState.of(),
             members={
                 member_name("graph", rank, "json"): json.dumps(
                     {"region": region}
@@ -466,9 +469,10 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
     r.drafter = SimpleNamespace(is_block_drafter=False, mtp_k=1)
     mode = SimpleNamespace(
         sync=SimpleNamespace(
-            num_tokens_across_dp=torch.tensor([64, 64]),
+            scheduled_tokens_per_dp_rank=torch.tensor([64, 64]),
             max_bs_across_dp=1,
             ub_tokens_across_dp=None,
+            any_rank_needs_eager=False,
         ),
         running_tokens_are_unified=False,
         running_tokens=64,
@@ -512,7 +516,7 @@ def _population(tmp_path_factory, line, drafts):
         [
             sys.executable,
             "-c",
-            "import sys; from atom.compass.cli import main; main(sys.argv[1:])",
+            MAIN,
             *argv,
         ],
         capture_output=True,
@@ -583,7 +587,10 @@ def test_a_decode_padded_to_its_rung_prices_its_drafter_at_its_rows(
     padded, full = backend.price(verify_view(3, 4)), backend.price(verify_view(4, 4))
 
     assert padded.draft_terms[-1].provenance.detail.endswith("decode T=3 B=4")
-    assert padded.target_seconds == full.target_seconds
+    # Its target ran at its rung, its experts on its 6 tokens of the 8 rows.
+    target = [{t.name: t.seconds for t in cost.terms} for cost in (padded, full)]
+    experts = [terms.pop(f"op.{MOE}") for terms in target]
+    assert target[0] == target[1] and experts[0] < experts[1]
     # The rung's drafter, which this step read before, prices more than runs.
     assert 0 < padded.draft_seconds < full.draft_seconds
 

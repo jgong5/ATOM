@@ -188,6 +188,27 @@ pub fn start() {
     });
 }
 
+/// `builder` for the router's client to the workers: under the router LP, with
+/// no TCP user timeout. A frontend leaves a request's body unread until the
+/// clock releases the request, which can take more wall time than reqwest's
+/// default of 30 s, so a large body's send would end there.
+pub fn worker_client(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    match LP.get() {
+        Some(_) => held_sends(builder),
+        None => builder,
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+fn held_sends(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder.tcp_user_timeout(None)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+fn held_sends(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
+}
+
 fn kind(channel: &str) -> &str {
     channel.rsplit(':').next().unwrap_or_default()
 }
@@ -217,25 +238,37 @@ impl Lp {
     }
 
     /// Run each task due by `time`, in deadline then registration order, with
-    /// the policies' clock at its deadline.
-    fn fire(&self, time: f64) {
+    /// the policies' clock at its deadline. The clock was at `at`: a deadline
+    /// past it is a step the router takes on its own. Returns the clock.
+    fn fire(&self, time: f64, mut at: f64, client: &mut ClockClient) -> f64 {
         while self.next_due() <= time {
             let mut timers = self.timers.lock();
             let first = timers.iter_mut().min_by(|a, b| a.due.total_cmp(&b.due));
             let timer = first.expect("a due task");
+            if timer.due > at {
+                client.step(f64::INFINITY, timer.due);
+                at = timer.due;
+            }
             determinism::set_now(timer.due);
             (timer.task)();
             timer.due += timer.every;
         }
+        at
     }
 
     /// Ask for the next event until the `+inf` grant, handing each release
-    /// the client until it is handled.
+    /// the client until it is handled. A message released ahead of the grant
+    /// is reached by a step the router takes on its own.
     async fn serve(&self, mut client: ClockClient) -> Result<(), ClockError> {
         loop {
             let grant = client.next_event(f64::INFINITY, self.next_due()).await?;
+            let mut at = grant.time;
             for message in grant.released {
-                self.fire(message.arrival);
+                at = self.fire(message.arrival, at, &mut client);
+                if message.arrival > at {
+                    client.step(f64::INFINITY, message.arrival);
+                    at = message.arrival;
+                }
                 determinism::set_now(message.arrival);
                 let take = self.taken(&message.channel, message.seq).await;
                 let (back, done) = oneshot::channel();
@@ -252,7 +285,7 @@ impl Lp {
             if grant.time == f64::INFINITY {
                 return Ok(());
             }
-            self.fire(grant.time);
+            self.fire(grant.time, at, &mut client);
         }
     }
 
@@ -536,7 +569,11 @@ where
                     }
                     match upstream.next().await {
                         Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
-                        Some(Err(error)) => return Some((Err(error), (upstream, buf, guard))),
+                        Some(Err(error)) => {
+                            // The client sees only a cut body; this names the cause.
+                            error!("router LP: request {request:?}'s stream from {from} failed: {error:?}");
+                            return Some((Err(error), (upstream, buf, guard)));
+                        }
                         None if buf.is_empty() => return None,
                         None => {
                             let rest = Bytes::from(std::mem::take(&mut buf));
@@ -592,6 +629,37 @@ mod tests {
     use super::{header, stamp, Handling, REQUEST};
     use std::cell::RefCell;
 
+    /// A send to a worker that leaves the body unread for 40 wall seconds, as a
+    /// frontend holding a request does: reqwest's own client ends it at its
+    /// 30 s TCP user timeout, the router LP's goes on waiting.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_held_send_outlasts_30_wall_seconds() {
+        use super::held_sends;
+        use std::time::Duration;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            loop {
+                accepted.push(listener.accept().await.unwrap().0);
+            }
+        });
+        let send = |builder: reqwest::ClientBuilder| {
+            let post = builder.build().unwrap().post(&url).body(vec![b'x'; 64 << 20]);
+            tokio::time::timeout(Duration::from_secs(40), post.send())
+        };
+        let (plain, lp) = tokio::join!(
+            send(reqwest::Client::builder()),
+            send(held_sends(reqwest::Client::builder()))
+        );
+        eprintln!("reqwest's client: {plain:?}; the router LP's: {lp:?}");
+        assert!(matches!(plain, Ok(Err(_))));
+        assert!(lp.is_err());
+        held.abort();
+    }
+
     #[test]
     fn restamped_entry_goes_first_within_32_entries() {
         let placed = Handling {
@@ -605,6 +673,64 @@ mod tests {
         assert_eq!(sent.len(), 32);
         assert_eq!(sent[..3], ["compass=a:2.0;s:1", "k=v", "k0=v"]);
         assert_eq!(sent[31], "k29=v");
+    }
+
+    /// A grant's messages past its time, and a task due among them, are each
+    /// a step the router takes on its own and reports with its next request.
+    #[tokio::test]
+    async fn messages_and_tasks_past_the_grant_are_its_own_steps() {
+        use super::{ClockClient, Lp, Timer};
+        use serde_json::json;
+        use std::{
+            collections::{BTreeMap, HashMap},
+            sync::{atomic::AtomicBool, Arc},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+        let http = "traffic->router:http";
+        let replies = [
+            json!({"kind": "JOINED", "now": 0.0, "seqs": {}}),
+            json!({"kind": "GRANT", "G": 0.5, "ceiling": 3.0,
+                   "released": {"traffic->router:http": [[0, 0.5], [1, 1.0], [2, 2.0]]}}),
+            json!({"kind": "GRANT", "G": "+inf", "released": {}}),
+        ];
+        let served = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut read = Vec::new();
+            for reply in replies {
+                let mut body = vec![0; sock.read_u32().await.unwrap() as usize];
+                sock.read_exact(&mut body).await.unwrap();
+                read.push(String::from_utf8(body).unwrap());
+                let body = reply.to_string();
+                sock.write_u32(body.len() as u32).await.unwrap();
+                sock.write_all(body.as_bytes()).await.unwrap();
+            }
+            read
+        });
+        let lp = Arc::new(Lp::new(HashMap::new(), BTreeMap::new()));
+        lp.timers.lock().push(Timer {
+            due: 1.5,
+            every: 10.0,
+            stopped: Arc::new(AtomicBool::new(false)),
+            task: Box::new(|| {}),
+        });
+        for seq in 0..3 {
+            let lp = lp.clone();
+            tokio::spawn(async move { drop(lp.hold(http, seq).await) });
+        }
+        let client = ClockClient::bind(&endpoint, "router").await.unwrap();
+        lp.serve(client).await.unwrap();
+        let read = served.await.unwrap();
+        assert_eq!(read[1], r#"{"kind":"NER","log":[],"t":"+inf","t_daemon":1.5}"#);
+        assert_eq!(
+            read[2],
+            concat!(
+                r#"{"ahead":true,"kind":"NER","log":[],"steps":[["NER","+inf",1.0,0],"#,
+                r#"["NER","+inf",1.5,0],["NER","+inf",2.0,0]],"t":"+inf","t_daemon":11.5}"#,
+            )
+        );
     }
 
     #[test]

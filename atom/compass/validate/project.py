@@ -16,8 +16,9 @@ measured time, which is another device's. Each cell is priced in a process of
 its own, since a build declares one engine per process.
 
 The `projection` published in S states, per cell and granularity, the steps
-priced and refused by reason, the projected seconds per phase, and the tokens
-a second over the steps priced; per granularity, the cells ranked by those
+priced and refused by reason, the projected seconds per phase (under a
+drafter, the target's, its drafter's apart in `draft_s`), and the tokens a
+second over the steps priced; per granularity, the cells ranked by those
 tokens a second, its first (top-1) and first three (top-3); and each field of
 SPEC whose origin is `assumed` that a price read, with its value, and for an
 assumed arch the compute units and stepping its op_graphs were traced at.
@@ -45,9 +46,8 @@ from atom.compass.artifacts import (
     Key,
     Kind,
     Provenance,
-    Reading,
     Topology,
-    machine_spec_key,
+    machine_platform,
     member_name,
     roots_for,
 )
@@ -60,7 +60,6 @@ PROG = "compass project"
 #: What a projected device takes from the probed one as it stands, no
 #: datasheet stating it.
 CARRIED = (
-    "host.",
     "device.kernel_floor_s",
     "device.software_pinned_to.",
     "interconnect.intra_node.link_latency_s",
@@ -99,7 +98,7 @@ def projected(target: MachineSpec, source: MachineSpec) -> MachineSpec:
         },
     }
     values["name"] = f"{target.values['name']} at {source.values['name']} ratios"
-    echo = MachineSpec(values, source.tokenizers).echo()
+    echo = MachineSpec(values).echo()
     return MachineSpec.from_mapping(echo)
 
 
@@ -136,7 +135,7 @@ def cell(model: str, tp: int, machine: dict, store: str, record: str, atom_args)
     for level, r in report.items():
         rate = r["ranking"] and r["ranking"]["tokens_per_s"][record]["analytical"]
         held = ("steps", "steps_refused", "refused", "analytical_s", "by_bound")
-        levels[level] = {k: r[k] for k in held} | {"tokens_per_s": rate}
+        levels[level] = {k: r[k] for k in (*held, "draft_s")} | {"tokens_per_s": rate}
     return {
         "model": _file_digest(config.model, "config.json"),
         "engine": keyed(config, ladder=False),
@@ -192,7 +191,7 @@ def scaled(machine: MachineSpec, path: str, factor: float):
         values[path] = min(machine.value(path) * factor, 1.0)
     else:
         capped, values[path] = False, machine.value(path) * factor
-    return MachineSpec(values, machine.tokenizers), capped
+    return MachineSpec(values), capped
 
 
 def band(machine: MachineSpec, assumed: dict, jobs: list, base: dict) -> dict:
@@ -247,22 +246,22 @@ def projection(machine: MachineSpec, cells: dict) -> dict:
 
 def publish(store: str, document: dict, cells: dict, machine, command: str):
     """Publish `document` in `store` as a `projection`, keyed by its model,
-    spec, ATOM tree and cells."""
+    spec, ATOM source, cells and this process's torch."""
     import torch
 
-    from atom.compass.run import host_cpu
+    from atom.compass.run import atom_source, host_cpu, source_root
 
     model = next(iter(cells.values()))[1]["model"]
     roots = roots_for({"atom": "atom", "aiter": "aiter"})
-    atom = next(r for r in roots if r.name == "atom")
     engines = json.dumps([c["engine"] for _, c in cells.values()], sort_keys=True)
     identity = json.dumps([[c["steps"], c["engine"]] for _, c in cells.values()])
     key = Key.of(
         Kind.PROJECTION,
         model=model,
         spec=machine.digest(),
-        source_root=f"{atom.revision_kind}-{atom.revision}",
+        source_root=source_root(),
         cells=f"sha256:{hashlib.sha256(identity.encode()).hexdigest()}",
+        torch=torch.__version__,
     )
     rank = Topology().ranks()[0]
     ArtifactStore(store).publish(
@@ -272,9 +271,8 @@ def publish(store: str, document: dict, cells: dict, machine, command: str):
         ),
         topology=Topology(),
         conditions=Conditions.of(
-            **machine_spec_key(machine).values,
-            torch=torch.__version__,
-            atom_src=Reading.of_source_root(atom),
+            **{**machine_platform(machine), "torch": torch.__version__},
+            atom_src=atom_source(),
             model=model,
             host_cpu=host_cpu(),
             engine_config=engines,
@@ -306,6 +304,7 @@ def text(document: dict) -> str:
                 f"refused, {rate} tokens/s; {phases}"
             )
             out += [f"    refused {n} steps: {why}" for why, n in r["refused"].items()]
+            out += [f"    drafter: {p} {t:.2f} s" for p, t in r["draft_s"].items()]
             parts = fold_parts(r["by_bound"].values())
             whole = fold_seconds(parts.values())
             shares = ", ".join(

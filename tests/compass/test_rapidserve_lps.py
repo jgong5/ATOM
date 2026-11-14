@@ -45,7 +45,7 @@ FLAGS = ["--enable-rapidserve"]
 
 def _table():
     return single_engine_table(
-        admission_path="serving", ipc_s=IPC, stream_s=IPC, rapidserve=True
+        admission_s=0.54e-3, ipc_s=IPC, stream_s=IPC, rapidserve=True
     )
 
 
@@ -60,12 +60,12 @@ def test_the_two_engines_join_the_frontend_and_each_other():
     assert "frontend->engine-D:request#dp1" in names
     with pytest.raises(ValueError, match="ipc_s is 0.0"):
         single_engine_table(
-            admission_path="serving", ipc_s=0.0, stream_s=IPC, rapidserve=True
+            admission_s=0.54e-3, ipc_s=0.0, stream_s=IPC, rapidserve=True
         )
 
 
 def test_the_run_file_key_builds_the_table_every_lp_reads():
-    run = {"admission_path": "serving", "ipc_s": IPC, "stream_s": IPC}
+    run = {"admission_s": 0.54e-3, "ipc_s": IPC, "stream_s": IPC}
     assert compass_run.channel_table({**run, "rapidserve": True}).channel(BLOCKS_CH)
     with pytest.raises(KeyError):
         compass_run.channel_table(run).channel(BLOCKS_CH)
@@ -92,7 +92,7 @@ def test_each_engine_names_its_channels_by_the_index_its_frontend_gives_it(
 ):
     rt = LPRuntime(lp, _table(), None)
     monkeypatch.setattr(clock, "_installed", rt)
-    relay = clock.relay_queue(0)
+    relay = clock.relay_queue(SimpleNamespace(data_parallel_rank=0))
     clock.name_endpoints(0, "in", "ctl", "out", _engine_config(decode))
     assert relay.wsock.ch == f"{lp.name}->frontend:output{tag}"
     kinds = [rt.endpoints[a] for a in ("in", "out", "p2d", "d2p")]

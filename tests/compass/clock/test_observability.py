@@ -5,7 +5,7 @@
   when off, one record per reply in issue order, the recovery marker on
   exactly the replies the recovery branch issued, and every released message
   and every logged send in exactly one record.
-* **The stall diagnostic**: the serve loop logs one LP table per stall, counts
+* **The stall diagnostic**: the serve side logs one LP table per stall, counts
   it, keeps waiting and aborts nothing; each runtime counts its own.
 * **The dump** renders `lp_table()` and nothing else, with the binding term
   marked, and no term marked when none is finite.
@@ -184,7 +184,7 @@ def test_a_log_that_would_write_nothing_anywhere_is_refused():
 
 
 def test_the_finish_records_one_reply_per_lp_from_the_clock_it_finished_at():
-    table = single_engine_table(admission_path="serving", ipc_s=1.0e-4, stream_s=2.0e-3)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=1.0e-4, stream_s=2.0e-3)
     engine, frontend, traffic = table.registry.ids()
     ca = ClockAuthority(table, TimelineLog())
     ca.on_request(engine, NER, INF, [])
@@ -309,7 +309,7 @@ def test_a_stall_is_logged_again_only_after_a_request_and_never_before_all_ask(
 
 
 def test_a_client_run_counts_the_stalls_printed_during_it():
-    table = single_engine_table(admission_path="serving", ipc_s=1.0e-4, stream_s=2.0e-3)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=1.0e-4, stream_s=2.0e-3)
     engine, frontend, traffic = table.registry.ids()
     ca = ClockAuthority(table, client=traffic, client_runs=2)
     for stalls in (2, 1):
@@ -319,6 +319,22 @@ def test_a_client_run_counts_the_stalls_printed_during_it():
         ca.on_request(traffic, NER, INF, [])
     assert [run.diagnostics for run in ca.ended] == [2, 1]
     assert ca.diagnostics == 3 and ca.final_clocks is not None
+
+
+def test_a_client_runs_summary_counts_the_calls_served_up_to_its_end():
+    """Each end keeps the calls served, as it keeps the grants, for the
+    summary that client run writes."""
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=1.0e-4, stream_s=2.0e-3)
+    engine, frontend, traffic = table.registry.ids()
+    ca = ClockAuthority(table, client=traffic, client_runs=2)
+    for _ in range(2):
+        for lp in (engine, frontend, traffic):
+            ca.on_request(lp, NER, INF, [])
+    first, second = (RunSummary.of(run, 0.1).cost_record() for run in ca.ended)
+    names = [lp.name for lp in (engine, frontend, traffic)]
+    assert first["requests"] == [[name, 1] for name in names]
+    assert second["requests"] == [[name, 2] for name in names]
+    assert (first["requests_total"], second["requests_total"]) == (3, 6)
 
 
 def test_a_runtime_counts_its_unhandled_release_diagnostic():
@@ -466,10 +482,6 @@ def test_a_duration_that_is_not_a_finite_number_is_refused_where_it_enters():
             RunSummary.of(ca, bad)
         with pytest.raises(ValueError, match="lazy_trace_wall_seconds must be"):
             RunSummary.of(ca, 0.1, lazy_trace_wall_seconds=bad)
-        with pytest.raises(ValueError, match="^refused_predicted_seconds must be"):
-            RefusalTally.of([], 1, refused_predicted_seconds=bad)
-        with pytest.raises(ValueError, match="^predicted_seconds must be"):
-            RefusalTally.of([], 1, predicted_seconds=bad)
 
 
 def test_the_by_value_fields_land_in_their_halves():
@@ -500,7 +512,7 @@ def test_a_clean_run_ended_by_end_workload_and_a_raise_by_what_raised():
     assert RunSummary.of(running, 0.1).ended_by is None
 
 
-def test_refusals_tally_under_their_source_and_the_fractions_count_cost_only():
+def test_refusals_tally_under_their_source_and_the_step_fraction_counts_cost_only():
     tally = RefusalTally.of(
         [
             "cost:no price for this shape",
@@ -511,14 +523,11 @@ def test_refusals_tally_under_their_source_and_the_fractions_count_cost_only():
             "command:start_profiler",
         ],
         steps=50,
-        refused_predicted_seconds=1.5,
-        predicted_seconds=30.0,
     )
     record = tally.record()
     assert record["count"] == 6
     assert record["by_source"] == [["command", 2], ["cost", 3], ["executor", 1]]
     assert record["fraction_of_steps"] == pytest.approx(3 / 50)
-    assert record["fraction_of_predicted_seconds"] == pytest.approx(0.05)
     assert record["reasons"] == [
         ["command:start_profiler", 2],
         ["cost:no price for this shape", 2],
@@ -541,10 +550,7 @@ def test_a_refusal_that_does_not_name_its_source_is_refused(reason):
 
 def test_an_empty_run_divides_by_nothing():
     record = RefusalTally().record()
-    assert (record["fraction_of_steps"], record["fraction_of_predicted_seconds"]) == (
-        0.0,
-        0.0,
-    )
+    assert record["fraction_of_steps"] == 0.0
 
 
 def test_the_summary_survives_strict_json():

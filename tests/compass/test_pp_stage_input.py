@@ -42,7 +42,7 @@ def _stage(rank, *grants, frames=(), ready=C, parts=(), pp=2, post=0.0):
     device work `ready` after the call, and whose `W_post` is `post`; its
     runner calls by name and frame."""
     table = single_engine_table(
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=0.5,
         stream_s=0.5,
         pp=pp,
@@ -550,6 +550,10 @@ def _record_last_stage(tmp_path, monkeypatch, pp):
         def __init__(self, rank, config):
             self.rank, self.config = rank, config
             self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
             self.attn_metadata_builder = GRAPHABLE
             self.tokenID_processor = _Tokens()
 

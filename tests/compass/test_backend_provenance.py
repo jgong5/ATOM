@@ -121,7 +121,7 @@ def test_an_answer_names_the_source_that_produced_it():
     """The record says what answered, not only what method the answer was."""
     p = Provenance(Method.MEASURED, "op-level").resolved("price_list")
     assert str(p) == "measured (op-level) via price_list"
-    assert not p.is_refused
+    assert not p.fell_through
 
 
 def test_an_answer_must_name_a_source():
@@ -134,7 +134,7 @@ def test_a_stand_in_answer_renders_the_refusal_it_replaced():
     p = Provenance(Method.ANALYTICAL, "roofline").resolved(
         "analytical_law", [Refusal("price_list", "unpriced leaf")]
     )
-    assert p.is_refused
+    assert p.fell_through
     assert str(p) == (
         "refused(price_list: unpriced leaf) -> analytical (roofline) via analytical_law"
     )

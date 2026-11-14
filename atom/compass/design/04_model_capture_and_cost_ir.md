@@ -18,7 +18,7 @@ has no `exclusive` value (D19).
 [bench, band and capture ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252):**
 capture is concrete, one graph per decode width and prefill (T, B) that `trace ops` is
 given or that a record directory's steps hold (D17, D18, D19); each leaf carries a contract, its arguments by schema
-slot with each tensor's stride, role and preshuffled mark, and a raw Triton or FlyDSL launch lifts to its
+slot with each tensor's stride, role, preshuffled mark and host mark, and a raw Triton or FlyDSL launch lifts to its
 innermost ATOM function (D20).
 
 **Revised 2026-10-19 by #1401's capture of DeepSeek-V4-Pro:** capture runs ATOM's two MoE
@@ -38,6 +38,15 @@ each traced step follows two untraced steps of its shape (D20).
 drafter, a step that samples is captured as two graphs, its target's and its drafter's, cut
 where ATOM records `forward_done_event`, and the op-level backend tags the drafter's terms
 `draft` (D18).
+
+**Revised 2026-10-30 by [#2345](https://github.com/jgong5/ATOM/issues/2345):** a block
+drafter's draft-KV pass on a step that samples is a third graph, priced among the target's
+terms (D18).
+
+**Revised 2026-10-31 by [#2560](https://github.com/jgong5/ATOM/issues/2560):** a mono
+runner binds and builds its widths under capture as its deployment does; a refusal the
+deployment makes too traces the original path and is declared, and any other bind or build
+failure is refused by name (D18).
 
 **Depends on:** `02_model_runner_and_cost_backend.md` (the backend plug point this fills),
 `03_memory_and_kv_model.md` (the activation term this supplies).
@@ -168,6 +177,40 @@ needed **five** graphs for B = 2 to 512 anyway, cut by ATOM's implementation swi
 `cu_seqlens_q` in the attention builder; one concrete capture takes **7.6 s**, 2.2 s of
 it the traced forward, and a concrete prefill (T = 512) **6.9 s**.
 
+### One symbol: a DP prefill's gathered rows
+
+Revised 2026-11-09 by the owner's
+[ruling on #2956](https://github.com/jgong5/ATOM/issues/2956#issuecomment-6742702610).
+Under DP a graph is keyed by G, the rows the step's MoE gathers (`07` Phase 1a), and a
+simulated DeepSeek-V4-Pro DPA-TP8 prefill meets a G no real run met at most steps: at
+#975's c=256 cell, 4,259 new (T, B, G) over 612 (T, B), 130 of them new, about 5 h of
+concrete traces against 76 min real. So a run's lazy trace of a DP prefill with no drafter
+holds G as one symbol, `ir.G`, and its graph is keyed by (T, B) alone, with the width W a
+sampling prefill's LM head pads to where it pads past B (`capture.forward.symbolic_shape`). The symbol is a backed `SymInt` made where the peer
+stand-in builds the gathered rows or MORI's received rows (`capture/peers.py`); a size
+that is G itself is recorded as `ir.G`, any other symbolic size refuses the record.
+Route A's specialization detector runs on it: a symbol the shape env replaced by a value
+refuses the record, and the guards the trace installed on G are the record's
+applicability, each read back true at its hint (`forward._guards`).
+
+ATOM keeps each rank's rows in numpy (`DPMetadata.running_tokens_per_dp_rank`), which
+carries the hint and never the symbol, so in place of the fourth discipline's census each
+(T, B) is traced at both ends of G's range, from a prefilling peer's one row past T to
+each peer at `max_num_batched_tokens` (`forward.Tracer.symbolic`). The two records must
+agree once G and each DP exchange's `sizes`, restated by the stand-in's split
+(`peers.split`), are put at either end; the check compares operators, not guards, since a
+guard holding a hint-derived constant differs by construction. The upper end is traced
+first, after the warm-up steps any trace runs, and the lower end follows it at the same
+(T, B) with none of its own. The upper end's record is kept, MORI's trim guarding G at most
+its hint, with the paths that hold G (`peers.slots`). A step's G inside the hints that the guards
+admit is put into the record (`peers.at`), copying only what holds G; any other G, and
+every G of a (T, B) whose ends differ (`forward.PerG`, named with the first difference in
+the run summary's `lazy_per_g`), is traced concretely as before. `trace ops --symbolic`
+traces the same graph ahead of a run for each prefill (T, B) of a record's steps, so only
+a (T, B) no record holds is traced on a run's step path. The probe behind the ruling put such records at 60 of 60 G
+across five configurations, V4-Pro, V4.1-Flash and Qwen3-235B-A22B, gather and MORI, each
+byte-identical to a full trace once `sizes` was restated.
+
 ### Route A's four disciplines: the record of the symbolic capture
 
 They bind no concrete capture. They are kept because they are what a symbolic capture,
@@ -251,96 +294,57 @@ Three FakeTensor traps, each of which silently produces a wrong artifact:
 Route A only, like the three above: a concrete capture has no symbol to ask.
 
 The three disciplines above keep the *tracing* symbolic. They are not enough on a real
-engine, and the reason is one line of torch: **`SymInt.__index__` and `SymInt.__int__`
-are `guard_int`.** Every host-side use of a step's width — filling a staging buffer's
-numpy view, slicing a Python list, checking a staged array's length — asks for a number,
-gets the symbol's trace-time hint, and *records the ask as `Eq(s, hint)`*. The graph is
-constant from there, with no error and no warning.
-
-Measured on ATOM's decode path for the published 27B: **16 ATOM lines** convert the step's
-width to a number during one traced forward — 20 conversions in all — and they are host
-fills and slices, nothing else:
-
-| where | lines | conversions |
-|---|---|---|
-| `aiter_attention.py in prepare_decode` | 1106, 1115, 1121, 1122, 1123, 1131, 1132 | 10 |
-| `model_runner.py::ModelRunner.prepare_inputs` | 2468, 2479, 2481 | 4 |
-| `model_runner.py::tokenIDProcessor.prepare_input_ids` | 510, 513 | 2 |
-| `model_runner.py::ModelRunner.prepare_sample` | 2564 | 1 |
-| `backends.py in _mrope_cpu_view` | 398, 400 | 2 |
-| `gdn_attn.py in _attach_gdn_decode_metadata` | 1237 | 1 |
-
-A seventeenth sits in `forward_context`'s own `assert_shape_contract`, whose `_rows`
-helper takes `int(t.shape[0])`, and an eighteenth solves the width by *comparison* rather
-than conversion: `ScheduledBatch.__init__` checks the staged token array's length against
-the count. **Repairing them one at a time does not converge** — the two sites this
-property was originally recorded at were repaired and `_rows` appeared behind them.
+engine, because **`SymInt.__index__` and `SymInt.__int__` are `guard_int`.** Every
+host-side use of a step's width -- filling a staging buffer's numpy view, slicing a list,
+checking a count -- asks for a number, gets the symbol's trace-time hint, and *records the
+ask as `Eq(s, hint)`*. The graph is constant from there, with no error and no warning.
+Many ATOM lines do this in one decode forward, and **repairing them one at a time does not
+converge**: closing one hands the symbol to whichever line reaches it next.
 
 **The conversion is not the defect; the recording is.** A host fill genuinely needs a
 number, and the number it needs is the hint, which is the count the engine computed. So a
-symbolic capture keeps the conversion and replaces the guard with its own log — every
-conversion, with the line it happened on — and asserts that log, as a multiset of
-`(line, conversions)`, against a stated set. That last clause is the whole of the
-discipline's value and it is the part that is easy to leave out: a log nothing compares
-records a conversion at a seventeenth line and says nothing, so the instrument reads as
-evidence while behaving as decoration. The capture referenced below declares the set as
-`EXPECTED_HOST_RESOLUTIONS` and asserts it at both group widths and both step widths.
-**`__bool__` stays untouched**, so a branch on a width still installs its guard and a step
-whose shape decides which path the engine takes still records that it did.
+symbolic capture keeps the conversion and replaces the guard with its own log -- every
+conversion, with the line it happened on -- and asserts that log, as a multiset of
+`(line, conversions)`, against a stated set. A log nothing compares records a conversion
+at a new line and says nothing. **`__bool__` stays untouched**, so a branch on a width
+still installs its guard and a step whose shape decides which path the engine takes still
+records that it did.
 
-Two consequences worth stating, because both were expected the other way round:
+ATOM's decode step needs more answers on the capture side:
 
-- **`copy_to_gpu` needs no change, and neither does `CpuGpuBuffer`.** The specialisation
-  recorded there was a *buffer capacity* — `max_model_len // block_size` — being solved
-  against the CPU side's constant, and it only existed because that capture symbolised
-  every dimension of the staged device tensor. Capacities are engine configuration and are
-  not a function of the step. With only the step's width symbolic, the two slices carry
-  the same symbol and the copy dispatches with it on both sides.
-- **One production line changes**, `_rows`'s `int(t.shape[0])` → `t.shape[0]`.
-  `torch.Size.__getitem__` already returns a Python `int` for a tensor with a real size,
-  so it is the identity in a served step; it matters only where the size is symbolic, and
-  there converting one side of an equality to a number forces the other to become it.
+- **`SymInt.__hash__`** is answered with the hint and logged: aiter's greedy top-k caches
+  a tensor per row count, and hashing a symbol otherwise raises.
+- **Block-table padding** compares the padded width with the batch's own host rows, and is
+  handed the hint.
+- **Raw FlyDSL launches**, like raw Triton ones, never enter the dispatcher; they are
+  recorded and skipped, so the inventory is diagnostic.
 
-**What the symbol has to be attached to is the batch, not the buffers.** Handing each
-staged buffer a bound of its own re-derives widths the engine did not run at. The width
-is set on the `ScheduledBatch` and the engine derives the rest — `ForwardMode.decide`
-settles both units off it, `prepare_inputs` writes the `cu_seqlens_q` boundary at
-`running_bs + 1`, `prepare_decode` uses it as every staged bound. A decode step is one
-query row per sequence, so its token count and its sequence count are **one** symbol; two
-would have to be equated later, which is the specialisation again by a longer route.
+**What the symbol has to be attached to is the batch, not the buffers.** A staged buffer's
+dimensions are engine capacities, not a function of the step, so none is symbolised. The
+width is set on the `ScheduledBatch` and the engine derives every bound from it. A decode
+step is one query row per sequence, so its token count and its sequence count are **one**
+symbol; two would have to be equated later, which is the specialisation again by a longer
+route. The one exception is `ScheduledBatch.__init__`, which compares the staged token
+array's length against the count and so solves the width by comparison rather than
+conversion: the capture builds the batch at the concrete width and rebinds its count
+fields afterwards.
 
-**It does not survive the batch's own constructor, and that is the eighteenth site.**
-`ScheduledBatch.__init__` compares the staged token array's length against the count it
-was handed, which solves the width by comparison rather than by conversion — the
-`__bool__` boundary this discipline deliberately leaves alive. So the capture builds the
-batch at the concrete width and rebinds the four count fields afterwards. The symbol
-enters the engine's *staging*; it does not enter the engine's batch constructor, and a
-reader who takes "the symbol enters at the `ScheduledBatch`" literally will look for it
-in the wrong place.
+**One place the width is not free: the H2D publication.** `atom/utils/h2d.py` checks each
+staged count with `operator.index` and copies with the number that returns, so its copies
+take the hint; the view it hands back carries the symbol. The digest below leaves the
+publication's operators out by name.
 
 **The evidence that the symbol is free, rather than a hint in disguise.** The engine
 computes its host values from the hint, so a graph built this way would still be a graph
-about one width if any dimension had taken the hint instead of the symbol — and nothing in
+about one width if any dimension had taken the hint instead of the symbol, and nothing in
 a census would say so. The step is therefore traced at **two** widths, at **each** group
 width the result is claimed at, and the inventories compared operator for operator and
-shape for shape with the symbol's name set aside. They are identical, which also says that
-every dimension that stayed a number is the same number at both widths and so is not a
-width in disguise. The digest that carries this covers operator names and tensor shapes
-only — not scalar arguments, dtypes or strides — so a value-level difference is found by
-comparing the distinct-operator sets instead, which is how the one difference between the
-concrete and symbolic passes (`lift_fresh` becoming `scalar_tensor`) was found.
+shape for shape with the symbol's name set aside. They must be identical. The digest
+covers operator names and tensor shapes only, not scalar arguments, dtypes or strides, so
+a value-level difference shows only in the distinct-operator sets.
 
-**One artifact is width-dependent, and the comparison should say so rather than omit it.**
-The guard set is not the same at two hints: at every hint but 2 a lower bound
-`<axis> + 1 > <hint>` appears as well, measured at hints 3, 8 and 16 at TP1
-and at hint 8 at TP2, and seen independently at 5, 7 and 64. At a hint of 2 it is
-elided, because a size symbol's default range is
-`[2, ∞)` and the inequality is vacuous. It is a `__bool__` comparison on a live symbol, so
-it is the positive evidence that the boundary is intact — but it means the applicability
-statement carries a *lower* bound at any hint but 2, and a two-width table that lists
-five rows as identical has to name the sixth that is not.
-
-Pinned by `tests/compass/test_capture_real_model.py`.
+Pinned by `tests/compass/test_capture_real_model.py`, which holds the measured sites, the
+declared conversion set and the guards.
 
 ### The gating cost turned out to be small
 
@@ -532,15 +536,53 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   ([#2053](https://github.com/jgong5/ATOM/issues/2053)). A GDN prefill under ReplaySSM counts
   its live state slots with a boolean index, a size no fake tensor holds; the host-staged
   slot indices bind it.
-- **Refused by name.** A block drafter (DSpark): it writes its draft KV before
-  `forward_done_event` on a step that samples ([#1607](https://github.com/jgong5/ATOM/pull/1607)),
-  so one cut does not part its target from its draft.
+- **A block drafter's draft-KV pass is a third graph.** A block drafter (DSpark) runs its
+  draft-KV pass after the target's forward and before its sampling, so before
+  `forward_done_event` on a step that samples ([#1607](https://github.com/jgong5/ATOM/pull/1607)).
+  Capture marks both ends of the pass there, as the parity record stamps `d_draft_kv_ns`:
+  the target's graph is what runs outside it up to the event, the pass is its own graph,
+  the target's key plus `draft kv`, and the drafter's graph is its propose after the event
+  ([#2345](https://github.com/jgong5/ATOM/issues/2345)). The op-level backend reads the
+  pass's graph at the target's shape and prices it among the target's terms, named
+  `draft_kv op.<kind>`: the step's output waits for it, so it is in `D_target` (`01` D4),
+  as the step linear law prices it ([#2080](https://github.com/jgong5/ATOM/issues/2080)).
+  A middle chunk's pass starts its drafter's graph, as any drafter's does.
 
 The drafter's roofline is not its measured time. On #1208's MTP1 record
 (Qwen3.5-35B-A3B-FP8, TP1, MI308X) the drafter's roofline is 0.39 of the measured draft at
 p50, 342 us against 874 us; the LM head's weight read is 232 us of it. The rest is time no
 leaf's roofline holds, and the op level fits no residual
 ([#1489](https://github.com/jgong5/ATOM/issues/1489)).
+
+### A mono decode binds and builds as its deployment does
+
+A mono runner (`atom/mono/runtime`), DeepSeek-V4.1's mono decode among them, is created on
+its model's first eligible decode step and builds each step width on that width's first
+step (`route.LazyRunner`, `widths.WidthBuilds`). Both are collective over the TP group,
+and a capture's group is one process. Capture stands in for what needs a peer or a device
+(`capture.forward._mono`, [#2560](https://github.com/jgong5/ATOM/issues/2560)):
+
+- **The consensus runs on the host.** `consensus.tp_agree` all-reduces a flag it builds with
+  `torch.tensor`, which inside the fake mode leaves `item()` a data-dependent guard on a
+  fake. It runs outside the fake mode and the recorder, as the step's DP exchange does, and
+  over the fake group agrees with this rank: every rank of a capture is this one.
+- **The peer buffer has no device.** `lifecycle.owned_peer_buffer` gets
+  `capture.driverless.PeerBuffer`: the regions the runner asks for, on the declared
+  device, with no IPC heap and no handle exchange.
+- **A width compiles for real.** Capture's FlyDSL entries record a launch and compile
+  nothing, so the build's `compile.scratch_bytes` would find no binary and mono would
+  decline the width. A width's kernels compile compile-only at the declared arch, through
+  FlyDSL's own entries and outside the modes; their scratch is read off their binaries,
+  and capture logs it.
+- **A refusal is the deployment's or the capture's.** A bind check's `MonoUnsupported` and
+  a kernel that needs scratch are refusals the deployment makes too: the step traces the
+  original path, and the `declared` of each graph whose steps it turned away names it under
+  `mono`. Any other bind failure, which `consensus.bind_agreed` converts to a refusal, and
+  any build failure, which `WidthBuilds.prepare` logs and declines, stop the capture by
+  name: the deployment does
+  not fail there, so it runs mono, and the original path is not its step.
+
+Past its bind and its builds, a mono runner's launches lift by the lift rule (D20).
 
 ### Open issues
 
@@ -616,9 +658,12 @@ Graph   := (applicability, Region)
 Region  := Seq[Node] | Repeat(body: Region, count: int) | Par([Region], join: JoinPolicy)
 Node    := Op(name, kind, args: {slot: Arg}, out_shapes: [Shape],
               stream_id, context_ref, stated: {name: Value})
-Arg     := Tensor(shape, dtype, stride, role, shuffled) | Value | ModuleRef(path)
+Arg     := Tensor(shape, dtype, stride, role, shuffled, host) | Value | ModuleRef(path)
 role    := activation | weight | KV | metadata
 shuffled := bool, ATOM's `is_shuffled` mark on a preshuffled weight
+host    := bool, whether ATOM holds the tensor on the host; an `op_graph` states
+           `"device": "cpu"` on a host tensor alone, and a tensor stating none is on
+           the device
 ```
 
 ### `Repeat` — the efficiency property
@@ -781,7 +826,9 @@ driven by `forward_context.ubatch_slices is not None`.
 Every branch ATOM takes on a shape was taken at capture, at that shape, so the graph needs
 no guard domain: its path is ATOM's own control flow, which cannot drift from itself, and
 a step whose key and shape no graph holds is captured lazily or refused (D17) rather than
-mispriced.
+mispriced. One graph is the exception: a DP prefill's that holds G (D18) carries the G
+range its two traces span and the guards its trace installed on G, and answers only a G
+both admit.
 
 ### `Repeat` must nest, and must tolerate a non-contiguous pattern
 
@@ -949,7 +996,17 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   weight it preshuffled after loading, and aiter's `fused_moe_` picks its kernel by that
   mark on `w1` and `w2`, which no shape or dtype shows. A replay without it calls a
   different kernel, which D20's contract forbids; unmarked mxfp4 MoE weights reach CK
-  stage kernels that refuse the shape.
+  stage kernels that refuse the shape. So is the host mark
+  ([#2857](https://github.com/jgong5/ATOM/issues/2857)): ATOM's forward copies values
+  it staged on the host to the device, DeepSeek-V4.1's cursors and slots among them,
+  and a Python number it writes reaches a fill as a host scalar. A replay that takes
+  such a tensor from a device buffer copies device to device, or nothing. The graph
+  states `"device": "cpu"` on a host tensor alone, so a tensor stating none, every
+  tensor of a graph captured before the mark among them, is on the device, as it was
+  read before. A capture places each tensor where ATOM's runner does: it caches
+  torch's default-device constructors before it patches `torch.zeros`, which
+  otherwise leaves every later `torch.zeros` of ATOM's, V4.1's MoE weight scales
+  among them, on the host.
 - **Role by provenance.** `activation`, `weight`, `KV` or `metadata`, read from where the
   tensor's storage came from rather than from the argument's name, so an ambient tensor
   passed under another name, such as `kv_indptr_convert`, still reads metadata.
@@ -960,14 +1017,16 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   `ModuleRef("runner.<attr>")`. Any other object that pickle reduces to its class and a
   dict of attributes, each attribute contract-legal in turn, is recorded in that shape
   (`ir.nodes.Reduced`): its class by `module:qualname` and its state, an enum member by
-  its value, a plain dict by its items. Anything else, a callable among it, refuses the
-  leaf by its type. Widening to the runner's whole object graph or the full reduce
-  protocol is additive, and a refusal on an in-scope configuration forces it.
+  its value, a plain dict by its items, a NamedTuple by its fields, which a callee reads
+  by name (DeepSeek-V4.1's FP4 index plane,
+  [#3001](https://github.com/jgong5/ATOM/issues/3001)). Anything else, a callable among
+  it, refuses the leaf by its type. Widening to the runner's whole object graph or the
+  full reduce protocol is additive, and a refusal on an in-scope configuration forces it.
   [#1812's census](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6296604735)
   holds the Triton MoE's `RoutingData`, `ExptData`, `Bitmatrix` and
   `DequantScaleRoundingMode` and V4's `UnifiedPoolGeometry`, `ClassLayout` and
   `WindowParams` this way, and finds no argument that is a runner attribute. `measure
-  ops` does not rebuild such an argument yet
+  ops` rebuilds such an argument as the replay does
   ([#1853](https://github.com/jgong5/ATOM/issues/1853)).
 - **An integer that moves with the context is stored affine in it.** A decode shape is
   traced at two contexts; an integer argument that differs between them is stored as
@@ -995,9 +1054,30 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   extended to the bf16 leaf by [#2031](https://github.com/jgong5/ATOM/issues/2031)):
   at decode it writes each token's window row to the destination rows of that ratio's
   class, which `bench.ops.V4_METADATA` binds to `v4_swa_dest_{dense,csa,hca}`.
+  DeepSeek-V4's prefill attention (`capture.forward.V4_PREFILLS`: the fp8 KV cache's
+  `aiter.pa_sparse_prefill_fp8_opus.default` and the bf16 one's
+  `aiter.pa_sparse_prefill_opus.default`) states its layer's `compress_ratio` too: it is
+  passed the prefix index list and indptr of that ratio's class, which
+  `bench.ops.V4_METADATA` binds to `kv_{indices,indptr}_prefix_{swa,csa,hca}`
+  ([ruling on #3023](https://github.com/jgong5/ATOM/pull/3040#issuecomment-6730173331),
+  extended to the bf16 leaf by [#3038](https://github.com/jgong5/ATOM/issues/3038)). The
+  bf16 leaf is V4.1's sparse attention's operator, so `bench.ops.V4_SHARED` binds it so
+  only on a step holding V4's prefill lists.
+  DeepSeek-V4.1's sparse attention (`capture.forward.V41_ATTENTION`), its index lists
+  sized as V4's, states the same three of its layer, and its indexer's scorers
+  (`capture.forward.V41_SCORERS`: gfx1250's FlyDSL one and gfx950's Triton one) its
+  `compress_ratio` and `index_candidates`, the most entries it scores where an earlier
+  layer chose its candidates, else null (#2344). Its index keys' RoPE
+  (`capture.forward.V41_ROPE`, under `Indexer.project_keys`) states their indexer's
+  `compress_ratio`: their positions are that ratio's compress plan's, which
+  `bench.ops.V41_NAMES` binds, and at a decode with no drafter both ratios' plans hold
+  a row a request, so the leaf's shape cannot tell them apart
+  ([#3141](https://github.com/jgong5/ATOM/issues/3141)). The indexer query's RoPE, on
+  the step's positions at every ratio, states none. In a graph captured before,
+  `measure ops` takes a key's ratio from the compress leaf whose plan holds as many rows.
 
-Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers
-and DeepSeek-V4's attention aside, below), so its ambient reads stay
+Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers,
+DeepSeek-V4's attention and V4.1's guarded ops aside, below), so its ambient reads stay
 invisible to the trace; the bench does not need them, because it times the leaf at a
 point `ModelRunner.prepare_model` prepared, where ATOM has built the forward context for
 that point, and runs no forward (`07` D39).
@@ -1020,7 +1100,11 @@ the analytical extractor and `measure ops` alike.
   whichever package: aiter's `mla_decode_fwd_v4_nm`, not the ATOM function that calls
   it.
 - **The entry points.** Triton is taken at `JITFunction.run`, gluon included; a
-  `warmup=True` call launches nothing; a direct `CompiledKernel.run` is refused by name.
+  `warmup=True` call launches nothing; a direct `CompiledKernel` launch, through its
+  `run` or a `kernel[grid]` call, lifts as `JITFunction.run` does
+  ([ruling on #2344](https://github.com/jgong5/ATOM/issues/2344#issuecomment-6469812924)): a leaf's arguments come from its function's call entry,
+  not from the launch. gfx950's FP8 index scorer, aiter's
+  `deepgemm_fp8_paged_mqa_logits`, launches that way.
   FlyDSL is taken at `JitFunction.__call__` and at `CompiledFunction.__call__`, which
   capture's `_compile_impl` maps back to its jit function, so both give one leaf name and
   contract; a `CompiledFunction` compiled before the capture names no jit function and is
@@ -1061,24 +1145,32 @@ leaf: `try_mrope_qk_fused` launches mrope's tiled kernel at B >= 128.
 
 Owner's [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811), 2026-10-20, as
 [#1867](https://github.com/jgong5/ATOM/pull/1867) built it. An `op_graph` is keyed by its
-structure and its shape (`07` D41). The structure (`capture.forward.structure`) is the
+structure, its shape, and the ATOM source and torch it was traced under (`07` D41); a DP prefill's graph that holds G (D18) by the shape
+`prefill T=<T> B=<B> G=G`, ` W=<W>` before G where its LM head pads, its hints and guards in its graph member. The structure (`capture.forward.structure`) is the
 model's architecture, the device arch, the config.json digest, the engine config the
 step law is keyed by less its ladder (`run.step_grid.keyed`, `09` D54), the TP width and
 the DP and EP widths when set, the phase, the mode, and whether the step produces
 output. That engine config holds the KV block size and dtype, the quantization's hash,
-the parallel layout, TBO, speculation when it is on, `moe_backend`, `eplb_enable` and
-`enable_decoder_swa_bounded_replay` when
-they are off ATOM's default, and the performance environment
+the parallel layout, TBO, speculation when it is on, `moe_backend`,
+`moe_all2all_backend`, `eplb_enable` and `enable_decoder_swa_bounded_replay` when
+they are off ATOM's default, the `index_cache_dtype` ATOM resolved where it differs
+from `kv_cache_dtype` (the [ruling on #2981](https://github.com/jgong5/ATOM/issues/2981)),
+whether `mori` imports where it does not, and the performance environment
 (`atom.benchmarks.results.metadata.PERFORMANCE_KEYS`) less the client's `AIPERF_*`
 variables and the device selection; ATOM's Triton expert and GEMM switches
 (`ATOM_USE_TRITON_MOE`, `ATOM_USE_TRITON_MOE_A4W4`, `ATOM_USE_TRITON_MOE_DECODE`,
-`ATOM_USE_TRITON_GEMM`) are in it. One store holds V4-Pro graphs of one shape that
-differ only in `kv_cache_dtype`, or only in `ATOM_USE_TRITON_MOE`, and each run reads its
-own.
+`ATOM_USE_TRITON_GEMM`) are in it, and ATOM's prefill token buckets
+(`ATOM_TOKEN_GRAPH_SIZES`), `ATOM_FUSE_SHARED_EXPERT`, `ATOM_DISABLE_MORI_EP` and
+`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4` only when ATOM reads them off their default.
+The last three, with the all-to-all backend and `mori`, decide whether a MoE fuses
+its shared expert into aiter's top-k table, which changes its graph ([#3333](https://github.com/jgong5/ATOM/issues/3333)). One store holds V4-Pro graphs of one shape that
+differ only in `kv_cache_dtype`, only in `ATOM_USE_TRITON_MOE`, or only in the index
+cache dtype ATOM resolves for a P/D side and for a plain start at gfx950
+(`atom/config.py::Config.__post_init__`), and each run reads its own.
 
 A run, or `measure ops`, that finds no graph at its key where the store holds one at
-the same shape and otherwise the same structure refuses, naming each engine field that
-differs, a performance variable by its own name (`run.step_grid.differ`, which the step
+the same shape and otherwise the same structure refuses, naming the ATOM source or torch
+it was traced under and each engine field that differs, a performance variable by its own name (`run.step_grid.differ`, which the step
 law's engine check shares). Every key moved with #1867, so a store is traced again in the
 environment its reader runs in.
 
@@ -1158,6 +1250,16 @@ as `aiter.mla:mla_decode_fwd_v4_nm`, the bf16 one's as
 own, `flydsl_qk_norm_rope_quant`. The indexer's score and top-k stays one leaf: its FP4 kernels
 launch through aiter's own launcher.
 
+DeepSeek-V4.1's guarded ops (`capture.forward.V41_OPENED`: its attention, Engram, the
+step's staging around the forward and the record of a TBO expert output) run their bodies
+too (#2344), on a real step's batch whose rows each hold a state slot: V4.1 serves a dummy
+run as idle padding. Its compressor, index writes, scorer, top-k and sparse attention are
+leaves under the lift rule; the delayed hyper-connection seam, `v41_mhc_pre_delayed`,
+stays one leaf with its own arguments. The state cursors V4.1 reads back to the host read
+zeros, and its check that each request's state is where the scheduler put it has no values
+to judge. Each decode row holds a token before its new one at both contexts
+(`capture.forward.CONTEXTS`), since a request's first forward starts its state over.
+
 A FlyDSL launch outside an opaque leaf capture keeps closed, the sampler's argmax or one
 in the opened bodies, lifts by the lift rule; inside a closed one it is never reached.
 
@@ -1175,8 +1277,9 @@ Python entries, before the arguments are erased.
 ### Open issues
 
 - The op-level extractor table is `backends/op_work.py::EXTRACTORS` (`10` D64); a leaf
-  kind with none is refused by name, V4-Pro bf16 prefill's `pa_sparse_prefill_opus`
-  among them.
+  kind with none is refused by name. V4-Pro bf16 prefill's `pa_sparse_prefill_opus` takes
+  V4.1's extractor, which refuses it for the `window_size` and `index_topk` it does not
+  state.
 - Leaf prices are not repeatable to better than about 1%: two runs of one graph, one box,
   back to back, identical code moved the summed contribution **0.96%**, median
   per-signature **1.18%**, **p90 32%**. **Any residual quoted below ~2% is quoting the
@@ -1501,10 +1604,10 @@ Deferred to future work by decision on 2026-09-18.
 | # | Decision | Date |
 |---|---|---|
 | D17 | Two granularities behind one `CostBackend`; the step level discovers the shapes the op level captures. No fallback crosses granularity: a capture failure fails the run, lazy trace off makes an uncaptured shape a refusal | 2026-09-18; revised 2026-10-14 (#952); per shape 2026-10-18 (#1489) |
-| D18 | Capture with `TorchDispatchMode` + `FakeTensorMode`, on FakeTensor rather than bare meta, at concrete shapes: one graph per decode width and prefill (T, B) that `trace ops` is given or that a record directory's steps hold. The symbolic route A and its four disciplines (the fourth: the engine's host arithmetic asks a symbol for a number, so a symbolic capture keeps the conversion, logs it with its line, and asserts that log against a stated set) are recorded, not built. Under a drafter a step that samples is two graphs, the target's and the drafter's, cut at `forward_done_event` | 2026-09-18, fourth discipline 2026-09-22; concrete 2026-10-18 (#1489); drafter 2026-10-21 (#1270) |
+| D18 | Capture with `TorchDispatchMode` + `FakeTensorMode`, on FakeTensor rather than bare meta, at concrete shapes: one graph per decode width and prefill (T, B) that `trace ops` is given or that a record directory's steps hold. The symbolic route A and its four disciplines (the fourth: the engine's host arithmetic asks a symbol for a number, so a symbolic capture keeps the conversion, logs it with its line, and asserts that log against a stated set) are recorded, not built. Under a drafter a step that samples is two graphs, the target's and the drafter's, cut at `forward_done_event`; a block drafter's draft-KV pass before that event is a third, priced among the target's terms. A mono runner binds and builds its widths as its deployment does: a refusal the deployment makes too is declared, any other bind or build failure refused by name. A run's lazy trace of a DP prefill holds G, the rows its MoE gathers, as one symbol, keyed by (T, B) and the width its LM head pads to, traced at both ends of G's range and kept when the two agree but for the exchanges' `sizes`; a G its hints and guards admit is put into it, any other traced concretely | 2026-09-18, fourth discipline 2026-09-22; concrete 2026-10-18 (#1489); drafter 2026-10-21 (#1270); block drafter 2026-10-30 (#2345); mono 2026-10-31 (#2560); a DP prefill's G 2026-11-09 (#2956) |
 | D18.1 | `torch.export` recorded as an unverified alternative; rejected now on decomposition fidelity and on capturing a model call rather than an engine step | 2026-09-18 |
 | D19 | Hierarchical, concrete, stream-annotated IR: `Seq` / `Repeat` / `Par`, a node's arguments its leaf contract. No branches in the IR — applicability is a discrete key and the captured shape, matched by equality | 2026-09-18; revised 2026-10-18 (#531); concrete 2026-10-18 (#1489) |
-| D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride, role by provenance (activation, weight, KV, metadata) and preshuffled mark, non-tensor arguments and module references kept, a runner attribute as `runner.<attr>`, any other object in pickle's reduce shape or refused by its type. A raw Triton (`JITFunction.run`, a warmup aside) or FlyDSL (`JitFunction.__call__`, `CompiledFunction.__call__`) launch lifts to the first function its `module:qualname` names, past the languages' frames, closures and generic launchers; a direct `CompiledKernel.run` is refused. Nested launching calls and custom ops fold into the outermost; arguments come from call entry in a traced step that follows two untraced steps of its shape; each contract must replay to the same kernels and operators outside torch's, and a launch outside a found function, a raise after a launch or a call open at the step's end is refused. An `op_graph` is keyed by the step law's engine config less its ladder, the performance environment in it, and a miss names each differing field; keying on a kernel-selecting environment variable is a workaround for an ATOM design that should take the choice as an argument. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401); lift rule and key 2026-10-20 (#1811); two untraced steps 2026-10-21 (#1812); preshuffled mark 2026-10-22 (#1953) |
+| D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride, role by provenance (activation, weight, KV, metadata), preshuffled mark and host mark, non-tensor arguments and module references kept, a runner attribute as `runner.<attr>`, any other object in pickle's reduce shape or refused by its type. A raw Triton (`JITFunction.run`, a warmup aside) or FlyDSL (`JitFunction.__call__`, `CompiledFunction.__call__`) launch lifts to the first function its `module:qualname` names, past the languages' frames, closures and generic launchers, and so does a direct `CompiledKernel` launch. Nested launching calls and custom ops fold into the outermost; arguments come from call entry in a traced step that follows two untraced steps of its shape; each contract must replay to the same kernels and operators outside torch's, and a launch outside a found function, a raise after a launch or a call open at the step's end is refused. An `op_graph` is keyed by the step law's engine config less its ladder, the performance environment in it, and a miss names each differing field; keying on a kernel-selecting environment variable is a workaround for an ATOM design that should take the choice as an argument. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401); lift rule and key 2026-10-20 (#1811); two untraced steps 2026-10-21 (#1812); preshuffled mark 2026-10-22 (#1953); host mark 2026-11-10 (#2857); compiled kernels lift 2026-10-28 (#2344); NamedTuple arguments 2026-11-08 (#3001) |
 | D21 | Stated nodes over chased coverage, their terms declared; refuse and record `unpriced` reasons; a failed forward writes no graph. The MoE exchanges are the first stated nodes | 2026-09-18; revised 2026-10-14 (#952); MoE exchanges 2026-10-19 (#1401) |
 | D22 | Liveness stays observational under fake tensors; internal scratch of an opaque leaf is a stated per-leaf constant. Revised: until capture lands the activation term is a coefficient measured on a real run, scratch inside it, and the walk replaces it after | 2026-09-18; revised 2026-10-10 |
 | D23 | Trace eager, price with the regime constant of the real step. The inductor fusion gap (~4.8% decode) is a documented **TODO**, not a decision. | 2026-09-18 |

@@ -5,9 +5,12 @@ One transfer is priced as `latency + bytes / bandwidth`, and the three terms
 come from three different places on purpose.
 
 **The bytes are exact.** A transfer moves a whole number of paged blocks, and
-what one block costs is the geometry the engine was built with, not a
-measurement -- so the byte count carries no error at all and nothing here
-re-derives a KV layout.
+what one block costs is the entry of the paged class the engine's runner
+planned its pool with, not a measurement -- so the byte count carries no error
+at all and nothing here re-derives a KV layout. A model whose transfer also
+carries the request's state slot moves one planned slot beside its blocks, and
+one that stages its compressor state for prefill-decode moves that staging row
+in a second write, which pays the latency again.
 
 **The bandwidth is a spec peak, and it is spent at the derate the spec
 declares.** A datasheet number spent as an achievable one would make every
@@ -20,22 +23,22 @@ the caller says which side it is on. There is no default and no fall back to
 the other side: a transfer between two nodes priced on the intra-node link is
 wrong by roughly an order of magnitude and would look entirely plausible.
 
-Two things this model is not.
-
-It is **unvalidated**. No real RDMA baseline has been fitted to it, so the
-latency and bandwidth in a spec are declarations rather than measurements, and
-a predicted transfer time inherits that. Fitting them is a calibration
-exercise against a real deployment; until then the numbers are as good as the
-document they came from and no better.
+The numbers are as good as the document they came from. A spec's provenance
+says per value whether it came from a datasheet, was assumed or was probed. A
+probed RDMA link is
+`atom/compass/networks/crs005-013-ionic.json`, measured on the rails between
+two MI355X nodes; its provenance names the bench and the run.
 
 It charges the same duration to both ends of the same wire. A push and a pull
 of the same blocks cost the same here, which is a claim about the fabric being
 symmetric that this model cannot check.
 
 Writes on one `Link` move one at a time, in arrival order. A link's first
-write that moves blocks also pays the link's one-off setup, when the spec
-declares one; a zero-block write makes no transfer call and pays none. Writes on
-different links do not contend, even where real ones would share a NIC.
+write that moves bytes also pays the link's one-off setup, when the spec
+declares one; a write that moves no block and no slot makes no transfer call
+and pays none. Writes on different links do not contend, even where real ones
+share a rail or a NIC, so writes that fan in on one are each priced at a lone
+writer's rate.
 
 Nothing in this module imports the engine or a tensor library. Reaching it
 through the package around it is not the same import: `atom.compass.kv` loads
@@ -71,12 +74,19 @@ class TransferModel:
     `bandwidth_bytes_per_s` is what a transfer actually reaches, not what the
     link is rated at -- `from_spec` applies the derate before it gets here, so
     a model built by hand in a test states an achievable number too.
+    `slot_bytes` is the request's state slot, which every transfer moves beside
+    its blocks, or after them when `slot_after_blocks`; 0 for a model whose
+    transfer carries none. `staging_bytes` is the staging row a second write
+    moves once the first completes; 0 for a model that stages nothing.
     """
 
     latency_s: float
     bandwidth_bytes_per_s: float
     bytes_per_block: int
     setup_s: float = 0.0
+    slot_bytes: int = 0
+    staging_bytes: int = 0
+    slot_after_blocks: bool = False
 
     def __post_init__(self) -> None:
         if self.latency_s < 0:
@@ -92,10 +102,26 @@ class TransferModel:
             raise ValueError(
                 f"bytes_per_block must be at least 1, got {self.bytes_per_block}"
             )
+        if self.slot_bytes < 0:
+            raise ValueError(f"slot_bytes must not be negative, got {self.slot_bytes}")
+        if self.staging_bytes < 0:
+            raise ValueError(
+                f"staging_bytes must not be negative, got {self.staging_bytes}"
+            )
 
     @classmethod
-    def from_spec(cls, spec, geometry, scope: Scope) -> TransferModel:
-        """Price a block of *geometry* on the *scope* link of *spec*.
+    def from_spec(
+        cls,
+        spec,
+        bytes_per_block: int,
+        scope: Scope,
+        slot_bytes: int = 0,
+        staging_bytes: int = 0,
+        slot_after_blocks: bool = False,
+    ) -> TransferModel:
+        """Price a block of *bytes_per_block*, and a state slot of
+        *slot_bytes* and a staging row of *staging_bytes* per transfer, on the
+        *scope* link of *spec*.
 
         The spec refuses a link it does not carry, and refuses a peak
         bandwidth whose derate is missing; both refusals travel out of here
@@ -107,16 +133,33 @@ class TransferModel:
         return cls(
             latency_s=spec.value(f"{link}.link_latency_s"),
             bandwidth_bytes_per_s=peak * derate,
-            bytes_per_block=geometry.bytes_per_block,
+            bytes_per_block=bytes_per_block,
             setup_s=spec.values.get(f"{link}.link_setup_s", 0.0),
+            slot_bytes=slot_bytes,
+            staging_bytes=staging_bytes,
+            slot_after_blocks=slot_after_blocks,
         )
+
+    def bytes_moved(self, blocks: int) -> int:
+        """The bytes a transfer of *blocks* moves: its blocks, the state slot
+        and the staging row."""
+        return blocks * self.bytes_per_block + self.slot_bytes + self.staging_bytes
+
+    def writes(self, blocks: int) -> int:
+        """The writes a transfer of *blocks* takes, each paying the latency:
+        the blocks, with the slot unless it follows them, then the staging row
+        and a slot that follows the blocks. A write with no bytes is not
+        posted, and a transfer that moves no byte still takes one."""
+        after = self.staging_bytes + (self.slot_bytes if self.slot_after_blocks else 0)
+        return max(1, (self.bytes_moved(blocks) > after) + (after > 0))
 
     def duration_s(self, blocks: int) -> float:
         """How long *blocks* take on this link.
 
         Zero blocks is a real case -- a consumer whose prefix cache already
         holds the whole prompt still has a transfer to complete -- and it
-        costs the latency, because the two ends still have to say so.
+        costs the latency, because the two ends still have to say so, and
+        the state slot, which no prefix cache holds.
         """
         if blocks < 0:
             raise ValueError(
@@ -126,8 +169,8 @@ class TransferModel:
                 "before it starts"
             )
         return (
-            self.latency_s
-            + (blocks * self.bytes_per_block) / self.bandwidth_bytes_per_s
+            self.writes(blocks) * self.latency_s
+            + self.bytes_moved(blocks) / self.bandwidth_bytes_per_s
         )
 
     def release_at(self, issue_time_s: float, blocks: int) -> float:
@@ -143,14 +186,16 @@ class Link:
     after its last byte. Its completion is fixed when it arrives, so two
     holders fed the same arrivals in the same order compute the same times. A
     write alone on the link completes at `a + duration_s(blocks)`, and the
-    link's first write with blocks starts `setup_s` after it would otherwise.
+    link's first write that moves bytes starts `setup_s` after it would
+    otherwise. A transfer whose staging row or slot follows in a second write
+    holds the link until it has moved, the first write's latency included.
     """
 
     def __init__(self, model: TransferModel) -> None:
         self._model = model
         self._last = -math.inf  # the latest arrival
         self._free = -math.inf  # when the link has moved every byte so far
-        self._set_up = False  # whether a write with blocks has paid setup_s
+        self._set_up = False  # whether a write that moves bytes has paid setup_s
 
     def start(self, a: float, blocks: int) -> float:
         """A write of `blocks` arrives at `a`; when it completes."""
@@ -161,11 +206,12 @@ class Link:
             )
         self._last = a
         start = max(a, self._free)
-        if blocks > 0 and not self._set_up:
+        moved = self._model.bytes_moved(blocks)
+        if moved > 0 and not self._set_up:
             self._set_up = True
             start += self._model.setup_s
         done = start + self._model.duration_s(blocks)
-        self._free = start + blocks * self._model.bytes_per_block / (
-            self._model.bandwidth_bytes_per_s
-        )
+        # A second write leaves when the first write completes.
+        gap = (self._model.writes(blocks) - 1) * self._model.latency_s
+        self._free = start + gap + moved / self._model.bandwidth_bytes_per_s
         return done

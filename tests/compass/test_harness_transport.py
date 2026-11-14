@@ -87,7 +87,7 @@ class _Frontend:
     """Stand-in for the frontend LP's runtime: hands out the scripted stamps."""
 
     me = LpId("frontend")
-    table = single_engine_table(admission_path="serving", ipc_s=0.0, stream_s=0.0)
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=0.0, stream_s=0.0)
 
     def __init__(self) -> None:
         self.arrival, self.seq = 0.0, 0
@@ -333,7 +333,12 @@ def test_a_stamp_after_its_request_timed_out_leaves_later_requests_served(
 
 
 def test_a_changed_pinned_function_refuses_the_run_by_name(tmp_path):
-    shutil.copytree(Path(aiperf.__file__).parent, tmp_path / "aiperf")
+    # Another gate shard may be writing bytecode into __pycache__ as this copies.
+    shutil.copytree(
+        Path(aiperf.__file__).parent,
+        tmp_path / "aiperf",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     fingerprint.check(tmp_path)
     path = tmp_path / "aiperf" / "transports" / "aiohttp_client.py"
     text = path.read_text()
@@ -395,3 +400,45 @@ def test_the_worker_that_sent_a_request_posts_its_stamped_cancel(tmp_path, monke
     written, cancels = _run(run())
     assert written == (_key(0),)
     assert cancels == [("compass=a:11.0;s:3", cancel_body(SENDS[0][1]))]
+
+
+def test_a_cancel_naming_a_url_is_posted_there_on_its_request_s_path(
+    tmp_path, monkeypatch
+):
+    """Behind a router that is no LP the traffic LP publishes credit 0's
+    cancel with frontend-P's URL: the worker posts it there, on credit 0's
+    path, and credit 0's URL, the router's, gets none."""
+
+    async def run():
+        prefill = []
+
+        async def take(request: web.Request) -> web.Response:
+            prefill.append((request.path, request.headers["tracestate"]))
+            prefill.append(await request.read())
+            return web.Response(status=204)
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", take)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        url = f"http://127.0.0.1:{runner.addresses[0][1]}"
+        try:
+            async with CancelHarness(tmp_path, monkeypatch) as h:
+                await h.stamp(0)
+                await h.send(0)
+                for _ in range(len(TOKENS[0]) + 1):
+                    await h.pull.recv_pyobj()
+                await h.pub.send_pyobj((_key(0), 11.0, 3, "cancel", url))
+                written = await h.pull.recv_pyobj()
+        finally:
+            await runner.cleanup()
+        return written, h.cancels, prefill
+
+    written, routed, prefill = _run(run())
+    assert written == (_key(0),)
+    assert routed == []
+    assert prefill == [
+        ("/v1/chat/completions", "compass=a:11.0;s:3"),
+        cancel_body(SENDS[0][1]),
+    ]

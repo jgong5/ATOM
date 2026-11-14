@@ -45,10 +45,14 @@ socket.socket.bind = plant
 
 
 def _hold(port=0):
-    """A socket bound to port, or to a free one for 0, that a planted bind can share."""
+    """A socket bound to port, or to a free one for 0, that a planted bind can share.
+
+    It binds every address, as the port pick does: a port free on loopback can
+    be held on another of the host's addresses, where the pick's bind is refused.
+    """
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    s.bind(("127.0.0.1", port))
+    s.bind(("", port))
     return s
 
 
@@ -152,7 +156,7 @@ def test_a_1p1d_cell_hands_pd_sim_a_free_dp_master_port_for_each_side(tmp_path):
     traces = tmp_path / "traces.jsonl"
     traces.write_text('{"id": 0}\n')
     run_file = tmp_path / "run.json"
-    run_file.write_text(json.dumps({"kv_write_req_s": 2.0**-10}))
+    run_file.write_text(json.dumps({"router_s": 2.0**-12}))
     done = subprocess.run(
         [bash, str(SCRIPT), str(run_file), str(tmp_path / "cell")],
         cwd="/",
@@ -172,3 +176,51 @@ def test_a_1p1d_cell_hands_pd_sim_a_free_dp_master_port_for_each_side(tmp_path):
     assert seen.exists(), done.stdout + done.stderr
     ports = seen.read_text().split()
     assert len(set(ports)) == 2, (ports, done.stderr)
+
+
+def test_a_1p1d_cell_names_pd_sim_s_prefill_server_to_aiperf(tmp_path):
+    """Behind a router that is no LP the traffic LP posts each cancel to the
+    prefill server, at the port the cell hands pd_sim.sh."""
+    seen = tmp_path / "seen"
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    bash = shutil.which("bash")
+    (bin_ / "bash").write_text(
+        "#!/bin/sh\n"
+        'case "$1" in */pd_sim.sh)\n'
+        f'    echo "$PREFILL_PORT" >{seen}.port; echo "pd_sim: ready"; sleep 3; exit 1;;\n'
+        "esac\n"
+        f'exec {bash} "$@"\n'
+    )
+    (bin_ / "harness-python").write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = -c ] && exec echo "${PYTHONPATH%%:*}/compass_harness/x.py"\n'
+        f'echo "$COMPASS_HARNESS_PREFILL_URL" >{seen}.url\n'
+        "exit 3\n"
+    )
+    for f in bin_.iterdir():
+        f.chmod(0o755)
+    traces = tmp_path / "traces.jsonl"
+    traces.write_text('{"id": 0}\n')
+    run_file = tmp_path / "run.json"
+    run_file.write_text(json.dumps({"router_s": 2.0**-12}))
+    done = subprocess.run(
+        [bash, str(SCRIPT), str(run_file), str(tmp_path / "cell")],
+        cwd="/",
+        env=dict(
+            os.environ,
+            PATH=f"{bin_}:{os.environ['PATH']}",
+            MODEL=str(tmp_path),
+            TRACES=str(traces),
+            HARNESS_PYTHON=str(bin_ / "harness-python"),
+            WAIT_S="30",
+        ),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    url = Path(f"{seen}.url")
+    assert url.exists(), done.stdout + done.stderr
+    port = Path(f"{seen}.port").read_text().strip()
+    assert url.read_text().strip() == f"http://127.0.0.1:{port}"

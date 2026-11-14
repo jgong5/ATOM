@@ -50,8 +50,8 @@ from atom.compass.artifacts import (
     GateState,
     Key,
     Kind,
-    machine_spec_digest,
-    machine_spec_key,
+    keyed_platform,
+    machine_platform,
     member_name,
 )
 from atom.compass.backends.geometry import dtype_bytes as element_bytes
@@ -109,19 +109,6 @@ META_8B = meta_tree(16_000_000_000)
 
 STACK = {"rocm": "7.2.4", "aiter": "f4e7c7509", "rccl": "2.22.3", "torch": "2.10.0"}
 
-TOKENIZER = {
-    "id": "qwen3-151k-bpe",
-    "backend": "fast",
-    "vocab_size": 151936,
-    "fingerprint": "sha256:" + "a" * 64,
-    "applies_to": ["Qwen3ForCausalLM"],
-    "encode_fixed_s": 3.0e-4,
-    "encode_tokens_per_s": 2.0e6,
-    "decode_fixed_s": 1.5e-4,
-    "decode_tokens_per_s": 3.0e6,
-    "derate": 0.85,
-}
-
 DOCUMENT = {
     "schema_version": 1,
     "name": "mi355x-8gpu-2node",
@@ -129,12 +116,6 @@ DOCUMENT = {
         "authored_by": "tests/compass/test_memory_readings.py",
         "date": "2026-09-22",
         "origin": "assumed",
-    },
-    "host": {
-        "cpu": {"cores_physical": 96, "cores_logical": 192},
-        "tokenizers": [TOKENIZER],
-        "ipc": {"zmq_roundtrip_s": 5.0e-5, "shm_broadcast_s": 2.0e-5},
-        "http_intake": {"fixed_s": 2.0e-3, "per_byte_s": 2.0e-8},
     },
     "device": {
         "name": "MI355X",
@@ -168,6 +149,12 @@ DOCUMENT = {
         "router_relay_s": 1.5e-3,
     },
 }
+
+
+def spec_file(tmp_path) -> str:
+    """`DOCUMENT`, written to `tmp_path/spec.json`, as a command names a spec."""
+    (tmp_path / "spec.json").write_text(json.dumps(DOCUMENT))
+    return str(tmp_path / "spec.json")
 
 
 #: One rank's member of the `memory_readings` entry at each width, as
@@ -204,13 +191,12 @@ def publish_readings(store, config, document=DOCUMENT, readings=READINGS[1]):
     # As a run file carries it: JSON.
     machine = MachineSpec.from_mapping(json.loads(json.dumps(document)))
     fields = entry.key_fields(config)
+    platform = machine_platform(machine)
     key = Key.of(
-        Kind.MEMORY_READINGS, machine_spec=machine_spec_digest(machine), **fields
+        Kind.MEMORY_READINGS, **keyed_platform(Kind.MEMORY_READINGS, platform), **fields
     )
     store = ArtifactStore(store)
     if not store.directory_for(key).exists():
-        platform = machine_spec_key(machine).values
-        platform["torch"] = machine.value("device.software_pinned_to.torch")
         store.publish(
             key,
             provenance=STANZA,
@@ -346,9 +332,7 @@ def reserved(qwen, total_bytes):
 
 def model_terms(tree=META_8B):
     """`tree`'s model terms, the activations off the TP1 entry."""
-    return ModelTerms.from_tree(
-        tree, activations=measured(1).activations(WARMUP_TOKENS)
-    )
+    return ModelTerms.from_tree(tree, activations=measured(1).activations())
 
 
 def readings_at(spec, qwen, tp_width):
@@ -579,17 +563,14 @@ def test_the_graph_pool_reservation_follows_the_element_size(resident):
     assert reserved(config, 288.0e9).total == GRAPH_POOL_BY_DTYPE[name]
 
 
-def test_the_entry_measures_the_activations_at_its_own_warmup_and_scales_them():
+def test_the_entry_measures_the_activations_at_its_own_warmup():
     # One start reads `peak - current` over its warmup: measured at those
-    # tokens, and the coefficient times another count is an estimate.
-    term = measured(1).activations(WARMUP_TOKENS)
+    # tokens, which are the deployment's, so nothing scales it.
+    term = measured(1).activations()
     assert (term.nbytes, term.method) == (805_306_368, Method.MEASURED)
     assert (
         term.source == f"{SOURCE} activation_bytes over {WARMUP_TOKENS} warmup tokens"
     )
-    half = measured(1).activations(WARMUP_TOKENS // 2)
-    assert (half.nbytes, half.method) == (402_653_184, Method.ESTIMATED)
-    assert not half.validated
 
 
 @pytest.mark.parametrize(
@@ -622,7 +603,7 @@ def test_an_assumed_member_declares_every_term_built_on_it(qwen):
         tp_width=1,
         model=ModelTerms.from_tree(
             META_8B,
-            activations=measured(1, assumed=ASSUMED).activations(WARMUP_TOKENS),
+            activations=measured(1, assumed=ASSUMED).activations(),
         ),
         cudagraph_overhead=reserved(qwen, 288.0e9),
     )

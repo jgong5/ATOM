@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT
 """The step linear law under DP-attention with EP off: one law per rank, priced at
-the deployment's DP width, the group's step the max over its ranks. The checked-in
-DeepSeek-V4-Pro EP8 laws install at their own side's engine config only, and
-validate a step at every decode rung they fit.
+the deployment's DP width, the group's step the max over its ranks. A rung's hull
+holds each fitted step at the rank its vector prices it as, MoE column included,
+and at its rank of larger features where its ranks price alike; a rung that
+adopts a column is solved on those rows.
+The checked-in DeepSeek-V4-Pro EP8 laws install at their own side's engine config
+only, and validate a step at every decode rung they fit.
 
 Each rank's record is written from a known per-rank law, every line labelled
 with the group's step, the max over the ranks' prices, as a real DP group's
@@ -17,6 +20,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import test_step_linear_moe_column as routed
 from test_backend_step_linear import _installed, _without_step_stub, law
 from test_backend_step_linear_fit import SPEC, _engine_file, _fit, _record
 from test_memory_readings import META_8B, publish_readings
@@ -31,7 +35,9 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
+from atom.compass.backends.shape import sum_context
 from atom.compass.backends.step_linear import UNIFORM_ROUTING
+from atom.compass.backends.step_linear_fit import priced_rank
 
 DP = 4
 PREFILL = {
@@ -92,7 +98,7 @@ def _groups(seed, n=300):
 def _records(tmp_path, groups):
     """Rank `r`'s record, its labels stretched by `1 + 0.01 r`."""
     paths = []
-    for r in range(DP):
+    for r in range(len(groups[0][0])):
         steps = [
             (
                 [
@@ -149,16 +155,229 @@ def test_a_law_stating_key_refuses_by_name():
         StepLinearLaw(dict(law(), key=[8, 1]))
 
 
-@pytest.mark.parametrize("cap, decode", [(20, 4), (4, 4), (3, None)])
-def test_the_fit_records_whether_the_alternation_settled(
-    tmp_path, monkeypatch, cap, decode
+@pytest.mark.parametrize(
+    "cap, start, count", [(20, "all_rows", 4), (6, "all_rows", 4), (3, "context", 1)]
+)
+def test_the_fit_records_its_passes_and_a_start_at_the_limit_still_competes(
+    tmp_path, monkeypatch, cap, start, count
 ):
+    """Rung 4 settles in 4 passes from every rank's row, the start that goes
+    on, and in 1 from the `context` axis at the same `F`; another feature's
+    axis takes 7. A start the limit stops competes on the `F` it reached and
+    loses: that axis's below 7 passes, every rank's row's below 4."""
     from atom.compass.backends import step_linear_fit
 
-    monkeypatch.setattr(step_linear_fit, "MAD_PASSES", cap)
+    monkeypatch.setattr(step_linear_fit, "FIT_PASSES", cap)
     law_ = _fit(_records(tmp_path, _groups(0)), dp=DP)
-    assert law_["prefill"]["fit"]["passes"] == 1
-    assert law_["decode"]["4"]["fit"]["passes"] == decode
+    assert law_["prefill"]["fit"]["passes"]["count"] == 1
+    passes = law_["decode"]["4"]["fit"]["passes"]
+    assert (passes["start"], passes["count"], passes["stop"]) == (
+        start,
+        count,
+        "settled",
+    )
+    assert passes["F"] == pytest.approx(0.0, abs=1e-20)
+    assert law_["decode"]["4"]["coefficients"] == pytest.approx(DECODE, rel=1e-6)
+
+
+#: Two ranks' (context, graph_padding) in units of 800 tokens, six steps
+#: labelled by `DECODE`, on which the alternation from the fit on every rank's
+#: row settles with `context` near zero.
+CORNER = (
+    ((2, 3), (9, 5)),
+    ((9, 4), (8, 3)),
+    ((8, 9), (1, 2)),
+    ((9, 1), (1, 3)),
+    ((8, 4), (8, 4)),
+    ((1, 1), (8, 3)),
+)
+
+
+def test_a_fit_that_settles_from_every_rank_s_row_above_a_feature_s_start_goes_on_from_that_start(
+    tmp_path,
+):
+    """From the fit on every rank's row the alternation settles at `F` above
+    zero; from the `context` axis it reaches the per-rank law."""
+    groups = []
+    for ranks in CORNER:
+        views = [_decode_step(8, 800 * c, 800 * p) for c, p in ranks]
+        groups.append((views, max(_price(v) for v in views)))
+
+    vector = _fit(_records(tmp_path, groups), dp=2)["decode"]["8"]
+    assert vector["coefficients"] == pytest.approx(DECODE, rel=1e-6)
+    assert vector["fit"]["passes"]["start"] == "context"
+    assert vector["fit"]["passes"]["F"] == pytest.approx(0.0, abs=1e-20)
+
+
+#: A rank's wide rows and another's one tall row cost about the same.
+WIDE_OR_TALL = {
+    "step": 0.015,
+    "context": 2e-8,
+    "graph_padding": 1e-8,
+    "moe_experts": 1.5e-4,
+}
+
+
+def _wide_or_tall(seed, widths, wide):
+    """200 decode steps at rung 4, each the group's step under `WIDE_OR_TALL`:
+    rank 0 runs 4 rows of one context drawn from `wide`, rank 1 one row 1.4 to
+    1.9 times as long, which the rung pads, and the others `widths` short rows,
+    so that the group's MoE tokens vary from step to step."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(200):
+        n = int(rng.uniform(*wide))
+        contexts = [[n] * routed.RUNG, [int(n * rng.uniform(1.4, 1.9))]]
+        for _ in range(DP - 2):
+            contexts.append(rng.integers(1, 1000, rng.integers(*widths)).tolist())
+        views = [routed._view(c, sum(map(len, contexts))) for c in contexts]
+        out.append((views, max(routed._price(v, WIDE_OR_TALL) for v in views)))
+    return out
+
+
+def test_a_routed_rung_hulls_each_step_at_the_rank_it_prices(tmp_path):
+    """The alternation takes each step's row on the rung's features alone; the
+    experts column the rung then adopts moves some steps' costliest rank from
+    the wide one to the tall one. Each step prices inside the fitted hull at
+    the rank it is priced as."""
+    full = _wide_or_tall(0, routed.FULL, (110_000, 130_000))
+    sparse = _wide_or_tall(1, routed.SPARSE, (80_000, 100_000))
+    records = routed._records(tmp_path / "full", full)
+    records += routed._records(tmp_path / "sparse", sparse)
+    law_ = routed._routed(records)[0]
+    vector = law_["decode"][str(routed.RUNG)]
+    assert vector["fit"]["moe_column"]["adopted"] == "moe_experts"
+    assert vector["fit"]["dropped"] == 0
+
+    laws = [_fit(records, dp=DP), law_]
+    backends = [StepLinearBackend(StepLinearLaw(x), DP) for x in laws]
+    moved, outside = 0, []
+    for i, (views, _) in enumerate(full + sparse):
+        costs = [[b.price(v) for v in views] for b in backends]
+        top = [int(np.argmax([c.seconds for c in cost])) for cost in costs]
+        moved += top[0] != top[1]
+        if any(t.provenance.extrapolated for t in costs[1][top[1]].terms):
+            outside.append(i)
+    assert moved
+    assert outside == []
+
+
+@pytest.mark.parametrize("cap, stop", [(20, "settled"), (9, "settled"), (8, "limit")])
+def test_a_routed_rung_is_fitted_again_under_its_column(
+    tmp_path, monkeypatch, cap, stop
+):
+    """The experts column moves some steps' costliest rank off the row the
+    rung's features alone pick, so the rung is fitted again under it, from
+    every rank's row. Once no step moves, it is solved on the rows it
+    prices: the per-rank law, at the 9th pass. A limit one pass short ends
+    the fit there, its vector within a millionth of that law."""
+    from atom.compass.backends import step_linear_fit
+
+    monkeypatch.setattr(step_linear_fit, "FIT_PASSES", cap)
+    full = _wide_or_tall(2, routed.FULL, (110_000, 130_000))
+    sparse = _wide_or_tall(3, routed.SPARSE, (80_000, 100_000))
+    records = routed._records(tmp_path / "full", full)
+    records += routed._records(tmp_path / "sparse", sparse)
+    vector = routed._routed(records)[0]["decode"][str(routed.RUNG)]
+    passes = vector["fit"]["passes"]
+    assert (passes["count"], passes["stop"]) == (min(cap, 9), stop)
+    assert vector["coefficients"] == pytest.approx(WIDE_OR_TALL, rel=1e-6)
+
+
+#: Two ranks' (context, graph_padding) in thousands of tokens and the group's
+#: step in centiseconds, six steps on which the alternation by full refits
+#: cycles between two states that differ at the last step's rank.
+CYCLE = (
+    ((3, 4), (1, 2), 3.68),
+    ((3, 5), (1, 5), 3.9),
+    ((6, 5), (1, 5), 4.79),
+    ((1, 5), (1, 5), 3.36),
+    ((2, 1), (8, 2), 4.81),
+    ((7, 1), (5, 4), 4.22),
+)
+
+
+def test_an_alternation_that_cycles_on_full_refits_ends_at_a_tie_below_both(
+    tmp_path,
+):
+    """Solved on the rows one state picks, each state's vector picks the
+    other's. The fit's line search ends between them where the last step's
+    two ranks price alike, `F` below either state."""
+    from scipy.optimize import nnls
+
+    groups = [
+        ([_decode_step(8, 800 * c, 800 * p) for c, p in ranks], y / 100)
+        for *ranks, y in CYCLE
+    ]
+    x = np.array([[(1, 800 * c, 800 * p) for c, p in ranks] for *ranks, _ in CYCLE])
+    y = np.array([g[1] for g in groups])
+
+    def state(pick):
+        coef = nnls(x[np.arange(len(y)), pick] / y[:, None], np.ones(len(y)))[0]
+        return coef, tuple(np.argmax(x @ coef, axis=1))
+
+    def cost(coef):
+        return float((((x @ coef).max(axis=1) / y - 1) ** 2).sum())
+
+    a, b = (0, 0, 0, 0, 1, 0), (0, 0, 0, 0, 1, 1)
+    (coef_a, after_a), (coef_b, after_b) = state(a), state(b)
+    assert (after_a, after_b) == (b, a)
+
+    law_ = _fit(_records(tmp_path, groups), dp=2)
+    passes = law_["decode"]["8"]["fit"]["passes"]
+    assert passes["stop"] == "tie"
+    assert passes["F"] < min(cost(coef_a), cost(coef_b))
+    backend = StepLinearBackend(StepLinearLaw(law_), 2)
+    last = [backend.price(v).seconds for v in groups[-1][0]]
+    assert last[0] == pytest.approx(last[1], rel=1e-6)
+    for views, _ in groups:
+        costs = [backend.price(v) for v in views]
+        top = max(costs, key=lambda c: c.seconds)
+        assert not any(t.provenance.extrapolated for t in top.terms)
+
+
+def _alike(seed, n=300):
+    """`n` decode steps at rung 4, each rank 1 to 4 rows of a random context,
+    each step 20 ms whatever its rows."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(n):
+        views = []
+        for _ in range(DP):
+            width = int(rng.integers(1, 5))
+            rows = [
+                RequestShape(1, int(rng.integers(1, 50_000)), True)
+                for _ in range(width)
+            ]
+            views.append(BatchView(tuple(rows), 4, DP * 4))
+        out.append((views, 0.02))
+    return out
+
+
+def test_ranks_priced_alike_hull_each_step_at_its_rank_of_larger_features(tmp_path):
+    """Every step takes 20 ms, so the rung's vector prices a step's ranks alike
+    up to rounding, and the step is priced as its costliest rank of larger
+    features (`priced_rank`), which some steps' first costliest rank is not.
+    Each step prices inside the fitted hull at that rank."""
+    runs = [_alike(seed) for seed in (0, 1)]
+    records = []
+    for i, steps in enumerate(runs):
+        (tmp_path / str(i)).mkdir()
+        records += _records(tmp_path / str(i), steps)
+    backend = StepLinearBackend(StepLinearLaw(_fit(records, dp=DP)), DP)
+    tied, outside = 0, []
+    for i, (views, _) in enumerate(runs[0] + runs[1]):
+        costs = [backend.price(v) for v in views]
+        ranks = {
+            j: (c.target_seconds, (1, sum_context(v.decode), v.graph_padding))
+            for j, (c, v) in enumerate(zip(costs, views))
+        }
+        top = priced_rank(ranks)
+        tied += top != max(ranks, key=lambda j: ranks[j][0])
+        if any(t.provenance.extrapolated for t in costs[top].terms):
+            outside.append(i)
+    assert tied
+    assert outside == []
 
 
 def test_a_law_fitted_on_dp_records_joins_at_their_width_and_refuses_at_dp_1(
@@ -218,26 +437,40 @@ def test_a_stated_engine_file_contradicting_the_records_own_refuses(tmp_path):
 
 COMPASS = Path(__file__).resolve().parents[2] / "scripts" / "compass"
 GPU45 = json.loads((COMPASS / "machines" / "mi355x-gpu45.json").read_text())
+CRS005 = json.loads((COMPASS / "machines" / "mi355x-crs005.json").read_text())
+#: Each DeepSeek-V4-Pro EP8 law pair's file stem, the spec it was fitted under and
+#: the index cache dtype it is keyed to: the fp4 gpu-40's lone servers ran, the fp8
+#: a P/D side resolves.
+EP8_PAIRS = [
+    pytest.param(
+        "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661",
+        GPU45,
+        "fp4",
+        id="gpu45",
+    ),
+    pytest.param("deepseek-v4-pro-dpa8-ep8-mi355x-crs005", CRS005, "fp8", id="crs005"),
+]
 
 
 @pytest.mark.parametrize("side", ["prefill", "decode"])
-def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
-    monkeypatch, tmp_path, side
+@pytest.mark.parametrize("stem,spec,index", EP8_PAIRS)
+def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off_or_the_other_indexer(
+    monkeypatch, tmp_path, stem, spec, index, side
 ):
-    name = f"deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{side}.json"
-    fitted = json.loads((COMPASS / "laws" / name).read_text())
+    fitted = json.loads((COMPASS / "laws" / f"{stem}-{side}.json").read_text())
     engine = fitted["engine_config"]
     for key in PERFORMANCE_KEYS:
         monkeypatch.delenv(key, raising=False)
     for key, value in engine["env"].items():
         monkeypatch.setenv(key, value)
-    run = _without_step_stub(tmp_path, step_linear=fitted, machine=GPU45)
+    run = _without_step_stub(tmp_path, step_linear=fitted, machine=spec)
     monkeypatch.setenv(compass_run.ENV, str(run))
 
-    def installed(ep):
+    def installed(ep, index=index):
         r = deployment(
             tmp_path,
             **{k: engine[k] for k in ("kv_cache_block_size", "kv_cache_dtype")},
+            index_cache_dtype=index,
             quant_config=SimpleNamespace(compute_hash=lambda: engine["quantization"]),
             parallel_config=SimpleNamespace(
                 data_parallel_size=8, data_parallel_rank=0, pipeline_parallel_rank=0
@@ -249,7 +482,7 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
             enable_expert_parallel=ep,
             enable_tbo=engine["enable_tbo"],
         )
-        publish_readings(tmp_path / "store", r.config, GPU45)
+        publish_readings(tmp_path / "store", r.config, spec)
         compass_run.runner(r, META_8B)
         return r.compass_backend
 
@@ -258,6 +491,8 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
         ValueError, match="enable_expert_parallel True in the law and False here"
     ):
         installed(False)
+    with pytest.raises(ValueError, match="another engine config: index_cache_dtype"):
+        installed(True, {"fp4": "fp8", "fp8": "fp4"}[index])
 
 
 def _inside(hull: dict, features: tuple) -> dict:

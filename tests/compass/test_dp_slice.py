@@ -40,22 +40,17 @@ from atom.compass import run as compass_run
 from atom.compass.carriers import tracestate_with
 from atom.compass.clock import NER, LpId
 from atom.compass.detect.scenario import check_run
-from atom.compass.drive.serve import _free_ports
 from atom.compass.parity import read
 from atom.compass.runner.overrides import start_on_host
 from atom.utils import CpuGpuBuffer, clock
 from atom.utils.clock import LPRuntime
 from atom.utils.distributed import utils
+from tests.compass.held_ports import held_ports
 
 #: One request per entry, by its max_tokens; unequal, so one rank finishes first.
 MAX_TOKENS = (2, 4, 6, 8)
 #: The slice's machine.
 DP_MACHINE = copy.deepcopy(DOCUMENT)
-#: The tokenizers probed on the checked-in MI308X machine as well, so a slice
-#: model of theirs (Qwen3.8-27B) resolves its tokenizer.
-DP_MACHINE["host"]["tokenizers"] += json.loads(
-    (TREE / "scripts/compass/machines/mi308x-hjbog39.json").read_text()
-)["host"]["tokenizers"]
 #: Declared test values for a pipeline stage's send: every part is rendezvous.
 DP_MACHINE["interconnect"]["intra_node"]["pp"] = {
     carrier: {
@@ -73,10 +68,6 @@ DP_MACHINE["interconnect"]["intra_node"]["pp"]["gloo"] |= {
     "wake_s": 2.0**-12,
     "wake_rise_s": 2.0**-6,
 }
-#: The run test's machine: an HTTP intake of about a picosecond, so the four
-#: requests reach the engine together and each rank batches two.
-BATCHED = copy.deepcopy(DP_MACHINE)
-BATCHED["host"]["http_intake"] = {"fixed_s": 2.0**-40, "per_byte_s": 2.0**-60}
 DONE = "data: [DONE]"
 #: The slice's parallelism: two DP ranks at TP 1, with expert parallelism.
 DP_WIDTH = ["-tp", "2", "--enable-dp-attention", "--enable-expert-parallel"]
@@ -127,45 +118,45 @@ def run_dp_slice(
     `width` is the server's parallelism flags, `dp` the DP ranks and `pp` the
     pipeline stages they start; the parity record holds every stage's."""
     out.mkdir()
-    clock_port, port = _free_ports(2)
-    run_file = _run_file(
-        out,
-        clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
-        data_parallel_size=dp,
-        pipeline_parallel_size=pp,
-        step_stub=CONSTANT,
-        machine=machine,
-    )
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=seed,
-        PYTHONPATH=str(TREE),
-        AITER_LOG_LEVEL="WARNING",
-        ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
-    )
-    args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
-    args += width
-    args += ["--enforce-eager", "--max-model-len", "2048"]
-    publish_entry(out / "store", machine, args, env)
-    with open(out / "server.log", "w") as log:
-        server = subprocess.Popen(
-            [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
-            + ["--compass-run", str(run_file)],
-            cwd=TREE,
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
+    with held_ports(2) as (clock_port, port):
+        run_file = _run_file(
+            out,
+            clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
+            data_parallel_size=dp,
+            pipeline_parallel_size=pp,
+            step_stub=CONSTANT,
+            machine=machine,
         )
-        watchdog = threading.Timer(WALL_S, server.kill)
-        watchdog.start()
-        try:
-            traffic = Requests(json.loads(run_file.read_text()), port, server)
-            traffic.run()
-            code = server.wait(timeout=120)
-        finally:
-            watchdog.cancel()
-            if server.poll() is None:
-                server.kill()
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
+        )
+        args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
+        args += width
+        args += ["--enforce-eager", "--max-model-len", "2048"]
+        publish_entry(out / "store", machine, args, env)
+        with open(out / "server.log", "w") as log:
+            server = subprocess.Popen(
+                [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
+                + ["--compass-run", str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            watchdog = threading.Timer(WALL_S, server.kill)
+            watchdog.start()
+            try:
+                traffic = Requests(json.loads(run_file.read_text()), port, server)
+                traffic.run()
+                code = server.wait(timeout=120)
+            finally:
+                watchdog.cancel()
+                if server.poll() is None:
+                    server.kill()
     tail = (out / "server.log").read_text()[-4000:]
     assert code == 0, f"the server exited {code} after the finish:\n{tail}"
     return {
@@ -180,9 +171,9 @@ def run_dp_slice(
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("dp_slice")
-    return [
-        run_dp_slice(root / f"seed{seed}", seed, machine=BATCHED) for seed in ("1", "2")
-    ]
+    # With no HTTP intake term the four requests reach the engine together, and
+    # each rank batches two.
+    return [run_dp_slice(root / f"seed{seed}", seed) for seed in ("1", "2")]
 
 
 @NEEDS_A_RUN
@@ -242,6 +233,8 @@ def test_each_dp_rank_joins_the_engine_lp_as_its_own_member(monkeypatch, tmp_pat
     monkeypatch.setattr(clock, "_installed", None)
     monkeypatch.setattr(utils, "LP_OF_RANK", None, raising=False)
     monkeypatch.setattr(compass_run, "_member", None)
+    for name in clock.COLLECTIVES:  # the engine's bootstrap wraps each
+        monkeypatch.setattr(torch.distributed, name, getattr(torch.distributed, name))
     joined = []
     monkeypatch.setattr(
         compass_run, "connect", lambda lp, endpoint, member: joined.append((lp, member))
@@ -269,18 +262,6 @@ def test_the_authority_joins_the_ranks_and_releases_each_its_own_channels(tmp_pa
     assert [str(r) for r in ca.steps.rows if r.event == "release"] == [
         f"engine 0.0 1.0 release {request} 0 -"
     ]
-
-
-def test_a_standalone_authority_starts_the_run_once_every_rank_has_asked(tmp_path):
-    run = json.loads(_run_file(tmp_path, data_parallel_size=2).read_text())
-    ca = compass_run._RecordingAuthority(run)
-    ca.on_request(LpId("traffic"), NER, math.inf, [])
-    ca.on_request(compass_run.FRONTEND, NER, math.inf, [])
-    # The member positionally, as the clock transport passes it.
-    ca.on_request(compass_run.ENGINE, NER, math.inf, [], math.inf, "dp0")
-    assert ca.started is None
-    ca.on_request(compass_run.ENGINE, NER, math.inf, [], math.inf, "dp1")
-    assert ca.started is not None
 
 
 # Each rank's own `priced_steps` reply; no field is equal across the ranks.
@@ -324,7 +305,7 @@ def _finish(monkeypatch, tmp_path, ranks):
         worker = SimpleNamespace(call_func=lambda name, wait_out, r=replies: r[name])
         compass_run.engine_done(SimpleNamespace(runner_mgr=worker))
 
-    authority.started = authority.finished = time.monotonic()
+    authority.finished = time.monotonic()
     monkeypatch.setattr(compass_run, "_authority", authority)
     frontend = LPRuntime(compass_run.FRONTEND, table, None)
     frontend.now = math.inf

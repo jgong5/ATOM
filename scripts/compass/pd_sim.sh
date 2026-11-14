@@ -48,7 +48,8 @@
 # BENCHMARK_KIND=aiperf_agentic or a rank mapping policy other than none, that
 # is --dp-aware: the router chooses among DP ranks on load that responses
 # move, which makes it LP `router` of the run, and RUN_FILE gains `router_in_s`
-# unless it has one already, and `router`, the binary that runs it, refused unless built from this tree's
+# unless it has one already, at `ipc_s`, borrowed: Atomesh logs no receipt to
+# measure its own from; and `router`, the binary that runs it, refused unless built from this tree's
 # atom/mesh (`router_binary` in atom/compass/run). Several servers of a side
 # make it LP `router` too, as it chooses among them. As LP `router` it lists
 # each side's workers in RUN_FILE's `worker_order`, else sorted. Otherwise
@@ -92,6 +93,7 @@ done
 read -r PREFILLS DECODES < <(python3 -c 'import json, sys
 run = json.load(open(sys.argv[1]))
 print(run.get("prefill_instances", 1), run.get("decode_instances", 1))' "$RUN_FILE")
+on_arch=$(compass_on_arch "$RUN_FILE")
 
 server() { # role port kv_role dp_port instance count [exec]
     # Above one server of a side each is named, and names itself, by its index.
@@ -102,8 +104,8 @@ server() { # role port kv_role dp_port instance count [exec]
     # timeout takes a grant, would differ between runs. Only the router closes.
     local extra=${DECODE_ARGS:-} vars=${DECODE_ENV:-}
     [[ $1 == prefill ]] && extra=${PREFILL_ARGS:-} vars=${PREFILL_ENV:-}
-    # shellcheck disable=SC2086 # DECODE_EXEC, the side's variables and the server flags are word lists
-    ${7:-} env "${passed[@]}" $vars ${ATOM_COMPASS_PARITY_RECORD:+"ATOM_COMPASS_PARITY_RECORD=$ATOM_COMPASS_PARITY_RECORD/$name"} python3 -m atom.entrypoints.openai_server \
+    # shellcheck disable=SC2086 # DECODE_EXEC, the side's variables, on_arch and the server flags are word lists
+    ${7:-} env "${passed[@]}" $vars ${ATOM_COMPASS_PARITY_RECORD:+"ATOM_COMPASS_PARITY_RECORD=$ATOM_COMPASS_PARITY_RECORD/$name"} python3 $on_arch -m atom.entrypoints.openai_server \
         --model "$MODEL" --host 127.0.0.1 --server-port "$2" --timeout-keep-alive 1000000 \
         --data-parallel-master-port "$4" \
         $SERVER_ARGS $extra \
@@ -156,7 +158,7 @@ if ((${#dp_aware[@]} || PREFILLS > 1 || DECODES > 1)); then
     lp=$(python3 - "$RUN_FILE" "$ATOMESH" "$PREFILL_PORT" "$DECODE_PORT" <<'EOF'
 import json, sys
 from pathlib import Path
-from atom.compass.run import ROUTER, channel_table, router_binary, worker_order
+from atom.compass.run import ROUTER, channel_table, hop, router_binary, worker_order
 
 path = Path(sys.argv[1])
 run = json.loads(path.read_text())
@@ -165,7 +167,7 @@ try:
     order = worker_order(run)
 except Exception as e:
     sys.exit(f"pd_sim: {e}")
-run.setdefault("router_in_s", run["ipc_s"])
+run.setdefault("router_in_s", hop(run, "ipc_s"))
 path.write_text(json.dumps(run))
 table = channel_table(run)
 print(json.dumps({c.name: table.lookahead(c.name) for c in table.channels_from(ROUTER)}))
@@ -203,7 +205,8 @@ done
 env "${router_env[@]}" "$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --pd-disaggregation \
     "${urls[@]}" \
     "${router[@]}" --backend atom --disable-health-check --disable-circuit-breaker \
-    --disable-retries --prometheus-port "$PROMETHEUS_PORT" --log-level info \
+    --disable-retries --request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S" \
+    --prometheus-port "$PROMETHEUS_PORT" --log-level info \
     >"$OUT/router.log" 2>&1 &
 compass_wait_up router $! "http://127.0.0.1:$ROUTER_PORT/v1/models"
 echo "pd_sim: ready"

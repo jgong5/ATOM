@@ -6,9 +6,11 @@ with ``atom.compass.parity.client_run``.
 Stand-ins on ``PATH``: a ``curl`` the server's ``/health`` answers, and a
 harness Python whose probes answer as one holding this tree's compass-harness,
 its aiperf plugin installed when ``$HARNESS_PLUGIN`` is set, and whose aiperf
-saves how it ran to ``$SEEN`` and writes the export and raw records ``$SPEC``
-holds, its dataset the trace files it was given. Each
-breaks the step ``$BREAK`` names. With ``--stop``, a stand-in compass command
+saves how it ran to ``$SEEN``, writes the export and raw records ``$SPEC``
+holds, its dataset the trace files it was given, then prints ``$SPEC``'s
+``log`` and exits its ``rc``. Each
+breaks the step ``$BREAK`` names; ``hang`` makes aiperf write its pid to
+``$SEEN`` and sleep. With ``--stop``, a stand-in compass command
 serves a ``sleep``. Nothing needs a driver, a server or aiperf.
 """
 
@@ -24,13 +26,15 @@ from pathlib import Path
 
 import pytest
 from test_parity_client_run import ARGUMENTS, CONFIG, PARAMETERS, raw, sse
+from test_smoke_cell import _alive
 
 from atom.compass.parity.client_run import NAME, RAW
+from atom.compass.validate.__main__ import WORKLOAD, _odd_workloads
 
 TREE = Path(__file__).resolve().parents[2]
 SCRIPT = TREE / "scripts/compass/client.sh"
 HARNESS = r"""
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
 a, brk = sys.argv[1:], os.environ.get("BREAK")
 if "import compass_harness" in a[1]:
@@ -44,6 +48,10 @@ if "profile" not in a:
     sys.exit()
 if brk == "aiperf":
     sys.exit(3)
+if brk == "hang":
+    Path(os.environ["SEEN"] + ".t").write_text(str(os.getpid()))
+    os.rename(os.environ["SEEN"] + ".t", os.environ["SEEN"])
+    time.sleep(600)
 Path(os.environ["SEEN"]).write_text(json.dumps([a, dict(os.environ), os.getcwd()]))
 spec = json.loads(Path(os.environ["SPEC"]).read_text())
 art = Path(a[a.index("--artifact-dir") + 1])
@@ -54,6 +62,8 @@ dataset |= {"random_seed": 20260707, "path": a[a.index("--input-file") + 1]}
 config = spec["config"] | {"datasets": [dataset]}
 export = {"input_config": config, "benchmark_id": "000000000000"}
 (art / "profile_export_aiperf.json").write_text(json.dumps(export))
+print(spec.get("log", ""), end="")
+sys.exit(spec.get("rc", 0))
 """
 #: Serves a `sleep` until SIGTERM, then writes run.json and exits.
 COMMAND = """
@@ -171,6 +181,25 @@ def test_a_run_file_makes_the_client_simulated(tmp_path, simulated):
     }
 
 
+@pytest.mark.parametrize("deployed", [True, False])
+def test_a_deploy_sh_out_names_its_prefill_instance_to_aiperf(tmp_path, deployed):
+    """Behind a router that is no LP the traffic LP posts each cancel to the
+    prefill instance, whose URL a deploy.sh OUT's prefill/server.json names;
+    the caller's own value never reaches aiperf."""
+    out, env = _setup(tmp_path, SIM)
+    if deployed:
+        (out / "prefill").mkdir()
+        server = {"url": "http://10.0.0.5:8010", "pid": 1}
+        (out / "prefill/server.json").write_text(json.dumps(server))
+    stale = {"COMPASS_HARNESS_PREFILL_URL": "http://stale:1"}
+    done = _client(out, *GOOD, env=env | stale)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+    _, aiperf_env, _ = json.loads((tmp_path / "seen.json").read_text())
+    named = aiperf_env.get("COMPASS_HARNESS_PREFILL_URL")
+    assert named == ("http://10.0.0.5:8010" if deployed else None)
+
+
 #: The nightly's client arguments and aiperf timeouts client.sh has no default for.
 NIGHTLY = (
     "--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75"
@@ -210,6 +239,67 @@ def test_a_failed_export_names_its_step(tmp_path):
     assert done.returncode == 1, done.stdout + done.stderr
     assert "two requests got response id a" in done.stderr
     assert done.stderr.splitlines()[-1].startswith("client: export: ")
+    assert not (out / "artifacts" / NAME).exists()
+
+
+#: aiperf's console from a c=1 record on node 18 that failed the scenario's
+#: coverage check, its exit errors panel cut to the lines read here.
+COVERAGE = """\
+04:52:16.360 ERROR    Profiling metric coverage below the required 95.0% for phase \
+'profiling': TTFT=87.5%, inter-token latency=93.0% over the configured 1800.0s \
+duration. Neither latency signal extended into the final 90.0s before the nominal \
+profiling end; check inference server logs for a stalled or unavailable server. \
+(records_manager.py:1834)
+╭─ AIPerf System Exit Errors ──────────────────────────────────────────────────╮
+│ • Service: records_manager                                                   │
+│    Operation: profile_results_validation                                     │
+│    Error: ProfileMetricCoverageError                                         │
+│    Reason: Profiling metric coverage below the required 95.0% for phase      │
+╰──────────────────────────────────────────────────────────────────────────────╯
+"""
+#: Another exit error's entry, as aiperf printed it on node 18.
+NO_RESULTS = """\
+│ • Service: system_controller                                                 │
+│    Operation: export_results                                                 │
+│    Error: Unknown                                                            │
+│    Reason: No profile results to export. A required service likely failed    │
+"""
+
+
+def test_aiperfs_coverage_check_alone_fails_no_client_run(tmp_path):
+    out, env = _setup(tmp_path, SIM)
+    spec = json.loads((tmp_path / "spec.json").read_text())
+    spec |= {"log": COVERAGE, "rc": 1}
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    done = _client(out, *GOOD, env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (out / "artifacts" / NAME).exists()
+    assert (
+        "client: aiperf failed its coverage check alone: Profiling metric coverage "
+        "below the required 95.0% for phase 'profiling': TTFT=87.5%, inter-token "
+        "latency=93.0% over the configured 1800.0s duration"
+    ) in done.stdout.splitlines()
+
+
+@pytest.mark.parametrize(
+    "log, rc",
+    [
+        (COVERAGE.replace("╰", NO_RESULTS + "╰", 1), 1),
+        (COVERAGE, 2),
+        (COVERAGE.replace("ProfileMetricCoverageError", "Unknown"), 1),
+        ("", 1),
+    ],
+    ids=["another error beside it", "another exit status", "another error", "none"],
+)
+def test_any_other_aiperf_failure_fails_the_client_run(tmp_path, log, rc):
+    out, env = _setup(tmp_path, SIM)
+    spec = json.loads((tmp_path / "spec.json").read_text())
+    spec |= {"log": log, "rc": rc}
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    done = _client(out, *GOOD, env=env)
+    assert done.returncode == 1, done.stdout + done.stderr
+    last = done.stderr.splitlines()[-1]
+    assert fnmatchcase(last, f"client: aiperf: exited {rc}; see */client/aiperf.log")
     assert not (out / "artifacts" / NAME).exists()
 
 
@@ -348,6 +438,48 @@ def test_its_workload_is_the_one_cctraces_sim_writes_for_the_same_cell(tmp_path,
     assert workload == run["workload"]
 
 
+#: A real server's server.json: no run file.
+REAL = {k: SIM[k] for k in ("url", "pid")}
+AGENTX = ["--agentx", "--concurrency", "3"]
+
+
+@pytest.mark.parametrize("agentx", [True, False], ids=["agentx", "base"])
+@pytest.mark.parametrize("server", [SIM, REAL], ids=["simulated", "real"])
+def test_only_agentx_against_a_real_server_leaves_aiperfs_scrape_on(
+    tmp_path, agentx, server
+):
+    """aiperf scrapes the server's /metrics unless given --no-server-metrics.
+    --agentx gives it a simulated server's client alone, whose compass-harness
+    refuses the scrape, and out of the hashed arguments; base mode gives it
+    both clients, in them, as its graded runs recorded."""
+    out, env = _setup(tmp_path, server)
+    done = _client(out, *(AGENTX if agentx else GOOD), env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    argv = json.loads((tmp_path / "seen.json").read_text())[0]
+    scraped = agentx and server is REAL
+    assert argv.count("--no-server-metrics") == (0 if scraped else 1)
+    hashed = json.loads((out / "artifacts/workload.json").read_text())["aiperf_args"]
+    assert ("--no-server-metrics" in hashed) is not agentx
+
+
+def test_a_real_and_a_simulated_agentx_run_write_one_workload(tmp_path):
+    """The cell grader refuses a cell whose runs ran different workloads; a
+    real and a simulated --agentx run differ only in aiperf's scrape, which
+    changes what it writes, not what it sends."""
+    cell, runs = tmp_path / "cell", {"real1": REAL, "step_linear": SIM}
+    cell.mkdir()
+    for name, server in runs.items():
+        (tmp_path / name).mkdir()
+        out, env = _setup(tmp_path / name, server)
+        done = _client(out, *AGENTX, env=env)
+        assert done.returncode == 0, done.stdout + done.stderr
+        (cell / name).symlink_to(out)
+    # A run's run.json names no workload; client.sh's workload.json states it.
+    assert _odd_workloads(cell, {n: {} for n in runs}) == {}
+    real, simulated = ((cell / n / WORKLOAD).read_text() for n in runs)
+    assert real == simulated
+
+
 def test_both_clients_strip_payloads_and_gzip_the_raw_records_once_exported(tmp_path):
     out, env = _setup(tmp_path, SIM)
     done = _client(out, *GOOD, env=env)
@@ -375,3 +507,29 @@ def test_both_clients_strip_payloads_and_gzip_the_raw_records_once_exported(tmp_
         assert not (art / RAW).exists()
         with gzip.open(art / (RAW + ".gz"), "rt") as f:
             assert [json.loads(line) for line in f] == spec["raw"]
+
+
+def test_sigterm_during_aiperf_leaves_it_not_running(tmp_path):
+    out, env = _setup(tmp_path, SIM)
+    seen = tmp_path / "seen.json"
+    p = subprocess.Popen(
+        ["bash", SCRIPT, out, *GOOD],
+        cwd="/",
+        env=env | {"BREAK": "hang"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not seen.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        p.terminate()
+        _, err = p.communicate(timeout=60)
+    finally:
+        p.kill()
+    pid = int(seen.read_text())
+    alive = _alive(pid)
+    alive and os.kill(pid, signal.SIGKILL)
+    assert p.returncode == -signal.SIGTERM, err
+    assert not alive

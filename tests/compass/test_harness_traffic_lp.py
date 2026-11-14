@@ -9,16 +9,20 @@ strategy is a stand-in that schedules the next turn a fixed delay after a
 return, on a ``ClockPacedLoopScheduler`` paced by the traffic LP. The hold
 tests replace the authority with a scripted runtime, so a return can be put
 on either side of its final event's release. The stop tests serve a run's
-recording authority over TCP and stop it as a SIGTERM does. Skips by name as
-``test_harness_pacing.py`` does.
+recording authority over TCP and stop it as a SIGTERM does. The shutdown
+tests run aiperf's own system controller, as plugin discovery resolves it,
+on the router's messages. Skips by name as ``test_harness_pacing.py`` does.
 """
 
 import asyncio
+import contextlib
 import heapq
 import json
 import math
+import os
 import re
 import shutil
+import socket
 import threading
 import time
 import uuid
@@ -46,18 +50,32 @@ if _why := _missing():
         allow_module_level=True,
     )
 
-from aiperf.plugin import plugins  # noqa: F401  plugin discovery, as in aiperf
+from aiperf.plugin import plugins  # plugin discovery, as in aiperf
 
 # isort: split
 import aiperf
 import zmq
 import zmq.asyncio
-from aiperf.common.enums import CreditPhase
+from aiperf.common.enums import (
+    CreditPhase,
+    LifecycleState,
+    make_result_producer_capability,
+)
+from aiperf.common.hooks import AIPerfHook
+from aiperf.common.messages import Message, RegisterServiceCommand
+from aiperf.common.mixins import HooksMixin
+from aiperf.controller.result_join_coordinator import ResultJoinCoordinator
+from aiperf.controller.system_controller import SystemController
 from aiperf.credit.sticky_router import StickyCreditRouter
+from aiperf.plugin.enums import PluginType, ServiceType
+from compass_harness.controller import CompassSystemController
 from compass_harness.router import CompassCreditRouter
 from compass_harness.scheduler import ClockPacedLoopScheduler
+from compass_harness.strategy import ClockPhaseRunner
+from compass_harness.timesource import ClockTimer
 from compass_harness.traffic_lp import (
     HTTP,
+    PREFILL_URL_ENV,
     STREAM,
     SendAfterCancel,
     TrafficLP,
@@ -69,6 +87,7 @@ from atom.compass import clock_transport
 from atom.compass import run as compass_run
 from atom.compass.clock import (
     NER,
+    ClockAbort,
     ClockAuthority,
     LpId,
     prefill_decode_table,
@@ -79,7 +98,7 @@ from atom.utils.clock import LPRuntime, Straggler
 from compass_harness import ADDRESS_ENV, fingerprint, traffic_lp
 
 #: The run file's table keys, as the deployment writes them.
-RUN = {"admission_path": "serving", "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+RUN = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
 TABLE = single_engine_table(**RUN)
 FRONTEND, ENGINE = LpId("frontend"), LpId("engine")
 INF = math.inf
@@ -146,7 +165,10 @@ class Frontend(threading.Thread):
 
 async def _trace(endpoint, prefix, monkeypatch, *, requests, drop=(), logged=None):
     """Run `requests` turns, each `DELAY` after the last one's return."""
-    monkeypatch.setattr(StickyCreditRouter, "__init__", lambda self, **kw: None)
+    comms = SimpleNamespace(create_pub_client=lambda address: None)
+    monkeypatch.setattr(
+        StickyCreditRouter, "__init__", lambda s, **kw: setattr(s, "comms", comms)
+    )
     sent = []
     monkeypatch.setattr(
         StickyCreditRouter, "send_credit", lambda self, credit: _record(sent, credit)
@@ -252,6 +274,98 @@ def test_a_dropped_response_is_named_at_the_finish(ca, monkeypatch):
     assert re.search(named, message)
 
 
+class IdleEngine(threading.Thread):
+    """The engine LP with nothing to run: its only clock wait is a daemon
+    deadline every second, as its metrics push is. It records each finite grant."""
+
+    def __init__(self, endpoint) -> None:
+        super().__init__(name="engine", daemon=True)
+        self.endpoint, self.grants = endpoint, []
+
+    def run(self) -> None:
+        rt = LPRuntime(ENGINE, TABLE, clock_transport.connect(ENGINE, self.endpoint))
+        while (g := rt.next_event(INF, rt.now + 1.0)) != INF:
+            self.grants.append(g)
+
+
+async def _wait_for_return(endpoint, prefix, monkeypatch, grace, sent):
+    """Send request 0 if `sent`, and wait for its return as aiperf's phase
+    runner does, with a `grace` deadline; then finish. A pacing timer due past
+    the deadline is pending meanwhile and cancelled after it, as the phase's
+    end cancels a turn scheduled past it."""
+    traffic = TrafficLP.from_env()
+    monkeypatch.setattr(ClockPacedLoopScheduler, "clock", traffic)
+    returned = asyncio.Event()
+
+    async def on_return(worker_id, ret):
+        returned.set()
+
+    loop = asyncio.get_running_loop()
+    frontend = Frontend(endpoint, prefix, loop, traffic.hold(on_return))
+    frontend.start()
+    await traffic.subscribed(1)
+    if sent:
+        traffic.send(_key(0))
+    pacing = ClockTimer(grace + 100.0, lambda: None)
+    # The deadline wait reads nothing else of its runner.
+    timed_out = await ClockPhaseRunner._wait_for_event_with_timeout(
+        SimpleNamespace(info=lambda message: None),
+        name="profiling phase credits returned",
+        event=returned,
+        timeout=grace,
+        task_to_cancel=None,
+    )
+    pacing.cancel()
+    at = traffic.now()
+    traffic.finish()
+    await traffic.done
+    frontend.join(10)
+    return timed_out, at
+
+
+#: Request 0's final event reaches the traffic LP here: the client run's end.
+END = ADMIT + EVENTS[-1] + STREAM_S
+
+
+@pytest.mark.parametrize(
+    ("grace", "sent", "waited", "end"),
+    [
+        (300.0, True, (False, END), END),
+        (0.75, True, (True, 0.75), END),
+        (5.0, False, (True, 5.0), 5.0),
+    ],
+    ids=["withdrawn", "fired", "idle"],
+)
+def test_a_grace_deadline_keeps_no_lp_running_past_the_last_request_s_end(
+    grace, sent, waited, end, tmp_path, monkeypatch
+):
+    """aiperf waits for request 0's return with a grace deadline while the
+    idle engine ticks every second. At 300 s the return comes first and aiperf
+    withdraws the deadline: every LP is granted ``+inf`` at the request's end,
+    with no tick granted past it. At 0.75 s the deadline falls inside the
+    request and fires there. With no request sent, the deadline is the only
+    work, and the clock runs to it. The pacing timer due past the deadline
+    moves no LP past it in any case."""
+    authority = ClockAuthority(TABLE)
+    endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
+    server = clock_transport.serve(authority, endpoint)
+    run_file = tmp_path / "run.json"
+    run_file.write_text(json.dumps({"clock_endpoint": endpoint, "bound_s": 1e6, **RUN}))
+    monkeypatch.setenv(RUN_ENV, str(run_file))
+    monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / "lp"))
+    engine = IdleEngine(endpoint)
+    engine.start()
+    prefix = str(tmp_path / "lp")
+    try:
+        got = _run(_wait_for_return(endpoint, prefix, monkeypatch, grace, sent))
+    finally:
+        engine.join(10)
+        server.close()
+    assert got == waited
+    assert max(clock for _, clock in authority.final_clocks) == end
+    assert engine.grants == [float(k) for k in range(1, math.floor(end) + 1)]
+
+
 def test_a_client_bound_at_a_stop_names_its_open_request(tmp_path):
     """The frontend, the engine and the traffic LP each hold a TCP connection,
     as a deployment's processes do. The frontend takes request 0, then stops
@@ -345,7 +459,8 @@ class ScriptedRuntime:
     """The traffic LP's runtime with its grants scripted instead of asked for.
 
     Each script entry ``(G, seqs)`` is the next grant and the stream seqs it
-    releases; a clock call whose target comes first is granted the target.
+    releases; a clock call whose target or daemon deadline comes first is
+    granted that.
     """
 
     def __init__(self, script, stream=STREAM) -> None:
@@ -360,7 +475,8 @@ class ScriptedRuntime:
     def check_arrival(self, ch, arrival, seq) -> None:
         pass
 
-    def next_event(self, t):
+    def next_event(self, t, t_daemon=INF):
+        t = min(t, t_daemon)
         self.calls.append(t)
         if self.script and self.script[0][0] <= t:
             self.now, seqs = self.script.pop(0)
@@ -524,6 +640,90 @@ def test_a_slow_report_with_no_errored_request_keeps_the_hold_waiting(
     assert passed == [None] and calls[-1] == INF
 
 
+def test_a_grant_resolves_only_the_clock_waits_it_makes_due(tmp_path):
+    """Waits for 2 and 5, with a grant at 1 that comes before the time asked,
+    as an arrival's does: each wait resolves at the grant that reaches its
+    time, and each clock call asks for the earliest one pending."""
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, set())])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        resolved = {}
+
+        async def waiter(t):
+            await traffic.wait(t)
+            resolved[t] = traffic.now()
+
+        await asyncio.gather(waiter(2.0), waiter(5.0))
+        traffic.done.cancel()
+        return resolved, rt.calls
+
+    resolved, calls = _run(main())
+    assert resolved == {2.0: 2.0, 5.0: 5.0}
+    assert calls == [2.0, 2.0, 5.0]
+
+
+def test_a_task_ending_while_the_hold_waits_on_a_return_has_its_callbacks_run_first(
+    tmp_path,
+):
+    """aiperf's return callback yields, so the hold waits for it, then starts a
+    task that ends at its first step, as a turn the replay barrier holds does:
+    that task's done callbacks run before the traffic LP asks for time again."""
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, {0})])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        calls_at_done = []
+
+        async def ends_at_once():
+            pass
+
+        async def on_return(worker_id, ret):
+            await asyncio.sleep(0)
+            ended = asyncio.ensure_future(ends_at_once())
+            ended.add_done_callback(lambda _: calls_at_done.append(len(rt.calls)))
+
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(str(tmp_path / "lp"))[1])
+        traffic.send(_key(0))
+        push.send_pyobj((_key(0), 0, 1.0, True))
+        await traffic.hold(on_return)(
+            "worker_0", SimpleNamespace(credit=_credit(0), error=None)
+        )
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 5)
+        finally:
+            push.close(linger=0)
+        return calls_at_done
+
+    # The final event's grant answers the first clock call; the task ends in its hold.
+    assert _run(main()) == [1]
+
+
+def test_a_task_ending_while_the_owner_idles_has_its_callbacks_run_first(tmp_path):
+    """The owner idles with no request open, no clock wait and no finish; a
+    task sends a request and ends in one step, so its done callbacks queue
+    behind the owner's wake: they run before the traffic LP asks for time."""
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, {0})])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        calls_at_done = []
+        await asyncio.sleep(0.05)  # the owner settles, then idles
+
+        async def sends():
+            traffic.send(_key(0))
+
+        sent = asyncio.ensure_future(sends())
+        sent.add_done_callback(lambda _: calls_at_done.append(len(rt.calls)))
+        await asyncio.sleep(0.05)
+        traffic.done.cancel()
+        return calls_at_done
+
+    assert _run(main()) == [0]
+
+
 class ScriptedConn:
     """A Clock Authority connection whose grants are scripted: grant ``k``
     releases stream seq ``k`` at ``k + 1``, then ``+inf`` ends the run. Each
@@ -576,6 +776,76 @@ def test_a_pass_scans_only_the_open_stream_events(tmp_path):
     assert held_at_call == [0] * (n + 1)
 
 
+class ReportedDuringTheCall(ScriptedConn):
+    """Grant ``k`` releases stream seq ``k - 1`` of request 0, the last one
+    final; that event's report reaches the traffic LP's socket while the owner
+    is blocked in the clock call, as a worker's report usually does. Each grant
+    also puts a marker on the event loop, and each clock call records how many
+    markers have run: the loop's turns since the first grant."""
+
+    def __init__(self, grants: int) -> None:
+        super().__init__(grants)
+        self.push = self.pull = None
+        self.turns, self.turns_at_call = [], []
+
+    def send(self, msg) -> None:
+        super().send(msg)
+        self.turns_at_call.append(len(self.turns))
+
+    def recv(self):
+        if self.k < self.grants:
+            seq = self.k
+            last = seq == self.grants - 1
+            self.push.send_pyobj((_key(0), seq, float(seq + 1), last))
+            while not self.pull.get(zmq.EVENTS) & zmq.POLLIN:
+                time.sleep(0.001)
+            asyncio.get_running_loop().call_soon(self.turns.append, seq)
+        return super().recv()
+
+
+def test_a_report_in_the_socket_at_its_grant_counts_without_a_turn_of_the_event_loop(
+    tmp_path, monkeypatch
+):
+    """The owner takes each report already in its socket and asks for its next
+    time with no turn of the event loop between, while a pacing timer waits on
+    the clock for a time past every grant; only the final event's grant, whose
+    return aiperf must take, waits for one."""
+    n = 20
+
+    async def main():
+        conn = ReportedDuringTheCall(n)
+        conn.rt = rt = LPRuntime(LpId("traffic"), TABLE, conn)
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        monkeypatch.setattr(ClockPacedLoopScheduler, "clock", traffic)
+        scheduler = ClockPacedLoopScheduler()
+        scheduler.schedule_later(10.0 * n, _nothing())
+        conn.pull = traffic._pull
+        conn.push = zmq.Context.instance().socket(zmq.PUSH)
+        conn.push.connect(addresses(str(tmp_path / "lp"))[1])
+        passed = []
+
+        async def on_return(worker_id, ret):
+            passed.append(ret.credit.id)
+
+        traffic.send(_key(0))
+        await traffic.hold(on_return)(
+            "worker_0", SimpleNamespace(credit=_credit(0), error=None)
+        )
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 10)
+        finally:
+            conn.push.close(linger=0)
+            scheduler.cancel_all()
+        return passed, conn.turns_at_call
+
+    passed, turns_at_call = _run(main())
+    assert passed == [0]
+    # Call k follows grant k; the loop first turns in the final event's hold,
+    # after grant n.
+    assert turns_at_call == [0] * n + [n]
+
+
 def test_a_raising_return_callback_does_not_stop_later_returns(tmp_path, caplog):
     async def main():
         traffic = TrafficLP(ScriptedRuntime([]), str(tmp_path / "lp"))
@@ -599,7 +869,12 @@ def test_a_raising_return_callback_does_not_stop_later_returns(tmp_path, caplog)
 
 
 def test_a_second_send_credit_call_site_refuses_the_package(tmp_path):
-    shutil.copytree(Path(aiperf.__file__).parent, tmp_path / "aiperf")
+    # Another gate shard may be writing bytecode into __pycache__ as this copies.
+    shutil.copytree(
+        Path(aiperf.__file__).parent,
+        tmp_path / "aiperf",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     fingerprint.check(tmp_path)
     path = tmp_path / "aiperf" / "timing" / "intervals.py"
     path.write_text(
@@ -729,6 +1004,90 @@ def test_behind_the_router_lp_requests_cancels_and_the_stream_cross_it(
     assert published[1] == (_key(0), 2.0 + ADMIT, 1, "cancel")
 
 
+#: frontend-P's URL, as a launcher names it.
+PREFILL_URL = "http://127.0.0.1:8010"
+
+
+@pytest.mark.parametrize(
+    "router_in_s, channels, to",
+    [
+        (
+            None,
+            ("traffic->frontend-P:http", "frontend-D->traffic:stream"),
+            (PREFILL_URL,),
+        ),
+        (2.0**-14, ("traffic->router:http", "router->traffic:stream"), ()),
+    ],
+    ids=["plain-router", "router-lp"],
+)
+def test_only_behind_a_plain_router_a_cancel_carries_frontend_p_s_url(
+    router_in_s, channels, to, tmp_path, monkeypatch
+):
+    """With frontend-P's URL named, aiperf's cancel of a request open at the
+    grace deadline, 2.0, is stamped on the request's channel and published with
+    that URL behind a PD router that is no LP, which answers a cancel 400, and
+    without it behind the router LP, which hands it on."""
+    pd = {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10}
+    if router_in_s is not None:
+        pd["router_in_s"] = router_in_s
+    endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
+    server = clock_transport.serve(
+        ClockAuthority(prefill_decode_table(**RUN, **pd)), endpoint
+    )
+    run_file = tmp_path / "run.json"
+    run_file.write_text(
+        json.dumps({"clock_endpoint": endpoint, "bound_s": 1e6, **RUN, **pd})
+    )
+    monkeypatch.setenv(RUN_ENV, str(run_file))
+    monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / "lp"))
+    monkeypatch.setenv(PREFILL_URL_ENV, PREFILL_URL)
+    stream = channels[1]
+    monkeypatch.setattr(
+        traffic_lp, "LPRuntime", lambda *_: ScriptedRuntime([(2.0, set())], stream)
+    )
+
+    async def main():
+        traffic = TrafficLP.from_env()
+        stamps, reports = addresses(str(tmp_path / "lp"))
+        sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+        sub.connect(stamps)
+        sub.subscribe(b"")
+        await traffic.subscribed(1)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(reports)
+
+        async def on_return(worker_id, ret):
+            pass
+
+        held = traffic.hold(on_return)
+
+        async def worker():
+            published = [await sub.recv_pyobj() for _ in range(2)]
+            push.send_pyobj((_key(0),))
+            await held("w", SimpleNamespace(credit=_credit(0), error=None))
+            return published
+
+        worker = asyncio.ensure_future(worker())
+        traffic.send(_key(0))
+        while traffic.now() < 2.0:
+            await traffic.wait(2.0)
+        await traffic.cancel()
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 5)
+        finally:
+            push.close(linger=0)
+            sub.close(linger=0)
+        return traffic.http, await worker
+
+    try:
+        http, published = _run(main())
+    finally:
+        server.close()
+    assert http == channels[0]
+    assert published[1] == (_key(0), 2.0 + ADMIT, 1, "cancel", *to)
+
+
 def test_a_1p1d_hold_settles_the_frontend_d_stream(tmp_path):
     """Behind a prefill-decode router the hold reads frontend-D's stream: the
     released final is reported, its return passed, and the run finishes."""
@@ -768,9 +1127,9 @@ def test_a_cancel_closes_the_open_requests_and_drops_their_later_events(tmp_path
     dropped, so the run finishes with nothing open."""
 
     class Runtime(ScriptedRuntime):
-        def next_event(self, t):
+        def next_event(self, t, t_daemon=INF):
             passed_at.append(list(passed))
-            return super().next_event(t)
+            return super().next_event(t, t_daemon)
 
     passed, passed_at = [], []
 
@@ -1065,10 +1424,12 @@ def test_a_failed_traffic_lp_tells_aiperf_the_run_failed_before_it_stops(
 ):
     """The reader rejects a report, as above, under the router. Before the loop
     stops, the router publishes an error the controller keeps as an exit error,
-    then the cancel the records manager finishes on."""
+    then the cancel the records manager finishes on, whose log line names the
+    error."""
     from aiperf.common.messages import ProfileCancelCommand
     from aiperf.controller.result_join_coordinator import ResultJoinCoordinator
     from aiperf.controller.system_controller import SystemController
+    from aiperf.records.records_manager import RecordsManager
 
     sent = []
 
@@ -1079,10 +1440,8 @@ def test_a_failed_traffic_lp_tells_aiperf_the_run_failed_before_it_stops(
 
     def init(self, **kw):
         self.comms = SimpleNamespace(create_pub_client=lambda address: Bus())
-        self._init_credit_channels(None)
 
     monkeypatch.setattr(StickyCreditRouter, "__init__", init)
-    monkeypatch.setattr(StickyCreditRouter, "_init_credit_channels", lambda s, c: None)
     monkeypatch.setattr(CompassCreditRouter, "exception", lambda self, msg: None)
 
     async def main():
@@ -1120,3 +1479,239 @@ def test_a_failed_traffic_lp_tells_aiperf_the_run_failed_before_it_stops(
     (exit_error,) = controller._exit_errors
     assert exit_error.error_details.type == "Straggler"
     assert "seq 1 arrives at 0.5, now 1.0" in exit_error.error_details.message
+
+    async def process_results(phase, cancelled):
+        pass
+
+    warned = []
+    records = SimpleNamespace(
+        warning=warned.append,
+        _records_tracker=SimpleNamespace(mark_phase_cancelled=lambda phase: None),
+        _process_results=process_results,
+    )
+    asyncio.run(RecordsManager._on_profile_cancel_command(records, cancel))
+    (line,) = warned
+    assert re.search(
+        r'"reason_detail":"traffic LP: Straggler\(.* seq 1 arrives at 0.5, now 1.0',
+        line,
+    )
+
+
+#: The records manager's results, as the controller's handler reads them.
+RESULTS = SimpleNamespace(
+    service_id="records_manager",
+    results=SimpleNamespace(
+        errors=[],
+        fatal_errors=[],
+        results=SimpleNamespace(records=["a record"], error_summary=None),
+    ),
+)
+
+
+async def _nothing(*args) -> None:
+    pass
+
+
+async def _controller(monkeypatch, stop):
+    """aiperf's system controller as plugin discovery resolves it, past each
+    service's registration and the configure step; the records manager
+    advertises ``profile``. Its own handlers and shutdown barrier run, and it
+    stops by `stop`."""
+    cls = plugins.get_class(PluginType.SERVICE, ServiceType.SYSTEM_CONTROLLER)
+    ctl = cls.__new__(cls)
+    HooksMixin.__init__(ctl)  # its hooks and logger, as BaseService builds them
+    ctl.service_id, ctl.stop, ctl._exit_errors = "system_controller", stop, []
+    ctl._processed_command_ids, ctl.publish = set(), _nothing
+    ctl.service_manager = SimpleNamespace(service_id_map={}, service_map={})
+    ctl._result_join_coordinator = ResultJoinCoordinator()
+    ctl._shutdown_lock, ctl._shutdown_triggered = asyncio.Lock(), False
+    for name, produces in (("records_manager", ("profile",)), ("timing_manager", ())):
+        await ctl._handle_register_service_command(
+            RegisterServiceCommand(
+                service_id=name,
+                service_type=ServiceType(name),
+                state=LifecycleState.RUNNING,
+                capabilities=tuple(map(make_result_producer_capability, produces)),
+            )
+        )
+    monkeypatch.setattr(SystemController, "_profile_configure_all_services", _nothing)
+    await ctl._profile_configure_all_services()
+    return ctl
+
+
+def _router_bus(monkeypatch, publish) -> None:
+    """Each router built from here publishes by `publish` and logs nothing."""
+    comms = SimpleNamespace(
+        create_pub_client=lambda a: SimpleNamespace(publish=publish)
+    )
+    monkeypatch.setattr(
+        StickyCreditRouter, "__init__", lambda s, **kw: setattr(s, "comms", comms)
+    )
+    monkeypatch.setattr(CompassCreditRouter, "exception", lambda self, msg: None)
+
+
+async def _deliver(ctl, message) -> None:
+    """`message` through aiperf's bus to each of `ctl`'s hooks on its type."""
+    message = Message.from_json(message.to_json_bytes())
+    for hook in ctl.get_hooks(AIPerfHook.ON_MESSAGE):
+        if message.message_type in hook.resolve_params(ctl):
+            await hook.func(message)
+
+
+def test_aiperf_loads_the_compass_system_controller():
+    found = plugins.get_class(PluginType.SERVICE, ServiceType.SYSTEM_CONTROLLER)
+    assert found is CompassSystemController
+
+
+#: The engine's work, which it holds past the moment every result is in.
+HELD = 50.0
+
+
+class HoldingEngine(threading.Thread):
+    """The engine LP with work to `HELD`, which it holds in wall time until
+    `release` is set. It keeps its next grant, or the refusal that ended the
+    run, as `got`."""
+
+    def __init__(self, endpoint) -> None:
+        super().__init__(name="engine", daemon=True)
+        self.endpoint, self.got = endpoint, None
+        self.holding, self.release = threading.Event(), threading.Event()
+
+    def run(self) -> None:
+        rt = LPRuntime(ENGINE, TABLE, clock_transport.connect(ENGINE, self.endpoint))
+        rt.next_event(HELD)
+        self.holding.set()
+        self.release.wait(10)
+        try:
+            self.got = rt.next_event(INF)
+        except ClockAbort as abort:
+            self.got = abort
+
+
+class TimingManager(threading.Thread):
+    """aiperf's timing manager: the router on its own event loop, the traffic
+    LP's clock owner. aiperf has sent everything, so the traffic LP asks for
+    time until its ``+inf`` grant."""
+
+    def __init__(self) -> None:
+        super().__init__(name="timing_manager", daemon=True)
+        self.loop, self.router = asyncio.new_event_loop(), None
+
+    def run(self) -> None:
+        async def serve():
+            self.router = CompassCreditRouter(run=None, service_id="timing_manager")
+            self.router.traffic.finish()
+            await asyncio.Event().wait()
+
+        with contextlib.suppress(RuntimeError):  # the loop stopped
+            self.loop.run_until_complete(serve())
+
+    def kill(self) -> None:
+        """aiperf's SIGKILL: the traffic LP's clock connection ends wherever
+        the loop is, and the loop stops."""
+        fd = os.dup(self.router.traffic.rt.conn.fileno())
+        with socket.socket(fileno=fd) as sock, contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+
+def test_aiperf_s_shutdown_waits_for_the_traffic_lp_s_inf_grant(tmp_path, monkeypatch):
+    """Every result reaches aiperf's controller while the engine holds work,
+    so the traffic LP still waits for its ``+inf`` grant, its event loop
+    blocked in that wait. The controller stops only once the router reports
+    the traffic LP done, and its stop kills the timing manager as aiperf's
+    does. Nothing ends the run: the engine is granted ``+inf``, and the
+    traffic LP's final-response check runs and passes."""
+    run = {**RUN, "bound_s": 100.0, "out_dir": str(tmp_path)}
+    server = clock_transport.serve(
+        compass_run._RecordingAuthority(run), "tcp://127.0.0.1:0"
+    )
+    frontend = clock_transport.connect(FRONTEND, server.endpoint)
+    frontend.send((NER, INF, [], INF))  # idle throughout
+    lp = str(tmp_path / "lp")
+
+    def traffic(cls):
+        conn = clock_transport.connect(compass_run.TRAFFIC, server.endpoint)
+        return cls(LPRuntime(compass_run.TRAFFIC, TABLE, conn), lp)
+
+    monkeypatch.setattr(TrafficLP, "from_env", classmethod(traffic))
+    monkeypatch.setattr(ClockPacedLoopScheduler, "clock", None)
+    tm, engine, kills = TimingManager(), HoldingEngine(server.endpoint), []
+
+    async def main():
+        loop, killed = asyncio.get_running_loop(), asyncio.Event()
+
+        async def publish(message):  # from the timing manager's process
+            loop.call_soon_threadsafe(asyncio.ensure_future, _deliver(ctl, message))
+
+        _router_bus(monkeypatch, publish)
+
+        async def stop():
+            kills.append(tm.router.traffic.done.done())
+            tm.kill()
+            killed.set()
+
+        ctl = await _controller(monkeypatch, stop)
+        tm.start()
+        engine.start()
+        assert await asyncio.to_thread(engine.holding.wait, 10)
+        await ctl._on_process_records_result_message(RESULTS)  # every result is in
+        engine.release.set()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(killed.wait(), 10)
+        return ctl
+
+    try:
+        ctl = _run(main())
+    finally:
+        if not kills:
+            tm.loop.call_soon_threadsafe(tm.loop.stop)
+        tm.join(10)
+        engine.join(10)
+        frontend.close()
+        server.close()
+    assert engine.got == INF
+    assert kills == [True]  # once, after the traffic LP was done
+    done = tm.router.traffic.done
+    assert done.result() is None and tm.router.traffic.now() == INF
+    assert ctl._exit_errors == []
+
+
+def test_a_failing_traffic_lp_still_fails_aiperf_s_run(tmp_path, monkeypatch):
+    """Request 0 is open at the ``+inf`` grant, so the traffic LP fails its
+    final-response check. The router's service error unregisters the timing
+    manager from the traffic domain, so aiperf stops on the records manager's
+    results and exits 1 naming the open request."""
+    sent, stops, rt, lp = [], [], ScriptedRuntime([]), str(tmp_path / "lp")
+
+    async def publish(message):
+        sent.append(message)
+
+    async def stop():
+        stops.append("stop")
+
+    _router_bus(monkeypatch, publish)
+    monkeypatch.setattr(TrafficLP, "from_env", classmethod(lambda cls: cls(rt, lp)))
+
+    async def timing_manager():
+        traffic = CompassCreditRouter(run=None, service_id="timing_manager").traffic
+        traffic.send(_key(0))
+        traffic.finish()
+        await asyncio.Event().wait()  # only the router stops the loop
+
+    with pytest.raises(RuntimeError, match="Event loop stopped before Future"):
+        _run(timing_manager())
+
+    async def controller():
+        ctl = await _controller(monkeypatch, stop)
+        for message in sent:  # the service error, then the cancel
+            await _deliver(ctl, message)
+        assert stops == []  # the records manager's results are not in yet
+        await ctl._on_process_records_result_message(RESULTS)
+        return ctl
+
+    ctl = asyncio.run(controller())
+    assert stops == ["stop"]
+    (error,) = ctl._exit_errors
+    assert error.error_details.type == "UnansweredRequests"
+    assert str(_key(0)) in error.error_details.message

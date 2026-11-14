@@ -5,26 +5,14 @@
 
 `BatchView` and `RequestShape` live in `atom.compass.backends` because the scan
 that forbids engine imports reads that package and nothing else. This module is
-their other half and does the opposite: it reads a scheduled batch, the
-sequences that batch was built from, and the runner's graph-capture ladder, and
-turns them into those two types. Keeping the builder here is what lets it read
-the engine at all.
+their other half and does the opposite: it reads a scheduled batch and the
+runner's graph-capture ladder, and turns them into those two types. Keeping the
+builder here is what lets it read the engine at all.
 
-Two things the type cannot check, both of which belong to whoever builds the
-projection rather than to whoever prices it.
-
-**The row count.** `BatchView` states, and measures, that a one-row batch is
-`tokens x history` exactly -- the collapsed form that summing per request
-exists to keep out -- and that nothing in the type ties its row count to the
-number of requests a scheduler scheduled. It names this module as what closes
-that. So the rows here are one per entry of
-`ScheduledBatch.num_scheduled_tokens`, and a `seqs` mapping whose keys are not
-the batch's own `req_ids`, in the batch's own order, is refused. That refusal
-is the load-bearing line in this file rather than housekeeping: `zip` is how
-both structures are read everywhere else in the tree, including by
-`Scheduler.compute_detailed_aggregates`, and `zip` over a mapping one request
-short drops the last row in silence -- which is a shorter batch that prices
-without complaining, and at two requests is exactly the collapse.
+**The row count.** `BatchView` cannot tie its row count to the number of
+requests a scheduler scheduled, so `batch_view` builds one row per entry of
+`ScheduledBatch.num_scheduled_tokens`, each with the `N_KV` ATOM computed when
+it built the batch, `ScheduledBatch.context_lens`.
 
 **The rung.** The type refuses a `capture_rung` with no decode rows and one
 narrower than the decode row count. It cannot refuse one that is far too wide,
@@ -40,23 +28,6 @@ the width by binary search and so has a precondition -- an ascending ladder --
 which is checked here rather than assumed, because an unsorted ladder answers a
 width that is not the smallest captured one holding the batch, and too wide is
 the direction the type cannot refuse.
-
-**Why each row's history is read twice.** `ScheduledBatch.context_lens` is the
-`N_KV` ATOM computed when it built the batch -- a prefill chunk's cached tokens
-plus the chunk, a decode's whole sequence -- and is what this builds rows from.
-The sequence is read for its type and for a second derivation of that same
-`N_KV`, from `Sequence.num_tokens` and `Sequence.num_cached_tokens`, which is
-the one `Scheduler.compute_detailed_aggregates` takes. They must agree. A
-disagreement has two causes and this module cannot tell them apart by looking
-at the numbers, so the refusal names both. Either the sequences handed in are
-not the ones the batch was built from -- a stale or a later step's mapping --
-or they are exactly those sequences and the scheduler advanced them on
-purpose: `Scheduler.advance_on_schedule` is on whenever
-`pipeline_parallel_size > 1`, and `Scheduler._advance_prefill_on_schedule` adds
-each chunk to its sequence's offsets after the batch has snapshotted them. Under
-that configuration the two readings differ by a whole chunk of history on
-every prefill row, and the projection refuses there instead of picking one of
-the two readings.
 """
 
 from __future__ import annotations
@@ -64,72 +35,11 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import torch
 
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.runner.overrides import RunnerRefusal
-from atom.model_engine.sequence import SequenceType
 from atom.utils.forward_context import ForwardMode
-
-
-def request_rows(batch: Any, seqs: dict[int, Any]) -> tuple[RequestShape, ...]:
-    """One row per scheduled request, in the batch's own order.
-
-    `batch.req_ids` is `list(seqs.keys())` taken when the batch was built, so
-    requiring the two to be equal states both halves of the projection's
-    guarantee -- the row count, and that row *i* describes the request row *i*
-    of every parallel array on the batch describes.
-
-    Both integers are cast out of `np.int32` before a row is built. The sums
-    over these rows multiply two of them together, and the scheduler's own
-    aggregate casts for the same reason and says so: past roughly 46341 tokens
-    a 32-bit product wraps, which is not an error anywhere downstream but a
-    smaller -- or negative -- price.
-    """
-    if list(seqs.keys()) != list(batch.req_ids):
-        raise RunnerRefusal(
-            f"the batch scheduled {list(batch.req_ids)} and the sequences handed "
-            f"in are {list(seqs.keys())}; one row per scheduled request is what "
-            "keeps a batch of two from being priced as the single collapsed row "
-            "it would otherwise sum to, and every reader of these two pairs them "
-            "positionally"
-        )
-    rows = []
-    for index, (seq, scheduled) in enumerate(
-        zip(seqs.values(), batch.num_scheduled_tokens)
-    ):
-        query = int(scheduled)
-        decode = seq.type == SequenceType.DECODE
-        context = int(batch.context_lens[index])
-        settled = int(seq.num_tokens) if decode else int(seq.num_cached_tokens) + query
-        if settled != context:
-            raise RunnerRefusal(
-                f"request {batch.req_ids[index]} reads {context} context tokens "
-                f"off the batch and {settled} off its sequence; the two readings "
-                "differ by history this step either did or did not compute. "
-                "Either these are not the sequences this batch was built from, "
-                "or they are and `advance_on_schedule` moved them on purpose "
-                "after the batch snapshotted its offsets -- which it does on "
-                "every pipeline-parallel run, and this cannot tell the two "
-                "apart from the numbers"
-            )
-        rows.append(RequestShape(query, context, decode))
-    if len(rows) != batch.total_seqs_num:
-        raise RunnerRefusal(
-            f"{len(rows)} rows for the {batch.total_seqs_num} requests the "
-            "scheduler counted into this batch"
-        )
-    return tuple(rows)
-
-
-def capture_rung(batch: Any, runner: Any) -> int | None:
-    """The width of the graph this step replays, or `None` if it replays none.
-
-    Asked of `ForwardMode.decide`, which is the rule the real runner dispatches
-    by, rather than derived from the ladder here: deriving it is how a rung gets
-    assigned to a prefill step, which replays nothing and would then be charged
-    graph padding for a graph that did not run.
-    """
-    return _rung(forward_mode(batch, runner))
 
 
 def _rung(mode: ForwardMode) -> int | None:
@@ -143,6 +53,22 @@ def dp_group() -> Any:
     return get_dp_group().cpu_group
 
 
+def dummy_ranks(batch: Any, mode: ForwardMode) -> int:
+    """How many ranks of the step's data-parallel group run a dummy forward,
+    this one among them when `batch` is its dummy; 0 on one rank.
+
+    ATOM's DP sync carries no dummy flag: a dummy reports one token, as a rank
+    decoding one request does. So the group sums each rank's `is_dummy_run`
+    over its CPU group, a collective of the simulated step's own that every
+    rank of the group runs once before pricing, as it runs `decide`'s.
+    """
+    if mode.sync is None or len(mode.sync.scheduled_tokens_per_dp_rank) < 2:
+        return 0
+    flag = torch.tensor([int(bool(batch.is_dummy_run))], dtype=torch.int32)
+    torch.distributed.all_reduce(flag, group=dp_group())
+    return int(flag.item())
+
+
 def forward_mode(batch: Any, runner: Any) -> ForwardMode:
     """The step's shape, settled by `ForwardMode.decide` as the real runner settles it.
 
@@ -154,11 +80,12 @@ def forward_mode(batch: Any, runner: Any) -> ForwardMode:
     config's `enable_tbo` and the runner's own `_local_tbo_eligibility`, which
     ride the collective, so the group agrees the two-batch-overlap split a real
     run agrees. The other arguments that do not reach the rung are passed at
-    their inert values: `decide` settles a query length and a token count as
-    well, and those are what `captured_tokens` and `is_block_drafter` feed. The
-    width and the replay decision come from `capture_sizes`, `enforce_eager`,
-    the attention builder's `step_needs_eager`, the batch and the collective
-    alone.
+    their inert values: `decide` settles a query length as well, and that is
+    what `is_block_drafter` feeds. The width and the replay decision come from
+    `capture_sizes`, `enforce_eager`, the attention builder's
+    `step_needs_eager`, `tbo_decode_graphs`, the batch and the collective
+    alone; the group's running tokens land in the runner's own
+    `running_tokens_per_dp_rank`, as the real forward's do.
     """
     dp_size = _data_parallel_size(runner)
     tbo_on = runner.config.enable_tbo
@@ -178,13 +105,14 @@ def forward_mode(batch: Any, runner: Any) -> ForwardMode:
         enforce_eager=bool(runner.enforce_eager),
         step_needs_eager=runner.attn_metadata_builder.step_needs_eager(batch),
         capture_sizes=ladder,
-        captured_tokens=None,
         is_block_drafter=False,
         tbo_on=tbo_on,
         local_tbo=(
             runner._local_tbo_eligibility(batch) if tbo_on else (False, False, 0, 0)
         ),
         max_seqlen_q=batch.num_spec_step + 1,
+        running_tokens_per_dp_rank=runner.running_tokens_per_dp_rank,
+        tbo_decode_graphs=runner.tbo_decode_graphs,
     )
 
 
@@ -195,7 +123,7 @@ def _data_parallel_size(runner: Any) -> int:
     the set ATOM's `ParallelConfig` refuses too. A runner shaped differently
     from the engine's own would otherwise be priced as a single rank on a
     default nothing checked; zero or a negative width would pass the `> 1`
-    test in `capture_rung` as the single-rank case.
+    test in `forward_mode` as the single-rank case.
     """
     parallel = getattr(getattr(runner, "config", None), "parallel_config", None)
     size = getattr(parallel, "data_parallel_size", None)
@@ -209,14 +137,9 @@ def _data_parallel_size(runner: Any) -> int:
     return int(size)
 
 
-def project(batch: Any, seqs: dict[int, Any], runner: Any) -> BatchView:
-    """The whole projection: the batch's rows, and the rung it replayed."""
-    return BatchView(
-        request_rows(batch, seqs), capture_rung=capture_rung(batch, runner)
-    )
-
-
-def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
+def batch_view(
+    batch: Any, mode: ForwardMode, runner: Any, dummies: int = 0
+) -> BatchView:
     """The projection a worker builds: it holds the batch and not the sequences.
 
     A row's kind is the convention `ModelRunner.prepare_inputs` reads: the
@@ -224,9 +147,18 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     gather's rows come from `mode`, the step's one `forward_mode`; a
     data-parallel runner handed a mode with no group counts is refused.
     Whether the step produces output is `ScheduledBatch.produces_output`, and
-    the TBO split is the collective's `ub_tokens_across_dp`, this rank's slot
-    in it the config's `data_parallel_rank`. A data-parallel rank's
-    `is_dummy_run` batch is its `dp_dummy`.
+    the TBO split is the collective's `ub_tokens_across_dp`, a group of one's
+    too, since ATOM splits one rank's step by the same rule; a data-parallel
+    rank's slot in it is the config's `data_parallel_rank`. A data-parallel rank's
+    `is_dummy_run` batch is its `dp_dummy`, a step some rank prefills its
+    `group_prefills`, and `dummies`, the group's dummy forwards as
+    `dummy_ranks` sums them, its `group_dummies`: a caller that does not run
+    that collective, as a recording real run does not, passes none. The most
+    tokens any rank scheduled is its `group_max_tokens`. A single
+    rank reads none of the collective's other counts, though `decide` returns
+    them for a group of one. Every rank, a lone one too, reads the
+    collective's `any_rank_needs_eager`, whether an attention backend refused
+    the step a graph, as its `group_needs_eager`.
 
     The MoE gather's rows follow `running_tokens_are_unified`, as
     `FusedMoE.forward_impl_graph` does. Every rank decoding, the padded
@@ -246,6 +178,7 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     decode every rank decodes in, its inputs; a sampling prefill, its LM head.
     """
     draft_moe_rows = moe_tokens = dp_rank = draft_bs = target_bs = draft_rows = None
+    group_max_tokens = None
     drafter = getattr(runner, "drafter", None)
     if getattr(drafter, "step", None) is not None:  # `EagleProposer`'s pass
         draft_bs = int(mode.running_bs)
@@ -255,9 +188,14 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
     ):
         wider = mode.running_bs > len(batch.num_scheduled_tokens)
         target_bs = mode.running_bs if wider else None
-    if mode.sync is not None:
+    if _data_parallel_size(runner) == 1:
+        moe_rows = None
+    elif mode.sync is not None and len(
+        mode.sync.scheduled_tokens_per_dp_rank
+    ) == _data_parallel_size(runner):
         dp_rank = runner.config.parallel_config.data_parallel_rank
-        gathered = moe_tokens = int(mode.sync.num_tokens_across_dp.sum())
+        gathered = moe_tokens = int(mode.sync.scheduled_tokens_per_dp_rank.sum())
+        group_max_tokens = int(mode.sync.scheduled_tokens_per_dp_rank.max())
         if mode.running_tokens_are_unified:
             moe_rows = _data_parallel_size(runner) * mode.running_tokens
         else:
@@ -270,14 +208,12 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
                     if mode.running_tokens_are_unified
                     else mode.sync.max_bs_across_dp + _data_parallel_size(runner) - 1
                 )
-    elif _data_parallel_size(runner) > 1:
+    else:
         raise RunnerRefusal(
             "this rank is one of a data-parallel group and its forward mode "
-            "states no num_tokens_across_dp, so the MoE segment has no gathered "
-            "row count to be priced from"
+            "states no scheduled_tokens_per_dp_rank for that group, so the MoE "
+            "segment has no gathered row count to be priced from"
         )
-    else:
-        moe_rows = None
     rows = zip(batch.num_scheduled_tokens, batch.context_lens)
     return BatchView(
         tuple(
@@ -294,7 +230,11 @@ def batch_view(batch: Any, mode: ForwardMode, runner: Any) -> BatchView:
         moe_tokens=moe_tokens,
         dp_rank=dp_rank,
         dp_dummy=dp_rank is not None and bool(batch.is_dummy_run),
+        group_dummies=dummies if dp_rank is not None else 0,
         draft_rows=draft_rows,
+        group_prefills=dp_rank is not None and not mode.running_tokens_are_unified,
+        group_max_tokens=group_max_tokens,
+        group_needs_eager=mode.sync is not None and mode.sync.any_rank_needs_eager,
     )
 
 
@@ -303,10 +243,12 @@ def image_tokens(batch: Any, runner: Any) -> int:
     handles them. With embedding spans, a payload still carrying pixel values
     encodes every span on this chunk, even one that fills none; a later chunk
     fills the spans it overlaps. Without spans, the image's embeddings sit at
-    the model's image token."""
+    the model's image token; a batch with no multimodal data has none."""
+    media = getattr(batch, "multimodal_data", None)
+    if not media:
+        return 0
     from atom.model_engine.multimodal_runtime import embedding_indices
 
-    media = getattr(batch, "multimodal_data", None) or {}
     count, offset = 0, 0
     for req, length, end in zip(
         batch.req_ids, batch.num_scheduled_tokens, batch.context_lens

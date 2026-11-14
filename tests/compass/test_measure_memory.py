@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -26,7 +27,10 @@ from types import SimpleNamespace
 
 import pytest
 from test_artifact_invalidation import BASE, STANZA
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_drive_gpu import FREE, _plant
+from test_drive_serve import RUNNERS, runners_logged
+from test_launcher_held_ports import HELD, _squat
 from test_memory_readings import (
     CONFIG_JSON,
     DOCUMENT,
@@ -51,17 +55,17 @@ from atom.compass.artifacts import (
     Kind,
     Row,
     Topology,
-    machine_spec_digest,
+    keyed_platform,
+    machine_platform,
     member_name,
 )
-from atom.compass.drive import gpu, measure_memory, serve
+from atom.compass.drive import aiter_jit, gpu, jit_cache, measure_memory, serve
 from atom.compass.drive.gpu import GpuRefusal
 from atom.compass.memory import ModelTerms, device_readings, reserves
 from atom.compass.memory.check import STORAGE
 from atom.compass.memory.readings import MemoryReadings
 from atom.compass.run import memory
 from atom.compass.spec import MachineSpec, SpecRefusal
-from atom.utils import backends
 
 MACHINE = MachineSpec.from_mapping(copy.deepcopy(DOCUMENT))
 #: One TP2 rank's readings beside `READINGS[2]`: a rank need not read as another.
@@ -108,20 +112,37 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
             record,
         )
     copy_ = json.loads((tmp_path / "out" / "memory_readings.json").read_text())
-    assert copy_["key"]["tp"] == 2 and copy_["key"]["machine_spec"] == (
-        machine_spec_digest(MACHINE)
-    )
+    assert copy_["key"]["tp"] == 2
+    assert copy_["key"]["software_stack"] == machine_platform(MACHINE)["software_stack"]
     assert len(copy_["members"]) == 2
+
+
+def left_group() -> int:
+    """A process group this test started and whose one member has exited, for
+    a stand-in engine's pid: `serve._stop` finds no member of it left. Not 0:
+    under `podman exec`, as the CPU gate runs, /proc shows the exec's shell, an
+    ancestor of this test, in group 0, so a stop of group 0 waited
+    `serve.STOP_GRACE_S` twice."""
+    leader = subprocess.Popen(["true"], start_new_session=True)
+    leader.wait()
+    return leader.pid
 
 
 def a_start(tmp_path, monkeypatch, stack):
     """The suite's TP2 worker and `main`'s arguments for a start on GPU 5 under
     `stack`, its engine and identity stood in for: the command reads `stack`, the
-    ranks write their files as the engine starts, and run.json names `stack`."""
+    ranks write their files as the engine starts, and run.json names `stack`.
+    The JIT cache roots its start restores into and its stop saves from are
+    empty directories of the test's own, so a compile elsewhere in the
+    container while it runs reaches no store."""
     r, out = tp2(tmp_path), tmp_path / "out"
+    roots = {tmp_path / "roots" / compiler: compiler for compiler in jit_cache.RULES}
+    for root in roots:
+        root.mkdir(parents=True)
+    monkeypatch.setattr(aiter_jit, "_roots", lambda: roots)
 
     class Engine:
-        pid = 0
+        pid = left_group()
 
         def __init__(self, *args, **kwargs):
             (tmp_path / "hip").write_text(kwargs["env"]["HIP_VISIBLE_DEVICES"])
@@ -164,7 +185,7 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_the_start_used(
 ):
     _, argv = a_start(tmp_path, monkeypatch, STACK)
     root = tmp_path / "home/.cache/atom"
-    monkeypatch.setattr(backends, "VLLM_CACHE_ROOT", str(root))
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(root))
     used = root / "torch_compile_cache/0123456789/rank_0/backbone"
     other = root / "torch_compile_cache/9876543210"
     other.mkdir(parents=True)
@@ -182,6 +203,37 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_the_start_used(
     assert not used.parents[1].exists() and other.exists()
 
 
+@pytest.mark.parametrize(
+    "widths, seen",
+    [
+        (["-dp", "2"], "1"),
+        ([], "unset"),
+        (["-dp", "2", "--enable-dp-attention"], "unset"),
+    ],
+)
+def test_a_start_at_dp_and_tp_above_1_logs_each_line_s_process(
+    tmp_path, monkeypatch, widths, seen
+):
+    _, argv = a_start(tmp_path, monkeypatch, STACK)
+    monkeypatch.delenv("ATOM_LOG_MORE", raising=False)
+    monkeypatch.setenv("PYTHONPATH", str(serve.TREE))
+    monkeypatch.setenv("RUNNERS_SEEN", str(tmp_path / "seen"))
+    monkeypatch.setenv("RUNNERS_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(tmp_path / "cache"))
+    engine = measure_memory.subprocess.Popen
+
+    def logging(args, **kwargs):
+        engine(args, **kwargs)  # the ranks' files
+        return subprocess.Popen([sys.executable, "-c", RUNNERS], **kwargs)
+
+    monkeypatch.setattr(measure_memory.subprocess, "Popen", logging)
+    measure_memory.main([*argv, "-tp", "2", *widths])
+
+    assert (tmp_path / "seen").read_text() == seen
+    if seen == "1":
+        runners_logged(tmp_path / "out" / measure_memory.LOG, tmp_path / "cache")
+
+
 def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypatch):
     r, argv = a_start(tmp_path, monkeypatch, STACK)
 
@@ -189,7 +241,7 @@ def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypat
 
     key = Key.of(
         Kind.MEMORY_READINGS,
-        machine_spec=machine_spec_digest(MACHINE),
+        **keyed_platform(Kind.MEMORY_READINGS, machine_platform(MACHINE)),
         **memory.key_fields(r.config),
     )
     cells = dict(
@@ -202,16 +254,21 @@ def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(
-    "gpus, cards",
+    "gpus, asked, cards",
     [
-        ("5", [dict(MI355X, name="MI308X", arch="gfx942")]),
-        ("4,5", [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")]),
+        ("5", (5,), [dict(MI355X, name="MI308X", arch="gfx942")]),
+        (
+            "4,5",
+            (4, 5),
+            [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")],
+        ),
     ],
 )
 def test_a_start_on_another_device_than_the_spec_states_refuses_naming_both(
-    tmp_path, monkeypatch, gpus, cards
+    tmp_path, monkeypatch, gpus, asked, cards
 ):
-    monkeypatch.setattr(measure_memory, "_device", lambda gpus: cards)
+    # Only the GPUs `--gpu` names have cards; asking about any others raises.
+    monkeypatch.setattr(measure_memory, "_device", {asked: cards}.__getitem__)
     machine = tmp_path / "machine.json"
     machine.write_text(json.dumps(DOCUMENT))
     flags = ["--gpu", gpus, "--machine", str(machine), "--store", str(tmp_path / "s")]
@@ -358,6 +415,53 @@ def test_the_after_check_waits_for_members_that_outlive_the_engine(
     assert (tmp_path / "out" / "memory_readings.json").exists()
 
 
+def test_the_after_check_waits_for_kfd_to_free_what_the_engine_left(
+    tmp_path, monkeypatch
+):
+    """KFD lists an exited rank until it has freed the rank's GPU memory, by a
+    PID a container's /proc need not show: DeepSeek-V4.1-Flash's TP4 ranks,
+    270 GB a card, stayed listed seconds after the engine's group had left.
+    Here the group's members exit at once and KFD frees the rank 2 s later."""
+    kill = os.killpg
+    r, argv = a_start(tmp_path, monkeypatch, STACK)
+    out = _plant(tmp_path, monkeypatch, FREE)
+    kfd, members = tmp_path / "kfd", tmp_path / "members"
+    rank = kfd / "proc" / "3362894"
+    rank.parent.mkdir(parents=True)
+    monkeypatch.setattr(serve, "KFD", kfd)
+    smi = tmp_path / "bin" / "rocm-smi"
+    listed = f"[ -d {rank} ] && printf 'PID 3362894 is using 1 DRM device(s):\\n5\\n'\n"
+    smi.write_text(
+        smi.read_text().replace("*--showpids*)\n", "*--showpids*)\n" + listed)
+    )
+
+    def freed():
+        _until(lambda: members.exists() and members.read_text())
+        pids = members.read_text().split()
+        _until(lambda: all(_state(p) in (None, "Z") for p in pids))
+        time.sleep(2)
+        rank.rmdir()
+
+    def popen(command, **kwargs):
+        ranks_wrote(out, r.config, [READINGS[2]] * 2)
+        rank.mkdir()
+        threading.Thread(target=freed, daemon=True).start()
+        group = [sys.executable, "-c", GROUP, str(members), "0"]
+        return subprocess.Popen(group, **kwargs)
+
+    started_by = SimpleNamespace(
+        Popen=popen, STDOUT=subprocess.STDOUT, TimeoutExpired=subprocess.TimeoutExpired
+    )
+    monkeypatch.setattr(measure_memory, "subprocess", started_by)
+    monkeypatch.setattr(measure_memory, "quiet", gpu.quiet)
+    monkeypatch.setattr(os, "killpg", kill)
+
+    measure_memory.main(argv)
+
+    assert (tmp_path / "out" / "gpu_after.txt").read_text() == FREE
+    assert (tmp_path / "out" / "memory_readings.json").exists()
+
+
 def test_a_member_that_stays_fails_the_after_check_naming_it(
     tmp_path, group_start, monkeypatch
 ):
@@ -453,7 +557,7 @@ def starts_autotuning(monkeypatch, r, out, autotuned, field="autotuned_kernels")
     left, envs = list(autotuned), []
 
     class Engine:
-        pid = 0
+        pid = left_group()
 
         def __init__(self, *args, env, **kwargs):
             envs.append(env)
@@ -696,7 +800,7 @@ def test_a_key_stating_another_layout_than_its_members_publishes_nothing(tmp_pat
     key = Key.of(
         Kind.MEMORY_READINGS,
         model="sha256:" + "a" * 64,
-        machine_spec=machine_spec_digest(MACHINE),
+        **keyed_platform(Kind.MEMORY_READINGS, machine_platform(MACHINE)),
         dp=1,
         pp=1,
         pcp=1,
@@ -732,6 +836,100 @@ def test_dummy_weights_are_refused(tmp_path, flag, capsys):
         refused.value
     )
     assert not any(tmp_path.iterdir())
+
+
+#: ATOM's arguments for an engine start, each read by `EngineArgs`.
+ENGINE_ARGV = ["--model", "m", "-tp", "4", "--kv_cache_dtype", "fp8"]
+
+
+def built_from(argv, monkeypatch):
+    """The model and keywords `measure_memory.start` builds its engine from,
+    given ATOM's arguments `argv`; the engine is a stand-in that starts nothing."""
+    from atom.model_engine import llm_engine
+
+    built = []
+
+    class Engine:
+        def __init__(self, model, **kwargs):
+            built.append((model, kwargs))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(llm_engine, "LLMEngine", Engine)
+    measure_memory.start(argv)
+    return built
+
+
+def test_a_start_takes_the_server_flags_record_passes_and_builds_without_them(
+    monkeypatch,
+):
+    from atom.entrypoints.openai import api_server
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    class Parsing(Exception):
+        pass
+
+    def parse_args(parser, *args, **kwargs):
+        raise Parsing(parser)
+
+    with monkeypatch.context() as m, pytest.raises(Parsing) as server:
+        m.setattr(FlexibleArgumentParser, "parse_args", parse_args)
+        api_server.main()
+    engine = EngineArgs.add_cli_args(FlexibleArgumentParser())._actions
+    frontend = [
+        [a.option_strings[0], *(["1"] if a.nargs != 0 else [])]
+        for a in server.value.args[0]._actions
+        if a.dest not in {e.dest for e in engine}
+        and set(a.option_strings).isdisjoint(serve.OWNED)
+    ]
+    assert ["--default-chat-template-kwargs", "1"] in frontend
+    served = ENGINE_ARGV + [arg for flag in frontend for arg in flag]
+    assert built_from(served, monkeypatch) == built_from(ENGINE_ARGV, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "flag", [["--max-num-sqes", "8"], ["--compass-run", "run.json"]]
+)
+def test_a_start_refuses_a_flag_neither_the_engine_nor_record_takes(
+    flag, monkeypatch, capsys
+):
+    with pytest.raises(SystemExit):
+        built_from(ENGINE_ARGV + flag, monkeypatch)
+    assert f"unrecognized arguments: {' '.join(flag)}" in capsys.readouterr().err
+
+
+def test_frontend_is_the_server_flags_record_passes_each_parsed_as_the_server_does(
+    monkeypatch,
+):
+    from atom.entrypoints.openai import api_server
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    class Parsing(Exception):
+        pass
+
+    def parse_args(parser, *args, **kwargs):
+        raise Parsing(parser)
+
+    with monkeypatch.context() as m, pytest.raises(Parsing) as server:
+        m.setattr(FlexibleArgumentParser, "parse_args", parse_args)
+        api_server.main()
+    engine = EngineArgs.add_cli_args(FlexibleArgumentParser())._actions
+    frontend = FlexibleArgumentParser(add_help=False)
+    for flag, kind in measure_memory.FRONTEND.items():
+        frontend.add_argument(flag, **kind)
+
+    def kinds(actions):
+        return {(a.option_strings[0], a.nargs, a.type or str) for a in actions}
+
+    assert kinds(frontend._actions) == kinds(
+        a
+        for a in server.value.args[0]._actions
+        if a.dest not in {e.dest for e in engine}
+        and set(a.option_strings).isdisjoint(serve.OWNED)
+    )
 
 
 # --- a run reading its configuration's entry ---------------------------------
@@ -808,7 +1006,7 @@ def test_the_mi308x_entry_gives_the_readings_its_spec_gave():
     spec = MachineSpec.from_mapping(json.loads(path.read_text()))
     entry = MemoryReadings.from_member(MI308X_READINGS, "memory_readings mi308x")
     model = ModelTerms.from_tree(
-        meta_tree(54_713_457_120), activations=entry.activations(16_384)
+        meta_tree(54_713_457_120), activations=entry.activations()
     )
     readings = device_readings(
         spec,
@@ -856,3 +1054,18 @@ def test_a_weights_compile_key_is_the_same_whatever_the_import_order():
         for order in ("first", "torch")
     }
     assert len(keys) == 1, keys
+
+
+def test_the_engine_s_dp_master_port_is_held_from_another_process_first(
+    tmp_path, monkeypatch
+):
+    _, argv = a_start(tmp_path, monkeypatch, STACK)
+    engine, squatted = measure_memory.subprocess.Popen, []
+
+    def squatting(*args, **kwargs):
+        squatted.extend(_squat(kwargs["env"]["ATOM_DP_MASTER_PORT"]))
+        return engine(*args, **kwargs)
+
+    monkeypatch.setattr(measure_memory.subprocess, "Popen", squatting)
+    measure_memory.main(argv)
+    assert squatted == [HELD]

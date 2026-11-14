@@ -27,11 +27,20 @@ if ATOM_ROOT not in sys.path:
 
 # ── 2. Import atom submodules ──────────────────────────────────────────────
 
+# Compass's GPU checks leave out the process that runs them by the KFD entry
+# its first open of /dev/kfd adds. `atom.utils.region_graph` below opens it
+# (`atom.utils.forward_context` asks torch whether a GPU is available), so the
+# session takes that first open here.
+from atom.compass.drive.gpu import kfd_pid
+
+kfd_pid()
+
 from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+from atom.utils.region_graph import ReqGraph
 
 # ── 3. MockConfig ──────────────────────────────────────────────────────────
 
@@ -61,6 +70,9 @@ class MockConfig:
             "throughput_log_interval": 10.0,
             "cache_hit_rate_window": 1000,
             "enable_chunked_prefill": True,
+            "enable_dynamic_chunking": False,
+            "dynamic_chunking_smooth_factor": 0.75,
+            "dynamic_chunking_min_chunk_size": 4096,
             "max_num_seqs": 4,
             "max_num_batched_tokens": 64,
             "long_prefill_token_threshold": 0,
@@ -261,6 +273,37 @@ def keep_envs_lazy():
             delattr(envs, name)
 
 
+_SHIM_SWAPPED = ("Context", "Poller", "Socket")
+
+
+@pytest.fixture(autouse=True)
+def keep_zmq_shim_choosing():
+    """Fail the test that leaves `zmq_shim` a fixed `Context`, `Poller` or
+    `Socket`, and undo it.
+
+    `atom.utils.zmq_shim` picks each of the three on every read, through a
+    module-level `__getattr__`: pyzmq's with no LP runtime installed, the
+    runtime's own with one. `monkeypatch.setattr` on the shim restores by
+    `setattr`, so the pyzmq class it read stays in the module dict, and a later
+    test that installs a runtime gets pyzmq's: an engine input thread then never
+    reports its requests. Patch it in the shim's dict instead
+    (`monkeypatch.setitem(vars(zmq_shim), ...)`), whose undo deletes it.
+
+    pytest sets autouse fixtures up in name order, and this name sorts before
+    `mono_runs_on_gfx950`, the first to take `monkeypatch`: its check runs
+    after monkeypatch's undo.
+    """
+    yield
+    shim = sys.modules.get("atom.utils.zmq_shim")
+    fixed = [n for n in _SHIM_SWAPPED if shim is not None and n in vars(shim)]
+    for name in fixed:
+        delattr(shim, name)
+    assert not fixed, (
+        f"this test left zmq_shim's {fixed} fixed, which a later test's LP "
+        "runtime would not get; patch it with `monkeypatch.setitem(vars(...))`"
+    )
+
+
 @pytest.fixture
 def seq_factory():
     """Factory for creating Sequence objects with sensible defaults."""
@@ -270,3 +313,49 @@ def seq_factory():
         return Sequence(token_ids, block_size, sampling_params=sp, **kwargs)
 
     return make_sequence
+
+
+class ReqGraphRecordings:
+    """What a warmup's capture leaves in request graphs, held on the CPU: a
+    bucket of ``running_bs`` requests replays to ``out``."""
+
+    def __init__(self):
+        self.by_requests = {}
+
+    def add(self, running_bs, out, on_replay=None):
+        def replay():
+            if on_replay is not None:
+                on_replay()
+            return out
+
+        self.by_requests[running_bs] = replay
+
+
+@pytest.fixture
+def req_graph_recordings(monkeypatch):
+    """`ReqGraph`'s interface served from `ReqGraphRecordings`, for a draft
+    pass (`DraftGraph`, keyed by its request count) and a test without a GPU
+    to record it on."""
+    recordings = ReqGraphRecordings()
+    held = recordings.by_requests
+
+    def release_graphs(self):
+        dropped = len(held)
+        held.clear()
+        return dropped
+
+    monkeypatch.setattr(ReqGraph, "has", lambda self, key, phase=None: key in held)
+    monkeypatch.setattr(ReqGraph, "replay", lambda self, key=None, **_: held[key]())
+    monkeypatch.setattr(ReqGraph, "release_graphs", release_graphs)
+    return recordings
+
+
+@pytest.fixture(autouse=True)
+def mono_runs_on_gfx950(monkeypatch):
+    """Mono's deployment checks see gfx950, the only arch its kernels are built
+    for, so a refusal test asserts on its own condition on any runner (a CPU
+    one has no chip to ask). The arch check itself is tested by patching back.
+    """
+    from atom.mono.runtime import deployment
+
+    monkeypatch.setattr(deployment, "_gfx", lambda: "gfx950")

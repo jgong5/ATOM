@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import types
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -178,6 +179,17 @@ def _planned(x, plan, pool):
     _run(_kernel, x, plan.rows)
 
 
+class _Units(NamedTuple):
+    values: torch.Tensor
+    scales: torch.Tensor
+
+
+def _written(x, units):
+    # Reads its planes by field, as DeepSeek-V4.1's FP4 index write does: a
+    # replay passes `units` rebuilt as its class.
+    _run(_kernel, x, units.values, units.scales)
+
+
 def test_a_launch_lifts_past_closures_and_generic_launchers_with_its_entry_arguments(
     recorder,
 ):
@@ -234,7 +246,7 @@ def test_a_leaf_still_open_when_the_step_ends_is_refused_by_name(recorder):
     recorder.start()  # the generator's close unwinds a leaf no step traces
 
 
-def test_a_triton_warmup_launches_nothing_and_a_compiled_kernel_is_refused(
+def test_a_triton_warmup_launches_nothing_and_a_compiled_kernel_lifts_as_a_jit_one(
     request, tmp_path
 ):
     if "COMPASS_ARCH_DECLARED" not in os.environ:
@@ -269,8 +281,8 @@ def test_a_triton_warmup_launches_nothing_and_a_compiled_kernel_is_refused(
         kernel.warmup(1, grid=(1,))
         with pytest.raises(ValueError, match="triton.kernel lifts to"):
             kernel.run(1, grid=(1,), warmup=False)
-        for launch in (lambda: compiled.run, lambda: compiled[1]):
-            with pytest.raises(ValueError, match="through CompiledKernel.run"):
+        for launch in (lambda: compiled.run(1, 1, 1), lambda: compiled[(1,)](1)):
+            with pytest.raises(ValueError, match="triton.kernel lifts to"):
                 launch()
         with pytest.raises(ValueError, match="compiled outside the capture"):
             fly.CompiledFunction(None, None)()
@@ -351,6 +363,21 @@ def test_an_object_argument_is_held_as_pickle_reduces_it_or_as_the_runner_s(
     assert dict(leaf.args)["pool"] == ir.ModuleRef("runner.pool")
 
 
+def test_a_named_tuple_argument_is_held_as_its_class_and_fields(recorder):
+    def call(x):
+        scales = torch.empty(2, dtype=torch.uint8, device="cuda")
+        _written(x, _Units(torch.empty(2, 8, device="cuda"), scales))
+
+    steps(recorder, call, call)
+
+    leaf = recorder.items[-1][1]
+    assert leaf.name == f"{__name__}:_written"
+    values = ir.Tensor((2, 8), "torch.float32", (8, 1), ir.Role.METADATA)
+    scales = ir.Tensor((2,), "torch.uint8", (1,), ir.Role.METADATA)
+    fields = (("values", values), ("scales", scales))
+    assert dict(leaf.args)["units"] == Reduced(f"{__name__}:_Units", fields)
+
+
 def test_an_argument_neither_a_value_nor_reducible_is_refused_by_its_type(
     recorder,
 ):
@@ -403,7 +430,6 @@ def test_v4_pro_s_triton_experts_capture_at_the_functions_that_launch_them(
     triton = "aiter.ops.triton.moe."
     assert {
         triton + "moe_op_gemm_a16w4:moe_gemm_a16w4",
-        triton + "moe_routing.routing:sort_tokens_fused",
-        triton + "moe_routing.topk:topk",
+        triton + "moe_routing.routing:ep_sort_routing",
     } <= names
     assert "aiter.fused_moe_.default" not in names

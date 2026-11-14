@@ -1,0 +1,306 @@
+{
+  "schema_version": 1,
+  "name": "mi355x-crs005",
+  "provenance": {
+    "authored_by": "compass agent for jgong5",
+    "date": "2026-11-11",
+    "origin": "mixed",
+    "origins": {
+      "device.name": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.arch": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.count_per_node": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.memory.capacity_bytes": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.software_pinned_to.rocm": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.software_pinned_to.aiter": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.software_pinned_to.rccl": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.software_pinned_to.torch": {
+        "origin": "probed",
+        "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+        "width": 8,
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb"
+      },
+      "device.memory.bandwidth_bytes_per_s": {
+        "origin": "datasheet"
+      },
+      "device.compute.bf16_flops": {
+        "origin": "datasheet"
+      },
+      "device.compute.fp8_flops": {
+        "origin": "datasheet"
+      },
+      "device.compute.fp4_flops": {
+        "origin": "datasheet"
+      },
+      "interconnect.intra_node.domain_devices": {
+        "origin": "datasheet"
+      },
+      "interconnect.intra_node.link_bandwidth_bytes_per_s": {
+        "origin": "datasheet"
+      },
+      "interconnect.intra_node.topology": {
+        "origin": "assumed"
+      },
+      "interconnect.router_relay_s": {
+        "origin": "assumed"
+      },
+      "device.ptl": {
+        "origin": "probed"
+      },
+      "device.memory.bandwidth_curve": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "device.kernel_floor_s": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1",
+        "p10": 1.5642129778861997e-06,
+        "p90": 1.5676080465316773e-06
+      },
+      "interconnect.intra_node.link_latency_s": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1",
+        "p10": 8.557889819145204e-07,
+        "p90": 8.71113008260727e-07
+      },
+      "device.memory.derate": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "device.compute.derate.bf16": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "device.compute.derate.fp8": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "device.compute.derate.fp4": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "interconnect.intra_node.derate": {
+        "origin": "probed",
+        "source_root": "commit:f6e1fa77d",
+        "record": "sha256:ba2c62a63f3adfdee2541e81b81aa03b153ec8c563f92aa54fbcab7a0a573cf1"
+      },
+      "device.profiler_floor_s": {
+        "origin": "probed",
+        "source_root": "commit:0bdc17c90",
+        "record": "sha256:933a0d26bfeed09e301a6582acddc40da10119a5c5146e853fef982dcfa01cdb",
+        "p10": 3.878999999999906e-06,
+        "p90": 4.03900000000067e-06
+      },
+      "interconnect.inter_node.link_bandwidth_bytes_per_s": {
+        "origin": "probed",
+        "source_root": "commit:f371241a0",
+        "record": "sha256:8c5a2b561e898c28f51605e5069c4a98cbe362db40a8f734a83cb74423f88103",
+        "p10": 50000000000.0,
+        "p90": 50000000000.0
+      },
+      "interconnect.inter_node.link_latency_s": {
+        "origin": "probed",
+        "source_root": "commit:f371241a0",
+        "record": "sha256:8c5a2b561e898c28f51605e5069c4a98cbe362db40a8f734a83cb74423f88103",
+        "p10": 2.950775364256114e-05,
+        "p90": 6.060598291460931e-05
+      },
+      "interconnect.inter_node.derate": {
+        "origin": "probed",
+        "source_root": "commit:f371241a0",
+        "record": "sha256:dfe10eb1bf596f9a77c38cff6e3a9419cd5ff1ccf447eb1a1283a367b3eb6c91",
+        "p10": 0.3716563888843095,
+        "p90": 0.5117426951060756
+      }
+    },
+    "fragments": [
+      "device",
+      "datasheet",
+      "assumed",
+      "ptl",
+      "peaks",
+      "profiler",
+      "crs005-013-ionic"
+    ],
+    "notes": "one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo start at f6e1fa77d | MI355X datasheet | no probe fills these | no card has a ptl directory | probe_device.py: GEMM, read, write, copy, graph and link samples | probe_device.py: empty kernels queued under a trace run's profiler | crsuse2-m2m-v3-005 writing into -013 over ionic_N, the rails of matched-rail Mooncake. At f371241a0, the source root, rdma_link.py's bench (005's GPUs into 013's, the 1P1D deployment's RDMA settings) read the port rate on all sixteen ports and timed every GPU's writes on its own rail and the next GPU's, and one 1P1D run of #975's EP-off cell at c=64 for 600 s recorded its KV writes. rdma_link.py fit BENCH RECORD at 5f5cccf1a gives the values: the port rate, the latency fitted per round on the bench's writes, and the derate of the run's KV writes that no other write was in flight beside on their prefill rank or rail. The rate's and the latency's record is the bench's sha256; the derate's is the sha256 that fit prints over the run's writes files"
+  },
+  "device": {
+    "name": "MI355X",
+    "arch": "gfx950",
+    "count_per_node": 8,
+    "ptl": "disabled",
+    "memory": {
+      "capacity_bytes": 309220868096,
+      "bandwidth_bytes_per_s": 8000000000000.0,
+      "bandwidth_curve": [
+        [
+          4096,
+          2448213119.8574038
+        ],
+        [
+          8192,
+          4901932899.645926
+        ],
+        [
+          16384,
+          9799057786.896889
+        ],
+        [
+          32768,
+          19216086138.60756
+        ],
+        [
+          65536,
+          36700073375.20446
+        ],
+        [
+          131072,
+          73396013852.64185
+        ],
+        [
+          262144,
+          146726346018.3001
+        ],
+        [
+          524288,
+          281614855936.05884
+        ],
+        [
+          1048576,
+          559324208073.2725
+        ],
+        [
+          2097152,
+          1069975261609.8036
+        ],
+        [
+          4194304,
+          1900125139330.0735
+        ],
+        [
+          8388608,
+          3036138588634.988
+        ],
+        [
+          16777216,
+          4078284050135.474
+        ],
+        [
+          33554432,
+          5133415851480.742
+        ],
+        [
+          67108864,
+          5842638294512.771
+        ],
+        [
+          134217728,
+          6020018863349.566
+        ],
+        [
+          268435456,
+          6119695251585.363
+        ],
+        [
+          536870912,
+          6257719852339.275
+        ],
+        [
+          1073741824,
+          6371910488551.815
+        ],
+        [
+          2147483648,
+          6463389077030.495
+        ],
+        [
+          4294967296,
+          6556731501062.837
+        ]
+      ],
+      "derate": 0.8195914376328546
+    },
+    "compute": {
+      "bf16_flops": 2516600000000000.0,
+      "fp8_flops": 5033200000000000.0,
+      "fp4_flops": 1.00663e+16,
+      "derate": {
+        "bf16": 0.6507569126723242,
+        "fp8": 0.6723797263423974,
+        "fp4": 0.5597019488155491
+      }
+    },
+    "kernel_floor_s": 1.5658164620399475e-06,
+    "profiler_floor_s": 3.9590000000007426e-06,
+    "software_pinned_to": {
+      "rocm": "7.2.4",
+      "aiter": "41d4d8d7e",
+      "rccl": "2.27.7",
+      "torch": "2.10.0+rocm7.2.4.git3d3aa833"
+    }
+  },
+  "interconnect": {
+    "intra_node": {
+      "topology": "fully_connected",
+      "domain_devices": 8,
+      "link_bandwidth_bytes_per_s": 76800000000.0,
+      "link_latency_s": 8.638092577457427e-07,
+      "derate": 0.792221303292688
+    },
+    "inter_node": {
+      "link_bandwidth_bytes_per_s": 50000000000.0,
+      "link_latency_s": 3.008648854934795e-05,
+      "derate": 0.46939086521217643
+    },
+    "router_relay_s": 0.0015
+  }
+}

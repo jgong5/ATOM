@@ -2,7 +2,7 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header.
-**Decisions D0–D105, with no gaps, and their sub-decisions** are indexed at the end of this
+**Decisions D0–D107, with no gaps, and their sub-decisions** are indexed at the end of this
 file. The TODOs are registered in **`12_open_items.md`**, with the load-bearing assumptions
 and the cross-cutting issues. Implementation follows the execution plan in `16`.
 
@@ -52,6 +52,9 @@ Added later, from the evidence and the owner's rulings, and not in the original 
 | **7** | **Never report an aggregate without its decomposition.** | Aggregates have hidden compensating errors here at least six times. See finding 2. |
 | **8** | **Every claim carries its measurement.** A number without a source is a defect. | Several "known" constants turned out to be one data point. |
 | **9** | **Model ATOM as it is meant to run.** An ATOM functional or performance bug gets no price term, probe field, host segment or planner rule. It is filed against ATOM under the [`atom-issue`](https://github.com/jgong5/ATOM/issues?q=label%3Aatom-issue) label for ATOM's side to fix, and the residual it leaves is stated in the named result of the task that found it. | Measured gaps that were ATOM's own: PP's gloo round trip before the RCCL receive and its serial RCCL parts ([#1559 Ruling](https://github.com/jgong5/ATOM/issues/1559#issuecomment-6266312440)), and gluon `pa_decode` running a 128- or 256-token split faster than its neighbours ([#1752 Ruling](https://github.com/jgong5/ATOM/issues/1752#issuecomment-6306960229)). |
+| **10** | **No algorithm that serves one refit, machine move or task enters the code.** A rule the code applies holds for every fit, machine and task it can meet. The one expedient is reusing costly measurements, such as a law re-keyed without a refit or a vector fitted on another subject, and it is stated where used: in the law's provenance or the vector's `declared` note. | `step_linear_fit --reference` let the gpu-45 decode law's held-out band veto the crs005 decode law's MoE column, a bar borrowed from another machine for one refit; it left the code by the [#2727 Ruling](https://github.com/jgong5/ATOM/issues/2727#issuecomment-6602866038) ([#2735](https://github.com/jgong5/ATOM/issues/2735)). |
+| **11** | **Compass does not model CPU cache state, in any host term.** A host term that costs more after an idle gap, or after other work evicts its data, keeps those samples in its fit, and the task that finds it states the residual. | Host terms that moved with it: the decode right after an output prefill runs its `W_inputs` longer ([#2218](https://github.com/jgong5/ATOM/issues/2218)), and a tokenizer decode 1 ms or more after its thread's previous call takes 2.8 to 9 times the pooled law's price ([#2919](https://github.com/jgong5/ATOM/issues/2919), [its Ruling](https://github.com/jgong5/ATOM/issues/2919#issuecomment-6768687256)). |
+| **12** | **Compass does not model a card's own hardware speed.** One law prices the card mix of its records, and a card faster or slower than that mix leaves a residual, which `validate.cost` states per DP rank with its cards' PCI buses, as `run.json` records them. No key or fit reads a bus. | crsuse2-m2m-v3-005's cards run one DeepSeek-V4-Pro prefill chunk 0.6% under to 1.1% over the shared crs005 law, and rank 0's offset moved about 10 ms between 10-29 and 11-02, when no record named the card a rank ran on ([#2992](https://github.com/jgong5/ATOM/issues/2992), [#3048 Ruling](https://github.com/jgong5/ATOM/issues/3048#issuecomment-6851366020)). |
 
 ---
 
@@ -67,15 +70,16 @@ ATOM's real code owns still never touch a device.
 | **Model weights** | **STUBBED** | Constructed on meta/fake tensors for geometry; no checkpoint bytes are read and nothing is resident on a device. `02`, and see `12_open_items.md` M-c |
 | **KV cache *tensors*** | **STUBBED** | `allocate_kv_cache` allocates no bytes. It passes an empty registry to ATOM's `set_kv_cache_data`, which sets the registry to `{}` and builds the worker-side KV connector for a `compass` `kv_transfer_config`. `03` D13 |
 | **KV block accounting** | **REUSED, unmodified** | `BlockManager`, `BlockPool`, the prefix index, `plan_pools`, ref counting, eviction, preemption. It is pure arithmetic over integers, so running the real thing is *more* faithful than simulating it, and free. `03` D13 |
-| **KV *transfer* (PD disagg)** | **SIMULATED** | No RDMA, no real bytes on a fabric. A simulated connector registered in ATOM's existing factory charges `latency + bytes/bandwidth` from the machine spec, a rank pair's writes moved one at a time. `allocate_kv_cache` refuses, by name, any `kv_connector` other than `compass` and `lmcache_mp`, alone or in a `multi`, including a non-empty `kv_transfer_config` with no `kv_connector` key, which reads as `moriio`. A `kv_transfer_config` of `{}` (ATOM's default) or `None` builds no connector and refuses nothing; a config that lacks the field is refused by name. `01` D6 |
+| **KV *transfer* (PD disagg)** | **SIMULATED** | No RDMA, no real bytes on a fabric. A simulated connector registered in ATOM's existing factory charges `latency + bytes/bandwidth` from the machine spec, a rank pair's writes moved one at a time. `allocate_kv_cache` refuses, by name, any `kv_connector` other than `compass`, `lmcache_mp` and `lmcache_offload`, alone or in a `multi`, including a non-empty `kv_transfer_config` with no `kv_connector` key, which reads as `moriio`. A `kv_transfer_config` of `{}` (ATOM's default) or `None` builds no connector and refuses nothing; a config that lacks the field is refused by name. `01` D6 |
 | **KV offload server (`lmcache_mp`)** | **SIMULATED** | The lmcache MP server is LP `lmcache`: a Compass stand-in on the real ZMQ channels, holding a content index without bytes and pricing its work on two stations; stores and loads complete as stamped replies, which the engine's shell sends and takes on its step loop. `01` D6.1 |
+| **KV offload tier (`lmcache_offload`)** | **SIMULATED** | Each rank's CPU tier is a chunk index without bytes, evicted by ATOM's SLRU policy; lookup, store and load are priced, and ATOM's scheduler half runs as real code. `03` D13.1 |
 | **Prefix caching** | **REUSED, unmodified** | The hit *is* ATOM's hit, at ATOM's 64-token block granularity. Its effect on prefill cost is a cost-model term, not an inference. `03` |
 | **Scheduler / admission / chunking** | **REUSED, unmodified** | The whole point. Same decisions as a real run. `01`, `03` |
 | **API server, tokenizer** | **REUSED, real** | Real HTTP, real uvicorn, real tokenizer — run for its *effect*, with a modelled duration charged for its *time*. `06` D33 |
 | **Device memory readings** | **SUBSTITUTED** | The five readings are built from the machine spec, the model and a `memory_readings` entry `compass measure memory` took on the target, instead of the runtime, so a host without the device can model it. The budget *arithmetic* around them is ATOM's. `03` D14, `07` D38 |
 | **Wall-clock time** | **SUBSTITUTED** | Every clock read and timer the Clock Authority can reach runs on virtual time, failure detectors and metrics cadence included. Only the Atomesh router's bounds and health check, set by its flags, OS-level process-death detection and the control-command reply deadline stay real ([`01` K8](01_execution_and_time_model.md#d4-the-interception-contract-which-waits-must-be-touched)). `01` D5, `11` D72 |
 | **Collectives / comms** | **SIMULATED** (cost only) | Priced from measurements or the spec; no collective actually runs on a device. `07` D40 |
-| **Atomesh router** | **REUSED, configured** | No Compass change beyond the `--worker-request-timeout-secs` option (#478); a simulated launch sets it large and switches the health check and circuit breaker off. The simulated timeline rides carriers the router already relays: the `compass` entry of the `tracestate` header on requests, a field in `kv_transfer_params` on the prefill-to-decode forward, and SSE comment lines on streamed output. `01` D7, `06` D30 |
+| **Atomesh router** | **REUSED, configured** | No Compass change beyond the `--worker-request-timeout-secs` option (#478); a simulated launch sets it and `--request-timeout-secs` large and switches the health check and circuit breaker off. The simulated timeline rides carriers the router already relays: the `compass` entry of the `tracestate` header on requests, a field in `kv_transfer_params` on the prefill-to-decode forward, and SSE comment lines on streamed output. `01` D7, `06` D30 |
 | **Serving *decisions*** | **NOT MODELLED** | Compass predicts the time decisions consume, not the decisions themselves — because it reuses the code that makes them. *(A simple serving simulation is planned as a future part of Compass; explicitly out of scope for this work.)* |
 
 **The rule underneath the table:** anything that is *arithmetic* is reused; anything that is
@@ -84,9 +88,10 @@ one most often assumed to be the second.
 
 ### Not modelled at all
 
-Fragmentation. Neighbour contention. A device that has never been measured (except by the
-analytical projection, whose peaks carried from a probed device make its terms declared). See **Scope and non-goals**
-below for where each is recorded.
+Fragmentation. Neighbour contention. The GIL. CPU cache state, in any host term (principle 11). A card's own
+hardware speed (principle 12). A device that
+has never been measured (except by the analytical projection, whose peaks carried from a probed
+device make its terms declared). See **Scope and non-goals** below for where each is recorded.
 
 ---
 
@@ -156,11 +161,11 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 ```
   +=====================================================================+
   |  L5  TOOLING          compass record | trace {steps,ops} |          |
-  |                       measure {steps,ops,memory} |                  |
-  |                       fit {steps,ops,host} | run; the bench;        |
+  |                       measure {steps,ops,memory,device} |           |
+  |                       fit {steps,ops,host,device} | run; the bench; |
   |                       step grid's planner, inside measure steps     |
-  |                       spec package: probes . merge . validate .     |
-  |                       explain, run by per-machine scripts           |
+  |                       device datasheets, network files; the spec    |
+  |                       a run composes from them and its readings     |
   |                       flags, precedence, the `compass` entry        |
   |                                                docs 07, 05, 13      |
   +=====================================================================+
@@ -177,9 +182,11 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       or estimated                                  |
   |                       Cost IR: Seq/Repeat/Par, opaque leaves        |
   |                       fitting, law selection, hull guard            |
+  |                       pass registry, pass record, one label rule    |
+  |                       for host-paced device time                    |
   |                       spec-decode: draft/verify structures,         |
   |                       acceptance inputs, draft KV                   |
-  |                                       docs 02,03,04,09,10,14,17     |
+  |                                    docs 02,03,04,09,10,14,17,18     |
   +=====================================================================+
   |  L2  EXECUTION        CompassModelRunner (the seam)                 |
   |                       simulated KV connector                        |
@@ -195,8 +202,8 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       PP adds one LP per stage                      |
   |                                                docs 01, 15          |
   +=====================================================================+
-  |  L0  ARTIFACTS        machine_spec   op_graph      price_list       |
-  |                       op_measurement memory_readings                |
+  |  L0  ARTIFACTS        probe_record  platform_readings  op_graph     |
+  |                       price_list  op_measurement  memory_readings   |
   |                       shape_population  step_measurement            |
   |                       step_linear_law  host_laws  step grid bundle  |
   |                       keys . digests . fingerprints . invalidation  |
@@ -222,18 +229,20 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L2 | Atomesh handling | [`01`](01_execution_and_time_model.md), [`06`](06_workload_harness_contract.md) | D7, D30 |
 | L2 | Prometheus metrics under virtual time | [`11_metrics_support.md`](11_metrics_support.md) | D71–D77 |
 | L3 | `CostBackend` interface, granularity, the method vocabulary | [`02`](02_model_runner_and_cost_backend.md) | D11 |
-| L3 | Memory model, KV pool reuse | [`03_memory_and_kv_model.md`](03_memory_and_kv_model.md) | D13–D16 |
+| L3 | Memory model, KV pool reuse, the `lmcache_offload` tier | [`03_memory_and_kv_model.md`](03_memory_and_kv_model.md) | D13–D16 (+ D13.1) |
 | L3 | Model capture, Cost IR | [`04_model_capture_and_cost_ir.md`](04_model_capture_and_cost_ir.md) | D17–D23 (+ D18.1) |
 | L3 | Fitting, law selection, hull guard | [`09_fitting_and_law_selection.md`](09_fitting_and_law_selection.md) | D53–D62 |
 | L3 | Analytical laws, the step roofline | [`10_analytical_laws.md`](10_analytical_laws.md) | D63–D70 |
 | L3 | Step grid backend (step-level), a stage-2 candidate | [`17`](17_step_grid_backend.md) | D96–D105 |
-| L4 | Harness contract, wire fields, adapter | [`06_workload_harness_contract.md`](06_workload_harness_contract.md) | D27–D35 |
+| L3 | The pass record and the one label rule for host-paced device time | [`18`](18_pass_record_and_host_paced_time.md) | D107 |
+| L4 | Harness contract, wire fields, adapter | [`06_workload_harness_contract.md`](06_workload_harness_contract.md) | D27–D35 (+ D35.1) |
 | L5 | The calibration phases, the measurement bench and the recommended flow | [`07_calibration_toolchain.md`](07_calibration_toolchain.md) | D36–D43 |
-| L5 | Machine spec schema and probes | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
+| L5 | The JIT sweep and the per-stack cache library that warm a container before a graded run | [`07`](07_calibration_toolchain.md) | D106 |
+| L5 | Machine spec layers, their schema, `measure device` and `fit device` | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
 | L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
-| — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D50.1, D50.2, D50.3) |
+| — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D45.1, D50.1, D50.2, D50.3) |
 | L5 | Configuration surface: flags, precedence, the `compass` commands with their inputs and outputs | [`13_configuration_surface.md`](13_configuration_surface.md) | D78–D81 |
-| L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 |
+| L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 (+ D87.1) |
 | L1/L3 | Parallelism: TP, DP, PP, EP | [`15_parallelism_support.md`](15_parallelism_support.md) | D88–D94 |
 | — | Open items, assumptions, gaps | [`12_open_items.md`](12_open_items.md) | — |
 | — | How it gets built: tasks, waves, gates, GPU queue | [`16_execution_plan.md`](16_execution_plan.md) | — |
@@ -277,7 +286,7 @@ This is what makes "no GPU at simulation time" work.
   OFFLINE, needs a GPU, run rarely          ONLINE, device-free, every run
   ================================          ==============================
 
-   spec probes      Phase 1b price
+   measure device   Phase 1b price
    Phase 1c in-situ Phase 2 memory
         |                  |
         v                  v
@@ -285,7 +294,7 @@ This is what makes "no GPU at simulation time" work.
    |        ARTIFACT STORE          |------>|  Phase 0  discovery       |
    |  key + digest + fingerprint    |       |  Phase 1a trace (JIT)     |
    |                                |<------|  cost model -> seconds    |
-   |  machine_spec   price_list     |  JIT  |  memory model -> blocks   |
+   |  platform_readings  price_list |  JIT  |  memory model -> blocks   |
    |  op_graph                      | trace |                           |
    |  memory_readings               |       |  -> simulated run         |
    +--------------------------------+       +---------------------------+
@@ -344,7 +353,12 @@ graded as a candidate for #627's stage 2 (`17` D96, `07` D36).
 
 The analytical method has its own gate, stated in advance: on every measured step, at both
 granularities, it prices **at most the measured time**; configuration ranking and the
-method's error are reported, not gated (`10` D67.1, #1392).
+method's error are reported, not gated (`10` D67.1, #1392). Stage 4 checks it on MI455's own
+runs at peaks probed there, and reports the method's error as the same MI455 records
+bounded at the frozen projection's spec and at the probed one (`16` *Stage 4*, `08` D50.2).
+
+The M3-Agentic stage's cells grade each point by its overlap with the real curve
+(`08` D45.1).
 
 Final proof is **paired simulated and real execution of cc-traces proper**.
 
@@ -353,8 +367,9 @@ Final proof is **paired simulated and real execution of cc-traces proper**.
 | # | Milestone |
 |---|---|
 | **M1** | **[#627](https://github.com/jgong5/ATOM/issues/627) stages 1 and 1b: cc-traces end to end on a GPU-free simulated run** (`16` D95). Stage 1 drives cc-traces through agentx-harness at TP1; stage 1b adds atomesh at 1P+1D; each run ends by the finish. Built on the discrete-event foundation, fake models covering prefill, decode and KV need, and the test harness |
-| **M2 — v1** | **#627 stage 3: DeepSeek-V4-Pro 1P+1D on MI355X within the targets above**, first in the nightly configurations with expert parallelism off, then at EP8 — each step first the same scheduling decisions as the real engine, then the separable results of `08` D44 and the configuration-ranking gate; **the MI455 roofline projection**, held to the soundness checks of `16` D95. **First gate, #627 stage 2:** Qwen3.8-27B TP1 on MI308X, paired real and simulated cc-traces graded by `08` |
+| **M2 — v1** | **#627 stage 3: DeepSeek-V4-Pro 1P+1D on MI355X within the targets above**, first in the nightly configurations with expert parallelism off, then at EP8 — each step first the same scheduling decisions as the real engine, then the separable results of `08` D44 and the configuration-ranking gate; **the MI455 roofline projection** of stage 3c, held to the soundness checks of `16` D95 and then frozen; last, **stage 4: DeepSeek-V4.1-Flash measured on MI455 and graded by the step linear backend in two TP4 DSpark5 cells**, with the analytical bound checked on the same runs (`16` *Stage 4*, [#2138](https://github.com/jgong5/ATOM/issues/2138)). **First gate, #627 stage 2:** Qwen3.8-27B TP1 on MI308X, paired real and simulated cc-traces graded by `08` |
 | ~~M3–M7~~ | Retired by `16` D95, which maps each one to where its scope went. PP, EP beyond one node, and further models come after v1 |
+| **M3-Agentic** | **[#3256](https://github.com/jgong5/ATOM/issues/3256): ATOM's MiniMax-M3 AgentX submission to InferenceX, simulated on MI355X**, every arm and point, each simulated curve lying on this branch's real one by `08` D45.1, with EAGLE3 and the `lmcache_offload` tier (`16` D95.1). Named for the model, not the retired M3 |
 
 Sequencing, dependencies and parallelisable work are in the execution plan (`16`). `00_initial_prompt.md` is the original seed and is
 **not** a design document — see *Development history*.
@@ -370,6 +385,9 @@ Stated here so they are not discovered at review.
 | A device that has never been measured — except by the analytical projection, declared while its peaks are carried from a probed device | `10` D69 |
 | Neighbour contention. Compass models a **dedicated** device, so it will not predict an OOM a shared box produces | `03` D14 |
 | Memory fragmentation — not modelled, not planned, and nobody models it | `03` D16 |
+| The GIL. Host terms are fitted on lone calls and on the CPU clock, so none carries a wait for it; the waits a lone call still holds are a stated residual | `07` D38, Phase 1c |
+| CPU cache state, in any host term (principle 11). An output prefill evicts the worker's input-prep data from the core's L3, so the decode right after it runs its `W_inputs` longer, while its `E` runs more scheduling work; the decode host law keeps those decodes, and their residual is stated. A tokenizer decode costs more the longer its thread sat idle since its previous call; the tokenizer law keeps those calls, and each cell's residual is stated | [#2218](https://github.com/jgong5/ATOM/issues/2218), [#2919](https://github.com/jgong5/ATOM/issues/2919#issuecomment-6768687256) |
+| A card's own hardware speed (principle 12). A step law prices the card mix of its records; a DP rank whose card runs faster or slower leaves a residual, which `validate.cost` states per rank with its cards' PCI buses | [#3048 Ruling](https://github.com/jgong5/ATOM/issues/3048#issuecomment-6851366020) |
 | **Cancellation** — `status` is `"completed"` on all 1,697 subagent wrappers in both corpora. There is nothing to replay. | `06` D35 |
 | Serving *decisions* as a simulated subsystem — a simple serving simulation is planned for a later phase of Compass, not this one | — |
 
@@ -485,7 +503,7 @@ The documents use these precisely; a reader will bounce off without them.
 | **logical process (LP)** | the unit the Clock Authority coordinates. *Not* an OS process — a TP group is one LP, a DP group is one LP, because both already have a hardware barrier. |
 | **structure** | a distinct operator list, independent of shape: the discrete part of a graph's applicability key (`04` D19). Prefill has two (chunked, unchunked). Graphs are captured per shape, one per decode width and prefill (T, B) (`04` D18). |
 | **treatment** | a factor that moves cost and is invisible to every feature in the model. Uniform MoE routing under DP is one. Decode **row order** is one to the op-level IR. The step linear law prices it with `rowmod(k)` (`09` D61); the step grid's residual reads it (`17` D100). |
-| **refusal** | a declined answer with a named reason. Refusals are results, not errors, and are preferred to guesses everywhere. A **refused step** is one with some term still unanswered after method fallback, its reasons listed per term: it costs 0 s, the run continues, and any refusal makes the run a coverage report (`08` D50.1). A source that declines while a later one answers is a fall-through, and an answer of any method, unvalidated included, is reported by its method; neither is a refusal. |
+| **refusal** | a declined answer with a named reason. Refusals are results, not errors, and are preferred to guesses everywhere. A **refused step** is one with some term still unanswered after method fallback, its reasons listed per term: each unanswered term costs 0 s, and a step the cost backend refuses charges no device time, its answered terms included; the run continues, and any refusal makes the run a coverage report (`08` D50.1). A source that declines while a later one answers is a fall-through, and an answer of any method, unvalidated included, is reported by its method; neither is a refusal. |
 | **step grid** | the step-level backend of `17`, run-file key `step_grid`: a grid of step measurements looked up per batch, plus a residual, fitted on real-run step times, bench replays or both, for what the grid's coordinates cannot see (row order, raggedness). |
 | **complete cell** | a cell of the step grid whose every corner was measured. The step grid interpolates only inside one; it extrapolates a decode cell past the KV pool, and anywhere else declines to the step roofline (`17` D99, D102). |
 | **recipe** | the step grid's feature functions and the constants frozen with them. Configuration supplies geometry and hardware values, a fit supplies coefficients, and a recipe's version changes only when a function does. |
@@ -533,7 +551,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`05`](05_machine_spec_and_probes.md) | Machine Specification and its Probes | The one input artifact describing device, host, interconnect and the software stack it is pinned to. Read this before `03` and `04`, both of which consume it. Probe tools and their contamination refusals. |
+| [`05`](05_machine_spec_and_probes.md) | Machine Specification and its Probes | A value lives in the layer that names what it varies with: a device datasheet per SKU, platform readings per device, stack, PTL state and torch, folded from each node's probe record, and a network file per scale-out network for a run across nodes, composed into one machine spec for a run; the host's tokenizer and HTTP intake terms are host laws, fitted from served records; every artifact keys the platform its row depends on. Read this before `03` and `04`, both of which consume it. Probe tools and their contamination refusals. |
 | [`03`](03_memory_and_kv_model.md) | Memory Model and the KV Pool | **Do not simulate the KV pool** — ATOM's real one is pure arithmetic. Substitute the five device readings, never the arithmetic. How a prefix-cache hit reaches the cost model. Validate per term, never as a sum. |
 | [`04`](04_model_capture_and_cost_ir.md) | Model Capture and the Cost IR | Capture with `TorchDispatchMode` + `FakeTensorMode`, concrete, one graph per decode width and prefill (T, B). A hierarchical, stream-annotated IR whose leaves carry their call contract and whose `Repeat` nests and tolerates non-contiguous layer patterns. **Opaque leaves** are priced, not decomposed. |
 | [`10`](10_analytical_laws.md) | Analytical Laws | Cost and memory from device parameters and model geometry, with no observation of the subject. Three classes: exact from geometry, device-parameterised, policy-determined. The analytical fallback, the step roofline and the MI455 projection. Its gate is a **bound**, at most the measured time on every measured step; ranking is reported. **The most speculative document here.** |
@@ -543,15 +561,16 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`07`](07_calibration_toolchain.md) | Calibration and Benchmarking Toolchain | The phases and the commands that run them; the backend that needs a measurement plans it; the step bench is `EngineCore` without its scheduler, with one window for every step; the op bench times each leaf from its contract, cold, at points ATOM's runner prepares without a forward, and `fit ops` interpolates only between same-kernel neighbours. One recommended flow per half, steps and ops. The minimal recipe: one full-engine run at TP1, plus one TP2 transfer test, plus an engine start per configuration (`measure memory`). Four classes of communication pricing. The artifact store, its keys and its invalidation matrix. |
+| [`07`](07_calibration_toolchain.md) | Calibration and Benchmarking Toolchain | The phases and the commands that run them; the backend that needs a measurement plans it; the step bench is `EngineCore` without its scheduler, with one window for every step; the op bench times each leaf from its contract, cold, at points ATOM's runner prepares without a forward, and `fit ops` interpolates only between same-kernel neighbours. One recommended flow per half, steps and ops. The minimal recipe: one full-engine run at TP1, plus one TP2 transfer test, plus an engine start per configuration (`measure memory`). Four classes of communication pricing. The artifact store, its keys and its invalidation matrix. A constructed JIT sweep and a per-stack cache library warm a container before a graded run. |
 | [`09`](09_fitting_and_law_selection.md) | Fitting and Law Selection | How measurements become a model: fit relative error, per-rung decode, hull guards not bounding boxes, and why leave-one-out cannot choose a family. Owns coverage geometry for every other document. |
+| [`18`](18_pass_record_and_host_paced_time.md) | One Pass Record and One Rule for Host-Paced Device Time | A registry of each drafter flavor's passes; a record of when the host enqueued each pass; one rule that labels every pass and starts it in the recurrence, so a host-paced wait is counted once. Replaces `09` D54's decode cuts and part of `01` D4's recurrence. |
 
 ### Part IV — How it is driven and judged
 
 | Doc | Title | What it settles |
 |---|---|---|
 | [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced stamp each direction, audited for minimality: a `tracestate` entry in, an SSE comment line per event out. The timeline rides carriers Atomesh already forwards, so it needs no change. Tokenizer cost is a queue, not a constant. |
-| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two gates: a CPU gate over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU gate, a superset judged as a **delta** against pure upstream `661ef7661` on the nightly 20261013 image (`gate_gpu.sh`'s `BASE_*` constants, every failing node-id on file in `gpu_gate_known_failures.txt`). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible if stable; sensitivity is deferred. |
+| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two gates: a CPU gate over every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free **as a batch** and held to green, and a GPU gate, a superset less the files its GPU target's pair cannot record (`gpu_gate_skip.txt`, under `08`'s GPU-gate row), judged as a **delta** against a recorded baseline per GPU target (`gpu_gate_baselines/<target>/gpu_gate_baseline.env`, every failing node-id on file in `gpu_gate_known_failures.txt` beside it, both rewritten by `regen_gpu_gate_baseline.sh`). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible if stable; sensitivity is deferred. |
 | [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. The metrics push and refresh are daemon timers on simulated time. |
 
 ### Part V — Cross-cutting
@@ -582,20 +601,21 @@ The documents use these precisely; a reader will bounce off without them.
 |---|---|
 | D0 – D9 (+ D3.1–D3.5, D5.1, D6.1) | `01` Execution and Time Model |
 | D10 – D12 (+ D10.1) | `02` Model Runner Seam and Cost Backend |
-| D13 – D16 | `03` Memory Model and the KV Pool |
+| D13 – D16 (+ D13.1) | `03` Memory Model and the KV Pool |
 | D17 – D23 (+ D18.1) | `04` Model Capture and the Cost IR |
 | D24 – D26 (+ D25.1) | `05` Machine Specification and its Probes |
-| D27 – D35 (+ D34.1) | `06` Workload Harness Contract |
-| D36 – D43 (+ D38.1, D40.1) | `07` Calibration and Benchmarking Toolchain |
-| D43.1, D44 – D52 (+ D50.1, D50.2, D50.3) | `08` Validation Protocol |
+| D27 – D35 (+ D34.1, D35.1) | `06` Workload Harness Contract |
+| D36 – D43 (+ D38.1, D40.1), D106 | `07` Calibration and Benchmarking Toolchain |
+| D43.1, D44 – D52 (+ D45.1, D50.1, D50.2, D50.3) | `08` Validation Protocol |
 | D53 – D62 | `09` Fitting and Law Selection |
 | D63 – D70 (+ D67.1) | `10` Analytical Laws |
 | D71 – D77 | `11` Engine Metrics under Virtual Time |
 | D78 – D81 | `13` The Configuration Surface |
-| D82 – D87 | `14` Speculative Decoding and MTP |
+| D82 – D87 (+ D87.1) | `14` Speculative Decoding and MTP |
 | D88 – D94 | `15` Parallelism Support (TP, DP, PP, EP) |
-| D95 | `16` The Execution Plan |
+| D95 (+ D95.1) | `16` The Execution Plan |
 | D96 – D105 | `17` Step Grid Backend |
+| D107 | `18` One Pass Record and One Rule for Host-Paced Device Time |
 
 ### Headline decisions
 
@@ -617,5 +637,5 @@ The documents use these precisely; a reader will bounce off without them.
 | D45 | The real-vs-real spread is the tolerance; a metric must be stable, and sensitivity is deferred |
 | D3.2 | Always-on causality detectors: a straggler, checked on receipt and at each drain, fails the run rather than warning; a stall the Clock Authority cannot see waits for ever and prints one `DIAG_S` diagnostic, never aborting; a CI clock-source lint |
 | D3.3 | The Clock Authority ships two deployment forms from one implementation: co-hosted by default, standalone for multi-container runs |
-| D43.1 | ATOM's suite is a merge gate on every Compass change, unmodified, in two gates: a CPU gate (every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free as a batch, held to green) per change, a GPU gate, a superset judged as a delta per wave against `gate_gpu.sh`'s recorded baseline, by an equality on a per-tree expectation rather than "no worse than". The CPU gate **exits 98** rather than reporting "GPU not required" when it cannot tell |
+| D43.1 | ATOM's suite is a merge gate on every Compass change, unmodified, in two gates: a CPU gate (every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free as a batch, held to green) per change, a GPU gate, a superset less the files `gpu_gate_skip.txt` names for its GPU, judged as a delta per wave against `gate_gpu.sh`'s recorded baseline, by an equality on a per-tree expectation rather than "no worse than". The CPU gate **exits 98** rather than reporting "GPU not required" when it cannot tell |
 | D67.1 | The analytical method's gate is a **bound**: on every measured step, at both granularities, analytical is at most measured; configuration ranking and measured over analytical are reported, not gated |

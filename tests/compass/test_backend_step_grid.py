@@ -724,3 +724,20 @@ def test_an_alpha_the_grid_cannot_read_fails_loading(mode, alpha, match):
     mapping = _edited(lambda m: m["decode"].update(alpha=alpha), mode)
     with pytest.raises((ValueError, KeyError), match=match):
         StepGrid(mapping)
+
+
+def test_alpha_reads_the_mean_cached_context_and_a_grid_without_that_term_reads_0():
+    def g(c):
+        return f(20, c) + 3200
+
+    def priced(**alpha):
+        (term,) = alpha_replay(**alpha).price(view(*RAGGED, rung=32)).terms
+        return term.seconds * 1e6
+
+    alpha = 0.1 + 20 * MEAN / 2**16
+    assert priced(intercept=0.1, mean=20.0) == pytest.approx(
+        g(MEAN) + alpha * (g(LONGEST) - g(MEAN)), rel=1e-12
+    )
+    assert priced(intercept=0.1) == pytest.approx(
+        g(MEAN) + 0.1 * (g(LONGEST) - g(MEAN)), rel=1e-12
+    )

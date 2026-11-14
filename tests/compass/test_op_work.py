@@ -3,7 +3,8 @@
 
 The GEMM and attention leaves match hand counts at a decode and a prefill
 shape, their arguments as the Qwen3.8-27B capture records them; each other
-extractor matches a hand count on one shape; a kind with no extractor, or a
+extractor matches a hand count on one shape; a dtype view launches nothing,
+though a cast of the same tensor copies; a kind with no extractor, or a
 dtype with no operand format, is refused by name; and every leaf of the
 27B's captures at TP1 and TP2 has work that `price` prices.
 """
@@ -249,6 +250,21 @@ def test_a_leaf_that_launches_no_kernel_has_no_work(op):
     assert work(op, ONE, 2, "bf16") is None
 
 
+@pytest.mark.parametrize("dtype, size", [("torch.float8_e4m3fn", 1), (F32, 4)])
+def test_a_dtype_view_launches_nothing_where_a_cast_of_the_same_plane_copies(
+    dtype, size
+):
+    # V4.1's index writer reads its flat uint8 index plane as fp8 and as fp32:
+    # the same bytes, seen as other elements. A cast reads the plane and
+    # writes it anew in the new dtype.
+    plane = t([4096], "torch.uint8", role="KV")
+    view = leaf("aten.view.dtype", [[4096 // size]], self=plane, dtype=dtype)
+    cast = leaf("aten.to.dtype", [[4096]], self=plane, dtype=dtype)
+
+    assert work(view, ONE, 1, "bf16") is None
+    assert work(cast, ONE, 1, "bf16") == Work({}, 4096 + 4096 * size)
+
+
 def test_a_collective_spans_its_group():
     tensor = t([64, 5120])
     reduce = leaf(
@@ -270,6 +286,27 @@ def test_a_collective_spans_its_group():
     assert work(reduce, ONE, 1, "bf16").comm == ()
     assert work(gather, ONE, 1, "bf16").comm == (Collective(2, 4 * 124160 * 2),)
     assert work(cast, ONE, 2, "bf16").comm == (Collective(2, 64 * 4),)
+
+
+def test_a_fused_all_reduce_norm_reduces_its_input_and_moves_each_tensor_once():
+    # A row-parallel reduce fused with the residual add and RMSNorm after it:
+    # `inp` all-reduced, `inp`, `res_inp` and the weight read, and the normed
+    # rows and the new residual written, each once.
+    op = leaf(
+        "aiter.fused_allreduce_rmsnorm_.default",
+        [[64, 5120], [64, 5120]],
+        inp=t([64, 5120]),
+        res_inp=t([64, 5120]),
+        w=t([5120], role="weight"),
+        eps=1e-6,
+        group_name="tp:0",
+    )
+    buffer = 64 * 5120 * 2
+
+    assert work(op, ONE, 2, "bf16") == Work(
+        {}, 4 * buffer + 5120 * 2, (Collective(2, buffer),)
+    )
+    assert work(op, ONE, 1, "bf16").comm == ()
 
 
 def test_a_kind_with_no_extractor_is_refused_by_name():

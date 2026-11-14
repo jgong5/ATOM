@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT
+# What gate_gpu.sh and regen_gpu_gate_baseline.sh leave out on one GPU target,
+# one line each, "<target> <test file>", applying when torch reads that target
+# for the first card. Each file is one whose result on that target its pair
+# cannot record, under the issue or Ruling above it, and goes when that closes:
+# it stalls or aborts the run there, errors there, passes and fails at random
+# there, or fails there for the image rather than the tree. A suite file's
+# collected tests come off the expected pass count; a tests/compass file is left
+# out of that run, the expectation counting what tests/compass passes.
+#
+# "<target> driver-run" says that target's nodes hold no driver-run inputs:
+# gate_gpu.sh sets none there, needs one card and accepts a driver-run skip.
+
+# #2441: stalls at a device sync after a TBO forward.
+gfx942 tests/attentions/deepseek_v41/test_tbo.py
+# #2631: the V4 paged-decode kernel returns a different output on each call at head dim 96.
+gfx942 tests/model_ops/test_v4_fused_decode.py
+# #2914: FlyDSL 0.4.0's compile aborts the process on gfx1250.
+gfx1250 tests/models/deepseek_v41/test_index_fp4.py
+gfx1250 tests/models/glm52/kernels/test_glm5_tp4_index_fp8.py
+# #2915: aiter's pa_fwd_asm aborts the process on gfx1250.
+gfx1250 tests/test_model_runner_decode_padding.py
+# #2916: every test errors at setup, FlyDSL's s_waitcnt has no gfx1250.
+gfx1250 tests/test_deepseek_v41_mono_contract.py
+gfx1250 tests/test_minimax_m3_mono_contract.py
+# #2921: the MI455 image imports torch in every Python process, so these
+# tests' no-tensor-import assertions fail there.
+gfx1250 tests/compass/test_gate_gpu_aiter_version.py
+gfx1250 tests/compass/test_kv_budget.py
+gfx1250 tests/compass/test_memory_readings.py
+# The Ruling on #2896: MI455 nodes run only models verified on them, today
+# DeepSeek-V4.1-Flash.
+gfx1250 driver-run

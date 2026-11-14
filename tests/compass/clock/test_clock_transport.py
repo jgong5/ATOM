@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""`atom.compass.clock_transport`: the serve loop, held replies, refusals and the wire.
+"""`atom.compass.clock_transport`: the serve side, held replies, refusals and the wire.
 
 Every LP here talks to a real `ClockAuthority` through `connect`, the way
 `LPRuntime` does: ``send((kind, t, log, t_daemon))`` with ``(channel, seq,
@@ -12,13 +12,14 @@ import json
 import math
 import queue
 import re
+import socket
 import threading
-from unittest import mock
 
 import pytest
 
 from atom.compass.clock import (
     NER,
+    REPORT,
     TAR,
     BackdatedEvent,
     ChannelTable,
@@ -26,9 +27,9 @@ from atom.compass.clock import (
     ClockAuthority,
     LpId,
     LpRegistry,
+    Released,
     single_engine_table,
 )
-from atom.compass.clock.channels import ADMISSION_DELAY_S
 from atom.compass.clock_transport import (
     MalformedMessage,
     connect,
@@ -38,7 +39,16 @@ from atom.compass.clock_transport import (
     service,
 )
 
-from .test_member_join import ENGINE, FRONTEND, RANKS, _joined
+from .test_member_join import (
+    ENGINE,
+    FRONTEND,
+    OUT0,
+    OUT1,
+    RANKS,
+    _dp_table,
+    _joined,
+    _own,
+)
 
 A, B = LpId("a"), LpId("b")
 AB = "a->b:m"
@@ -57,7 +67,7 @@ def _table():
 
 
 class _Recorded(ClockAuthority):
-    """Records every request the serve loop hands the rule."""
+    """Records every request the serve side hands the rule."""
 
     def __init__(self, channels):
         super().__init__(channels)
@@ -94,8 +104,8 @@ def _later(fn, *args):
     return box
 
 
-def _result(box):
-    ok, value = box.get(timeout=WAIT_S)
+def _result(box, timeout=WAIT_S):
+    ok, value = box.get(timeout=timeout)
     if not ok:
         raise value
     return value
@@ -187,10 +197,7 @@ def _drive(conn, table, script):
 def _three_lp_run(cls, served):
     """Serve a `cls` over the single-engine table and run `SCRIPTS` on it."""
     # SCRIPTS' grant times are written for a 1.6 ms request lookahead.
-    with mock.patch.dict(ADMISSION_DELAY_S, serving=1.6e-3):
-        table = single_engine_table(
-            admission_path="serving", ipc_s=IPC_S, stream_s=STREAM_S
-        )
+    table = single_engine_table(admission_s=1.6e-3, ipc_s=IPC_S, stream_s=STREAM_S)
     ca = cls(table)
     endpoint = served(ca).endpoint
     conns = {name: connect(LpId(name), endpoint) for name in SCRIPTS}
@@ -257,6 +264,64 @@ def test_each_member_binds_its_own_connection_and_reads_its_own_releases(
         ((1.0, {REQ0: []}), (1.0, {REQ1: [(0, 1.0)]})),
         ((2.0, {REQ0: []}), (2.0, {REQ1: []})),
     ]
+
+
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+def test_a_member_asks_later_rounds_in_one_frame_and_reads_one_reply(served, endpoint):
+    authority = _joined()
+    endpoint = served(authority, endpoint).endpoint
+    frontend = connect(FRONTEND, endpoint)
+    dp0, dp1 = (connect(ENGINE, endpoint, rank) for rank in RANKS)
+    assert (frontend.member, dp0.member, dp1.member) == (None, *RANKS)
+    _result(_later(frontend.send, (NER, INF, [(REQ0, 0, 1.5), (REQ1, 0, 2.5)], INF)))
+    _result(_later(dp0.send, (TAR, 2.0, [], INF, [], False, [3.0])))
+    held = _later(dp0.recv)
+    assert _ask(dp1, (TAR, 2.0, [], INF)) == (2.0, {REQ1: []})
+    assert _ask(dp1, (TAR, 3.0, [], INF)) == (3.0, {REQ1: [(0, 2.5)]})
+    assert _result(held) == (3.0, {REQ0: [(0, 1.5)]})
+    assert authority.requests_served["engine"] == 3
+
+
+@pytest.mark.parametrize("endpoint", ["inproc:test", "tcp://127.0.0.1:0"])
+def test_a_report_gets_no_reply_and_hands_out_the_grants_it_makes_due(served, endpoint):
+    members = {ENGINE: {rank: _own(rank) for rank in RANKS}}
+    table = _dp_table(("engine", "engine"))
+    endpoint = served(ClockAuthority(table, members=members, ceilings=True), endpoint)
+    frontend = connect(FRONTEND, endpoint.endpoint)
+    dp0, dp1 = (connect(ENGINE, endpoint.endpoint, rank) for rank in RANKS)
+    _result(_later(frontend.send, (TAR, 3.4, [(REQ1, 0, 2.4)], INF)))
+    waiting = _later(frontend.recv)
+    _result(_later(dp0.send, (TAR, 2.0, [], INF, [], False, [2.5])))
+    held = _later(dp0.recv)
+    # Round 2.5 is granted at dp1's return, below the ceiling 4.0, and what it
+    # releases to dp1 goes ahead.
+    grant = _ask(dp1, (TAR, 2.0, [], INF))
+    assert grant == (2.0, {REQ1: [(0, 2.4)]}) and grant[1].ceiling == 4.0
+    assert _result(held) == (2.5, {REQ0: []})
+    steps = [(TAR, 2.5, 2.5, 1)]  # after its send, stamped at its return
+    _result(_later(dp1.send, (REPORT, 2.5, [(OUT1, 0, 3.0)], INF, steps, False)))
+    assert _result(waiting) == (3.4, {OUT0: [], OUT1: [(0, 3.0)]})
+    # dp1's next call reads its own reply: the report left none to read first.
+    _result(_later(dp0.send, (TAR, 4.0, [], INF)))
+    first = _later(dp0.recv)
+    assert _ask(dp1, (TAR, 4.0, [], INF)) == (4.0, {REQ1: []})
+    assert _result(first) == (4.0, {REQ0: []})
+
+
+def test_a_call_after_a_report_leaves_at_once_over_tcp(served):
+    """A report waits for no reply, so the frame after it must not wait in the
+    kernel for the report's acknowledgement."""
+    a = connect(A, served(ClockAuthority(_table()), "tcp://127.0.0.1:0").endpoint)
+    sock = a._server._sock
+    assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+
+
+def test_a_refused_report_ends_the_run_as_its_sender_reads_no_refusal(served):
+    endpoint = served(_joined()).endpoint
+    frontend, dp0 = connect(FRONTEND, endpoint), connect(ENGINE, endpoint, "dp0")
+    _result(_later(frontend.send, (REPORT, 1.0, [], INF)))
+    with pytest.raises(ClockAbort, match="frontend sent REPORT; only a member"):
+        _ask(dp0, (NER, INF, [], INF))
 
 
 # --- refusals -----------------------------------------------------------------
@@ -442,7 +507,9 @@ def test_a_log_behind_its_receiver_is_refused(served):
 def test_a_reply_is_not_something_a_participant_may_send(served):
     a = connect(A, served(ClockAuthority(_table())).endpoint)
     for message in [("GRANT", 1.0, {}), ("BIND", A)]:
-        with pytest.raises(MalformedMessage, match="sends only TAR, NER, PARK$"):
+        with pytest.raises(
+            MalformedMessage, match="sends only TAR, NER, PARK, REPORT$"
+        ):
             a.send(message)
     assert _ask(a, (TAR, 1.0, [], INF)) == (1.0, {})
 
@@ -538,6 +605,36 @@ def test_a_message_encodes_the_same_bytes_every_time():
     assert encode((NER, INF, [], 2.0)) == (
         b'{"kind":"NER","log":[],"t":"+inf","t_daemon":2.0}'
     )
+
+
+def test_steps_ahead_and_a_ceiling_ride_their_frames_and_only_when_present():
+    steps = [(TAR, 1.0, 1.0, 0), (NER, INF, 1.25, 1)]
+    request = (NER, INF, [(AB, 0, 1.5)], 2.0, steps, True)
+    assert decode(encode(request)) == request
+    assert b'"steps":[["TAR",1.0,1.0,0],["NER","+inf",1.25,1]]' in encode(request)
+    released = Released({AB: [(0, 0.5)]})
+    released.ceiling = INF
+    grant = decode(encode(("GRANT", 0.5, released)))
+    assert grant == ("GRANT", 0.5, {AB: [(0, 0.5)]}) and grant[2].ceiling == INF
+    assert decode(encode(("GRANT", 0.5, {AB: []})))[2].ceiling is None
+    assert encode((NER, INF, [], 2.0, [], False)) == encode((NER, INF, [], 2.0))
+    with pytest.raises(MalformedMessage):
+        decode(encode((NER, INF, [], 2.0, [("PARK", INF, 1.0, 0)], False)))
+
+
+def test_a_report_rides_its_own_frame():
+    report = (REPORT, 3.0, [(AB, 0, 3.5)], INF, [(TAR, 2.5, 2.5, 0)], False)
+    assert decode(encode(report)) == report
+    assert encode(report).startswith(b'{"kind":"REPORT","log":[["a->b:m",0,3.5]]')
+
+
+def test_later_rounds_ride_a_request_frame_and_only_when_present():
+    request = (TAR, 1.0, [], INF, [], False, [2.0, 3.0])
+    assert decode(encode(request)) == request
+    assert b'"rounds":[2.0,3.0]' in encode(request)
+    assert encode((TAR, 1.0, [], INF, [], False, [])) == encode((TAR, 1.0, [], INF))
+    with pytest.raises(MalformedMessage):
+        decode(b'{"kind":"TAR","log":[],"rounds":["soon"],"t":1.0,"t_daemon":"+inf"}')
 
 
 def test_a_frame_is_json_a_stranger_can_read():

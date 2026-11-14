@@ -415,8 +415,8 @@ method**, a price is `measured`; and **reading a measurement back from a file is
 - What a refusal *does to the run* is not local to this document and is settled in `08`
   D50.1: a step is refused only when some term is still unanswered after method
   fallback, so an unpriced leaf is answered by its analytical law, and an estimated
-  answer outside its validated region is priced and marked unvalidated. A refused step
-  costs 0 s, the run continues, and the run is a coverage report.
+  answer outside its validated region is priced and marked unvalidated. `08` D50.1 also
+  says what a refused step charges; the run continues, and the run is a coverage report.
 
 ---
 

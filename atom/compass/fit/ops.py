@@ -9,25 +9,41 @@ ops` published it. A `--plan` run resumed into a DIR keeps the rounds earlier
 runs wrote there, so DIR lists every run's points. A point a `--plan` run
 found already in S is in no round's ops.jsonl: pass the directory that
 measured it too. Every point
-must name one `price_list` key, its model, parallel layout, machine-spec
-digest and source root, and one torch; the price list is published at that key
+must name one `price_list` key, its model, parallel layout, platform and source
+root; the price list is published at that key
 under the readings the points ran under.
 
 A leaf's family is its signature with the integers that follow the shape
 masked. Among the points of one phase whose signatures match with every
 integer masked, an integer position follows the shape when it holds one value
-at each shape, a value not the same at every shape, and that value is the
-shape's token or sequence count or one more. Any other integer names the leaf:
-the GEMMs of a decode step differ in N and K and share a family per weight.
+at each shape, a value not the same at every shape, and that value is a count
+the point ran its leaf at or one more (`ran_counts`). Any other integer names
+the leaf: the GEMMs of a decode step differ in N and K and share a family per
+weight. A prefill that states a width ``W`` past its rows, where a padded step
+runs its LM head and its drafter's later passes, ran a leaf that leads with W,
+and not with its T or B, at W as its B, where `OpGraphBackend` asks such a
+leaf; W is no count of any other leaf's, so points at two widths stay apart.
+Where W is that prefill's T too, a leaf that leads with it may have run at
+either B: a point its family reads at two places is left out, named in the
+params' ``left_out``, and a run prices such a leaf there where either B gives
+one answer.
 
 A family's dimensions are the shape's counts its masked integers follow, a
-decode's B always, the rows its MoE gathers, ``G``, when the shape states them
-(a shape that states no ``G`` gathers every rank's T, and is another family), and,
+decode's B always, at its T where it states one (a drafter's own leaves at the
+rows they ran, the step padded to B), the rows its MoE gathers, ``G``, where
+every point states them and its masked integers follow them: a leaf that does
+not read them, as attention does not, is read at any ``G``
+(a shape that states no ``G`` gathers every rank's T, and is another family),
+``pad``, the pad rows of a padded decode's MoE, where some point of the family
+states its real rows (`measure ops`' ``R=``): the rows its ids route
+(`bench.ops.routed_rows`) less those, 0 at a point stating none, so a family
+over every rung lines its every-row points up along B, and,
 for a kind that depends on context as `measure ops`
 decides (`bench.ops._dependent`, a prefill kind read as a prefill's first),
 a prefill's B and the context: a decode point's ``context``, its longest
 row's, after its rows' mean context in `PERMILLE` of it (``mean``) where some
-point of the family has ragged rows, or a prefill point's rows' mean cached
+point of the family has ragged rows, leaving out each uniform point whose rows
+the KV pool cut, or a prefill point's rows' mean cached
 tokens (`band`); and a prefill's B for a kind its rows move (``("rows",
 op)``). A collective's
 points name their family themselves, `measure ops`'s `exchange`, and its one
@@ -73,7 +89,7 @@ from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, Key, Kind
 from atom.compass.backends.cost import CostTerm
-from atom.compass.backends.op_graph import LISTED, PERMILLE, band
+from atom.compass.backends.op_graph import LISTED, PERMILLE, _ran_at_each, band
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostSource
 from atom.compass.fit import publish
@@ -131,16 +147,15 @@ def read(store, dirs) -> tuple[list[dict], dict, dict]:
             rank = entry.topology.ranks()[0]
             points[key] = json.loads(entry.read_member("point", rank, "json"))
             fields = {k: v for k, v in key.values.items() if k != "point"}
-            torch = publish.platform(config)["torch"]
-            named.setdefault(json.dumps([fields, torch], sort_keys=True), d)
+            named.setdefault(json.dumps(fields, sort_keys=True), d)
     if not points:
         raise ValueError("these directories list no measured point")
     if len(named) > 1:
         raise ValueError(
-            f"the points name {len(named)} price lists, by (key fields, torch): "
+            f"the points name {len(named)} price lists, by key fields: "
             + "; ".join(f"{k} in {d}" for k, d in named.items())
         )
-    return list(points.values()), config, json.loads(next(iter(named)))[0]
+    return list(points.values()), config, json.loads(next(iter(named)))
 
 
 def _walk(x, f, n):
@@ -186,6 +201,23 @@ def shape_counts(shape: str) -> dict:
     return {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", shape)}
 
 
+def ran_counts(shape: str, leaf: dict) -> list[dict]:
+    """Each set of counts a point at `shape` may have run `leaf` at: `shape`'s,
+    less the width ``W`` it states past its rows; a prefill's W, where a padded
+    step runs its LM head and its drafter's later passes, is the B of a leaf
+    that leads with W and not with its T or B, as `OpGraphBackend` asks such a
+    leaf (`op_graph._ran_at`). Where W is the prefill's T too, a leaf that
+    leads with it ran at either B (`op_graph._ran_at_each`). The real MoE rows
+    ``R`` a point states are none of its counts."""
+    n = shape_counts(shape)
+    width, _ = n.pop("W", None), n.pop("R", None)
+    if width is None or shape.startswith("decode"):
+        return [n]
+    rows, sets = ("prefill", n["T"], n["B"]), ({n["T"], n["B"]}, {width})
+    each = _ran_at_each(leaf, (rows, rows[:2] + (width,), rows, sets))
+    return [n | {"B": b} for _, _, b in each]
+
+
 def _context(p) -> int:
     """A point's context: a decode point's ``context``, its longest row's; a
     prefill point's rows' mean cached tokens (`band`), else its ``context``,
@@ -205,13 +237,15 @@ def fit(points) -> dict:
     ranks' row counts can differ (``all_gatherv``, ``reduce_scatterv``, MORI's
     dispatch and combine), so a step may hold between two points' rows;
     ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad
-    every rank to the same rows and keep it."""
-    from atom.compass.bench.ops import DP_GROUP, _dependent, _split
+    every rank to the same rows and keep it; and ``left_out``, each point
+    whose leaf may have run at two places in its family (`ran_counts`), by
+    its shape, operator and why."""
+    from atom.compass.bench.ops import DP_GROUP, _dependent, _split, routed_rows
     from atom.compass.capture.peers import MORI
 
     dependent = _dependent(points)
     groups: dict[str, list] = {}
-    free_of, families = {}, {}
+    free_of, families, left_out = {}, {}, []
     for p in points:
         if "exchange" in p:  # a collective: one family over its message bytes
             fam, nbytes = p["exchange"]
@@ -228,30 +262,44 @@ def fit(points) -> dict:
         else:
             groups.setdefault(skeleton(p["shape"], p["leaf"]), []).append(p)
     for skel, members in groups.items():
+        sigs = [json.loads(p["leaf"]) for p in members]
+        ran = [ran_counts(p["shape"], sig) for p, sig in zip(members, sigs)]
         at: dict[str, list] = {}
-        for p in members:
-            at.setdefault(p["shape"], []).append(_ints(json.loads(p["leaf"])))
-        counts = {
-            s: {int(c) + d for c in re.findall(r"=(\d+)", s) for d in (0, 1)}
-            for s in at
-        }
+        for p, sig, counts in zip(members, sigs, ran):
+            at.setdefault(p["shape"], []).append((_ints(sig), counts))
+        each = [got for vs in at.values() for got in vs]
         free_of[skel] = [
             i
-            for i in range(len(next(iter(at.values()))[0]))
-            if all(len({v[i] for v in vs}) == 1 for vs in at.values())
-            and all(vs[0][i] in counts[s] for s, vs in at.items())
-            and len({vs[0][i] for vs in at.values()}) > 1
-        ]
-        follows = {
-            n
-            for i in free_of[skel]
-            for n in ("T", "B")
-            if all(
-                vs[0][i] - shape_counts(s).get(n, -9) in (0, 1) for s, vs in at.items()
+            for i in range(len(each[0][0]))
+            if all(len({v[i] for v, _ in vs}) == 1 for vs in at.values())
+            and all(
+                any(v[i] - c in (0, 1) for n in ns for c in n.values())
+                for v, ns in each
             )
+            and len({vs[0][0][i] for vs in at.values()}) > 1
+        ]
+        # a point that may have run its leaf at either B follows either
+        follows = {
+            k
+            for i in free_of[skel]
+            for k in ("T", "B", "G")
+            if all(any(v[i] - n.get(k, -9) in (0, 1) for n in ns) for v, ns in each)
         }
-        for p in members:
-            at_p = shape_counts(p["shape"]) | {"context": _context(p)}
+        ragged = {
+            family(p["shape"], p["leaf"], free_of[skel])
+            for p in members
+            if _split(p["context"])[1]
+        }
+        padded = {
+            family(p["shape"], p["leaf"], free_of[skel])
+            for p in members
+            if "R" in shape_counts(p["shape"])
+        }
+        for p, ns in zip(members, ran):
+            name = family(p["shape"], p["leaf"], free_of[skel])
+            at_p = ns[0] | {"context": _context(p)}
+            if p["shape"].startswith("decode") and "T" in at_p:
+                at_p["B"] = at_p.pop("T")  # a drafter's own rows, padded to B
             moves = dependent.get(p["op"], True)
             if "T" in at_p:
                 moves = dependent.get(("prefill", p["op"]), moves)
@@ -260,15 +308,28 @@ def fit(points) -> dict:
                 dims = [d for d in ("T", "B") if d in follows or moves]
                 if "B" not in dims and dependent.get(("rows", p["op"]), False):
                     dims.append("B")
-            dims += ["G"] if "G" in at_p else []
+            dims += ["G"] if "G" in follows else []
+            if name in padded:  # a padded decode's MoE: its pad rows, 0 at every row
+                dims.append("pad")
+                real = shape_counts(p["shape"]).get("R")
+                rows = routed_rows(json.loads(p["leaf"]))
+                at_p["pad"] = 0 if real is None else rows - real
             if moves and "T" not in at_p:  # a decode point, read at its mean too
+                # a uniform point whose rows the KV pool cut holds a mean its
+                # context does not name: a family with ragged points leaves it out
+                mean = _split(p["context"])[1]
+                cut = len({r[1] - r[0] for r in p.get("rows", ())}) > 1
+                if not mean and cut and name in ragged:
+                    continue
                 dims.append("mean")
-                at_p["mean"] = _split(p["context"])[1] or PERMILLE
+                at_p["mean"] = mean or PERMILLE
             dims += ["context"] if moves else []
-            f = families.setdefault(
-                family(p["shape"], p["leaf"], free_of[skel]),
-                {"op": p["op"], "dims": dims, "points": {}},
-            )
+            if len({tuple(n.get(d) for d in dims) for n in ns}) > 1:
+                left_out.append(
+                    {"shape": p["shape"], "op": p["op"], "why": _either(ns)}
+                )
+                continue
+            f = families.setdefault(name, {"op": p["op"], "dims": dims, "points": {}})
             got = f["points"].setdefault(tuple(at_p[d] for d in dims), [])
             got.append((p["cold_ns"], p["kernels"]))
     for name, f in families.items():
@@ -289,7 +350,15 @@ def fit(points) -> dict:
         if "row_bytes" in f:
             one = f["row_bytes"]
             f["row_bytes"] = one.pop() if len(one) == 1 else None
-    return {"free": free_of, "families": families}
+    return {"free": free_of, "families": families, "left_out": left_out}
+
+
+def _either(counts) -> str:
+    """Why a leaf that may have run at each of `counts` is read at none."""
+    ran = " or ".join(
+        " ".join(f"{k}={v}" for k, v in n.items() if v is not None) for n in counts
+    )
+    return f"it leads with its T, a count of its width too, so it ran at {ran}"
 
 
 def interpolate(points: dict, at: tuple, dims):
@@ -403,7 +472,12 @@ class PriceList(CostSource):
     at the step's count of each of its dimensions, ``context`` the bound's:
     a decode step's rows' max, a prefill's rows' mean cached tokens; ``mean``
     a decode step's rows' mean context over its B in `PERMILLE` of their max,
-    where the family was measured on ragged rows. It also
+    where the family was measured on ragged rows; ``pad`` the rows a decode's
+    MoE leaf routes less the real ones the bound states last, 0 where it
+    states none; a collective's family
+    (`bench.ops.exchange`) at its message bytes. A leaf asked at the list of
+    bounds it may have run at (`op_graph._ran_at_each`) takes the answer they
+    all give, and is declined, naming them, where they differ. It also
     declines inside a gap the fit declined, and prefill rows whose cached
     tokens from that mean to their max cross into another kernel. An answer
     between points is validated when every line it interpolates along holds
@@ -422,15 +496,29 @@ class PriceList(CostSource):
         self._index = functools.cache(self._index)
 
     def price(self, request: tuple) -> CostTerm | Refusal:
-        from atom.compass.bench.ops import signature
+        from atom.compass.bench.ops import exchange, routed_rows, signature
 
-        (leaf, (phase, *counts, last), _), kind = request, request[0]["op"]
-        at = dict(zip(("T", "B", "G", "context"), counts))
+        if isinstance(request[1], list):  # each bound it may have run at
+            leaf, bounds, work = request
+            got = [self.price((leaf, b, work)) for b in bounds]
+            if all(g == got[0] for g in got):
+                return got[0]
+            ran = _either(dict(zip("TBG", b[1:4])) for b in bounds)
+            return self.refuse(f"{leaf['op']}: {ran}")
+        leaf, (phase, t, b, g, context, last, *real), _ = request
+        kind, at = leaf["op"], {"T": t, "B": b, "G": g, "context": context}
         shape = phase if at["G"] is None else f"{phase} G={at['G']}"
-        name = self._family(shape, signature(leaf))
+        if ex := exchange(leaf):  # a collective: its family over its message bytes
+            name, at["bytes"] = ex
+            name = name if name in self.params["families"] else None
+        else:
+            name = self._family(shape, signature(leaf))
         if name is None:
             return self.refuse(f"{kind}: no point of its signature was measured")
         dims, top = self.params["families"][name]["dims"], None
+        if "pad" in dims:  # the rows it routes past the step's real ones
+            stated = real[0] if real else None
+            at["pad"] = 0 if stated is None else routed_rows(leaf) - stated
         if phase == "decode":
             at["mean"] = PERMILLE * last / at["context"]
         elif dims[-1:] == ["context"] and last != at["context"]:

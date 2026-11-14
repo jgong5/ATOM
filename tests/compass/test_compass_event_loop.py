@@ -8,7 +8,6 @@ and uvicorn's server tick and keep-alive timeout.
 """
 
 import asyncio
-import copy
 import http.client
 import importlib.util
 import json
@@ -42,10 +41,12 @@ from atom.utils.compass_loop import (
     CompassSelector,
     HttpChannel,
     Station,
+    charge,
+    wrap_decode,
     wrap_encode,
 )
 
-TABLE = single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002)
+TABLE = single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002)
 TRAFFIC, FRONTEND, ENGINE = LpId("traffic"), LpId("frontend"), LpId("engine")
 HTTP = "traffic->frontend:http"
 INF = math.inf
@@ -366,6 +367,44 @@ def test_the_finish_shuts_uvicorn_down_with_no_error_and_no_join_warning(
     errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
     joins = [str(w.message) for w in warned if w.category is RuntimeWarning]
     assert (stopped, errors, joins) == (None, [], [])
+    assert run.rt.now == INF and "Application shutdown complete." in caplog.messages
+
+
+def test_the_api_server_s_lifespan_starts_and_stops_inside_the_run(
+    run, caplog, monkeypatch
+):
+    """ATOM's lifespan hands tracing's setup and flush to a thread as the server
+    starts and as it leaves; the loop is in its run by then, so both are station
+    jobs, and the server starts, reaches the finish and shuts down."""
+    _idle_traffic(run)
+    monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+    # The process-wide collector settings startup makes, kept out of the test run.
+    for name in (
+        "tune_gc",
+        "maybe_attach_gc_debug_callback",
+        "freeze_gc_heap",
+        "arm_reclaim_watch",
+    ):
+        monkeypatch.setattr(api_server, name, lambda *_: None)
+    server = uvicorn.Server(
+        uvicorn.Config(
+            fastapi.FastAPI(lifespan=api_server.lifespan),
+            host="127.0.0.1",
+            port=0,
+            loop="atom.utils.compass_loop:CompassEventLoop",
+            lifespan="on",
+            log_config=None,
+        )
+    )
+    with caplog.at_level(logging.INFO, "uvicorn.error"):
+        try:
+            server.run()
+            stopped = None
+        except RuntimeError as e:
+            stopped = str(e)
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert (stopped, errors) == (None, [])
+    assert "Application startup complete." in caplog.messages
     assert run.rt.now == INF and "Application shutdown complete." in caplog.messages
 
 
@@ -837,7 +876,7 @@ def test_a_cancel_on_the_relay_hangs_its_request_up_at_its_arrival_never_the_soc
     1, is stamped at 1. The app serving request 0 reads ``http.disconnect`` at
     the cancel's arrival, and the cancel reaches no app: it is answered 204."""
     table = prefill_decode_table(
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=0.001,
         stream_s=0.002,
         router_s=2.0**-12,
@@ -921,17 +960,14 @@ def test_a_cancel_on_the_relay_hangs_its_request_up_at_its_arrival_never_the_soc
 
 
 def _intake_run_file(monkeypatch, tmp_path, intake) -> None:
-    """A run file whose machine spec states `intake` as host.http_intake, or
-    with no machine spec for None."""
-    from test_memory_readings import DOCUMENT
-
+    """A run file whose host entry states `intake` as its http_intake, or
+    with no host entry for None."""
     from atom.compass import run as compass_run
 
     run = {"bound_s": 600.0}
     if intake is not None:
-        machine = run["machine"] = copy.deepcopy(DOCUMENT)
         terms = ("fixed_s", "per_byte_s", "idle_s")
-        machine["host"]["http_intake"] = dict(zip(terms, intake))
+        run["host"] = {"http_intake": dict(zip(terms, intake))}
     path = tmp_path / "run.json"
     path.write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(path))
@@ -986,6 +1022,31 @@ def test_a_burst_reaches_the_app_one_intake_charge_at_a_time(
     first = arrival + fixed + sizes[0] * per_byte
     print(f"\n  app entered at {entered}")
     assert entered == pytest.approx([first, first + fixed + sizes[1] * per_byte])
+
+
+def test_a_body_outside_the_intake_hull_is_charged_nothing_and_named(
+    run, monkeypatch, tmp_path
+):
+    from atom.compass import run as compass_run
+
+    intake = {"fixed_s": 2e-3, "per_byte_s": 1e-6, "idle_s": 2e-3, "bytes": [500, 2000]}
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"bound_s": 600.0, "host": {"http_intake": intake}}))
+    monkeypatch.setenv(compass_run.ENV, str(path))
+    entered, named = [], []
+
+    async def app(scope, receive, send):
+        loop = asyncio.get_running_loop()
+        entered.append(loop.time())
+        named.append(list(loop.rt.refusals))
+
+    arrival = _burst(run, monkeypatch, 2, app, {0: 1000, 1: 3000})
+    first = arrival + 2e-3 + 1000 * 1e-6
+    assert entered == pytest.approx([first, first])
+    assert named[1] == [
+        "http:intake of a 3000-byte body, outside the 500 to 2000 bytes its "
+        + "http_intake was fitted on"
+    ]
 
 
 def test_a_request_that_finds_no_intake_on_the_loop_is_charged_the_idle_one(
@@ -1053,7 +1114,7 @@ def test_an_intake_waits_for_the_open_tokenizer_job_so_its_result_is_not_late(
     # 3 ms, inside request 1's intake, so its result runs when that intake
     # ends, at 4 ms, not once the clock has run on through every intake.
     _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-9))  # empty bodies
-    entry = SimpleNamespace(encode_fixed_s=1e-3, encode_tokens_per_s=1.0, derate=1.0)
+    entry = {"fixed_s": 1e-3, "tokens_per_s": 1.0}
     encode, done = wrap_encode(list, entry), []
 
     async def app(scope, receive, send):
@@ -1082,7 +1143,7 @@ def test_a_tokenizer_result_due_when_an_intake_starts_runs_before_its_charge(
     # the instant request 1's intake starts, so its result runs then, before
     # that intake is charged, not when the intake ends at 4 ms.
     _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-9))  # empty bodies
-    entry = SimpleNamespace(encode_fixed_s=0.0, encode_tokens_per_s=1.0, derate=1.0)
+    entry = {"fixed_s": 0.0, "tokens_per_s": 1.0}
     encode, done = wrap_encode(list, entry), []
 
     async def app(scope, receive, send):
@@ -1116,7 +1177,7 @@ def test_a_burst_tokenizer_results_do_not_depend_on_loop_turns_or_thread_speed(
     # 1's intake ends, at 4 ms, job 1's when request 2's ends, at 6 ms, and
     # job 2's at its completion, 7 ms.
     _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-9))  # empty bodies
-    entry = SimpleNamespace(encode_fixed_s=1e-3, encode_tokens_per_s=1.0, derate=1.0)
+    entry = {"fixed_s": 1e-3, "tokens_per_s": 1.0}
     encode, done = wrap_encode(list, entry), []
 
     async def app(scope, receive, send):
@@ -1150,7 +1211,7 @@ def test_tokenizer_results_due_at_one_instant_resume_in_submission_order(
     # in the loop's heap. Neither may decide which of the two resumes first.
     _idle_traffic(run)
     loop = CompassEventLoop()
-    entry = SimpleNamespace(encode_fixed_s=0.0, encode_tokens_per_s=1.0, derate=1.0)
+    entry = {"fixed_s": 0.0, "tokens_per_s": 1.0}
     encode, tokens, resumed = wrap_encode(list, entry), [5, 2, 3, 2, 4, 1, 6, 7], []
     # A server per job, whatever the host's pool width: every job starts at 0.
     loop.executor.station = Station(len(tokens))
@@ -1174,3 +1235,151 @@ def test_tokenizer_results_due_at_one_instant_resume_in_submission_order(
     loop.run_forever()
     loop.close()
     assert resumed == sorted(range(len(tokens)), key=lambda k: (tokens[k], k))
+
+
+@pytest.mark.parametrize("delay_s", [0.0, 0.3], ids=["fast", "slow"])
+def test_an_on_loop_tokenizer_call_places_open_encode_jobs_first(run, caplog, delay_s):
+    # An encode job charged 1 ms, whose real thread takes `delay_s` wall
+    # seconds; a decode on the loop thread at 0 charged 5 ms; a 3 ms timer
+    # whose callback decodes 5 ms more. The job completes inside the first
+    # decode, so its result runs when that decode ends, at 5 ms, before the
+    # timer's decode, however long its thread took. The slow thread outlasts
+    # diag_s, so the wait warns once.
+    _idle_traffic(run)
+    loop = CompassEventLoop()
+    loop.executor.station = Station(1, diag_s=0.1)
+    encode = wrap_encode(list, {"fixed_s": 1e-3, "tokens_per_s": 1.0})
+    decode = wrap_decode(
+        lambda ids: "",
+        {"fixed_s": 5e-3, "tokens_per_s": 1.0},
+    )
+    seen = {}
+
+    async def request():
+        def do_preprocess():
+            time.sleep(delay_s)
+            encode()
+
+        await loop.run_in_executor(None, do_preprocess)
+        seen["result"] = loop.time()
+
+    async def on_loop():
+        time.sleep(0.05)  # noqa: ASYNC251 - wall only: a fast thread is done by now
+        await asyncio.sleep(0)
+        decode([])
+        seen["decode"] = loop.time()
+
+    async def at_3ms():
+        await asyncio.sleep(3e-3)
+        for _ in range(3):  # past the callbacks that hand a result to its coroutine
+            await asyncio.sleep(0)
+        decode([])
+        seen["timer"] = loop.time()
+
+    async def go():
+        await asyncio.gather(request(), on_loop(), at_3ms())
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        loop.run_until_complete(go())
+    loop.run_forever()
+    loop.close()
+    print(f"\n  {delay_s} s thread: {seen}")
+    assert seen == pytest.approx({"result": 5e-3, "decode": 5e-3, "timer": 10e-3})
+    warned = [r for r in caplog.records if "event-loop charge waits" in r.getMessage()]
+    assert len(warned) == (delay_s > 0.1)
+
+
+def test_an_off_owner_charge_is_refused_before_it_places_the_loop_s_jobs(run):
+    # Another thread with no job of its own charges while the loop's tokenizer
+    # job is open. It is refused at once: it neither waits for the job nor
+    # places it, so no timer is set off the loop. The loop places it once it runs.
+    _idle_traffic(run)
+    loop = CompassEventLoop()
+    loop.executor.start_run()
+    release, refused, seen = threading.Event(), [], {}
+
+    def do_preprocess():  # a service job, by name
+        release.wait()
+
+    job = loop.executor.submit(do_preprocess)
+
+    def off_owner():
+        try:
+            charge(0.1)
+        except RuntimeError as e:
+            refused.append(str(e))
+
+    thread = threading.Thread(target=off_owner, name="EngineCoreOutputThread-DP0")
+    thread.start()
+    thread.join(5)
+    seen["waited"] = thread.is_alive()
+    release.set()
+    thread.join(5)
+    loop.executor.serial.submit(lambda: None).result(5)  # the job's thread is done
+    station = loop.executor.station
+    seen["placed"], seen["timers"] = station.final, len(loop._scheduled)
+    seen["left_for_the_loop"] = not loop.executor.done.empty()
+    loop.run_forever()
+    loop.close()
+    assert seen == {
+        "waited": False,
+        "placed": 0,
+        "timers": 0,
+        "left_for_the_loop": True,
+    }
+    assert "only the clock owner" in refused[0]
+    assert run.rt.refusals == ["clock:advance_to from EngineCoreOutputThread-DP0"]
+    assert station.final == 1 and job.done() and run.rt.now == INF
+
+
+class _Scripted:
+    """A clock connection that answers each request with the next scripted grant."""
+
+    def __init__(self, *grants) -> None:
+        self.grants = list(grants)
+
+    def send(self, msg) -> None:
+        pass
+
+    def recv(self):
+        return self.grants.pop(0)
+
+
+def _loop_after(frames):
+    """A frontend's loop whose engine output has brought `frames` frames, each
+    read and handled, and whose next request is released and not read yet."""
+    out = "engine->frontend:output#dp0"
+    grant = {out: [(k, k + 0.5) for k in range(frames)], HTTP: [(0, frames + 0.5)]}
+    rt = LPRuntime(FRONTEND, TABLE, _Scripted((frames + 1.0, grant), (INF, {})))
+    for k in range(frames):
+        rt.check_arrival(out, k + 0.5, k)
+    with rt.lock:
+        for k in range(frames):
+            rt.count_done_locked(out, k)
+    rt.advance_to(frames + 1.0)
+    clock.install(rt)
+    return rt, CompassEventLoop()
+
+
+def test_naming_the_unread_request_costs_the_same_however_many_frames_came_before():
+    """While a released request is unread, the loop names it at each idle point
+    (`CompassEventLoop.unread`)."""
+    costs = []
+    for frames in (10, 50_000):
+        rt, loop = _loop_after(frames)
+        try:
+            assert loop.unread() == (0, HTTP)
+            best = math.inf
+            for _ in range(3):
+                start = time.perf_counter()
+                for _ in range(200):
+                    loop.unread()
+                best = min(best, time.perf_counter() - start)
+            costs.append(best / 200 * 1e6)
+        finally:
+            rt.next_event(INF)
+            loop.close()
+            clock.install(None)
+    assert (
+        costs[1] < 5 * costs[0] + 5
+    ), f"{costs[0]:.1f} us after 10 frames, {costs[1]:.1f} us after 50,000"
