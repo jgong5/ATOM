@@ -22,8 +22,9 @@ says so in its place:
   refusals, whether the run is a coverage report, and each pricing method's
   share of the predicted seconds;
 - the per-request split, `split.FILE`: each segment's 10th, 50th and 90th
-  percentiles over the requests it split, the LMCache tokens they loaded and
-  stored, and why each other request was not split; or why there is no split;
+  percentiles over the requests it split that the headline metrics count, the
+  LMCache tokens those loaded and stored, and why each request it did not
+  split was not; or why there is no split;
 - grades, a real run's split beside a simulated run's, and the op-family
   split, none of which a run's directory holds.
 """
@@ -58,6 +59,9 @@ SEGMENTS = {
     "e2el_s": "end to end",
 }
 PERCENTILES = (10, 50, 90)
+#: The phases of the split's requests `curves.metrics` counts: the profiling
+#: phase's, and those aiperf names none for, which `from_aiperf` names unknown.
+PHASES = ("profiling", "unknown")
 STYLE = """
 :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6b6b6b;
   --line: #d8d8d8; }
@@ -268,16 +272,20 @@ def _split(run: Path) -> str:
             f", the decode side's joined to it at {high:.4f} s, its bounds"
             f" {low:.4f} s to {high:.4f} s"
         )
-    out = f"<p>{len(requests)} requests split, on {escape(clock)}; {len(unsplit)} not.</p>"
-    rows = []
+    counted = [r for r in requests if r["phase"] in PHASES]
+    text = (
+        f"{len(requests)} requests split, on {clock}; {len(unsplit)} not. Below,"
+        f" the {len(counted)} of them the headline metrics count."
+    )
+    out, rows = f"<p>{escape(text)}</p>", []
     for key, name in SEGMENTS.items():
-        values = [r[key] for r in requests if r.get(key) is not None]
+        values = [r[key] for r in counted if r.get(key) is not None]
         if values:
             at = [_number(curves.percentile(values, p)) for p in PERCENTILES]
             rows.append((name, len(values), *at))
     out += _table(rows, ("segment", "requests", *(f"p{p} (s)" for p in PERCENTILES)))
     tokens = [
-        sum(r[k] for r in requests)
+        sum(r[k] for r in counted)
         for k in ("lmcache_load_tokens", "lmcache_store_tokens")
     ]
     out += _table([("loaded", tokens[0]), ("stored", tokens[1])], ("LMCache", "tokens"))

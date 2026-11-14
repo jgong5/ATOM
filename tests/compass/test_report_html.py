@@ -143,6 +143,12 @@ def test_a_real_deployment_s_report_shows_both_sides_and_its_split_and_changes_n
 ):
     run = tmp_path / "run"
     _deployment(run)
+    # Request B is the warmup's, which neither the metrics nor the table count.
+    rows = [
+        json.loads(line) for line in (run / curves.RECORDS).read_text().splitlines()
+    ]
+    rows[1]["metadata"]["benchmark_phase"] = "warmup"
+    (run / curves.RECORDS).write_text("".join(json.dumps(r) + "\n" for r in rows))
     split.write(run)
     for side, args in (("prefill", ["--enable-tbo"]), ("decode", [])):
         own = {"argv": ["-c", "record", "--", "--model", "m", *args]}
@@ -171,17 +177,17 @@ def test_a_real_deployment_s_report_shows_both_sides_and_its_split_and_changes_n
     assert page.rows("Workload")[curves.CONCURRENCY] == ["2"]
     assert page.rows("Workload")["traces"] == ["2"]
     assert page.rows("Headline metrics") == _shown(curves.metrics(run))
-    made = json.loads((run / split.FILE).read_text())
+    a, b = json.loads((run / split.FILE).read_text())["requests"]
+    assert (a["phase"], b["phase"]) == ("profiling", "warmup")
     joined = "the decode side's joined to it at -999.9900 s, its bounds -1000.4000 s"
+    joined += " to -999.9900 s; 3 not. Below, the 1 of them the headline metrics count."
     assert page.parts["Per-request split"]["text"] == [
-        f"2 requests split, on the monotonic clock, {joined} to -999.9900 s; 3 not."
+        f"2 requests split, on the monotonic clock, {joined}"
     ]
     segments = page.rows("Per-request split")
     for key, name in html.SEGMENTS.items():
-        values = [r[key] for r in made["requests"]]
-        at = [f"{curves.percentile(values, p):.4g}" for p in html.PERCENTILES]
-        assert segments[name] == ["2", *at], name
-    assert segments["queue"] == ["2", "0.26", "0.5", "0.74"]
+        assert segments[name] == ["1", *[f"{a[key]:.4g}"] * 3], name
+    assert segments["queue"] == ["1", "0.2", "0.2", "0.2"]
     assert page.rows("Per-request split", 1) == {
         "LMCache": ["tokens"],
         "loaded": ["64"],
@@ -240,8 +246,9 @@ def test_deploy_sh_writes_the_report_beside_the_split(tmp_path, planted):  # noq
     assert script.returncode == 0, out
     page = _Page(d)
     assert page.rows("Run")["run"] == ["simulated, step_stub"]
+    counted = "Below, the 2 of them the headline metrics count."
     assert page.parts["Per-request split"]["text"] == [
-        "2 requests split, on the virtual clock; 3 not."
+        f"2 requests split, on the virtual clock; 3 not. {counted}"
     ]
     assert page.rows("Per-request split")["KV transfer"] == ["2", "0.4", "0.4", "0.4"]
     # The planted authority's summary is empty.
