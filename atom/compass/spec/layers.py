@@ -32,8 +32,8 @@ from .machine import (
     MachineSpec,
     _check_domain,
     _stated,
-    _survey,
     _version,
+    _walk,
     check_subject,
     field_origin,
 )
@@ -132,8 +132,7 @@ def _read(kind: str, fields: tuple, directory: Path, name_or_path) -> Layer:
     holder = f"{kind} {path}"
     _version(document)
     found: dict[str, Any] = {}
-    for refusal in _survey(document, "", found):
-        raise refusal
+    _walk(document, "", found)
     for stated in found:
         if stated not in HEADER and stated not in fields:
             raise SpecRefusal(

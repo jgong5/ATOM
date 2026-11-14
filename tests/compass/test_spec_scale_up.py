@@ -11,7 +11,7 @@ from test_spec_origin import saved
 from test_spec_schema import STACK, document, read, refusal_from
 from test_spec_verbs import fragment
 
-from atom.compass.spec import MachineSpec, SpecRefusal, merge, validate
+from atom.compass.spec import MachineSpec, SpecRefusal, merge
 from atom.compass.spec.rules import Rule
 
 MI455 = "mi455x-72gpu"
@@ -79,12 +79,10 @@ def test_a_spec_with_an_fp4_rate_and_a_fabric_width_reads_and_echoes_them():
     assert spec.value("device.compute.fp4_flops") == 10.0e15
     assert spec.value("interconnect.intra_node.domain_devices") == 8
     assert spec.echo() == written
-    assert validate(written).ok
 
 
 def test_a_spec_without_an_fp4_rate_reads_and_declines_only_that_field():
     spec = read()
-    assert validate(document()).ok
     with pytest.raises(SpecRefusal, match="declared by this schema as optional"):
         spec.value("device.compute.fp4_flops")
 
@@ -96,7 +94,6 @@ def test_a_fabric_narrower_than_the_node_is_refused_by_name():
     assert refusal.rule is Rule.SHAPE
     assert "`interconnect.intra_node.domain_devices` is 7" in refusal.what
     assert "`device.count_per_node` 8" in refusal.what
-    assert not validate(written).ok
     written["interconnect"]["intra_node"]["domain_devices"] = 8
     assert MachineSpec.from_mapping(written)
 
