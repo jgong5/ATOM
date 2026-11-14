@@ -3861,16 +3861,21 @@ def exchange(op: dict) -> list | None:
     bytes, the axis it is priced over: the family is its kind, each tensor
     argument's dtype and row width, its output rows' widths and its arguments
     neither tensors nor numbers; the bytes the largest of its tensors and its
-    outputs, at its first tensor's dtype. None for any other leaf."""
+    outputs, at its first tensor's dtype, but a MORI combine's its input's,
+    the rows it moves, since it returns MORI's whole buffer, as many rows at
+    every width. None for any other leaf."""
     import math
 
     if not op["op"].startswith(COLLECTIVES):
         return None
     tensors = [s for _, s in _specs(op["args"])]
     size = _dtype(tensors[0]["dtype"]).itemsize
+    sized, outs = tensors, op["out"]
+    if op["op"] == f"{MORI}.combine":
+        sized, outs = [op["args"]["input"]], []
     nbytes = max(
-        [math.prod(t["shape"]) * _dtype(t["dtype"]).itemsize for t in tensors]
-        + [math.prod(o) * size for o in op["out"]]
+        [math.prod(t["shape"]) * _dtype(t["dtype"]).itemsize for t in sized]
+        + [math.prod(o) * size for o in outs]
     )
     fam = {
         "op": op["op"],
