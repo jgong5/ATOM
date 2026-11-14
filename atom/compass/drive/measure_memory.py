@@ -87,12 +87,13 @@ RAPIDSERVE_RUNNER = (
 LOAD_DUMMY = "--load-dummy"
 START_TIMEOUT_S = 3600
 #: The API server's own flags that `compass record` passes it
-#: (`atom/entrypoints/openai/api_server.py::main`, less `serve.OWNED`). They
-#: shape its HTTP frontend, which a start has none of, so a start takes and
-#: drops them, and any other flag `EngineArgs` lacks still refuses.
+#: (`atom/entrypoints/openai/api_server.py::main`, less `serve.OWNED`), each
+#: parsed as the server parses it. They shape its HTTP frontend, which a start
+#: and the step bench (`bench/measure.py::atom_config`) have none of, so both
+#: take and drop them, and any other flag `EngineArgs` lacks still refuses.
 FRONTEND = {
     "--tool-call-parser": {},
-    "--timeout-keep-alive": {},
+    "--timeout-keep-alive": {"type": int},
     "--disable-uvicorn-access-log": {"action": "store_true"},
     "--chat-template": {},
     "--default-chat-template-kwargs": {},

@@ -147,9 +147,9 @@ def test_the_routed_experts_and_their_exchange_by_hand(spec):
         _module(experts, spec) + dispatch + combine
     )
     # One data-parallel rank: its graph's 8 rows, the output all-reduced; its
-    # 3 decode tokens and the pad reach the experts.
-    hit = activated_experts(8, 2, 4)
-    experts = Work({"bf16": 2 * 16 * (32 + 16) * 32}, hit * 816 + 8 * 144)
+    # 3 decode tokens alone reach the experts, a pad row routing to none.
+    hit = activated_experts(8, 2, 3)
+    experts = Work({"bf16": 2 * 6 * (32 + 16) * 32}, hit * 816 + 3 * 144)
     experts += allreduce(2, 8 * 32 * 2)
     one = BatchView((RequestShape(1, 4, True),) * 3, capture_rung=8)
     assert _price([one_rank], one, spec)["roofline.moe"] == pytest.approx(

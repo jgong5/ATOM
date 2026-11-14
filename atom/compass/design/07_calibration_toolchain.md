@@ -419,7 +419,20 @@ the rows' cached tokens, once its points at the most cached tokens still differ 
 fresh ones in kernels or time ([#1706](https://github.com/jgong5/ATOM/issues/1706)): a ladder twice as wide missed a same-kernel attention midpoint by
 1.0%, its repeats spreading 0.4% ([#1620](https://github.com/jgong5/ATOM/issues/1620)); attention's context features chosen per kind by data, under
 [#941](https://github.com/jgong5/ATOM/issues/941)'s rule. MoE leaves run on independent
-uniform routing. Each point records the kernels the leaf launched there, its kernel
+uniform routing. A padded decode's MoE runs real rows and pad rows that ATOM routes to no
+expert, 13 real of 32 gathered at p50 on a 1P1D DPA-TP8 decode side at rung 4, where the
+rung-4 leaf prices 0.55 of its every-row time
+([#3239](https://github.com/jgong5/ATOM/issues/3239#issuecomment-6861371586)). So each
+rung's routed leaf, whose ids are every row its MoE runs, is measured too at each count of
+real rows its steps' MoE ran and at one row's tokens, not on a ladder, since that leaf's time
+bends between counts 3 or 4 apart by up to 9% under one kernel
+([#3399](https://github.com/jgong5/ATOM/pull/3399)): a point states them as `R`, routes
+each row past them to no expert, the real ones spread evenly over the DP ranks and first in
+each rank's block of the gather, and on one rank its batch holds them alone, padded to the
+rung. `fit ops` interpolates such a family along its pad rows, the rows its ids route less
+`R`, 0 at every row, and a run asks it at the step's real rows: the DP group's tokens with its
+dummy forwards' rows as one, or one rank's own. A
+drafter's routed leaves stay at every row. Each point records the kernels the leaf launched there, its kernel
 identity, and each one's grid, by which a trace run's drafter kernel finds its own length
 (`09` D54, [#2415](https://github.com/jgong5/ATOM/issues/2415)).
 
@@ -444,9 +457,7 @@ no rank pausing (`09` D54).
 `atom/compass/parity/busy.py` reduces its traces to each forward's busy time per pass,
 which labels prefill (`09` D54); its decodes and host segments are profiled and label
 nothing. On every rank the recorder marks where a forward's target ends and where each
-drafter pass runs with profiler ranges, opened only while the profiler runs. Every
-trace run carries `09`'s
-profiler check.
+drafter pass runs with profiler ranges, opened only while the profiler runs.
 
 **Revised 2026-10-18 by the owner's ruling on
 [#1489](https://github.com/jgong5/ATOM/issues/1489):** Phase 1c produces nothing the
@@ -515,7 +526,10 @@ a GIL wait
   Its `recv` stretches stay in: the transport parses the request's own body as the read
   awaits it, and on a loaded loop serves other streams there too
   ([#2919](https://github.com/jgong5/ATOM/issues/2919)). `fixed_s` is the loop's CPU time per
-  request in the records' longest burst of served bodies, at that `per_byte_s`. No first-turn cell is recorded: cc-traces sessions
+  request in the records' longest burst of served bodies, at that `per_byte_s`. With no
+  burst, or one whose requests take less of the loop than that `per_byte_s` charges their
+  bodies, which would leave `fixed_s` negative, `fixed_s` is `idle_s` and the report says
+  why ([#3368](https://github.com/jgong5/ATOM/issues/3368), [#3384](https://github.com/jgong5/ATOM/issues/3384)). No first-turn cell is recorded: cc-traces sessions
   begin mid-conversation, so the longest burst is a client run's start. A burst alone would
   underprice later turns: on mi355-gpu-40 a V4.1-Flash
   first-turn body takes 5.64 to 5.80 ns a byte to parse and template, and the c=16 cell's
@@ -1057,7 +1071,15 @@ and it accounts for the gap a synthetic decode step shows between them, about 10
 [#828](https://github.com/jgong5/ATOM/issues/828)'s gap on real runs, 18 to 20%, is
 larger and stays open. The band one key
 leaves: same-key cards agree within 0.6% with PTL off; with PTL on, 3 to 5% per card
-plus 1 to 2% run-to-run remains.
+plus 1 to 2% run-to-run remains. That band is MI308X's, on a synthetic decode step.
+MI355X's cards spread wider with PTL disabled: crsuse2-m2m-v3-005's eight run a
+DeepSeek-V4-Pro 16384-token prefill chunk at 0.6% under to 1.1% over the crs005
+prefill law across 1P1D rounds of [#975](https://github.com/jgong5/ATOM/issues/975)'s cell ([#2992](https://github.com/jgong5/ATOM/issues/2992)),
+and crsuse2-m2m-v3-013's ranks run a one-row decode step 0.6 to 1.4% apart, part of
+it their contexts' mix ([#3048](https://github.com/jgong5/ATOM/issues/3048)). Neither enters a key or a fit:
+a law prices the card mix of its records, and `validate.cost` states each DP rank's
+error with its cards' PCI buses, which `run.json` records (README, principle 12;
+[#3048 Ruling](https://github.com/jgong5/ATOM/issues/3048#issuecomment-6851366020)).
 
 ### Four rules
 

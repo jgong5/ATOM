@@ -900,6 +900,38 @@ def test_a_start_refuses_a_flag_neither_the_engine_nor_record_takes(
     assert f"unrecognized arguments: {' '.join(flag)}" in capsys.readouterr().err
 
 
+def test_frontend_is_the_server_flags_record_passes_each_parsed_as_the_server_does(
+    monkeypatch,
+):
+    from atom.entrypoints.openai import api_server
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    class Parsing(Exception):
+        pass
+
+    def parse_args(parser, *args, **kwargs):
+        raise Parsing(parser)
+
+    with monkeypatch.context() as m, pytest.raises(Parsing) as server:
+        m.setattr(FlexibleArgumentParser, "parse_args", parse_args)
+        api_server.main()
+    engine = EngineArgs.add_cli_args(FlexibleArgumentParser())._actions
+    frontend = FlexibleArgumentParser(add_help=False)
+    for flag, kind in measure_memory.FRONTEND.items():
+        frontend.add_argument(flag, **kind)
+
+    def kinds(actions):
+        return {(a.option_strings[0], a.nargs, a.type or str) for a in actions}
+
+    assert kinds(frontend._actions) == kinds(
+        a
+        for a in server.value.args[0]._actions
+        if a.dest not in {e.dest for e in engine}
+        and set(a.option_strings).isdisjoint(serve.OWNED)
+    )
+
+
 # --- a run reading its configuration's entry ---------------------------------
 
 

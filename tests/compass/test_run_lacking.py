@@ -51,7 +51,7 @@ def lacked(out: str) -> list[str]:
 def served(monkeypatch, config):
     """`config` resolved from ATOM's arguments, its tokenizer a fast one with no
     tokenizer.json; no server starts."""
-    monkeypatch.setattr(drive_run, "_config", lambda atom_args: config)
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args, arch=None: config)
     tok = SimpleNamespace(is_fast=True, name_or_path=None)
     monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *args: tok)
     monkeypatch.setattr(serve, "serve", unstarted)

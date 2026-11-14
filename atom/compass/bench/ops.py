@@ -48,7 +48,10 @@ copy, as an activation is, pinned (`_host`); an
 activation is random at its shape, dtype and stride, except such
 a table, the placement's, a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
-experts' ids ATOM fuses into them (`_route`), the `NM_OUTPUT` slot at
+experts' ids ATOM fuses into them, at a point that states its real MoE
+rows (``R=``) each row past them routed to no expert as ATOM routes a pad
+row, one rank's batch holding its real rows alone (`_route`), the
+`NM_OUTPUT` slot at
 one KV split, a view at the start of twice its span, and aiter's top-k
 scratch (`TOPK_WORKSPACE`), one byte in the graph, built as aiter builds it
 on the device for the call's rows, row stride, k and path
@@ -177,7 +180,10 @@ graphs at its width, its B, do not hold, at its rows padded to that width,
 and under DP each leaf of a decode's drafter's graphs a run asks at its
 later passes' G at that G and the rows it ran there (`_drafter_at`), in
 place of its own shape's point,
-at the steps' lowest and highest row context (`_rows`); then each leaf of a
+at the steps' lowest and highest row context (`_rows`); then each rung's
+routed leaf whose ids are every row its MoE runs, a drafter's aside, at each
+count of real rows its steps' MoE ran (`_real`) and at one row's tokens; then
+each leaf of a
 kind those show depends on context (`_dependent`) over a ladder (`_ladder`)
 of the steps' row contexts, and, when some step's rows are ragged, at a
 shape of more than one row on ragged rows too (`_means`): the first at the
@@ -203,7 +209,10 @@ as a decode width does; and then, at the rows of each prefill family of a kind
 that depends on context, each token count its leaf's families at other rows hold
 between its own least and most, at each of its cached-token counts but those
 halving over cached tokens placed on one token count's line (`_filled`),
-densifying again after. DIR gets each round's ops.jsonl in `round<n>`, a run
+densifying again after. A family whose shapes state the rows a DP group gathers
+is not halved over its tokens, and is filled only at a token count its own
+points hold, on their graph, as `trace ops` traces such a shape only at a
+record's step. DIR gets each round's ops.jsonl in `round<n>`, a run
 resumed into DIR numbering on from the last round there, and after each round
 every point held, a measured one with its store token, in plan.jsonl.
 
@@ -759,11 +768,13 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     target's points at output cover both. A miss where the store holds the
     shape under another engine config, or traced under another ATOM source or
     torch (`capture.graph_key`), refuses naming what differs. A
-    two-batch-overlap micro-batch's `shape` reads its own graph."""
+    two-batch-overlap micro-batch's `shape` reads its own graph, and a shape
+    stating its real MoE rows the graph of all of them."""
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture import graph_key
     from atom.compass.capture.forward import missed, structure
 
+    shape = shape._replace(real=None)
     at = structure(
         config,
         shape.phase,
@@ -1043,7 +1054,8 @@ class Stub:
             )
         )
         self.shared = self.topk.get("topk_ids")
-        self.loads = []
+        # a point's real MoE rows, its ranks and the rows its MoE runs (`point`)
+        self.loads, self.real = [], None
         # DeepSeek-V4.1's compress ratios by the rows a page holds at each
         geometry = getattr(runner, "attn_metadata_builder", None)
         geometry = getattr(geometry, "geometry", None)
@@ -1355,7 +1367,14 @@ class Stub:
             exchange(o) for o, _ in found.values()
         )
         drafts = getattr(rule, "drafts", 0)  # a rule of no drafter states none
-        rows = point_rows(shape, context, pool, rule.block_size, bool(uncut), drafts)
+        batch, self.real = shape, None
+        if shape.real is not None:  # its MoE rows past the real ones are pad rows
+            dp = self.alone or self.runner.config.parallel_config.data_parallel_size
+            moe = shape.gathered or dp * shape.tokens * (drafts + 1)
+            self.real = shape.real, dp, moe
+            if dp == 1:  # one rank's batch holds its real rows, padded to the rung
+                batch = shape._replace(tokens=shape.real // (drafts + 1))
+        rows = point_rows(batch, context, pool, rule.block_size, bool(uncut), drafts)
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
         if shape.phase != "decode" and self.paged:
@@ -1412,11 +1431,12 @@ class Stub:
         self.written, self.later, self.fills = {}, {}, {}
         plans, p, need = None, 0, 1
         ladder = contextlib.nullcontext
-        if shape.width or shape.phase == "decode" and shape.tokens < shape.seqs:
+        if shape.width or shape.phase == "decode" and batch.tokens < shape.seqs:
             # a step that pads past its rows is prepared padded, as the
             # capture's runner pads it: to its W, where a prefill's LM head
             # and its drafter's later passes run, or, a drafter's own decode
-            # shape, to its B, where a block drafter's passes run
+            # shape, to its B, where a block drafter's passes run, as one
+            # rank's real rows are to their rung
             width = np.array([shape.width or shape.seqs], dtype=np.int32)
             ladder = functools.partial(
                 patch.object, self.runner, "capture_sizes_np", width
@@ -1882,8 +1902,11 @@ class Stub:
         """Copy `c`'s expert ids for `spec`: each row's experts drawn
         independently and uniformly, distinct, from the model's routed experts,
         its drafter's for a leaf of the drafter's alone (`drafted`), seeded by
-        `SEED` and `c`, and past top-k the row's ids in ATOM's buffer; the
-        copy's expert loads go to `loads`."""
+        `SEED` and `c`, and past top-k the row's ids in ATOM's buffer. At a
+        point stating its real MoE rows, ids of as many rows as its MoE runs
+        are routed past the real rows to -1, as ATOM routes a pad row: the
+        real ones spread evenly over the ranks, first in each rank's block of
+        the gather. The copy's real rows' expert loads go to `loads`."""
         moe = self.draft_moe if drafted else self.moe
         if len(moe) > 1:
             raise ValueError(
@@ -1893,11 +1916,19 @@ class Stub:
         [(experts, k)] = moe
         device = self.runner.device
         ids = uniform_ids(spec["shape"][0], experts, k, SEED * CALLS + c, device)
-        self.loads.append(torch.bincount(ids.flatten(), minlength=experts).tolist())
         out = _random(spec, device)
         out[:, :k] = ids
         if out.shape[1] > k:
             out[:, k:] = self.shared[: len(out), k:]
+        if self.real and len(out) == self.real[2]:
+            real, dp, rows = self.real
+            pad = torch.ones(rows, dtype=torch.bool, device=device)
+            for r in range(dp):
+                first = r * (rows // dp)
+                pad[first : first + real // dp + (r < real % dp)] = False
+            out[pad, :k] = -1
+            ids = ids[~pad]
+        self.loads.append(torch.bincount(ids.flatten(), minlength=experts).tolist())
         return out
 
     def _reweigh(self, op, sig, like, c):
@@ -1964,6 +1995,21 @@ def _alive(device) -> None:
         torch.cuda.synchronize(device)
     except Exception:  # noqa: BLE001 - any error here is the device's
         os._exit(1)
+
+
+def routed_rows(leaf: dict) -> int | None:
+    """The rows of the expert ids a routed leaf reads or writes (`Stub._route`):
+    its first two-dimensional int32 or int64 activation or metadata argument's;
+    None where it has none."""
+    for _, spec in _specs(leaf["args"]):
+        ids = spec["dtype"] in ("torch.int32", "torch.int64")
+        if (
+            ids
+            and spec["role"] in ("activation", "metadata")
+            and len(spec["shape"]) == 2
+        ):
+            return spec["shape"][0]
+    return None
 
 
 def _routing(loads) -> dict:
@@ -3162,13 +3208,39 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     for at in [c, *((c, m) for m in means)]:
                         fam = _family(shape, at, op["op"], sig, dependent)[0]
                         want[shape, at].add(fam)
+    # each rung's routed leaves at each count of real rows its steps' MoE ran
+    # (`_real`) and at one row's tokens, at the least context unless their kind
+    # depends on it: a leaf round 0 routed whose ids are all the rows its MoE
+    # runs, not a drafter's. A ladder's points read over `fit ops`' 5% off the
+    # line through their neighbours, the time bending under one kernel
+    if routed := [(k, r) for k, r in done.items() if r.get("routing")]:
+        dp = config.parallel_config.data_parallel_size
+        spec = config.speculative_config
+        row = (spec.num_speculative_tokens if spec else 0) + 1
+        real = defaultdict(set)
+        for s, line in steps:
+            if s in rungs and (n := _real(line)):
+                real[s].add(n)
+        for (text, context, sig), r in routed:
+            shape = _shape(text)
+            full = dp * shape.tokens * row
+            op = shape in real and graphs[shape][sig][0]
+            if not op or routed_rows(op) != full or op.get("drafted"):
+                continue
+            if context != min(contexts) and not dependent.get(r["op"], True):
+                continue
+            for n in sorted({row, *real[shape]}):
+                if n < full:
+                    at = shape._replace(real=n)
+                    graphs.setdefault(at, {})[sig] = graphs[shape][sig]
+                    fam = _family(at, context, r["op"], sig, dependent)[0]
+                    want[at, context].add(fam)
     seen = defaultdict(dict)
     for shape in sorted(prefills, key=str):  # G and W are None or a count
         for sig, (op, _) in graphs[shape].items():
             fam, tokens = _family(shape, None, op["op"], sig, dependent)
-            # `fit ops` keeps a shape that states G apart from one that does
-            # not, and a drafter's pass's G from its step's
-            apart = fam, not shape.gathered, shape in moved
+            # `fit ops` keeps a drafter's pass's G from its step's
+            apart = fam, shape in moved
             seen[apart].setdefault(tokens, (shape, op["op"], sig))
 
     def cached_ladder(top_only: bool) -> dict:
@@ -3225,14 +3297,13 @@ def _coverage_main(argv: list[str], atom_args: list[str]) -> dict:
     if arch not in driverless.DEVICES:
         declared = sorted(driverless.DEVICES)
         raise ValueError(f"no declared device for {arch}; declared: {declared}")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # aiter asks rocminfo for an arch at import, which the config reaches.
-        driverless._declare_arch(tmpdir, arch)
-        config = atom_config(atom_args)
-        ranks.layout(config)
-        _eager(config)
-        names = args.coverage
-        return coverage(store, args.store, config, names, records, arch, atom_args)
+    # aiter resolves its arch and fp8 dtype at import; the config holds the dtype.
+    driverless.import_aiter_on(arch)
+    config = atom_config(atom_args)
+    ranks.layout(config)
+    _eager(config)
+    names = args.coverage
+    return coverage(store, args.store, config, names, records, arch, atom_args)
 
 
 def _eager(config) -> None:
@@ -3314,14 +3385,16 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 whys[f"{part}op_graph"], found = found, []
             for name, fam, tokens, op, at in found:
                 asked = _drafter_at(at, op, line, config) if part == DRAFT else []
-                if decoding and asked and (moved := asked[0][1]) != at:
-                    # a decode's family names its shape, G among it
+                if asked and (moved := asked[0][1]) != at:
+                    # a family names G: a decode's its shape, a prefill's
+                    # whether its shape states one
                     at = moved
                     fam, tokens = _family(at, None, name, signature(op), dependent)
                 bound = (*at[:4], mean, top)
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
                     bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
+                    bound += (None if part else _real(line),)  # a target's real rows
                 elif asked:  # a prefill's drafter's leaf at each bound a run asks
                     each = [(*b, mean, top) for b, _ in asked]
                     bound = each if each[1:] else each[0]
@@ -3451,6 +3524,15 @@ def _rows(line, rung: int) -> tuple[int, int]:
     return max(lo, 1), max(contexts)
 
 
+def _real(line) -> int | None:
+    """A decode step's real MoE rows (`op_graph.real_rows`), as its line and
+    its group's dummy forwards at its step (`group_dummies`) state them."""
+    from atom.compass.backends.op_graph import real_rows
+
+    own, dummies = sum(row[0] for row in line["rows"]), line.get("group_dummies", 0)
+    return real_rows(own, line.get("moe_rows"), line.get("moe_tokens"), dummies)
+
+
 def _mean(line, rung: int) -> int:
     """A decode step's rows' mean context over its rung, a pad row holding
     none, in `PERMILLE` of their max."""
@@ -3500,7 +3582,8 @@ def _shape(text: str):
     n = shape_counts(text)
     if text.startswith("prefill"):
         return prefill(n["T"], n["B"], None, n.get("W"))._replace(gathered=n.get("G"))
-    return decode(n["B"], n.get("G"), n.get("T"))._replace(width=n.get("W"))
+    shape = decode(n["B"], n.get("G"), n.get("T"))
+    return shape._replace(width=n.get("W"), real=n.get("R"))
 
 
 def _abstract(value, n: int):
@@ -3565,7 +3648,8 @@ def _family(shape, context, op: str, sig: str, dependent: dict):
     a prefill leaf over its tokens, at its rows unless its kind's prefill
     points show it does not move with them, and at its rows and cached tokens
     when its kind depends on context, as its prefill points read it, else its
-    decode points, else by default; a collective over its message bytes
+    decode points, else by default, a shape that states G apart from one that
+    does not, as `fit ops` keeps them; a collective over its message bytes
     (`exchange`)."""
     if op.startswith(COLLECTIVES):
         return tuple(exchange(json.loads(sig)))
@@ -3573,10 +3657,11 @@ def _family(shape, context, op: str, sig: str, dependent: dict):
         context, mean = _split(context)
         return json.dumps([str(shape), sig] + ([mean] if mean else [])), context
     leaf = _abstract(json.loads(sig), shape.tokens)
+    head = "prefill" if shape.gathered is None else "prefill G"
     if not dependent.get(("prefill", op), dependent.get(op, True)):
         rows = shape.seqs if dependent.get(("rows", op), True) else None
-        return json.dumps(["prefill", rows, leaf], sort_keys=True), shape.tokens
-    fam = ["prefill", shape.seqs, leaf, context or 0]
+        return json.dumps([head, rows, leaf], sort_keys=True), shape.tokens
+    fam = [head, shape.seqs, leaf, context or 0]
     return json.dumps(fam, sort_keys=True), shape.tokens
 
 
@@ -3682,7 +3767,9 @@ def _densify(families, tried: set) -> dict:
     cached-token count both hold, at a count halving placed at neither: a
     switch that moves with cached tokens, as one at a fixed sum of the two
     does, is halved over cached tokens at each token count alone, where `fit
-    ops` reads it after the token count."""
+    ops` reads it after the token count. A prefill family whose shapes state G
+    is not halved over its tokens: `trace ops` traces such a shape only at a
+    record's step."""
     from atom.compass.capture.forward import decode, prefill
 
     steps = {
@@ -3728,10 +3815,7 @@ def _densify(families, tried: set) -> dict:
             if cut and moves(*cut, a, b):
                 continue
             tried.add((fam, mid))
-            # a micro-batch's leaves are read off its own graph, as its record marks
-            shape = _shape(record["shape"])._replace(
-                micro_batch=record.get("micro_batch", False)
-            )
+            shape = _marked(record)
             if isinstance(fam, tuple):  # over cached tokens at one token count
                 new = json.dumps([*json.loads(fam[0]), mid], sort_keys=True)
                 want[shape, mid].add(new)
@@ -3744,7 +3828,7 @@ def _densify(families, tried: set) -> dict:
                 want[step, other["context"]].add(fam)
             elif shape.phase == "decode":
                 want[shape, (mid, *ragged) if ragged else mid].add(fam)
-            else:
+            elif shape.gathered is None:
                 want[prefill(mid, shape.seqs), record["context"]].add(fam)
     return want
 
@@ -3758,21 +3842,30 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
     its first row has room for under `max_model_len`, unless `tried`. `fit
     ops` reads such a leaf over T, then its rows, then cached tokens: a step's
     rows are bracketed only where the token counts either side of it hold
-    them."""
+    them. A family whose shapes state G reads the token counts of families
+    whose shapes state G, as `fit ops` does, and is filled only at a token
+    count its own points hold, on their graph: `trace ops` traces such a
+    shape only at a record's step."""
     from atom.compass.capture.forward import prefill
     from atom.compass.fit.ops import skeleton
 
-    held, skeletons, axis = defaultdict(set), {}, defaultdict(set)
+    held, skeletons, axis, own = defaultdict(set), {}, defaultdict(set), {}
     for fam, points in families.items():
         if cut := _cut(fam):
+            head = json.loads(cut[0])[0]
             for tokens, _, record in points:
                 held[cut[0]].add((tokens, cut[1]))
-                skeletons[cut[0]] = skeleton(record["shape"], record["leaf"])
+                skeletons[cut[0]] = skeleton(record["shape"], record["leaf"]), head
                 axis[skeletons[cut[0]]].add(tokens)
+                own.setdefault((cut[0], tokens), _marked(record))
     want = defaultdict(set)
     for base, at in held.items():
-        rows, tokens = json.loads(base)[1], [t for t, _ in at]
+        head, rows, _ = json.loads(base)
+        tokens = [t for t, _ in at]
         for t in sorted(axis[skeletons[base]]):
+            shape = prefill(t, rows) if head == "prefill" else own.get((base, t))
+            if shape is None:
+                continue
             for c in sorted({c for u, c in at if ((base, u), c) not in tried}):
                 fam = json.dumps([*json.loads(base), c], sort_keys=True)
                 if (
@@ -3783,8 +3876,16 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
                 ):
                     continue
                 tried.add((fam, t))
-                want[prefill(t, rows), c or None].add(fam)
+                want[shape, c or None].add(fam)
     return want
+
+
+def _marked(record):
+    """The shape a point's record names, a micro-batch as the record marks it:
+    its leaves are read off its own graph."""
+    return _shape(record["shape"])._replace(
+        micro_batch=record.get("micro_batch", False)
+    )
 
 
 def _bent(points, steps=()) -> set:

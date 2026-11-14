@@ -6,9 +6,9 @@
 # fall outside the records the fits read; `compass measure memory`; one
 # `compass record` per RECORD, each serving one `client.sh` run of the
 # calibration traces, which stops it; then `compass fit steps` (step linear,
-# history form) and `compass fit host` on those records. It plans nothing: what
-# to record is its input. A decode rung N comes from a record at concurrency N
-# that starts every trajectory at its first turn
+# history form, MODEL's MoE routing) and `compass fit host` on those records.
+# It plans nothing: what to record is its input. A decode rung N comes from a
+# record at concurrency N that starts every trajectory at its first turn
 # (https://github.com/jgong5/ATOM/issues/1840). The prefill law fits from trace
 # runs alone: with none, the law's `unfitted` names prefill. `compass fit host`
 # leaves them out, since a trace run's host segments ran under the profiler.
@@ -159,7 +159,8 @@ for r; do
     [[ -z $flag ]] && cal+=("$OUT/$name") cal_runs+=("${runs[@]: -3}")
 done
 todo fit_steps step_linear_law.json && step fit_steps python3 -c "$CLI" fit steps \
-    --backend step-linear --form history "${dirs[@]}" "${runs[@]}" "${M[@]}" --out "$OUT/fit_steps"
+    --backend step-linear --form history --model "$MODEL" "${dirs[@]}" "${runs[@]}" "${M[@]}" \
+    --out "$OUT/fit_steps"
 todo fit_host host_laws.json &&
     step fit_host python3 -c "$CLI" fit host "${cal[@]}" "${cal_runs[@]}" "${M[@]}" --out "$OUT/fit_host"
 

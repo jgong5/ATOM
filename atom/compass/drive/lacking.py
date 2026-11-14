@@ -13,7 +13,9 @@ configuration's memory readings; an op graph's price list; and an
 `--acceptance-record`. An input is missing when nothing resolves for it, and
 stale when the run refuses the entry it holds, naming each artifact axis that
 moved. A memory readings entry holds every rank's member, or the store refuses
-it, so rank 0's load stands for each rank's.
+it, so rank 0's load stands for each rank's. Each is held to ATOM's config as
+a server resolves it on the machine spec's device arch, whatever device this
+host has (`run._config`).
 
 Printed apart, outside the exit status: the gaps `--coverage`'s check counts;
 an op graph's absent price list, which prices every leaf by its analytical
@@ -104,7 +106,8 @@ def lacking(args, atom_args) -> tuple[list, list]:
     except (OSError, SpecRefusal) as refused:
         return [("machine spec", "missing", str(refused), MADE_BY["machine spec"])], []
     store = ArtifactStore(Path(args.store).resolve())
-    config, engine = drive_run._config(atom_args), runfile._engine_args(atom_args)
+    arch, engine = machine.value("device.arch"), runfile._engine_args(atom_args)
+    config = drive_run._config(atom_args, arch)
     run = {"machine": document, "store": str(store.root)}
     flags = {k: getattr(args, k) for k in runfile.KINDS if getattr(args, k)}
     for name, tokens in (flags | {"host": args.host_laws or []}).items():
@@ -163,7 +166,7 @@ def lacking(args, atom_args) -> tuple[list, list]:
         if found := met("coverage input", made, drive_run.check, *given):
             apart.append(_coverage(found))
     if args.step_roofline or STEP_GRID in flags:
-        apart += _unclassified(atom_args, machine.value("device.arch"))
+        apart += _unclassified(atom_args, arch)
     return lacks, apart
 
 

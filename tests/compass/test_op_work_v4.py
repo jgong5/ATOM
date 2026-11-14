@@ -44,6 +44,8 @@ MORI = "mori.ops.dispatch_combine:EpDispatchCombineOp."
 DECODE = "aiter.mla:mla_decode_fwd_v4_nm"
 #: A machine stating an fp4 rate, as gfx950 does: V4-Pro's experts run at it.
 SPEC = machine(fp4_flops=10e15)
+#: The 8 decode rows of the MoE leaves below, each a token of its own.
+EIGHT = rows(*[(1, 1)] * 8)
 
 
 def moe(rows, local, mask=None, quant_type=3):
@@ -84,7 +86,7 @@ def close(got, want):
 def test_the_routed_experts_run_every_route_on_one_rank(quant_type, fmt):
     hit = activated_experts(16, 2, 8)
 
-    got = work(moe(8, 16, quant_type=quant_type), ONE, 1, "bf16")
+    got = work(moe(8, 16, quant_type=quant_type), EIGHT, 1, "bf16")
     close(got, experts(8, 16, hit, fmt=fmt))
 
 
@@ -96,7 +98,7 @@ def test_under_expert_parallelism_the_busiest_rank_s_share_runs(mask):
     # leaf carries, the sentinel slot for non-local routes or eight ranks'.
     load, hit = max_rank_load(8, 2, 16, 4), activated_experts(16, 2, 8) / 4
 
-    close(work(moe(8, 4, mask), ONE, 1, "bf16", 4), experts(8, load, hit, mask))
+    close(work(moe(8, 4, mask), EIGHT, 1, "bf16", 4), experts(8, load, hit, mask))
 
 
 TRITON = "aiter.ops.triton.moe."
@@ -141,7 +143,7 @@ def test_the_triton_experts_gemms_are_the_routed_experts_products(ep):
     hit = activated_experts(16, 2, 8) / ep
     share = load / 16
 
-    up, down = (work(triton("a8", 8, local, g), ONE, 1, "bf16", ep) for g in (0, 1))
+    up, down = (work(triton("a8", 8, local, g), EIGHT, 1, "bf16", ep) for g in (0, 1))
 
     weights = (32 * 64 + 64 * 2, 16 * 64 + 64 * 1)
     # Gate-up: the fp8 rows, their scales and gather index, and SwiGLU's half
@@ -165,7 +167,7 @@ def test_a_triton_down_gemm_writing_into_y_out_moves_the_same_bytes():
 @pytest.mark.parametrize("kind, fmt", [("a16", "bf16"), ("a8", "fp8"), ("a4", "fp4")])
 def test_the_triton_experts_run_at_the_activation_format_their_kind_names(kind, fmt):
     for gemm2 in (False, True):
-        got = work(triton(kind, 8, 16, gemm2), ONE, 1, "bf16")
+        got = work(triton(kind, 8, 16, gemm2), EIGHT, 1, "bf16")
 
         assert got.flops_by_format == {fmt: 2 * 16 * 64 * (32 if gemm2 else 64)}
 
