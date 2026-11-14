@@ -277,6 +277,9 @@ MTP_COPY = "L_mtp"
 PP_RECV_SEGMENT = "W_recv"
 #: The engine loop from a forward's exit to its next input pull: the charge's `out_s`.
 OUT_SEGMENT = "E_out"
+#: The wall seconds an op-graph run's `compass_lazy` sums: its lookups, and its
+#: backend's `price` calls, the lookups among them.
+WALLS = ("lookup_wall_seconds", "price_wall_seconds")
 #: Every segment a law may price.
 SEGMENTS = (*HOST_SEGMENTS, MTP_SEGMENT, MTP_COPY, PP_RECV_SEGMENT, OUT_SEGMENT)
 FORWARD_KINDS = ("decode", "prefill", "middle")
@@ -1142,12 +1145,16 @@ class PricedSteps:
         priced, before the max over the DP group, with the steps and seconds
         of each of `GROUPS` apart, and the steps a source extrapolated and
         those a fallback priced after a source declined, and under an op graph
-        its lazy traces and their wall seconds (`compass_lazy`). A dict even
-        before the first step, since a None reply parks the engine that asks.
+        its lazy traces and their wall seconds (`compass_lazy`); on a DP
+        group's first rank, or a rank of no group, the wall seconds the group
+        waited on its slowest rank's lookups and the rest of its pricing,
+        summed over its steps (`group_waited_seconds`). A dict even before the
+        first step, since a None reply parks the engine that asks.
         """
         from atom.compass.backends.cost import GROUPS, ProvenanceMix, group
 
         mix = vars(self).get("_priced") or ProvenanceMix()
+        waited = vars(self).get("_waited")
         steps = {group(*k): n for k, n in mix.steps_by_method().items()}
         seconds = {group(*k): s for k, s in mix.seconds_by_method().items()}
         return {
@@ -1161,6 +1168,7 @@ class PricedSteps:
             **{f"{g}_seconds": seconds.get(g, 0.0) for g in GROUPS},
             "treatments": dict(mix.treatments),
             **vars(self).get("compass_lazy", {}),
+            **({"group_waited_seconds": waited} if waited else {}),
         }
 
 
@@ -1769,7 +1777,10 @@ def _group_step_seconds(
     by rank, or None with one rank. `_out_s` is the host's ``out_s`` for this
     step, the seconds from its return to the engine's next input pull, or
     None; `_group_out` holds each rank's target plus its ``out_s``, for the
-    ranks with one, or None.
+    ranks with one, or None. In an op-graph run, the group's first rank, or a
+    rank of no group, adds to `_waited` the wall seconds of the step's price
+    the group waited on: the lookups and the rest of the price (`WALLS`) of
+    the rank whose sum of the two is largest.
 
     A pipeline stage runs only its own layers, so it is refused unless its
     backend states the `stage_share` it prices; any other backend prices the
@@ -1835,6 +1846,8 @@ def _group_step_seconds(
         seen = vars(runner).setdefault("_admitted", set())
         batch.compass_admitted = admitted(batch, seen, entry)
     dummies = dummy_ranks(batch, mode)
+    lazy = vars(runner).get("compass_lazy", {})
+    walls = [lazy.get(k, 0) for k in WALLS]
     try:
         if view is None:
             view = batch_view(batch, mode, runner, dummies)
@@ -1857,6 +1870,8 @@ def _group_step_seconds(
         mix.record(cost)
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
         terms = (*cost.terms, *cost.draft_terms)
+    lookup_s, price_s = (lazy.get(k, 0) - w for k, w in zip(WALLS, walls))
+    pricing_s = price_s - lookup_s
     # `decide` returns the collective's rows for a group of one too.
     many = mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1
     group = dp_group() if many else None
@@ -1884,18 +1899,26 @@ def _group_step_seconds(
         vars(runner).setdefault("_refused_commands", []).append(refused)
     group_s, targets, pulls = charge_s, None, None
     out_s = getattr(host, "out_s", None)
+    waited = lookup_s, pricing_s
     if group is not None:
         waits = host is None and batch.produces_output() and not batch.is_dummy_run
         out = math.nan if out_s is None else out_s
-        mine = torch.tensor([charge_s, waits, out], dtype=torch.float64)
+        mine = [charge_s, waits, out, lookup_s, pricing_s]
+        mine = torch.tensor(mine, dtype=torch.float64)
         rows = [torch.empty_like(mine) for _ in range(group.size())]
         torch.distributed.all_gather(rows, mine, group=group)
         rows = [r.tolist() for r in rows]
         top = max(s for s, *_ in rows)
-        targets = tuple(top if w else s for s, w, _ in rows)
-        ends = zip(targets, (o for *_, o in rows))
+        targets = tuple(top if w else s for s, w, *_ in rows)
+        ends = zip(targets, (o for _, _, o, *_ in rows))
         pulls = tuple(t + o for t, o in ends if not math.isnan(o)) or None
         group_s = targets[group.rank()]
+        # The group leaves the gather when its slowest rank to price arrives.
+        waited = max((r[3:] for r in rows), key=sum)
+    # An op-graph run's group waits, kept once: on its first rank.
+    if lazy and (group is None or group.rank() == 0):
+        kept = vars(runner).setdefault("_waited", [0.0, 0.0])
+        kept[:] = [k + w for k, w in zip(kept, waited)]
     vars(runner)["_group_targets"] = targets
     vars(runner)["_out_s"], vars(runner)["_group_out"] = out_s, pulls
     record = getattr(runner, "_parity_record", None)
