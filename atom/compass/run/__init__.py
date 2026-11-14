@@ -468,8 +468,8 @@ def pick_fitted(run: dict, name: str, config) -> None:
 def refuse_unfitted_law(run: dict, config) -> None:
     """Refuse the run file's step linear law where `config` is not what it was
     fitted under: its engine config, which states its tensor-parallel width,
-    context-parallel width 1, and its platform, which the run file's machine
-    spec must state."""
+    context-parallel width 1, a data-parallel group on one node, and its
+    platform, which the run file's machine spec must state."""
     from atom.compass.artifacts import Kind, keyed_platform, machine_platform
     from atom.compass.run.step_grid import differ, keyed
 
@@ -485,6 +485,18 @@ def refuse_unfitted_law(run: dict, config) -> None:
             + "; ".join(named)
         )
     refuse_context_parallel(STEP_LINEAR, config)
+    # A node running fewer ranks than the group holds is one of several, and
+    # ATOM hands MoRI its ranks times the TP width as the GPUs per node
+    # (`moe.py::FusedMoEParallelConfig.make`).
+    dp = config.parallel_config.data_parallel_size
+    local = getattr(config.parallel_config, "data_parallel_size_local", dp)
+    if local < dp:
+        raise ValueError(
+            "the step linear law states no data_parallel_size_local, so it "
+            "prices a data-parallel group on one node, and this run's group "
+            f"spans nodes: data_parallel_size_local {local} of "
+            f"data_parallel_size {dp}"
+        )
     fitted_on = law.get("platform") or {}
     here = keyed_platform(Kind.STEP_LINEAR_LAW, machine_platform(_machine(run)))
     if named := [

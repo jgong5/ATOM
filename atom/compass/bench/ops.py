@@ -3674,11 +3674,18 @@ def _dependent(records) -> dict:
     for (kind, *_), points in by.items():
         if len(points) > 1:
             cold = [p["cold_ns"] for p in points]
-            kernels = {tuple(p["kernels"]) for p in points}
+            kernels = {tuple(_launched(p)) for p in points}
             spread = max(cold) - min(cold)
             moved = spread > max(CONTEXT_MOVES * max(cold), CONTEXT_FLOOR_NS)
             kinds[kind] = kinds.get(kind, False) or moved or len(kernels) > 1
     return kinds
+
+
+def _launched(point) -> list:
+    """The kernels a measured point's leaf launched: none at a point timed at
+    0 ns, whose graph captured no device work, so that a kernel its profiles
+    named was another call's, as `_together`'s all-reduce can be."""
+    return point["kernels"] if point["cold_ns"] else []
 
 
 def _families(records, dependent) -> dict:
@@ -3688,7 +3695,7 @@ def _families(records, dependent) -> dict:
         if "refused" not in r:
             shape = _shape(r["shape"])
             fam, at = _family(shape, r["context"], r["op"], r["leaf"], dependent)
-            found[fam].append((at, tuple(r["kernels"]), r))
+            found[fam].append((at, tuple(_launched(r)), r))
     return {fam: sorted(points, key=lambda p: p[0]) for fam, points in found.items()}
 
 

@@ -49,6 +49,7 @@ class Kind(enum.Enum):
     STEP_GRID_BUNDLE = "step_grid_bundle"
     PROJECTION = "projection"
     PROBE_RECORD = "probe_record"
+    PLATFORM_READINGS = "platform_readings"
 
     def __str__(self) -> str:
         return self.value
@@ -267,6 +268,8 @@ ROWS_OF: Mapping[Kind, tuple[Row, ...]] = {
     Kind.SHAPE_POPULATION: (Row.SHAPE_POPULATION,),
     Kind.PROJECTION: (Row.PROJECTION,),
     Kind.PROBE_RECORD: (Row.PROBE_RECORD,),
+    # Folded from probe records, or another device's entry: the records' row.
+    Kind.PLATFORM_READINGS: (Row.PROBE_RECORD,),
 }
 
 

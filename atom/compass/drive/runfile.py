@@ -278,15 +278,16 @@ def _backend(entry) -> dict:
 
 def _price_list_key(atom_args, machine) -> Key:
     """The `price_list` key of the model and parallel layout ATOM's arguments
-    serve, on `machine`, from this ATOM source."""
+    serve, as `CoreManager` lays it out under DP attention, each TP rank a DP
+    rank of TP 1, on `machine`, from this ATOM source."""
     engine = _engine_args(atom_args)
     return Key.of(
         Kind.PRICE_LIST,
         model=_model_digest(engine.model),
-        dp=engine.data_parallel_size,
+        dp=_dp_width(atom_args),
         pp=engine.pipeline_parallel_size,
         pcp=engine.prefill_context_parallel_size,
-        tp=engine.tensor_parallel_size,
+        tp=1 if engine.enable_dp_attention else engine.tensor_parallel_size,
         enable_expert_parallel=engine.enable_expert_parallel,
         enable_dp_attention=engine.enable_dp_attention,
         decode_context_parallel_size=engine.decode_context_parallel_size,
