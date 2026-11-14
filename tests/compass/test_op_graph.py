@@ -1520,7 +1520,7 @@ def test_a_warm_tracer_holds_one_trace_s_worth_whatever_it_traced_before(
 def _alive(pid: int) -> bool:
     try:
         stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # reaped before or mid-read
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 

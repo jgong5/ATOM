@@ -29,6 +29,8 @@ NODE18 = json.loads(
 )
 STUB = """#!/bin/bash
 await() { for _ in {1..600}; do [ -e "$1" ] && return; sleep 0.1; done; exit 1; }
+# The simulated run file names a machine: its servers start under on_arch.
+[ "$2" = atom.compass.drive.on_arch ] && shift 3
 case "$1 $2" in
 "-m atom.entrypoints.openai.api_server")
     # As a real DP pair's group handshake orders them: rank 1 starts after rank 0,
