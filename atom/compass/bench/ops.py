@@ -3127,11 +3127,12 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     )
     rungs = [decode(r) for r in schedulable_ladder(config)]
     graphs, done, tried = {}, {}, set()
-    prefills, cached = set(), defaultdict(list)
+    prefills, cached, step_tokens = set(), defaultdict(list), defaultdict(set)
     for s, line in steps:
         if s.phase == "prefill":
             prefills.add(s)
             cached[s.seqs] += _cached(line)
+            step_tokens[s.seqs].add(s.tokens)
     # one that is a step's shape too is measured whole, as that step's
     own = {s: outputs for s, outputs in own.items() if s not in prefills}
     # first, so a graph only `trace ops --population` traces refuses before any
@@ -3293,8 +3294,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         measure_round(want, n)
         n += 1
         want = cached_ladder(top_only=False) if n == 2 else {}
-        families = _families(done.values(), _dependent(done.values()))
-        want = want or _densify(families, tried)
+        dependent = _dependent(done.values())
+        families = _families(done.values(), dependent)
+        want = want or _densify(families, tried, step_tokens, dependent)
         want = want or _filled(families, tried, config.max_model_len)
     kinds = Counter(r["op"] for r in done.values() if "refused" not in r)
     print(json.dumps({"points per leaf kind": dict(kinds.most_common())}, indent=1))
@@ -3608,18 +3610,6 @@ def _shape(text: str):
     return shape._replace(width=n.get("W"), real=n.get("R"))
 
 
-def _abstract(value, n: int):
-    """`value` with every int equal to `n` replaced by ``"T"``."""
-    # ponytail: an unrelated int equal to n (a stride of 1 at T = 1) is
-    # abstracted too, so that shape's leaf joins another family and its
-    # points bracket nothing; symbolic slots in the contract would end it.
-    if isinstance(value, dict):
-        return {k: _abstract(v, n) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_abstract(v, n) for v in value]
-    return "T" if type(value) is int and value == n else value
-
-
 #: Leaf kinds that exchange rows between ranks (`exchange`).
 COLLECTIVES = (
     "atom.model_ops.moe:",
@@ -3672,13 +3662,15 @@ def _family(shape, context, op: str, sig: str, dependent: dict):
     when its kind depends on context, as its prefill points read it, else its
     decode points, else by default, a shape that states G apart from one that
     does not, as `fit ops` keeps them; a collective over its message bytes
-    (`exchange`)."""
+    (`exchange`). A prefill leaf reads as `fit.ops.prefill_leaf` reads it."""
     if op.startswith(COLLECTIVES):
         return tuple(exchange(json.loads(sig)))
     if shape.phase == "decode":
         context, mean = _split(context)
         return json.dumps([str(shape), sig] + ([mean] if mean else [])), context
-    leaf = _abstract(json.loads(sig), shape.tokens)
+    from atom.compass.fit.ops import prefill_leaf
+
+    leaf = prefill_leaf(json.loads(sig), shape.tokens)[0]
     head = "prefill" if shape.gathered is None else "prefill G"
     if not dependent.get(("prefill", op), dependent.get(op, True)):
         rows = shape.seqs if dependent.get(("rows", op), True) else None
@@ -3778,7 +3770,7 @@ def _band(ats, lo, hi) -> slice | None:
     return None if i < 0 or j == len(ats) else slice(min(i, j), max(i, j) + 1)
 
 
-def _densify(families, tried: set) -> dict:
+def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
     """The point halfway between each two neighbours of a family, or of a
     prefill leaf's token count over cached tokens (`_cut`), more than one
     apart, unless `tried`, that launched different kernels or, in a decode
@@ -3798,7 +3790,9 @@ def _densify(families, tried: set) -> dict:
     does, is halved over cached tokens at each token count alone, where `fit
     ops` reads it after the token count. A prefill family whose shapes state G
     is not halved over its tokens: `trace ops` traces such a shape only at a
-    record's step."""
+    record's step. Any other is `_bent` on its line as `fit ops` reads it, taking
+    in a gap beside a bend each count of a step (`step_tokens`) at its rows, or
+    at any for a family stating none."""
     from atom.compass.capture.forward import decode, prefill
 
     steps = {
@@ -3823,21 +3817,48 @@ def _densify(families, tried: set) -> dict:
         at_a, at_b = ({x: k for x, k, _ in across[base, t]} for t in (a, b))
         return any(x in at_b and at_a[x] == at_b[x] for x in at_a)
 
+    # a prefill family's line as `fit ops` reads it: at any rows, unless its
+    # kind depends on context or its rows move it (`dependent`)
+    lines, moved = defaultdict(list), dependent or {}
+
+    def line(fam, points) -> str:
+        head, rows, *rest = json.loads(fam)
+        rows = rows if rest[1:] or moved.get(("rows", points[0][2].get("op"))) else 0
+        return json.dumps([head, rows, *rest])
+
+    for fam, points in families.items():
+        if json.loads(fam)[0] == "prefill":
+            lines[line(fam, points)] += points
+
     want = defaultdict(set)
     for fam, points in [*families.items(), *across.items()]:
         points = sorted(points, key=lambda p: p[0])
         decoding = points[0][2]["shape"].startswith("decode")
         # a ragged decode line is halved where it bends, not where its kind steps
         ragged = decoding and json.loads(fam)[2:]
-        if isinstance(fam, str) and _exchanged(fam):
-            sizes = [[*g] for _, g in itertools.groupby(points, key=lambda p: p[0])]
+        # a prefill family over its tokens, stating no G
+        tokened = isinstance(fam, str) and json.loads(fam)[0] == "prefill"
+        read = points  # a prefill family bends on its line as `fit ops` reads it
+        if tokened:
+            read = sorted(lines[line(fam, points)], key=lambda p: p[0])
+        if tokened or isinstance(fam, str) and _exchanged(fam):  # at each's mean
+            sizes = [[*g] for _, g in itertools.groupby(read, key=lambda p: p[0])]
             mean = (statistics.mean(p[2]["cold_ns"] for p in g) for g in sizes)
             at = ((*g[0][:2], {"cold_ns": ns}) for g, ns in zip(sizes, mean))
             bent = _bent([*at]) if len(sizes) > 2 else ()  # no line under three
         else:
             bent = _bent(points, () if ragged else steps) if decoding else ()
         cut = isinstance(fam, str) and _cut(fam)
+        at_rows = tokened and json.loads(fam)[1]  # None: a family at any rows
         for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
+            # each step's count between two points beside a bend of its line
+            if tokened and ka == kb and any(a <= x < b for x in sorted(bent)):
+                for r, held in (step_tokens or {}).items():
+                    for t in sorted(held) if at_rows in (None, r) else ():
+                        if a < t < b and (fam, t, r) not in tried:
+                            tried.add((fam, t, r))
+                            want[prefill(t, r), cut and cut[1] or None].add(fam)
+                continue
             mid = (a + b) // 2
             if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
                 continue
@@ -3874,13 +3895,18 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
     them. A family whose shapes state G reads the token counts of families
     whose shapes state G, as `fit ops` does, and is filled only at a token
     count its own points hold, on their graph: `trace ops` traces such a
-    shape only at a record's step."""
+    shape only at a record's step. So too a family of a kind free of cached
+    tokens that its rows move (`_dependent`)."""
     from atom.compass.capture.forward import prefill
     from atom.compass.fit.ops import skeleton
 
     held, skeletons, axis, own = defaultdict(set), {}, defaultdict(set), {}
+    dependent = _dependent(r for points in families.values() for *_, r in points)
     for fam, points in families.items():
-        if cut := _cut(fam):
+        kept = json.loads(fam)  # at its rows, of a kind its rows move
+        moved = dependent.get(("rows", points[0][2]["op"]))
+        cut = _cut(fam) or moved and type(kept[1]) is int and (fam, None)
+        if cut:
             head = json.loads(cut[0])[0]
             for tokens, _, record in points:
                 held[cut[0]].add((tokens, cut[1]))
@@ -3897,11 +3923,12 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
                 continue
             for c in sorted({c for u, c in at if ((base, u), c) not in tried}):
                 fam = json.dumps([*json.loads(base), c], sort_keys=True)
+                fam = base if c is None else fam
                 if (
                     not min(tokens) < t < max(tokens)
                     or (t, c) in at
                     or (fam, t) in tried
-                    or c > max_model_len - -(-t // rows)
+                    or (c or 0) > max_model_len - -(-t // rows)
                 ):
                     continue
                 tried.add((fam, t))
