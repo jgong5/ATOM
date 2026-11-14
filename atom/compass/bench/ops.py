@@ -3043,17 +3043,19 @@ def layout_of(config) -> dict:
     return {k: v for k, v in key_fields(config).items() if k in LAYOUT}
 
 
-#: How a leaf's `signature`, compact JSON, names the process group it runs on,
-#: as aiter's all-reduces and fused all-reduce norms and torch's functional
-#: collectives each take one.
-GROUP = '"group_name":'
+#: How a leaf's `signature`, compact JSON, shows the process group it runs on:
+#: an argument naming it, as aiter's all-reduces and fused all-reduce norms and
+#: torch's functional collectives each take one; or an operator ATOM runs on
+#: its TP group naming none, its all-reduce under two-batch overlap
+#: (`atom.model_ops.module_dispatch_ops.tbo_all_reduce`).
+ON_GROUP = ('"group_name":', '"op":"aiter.tbo_all_reduce.')
 
 
 def on_group(leaf: str, collective=False) -> bool:
     """Whether the leaf of signature `leaf` runs on a process group: a
     `collective` (`exchange`), some of which the capture lifts with their
-    group dropped, or one whose arguments name its group (`GROUP`)."""
-    return collective or GROUP in leaf
+    group dropped, or one its signature shows on a group (`ON_GROUP`)."""
+    return collective or any(mark in leaf for mark in ON_GROUP)
 
 
 def point_key(fields, layout, shape, context, leaf, collective=False) -> Key:

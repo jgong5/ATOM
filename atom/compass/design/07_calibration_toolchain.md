@@ -1054,11 +1054,13 @@ which the nearest entry of its kind differs.
 
 **An `op_measurement` keys the layout only for a collective leaf** (owner's
 [Ruling on #1500](https://github.com/jgong5/ATOM/issues/1500#issuecomment-6870338230)):
-a leaf that runs on a process group, one `measure ops` families by message bytes
-(`exchange`) or one whose arguments name its group (`group_name`), as aiter's all-reduces
-and fused all-reduce norms do. Its signature names the group by role (`tp:0`), not by its
-ranks, so its time depends on the layout beyond its signature, and its point's digest
-holds the layout. Any other leaf's signature holds the shapes the layout gives it, a weight at its
+a leaf that runs on a process group: one `measure ops` families by message bytes
+(`exchange`), one whose arguments name its group (`group_name`), as aiter's all-reduces
+and fused all-reduce norms do, or ATOM's all-reduce under two-batch overlap
+(`tbo_all_reduce`), which runs on the TP group naming none
+(`atom/compass/bench/ops.py::ON_GROUP`). A signature names a group by role (`tp:0`) or
+not at all, never by its ranks, so the leaf's time depends on the layout beyond its
+signature, and its point's digest holds the layout. Any other leaf's signature holds the shapes the layout gives it, a weight at its
 shard and attention at its heads, and under DP attention `measure ops` already times such
 a leaf on a runner at one rank's own width (D39). So its point is keyed by its signature
 alone and answers at every layout: a new layout measures only its collectives and the leaf

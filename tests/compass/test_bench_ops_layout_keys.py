@@ -39,12 +39,14 @@ GATHER = "_c10d_functional.all_gather_into_tensor.default"
 #: An all-reduce fused with a norm: no collective `exchange` families, on the
 #: group its `group_name` names.
 FUSED = "aiter.fused_allreduce_rmsnorm_.default"
+#: ATOM's TP all-reduce under two-batch overlap, which names no group.
+TBO = "aiter.tbo_all_reduce.default"
 
 
 def _graphs(ep: bool):
     """`ops.graph` at one layout: attention and a GEMM at either, a MoE whose
-    experts expert parallelism cuts, an all-gather across the ranks and an
-    all-reduce fused with a norm on the TP group."""
+    experts expert parallelism cuts, an all-gather across the ranks, an
+    all-reduce fused with a norm on the TP group and the TBO all-reduce."""
 
     def graph(store, config, shape, arch=None):
         x = ("x", _t([shape.seqs, 8], "activation"))
@@ -54,6 +56,7 @@ def _graphs(ep: bool):
             _leaf("aiter.moe", x, ("w", _t([4 if ep else 8, 8], "weight"))),
             _leaf(GATHER, x),
             _leaf(FUSED, x, ("group_name", "tp:0")),
+            _leaf(TBO, x),
             layers=1,
         )
 
@@ -139,10 +142,13 @@ def test_a_point_keys_the_layout_only_when_its_leaf_is_a_collective(
     fused = _graph(_leaf(FUSED, x, ("group_name", "tp:0")), layers=1)
     (sig,) = ops.leaves(fused["region"])
     on_group = ("decode B=2", 1000, sig)
+    (sig,) = ops.leaves(_graph(_leaf(TBO, x), layers=1)["region"])
+    tbo = ("decode B=2", 1000, sig)
 
     assert key["off"](*point) == key["on"](*point)
     assert key["off"](*point, True) != key["on"](*point, True)
     assert key["off"](*on_group) != key["on"](*on_group)
+    assert key["off"](*tbo) != key["on"](*tbo)
     # a leaf's digest is the one its point had when every key stated the layout
     assert key["on"](*point).values["point"] == ops.point_digest(*point)
     assert not set(EP_ON) & set(key["on"](*point, True).values)
@@ -153,7 +159,7 @@ def test_an_ep_plan_over_a_migrated_ep_off_store_measures_only_new_leaves_and_co
 ):
     population = _records(tmp_path / "plan", ([[1, 1000, True]], 1))
     measured = _plan_at(EP_OFF, bench, monkeypatch, tmp_path / "off", population)
-    assert measured == {"aiter.attn", "aiter.gemm", "aiter.moe", GATHER, FUSED}
+    assert measured == {"aiter.attn", "aiter.gemm", "aiter.moe", GATHER, FUSED, TBO}
     _, today, _, _ = bench
     _as_keyed_before(today, tmp_path / "old", EP_OFF)
     folder = Kind.OP_MEASUREMENT.value
@@ -170,11 +176,12 @@ def test_an_ep_plan_over_a_migrated_ep_off_store_measures_only_new_leaves_and_co
 
     measured = _plan_at(EP_ON, bench, monkeypatch, ep, population, root=new)
 
-    assert measured == {"aiter.moe", GATHER, FUSED}
+    assert measured == {"aiter.moe", GATHER, FUSED, TBO}
     held = [json.loads(x) for x in (ep / "plan.jsonl").read_text().splitlines()]
     assert {r["op"] for r in held} == {"aiter.attn", "aiter.gemm", "aiter.moe"} | {
         GATHER,
         FUSED,
+        TBO,
     }
     assert all(r["layout"] == EP_ON for r in held)
     fit = tmp_path / "fit"
