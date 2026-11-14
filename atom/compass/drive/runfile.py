@@ -187,7 +187,7 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     prefill side names that is not the decode side's refuses. With
     ``args.acceptance_record``, a decode record, it names the record as
     ``compass run`` does, refusing what either instance would refuse as it
-    joins (`run.joined_atom_args`)."""
+    joins (`drive.run.joined_atom_args`)."""
     out = build(args, prefill_args)
     if run.PRICE_LIST in out:
         decode = _price_list_key(decode_args, run._machine(out)).values
