@@ -491,15 +491,9 @@ def test_the_compass_runner_refuses_a_real_backend_beside_lmcache_mp(monkeypatch
 
 # --- a whole run --------------------------------------------------------------
 
-#: The machine the run is priced on and its memory readings measured on: the
-#: spec of the device `ATOM_COMPASS_SLICE_MACHINE` names, with a host link for
-#: the server's copies.
-MACHINE = Path(
-    os.environ.get(
-        "ATOM_COMPASS_SLICE_MACHINE",
-        TREE / "scripts/compass/machines/mi308x-hjbog39.json",
-    )
-)
+#: The machine the runs are priced on: an MI308X spec, which `on_cards` gives
+#: the platform its memory readings are measured on.
+MACHINE = TREE / "tests/compass/machines/mi308x-hjbog39.json"
 PROMPT = " ".join(f"word{k}" for k in range(200))  # a few lmcache chunks
 #: The third client run's request comes this long after its start: the
 #: eviction loop has emptied the server, and the session sweep has run.
@@ -530,8 +524,22 @@ class Delayed(Traffic):
         pass
 
 
-def _machine(out: Path) -> Path:
+def on_cards(gpu: str) -> dict:
+    """`MACHINE` at the device, PTL state and stack `compass measure memory`
+    reads on the GPUs `gpu` names, as rocm-smi numbers them."""
+    from atom.compass.drive.identity import _device, _ptl, _stack
+
+    gpus = tuple(int(g) for g in gpu.split(","))
     machine = json.loads(MACHINE.read_text())
+    [(name, arch)] = {(card["name"], card["arch"]) for card in _device(gpus)}
+    machine["device"] |= {"name": name, "arch": arch, "ptl": _ptl(gpus)}
+    machine["device"]["software_pinned_to"] = _stack()
+    return machine
+
+
+def _machine(out: Path, gpu: str) -> Path:
+    """`on_cards(gpu)` with a host link for the server's copies."""
+    machine = on_cards(gpu)
     machine["interconnect"]["host_link"] = {
         "bandwidth_bytes_per_s": BANDWIDTH,
         "latency_s": LATENCY_S,
@@ -557,7 +565,8 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(
     monkeypatch.setattr(test_vertical_slice, "SCRAPE_S", math.inf)
     # The readings are keyed by the performance environment the server runs in.
     monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
-    machine = _machine(tmp_path)
+    gpu = os.environ.get("HIP_VISIBLE_DEVICES", "0")
+    machine = _machine(tmp_path, gpu)
     server_port = lmcache_port
     flags = ["--host", "127.0.0.1", "--port", str(server_port), "--chunk-size", "256"]
     flags += ["--l1-size-gb", "1", "--eviction-policy", "LRU"]
@@ -567,7 +576,6 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(
     # lmcache server beside the engine.
     monkeypatch.setenv("ATOM_KV_OFFLOAD", "lmcache_mp")
     monkeypatch.setenv("ATOM_KV_OFFLOAD_EXTRA_CONFIG", json.dumps(extra))
-    gpu = os.environ.get("HIP_VISIBLE_DEVICES", "0")
     cli.main(
         ["measure", "memory", "--gpu", gpu]
         + ["--beside", shlex.join(["lmcache", "server", *flags])]

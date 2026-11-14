@@ -12,7 +12,7 @@ from atom.compass.spec.layers import DATASHEET, NETWORK, datasheet, network
 from atom.compass.spec.rules import Rule
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-MACHINES = ROOT / "scripts" / "compass" / "machines"
+MACHINES = ROOT / "tests" / "compass" / "machines"
 #: Each committed spec, by file stem: the datasheet and the network it states.
 LAYERS = {
     "mi308x-hjbog18": ("mi308x", "nic-400g"),

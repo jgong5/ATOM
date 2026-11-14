@@ -60,11 +60,12 @@ from atom.compass.run import host_key_of
 from atom.compass.spec import MachineSpec
 
 ROOT = Path(__file__).resolve().parents[2] / "scripts" / "compass"
+MACHINES = Path(__file__).resolve().parent / "machines"
 LAW = json.loads(
     (ROOT / "laws" / "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json").read_text()
 )
-N18 = json.loads((ROOT / "machines" / "mi308x-hjbog18.json").read_text())
-N39 = json.loads((ROOT / "machines" / "mi308x-hjbog39.json").read_text())
+N18 = json.loads((MACHINES / "mi308x-hjbog18.json").read_text())
+N39 = json.loads((MACHINES / "mi308x-hjbog39.json").read_text())
 #: The law at the test deployment's engine config, which `_installed` states.
 HERE = {k: v for k, v in LAW.items() if k != "engine_config"}
 
@@ -137,7 +138,7 @@ LAW_SPECS = {
 @pytest.mark.parametrize("name", sorted(p.name for p in (ROOT / "laws").glob("*.json")))
 def test_every_checked_in_law_states_the_platform_of_its_spec(name):
     law = json.loads((ROOT / "laws" / name).read_text())
-    spec = platform(json.loads((ROOT / "machines" / LAW_SPECS[name]).read_text()))
+    spec = platform(json.loads((MACHINES / LAW_SPECS[name]).read_text()))
     assert law["platform"] == keyed_platform(Kind.STEP_LINEAR_LAW, spec)
     host = {k: v for k, v in law["host"]["key"].items() if k in spec}
     assert host == keyed_platform(Kind.HOST_LAWS, spec)
@@ -147,7 +148,7 @@ def test_every_checked_in_law_states_the_platform_of_its_spec(name):
 def test_another_nodes_laws_refuse_a_crs005_run_naming_its_aiter(
     monkeypatch, tmp_path, node
 ):
-    crs005 = json.loads((ROOT / "machines" / "mi355x-crs005.json").read_text())
+    crs005 = json.loads((MACHINES / "mi355x-crs005.json").read_text())
     name = next(n for n, s in LAW_SPECS.items() if s == f"mi355x-{node}.json")
     law = json.loads((ROOT / "laws" / name).read_text())
     here = {k: v for k, v in law.items() if k != "engine_config"}
@@ -452,7 +453,7 @@ def digest(document: dict) -> str:
 
 def migrate(*args) -> list[str]:
     done = subprocess.run(
-        [sys.executable, str(MIGRATE), *map(str, args)],
+        [sys.executable, str(MIGRATE), "--machines", str(MACHINES), *map(str, args)],
         capture_output=True,
         text=True,
         check=True,
