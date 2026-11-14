@@ -252,16 +252,26 @@ def _op_graph(side: Path):
 
 def _warm_over_cold(run_file: dict):
     """`measure ops`'s warm time over its cold one per op kind, over the
-    points the store holds at the key of the run file's price list."""
+    points the store holds for the run file's price list: of its model,
+    platform and source root, a collective's at its layout too
+    (`bench.ops.point_key`)."""
+    from atom.compass.artifacts.keys import LAYOUT
+    from atom.compass.bench.ops import point_key
+
     store, fields, by = ArtifactStore(run_file["store"]), run_file.get(PRICE_LIST), {}
     folder = store.root / Kind.OP_MEASUREMENT.value
+    stated = {k: v for k, v in (fields or {}).items() if k not in LAYOUT}
+    layout = {k: v for k, v in (fields or {}).items() if k in LAYOUT}
     for path in sorted(folder.glob(f"[!.]*/{ENTRY_FILE}")) if fields else ():
         key = read_json(path)["key"]
-        if {k: v for k, v in key.items() if k != "point"} == fields:
-            entry = store.read(Key.of(Kind.OP_MEASUREMENT, **key))
+        if {k: v for k, v in key.items() if k != "point"} == stated:
+            entry = store.read(at := Key.of(Kind.OP_MEASUREMENT, **key))
             point = json.loads(
                 entry.read_member("point", entry.topology.ranks()[0], "json")
             )
+            ran = point["shape"], point["context"], point["leaf"]
+            if "exchange" in point and point_key(stated, layout, *ran, True) != at:
+                continue  # a collective measured at another layout
             by.setdefault(point["op"], []).append(point.get("warm_over_cold"))
     for op, ratios in sorted(by.items()):
         r = [x for x in ratios if x is not None]

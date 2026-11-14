@@ -91,7 +91,7 @@ and state as the capture's replay rebuilds one, its tensors built as any other
 argument's, its activations fresh on every copy, a lifted call's sequence a tuple.
 A leaf whose operator cannot run, or that copies to the host, refuses by name.
 On one GPU at a DP-attention layout, the runner is one DP rank's own, TP 1 and DP 1, the
-graphs read and the keys written keep the layout, and a collective leaf
+graphs read and the lines written keep the layout, and a collective leaf
 refuses: it is measured across the layout's ranks, where a DP all-gather's
 `x` holds each rank's own `sizes` entry's rows, the capture's being rank 0's
 (`_own_rows`).
@@ -163,10 +163,12 @@ device faulted (`_alive`); one that dies ends every rank, keeps the points
 every rank finished, the point it was measuring refuses, and new ones measure
 the rest; two in a row that die having finished no point fail the run.
 
-DIR gets run.json, the run's identity, and ops.jsonl, one line per point. S
-gets each measured point as an `op_measurement`, keyed by the model, the
-parallel layout, the device, stack, PTL state and torch run.json reads, the
-source root and the point.
+DIR gets run.json, the run's identity, and ops.jsonl, one line per point, a
+measured one with its store token and the run's parallel layout. S gets each
+measured point as an `op_measurement`, keyed by the model, the device, stack,
+PTL state and torch run.json reads, the source root and the point, the layout
+only for a collective leaf (`point_key`): a point of any other leaf answers at
+every layout, and one S holds is not measured again.
 
 `--plan` measures, in rounds, the points the steps of record directories call
 for (`record`'s or `trace steps`' output), under `--enable-tbo` a step its DP
@@ -214,7 +216,8 @@ is not halved over its tokens, and is filled only at a token count its own
 points hold, on their graph, as `trace ops` traces such a shape only at a
 record's step. DIR gets each round's ops.jsonl in `round<n>`, a run
 resumed into DIR numbering on from the last round there, and after each round
-every point held, a measured one with its store token, in plan.jsonl.
+every point held, a measured one with its store token and the run's layout,
+in plan.jsonl, those S held before the run among them.
 
 `--coverage` counts the steps of record directories, read as `--plan` reads
 them, that DIR's plan.jsonl covers (`coverage`), with the `op_graph`s of the
@@ -686,8 +689,9 @@ def main(argv: list[str]) -> None:
             command, atom_args = " ".join(command), argv[cut + 1 :]
             return plan(store, key, config, run, args, command, out, atom_args)
         for shape, context, found in todo:
-            for sig in list(found):
-                if store.directory_for(key(shape, context, sig)).exists():
+            for sig, (op, _) in list(found.items()):
+                at = key(shape, context, sig, exchange(op) is not None)
+                if store.directory_for(at).exists():
                     del found[sig]
                     held += 1
         print(f"{held} points already in the store", flush=True)
@@ -2985,33 +2989,48 @@ def _fields(held):
 
 
 def keys(config, run: dict):
-    """The `op_measurement` key of a point, `(shape, context, leaf)`, measured
-    under `config` on the platform `run` reads."""
-    from atom.compass.artifacts.keys import LAYOUT, keyed_platform, platform_of
+    """`point_key` of a point measured under `config` on the platform `run`
+    reads: `key(shape, context, leaf, collective=False)`."""
+    from atom.compass.artifacts.keys import keyed_platform, platform_of
     from atom.compass.fit.samples import run_fields
-    from atom.compass.run.memory import key_fields
 
     fields = run_fields(run)
     platform = platform_of(fields["device"], run["stack"], run["ptl"])
-    layout = {k: v for k, v in key_fields(config).items() if k in LAYOUT}
+    stated = {"model": fields["model"], "source_root": fields["source_root"]}
+    stated |= keyed_platform(Kind.OP_MEASUREMENT, platform)
+    return functools.partial(point_key, stated, layout_of(config))
 
-    def key(shape, context, leaf) -> Key:
-        point = json.dumps([str(shape), context, leaf]).encode()
-        return Key.of(
-            Kind.OP_MEASUREMENT,
-            model=fields["model"],
-            **layout,
-            **keyed_platform(Kind.OP_MEASUREMENT, platform),
-            source_root=fields["source_root"],
-            point="sha256:" + hashlib.sha256(point).hexdigest(),
-        )
 
-    return key
+def layout_of(config) -> dict:
+    """The parallel layout `config` resolves, as a key states it."""
+    from atom.compass.artifacts.keys import LAYOUT
+    from atom.compass.run.memory import key_fields
+
+    return {k: v for k, v in key_fields(config).items() if k in LAYOUT}
+
+
+def point_key(fields, layout, shape, context, leaf, collective=False) -> Key:
+    """The `op_measurement` key of the point `(shape, context, leaf)` measured
+    at `fields`, its model, platform and source root, its digest holding the
+    parallel `layout` only when the leaf is a `collective` (`exchange`): a
+    collective's signature names its group by role, not by its ranks, while
+    any other leaf's holds the shapes the layout gives it, so its point
+    answers at every layout."""
+    point = point_digest(shape, context, leaf, layout if collective else None)
+    return Key.of(Kind.OP_MEASUREMENT, **fields, point=point)
+
+
+def point_digest(shape, context, leaf, layout=None) -> str:
+    """The digest of a point an `op_measurement` key holds, of `layout` too
+    when it is not None."""
+    point = [str(shape), context, leaf] + ([] if layout is None else [layout])
+    text = json.dumps(point, sort_keys=True).encode()
+    return "sha256:" + hashlib.sha256(text).hexdigest()
 
 
 def publish(store, key, config, run: dict, command: str, results, out: Path):
-    """Write `results` to ``ops.jsonl`` in `out` and each measured one to
-    `store` at its `key`."""
+    """Write `results` to ``ops.jsonl`` in `out`, each with its store token
+    and `config`'s layout, and each measured one to `store` at its `key`."""
     from atom.compass.fit.publish import conditions, ranks
     from atom.compass.fit.samples import run_fields
     from atom.compass.run.step_grid import keyed
@@ -3022,10 +3041,13 @@ def publish(store, key, config, run: dict, command: str, results, out: Path):
     )
     roots = roots_for({"atom": "atom", "aiter": "aiter"})
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    layout = layout_of(config)
     with (out / "ops.jsonl").open("w") as lines:
         for record in results:
-            at = key(record["shape"], record["context"], record["leaf"])
-            lines.write(json.dumps(record | {"token": at.token()}) + "\n")
+            point = record["shape"], record["context"], record["leaf"]
+            at = key(*point, "exchange" in record)
+            line = record | {"token": at.token(), "layout": layout}
+            lines.write(json.dumps(line) + "\n")
             if "refused" not in record:
                 body, every = json.dumps(record).encode(), ranks(at)
                 store.publish(
@@ -3139,7 +3161,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     prefills |= {s for s in moved if s.phase == "prefill"}
     # a run resumed into `out` keeps the rounds an earlier one wrote there
     rounds = [int(d.name[5:]) for d in out.glob("round*") if d.name[5:].isdigit()]
-    first = max(rounds, default=-1) + 1
+    first, layout = max(rounds, default=-1) + 1, layout_of(config)
 
     def measure_round(want, n):
         dependent = _dependent(done.values())
@@ -3155,7 +3177,8 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     and fam not in families
                 ):
                     continue
-                if store.directory_for(at := key(shape, context, sig)).exists():
+                at = key(shape, context, sig, exchange(op) is not None)
+                if store.directory_for(at).exists():
                     entry = store.read(at)
                     held = entry.read_member("point", entry.topology.ranks()[0], "json")
                     # the asking shape's mark alone: the point's key holds no TBO
@@ -3178,7 +3201,8 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         with (out / "plan.jsonl").open("w") as lines:
             for r in done.values():
                 if "refused" not in r:  # a refused point is not in the store
-                    r = r | {"token": key(r["shape"], r["context"], r["leaf"]).token()}
+                    at = key(r["shape"], r["context"], r["leaf"], "exchange" in r)
+                    r = r | {"token": at.token(), "layout": layout}
                 lines.write(json.dumps(r) + "\n")
 
     decodes = [
