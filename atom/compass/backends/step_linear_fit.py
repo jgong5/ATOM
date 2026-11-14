@@ -5,10 +5,12 @@
 
     python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --platform JSON [--form FORM] [--moe-routing E,K] [--engine FILE]
     python -m atom.compass.backends.step_linear_fit offload LOG... --out ENTRY
+    python -m atom.compass.backends.step_linear_fit figures RECORD... --law LAW [--source NAME] [--form FORM] [--moe-routing E,K] [--engine FILE]
 
 The second form fits a run file's ``lmcache_offload`` entry, beside the law of
 an arm whose records ran the connector, on those runs' server logs
-(`fit_offload`).
+(`fit_offload`). The third writes the held-out figures (below) of the records
+into an existing law fitted on them (`figures_main`).
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
@@ -172,6 +174,13 @@ vector's `held_out`, the convex hull of the rows they were priced by, each
 step's costliest rank's, and their percentiles per band, which `StepLinearLaw`
 reads to mark a term validated. A cheaper rank's row is not hulled: no error was
 measured at it. A vector whose held-out steps span no hull gets none.
+The law and its report also state, under `figures`, per held-out run and kind
+(`prefill`, `decode`, and `draft` for a drafter's draft), `FIGURES` of that run's
+own steps priced by the law fitted on the others, as `validate.cost` grades a
+run, a step that law has no vector for entering none (`fold_figures`); the
+command prints them. A law fitted
+on records with a host key states the ATOM digest they ran at, the key's
+``atom``, as `records_atom`, which re-keying the host key leaves as it is.
 """
 
 from __future__ import annotations
@@ -244,6 +253,10 @@ TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
 #: What a forward that admits requests spends once, per prompt token past the
 #: prefix-cache hit and per token within it (`step_labels.admit_x`).
 ADMIT_FEATURES = ("admits", "uncached", "cached")
+#: The figures `validate.cost` grades a kind by that a held-out run's are written
+#: under: the steps graded, the error on their totals, the step that contributes
+#: most to it and the error holding that step out, and the median per step.
+FIGURES = ("steps", "on_totals", "held_out_step", "held_out", "median")
 #: Why a law fitted on records stating their prefill buckets nowhere has no `padding`.
 NO_BUCKETS = "no record states prefill buckets, so the prefill vector adds no padding"
 
@@ -1756,19 +1769,28 @@ def priced_rank(ranks: dict):
     return max(ranks, key=ranks.get)
 
 
-def _held_out(samples, options, seed, warm=None, draft: bool = False):
-    """Each step of each run, warm steps left out, priced as its costliest rank
-    by the law fitted on the other runs, under `draft` as `fit` fits a draft
-    law: (run, vector, band, that rank's (counts, context, tokens, dummies),
-    relative error), the error nan where that law has no vector."""
-    form, dp = _options(options)
+def _fold_laws(samples, options, seed, draft: bool = False):
+    """Each run of `samples`, in the order runs first appear, with its ranks'
+    samples and the law `fit` gives on the other runs, under `draft` as `fit`
+    fits a draft law."""
     options = {**(options or {}), "serial": _serial(samples, options)}
-    runs = _runs(samples, dp)
+    for run, ranks in _runs(samples, _options(options)[1]).items():
+        others = [s for s in samples if s.provenance["run"] != run]
+        yield run, ranks, fit(others, options, seed, draft)[0]
+
+
+def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None):
+    """Each step of each run, warm steps left out, priced as its costliest rank
+    by the law fitted on the other runs, `folds`' when given, else
+    `_fold_laws`', under `draft` as `fit` fits a draft law: (run, vector,
+    band, that rank's (counts, context, tokens, dummies), relative error), the
+    error nan where that law has no vector."""
+    form = _options(options)[0]
+    options = {**(options or {}), "serial": _serial(samples, options)}
     if warm is None:
         warm = fit(samples, options, seed, draft)[0]["warm_steps"]
-    for i, (run, ranks) in enumerate(runs.items()):
-        others = [s for s in samples if s.provenance["run"] != run]
-        law = fit(others, options, seed, draft)[0]
+    folds = _fold_laws(samples, options, seed, draft) if folds is None else folds
+    for i, (run, ranks, law) in enumerate(folds):
         routing = _law_routing(law)
         for group in _groups(
             ranks,
@@ -1820,22 +1842,50 @@ def _bands(rows) -> dict:
     return bands
 
 
+def _vector_of(view) -> str:
+    """The name a law's `sources` gives the vector that prices `view`'s step."""
+    return "prefill" if view.prefill else f"decode {_rung_key(view.capture_rung)}"
+
+
+def _figures(ranks, law: dict, vectors=None) -> dict:
+    """Per kind, `FIGURES` of the steps of `ranks`, one run's ranks' samples,
+    priced by `law` as `validate.cost` grades a run; with `vectors`, only the
+    steps a vector it names prices (`_vector_of`), each with its draft."""
+    from atom.compass.validate import cost
+
+    steps = None
+    if vectors is not None:
+        steps = {s.step for r in ranks for s in r if _vector_of(s.view) in vectors}
+    graded = cost.run_accuracy(ranks, law, steps)["graded"]
+    return {kind: {f: g[f] for f in FIGURES} for kind, g in graded.items()}
+
+
+def fold_figures(folds, vectors=None) -> dict:
+    """Per run of `folds`, `_fold_laws`', `_figures` of its steps priced by the
+    law fitted on the other runs."""
+    return {run: _figures(ranks, law, vectors) for run, ranks, law in folds}
+
+
 def mark_held_out(
     law: dict, report: dict, samples, options=None, seed: int = 0, draft=False
 ):
     """Write the held-out errors: under each of `law`'s vectors, as `held_out`,
     the hull of the rank rows `_held_out` priced its steps by, their errors per
-    band; under `report`'s `held_out`, each run's errors per band. A draft
+    band; under `report`'s `held_out`, each run's errors per band; and, unless
+    `draft`, under both's `figures`, `fold_figures`' on the same folds. A draft
     law fitted on an EAGLE3 drafter's passes, its vectors alike, on the steps
     each is fitted on, their bands named `draft` (`_mark_passes`); `draft`
     says `law` is a draft law."""
     from scipy.spatial import QhullError
 
+    folds = list(_fold_laws(samples, options, seed, draft))
     rows = [
         r
-        for r in _held_out(samples, options, seed, law["warm_steps"], draft)
+        for r in _held_out(samples, options, seed, law["warm_steps"], draft, folds)
         if not math.isnan(r[4])
     ]
+    if not draft:
+        law["figures"] = report["figures"] = fold_figures(folds)
     for run in dict.fromkeys(r[0] for r in rows):
         report["held_out"][run] = _bands([r for r in rows if r[0] == run])
     routing = _law_routing(law)
@@ -2055,19 +2105,10 @@ def offload_main(argv) -> None:
         print(f"{name}: {json.dumps(entry[name])} {json.dumps(fit)}")
 
 
-def main(argv=None) -> None:
-    argv = sys.argv[1:] if argv is None else argv
-    if argv[:1] == ["offload"]:
-        offload_main(argv[1:])
-        return
-    parser = argparse.ArgumentParser(
-        prog="python -m atom.compass.backends.step_linear_fit",
-        description=__doc__.split("\n\n")[0],
-    )
+def _records_parser(prog: str, description: str) -> argparse.ArgumentParser:
+    """A parser of the records and the options `_labelled` reads with them."""
+    parser = argparse.ArgumentParser(prog=prog, description=description)
     parser.add_argument("records", nargs="+", help="real step records, steps/dp0.jsonl")
-    parser.add_argument(
-        "--out", required=True, help="where the law is written, as JSON"
-    )
     parser.add_argument("--form", choices=FORMS, default="base")
     parser.add_argument(
         "--moe-routing",
@@ -2077,19 +2118,19 @@ def main(argv=None) -> None:
         "steps' real MoE tokens, or the experts they reach, as a column",
     )
     parser.add_argument(
-        "--platform",
-        required=True,
-        type=_platform_arg,
-        help="the platform the records ran on, as the law's and its host laws' "
-        'keys state it: {"step_linear_law": {...}, "host_laws": {...}}',
-    )
-    parser.add_argument(
         "--engine",
         help="the engine file the records ran under, stated in place of the "
         ".engine.json beside each, its prefill buckets for a record that states "
         "none; refused where one contradicts it",
     )
-    args = parser.parse_args(argv)
+    return parser
+
+
+def _labelled(args) -> tuple[list, dict, dict, dict]:
+    """`args.records`' samples, each record's table, the options `fit` takes
+    on them and the engine config they ran under. A record whose server built
+    an aiter JIT module refuses, and so does an engine file that contradicts
+    `--engine`."""
     for record in args.records:
         run = Path(record).resolve().parent.parent / "run.json"
         if run.is_file() and (
@@ -2116,6 +2157,89 @@ def main(argv=None) -> None:
     options = {"form": args.form, "dp": dp, "moe_routing": args.moe_routing}
     options["buckets"] = recorded_buckets(stated)
     samples, tables = label_records(args.records, dp)
+    return samples, tables, options, engine
+
+
+def _figures_table(figures: dict) -> str:
+    """`fold_figures`' figures, a line per held-out run and kind."""
+    lines = ["run | kind | steps | on totals | held-out step | holding it out | median"]
+    for run, kinds in figures.items():
+        for kind, f in kinds.items():
+            held = "-" if f["held_out"] is None else f"{f['held_out']:+.2%}"
+            lines.append(
+                f"{run} | {kind} | {f['steps']} | {f['on_totals']:+.2%} | "
+                f"{f['held_out_step']} | {held} | {f['median']:+.2%}"
+            )
+    return "\n".join(lines)
+
+
+def figures_main(argv) -> None:
+    """``figures RECORD... --law LAW [--source NAME]``: write `fold_figures`'
+    figures on the records into the law file LAW, and print them.
+
+    The records are folded under `--form`, `--moe-routing` and their engine
+    config as the command fits them, and must be the runs LAW states under
+    `runs`. A law whose `sources` splits its vectors takes one source's at a
+    time: `--source` names it, the records must be its `runs`, and the
+    figures, of the steps its `vectors` price, go under it."""
+    parser = _records_parser(
+        "python -m atom.compass.backends.step_linear_fit figures",
+        figures_main.__doc__.split("\n\n")[0],
+    )
+    parser.add_argument("--law", required=True, help="the law file written into")
+    parser.add_argument("--source", help="the entry of the law's sources folded")
+    args = parser.parse_args(argv)
+    law = json.loads(Path(args.law).read_text())
+    into, vectors, runs = law, None, law.get("runs")
+    sources = law.get("sources", {})
+    if args.source is not None or sources:
+        if args.source not in sources:
+            raise ValueError(
+                f"{args.law} splits its vectors over the sources {sorted(sources)}, "
+                f"and --source names {args.source}; each is folded with its own "
+                "records, form and options"
+            )
+        into = sources[args.source]
+        vectors = into["vectors"]
+        runs = runs and [runs[i] for i in into["runs"]]
+    if runs is None:
+        raise ValueError(f"{args.law} states no runs to hold the records to")
+    samples, _, options, _ = _labelled(args)
+    given = {s.provenance["run"] for s in samples}
+    if differ := sorted(given ^ set(runs)):
+        raise ValueError(
+            f"the records' runs are not the {len(runs)} runs {args.law} states "
+            f"for them; these are in one and not the other: {differ}"
+        )
+    into["figures"] = fold_figures(_fold_laws(samples, options, 0), vectors)
+    Path(args.law).write_text(json.dumps(law) + "\n")
+    print(_figures_table(into["figures"]))
+
+
+def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["offload"]:
+        offload_main(argv[1:])
+        return
+    if argv[:1] == ["figures"]:
+        figures_main(argv[1:])
+        return
+    parser = _records_parser(
+        "python -m atom.compass.backends.step_linear_fit", __doc__.split("\n\n")[0]
+    )
+    parser.add_argument(
+        "--out", required=True, help="where the law is written, as JSON"
+    )
+    parser.add_argument(
+        "--platform",
+        required=True,
+        type=_platform_arg,
+        help="the platform the records ran on, as the law's and its host laws' "
+        'keys state it: {"step_linear_law": {...}, "host_laws": {...}}',
+    )
+    args = parser.parse_args(argv)
+    samples, tables, options, engine = _labelled(args)
+    dp = options["dp"]
     for record, table in tables.items():
         step_labels.write_table(record, table)
     law, report = fit(samples, options)
@@ -2126,6 +2250,7 @@ def main(argv=None) -> None:
     law["platform"] = args.platform["step_linear_law"]
     law["engine_config"] = engine
     if "host" in law:
+        law["records_atom"] = law["host"]["key"]["atom"]
         stated = law["host"]["key"]["engine"]  # its graph sets stay
         graphs = {k: v for k, v in stated.items() if k == launch_features.GRAPHS}
         law["host"]["key"] |= {
@@ -2157,6 +2282,7 @@ def main(argv=None) -> None:
             print(f"\nheld out, form {form}\n{_table(errors)}")
         if "host" in law:
             print(f"\nheld out, host laws\n{_table(host_held_out(samples))}")
+        print(f"\nfigures, form {options['form']}\n{_figures_table(law['figures'])}")
 
 
 if __name__ == "__main__":

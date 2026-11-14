@@ -229,6 +229,19 @@ def cost_accuracy(record, backend, steps=None) -> dict:
             f"{record}'s ranks ran only DP's dummy forwards: no step to price"
         )
     dummies = [frozenset(s["step"] for s in x if s["is_dummy_run"]) for x in records]
+    number = [int(r.name[2:-6]) for r in ranks]
+    cards = _cards(identity, number)
+    return {"record": str(record), **run_accuracy(run, backend, steps, dummies, cards)}
+
+
+def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
+    """`cost_accuracy`'s report but its ``record``, on `run`, one run's ranks'
+    samples as `step_labels.label_run` labels them: `dummies` holds each rank's
+    steps run as dummy forwards, read from its samples when None, and `cards`
+    each rank's number, in rank order, to its cards' buses, rank i numbered i
+    with none named when None."""
+    cards = cards or dict.fromkeys(range(len(run)))
+    number = list(cards)
     joined, cut, _ = step_linear_fit._groups(run, "base", steps=steps, dummies=dummies)
     views = [{s.step: s.view for s in rank} for rank in run]
     drafts = [{s.step: s.draft_s for s in rank} for rank in run]
@@ -287,7 +300,7 @@ def cost_accuracy(record, backend, steps=None) -> dict:
             for group in GRADED[draft[2]]:
                 groups[group].setdefault("draft", []).append((band, step, *draft[:2]))
     name = backend.describe() if law is None else backend.law.fitted_on
-    report = {"record": str(record), "backend": name, "cut": cut}
+    report = {"backend": name, "cut": cut}
     for group, kinds in groups.items():
         report[group] = {
             kind: _summary(rows) for kind, rows in sorted(kinds.items(), reverse=True)
@@ -295,15 +308,13 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     report["warm"] = warm
     report["fallback"], report["refused"] = fell, declined
     report["extrapolated"] = extrapolated
-    number = [int(r.name[2:-6]) for r in ranks]
-    cards = _cards(identity, number)
     report["ranks"] = {
         kind: {
             number[i]: _rank(rows, cards[number[i]])
             for i, rows in sorted(mine.items(), key=lambda m: number[m[0]])
         }
         for kind, mine in sorted(by_rank.items(), reverse=True)
-        if len(ranks) > 1
+        if len(run) > 1
     }
     report["methods"], report["terms"] = {}, {}
     for kind, priced_steps in sorted(parts.items(), reverse=True):

@@ -24,15 +24,17 @@ the fit labels whose label keeps that kernel's recorded length.
 rank that gave no sample refuses; it pads prefill to the records'
 `prefill_buckets`, naming under `unfitted` records stating none, and holds
 out each run on the others when
-there are two or more, as that module's command does; `--seed` fixes
-its shuffles. With `--moe-routing E,K`, the model's routed experts and top-k,
+there are two or more, as that module's command does, the law and its report
+stating each held-out run's figures per kind; `--seed` fixes its shuffles.
+With `--moe-routing E,K`, the model's routed experts and top-k,
 the law states them as `moe_routing`, and each decode rung may adopt a MoE
 column over them, as that command's `--moe-routing` fits it. `--model DIR`
 reads them from the model directory the records served, as ATOM loads its
 config, and refuses one whose config.json is not the records'; a model that
 names no routed experts gives none. The law states,
 as `platform`, the platform fields of its key,
-and `engine_config`, as that command's does, and the key holds them. The report's
+and `engine_config`, as that command's does, and the key holds them; as
+`records_atom`, the ATOM digest its key's `source_root` holds. The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
 
@@ -123,6 +125,7 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     report["provenance"] = publish.runs(samples)
     law["platform"] = keyed_platform(Kind.STEP_LINEAR_LAW, config["platform"])
     law["engine_config"] = config["engine_config"]
+    law["records_atom"] = config["source_root"].split("-", 1)[1]
     return {"form": form, **law["platform"]}, law, report
 
 
