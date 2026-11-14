@@ -376,6 +376,17 @@ def _admit_rows(samples, host) -> list[tuple]:
     ]
 
 
+def records_atom(samples) -> str | None:
+    """The ATOM digest `samples`' records ran at, their host keys' ``atom``;
+    None when no record has a host key. Records at two refuse."""
+    atoms = {s.provenance["config"]["atom"] for s in samples if s.provenance["config"]}
+    if len(atoms) > 1:
+        raise ValueError(
+            f"the records ran at {len(atoms)} ATOM digests: {sorted(atoms)}"
+        )
+    return next(iter(atoms), None)
+
+
 def label_records(records, dp: int = 1) -> tuple[list, dict]:
     """`records`, runs of `dp` ranks in rank order, as `step_labels` samples, each
     run named by its records' digests; and each record's table rows."""
@@ -2249,8 +2260,9 @@ def main(argv=None) -> None:
         law["host"], law["host_fit"] = fit_host(samples)
     law["platform"] = args.platform["step_linear_law"]
     law["engine_config"] = engine
+    if atom := records_atom(samples):
+        law["records_atom"] = atom
     if "host" in law:
-        law["records_atom"] = law["host"]["key"]["atom"]
         stated = law["host"]["key"]["engine"]  # its graph sets stay
         graphs = {k: v for k, v in stated.items() if k == launch_features.GRAPHS}
         law["host"]["key"] |= {
