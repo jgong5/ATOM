@@ -1562,11 +1562,11 @@ after the real put: the records' `t_put_ns` measure that gap.
 
 | rule | applies to | where | waits for | ATOM site |
 |---|---|---|---|---|
-| R1 | output forward, single stage | after launch; before launch with MTP | the previous output forward's `target_end`; with MTP, then `L_mtp` | `tokenIDProcessor.recv_async_output`, from `prepare_sampled_ids`; with MTP, `tokenIDProcessor.recv_spec_status`, from `prepare_input_ids` in `ModelRunner.prepare_model` |
+| R1 | output forward, single stage, on a runner that defers output | after launch; before launch with MTP | the previous output forward's `target_end`; with MTP, then `L_mtp` | `tokenIDProcessor.recv_async_output`, from `prepare_sampled_ids`; with MTP, `tokenIDProcessor.recv_spec_status`, from `prepare_input_ids` in `ModelRunner.prepare_model` |
 | R4 | every forward, single stage | forward entry | `end[n-2]` | `ModelRunner._gate_staging_reuse` |
 | R6 | every forward, PP | forward entry | this stage's `end[n-pp]` | `ModelRunner._advance_forward_vars`, the `forward_vars` ring |
 | R7 | non-first PP stage | device start, host launch | the upstream stage's `end`, and its host send | `GroupCoordinator.recv_tensor_dict`, from `recv_intermediate_tensors` (`atom/distributed/pp_comm.py`) in `ModelRunner.run_model`: the metadata on gloo holds the host, the tensors the device |
-| R8 | last PP stage, output batch | after launch | its own `target_end` | `tokenIDProcessor.prepare_sampled_ids`'s `tolist`, on the stage that does not defer output |
+| R8 | output batch, on the last PP stage or a single stage whose runner does not defer output | after launch | its own `target_end` | `tokenIDProcessor.prepare_sampled_ids`'s `tolist`, on a runner that does not defer output ([#3174](https://github.com/jgong5/ATOM/issues/3174)) |
 
 **The MTP status copy, `L_mtp`** (owner ruling on
 [#2080](https://github.com/jgong5/ATOM/issues/2080), 2026-10-25). With MTP, R1 releases
