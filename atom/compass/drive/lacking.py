@@ -24,7 +24,8 @@ on the machine spec's device arch, whatever device this host has
 Each lacking input is printed with the command that makes it. A step linear
 law's is the `calibrate.sh` command that records and fits one for this
 configuration (`calibration`), into `--out`, or `cal` in the current directory
-without one, with its expected time, unknown while no calibration records its
+without one, naming each client variable it requires that this environment
+does not set, with its expected time, unknown while no calibration records its
 time.
 
 Printed apart, outside the exit status: the gaps `--coverage`'s check counts;
@@ -82,8 +83,9 @@ AXIS = re.compile(r"` x `([^`]+)`")
 CALIBRATE = Path(__file__).resolve().parents[3] / "scripts/compass/calibrate.sh"
 #: Its directory when `--out` names none, in the current one.
 CALIBRATION_OUT = "cal"
-#: The variables `calibrate.sh` reads for its clients, which no configuration
-#: states: its command states each this process's environment holds.
+#: The variables `calibrate.sh` requires for its clients, which no configuration
+#: states: its command states each this process's environment sets, and names
+#: each it does not.
 CLIENT_ENV = ("TRACES", "AIPERF_PYTHON")
 
 
@@ -238,8 +240,9 @@ def calibration(out, atom_args, config) -> str:
     expected time: the records `step_linear_plan.records` plans, the trace
     runs only where `compass record --trace` takes one; on as many GPUs as
     ATOM's ranks use; under this process's environment as a law's key states
-    it (`keyed_env`), and each of `CLIENT_ENV` it holds. Where `calibrate.sh`
-    cannot take ATOM's arguments, why."""
+    it (`keyed_env`), and each of `CLIENT_ENV` it sets, then a line naming each
+    it does not, which `calibrate.sh` refuses to run without. Where
+    `calibrate.sh` cannot take ATOM's arguments, why."""
     from atom.compass.drive.record import refuse_trace
     from atom.compass.run.step_grid import keyed_env
 
@@ -260,7 +263,16 @@ def calibration(out, atom_args, config) -> str:
     engine = runfile._engine_args(atom_args)
     gpus = engine.tensor_parallel_size * engine.data_parallel_size
     gpus *= engine.pipeline_parallel_size * engine.prefill_context_parallel_size
-    env = keyed_env() | {k: os.environ[k] for k in CLIENT_ENV if k in os.environ}
+    # `calibrate.sh` refuses an empty value as it refuses an unset one.
+    clients = {k: os.environ[k] for k in CLIENT_ENV if os.environ.get(k)}
+    unset = [k for k in CLIENT_ENV if k not in clients]
+    unheld = (
+        f"\n  before it runs, set {' and '.join(unset)}, which calibrate.sh "
+        "requires and this environment does not set"
+        if unset
+        else ""
+    )
+    env = keyed_env() | clients
     env |= {
         "MODEL": str(Path(engine.model).resolve()),
         "GPU": ",".join(map(str, range(gpus))),
@@ -270,6 +282,7 @@ def calibration(out, atom_args, config) -> str:
     words += map(shlex.quote, [str(CALIBRATE), str(Path(out).resolve()), *planned])
     return (
         " ".join(words)
+        + unheld
         + untraced
         + "\n  expected time: unknown, as calibrate.sh records no calibration's time"
     )

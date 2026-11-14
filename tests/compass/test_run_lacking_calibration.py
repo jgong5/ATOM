@@ -3,7 +3,8 @@
 `calibrate.sh` command that records and fits one for the configuration: a
 first-turn record for each decode rung it schedules, at that rung's batch on
 every DP rank, then the trace runs where `compass record --trace` takes one,
-on the cards ATOM's ranks use; then its expected time, unknown.
+on the cards ATOM's ranks use; then each client variable it requires that the
+environment does not set; then its expected time, unknown.
 
 The deployment is `test_run_step_grid`'s, at the ladder and bounds a test
 sets, checked as `test_run_lacking_rungs` checks it; the printed command runs
@@ -38,6 +39,13 @@ TP8 = ["-tp", "8", "--max-num-seqs", "512", "--max-num-batched-tokens", "16384"]
 #: A token no store entry has.
 ABSENT = "0123456789ab"
 UNKNOWN = "expected time: unknown, as calibrate.sh records no calibration's time"
+
+
+@pytest.fixture(autouse=True)
+def clients(monkeypatch):
+    """The clients' variables `calibrate.sh` requires, set at `--check`."""
+    monkeypatch.setenv("TRACES", "/cc/traces.jsonl")
+    monkeypatch.setenv("AIPERF_PYTHON", "/real/python")
 
 
 def printed(tmp_path, monkeypatch, capsys, atom_args, *flags, law=None, **config):
@@ -126,6 +134,42 @@ def test_the_eager_rung_is_recorded_at_the_scheduler_s_bound(
     assert env["GPU"] == "0"
 
 
+def test_the_command_takes_every_rank_s_card_under_the_keyed_environment(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("GPU_MAX_HW_QUEUES", "5")
+    _, command, _ = printed(tmp_path, monkeypatch, capsys, ["-dp", "2", "-tp", "4"])
+
+    env, *_ = parts(command)
+    assert env["GPU"] == "0,1,2,3,4,5,6,7"
+    assert env["GPU_MAX_HW_QUEUES"] == "5"
+
+
+@pytest.mark.parametrize(
+    "given", [{"TRACES": None, "AIPERF_PYTHON": None}, {"AIPERF_PYTHON": ""}]
+)
+def test_each_client_variable_this_environment_does_not_set_is_named(
+    tmp_path, monkeypatch, capsys, given
+):
+    # calibrate.sh refuses an empty value as it refuses an unset one.
+    for name, value in given.items():
+        if value is None:
+            monkeypatch.delenv(name)
+        else:
+            monkeypatch.setenv(name, value)
+    _, command, after = printed(tmp_path, monkeypatch, capsys, ["-tp", "2"])
+
+    env, *_ = parts(command)
+    assert [k for k in lacking.CLIENT_ENV if k in env] == [
+        k for k in lacking.CLIENT_ENV if k not in given
+    ]
+    named = (
+        f"before it runs, set {' and '.join(given)}, which calibrate.sh requires "
+        "and this environment does not set"
+    )
+    assert after == [named, UNKNOWN]
+
+
 def test_an_argument_calibrate_sh_would_split_prints_why_in_place_of_a_command(
     tmp_path, monkeypatch, capsys
 ):
@@ -143,8 +187,6 @@ def test_the_printed_command_runs_as_printed(tmp_path, monkeypatch, capsys):
     _tree(tmp_path)
     stub = tmp_path / "ATOM" / "scripts" / "compass" / "calibrate.sh"
     monkeypatch.setattr(lacking, "CALIBRATE", stub)
-    monkeypatch.setenv("TRACES", "/cc/traces.jsonl")
-    monkeypatch.setenv("AIPERF_PYTHON", "/real/python")
     o, atom_args = tmp_path / "o", ["-tp", "2", "--max-num-seqs", "2"]
     bounds = {"capture_sizes": [1, 2, 4], "max_num_seqs": 2}
     _, command, _ = printed(
