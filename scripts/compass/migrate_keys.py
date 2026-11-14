@@ -1,22 +1,30 @@
 # SPDX-License-Identifier: MIT
-"""Move artifacts keyed by a machine-spec digest to keys that state their platform.
+"""Move artifacts to their keys of today: a key that states its platform, not a
+machine-spec digest, and an `op_measurement` key that holds the parallel layout
+only for a collective leaf.
 
-    python3 scripts/compass/migrate_keys.py --machines DIR [--store OLD NEW] [--laws DIR]
+    python3 scripts/compass/migrate_keys.py [--machines DIR] [--store OLD NEW] [--laws DIR]
 
 A key used to state `machine_spec`, the digest of one spec's device, software
 stack and PTL state; it now states each platform field its kind's row marks,
 by value. A digest is read back as the platform of the spec in `--machines` it
-names, and an entry or law whose digest names none is listed and left as it
-is. Specs that differ in torch alone share a digest, which then names only the
+names, and an entry or law whose digest names none, any with no `--machines`,
+is listed and left as it is. Specs that differ in torch alone share a digest, which then names only the
 fields they agree on: an entry or law whose kind keys torch is listed.
+
+An `op_measurement` key used to state the parallel layout of every point; it
+now holds it in the point's digest for a leaf on a process group alone
+(`measure ops`' `point_key`), so any other leaf's point answers at every layout. Each point is
+republished as `measure ops` publishes one, its first rank's member at one
+rank.
 
 `--store OLD NEW` republishes every entry of the store OLD into NEW at its key
 of today, its members, provenance, gates and fingerprints as they are, its
 notes stating the key and the entry digest it came from. An entry that states
 no digest takes the platform fields its key lacks from the readings its
 fingerprints recorded. An entry listed is one whose platform is not known, whose
-fingerprints are not the ones its kind's rows record today, or that NEW
-refuses, each with the reason.
+fingerprints are not the ones its kind's rows record today, a point whose
+digest is not its record's, or one NEW refuses, each with the reason.
 
 `--laws DIR` rewrites each law file there in place: its `machine_spec` becomes
 its `platform`, and its host key's the platform fields a `host_laws` key states.
@@ -47,8 +55,10 @@ from atom.compass.artifacts import (
     fingerprint,
     keyed_platform,
     machine_platform,
+    member_name,
     rows_for,
 )
+from atom.compass.artifacts.keys import LAYOUT
 from atom.compass.spec import MachineSpec
 
 #: The key field that stated the digest.
@@ -106,7 +116,9 @@ def law(path: Path, known: dict) -> str:
     return f"MOVED {path.name}"
 
 
-def entry(directory: Path, known: dict, into: ArtifactStore, machines: Path) -> str:
+def entry(
+    directory: Path, known: dict, into: ArtifactStore, machines: Path | None
+) -> str:
     """Republish the entry in `directory` into `into` at its key of today."""
     raw = (directory / "entry.json").read_bytes()
     document = json.loads(raw)
@@ -119,11 +131,19 @@ def entry(directory: Path, known: dict, into: ArtifactStore, machines: Path) -> 
     }
     if OLD in stated:
         if stated[OLD] not in known:
-            return f"LISTED {where}: digest {stated[OLD]} names no spec in {machines}"
+            specs = f"in {machines}" if machines else "with no --machines"
+            return f"LISTED {where}: digest {stated[OLD]} names no spec {specs}"
         platform = known[stated[OLD]]
     else:
         platform = {name: read.value for name, read in cells.items()}
     values = {k: v for k, v in stated.items() if k != OLD}
+    topology = Topology.from_mapping(document["topology"])
+    members = {n: (directory / n).read_bytes() for n in document["members"]}
+    if kind is Kind.OP_MEASUREMENT and LAYOUT[0] in values:
+        try:
+            values, topology, members = _unlayered(values, topology, members)
+        except (KeyError, ValueError) as why:
+            return f"LISTED {where}: {type(why).__name__}: {why}"
     missing = [f for f in KEY_FIELDS[kind] if f not in values and f not in platform]
     if missing:
         why = (
@@ -145,10 +165,10 @@ def entry(directory: Path, known: dict, into: ArtifactStore, machines: Path) -> 
         into.publish(
             key,
             provenance=Provenance.from_json(document["provenance"]),
-            topology=Topology.from_mapping(document["topology"]),
+            topology=topology,
             conditions=conditions,
             gates=GateState.from_json(document["gates"]),
-            members={n: (directory / n).read_bytes() for n in document["members"]},
+            members=members,
             notes="\n".join(filter(None, (document["notes"], origin))),
         )
     except ArtifactRefusal as refused:
@@ -156,13 +176,35 @@ def entry(directory: Path, known: dict, into: ArtifactStore, machines: Path) -> 
     return f"MOVED {where} -> {key.token()}"
 
 
+def _unlayered(values: dict, topology: Topology, members: dict) -> tuple:
+    """An `op_measurement` key, `values`, that states its parallel layout, and
+    the topology and members its entry holds, as `measure ops` publishes them
+    today: the layout in the point digest of a leaf on a group alone, and the point at
+    one rank, its first rank's member; refused when the point's digest is not
+    its record's."""
+    from atom.compass.bench.ops import on_group, point_digest
+
+    layout = {f: values[f] for f in LAYOUT}
+    values = {k: v for k, v in values.items() if k not in LAYOUT}
+    first = members[member_name("point", topology.ranks()[0], "json")]
+    record = json.loads(first)
+    ran = record["shape"], record["context"], record["leaf"]
+    if (digest := point_digest(*ran)) != values["point"]:
+        raise ValueError(f"its point's digest is not its record's, {digest}")
+    if on_group(record["leaf"], "exchange" in record):
+        values["point"] = point_digest(*ran, layout)
+    one = Topology()
+    return values, one, {member_name("point", one.ranks()[0], "json"): first}
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--machines", type=Path, required=True, metavar="DIR")
+    p.add_argument("--machines", type=Path, metavar="DIR")
     p.add_argument("--store", nargs=2, metavar=("OLD", "NEW"))
     p.add_argument("--laws", type=Path, metavar="DIR")
     args = p.parse_args(argv)
-    known, lines = platforms(args.machines), []
+    known = platforms(args.machines) if args.machines else {}
+    lines = []
     if args.store:
         old, into = Path(args.store[0]), ArtifactStore(args.store[1])
         for directory in sorted(old.glob("*/[!.]*")):

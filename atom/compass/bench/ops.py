@@ -92,12 +92,19 @@ argument's, its activations fresh on every copy, a lifted call's sequence a tupl
 A leaf whose operator cannot run, or that copies to the host or with host
 memory ATOM keeps pageable (`_pageable`), refuses by name.
 On one GPU at a DP-attention layout, the runner is one DP rank's own, TP 1 and DP 1, the
-graphs read and the keys written keep the layout, and a collective leaf
+graphs read and the lines written keep the layout, and a collective leaf
 refuses: it is measured across the layout's ranks, where a DP all-gather's
 `x` holds each rank's own `sizes` entry's rows, the capture's being rank 0's
 (`_own_rows`).
 A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
+MORI's dispatch and combine are methods of a handle no graph holds: each is
+called at MORI's entry point on the handle ATOM builds for the model's MoE,
+with the leaf's arguments, and, since neither runs twice in a row, timed
+through graphs that keep MORI's order (`_Mori`): a combine alone on one
+dispatch's rows, their count restored before each call, less that restore;
+a dispatch as rounds of it and a combine, less that combine alone. The point
+records each graph's median (`parts_ns`), and its kernels are the leaf's own.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, a KV
 argument's as many entries of its widest-strided dimension, on a tie the
@@ -164,10 +171,13 @@ device faulted (`_alive`); one that dies ends every rank, keeps the points
 every rank finished, the point it was measuring refuses, and new ones measure
 the rest; two in a row that die having finished no point fail the run.
 
-DIR gets run.json, the run's identity, and ops.jsonl, one line per point. S
-gets each measured point as an `op_measurement`, keyed by the model, the
-parallel layout, the device, stack, PTL state and torch run.json reads, the
-source root and the point.
+DIR gets run.json, the run's identity, and ops.jsonl, one line per point, those
+S held already among them, each with its store token and the run's parallel
+layout. S gets each
+measured point as an `op_measurement`, keyed by the model, the device, stack,
+PTL state and torch run.json reads, the source root and the point, the layout
+only for a leaf on a process group (`point_key`): a point of any other leaf answers at
+every layout, and one S holds is not measured again.
 
 `--plan` measures, in rounds, the points the steps of record directories call
 for (`record`'s or `trace steps`' output), under `--enable-tbo` a step its DP
@@ -215,7 +225,8 @@ is not halved over its tokens, and is filled only at a token count its own
 points hold, on their graph, as `trace ops` traces such a shape only at a
 record's step. DIR gets each round's ops.jsonl in `round<n>`, a run
 resumed into DIR numbering on from the last round there, and after each round
-every point held, a measured one with its store token, in plan.jsonl.
+every point held, a measured one with its store token and the run's layout,
+in plan.jsonl, those S held before the run among them.
 
 `--coverage` counts the steps of record directories, read as `--plan` reads
 them, that DIR's plan.jsonl covers (`coverage`), with the `op_graph`s of the
@@ -269,6 +280,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.op_graph import DRAFT, DRAFT_KV, KV, PERMILLE
 from atom.compass.bench.routing import uniform_ids
+from atom.compass.capture.peers import MORI
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.compass.run.modules import LAYER
 from atom.utils.arg_parser import FlexibleArgumentParser
@@ -610,6 +622,8 @@ SNAPSHOTS = "v_cache"
 SEED = 0
 #: An integer dtype of each element size, which compares a tensor's bits.
 BITS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+#: The values an element of a packed dtype holds, by dtype; one elsewhere.
+PACKED = {torch.float4_e2m1fn_x2: 2}
 #: The rank `trace ops` writes an `op_graph`'s members at, which `graph` reads.
 RANK = Topology().ranks()[0]
 #: The runner's metadata builders the KV allocation may bind on: DeepSeek-V4.1's
@@ -685,19 +699,20 @@ def main(argv: list[str]) -> None:
     with quiet(args.gpu, out):
         run = identity(out / "engine.json", config.model, command, args.gpu)
         (out / "run.json").write_text(json.dumps(run))
-        key, held = keys(config, run), 0
+        key, held = keys(config, run), []
         if args.plan:
             command, atom_args = " ".join(command), argv[cut + 1 :]
             return plan(store, key, config, run, args, command, out, atom_args)
         for shape, context, found in todo:
-            for sig in list(found):
-                if store.directory_for(key(shape, context, sig)).exists():
+            for sig, (op, _) in list(found.items()):
+                at = key(shape, context, sig, exchange(op) is not None)
+                if store.directory_for(at).exists():
                     del found[sig]
-                    held += 1
-        print(f"{held} points already in the store", flush=True)
+                    held.append(_stored(store, at, shape))
+        print(f"{len(held)} points already in the store", flush=True)
         todo = [point for point in todo if point[2]]
         results = _measured(config, todo, args.llc_mib << 20, len(args.gpu))
-    publish(store, key, config, run, " ".join(command), results, out)
+    publish(store, key, config, run, " ".join(command), results, out, held)
     refused = [
         f"{r['op']} at {r['shape']}: {r['refused']}" for r in results if "refused" in r
     ]
@@ -1054,6 +1069,8 @@ class Stub:
         self.shared = self.topk.get("topk_ids")
         # a point's real MoE rows, its ranks and the rows its MoE runs (`point`)
         self.loads, self.real = [], None
+        # what ATOM builds for MORI's exchange, once a MORI leaf asks (`_mori`)
+        self.mori = None
         # DeepSeek-V4.1's compress ratios by the rows a page holds at each
         geometry = getattr(runner, "attn_metadata_builder", None)
         geometry = getattr(geometry, "geometry", None)
@@ -1697,7 +1714,9 @@ class Stub:
         none of a call its cold graph timed. Every rank's graph holds the most K
         any rank's call gives, and a leaf any rank refuses, every rank does; K
         past a leaf's occurrences, where later ones take a `QUERIED` buffer, a
-        multiple of them."""
+        multiple of them. A MORI leaf is timed at MORI's entry point through
+        graphs of its own (`_Mori`), each one's median kept (`parts_ns`); a
+        combine's routing is its first copy's."""
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
 
@@ -1716,7 +1735,12 @@ class Stub:
                 f"a copy with pageable host memory, {path}, which ATOM allocates "
                 "and no CUDA graph captures"
             )
-        fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
+        if op["op"].startswith(MORI):  # a method of a handle no graph holds
+            with refused_together():
+                fn = self._mori(op)
+        else:
+            fn = _function(op["op"])
+        m = self.cold_copies.get(sig, n)
         self.loads, self.built = [], {}
         if self.flush is None:
             self.flush = torch.empty(
@@ -1756,10 +1780,10 @@ class Stub:
                     calls.append(self._reweigh(op, sig, calls[c % n], c))
             n = len(calls)
             cycle = [calls[i % n] for i in range(k)]
-            cold = _replay(fn, cycle, self.flush)
+            cold, parts = _timed(fn, cycle, self.flush)
             # warm: call i on its cold call's occurrence's first copy (`QUERIED`)
             warm = [calls[i % n % o] for i in range(k)]
-            warm = _replay(fn, warm) if n > 1 and k == CALLS else None
+            warm = _timed(fn, warm)[0] if n > 1 and k == CALLS else None
             # two profiles that named nothing of a call its graph timed missed it
             if agreed(int(not kernels and any(cold)), cpu_group(), most=True):
                 forward_context._forward_context = calls[0][1]
@@ -1767,9 +1791,11 @@ class Stub:
         finally:
             forward_context._forward_context = forward_context.ForwardContext()
         medians = statistics.median(cold), warm and statistics.median(warm)
-        scratch = {}
+        scratch = {} if parts is None else {"parts_ns": parts}
         if op["op"] in TOPK_WORKSPACE:
             scratch["workspace_bytes"] = calls[0][0]["workspace"].nbytes
+        if isinstance(fn, _Mori) and fn.combines:  # every copy on the first's routing
+            self.loads = self.loads[:1]
         return scratch | {
             "kernels": kernels,
             "grids": grids,
@@ -1947,6 +1973,51 @@ class Stub:
             ids = ids[~pad]
         self.loads.append(torch.bincount(ids.flatten(), minlength=experts).tolist())
         return out
+
+    def _mori(self, op) -> "_Mori":
+        """`_Mori` for the MORI leaf `op` on the handle ATOM builds for the
+        model's first MoE layer, as its loader's `init_prepare_finalize`
+        builds it, once; refused by name where ATOM builds none, or one for
+        another EP width, hidden size or count of experts a token than the
+        leaf states, its hidden size the values a row of its `input` holds."""
+        from atom.model_ops.moe import FusedMoEMethodBase
+
+        if self.mori is None:
+            name, layer = next(
+                (
+                    (name, m)
+                    for name, m in self.modules.items()
+                    if isinstance(getattr(m, "quant_method", None), FusedMoEMethodBase)
+                ),
+                (None, None),
+            )
+            if layer is None:
+                raise ValueError(
+                    "the model has no MoE layer to build MORI's handle for"
+                )
+            method = layer.quant_method
+            made = FusedMoEMethodBase._maybe_make_prepare_finalize(
+                method.moe,
+                method.get_fused_moe_quant_config(layer),
+                method.routed_rows_wire,
+            )
+            if not getattr(made, "_mori_ops", None):
+                raise ValueError(
+                    f"ATOM builds {type(made).__name__} for {name}, not MORI"
+                )
+            self.mori = made, method.moe.in_dtype
+        made, dtype = self.mori
+        handle, args = made._mori_ops[0], op["args"]
+        c, sent = handle.config, args["input"]
+        built = c.world_size, c.hidden_dim, c.num_experts_per_token
+        hidden = sent["shape"][1] * PACKED.get(_dtype(sent["dtype"]), 1)
+        stated = args["num_ep_ranks"], hidden, args["indices"]["shape"][1]
+        if built != stated:
+            raise ValueError(
+                f"ATOM builds MORI's handle for (EP ranks, hidden, experts a "
+                f"token) {built}, and the leaf states {stated}"
+            )
+        return _Mori(op, handle, dtype)
 
     def _reweigh(self, op, sig, like, c):
         """Copy `like` of `op`'s call with the c-th weight of each weight
@@ -2615,6 +2686,109 @@ def _on_coordinator(name: str, fn):
     return call
 
 
+class _Mori:
+    """MORI's dispatch or combine leaf `op`, called at MORI's entry point on
+    `handle`, the one ATOM builds for the model's MoE (`Stub._mori`), with the
+    leaf's arguments, its stated EP width aside. A dispatch reserves rows in
+    its peers' buffers and adds the rows each received to a count there; a
+    combine reduces onto the last dispatch's routing, copies as many rows as
+    the count holds, zeroes it and meets every rank at a barrier. A dispatch
+    that follows another before a combine can reserve rows a peer has not
+    yet released, and a combine after a combine copies no rows, so a call
+    (`__call__`) keeps the leaf's own (`own`) in MORI's order (`before`,
+    `after`):
+
+    * a dispatch's call is a round: it, then a combine of its rows from a
+      buffer as ATOM's experts write one, of `dtype`;
+    * a combine's call first fills the count of one dispatch back in
+      (`_restore`): the first call's, made at once, and again after a round.
+      A combine's own dispatch sends zeros at the handle's format, as many
+      rows as the combine's ids, and every copy reduces onto its routing.
+
+    `parts` are the graphs the leaf is timed by, each signed: a combine, its
+    calls less the fill alone (`fill`); a dispatch, its rounds less a combine
+    of its first copy's rows after the fill (`alone`), plus the fill."""
+
+    def __init__(self, op, handle, dtype):
+        self.handle, self.dtype = handle, dtype
+        self.combines = op["op"].endswith(".combine")
+        # the last dispatch's count; the ids and count a combine restores
+        self.received = self.routed = self.out = None
+        self.parts = [("combine", 1, self), ("fill", -1, self.fill)]
+        if not self.combines:
+            self.parts = [("round", 1, self), ("combine", -1, self.alone)]
+            self.parts.append(("fill", 1, self.fill))
+
+    def __call__(self, **kwargs):
+        self.before(**kwargs)
+        self.own(**kwargs)
+        self.after(**kwargs)
+
+    def before(self, **kwargs):
+        if self.combines:
+            self._restore(kwargs)
+
+    def own(self, **kwargs):
+        if self.combines:
+            self.handle.combine(**self._called(kwargs) | {"indices": self.routed[0]})
+        else:
+            self._dispatch(kwargs)
+
+    def after(self, **kwargs):
+        if not self.combines:
+            self._combine(kwargs, kwargs["indices"])
+
+    def alone(self, **kwargs):
+        self._restore(kwargs)
+        self._combine(kwargs, self.routed[0])
+
+    def fill(self, **kwargs):
+        """The count zeroed, as a combine leaves it for the next dispatch."""
+        self.received.fill_(0)
+
+    def _dispatch(self, kwargs):
+        self.received = self.handle.dispatch(**self._called(kwargs))[-1]
+        self.routed = None  # its routing is the one a combine now reduces onto
+
+    def _restore(self, kwargs):
+        if self.routed is None:
+            sent = self._sent(kwargs) if self.combines else kwargs
+            self._dispatch(sent)
+            self.routed = sent["indices"], int(self.received)
+        self.received.fill_(self.routed[1])
+
+    @staticmethod
+    def _called(kwargs) -> dict:
+        return {k: v for k, v in kwargs.items() if k != "num_ep_ranks"}
+
+    def _sent(self, kwargs) -> dict:
+        """The dispatch whose rows a combine's `kwargs` reduce: its ids, and
+        zero bits at the handle's format, a packed one's values packed, its
+        scales by their byte size."""
+        c, ids = self.handle.config, kwargs["indices"]
+        zeros = functools.partial(torch.zeros, device=ids.device)
+        scales = None
+        if c.scale_dim:
+            scales = zeros(len(ids), c.scale_dim, dtype=BITS[c.scale_type_size])
+        width = c.hidden_dim // PACKED.get(c.data_type, 1)
+        sent = zeros(len(ids), width, dtype=BITS[c.data_type.itemsize])
+        return kwargs | {
+            "input": sent.view(c.data_type),
+            "weights": zeros(ids.shape, dtype=torch.float32),
+            "scales": scales,
+        }
+
+    def _combine(self, kwargs, indices):
+        """A combine onto `indices` of the experts' output for every rank's
+        rows, the most a rank receives, at the dispatch's launch counts."""
+        c, device = self.handle.config, indices.device
+        rows = len(indices) * c.world_size
+        if self.out is None or len(self.out) < rows:
+            self.out = torch.zeros(rows, c.hidden_dim, dtype=self.dtype, device=device)
+        launch = {k: kwargs[k] for k in ("block_num", "warp_per_block") if k in kwargs}
+        self.handle.combine(self.out, None, indices, **launch)
+
+
 def _identity(fn, kwargs, timed=False) -> tuple[list[str], list, float]:
     """`_kernels` of one call of `fn`, memory copies aside, with their grids,
     once two profiles in a row name the same kernels on every rank, at most
@@ -2646,14 +2820,20 @@ def _kernels(fn, kwargs) -> tuple[list[str], list, float]:
     rank together (`_together`), once the device has finished `_together`'s
     all-reduce, which would otherwise join the call's kernels. Kineto states
     a launch's grid in the profile's chrome trace alone, so all three are
-    read from it; a memory set or copy has no grid."""
+    read from it; a memory set or copy has no grid. Of a MORI leaf, its own
+    call alone, with MORI's order kept around the profile (`_Mori`)."""
     from torch.profiler import ProfilerActivity, profile
 
+    mori = isinstance(fn, _Mori)
+    if mori:
+        fn.before(**kwargs)
     _together()
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        fn(**kwargs)
+        (fn.own if mori else fn)(**kwargs)
         torch.cuda.synchronize()
+    if mori:
+        fn.after(**kwargs)
     with tempfile.TemporaryDirectory() as tmp:
         prof.export_chrome_trace(f"{tmp}/trace.json")
         events = json.loads(Path(tmp, "trace.json").read_text())["traceEvents"]
@@ -2663,6 +2843,17 @@ def _kernels(fn, kwargs) -> tuple[list[str], list, float]:
     ns = 1e3 * sum(e["dur"] for e in kernels)
     named = kernels or device
     return [e["name"] for e in named], [e["args"].get("grid") for e in named], ns
+
+
+def _timed(fn, calls, flush=None) -> tuple[list[float], dict | None]:
+    """Each timed replay of one graph of `calls` (`_replay`); of a MORI leaf,
+    timed through several graphs (`_Mori.parts`), each replay's signed sum
+    over them, and each graph's median by name."""
+    if not isinstance(fn, _Mori):
+        return _replay(fn, calls, flush), None
+    got = {name: (sign, _replay(part, calls, flush)) for name, sign, part in fn.parts}
+    times = [sum(sign * t[i] for sign, t in got.values()) for i in range(REPEATS)]
+    return times, {name: statistics.median(t) for name, (_, t) in got.items()}
 
 
 def _replay(fn, calls, flush=None) -> list[float]:
@@ -3018,33 +3209,75 @@ def _fields(held):
 
 
 def keys(config, run: dict):
-    """The `op_measurement` key of a point, `(shape, context, leaf)`, measured
-    under `config` on the platform `run` reads."""
-    from atom.compass.artifacts.keys import LAYOUT, keyed_platform, platform_of
+    """`point_key` of a point measured under `config` on the platform `run`
+    reads: `key(shape, context, leaf, collective=False)`."""
+    from atom.compass.artifacts.keys import keyed_platform, platform_of
     from atom.compass.fit.samples import run_fields
-    from atom.compass.run.memory import key_fields
 
     fields = run_fields(run)
     platform = platform_of(fields["device"], run["stack"], run["ptl"])
-    layout = {k: v for k, v in key_fields(config).items() if k in LAYOUT}
-
-    def key(shape, context, leaf) -> Key:
-        point = json.dumps([str(shape), context, leaf]).encode()
-        return Key.of(
-            Kind.OP_MEASUREMENT,
-            model=fields["model"],
-            **layout,
-            **keyed_platform(Kind.OP_MEASUREMENT, platform),
-            source_root=fields["source_root"],
-            point="sha256:" + hashlib.sha256(point).hexdigest(),
-        )
-
-    return key
+    stated = {"model": fields["model"], "source_root": fields["source_root"]}
+    stated |= keyed_platform(Kind.OP_MEASUREMENT, platform)
+    return functools.partial(point_key, stated, layout_of(config))
 
 
-def publish(store, key, config, run: dict, command: str, results, out: Path):
-    """Write `results` to ``ops.jsonl`` in `out` and each measured one to
-    `store` at its `key`."""
+def layout_of(config) -> dict:
+    """The parallel layout `config` resolves, as a key states it."""
+    from atom.compass.artifacts.keys import LAYOUT
+    from atom.compass.run.memory import key_fields
+
+    return {k: v for k, v in key_fields(config).items() if k in LAYOUT}
+
+
+#: How a leaf's `signature`, compact JSON, shows the process group it runs on:
+#: an argument naming it, as aiter's all-reduces and fused all-reduce norms and
+#: torch's functional collectives each take one; or an operator ATOM runs on
+#: its TP group naming none, its all-reduce under two-batch overlap
+#: (`atom.model_ops.module_dispatch_ops.tbo_all_reduce`).
+ON_GROUP = ('"group_name":', '"op":"aiter.tbo_all_reduce.')
+
+
+def on_group(leaf: str, collective=False) -> bool:
+    """Whether the leaf of signature `leaf` runs on a process group: a
+    `collective` (`exchange`), some of which the capture lifts with their
+    group dropped, or one its signature shows on a group (`ON_GROUP`)."""
+    return collective or any(mark in leaf for mark in ON_GROUP)
+
+
+def point_key(fields, layout, shape, context, leaf, collective=False) -> Key:
+    """The `op_measurement` key of the point `(shape, context, leaf)` measured
+    at `fields`, its model, platform and source root, its digest holding the
+    parallel `layout` only when the leaf runs on a process group (`on_group`):
+    a group is named by its role (`tp:0`), not by its ranks, while any other
+    leaf's signature holds the shapes the layout gives it, so its point
+    answers at every layout."""
+    grouped = on_group(leaf, collective)
+    point = point_digest(shape, context, leaf, layout if grouped else None)
+    return Key.of(Kind.OP_MEASUREMENT, **fields, point=point)
+
+
+def point_digest(shape, context, leaf, layout=None) -> str:
+    """The digest of a point an `op_measurement` key holds, of `layout` too
+    when it is not None."""
+    point = [str(shape), context, leaf] + ([] if layout is None else [layout])
+    text = json.dumps(point, sort_keys=True).encode()
+    return "sha256:" + hashlib.sha256(text).hexdigest()
+
+
+def _stored(store, at, shape) -> dict:
+    """The point `store` holds at `at`, asked at `shape`: with the asking
+    shape's micro-batch mark alone, since the point's key holds no TBO switch
+    and a store may hold it from before records kept one."""
+    entry = store.read(at)
+    point = json.loads(entry.read_member("point", entry.topology.ranks()[0], "json"))
+    point.pop("micro_batch", None)
+    return point | ({"micro_batch": True} if shape.micro_batch else {})
+
+
+def publish(store, key, config, run: dict, command: str, results, out: Path, held=()):
+    """Write `held`, points `store` held, and `results` to ``ops.jsonl`` in
+    `out`, each with its store token and `config`'s layout, and each measured
+    one of `results` to `store` at its `key`."""
     from atom.compass.fit.publish import conditions, ranks
     from atom.compass.fit.samples import run_fields
     from atom.compass.run.step_grid import keyed
@@ -3055,11 +3288,14 @@ def publish(store, key, config, run: dict, command: str, results, out: Path):
     )
     roots = roots_for({"atom": "atom", "aiter": "aiter"})
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    layout = layout_of(config)
     with (out / "ops.jsonl").open("w") as lines:
-        for record in results:
-            at = key(record["shape"], record["context"], record["leaf"])
-            lines.write(json.dumps(record | {"token": at.token()}) + "\n")
-            if "refused" not in record:
+        for n, record in enumerate([*held, *results]):
+            point = record["shape"], record["context"], record["leaf"]
+            at = key(*point, "exchange" in record)
+            line = record | {"token": at.token(), "layout": layout}
+            lines.write(json.dumps(line) + "\n")
+            if n >= len(held) and "refused" not in record:
                 body, every = json.dumps(record).encode(), ranks(at)
                 store.publish(
                     at,
@@ -3127,11 +3363,12 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     )
     rungs = [decode(r) for r in schedulable_ladder(config)]
     graphs, done, tried = {}, {}, set()
-    prefills, cached = set(), defaultdict(list)
+    prefills, cached, step_tokens = set(), defaultdict(list), defaultdict(set)
     for s, line in steps:
         if s.phase == "prefill":
             prefills.add(s)
             cached[s.seqs] += _cached(line)
+            step_tokens[s.seqs].add(s.tokens)
     # one that is a step's shape too is measured whole, as that step's
     own = {s: outputs for s, outputs in own.items() if s not in prefills}
     # first, so a graph only `trace ops --population` traces refuses before any
@@ -3172,7 +3409,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     prefills |= {s for s in moved if s.phase == "prefill"}
     # a run resumed into `out` keeps the rounds an earlier one wrote there
     rounds = [int(d.name[5:]) for d in out.glob("round*") if d.name[5:].isdigit()]
-    first = max(rounds, default=-1) + 1
+    first, layout = max(rounds, default=-1) + 1, layout_of(config)
 
     def measure_round(want, n):
         dependent = _dependent(done.values())
@@ -3188,15 +3425,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     and fam not in families
                 ):
                     continue
-                if store.directory_for(at := key(shape, context, sig)).exists():
-                    entry = store.read(at)
-                    held = entry.read_member("point", entry.topology.ranks()[0], "json")
-                    # the asking shape's mark alone: the point's key holds no TBO
-                    # switch, and a store may hold it from before records kept one
-                    point = json.loads(held)
-                    point.pop("micro_batch", None)
-                    mark = {"micro_batch": True} if shape.micro_batch else {}
-                    done[str(shape), context, sig] = point | mark
+                at = key(shape, context, sig, exchange(op) is not None)
+                if store.directory_for(at).exists():
+                    done[str(shape), context, sig] = _stored(store, at, shape)
                 else:
                     found[sig] = op, instances
             todo += [(shape, context, found)] if found else []
@@ -3211,7 +3442,8 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         with (out / "plan.jsonl").open("w") as lines:
             for r in done.values():
                 if "refused" not in r:  # a refused point is not in the store
-                    r = r | {"token": key(r["shape"], r["context"], r["leaf"]).token()}
+                    at = key(r["shape"], r["context"], r["leaf"], "exchange" in r)
+                    r = r | {"token": at.token(), "layout": layout}
                 lines.write(json.dumps(r) + "\n")
 
     decodes = [
@@ -3293,8 +3525,9 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         measure_round(want, n)
         n += 1
         want = cached_ladder(top_only=False) if n == 2 else {}
-        families = _families(done.values(), _dependent(done.values()))
-        want = want or _densify(families, tried)
+        dependent = _dependent(done.values())
+        families = _families(done.values(), dependent)
+        want = want or _densify(families, tried, step_tokens, dependent)
         want = want or _filled(families, tried, config.max_model_len)
     kinds = Counter(r["op"] for r in done.values() if "refused" not in r)
     print(json.dumps({"points per leaf kind": dict(kinds.most_common())}, indent=1))
@@ -3608,18 +3841,6 @@ def _shape(text: str):
     return shape._replace(width=n.get("W"), real=n.get("R"))
 
 
-def _abstract(value, n: int):
-    """`value` with every int equal to `n` replaced by ``"T"``."""
-    # ponytail: an unrelated int equal to n (a stride of 1 at T = 1) is
-    # abstracted too, so that shape's leaf joins another family and its
-    # points bracket nothing; symbolic slots in the contract would end it.
-    if isinstance(value, dict):
-        return {k: _abstract(v, n) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_abstract(v, n) for v in value]
-    return "T" if type(value) is int and value == n else value
-
-
 #: Leaf kinds that exchange rows between ranks (`exchange`).
 COLLECTIVES = (
     "atom.model_ops.moe:",
@@ -3672,13 +3893,15 @@ def _family(shape, context, op: str, sig: str, dependent: dict):
     when its kind depends on context, as its prefill points read it, else its
     decode points, else by default, a shape that states G apart from one that
     does not, as `fit ops` keeps them; a collective over its message bytes
-    (`exchange`)."""
+    (`exchange`). A prefill leaf reads as `fit.ops.prefill_leaf` reads it."""
     if op.startswith(COLLECTIVES):
         return tuple(exchange(json.loads(sig)))
     if shape.phase == "decode":
         context, mean = _split(context)
         return json.dumps([str(shape), sig] + ([mean] if mean else [])), context
-    leaf = _abstract(json.loads(sig), shape.tokens)
+    from atom.compass.fit.ops import prefill_leaf
+
+    leaf = prefill_leaf(json.loads(sig), shape.tokens)[0]
     head = "prefill" if shape.gathered is None else "prefill G"
     if not dependent.get(("prefill", op), dependent.get(op, True)):
         rows = shape.seqs if dependent.get(("rows", op), True) else None
@@ -3778,7 +4001,7 @@ def _band(ats, lo, hi) -> slice | None:
     return None if i < 0 or j == len(ats) else slice(min(i, j), max(i, j) + 1)
 
 
-def _densify(families, tried: set) -> dict:
+def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
     """The point halfway between each two neighbours of a family, or of a
     prefill leaf's token count over cached tokens (`_cut`), more than one
     apart, unless `tried`, that launched different kernels or, in a decode
@@ -3798,7 +4021,9 @@ def _densify(families, tried: set) -> dict:
     does, is halved over cached tokens at each token count alone, where `fit
     ops` reads it after the token count. A prefill family whose shapes state G
     is not halved over its tokens: `trace ops` traces such a shape only at a
-    record's step."""
+    record's step. Any other is `_bent` on its line as `fit ops` reads it, taking
+    in a gap beside a bend each count of a step (`step_tokens`) at its rows, or
+    at any for a family stating none."""
     from atom.compass.capture.forward import decode, prefill
 
     steps = {
@@ -3823,21 +4048,48 @@ def _densify(families, tried: set) -> dict:
         at_a, at_b = ({x: k for x, k, _ in across[base, t]} for t in (a, b))
         return any(x in at_b and at_a[x] == at_b[x] for x in at_a)
 
+    # a prefill family's line as `fit ops` reads it: at any rows, unless its
+    # kind depends on context or its rows move it (`dependent`)
+    lines, moved = defaultdict(list), dependent or {}
+
+    def line(fam, points) -> str:
+        head, rows, *rest = json.loads(fam)
+        rows = rows if rest[1:] or moved.get(("rows", points[0][2].get("op"))) else 0
+        return json.dumps([head, rows, *rest])
+
+    for fam, points in families.items():
+        if json.loads(fam)[0] == "prefill":
+            lines[line(fam, points)] += points
+
     want = defaultdict(set)
     for fam, points in [*families.items(), *across.items()]:
         points = sorted(points, key=lambda p: p[0])
         decoding = points[0][2]["shape"].startswith("decode")
         # a ragged decode line is halved where it bends, not where its kind steps
         ragged = decoding and json.loads(fam)[2:]
-        if isinstance(fam, str) and _exchanged(fam):
-            sizes = [[*g] for _, g in itertools.groupby(points, key=lambda p: p[0])]
+        # a prefill family over its tokens, stating no G
+        tokened = isinstance(fam, str) and json.loads(fam)[0] == "prefill"
+        read = points  # a prefill family bends on its line as `fit ops` reads it
+        if tokened:
+            read = sorted(lines[line(fam, points)], key=lambda p: p[0])
+        if tokened or isinstance(fam, str) and _exchanged(fam):  # at each's mean
+            sizes = [[*g] for _, g in itertools.groupby(read, key=lambda p: p[0])]
             mean = (statistics.mean(p[2]["cold_ns"] for p in g) for g in sizes)
             at = ((*g[0][:2], {"cold_ns": ns}) for g, ns in zip(sizes, mean))
             bent = _bent([*at]) if len(sizes) > 2 else ()  # no line under three
         else:
             bent = _bent(points, () if ragged else steps) if decoding else ()
         cut = isinstance(fam, str) and _cut(fam)
+        at_rows = tokened and json.loads(fam)[1]  # None: a family at any rows
         for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
+            # each step's count between two points beside a bend of its line
+            if tokened and ka == kb and any(a <= x < b for x in sorted(bent)):
+                for r, held in (step_tokens or {}).items():
+                    for t in sorted(held) if at_rows in (None, r) else ():
+                        if a < t < b and (fam, t, r) not in tried:
+                            tried.add((fam, t, r))
+                            want[prefill(t, r), cut and cut[1] or None].add(fam)
+                continue
             mid = (a + b) // 2
             if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
                 continue
@@ -3874,13 +4126,18 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
     them. A family whose shapes state G reads the token counts of families
     whose shapes state G, as `fit ops` does, and is filled only at a token
     count its own points hold, on their graph: `trace ops` traces such a
-    shape only at a record's step."""
+    shape only at a record's step. So too a family of a kind free of cached
+    tokens that its rows move (`_dependent`)."""
     from atom.compass.capture.forward import prefill
     from atom.compass.fit.ops import skeleton
 
     held, skeletons, axis, own = defaultdict(set), {}, defaultdict(set), {}
+    dependent = _dependent(r for points in families.values() for *_, r in points)
     for fam, points in families.items():
-        if cut := _cut(fam):
+        kept = json.loads(fam)  # at its rows, of a kind its rows move
+        moved = dependent.get(("rows", points[0][2]["op"]))
+        cut = _cut(fam) or moved and type(kept[1]) is int and (fam, None)
+        if cut:
             head = json.loads(cut[0])[0]
             for tokens, _, record in points:
                 held[cut[0]].add((tokens, cut[1]))
@@ -3897,11 +4154,12 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
                 continue
             for c in sorted({c for u, c in at if ((base, u), c) not in tried}):
                 fam = json.dumps([*json.loads(base), c], sort_keys=True)
+                fam = base if c is None else fam
                 if (
                     not min(tokens) < t < max(tokens)
                     or (t, c) in at
                     or (fam, t) in tried
-                    or c > max_model_len - -(-t // rows)
+                    or (c or 0) > max_model_len - -(-t // rows)
                 ):
                     continue
                 tried.add((fam, t))

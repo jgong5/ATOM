@@ -1135,6 +1135,29 @@ the decode): decode readings taken on 005 sized the simulated decode 79 to 80 KV
 blocks per rank above every real decode on 013
 ([ruling](https://github.com/jgong5/ATOM/issues/1111#issuecomment-6659985920)).
 
+### MORI's dispatch and combine at EP8
+
+At EP8 each MoE layer exchanges its rows through two leaves the EP-off graphs lack,
+MORI's dispatch and combine. Like every collective, only a `measure ops` run on all
+eight GPUs measures them, and a one-GPU run refuses them. Each rank calls them at
+MORI's entry point on the handle ATOM builds for the model's first MoE layer, and a
+point records each graph it was timed by under `parts_ns` (`_Mori` in
+`atom/compass/bench/ops.py`). Trace and measure under the EP8 cell's decode
+arguments and environment above, `MORI_SHMEM_HEAP_SIZE=16G` among them, with its
+Mooncake role, here `D` and `KV`:
+
+```
+compass trace ops --model <DeepSeek-V4-Pro> --tp 8 --arch gfx950 --width 1 --width 8 \
+  --width 32 --store S -- D --kv-transfer-config KV
+compass measure ops --width 1 --width 8 --width 32 --context 8192 --llc-mib 256 \
+  --gpu 0,1,2,3,4,5,6,7 --store S --out O -- D --kv-transfer-config KV --enforce-eager --level 0
+```
+
+`measure ops` skips a point its store holds, so each repeat measures into a copy of
+the traced store of its own. `fit ops` prices both leaves over their message bytes,
+as any collective. The EP8 cells' grade is
+[#3409](https://github.com/jgong5/ATOM/issues/3409)'s.
+
 ### The inter-node link — `rdma_link.py`
 
 `rdma_link.py` times Mooncake writes from 005's GPUs into 013's over the
@@ -1256,8 +1279,11 @@ store. A record without a store touches no library.
    `MODEL`, `GPU`, `TRACES` and `AIPERF_PYTHON` set, its store
    `$R/cal/store`; it reads no platform, so it prints the tokens, the law's held-out
    errors per band and the `compass run` line of step 5 with `$M` left as `--device
-   DATASHEET --ptl PTL`. A RECORD after its concurrency names
-   the client's scenario, such as `"8 --trajectory-start-min-ratio 0
+   DATASHEET --ptl PTL`. That store holds no `platform_readings` entry, and step 5's
+   `compass run` refuses a store with none: publish one into `$R/cal/store` with
+   `compass measure device` and `compass fit device`, as the platform's bullet in
+   [QUICKSTART.md](QUICKSTART.md#environment) does, before step 5. A RECORD after its
+   concurrency names the client's scenario, such as `"8 --trajectory-start-min-ratio 0
    --trajectory-start-max-ratio 0"`, the first-turn record that gives the law
    its decode rung 8; `trace` before one makes it a trace run of that recipe.
 4. Real runs: per concurrency, two `compass record --gpu G --out

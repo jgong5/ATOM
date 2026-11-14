@@ -4,14 +4,14 @@
     compass fit ops DIR... --store S --out D
 
 Each DIR is a `measure ops --out` directory; each point its ops.jsonl, or with
-`--plan` each round's, lists as measured is read back from S, where `measure
-ops` published it. A `--plan` run resumed into a DIR keeps the rounds earlier
-runs wrote there, so DIR lists every run's points. A point a `--plan` run
-found already in S is in no round's ops.jsonl: pass the directory that
-measured it too. Every point
-must name one `price_list` key, its model, parallel layout, platform and source
-root; the price list is published at that key
-under the readings the points ran under.
+`--plan` each round's and its plan.jsonl, lists as measured is read back from
+S, where `measure ops` published it. A `--plan` run resumed into a DIR keeps
+the rounds earlier runs wrote there, so DIR lists every run's points, and its
+plan.jsonl lists the points it found already in S, measured at any layout
+when their leaf runs on no process group (`bench.ops.point_key`). Every point must
+name one model, platform and source root, and every line one parallel layout,
+the layout of the run that listed it: the price list is published at that
+`price_list` key under the readings the points ran under.
 
 A leaf's family is its signature with the integers that follow the shape
 masked. Among the points of one phase whose signatures match with every
@@ -26,7 +26,9 @@ leaf; W is no count of any other leaf's, so points at two widths stay apart.
 Where W is that prefill's T too, a leaf that leads with it may have run at
 either B: a point its family reads at two places is left out, named in the
 params' ``left_out``, and a run prices such a leaf there where either B gives
-one answer.
+one answer. A prefill leaf's signature is read first by `prefill_leaf`, so a
+leaf whose sizes DeepSeek-V4's sparse prefill derives from T is one family
+over its token counts.
 
 A family's dimensions are the shape's counts its masked integers follow, a
 decode's B always, at its T where it states one (a drafter's own leaves at the
@@ -98,6 +100,8 @@ from atom.compass.fit.samples import run_fields
 PROG = "compass fit ops"
 #: What a masked integer reads as in a family's signature.
 MASK = "#"
+#: What a prefill leaf's integer equal to its token count, or one more, reads as.
+TOKENS = ("T", "T+1")
 #: The largest held-out error a point may read and its gaps interpolate.
 LIMIT = 0.05
 
@@ -127,26 +131,36 @@ def main(argv: list[str]) -> None:
 
 def read(store, dirs) -> tuple[list[dict], dict, dict]:
     """The measured points the ops.jsonl of `dirs` list, a `--plan` run's in
-    each round<n>, as `store` holds them, their configuration, and the
-    `price_list` key fields they name."""
-    points, named, config = {}, {}, None
+    each round<n> and its plan.jsonl, as `store` holds them, their
+    configuration, and the `price_list` key fields they name: their model,
+    platform and source root at the layout each line states."""
+    points, keys, named, config = {}, {}, {}, None
     for d in dirs:
         run = json.loads((d / "run.json").read_text())
         engine = json.loads((d / "engine.json").read_text())
         config = {**run_fields(run, d / "run.json"), "engine_config": engine}
         config |= {k: run[k] for k in ("stack", "host_key", "ptl")}
         lines = sorted(d.glob("round*/ops.jsonl")) or [d / "ops.jsonl"]
+        lines += [d / "plan.jsonl"] if (d / "plan.jsonl").is_file() else []
         for line in itertools.chain(*(f.read_text().splitlines() for f in lines)):
             record = json.loads(line)
             if "refused" in record:
                 continue
-            # ponytail: a token is a scan of the kind's folder; index it if a
-            # campaign's thousands of points make the fit slow
-            key = store.key_from_token(Kind.OP_MEASUREMENT, record["token"])
-            entry = store.read(key)
-            rank = entry.topology.ranks()[0]
-            points[key] = json.loads(entry.read_member("point", rank, "json"))
-            fields = {k: v for k, v in key.values.items() if k != "point"}
+            if "layout" not in record:
+                raise ValueError(
+                    f"{d} lists {record['op']} at {record['shape']} with no "
+                    "parallel layout: list it again by a `measure ops --plan` "
+                    "run, whose plan.jsonl names each point it finds in the store"
+                )
+            if (token := record["token"]) not in keys:
+                # ponytail: a token is a scan of the kind's folder; index it if
+                # a campaign's thousands of points make the fit slow
+                keys[token] = key = store.key_from_token(Kind.OP_MEASUREMENT, token)
+                entry = store.read(key)
+                rank = entry.topology.ranks()[0]
+                points[key] = json.loads(entry.read_member("point", rank, "json"))
+            fields = {k: v for k, v in keys[token].values.items() if k != "point"}
+            fields |= record["layout"]
             named.setdefault(json.dumps(fields, sort_keys=True), d)
     if not points:
         raise ValueError("these directories list no measured point")
@@ -181,16 +195,72 @@ def _text(x) -> str:
     return json.dumps(x, sort_keys=True, separators=(",", ":"))
 
 
-def skeleton(shape: str, leaf: str) -> str:
+def prefill_leaf(leaf: dict, tokens: int, at=None) -> tuple[dict, set]:
+    """A prefill leaf's signature at `tokens` as `measure ops --plan` and `fit
+    ops` key its family, and its marks: each metadata size of a kernel's (not an
+    aten operator's) masked, as ATOM's runner sizes it from the batch, its value
+    a mark; then each integer equal to `tokens` or one more, or with `at` each at
+    a position it holds (`_tokens_at`), read as `TOKENS` says, marked "T"."""
+    # ponytail: the plan reads every int equal to T or T + 1 so, a stride of 1 at T = 1
+    marks, kernel = set(), not leaf.get("op", "").startswith("aten.")
+
+    def sized(x, inside=False):
+        if isinstance(x, list):
+            return [sized(v, inside) for v in x]
+        if isinstance(x, dict):
+            meta = kernel and x.get("role") == "metadata"
+            return {k: sized(v, inside or meta and k == "shape") for k, v in x.items()}
+        if inside and type(x) is int:
+            marks.add(x)
+            return MASK
+        return x
+
+    def read(i, v):
+        if v - tokens not in (0, 1) or at is not None and i not in at:
+            return v
+        marks.add("T")
+        return TOKENS[v - tokens]
+
+    return _walk(sized(leaf), read, [0]), marks
+
+
+def _read(shape: str, leaf: str, at=()) -> tuple[dict, set]:
+    """`leaf`'s signature at `shape` as its family reads it, and its marks."""
+    sig = json.loads(leaf)
+    if not shape.startswith("prefill"):
+        return sig, set()
+    return prefill_leaf(sig, shape_counts(shape)["T"], at)
+
+
+def _tokens_at(members) -> list[int]:
+    """The positions `prefill_leaf` reads as T in a prefill skeleton's points:
+    those whose values differ between shapes and are T or one more at a point
+    that ran its leaf at one B (`ran_counts`), so not a constant nor a W."""
+    each, held = [], {}
+    for p in members:
+        v = _ints(_read(p["shape"], p["leaf"])[0])
+        one = len(ran_counts(p["shape"], json.loads(p["leaf"]))) == 1
+        each.append((v, shape_counts(p["shape"])["T"], one))
+        held.setdefault(p["shape"], []).append(v)
+    return [
+        i
+        for i in range(len(each[0][0]))
+        if len({frozenset(v[i] for v in vs) for vs in held.values()}) > 1
+        and any(one and v[i] - t in (0, 1) for v, t, one in each)
+    ]
+
+
+def skeleton(shape: str, leaf: str, at=()) -> str:
     """The phase of `shape` and `leaf`'s signature with every integer masked."""
-    return _text([shape.split()[0], _walk(json.loads(leaf), lambda i, v: MASK, [0])])
+    sig = _walk(_read(shape, leaf, at)[0], lambda i, v: MASK, [0])
+    return _text([shape.split()[0], sig])
 
 
-def family(shape: str, leaf: str, free) -> str:
+def family(shape: str, leaf: str, free, at=()) -> str:
     """The phase of `shape`, ``G`` after it when `shape` states one, and
     `leaf`'s signature with the positions `free` holds masked: the integers
     that follow the shape."""
-    sig = _walk(json.loads(leaf), lambda i, v: MASK if i in free else v, [0])
+    sig = _walk(_read(shape, leaf, at)[0], lambda i, v: MASK if i in free else v, [0])
     head = shape.split()[0] + (" G" if "G" in shape_counts(shape) else "")
     return _text([head, sig])
 
@@ -239,7 +309,7 @@ def fit(points) -> dict:
     ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad
     every rank to the same rows and keep it; and ``left_out``, each point
     whose leaf may have run at two places in its family (`ran_counts`), by
-    its shape, operator and why."""
+    its shape, operator and why; and ``tokens`` (`_tokens_at`)."""
     from atom.compass.bench.ops import (
         DP_GROUP,
         _dependent,
@@ -267,11 +337,21 @@ def fit(points) -> dict:
             )
         else:
             groups.setdefault(skeleton(p["shape"], p["leaf"]), []).append(p)
+    # a prefill skeleton splits by where its positions read as T hold it
+    t_at, refined = {}, {}
     for skel, members in groups.items():
+        if skel.startswith('["prefill"'):
+            t_at[skel] = _tokens_at(members)
+        tokens = t_at.get(skel, ())
+        for p in members:
+            key = skeleton(p["shape"], p["leaf"], tokens)
+            refined.setdefault(key, (tokens, []))[1].append(p)
+    for skel, (tokens, members) in refined.items():
         sigs = [json.loads(p["leaf"]) for p in members]
         ran = [ran_counts(p["shape"], sig) for p, sig in zip(members, sigs)]
+        read = [_read(p["shape"], p["leaf"], tokens) for p in members]
         at: dict[str, list] = {}
-        for p, sig, counts in zip(members, sigs, ran):
+        for p, (sig, _), counts in zip(members, read, ran):
             at.setdefault(p["shape"], []).append((_ints(sig), counts))
         each = [got for vs in at.values() for got in vs]
         free_of[skel] = [
@@ -290,19 +370,23 @@ def fit(points) -> dict:
             for i in free_of[skel]
             for k in ("T", "B", "G")
             if all(any(v[i] - n.get(k, -9) in (0, 1) for n in ns) for v, ns in each)
-        }
+        } | read[0][1] & {"T"}
+        sizes = {}  # a prefill whose masked sizes move at one B follows T too
+        for (_, marks), ns in zip(read, ran):
+            sizes.setdefault(ns[0].get("B"), set()).add(frozenset(marks - {"T"}))
+        follows |= {"T"} if any(len(s) > 1 for s in sizes.values()) else set()
         ragged = {
-            family(p["shape"], p["leaf"], free_of[skel])
+            family(p["shape"], p["leaf"], free_of[skel], tokens)
             for p in members
             if _split(p["context"])[1]
         }
         padded = {
-            family(p["shape"], p["leaf"], free_of[skel])
+            family(p["shape"], p["leaf"], free_of[skel], tokens)
             for p in members
             if "R" in shape_counts(p["shape"])
         }
         for p, ns in zip(members, ran):
-            name = family(p["shape"], p["leaf"], free_of[skel])
+            name = family(p["shape"], p["leaf"], free_of[skel], tokens)
             at_p = ns[0] | {"context": _context(p)}
             if p["shape"].startswith("decode") and "T" in at_p:
                 at_p["B"] = at_p.pop("T")  # a drafter's own rows, padded to B
@@ -356,7 +440,7 @@ def fit(points) -> dict:
         if "row_bytes" in f:
             one = f["row_bytes"]
             f["row_bytes"] = one.pop() if len(one) == 1 else None
-    return {"free": free_of, "families": families, "left_out": left_out}
+    return {"free": free_of, "tokens": t_at, "families": families, "left_out": left_out}
 
 
 def _either(counts) -> str:
@@ -513,10 +597,14 @@ class PriceList(CostSource):
             return self.refuse(f"{leaf['op']}: {ran}")
         leaf, (phase, t, b, g, context, last, *real), _ = request
         kind, at = leaf["op"], {"T": t, "B": b, "G": g, "context": context}
-        shape = phase if at["G"] is None else f"{phase} G={at['G']}"
+        shape = f"{phase} T={t}" if phase == "prefill" else phase  # `_read`'s T
+        shape += "" if at["G"] is None else f" G={at['G']}"
         if ex := exchange(leaf):  # a collective: its family over its message bytes
             name, at["bytes"] = ex
             name = name if name in self.params["families"] else None
+        elif phase == "prefill" and "tokens" not in self.params:
+            why = "the price list keys prefill families as before; refit it"
+            return self.refuse(f"{kind}: {why}")
         else:
             name = self._family(shape, signature(leaf))
         if name is None:
@@ -539,9 +627,9 @@ class PriceList(CostSource):
 
     def _family(self, shape: str, sig: str) -> str | None:
         """The family of a leaf of signature `sig` at `shape`, or None."""
-
-        free = self.params["free"].get(skeleton(shape, sig))
-        name = None if free is None else family(shape, sig, free)
+        at = self.params.get("tokens", {}).get(skeleton(shape, sig), ())
+        free = self.params["free"].get(skeleton(shape, sig, at))
+        name = None if free is None else family(shape, sig, free, at)
         return name if name in self.params["families"] else None
 
     def _lookup(self, name: str, at: tuple, top) -> tuple[float, bool, bool] | str:
