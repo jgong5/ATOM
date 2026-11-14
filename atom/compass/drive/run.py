@@ -185,8 +185,14 @@ def measured(record, atom_args, ranks: int) -> list[float]:
     files = sorted(
         (Path(record) / serve.STEPS).glob(compass_run.ACCEPTANCE_FILE.format("*"))
     )
+    names = {compass_run.ACCEPTANCE_FILE.format(r) for r in range(ranks)}
+    if files and (missing := sorted(names - {p.name for p in files})):
+        raise ValueError(
+            f"--acceptance-record: {record} holds no {', '.join(missing)}, and "
+            f"ATOM's arguments run {ranks} DP ranks"
+        )
     counts = Counter()
-    for path in files:
+    for path in (p for p in files if p.name in names):
         held = json.loads(path.read_text())
         if held["draft_tokens"] != width:
             raise ValueError(
@@ -199,12 +205,6 @@ def measured(record, atom_args, ranks: int) -> list[float]:
         raise ValueError(
             f"--acceptance-record: {record} holds no accepted-draft histogram; "
             "a speculative record writes one per DP rank in its steps"
-        )
-    names = {compass_run.ACCEPTANCE_FILE.format(r) for r in range(ranks)}
-    if missing := sorted(names - {p.name for p in files}):
-        raise ValueError(
-            f"--acceptance-record: {record} holds no {', '.join(missing)}, and "
-            f"ATOM's arguments run {ranks} DP ranks"
         )
     return [sum(n for a, n in counts.items() if a > i) / rows for i in range(width)]
 
