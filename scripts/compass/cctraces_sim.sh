@@ -214,22 +214,28 @@ if [[ $MODE == 1p1d ]]; then
     [[ " $SERVER_ARGS ${PREFILL_ARGS:-} ${DECODE_ARGS:-} " == *" --enable-dp-attention "* ]] && export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
     PREFILL_PORT=$PORT bash "$ROOT/scripts/compass/pd_sim.sh" "$OUT/run.json" >"$OUT/pd_sim.log" 2>&1 &
     ready=("pd_sim: ready" "$OUT/pd_sim.log")
+    # Behind a router that is no LP, the traffic LP posts each cancel to the
+    # prefill server (compass_harness/traffic_lp.py).
+    export COMPASS_HARNESS_PREFILL_URL=http://127.0.0.1:$PORT
     PORT=$ROUTER_PORT
 else
     compass=(--compass-run "$OUT/run.json")
     ((REAL)) && compass=()
+    on_arch=$( ((REAL)) || compass_on_arch "$OUT/run.json")
     record=$OUT/steps
     ((${RECORD:-1})) || record=
     main=(-m atom.entrypoints.openai.api_server)
     [[ -z ${HTTP_INTAKE:-} ]] || main=("$ROOT/scripts/compass/http_intake.py" serve "$HTTP_INTAKE")
+    # on_arch runs a module: the probe as one, from its directory.
+    [[ -z ${HTTP_INTAKE:-} || -z $on_arch ]] || main=(-m http_intake serve "$HTTP_INTAKE") PYTHONPATH+=:$ROOT/scripts/compass
     # The keep-alive timeout as in pd_sim.sh, aiperf's pool in the router's place.
     # Its own process group, so a real server's workers stop with it. A held
     # DP master port, as `compass record` gives one: the port keys ATOM's
     # compiled-graph cache, and the first start that loads it autotunes again.
     # No later start loads it, so the server's stop removes it, as there.
-    # shellcheck disable=SC2086 # SERVER_ARGS is a word list
+    # shellcheck disable=SC2086 # SERVER_ARGS and on_arch are word lists
     ATOM_DP_MASTER_PORT=$(compass_held_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
-        python3 "${main[@]}" \
+        python3 $on_arch "${main[@]}" \
         --model "$MODEL" --host 127.0.0.1 --server-port "$PORT" --timeout-keep-alive 1000000 \
         $SERVER_ARGS "${compass[@]}" >"$OUT/server.log" 2>&1 &
     # Ready once uvicorn listens; the frontend answers /health from then on,

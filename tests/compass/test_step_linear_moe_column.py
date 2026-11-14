@@ -193,6 +193,79 @@ def test_the_pick_weighs_each_held_out_record_by_its_steps(tmp_path):
     assert list(vector["coefficients"]) == list(WIDE)
 
 
+SKEWED = {"step": 0.015, "context": 2e-8, "graph_padding": 3e-8, "moe_tokens": 4e-4}
+
+
+def _wide_or_tall(seed, others, wide):
+    """200 decode steps at rung 4 under `SKEWED`: rank 0 runs 4 rows near one
+    context drawn from `wide`, rank 1 one row 1.2 to 2.2 times as long, which
+    the rung pads, and on some steps a short one, the others `others`' short
+    rows."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(200):
+        n = rng.uniform(*wide)
+        rows = [int(n * rng.uniform(0.9, 1.0)) for _ in range(RUNG)]
+        tall = [int(n * rng.uniform(1.2, 2.2)), int(n * rng.uniform(0.05, 0.3))]
+        contexts = [rows, tall[: 1 + int(rng.integers(0, 2))]]
+        for _ in range(DP - 2):
+            contexts.append(rng.integers(1, 1000, rng.integers(*others)).tolist())
+        views = [_view(c, sum(map(len, contexts))) for c in contexts]
+        out.append((views, max(_price(v, SKEWED) for v in views)))
+    return out
+
+
+@pytest.fixture
+def skewed(tmp_path):
+    groups = [
+        _wide_or_tall(0, FULL, (110_000, 130_000)),
+        _wide_or_tall(1, SPARSE, (80_000, 100_000)),
+    ]
+    paths = [
+        _records(tmp_path / name, g) for name, g in zip(("full", "sparse"), groups)
+    ]
+    return groups, paths
+
+
+def test_each_form_is_chosen_on_the_rows_it_prices_not_the_base_form_s(skewed):
+    """The cost follows the tokens. The law without a column, fitted on both
+    records, prices some steps costliest at another rank than the cost does:
+    on the rows it picks, the experts column holds out nearer than the
+    tokens. Each form fitted on its own rows, the tokens price every record
+    exactly and are adopted."""
+    groups, paths = skewed
+    base = StepLinearBackend(StepLinearLaw(_fit(paths[0] + paths[1], dp=DP)), DP)
+    moved = 0
+    for views, _ in groups[0] + groups[1]:
+        truth = np.argmax([_price(v, SKEWED) for v in views])
+        moved += truth != np.argmax([base.price(v).seconds for v in views])
+    assert moved
+
+    vector = _routed(paths[0] + paths[1])[0]["decode"][str(RUNG)]
+    figures = vector["fit"]["moe_column"]
+    assert figures["picked"] == figures["adopted"] == "moe_tokens"
+    error = {f: v["error"] for f, v in figures["held_out"].items()}
+    assert error["moe_tokens"] == pytest.approx(0.0, abs=1e-6)
+    assert error["moe_tokens"] < error["moe_experts"] < error["none"]
+    assert vector["coefficients"] == pytest.approx(SKEWED, rel=1e-6)
+
+
+def test_a_held_out_fold_prices_each_step_as_the_max_over_its_ranks(skewed):
+    """A record's fold under no column is the law fitted on the other record
+    alone, and its error on each held-out step is that law's costliest rank's
+    price over the group's step."""
+    groups, paths = skewed
+    folds = _routed(paths[0] + paths[1])[0]["decode"][str(RUNG)]["fit"]
+    folds = folds["moe_column"]["held_out"]["none"]["folds"]
+    for held, other in ((0, 1), (1, 0)):
+        backend = StepLinearBackend(StepLinearLaw(_fit(paths[other], dp=DP)), DP)
+        error = [
+            max(backend.price(v).seconds for v in views) / seconds - 1.0
+            for views, seconds in groups[held]
+        ]
+        assert folds[str(held)] == pytest.approx([200, np.median(error)], rel=1e-9)
+
+
 def test_a_rung_with_a_record_of_few_steps_adopts_its_column(tmp_path):
     """The cost follows the experts and one record holds 20 steps at the rung:
     held out of the other, it is priced as closely, and the column holds."""
@@ -214,6 +287,29 @@ def test_a_rung_of_one_record_has_no_held_out_error_and_adopts_none(cells):
     assert figures["picked"] is None and figures["adopted"] is None
     assert all(v == {"error": None, "folds": {}} for v in figures["held_out"].values())
     assert list(vector["coefficients"]) == list(BASE)
+
+
+def test_a_routed_rung_fits_each_fold_of_the_form_it_adopts_once(cells, monkeypatch):
+    """Both records hold enough steps at the rung for `rowmod` to hold each
+    out without its column: it takes the experts column's folds the column
+    was chosen on, and the law is the one it writes fitting them again."""
+    from atom.compass.backends import step_linear_fit
+
+    folds, fitted = step_linear_fit._max_affine_folds, []
+
+    def counted(steps, vector, routing):
+        fitted.append(tuple(vector["coefficients"]))
+        return folds(steps, vector, routing)
+
+    monkeypatch.setattr(step_linear_fit, "_max_affine_folds", counted)
+    full, sparse = cells
+    law = _routed(full + sparse)[0]
+    assert law["decode"][str(RUNG)]["fit"]["moe_column"]["adopted"] == "moe_experts"
+    assert fitted.count(tuple(EXPERTS)) == 1
+    rowmod, fitted[:] = step_linear_fit._rowmod, []
+    monkeypatch.setattr(step_linear_fit, "_rowmod", lambda *a: rowmod(*a[:-1], None))
+    assert json.dumps(_routed(full + sparse)[0]) == json.dumps(law)
+    assert fitted.count(tuple(EXPERTS)) == 2
 
 
 def test_a_rung_law_fitted_on_full_ranks_prices_idle_ranks_high_and_the_routed_one_does_not(

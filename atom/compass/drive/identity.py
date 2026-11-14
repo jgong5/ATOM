@@ -5,7 +5,8 @@ mix of them.
 
 The device and the stack are recorded as a machine spec states them: each GPU's
 name and arch, the cards' one PTL state, and ROCm's version, aiter's commit,
-RCCL's version and torch's.
+RCCL's version and torch's. Each GPU also names its card's PCI bus, which no
+key or fit reads; a cost report names by it the cards each DP rank ran on.
 
 It holds no workload: no command starts the client, and which requests a server
 served is read from its step record.
@@ -83,18 +84,21 @@ def _device(gpus: tuple[int, ...]) -> list[dict]:
     """Each GPU's index, and its name and arch as a machine spec states them,
     from rocm-smi's series and gfx version, or `MODELS` when the series is not
     the brand and a model; a GPU it does not list or a model `MODELS` lacks
-    refuses."""
+    refuses. Each also names its card's PCI bus as rocm-smi's bus listing
+    names it, in the lower case of its sysfs directory."""
     if not gpus:
         return []
     cards = json.loads(smi("--showproductname", "--json"))
     missing = [gpu for gpu in gpus if f"card{gpu}" not in cards]
     if missing:
         raise GpuRefusal(f"rocm-smi lists no GPU {missing}; it lists {list(cards)}")
+    buses = json.loads(smi("--showbus", "--json"))
     return [
         {
             "index": gpu,
             "name": _model(gpu, cards[f"card{gpu}"]),
             "arch": cards[f"card{gpu}"]["GFX Version"],
+            "bus": buses[f"card{gpu}"]["PCI Bus"].lower(),
         }
         for gpu in gpus
     ]

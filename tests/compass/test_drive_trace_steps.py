@@ -72,6 +72,17 @@ http.server.HTTPServer(("127.0.0.1", port), Health).handle_request()
 """
 
 
+def plant_module(tmp_path, monkeypatch, source: str) -> None:
+    """`serve`'s server, the module ``planted`` holding `source`: run as
+    ATOM's server is, ``python -m``, from a path the server inherits."""
+    (tmp_path / "planted.py").write_text(source)
+    monkeypatch.setattr(serve, "SERVER", (sys.executable, "-m", "planted"))
+    path = [str(tmp_path), os.environ.get("PYTHONPATH")]
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, path)))
+    # A test may plant another source in its place before the server starts.
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+
+
 @pytest.fixture(autouse=True)
 def _roots(monkeypatch):
     """The trees a published entry names, planted: a test's tree is no snapshot."""
@@ -292,8 +303,7 @@ def test_trace_steps_serves_simulated_and_publishes_what_its_server_recorded(
 ):
     record = tmp_path / "record"
     _drive(record, monkeypatch, {0: [0, 1]})
-    (tmp_path / "planted.py").write_text(PLANTED)
-    monkeypatch.setattr(serve, "SERVER", (sys.executable, str(tmp_path / "planted.py")))
+    plant_module(tmp_path, monkeypatch, PLANTED)
     monkeypatch.setattr(serve, "identity", lambda *args: IDENTITY)
     monkeypatch.setenv("PLANTED_RECORD", str(record))
     flags = ["--step-stub", str(stub(tmp_path, 1)), "--out", str(tmp_path / "out")]

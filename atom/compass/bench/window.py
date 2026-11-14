@@ -38,6 +38,12 @@ draft-KV pass before `forward_done_event` on a forward that produces output,
 and the drafter's part is the rest of A to B, kept as the repeat's fourth
 time. The statistic is then the median of the target's parts, F to B less the
 drafter's, and `draft_median_ns` the median of the drafter's.
+
+The reply also states `group_needs_eager`: the `any_rank_needs_eager` of the
+`ForwardMode` the forwards settled, which `StepRecording` keeps at `run_model`
+entry, so whether an attention backend refused the batch a graph and it ran
+eagerly. Each forward runs the same batch, so each settles alike; a forward
+that settled no mode states false.
 """
 
 import copy
@@ -96,6 +102,7 @@ class BenchWindow:
             "repeats": kept,
             "discarded": discarded,
             "preload_ns": preload,
+            "group_needs_eager": self._needs_eager,
         }
         if len(kept[0]) > 3:
             result["draft_median_ns"] = statistics.median(t[3] for t in kept)
@@ -115,6 +122,7 @@ class BenchWindow:
             self.forward(batch)
         finally:
             self._parity_record = None
+        self._needs_eager = forward.needs_eager
         group = self.bench_group()
         if group is None:
             return forward.values
@@ -144,8 +152,10 @@ class _Forward:
         # device gap is F to A.
         runner._last_exit = entry
         reply = forward(batch)
-        _stamps, window = runner.step_stamps()  # records B
+        stamps, window = runner.step_stamps()  # records B
         host = runner.step_clock_ns() - start
+        mode = stamps.get("forward_mode")
+        self.needs_eager = bool(mode and mode.sync and mode.sync.any_rank_needs_eager)
         missed = entry.query()
         fields = window(True)
         values = [

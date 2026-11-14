@@ -506,7 +506,7 @@ def _fit(
 def _span(points: np.ndarray, names: tuple[str, ...]) -> dict:
     """`_hull` of `points`, a constant coordinate kept as the float it is;
     `_hull` writes it as an integer count."""
-    hull = _hull(points, names)
+    hull = _hull(points, names, affine=False)
     hull["equal"] = {f: float(points[0, names.index(f)]) for f in hull["equal"]}
     return hull
 
