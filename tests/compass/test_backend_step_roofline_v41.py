@@ -36,7 +36,7 @@ from atom.compass.backends.work import Work, allgather, elementwise, gemm
 
 TREE = pathlib.Path(__file__).resolve().parents[2]
 CONFIG = TREE / "tests" / "models" / "deepseek_v41" / "fixtures" / "config.json"
-MI455 = TREE / "scripts" / "compass" / "machines" / "mi455-b0.json"
+MI455 = TREE / "tests" / "compass" / "machines" / "mi455-b0.json"
 
 
 def _cost(modules, step, spec):

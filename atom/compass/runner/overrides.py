@@ -515,14 +515,20 @@ class HostDeviceRecurrence:
         return released + post
 
 
-def schedulable_ladder(config: Any) -> list[int]:
-    """The capture sizes the scheduler can produce, ascending: ATOM's capture
-    bound, each sequence charged one token plus its drafts.
+def schedulable_bound(config: Any) -> int:
+    """The widest decode batch the scheduler can produce: ATOM's capture bound,
+    each sequence charged one token plus its drafts.
     `max_schedulable_decode_bs` holds it; importing that would pull the engine,
     and its kernels, into a driver-free process."""
     spec = getattr(config, "speculative_config", None)
     q = 1 + (spec.num_speculative_tokens if spec else 0)
-    bound = min(config.max_num_seqs, config.max_num_batched_tokens // q)
+    return min(config.max_num_seqs, config.max_num_batched_tokens // q)
+
+
+def schedulable_ladder(config: Any) -> list[int]:
+    """The capture sizes the scheduler can produce (`schedulable_bound`),
+    ascending."""
+    bound = schedulable_bound(config)
     return sorted(s for s in config.capture_sizes if s <= bound)
 
 

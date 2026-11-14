@@ -3,13 +3,8 @@
 pricing a stage's input in the recurrence gate."""
 
 import copy
-import hashlib
-import importlib.util
 import json
 import math
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -21,12 +16,7 @@ from atom.compass.runner.pp_send import CarrierModel, carrier_models
 from atom.compass.spec import MachineSpec, SpecRefusal
 
 TREE = Path(__file__).resolve().parents[2]
-SPEC = TREE / "scripts/compass/machines/mi308x-hjbog39.json"
-_script = importlib.util.spec_from_file_location(
-    "pp_carriers", TREE / "scripts/compass/pp_carriers.py"
-)
-script = importlib.util.module_from_spec(_script)
-_script.loader.exec_module(script)
+SPEC = TREE / "tests/compass/machines/mi308x-hjbog39.json"
 
 #: gloo free; each RCCL tensor of one 500-byte token rendezvous in 0.5 ms.
 MODELS = {
@@ -243,48 +233,6 @@ def test_the_probe_fits_how_late_a_blocked_gloo_sender_wakes():
     assert gloo["late"] == pytest.approx([0] * 5, abs=1e-9)
     assert gloo["rendezvous_fixed_s"] == pytest.approx(fixed, rel=1e-6)
     assert "wake_s" not in probe.fit(_samples(TRUTH))["gloo"]
-
-
-def test_the_probe_pools_the_records_it_wrote(tmp_path):
-    """Two runs' wakes differ; their pooled fit takes every block's median
-    over both, and names each run's record by its digest."""
-    runs = []
-    for k, level in enumerate((1e-4, 2e-4)):
-        samples = _samples(TRUTH)
-        for b in probe.BLOCKS:
-            done = b + level * -math.expm1(-b / 0.5)
-            stamps = {"send": 0.0, "done": done, "post": b, "end": done}
-            samples.append(
-                {"carrier": "gloo", "bytes": 8, "late": True, "block": b} | stamps
-            )
-        runs.append(tmp_path / f"run{k}.json")
-        runs[-1].write_text(json.dumps({"samples": samples}) + "\n")
-    script.main(str(tmp_path / "pooled.json"), *map(str, runs))
-    pooled = json.loads((tmp_path / "pooled.json").read_text())
-    both = [s for r in runs for s in json.loads(r.read_text())["samples"]]
-    assert pooled["carriers"] == probe.fit(both)
-    assert pooled["records"] == [
-        hashlib.sha256(r.read_bytes()).hexdigest() for r in runs
-    ]
-
-
-def test_the_probe_runs_from_the_root_on_its_own_tree(tmp_path):
-    """Run as its README gives it, from `/` and with no PYTHONPATH, the probe
-    imports this tree's `atom.compass`, not an ATOM installed elsewhere."""
-    run, out = tmp_path / "run.json", tmp_path / "out.json"
-    run.write_text(json.dumps({"samples": _samples(TRUTH)}) + "\n")
-    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-    script = TREE / "scripts/compass/pp_carriers.py"
-    ran = subprocess.run(
-        [sys.executable, str(script), str(out), str(run)],
-        cwd="/",
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert ran.returncode == 0, ran.stderr
-    assert json.loads(out.read_text())["carriers"] == probe.fit(_samples(TRUTH))
 
 
 def test_the_probe_prices_a_late_rendezvous_receive_with_its_threshold_moved():

@@ -117,7 +117,12 @@ def _candidate(chosen: dict, blocks: list, model: str, where: str) -> dict:
                 value = block[field]
                 _put(once, field, value, f"{field} {value}", source, where)
         for what, reason in block.get("departures", {}).items():
-            _put(departures, what, reason, f"{what} departs: {reason}", source, where)
+            key = what  # a variable's name
+            if what.startswith("--"):  # an argument, as ATOM's parser reads it
+                flag, (what,) = _argument(what, True)
+                key = f"--{flag}"
+            shown = f"{what} departs: {reason}"
+            _put(departures, key, (what, reason), shown, source, where)
     if "basis" not in once:
         raise ValueError(f"{where} names no ATOM basis: give it to common or a value")
     deployment = once.get("deployment", ("single",))[0]
@@ -131,7 +136,7 @@ def _candidate(chosen: dict, blocks: list, model: str, where: str) -> dict:
         "values": chosen,
         "deployment": deployment,
         "basis": once["basis"][0],
-        "departures": {what: reason for what, (reason, *_) in departures.items()},
+        "departures": dict(value for value, *_ in departures.values()),
         "instances": {
             side: _instance(side, blocks, model, where)
             for side in INSTANCES[deployment]
@@ -269,6 +274,8 @@ def _block(where: str, block, sides: bool = True) -> None:
         _is(f"{where}.deployment", ok, " or ".join(INSTANCES))
     at = f"{where}.departures"
     for what, reason in _map(at, block.get("departures", {})).items():
+        ok = FLAG.fullmatch(what) or VARIABLE.fullmatch(what)
+        _is(f"{at}: {what!r}", ok, "a long flag, --name, or a variable's name")
         _is(f"{at}.{what}", _text(reason), "its reason, as a string")
     for side in ("prefill", "decode"):
         if side in block:
