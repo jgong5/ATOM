@@ -1284,8 +1284,11 @@ store. A record without a store touches no library.
    `MODEL`, `GPU`, `TRACES` and `AIPERF_PYTHON` set, its store
    `$R/cal/store`; it reads no platform, so it prints the tokens, the law's held-out
    errors per band and the `compass run` line of step 5 with `$M` left as `--device
-   DATASHEET --ptl PTL`. A RECORD after its concurrency names
-   the client's scenario, such as `"8 --trajectory-start-min-ratio 0
+   DATASHEET --ptl PTL`. That store holds no `platform_readings` entry, and step 5's
+   `compass run` refuses a store with none: publish one into `$R/cal/store` with
+   `compass measure device` and `compass fit device`, as the platform's bullet in
+   [QUICKSTART.md](QUICKSTART.md#environment) does, before step 5. A RECORD after its
+   concurrency names the client's scenario, such as `"8 --trajectory-start-min-ratio 0
    --trajectory-start-max-ratio 0"`, the first-turn record that gives the law
    its decode rung 8; `trace` before one makes it a trace run of that recipe.
 4. Real runs: per concurrency, two `compass record --gpu G --out
