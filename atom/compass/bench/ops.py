@@ -3790,9 +3790,9 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
     does, is halved over cached tokens at each token count alone, where `fit
     ops` reads it after the token count. A prefill family whose shapes state G
     is not halved over its tokens: `trace ops` traces such a shape only at a
-    record's step. Any other is `_bent` on its line as `fit ops` reads it, which
-    declines the gaps beside such a point, and takes there each token count of a
-    step (`step_tokens`) at its rows, or at any for a family stating none."""
+    record's step. Any other is `_bent` on its line as `fit ops` reads it, taking
+    in a gap beside a bend each count of a step (`step_tokens`) at its rows, or
+    at any for a family stating none."""
     from atom.compass.capture.forward import decode, prefill
 
     steps = {
@@ -3838,26 +3838,26 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
         ragged = decoding and json.loads(fam)[2:]
         # a prefill family over its tokens, stating no G
         tokened = isinstance(fam, str) and json.loads(fam)[0] == "prefill"
-        merged = tokened and sorted(lines[line(fam, points)], key=lambda p: p[0])
+        read = points  # a prefill family bends on its line as `fit ops` reads it
+        if tokened:
+            read = sorted(lines[line(fam, points)], key=lambda p: p[0])
         if tokened or isinstance(fam, str) and _exchanged(fam):  # at each's mean
-            sizes = [
-                [*g] for _, g in itertools.groupby(merged or points, key=lambda p: p[0])
-            ]
+            sizes = [[*g] for _, g in itertools.groupby(read, key=lambda p: p[0])]
             mean = (statistics.mean(p[2]["cold_ns"] for p in g) for g in sizes)
             at = ((*g[0][:2], {"cold_ns": ns}) for g, ns in zip(sizes, mean))
             bent = _bent([*at]) if len(sizes) > 2 else ()  # no line under three
         else:
             bent = _bent(points, () if ragged else steps) if decoding else ()
         cut = isinstance(fam, str) and _cut(fam)
+        at_rows = tokened and json.loads(fam)[1]  # None: a family at any rows
         for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
             # each step's count between two points beside a bend of its line
             if tokened and ka == kb and any(a <= x < b for x in sorted(bent)):
-                rows = json.loads(fam)[1]  # None: a family at any rows
                 for r, held in (step_tokens or {}).items():
-                    for t in sorted(held) if rows in (None, r) else ():
+                    for t in sorted(held) if at_rows in (None, r) else ():
                         if a < t < b and (fam, t, r) not in tried:
                             tried.add((fam, t, r))
-                            want[prefill(t, r), record["context"]].add(fam)
+                            want[prefill(t, r), cut and cut[1] or None].add(fam)
                 continue
             mid = (a + b) // 2
             if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:

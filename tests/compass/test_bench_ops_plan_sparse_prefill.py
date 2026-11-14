@@ -207,3 +207,36 @@ def test_a_masked_metadata_size_reads_no_rows_where_they_do_not_move_the_kind():
         if name.startswith('["prefill"')
     ]
     assert got == [["T"]]
+
+
+def _sampled(t, b, sizes=None):
+    """A kernel over a prefill's `b` rows of `t` tokens, its metadata tensor
+    per row, as a sampler's temperatures are, or `sizes(t)` long."""
+    meta = {"shape": [sizes(t) if sizes else b], "stride": [1], "dtype": I32}
+    x = {"shape": [b, 8], "stride": [8, 1], "dtype": "torch.float32"}
+    args = {"x": x | {"role": "activation"}, "t": meta | {"role": "metadata"}}
+    return {"op": "aiter.s", "args": args, "out": [[b, 8]]}
+
+
+@pytest.mark.parametrize("sizes, dims", [(None, ["B"]), (_window, ["T", "B"])])
+def test_a_masked_metadata_size_reads_t_only_where_it_moves_at_one_row_count(
+    sizes, dims
+):
+    def point(shape, leaf, ns, context=None):
+        record = {"shape": shape, "context": context, "op": "aiter.s"}
+        return record | {"leaf": json.dumps(leaf), "cold_ns": ns, "kernels": ["s"]}
+
+    # flat over a decode's context; one row at 40 and 150 tokens, two at 60 and
+    # 150, three at 100: a step of two rows at 120 lies past what three hold
+    points = [point("decode B=2", _sampled(2, 2), 2e3, c) for c in (1000, 3000)]
+    for t, b in ((40, 1), (150, 1), (60, 2), (150, 2), (100, 3)):
+        points += [point(f"prefill T={t} B={b}", _sampled(t, b, sizes), b * 1e3)]
+
+    params = fit_ops.fit(points)
+    got = [f["dims"] for n, f in params["families"].items() if n.startswith('["p')]
+    asked = (_sampled(120, 2, sizes), ("prefill", 120, 2, None, 0, 0), None)
+
+    assert got == [dims]
+    # read over its rows alone, a step of two rows prices at any token count
+    priced = fit_ops.PriceList(params).price(asked)
+    assert isinstance(priced, Refusal) == (dims != ["B"])

@@ -26,10 +26,9 @@ leaf; W is no count of any other leaf's, so points at two widths stay apart.
 Where W is that prefill's T too, a leaf that leads with it may have run at
 either B: a point its family reads at two places is left out, named in the
 params' ``left_out``, and a run prices such a leaf there where either B gives
-one answer. A prefill leaf's signature is read first as `prefill_leaf` reads
-it, with its T read at the positions its points show follow T (`_tokens_at`),
-so a leaf whose sizes DeepSeek-V4's sparse prefill derives from T is one
-family over its token counts.
+one answer. A prefill leaf's signature is read first by `prefill_leaf`, so a
+leaf whose sizes DeepSeek-V4's sparse prefill derives from T is one family
+over its token counts.
 
 A family's dimensions are the shape's counts its masked integers follow, a
 decode's B always, at its T where it states one (a drafter's own leaves at the
@@ -188,13 +187,12 @@ def _text(x) -> str:
 
 def prefill_leaf(leaf: dict, tokens: int, at=None) -> tuple[dict, set]:
     """A prefill leaf's signature at `tokens` as `measure ops --plan` and `fit
-    ops` key its family, and whether it follows T (as {"T"}): each metadata size
-    of a kernel's (not an aten operator's) masked, as ATOM's runner sizes it from
-    the batch; then each integer equal to `tokens` or one more, or with `at` each
-    at a position it holds (`_tokens_at`), read as `TOKENS` says."""
-    # ponytail: the plan reads an unrelated int equal to T or T + 1 (a stride
-    # of 1 at T = 1) as one too, measuring that shape's leaf apart
-    follows, kernel = set(), not leaf.get("op", "").startswith("aten.")
+    ops` key its family, and its marks: each metadata size of a kernel's (not an
+    aten operator's) masked, as ATOM's runner sizes it from the batch, its value
+    a mark; then each integer equal to `tokens` or one more, or with `at` each at
+    a position it holds (`_tokens_at`), read as `TOKENS` says, marked "T"."""
+    # ponytail: the plan reads every int equal to T or T + 1 so, a stride of 1 at T = 1
+    marks, kernel = set(), not leaf.get("op", "").startswith("aten.")
 
     def sized(x, inside=False):
         if isinstance(x, list):
@@ -203,22 +201,21 @@ def prefill_leaf(leaf: dict, tokens: int, at=None) -> tuple[dict, set]:
             meta = kernel and x.get("role") == "metadata"
             return {k: sized(v, inside or meta and k == "shape") for k, v in x.items()}
         if inside and type(x) is int:
-            follows.add("T")
+            marks.add(x)
             return MASK
         return x
 
     def read(i, v):
         if v - tokens not in (0, 1) or at is not None and i not in at:
             return v
-        follows.add("T")
+        marks.add("T")
         return TOKENS[v - tokens]
 
-    return _walk(sized(leaf), read, [0]), follows
+    return _walk(sized(leaf), read, [0]), marks
 
 
 def _read(shape: str, leaf: str, at=()) -> tuple[dict, set]:
-    """`leaf`'s signature at `shape` as its family reads it, a prefill's
-    through `prefill_leaf` at its T and `at`, and the counts it follows."""
+    """`leaf`'s signature at `shape` as its family reads it, and its marks."""
     sig = json.loads(leaf)
     if not shape.startswith("prefill"):
         return sig, set()
@@ -227,9 +224,8 @@ def _read(shape: str, leaf: str, at=()) -> tuple[dict, set]:
 
 def _tokens_at(members) -> list[int]:
     """The positions `prefill_leaf` reads as T in a prefill skeleton's points:
-    those whose values at one shape differ from those at another, where a point
-    that ran its leaf at one B (`ran_counts`) holds T or one more; so neither a
-    weight's size equal to T at one shape nor a width W that is T is."""
+    those whose values differ between shapes and are T or one more at a point
+    that ran its leaf at one B (`ran_counts`), so not a constant nor a W."""
     each, held = [], {}
     for p in members:
         v = _ints(_read(p["shape"], p["leaf"])[0])
@@ -303,8 +299,7 @@ def fit(points) -> dict:
     ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad
     every rank to the same rows and keep it; and ``left_out``, each point
     whose leaf may have run at two places in its family (`ran_counts`), by
-    its shape, operator and why; per prefill skeleton read with no T, its
-    ``tokens``, the positions `prefill_leaf` reads as T (`_tokens_at`)."""
+    its shape, operator and why; and ``tokens`` (`_tokens_at`)."""
     from atom.compass.bench.ops import (
         DP_GROUP,
         _dependent,
@@ -365,7 +360,11 @@ def fit(points) -> dict:
             for i in free_of[skel]
             for k in ("T", "B", "G")
             if all(any(v[i] - n.get(k, -9) in (0, 1) for n in ns) for v, ns in each)
-        } | read[0][1]
+        } | read[0][1] & {"T"}
+        sizes = {}  # a prefill whose masked sizes move at one B follows T too
+        for (_, marks), ns in zip(read, ran):
+            sizes.setdefault(ns[0].get("B"), set()).add(frozenset(marks - {"T"}))
+        follows |= {"T"} if any(len(s) > 1 for s in sizes.values()) else set()
         ragged = {
             family(p["shape"], p["leaf"], free_of[skel], tokens)
             for p in members
