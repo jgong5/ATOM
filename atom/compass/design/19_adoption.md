@@ -271,7 +271,7 @@ the same candidates in the same order, and refuses by name an unknown field,
 contradictory values or an empty expansion. Each candidate names its ATOM basis, the
 recipe its arguments follow, and each departure with its reason. Its format follows.
 The two templates, D116's and D117's, are space files in `scripts/compass/spaces/`,
-beside `laws/` and `machines/`; `compass advice` reads the SPACE it is given and falls
+beside `laws/`; `compass advice` reads the SPACE it is given and falls
 back on neither. The file is the search's input, as traces are a client's: each
 candidate's run takes `compass run`'s flags and ATOM's arguments from `compass advice`,
 so the file adds no level to `13` D79's precedence and is not the Compass config file D79
@@ -297,8 +297,9 @@ A block's fields are all optional: `basis`, the recipe its arguments follow; `de
 value, a string, a number, or `true` for a bare flag; `env`, each environment variable to
 its value; `per_concurrency`, each ATOM long flag to a positive integer, its value at a
 point that integer times the point's concurrency, as MiniMax-M3's `--max-num-seqs` is 2;
-`departures`, each argument or variable that departs from the basis to its reason; and, on
-a 1P1D candidate, `prefill` and `decode`, each holding one side's `args`, `env` and
+`departures`, each argument, by its long flag, or variable that departs from the basis to
+its reason, the flag read as an argument is and written with dashes; and, on a 1P1D
+candidate, `prefill` and `decode`, each holding one side's `args`, `env` and
 `per_concurrency`.
 
 **The expansion.** Each combination of the dimensions' values that no exclusion names is a

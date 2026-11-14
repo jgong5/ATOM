@@ -26,7 +26,7 @@ from atom.compass.spec.fields import PINNED
 
 TREE = pathlib.Path(__file__).resolve().parents[2]
 SPEC = MachineSpec.from_mapping(
-    json.loads((TREE / "scripts/compass/machines/mi308x-hjbog39.json").read_text())
+    json.loads((TREE / "tests/compass/machines/mi308x-hjbog39.json").read_text())
 )
 LAYOUT = {"dp": 1, "pp": 1, "pcp": 1, "tp": 1, "decode_context_parallel_size": 1}
 LAYOUT |= {"enable_expert_parallel": False, "enable_dp_attention": False}

@@ -6,25 +6,32 @@ priced at another's probed ratios, the method's error on its own records.
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import platforms
 import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_backend_step_roofline import STACK
-from test_probe_device import SCRIPTS
 from test_validate_bound import LINES, _main, drafted, graph, record
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends.step_roofline import StepRooflineBackend
-from atom.compass.fit import device
 from atom.compass.spec import MachineSpec
 from atom.compass.validate import bound, project
 
-MACHINES = SCRIPTS / "machines"
+MACHINES = Path(__file__).resolve().parent / "machines"
 #: MI455's B0 spec is MI355X's probed ratios on MI455X's datasheet, for a
 #: device no engine has run on.
 MI355X, MI455 = (MACHINES / f"{name}.json" for name in ("mi355x-gpu45", "mi455-b0"))
+#: What a spec at another device's ratios takes from that device's spec as it
+#: stands, no datasheet stating it.
+CARRIED = (
+    "device.kernel_floor_s",
+    "device.software_pinned_to.",
+    "interconnect.intra_node.link_latency_s",
+    "interconnect.inter_node.link_latency_s",
+)
 
 
 def spec(path):
@@ -61,7 +68,7 @@ def test_bound_ratios_from_prices_records_at_the_other_devices_ratios(
     target, probed = spec(MI355X), spec(mi308x)
 
     def taken(path):
-        return "derate" in path.split(".") or path.startswith(device.CARRIED)
+        return "derate" in path.split(".") or path.startswith(CARRIED)
 
     values = {p: v for p, v in target.values.items() if not taken(p)}
     values |= {p: v for p, v in probed.values.items() if taken(p)}

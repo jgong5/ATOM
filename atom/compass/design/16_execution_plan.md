@@ -176,8 +176,8 @@ stage is named for the model; it is not the retired milestone M3 of D95.
   mi355-gpu-40, three spaced rounds per point (`08` D45). The submission's own image is
   not run again and InferenceX's published points are not drawn: Compass grades a
   simulated run against real runs of its own tree.
-- **Platform.** gpu-40 on `scripts/compass/machines/mi355x-gpu40.json`'s stack (nightly
-  20261026), not InferenceX's nightly 20261007; each registration states it.
+- **Platform.** gpu-40 on the nightly 20261026 stack, not InferenceX's nightly 20261007;
+  each registration states it.
 - **One frozen commit.** Calibration and every graded run use the commit frozen at
   #3266's first registration. A later ATOM change re-keys the laws
   ([#2350](https://github.com/jgong5/ATOM/issues/2350)), so moving needs a new
