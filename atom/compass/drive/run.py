@@ -42,7 +42,8 @@ micro-batches, and a run file that names no price list refuses. Another backend
 has no check, and refuses `--coverage`.
 
 `--check` starts no server: it lists every input the run lacks and the command
-that makes each, exiting 1 when one is lacking (`lacking`); it takes no `--out`.
+that makes each, exiting 1 when one is lacking (`lacking`); its `--out` is the
+directory a step linear law's printed calibration writes, and it writes none.
 
 `--acceptance-record` names a speculative `compass record` directory: its
 histograms' rates (`measured`) go to ATOM as ``--spec-decode-acceptance-rates``,
