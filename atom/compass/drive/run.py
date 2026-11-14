@@ -43,7 +43,8 @@ micro-batches, and a run file that names no price list refuses. Another backend
 has no check, and refuses `--coverage`.
 
 `--check` starts no server: it lists every input the run lacks and the command
-that makes each, exiting 1 when one is lacking (`lacking`); it takes no `--out`.
+that makes each, exiting 1 when one is lacking (`lacking`); its `--out` is the
+directory a step linear law's printed calibration writes, and it writes none.
 `--check prefill` or `--check decode` checks that side of a deployment, its
 flags and ATOM arguments as `deploy.sh run` takes them, so `--network` names a
 deployment across nodes. Its ATOM arguments gain the `--kv-transfer-config` the
