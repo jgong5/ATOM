@@ -27,10 +27,9 @@ Where W is that prefill's T too, a leaf that leads with it may have run at
 either B: a point its family reads at two places is left out, named in the
 params' ``left_out``, and a run prices such a leaf there where either B gives
 one answer. A prefill leaf's signature is read first as `prefill_leaf` reads
-it, as `measure ops --plan` keys its families: a kernel's metadata sizes, which
-follow its T and B, masked, and each other integer equal to its T or one more
-read as that, which follows its T, so a leaf whose sizes DeepSeek-V4's sparse
-prefill derives from T in other ways is one family over its token counts.
+it, with its T read at the positions its points show follow T (`_tokens_at`),
+so a leaf whose sizes DeepSeek-V4's sparse prefill derives from T is one
+family over its token counts.
 
 A family's dimensions are the shape's counts its masked integers follow, a
 decode's B always, at its T where it states one (a drafter's own leaves at the
@@ -189,16 +188,13 @@ def _text(x) -> str:
 
 def prefill_leaf(leaf: dict, tokens: int, at=None) -> tuple[dict, set]:
     """A prefill leaf's signature at `tokens` as `measure ops --plan` and `fit
-    ops` key its family, and the counts it follows thereby: each size of a
-    kernel's (not an aten operator's) metadata tensor masked, following T and
-    B, since ATOM's runner sizes such a tensor from the batch, and
-    DeepSeek-V4's sparse prefill indices sum each token's window; then each
-    integer equal to `tokens` or one more read as `TOKENS` says, following T:
-    every such integer, or with `at` those at the positions it holds
-    (`_tokens_at`)."""
+    ops` key its family, and the counts it follows thereby (T): each size of a
+    kernel's (not an aten operator's) metadata tensor masked, as ATOM's runner
+    sizes it from the batch (DeepSeek-V4's sparse indices sum each token's
+    window); then each integer equal to `tokens` or one more, or with `at`
+    each at a position it holds (`_tokens_at`), read as `TOKENS` says."""
     # ponytail: the plan reads an unrelated int equal to T or T + 1 (a stride
-    # of 1 at T = 1) as one too, so that shape's leaf is a family of its own
-    # and measured apart; symbolic slots in the contract would end it.
+    # of 1 at T = 1) as one too, measuring that shape's leaf apart
     follows, kernel = set(), not leaf.get("op", "").startswith("aten.")
 
     def sized(x, inside=False):
@@ -208,7 +204,7 @@ def prefill_leaf(leaf: dict, tokens: int, at=None) -> tuple[dict, set]:
             meta = kernel and x.get("role") == "metadata"
             return {k: sized(v, inside or meta and k == "shape") for k, v in x.items()}
         if inside and type(x) is int:
-            follows.update("TB")
+            follows.add("T")
             return MASK
         return x
 
@@ -222,9 +218,8 @@ def prefill_leaf(leaf: dict, tokens: int, at=None) -> tuple[dict, set]:
 
 
 def _read(shape: str, leaf: str, at=()) -> tuple[dict, set]:
-    """`leaf`'s signature at `shape` as its family reads it, a prefill's at its
-    T with the integers at positions `at` read as it (`prefill_leaf`), and the
-    counts that reading follows."""
+    """`leaf`'s signature at `shape` as its family reads it, a prefill's
+    through `prefill_leaf` at its T and `at`, and the counts it follows."""
     sig = json.loads(leaf)
     if not shape.startswith("prefill"):
         return sig, set()
@@ -304,17 +299,16 @@ def _context(p) -> int:
 
 def fit(points) -> dict:
     """The price list's params: per skeleton, the integer positions that follow
-    the shape; per prefill skeleton read with none as T, the positions
-    `prefill_leaf` reads as T (`_tokens_at`); and per family, its dimensions
-    and its points, each its coordinates, its cold time in ns and its kernels,
-    and a collective's
+    the shape, and per family, its dimensions and its points, each its
+    coordinates, its cold time in ns and its kernels, and a collective's
     ``row_bytes``, None when its points move other bytes per row or when
     ranks' row counts can differ (``all_gatherv``, ``reduce_scatterv``, MORI's
     dispatch and combine), so a step may hold between two points' rows;
     ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad
     every rank to the same rows and keep it; and ``left_out``, each point
     whose leaf may have run at two places in its family (`ran_counts`), by
-    its shape, operator and why."""
+    its shape, operator and why; per prefill skeleton read with no T, its
+    ``tokens``, the positions `prefill_leaf` reads as T (`_tokens_at`)."""
     from atom.compass.bench.ops import (
         DP_GROUP,
         _dependent,
@@ -369,8 +363,7 @@ def fit(points) -> dict:
             )
             and len({vs[0][0][i] for vs in at.values()}) > 1
         ]
-        # a point that may have run its leaf at either B follows either, and a
-        # prefill what its reading does, alike over its skeleton
+        # a point that may have run its leaf at either B follows either
         follows = {
             k
             for i in free_of[skel]
@@ -609,6 +602,9 @@ class PriceList(CostSource):
         if ex := exchange(leaf):  # a collective: its family over its message bytes
             name, at["bytes"] = ex
             name = name if name in self.params["families"] else None
+        elif phase == "prefill" and "tokens" not in self.params:
+            why = "the price list keys prefill families as before; refit it"
+            return self.refuse(f"{kind}: {why}")
         else:
             name = self._family(shape, signature(leaf))
         if name is None:
@@ -631,8 +627,6 @@ class PriceList(CostSource):
 
     def _family(self, shape: str, sig: str) -> str | None:
         """The family of a leaf of signature `sig` at `shape`, or None."""
-
-        # a price list fitted before `_tokens_at` reads no position as T
         at = self.params.get("tokens", {}).get(skeleton(shape, sig), ())
         free = self.params["free"].get(skeleton(shape, sig, at))
         name = None if free is None else family(shape, sig, free, at)
