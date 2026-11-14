@@ -15,7 +15,9 @@ them the same way for every line:
   tokens and K drafts, each draft the row's filler, as the scheduler hands
   the batch K drafts a row.
 - No row holds more than `max_model_len` tokens: ATOM's scheduler admits no
-  such request, and its runner's block tables have no room for one.
+  such request, and its runner's block tables have no room for one. Nor does
+  a row hold more KV blocks, its draft round's positions included, than the
+  `ceil(max_model_len / block_size)` columns its runner gives a block table.
 - Each row is a new request, numbered by `Sequence`'s own counter, so no two
   replays share a request.
 - Row i holds `ceil(context / block_size)` KV blocks, contiguous, from a fresh
@@ -130,6 +132,7 @@ class ReplayRule:
         self.block_size = config.kv_cache_block_size
         self.num_blocks = config.num_kvcache_blocks
         self.max_model_len = config.max_model_len
+        self.columns = -(-config.max_model_len // self.block_size)
         self.stateful = (
             config.hf_config.model_type
             in InputOutputProcessor._per_req_cache_model_types()
@@ -163,6 +166,12 @@ class ReplayRule:
             raise ValueError(
                 f"rows {rows} hold a row of {longest} tokens, past max_model_len "
                 f"{self.max_model_len}"
+            )
+        widest = -(-(longest + self.lookahead) // self.block_size)
+        if widest > self.columns:
+            raise ValueError(
+                f"rows {rows} hold a row of {widest} KV blocks, lookahead included, "
+                f"past the {self.columns} columns of ATOM's block table"
             )
         final = bool(line["produces_output"])
         shared = line.get("shared", 0)
