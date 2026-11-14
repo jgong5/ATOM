@@ -177,10 +177,14 @@ def test_a_real_deployment_s_report_shows_both_sides_and_its_split_and_changes_n
     assert page.rows("Workload")[curves.CONCURRENCY] == ["2"]
     assert page.rows("Workload")["traces"] == ["2"]
     assert page.rows("Headline metrics") == _shown(curves.metrics(run))
-    a, b = json.loads((run / split.FILE).read_text())["requests"]
+    made = json.loads((run / split.FILE).read_text())
+    a, b = made["requests"]
     assert (a["phase"], b["phase"]) == ("profiling", "warmup")
-    joined = "the decode side's joined to it at -999.9900 s, its bounds -1000.4000 s"
-    joined += " to -999.9900 s; 3 not. Below, the 1 of them the headline metrics count."
+    low, high = made["decode_offset_s"]
+    joined = f"the decode side's joined to it at {high:.4f} s, its bounds {low:.4f} s"
+    joined += (
+        f" to {high:.4f} s; 3 not. Below, the 1 of them the headline metrics count."
+    )
     assert page.parts["Per-request split"]["text"] == [
         f"2 requests split, on the monotonic clock, {joined}"
     ]
