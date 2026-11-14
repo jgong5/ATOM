@@ -26,11 +26,13 @@ A pass's busy time is the union of its kernels' device intervals plus each gap
 before one of them on the forward's device timeline: whole where that kernel's
 launch call had returned when the gap opened, so the device idled on its own,
 else capped at the rank's median such queued gap, since the device then waited
-for the host's launch. A TP collective's kernel on one rank includes its wait
-for the peers: the n-th collective kernel (`COLLECTIVE`) of a forward, the
-target's or the drafter's, counts on every rank from its latest rank's start,
-and as queued once its latest rank's launch call returned. Each pass's busy
-time is its largest over the ranks.
+for the host's launch. That median leaves out each queued gap of `ROUNDING` or
+less, one timestamp rounding step between two kernels that abut. A TP
+collective's kernel on one rank includes its wait for the peers: the n-th
+collective kernel (`COLLECTIVE`) of a forward, the target's or the drafter's,
+counts on every rank from its latest rank's start, and as queued once its
+latest rank's launch call returned. Each pass's busy time is its largest over
+the ranks.
 
 A trace directory not named ``rank_<r>``, a DP or a pipeline run's, refuses:
 per-rank busy time under DP is not reduced. So does a trace that lacks a
@@ -66,6 +68,9 @@ COLLECTIVE = re.compile(
     r"cross_device_reduce|allgather|all_gather|all_?reduce|allReduce|\bar_ll"
     r"|reduce_scatter|nccl|mono_step_begin"
 )
+#: The longest queued gap, in us, the cap's median leaves out: one timestamp
+#: rounding step, which two kernels that abut read as their gap.
+ROUNDING = 2e-3
 #: The drafter passes a busy line times apart, by their record line field.
 PASSES = ("d_propose_ns", "d_draft_kv_ns")
 #: Each drafter part `drafter` times, by the busy line field of its label.
@@ -226,9 +231,12 @@ def _walk(kernels):
 
 def busy(fs: list[dict]) -> list[dict]:
     """One rank's busy time per forward and pass, in ns."""
-    queued = [g for f in fs for _, _, g, q in _walk(f["kernels"]) if q and g > 0]
+    queued = [g for f in fs for _, _, g, q in _walk(f["kernels"]) if q and g > ROUNDING]
     if not queued:
-        raise ValueError("no kernel was queued at a gap, so no gap measures the cap")
+        raise ValueError(
+            "no kernel was queued at a gap past one rounding step, so no gap "
+            "measures the cap"
+        )
     cap = statistics.median(queued)
     out = []
     for f in fs:

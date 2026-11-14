@@ -31,6 +31,10 @@ from atom.compass.drive import runfile, serve
 from atom.compass.validate import bound
 from atom.model_engine import llm_engine
 
+#: Capture sizes whose rungs `step_linear`'s law has decode vectors for: rung 2,
+#: and the eager rung past it.
+COVERED = [2]
+
 
 def checked(tmp_path, *flags, platform=None):
     """`compass run --check`'s exit status with `flags`, the suite's platform,
@@ -50,7 +54,7 @@ def lacked(out: str) -> list[str]:
 def served(monkeypatch, config):
     """`config` resolved from ATOM's arguments, its tokenizer a fast one with no
     tokenizer.json; no server starts."""
-    monkeypatch.setattr(drive_run, "_config", lambda atom_args: config)
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args, arch=None: config)
     tok = SimpleNamespace(is_fast=True, name_or_path=None)
     monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *args: tok)
     monkeypatch.setattr(serve, "serve", unstarted)
@@ -106,9 +110,9 @@ def test_a_stale_law_names_each_axis_and_stale_host_laws_each_field(
 def test_check_meets_the_runner_s_own_refusal_of_a_law_from_another_engine_config(
     tmp_path, monkeypatch, capsys
 ):
-    entry = step_linear(tmp_path, deployment(tmp_path))
+    entry = step_linear(tmp_path, deployment(tmp_path, capture_sizes=COVERED))
     run = runfile.build(*_parsed(tmp_path, "--step-linear", entry.key.token()))
-    here = deployment(tmp_path, kv_cache_block_size=32)
+    here = deployment(tmp_path, kv_cache_block_size=32, capture_sizes=COVERED)
     with pytest.raises(ValueError) as installed:
         install(tmp_path, monkeypatch, run, here)
     served(monkeypatch, here.config)
@@ -157,7 +161,7 @@ def _parsed(tmp_path, *flags):
 def test_a_run_that_lacks_nothing_exits_0_and_needs_no_out(
     tmp_path, monkeypatch, capsys
 ):
-    r = deployment(tmp_path)
+    r = deployment(tmp_path, capture_sizes=COVERED)
     served(monkeypatch, r.config)
     law, host = step_linear(tmp_path, r), host_laws(tmp_path, r)
     flags = ["--step-linear", law.key.token(), "--host-laws", host.key.token()]

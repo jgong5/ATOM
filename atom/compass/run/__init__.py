@@ -175,9 +175,11 @@ channel table from the run file alone. Each DP rank's engine process hands in
 its own refusals, as ``<lp>.<member>``. A key `RENAMED_KEYS` lists refuses,
 naming its name now.
 
-A run file that also has ``router_s`` describes a prefill-decode run over
-`prefill_decode_table`: its hops are prefill's, its ``decode_hops`` decode's
-``ipc_s``, ``ipc_out_s`` and ``stream_s``, and ``kv_link`` (``intra_node``
+A run file that also has ``router_s``, the router's per-request forward or
+null where no entry states it, describes a prefill-decode run over
+`prefill_decode_table`: its hops are prefill's, ``router_s`` among them, its
+``decode_hops`` decode's ``ipc_s``, ``ipc_out_s`` and ``stream_s``, and
+``kv_link`` (``intra_node``
 or ``inter_node``) names the link its KV transfers are priced on. An optional
 ``router_in_s`` makes the router the ``router`` LP, with that lookahead on each
 hop into it; it prices no work, so it is no server LP and hands nothing in.
@@ -223,6 +225,16 @@ prices on the machine's ``interconnect.host_link``. Its channels' lookahead is
 has the connector factory build ``lmcache_mp`` as Compass's
 (`atom.compass.kv.lmcache_mp`), whose scheduler half sends each transfer to LP
 ``lmcache`` from the step loop.
+
+A deployment that offloads KV through ATOM's in-process ``lmcache_offload``
+needs an ``lmcache_offload`` entry, which `atom.compass.kv.lmcache_offload`
+states, and a run file with one needs such a deployment, at DP and pipeline
+width 1. `engine(config)` then has the connector factory build it as Compass's,
+whose scheduler half keeps each TP rank's CPU tier and prices the tier's
+lookups and copies from the entry. Each such engine's hand-in holds
+``offload``, and the summary carries it over the client run's steps, with the
+GPU and CPU hit rates: prefix-cache hits and tier loads over the prompt tokens
+the prefix cache counted.
 
 The API server's ``--compass-clock-endpoint`` sets `CLOCK_ENV`: the authority
 is not co-hosted but served by `authority`, its own process started before the
@@ -349,9 +361,9 @@ HOST_TERMS = ("http_intake", "tokenizer")
 TOKENIZER_KINDS = ("encode", "encode_batch", "decode", "segment")
 #: A ``host`` entry's ``hops``, each optional and the run-file key of its name:
 #: the lookaheads of the traffic's request, an engine's ZMQ message in, its
-#: output, the stream back and a prefill-decode run's write request. Such a run
-#: states its decode side's under `DECODE_HOPS`.
-HOPS = ("admission_s", "ipc_s", "ipc_out_s", "stream_s", "kv_write_req_s")
+#: output, the stream back, and a prefill-decode run's write request and router
+#: forward. Such a run states its decode side's under `DECODE_HOPS`.
+HOPS = ("admission_s", "ipc_s", "ipc_out_s", "stream_s", "kv_write_req_s", "router_s")
 DECODE_HOPS = "decode_hops"
 #: A hop's lookahead where the run file states none: not 0 s, which puts a
 #: serving run on deadlock recovery.
@@ -458,8 +470,8 @@ def pick_fitted(run: dict, name: str, config) -> None:
 def refuse_unfitted_law(run: dict, config) -> None:
     """Refuse the run file's step linear law where `config` is not what it was
     fitted under: its engine config, which states its tensor-parallel width,
-    context-parallel width 1, and its platform, which the run file's machine
-    spec must state."""
+    context-parallel width 1, a data-parallel group on one node, and its
+    platform, which the run file's machine spec must state."""
     from atom.compass.artifacts import Kind, keyed_platform, machine_platform
     from atom.compass.run.step_grid import differ, keyed
 
@@ -475,6 +487,18 @@ def refuse_unfitted_law(run: dict, config) -> None:
             + "; ".join(named)
         )
     refuse_context_parallel(STEP_LINEAR, config)
+    # A node running fewer ranks than the group holds is one of several, and
+    # ATOM hands MoRI its ranks times the TP width as the GPUs per node
+    # (`moe.py::FusedMoEParallelConfig.make`).
+    dp = config.parallel_config.data_parallel_size
+    local = getattr(config.parallel_config, "data_parallel_size_local", dp)
+    if local < dp:
+        raise ValueError(
+            "the step linear law states no data_parallel_size_local, so it "
+            "prices a data-parallel group on one node, and this run's group "
+            f"spans nodes: data_parallel_size_local {local} of "
+            f"data_parallel_size {dp}"
+        )
     fitted_on = law.get("platform") or {}
     here = keyed_platform(Kind.STEP_LINEAR_LAW, machine_platform(_machine(run)))
     if named := [
@@ -754,7 +778,7 @@ def _engines_table(run: dict):
             **common,
             stream_s=hop(run, f"{DECODE_HOPS}.stream_s"),
             decode_ipc=tuple(hop(run, f"{DECODE_HOPS}.{k}") for k in HOPS[1:3]),
-            router_s=run["router_s"],
+            router_s=hop(run, "router_s"),
             kv_write_req_s=hop(run, "kv_write_req_s"),
             dp=_widths(run),
             router_in_s=run.get("router_in_s"),
@@ -1595,6 +1619,7 @@ def engine(config):
         from atom.compass.kv.lmcache_mp import substitute
 
         substitute()
+    _offload_tier(config, run)
     utils.LP_OF_RANK = dict.fromkeys(range(pc.data_parallel_size), lp)
     _member = f"dp{pc.data_parallel_rank}" if pc.data_parallel_size > 1 else None
     name = lp.name if _member is None else f"{lp.name}.{_member}"
@@ -1603,7 +1628,7 @@ def engine(config):
         # Under the clock's wrap, so a call settles before it waits on its peers.
         shm_collectives.install()
     clock.settle_before_collectives()
-    if _member is not None and _offloads_to_lmcache_mp(config.kv_transfer_config):
+    if _member is not None and _offloads(config.kv_transfer_config, "lmcache_mp"):
         _park_before_dispatch()
     rt = _runtime(lp, run, _member, _PublishedClock)
     inner = _ignoring_sigterm_from_ready(_named(_start_on_leaving(rt)))
@@ -1643,9 +1668,9 @@ def _ignoring_sigterm_from_ready(inner):
         EngineCore._send_ready_signal = ready
 
 
-def _offloads_to_lmcache_mp(kv) -> bool:
-    """Whether a KV transfer config offloads to the lmcache MP server, on its
-    own or as one connector of a ``multi``."""
+def _offloads(kv, connector: str) -> bool:
+    """Whether a KV transfer config offloads KV through `connector`, on its own
+    or as one connector of a ``multi``."""
     if not kv:
         return False
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -1654,7 +1679,37 @@ def _offloads_to_lmcache_mp(kv) -> bool:
         return KVConnectorFactory.canonical_name(c.get("kv_connector", "moriio"))
 
     subs = kv.get("connectors", []) if name(kv) == "multi" else [kv]
-    return any(name(c) == "lmcache_mp" for c in subs)
+    return any(name(c) == connector for c in subs)
+
+
+def _offload_tier(config, run: dict) -> None:
+    """Have the connector factory build ``lmcache_offload`` as Compass's
+    (`atom.compass.kv.lmcache_offload`) when this deployment offloads through
+    it; refuse a deployment and a run file that disagree on whether it does,
+    an entry the connector cannot read, and a deployment above DP or pipeline
+    width 1, whose ranks' tiers this does not join."""
+    from atom.compass.kv import lmcache_offload
+
+    offloads = _offloads(config.kv_transfer_config, "lmcache_offload")
+    if offloads != (lmcache_offload.ENTRY in run):
+        raise ValueError(
+            f"this deployment {'offloads' if offloads else 'offloads no'} KV "
+            f"through lmcache_offload and the run file "
+            f"{'has no' if offloads else 'has an'} {lmcache_offload.ENTRY} entry"
+        )
+    if not offloads:
+        return
+    widths = {
+        "data_parallel_size": config.parallel_config.data_parallel_size,
+        "pipeline_parallel_size": getattr(config, "pipeline_parallel_size", 1),
+    }
+    if wide := [f"{k} {v}" for k, v in widths.items() if v > 1]:
+        raise ValueError(
+            f"lmcache_offload is simulated at DP and pipeline width 1; this "
+            f"deployment runs {', '.join(wide)}"
+        )
+    lmcache_offload.check_entry(run[lmcache_offload.ENTRY])
+    lmcache_offload.substitute()
 
 
 def _park_before_dispatch() -> None:
@@ -2877,7 +2932,10 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     `LPRuntime.paid`. An engine whose offload
     scheduler keeps lookup counters hands in ``lookups``: its tier lookups,
     the prefetches among them, and the deferred prefetches it stopped
-    waiting for. A speculative engine hands in ``speculative``, `_acceptance`."""
+    waiting for. A speculative engine hands in ``speculative``, `_acceptance`.
+    An engine whose ``lmcache_offload`` is simulated hands in ``offload``:
+    `OffloadShell.offload_statistics`, and under ``cache`` its prefix cache's
+    counters (`EngineStats.cache_statistics`)."""
     said = _workers_say(engine_core)
     rt = clock.installed()
     lp = rt.me.name if _member is None else f"{rt.me.name}.{_member}"
@@ -2894,6 +2952,10 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     scheduler = getattr(engine_core, "scheduler", None)
     if getattr(getattr(scheduler, "engine_stats", None), "spec_enabled", False):
         sections = sections | {"speculative": _acceptance(scheduler, run)}
+    for half in getattr(kv, "_connectors", None) or [kv]:
+        if callable(tier := getattr(half, "offload_statistics", None)):
+            cache = scheduler.engine_stats.cache_statistics()
+            sections = sections | {"offload": tier() | {"cache": cache}}
     _hand_in(run, lp, reasons, client_run, **said, **sections)
 
 
@@ -2922,6 +2984,54 @@ def _acceptance(scheduler, run: dict) -> dict:
     }
 
 
+#: The methods ATOM's engine loops run a step through: a pipeline head's, and
+#: every other engine's.
+STEP_METHODS = ("_pp_head_step", "_process_engine_step")
+
+
+def _hit_counters(scheduler) -> list:
+    """``cached_tokens`` and ``full_tokens`` (`EngineStats.cache_statistics`)
+    and the KV connector's ``loaded_tokens``, 0 with none, read as ATOM's
+    ``/metrics`` reads them (`EngineUtilityHandler.collect_metrics`)."""
+    cache = scheduler.engine_stats.cache_statistics()
+    kv = getattr(scheduler, "kv_connector", None)
+    tier = kv.get_statistics() if hasattr(kv, "get_statistics") else {}
+    return [cache["cached_tokens"], cache["full_tokens"], tier.get("loaded_tokens", 0)]
+
+
+def _sample_hit_counters(engine_core) -> list | None:
+    """The series of `engine_core`'s hit counters on its LP clock, cumulative
+    from the server's start: ``[t, *_hit_counters]`` at the run's start, and
+    after each step that changed one, through its `STEP_METHODS`, wrapped on
+    this engine alone. None for an engine with no scheduler statistics."""
+    scheduler = getattr(engine_core, "scheduler", None)
+    if getattr(scheduler, "engine_stats", None) is None:
+        return None
+    rt = clock.installed()
+    series = [[rt.now, *_hit_counters(scheduler)]]
+
+    def sampled(step):
+        @functools.wraps(step)
+        def stepped(*args, **kwargs):
+            out = step(*args, **kwargs)
+            if (now := _hit_counters(scheduler)) != series[-1][1:]:
+                series.append([rt.now, *now])
+            return out
+
+        return stepped
+
+    for name in STEP_METHODS:
+        if hasattr(engine_core, name):
+            setattr(engine_core, name, sampled(getattr(engine_core, name)))
+    return series
+
+
+def _in_force_from(series: list, t: float) -> list:
+    """`series`' samples from the one in force at `t`, the last at or before
+    it, on."""
+    return [s for s in series if s[0] <= t][-1:] + [s for s in series if s[0] > t]
+
+
 def _block_file(now: Path) -> Path:
     """Where the engine whose clock file is `now` publishes its planned KV block
     and the state slot and staging row a transfer moves (`publish_transfer`)."""
@@ -2942,7 +3052,8 @@ def engine_loop(engine_core):
     seconds unless one died. A dead worker reaches the engine as a bare
     `SystemExit`, so its ``ended:`` reason carries what each worker rank wrote
     it raised. Under ``step_grid`` the workers are asked for the bundle
-    before the loop, so a run that ends early still hands it in.
+    before the loop, so a run that ends early still hands it in. In a run the
+    engine hands in ``hit_counters`` too (`_sample_hit_counters`).
 
     In a run the engine ignores SIGTERM until it has handed in: ATOM's handler
     would stop the workers inside a clock call, before they say what their
@@ -2974,6 +3085,8 @@ def engine_loop(engine_core):
             bundle = workers.call_func("step_grid_bundle", wait_out=True)
             sections["step_grid"] = bundle
         if run is not None:
+            if (series := _sample_hit_counters(engine_core)) is not None:
+                sections["hit_counters"] = series
             clock.installed().client_run_ended = lambda k: _engine_hand_in(
                 run, engine_core, sections, k
             )
@@ -3122,7 +3235,8 @@ def _write_summary(run: dict, a: _RecordingAuthority, ended: bool = False) -> No
 
 def _write_client_run(run: dict, a: _RecordingAuthority, k: int, hand_ins=None):
     """Write client run `k`'s summary from the hand-ins at its end, those in its
-    directory unless given, less those at client run ``k - 1``'s end."""
+    directory unless given, less those at client run ``k - 1``'s end, and
+    under ``hit_counters`` each engine's from the sample in force at its start."""
     out = Path(run["out_dir"])
     here = out / CLIENT_DIR.format(k)
     if hand_ins is None:
@@ -3131,6 +3245,13 @@ def _write_client_run(run: dict, a: _RecordingAuthority, k: int, hand_ins=None):
     record = a.ended[k]
     summary = _summary(run, a, record, a.wall(k), hand_ins, since)
     summary["client_run"] = {"index": k, "start": record.start, "end": record.end}
+    hits = {
+        n: _in_force_from(h["hit_counters"], record.start)
+        for n, h in hand_ins.items()
+        if "hit_counters" in h
+    }
+    if hits:
+        summary["hit_counters"] = hits
     here.mkdir(exist_ok=True)
     _write_whole(here / SUMMARY_FILE, json.dumps(summary, sort_keys=True, indent=1))
 
@@ -3248,7 +3369,44 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
             }
     if speculative:
         summary["speculative"] = speculative
+    # Each offloading engine's tier and copies over these steps, and the hit
+    # rates ATOM's counters give: prefix-cache hits and tier loads, each over
+    # the prompt tokens its prefix cache counted.
+    offload = {}
+    for n, h in hand_ins.items():
+        if "offload" in h:
+            seen = _counted_since(h["offload"], since.get(n, {}).get("offload", {}))
+            full = seen["cache"]["full_tokens"]
+            gpu, cpu = (
+                seen["cache"]["cached_tokens"],
+                seen["connector"]["loaded_tokens"],
+            )
+            offload[n] = seen | {
+                "gpu_hit_rate": gpu / full if full else None,
+                "cpu_hit_rate": cpu / full if full else None,
+            }
+    if offload:
+        summary["offload"] = offload
     return summary
+
+
+#: Counters of an ``offload`` hand-in that are levels, not counts: reported as
+#: they stand, never less an earlier client run's.
+OFFLOAD_LEVELS = frozenset(
+    {"held_chunks", "loads_pending", "saves_pending", "blocks_waiting_for_store"}
+)
+
+
+def _counted_since(now: dict, then: dict) -> dict:
+    """`now`'s counts less `then`'s, nested alike; a level as it stands."""
+    return {
+        k: (
+            _counted_since(v, then.get(k, {}))
+            if isinstance(v, dict)
+            else v if k in OFFLOAD_LEVELS else v - then.get(k, 0)
+        )
+        for k, v in now.items()
+    }
 
 
 def authority(endpoint: str) -> None:

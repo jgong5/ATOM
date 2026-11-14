@@ -62,7 +62,7 @@ def test_a_saved_spec_answers_origin_for_every_field():
 
 def test_a_field_two_fragments_agree_on_is_assumed_only_if_both_assumed_it():
     links = fragment("links", LINKS, origin="assumed")
-    probed = fragment("probe", {"interconnect": {"router_relay_s": 1.5e-3}})
+    probed = fragment("probe", {"interconnect": {"inter_node": {"derate": 0.80}}})
     sheet = fragment(
         "datasheet",
         {"interconnect": {"inter_node": {"link_latency_s": 5.0e-6}}},
@@ -71,7 +71,7 @@ def test_a_field_two_fragments_agree_on_is_assumed_only_if_both_assumed_it():
     fragments = [*three_origins()[:2], probed, sheet, links]
     document = saved(merge(fragments).document)
     spec = MachineSpec.from_mapping(document)
-    assert spec.origin("interconnect.router_relay_s") == {"origin": "probed"}
+    assert spec.origin("interconnect.inter_node.derate") == {"origin": "probed"}
     assert spec.origin("interconnect.inter_node.link_latency_s") == {
         "origin": "datasheet"
     }
@@ -116,7 +116,7 @@ def test_a_document_of_one_origin_answers_without_the_map():
     stanza = dict(DOCUMENT["provenance"], subject={"model": "Qwen/Qwen3-8B"})
     spec = MachineSpec.from_mapping(dict(DOCUMENT, provenance=stanza))
     assert "provenance.origins" not in spec.values
-    assert spec.origin("interconnect.router_relay_s") == {
+    assert spec.origin("interconnect.inter_node.derate") == {
         "origin": "probed",
         "model": "Qwen/Qwen3-8B",
     }
@@ -140,7 +140,7 @@ def test_one_field_is_never_mixed_and_only_a_probed_one_has_a_subject():
     ):
         broken = copy.deepcopy(document)
         broken["provenance"]["origins"] = dict(
-            origins, **{"interconnect.router_relay_s": entry}
+            origins, **{"interconnect.inter_node.derate": entry}
         )
         with pytest.raises(SpecRefusal, match=wanted):
             MachineSpec.from_mapping(broken)

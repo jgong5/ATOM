@@ -885,11 +885,13 @@ Its other vectors and its host laws are the ones fitted on the lone cells alone,
 its `sources` names the records each came from. The prefill law's rung-2 vector is the
 decode law's, stating `declared`, since the prefill law's own fit left rung 2 unfitted
 ([#2660](https://github.com/jgong5/ATOM/issues/2660)). Its prefill vector is refitted
-in the `cached_seqs` form on the lone prefill cells and on the prefill side of one 1P1D
-`deploy.sh record` cell, #975's cell at c=1 over traces 256 to 392, seed 20260707
-([#2853](https://github.com/jgong5/ATOM/issues/2853)); its other vectors but rung 2, and its
-host laws, are the lone cells' fit. The pair's lone cells ran the fp4 indexer and its 1P1D
-cells the fp8 one. Each law is keyed to the fp8 a P/D side resolves, without a refit: it
+in the `cached_seqs` form on records that ran the fp8 indexer alone: the prefill sides of
+#975's 1P1D cell, at c=1 over traces 256 to 392 and 0 to 255, seed 20260707
+([#2853](https://github.com/jgong5/ATOM/issues/2853)), and of #975's own rounds at c=1 to
+256, and two lone prefill cells at c=64 that ran fp8
+([#3073](https://github.com/jgong5/ATOM/issues/3073), [#3402](https://github.com/jgong5/ATOM/issues/3402));
+its other vectors but rung 2, and its host laws, are the lone cells' fit. The pair's lone
+cells ran the fp4 indexer and its 1P1D cells the fp8 one. Each law is keyed to the fp8 a P/D side resolves, without a refit: it
 states no `index_cache_dtype`, which then reads as `kv_cache_dtype`'s fp8, so a server that
 resolves fp4 refuses it. Its provenance states the gap that interleaved fp8 and fp4 lone cells
 measured ([#3073](https://github.com/jgong5/ATOM/issues/3073#issuecomment-6757202887)).
@@ -1001,7 +1003,8 @@ since calibration replays traces no cell is graded on (the
 cell's record (`OUT_DIR/steps` of a `REAL=1 cctraces_sim.sh` run) with a law
 file as `step_linear_fit` writes it, and prints the error per kind, per decode rung
 and per prefill token band; a record of several DP ranks is joined on step index,
-each step priced and banded as its slowest rank. The module's docstring states what each figure is.
+each step priced and banded as its slowest rank, and the error is also given per rank
+with its cards' PCI buses where `run.json` names them. The module's docstring states what each figure is.
 Grade a law only on cells whose traces its calibration cells do not replay.
 
 ## Schedule and end-to-end grades — `validate.runs`
@@ -1024,6 +1027,15 @@ over every DP rank of that side, cost at the law fitted under that side's engine
 memory against that side's hand-in (`lp-engine-P.json`, `lp-engine-D.json`); end to
 end once, from the deployment's export. The export names decode's response ids, so
 prefill's side is split through decode's `transfers.jsonl` (`parity.transfers`).
+
+## Curves and a verdict per point — `python -m atom.compass.validate --curves`
+
+`PYTHONPATH=$T python -m atom.compass.validate --curves OUT ARM...` reads each ARM's
+points, a directory per concurrency holding two or more `real*/` runs and a simulated run
+per backend, computes InferenceX's agentic metrics from each run's client export, draws
+the real and simulated curves on InferenceX's axes as PNG files in OUT, and prints a
+verdict per point and metric. The `validate.curves` docstring states the metrics, the
+limits and the charts.
 
 ## A 1P1D deployment across crsuse2-m2m-v3-005 and -013
 
@@ -1122,6 +1134,29 @@ at the run's own commit on the node where that side's real instance runs (013 fo
 the decode): decode readings taken on 005 sized the simulated decode 79 to 80 KV
 blocks per rank above every real decode on 013
 ([ruling](https://github.com/jgong5/ATOM/issues/1111#issuecomment-6659985920)).
+
+### MORI's dispatch and combine at EP8
+
+At EP8 each MoE layer exchanges its rows through two leaves the EP-off graphs lack,
+MORI's dispatch and combine. Like every collective, only a `measure ops` run on all
+eight GPUs measures them, and a one-GPU run refuses them. Each rank calls them at
+MORI's entry point on the handle ATOM builds for the model's first MoE layer, and a
+point records each graph it was timed by under `parts_ns` (`_Mori` in
+`atom/compass/bench/ops.py`). Trace and measure under the EP8 cell's decode
+arguments and environment above, `MORI_SHMEM_HEAP_SIZE=16G` among them, with its
+Mooncake role, here `D` and `KV`:
+
+```
+compass trace ops --model <DeepSeek-V4-Pro> --tp 8 --arch gfx950 --width 1 --width 8 \
+  --width 32 --store S -- D --kv-transfer-config KV
+compass measure ops --width 1 --width 8 --width 32 --context 8192 --llc-mib 256 \
+  --gpu 0,1,2,3,4,5,6,7 --store S --out O -- D --kv-transfer-config KV --enforce-eager --level 0
+```
+
+`measure ops` skips a point its store holds, so each repeat measures into a copy of
+the traced store of its own. `fit ops` prices both leaves over their message bytes,
+as any collective. The EP8 cells' grade is
+[#3409](https://github.com/jgong5/ATOM/issues/3409)'s.
 
 ### The inter-node link — `rdma_link.py`
 
@@ -1235,15 +1270,20 @@ store. A record without a store touches no library.
    tool: per concurrency 16 and 4, `compass record --trace --gpu G --out
    $R/trace/c<C> -- $ATOM` and `client.sh $R/trace/c<C> --traces 256-392
    --concurrency <C> --duration 120 --stop`.
-3. `compass fit steps --backend step-linear --form history $R/cal/c* $R/trace/c*
-   --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $S --out
-   $R/fit`, every record and trace run named before the first `--client-run`, and
+3. `compass fit steps --backend step-linear --form history --model $MODEL $R/cal/c*
+   $R/trace/c* --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $S
+   --out $R/fit`, every record and trace run named before the first `--client-run`,
+   `--model` naming the model directory, whose config gives a MoE model's routing, and
    `compass fit host` on the calibration records alone; each prints its store token.
    Steps 1 to 3, after a warm record, are `calibrate.sh $R/cal 1 4 16 "trace 16" "trace 4"` with
    `MODEL`, `GPU`, `TRACES` and `AIPERF_PYTHON` set, its store
-   `$R/cal/store`; it prints the tokens, the law's held-out errors per band
-   and the `compass run` line of step 5. A RECORD after its concurrency names
-   the client's scenario, such as `"8 --trajectory-start-min-ratio 0
+   `$R/cal/store`; it reads no platform, so it prints the tokens, the law's held-out
+   errors per band and the `compass run` line of step 5 with `$M` left as `--device
+   DATASHEET --ptl PTL`. That store holds no `platform_readings` entry, and step 5's
+   `compass run` refuses a store with none: publish one into `$R/cal/store` with
+   `compass measure device` and `compass fit device`, as the platform's bullet in
+   [QUICKSTART.md](QUICKSTART.md#environment) does, before step 5. A RECORD after its
+   concurrency names the client's scenario, such as `"8 --trajectory-start-min-ratio 0
    --trajectory-start-max-ratio 0"`, the first-turn record that gives the law
    its decode rung 8; `trace` before one makes it a trace run of that recipe.
 4. Real runs: per concurrency, two `compass record --gpu G --out

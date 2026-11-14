@@ -27,8 +27,7 @@ from atom.compass.spec.fields import BAND
 from atom.compass.spec.layers import BANDWIDTH, CURVE, DATASHEET, NETWORK, RATES
 
 #: What a spec states that no readings entry holds: the document's header, the
-#: stack and PTL state its key states, the derates the composition makes, the
-#: router's hop.
+#: stack and PTL state its key states and the derates the composition makes.
 NOT_READINGS = (
     "schema_version",
     "name",
@@ -36,7 +35,6 @@ NOT_READINGS = (
     "device.software_pinned_to.",
     "device.ptl",
     "device.memory.derate",
-    "interconnect.router_relay_s",
     *DATASHEET,
     *NETWORK,
 )

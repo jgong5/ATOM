@@ -20,7 +20,7 @@ curve is `[bytes, bytes per second]` points, both rising with the bytes.
 Every field is required except the provenance fields `merge` fills in,
 `fp4_flops` and its derate, the bandwidth curve, the kernel and profiler
 floors, the pipeline send terms, a link's `link_setup_s` (zero when absent), the
-`inter_node` link, which only a run across nodes reads, the router's hop, the
+`inter_node` link, which only a run across nodes reads, the
 `host_link` pair and `device.ptl`, the cards' PTL state (`disabled` when
 absent). An engine start's memory readings are no field here: `compass measure
 memory` publishes them per configuration, as a `memory_readings` entry.
@@ -173,7 +173,6 @@ FIELDS = (
     ),
     Field("interconnect.inter_node.link_latency_s", Kind.QUANTITY, required=False),
     Field("interconnect.inter_node.link_setup_s", Kind.QUANTITY, required=False),
-    Field("interconnect.router_relay_s", Kind.QUANTITY, required=False),
     # The device-to-host copy an lmcache server's stores and loads ride, as a
     # copy reaches it (not a peak); a run with an lmcache server requires it.
     Field(

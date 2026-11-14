@@ -95,7 +95,6 @@ DOCUMENT = {
             "link_latency_s": 5.0e-6,
             "derate": 0.80,
         },
-        "router_relay_s": 1.5e-3,
     },
 }
 
@@ -820,7 +819,7 @@ def test_a_missing_stack_pin_is_refused():
     [
         (("device", "count_per_node"), True),
         (("device", "count_per_node"), 0),
-        (("interconnect", "router_relay_s"), -1.0),
+        (("interconnect", "inter_node", "link_latency_s"), -1.0),
         (("device", "name"), ""),
         (("device", "arch"), 950),
         (("schema_version",), 2),
