@@ -54,9 +54,11 @@
 # OUT. A client drives the deployment through server.json as it drives one
 # server (client.sh); no client starts here. It serves until SIGTERM or SIGINT,
 # then stops the instances, the router and the authority, writes OUT/run.json,
-# the command line, the KV link, the run file and the router's command, and
+# the command line, the KV link, the run file and the router's command, and,
+# once a client's export is complete (OUT/artifacts/client_run.json), each
+# request's split, OUT/request_split.json (atom/compass/report/split.py), and
 # exits 0, or 1 when something left on its own, a router LP as the traffic
-# closes aside, or failed to stop. Exits 2 on bad arguments.
+# closes aside, failed to stop, or the split failed. Exits 2 on bad arguments.
 #
 # Real, there is no run file or authority: each instance is one `compass
 # record --out`, which checks its node's GPUs before and after.
@@ -322,4 +324,8 @@ if os.path.exists(out + "/run_file.json"):
 open(out + "/run.json.part", "w").write(json.dumps(run))' \
     "$OUT" "$KV_LINK" "${#ARGV[@]}" "${ARGV[@]}" "${ROUTER[@]}"
 mv "$OUT/run.json.part" "$OUT/run.json"
+if [[ -s $OUT/artifacts/client_run.json ]]; then
+    (cd / && python3 -m atom.compass.report.split "$OUT") ||
+        { echo "deploy: split: atom.compass.report.split exited $?" >&2; rc=1; }
+fi
 exit $rc

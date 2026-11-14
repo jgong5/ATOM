@@ -1787,7 +1787,10 @@ def _group_step_seconds(
     has one reason.
 
     On the rank that keeps the parity record, each step also appends its cost
-    line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`; with a
+    line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`;
+    `t_s`, the engine's clock at the forward's entry, read through the
+    `compass_host`'s `now`, or None without one, so the forward runs from
+    `t_s` to `t_s` plus `group_s`, which it returns; with a
     `compass_host` that reports them, each of `HOST_SEGMENTS` and
     `MTP_SEGMENT` and `PP_RECV_SEGMENT`, the part of `W_launch` before a
     later stage's receive, in seconds, each 0.0 where the law has none, and `skipped`,
@@ -1906,8 +1909,10 @@ def _group_step_seconds(
     if hasattr(host, "segments"):
         skipped = [s for s in host.segments if s in host.skip]
         segments = {**host.segments, "skipped": skipped}
+    now = getattr(host, "now", None)
     line = {
         "step": step,
+        "t_s": None if now is None else now(),
         **segments,
         "device_s": device_s,
         "draft_s": draft_s,
