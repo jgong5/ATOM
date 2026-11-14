@@ -5,8 +5,10 @@ readings get a verdict naming the requirement that failed, written into OUT.
 The configuration is `test_run_step_grid`'s deployment, resolved for every
 instance, with its readings and platform readings in the store; its laws are
 the checked-in DPA8 decode law re-keyed to that configuration, as a law file
-(`reuse.LAWS`) or a store entry beside host laws. The head is the tree's own
-digest, except where a test builds a repository for the tree.
+(`reuse.LAWS`) or a store entry beside host laws. The 1P1D sides whose config
+resolves for real are DeepSeek-V4-Pro's, judged by the shipped crs005 DPA8
+pair. The head is the tree's own digest, except where a test builds a
+repository for the tree.
 """
 
 import json
@@ -16,12 +18,22 @@ import subprocess
 import platforms
 import pytest
 from test_artifact_invalidation import STANZA, moved
+from test_capture_v4_pro import CONFIG as V4_PRO
 from test_drive_runfile import LAWS as HOST_LAWS
 from test_memory_readings import READINGS, publish_readings
+from test_run_check_side import (
+    DECODE_SIZES,
+    MACHINE,
+    PAIR,
+    SHARED_ENV,
+    SIDES,
+    UNCOVERED,
+)
 from test_run_lacking import served
 from test_run_lacking_rungs import DPA8
 from test_run_step_grid import DOCUMENT, PLATFORM, deployment, host_laws_key, readings
 
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import cli
 from atom.compass import run as compass_run
 from atom.compass.advice.check import REUSE
@@ -47,24 +59,30 @@ WITHIN |= {"median": -0.02, "refused": 0}
 
 
 @pytest.fixture
-def searched(tmp_path, monkeypatch):
+def at_head(monkeypatch):
+    """The head taken, a commit whose ATOM digest is the tree's."""
+    head = {"commit": "c0ffee" * 6 + "c0ff", "ref": "origin/" + reuse.INTEGRATION}
+    head["atom"] = compass_run.atom_digest()
+    monkeypatch.setattr(reuse, "head", lambda commit=None: head)
+
+
+@pytest.fixture
+def searched(tmp_path, monkeypatch, at_head):
     """The deployment at `COVERED`, served for every instance, at the head
     whose digest is the tree's, with no law file."""
     r = deployment(tmp_path, **COVERED)
     served(monkeypatch, r.config)
-    head = {"commit": "c0ffee" * 6 + "c0ff", "ref": "origin/" + reuse.INTEGRATION}
-    head["atom"] = compass_run.atom_digest()
-    monkeypatch.setattr(reuse, "head", lambda commit=None: head)
     monkeypatch.setattr(reuse, "LAWS", tmp_path / "laws")
     (tmp_path / "laws").mkdir()
     return r
 
 
-def advise(tmp_path, **fields) -> dict:
+def advise(tmp_path, document=DOCUMENT, **fields) -> dict:
     """`compass advice` on one candidate at concurrencies 1 and 4, serving
-    the model in `tmp_path` on the suite's platform from its store, with
-    `fields` in place of the space's own; the verdicts it writes."""
-    flags = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
+    the model in `tmp_path` on `document`'s platform, the suite's, from its
+    store, with `fields` in place of the space's own; the verdicts it
+    writes."""
+    flags = platforms.flags(tmp_path / "store", document, tmp_path)
     space = {
         "model": str(tmp_path),
         "machine": {"device": flags[1], "ptl": flags[3]},
@@ -80,10 +98,10 @@ def advise(tmp_path, **fields) -> dict:
     return json.loads((tmp_path / "out" / REUSE).read_text())
 
 
-def verdicts(judged: dict, what: str) -> list[dict]:
-    """The one candidate's `what` verdicts, a point's each."""
+def verdicts(judged: dict, what: str, side: str = "server") -> list[dict]:
+    """The one candidate's `what` verdicts on its `side`, a point's each."""
     points = judged["candidates"]["a"]["points"]
-    return [point[what]["server"] for point in points.values()]
+    return [point[what][side] for point in points.values()]
 
 
 def law(r, **changed) -> dict:
@@ -99,6 +117,15 @@ def law(r, **changed) -> dict:
     for source in held["sources"].values():
         source["figures"] = {run: {"decode": dict(WITHIN)} for run in held["runs"]}
     return held | changed
+
+
+def past(r) -> tuple[dict, str]:
+    """`law` with one run's decode median +5.12% on source refitted, past the
+    gate; and that run."""
+    held = law(r)
+    run = held["runs"][1]
+    held["sources"]["refitted"]["figures"][run]["decode"]["median"] = 0.0512
+    return held, run
 
 
 def law_file(tmp_path, held: dict) -> str:
@@ -120,11 +147,13 @@ def publish(tmp_path, r, kind, key, params, conditions=None, store="store"):
     )
 
 
-def stored(tmp_path, r, conditions=None, atom=None, host=True, store="store"):
-    """`law`'s step law in the store at `tmp_path / store`, its records at
-    `atom`, else at the head's digest, under `conditions`; with `host`, its
-    host laws beside it."""
-    held = law(r)
+def stored(
+    tmp_path, r, conditions=None, atom=None, host=True, store="store", held=None
+):
+    """`held`'s step law, else `law`'s, in the store at `tmp_path / store`, its
+    records at `atom`, else at the head's digest, under `conditions`; with
+    `host`, its host laws beside it."""
+    held = held or law(r)
     key = {
         "model": compass_run._file_digest(r.config.model, "config.json"),
         "engine_config": json.dumps(keyed(r.config), sort_keys=True),
@@ -247,9 +276,7 @@ def test_a_scheduled_decode_rung_with_no_vector_names_requirement_3(
 def test_a_figure_past_5_percent_names_requirement_4(
     tmp_path, searched, records, verdict, named
 ):
-    held = law(searched)
-    run = held["runs"][1]
-    held["sources"]["refitted"]["figures"][run]["decode"]["median"] = 0.0512
+    held, run = past(searched)
     if records != "at the head":
         held["records_atom"] = "0" * 64 if records == "at another digest" else None
     law_file(tmp_path, held)
@@ -335,6 +362,79 @@ def test_a_candidate_is_looked_up_in_the_latest_calibration_store_holding_all_it
 
     assert judged["candidates"]["a"]["store"] == str(tmp_path / "store")
     assert {v["verdict"] for v in verdicts(judged, "readings")} == {"measure"}
+
+
+@pytest.mark.parametrize(
+    "case, looked_up, verdict",
+    [
+        ("every input at its key", "cal/a", ("refused", 4)),
+        ("its law at another digest", "shared", ("calibrate", 1)),
+        ("no platform readings", "shared", ("calibrate", 1)),
+    ],
+)
+def test_a_calibration_store_holding_every_input_at_its_key_is_looked_up_whatever_its_verdict(
+    tmp_path, searched, case, looked_up, verdict
+):
+    r = searched
+    a = tmp_path / "out/cal/a/store"
+    if case != "no platform readings":
+        platforms.flags(a, DOCUMENT, tmp_path)
+    atom = "0" * 64 if case == "its law at another digest" else None
+    stored(tmp_path, r, atom=atom, store=a.relative_to(tmp_path), held=past(r)[0])
+    publish_readings(a, r.config)
+
+    judged = advise(tmp_path)
+
+    store = a if looked_up == "cal/a" else tmp_path / "store"
+    assert judged["candidates"]["a"]["store"] == str(store)
+    found = verdicts(judged, "law")
+    assert [(v["verdict"], v["requirement"]) for v in found] == [verdict] * 2
+    assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
+
+
+def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, at_head):
+    for name in PERFORMANCE_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    model = tmp_path / "DeepSeek-V4-Pro"
+    model.mkdir()
+    shutil.copy(V4_PRO, model / "config.json")
+    cpu = json.loads(PAIR["prefill"].read_text())["host"]["key"]["host_cpu"]
+    monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
+    common = {"basis": "a recipe", "deployment": "1p1d", "env": SHARED_ENV}
+    common["args"] = {"--tensor-parallel-size": 8, "--kv-cache-dtype": "fp8"}
+    common["args"]["--enable-dp-attention"] = True
+    common["prefill"] = {"args": {"--enable-tbo": True}, "env": SIDES["prefill"][1]}
+    common["decode"] = {"args": {"--cudagraph-capture-sizes": DECODE_SIZES}}
+
+    judged = advise(tmp_path, MACHINE, model=str(model), common=common)
+
+    for side, rungs in UNCOVERED.items():
+        found = verdicts(judged, "law", side)
+        assert [(v["verdict"], v["requirement"]) for v in found] == [
+            ("calibrate", 3)
+        ] * 2
+        assert f"{PAIR[side]} has no decode vector for rungs {rungs}, which" in (
+            found[0]["reason"]
+        )
+        (reason,) = {v["reason"] for v in verdicts(judged, "readings", side)}
+        assert '"index_cache_dtype": "fp8"' in reason
+        assert '"AITER_LOG_LEVEL": "WARNING"' in reason
+
+
+def test_a_side_s_own_kv_transfer_config_is_refused_as_deploy_sh_refuses_it(
+    tmp_path, searched
+):
+    law_file(tmp_path, law(searched))
+    prefill = {"args": {"--kv-transfer-config": "{}"}}
+    block = {"basis": "a recipe", "deployment": "1p1d", "prefill": prefill}
+
+    judged = advise(tmp_path, common=block)
+
+    named = "--kv-transfer-config is among the prefill side's ATOM arguments"
+    for what in ("law", "readings"):
+        found = verdicts(judged, what, "prefill")
+        assert {(v["verdict"], v["requirement"]) for v in found} == {("refused", None)}
+        assert found[0]["reason"].startswith(named)
 
 
 def git(tree, *args) -> str:

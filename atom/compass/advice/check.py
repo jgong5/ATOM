@@ -6,13 +6,17 @@ written into OUT as `REUSE`.
 The head is taken once, at the commit SPACE freezes or the integration branch's
 tip; a tree that is not the head gives every verdict ``refused``, requirement
 1, with the reason. A candidate is looked up in each of `reuse.stores` in turn
-and takes the first in which every verdict of its points is ``reuse``, else the
-shared store's. There, each instance of each point is resolved as ATOM's server
+and takes the first that holds every input of its points, whatever the verdicts
+on them there, else the shared store's: its platform readings compose with
+SPACE's machine, and no verdict names requirement 1, so each point's readings,
+and each law that is not a checked-in file, are at their key at the head's ATOM
+digest. There, each instance of each point is resolved as ATOM's server
 resolves its arguments, under its variables, on the device arch of the machine
-spec that store's platform readings compose with SPACE's machine; the laws are
-judged at each point, since an argument that varies with the concurrency moves
-their key. A refusal of the composition, of a configuration or of the runner
-under a law is ``refused``, verbatim, naming no requirement.
+spec that store's platform readings compose with SPACE's machine; a 1P1D side
+as `deploy.sh run` starts it, as `compass run --check` resolves one. The laws
+are judged at each point, since an argument that varies with the concurrency
+moves their key. A refusal of the composition, of a configuration or of the
+runner under a law is ``refused``, verbatim, naming no requirement.
 """
 
 import contextlib
@@ -49,7 +53,7 @@ def check(expansion: dict, out: Path) -> dict:
         points = [p for p in expansion["points"] if p["candidate"] == candidate["name"]]
         if refused:
             verdicts = {
-                p["name"]: _point(p, lambda _: (refused, refused)) for p in points
+                p["name"]: _point(p, lambda *_: (refused, refused)) for p in points
             }
             judged[candidate["name"]] = {"store": None, "points": verdicts}
             continue
@@ -59,7 +63,9 @@ def check(expansion: dict, out: Path) -> dict:
             spec = _or_refused(compose, *given)
             judge = functools.partial(_judged, store, spec, head["atom"], seen)
             verdicts = {p["name"]: _point(p, judge) for p in points}
-            if all(v["verdict"] == "reuse" for v in _each(verdicts)):
+            if not isinstance(spec, dict) and all(
+                v["requirement"] != 1 for v in _each(verdicts)
+            ):
                 break
         judged[candidate["name"]] = {"store": str(store.root), "points": verdicts}
     written = {"head": head, "refused": refused, "candidates": judged}
@@ -87,31 +93,39 @@ def lines(judged: dict) -> list[str]:
 
 def _point(point: dict, judge) -> dict:
     """`point`'s ``law`` and ``readings`` verdicts per instance, as `judge`
-    gives them for each."""
+    gives them for each, given its side."""
     verdicts = {"law": {}, "readings": {}}
     for side, one in point["instances"].items():
-        verdicts["law"][side], verdicts["readings"][side] = judge(one)
+        verdicts["law"][side], verdicts["readings"][side] = judge(side, one)
     return verdicts
 
 
-def _judged(store, machine, atom: str, seen: dict, one: dict) -> tuple:
+def _judged(store, machine, atom: str, seen: dict, side: str, one: dict) -> tuple:
     """The instance `one`'s law and readings verdicts in `store` on `machine`,
     a spec or the verdict its refusal gives, at the head's ATOM digest `atom`:
     each instance's config resolved once, under its variables, and judged once
-    a store, both kept in `seen`."""
+    a store, both kept in `seen`. A 1P1D `side` takes the KV transfer config
+    `deploy.sh` adds, on the simulated connector, and runs under the
+    ``AITER_LOG_LEVEL`` the script's `compass_env` sets when unset."""
     if isinstance(machine, dict):
         return machine, machine
-    instance = (tuple(one["args"]), tuple(one["env"].items()))
+    args, env = one["args"], one["env"]
+    if side in drive_run.ROLES:
+        args = _or_refused(drive_run.side_args, side, args, drive_run.SIMULATED)
+        if isinstance(args, dict):
+            return args, args
+        env = {"AITER_LOG_LEVEL": os.environ.get("AITER_LOG_LEVEL", "WARNING")} | env
+    instance = (tuple(args), tuple(env.items()))
     if (store.root, *instance) not in seen:
-        with _env(one["env"]):
+        with _env(env):
             if instance not in seen:
                 arch = machine.value("device.arch")
-                seen[instance] = _or_refused(drive_run._config, one["args"], arch)
+                seen[instance] = _or_refused(drive_run._config, args, arch)
             if isinstance(config := seen[instance], dict):
                 verdicts = config, config
             else:
                 verdicts = (
-                    _or_refused(reuse.law, store, config, machine, one["args"], atom),
+                    _or_refused(reuse.law, store, config, machine, args, atom),
                     _or_refused(reuse.readings, store, config, machine),
                 )
         seen[(store.root, *instance)] = verdicts
