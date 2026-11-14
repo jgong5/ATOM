@@ -564,7 +564,8 @@ FLYDSL_OFF_VALUES = ("1", "true", "True", "yes", "YES")
 #: pick's top-k's row bounds (`ends`), there where its logits, the block
 #: maxima, are an activation (FP8) or packed rows (FP4).
 _FP4 = (
-    "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4:flydsl_pa_mqa_logits_fp4"
+    "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup:"
+    "flydsl_pa_mqa_logits_fp4_rowgroup"
 )
 _WRITTEN = {
     (_LOGITS, "kv_indices"): "tiles",

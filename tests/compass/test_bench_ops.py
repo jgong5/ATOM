@@ -793,7 +793,6 @@ def test_v41_fp4_candidate_leaves_take_the_tables_atom_s_forward_writes(monkeypa
         return _leaf(
             ops._FP4,
             ("block_tables", table),
-            ("context_lens", None),
             ("row_ends", bounds),
             ("max_seq_len", 32),
         )
