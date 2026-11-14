@@ -51,14 +51,14 @@ method's error compares the frozen projection's spec with A0's on those records 
 [#3257](https://github.com/jgong5/ATOM/issues/3257):** the M3-Agentic stage grades each
 point by its overlap with the real curve (D45.1), its arms a set of their own (D50).
 
-**Revised 2026-11-14 by the owner's ruling on
-[#3423](https://github.com/jgong5/ATOM/issues/3423):** the DSv41-DPEP stage grades its DP
-points by D45.1 too, without the CPU hit rate, a set of their own (D50).
-
 **Revised 2026-11-13 by [#3355](https://github.com/jgong5/ATOM/issues/3355):** the
 adoption showcase grades the configuration its MiniMax-M3 search recommends and the
 runner-up, a set of their own, and compares their order, each point's D45.1 verdict
 reported beside its grade (D50, `19` D117).
+
+**Revised 2026-11-14 by the owner's ruling on
+[#3423](https://github.com/jgong5/ATOM/issues/3423):** the DSv41-DPEP stage grades its DP
+points by D45.1 too, without the CPU hit rate, a set of their own (D50).
 
 **Scope.** What counts as evidence: which results are reported, how each is measured, what
 tolerance applies and where that tolerance comes from, and what invalidates a run.

@@ -531,6 +531,15 @@ DSv41-DPEP stage (`16` D95.2), whose arms serve DeepSeek-V4.1-Flash with `--meth
 - **Its KV is in the target's pool**, as at stage 4: at these arms an MXFP8 pool with an
   FP4 index, its window-only layers in each request's STATE entry. Each rank's memory
   reading is taken with it.
+- **Priced at step level, from records, by the drafter's own vectors fitted per rank.**
+  Each rank's one-pass block draft is priced by the draft law (`backends/step_linear.py`'s
+  `draft`) at that rank's rung and rows: its decode vector on a decode and its prefill
+  vector on a prefill, `propose` for the propose pass an output prefill runs and
+  `draft_kv` for the draft-KV pass a decode runs, each fitted as a DP vector on the rank's
+  own rows, its MoE column at the arm's layout
+  ([#3429](https://github.com/jgong5/ATOM/issues/3429)). An idle rank's dummy draft is
+  priced the same way, and the group's step is the `max` over ranks (`15` D90). There is
+  no `forward` vector a pass: the block drafter runs one.
 - **Acceptance is forced at 3.51** through `--spec-decode-acceptance-length` on both runs,
   InferenceX's golden length for DSpark5 with thinking on. At 3.51 and `K = 5` the
   minimum-variance schedule (D84) accepts two drafts on every verify row and a third with
@@ -572,7 +581,7 @@ DSv41-DPEP stage (`16` D95.2), whose arms serve DeepSeek-V4.1-Flash with `--meth
 | D86 | Draft weights are Class A; draft KV comes from ATOM's own pool declarations (`ModelRunner._sub_pool_specs`), and its layer count is never re-derived. | 2026-09-19; revised 2026-10-29 (#2437) |
 | D87 | A speculative throughput result is **conditional on its acceptance input**, and the run summary names its method. Mean AL and the accepted-count histogram are checked by tests of the plumbing, not graded per cell; per-step realisation and within-sequence correlation are **not reproduced and not claimed**. Schedule agreement is graded more loosely for speculative cells. Predicting acceptance itself is explicitly not attempted. A cell whose two runs state the same AL is acceptance evidence. | 2026-09-19; revised 2026-11-02 (#2683), 2026-11-13 (#3345) |
 | D87.1 | MiniMax-M3's EAGLE3, ruled by the owner: a Llama draft stack with its own draft KV pool, declared by `draft_kv_builder`; priced at step level from records by the drafter's own vectors, a draft forward per serial pass, propose and draft KV; acceptance forced through `--spec-decode-acceptance-length` on both runs; at level 0 by scenario, closing #2672's Eagle case. | 2026-11-12 (#3257) |
-| D87.2 | DSpark5 under DP attention, ruled by the owner for the DSv41-DPEP stage: one draft pass a step on every rank, padded to the group with no gather of its own; its routed experts in the arm's layout; its KV in the target's MXFP8 pool; acceptance forced at 3.51 on both runs. | 2026-11-14 (#3423) |
+| D87.2 | DSpark5 under DP attention, ruled by the owner for the DSv41-DPEP stage: one draft pass a step on every rank, padded to the group with no gather of its own; priced at step level from records by the draft law's own vectors, each fitted as a DP vector on the rank's own rows; its routed experts in the arm's layout; its KV in the target's MXFP8 pool; acceptance forced at 3.51 on both runs. | 2026-11-14 (#3423) |
 
 ---
 

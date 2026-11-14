@@ -217,8 +217,9 @@ named for the model and the parallelism of its arms.
   [#3126](https://github.com/jgong5/ATOM/issues/3126).
 - **The real curve is this branch's ATOM**, as D95.1 rules for M3-Agentic. Its ATOM
   base is ROCm/ATOM `e893780f4`, 120 commits behind the submission's `e5b74bc86`. Every
-  DP change the submission names is in the base; five later ones change a DP point
-  (ROCm/ATOM#2456, #2727, #3106, #3098, #2912), so each registration states the gap
+  DP change the submission names is in the base; later ones change a DP point
+  (ROCm/ATOM#2456, ROCm/ATOM#2727, ROCm/ATOM#3106, ROCm/ATOM#3098 and
+  ROCm/ATOM#2912), so each registration states the gap
   [#3425](https://github.com/jgong5/ATOM/issues/3425) measures.
 - **Platform and freeze as D95.1's:** gpu-40 on nightly 20261026, and the commit #3266
   freezes, or this stage's first registration if it comes first.
