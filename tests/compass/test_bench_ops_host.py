@@ -152,7 +152,7 @@ def test_a_tensor_pinned_as_the_runner_is_built_states_no_pageable(request, tmp_
     if "COMPASS_ARCH_DECLARED" not in os.environ:
         done = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
-            + [f"{__file__}::{request.node.name}"],
+            + ["--show-capture=no", f"{__file__}::{request.node.name}"],
             env={**os.environ, "COMPASS_ARCH_DECLARED": "1"},
             capture_output=True,
             text=True,
@@ -171,7 +171,7 @@ def test_a_tensor_pinned_as_the_runner_is_built_states_no_pageable(request, tmp_
     init, step = Model.__init__, Model.forward
 
     def pinned(out):
-        held.append(torch.zeros(3, dtype=torch.int16, pin_memory=True))
+        held.append(torch.zeros(3, dtype=torch.int16, device="cpu", pin_memory=True))
         return out
 
     def copied(model, *args, **kwargs):
@@ -189,4 +189,4 @@ def test_a_tensor_pinned_as_the_runner_is_built_states_no_pageable(request, tmp_
     copies = [op for _, op in tracer.recorder.items if getattr(op, "name", 0) == COPY]
     sources = [graph._json(op)["args"]["src"] for op in copies]
     staged = [s for s in sources if s["dtype"] == "torch.int16"]
-    assert [s.get("pageable", False) for s in staged] == [False, False]
+    assert [(s.get("device"), s.get("pageable")) for s in staged] == [("cpu", None)] * 2
