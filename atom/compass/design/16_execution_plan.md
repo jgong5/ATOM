@@ -255,7 +255,7 @@ atom/compass/
   memory/     device-reading substitution, per-term model
   ir/         Cost IR (Seq/Repeat/Par), nested-Repeat detector, opaque leaves
   capture/    FakeTensorMode capture, one concrete graph per shape, leaf contracts
-  spec/       machine-spec schema, probes, merge / validate / explain
+  spec/       machine-spec schema, the reader, layer composition, the cross-rank spread check
   artifacts/  store, keys, digests, invalidation matrix
   drive/      serving ATOM for record, trace steps and run; measure memory; run.json; the GPU checks
   bench/      the step bench: replay by rule, the window, measure; the op bench

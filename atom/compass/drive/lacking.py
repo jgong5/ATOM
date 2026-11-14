@@ -21,6 +21,11 @@ stands for each rank's. Each is held to ATOM's config as a server resolves it
 on the machine spec's device arch, whatever device this host has
 (`run._config`).
 
+A prefill or decode instance's run reads a network file across nodes, as
+`deploy.sh run` hands it one, and its readings command takes the ATOM
+arguments a real start of it takes, where they are not the run's, and the
+environment the run's check set.
+
 Printed apart, outside the exit status: the gaps `--coverage`'s check counts;
 an op graph's absent price list, which prices every leaf by its analytical
 law, unless `--coverage` asks for its check, which then refuses; and the
@@ -74,10 +79,10 @@ MADE_BY = {
 AXIS = re.compile(r"` x `([^`]+)`")
 
 
-def report(args, atom_args) -> int:
+def report(args, atom_args, real=None, env=None) -> int:
     """Print each input `lacking` finds, with the run's refusal and the command
     that makes it, then what it prints apart; 1 when one is lacking, else 0."""
-    lacks, apart = lacking(args, atom_args)
+    lacks, apart = lacking(args, atom_args, real, env)
     for name, state, refusal, made_by in lacks:
         print(f"lacking {name}: {state}\n  refused: {refusal}\n  made by: {made_by}")
     if not lacks:
@@ -87,10 +92,11 @@ def report(args, atom_args) -> int:
     return 1 if lacks else 0
 
 
-def lacking(args, atom_args) -> tuple[list, list]:
+def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     """Each input the run `args`, parsed by `run`, lacks under ATOM's arguments
     `atom_args`, as ``(name, state, refusal, made by)``; and the lines printed
-    apart."""
+    apart. The readings command takes `real`, a real start's ATOM arguments,
+    and runs under `env`, the variables the check set, where given."""
     from atom.compass.drive import run as drive_run
     from atom.compass.run import memory, step_grid
     from atom.model_engine.llm_engine import _load_tokenizer
@@ -107,8 +113,9 @@ def lacking(args, atom_args) -> tuple[list, list]:
             return False
 
     store = ArtifactStore(Path(args.store).resolve())
+    across = bool(args.network) and runfile.pd_side(atom_args) is not None
     try:
-        machine = runfile.spec(args, store)
+        machine = runfile.spec(args, store, across)
     except (OSError, ArtifactRefusal, SpecRefusal, ValueError) as refused:
         return [("platform", "missing", str(refused), MADE_BY["platform"])], []
     arch, engine = machine.value("device.arch"), runfile._engine_args(atom_args)
@@ -152,8 +159,9 @@ def lacking(args, atom_args) -> tuple[list, list]:
         and met(grid, made, step_grid.load, run[STEP_GRID], config, machine)
     )
     made = MADE_BY["memory readings"].format(
-        store=args.store, atom=shlex.join(atom_args)
+        store=args.store, atom=shlex.join(real or atom_args)
     )
+    made = " ".join([*(f"{k}={shlex.quote(v)}" for k, v in (env or {}).items()), made])
     met("memory readings", made, memory.load, run["store"], config, machine, 0)
 
     if getattr(args, OP_GRAPH):
