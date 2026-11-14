@@ -243,6 +243,7 @@ def test_a_store_law_the_store_refuses_to_load_names_requirement_2(
             "reason": where,
             "law": where,
             "run": [where.split()[1], host],
+            "store": str(tmp_path / "store"),
         }
 
 
@@ -398,39 +399,57 @@ def test_a_calibration_store_holding_every_input_at_its_key_is_looked_up_whateve
 @pytest.mark.parametrize(
     "case, looked_up, verdict, named, readings_verdict",
     [
+        ("a reusable law", "b", ("reuse", None), "", "measure"),
         ("host laws of another CPU", "b", ("refused", 1), "on another CPU", "reuse"),
-        ("past 5% with no readings", "b", ("refused", 4), "run at the head", "measure"),
+        ("past 5%", "b", ("refused", 4), "run at the head", "measure"),
         ("an older store holding every input", "a", ("reuse", None), "", "reuse"),
     ],
 )
-def test_with_no_store_holding_every_input_the_latest_whose_law_is_refused_is_looked_up(
+def test_with_no_store_holding_every_input_the_latest_a_law_is_read_from_is_looked_up(
     tmp_path, searched, case, looked_up, verdict, named, readings_verdict
 ):
     r = searched
-    # "a", if anything, holds every input; "b", published into later, a law refused.
+    # "a" holds a reusable law, and in the last case its readings; "b", published
+    # into later, the case's law, and in the case of another CPU its readings.
     a, b = (tmp_path / f"out/cal/{name}/store" for name in "ab")
+    platforms.flags(a, DOCUMENT, tmp_path)
+    stored(tmp_path, r, store=a.relative_to(tmp_path))
     if case == "an older store holding every input":
-        platforms.flags(a, DOCUMENT, tmp_path)
-        stored(tmp_path, r, store=a.relative_to(tmp_path))
         publish_readings(a, r.config)
     platforms.flags(b, DOCUMENT, tmp_path)
-    if case == "past 5% with no readings":
-        stored(tmp_path, r, store=b.relative_to(tmp_path), held=past(r)[0])
-    else:
-        held = law(r)
+    held = past(r)[0] if case == "past 5%" else law(r)
+    if case == "host laws of another CPU":
         held["host"]["key"]["host_cpu"] = "another CPU"
-        stored(tmp_path, r, store=b.relative_to(tmp_path), held=held)
         publish_readings(b, r.config)
+    stored(tmp_path, r, store=b.relative_to(tmp_path), held=held)
 
     judged = advise(tmp_path)
 
     store = str(tmp_path / f"out/cal/{looked_up}/store")
     assert judged["candidates"]["a"]["store"] == store
     found = verdicts(judged, "law")
-    assert [(v["verdict"], v["requirement"]) for v in found] == [verdict] * 2
-    assert store in found[0]["reason"] and named in found[0]["reason"]
+    assert [(v["verdict"], v["requirement"], v["store"]) for v in found] == [
+        (*verdict, store)
+    ] * 2
+    assert named in found[0]["reason"]
     readings_found = {v["verdict"] for v in verdicts(judged, "readings")}
     assert readings_found == {readings_verdict}
+
+
+def test_a_store_no_law_is_read_from_is_passed_over_for_the_shared_store(
+    tmp_path, searched
+):
+    held = law(searched)
+    held["host"]["key"]["host_cpu"] = "another CPU"
+    law_file(tmp_path, held)
+    platforms.flags(tmp_path / "out/cal/x/store", DOCUMENT, tmp_path)
+
+    judged = advise(tmp_path)
+
+    assert judged["candidates"]["a"]["store"] == str(tmp_path / "store")
+    found = verdicts(judged, "law")
+    assert [(v["verdict"], v["requirement"]) for v in found] == [("refused", 1)] * 2
+    assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
 
 
 def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, at_head):

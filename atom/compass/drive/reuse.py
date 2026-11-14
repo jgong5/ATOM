@@ -33,11 +33,13 @@ first, then refused, then calibrate. The requirement a verdict names:
    calibration refits the same miss, else calibrate.
 
 A verdict on a law found names, as ``run``, the ``--step-linear`` and
-``--host-laws`` values a run of it takes. A refusal the runner makes of the
-config under the law, as of context parallelism, propagates. `readings` gives
-the config's memory readings in a store `reuse`, or `measure` where none is at
-their key or the one there was measured at another ATOM digest (requirement
-1). `stores` orders the stores a candidate is looked up in.
+``--host-laws`` values a run of it takes, and one on a store's own step linear
+law at the head's ATOM digest names that ``store``, whatever the verdict. A
+refusal the runner makes of the config under the law, as of context
+parallelism, propagates. `readings` gives the config's memory readings in a
+store `reuse`, or `measure` where none is at their key or the one there was
+measured at another ATOM digest (requirement 1). `stores` orders the stores a
+candidate is looked up in.
 """
 
 import json
@@ -165,23 +167,24 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
             why = f"ran at {ran}, and a store entry is never re-keyed"
             found.append(_verdict("calibrate", 1, f"{where} {why}", law=where))
             continue
+        read = {"law": where, "store": str(store.root)}
         try:
             step = runfile.resolve(store, STEP_LINEAR, key.token(), machine, atom_args)
         except ArtifactRefusal as refused:
             if refused.rule is not Rule.INVALIDATED:
                 raise
-            found.append(_verdict("calibrate", 2, f"{where}: {refused}", law=where))
+            found.append(_verdict("calibrate", 2, f"{where}: {refused}", **read))
             continue
         here = {"model": model, "atom_src": atom}
         here |= keyed_platform(Kind.HOST_LAWS, platform)
         hosts = _keyed(store, Kind.HOST_LAWS, engine, **here)
         if not hosts:
             why = f"{where} has no host laws beside it at the head's ATOM digest"
-            found.append(_verdict("calibrate", 1, why, law=where))
+            found.append(_verdict("calibrate", 1, why, **read))
             continue
         hosts.sort(key=lambda k: k.values["host_cpu"] != compass_run.host_cpu())
         host = runfile._member(store.read(hosts[0]), "params")
-        found.append(_judged(where, step[0], host, config, machine, atom))
+        found.append(_judged(where, step[0], host, config, machine, atom) | read)
         found[-1]["run"] = [key.token(), hosts[0].token()]
     if not found:
         why = (
