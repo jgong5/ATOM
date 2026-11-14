@@ -100,9 +100,6 @@ def test_a_module_not_built_refuses_and_a_missing_dependency_does_not_read_as_on
             "compass measure steps --grid plans the step grid's points, and compass run --coverage",
         ),
         ("validate", "grading is python -m atom.compass.validate"),
-        ("explain", "name it with --device and --ptl"),
-        ("probe", "name it with --device and --ptl"),
-        ("spec", "name it with --device and --ptl"),
         ("measure collectives", "priced by compass measure ops"),
         ("discover", "renamed compass trace steps"),
         ("trace", "use compass trace steps or compass trace ops"),
@@ -147,7 +144,9 @@ def test_project_is_a_command_and_the_bound_check_runs_by_python_m(
     )
 
 
-@pytest.mark.parametrize("argv", [[], ["fit"], ["measure", "everything"]])
+@pytest.mark.parametrize(
+    "argv", [[], ["fit"], ["measure", "everything"], ["explain"], ["probe"], ["spec"]]
+)
 def test_no_command_refuses_with_the_usage(argv):
     with pytest.raises(SystemExit, match="usage: compass <command>"):
         cli.main(argv)

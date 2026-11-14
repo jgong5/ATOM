@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """The machine spec: one document read against the field table, and its readers.
 
-The spec is held as a flat map from dotted path to checked value, so merging,
-validating and explaining are per-field operations.
+The spec is held as a flat map from dotted path to checked value, so merging and
+validating are per-field operations.
 
 **The schema is closed.** A key with no row in the field table is refused where
 it sits. The stated version is read first, so a document written to a later

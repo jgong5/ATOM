@@ -13,10 +13,10 @@ import pathlib
 import pytest
 from test_spec_schema import document, refusal_from
 
-from atom.compass.spec import MachineSpec, explain, validate
+from atom.compass.spec import MachineSpec, validate
 from atom.compass.spec.rules import Rule
 
-MACHINES = pathlib.Path(__file__).resolve().parents[2] / "scripts/compass/machines"
+MACHINES = pathlib.Path(__file__).resolve().parents[2] / "tests/compass/machines"
 CURVE = [[4096, 1.1e11], [1048576, 3.0e12], [4294967296, 6.4e12]]
 
 
@@ -39,14 +39,6 @@ def test_a_spec_with_the_new_fields_validates_and_echoes_them():
     for fmt, derate in {"bf16": 0.70, "fp8": 0.70, "fp4": 0.60}.items():
         assert spec.value(f"device.compute.derate.{fmt}") == derate
     assert spec.echo() == written
-
-
-def test_each_compute_rate_is_explained_with_its_own_formats_derate():
-    spec = MachineSpec.from_mapping(roofline_document())
-    rows = {row.path: row for row in explain(spec, "device.compute").contributions}
-    assert rows["device.compute.fp4_flops"].derate == 0.60
-    assert rows["device.compute.fp4_flops"].effective == 1.0e16 * 0.60
-    assert rows["device.compute.bf16_flops"].derate == 0.70
 
 
 @pytest.mark.parametrize(
@@ -120,7 +112,7 @@ def test_each_machine_file_reads_the_new_fields_with_their_origins(machine):
         "device.memory.bandwidth_curve",
         "device.kernel_floor_s",
     ]
-    # Node 18's, the MI355X hosts' and MI455 A0's are probe_device.py's
+    # Node 18's, the MI355X hosts' and MI455 A0's are probed
     # readings; the others are still assumed.
     probed = (
         "mi308x-hjbog18",
