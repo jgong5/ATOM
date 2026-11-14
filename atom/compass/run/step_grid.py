@@ -26,15 +26,18 @@ definition and the residual's sources, which loading does not read.
 
 Its publisher states the readings `conditions` takes. The engine-config reading
 is `keyed`, as JSON: the ladder the runner replays (none under
-``enforce_eager``), the KV block size and dtype, the quantization, the TP and
-DP widths, DP attention, expert parallelism, TBO, the MoE backend, EPLB and
-DeepSeek-V4.1 decoder SWA bounded replay when
+``enforce_eager``), the KV block size and dtype, the quantization with its
+layer names as the model's runner remaps them (`quantization`), the TP and
+DP widths, DP attention, expert parallelism, TBO, the MoE backend, the
+all-to-all backend, EPLB and DeepSeek-V4.1 decoder SWA bounded replay when
 off ATOM's default, the index cache's dtype where ATOM resolved it apart from
-the KV cache's, MiniMax-M3's indexer-only context parallelism when on, the
-model config's ``--hf-overrides`` when it states any, the performance
-environment, ATOM's prefill token buckets, vocabulary-embedding replication
-and MXFP8 shared-expert fusion in it when off ATOM's default too, and, under
-speculation, its method and draft width. Loading refuses, naming what differs:
+the KV cache's, whether mori imports where it does not, MiniMax-M3's
+indexer-only context parallelism when on, the model config's
+``--hf-overrides`` when it states any, the performance environment, each
+variable of `READ_OFF_DEFAULT` in it when ATOM reads it off its default too,
+and, under speculation, its method and draft width, and the digest of the
+draft's config.json where it is not the target's. Loading refuses, naming
+what differs:
 
 - a run at data-parallel width above one, since every bundle is measured at one;
 - a keyed condition, the grid's graph mode, a timing scope other than the
@@ -59,8 +62,12 @@ the grading process: the run checked it against its own as it started, and its
 summary records the digest of the bundle it priced with.
 """
 
+import functools
+import importlib.util
 import json
 import os
+import pickle
+import tempfile
 from collections.abc import Mapping
 from types import FunctionType, SimpleNamespace
 
@@ -90,6 +97,7 @@ MEMBER = ("params", Topology().ranks()[0], "json")
 #: value of the field it names there. None, a field left unresolved, is default.
 OFF_DEFAULT = (
     "moe_backend",
+    "moe_all2all_backend",
     "eplb_enable",
     "enable_decoder_swa_bounded_replay",
     "index_cache_dtype",
@@ -98,31 +106,50 @@ OFF_DEFAULT = (
 DERIVED = {"index_cache_dtype": "kv_cache_dtype"}
 #: ATOM's prefill token buckets, an environment variable `keyed` the same way.
 BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
-#: ATOM's environment variables `keyed` states only where ATOM reads them off
-#: their default: `BUCKETS`, vocabulary-embedding replication (GLM-5.2's whole
-#: embedding, with no all-reduce after it) and the fusion of MiniMax-M3.1's
-#: MXFP8 shared expert into its MXFP4 MoE.
-ENV_OFF_DEFAULT = (
+#: ATOM's environment variables keyed only where ATOM reads them off their
+#: default: `BUCKETS`, vocabulary-embedding replication (GLM-5.2's and an EAGLE3
+#: draft's whole embedding, with no all-reduce after it), and the three that
+#: decide, with the all-to-all backend and whether mori imports (`MORI`), whether
+#: a MoE fuses its shared expert into aiter's top-k table (`model_ops/topK.py`):
+#: two under DP attention, and one for an MXFP8 shared expert beside MXFP4
+#: routed ones.
+READ_OFF_DEFAULT = (
     BUCKETS,
     "ATOM_REPLICATE_VOCAB_EMBED",
+    "ATOM_FUSE_SHARED_EXPERT",
+    "ATOM_DISABLE_MORI_EP",
     "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4",
 )
+#: Whether mori, the all-to-all ATOM selects by default, imports: keyed only
+#: where it does not, so keys written where it imports do not move.
+MORI = "mori_imports"
+#: The quantization config's lists of layer names, which its runner remaps.
+LAYERS = ("layer_pattern_specs", "exclude_layers")
+LAYERS += tuple(f"online_{name}" for name in LAYERS)
+#: The arch `remapped` declares: what it reads is a class constant on any arch.
+REMAP_ARCH = "gfx950"
+#: The digest of a drafter's config.json, keyed only where it is not the
+#: target's, which every key already holds as its model's.
+DRAFT = "draft_model"
 
 
 def keyed(config, ladder: bool = True) -> dict:
     """The conditions a bundle is measured under, as the resolved config holds them,
-    `OFF_DEFAULT` only where it is off its default, MiniMax-M3's indexer-only
-    context parallelism only when on, the model config's overrides only when
-    it states some, and the performance environment of this process less the
-    client's and the device selection, `ENV_OFF_DEFAULT` in it only off ATOM's
-    default, and under speculation its method and draft width; the ladder only
-    with `ladder`."""
+    `OFF_DEFAULT` only where it is off its default, `MORI` only where mori does
+    not import, MiniMax-M3's indexer-only context parallelism only when on, the
+    model config's overrides only when it states some, and the performance
+    environment of this process less the client's and the device selection
+    (`keyed_env`), and under speculation its method and draft width, and
+    `DRAFT` (`_draft`); the ladder only with `ladder`."""
     from atom.config import Config
 
     spec = getattr(config, "speculative_config", None)
     drafts = {"speculative": [spec.method, spec.num_speculative_tokens]} if spec else {}
+    drafts |= _draft(config, spec) if spec else {}
     if ladder:
         drafts["ladder"] = [] if config.enforce_eager else schedulable_ladder(config)
+    if importlib.util.find_spec("mori") is None:
+        drafts[MORI] = False
     for name in OFF_DEFAULT:
         default = Config.__dataclass_fields__[name].default
         if name in DERIVED:
@@ -137,7 +164,7 @@ def keyed(config, ladder: bool = True) -> dict:
     return drafts | {
         "kv_cache_block_size": config.kv_cache_block_size,
         "kv_cache_dtype": config.kv_cache_dtype,
-        "quantization": config.quant_config.compute_hash(),
+        "quantization": quantization(config),
         "tensor_parallel_size": config.tensor_parallel_size,
         "data_parallel_size": config.parallel_config.data_parallel_size,
         "enable_dp_attention": config.enable_dp_attention,
@@ -148,30 +175,86 @@ def keyed(config, ladder: bool = True) -> dict:
     }
 
 
+def _draft(config, spec) -> dict:
+    """`DRAFT` as the drafter `spec` reads it: the digest of its checkpoint's
+    config.json, the target's when it names none, as ATOM loads it, stated only
+    where that is not the target's config.json."""
+    from atom.compass.run import _file_digest
+
+    draft, target = (
+        _file_digest(model, "config.json")
+        for model in (getattr(spec, "model", None) or config.model, config.model)
+    )
+    return {DRAFT: draft} if draft != target else {}
+
+
+def quantization(config) -> str:
+    """The hash of `config`'s quantization config as its runner holds it, its
+    layer names remapped to the model's modules as `ModelRunner.__init__` remaps
+    them before it builds: by `remapped` where the runner has not, and as it is
+    where the packed modules the remap leaves on it say it has, since a second
+    remap can rename a name again. A config naming no layer, or with no remap,
+    has none to apply."""
+    held = config.quant_config
+    if (
+        hasattr(held, "remap_layer_name")
+        and not hasattr(held, "packed_modules_mapping")
+        and any(getattr(held, name) for name in LAYERS)
+    ):
+        return remapped(pickle.dumps((held, config.hf_config)))
+    return held.compute_hash()
+
+
+@functools.cache
+def remapped(pickled: bytes) -> str:
+    """The hash of the quantization config `pickled` with its model's config,
+    remapped as `ModelRunner.__init__` remaps it, in a process of its own: the
+    model class's module imports aiter, whose probes need a device, here
+    `REMAP_ARCH`, and a class may hold its packed modules in a property."""
+    from atom.compass.bench.ops import _child
+
+    return _child(_remapped, pickled)
+
+
+def _remapped(pickled: bytes) -> str:
+    from atom.compass.capture import driverless
+
+    with tempfile.TemporaryDirectory(prefix="compass-remap-") as tmpdir:
+        driverless.install(tmpdir, REMAP_ARCH)  # before anything imports aiter
+        quant, hf_config = pickle.loads(pickled)
+        from atom.model_engine.model_runner import support_model_arch_dict
+        from atom.utils import resolve_obj_by_qualname
+
+        arch = hf_config.architectures[0]
+        cls = resolve_obj_by_qualname(support_model_arch_dict[arch])
+    names = ("packed_modules_mapping", "quant_exclude_name_mapping")
+    quant.remap_layer_name(hf_config, **{n: getattr(cls, n, {}) for n in names})
+    return quant.compute_hash()
+
+
 def keyed_env() -> dict:
     """This process's performance environment as `keyed` states it: less the
-    client's variables and the device selection, `ENV_OFF_DEFAULT` in it only
-    off ATOM's default."""
+    client's variables and the device selection, each of `READ_OFF_DEFAULT` in
+    it only where ATOM reads it off its default."""
     return {
         k: v
-        for k, v in sorted((performance_env() | _env_off_default()).items())
+        for k, v in sorted((performance_env() | _off_default()).items())
         if not (k.startswith("AIPERF_") or k.endswith("_VISIBLE_DEVICES"))
     }
 
 
-def _env_off_default() -> dict:
-    """Each of `ENV_OFF_DEFAULT` that ATOM reads off its default, as this
-    process sets it: ATOM states each default only inside its reader, run here
-    unset."""
+def _off_default() -> dict:
+    """Each of `READ_OFF_DEFAULT` as this process sets it where ATOM reads it off
+    its default: ATOM states each default only inside its reader, run here unset."""
     from atom.utils import envs
 
     unset = SimpleNamespace(getenv=lambda _, default=None: default)
-    off = {}
-    for name in ENV_OFF_DEFAULT:
-        read = envs.environment_variables[name]
-        if read() != FunctionType(read.__code__, read.__globals__ | {"os": unset})():
-            off[name] = os.environ[name]
-    return off
+    readers = {name: envs.environment_variables[name] for name in READ_OFF_DEFAULT}
+    return {
+        name: os.environ[name]
+        for name, read in readers.items()
+        if read() != FunctionType(read.__code__, read.__globals__ | {"os": unset})()
+    }
 
 
 def differ(there: dict, here: dict, where: str) -> list[str]:

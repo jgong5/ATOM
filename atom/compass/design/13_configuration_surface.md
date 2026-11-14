@@ -227,9 +227,9 @@ compass measure memory [--beside CMD] --out D --store S -- <ATOM args>       [GP
 compass measure device --gpu G... [--pp] --out D --store S        [GPU, every card]
 compass fit device     RECORD... --out D --store S
 compass fit device     --assume-from DEVICE --ptl P --device DATASHEET --out D --store S
-compass fit steps      --backend step-linear [--form FORM] [--seed SEED] \
-                       RECORD... --client-run RECORD EXPORT... [--ops MEASURED...] \
-                       --out D --store S
+compass fit steps      --backend step-linear [--form FORM] \
+                       [--moe-routing E,K | --model DIR] [--seed SEED] RECORD... \
+                       --client-run RECORD EXPORT... [--ops MEASURED...] --out D --store S
 compass fit steps      --backend step-grid --grid <population>... --grid-definition F \
                        [--sessions A:B] [--seed SEED] <targets>... \
                        --client-run INPUT EXPORT... [--ops MEASURED...] --out D --store S
@@ -263,9 +263,9 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
 | `measure steps` | 1c, on the bench | GPU | its `<batches>`, and `--grid`'s inputs | `--store`: one `step_measurement` per distinct batch |
 | `measure ops` | 1b, collectives included | GPU, every rank of the layout | an `op_graph`; with `--plan`, every step of a record directory from `record` or `trace steps --out`, which its planner places each leaf's points over (`07` D37); with `--coverage`, its own record directories of the same kind, the graded runs apart from `--plan`'s, and the `--plan` run's `--out`; the stated collective entry points (`07` D40) | `--store`: one `op_measurement` per point, cold, with the kernels each leaf launched and its warm-over-cold ratio (`07` D41) |
 | `measure memory` | 2 | GPU | ATOM's arguments; the cards' device, stack and PTL state, and torch | `--store`: one `memory_readings` for the configuration; `--out`: `run.json`, logs, a readable copy |
-| `measure device` | the platform's (`05` D26) | GPU, every card of a node | the cards | `--store`: one `probe_record` for the node; `--out`: `run.json`, every sample, logs |
+| `measure device` | the platform's (`05` D26) | GPU, every card of a node | the cards | `--store`: one `probe_record` for the node; `--out`: `record.json`, a readable copy of the record, which holds every sample; each probe process's own file and log |
 | `fit device` | from probe records | none | `probe_record` entries of one platform; or, with `--assume-from`, another device's `platform_readings` and datasheet, and the datasheet `--device` names | `--store`: one `platform_readings`; `--out`: a readable copy |
-| `fit steps` | from 1c's measurements | none | `record` directories, each with the exports of the client runs its server served, and `step_measurement` entries, as the backend accepts; `--ops`, `measure ops --out` directories whose points take the profiler's floor out of a trace run's drafter labels | `--store`: a `step_linear_law` or a step grid bundle, with its report; `--out`: a readable copy |
+| `fit steps` | from 1c's measurements | none | `record` directories, each with the exports of the client runs its server served, and `step_measurement` entries, as the backend accepts; `--ops`, `measure ops --out` directories whose points take the profiler's floor out of a trace run's drafter labels; for `step-linear`, `--moe-routing E,K`, the model's routed experts and top-k, over which each decode rung may adopt a MoE column (`09` D55), or `--model DIR`, the model directory the records served, whose config states them as ATOM loads it, refused unless its config.json is the records' | `--store`: a `step_linear_law` or a step grid bundle, with its report; `--out`: a readable copy |
 | `fit host` | from real runs | none | `record` directories only, each with the exports of the client runs its server served | `--store`: `host_laws`, its `tokenizer` and `http_intake` terms included, with its report listing each term it left unfitted |
 | `fit ops` | from 1b's measurements | none | `measure ops` `--out` directories, whose `op_measurement` entries it reads from `--store` | `--store`: a `price_list`, interpolating only between same-kernel neighbours |
 | `run` | a simulated serve | none | a backend, the platform's datasheet, readings entry and, for a run across nodes, network file, the configuration's `memory_readings`, ATOM's arguments; the requests clients send | `--out`: the step record with its cost lines, the step table, the run summary, `run.json` with the run file and what grading reads (below), logs |
@@ -287,7 +287,9 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
   (`atom/compass/parity/`): `record`, `trace steps` and `run` write it, and
   `measure steps` reads its batches in it, the planner's points included.
 - **`run.json`** in every `--out`: the full command line, the resolved configuration, the
-  Compass tree's source digest, the host key, and the device and stack.
+  Compass tree's source digest, the host key, and the device and stack. `measure device`
+  serves no model, so has no host key: its `record.json` states the host, device and stack,
+  and the entry's provenance the command line and source digests.
 - **A GPU command refuses rather than warns** (`07` D42): it names its GPU, with no
   default device; it checks that GPU is quiet before and after, keeping both process
   listings; it records whether it was profiled. `fit` refuses profiled inputs, inputs

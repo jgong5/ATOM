@@ -1067,7 +1067,14 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   sized as V4's, states the same three of its layer, and its indexer's scorers
   (`capture.forward.V41_SCORERS`: gfx1250's FlyDSL one and gfx950's Triton one) its
   `compress_ratio` and `index_candidates`, the most entries it scores where an earlier
-  layer chose its candidates, else null (#2344).
+  layer chose its candidates, else null (#2344). Its index keys' RoPE
+  (`capture.forward.V41_ROPE`, under `Indexer.project_keys`) states their indexer's
+  `compress_ratio`: their positions are that ratio's compress plan's, which
+  `bench.ops.V41_NAMES` binds, and at a decode with no drafter both ratios' plans hold
+  a row a request, so the leaf's shape cannot tell them apart
+  ([#3141](https://github.com/jgong5/ATOM/issues/3141)). The indexer query's RoPE, on
+  the step's positions at every ratio, states none. In a graph captured before,
+  `measure ops` takes a key's ratio from the compress leaf whose plan holds as many rows.
 
 Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers,
 DeepSeek-V4's attention and V4.1's guarded ops aside, below), so its ambient reads stay
@@ -1144,19 +1151,22 @@ model's architecture, the device arch, the config.json digest, the engine config
 step law is keyed by less its ladder (`run.step_grid.keyed`, `09` D54), the TP width and
 the DP and EP widths when set, the phase, the mode, and whether the step produces
 output. That engine config holds the KV block size and dtype, the quantization's hash,
-the parallel layout, TBO, speculation when it is on, `moe_backend`, `eplb_enable` and
-`enable_decoder_swa_bounded_replay` when
+the parallel layout, TBO, speculation when it is on, `moe_backend`,
+`moe_all2all_backend`, `eplb_enable` and `enable_decoder_swa_bounded_replay` when
 they are off ATOM's default, the `index_cache_dtype` ATOM resolved where it differs
 from `kv_cache_dtype` (the [ruling on #2981](https://github.com/jgong5/ATOM/issues/2981)),
-MiniMax-M3's indexer-only context parallelism (`dcp_config.indexer_dcp_only`) when it
-is on, `--hf-overrides` when it states any, and the performance environment
+whether `mori` imports where it does not, MiniMax-M3's indexer-only context
+parallelism (`dcp_config.indexer_dcp_only`) when it is on, `--hf-overrides` when it
+states any, and the performance environment
 (`atom.benchmarks.results.metadata.PERFORMANCE_KEYS`) less the client's `AIPERF_*`
 variables and the device selection; ATOM's Triton expert and GEMM switches
 (`ATOM_USE_TRITON_MOE`, `ATOM_USE_TRITON_MOE_A4W4`, `ATOM_USE_TRITON_MOE_DECODE`,
 `ATOM_USE_TRITON_GEMM`) are in it, and ATOM's prefill token buckets
 (`ATOM_TOKEN_GRAPH_SIZES`), vocabulary-embedding replication
-(`ATOM_REPLICATE_VOCAB_EMBED`) and MXFP8 shared-expert fusion
-(`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4`) only when ATOM reads them off its default. One store holds V4-Pro graphs of one shape that
+(`ATOM_REPLICATE_VOCAB_EMBED`), `ATOM_FUSE_SHARED_EXPERT`, `ATOM_DISABLE_MORI_EP` and
+`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4` only when ATOM reads them off their default.
+The last three, with the all-to-all backend and `mori`, decide whether a MoE fuses
+its shared expert into aiter's top-k table, which changes its graph ([#3333](https://github.com/jgong5/ATOM/issues/3333)). One store holds V4-Pro graphs of one shape that
 differ only in `kv_cache_dtype`, only in `ATOM_USE_TRITON_MOE`, or only in the index
 cache dtype ATOM resolves for a P/D side and for a plain start at gfx950
 (`atom/config.py::Config.__post_init__`), and each run reads its own.

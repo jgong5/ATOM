@@ -301,7 +301,9 @@ def test_the_server_and_the_run_file_take_the_host_entry_the_runner_takes(
         (tmp_path / f"law{i}.json").write_text(json.dumps({"host": host}))
         flags += ["--host-laws", str(tmp_path / f"law{i}.json")]
     # This run's ATOM arguments resolve the second deployment's config.
-    monkeypatch.setattr("atom.compass.drive.run._config", lambda atom_args: r.config)
+    monkeypatch.setattr(
+        "atom.compass.drive.run._config", lambda atom_args, arch: r.config
+    )
     run = runfile.build(parsed(tmp_path, *flags), model(tmp_path))
     _run_file(monkeypatch, tmp_path, run | {"out_dir": str(tmp_path)})
     monkeypatch.setattr(compass_run, "_frontend_host", None)
