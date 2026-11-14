@@ -2216,7 +2216,10 @@ def figures_main(argv) -> None:
     at a time: `--source` names it, the records must be its `runs`, they are
     folded under `--form` and `--moe-routing`, as its provenance states them,
     and the figures, of the steps its `vectors` price, go under it; a source
-    whose vectors price none of the records' steps refuses."""
+    whose vectors price none of the records' steps refuses. Records whose
+    prefill buckets, `--engine`'s included, are not those LAW's prefill
+    vector was fitted under refuse where the figures grade that vector, as
+    do any under a law with no `sources` that names `padding` unfitted."""
     parser = _records_parser(
         "python -m atom.compass.backends.step_linear_fit figures",
         figures_main.__doc__.split("\n\n")[0],
@@ -2258,6 +2261,16 @@ def figures_main(argv) -> None:
             f"the records' runs are not the {len(runs)} runs {args.law} states "
             f"for them; these are in one and not the other: {differ}"
         )
+    prefill = law.get("prefill") if vectors is None or "prefill" in vectors else None
+    if prefill or (vectors is None and "padding" in law.get("unfitted", {})):
+        fitted, stated = tuple((prefill or {}).get("buckets", ())), _buckets(options)
+        if stated != fitted:
+            raise ValueError(
+                f"{args.law} was fitted under the prefill buckets "
+                f"{list(fitted) or 'none'}, and the records"
+                f"{' with ' + args.engine if args.engine else ''} state "
+                f"{list(stated) or 'none'}: its folds are fitted under its own"
+            )
     if vectors is not None and not any(_vector_of(s.view) in vectors for s in samples):
         raise ValueError(
             f"{args.law}'s source {args.source} prices none of the records' "

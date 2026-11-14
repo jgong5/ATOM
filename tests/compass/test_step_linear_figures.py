@@ -37,6 +37,8 @@ from atom.compass.validate.cost import cost_accuracy
 BIAS = {0: 1.0, 1: 1.0, 2: 1.04}
 #: The odd steps of `_steps`, its decodes.
 DECODES = set(range(1, 120, 2))
+#: The prefill token-graph buckets an engine file states.
+BUCKETS = [512, 1024, 2048, 4096, 8192, 16384, 32768]
 
 
 def _jittered(seed, n=120):
@@ -82,6 +84,18 @@ def _plain(path, seed):
 
 def _drafted(path, seed):
     return _mtp_record(path, _jittered(seed))
+
+
+def _decodes(path, seed):
+    """`_plain`'s record, its decodes alone."""
+    return _record(path, [s for i, s in enumerate(_jittered(seed)) if i in DECODES])
+
+
+def _engine(tmp_path) -> list:
+    """The `--engine` flag of an engine file stating `BUCKETS`."""
+    engine = tmp_path / "engine.json"
+    engine.write_text(json.dumps({"data_parallel_size": 1, "prefill_buckets": BUCKETS}))
+    return ["--engine", str(engine)]
 
 
 @pytest.mark.parametrize(
@@ -152,6 +166,27 @@ def test_the_steps_a_fold_s_law_refuses_are_stated_beside_its_figures(
     assert printed[-1].endswith(f" | {refused}")
 
 
+def test_a_fold_s_law_with_no_prefill_vector_refuses_its_run_s_prefills(tmp_path):
+    """The first two runs hold no prefill step: the law fitted on them has no
+    prefill vector, and the third run's figures grade its decodes and count
+    its prefills refused under `prefill`."""
+    law, records = _fits(
+        tmp_path, lambda path, seed: (_plain if seed == 2 else _decodes)(path, seed)
+    )
+    fold = _fit(records[:2])
+    report = cost_accuracy(records[2].parent, fold)
+    assert "prefill" not in fold and report["refused"]
+    assert {band.split()[0] for band in report["refused"]} == {"prefill"}
+
+    figures = law["figures"][digest(records[2])]
+    assert figures.pop("prefill") == {
+        **dict.fromkeys(FIGURES),
+        "steps": 0,
+        "refused": sum(r["steps"] for r in report["refused"].values()),
+    }
+    _same(figures, _graded(records[2].parent, fold))
+
+
 def test_a_dp_run_is_graded_at_each_step_s_costliest_rank(tmp_path, monkeypatch):
     monkeypatch.setattr(dp, "DP", 2)
     directories, records = [], []
@@ -193,8 +228,8 @@ def test_a_law_s_sources_are_each_folded_with_their_own_records_form_and_options
     file = tmp_path / "law.json"
     file.write_text(json.dumps(law))
 
-    def figures(*records, source=None, form="base"):
-        flags = ["--source", source] if source else []
+    def figures(*records, source=None, form="base", engine=()):
+        flags = [*(["--source", source] if source else []), *engine]
         main(
             ["figures", *map(str, records), "--law", str(file), "--form", form, *flags]
         )
@@ -227,6 +262,14 @@ def test_a_law_s_sources_are_each_folded_with_their_own_records_form_and_options
         figures(*records, source="shipped")
     assert "figures" not in json.loads(file.read_text())["sources"]["shipped"]
 
+    # Buckets the law's prefill vector was not fitted under refuse only the
+    # source that prices it.
+    engine = _engine(tmp_path)
+    with pytest.raises(ValueError, match="fitted under the prefill buckets none"):
+        figures(*records, source="three", engine=engine)
+    written = figures(*records[:2], source="two", form="history", engine=engine)
+    assert written["sources"]["two"]["figures"] == two
+
 
 @pytest.mark.parametrize(
     "fitted",
@@ -252,6 +295,32 @@ def test_the_figures_command_restates_the_figures_the_fit_wrote(tmp_path, fitted
     file.write_text(json.dumps(law))
     with pytest.raises(ValueError, match="states no runs to hold the records to"):
         main(argv)
+
+
+@pytest.mark.parametrize(
+    "write, fitted",
+    [(_plain, True), (_plain, False), (_decodes, False)],
+    ids=["under buckets", "under none", "under none, no prefill vector"],
+)
+def test_a_law_with_no_sources_is_folded_under_the_prefill_buckets_it_was_fitted_under(
+    tmp_path, write, fitted
+):
+    """A law fitted with an engine file stating prefill buckets restates its
+    figures under that file and refuses records stating none; one fitted on
+    records stating none, with a prefill vector or none, refuses the file."""
+    engine = _engine(tmp_path)
+    law, records = _fits(tmp_path, write, *engine * fitted)
+    assert ("prefill" in law) == (write is _plain)
+    assert ("padding" in law["unfitted"]) == (not fitted)
+    file = tmp_path / "law.json"
+    argv = ["figures", *map(str, records), "--law", str(file)]
+
+    file.write_text(json.dumps({**law, "figures": {}}))
+    main([*argv, *engine * fitted])
+    assert json.loads(file.read_text()) == law
+    stated = "none" if fitted else str(BUCKETS)
+    with pytest.raises(ValueError, match=re.escape(f"state {stated}: its folds")):
+        main([*argv, *engine * (not fitted)])
 
 
 def test_the_law_states_the_atom_its_records_ran_at_whatever_its_host_key_is_re_keyed_to(
