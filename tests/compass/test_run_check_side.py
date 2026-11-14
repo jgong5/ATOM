@@ -6,9 +6,10 @@ them.
 DeepSeek-V4-Pro's DPA8 sides resolve the fp8 index cache under the
 `--kv-transfer-config` the script adds, and fp4 without one at gfx950. The
 shipped crs005 DPA8 pair is keyed to fp8, so each side's check finds its own
-law and host laws there and lacks only its readings, which the command it
-prints measures; the same arguments checked as a lone server resolve fp4, and
-both laws refuse them, naming it.
+law and host laws there and lacks only the decode rungs its capture ladder
+schedules that its own law has no vector for, and its readings, which the
+command it prints measures; the same arguments checked as a lone server
+resolve fp4, and both laws refuse them, naming it.
 
 Each check resolves its config where the machine's gfx950 is declared, a
 process of its own (`run._config`). The host laws' CPU is the laws', and ATOM's
@@ -32,6 +33,7 @@ from test_run_step_grid import deployment
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
 from atom.compass.drive import run as drive_run
+from atom.compass.drive import runfile
 from atom.model_engine import llm_engine
 
 LAWS = Path(__file__).resolve().parents[2] / "scripts/compass/laws"
@@ -63,12 +65,22 @@ SIDES = {
 #: Both sides' environment less AITER_LOG_LEVEL, which deploy.sh sets.
 SHARED_ENV = {"AITER_BF16_FP8_MOE_BOUND": "0", "ATOM_MOE_GU_ITLV": "1"}
 ROLES = {"prefill": "kv_producer", "decode": "kv_consumer"}
+#: The decode rungs each side's capture ladder schedules that its law in the
+#: pair has no vector for.
+UNCOVERED = {
+    "prefill": "8, 16, 48, 64, 128, 256, 512",
+    "decode": ", ".join(map(str, range(32, 257, 4))) + ", eager",
+}
+COVERAGE = "step linear law: stale (coverage)"
 
 
 @pytest.fixture(autouse=True)
 def environment(monkeypatch):
+    # Set first, so each is restored after the test, AITER_LOG_LEVEL too,
+    # which a side's check sets.
     for name in PERFORMANCE_KEYS:
-        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
 
 
 def platform(tmp_path) -> list[str]:
@@ -121,7 +133,8 @@ def test_each_side_holds_the_fp8_index_cache_its_crs005_laws_state(
     assert checked(pair(tmp_path), side, atom_args) == 1
 
     out = capsys.readouterr().out
-    assert lacked(out) == ["memory readings: missing"]
+    assert lacked(out) == [COVERAGE, "memory readings: missing"]
+    assert f"no decode vector for rungs {UNCOVERED[side]}, which" in out
     assert '"index_cache_dtype": "fp8"' in out
     assert '"AITER_LOG_LEVEL": "WARNING"' in out
     kv = json.dumps({"kv_role": ROLES[side], "kv_connector": "mooncake"})
@@ -155,18 +168,21 @@ def test_readings_the_printed_command_measures_complete_the_side_s_check(
     tmp_path, monkeypatch, capsys, side
 ):
     atom_args = side_args(tmp_path, monkeypatch, side)
-    monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
     flags = pair(tmp_path)
     assert checked(flags, side, atom_args) == 1
-    measured = drive_run.side_args(side, atom_args, drive_run.REAL)
-    assert capsys.readouterr().out.endswith(f" -- {shlex.join(measured)}\n")
+    words = shlex.split(capsys.readouterr().out.rsplit("made by: ", 1)[1])
+    env, measured = words[: words.index("compass")], words[words.index("--") + 1 :]
+    # The command runs in the shell the check ran in, AITER_LOG_LEVEL unset.
+    monkeypatch.delenv("AITER_LOG_LEVEL")
+    for name, value in (word.split("=", 1) for word in env):
+        monkeypatch.setenv(name, value)
     config = drive_run._config(measured, "gfx950")
     publish_readings(tmp_path / "store", config, MACHINE)
+    monkeypatch.delenv("AITER_LOG_LEVEL", raising=False)
 
-    assert checked(flags, side, atom_args) == 0
+    assert checked(flags, side, atom_args) == 1
 
-    out = capsys.readouterr().out
-    assert out == "nothing lacking: every input the run reads resolves and holds\n"
+    assert lacked(capsys.readouterr().out) == [COVERAGE]
 
 
 @pytest.mark.parametrize(
@@ -174,9 +190,8 @@ def test_readings_the_printed_command_measures_complete_the_side_s_check(
     [
         ["--kv-transfer-config", '{"kv_role":"kv_producer","kv_connector":"compass"}'],
         ["--kv-transfer-config={}"],
-        ["--kv_transfer_config", '{"kv_connector":"mooncake"}'],
     ],
-    ids=["compass", "equals", "underscores"],
+    ids=["compass", "equals"],
 )
 def test_a_side_s_own_kv_transfer_config_refuses_as_deploy_sh_refuses_it(
     tmp_path, given
@@ -186,6 +201,15 @@ def test_a_side_s_own_kv_transfer_config_refuses_as_deploy_sh_refuses_it(
     with pytest.raises(ValueError, match="adds its --kv-transfer-config") as e:
         drive_run.main([*flags, "--check", "prefill", "--", "--model", "m", *given])
     assert str(e.value).startswith(f"{given[0]} is among the prefill side's")
+
+
+def test_the_config_a_side_adds_overrides_another_spelling_as_deploy_sh_s_does():
+    given = ["--model", "m", "--kv_transfer_config", '{"kv_connector":"mooncake"}']
+
+    resolved = runfile._engine_args(drive_run.side_args("decode", given, "compass"))
+
+    kv = {"kv_role": "kv_consumer", "kv_connector": "compass"}
+    assert json.loads(resolved.kv_transfer_config) == kv
 
 
 def test_a_side_reads_a_network_file_across_nodes_and_a_lone_server_refuses_one(

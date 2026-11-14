@@ -53,7 +53,8 @@ environment the script starts the side in, `AITER_LOG_LEVEL` set when unset
 `--kv-transfer-config` among them refuses, as the script refuses one. The
 readings command it prints takes Mooncake's connector in the simulated one's
 place, as `deploy.sh record` starts the side: a real start has no clock to
-build the simulated one on.
+build the simulated one on. It names `AITER_LOG_LEVEL` when the check set it,
+since the readings key holds it.
 
 `--acceptance-record` names a speculative `compass record` directory: its
 histograms' rates (`measured`) go to ATOM as ``--spec-decode-acceptance-rates``,
@@ -130,9 +131,10 @@ def main(argv: list[str]) -> None:
     if args.check in ROLES:
         serve._refuse(atom_args)
         # deploy.sh starts each side under `compass_env` (scripts/compass/_lib.sh).
-        os.environ.setdefault("AITER_LOG_LEVEL", "WARNING")
+        env = {} if "AITER_LOG_LEVEL" in os.environ else {"AITER_LOG_LEVEL": "WARNING"}
+        os.environ.update(env)
         sides = [side_args(args.check, atom_args, c) for c in (SIMULATED, REAL)]
-        raise SystemExit(lacking.report(args, *sides))
+        raise SystemExit(lacking.report(args, *sides, env))
     runfile.pd_side(atom_args, refuse=True)
     if args.check:
         serve._refuse(atom_args)
@@ -202,10 +204,10 @@ def _parser() -> argparse.ArgumentParser:
 def side_args(side: str, atom_args, connector: str) -> list[str]:
     """ATOM's arguments `atom_args` of a deployment's `side`, as deploy.sh takes
     them, with the `KV_FLAG` it adds: the side's KV role on `connector`. One
-    among them refuses, as the script refuses it."""
+    among them refuses, as the script refuses it; the one added overrides
+    another spelling, as the script's does."""
     for arg in atom_args:
-        flag = arg.split("=", 1)[0].replace("_", "-")
-        if len(flag) > 2 and flag.startswith("--") and KV_FLAG.startswith(flag):
+        if arg.startswith(KV_FLAG):
             raise ValueError(
                 f"{arg} is among the {side} side's ATOM arguments; --check {side} "
                 f"adds its {KV_FLAG}, as deploy.sh does"
