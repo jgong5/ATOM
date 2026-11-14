@@ -1,28 +1,11 @@
-"""The attainable-peak probe: the cards it refuses, and the fragment its
-samples make, merged into a machine spec by that machine's script."""
-
-import importlib.util
-import json
-from pathlib import Path
+"""The attainable-peak probes: what their samples read, and the cards they
+refuse."""
 
 import pytest
 
 from atom.compass.drive import device_probe
-from atom.compass.spec import Fragment, MachineSpec, SpecRefusal
+from atom.compass.spec import SpecRefusal
 from atom.compass.spec.rules import Rule
-
-TREE = Path(__file__).resolve().parents[2]
-SCRIPTS = TREE / "scripts" / "compass"
-
-
-def _load(name):
-    loaded = importlib.util.spec_from_file_location(name, SCRIPTS / f"{name}.py")
-    module = importlib.util.module_from_spec(loaded)
-    loaded.loader.exec_module(module)
-    return module
-
-
-probe = _load("probe_device")
 
 #: Samples as a probe writes them: GEMM seconds per shape, read, write and copy
 #: seconds per size moved, copy the fastest and its rate dipping on the
@@ -73,37 +56,6 @@ def test_the_curve_is_at_least_every_kind_at_every_size():
     ]
     for kind in device_probe.rates(record).values():
         assert all(rate >= kind[size] for size, rate in curve)
-
-
-def test_the_node18_script_publishes_the_probed_fields(monkeypatch, tmp_path):
-    monkeypatch.setenv("COMPASS_MACHINE", "mi308x-hjbog18")
-    script = _load("mi308x_spec")
-    found = device_probe.readings(RECORD)
-    monkeypatch.setattr(script, "PEAKS", ("2026-10-19", "abc", found, "f00d"))
-    out = tmp_path / "spec.json"
-    assert script.main(["--out", str(out)]) == 0
-    spec = MachineSpec.from_mapping(json.loads(out.read_text()))
-    assert spec.value("device.compute.derate.fp8") == 2 * 8192**3 / 2e-3 / 6.88e14
-    assert spec.value("device.memory.derate") == 2.048e9 / 5.3e12
-    assert spec.value("interconnect.intra_node.derate") == 3.2e10 / 6.4e10
-    floor = spec.origin("device.kernel_floor_s")
-    assert floor["origin"] == "probed" and floor["record"] == "sha256:f00d"
-    assert (floor["p10"], floor["p90"]) == pytest.approx((1.4e-6, 4.6e-6))
-
-
-def test_a_rate_above_its_peak_is_refused():
-    peaks = {
-        "device.compute.bf16_flops": 1.0,
-        "device.compute.fp8_flops": 1e30,
-        "device.memory.bandwidth_bytes_per_s": 1e30,
-        "interconnect.intra_node.link_bandwidth_bytes_per_s": 1e30,
-    }
-    found = device_probe.readings(RECORD)
-    document = probe.fragment("m", found, peaks, "a", "2026-10-19", {"record": "r"})
-    with pytest.raises(SpecRefusal) as refused:
-        Fragment.from_mapping(document, "probe")
-    assert refused.value.rule is Rule.DERATE
-    assert "device.compute.derate.bf16" in str(refused.value)
 
 
 def _card(drm, name, bdf, used, ptl=None, charged=()):
@@ -256,93 +208,3 @@ def test_a_card_on_which_no_fp4_gemm_runs_is_refused_naming_each_error():
     assert refused.value.rule is Rule.MEASURED
     assert "torch._scaled_mm RuntimeError: no kernel" in str(refused.value)
     assert f"aiter.gemm_a4w4 RuntimeError: {A0}" in str(refused.value)
-
-
-def test_the_mi355x_script_publishes_the_probed_fields_fp4_included(
-    monkeypatch, tmp_path
-):
-    monkeypatch.delenv("COMPASS_MACHINE", raising=False)
-    script = _load("mi355x_spec")
-    gemm = RECORD["gemm"] | {"fp4": {"8192x8192x8192": [1e-3, 2e-3, 3e-3]}}
-    found = device_probe.readings(RECORD | {"gemm": gemm})
-    monkeypatch.setattr(script, "PEAKS", ("2026-10-19", "abc", found, "f00d"))
-    out = tmp_path / "spec.json"
-    assert script.main(["--out", str(out)]) == 0
-    spec = MachineSpec.from_mapping(json.loads(out.read_text()))
-    # Each derate is over the datasheet's peak, FP4's over `fp4_flops`.
-    assert spec.value("device.compute.derate.fp4") == 2 * 8192**3 / 2e-3 / 1.00663e16
-    assert spec.value("device.memory.derate") == 2.048e9 / 8.0e12
-    for path in ("device.compute.derate.fp4", "device.memory.bandwidth_curve"):
-        assert spec.origin(path)["record"] == "sha256:f00d"
-    assert spec.origin("device.compute.fp4_flops")["origin"] == "datasheet"
-
-
-def test_the_record_names_the_stack_aiter_s_commit_included(monkeypatch, tmp_path):
-    import shutil
-    import subprocess
-    from types import SimpleNamespace
-
-    import torch
-
-    from atom.compass.drive import identity
-
-    git = shutil.which("git")
-    if git is None:
-        pytest.skip("needs git")
-    aiter = tmp_path / "aiter"
-    aiter.mkdir()
-    (aiter / "a.py").write_text("a = 1\n")
-    for argv in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "s"]):
-        subprocess.run(
-            [git, "-C", str(aiter), "-c", "user.name=t", "-c", "user.email=t@t", *argv],
-            check=True,
-        )
-    head = subprocess.run(
-        [git, "-C", str(aiter), "rev-parse", "--short=9", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    monkeypatch.setattr(identity, "module_root", lambda module: str(aiter))
-    (tmp_path / "rocm" / ".info").mkdir(parents=True)
-    (tmp_path / "rocm" / ".info" / "version").write_text("7.2.4\n")
-    monkeypatch.setenv("ROCM_PATH", str(tmp_path / "rocm"))
-    monkeypatch.setattr(torch.cuda.nccl, "version", lambda: (2, 27, 7))
-    card = SimpleNamespace(
-        pci_domain_id=0, pci_bus_id=10, pci_device_id=0, gcnArchName="gfx942"
-    )
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: card)
-    monkeypatch.setattr(probe, "cards", lambda bdfs: [])  # no card to refuse
-    monkeypatch.setattr(probe, "probe", lambda torch, formats: RECORD)
-    out = tmp_path / "record.json"
-    spec = SCRIPTS / "machines" / "mi308x-hjbog18.json"
-    assert probe.main([str(spec), str(out)]) == 0
-    assert json.loads(out.read_text())["stack"] == {
-        "rocm": "7.2.4",
-        "aiter": head,
-        "rccl": "2.27.7",
-        "torch": torch.__version__,
-    }
-
-
-def test_the_cards_are_read_with_no_wait(monkeypatch, tmp_path):
-    """VRAM used, KFD's charges and PTL are counters and a setting the driver
-    keeps, none of which moves while a card wakes, so nothing waits for them."""
-    from types import SimpleNamespace
-
-    import torch
-
-    from atom.compass.drive import identity
-
-    order = []
-    monkeypatch.setattr(device_probe, "time", SimpleNamespace(sleep=order.append))
-    card = SimpleNamespace(
-        pci_domain_id=0, pci_bus_id=10, pci_device_id=0, gcnArchName="gfx942"
-    )
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: card)
-    monkeypatch.setattr(identity, "_stack", dict)
-    monkeypatch.setattr(probe, "cards", lambda bdfs: order.append("cards") or [])
-    monkeypatch.setattr(probe, "probe", lambda torch, formats: RECORD)
-    spec = SCRIPTS / "machines" / "mi308x-hjbog18.json"
-    assert probe.main([str(spec), str(tmp_path / "record.json")]) == 0
-    assert order == ["cards"]

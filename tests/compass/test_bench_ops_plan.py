@@ -104,7 +104,7 @@ def bench(tmp_path, monkeypatch):
     """A store, the key of a point measured on hjbog-srdc-39, the run, and
     the stand-in bench and graphs in place."""
     spec = MachineSpec.from_mapping(
-        json.loads((TREE / "scripts/compass/machines/mi308x-hjbog39.json").read_text())
+        json.loads((TREE / "tests/compass/machines/mi308x-hjbog39.json").read_text())
     )
     run = {
         "device": [{"index": 6, "name": spec.value("device.name")}],

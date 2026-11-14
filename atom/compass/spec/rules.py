@@ -24,7 +24,6 @@ class Rule(enum.Enum):
     ADDRESSING = "a field is asked for by the path of the field itself"
     VERSION = "the reader knows the schema version the document was written to"
     MEASURED = "a probe reports what it read, and refuses what it could not"
-    BAND = "a probed number is published with the band its probe measured"
     LAYER = "a value is stated in the layer that names what it varies with"
 
 

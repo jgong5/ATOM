@@ -7,8 +7,7 @@ deployment, and the closed schema refuses any key it does not declare. An
 engine start's memory readings are not the spec's: `compass measure memory`
 publishes them per configuration as a `memory_readings` entry.
 
-A per-machine script (`scripts/compass/mi3*_spec.py`) authors a spec with the
-verbs here: `merge` combines fragments and refuses ones that describe two
+The verbs: `merge` combines fragments and refuses ones that describe two
 machines, `validate` reports every refusal of the merged document, and
 `explain` takes a field or block back to its values and their origins. A run
 reads the result with `MachineSpec`. `across_ranks` is `compass measure

@@ -17,6 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import platforms
 import pytest
 from test_check_fp8_arch import machine, worker
 from test_key_quantization_remap import QWEN35
@@ -98,13 +99,15 @@ def test_a_script_s_simulated_server_keys_fp8_as_its_machine_s_worker_does(
     )
     for stub in (tmp_path / "bin").iterdir():
         stub.chmod(0o755)
-    (tmp_path / "machine.json").write_text(json.dumps(machine(arch)))
+    # What parity_one_node.sh composes its run file's machine from.
+    readings = tmp_path / "readings"
+    _, device, _, ptl = platforms.flags(readings, machine(arch), tmp_path)
     run_file = [] if run is None else [tmp_path / "run.json"]
     (tmp_path / "run.json").write_text(
         json.dumps({**(run or {}), "machine": machine(arch)})
     )
     (tmp_path / "traces.jsonl").write_text('{"id": 0}\n')
-    inherited = {"CONFIG", "HIP_VISIBLE_DEVICES", "HTTP_INTAKE"}
+    inherited = {"CONFIG", "HIP_VISIBLE_DEVICES", "HTTP_INTAKE", "STACK"}
     env = dict(
         {k: v for k, v in os.environ.items() if k not in inherited},
         PATH=f"{tmp_path}/bin:{os.environ['PATH']}",
@@ -115,7 +118,9 @@ def test_a_script_s_simulated_server_keys_fp8_as_its_machine_s_worker_does(
         WAIT_S="120",
         TRACES=str(tmp_path / "traces.jsonl"),
         HARNESS_PYTHON=str(tmp_path / "bin/harness"),
-        MACHINE=str(tmp_path / "machine.json"),
+        DEVICE=device,
+        PTL=ptl,
+        READINGS=str(readings),
         STORE=str(tmp_path / "store"),
     ) | {name: str(tmp_path / value) for name, value in more.items()}
 

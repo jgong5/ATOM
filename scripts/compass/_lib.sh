@@ -375,3 +375,20 @@ compass_gpus() {
             print out
         }' || { echo "compass_gpus: rocm-smi --showhw does not map every GPU of $2 to its own KFD node" >&2; return 1; }
 }
+
+# compass_machine FILE: write to FILE the machine spec `compass run --device
+# DEVICE --ptl PTL [--stack STACK]` composes, the platform_readings entry read
+# from the store READINGS, for a run file's `machine` block. Exits when DEVICE,
+# PTL or READINGS is unset.
+compass_machine() {
+    python3 -c 'import json, sys
+from atom.compass.artifacts import ArtifactStore
+from atom.compass.fit.device import compose
+device, ptl, readings, stack, out = sys.argv[1:]
+spec = compose(device, ArtifactStore(readings), ptl, stack or None)
+open(out, "w").write(json.dumps(spec.echo()))' \
+        "${DEVICE:?DEVICE names the datasheet of the GPUs, by SKU or path}" \
+        "${PTL:?PTL names their PTL state, enabled or disabled}" \
+        "${READINGS:?READINGS names a store holding their platform_readings}" \
+        "${STACK:-}" "$1"
+}
