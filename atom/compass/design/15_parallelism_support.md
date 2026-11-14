@@ -8,6 +8,11 @@ written against it yet; implementation follows the execution plan in `16`.
 `03` / `05` (width-keyed memory), `07` D40 (communication pricing), `04` (structures that
 exist only at width).
 
+**Revised 2026-11-14 by the owner's ruling on
+[#3423](https://github.com/jgong5/ATOM/issues/3423):** the DSv41-DPEP stage serves
+DeepSeek-V4.1-Flash at DTP2 and DEP2. How a request reaches its rank and how the group
+schedules a prefill there is D90.1; how the two MoE layouts key is D92.1.
+
 **Scope.** What each parallelism strategy changes for a simulator, answered in one frame
 so the four are comparable. It **applies** `01`'s clock protocol per strategy; it does not
 re-decide it.
@@ -258,6 +263,40 @@ transfer to DP.
   last cross-rank collective. With no host time every output rank stamps its outputs at
   the group's `max`, so a fast rank's output is late by at most the difference between its
   own cost and the `max`. The step is split with in-step TAR only if that is measured to affect TPOT.
+
+---
+
+## D90.1. A V4.1 engine's DP routing and prefill scheduling, as ATOM runs them
+
+Owner ruling on [#3423](https://github.com/jgong5/ATOM/issues/3423), 2026-11-14, for the
+DSv41-DPEP stage (`16` D95.2), whose arms serve `-tp 2 --enable-dp-attention` with
+`--dp-load-balance least_tokens`, `ATOM_DP_LB_REQ_EQUIV=512`, `ATOM_DP_SESSION_AFFINITY=1`
+and the prefill delayer at `ATOM_PREFILL_DECODE_INTERVAL=10`.
+
+### Decision
+
+**Routing and prefill scheduling run as ATOM's own code on the real and the simulated
+run alike; Compass adds no model of either.** The simulated run keeps ATOM's process
+topology (`01`, option B), so `CoreManager` and every rank's scheduler are the real ones.
+
+| Item | In ATOM | For this topic |
+|---|---|---|
+| the group | `CoreManager.__init__` rewrites `dp := dp × tp, tp := 1` (D92), so a key reads `tensor_parallel_size` 1 and `data_parallel_size` 2 | two ranks, one LP (D90) |
+| a new session | `CoreManager._select_dp_rank_locked` under `least_tokens`: the lowest `tokens + req_equiv × reqs` over each rank's in-flight requests, ties broken by a rotating cursor | real code, its counts moving with the run's own clock |
+| a later turn | the session id is `x-dynamo-session-id`, else `x-session-id`, else `x-correlation-id` (`api_server.py`), and a session keeps the rank its first turn took; each child correlation id is a session of its own | real code; the client sends the submission's header |
+| prefill | the delayer holds a prefill until every rank is prefill-ready or a bound fires, one `all_reduce` a tick (`prefill_delayer.py`); with token graphs recorded, `Scheduler._group_prefill_tick` has a rank with nothing to prefill run the group's dummy prefill | real code on the engine cores' DP group (D90, *Transport*); the simulated runner states the buckets the real one records ([#3148](https://github.com/jgong5/ATOM/pull/3148)) |
+
+- **A routing difference is a timing difference.** Both runs route on the same session
+  header and prompt tokens; only the in-flight counts can part, and they move with each
+  run's clock. [#3427](https://github.com/jgong5/ATOM/issues/3427) compares each request's
+  rank on a real and a simulated run and lists the first that differs, with each rank's
+  load there; [#3428](https://github.com/jgong5/ATOM/issues/3428) holds the group's
+  prefill ticks and delayer holds against a real record under `parity.compare`.
+- **None of these switches is in a key.** A key's environment is `performance_env()`'s
+  list and `READ_OFF_DEFAULT` (`run/step_grid.py::keyed_env`), at these arms
+  `GPU_MAX_HW_QUEUES`, `OMP_NUM_THREADS`, `ATOM_NUMA_BIND` and `AITER_LOG_LEVEL`
+  ([#3426](https://github.com/jgong5/ATOM/issues/3426)). The routing and delayer switches
+  decide which steps run and on which rank; a step's price reads its shape, not them.
 
 ---
 
@@ -786,6 +825,26 @@ in `moe.py::init_balance_router_logits`, inside the `--fake-eplb` synthetic rout
 
 ---
 
+## D92.1. DTP2 and DEP2: V4.1's routed experts over TP and over EP2 key apart
+
+Owner ruling on [#3423](https://github.com/jgong5/ATOM/issues/3423), 2026-11-14, for the
+DSv41-DPEP stage (`16` D95.2).
+
+- **Two layouts, two keys.** Under DP attention DTP2 runs the routed experts over TP
+  on the group's gathered rows; DEP2 (`--enable-expert-parallel`) shards them whole over
+  the two ranks. `run/step_grid.py::keyed` holds `enable_expert_parallel`, so a law or a
+  readings entry fitted under one refuses the other, and each arm is fitted on its own
+  records.
+- **The slowest rank prices the step** (D90). Under EP2 it is the rank the routing sends
+  the most rows, which uniform routing understates (D90, *Non-uniform routing*). The
+  step linear law fits a DP rung's MoE column on each rank's own rows and prices its
+  held-out folds as the max over ranks ([#3043](https://github.com/jgong5/ATOM/pull/3043));
+  the step grid replays routing recorded on real runs
+  ([#3285](https://github.com/jgong5/ATOM/issues/3285)).
+- **The drafter's MoE takes the arm's layout** (`14` D87.2).
+
+---
+
 ## D93. Composition, and what the LP count actually is
 
 Strategies compose, and the LP count is what the clock protocol pays for:
@@ -882,8 +941,10 @@ CPU-only path (`08` D43.1).
 | D88 | One frame of four questions per strategy — LPs and lookahead, scheduling coupling, cost, memory. **Only PP adds logical processes**; TP, DP and EP each sit behind an existing barrier. | 2026-09-19 |
 | D89 | TP is the settled instance and supplies the per-width discipline: width is a key, not a parameter. | 2026-09-19 |
 | D90 | DP's two collectives **run for real** — both reduce over scheduling metadata, never over model outputs, so the real reduction is more faithful than a model and free. The DP group stays one LP, with one member process per rank. With host time the group's device end is the `max` over ranks of each rank's own device end, computed not rank-0-sourced by one `all_reduce(MAX)`, and each rank leaves at its own charge; with no host time an output rank leaves at the `max` of the step seconds. The step targets are exchanged by one `all_gather` inside the predicted forward (#988); both collectives are K6 waits that carry no cost; the lockstep `all_reduce` keeps its payload. With EP off the MoE segment reads `T_moe`, the rows the group's MoE gather carries (`dp x running_bs x max_seqlen_q` when every rank decodes, `sum(num_tokens_across_dp)` otherwise), and is rank-invariant by construction, which makes `max` the per-layer critical path. With EP on the group dispatches the same `T_moe` rows to MORI, padded to the group's height on every rank when no rank prefills (`running_tokens_are_unified`), replayed or eager, and each rank's own when one does; `max` rests on uniform routing, an assumed treatment under which the step linear law fitted under the EP8 engine config absorbs MORI through its `moe_rows` term and intercepts; the measured imbalance is reported beside it. Idle ranks are priced through `dummy_execution`'s own `forward`. Q4's replicated weights and DP-independent width key hold for plain DP only; under DP-attention the routed experts shard over the DP group and the width key is open. | 2026-09-19, revised 2026-09-28, 2026-10-01 (owner's DP ruling, [#470](https://github.com/jgong5/ATOM/issues/470#issuecomment-5933154215)), 2026-10-09 (`T_moe`, [#502](https://github.com/jgong5/ATOM/issues/502#issuecomment-6081138199)), 2026-10-10 (Q4, [#702](https://github.com/jgong5/ATOM/issues/702)), 2026-10-15 (the `all_gather` and each member's own step end, [#988](https://github.com/jgong5/ATOM/issues/988#issuecomment-6183664946)), 2026-10-15 (EP on: uniform routing, [#627](https://github.com/jgong5/ATOM/issues/627#issuecomment-6194442788); the row count, [#1106](https://github.com/jgong5/ATOM/issues/1106#issuecomment-6236367874)) and 2026-10-16 (the device end, [#1267](https://github.com/jgong5/ATOM/issues/1267#issuecomment-6215701399)) |
+| D90.1 | A V4.1 engine's DP routing and prefill scheduling, ruled by the owner for the DSv41-DPEP stage: `CoreManager`'s `least_tokens` routing with session affinity and the prefill delayer run as ATOM's own code on both runs, Compass modelling neither; a routing difference is a timing difference, compared request by request; none of the switches is in a key. | 2026-11-14 (#3423) |
 | D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. Revised: a send part completes on the sender's clock when eager and at `max(t_send, r_i - E × G) + T` when rendezvous, a threshold's bytes `E` leaving before the post (#1458), `r_i` the time its receive is posted, a per-carrier size threshold deciding which, and a send's `done` is the latest over its gloo parts, the only ones its host waits for, its RCCL parts holding the next send's (#1383) and, carried by the ack, the device start of the stage's later forwards, and posted no earlier than the receiving stage's device end (#1444), and a receive is posted at the receiving forward's prepare end (#1443); the receiver returns that completion, when a gloo part is rendezvous, on `stage(k+1)->stage(k):pp_ack#dp0`, lookahead `T_min - L_data`, and both waits receive it (K5). Confirmed by the owner on 2026-10-02: the send reaches the next stage on `stage(k)->stage(k+1):pp_data#dp0`, and the TP-rank-0 workers carry both channels' frames over the PP CPU group. | 2026-09-19, revised 2026-09-28 and 2026-09-30, confirmed 2026-10-02, revised 2026-10-18 and 2026-10-19 |
 | D92 | EP adds no LPs (inherits the TP group) but its all-to-all is invisible and must be a stated node; under TBO it overlaps the other micro-batch's compute, on the comm stream or as split send and receive (`04` D19). Expert sharding is Class A, remainder included. | 2026-09-19, revised 2026-10-18 ([#531](https://github.com/jgong5/ATOM/issues/531#issuecomment-6244543796)) |
+| D92.1 | DTP2 and DEP2, ruled by the owner for the DSv41-DPEP stage: V4.1's routed experts over TP and over EP2 key apart by `enable_expert_parallel`, each arm fitted on its own records; the slowest rank prices the step, through the step linear law's per-rank MoE column and the step grid's recorded routing. | 2026-11-14 (#3423) |
 | D93 | LP count = 1 traffic LP + per deployment (1 frontend LP + one engine LP per PP stage): 3 aggregated, 5 for 1P1D, independent of GPU count. The clock protocol's cost tracks PP degree and PD roles, not width. | 2026-09-19, revised 2026-09-28 |
 | D94 | Parallelism splits across `16` D95's milestones: TP and DP plumbing (LP structure, couplings, memory shape) at **M1**, with no parity test; at **M2**, scheduling parity and then cost accuracy. The parity test needs no cost model and runs TP2/DP2 as `-tp 2 --enable-dp-attention`, then DeepSeek-V4-Pro 1P+1D in the nightly DP-attention configuration with expert parallelism off; M2's EP8 step, which also carries EP's plumbing, repeats both with expert parallelism on, EP2 as `-tp 2 --enable-dp-attention --enable-expert-parallel`, then EP8. PP, its accuracy, and EP beyond one node come after v1. | 2026-09-19, revised 2026-10-10 (`16` D95) |
 
