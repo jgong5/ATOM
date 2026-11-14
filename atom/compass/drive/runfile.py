@@ -21,8 +21,9 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   ``provenance``, with its report's as ``inputs``; a stub's, and an op graph's
   with no price list, is None, its digest over what the run file states.
 - ``--host-laws KEY``, a `host_laws` entry's params, as ``host``, and its
-  ``hops``, each at the run-file key of its name; without it the run charges
-  no host time and each hop its floor (`run.HOP_FLOOR_S`).
+  ``hops``, each at the run-file key of its name, ``router_s`` only in a
+  prefill-decode run's; without it the run charges no host time and each hop
+  its floor (`run.HOP_FLOOR_S`).
 - ``--step-linear`` and ``--host-laws`` repeat, one entry per engine config:
   the key then holds a list, each process installing its own config's entry,
   and where their hops differ, the hops are those of the entry fitted under the
@@ -72,9 +73,6 @@ KINDS = {run.STEP_LINEAR: Kind.STEP_LINEAR_LAW, run.STEP_GRID: Kind.STEP_GRID_BU
 FIXED = {"bound_s": 1e7}
 #: A law file's host laws and their fit report, which are not its step law.
 HOST_MEMBERS = ("host", "host_fit")
-#: The router's per-request forward a prefill-decode deployment charges, one
-#: node or two: assumed, since nothing stamps the router's own time.
-ROUTER_RELAY_S = 1.5e-3
 
 
 def add_arguments(parser) -> None:
@@ -203,7 +201,9 @@ def build(args, atom_args, across: bool = False) -> dict:
             resolve(store, "host", k, machine, atom_args)[0] for k in args.host_laws
         ]
         out["host"] = hosts if len(hosts) > 1 else hosts[0]
-        out |= _hops(hosts, atom_args, machine.value("device.arch"))
+        # A run file's router_s makes it prefill-decode: `prefill_decode` writes it.
+        hops = _hops(hosts, atom_args, machine.value("device.arch"))
+        out |= {k: v for k, v in hops.items() if k != "router_s"}
     if args.padding:
         out["padding"] = args.padding
     if entry := getattr(args, "lmcache_offload", None):
@@ -236,7 +236,8 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     """The run file `build` builds from `args` for one prefill and one decode
     instance, started with ATOM's arguments `prefill_args` and `decode_args`:
     each side's DP width read from its own, the router's per-request forward
-    cost `ROUTER_RELAY_S`, and the KV transfers priced on the spec's
+    cost the prefill side's host entry's ``router_s`` hop, None for the floor
+    where it states none, and the KV transfers priced on the spec's
     `kv_link`, ``intra_node`` for two instances on one node and
     ``inter_node`` across two, which alone reads ``--network``. Its hops are
     the prefill side's host entry's, its ``decode_hops`` the decode side's. A
@@ -256,7 +257,7 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
         arch = run._machine(out).value("device.arch")
         out[run.DECODE_HOPS] = _hops(hosts, decode_args, arch)
     return out | {
-        "router_s": ROUTER_RELAY_S,
+        "router_s": _hops(hosts, prefill_args, arch).get("router_s") if hosts else None,
         "kv_link": kv_link,
     }
 

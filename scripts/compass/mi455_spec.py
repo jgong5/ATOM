@@ -11,16 +11,15 @@ them (`PEAKS`) give each format's derate over the peaks, the bandwidth curve,
 the kernel floor and the intra-node link's latency and derate, and its record
 the device fragment (`DEVICE`): the arch, the capacity torch reads and the
 stack. No card has a ptl directory. What no probe fills on any machine (the
-inter-node link's latency and derate, the router relay) is assumed as on
-mi355-gpu-45.
+inter-node link's latency and derate) is assumed as on mi355-gpu-45.
 
 `mi455-b0`, device `MI455X B0`, which no card reads: each attainable value is a
 peak times the ratio mi355-gpu-45 probed, assumed, as `compass project` takes
 them for a device never run. Every derate is MI355X's, each bandwidth-curve
 point is MI355X's over its datasheet bandwidth times MI455X's, and where no
 datasheet states a value MI355X's stands (`CARRIED`): its kernel floor and
-intra-node link latency, its stack, and the inter-node link latency
-and router relay it assumes. Its capacity is the datasheet's and its arch,
+intra-node link latency, its stack, and the inter-node link latency it
+assumes. Its capacity is the datasheet's and its arch,
 assumed, the A0 samples'; no rate, latency or stack A0's probe read reaches it.
 
 Each writes `--out`, by default its file in `machines/`, when `validate`
@@ -236,7 +235,7 @@ def b0_fragments() -> list[Fragment]:
             "assumed",
             f"{never_ran} values where no datasheet states one: its probed kernel "
             "floor and intra-node link latency, its stack, and the "
-            "inter-node link latency and router relay it assumes",
+            "inter-node link latency it assumes",
             date,
         ),
     ]

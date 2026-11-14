@@ -74,7 +74,6 @@ CARRIED = (
     "device.software_pinned_to.",
     "interconnect.intra_node.link_latency_s",
     "interconnect.inter_node.link_latency_s",
-    "interconnect.router_relay_s",
 )
 
 

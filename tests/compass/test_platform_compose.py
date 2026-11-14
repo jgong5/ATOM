@@ -41,14 +41,9 @@ from atom.compass.spec.layers import datasheet
 
 #: Each committed spec of one node's readings.
 ONE_NODE = sorted(p.stem for p in (SCRIPTS / "machines").glob("*.json"))
-#: What leaves the spec: the document's header, the scale-out network, which
-#: only a run across nodes reads, and the router's hop.
-MOVED = (
-    "provenance.",
-    "name",
-    "interconnect.inter_node.",
-    "interconnect.router_relay_s",
-)
+#: What leaves the spec: the document's header and the scale-out network, which
+#: only a run across nodes reads.
+MOVED = ("provenance.", "name", "interconnect.inter_node.")
 AT_A = {
     "software_stack": "rocm 7.2.4 / aiter f4e7c7509 / rccl 2.22.3",
     "torch": "2.10.0",
@@ -221,7 +216,6 @@ def test_only_a_run_across_nodes_reads_a_network_file(tmp_path):
     run = runfile.prefill_decode(parsed(tmp_path, *flags, *net), *pd, "inter_node")
     inter = run["machine"]["interconnect"]["inter_node"]
     assert inter == DOCUMENT["interconnect"]["inter_node"]
-    assert run["router_s"] == runfile.ROUTER_RELAY_S
 
 
 def test_step_measurements_fit_on_their_keys_platform_and_two_refuse(
