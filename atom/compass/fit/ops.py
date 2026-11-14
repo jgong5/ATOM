@@ -188,11 +188,10 @@ def _text(x) -> str:
 
 def prefill_leaf(leaf: dict, tokens: int, at=None) -> tuple[dict, set]:
     """A prefill leaf's signature at `tokens` as `measure ops --plan` and `fit
-    ops` key its family, and the counts it follows thereby (T): each size of a
-    kernel's (not an aten operator's) metadata tensor masked, as ATOM's runner
-    sizes it from the batch (DeepSeek-V4's sparse indices sum each token's
-    window); then each integer equal to `tokens` or one more, or with `at`
-    each at a position it holds (`_tokens_at`), read as `TOKENS` says."""
+    ops` key its family, and whether it follows T (as {"T"}): each metadata size
+    of a kernel's (not an aten operator's) masked, as ATOM's runner sizes it from
+    the batch; then each integer equal to `tokens` or one more, or with `at` each
+    at a position it holds (`_tokens_at`), read as `TOKENS` says."""
     # ponytail: the plan reads an unrelated int equal to T or T + 1 (a stride
     # of 1 at T = 1) as one too, measuring that shape's leaf apart
     follows, kernel = set(), not leaf.get("op", "").startswith("aten.")
@@ -227,12 +226,10 @@ def _read(shape: str, leaf: str, at=()) -> tuple[dict, set]:
 
 
 def _tokens_at(members) -> list[int]:
-    """The integer positions of a prefill skeleton's points, `_read` without
-    `at`, that `prefill_leaf` reads as the token count: those whose values at
-    one shape differ from those at another, where a point that ran its leaf at
-    one B (`ran_counts`) holds T or one more. A weight's size that equals T at
-    one shape, and a leaf that leads with a width W that is its T, keep their
-    integers."""
+    """The positions `prefill_leaf` reads as T in a prefill skeleton's points:
+    those whose values at one shape differ from those at another, where a point
+    that ran its leaf at one B (`ran_counts`) holds T or one more; so neither a
+    weight's size equal to T at one shape nor a width W that is T is."""
     each, held = [], {}
     for p in members:
         v = _ints(_read(p["shape"], p["leaf"])[0])
@@ -248,16 +245,15 @@ def _tokens_at(members) -> list[int]:
 
 
 def skeleton(shape: str, leaf: str, at=()) -> str:
-    """The phase of `shape` and `leaf`'s signature, as `_read` reads it at
-    `at`, with every integer masked."""
+    """The phase of `shape` and `leaf`'s signature with every integer masked."""
     sig = _walk(_read(shape, leaf, at)[0], lambda i, v: MASK, [0])
     return _text([shape.split()[0], sig])
 
 
 def family(shape: str, leaf: str, free, at=()) -> str:
     """The phase of `shape`, ``G`` after it when `shape` states one, and
-    `leaf`'s signature, as `_read` reads it at `at`, with the positions `free`
-    holds masked: the integers that follow the shape."""
+    `leaf`'s signature with the positions `free` holds masked: the integers
+    that follow the shape."""
     sig = _walk(_read(shape, leaf, at)[0], lambda i, v: MASK if i in free else v, [0])
     head = shape.split()[0] + (" G" if "G" in shape_counts(shape) else "")
     return _text([head, sig])
@@ -337,11 +333,11 @@ def fit(points) -> dict:
         else:
             groups.setdefault(skeleton(p["shape"], p["leaf"]), []).append(p)
     # a prefill skeleton splits by where its positions read as T hold it
-    tokens_of, refined = {}, {}
+    t_at, refined = {}, {}
     for skel, members in groups.items():
         if skel.startswith('["prefill"'):
-            tokens_of[skel] = _tokens_at(members)
-        tokens = tokens_of.get(skel, ())
+            t_at[skel] = _tokens_at(members)
+        tokens = t_at.get(skel, ())
         for p in members:
             key = skeleton(p["shape"], p["leaf"], tokens)
             refined.setdefault(key, (tokens, []))[1].append(p)
@@ -435,12 +431,7 @@ def fit(points) -> dict:
         if "row_bytes" in f:
             one = f["row_bytes"]
             f["row_bytes"] = one.pop() if len(one) == 1 else None
-    return {
-        "free": free_of,
-        "tokens": tokens_of,
-        "families": families,
-        "left_out": left_out,
-    }
+    return {"free": free_of, "tokens": t_at, "families": families, "left_out": left_out}
 
 
 def _either(counts) -> str:

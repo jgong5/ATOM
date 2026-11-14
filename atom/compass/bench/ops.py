@@ -3790,10 +3790,9 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
     does, is halved over cached tokens at each token count alone, where `fit
     ops` reads it after the token count. A prefill family whose shapes state G
     is not halved over its tokens: `trace ops` traces such a shape only at a
-    record's step. Any other is `_bent` over its tokens too, as a collective's
-    is, over its line as `fit ops` reads it, which declines the gaps beside such
-    a point, and takes there each token count of a step (`step_tokens`) at its
-    rows, or at any for a family stating none."""
+    record's step. Any other is `_bent` on its line as `fit ops` reads it, which
+    declines the gaps beside such a point, and takes there each token count of a
+    step (`step_tokens`) at its rows, or at any for a family stating none."""
     from atom.compass.capture.forward import decode, prefill
 
     steps = {
