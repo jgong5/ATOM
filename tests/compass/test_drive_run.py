@@ -14,7 +14,6 @@ summary into its out_dir; the summary after a refused step is the one
 
 import dataclasses
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,7 +24,7 @@ from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_capture_v4_pro import CONFIG as V4_PRO
 from test_dp_step_max import runner
 from test_drive_runfile import build, price_list_key, published
-from test_drive_trace_steps import IDENTITY
+from test_drive_trace_steps import IDENTITY, plant_module
 from test_memory_readings import ASSUMED, DOCUMENT, READINGS
 from test_op_graph import BENT, GEMM, g, listed, pt
 from test_op_work_v4 import MORI
@@ -91,7 +90,7 @@ def bundle(tmp_path, monkeypatch, member, **config):
     backend = loaded(tmp_path, member)
     bounds = {k: ENGINE[k] for k in ("max_num_seqs", "max_num_batched_tokens")}
     r = deployment(tmp_path, **{**bounds, **config}, capture_sizes=LADDER)
-    monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args, arch=None: r.config)
     return Key.of(Kind.STEP_GRID_BUNDLE, **KEY).token(), backend
 
 
@@ -125,8 +124,7 @@ def refused_summary(directory, monkeypatch):
 def plant(tmp_path, monkeypatch, steps, summary) -> None:
     """Serve from the planted server, which writes the record `steps` and
     client run 0's summary `summary`."""
-    (tmp_path / "planted.py").write_text(PLANTED)
-    monkeypatch.setattr(serve, "SERVER", (sys.executable, str(tmp_path / "planted.py")))
+    plant_module(tmp_path, monkeypatch, PLANTED)
     monkeypatch.setattr(serve, "identity", lambda *args: IDENTITY)
     monkeypatch.setenv("PLANTED_RECORD", str(steps))
     monkeypatch.setenv("PLANTED_SUMMARY", str(summary))
@@ -548,7 +546,7 @@ def op_graph_run(tmp_path, monkeypatch, steps, price_list):
     graph `decode_gemm`."""
     bounds = {k: ENGINE[k] for k in ("max_num_seqs", "max_num_batched_tokens")}
     r = deployment(tmp_path, **bounds, capture_sizes=LADDER)
-    monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args, arch=None: r.config)
     monkeypatch.setattr(compass_run, "_op_graphs", lambda *args, **kw: decode_gemm)
     if price_list:
         key = price_list_key(tmp_path)
@@ -634,7 +632,7 @@ def test_coverage_of_a_v4_pro_ep8_run_asks_its_price_list_at_atom_s_ep_width(
     r = deployment(
         tmp_path, **bounds, capture_sizes=LADDER, enable_expert_parallel=True
     )
-    monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args, arch=None: r.config)
     kinds = ("aiter.fused_moe_.default", MORI + "dispatch", MORI + "combine")
     region = {"seq": [{"op": kind, "args": {}} for kind in kinds]}
     monkeypatch.setattr(compass_run, "_op_graphs", lambda *a, **kw: lambda *s: region)
@@ -672,10 +670,6 @@ def test_coverage_of_a_v4_pro_dpa_run_reads_graphs_at_the_widths_its_ranks_run(
     atom += ["--max-num-seqs", "8", "--max-num-batched-tokens", "64"]
     atom += ["--max-model-len", "2048", "--cudagraph-capture-sizes", str(LADDER)]
     directory = recorded(tmp_path, monkeypatch, SHORT)
-    # Reading the quantization imports aiter, which a process with no driver
-    # cannot do; the build that reads the EP width does it in its own process.
-    quant = SimpleNamespace(compute_hash=lambda: "fp8", exclude_layers=[])
-    monkeypatch.setattr("atom.config.QuantizationConfig", lambda *args: quant)
     kinds = ("aiter.fused_moe_.default", MORI + "dispatch", MORI + "combine")
     region = {"seq": [{"op": kind, "args": {}} for kind in kinds]}
     structures = []
@@ -750,7 +744,7 @@ def test_coverage_under_tbo_reads_a_step_its_dp_group_split_as_its_micro_batches
     r = deployment(
         tmp_path, **bounds, capture_sizes=LADDER, enable_tbo=True, parallel_config=dp
     )
-    monkeypatch.setattr(drive_run, "_config", lambda atom_args: r.config)
+    monkeypatch.setattr(drive_run, "_config", lambda atom_args, arch=None: r.config)
     traced = set(population_shapes([str(directory)], tbo=True))
 
     def graph(phase, tokens, seqs, output, gathered=None, micro_batch=False):

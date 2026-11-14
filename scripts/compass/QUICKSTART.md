@@ -299,8 +299,8 @@ real runs at once, since real runs time the host. Success as in step 2.
 set -o pipefail   # a fit's exit status, not tee's
 RUNS=$(for d in $R/cal/c*; do echo --client-run $d $d/artifacts/client_run.json; done)
 TRACE_RUNS=$(for d in $R/trace/c*; do echo --client-run $d $d/artifacts/client_run.json; done)
-compass fit steps --backend step-linear --form history $R/cal/c* $R/trace/c* $RUNS $TRACE_RUNS \
-  $M $S --out $R/fit/steps 2>&1 | tee $R/logs/fit_steps.log
+compass fit steps --backend step-linear --form history --model $MODEL $R/cal/c* $R/trace/c* \
+  $RUNS $TRACE_RUNS $M $S --out $R/fit/steps 2>&1 | tee $R/logs/fit_steps.log
 compass fit host $R/cal/c* $RUNS $M $S --out $R/fit/host 2>&1 | tee $R/logs/fit_host.log
 token() { awk '/^published / {t = $NF} END {print t}' "$1"; }
 LAW=$(token $R/logs/fit_steps.log) HOST=$(token $R/logs/fit_host.log)

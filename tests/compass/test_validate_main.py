@@ -916,7 +916,9 @@ def test_an_op_graph_cell_grades_with_its_method_shares_term_gaps_and_warm_over_
     monkeypatch.setattr(
         drive_run,
         "_config",
-        lambda args: SimpleNamespace(atom_args=args, enable_expert_parallel=False),
+        lambda args, arch: SimpleNamespace(
+            atom_args=args, enable_expert_parallel=False
+        ),
     )
     monkeypatch.setattr(compass_run, "op_graph", op_graph)
 

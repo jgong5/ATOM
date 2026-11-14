@@ -39,6 +39,8 @@ reads in `non_torch`. A second such start refuses.
 file, and ``memory_readings.json``, the entry's readable copy (a RapidServe
 decode entry's in ``memory_readings.decode.json``). ATOM's
 ``--load_dummy`` refuses until its readings are shown to match a real load's.
+The API server's `FRONTEND` flags, which `compass record` serves with, are
+taken and dropped.
 """
 
 import argparse
@@ -84,6 +86,19 @@ RAPIDSERVE_RUNNER = (
 #: ATOM's dummy weights flag; its parser reads `_` in a flag as `-`.
 LOAD_DUMMY = "--load-dummy"
 START_TIMEOUT_S = 3600
+#: The API server's own flags that `compass record` passes it
+#: (`atom/entrypoints/openai/api_server.py::main`, less `serve.OWNED`), each
+#: parsed as the server parses it. They shape its HTTP frontend, which a start
+#: and the step bench (`bench/measure.py::atom_config`) have none of, so both
+#: take and drop them, and any other flag `EngineArgs` lacks still refuses.
+FRONTEND = {
+    "--tool-call-parser": {},
+    "--timeout-keep-alive": {"type": int},
+    "--disable-uvicorn-access-log": {"action": "store_true"},
+    "--chat-template": {},
+    "--default-chat-template-kwargs": {},
+    "--request-log": {},
+}
 #: Where in `READINGS` a RapidServe decode engine writes its readings.
 DECODE = "decode"
 
@@ -99,6 +114,8 @@ def start(argv: list[str]) -> None:
 
     parser = FlexibleArgumentParser()
     EngineArgs.add_cli_args(parser)
+    for flag, kind in FRONTEND.items():
+        parser.add_argument(flag, **kind)
     args = EngineArgs.from_cli_args(parser.parse_args(argv))
     kwargs = args._get_engine_kwargs()
     runner = RAPIDSERVE_RUNNER if args.enable_rapidserve else RUNNER

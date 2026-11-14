@@ -1084,13 +1084,17 @@ turn (agentx-harness `timing/trajectory_source.py`).
 - **One option differs, and it sends nothing to the model:** aiperf's server-metrics
   scrape, which `agentx` leaves on and InferenceX takes its hit rates from.
   `CompassAgenticReplay` refuses it, since D34 leaves how the scrape's process reaches the
-  clock undesigned; `08` D45.1 records what that leaves open for the hit rates.
+  clock undesigned. A real run scrapes (#3332), the option outside the hashed arguments so
+  both sides hash alike; a simulated run's hit rates are its engines' own counters across
+  the client run, warmup included, as aiperf's real export reads them (`08` D45.1).
 
 ### Open issues
 
-- The warmup barrier's drain polls `asyncio.sleep` in aiperf's runner, outside the
-  `LoopScheduler` rebind. Whether a simulated warmup, its 1800 s grace included, ends as a
-  real one does shows first in #3261's pair.
+- ~~The warmup barrier's drain polls `asyncio.sleep` in aiperf's runner, outside the
+  `LoopScheduler` rebind.~~ Settled by #3261: with the poll on the wall clock, the traffic
+  LP granted the drain's 1800 s grace while the poll slept, so a simulated warmup ended
+  at its grace; `ClockPhaseRunner._wait_for_accelerated_warmup_wire_drain` polls on the
+  clock instead.
 
 ---
 
