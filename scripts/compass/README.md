@@ -1254,8 +1254,9 @@ store. A record without a store touches no library.
    `compass fit host` on the calibration records alone; each prints its store token.
    Steps 1 to 3, after a warm record, are `calibrate.sh $R/cal 1 4 16 "trace 16" "trace 4"` with
    `MODEL`, `GPU`, `TRACES` and `AIPERF_PYTHON` set, its store
-   `$R/cal/store`; it prints the tokens, the law's held-out errors per band
-   and the `compass run` line of step 5. A RECORD after its concurrency names
+   `$R/cal/store`; it reads no platform, so it prints the tokens, the law's held-out
+   errors per band and the `compass run` line of step 5 with `$M` left as `--device
+   DATASHEET --ptl PTL`. A RECORD after its concurrency names
    the client's scenario, such as `"8 --trajectory-start-min-ratio 0
    --trajectory-start-max-ratio 0"`, the first-turn record that gives the law
    its decode rung 8; `trace` before one makes it a trace run of that recipe.
