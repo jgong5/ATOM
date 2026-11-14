@@ -66,7 +66,7 @@ def _export(run, requests, simulated=False) -> None:
 def _line(step, enter, out, batch=(), named=(), **more) -> dict:
     """A real step line: (request id, tokens, context) per row, and (request
     id, key, response id) per request it names; times in seconds."""
-    line = {"step": step, "dp_rank": 0, "is_dummy_run": False}
+    line = {"step": step, "dp_rank": 0, "is_dummy_run": False, "produces_output": True}
     line |= {"batch": [list(b) for b in batch], "named": [list(n) for n in named]}
     return line | {
         "t_enter_ns": round(enter * 1e9),
@@ -103,15 +103,15 @@ def _record(side, lines, simulated, transfers=()) -> None:
 
 def _deployment(run, kv_link="inter_node", d=DECODE_S, simulated=False) -> None:
     """A 1P1D run of two requests, A and B, its decode side's clock `d` ahead,
-    and three aiperf did not split: one errored, one with no response id, one
-    no step names."""
+    each decode forward handing the one before's tokens over, and three aiperf
+    did not split: one errored, one with no response id, one no step names."""
     run.mkdir()
     (run / "run.json").write_text(json.dumps({"kv_link": kv_link}))
     load = [[1, "load", 0, 64], [1, "save", 64, 200]]
     _record(
         run / "prefill",
         [
-            _line(0, 1.2, 1.5, [(1, 64, 64)], kv=load),
+            _line(0, 1.2, 1.5, [(1, 64, 64)], kv=load, produces_output=False),
             _line(1, 1.5, 1.9, [(1, 136, 200)], [(1, "ka", "pa")]),
             _line(2, 1.9, 2.2, [(2, 50, 50)], [(2, "kb", "pb")]),
         ],
@@ -122,6 +122,7 @@ def _deployment(run, kv_link="inter_node", d=DECODE_S, simulated=False) -> None:
         [
             _line(0, d + 2.3, d + 2.32, [(5, 1, 201)], [(5, 5, "a")]),
             _line(1, d + 2.6, d + 2.62, [(5, 1, 202), (6, 1, 51)], [(6, 6, "b")]),
+            _line(2, d + 2.7, d + 2.72, is_dummy_run=True),
         ],
         simulated,
         transfers=[(1, "a"), (2, "b")],
@@ -129,8 +130,8 @@ def _deployment(run, kv_link="inter_node", d=DECODE_S, simulated=False) -> None:
     _export(
         run,
         [
-            ("xa", "a", 1.0, 1.33, 2.0),
-            ("xb", "b", 1.1, 1.54, 1.8),
+            ("xa", "a", 1.0, 1.64, 2.0),
+            ("xb", "b", 1.1, 1.65, 1.8),
             ("xe", "e", 1.1, None, None),
             ("xn", None, 1.1, 0.5, 0.6),
             ("xu", "u", 1.1, 0.5, 0.6),
@@ -147,24 +148,24 @@ def test_a_real_deployment_joins_its_decode_node_to_its_clients_clock(tmp_path):
 
     assert json.loads((run / split.FILE).read_text()) == out
     # Prefill return less decode entry: 1.9 - 1002.3, 2.2 - 1002.6; first
-    # token less decode return: 2.33 - 1002.32, 2.64 - 1002.62.
+    # token less hand-over: 2.64 - 1002.62, 2.75 - 1002.72.
     assert out["clock"] == "monotonic"
-    assert out["decode_offset_s"] == pytest.approx([-1000.4, -999.99])
+    assert out["decode_offset_s"] == pytest.approx([-1000.4, -999.98])
     a, b = out["requests"]
     assert (a["response_id"], a["request_id"], b["response_id"]) == ("a", "xa", "b")
     for r, expected in (
         (
             a,
-            {"queue_s": 0.2, "prefill_s": 0.7, "kv_transfer_s": 0.41, "decode_s": 0.69},
+            {"queue_s": 0.2, "prefill_s": 0.7, "kv_transfer_s": 0.42, "decode_s": 0.68},
         ),
         (
             b,
-            {"queue_s": 0.8, "prefill_s": 0.3, "kv_transfer_s": 0.41, "decode_s": 0.29},
+            {"queue_s": 0.8, "prefill_s": 0.3, "kv_transfer_s": 0.42, "decode_s": 0.28},
         ),
     ):
         assert {k: r[k] for k in expected} == pytest.approx(expected)
         assert sum(r[k] for k in expected) == pytest.approx(r["e2el_s"], abs=1e-9)
-    assert (a["forward_ttft_s"], b["forward_ttft_s"]) == pytest.approx((1.33, 1.53))
+    assert (a["forward_ttft_s"], b["forward_ttft_s"]) == pytest.approx((1.64, 1.64))
     assert (a["lmcache_load_tokens"], a["lmcache_store_tokens"]) == (64, 136)
     assert (b["lmcache_load_tokens"], b["lmcache_store_tokens"]) == (0, 0)
     assert out["unsplit"] == {
@@ -178,26 +179,53 @@ def test_a_deployment_on_one_node_keeps_one_clock_and_refuses_events_out_of_orde
     tmp_path,
 ):
     """Intra-node, the decode side's forwards are read on the client's clock,
-    `DECODE_S` before its first forward's return, so each request's first
-    token at the client comes before the forward that produced it."""
+    `DECODE_S` ahead of it, so each request's first token at the client comes
+    before the forward that handed it over."""
     run = tmp_path / "run"
     _deployment(run, kv_link="intra_node")
 
     out = split.write(run)
 
     assert out == {
-        "refused": "request a's first token is 999.990000000 s before its decode "
-        "return, so its events are not on one clock"
+        "refused": "request a's first token is 999.980000000 s before its "
+        "hand-over, so its events are not on one clock"
+    }
+
+
+def test_a_request_no_later_forward_hands_over_is_unsplit(tmp_path):
+    """The decode side's record ends at the forward naming B."""
+    run = tmp_path / "run"
+    _deployment(run)
+    record = run / "decode" / "steps" / "dp0.jsonl"
+    record.write_text("".join(record.read_text().splitlines(keepends=True)[:-1]))
+
+    out = split.write(run)
+
+    assert [r["response_id"] for r in out["requests"]] == ["a"]
+    assert out["unsplit"]["xb"] == "no later forward hands its first token over"
+
+
+def test_a_pipelines_record_is_refused(tmp_path):
+    run = tmp_path / "run"
+    _deployment(run)
+    steps = run / "prefill" / "steps"
+    (steps / "pp1.dp0.jsonl").write_text("")
+
+    assert split.write(run) == {
+        "refused": f"{steps} is a pipeline's record, whose first tokens leave a "
+        "stage the split does not read"
     }
 
 
 def _simulated_instance(run, monkeypatch, cost=None) -> list[dict]:
     """A `compass run` instance's record and cost lines, its forwards driven
     on a clock each moves by its charge and 2 ms more, `cost` applied to each
-    cost line; each request's expected split."""
+    cost line; each request's expected split, its first token handed over by
+    the forward whose reply ATOM's scheduler first streamed it from."""
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(overrides, "_group_step_seconds", lambda *_: 0.0)
-        batches = _drive().batches
+        driven = _drive()
+    batches = driven.batches
     monkeypatch.setenv(parity.ENV, str(run / "steps"))
     r, clock, windows = _Runner(_config()), [10.0], []
     r.compass_host = HostDeviceRecurrence({}, (), lambda: clock[0])
@@ -221,10 +249,11 @@ def _simulated_instance(run, monkeypatch, cost=None) -> list[dict]:
                 e.setdefault("return", out)
             e["last"] = out
     for request, e in expected.items():
-        sent, first, end = e["entry"] - 0.25, e["return"] + 0.01, e["last"] + 0.01
+        handed = windows[driven.first_offer[request] - 1][1]
+        sent, first, end = e["entry"] - 0.25, handed + 0.01, e["last"] + 0.01
         requests.append((f"x{request}", f"r{request}", sent, first - sent, end - sent))
         e |= {"queue_s": 0.25, "prefill_s": e["return"] - e["entry"]}
-        e |= {"decode_s": end - e["return"], "forward_ttft_s": e["return"] - sent}
+        e |= {"decode_s": end - e["return"], "forward_ttft_s": handed - sent}
     _export(run, requests, simulated=True)
     return [expected[r] for r in expected]
 
@@ -250,16 +279,28 @@ def test_a_simulated_instance_splits_on_its_engines_clock_from_its_cost_lines(
         assert sum(r[k] for k in segments) == pytest.approx(r["e2el_s"], abs=1e-9)
 
 
-def test_a_simulated_record_whose_cost_lines_hold_no_step_times_is_refused(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "cost, why",
+    [
+        (lambda line: {**line, "t_s": None}, "{cost} holds no step times (t_s)"),
+        (
+            lambda line: {**line, "step": line["step"] + 1},
+            "{record}'s cost line of step 1 stands beside step 0",
+        ),
+    ],
+    ids=["no t_s", "another step's"],
+)
+def test_a_simulated_record_whose_cost_lines_do_not_time_its_steps_is_refused(
+    tmp_path, monkeypatch, cost, why
 ):
     run = tmp_path / "run"
-    _simulated_instance(run, monkeypatch, lambda line: {**line, "t_s": None})
+    _simulated_instance(run, monkeypatch, cost)
 
     out = split.write(run)
 
-    cost = run / "steps" / "dp0.cost.jsonl"
-    assert out == {"refused": f"{cost} holds no step times (t_s)"}
+    steps = run / "steps"
+    why = why.format(cost=steps / "dp0.cost.jsonl", record=steps / "dp0.jsonl")
+    assert out == {"refused": why}
 
 
 def test_a_run_with_no_step_record_is_refused_naming_where_it_looked(tmp_path):
@@ -319,4 +360,4 @@ def test_deploy_sh_writes_the_split_once_its_clients_export_is_complete(
         (b, {"queue_s": 0.8, "prefill_s": 0.3, "kv_transfer_s": 0.4, "decode_s": 0.3}),
     ):
         assert {k: r[k] for k in expected} == pytest.approx(expected)
-    assert (a["forward_ttft_s"], b["forward_ttft_s"]) == pytest.approx((1.32, 1.52))
+    assert (a["forward_ttft_s"], b["forward_ttft_s"]) == pytest.approx((1.62, 1.62))

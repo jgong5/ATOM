@@ -20,7 +20,7 @@ D80), `16` (D95.1), and the M3-Agentic stage's `03` D13.1, `06` D35.1 and `14` D
 | `13` D80: no command starts the client or takes a workload | `compass advice` does both | D109 |
 | `13` D80: a prefill or decode `run` refuses without `--join` | not under `--check`, which resolves the side as `deploy.sh` does | D109 |
 | `13` D80: what `run --check` lists | a step linear law's scheduled decode rungs with no vector, too | D112 |
-| `13` D80: what `run`, `record` and `deploy.sh` write | each writes its per-request split and `report.html` when its run ends | D114, D115 |
+| `13` D80: what `run`, `record` and `deploy.sh` leave | each run's per-request split and `report.html`, written as it ends by `client.sh --stop` for an instance and by `deploy.sh` for a deployment | D114, D115 |
 | `08` D50: the cell matrix | a MiniMax-M3 showcase set: the recommended configuration and the runner-up | D117 |
 
 ---
@@ -271,7 +271,7 @@ the same candidates in the same order, and refuses by name an unknown field,
 contradictory values or an empty expansion. Each candidate names its ATOM basis, the
 recipe its arguments follow, and each departure with its reason. Its format follows.
 The two templates, D116's and D117's, are space files in `scripts/compass/spaces/`,
-beside `laws/` and `machines/`; `compass advice` reads the SPACE it is given and falls
+beside `laws/`; `compass advice` reads the SPACE it is given and falls
 back on neither. The file is the search's input, as traces are a client's: each
 candidate's run takes `compass run`'s flags and ATOM's arguments from `compass advice`,
 so the file adds no level to `13` D79's precedence and is not the Compass config file D79
@@ -297,8 +297,9 @@ A block's fields are all optional: `basis`, the recipe its arguments follow; `de
 value, a string, a number, or `true` for a bare flag; `env`, each environment variable to
 its value; `per_concurrency`, each ATOM long flag to a positive integer, its value at a
 point that integer times the point's concurrency, as MiniMax-M3's `--max-num-seqs` is 2;
-`departures`, each argument or variable that departs from the basis to its reason; and, on
-a 1P1D candidate, `prefill` and `decode`, each holding one side's `args`, `env` and
+`departures`, each argument, by its long flag, or variable that departs from the basis to
+its reason, the flag read as an argument is and written with dashes; and, on a 1P1D
+candidate, `prefill` and `decode`, each holding one side's `args`, `env` and
 `per_concurrency`.
 
 **The expansion.** Each combination of the dimensions' values that no exclusion names is a
@@ -558,11 +559,14 @@ has run, and #3355 defers changing either.
   at the client, so they sum to its end-to-end latency within the clock's resolution. A
   real deployment's decode node's clock is joined to its client's, the bounds its
   forwards and first tokens set stated in the file. On a real run its TTFT, from the
-  send to the return of the forward whose output is its first token, matches aiperf's
-  within a tolerance measured first. A run the split cannot be made for gets the reason
-  in its file. Its format, `request_split.json`: each request aiperf finished as an
-  `atom-benchmark/v1` request record with its segments, that TTFT, its LMCache tokens
-  loaded and stored and its response id; every other request with why; the clock.
+  send to the return of the forward that hands its first token over, matches aiperf's
+  within a tolerance measured first; off a pipeline, the ATOM runner a client's tokens
+  come from hands an output-producing forward's tokens over at the return of its rank's
+  next one. A run the split cannot be made for gets the reason in its file, a
+  pipeline's among them. Its format, `request_split.json`: each request aiperf finished
+  as an `atom-benchmark/v1` request record with its segments, that TTFT, its LMCache
+  tokens loaded and stored and its response id; every other request with why; the
+  clock.
 - **The op-family split**, op level only: the prices per op kind a `compass run
   --op-graph` run holds per step (`op.<kind>` in `dp<r>.cost.jsonl`), summed per step
   phase into MoE, attention, dense GEMM, collectives, norms and elementwise, and other,

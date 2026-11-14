@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from test_lmcache_mp_engine import MACHINE
+from test_lmcache_mp_engine import on_cards
 from test_vertical_slice import (
     CONSTANT,
     HTTP,
@@ -137,12 +137,14 @@ def runs(tmp_path_factory):
     from atom.compass import cli
 
     root = tmp_path_factory.mktemp("images")
-    machine = MACHINE
+    gpu = os.environ.get("HIP_VISIBLE_DEVICES", "0")
+    machine = root / "machine.json"
+    machine.write_text(json.dumps(on_cards(gpu)))
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("AITER_LOG_LEVEL", "WARNING")  # the readings are keyed by it
         cli.main(
             ["measure", "memory"]
-            + ["--gpu", os.environ.get("HIP_VISIBLE_DEVICES", "0")]
+            + ["--gpu", gpu]
             + ["--store", str(root / "store"), "--out", str(root / "measure")]
             + ["--", *ARGS]
         )

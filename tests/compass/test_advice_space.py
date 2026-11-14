@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""`compass advice SPACE OUT`, through the `compass` entry: a space file
-expanded into its candidates and points, and each way a space is refused."""
+"""`compass advice SPACE OUT`, through the `compass` entry and `python -m`: a
+space file expanded into its candidates and points, and each way a space is
+refused."""
 
 import copy
 import json
+import subprocess
+import sys
 
 import pytest
 
@@ -67,7 +70,7 @@ TEMPLATE = {
             "S1": {
                 "basis": f"{SINGLE}, TP",
                 "args": ONE_NODE,
-                "departures": {"--max-num-seqs": SEQS},
+                "departures": {"--max_num_seqs": SEQS},
             },
             "S2": {
                 "basis": f"{SINGLE}, DP attention",
@@ -245,6 +248,10 @@ def test_a_per_concurrency_argument_is_its_factor_times_each_point_s_concurrency
             "common.args: '-tp' takes a long flag",
         ),
         (
+            lambda s: s["common"].update(departures={"-tp": "a"}),
+            "common.departures: '-tp' takes a long flag, --name, or a variable's name",
+        ),
+        (
             lambda s: s["workload"].update(select="9-3"),
             "workload.select takes A-B, A at most B, or agentx",
         ),
@@ -299,6 +306,11 @@ def test_an_unknown_or_malformed_field_is_refused_by_name(tmp_path, change, name
             {"departures": {"--level": "a"}},
             {"departures": {"--level": "b"}},
             "--level departs: a in common, but --level departs: b in dimensions.tp.tp8",
+        ),
+        (
+            {"departures": {"--max_num_seqs": "a"}},
+            {"departures": {"--max-num-seqs": "b"}},
+            "--max-num-seqs departs: a in common, but --max-num-seqs departs: b in",
         ),
         (
             {},
@@ -369,4 +381,31 @@ def test_compass_advice_reads_only_the_space_it_is_given(tmp_path):
         cli.main(["advice", str(tmp_path / "absent.json"), str(tmp_path / "out")])
 
     assert str(tmp_path / "absent.json") in str(refused.value)
+    assert not (tmp_path / "out").exists()
+
+
+def test_python_m_runs_compass_advice(tmp_path):
+    advise(tmp_path, small(), "first")
+    advice = [sys.executable, "-m", "atom.compass.advice"]
+
+    done = subprocess.run(
+        [*advice, str(tmp_path / "space.json"), str(tmp_path / "second")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    refused = subprocess.run(
+        [*advice, str(tmp_path / "absent.json"), str(tmp_path / "out")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    written = [
+        (tmp_path / d / "candidates.json").read_bytes() for d in ("first", "second")
+    ]
+    assert written[0] == written[1]
+    assert refused.returncode == 1 and "Traceback" not in refused.stderr
+    assert refused.stderr.startswith("compass advice: ")
     assert not (tmp_path / "out").exists()

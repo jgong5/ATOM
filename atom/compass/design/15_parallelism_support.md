@@ -518,7 +518,7 @@ protocol, so each carrier (`rccl`, `gloo`) gets these fields under
 of `T = rendezvous_fixed_s + bytes × G`. So `T_min` is the least `rendezvous_fixed_s`. PP is
 single-node (every PP address is ZMQ IPC), hence the intra-node section. The fields are
 optional in the schema and required by a PP run; a machine that does not state them refuses
-a PP run by name. `scripts/compass/pp_carriers.py` fits them on two GPUs over RCCL and gloo
+a PP run by name. `compass measure device --pp` fits them on two GPUs over RCCL and gloo
 (README principle 8). A threshold of 0 states that no size is eager: on MI308X a gloo send
 completes only once its receive is posted, at every size probed, so each of its parts is
 rendezvous and each send takes an ack.
