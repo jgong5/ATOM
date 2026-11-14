@@ -129,7 +129,7 @@ development nodes are crsuse2-m2m-v3-005 and -013.
              with --kv-transfer-config, so DeepSeek-V4's index cache is fp8 in
              both keys (D109); a law and readings per side (D112)
    simulate  deploy.sh run: both sides, the router, one client.sh run
-   results   both sides' GPUs counted (D111, T110)
+   results   both sides' GPUs counted, each from its own engine record (D111)
    the run   its per-request split joins both sides on each request (D114)
 ```
 
@@ -348,8 +348,10 @@ the input and output tokens, cache hits included; P90 interactivity, one over th
 and the normalised one, one over the P90 of each request's end-to-end latency per output
 token; P90 TTFT. The search adds two of its own from the same export: throughput per GPU
 of the tokens the engine computed, the input and output tokens less
-`usage_prompt_cache_read_tokens`; P90 end-to-end latency, from `request_latency`. A 1P1D
-point counts both sides' GPUs (T110).
+`usage_prompt_cache_read_tokens`; P90 end-to-end latency, from `request_latency`. A
+point's GPUs are those its engine records state, each tensor parallel times data
+parallel: a 1P1D point's are its prefill side's plus its decode side's, each read from
+that side's own record, in the `prefill/` and `decode/` that `deploy.sh` writes.
 
 - **Frontier**: throughput per GPU, InferenceX's, against P90 interactivity; the points
   no other dominates on both.
@@ -371,8 +373,10 @@ point counts both sides' GPUs (T110).
 **Reason.** InferenceX's definitions, so a user reads the curves as InferenceX's, from the
 code that grades the M3-Agentic stage, so a search and a grade share them; the search's
 own add the engine's work net of prefix-cache hits and a request's whole wait; a refused
-step charges less than it ran by an amount nothing measured (`08` D50.1). **Basis.** The
-owner on #3355; #3264, landed by #3325; `08` D45.1, D50.1.
+step charges less than it ran by an amount nothing measured (`08` D50.1). Both sides of a
+1P1D point hold their cards for the whole run, and their widths may differ, so each side
+counts its own. **Basis.** The owner on #3355; #3264, landed by #3325; the GPU count,
+#3454; `08` D45.1, D50.1.
 
 **Rejected.** Ranking by the computed-token throughput: the tokens a user is served,
 cache hits included, are what InferenceX ranks and the M3-Agentic stage grades, so the
@@ -828,7 +832,7 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | D108 | Fitting apart from searching: a candidate is simulated once its law exists; the halves meet only through the store and a calibration's `status` file, the search owning no calibration, fitting, reuse judgement or version management. A user guide, `scripts/compass/ADVICE.md`, exact enough that an agent following it fills the DeepSeek-V4-Pro template's space file, and no skill; an agent starts a calibration only on the user's yes. | 2026-11-13 ([#3355](https://github.com/jgong5/ATOM/issues/3355), [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6845852318)) |
 | D109 | `compass advice SPACE OUT` checks each candidate (searchable, missing a law, calibrating, refused) and each point's readings (missing readings, with the `measure memory` command `run --check` prints), simulates each searchable point on a fresh server with no step roofline, and writes the results; it never calibrates, and runs at the integration head, on the target machine type, in a GPU container. Amends `13` D80: it starts the client and takes a workload, and `run --check` resolves a prefill or decode side. | 2026-11-13 (#3355, #3363) |
 | D110 | The user provides the space file, by hand or through an agent following the guide from what the user asks for, a recipe or real-run arguments; it names the shared store and, for a frozen search, its commit; it expands deterministically into candidates, each naming its ATOM basis and departures; the templates live in `scripts/compass/spaces/`, no default; it is the search's input, not a level of `13` D79's precedence nor the config file it rejects. Its format: one JSON object, the dimensions' product less the exclusions, each candidate `common`'s block and its values', two blocks setting one thing apart refused. | 2026-11-13 (#3355, #3363); D79 settled 2026-11-14 ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927)); the format 2026-11-14 (#3448) |
-| D111 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. | 2026-11-13 (#3355) |
+| D111 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. A 1P1D point's GPUs are its prefill side's plus its decode side's, each from its own engine record. | 2026-11-13 (#3355); the GPU count 2026-11-14 ([#3454](https://github.com/jgong5/ATOM/issues/3454)) |
 | D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage (a decode vector for every scheduled rung before the search, each point's extrapolated share reported after it) and `08` D47's three figures on each leave-one-run-out fold within #627's 5% gate, a law at the head past it refused; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose ATOM digest is not the head's, the remote tip's or a frozen commit's, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363; the head by ATOM's digest, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957); coverage in two parts, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216); the accuracy bar, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6869501859)) |
 | D113 | The step linear backend lists a configuration's missing records, for a missing law or decode rung, as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
 | D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355) |
