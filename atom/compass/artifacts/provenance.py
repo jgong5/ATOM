@@ -24,8 +24,9 @@ the difference.
 aiter's, aiter lives in the container's writable layer outside `/workspace`,
 and two versions are in circulation on this project right now. A stanza naming
 only ATOM's tree describes half of what ran, so a `Provenance` cannot be built
-without both. An aiter bump refuses: the machine-spec key pins aiter's commit,
-and a root this module counts as dirty refuses at publish.
+without both. An aiter bump refuses: a key that states the software stack
+names aiter's version, and a root this module counts as dirty refuses at
+publish.
 
 `git describe --tags --always --dirty` is the call the GPU gate makes to
 version aiter, and the gate finds aiter's checkout with this module's
