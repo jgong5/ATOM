@@ -297,8 +297,9 @@ A block's fields are all optional: `basis`, the recipe its arguments follow; `de
 value, a string, a number, or `true` for a bare flag; `env`, each environment variable to
 its value; `per_concurrency`, each ATOM long flag to a positive integer, its value at a
 point that integer times the point's concurrency, as MiniMax-M3's `--max-num-seqs` is 2;
-`departures`, each argument or variable that departs from the basis to its reason; and, on
-a 1P1D candidate, `prefill` and `decode`, each holding one side's `args`, `env` and
+`departures`, each argument, by its long flag, or variable that departs from the basis to
+its reason, the flag read as an argument is and written with dashes; and, on a 1P1D
+candidate, `prefill` and `decode`, each holding one side's `args`, `env` and
 `per_concurrency`.
 
 **The expansion.** Each combination of the dimensions' values that no exclusion names is a
