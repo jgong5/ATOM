@@ -19,7 +19,7 @@ that change kernels and groups at a fixed rank count: the switches
 (`SWITCHES`) and `decode_context_parallel_size`. A `price_list` or
 `memory_readings` entry answers only at the layout it was
 keyed at: a TP2 price list does not answer for `-tp 2 -dp 2`. An
-`op_measurement` holds the layout only for a collective leaf, in its point's
+`op_measurement` holds the layout only for a leaf on a process group, in its point's
 digest, and answers at every layout for any other leaf. A width is a
 whole number of at least one and a switch is a `bool`. A `bool` is refused in
 every other field, because `True == 1` would make two keys equal whose
@@ -74,7 +74,8 @@ OWN_FIELDS: Mapping[Kind, tuple[str, ...]] = {
     # traced under another of either is another entry.
     Kind.OP_GRAPH: ("structure", "shape", "source_root"),
     # `point` is the digest of the shape, context and leaf one measurement
-    # took, and of the layout for a collective leaf alone (`bench.ops.point_key`).
+    # took, and of the layout for a leaf on a process group alone
+    # (`bench.ops.point_key`).
     Kind.OP_MEASUREMENT: ("model", "source_root", "point"),
     Kind.PRICE_LIST: ("model", *LAYOUT, "source_root"),
     # The engine config as `run.memory.key_fields` reads it, as sorted JSON.

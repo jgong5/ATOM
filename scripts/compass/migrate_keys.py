@@ -13,8 +13,8 @@ is. Specs that differ in torch alone share a digest, which then names only the
 fields they agree on: an entry or law whose kind keys torch is listed.
 
 An `op_measurement` key used to state the parallel layout of every point; it
-now holds it in the point's digest for a collective leaf alone (`measure ops`'
-`point_key`), so any other leaf's point answers at every layout. Each point is
+now holds it in the point's digest for a leaf on a process group alone
+(`measure ops`' `point_key`), so any other leaf's point answers at every layout. Each point is
 republished as `measure ops` publishes one, its first rank's member at one
 rank.
 
@@ -177,10 +177,10 @@ def entry(directory: Path, known: dict, into: ArtifactStore) -> str:
 def _unlayered(values: dict, topology: Topology, members: dict) -> tuple:
     """An `op_measurement` key, `values`, that states its parallel layout, and
     the topology and members its entry holds, as `measure ops` publishes them
-    today: the layout in a collective's point digest alone, and the point at
+    today: the layout in the point digest of a leaf on a group alone, and the point at
     one rank, its first rank's member; refused when the point's digest is not
     its record's."""
-    from atom.compass.bench.ops import point_digest
+    from atom.compass.bench.ops import on_group, point_digest
 
     layout = {f: values[f] for f in LAYOUT}
     values = {k: v for k, v in values.items() if k not in LAYOUT}
@@ -189,7 +189,7 @@ def _unlayered(values: dict, topology: Topology, members: dict) -> tuple:
     ran = record["shape"], record["context"], record["leaf"]
     if (digest := point_digest(*ran)) != values["point"]:
         raise ValueError(f"its point's digest is not its record's, {digest}")
-    if "exchange" in record:
+    if on_group(record["leaf"], "exchange" in record):
         values["point"] = point_digest(*ran, layout)
     one = Topology()
     return values, one, {member_name("point", one.ranks()[0], "json"): first}

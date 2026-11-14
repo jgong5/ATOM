@@ -8,7 +8,7 @@ Each DIR is a `measure ops --out` directory; each point its ops.jsonl, or with
 S, where `measure ops` published it. A `--plan` run resumed into a DIR keeps
 the rounds earlier runs wrote there, so DIR lists every run's points, and its
 plan.jsonl lists the points it found already in S, measured at any layout
-when their leaf is no collective (`bench.ops.point_key`). Every point must
+when their leaf runs on no process group (`bench.ops.point_key`). Every point must
 name one model, platform and source root, and every line one parallel layout,
 the layout of the run that listed it: the price list is published at that
 `price_list` key under the readings the points ran under.

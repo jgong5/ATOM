@@ -164,11 +164,12 @@ device faulted (`_alive`); one that dies ends every rank, keeps the points
 every rank finished, the point it was measuring refuses, and new ones measure
 the rest; two in a row that die having finished no point fail the run.
 
-DIR gets run.json, the run's identity, and ops.jsonl, one line per point with
-its store token and the run's parallel layout. S gets each
+DIR gets run.json, the run's identity, and ops.jsonl, one line per point, those
+S held already among them, each with its store token and the run's parallel
+layout. S gets each
 measured point as an `op_measurement`, keyed by the model, the device, stack,
 PTL state and torch run.json reads, the source root and the point, the layout
-only for a collective leaf (`point_key`): a point of any other leaf answers at
+only for a leaf on a process group (`point_key`): a point of any other leaf answers at
 every layout, and one S holds is not measured again.
 
 `--plan` measures, in rounds, the points the steps of record directories call
@@ -688,7 +689,7 @@ def main(argv: list[str]) -> None:
     with quiet(args.gpu, out):
         run = identity(out / "engine.json", config.model, command, args.gpu)
         (out / "run.json").write_text(json.dumps(run))
-        key, held = keys(config, run), 0
+        key, held = keys(config, run), []
         if args.plan:
             command, atom_args = " ".join(command), argv[cut + 1 :]
             return plan(store, key, config, run, args, command, out, atom_args)
@@ -697,11 +698,11 @@ def main(argv: list[str]) -> None:
                 at = key(shape, context, sig, exchange(op) is not None)
                 if store.directory_for(at).exists():
                     del found[sig]
-                    held += 1
-        print(f"{held} points already in the store", flush=True)
+                    held.append(_stored(store, at, shape))
+        print(f"{len(held)} points already in the store", flush=True)
         todo = [point for point in todo if point[2]]
         results = _measured(config, todo, args.llc_mib << 20, len(args.gpu))
-    publish(store, key, config, run, " ".join(command), results, out)
+    publish(store, key, config, run, " ".join(command), results, out, held)
     refused = [
         f"{r['op']} at {r['shape']}: {r['refused']}" for r in results if "refused" in r
     ]
@@ -3042,14 +3043,28 @@ def layout_of(config) -> dict:
     return {k: v for k, v in key_fields(config).items() if k in LAYOUT}
 
 
+#: How a leaf's `signature`, compact JSON, names the process group it runs on,
+#: as aiter's all-reduces and fused all-reduce norms and torch's functional
+#: collectives each take one.
+GROUP = '"group_name":'
+
+
+def on_group(leaf: str, collective=False) -> bool:
+    """Whether the leaf of signature `leaf` runs on a process group: a
+    `collective` (`exchange`), some of which the capture lifts with their
+    group dropped, or one whose arguments name its group (`GROUP`)."""
+    return collective or GROUP in leaf
+
+
 def point_key(fields, layout, shape, context, leaf, collective=False) -> Key:
     """The `op_measurement` key of the point `(shape, context, leaf)` measured
     at `fields`, its model, platform and source root, its digest holding the
-    parallel `layout` only when the leaf is a `collective` (`exchange`): a
-    collective's signature names its group by role, not by its ranks, while
-    any other leaf's holds the shapes the layout gives it, so its point
+    parallel `layout` only when the leaf runs on a process group (`on_group`):
+    a group is named by its role (`tp:0`), not by its ranks, while any other
+    leaf's signature holds the shapes the layout gives it, so its point
     answers at every layout."""
-    point = point_digest(shape, context, leaf, layout if collective else None)
+    grouped = on_group(leaf, collective)
+    point = point_digest(shape, context, leaf, layout if grouped else None)
     return Key.of(Kind.OP_MEASUREMENT, **fields, point=point)
 
 
@@ -3061,9 +3076,20 @@ def point_digest(shape, context, leaf, layout=None) -> str:
     return "sha256:" + hashlib.sha256(text).hexdigest()
 
 
-def publish(store, key, config, run: dict, command: str, results, out: Path):
-    """Write `results` to ``ops.jsonl`` in `out`, each with its store token
-    and `config`'s layout, and each measured one to `store` at its `key`."""
+def _stored(store, at, shape) -> dict:
+    """The point `store` holds at `at`, asked at `shape`: with the asking
+    shape's micro-batch mark alone, since the point's key holds no TBO switch
+    and a store may hold it from before records kept one."""
+    entry = store.read(at)
+    point = json.loads(entry.read_member("point", entry.topology.ranks()[0], "json"))
+    point.pop("micro_batch", None)
+    return point | ({"micro_batch": True} if shape.micro_batch else {})
+
+
+def publish(store, key, config, run: dict, command: str, results, out: Path, held=()):
+    """Write `held`, points `store` held, and `results` to ``ops.jsonl`` in
+    `out`, each with its store token and `config`'s layout, and each measured
+    one of `results` to `store` at its `key`."""
     from atom.compass.fit.publish import conditions, ranks
     from atom.compass.fit.samples import run_fields
     from atom.compass.run.step_grid import keyed
@@ -3076,12 +3102,12 @@ def publish(store, key, config, run: dict, command: str, results, out: Path):
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     layout = layout_of(config)
     with (out / "ops.jsonl").open("w") as lines:
-        for record in results:
+        for n, record in enumerate([*held, *results]):
             point = record["shape"], record["context"], record["leaf"]
             at = key(*point, "exchange" in record)
             line = record | {"token": at.token(), "layout": layout}
             lines.write(json.dumps(line) + "\n")
-            if "refused" not in record:
+            if n >= len(held) and "refused" not in record:
                 body, every = json.dumps(record).encode(), ranks(at)
                 store.publish(
                     at,
@@ -3212,14 +3238,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     continue
                 at = key(shape, context, sig, exchange(op) is not None)
                 if store.directory_for(at).exists():
-                    entry = store.read(at)
-                    held = entry.read_member("point", entry.topology.ranks()[0], "json")
-                    # the asking shape's mark alone: the point's key holds no TBO
-                    # switch, and a store may hold it from before records kept one
-                    point = json.loads(held)
-                    point.pop("micro_batch", None)
-                    mark = {"micro_batch": True} if shape.micro_batch else {}
-                    done[str(shape), context, sig] = point | mark
+                    done[str(shape), context, sig] = _stored(store, at, shape)
                 else:
                     found[sig] = op, instances
             todo += [(shape, context, found)] if found else []

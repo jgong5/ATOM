@@ -253,7 +253,7 @@ def _op_graph(side: Path):
 def _warm_over_cold(run_file: dict):
     """`measure ops`'s warm time over its cold one per op kind, over the
     points the store holds for the run file's price list: of its model,
-    platform and source root, a collective's at its layout too
+    platform and source root, one on a process group at its layout too
     (`bench.ops.point_key`)."""
     from atom.compass.artifacts.keys import LAYOUT
     from atom.compass.bench.ops import point_key
@@ -270,8 +270,8 @@ def _warm_over_cold(run_file: dict):
                 entry.read_member("point", entry.topology.ranks()[0], "json")
             )
             ran = point["shape"], point["context"], point["leaf"]
-            if "exchange" in point and point_key(stated, layout, *ran, True) != at:
-                continue  # a collective measured at another layout
+            if point_key(stated, layout, *ran, "exchange" in point) != at:
+                continue  # a point on a process group, at another layout
             by.setdefault(point["op"], []).append(point.get("warm_over_cold"))
     for op, ratios in sorted(by.items()):
         r = [x for x in ratios if x is not None]
