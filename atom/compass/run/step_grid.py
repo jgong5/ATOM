@@ -31,11 +31,13 @@ layer names as the model's runner remaps them (`quantization`), the TP and
 DP widths, DP attention, expert parallelism, TBO, the MoE backend, the
 all-to-all backend, EPLB and DeepSeek-V4.1 decoder SWA bounded replay when
 off ATOM's default, the index cache's dtype where ATOM resolved it apart from
-the KV cache's, whether mori imports where it does not, the performance
-environment, each variable of `READ_OFF_DEFAULT` in it when ATOM reads it off
-its default too, and, under speculation, its
-method and draft width, and the digest of the draft's config.json where it is
-not the target's. Loading refuses, naming what differs:
+the KV cache's, whether mori imports where it does not, MiniMax-M3's
+indexer-only context parallelism when on, the model config's
+``--hf-overrides`` when it states any, the performance environment, each
+variable of `READ_OFF_DEFAULT` in it when ATOM reads it off its default too,
+and, under speculation, its method and draft width, and the digest of the
+draft's config.json where it is not the target's. Loading refuses, naming
+what differs:
 
 - a run at data-parallel width above one, since every bundle is measured at one;
 - a keyed condition, the grid's graph mode, a timing scope other than the
@@ -105,12 +107,15 @@ DERIVED = {"index_cache_dtype": "kv_cache_dtype"}
 #: ATOM's prefill token buckets, an environment variable `keyed` the same way.
 BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
 #: ATOM's environment variables keyed only where ATOM reads them off their
-#: default: `BUCKETS`, and the three that decide, with the all-to-all backend
-#: and whether mori imports (`MORI`), whether a MoE fuses its shared expert
-#: into aiter's top-k table (`model_ops/topK.py`): two under DP attention, and
-#: one for an MXFP8 shared expert beside MXFP4 routed ones.
+#: default: `BUCKETS`, vocabulary-embedding replication (GLM-5.2's and an EAGLE3
+#: draft's whole embedding, with no all-reduce after it), and the three that
+#: decide, with the all-to-all backend and whether mori imports (`MORI`), whether
+#: a MoE fuses its shared expert into aiter's top-k table (`model_ops/topK.py`):
+#: two under DP attention, and one for an MXFP8 shared expert beside MXFP4
+#: routed ones.
 READ_OFF_DEFAULT = (
     BUCKETS,
+    "ATOM_REPLICATE_VOCAB_EMBED",
     "ATOM_FUSE_SHARED_EXPERT",
     "ATOM_DISABLE_MORI_EP",
     "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4",
@@ -131,10 +136,11 @@ DRAFT = "draft_model"
 def keyed(config, ladder: bool = True) -> dict:
     """The conditions a bundle is measured under, as the resolved config holds them,
     `OFF_DEFAULT` only where it is off its default, `MORI` only where mori does
-    not import, and the performance environment of this process less the
-    client's and the device selection (`keyed_env`), and under speculation its
-    method and draft width, and `DRAFT` (`_draft`); the ladder only with
-    `ladder`."""
+    not import, MiniMax-M3's indexer-only context parallelism only when on, the
+    model config's overrides only when it states some, and the performance
+    environment of this process less the client's and the device selection
+    (`keyed_env`), and under speculation its method and draft width, and
+    `DRAFT` (`_draft`); the ladder only with `ladder`."""
     from atom.config import Config
 
     spec = getattr(config, "speculative_config", None)
@@ -150,6 +156,11 @@ def keyed(config, ladder: bool = True) -> dict:
             default = getattr(config, DERIVED[name])
         if (value := getattr(config, name, None)) not in (None, default):
             drafts[name] = value
+    if getattr(getattr(config, "dcp_config", None), "indexer_dcp_only", False):
+        drafts["indexer_dcp_only"] = True
+    # ATOM applies them to the model config after it reads config.json.
+    if overrides := getattr(config, "hf_overrides", None):
+        drafts["hf_overrides"] = overrides
     return drafts | {
         "kv_cache_block_size": config.kv_cache_block_size,
         "kv_cache_dtype": config.kv_cache_dtype,

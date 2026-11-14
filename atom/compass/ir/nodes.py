@@ -59,7 +59,8 @@ class Tensor:
     """A tensor argument: enough to make one like it, and where it came from.
     `shuffled` is the `is_shuffled` mark ATOM sets on a preshuffled weight,
     which an operator such as aiter's `fused_moe_` reads to pick its kernel;
-    `host`, whether ATOM holds it on the host rather than the device."""
+    `host`, whether ATOM holds it on the host rather than the device;
+    `pageable`, whether such a tensor is one ATOM did not ask to pin."""
 
     shape: tuple
     dtype: str
@@ -67,6 +68,7 @@ class Tensor:
     role: Role
     shuffled: bool = False
     host: bool = False
+    pageable: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "shape", as_shape(self.shape))

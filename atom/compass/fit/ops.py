@@ -240,7 +240,13 @@ def fit(points) -> dict:
     every rank to the same rows and keep it; and ``left_out``, each point
     whose leaf may have run at two places in its family (`ran_counts`), by
     its shape, operator and why."""
-    from atom.compass.bench.ops import DP_GROUP, _dependent, _split, routed_rows
+    from atom.compass.bench.ops import (
+        DP_GROUP,
+        _dependent,
+        _launched,
+        _split,
+        routed_rows,
+    )
     from atom.compass.capture.peers import MORI
 
     dependent = _dependent(points)
@@ -253,7 +259,7 @@ def fit(points) -> dict:
                 fam,
                 {"op": p["op"], "dims": ["bytes"], "points": {}, "row_bytes": set()},
             )
-            f["points"].setdefault((nbytes,), []).append((p["cold_ns"], p["kernels"]))
+            f["points"].setdefault((nbytes,), []).append((p["cold_ns"], _launched(p)))
             counts = shape_counts(p["shape"])
             gathered = p["op"].startswith(DP_GROUP + (MORI,))
             f["row_bytes"].add(
@@ -331,7 +337,7 @@ def fit(points) -> dict:
                 continue
             f = families.setdefault(name, {"op": p["op"], "dims": dims, "points": {}})
             got = f["points"].setdefault(tuple(at_p[d] for d in dims), [])
-            got.append((p["cold_ns"], p["kernels"]))
+            got.append((p["cold_ns"], _launched(p)))
     for name, f in families.items():
         if "mean" in f["dims"]:  # rows measured alike only: read by max alone
             i = f["dims"].index("mean")
