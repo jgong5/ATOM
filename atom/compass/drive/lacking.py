@@ -31,9 +31,9 @@ time.
 A prefill or decode instance's run reads a network file across nodes, as
 `deploy.sh run` hands it one, and its readings command takes the ATOM
 arguments a real start of it takes, where they are not the run's, and the
-environment the run's check set. Its step linear law is made by `deploy.sh
-record` and a fit of that side's records (`SIDE_LAW`): `calibrate.sh` records
-a lone server.
+environment the run's check set. Its step linear law and host laws are made
+by `deploy.sh record`, which records both sides together, and a fit of that
+side's records (`SIDE_LAW`); `calibrate.sh` records a lone server.
 
 Printed apart, outside the exit status: the gaps `--coverage`'s check counts;
 an op graph's absent price list, which prices every leaf by its analytical
@@ -94,12 +94,14 @@ CALIBRATION_OUT = "cal"
 #: states: its command states each this process's environment sets, and names
 #: each it does not.
 CLIENT_ENV = ("TRACES", "AIPERF_PYTHON")
-#: The command that makes a prefill or decode instance's step linear law: each
-#: `deploy.sh record` deployment writes the side's record in OUT/<side>.
+#: The command that makes a prefill or decode instance's law, `fit` its
+#: `compass fit` command: each `deploy.sh record` deployment writes the side's
+#: record in OUT/<side>.
 SIDE_LAW = (
-    "deploy.sh OUT record of the deployment, then compass fit steps --backend "
-    "step-linear on each OUT/{side}"
+    "deploy.sh OUT record of the deployment, then compass fit {fit} on each OUT/{side}"
 )
+#: Each law a side fits from its own records, by its `compass fit` command.
+FITS = {STEP_LINEAR: "steps --backend step-linear", "host": "host"}
 #: Each side by the letter `runfile.pd_side` gives it.
 SIDES = {"P": "prefill", "D": "decode"}
 
@@ -149,8 +151,10 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     run = {"machine": machine.echo(), "store": str(store.root)}
     flags = {k: getattr(args, k) for k in runfile.KINDS if getattr(args, k)}
     made_by = dict(MADE_BY)
-    if STEP_LINEAR in flags and side:
-        made_by[STEP_LINEAR] = SIDE_LAW.format(side=SIDES[side])
+    if side:
+        made_by |= {
+            k: SIDE_LAW.format(fit=f, side=SIDES[side]) for k, f in FITS.items()
+        }
     elif STEP_LINEAR in flags:
         out = args.out or CALIBRATION_OUT
         made_by[STEP_LINEAR] = calibration(out, atom_args, config)
@@ -179,12 +183,12 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
             )
             lacks.append((law, "stale (coverage)", refusal, made_by[STEP_LINEAR]))
     if "host" in run and met(
-        host, MADE_BY["host"], compass_run.pick_fitted, run, "host", config
+        host, made_by["host"], compass_run.pick_fitted, run, "host", config
     ):
         given = run["host"], config, machine_platform(machine)
-        met(host, MADE_BY["host"], compass_run.refuse_unfitted_host, *given)
+        met(host, made_by["host"], compass_run.refuse_unfitted_host, *given)
         tok = _load_tokenizer(engine.model, engine.trust_remote_code)
-        met(host, MADE_BY["host"], compass_run.tokenizer_term, run, tok, config)
+        met(host, made_by["host"], compass_run.tokenizer_term, run, tok, config)
     grid, made = NAMES[STEP_GRID], MADE_BY[STEP_GRID]
     checked = STEP_GRID in run and (
         met(grid, made, compass_run.refuse_context_parallel, STEP_GRID, config)
