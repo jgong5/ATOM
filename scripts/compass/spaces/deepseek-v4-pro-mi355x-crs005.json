@@ -1,0 +1,180 @@
+{
+  "model": "/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro",
+  "machine": {
+    "device": "mi355x",
+    "ptl": "disabled",
+    "network": "crs005-013-ionic"
+  },
+  "store": "/shared_nfs/xingjche/compass/store",
+  "workload": {
+    "traces": "/shared_nfs/huggingface_models/datasets--semianalysisai--cc-traces-weka-062126-256k/snapshots/8fecd2fc56694469f758f0afbbb6335ad3043740/traces.jsonl",
+    "select": "0-255",
+    "concurrency": [1, 2, 4, 8, 16, 32, 64, 128, 256]
+  },
+  "slo": {
+    "min_interactivity_p90": 30,
+    "max_ttft_p90_s": 5
+  },
+  "common": {
+    "args": {
+      "--tensor-parallel-size": 8,
+      "--kv_cache_dtype": "fp8",
+      "--enable_prefix_caching": true,
+      "--max-num-seqs": 512
+    },
+    "env": {
+      "AITER_BF16_FP8_MOE_BOUND": "0",
+      "ATOM_MOE_GU_ITLV": "1"
+    },
+    "departures": {
+      "--host": "unset: compass run and compass record assign it and refuse it among ATOM's arguments",
+      "--server-port": "unset: compass run and compass record assign it and refuse it among ATOM's arguments"
+    }
+  },
+  "dimensions": {
+    "config": {
+      "S1": {
+        "basis": "recipes/DeepSeek-V4-Agentic-InferenceX.md, TP",
+        "args": {
+          "--index_cache_dtype": "fp4",
+          "--method": "mtp",
+          "--num-speculative-tokens": 3,
+          "--spec-decode-acceptance-length": 2.49,
+          "--gpu-memory-utilization": 0.9,
+          "--max-num-batched-tokens": 16384,
+          "--attn-prefill-chunk-size": 16384,
+          "--state-checkpoint-interval-tokens": 8192,
+          "--level": 3,
+          "--cudagraph-mode": "FULL"
+        },
+        "departures": {
+          "--served-model-name": "unset: ATOM then serves the model under its --model path, the value the recipe gives",
+          "--max-num-seqs": "512, not twice the concurrency: one value keeps one memory-readings entry per configuration"
+        }
+      },
+      "S2": {
+        "basis": "recipes/DeepSeek-V4-Agentic-InferenceX.md, DP attention",
+        "args": {
+          "--index_cache_dtype": "fp4",
+          "--method": "mtp",
+          "--num-speculative-tokens": 3,
+          "--spec-decode-acceptance-length": 2.49,
+          "--gpu-memory-utilization": 0.9,
+          "--max-num-batched-tokens": 16384,
+          "--attn-prefill-chunk-size": 16384,
+          "--state-checkpoint-interval-tokens": 8192,
+          "--level": 3,
+          "--cudagraph-mode": "FULL",
+          "--enable-dp-attention": true,
+          "--enable-tbo": true
+        },
+        "env": {
+          "GPU_MAX_HW_QUEUES": "5",
+          "ATOM_NUMA_BIND": "1",
+          "ATOM_DP_SESSION_AFFINITY": "1",
+          "ATOM_DP_LB_REQ_EQUIV": "512",
+          "ATOM_ENABLE_PREFILL_DELAYER": "1",
+          "ATOM_PREFILL_DECODE_INTERVAL": "10"
+        },
+        "departures": {
+          "--served-model-name": "unset: ATOM then serves the model under its --model path, the value the recipe gives",
+          "--max-num-seqs": "512, not twice the concurrency: one value keeps one memory-readings entry per configuration"
+        }
+      },
+      "S5": {
+        "basis": "recipes/DeepSeek-V4-Agentic-InferenceX.md, DP attention with LMCache",
+        "args": {
+          "--index_cache_dtype": "fp4",
+          "--method": "mtp",
+          "--num-speculative-tokens": 3,
+          "--spec-decode-acceptance-length": 2.49,
+          "--gpu-memory-utilization": 0.9,
+          "--max-num-batched-tokens": 16384,
+          "--attn-prefill-chunk-size": 16384,
+          "--state-checkpoint-interval-tokens": 8192,
+          "--level": 3,
+          "--cudagraph-mode": "FULL",
+          "--enable-dp-attention": true,
+          "--enable-tbo": true
+        },
+        "env": {
+          "GPU_MAX_HW_QUEUES": "5",
+          "ATOM_NUMA_BIND": "1",
+          "ATOM_DP_SESSION_AFFINITY": "1",
+          "ATOM_DP_LB_REQ_EQUIV": "512",
+          "ATOM_ENABLE_PREFILL_DELAYER": "1",
+          "ATOM_PREFILL_DECODE_INTERVAL": "10",
+          "ATOM_KV_OFFLOAD": "lmcache_mp",
+          "ATOM_KV_OFFLOAD_EXTRA_CONFIG": "{\"lmcache.mp.host\": \"tcp://127.0.0.1\", \"lmcache.mp.port\": 5555}",
+          "LMCACHE_CHUNK_SIZE": "256",
+          "OFFLOAD_MAX_PENDING_SAVES": "8"
+        },
+        "departures": {
+          "--served-model-name": "unset: ATOM then serves the model under its --model path, the value the recipe gives",
+          "--max-num-seqs": "512, not twice the concurrency: one value keeps one memory-readings entry per configuration"
+        }
+      },
+      "P1": {
+        "basis": "recipes/mesh/DeepSeek-V4.md, pure TP; nightly ds-v4-1p1d-tp8",
+        "deployment": "1p1d",
+        "args": {
+          "--trust-remote-code": true,
+          "--gpu-memory-utilization": 0.75
+        },
+        "decode": {
+          "args": {
+            "--cudagraph-capture-sizes": "[1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128,132,136,140,144,148,152,156,160,164,168,172,176,180,184,188,192,196,200,204,208,212,216,220,224,228,232,236,240,244,248,252,256]"
+          }
+        },
+        "departures": {
+          "--enable_prefix_caching": "on, not off: as the agentic workload and the single-node recipe have it; no law keys on it",
+          "--block-size": "unset: ATOM sets 256 on any DeepSeek-V4 checkpoint, so the recipe's 16 has no effect",
+          "--gpu-memory-utilization": "0.75 on each side, not 0.85: at 0.85 Mooncake's dmabuf registration on crsuse2-m2m-v3-005 and -013 runs DeepSeek-V4-Pro at TP8 out of memory",
+          "--kv-transfer-config": "unset: deploy.sh adds each side's and refuses one among ATOM's arguments",
+          "HIP_VISIBLE_DEVICES": "unset: a real side's cards are deploy.sh's --gpu, and a simulated side uses none",
+          "ATOM_HOST_IP": "unset: a node's own address, which a real side takes from scripts/compass/README.md's 1P1D deployment",
+          "MC_ENABLE_DEST_DEVICE_AFFINITY": "unset: a real side on crsuse2-m2m-v3-005 and -013 takes scripts/compass/README.md's Mooncake variables instead",
+          "ATOM_PD_RANK_MAPPING_POLICY": "unset: CI's router script reads it, and ATOM does not",
+          "AITER_LOG_LEVEL": "unset: deploy.sh sets WARNING itself",
+          "PYTHONUNBUFFERED": "unset: it orders log lines, not the engine's work"
+        }
+      },
+      "P3": {
+        "basis": "recipes/mesh/DeepSeek-V4.md, DPA",
+        "deployment": "1p1d",
+        "args": {
+          "--trust-remote-code": true,
+          "--enable-dp-attention": true
+        },
+        "prefill": {
+          "args": {
+            "--gpu-memory-utilization": 0.72,
+            "--enable-tbo": true
+          },
+          "env": {
+            "GPU_MAX_HW_QUEUES": "5",
+            "ATOM_NUMA_BIND": "1"
+          }
+        },
+        "decode": {
+          "args": {
+            "--gpu-memory-utilization": 0.75,
+            "--cudagraph-capture-sizes": "[1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128,132,136,140,144,148,152,156,160,164,168,172,176,180,184,188,192,196,200,204,208,212,216,220,224,228,232,236,240,244,248,252,256]"
+          }
+        },
+        "departures": {
+          "--enable_prefix_caching": "on, not off: as the agentic workload and the single-node recipe have it; no law keys on it",
+          "--block-size": "unset: ATOM sets 256 on any DeepSeek-V4 checkpoint, so the recipe's 16 has no effect",
+          "--gpu-memory-utilization": "0.75 on the decode side, not 0.85, as P1's; 0.72 on the prefill side, where at 0.75 the eight DPA ranks' gathered MoE rows pass 65,536 and aiter's MoE workspace runs out of memory",
+          "--kv-transfer-config": "unset: deploy.sh adds each side's and refuses one among ATOM's arguments",
+          "HIP_VISIBLE_DEVICES": "unset: a real side's cards are deploy.sh's --gpu, and a simulated side uses none",
+          "ATOM_HOST_IP": "unset: a node's own address, which a real side takes from scripts/compass/README.md's 1P1D deployment",
+          "MC_ENABLE_DEST_DEVICE_AFFINITY": "unset: a real side on crsuse2-m2m-v3-005 and -013 takes scripts/compass/README.md's Mooncake variables instead",
+          "ATOM_PD_RANK_MAPPING_POLICY": "unset: CI's router script reads it, and ATOM does not",
+          "AITER_LOG_LEVEL": "unset: deploy.sh sets WARNING itself",
+          "PYTHONUNBUFFERED": "unset: it orders log lines, not the engine's work"
+        }
+      }
+    }
+  }
+}
