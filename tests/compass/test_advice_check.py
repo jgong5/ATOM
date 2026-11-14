@@ -7,8 +7,8 @@ The configuration is `test_advice_reuse`'s, its law the re-keyed DPA8 law as a
 law file; ATOM's arguments resolve it changed by each of `CHANGED` they state.
 `compass run` and `deploy.sh` are one stub that records each start and
 answers, or, under `--enable-dynamic-chunking`, raises the simulated runner's
-own refusal of it into its server log and leaves as `compass run` does, or,
-under ``STUB_STALL``, never answers.
+own refusal of it into its server log, logs its stop after it and leaves as
+`compass run` does, or, under ``STUB_STALL``, never answers.
 """
 
 import itertools
@@ -32,6 +32,7 @@ from atom.compass.advice import check
 from atom.compass.artifacts import Kind
 from atom.compass.drive import reuse
 from atom.compass.drive import run as drive_run
+from atom.compass.spec.layers import stack_of
 
 #: The ATOM arguments the stubbed resolution reads, by the config field each sets.
 CHANGED = {
@@ -55,6 +56,8 @@ if "--enable-dynamic-chunking" in argv:
     )
     with open(at / "server.log", "w") as log:
         subprocess.run([sys.executable, "-c", refuse], stderr=log, cwd={tree!r})
+    with open(at / "server.log", "a") as log:
+        log.write("the server stopped\\n")
     sys.exit(
         "compass run: the server exited 1 before /health answered; see "
         + str(at / "server.log")
@@ -118,14 +121,15 @@ def stubbed(tmp_path, monkeypatch):
     return r
 
 
-def advise(tmp_path, dimensions: dict, network=None) -> dict:
+def advise(tmp_path, dimensions: dict, **machine) -> dict:
     """`compass advice` on `dimensions`' candidates at concurrencies 1 and 4,
-    on the suite's platform, with `network` where given; the states it writes."""
+    on the suite's platform, with each of `machine`'s fields given; the states
+    it writes."""
     flags = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
-    machine = {"device": flags[1], "ptl": flags[3]}
+    machine = {k: v for k, v in machine.items() if v}
     space = {
         "model": str(tmp_path),
-        "machine": machine | ({"network": network} if network else {}),
+        "machine": {"device": flags[1], "ptl": flags[3]} | machine,
         "store": str(tmp_path / "store"),
         "workload": {
             "traces": str(tmp_path / "traces.jsonl"),
@@ -222,6 +226,23 @@ def test_a_refusal_at_one_point_outranks_another_point_s_missing_law(tmp_path, s
     assert starts(tmp_path) == []
 
 
+def test_a_value_atom_s_parser_rejects_refuses_its_candidate_with_the_parser_s_error(
+    tmp_path, stubbed
+):
+    # The stubbed resolution reads no --block-size; ATOM's parser types it.
+    found = advise(tmp_path, {"a": {}, "b": {"args": {"--block-size": "big"}}})
+
+    rejected = "argument --block-size/--block_size: invalid int value: 'big'"
+    assert found["a"]["state"] == "missing a law"
+    assert found["b"] == {
+        "state": "refused",
+        "why": [f"ATOM's parser: {rejected}"],
+        "made_by": [],
+        "points": {},
+    }
+    assert starts(tmp_path) == []
+
+
 @pytest.mark.parametrize("lands", ["a law", "readings"])
 def test_rerunning_after_an_input_lands_moves_only_what_it_serves_to_searchable(
     tmp_path, stubbed, lands
@@ -258,6 +279,27 @@ def test_rerunning_after_an_input_lands_moves_only_what_it_serves_to_searchable(
     }
 
 
+def test_a_start_takes_the_store_holding_its_inputs_and_space_s_stack(
+    tmp_path, stubbed
+):
+    # Only the store a calibration of a writes into holds the readings.
+    store, own = tmp_path / "store", tmp_path / "out/cal/a/store"
+    law_file(tmp_path, law(stubbed))
+    platforms.flags(own, DOCUMENT, tmp_path)
+    publish_readings(own, stubbed.config)
+    shutil.rmtree(store / Kind.MEMORY_READINGS.value)
+    (entry,) = (own / Kind.PLATFORM_READINGS.value).glob("*/entry.json")
+    stack = stack_of(json.loads(entry.read_text())["key"])
+
+    found = advise(tmp_path, {"a": {}}, stack=stack)
+
+    assert found["a"]["state"] == "searchable"
+    (call,) = starts(tmp_path)
+    argv = call["argv"]
+    assert argv[argv.index("--store") + 1] == str(own)
+    assert argv[argv.index("--stack") + 1] == stack
+
+
 @pytest.mark.parametrize("network", [NETWORK, None])
 def test_a_1p1d_start_takes_the_decode_side_s_own_variables_in_a_local_prefix(
     tmp_path, stubbed, monkeypatch, network
@@ -274,7 +316,7 @@ def test_a_1p1d_start_takes_the_decode_side_s_own_variables_in_a_local_prefix(
         "decode": {"env": {"STUB_SIDE": "decode"}},
     }
 
-    found = advise(tmp_path, {"p": side}, network)
+    found = advise(tmp_path, {"p": side}, network=network)
 
     if network is None:
         assert found["p"] == {
@@ -301,6 +343,24 @@ def test_a_1p1d_start_takes_the_decode_side_s_own_variables_in_a_local_prefix(
     ]
     held = ("STUB_BOTH", "STUB_PREFILL", "STUB_SIDE")
     assert [call["env"].get(k) for k in held] == ["1", "1", None]
+
+
+def test_a_1p1d_decode_side_variable_holding_whitespace_is_refused_unstarted(
+    tmp_path, stubbed, monkeypatch
+):
+    monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
+    publish_readings(tmp_path / "store", stubbed.config)
+    law_file(tmp_path, law(stubbed))
+    side = {"deployment": "1p1d", "decode": {"env": {"STUB_SIDE": "a b"}}}
+
+    found = advise(tmp_path, {"p": side}, network=NETWORK)
+
+    (why,) = found["p"]["why"]
+    assert why == (
+        "deploy.sh takes the decode side's own variables as one --on prefix split "
+        "on whitespace, and STUB_SIDE=a b holds whitespace"
+    )
+    assert (found["p"]["state"], starts(tmp_path)) == ("refused", [])
 
 
 def test_a_1p1d_side_missing_readings_is_measured_on_the_connector_a_real_start_takes(

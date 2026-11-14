@@ -20,8 +20,9 @@ variables, on the device arch of the machine spec that store's platform
 readings compose with SPACE's machine; a 1P1D side as `deploy.sh run` starts
 it, as `compass run --check` resolves one. The laws are judged at each point,
 since an argument that varies with the concurrency moves their key. A refusal
-of the composition, of a configuration or of the runner under a law is
-``refused``, verbatim, naming no requirement. A law verdict ``calibrate``
+of the composition, of an argument by ATOM's parser, of a configuration or of
+the runner under a law is ``refused``, verbatim, naming no requirement. A law
+verdict ``calibrate``
 names the command that makes the law as `compass run --check` prints it: on
 one node the `calibrate.sh` command of its records into OUT's
 ``cal/<candidate>``, its clients on SPACE's traces; on a 1P1D side `deploy.sh
@@ -328,7 +329,7 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
         with _env(env):
             if instance not in seen:
                 arch = machine.value("device.arch")
-                seen[instance] = _or_refused(drive_run._config, args, arch)
+                seen[instance] = _or_refused(_resolved, args, arch)
             if isinstance(config := seen[instance], dict):
                 verdicts = config, config
             else:
@@ -352,6 +353,22 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                 verdicts = law, readings
         seen[(store.root, *instance)] = verdicts
     return seen[(store.root, *instance)]
+
+
+def _resolved(args, arch: str):
+    """`drive_run._config` of ATOM's arguments `args` on a device of `arch`,
+    once ATOM's engine parser reads them here as `runfile._engine_args` does:
+    a value it rejects raises its error, where the child that resolves them
+    would exit this process."""
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    class Refusing(FlexibleArgumentParser):
+        def error(self, message):
+            raise ValueError(f"ATOM's parser: {message}")
+
+    EngineArgs.add_cli_args(Refusing(add_help=False)).parse_known_args(args)
+    return drive_run._config(args, arch)
 
 
 def _or_refused(call, *args):
