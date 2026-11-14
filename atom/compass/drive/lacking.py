@@ -194,10 +194,7 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
         met(grid, made, compass_run.refuse_context_parallel, STEP_GRID, config)
         and met(grid, made, step_grid.load, run[STEP_GRID], config, machine)
     )
-    made = MADE_BY["memory readings"].format(
-        store=args.store, atom=shlex.join(real or atom_args)
-    )
-    made = " ".join([*(f"{k}={shlex.quote(v)}" for k, v in (env or {}).items()), made])
+    made = measure_memory(args.store, real or atom_args, env)
     met("memory readings", made, memory.load, run["store"], config, machine, 0)
 
     if getattr(args, OP_GRAPH):
@@ -227,6 +224,13 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     if args.step_roofline or STEP_GRID in flags:
         apart += _unclassified(atom_args, arch)
     return lacks, apart
+
+
+def measure_memory(store, atom_args, env=None) -> str:
+    """The command that measures the memory readings of a start under ATOM's
+    arguments `atom_args` into `store`, run under the variables `env`."""
+    made = MADE_BY["memory readings"].format(store=store, atom=shlex.join(atom_args))
+    return " ".join([*(f"{k}={shlex.quote(v)}" for k, v in (env or {}).items()), made])
 
 
 def _state(refused) -> str:

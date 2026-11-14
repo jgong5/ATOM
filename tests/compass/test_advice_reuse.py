@@ -176,11 +176,8 @@ def test_a_law_and_readings_at_the_head_s_key_are_reused_at_every_point(
 
     judged = advise(tmp_path)
 
-    assert (
-        verdicts(judged, "law")
-        == [{"verdict": "reuse", "requirement": None, "reason": where, "law": where}]
-        * 2
-    )
+    reused = {"verdict": "reuse", "requirement": None, "reason": where, "law": where}
+    assert verdicts(judged, "law") == [reused | {"run": [where, where]}] * 2
     assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
     assert judged["candidates"]["a"]["store"] == str(tmp_path / "store")
     out = capsys.readouterr().out
@@ -238,11 +235,13 @@ def test_a_store_law_the_store_refuses_to_load_names_requirement_2(
         assert found["reason"].startswith(f"{where}: ")
         assert f"`{Kind.STEP_LINEAR_LAW}` x `{Axis.ATOM_SRC}`" in found["reason"]
     else:
+        host = Key.of(Kind.HOST_LAWS, **host_laws_key(r)).token()
         assert found == {
             "verdict": "reuse",
             "requirement": None,
             "reason": where,
             "law": where,
+            "run": [where.split()[1], host],
         }
 
 
@@ -295,11 +294,14 @@ def test_a_law_with_a_source_stating_no_figures_names_requirement_4(tmp_path, se
 
     found, _ = verdicts(advise(tmp_path), "law")
 
+    (made_by,) = found.pop("made_by")
+    assert made_by.startswith("no calibrate.sh command: ")
     assert found == {
         "verdict": "calibrate",
         "requirement": 4,
         "reason": f"{where} states no cost-accuracy figures of source lone",
         "law": where,
+        "run": [where, where],
     }
 
 

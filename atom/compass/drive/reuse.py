@@ -32,11 +32,12 @@ first, then refused, then calibrate. The requirement a verdict names:
    law's records ran at the head's ATOM digest (`records_atom`), since a
    calibration refits the same miss, else calibrate.
 
-A refusal the runner makes of the config under the law, as of context
-parallelism, propagates. `readings` gives the config's memory readings in a
-store `reuse`, or `measure` where none is at their key or the one there was
-measured at another ATOM digest (requirement 1). `stores` orders the stores a
-candidate is looked up in.
+A verdict on a law found names, as ``run``, the ``--step-linear`` and
+``--host-laws`` values a run of it takes. A refusal the runner makes of the
+config under the law, as of context parallelism, propagates. `readings` gives
+the config's memory readings in a store `reuse`, or `measure` where none is at
+their key or the one there was measured at another ATOM digest (requirement
+1). `stores` orders the stores a candidate is looked up in.
 """
 
 import json
@@ -157,6 +158,7 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
         at = host and (held.get("platform"), host["key"].get("model"))
         if at == (stated, model) and _same(held.get("engine_config"), engine):
             found.append(_law_file(str(path), held, config, machine, atom))
+            found[-1]["run"] = [str(path)] * 2
     for key in _keyed(store, Kind.STEP_LINEAR_LAW, engine, model=model, **stated):
         where = f"{key.kind} {key.token()} in {store.root}"
         if (ran := key.values["source_root"]) != compass_run.source_root(atom):
@@ -180,6 +182,7 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
         hosts.sort(key=lambda k: k.values["host_cpu"] != compass_run.host_cpu())
         host = runfile._member(store.read(hosts[0]), "params")
         found.append(_judged(where, step[0], host, config, machine, atom))
+        found[-1]["run"] = [key.token(), hosts[0].token()]
     if not found:
         why = (
             f"no step linear law at its key, model {model}, this engine config and "
