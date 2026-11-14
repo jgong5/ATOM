@@ -5,9 +5,12 @@
 
 SPACE is the space file, expanded by `space.expand`; OUT, made when absent,
 gets `CANDIDATES`, the expansion: SPACE's path, its model, machine, store,
-frozen commit, workload and SLO, its candidates and their points. It prints
-each candidate with its ATOM basis and each departure with its reason. It
-reads SPACE alone, and writes nothing when SPACE refuses.
+frozen commit, workload and SLO, its candidates and their points; and
+`check.REUSE`, the reuse check's verdicts on each point's laws and memory
+readings (`check.check`). It prints the head the check took, or why the tree
+is refused, then each candidate with its ATOM basis, each departure with its
+reason, and its verdicts. It reads SPACE alone, and writes nothing when SPACE
+refuses.
 """
 
 import argparse
@@ -15,6 +18,7 @@ import json
 import sys
 from pathlib import Path
 
+from atom.compass.advice.check import REUSE, check, lines
 from atom.compass.advice.space import expand
 from atom.compass.cli import refusing
 
@@ -32,10 +36,20 @@ def main(argv: list[str]) -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     written = args.out / CANDIDATES
     written.write_text(json.dumps(expansion, indent=1) + "\n")
+    judged, verdicts = check(expansion, args.out), args.out / REUSE
+    if head := judged["head"]:
+        print(
+            f"the reuse check at {head['commit']} ({head['ref']}), ATOM digest "
+            f"{head['atom']}: verdicts in {verdicts}"
+        )
+    else:
+        print(f"the reuse check refuses: {judged['refused']['reason']}")
     for candidate in expansion["candidates"]:
         print(f"{candidate['name']}: {candidate['deployment']}, {candidate['basis']}")
         for what, reason in candidate["departures"].items():
             print(f"  {what} departs: {reason}")
+        if not judged["refused"]:
+            print("\n".join(lines(judged["candidates"][candidate["name"]])))
     candidates, points = len(expansion["candidates"]), len(expansion["points"])
     print(f"{candidates} candidates and {points} points in {written}")
 
