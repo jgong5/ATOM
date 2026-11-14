@@ -60,7 +60,7 @@ def platform_arg(document: dict) -> tuple[str, str]:
 SPEC = platform_arg(
     json.loads(
         (
-            Path(__file__).parents[2] / "scripts/compass/machines/mi308x-hjbog39.json"
+            Path(__file__).parents[2] / "tests/compass/machines/mi308x-hjbog39.json"
         ).read_text()
     )
 )

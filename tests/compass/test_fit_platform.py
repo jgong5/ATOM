@@ -45,7 +45,7 @@ from atom.compass.drive import identity as drive
 from atom.compass.run import step_grid
 from atom.compass.spec import MachineSpec
 
-MACHINES = Path(__file__).parents[2] / "scripts/compass/machines"
+MACHINES = Path(__file__).parents[2] / "tests/compass/machines"
 #: rocm-smi's listing of GPU 0 in compass-next:nightly-20261013 on hjbog-srdc-18.
 CARD = {
     "Card Series": "AMD Instinct MI308X",

@@ -219,8 +219,6 @@ if [ -z "$NO_DRIVER_RUN" ] && grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/co
     # agentx-harness with compass-harness installed, and without it.
     export COMPASS_HARNESS_PYTHON=${COMPASS_HARNESS_PYTHON:-/root/cells/venv/bin/python}
     export COMPASS_AIPERF_PYTHON=${COMPASS_AIPERF_PYTHON:-/opt/venv/bin/python}
-    # The cards' PTL state is part of the machine's key; node 18's run with it on.
-    export ATOM_COMPASS_SLICE_MACHINE=${ATOM_COMPASS_SLICE_MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
     # The router-LP forms refuse a router not built at this tree's commit, so a
     # snapshot needs one built (cargo build --release in atom/mesh) in a git
     # checkout of it.
@@ -235,14 +233,13 @@ if [ -z "$NO_DRIVER_RUN" ] && grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/co
     [ -r "$ATOM_COMPASS_CCTRACES" ] || MISSING+="ATOM_COMPASS_CCTRACES $ATOM_COMPASS_CCTRACES; "
     [ -x "$COMPASS_HARNESS_PYTHON" ] || MISSING+="COMPASS_HARNESS_PYTHON $COMPASS_HARNESS_PYTHON; "
     [ -x "$COMPASS_AIPERF_PYTHON" ] || MISSING+="COMPASS_AIPERF_PYTHON $COMPASS_AIPERF_PYTHON; "
-    [ -r "$ATOM_COMPASS_SLICE_MACHINE" ] || MISSING+="ATOM_COMPASS_SLICE_MACHINE $ATOM_COMPASS_SLICE_MACHINE; "
     ROUTER=$(python -c 'import sys; from atom.compass.run import router_binary; router_binary(sys.argv[1])' \
         "$ATOMESH" 2>&1) || MISSING+="ATOMESH, ${ROUTER##*$'\n'}; "
     [ "$(tr ',' '\n' <<<"$GPUS" | grep -c .)" -ge 4 ] ||
         MISSING+="four cards in HIP_VISIBLE_DEVICES, which names $GPUS; "
     [ -z "$MISSING" ] || finish 92 "the driver-run tests lack ${MISSING%; }; nothing was run"
-    printf 'driver-run: slice %s\n            image %s\n            machine %s\n            router %s\n' \
-        "$ATOM_COMPASS_SLICE_MODEL" "$ATOM_COMPASS_IMAGE_MODEL" "$ATOM_COMPASS_SLICE_MACHINE" "$ATOMESH"
+    printf 'driver-run: slice %s\n            image %s\n            router %s\n' \
+        "$ATOM_COMPASS_SLICE_MODEL" "$ATOM_COMPASS_IMAGE_MODEL" "$ATOMESH"
     printf 'spec:       mtp %s\n            dspark %s\n' "$ATOM_COMPASS_MTP_MODEL" "$ATOM_COMPASS_DSPARK_MODEL"
     printf 'cc-traces:  model %s\n            traces %s\n            harness %s\n            aiperf %s\n' \
         "$ATOM_COMPASS_CCTRACES_MODEL" "$ATOM_COMPASS_CCTRACES" "$COMPASS_HARNESS_PYTHON" "$COMPASS_AIPERF_PYTHON"

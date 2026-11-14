@@ -245,8 +245,8 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
 | — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D45.1, D50.1, D50.2, D50.3) |
 | L5 | Configuration surface: flags, precedence, the `compass` commands with their inputs and outputs | [`13_configuration_surface.md`](13_configuration_surface.md) | D78–D81 |
-| L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 (+ D87.1) |
-| L1/L3 | Parallelism: TP, DP, PP, EP | [`15_parallelism_support.md`](15_parallelism_support.md) | D88–D94 |
+| L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 (+ D87.1, D87.2) |
+| L1/L3 | Parallelism: TP, DP, PP, EP | [`15_parallelism_support.md`](15_parallelism_support.md) | D88–D94 (+ D90.1, D92.1) |
 | — | Open items, assumptions, gaps | [`12_open_items.md`](12_open_items.md) | — |
 | — | How it gets built: tasks, waves, gates, GPU queue | [`16_execution_plan.md`](16_execution_plan.md) | — |
 
@@ -360,8 +360,8 @@ method's error are reported, not gated (`10` D67.1, #1392). Stage 4 checks it on
 runs at peaks probed there, and reports the method's error as the same MI455 records
 bounded at the frozen projection's spec and at the probed one (`16` *Stage 4*, `08` D50.2).
 
-The M3-Agentic stage's cells grade each point by its overlap with the real curve
-(`08` D45.1).
+The M3-Agentic and DSv41-DPEP stages' cells grade each point by its overlap with the
+real curve (`08` D45.1).
 
 Final proof is **paired simulated and real execution of cc-traces proper**.
 
@@ -373,6 +373,7 @@ Final proof is **paired simulated and real execution of cc-traces proper**.
 | **M2 — v1** | **#627 stage 3: DeepSeek-V4-Pro 1P+1D on MI355X within the targets above**, first in the nightly configurations with expert parallelism off, then at EP8 — each step first the same scheduling decisions as the real engine, then the separable results of `08` D44 and the configuration-ranking gate; **the MI455 roofline projection** of stage 3c, held to the soundness checks of `16` D95 and then frozen; last, **stage 4: DeepSeek-V4.1-Flash measured on MI455 and graded by the step linear backend in two TP4 DSpark5 cells**, with the analytical bound checked on the same runs (`16` *Stage 4*, [#2138](https://github.com/jgong5/ATOM/issues/2138)). **First gate, #627 stage 2:** Qwen3.8-27B TP1 on MI308X, paired real and simulated cc-traces graded by `08` |
 | ~~M3–M7~~ | Retired by `16` D95, which maps each one to where its scope went. PP, EP beyond one node, and further models come after v1 |
 | **M3-Agentic** | **[#3256](https://github.com/jgong5/ATOM/issues/3256): ATOM's MiniMax-M3 AgentX submission to InferenceX, simulated on MI355X**, every arm and point, each simulated curve lying on this branch's real one by `08` D45.1, with EAGLE3 and the `lmcache_offload` tier (`16` D95.1). Named for the model, not the retired M3 |
+| **DSv41-DPEP** | **[#3423](https://github.com/jgong5/ATOM/issues/3423): the DP points of ATOM's DeepSeek-V4.1-Flash AgentX submission to InferenceX, simulated on MI355X**, DTP2 and DEP2 with DSpark5, each point graded by `08` D45.1 on both backends (`16` D95.2) |
 
 Sequencing, dependencies and parallelisable work are in the execution plan (`16`). `00_initial_prompt.md` is the original seed and is
 **not** a design document — see *Development history*.
@@ -620,9 +621,9 @@ The documents use these precisely; a reader will bounce off without them.
 | D63 – D70 (+ D67.1) | `10` Analytical Laws |
 | D71 – D77 | `11` Engine Metrics under Virtual Time |
 | D78 – D81 | `13` The Configuration Surface |
-| D82 – D87 (+ D87.1) | `14` Speculative Decoding and MTP |
-| D88 – D94 | `15` Parallelism Support (TP, DP, PP, EP) |
-| D95 (+ D95.1) | `16` The Execution Plan |
+| D82 – D87 (+ D87.1, D87.2) | `14` Speculative Decoding and MTP |
+| D88 – D94 (+ D90.1, D92.1) | `15` Parallelism Support (TP, DP, PP, EP) |
+| D95 (+ D95.1, D95.2) | `16` The Execution Plan |
 | D96 – D105 | `17` Step Grid Backend |
 | D107 | `18` One Pass Record and One Rule for Host-Paced Device Time |
 | D108 – D117 | `19` Adoption |
