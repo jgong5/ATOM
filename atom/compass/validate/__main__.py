@@ -35,6 +35,11 @@ each side costed at the law fitted under its engine config and checked against i
 engine's hand-in, `lp-engine-P.json` or `lp-engine-D.json`, at DP width above 1
 each rank's (`lp-engine-P.dp0.json`, a row per rank); `validate.runs` grades its
 schedule per side, its end to end once.
+
+`python -m atom.compass.validate --curves OUT ARM...` draws instead each ARM's
+points, a directory each, as InferenceX draws agentic results: real and
+simulated curves as charts in OUT, and a verdict per point and metric, as
+`validate.curves` states.
 """
 
 from __future__ import annotations
@@ -68,7 +73,7 @@ from atom.compass.run import (
     refuse_renamed_keys,
 )
 from atom.compass.run.step_grid import keyed_of, read
-from atom.compass.validate import cost, runs
+from atom.compass.validate import cost, curves, runs
 
 BANDS = [token_band(edge) for edge in (0, *TOKEN_BANDS)]
 #: Cost rows' verdict per report group: the graded ones carry the gate.
@@ -229,16 +234,17 @@ def _law(run_file: dict, real: Path) -> dict:
 def _op_graph(side: Path):
     """The `OpGraphBackend` a `compass run --op-graph` server at `side`
     priced with: its run file under the ATOM arguments its command line served,
-    its graphs read under the performance environment its engine file states,
-    as its server read them, not this process's."""
+    resolved on its machine's device arch, its graphs read under the
+    performance environment its engine file states, as its server read them,
+    not this process's."""
     from atom.compass import run as compass_run
     from atom.compass.drive import run as drive_run
 
     run = read_json(side / "run.json")
     why = "an op graph is read under the ones its server ran"
     atom_args = _atom_args(side, run, why)
-    config = drive_run._config(atom_args)
     machine = compass_run._machine(run["run_file"])
+    config = drive_run._config(atom_args, machine.value("device.arch"))
     ep = drive_run._ep_width(atom_args, machine) if config.enable_expert_parallel else 1
     env = read_json(side / "steps/dp0.engine.json")["env"]
     return compass_run.op_graph(run["run_file"], config, machine, ep, env=env)
@@ -246,16 +252,26 @@ def _op_graph(side: Path):
 
 def _warm_over_cold(run_file: dict):
     """`measure ops`'s warm time over its cold one per op kind, over the
-    points the store holds at the key of the run file's price list."""
+    points the store holds for the run file's price list: of its model,
+    platform and source root, one on a process group at its layout too
+    (`bench.ops.point_key`)."""
+    from atom.compass.artifacts.keys import LAYOUT
+    from atom.compass.bench.ops import point_key
+
     store, fields, by = ArtifactStore(run_file["store"]), run_file.get(PRICE_LIST), {}
     folder = store.root / Kind.OP_MEASUREMENT.value
+    stated = {k: v for k, v in (fields or {}).items() if k not in LAYOUT}
+    layout = {k: v for k, v in (fields or {}).items() if k in LAYOUT}
     for path in sorted(folder.glob(f"[!.]*/{ENTRY_FILE}")) if fields else ():
         key = read_json(path)["key"]
-        if {k: v for k, v in key.items() if k != "point"} == fields:
-            entry = store.read(Key.of(Kind.OP_MEASUREMENT, **key))
+        if {k: v for k, v in key.items() if k != "point"} == stated:
+            entry = store.read(at := Key.of(Kind.OP_MEASUREMENT, **key))
             point = json.loads(
                 entry.read_member("point", entry.topology.ranks()[0], "json")
             )
+            ran = point["shape"], point["context"], point["leaf"]
+            if point_key(stated, layout, *ran, "exchange" in point) != at:
+                continue  # a point on a process group, at another layout
             by.setdefault(point["op"], []).append(point.get("warm_over_cold"))
     for op, ratios in sorted(by.items()):
         r = [x for x in ratios if x is not None]
@@ -417,8 +433,11 @@ def rows(cell) -> list[tuple]:
 
 
 def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["--curves"]:
+        return curves.main(argv[1:])
     print("cell | result | metric | value | verdict")
-    for cell in sys.argv[1:] if argv is None else argv:
+    for cell in argv:
         for row in rows(cell):
             print(" | ".join((Path(cell).name, *row)))
 

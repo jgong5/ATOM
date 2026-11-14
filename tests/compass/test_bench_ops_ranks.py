@@ -770,11 +770,13 @@ def test_one_gpu_at_dp_attention_measures_a_rank_s_leaves_and_refuses_collective
     assert got[GATHER]["refused"].startswith(why)
     assert GATHER in str(refused.value)
     assert "refused" not in got[NEG] and got[NEG]["cold_ns"] == 1.0
-    # keyed by the deployed layout, two DP ranks of TP 1, not the runner's
+    # keyed by its signature alone, at the runner's layout as at the deployed
+    # one; its line states the deployed layout, two DP ranks of TP 1
     store, _, _, run = bench
     point = decode(2), 20, got[NEG]["leaf"]
     assert store.directory_for(ops.keys(config, run)(*point)).exists()
-    assert not store.directory_for(ops.keys(built, run)(*point)).exists()
+    assert ops.keys(built, run)(*point) == ops.keys(config, run)(*point)
+    assert got[NEG]["layout"] == ops.layout_of(config) != ops.layout_of(built)
 
 
 def test_one_gpu_refuses_a_tp_layout_wider_than_one_rank(

@@ -406,7 +406,6 @@ def edited(path: str, value) -> dict:
         ("interconnect.intra_node.link_latency_s", 3e-06),
         ("device.memory.derate", 0.8),
         ("device.memory.capacity_bytes", 1),
-        ("interconnect.router_relay_s", 1e-3),
         ("provenance.notes", "re-probed"),
     ],
 )

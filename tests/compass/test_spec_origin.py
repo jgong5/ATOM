@@ -103,7 +103,7 @@ def test_a_document_of_one_origin_answers_without_the_map():
     stanza = dict(DOCUMENT["provenance"], subject={"model": "Qwen/Qwen3-8B"})
     spec = MachineSpec.from_mapping(dict(DOCUMENT, provenance=stanza))
     assert "provenance.origins" not in spec.values
-    assert spec.origin("interconnect.router_relay_s") == {
+    assert spec.origin("interconnect.inter_node.derate") == {
         "origin": "probed",
         "model": "Qwen/Qwen3-8B",
     }
@@ -128,7 +128,7 @@ def test_one_field_is_never_mixed_and_only_a_probed_one_has_a_subject():
     ):
         broken = copy.deepcopy(document)
         broken["provenance"]["origins"] = dict(
-            origins, **{"interconnect.router_relay_s": entry}
+            origins, **{"interconnect.inter_node.derate": entry}
         )
         with pytest.raises(SpecRefusal, match=wanted):
             MachineSpec.from_mapping(broken)

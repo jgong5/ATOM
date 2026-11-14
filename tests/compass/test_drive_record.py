@@ -433,14 +433,17 @@ def test_a_record_names_each_compile_its_server_ran_while_it_served(
 
 
 #: Put after the planted server: once `compass record` has read its card's PTL
-#: state while it serves (``PLANTED_READ``), PTL is disabled on that card.
+#: state while it serves (``PLANTED_READ``), PTL is disabled on that card by a
+#: file renamed over ``ptl_enable``, so no reading finds it empty, as on sysfs.
 FLIPS = """
 import os, pathlib, time
 for _ in range(600):
     if os.path.exists(os.environ["PLANTED_READ"]):
         break
     time.sleep(0.05)
-pathlib.Path(os.environ["PLANTED_PTL"]).write_text("disabled\\n")
+staged = pathlib.Path(os.environ["PLANTED_PTL"] + ".new")
+staged.write_text("disabled\\n")
+staged.replace(os.environ["PLANTED_PTL"])
 """
 
 

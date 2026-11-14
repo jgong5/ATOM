@@ -21,14 +21,17 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   ``provenance``, with its report's as ``inputs``; a stub's, and an op graph's
   with no price list, is None, its digest over what the run file states.
 - ``--host-laws KEY``, a `host_laws` entry's params, as ``host``, and its
-  ``hops``, each at the run-file key of its name; without it the run charges
-  no host time and each hop its floor (`run.HOP_FLOOR_S`).
+  ``hops``, each at the run-file key of its name, ``router_s`` only in a
+  prefill-decode run's; without it the run charges no host time and each hop
+  its floor (`run.HOP_FLOOR_S`).
 - ``--step-linear`` and ``--host-laws`` repeat, one entry per engine config:
   the key then holds a list, each process installing its own config's entry,
   and where their hops differ, the hops are those of the entry fitted under the
   config ATOM's arguments resolve, as `drive.run.check` resolves one,
   and ``backend``'s digest is over every law's in any order, their provenance
   ``entries``.
+- ``--lmcache-offload FILE``, the ``lmcache_offload`` entry
+  `step_linear_fit`'s offload form writes, at that key.
 - ``--device``, ``--ptl``, ``--stack`` and ``--network``, the platform
   flags, whose spec `spec` composes, as ``machine``; ``--store``'s root as
   ``store``; ``--on-refusal``;
@@ -70,9 +73,6 @@ KINDS = {run.STEP_LINEAR: Kind.STEP_LINEAR_LAW, run.STEP_GRID: Kind.STEP_GRID_BU
 FIXED = {"bound_s": 1e7}
 #: A law file's host laws and their fit report, which are not its step law.
 HOST_MEMBERS = ("host", "host_fit")
-#: The router's per-request forward a prefill-decode deployment charges, one
-#: node or two: assumed, since nothing stamps the router's own time.
-ROUTER_RELAY_S = 1.5e-3
 
 
 def add_arguments(parser) -> None:
@@ -85,6 +85,9 @@ def add_arguments(parser) -> None:
     backend.add_argument("--op-graph", dest=run.OP_GRAPH, action="store_true")
     parser.add_argument(
         "--host-laws", metavar="KEY", action="append", help="a token or law file"
+    )
+    parser.add_argument(
+        "--lmcache-offload", metavar="FILE", help="the lmcache_offload entry"
     )
     parser.add_argument("--device", required=True, help="the datasheet, SKU or path")
     parser.add_argument("--ptl", required=True, choices=("enabled", "disabled"))
@@ -198,9 +201,13 @@ def build(args, atom_args, across: bool = False) -> dict:
             resolve(store, "host", k, machine, atom_args)[0] for k in args.host_laws
         ]
         out["host"] = hosts if len(hosts) > 1 else hosts[0]
-        out |= _hops(hosts, atom_args)
+        # A run file's router_s makes it prefill-decode: `prefill_decode` writes it.
+        hops = _hops(hosts, atom_args, machine.value("device.arch"))
+        out |= {k: v for k, v in hops.items() if k != "router_s"}
     if args.padding:
         out["padding"] = args.padding
+    if entry := getattr(args, "lmcache_offload", None):
+        out["lmcache_offload"] = json.loads(Path(entry).read_text())
     return out
 
 
@@ -229,7 +236,8 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     """The run file `build` builds from `args` for one prefill and one decode
     instance, started with ATOM's arguments `prefill_args` and `decode_args`:
     each side's DP width read from its own, the router's per-request forward
-    cost `ROUTER_RELAY_S`, and the KV transfers priced on the spec's
+    cost the prefill side's host entry's ``router_s`` hop, None for the floor
+    where it states none, and the KV transfers priced on the spec's
     `kv_link`, ``intra_node`` for two instances on one node and
     ``inter_node`` across two, which alone reads ``--network``. Its hops are
     the prefill side's host entry's, its ``decode_hops`` the decode side's. A
@@ -246,9 +254,10 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     out[run.DP_WIDTHS["P"]] = _dp_width(prefill_args)
     out[run.DP_WIDTHS["D"]] = _dp_width(decode_args)
     if hosts := run.entries(out, "host"):
-        out[run.DECODE_HOPS] = _hops(hosts, decode_args)
+        arch = run._machine(out).value("device.arch")
+        out[run.DECODE_HOPS] = _hops(hosts, decode_args, arch)
     return out | {
-        "router_s": ROUTER_RELAY_S,
+        "router_s": _hops(hosts, prefill_args, arch).get("router_s") if hosts else None,
         "kv_link": kv_link,
     }
 
@@ -283,17 +292,17 @@ def _model_digest(model: str) -> str:
     return run._file_digest(model, "config.json")
 
 
-def _hops(hosts: list, atom_args) -> dict:
+def _hops(hosts: list, atom_args, arch: str) -> dict:
     """The ``hops`` of the entry of `hosts` fitted under the config ATOM's
-    arguments `atom_args` resolve, picked as the runner picks its own
-    (`run.pick_fitted`); the hops every entry states alike as they are, with no
-    config resolved."""
+    arguments `atom_args` resolve on a device of `arch`, picked as the runner
+    picks its own (`run.pick_fitted`); the hops every entry states alike as
+    they are, with no config resolved."""
     host = hosts[0]
     if any(h.get("hops") != host.get("hops") for h in hosts):
         from atom.compass.drive.run import _config
 
         picked = {"host": hosts}
-        run.pick_fitted(picked, "host", _config(atom_args))
+        run.pick_fitted(picked, "host", _config(atom_args, arch))
         host = picked["host"]
     return host.get("hops", {})
 
@@ -326,15 +335,16 @@ def _backend(entry) -> dict:
 
 def _price_list_key(atom_args, machine) -> Key:
     """The `price_list` key of the model and parallel layout ATOM's arguments
-    serve, on `machine`, from this ATOM source."""
+    serve, as `CoreManager` lays it out under DP attention, each TP rank a DP
+    rank of TP 1, on `machine`, from this ATOM source."""
     engine = _engine_args(atom_args)
     return Key.of(
         Kind.PRICE_LIST,
         model=_model_digest(engine.model),
-        dp=engine.data_parallel_size,
+        dp=_dp_width(atom_args),
         pp=engine.pipeline_parallel_size,
         pcp=engine.prefill_context_parallel_size,
-        tp=engine.tensor_parallel_size,
+        tp=1 if engine.enable_dp_attention else engine.tensor_parallel_size,
         enable_expert_parallel=engine.enable_expert_parallel,
         enable_dp_attention=engine.enable_dp_attention,
         decode_context_parallel_size=engine.decode_context_parallel_size,

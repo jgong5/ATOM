@@ -27,6 +27,7 @@ from atom.compass.backends import (
 )
 from atom.compass.backends.step_labels import BUILDS, label
 from atom.compass.backends.step_linear_fit import (
+    _fit_form,
     _solve,
     fit,
     fit_host,
@@ -292,6 +293,53 @@ def test_a_rung_a_mad_pass_drops_entirely_gets_coefficient_zero():
     assert not solved["keep"][-2:].any()
     assert solved["coef"][2] == 0.0
     assert np.isfinite(solved["coef"]).all()
+
+
+def test_a_fit_at_the_pass_limit_ends_there_with_the_vector_it_reached(monkeypatch):
+    """Each step's label is the max of two ranks' prices under (1, 2, 3), one
+    label doubled. Unlimited, the passes settle at that law at the 4th and a
+    MAD round drops the doubled step. Limited to one pass, the first round
+    ends at the limit: the fit keeps the vector that pass reached, its `F`
+    the one recorded and below the start's, and runs no MAD round."""
+    from scipy.optimize import nnls
+
+    from atom.compass.backends import step_linear_fit
+
+    rng = np.random.default_rng(0)
+    x = np.ones((60, 2, 3))
+    x[..., 1] = rng.uniform(0, 1, (60, 2))
+    x[..., 2] = rng.uniform(0, 1, (60, 2))
+    y = (x @ [1.0, 2.0, 3.0]).max(axis=1)
+    y[7] *= 2.0
+    real = np.ones((60, 2), dtype=bool)
+    names = ["step", "context", "graph_padding"]
+
+    def cost(c):
+        return float((((x @ c).max(axis=1) / y - 1) ** 2).sum())
+
+    settled = _fit_form(x, real, y, names)
+    passes = settled["passes"]
+    assert (passes["start"], passes["count"], passes["stop"]) == (
+        "all_rows",
+        4,
+        "settled",
+    )
+    assert settled["coef"] == pytest.approx([1.0, 2.0, 3.0], rel=1e-9)
+    assert np.flatnonzero(~settled["keep"]).tolist() == [7]
+
+    monkeypatch.setattr(step_linear_fit, "FIT_PASSES", 1)
+    limited = _fit_form(x, real, y, names)
+    passes = limited["passes"]
+    assert (passes["start"], passes["count"], passes["stop"]) == (
+        "all_rows",
+        1,
+        "limit",
+    )
+    assert limited["keep"].all()
+    assert passes["F"] == pytest.approx(cost(limited["coef"]), rel=1e-9)
+    start = nnls((x / y[:, None, None]).reshape(-1, 3), np.ones(120))[0]
+    assert passes["F"] < cost(start)
+    assert limited["coef"] != pytest.approx([1.0, 2.0, 3.0], rel=1e-3)
 
 
 def test_the_command_writes_a_law_a_run_file_can_carry(tmp_path, capsys):

@@ -89,9 +89,6 @@
       "interconnect.inter_node.link_latency_s": {
         "origin": "assumed"
       },
-      "interconnect.router_relay_s": {
-        "origin": "assumed"
-      },
       "interconnect.inter_node.derate": {
         "origin": "assumed"
       },
@@ -278,7 +275,6 @@
       "link_bandwidth_bytes_per_s": 50000000000.0,
       "link_latency_s": 5e-06,
       "derate": 0.8
-    },
-    "router_relay_s": 0.0015
+    }
   }
 }

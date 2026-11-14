@@ -32,11 +32,12 @@ from atom.utils.clock import LPRuntime
 LAWS = REPO / "scripts/compass/laws"
 #: The node-18 TP1 law file, which a TP1 1P1D cell runs.
 TP1 = LAWS / "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json"
-ROUTER = runfile.ROUTER_RELAY_S
 FLOOR = compass_run.HOP_FLOOR_S
-#: Each channel's lookahead before the hops left the code: the serving path's
-#: HTTP transport, the ZMQ request and output and the SSE stream as node-18
-#: medians, and the write request as a node-18 p10.
+#: Each channel's lookahead before the hops left the code and the spec: the
+#: serving path's HTTP transport, the ZMQ request and output and the SSE stream
+#: as node-18 medians, the write request as a node-18 p10, and the router's
+#: forward, assumed.
+ROUTER = 1.5e-3
 SINGLE = {
     "traffic->frontend:http": 0.54e-3,
     "frontend->traffic:stream": 159e-6,
@@ -100,6 +101,8 @@ def test_each_law_file_builds_the_lookaheads_a_run_charged_before(tmp_path, law)
 
     assert lookaheads(run) == pytest.approx(SINGLE)
     assert None not in compass_run.hops(run).values()
+    # The entry's router hop would make the run prefill-decode.
+    assert "router_s" not in run
 
 
 @pytest.mark.parametrize("law", sorted(FITTED_HOPS))
@@ -148,12 +151,23 @@ def test_each_side_of_a_prefill_decode_run_takes_the_hops_fitted_under_its_confi
         "ipc_s": 2e-4,
         "ipc_out_s": 3e-4,
         "kv_write_req_s": 4e-4,
+        "router_s": 2e-3,
     }
-    hops_d = {"admission_s": 9e-3, "ipc_s": 5e-4, "ipc_out_s": 6e-4, "stream_s": 7e-4}
+    hops_d = {
+        "admission_s": 9e-3,
+        "ipc_s": 5e-4,
+        "ipc_out_s": 6e-4,
+        "stream_s": 7e-4,
+        "router_s": 8e-3,
+    }
     laws = [entry(tmp_path, "p.json", p, hops_p), entry(tmp_path, "d.json", d, hops_d)]
     sides = {"P": model(tmp_path, "-dp", "1"), "D": model(tmp_path)}
-    configs = {tuple(sides["P"]): p.config, tuple(sides["D"]): d.config}
-    monkeypatch.setattr("atom.compass.drive.run._config", lambda a: configs[tuple(a)])
+    # Each side's config as resolved on the machine's arch, the only one stated.
+    gfx = DOCUMENT["device"]["arch"]
+    configs = {(tuple(sides["P"]), gfx): p.config, (tuple(sides["D"]), gfx): d.config}
+    monkeypatch.setattr(
+        "atom.compass.drive.run._config", lambda a, arch: configs[tuple(a), arch]
+    )
 
     for order in (laws, laws[::-1]):
         flags = [f for law in order for f in ("--host-laws", law)]
@@ -164,15 +178,42 @@ def test_each_side_of_a_prefill_decode_run_takes_the_hops_fitted_under_its_confi
 
         assert {k: run[k] for k in hops_p} == hops_p
         assert run[compass_run.DECODE_HOPS] == hops_d
-        assert got["traffic->frontend-P:http"] == pytest.approx(1e-3 + ROUTER)
-        assert got["frontend-D->traffic:stream"] == pytest.approx(7e-4 + ROUTER)
+        assert got["traffic->frontend-P:http"] == pytest.approx(1e-3 + 2e-3)
+        assert got["frontend-D->traffic:stream"] == pytest.approx(7e-4 + 2e-3)
+        assert got["frontend-P->frontend-D:relay"] == 2e-3
         assert got["engine-D->engine-P:kv_write_req"] == 4e-4
         assert got["frontend-P->engine-P:request#dp0"] == 2e-4
         assert got["engine-P->frontend-P:output#dp0"] == 3e-4
         assert got["frontend-D->engine-D:request#dp0"] == 5e-4
         assert got["engine-D->frontend-D:output#dp0"] == 6e-4
-        # Prefill's entry states no stream, decode's no write request: neither is read.
+        # Prefill's entry states no stream, decode's no write request, and
+        # decode's router hop is not read either.
         assert None not in compass_run.hops(run).values()
+
+
+def test_an_entry_with_no_router_hop_charges_its_floor_and_lists_it(tmp_path):
+    law = tmp_path / "law.json"
+    law.write_text(
+        json.dumps({"host": {"key": {}, "laws": {}, "hops": {"ipc_s": 1e-4}}})
+    )
+    args = parsed(tmp_path, "--host-laws", str(law))
+
+    run = runfile.prefill_decode(args, model(tmp_path), model(tmp_path), "intra_node")
+
+    assert run["router_s"] is None
+    assert lookaheads(run)["frontend-P->frontend-D:relay"] == FLOOR
+    assert compass_run.hops(run)["router_s"] is None
+    assert compass_run.hops(run)["ipc_s"] == 1e-4
+
+
+def test_a_router_lp_whose_router_hop_is_the_floor_refuses(tmp_path):
+    run = runfile.prefill_decode(
+        parsed(tmp_path), model(tmp_path), model(tmp_path), "intra_node"
+    )
+    run["router_in_s"] = compass_run.hop(run, "ipc_s")
+
+    with pytest.raises(ValueError, match="0 < router_in_s < router_s"):
+        compass_run.channel_table(run)
 
 
 def test_without_host_laws_every_hop_takes_the_floor(tmp_path):
@@ -184,10 +225,9 @@ def test_without_host_laws_every_hop_takes_the_floor(tmp_path):
     assert lookaheads(single) == {name: FLOOR for name in SINGLE}
     assert lookaheads(pd) == pytest.approx(
         {
-            name: FLOOR + ROUTER * (":http" in name or ":stream" in name)
+            name: FLOOR * (1 + (":http" in name or ":stream" in name))
             for name in PREFILL_DECODE
         }
-        | {"frontend-P->frontend-D:relay": ROUTER}
     )
     assert sorted(compass_run.hops(pd)) == [
         "admission_s",
@@ -197,6 +237,7 @@ def test_without_host_laws_every_hop_takes_the_floor(tmp_path):
         "ipc_out_s",
         "ipc_s",
         "kv_write_req_s",
+        "router_s",
     ]
     assert set(compass_run.hops(pd).values()) == {None}
 
@@ -209,7 +250,7 @@ def test_a_run_file_with_an_admission_path_runs_as_one_without(monkeypatch, tmp_
 
 
 @pytest.mark.parametrize(
-    "hops", [{"ipc_s": 0.0}, {"ipc_s": -1e-4}, {"router_s": 1e-3}, {"ipc_s": "1e-4"}]
+    "hops", [{"ipc_s": 0.0}, {"ipc_s": -1e-4}, {"relay_s": 1e-3}, {"ipc_s": "1e-4"}]
 )
 def test_a_host_entry_with_a_hop_a_channel_cannot_take_is_refused(
     monkeypatch, tmp_path, hops

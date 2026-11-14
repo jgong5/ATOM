@@ -17,6 +17,8 @@ from test_parity_record import _drive
 
 from atom.compass.drive import identity as drive
 from atom.compass.drive.gpu import GpuRefusal
+from atom.compass.drive.jit_cache import stack_key
+from atom.compass.fit.samples import run_fields
 from atom.compass.run import host_key
 
 GIT = shutil.which("git")
@@ -162,7 +164,7 @@ def test_an_aiter_root_git_cannot_name_refuses_naming_it(
 
 def test_each_named_gpu_is_recorded_with_its_model(planted):
     *_, served = planted
-    model = {"name": "MI308X", "arch": "gfx942"}
+    model = {"name": "MI308X", "arch": "gfx942", "bus": "0000:0a:00.0"}
     assert drive.identity(*served, ARGV, (7, 6))["device"] == [
         {"index": 7, **model},
         {"index": 6, **model},
@@ -200,11 +202,30 @@ GPU45_CARD = {
 def test_each_machine_s_listing_names_the_device_its_spec_states(
     monkeypatch, card, machine
 ):
-    monkeypatch.setattr(drive, "smi", lambda *args: json.dumps({"card0": card}))
+    listing = {"--showbus": {"card0": {"PCI Bus": "0000:0A:00.0"}}}
+    monkeypatch.setattr(
+        drive, "smi", lambda *args: json.dumps(listing.get(args[0], {"card0": card}))
+    )
     spec = json.loads((MACHINES / f"{machine}.json").read_text())["device"]
     assert drive._device((0,)) == [
-        {"index": 0, "name": spec["name"], "arch": spec["arch"]}
+        {"index": 0, "name": spec["name"], "arch": spec["arch"], "bus": "0000:0a:00.0"}
     ]
+
+
+def test_each_gpu_names_its_card_s_bus_which_no_key_or_fit_reads(planted, tmp_path):
+    *_, served = planted
+    cards = {"card6": {**CARD, "PCI Bus": "0000:0B:00.0"}, "card7": CARD}
+    (tmp_path / "bin" / "cards.json").write_text(json.dumps(cards))
+    run = drive.identity(*served, ARGV, (7, 6))
+    buses = [(gpu["index"], gpu["bus"]) for gpu in run["device"]]
+    assert buses == [(7, "0000:0a:00.0"), (6, "0000:0b:00.0")]
+
+    # A run on other cards of the same platform keys and fits as this one.
+    moved = {**run, "device": [{**g, "bus": "0000:ff:00.0"} for g in run["device"]]}
+    assert run_fields(moved) == run_fields(run)
+    assert stack_key(run["stack"], moved["device"]) == stack_key(
+        run["stack"], run["device"]
+    )
 
 
 def test_a_card_neither_its_series_nor_its_model_names_refuses_naming_both(
@@ -273,7 +294,10 @@ def test_a_ptl_watch_names_each_change_from_when_its_file_exists(
             if (tmp_path / "read").exists():
                 break
             time.sleep(0.01)
-        enable[1].write_text("enabled\n")
+        # Renamed over whole, so no reading finds the file empty, as on sysfs.
+        staged = enable[1].with_name("ptl_enable.new")
+        staged.write_text("enabled\n")
+        staged.replace(enable[1])
 
     assert [(c["from"], c["to"]) for c in changes] == [("disabled", to)]
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", changes[0]["at"])

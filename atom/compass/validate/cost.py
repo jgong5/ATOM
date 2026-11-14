@@ -53,6 +53,14 @@ Per kind the report also gives the priced seconds of those steps by method
 ``op.<kind>`` and ``op.<kind>.price_list`` terms together, the term's seconds
 over the measured ones: on totals, and the p10, p50 and p90 per step. Summed
 over the terms, they are the composed step over the measured one.
+
+On a record of several DP ranks it gives, per kind and per rank, the graded
+steps that rank was priced as, their error on totals and the median per step,
+with the PCI buses of the rank's cards that the run.json beside the record
+names (`identity._device`): a law prices the card mix of its records, and this
+split states what a rank's card leaves. ATOM runs DP rank r on the r-th equal slice of the GPUs its server
+saw; a run.json that names no bus, as one written before it named any, leaves
+each rank's cards unnamed.
 """
 
 from __future__ import annotations
@@ -156,6 +164,30 @@ def _summary(steps: list[tuple]) -> dict:
     }
 
 
+def _cards(run: dict | None, ranks: list[int]) -> dict:
+    """The PCI buses of each DP rank's cards in `ranks`, rank r the r-th of
+    as many equal slices of the GPUs `run`, the record's run.json, names; None
+    for each when it names no bus or its GPUs do not split so."""
+    gpus = (run or {}).get("device", [])
+    span, rest = divmod(len(gpus), len(ranks))
+    if not span or rest or any("bus" not in g for g in gpus):
+        return dict.fromkeys(ranks)
+    return {
+        r: [g["bus"] for g in gpus[r * span : (r + 1) * span]] or None for r in ranks
+    }
+
+
+def _rank(rows: list[tuple], buses: list[str] | None) -> dict:
+    """The (real, priced) rows of the graded steps one rank was priced as."""
+    real, priced = np.array(rows).T
+    return {
+        "buses": buses,
+        "steps": len(rows),
+        "on_totals": float(priced.sum() / real.sum() - 1.0),
+        "median": float(np.median(priced / real - 1.0)),
+    }
+
+
 def cost_accuracy(record, backend, steps=None) -> dict:
     """The report for `backend`, a `CostBackend` or a law mapping
     `StepLinearLaw` reads, on the record directory `record`: on its steps whose
@@ -176,9 +208,12 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     some ranks only are refused, and so is a record whose every rank ran only
     dummy forwards.
     So is a record whose run.json, beside `record`, names `aiter_jit_builds`.
+    On several ranks, the report's ``ranks`` holds per kind and rank number
+    the graded steps that rank was priced as (`_rank`), with its cards' buses.
     """
     run = Path(record).resolve().parent / "run.json"
-    if run.is_file() and (built := aiter_jit.refusal(read_json(run))):
+    identity = read_json(run) if run.is_file() else None
+    if identity is not None and (built := aiter_jit.refusal(identity)):
         raise ValueError(f"{record} is not costed: {built}")
     ranks = sorted(Path(record).glob("dp*[0-9].jsonl"))
     records = [read_jsonl(r) for r in ranks]
@@ -227,10 +262,11 @@ def cost_accuracy(record, backend, steps=None) -> dict:
             mine = costs[top].draft_terms
             draft = (min(labels), costs[top].draft_seconds, _group(mine))
         target = _group(costs[top].terms)
-        priced.append((key, band, step, seconds, price, target, draft, costs[top]))
+        priced.append((key, band, step, seconds, price, target, draft, costs[top], top))
     leading = set() if grid else _leading_slow(priced, law)
     parts: dict[str, list] = {}
-    for key, band, step, seconds, price, target, draft, cost in priced:
+    by_rank: dict[str, dict] = {}
+    for key, band, step, seconds, price, target, draft, cost, top in priced:
         if step in leading or seconds > WARM_FACTOR * price:
             warm.append(
                 {
@@ -244,6 +280,8 @@ def cost_accuracy(record, backend, steps=None) -> dict:
         kind = "prefill" if key == "prefill" else "decode"
         for group in GRADED[target]:
             groups[group].setdefault(kind, []).append((band, step, seconds, price))
+        if "graded" in GRADED[target]:
+            by_rank.setdefault(kind, {}).setdefault(top, []).append((seconds, price))
         parts.setdefault(kind, []).append((seconds, cost))
         if draft is not None:
             for group in GRADED[draft[2]]:
@@ -257,6 +295,16 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     report["warm"] = warm
     report["fallback"], report["refused"] = fell, declined
     report["extrapolated"] = extrapolated
+    number = [int(r.name[2:-6]) for r in ranks]
+    cards = _cards(identity, number)
+    report["ranks"] = {
+        kind: {
+            number[i]: _rank(rows, cards[number[i]])
+            for i, rows in sorted(mine.items(), key=lambda m: number[m[0]])
+        }
+        for kind, mine in sorted(by_rank.items(), reverse=True)
+        if len(ranks) > 1
+    }
     report["methods"], report["terms"] = {}, {}
     for kind, priced_steps in sorted(parts.items(), reverse=True):
         real, methods, terms = np.array([s for s, _ in priced_steps]), Counter(), {}
@@ -338,6 +386,15 @@ def _text(report: dict) -> str:
                     f"  {band} | {b['steps']} | {b['p10']:+.1%} | {b['p50']:+.1%}"
                     f" | {b['p90']:+.1%} | {b['within_10pct']:.1%}"
                 )
+    for kind, ranks in report["ranks"].items():
+        out.append(f"\n{kind} by priced rank")
+        out.append("  rank | cards | steps | on totals | median")
+        for rank, r in ranks.items():
+            cards = ", ".join(r["buses"]) if r["buses"] else "unrecorded"
+            out.append(
+                f"  dp{rank} | {cards} | {r['steps']} | {r['on_totals']:+.2%}"
+                f" | {r['median']:+.2%}"
+            )
     for w in report["warm"]:
         out.append(
             f"\nwarm step {w['step']} ({w['band']}): real {w['real_s']:.2f} s,"

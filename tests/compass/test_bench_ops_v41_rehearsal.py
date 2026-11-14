@@ -12,9 +12,11 @@ own: each leaf takes the buffers ATOM's own capture passes it
 (`v41_capture_truth.py`).
 """
 
+import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -31,11 +33,13 @@ from atom.compass.bench import ops
 from atom.utils import forward_context as fctx
 
 HARNESS = pathlib.Path(__file__).with_name("v41_ops_rehearsal.py")
+#: The cells' drafter.
+DRAFTER = " --method dspark --num-speculative-tokens 5"
+DRAFTER += " --spec-decode-acceptance-length 3"
 #: The cells' engine arguments past the model and TP, as their card run starts
 #: them.
-CELL = ARGS + (
-    " --method dspark --num-speculative-tokens 5"
-    " --spec-decode-acceptance-length 3 --gpu-memory-utilization 0.9"
+CELL = f"{ARGS}{DRAFTER}" + (
+    " --gpu-memory-utilization 0.9"
     " --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384"
     " --block-size 16 --max-num-seqs 64 --max-model-len 262144"
     " --cudagraph-capture-sizes [1,2,3,4,5,6,7,8,12,16,24,32,40,48,56,64]"
@@ -66,6 +70,11 @@ HOST_COPY = "aten.to.dtype_layout"
 #: the source of each copy of its staged cursors and slots, and a fill's value
 #: that is a Python number.
 HOSTED = {("aten.copy_.default", "src"), ("aten.fill_.Tensor", "value")}
+#: aten's leaves of V4.1 whose table, not an index, is bound by name: the
+#: sampler's search of each request's draft counts, and the gather of a
+#: replay's queries' pointers.
+SEARCH = "aten.searchsorted.Tensor", "sorted_sequence"
+GATHER = "aten.index.Tensor", "self"
 
 
 def _run(script, *argv, cwd=TREE):
@@ -177,6 +186,22 @@ def test_each_leaf_takes_the_buffers_atom_s_capture_passes_it(rehearsed):
     assert checked and wrong == []
 
 
+def test_a_searched_or_gathered_table_is_one_atom_s_capture_passes(rehearsed):
+    """The sampler's search takes its drafts' counts at a decode, and the
+    queries' pointer gather, passed the prefix table and then the extend table
+    at the last layer's ratio, one of them at a prefill, cached or not."""
+    got, truth = rehearsed
+    taken = [
+        (r["shape"], (r["op"], slot), name, truth[r["leaf"]][slot])
+        for r in [*got["cached"], *got["fresh"]]
+        for slot, name in r["identity"].items()
+        if (r["op"], slot) in (SEARCH, GATHER) and r["shape"] != "prefill T=128 B=1"
+    ]
+    assert all(name in want for *_, name, want in taken), taken
+    shapes = {(s, leaf) for s, leaf, *_ in taken}
+    assert {("decode B=16", SEARCH), ("prefill T=2048 B=1", GATHER)} <= shapes
+
+
 def test_a_leaf_s_later_occurrences_take_what_atom_passes_them():
     """Copies of a leaf that runs twice alternate its occurrences' buffers:
     the tail's batch ids, then its layer 39's queries'."""
@@ -228,3 +253,80 @@ def test_the_cursor_write_s_values_are_its_staging_s_first_rows(shape):
     op = {"op": "aten.index_put_.default", "args": {"self": {"role": "kv"}}}
     _, view = ops._kv(spec, "values", ops._named(op, "values", spec, held) or held)
     assert (view.data_ptr(), list(view.shape)) == (staged.data_ptr(), shape)
+
+
+def test_the_queries_pointer_gather_takes_its_last_layer_s_prefix_table():
+    """At the ratio the last layer runs, not the first ratio's by layout."""
+    cache = "attn_metadata_builder.cache.indptr_buffers"
+    held = {f"{cache}.{n // 2}.{n % 2}": torch.zeros(129).int() for n in range(6)}
+    spec = {"shape": [129], "stride": [1], "dtype": "torch.int32", "role": "kv"}
+    op = {"op": GATHER[0], "args": {"self": spec}}
+    known = {("rows_per_page", 64): 1, ("rows_per_page", 2): 2, ("queries", None): 2}
+    pool = ops._named(op, "self", spec, held, known) or held
+    assert ops._kv(spec, "self", pool)[0] == f"{cache}.2.0"
+
+
+@pytest.fixture(scope="module")
+def undrafted_cell(model_dir, tmp_path_factory):  # noqa: F811
+    """Cell B's decode B=16 with no drafter, traced, and what its capture passes
+    each leaf, under one root; and ATOM's arguments for that cell."""
+    root, cell = tmp_path_factory.mktemp("v41_undrafted"), CELL.replace(DRAFTER, "")
+    _trace(root, f"--width 16{cell}", ("--arch", "gfx1250", "--gpu", "0"), READ)
+    model, cell = root / "model", cell.split()[1:]
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(model_dir / name, model / name)
+    _run(TRUTH, root / "truth.json", model, 4, "--width", "16", "--", *cell)
+    atom = ["--model", model, "-tp", "4", "--enforce-eager", "--level", "0", *cell]
+    return root, atom
+
+
+@pytest.fixture(scope="module")
+def undrafted(undrafted_cell):
+    """The rehearsal's record of `undrafted_cell`'s RoPE leaves alone, no
+    compress leaf beside them, at 8192 tokens a row; and its capture's truth."""
+    root, atom = undrafted_cell
+    point = ["--width", "16", "--context", "8192", "--only", ROPE, "--llc-mib", "512"]
+    _run(HARNESS, root / "got.json", *point, "--store", root / "store", "--", *atom)
+    return [json.loads((root / f).read_text()) for f in ("got.json", "truth.json")]
+
+
+def test_each_rope_alone_takes_its_positions_at_a_decode_with_no_drafter(undrafted):
+    """With no drafter both ratios' compress plans hold a row a request, so only
+    the ratio the capture states tells their keys' RoPEs apart: each RoPE leaf,
+    with no compress leaf beside it, takes the positions ATOM's capture passes
+    it, the query's and each ratio's keys' apart, a buffer a leaf."""
+    got, truth = undrafted
+    taken = {r["leaf"]: r["identity"].get("positions") for r in got}
+    want = {s: truth.get(s, {}).get("positions") for s in taken}
+    assert {s: [n] for s, n in taken.items()} == want
+    assert {(r["op"], r["verdict"]) for r in got} == {(ROPE, "reaches launch")}
+    assert len(set(taken.values())) == len(taken) == 3
+
+
+def test_a_key_rope_stating_no_ratio_refuses_where_both_ratios_plans_hold_its_rows(
+    undrafted_cell,
+):
+    """In a graph traced before V4.1's key RoPE stated its ratio, at a decode
+    with no drafter, both ratios' keys' RoPEs are one leaf, and both ratios'
+    compress plans hold its rows: alone or beside them, it refuses by name, to
+    be traced again, and the query's RoPE takes what ATOM's capture passes it."""
+    root, atom = undrafted_cell
+    store, truth = root / "unstated", json.loads((root / "truth.json").read_text())
+    shutil.copytree(root / "store", store, copy_function=shutil.copyfile)
+    for entry in store.glob("op_graph/*/entry.json"):  # each RoPE stating nothing
+        doc = json.loads(entry.read_text())
+        for name in doc["members"]:
+            data = (entry.parent / name).read_bytes()
+            data = re.sub(rb', "stated": \{"compress_ratio": \d+\}', b"", data)
+            (entry.parent / name).write_bytes(data)
+            doc["members"][name] = f"sha256:{hashlib.sha256(data).hexdigest()}"
+        entry.write_text(json.dumps(doc))
+    for only in (["--only", ROPE], []):
+        point = ["--width", "16", "--context", "8192", *only, "--llc-mib", "512"]
+        _run(HARNESS, root / "unstated.json", *point, "--store", store, "--", *atom)
+        got = json.loads((root / "unstated.json").read_text())
+        ropes = [r for r in got if r["op"] == ROPE]
+        heads = [json.loads(r["leaf"])["args"]["input"]["shape"][-2] for r in ropes]
+        (_, key), (_, query) = sorted(zip(heads, ropes), key=lambda h: h[0])
+        assert key["why"].endswith("holds its 16 rows: trace its shape again")
+        assert [query["identity"].get("positions")] == truth[query["leaf"]]["positions"]

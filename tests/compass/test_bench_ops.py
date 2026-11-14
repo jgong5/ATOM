@@ -974,6 +974,44 @@ def test_each_copy_of_a_v41_index_scorer_writes_a_logits_plane_of_its_own():
     assert len({plane.data_ptr() for plane in planes}) == 3
 
 
+@pytest.mark.parametrize(
+    "bounds, copies, buffers",
+    [([100, 120, 110, 120], 11, 2), ([600] * 4, 3, 3), ([1000, 20, 20, 20], 3, 3)],
+    ids=["rows_alike", "rows_past_half", "one_long_row"],
+)
+def test_a_v41_plane_counts_and_copies_the_columns_below_its_rows_bounds(
+    bounds, copies, buffers
+):
+    # a top-k's FP8 plane, [4, 1024] float32, beside its 32-byte bounds, at
+    # twice a cache of 20000 bytes: 8 copies of rows alike share a buffer,
+    # 128 columns apart; rows past half its width take a buffer a copy, at
+    # most twice that, and read past it, but for ragged rows (#3274)
+    runner = _Runner()
+    geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(4, 1024)
+    runner.forward_vars["ends"] = torch.tensor(bounds)
+    plane, ends = _t([4, 1024], "metadata"), _t([4], "metadata", dtype="torch.int64")
+    top_k = _leaf(ops._TOPK, ("logits", plane), ("row_ends", ends))
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(top_k, layers=1)["region"])
+    stub._prepare((0, 0))
+    [(sig, (op, instances))] = stub.leaves.items()
+
+    n, size, _, _ = stub._plan(op, instances, {}, 4, 4, sig=sig, decode=True)
+    planes = [stub._copy(op, sig, instances, c)[0]["logits"] for c in range(n)]
+
+    assert (n, size) == (copies, 4 * sum(bounds) + 32)
+    assert n * size > 20_000 or max(bounds) > 2 * min(bounds)
+    assert len({p.untyped_storage().data_ptr() for p in planes}) == buffers
+    reach = list(enumerate(bounds))
+    assert all(p[r, :b].ne(0).all() for p in planes for r, b in reach)
+    for c, p in enumerate(planes):  # no copy reaches another's columns
+        for r, b in reach:
+            p[r, :b] = c
+    assert all(p[r, :b].eq(c).all() for c, p in enumerate(planes) for r, b in reach)
+
+
 def test_an_embedding_reads_the_token_ids_atom_prepared():
     runner = _Runner()
     # An index buffer whose name holds the slot's, which the name rule picks.
@@ -1665,6 +1703,74 @@ def test_v41_attention_takes_the_lists_atom_s_index_build_writes_for_its_pass(
     # one copy a pass, its indptrs filled afresh into the cache's buffers
     assert len({f[0] for f in fills}) == 2
     assert all(f[1:] == ({}, None) for f in fills)
+
+
+def test_a_v41_attention_reads_the_pool_rows_its_pass_s_selection_names():
+    # V4.1's attention at ratio 2, top-k 8, over a prefill's 4 rows of one
+    # request from position 1199, seeing 600 and 601 rows, and over its
+    # replay's query, the last. The bench spreads each row's 8 over its own
+    # visible rows: the prefill's lists name 12 of the pool's rows of 16
+    # bytes, the query's its 8.
+    from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
+    from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
+
+    i32, runner = torch.int32, _Runner()
+    runner.config.kv_cache_block_size = 32
+    runner.model.append(torch.nn.Module())
+    runner.model[-1].spec = LayerAttentionSpec(2, 2, AttentionMode.FULL, 2, 2)
+    visible = {2: torch.tensor([600, 600, 601, 601], dtype=i32)}
+    spans = (RequestSpan(0, 1199, 0, 4, 0),)
+    step = BatchStep(spans, *(torch.zeros(4, dtype=i32),) * 4, None, visible=visible)
+    step.decoder = SimpleNamespace(
+        tail=step, tail_rows=torch.zeros(3), last=torch.zeros(1), filled_gpu=None,
+        finishing_gpu=None, query_ids=torch.tensor([-1, -1, -1, 0], dtype=i32),
+        query_ptrs=torch.tensor([3, 0], dtype=i32),
+    )  # fmt: skip
+    lists = [torch.zeros(4, dtype=i32)] * 4
+    cache = SimpleNamespace(attention_indices=lambda *_: lists)
+    cache.geometry = SimpleNamespace(batch_topk=lambda ratio: 8)
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):
+        out = prepare(batch)
+        vars(fctx._forward_context.attn_metadata).update(step=step, cache=cache)
+        return out
+
+    def attend(rows, *slots):
+        args = [(s, _t([n], "activation", dtype="torch.int32")) for s, n in slots]
+        q, kv = _t([rows, 2, 4], "activation"), _t([999, 4], "kv")
+        leaf = _leaf(ops._ATTEND, ("q", q), ("unified_kv", kv), *args)
+        top = ("window_size", 128), ("compress_ratio", 2), ("index_topk", 8)
+        return dataclasses.replace(leaf, stated=top)
+
+    runner.prepare_model, stub = prepare_model, ops.Stub(runner, 10_000)
+    leaves = attend(4, ("kv_indices_prefix", 4))
+    leaves = leaves, attend(1, ("kv_indices_prefix", 1), ("kv_indptr_prefix", 2))
+    stub.leaves = ops.leaves(_graph(*leaves, layers=1)["region"])
+    stub._prepare((0, 0))
+
+    # by block, the prefill past the 8 a request its top-k reads at most
+    assert {
+        op["args"]["q"]["shape"][0]: stub._plan(op, i, {}, 99, 1, None, s)[3][0]
+        for s, (op, i) in stub.leaves.items()
+    } == {4: 12 * 16, 1: 8 * 16}
+
+
+@pytest.mark.parametrize(
+    "spans",
+    [((1199, 4),), ((0, 3), (8190, 6)), ((1199, 4), (1199, 4)), ((9000, 300),)],
+)
+def test_the_host_s_spread_counts_the_rows_the_bench_s_candidates_keep(spans):
+    # `_spread` off each request's (first position, rows), against the ids
+    # `_candidates` keeps over the rows' visible rows, a request's apart: two
+    # requests at the same rows name theirs twice
+    ratio, k = 4, 16
+    positions = torch.cat([torch.arange(p, p + n) for p, n in spans])
+    ids = ops._candidates((positions + 1) // ratio, k).long()
+    batch = torch.cat([torch.full((n,), i) for i, (_, n) in enumerate(spans)])
+    kept = ids >= 0
+    named = (batch[:, None].expand_as(ids)[kept] << 32 | ids[kept]).unique()
+    assert ops._spread(spans, ratio, k) == named.numel()
 
 
 def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
@@ -2726,6 +2832,53 @@ def test_a_warm_call_takes_its_cold_call_s_occurrence_on_that_one_s_first_copy(
     cold, warm = ([b for _, b in g] for g in graphs)
     assert warm == cold and (-1 in cold) == queried
     assert len({c for c, _ in graphs[1]}) == 1 + queried
+
+
+@pytest.mark.parametrize(
+    "call_ns, copies, calls, other",
+    [(1.0, 12, ops.CALLS, ops.CALLS), (ops.GRAPH_NS // 11, 10, 10, 11)],
+)
+def test_each_occurrence_of_a_queried_leaf_takes_as_many_copies_and_calls(
+    monkeypatch, call_ns, copies, calls, other
+):
+    # Two leaves of two occurrences, 200 bytes a call: 11 copies pass twice
+    # 1000 bytes. The scan's later occurrence takes its own ids, all -1
+    # (`QUERIED`): its copies round up to 12, each on activations of its own,
+    # and where 11 calls fill `GRAPH_NS`, its calls down to 10, so each
+    # occurrence takes half the calls. The other, with no later binding,
+    # keeps 11 copies and its calls.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    args = ("ids", _t([25], "activation")), ("x", _t([25], "activation"))
+    leaves = _leaf("aiter.scan", *args), _leaf("aiter.other", *args)
+    found = ops.leaves(_graph(*leaves, layers=2)["region"])
+    [sig] = [s for s, (op, _) in found.items() if op["op"] == "aiter.scan"]
+    queries, prepare = torch.full((25,), -1.0), ops.Stub._prepare
+
+    def preparing(stub, batch):
+        prepare(stub, batch)
+        stub.later[len(stub.placed) - 1, sig, "ids"] = ("queries", queries)
+
+    monkeypatch.setattr(ops.Stub, "_prepare", preparing)
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    graphs = []
+
+    def replay(fn, calls, flush=None):
+        graphs.append([kwargs for kwargs, _ in calls])
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], call_ns)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        scan, rest = ops.Stub(_Runner(), 1000).point(placed, decode(2), 20, found)
+
+    taken = [bool((kwargs["ids"] == -1).all()) for kwargs in graphs[0]]
+    assert scan["later"] == {"ids": "queries"} and "later" not in rest
+    assert (taken.count(False), taken.count(True)) == (calls // 2, calls // 2)
+    assert len({id(kwargs["x"]) for kwargs in graphs[0]}) == copies
+    got = [(r["copies"], r["calls"], r["footprint_bytes"]) for r in (scan, rest)]
+    assert got == [(copies, calls, copies * 200), (11, other, 11 * 200)]
 
 
 def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):

@@ -83,9 +83,6 @@
       "interconnect.intra_node.topology": {
         "origin": "assumed"
       },
-      "interconnect.router_relay_s": {
-        "origin": "assumed"
-      },
       "device.ptl": {
         "origin": "probed"
       },
@@ -300,7 +297,6 @@
       "link_bandwidth_bytes_per_s": 50000000000.0,
       "link_latency_s": 3.008648854934795e-05,
       "derate": 0.46939086521217643
-    },
-    "router_relay_s": 0.0015
+    }
   }
 }

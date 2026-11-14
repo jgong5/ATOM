@@ -105,7 +105,7 @@ def planted(tmp_path, monkeypatch):
 def _running(pid) -> bool:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # reaped before or mid-read
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 

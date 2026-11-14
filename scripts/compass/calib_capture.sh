@@ -5,8 +5,10 @@
 # to 392 on a real TP1 server through `REAL=1 cctraces_sim.sh`, at each
 # concurrency in CELLS, one cell at a time, since a cell run beside another
 # moves the host time the host laws measure. Each cell is stopped STEPS_S
-# seconds after its first recorded step, so a cell whose aiperf warmup outlasts
-# that window ends without its export. Qwen3.8-27B TP1 on MI308X captures with
+# seconds after aiperf's profiling phase starts, past its warmup, as aiperf.log
+# records it, or in its warmup, STEPS_S seconds after the warmup started, if its
+# profiling has not started by then.
+# Qwen3.8-27B TP1 on MI308X captures with
 # CELLS="1 4 16": at 64 and 256 its warmup cannot finish within STEPS_S, so the
 # owner dropped them for that model and machine as not a sustainable
 # configuration (https://github.com/jgong5/ATOM/issues/1590#issuecomment-6281930268).
@@ -25,7 +27,7 @@
 #   RUN_FILE, MODEL, TRACES, HARNESS_PYTHON  as cctraces_sim.sh takes them
 #   CELLS        concurrencies, in run order (default: 1 4 16 64 256, which
 #                DeepSeek-V4-Pro DPA-TP8 captures at)
-#   STEPS_S      wall seconds recorded per cell (default 1800)
+#   STEPS_S      wall seconds of aiperf's profiling per cell (default 1800)
 #   SERVER_ARGS  API server flags (default: --max-model-len 262144, so decode
 #                runs on captured graphs)
 #   HIP_VISIBLE_DEVICES  the GPUs as HIP numbers them (default 0); a cell refuses
@@ -34,10 +36,9 @@
 # OUT_DIR/c<C>/ is the cell's cctraces_sim.sh directory, its step record in
 # steps/; OUT_DIR/c<C>.log holds the tree's commit, the host load (`uptime`),
 # the GPUs' processes, VRAM and use at the cell's start and end, and the cell's
-# exit status, aiperf's: on SIGINT aiperf writes its export, or, stopped in its
-# warmup, none and exits 1. A cell whose aiperf duration has passed is not
-# stopped: aiperf ends it with its export. The cell's run.json gains a
-# `compass record` identity.
+# exit status, aiperf's: on SIGINT aiperf writes its export, unless in its
+# warmup. A cell whose aiperf duration has passed is not stopped: aiperf ends it
+# with its export. The cell's run.json gains a `compass record` identity.
 # The capture exits 1 naming each cell left without artifacts/client_run.json
 # or without that identity.
 #   compass fit steps --backend step-linear OUT_DIR/c<C>... --client-run OUT_DIR/c<C> \
@@ -61,6 +62,9 @@ state() {
     echo "$1 $(date -u +%FT%TZ) uptime:$(uptime)"
     { rocm-smi --showpids --showpidgpus; rocm-smi --showmeminfo vram --showuse; } | sed 's/^/  /'
 }
+# Sends the cell's aiperf SIGINT and logs it: aiperf runs as a child of
+# cctraces_sim.sh ($sim), which runs under timeout.
+stop_aiperf() { pkill -INT -P "$(pgrep -P $sim)" -f "^aiperf system_controller" && echo "stopped aiperf $(date -u +%FT%TZ)" >>"$log"; }
 
 for c in ${CELLS:-1 4 16 64 256}; do
     o=$OUT/c$c log=$OUT/c$c.log
@@ -71,9 +75,21 @@ for c in ${CELLS:-1 4 16 64 256}; do
     gpu=$(busy | grep -xFm1 -f <(tr , '\n' <<<"$SMI_GPUS")) && { echo "calib_capture: rocm-smi GPU $gpu is in use" | tee -a "$log" >&2; exit 3; }
     CONCURRENCY=$c timeout 7200 bash "$ROOT/scripts/compass/cctraces_sim.sh" "$RUN_FILE" "$o" >"$o.out" 2>&1 &
     sim=$!
-    until [[ -s $o/steps/dp0.jsonl ]] || ! kill -0 $sim 2>/dev/null; do sleep 1; done
-    if kill -0 $sim 2>/dev/null; then
-        echo "first step $(date -u +%FT%TZ)" >>"$log"
+    # Not the step record: the server writes it only at its exit. warmup_s
+    # counts the seconds slept since aiperf's warmup started, empty before.
+    warmup_s=
+    until grep -qsF "Phase profiling (profiling) started" "$o/aiperf.log" || ! kill -0 $sim 2>/dev/null; do
+        if [[ -z $warmup_s ]]; then
+            grep -qsF "Phase warmup (warmup) started" "$o/aiperf.log" && warmup_s=0 && echo "aiperf warmup started $(date -u +%FT%TZ)" >>"$log"
+        elif ((++warmup_s >= ${STEPS_S:-1800})); then
+            # Stopped in its warmup, aiperf exits 1 and writes no export.
+            stop_aiperf
+            break
+        fi
+        sleep 1
+    done
+    if kill -0 $sim 2>/dev/null && grep -qsF "Phase profiling (profiling) started" "$o/aiperf.log"; then
+        echo "aiperf profiling started $(date -u +%FT%TZ)" >>"$log"
         # Wakes each 10 s, so a cell that ends on its own is not held to STEPS_S.
         for ((t = 0; t < ${STEPS_S:-1800}; t += 10)); do kill -0 $sim 2>/dev/null && sleep 10; done
         # Once aiperf's duration has passed it ends the cell itself after its
@@ -81,8 +97,7 @@ for c in ${CELLS:-1 4 16 64 256}; do
         if grep -qsF "Phase profiling (profiling) sending complete" "$o/aiperf.log"; then
             echo "aiperf duration ended $(date -u +%FT%TZ)" >>"$log"
         else
-            # aiperf runs as a child of cctraces_sim.sh, which runs under timeout.
-            pkill -INT -P "$(pgrep -P $sim)" -f "^aiperf system_controller" && echo "stopped aiperf $(date -u +%FT%TZ)" >>"$log"
+            stop_aiperf
         fi
     fi
     wait $sim

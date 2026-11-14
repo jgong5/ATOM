@@ -226,7 +226,11 @@ class BatchView:
     prefills at this step; False on one rank. `group_max_tokens` is the most
     tokens any rank of the group scheduled at this step, which ATOM picks the
     step's prefill token-graph bucket by (`ForwardMode._pad_to_token_graph`),
-    never fewer than this rank's; None on one rank. `image_tokens` counts the
+    never fewer than this rank's; None on one rank. `group_needs_eager` says
+    the attention backend of some rank of the group, a group of one included,
+    refuses a graph for this step (`DPSyncResult.any_rank_needs_eager`), so
+    the group runs it eagerly and replays no token graph for its prefill.
+    `image_tokens` counts the
     scheduled tokens whose embedding the step's vision encoder supplies; a
     backend that has no basis for pricing that encoder refuses a step with any.
 
@@ -251,6 +255,7 @@ class BatchView:
     draft_rows: int | None = None
     group_dummies: int = 0
     group_max_tokens: int | None = None
+    group_needs_eager: bool = False
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)

@@ -87,7 +87,6 @@ def test_a_network_file_reads_by_path(tmp_path):
     "path, value",
     [
         ("device.name", "MI355X"),
-        ("interconnect.router_relay_s", 1.5e-3),
         ("interconnect.intra_node.link_latency_s", 2.0e-6),
     ],
 )

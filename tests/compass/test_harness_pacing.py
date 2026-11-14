@@ -537,7 +537,6 @@ def test_a_cancel_moves_the_clock_wait_to_the_next_timer_or_withdraws_it(
     "option, name",
     [
         ({"seamless": True}, "seamless"),
-        ({"trace_cap": 30.0}, "trace_idle_gap_cap_seconds"),
         ({"metrics_off": False}, "server metrics"),
         ({"gpu_off": False}, "GPU telemetry"),
         ({"prefill_concurrency": 2}, "prefill concurrency (--prefill-concurrency)"),
