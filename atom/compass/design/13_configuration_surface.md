@@ -460,7 +460,6 @@ was built, and an entry asked for one refuses, naming where its work went.
 |---|---|
 | `compass plan` | Nowhere as one command (`07` D37). The step grid's planning and coverage check sit beside its backend (`17` D98, D99): `measure steps --grid` runs the planner over a `shape_population`, and `run --coverage` calls the check before the run starts |
 | `compass validate` | Grading stays `python -m atom.compass.validate` (`08`), outside the CLI, and decides whether a run is gradeable from what `run.json` records; the analytical bound check is `python -m atom.compass.validate.bound` (`08` D50.2), and a projection `compass project` |
-| `compass explain`, `compass probe`, `compass spec` | `measure device` and `fit device` fill a platform's readings, a datasheet or network file is a file a user names, and the composed spec in `run.json` states each field with its origin (`05` D24, D26) |
 | `compass measure collectives` | `measure ops` (`07` D40) |
 | `compass discover` | renamed `trace steps` |
 | `compass trace`, alone | renamed `trace ops`; there is no bare `trace`, only `trace steps` and `trace ops` |

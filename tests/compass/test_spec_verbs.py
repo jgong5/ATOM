@@ -22,11 +22,9 @@ from atom.compass.spec import (
     MachineSpec,
     SpecRefusal,
     across_ranks,
-    explain,
     merge,
     validate,
 )
-from atom.compass.spec.fields import BY_PATH
 from atom.compass.spec.rules import Rule
 
 MACHINE = "mi355x-8gpu-2node"
@@ -367,96 +365,6 @@ def test_a_value_of_the_wrong_shape_is_reported():
     assert [refusal.rule for refusal in checked.refusals] == [Rule.SHAPE]
 
 
-# --- explain: the basis of a number ------------------------------------------
-
-
-def test_every_term_a_resolved_spec_holds_can_be_explained():
-    # The exit criterion, and it has to assert what is in the basis rather than
-    # that there is one: a path that is in `spec.values` cannot come back empty,
-    # so reachability alone survives every wrong value this module could report.
-    # Each row states the value the document holds, and carries a derate exactly
-    # when the field it came from is a spec peak.
-    spec = resolved()
-    for path in sorted(spec.values):
-        basis = explain(spec, path)
-        assert basis.contributions, path
-        assert basis.digest == spec.digest()
-        field = BY_PATH[path]
-        for row in basis.contributions:
-            assert row.value == spec.values[path], path
-            assert (row.derate is not None) == field.peak, path
-
-
-def test_a_spec_peak_is_reported_with_its_derate_and_the_derated_value():
-    basis = explain(resolved(), "device.compute.bf16_flops")
-    (row,) = basis.contributions
-    assert (row.value, row.derate) == (2.5e15, 0.70)
-    assert row.effective == pytest.approx(1.75e15)
-    assert "x 0.7" in str(row)
-
-
-def test_a_number_that_is_not_a_spec_peak_carries_no_derate():
-    (row,) = explain(resolved(), "device.memory.capacity_bytes").contributions
-    assert row.derate is None and row.effective == row.value
-
-
-def test_a_block_explains_to_every_field_under_it():
-    term = "interconnect.inter_node"
-    paths = {row.path for row in explain(resolved(), term).contributions}
-    assert paths == {
-        f"{term}.link_bandwidth_bytes_per_s",
-        f"{term}.link_latency_s",
-        f"{term}.derate",
-    }
-
-
-def test_a_basis_names_the_fragment_each_field_came_from():
-    combination = merged()
-    spec = MachineSpec.from_mapping(combination.document)
-    basis = explain(spec, "device.memory.capacity_bytes", origin=combination)
-    supplied = {row.path: row.supplied_by for row in basis.contributions}
-    assert supplied["device.memory.capacity_bytes"] == ("class1",)
-    links = explain(spec, "interconnect.intra_node", origin=combination)
-    supplied = {row.path: row.supplied_by for row in links.contributions}
-    assert supplied["interconnect.intra_node.link_latency_s"] == ("links",)
-
-
-def test_without_a_merge_a_basis_still_reads_but_names_no_fragment():
-    basis = explain(resolved(), "device.memory.capacity_bytes")
-    assert basis.contributions[0].supplied_by == ()
-
-
-def test_a_term_the_schema_does_not_know_is_asked_for_again_by_path():
-    # An unknown term and an optional field the document left out both come
-    # back empty however they are spelled, so both are asked for again.
-    assert "device.clock_ceiling" not in BY_PATH
-    assert not BY_PATH["provenance.notes"].required
-    for term in ("device.clock_ceiling", "provenance.notes"):
-        with pytest.raises(SpecRefusal) as refused:
-            explain(resolved(), term)
-        assert refused.value.rule is Rule.ADDRESSING
-        assert refused.value.what == f"`{term}` names no field this spec states"
-        assert "ask again by the dotted path" in refused.value.remedy
-
-
-def test_a_block_explains_without_an_optional_field_the_document_left_out():
-    spec = resolved()
-    assert "provenance.notes" not in spec.values
-    paths = {row.path for row in explain(spec, "provenance").contributions}
-    assert "provenance.authored_by" in paths
-    assert "provenance.notes" not in paths
-
-
-def test_the_basis_prints_its_spec_and_one_line_per_field():
-    combination = merged()
-    spec = MachineSpec.from_mapping(combination.document)
-    term = "interconnect.inter_node"
-    printed = str(explain(spec, term, origin=combination)).splitlines()
-    assert printed[0].endswith(spec.digest())
-    assert printed[2].strip().startswith(f"{term}.link_latency_s = 5e-06")
-    assert printed[2].endswith("[links]  probed")
-
-
 # --- one reading per rank ----------------------------------------------------
 
 
@@ -496,6 +404,6 @@ def test_a_reading_no_spec_could_hold_is_refused_where_the_ranks_are():
 
 
 def test_the_verbs_are_reachable_by_name():
-    for name in ("merge", "validate", "explain", "across_ranks"):
+    for name in ("merge", "validate", "across_ranks"):
         assert name in spec_package.__all__
         assert getattr(spec_package, name, None) is not None

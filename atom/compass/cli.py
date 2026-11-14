@@ -61,10 +61,6 @@ COMMANDS = {
     ),
 }
 OPS = "the op-level half of the toolchain is not built yet"
-MACHINE = (
-    "compass measure device and compass fit device publish a platform's readings, "
-    "and the commands that price name it with --device and --ptl"
-)
 #: Each command that refuses, to why and where its work is.
 REFUSED = {
     "trace": "there is no bare trace: use compass trace steps or compass trace ops",
@@ -77,9 +73,6 @@ REFUSED = {
         "bound check python -m atom.compass.validate.bound, and a projection "
         "compass project"
     ),
-    "explain": "deprecated: " + MACHINE,
-    "probe": "deprecated: " + MACHINE,
-    "spec": "deprecated: " + MACHINE,
     "measure collectives": "deprecated: collectives are priced by compass measure ops",
     "discover": "deprecated: renamed compass trace steps",
 }

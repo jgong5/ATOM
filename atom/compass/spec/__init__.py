@@ -8,15 +8,13 @@ engine start's memory readings are not the spec's: `compass measure memory`
 publishes them per configuration as a `memory_readings` entry.
 
 The verbs: `merge` combines fragments and refuses ones that describe two
-machines, `validate` reports every refusal of the merged document, and
-`explain` takes a field or block back to its values and their origins. A run
-reads the result with `MachineSpec`. `across_ranks` is `compass measure
-memory`'s spread check.
+machines, and `validate` reports every refusal of the merged document. A run
+reads the result with `MachineSpec`, which states each field's origin.
+`across_ranks` is `compass measure memory`'s spread check.
 
 Nothing here imports a tensor library, a device runtime or the engine.
 """
 
-from .explain import explain
 from .machine import MachineSpec
 from .merge import Fragment, merge
 from .ranks import across_ranks
@@ -28,7 +26,6 @@ __all__ = [
     "MachineSpec",
     "SpecRefusal",
     "across_ranks",
-    "explain",
     "merge",
     "validate",
 ]
