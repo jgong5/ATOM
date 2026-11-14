@@ -219,7 +219,7 @@ M-f `14`; M-g `01` D3.5.
 | T111 | Whether ATOM's Benchmark Dashboard (`.github/dashboard/index.html`) can show both marks and the recommended point, or the dashboard is a page of Compass's own (`19` D115) |
 | T112 | How MiniMax-M3's calibration and grading divide the traces: the `agentx` workload takes all 393 (`06` D35.1), a grader refuses a backend fitted on the traces it grades (`13` D80), and the M3-Agentic stage has stated neither yet (`19` D117) |
 | T113 | How one law serves an arm's points whose `--max-num-seqs` differs: [#3275](https://github.com/jgong5/ATOM/issues/3275)'s ruling (`19` D117, `16` D95.1) |
-| T114 | Which of a law's held-out errors `19` D112's requirement 4 bounds, against which acceptance target: a fit reports each band's errors by percentile, while `08` D47 grades totals, the worst held out and the median step under #627's 5% gate; a bar is measured before the reuse check refuses on it |
+| ~~T114~~ | ~~Which of a law's held-out errors `19` D112's requirement 4 bounds, against which acceptance target: a fit reports each band's errors by percentile, while `08` D47 grades totals, the worst held out and the median step under #627's 5% gate; a bar is measured before the reuse check refuses on it~~ — ruled 2026-11-14 on [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6869501859): the fit reports `08` D47's three figures over its leave-one-run-out folds, and a law past #627's 5% gate fails `19` D112's requirement 4 |
 
 ### Topics 02, 01 — gaps now closed
 
