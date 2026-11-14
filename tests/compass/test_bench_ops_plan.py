@@ -9,8 +9,6 @@ read back from a real store.
 
 import json
 import os
-import re
-import subprocess
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -489,11 +487,11 @@ def test_a_planned_prefill_attention_leaf_holds_a_step_s_rows_either_side_of_its
     "tokens, lo, hi, why",
     [
         (120, 0, 1000, ""),  # fresh to 1000 cached, both of one kernel
-        (120, 1000, 2000, "between two kernels"),  # 1000 and 2000 differ
+        (120, 1000, 2000, "outside the measured range"),  # 100 holds no 2000
         (120, 1000, 1000, ""),
         (200, 0, 0, "outside the measured range"),  # past the token counts
         (120, 1000, 5000, "outside the measured range"),  # past the cached counts
-        (60, 1000, 1000, "outside the measured range"),  # 1000 holds no 60
+        (60, 1000, 1000, "between two kernels"),  # 40 holds 0 and 2000, apart
     ],
 )
 def test_a_cached_bracket_holds_between_counts_and_tokens_of_one_kernel(
@@ -1017,33 +1015,24 @@ def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
 
 
 @pytest.fixture(autouse=True)
-def _declared_arch_ends_with_its_test(monkeypatch):
-    """`--coverage` declares the plan's arch to the whole process, in its
-    environment and Triton's driver; each test's declaration ends with it."""
-    import triton
-
-    monkeypatch.setattr(triton.runtime.driver, "_active", triton.runtime.driver._active)
-    with patch.dict(os.environ):
-        yield
+def declared(monkeypatch):
+    """The arches `--coverage` imports aiter on, in turn: a process imports
+    aiter once, and this one is the test run's, so an import is only recorded."""
+    arches = []
+    monkeypatch.setattr(driverless, "import_aiter_on", arches.append)
+    return arches
 
 
 def test_coverage_declares_the_plan_s_arch_to_aiter_before_it_builds_the_config(
-    tmp_path, monkeypatch, model_config  # noqa: F811
+    tmp_path, monkeypatch, model_config, declared  # noqa: F811
 ):
-    """ATOM's config imports aiter, which asks `GPU_ARCHS` and `rocminfo` for
-    the arch; with no driver, `rocminfo` names none."""
+    """ATOM's config holds aiter's fp8 dtype, which aiter resolves at import
+    from the device it finds; with no driver, none."""
     model_config.pipeline_parallel_size = model_config.prefill_context_parallel_size = 1
-    driverless_bin = tmp_path / "bin"
-    driverless_bin.mkdir()
-    (driverless_bin / "rocminfo").write_text("#!/bin/sh\nexit 0\n")
-    (driverless_bin / "rocminfo").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{driverless_bin}:{os.environ['PATH']}")
     asked = []
 
     def atom_config(args):
-        found = subprocess.run(["rocminfo"], capture_output=True, text=True, check=True)
-        listing = found.stdout
-        asked.append((re.findall(r"\bgfx\w+", listing), os.environ.get("GPU_ARCHS")))
+        asked.append(list(declared))
         return model_config
 
     monkeypatch.setattr("atom.compass.bench.measure.atom_config", atom_config)
@@ -1058,7 +1047,7 @@ def test_coverage_declares_the_plan_s_arch_to_aiter_before_it_builds_the_config(
     argv = ["--coverage", graded, "--store", str(store.root), "--out", str(out)]
     report = ops._coverage_main(argv, [])
 
-    assert asked == [(["gfx950"], "gfx950")]
+    assert asked == [["gfx950"]]
     assert report["steps"] == 1
 
 
@@ -1196,7 +1185,9 @@ def test_a_child_that_dies_costs_the_plan_only_the_point_it_was_measuring(
         for d in dead
     ]
     assert [r for r in records if "refused" not in r] == [
-        r for r in whole if {k: r[k] for k in r if k != "token"} not in dead
+        r
+        for r in whole
+        if {k: r[k] for k in r if k not in ("token", "layout")} not in dead
     ]
     monkeypatch.setattr(ops, "_child", _bench)
     again = _plan(bench, tmp_path, population)  # the next plan retries them

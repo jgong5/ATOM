@@ -29,7 +29,8 @@ clock with its peer, so it refuses without `--join`.
 `--coverage` names record directories and `shape_population` tokens whose steps
 the backend's coverage check reads before the server starts: the step grid's
 is `step_grid_plan.coverage`, over the bundle `step_grid.load` loads under the
-config ATOM's arguments resolve. An input whose DP rank's engine file (a
+config ATOM's arguments resolve on the machine spec's device arch (`_config`).
+An input whose DP rank's engine file (a
 record's `steps/dp<r>.engine.json`, a population's `engine` member) states
 another `SHAPING` field than that config refuses first, naming each field and
 both values. The check refuses no step: it counts those the grid extrapolates
@@ -213,18 +214,19 @@ def measured(record, atom_args, ranks: int) -> list[float]:
 def check(inputs, run: dict, atom_args) -> dict:
     """The coverage of the steps `inputs` hold by the step grid or the op
     graph's price list the run file `run` names, loaded under the config
-    `atom_args` resolve; an input that ran under other `SHAPING` fields
-    refuses."""
+    `atom_args` resolve on its machine's device arch; an input that ran under
+    other `SHAPING` fields refuses."""
     if run.get(OP_GRAPH) and PRICE_LIST not in run:
         raise ValueError(
             "--coverage: the store holds no price_list at this run's key, so "
             "the op graph prices every leaf by its roofline and no step is "
             "covered; compass fit ops publishes one"
         )
-    store, config = ArtifactStore(run["store"]), _config(atom_args)
+    machine = compass_run._machine(run)
+    store = ArtifactStore(run["store"])
+    config = _config(atom_args, machine.value("device.arch"))
     here = step_grid.keyed(config) | {name: getattr(config, name) for name in BOUNDS}
     steps = [s for name in inputs for s in _steps(name, store, here, config.enable_tbo)]
-    machine = compass_run._machine(run)
     if run.get(OP_GRAPH):
         # ATOM's MoE shards no experts without expert parallelism.
         ep = _ep_width(atom_args, machine) if config.enable_expert_parallel else 1
@@ -355,11 +357,33 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
     ]
 
 
-def _config(atom_args):
-    """ATOM's `Config` for a server's arguments, as the server runs it."""
+def _config(atom_args, arch: str | None = None):
+    """ATOM's `Config` for a server's arguments, as the server runs it; with
+    `arch`, as it runs on a device of that arch (`_declared`)."""
+    if arch is not None:
+        from transformers.dynamic_module_utils import init_hf_modules
+
+        from atom.compass.bench.ops import _child
+
+        # A model's remote code loads in the child, which writes it to
+        # transformers' module cache; its config classes load here from there.
+        init_hf_modules()
+        return _child(_declared, atom_args, arch)
     from atom.compass.bench.measure import atom_config
 
     return atom_config(atom_args, server=True)
+
+
+def _declared(atom_args, arch: str):
+    """`_config` of `atom_args` in a process that declares a device of `arch`
+    before aiter loads: aiter resolves its fp8 dtype at import from the device
+    it finds, ``uint8`` where it finds none, and ATOM's quantization config
+    holds that dtype, which its hash keys."""
+    from atom.compass.capture import driverless
+
+    with tempfile.TemporaryDirectory(prefix="compass-run-config-") as tmpdir:
+        driverless.install(tmpdir, arch)
+        return _config(atom_args)
 
 
 def write_grading(out, report, side=None) -> None:

@@ -6,7 +6,8 @@ run builds. This records them where both runs can be read the same way, at the
 model runner's `forward`: one JSON line per call, built before the call runs,
 because a real forward rewrites some batch fields in place. Each line carries
 the batch as the `BatchView` a simulated runner prices it from (`rows`, `rung`,
-and above DP width 1 `moe_rows` and `moe_tokens`, with an MTP drafter `draft_moe_rows` too, `draft_bs` where its later passes pad, `draft_rows` where they run at its rows, `target_bs` where its target pads, on a split step `tbo_tokens`); a
+and above DP width 1 `moe_rows` and `moe_tokens`, with an MTP drafter `draft_moe_rows` too, `draft_bs` where its later passes pad, `draft_rows` where they run at its rows, `target_bs` where its target pads, on a split step `tbo_tokens`, and
+`group_needs_eager`, true, on a step an attention backend refuses a graph for); a
 real runner settles that view from the `ForwardMode` its own forward settled,
 so recording adds no DP collective. Its line also carries `t_enter_ns` and `t_exit_ns`, the worker's
 monotonic clock around its forward, and is finished once the forward returns.
@@ -22,7 +23,11 @@ recorded at the forward's exit (`d_target_ns` to one recorded just after
 pass before it, or on a forward that samples nothing, to the start of its first
 drafter pass, that one or `propose_draft_token_ids`); `d_draft_kv_ns` and
 `d_propose_ns` time those two drafter passes, each between device events at its
-entry and exit, on a forward that runs it; and `d_gap_ns`, from the previous forward's
+entry and exit, on a forward that runs it; under an EAGLE3 drafter
+`d_draft_passes_ns` times each draft forward `propose_draft_token_ids` runs, one
+a pass, from a device event where the drafter points its context at that pass
+(`_publish_draft_shape`) to the next one's, the last to the propose's exit;
+and `d_gap_ns`, from the previous forward's
 exit event to this launch's entry event, absent on the first line; summed in
 order they lay every forward on one device timeline. A later pipeline stage's
 receive of its input is `t_pp_recv_ns`, its device part `d_recv_ns`; an idle
@@ -65,7 +70,10 @@ received, or a RapidServe engine's) has no digest: its first step names it,
 its request id its key, so its response id still follows it. A 1P1D
 deployment's two records join on prefill's request id (`transfers`).
 Prefix caching is not covered: the worker never sees a cached prefix, so parity
-runs need caching off or the same cache hits in both runs. Requests of one
+runs need caching off or the same cache hits in both runs. Nor is an lmcache
+offload load: a prefill window that starts where the last load handed for its
+request ended, and the request's last window ended where that load began, is
+digested on from there, the loaded tokens left out as a cached prefix's are. Requests of one
 record with one prompt are named in the order their final chunks are scheduled:
 the first by the digest, the n-th after it by `<digest>.<n>`. A run that
 schedules them in the other order names them the other way round, and `compare`
@@ -82,13 +90,13 @@ import os
 import pathlib
 import sys
 import time
-from itertools import zip_longest
+from itertools import pairwise, zip_longest
 
 import numpy as np
 
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.launch_features import GRAPHS, architecture, provider
-from atom.compass.backends.step_labels import join_stamps
+from atom.compass.backends.step_labels import DRAFT_PASSES, join_stamps
 
 ENV = "ATOM_COMPASS_PARITY_RECORD"
 #: The file in a real run's record directory holding when its workload was sent
@@ -118,6 +126,7 @@ TIMESTAMPS = (
     "d_recv_ns",
     "d_draft_kv_ns",
     "d_propose_ns",
+    DRAFT_PASSES,
     "t_pull_ns",
     "t_put_ns",
     "blocked_ns",
@@ -157,6 +166,8 @@ class StepRecord:
         self.pending: collections.deque[tuple] = collections.deque()
         # Offload decisions handed to the worker, not yet on a line.
         self.kv: list[tuple] = []
+        # Request id -> (start, end) of the last offload load handed for it.
+        self.loaded: dict[int, tuple[int, int]] = {}
 
     def note_kv(self, meta) -> None:
         """Keep each lmcache offload load and save `meta` hands the worker:
@@ -164,9 +175,9 @@ class StepRecord:
         ``[request id, "save", tokens already saved, tokens computed]``."""
         for req in getattr(meta, "requests", ()):
             if (ls := req.load_spec) is not None:
-                self.kv.append(
-                    (req.req_id, "load", ls.hbm_cached_tokens, ls.lmcache_cached_tokens)
-                )
+                span = (ls.hbm_cached_tokens, ls.lmcache_cached_tokens)
+                self.kv.append((req.req_id, "load", *span))
+                self.loaded[req.req_id] = span
             if (ss := req.save_spec) is not None:
                 self.kv.append(
                     (req.req_id, "save", ss.skip_leading_tokens, len(req.token_ids))
@@ -180,7 +191,7 @@ class StepRecord:
         (query tokens, context tokens, decode), `rung`, the graph width the
         step replays or None, and `moe_rows`, the rows the DP group's MoE
         gather carries, absent at DP width 1, and `draft_moe_rows`, `draft_bs`, `draft_rows`, `target_bs`, `moe_tokens` and `tbo_tokens`, each where the
-        view has it. The view's mode is the one `forward` settled, stamped by
+        view has it, and `group_needs_eager` where it is true. The view's mode is the one `forward` settled, stamped by
         `run_model` under `forward_mode`; without one it is `forward_mode`'s,
         which runs the DP collective itself. Each prefill window is added to its request's
         digest; the line holding a request's final chunk names it under
@@ -230,6 +241,11 @@ class StepRecord:
                 digest, end = self.prompts.pop(
                     req_id, (hashlib.blake2b(digest_size=8), start)
                 )
+                # A load filled [end, start) from the offload tier.
+                span = self.loaded.get(req_id)
+                if span is not None and span[0] <= end < start <= span[1]:
+                    end = start
+                    del self.loaded[req_id]
                 # A forward the scheduler backed off below where the prefill
                 # resumed recomputes the rows between: digested once already.
                 replay = batch.replaying.get(i)
@@ -292,6 +308,8 @@ class StepRecord:
         ):
             if getattr(view, field) is not None:
                 line[field] = getattr(view, field)
+        if view.group_needs_eager:
+            line["group_needs_eager"] = True
         self.pending.append((line, window))
         self.flush()
         if forward is None:  # a simulated step: priced, not timed
@@ -530,6 +548,12 @@ class StepRecording:
             self.drafter.compute_draft_kv = functools.partial(
                 self._draft_pass, "d_draft_kv_ns", draft_kv
             )
+            spec = getattr(self.drafter, "speculative_config", None)
+            publish = getattr(self.drafter, "_publish_draft_shape", None)
+            if publish is not None and getattr(spec, "method", None) == "eagle3":
+                self.drafter._publish_draft_shape = functools.partial(
+                    self._serial_pass, publish
+                )
         self._recording = True
 
     def forward(self, batch):
@@ -601,6 +625,13 @@ class StepRecording:
         self._stamps[key] = [start, self.device_event()]
         return reply
 
+    def _serial_pass(self, call, *args, **kwargs):
+        """`call`, an EAGLE3 drafter pointing its context at its next pass,
+        after a device event where that pass starts."""
+        if getattr(self, "_parity_record", None) is not None:
+            self._stamps.setdefault("pass_events", []).append(self.device_event())
+        return call(*args, **kwargs)
+
     def propose_draft_token_ids(self, *args, **kwargs):
         call = super().propose_draft_token_ids
         return self._draft_pass("d_propose_ns", call, *args, **kwargs)
@@ -631,9 +662,13 @@ class StepRecording:
         names = {"d_target_ns": "target_event", "d_recv_ns": "recv_event"}
         marks = {k: [stamps.pop(e)] for k, e in names.items() if e in stamps}
         first = stamps.pop("draft_event", None)
+        starts = stamps.pop("pass_events", [])
         passes = {
             k: stamps.pop(k) for k in ("d_draft_kv_ns", "d_propose_ns") if k in stamps
         }
+        # Each draft pass runs to the next one's start, the last to the propose's exit.
+        propose = passes.get("d_propose_ns")
+        bounds = [*starts, propose[1]] if starts and propose else []
         if "d_target_ns" in marks and "d_draft_kv_ns" in passes:
             # It sampled after its draft-KV pass, the first drafter pass a
             # forward runs, and that pass is not the target's work.
@@ -646,7 +681,7 @@ class StepRecording:
                 marks[key] = [end, launch, start]
             done, previous = self.device_event(), self._last_exit
             self._last_exit = done
-            window = functools.partial(_window, previous, launch, done, marks)
+            window = functools.partial(_window, previous, launch, done, marks, bounds)
         return stamps, window
 
     def exit(self):
@@ -668,8 +703,9 @@ def _traced(name: str):
     return contextlib.nullcontext()
 
 
-def _window(previous, launch, done, marks, wait: bool):
-    """The device window's fields once `done` has completed, polled, else None."""
+def _window(previous, launch, done, marks, bounds, wait: bool):
+    """The device window's fields once `done` has completed, polled, else None;
+    with `bounds`, `DRAFT_PASSES`, the time between each two of them."""
     while not done.query():
         if not wait:
             return None
@@ -678,6 +714,10 @@ def _window(previous, launch, done, marks, wait: bool):
     for key, (event, *less) in marks.items():
         ms = launch.elapsed_time(event) - (less[0].elapsed_time(less[1]) if less else 0)
         fields[key] = round(ms * 1e6)
+    if bounds:
+        fields[DRAFT_PASSES] = [
+            round(a.elapsed_time(b) * 1e6) for a, b in pairwise(bounds)
+        ]
     if previous is not None:
         fields["d_gap_ns"] = round(previous.elapsed_time(launch) * 1e6)
     return fields

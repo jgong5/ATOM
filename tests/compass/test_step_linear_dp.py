@@ -155,29 +155,29 @@ def test_a_law_stating_key_refuses_by_name():
         StepLinearLaw(dict(law(), key=[8, 1]))
 
 
-@pytest.mark.parametrize("cap", [20, 7, 6])
-def test_the_fit_records_its_passes_and_a_cap_reached_refuses_it(
-    tmp_path, monkeypatch, cap
+@pytest.mark.parametrize(
+    "cap, start, count", [(20, "all_rows", 4), (6, "all_rows", 4), (3, "context", 1)]
+)
+def test_the_fit_records_its_passes_and_a_start_at_the_limit_still_competes(
+    tmp_path, monkeypatch, cap, start, count
 ):
     """Rung 4 settles in 4 passes from every rank's row, the start that goes
-    on; a start from a feature's axis takes 7, and its cap refuses the fit."""
+    on, and in 1 from the `context` axis at the same `F`; another feature's
+    axis takes 7. A start the limit stops competes on the `F` it reached and
+    loses: that axis's below 7 passes, every rank's row's below 4."""
     from atom.compass.backends import step_linear_fit
 
     monkeypatch.setattr(step_linear_fit, "FIT_PASSES", cap)
-    records = _records(tmp_path, _groups(0))
-    if cap < 7:
-        with pytest.raises(ValueError, match="still moved after 6 passes"):
-            _fit(records, dp=DP)
-        return
-    law_ = _fit(records, dp=DP)
+    law_ = _fit(_records(tmp_path, _groups(0)), dp=DP)
     assert law_["prefill"]["fit"]["passes"]["count"] == 1
     passes = law_["decode"]["4"]["fit"]["passes"]
     assert (passes["start"], passes["count"], passes["stop"]) == (
-        "all_rows",
-        4,
+        start,
+        count,
         "settled",
     )
     assert passes["F"] == pytest.approx(0.0, abs=1e-20)
+    assert law_["decode"]["4"]["coefficients"] == pytest.approx(DECODE, rel=1e-6)
 
 
 #: Two ranks' (context, graph_padding) in units of 800 tokens, six steps
@@ -262,12 +262,15 @@ def test_a_routed_rung_hulls_each_step_at_the_rank_it_prices(tmp_path):
     assert outside == []
 
 
-@pytest.mark.parametrize("cap", [20, 9, 8])
-def test_a_routed_rung_is_fitted_again_under_its_column(tmp_path, monkeypatch, cap):
+@pytest.mark.parametrize("cap, stop", [(20, "settled"), (9, "settled"), (8, "limit")])
+def test_a_routed_rung_is_fitted_again_under_its_column(
+    tmp_path, monkeypatch, cap, stop
+):
     """The experts column moves some steps' costliest rank off the row the
     rung's features alone pick, so the rung is fitted again under it, from
     every rank's row. Once no step moves, it is solved on the rows it
-    prices: the per-rank law. A cap reached refuses the fit."""
+    prices: the per-rank law, at the 9th pass. A limit one pass short ends
+    the fit there, its vector within a millionth of that law."""
     from atom.compass.backends import step_linear_fit
 
     monkeypatch.setattr(step_linear_fit, "FIT_PASSES", cap)
@@ -275,13 +278,9 @@ def test_a_routed_rung_is_fitted_again_under_its_column(tmp_path, monkeypatch, c
     sparse = _wide_or_tall(3, routed.SPARSE, (80_000, 100_000))
     records = routed._records(tmp_path / "full", full)
     records += routed._records(tmp_path / "sparse", sparse)
-    if cap < 9:
-        with pytest.raises(ValueError, match="still moved after 8 passes"):
-            routed._routed(records)
-        return
     vector = routed._routed(records)[0]["decode"][str(routed.RUNG)]
     passes = vector["fit"]["passes"]
-    assert (passes["count"], passes["stop"]) == (9, "settled")
+    assert (passes["count"], passes["stop"]) == (min(cap, 9), stop)
     assert vector["coefficients"] == pytest.approx(WIDE_OR_TALL, rel=1e-6)
 
 

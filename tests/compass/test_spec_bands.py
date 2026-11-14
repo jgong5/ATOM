@@ -30,7 +30,7 @@ def test_a_band_is_two_ends_the_low_one_first(band):
 
 def test_only_a_probed_field_states_a_band():
     document = saved(merge(three_origins()).document)
-    assumed = document["provenance"]["origins"]["interconnect.router_relay_s"]
+    assumed = document["provenance"]["origins"]["interconnect.inter_node.derate"]
     assumed |= {"p10": 1e-3, "p90": 2e-3}
     with pytest.raises(SpecRefusal, match="only kind with a subject"):
         MachineSpec.from_mapping(document)

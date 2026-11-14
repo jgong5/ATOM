@@ -168,9 +168,9 @@ serve() {
             dp=(--data-parallel-size "$TREES" --data-parallel-size-local 1
                 --data-parallel-rank "$k" --data-parallel-base-port "$base")
         fi
-        # shellcheck disable=SC2086 # SERVER_ARGS is a word list
+        # shellcheck disable=SC2086 # SERVER_ARGS and on_arch, the sim side's, are word lists
         env ATOM_DP_MASTER_PORT="$master" ATOM_COMPASS_PARITY_RECORD="$OUT/$side/record" \
-            "${devices[@]}" setsid python3 -m atom.entrypoints.openai.api_server \
+            "${devices[@]}" setsid python3 ${on_arch-} -m atom.entrypoints.openai.api_server \
             --model "$MODEL" --host 127.0.0.1 --server-port "$port" \
             --port "$(compass_held_port)" -tp "$TP" $PPA $DPA "${dp[@]}" $SERVER_ARGS "$@" \
             >"$log" 2>&1 &
@@ -265,6 +265,7 @@ if ((TREES > 1)); then
         sleep 0.2
     done
 fi
+on_arch=$(compass_on_arch "$RUN")
 serve sim --compass-run "$RUN" "${CLOCK[@]}"
 ATOM_COMPASS_RUN=$RUN python3 -m atom.compass.parity.traffic "$PORT" "$MODEL" \
     "$OUT/real/record" >"$OUT/sim/traffic.log" 2>&1 || sim_rc=$?

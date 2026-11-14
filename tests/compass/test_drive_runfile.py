@@ -41,7 +41,6 @@ from atom.compass.artifacts import (
     GateState,
     Key,
     Kind,
-    Topology,
     keyed_platform,
     member_name,
 )
@@ -55,7 +54,7 @@ from atom.compass.detect import scenario
 from atom.compass.detect.determinism import CONFIGURATION_PREFIX
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import runfile, serve
-from atom.compass.fit.publish import RANK
+from atom.compass.fit.publish import ranks
 from atom.compass.run.step_grid import keyed
 from atom.compass.spec import SpecRefusal
 from atom.compass.validate import runs
@@ -65,16 +64,20 @@ REPORT = {"provenance": [{"source": "record", "run": "r1", "traces": ["trace-a"]
 
 
 def published(tmp_path, r, kind, key, params, report=REPORT):
-    """`params` and `report` handed off at `key` as `fit` hands them off."""
+    """`params` and `report` handed off at `key` as `fit` hands them off, at
+    each rank of the layout `key` states."""
+    key = Key.of(kind, **key)
+    at = ranks(key)
     return ArtifactStore(tmp_path / "store").publish(
-        Key.of(kind, **key),
+        key,
         provenance=STANZA,
-        topology=Topology(),
+        topology=at[0].topology,
         conditions=readings(r),
         gates=GateState.of(),
         members={
-            member_name(stem, RANK, "json"): json.dumps(body).encode()
+            member_name(stem, rank, "json"): json.dumps(body).encode()
             for stem, body in {"params": params, "report": report}.items()
+            for rank in at
         },
     )
 
@@ -488,7 +491,8 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
 
     assert "data_parallel_size" not in run
     assert compass_run._widths(run) == (2, 1)
-    assert run["router_s"] == runfile.ROUTER_RELAY_S
+    # No host laws state the router's hop: it takes the floor.
+    assert run["router_s"] is None
     assert run["kv_link"] == "inter_node"
     table = compass_run.channel_table(run)
     lps = {lp.name for lp in table.registry.ids()}
@@ -496,7 +500,7 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
     write = [f"engine-D->engine-P:kv_write_req#dp0.dp{p}" for p in (0, 1)]
     assert [table.lookahead(c) for c in write] == [compass_run.HOP_FLOOR_S] * 2
     relay = table.lookahead("frontend-P->frontend-D:relay")
-    assert relay == run["router_s"]
+    assert relay == compass_run.HOP_FLOOR_S
 
 
 def price_list_key(tmp_path, **layout):
@@ -550,6 +554,22 @@ def test_op_graph_with_no_price_list_at_its_key_installs_analytically(
     stated = json.dumps({"op_graph": True}).encode()
     digest = "sha256:" + hashlib.sha256(stated).hexdigest()
     assert run["backend"] == {"digest": digest, "provenance": None}
+
+
+@pytest.mark.parametrize("layout", [["-tp", "8"], ["-tp", "4", "-dp", "2"]])
+def test_a_dp_attention_op_graph_names_the_price_list_at_the_layout_its_ranks_run(
+    tmp_path, layout
+):
+    # `fit ops` publishes at the layout `CoreManager` runs, each TP rank a DP
+    # rank of TP 1: eight DP ranks of TP 1 for either layout.
+    r = deployment(tmp_path)
+    key = price_list_key(tmp_path, dp=8, enable_dp_attention=True)
+    entry = published(tmp_path, r, Kind.PRICE_LIST, key, FLAT.params)
+
+    run = build(tmp_path, "--op-graph", atom=[*layout, "--enable-dp-attention"])
+
+    assert run["price_list"] == key
+    assert run["backend"]["digest"] == entry.digest
 
 
 def test_a_prefill_decode_op_graph_whose_sides_name_two_price_lists_refuses(

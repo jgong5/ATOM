@@ -13,6 +13,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import types
 
 import torch
@@ -343,6 +344,35 @@ def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None, warp=None) ->
             raise RuntimeError(f"a device-free capture has no Triton driver: {name}")
 
     triton.runtime.driver.set_active(_DeclaredTarget())
+
+
+def import_aiter_on(arch: str) -> None:
+    """Import aiter in this process as on a device of `arch`, whatever device
+    this host has. aiter resolves its fp8 dtype at import, ``uint8`` where no
+    device is available, and caches each arch probe's first answer; those
+    answers stay, as does Triton's target (`_declare_arch`). The device query
+    and the environment are put back, so a process this one starts finds this
+    host's own."""
+    if arch not in DEVICES:
+        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
+    if "aiter" in sys.modules:
+        raise RuntimeError("aiter is loaded already, its fp8 dtype resolved")
+    environ = {name: os.environ.get(name) for name in ("PATH", "GPU_ARCHS")}
+    available, torch.cuda.is_available = torch.cuda.is_available, lambda: True
+    try:
+        with tempfile.TemporaryDirectory(prefix="compass-arch-") as tmpdir:
+            _declare_arch(tmpdir, arch)
+            from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+            from aiter.utility import dtypes  # noqa: F401  its fp8 resolves here
+
+            get_gfx(), get_gfx_runtime()
+    finally:
+        torch.cuda.is_available = available
+        for name, value in environ.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def group(tp: int, dp: int) -> dict:

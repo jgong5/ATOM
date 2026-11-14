@@ -70,6 +70,18 @@ PINNED = {
     "aiperf.timing.strategies.agentic_replay:AgenticReplayStrategy._cancel_system_idle_watchdog": "272b852cce3db18c82e8a85d01588bb280ad9633fa0e88b68f180fc9fef53160",
     "aiperf.timing.phase.runner:PhaseRunner._wait_for_event_with_timeout": "02074d907a91cc440a678e5e8648f17d9a89c8cdad83f80e683204de8867c55b",
     "aiperf.timing.phase.runner:PhaseRunner._wait_for_returning_complete": "4e130c806fdb0a7ef884284602eecd2aba15ffef4ad8cc0cb479b73db04b4a12",
+    # The accelerated warmup's drain ClockPhaseRunner moves onto the clock, and
+    # the handoff that waits on it.
+    "aiperf.timing.phase.runner:PhaseRunner._wait_for_accelerated_warmup_wire_drain": "89b02fa3f70bf569ed244bf8585c148f4574eb8f978f8b34cfcfd422ba92098a",
+    "aiperf.timing.phase.runner:PhaseRunner._wait_for_accelerated_warmup_handoff": "c15f372abf4b000bed18051148c7dc5e23741fde65ebf376511ce63150e541cd",
+    # The per-trace idle cap ClockReplayBarrierCoordinator moves onto the clock:
+    # the arming it overrides, the cap its timer runs, and every cancel of that
+    # timer.
+    "aiperf.timing.replay_dependencies:ReplayBarrierCoordinator._arm_root_idle_watchdog": "2974a3589c40ec330014e15780b5993d7fbde899d62f1228f270a647ffbe8399",
+    "aiperf.timing.replay_dependencies:ReplayBarrierCoordinator._enforce_root_idle_cap": "b269ac2d805f8b5349999bc7484b21840bafe782f294b6229082c6c3b71af862",
+    "aiperf.timing.replay_dependencies:ReplayBarrierCoordinator.observe_issued": "91b831cb2bbf44ba560ad5e1c3501aa753fb8c88117e5d5d27419bcd85924d84",
+    "aiperf.timing.replay_dependencies:ReplayBarrierCoordinator.close_root": "d49f0c9c27140f381a6dfd3f1a4835e445b913fcf7caa11646ce150132be4b30",
+    "aiperf.timing.replay_dependencies:ReplayBarrierCoordinator.cancel_pending": "c8cebac957f4a7ef679c8509f8b16144f9aea7c9c717ff113f0f025d452e1921",
     "aiperf.timing.phase_orchestrator:PhaseOrchestrator._execute_phases": "7181bf33a2d4e6c440c2291390feb96a8c31f76bab258e9a3df633006f125abd",
     "aiperf.cli_runner:_make_benchmark_run": "f804f11878e985466855f13604390f7b68143da9f8fccb9f22255d67b884f1cc",
 }
