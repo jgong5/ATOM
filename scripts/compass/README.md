@@ -885,11 +885,13 @@ Its other vectors and its host laws are the ones fitted on the lone cells alone,
 its `sources` names the records each came from. The prefill law's rung-2 vector is the
 decode law's, stating `declared`, since the prefill law's own fit left rung 2 unfitted
 ([#2660](https://github.com/jgong5/ATOM/issues/2660)). Its prefill vector is refitted
-in the `cached_seqs` form on the lone prefill cells and on the prefill side of one 1P1D
-`deploy.sh record` cell, #975's cell at c=1 over traces 256 to 392, seed 20260707
-([#2853](https://github.com/jgong5/ATOM/issues/2853)); its other vectors but rung 2, and its
-host laws, are the lone cells' fit. The pair's lone cells ran the fp4 indexer and its 1P1D
-cells the fp8 one. Each law is keyed to the fp8 a P/D side resolves, without a refit: it
+in the `cached_seqs` form on records that ran the fp8 indexer alone: the prefill sides of
+#975's 1P1D cell, at c=1 over traces 256 to 392 and 0 to 255, seed 20260707
+([#2853](https://github.com/jgong5/ATOM/issues/2853)), and of #975's own rounds at c=1 to
+256, and two lone prefill cells at c=64 that ran fp8
+([#3073](https://github.com/jgong5/ATOM/issues/3073), [#3402](https://github.com/jgong5/ATOM/issues/3402));
+its other vectors but rung 2, and its host laws, are the lone cells' fit. The pair's lone
+cells ran the fp4 indexer and its 1P1D cells the fp8 one. Each law is keyed to the fp8 a P/D side resolves, without a refit: it
 states no `index_cache_dtype`, which then reads as `kv_cache_dtype`'s fp8, so a server that
 resolves fp4 refuses it. Its provenance states the gap that interleaved fp8 and fp4 lone cells
 measured ([#3073](https://github.com/jgong5/ATOM/issues/3073#issuecomment-6757202887)).

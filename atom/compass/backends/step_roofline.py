@@ -22,7 +22,8 @@ real rows among those the data-parallel group's gather carries (`moe_rows`,
 `moe_tokens`), on one rank on the step's own tokens, and under expert
 parallelism on the busiest rank's expected share of them (`routing_rows`):
 a pad row, a gather's or a graph's, routes to no expert, and one rank's
-takes no shared expert either.
+takes no shared expert either. MoRI's exchange sends a rank's own real
+tokens: a graph's pad row, routed to no expert, goes to no rank.
 
 A prefill that replays its decoder runs a module with a `replay` on each
 request that finishes its prompt, on its last `replay` rows, which attend
@@ -325,8 +326,9 @@ def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     On one data-parallel rank the output is all-reduced over the module's
     `ranks`, 1 where its block leaves that to the next norm. Over a group, the
     hidden states and router logits are gathered and the output scattered
-    back; under expert parallelism MoRI sends each of this rank's tokens once
-    to every rank holding one of its experts, and back.
+    back; under expert parallelism MoRI sends each of this rank's real tokens
+    once to every rank holding one of its experts, and back: a pad row routes
+    to no expert, so it goes to no rank.
     """
     experts, local, k, inter, hidden, ranks, dp, _, held = m.dims[:9]
     shared = m.dims[9] if len(m.dims) > 9 else 0
@@ -352,7 +354,8 @@ def _moe(m: Module, view: BatchView, tokens: int) -> tuple[Work, Work, Work]:
     if local == experts:
         gather = allgather(dp, rows * (hidden + experts) * act)
         return gather, work, reduce_scatter(dp, rows * hidden * act)
-    sent = tokens * hidden * ranks * (1 - comb(experts - local, k) / comb(experts, k))
+    own = sum_tokens(view.requests)
+    sent = own * hidden * ranks * (1 - comb(experts - local, k) / comb(experts, k))
     dispatch = all_to_all(ranks, sent * ELEMENT_BYTES[m.wire[0]])
     return dispatch, work, all_to_all(ranks, sent * ELEMENT_BYTES[m.wire[1]])
 
