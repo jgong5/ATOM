@@ -140,6 +140,12 @@ V41_SCORERS = (
     ),
     "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
 )
+#: DeepSeek-V4.1's top-k, as aiter's decode top-k launches it: FlyDSL's
+#: one-block kernel, or its HIP kernel on logits narrower than k.
+V41_TOPKS = (
+    "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
+    "aiter._top_k_per_row_decode.default",
+)
 #: DeepSeek-V4.1's RoPE, which its index keys take at their ratio's compress
 #: plan's positions: with no drafter both ratios' plans hold as many rows.
 V41_ROPE = "aiter.rope_cached_positions_fwd_impl.default"
@@ -1318,7 +1324,8 @@ def _v41(recorder, hf):
     chose its candidates, else None: read off the layer `layer_name` names
     and the model's config `hf`. Its index keys' RoPE (`V41_ROPE`) states
     their indexer's `compress_ratio`; its query's, on the step's positions
-    at every ratio, states none.
+    at every ratio, states none. Its top-k (`V41_TOPKS`) states the scorers'
+    `compress_ratio`.
     """
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.models.deepseek_v41.attention import Indexer
@@ -1337,6 +1344,7 @@ def _v41(recorder, hf):
         stated = {
             V41_ATTENTION: (*geometry, ("index_topk", top)),
             **dict.fromkeys(V41_SCORERS, scored),
+            **dict.fromkeys(V41_TOPKS, scored[:1]),
         }
         with patch.object(recorder, "stated", stated):
             return attend(hidden, layer_name, *args, **kwargs)
