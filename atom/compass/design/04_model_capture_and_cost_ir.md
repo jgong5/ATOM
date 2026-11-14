@@ -1082,7 +1082,9 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   a row a request, so the leaf's shape cannot tell them apart
   ([#3141](https://github.com/jgong5/ATOM/issues/3141)). The indexer query's RoPE, on
   the step's positions at every ratio, states none. In a graph captured before,
-  `measure ops` takes a key's ratio from the compress leaf whose plan holds as many rows.
+  `measure ops` takes a key's ratio from the one ratio's compress plan in its point
+  that holds as many rows; where none or both do, it refuses the key by name until its
+  shape is traced again ([#3235](https://github.com/jgong5/ATOM/issues/3235)).
 
 Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers,
 DeepSeek-V4's attention and V4.1's guarded ops aside, below), so its ambient reads stay
