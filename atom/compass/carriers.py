@@ -16,6 +16,9 @@ whose body names the cancelled request's seq: ``{"compass_cancel": <seq>}``.
 A router hands a cancel on along the request's path; on a relay it carries
 its own stamp in the body, after the seq:
 ``{"compass_cancel": <seq>, "kv_transfer_params": {"compass": "a:<arrival>;s:<seq>"}}``.
+
+A client's own records carry simulated time as aiperf's ns stamps, each the
+simulated seconds in ns plus `EPOCH_NS`.
 """
 
 import re
@@ -23,12 +26,13 @@ from typing import Any
 
 import msgspec
 
-from atom.utils.clock import channel_of
-
 _NUM = r"(inf|\d[\d.e+-]*)"
 _ENTRY = re.compile(rf"a:{_NUM};s:(\d+)")
 _COMMENT = re.compile(rf": compass a={_NUM} s=(\d+)")
 _MAX_ENTRIES = 32
+#: Added to every simulated ns stamp a client records. Simulated time starts at
+#: 0, and aiperf reads a 0 start stamp as missing.
+EPOCH_NS = 10**9
 
 
 def _parse(pattern: re.Pattern, text: str, what: str) -> tuple[float, int]:
@@ -77,6 +81,10 @@ def stamp_events(text: str, rt) -> str:
     A write must end its last frame in a blank line: text after it is refused,
     since the next write's comment would land inside that frame.
     """
+    # Here, not at the top: the harness reads EPOCH_NS while aiperf imports its
+    # phase runner, and `atom.utils` would load torch there.
+    from atom.utils.clock import channel_of
+
     ch = channel_of(rt, "stream")
     *events, tail = text.split("\n\n")
     if tail:

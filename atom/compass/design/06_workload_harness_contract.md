@@ -8,6 +8,11 @@ written against it yet; implementation follows the execution plan in `16`.
 the K1-K9 mechanisms), `05_machine_spec_and_probes.md` D25 (the host laws' tokenizer and HTTP intake
 terms the service model reads).
 
+**Revised 2026-11-12 by the owner's ruling on
+[#3257](https://github.com/jgong5/ATOM/issues/3257):** the M3-Agentic stage's real and
+simulated runs take InferenceX's `agentx` client defaults, the per-trace idle cap paced on
+the Compass clock (D35.1).
+
 **Scope.** How traffic reaches a simulated ATOM: the contract any harness must satisfy,
 the wire protocol, the per-harness adapter, and the serving-side costs the harness makes
 visible. Acceptance requires paired simulated and real execution of cc-traces proper, so
@@ -1048,6 +1053,51 @@ requires genuine fan-out in every root is not constructible without reusing sess
 
 ---
 
+## D35.1. The M3-Agentic client: InferenceX's `agentx` scenario on both sides
+
+Owner ruling on [#3257](https://github.com/jgong5/ATOM/issues/3257), 2026-11-12, for the
+M3-Agentic stage (`16` D95.1).
+
+### Decision
+
+**A real and a simulated run take the same client: the defaults of agentx-harness's
+`agentx` scenario**, which InferenceX ran the submission under. 3600 s, seed 42, a
+trajectory start between 0.25 and 0.75, every cc-trace at full length rather than the
+corpus's 256k-capped copy, 10 warmup requests per lane with 1800 s grace, a per-trace
+idle cap of 300 s, a system idle cap of 10 s, server token counts, and the chat template
+applied. The trajectory start draws each
+lane's starting instant uniformly from that share of its trace's span, seeded by seed,
+trace and lane; warmup primes the conversation there and the profile resumes at the next
+turn (agentx-harness `timing/trajectory_source.py`).
+
+- **On the pinned revision, as flags.** The scenario
+  (`aiperf/common/scenario/inferencex_agentx_mvp.py::AGENTX`) arrived in
+  `agentx-v1.0.13`, after the `56a0cf70f` that D34 pins, and that release changes
+  functions Compass fingerprints. Each of its defaults is an option at `56a0cf70f`, so
+  `client.sh` passes them as flags on `inferencex-agentx-mvp`, as ATOM's nightly agentic
+  benchmark does (`.github/scripts/aiperf_agentic.sh`).
+- **The per-trace idle cap runs on the Compass clock**, by `ClockTimer`, as
+  `CompassAgenticReplay._arm_system_idle_watchdog` already runs the system cap; #3261
+  replaces the strategy's refusal of `trace_idle_gap_cap_seconds`. Both timers of T75 are
+  then on the clock.
+- **Warmup** requests are excluded by request id on both sides (D27).
+- **One option differs, and it sends nothing to the model:** aiperf's server-metrics
+  scrape, which `agentx` leaves on and InferenceX takes its hit rates from.
+  `CompassAgenticReplay` refuses it, since D34 leaves how the scrape's process reaches the
+  clock undesigned. A real run scrapes (#3332), the option outside the hashed arguments so
+  both sides hash alike; a simulated run's hit rates are its engines' own counters across
+  the client run, warmup included, as aiperf's real export reads them (`08` D45.1).
+
+### Open issues
+
+- ~~The warmup barrier's drain polls `asyncio.sleep` in aiperf's runner, outside the
+  `LoopScheduler` rebind.~~ Settled by #3261: with the poll on the wall clock, the traffic
+  LP granted the drain's 1800 s grace while the poll slept, so a simulated warmup ended
+  at its grace; `ClockPhaseRunner._wait_for_accelerated_warmup_wire_drain` polls on the
+  clock instead.
+
+---
+
 ## Decision log
 
 | # | Decision | Date |
@@ -1062,6 +1112,7 @@ requires genuine fan-out in every root is not constructible without reusing sess
 | D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. Revised: arrival rides the `compass` entry of `tracestate`, output times ride SSE comment lines, and the `/metrics` scrape is paced on simulated time. Revised 2026-10-02 (#533, #534): the scrape is a daemon deadline, and the run ends when no essential work is left. | 2026-09-18; revised 2026-09-28 and 2026-10-02 |
 | D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf`; an inline attempt does not raise to the operator, it de-registers the whole plugin and logs one `WARNING` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |
+| D35.1 | The M3-Agentic client, ruled by the owner: the `agentx` scenario's defaults on real and simulated runs alike (seed 42, trajectory start 0.25 to 0.75, every trace at full length, 10 warmup requests per lane with 1800 s grace, per-trace idle cap 300 s, system idle cap 10 s), passed as flags at the pinned revision; the per-trace idle cap on the Compass clock, settling T75. | 2026-11-12 (#3257) |
 
 ---
 

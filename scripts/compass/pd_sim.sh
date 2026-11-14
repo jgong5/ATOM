@@ -93,6 +93,7 @@ done
 read -r PREFILLS DECODES < <(python3 -c 'import json, sys
 run = json.load(open(sys.argv[1]))
 print(run.get("prefill_instances", 1), run.get("decode_instances", 1))' "$RUN_FILE")
+on_arch=$(compass_on_arch "$RUN_FILE")
 
 server() { # role port kv_role dp_port instance count [exec]
     # Above one server of a side each is named, and names itself, by its index.
@@ -103,8 +104,8 @@ server() { # role port kv_role dp_port instance count [exec]
     # timeout takes a grant, would differ between runs. Only the router closes.
     local extra=${DECODE_ARGS:-} vars=${DECODE_ENV:-}
     [[ $1 == prefill ]] && extra=${PREFILL_ARGS:-} vars=${PREFILL_ENV:-}
-    # shellcheck disable=SC2086 # DECODE_EXEC, the side's variables and the server flags are word lists
-    ${7:-} env "${passed[@]}" $vars ${ATOM_COMPASS_PARITY_RECORD:+"ATOM_COMPASS_PARITY_RECORD=$ATOM_COMPASS_PARITY_RECORD/$name"} python3 -m atom.entrypoints.openai_server \
+    # shellcheck disable=SC2086 # DECODE_EXEC, the side's variables, on_arch and the server flags are word lists
+    ${7:-} env "${passed[@]}" $vars ${ATOM_COMPASS_PARITY_RECORD:+"ATOM_COMPASS_PARITY_RECORD=$ATOM_COMPASS_PARITY_RECORD/$name"} python3 $on_arch -m atom.entrypoints.openai_server \
         --model "$MODEL" --host 127.0.0.1 --server-port "$2" --timeout-keep-alive 1000000 \
         --data-parallel-master-port "$4" \
         $SERVER_ARGS $extra \

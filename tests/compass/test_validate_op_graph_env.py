@@ -132,7 +132,7 @@ def test_each_side_reads_the_graphs_traced_under_the_variables_its_engine_file_s
         (sim / side / "run.json").write_text(json.dumps(run | {"run_file": run_file}))
     deployed = json.loads((sim / "run.json").read_text())
     (sim / "run.json").write_text(json.dumps(deployed | {"run_file": run_file}))
-    monkeypatch.setattr(drive_run, "_config", lambda args: config)
+    monkeypatch.setattr(drive_run, "_config", lambda args, arch: config)
     # The grading process holds neither side's variables.
     _variables(monkeypatch, {})
 
