@@ -53,6 +53,11 @@ MiniMax-M3 AgentX submission on MI355X and grades it point by point (D95.1).
 **Revised 2026-11-13 by [#3355](https://github.com/jgong5/ATOM/issues/3355):** *After v1*
 lists adoption (`19`) and the order its work runs in.
 
+**Revised 2026-11-14 by the owner's ruling on
+[#3423](https://github.com/jgong5/ATOM/issues/3423):** *Stage DSv41-DPEP* simulates the DP
+points of ATOM's DeepSeek-V4.1-Flash AgentX submission on MI355X and grades them as
+M3-Agentic does (D95.2).
+
 **Scope.** How the work is organised, allocated and gated; what happens first; and what
 each stage must produce. It is **detailed through M2**. Work after v1 is listed, not
 planned — see *After v1*. Phase 0b's answers can still reshape Waves 4–6, and the plan
@@ -193,6 +198,47 @@ stage is named for the model; it is not the retired milestone M3 of D95.
   [#3275](https://github.com/jgong5/ATOM/issues/3275)'s ruling. An indexer-CP arm's law
   waits on #3054's indexer-CP key, without which its runs would read a law fitted
   without indexer CP.
+
+---
+
+## D95.2. The DSv41-DPEP stage: DeepSeek-V4.1-Flash's DP points on MI355X
+
+Owner ruling of 2026-11-14 on [#3423](https://github.com/jgong5/ATOM/issues/3423), for the
+stage and its design ([#3424](https://github.com/jgong5/ATOM/issues/3424)). The stage is
+named for the model and the parallelism of its arms.
+
+- **Target.** Compass reproduces the DP points of ATOM's DeepSeek-V4.1-Flash AgentX
+  submission to InferenceX on MI355X, entry `dsv41flash-fp4-mi355x-atom-agentic-dspark`
+  as InferenceX run
+  [43180092301](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/43180092301)
+  ran it: DTP2 (DP attention, MoE over TP) at concurrency 64, and DEP2 (DP attention
+  with expert parallelism) at 128 and 256. #3423 holds their arguments and InferenceX's
+  values; this document does not copy them. The entry's nine plain-TP points stay with
+  [#3126](https://github.com/jgong5/ATOM/issues/3126).
+- **The real curve is this branch's ATOM**, as D95.1 rules for M3-Agentic. Its ATOM
+  base is ROCm/ATOM `e893780f4`, 120 commits behind the submission's `e5b74bc86`. Every
+  DP change the submission names is in the base; later ones change a DP point
+  (ROCm/ATOM#2456, ROCm/ATOM#2727, ROCm/ATOM#3106, ROCm/ATOM#3098 and
+  ROCm/ATOM#2912), so each registration states the gap
+  [#3425](https://github.com/jgong5/ATOM/issues/3425) measures.
+- **Platform and freeze as D95.1's:** gpu-40 on nightly 20261026, and the commit #3266
+  freezes, or this stage's first registration if it comes first.
+- **What Compass adds for it:** a V4.1 engine's DP routing and prefill scheduling checked
+  against a real record (`15` D90.1), MoE over TP and over EP2 keyed apart (`15` D92.1)
+  and DSpark5 under DP attention (`14` D87.2). The client, the overlap criterion and the
+  curves are M3-Agentic's (`06` D35.1, `08` D45.1).
+- **Keys.** ATOM serves V4.1 at a KV block of 128 whatever `--block-size` says
+  (`atom/config.py`, its `deepseek_v41_text` branch), so the submission's 16 changes no
+  key. Every point keeps ATOM's default `--max-num-seqs`; c=64 and c=128 share a capture
+  ladder and c=256 adds 256. Until [#3275](https://github.com/jgong5/ATOM/issues/3275) is
+  ruled, one step linear law and one `host_laws` entry each for DTP2 c=64, DEP2 c=128 and
+  DEP2 c=256, with memory readings per point; a ruling that admits a ladder prefix merges
+  DEP2's two.
+- **Two backends**, the step linear law and the step grid, each graded by `08` D45.1, as
+  #3256 rules for M3-Agentic: the submission's inputs reach 525k tokens at p95, past a
+  law's hull.
+- **Small case** at DTP2 c=16 and c=64. c=16 is not a submission point, but it keys as
+  c=64 does, so one law serves both.
 
 ---
 
@@ -813,6 +859,30 @@ coordination on gpu-40 and the work outside the stage that it waits on.
 | **MA.15** | Cell E, TP4 with indexer CP and LMCache ([#3271](https://github.com/jgong5/ATOM/issues/3271)) | `scripts/compass/` | ~10 | MA.10, MA.8, MA.7, #3054 |
 
 **Exit:** MA.11 to MA.15 closed, each with a chart that meets `08` D45.1 at every point.
+
+### Stage DSv41-DPEP — DeepSeek-V4.1-Flash's DP points on MI355X
+
+Tracked on [#3423](https://github.com/jgong5/ATOM/issues/3423) and ruled there on 2026-11-14
+(D95.2). Every issue carries `scale: agentic` and `M3`; #3423 holds the stage's
+coordination on gpu-40, which it shares with M3-Agentic, and the work outside the stage
+that it waits on.
+
+| ID | Task | Module | Effort | Depends on |
+|---|---|---|---|---|
+| **DPEP.1** | The design text ([#3424](https://github.com/jgong5/ATOM/issues/3424)) | design | 120–200 design text | — |
+| **DPEP.2** | DeepSeek-V4.1-Flash served on gpu-40 at DTP2 and DEP2 with the submission's arguments ([#3425](https://github.com/jgong5/ATOM/issues/3425)) | none, results on the issue | 0 | GPU queue |
+| **DPEP.3** | `compass run --check` lacking only the stage's own records ([#3426](https://github.com/jgong5/ATOM/issues/3426)) | none, results on the issue | 0 | — |
+| **DPEP.4** | The submission's session header, and each request's rank compared real against simulated (`15` D90.1; [#3427](https://github.com/jgong5/ATOM/issues/3427)) | `scripts/compass/` | 20–60 | DPEP.1 |
+| **DPEP.5** | A simulated V4.1 DP run's prefill scheduling against a real record (`15` D90.1; [#3428](https://github.com/jgong5/ATOM/issues/3428)) | `runner/` | 50–150 | DPEP.1 |
+| **DPEP.6** | DSpark5 at DTP2 and DEP2 recorded and priced on an MXFP8 pool (`14` D87.2, `15` D92.1; [#3429](https://github.com/jgong5/ATOM/issues/3429)) | `backends/`, `run/` | 100–250 | DPEP.1 |
+| **DPEP.7** | The step grid at DTP2 and DEP2, EP2 routing replayed ([#3430](https://github.com/jgong5/ATOM/issues/3430)) | `run/`, `backends/` | 50–150 | DPEP.1, #3285–#3287 |
+| **DPEP.8** | The small case, DTP2 at concurrency 16 and 64 for 600 s ([#3431](https://github.com/jgong5/ATOM/issues/3431)) | none, results on the issue | 0 | DPEP.2–DPEP.6 |
+| **DPEP.9** | Calibration: memory readings at each point, the DTP2 and DEP2 laws ([#3432](https://github.com/jgong5/ATOM/issues/3432)) | `scripts/compass/laws/` | ~10 | DPEP.8, #3275 |
+| **DPEP.10** | Cell A, DTP2 at 64 ([#3433](https://github.com/jgong5/ATOM/issues/3433)) | `scripts/compass/` | ~10 | DPEP.9, DPEP.7 |
+| **DPEP.11** | Cell B, DEP2 at 128 and 256 ([#3434](https://github.com/jgong5/ATOM/issues/3434)) | `scripts/compass/` | ~10 | DPEP.9, DPEP.7 |
+
+**Exit:** DPEP.10 and DPEP.11 closed, each with a chart that meets `08` D45.1 at every
+point on both backends.
 
 ---
 
