@@ -20,7 +20,7 @@ D80), `16` (D95.1), and the M3-Agentic stage's `03` D13.1, `06` D35.1 and `14` D
 | `13` D80: no command starts the client or takes a workload | `compass advice` does both | D109 |
 | `13` D80: a prefill or decode `run` refuses without `--join` | not under `--check`, which resolves the side as `deploy.sh` does | D109 |
 | `13` D80: what `run --check` lists | a step linear law's scheduled decode rungs with no vector, too | D112 |
-| `13` D80: what `run`, `record` and `deploy.sh` write | each writes its per-request split and `report.html` when its run ends | D114, D115 |
+| `13` D80: what `run`, `record` and `deploy.sh` leave | each run's per-request split and `report.html`, written as it ends by `client.sh --stop` for an instance and by `deploy.sh` for a deployment | D114, D115 |
 | `08` D50: the cell matrix | a MiniMax-M3 showcase set: the recommended configuration and the runner-up | D117 |
 
 ---
@@ -558,11 +558,14 @@ has run, and #3355 defers changing either.
   at the client, so they sum to its end-to-end latency within the clock's resolution. A
   real deployment's decode node's clock is joined to its client's, the bounds its
   forwards and first tokens set stated in the file. On a real run its TTFT, from the
-  send to the return of the forward whose output is its first token, matches aiperf's
-  within a tolerance measured first. A run the split cannot be made for gets the reason
-  in its file. Its format, `request_split.json`: each request aiperf finished as an
-  `atom-benchmark/v1` request record with its segments, that TTFT, its LMCache tokens
-  loaded and stored and its response id; every other request with why; the clock.
+  send to the return of the forward that hands its first token over, matches aiperf's
+  within a tolerance measured first; off a pipeline, the ATOM runner a client's tokens
+  come from hands an output-producing forward's tokens over at the return of its rank's
+  next one. A run the split cannot be made for gets the reason in its file, a
+  pipeline's among them. Its format, `request_split.json`: each request aiperf finished
+  as an `atom-benchmark/v1` request record with its segments, that TTFT, its LMCache
+  tokens loaded and stored and its response id; every other request with why; the
+  clock.
 - **The op-family split**, op level only: the prices per op kind a `compass run
   --op-graph` run holds per step (`op.<kind>` in `dp<r>.cost.jsonl`), summed per step
   phase into MoE, attention, dense GEMM, collectives, norms and elementwise, and other,

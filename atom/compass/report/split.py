@@ -18,29 +18,33 @@ to OUT/`FILE`, one JSON document, and no other file changes:
   - ``decode_s``, from there, an instance's from its prefill's end, to its
     end at the client.
   They sum to aiperf's ``e2el_s``. ``forward_ttft_s`` runs from its send
-  to the return of the forward that produced its first token, the decode
-  side's first or an instance's final prefill chunk's; aiperf's ``ttft_s``
-  adds the token's way out, which on a runner that defers its output holds its
-  rank's next forward. ``lmcache_load_tokens`` and
-  ``lmcache_store_tokens`` are the tokens the scheduler handed its worker to
-  load from LMCache and to store there.
+  to the return of the forward that hands its first token over: off a
+  pipeline, the runner a client's tokens come from hands an output-producing
+  forward's tokens over at the return of its rank's next one
+  (`tokenIDProcessor.is_deferred_out`), so the next after the decode side's
+  first forward holding it, or after an instance's final prefill chunk's.
+  aiperf's ``ttft_s`` adds the token's way out. ``lmcache_load_tokens`` and ``lmcache_store_tokens`` are the
+  tokens the scheduler handed its worker to load from LMCache and to store
+  there.
 - ``unsplit``: each other request aiperf recorded, by its ``request_id``, and why.
 - ``clock``: ``virtual`` for a simulated run; ``monotonic`` for a real one, the
   host clock its client shares with the server it reaches at 127.0.0.1. A real
   deployment's decode side on another node (`run.json`'s ``kv_link``
   ``inter_node``) is joined to it: ``decode_offset_s`` bounds what its times
   take to land on this clock, at least each request's prefill return less its
-  decode entry and at most its first token less its decode return; they take
-  the upper bound.
+  decode entry and at most its first token less its hand-over's return; they
+  take the upper bound.
 
 A real forward's entry and return are its step line's ``t_enter_ns`` and
 ``t_exit_ns``; a simulated one's are its cost line's ``t_s`` and that plus
 ``group_s``. A simulated client's stamps are `EPOCH_NS` past the virtual clock.
 A deployment's sides join through the decode side's `TRANSFERS`. In place of
 the split, ``refused`` says why there is none: a file it reads is missing or
-holds no step times, or a request's events are out of order, each of its send,
-its prefill's first entry and final return, its decode side's first entry and
-return, its first token and its end at least the one before.
+holds no step times, a side is a pipeline's, whose first tokens leave a stage
+whose forwards it does not read, or a request's events are out of order, each of
+its send, its prefill's first entry and final return, its decode side's first
+entry, its hand-over's return, its first token and its end at least the one
+before.
 """
 
 import collections
@@ -127,29 +131,42 @@ def _window(path: Path, step: dict, cost) -> tuple[float, float]:
 
 def _record(side: Path, simulated: bool, every: bool) -> tuple[dict, dict, dict]:
     """`side`'s step record, by (DP rank, request id): the entry of the first
-    forward holding each request, the response id and the forward that names
-    it, and its LMCache tokens loaded and stored. Unless `every`, only the
-    forwards naming a request are read."""
-    paths = sorted((side / STEPS).glob("dp*[0-9].jsonl"))
+    forward holding each request; the response id, the entry and return of the
+    forward that names it and, once one follows, the return of its rank's next
+    output-producing forward, which hands that one's tokens over; and its
+    LMCache tokens loaded and stored. Unless `every`, only the forwards naming
+    a request and those handing one over are read."""
+    steps = side / STEPS
+    if any(steps.glob("pp*.dp*.jsonl")):
+        raise ValueError(
+            f"{steps} is a pipeline's record, whose first tokens leave a stage "
+            "the split does not read"
+        )
+    paths = sorted(steps.glob("dp*[0-9].jsonl"))
     if not paths:
-        raise ValueError(f"{side / STEPS} holds no DP rank's step record")
+        raise ValueError(f"{steps} holds no DP rank's step record")
     first, named, lmcache = {}, {}, collections.defaultdict(lambda: [0, 0])
     for path in paths:
-        rank = int(path.stem[2:])
+        rank, waiting = int(path.stem[2:]), []
         with open(path, "rb") as lines:
             for line, cost in zip(lines, _costs(path, simulated)):
                 # A record line is `json.dumps`'s: one naming nobody holds this.
-                if not every and b'"named": []' in line:
+                if not (every or waiting) and b'"named": []' in line:
                     continue
                 step = json.loads(line.decode())
-                if not (step["batch"] or step.get("kv")):
+                if not (step["batch"] or step.get("kv") or waiting):
                     continue
                 enter, out = _window(path, step, cost)
+                if step["produces_output"]:
+                    for key in waiting:
+                        named[key] += (out,)
+                    waiting = []
                 for request, *_ in step["batch"]:
                     first.setdefault((rank, request), enter)
                 for request, _key, *name in step["named"]:
                     if name:
                         named[rank, request] = (name[0], enter, out)
+                        waiting.append((rank, request))
                 for request, kind, held, upto in step.get("kv", ()):
                     lmcache[rank, request][kind == "save"] += upto - held
     return first, named, lmcache
@@ -170,7 +187,7 @@ def split(run) -> dict:
             raise ValueError(f"{sides[1] / STEPS} holds no {TRANSFERS}")
         own = {name: key for key, name in transfers(sides[1] / STEPS).items()}
         _, decoded, _ = _record(sides[1], simulated, every=False)
-        decode = {name: (enter, out) for name, enter, out in decoded.values()}
+        decode = {name: forwards for name, *forwards in decoded.values()}
     events = {}
     for name, (record, (send, token, end)) in done.items():
         key = own.get(name)
@@ -178,19 +195,25 @@ def split(run) -> dict:
             unsplit[record["request_id"]] = "no step names it on every side"
             continue
         e = {"send": send, "prefill entry": first[key]}
-        e["prefill return"] = named[key][2]
+        e["prefill return"], forwards = named[key][2], named[key][1:]
         if len(sides) == 2:
-            e["decode entry"], e["decode return"] = decode[name]
-        events[name] = e | {"first token": token, "end": end}
+            forwards = decode[name]
+            e["decode entry"] = forwards[0]
+        if len(forwards) < 3:
+            unsplit[record["request_id"]] = (
+                "no later forward hands its first token over"
+            )
+            continue
+        events[name] = e | {"hand-over": forwards[2], "first token": token, "end": end}
     if not events:
         raise ValueError("no request aiperf finished is named by its step records")
     clock = {"clock": "virtual" if simulated else "monotonic"}
     if not simulated and meta.get("kv_link") == "inter_node":
         low = max(e["prefill return"] - e["decode entry"] for e in events.values())
-        high = min(e["first token"] - e["decode return"] for e in events.values())
+        high = min(e["first token"] - e["hand-over"] for e in events.values())
         for e in events.values():
             e["decode entry"] += high
-            e["decode return"] += high
+            e["hand-over"] += high
         clock["decode_offset_s"] = [low, high]
     requests = []
     for name, e in events.items():
@@ -210,7 +233,7 @@ def split(run) -> dict:
             record["kv_transfer_s"] = start - e["prefill return"]
         record |= {
             "decode_s": e["end"] - start,
-            "forward_ttft_s": e.get("decode return", e["prefill return"]) - e["send"],
+            "forward_ttft_s": e["hand-over"] - e["send"],
         }
         loaded, stored = lmcache.get(key, (0, 0))
         requests.append(
