@@ -3575,18 +3575,6 @@ def _shape(text: str):
     return shape._replace(width=n.get("W"), real=n.get("R"))
 
 
-def _abstract(value, n: int):
-    """`value` with every int equal to `n` replaced by ``"T"``."""
-    # ponytail: an unrelated int equal to n (a stride of 1 at T = 1) is
-    # abstracted too, so that shape's leaf joins another family and its
-    # points bracket nothing; symbolic slots in the contract would end it.
-    if isinstance(value, dict):
-        return {k: _abstract(v, n) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_abstract(v, n) for v in value]
-    return "T" if type(value) is int and value == n else value
-
-
 #: Leaf kinds that exchange rows between ranks (`exchange`).
 COLLECTIVES = (
     "atom.model_ops.moe:",
@@ -3634,18 +3622,21 @@ def _exchanged(fam: str) -> bool:
 def _family(shape, context, op: str, sig: str, dependent: dict):
     """The family a leaf's point belongs to, and where on its axis: a decode
     leaf at its width, and its rows' mean when they are ragged, over context;
-    a prefill leaf over its tokens, at its rows unless its kind's prefill
-    points show it does not move with them, and at its rows and cached tokens
-    when its kind depends on context, as its prefill points read it, else its
-    decode points, else by default, a shape that states G apart from one that
-    does not, as `fit ops` keeps them; a collective over its message bytes
-    (`exchange`)."""
+    a prefill leaf, its integers equal to T or one more and a kernel's
+    metadata sizes read as `fit ops` reads them (`fit.ops.prefill_leaf`), over
+    its tokens, at its rows unless its kind's prefill points show it does not
+    move with them, and at its rows and cached tokens when its kind depends on
+    context, as its prefill points read it, else its decode points, else by
+    default, a shape that states G apart from one that does not, as `fit ops`
+    keeps them; a collective over its message bytes (`exchange`)."""
     if op.startswith(COLLECTIVES):
         return tuple(exchange(json.loads(sig)))
     if shape.phase == "decode":
         context, mean = _split(context)
         return json.dumps([str(shape), sig] + ([mean] if mean else [])), context
-    leaf = _abstract(json.loads(sig), shape.tokens)
+    from atom.compass.fit.ops import prefill_leaf
+
+    leaf = prefill_leaf(json.loads(sig), shape.tokens)[0]
     head = "prefill" if shape.gathered is None else "prefill G"
     if not dependent.get(("prefill", op), dependent.get(op, True)):
         rows = shape.seqs if dependent.get(("rows", op), True) else None
