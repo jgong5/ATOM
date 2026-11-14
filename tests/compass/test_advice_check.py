@@ -13,13 +13,14 @@ under ``STUB_STALL``, never answers.
 
 import itertools
 import json
+import shlex
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import platforms
 import pytest
-from test_advice_reuse import COVERED, law, law_file
+from test_advice_reuse import COVERED, law, law_file, past
 from test_memory_readings import publish_readings
 from test_run_lacking import served
 from test_run_step_grid import DOCUMENT, deployment
@@ -206,6 +207,19 @@ def test_each_candidate_gets_one_state_and_each_point_missing_readings_its_comma
     assert f"1 points searchable, each state in {out / check.STATES}\n" in printed
 
 
+def test_a_refusal_at_one_point_outranks_another_point_s_missing_law(tmp_path, stubbed):
+    # Past the gate on records at the head: c1, whose ladder the law covers,
+    # is refused; c4, whose bound of 32 passes the ladder, lacks the eager rung.
+    law_file(tmp_path, past(stubbed)[0])
+
+    found = advise(tmp_path, {"a": {"per_concurrency": {"--max-num-seqs": 8}}})
+
+    (why,) = found["a"]["why"]
+    assert (found["a"]["state"], found["a"]["made_by"]) == ("refused", [])
+    assert "past 5%, on records run at the head" in why
+    assert starts(tmp_path) == []
+
+
 @pytest.mark.parametrize("lands", ["a law", "readings"])
 def test_rerunning_after_an_input_lands_moves_only_what_it_serves_to_searchable(
     tmp_path, stubbed, lands
@@ -285,6 +299,29 @@ def test_a_1p1d_start_takes_the_decode_side_s_own_variables_in_a_local_prefix(
     ]
     held = ("STUB_BOTH", "STUB_PREFILL", "STUB_SIDE")
     assert [call["env"].get(k) for k in held] == ["1", "1", None]
+
+
+def test_a_1p1d_side_missing_readings_is_measured_on_the_connector_a_real_start_takes(
+    tmp_path, stubbed, monkeypatch
+):
+    # The law is keyed under the AITER_LOG_LEVEL a side runs under; the
+    # readings the fixture published are not.
+    monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
+    law_file(tmp_path, law(stubbed))
+
+    found = advise(tmp_path, {"p": {"deployment": "1p1d", "env": {"STUB_BOTH": "1"}}})
+
+    assert found["p"]["state"] == "searchable"
+    measured = "AITER_LOG_LEVEL=WARNING STUB_BOTH=1 compass measure memory --gpu G "
+    measured += f"--out D --store {tmp_path / 'store'} -- --model {tmp_path} "
+    point = found["p"]["points"]["p-c1"]
+    assert point["state"] == "missing readings"
+    assert point["made_by"] == [
+        f"{measured}--kv-transfer-config "
+        + shlex.quote(json.dumps({"kv_role": role, "kv_connector": "mooncake"}))
+        for role in ("kv_producer", "kv_consumer")
+    ]
+    assert starts(tmp_path) == []
 
 
 def test_a_tree_that_is_not_the_head_refuses_every_candidate_verbatim(
