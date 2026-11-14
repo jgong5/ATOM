@@ -32,8 +32,9 @@
 #                    a trace run's (OUT/trace) serve.TRACE_STOP_S more, set
 #                    the export's server_stopped and, for an instance, write
 #                    each request's split, OUT/request_split.json
-#                    (atom/compass/report/split.py), which deploy.sh writes
-#                    for a deployment as it stops
+#                    (atom/compass/report/split.py), then the run's report,
+#                    OUT/report.html (atom/compass/report/html.py), which
+#                    deploy.sh writes for a deployment as it stops
 #   --sweep          in place of aiperf, send the JIT sweep of the cell the
 #                    server's engine and traces A to B make, then after the
 #                    stop keep the points its record covers in the server's
@@ -274,5 +275,8 @@ path = Path(sys.argv[1])
 export = json.loads(path.read_text()) | {"server_stopped": True}
 path.write_text(json.dumps(export, sort_keys=True))
 EOF
-[[ -d $OUT/prefill ]] || (cd / && python3 -m atom.compass.report.split "$OUT") ||
+[[ -d $OUT/prefill ]] && exit 0
+(cd / && python3 -m atom.compass.report.split "$OUT") ||
     fail "split: atom.compass.report.split exited $?"
+(cd / && python3 -m atom.compass.report.html "$OUT") ||
+    fail "report: atom.compass.report.html exited $?"
