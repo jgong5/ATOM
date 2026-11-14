@@ -3851,10 +3851,10 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
         cut = isinstance(fam, str) and _cut(fam)
         for (a, ka, record), (b, kb, other) in itertools.pairwise(points):
             # each step's count between two points beside a bend of its line
-            if tokened and ka == kb and any(a <= x < b for x in bent):
+            if tokened and ka == kb and any(a <= x < b for x in sorted(bent)):
                 rows = json.loads(fam)[1]  # None: a family at any rows
                 for r, held in (step_tokens or {}).items():
-                    for t in held if rows in (None, r) else ():
+                    for t in sorted(held) if rows in (None, r) else ():
                         if a < t < b and (fam, t, r) not in tried:
                             tried.add((fam, t, r))
                             want[prefill(t, r), record["context"]].add(fam)
