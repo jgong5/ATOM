@@ -48,7 +48,10 @@ copy, as an activation is, pinned (`_host`); an
 activation is random at its shape, dtype and stride, except such
 a table, the placement's, a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
-experts' ids ATOM fuses into them (`_route`), the `NM_OUTPUT` slot at
+experts' ids ATOM fuses into them, at a point that states its real MoE
+rows (``R=``) each row past them routed to no expert as ATOM routes a pad
+row, one rank's batch holding its real rows alone (`_route`), the
+`NM_OUTPUT` slot at
 one KV split, a view at the start of twice its span, and aiter's top-k
 scratch (`TOPK_WORKSPACE`), one byte in the graph, built as aiter builds it
 on the device for the call's rows, row stride, k and path
@@ -177,7 +180,10 @@ graphs at its width, its B, do not hold, at its rows padded to that width,
 and under DP each leaf of a decode's drafter's graphs a run asks at its
 later passes' G at that G and the rows it ran there (`_drafter_at`), in
 place of its own shape's point,
-at the steps' lowest and highest row context (`_rows`); then each leaf of a
+at the steps' lowest and highest row context (`_rows`); then each rung's
+routed leaf whose ids are every row its MoE runs, a drafter's aside, at each
+count of real rows its steps' MoE ran (`_real`) and at one row's tokens; then
+each leaf of a
 kind those show depends on context (`_dependent`) over a ladder (`_ladder`)
 of the steps' row contexts, and, when some step's rows are ragged, at a
 shape of more than one row on ragged rows too (`_means`): the first at the
@@ -756,11 +762,13 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     target's points at output cover both. A miss where the store holds the
     shape under another engine config, or traced under another ATOM source or
     torch (`capture.graph_key`), refuses naming what differs. A
-    two-batch-overlap micro-batch's `shape` reads its own graph."""
+    two-batch-overlap micro-batch's `shape` reads its own graph, and a shape
+    stating its real MoE rows the graph of all of them."""
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture import graph_key
     from atom.compass.capture.forward import missed, structure
 
+    shape = shape._replace(real=None)
     at = structure(
         config,
         shape.phase,
@@ -1040,7 +1048,8 @@ class Stub:
             )
         )
         self.shared = self.topk.get("topk_ids")
-        self.loads = []
+        # a point's real MoE rows, its ranks and the rows its MoE runs (`point`)
+        self.loads, self.real = [], None
         # DeepSeek-V4.1's compress ratios by the rows a page holds at each
         geometry = getattr(runner, "attn_metadata_builder", None)
         geometry = getattr(geometry, "geometry", None)
@@ -1352,7 +1361,14 @@ class Stub:
             exchange(o) for o, _ in found.values()
         )
         drafts = getattr(rule, "drafts", 0)  # a rule of no drafter states none
-        rows = point_rows(shape, context, pool, rule.block_size, bool(uncut), drafts)
+        batch, self.real = shape, None
+        if shape.real is not None:  # its MoE rows past the real ones are pad rows
+            dp = self.alone or self.runner.config.parallel_config.data_parallel_size
+            moe = shape.gathered or dp * shape.tokens * (drafts + 1)
+            self.real = shape.real, dp, moe
+            if dp == 1:  # one rank's batch holds its real rows, padded to the rung
+                batch = shape._replace(tokens=shape.real // (drafts + 1))
+        rows = point_rows(batch, context, pool, rule.block_size, bool(uncut), drafts)
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
         if shape.phase != "decode" and self.paged:
@@ -1409,11 +1425,12 @@ class Stub:
         self.written, self.later, self.fills = {}, {}, {}
         plans, p, need = None, 0, 1
         ladder = contextlib.nullcontext
-        if shape.width or shape.phase == "decode" and shape.tokens < shape.seqs:
+        if shape.width or shape.phase == "decode" and batch.tokens < shape.seqs:
             # a step that pads past its rows is prepared padded, as the
             # capture's runner pads it: to its W, where a prefill's LM head
             # and its drafter's later passes run, or, a drafter's own decode
-            # shape, to its B, where a block drafter's passes run
+            # shape, to its B, where a block drafter's passes run, as one
+            # rank's real rows are to their rung
             width = np.array([shape.width or shape.seqs], dtype=np.int32)
             ladder = functools.partial(
                 patch.object, self.runner, "capture_sizes_np", width
@@ -1879,8 +1896,11 @@ class Stub:
         """Copy `c`'s expert ids for `spec`: each row's experts drawn
         independently and uniformly, distinct, from the model's routed experts,
         its drafter's for a leaf of the drafter's alone (`drafted`), seeded by
-        `SEED` and `c`, and past top-k the row's ids in ATOM's buffer; the
-        copy's expert loads go to `loads`."""
+        `SEED` and `c`, and past top-k the row's ids in ATOM's buffer. At a
+        point stating its real MoE rows, ids of as many rows as its MoE runs
+        are routed past the real rows to -1, as ATOM routes a pad row: the
+        real ones spread evenly over the ranks, first in each rank's block of
+        the gather. The copy's real rows' expert loads go to `loads`."""
         moe = self.draft_moe if drafted else self.moe
         if len(moe) > 1:
             raise ValueError(
@@ -1890,11 +1910,19 @@ class Stub:
         [(experts, k)] = moe
         device = self.runner.device
         ids = uniform_ids(spec["shape"][0], experts, k, SEED * CALLS + c, device)
-        self.loads.append(torch.bincount(ids.flatten(), minlength=experts).tolist())
         out = _random(spec, device)
         out[:, :k] = ids
         if out.shape[1] > k:
             out[:, k:] = self.shared[: len(out), k:]
+        if self.real and len(out) == self.real[2]:
+            real, dp, rows = self.real
+            pad = torch.ones(rows, dtype=torch.bool, device=device)
+            for r in range(dp):
+                first = r * (rows // dp)
+                pad[first : first + real // dp + (r < real % dp)] = False
+            out[pad, :k] = -1
+            ids = ids[~pad]
+        self.loads.append(torch.bincount(ids.flatten(), minlength=experts).tolist())
         return out
 
     def _reweigh(self, op, sig, like, c):
@@ -1961,6 +1989,21 @@ def _alive(device) -> None:
         torch.cuda.synchronize(device)
     except Exception:  # noqa: BLE001 - any error here is the device's
         os._exit(1)
+
+
+def routed_rows(leaf: dict) -> int | None:
+    """The rows of the expert ids a routed leaf reads or writes (`Stub._route`):
+    its first two-dimensional int32 or int64 activation or metadata argument's;
+    None where it has none."""
+    for _, spec in _specs(leaf["args"]):
+        ids = spec["dtype"] in ("torch.int32", "torch.int64")
+        if (
+            ids
+            and spec["role"] in ("activation", "metadata")
+            and len(spec["shape"]) == 2
+        ):
+            return spec["shape"][0]
+    return None
 
 
 def _routing(loads) -> dict:
@@ -3154,6 +3197,33 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                     for at in [c, *((c, m) for m in means)]:
                         fam = _family(shape, at, op["op"], sig, dependent)[0]
                         want[shape, at].add(fam)
+    # each rung's routed leaves at each count of real rows its steps' MoE ran
+    # (`_real`) and at one row's tokens, at the least context unless their kind
+    # depends on it: a leaf round 0 routed whose ids are all the rows its MoE
+    # runs, not a drafter's. A ladder's points read over `fit ops`' 5% off the
+    # line through their neighbours, the time bending under one kernel
+    if routed := [(k, r) for k, r in done.items() if r.get("routing")]:
+        dp = config.parallel_config.data_parallel_size
+        spec = config.speculative_config
+        row = (spec.num_speculative_tokens if spec else 0) + 1
+        real = defaultdict(set)
+        for s, line in steps:
+            if s in rungs and (n := _real(line)):
+                real[s].add(n)
+        for (text, context, sig), r in routed:
+            shape = _shape(text)
+            full = dp * shape.tokens * row
+            op = shape in real and graphs[shape][sig][0]
+            if not op or routed_rows(op) != full or op.get("drafted"):
+                continue
+            if context != min(contexts) and not dependent.get(r["op"], True):
+                continue
+            for n in sorted({row, *real[shape]}):
+                if n < full:
+                    at = shape._replace(real=n)
+                    graphs.setdefault(at, {})[sig] = graphs[shape][sig]
+                    fam = _family(at, context, r["op"], sig, dependent)[0]
+                    want[at, context].add(fam)
     seen = defaultdict(dict)
     for shape in sorted(prefills, key=str):  # G and W are None or a count
         for sig, (op, _) in graphs[shape].items():
@@ -3313,6 +3383,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
                     bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
+                    bound += (None if part else _real(line),)  # a target's real rows
                 elif asked:  # a prefill's drafter's leaf at each bound a run asks
                     each = [(*b, mean, top) for b, _ in asked]
                     bound = each if each[1:] else each[0]
@@ -3442,6 +3513,15 @@ def _rows(line, rung: int) -> tuple[int, int]:
     return max(lo, 1), max(contexts)
 
 
+def _real(line) -> int | None:
+    """A decode step's real MoE rows (`op_graph.real_rows`), as its line and
+    its group's dummy forwards at its step (`group_dummies`) state them."""
+    from atom.compass.backends.op_graph import real_rows
+
+    own, dummies = sum(row[0] for row in line["rows"]), line.get("group_dummies", 0)
+    return real_rows(own, line.get("moe_rows"), line.get("moe_tokens"), dummies)
+
+
 def _mean(line, rung: int) -> int:
     """A decode step's rows' mean context over its rung, a pad row holding
     none, in `PERMILLE` of their max."""
@@ -3491,7 +3571,8 @@ def _shape(text: str):
     n = shape_counts(text)
     if text.startswith("prefill"):
         return prefill(n["T"], n["B"], None, n.get("W"))._replace(gathered=n.get("G"))
-    return decode(n["B"], n.get("G"), n.get("T"))._replace(width=n.get("W"))
+    shape = decode(n["B"], n.get("G"), n.get("T"))
+    return shape._replace(width=n.get("W"), real=n.get("R"))
 
 
 def _abstract(value, n: int):

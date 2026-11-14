@@ -283,6 +283,16 @@ def gathered_off_default(
     return None if gathered == dp * rows else gathered
 
 
+def real_rows(own: int, gathered: int | None, tokens: int | None, dummies: int):
+    """The real rows a decode step's MoE runs, its others pad rows that route
+    to no expert: where its DP group's MoE gathers `gathered` rows, the group's
+    `tokens` with its `dummies` dummy forwards' rows as one, every dummy
+    running the same row, or None where it states no tokens; else its `own`."""
+    if gathered is None:
+        return own
+    return tokens and tokens - max(dummies - 1, 0)
+
+
 def _ran_at(leaf: dict, bound: tuple) -> tuple:
     """`bound` at the rows `leaf` ran: a padded target's or drafter's
     (`_bound`) at its width where an activation, metadata or output of the
@@ -513,7 +523,8 @@ class OpGraphBackend(CostBackend):
         are its block's, the rung's rows and their `drafts` tokens each, on
         this rank and gathered over the DP group, and none is its rows', so
         a leaf that leads with its rows alone or beside the target's tokens,
-        as its anchors do, is asked at its rows."""
+        as its anchors do, is asked at its rows. Last, a decode's target
+        states the real rows its MoE runs (`real_rows`), and any other None."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
@@ -532,6 +543,9 @@ class OpGraphBackend(CostBackend):
         bound = (phase, t, b, g, mean, top)
         if phase == "decode":  # its max, then its mean over B: a pad row holds none
             bound = (phase, t, b, g, top, sum(c for _, c in rows) / b)
+        own = sum(r.query_tokens for r in view.requests)
+        real = real_rows(own, view.moe_rows, view.moe_tokens, view.group_dummies)
+        bound += (real if phase == "decode" and not draft else None,)
         if not width:
             return bound
         if ran == t:
@@ -553,7 +567,7 @@ class OpGraphBackend(CostBackend):
             g = gathered_off_default(phase, t, low, self.dp, self.drafts)
             both = (phase, t, b, g, *bound[4:])
         if phase == "decode":
-            wide = (*wide[:5], wide[5] * b / width)
+            wide = (*wide[:5], wide[5] * b / width, *wide[6:])
         return bound, wide, both, (frozenset(counts), frozenset(wides))
 
     def _region(
