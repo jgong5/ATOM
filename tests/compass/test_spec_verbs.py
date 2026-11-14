@@ -68,7 +68,6 @@ LINKS = {
             "link_latency_s": 5.0e-6,
             "derate": 0.80,
         },
-        "router_relay_s": 1.5e-3,
     }
 }
 

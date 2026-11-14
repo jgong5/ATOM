@@ -31,7 +31,6 @@ CARRIED = (
     "device.software_pinned_to.",
     "interconnect.intra_node.link_latency_s",
     "interconnect.inter_node.link_latency_s",
-    "interconnect.router_relay_s",
 )
 
 
@@ -135,8 +134,9 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
     # The assumed gfx1250 device the graphs were traced at: 256 CUs, B0.
     declared = {"capture.compute_units": 256, "capture.revision": 1}
     assert declared.items() <= doc["assumed"].items()
-    assert mi455.origin("interconnect.router_relay_s")["origin"] == "assumed"
-    for unread in ("interconnect.router_relay_s", "device.compute.bf16_flops"):
+    never_read = "interconnect.inter_node.link_latency_s"
+    assert mi455.origin(never_read)["origin"] == "assumed"
+    for unread in (never_read, "device.compute.bf16_flops"):
         assert unread not in doc["assumed"]
     # Each assumed ratio and the kernel floor read, every cell priced again at
     # 0.8 and 1.2 of it.

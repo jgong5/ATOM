@@ -175,9 +175,11 @@ channel table from the run file alone. Each DP rank's engine process hands in
 its own refusals, as ``<lp>.<member>``. A key `RENAMED_KEYS` lists refuses,
 naming its name now.
 
-A run file that also has ``router_s`` describes a prefill-decode run over
-`prefill_decode_table`: its hops are prefill's, its ``decode_hops`` decode's
-``ipc_s``, ``ipc_out_s`` and ``stream_s``, and ``kv_link`` (``intra_node``
+A run file that also has ``router_s``, the router's per-request forward or
+null where no entry states it, describes a prefill-decode run over
+`prefill_decode_table`: its hops are prefill's, ``router_s`` among them, its
+``decode_hops`` decode's ``ipc_s``, ``ipc_out_s`` and ``stream_s``, and
+``kv_link`` (``intra_node``
 or ``inter_node``) names the link its KV transfers are priced on. An optional
 ``router_in_s`` makes the router the ``router`` LP, with that lookahead on each
 hop into it; it prices no work, so it is no server LP and hands nothing in.
@@ -359,9 +361,9 @@ HOST_TERMS = ("http_intake", "tokenizer")
 TOKENIZER_KINDS = ("encode", "encode_batch", "decode", "segment")
 #: A ``host`` entry's ``hops``, each optional and the run-file key of its name:
 #: the lookaheads of the traffic's request, an engine's ZMQ message in, its
-#: output, the stream back and a prefill-decode run's write request. Such a run
-#: states its decode side's under `DECODE_HOPS`.
-HOPS = ("admission_s", "ipc_s", "ipc_out_s", "stream_s", "kv_write_req_s")
+#: output, the stream back, and a prefill-decode run's write request and router
+#: forward. Such a run states its decode side's under `DECODE_HOPS`.
+HOPS = ("admission_s", "ipc_s", "ipc_out_s", "stream_s", "kv_write_req_s", "router_s")
 DECODE_HOPS = "decode_hops"
 #: A hop's lookahead where the run file states none: not 0 s, which puts a
 #: serving run on deadlock recovery.
@@ -776,7 +778,7 @@ def _engines_table(run: dict):
             **common,
             stream_s=hop(run, f"{DECODE_HOPS}.stream_s"),
             decode_ipc=tuple(hop(run, f"{DECODE_HOPS}.{k}") for k in HOPS[1:3]),
-            router_s=run["router_s"],
+            router_s=hop(run, "router_s"),
             kv_write_req_s=hop(run, "kv_write_req_s"),
             dp=_widths(run),
             router_in_s=run.get("router_in_s"),
