@@ -379,12 +379,12 @@ def _admit_rows(samples, host) -> list[tuple]:
 def records_atom(samples) -> str | None:
     """The ATOM digest `samples`' records ran at, their host keys' ``atom``;
     None when no record has a host key. Records at two refuse."""
-    atoms = {s.provenance["config"]["atom"] for s in samples if s.provenance["config"]}
+    atoms = sorted(
+        {s.provenance["config"]["atom"] for s in samples if s.provenance["config"]}
+    )
     if len(atoms) > 1:
-        raise ValueError(
-            f"the records ran at {len(atoms)} ATOM digests: {sorted(atoms)}"
-        )
-    return next(iter(atoms), None)
+        raise ValueError(f"the records ran at {len(atoms)} ATOM digests: {atoms}")
+    return atoms[0] if atoms else None
 
 
 def label_records(records, dp: int = 1) -> tuple[list, dict]:
@@ -1860,14 +1860,15 @@ def _vector_of(view) -> str:
 
 def _figures(ranks, law: dict, vectors=None) -> dict:
     """Per kind, `FIGURES` of the steps of `ranks`, one run's ranks' samples,
-    priced by `law` as `validate.cost` grades a run; with `vectors`, only the
-    steps a vector it names prices (`_vector_of`), each with its draft."""
-    from atom.compass.validate import cost
+    priced by `law` as `validate.cost` grades a run (`accuracy.run_accuracy`);
+    with `vectors`, only the steps a vector it names prices (`_vector_of`), each
+    with its draft."""
+    from atom.compass.backends.accuracy import run_accuracy
 
     steps = None
     if vectors is not None:
         steps = {s.step for r in ranks for s in r if _vector_of(s.view) in vectors}
-    graded = cost.run_accuracy(ranks, law, steps)["graded"]
+    graded = run_accuracy(ranks, law, steps)["graded"]
     return {kind: {f: g[f] for f in FIGURES} for kind, g in graded.items()}
 
 
