@@ -8,7 +8,9 @@ environment does not set; then its expected time, unknown.
 
 The deployment is `test_run_step_grid`'s, at the ladder and bounds a test
 sets, checked as `test_run_lacking_rungs` checks it; the printed command runs
-in the stub tree `test_calibrate` runs `calibrate.sh` in.
+in the stub tree `test_calibrate` runs `calibrate.sh` in. A side of a
+`deploy.sh` deployment, checked as `test_run_check_side` checks it, prints
+`deploy.sh record` and a fit of that side's records instead.
 """
 
 import json
@@ -22,10 +24,12 @@ import platforms
 import pytest
 from test_calibrate import _tree
 from test_memory_readings import DOCUMENT
+from test_run_check_side import COVERAGE, checked, pair, side_args
 from test_run_lacking import served
 from test_run_lacking_rungs import DEFAULT_SIZES, DPA8, mtp
 from test_run_step_grid import deployment
 
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass.drive import lacking
 from atom.compass.drive import run as drive_run
 from atom.compass.runner.overrides import schedulable_ladder
@@ -226,3 +230,24 @@ def test_the_printed_command_runs_as_printed(tmp_path, monkeypatch, capsys):
         f"atom --model {tmp_path} -tp 2 --max-num-seqs 2",
         "traces /cc/traces.jsonl 256-392",
     ]
+
+
+@pytest.mark.parametrize("side", ["prefill", "decode"])
+def test_a_deployment_side_lacking_its_law_prints_deploy_sh_record_and_a_fit(
+    tmp_path, monkeypatch, capsys, side
+):
+    # The side's environment alone, and AITER_LOG_LEVEL, which its check sets,
+    # restored after it.
+    for name in PERFORMANCE_KEYS:
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    atom_args = side_args(tmp_path, monkeypatch, side)
+
+    assert checked(pair(tmp_path), side, atom_args) == 1
+
+    out = capsys.readouterr().out
+    law = rf"^lacking {re.escape(COVERAGE)}\n  refused: .*\n  made by: (.*)$"
+    assert re.search(law, out, re.MULTILINE)[1] == (
+        "deploy.sh OUT record of the deployment, then compass fit steps --backend "
+        f"step-linear on each OUT/{side}"
+    )

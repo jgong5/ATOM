@@ -31,7 +31,9 @@ time.
 A prefill or decode instance's run reads a network file across nodes, as
 `deploy.sh run` hands it one, and its readings command takes the ATOM
 arguments a real start of it takes, where they are not the run's, and the
-environment the run's check set.
+environment the run's check set. Its step linear law is made by `deploy.sh
+record` and a fit of that side's records (`SIDE_LAW`): `calibrate.sh` records
+a lone server.
 
 Printed apart, outside the exit status: the gaps `--coverage`'s check counts;
 an op graph's absent price list, which prices every leaf by its analytical
@@ -92,6 +94,14 @@ CALIBRATION_OUT = "cal"
 #: states: its command states each this process's environment sets, and names
 #: each it does not.
 CLIENT_ENV = ("TRACES", "AIPERF_PYTHON")
+#: The command that makes a prefill or decode instance's step linear law: each
+#: `deploy.sh record` deployment writes the side's record in OUT/<side>.
+SIDE_LAW = (
+    "deploy.sh OUT record of the deployment, then compass fit steps --backend "
+    "step-linear on each OUT/{side}"
+)
+#: Each side by the letter `runfile.pd_side` gives it.
+SIDES = {"P": "prefill", "D": "decode"}
 
 
 def report(args, atom_args, real=None, env=None) -> int:
@@ -128,7 +138,8 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
             return False
 
     store = ArtifactStore(Path(args.store).resolve())
-    across = bool(args.network) and runfile.pd_side(atom_args) is not None
+    side = runfile.pd_side(atom_args)
+    across = bool(args.network) and side is not None
     try:
         machine = runfile.spec(args, store, across)
     except (OSError, ArtifactRefusal, SpecRefusal, ValueError) as refused:
@@ -138,7 +149,9 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     run = {"machine": machine.echo(), "store": str(store.root)}
     flags = {k: getattr(args, k) for k in runfile.KINDS if getattr(args, k)}
     made_by = dict(MADE_BY)
-    if STEP_LINEAR in flags:
+    if STEP_LINEAR in flags and side:
+        made_by[STEP_LINEAR] = SIDE_LAW.format(side=SIDES[side])
+    elif STEP_LINEAR in flags:
         out = args.out or CALIBRATION_OUT
         made_by[STEP_LINEAR] = calibration(out, atom_args, config)
     for name, tokens in (flags | {"host": args.host_laws or []}).items():
