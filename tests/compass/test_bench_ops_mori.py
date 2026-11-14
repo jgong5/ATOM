@@ -15,6 +15,7 @@ from test_bench_ops import _Runner
 
 from atom.compass.bench import ops
 from atom.compass.capture.peers import MORI
+from atom.compass.fit import ops as fit
 from atom.utils import forward_context as fctx
 
 EXPERTS, TOP_K, HIDDEN, RANKS, ROWS = 16, 2, 8, 8, 4
@@ -298,3 +299,49 @@ def test_a_packed_fp4_wire_holds_two_values_a_column(monkeypatch, op):
 
     assert record["cold_ns"] == COST[leaf]
     assert {(t.shape, t.dtype) for t in handle.sent} == {((ROWS, HIDDEN // 2), fp4)}
+
+
+#: #1500's EP8 combines on DeepSeek-V4-Pro by their B, and their cold ns on 005.
+EP8_COMBINE_NS = {1: 22219.0, 8: 22181.0, 32: 28122.0}
+
+
+def _ep8_combine(b):
+    """An EP8 combine as the capture states it (`peers.install_mori`): eight
+    ranks' B rows in, MORI's whole buffer of 16384 rows out at every B."""
+    return {
+        "op": f"{MORI}.combine",
+        "args": {
+            "input": _spec([8 * b, 7168], "torch.bfloat16"),
+            "weights": None,
+            "indices": _spec([b, 6], "torch.int32"),
+            "block_num": 128,
+            "warp_per_block": 8,
+            "num_ep_ranks": 8,
+        },
+        "out": [[16384, 7168]],
+    }
+
+
+def test_an_ep8_combine_is_priced_at_each_width_over_the_rows_it_moves():
+    points = [
+        {"shape": f"decode B={b}", "context": 8192, "op": f"{MORI}.combine"}
+        | {"leaf": ops.signature(_ep8_combine(b)), "cold_ns": ns}
+        | {"kernels": ["combine"], "exchange": ops.exchange(_ep8_combine(b))}
+        for b, ns in EP8_COMBINE_NS.items()
+    ]
+    params = fit.fit(points)
+    fit.held_out(params)
+
+    got = [
+        fit.PriceList(params).price(
+            (_ep8_combine(b), ("decode", None, b, None, 8192, 8192), 0)
+        )
+        for b in EP8_COMBINE_NS
+    ]
+
+    assert [g.seconds for g in got] == pytest.approx(
+        [ns * 1e-9 for ns in EP8_COMBINE_NS.values()]
+    )
+    # its input's bytes, eight ranks' B rows of bf16, rising with B
+    sizes = [p["exchange"][1] for p in points]
+    assert sizes == [8 * b * 7168 * 2 for b in EP8_COMBINE_NS]
