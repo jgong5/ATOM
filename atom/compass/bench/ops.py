@@ -163,8 +163,8 @@ device faulted (`_alive`); one that dies ends every rank, keeps the points
 every rank finished, the point it was measuring refuses, and new ones measure
 the rest; two in a row that die having finished no point fail the run.
 
-DIR gets run.json, the run's identity, and ops.jsonl, one line per point, a
-measured one with its store token and the run's parallel layout. S gets each
+DIR gets run.json, the run's identity, and ops.jsonl, one line per point with
+its store token and the run's parallel layout. S gets each
 measured point as an `op_measurement`, keyed by the model, the device, stack,
 PTL state and torch run.json reads, the source root and the point, the layout
 only for a collective leaf (`point_key`): a point of any other leaf answers at
