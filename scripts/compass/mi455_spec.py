@@ -38,8 +38,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mi308x_spec as base
 from mi308x_spec import fragment
 
+from atom.compass.fit.device import CARRIED
 from atom.compass.spec import Fragment, MachineSpec, merge, validate
-from atom.compass.validate.project import CARRIED
 
 NAME = "mi455-a0"
 base.NAME = NAME  # the shared fragment functions name this machine

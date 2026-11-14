@@ -214,21 +214,28 @@ transfer to DP.
   included, and `T_moe` is the group's sum of them. Either way the group dispatches
   `T_moe` rows, so `T_moe` is the MoE row count with EP on too, and `BatchView.moe_rows`
   carries it unchanged (`atom/compass/runner/projection.py`, `batch_view`). MORI sends a
-  row to every rank that holds one of its routed experts; under uniform routing a rank
-  receives `T_moe x reach / dp` rows, `reach` being the ranks one row reaches: 4.42 for
+  row to every rank that holds one of its routed experts, so a pad row, routed to none,
+  to no rank (`EpDispatchIntraNodeKernel` skips an id below 0; the low-latency `AsyncLL`
+  kernels send it to rank 0, [#3404](https://github.com/jgong5/ATOM/issues/3404)); under
+  uniform routing a rank receives `R x reach / dp` rows, `R` the real rows among `T_moe`
+  (`BatchView.moe_tokens`), `reach` being the ranks one row reaches: 4.42 for
   DeepSeek-V4-Pro's 6 routed experts of 384 over 8 ranks, 4.43 measured. These readings
   are [#1106](https://github.com/jgong5/ATOM/issues/1106#issuecomment-6236367874)'s
   EP8 diagnostic cells.
 - **Why `max` is the critical path here.** Under DP-attention a layer's barrier-delimited
   segments are the local segment and the MoE segment. With EP off the MoE segment is
-  rank-invariant by construction (above). With EP on its priced cost is rank-invariant
-  under uniform routing: every rank is priced at the expected maximum rank load (`10` D64).
+  rank-invariant by construction (above). With EP on the experts' priced cost is
+  rank-invariant under uniform routing: every rank is priced at the expected maximum rank
+  load (`10` D64). MORI's exchange is priced at each rank's own real rows, so it joins the
+  rank-variant part: the IntraNode dispatch ends on every rank only once each peer has
+  finished its whole send, at the latest peer's local segment plus its own send, and the
+  combine reads a rank's own rows after its barrier, before that rank's next local segment.
   When one segment is rank-invariant the sum of per-segment maxima equals the max of
   per-rank sums.
-  Rank 0 at attention 3 per layer and rank 1 at 1, both at MoE `c`, give
+  Rank 0 at attention 3 per layer and rank 1 at 1, both at experts `c`, give
   `max(3 + c, 1 + c) = max(3, 1) + c`. A gap between the two, such as 240 against 360 over
-  60 layers for attention 3 / MoE 1 against 1 / 3, needs MoE cost to differ across ranks,
-  which only non-uniform routing under EP produces.
+  60 layers for attention 3 / experts 1 against 1 / 3, needs the experts' cost to differ
+  across ranks, which only non-uniform routing under EP produces.
 - **Non-uniform routing is a stated limit.** Real routing is data-dependent (D92 Q2).
   With EP off it changes the MoE cost equally on every rank. With EP on it loads ranks
   unevenly: on #1106's cells the busiest rank's received rows over the group mean, per

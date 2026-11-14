@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_launcher_held_ports import HELD, SQUAT
 from test_memory_readings import DOCUMENT
@@ -121,7 +122,7 @@ ROUTER_LP_ARGS = [*ROUTER_ARGS, "--disable-retries", "--dp-aware"]
 
 @pytest.fixture
 def planted(tmp_path):
-    """The stubbed `python3` and router, the suite's machine and a step stub;
+    """The stubbed `python3` and router, the suite's platform and a step stub;
     returns the environment and the run flags."""
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -138,7 +139,6 @@ def planted(tmp_path):
     (bindir / "atomesh").write_text(f"#!{sys.executable}\n" + ROUTER)
     for tool in ("python3", "atomesh"):
         (bindir / tool).chmod(0o755)
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     (tmp_path / "stub.json").write_text(json.dumps(dataclasses.asdict(Coefficients())))
     # The router stub records every ATOM_COMPASS_* it inherits, so none come
     # from the caller (the GPU gate sets the slice model's).
@@ -151,7 +151,7 @@ def planted(tmp_path):
         "WAIT_S": "60",
     }
     flags = ["--step-stub", str(tmp_path / "stub.json")]
-    flags += ["--machine", str(tmp_path / "machine.json")]
+    flags += platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
     flags += ["--store", str(tmp_path / "store")]
     return env, flags
 

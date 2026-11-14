@@ -361,9 +361,8 @@ it carries Mooncake's KV transfer between the prefill and the decode node (`01` 
    derived, not probed: the composed curve's largest point over `bandwidth_bytes_per_s`.
    No readings entry names a datasheet, so correcting one re-prices every run that reads
    it and refuses none. A stated peak the entry gives no derate for is left out of the
-   composed spec, as `atom/compass/validate/project.py::projected` leaves it: a price
-   that reads that rate refuses naming it, and a required peak refuses as a missing
-   field.
+   composed spec (`atom/compass/spec/layers.py::composed`): a price that reads that
+   rate refuses naming it, and a required peak refuses as a missing field.
 3. **Entries one run reads must agree.** Device numbers track the ROCm/RCCL/AITER build
    as well as the die (`07` D43), so every entry a command reads states the platform it
    was made on: its key the device, stack, PTL state and torch its row marks (D24, `07`
@@ -461,8 +460,8 @@ datasheet, and states the ratios for the device `--device` names, every field as
 each derate, the bandwidth curve over DEVICE's bandwidth, and the kernel floor and the
 link and carrier terms as they are; a compute format the source states no rate for is
 left out, so the composition leaves its peak out (D25 rule 2). This is the rule `compass
-project` carries a probed device's ratios by (`atom/compass/validate/project.py::projected`),
-and it moves here. The entry is keyed by the target device and the source's stack, torch
+project` carried a probed device's ratios by, and it lives here now
+(`atom/compass/fit/device.py::assumed`). The entry is keyed by the target device and the source's stack, torch
 and PTL state, the stack stated as assumed from the source's. Several source entries
 refuse, listing them. MI455X B0's readings are MI355X's taken this
 way, as the frozen MI455 projection took them (`10` D69).

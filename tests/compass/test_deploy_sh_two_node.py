@@ -19,8 +19,10 @@ import subprocess
 import time
 from pathlib import Path
 
+import platforms
 import pytest
 from test_deploy_sh import ROUTER_ARGS, _until, argv, planted  # noqa: F401
+from test_memory_readings import DOCUMENT
 
 ON = """\
 #!/bin/sh
@@ -134,6 +136,8 @@ def test_a_simulated_deployment_prices_kv_on_the_link_its_layout_spans(
 ):
     env, flags = planted
     d = tmp_path / "d"
+    if node_b:  # only a run across nodes reads a network file
+        flags = [*flags, *platforms.network(DOCUMENT, tmp_path)]
     words = argv(tmp_path, flags)
     if node_b:
         at = words.index("--decode") + 1

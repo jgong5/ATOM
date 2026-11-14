@@ -13,8 +13,10 @@ import dataclasses
 import json
 import math
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_memory_readings import DOCUMENT
 from test_run_step_grid import deployment
@@ -30,7 +32,7 @@ from atom.utils.clock import LPRuntime
 LAWS = REPO / "scripts/compass/laws"
 #: The node-18 TP1 law file, which a TP1 1P1D cell runs.
 TP1 = LAWS / "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json"
-ROUTER = DOCUMENT["interconnect"]["router_relay_s"]
+ROUTER = runfile.ROUTER_RELAY_S
 FLOOR = compass_run.HOP_FLOOR_S
 #: Each channel's lookahead before the hops left the code: the serving path's
 #: HTTP transport, the ZMQ request and output and the SSE stream as node-18
@@ -64,13 +66,18 @@ def lookaheads(run: dict) -> dict:
 
 
 def parsed(tmp_path, *flags):
-    """`flags` after a step stub, the suite's machine and the store."""
+    """`flags` after a step stub, the suite's machine, at the stack a law file's
+    host laws state, and the store."""
     stub = tmp_path / "stub.json"
     stub.write_text(json.dumps(dataclasses.asdict(Coefficients())))
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     parser = argparse.ArgumentParser()
     runfile.add_arguments(parser)
-    common = ["--step-stub", str(stub), "--machine", str(tmp_path / "machine.json")]
+    common = ["--step-stub", str(stub)]
+    laws = [json.loads(Path(f).read_text()) for f in flags if f.endswith(".json")]
+    at = next(
+        (law["host"]["key"] for law in laws if "torch" in law["host"]["key"]), None
+    )
+    common += platforms.flags(tmp_path / "store", DOCUMENT, tmp_path, at)
     return parser.parse_args([*common, "--store", str(tmp_path / "store"), *flags])
 
 

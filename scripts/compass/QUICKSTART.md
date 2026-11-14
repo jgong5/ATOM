@@ -38,8 +38,8 @@ container, entered with `docker exec -it ${USER}_compass_gpu bash`.
 
 - **Image.** `rocm/atom-dev:vllm-v0.31.0-nightly_20261013`. Node 18 holds it as
   `compass-next:nightly-20261013`, the same image: name that tag there, or Docker
-  pulls. The machine specs were measured in it, and a fit refuses records from
-  another stack than its machine spec states.
+  pulls. The platform readings were measured in it, and a run refuses entries
+  of two stacks.
 - **One GPU container**, named for its owner and purpose, with the GPU devices,
   host networking, the inputs mounted read-only, the data directory (Disk) at
   its own path, and a tmpfs over each cache the runs fill:
@@ -91,12 +91,14 @@ container, entered with `docker exec -it ${USER}_compass_gpu bash`.
   git checkout nor a stamped snapshot"; a snapshot avoids that. After switching
   trees, clear ATOM's compile cache in the container (`rm -rf /root/.cache/atom/*`)
   while no server runs.
-- **The machine spec** of your node's GPUs, from `scripts/compass/machines/`,
-  where each file is named for its device and host (`mi308x-hjbog18.json` is node
-  18's). Its `device.ptl` must be the cards' PTL state, which
-  `cat /sys/bus/pci/devices/*/ptl/ptl_enable` prints; `measure memory` refuses a
-  spec that states another. A node with no spec of its own needs a developer to
-  write one with its per-machine script first.
+- **The platform** of your node's GPUs: their datasheet, by SKU from
+  `atom/compass/devices/` (`mi308x` on node 18), their PTL state, which
+  `cat /sys/bus/pci/devices/*/ptl/ptl_enable` prints, and their readings, a
+  `platform_readings` entry in the store. Publish the readings once per node and
+  stack, on two or more idle cards, `<token>` the one the first command prints:
+  `compass measure device --gpu $G,<another card> $S --out $R/device`, then
+  `compass fit device <token> $S --out $R/readings`. `run` reads them at the
+  stack its law and host laws state, and refuses a store with none.
 - **Inputs you supply:** a model directory; a cc-traces `traces.jsonl` (sha256
   `e39cd2ff3eba...`, 568,864,747 bytes); and two client Pythons (Variables). On
   node 18 the model repo is `/data/xingjche/compass/inputs/models--Qwen--Qwen3.8-27B`,
@@ -132,8 +134,7 @@ G=<gpu>                          # the GPU, as rocm-smi numbers it
 MODEL=/models/qwen38/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0  # client.sh reads it too
 TRACES=/cc/traces.jsonl          # the cc-traces file; client.sh reads it
 ATOM="--model $MODEL --max-model-len 262144"   # ATOM's arguments, identical for every step
-SPEC=$T/scripts/compass/machines/mi308x-hjbog18.json   # this node's machine spec (Environment)
-M="--machine $SPEC"
+P="--device mi308x --ptl enabled"   # this node's datasheet and PTL state (Environment)
 S="--store $R/store"
 V=$DATA/venv-sim                 # the compass-harness venv (below)
 REAL_PY=/opt/venv/bin/python3    # a real server's client: the image's, with agentx-harness's aiperf
@@ -251,7 +252,7 @@ container's first start, as in
 [PR #1762](https://github.com/jgong5/ATOM/pull/1762)'s smoke cell at 829cf661a).
 
 ```bash
-compass measure memory --gpu $G $M $S --out $R/memory -- $ATOM
+compass measure memory --gpu $G $S --out $R/memory -- $ATOM
 ```
 
 Writes a `memory_readings` entry to the store. Success: exit 0 and a `published
@@ -300,8 +301,8 @@ set -o pipefail   # a fit's exit status, not tee's
 RUNS=$(for d in $R/cal/c*; do echo --client-run $d $d/artifacts/client_run.json; done)
 TRACE_RUNS=$(for d in $R/trace/c*; do echo --client-run $d $d/artifacts/client_run.json; done)
 compass fit steps --backend step-linear --form history --model $MODEL $R/cal/c* $R/trace/c* \
-  $RUNS $TRACE_RUNS $M $S --out $R/fit/steps 2>&1 | tee $R/logs/fit_steps.log
-compass fit host $R/cal/c* $RUNS $M $S --out $R/fit/host 2>&1 | tee $R/logs/fit_host.log
+  $RUNS $TRACE_RUNS $S --out $R/fit/steps 2>&1 | tee $R/logs/fit_steps.log
+compass fit host $R/cal/c* $RUNS $S --out $R/fit/host 2>&1 | tee $R/logs/fit_host.log
 token() { awk '/^published / {t = $NF} END {print t}' "$1"; }
 LAW=$(token $R/logs/fit_steps.log) HOST=$(token $R/logs/fit_host.log)
 ```
@@ -316,7 +317,7 @@ host segments ran under the profiler.
 
 ```bash
 for C in 1 4 16; do
-  serve $R/cell/c$C/step_linear 0-255 $C $SIM_PY run --step-linear $LAW --host-laws $HOST $M $S || break
+  serve $R/cell/c$C/step_linear 0-255 $C $SIM_PY run --step-linear $LAW --host-laws $HOST $P $S || break
 done
 ```
 
@@ -382,7 +383,7 @@ header. It may run on a busy node (GPUs are shared), and its real runs count
 toward the two at once.
 
 ```bash
-GPU=$G MACHINE=$SPEC HARNESS_PYTHON=$SIM_PY AIPERF_PYTHON=$REAL_PY \
+GPU=$G DEVICE=mi308x PTL=enabled READINGS=$R/store HARNESS_PYTHON=$SIM_PY AIPERF_PYTHON=$REAL_PY \
   $T/scripts/compass/smoke_cell.sh $MODEL $R/smoke
 ```
 
@@ -413,9 +414,9 @@ law's accuracy.
 |---|---|---|
 | `<tree>/atom is neither a git checkout nor a stamped snapshot` | a git worktree in a root container fails git's ownership check | use a `snapshot.sh` tree (this page), or `git config --global safe.directory <tree>` in the container |
 | grading or a check imports `/app/ATOM` | `python -m` without `PYTHONPATH=$T`, or run from inside a checkout | `PYTHONPATH=$T`, from `/` |
-| `measure memory`: the cards read ptl `enabled`, and the spec states `disabled` | another node's machine spec, such as `mi308x-hjbog39.json` on node 18 | this node's spec (Environment) |
+| `run`: `... holds 0 platform_readings entries for MI308X gfx942 at PTL enabled ...` | no readings in the store for these cards, at this PTL state | `compass measure device` and `compass fit device` on this node (Environment) |
 | a GPU command refuses: `GPU N has PID P on it before the run` | the GPU is not idle | another GPU; never stop another user's work |
-| `run` refuses its law or host laws | records, fits and runs from two trees, two `$ATOM`s, two specs or two environments | one tree, one `$ATOM`, one spec and one environment (Variables) for every step |
+| `run` refuses its law or host laws | records, fits and runs from two trees, two `$ATOM`s, two platforms or two environments | one tree, one `$ATOM`, one platform and one environment (Variables) for every step |
 | `... holds an earlier run's files`, or `client.sh` refuses its OUT | one server per `--out`, one client run per server | a fresh `--out` for every server |
 | `fit` refuses `... is not a record directory (no run.json)` | a log file matched `$R/cal/c*` | keep logs outside the record directories |
 | `fit` refuses: `[Errno 2] No such file or directory: '<record>/artifacts/client_run.json'` | a stopped calibration record under `$R/cal/` | `rm -rf` it and take it again |

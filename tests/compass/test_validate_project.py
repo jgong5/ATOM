@@ -8,6 +8,7 @@ priced at another's probed ratios, the method's error on its own records.
 import json
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_backend_step_roofline import STACK
@@ -16,19 +17,23 @@ from test_validate_bound import LINES, _main, drafted, graph, record
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends.step_roofline import StepRooflineBackend
-from atom.compass.spec import MachineSpec, SpecRefusal
+from atom.compass.fit import device
+from atom.compass.spec import MachineSpec
 from atom.compass.validate import bound, project
 
 MACHINES = SCRIPTS / "machines"
 #: MI455's B0 spec is MI355X's probed ratios on MI455X's datasheet, for a
 #: device no engine has run on.
-MI308X, MI355X, MI455 = (
-    MACHINES / f"{name}.json" for name in ("mi308x-hjbog18", "mi355x-gpu45", "mi455-b0")
-)
+MI355X, MI455 = (MACHINES / f"{name}.json" for name in ("mi355x-gpu45", "mi455-b0"))
 
 
 def spec(path):
     return MachineSpec.from_mapping(json.loads(path.read_text()))
+
+
+def on_mi455(store, directory) -> list[str]:
+    """The platform flags of MI455's B0 spec, its readings in `store`."""
+    return platforms.flags(store, json.loads(MI455.read_text()), directory)
 
 
 def ran(path, lines):
@@ -38,46 +43,36 @@ def ran(path, lines):
     return path
 
 
-def test_a_projected_device_keeps_its_peaks_at_the_others_probed_ratios():
-    mi355x, mi308x = spec(MI355X), spec(MI308X)
-    p = project.projected(mi355x, mi308x)
-
-    for path in ("device.arch", "device.compute.bf16_flops", project.BANDWIDTH):
-        assert p.value(path) == mi355x.value(path)
-    for path in (
-        "device.compute.derate.bf16",
-        "device.memory.derate",
-        "device.kernel_floor_s",
-        "interconnect.intra_node.link_latency_s",
-    ):
-        assert (p.value(path), p.origin(path)["origin"]) == (
-            mi308x.value(path),
-            "assumed",
-        )
-    scale = mi355x.value(project.BANDWIDTH) / mi308x.value(project.BANDWIDTH)
-    for (size, rate), (at, probed) in zip(
-        p.value(project.CURVE), mi308x.value(project.CURVE)
-    ):
-        assert (size, rate) == (at, pytest.approx(probed * scale))
-    # MI308X probed no FP4 rate, so a price that reads one is refused.
-    with pytest.raises(SpecRefusal, match="fp4_flops"):
-        p.value("device.compute.fp4_flops")
-    # MI455's spec is the same method applied to MI355X.
-    mi455 = project.projected(spec(MI455), mi355x).values
-    assert mi455 | {"name": None} == spec(MI455).values | {"name": None}
-
-
-def test_bound_ratios_from_prices_records_at_the_projected_spec(monkeypatch, tmp_path):
+def test_bound_ratios_from_prices_records_at_the_other_devices_ratios(
+    monkeypatch, tmp_path
+):
     rec = ran(tmp_path / "rec", LINES[:3])
     reports = []
     monkeypatch.setattr(bound, "text", lambda r: reports.append(r) or "")
-    for more in ([], ["--ratios-from", str(MI308X)]):
-        _main(monkeypatch, tmp_path, [rec], more=["--machine", str(MI355X), *more])
+    mi308x = MACHINES / "mi308x-hjbog39.json"
+    platforms.flags(tmp_path / "store", json.loads(mi308x.read_text()), tmp_path)
+    mi355x = json.loads(MI355X.read_text())
+    for more in ([], ["--ratios-from", "MI308X"]):
+        _main(monkeypatch, tmp_path, [rec], more=more, document=mi355x)
 
     own, at_ratios = (r["step"]["analytical_s"]["prefill"]["total"] for r in reports)
-    machine = project.projected(spec(MI355X), spec(MI308X))
+    # MI355X's peaks at MI308X's derates, MI308X's curve at MI355X's bandwidth,
+    # and MI308X's values no datasheet states.
+    target, probed = spec(MI355X), spec(mi308x)
+
+    def taken(path):
+        return "derate" in path.split(".") or path.startswith(device.CARRIED)
+
+    values = {p: v for p, v in target.values.items() if not taken(p)}
+    values |= {p: v for p, v in probed.values.items() if taken(p)}
+    scale = target.value(project.BANDWIDTH) / probed.value(project.BANDWIDTH)
+    values[project.CURVE] = [[s, r * scale] for s, r in probed.value(project.CURVE)]
+    machine = MachineSpec(values)
     direct = bound.gate([rec], {"step": StepRooflineBackend(machine, STACK)})
-    assert at_ratios == direct["step"]["analytical_s"]["prefill"]["total"] != own
+    assert at_ratios == pytest.approx(
+        direct["step"]["analytical_s"]["prefill"]["total"]
+    )
+    assert at_ratios != own
 
 
 def _priced_here(monkeypatch, drafter=None):
@@ -111,7 +106,7 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
     decode = ran(tmp_path / "decode", LINES[:1])
     prefill = ran(tmp_path / "prefill", LINES[1:2])
     store = tmp_path / "store"
-    argv = ["--model", "m", "--machine", str(MI455), "--store", str(store)]
+    argv = ["--model", "m", *on_mi455(store, tmp_path), "--store", str(store)]
     project.main([*argv, "--", str(decode), "--enable-tbo", "--", str(prefill)])
 
     token = capsys.readouterr().out.split()[-1]
@@ -175,7 +170,8 @@ def test_main_reads_a_records_atom_arguments_from_its_run_json(monkeypatch, tmp_
     line += ["--enable-tbo", "--tool-call-parser", "qwen3"]
     (served / "run.json").write_text(json.dumps({"argv": line}))
     (bare / "run.json").write_text(json.dumps({"argv": ["compass", "record"]}))
-    argv = ["--model", "m", "--machine", str(MI455), "--store", str(tmp_path / "s")]
+    argv = ["--model", "m", *on_mi455(tmp_path / "s", tmp_path)]
+    argv += ["--store", str(tmp_path / "s")]
 
     with pytest.raises(ValueError) as refused:
         project.main([*argv, str(served), str(bare)])
@@ -202,10 +198,11 @@ def test_a_record_naming_a_draft_model_is_refused_naming_the_dash_form(tmp_path,
     )
 
 
-def test_main_refuses_cells_of_two_models_and_a_run_with_no_cell(monkeypatch):
+def test_main_refuses_cells_of_two_models_and_a_run_with_no_cell(monkeypatch, tmp_path):
     two = [{"model": "sha256:a"}, {"model": "sha256:b"}]
     monkeypatch.setattr(project, "_each", lambda jobs: two)
-    argv = ["--model", "m", "--machine", str(MI455), "--store", "s"]
+    store = tmp_path / "s"
+    argv = ["--model", "m", *on_mi455(store, tmp_path), "--store", str(store)]
 
     with pytest.raises(ValueError, match="different models"):
         project.main([*argv, "--", "a", "--", "b"])

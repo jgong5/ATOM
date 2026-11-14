@@ -211,7 +211,7 @@ def test_unset_store_measures_first_with_the_servers_flags_and_environment(tmp_p
     out = tmp_path / "out"
     measure, real, sim = servers
     assert (
-        f" measure memory --gpu 0,1,2,3,4,5,6,7 --machine {machine} "
+        " measure memory --gpu 0,1,2,3,4,5,6,7 "
         f"--store {out}/store --out {out}/memory -- --model {tmp_path}/model -tp 8 "
     ) in measure
     flags = measure.split(" -tp ", 1)[1]
@@ -291,7 +291,7 @@ def test_pp2_runs_two_stages_on_two_gpus_and_compares_each_stage(tmp_path):
     r, servers, run = _parity(tmp_path, CONFIG="pp2", STORE=None)
     assert r.returncode == 0, r.stderr
     machine = ROOT / "scripts/compass/machines/mi308x-hjbog18.json"
-    assert f" measure memory --gpu 0,1 --machine {machine} " in servers[0]
+    assert " measure memory --gpu 0,1 --store " in servers[0]
     assert len(servers) == 3
     for line in servers:
         assert " -tp 1 -pp 2 --enforce-eager --level 0 --max-model-len 8192 " in line

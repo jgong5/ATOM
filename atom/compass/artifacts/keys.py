@@ -64,7 +64,6 @@ PLATFORM = (Axis.DEVICE, Axis.SOFTWARE_STACK, Axis.PTL, Axis.TORCH)
 
 #: What keys each artifact besides its platform, in the order a key reads.
 OWN_FIELDS: Mapping[Kind, tuple[str, ...]] = {
-    Kind.MACHINE_SPEC: (),
     # `workload` is the digest of the requests its steps name; `backend` the
     # pricing backend's digest, so another backend addresses another entry.
     Kind.SHAPE_POPULATION: ("model", "workload", "engine_config", "backend"),
@@ -97,6 +96,7 @@ OWN_FIELDS: Mapping[Kind, tuple[str, ...]] = {
     Kind.PROJECTION: ("model", "spec", "source_root", "cells"),
     # The node's host name, so one node publishes one record per platform.
     Kind.PROBE_RECORD: ("host",),
+    Kind.PLATFORM_READINGS: (),
 }
 
 #: What keys each artifact: its own fields, then each platform axis a row of

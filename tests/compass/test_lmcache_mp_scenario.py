@@ -123,7 +123,7 @@ def _measure(out: Path, machine: Path, width: list, port: int) -> None:
     gpus = os.environ.get("HIP_VISIBLE_DEVICES", "0")
     beside = shlex.join(["lmcache", "server", *_server(port)])
     cli.main(
-        ["measure", "memory", "--gpu", gpus, "--machine", str(machine)]
+        ["measure", "memory", "--gpu", gpus]
         + ["--beside", beside]
         + ["--store", str(out / "store"), "--out", str(out / "measure")]
         + ["--", *ATOM_ARGS, *width]

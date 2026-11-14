@@ -3,7 +3,8 @@
 
 `lacking` resolves the run's inputs as `runfile.build`, the runner and the
 server do, calling per input the function whose refusal the run would meet,
-so one lacking input hides no other: the machine spec; each store key or law
+so one lacking input hides no other: the platform, its datasheet and readings
+(`runfile.spec`); each store key or law
 file a flag names (`runfile.resolve`); a step linear law and host laws held
 against this run's engine config, widths, platform and host key
 (`run.pick_fitted`, `run.refuse_unfitted_law`, `run.refuse_unfitted_host`),
@@ -50,12 +51,12 @@ NAMES = {
 }
 #: The commands that make each input.
 MADE_BY = {
-    "machine spec": "a developer's spec script, scripts/compass/<machine>_spec.py",
+    "platform": "compass measure device on each node, then compass fit device",
     STEP_LINEAR: "compass record, then compass fit steps --backend step-linear",
     STEP_GRID: "compass trace steps, compass measure steps --grid, then compass "
     "fit steps --backend step-grid",
     "host": "compass record, then compass fit host",
-    "memory readings": "compass measure memory --gpu G --out D --machine {machine} "
+    "memory readings": "compass measure memory --gpu G --out D "
     "--store {store} -- {atom}",
     PRICE_LIST: "compass trace ops --population, compass measure ops --plan, then "
     "compass fit ops",
@@ -100,15 +101,14 @@ def lacking(args, atom_args) -> tuple[list, list]:
             lacks.append((name, state or _state(refused), str(refused), made_by))
             return False
 
-    try:
-        document = json.loads(Path(args.machine).read_text())
-        machine = compass_run._machine({"machine": document})
-    except (OSError, SpecRefusal) as refused:
-        return [("machine spec", "missing", str(refused), MADE_BY["machine spec"])], []
     store = ArtifactStore(Path(args.store).resolve())
+    try:
+        machine = runfile.spec(args, store)
+    except (OSError, ArtifactRefusal, SpecRefusal, ValueError) as refused:
+        return [("platform", "missing", str(refused), MADE_BY["platform"])], []
     arch, engine = machine.value("device.arch"), runfile._engine_args(atom_args)
     config = drive_run._config(atom_args, arch)
-    run = {"machine": document, "store": str(store.root)}
+    run = {"machine": machine.echo(), "store": str(store.root)}
     flags = {k: getattr(args, k) for k in runfile.KINDS if getattr(args, k)}
     for name, tokens in (flags | {"host": args.host_laws or []}).items():
         tokens, held = [tokens] if isinstance(tokens, str) else tokens, []
@@ -137,7 +137,7 @@ def lacking(args, atom_args) -> tuple[list, list]:
         and met(grid, made, step_grid.load, run[STEP_GRID], config, machine)
     )
     made = MADE_BY["memory readings"].format(
-        machine=args.machine, store=args.store, atom=shlex.join(atom_args)
+        store=args.store, atom=shlex.join(atom_args)
     )
     met("memory readings", made, memory.load, run["store"], config, machine, 0)
 

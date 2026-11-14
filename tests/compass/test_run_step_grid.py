@@ -80,10 +80,11 @@ KEY = {
     "engine_config": "replay-mns48",
     "grid": "s2-sparse-margin0.25",
     "source_root": "tree-67c176f0",
-    "device": "MI355X",
-    "software_stack": "rocm 7.2.4 / aiter 9205e1059 / rccl 2.27.7",
+    # The platform the suite's machine document states, as a run reads it.
+    "device": "MI355X gfx950",
+    "software_stack": "rocm 7.2.4 / aiter f4e7c7509 / rccl 2.22.3",
     "ptl": "disabled",
-    "torch": "2.10.0+rocm7.2.4.git3d3aa833",
+    "torch": "2.10.0",
 }
 BOUNDS = {"max_num_seqs": 48, "max_num_batched_tokens": 8192, "max_model_len": 2048}
 BUNDLE = {

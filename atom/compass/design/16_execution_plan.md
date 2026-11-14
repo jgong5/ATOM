@@ -4,7 +4,7 @@
 interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
 written against it yet; implementation follows the execution plan in `16`.
 
-**Depends on:** all of `01`–`15`, and `17`. This document turns those topics' decisions,
+**Depends on:** all of `01`–`15`, `17` and `19`. This document turns those topics' decisions,
 and the register of open items in [`12_open_items.md`](12_open_items.md), into work that
 can be allocated. Neither is counted here. The register is owned by `12`, restated once on
 `README.md`'s front page, and it moves as tasks land; a third copy in a document that does
@@ -49,6 +49,9 @@ last step of v1; stage 3c's projection stays frozen as the before side of the me
 [#3256](https://github.com/jgong5/ATOM/issues/3256) and
 [#3257](https://github.com/jgong5/ATOM/issues/3257):** *Stage M3-Agentic* simulates ATOM's
 MiniMax-M3 AgentX submission on MI355X and grades it point by point (D95.1).
+
+**Revised 2026-11-13 by [#3355](https://github.com/jgong5/ATOM/issues/3355):** *After v1*
+lists adoption (`19`) and the order its work runs in.
 
 **Scope.** How the work is organised, allocated and gated; what happens first; and what
 each stage must produce. It is **detailed through M2**. Work after v1 is listed, not
@@ -512,7 +515,7 @@ the 450–650 range needs re-costing before W1.9 starts:
 | Correction | Effect on W1.9 |
 |---|---|
 | A bootstrap that precedes the first `PhaseRunner` **does** exist. `discover_plugins()` resolves each entry point with `importlib.util.find_spec`, which on a *dotted* value imports the parent package, so `compass_harness.plugin:plugins.yaml` executes `compass_harness/__init__.py` during discovery. The rebind is deferred from there by a stdlib import hook, because that bootstrap runs inside `aiperf.plugin.plugins`' own module body and cannot import `aiperf` — executed, five combinations, 7/7 in the working shape (`06` D34, T73) | **T73 is a packaging choice plus ~20 lines of import hook, inside the existing "plugin manifest, bootstrap, config glue" row — not a precondition of the seam and not W1.9's first deliverable.** The bootstrap shape that *would* be too late is a side effect of the strategy module: phase 0 on the real clock, phase 1 rebound, smoke test passes. That is why the tripwire ships regardless |
-| `runner.py:191` calls `LoopScheduler()` with no arguments, so the rebound class must be no-arg constructible — `ClockPacedLoopScheduler(LoopScheduler)`, a subclass, not the spike's `ClockPacedScheduler(inner)` wrapper | The spike validated option A's shape. "About five lines" was costed against the wrong object, so that component row is **open** |
+| aiperf's `timing/phase/runner.py::PhaseRunner.__init__` calls `LoopScheduler()` with no arguments, so the rebound class must be no-arg constructible — `ClockPacedLoopScheduler(LoopScheduler)`, a subclass, not the spike's `ClockPacedScheduler(inner)` wrapper | The spike validated option A's shape. "About five lines" was costed against the wrong object, so that component row is **open** |
 | One scheduler per `PhaseRunner`, and `seamless=True` keeps two live | T76 — reconcile, or assert `seamless=False` |
 | Two `loop.call_later` idle-cap timers the rebind cannot reach, one of which upstream deliberately keeps outside the scheduler | T75 — override the two `_arm_*` methods, or declare the feature unsupported and assert both caps are `None` |
 
@@ -825,6 +828,12 @@ Listed so it is not mistaken for an omission; each is re-planned when v1 lands.
   an optional recipe (`17` D100).
 - Width transfer (T21) as a claim.
 - The upstream RFC for ATOM-core edits.
+- Adoption (`19`), its tasks cut from [#3355](https://github.com/jgong5/ATOM/issues/3355):
+  first with no GPU compute, on DeepSeek-V4-Pro's laws that pass `19` D112, the search,
+  the reuse check, the record list, the per-request split, the views and the guide's
+  draft; then on GPUs, `calibrate.sh`'s store and status, the development calibration and
+  the guide walked through; last, the op-family split once #1498 closes. The move to
+  MiniMax-M3 starts whenever `19` D117's conditions hold, its steps in D117's order.
 
 ---
 

@@ -8,18 +8,13 @@ invalidates the rows that name it and leaves the rest alone.
 `MATRIX` below holds the dependency rows, and it is deliberately a table: the
 deliverable is that a reader can check it cell by cell.
 
-**A uniform matrix has lost its point**, and these cells are the ones a tidying
+**A uniform matrix has lost its point**, and this cell is the one a tidying
 hand would take away:
 
 * `price_list` does **not** depend on the model. Its leaves are
   shape-parametric, and that is exactly what lets one campaign serve many
   shapes. A row that also depended on the model would make every new model a
   new pricing campaign.
-* `machine_spec`'s tokenizer terms do **not** depend on the device -- they are
-  host CPU work -- and its capacity does not depend on the software stack. So
-  `machine_spec` is a capacity row and a tokenizer-terms row here rather than
-  one, and a device change invalidates the first while a tokenizer change
-  invalidates the second.
 
 The host CPU invalidates `host_laws`, which time the host, and nothing that
 holds device time. A `shape_population`'s pricing backend is in its key rather
@@ -37,7 +32,6 @@ from .rules import ArtifactRefusal, Rule
 class Kind(enum.Enum):
     """The artifacts this store holds. There are no others."""
 
-    MACHINE_SPEC = "machine_spec"
     SHAPE_POPULATION = "shape_population"
     OP_GRAPH = "op_graph"
     OP_MEASUREMENT = "op_measurement"
@@ -49,6 +43,7 @@ class Kind(enum.Enum):
     STEP_GRID_BUNDLE = "step_grid_bundle"
     PROJECTION = "projection"
     PROBE_RECORD = "probe_record"
+    PLATFORM_READINGS = "platform_readings"
 
     def __str__(self) -> str:
         return self.value
@@ -80,14 +75,9 @@ class Axis(enum.Enum):
 
 
 class Row(enum.Enum):
-    """The rows. `machine_spec`'s capacity and tokenizer terms are rows apart,
-    and that is the point."""
-
     OP_GRAPH = "op_graph"
     PRICE_LIST = "price_list"
     MEMORY_READINGS = "memory_readings"
-    MACHINE_SPEC_CAPACITY = "machine_spec: capacity"
-    MACHINE_SPEC_TOKENIZER_TERMS = "machine_spec: tokenizer terms"
     STEP_MEASUREMENT = "step_measurement"
     STEP_LINEAR_LAW = "step_linear_law"
     HOST_LAWS = "host_laws"
@@ -111,8 +101,8 @@ class Cell:
 
     The note is carried rather than dropped because each row that has one
     says something the mark alone does not -- which part of the engine config
-    an `op_graph` turns on, why a `price_list` is free of the model, and which
-    reading of "model" a tokenizer term follows.
+    an `op_graph` turns on, why a `price_list` is free of the model, and what
+    a `probe_record` reads torch through.
     """
 
     depends: bool
@@ -158,26 +148,6 @@ MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
         Axis.PTL: DEPENDS,
         Axis.HOST_CPU: INDEPENDENT,
         Axis.ENGINE_CONFIG: DEPENDS,
-    },
-    Row.MACHINE_SPEC_CAPACITY: {
-        Axis.SOFTWARE_STACK: INDEPENDENT,
-        Axis.TORCH: INDEPENDENT,
-        Axis.ATOM_SRC: INDEPENDENT,
-        Axis.MODEL: INDEPENDENT,
-        Axis.DEVICE: DEPENDS,
-        Axis.PTL: INDEPENDENT,
-        Axis.HOST_CPU: INDEPENDENT,
-        Axis.ENGINE_CONFIG: INDEPENDENT,
-    },
-    Row.MACHINE_SPEC_TOKENIZER_TERMS: {
-        Axis.SOFTWARE_STACK: INDEPENDENT,
-        Axis.TORCH: INDEPENDENT,
-        Axis.ATOM_SRC: INDEPENDENT,
-        Axis.MODEL: Cell(True, "tokenizer"),
-        Axis.DEVICE: Cell(False, "host CPU"),
-        Axis.PTL: INDEPENDENT,
-        Axis.HOST_CPU: Cell(False, "untested: assumed to transfer by derate"),
-        Axis.ENGINE_CONFIG: INDEPENDENT,
     },
     Row.STEP_MEASUREMENT: {
         Axis.SOFTWARE_STACK: DEPENDS,
@@ -252,14 +222,12 @@ MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
     },
 }
 
-#: Which rows decide a kind's validity. `machine_spec` is its capacity and
-#: tokenizer-terms rows.
+#: Which rows decide a kind's validity.
 ROWS_OF: Mapping[Kind, tuple[Row, ...]] = {
     Kind.OP_GRAPH: (Row.OP_GRAPH,),
     Kind.PRICE_LIST: (Row.PRICE_LIST,),
     Kind.OP_MEASUREMENT: (Row.PRICE_LIST,),
     Kind.MEMORY_READINGS: (Row.MEMORY_READINGS,),
-    Kind.MACHINE_SPEC: (Row.MACHINE_SPEC_CAPACITY, Row.MACHINE_SPEC_TOKENIZER_TERMS),
     Kind.STEP_MEASUREMENT: (Row.STEP_MEASUREMENT,),
     Kind.STEP_LINEAR_LAW: (Row.STEP_LINEAR_LAW,),
     Kind.HOST_LAWS: (Row.HOST_LAWS,),
@@ -267,16 +235,13 @@ ROWS_OF: Mapping[Kind, tuple[Row, ...]] = {
     Kind.SHAPE_POPULATION: (Row.SHAPE_POPULATION,),
     Kind.PROJECTION: (Row.PROJECTION,),
     Kind.PROBE_RECORD: (Row.PROBE_RECORD,),
+    # Folded from probe records, or another device's entry: the records' row.
+    Kind.PLATFORM_READINGS: (Row.PROBE_RECORD,),
 }
 
 
 def rows_for(kind: Kind) -> tuple[Row, ...]:
-    """The rows of the matrix a kind is checked against, or a refusal.
-
-    `machine_spec` answers with its capacity and tokenizer-terms rows, because
-    a device change invalidates its capacity while leaving its tokenizer terms
-    standing, and one row could not say that.
-    """
+    """The rows of the matrix a kind is checked against, or a refusal."""
     rows = ROWS_OF.get(kind, ())
     if not rows:
         raise ArtifactRefusal(

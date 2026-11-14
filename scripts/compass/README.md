@@ -890,11 +890,13 @@ Its other vectors and its host laws are the ones fitted on the lone cells alone,
 its `sources` names the records each came from. The prefill law's rung-2 vector is the
 decode law's, stating `declared`, since the prefill law's own fit left rung 2 unfitted
 ([#2660](https://github.com/jgong5/ATOM/issues/2660)). Its prefill vector is refitted
-in the `cached_seqs` form on the lone prefill cells and on the prefill side of one 1P1D
-`deploy.sh record` cell, #975's cell at c=1 over traces 256 to 392, seed 20260707
-([#2853](https://github.com/jgong5/ATOM/issues/2853)); its other vectors but rung 2, and its
-host laws, are the lone cells' fit. The pair's lone cells ran the fp4 indexer and its 1P1D
-cells the fp8 one. Each law is keyed to the fp8 a P/D side resolves, without a refit: it
+in the `cached_seqs` form on records that ran the fp8 indexer alone: the prefill sides of
+#975's 1P1D cell, at c=1 over traces 256 to 392 and 0 to 255, seed 20260707
+([#2853](https://github.com/jgong5/ATOM/issues/2853)), and of #975's own rounds at c=1 to
+256, and two lone prefill cells at c=64 that ran fp8
+([#3073](https://github.com/jgong5/ATOM/issues/3073), [#3402](https://github.com/jgong5/ATOM/issues/3402));
+its other vectors but rung 2, and its host laws, are the lone cells' fit. The pair's lone
+cells ran the fp4 indexer and its 1P1D cells the fp8 one. Each law is keyed to the fp8 a P/D side resolves, without a refit: it
 states no `index_cache_dtype`, which then reads as `kv_cache_dtype`'s fp8, so a server that
 resolves fp4 refuses it. Its provenance states the gap that interleaved fp8 and fp4 lone cells
 measured ([#3073](https://github.com/jgong5/ATOM/issues/3073#issuecomment-6757202887)).
@@ -992,7 +994,7 @@ on cards 0-3, was taken again.
 A simulated run prices by a checked-in law when the law file stands in for both tokens:
 `compass run --step-linear LAW --host-laws LAW $M $S --out D -- $ATOM`, `LAW` a file in
 `scripts/compass/laws/` (or any law file `step_linear_fit` writes), and `$S` the store that
-holds the configuration's `memory_readings`. The run takes the step law at the machine spec
+holds the configuration's `memory_readings` and the platform's readings at the stack the file states. The run takes the step law at the platform
 and engine config the file states, and its `host` at the host key the file states, the
 `atom` digest it was last re-keyed at, so a law re-keyed to this tree runs here though its
 records ran at another; each refuses where a store entry's would. A law file names no fit
@@ -1129,7 +1131,7 @@ all-to-all is the default; EPLB, MTP and the decode's low-latency mode stay off.
 A real run is `deploy.sh record ... --store S`, which merges in the
 stack's JIT cache library from `S` and writes it back. A simulated run is
 `deploy.sh run --step-linear P --step-linear D --host-laws P --host-laws D
---machine scripts/compass/machines/mi355x-crs005.json --store S`, which builds the
+--device mi355x --ptl disabled --network crs005-013-ionic --store S`, which builds the
 cell's run file from these flags and both sides' arguments. `P` and `D` are
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json` and
 `-decode.json`, and `S` holds each side's `compass measure memory` readings, taken
@@ -1205,9 +1207,9 @@ Run everything from one tree, `$T` below, in the GPU container: host laws are
 keyed by ATOM's source, so records, fits and runs from two trees refuse each other.
 In the image, `compass` is `$T/scripts/compass/compass`, linked anywhere, and `python -m`
 runs with `PYTHONPATH=$T`, both from `/` so every path is absolute. Below, `$ATOM` is
-`--model <Qwen3.8-27B> --max-model-len 262144`, `$M` is `--machine` and this node's spec
+`--model <Qwen3.8-27B> --max-model-len 262144`, `$M` is `--device` and `--ptl`, this node's platform
 ([QUICKSTART.md](QUICKSTART.md#environment) says which), `$R` is a directory under `/data`
-or `/tmp` and `$S` is `--store $R/store`, empty at the start. The raw export keeps
+or `/tmp` and `$S` is `--store $R/store`, holding only the platform's readings at the start. The raw export keeps
 no prompt: aiperf leaves each request's payload out of it, and the client
 gzips it once the client run's export is written.
 
@@ -1262,7 +1264,7 @@ container's caches, replacing no file there, and its stop writes back each artif
 the server finished compiling; `compass measure memory` does the same with its
 store. A record without a store touches no library.
 
-1. `compass measure memory --gpu G $M $S --out $R/mem -- $ATOM`.
+1. `compass measure memory --gpu G $S --out $R/mem -- $ATOM`.
 2. Calibration, alone on the node: per concurrency 1, 4 and 16,
    `compass record --gpu G --out $R/cal/c<C> -- $ATOM` and `client.sh $R/cal/c<C>
    --traces 256-392 --concurrency <C> --stop`, each server started with
@@ -1274,8 +1276,8 @@ store. A record without a store touches no library.
    $R/trace/c<C> -- $ATOM` and `client.sh $R/trace/c<C> --traces 256-392
    --concurrency <C> --duration 120 --stop`.
 3. `compass fit steps --backend step-linear --form history --model $MODEL $R/cal/c*
-   $R/trace/c* --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M
-   $S --out $R/fit`, every record and trace run named before the first `--client-run`,
+   $R/trace/c* --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $S
+   --out $R/fit`, every record and trace run named before the first `--client-run`,
    `--model` naming the model directory, whose config gives a MoE model's routing, and
    `compass fit host` on the calibration records alone; each prints its store token.
    Steps 1 to 3, after a warm record, are `calibrate.sh $R/cal 1 4 16 "trace 16" "trace 4"` with
@@ -1302,7 +1304,7 @@ each run by the law fitted on the others; with one trace run, every prefill term
 unvalidated. Leave the trace runs out of `compass fit host`: their host segments ran
 under the profiler. A higher concurrency holds more prefill steps in the same time.
 Under a speculative drafter, `compass fit steps --ops DIR...` takes the profiler's
-floor, `--machine`'s `device.profiler_floor_s` (`probe_device.py`), out of the trace
+floor, the `device.profiler_floor_s` of the store's readings at its points' platform, out of the trace
 runs' drafter labels, each kernel's own length from `compass measure ops --drafter` at
 the trace runs' step shapes, traced first by `compass trace ops`; the fit's report
 names each kernel no point gave its own length.
@@ -1368,7 +1370,7 @@ powers of two and no margin:
 8. `compass fit steps --backend step-grid --grid POP... $R/cell/c*/real*
     --grid-definition $G $R/cal/c* RAGGED... --client-run ...`, naming every
     population, real run and record, and as `RAGGED` every view token step 7's
-    `--ragged` run printed, `$M $S --out $R/fit-grid`; it plans the views' cells
+    `--ragged` run printed, `$S --out $R/fit-grid`; it plans the views' cells
     again and refuses naming any not measured. It prints the bundle's
     token, and its report's `alpha` states per rung whether alpha was kept. A
     second fit of one definition into one store is refused as an overwrite:
@@ -1430,7 +1432,8 @@ and 5 at concurrency 16 alone, with these changes:
 
 - The image is `rocm/atom-dev:vllm-v0.31.0-nightly_20261026`, whose aiter the tree
   serves V4.1-Flash on, with `aiter_c90842add0.sh` run in each container before its
-  first server, and `$M` names `machines/mi355x-gpu40.json`, pinned to that stack.
+  first server, and `$M` is `--device mi355x --ptl disabled`, the store holding
+  gpu-40's readings at that stack.
 - `$ATOM` is `--model <DeepSeek-V4.1-Flash> --max-model-len 262144 -tp 4
   --kv_cache_dtype bf16 --index-cache-dtype fp8 --method dspark
   --num-speculative-tokens 5 --spec-decode-acceptance-length 3 --level 0`, plus

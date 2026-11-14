@@ -2,7 +2,7 @@
 """The `compass` console script: its command table, its refusals and its entry.
 
 `fit steps` and `fit host` run through it in `test_fit_steps.py` and
-`test_fit_host.py`, and here on a machine spec that refuses; elsewhere a
+`test_fit_host.py`, and here on records that refuse; elsewhere a
 command's module is planted where one is needed.
 """
 
@@ -16,12 +16,11 @@ from pathlib import Path
 
 import pytest
 import tomllib
+from test_fit_samples import edit
 from test_fit_steps import LINEAR, clients, record
-from test_memory_readings import DOCUMENT
 
 from atom.compass import cli
 from atom.compass.drive.gpu import GpuRefusal
-from atom.compass.spec import MachineSpec, SpecRefusal
 
 VERBS = [
     "record",
@@ -84,7 +83,7 @@ def test_a_module_not_built_refuses_and_a_missing_dependency_does_not_read_as_on
 ):
     monkeypatch.setitem(cli.COMMANDS, "run", ("atom.compass.no_such.run", ""))
     with pytest.raises(SystemExit, match="^compass run: not built yet$"):
-        cli.main(["run", "--machine", "m"])
+        cli.main(["run", "--device", "d"])
 
     (tmp_path / "planted_run.py").write_text("import planted_dependency\n")
     monkeypatch.syspath_prepend(tmp_path)
@@ -101,9 +100,9 @@ def test_a_module_not_built_refuses_and_a_missing_dependency_does_not_read_as_on
             "compass measure steps --grid plans the step grid's points, and compass run --coverage",
         ),
         ("validate", "grading is python -m atom.compass.validate"),
-        ("explain", "pass one with --machine"),
-        ("probe", "pass one with --machine"),
-        ("spec", "pass one with --machine"),
+        ("explain", "name it with --device and --ptl"),
+        ("probe", "name it with --device and --ptl"),
+        ("spec", "name it with --device and --ptl"),
         ("measure collectives", "priced by compass measure ops"),
         ("discover", "renamed compass trace steps"),
         ("trace", "use compass trace steps or compass trace ops"),
@@ -137,7 +136,8 @@ def test_project_is_a_command_and_the_bound_check_runs_by_python_m(
     assert got == [["--model", "m", "rec"]]
 
     spec = tmp_path / "spec.json"
-    bound = ["-m", "atom.compass.validate.bound", "--model", "m", "--machine", spec]
+    bound = ["-m", "atom.compass.validate.bound", "--model", "m", "--device", spec]
+    bound += ["--ptl", "disabled"]
     argv = [sys.executable, *map(str, bound), "--store", "s", "rec"]
     done = subprocess.run(argv, capture_output=True, text=True, check=False)
     assert done.returncode == 1 and "Traceback" not in done.stderr
@@ -154,26 +154,25 @@ def test_no_command_refuses_with_the_usage(argv):
 
 
 @pytest.mark.parametrize("verb, args", [("fit steps", LINEAR), ("fit host", ())])
-def test_a_machine_spec_that_refuses_exits_fit_with_its_refusal(tmp_path, verb, args):
-    a, machine = record(tmp_path / "a", 19), tmp_path / "spec.json"
-    spec = {**DOCUMENT, "schema_version": 2}
-    machine.write_text(json.dumps(spec))
-    with pytest.raises(SpecRefusal) as refusal:
-        MachineSpec.from_mapping(spec)
+def test_a_refusal_exits_fit_with_its_message(tmp_path, verb, args):
+    a = record(tmp_path / "a", 19)
+    edit(a / "run.json", lambda r: r.pop("ptl"))
 
-    tail = ["--machine", machine, "--store", tmp_path / "store", "--out", tmp_path]
+    tail = ["--store", tmp_path / "store", "--out", tmp_path]
     with pytest.raises(SystemExit) as exited:
         cli.main([*verb.split(), *args, *map(str, [a, *clients(a), *tail])])
-    assert exited.value.code == f"compass {verb}: {refusal.value}"
+    assert exited.value.code == (
+        f"compass {verb}: the records carry no PTL state; --ptl states their "
+        "cards' state"
+    )
 
 
 def test_a_malformed_record_exits_fit_with_its_traceback(tmp_path):
     """Its message names no file, so it is not printed as a refusal."""
-    a, machine = record(tmp_path / "a", 19), tmp_path / "spec.json"
-    machine.write_text(json.dumps(DOCUMENT))
+    a = record(tmp_path / "a", 19)
     (a / "run.json").write_text("{")
 
-    tail = ["--machine", machine, "--store", tmp_path / "store", "--out", tmp_path]
+    tail = ["--store", tmp_path / "store", "--out", tmp_path]
     with pytest.raises(json.JSONDecodeError):
         cli.main(["fit", "host", *map(str, [a, *clients(a), *tail])])
 

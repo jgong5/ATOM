@@ -4,11 +4,12 @@ torch its row of the invalidation matrix marks, and no other.
 
 The checked-in PTL-off law loads under hjbog-srdc-39's machine file and refuses
 under node 18's, naming the PTL state, while its host laws, whose row leaves
-PTL out, answer there. Records whose cards read another PTL state than the spec
-states refuse at the fit, naming it, and so do step grid bundles and step
-measurements at load. Every checked-in law states the platform of the spec it
-was fitted on and this tree's `atom` digest. `scripts/compass/migrate_keys.py`
-moves a law or a store entry keyed by a machine-spec digest to these keys.
+PTL out, answer there. Records fit under the PTL state their cards read, and
+refuse with none unless `--ptl` states it; step grid bundles and step
+measurements of another PTL state refuse at load. Every checked-in law states
+the platform of the spec it was fitted on and this tree's `atom` digest.
+`scripts/compass/migrate_keys.py` moves a law or a store entry keyed by a
+machine-spec digest to these keys.
 """
 
 import copy
@@ -35,8 +36,7 @@ from test_backend_step_linear import _installed
 from test_backend_step_linear_fit import _steps, _timed_record
 from test_fit_samples import edit
 from test_fit_steps import clients, planted_roots, record  # noqa: F401
-from test_measure_memory import a_start
-from test_memory_readings import DOCUMENT, META_8B, STACK, publish_readings
+from test_memory_readings import DOCUMENT, META_8B, publish_readings
 
 from atom.compass import cli
 from atom.compass.artifacts import (
@@ -54,7 +54,7 @@ from atom.compass.artifacts import (
     rows_for,
 )
 from atom.compass.backends import StepLinearBackend
-from atom.compass.drive import identity, measure_memory
+from atom.compass.drive import identity
 from atom.compass.drive.gpu import GpuRefusal
 from atom.compass.run import host_key_of
 from atom.compass.spec import MachineSpec
@@ -177,39 +177,28 @@ def test_the_ptl_off_law_refuses_on_cards_of_its_stack_with_ptl_on(
         _installed(monkeypatch, tmp_path, step_linear=HERE, machine=on)
 
 
-def with_ptl(tmp_path, ptl: str) -> Path:
-    """A spec file of `DOCUMENT` stating `ptl`."""
-    document = copy.deepcopy(DOCUMENT)
-    document["device"]["ptl"] = ptl
-    path = tmp_path / f"spec-{ptl}.json"
-    path.write_text(json.dumps(document))
-    return path
-
-
-def fit(tmp_path, a, spec: Path, *flags):
+def fit(tmp_path, a, *flags):
     store, out = tmp_path / "store", tmp_path / "out"
-    tail = ["--machine", spec, "--store", store, "--out", out, *flags]
+    tail = ["--store", store, "--out", out, *flags]
     argv = ["fit", "steps", "--backend", "step-linear", a, *clients(a), *tail]
     cli.main(list(map(str, argv)))
     return json.loads((out / "step_linear_law.json").read_text())
 
 
-@pytest.mark.parametrize(
-    "ran, stated",
-    [("enabled", "disabled"), ("disabled", "enabled"), (None, "disabled")],
-    ids=["on-under-off", "off-under-on", "unrecorded"],
-)
-def test_records_fit_only_under_a_spec_of_their_cards_ptl(tmp_path, ran, stated):
+@pytest.mark.parametrize("ran", ["enabled", "disabled"])
+def test_records_fit_under_the_ptl_state_their_cards_read(tmp_path, ran):
     a = record(tmp_path / "a", 19)
-    edit(a / "run.json", lambda r: r.update(ptl=ran) if ran else r.pop("ptl"))
-    told = f"ptl {ran or 'unrecorded'!r} in the records and {stated!r} in"
-    with pytest.raises(SystemExit, match=re.escape(told)):
-        fit(tmp_path, a, with_ptl(tmp_path, stated))
-    assert not (tmp_path / "store").exists()
+    edit(a / "run.json", lambda r: r.update(ptl=ran))
+    law = fit(tmp_path, a)
+    assert law["key"]["ptl"] == law["params"]["platform"]["ptl"] == ran
 
-    if ran:
-        law = fit(tmp_path, a, with_ptl(tmp_path, ran))
-        assert law["key"]["ptl"] == law["params"]["platform"]["ptl"] == ran
+
+def test_records_that_carry_no_ptl_state_refuse_without_ptl(tmp_path):
+    a = record(tmp_path / "a", 19)
+    edit(a / "run.json", lambda r: r.pop("ptl"))
+    with pytest.raises(SystemExit, match="the records carry no PTL state"):
+        fit(tmp_path, a)
+    assert not (tmp_path / "store").exists()
 
 
 def test_ptl_states_the_state_of_records_that_carry_none_and_the_report_says_so(
@@ -217,7 +206,7 @@ def test_ptl_states_the_state_of_records_that_carry_none_and_the_report_says_so(
 ):
     a = record(tmp_path / "a", 19)
     edit(a / "run.json", lambda r: r.pop("ptl"))
-    law = fit(tmp_path, a, with_ptl(tmp_path, "enabled"), "--ptl", "enabled")
+    law = fit(tmp_path, a, "--ptl", "enabled")
     assert law["report"]["stated_ptl"] == "enabled"
     assert law["key"]["ptl"] == "enabled"
 
@@ -231,7 +220,7 @@ def test_ptl_refuses_for_records_that_carry_a_ptl_state(tmp_path, carried):
         f"and these carry {carried!r}"
     )
     with pytest.raises(SystemExit, match=re.escape(told)):
-        fit(tmp_path, a, with_ptl(tmp_path, "enabled"), "--ptl", "enabled")
+        fit(tmp_path, a, "--ptl", "enabled")
     assert not (tmp_path / "store").exists()
 
 
@@ -288,20 +277,6 @@ def test_cards_read_ptl_under_their_pci_device_and_none_reads_disabled(
         "the cards of this run disagree on PTL: GPU 2 enabled, GPU 1 disabled, "
         "GPU 0 enabled"
     )
-
-
-def test_a_memory_start_on_cards_of_another_ptl_refuses_before_it_starts(
-    tmp_path, monkeypatch
-):
-    _, argv = a_start(tmp_path, monkeypatch, STACK)
-    monkeypatch.setattr(measure_memory, "_ptl", lambda gpus: "enabled")
-    with pytest.raises(ValueError) as refused:
-        measure_memory.main(argv)
-    assert str(refused.value) == (
-        f"the cards read ptl 'enabled', and {tmp_path / 'machine.json'} states "
-        "'disabled'; name the machine spec of the cards' PTL state"
-    )
-    assert not (tmp_path / "out").exists()
 
 
 def test_a_law_that_states_no_platform_refuses(monkeypatch, tmp_path):

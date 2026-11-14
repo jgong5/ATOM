@@ -12,6 +12,7 @@ import re
 import shutil
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_artifact_invalidation import moved
 from test_drive_run import bundle, op_graph_run, recorded, stub, unstarted
@@ -31,13 +32,11 @@ from atom.compass.validate import bound
 from atom.model_engine import llm_engine
 
 
-def checked(tmp_path, *flags, machine=None):
-    """`compass run --check`'s exit status with `flags`, the suite's machine,
-    or the file `machine`, and the store, serving the model in `tmp_path`."""
-    if machine is None:
-        machine = tmp_path / "machine.json"
-        machine.write_text(json.dumps(DOCUMENT))
-    common = ["--machine", str(machine), "--store", str(tmp_path / "store")]
+def checked(tmp_path, *flags, platform=None):
+    """`compass run --check`'s exit status with `flags`, the suite's platform,
+    or the `platform` flags, and the store, serving the model in `tmp_path`."""
+    common = platform or platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
+    common += ["--store", str(tmp_path / "store")]
     with pytest.raises(SystemExit) as exited:
         drive_run.main([*flags, *common, "--check", "--", "--model", str(tmp_path)])
     return exited.value.code
@@ -78,7 +77,7 @@ def test_one_check_lists_every_missing_input_with_what_makes_it(
     assert "0 step_linear_law entries in" in out
     assert "made by: compass record, then compass fit host" in out
     made = f"--store {tmp_path / 'store'} -- --model {tmp_path}"
-    assert "made by: compass measure memory --gpu G --out D --machine " in out
+    assert "made by: compass measure memory --gpu G --out D --store " in out
     assert made in out
     assert not (tmp_path / "out").exists()
 
@@ -150,8 +149,7 @@ def test_check_meets_the_server_s_refusal_of_a_tokenizer_from_another_backend(
 
 
 def _parsed(tmp_path, *flags):
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
-    common = ["--machine", str(tmp_path / "machine.json")]
+    common = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
     argv = [*flags, *common, "--store", str(tmp_path / "store"), "--check"]
     return drive_run._parser().parse_args(argv), ["--model", str(tmp_path)]
 
@@ -171,13 +169,14 @@ def test_a_run_that_lacks_nothing_exits_0_and_needs_no_out(
     assert not (tmp_path / "out").exists()
 
 
-def test_a_missing_machine_spec_is_listed_alone(tmp_path, monkeypatch, capsys):
+def test_missing_platform_readings_are_listed_alone(tmp_path, monkeypatch, capsys):
     served(monkeypatch, deployment(tmp_path).config)
 
-    code = checked(tmp_path, "--step-stub", stub(tmp_path), machine="absent.json")
+    platform = ["--device", "mi355x", "--ptl", "disabled"]
+    code = checked(tmp_path, "--step-stub", stub(tmp_path), platform=platform)
 
     assert code == 1
-    assert lacked(capsys.readouterr().out) == ["machine spec: missing"]
+    assert lacked(capsys.readouterr().out) == ["platform: missing"]
 
 
 def test_a_stale_bundle_is_listed_and_a_held_one_s_coverage_printed_apart(
@@ -249,8 +248,11 @@ def test_check_refuses_beside_join_and_a_run_without_it_still_needs_out(tmp_path
         drive_run.main([*join, "--", "--model", str(tmp_path)])
     assert refused.value.code == 2
 
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
-    argv = ["--step-stub", stub(tmp_path), "--machine", str(tmp_path / "machine.json")]
+    argv = [
+        "--step-stub",
+        stub(tmp_path),
+        *platforms.flags(tmp_path, DOCUMENT, tmp_path),
+    ]
     with pytest.raises(SystemExit) as refused:
         drive_run.main([*argv, "--store", str(tmp_path), "--", "--model", "m"])
     assert refused.value.code == 2
