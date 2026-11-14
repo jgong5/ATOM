@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """`compass measure ops` on MORI's dispatch and combine: each leaf is called at
-MORI's entry point on the handle ATOM builds for the model's MoE, never twice in
-a row, and priced at its own call's device time."""
+MORI's entry point on the handle ATOM builds for the model's MoE, built before
+the runner's KV pool is sized as ATOM's loader builds it, never twice in a row,
+and priced at its own call's device time."""
 
 import json
 import sys
@@ -12,8 +13,9 @@ from unittest.mock import patch
 import pytest
 import torch
 from test_bench_ops import _Runner
+from test_bench_ops_ranks import _atom_runner, _AtomRunner, _dpa_config
 
-from atom.compass.bench import ops
+from atom.compass.bench import ops, ranks
 from atom.compass.capture.peers import MORI
 from atom.utils import forward_context as fctx
 
@@ -298,3 +300,42 @@ def test_a_packed_fp4_wire_holds_two_values_a_column(monkeypatch, op):
 
     assert record["cold_ns"] == COST[leaf]
     assert {(t.shape, t.dtype) for t in handle.sent} == {((ROWS, HIDDEN // 2), fp4)}
+
+
+@pytest.mark.parametrize("uses_mori", [True, False], ids=["mori", "other"])
+def test_the_runner_builds_mori_s_exchange_before_atom_sizes_its_pool(
+    monkeypatch, uses_mori
+):
+    # ATOM's loader builds it, and MORI's heap with it, before ATOM sizes the
+    # pool; built at the first MORI leaf instead, the heap took room the pool
+    # had left the leaves' weights, and an EP8 MoE leaf ran out of memory
+    device = _Device()
+    handle = _Handle(device)
+    base, calls = _atom(monkeypatch, SimpleNamespace(_mori_ops=[handle]))
+    base.moe = SimpleNamespace(in_dtype=torch.bfloat16, use_mori_kernels=uses_mori)
+    built_when_sized = []
+
+    class Runner(_AtomRunner):
+        def __init__(self, rank, config):
+            super().__init__(rank, config)
+            self.model.append(_Moe(base()))
+
+        def get_num_blocks(self):
+            built_when_sized.append(len(calls))
+            return super().get_num_blocks()
+
+    _atom_runner(monkeypatch)
+    engine = SimpleNamespace(ModelRunner=Runner, RapidServeModelRunner=None)
+    monkeypatch.setitem(sys.modules, "atom.model_engine.model_runner", engine)
+    config = _dpa_config(2)
+    ranks.layout(config)
+    config.parallel_config._managed_distributed_store = True
+
+    stub = ops.Stub(ops._runner(config, 0), 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+    record = _time(stub, DISPATCH, device)
+
+    assert built_when_sized == [int(uses_mori)]
+    # one build, which the leaf takes: the runner's, else the leaf's own
+    assert len(calls) == 1
+    assert record["cold_ns"] == COST["dispatch"] and handle.sent

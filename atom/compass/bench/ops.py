@@ -953,7 +953,9 @@ def _runner(config, rank: int):
     """ATOM's runner at TP `rank` of `config`'s DP rank, its parameters built on
     the meta device and no warmup run, its KV pool allocated at the fewest
     blocks a rank has room for, sized by ATOM with the parameters' bytes held
-    on the device and then freed for the weights each leaf builds; the runner
+    on the device and then freed for the weights each leaf builds, and with
+    the MORI exchange ATOM's loader builds before it, MORI's heap with it, in
+    its `mori` (`_exchange`) where its MoE exchanges through MORI; the runner
     attributes the allocation set are in its `kv_held`, and by path each
     tensor it bound on a metadata builder (`BUILDERS`, `_bound`) but a view the
     builder cut from one of the runner's (`_cut_from`); and, when
@@ -995,6 +997,9 @@ def _runner(config, rank: int):
     runner.store = store
     nbytes = sum(p.nbytes for p in runner.model.parameters())
     held = torch.empty(nbytes, dtype=torch.uint8, device=runner.device)
+    # as ATOM's loader, before the pool is sized: built at the first MORI
+    # leaf instead, the heap took room the pool left the leaves' weights
+    runner.mori = _exchange(dict(runner.model.named_modules()), mori_only=True)
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     del held
     _release()  # the pool takes the room the hold had
@@ -1021,6 +1026,33 @@ def _runner(config, rank: int):
         ids.send_to_cpu_async(zero, ids.token_ids_cpu, done)
         ids.recv_async_output(ids.token_ids_cpu)
     return runner
+
+
+def _exchange(modules: dict, mori_only: bool = False):
+    """What ATOM's loader (`init_prepare_finalize`) builds for the exchange of
+    the first MoE layer in `modules`: the layer's name, what it built and the
+    dtype the layer's rows enter in; building MORI's exchange builds MORI's
+    heap. None where `modules` hold no MoE layer (a model holding one has
+    imported ATOM's MoE module), or, with `mori_only`, where that layer's
+    exchange is not MORI's."""
+    base = getattr(sys.modules.get("atom.model_ops.moe"), "FusedMoEMethodBase", ())
+    name, layer = next(
+        (
+            (name, m)
+            for name, m in modules.items()
+            if isinstance(getattr(m, "quant_method", None), base)
+        ),
+        (None, None),
+    )
+    if layer is None or (mori_only and not layer.quant_method.moe.use_mori_kernels):
+        return None
+    method = layer.quant_method
+    made = base._maybe_make_prepare_finalize(
+        method.moe,
+        method.get_fused_moe_quant_config(layer),
+        method.routed_rows_wire,
+    )
+    return name, made, method.moe.in_dtype
 
 
 class Stub:
@@ -1069,8 +1101,9 @@ class Stub:
         self.shared = self.topk.get("topk_ids")
         # a point's real MoE rows, its ranks and the rows its MoE runs (`point`)
         self.loads, self.real = [], None
-        # what ATOM builds for MORI's exchange, once a MORI leaf asks (`_mori`)
-        self.mori = None
+        # what ATOM builds for MORI's exchange: the runner's, built before
+        # its pool was sized (`_runner`), else once a MORI leaf asks (`_mori`)
+        self.mori = getattr(runner, "mori", None)
         # DeepSeek-V4.1's compress ratios by the rows a page holds at each
         geometry = getattr(runner, "attn_metadata_builder", None)
         geometry = getattr(geometry, "geometry", None)
@@ -1980,33 +2013,12 @@ class Stub:
         builds it, once; refused by name where ATOM builds none, or one for
         another EP width, hidden size or count of experts a token than the
         leaf states, its hidden size the values a row of its `input` holds."""
-        from atom.model_ops.moe import FusedMoEMethodBase
-
+        self.mori = self.mori or _exchange(self.modules)
         if self.mori is None:
-            name, layer = next(
-                (
-                    (name, m)
-                    for name, m in self.modules.items()
-                    if isinstance(getattr(m, "quant_method", None), FusedMoEMethodBase)
-                ),
-                (None, None),
-            )
-            if layer is None:
-                raise ValueError(
-                    "the model has no MoE layer to build MORI's handle for"
-                )
-            method = layer.quant_method
-            made = FusedMoEMethodBase._maybe_make_prepare_finalize(
-                method.moe,
-                method.get_fused_moe_quant_config(layer),
-                method.routed_rows_wire,
-            )
-            if not getattr(made, "_mori_ops", None):
-                raise ValueError(
-                    f"ATOM builds {type(made).__name__} for {name}, not MORI"
-                )
-            self.mori = made, method.moe.in_dtype
-        made, dtype = self.mori
+            raise ValueError("the model has no MoE layer to build MORI's handle for")
+        name, made, dtype = self.mori
+        if not getattr(made, "_mori_ops", None):
+            raise ValueError(f"ATOM builds {type(made).__name__} for {name}, not MORI")
         handle, args = made._mori_ops[0], op["args"]
         c, sent = handle.config, args["input"]
         built = c.world_size, c.hidden_dim, c.num_experts_per_token
