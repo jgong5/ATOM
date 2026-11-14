@@ -214,7 +214,7 @@ M-f `14`; M-g `01` D3.5.
 | # | Item |
 |---|---|
 | ~~T108~~ | ~~The space file's format: every field, its values and its default, the arguments that vary with the concurrency included (`19` D110)~~ — settled 2026-11-14 by [#3448](https://github.com/jgong5/ATOM/issues/3448): `19` D110 states every field, its values and its default, and the expansion |
-| T109 | The per-request split's file format; ATOM's `atom-benchmark/v1` request records are a candidate (`19` D114) |
+| ~~T109~~ | ~~The per-request split's file format; ATOM's `atom-benchmark/v1` request records are a candidate (`19` D114)~~ — settled 2026-11-14 by [#3458](https://github.com/jgong5/ATOM/issues/3458): `19` D114 states the file, `request_split.json`, each finished request an `atom-benchmark/v1` request record with its split |
 | ~~T110~~ | ~~A 1P1D point's GPUs over both sides from #3264's code, which counts TP times DP from one engine record (`19` D111)~~ — settled 2026-11-14 by [#3454](https://github.com/jgong5/ATOM/issues/3454): `19` D111 counts a 1P1D point's GPUs as its prefill side's plus its decode side's, each tensor parallel times data parallel from that side's own engine record |
 | T111 | Whether ATOM's Benchmark Dashboard (`.github/dashboard/index.html`) can show both marks and the recommended point, or the dashboard is a page of Compass's own (`19` D115) |
 | T112 | How MiniMax-M3's calibration and grading divide the traces: the `agentx` workload takes all 393 (`06` D35.1), a grader refuses a backend fitted on the traces it grades (`13` D80), and the M3-Agentic stage has stated neither yet (`19` D117) |
