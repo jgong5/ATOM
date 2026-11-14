@@ -13,10 +13,6 @@ really produced. Round numbers would make both tests vacuous.
 """
 
 import copy
-import importlib.util
-import json
-import pathlib
-import re
 
 import pytest
 
@@ -26,11 +22,9 @@ from atom.compass.spec import (
     MachineSpec,
     SpecRefusal,
     across_ranks,
-    explain,
     merge,
     validate,
 )
-from atom.compass.spec.fields import BY_PATH
 from atom.compass.spec.rules import Rule
 
 MACHINE = "mi355x-8gpu-2node"
@@ -371,96 +365,6 @@ def test_a_value_of_the_wrong_shape_is_reported():
     assert [refusal.rule for refusal in checked.refusals] == [Rule.SHAPE]
 
 
-# --- explain: the basis of a number ------------------------------------------
-
-
-def test_every_term_a_resolved_spec_holds_can_be_explained():
-    # The exit criterion, and it has to assert what is in the basis rather than
-    # that there is one: a path that is in `spec.values` cannot come back empty,
-    # so reachability alone survives every wrong value this module could report.
-    # Each row states the value the document holds, and carries a derate exactly
-    # when the field it came from is a spec peak.
-    spec = resolved()
-    for path in sorted(spec.values):
-        basis = explain(spec, path)
-        assert basis.contributions, path
-        assert basis.digest == spec.digest()
-        field = BY_PATH[path]
-        for row in basis.contributions:
-            assert row.value == spec.values[path], path
-            assert (row.derate is not None) == field.peak, path
-
-
-def test_a_spec_peak_is_reported_with_its_derate_and_the_derated_value():
-    basis = explain(resolved(), "device.compute.bf16_flops")
-    (row,) = basis.contributions
-    assert (row.value, row.derate) == (2.5e15, 0.70)
-    assert row.effective == pytest.approx(1.75e15)
-    assert "x 0.7" in str(row)
-
-
-def test_a_number_that_is_not_a_spec_peak_carries_no_derate():
-    (row,) = explain(resolved(), "device.memory.capacity_bytes").contributions
-    assert row.derate is None and row.effective == row.value
-
-
-def test_a_block_explains_to_every_field_under_it():
-    term = "interconnect.inter_node"
-    paths = {row.path for row in explain(resolved(), term).contributions}
-    assert paths == {
-        f"{term}.link_bandwidth_bytes_per_s",
-        f"{term}.link_latency_s",
-        f"{term}.derate",
-    }
-
-
-def test_a_basis_names_the_fragment_each_field_came_from():
-    combination = merged()
-    spec = MachineSpec.from_mapping(combination.document)
-    basis = explain(spec, "device.memory.capacity_bytes", origin=combination)
-    supplied = {row.path: row.supplied_by for row in basis.contributions}
-    assert supplied["device.memory.capacity_bytes"] == ("class1",)
-    links = explain(spec, "interconnect.intra_node", origin=combination)
-    supplied = {row.path: row.supplied_by for row in links.contributions}
-    assert supplied["interconnect.intra_node.link_latency_s"] == ("links",)
-
-
-def test_without_a_merge_a_basis_still_reads_but_names_no_fragment():
-    basis = explain(resolved(), "device.memory.capacity_bytes")
-    assert basis.contributions[0].supplied_by == ()
-
-
-def test_a_term_the_schema_does_not_know_is_asked_for_again_by_path():
-    # An unknown term and an optional field the document left out both come
-    # back empty however they are spelled, so both are asked for again.
-    assert "device.clock_ceiling" not in BY_PATH
-    assert not BY_PATH["provenance.notes"].required
-    for term in ("device.clock_ceiling", "provenance.notes"):
-        with pytest.raises(SpecRefusal) as refused:
-            explain(resolved(), term)
-        assert refused.value.rule is Rule.ADDRESSING
-        assert refused.value.what == f"`{term}` names no field this spec states"
-        assert "ask again by the dotted path" in refused.value.remedy
-
-
-def test_a_block_explains_without_an_optional_field_the_document_left_out():
-    spec = resolved()
-    assert "provenance.notes" not in spec.values
-    paths = {row.path for row in explain(spec, "provenance").contributions}
-    assert "provenance.authored_by" in paths
-    assert "provenance.notes" not in paths
-
-
-def test_the_basis_prints_its_spec_and_one_line_per_field():
-    combination = merged()
-    spec = MachineSpec.from_mapping(combination.document)
-    term = "interconnect.inter_node"
-    printed = str(explain(spec, term, origin=combination)).splitlines()
-    assert printed[0].endswith(spec.digest())
-    assert printed[2].strip().startswith(f"{term}.link_latency_s = 5e-06")
-    assert printed[2].endswith("[links]  probed")
-
-
 # --- one reading per rank ----------------------------------------------------
 
 
@@ -500,136 +404,6 @@ def test_a_reading_no_spec_could_hold_is_refused_where_the_ranks_are():
 
 
 def test_the_verbs_are_reachable_by_name():
-    for name in ("merge", "validate", "explain", "across_ranks"):
+    for name in ("merge", "validate", "across_ranks"):
         assert name in spec_package.__all__
         assert getattr(spec_package, name, None) is not None
-
-
-SPEC_ROOT = pathlib.Path(__file__).resolve().parents[2]
-
-
-def _node18_script():
-    path = SPEC_ROOT / "scripts" / "compass" / "mi308x_spec.py"
-    loaded = importlib.util.spec_from_file_location("mi308x_spec", path)
-    module = importlib.util.module_from_spec(loaded)
-    loaded.loader.exec_module(module)
-    return module
-
-
-def test_the_node_18_fragments_validate_and_explain_splits_measured_from_declared():
-    script = _node18_script()
-    merged = merge(script.device_fragments())
-    assert validate(merged.document).ok
-    measured, declared = script.report(merged).split("assumed:")
-    for field in ("device.memory.capacity_bytes", "device.ptl"):
-        assert field in measured and field not in declared
-    for field in ("interconnect.inter_node.derate", "inter_node.link_latency_s"):
-        assert field in declared and field not in measured
-
-
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39"])
-def test_the_checked_in_mi308x_specs_hold_their_start(monkeypatch, name):
-    monkeypatch.setenv("COMPASS_MACHINE", name)
-    script = _node18_script()
-    path = SPEC_ROOT / "scripts" / "compass" / "machines" / f"{name}.json"
-    values = MachineSpec.from_mapping(json.loads(path.read_text())).values
-    for fragment in script.device_fragments():
-        for key, value in fragment.values.items():
-            if not key.startswith("provenance."):
-                assert values[key] == value, key
-
-
-MI355X = ["mi355x-gpu45", "mi355x-crs005", "mi355x-gpu40"]
-
-
-def _mi355x_spec(monkeypatch, name):
-    """The MI355X script for machine `name` and its checked-in document, read."""
-    monkeypatch.setenv("COMPASS_MACHINE", name)
-    path = SPEC_ROOT / "scripts" / "compass" / "mi355x_spec.py"
-    loaded = importlib.util.spec_from_file_location("mi355x_spec", path)
-    script = importlib.util.module_from_spec(loaded)
-    loaded.loader.exec_module(script)
-    assert script.NAME == name
-    document = SPEC_ROOT / "scripts" / "compass" / "machines" / f"{name}.json"
-    return script, MachineSpec.from_mapping(json.loads(document.read_text()))
-
-
-@pytest.mark.parametrize("name", ["mi355x-crs013", "mi308x-hjbog18"])
-def test_the_mi355x_spec_refuses_a_machine_it_has_no_tables_for(monkeypatch, name):
-    with pytest.raises(SystemExit, match=f"COMPASS_MACHINE={name}: "):
-        _mi355x_spec(monkeypatch, name)
-
-
-@pytest.mark.parametrize("name", MI355X)
-def test_the_checked_in_mi355x_spec_holds_its_start(monkeypatch, name):
-    script, spec = _mi355x_spec(monkeypatch, name)
-    for fragment in script.device_fragments():
-        for key, value in fragment.values.items():
-            if not key.startswith("provenance."):
-                assert spec.values[key] == value, key
-
-
-@pytest.mark.parametrize("name", MI355X)
-def test_the_mi355x_spec_explains_what_the_start_measured_apart_from_the_declared(
-    monkeypatch, name
-):
-    script, spec = _mi355x_spec(monkeypatch, name)
-    origins = {}
-    for block in ("device", "interconnect"):
-        for row in explain(spec, block).contributions:
-            origins.setdefault(row.origin["origin"], set()).add(row.path)
-    assert set(origins) == {"probed", "datasheet", "assumed"}
-    assert "device.memory.capacity_bytes" in origins["probed"]
-    assert origins["datasheet"] == {
-        "device.memory.bandwidth_bytes_per_s",
-        "device.compute.bf16_flops",
-        "device.compute.fp8_flops",
-        "device.compute.fp4_flops",
-        "interconnect.intra_node.domain_devices",
-        "interconnect.intra_node.link_bandwidth_bytes_per_s",
-    }
-    record = spec.origin("device.memory.capacity_bytes")["record"]
-    assert record == f"sha256:{script.RECORD}"
-
-
-@pytest.mark.parametrize("name", MI355X)
-def test_the_mi355x_spec_rebuilds_byte_for_byte(monkeypatch, tmp_path, name):
-    script, _ = _mi355x_spec(monkeypatch, name)
-    document = SPEC_ROOT / "scripts" / "compass" / "machines" / f"{name}.json"
-    out = tmp_path / "rebuilt.json"
-    assert script.main(["--out", str(out)]) == 0
-    assert out.read_bytes() == document.read_bytes()
-
-
-def test_the_gpu40_spec_pins_nightly_20261026_with_the_recipes_aiter(monkeypatch):
-    script, spec = _mi355x_spec(monkeypatch, "mi355x-gpu40")
-    document = SPEC_ROOT / "scripts" / "compass" / "machines" / "mi355x-gpu40.json"
-    assert validate(json.loads(document.read_text())).ok
-    recipe = SPEC_ROOT / "scripts" / "compass" / "aiter_c90842add0.sh"
-    patched = re.search(r"^PATCHED=([0-9a-f]{40})$", recipe.read_text(), re.MULTILINE)
-    pinned = {
-        k: spec.value(f"device.software_pinned_to.{k}")
-        for k in ("rocm", "aiter", "rccl", "torch")
-    }
-    assert pinned == {
-        "rocm": "7.2.4",
-        "aiter": patched.group(1)[:9],
-        "rccl": "2.27.7",
-        "torch": "2.10.0+rocm7.2.4.git3d3aa833",
-    }
-    assert spec.value("device.ptl") == "disabled"
-    # The stack is the patched container's start's; the device is still the
-    # device start's, which ran the image's aiter.
-    stack = spec.origin("device.software_pinned_to.aiter")["record"]
-    assert stack == f"sha256:{script.STACK[-1]}"
-    assert spec.origin("device.name")["record"] == f"sha256:{script.RECORD}"
-
-
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39"])
-def test_the_mi308x_specs_rebuild_byte_for_byte(monkeypatch, tmp_path, name):
-    monkeypatch.setenv("COMPASS_MACHINE", name)
-    script = _node18_script()
-    document = SPEC_ROOT / "scripts" / "compass" / "machines" / f"{name}.json"
-    out = tmp_path / "rebuilt.json"
-    assert script.main(["--out", str(out)]) == 0
-    assert out.read_bytes() == document.read_bytes()

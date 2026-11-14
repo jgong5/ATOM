@@ -17,9 +17,9 @@
 #
 # The commit takes a fixed author, committer, date and message, so every
 # container of the image makes the same one, `PATCHED`, which
-# `machines/mi355x-gpu40.json` pins as aiter's commit: a container that has not
-# run this reads 41d4d8d7e, and every command that checks the stack against the
-# spec refuses there. A checkout already at `PATCHED` is not committed again,
+# gpu-40's laws state as aiter's commit: a container that has not
+# run this reads 41d4d8d7e, and a run there on those laws reads another stack
+# and refuses. A checkout already at `PATCHED` is not committed again,
 # and a checkout whose tracked files differ from its commit refuses, at either
 # commit: at `PATCHED` with the csrc reverted, the modules would build unpatched.
 # The modules are rebuilt for gfx950, the arch of gpu-40's cards, unless a build

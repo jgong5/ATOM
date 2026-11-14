@@ -27,7 +27,7 @@ from atom.compass.spec import MachineSpec
 
 FP8, E8M0, I64 = "torch.float8_e4m3fn", "torch.float8_e8m0fnu", "torch.int64"
 MI455 = MachineSpec.from_mapping(
-    json.loads((TREE / "scripts/compass/machines/mi455-a0.json").read_text())
+    json.loads((TREE / "tests/compass/machines/mi455-a0.json").read_text())
 )
 #: Window 4, every 2 tokens compressed, the top 3 read.
 GEOMETRY = {"window_size": 4, "compress_ratio": 2, "index_topk": 3}

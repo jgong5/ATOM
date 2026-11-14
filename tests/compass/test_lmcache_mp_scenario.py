@@ -195,7 +195,7 @@ def run_scenario(
 def runs(request, tmp_path_factory, lmcache_port):  # noqa: F811
     dp = request.param
     root = tmp_path_factory.mktemp(f"lmcache_dp{dp}")
-    machine = _machine(root)
+    machine = _machine(root, os.environ.get("HIP_VISIBLE_DEVICES", "0"))
     spec = json.loads(machine.read_text())
     spec["interconnect"]["host_link"] = {
         "bandwidth_bytes_per_s": 1e30,

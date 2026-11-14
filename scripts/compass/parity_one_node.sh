@@ -12,7 +12,7 @@
 #                    DeepSeek-V4-Pro's nightly DP-attention prefill server of
 #                    recipes/mesh/DeepSeek-V4.md, aggregated, MTP and expert
 #                    parallelism off: -tp 8 --enable-dp-attention --enable-tbo with
-#                    the nightly's flags and environment; it needs MACHINE.
+#                    the nightly's flags and environment.
 #                    Under DP-attention the DP width is the -tp width.
 #                    rapidserve: -tp 1 --enable-rapidserve, eager at compile
 #                    level 0; each engine records, and is compared, in its own
@@ -39,8 +39,12 @@
 #   LONG_TOKENS      output tokens request 0 asks for, to keep one request (and
 #                    under LMCACHE its server session) alive for long (default
 #                    0: its usual count)
-#   MACHINE          machine spec (default scripts/compass/machines/mi308x-hjbog18.json,
-#                    node 18's, PP carriers included; dsv4-dpa8 has no default)
+#   DEVICE PTL       the GPUs' datasheet, by SKU or path, and their PTL state, as
+#                    `compass run --device` and `--ptl` take them (required)
+#   READINGS         artifact store holding the GPUs' platform_readings, which
+#                    the run file's machine block is composed from (required)
+#   STACK            the readings' stack, as `compass run --stack` takes it, when
+#                    READINGS holds several
 #   STORE            artifact store holding the simulated configuration's memory
 #                    readings, taken by `compass measure memory`. Unset, the
 #                    script takes them first into OUT_DIR/store: `compass measure
@@ -54,8 +58,8 @@
 #                    tokens; the real run to a real `lmcache server` started
 #                    beside it with LMCACHE_FLAGS, the simulated one to LP lmcache
 #                    with the same flags, its request loop on the declared laws
-#                    below and its copies on MACHINE's interconnect.host_link,
-#                    which it then needs. Every request starts with PREFIX_WORDS
+#                    below and its copies on the readings' interconnect.host_link,
+#                    which they then hold. Every request starts with PREFIX_WORDS
 #                    shared words (default 600). Default 0.
 #   FAMILIES         prefix families: above 1, request k shares PREFIX_WORDS
 #                    only with the requests of family k % FAMILIES (default 1)
@@ -68,8 +72,8 @@
 #                    seconds (default 0.01)
 # The real run uses HIP_VISIBLE_DEVICES as set, and the measurement those GPUs
 # (unset, the first -tp of them). OUT_DIR gets memory/ when it measures, real/
-# and sim/, each with its server log and step record (sim/ also has the run
-# file, step table and summary), and compare.json; the last lines are the real run's
+# and sim/, each with its server log and step record (sim/ also has the machine
+# spec, run file, step table and summary), and compare.json; the last lines are the real run's
 # admission, send to response headers, and the compare per DP rank. Under
 # LMCACHE they also give the requests whose offload loads and saves differ, and
 # each run's expired-session sweeps and eviction ticks, from its server's log. A
@@ -92,7 +96,6 @@ tp2 | tp2-plain | dp-two-trees)
 dsv4-dpa8)
     TP=8 ARGS="--trust-remote-code --no-enable_prefix_caching --kv_cache_dtype fp8
         --block-size 16 --gpu-memory-utilization 0.85 --max-num-seqs 512 --enable-tbo"
-    MACHINE=${MACHINE:?CONFIG=dsv4-dpa8 needs MACHINE, the MI355X machine spec}
     export AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1 GPU_MAX_HW_QUEUES=5 ATOM_NUMA_BIND=1
     ;;
 rapidserve)
@@ -104,7 +107,6 @@ pp2)
     ;;
 *) echo "parity_one_node: CONFIG is tp2, tp2-plain, dp-two-trees, dsv4-dpa8, rapidserve or pp2, not $CONFIG" >&2; exit 2 ;;
 esac
-MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
 TREES=1 MEASURE_DP=
 if [[ $CONFIG == dp-two-trees ]]; then
     TREES=2 MEASURE_DP="--data-parallel-size 2"
@@ -120,6 +122,7 @@ ALONE=${ALONE:-0} GAP=0.05
 [[ $ALONE == 1 ]] && GAP=0.25
 mkdir -p "$OUT/real" "$OUT/sim"
 OUT=$(realpath "$OUT")
+compass_machine "$OUT/sim/machine.json"
 LMCACHE=${LMCACHE:-0} PREFIX=0 LM_FLAGS=
 if [[ $LMCACHE == 1 ]]; then
     PREFIX=${PREFIX_WORDS:-600} LM_PORT=$(compass_held_port)
@@ -219,7 +222,7 @@ for side in $SIDES; do
 done
 
 RUN=$OUT/sim/run.json CLOCK_PORT=$(compass_held_port)
-python3 - "$RUN" "$OUT" "$MACHINE" "$MODEL" "$STORE" "$CLOCK_PORT" "${DPA:+$((TP * TREES))}" \
+python3 - "$RUN" "$OUT" "$OUT/sim/machine.json" "$MODEL" "$STORE" "$CLOCK_PORT" "${DPA:+$((TP * TREES))}" \
     "$LM_FLAGS" "${IMAGE_S:-0.01}" "$TP" "$SIDES" "$PP" <<'EOF'
 import json, re, sys
 from pathlib import Path

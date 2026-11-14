@@ -12,9 +12,11 @@ reads SPACE alone, and writes nothing when SPACE refuses.
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from atom.compass.advice.space import expand
+from atom.compass.cli import refusing
 
 PROG = "compass advice"
 #: The expansion, in OUT.
@@ -36,3 +38,7 @@ def main(argv: list[str]) -> None:
             print(f"  {what} departs: {reason}")
     candidates, points = len(expansion["candidates"]), len(expansion["points"])
     print(f"{candidates} candidates and {points} points in {written}")
+
+
+if __name__ == "__main__":
+    refusing(PROG, main, sys.argv[1:])

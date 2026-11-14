@@ -20,7 +20,7 @@ from test_drive_runfile import host_laws, step_linear
 from test_fit_steps import planted_roots  # noqa: F401  autouse
 from test_key_index_cache_dtype import QWEN
 from test_key_index_cache_dtype import served as built
-from test_run_lacking import checked, lacked, served
+from test_run_lacking import COVERED, checked, lacked, served
 from test_run_step_grid import deployment, publish
 from test_step_labels_floor import _fit_traced, _ops
 
@@ -112,7 +112,9 @@ def _entries(tmp_path, taken):
 def test_entries_taken_with_one_draft_hold_with_it_and_refuse_the_other(
     tmp_path, monkeypatch, capsys, drafts
 ):
-    taken = deployment(tmp_path, speculative_config=drafter(drafts["eagle3"]))
+    taken = deployment(
+        tmp_path, speculative_config=drafter(drafts["eagle3"]), capture_sizes=COVERED
+    )
     flags = _entries(tmp_path, taken)
     served(monkeypatch, taken.config)
     assert checked(tmp_path, *flags) == 0
