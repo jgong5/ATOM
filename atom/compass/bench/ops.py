@@ -89,7 +89,8 @@ timed, for its pass as its forward's first reader fills it
 fills none; an object is rebuilt from its class
 and state as the capture's replay rebuilds one, its tensors built as any other
 argument's, its activations fresh on every copy, a lifted call's sequence a tuple.
-A leaf whose operator cannot run, or that copies to the host, refuses by name.
+A leaf whose operator cannot run, or that copies to the host or with host
+memory ATOM keeps pageable (`_pageable`), refuses by name.
 On one GPU at a DP-attention layout, the runner is one DP rank's own, TP 1 and DP 1, the
 graphs read and the keys written keep the layout, and a collective leaf
 refuses: it is measured across the layout's ranks, where a DP all-gather's
@@ -273,6 +274,9 @@ from atom.compass.run.modules import LAYER
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 PROG = "compass measure ops"
+#: aten's copies: each moves a host operand of any size by DMA, where another
+#: operator reads a 0-dim host tensor as a number.
+COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: The timing protocol's version; it changes whenever the operator a point
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
@@ -1215,6 +1219,17 @@ class Stub:
                     elif v41 := _named(op, path, spec, live, self.known):
                         pool = v41
                     try:
+                        rope = (op["op"], path, ratio) == (_ROPE, "positions", None)
+                        if (
+                            rope
+                            and self.pages
+                            and op["args"]["input"]["shape"][-2] == 1
+                        ):
+                            raise ValueError(  # a key's, over one head
+                                "its graph states no compress ratio, and no one "
+                                f"compress plan here holds its {spec['shape'][-1]} "
+                                "rows: trace its shape again"
+                            )
                         if index:  # as the forward's first reader writes it
                             step = passes.get(at, passes[None])[0]
                             pool = self._index(md.cache, step, index, ratio)
@@ -1390,11 +1405,14 @@ class Stub:
             and (op["args"].get("context_lens") or {}).get("role") != "activation"
         }
         # and by the rows each compress plan holds, as many as its keys' RoPE's,
-        # for a key RoPE captured before it stated its ratio
+        # for a key RoPE captured before it stated its ratio: rows that no one
+        # ratio's plan here holds tell none, and `_prepare` refuses that key
+        ratios = defaultdict(set)
+        for op, _ in found.values():
+            if op["op"] == _FUSED:
+                ratios[op["args"]["plan_gpu"]["shape"][0]].add(op["args"]["ratio"])
         self.known |= {
-            ("compressed", op["args"]["plan_gpu"]["shape"][0]): op["args"]["ratio"]
-            for op, _ in found.values()
-            if op["op"] == _FUSED
+            ("compressed", n): r.pop() for n, r in ratios.items() if len(r) == 1
         }
         # and its last layer's, whose tables a replay's queries take their
         # pointers from (`QueryRows.indices`)
@@ -1692,6 +1710,11 @@ class Stub:
             raise ValueError(
                 "a copy to pageable host memory, which ATOM allocates and no "
                 "CUDA graph captures"
+            )
+        if path := _pageable(op):
+            raise ValueError(
+                f"a copy with pageable host memory, {path}, which ATOM allocates "
+                "and no CUDA graph captures"
             )
         fn, m = _function(op["op"]), self.cold_copies.get(sig, n)
         self.loads, self.built = [], {}
@@ -2865,10 +2888,20 @@ def _random(spec, device) -> torch.Tensor:
     return flat.as_strided(spec["shape"], spec["stride"])
 
 
+def _pageable(op) -> str | None:
+    """The path of the first argument of `op` the capture states ATOM keeps in
+    pageable host memory: a copy's (`COPIES`), or any other's but a 0-dim one."""
+    copy = op["op"].startswith(COPIES)
+    for path, spec in _specs(op["args"]):
+        if spec.get("pageable") and (copy or spec["shape"]):
+            return path
+    return None
+
+
 def _host(spec, pinned) -> torch.Tensor:
     """`spec` on the host, drawn as `_random` draws it, in pinned memory when
-    `pinned`: a CUDA graph replays a copy from pinned memory only, and a
-    capture cannot tell pinned from pageable."""
+    `pinned`: a CUDA graph replays a copy from pinned memory only, and one
+    with memory ATOM keeps pageable refuses first (`_pageable`)."""
     drawn = _random(spec, "cpu")
     out = torch.empty_strided(
         drawn.shape, drawn.stride(), dtype=drawn.dtype, device="cpu", pin_memory=pinned
