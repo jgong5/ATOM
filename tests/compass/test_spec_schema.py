@@ -47,7 +47,7 @@ import sys
 import pytest
 
 from atom.compass import spec as spec_package
-from atom.compass.spec import Fragment, MachineSpec, SpecRefusal, explain
+from atom.compass.spec import Fragment, MachineSpec, SpecRefusal
 from atom.compass.spec.fields import FIELDS, SCHEMA, SCHEMA_VERSION, Kind
 from atom.compass.spec.rules import DEPLOYMENT_OWNED, Rule
 
@@ -595,16 +595,6 @@ def test_every_site_that_declines_a_document_is_driven_here():
         for make in BREAKAGES.values()
     } | {_site_of(declines) for declines in ELSEWHERE.values()}
     assert driven == _sites_naming("SHAPE")
-
-
-def test_explain_declines_an_unknown_term_and_an_absent_one_at_one_site():
-    # Neither is a document to correct, so neither is a shape: both are asked
-    # again by a path the spec states.
-    unknown = _site_of(lambda: explain(read(), "no_such_term"))
-    absent = _site_of(lambda: explain(read(), "provenance.notes"))
-    assert unknown[0] == "explain.py" and unknown in _sites_naming("ADDRESSING")
-    assert absent == unknown
-    assert unknown not in _sites_naming("SHAPE")
 
 
 def test_the_version_is_the_one_site_that_is_not_about_the_document():

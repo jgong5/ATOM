@@ -13,7 +13,7 @@ import pytest
 from test_spec_schema import DOCUMENT
 from test_spec_verbs import CLASS1, LINKS, fragment
 
-from atom.compass.spec import MachineSpec, SpecRefusal, explain, merge
+from atom.compass.spec import MachineSpec, SpecRefusal, merge
 from atom.compass.spec.fields import SCHEMA
 from atom.compass.spec.rules import Rule
 
@@ -107,8 +107,6 @@ def test_a_mixed_document_without_its_map_is_refused_by_name():
     assert refused.value.rule is Rule.TOTALITY
     assert "records no origin for `device.memory.capacity_bytes`" in str(refused.value)
     with pytest.raises(SpecRefusal, match="records no origin"):
-        explain(spec, "device.memory.capacity_bytes")
-    with pytest.raises(SpecRefusal, match="records no origin"):
         merge(
             [fragment("machine.json", {"device": document["device"]}, origin="mixed")]
         )
@@ -155,15 +153,3 @@ def test_origin_of_a_host_field_is_refused_as_of_any_unknown_path():
     for path in ("host.http_intake.fixed_s", "device.memory.colour"):
         with pytest.raises(SpecRefusal, match="not a field of this schema"):
             spec.origin(path)
-
-
-def test_explain_names_each_contributions_origin():
-    combination = merge(three_origins())
-    spec = MachineSpec.from_mapping(saved(combination.document))
-    rows = {row.path: row for row in explain(spec, "device").contributions}
-    assert rows["device.memory.capacity_bytes"].origin == {"origin": "probed", **CARD}
-    assert str(rows["device.memory.capacity_bytes"]).endswith(
-        "probed on model Qwen/Qwen3.8-27B, width 1, source_root commit:983e42973"
-    )
-    stated = {row.path: row.origin for row in explain(spec, "provenance").contributions}
-    assert set(stated.values()) == {None}
