@@ -461,7 +461,7 @@ V4_LISTS = {
 #: them: the paged cache's, the pass's step (`step.`), the decoder plan
 #: (`plan.`), the scorer workspace (`workspace.`), the forward context or the
 #: runner's buffers; or past one, its first row (`.0`) or it widened to int64
-#: (`.long`).
+#: (`.long`). A top-k of packed rows is keyed by the role `packed`.
 _CACHE = "attn_metadata_builder.cache.indptr_buffers.{ratio}"
 _STAGED = "attn_metadata_builder.cache._cursor_staging.gpu"
 _LOGITS = (
@@ -473,6 +473,7 @@ _FP4 = (
     "flydsl_pa_mqa_logits_fp4_rowgroup"
 )
 _PLAN = "step.plans.{ratio}.compress_plan_gpu"
+_OFFSETS = "step.planned.v41_score_offsets_{ratio}"
 _TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
 _INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
 _SCAN = f"{_INDPTRS}:_launch_indptr_scan"
@@ -492,7 +493,11 @@ V41_NAMES = {
     (_LOGITS, "out_logits"): "workspace._logits",
     (_FP4, "out"): "workspace._logits",
     (_LOGITS, "context_lens"): "step.visible.{ratio}",
+    (_FP4, "row_ends"): "step.visible.{ratio}",
     (_LOGITS, "kv_indices"): "workspace._tiles.{ratio}",
+    # where each row's logits start in the packed buffer (`score_layout`)
+    (_FP4, "out_offsets"): _OFFSETS,
+    (_TOPK, "row_starts", "packed"): _OFFSETS,
     (_TOPK, "row_starts"): "step.visible.{ratio}",
     (_TOPK, "row_ends"): "step.visible.{ratio}",
     (_FUSED, "plan_gpu"): _PLAN,
@@ -1123,13 +1128,27 @@ class Stub:
         # its pool was sized (`_runner`), else once a MORI leaf asks (`_mori`)
         self.mori = getattr(runner, "mori", None)
         # DeepSeek-V4.1's compress ratios by the rows a page holds at each
-        geometry = getattr(runner, "attn_metadata_builder", None)
-        geometry = getattr(geometry, "geometry", None)
+        builder = getattr(runner, "attn_metadata_builder", None)
+        geometry = getattr(builder, "geometry", None)
         self.known = self.pages = {
             ("rows_per_page", geometry.rows_per_page(r)): r
             for r in getattr(geometry, "layer_ratios", ())
             if r and hasattr(geometry, "rows_per_page")
         }
+        # on its FP4 plane, by the index blocks a page holds (a scorer's plan's
+        # `pages_per_block`) and the rows its block table's columns hold (the
+        # plane a whole context's top-k ranks)
+        if getattr(geometry, "index_fp4", False):
+            cols = getattr(builder, "block_table_cols", 0)
+            self.pages |= {
+                key: r
+                for r in geometry.layer_ratios
+                if r
+                for key in (
+                    ("pages_per_block", geometry.index_blocks_per_page(r)),
+                    ("plane_width", cols * geometry.rows_per_page(r)),
+                )
+            }
         # and the rows a request's window ring holds at a layer
         self.ring = getattr(geometry, "ring_slots", 0)
         # V4.1's FP8 index plane, whose prefill logits are as wide as the
@@ -2300,11 +2319,14 @@ def _ratio(op, path, known=None):
     argument, else the one it states; a list slot's i-th item the i-th of its
     `ratios` (DeepSeek-V4.1's indptr scan, a table a ratio); else the ratio
     `known` gives the rows a page holds at it (`rows_per_page`, V4.1's index
-    build, 0 when it takes no selection) or the width of the logits it reads
-    (`stride0`, V4.1's top-k, its scorer's), or, in a graph captured before
-    V4.1's key RoPE stated its ratio, a RoPE's positions the rows its compress
-    plan holds (`compressed`), or aten's index its table its model's last
-    layer's (`queries`), where a replay's queries take their pointers."""
+    build, 0 when it takes no selection), the index blocks its plan's page
+    holds (`pages_per_block`, V4.1's FP4 scorer), the plane its rows stand
+    for (an FP4 top-k's: `plane_width` packed, else its logits' `stride0`) or
+    the width of the logits it reads (`stride0`, V4.1's top-k, its scorer's),
+    or, in a graph captured before V4.1's key RoPE stated its ratio, a RoPE's
+    positions the rows its compress plan holds (`compressed`), or aten's index
+    its table its model's last layer's (`queries`), where a replay's queries
+    take their pointers."""
     args, (slot, *rest) = op["args"], path.split(".")
     listed = args.get("ratios")
     if rest and isinstance(args.get(slot), list) and isinstance(listed, list):
@@ -2313,6 +2335,13 @@ def _ratio(op, path, known=None):
     if ratio is None and "rows_per_page" in args and "selected" in args:
         ratio = (known or {}).get(("rows_per_page", args["rows_per_page"]))
         ratio = ratio if args["selected"] else 0
+    plan = args.get("plan") if op["op"] == _FP4 else None
+    if ratio is None and known and isinstance(plan, dict):
+        blocks = dict(plan.get("state") or ()).get("pages_per_block")
+        ratio = known.get(("pages_per_block", blocks))
+    if ratio is None and known and "plane_width" in args:
+        width = args["plane_width"] or args.get("stride0")
+        ratio = known.get(("plane_width", width))
     if ratio is None and known and "stride0" in args:
         ratio = known.get(("stride0", args["stride0"]))
     if ratio is None and known and (op["op"], path) == (_ROPE, "positions"):
@@ -2329,6 +2358,8 @@ def _named(op, path, spec, pool, known=None) -> dict | None:
     role = (op["args"].get("self") or {}).get("role")
     if op["op"] == _ROPE:  # over one head a ratio's index keys, over more a query
         role = "key" if op["args"]["input"]["shape"][-2] == 1 else "query"
+    if op["args"].get("packed_rows"):  # a top-k whose rows start apart
+        role = "packed"
     wanted = V41_NAMES.get((*key, role), V41_NAMES.get(key, ()))
     wanted = wanted if isinstance(wanted, tuple) else (wanted,)
     ratio = _ratio(op, path, known)
