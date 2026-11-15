@@ -2,8 +2,9 @@
 """A run's decode steps priced through a published price list, as a run asks
 them: each step prices as a backend new to it does, while each leaf's
 signature, and the work of a leaf whose work reads nothing of the step, is
-taken once over the run, and the work of a leaf whose work reads the step
-only where the list declines it.
+taken once over the run, the work of a leaf whose work reads the step only
+where the list declines it, and a step at a view priced before asks the list
+nothing.
 """
 
 import collections
@@ -22,8 +23,9 @@ from atom.compass.fit import ops, publish
 GEMM = "aiter.gemm_a16w16.default"
 ATTENTION = "aiter.unified_attention_with_output_base.default"
 VIEW = "aten.view.default"
-#: Each step's one row's context: the last but one past the measured range.
-CONTEXTS = (1000, 1001, 1002, 2000, 5000, 2001)
+#: Each step's one row's context: one past the measured range, and the first
+#: again, as a DP rank's dummy forwards repeat one view.
+CONTEXTS = (1000, 1001, 1002, 2000, 5000, 2001, 1000)
 
 
 def _gemm():
@@ -83,6 +85,9 @@ def test_steps_price_as_new_while_each_leaf_is_signed_and_worked_out_once(
         bench, "signature", lambda leaf: signed.append(1) or signature(leaf)
     )
     priced = backend(region)
+    listed, asked = priced.resolver.sources[0], []
+    price = listed.price
+    monkeypatch.setattr(listed, "price", lambda r: asked.append(1) or price(r))
 
     assert [_terms(priced, step) for step in steps] == new
     assert [sorted(t.name for t in terms) for terms, _ in new] == [
@@ -92,3 +97,5 @@ def test_steps_price_as_new_while_each_leaf_is_signed_and_worked_out_once(
     # attention's work at the first step and where the list declines it
     assert works == {VIEW: 1, GEMM: 1, ATTENTION: 2}
     assert len(signed) == 2
+    # the GEMM and attention once a step, but at the view priced before
+    assert len(asked) == 2 * len(set(CONTEXTS))
