@@ -585,8 +585,12 @@ search's or profiling's code.
   optional reference layer, labelled with its source: InferenceX's DeepSeek-V4-Pro curves,
   frozen since it retired the model on 2026-10-29, as another ATOM version with
   unverified configurations; on MiniMax-M3, the M3-Agentic stage's per-point verdicts on
-  mi355-gpu-40, as another platform; never InferenceX's MiniMax-M3 points. ATOM's
-  Benchmark Dashboard (`.github/dashboard/index.html`) is tried first (T111).
+  mi355-gpu-40, as another platform; never InferenceX's MiniMax-M3 points. The layer is
+  the file `compass advice --reference` names, its source and its curves, each point's
+  metrics under the result table's names, so no code branches on the model. The page is
+  Compass's own (`atom/compass/advice/dashboard.py`), its four views drawn when it is
+  written and switched with no script; ATOM's Benchmark Dashboard was tried first and
+  serves neither mark (T111, below).
 - **The per-run report**, `report.html`, which every run, simulated or real, writes into
   its directory when it ends: the run (configuration, machine, ATOM tree, law sources
   from `run.json`, workload); headline metrics by #3264's code, as the dashboard computes
@@ -607,7 +611,14 @@ measured. **Basis.** The owner on #3355; `08` D50.1; `11`, which owns `/metrics`
 
 **Rejected.** ATOM's own report (`.github/scripts/atomesh/observability/export_report.py`):
 it plots Prometheus series, which need `/metrics` sampled on the simulated clock,
-deferred.
+deferred. ATOM's Benchmark Dashboard (`.github/dashboard/index.html`) for the search's
+dashboard (T111, settled by [#3465](https://github.com/jgong5/ATOM/issues/3465)): its
+points are CI benchmark entries from `data.js`, each keyed by model, ISL/OSL, concurrency
+and hardware, with no field for a grading state, method shares, a refusal or a
+recommendation; its trade-off chart draws total throughput per GPU against one over the
+mean TPOT, neither of InferenceX's interactivities; a point links only an `https://` URL
+(`safeHref`), never a run's `report.html` beside the page; and it loads Chart.js from a
+CDN, so it draws nothing offline. Each would change ATOM's CI page for one Compass view.
 
 ---
 
@@ -836,7 +847,7 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage (a decode vector for every scheduled rung before the search, each point's extrapolated share reported after it) and `08` D47's three figures on each leave-one-run-out fold within #627's 5% gate, a law at the head past it refused; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose ATOM digest is not the head's, the remote tip's or a frozen commit's, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363; the head by ATOM's digest, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957); coverage in two parts, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216); the accuracy bar, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6869501859)) |
 | D113 | The step linear backend lists a configuration's missing records, for a missing law or decode rung, as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
 | D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355) |
-| D115 | Two static views reading files only: the search's dashboard, each point marked by grading state and method shares, and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell, which renders the cell's reports again. | 2026-11-13 (#3355, #3363) |
+| D115 | Two static views reading files only: the search's dashboard, a page of Compass's own, each point marked by grading state and method shares, with a reference layer from the file `--reference` names; and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell, which renders the cell's reports again. | 2026-11-13 (#3355, #3363); the page Compass's own 2026-11-15 ([#3465](https://github.com/jgong5/ATOM/issues/3465)) |
 | D116 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355) |
 | D117 | Moved to MiniMax-M3 once its Compass features land and #3265 passes, calibrated on the development nodes from #3256's arms at one frozen commit, where its simulations and validation runs run too, every point priced by the step linear law alone, a step past its records extrapolated and reported, and the pricing reopened if #3256's grading fails the law where the step grid passes ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216)); the showcase validation runs the recommended configuration and the runner-up real, graded by `08` D44, their real order compared with the simulated one, each point's `08` D45.1 verdict beside its grade, not gated. Amends `08` D50. | 2026-11-13 (#3355, #3363) |
 
