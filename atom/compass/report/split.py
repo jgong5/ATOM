@@ -93,6 +93,8 @@ def _client(run: Path, simulated: bool) -> tuple[dict, dict]:
             ns, name = sent.get(record["request_id"], (None, None))
             if record["status"] != "success" or "e2el_s" not in record:
                 unsplit[record["request_id"]] = f"aiperf records it {record['status']}"
+            elif "ttft_s" not in record:  # aiperf times no first token without content
+                unsplit[record["request_id"]] = "aiperf records no first token for it"
             elif name is None:
                 unsplit[record["request_id"]] = "it got no response id"
             else:

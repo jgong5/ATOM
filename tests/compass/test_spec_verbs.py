@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""The verbs over the spec: combining fragments, checking one, reading one.
+"""The verbs over the spec: combining fragments and reading one.
 
 The fragments below are the ones the probes of each hardware probe class would emit --
 a single-card engine start and a fabric measurement -- so a test that combines them combines
@@ -23,7 +23,6 @@ from atom.compass.spec import (
     SpecRefusal,
     across_ranks,
     merge,
-    validate,
 )
 from atom.compass.spec.rules import Rule
 
@@ -105,16 +104,6 @@ def merged(**edits):
 
 def resolved(**edits):
     return MachineSpec.from_mapping(merged(**edits).document)
-
-
-def without(body, *path):
-    """A copy of a fragment body with one dotted field taken out of it."""
-    fresh = copy.deepcopy(body)
-    node = fresh
-    for key in path[:-1]:
-        node = node[key]
-    del node[path[-1]]
-    return fresh
 
 
 # --- merge: the conflict check, which is the point of the verb ----------------
@@ -289,82 +278,6 @@ def test_a_fragment_that_is_not_a_mapping_is_refused():
     assert refused.value.rule is Rule.SHAPE
 
 
-# --- validate: every reason at once, and the refusal list --------------------
-
-
-def test_a_complete_spec_validates_and_resolves():
-    checked = validate(merged().document)
-    assert checked.ok, [str(refusal) for refusal in checked.refusals]
-    assert str(checked) == "ok: 0 refusal(s)"
-
-
-def test_every_missing_field_is_reported_and_not_only_the_first():
-    thin = without(CLASS1, "device", "arch")
-    thin = without(thin, "device", "memory", "capacity_bytes")
-    checked = validate(merge(fragments(class1=thin)).document)
-    missing = {
-        refusal.what.split("`")[1]
-        for refusal in checked.refusals
-        if "`" in refusal.what
-    }
-    assert {"device.arch", "device.memory.capacity_bytes"} <= missing
-    assert not checked.ok
-
-
-def test_a_spec_peak_with_no_derate_beside_it_is_refused():
-    thin = without(CLASS1, "device", "compute", "derate", "bf16")
-    checked = validate(merge(fragments(class1=thin)).document)
-    assert [refusal.rule for refusal in checked.refusals] == [Rule.DERATE]
-
-
-def test_an_unknown_key_is_refused_where_it_sits():
-    checked = validate(dict(merged().document, gpu_memory_utilization=0.9))
-    assert [refusal.rule for refusal in checked.refusals] == [Rule.SEPARATION]
-
-
-def test_a_field_stated_twice_is_reported_beside_the_rest_rather_than_raised():
-    # The reader refuses a document that states one field under two spellings.
-    # The check walks the same document, so it reports that refusal with the
-    # others and keeps walking: raised out of the walk instead, it would take
-    # every other result of the run with it, the unknown key beside it included.
-    document = dict(merged().document, gpu_memory_utilization=0.9)
-    assert "link_latency_s" in document["interconnect"]["inter_node"]
-    document["interconnect.inter_node.link_latency_s"] = 1
-    checked = validate(document)
-    rules = sorted(refusal.rule.name for refusal in checked.refusals)
-    assert rules == ["SEPARATION", "SHAPE"]
-    assert any("stated twice" in refusal.what for refusal in checked.refusals)
-
-
-def test_one_mistyped_key_does_not_take_the_rest_of_the_document_with_it():
-    # The refusal a mistyped key earns is about that key; the field it was
-    # meant to state is reported missing beside it.
-    document = merged().document
-    memory = document["device"]["memory"]
-    memory["capacity_byte"] = memory.pop("capacity_bytes")
-    checked = validate(document)
-    rules = [refusal.rule for refusal in checked.refusals]
-    assert rules.count(Rule.SEPARATION) == 1
-    assert rules.count(Rule.SHAPE) == 1
-
-
-def test_a_block_holding_a_scalar_does_not_take_the_rest_with_it_either():
-    # The other way the walk refuses: a block written as a number. The fields
-    # under it are gone, and everything beside it is still checked.
-    document = merged().document
-    document["device"]["memory"] = 288.0e9
-    checked = validate(document)
-    rules = [refusal.rule for refusal in checked.refusals]
-    assert rules.count(Rule.DERATE) == 1
-
-
-def test_a_value_of_the_wrong_shape_is_reported():
-    document = merged().document
-    document["device"]["count_per_node"] = True
-    checked = validate(document)
-    assert [refusal.rule for refusal in checked.refusals] == [Rule.SHAPE]
-
-
 # --- one reading per rank ----------------------------------------------------
 
 
@@ -404,6 +317,6 @@ def test_a_reading_no_spec_could_hold_is_refused_where_the_ranks_are():
 
 
 def test_the_verbs_are_reachable_by_name():
-    for name in ("merge", "validate", "across_ranks"):
+    for name in ("merge", "across_ranks"):
         assert name in spec_package.__all__
         assert getattr(spec_package, name, None) is not None
