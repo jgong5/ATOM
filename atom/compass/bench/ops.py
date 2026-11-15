@@ -1258,6 +1258,7 @@ class Stub:
         zeros = getattr(tokens, "zero_spec_counts", None)
         drafter = {} if zeros is None else {"zero_spec_counts": zeros}
         meta = dict(self.kv)
+        untold = len(set(self.pages.values())) > 1  # V4.1 compressing at several
         for sig, (op, _) in self.leaves.items():
             writes, rows = _writes(op["op"]), _pass_rows(op)
             at = None if rows == running else rows
@@ -1308,15 +1309,19 @@ class Stub:
                         pool = v41
                     try:
                         rope = (op["op"], path, ratio) == (_ROPE, "positions", None)
-                        if (
-                            rope
-                            and self.pages
-                            and op["args"]["input"]["shape"][-2] == 1
-                        ):
+                        if rope and untold and op["args"]["input"]["shape"][-2] == 1:
                             raise ValueError(  # a key's, over one head
-                                "its graph states no compress ratio, and no one "
-                                f"compress plan here holds its {spec['shape'][-1]} "
-                                "rows: trace its shape again"
+                                "its graph states no compress ratio, and this point "
+                                "cannot tell which ratio's compress plan holds its "
+                                f"{spec['shape'][-1]} rows: trace its shape again"
+                            )
+                        bound = path in ("row_starts", "row_ends") and not index
+                        if (op["op"], ratio) == (_TOPK, None) and untold and bound:
+                            raise ValueError(  # a row bound ATOM stages, its ratio's
+                                "its graph states no compress ratio, and this point "
+                                "cannot tell which ratio's scorer writes its "
+                                f"{op['args']['stride0']}-wide logits: trace its "
+                                "shape again"
                             )
                         if index:  # as the forward's first reader writes it
                             step = passes.get(at, passes[None])[0]
@@ -1506,15 +1511,17 @@ class Stub:
             and (op["args"].get("context_lens") or {}).get("role") != "activation"
         }
         # and by the rows each compress plan holds, as many as its keys' RoPE's,
-        # for a key RoPE captured before it stated its ratio: rows that no one
-        # ratio's plan here holds tell none, and `_prepare` refuses that key
+        # for a key RoPE captured before it stated its ratio, where the point
+        # holds every ratio's compressor: rows that no one ratio's plan here
+        # holds tell none, and `_prepare` refuses that key
         ratios = defaultdict(set)
         for op, _ in found.values():
             if op["op"] == _FUSED:
                 ratios[op["args"]["plan_gpu"]["shape"][0]].add(op["args"]["ratio"])
-        self.known |= {
-            ("compressed", n): r.pop() for n, r in ratios.items() if len(r) == 1
-        }
+        if set().union(*ratios.values()) >= set(self.pages.values()):
+            self.known |= {
+                ("compressed", n): r.pop() for n, r in ratios.items() if len(r) == 1
+            }
         # and its last layer's, whose tables a replay's queries take their
         # pointers from (`QueryRows.indices`)
         model = self.runner.model
