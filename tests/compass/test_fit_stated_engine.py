@@ -38,9 +38,11 @@ STATED = {**ENGINE, "indexer_dcp_only": True}
 
 
 def _engine(tmp_path, **fields):
-    """An engine file stating `STATED`, with `fields` over it."""
+    """An engine file stating `STATED`, with `fields` over it, a field set to
+    None left out."""
+    stated = {**STATED, **dict.fromkeys(BOUNDS, 4096), **fields}
     path = tmp_path / "engine.json"
-    path.write_text(json.dumps({**STATED, **dict.fromkeys(BOUNDS, 4096), **fields}))
+    path.write_text(json.dumps({k: v for k, v in stated.items() if v is not None}))
     return path
 
 
@@ -74,17 +76,29 @@ def test_both_fits_key_their_entries_by_the_stated_engine_as_step_linear_fit_doe
     assert [(d / "steps/dp0.engine.json").read_bytes() for d in (a, b)] == owns
 
 
-@pytest.mark.parametrize("command", ["fit host", "fit steps --backend step-linear"])
-def test_an_engine_file_a_record_contradicts_refuses_naming_the_field(
-    tmp_path, command
+@pytest.mark.parametrize(
+    "command", ["fit host", "fit steps --backend step-linear", "step_linear_fit"]
+)
+@pytest.mark.parametrize(
+    "field, value", [("kv_cache_dtype", "fp8"), ("quantization", None)]
+)
+def test_an_engine_file_stating_otherwise_or_omitting_a_record_s_field_refuses(
+    tmp_path, command, field, value
 ):
     a = record(tmp_path / "a", 19)
-    engine = _engine(tmp_path, kv_cache_dtype="fp8")
+    engine = _engine(tmp_path, **{field: value})
 
-    named = f"{a / 'steps/dp0.engine.json'} contradicts {engine} in ['kv_cache_dtype']"
-    with pytest.raises(SystemExit, match=re.escape(named)):
-        fit(tmp_path, command, a, *clients(a), "--engine", engine)
+    named = f"{a / 'steps/dp0.engine.json'} contradicts {engine} in ['{field}']"
+    with pytest.raises((SystemExit, ValueError), match=re.escape(named)):
+        if command == "step_linear_fit":
+            step_linear_fit.main(
+                [str(a / "steps/dp0.jsonl"), *platform_arg(DOCUMENT)]
+                + ["--out", str(tmp_path / "law.json"), "--engine", str(engine)]
+            )
+        else:
+            fit(tmp_path, command, a, *clients(a), "--engine", engine)
     assert not (tmp_path / "store").exists()
+    assert not (tmp_path / "law.json").exists()
 
 
 def test_a_record_stating_no_buckets_takes_the_file_s_and_one_stating_others_refuses(

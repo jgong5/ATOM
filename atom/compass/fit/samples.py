@@ -56,7 +56,11 @@ from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS
 from atom.compass.backends.step_labels import Sample, digest, label_run
-from atom.compass.backends.step_linear_fit import recorded_buckets, stated_buckets
+from atom.compass.backends.step_linear_fit import (
+    recorded_buckets,
+    refuse_contradicting,
+    stated_buckets,
+)
 from atom.compass.drive import aiter_jit
 from atom.compass.drive.identity import PTL_CHANGES
 from atom.compass.parity import ARRIVALS
@@ -170,11 +174,11 @@ def _record(
 def _stated(own: Path, held: dict, buckets, stated) -> tuple[dict, list | None]:
     """The `keyed` fields of the engine file `stated` and the prefill buckets a
     record with engine file `own`, `held` its keyed fields, states, else the
-    file's. A field `held` states otherwise, or other buckets, refuse."""
+    file's. A field `held` holds that the file omits or states otherwise
+    (`refuse_contradicting`), or other buckets, refuse."""
     raw = json.loads(Path(stated).read_text())
     engine = keyed_of(raw)
-    if differ := [k for k, v in held.items() if engine.get(k, v) != v]:
-        raise ValueError(f"{own} contradicts {stated} in {differ}")
+    refuse_contradicting(own, held, stated, engine)
     held_buckets = {} if buckets is None else {str(own.parent): buckets}
     stating = recorded_buckets({str(stated): raw.get(PREFILL_BUCKETS)} | held_buckets)
     return engine, None if stating is None else list(stating)

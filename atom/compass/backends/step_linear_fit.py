@@ -2061,6 +2061,14 @@ def recorded_buckets(stated: dict) -> tuple[int, ...] | None:
     return next(iter(held), None)
 
 
+def refuse_contradicting(own, held: dict, stated, engine: dict) -> None:
+    """Refuse `engine`, the keyed fields of the engine file `stated`, where it
+    omits a field `held`, those of the record's own engine file `own`, holds,
+    or states it otherwise, naming each such field."""
+    if differ := [k for k, v in held.items() if k not in engine or engine[k] != v]:
+        raise ValueError(f"{own} contradicts {stated} in {differ}")
+
+
 def refuse_context_parallel(engine: dict, where: str) -> None:
     """Refuse an engine config that states a context-parallel width: a step
     linear law states none, so a run at width 1 would price with it."""
@@ -2145,7 +2153,7 @@ def _records_parser(prog: str, description: str) -> argparse.ArgumentParser:
         "--engine",
         help="the engine file the records ran under, stated in place of the "
         ".engine.json beside each, its prefill buckets for a record that states "
-        "none; refused where one contradicts it",
+        "none; refused where one holds a field it omits or states otherwise",
     )
     return parser
 
@@ -2153,8 +2161,8 @@ def _records_parser(prog: str, description: str) -> argparse.ArgumentParser:
 def _labelled(args) -> tuple[list, dict, dict, dict]:
     """`args.records`' samples, each record's table, the options `fit` takes
     on them and the engine config they ran under. A record whose server built
-    an aiter JIT module refuses, and so does an engine file that contradicts
-    `--engine`."""
+    an aiter JIT module refuses, and so does an engine file holding a field
+    `--engine` omits or states otherwise (`refuse_contradicting`)."""
     for record in args.records:
         run = Path(record).resolve().parent.parent / "run.json"
         if run.is_file() and (
@@ -2169,8 +2177,7 @@ def _labelled(args) -> tuple[list, dict, dict, dict]:
             raw = json.loads(own.read_text()) if own.exists() else {}
             held = keyed_of(raw)
             refuse_context_parallel(held, str(own))
-            if differ := [k for k, v in held.items() if engine.get(k, v) != v]:
-                raise ValueError(f"{own} contradicts {args.engine} in {differ}")
+            refuse_contradicting(own, held, args.engine, engine)
         given = json.loads(Path(args.engine).read_text()).get(PREFILL_BUCKETS)
         stated = {args.engine: given} | {
             r: b for r, b in stated.items() if b is not None
