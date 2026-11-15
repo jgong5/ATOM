@@ -60,7 +60,7 @@ step is priced and banded as its costliest rank.
 Records with a host key (`dp0.key.json`, from the real runner) also give the
 host laws as a run file's `host` entry: `key`, and `laws[kind][segment]`,
 seconds on `(1, tokens, seqs)`, fitted on the samples' host labels. They take
-the step linear law's solver, MAD drops and hulls; `seqs` in a fixed
+the step linear law's solver and hulls, and drop no sample (`_host_law`); `seqs` in a fixed
 proportion to `tokens` on every sample (equal, or a decode under MTP, where
 each row computes its drafts too) gets zero. Two keys refuse. The law, as
 `platform`, and the host key state the platform fields `--platform` gives for
@@ -940,9 +940,11 @@ def _hop_messages(intake: Path, client) -> dict:
 
 def _host_law(x, y, names, offset=0.0, columns=()) -> tuple[list, dict]:
     """The host law on `names` over the forwards `x` labelled `y`, the part
-    `offset` of each label fixed, and its report. Raises on too few forwards or
-    no hull; with the last of `names` in a fixed proportion to the one before on
-    every forward, it gets zero. Each of `columns`, (feature, values), follows."""
+    `offset` of each label fixed, and its report. Every forward stays in the
+    fit: one slowed by an idle CPU is no outlier, and a MAD test cannot tell it
+    from scatter. Raises on too few forwards or no hull; with the last of
+    `names` in a fixed proportion to the one before on every forward, it gets
+    zero. Each of `columns`, (feature, values), follows."""
     x = np.array(x, dtype=np.float64).reshape(-1, len(names))
     if len(x) <= (k := len(names) + len(columns)):
         raise ValueError(f"{len(x)} forwards for {k} coefficients")
@@ -952,7 +954,7 @@ def _host_law(x, y, names, offset=0.0, columns=()) -> tuple[list, dict]:
         x[:, width] = 0.0
     wide = np.column_stack([x, *(v for _, v in columns)])
     names = [*names, *(f for f, _ in columns)]
-    s = _solve(wide, np.array(y), names, np.array(offset), names[0])
+    s = _solve(wide, np.array(y), names, np.array(offset), names[0], drops=False)
     hull = _hull(x[s["keep"]][:, 1:width], names[1:width])
     return s["coef"].tolist(), {
         "hull": hull,
@@ -1026,13 +1028,18 @@ def _launch_columns(members, features) -> tuple[list[str], dict]:
 
 
 def _solve(
-    x: np.ndarray, y: np.ndarray, names: list[str], offset=0.0, kept: str = "step"
+    x: np.ndarray,
+    y: np.ndarray,
+    names: list[str],
+    offset=0.0,
+    kept: str = "step",
+    drops: bool = True,
 ) -> dict:
-    """Non-negative least squares on relative error, MAD-dropped until settled;
-    `offset` is a fixed part of each label's price, outside the coefficients:
-    `_fit_form` on one row per step."""
+    """Non-negative least squares on relative error, MAD-dropped until settled
+    unless `drops` is false; `offset` is a fixed part of each label's price,
+    outside the coefficients: `_fit_form` on one row per step."""
     return _fit_form(
-        x[:, None], np.ones((len(y), 1), dtype=bool), y, names, offset, kept
+        x[:, None], np.ones((len(y), 1), dtype=bool), y, names, offset, kept, drops
     )
 
 
@@ -1043,6 +1050,7 @@ def _fit_form(
     names: list[str],
     offset=0.0,
     kept: str = "step",
+    drops: bool = True,
 ) -> dict:
     """One form fitted by max-affine regression: step `i`'s label `y[i]` is the
     max over its ranks' rows `x[i, r]`, those `real[i, r]` holds, of their
@@ -1067,8 +1075,9 @@ def _fit_form(
     label, over its price. Steps whose residual is more than
     `MAD_K` scaled MADs from the median are then dropped and the passes rerun
     from there, until the kept set settles, for `MAD_PASSES` rounds, or until
-    the passes reach the limit. A kept step priced at no time, which no
-    equation can be divided by, ends the reweighting; its residual drops it.
+    the passes reach the limit; with `drops` false none is dropped. A kept step
+    priced at no time, which no equation can be divided by, ends the
+    reweighting, and a MAD round drops it.
 
     Returns the solve's figures: `pick`, each step's rank, at a tie the rank
     of larger features (`priced_rank`, prices folded as a run folds them);
@@ -1180,7 +1189,12 @@ def _fit_form(
         centre = np.median(residual)
         mad = 1.4826 * np.median(np.abs(residual - centre))
         moved = np.abs(residual - centre) <= max(MAD_K * mad, MAD_FLOOR)
-        if stop == "limit" or (moved == keep).all() or rounds == MAD_PASSES:
+        if (
+            not drops
+            or stop == "limit"
+            or (moved == keep).all()
+            or rounds == MAD_PASSES
+        ):
             break
         keep, on = moved, None
     pick = np.zeros(n, dtype=int)
@@ -1223,13 +1237,14 @@ def _fit_vector(steps, vector: dict, routing) -> dict:
 
 def _folds(design, y, cell, names, path=None) -> dict:
     """Per record of `cell` beside which another holds rows, (its rows, the p50
-    error on them of the solve of `design` on the other records' rows); given
+    error on them of the host-law solve of `design` on the other records'
+    rows, which drops none); given
     `path`, a value per row, the same per record and value, keyed by both."""
     out = {}
     for c in sorted(set(cell.tolist())):
         other = cell != c
         if other.any():
-            coef = _solve(design[other], y[other], names)["coef"]
+            coef = _solve(design[other], y[other], names, drops=False)["coef"]
             error = design[~other] @ coef / y[~other] - 1.0
             if path is None:
                 out[c] = (int((~other).sum()), float(np.median(error)))
