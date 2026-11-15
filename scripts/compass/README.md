@@ -1467,13 +1467,15 @@ and 5 at concurrency 16 alone, with these changes:
 4 and 5 at concurrency 1, 4, 16 and 64, every run from one tree, with these changes from the
 smoke above:
 
-- `$ATOM`, its environment and the container are those the cell's law states (its paragraph
-  above), and `$M` is `--device mi455x-a0 --ptl disabled`, the store holding the node's
-  readings at that stack.
+- `$ATOM`, its environment and the container are those
+  `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json` states (its
+  paragraph above), and `$M` is `--device mi455x-a0 --ptl disabled`, the store holding the
+  node's readings at that stack.
 - Step 5 prices by the law file, `--step-linear LAW --host-laws LAW`, with the
   `memory_readings` that `compass measure memory` takes at the same tree and settings.
 - Steps 4 and 5 take `--duration 3600`, one server on the node at a time. Step 4 runs three
-  spaced rounds, each at c=1, 4, 16 and 64 in turn.
+  spaced rounds at c=1, 4, 16 and 64: the first ran c=1, 4 and 64, then 16, as the interim
+  check ordered them; the second and third ran 1, 4, 16, 64.
 - `python -m atom.compass.validate` grades each concurrency's simulated run against its three
   real runs, with throughput and TPOT targets of 10% and TTFT's of 15%, beside the real spread.
 - A real run has hung when, for 90 s while requests run or wait, its log shows neither a step
