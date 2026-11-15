@@ -104,6 +104,16 @@ def at_ladder(here: dict, there) -> dict:
     return here
 
 
+def pooled(engines: dict) -> dict:
+    """`engines`, {input: its engine config}, each read by `at_ladder` at the
+    longest ladder among them, the first of that length: a fit pools records
+    whose ladders are prefixes of it. Any other ladder stays as it is, so a
+    comparison after names `ladder`."""
+    ladders = [e.get("ladder") for e in engines.values()]
+    longest = max((x for x in ladders if isinstance(x, list)), key=len, default=None)
+    return {i: at_ladder(e, {"ladder": longest}) for i, e in engines.items()}
+
+
 def _views(steps) -> list[tuple[str, BatchView]]:
     """Each named step-record line as the view a simulated runner prices."""
     views = [
