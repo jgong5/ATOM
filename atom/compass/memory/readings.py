@@ -182,7 +182,7 @@ class MemoryReadings:
                 f"{source} holds {ASSUMED} {assumed!r}, which names no assumption",
                 "state where its readings were copied from and why",
             )
-        for name in (*ENTRY_FIELDS, *(fields & {PAGE_BOUND})):
+        for name in (*ENTRY_FIELDS, *sorted(fields & {PAGE_BOUND})):
             value = member[name]
             whole = isinstance(value, int) and not isinstance(value, bool)
             if name == "record":
