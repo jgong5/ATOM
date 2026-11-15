@@ -328,6 +328,13 @@ if not os.fork():
     select.select([os.pidfd_open(int(sys.argv[1]))], [], [])' $$ "${1:-1}"
 }
 
+# compass_dynamo_header: X-Dynamo-Session-ID, which aiperf then sends, where
+# AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID is true as aiperf reads it.
+compass_dynamo_header() {
+    local v=${AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID-}
+    [[ ${v,,} =~ ^(1|t|true|y|yes|on)$ ]] && echo X-Dynamo-Session-ID || :
+}
+
 # The router's bound on each request to a worker, its whole response
 # included, which `--request-timeout-secs` sets (default 1800 s) and the
 # clock cannot reach. A simulated stream lasts as much wall time as the run
