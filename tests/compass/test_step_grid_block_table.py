@@ -68,3 +68,25 @@ def test_the_top_corners_fill_atoms_block_table_and_one_position_more_is_refused
             rule.batch({"rows": [[q, c + 1 + q, decode]], "produces_output": True})
         with pytest.raises(ValueError, match="exceeds the destination columns"):
             table([list(range(-(-held // 16)))])
+
+
+@pytest.mark.parametrize("drafter, top", [("dspark5", None), ("mtp1", 3)])
+def test_a_model_length_short_of_the_token_budget_and_lookahead_is_refused(
+    model_dir, drafter, top  # noqa: F811
+):
+    """At max_model_len 67, three tokens above the 64-token budget, prefill's
+    top c node is 67 - 64 - 4 = -1 under DSpark5, whose draft round writes 4
+    positions past a row, so the plan refuses; MTP1's writes none and its top
+    node is 3."""
+    steps, engines = recorded(model_dir, drafter)
+    (engine,) = engines.values()
+    engine["max_model_len"] = 64 + 3
+
+    if top is None:
+        with pytest.raises(
+            ValueError, match="max_model_len is below its max_num_batched_tokens and "
+        ):
+            step_grid_plan.plan(DEFINITION, steps, engines)
+        return
+    planned = step_grid_plan.plan(DEFINITION, steps, engines)
+    assert planned["prefill"]["nodes"]["c"][-1] == top
