@@ -260,6 +260,7 @@ import contextlib
 import functools
 import gc
 import hashlib
+import io
 import json
 import math
 import os
@@ -269,6 +270,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -2842,10 +2844,10 @@ def source_root(digest: str | None = None) -> str:
     return f"{reading.kind}-{reading.value}"
 
 
-def atom_digest() -> str:
-    """The sha256 of ATOM's Python modules here, less `COMPASS_ONLY` and
-    `INSTALL_WRITTEN`."""
-    root = Path(atom.__file__).parent
+def atom_digest(root: Path | None = None) -> str:
+    """The sha256 of ATOM's Python modules here, or in the package directory
+    `root`, less `COMPASS_ONLY` and `INSTALL_WRITTEN`."""
+    root = Path(atom.__file__).parent if root is None else root
     digest = hashlib.sha256()
     for path in sorted(root.rglob("*.py")):
         relative = path.relative_to(root)
@@ -2867,6 +2869,24 @@ def atom_digest() -> str:
                 del lines[prev.end_lineno if prev else 0 : node.end_lineno]
         digest.update(f"{relative}\0".encode() + b"".join(lines))
     return digest.hexdigest()
+
+
+def committed_atom_digest(repo: Path, commit: str) -> str:
+    """`atom_digest` of the ``atom/`` that `commit` holds in the git repository
+    at `repo`, as `git archive` ships it."""
+    archive = subprocess.run(
+        ["git", "-C", str(repo), "archive", commit, "atom"],
+        capture_output=True,
+        check=False,
+    )
+    if archive.returncode:
+        raise ValueError(
+            f"git archive {commit} atom in {repo}: {archive.stderr.decode().strip()}"
+        )
+    with tempfile.TemporaryDirectory(prefix="compass-head-") as tmp:
+        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tar:
+            tar.extractall(tmp, filter="data")
+        return atom_digest(Path(tmp) / "atom")
 
 
 def _file_digest(name: str, filename: str) -> str | None:
