@@ -2590,8 +2590,9 @@ def _kv(spec, slot, live, ring=False) -> tuple[str, torch.Tensor | None]:
     except ValueError as error:  # the leaf refuses, not the point
         return str(error), None
     t, end = own[name], lambda x: x.storage_offset() + _span(x.shape, x.stride())
+    rows = live[name] if cols else t  # its rows whole
     for b, e in bufs.values() if ring else ():
-        if end(b) * b.itemsize == end(t) * t.itemsize and _inside(b, t):
+        if end(b) * b.itemsize == end(rows) * rows.itemsize and _inside(b, rows):
             n, room = -(-nbytes // e), b.nbytes // e
             if n > room:
                 why = f"a window ring over {n} state slots; the bench holds {room}"
