@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -159,9 +160,10 @@ def _gated(tmp_path) -> Path:
     return tmp_path / "gate"
 
 
-def _started(tmp_path, out: str, gate: Path) -> int:
+def _started(tmp_path, out: str, gate: Path, request) -> int:
     """calibrate.sh into `out` under `setsid nohup` from a shell that exits at
-    once, as the guide starts one; its PID once its status shows cal1-c1."""
+    once, as the guide starts one; its PID once its status shows cal1-c1. Its
+    session is killed when the test ends, however it ends."""
     script = tmp_path / "ATOM" / "scripts" / "compass" / "calibrate.sh"
     env = {
         **os.environ,
@@ -183,18 +185,26 @@ def _started(tmp_path, out: str, gate: Path) -> int:
         timeout=60,
         check=True,
     )
+    pid = int(started.stdout)
+    request.addfinalizer(lambda: _killed(pid))
     o = tmp_path / out
     _until(lambda: "start cal1-c1" in _read(o / "status"), "cal1-c1 started")
-    return int(started.stdout)
+    return pid
+
+
+def _killed(pid: int) -> None:
+    """Kill the process group `pid` leads, setsid's, if it is still there."""
+    with suppress(ProcessLookupError):
+        os.killpg(pid, signal.SIGKILL)
 
 
 def _read(path: Path) -> str:
     return path.read_text() if path.exists() else ""
 
 
-def test_under_setsid_nohup_it_outlives_its_shell_and_a_sighup(tmp_path):
+def test_under_setsid_nohup_it_outlives_its_shell_and_a_sighup(tmp_path, request):
     gate = _gated(tmp_path)
-    pid = _started(tmp_path, "o", gate)
+    pid = _started(tmp_path, "o", gate, request)
 
     os.kill(pid, signal.SIGHUP)
     time.sleep(0.5)
@@ -207,10 +217,10 @@ def test_under_setsid_nohup_it_outlives_its_shell_and_a_sighup(tmp_path):
 
 
 def test_a_sigterm_fails_its_step_which_a_resume_takes_again_and_nothing_before_it(
-    tmp_path,
+    tmp_path, request
 ):
     gate = _gated(tmp_path)
-    pid = _started(tmp_path, "o", gate)
+    pid = _started(tmp_path, "o", gate, request)
     o = tmp_path / "o"
 
     os.kill(pid, signal.SIGTERM)
