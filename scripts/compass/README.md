@@ -792,7 +792,9 @@ cctraces_sim.sh` runs, each with the `dp0.engine.json` the run wrote beside it,
 whose engine config the law states and whose `data_parallel_size` its ranks
 join at. Records that ran before a run wrote that file, or wrote it without
 `data_parallel_size`, take an engine file stated from their `server.log` as
-`--engine FILE`. `atom/compass/backends/step_labels.py` states the label
+`--engine FILE`; `compass fit steps` and `compass fit host` take it too, the
+host laws then keyed by it with the records' launch graph sets
+(`atom/compass/fit/samples.py`). `atom/compass/backends/step_labels.py` states the label
 and what is cut, and the command writes each record's labels beside it for
 reading, `dp0.cost.jsonl`; the module's docstring states how outliers are
 dropped. A prefill step's label is a trace run's busy time, which `calib_capture.sh`
