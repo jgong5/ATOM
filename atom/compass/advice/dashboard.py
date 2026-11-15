@@ -208,12 +208,9 @@ def _ran(row: dict, out: Path) -> dict:
         if tree and dirty:
             tree += f", {dirty} files uncommitted"
         named[side.name] = tree or "not stated"
-    trees = set(named.values())
-    tree = (
-        trees.pop()
-        if len(trees) == 1
-        else "; ".join(f"{s} {t}" for s, t in named.items())
-    )
+    # One tree once, else each side's by name.
+    trees = list(dict.fromkeys(named.values()))
+    tree = trees[0] if len(trees) == 1 else "; ".join(f"{s} {t}" for s, t in named.items())
     tpg = row["throughput per GPU"]
     report = run / REPORT
     return {
