@@ -80,10 +80,11 @@ KEY = {
     "engine_config": "replay-mns48",
     "grid": "s2-sparse-margin0.25",
     "source_root": "tree-67c176f0",
-    "device": "MI355X",
-    "software_stack": "rocm 7.2.4 / aiter 9205e1059 / rccl 2.27.7",
+    # The platform the suite's machine document states, as a run reads it.
+    "device": "MI355X gfx950",
+    "software_stack": "rocm 7.2.4 / aiter f4e7c7509 / rccl 2.22.3",
     "ptl": "disabled",
-    "torch": "2.10.0+rocm7.2.4.git3d3aa833",
+    "torch": "2.10.0",
 }
 BOUNDS = {"max_num_seqs": 48, "max_num_batched_tokens": 8192, "max_model_len": 2048}
 BUNDLE = {
@@ -468,7 +469,7 @@ def test_a_new_kind_loads_under_the_runs_readings_and_refuses_on_its_rows_cells(
 def test_each_mi308x_spec_states_its_torch_and_the_runs_readings_take_it(
     tmp_path, name
 ):
-    path = Path(__file__).parents[2] / "scripts/compass/machines" / f"{name}.json"
+    path = Path(__file__).parents[2] / "tests/compass/machines" / f"{name}.json"
     spec = MachineSpec.from_mapping(json.loads(path.read_text()))
     pinned = "device.software_pinned_to.torch"
 

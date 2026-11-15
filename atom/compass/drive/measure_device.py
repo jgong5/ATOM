@@ -13,7 +13,9 @@ pinned host memory, each `REPS` times behind a spin. With `--pp`, `pp_probe`
 fits a PP send's carriers on the first two cards. Before each process and
 after the last, `device_probe.refuse_unfit` refuses cards that hold memory or
 another process, or read another PTL state; each reading is kept in the
-record.
+record. After each process the command waits, up to `SETTLE_S`, for the
+cards' memory to read idle: the driver frees and clears an exited process's
+memory after KFD stops listing it.
 
 Every format of `device_probe.FORMATS` is probed: a format no library runs on
 these cards is recorded absent with each library's error. Cards of two
@@ -62,6 +64,9 @@ PROG = "compass measure device"
 MODULE = "atom.compass.drive.measure_device"
 #: Bytes of the host-link probe's small copy, whose seconds are its latency.
 HOST_SMALL = 4
+#: Seconds a probe's cards may take to read idle once KFD lists its process no
+#: more; on crs005 a card read 1.37 GB used under a second after a probe exited.
+SETTLE_S = 60
 #: Each scalar reading, to the samples of a card's probe it is read from.
 SAMPLED = {
     "device.kernel_floor_s": "floor",
@@ -101,11 +106,11 @@ def main(argv: list[str]) -> None:
         checks.append(_idle(bdfs, ptl))
         # ponytail: one card at a time, 10-15 min a card; disjoint pairs could
         # run at once if a card's rates are shown unmoved by a busy neighbour.
-        cards[str(gpu)] = _child(out, "pair", (gpu, gpus[(i + 1) % len(gpus)]))
+        cards[str(gpu)] = _child(out, "pair", (gpu, gpus[(i + 1) % len(gpus)]), bdfs)
     pp = None
     if args.pp:
         checks.append(_idle(bdfs, ptl))
-        pp = _child(out, "pp", gpus[:2])
+        pp = _child(out, "pp", gpus[:2], bdfs)
     checks.append(_idle(bdfs, ptl))
     record = {
         "host": key.values["host"],
@@ -148,11 +153,11 @@ def _idle(bdfs: list[str], ptl: str) -> list[dict]:
     return read
 
 
-def _child(out: Path, task: str, gpus: tuple[int, ...]) -> dict:
+def _child(out: Path, task: str, gpus: tuple[int, ...], bdfs: list[str]) -> dict:
     """What `child(task, ...)` wrote, run in a process that sees `gpus`; under
     torchrun, two ranks, for ``pp``. It returns once `serve._stop` finds the
     process's session gone and KFD listing no process it did not list
-    before: KFD lists an exited process until it has freed its GPU memory.
+    before, and then `_freed` finds the cards `bdfs` names idle.
     SIGINT and SIGTERM end the wait, never the stop: the process runs in its
     own session, so a command that ends first leaves it running."""
     kfd = serve._kfd()
@@ -178,7 +183,20 @@ def _child(out: Path, task: str, gpus: tuple[int, ...]) -> dict:
         raise ValueError(f"{name} stopped the command; nothing is published")
     if code:
         raise ValueError(f"the {task} probe on GPUs {gpus} exited {code}; see {log}")
+    _freed(bdfs)
     return json.loads(path.read_text())
+
+
+def _freed(bdfs: list[str]) -> None:
+    """Wait up to `SETTLE_S` until every card in `bdfs` reads at most
+    `device_probe.IDLE_BYTES` of VRAM used, and print how long, if at all."""
+    start = time.monotonic()
+    while time.monotonic() - start < SETTLE_S and any(
+        c["vram_used"] > device_probe.IDLE_BYTES for c in device_probe.cards(bdfs)
+    ):
+        time.sleep(serve.POLL_S)
+    if (waited := time.monotonic() - start) > serve.POLL_S:
+        print(f"waited {waited:.1f} s for the cards' memory to read idle")
 
 
 def child(task: str, path: str) -> None:

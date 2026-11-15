@@ -6,9 +6,9 @@
 # fall outside the records the fits read; `compass measure memory`; one
 # `compass record` per RECORD, each serving one `client.sh` run of the
 # calibration traces, which stops it; then `compass fit steps` (step linear,
-# history form) and `compass fit host` on those records. It plans nothing: what
-# to record is its input. A decode rung N comes from a record at concurrency N
-# that starts every trajectory at its first turn
+# history form, MODEL's MoE routing) and `compass fit host` on those records.
+# It plans nothing: what to record is its input. A decode rung N comes from a
+# record at concurrency N that starts every trajectory at its first turn
 # (https://github.com/jgong5/ATOM/issues/1840). The prefill law fits from trace
 # runs alone: with none, the law's `unfitted` names prefill. `compass fit host`
 # leaves them out, since a trace run's host segments ran under the profiler.
@@ -27,7 +27,6 @@
 #                   (required)
 #   GPU             the one GPU, as rocm-smi and `--gpu` number it (required);
 #                   each compass command refuses it while a process is on it
-#   MACHINE         the machine spec of this node's GPUs (required)
 #   TRACES          a cc-traces traces.jsonl (required, as client.sh takes it)
 #   AIPERF_PYTHON   the Python with agentx-harness and no compass-harness, for
 #                   the records' clients (required)
@@ -50,8 +49,10 @@
 # has published refuses, before it serves: the fit's key names no record, so the
 # store refuses that fit again, and the calibration needs a new OUT. It prints
 # the tokens, the law's held-out errors per band, the `compass run` line that
-# prices by the law, and the wall time. It exits 2 on bad arguments or inputs,
-# 90 to 99 as _lib.sh's tree checks refuse, else 1 naming the step that failed.
+# prices by the law, its DATASHEET and PTL left to name and its store to be
+# given the platform's readings (`compass fit device`), and the wall time.
+# It exits 2 on bad arguments or inputs, 90 to 99 as _lib.sh's tree checks
+# refuse, else 1 naming the step that failed.
 # A trace run's directory is trace<k>-c<C>/, done once it holds busy lines,
 # which one refused at its stop lacks.
 set -uo pipefail
@@ -66,8 +67,8 @@ compass_describe "$ROOT"
 OUT=$1
 shift
 for r; do [[ $r =~ ^(trace )?[1-9][0-9]*( |$) ]] || bad "RECORD '$r' does not start with a concurrency"; done
-for v in MODEL GPU MACHINE TRACES AIPERF_PYTHON; do [[ -n ${!v-} ]] || bad "$v is not set"; done
-MODEL=$(realpath "$MODEL") MACHINE=$(realpath "$MACHINE")
+for v in MODEL GPU TRACES AIPERF_PYTHON; do [[ -n ${!v-} ]] || bad "$v is not set"; done
+MODEL=$(realpath "$MODEL")
 CAL=${CAL_TRACES:-256-392} DURATION_S=${DURATION_S:-1800} WAIT_S=${WAIT_S:-1800} TRACE_S=${TRACE_S:-120}
 # shellcheck disable=SC2206 # SERVER_ARGS is a word list
 ATOM_ARGS=(--model "$MODEL" ${SERVER_ARGS:---max-model-len 262144})
@@ -75,7 +76,7 @@ CLI='from atom.compass.cli import main; main()'
 export MODEL TRACES
 sha=$(compass_head_sha "$ROOT") ||
     bad "$ROOT is neither a git checkout nor a snapshot.sh tree, and a fit refuses it"
-inputs=$(printf '%s\n' "tree $sha" "atom ${ATOM_ARGS[*]}" "machine $MACHINE" \
+inputs=$(printf '%s\n' "tree $sha" "atom ${ATOM_ARGS[*]}" \
     "traces $TRACES $CAL" "duration $DURATION_S" "trace duration $TRACE_S" "${@/#/record }")
 mkdir -p "$OUT" && OUT=$(realpath "$OUT")
 if [[ -e $OUT/inputs ]]; then
@@ -135,7 +136,7 @@ serve() {
     wait $pid || fail "$name" "its server exit $?; see $OUT/$name.log"
 }
 
-M=(--machine "$MACHINE" --store "$OUT/store")
+M=(--store "$OUT/store")
 # client.sh --stop marks its export `server_stopped` once the server has
 # stopped and written run.json.
 STOPPED=(artifacts/client_run.json '"server_stopped": true')
@@ -159,7 +160,8 @@ for r; do
     [[ -z $flag ]] && cal+=("$OUT/$name") cal_runs+=("${runs[@]: -3}")
 done
 todo fit_steps step_linear_law.json && step fit_steps python3 -c "$CLI" fit steps \
-    --backend step-linear --form history "${dirs[@]}" "${runs[@]}" "${M[@]}" --out "$OUT/fit_steps"
+    --backend step-linear --form history --model "$MODEL" "${dirs[@]}" "${runs[@]}" "${M[@]}" \
+    --out "$OUT/fit_steps"
 todo fit_host host_laws.json &&
     step fit_host python3 -c "$CLI" fit host "${cal[@]}" "${cal_runs[@]}" "${M[@]}" --out "$OUT/fit_host"
 
@@ -180,6 +182,6 @@ rows = [
 print("\n".join(["held out | steps | p10 | p50 | p90", *rows]) if rows else
       "calibrate: no held-out errors: fit steps holds out each of two or more records")
 EOF
-run=("$ROOT/scripts/compass/compass" run --step-linear "$law" --host-laws "$host" "${M[@]}" --out DIR -- "${ATOM_ARGS[@]}")
+run=("$ROOT/scripts/compass/compass" run --step-linear "$law" --host-laws "$host" --device DATASHEET --ptl PTL "${M[@]}" --out DIR -- "${ATOM_ARGS[@]}")
 echo "calibrate: a run priced by the law: $(printf '%q ' "${run[@]}")"
 echo "calibrate: calibrated in $(((SECONDS - start) / 60)) min"

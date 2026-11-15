@@ -2,7 +2,7 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header.
-**Decisions D0–D106, with no gaps, and their sub-decisions** are indexed at the end of this
+**Decisions D0–D117, with no gaps, and their sub-decisions** are indexed at the end of this
 file. The TODOs are registered in **`12_open_items.md`**, with the load-bearing assumptions
 and the cross-cutting issues. Implementation follows the execution plan in `16`.
 
@@ -54,6 +54,7 @@ Added later, from the evidence and the owner's rulings, and not in the original 
 | **9** | **Model ATOM as it is meant to run.** An ATOM functional or performance bug gets no price term, probe field, host segment or planner rule. It is filed against ATOM under the [`atom-issue`](https://github.com/jgong5/ATOM/issues?q=label%3Aatom-issue) label for ATOM's side to fix, and the residual it leaves is stated in the named result of the task that found it. | Measured gaps that were ATOM's own: PP's gloo round trip before the RCCL receive and its serial RCCL parts ([#1559 Ruling](https://github.com/jgong5/ATOM/issues/1559#issuecomment-6266312440)), and gluon `pa_decode` running a 128- or 256-token split faster than its neighbours ([#1752 Ruling](https://github.com/jgong5/ATOM/issues/1752#issuecomment-6306960229)). |
 | **10** | **No algorithm that serves one refit, machine move or task enters the code.** A rule the code applies holds for every fit, machine and task it can meet. The one expedient is reusing costly measurements, such as a law re-keyed without a refit or a vector fitted on another subject, and it is stated where used: in the law's provenance or the vector's `declared` note. | `step_linear_fit --reference` let the gpu-45 decode law's held-out band veto the crs005 decode law's MoE column, a bar borrowed from another machine for one refit; it left the code by the [#2727 Ruling](https://github.com/jgong5/ATOM/issues/2727#issuecomment-6602866038) ([#2735](https://github.com/jgong5/ATOM/issues/2735)). |
 | **11** | **Compass does not model CPU cache state, in any host term.** A host term that costs more after an idle gap, or after other work evicts its data, keeps those samples in its fit, and the task that finds it states the residual. | Host terms that moved with it: the decode right after an output prefill runs its `W_inputs` longer ([#2218](https://github.com/jgong5/ATOM/issues/2218)), and a tokenizer decode 1 ms or more after its thread's previous call takes 2.8 to 9 times the pooled law's price ([#2919](https://github.com/jgong5/ATOM/issues/2919), [its Ruling](https://github.com/jgong5/ATOM/issues/2919#issuecomment-6768687256)). |
+| **12** | **Compass does not model a card's own hardware speed.** One law prices the card mix of its records, and a card faster or slower than that mix leaves a residual, which `validate.cost` states per DP rank with its cards' PCI buses, as `run.json` records them. No key or fit reads a bus. | crsuse2-m2m-v3-005's cards run one DeepSeek-V4-Pro prefill chunk 0.6% under to 1.1% over the shared crs005 law, and rank 0's offset moved about 10 ms between 10-29 and 11-02, when no record named the card a rank ran on ([#2992](https://github.com/jgong5/ATOM/issues/2992), [#3048 Ruling](https://github.com/jgong5/ATOM/issues/3048#issuecomment-6851366020)). |
 
 ---
 
@@ -87,7 +88,8 @@ one most often assumed to be the second.
 
 ### Not modelled at all
 
-Fragmentation. Neighbour contention. The GIL. CPU cache state, in any host term (principle 11). A device that
+Fragmentation. Neighbour contention. The GIL. CPU cache state, in any host term (principle 11). A card's own
+hardware speed (principle 12). A device that
 has never been measured (except by the analytical projection, whose peaks carried from a probed
 device make its terms declared). See **Scope and non-goals** below for where each is recorded.
 
@@ -165,7 +167,9 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       device datasheets, network files; the spec    |
   |                       a run composes from them and its readings     |
   |                       flags, precedence, the `compass` entry        |
-  |                                                docs 07, 05, 13      |
+  |                       advice: a space searched, with its dashboard  |
+  |                       each run's per-request split and report       |
+  |                                                docs 07, 05, 13, 19  |
   +=====================================================================+
   |  L4  WORKLOAD         clock client  |  compass stamps on the wire   |
   |                       per-harness adapter (out of tree)             |
@@ -180,9 +184,11 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       or estimated                                  |
   |                       Cost IR: Seq/Repeat/Par, opaque leaves        |
   |                       fitting, law selection, hull guard            |
+  |                       pass registry, pass record, one label rule    |
+  |                       for host-paced device time                    |
   |                       spec-decode: draft/verify structures,         |
   |                       acceptance inputs, draft KV                   |
-  |                                       docs 02,03,04,09,10,14,17     |
+  |                                    docs 02,03,04,09,10,14,17,18     |
   +=====================================================================+
   |  L2  EXECUTION        CompassModelRunner (the seam)                 |
   |                       simulated KV connector                        |
@@ -230,15 +236,17 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L3 | Fitting, law selection, hull guard | [`09_fitting_and_law_selection.md`](09_fitting_and_law_selection.md) | D53–D62 |
 | L3 | Analytical laws, the step roofline | [`10_analytical_laws.md`](10_analytical_laws.md) | D63–D70 |
 | L3 | Step grid backend (step-level), a stage-2 candidate | [`17`](17_step_grid_backend.md) | D96–D105 |
+| L3 | The pass record and the one label rule for host-paced device time | [`18`](18_pass_record_and_host_paced_time.md) | D107 |
 | L4 | Harness contract, wire fields, adapter | [`06_workload_harness_contract.md`](06_workload_harness_contract.md) | D27–D35 (+ D35.1) |
 | L5 | The calibration phases, the measurement bench and the recommended flow | [`07_calibration_toolchain.md`](07_calibration_toolchain.md) | D36–D43 |
 | L5 | The JIT sweep and the per-stack cache library that warm a container before a graded run | [`07`](07_calibration_toolchain.md) | D106 |
 | L5 | Machine spec layers, their schema, `measure device` and `fit device` | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
+| L5 | `compass advice`, a user's configuration space searched with calibration kept apart; each run's per-request split and report; the dashboard | [`19_adoption.md`](19_adoption.md) | D108–D117 |
 | L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
 | — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D45.1, D50.1, D50.2, D50.3) |
 | L5 | Configuration surface: flags, precedence, the `compass` commands with their inputs and outputs | [`13_configuration_surface.md`](13_configuration_surface.md) | D78–D81 |
-| L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 (+ D87.1) |
-| L1/L3 | Parallelism: TP, DP, PP, EP | [`15_parallelism_support.md`](15_parallelism_support.md) | D88–D94 |
+| L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 (+ D87.1, D87.2) |
+| L1/L3 | Parallelism: TP, DP, PP, EP | [`15_parallelism_support.md`](15_parallelism_support.md) | D88–D94 (+ D90.1, D92.1) |
 | — | Open items, assumptions, gaps | [`12_open_items.md`](12_open_items.md) | — |
 | — | How it gets built: tasks, waves, gates, GPU queue | [`16_execution_plan.md`](16_execution_plan.md) | — |
 
@@ -352,8 +360,8 @@ method's error are reported, not gated (`10` D67.1, #1392). Stage 4 checks it on
 runs at peaks probed there, and reports the method's error as the same MI455 records
 bounded at the frozen projection's spec and at the probed one (`16` *Stage 4*, `08` D50.2).
 
-The M3-Agentic stage's cells grade each point by its overlap with the real curve
-(`08` D45.1).
+The M3-Agentic and DSv41-DPEP stages' cells grade each point by its overlap with the
+real curve (`08` D45.1).
 
 Final proof is **paired simulated and real execution of cc-traces proper**.
 
@@ -365,6 +373,7 @@ Final proof is **paired simulated and real execution of cc-traces proper**.
 | **M2 — v1** | **#627 stage 3: DeepSeek-V4-Pro 1P+1D on MI355X within the targets above**, first in the nightly configurations with expert parallelism off, then at EP8 — each step first the same scheduling decisions as the real engine, then the separable results of `08` D44 and the configuration-ranking gate; **the MI455 roofline projection** of stage 3c, held to the soundness checks of `16` D95 and then frozen; last, **stage 4: DeepSeek-V4.1-Flash measured on MI455 and graded by the step linear backend in two TP4 DSpark5 cells**, with the analytical bound checked on the same runs (`16` *Stage 4*, [#2138](https://github.com/jgong5/ATOM/issues/2138)). **First gate, #627 stage 2:** Qwen3.8-27B TP1 on MI308X, paired real and simulated cc-traces graded by `08` |
 | ~~M3–M7~~ | Retired by `16` D95, which maps each one to where its scope went. PP, EP beyond one node, and further models come after v1 |
 | **M3-Agentic** | **[#3256](https://github.com/jgong5/ATOM/issues/3256): ATOM's MiniMax-M3 AgentX submission to InferenceX, simulated on MI355X**, every arm and point, each simulated curve lying on this branch's real one by `08` D45.1, with EAGLE3 and the `lmcache_offload` tier (`16` D95.1). Named for the model, not the retired M3 |
+| **DSv41-DPEP** | **[#3423](https://github.com/jgong5/ATOM/issues/3423): the DP points of ATOM's DeepSeek-V4.1-Flash AgentX submission to InferenceX, simulated on MI355X**, DTP2 and DEP2 with DSpark5, each point graded by `08` D45.1 on both backends (`16` D95.2) |
 
 Sequencing, dependencies and parallelisable work are in the execution plan (`16`). `00_initial_prompt.md` is the original seed and is
 **not** a design document — see *Development history*.
@@ -382,6 +391,7 @@ Stated here so they are not discovered at review.
 | Memory fragmentation — not modelled, not planned, and nobody models it | `03` D16 |
 | The GIL. Host terms are fitted on lone calls and on the CPU clock, so none carries a wait for it; the waits a lone call still holds are a stated residual | `07` D38, Phase 1c |
 | CPU cache state, in any host term (principle 11). An output prefill evicts the worker's input-prep data from the core's L3, so the decode right after it runs its `W_inputs` longer, while its `E` runs more scheduling work; the decode host law keeps those decodes, and their residual is stated. A tokenizer decode costs more the longer its thread sat idle since its previous call; the tokenizer law keeps those calls, and each cell's residual is stated | [#2218](https://github.com/jgong5/ATOM/issues/2218), [#2919](https://github.com/jgong5/ATOM/issues/2919#issuecomment-6768687256) |
+| A card's own hardware speed (principle 12). A step law prices the card mix of its records; a DP rank whose card runs faster or slower leaves a residual, which `validate.cost` states per rank with its cards' PCI buses | [#3048 Ruling](https://github.com/jgong5/ATOM/issues/3048#issuecomment-6851366020) |
 | **Cancellation** — `status` is `"completed"` on all 1,697 subagent wrappers in both corpora. There is nothing to replay. | `06` D35 |
 | Serving *decisions* as a simulated subsystem — a simple serving simulation is planned for a later phase of Compass, not this one | — |
 
@@ -557,6 +567,7 @@ The documents use these precisely; a reader will bounce off without them.
 |---|---|---|
 | [`07`](07_calibration_toolchain.md) | Calibration and Benchmarking Toolchain | The phases and the commands that run them; the backend that needs a measurement plans it; the step bench is `EngineCore` without its scheduler, with one window for every step; the op bench times each leaf from its contract, cold, at points ATOM's runner prepares without a forward, and `fit ops` interpolates only between same-kernel neighbours. One recommended flow per half, steps and ops. The minimal recipe: one full-engine run at TP1, plus one TP2 transfer test, plus an engine start per configuration (`measure memory`). Four classes of communication pricing. The artifact store, its keys and its invalidation matrix. A constructed JIT sweep and a per-stack cache library warm a container before a graded run. |
 | [`09`](09_fitting_and_law_selection.md) | Fitting and Law Selection | How measurements become a model: fit relative error, per-rung decode, hull guards not bounding boxes, and why leave-one-out cannot choose a family. Owns coverage geometry for every other document. |
+| [`18`](18_pass_record_and_host_paced_time.md) | One Pass Record and One Rule for Host-Paced Device Time | A registry of each drafter flavor's passes; a record of when the host enqueued each pass; one rule that labels every pass and starts it in the recurrence, so a host-paced wait is counted once. Replaces `09` D54's decode cuts and part of `01` D4's recurrence. |
 
 ### Part IV — How it is driven and judged
 
@@ -586,6 +597,12 @@ The documents use these precisely; a reader will bounce off without them.
 |---|---|---|
 | [`16`](16_execution_plan.md) | The Execution Plan | Tasks are a **pool**, capped at 5 in flight, with context durable in the task's GitHub issue and PR rather than in an agent. Phase 0 de-risks five assumptions before any build work. Effort in lines of code, not dates. Detailed through Wave 3, deliberately sketched beyond. |
 
+### Part VIII — How a user searches, after v1
+
+| Doc | Title | What it settles |
+|---|---|---|
+| [`19`](19_adoption.md) | Adoption | One `compass advice` command checks a space the user provides, simulates every candidate whose law exists and recommends a configuration; calibration stays apart, reached through the store, and calibrated data is reused only under the reuse requirements. Every run writes its per-request split and a report. Developed on DeepSeek-V4-Pro, shown on MiniMax-M3. |
+
 ---
 
 ## Decision map
@@ -604,10 +621,12 @@ The documents use these precisely; a reader will bounce off without them.
 | D63 – D70 (+ D67.1) | `10` Analytical Laws |
 | D71 – D77 | `11` Engine Metrics under Virtual Time |
 | D78 – D81 | `13` The Configuration Surface |
-| D82 – D87 (+ D87.1) | `14` Speculative Decoding and MTP |
-| D88 – D94 | `15` Parallelism Support (TP, DP, PP, EP) |
-| D95 (+ D95.1) | `16` The Execution Plan |
+| D82 – D87 (+ D87.1, D87.2) | `14` Speculative Decoding and MTP |
+| D88 – D94 (+ D90.1, D92.1) | `15` Parallelism Support (TP, DP, PP, EP) |
+| D95 (+ D95.1, D95.2) | `16` The Execution Plan |
 | D96 – D105 | `17` Step Grid Backend |
+| D107 | `18` One Pass Record and One Rule for Host-Paced Device Time |
+| D108 – D117 | `19` Adoption |
 
 ### Headline decisions
 
@@ -627,6 +646,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D36 | Two axes: a backend's granularity, step-level or op-level, and each term's method, analytical, declared, measured or estimated; fallback runs only along method inside one granularity. Compass models a device it has been measured on |
 | D37 | The tool tells the user what to measure: the backend that needs a measurement plans it |
 | D45 | The real-vs-real spread is the tolerance; a metric must be stable, and sensitivity is deferred |
+| D109 | One `compass advice` command searches a user's configuration space by simulation and recommends a configuration; the calibration it lacks stays apart (D108) |
 | D3.2 | Always-on causality detectors: a straggler, checked on receipt and at each drain, fails the run rather than warning; a stall the Clock Authority cannot see waits for ever and prints one `DIAG_S` diagnostic, never aborting; a CI clock-source lint |
 | D3.3 | The Clock Authority ships two deployment forms from one implementation: co-hosted by default, standalone for multi-container runs |
 | D43.1 | ATOM's suite is a merge gate on every Compass change, unmodified, in two gates: a CPU gate (every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, driver-free as a batch, held to green) per change, a GPU gate, a superset less the files `gpu_gate_skip.txt` names for its GPU, judged as a delta per wave against `gate_gpu.sh`'s recorded baseline, by an equality on a per-tree expectation rather than "no worse than". The CPU gate **exits 98** rather than reporting "GPU not required" when it cannot tell |

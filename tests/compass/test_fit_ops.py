@@ -26,7 +26,7 @@ from atom.compass.spec.fields import PINNED
 
 TREE = pathlib.Path(__file__).resolve().parents[2]
 SPEC = MachineSpec.from_mapping(
-    json.loads((TREE / "scripts/compass/machines/mi308x-hjbog39.json").read_text())
+    json.loads((TREE / "tests/compass/machines/mi308x-hjbog39.json").read_text())
 )
 LAYOUT = {"dp": 1, "pp": 1, "pcp": 1, "tp": 1, "decode_context_parallel_size": 1}
 LAYOUT |= {"enable_expert_parallel": False, "enable_dp_attention": False}
@@ -163,7 +163,7 @@ def test_fit_ops_publishes_its_points_key_and_their_held_out_error(measured, tmp
     got = _fit(tmp_path / "fit", tmp_path / "store", d)
 
     fields = key("decode B=2", 1024, _leaf(2, 128)).values
-    assert got["key"] == {k: v for k, v in fields.items() if k != "point"}
+    assert got["key"] == {k: v for k, v in fields.items() if k != "point"} | LAYOUT
     assert got["report"]["by_op"] == {
         "decode aiter.gemm": {"held_out": 4, "declined": 2, "declining": 1}
         | {"median_error": pytest.approx(0.04), "max_error": pytest.approx(0.04)}
@@ -188,7 +188,7 @@ def test_fit_ops_reads_a_plan_run_s_rounds_as_one_directory(measured, tmp_path):
     got = _fit(tmp_path / "fit", tmp_path / "store", d)
 
     fields = key("decode B=2", 1024, _leaf(2, 128)).values
-    assert got["key"] == {k: v for k, v in fields.items() if k != "point"}
+    assert got["key"] == {k: v for k, v in fields.items() if k != "point"} | LAYOUT
     (f,) = got["params"]["families"].values()
     assert f["points"] == [
         [[b, 1024], ns, ["k"]] for b, ns in ((2, 10.0), (8, 16.0), (4, 12.5))

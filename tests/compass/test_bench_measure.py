@@ -937,4 +937,58 @@ def test_run_and_measure_steps_lay_out_dp_attention_alike(
         pc = config.parallel_config
         assert (config.tensor_parallel_size, pc.data_parallel_size) == (1, 2)
     with pytest.raises(SystemExit):
-        measure.atom_config([*atom_args, "--timeout-keep-alive", "5"])
+        measure.atom_config([*atom_args, "--compass-run", "run.json"])
+
+
+#: The API server's flags `compass record` passes it, as MiniMax-M3's
+#: submission serves with them.
+SERVED = [
+    "--default-chat-template-kwargs",
+    '{"thinking_mode":"enabled"}',
+    "--tool-call-parser",
+    "minimax_m3",
+    "--timeout-keep-alive",
+    "600",
+    "--disable-uvicorn-access-log",
+    "--chat-template",
+    "template.jinja",
+    "--request-log",
+    "requests.jsonl",
+]
+
+
+@pytest.fixture
+def config_of(monkeypatch, model_dir):  # noqa: F811
+    """`measure.atom_config` of `-tp 4` on `model_dir` and the arguments given."""
+
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+
+    def config_of(*argv):
+        return measure.atom_config(["--model", str(model_dir), "-tp", "4", *argv])
+
+    return config_of
+
+
+def test_measure_steps_takes_the_server_flags_record_passes_and_resolves_without_them(
+    config_of,
+):
+    assert vars(config_of(*SERVED)) == vars(config_of())
+
+
+@pytest.mark.parametrize(
+    "argv, error",
+    [
+        (["--max-num-sqes", "8"], "unrecognized arguments: --max-num-sqes 8"),
+        (["--timeout-keep-alive", "soon"], "invalid int value: 'soon'"),
+    ],
+)
+def test_measure_steps_refuses_a_misspelled_engine_flag_and_a_value_the_server_refuses(
+    config_of, argv, error, capsys
+):
+    with pytest.raises(SystemExit):
+        config_of(*SERVED[:2], *argv)
+    assert error in capsys.readouterr().err

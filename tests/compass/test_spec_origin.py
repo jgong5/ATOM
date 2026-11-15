@@ -7,19 +7,16 @@ check for.
 """
 
 import copy
-import importlib.util
 import json
-import pathlib
 
 import pytest
 from test_spec_schema import DOCUMENT
 from test_spec_verbs import CLASS1, LINKS, fragment
 
-from atom.compass.spec import MachineSpec, SpecRefusal, explain, merge
+from atom.compass.spec import MachineSpec, SpecRefusal, merge
 from atom.compass.spec.fields import SCHEMA
 from atom.compass.spec.rules import Rule
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
 CARD = {"model": "Qwen/Qwen3.8-27B", "width": 1, "source_root": "commit:983e42973"}
 
 
@@ -65,7 +62,7 @@ def test_a_saved_spec_answers_origin_for_every_field():
 
 def test_a_field_two_fragments_agree_on_is_assumed_only_if_both_assumed_it():
     links = fragment("links", LINKS, origin="assumed")
-    probed = fragment("probe", {"interconnect": {"router_relay_s": 1.5e-3}})
+    probed = fragment("probe", {"interconnect": {"inter_node": {"derate": 0.80}}})
     sheet = fragment(
         "datasheet",
         {"interconnect": {"inter_node": {"link_latency_s": 5.0e-6}}},
@@ -74,7 +71,7 @@ def test_a_field_two_fragments_agree_on_is_assumed_only_if_both_assumed_it():
     fragments = [*three_origins()[:2], probed, sheet, links]
     document = saved(merge(fragments).document)
     spec = MachineSpec.from_mapping(document)
-    assert spec.origin("interconnect.router_relay_s") == {"origin": "probed"}
+    assert spec.origin("interconnect.inter_node.derate") == {"origin": "probed"}
     assert spec.origin("interconnect.inter_node.link_latency_s") == {
         "origin": "datasheet"
     }
@@ -110,8 +107,6 @@ def test_a_mixed_document_without_its_map_is_refused_by_name():
     assert refused.value.rule is Rule.TOTALITY
     assert "records no origin for `device.memory.capacity_bytes`" in str(refused.value)
     with pytest.raises(SpecRefusal, match="records no origin"):
-        explain(spec, "device.memory.capacity_bytes")
-    with pytest.raises(SpecRefusal, match="records no origin"):
         merge(
             [fragment("machine.json", {"device": document["device"]}, origin="mixed")]
         )
@@ -121,7 +116,7 @@ def test_a_document_of_one_origin_answers_without_the_map():
     stanza = dict(DOCUMENT["provenance"], subject={"model": "Qwen/Qwen3-8B"})
     spec = MachineSpec.from_mapping(dict(DOCUMENT, provenance=stanza))
     assert "provenance.origins" not in spec.values
-    assert spec.origin("interconnect.router_relay_s") == {
+    assert spec.origin("interconnect.inter_node.derate") == {
         "origin": "probed",
         "model": "Qwen/Qwen3-8B",
     }
@@ -145,7 +140,7 @@ def test_one_field_is_never_mixed_and_only_a_probed_one_has_a_subject():
     ):
         broken = copy.deepcopy(document)
         broken["provenance"]["origins"] = dict(
-            origins, **{"interconnect.router_relay_s": entry}
+            origins, **{"interconnect.inter_node.derate": entry}
         )
         with pytest.raises(SpecRefusal, match=wanted):
             MachineSpec.from_mapping(broken)
@@ -158,56 +153,3 @@ def test_origin_of_a_host_field_is_refused_as_of_any_unknown_path():
     for path in ("host.http_intake.fixed_s", "device.memory.colour"):
         with pytest.raises(SpecRefusal, match="not a field of this schema"):
             spec.origin(path)
-
-
-def test_explain_names_each_contributions_origin():
-    combination = merge(three_origins())
-    spec = MachineSpec.from_mapping(saved(combination.document))
-    rows = {row.path: row for row in explain(spec, "device").contributions}
-    assert rows["device.memory.capacity_bytes"].origin == {"origin": "probed", **CARD}
-    assert str(rows["device.memory.capacity_bytes"]).endswith(
-        "probed on model Qwen/Qwen3.8-27B, width 1, source_root commit:983e42973"
-    )
-    stated = {row.path: row.origin for row in explain(spec, "provenance").contributions}
-    assert set(stated.values()) == {None}
-
-
-def _script(monkeypatch, name):
-    monkeypatch.setenv("COMPASS_MACHINE", name)
-    path = ROOT / "scripts" / "compass" / "mi308x_spec.py"
-    loaded = importlib.util.spec_from_file_location("mi308x_spec", path)
-    module = importlib.util.module_from_spec(loaded)
-    loaded.loader.exec_module(module)
-    return module
-
-
-@pytest.mark.parametrize("name", ["mi308x-hjbog18", "mi308x-hjbog39"])
-def test_the_checked_in_specs_say_where_each_field_came_from(monkeypatch, name):
-    script = _script(monkeypatch, name)
-    path = ROOT / "scripts" / "compass" / "machines" / f"{name}.json"
-    spec = MachineSpec.from_mapping(saved(json.loads(path.read_text())))
-    answered = {label: spec.origin(label) for label in labels(spec)}
-    # The attainable-peak probe states its own subject, and a band where owed.
-    peaks = set()
-    if script.PEAKS:
-        _, root, _, record = script.PEAKS
-        probe = {"source_root": f"commit:{root}", "record": f"sha256:{record}"}
-        probe["origin"] = "probed"
-        peaks = {
-            label
-            for label, found in answered.items()
-            if {k: v for k, v in found.items() if k not in ("p10", "p90")} == probe
-        }
-        derates = {label for label in answered if "derate" in label.split(".")}
-        assert derates - peaks == {"interconnect.inter_node.derate"}
-    for label, found in answered.items():
-        engine = label.startswith("device.") and label != "device.ptl"
-        if engine and found["origin"] == "probed" and label not in peaks:
-            assert found == {"origin": "probed", **script.SUBJECT}, label
-    # The cards' PTL state is read from sysfs, with no model or width under it.
-    assert answered["device.ptl"] == {"origin": "probed"}
-    for label, found in answered.items():
-        if label in peaks:
-            continue
-        if found["origin"] != "probed" or "derate" in label.split("."):
-            assert found == {"origin": "assumed"}, label
