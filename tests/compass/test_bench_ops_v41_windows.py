@@ -54,7 +54,8 @@ def test_the_drafter_s_window_read_takes_its_stage_layers_rows_at_the_step_s_slo
     runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
     runner.model.append(torch.nn.Module())
     runner.model[-1].spec = LayerAttentionSpec(0, 0, AttentionMode.FULL)
-    stages = SimpleNamespace(_context_layer_ids=lambda d: torch.tensor([2, 1]))
+    stages = torch.nn.Module()
+    stages._context_layer_ids = lambda device: torch.tensor([2, 1])
     runner.drafter, prepare = SimpleNamespace(model=stages), runner.prepare_model
 
     def prepare_model(batch):
