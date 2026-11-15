@@ -293,7 +293,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 34
+PROTOCOL = 36
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -1527,9 +1527,9 @@ class Stub:
             if spec["role"] == "kv"
         }
         self.kv = {k: _kv(spec, k[1], live) for k, (spec, live) in bind.items()}
-        # a view of a pool holding the state arena past its pages, narrower than
-        # the widest of it its leaf takes, is a window ring, as `_plan` reads one
-        span = {k: _span(v["shape"], v["stride"]) for k, (v, _) in bind.items()}
+        # a view of a pool holding the state arena past its pages, of fewer rows
+        # than the widest of it its leaf takes, is a window ring, as `_plan` reads one
+        span = {k: _whole(v["shape"], v["stride"]) for k, (v, _) in bind.items()}
         named = {k: (k[0], self.kv[k][0]) for k in bind}
         for k, (spec, live) in bind.items():
             pooled = self.state.get(named[k][1])
@@ -1696,14 +1696,15 @@ class Stub:
                     # than the widest of it a leaf stating its window takes, read
                     # a window a token, or the view a leaf given the ring's
                     # `window` writes a row a token; a ring a request at most
+                    whole = _whole(s["shape"], s["stride"]) * itemsize
                     widest = max(
-                        _span(v["shape"], v["stride"]) * itemsize
+                        _whole(v["shape"], v["stride"]) * itemsize
                         for p, v in _specs(op["args"])
                         if self.kv.get((sig, p), ("",))[0] == name
                     )
                     given = op["args"].get("window")
                     writes = isinstance(given, dict) and "object" in given
-                    if nbytes < widest if window else writes:
+                    if whole < widest if window else writes:
                         reach = acts[0]["shape"][0] + rows * ((window or 1) - 1)
                         unit, slotted = min(reach, rows * self.ring), 1
                     elif window and not decode:
@@ -2540,11 +2541,14 @@ def _kv(spec, slot, live, ring=False) -> tuple[str, torch.Tensor | None]:
     own dtype first, whose whole entries (`_entry`) it fills, as the capture's
     pool sized it. Before an arena's buffer, one takes a tensor in one, of its
     strides and dtype, that it lies inside, cut from that tensor's end in
-    every dim but the widest-strided (V4.1's cursor history). A `ring` (V4.1's
-    `ring_view`) binds the arena buffer ending its tensor, past its start by the
-    bytes it falls short of whole entries, or refuses past that buffer's."""
+    every dim but the widest-strided (V4.1's cursor history). Else a one-byte
+    view takes columns of a held one-byte tensor's rows at its stride, from the
+    first if half a row or wider, else the last: V4.1's FP8 values and scales.
+    A `ring` (V4.1's `ring_view`) binds the arena buffer ending its tensor,
+    past its start by the bytes its whole rows fall short of whole entries,
+    or refuses past that buffer's."""
     shape, stride, dtype = spec["shape"], spec["stride"], _dtype(spec["dtype"])
-    nbytes = _span(shape, stride) * dtype.itemsize
+    nbytes = _whole(shape, stride) * dtype.itemsize
     bufs = {n: (t, _entry(n, live)) for n, t in live.items() if ".buf." in n}
     own = {
         n: t.view(dtype)
@@ -2568,6 +2572,17 @@ def _kv(spec, slot, live, ring=False) -> tuple[str, torch.Tensor | None]:
     }
     flat = f".buf.{spec['dtype']}"
     own = own or {n: t for n, t in live.items() if n.endswith(flat)}
+    cols = {}
+    if not own:
+        cols = {
+            n: 0 if 2 * shape[-1] >= t.shape[-1] else t.shape[-1] - shape[-1]
+            for n, t in live.items()
+            if t.dim() == len(shape) == 2
+            and t.element_size() == dtype.itemsize == 1
+            and t.stride() == tuple(stride)
+            and shape[-1] < t.shape[-1]
+        }
+        own = {n: live[n].view(dtype)[:, c:] for n, c in cols.items()}
     if not own:
         return f"ATOM's KV holds no tensor laid out as {slot} {_text(spec)}", None
     try:
@@ -2582,7 +2597,7 @@ def _kv(spec, slot, live, ring=False) -> tuple[str, torch.Tensor | None]:
                 why = f"a window ring over {n} state slots; the bench holds {room}"
                 return f"{slot} {_text(spec)}: {why}", None
             at = b.storage_offset() * b.itemsize + n * e - nbytes
-            view = t.as_strided(shape, stride, at // t.itemsize)
+            view = t.as_strided(shape, stride, at // t.itemsize + cols.get(name, 0))
     return name, view
 
 
@@ -2600,6 +2615,14 @@ def _layout(shape, stride) -> list:
     cut = _widest(shape, stride)
     dims = zip(range(len(shape)), shape, stride)
     return [(None if i == cut else n, s) for i, n, s in dims if n != 1 or i in (0, cut)]
+
+
+def _whole(shape, stride) -> int:
+    """Elements a view's rows reach from its offset, each a whole row: its
+    widest-strided dim's size times that stride, its span where it fills its
+    rows; past the span of one of some of each row's columns (`_kv`)."""
+    cut = _widest(shape, stride)
+    return shape[cut] * stride[cut] if len(shape) else 1
 
 
 def _widest(shape, stride) -> int:
