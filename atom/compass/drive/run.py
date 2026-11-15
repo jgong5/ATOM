@@ -359,9 +359,9 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
     """The steps of the record directory or `shape_population` token `name`,
     less DP's dummy runs, each named `<name> dp<r> step <n>`; a rank whose
     engine states other `SHAPING` fields than `here` refuses, naming each.
-    Whatever a line states, its `tbo_tokens` is, on a data-parallel step under
-    two-batch overlap (`tbo`, ATOM's `enable_tbo`), the split `bound._split`
-    agrees over every rank's line at that step, else None."""
+    Whatever a line states, its `tbo_tokens` is, under two-batch overlap
+    (`tbo`, ATOM's `enable_tbo`), the split `bound._split` agrees over every
+    rank's line at that step, one rank's included, else None."""
     path = Path(name)
     if (path / serve.RUN_JSON).is_file():
         records = {
@@ -391,9 +391,9 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
         rank: {s["step"]: s for s in map(json.loads, text.splitlines())}
         for rank, (text, _) in sorted(records.items())
     }
-    # One rank is no DP group; dummy runs join the split, and a step some rank
-    # lacks splits none, as `trace ops --population` reads it.
-    every = set.intersection(*map(set, at.values())) if tbo and len(at) > 1 else ()
+    # Dummy runs join the split, and a step some rank lacks splits none, as
+    # `trace ops --population` reads it.
+    every = set.intersection(*map(set, at.values())) if tbo and at else ()
     splits = {n: _split([r[n] for r in at.values()]) for n in every}
     return [
         (f"{name} dp{rank} step {n}", line | {"tbo_tokens": splits.get(n)})
