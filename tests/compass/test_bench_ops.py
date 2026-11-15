@@ -870,7 +870,6 @@ def test_v41_fp4_whole_context_leaves_take_their_ratio_s_bounds_and_packed_start
     # two rows, laid out in the packed logits a plane's width apart
     step = SimpleNamespace(
         batch_ids=torch.arange(2, dtype=i32),
-        block_tables=torch.tensor([[3, 1], [0, 2]], dtype=i32),
         visible={r: torch.tensor([50, 20], dtype=i32) // r for r in (1, 2)},
         planned={
             f"v41_score_offsets_{r}": torch.tensor([0, 64 // r], dtype=i32)
@@ -893,7 +892,6 @@ def test_v41_fp4_whole_context_leaves_take_their_ratio_s_bounds_and_packed_start
         return _leaf(
             ops._FP4,
             ("plan", Reduced(f"{plan}Fp4MqaPlan", (("pages_per_block", blocks),))),
-            ("block_tables", _t([2, 2], "metadata", dtype=I32)),
             *[("row_ends", rows), ("out", _t([128], "metadata"))],
             ("out_offsets", rows),
         )

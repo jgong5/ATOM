@@ -1123,23 +1123,28 @@ class Stub:
         # what ATOM builds for MORI's exchange: the runner's, built before
         # its pool was sized (`_runner`), else once a MORI leaf asks (`_mori`)
         self.mori = getattr(runner, "mori", None)
-        # DeepSeek-V4.1's compress ratios by the rows a page holds at each,
-        # the index blocks it holds (an FP4 scorer's plan's `pages_per_block`)
-        # and the rows its block table's columns hold (the plane width a
-        # packed top-k's rows stand for)
+        # DeepSeek-V4.1's compress ratios by the rows a page holds at each
         builder = getattr(runner, "attn_metadata_builder", None)
         geometry = getattr(builder, "geometry", None)
-        cols = getattr(builder, "block_table_cols", 0)
         self.known = self.pages = {
-            key: r
+            ("rows_per_page", geometry.rows_per_page(r)): r
             for r in getattr(geometry, "layer_ratios", ())
             if r and hasattr(geometry, "rows_per_page")
-            for key in (
-                ("rows_per_page", geometry.rows_per_page(r)),
-                ("pages_per_block", geometry.index_blocks_per_page(r)),
-                ("plane_width", cols * geometry.rows_per_page(r)),
-            )
         }
+        # on its FP4 plane, by the index blocks a page holds (a scorer's plan's
+        # `pages_per_block`) and the rows its block table's columns hold (the
+        # plane a packed top-k's rows stand for, its `plane_width`)
+        if getattr(geometry, "index_fp4", False):
+            cols = getattr(builder, "block_table_cols", 0)
+            self.pages |= {
+                key: r
+                for r in geometry.layer_ratios
+                if r
+                for key in (
+                    ("pages_per_block", geometry.index_blocks_per_page(r)),
+                    ("plane_width", cols * geometry.rows_per_page(r)),
+                )
+            }
         # and the rows a request's window ring holds at a layer
         self.ring = getattr(geometry, "ring_slots", 0)
         # V4.1's FP8 index plane, whose prefill logits are as wide as the
