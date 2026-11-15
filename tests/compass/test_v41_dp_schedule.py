@@ -74,7 +74,11 @@ REQUESTS = (
 
 
 class _Runtime:
-    """The LP clock both ranks read."""
+    """The LP clock both ranks read. It has no owner thread, so a host
+    collective that `clock.settle_before_collectives` wraps settles nothing:
+    the loop moves the clock itself."""
+
+    owner = None
 
     def __init__(self):
         self.t = 0.0
@@ -245,6 +249,8 @@ def run():
             ),
         )
         mp.setattr(clock, "_installed", rt)
+        # Token-graph buckets are the process's: only this run's are stated.
+        release_registered_graphs()
         try:
             with ThreadPoolExecutor(2) as pool:
                 for f in [pool.submit(rank_loop, r, ports) for r in (0, 1)]:
