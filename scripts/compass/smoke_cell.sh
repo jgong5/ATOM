@@ -22,7 +22,13 @@
 #   OUT             an absent or empty directory, on a disk with room
 #   GPU             the one GPU, as rocm-smi and `--gpu` number it (required);
 #                   each compass command refuses it while a process is on it
-#   MACHINE         the machine spec of this node's GPUs (required)
+#   DEVICE          the GPUs' datasheet, by SKU or path, as `compass run
+#                   --device` takes it (required)
+#   PTL             the GPUs' PTL state, enabled or disabled (required)
+#   READINGS        an artifact store holding this platform's readings, which
+#                   `compass measure device` and `compass fit device` publish;
+#                   its platform_readings entries are copied into OUT/store
+#                   (required)
 #   TRACES          a cc-traces traces.jsonl (required, as client.sh takes it)
 #   HARNESS_PYTHON  the Python with agentx-harness and compass-harness, for the
 #                   simulated run's client (required)
@@ -49,7 +55,8 @@ compass_require_tree "$ROOT" || exit $?
 compass_describe "$ROOT"
 MODEL=$(realpath "${1:?usage: smoke_cell.sh MODEL OUT}")
 OUT=${2:?usage: smoke_cell.sh MODEL OUT}
-MACHINE=$(realpath "${MACHINE:?MACHINE names the machine spec of the GPUs}")
+: "${DEVICE:?DEVICE names the datasheet of the GPUs}" "${PTL:?PTL names their PTL state}"
+READINGS=$(realpath "${READINGS:?READINGS names a store holding the readings of the GPUs}")
 : "${TRACES:?TRACES names a cc-traces traces.jsonl}"
 : "${HARNESS_PYTHON:?HARNESS_PYTHON names the Python with compass-harness}"
 : "${AIPERF_PYTHON:?AIPERF_PYTHON names the Python without compass-harness}"
@@ -105,7 +112,9 @@ serve() {
 # token LOG: the store token a fit's LOG ends with.
 token() { awk '/^published / {t = $NF} END {print t}' "$1"; }
 
-M=(--machine "$MACHINE" --store "$OUT/store")
+M=(--store "$OUT/store")
+mkdir -p "$OUT/store" && cp -r "$READINGS/platform_readings" "$OUT/store/" ||
+    fail readings "$READINGS holds no platform_readings"
 CAL=353-$((352 + N)) CELL=0-$((N - 1))
 step memory python3 -c "$CLI" measure memory --gpu "$GPU" "${M[@]}" --out "$OUT/memory" -- "${ATOM_ARGS[@]}"
 serve warm "$OUT/warm" "$CELL" "$AIPERF_PYTHON" record --gpu "$GPU"
@@ -119,7 +128,7 @@ for k in 1 2; do
     serve real$k "$OUT/cell/real$k" "$CELL" "$AIPERF_PYTHON" record --gpu "$GPU"
 done
 serve step_linear "$OUT/cell/step_linear" "$CELL" "$HARNESS_PYTHON" \
-    run --step-linear "$LAW" --host-laws "$HOST" "${M[@]}"
+    run --step-linear "$LAW" --host-laws "$HOST" --device "$DEVICE" --ptl "$PTL" "${M[@]}"
 step grade python3 -m atom.compass.validate "$OUT/cell"
 
 cat "$OUT/grade.log"

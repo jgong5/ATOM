@@ -4,8 +4,9 @@
 The gather pads every rank to the rung, and a pad row routes to no expert:
 only the gather's real rows (`moe_tokens`) route, and the group's dummy
 forwards, each one row of token 0 at position 0, reach one token's experts.
-A fused shared expert still takes every gathered row, and the exchanges
-still move every row. Each is checked against a count by hand.
+A fused shared expert still takes every gathered row, and the gather and
+scatter still move every row; MoRI's exchange moves only this rank's real
+rows. Each is checked against a count by hand.
 """
 
 from math import comb
@@ -52,12 +53,12 @@ def test_only_the_real_rows_route_and_the_dummies_reach_one_tokens_experts(spec)
 @BOUND
 def test_under_expert_parallelism_the_busiest_rank_takes_the_real_rows_share(spec):
     # EP2: the busiest rank's share of 5 real rows' routes at the full
-    # intermediate; MoRI sends this rank's 4 graph rows as before.
+    # intermediate; MoRI sends this rank's 3 real rows, not its graph's pad row.
     ep2 = Module("experts", "moe", EP2, "fp4", ranks=2, act="fp8", wire=("fp4", "fp8"))
     load, hit = max_rank_load(5, 2, 8, 2), activated_experts(8, 2, 5)
     row = 32 * (0.5 + 2) + 16
     want = Work({"fp8": 2 * load * (64 + 32) * 32}, hit / 2 * 1632 + load / 2 * row)
-    sent = 4 * 32 * 2 * (1 - comb(4, 2) / comb(8, 2))
+    sent = 3 * 32 * 2 * (1 - comb(4, 2) / comb(8, 2))
     exchanges = 2e-6 + sent * 0.5 / 2 / LINK + 2e-6 + sent / 2 / LINK
 
     got = _price([ep2], gathered(8, 5), spec)["roofline.moe"]

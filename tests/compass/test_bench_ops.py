@@ -3950,7 +3950,7 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
     tmp_path, monkeypatch
 ):
     spec = MachineSpec.from_mapping(
-        json.loads((TREE / "scripts/compass/machines/mi308x-hjbog39.json").read_text())
+        json.loads((TREE / "tests/compass/machines/mi308x-hjbog39.json").read_text())
     )
     stack = {c: spec.value(f"device.software_pinned_to.{c}") for c in PINNED}
     name, arch = spec.value("device.name"), spec.value("device.arch")

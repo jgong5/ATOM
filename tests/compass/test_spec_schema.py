@@ -47,7 +47,7 @@ import sys
 import pytest
 
 from atom.compass import spec as spec_package
-from atom.compass.spec import Fragment, MachineSpec, SpecRefusal, explain
+from atom.compass.spec import MachineSpec, SpecRefusal
 from atom.compass.spec.fields import FIELDS, SCHEMA, SCHEMA_VERSION, Kind
 from atom.compass.spec.rules import DEPLOYMENT_OWNED, Rule
 
@@ -95,7 +95,6 @@ DOCUMENT = {
             "link_latency_s": 5.0e-6,
             "derate": 0.80,
         },
-        "router_relay_s": 1.5e-3,
     },
 }
 
@@ -356,14 +355,6 @@ BREAKAGES = {
     ),
 }
 
-#: The same rule named by the verbs other than the reader, each driven through
-#: the verb that declines. Not part of the edit-then-read claim below, which is
-#: about what this reader goes on to read; here only so the partition covers
-#: every site the package has rather than the reader's share of them.
-ELSEWHERE = {
-    "a fragment that is not a mapping": lambda: Fragment.from_mapping([1, 2], "p"),
-}
-
 
 def _spec_modules():
     # The one walk over the package: every check below that reads its source
@@ -589,23 +580,13 @@ def test_every_rule_is_named_by_at_least_one_site():
 def test_every_site_that_declines_a_document_is_driven_here():
     # A table written by hand that quietly covers six of seven sites passes for
     # a reason nobody stated, so the set is read out of the package's source
-    # instead of counted. A site added later is red here until it is placed on
-    # one side of the partition or the other.
+    # instead of counted. A site added later is red here until a breakage
+    # drives it.
     driven = {
         _site_of(lambda make=make: MachineSpec.from_mapping(make()))
         for make in BREAKAGES.values()
-    } | {_site_of(declines) for declines in ELSEWHERE.values()}
+    }
     assert driven == _sites_naming("SHAPE")
-
-
-def test_explain_declines_an_unknown_term_and_an_absent_one_at_one_site():
-    # Neither is a document to correct, so neither is a shape: both are asked
-    # again by a path the spec states.
-    unknown = _site_of(lambda: explain(read(), "no_such_term"))
-    absent = _site_of(lambda: explain(read(), "provenance.notes"))
-    assert unknown[0] == "explain.py" and unknown in _sites_naming("ADDRESSING")
-    assert absent == unknown
-    assert unknown not in _sites_naming("SHAPE")
 
 
 def test_the_version_is_the_one_site_that_is_not_about_the_document():
@@ -830,7 +811,7 @@ def test_a_missing_stack_pin_is_refused():
     [
         (("device", "count_per_node"), True),
         (("device", "count_per_node"), 0),
-        (("interconnect", "router_relay_s"), -1.0),
+        (("interconnect", "inter_node", "link_latency_s"), -1.0),
         (("device", "name"), ""),
         (("device", "arch"), 950),
         (("schema_version",), 2),
