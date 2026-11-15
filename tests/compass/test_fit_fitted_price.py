@@ -6,11 +6,19 @@ slow leading step, read the residual it solves, price less label over price."""
 
 import numpy as np
 import pytest
+from test_backend_step_linear_fit import HOST, _steps, _timed_record
 from test_fit_host import BATCH, DECODE, ENCODE, stamped
 
 from atom.compass import run as compass_run
 from atom.compass.backends.accuracy import _leading_slow
-from atom.compass.backends.step_linear_fit import _fit_form, _solve, fit_tokenizer
+from atom.compass.backends.step_linear_fit import (
+    _fit_form,
+    _host_law,
+    _solve,
+    fit_host,
+    fit_tokenizer,
+    label_records,
+)
 
 
 @pytest.mark.parametrize("width", [1, 2], ids=["one rank", "two ranks"])
@@ -75,3 +83,34 @@ def test_a_step_no_column_prices_is_dropped_and_divides_no_equation():
 
     assert solved["keep"].tolist() == [False, True, True, True, True]
     assert solved["coef"] == pytest.approx([1.0], rel=1e-12)
+
+
+def test_a_host_law_keeps_a_sample_at_twice_its_price_which_the_step_solve_drops():
+    # Thirty samples at 0.98, 1 and 1.02 times a law, the first at twice it,
+    # as a call after an idle CPU runs. The step solve's MAD test drops it;
+    # the host law keeps every sample and prices their mean ratio at 1.
+    tokens = np.linspace(1000, 30_000, 30)
+    x = np.column_stack([np.ones(30), tokens])
+    seconds = x @ [0.01, 1e-6] * np.r_[2.0, np.resize([0.98, 1.0, 1.02], 29)]
+    coef, report = _host_law(x, seconds, ["fixed", "tokens"])
+
+    assert (report["samples"], report["dropped"]) == (30, 0)
+    assert np.mean(seconds / (x @ coef)) == pytest.approx(1.0, rel=1e-9)
+    assert not _solve(x, seconds, ["fixed", "tokens"], kept="fixed")["keep"][0]
+
+
+def test_the_jit_cut_still_drops_a_compile_the_host_laws_then_leave_out(tmp_path):
+    # Output prefill 110's launch stalls on a compile, 20 times its law, and
+    # decode 251's runs 6 times its own. The JIT cut's MAD test names both;
+    # with them and the forwards after them left out, every host law, which
+    # drops no sample, is the planted one.
+    scale = {(110, "W_launch"): 20, (251, "W_launch"): 6}
+    record, _ = _timed_record(tmp_path / "dp0.jsonl", _steps(14, n=400), scale=scale)
+    host, report = fit_host(label_records([record])[0])
+
+    assert list(report["jit_steps"].values()) == [[110, 251]]
+    for kind, segments in HOST.items():
+        for segment, c in segments.items():
+            got = host["laws"][kind][segment]
+            assert got == pytest.approx(c, rel=1e-4, abs=1e-12), f"{kind}.{segment}"
+            assert report[f"{kind}.{segment}"]["dropped"] == 0

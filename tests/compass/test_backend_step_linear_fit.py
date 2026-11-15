@@ -631,7 +631,8 @@ def test_a_launch_a_first_use_compile_stalls_is_named_and_left_out_with_the_next
     but 106's twice, and the decode after each enters 0.9% late, inside the MAD floor,
     as its period takes up the stall. Decode 251's launch runs 6 times its law,
     decode 151's 3 times: a decode's launch counts as a compile only past
-    `WARM_FACTOR`, a prefill's whenever the fit drops it above its law."""
+    `WARM_FACTOR`, a prefill's whenever the fit drops it above its law.
+    Decode 151's launch stays in its law, which drops no sample."""
     jit = list(range(102, 142, 4))
     scale = {(n, "W_launch"): 20 for n in jit} | {(n + 1, "E"): 1.009 for n in jit}
     scale |= {(106, "W_launch"): 2, (151, "W_launch"): 3, (251, "W_launch"): 6}
@@ -641,8 +642,12 @@ def test_a_launch_a_first_use_compile_stalls_is_named_and_left_out_with_the_next
     assert list(report["jit_steps"].values()) == [sorted(jit + [251])]
     for kind, segments in HOST.items():
         for segment, c in segments.items():
+            if (kind, segment) == ("decode", "W_launch"):
+                continue
             got = host["laws"][kind][segment]
             assert got == pytest.approx(c, rel=1e-4, abs=1e-12), f"{kind}.{segment}"
+    assert report["decode.W_launch"]["dropped"] == 0
+    assert host["laws"]["decode"]["W_launch"][0] > HOST["decode"]["W_launch"][0]
 
 
 def test_records_under_two_host_keys_are_refused(tmp_path):
