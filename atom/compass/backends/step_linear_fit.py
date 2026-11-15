@@ -2093,6 +2093,13 @@ def recorded_buckets(stated: dict) -> tuple[int, ...] | None:
     return next(iter(held), None)
 
 
+def refuse_contradicting(own, held: dict, stated, engine: dict) -> None:
+    """Refuse `engine`, the engine file `stated`'s keyed fields, where it omits
+    or states otherwise a field `held`, the record's own file `own`'s, holds."""
+    if differ := [k for k, v in held.items() if k not in engine or engine[k] != v]:
+        raise ValueError(f"{own} contradicts {stated} in {differ}")
+
+
 def refuse_context_parallel(engine: dict, where: str) -> None:
     """Refuse an engine config that states a context-parallel width: a step
     linear law states none, so a run at width 1 would price with it."""
@@ -2201,8 +2208,7 @@ def _labelled(args) -> tuple[list, dict, dict, dict]:
             raw = json.loads(own.read_text()) if own.exists() else {}
             held = keyed_of(raw)
             refuse_context_parallel(held, str(own))
-            if differ := [k for k, v in held.items() if engine.get(k, v) != v]:
-                raise ValueError(f"{own} contradicts {args.engine} in {differ}")
+            refuse_contradicting(own, held, args.engine, engine)
         given = json.loads(Path(args.engine).read_text()).get(PREFILL_BUCKETS)
         stated = {args.engine: given} | {
             r: b for r, b in stated.items() if b is not None

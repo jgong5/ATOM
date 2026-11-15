@@ -498,8 +498,8 @@ def test_each_mi308x_spec_states_its_torch_and_the_runs_readings_take_it(
             "tensor_parallel_size 1 in the bundle and 2 here",
         ),
         (
-            {"capture_sizes": LADDER[:-1]},
-            f"ladder {LADDER} in the bundle and {LADDER[:-1]} here",
+            {"capture_sizes": LADDER[1:]},
+            f"ladder {LADDER} in the bundle and {LADDER[1:]} here",
         ),
         ({"enforce_eager": True}, "graph mode 'replay' in the bundle and 'eager' here"),
     ],

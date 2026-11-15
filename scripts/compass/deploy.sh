@@ -56,9 +56,10 @@
 # then stops the instances, the router and the authority, writes OUT/run.json,
 # the command line, the KV link, the run file and the router's command, and,
 # once a client's export is complete (OUT/artifacts/client_run.json), each
-# request's split, OUT/request_split.json (atom/compass/report/split.py), and
-# exits 0, or 1 when something left on its own, a router LP as the traffic
-# closes aside, failed to stop, or the split failed. Exits 2 on bad arguments.
+# request's split, OUT/request_split.json (atom/compass/report/split.py), then
+# the run's report, OUT/report.html (atom/compass/report/html.py), and exits 0,
+# or 1 when something left on its own, a router LP as the traffic closes aside,
+# failed to stop, or the split or the report failed. Exits 2 on bad arguments.
 #
 # Real, there is no run file or authority: each instance is one `compass
 # record --out`, which checks its node's GPUs before and after.
@@ -327,5 +328,7 @@ mv "$OUT/run.json.part" "$OUT/run.json"
 if [[ -s $OUT/artifacts/client_run.json ]]; then
     (cd / && python3 -m atom.compass.report.split "$OUT") ||
         { echo "deploy: split: atom.compass.report.split exited $?" >&2; rc=1; }
+    (cd / && python3 -m atom.compass.report.html "$OUT") ||
+        { echo "deploy: report: atom.compass.report.html exited $?" >&2; rc=1; }
 fi
 exit $rc
