@@ -29,8 +29,11 @@
 #                    hit rates from
 #   --stop           then SIGTERM the command that started the server, wait
 #                    WAIT_S (default 600) for it to write OUT/run.json and leave,
-#                    a trace run's (OUT/trace) serve.TRACE_STOP_S more, and set
-#                    the export's server_stopped
+#                    a trace run's (OUT/trace) serve.TRACE_STOP_S more, set
+#                    the export's server_stopped and, for an instance, write
+#                    each request's split, OUT/request_split.json
+#                    (atom/compass/report/split.py), which deploy.sh writes
+#                    for a deployment as it stops
 #   --sweep          in place of aiperf, send the JIT sweep of the cell the
 #                    server's engine and traces A to B make, then after the
 #                    stop keep the points its record covers in the server's
@@ -271,3 +274,5 @@ path = Path(sys.argv[1])
 export = json.loads(path.read_text()) | {"server_stopped": True}
 path.write_text(json.dumps(export, sort_keys=True))
 EOF
+[[ -d $OUT/prefill ]] || (cd / && python3 -m atom.compass.report.split "$OUT") ||
+    fail "split: atom.compass.report.split exited $?"
