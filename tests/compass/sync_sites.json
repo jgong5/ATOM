@@ -4727,16 +4727,16 @@
    "mechanism_why": "the bench is stopping; it measures real forwards on a real runner for a measuring command, and no simulated run starts one"
   },
   {
-   "id": "atom/compass/bench/runner.py::BenchModelRunner.__init__::end.synchronize()::device_sync#0",
-   "file": "atom/compass/bench/runner.py",
-   "symbol": "BenchModelRunner.__init__",
+   "id": "atom/compass/parity/runner.py::_Recording.calibrate_preload::end.synchronize()::device_sync#0",
+   "file": "atom/compass/parity/runner.py",
+   "symbol": "_Recording.calibrate_preload",
    "call": "end.synchronize",
    "expr": "end.synchronize()",
    "shape": "device_sync",
    "peer": "none",
-   "why": "the bench runner waits for its spin-kernel calibration to finish on the device, once at startup",
+   "why": "the recording runner waits for its spin-kernel calibration to finish on the device, once: at the bench runner's startup, or before a gated record's first forward",
    "mechanism": "K9",
-   "mechanism_why": "a startup calibration inside the bench's real runner; the bench measures real forwards on a real runner for a measuring command, and no simulated run starts one"
+   "mechanism_why": "a calibration inside a real recording runner, for the bench's measuring command or a gated `compass record`; both measure real forwards on a real runner, and no simulated run calls it"
   },
   {
    "id": "atom/compass/bench/window.py::BenchWindow.bench_step::while len(kept) < REPEATS::spin_loop#0",

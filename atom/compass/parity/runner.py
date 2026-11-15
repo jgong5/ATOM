@@ -20,10 +20,14 @@ from atom.model_engine.model_runner import ModelRunner, RapidServeModelRunner
 
 key_memory_formats_by_name()
 
+#: Spin cycles timed once, to turn a preload's nanoseconds into cycles.
+CALIBRATION_CYCLES = 10_000_000
+
 
 class _Recording(StepRecording):
     """`StepRecording` on this worker's clocks, with the host key read at
-    startup, and the blocking-call tool where HIP's initialization loaded it."""
+    startup, the blocking-call tool where HIP's initialization loaded it, and
+    the spin a gated record and the bench queue before a forward."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -42,6 +46,21 @@ class _Recording(StepRecording):
         event = torch.cuda.Event(enable_timing=True)
         event.record()
         return event
+
+    def calibrate_preload(self) -> None:
+        """Time `CALIBRATION_CYCLES` of the spin `preload` queues, once: its
+        cycles per nanosecond on this worker's device."""
+        # The first launch also loads the kernel, which takes longer than it spins.
+        torch.cuda._sleep(1)
+        start = self.device_event()
+        torch.cuda._sleep(CALIBRATION_CYCLES)
+        end = self.device_event()
+        end.synchronize()
+        self.cycles_per_ns = CALIBRATION_CYCLES / (start.elapsed_time(end) * 1e6)
+
+    def preload(self, ns: int) -> None:
+        """Queue about `ns` of device work on the current stream: a spin kernel."""
+        torch.cuda._sleep(round(ns * self.cycles_per_ns))
 
 
 class RecordingModelRunner(_Recording, ModelRunner):
