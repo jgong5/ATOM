@@ -594,12 +594,13 @@ def test_cctraces_sim_sends_the_arm_s_dynamo_header_as_client_sh_does(tmp_path, 
     (tmp_path / "bin" / "python3").chmod(0o755)
     (tmp_path / "run_file.json").write_text("{}")
     cell = {"FIRST_SESSION": "1", "SESSIONS": "2", "CONCURRENCY": "3", "WAIT_S": "5"}
+    # About 9 s alone; a CPU gate beside another has taken over 120 s.
     subprocess.run(
         ["bash", TREE / "scripts/compass/cctraces_sim.sh", "run_file.json", "cell"],
         cwd=tmp_path,
         env=env | cell,
         capture_output=True,
-        timeout=120,
+        timeout=600,
         check=False,
     )
     seen.append(json.loads((tmp_path / "seen.json").read_text())[1])
