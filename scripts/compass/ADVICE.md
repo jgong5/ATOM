@@ -13,7 +13,7 @@ records, fits, real runs and grading. This page uses its container, variables an
 platform readings, and never grades. A prediction on a host with no GPU at all is
 [#2893](https://github.com/jgong5/ATOM/issues/2893)'s page.
 
-## The three limits
+## Limits
 
 - **A GPU container.** The search uses no GPU compute, but a simulated server
   imports aiter, which needs a ROCm driver. Run it in the GPU container of
@@ -30,7 +30,7 @@ platform readings, and never grades. A prediction on a host with no GPU at all i
 ## Before the first search
 
 Set up QUICKSTART's [Environment](QUICKSTART.md#environment) and
-[Variables](QUICKSTART.md#variables), with two differences.
+[Variables](QUICKSTART.md#variables), with these differences.
 
 - **The tree is a clone, not a snapshot.** The check reads the head from git, so
   `$T` is a clone of `https://github.com/jgong5/ATOM` checked out at the head, and
@@ -199,7 +199,8 @@ compass advice SPACE OUT
 ```
 
 OUT is the search's directory, made when absent; keep it for every rerun. The
-command checks, simulates and ranks in one run, printing as it goes:
+command checks, simulates and ranks in one run. Each step prints its lines once
+it has ended, so the simulation prints nothing until its last point ends:
 
 1. **The expansion.** A space file it cannot expand is refused in one line naming
    the file and the field, such as `compass advice: SPACE: candidate S1:
@@ -219,9 +220,11 @@ command checks, simulates and ranks in one run, printing as it goes:
 3. **The simulation.** Each searchable point runs on a fresh server with one
    client run, into `OUT/runs/<candidate>-c<concurrency>/`, its server's output in
    `<point>.log` and its client's in `<point>.client.log` beside it. Points run in
-   parallel, as many as the host's CPUs hold at one CPU per rank. Each prints
-   `<point>: finished in <dir>, <s> CPU s`, or `failed after 2 tries` with each
-   try's reason, then a total line. A rerun skips a finished point.
+   parallel, as many as the host's CPUs hold at one CPU per rank. Meanwhile
+   `OUT/runs/<point>/point.json` appears as each point finishes. At the end,
+   each prints `<point>: finished in <dir>, <s> CPU s`, or `failed after 2
+   tries` with each try's reason, then a total line. A rerun skips a finished
+   point.
 4. **The results**, in `OUT/results.json`: the SLO, the result table, the command
    that makes what each coverage report lacks, and the recommendation's text,
    which starts `Recommended:` or `No recommendation:`.
