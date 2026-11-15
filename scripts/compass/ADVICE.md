@@ -76,10 +76,10 @@ Take each field from what the user asks for:
 | Field | From |
 |---|---|
 | `model` | the model directory the user serves; the recipe's `--model` names one too |
-| `machine` | `device`, the target's datasheet under `atom/compass/devices/` (`mi355x`); `ptl`, what `cat /sys/bus/pci/devices/*/ptl/ptl_enable` prints on the target, `disabled` where it finds no file; `network`, a file under `atom/compass/networks/`, only when a 1P1D candidate puts its sides on two nodes; `stack` only when the store holds readings of several |
+| `machine` | `device`, the target's datasheet under `atom/compass/devices/` (`mi355x`); `ptl`, what `cat /sys/bus/pci/devices/*/ptl/ptl_enable` prints on the target, `disabled` where it finds no file; `network`, the name of a file under `atom/compass/networks/` without `.json`, only when a 1P1D candidate puts its sides on two nodes; `stack`, left out until a search refuses, listing the store's several readings, then the one the user runs |
 | `store` | the shared store, an absolute path |
 | `commit` | only when the user freezes the search at one commit |
-| `workload` | the traces file's absolute path; `select`, the traces (`0-255`) or `agentx`; each concurrency the user asks for; `duration_s` only when the user names one |
+| `workload` | the traces file's absolute path; `select`, the traces (`0-255`) or `agentx`; each concurrency the user asks for, whatever band a recipe runs its variant at; `duration_s` only when the user names one |
 | `slo` | the user's bounds; a bound they do not state is left out, and bounds nothing |
 
 Then the configurations. One dimension whose values are whole configurations, as
@@ -92,13 +92,15 @@ removing the combinations they do not want.
 Each configuration has a basis: a recipe and the variant in it, or the user's own
 real-run command. Copy its server command into blocks by these rules.
 
-- **`basis`** names the recipe's path and its variant's heading, such as
+- **`basis`** names the recipe's path and its variant, in any words that tell it
+  from the recipe's others, such as
   `recipes/DeepSeek-V4-Agentic-InferenceX.md, DP attention`; for a user's command,
   where it came from.
 - **What every candidate shares goes into `common`**, the rest into the value's
   block. Each argument or variable is set in one block only: two blocks that set
   one thing to different values refuse the candidate.
-- **`--model`** is the `model` field, never an argument.
+- **`--model`** is the `model` field, never an argument, and the recipe's own
+  path takes no departure.
 - **An argument is a long flag** mapped to its value: `--level 3` is
   `"--level": 3`, a number written as a number; a bare flag is `true`, such as
   `"--enable-dp-attention": true`, and its negation keeps the `--no-` spelling,
@@ -139,20 +141,23 @@ when every candidate's recipe sets it:
 Some things a recipe sets are no instance's and take no departure: the
 router's command (`deploy.sh` starts it), the client's with its `AIPERF_*`
 variables (`client.sh` runs it from `workload`), an LMCache server's (a simulated
-run serves Compass's own in its place), and a variable ATOM does not read that
-the recipe sets only to build another value, as `NODE_IP` builds `ATOM_HOST_IP`
-and `--kv-transfer-config`. Keep the variables that point the server at LMCache,
-such as `ATOM_KV_OFFLOAD`.
+run serves Compass's own in its place), a variable ATOM does not read that the
+recipe sets only to build another value, as `NODE_IP` builds `ATOM_HOST_IP` and
+`--kv-transfer-config`, and the Mooncake variables the README's 1P1D deployment
+gives a real side. Keep the variables that point the server at LMCache, such as
+`ATOM_KV_OFFLOAD`.
 
 ### What the user decides
 
 Some values no recipe gives: one value where the recipe varies it with the
 concurrency, a switch turned the other way, a memory fraction the target needs.
 Take each from the user, write it in its block, and give it a departure with the
-user's reason. Without one, keep the recipe's value and the user's decision
-open: an agent asks, and never picks one. A configuration that does not start on
-the target, such as one out of memory, comes back from step 2 refused, with the
-start's error.
+user's reason. A departure is keyed by the argument in either spelling, `--no-x`
+and `--x` being one, and sits in `common` or a value's block, never a side's: a
+value that differs by side states each side's in one reason. Without the user's
+value, keep the recipe's and the decision open: an agent asks, and never picks
+one. A configuration that does not start on the target, such as one out of
+memory, comes back from step 2 refused, with the start's error.
 
 ### Example: S1 from its recipe
 
