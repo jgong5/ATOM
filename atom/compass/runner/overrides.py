@@ -105,6 +105,7 @@ import os
 import pickle
 import sys
 from functools import partial, wraps
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -855,20 +856,83 @@ def gathers_by_shape():
         GroupCoordinator.all_gather = gather
 
 
+_IS_CUDA = torch.Tensor.is_cuda.__get__
+
+
+class _MetaOnDevice(TorchFunctionMode):
+    """A meta tensor says it is on the GPU, as the tensor it stands for is."""
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if func == _IS_CUDA and args[0].is_meta:
+            return True
+        return func(*args, **(kwargs or {}))
+
+
+@contextlib.contextmanager
+def mhc_packed_on_meta():
+    """DeepSeek-V4.1's mHC pack packs a meta weight as it packs one on the GPU.
+
+    A V4.1 block keeps each mHC projection packed in a buffer after load
+    (`pack_mhc_fn`), but only for a weight on a gfx950 GPU, and a meta weight
+    is on none. Inside the pack a meta tensor says it is on the GPU and a meta
+    device's properties name the arch aiter's probe answers (the simulated
+    device's under `simulated_arch`), so ATOM's and aiter's code leave the
+    meta tensor a real start keeps, or nothing where that device keeps none.
+    Without the pack's module loaded nothing is swapped.
+    """
+    name = "pack_mhc_fn"
+    pack = getattr(
+        sys.modules.get("atom.model_ops.deepseek_v41.mhc_pre_delayed"), name, None
+    )
+    if pack is None:
+        yield
+        return
+    properties = torch.cuda.get_device_properties
+
+    def on_device(device=None):
+        if device is None or torch.device(device).type != "meta":
+            return properties(device)
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return SimpleNamespace(gcnArchName=get_gfx())
+
+    @wraps(pack)
+    def packed(fn):
+        if not fn.is_meta:
+            return pack(fn)
+        torch.cuda.get_device_properties = on_device
+        try:
+            with _MetaOnDevice():
+                return pack(fn)
+        finally:
+            torch.cuda.get_device_properties = properties
+
+    loaded = list(sys.modules.values())
+    bound = [m for m in loaded if getattr(m, "__dict__", {}).get(name) is pack]
+    for m in bound:
+        setattr(m, name, packed)
+    try:
+        yield
+    finally:
+        for m in bound:
+            setattr(m, name, pack)
+
+
 def process_weights_after_loading(tree: torch.nn.Module) -> None:
     """Run on a meta tree the post-load hooks `load_model` runs after a load.
 
     The same walk, parent first: each module's own hook, then its quant
     method's. The hooks re-lay weights (an MXFP4 MoE pads its expert scales),
     so the storages they leave are the ones a real start holds; a gather
-    across a process group answers with its shape (`gathers_by_shape`). The
+    across a process group answers with its shape (`gathers_by_shape`), and
+    V4.1's mHC pack packs as on the GPU (`mhc_packed_on_meta`). The
     loader's `init_prepare_finalize` is not run: it sets up an MoE's dispatch
     and holds no weight. A hook that fails on the meta device refuses the
     start by name.
     """
     if not isinstance(tree, torch.nn.Module):
         return
-    with gathers_by_shape():
+    with gathers_by_shape(), mhc_packed_on_meta():
         _run_post_load_hooks(tree)
 
 
