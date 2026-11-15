@@ -105,6 +105,7 @@ import os
 import pickle
 import sys
 from functools import partial, wraps
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -114,6 +115,7 @@ from torch.utils._device import _device_constructors
 
 from atom.compass.backends.base import CostBackend
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
+from atom.compass.memory.readings import PAGE_BOUND
 from atom.compass.runner.step_output import DeferredTokenStream, filler_token_ids
 
 logger = logging.getLogger(__name__)
@@ -515,14 +517,20 @@ class HostDeviceRecurrence:
         return released + post
 
 
-def schedulable_ladder(config: Any) -> list[int]:
-    """The capture sizes the scheduler can produce, ascending: ATOM's capture
-    bound, each sequence charged one token plus its drafts.
+def schedulable_bound(config: Any) -> int:
+    """The widest decode batch the scheduler can produce: ATOM's capture bound,
+    each sequence charged one token plus its drafts.
     `max_schedulable_decode_bs` holds it; importing that would pull the engine,
     and its kernels, into a driver-free process."""
     spec = getattr(config, "speculative_config", None)
     q = 1 + (spec.num_speculative_tokens if spec else 0)
-    bound = min(config.max_num_seqs, config.max_num_batched_tokens // q)
+    return min(config.max_num_seqs, config.max_num_batched_tokens // q)
+
+
+def schedulable_ladder(config: Any) -> list[int]:
+    """The capture sizes the scheduler can produce (`schedulable_bound`),
+    ascending."""
+    bound = schedulable_bound(config)
     return sorted(s for s in config.capture_sizes if s <= bound)
 
 
@@ -613,21 +621,24 @@ def _resident(readings: DeviceReadings, config: Any) -> int:
     after the load. Its `persistent` is read at the KV budget, after the
     attention builder that asks this has allocated, so none of it is counted.
 
-    Refused under `--index-cache-dtype fp4`, where DeepSeek-V4.1 sizes its
-    packed score workspace by the PAGEs left after this; on the fp8 plane the
-    answer sizes nothing."""
-    if getattr(config, "index_cache_dtype", None) == "fp4":
+    Under `--index-cache-dtype fp4`, where DeepSeek-V4.1 sizes its packed score
+    workspace by the PAGEs left after this, it adds `readings.page_bound`, what
+    a real start holds there above its load, and is refused without it; on the
+    fp8 plane the answer sizes nothing."""
+    fp4 = getattr(config, "index_cache_dtype", None) == "fp4"
+    if fp4 and readings.page_bound is None:
         raise RunnerRefusal(
             "under --index-cache-dtype fp4 DeepSeek-V4.1 bounds its score "
             "workspace by the PAGEs `memory_allocated` leaves, and a simulated "
             "start reads only the weights, buffers and load residue there; a "
             "real start also holds the drafter, the forward buffers and the "
-            "attention builder's own, which no memory reading separates, so "
-            "the PAGE bound would exceed a real start's. Pass "
+            "attention builder's own, and the run's memory readings state no "
+            f"{PAGE_BOUND}; take them again with compass measure memory, or pass "
             "--index-cache-dtype fp8, whose workspace does not read it."
         )
     held = ("weights", "buffers", "load residue")
-    return sum(t.nbytes for t in readings.peak_torch.terms if t.name in held)
+    resident = sum(t.nbytes for t in readings.peak_torch.terms if t.name in held)
+    return resident + (readings.page_bound.nbytes if fp4 else 0)
 
 
 @contextlib.contextmanager
@@ -815,17 +826,117 @@ def _gpu(arg: Any) -> bool:
     return isinstance(arg, (str, torch.device)) and torch.device(arg).type == "cuda"
 
 
+@contextlib.contextmanager
+def gathers_by_shape():
+    """A process group's gather of a meta tensor answers with its shape.
+
+    A hook that re-quantizes a sharded weight first gathers it whole across
+    its group: online quantization does, to a per-token target on a
+    row-parallel layer (`LinearBase.online_quantize_weight`). A meta shard has
+    no bytes to send, and the collective refuses it. Here it gets a meta
+    tensor of the gathered shape, its size along the gathered dim times the
+    group's width, and no collective runs; a gather of real bytes runs as
+    before.
+    """
+    from aiter.dist.parallel_state import GroupCoordinator
+
+    gather = GroupCoordinator.all_gather
+
+    def by_shape(group, input_, use_custom=False, dim=-1):
+        if not input_.is_meta:
+            return gather(group, input_, use_custom, dim)
+        shape = list(input_.shape)
+        shape[dim] *= group.world_size
+        return input_.new_empty(shape)
+
+    GroupCoordinator.all_gather = by_shape
+    try:
+        yield
+    finally:
+        GroupCoordinator.all_gather = gather
+
+
+_IS_CUDA = torch.Tensor.is_cuda.__get__
+
+
+class _MetaOnDevice(TorchFunctionMode):
+    """A meta tensor says it is on the GPU, as the tensor it stands for is."""
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if func == _IS_CUDA and args[0].is_meta:
+            return True
+        return func(*args, **(kwargs or {}))
+
+
+@contextlib.contextmanager
+def mhc_packed_on_meta():
+    """DeepSeek-V4.1's mHC pack packs a meta weight as it packs one on the GPU.
+
+    A V4.1 block keeps each mHC projection packed in a buffer after load
+    (`pack_mhc_fn`), but only for a weight on a gfx950 GPU, and a meta weight
+    is on none. Inside the pack a meta tensor says it is on the GPU and a meta
+    device's properties name the arch aiter's probe answers (the simulated
+    device's under `simulated_arch`), so ATOM's and aiter's code leave the
+    meta tensor a real start keeps, or nothing where that device keeps none.
+    Without the pack's module loaded nothing is swapped.
+    """
+    name = "pack_mhc_fn"
+    pack = getattr(
+        sys.modules.get("atom.model_ops.deepseek_v41.mhc_pre_delayed"), name, None
+    )
+    if pack is None:
+        yield
+        return
+    properties = torch.cuda.get_device_properties
+
+    def on_device(device=None):
+        if device is None or torch.device(device).type != "meta":
+            return properties(device)
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return SimpleNamespace(gcnArchName=get_gfx())
+
+    @wraps(pack)
+    def packed(fn):
+        if not fn.is_meta:
+            return pack(fn)
+        torch.cuda.get_device_properties = on_device
+        try:
+            with _MetaOnDevice():
+                return pack(fn)
+        finally:
+            torch.cuda.get_device_properties = properties
+
+    loaded = list(sys.modules.values())
+    bound = [m for m in loaded if getattr(m, "__dict__", {}).get(name) is pack]
+    for m in bound:
+        setattr(m, name, packed)
+    try:
+        yield
+    finally:
+        for m in bound:
+            setattr(m, name, pack)
+
+
 def process_weights_after_loading(tree: torch.nn.Module) -> None:
     """Run on a meta tree the post-load hooks `load_model` runs after a load.
 
     The same walk, parent first: each module's own hook, then its quant
     method's. The hooks re-lay weights (an MXFP4 MoE pads its expert scales),
-    so the storages they leave are the ones a real start holds. The loader's
-    `init_prepare_finalize` is not run: it sets up an MoE's dispatch and holds
-    no weight. A hook that fails on the meta device refuses the start by name.
+    so the storages they leave are the ones a real start holds; a gather
+    across a process group answers with its shape (`gathers_by_shape`), and
+    V4.1's mHC pack packs as on the GPU (`mhc_packed_on_meta`). The
+    loader's `init_prepare_finalize` is not run: it sets up an MoE's dispatch
+    and holds no weight. A hook that fails on the meta device refuses the
+    start by name.
     """
     if not isinstance(tree, torch.nn.Module):
         return
+    with gathers_by_shape(), mhc_packed_on_meta():
+        _run_post_load_hooks(tree)
+
+
+def _run_post_load_hooks(tree: torch.nn.Module) -> None:
     from atom.model_ops.base_config import QuantizeMethodBase
 
     for name, module in tree.named_modules():
@@ -1460,10 +1571,11 @@ class NonAllocatingRunner(
 
         An empty registry still goes through ATOM's `set_kv_cache_data`: it is
         the one call that builds the worker-side KV connector, which the engine
-        polls for transfer completions. An `lmcache_mp` one, alone or in a
-        `multi`, is built as `compass`'s worker half, which moves nothing.
+        polls for transfer completions. An `lmcache_mp` or `lmcache_offload`
+        one, alone or in a `multi`, is built as `compass`'s worker half, which
+        moves nothing.
         """
-        from atom.compass.kv.lmcache_mp import substitute
+        from atom.compass.kv import lmcache_mp, lmcache_offload
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
         from atom.utils.forward_context import set_kv_cache_data
 
@@ -1472,15 +1584,16 @@ class NonAllocatingRunner(
             names = [
                 n for n, _ in KVConnectorFactory.leaf_connectors(self.config) or ()
             ]
+        simulated = {"lmcache_mp": lmcache_mp, "lmcache_offload": lmcache_offload}
         for name in names:
-            if name not in ("compass", "lmcache_mp"):
+            if name != "compass" and name not in simulated:
                 raise RunnerRefusal(
                     f"kv_connector {name!r} is a real transfer backend; this "
-                    "runner simulates only 'compass' and 'lmcache_mp', and an "
-                    "unset kv_connector means 'moriio'."
+                    "runner simulates only 'compass', 'lmcache_mp' and "
+                    "'lmcache_offload', and an unset kv_connector means 'moriio'."
                 )
-        if "lmcache_mp" in names:
-            substitute()
+        for name in sorted(simulated.keys() & set(names)):
+            simulated[name].substitute()
         set_kv_cache_data({}, self.config, num_blocks=num_kvcache_blocks)
         self.config.num_kvcache_blocks = num_kvcache_blocks
         logger.info(
@@ -1752,7 +1865,10 @@ def _group_step_seconds(
     has one reason.
 
     On the rank that keeps the parity record, each step also appends its cost
-    line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`; with a
+    line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`;
+    `t_s`, the engine's clock at the forward's entry, read through the
+    `compass_host`'s `now`, or None without one, so the forward runs from
+    `t_s` to `t_s` plus `group_s`, which it returns; with a
     `compass_host` that reports them, each of `HOST_SEGMENTS` and
     `MTP_SEGMENT` and `PP_RECV_SEGMENT`, the part of `W_launch` before a
     later stage's receive, in seconds, each 0.0 where the law has none, and `skipped`,
@@ -1871,8 +1987,10 @@ def _group_step_seconds(
     if hasattr(host, "segments"):
         skipped = [s for s in host.segments if s in host.skip]
         segments = {**host.segments, "skipped": skipped}
+    now = getattr(host, "now", None)
     line = {
         "step": step,
+        "t_s": None if now is None else now(),
         **segments,
         "device_s": device_s,
         "draft_s": draft_s,

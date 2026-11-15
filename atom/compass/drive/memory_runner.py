@@ -7,6 +7,7 @@ Kept apart from the command because importing `ModelRunner` needs a driver.
 
 import json
 import os
+from functools import wraps
 from pathlib import Path
 
 import torch
@@ -15,6 +16,7 @@ from torch._dynamo.utils import compilation_time_metrics, counters
 from atom.compass.artifacts import member_name
 from atom.compass.drive.measure_memory import OUT_ENV
 from atom.compass.memory.check import STORAGE
+from atom.compass.memory.readings import PAGE_BOUND
 from atom.compass.parity import key_memory_formats_by_name
 from atom.compass.run import memory
 from atom.compass.run.step_grid import BOUNDS, keyed
@@ -44,8 +46,8 @@ class MemoryReadingModelRunner(ModelRunner):
     """`ModelRunner`, unchanged, with its rank's memory read through its start
     into ``readings.<rank>.json`` in the directory `OUT_ENV` names: allocated
     bytes once the weights load, less their storages; allocated bytes where
-    the KV budget reads the device, less those; the warmup's peak above them
-    over its tokens; the budget's
+    the KV budget reads the device and the builder bounds its PAGEs, less
+    those; the warmup's peak above them over its tokens; the budget's
     `non_torch` and total; the reserved bytes graph capture adds; the
     kernels inductor autotuned and the graphs it missed, which
     `compass measure memory` starts again for; and beside the readings, as
@@ -60,6 +62,20 @@ class MemoryReadingModelRunner(ModelRunner):
             "weights": _storage_bytes([*model.parameters(), *model.buffers()]),
             "parameters": _storage_bytes(model.parameters()),
         }
+
+    def allocate_forward_vars(self):
+        super().allocate_forward_vars()
+        # The builder built next may bound its PAGEs by what is allocated as it
+        # asks (DeepSeek-V4.1's); a simulated start answers it there.
+        builder, read = self.attn_backend.get_builder_cls(), self._read
+        if bound := getattr(builder, "_page_bound", None):
+
+            @wraps(bound)
+            def reading(built, *args, **kwargs):
+                read["page_bound"] = torch.cuda.memory_allocated(built.device)
+                return bound(built, *args, **kwargs)
+
+            builder._page_bound = reading
 
     def _maybe_warmup(self):
         tokens, forward = [], self.forward
@@ -117,6 +133,8 @@ class MemoryReadingModelRunner(ModelRunner):
             "warmup_tokens": read["warmup_tokens"],
             "cudagraph_pool_bytes": pool,
         }
+        if "page_bound" in read:
+            readings[PAGE_BOUND] = read["page_bound"] - read["loaded"]
         name = member_name(
             memory.STEM, memory.coords(config, self.rank), memory.EXTENSION
         )

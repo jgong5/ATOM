@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""A ``LoopScheduler`` whose delayed work fires on the Compass clock.
+"""A ``LoopScheduler`` whose delayed work fires on the Compass clock, and a
+replay barrier whose per-trace idle cap times out on it.
 
 Imported only after ``aiperf.timing.phase.runner`` has executed (by the
 package's import hook, or by the strategy plugin aiperf loads lazily), never
@@ -12,6 +13,9 @@ import itertools
 import math
 
 from aiperf.common.loop_scheduler import LoopScheduler
+from aiperf.timing.replay_dependencies import ReplayBarrierCoordinator
+
+from compass_harness.timesource import ClockTimer
 
 
 class _Timer:
@@ -138,3 +142,23 @@ class ClockPacedLoopScheduler(LoopScheduler):
                 self._safe_callback([timer], coro)
             await asyncio.sleep(0)
         self._queue.clear()
+
+
+class ClockReplayBarrierCoordinator(ReplayBarrierCoordinator):
+    """``ReplayBarrierCoordinator`` whose per-trace idle cap times out on the Compass clock."""
+
+    def _arm_root_idle_watchdog(self, root_id, state) -> None:
+        """Upstream's idle recheck of one trace's tree, on the Compass clock
+        instead of ``loop.call_later``."""
+        cap = self._root_idle_gap_cap_seconds
+        if (
+            cap is None
+            or cap < 0
+            or self._scheduler is None
+            or state.idle_watchdog is not None
+        ):
+            return
+        state.idle_watchdog = ClockTimer(
+            0.0 if state.idle_cap_expired else cap,
+            lambda: self._enforce_root_idle_cap(root_id),
+        )

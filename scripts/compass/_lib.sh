@@ -335,6 +335,17 @@ if not os.fork():
 # the bound to a year.
 COMPASS_SIM_REQUEST_TIMEOUT_S=31536000
 
+# compass_on_arch RUN_FILE: the words ahead of `-m MODULE` that start a simulated
+# server under on_arch on RUN_FILE's machine's arch, as `compass run` starts its
+# own (atom/compass/drive/serve.py); none when RUN_FILE names no machine.
+compass_on_arch() {
+    python3 -c 'import json, sys
+from atom.compass.drive.serve import ON_ARCH
+from atom.compass.run import _machine
+run = json.load(open(sys.argv[1]))
+"machine" in run and print(*ON_ARCH, _machine(run).value("device.arch"))' "$1"
+}
+
 # compass_wait_up WHAT PID URL: return once URL answers; exit 1 if PID exits
 # first or WAIT_S seconds pass.
 compass_wait_up() {
@@ -363,4 +374,21 @@ compass_gpus() {
             }
             print out
         }' || { echo "compass_gpus: rocm-smi --showhw does not map every GPU of $2 to its own KFD node" >&2; return 1; }
+}
+
+# compass_machine FILE: write to FILE the machine spec `compass run --device
+# DEVICE --ptl PTL [--stack STACK]` composes, the platform_readings entry read
+# from the store READINGS, for a run file's `machine` block. Exits when DEVICE,
+# PTL or READINGS is unset.
+compass_machine() {
+    python3 -c 'import json, sys
+from atom.compass.artifacts import ArtifactStore
+from atom.compass.fit.device import compose
+device, ptl, readings, stack, out = sys.argv[1:]
+spec = compose(device, ArtifactStore(readings), ptl, stack or None)
+open(out, "w").write(json.dumps(spec.echo()))' \
+        "${DEVICE:?DEVICE names the datasheet of the GPUs, by SKU or path}" \
+        "${PTL:?PTL names their PTL state, enabled or disabled}" \
+        "${READINGS:?READINGS names a store holding their platform_readings}" \
+        "${STACK:-}" "$1"
 }

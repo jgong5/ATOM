@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """`compass fit host`: the host laws, fitted on real runs' records and published.
 
-    compass fit host RECORD... --client-run RECORD EXPORT... --machine M
-        --store ROOT --out DIR
+    compass fit host RECORD... --client-run RECORD EXPORT... --store ROOT
+        --out DIR
 
 `host_laws` fits the samples' host labels by `step_linear_fit.fit_host`, under
 the host key the real runner writes beside each record, and its report names

@@ -147,14 +147,32 @@ def test_the_routed_experts_and_their_exchange_by_hand(spec):
         _module(experts, spec) + dispatch + combine
     )
     # One data-parallel rank: its graph's 8 rows, the output all-reduced; its
-    # 3 decode tokens and the pad reach the experts.
-    hit = activated_experts(8, 2, 4)
-    experts = Work({"bf16": 2 * 16 * (32 + 16) * 32}, hit * 816 + 8 * 144)
+    # 3 decode tokens alone reach the experts, a pad row routing to none.
+    hit = activated_experts(8, 2, 3)
+    experts = Work({"bf16": 2 * 6 * (32 + 16) * 32}, hit * 816 + 3 * 144)
     experts += allreduce(2, 8 * 32 * 2)
     one = BatchView((RequestShape(1, 4, True),) * 3, capture_rung=8)
     assert _price([one_rank], one, spec)["roofline.moe"] == pytest.approx(
         _module(experts, spec)
     )
+
+
+def test_a_padded_decode_exchanges_only_its_real_rows():
+    # EP2 at rung 4: this rank's 3 decode rows and a pad row, which routes to
+    # no expert, so MoRI sends it nowhere: the exchange moves what the 3 rows
+    # move unpadded, at fp4 out and fp8 back.
+    ep2 = Module("experts", "moe", EP2, "fp4", ranks=2, act="fp8", wire=("fp4", "fp8"))
+    rows = (RequestShape(1, 9, True),) * 3
+    padded = BatchView(rows, capture_rung=4, moe_rows=8, moe_tokens=6)
+    unpadded = BatchView(rows, moe_rows=6, moe_tokens=6)
+
+    def transfer(step):
+        (term,) = StepRooflineBackend(machine(1e18), [ep2]).price(step).terms
+        return term.by_bound["comm.transfer"]
+
+    sent = 3 * 32 * 2 * (1 - comb(4, 2) / comb(8, 2))
+    assert transfer(padded) == pytest.approx(sent * (0.5 + 1) / 2 / LINK)
+    assert transfer(padded) == pytest.approx(transfer(unpadded))
 
 
 @BOUND
