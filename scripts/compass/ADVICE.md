@@ -234,7 +234,8 @@ takes up the rest.
 | State | What it prints | Next |
 |---|---|---|
 | `searchable` | `N of M points searchable`, each other point with its own state | step 3 simulates it |
-| `missing a law` | `made by:` the command that makes the law | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
+| `missing a law` | `made by:` the command that makes the law; `calibration:` the last line of one that stopped or ended | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
+| `calibrating` | `calibration:` its status file, how many steps have ended and its last line | run the search again later |
 | `missing readings`, a point of a searchable candidate | `made by:` its `compass measure memory` command | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
 | `refused` | `refused:` ATOM's or Compass's refusal, verbatim | below |
 
@@ -262,15 +263,16 @@ the script, its OUT and one quoted argument per record, followed by indented
 notes:
 
 ```
-AITER_BF16_FP8_MOE_BOUND=0 ... MODEL=... GPU=0,1,2,3,4,5,6,7 SERVER_ARGS='...' <T>/scripts/compass/calibrate.sh OUT/cal/S1 '1 --trajectory-start-min-ratio 0 ...' ... 'trace 16' 'trace 4'
+AITER_BF16_FP8_MOE_BOUND=0 ... MODEL=... GPU=0,1,2,3,4,5,6,7 SERVER_ARGS='...' STORE=<the shared store> <T>/scripts/compass/calibrate.sh OUT/cal/S1 '1 --trajectory-start-min-ratio 0 ...' ... 'trace 16' 'trace 4'
   before it runs, set AIPERF_PYTHON, which calibrate.sh requires and this environment does not set
-  expected time: unknown, as calibrate.sh records no calibration's time
+  expected time: unknown, as no earlier calibration's status is read for it
 ```
 
-The first line is the command. Its GPU time is its `GPU` cards times its wall
-time: say `unknown` as printed, with the number of records and cards, and add
-no estimate of your own. A note `no trace run, which compass record refuses`
-says why the law's prefill will stay unfitted; show it with the command.
+The first line is the command. `GPU` names every card the configuration uses.
+Its GPU time is those cards times its wall time: say `unknown` as printed, with
+the number of records and cards, and add no estimate of your own. A note `no
+trace run, which compass record refuses` says why the law's prefill will stay
+unfitted; show it with the command.
 
 Start it in the background, so it outlives the shell, its output beside its
 directory, with the variables set as Before the first search sets them:
@@ -281,12 +283,19 @@ setsid nohup env <the first line> > OUT/cal/S1.log 2>&1 < /dev/null &
 ```
 
 Run it alone on the node, on idle GPUs, as QUICKSTART's Environment says: a
-calibration beside other work fits that load into its laws. It publishes the law
-and the memory readings into its own `OUT/cal/<candidate>/store`. A search looks
-each candidate up in those stores, the latest published into first, then in the
-shared store, but passes by a store with no platform readings for SPACE's
-machine, and a calibration's store starts with none. Once it has ended, take
-them into it on two idle cards of the target, as QUICKSTART's Environment ("The
+calibration beside other work fits that load into its laws.
+
+**Where it publishes.** With `STORE=<the shared store>`, as printed when the
+shared store holds neither readings at the configuration's key nor a law of it
+at the head, it publishes the law and the memory readings there, beside the
+platform readings, and the next `compass advice SPACE OUT` reads them. Without
+`STORE`, as printed when the shared store holds one of them, which a second
+publish at its key would meet, it publishes into its own
+`OUT/cal/<candidate>/store`. A search looks each candidate up in those stores,
+the latest published into first, then in the shared store, but passes by a
+store with no platform readings for SPACE's machine, and a calibration's own
+store starts with none. Once such a calibration has ended, take them into its
+store on two idle cards of the target, as QUICKSTART's Environment ("The
 platform") takes them, `<token>` the one the first command prints:
 
 ```bash
@@ -294,15 +303,23 @@ compass measure device --gpu <a card>,<another card> --store OUT/cal/S1/store --
 compass fit device <token> --store OUT/cal/S1/store --out OUT/cal/S1.readings
 ```
 
-The next `compass advice SPACE OUT`, with the same OUT, then reads the new law.
-
-- **Check on it**: `tail OUT/cal/S1.log`; each step's own log is in
-  `OUT/cal/S1/`.
-- **Resume a stopped one**: run the same command again. `calibrate.sh` skips each
-  step whose output exists and takes a stopped one again; its other refusals and
-  exit codes are in its header.
-- **Its end** prints the published tokens, the law's held-out errors and the wall
-  time.
+- **Check on it**: `compass advice SPACE OUT` prints the candidate `calibrating`
+  with a `calibration:` line: its status file, `OUT/cal/S1/status`, how many
+  steps have ended and the file's last line. The file holds a line per step's
+  start, its end with its wall seconds, or its failure with its reason, each
+  stamped in UTC: `cat OUT/cal/S1/status`. Each step's own log is in
+  `OUT/cal/S1/`, and the script's in `OUT/cal/S1.log`. A status file whose last
+  line is a start long past, with no `calibrate.sh` running, is a calibration
+  killed with no chance to record it, as a node's job end kills one: resume it.
+- **Resume a stopped one**: run the same command again, in the background as
+  above. A failed calibration's state is `missing a law`, its `calibration:`
+  line naming the step that failed and why, and its `made by:` command is the
+  same. `calibrate.sh` skips each step whose output exists and takes a stopped
+  one again; its other refusals and exit codes are in its header.
+- **Its end** prints the published tokens, the law's held-out errors, a table of
+  each step's wall seconds, the node-hours every take of every step held, and
+  this run's wall time; the status file's last line is then `end calibration
+  <h> node-hours`.
 
 **A missing point's readings** take `compass measure memory --gpu G --out D
 --store <store> -- <ATOM's arguments>`, as printed, under the variables it
@@ -317,7 +334,7 @@ takes one, not one command; show it to the user as printed.
 
 Then run `compass advice SPACE OUT` again, now or in a later session, rather than
 waiting on the calibration: a candidate whose law has published is searchable,
-and one whose calibration is still running reads `missing a law` until it has.
+and one whose calibration is still running reads `calibrating` until it has.
 
 ## 4. Read the results
 
@@ -368,4 +385,4 @@ An agent that runs this guide for a user keeps these rules:
 | `before it runs, set AIPERF_PYTHON` under a printed command | the shell that ran the search did not set it | set it in the shell that starts the calibration |
 | a candidate `refused` with `ATOM's parser: unrecognized arguments: ...` | a flag ATOM does not have, such as a misspelt one | correct the space file |
 | a candidate `refused` with `--server-port ... is among ATOM's arguments; the driver owns it` | an argument `compass run` assigns, `--host` or a port | leave it out, as What a space file leaves out says |
-| a calibrated candidate still `missing a law` | its calibration has not ended, or its store holds no platform readings | step 3's `tail`, then its `measure device` and `fit device` |
+| a calibrated candidate still `missing a law` | its calibration failed, or it published into its own store, which holds no platform readings | its `calibration:` line; resume it, or take its store's `measure device` and `fit device` (step 3) |

@@ -38,8 +38,9 @@ law at the head's ATOM digest names that ``store``, whatever the verdict. A
 refusal the runner makes of the config under the law, as of context
 parallelism, propagates. `readings` gives the config's memory readings in a
 store `reuse`, or `measure` where none is at their key or the one there was
-measured at another ATOM digest (requirement 1). `stores` orders the stores a
-candidate is looked up in.
+measured at another ATOM digest (requirement 1), ``held`` saying which, since
+the store refuses a second publish at the key either way. `stores` orders the
+stores a candidate is looked up in.
 """
 
 import json
@@ -205,7 +206,7 @@ def readings(store: ArtifactStore, config, machine) -> dict:
             stale and AXIS.findall(str(refused)) == [str(Axis.ATOM_SRC)]
         ):
             raise
-        return _verdict("measure", 1, str(refused))
+        return _verdict("measure", 1, str(refused), held=stale)
     return _verdict("reuse", None, f"at their key in {store.root}")
 
 

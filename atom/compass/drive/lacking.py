@@ -25,8 +25,8 @@ Each lacking input is printed with the command that makes it. A step linear
 law's is the `calibrate.sh` command that records and fits one for this
 configuration (`calibration`), into `--out`, or `cal` in the current directory
 without one, naming each client variable it requires that this environment
-does not set, with its expected time, unknown while no calibration records its
-time.
+does not set, with its expected time, unknown, as no earlier calibration's
+status is read for it.
 
 A prefill or decode instance's run reads a network file across nodes, as
 `deploy.sh run` hands it one, and its readings command takes the ATOM
@@ -263,15 +263,16 @@ def _ladder(config) -> list[int]:
     return [] if config.enforce_eager else schedulable_ladder(config)
 
 
-def calibration(out, atom_args, config) -> str:
+def calibration(out, atom_args, config, store=None) -> str:
     """The `calibrate.sh` command that records and fits a step linear law for
-    `config`, ATOM's arguments `atom_args` resolved, into `out`, then its
-    expected time: the records `step_linear_plan.records` plans, the trace
-    runs only where `compass record --trace` takes one; on as many GPUs as
-    ATOM's ranks use; under this process's environment as a law's key states
-    it (`keyed_env`), and each of `CLIENT_ENV` it sets, then a line naming each
-    it does not, which `calibrate.sh` refuses to run without. Where
-    `calibrate.sh` cannot take ATOM's arguments, why."""
+    `config`, ATOM's arguments `atom_args` resolved, into `out`, publishing
+    into `store` when given, else into its own, then its expected time: the
+    records `step_linear_plan.records` plans, the trace runs only where
+    `compass record --trace` takes one; on as many GPUs as ATOM's ranks use;
+    under this process's environment as a law's key states it (`keyed_env`),
+    and each of `CLIENT_ENV` it sets, then a line naming each it does not,
+    which `calibrate.sh` refuses to run without. Where `calibrate.sh` cannot
+    take ATOM's arguments, why."""
     from atom.compass.drive.record import refuse_trace
     from atom.compass.run.step_grid import keyed_env
 
@@ -307,13 +308,15 @@ def calibration(out, atom_args, config) -> str:
         "GPU": ",".join(map(str, range(gpus))),
         "SERVER_ARGS": " ".join(server),
     }
+    if store is not None:
+        env["STORE"] = str(store)
     words = [f"{k}={shlex.quote(v)}" for k, v in env.items()]
     words += map(shlex.quote, [str(CALIBRATE), str(Path(out).resolve()), *planned])
     return (
         " ".join(words)
         + unheld
         + untraced
-        + "\n  expected time: unknown, as calibrate.sh records no calibration's time"
+        + "\n  expected time: unknown, as no earlier calibration's status is read for it"
     )
 
 

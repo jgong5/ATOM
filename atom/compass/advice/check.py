@@ -25,24 +25,30 @@ the runner under a law is ``refused``, verbatim, naming no requirement. A law
 verdict ``calibrate``
 names the command that makes the law as `compass run --check` prints it: on
 one node the `calibrate.sh` command of its records into OUT's
-``cal/<candidate>``, its clients on SPACE's traces; on a 1P1D side `deploy.sh
-record` and a fit of that side. A readings verdict ``measure`` names the
-`compass measure memory` command, under the instance's variables, a 1P1D
-side's on the connector a real start of it takes.
+``cal/<candidate>``, its clients on SPACE's traces, publishing into the shared
+store when the verdicts were judged there and it holds neither a step linear
+law of the configuration at the head's ATOM digest nor readings at their key,
+since it refuses a second publish at a key, else into the calibration's own;
+on a 1P1D side `deploy.sh record` and a fit of that side. A readings verdict
+``measure`` names the `compass measure memory` command, under the instance's
+variables, a 1P1D side's on the connector a real start of it takes.
 
 `states` gives each candidate one state: ``refused``, with each refusal
-verbatim, when any verdict is; else ``missing a law``, with each command,
-when a law's verdict is ``calibrate``; else ``searchable``. A searchable
-candidate's point whose readings a verdict sends to measure is ``missing
-readings``, with its command. Each other point starts with no traffic, as the
-search will run it, for what only a start shows: `compass run`, or `deploy.sh
-run` on 1P1D with `ROUTER`'s router arguments, its decode side through a local
-``--on`` prefix carrying its own variables where SPACE names a network. A
-point answers once the start's ``server.json`` names it, and is
-``searchable``; a start that leaves first, or does not answer in `START_S`,
-refuses the candidate with the start's last line and each log's first raised
-error. Points whose instances run alike start once. Nothing is calibrated or
-measured.
+verbatim, when any verdict is; else, when a law's verdict is ``calibrate``,
+``calibrating`` while the `STATUS` file of the calibration into
+``cal/<candidate>`` ends in a step's start or end, else ``missing a law``,
+with each command, which resumes a calibration that stopped; either with the
+status file's last line and how many steps it has seen end; else
+``searchable``. A searchable candidate's point whose readings a verdict sends
+to measure is ``missing readings``, with its command. Each other point starts
+with no traffic, as the search will run it, for what only a start shows:
+`compass run`, or `deploy.sh run` on 1P1D with `ROUTER`'s router arguments, its
+decode side through a local ``--on`` prefix carrying its own variables where
+SPACE names a network. A point answers once the start's ``server.json`` names
+it, and is ``searchable``; a start that leaves first, or does not answer in
+`START_S`, refuses the candidate with the start's last line and each log's
+first raised error. Points whose instances run alike start once. Nothing is
+calibrated or measured.
 """
 
 import contextlib
@@ -71,6 +77,9 @@ REFUSALS = (ArtifactRefusal, SpecRefusal, ValueError, OSError)
 STATES = "states.json"
 #: Where each candidate's calibration writes, and each point starts, in OUT.
 CAL, STARTS = "cal", "starts"
+#: The file a calibration appends each step's start, end or failure to, in its
+#: directory, and ``end calibration`` once it has fitted both laws.
+STATUS = "status"
 #: What a start runs: a server on one node, a deployment on 1P1D.
 COMPASS, DEPLOY = (
     serve.TREE / "scripts" / "compass" / n for n in ("compass", "deploy.sh")
@@ -117,6 +126,7 @@ def check(expansion: dict, out: Path) -> dict:
             given += (machine.get("stack"), machine.get("network"))
             spec = _or_refused(compose, *given)
             made = out / CAL / candidate["name"], expansion["workload"]["traces"]
+            made += (expansion["store"],)
             judge = functools.partial(_judged, store, spec, head["atom"], seen, made)
             verdicts = {p["name"]: _point(p, judge) for p in points}
             if isinstance(spec, dict):
@@ -165,7 +175,7 @@ def states(expansion: dict, judged: dict, out: Path) -> dict:
         if refused := [v for v in _each(held["points"]) if v["verdict"] == "refused"]:
             state = _state("refused", refused, points={})
         elif calibrate := [v for v in laws if v["verdict"] == "calibrate"]:
-            state = _state("missing a law", calibrate, points={})
+            state = _calibration(out / CAL / candidate["name"], calibrate)
         else:
             state = _searchable(expansion, candidate, held, out)
         found[candidate["name"]] = state
@@ -183,10 +193,34 @@ def state_lines(state: dict) -> list[str]:
     out += [
         f"    refused: {why}" for why in state["why"] if state["state"] == "refused"
     ]
+    if "calibration" in state:
+        out.append(f"    calibration: {state['calibration']}")
     out += [f"    made by: {command}" for command in state["made_by"]]
     for point, held in state["points"].items():
         out += [f"    {point}: {held['state']}, made by: {c}" for c in held["made_by"]]
     return out
+
+
+def _calibration(at: Path, calibrate: list) -> dict:
+    """The state of a candidate whose law verdicts `calibrate` send it to
+    calibrate into `at`: ``calibrating`` while the `STATUS` file there ends in
+    a step's start or end; else ``missing a law``, with each verdict's reason
+    and command. With a status file, either states its last line and how many
+    steps it has seen end."""
+    status = at / STATUS
+    said = status.read_text().splitlines() if status.is_file() else []
+    lines = [line.split() for line in said if line]
+    if not lines:
+        return _state("missing a law", calibrate, points={})
+    ended = {step for _, event, step, *_ in lines if event == "end"}
+    ended.discard("calibration")
+    said = f"{status}, {len(ended)} steps ended, last: {' '.join(lines[-1])}"
+    _, event, step, *_ = lines[-1]
+    if event in ("start", "end") and step != "calibration":
+        verdicts, state = [], "calibrating"
+    else:
+        verdicts, state = calibrate, "missing a law"
+    return _state(state, [*verdicts, {"reason": said}], points={}, calibration=said)
 
 
 def _searchable(expansion: dict, candidate: dict, held: dict, out: Path) -> dict:
@@ -380,8 +414,8 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     a store, both kept in `seen`. A 1P1D `side` takes the KV transfer config
     `deploy.sh` adds, on the simulated connector, and runs under the
     ``AITER_LOG_LEVEL`` the script's `compass_env` sets when unset. `made` is
-    the calibration's directory and traces a ``calibrate`` verdict's command
-    takes."""
+    the calibration's directory, traces and the shared store a ``calibrate``
+    verdict's command takes."""
     if isinstance(machine, dict):
         return machine, machine
     args, env = one["args"], one["env"]
@@ -407,8 +441,10 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                         lacking.SIDE_LAW.format(fit=f, side=side) for f in fits
                     ]
                 elif law["verdict"] == "calibrate":
+                    into = _publishing(store, made[2], law, readings)
                     with _env({"TRACES": made[1]}):
-                        law["made_by"] = [lacking.calibration(made[0], args, config)]
+                        command = lacking.calibration(made[0], args, config, into)
+                        law["made_by"] = [command]
                 if readings["verdict"] == "measure":
                     real = args
                     if side in drive_run.ROLES:
@@ -419,6 +455,16 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                 verdicts = law, readings
         seen[(store.root, *instance)] = verdicts
     return seen[(store.root, *instance)]
+
+
+def _publishing(store, shared: str, law: dict, readings: dict) -> str | None:
+    """The store a calibration whose verdicts `law` and `readings` were judged
+    in `store` publishes into: `shared`, the shared store, when it is `store`
+    and holds neither a step linear law at the head's ATOM digest nor readings
+    at their key, since a store refuses a second publish at a key; else None,
+    the calibration's own."""
+    held = "store" in law or readings["verdict"] == "reuse" or readings.get("held")
+    return shared if store.root == Path(shared) and not held else None
 
 
 def _resolved(args, arch: str):
