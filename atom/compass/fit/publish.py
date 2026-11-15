@@ -17,7 +17,9 @@ none, and refuses for records that carry one; the report records it as
 marks its key and params state, and `readings`, those a run on that platform
 takes with the inputs' source root, model and engine, under which each
 measurement is loaded. `--ops` takes the profiler's floor from the
-`platform_readings` entry the store holds at the inputs' platform.
+`platform_readings` entry the store holds at the inputs' platform. `--engine` states the engine file the
+records ran under, read from their server logs, in place of each record's own
+(`samples.load`); the report records it as `stated_engine`.
 
 `publish` hands off one store entry whose members are `params`, what a run
 file carries, and `report`, the fit's report, under the readings it is
@@ -105,6 +107,13 @@ def parser(prog: str, description: str) -> argparse.ArgumentParser:
         choices=("enabled", "disabled"),
         help="the PTL state of records that carry none",
     )
+    p.add_argument(
+        "--engine",
+        metavar="FILE",
+        help="the engine file the records ran under, stated in place of the "
+        ".engine.json beside each, its prefill buckets for a record that states "
+        "none; refused where one contradicts it",
+    )
     p.add_argument("--store", required=True, help="the artifact store's root")
     p.add_argument("--out", required=True, help="where the readable copy goes")
     return p
@@ -147,7 +156,7 @@ def inputs(args, sources, ops=()) -> tuple[list, dict]:
         points, measured, keyed = fit_ops.read(store, map(Path, ops))
         floor = Floor(_floor(store, runs, measurements, args.ptl), points)
         floored = functools.partial(busy.floored, floor=floor)
-    samples, config = load(runs, measurements, args.store, floored)
+    samples, config = load(runs, measurements, args.store, floored, args.engine)
     if args.ptl:
         if config.get("ptl") != UNRECORDED:
             raise ValueError(
@@ -249,6 +258,8 @@ def publish(args, command: str, key, readings: Conditions, params, report):
     and write their readable copy in `args.out`."""
     if args.ptl:
         report = {**report, "stated_ptl": args.ptl}
+    if args.engine:
+        report = {**report, "stated_engine": read_json(args.engine)}
     members, at = {"params": params, "report": report}, ranks(key)
     ArtifactStore(args.store).publish(
         key,
