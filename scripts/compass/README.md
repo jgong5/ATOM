@@ -1468,7 +1468,8 @@ and 5 at concurrency 16 alone, with these changes:
 smoke above:
 
 - `$ATOM`, its environment and the container are those the cell's law states (its paragraph
-  above), and `$M` is `machines/mi455-a0.json`.
+  above), and `$M` is `--device mi455x-a0 --ptl disabled`, the store holding the node's
+  readings at that stack.
 - Step 5 prices by the law file, `--step-linear LAW --host-laws LAW`, with the
   `memory_readings` that `compass measure memory` takes at the same tree and settings.
 - Steps 4 and 5 take `--duration 3600`, one server on the node at a time. Step 4 runs three
