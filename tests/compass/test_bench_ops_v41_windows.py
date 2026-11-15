@@ -5,11 +5,13 @@ drafter's stage layers at the step's state slots, and reads a ring row an
 address.
 """
 
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import torch
 from test_bench_ops import _graph, _leaf, _Runner, _t
-from test_capture_packed_window import _own_process
 
 from atom.compass.bench import ops
 from atom.compass.capture import driverless
@@ -22,7 +24,19 @@ def test_the_drafter_s_window_read_takes_its_stage_layers_rows_at_the_step_s_slo
     # V4.1's FP8 pool of 2 pages and 4 state slots, a ring of 5 rows of 33
     # bytes a layer; the drafter's stages read layers 2 and 1, a decode's 2
     # rows in slots 3 and 1: 20 ring rows, each by its byte address tagged FP8
-    if _own_process(request):
+    if "COMPASS_ARCH_DECLARED" not in os.environ:
+        # V4.1's cache imports aiter, which needs an arch declared: once per
+        # process, so in a process of its own.
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+            + [f"{__file__}::{request.node.name}"],
+            env={**os.environ, "COMPASS_ARCH_DECLARED": "1"},
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        assert done.returncode == 0, done.stdout[-4000:]
         return
     driverless.install(str(tmp_path), "gfx1250")
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
