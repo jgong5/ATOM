@@ -92,6 +92,8 @@ step it adds the drafter's draft-KV pass, which runs before
 `forward_done_event`, so its terms are the target's. A draft law with
 `output_prefill_kv` true prices that pass on a prefill step that produces
 output by its prefill vector, whose terms there are the target's too.
+A data-parallel rank's dummy forward (`BatchView.dp_dummy`) runs no draft-KV
+pass, so neither prices one there: its draft is the rest of the draft law's.
 A serial drafter's draft law may hold a `forward` vector over the prefill
 vector's base features, with `passes`, the draft forwards its `propose` runs.
 On a decode and on a prefill step that produces output it prices the draft
@@ -444,15 +446,16 @@ class StepLinearBackend(CostBackend):
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
         terms, kv = self._priced(law, vector, kind, counts, what), []
+        dummy = batch_view.dp_dummy
         if prefill and law.output_prefill_kv and batch_view.produces_output:
-            terms, kv = [], terms
+            terms, kv = [], ([] if dummy else terms)
         seqs = (1, len(batch_view.requests))
         if prefill and law.propose is not None and batch_view.produces_output:
             propose = law.propose
             if law.short_propose and sum_tokens(prefill) < law.below:
                 propose = law.short_propose
             terms += self._priced(law, propose, "propose", seqs, what)
-        if decode and law.draft_kv is not None:
+        if decode and law.draft_kv is not None and not dummy:
             kv = self._priced(law, law.draft_kv, "draft_kv", seqs, what)
         return terms, kv
 
