@@ -54,7 +54,9 @@ dimension is their message bytes; one apart along it is one row's bytes
 moves that many bytes per row. Where ranks' row counts can differ (``all_gatherv``,
 ``reduce_scatterv``, MORI's dispatch and combine) it is one byte;
 ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad every
-rank to the same rows and keep one row. Points at one
+rank to the same rows and keep one row. A MORI combine's bytes are read from
+its leaf (`bench.ops.exchange`), the rows it moves: a point stored before
+`exchange` sized it so keeps MORI's whole buffer. Points at one
 coordinate, its other counts or contexts dropped, are one point at their mean
 time. `interpolate` prices a query at a measured point as
 that point; between points, multilinearly over the neighbours that bracket it
@@ -315,6 +317,7 @@ def fit(points) -> dict:
         _dependent,
         _launched,
         _split,
+        exchange,
         routed_rows,
     )
     from atom.compass.capture.peers import MORI
@@ -325,6 +328,8 @@ def fit(points) -> dict:
     for p in points:
         if "exchange" in p:  # a collective: one family over its message bytes
             fam, nbytes = p["exchange"]
+            if p["op"] == f"{MORI}.combine":  # its input's, whatever it stored
+                nbytes = exchange(json.loads(p["leaf"]))[1]
             f = families.setdefault(
                 fam,
                 {"op": p["op"], "dims": ["bytes"], "points": {}, "row_bytes": set()},
