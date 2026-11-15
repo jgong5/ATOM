@@ -141,8 +141,11 @@ V41_SCORERS = (
     "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
 )
 #: DeepSeek-V4.1's top-k, as aiter's decode top-k launches it: FlyDSL's
-#: one-block kernel, or its HIP kernel on logits narrower than k.
+#: multi-CTA kernel where the arch's gates take the call's width and rows
+#: (gfx950's), else FlyDSL's one-block kernel, else, on logits narrower than
+#: k, its HIP kernel.
 V41_TOPKS = (
+    "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode",
     "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
     "aiter._top_k_per_row_decode.default",
 )
