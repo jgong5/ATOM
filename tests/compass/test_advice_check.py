@@ -243,6 +243,38 @@ def test_a_value_atom_s_parser_rejects_refuses_its_candidate_with_the_parser_s_e
     assert starts(tmp_path) == []
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        AssertionError("tp_size (8) must be divisible by dcp_size (3)"),
+        TypeError("ATOM_KV_OFFLOAD_EXTRA_CONFIG must be a JSON object"),
+    ],
+    ids=["assertion", "type"],
+)
+def test_a_configuration_atom_refuses_refuses_its_candidate_with_atom_s_error(
+    tmp_path, stubbed, monkeypatch, error
+):
+    def refusing(atom_args, arch=None):
+        if "--decode-context-parallel-size" in atom_args:
+            raise error
+        return resolved(stubbed.config, atom_args)
+
+    monkeypatch.setattr(drive_run, "_config", refusing)
+
+    found = advise(
+        tmp_path, {"a": {}, "b": {"args": {"--decode-context-parallel-size": 3}}}
+    )
+
+    assert found["a"]["state"] == "missing a law"
+    assert found["b"] == {
+        "state": "refused",
+        "why": [f"ATOM's config: {type(error).__name__}: {error}"],
+        "made_by": [],
+        "points": {},
+    }
+    assert starts(tmp_path) == []
+
+
 @pytest.mark.parametrize("lands", ["a law", "readings"])
 def test_rerunning_after_an_input_lands_moves_only_what_it_serves_to_searchable(
     tmp_path, stubbed, lands

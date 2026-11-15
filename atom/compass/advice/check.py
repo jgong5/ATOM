@@ -53,10 +53,11 @@ import shutil
 import signal
 import subprocess
 import time
+import traceback
 from pathlib import Path
 
 from atom.compass.artifacts import ArtifactRefusal
-from atom.compass.drive import lacking, reuse, serve
+from atom.compass.drive import lacking, reuse, runfile, serve
 from atom.compass.drive import run as drive_run
 from atom.compass.fit.device import compose
 from atom.compass.spec import SpecRefusal
@@ -357,18 +358,22 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
 
 def _resolved(args, arch: str):
     """`drive_run._config` of ATOM's arguments `args` on a device of `arch`,
-    once ATOM's engine parser reads them here as `runfile._engine_args` does:
-    a value it rejects raises its error, where the child that resolves them
-    would exit this process."""
-    from atom.model_engine.arg_utils import EngineArgs
+    once `runfile._engine_args` reads them here: a value ATOM's parser rejects
+    raises its error, where the child that resolves them would exit this
+    process. A configuration ATOM refuses with an assertion or a type error,
+    besides a value error, raises its exception line as a value error."""
     from atom.utils.arg_parser import FlexibleArgumentParser
 
     class Refusing(FlexibleArgumentParser):
         def error(self, message):
             raise ValueError(f"ATOM's parser: {message}")
 
-    EngineArgs.add_cli_args(Refusing(add_help=False)).parse_known_args(args)
-    return drive_run._config(args, arch)
+    runfile._engine_args(args, Refusing)
+    try:
+        return drive_run._config(args, arch)
+    except (AssertionError, TypeError) as error:
+        said = traceback.format_exception_only(error)[-1].strip()
+        raise ValueError(f"ATOM's config: {said}") from error
 
 
 def _or_refused(call, *args):
