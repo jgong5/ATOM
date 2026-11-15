@@ -1370,12 +1370,14 @@ def frontend(config):
     A real run with the parity record's variable set runs ATOM's runner
     through the recording one, and refuses any other runner, which would
     record nothing. With it set, real or simulated, each request's sequence
-    carries its response id (`parity.carry_response_ids`).
+    carries its response id (`parity.carry_response_ids`), and each request
+    routed across DP ranks is recorded (`_record_routes`).
     """
     global _authority, _early_end
     from atom.compass import parity
 
     if os.environ.get(parity.ENV):
+        _record_routes(Path(os.environ[parity.ENV]))
         parity.carry_response_ids()
     run = spec()
     if run is None:
@@ -2447,6 +2449,43 @@ def _record_host(tok, record: Path) -> None:
         ),
     )
     _stamp_intake(_LineFile(record / INTAKE_RECORD))
+
+
+def _record_routes(record: Path) -> None:
+    """Write `parity.ROUTES` into `record` from the first request `CoreManager`
+    routes across DP ranks, a line as each is routed; its key, as `parity.read`
+    keys an uncached prompt, is digested before the router's lock. Installed
+    beneath `parity.carry_response_ids`, which reads its caller's frame."""
+    from atom.compass import parity
+    from atom.model_engine.engine_core_mgr import CoreManager
+
+    add, select = CoreManager.add_request, CoreManager._select_dp_rank_for_seq_locked
+    lines = []
+
+    def add_request(self, seqs):
+        if self.pp_size > 1 or self._routable_engine_count == 1:
+            return add(self, seqs)
+        if not lines:
+            lines.append(_LineFile(record / parity.ROUTES))
+        keys = {}
+        for seq in seqs:
+            prompt = memoryview(seq.token_ids)[: seq.num_prompt_tokens]
+            keys[seq.id] = hashlib.blake2b(prompt, digest_size=8).hexdigest()
+
+        def routed(seq, explicit_rank):
+            load = {"reqs": list(self._rank_reqs), "tokens": list(self._rank_tokens)}
+            rank = select(self, seq, explicit_rank)
+            line = {"key": keys[seq.id], "rank": rank} | load
+            lines[0].write(json.dumps(line) + "\n")
+            return rank
+
+        self._select_dp_rank_for_seq_locked = routed
+        try:
+            return add(self, seqs)
+        finally:
+            del self._select_dp_rank_for_seq_locked
+
+    CoreManager.add_request = add_request
 
 
 class _LineFile:

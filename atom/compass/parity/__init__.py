@@ -105,6 +105,11 @@ ARRIVALS = "arrivals.json"
 #: The file in a decode instance's record directory joining each request's
 #: response id to the prefill request its KV came from (`carry_response_ids`).
 TRANSFERS = "transfers.jsonl"
+#: The file in a record directory with a line ``{key, rank, reqs, tokens}`` per
+#: request the frontend routed across DP ranks, in routing order: its whole
+#: prompt's digest, its rank, and each rank's in-flight requests and queued
+#: prefill tokens the router weighed (`atom.compass.run._record_routes`).
+ROUTES = "routes.jsonl"
 RUNNER = "atom.compass.parity.runner.RecordingModelRunner"
 #: The recording runner of a real RapidServe run.
 RAPID = "atom.compass.parity.runner.RecordingRapidServeModelRunner"
@@ -790,6 +795,35 @@ def _request_ranks(name: str, record: dict[int, list[dict]]) -> dict[str, int]:
     return ranks
 
 
+def compare_routes(real, simulated) -> dict | None:
+    """Two record directories' `ROUTES`, None unless both hold it: requests
+    per DP rank in each; of the requests both routed, keyed as `read` keys
+    twins, how many took the same rank; and the first of those, in the real
+    run's order, that did not, with each run's line for it."""
+    runs = {}
+    for name, directory in (("real", real), ("simulated", simulated)):
+        if not (path := pathlib.Path(directory) / ROUTES).exists():
+            return None
+        runs[name], seen = read_jsonl(path), collections.Counter()
+        for line in runs[name]:
+            n = seen[line["key"]]
+            seen[line["key"]] += 1
+            line["key"] += f".{n}" if n else ""
+    other = {line["key"]: line for line in runs["simulated"]}
+    both = [(a, other[a["key"]]) for a in runs["real"] if a["key"] in other]
+    unlike = [{"real": a, "simulated": b} for a, b in both if a["rank"] != b["rank"]]
+    width = max((len(x["reqs"]) for lines in runs.values() for x in lines), default=0)
+    return {
+        "requests_per_rank": {
+            name: [sum(line["rank"] == r for line in lines) for r in range(width)]
+            for name, lines in runs.items()
+        },
+        "routed_by_both": len(both),
+        "routed_alike": len(both) - len(unlike),
+        "first_unlike": unlike[0] if unlike else None,
+    }
+
+
 def compare(real, simulated, stage: int = 0) -> dict:
     """Two record directories: per DP rank of pipeline `stage`, the first step
     whose decision differs.
@@ -799,7 +833,8 @@ def compare(real, simulated, stage: int = 0) -> dict:
     steps is refused: two runs that scheduled nothing agree, and that means
     nothing. Steps are compared and reported without timestamps, request
     or response ids or a real line's `launch`. Under `steps`, each rank's count of step pairs compared
-    and of identical ones.
+    and of identical ones. Where both hold `ROUTES`, `routes` holds
+    `compare_routes`'s answer.
     """
     records = {"real": read(real, stage), "simulated": read(simulated, stage)}
     for name, record in records.items():
@@ -828,10 +863,13 @@ def compare(real, simulated, stage: int = 0) -> dict:
             "compared": len(pairs),
             "identical": sum(a == b for a, b in pairs),
         }
-    return {
+    out = {
         "first_divergence": first,
         "steps": counts,
         "request_dp_rank": {
             name: _request_ranks(name, record) for name, record in records.items()
         },
     }
+    if (routed := compare_routes(real, simulated)) is not None:
+        out["routes"] = routed
+    return out
