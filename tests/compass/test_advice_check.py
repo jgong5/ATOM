@@ -98,7 +98,8 @@ def resolved(config, atom_args):
 def stubbed(tmp_path, monkeypatch):
     """The configuration, resolved as `resolved` resolves it for every
     instance, at the head whose digest is the tree's, with no law file; each
-    start the stub's, given `check.START_S` 2 s."""
+    start the stub's, given `check.START_S` 2 s; with ``HARNESS_PYTHON`` unset,
+    so no searchable point is simulated."""
     r = deployment(tmp_path, **COVERED)
     served(monkeypatch, r.config)
     monkeypatch.setattr(
@@ -118,6 +119,7 @@ def stubbed(tmp_path, monkeypatch):
     monkeypatch.setattr(check, "START_S", 2)
     monkeypatch.setenv("STUB_CALLS", str(tmp_path / "calls.jsonl"))
     monkeypatch.delenv("STUB_STALL", raising=False)
+    monkeypatch.delenv("HARNESS_PYTHON", raising=False)
     return r
 
 

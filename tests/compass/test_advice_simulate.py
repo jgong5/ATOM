@@ -11,13 +11,16 @@ SIGTERM writes the run summary and the run file, but no summary for the point
 ``STUB_SERVER_EXIT`` names; under a run directory it leaves before answering
 for the points ``STUB_FAILS`` names, as many times as it says. The client
 spends the CPU seconds ``STUB_CLIENT_CPU_S`` gives, sleeps the seconds
-``STUB_CLIENT_S`` gives its point, writes the client export, then stops the
-server through its ``server.json`` and waits for it to leave; it exits 1 for
-the points ``STUB_CLIENT_FAIL`` names, and for the point ``STUB_HANG`` names
-writes its pid and sleeps. The tree each point runs on reads as `TREE`,
-with no uncommitted file, unless a test says otherwise.
+``STUB_CLIENT_S`` gives its point, waits, up to 60 s, until the calls log holds
+the stop of the point ``STUB_AFTER`` maps its point to, writes the client
+export, then stops the server through its ``server.json`` and waits for it to
+leave; it exits 1 for the points ``STUB_CLIENT_FAIL`` names, and for the point
+``STUB_HANG`` names writes its pid and sleeps. The tree each point runs on,
+`serve.TREE`, reads as `TREE`, with no uncommitted file, unless a test says
+otherwise.
 """
 
+import itertools
 import json
 import os
 import signal
@@ -36,7 +39,7 @@ from test_run_step_grid import DOCUMENT
 from atom.compass import cli
 from atom.compass.advice import check, simulate
 from atom.compass.artifacts.provenance import SourceRoot
-from atom.compass.drive import reuse
+from atom.compass.drive import reuse, serve
 
 SERVER = """#!{python}
 import json, os, signal, sys, time
@@ -87,6 +90,12 @@ spent = time.process_time() + float(os.environ.get("STUB_CLIENT_CPU_S", 0))
 while time.process_time() < spent:
     pass
 time.sleep(json.loads(os.environ.get("STUB_CLIENT_S", "{{}}")).get(at.name, 0))
+after = json.loads(os.environ.get("STUB_AFTER", "{{}}")).get(at.name)
+down = json.dumps({{"down": str(at.parent / after)}}) if after else ""
+for _ in range(1200):
+    if down in Path(os.environ["STUB_CALLS"]).read_text():
+        break
+    time.sleep(0.05)
 (at / "artifacts").mkdir()
 (at / "artifacts" / "client_run.json").write_text(json.dumps({{"point": at.name}}))
 pid = json.loads((at / "server.json").read_text())["pid"]
@@ -103,9 +112,14 @@ TREE, ANOTHER = "1e47fbd62" + "0" * 31, "54a68b588" + "0" * 31
 
 
 def tree(revision: str, dirty: int | None = 0):
-    """`git_tree_root`, reading the tree each point runs on as `revision`, with
-    `dirty` uncommitted files."""
-    return lambda name, root: SourceRoot(name, root, revision, "tree", "a stub", dirty)
+    """`git_tree_root`, reading the tree each point runs on, `serve.TREE`, as
+    `revision`, with `dirty` uncommitted files."""
+
+    def read(name: str, root: str) -> SourceRoot:
+        assert root == str(serve.TREE)
+        return SourceRoot(name, root, revision, "tree", "a stub", dirty)
+
+    return read
 
 
 @pytest.fixture
@@ -121,7 +135,7 @@ def simulating(tmp_path, stubbed, monkeypatch):  # noqa: F811
     monkeypatch.setattr(simulate, "CLIENT", tmp_path / "client")
     monkeypatch.setattr(simulate, "git_tree_root", tree(TREE))
     monkeypatch.setenv("HARNESS_PYTHON", "/sim/python")
-    stubs = "FAILS CLIENT_FAIL NO_SUMMARY HANG CLIENT_S CLIENT_CPU_S SERVER_EXIT"
+    stubs = "FAILS CLIENT_FAIL NO_SUMMARY HANG CLIENT_S CLIENT_CPU_S SERVER_EXIT AFTER"
     for name in stubs.split():
         monkeypatch.delenv(f"STUB_{name}", raising=False)
     return stubbed
@@ -325,12 +339,11 @@ def test_points_run_as_many_at_once_as_the_cpus_hold_the_widest_point_s_ranks(
 def test_the_same_inputs_give_the_same_results_whatever_order_points_end_in(
     tmp_path, simulating, monkeypatch
 ):
-    # One at a time, then all at once with each earlier point ending later.
+    # One at a time, then all at once with each point ending after the next.
     monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0})
     one = searched(tmp_path, THREE)
     monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(6)))
-    later = {point: 0.3 * (6 - i) for i, point in enumerate(SIX)}
-    monkeypatch.setenv("STUB_CLIENT_S", json.dumps(later))
+    monkeypatch.setenv("STUB_AFTER", json.dumps(dict(itertools.pairwise(SIX))))
 
     every = searched(tmp_path, THREE, out="again")
 
