@@ -194,8 +194,9 @@ stage is named for the model; it is not the retired milestone M3 of D95.
   its own arm's and the TP4 indexer-CP LMCache arm's, so each pools records with the tier
   off and on. The LMCache arms reuse those two laws with the offload terms of `03` D13.1.
   A law's key holds the capture ladder (`run/step_grid.py::keyed`), which ATOM clips at
-  `--max-num-seqs`, so how one law serves the other points it covers is
-  [#3275](https://github.com/jgong5/ATOM/issues/3275)'s ruling. An indexer-CP arm's law
+  `--max-num-seqs`; a law, its host laws and a step grid bundle serve each point whose
+  ladder is a prefix of their own ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)), so an arm's entry keyed at its
+  top point serves its lower ones. An indexer-CP arm's law
   waits on #3054's indexer-CP key, without which its runs would read a law fitted
   without indexer CP.
 
@@ -230,10 +231,9 @@ named for the model and the parallelism of its arms.
 - **Keys.** ATOM serves V4.1 at a KV block of 128 whatever `--block-size` says
   (`atom/config.py`, its `deepseek_v41_text` branch), so the submission's 16 changes no
   key. Every point keeps ATOM's default `--max-num-seqs`; c=64 and c=128 share a capture
-  ladder and c=256 adds 256. Until [#3275](https://github.com/jgong5/ATOM/issues/3275) is
-  ruled, one step linear law and one `host_laws` entry each for DTP2 c=64, DEP2 c=128 and
-  DEP2 c=256, with memory readings per point; a ruling that admits a ladder prefix merges
-  DEP2's two.
+  ladder and c=256 adds 256. One step linear law and one `host_laws` entry each for DTP2
+  c=64 and for DEP2, keyed at c=256's ladder, which serves c=128 at its prefix
+  ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)), with memory readings per point.
 - **Two backends**, the step linear law and the step grid, each graded by `08` D45.1, as
   #3256 rules for M3-Agentic: the submission's inputs reach 525k tokens at p95, past a
   law's hull.
