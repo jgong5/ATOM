@@ -1221,6 +1221,7 @@ class Stub:
         zeros = getattr(tokens, "zero_spec_counts", None)
         drafter = {} if zeros is None else {"zero_spec_counts": zeros}
         meta = dict(self.kv)
+        untold = len(set(self.pages.values())) > 1  # V4.1 compressing at several
         for sig, (op, _) in self.leaves.items():
             writes, rows = _writes(op["op"]), _pass_rows(op)
             at = None if rows == running else rows
@@ -1270,18 +1271,14 @@ class Stub:
                         pool = v41
                     try:
                         rope = (op["op"], path, ratio) == (_ROPE, "positions", None)
-                        if (
-                            rope
-                            and self.pages
-                            and op["args"]["input"]["shape"][-2] == 1
-                        ):
+                        if rope and untold and op["args"]["input"]["shape"][-2] == 1:
                             raise ValueError(  # a key's, over one head
                                 "its graph states no compress ratio, and this point "
                                 "cannot tell which ratio's compress plan holds its "
                                 f"{spec['shape'][-1]} rows: trace its shape again"
                             )
                         bound = path in ("row_starts", "row_ends") and not index
-                        if (op["op"], ratio) == (_TOPK, None) and self.pages and bound:
+                        if (op["op"], ratio) == (_TOPK, None) and untold and bound:
                             raise ValueError(  # a row bound ATOM stages, its ratio's
                                 "its graph states no compress ratio, and this point "
                                 "cannot tell which ratio's scorer writes its "
