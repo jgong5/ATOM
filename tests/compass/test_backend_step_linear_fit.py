@@ -297,7 +297,7 @@ def test_a_rung_a_mad_pass_drops_entirely_gets_coefficient_zero():
 
 def test_a_fit_at_the_pass_limit_ends_there_with_the_vector_it_reached(monkeypatch):
     """Each step's label is the max of two ranks' prices under (1, 2, 3), one
-    label doubled. Unlimited, the passes settle at that law at the 4th and a
+    label doubled. Unlimited, the passes settle at that law at the 11th and a
     MAD round drops the doubled step. Limited to one pass, the first round
     ends at the limit: the fit keeps the vector that pass reached, its `F`
     the one recorded and below the start's, and runs no MAD round."""
@@ -321,7 +321,7 @@ def test_a_fit_at_the_pass_limit_ends_there_with_the_vector_it_reached(monkeypat
     passes = settled["passes"]
     assert (passes["start"], passes["count"], passes["stop"]) == (
         "all_rows",
-        4,
+        11,
         "settled",
     )
     assert settled["coef"] == pytest.approx([1.0, 2.0, 3.0], rel=1e-9)

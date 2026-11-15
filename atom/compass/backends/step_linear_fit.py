@@ -46,7 +46,7 @@ is the max over its ranks, so each vector is fitted by max-affine regression
 the lowest after a first round going on, each pass refits on the row
 each step's price picks, a step line-searched until it lowers the squared
 relative error, until no step changes rank, the step's ranks tie or the passes
-reach `FIT_PASSES`; MAD drops rerun it, short of that limit. The vector's solve, warm steps and hull read each step's row at the
+reach `FIT_PASSES`, reweighted until no price moves; MAD drops rerun it, short of that limit. The vector's solve, warm steps and hull read each step's row at the
 rank it prices the step as (`priced_rank`); so does each form a decode rung
 chooses among, MoE column and `rowmod` (below), and each held-out fold
 that chooses, which prices a step as the max over its ranks. Each
@@ -95,8 +95,9 @@ HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
 requests, ``fixed_s`` from a burst or else ``idle_s``, and ``bytes`` over every
 request's body.
 
-Each equation is divided by its own label and the coefficients are bound to be
-non-negative. Steps whose relative residual is more than `MAD_K` scaled MADs
+Each equation is divided by its price, from its label until no price moves
+(`_fit_form`), and the coefficients are bound to be
+non-negative. Steps whose relative residual, price less label over price, is more than `MAD_K` scaled MADs
 from the median are dropped and the rest refitted, until the kept set settles.
 The dropped steps that lead a record's steps of one vector, each slower than
 the law, are its warm steps (shape compiles and first touches), and so is a
@@ -1047,28 +1048,27 @@ def _fit_form(
     max over its ranks' rows `x[i, r]`, those `real[i, r]` holds, of their
     price, plus `offset`, a fixed part of it outside the coefficients.
 
-    `F(c) = sum_i ((max_r x_ir.c + offset_i - y_i) / s_i)^2` over the kept
-    steps, each equation divided by its scale `s_i`: its label at first, then
-    its price under the vector reached. The start is the non-negative
-    least-squares solve of every rank's row, each equation divided by its label.
-    Each pass solves on the row each step's current price picks, a
-    Gauss-Newton step on `F`, and halves it until `F` falls. The passes end
-    settled, the solve picking the rows it was solved on, or at a tie between
-    ranks, when no step that moves some price by more than the square root of
-    the float epsilon of its scale makes `F` fall, or at the limit,
-    `FIT_PASSES` passes in all, keeping the vector they reached. Each feature
-    that differs between some step's ranks is a start too, its axis scaled to
-    the labels: the first round runs from each start, every step kept, and the
-    lowest `F` goes on, a start at the limit included. Each kept step's scale
-    then becomes its price and the passes rerun, until no kept step's price
-    moves by more than that epsilon of its scale: iteratively reweighted least
-    squares for a Gamma model with identity link, so the law prices its steps'
-    mean where dividing by the label prices scattered steps low. A step's
-    residual is its price less its label, over its price. Steps whose residual
-    is more than `MAD_K` scaled MADs from the median are then dropped and the
-    passes rerun from there, until the kept set settles, for `MAD_PASSES`
-    rounds, or until the passes reach the limit. Raises when a kept step's
-    price is not positive, as no residual divides by it.
+    `F(c) = sum_i ((max_r x_ir.c + offset_i - y_i) / s_i)^2` over the kept steps,
+    each equation divided by its scale `s_i`, its label in the first round.
+    The start is the non-negative least-squares solve of every rank's row, each
+    equation divided by its label. Each pass solves on the row each step's
+    current price picks, a Gauss-Newton step on `F`, and halves it until `F`
+    falls. The passes end settled, the solve picking the rows it was solved
+    on, or at a tie between ranks, when no step that moves some price by more
+    than the square root of the float epsilon makes `F` fall, or at the
+    limit, `FIT_PASSES` passes in all, keeping the vector they reached. Each
+    feature that differs between some step's ranks is a start too, its axis
+    scaled to the labels: the first round runs from each start, every step
+    kept, and the lowest `F` goes on, a start at the limit included. Each kept
+    step's scale then becomes its price under the vector reached and the passes
+    rerun, until no kept step's price moves by that epsilon of its scale:
+    iteratively reweighted least squares for a Gamma model with identity link,
+    so the law prices its steps' mean. A step's residual is its price less its
+    label, over its price. Steps whose residual is more than
+    `MAD_K` scaled MADs from the median are then dropped and the passes rerun
+    from there, until the kept set settles, for `MAD_PASSES` rounds, or until
+    the passes reach the limit. A kept step priced at no time, which no
+    equation can be divided by, ends the reweighting; its residual drops it.
 
     Returns the solve's figures: `pick`, each step's rank, at a tie the rank
     of larger features (`priced_rank`, prices folded as a run folds them);
@@ -1146,17 +1146,12 @@ def _fit_form(
 
     def reweight(c, cols, on, passes, stop):
         """Each kept step's scale set to its price under `c` and the passes
-        rerun, until no kept step's price moves by `tol` of its scale or the
-        passes reach the limit."""
+        rerun, until no kept step's price moves by `tol` of its scale, the
+        passes reach the limit or `c` prices a kept step at no time."""
         while stop != "limit":
-            got = priced(c)[keep]
-            if (np.abs(got - scale[keep]) <= tol * scale[keep]).all():
+            got, now = priced(c)[keep], scale[keep]
+            if (got <= 0).any() or (np.abs(got - now) <= tol * now).all():
                 break
-            if (got <= 0).any():
-                raise ValueError(
-                    f"the fit prices {int((got <= 0).sum())} of its {got.size} "
-                    "kept steps at no time, so no relative error divides by it"
-                )
             scale[keep] = got
             c, cols, on, passes, stop = alternate(c, cols, None, passes)
         return c, cols, on, passes, stop
