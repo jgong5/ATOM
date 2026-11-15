@@ -174,8 +174,7 @@ def _record(
 def _stated(own: Path, held: dict, buckets, stated) -> tuple[dict, list | None]:
     """The `keyed` fields of the engine file `stated` and the prefill buckets a
     record with engine file `own`, `held` its keyed fields, states, else the
-    file's. A field `held` holds that the file omits or states otherwise
-    (`refuse_contradicting`), or other buckets, refuse."""
+    file's. A field the file omits or states otherwise, or other buckets, refuse."""
     raw = json.loads(Path(stated).read_text())
     engine = keyed_of(raw)
     refuse_contradicting(own, held, stated, engine)

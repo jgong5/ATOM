@@ -112,7 +112,7 @@ def parser(prog: str, description: str) -> argparse.ArgumentParser:
         metavar="FILE",
         help="the engine file the records ran under, stated in place of the "
         ".engine.json beside each, its prefill buckets for a record that states "
-        "none; refused where one holds a field it omits or states otherwise",
+        "none; refused where one contradicts it",
     )
     p.add_argument("--store", required=True, help="the artifact store's root")
     p.add_argument("--out", required=True, help="where the readable copy goes")

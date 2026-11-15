@@ -2062,9 +2062,8 @@ def recorded_buckets(stated: dict) -> tuple[int, ...] | None:
 
 
 def refuse_contradicting(own, held: dict, stated, engine: dict) -> None:
-    """Refuse `engine`, the keyed fields of the engine file `stated`, where it
-    omits a field `held`, those of the record's own engine file `own`, holds,
-    or states it otherwise, naming each such field."""
+    """Refuse `engine`, the engine file `stated`'s keyed fields, where it omits
+    or states otherwise a field `held`, the record's own file `own`'s, holds."""
     if differ := [k for k, v in held.items() if k not in engine or engine[k] != v]:
         raise ValueError(f"{own} contradicts {stated} in {differ}")
 
@@ -2153,7 +2152,7 @@ def _records_parser(prog: str, description: str) -> argparse.ArgumentParser:
         "--engine",
         help="the engine file the records ran under, stated in place of the "
         ".engine.json beside each, its prefill buckets for a record that states "
-        "none; refused where one holds a field it omits or states otherwise",
+        "none; refused where one contradicts it",
     )
     return parser
 
@@ -2161,8 +2160,8 @@ def _records_parser(prog: str, description: str) -> argparse.ArgumentParser:
 def _labelled(args) -> tuple[list, dict, dict, dict]:
     """`args.records`' samples, each record's table, the options `fit` takes
     on them and the engine config they ran under. A record whose server built
-    an aiter JIT module refuses, and so does an engine file holding a field
-    `--engine` omits or states otherwise (`refuse_contradicting`)."""
+    an aiter JIT module refuses, and so does an engine file that contradicts
+    `--engine`."""
     for record in args.records:
         run = Path(record).resolve().parent.parent / "run.json"
         if run.is_file() and (
