@@ -11,16 +11,18 @@ and takes the first that holds every input of its points, whatever the verdicts
 on them there: its platform readings compose with SPACE's machine, and no
 verdict names requirement 1, so each point's readings, and each law that is not
 a checked-in file, are at their key at the head's ATOM digest. With none, it
-takes the first whose platform readings compose and where a law is refused, as
-one fitted on another host CPU is, so the refusal is named rather than the
-shared store's calibrate; else the shared store's. There, each instance of
+takes the first whose platform readings compose and that one of its laws is
+read from, the store's own step linear law at the head's ATOM digest, whatever
+the verdict on it, as a readings gap is measured into the store a law is read
+from; else the shared store's. There, each instance of
 each point is resolved as ATOM's server resolves its arguments, under its
 variables, on the device arch of the machine spec that store's platform
 readings compose with SPACE's machine; a 1P1D side as `deploy.sh run` starts
 it, as `compass run --check` resolves one. The laws are judged at each point,
 since an argument that varies with the concurrency moves their key. A refusal
-of the composition, of a configuration or of the runner under a law is
-``refused``, verbatim, naming no requirement. A law verdict ``calibrate``
+of the composition, of an argument by ATOM's parser, of a configuration or of
+the runner under a law is ``refused``, verbatim, naming no requirement. A law
+verdict ``calibrate``
 names the command that makes the law as `compass run --check` prints it: on
 one node the `calibrate.sh` command of its records into OUT's
 ``cal/<candidate>``, its clients on SPACE's traces; on a 1P1D side `deploy.sh
@@ -34,7 +36,7 @@ when a law's verdict is ``calibrate``; else ``searchable``. A searchable
 candidate's point whose readings a verdict sends to measure is ``missing
 readings``, with its command. Each other point starts with no traffic, as the
 search will run it, for what only a start shows: `compass run`, or `deploy.sh
-run` on 1P1D with no router arguments, its decode side through a local
+run` on 1P1D with `ROUTER`'s router arguments, its decode side through a local
 ``--on`` prefix carrying its own variables where SPACE names a network. A
 point answers once the start's ``server.json`` names it, and is
 ``searchable``; a start that leaves first, or does not answer in `START_S`,
@@ -45,16 +47,18 @@ measured.
 
 import contextlib
 import functools
+import itertools
 import json
 import os
 import shutil
 import signal
 import subprocess
 import time
+import traceback
 from pathlib import Path
 
 from atom.compass.artifacts import ArtifactRefusal
-from atom.compass.drive import lacking, reuse, serve
+from atom.compass.drive import lacking, reuse, runfile, serve
 from atom.compass.drive import run as drive_run
 from atom.compass.fit.device import compose
 from atom.compass.spec import SpecRefusal
@@ -74,6 +78,17 @@ COMPASS, DEPLOY = (
 #: Seconds a start has to answer, and its stop to leave: deploy.sh's default
 #: wait for each of its instances and its router.
 START_S = 3 * 600
+#: The router arguments of a 1P1D start: ATOM's adapter, which asks the
+#: prefill side for the KV transfer the decode side takes, where the router's
+#: default is SGLang's; and none of the wall-clock failure detectors, which
+#: `deploy.sh run` leaves its caller to switch off.
+ROUTER = (
+    "--backend",
+    "atom",
+    "--disable-health-check",
+    "--disable-circuit-breaker",
+    "--disable-retries",
+)
 
 
 def check(expansion: dict, out: Path) -> dict:
@@ -96,7 +111,7 @@ def check(expansion: dict, out: Path) -> dict:
             }
             judged[candidate["name"]] = {"store": None, "points": verdicts}
             continue
-        refusing = None
+        holding_law = None
         for store in reuse.stores(expansion["store"], out):
             given = (machine["device"], store, machine["ptl"])
             given += (machine.get("stack"), machine.get("network"))
@@ -109,10 +124,11 @@ def check(expansion: dict, out: Path) -> dict:
             if all(v["requirement"] != 1 for v in _each(verdicts)):
                 break
             laws = (v for point in verdicts.values() for v in point["law"].values())
-            if refusing is None and any(v["verdict"] == "refused" for v in laws):
-                refusing = store, verdicts
+            read = any(v.get("store") == str(store.root) for v in laws)
+            if holding_law is None and read:
+                holding_law = store, verdicts
         else:
-            store, verdicts = refusing or (store, verdicts)
+            store, verdicts = holding_law or (store, verdicts)
         judged[candidate["name"]] = {"store": str(store.root), "points": verdicts}
     written = {"head": head, "refused": refused, "candidates": judged}
     (out / REUSE).write_text(json.dumps(written, indent=1) + "\n")
@@ -242,8 +258,20 @@ def serving(machine, candidate, point, verdicts, store, at: Path) -> tuple[list,
             f"by {' '.join(words)}"
         )
     command = [DEPLOY, at, "run", *flags, "--prefill", "--", *sides["prefill"]["args"]]
-    command += ["--decode", *on, "--", *sides["decode"]["args"], "--router", "--"]
-    return command, prefill
+    command += ["--decode", *on, "--", *sides["decode"]["args"]]
+    return command + ["--router", "--", *ROUTER], prefill
+
+
+def launched(command: list, env: dict, at: Path, until) -> "Command":
+    """`command` under `env`, run into `at` afresh, its output beside it in
+    ``<at>.log``, and waited for until it leaves, the ``server.json`` it
+    writes in `at` names its server, or `until()` holds, at most `START_S`."""
+    shutil.rmtree(at, ignore_errors=True)
+    at.parent.mkdir(parents=True, exist_ok=True)
+    server = Command(command, env, at.with_name(at.name + ".log"))
+    ready = at / serve.READY_FILE
+    server.wait(int(START_S / serve.POLL_S), lambda: ready.is_file() or until())
+    return server
 
 
 def _started(command: list, env: dict, at: Path) -> str | None:
@@ -251,35 +279,65 @@ def _started(command: list, env: dict, at: Path) -> str | None:
     names its server, then stop it with SIGTERM, as each is stopped: None.
     When it leaves first or does not answer in `START_S`, its last line and
     the first error raised in each log under `at`."""
-    shutil.rmtree(at, ignore_errors=True)
-    at.parent.mkdir(parents=True, exist_ok=True)
-    log = at.with_name(at.name + ".log")
-    with log.open("w") as written:
-        server = subprocess.Popen(
-            list(map(str, command)),
-            stdout=written,
-            stderr=subprocess.STDOUT,
-            env=os.environ | env,
-            cwd=serve.TREE,
-            start_new_session=True,
-        )
+    server = launched(command, env, at, lambda: False)
     ready = at / serve.READY_FILE
-    for _ in range(int(START_S / serve.POLL_S)):
-        if server.poll() is not None or ready.is_file():
-            break
-        time.sleep(serve.POLL_S)
-    answered, left = ready.is_file(), server.poll() is not None
-    server.terminate()
-    try:
-        server.wait(START_S)
-    except subprocess.TimeoutExpired:
-        os.killpg(server.pid, signal.SIGKILL)
-        server.wait()
+    answered, left = ready.is_file(), server.left()
+    server.end()
     if answered:
         return None
     said = [] if left else [f"no {ready} in {START_S} s"]
-    said += [_said(log, last=True), *(_said(p) for p in sorted(at.rglob("*.log")))]
+    said += [_said(server.log, last=True)]
+    said += [_said(p) for p in sorted(at.rglob("*.log"))]
     return "; ".join(dict.fromkeys(filter(None, said)))
+
+
+class Command:
+    """A command in a process group of its own, run in the tree under this
+    process's environment and `env`, its output in `log`; once reaped, its
+    exit ``status`` and the CPU seconds it and the processes it waited for
+    took."""
+
+    def __init__(self, command: list, env: dict, log: Path):
+        self.log = log
+        with log.open("w") as written:
+            self.process = subprocess.Popen(
+                list(map(str, command)),
+                stdout=written,
+                stderr=subprocess.STDOUT,
+                env=os.environ | env,
+                cwd=serve.TREE,
+                start_new_session=True,
+            )
+        self.status, self.cpu_s = None, 0.0
+
+    def left(self) -> bool:
+        """Whether it has exited, reaped here for its status and CPU seconds."""
+        if self.status is None:
+            pid, status, usage = os.wait4(self.process.pid, os.WNOHANG)
+            if pid:
+                self.status = os.waitstatus_to_exitcode(status)
+                self.process.returncode = self.status
+                self.cpu_s = usage.ru_utime + usage.ru_stime
+        return self.status is not None
+
+    def wait(self, polls: int | None, until) -> None:
+        """Until it exits or `until()` holds, for at most `polls` polls, or
+        with no bound when None."""
+        for _ in itertools.count() if polls is None else range(polls):
+            if self.left() or until():
+                return
+            time.sleep(serve.POLL_S)
+
+    def end(self) -> None:
+        """Stop it with SIGTERM; SIGKILL its group after `START_S`; and reap
+        it."""
+        # Not Popen's own signalling: its poll would reap the process first.
+        if not self.left():
+            os.kill(self.process.pid, signal.SIGTERM)
+            self.wait(int(START_S / serve.POLL_S), lambda: False)
+        if not self.left():
+            os.killpg(self.process.pid, signal.SIGKILL)
+            self.wait(None, lambda: False)
 
 
 def _said(log: Path, last: bool = False) -> str | None:
@@ -337,7 +395,7 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
         with _env(env):
             if instance not in seen:
                 arch = machine.value("device.arch")
-                seen[instance] = _or_refused(drive_run._config, args, arch)
+                seen[instance] = _or_refused(_resolved, args, arch)
             if isinstance(config := seen[instance], dict):
                 verdicts = config, config
             else:
@@ -361,6 +419,26 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                 verdicts = law, readings
         seen[(store.root, *instance)] = verdicts
     return seen[(store.root, *instance)]
+
+
+def _resolved(args, arch: str):
+    """`drive_run._config` of ATOM's arguments `args` on a device of `arch`,
+    once `runfile._engine_args` reads them here: a value ATOM's parser rejects
+    raises its error, where the child that resolves them would exit this
+    process. A configuration ATOM refuses with an assertion or a type error,
+    besides a value error, raises its exception line as a value error."""
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    class Refusing(FlexibleArgumentParser):
+        def error(self, message):
+            raise ValueError(f"ATOM's parser: {message}")
+
+    runfile._engine_args(args, Refusing)
+    try:
+        return drive_run._config(args, arch)
+    except (AssertionError, TypeError) as error:
+        said = traceback.format_exception_only(error)[-1].strip()
+        raise ValueError(f"ATOM's config: {said}") from error
 
 
 def _or_refused(call, *args):

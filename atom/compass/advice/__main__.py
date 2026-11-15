@@ -47,6 +47,8 @@ def main(argv: list[str]) -> None:
     parser.add_argument("space", type=Path, help="the space file")
     parser.add_argument("out", type=Path, help="the search's directory")
     args = parser.parse_args(argv)
+    # Each start runs in the tree, so it is given OUT whole.
+    args.out = args.out.resolve()
     expansion = expand(args.space)
     args.out.mkdir(parents=True, exist_ok=True)
     earlier = _only_slo_changed(expansion, args.out)
