@@ -6,8 +6,11 @@ capture also states a host tensor ATOM did not ask to pin, and a copy with one
 refuses by name.
 """
 
+import contextlib
 import dataclasses
 import os
+import pathlib
+import shutil
 import subprocess
 import sys
 from unittest.mock import patch
@@ -22,6 +25,7 @@ from atom.compass.bench import ops
 from atom.compass.capture import driverless, forward, graph
 
 I32 = "torch.int32"
+QWEN3 = pathlib.Path(__file__).with_name("qwen3_0_6b_config.json")
 COPY = "aten.copy_.default"
 
 
@@ -139,3 +143,50 @@ def test_a_copy_with_host_memory_atom_keeps_pageable_refuses_by_name():
         "graph captures",
         ["k"],
     ]
+
+
+def test_a_tensor_pinned_as_the_runner_is_built_states_no_pageable(request, tmp_path):
+    """A `pin_memory=True` host tensor Qwen3-0.6B's model allocates in its
+    constructor, or its runner as it sizes its pools, states no `pageable`
+    where a captured step copies it."""
+    if "COMPASS_ARCH_DECLARED" not in os.environ:
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+            + ["--show-capture=no", f"{__file__}::{request.node.name}"],
+            env={**os.environ, "COMPASS_ARCH_DECLARED": "1"},
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        assert done.returncode == 0, done.stdout[-4000:]
+        return
+    (tmp_path / "model").mkdir()
+    shutil.copy(QWEN3, tmp_path / "model" / "config.json")
+    tracer = forward.Tracer(str(tmp_path / "model"), 1, str(tmp_path))
+    from atom.model_engine.model_runner import ModelRunner
+    from atom.models.qwen3 import Qwen3ForCausalLM as Model
+
+    held, plan = [], ModelRunner.get_num_blocks
+    init, step = Model.__init__, Model.forward
+
+    def pinned(out):
+        held.append(torch.zeros(3, dtype=torch.int16, device="cpu", pin_memory=True))
+        return out
+
+    def copied(model, *args, **kwargs):
+        for host in held:
+            torch.empty(3, dtype=torch.int16, device="cuda").copy_(host)
+        return step(model, *args, **kwargs)
+
+    with (
+        patch.object(Model, "__init__", lambda *a, **k: pinned(init(*a, **k))),
+        patch.object(ModelRunner, "get_num_blocks", lambda r: pinned(plan(r))),
+        patch.object(Model, "forward", copied),
+        contextlib.closing(tracer),
+    ):
+        list(tracer.trace([forward.Shape("decode", 1, 1)]))
+    copies = [op for _, op in tracer.recorder.items if getattr(op, "name", 0) == COPY]
+    sources = [graph._json(op)["args"]["src"] for op in copies]
+    staged = [s for s in sources if s["dtype"] == "torch.int16"]
+    assert [(s.get("device"), s.get("pageable")) for s in staged] == [("cpu", None)] * 2

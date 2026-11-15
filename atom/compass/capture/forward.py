@@ -886,6 +886,20 @@ class _Recorder(TorchDispatchMode):
         return re.sub(rf"\blayers\.{self.layer}\b", f"layers.{{{LAYER}}}", path)
 
 
+class _Pinned(TorchDispatchMode):
+    """What ATOM allocates with `pin_memory=True` where the recorder is off, as
+    the runner is built and sizes its pools, held pinned (`_Recorder.pin`);
+    nothing else is touched, a host array headed for the device among it."""
+
+    def __init__(self, recorder):
+        super().__init__()
+        self.pin = recorder.pin
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        return self.pin(out) if (kwargs or {}).get("pin_memory") else out
+
+
 def _coordinator(group_name: str) -> str:
     """The aiter coordinator (`tp:0`) whose device group torch names
     `group_name`, or the name as it is when none is: torch numbers groups in
@@ -1689,7 +1703,9 @@ class Tracer:
                 stack.enter_context(patch.object(owner, name, value))
             if config.enable_expert_parallel:
                 peers.install_mori(recorder)
-        runner = _build_runner(config, fake_mode)
+        pinned = _Pinned(recorder)
+        with pinned:
+            runner = _build_runner(config, fake_mode)
         if v4 := sys.modules.get("atom.models.deepseek_v4"):
             stack.enter_context(_v4_attention(v4, recorder))
         if v41 := "atom.models.deepseek_v41.runtime" in sys.modules:
@@ -1720,7 +1736,7 @@ class Tracer:
         recorder.roles = dict.fromkeys(weights, ir.Role.WEIGHT)
         per_req = InputOutputProcessor._per_req_cache_model_types()
         self.stateful = config.hf_config.model_type in per_req
-        with fake_mode, torch.inference_mode():
+        with fake_mode, pinned, torch.inference_mode():
             runner.get_num_blocks()  # sizes the pools, as `EngineCore` does
         # A warmup copy whose bytes nobody reads, like `_maybe_warmup`.
         runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
