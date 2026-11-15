@@ -20,8 +20,11 @@ result table, each command that makes what a point lacks, and the
 recommendation's text. When SPACE differs from the search OUT holds only in its
 SLO, the results alone are made again, from the verdicts, states and outcomes
 OUT holds, and nothing is checked or simulated; a search that did not end holds
-no outcomes, so the next is whole. It reads SPACE alone, and writes nothing
-when SPACE refuses.
+no outcomes, so the next is whole. Beside SPACE and the store and laws the
+check reads, it reads OUT's last search: an SLO-only rerun takes its
+`CANDIDATES`, `check.REUSE`, `check.STATES` and `simulate.SIMULATED` as they
+are, and each point's run directory is read to skip a finished point and for
+its metrics. It writes nothing when SPACE refuses.
 """
 
 import argparse

@@ -56,10 +56,13 @@ COVERAGE = SUMMARY | {
 LAW = "/laws/law.json"
 
 
-def made(d, concurrency, scale=1.0, tp=1, sides=None, cached=True, summary=SUMMARY):
+def made(
+    d, concurrency, scale=1.0, tp=1, sides=None, cached=True, itl=True, summary=SUMMARY
+):
     """A simulated run of the export at `scale` at `d`, on `tp` GPUs or a
     deployment's (tensor parallel, data parallel) `sides`, its run summary
-    `summary` where given; every record states its cached tokens if `cached`."""
+    `summary` where given; every record states its cached tokens if `cached`,
+    and none its inter-token latency unless `itl`."""
     if sides:
         _deployment(d, concurrency, scale, server=False, **sides)
     else:
@@ -67,8 +70,11 @@ def made(d, concurrency, scale=1.0, tp=1, sides=None, cached=True, summary=SUMMA
     records = [
         json.loads(line) for line in (d / curves.RECORDS).read_text().splitlines()
     ]
-    for r in records if cached else ():
-        r["metrics"][results.CACHED] = {"value": CACHED, "unit": "tokens"}
+    for r in records:
+        if cached:
+            r["metrics"][results.CACHED] = {"value": CACHED, "unit": "tokens"}
+        if not itl:
+            r["metrics"].pop("inter_token_latency", None)
     (d / curves.RECORDS).write_text("".join(json.dumps(r) + "\n" for r in records))
     if summary:
         (d / "summary.json").write_text(json.dumps(summary))
@@ -168,28 +174,37 @@ def test_inferencex_metrics_are_curves_and_the_search_s_own_come_from_the_same_e
     assert held["n-c4"]["throughput per GPU"] == held["a-c4"]["throughput per GPU"]
 
 
-#: Eight points: (throughput per GPU, p90 interactivity) at scale s on tp GPUs
-#: is (TOKENS / 11.65 / (s tp), I / s), so a-c1 is (T/2, I), b-c2 (T/4, 2I)
-#: and c-c2 (T/1.5, I/1.5), which no other dominates; d-c1, whose (2T, 4I)
-#: would dominate them all, is a coverage report, and d-c2 failed.
-EIGHT = {
+#: The points: (throughput per GPU, p90 interactivity) at scale s on tp GPUs
+#: is (TOKENS / 11.65 / (s tp), I / s), so a-c1 and e-c1 are (T/2, I), b-c2
+#: (T/4, 2I) and c-c2 (T/1.5, I/1.5), which no other dominates; b-c1, at
+#: (T/3, I), only a-c1 and e-c1 do, by throughput alone. d-c1, whose (2T, 4I)
+#: would dominate them all, is a coverage report, d-c2 failed, and e-c2's
+#: records state no inter-token latency, so it has no interactivity.
+POINTS = {
     "a-c1": {"scale": 1.0, "tp": 2},
     "a-c2": {"scale": 2.0, "tp": 1},
-    "b-c1": {"scale": 1.0, "tp": 8},
+    "b-c1": {"scale": 1.0, "tp": 3},
     "b-c2": {"scale": 0.5, "tp": 8},
     "c-c1": {"scale": 4.0, "tp": 1},
     "c-c2": {"scale": 1.5, "tp": 1},
     "d-c1": {"scale": 0.25, "sides": {"prefill": (1, 1), "decode": (1, 1)}}
     | {"summary": COVERAGE},
     "d-c2": {"state": "failed", "tries": 2, "why": ["client.sh exited 1"]},
+    "e-c1": {"scale": 1.0, "tp": 2},
+    "e-c2": {"scale": 1.0, "tp": 8, "itl": False},
 }
-CONFIGS = {"a": {}, "b": {}, "c": {}, "d": {"deployment": "1p1d"}}
+CONFIGS = {"a": {}, "b": {}, "c": {}, "d": {"deployment": "1p1d"}, "e": {}}
 
 
 def test_the_frontier_holds_exactly_the_points_no_other_dominates(tmp_path):
-    held = search(tmp_path, CONFIGS, [1, 2], EIGHT, {})
+    held = search(tmp_path, CONFIGS, [1, 2], POINTS, {})
 
-    placed = [r for r in held["rows"] if r["grading"] == "ungraded"]
+    assert rows(held)["e-c2"]["p90 interactivity"] is None
+    placed = [
+        r
+        for r in held["rows"]
+        if r["grading"] == "ungraded" and r["p90 interactivity"] is not None
+    ]
     brute = {
         r["point"]
         for r in placed
@@ -201,7 +216,7 @@ def test_the_frontier_holds_exactly_the_points_no_other_dominates(tmp_path):
             for o in placed
         )
     }
-    assert brute == {"a-c1", "b-c2", "c-c2"}
+    assert brute == {"a-c1", "b-c2", "c-c2", "e-c1"}
     assert {r["point"] for r in held["rows"] if r["frontier"]} == brute
     d = rows(held)["d-c1"]
     assert d["throughput per GPU"] == pytest.approx(2 * TOKENS / 11.65)
@@ -218,11 +233,14 @@ def test_the_frontier_holds_exactly_the_points_no_other_dominates(tmp_path):
 @pytest.mark.parametrize(
     "slo, best, runner",
     [
-        # The four whose TTFT is at most 1.7 s and interactivity at least 23;
-        # at c-c2's concurrency, b-c2, though a-c1 has more throughput.
+        # TTFT at most 1.7 s and interactivity at least 23, which e-c2, with
+        # none, misses; at c-c2's concurrency, b-c2, though a-c1 has more
+        # throughput.
         ({"max_ttft_p90_s": 1.7, "min_interactivity_p90": 23}, "c-c2", "b-c2"),
-        ({"max_ttft_p90_s": 1.2}, "a-c1", "b-c1"),
-        # No bound: d-c1 would lead, but has a refusal; a-c2 now meets it.
+        # a-c1 and e-c1 tie on throughput: the first in SPACE's order leads.
+        ({"max_ttft_p90_s": 1.2}, "a-c1", "e-c1"),
+        # No bound: d-c1 would lead, but has a refusal; a-c2 now meets it, and
+        # e-c2 with no interactivity.
         ({}, "c-c2", "a-c2"),
         ({"min_interactivity_p90": 2.1 * I}, None, None),
     ],
@@ -230,14 +248,16 @@ def test_the_frontier_holds_exactly_the_points_no_other_dominates(tmp_path):
 def test_the_recommendation_and_runner_up_meet_the_slo_and_have_no_refusal(
     tmp_path, slo, best, runner
 ):
-    held = search(tmp_path, CONFIGS, [1, 2], EIGHT, slo)
+    held = search(tmp_path, CONFIGS, [1, 2], POINTS, slo)
 
     assert (held["recommendation"], held["runner_up"]) == (best, runner)
     met = {r["point"] for r in held["rows"] if r["slo_met"]}
     for r in held["rows"]:
         if r["grading"]:
             meets = r["p90 TTFT"] <= slo.get("max_ttft_p90_s", 1e9)
-            meets &= r["p90 interactivity"] >= slo.get("min_interactivity_p90", 0)
+            if (lowest := slo.get("min_interactivity_p90")) is not None:
+                got = r["p90 interactivity"]
+                meets = meets and got is not None and got >= lowest
             assert (r["point"] in met) == meets, r["point"]
     assert rows(held)["d-c2"]["slo_met"] is None
     text = held["text"].splitlines()
@@ -268,7 +288,7 @@ def _numbers(text: str) -> set[str]:
 
 @pytest.mark.parametrize("slo", [{"max_ttft_p90_s": 1.7}, {"max_ttft_p90_s": 1.2}])
 def test_every_number_in_the_text_is_in_the_table(tmp_path, slo):
-    held = search(tmp_path, CONFIGS, [1, 2], EIGHT, slo)
+    held = search(tmp_path, CONFIGS, [1, 2], POINTS, slo)
 
     printed = results.lines(held)
     table = printed[2 : 2 + len(held["rows"])]
@@ -440,3 +460,12 @@ def test_a_search_ends_in_its_results_and_a_changed_slo_simulates_nothing(
     # A search stopped before its outcomes: the next is whole, SLO changed or not.
     assert len(starts(tmp_path)) > ran
     assert "only in its SLO" not in capsys.readouterr().out
+    ran = len(starts(tmp_path))
+    space["dimensions"]["config"]["m"]["args"]["--max-num-seqs"] = 16
+
+    changed = advise({"max_ttft_p90_s": 1, "min_interactivity_p90": 30})
+
+    # The SLO and a block's arguments changed in one edit: the whole search.
+    assert len(starts(tmp_path)) > ran
+    assert "only in its SLO" not in capsys.readouterr().out
+    assert "--max-num-seqs 16" in rows(changed)["m-c1"]["made_by"][0]
