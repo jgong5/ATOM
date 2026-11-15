@@ -1120,7 +1120,7 @@ def test_each_copy_of_a_v41_index_scorer_writes_a_logits_plane_of_its_own():
 
 @pytest.mark.parametrize(
     "bounds, copies, buffers",
-    [([100, 120, 110, 120], 11, 2), ([600] * 4, 3, 3), ([1000, 20, 20, 20], 3, 3)],
+    [([100, 120, 110, 120], 11, 2), ([600] * 4, 3, 3), ([1000, 20, 20, 20], 5, 5)],
     ids=["rows_alike", "rows_past_half", "one_long_row"],
 )
 def test_a_v41_plane_counts_and_copies_the_columns_below_its_rows_bounds(
@@ -1129,7 +1129,7 @@ def test_a_v41_plane_counts_and_copies_the_columns_below_its_rows_bounds(
     # a top-k's FP8 plane, [4, 1024] float32, beside its 32-byte bounds, at
     # twice a cache of 20000 bytes: 8 copies of rows alike share a buffer,
     # 128 columns apart; rows past half its width take a buffer a copy, at
-    # most twice that, and read past it, but for ragged rows (#3274)
+    # most four times that, and read past it
     runner = _Runner()
     geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
     runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
@@ -1146,7 +1146,7 @@ def test_a_v41_plane_counts_and_copies_the_columns_below_its_rows_bounds(
     planes = [stub._copy(op, sig, instances, c)[0]["logits"] for c in range(n)]
 
     assert (n, size) == (copies, 4 * sum(bounds) + 32)
-    assert n * size > 20_000 or max(bounds) > 2 * min(bounds)
+    assert n * size > 20_000
     assert len({p.untyped_storage().data_ptr() for p in planes}) == buffers
     reach = list(enumerate(bounds))
     assert all(p[r, :b].ne(0).all() for p in planes for r, b in reach)
@@ -1154,6 +1154,49 @@ def test_a_v41_plane_counts_and_copies_the_columns_below_its_rows_bounds(
         for r, b in reach:
             p[r, :b] = c
     assert all(p[r, :b].eq(c).all() for c, p in enumerate(planes) for r, b in reach)
+
+
+@pytest.mark.parametrize(
+    "llc, copies, buffers, starts",
+    [(10_000, 14, 4, [0, 512, 1152, 1664]), (5_000, 6, 3, [0, 384])],
+    ids=["stairs", "stairs_past_twice_cold"],
+)
+def test_a_v41_plane_s_copies_read_its_widest_row_beside_others_narrow_rows(
+    llc, copies, buffers, starts
+):
+    # a top-k's FP8 plane, [4, 1024] float32, its first row reading 300
+    # columns and the rest 20: a copy a row and 128 columns past another reads
+    # its first row beside the other's second, two such stairs to a buffer 512
+    # columns apart, and 14 copies read past twice the cache, where copies 384
+    # columns apart, two to a buffer, read under it; at half the cache a
+    # stair's buffer, 23040 bytes, would pass twice `COLD` times it
+    bounds = [300, 20, 20, 20]
+    runner = _Runner()
+    geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(4, 1024)
+    runner.forward_vars["ends"] = torch.tensor(bounds)
+    plane, ends = _t([4, 1024], "metadata"), _t([4], "metadata", dtype="torch.int64")
+    top_k = _leaf(ops._TOPK, ("logits", plane), ("row_ends", ends))
+    stub = ops.Stub(runner, llc)
+    stub.leaves = ops.leaves(_graph(top_k, layers=1)["region"])
+    stub._prepare((0, 0))
+    [(sig, (op, instances))] = stub.leaves.items()
+
+    n, size, _, _ = stub._plan(op, instances, {}, 4, 4, sig=sig, decode=True)
+    planes = [stub._copy(op, sig, instances, c)[0]["logits"] for c in range(n)]
+
+    assert (n, size) == (copies, 4 * sum(bounds) + 32)
+    assert (n * size > 2 * llc) == (llc == 10_000)
+    assert len({p.untyped_storage().data_ptr() for p in planes}) == buffers
+    reach = list(enumerate(bounds))
+    for c, p in enumerate(planes):  # no copy reaches another's columns
+        for r, b in reach:
+            p[r, :b] = c
+    assert all(p[r, :b].eq(c).all() for c, p in enumerate(planes) for r, b in reach)
+    first = planes[0].untyped_storage().data_ptr()
+    at = [p.storage_offset() for p in planes if p.untyped_storage().data_ptr() == first]
+    assert at == starts
 
 
 def test_an_embedding_reads_the_token_ids_atom_prepared():
