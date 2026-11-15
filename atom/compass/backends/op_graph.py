@@ -42,10 +42,11 @@ every part of a leaf the kind's work has read, a leaf whose work reads nothing
 of the step keeps its price and its work, or that it launches no kernel, and
 with no price list a graph keeps its price for each set of prices of its
 leaves that read the step. A step at a view priced before, as a DP rank's
-dummy forwards are, prices as it did then. Regions compose by the IR's joins:
-a `Seq` adds its items in order, a `Repeat` re-emits its body's prices once per
-instance, a `max` `Par` emits its longest branch's prices, and a
-`resource_bound` `Par` one roofline over its branches' summed work. The price
+dummy forwards are, prices as it did then when it reads the same graphs.
+Regions compose by the IR's joins: a `Seq` adds its items in order, a `Repeat`
+re-emits its body's prices once per instance, a `max` `Par` emits its longest
+branch's prices, and a `resource_bound` `Par` one roofline over its branches'
+summed work. The price
 is one rank's device busy time: the runner takes a DP group's max and
 composes host time.
 
@@ -380,8 +381,9 @@ class OpGraphBackend(CostBackend):
         self._step: dict[tuple, tuple] = {}
         self._reads: dict[str, set] = {}
         self._graphs: dict[tuple, tuple] = {}
-        # By view: a step's price, for a step at the same view again
-        self._viewed: dict[BatchView, StepCost] = {}
+        # By view and graphs' objects: a step's price, and the graphs, which
+        # keep their ids theirs.
+        self._viewed: dict[tuple, tuple] = {}
         self._live: list | None = None
         self._pars = 0
         # By leaf object: the view of the rows its pass runs, for a routed
@@ -395,21 +397,23 @@ class OpGraphBackend(CostBackend):
         return Granularity.OP
 
     def price(self, batch_view: BatchView) -> StepCost:
-        if batch_view.tbo_tokens is None:
-            cost = self._viewed.get(batch_view)
-            if cost is not None:
-                return cost
         refused: list[Refusal] = []
-        self._step, self._live, self._pars, graph = {}, None, 0, None
+        self._step, self._live, self._pars, graph, viewed = {}, None, 0, None, None
         self._passes = {}
         if batch_view.tbo_tokens is None or batch_view.image_tokens:
             at, region = self._region(batch_view)
-            bound = self.resolver and self._bound(batch_view)
             drafted_at, drafted = (
                 self._region(batch_view, draft=True) if self.drafts else (None, None)
             )
             samples = batch_view.decode or batch_view.produces_output
             kv = self.block and samples and self._region(batch_view, draft=KV)[1]
+            # The same view of the same graphs prices as it did, a DP rank's
+            # dummy forward among them.
+            held = (region, drafted, kv)
+            viewed = (batch_view, *map(id, held))
+            if (got := self._viewed.get(viewed)) is not None:
+                return got[0]
+            bound = self.resolver and self._bound(batch_view)
             if drafted and samples and batch_view.moe_rows is None:
                 self._passes = self._pass_views(drafted, batch_view)
             # A price list's bound reads each step's context, so its steps
@@ -488,10 +492,10 @@ class OpGraphBackend(CostBackend):
                 composed.clear()
             composed[_same(live)] = cost
             self._graphs[graph] = ((region, drafted, kv), live, composed)
-        if batch_view.tbo_tokens is None:
+        if viewed is not None:
             if len(self._viewed) >= VIEWED:
                 self._viewed.clear()
-            self._viewed[batch_view] = cost
+            self._viewed[viewed] = (cost, held)
         return cost
 
     def describe(self) -> str:
