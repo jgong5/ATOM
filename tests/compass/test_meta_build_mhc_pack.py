@@ -127,10 +127,13 @@ def test_each_v41_block_keeps_both_mhc_packs_on_meta_as_a_gfx950_start(built):
 
 def test_the_buffers_count_each_pack_only_where_atom_packs(built):
     """Under the Triton backend ATOM packs nothing, nor does its meta build;
-    under its default each pack is one more buffer storage."""
+    under its default each pack is one more buffer storage, of its
+    projection's bytes."""
     auto, triton = built["auto"], built["triton"]
-    packs = sum(held[s][-1] for held in auto["layers"] for s in ("attn", "ffn"))
+    text = json.loads(CONFIG.read_text())["text_config"]
+    packs = 2 * text["num_hidden_layers"]
+    projection = 24 * text["hc_mult"] * text["hidden_size"] * 4
     assert all(len(v) == 1 for held in triton["layers"] for v in held.values())
-    assert auto["buffers"][0] - triton["buffers"][0] == packs
     stored = [int(t["buffers"][1].split()[0]) for t in (auto, triton)]
-    assert stored[0] - stored[1] == 2 * len(auto["layers"])
+    assert stored[0] - stored[1] == packs
+    assert auto["buffers"][0] - triton["buffers"][0] == packs * projection
