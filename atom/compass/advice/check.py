@@ -11,16 +11,18 @@ and takes the first that holds every input of its points, whatever the verdicts
 on them there: its platform readings compose with SPACE's machine, and no
 verdict names requirement 1, so each point's readings, and each law that is not
 a checked-in file, are at their key at the head's ATOM digest. With none, it
-takes the first whose platform readings compose and where a law is refused, as
-one fitted on another host CPU is, so the refusal is named rather than the
-shared store's calibrate; else the shared store's. There, each instance of
+takes the first whose platform readings compose and that one of its laws is
+read from, the store's own step linear law at the head's ATOM digest, whatever
+the verdict on it, as a readings gap is measured into the store a law is read
+from; else the shared store's. There, each instance of
 each point is resolved as ATOM's server resolves its arguments, under its
 variables, on the device arch of the machine spec that store's platform
 readings compose with SPACE's machine; a 1P1D side as `deploy.sh run` starts
 it, as `compass run --check` resolves one. The laws are judged at each point,
 since an argument that varies with the concurrency moves their key. A refusal
-of the composition, of a configuration or of the runner under a law is
-``refused``, verbatim, naming no requirement. A law verdict ``calibrate``
+of the composition, of an argument by ATOM's parser, of a configuration or of
+the runner under a law is ``refused``, verbatim, naming no requirement. A law
+verdict ``calibrate``
 names the command that makes the law as `compass run --check` prints it: on
 one node the `calibrate.sh` command of its records into OUT's
 ``cal/<candidate>``, its clients on SPACE's traces; on a 1P1D side `deploy.sh
@@ -51,10 +53,11 @@ import shutil
 import signal
 import subprocess
 import time
+import traceback
 from pathlib import Path
 
 from atom.compass.artifacts import ArtifactRefusal
-from atom.compass.drive import lacking, reuse, serve
+from atom.compass.drive import lacking, reuse, runfile, serve
 from atom.compass.drive import run as drive_run
 from atom.compass.fit.device import compose
 from atom.compass.spec import SpecRefusal
@@ -96,7 +99,7 @@ def check(expansion: dict, out: Path) -> dict:
             }
             judged[candidate["name"]] = {"store": None, "points": verdicts}
             continue
-        refusing = None
+        holding_law = None
         for store in reuse.stores(expansion["store"], out):
             given = (machine["device"], store, machine["ptl"])
             given += (machine.get("stack"), machine.get("network"))
@@ -109,10 +112,11 @@ def check(expansion: dict, out: Path) -> dict:
             if all(v["requirement"] != 1 for v in _each(verdicts)):
                 break
             laws = (v for point in verdicts.values() for v in point["law"].values())
-            if refusing is None and any(v["verdict"] == "refused" for v in laws):
-                refusing = store, verdicts
+            read = any(v.get("store") == str(store.root) for v in laws)
+            if holding_law is None and read:
+                holding_law = store, verdicts
         else:
-            store, verdicts = refusing or (store, verdicts)
+            store, verdicts = holding_law or (store, verdicts)
         judged[candidate["name"]] = {"store": str(store.root), "points": verdicts}
     written = {"head": head, "refused": refused, "candidates": judged}
     (out / REUSE).write_text(json.dumps(written, indent=1) + "\n")
@@ -337,7 +341,7 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
         with _env(env):
             if instance not in seen:
                 arch = machine.value("device.arch")
-                seen[instance] = _or_refused(drive_run._config, args, arch)
+                seen[instance] = _or_refused(_resolved, args, arch)
             if isinstance(config := seen[instance], dict):
                 verdicts = config, config
             else:
@@ -361,6 +365,26 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                 verdicts = law, readings
         seen[(store.root, *instance)] = verdicts
     return seen[(store.root, *instance)]
+
+
+def _resolved(args, arch: str):
+    """`drive_run._config` of ATOM's arguments `args` on a device of `arch`,
+    once `runfile._engine_args` reads them here: a value ATOM's parser rejects
+    raises its error, where the child that resolves them would exit this
+    process. A configuration ATOM refuses with an assertion or a type error,
+    besides a value error, raises its exception line as a value error."""
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    class Refusing(FlexibleArgumentParser):
+        def error(self, message):
+            raise ValueError(f"ATOM's parser: {message}")
+
+    runfile._engine_args(args, Refusing)
+    try:
+        return drive_run._config(args, arch)
+    except (AssertionError, TypeError) as error:
+        said = traceback.format_exception_only(error)[-1].strip()
+        raise ValueError(f"ATOM's config: {said}") from error
 
 
 def _or_refused(call, *args):
