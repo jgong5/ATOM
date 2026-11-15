@@ -67,6 +67,17 @@ without busy time is cut as `untraced`. A trace run, a record with its busy
 lines beside it or whose run directory holds `TRACE`, ran under a profiler: its
 decode steps are cut as `traced` and its steps carry no host labels.
 
+A gated record, one whose lines state `gated` (`parity.GATE`), labels each of
+its prefill steps from the step's own window instead, the target pass alone as
+an MTP decode's is: `d_target_ns`, with an output prefill's draft-KV pass, or
+`d_busy_ns` without a target end. Its drafter passes get no label. Such a step
+is cut as `unqualified` where its line does not state `qualified`, and as
+`late_dummy` where a DP dummy forward at its step ended its model launch
+(`t_launch_ns`), on the host clock the ranks share, no earlier than the step's
+host began its draft copy wait, or, without one, left the forward: that
+dummy's host may have paced the collectives they share (`gate_cut`). A gated
+record's steps carry no host labels: each preload moves the host waits after it.
+
 Given `floored`, a trace run's drafter labels, the draft's and its passes',
 lose what the profiler added to each drafter kernel shorter than the profiler's
 floor (`parity.busy.floored` under a `Floor`): queued behind another, such a
@@ -120,6 +131,7 @@ import bisect
 import hashlib
 import itertools
 import json
+import math
 import statistics
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
@@ -136,6 +148,9 @@ ANCHORS = 32
 #: Why a device label is cut: a launch-exposed decode, mixed rows, no MTP target
 #: end, a prefill with no traced busy time, a trace run's decode.
 CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced")
+#: Why a gated record's prefill label is cut (`gate_cut`); counted only where
+#: one is.
+GATE_CUTS = ("unqualified", "late_dummy")
 #: The directory beside a trace run's `steps` its traces are in (`parity.busy`).
 TRACE = "trace"
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
@@ -162,10 +177,11 @@ def refusal(run: dict) -> str | None:
 class Sample:
     """One real forward, labelled.
 
-    `device_s` is its device label, None when cut, and `cut` names why (`CUTS`).
-    `draft_s` is its draft label, None when cut, on a step with no draft, or
-    on a decode whose device reached its `propose` pass before the host's
-    draft copy wait.
+    `device_s` is its device label, None when cut, and `cut` names why (`CUTS`,
+    `GATE_CUTS`).
+    `draft_s` is its draft label, None when cut, on a step with no draft, on a
+    gated record's prefill, or on a decode whose device reached its `propose`
+    pass before the host's draft copy wait.
     `propose_s` is its propose label, the part of `draft_s` that is the
     `propose` pass, on a prefill step that produces output; None elsewhere.
     `draft_kv_s` is its draft-KV label, the part of `device_s` that is the
@@ -304,6 +320,31 @@ def group_peaks(ranks: Iterable[list[dict]]) -> dict[int, int]:
             tokens = sum(q for q, _, _ in s["rows"])
             peaks[s["step"]] = max(tokens, peaks.get(s["step"], 0))
     return peaks
+
+
+def dummy_launches(ranks: Iterable[list[dict]]) -> dict[int, float]:
+    """Per step, when the last DP dummy forward of `ranks`, one run's rank
+    records as their lines, ended its model launch (`t_launch_ns`) on the
+    host clock the ranks share; infinite for one that stamped none."""
+    ends: dict[int, float] = {}
+    for lines in ranks:
+        for s in lines:
+            if s["is_dummy_run"]:
+                end = s["t_launch_ns"][1] if "t_launch_ns" in s else math.inf
+                ends[s["step"]] = max(end, ends.get(s["step"], end))
+    return ends
+
+
+def gate_cut(line: dict, launches: dict[int, float]) -> str | None:
+    """Why a gated record's prefill `line` takes no label from its window
+    (`GATE_CUTS`), or None. `launches` is `dummy_launches` of its run: each
+    dummy beside it must have queued the collectives they share before the
+    host here began its draft copy wait, or left a forward without one, while
+    F was still pending."""
+    if not line.get("qualified"):
+        return "unqualified"
+    wait = line.get("t_draft_recv_ns", (line["t_exit_ns"],))[0]
+    return "late_dummy" if launches.get(line["step"], -math.inf) >= wait else None
 
 
 def _peers(path: Path) -> list[Path]:
@@ -491,7 +532,8 @@ def label(
     the rank records beside it.
     """
     lines = _read(record)
-    return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None, None)
+    starts = [_pull(s) for s in lines]
+    return _label(record, lines, run, starts, split_rule, None, None, None)
 
 
 def label_run(
@@ -512,19 +554,19 @@ def label_run(
         )
     n = max(map(len, ranks), default=0)
     starts = [max(_pull(x[i]) for x in ranks if i < len(x)) for i in range(n)]
-    dummy_ranks, peaks = group_dummies(ranks), group_peaks(ranks)
+    group = group_dummies(ranks), group_peaks(ranks), dummy_launches(ranks)
     return [
         (
             ([], [])
             if x and all(s["is_dummy_run"] for s in x)
-            else _label(r, x, run, starts, split_rule, dummy_ranks, peaks)
+            else _label(r, x, run, starts, split_rule, *group)
         )
         for r, x in zip(records, ranks)
     ]
 
 
 def _label(
-    record, lines, run, starts, split_rule, dummy_ranks, peaks
+    record, lines, run, starts, split_rule, dummy_ranks, peaks, launches
 ) -> tuple[list[Sample], list[dict]]:
     """`label` of `record`'s `lines`, each `E` from `starts` at the line before."""
     path = Path(record)
@@ -540,6 +582,7 @@ def _label(
             "by its device time"
         )
     (exposed, early), traced = _host_cut(lines), _traced(path)
+    gated = any("gated" in s for s in lines)
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     key = path.with_suffix(".key.json")
@@ -557,6 +600,7 @@ def _label(
         if dp and dummy_ranks is None:
             peers = [read_jsonl(p) for p in _peers(path)]
             dummy_ranks, peaks = group_dummies(peers), group_peaks(peers)
+            launches = dummy_launches(peers)
         if dp and tokens is None:
             if ranks is None:
                 ranks = [{t["step"]: t for t in read_jsonl(p)} for p in _peers(path)]
@@ -587,13 +631,16 @@ def _label(
             group_needs_eager=s.get("group_needs_eager", False),
         )
         cut = None
+        held = gate_cut(s, launches or {}) if gated and view.prefill else None
         if view.prefill and view.decode:
             cut = "mixed"
         elif not view.prefill and s["step"] in exposed:
             cut = "exposed"
         elif not view.prefill and traced:
             cut = "traced"
-        elif view.prefill and "b_target_ns" not in s:
+        elif held:
+            cut = held
+        elif view.prefill and not gated and "b_target_ns" not in s:
             cut = "untraced"
         elif mtp and "d_target_ns" not in s:
             cut = "unsplit"
@@ -609,7 +656,9 @@ def _label(
                 target += draft_kv or 0
             device = None if cut else target * 1e-9
             draft = (s["d_busy_ns"] - target) * 1e-9
-        if view.prefill and not cut:  # a trace run's busy time
+        if view.prefill and gated:  # its window: the target pass alone
+            draft = None
+        elif view.prefill and not cut:  # a trace run's busy time
             target, draft = s["b_target_ns"], s.get("b_draft_ns")
             draft_kv = s.get("b_draft_kv_ns") if view.produces_output else None
             target += draft_kv or 0
@@ -637,7 +686,7 @@ def _label(
         idle = prev is not None and not busy[i]
         if prev is not None and not idle:
             host["E"] = enter - starts[i - 1]
-        host = {} if traced else {k: v * 1e-9 for k, v in host.items()}
+        host = {} if traced or gated else {k: v * 1e-9 for k, v in host.items()}
         provenance = {
             "source": "record",
             "run": run,

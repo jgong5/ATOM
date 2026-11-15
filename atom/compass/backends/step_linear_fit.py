@@ -293,7 +293,7 @@ def _features(
     for s in samples:
         view = s.view
         if s.cut:
-            cut[s.cut] += 1
+            cut[s.cut] = cut.get(s.cut, 0) + 1
         else:
             tokens = None
             if view.prefill:
@@ -1400,16 +1400,20 @@ def _groups(
     smallest rank label, a rank that ran the step as a dummy forward holding
     none; what was cut; and each step's rank label spread. With `steps`, only
     the steps numbered in it; `serial`, `routing` and `buckets` as
-    `_features` reads them;
+    `_features` reads them, and `draft` too, or where any of the run's samples
+    has a draft label, so a prefill without one, a gated record's, counts the
+    same columns;
     `dummies`, each rank's steps run as dummy forwards, read from its samples
     when None: a rank that gave no sample needs them given."""
     if dummies is None:
         dummies = [rank[0].dummies for rank in run]
+    draft = draft or any(s.draft_s is not None for rank in run for s in rank)
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
     got = [
         _features(rank, form, len(run), draft, serial, routing, buckets) for rank in run
     ]
-    cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
+    names = dict.fromkeys(k for _, c in got for k in c)
+    cut = {k: sum(c.get(k, 0) for _, c in got) for k in names}
     if len(run) == 1:
         return [{0: r} for r in got[0][0]], cut, []
     ranks = [{r[3]: r for r in rows} for rows, _ in got]

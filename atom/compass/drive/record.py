@@ -2,7 +2,7 @@
 """`compass record`: one instance's real server, with its step record, serving
 whatever client runs reach it until it is stopped.
 
-    compass record --gpu G [--host H] [--store S] [--sweep] [--trace] --out DIR -- <ATOM args>
+    compass record --gpu G [--host H] [--store S] [--sweep] [--trace | --gate S] --out DIR -- <ATOM args>
 
 `serve` starts the server on the GPUs `--gpu` names with the step record on,
 bound to `--host`, 127.0.0.1 unless named, an address a router on another node
@@ -37,6 +37,14 @@ that labels its prefill passes: the server runs ATOM's profiler on every rank
 from before the first request to its stop (`serve`), and the record gets its
 busy lines (`parity.busy`) before its cost lines. A run under DP or pipeline
 stages refuses it before its server starts.
+
+`--gate S` makes it a gated record, which labels a DP run's prefill passes
+from their own windows: each worker runs every forward holding prefill tokens
+behind about S seconds of spin, and states on its line whether the forward
+qualified (`parity.GATE`, `step_labels`). Its server's environment and run.json's
+``env`` hold the gate in nanoseconds. A run of no DP ranks, of a DP rank over
+more than one worker, or of pipeline stages refuses it before its server starts,
+as does an S of 0 or less.
 
 The server's environment holds `AUTOTUNE_CACHE` as the command's does, 1 when
 the command's has none, and ``TRITON_CACHE_DIR`` as the command's does, or the
@@ -81,7 +89,7 @@ from atom.compass.drive import aiter_jit, runfile, serve
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.compass.drive.identity import PTL_CHANGES, ptl_changes
 from atom.compass.drive.sweep import pacing
-from atom.compass.parity import busy
+from atom.compass.parity import GATE, busy
 from atom.compass.run import _write_whole
 
 PROG = "compass record"
@@ -111,6 +119,9 @@ def main(argv: list[str]) -> None:
         AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1"),
         "TRITON_CACHE_DIR": knobs.cache.dir,
     }
+    if args.gate is not None:
+        refuse_gate(atom_args, args.gate)
+        env[GATE] = str(round(args.gate * 1e9))
     if args.sweep:
         env |= pacing(atom_args)
     # serve writes server.json when /health first answers, so its mtime is
@@ -150,6 +161,25 @@ def refuse_trace(atom_args) -> None:
         )
 
 
+def refuse_gate(atom_args, seconds: float) -> None:
+    """Refuse a gate of `seconds` on ATOM's arguments `atom_args` that run no
+    DP ranks, a DP rank over more than one worker, or pipeline stages: each DP
+    rank's one worker gates its own forwards."""
+    if seconds <= 0:
+        raise ValueError(f"--gate {seconds}: a gate runs behind a preload above 0 s")
+    engine = runfile._engine_args(atom_args)
+    workers = 1 if engine.enable_dp_attention else engine.tensor_parallel_size
+    if (
+        runfile._dp_width(atom_args) < 2
+        or workers > 1
+        or engine.pipeline_parallel_size > 1
+    ):
+        raise ValueError(
+            "--gate gates each DP rank's one worker, and ATOM's arguments run no "
+            "DP ranks, a DP rank over more than one worker or pipeline stages"
+        )
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n\n")[0])
     add_gpu_flag(p)
@@ -169,6 +199,13 @@ def _parser() -> argparse.ArgumentParser:
         "--trace",
         action="store_true",
         help="a trace run: profile the ranks and reduce its prefill busy time",
+    )
+    p.add_argument(
+        "--gate",
+        type=float,
+        metavar="S",
+        help="a gated record: each DP forward holding prefill tokens runs behind "
+        "S seconds of spin",
     )
     p.add_argument("--profile-ops", action="store_true", help="refused: ops half")
     p.add_argument("--profile-steps", metavar="A:B", help="refused: ops half")

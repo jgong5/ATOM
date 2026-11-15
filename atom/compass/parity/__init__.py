@@ -60,6 +60,16 @@ runner records from `NonAllocatingRunner.forward`; a real one records through
 `StepRecording`, composed into `RUNNER`, which the frontend names on a real run
 with the variable set.
 
+With `GATE` set too, to a number of nanoseconds, a real record is gated: each
+forward holding prefill tokens, a DP dummy's aside, first queues a spin kernel
+about that long on the worker's stream (its runner's `preload`), then records
+event F there, and the forward runs behind it. Every line of a gated record
+states `gated`, true on such a forward, whose line also states `qualified`:
+whether F was still pending when the host began its draft copy wait, or, on a
+forward without one, once it returned. The device was then still in the spin,
+behind everything the host had queued, so the forward's window holds no time
+the host paced (`step_labels`).
+
 A request is named by its key, because request ids are numbered per run: a
 digest of its whole prompt as its prefill windows carry it, taken when its final
 chunk is scheduled, so it does not move with chunking. A line records request
@@ -99,6 +109,9 @@ from atom.compass.backends.launch_features import GRAPHS, architecture, provider
 from atom.compass.backends.step_labels import DRAFT_PASSES, join_stamps
 
 ENV = "ATOM_COMPASS_PARITY_RECORD"
+#: The variable gating a real record's forwards that hold prefill tokens: the
+#: nanoseconds of spin each one runs behind.
+GATE = "ATOM_COMPASS_PARITY_GATE"
 #: The file in a real run's record directory holding when its workload was sent
 #: and when the server admitted each request.
 ARRIVALS = "arrivals.json"
@@ -136,15 +149,22 @@ TIMESTAMPS = (
 #: the range named `MARK` and its line field.
 MARK = "compass::"
 TARGET_DONE = MARK + "target_done"
+#: A gated record's line keys, which say how its window was timed, not what
+#: the step decided.
+GATED = ("gated", "qualified")
 #: The stamps the blocking-call tool's sums are read at: a line's `blocked_ns`
 #: runs from the launch's entry to the token copy wait's, as `W_launch` does.
 BLOCKED_AT = ("t_launch_ns", "t_recv_ns")
 
 
 class StepRecord:
-    """One DP rank's record: a JSON line per forward call."""
+    """One DP rank's record: a JSON line per forward call; with `gate`, the
+    preload's nanoseconds, a gated one."""
 
-    def __init__(self, directory, dp_rank: int, stage: int = 0) -> None:
+    def __init__(
+        self, directory, dp_rank: int, stage: int = 0, gate: int | None = None
+    ) -> None:
+        self.gate = gate
         name = f"pp{stage}.dp{dp_rank}" if stage else f"dp{dp_rank}"
         self.path = pathlib.Path(directory) / f"{name}.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -204,7 +224,11 @@ class StepRecord:
         rewrites batch fields in place, and written after it returns, with `t_enter_ns`
         and `t_exit_ns` read off `runner.step_clock_ns()` around it and
         `runner.step_stamps()` added; a line with a device window waits in
-        `pending` until the window closes, then in `lines` until `write`. Returns `forward`'s reply, or
+        `pending` until the window closes, then in `lines` until `write`. Under
+        `gate`, a forward of a batch holding prefill tokens, not a dummy, runs
+        after `runner.preload(gate)` and F, `runner.device_event()`, and its
+        line states `gated` true and `qualified`; every other line `gated`
+        false. Returns `forward`'s reply, or
         without one the mode the view was built from and the view, so a caller
         pricing the step need not run the collective or build the view again.
         """
@@ -283,11 +307,24 @@ class StepRecord:
             line["kv"], self.kv = tuple(self.kv), []
         reply, window, mode = None, None, None
         if forward is not None:
+            gated = self.gate is not None and not batch.is_dummy_run
+            gated = gated and batch.total_tokens_num_prefill > 0
             line["t_enter_ns"] = runner.step_clock_ns()
+            if gated:
+                runner.preload(self.gate)
+                runner._gate_event = runner.device_event()
             reply = forward(batch)
             line["t_exit_ns"] = runner.step_clock_ns()
             stamps, window = runner.step_stamps()
             mode = stamps.pop("forward_mode", None)
+            pending = stamps.pop("gate_pending", None)
+            if self.gate is not None:
+                line["gated"] = gated
+            if gated:
+                # Read after the exit's stamp: pending now, pending then.
+                if pending is None:
+                    pending = not runner._gate_event.query()
+                line["qualified"], runner._gate_event = pending, None
             line.update(stamps)
         mode = mode or forward_mode(before, runner)
         view = batch_view(before, mode, runner)
@@ -386,7 +423,10 @@ def _record(runner):
             pc = runner.config.parallel_config
             pp = runner.config.pipeline_parallel_size > 1
             stage = pc.pipeline_parallel_rank if pp else 0
-            record = StepRecord(directory, pc.data_parallel_rank, stage)
+            gate = int(os.environ[GATE]) if os.environ.get(GATE) else None
+            record = StepRecord(directory, pc.data_parallel_rank, stage, gate)
+            if gate is not None:
+                runner.calibrate_preload()
             # By its first step the runner has resolved its engine.
             engine = keyed(runner.config) | {
                 name: getattr(runner.config, name) for name in UNKEYED
@@ -486,7 +526,9 @@ class StepRecording:
     batch, which the simulated runner declines, so recording starts once
     construction returns. The class it is composed into supplies
     `step_clock_ns`, the clock its lines are timed by, and `device_event`,
-    which records a timing event on the current stream and returns it.
+    which records a timing event on the current stream and returns it, and,
+    for a gated record, `calibrate_preload()`, run once before its first
+    forward, and `preload(ns)`, which queues about `ns` of device work.
 
     A recorded forward is also stamped inside: around `_gate_staging_reuse`,
     `run_model` and the instance's `tokenID_processor.recv_async_output`, with
@@ -499,10 +541,13 @@ class StepRecording:
     launch provider that declares features is installed once built, and its
     `observe` is the line's `launch`. The class it is composed into may set
     `_blocked` to the blocking-call tool (`blocked.loaded`) for `blocked_ns`.
+    On a gated forward the record keeps F in `_gate_event`, and the draft copy
+    wait's stamp states whether it was still pending as the wait began.
     """
 
     _recording = False
     _blocked = None
+    _gate_event = None
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -587,6 +632,9 @@ class StepRecording:
             return call(*args)
         tool = self._blocked if key in BLOCKED_AT else None
         enter = self.step_clock_ns()
+        if key == "t_draft_recv_ns" and self._gate_event is not None:
+            # Read after the stamp: pending now, pending as the wait began.
+            self._stamps.setdefault("gate_pending", not self._gate_event.query())
         before = None if tool is None else tool()
         reply = call(*args)
         self._stamps[key] = (enter, self.step_clock_ns())
@@ -798,16 +846,17 @@ def compare(real, simulated, stage: int = 0) -> dict:
     both steps, None for a record that has already ended. A record with no
     steps is refused: two runs that scheduled nothing agree, and that means
     nothing. Steps are compared and reported without timestamps, request
-    or response ids or a real line's `launch`. Under `steps`, each rank's count of step pairs compared
+    or response ids, a real line's `launch` or its gate's keys. Under `steps`, each rank's count of step pairs compared
     and of identical ones.
     """
     records = {"real": read(real, stage), "simulated": read(simulated, stage)}
+    left_out = (*TIMESTAMPS, *GATED, "request_ids", "response_ids", "launch")
     for name, record in records.items():
         if not any(record.values()):
             raise ValueError(f"the {name} record has no steps to compare.")
         for steps in record.values():
             for step in steps:
-                for key in (*TIMESTAMPS, "request_ids", "response_ids", "launch"):
+                for key in left_out:
                     step.pop(key, None)
     first, counts = {}, {}
     for rank in sorted(records["real"].keys() | records["simulated"].keys()):
