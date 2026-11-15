@@ -117,6 +117,8 @@ real-run command. Copy its server command into blocks by these rules.
   takes into its `prefill` or `decode` block.
 - **A variant that adds to another**, as the single-node recipe's LMCache variant
   adds variables to the DP attention one, is written whole in its own value.
+- **Every other argument and variable** of the server command is kept as the
+  recipe gives it; only the next two sections take any out or change one.
 
 ### What a space file leaves out
 
@@ -144,20 +146,22 @@ variables (`client.sh` runs it from `workload`), an LMCache server's (a simulate
 run serves Compass's own in its place), a variable ATOM does not read that the
 recipe sets only to build another value, as `NODE_IP` builds `ATOM_HOST_IP` and
 `--kv-transfer-config`, and the Mooncake variables the README's 1P1D deployment
-gives a real side. Keep the variables that point the server at LMCache, such as
-`ATOM_KV_OFFLOAD`.
+gives a real side. Keep each variable the recipe gives the server for LMCache,
+such as `ATOM_KV_OFFLOAD` and its `ATOM_KV_OFFLOAD_EXTRA_CONFIG`, as it gives it.
 
 ### What the user decides
 
 Some values no recipe gives: one value where the recipe varies it with the
 concurrency, a switch turned the other way, a memory fraction the target needs.
 Take each from the user, write it in its block, and give it a departure with the
-user's reason. A departure is keyed by the argument in either spelling, `--no-x`
-and `--x` being one, and sits in `common` or a value's block, never a side's: a
-value that differs by side states each side's in one reason. Without the user's
-value, keep the recipe's and the decision open: an agent asks, and never picks
-one. A configuration that does not start on the target, such as one out of
-memory, comes back from step 2 refused, with the start's error.
+user's reason. A departure is keyed by the argument in either spelling, `--a_b`
+or `--a-b`, `--no-x` and `--x` being one. It sits in the block of each candidate
+whose recipe it departs from, even when the value sits in `common`, as S1's
+`--max-num-seqs` does below, and never in a side's: a value that differs by side
+states each side's in one reason. Without the user's value, keep the recipe's
+and the decision open: an agent asks, and never picks one. A configuration that
+does not start on the target, such as one out of memory, comes back from step 2
+refused, with the start's error.
 
 ### Example: S1 from its recipe
 
