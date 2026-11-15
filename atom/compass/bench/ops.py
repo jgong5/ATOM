@@ -1133,7 +1133,7 @@ class Stub:
         }
         # on its FP4 plane, by the index blocks a page holds (a scorer's plan's
         # `pages_per_block`) and the rows its block table's columns hold (the
-        # plane a packed top-k's rows stand for, its `plane_width`)
+        # plane a whole context's top-k ranks)
         if getattr(geometry, "index_fp4", False):
             cols = getattr(builder, "block_table_cols", 0)
             self.pages |= {
@@ -2316,12 +2316,13 @@ def _ratio(op, path, known=None):
     `ratios` (DeepSeek-V4.1's indptr scan, a table a ratio); else the ratio
     `known` gives the rows a page holds at it (`rows_per_page`, V4.1's index
     build, 0 when it takes no selection), the index blocks its plan's page
-    holds (`pages_per_block`, V4.1's FP4 scorer), the plane its packed rows
-    stand for (`plane_width`, a top-k of them) or the width of the logits it
-    reads (`stride0`, V4.1's top-k, its scorer's), or, in a graph captured
-    before V4.1's key RoPE stated its ratio, a RoPE's positions the rows its
-    compress plan holds (`compressed`), or aten's index its table its model's
-    last layer's (`queries`), where a replay's queries take their pointers."""
+    holds (`pages_per_block`, V4.1's FP4 scorer), the plane its rows stand
+    for (an FP4 top-k's: `plane_width` packed, else its logits' `stride0`) or
+    the width of the logits it reads (`stride0`, V4.1's top-k, its scorer's),
+    or, in a graph captured before V4.1's key RoPE stated its ratio, a RoPE's
+    positions the rows its compress plan holds (`compressed`), or aten's index
+    its table its model's last layer's (`queries`), where a replay's queries
+    take their pointers."""
     args, (slot, *rest) = op["args"], path.split(".")
     listed = args.get("ratios")
     if rest and isinstance(args.get(slot), list) and isinstance(listed, list):
@@ -2335,7 +2336,8 @@ def _ratio(op, path, known=None):
         blocks = dict(plan.get("state") or ()).get("pages_per_block")
         ratio = known.get(("pages_per_block", blocks))
     if ratio is None and known and "plane_width" in args:
-        ratio = known.get(("plane_width", args["plane_width"]))
+        width = args["plane_width"] or args.get("stride0")
+        ratio = known.get(("plane_width", width))
     if ratio is None and known and "stride0" in args:
         ratio = known.get(("stride0", args["stride0"]))
     if ratio is None and known and (op["op"], path) == (_ROPE, "positions"):

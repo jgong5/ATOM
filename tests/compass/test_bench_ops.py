@@ -896,15 +896,17 @@ def test_v41_fp4_whole_context_leaves_take_their_ratio_s_bounds_and_packed_start
             ("out_offsets", rows),
         )
 
-    def top_k(width):  # its rows packed, standing for a plane that wide
+    def top_k(width, packed=True):  # its rows standing for a plane that wide
         return _leaf(
             ops._TOPK,
-            ("logits", _t([2, 128], "metadata", [0, 1])),
-            *[("row_starts", rows), ("row_ends", rows), ("stride0", 0)],
-            *[("plane_width", width), ("packed_rows", True)],
+            ("logits", _t([2, 128] if packed else [2, width], "metadata")),
+            *[("row_starts", rows), ("row_ends", rows)],
+            ("stride0", 0 if packed else width),
+            *[("plane_width", width if packed else None), ("packed_rows", packed)],
         )
 
-    leaves = scorer(2), top_k(32), scorer(4), top_k(64)
+    # each ratio's scorer and top-k, packed, and ratio 2's on rows of their own
+    leaves = scorer(2), top_k(32), scorer(4), top_k(64), top_k(32, packed=False)
     found = ops.leaves(_graph(*leaves, layers=1)["region"])
     placed = SimpleNamespace(block_size=32, batch=lambda *a: a[1:])
     got = ops.Stub(runner, 10_000).point(placed, decode(2), 64, found)
@@ -918,6 +920,7 @@ def test_v41_fp4_whole_context_leaves_take_their_ratio_s_bounds_and_packed_start
         {"row_starts": starts(2), "row_ends": "step.visible.2"},
         {"row_ends": "step.visible.1", "out_offsets": starts(1)},
         {"row_starts": starts(1), "row_ends": "step.visible.1"},
+        {"row_starts": "step.visible.2", "row_ends": "step.visible.2"},
     ]
 
 
