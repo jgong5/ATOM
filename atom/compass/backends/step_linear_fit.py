@@ -165,9 +165,11 @@ the law states `moe_routing` and, outside `shared`, a decode rung may adopt one
 MoE column (`StepLinearLaw`), `moe_tokens` or `moe_experts`, by the rule
 `_moe_column` states; the vector records under `fit.moe_column` the figures the
 rule read.
-An MTP record's draft law adopts none at `data_parallel_size` 1; above it, its
-decode rungs adopt one by the same rule, as a drafter's routed experts run on
-its group's rows in the arm's layout, as the target's do.
+An MTP record's draft law adopts none at `data_parallel_size` 1; above it,
+given the drafter's own routed experts and top-k (`compass fit steps --model`
+reads a block drafter's), its decode rungs adopt one by the same rule, as a
+drafter's routed experts run on its group's rows in the arm's layout, as the
+target's do.
 
 Outside `shared`, a decode rung may adopt a `rowmod(k)` column (`StepLinearLaw`),
 read from its rows in scheduled order, by the rule `_rowmod` states; the
@@ -1491,7 +1493,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     `options` takes `form` (`base` by default), `dp`, the ranks each run
     holds (1 by default), `moe_routing`, the model's (routed experts,
     top-k), under which each decode rung but the draft law's may adopt a MoE
-    column (`_moe_column`), and `buckets`, the records' prefill token-graph
+    column (`_moe_column`), `draft_moe_routing`, the drafter's, under which
+    above `dp` 1 the draft law's may (`_draft_options`), and `buckets`, the records' prefill token-graph
     buckets, under which the prefill vector adds `padding`; `seed` fixes the
     `rowmod` shuffles; `draft`, or a sample with a draft label, adds `seqs` and
     `out` to the prefill vector.
@@ -1687,13 +1690,15 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
 
 def _draft_options(options, serial: bool) -> dict:
     """`options` for the draft law, which adds no padding, and adopts no MoE
-    column at `dp` 1; above it, its decode rungs pick one as the target's do.
+    column at `dp` 1; above it, over `draft_moe_routing`, the drafter's own
+    routed experts and top-k where `options` state them, its decode rungs pick
+    one as the target's do.
     Under an EAGLE3 drafter whose records time its passes, the `base` form: its
     prefill vector fits the middle chunks alone, each one request's chunk at
     the step's token budget, whose `history` is its `query_cached` over it."""
-    drafted = {**(options or {}), "buckets": None}
-    if _options(options)[1] == 1:
-        drafted["moe_routing"] = None
+    dp, options = _options(options)[1], options or {}
+    routing = options.get("draft_moe_routing") if dp > 1 else None
+    drafted = {**options, "moe_routing": routing, "buckets": None}
     return {**drafted, "form": "base"} if serial else drafted
 
 
@@ -2368,6 +2373,7 @@ def figures_main(argv) -> None:
     if runs is None:
         raise ValueError(f"{args.law} states no runs to hold the records to")
     samples, _, options, _ = _labelled(args)
+    options["draft_moe_routing"] = _law_routing(law.get("draft", {}))
     given = {s.provenance["run"] for s in samples}
     if differ := sorted(given ^ set(runs)):
         raise ValueError(

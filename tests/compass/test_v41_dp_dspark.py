@@ -13,12 +13,16 @@ forwards. The fitted law is read by `StepLinearLaw` and priced by
 """
 
 import dataclasses
+import hashlib
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from test_backend_step_linear_fit import _record, traced
 
+from atom.compass.artifacts import machine_platform
 from atom.compass.backends import (
     BatchView,
     RequestShape,
@@ -27,12 +31,18 @@ from atom.compass.backends import (
 )
 from atom.compass.backends.step_linear_fit import fit, label_records, mark_held_out
 from atom.compass.backends.work import activated_experts
+from atom.compass.fit import steps
+from atom.compass.spec import MachineSpec
 from atom.compass.validate.cost import cost_accuracy
 
+TREE = Path(__file__).resolve().parents[2]
+#: `deepseek-ai/DeepSeek-V4.1-Flash`'s config.json: the target routes each row
+#: to 6 of 384 experts, its DSpark drafter to 3 of its own 128.
+CONFIG = TREE / "tests/models/deepseek_v41/fixtures/config.json"
 DP, RUNG, K = 2, 4, 5
-ROUTING = (64, 4)
-#: Each rank's target decode at rung 4, and its block draft's, both over the
-#: experts the group's real tokens reach.
+ROUTING, DRAFT_ROUTING = (384, 6), (128, 3)
+#: Each rank's target decode at rung 4, and its block draft's, each over the
+#: experts of its own routing the group's real tokens reach.
 TARGET = {"step": 8e-3, "context": 2e-9, "graph_padding": 1e-10, "moe_experts": 6e-5}
 DRAFT = {"step": 7e-4, "context": 3e-10, "graph_padding": 0.0, "moe_experts": 2e-5}
 #: Each rank's draft-KV pass on a decode, and its propose pass on an output
@@ -49,16 +59,21 @@ PREFILL = {
 }
 DRAFT_PREFILL = {"step": 4e-5, "tokens": 2e-8, "seqs": 2.5e-5}
 FULL, HALF, SPARSE = (3, 5), (2, 4), (1, 3)
-OPTIONS = {"form": "base", "dp": DP, "moe_routing": ROUTING}
+OPTIONS = {
+    "form": "base",
+    "dp": DP,
+    "moe_routing": ROUTING,
+    "draft_moe_routing": DRAFT_ROUTING,
+}
 
 
-def _decode(view: BatchView, law: dict) -> float:
+def _decode(view: BatchView, law: dict, routing=ROUTING) -> float:
     reached = view.moe_tokens - max(view.group_dummies - 1, 0)
     return (
         law["step"]
         + law["context"] * sum(r.context_tokens for r in view.decode)
         + law["graph_padding"] * view.graph_padding
-        + law["moe_experts"] * activated_experts(*ROUTING, reached)
+        + law["moe_experts"] * activated_experts(*routing, reached)
     )
 
 
@@ -140,7 +155,10 @@ def _groups(seed, n, others):
                 for r, mine in enumerate(contexts)
             ]
             parts = [
-                {"target": _decode(v, TARGET), "draft": _decode(v, DRAFT)}
+                {
+                    "target": _decode(v, TARGET),
+                    "draft": _decode(v, DRAFT, DRAFT_ROUTING),
+                }
                 | ({} if v.dp_dummy else {"kv": _seqs(v, DRAFT_KV)})
                 for v in views
             ]
@@ -228,11 +246,12 @@ def _priced(law, views):
 
 def test_each_draft_vector_is_fitted_as_a_dp_vector_on_each_rank_s_rows(fitted):
     """The draft law's decode rung adopts the experts its block draft reaches,
-    as the target's does, and `propose` and `draft_kv` recover each rank's
-    law from labels each the group's: the max over its ranks."""
+    over the drafter's own routing, as the target's does over its, and
+    `propose` and `draft_kv` recover each rank's law from labels each the
+    group's: the max over its ranks."""
     law, _, _, _ = fitted
     draft = law["draft"]
-    assert draft["moe_routing"] == {"experts": ROUTING[0], "top_k": ROUTING[1]}
+    assert draft["moe_routing"] == {"experts": 128, "top_k": 3}
     for vector, expected in (
         (law["decode"]["4"], TARGET),
         (draft["decode"]["4"], DRAFT),
@@ -309,3 +328,30 @@ def test_the_draft_law_s_vectors_are_held_out_by_run(fitted):
     graded = cost_accuracy(root / "held", law)["validated"]
     for kind in ("prefill", "decode", "draft"):
         assert graded[kind]["on_totals"] == pytest.approx(0.0, abs=1e-5), kind
+
+
+def test_fit_steps_takes_the_drafter_s_routing_from_the_served_model(fitted, tmp_path):
+    """`compass fit steps --model` reads V4.1-Flash's target and DSpark routing
+    off its config.json, and the draft law fitted at DP 2 states the
+    drafter's."""
+    _, _, samples, _ = fitted
+    # `compass fit steps` labels each sample with the traces its client served.
+    samples = [
+        dataclasses.replace(s, provenance={**s.provenance, "traces": []})
+        for s in samples
+    ]
+    (tmp_path / "config.json").write_bytes(CONFIG.read_bytes())
+    digest = "sha256:" + hashlib.sha256(CONFIG.read_bytes()).hexdigest()
+    document = json.loads(
+        (TREE / "tests/compass/machines/mi308x-hjbog39.json").read_text()
+    )
+    config = {
+        "engine_config": {"data_parallel_size": DP},
+        "model": digest,
+        "platform": machine_platform(MachineSpec.from_mapping(document)),
+    }
+    args = SimpleNamespace(form="base", seed=0, moe_routing=None, model=str(tmp_path))
+    law = steps._step_linear(samples, config, args)[1]
+    assert law["moe_routing"] == {"experts": 384, "top_k": 6}
+    assert law["draft"]["moe_routing"] == {"experts": 128, "top_k": 3}
+    assert law["draft"]["decode"]["4"]["fit"]["moe_column"]["adopted"] == "moe_experts"
