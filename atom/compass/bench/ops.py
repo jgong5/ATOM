@@ -37,10 +37,12 @@ metadata and forward context; for DeepSeek-V4, the CSA top-k section its
 forward writes is written from ids spread over each token's compressed rows
 (`Stub._top_k`); for DeepSeek-V4.1's index planes, each table an earlier
 leaf of its forward writes (`_WRITTEN`) is written for the reading leaf's pass
-as that leaf writes it (`Stub._index`), and the FP8 logits plane its scorer
+as that leaf writes it (`Stub._index`), and the logits plane its scorer
 writes, which a top-k or the pick's block maxima ranks (`PAGE_WIDE`), is
 each copy's own, drawn for a top-k or block maxima as an activation is,
-below each row's bound (`_scores`); its sparse attention's index lists are
+below each row's bound (`_scores`), on FP4 a packed row from its start,
+as the FP4 block maxima's own are each copy's own (`PACKED_ROWS`); its
+sparse attention's index lists are
 those its index build writes for the leaf's pass, off a selection spread over
 each row's visible rows (`Stub._lists`). A `Stub` calls each leaf from its
 contract: a tensor the capture states on the host is built there on every
@@ -115,7 +117,7 @@ window and compress ratio, the plane rows the batch's blocks hold at that
 ratio, a pointer table's (`_CACHE`) its entries, a view operator's none, a
 RoPE table's (`TABLES`), a weight or a tensor of a module it names, a row a
 position its call takes, else a token, a table a leaf gathers by token ids
-(`GATHERED`) as many rows as its ids, V4.1's FP8 index plane (`Stub._plane`)
+(`GATHERED`) as many rows as its ids, V4.1's index plane (`Stub._plane`)
 the columns below its rows' bounds, aiter's top-k scratch (`TOPK_WORKSPACE`)
 the bytes it launches with, but none of the multi-block path's one cached
 buffer, which every copy launches and the point's footprint counts once, the
@@ -293,7 +295,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 35
+PROTOCOL = 37
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -575,6 +577,17 @@ PAGE_WIDE = {
     _PICK: ("seqLens", "logits", "stride0"),
     _MAXIMA: ("visible", "logits", "maxima", "blocks"),
     f"{_V41}.unit_table:unit_table": ("block_tables", "block_tables"),
+}
+#: DeepSeek-V4.1's index planes by operator and slot, its FP4 scorer's and
+#: its FP4 block maxima's own among them, where its rows may be packed in one
+#: flat run, each at a start of its own (`ScoreWorkspace.pack`): the slot of
+#: its row bounds, of their starts, and of a block's rows where bounds count
+#: blocks.
+PACKED_ROWS = {
+    (_FP4, "out"): ("row_ends", "out_offsets", None),
+    (_TOPK, "logits"): ("row_ends", "row_starts", None),
+    (_MAXIMA, "logits"): ("visible", "packed.0", None),
+    (_MAXIMA, "maxima"): ("visible", "packed.1", "block_size"),
 }
 #: The arches on which aiter's decode top-k (`top_k_per_row_decode`) runs
 #: FlyDSL's one-block kernel (`_TOPK`) for every call its signature check
@@ -1777,14 +1790,27 @@ class Stub:
         return min(CALLS, COLD * self.llc // size + 1) if size else 1
 
     def _plane(self, op, sig, path):
-        """V4.1's FP8 index plane at `op`'s `path` (`PAGE_WIDE`), or None: the
+        """V4.1's index plane at `op`'s `path` (`_bounds`), or None: the
         columns below its rows' bounds, all where none is bound, and its
-        copies' layout (`_stairs`)."""
-        bound, plane = PAGE_WIDE.get(op["op"], ("", ""))[:2]
-        spec = op["args"][path] if self.paged and path == plane else {}
-        if spec.get("role") != "metadata" or not plane.endswith("logits"):
+        copies' layout (`_stairs`); of packed rows, read from their starts,
+        a copy a band as long as its run to its last row's end, as many in one
+        buffer as pass `COLD` times the cache."""
+        bound, starts, block = _bounds(op, path)
+        spec = op["args"][path] if self.pages and bound else {}
+        if spec.get("role") != "metadata":
             return None  # nor the pick's top-k's, on block maxima, an activation
         ends = self.placed[0][1].get((sig, bound), ("", None))[1]
+        if starts:  # packed rows: a copy's run ends at its last row's end
+            at = self.placed[0][1].get((sig, starts), ("", None))[1]
+            if at is None or ends is None:  # unbound: the leaf refuses
+                return None
+            size, unit = _dtype(spec["dtype"]).itemsize, op["args"].get(block, 1)
+            span = _span(spec["shape"], spec["stride"])
+            reach = [-(-e // unit) for e in _reached(ends, span * unit)]
+            run = max(map(sum, zip(_reached(at, span), reach)), default=0)
+            cols = -(-run * size // WEIGHT_ALIGN) * WEIGHT_ALIGN // size
+            k = self._cold(sum(reach) * size)
+            return sum(reach), k, k, 0, cols, span + (k - 1) * cols
         (rows, width), size = spec["shape"], _dtype(spec["dtype"]).itemsize
         reach = [width] * rows if ends is None else _reached(ends, width)
         stride, span = spec["stride"][0], _span(spec["shape"], spec["stride"])
@@ -1975,22 +2001,23 @@ class Stub:
                 if c % op.get("occurrences", 1):  # a later one's own (`QUERIED`)
                     taken = self.later.get((p, sig, path), taken)
                 out = self._tensor(value, taken, fresh)
-                # V4.1's FP8 plane a top-k or block maxima ranks: ATOM's scorer
-                # writes it first, which here no leaf has, or a scorer timed
+                # V4.1's plane a top-k or block maxima ranks: an earlier leaf
+                # writes it first, which here no leaf has, or one timed
                 # before has, off its own random inputs. Placements share one
                 # clone of it, which ATOM's preparation leaves unchanged, so
                 # each copy draws on a plane of its own
                 if plane := self._plane(op, sig, path):  # a scorer's too
                     _, per, k, step, band, held = plane
                     b, i = divmod(c, per)
-                    if (sig, b) not in self.built:
-                        self.built[sig, b] = out.new_zeros(held)
-                    whole, at = self.built[sig, b], i // k * step + i % k * band
+                    if (sig, path, b) not in self.built:
+                        self.built[sig, path, b] = out.new_zeros(held)
+                    whole, at = self.built[sig, path, b], i // k * step + i % k * band
                     out = whole.as_strided(out.shape, out.stride(), at)
-                if self.paged and path == "logits" and value["role"] == "metadata":
-                    bound = PAGE_WIDE.get(op["op"], ("",))[0]
+                if plane and path == "logits":
+                    bound, starts, _ = _bounds(op, path)
                     if (ends := meta.get((sig, bound), ("", None))[1]) is not None:
-                        _scores(out, ends, value)
+                        first = meta.get((sig, starts), ("", None))[1]
+                        _scores(out, ends, value, first, band)
                 return out
             if isinstance(value, str) and value.startswith("torch."):
                 return getattr(torch, value[6:], value)
@@ -3188,11 +3215,36 @@ def _host(spec, pinned) -> torch.Tensor:
     return out.copy_(drawn)
 
 
-def _scores(plane, ends, spec) -> None:
+def _bounds(op, path) -> tuple:
+    """The slot of the row bounds of V4.1's index plane at `op`'s `path`
+    (`PAGE_WIDE`, `PACKED_ROWS`), "" where it holds none; and where its rows
+    are packed in one flat run, one dimension or rows 0 apart, the slots of
+    their starts and of a block's rows, else None."""
+    bound, plane = PAGE_WIDE.get(op["op"], ("", ""))[:2]
+    bound = bound if path == plane and plane.endswith("logits") else ""
+    bound, starts, block = PACKED_ROWS.get((op["op"], path), (bound, None, None))
+    spec = op["args"][path] if bound else {"shape": []}
+    flat = len(spec["shape"]) < 2 or not spec["stride"][0]
+    return (bound, starts, block) if flat else (bound, None, None)
+
+
+def _scores(plane, ends, spec, starts=None, run=0) -> None:
     """`plane`'s columns below each row's bound in `ends` drawn as an
-    activation of `spec` is (`_random`); the rest as they were."""
+    activation of `spec` is (`_random`), or of packed rows the first `run`
+    elements of its flat run from each row's start in `starts` up to its
+    bound; the rest as they were."""
+    if starts is not None:  # +1 where a row starts, -1 where it ends
+        run = min(run, _room(plane))  # an aligned run past a buffer's end
+        edges = torch.zeros(run + 1, dtype=torch.int32, device=plane.device)
+        for at, by in ((starts, 1), (starts + ends, -1)):
+            at = at.reshape(-1).long().clamp(0, run)
+            edges.index_add_(0, at, torch.full_like(at, by, dtype=torch.int32))
+        below = edges.cumsum(0, dtype=torch.int32)[None, :run] > 0
+        plane = plane.as_strided((1, run), (run, 1))
+        spec = {**spec, "shape": [1, run], "stride": [run, 1]}
+    else:
+        below = torch.arange(plane.shape[-1], device=plane.device) < ends.reshape(-1, 1)
     drawn = _random(spec, plane.device)
-    below = torch.arange(plane.shape[-1], device=plane.device) < ends.reshape(-1, 1)
     plane.copy_(torch.where(below, drawn, plane))
 
 
