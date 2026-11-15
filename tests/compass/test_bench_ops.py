@@ -924,7 +924,9 @@ def test_v41_fp4_whole_context_leaves_take_their_ratio_s_bounds_and_packed_start
     ]
 
 
-@pytest.mark.parametrize("top_k, slot", [(ops._MULTI, "seq_lens"), (ops._PICK, "seqLens")])
+@pytest.mark.parametrize(
+    "top_k, slot", [(ops._MULTI, "seq_lens"), (ops._PICK, "seqLens")]
+)
 def test_a_v41_top_k_s_staged_bounds_are_its_ratio_s_with_and_without_its_scorer(
     monkeypatch, top_k, slot
 ):
@@ -945,8 +947,9 @@ def test_a_v41_top_k_s_staged_bounds_are_its_ratio_s_with_and_without_its_scorer
         fctx._forward_context.attn_metadata.step = SimpleNamespace(visible=visible)
         return out
 
-    def stating(op, ratio=None):
-        return dataclasses.replace(op, stated=(("compress_ratio", ratio),) * bool(ratio))
+    def stating(op, ratio):
+        said = (("compress_ratio", ratio),) if ratio else ()
+        return dataclasses.replace(op, stated=said)
 
     def top(width, ratio=None):  # as aiter's decode top-k launches it
         plane = ("logits", _t([2, width], "metadata"))
