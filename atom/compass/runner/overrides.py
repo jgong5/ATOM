@@ -114,6 +114,7 @@ from torch.utils._device import _device_constructors
 
 from atom.compass.backends.base import CostBackend
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
+from atom.compass.memory.readings import PAGE_BOUND
 from atom.compass.runner.step_output import DeferredTokenStream, filler_token_ids
 
 logger = logging.getLogger(__name__)
@@ -619,21 +620,24 @@ def _resident(readings: DeviceReadings, config: Any) -> int:
     after the load. Its `persistent` is read at the KV budget, after the
     attention builder that asks this has allocated, so none of it is counted.
 
-    Refused under `--index-cache-dtype fp4`, where DeepSeek-V4.1 sizes its
-    packed score workspace by the PAGEs left after this; on the fp8 plane the
-    answer sizes nothing."""
-    if getattr(config, "index_cache_dtype", None) == "fp4":
+    Under `--index-cache-dtype fp4`, where DeepSeek-V4.1 sizes its packed score
+    workspace by the PAGEs left after this, it adds `readings.page_bound`, what
+    a real start holds there above its load, and is refused without it; on the
+    fp8 plane the answer sizes nothing."""
+    fp4 = getattr(config, "index_cache_dtype", None) == "fp4"
+    if fp4 and readings.page_bound is None:
         raise RunnerRefusal(
             "under --index-cache-dtype fp4 DeepSeek-V4.1 bounds its score "
             "workspace by the PAGEs `memory_allocated` leaves, and a simulated "
             "start reads only the weights, buffers and load residue there; a "
             "real start also holds the drafter, the forward buffers and the "
-            "attention builder's own, which no memory reading separates, so "
-            "the PAGE bound would exceed a real start's. Pass "
+            "attention builder's own, and the run's memory readings state no "
+            f"{PAGE_BOUND}; take them again with compass measure memory, or pass "
             "--index-cache-dtype fp8, whose workspace does not read it."
         )
     held = ("weights", "buffers", "load residue")
-    return sum(t.nbytes for t in readings.peak_torch.terms if t.name in held)
+    resident = sum(t.nbytes for t in readings.peak_torch.terms if t.name in held)
+    return resident + (readings.page_bound.nbytes if fp4 else 0)
 
 
 @contextlib.contextmanager
