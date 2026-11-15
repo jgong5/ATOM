@@ -121,10 +121,10 @@ def stubbed(tmp_path, monkeypatch):
     return r
 
 
-def advise(tmp_path, dimensions: dict, **machine) -> dict:
+def advise(tmp_path, dimensions: dict, out: str | None = None, **machine) -> dict:
     """`compass advice` on `dimensions`' candidates at concurrencies 1 and 4,
-    on the suite's platform, with each of `machine`'s fields given; the states
-    it writes."""
+    on the suite's platform, with each of `machine`'s fields given, into OUT
+    `out`, `tmp_path`'s ``out`` when None; the states it writes there."""
     flags = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
     machine = {k: v for k, v in machine.items() if v}
     space = {
@@ -141,8 +141,9 @@ def advise(tmp_path, dimensions: dict, **machine) -> dict:
         "dimensions": {"config": dimensions},
     }
     (tmp_path / "space.json").write_text(json.dumps(space))
-    cli.main(["advice", str(tmp_path / "space.json"), str(tmp_path / "out")])
-    return json.loads((tmp_path / "out" / check.STATES).read_text())
+    out = out or str(tmp_path / "out")
+    cli.main(["advice", str(tmp_path / "space.json"), out])
+    return json.loads((Path(out) / check.STATES).read_text())
 
 
 def starts(tmp_path) -> list[dict]:
@@ -311,8 +312,9 @@ def test_rerunning_after_an_input_lands_moves_only_what_it_serves_to_searchable(
     }
 
 
-def test_a_start_takes_the_store_holding_its_inputs_and_space_s_stack(
-    tmp_path, stubbed
+@pytest.mark.parametrize("given", ["whole", "relative"])
+def test_a_start_takes_out_whole_and_the_store_holding_its_inputs_and_space_s_stack(
+    tmp_path, stubbed, monkeypatch, given
 ):
     # Only the store a calibration of a writes into holds the readings.
     store, own = tmp_path / "store", tmp_path / "out/cal/a/store"
@@ -322,12 +324,15 @@ def test_a_start_takes_the_store_holding_its_inputs_and_space_s_stack(
     shutil.rmtree(store / Kind.MEMORY_READINGS.value)
     (entry,) = (own / Kind.PLATFORM_READINGS.value).glob("*/entry.json")
     stack = stack_of(json.loads(entry.read_text())["key"])
+    monkeypatch.chdir(tmp_path)
 
-    found = advise(tmp_path, {"a": {}}, stack=stack)
+    out = "out" if given == "relative" else None
+    found = advise(tmp_path, {"a": {}}, out=out, stack=stack)
 
     assert found["a"]["state"] == "searchable"
     (call,) = starts(tmp_path)
     argv = call["argv"]
+    assert argv[argv.index("--out") + 1] == str(tmp_path / "out/starts/a-c1")
     assert argv[argv.index("--store") + 1] == str(own)
     assert argv[argv.index("--stack") + 1] == stack
 
