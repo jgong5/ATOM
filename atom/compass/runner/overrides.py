@@ -325,9 +325,9 @@ class HostDeviceRecurrence:
     The host runs `HOST_SEGMENTS` from `now`. A forward's entry waits for the
     device work two forwards back, or on a pipeline stage `stage = (rank, pp)`,
     `pp` forwards back; an output forward, after launch, waits for the previous
-    output forward's, or on the last stage for its own, and on any other stage
+    output forward's, or for its own on the last stage or a single stage that does not `defer` its output, and on any other stage
     for nothing. With `mtp`, a forward's device work is its target's and then
-    its draft's, and a single-stage output forward waits before launch, for
+    its draft's, and an output forward on a single stage that defers waits before launch, for
     the previous output forward's target and then `MTP_COPY`; `MTP_SEGMENT`
     runs after that wait, before the launch. A batch's `compass_queued_s`,
     the device work its prepare queued ahead of its launch, runs after
@@ -358,6 +358,7 @@ class HostDeviceRecurrence:
         admit=ADMISSION_IN_E,
         columns=None,
         launch=(None, None),
+        defer=True,
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
         self.admit, self.columns, self.launch = admit, columns or {}, launch
@@ -375,6 +376,7 @@ class HostDeviceRecurrence:
         ring = 2 if stage is None else stage[1]
         self.ends = collections.deque([-math.inf] * ring, maxlen=ring)  # n-ring..n-1
         self.last = None if stage is None else stage[0] == stage[1] - 1
+        self.last = True if stage is None and not defer else self.last
         self.recv = stage is not None and stage[0] > 0  # a later stage receives
         self.output_end = -math.inf  # target end of the last output forward
         self.mtp = mtp
@@ -504,7 +506,7 @@ class HostDeviceRecurrence:
         """The exit of the forward `device_end` priced, its device work ending
         at `end` and its target's at `target_end`: `W_post` after its launch
         and the wait that follows it, an output forward's for the previous
-        output forward's target on a single stage or its own on the last, or
+        output forward's target on a single stage that defers or its own on the last or one that does not, or
         under `sync` for `end`."""
         _, launch_end, output, post = self._held
         released = launch_end
@@ -1834,7 +1836,7 @@ def _group_step_seconds(
     `compass_admitted`, set here first (`admitted`, over the requests this
     runner has seen).
     Under DP, a `HostDeviceRecurrence`'s device end, and its output mark
-    (the device end, or under MTP the target end), are first replaced by
+    (the device end, or with MTP or a draft the target end), are replaced by
     the group's latest, an `all_reduce(MAX)` standing in
     for a real forward's cross-rank collectives, and every rank leaves at its
     own charge. With no
@@ -1942,8 +1944,8 @@ def _group_step_seconds(
 
         def charge(batch, device_s, draft_s, refuse=True):
             end = host.device_end(batch, device_s, draft_s, refuse)
-            # The output end: the group's device end, or under MTP its target end.
-            mark = host.target_end if host.mtp else end
+            # The output end: the device end, or with MTP or a draft the target end.
+            mark = host.target_end if host.mtp or draft_s else end
             t = torch.tensor([end, mark], dtype=torch.float64)
             torch.distributed.all_reduce(t, torch.distributed.ReduceOp.MAX, group)
             return host.release(*t.tolist())
