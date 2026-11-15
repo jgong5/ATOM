@@ -1,0 +1,167 @@
+# SPDX-License-Identifier: MIT
+"""What grading keeps, `python -m atom.compass.validate CELL...`: the rows it
+prints, in the cell's `grades.json`, and the report of each of the cell's runs
+rendered again to show them while none of its runs ran again. The cells are
+`test_validate_main`'s, laid out as `record` and `run` write them, each run's
+report written as a run writes its own when it ends.
+"""
+
+import json
+import shutil
+
+import pytest
+from test_report_html import _Page
+from test_validate_main import _as_recorded, _rows
+
+from atom.compass.report import html
+from atom.compass.run import SUMMARY_FILE
+from atom.compass.validate import __main__ as validate
+from atom.compass.validate.__main__ import main
+from atom.compass.validate.runs import EXPORT
+
+RUNS = ["real0", "real1", "real2", "step_linear"]
+SHOWN = f"Cell c4, graded on its runs {', '.join(RUNS)}."
+
+
+def _cell(capsys, tmp_path):
+    """Cell c4 as `record` and `run` write it, ungraded, its simulated run's
+    summary as the run's writer states it."""
+    cell = tmp_path / "c4"
+    _rows(capsys, tmp_path)
+    (cell / html.GRADES).unlink(missing_ok=True)
+    _as_recorded(cell)
+    path = cell / "step_linear" / "summary.json"
+    summary = json.loads(path.read_text())
+    summary["schedule"] |= {"extrapolated_steps": 0, "fallback_steps": 0}
+    summary["schedule"]["refusals"]["reasons"] = []
+    path.write_text(json.dumps(summary))
+    return cell
+
+
+def _graded(capsys, cell) -> list[str]:
+    main([str(cell)])
+    return capsys.readouterr().out.splitlines()
+
+
+def test_grading_keeps_the_rows_it_prints_and_renders_each_report_again(
+    capsys, tmp_path
+):
+    cell = _cell(capsys, tmp_path)
+    wrote = ["real0", "real1", "step_linear"]  # real2 ended before reports existed
+    for run in wrote:
+        html.write(cell / run)
+    before = _Page(cell / "real0").parts
+
+    printed = _graded(capsys, cell)
+
+    assert printed[0] == "cell | result | metric | value | verdict"
+    assert before.pop("Grades")["text"] == [
+        f"None: {cell} holds no {html.GRADES}; it is not a graded cell."
+    ]
+    after = {run: _Page(cell / run).parts for run in wrote}
+    shown = {run: page.pop("Grades") for run, page in after.items()}
+    assert [s["text"] for s in shown.values()] == [[SHOWN]] * len(wrote)
+    grades = json.loads((cell / html.GRADES).read_text())
+    assert grades["cell"] == "c4"
+    assert grades["runs"] == {run: html.digest(cell / run) for run in RUNS}
+    assert grades["columns"] == ["result", "metric", "value", "verdict"]
+    assert [" | ".join(("c4", *r)) for r in grades["rows"]] == printed[1:]
+    assert grades["rows"][0] == ["cell", "verdict", "3 real runs", "graded"]
+    for run in wrote:
+        head, *rows = shown[run]["tables"][0]
+        assert (head, rows) == (grades["columns"], grades["rows"]), run
+    # On a report, grading changes its grades alone.
+    assert after["real0"] == before
+    assert not (cell / "real2" / html.FILE).exists()
+
+
+def test_the_report_of_a_run_its_cell_gained_after_grading_says_it_was_not_graded(
+    capsys, tmp_path
+):
+    cell = _cell(capsys, tmp_path)
+    _graded(capsys, cell)
+    shutil.copytree(cell / "real0", cell / "real3")
+
+    page = _Page(html.write(cell / "real3").parent)
+
+    graded = ", ".join(RUNS)
+    assert page.parts["Grades"]["text"] == [
+        f"None: {cell / html.GRADES} grades {graded}, not this run."
+    ]
+
+
+#: Each run rerun, the one of its `html.RESULTS` the test rewrites, and how: a
+#: real run's export with new latencies; a simulated run's summary as a
+#: coverage report, alone, though its rerun writes a new export beside it.
+RERUNS = {
+    "real1": (
+        EXPORT,
+        {"time_to_first_token": {"unit": "ms", "avg": 1300.0, "p50": 1200.0}},
+    ),
+    "step_linear": (SUMMARY_FILE, {"coverage_report": True}),
+}
+
+
+def _rerun(cell, run):
+    """Rewrite `run`'s file in `RERUNS` as it says."""
+    name, change = RERUNS[run]
+    path = cell / run / name
+    path.write_text(json.dumps(json.loads(path.read_text()) | change))
+
+
+@pytest.mark.parametrize("rerun", RERUNS)
+def test_a_run_rerun_in_its_graded_cell_shows_no_grades_until_graded_again(
+    capsys, tmp_path, rerun
+):
+    cell = _cell(capsys, tmp_path)
+    first = _graded(capsys, cell)
+    _rerun(cell, rerun)
+
+    graded = ", ".join(RUNS)
+    for run in (rerun, "real0"):  # the rerun's own report, and another's
+        page = _Page(html.write(cell / run).parent)
+        assert page.parts["Grades"]["text"] == [
+            f"None: {cell / html.GRADES} grades {graded}; {rerun} changed since."
+        ], run
+
+    again = _graded(capsys, cell)
+    assert again != first
+    shown = _Page(cell / rerun).parts["Grades"]
+    assert shown["text"] == [SHOWN]
+    assert [" | ".join(("c4", *r)) for r in shown["tables"][0][1:]] == again[1:]
+
+
+def test_a_run_that_reruns_while_its_cell_is_graded_shows_no_grades(
+    capsys, tmp_path, monkeypatch
+):
+    cell = _cell(capsys, tmp_path)
+    html.write(cell / "step_linear")
+    rows = validate.rows
+
+    def rerun_once_read(c):
+        read = rows(c)
+        _rerun(cell, "step_linear")
+        return read
+
+    monkeypatch.setattr(validate, "rows", rerun_once_read)
+    _graded(capsys, cell)
+
+    assert _Page(cell / "step_linear").parts["Grades"]["text"] == [
+        f"None: {cell / html.GRADES} grades {', '.join(RUNS)}; step_linear changed since."
+    ]
+
+
+def test_a_cell_and_a_run_given_as_the_working_directory_are_named(
+    capsys, tmp_path, monkeypatch
+):
+    """`cd CELL && python -m atom.compass.validate .`, then a report written
+    from inside a run, `python -m atom.compass.report.html .`."""
+    cell = _cell(capsys, tmp_path)
+    monkeypatch.chdir(cell)
+    _graded(capsys, ".")
+    assert json.loads((cell / html.GRADES).read_text())["cell"] == "c4"
+
+    monkeypatch.chdir(cell / "real0")
+    html.write(".")
+
+    assert _Page(cell / "real0").parts["Grades"]["text"] == [SHOWN]

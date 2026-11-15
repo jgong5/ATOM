@@ -157,6 +157,24 @@ def test_the_routed_experts_and_their_exchange_by_hand(spec):
     )
 
 
+def test_a_padded_decode_exchanges_only_its_real_rows():
+    # EP2 at rung 4: this rank's 3 decode rows and a pad row, which routes to
+    # no expert, so MoRI sends it nowhere: the exchange moves what the 3 rows
+    # move unpadded, at fp4 out and fp8 back.
+    ep2 = Module("experts", "moe", EP2, "fp4", ranks=2, act="fp8", wire=("fp4", "fp8"))
+    rows = (RequestShape(1, 9, True),) * 3
+    padded = BatchView(rows, capture_rung=4, moe_rows=8, moe_tokens=6)
+    unpadded = BatchView(rows, moe_rows=6, moe_tokens=6)
+
+    def transfer(step):
+        (term,) = StepRooflineBackend(machine(1e18), [ep2]).price(step).terms
+        return term.by_bound["comm.transfer"]
+
+    sent = 3 * 32 * 2 * (1 - comb(4, 2) / comb(8, 2))
+    assert transfer(padded) == pytest.approx(sent * (0.5 + 1) / 2 / LINK)
+    assert transfer(padded) == pytest.approx(transfer(unpadded))
+
+
 @BOUND
 def test_sparse_attention_and_the_hyper_connection_mix_by_hand(spec):
     # Window 4, every 3 tokens compressed, the indexer keeping the top 2.

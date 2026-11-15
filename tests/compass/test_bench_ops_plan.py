@@ -104,7 +104,7 @@ def bench(tmp_path, monkeypatch):
     """A store, the key of a point measured on hjbog-srdc-39, the run, and
     the stand-in bench and graphs in place."""
     spec = MachineSpec.from_mapping(
-        json.loads((TREE / "scripts/compass/machines/mi308x-hjbog39.json").read_text())
+        json.loads((TREE / "tests/compass/machines/mi308x-hjbog39.json").read_text())
     )
     run = {
         "device": [{"index": 6, "name": spec.value("device.name")}],
@@ -1185,7 +1185,9 @@ def test_a_child_that_dies_costs_the_plan_only_the_point_it_was_measuring(
         for d in dead
     ]
     assert [r for r in records if "refused" not in r] == [
-        r for r in whole if {k: r[k] for k in r if k != "token"} not in dead
+        r
+        for r in whole
+        if {k: r[k] for k in r if k not in ("token", "layout")} not in dead
     ]
     monkeypatch.setattr(ops, "_child", _bench)
     again = _plan(bench, tmp_path, population)  # the next plan retries them

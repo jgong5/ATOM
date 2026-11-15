@@ -23,6 +23,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import platforms
 import pytest
 import torch
 from test_drive_run import recorded, stub
@@ -93,8 +94,11 @@ def test_a_check_finds_the_readings_its_machine_s_worker_keys(
     document = machine(arch)
     config = worker(tmp_path, monkeypatch, arch, config_json, *args)
     publish_readings(tmp_path / "store", config, document)
-    (tmp_path / "machine.json").write_text(json.dumps(document))
-    flags = ["--step-stub", stub(tmp_path), "--machine", str(tmp_path / "machine.json")]
+    flags = [
+        "--step-stub",
+        stub(tmp_path),
+        *platforms.flags(tmp_path / "store", document, tmp_path),
+    ]
     flags += ["--store", str(tmp_path / "store"), "--check"]
 
     with pytest.raises(SystemExit) as exited:
@@ -117,9 +121,12 @@ def test_a_check_s_coverage_loads_the_bundle_its_machine_s_worker_keys(
     config = worker(tmp_path, monkeypatch, "gfx950", QWEN, *args)
     publish(tmp_path, SimpleNamespace(config=config), member=member)
     publish_readings(tmp_path / "store", config)
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     token = Key.of(Kind.STEP_GRID_BUNDLE, **KEY).token()
-    flags = ["--step-grid", token, "--machine", str(tmp_path / "machine.json")]
+    flags = [
+        "--step-grid",
+        token,
+        *platforms.flags(tmp_path / "store", DOCUMENT, tmp_path),
+    ]
     flags += ["--store", str(tmp_path / "store"), "--coverage", str(directory)]
 
     with pytest.raises(SystemExit) as exited:
@@ -138,8 +145,11 @@ def test_a_check_reads_the_config_of_a_model_with_remote_code(tmp_path):
     config["auto_map"] = {"AutoConfig": "configuration_tiny.TinyConfig"}
     (model / "config.json").write_text(json.dumps(config))
     (model / "configuration_tiny.py").write_text(REMOTE)
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
-    flags = ["--step-stub", stub(tmp_path), "--machine", str(tmp_path / "machine.json")]
+    flags = [
+        "--step-stub",
+        stub(tmp_path),
+        *platforms.flags(tmp_path / "store", DOCUMENT, tmp_path),
+    ]
     flags += ["--store", str(tmp_path / "store"), "--check"]
     atom = ["--model", str(model), "--trust-remote-code"]
     # A command of its own, as the check runs: no remote code is loaded in it.

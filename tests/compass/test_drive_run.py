@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import platforms
 import pytest
 import test_drive_trace_steps
 import torch
@@ -103,8 +104,7 @@ def stub(tmp_path):
 def flags(tmp_path, *backend, atom=()):
     """`compass run`'s arguments, the suite's machine and the store with
     `backend`'s flags, out to ``out``, serving the model in `tmp_path`."""
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
-    common = ["--machine", str(tmp_path / "machine.json")]
+    common = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
     common += ["--store", str(tmp_path / "store"), "--out", str(tmp_path / "out")]
     return [*backend, *common, "--", "--model", str(tmp_path), *atom]
 
