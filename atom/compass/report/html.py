@@ -4,8 +4,8 @@
 
 OUT is a run's directory as `split` reads it, once its split is written. The
 page goes to OUT/`FILE`, and no other file changes. Every number on it is read
-from a file in OUT, and a part whose file is missing, or holds nothing for it,
-says so in its place:
+from a file in OUT, or in the cell holding OUT for its grades, and a part whose
+file is missing, or holds nothing for it, says so in its place:
 
 - the run: simulated, by which backend, or real; one instance, or a
   deployment's two sides, their KV link and the router's arguments; each
@@ -25,12 +25,18 @@ says so in its place:
   percentiles over the requests it split that the headline metrics count, the
   LMCache tokens those loaded and stored, and why each request it did not
   split was not; or why there is no split;
-- grades, a real run's split beside a simulated run's, and the op-family
-  split, none of which a run's directory holds.
+- grades, the rows `python -m atom.compass.validate` printed for the cell
+  holding OUT, from the cell's `GRADES`, when OUT is a run it graded and every
+  run it graded still holds the results it read (`digest`); grading writes
+  that file and then renders the report of each of its runs again;
+- a real run's split beside a simulated run's, and the op-family split, none
+  of which a run's directory holds.
 """
 
 import collections
+import hashlib
 import json
+import os
 import sys
 from html import escape
 from pathlib import Path
@@ -39,9 +45,15 @@ from atom.compass.backends.json_file import read_json
 from atom.compass.report import split
 from atom.compass.run import OP_GRAPH, STEP_GRID, STEP_LINEAR, STEP_STUB, SUMMARY_FILE
 from atom.compass.validate import curves
-from atom.compass.validate.runs import CLIENT_RUN, sides
+from atom.compass.validate.runs import CLIENT_RUN, EXPORT, sides
 
 FILE = "report.html"
+#: The rows grading printed for a cell, in that cell, with the runs it graded.
+GRADES = "grades.json"
+#: The files a run writes anew each time it runs, whose `digest` `GRADES` keeps:
+#: its client's export, which holds a real run's wall-clock times, and a
+#: simulated run's summary, which holds its wall seconds.
+RESULTS = (EXPORT, SUMMARY_FILE)
 RUN = "run.json"
 WORKLOAD = "artifacts/workload.json"
 #: The run-file keys that name a backend, each by its name.
@@ -294,6 +306,34 @@ def _split(run: Path) -> str:
     return out
 
 
+def digest(run) -> str:
+    """The sha256 of `run`'s `RESULTS`, a file it lacks read as empty."""
+    sha = hashlib.sha256()
+    for name in RESULTS:
+        path = Path(run) / name
+        sha.update(path.read_bytes() if path.is_file() else b"")
+    return sha.hexdigest()
+
+
+def _grades(run: Path) -> str:
+    """The grades of the cell holding `run`, from its `GRADES`, while each run
+    they grade holds the results grading read, by its `digest`."""
+    run = Path(os.path.abspath(run))  # its cell is the directory holding it
+    path = run.parent / GRADES
+    if not path.is_file():
+        return _none(f"None: {run.parent} holds no {GRADES}; it is not a graded cell.")
+    graded = read_json(path)
+    names = ", ".join(graded["runs"])
+    if run.name not in graded["runs"]:
+        return _none(f"None: {path} grades {names}, not this run.")
+    ran = graded["runs"].items()
+    if changed := [n for n, sha in ran if digest(run.parent / n) != sha]:
+        changed = ", ".join(changed)
+        return _none(f"None: {path} grades {names}; {changed} changed since.")
+    text = f"Cell {graded['cell']}, graded on its runs {names}."
+    return f"<p>{escape(text)}</p>{_table(graded['rows'], graded['columns'])}"
+
+
 def _part(title: str, make, *args) -> str:
     try:
         body = make(*args)
@@ -316,7 +356,7 @@ def page(run) -> str:
         _part("Workload", _workload, run),
         _part("Headline metrics", _metrics, run, simulated, summary),
         _part("Trust", _trust, simulated, summary),
-        _part("Grades", _none, "None: no grades are recorded for this run."),
+        _part("Grades", _grades, run),
         _part("Per-request split", _split, run),
     ]
     if simulated:
