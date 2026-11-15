@@ -4,8 +4,8 @@ ends: one static page, served by no server and loading nothing from a network.
 
 It is built from files alone and computes no result anew: OUT's results
 (`results.RESULTS`), the expansion `compass advice` wrote, the head the reuse
-check took (`check.REUSE`), and, for each point that ran, each side's engine
-record for its GPUs and each side's ``run.json`` for the ATOM tree it ran.
+check took (`check.REUSE`), and, for each point that ran, its GPUs as
+`curves.gpus` counts them and each side's ``run.json`` for the ATOM tree it ran.
 Top to bottom:
 
 - the search: its model, machine, store, workload and SLO, and the head, its
@@ -37,11 +37,12 @@ from atom.compass.advice import results
 from atom.compass.advice.check import REUSE
 from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.json_file import read_json
-from atom.compass.validate.curves import ENGINE_RECORD
+from atom.compass.drive.serve import RUN_JSON
+from atom.compass.validate import curves
 from atom.compass.validate.runs import sides
 
-#: The dashboard, in OUT; a run's report, in its directory; a side's run record.
-FILE, REPORT, RUN = "dashboard.html", "report.html", "run.json"
+#: The dashboard, in OUT; a run's report, in its directory.
+FILE, REPORT = "dashboard.html", "report.html"
 #: Each switched axis: its two definitions, InferenceX's first, each with the
 #: switch's label.
 AXES = {
@@ -182,25 +183,18 @@ def _number(v) -> bool:
 
 
 def _ran(row: dict, out: Path) -> dict:
-    """What `row`'s run directory adds: its GPUs, each side's engine record's
-    tensor parallel times data parallel summed; the total throughput; the ATOM
-    tree each side's run record names; and its report, relative to `out`.
-    None where a file is missing or does not say."""
+    """What `row`'s run directory adds: its GPUs (`curves.gpus`), which read
+    when its metrics did; the total throughput; the ATOM tree each side's run
+    record names, "not stated" where it is missing or does not say; and its
+    report, relative to `out`, None where there is none. All None for a point
+    that did not run."""
     if not row["run"]:
         return dict.fromkeys(("gpus", "total", "tree", "report"))
-    run, gpus, named = Path(row["run"]), 0, {}
+    run, named = Path(row["run"]), {}
+    gpus = curves.gpus(run)
     for side in sides(run):
         try:
-            engine = read_json(side / ENGINE_RECORD)
-            gpus += engine["tensor_parallel_size"] * (
-                engine.get("data_parallel_size") or 1
-            )
-        except (OSError, ValueError, KeyError, TypeError):
-            gpus = None
-            break
-    for side in sides(run):
-        try:
-            source = read_json(side / RUN).get("source") or {}
+            source = read_json(side / RUN_JSON).get("source") or {}
         except (OSError, ValueError, AttributeError):
             source = {}
         revision, dirty = source.get("revision"), source.get("dirty")
@@ -210,12 +204,14 @@ def _ran(row: dict, out: Path) -> dict:
         named[side.name] = tree or "not stated"
     # One tree once, else each side's by name.
     trees = list(dict.fromkeys(named.values()))
-    tree = trees[0] if len(trees) == 1 else "; ".join(f"{s} {t}" for s, t in named.items())
+    tree = (
+        trees[0] if len(trees) == 1 else "; ".join(f"{s} {t}" for s, t in named.items())
+    )
     tpg = row["throughput per GPU"]
     report = run / REPORT
     return {
         "gpus": gpus,
-        "total": tpg * gpus if tpg is not None and gpus else None,
+        "total": tpg * gpus if tpg is not None else None,
         "tree": tree,
         "report": os.path.relpath(report, out) if report.is_file() else None,
     }
@@ -235,7 +231,8 @@ def _shown(row: dict, column: str) -> str:
     if column == "extrapolated_share":
         return f"{value:.1%}"
     if column == "laws":
-        return "; ".join(f"{s} {', '.join(dict.fromkeys(r))}" for s, r in value.items())
+        laws = (f"{s} {', '.join(dict.fromkeys(r))}" for s, r in value.items())
+        return "; ".join(laws) or "-"
     if isinstance(value, bool):
         return "yes" if value else "no"
     return str(value)
@@ -402,12 +399,11 @@ def _view(rows: list[dict], rings: dict, layer: dict | None, x: str, y: str) -> 
                 f'<text class="name" x="{px + 12:.1f}" y="{py + 4:.1f}">{escape(name)}</text>'
             )
     for r in placed:
-        state = r["grading"] if r["grading"] in SHAPES else "ungraded"
-        shape = SHAPES[state]
+        shape = SHAPES[r["grading"]]
         if r["refusal"]:
             mark = f'<g class="refused">{shape}</g>'
         else:
-            mark = f'<g clip-path="url(#clip-{state.replace(" ", "-")})">{_pie(r["method_shares"])}</g>'
+            mark = f'<g clip-path="url(#clip-{r["grading"].replace(" ", "-")})">{_pie(r["method_shares"])}</g>'
             mark += f'<g class="outline">{shape}</g>'
         if ring := rings.get(r["point"]):
             runner = " runner" if ring == "runner-up" else ""

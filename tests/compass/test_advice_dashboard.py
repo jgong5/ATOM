@@ -22,6 +22,7 @@ from test_advice_results import (
     CLIENT,
     CONFIGS,
     COVERAGE,
+    LAW,
     POINTS,
     REFUSED,
     SERVER,
@@ -34,8 +35,10 @@ from test_advice_simulate import simulating, stubbed  # noqa: F401  the fixtures
 from test_run_step_grid import DOCUMENT
 
 from atom.compass import cli
-from atom.compass.advice import check, dashboard, simulate
+from atom.compass.advice import check, dashboard, results, simulate
 from atom.compass.advice.space import expand
+from atom.compass.drive.serve import RUN_JSON
+from atom.compass.validate.runs import sides
 
 #: A drawn point: its link, place, hover text and mark.
 POINT = re.compile(
@@ -48,6 +51,15 @@ SLICE = re.compile(
     r'<path class="m-(\w+)" d="M0 0L(\S+) (\S+)A10 10 0 [01] 1 (\S+) (\S+)Z"/>'
 )
 SOURCE = "InferenceX, frozen 2026-10-29: another ATOM version"
+#: The ATOM tree each run's sides state in their ``run.json``, a revision and
+#: its uncommitted files, by point, and the tree its hover text names: d-c1's
+#: two sides at two revisions, and e-c1's run stating none.
+SOURCES = {"*": [("a" * 40, 0)], "d-c1": [("b" * 40, 0), ("c" * 40, 3)], "e-c1": []}
+TREES = {
+    "*": "commit aaaaaaaaa",
+    "d-c1": "prefill commit bbbbbbbbb; decode commit ccccccccc, 3 files uncommitted",
+    "e-c1": "not stated",
+}
 
 
 def drawn(page: str) -> dict:
@@ -84,11 +96,17 @@ def labelled(page: str) -> str | None:
 
 
 def dashed(tmp_path, slo: dict, layer=None, reports=()) -> tuple[dict, str]:
-    """`search` over `POINTS` at `slo`, each run in `reports` given a report,
-    then the dashboard over its results and expansion: the results and the
-    page."""
+    """`search` over `POINTS` at `slo`, each run's sides given their
+    `SOURCES` and each run in `reports` a report, then the dashboard over its
+    results and expansion: the results and the page."""
     held = search(tmp_path, CONFIGS, [1, 2], POINTS, slo)
     out = tmp_path / "out"
+    for run in (out / "runs").iterdir():
+        for side, (revision, dirty) in zip(
+            sides(run), SOURCES.get(run.name, SOURCES["*"])
+        ):
+            source = {"revision_kind": "commit", "revision": revision, "dirty": dirty}
+            (side / RUN_JSON).write_text(json.dumps({"source": source}))
     for name in reports:
         (out / "runs" / name / dashboard.REPORT).write_text("<p>report</p>")
     expansion = expand(tmp_path / "space.json")
@@ -126,13 +144,17 @@ def test_each_point_is_placed_by_its_metrics_on_each_view_and_opens_its_report(
             row, given = rows[name], POINTS[name]
             gpus = given.get("tp") or sum(t * d for t, d in given["sides"].values())
             total = row["throughput per GPU"] * gpus
+            laws = "; ".join(f"{s} {LAW}" for s in given.get("sides", ["server"]))
             said = m["title"].split("\n")
             assert (
                 said[0] == f"{row['configuration']} at concurrency {row['concurrency']}"
             )
-            assert {f"GPUs: {gpus}", f"total throughput (tok/s): {total:.1f}"} <= set(
-                said
-            )
+            assert {
+                f"GPUs: {gpus}",
+                f"total throughput (tok/s): {total:.1f}",
+                f"ATOM tree: {TREES.get(name, TREES['*'])}",
+                f"laws: {laws}",
+            } <= set(said)
     # The computed tokens are fewer than those served: every point lower.
     served = drawn(page)["throughput per GPU", "p90 interactivity"]
     computed = drawn(page)["computed throughput per GPU", "p90 interactivity"]
@@ -181,6 +203,44 @@ def test_each_point_carries_its_grading_state_and_method_shares_and_a_refusal_is
     assert sum(m["mark"].count('class="ring') for m in points.values()) == 2
     for line in held["text"].splitlines():
         assert f"<p>{escape(line)}</p>" in page
+
+
+def test_each_switch_shows_its_definitions_view_and_the_frontier_joins_its_points(
+    tmp_path,
+):
+    held, page = dashed(tmp_path, {})
+
+    # One rule shows each view, at the switches of its own two definitions.
+    style = page.split("<style>")[1].split("</style>")[0]
+    shown = re.search(r"([^{}]*)\{ display: block; \}", style)[1]
+    ys, xs = dashboard.AXES["y"], dashboard.AXES["x"]
+    assert {s.strip() for s in shown.split(",")} == {
+        f"#y{i}:checked ~ #x{j}:checked ~ .views .y{i}x{j}"
+        for i in range(len(ys))
+        for j in range(len(xs))
+    }
+    # Each switch labelled with its definition, InferenceX's checked.
+    for axis, names in (("y", ys), ("x", xs)):
+        for i, label in enumerate(names.values()):
+            checked = " checked" if i == 0 else ""
+            assert f'id="{axis}{i}"{checked}><label for="{axis}{i}">{label}<' in page
+    # By p90 interactivity: c-c2's I/1.5, a-c1's and e-c1's I, b-c2's 2I.
+    frontier = ["c-c2", "a-c1", "e-c1", "b-c2"]
+    assert {r["point"] for r in held["rows"] if r["frontier"]} == set(frontier)
+    for i, y in enumerate(ys):
+        for j, x in enumerate(xs):
+            view = page.split(f'<div class="y{i}x{j}">')[1].split("</svg>")[0]
+            named = r'<text class="name" [^>]*text-anchor="middle">([^<]*)</text>'
+            assert re.findall(named, view) == [
+                results.METRICS[x][0],
+                results.METRICS[y][0],
+            ]
+            # The frontier through its points' places on this view, in order.
+            points = drawn(page)[y, x]
+            (line,) = re.findall(r'<polyline class="frontier" points="([^"]*)"/>', view)
+            assert line == " ".join(
+                f"{points[n]['x']},{points[n]['y']}" for n in frontier
+            )
 
 
 def test_the_reference_layer_is_drawn_labelled_with_its_source(tmp_path):
