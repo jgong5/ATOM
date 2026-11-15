@@ -177,17 +177,24 @@ def _hit_counters(run: Path, sent: list[dict]) -> list | None:
     return change
 
 
-def metrics(run, simulated: bool = False) -> dict:
-    """InferenceX's metrics of the run directory `run`, None where it has none;
-    the hit rates from its own counters when `simulated`."""
-    run = Path(run)
-    sent = read_jsonl(run / RECORDS)
-    rs = [
+def profiled(sent: list[dict]) -> list[dict]:
+    """The records of the client export `sent` that InferenceX's metrics are
+    computed over: those that hold no error and are of the profiling phase or
+    name none."""
+    return [
         r
         for r in sent
         if not r.get("error")
         and r.get("metadata", {}).get("benchmark_phase") in (None, "profiling")
     ]
+
+
+def metrics(run, simulated: bool = False) -> dict:
+    """InferenceX's metrics of the run directory `run`, None where it has none;
+    the hit rates from its own counters when `simulated`."""
+    run = Path(run)
+    sent = read_jsonl(run / RECORDS)
+    rs = profiled(sent)
     ttft, itl = (
         [v / 1000 for v in _positive(_metric(r, k) for r in rs)]
         for k in ("time_to_first_token", "inter_token_latency")
