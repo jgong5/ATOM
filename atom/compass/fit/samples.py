@@ -39,7 +39,8 @@ names none. A measurement reads the same fields but the host key, stack and
 prefill buckets from its key, whose `engine_config` and `sampling` are JSON
 objects as text. A field that differs between inputs refuses, naming each
 value and the inputs holding it; so do a profiled record and a record whose
-requests carry two sets of request parameters.
+requests carry two sets of request parameters. Ladders that are non-empty
+prefixes of the longest among the inputs read as it (`step_grid_plan.pooled`).
 
 A stated engine file (`--engine`) stands in for each record's own as
 `step_linear_fit --engine` takes it, in `engine_config`, the host key's
@@ -54,7 +55,7 @@ from pathlib import Path
 from atom.compass.artifacts import ArtifactStore, Topology
 from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.shape import BatchView, RequestShape
-from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS
+from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, pooled
 from atom.compass.backends.step_labels import Sample, digest, label_run
 from atom.compass.backends.step_linear_fit import (
     recorded_buckets,
@@ -85,16 +86,22 @@ def load(
     """The samples of `records`, {record directory: the client runs its server
     served}, labelled under `floored`, and of the `measurements` keys in the
     store at `store`, in run digest, DP rank and step order; and the
-    configuration they state, the records' under the engine file `engine`."""
-    samples, configs = [], {}
+    configuration they state, the records' under the engine file `engine`, and
+    each engine config at the longest ladder among them (`pooled`)."""
+    samples, configs, held = [], {}, {}
+    if engine is not None:
+        owns = {d: Path(d) / "steps" / "dp0.engine.json" for d in records}
+        held = pooled({d: keyed_of(json.loads(o.read_text())) for d, o in owns.items()})
     for directory, client_runs in records.items():
         got, configs[str(directory)] = _record(
-            Path(directory), client_runs, floored, engine
+            Path(directory), client_runs, floored, engine, held.get(directory)
         )
         samples += got
     for key in measurements:
         got, configs[str(key)] = _measurement(ArtifactStore(store), key)
         samples.append(got)
+    for i, at in pooled({i: c["engine_config"] for i, c in configs.items()}).items():
+        configs[i]["engine_config"] = at
     fields = sorted({f for c in configs.values() for f in c})
     differ = [
         line
@@ -109,7 +116,7 @@ def load(
 
 
 def _record(
-    directory: Path, client_runs, floored=None, stated=None
+    directory: Path, client_runs, floored=None, stated=None, held=None
 ) -> tuple[list[Sample], dict]:
     run = json.loads((directory / "run.json").read_text())
     if run["format_version"] != FORMAT_VERSION:
@@ -148,7 +155,7 @@ def _record(
     own, buckets = steps / "dp0.engine.json", stated_buckets(steps / "dp0.jsonl")
     engine = keyed_of(json.loads(own.read_text()))
     if stated is not None:
-        engine, buckets = _stated(own, engine, buckets, stated)
+        engine, buckets = _stated(own, held, buckets, stated)
     files = sorted(steps.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
     name, samples = ", ".join(map(digest, files)), []
     for got, _ in label_run(files, name, _split, floored):
@@ -173,8 +180,9 @@ def _record(
 
 def _stated(own: Path, held: dict, buckets, stated) -> tuple[dict, list | None]:
     """The `keyed` fields of the engine file `stated` and the prefill buckets a
-    record with engine file `own`, `held` its keyed fields, states, else the
-    file's. A field the file omits or states otherwise, or other buckets, refuse."""
+    record with engine file `own`, `held` its keyed fields at the records'
+    longest ladder, states, else the file's. A field the file omits or states
+    otherwise, or other buckets, refuse."""
     raw = json.loads(Path(stated).read_text())
     engine = keyed_of(raw)
     refuse_contradicting(own, held, stated, engine)

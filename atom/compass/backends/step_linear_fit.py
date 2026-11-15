@@ -30,7 +30,8 @@ holds the runs it was fitted on, each vector's fit figures and hull, and, once
 
 The law states the records' `engine_config`, read from the `.engine.json`
 beside each (`engine_config`) or from `--engine FILE` in their place, and a run
-under another engine config refuses it. At its `data_parallel_size` N above 1
+under another engine config refuses it, records whose ladders are prefixes of
+the longest read at it (`step_grid_plan.pooled`). At its `data_parallel_size` N above 1
 (EP off) the records come in runs of
 N, each run's `dp0.jsonl` to `dp<N-1>.jsonl`. A step is its ranks' lines
 joined on step index, labelled with the smallest rank label (the others wait
@@ -62,7 +63,8 @@ host laws as a run file's `host` entry: `key`, and `laws[kind][segment]`,
 seconds on `(1, tokens, seqs)`, fitted on the samples' host labels. They take
 the step linear law's solver and hulls, and drop no sample (`_host_law`); `seqs` in a fixed
 proportion to `tokens` on every sample (equal, or a decode under MTP, where
-each row computes its drafts too) gets zero. Two keys refuse. The law, as
+each row computes its drafts too) gets zero. Two keys refuse, ladders pooled
+first. The law, as
 `platform`, and the host key state the platform fields `--platform` gives for
 their kinds, `step_linear_law` and `host_laws`, which a run's spec must match,
 and the host key's `engine` is the law's `engine_config`. A segment outside `HOST_SEGMENTS` is
@@ -206,7 +208,7 @@ from atom.compass.backends.shape import (
     sum_query_square,
     sum_tokens,
 )
-from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, keyed_of
+from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, keyed_of, pooled
 from atom.compass.backends.step_labels import CUTS, HOST_SEGMENTS, host_kind
 from atom.compass.backends.step_linear import (
     DECODE,
@@ -417,7 +419,14 @@ def fit_host(samples) -> tuple[dict, dict]:
     """The host laws over `samples`, as a run file's `host` entry, and their report."""
     from scipy.spatial import QhullError
 
-    keys = sorted({json.dumps(s.provenance["config"], sort_keys=True) for s in samples})
+    held = {json.dumps(s.provenance["config"], sort_keys=True) for s in samples}
+    held = {k: json.loads(k) for k in held}
+    at = pooled({k: c["engine"] for k, c in held.items() if c})
+    keys = {
+        json.dumps(c and {**c, "engine": at[k]}, sort_keys=True)
+        for k, c in held.items()
+    }
+    keys = sorted(keys)
     if len(keys) != 1:
         raise ValueError(
             f"the records carry {len(keys)} host keys ({' / '.join(keys)}); "
@@ -2059,8 +2068,8 @@ def _table(errors: dict) -> str:
 
 def engine_config(records) -> dict:
     """The engine config `records` ran under: `keyed_of` the `.engine.json`
-    beside each. A record without one, or records under two, refuse, naming
-    the fields that differ."""
+    beside each, at the longest ladder (`pooled`). A record without one, or
+    records under two, refuse, naming the fields that differ."""
     held = []
     for record in records:
         engine = Path(record).with_suffix(".engine.json")
@@ -2069,6 +2078,7 @@ def engine_config(records) -> dict:
                 f"{record} has no {engine.name}, the engine config it ran under"
             )
         held.append(keyed_of(json.loads(engine.read_text())))
+    held = list(pooled(dict(enumerate(held))).values())
     names = sorted({k for e in held for k in e})
     if differ := [k for k in names if any(e.get(k) != held[0].get(k) for e in held)]:
         raise ValueError(
@@ -2208,7 +2218,7 @@ def _labelled(args) -> tuple[list, dict, dict, dict]:
     """`args.records`' samples, each record's table, the options `fit` takes
     on them and the engine config they ran under. A record whose server built
     an aiter JIT module refuses, and so does an engine file that contradicts
-    `--engine`."""
+    `--engine` at the records' longest ladder."""
     for record in args.records:
         run = Path(record).resolve().parent.parent / "run.json"
         if run.is_file() and (
@@ -2219,9 +2229,8 @@ def _labelled(args) -> tuple[list, dict, dict, dict]:
     stated = {r: stated_buckets(r) for r in args.records}
     if args.engine:
         engine = keyed_of(json.loads(Path(args.engine).read_text()))
-        for own in owns:
-            raw = json.loads(own.read_text()) if own.exists() else {}
-            held = keyed_of(raw)
+        raw = {own: json.loads(own.read_text()) if own.exists() else {} for own in owns}
+        for own, held in pooled({o: keyed_of(r) for o, r in raw.items()}).items():
             refuse_context_parallel(held, str(own))
             refuse_contradicting(own, held, args.engine, engine)
         given = json.loads(Path(args.engine).read_text()).get(PREFILL_BUCKETS)
