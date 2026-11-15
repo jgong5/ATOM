@@ -65,12 +65,15 @@ def drawn(page: str) -> dict:
 
 
 def shares(mark: str) -> dict:
-    """Each slice's turn of a point's fill, by method."""
+    """Each slice's turn of a point's fill, by method, the slices tiling it
+    clockwise from the top: each starts where the last ended."""
     held = {m: 1.0 for m in re.findall(r'<circle r="10" class="m-(\w+)"/>', mark)}
+    last = (0.0, -10.0)
     for method, *ends in SLICE.findall(mark):
         x0, y0, x1, y1 = map(float, ends)
+        assert (x0, y0) == pytest.approx(last, abs=0.01), method
         turn = (math.atan2(y1, x1) - math.atan2(y0, x0)) % (2 * math.pi)
-        held[method] = held.get(method, 0) + turn / (2 * math.pi)
+        held[method], last = held.get(method, 0) + turn / (2 * math.pi), (x1, y1)
     return held
 
 
