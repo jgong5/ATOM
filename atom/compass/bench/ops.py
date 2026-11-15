@@ -2205,9 +2205,10 @@ def point_rows(
     ones, its step padded to its W where it states one. When they need more
     than the `pool`'s KV blocks, the first keeps its context and each other
     shares what it leaves, as the rows of a ragged step do. A ragged decode
-    point's rows (`_split`) are its first row's context and, past it, rows of
-    at least a token each that hold its mean; None when they need more than
-    the pool, as a decode point's are when `uncut`."""
+    point's rows (`_split`) are its first row's context and, past it, rows
+    that hold its mean, each at least its query, a drafted row's drafts among
+    them; None when they need more than the pool, as a decode point's are
+    when `uncut`."""
     decode = shape.phase == "decode"
     context, mean = _split(context)
     seqs = min(shape.tokens, shape.seqs) if decode else shape.seqs
@@ -2218,7 +2219,7 @@ def point_rows(
     if mean:
         share = (mean * context * len(rows) // PERMILLE - context) // (len(rows) - 1)
         for row in rows[1:]:
-            row[1] = max(share, 1)
+            row[1] = max(share, row[0])
     blocks = [-(-row[1] // block_size) for row in rows]
     if sum(blocks) > pool and (mean or uncut and decode):
         return None
@@ -3880,8 +3881,9 @@ def _mean(line, rung: int) -> int:
 
 def _means(rung: int) -> list:
     """The means, in `PERMILLE` of the max, a rung's ragged points take: the
-    least its rows hold, a token past the first each, and each `GRID`th of
-    the max past it; none at one row."""
+    least its rows hold, a token past the first each, which a drafted row's
+    query raises at its point (`point_rows`), and each `GRID`th of the max
+    past it; none at one row."""
     least = round(PERMILLE / rung)
     grid = (round(PERMILLE * k / GRID) for k in range(1, GRID))
     return [least, *(m for m in grid if m > least)] if rung > 1 else []

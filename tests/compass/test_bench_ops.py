@@ -4074,6 +4074,67 @@ def test_a_ragged_point_runs_its_rows_at_their_longest_or_refuses_past_the_pool(
     assert refused["refused"] == "its rows need more than the pool's 64 KV blocks"
 
 
+#: Five DSpark drafts: a decode row verifies six tokens.
+DSPARK5 = SimpleNamespace(num_speculative_tokens=5, use_dspark=lambda: True)
+
+
+@pytest.mark.parametrize("context", [2048, 65536])
+@pytest.mark.parametrize("rung", [2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 40, 48, 56, 64])
+def test_each_rung_s_least_mean_point_under_a_drafter_reaches_its_leaves(
+    rule, monkeypatch, rung, context  # noqa: F811
+):
+    # The least mean leaves a row past the first fewer tokens than the six it
+    # verifies, or none: it holds its six, so ATOM's rule builds the batch.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    drafting = rule(blocks=1 << 15, max_model_len=1 << 17, speculative_config=DSPARK5)
+    built = []
+
+    def batch(view, block, slot):  # ATOM's rule builds it, the stand-in prepares
+        built.append(drafting.batch(view, block, slot))
+        return block, slot
+
+    placed = SimpleNamespace(block_size=16, drafts=drafting.drafts, batch=batch)
+    runner = _Runner()
+    runner.config.num_kvcache_blocks = 1 << 14
+    x = ("self", _t([2, 3], "activation"))
+    found = ops.leaves(_graph(_leaf("aten.neg.default", x), layers=1)["region"])
+    least = ops._means(rung)[0]
+
+    [record] = ops.Stub(runner, 10_000).point(
+        placed, decode(rung), (context, least), found
+    )
+
+    assert "refused" not in record and built
+    first, *rest = record["rows"]
+    assert first == [6, context + 5, True]
+    assert len(rest) == rung - 1 and all(q == 6 <= c for q, c, _ in rest)
+
+
+@pytest.mark.parametrize(
+    "spec, context, rows",
+    [
+        # 62 permille of 65536 over 16 rows leaves the 15 past the first none:
+        # each holds its token, or, under 5 drafts, the 6 it verifies.
+        (None, (65536, 62), [[1, 65536, True]] + [[1, 1, True]] * 15),
+        (DSPARK5, (65536, 62), [[6, 65541, True]] + [[6, 6, True]] * 15),
+        # 94 permille leaves them 2202 each, past either query.
+        (None, (65536, 94), [[1, 65536, True]] + [[1, 2202, True]] * 15),
+        (DSPARK5, (65536, 94), [[6, 65541, True]] + [[6, 2202, True]] * 15),
+    ],
+)
+def test_a_ragged_row_holds_its_share_of_the_mean_or_its_query_past_it(
+    rule, spec, context, rows  # noqa: F811
+):
+    drafts = spec.num_speculative_tokens if spec else 0
+
+    got = ops.point_rows(decode(16), context, 1 << 20, 16, drafts=drafts)
+
+    assert got == rows
+    built = rule(blocks=1 << 15, max_model_len=1 << 17, speculative_config=spec)
+    built.batch({"rows": got, "produces_output": True})
+
+
 @pytest.mark.parametrize(
     "argv, refusal",
     [
