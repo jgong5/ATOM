@@ -709,7 +709,7 @@ GROUP = [
     [([FIRST, SECOND], 18000, False), ([[9000, 9000, False]], 9001, False)],
     [([SECOND, FIRST], 18000, False), ([[1, 1, True]], 9001, True)],
 ]
-#: One rank, in no DP group, prefilling as much: it runs whole.
+#: One rank prefilling as much: no peer vetoes its split.
 ALONE = [[([FIRST, SECOND], None, False)]]
 
 
@@ -762,3 +762,19 @@ def test_coverage_under_tbo_reads_a_step_its_dp_group_split_as_its_micro_batches
     served = sum(not dummy for steps in ranks for *_, dummy in steps)
     assert report["left out, by leaf kind"] == {}
     assert report["by phase"] == {"prefill": {"steps": served, "covered": served}}
+
+
+def test_coverage_under_tbo_reads_one_rank_s_split_step_as_split(tmp_path):
+    # ALONE's 9000 tokens clear the default 8192-token bar; no peer vetoes it.
+    steps = tmp_path / serve.STEPS
+    steps.mkdir()
+    (tmp_path / serve.RUN_JSON).write_text(json.dumps(IDENTITY))
+    rows, _, _ = ALONE[0][0]
+    line = {"step": 0, "dp_rank": 0, "is_dummy_run": False, "rows": rows}
+    (steps / "dp0.jsonl").write_text(json.dumps(line) + "\n")
+    (steps / "dp0.engine.json").write_text("{}")
+    here = dict.fromkeys(drive_run.SHAPING)
+
+    [(_, read)] = drive_run._steps(str(tmp_path), None, here, tbo=True)
+
+    assert read["tbo_tokens"] == ((4500,), (4500,))

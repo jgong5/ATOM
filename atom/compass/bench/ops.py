@@ -35,9 +35,9 @@ head or its sampler runs. Each point reaches the runner as a batch
 first seated at its cached context (`replay.seat_states`), so ATOM builds its
 metadata and forward context; for DeepSeek-V4, the CSA top-k section its
 forward writes is written from ids spread over each token's compressed rows
-(`Stub._top_k`); for DeepSeek-V4.1's FP8 index plane, each table an earlier
+(`Stub._top_k`); for DeepSeek-V4.1's index planes, each table an earlier
 leaf of its forward writes (`_WRITTEN`) is written for the reading leaf's pass
-as that leaf writes it (`Stub._index`), and the logits plane its scorer
+as that leaf writes it (`Stub._index`), and the FP8 logits plane its scorer
 writes, which a top-k or the pick's block maxima ranks (`PAGE_WIDE`), is
 each copy's own, drawn for a top-k or block maxima as an activation is,
 below each row's bound (`_scores`); its sparse attention's index lists are
@@ -293,7 +293,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 32
+PROTOCOL = 33
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -468,6 +468,10 @@ _LOGITS = (
     "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
     "flydsl_fp8_paged_mqa_logits_gfx1250"
 )
+_FP4 = (
+    "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup:"
+    "flydsl_pa_mqa_logits_fp4_rowgroup"
+)
 _PLAN = "step.plans.{ratio}.compress_plan_gpu"
 _TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
 _INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
@@ -484,6 +488,7 @@ V41_NAMES = {
     (_SCAN, "pptrs"): f"{_CACHE}.0",
     (_SCAN, "eptrs"): f"{_CACHE}.1",
     (_LOGITS, "out_logits"): "workspace._logits",
+    (_FP4, "out"): "workspace._logits",
     (_LOGITS, "context_lens"): "step.visible.{ratio}",
     (_LOGITS, "kv_indices"): "workspace._tiles.{ratio}",
     (_TOPK, "row_starts"): "step.visible.{ratio}",
@@ -572,18 +577,27 @@ PAGE_WIDE = {
 ONE_BLOCK = ("gfx1250",)
 FLYDSL_OFF = "AITER_DISABLE_FLYDSL_TOPK_DECODE"
 FLYDSL_OFF_VALUES = ("1", "true", "True", "yes", "YES")
-#: DeepSeek-V4.1's FP8 index tables an earlier leaf of its forward writes, by
+#: DeepSeek-V4.1's index tables an earlier leaf of its forward writes, by
 #: the operator and slot that read them (`_written`): the page-wide scorer's
 #: tile table (`tiles`); the blocks each row keeps of the candidate pick
 #: (`ids`) and a candidate list's tile table (`table`) and row bounds
 #: (`context`), its scorer's and its top-k's; and the pick's top-k's row
-#: bounds (`ends`), there where its logits, the block maxima, are an activation.
+#: bounds (`ends`), there where its logits, the block maxima, are an activation
+#: or packed rows. On the FP4 plane, also a candidate list's rows, each a
+#: sequence of its own (`starts`), and the packed maxima (`maxima`) and where
+#: the pick's packed rows start (`block_offsets`, `offsets`).
 _WRITTEN = {
     (_LOGITS, "kv_indices"): "tiles",
     (_LOGITS, "context_lens"): "context",
+    (_FP4, "block_tables"): "table",
+    (_FP4, "row_ends"): "context",
+    (_FP4, "query_start_loc"): "starts",
+    (_TOPK, "logits"): "maxima",
     (_TOPK, "row_starts"): "context",
     (_TOPK, "row_ends"): "context",
     (_PICK, "seqLens"): "context",
+    (_MAXIMA, "packed.0"): "offsets",
+    (_MAXIMA, "packed.1"): "block_offsets",
     **{
         (f"{_V41}.candidate_table:{f}", "candidates"): "ids"
         for f in ("candidate_block_table", "lift_candidate_selection")
@@ -1242,7 +1256,8 @@ class Stub:
                         self.fills[sig] = cache, passes.get(at, passes[None])[0]
                     else:
                         meta[sig, path] = f"no pass here fills {path} {bound}", None
-                index = self.paged and _written(op, path)
+                index = bool(self.pages) and _written(op, path)
+                index = None if index == "tiles" and not self.paged else index
                 if spec.get("device") == "cpu":  # `_copy` builds it on the host
                     continue
                 act = self.specs and spec["role"] == "activation"
@@ -1353,13 +1368,26 @@ class Stub:
         scorer workspace's (`unit_tiles`); or, off the blocks each row keeps of
         the candidate pick (`_candidates`), those, a candidate list's tile
         table or row bounds (`candidate_blocks`), or each row's visible blocks,
-        the pick's top-k's row bounds (`_block_maxima`'s `ends`)."""
+        the pick's top-k's row bounds (`_block_maxima`'s `ends`); the scorer
+        workspace's row starts (`starts`) or packed block maxima (`maxima`);
+        or where the pick's packed rows start (`score_layout`)."""
+        from atom.model_ops.attentions.deepseek_v41.score_planner import score_layout
+
         if kind == "tiles":  # rewritten: another pass may have written it since
             step.tiles.pop(ratio, None)
             return {f"workspace._tiles.{ratio}": cache.unit_tiles(step, ratio)}
+        if kind == "starts":  # each row a sequence of its own
+            rows = len(step.batch_ids)
+            return {"workspace._row_starts": cache.workspace.row_starts(rows)}
+        if kind == "maxima":
+            return {"workspace._maxima": cache.workspace.packed_maxima()}
         if self.picker is None:
             raise ValueError("no layer of the model picks candidate blocks")
         spec, block = self.picker.spec, self.picker.block_size
+        if kind in ("offsets", "block_offsets"):
+            if (layout := score_layout(step, spec.ratio)) is None:
+                raise ValueError(f"the step packs no rows at ratio {spec.ratio}")
+            return {f"step.planned.{kind}.{spec.ratio}": getattr(layout, kind)}
         ends = (step.visible[spec.ratio] + block - 1) // block
         if kind == "ends":
             return {f"step.visible.{spec.ratio}.blocks": ends}
@@ -2392,18 +2420,26 @@ def _own_rows(op) -> dict:
 
 
 def _written(op, path) -> str | None:
-    """Which index table of `_WRITTEN` `op`'s `path` takes: a scorer's on a
-    plane its row bounds ATOM stages bound, the page-wide one, its tile table
-    (`tiles`), else a candidate list's (`table`); an activation row bound the
-    pick's (`ends`) under a top-k of activation logits, else a candidate
-    list's (`context`); None for a row bound ATOM stages, or another slot."""
-    kind = _WRITTEN.get((op["op"], path))
-    role = {s: v.get("role") for s, v in op["args"].items() if isinstance(v, dict)}
-    if kind == "tiles" and role.get("context_lens") != "metadata":
-        return "table"
+    """Which index table of `_WRITTEN` `op`'s `path` takes: a scorer's on
+    activation row bounds a candidate list's (`table`, `starts`), else the
+    FP8 page-wide one's (`tiles`); an activation row bound the pick's
+    (`ends`) under a top-k of activation logits or of packed rows, there its
+    maxima and their starts too, else a candidate list's (`context`); None
+    for a table or row bound ATOM stages, or another slot."""
+    kind, args = _WRITTEN.get((op["op"], path)), op["args"]
+    role = {s: v.get("role") for s, v in args.items() if isinstance(v, dict)}
+    listed = (role.get("context_lens") or role.get("row_ends")) == "activation"
+    packed = listed and bool(args.get("packed_rows"))  # FP4's pick's top-k
+    if kind == "tiles":
+        return "table" if listed else kind
+    if kind in ("table", "starts"):  # FP4's: else its PAGE table, its sequences
+        return kind if listed else None
+    if kind == "maxima":
+        return kind if packed else None
     if kind == "context" and role.get(path) != "activation":
-        return None
-    return "ends" if kind == "context" and role.get("logits") == "activation" else kind
+        return "block_offsets" if packed else None
+    picks = role.get("logits") == "activation" or packed
+    return "ends" if kind == "context" and picks else kind
 
 
 def _candidates(ends, k) -> torch.Tensor:
