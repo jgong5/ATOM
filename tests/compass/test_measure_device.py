@@ -236,3 +236,44 @@ def test_a_sigint_during_a_probe_stops_its_session_and_nothing_is_published(
     assert "SIGINT stopped the command; nothing is published" in str(refused.value)
     assert node["pairs"] == ["0,1"]
     assert not (tmp_path / "store" / "probe_record").exists()
+
+
+def test_a_probes_memory_still_clearing_once_it_exits_is_waited_for(
+    node, monkeypatch, tmp_path
+):
+    # KFD lists no probe process while card 1 still reads 1.37 GB used for
+    # three reads after each probe, as crs005's did under a second after one.
+    stubbed, reads = device_probe.cards, {}
+
+    def cards(bdfs):
+        read, probes = stubbed(bdfs), len(node["pairs"])
+        reads[probes] = reads.get(probes, 0) + 1
+        if probes and reads[probes] <= 3:
+            read[1] = read[1] | {"vram_used": 1371521024}
+        return read
+
+    monkeypatch.setattr(device_probe, "cards", cards)
+    measure(tmp_path, "0,1,2")
+    record = published(tmp_path)
+    assert node["pairs"] == ["0,1", "1,2", "2,0"]
+    assert [c["vram_used"] for check in record["checks"] for c in check] == [2**20] * 12
+
+
+def test_a_card_not_idle_by_settle_s_after_a_probe_refuses_naming_it(
+    node, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(measure_device, "SETTLE_S", 0.05)
+    stubbed = device_probe.cards
+
+    def cards(bdfs):
+        read = stubbed(bdfs)
+        if node["pairs"]:
+            read[1] = read[1] | {"vram_used": 1371521024}
+        return read
+
+    monkeypatch.setattr(device_probe, "cards", cards)
+    with pytest.raises(SystemExit) as refused:
+        measure(tmp_path, "0,1,2")
+    assert f"{BUS[1]} (ptl disabled, 1371521024 B used" in str(refused.value)
+    assert node["pairs"] == ["0,1"]
+    assert not (tmp_path / "store" / "probe_record").exists()

@@ -22,6 +22,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
+import platforms
 import pytest
 import torch
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
@@ -69,6 +70,17 @@ class Health(http.server.BaseHTTPRequestHandler):
 port = int(sys.argv[sys.argv.index("--server-port") + 1])
 http.server.HTTPServer(("127.0.0.1", port), Health).handle_request()
 """
+
+
+def plant_module(tmp_path, monkeypatch, source: str) -> None:
+    """`serve`'s server, the module ``planted`` holding `source`: run as
+    ATOM's server is, ``python -m``, from a path the server inherits."""
+    (tmp_path / "planted.py").write_text(source)
+    monkeypatch.setattr(serve, "SERVER", (sys.executable, "-m", "planted"))
+    path = [str(tmp_path), os.environ.get("PYTHONPATH")]
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, path)))
+    # A test may plant another source in its place before the server starts.
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
 
 
 @pytest.fixture(autouse=True)
@@ -269,7 +281,15 @@ def test_a_prefill_or_a_decode_instance_refuses_before_its_server_starts(
     tmp_path, role, side
 ):
     kv = json.dumps({"kv_connector": "compass", "kv_role": role})
-    flags = ["--step-stub", str(stub(tmp_path, 0)), "--machine", "m", "--store", "s"]
+    flags = [
+        "--step-stub",
+        str(stub(tmp_path, 0)),
+        "--device",
+        "d",
+        "--ptl",
+        "disabled",
+    ]
+    flags += ["--store", "s"]
     with pytest.raises(ValueError, match=f"makes this a {side} instance"):
         trace_steps.main(
             [*flags, "--out", str(tmp_path / "out"), "--", "--model", "m"]
@@ -283,13 +303,11 @@ def test_trace_steps_serves_simulated_and_publishes_what_its_server_recorded(
 ):
     record = tmp_path / "record"
     _drive(record, monkeypatch, {0: [0, 1]})
-    (tmp_path / "planted.py").write_text(PLANTED)
-    monkeypatch.setattr(serve, "SERVER", (sys.executable, str(tmp_path / "planted.py")))
+    plant_module(tmp_path, monkeypatch, PLANTED)
     monkeypatch.setattr(serve, "identity", lambda *args: IDENTITY)
     monkeypatch.setenv("PLANTED_RECORD", str(record))
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     flags = ["--step-stub", str(stub(tmp_path, 1)), "--out", str(tmp_path / "out")]
-    flags += ["--machine", str(tmp_path / "machine.json")]
+    flags += platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
     flags += ["--store", str(tmp_path / "store")]
     trace_steps.main([*flags, "--", "--model", str(tmp_path)])
 
@@ -319,10 +337,9 @@ def test_a_simulated_server_serves_a_client_and_publishes_its_steps(tmp_path):
     from test_vertical_slice import Traffic, publish_entry
 
     machine = copy.deepcopy(DOCUMENT)
-    (tmp_path / "machine.json").write_text(json.dumps(machine))
     out, store = tmp_path / "out", tmp_path / "store"
     argv = ["trace", "steps", "--step-stub", str(stub(tmp_path, 1))]
-    argv += ["--machine", str(tmp_path / "machine.json"), "--store", str(store)]
+    argv += [*platforms.flags(store, machine, tmp_path), "--store", str(store)]
     argv += ["--out", str(out), "--", "--model", MODEL, "--enforce-eager"]
     publish_entry(store, machine, ["--model", MODEL, "--enforce-eager"], os.environ)
     driver = subprocess.Popen(

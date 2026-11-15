@@ -10,9 +10,7 @@ module while ``aiperf.timing.phase.runner`` is still importing.
 import asyncio
 import uuid
 
-#: Added to every simulated ns stamp. Simulated time starts at 0, and aiperf
-#: reads a 0 start stamp as missing.
-EPOCH_NS = 10**9
+from atom.compass.carriers import EPOCH_NS
 
 
 def clock():
