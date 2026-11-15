@@ -293,7 +293,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 33
+PROTOCOL = 34
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -485,6 +485,8 @@ _GATHER = "atom.model_ops.attentions.token_layout.gather:gather_rows"
 V41_NAMES = {
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_prefix"): f"{_CACHE}.0",
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_extend"): f"{_CACHE}.1",
+    ("aiter.mla_sparse_prefill_v41.default", "kv_indptr_prefix"): f"{_CACHE}.0",
+    ("aiter.mla_sparse_prefill_v41.default", "kv_indptr_extend"): f"{_CACHE}.1",
     (_SCAN, "pptrs"): f"{_CACHE}.0",
     (_SCAN, "eptrs"): f"{_CACHE}.1",
     (_LOGITS, "out_logits"): "workspace._logits",
@@ -603,7 +605,8 @@ _WRITTEN = {
         for f in ("candidate_block_table", "lift_candidate_selection")
     },
 }
-#: DeepSeek-V4.1's sparse attention over its BF16 pool, by slot: the item of
+#: DeepSeek-V4.1's sparse attention over its BF16 pool, and over its FP8 one,
+#: by slot: the item of
 #: what its forward's index build returns (`PagedAttentionCache.
 #: attention_indices`, `(prefix, pptr, second, sptr)`) an activation slot
 #: takes, a list or, at a bounded replay's queries, a pointer table.
@@ -614,6 +617,7 @@ LISTS = {
     (_ATTEND, "kv_indices_extend"): 2,
     (_ATTEND, "kv_indptr_extend"): 3,
 }
+LISTS |= {("aiter.mla_sparse_prefill_v41.default", s): i for (_, s), i in LISTS.items()}
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
 #: the span, and past an exact buffer kills the process (aiter defect, #1977).

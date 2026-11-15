@@ -1071,8 +1071,9 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   extended to the bf16 leaf by [#3038](https://github.com/jgong5/ATOM/issues/3038)). The
   bf16 leaf is V4.1's sparse attention's operator, so `bench.ops.V4_SHARED` binds it so
   only on a step holding V4's prefill lists.
-  DeepSeek-V4.1's sparse attention (`capture.forward.V41_ATTENTION`), its index lists
-  sized as V4's, states the same three of its layer, and its indexer's scorers
+  DeepSeek-V4.1's sparse attention (`capture.forward.V41_ATTENTION`, over its FP8 pool
+  `V41_FP8_ATTENTION`), its index lists sized as V4's, states the same three of its
+  layer, and its indexer's scorers
   (`capture.forward.V41_SCORERS`: gfx1250's FlyDSL one and gfx950's Triton one) its
   `compress_ratio` and `index_candidates`, the most entries it scores where an earlier
   layer chose its candidates, else null (#2344). Its index keys' RoPE
