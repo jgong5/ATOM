@@ -49,7 +49,7 @@ from atom.compass.spec import MachineSpec
 
 CONFIG = pathlib.Path(__file__).with_name("qwen3_5_35b_a3b_fp8_config.json")
 CONFIG_ARCHITECTURES = json.loads(CONFIG.read_text())["architectures"]
-MACHINE = TREE / "scripts" / "compass" / "machines" / "mi308x-hjbog39.json"
+MACHINE = TREE / "tests" / "compass" / "machines" / "mi308x-hjbog39.json"
 ATTENTION = "aiter.unified_attention_with_output_base.default"
 SAMPLER = "atom.model_ops.rejection_sampler:rejection_sample"
 ARGMAX = "aiter.ops.flydsl.topk.topk_per_row_argmax:topk_per_row_argmax"

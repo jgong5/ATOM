@@ -6,7 +6,8 @@ An ARM directory holds one directory per point. A point holds two or more real
 runs, `real*/`, and one simulated run per backend that priced it,
 `step_linear/`, `step_grid/` or `op_graph/`; each run holds its client's
 `artifacts/` as `client.sh` writes them and its engine record,
-`steps/dp0.engine.json`. Every run of a point must have been given the same
+`steps/dp0.engine.json`, or, a deployment `deploy.sh` wrote, one in each of its
+sides, `prefill/` and `decode/`. Every run of a point must have been given the same
 client arguments (`artifacts/client_run.json`), whose profiling concurrency is
 the point's.
 
@@ -17,8 +18,9 @@ SemiAnalysisAI/InferenceX 4b94f096 (`request_metrics.py`, and
 phase or name none. A percentile interpolates linearly between ranks.
 
 - throughput per GPU: the input and output tokens over the time from the first
-  request's start to the last one's end, over the GPUs its engine record
-  states, `tensor_parallel_size` times `data_parallel_size`;
+  request's start to the last one's end, over the GPUs its engine records
+  state, each `tensor_parallel_size` times `data_parallel_size`: a
+  deployment's are its prefill side's plus its decode side's;
 - p90 TTFT; median TPOT, the median inter-token latency;
 - p90 interactivity, one over the p90 inter-token latency; p90 E2E-normalized
   interactivity, one over the p90 of each request's latency per output token;
@@ -59,7 +61,7 @@ from statistics import fmean
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.carriers import EPOCH_NS
 from atom.compass.run import CLIENT_DIR, OP_GRAPH, STEP_GRID, STEP_LINEAR, SUMMARY_FILE
-from atom.compass.validate.runs import CLIENT_RUN
+from atom.compass.validate.runs import CLIENT_RUN, sides
 
 RECORDS = "artifacts/profile_export.jsonl"
 SERVER_METRICS = "artifacts/server_metrics_export.json"
@@ -203,8 +205,10 @@ def metrics(run, simulated: bool = False) -> dict:
     starts = [int(m["request_start_ns"]) for m in meta if m.get("request_start_ns")]
     ends = [int(m["request_end_ns"]) for m in meta if m.get("request_end_ns")]
     duration = (max(ends) - min(starts)) / 1e9 if starts and ends else 0
-    engine = read_json(run / ENGINE_RECORD)
-    gpus = engine["tensor_parallel_size"] * (engine.get("data_parallel_size") or 1)
+    engines = [read_json(side / ENGINE_RECORD) for side in sides(run)]
+    gpus = sum(
+        e["tensor_parallel_size"] * (e.get("data_parallel_size") or 1) for e in engines
+    )
     if simulated:
         gpu, full, cpu = _hit_counters(run, sent) or (None, None, None)
     else:

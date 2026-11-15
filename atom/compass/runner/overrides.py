@@ -114,6 +114,7 @@ from torch.utils._device import _device_constructors
 
 from atom.compass.backends.base import CostBackend
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
+from atom.compass.memory.readings import PAGE_BOUND
 from atom.compass.runner.step_output import DeferredTokenStream, filler_token_ids
 
 logger = logging.getLogger(__name__)
@@ -517,14 +518,20 @@ class HostDeviceRecurrence:
         return released + post
 
 
-def schedulable_ladder(config: Any) -> list[int]:
-    """The capture sizes the scheduler can produce, ascending: ATOM's capture
-    bound, each sequence charged one token plus its drafts.
+def schedulable_bound(config: Any) -> int:
+    """The widest decode batch the scheduler can produce: ATOM's capture bound,
+    each sequence charged one token plus its drafts.
     `max_schedulable_decode_bs` holds it; importing that would pull the engine,
     and its kernels, into a driver-free process."""
     spec = getattr(config, "speculative_config", None)
     q = 1 + (spec.num_speculative_tokens if spec else 0)
-    bound = min(config.max_num_seqs, config.max_num_batched_tokens // q)
+    return min(config.max_num_seqs, config.max_num_batched_tokens // q)
+
+
+def schedulable_ladder(config: Any) -> list[int]:
+    """The capture sizes the scheduler can produce (`schedulable_bound`),
+    ascending."""
+    bound = schedulable_bound(config)
     return sorted(s for s in config.capture_sizes if s <= bound)
 
 
@@ -615,21 +622,24 @@ def _resident(readings: DeviceReadings, config: Any) -> int:
     after the load. Its `persistent` is read at the KV budget, after the
     attention builder that asks this has allocated, so none of it is counted.
 
-    Refused under `--index-cache-dtype fp4`, where DeepSeek-V4.1 sizes its
-    packed score workspace by the PAGEs left after this; on the fp8 plane the
-    answer sizes nothing."""
-    if getattr(config, "index_cache_dtype", None) == "fp4":
+    Under `--index-cache-dtype fp4`, where DeepSeek-V4.1 sizes its packed score
+    workspace by the PAGEs left after this, it adds `readings.page_bound`, what
+    a real start holds there above its load, and is refused without it; on the
+    fp8 plane the answer sizes nothing."""
+    fp4 = getattr(config, "index_cache_dtype", None) == "fp4"
+    if fp4 and readings.page_bound is None:
         raise RunnerRefusal(
             "under --index-cache-dtype fp4 DeepSeek-V4.1 bounds its score "
             "workspace by the PAGEs `memory_allocated` leaves, and a simulated "
             "start reads only the weights, buffers and load residue there; a "
             "real start also holds the drafter, the forward buffers and the "
-            "attention builder's own, which no memory reading separates, so "
-            "the PAGE bound would exceed a real start's. Pass "
+            "attention builder's own, and the run's memory readings state no "
+            f"{PAGE_BOUND}; take them again with compass measure memory, or pass "
             "--index-cache-dtype fp8, whose workspace does not read it."
         )
     held = ("weights", "buffers", "load residue")
-    return sum(t.nbytes for t in readings.peak_torch.terms if t.name in held)
+    resident = sum(t.nbytes for t in readings.peak_torch.terms if t.name in held)
+    return resident + (readings.page_bound.nbytes if fp4 else 0)
 
 
 @contextlib.contextmanager
@@ -1789,7 +1799,10 @@ def _group_step_seconds(
     has one reason.
 
     On the rank that keeps the parity record, each step also appends its cost
-    line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`; with a
+    line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`;
+    `t_s`, the engine's clock at the forward's entry, read through the
+    `compass_host`'s `now`, or None without one, so the forward runs from
+    `t_s` to `t_s` plus `group_s`, which it returns; with a
     `compass_host` that reports them, each of `HOST_SEGMENTS` and
     `MTP_SEGMENT` and `PP_RECV_SEGMENT`, the part of `W_launch` before a
     later stage's receive, in seconds, each 0.0 where the law has none, and `skipped`,
@@ -1908,8 +1921,10 @@ def _group_step_seconds(
     if hasattr(host, "segments"):
         skipped = [s for s in host.segments if s in host.skip]
         segments = {**host.segments, "skipped": skipped}
+    now = getattr(host, "now", None)
     line = {
         "step": step,
+        "t_s": None if now is None else now(),
         **segments,
         "device_s": device_s,
         "draft_s": draft_s,

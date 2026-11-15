@@ -110,8 +110,7 @@ BASE = Conditions.of(
 #: The platform `BASE` reads, as a key states it.
 STATED = {a.field: BASE.reading(a).value for a in PLATFORM}
 
-#: A key per row of the matrix. The three `machine_spec` rows share one key,
-#: because they are three facets of one artifact and that is the point of them.
+#: A key per row the tests below publish.
 KEY_OF: dict[Row, Key] = {
     Row.OP_GRAPH: Key.of(
         Kind.OP_GRAPH,
@@ -134,8 +133,10 @@ KEY_OF: dict[Row, Key] = {
         **LAYOUT,
         engine_config="cudagraph=piecewise,level=3",
     ),
-    Row.MACHINE_SPEC_CAPACITY: Key.of(
-        Kind.MACHINE_SPEC, **keyed_platform(Kind.MACHINE_SPEC, STATED)
+    Row.PROBE_RECORD: Key.of(
+        Kind.PROBE_RECORD,
+        host="hjbog-srdc-18",
+        **keyed_platform(Kind.PROBE_RECORD, STATED),
     ),
     Row.STEP_GRID_BUNDLE: Key.of(
         Kind.STEP_GRID_BUNDLE,
@@ -146,7 +147,6 @@ KEY_OF: dict[Row, Key] = {
         source_root=ATOM_ROOT.revision,
     ),
 }
-KEY_OF[Row.MACHINE_SPEC_TOKENIZER_TERMS] = KEY_OF[Row.MACHINE_SPEC_CAPACITY]
 
 
 def moved(conditions: Conditions, axis: Axis) -> Conditions:
@@ -195,8 +195,6 @@ def test_the_matrix_is_not_uniform():
     assert not MATRIX[Row.PRICE_LIST][Axis.MODEL].depends
     assert MATRIX[Row.PRICE_LIST][Axis.MODEL].note == "shape-parametric"
     assert MATRIX[Row.MEMORY_READINGS][Axis.MODEL].depends
-    assert not MATRIX[Row.MACHINE_SPEC_TOKENIZER_TERMS][Axis.DEVICE].depends
-    assert not MATRIX[Row.MACHINE_SPEC_CAPACITY][Axis.SOFTWARE_STACK].depends
 
 
 @pytest.mark.parametrize("kind", list(Kind))
@@ -295,7 +293,12 @@ def test_a_fingerprint_carries_only_the_cells_its_row_depends_on():
     assert fingerprint(Row.PRICE_LIST, BASE).axes == axes_of(Row.PRICE_LIST)
     assert Axis.MODEL not in fingerprint(Row.PRICE_LIST, BASE).axes
     assert Axis.MODEL in fingerprint(Row.MEMORY_READINGS, BASE).axes
-    assert fingerprint(Row.MACHINE_SPEC_CAPACITY, BASE).axes == (Axis.DEVICE,)
+    assert fingerprint(Row.PROBE_RECORD, BASE).axes == (
+        Axis.SOFTWARE_STACK,
+        Axis.TORCH,
+        Axis.DEVICE,
+        Axis.PTL,
+    )
 
 
 def test_no_axis_of_the_matrix_is_a_width():
@@ -333,40 +336,29 @@ def test_a_price_list_survives_a_model_change_and_memory_readings_refuse_one(tmp
     assert "deepseek-ai/DeepSeek-V3.1" in str(refused.value)
 
 
-def test_a_machine_spec_is_its_rows_and_a_device_change_moves_the_capacity(tmp_path):
-    """One artifact, a fingerprint per row, invalidated by different things.
-
-    This is the row that would be destroyed by tidying `machine_spec` into one
-    entry-wide fingerprint: the capacity is the silicon's, and the tokenizer
-    terms are host CPU work that no device change touches.
-    """
+def test_a_probe_record_refuses_a_device_change_and_survives_a_model_change(tmp_path):
+    """Vendor kernels timed on the cards: the silicon moves it, the model and
+    ATOM's source do not, since no model or engine code runs."""
     store = ArtifactStore(tmp_path)
-    entry = publish(store, KEY_OF[Row.MACHINE_SPEC_CAPACITY])
-    assert set(entry.fingerprints) == set(rows_for(Kind.MACHINE_SPEC))
+    entry = publish(store, KEY_OF[Row.PROBE_RECORD])
+    assert set(entry.fingerprints) == set(rows_for(Kind.PROBE_RECORD))
 
     with pytest.raises(ArtifactRefusal) as device:
         store.load(entry.key, conditions=moved(BASE, Axis.DEVICE), gates=GATES)
-    assert "`machine_spec: capacity` x `device`" in str(device.value)
-    assert "tokenizer terms" not in str(device.value)
+    assert "`probe_record` x `device`" in str(device.value)
 
-    with pytest.raises(ArtifactRefusal) as tokenizer:
-        store.load(entry.key, conditions=moved(BASE, Axis.MODEL), gates=GATES)
-    assert "`machine_spec: tokenizer terms` x `model` (tokenizer)" in str(
-        tokenizer.value
-    )
-    assert "capacity" not in str(tokenizer.value)
-
-    assert (
-        store.load(entry.key, conditions=moved(BASE, Axis.TORCH), gates=GATES).key
-        == entry.key
-    )
+    for axis in (Axis.MODEL, Axis.ATOM_SRC):
+        assert (
+            store.load(entry.key, conditions=moved(BASE, axis), gates=GATES).key
+            == entry.key
+        )
 
 
 def test_an_aiter_bump_refuses_while_its_meaning_is_open(tmp_path):
     """The default, because what an aiter bump means is left open (#168).
 
-    The rows that carry ROCm/AITER/RCCL refuse a bump; `machine_spec` does
-    not, because the silicon did not move. If it is settled as "warn", this is
+    The rows that carry ROCm/AITER/RCCL refuse a bump; `op_graph` does not,
+    because it times no kernel. If it is settled as "warn", this is
     the test that changes, and one cell of `MATRIX` with it.
     """
     store = ArtifactStore(tmp_path)
@@ -374,15 +366,15 @@ def test_an_aiter_bump_refuses_while_its_meaning_is_open(tmp_path):
         Axis.SOFTWARE_STACK,
         "rocm7.2.4 / aiter v0.1.20-103-g23f83724f / rccl2.22.3",
     )
-    for row in (Row.PRICE_LIST, Row.MEMORY_READINGS):
+    for row in (Row.PRICE_LIST, Row.MEMORY_READINGS, Row.PROBE_RECORD):
         publish(store, KEY_OF[row])
         with pytest.raises(ArtifactRefusal) as refused:
             store.load(KEY_OF[row], conditions=bumped, gates=GATES)
         assert refused.value.rule is Rule.INVALIDATED
         assert f"`{row}` x `ROCm / AITER / RCCL`" in str(refused.value)
 
-    spec = publish(store, KEY_OF[Row.MACHINE_SPEC_CAPACITY])
-    assert store.load(spec.key, conditions=bumped, gates=GATES).key == spec.key
+    graph = publish(store, KEY_OF[Row.OP_GRAPH])
+    assert store.load(graph.key, conditions=bumped, gates=GATES).key == graph.key
 
 
 def test_a_refusal_names_every_cell_that_moved(tmp_path):
@@ -477,15 +469,13 @@ BEFORE_HOST_CPU = {
     "op_graph": ("torch", "atom_src", "model", "engine_config"),
     "price_list": ("software_stack", "torch", "atom_src", "device"),
     "memory_readings": BUT_HOST_CPU,
-    "machine_spec_capacity": ("device",),
-    "machine_spec_tokenizer_terms": ("model",),
     "step_grid_bundle": BUT_HOST_CPU,
 }
 
 
 @pytest.mark.parametrize(
     "row",
-    [Row.OP_GRAPH, Row.MACHINE_SPEC_CAPACITY],
+    [Row.OP_GRAPH],
     ids=lambda row: row.name,
 )
 def test_an_entry_published_before_the_host_cpu_axis_still_loads(tmp_path, row):
@@ -742,7 +732,7 @@ def test_a_recorded_row_the_matrix_no_longer_names_is_refused(tmp_path):
     version does not change when the matrix does.
     """
     store = ArtifactStore(tmp_path)
-    entry = publish(store, KEY_OF[Row.MACHINE_SPEC_CAPACITY])
+    entry = publish(store, KEY_OF[Row.PROBE_RECORD])
     document = json.loads((entry.directory / "entry.json").read_bytes())
     document["fingerprints"]["region_terms"] = fingerprint(
         Row.MEMORY_READINGS, BASE

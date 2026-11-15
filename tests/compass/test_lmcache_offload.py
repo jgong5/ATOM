@@ -15,6 +15,7 @@ import json
 import math
 from types import SimpleNamespace
 
+import platforms
 import pytest
 import test_parity_record as parity_test
 from conftest import atom_config_double
@@ -345,14 +346,13 @@ def test_the_compass_runner_builds_the_worker_half_that_moves_nothing(monkeypatc
 
 
 def test_compass_run_writes_the_entry_its_flag_names(tmp_path):
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     (tmp_path / "stub.json").write_text(json.dumps({"decode_step": 0.01}))
     (tmp_path / "entry.json").write_text(json.dumps(_entry()))
     parser = argparse.ArgumentParser()
     runfile.add_arguments(parser)
     args = parser.parse_args(
         ["--step-stub", str(tmp_path / "stub.json")]
-        + ["--machine", str(tmp_path / "machine.json")]
+        + platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
         + ["--store", str(tmp_path / "store")]
         + ["--lmcache-offload", str(tmp_path / "entry.json")]
     )
