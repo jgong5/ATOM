@@ -613,12 +613,13 @@ measured. **Basis.** The owner on #3355; `08` D50.1; `11`, which owns `/metrics`
 it plots Prometheus series, which need `/metrics` sampled on the simulated clock,
 deferred. ATOM's Benchmark Dashboard (`.github/dashboard/index.html`) for the search's
 dashboard (T111, settled by [#3465](https://github.com/jgong5/ATOM/issues/3465)): its
-points are CI benchmark entries from `data.js`, each keyed by model, ISL/OSL, concurrency
-and hardware, with no field for a grading state, method shares, a refusal or a
-recommendation; its trade-off chart draws total throughput per GPU against one over the
-mean TPOT, neither of InferenceX's interactivities; a point links only an `https://` URL
-(`safeHref`), never a run's `report.html` beside the page; and it loads Chart.js from a
-CDN, so it draws nothing offline. Each would change ATOM's CI page for one Compass view.
+points are CI benchmark entries from `data.js`, with no field for a grading state, method
+shares, a refusal or a recommendation; its Disaggregated view
+(`renderAtomeshPerformanceTab`) switches between InferenceX's two interactivities, but
+draws the throughput of the tokens served alone, with no computed-token throughput; a
+point links only an `https://` URL (`safeHref`), never a run's `report.html` beside the
+page; and it loads Chart.js from a CDN, so it draws nothing offline. Each would change
+ATOM's CI page for one Compass view.
 
 ---
 
