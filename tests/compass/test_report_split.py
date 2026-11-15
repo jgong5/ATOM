@@ -205,6 +205,21 @@ def test_a_request_no_later_forward_hands_over_is_unsplit(tmp_path):
     assert out["unsplit"]["xb"] == "no later forward hands its first token over"
 
 
+def test_a_request_aiperf_finished_with_no_first_token_is_unsplit(tmp_path):
+    """aiperf records a success with no content response with no TTFT."""
+    run = tmp_path / "run"
+    _deployment(run)
+    rows = run / "artifacts" / "profile_export.jsonl"
+    lines = [json.loads(line) for line in rows.read_text().splitlines()]
+    del lines[1]["metrics"]["time_to_first_token"]
+    rows.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    out = split.write(run)
+
+    assert [r["response_id"] for r in out["requests"]] == ["a"]
+    assert out["unsplit"]["xb"] == "aiperf records no first token for it"
+
+
 def test_a_pipelines_record_is_refused(tmp_path):
     run = tmp_path / "run"
     _deployment(run)
