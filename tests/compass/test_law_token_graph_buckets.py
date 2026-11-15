@@ -132,3 +132,15 @@ def test_a_runner_that_records_no_token_graph_keeps_a_law_stating_none(
     install(tmp_path, monkeypatch, run, r)
 
     assert r.capture_cudagraph() == (0.0, [], 0)
+
+
+def test_a_decode_only_runner_keeps_a_law_whose_prefill_vector_states_buckets(
+    monkeypatch, tmp_path
+):
+    """A disaggregated decode engine records no prefill buckets, so a law whose
+    records' runner did, as a prefill-and-decode deployment's, still runs."""
+    r = recording(tmp_path, decode_only=True)
+    run = build(tmp_path, "--step-linear", law_file(tmp_path, r, RECORDED))
+    install(tmp_path, monkeypatch, run, r)
+
+    assert r.capture_cudagraph() == (0.0, [], 0)
