@@ -9,17 +9,22 @@ from types import SimpleNamespace
 
 import torch
 from test_bench_ops import _graph, _leaf, _Runner, _t
+from test_capture_packed_window import _own_process
 
 from atom.compass.bench import ops
+from atom.compass.capture import driverless
 from atom.utils import forward_context as fctx
 
 
 def test_the_drafter_s_window_read_takes_its_stage_layers_rows_at_the_step_s_slots(
-    monkeypatch,
+    monkeypatch, request, tmp_path
 ):
     # V4.1's FP8 pool of 2 pages and 4 state slots, a ring of 5 rows of 33
     # bytes a layer; the drafter's stages read layers 2 and 1, a decode's 2
     # rows in slots 3 and 1: 20 ring rows, each by its byte address tagged FP8
+    if _own_process(request):
+        return
+    driverless.install(str(tmp_path), "gfx1250")
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
         V41PoolGeometry,
