@@ -393,7 +393,8 @@ and each point's readings one, *reuse*, *measure* or *refused*, naming the requi
 that failed; `compass advice` calls it and judges nothing. A reused input is stated in
 the run's provenance.
 
-1. **Same key**, as `07` D41 keys each kind, at the head's ATOM. The check compares the
+1. **Same key**, as `07` D41 keys each kind, at the head's ATOM, a law's and its host
+   laws' capture ladder one the candidate's is a non-empty prefix of (`09` D54). The check compares the
    ATOM digest of the tree `atom` resolves under
    (`atom/compass/run/__init__.py::atom_digest`, the sha256 of ATOM's Python less
    Compass's own code, which every key reads) with the head's: the digest of the `atom/`
@@ -687,8 +688,9 @@ development nodes.
 - **The template**: #3256's arms with the submission's arguments as #3256 records them,
   `--max-num-seqs` twice the concurrency, EAGLE3 at `14` D87.1's forced length and the
   `agentx` workload (`06` D35.1), each arm at every concurrency InferenceX ran; a point
-  that cannot be priced is a grey coverage report. How one law serves points whose
-  `--max-num-seqs` differs is #3275's ruling (T113).
+  that cannot be priced is a grey coverage report. A law serves each point whose capture
+  ladder is a prefix of its own, so an arm's law keyed at its top point serves its lower
+  ones (#3275, T113).
 - **Calibration** as `16` D95.1's, after the environment check: a base law each for TP4,
   TP4 with indexer CP and TP2, the last two pooling their LMCache arms' records, with `03`
   D13.1's offload terms, only if those arms come up; a readings entry per point; each step
@@ -766,8 +768,7 @@ settled by the [sixth ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomm
 No spike and no sync issue: no decision waits on a measurement, and none needs an
 interface only the upstream has. Other issues settle what decisions leave to them: #3256's
 grading, which reopens the showcase's pricing if it fails the step linear law where the
-step grid passes on a cell the showcase runs (D117); #3275 how one law serves an arm's
-points (T113); #3054 the indexer-CP key MiniMax-M3's move waits on (D117); #2311 who judges a change that
+step grid passes on a cell the showcase runs (D117); #3054 the indexer-CP key MiniMax-M3's move waits on (D117); #2311 who judges a change that
 moves step costs (D112); #3122 readings re-keyed with a law, and trees other than the
 head (D112); #1498 the op-family split's inputs on DeepSeek-V4-Pro (D114).
 
