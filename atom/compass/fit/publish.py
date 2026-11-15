@@ -258,8 +258,8 @@ def publish(args, command: str, key, readings: Conditions, params, report):
     and write their readable copy in `args.out`."""
     if args.ptl:
         report = {**report, "stated_ptl": args.ptl}
-    if args.engine:
-        report = {**report, "stated_engine": read_json(args.engine)}
+    if engine := getattr(args, "engine", None):  # `fit ops` states none
+        report = {**report, "stated_engine": read_json(engine)}
     members, at = {"params": params, "report": report}, ranks(key)
     ArtifactStore(args.store).publish(
         key,
