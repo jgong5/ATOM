@@ -135,6 +135,9 @@ gathered table (at most K), copy
 c mod N with the c-th weights on that copy's other arguments. Of a leaf whose
 later occurrences take a `QUERIED` slot, M and N round up to a multiple of its
 occurrences, and K past them down, so each occurrence takes as many calls.
+A leaf whose N copies stop under both M and K, that plane's where no cold
+layout fits beside its widest rows, refuses by name, naming the share of
+`COLD` times the cache its copies' bytes read.
 Copy c < N takes fresh activations below M and copy c mod M's from there,
 weight c mod the more of M and the leaf's occurrences, a gathered table's one
 weight, its ids rows c n to (c + 1) n of one seeded permutation of the table's
@@ -293,7 +296,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 35
+PROTOCOL = 36
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -1102,6 +1105,7 @@ class Stub:
         # by leaf, the cache and pass step whose indptrs it reads (`_prepare`)
         self.fills = {}
         self.cold_copies, self.clones, self.kv, self.state = {}, {}, {}, {}
+        self.sizes = {}  # by leaf, its bytes a call (`_plan`)
         # `once`: by leaf, the bytes of a buffer every copy launches
         self.written, self.unplanned, self.once = {}, {}, {}
         self.modules = dict(runner.model.named_modules())
@@ -1579,7 +1583,8 @@ class Stub:
                 }
                 need = max(n for _, _, n, _ in plans.values())
             p += 1
-        self.cold_copies = {s: self._cold(size) for s, (_, size, *_) in plans.items()}
+        self.sizes = {s: size for s, (_, size, *_) in plans.items()}
+        self.cold_copies = {s: self._cold(size) for s, size in self.sizes.items()}
         got = []
         for sig, (op, inst) in found.items():
             n, size, _, (by_block, by_slot) = plans[sig]
@@ -1795,9 +1800,11 @@ class Stub:
         none of a call its cold graph timed. Every rank's graph holds the most K
         any rank's call gives, and a leaf any rank refuses, every rank does; K
         past a leaf's occurrences, where later ones take a `QUERIED` buffer, a
-        multiple of them. A MORI leaf is timed at MORI's entry point through
-        graphs of its own (`_Mori`), each one's median kept (`parts_ns`); a
-        combine's routing is its first copy's."""
+        multiple of them. Refused, naming the share of `COLD` times the cache
+        its copies read, where `n` stops under both `m` and K. A MORI leaf is
+        timed at MORI's entry point through graphs of its own (`_Mori`), each
+        one's median kept (`parts_ns`); a combine's routing is its first
+        copy's."""
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
 
@@ -1851,6 +1858,14 @@ class Stub:
             k -= k % o if k > o else 0
             n = min(n, k)
             with refused_together():
+                # under the cache-sized copies and K: an FP8 index plane's,
+                # stopped where their buffers pass 4 * COLD * llc (`_plan`)
+                if n < min(m, k):
+                    read = 100 * n * self.sizes[sig] // (COLD * self.llc)
+                    raise ValueError(
+                        f"its {n} copies for {k} calls read {read}% of twice the "
+                        "cache: no cold layout fits its ragged rows"
+                    )
                 calls += [
                     self._copy(op, sig, instances, c) for c in range(1, min(n, m))
                 ]
