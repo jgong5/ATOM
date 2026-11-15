@@ -36,7 +36,7 @@ when a law's verdict is ``calibrate``; else ``searchable``. A searchable
 candidate's point whose readings a verdict sends to measure is ``missing
 readings``, with its command. Each other point starts with no traffic, as the
 search will run it, for what only a start shows: `compass run`, or `deploy.sh
-run` on 1P1D with no router arguments, its decode side through a local
+run` on 1P1D with `ROUTER`'s router arguments, its decode side through a local
 ``--on`` prefix carrying its own variables where SPACE names a network. A
 point answers once the start's ``server.json`` names it, and is
 ``searchable``; a start that leaves first, or does not answer in `START_S`,
@@ -47,6 +47,7 @@ measured.
 
 import contextlib
 import functools
+import itertools
 import json
 import os
 import shutil
@@ -77,6 +78,17 @@ COMPASS, DEPLOY = (
 #: Seconds a start has to answer, and its stop to leave: deploy.sh's default
 #: wait for each of its instances and its router.
 START_S = 3 * 600
+#: The router arguments of a 1P1D start: ATOM's adapter, which asks the
+#: prefill side for the KV transfer the decode side takes, where the router's
+#: default is SGLang's; and none of the wall-clock failure detectors, which
+#: `deploy.sh run` leaves its caller to switch off.
+ROUTER = (
+    "--backend",
+    "atom",
+    "--disable-health-check",
+    "--disable-circuit-breaker",
+    "--disable-retries",
+)
 
 
 def check(expansion: dict, out: Path) -> dict:
@@ -246,8 +258,20 @@ def serving(machine, candidate, point, verdicts, store, at: Path) -> tuple[list,
             f"by {' '.join(words)}"
         )
     command = [DEPLOY, at, "run", *flags, "--prefill", "--", *sides["prefill"]["args"]]
-    command += ["--decode", *on, "--", *sides["decode"]["args"], "--router", "--"]
-    return command, prefill
+    command += ["--decode", *on, "--", *sides["decode"]["args"]]
+    return command + ["--router", "--", *ROUTER], prefill
+
+
+def launched(command: list, env: dict, at: Path, until) -> "Command":
+    """`command` under `env`, run into `at` afresh, its output beside it in
+    ``<at>.log``, and waited for until it leaves, the ``server.json`` it
+    writes in `at` names its server, or `until()` holds, at most `START_S`."""
+    shutil.rmtree(at, ignore_errors=True)
+    at.parent.mkdir(parents=True, exist_ok=True)
+    server = Command(command, env, at.with_name(at.name + ".log"))
+    ready = at / serve.READY_FILE
+    server.wait(int(START_S / serve.POLL_S), lambda: ready.is_file() or until())
+    return server
 
 
 def _started(command: list, env: dict, at: Path) -> str | None:
@@ -255,35 +279,65 @@ def _started(command: list, env: dict, at: Path) -> str | None:
     names its server, then stop it with SIGTERM, as each is stopped: None.
     When it leaves first or does not answer in `START_S`, its last line and
     the first error raised in each log under `at`."""
-    shutil.rmtree(at, ignore_errors=True)
-    at.parent.mkdir(parents=True, exist_ok=True)
-    log = at.with_name(at.name + ".log")
-    with log.open("w") as written:
-        server = subprocess.Popen(
-            list(map(str, command)),
-            stdout=written,
-            stderr=subprocess.STDOUT,
-            env=os.environ | env,
-            cwd=serve.TREE,
-            start_new_session=True,
-        )
+    server = launched(command, env, at, lambda: False)
     ready = at / serve.READY_FILE
-    for _ in range(int(START_S / serve.POLL_S)):
-        if server.poll() is not None or ready.is_file():
-            break
-        time.sleep(serve.POLL_S)
-    answered, left = ready.is_file(), server.poll() is not None
-    server.terminate()
-    try:
-        server.wait(START_S)
-    except subprocess.TimeoutExpired:
-        os.killpg(server.pid, signal.SIGKILL)
-        server.wait()
+    answered, left = ready.is_file(), server.left()
+    server.end()
     if answered:
         return None
     said = [] if left else [f"no {ready} in {START_S} s"]
-    said += [_said(log, last=True), *(_said(p) for p in sorted(at.rglob("*.log")))]
+    said += [_said(server.log, last=True)]
+    said += [_said(p) for p in sorted(at.rglob("*.log"))]
     return "; ".join(dict.fromkeys(filter(None, said)))
+
+
+class Command:
+    """A command in a process group of its own, run in the tree under this
+    process's environment and `env`, its output in `log`; once reaped, its
+    exit ``status`` and the CPU seconds it and the processes it waited for
+    took."""
+
+    def __init__(self, command: list, env: dict, log: Path):
+        self.log = log
+        with log.open("w") as written:
+            self.process = subprocess.Popen(
+                list(map(str, command)),
+                stdout=written,
+                stderr=subprocess.STDOUT,
+                env=os.environ | env,
+                cwd=serve.TREE,
+                start_new_session=True,
+            )
+        self.status, self.cpu_s = None, 0.0
+
+    def left(self) -> bool:
+        """Whether it has exited, reaped here for its status and CPU seconds."""
+        if self.status is None:
+            pid, status, usage = os.wait4(self.process.pid, os.WNOHANG)
+            if pid:
+                self.status = os.waitstatus_to_exitcode(status)
+                self.process.returncode = self.status
+                self.cpu_s = usage.ru_utime + usage.ru_stime
+        return self.status is not None
+
+    def wait(self, polls: int | None, until) -> None:
+        """Until it exits or `until()` holds, for at most `polls` polls, or
+        with no bound when None."""
+        for _ in itertools.count() if polls is None else range(polls):
+            if self.left() or until():
+                return
+            time.sleep(serve.POLL_S)
+
+    def end(self) -> None:
+        """Stop it with SIGTERM; SIGKILL its group after `START_S`; and reap
+        it."""
+        # Not Popen's own signalling: its poll would reap the process first.
+        if not self.left():
+            os.kill(self.process.pid, signal.SIGTERM)
+            self.wait(int(START_S / serve.POLL_S), lambda: False)
+        if not self.left():
+            os.killpg(self.process.pid, signal.SIGKILL)
+            self.wait(None, lambda: False)
 
 
 def _said(log: Path, last: bool = False) -> str | None:

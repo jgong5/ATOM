@@ -4,15 +4,17 @@ fresh server driven by one client run, in parallel, a failed point tried again
 and then listed, a finished one skipped on a rerun.
 
 The check is `test_advice_check`'s, its law the re-keyed DPA8 law as a law
-file. `compass run`, `deploy.sh` and `client.sh` are stubs that log each call.
-A server answers at once, and on SIGTERM writes the run summary and the run
-file, but no summary for the point ``STUB_NO_SUMMARY`` names, and exits 0;
-under a run directory it leaves before answering for the points
-``STUB_FAILS`` names, as many times as it says. The client sleeps the
-seconds ``STUB_CLIENT_S`` gives its point, writes the client export, then
-stops the server through its ``server.json`` and waits for it to leave; it
-exits 1 for the points ``STUB_CLIENT_FAIL`` names, and for the point
-``STUB_HANG`` names writes its pid and sleeps.
+file. `compass run`, `deploy.sh` and `client.sh` are stubs that log each call,
+a server's with the ``STUB_X`` it runs under. A server answers at once, and on
+SIGTERM writes the run summary and the run file, but no summary for the point
+``STUB_NO_SUMMARY`` names, and exits 0, or 3 for the point
+``STUB_SERVER_EXIT`` names; under a run directory it leaves before answering
+for the points ``STUB_FAILS`` names, as many times as it says. The client
+spends the CPU seconds ``STUB_CLIENT_CPU_S`` gives, sleeps the seconds
+``STUB_CLIENT_S`` gives its point, writes the client export, then stops the
+server through its ``server.json`` and waits for it to leave; it exits 1 for
+the points ``STUB_CLIENT_FAIL`` names, and for the point ``STUB_HANG`` names
+writes its pid and sleeps.
 """
 
 import json
@@ -32,6 +34,7 @@ from test_run_step_grid import DOCUMENT
 
 from atom.compass import cli
 from atom.compass.advice import check, simulate
+from atom.compass.drive import reuse
 
 SERVER = """#!{python}
 import json, os, signal, sys, time
@@ -42,14 +45,14 @@ at = Path(argv[0] if argv[0] != "run" else argv[argv.index("--out") + 1])
 def log(**entry):
     with open(os.environ["STUB_CALLS"], "a") as calls:
         calls.write(json.dumps(entry) + "\\n")
-log(argv=argv)
+log(argv=argv, x=os.environ.get("STUB_X"))
 at.mkdir(parents=True)
 def stop(*_):
     for name in ("summary.json", "run_file.json"):
         if name != "summary.json" or at.name != os.environ.get("STUB_NO_SUMMARY"):
             (at / name).write_text(json.dumps({{"point": at.name}}))
     log(down=str(at))
-    sys.exit(0)
+    sys.exit(3 if at.name == os.environ.get("STUB_SERVER_EXIT") else 0)
 signal.signal(signal.SIGTERM, stop)
 fails = json.loads(os.environ.get("STUB_FAILS", "{{}}")).get(at.name, 0)
 if at.parent.name == "runs" and fails:
@@ -78,6 +81,9 @@ if at.name == os.environ.get("STUB_HANG"):
     Path(os.environ["STUB_CALLS"] + ".t").write_text(str(os.getpid()))
     os.rename(os.environ["STUB_CALLS"] + ".t", os.environ["STUB_CALLS"] + ".hung")
     time.sleep(600)
+spent = time.process_time() + float(os.environ.get("STUB_CLIENT_CPU_S", 0))
+while time.process_time() < spent:
+    pass
 time.sleep(json.loads(os.environ.get("STUB_CLIENT_S", "{{}}")).get(at.name, 0))
 (at / "artifacts").mkdir()
 (at / "artifacts" / "client_run.json").write_text(json.dumps({{"point": at.name}}))
@@ -104,15 +110,19 @@ def simulating(tmp_path, stubbed, monkeypatch):  # noqa: F811
     monkeypatch.setattr(check, "DEPLOY", tmp_path / "server")
     monkeypatch.setattr(simulate, "CLIENT", tmp_path / "client")
     monkeypatch.setenv("HARNESS_PYTHON", "/sim/python")
-    for name in ("FAILS", "CLIENT_FAIL", "NO_SUMMARY", "HANG", "CLIENT_S"):
+    stubs = "FAILS CLIENT_FAIL NO_SUMMARY HANG CLIENT_S CLIENT_CPU_S SERVER_EXIT"
+    for name in stubs.split():
         monkeypatch.delenv(f"STUB_{name}", raising=False)
     return stubbed
 
 
-def searched(tmp_path, dimensions: dict, out="out", network=None, **workload) -> dict:
+def searched(
+    tmp_path, dimensions: dict, out="out", network=None, whole=True, **workload
+) -> dict:
     """`compass advice` on `dimensions`' candidates at concurrencies 1 and 4,
     on the suite's platform and `network`, with `workload`'s fields in place
-    of its own, into `out`; the outcomes the simulation writes."""
+    of its own, into `tmp_path`'s `out`, named whole or, unless `whole`, from
+    `tmp_path` as the working directory; the outcomes the simulation writes."""
     flags = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
     machine = {"device": flags[1], "ptl": flags[3]}
     space = {
@@ -130,7 +140,8 @@ def searched(tmp_path, dimensions: dict, out="out", network=None, **workload) ->
         "dimensions": {"config": dimensions},
     }
     (tmp_path / "space.json").write_text(json.dumps(space))
-    cli.main(["advice", str(tmp_path / "space.json"), str(tmp_path / out)])
+    given = str(tmp_path / out) if whole else out
+    cli.main(["advice", str(tmp_path / "space.json"), given])
     return json.loads((tmp_path / out / simulate.SIMULATED).read_text())
 
 
@@ -140,23 +151,29 @@ def calls(tmp_path, what: str) -> list:
     return [c for c in starts(tmp_path) if what in c]
 
 
-def ran(tmp_path, at: Path) -> list[list[str]]:
-    """Each server command started into `at`, in order: `compass run`'s
-    ``--out``, or `deploy.sh`'s OUT."""
-    return [
-        argv
-        for argv in (c["argv"] for c in calls(tmp_path, "argv"))
-        if str(at) == (argv[argv.index("--out") + 1] if argv[0] == "run" else argv[0])
-    ]
+def ran(tmp_path, at: Path, what="argv") -> list:
+    """Each server started into `at`, `compass run`'s ``--out`` or `deploy.sh`'s
+    OUT, in order: its command, or, as `what` ``x``, the ``STUB_X`` it ran
+    under."""
+
+    def into(argv: list[str]) -> str:
+        return argv[argv.index("--out") + 1] if argv[0] == "run" else argv[0]
+
+    return [c[what] for c in calls(tmp_path, "argv") if str(at) == into(c["argv"])]
 
 
+@pytest.mark.parametrize("whole", [True, False])
 def test_each_searchable_point_runs_on_a_fresh_server_with_one_client_run(
-    tmp_path, simulating, capsys
+    tmp_path, simulating, monkeypatch, capsys, whole
 ):
     # b reads readings of its own at both points: each is missing readings.
-    dimensions = {"a": {}, "b": {"per_concurrency": {"--max-model-len": 256}}}
+    dimensions = {"a": {"env": {"STUB_X": "1"}}}
+    dimensions["b"] = {"per_concurrency": {"--max-model-len": 256}}
+    monkeypatch.setenv("STUB_CLIENT_CPU_S", "0.2")
+    if not whole:
+        monkeypatch.chdir(tmp_path)
 
-    found = searched(tmp_path, dimensions, select="0-7", duration_s=600)
+    found = searched(tmp_path, dimensions, whole=whole, select="0-7", duration_s=600)
 
     out = tmp_path / "out"
     assert list(found["points"]) == ["a-c1", "a-c4"]
@@ -164,7 +181,7 @@ def test_each_searchable_point_runs_on_a_fresh_server_with_one_client_run(
     for point, n in (("a-c1", 1), ("a-c4", 4)):
         at = out / simulate.RUNS / point
         held = found["points"][point]
-        assert held["cpu_s"] >= 0
+        assert held["cpu_s"] >= 0.2
         assert held == {
             "state": "finished",
             "run": str(at),
@@ -178,6 +195,7 @@ def test_each_searchable_point_runs_on_a_fresh_server_with_one_client_run(
         assert ran(tmp_path, at) == [
             [str(at) if w == str(out / check.STARTS / "a-c1") else w for w in started]
         ]
+        assert ran(tmp_path, at, "x") == ["1"]
         (client,) = [c for c in calls(tmp_path, "client") if c["client"][0] == str(at)]
         assert client == {
             "client": [str(at), "--traces", "0-7", "--concurrency", str(n)]
@@ -199,6 +217,7 @@ def test_each_searchable_point_runs_on_a_fresh_server_with_one_client_run(
         ({"STUB_FAILS": '{"a-c1": 2}'}, "the server exited 1 before /health answered"),
         ({"STUB_CLIENT_FAIL": "a-c1"}, "client: aiperf: exited 1; see "),
         ({"STUB_NO_SUMMARY": "a-c1"}, "no summary.json in "),
+        ({"STUB_SERVER_EXIT": "a-c1"}, "server exited 3"),
     ],
 )
 def test_a_failed_point_is_tried_again_then_listed_with_its_reason_and_left_out(
@@ -253,6 +272,15 @@ def test_a_rerun_skips_each_finished_point_and_runs_what_did_not_finish_or_chang
     changed = searched(tmp_path, {"a": {}}, duration_s=60)
 
     assert [p["skipped"] for p in changed["points"].values()] == [False, False]
+    assert len(calls(tmp_path, "client")) == before + 2
+    before = len(calls(tmp_path, "client"))
+    # The same space, at another head.
+    taken = reuse.head() | {"commit": "deadbeef" * 5}
+    monkeypatch.setattr(reuse, "head", lambda commit=None: taken)
+
+    moved = searched(tmp_path, {"a": {}}, duration_s=60)
+
+    assert [p["skipped"] for p in moved["points"].values()] == [False, False]
     assert len(calls(tmp_path, "client")) == before + 2
 
 
@@ -319,7 +347,11 @@ def test_a_1p1d_point_runs_its_deployment_and_one_client_through_it(
     assert found["points"]["p-c1"]["state"] == "finished"
     (deployed,) = ran(tmp_path, at)
     assert deployed[1:3] == ["run", "--device"]
-    assert deployed[-2:] == ["--router", "--"]
+    # ATOM's adapter, and none of the router's wall-clock detectors.
+    assert deployed[deployed.index("--router") :] == [
+        *("--router", "--", "--backend", "atom", "--disable-health-check"),
+        *("--disable-circuit-breaker", "--disable-retries"),
+    ]
     assert [c["client"][0] for c in calls(tmp_path, "client")].count(str(at)) == 1
     assert found["at_once"] == max(1, len(os.sched_getaffinity(0)) // 2)
 

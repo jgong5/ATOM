@@ -12,13 +12,13 @@ finished once both exit 0 and its directory holds the run summary, the run
 file and the client export (`HELD`); then ``point.json`` there records what
 ran, the CPU seconds the two commands and the processes they waited for took,
 and the tries. A rerun skips a point whose ``point.json`` records what it
-would run; any other directory there is removed first. A point that fails is
-tried again from a fresh directory, then listed with each try's reason: the
-client's last line, the server command's, and the first error raised in each
-log under the point's directory. Each command's output is beside the
-directory, in ``<point>.log`` and ``<point>.client.log``. With
-``HARNESS_PYTHON``, the Python `client.sh` runs aiperf under, unset, no point
-runs, and each is listed with why.
+would run, at the commit the check took as the head; any other directory
+there is removed first. A point that fails is tried again from a fresh
+directory, then listed with each try's reason: the client's last line, the
+server command's, and the first error raised in each log under the point's
+directory. Each command's output is beside the directory, in ``<point>.log``
+and ``<point>.client.log``. With ``HARNESS_PYTHON``, the Python `client.sh`
+runs aiperf under, unset, no point runs, and each is listed with why.
 
 Points start in SPACE's order, as many at once as this process's CPUs hold
 the widest point's ranks, each rank one CPU; each server draws its own ports.
@@ -29,14 +29,9 @@ host's CPU and the points run at once.
 """
 
 import concurrent.futures
-import itertools
 import json
 import os
-import shutil
-import signal
-import subprocess
 import threading
-import time
 from pathlib import Path
 
 from atom.compass import run as compass_run
@@ -126,8 +121,9 @@ def lines(outcome: dict) -> list[str]:
 
 def _plan(expansion: dict, judged: dict, candidate: dict, point: dict, out: Path):
     """What `point` of `candidate` runs into `out`'s `RUNS`: its ``at``; as
-    ``ran``, its server's and its client's commands and variables; and its
-    ``ranks``, TP times DP over its instances."""
+    ``ran``, the head's commit, which the tree that runs it is, and its
+    server's and its client's commands and variables; and its ``ranks``, TP
+    times DP over its instances."""
     held = judged["candidates"][candidate["name"]]
     at, verdicts = out / RUNS / point["name"], held["points"][point["name"]]
     machine, store = expansion["machine"], held["store"]
@@ -137,6 +133,7 @@ def _plan(expansion: dict, judged: dict, candidate: dict, point: dict, out: Path
     client = [CLIENT, at, *select, "--concurrency", point["concurrency"]]
     client += ["--duration", workload["duration_s"]] if "duration_s" in workload else []
     ran = {
+        "head": judged["head"]["commit"],
         "server": list(map(str, server)),
         "env": env,
         "client": list(map(str, [*client, "--stop"])),
@@ -185,17 +182,12 @@ def _try(plan: dict, stopping: threading.Event) -> tuple[str | None, float]:
     """One try of `plan`'s point from a fresh directory: None once it
     finished, else why not; and the CPU seconds its commands took."""
     at, ran = plan["at"], plan["ran"]
-    shutil.rmtree(at, ignore_errors=True)
-    at.parent.mkdir(parents=True, exist_ok=True)
-    log, client_log = (at.with_name(at.name + end) for end in (".log", ".client.log"))
-    ready = at / serve.READY_FILE
-    server = _Command(ran["server"], ran["env"], log)
-    polls = int(check.START_S / serve.POLL_S)
-    server.wait(polls, lambda: ready.is_file() or stopping.is_set())
+    server = check.launched(ran["server"], ran["env"], at, stopping.is_set)
+    ready, client_log = at / serve.READY_FILE, at.with_name(at.name + ".client.log")
     said, cpu_s = [], 0.0
     served = ready.is_file() and not stopping.is_set()
     if served:
-        client = _Command(ran["client"], ran["client_env"], client_log)
+        client = check.Command(ran["client"], ran["client_env"], client_log)
         client.wait(None, stopping.is_set)
         client.end()
         cpu_s += client.cpu_s
@@ -208,56 +200,9 @@ def _try(plan: dict, stopping: threading.Event) -> tuple[str | None, float]:
     cpu_s += server.cpu_s
     if server.status or not served:
         exited = f"{ran['server'][0]} exited {server.status}"
-        said.append(check._said(log, last=True) or exited)
+        said.append(check._said(server.log, last=True) or exited)
     if not said:
         lacking = [name for name in HELD if not (at / name).is_file()]
         return (f"no {', '.join(lacking)} in {at}" if lacking else None), cpu_s
     said += [check._said(p) for p in sorted(at.rglob("*.log"))]
     return "; ".join(dict.fromkeys(filter(None, said))), cpu_s
-
-
-class _Command:
-    """A command in a process group of its own, under this process's
-    environment and `env`, its output in `log`; once reaped, its exit
-    ``status`` and the CPU seconds it and the processes it waited for took."""
-
-    def __init__(self, command: list, env: dict, log: Path):
-        with log.open("w") as written:
-            self.process = subprocess.Popen(
-                command,
-                stdout=written,
-                stderr=subprocess.STDOUT,
-                env=os.environ | env,
-                cwd=serve.TREE,
-                start_new_session=True,
-            )
-        self.status, self.cpu_s = None, 0.0
-
-    def left(self) -> bool:
-        """Whether it has exited, reaped here for its status and CPU seconds."""
-        if self.status is None:
-            pid, status, usage = os.wait4(self.process.pid, os.WNOHANG)
-            if pid:
-                self.status = os.waitstatus_to_exitcode(status)
-                self.process.returncode = self.status
-                self.cpu_s = usage.ru_utime + usage.ru_stime
-        return self.status is not None
-
-    def wait(self, polls: int | None, until) -> None:
-        """Until it exits or `until()` holds, for at most `polls` polls, or
-        with no bound when None."""
-        for _ in itertools.count() if polls is None else range(polls):
-            if self.left() or until():
-                return
-            time.sleep(serve.POLL_S)
-
-    def end(self) -> None:
-        """Stop it with SIGTERM, as the check stops a start; SIGKILL its group
-        after `check.START_S`; and reap it."""
-        # Not Popen's own signalling: its poll would reap the process first.
-        if not self.left():
-            os.kill(self.process.pid, signal.SIGTERM)
-            self.wait(int(check.START_S / serve.POLL_S), lambda: False)
-        if not self.left():
-            os.killpg(self.process.pid, signal.SIGKILL)
-            self.wait(None, lambda: False)

@@ -376,7 +376,7 @@ def test_a_1p1d_start_takes_the_decode_side_s_own_variables_in_a_local_prefix(
         *("--step-linear", where, "--host-laws", where, "--network", NETWORK),
         *("--prefill", "--", *model, "--enable-tbo"),
         *("--decode", "--on", "env -u STUB_PREFILL STUB_SIDE=decode"),
-        *("--", *model, "--router", "--"),
+        *("--", *model, "--router", "--", *check.ROUTER),
     ]
     held = ("STUB_BOTH", "STUB_PREFILL", "STUB_SIDE")
     assert [call["env"].get(k) for k in held] == ["1", "1", None]
