@@ -35,7 +35,7 @@ from atom.compass.spec import MachineSpec
 
 TREE = pathlib.Path(__file__).resolve().parents[2]
 CONFIG = pathlib.Path(__file__).with_name("deepseek_v3_config.json")
-MI355X = TREE / "scripts" / "compass" / "machines" / "mi355x-gpu45.json"
+MI355X = TREE / "tests" / "compass" / "machines" / "mi355x-gpu45.json"
 #: Heads, the decode kernel's padded heads, latent, rope, no-rope and value.
 MLA = (2, 4, 8, 4, 6, 5)
 

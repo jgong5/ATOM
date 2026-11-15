@@ -42,10 +42,12 @@ what differs:
 - a run at data-parallel width above one, since every bundle is measured at one;
 - a keyed condition, the grid's graph mode, a timing scope other than the
   whole ``ModelRunner.forward``, or a value other than ``measure steps``'
-  bench window (`step_grid_fit.VALUE`), none included;
-- the gates, or any reading, through `ArtifactStore.load`;
-- a rung of the ladder between the grid's lowest and highest measured rungs
-  that was not measured;
+  bench window (`step_grid_fit.VALUE`), none included; a ladder that is a
+  non-empty prefix of the bundle's is read as the bundle's (`at_ladder`);
+- the gates, or any reading, through `ArtifactStore.load`, the engine config
+  read at the bundle's ladder too;
+- a rung of this run's ladder between the grid's lowest and highest measured
+  rungs that was not measured;
 - a configured bound above the one the grid was planned for.
 
 Under expert parallelism the bench routed every MoE layer by a uniform draw
@@ -85,7 +87,12 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.step_grid import StepGrid, StepGridBackend
 from atom.compass.backends.step_grid_fit import VALUE
-from atom.compass.backends.step_grid_plan import BOUNDS, SCOPE, keyed_of  # noqa: F401
+from atom.compass.backends.step_grid_plan import (  # noqa: F401
+    BOUNDS,
+    SCOPE,
+    at_ladder,
+    keyed_of,
+)
 from atom.compass.backends.step_grid_residual import Residual
 from atom.compass.backends.step_linear import UNIFORM_ROUTING
 from atom.compass.runner.overrides import schedulable_ladder
@@ -273,30 +280,26 @@ def differ(there: dict, here: dict, where: str) -> list[str]:
     return named
 
 
-def conditions(config, machine) -> Conditions:
+def conditions(config, machine, engine: dict | None = None) -> Conditions:
     """This run's readings: `readings` of this process's ATOM source, the
-    served config.json and `keyed`."""
+    served config.json and `keyed`, or `engine` in its place."""
     from atom.compass.run import _file_digest, atom_source
 
     return readings(
-        machine,
+        machine_platform(machine),
         atom_src=atom_source(),
         model=_file_digest(config.model, "config.json"),
-        engine_config=json.dumps(keyed(config), sort_keys=True),
+        engine_config=json.dumps(engine or keyed(config), sort_keys=True),
     )
 
 
-def readings(machine, **inputs) -> Conditions:
-    """The readings a run on `machine` takes: the platform the spec states, and
-    this host's CPU; `inputs` state the ATOM source, the model and the engine
-    config."""
+def readings(platform: Mapping, **inputs) -> Conditions:
+    """The readings a run on `platform` takes, the device, stack, PTL state
+    and torch a spec or a run's inputs state, with this host's CPU; `inputs`
+    state the ATOM source, the model and the engine config."""
     from atom.compass.run import host_cpu
 
-    return Conditions.of(
-        **machine_platform(machine),
-        host_cpu=host_cpu(),
-        **inputs,
-    )
+    return Conditions.of(**platform, host_cpu=host_cpu(), **inputs)
 
 
 def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
@@ -326,11 +329,12 @@ def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
         raise ValueError(
             f"{key} does not load: {type(error).__name__}: {error}"
         ) from error
+    at = at_ladder(ours, recorded)
     pairs = {
         "graph mode": (grid.graph_mode, "eager" if config.enforce_eager else "replay"),
         "timing scope": (grid.scope, SCOPE),
         "value": (member["grid"].get("value"), VALUE),
-        **{name: (recorded.get(name), value) for name, value in ours.items()},
+        **{name: (recorded.get(name), value) for name, value in at.items()},
     }
     differ = [
         f"{name} {theirs!r} in the bundle and {here!r} here"
@@ -341,7 +345,7 @@ def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
         raise ValueError(
             f"{key} was measured under other conditions: " + "; ".join(differ)
         )
-    store.load(key, conditions=conditions(config, machine), gates=GateState.of())
+    store.load(key, conditions=conditions(config, machine, at), gates=GateState.of())
     if grid.graph_mode == "replay":
         measured = sorted(rung for rung, cells in grid.decode.items() if cells.points)
         unmeasured = [

@@ -164,7 +164,7 @@ def test_assume_from_states_the_sources_ratios_on_its_datasheet_every_field_assu
     assert b0["provenance"]["origin"] == "assumed"
     assert {o["origin"] for o in b0["provenance"]["origins"].values()} == {"assumed"}
     assert set(b0["provenance"]["origins"]) == {
-        p for p in b0 if p not in ("key", "token", *device.HEADER)
+        p for p in b0 if p not in ("key", "token", *device.READINGS_HEADER)
     }
     # An assumed entry is no source: its ratios are not rates to divide.
     a0 = ("--device", "mi455x-a0", "--assume-from", "MI455X B0", "--ptl", "disabled")
