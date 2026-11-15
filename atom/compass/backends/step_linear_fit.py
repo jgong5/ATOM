@@ -122,12 +122,19 @@ out and named under `unfitted`; `StepLinearBackend` refuses its steps.
 On an MTP record a step also carries a draft label (`step_labels`). `fit` fits
 the steps that carry one on their draft labels the same way, and writes that law
 under the law's `draft`; it holds no `held_out` unless its records time a
-EAGLE3 drafter's passes (below). A step with a propose label
-(`step_labels`) is fitted there on its draft label less that label, the
-draft-KV pass a middle chunk runs too, and left out when nothing remains; the
-propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`,
+EAGLE3 drafter's passes (below) or run at `data_parallel_size` above 1. A step
+with a propose label (`step_labels`) is fitted there on its draft label less
+that label, the draft-KV pass a middle chunk runs too, and left out when
+nothing remains; the propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`,
 whatever lag the device ran at.
-A decode's draft-KV label fits the draft law's `draft_kv` vector alike. An
+A decode's draft-KV label fits the draft law's `draft_kv` vector alike. At
+`data_parallel_size` above 1 each of the two is fitted as the law's vectors are:
+a step is its ranks' labelled rows, labelled with the smallest, and priced as
+their max (`_pass_steps`); a step some rank neither labels nor ran as a dummy
+forward is left out, counted under the vector's `fit.ranks`. There
+`mark_held_out` gives the draft law's vectors `held_out` as it gives the law's,
+on the steps each is fitted on, `propose` and `draft_kv` priced as the max over
+each step's ranks (`_mark_dp_passes`). An
 output prefill's fits the draft law's prefill vector in place of its draft
 label, which, all after `forward_done_event`, fits the `propose` vector, and
 sets the draft law's `output_prefill_kv`. The target's vectors fit the device
@@ -164,7 +171,9 @@ the law states `moe_routing` and, outside `shared`, a decode rung may adopt one
 MoE column (`StepLinearLaw`), `moe_tokens` or `moe_experts`, by the rule
 `_moe_column` states; the vector records under `fit.moe_column` the figures the
 rule read.
-An MTP record's draft law adopts none.
+An MTP record's draft law adopts none at `data_parallel_size` 1; above it, its
+decode rungs adopt one by the same rule, as a drafter's routed experts run on
+its group's rows in the arm's layout, as the target's do.
 
 Outside `shared`, a decode rung may adopt a `rowmod(k)` column (`StepLinearLaw`),
 read from its rows in scheduled order, by the rule `_rowmod` states; the
@@ -1561,7 +1570,6 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     routing = _routing(options)
     serial = _serial(samples, options)
     buckets = _buckets(options)
-    kvs = [s for s in samples if s.draft_kv_s is not None and not s.view.prefill]
     samples = [
         (
             s
@@ -1733,25 +1741,27 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         law["draft"]["forward"] = _forward(serial)
         law["draft"]["propose"] = _propose(_rest(serial))
     elif drafts:
-        if proposes := [
-            s if s.draft_kv_s is None else dataclasses.replace(s, propose_s=s.draft_s)
-            for s in samples
-            if s.propose_s is not None
-        ]:
-            law["draft"]["propose"] = _propose(proposes)
-        if kvs:
-            law["draft"]["draft_kv"] = _propose(kvs, "draft_kv_s")
+        for name, mine in _pass_samples(samples).items():
+            vector = mine and _propose(mine, PASSES[name], dp, samples)
+            if vector:
+                law["draft"][name] = vector
+            elif mine:
+                why = "no step every rank of which ran it or a dummy forward"
+                law["draft"]["unfitted"][name] = why
         if any(s.view.prefill and s.draft_kv_s is not None for s in samples):
             law["draft"]["output_prefill_kv"] = True
     return law, report
 
 
 def _draft_options(options, serial: bool) -> dict:
-    """`options` for the draft law, which adopts no MoE column and no padding;
-    under an EAGLE3 drafter whose records time its passes, the `base` form: its
+    """`options` for the draft law, which adds no padding, and adopts no MoE
+    column at `dp` 1; above it, its decode rungs pick one as the target's do.
+    Under an EAGLE3 drafter whose records time its passes, the `base` form: its
     prefill vector fits the middle chunks alone, each one request's chunk at
     the step's token budget, whose `history` is its `query_cached` over it."""
-    drafted = {**(options or {}), "moe_routing": None, "buckets": None}
+    drafted = {**(options or {}), "buckets": None}
+    if _options(options)[1] == 1:
+        drafted["moe_routing"] = None
     return {**drafted, "form": "base"} if serial else drafted
 
 
@@ -1807,9 +1817,73 @@ def _draft_kv(s) -> float:
     return s.draft_s - (s.propose_s or 0.0)
 
 
-def _propose(samples, label: str = "propose_s") -> dict:
+#: The draft law's vectors on `PROPOSE`, each with the label it is fitted on.
+PASSES = {"propose": "propose_s", "draft_kv": "draft_kv_s"}
+
+
+def _pass_samples(samples) -> dict:
+    """The samples each of `PASSES` is fitted on: under `propose` those with a
+    propose label, an output prefill's being its whole draft label, all after
+    `forward_done_event`; under `draft_kv` the decodes with a draft-KV label."""
+    return {
+        "propose": [
+            s if s.draft_kv_s is None else dataclasses.replace(s, propose_s=s.draft_s)
+            for s in samples
+            if s.propose_s is not None
+        ],
+        "draft_kv": [
+            s for s in samples if s.draft_kv_s is not None and not s.view.prefill
+        ],
+    }
+
+
+def _pass_steps(samples, label: str, dp: int, every) -> tuple[list, int]:
+    """`samples` of `dp` ranks joined on run and step, each step its ranks'
+    rows `(run, None, (1, seqs), seconds, step)`, `seconds` the smallest of
+    their `label`s, in the order `every`'s runs first appear, then by step;
+    and how many steps were left out, at which a rank gave no sample here and
+    ran no dummy forward, as its samples in `every` state."""
+    runs = list(dict.fromkeys(s.provenance["run"] for s in every))
+    dummies = {(s.provenance["run"], s.rank): s.dummies for s in every}
+    joined: dict = {}
+    for s in samples:
+        joined.setdefault((runs.index(s.provenance["run"]), s.step), {})[s.rank] = s
+    steps, cut = [], 0
+    for (i, step), ranks in sorted(joined.items()):
+        idle = [step in dummies.get((runs[i], r), ()) for r in range(dp)]
+        if sum(r in ranks or idle[r] for r in range(dp)) < dp:
+            cut += 1
+            continue
+        seconds = min(getattr(s, label) for s in ranks.values())
+        rows = [(1, len(s.view.requests)) for _, s in sorted(ranks.items())]
+        steps.append([(i, None, x, seconds, step) for x in rows])
+    return steps, cut
+
+
+def _propose(samples, label: str = "propose_s", dp: int = 1, every=()) -> dict:
     """The draft law's `propose` vector over `samples`' propose labels, or
-    another `label`, on `PROPOSE`, solved and hulled as a step vector is."""
+    another `label`, on `PROPOSE`, solved and hulled as a step vector is; above
+    `dp` 1 by max-affine regression over `_pass_steps` of them, whose dummy
+    forwards `every` states, hulled at each step's priced rank, the steps it
+    left out under its fit's `ranks`; None when it left out every step."""
+    if dp > 1:
+        steps, cut = _pass_steps(samples, label, dp, every)
+        if not steps:
+            return None
+        s = _fit_steps(steps, list(PROPOSE), lambda r: r[2])
+        x = np.array([r[2] for r in s["rows"]], dtype=np.float64)
+        return {
+            "coefficients": dict(zip(PROPOSE, map(float, s["coef"]))),
+            "hull": _hull(x[s["keep"]][:, 1:], PROPOSE[1:]),
+            "fit": {
+                "samples": int(s["keep"].sum()),
+                "dropped": int((~s["keep"]).sum()),
+                "ranks": cut,
+                **{k: s[k] for k in ("condition", "centre", "mad", "zero")},
+                "all_rows": s["all_rows"],
+                "passes": s["passes"],
+            },
+        }
     x = np.array([(1, len(s.view.requests)) for s in samples], dtype=np.float64)
     return _vector(x, np.array([getattr(s, label) for s in samples]), PROPOSE)
 
@@ -1965,9 +2039,9 @@ def mark_held_out(
     the hull of the rank rows `_held_out` priced its steps by, their errors per
     band; under `report`'s `held_out`, each run's errors per band; and, unless
     `draft`, under both's `figures`, `fold_figures`' on the same folds. A draft
-    law fitted on an EAGLE3 drafter's passes, its vectors alike, on the steps
-    each is fitted on, their bands named `draft` (`_mark_passes`); `draft`
-    says `law` is a draft law."""
+    law fitted on an EAGLE3 drafter's passes (`_mark_passes`), or above `dp` 1
+    (`_mark_dp_passes`), its vectors alike, on the steps each is fitted on,
+    their bands named `draft`; `draft` says `law` is a draft law."""
     from scipy.spatial import QhullError
 
     folds = list(_fold_laws(samples, options, seed, draft))
@@ -1994,15 +2068,18 @@ def mark_held_out(
         except (ValueError, QhullError):
             continue
         vector["held_out"] = {"hull": hull, "bands": _bands(mine)}
-    if "forward" not in law.get("draft", {}):
+    dp, serial = _options(options)[1], "forward" in law.get("draft", {})
+    if "draft" not in law or not (serial or dp > 1):
         return
-    serial = [s for s in samples if s.passes_s]
+    passes = [s for s in samples if s.passes_s]
     drafts, mine = _draft_samples(samples), {"held_out": {}}
     if len({s.provenance["run"] for s in drafts}) > 1:
-        drafted = _draft_options(options, True)
+        drafted = _draft_options(options, serial)
         mark_held_out(law["draft"], mine, drafts, drafted, seed, True)
-    if len({s.provenance["run"] for s in serial}) > 1:
-        _mark_passes(law["draft"], mine, serial)
+    if serial and len({s.provenance["run"] for s in passes}) > 1:
+        _mark_passes(law["draft"], mine, passes)
+    elif not serial:
+        _mark_dp_passes(law["draft"], mine, samples, dp)
     for run, bands in mine["held_out"].items():
         named = {f"draft {b}": v for b, v in bands.items()}
         report["held_out"].setdefault(run, {}).update(named)
@@ -2039,6 +2116,42 @@ def _mark_passes(law: dict, report: dict, samples) -> None:
         except (ValueError, QhullError):
             continue
         law[key]["held_out"] = {"hull": hull, "bands": _bands(got)}
+
+
+def _mark_dp_passes(law: dict, report: dict, samples, dp: int) -> None:
+    """`mark_held_out` for a data-parallel draft law's `PASSES` vectors: each
+    run's steps (`_pass_steps`) priced as the max over their ranks by the
+    vector fitted on the other runs, banded by vector."""
+    from scipy.spatial import QhullError
+
+    for name, mine in _pass_samples(samples).items():
+        runs = list(dict.fromkeys(s.provenance["run"] for s in mine))
+        if name not in law or len(runs) < 2:
+            continue
+        rows = []
+        for run in runs:
+            others = [s for s in mine if s.provenance["run"] != run]
+            fold = _propose(others, PASSES[name], dp, samples)
+            if fold is None:
+                continue
+            c = list(fold["coefficients"].values())
+            held = [s for s in mine if s.provenance["run"] == run]
+            for step in _pass_steps(held, PASSES[name], dp, samples)[0]:
+                price = {j: (float(np.dot(c, r[2])), r[2]) for j, r in enumerate(step)}
+                top = priced_rank(price)
+                error = price[top][0] / step[top][3] - 1.0
+                rows.append((run, "", name, step[top][2], error))
+        for run in dict.fromkeys(r[0] for r in rows):
+            bands = _bands([r for r in rows if r[0] == run])
+            report["held_out"].setdefault(run, {}).update(bands)
+        if not rows:
+            continue
+        try:
+            points = np.array([r[3] for r in rows], dtype=np.float64)
+            hull = _hull(points[:, 1:], PROPOSE[1:])
+        except (ValueError, QhullError):
+            continue
+        law[name]["held_out"] = {"hull": hull, "bands": _bands(rows)}
 
 
 def host_held_out(samples) -> dict:
