@@ -19,8 +19,10 @@ import subprocess
 import time
 from pathlib import Path
 
+import platforms
 import pytest
 from test_deploy_sh import ROUTER_ARGS, _until, argv, planted  # noqa: F401
+from test_memory_readings import DOCUMENT
 
 ON = """\
 #!/bin/sh
@@ -56,7 +58,7 @@ def _gone(pid: int) -> bool:
     for _ in range(150):
         try:
             stat = Path(f"/proc/{pid}/stat").read_text()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):  # reaped before or mid-read
             return True
         if stat.rsplit(")", 1)[1].split()[0] == "Z":
             return True
@@ -134,6 +136,8 @@ def test_a_simulated_deployment_prices_kv_on_the_link_its_layout_spans(
 ):
     env, flags = planted
     d = tmp_path / "d"
+    if node_b:  # only a run across nodes reads a network file
+        flags = [*flags, *platforms.network(DOCUMENT, tmp_path)]
     words = argv(tmp_path, flags)
     if node_b:
         at = words.index("--decode") + 1

@@ -11,7 +11,9 @@ each aiperf module in ``REBIND`` once that module has executed. The runner's
 ``LoopScheduler`` becomes ``ClockPacedLoopScheduler``, so every phase runner's
 scheduler, and the branch orchestrator and replay barrier it is handed to, pace
 on the Compass clock; the hook then refuses the run unless this package's
-strategy is the registered ``agentic_replay``. The timing manager's
+strategy is the registered ``agentic_replay``. The runner's
+``ReplayBarrierCoordinator`` becomes ``ClockReplayBarrierCoordinator``, whose
+per-trace idle cap times out on that clock. The timing manager's
 ``StickyCreditRouter`` becomes ``CompassCreditRouter``, which binds that clock
 to the traffic LP. The orchestrator's ``PhaseRunner`` becomes
 ``ClockPhaseRunner``, whose phase deadlines wait on that clock. ``time`` in the
@@ -39,6 +41,10 @@ REBIND = {
     RUNNER: (
         ("LoopScheduler", "compass_harness.scheduler:ClockPacedLoopScheduler"),
         ("asyncio", "compass_harness.timesource:ClockAsyncio"),
+        (
+            "ReplayBarrierCoordinator",
+            "compass_harness.scheduler:ClockReplayBarrierCoordinator",
+        ),
     ),
     "aiperf.timing.manager": (
         ("StickyCreditRouter", "compass_harness.router:CompassCreditRouter"),

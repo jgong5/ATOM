@@ -13,7 +13,7 @@ import pytest
 import test_measure_memory
 import torch
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
-from test_measure_memory import MACHINE, a_start, started
+from test_measure_memory import MACHINE, PLATFORM, a_start, started
 from test_memory_readings import READINGS, STACK, publish_readings
 from test_rapidserve_runner_config import _config
 from test_run_step_grid import deployment
@@ -176,7 +176,7 @@ def test_decode_publishes_its_entry_unless_its_key_is_prefills(tmp_path, eager):
         json.dumps({"key": memory.key_fields(decode), "readings": held})
     )
 
-    measure_memory.publish(out, MACHINE, tmp_path / "s", "c")
+    measure_memory.publish(out, PLATFORM, tmp_path / "s", "c")
 
     read = memory.load(tmp_path / "s", prefill, MACHINE, 0)
     assert read.values == dict(READINGS[1], record=record)

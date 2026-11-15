@@ -151,7 +151,9 @@ def population_steps(names, tbo=False, drafters=False):
     """Each step the record directories `names` hold, DP's dummy runs aside,
     as its shape, the one the op-level backend prices it at
     (`op_graph.step_shape`), with the rows its DP group's MoE
-    gathered (`moe_rows`), and its step-record line. A decode step verifies
+    gathered (`moe_rows`), and its step-record line, marked with how many of
+    its group's ranks ran the step as a dummy forward (`group_dummies`). A
+    decode step verifies
     as many drafts in each row as its shortest row does. Under two-batch
     overlap (`tbo`, ATOM's `enable_tbo`) a DP step the group split, by the
     rule `validate.bound` agrees over every rank's line at that step
@@ -164,6 +166,7 @@ def population_steps(names, tbo=False, drafters=False):
     replays no graph yet pads past its rows takes `target_bs` as its `width`."""
     from atom.compass.backends import BatchView, RequestShape
     from atom.compass.backends.op_graph import step_shape
+    from atom.compass.backends.step_labels import group_dummies
     from atom.compass.backends.step_roofline import micro_batches
     from atom.compass.validate.bound import _split
 
@@ -175,7 +178,7 @@ def population_steps(names, tbo=False, drafters=False):
             raise ValueError(f"{name} is not a record directory: it has no run.json")
         paths = sorted((path / "steps").glob("dp*[0-9].jsonl"))
         ranks = [[json.loads(t) for t in p.read_text().splitlines()] for p in paths]
-        dp, splits = len(ranks), {}
+        dp, splits, dummies = len(ranks), {}, group_dummies(ranks)
         if tbo and ranks:
             at = [{s["step"]: s for s in lines} for lines in ranks]
             for step in set.intersection(*map(set, at)):
@@ -183,6 +186,7 @@ def population_steps(names, tbo=False, drafters=False):
         for rank, line in ((r, s) for r, lines in enumerate(ranks) for s in lines):
             if line["is_dummy_run"]:
                 continue
+            line["group_dummies"] = dummies[line["step"]]
             rows = [(row[0], row[2]) for row in line["rows"]]
             dp_step = line.get("moe_rows") is not None
             split = splits.get(line["step"]) if dp_step else None
