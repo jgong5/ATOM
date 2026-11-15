@@ -14,7 +14,8 @@ spends the CPU seconds ``STUB_CLIENT_CPU_S`` gives, sleeps the seconds
 ``STUB_CLIENT_S`` gives its point, writes the client export, then stops the
 server through its ``server.json`` and waits for it to leave; it exits 1 for
 the points ``STUB_CLIENT_FAIL`` names, and for the point ``STUB_HANG`` names
-writes its pid and sleeps.
+writes its pid and sleeps. The tree each point runs on reads as `TREE`,
+with no uncommitted file, unless a test says otherwise.
 """
 
 import json
@@ -34,6 +35,7 @@ from test_run_step_grid import DOCUMENT
 
 from atom.compass import cli
 from atom.compass.advice import check, simulate
+from atom.compass.artifacts.provenance import SourceRoot
 from atom.compass.drive import reuse
 
 SERVER = """#!{python}
@@ -96,6 +98,14 @@ while stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] != "Z":
 #: Three single-node candidates the check finds searchable at both points.
 THREE = {"a": {}, "b": {"env": {"STUB_X": "1"}}, "c": {"env": {"STUB_X": "2"}}}
 SIX = [f"{c}-c{n}" for c in "abc" for n in (1, 4)]
+#: The tree each point runs on, and another.
+TREE, ANOTHER = "1e47fbd62" + "0" * 31, "54a68b588" + "0" * 31
+
+
+def tree(revision: str, dirty: int | None = 0):
+    """`git_tree_root`, reading the tree each point runs on as `revision`, with
+    `dirty` uncommitted files."""
+    return lambda name, root: SourceRoot(name, root, revision, "tree", "a stub", dirty)
 
 
 @pytest.fixture
@@ -109,6 +119,7 @@ def simulating(tmp_path, stubbed, monkeypatch):  # noqa: F811
     monkeypatch.setattr(check, "COMPASS", tmp_path / "server")
     monkeypatch.setattr(check, "DEPLOY", tmp_path / "server")
     monkeypatch.setattr(simulate, "CLIENT", tmp_path / "client")
+    monkeypatch.setattr(simulate, "git_tree_root", tree(TREE))
     monkeypatch.setenv("HARNESS_PYTHON", "/sim/python")
     stubs = "FAILS CLIENT_FAIL NO_SUMMARY HANG CLIENT_S CLIENT_CPU_S SERVER_EXIT"
     for name in stubs.split():
@@ -274,14 +285,21 @@ def test_a_rerun_skips_each_finished_point_and_runs_what_did_not_finish_or_chang
     assert [p["skipped"] for p in changed["points"].values()] == [False, False]
     assert len(calls(tmp_path, "client")) == before + 2
     before = len(calls(tmp_path, "client"))
-    # The same space, at another head.
+    # The same space at another head, on the same tree.
     taken = reuse.head() | {"commit": "deadbeef" * 5}
     monkeypatch.setattr(reuse, "head", lambda commit=None: taken)
 
     moved = searched(tmp_path, {"a": {}}, duration_s=60)
 
-    assert [p["skipped"] for p in moved["points"].values()] == [False, False]
-    assert len(calls(tmp_path, "client")) == before + 2
+    assert [p["skipped"] for p in moved["points"].values()] == [True, True]
+    # On another tree; then twice with an uncommitted file; then clean again.
+    for revision, dirty in ((ANOTHER, 0), (ANOTHER, 1), (ANOTHER, 1), (ANOTHER, 0)):
+        monkeypatch.setattr(simulate, "git_tree_root", tree(revision, dirty))
+
+        rerun = searched(tmp_path, {"a": {}}, duration_s=60)
+
+        assert [p["skipped"] for p in rerun["points"].values()] == [False, False]
+    assert len(calls(tmp_path, "client")) == before + 8
 
 
 @pytest.mark.parametrize("cpus, tp, at_once", [(1, 1, 1), (4, 2, 2)])
