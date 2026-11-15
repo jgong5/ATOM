@@ -847,6 +847,83 @@ def test_v41_fp4_candidate_leaves_take_the_tables_atom_s_forward_writes(monkeypa
     assert paged["block_tables"].tolist() == [[3, 1], [0, 2]]
 
 
+def test_v41_fp4_whole_context_leaves_take_their_ratio_s_bounds_and_packed_starts(
+    monkeypatch,
+):
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
+        V41PoolGeometry,
+    )
+
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *a: {})
+    I32, i32 = "torch.int32", torch.int32
+    # PAGEs of 32 tokens, a block table 2 of them: at ratio 1 4 index blocks a
+    # PAGE and planes 64 rows wide, at ratio 2 2 blocks and 32 rows
+    geometry = V41PoolGeometry(
+        2, ((0, 1), (1, 2)), 32, 4, 512, 128, layer_ratios=(1, 2),
+        index_block_rows=8, index_fp4=True,
+    )  # fmt: skip
+    runner = _Runner()
+    runner.attn_metadata_builder = SimpleNamespace(
+        geometry=geometry, block_table_cols=2
+    )
+    # two rows, laid out in the packed logits a plane's width apart
+    step = SimpleNamespace(
+        batch_ids=torch.arange(2, dtype=i32),
+        visible={r: torch.tensor([50, 20], dtype=i32) // r for r in (1, 2)},
+        planned={
+            f"v41_score_offsets_{r}": torch.tensor([0, 64 // r], dtype=i32)
+            for r in (1, 2)
+        },
+    )
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        fctx._forward_context.attn_metadata.step = step
+        fctx._forward_context.attn_metadata.cache = SimpleNamespace()
+        return out
+
+    runner.prepare_model = prepare_model
+    rows = _t([2], "metadata", dtype=I32)
+    plan = "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup:"
+
+    def scorer(blocks):  # its plan's index blocks a PAGE: the ratio's
+        return _leaf(
+            ops._FP4,
+            ("plan", Reduced(f"{plan}Fp4MqaPlan", (("pages_per_block", blocks),))),
+            *[("row_ends", rows), ("out", _t([128], "metadata"))],
+            ("out_offsets", rows),
+        )
+
+    def top_k(width, packed=True):  # its rows standing for a plane that wide
+        return _leaf(
+            ops._TOPK,
+            ("logits", _t([2, 128] if packed else [2, width], "metadata")),
+            *[("row_starts", rows), ("row_ends", rows)],
+            ("stride0", 0 if packed else width),
+            *[("plane_width", width if packed else None), ("packed_rows", packed)],
+        )
+
+    # each ratio's scorer and top-k, packed, and ratio 2's on rows of their own
+    leaves = scorer(2), top_k(32), scorer(4), top_k(64), top_k(32, packed=False)
+    found = ops.leaves(_graph(*leaves, layers=1)["region"])
+    placed = SimpleNamespace(block_size=32, batch=lambda *a: a[1:])
+    got = ops.Stub(runner, 10_000).point(placed, decode(2), 64, found)
+
+    slots = "row_starts", "row_ends", "out_offsets"
+    named = [{s: r["metadata"][s] for s in slots if s in r["metadata"]} for r in got]
+    # each row's logits' start in the packed buffer, as ATOM's step lays it out
+    starts = "step.planned.v41_score_offsets_{}".format
+    assert named == [
+        {"row_ends": "step.visible.2", "out_offsets": starts(2)},
+        {"row_starts": starts(2), "row_ends": "step.visible.2"},
+        {"row_ends": "step.visible.1", "out_offsets": starts(1)},
+        {"row_starts": starts(1), "row_ends": "step.visible.1"},
+        {"row_starts": "step.visible.2", "row_ends": "step.visible.2"},
+    ]
+
+
 def test_the_v41_candidate_lift_leaves_its_selection_as_built_past_twice_the_kept(
     monkeypatch,
 ):

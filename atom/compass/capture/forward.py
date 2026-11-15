@@ -130,9 +130,10 @@ V41_OPENED = (
     "v41_end_forward",
     "v41_record_tbo_expert_output",
 )
-#: DeepSeek-V4.1's sparse attention, and its indexer's scorers, gfx1250's
-#: and gfx950's.
+#: DeepSeek-V4.1's sparse attention, over its FP8 pool the second, and its
+#: indexer's scorers, gfx1250's and gfx950's.
 V41_ATTENTION = "aiter.pa_sparse_prefill_opus.default"
+V41_FP8_ATTENTION = "aiter.mla_sparse_prefill_v41.default"
 V41_SCORERS = (
     (
         "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
@@ -1325,7 +1326,8 @@ def _v41(recorder, hf):
     each request's state is where the scheduler put it has no values to
     judge.
 
-    Its sparse attention (`V41_ATTENTION`) states the layer's `window_size`,
+    Its sparse attention (`V41_ATTENTION`, `V41_FP8_ATTENTION`) states the
+    layer's `window_size`,
     `compress_ratio` and `index_topk` (None where it compresses nothing), and
     its indexer's scorers (`V41_SCORERS`) the `compress_ratio` and
     `index_candidates`, the most entries it scores where an earlier layer
@@ -1350,6 +1352,7 @@ def _v41(recorder, hf):
         scored = ("compress_ratio", ratio), ("index_candidates", candidates)
         stated = {
             V41_ATTENTION: (*geometry, ("index_topk", top)),
+            V41_FP8_ATTENTION: (*geometry, ("index_topk", top)),
             **dict.fromkeys(V41_SCORERS, scored),
         }
         with patch.object(recorder, "stated", stated):
