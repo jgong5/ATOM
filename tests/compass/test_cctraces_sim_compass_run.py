@@ -53,6 +53,8 @@ def test_a_compass_run_run_file_ends_the_cell_with_its_result_line(tmp_path):
     (tmp_path / "server.py").write_text(SERVER)
     (bin_ / "python3").write_text(
         "#!/bin/sh\n"
+        # The run file names a machine: the server starts under on_arch.
+        '[ "$2" = atom.compass.drive.on_arch ] && shift 3\n'
         'if [ "$2" = atom.entrypoints.openai.api_server ]; then\n'
         f'    shift 2; exec {sys.executable} {tmp_path / "server.py"} "$@"\n'
         "fi\n"

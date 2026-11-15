@@ -259,6 +259,12 @@ def test_parity_pd_holds_each_server_s_ports_and_the_ones_pd_sim_derives(tmp_pat
     (bin_ / "atomesh").write_text(f"#!{sys.executable}\n{PD_ROUTER}")
     for f in bin_.iterdir():
         f.chmod(0o755)
+    import platforms
+
+    node18 = json.loads(
+        (TREE / "tests/compass/machines/mi308x-hjbog18.json").read_text()
+    )
+    _, device, _, ptl = platforms.flags(tmp_path / "readings", node18, tmp_path)
     done = subprocess.run(
         ["bash", SCRIPTS / "parity_pd.sh", tmp_path / "out"],
         cwd="/",
@@ -266,6 +272,9 @@ def test_parity_pd_holds_each_server_s_ports_and_the_ones_pd_sim_derives(tmp_pat
             os.environ,
             PATH=f"{bin_}:{os.environ['PATH']}",
             MODEL=str(model),
+            DEVICE=device,
+            PTL=ptl,
+            READINGS=str(tmp_path / "readings"),
             STORE=str(tmp_path / "store"),
             ATOMESH=str(bin_ / "atomesh"),
             PREFILL_GPUS="0 1",

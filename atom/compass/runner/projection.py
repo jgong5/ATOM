@@ -156,7 +156,9 @@ def batch_view(
     that collective, as a recording real run does not, passes none. The most
     tokens any rank scheduled is its `group_max_tokens`. A single
     rank reads none of the collective's other counts, though `decide` returns
-    them for a group of one.
+    them for a group of one. Every rank, a lone one too, reads the
+    collective's `any_rank_needs_eager`, whether an attention backend refused
+    the step a graph, as its `group_needs_eager`.
 
     The MoE gather's rows follow `running_tokens_are_unified`, as
     `FusedMoE.forward_impl_graph` does. Every rank decoding, the padded
@@ -232,6 +234,7 @@ def batch_view(
         draft_rows=draft_rows,
         group_prefills=dp_rank is not None and not mode.running_tokens_are_unified,
         group_max_tokens=group_max_tokens,
+        group_needs_eager=mode.sync is not None and mode.sync.any_rank_needs_eager,
     )
 
 

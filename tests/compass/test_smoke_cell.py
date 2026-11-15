@@ -87,6 +87,7 @@ def _smoke(tmp_path, use="0", stamp=True, **env):
         shutil.copy(COMPASS / name, scripts / name)
     (scripts / "client.sh").write_text(CLIENT)
     (scripts / "client.sh").chmod(0o755)
+    (tmp_path / "readings" / "platform_readings").mkdir(parents=True)
     if stamp:
         (tree / ".compass-commit").write_text("cafe\n")
     stubs = {"cli": CLI, "validate/__main__": VALIDATE, "parity/blocked": BLOCKED}
@@ -110,7 +111,9 @@ def _smoke(tmp_path, use="0", stamp=True, **env):
             PATH=f"{bindir}:{Path(sys.executable).parent}:{os.environ['PATH']}",
             LOG=str(tmp_path / "log"),
             GPU="7",
-            MACHINE=str(tmp_path / "spec.json"),
+            DEVICE="mi355x",
+            PTL="disabled",
+            READINGS=str(tmp_path / "readings"),
             TRACES="/cc/traces.jsonl",
             HARNESS_PYTHON="/sim/python",
             AIPERF_PYTHON="/real/python",
@@ -138,7 +141,7 @@ def _smoke(tmp_path, use="0", stamp=True, **env):
 def test_the_path_runs_in_order_and_ends_with_the_cell_s_verdict(tmp_path):
     r, log, o = _smoke(tmp_path)
     assert r.returncode == 0, r.stderr
-    machine = f"--machine {tmp_path}/spec.json --store {o}/store"
+    store = f"--store {o}/store"
     run = {
         d: f"--client-run {o}/{d} {o}/{d}/artifacts/client_run.json"
         for d in ("calibration", "trace")
@@ -146,26 +149,28 @@ def test_the_path_runs_in_order_and_ends_with_the_cell_s_verdict(tmp_path):
     client = "--concurrency 1 --duration 600 --stop"
     assert log == [
         f"blocked {o}/tool",
-        f"measure memory --gpu 7 {machine} --out {o}/memory",
+        f"measure memory --gpu 7 {store} --out {o}/memory",
         f"record --gpu 7 --out {o}/warm",
         f"client {o}/warm --traces 0-7 {client} /real/python",
         f"record --gpu 7 --out {o}/calibration",
         f"client {o}/calibration --traces 353-360 {client} /real/python",
         f"record --gpu 7 --trace --out {o}/trace",
         f"client {o}/trace --traces 353-360 {client} /real/python",
-        f"fit steps --backend step-linear --form history {o}/calibration {o}/trace "
-        f"{run['calibration']} {run['trace']} {machine} --out {o}/fit_steps",
-        f"fit host {o}/calibration {run['calibration']} {machine} --out {o}/fit_host",
+        f"fit steps --backend step-linear --form history --model {tmp_path}/m "
+        f"{o}/calibration {o}/trace {run['calibration']} {run['trace']} {store} "
+        f"--out {o}/fit_steps",
+        f"fit host {o}/calibration {run['calibration']} {store} --out {o}/fit_host",
         f"record --gpu 7 --out {o}/cell/real1",
         f"client {o}/cell/real1 --traces 0-7 {client} /real/python",
         f"record --gpu 7 --out {o}/cell/real2",
         f"client {o}/cell/real2 --traces 0-7 {client} /real/python",
-        f"run --step-linear tok-steps --host-laws tok-host {machine} --out {o}/cell/step_linear",
+        f"run --step-linear tok-steps --host-laws tok-host --device mi355x --ptl disabled {store} --out {o}/cell/step_linear",
         f"client {o}/cell/step_linear --traces 0-7 {client} /sim/python",
     ]
     warmup = "; ".join(f"{run} requests 1, steps 3" for run in RUNS)
     assert r.stdout.endswith(f"warmup: {warmup}\n")
     assert "smoke_cell: graded in 0 min;" in r.stdout
+    assert (o / "store" / "platform_readings").is_dir()
 
 
 def test_a_gpu_rocm_smi_reads_busy_runs_and_rocm_smi_is_never_read(tmp_path):

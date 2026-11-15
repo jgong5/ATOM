@@ -25,7 +25,7 @@ from atom.compass.memory.check import parts
 from atom.compass.spec import MachineSpec
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-HJBOG39 = ROOT / "scripts" / "compass" / "machines" / "mi308x-hjbog39.json"
+HJBOG39 = ROOT / "tests" / "compass" / "machines" / "mi308x-hjbog39.json"
 SPEC_TERMS = ("capacity",)
 #: The terms the run's `memory_readings` entry gives, measured on any spec.
 ENTRY_TERMS = ("driver and collective reserve", "load residue", "persistent")

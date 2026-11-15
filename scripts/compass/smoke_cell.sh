@@ -5,13 +5,14 @@
 # memory`; a calibration `compass record` serving cc-traces 353 on, its server
 # with the blocking-call tool (atom/compass/parity/README.md), and a trace run of
 # the same recipe, `compass record --trace`; `compass fit steps` (step linear,
-# history form) on both and `compass fit host` on the calibration record, since
-# the prefill vector fits from a trace run alone and a trace run's host segments
-# ran under the profiler; two real `compass record` runs and one `compass run`,
-# serving traces 0 on; then the cell graded by `python -m atom.compass.validate`.
-# Each server serves one `client.sh` run, with its warmup, which stops it. The
-# fits run before the real runs, so a failed fit, or a law that leaves a vector
-# unfitted and so refuses every step it prices, costs no more GPU time.
+# history form, MODEL's MoE routing) on both and `compass fit host` on the
+# calibration record, since the prefill vector fits from a trace run alone and a
+# trace run's host segments ran under the profiler; two real `compass record`
+# runs and one `compass run`, serving traces 0 on; then the cell graded by
+# `python -m atom.compass.validate`. Each server serves one `client.sh` run, with
+# its warmup, which stops it. The fits run before the real runs, so a failed
+# fit, or a law that leaves a vector unfitted and so refuses every step it
+# prices, costs no more GPU time.
 # Before calibration, a record nothing reads, warm/, serves the cell's traces
 # once, so that it takes the aiter JIT builds a fresh container meets while
 # serving, which grading, the fits and `validate.cost` refuse in a record
@@ -25,7 +26,13 @@
 #   OUT             an absent or empty directory, on a disk with room
 #   GPU             the one GPU, as rocm-smi and `--gpu` number it (required);
 #                   each compass command refuses it while a process is on it
-#   MACHINE         the machine spec of this node's GPUs (required)
+#   DEVICE          the GPUs' datasheet, by SKU or path, as `compass run
+#                   --device` takes it (required)
+#   PTL             the GPUs' PTL state, enabled or disabled (required)
+#   READINGS        an artifact store holding this platform's readings, which
+#                   `compass measure device` and `compass fit device` publish;
+#                   its platform_readings entries are copied into OUT/store
+#                   (required)
 #   TRACES          a cc-traces traces.jsonl (required, as client.sh takes it)
 #   HARNESS_PYTHON  the Python with agentx-harness and compass-harness, for the
 #                   simulated run's client (required)
@@ -53,7 +60,8 @@ compass_require_tree "$ROOT" || exit $?
 compass_describe "$ROOT"
 MODEL=$(realpath "${1:?usage: smoke_cell.sh MODEL OUT}")
 OUT=${2:?usage: smoke_cell.sh MODEL OUT}
-MACHINE=$(realpath "${MACHINE:?MACHINE names the machine spec of the GPUs}")
+: "${DEVICE:?DEVICE names the datasheet of the GPUs}" "${PTL:?PTL names their PTL state}"
+READINGS=$(realpath "${READINGS:?READINGS names a store holding the readings of the GPUs}")
 : "${TRACES:?TRACES names a cc-traces traces.jsonl}"
 : "${HARNESS_PYTHON:?HARNESS_PYTHON names the Python with compass-harness}"
 : "${AIPERF_PYTHON:?AIPERF_PYTHON names the Python without compass-harness}"
@@ -111,7 +119,9 @@ serve() {
 # token LOG: the store token a fit's LOG ends with.
 token() { awk '/^published / {t = $NF} END {print t}' "$1"; }
 
-M=(--machine "$MACHINE" --store "$OUT/store")
+M=(--store "$OUT/store")
+mkdir -p "$OUT/store" && cp -r "$READINGS/platform_readings" "$OUT/store/" ||
+    fail readings "$READINGS holds no platform_readings"
 CAL=353-$((352 + N)) CELL=0-$((N - 1))
 step tool python3 -m atom.compass.parity.blocked "$OUT/tool"
 step memory python3 -c "$CLI" measure memory --gpu "$GPU" "${M[@]}" --out "$OUT/memory" -- "${ATOM_ARGS[@]}"
@@ -122,7 +132,8 @@ DURATION_S=$TRACE_S serve trace "$OUT/trace" "$CAL" "$AIPERF_PYTHON" record --gp
 RUNS=(--client-run "$OUT/calibration" "$OUT/calibration/artifacts/client_run.json")
 TRACE=(--client-run "$OUT/trace" "$OUT/trace/artifacts/client_run.json")
 step fit_steps python3 -c "$CLI" fit steps --backend step-linear --form history \
-    "$OUT/calibration" "$OUT/trace" "${RUNS[@]}" "${TRACE[@]}" "${M[@]}" --out "$OUT/fit_steps"
+    --model "$MODEL" "$OUT/calibration" "$OUT/trace" "${RUNS[@]}" "${TRACE[@]}" "${M[@]}" \
+    --out "$OUT/fit_steps"
 unfitted=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["params"]["unfitted"] or "")' \
     "$OUT/fit_steps/step_linear_law.json") || fail fit_steps "its law cannot be read; see $OUT/fit_steps.log"
 [[ -z $unfitted ]] || fail fit_steps "the law leaves unfitted, so refusing every step they price: $unfitted"
@@ -132,7 +143,7 @@ for k in 1 2; do
     serve real$k "$OUT/cell/real$k" "$CELL" "$AIPERF_PYTHON" record --gpu "$GPU"
 done
 serve step_linear "$OUT/cell/step_linear" "$CELL" "$HARNESS_PYTHON" \
-    run --step-linear "$LAW" --host-laws "$HOST" "${M[@]}"
+    run --step-linear "$LAW" --host-laws "$HOST" --device "$DEVICE" --ptl "$PTL" "${M[@]}"
 step grade python3 -m atom.compass.validate "$OUT/cell"
 
 cat "$OUT/grade.log"
