@@ -562,7 +562,7 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
         else:
             report["unfitted"][kind] = f"{kind}'s calls take no time per token"
             continue
-        error = x @ coef / got[:, 1] - 1
+        error = 1 - got[:, 1] / (x @ coef)
         fitted["records"] = {
             str(p): np.percentile(error[record == i], [10, 50, 90]).tolist()
             for i, p in enumerate(paths)
@@ -983,7 +983,7 @@ def _jit(samples, features=()) -> set[tuple]:
             x[:, 2] = 0.0
         y = np.array([m.host["W_launch"] for m in members])
         solved = _solve(x, y, [*HOST_FEATURES, *features])
-        floor = 1 / WARM_FACTOR - 1 if kind == "decode" else 0.0
+        floor = 1 - WARM_FACTOR if kind == "decode" else 0.0
         jit |= {
             (m.provenance["run"], m.rank, m.step)
             for m, keep, r in zip(members, solved["keep"], solved["residual"])
@@ -1047,21 +1047,28 @@ def _fit_form(
     max over its ranks' rows `x[i, r]`, those `real[i, r]` holds, of their
     price, plus `offset`, a fixed part of it outside the coefficients.
 
-    `F(c) = sum_i ((max_r x_ir.c + offset_i) / y_i - 1)^2` over the kept steps.
-    The start is the non-negative least-squares solve of every rank's row, each
-    equation divided by its label. Each pass solves on the row each step's
-    current price picks, a Gauss-Newton step on `F`, and halves it until `F`
-    falls. The passes end settled, the solve picking the rows it was solved
-    on, or at a tie between ranks, when no step that moves some price by more
-    than the square root of the float epsilon makes `F` fall, or at the
-    limit, `FIT_PASSES` passes in all, keeping the vector they reached. Each
-    feature that differs between some step's ranks is a start too, its axis
-    scaled to the labels: the first round runs from each start, every step
-    kept, and the lowest `F` goes on, a start at the limit included.
-    Steps whose residual is more than
-    `MAD_K` scaled MADs from the median are then dropped and the passes rerun
-    from there, until the kept set settles, for `MAD_PASSES` rounds, or until
-    the passes reach the limit.
+    `F(c) = sum_i ((max_r x_ir.c + offset_i - y_i) / s_i)^2` over the kept
+    steps, each equation divided by its scale `s_i`: its label at first, then
+    its price under the vector reached. The start is the non-negative
+    least-squares solve of every rank's row, each equation divided by its label.
+    Each pass solves on the row each step's current price picks, a
+    Gauss-Newton step on `F`, and halves it until `F` falls. The passes end
+    settled, the solve picking the rows it was solved on, or at a tie between
+    ranks, when no step that moves some price by more than the square root of
+    the float epsilon of its scale makes `F` fall, or at the limit,
+    `FIT_PASSES` passes in all, keeping the vector they reached. Each feature
+    that differs between some step's ranks is a start too, its axis scaled to
+    the labels: the first round runs from each start, every step kept, and the
+    lowest `F` goes on, a start at the limit included. Each kept step's scale
+    then becomes its price and the passes rerun, until no kept step's price
+    moves by more than that epsilon of its scale: iteratively reweighted least
+    squares for a Gamma model with identity link, so the law prices its steps'
+    mean where dividing by the label prices scattered steps low. A step's
+    residual is its price less its label, over its price. Steps whose residual
+    is more than `MAD_K` scaled MADs from the median are then dropped and the
+    passes rerun from there, until the kept set settles, for `MAD_PASSES`
+    rounds, or until the passes reach the limit. Raises when a kept step's
+    price is not positive, as no residual divides by it.
 
     Returns the solve's figures: `pick`, each step's rank, at a tie the rank
     of larger features (`priced_rank`, prices folded as a run folds them);
@@ -1071,8 +1078,8 @@ def _fit_form(
     from scipy.optimize import nnls
 
     n, width, k = x.shape
-    a, b = x / y[:, None, None], 1.0 - offset / y
-    flat = a.reshape(-1, k)
+    flat = x.reshape(-1, k)
+    scale = np.array(y, dtype=np.float64)
     # An intercept, a column whose name starts with `kept`, is kept whatever
     # its variance; any other constant column is not.
     vary = [
@@ -1094,12 +1101,22 @@ def _fit_form(
     def price(c):
         return np.where(real, (flat @ c).reshape(n, width), -np.inf)
 
+    def priced(c):
+        return price(c).max(axis=1) + offset
+
+    def relative(c):
+        with np.errstate(divide="ignore"):
+            return 1.0 - y / priced(c)
+
     def cost(c):
-        return float(((price(c).max(axis=1) - b)[keep] ** 2).sum())
+        return float((((priced(c) - y) / scale)[keep] ** 2).sum())
 
     keep = np.ones(n, dtype=bool)
-    c, cols = solve(a[real], np.broadcast_to(b[:, None], real.shape)[real])
-    start = price(c).max(axis=1) - b
+    c, cols = solve(
+        (x / scale[:, None, None])[real],
+        np.broadcast_to(((y - offset) / scale)[:, None], real.shape)[real],
+    )
+    start = relative(c)
 
     def alternate(c, cols, on, passes):
         """Passes from `c` over the kept steps until settled, at a tie or at
@@ -1113,17 +1130,36 @@ def _fit_form(
             if passes == FIT_PASSES:
                 return c, cols, on, passes, "limit"
             passes += 1
-            full, solved = solve(a[steps, pick][keep], b[keep])
+            rows = x[steps, pick][keep] / scale[keep, None]
+            full, solved = solve(rows, ((y - offset) / scale)[keep])
             if (price(full).argmax(axis=1)[keep] == pick[keep]).all():
                 c, cols, on = full, solved, picked
             else:
                 d, f, t = full - c, cost(c), 1.0
-                moves = np.abs(price(full - c)[real & keep[:, None]]).max()
+                moved = price(full - c) / scale[:, None]
+                moves = np.abs(moved[real & keep[:, None]]).max()
                 while cost(c + t * d) >= f and t * moves > tol:
                     t /= 2
                 if t * moves <= tol:
                     return c, cols, on, passes, "tie"
                 c, cols, on = c + t * d, solved, picked if t == 1 else None
+
+    def reweight(c, cols, on, passes, stop):
+        """Each kept step's scale set to its price under `c` and the passes
+        rerun, until no kept step's price moves by `tol` of its scale or the
+        passes reach the limit."""
+        while stop != "limit":
+            got = priced(c)[keep]
+            if (np.abs(got - scale[keep]) <= tol * scale[keep]).all():
+                break
+            if (got <= 0).any():
+                raise ValueError(
+                    f"the fit prices {int((got <= 0).sum())} of its {got.size} "
+                    "kept steps at no time, so no relative error divides by it"
+                )
+            scale[keep] = got
+            c, cols, on, passes, stop = alternate(c, cols, None, passes)
+        return c, cols, on, passes, stop
 
     # Each feature that differs between some step's ranks starts from its axis,
     # scaled by the median of each step's label over its largest value of it.
@@ -1144,7 +1180,8 @@ def _fit_form(
     for rounds in range(1, MAD_PASSES + 1):
         if rounds > 1:
             c, cols, on, passes, stop = alternate(c, cols, on, passes)
-        residual = price(c).max(axis=1) - b
+        c, cols, on, passes, stop = reweight(c, cols, on, passes, stop)
+        residual = relative(c)
         centre = np.median(residual)
         mad = 1.4826 * np.median(np.abs(residual - centre))
         moved = np.abs(residual - centre) <= max(MAD_K * mad, MAD_FLOOR)
@@ -1576,7 +1613,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             names = [*vector["coefficients"], *["rowmod"] * bool(rowmod_k)]
         members = solved["rows"]
         slow = ~solved["keep"] & (solved["residual"] < 0)
-        once = solved["residual"] < 1 / WARM_FACTOR - 1
+        once = solved["residual"] < 1 - WARM_FACTOR
         warm = np.zeros(len(members), dtype=bool)
         for rec in range(len(runs)):
             leading = True
