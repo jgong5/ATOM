@@ -41,8 +41,9 @@ no kernel costs nothing. A step prices once the leaves of a kind that agree on
 every part of a leaf the kind's work has read, a leaf whose work reads nothing
 of the step keeps its price and its work, or that it launches no kernel, and
 with no price list a graph keeps its price for each set of prices of its
-leaves that read the step. A step at a view priced before, as a DP rank's
-dummy forwards are, prices as it did then when it reads the same graphs.
+leaves that read the step. A step at the view of one of the last `VIEWED`
+steps, reading the same graphs, prices as it did, as a DP rank's dummy
+forwards do.
 Regions compose by the IR's joins: a `Seq` adds its items in order, a `Repeat`
 re-emits its body's prices once per instance, a `max` `Par` emits its longest
 branch's prices, and a `resource_bound` `Par` one roofline over its branches'
@@ -135,9 +136,10 @@ KEPT = 1 << 16
 #: The prices a graph keeps by its step-reading leaves' prices; past it, it
 #: forgets them.
 COMPOSED = 1 << 12
-#: The steps a backend keeps the prices of by their views; past it, it forgets
-#: them.
-VIEWED = 1 << 10
+#: The steps a backend keeps the prices of by their views and graphs: as many
+#: as a run's graph lookup keeps graphs (`run._op_graphs`), which parses a
+#: graph it dropped anew, so a step kept longer would only hold its graphs.
+VIEWED = 64
 #: A reference argument's keys: a context key or a module path, whose value a
 #: leaf's work does not read.
 REFS = ({"context"}, {"module"})
@@ -381,8 +383,8 @@ class OpGraphBackend(CostBackend):
         self._step: dict[tuple, tuple] = {}
         self._reads: dict[str, set] = {}
         self._graphs: dict[tuple, tuple] = {}
-        # By view and graphs' objects: a step's price, and the graphs, which
-        # keep their ids theirs.
+        # By view and graphs' ids: a step's price, and the graphs, which keep
+        # those ids theirs.
         self._viewed: dict[tuple, tuple] = {}
         self._live: list | None = None
         self._pars = 0
@@ -407,8 +409,8 @@ class OpGraphBackend(CostBackend):
             )
             samples = batch_view.decode or batch_view.produces_output
             kv = self.block and samples and self._region(batch_view, draft=KV)[1]
-            # The same view of the same graphs prices as it did, a DP rank's
-            # dummy forward among them.
+            # A view and graphs priced lately price as they did, a DP rank's
+            # dummy forwards among them.
             held = (region, drafted, kv)
             viewed = (batch_view, *map(id, held))
             if (got := self._viewed.get(viewed)) is not None:

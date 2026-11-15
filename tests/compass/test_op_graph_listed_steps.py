@@ -4,10 +4,14 @@ them: each step prices as a backend new to it does, while each leaf's
 signature, and the work of a leaf whose work reads nothing of the step, is
 taken once over the run, the work of a leaf whose work reads the step only
 where the list declines it, and a step at a view priced before asks the list
-nothing.
+nothing; and a backend keeps alive the graphs of no more steps than a run's
+graph lookup keeps graphs.
 """
 
 import collections
+import gc
+import weakref
+from types import SimpleNamespace
 
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
 from test_fit_ops import SPEC, _at, _fit, measured  # noqa: F401  fixture
@@ -16,7 +20,10 @@ from test_op_work import leaf, t
 from atom.compass import run
 from atom.compass.artifacts import ArtifactStore
 from atom.compass.backends import BatchView, RequestShape, op_graph
-from atom.compass.backends.op_graph import OpGraphBackend
+from atom.compass.backends.cost import CostTerm
+from atom.compass.backends.op_graph import LISTED, OpGraphBackend
+from atom.compass.backends.provenance import Method, Provenance
+from atom.compass.backends.resolver import CostSource
 from atom.compass.bench import ops as bench
 from atom.compass.fit import ops, publish
 
@@ -99,3 +106,40 @@ def test_steps_price_as_new_while_each_leaf_is_signed_and_worked_out_once(
     assert len(signed) == 2
     # the GEMM and attention once a step, but at the view priced before
     assert len(asked) == 2 * len(set(CONTEXTS))
+
+
+class _Region(dict):
+    """A graph's region a weak reference can follow."""
+
+
+class _Flat(CostSource):
+    """A price list that prices every leaf at 1 us."""
+
+    name = LISTED
+
+    def price(self, request):
+        return CostTerm(f"op.{request[0]['op']}", 1e-6, Provenance(Method.MEASURED))
+
+
+def test_a_backend_keeps_alive_no_more_steps_graphs_than_a_run_s_lookup_keeps(
+    tmp_path,
+):
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1), speculative_config=None
+    )
+    kept = run._op_graphs(str(tmp_path), config, "gfx950").cache_info().maxsize
+    # a lookup that parses each step's graph anew, as `run._op_graphs` does a
+    # graph it dropped, over one step more than it keeps
+    parsed = []
+
+    def graph(*_, **__):
+        region = _Region(seq=[_gemm(), _attention()])
+        parsed.append(weakref.ref(region))
+        return region
+
+    backend = OpGraphBackend(SPEC, graph, kv="bf16", price_list=_Flat())
+    for c in range(kept + 1):
+        backend.price(BatchView((RequestShape(1, 1000 + c, True),)))
+    gc.collect()
+
+    assert sum(r() is not None for r in parsed) <= kept
