@@ -4,7 +4,8 @@ point missing readings the command that measures them, and each other point of
 a searchable candidate a start with no traffic, all written into OUT.
 
 The configuration is `test_advice_reuse`'s, its law the re-keyed DPA8 law as a
-law file; ATOM's arguments resolve it changed by each of `CHANGED` they state.
+law file; ATOM's arguments resolve it in this process, changed by each of
+`CHANGED` they state, but where a test resolves them in a real child.
 `compass run` and `deploy.sh` are one stub that records each start and
 answers, or, under `--enable-dynamic-chunking`, raises the simulated runner's
 own refusal of it into its server log, logs its stop after it and leaves as
@@ -13,6 +14,7 @@ own refusal of it into its server log, logs its stop after it and leaves as
 
 import itertools
 import json
+import os
 import shlex
 import shutil
 import sys
@@ -21,7 +23,8 @@ from types import SimpleNamespace
 
 import platforms
 import pytest
-from test_advice_reuse import COVERED, law, law_file, past
+from test_advice_reuse import COVERED, law, law_file, past, resolved_here
+from test_capture_v4_pro import CONFIG as V4_PRO
 from test_memory_readings import publish_readings
 from test_run_lacking import served
 from test_run_step_grid import DOCUMENT, deployment
@@ -30,6 +33,7 @@ from atom.compass import cli
 from atom.compass import run as compass_run
 from atom.compass.advice import check
 from atom.compass.artifacts import Kind
+from atom.compass.bench import ops
 from atom.compass.drive import reuse
 from atom.compass.drive import run as drive_run
 from atom.compass.spec.layers import stack_of
@@ -47,7 +51,9 @@ from pathlib import Path
 argv = sys.argv[1:]
 at = Path(argv[0] if argv[0] != "run" else argv[argv.index("--out") + 1])
 with open(os.environ["STUB_CALLS"], "a") as calls:
-    calls.write(json.dumps({{"argv": argv, "env": dict(os.environ)}}) + "\\n")
+    calls.write(
+        json.dumps({{"argv": argv, "env": dict(os.environ), "cwd": os.getcwd()}}) + "\\n"
+    )
 at.mkdir(parents=True)
 if "--enable-dynamic-chunking" in argv:
     refuse = (
@@ -81,6 +87,36 @@ ONE_ENVIRONMENT = (
 )
 #: The network the 1P1D candidates read.
 NETWORK = "crs005-013-ionic"
+#: The check's child and the resolution it runs, which the fixture keeps here.
+CHILD, DECLARED = ops._child, drive_run._declared
+#: Why Compass refuses `compass_refusing`'s side.
+REFUSING = (
+    f"{drive_run.KV_FLAG} is among the prefill side's ATOM arguments; --check "
+    f"prefill adds its {drive_run.KV_FLAG}, as deploy.sh does"
+)
+
+
+class Unpicklable(Exception):
+    """An error its own arguments do not rebuild, so it fails to unpickle, as
+    huggingface_hub's `StrictDataclassFieldValidationError` does."""
+
+    def __init__(self, field: str, cause: str):
+        super().__init__(f"Validation error for field {field!r}: {cause}")
+
+
+def unpicklable(atom_args, arch):
+    """A resolution raising an `Unpicklable`."""
+    raise Unpicklable("num_hidden_layers", "expected int, got str")
+
+
+def compass_refusing(atom_args, arch):
+    """A resolution Compass's own code refuses."""
+    return drive_run.side_args("prefill", [drive_run.KV_FLAG], drive_run.SIMULATED)
+
+
+def compass_failing(atom_args, arch):
+    """A resolution failing in Compass's own code: no side is a server."""
+    return drive_run.side_args("server", atom_args, drive_run.SIMULATED)
 
 
 def resolved(config, atom_args):
@@ -101,9 +137,7 @@ def stubbed(tmp_path, monkeypatch):
     start the stub's, given `check.START_S` 2 s."""
     r = deployment(tmp_path, **COVERED)
     served(monkeypatch, r.config)
-    monkeypatch.setattr(
-        drive_run, "_config", lambda a, arch=None: resolved(r.config, a)
-    )
+    resolved_here(monkeypatch, lambda atom_args: resolved(r.config, atom_args))
     head = {"commit": "c0ffee" * 6 + "c0ff", "ref": "origin/" + reuse.INTEGRATION}
     head["atom"] = compass_run.atom_digest()
     monkeypatch.setattr(reuse, "head", lambda commit=None: head)
@@ -255,12 +289,12 @@ def test_a_value_atom_s_parser_rejects_refuses_its_candidate_with_the_parser_s_e
 def test_a_configuration_atom_refuses_refuses_its_candidate_with_atom_s_error(
     tmp_path, stubbed, monkeypatch, error
 ):
-    def refusing(atom_args, arch=None):
+    def refusing(atom_args):
         if "--decode-context-parallel-size" in atom_args:
             raise error
         return resolved(stubbed.config, atom_args)
 
-    monkeypatch.setattr(drive_run, "_config", refusing)
+    resolved_here(monkeypatch, refusing)
 
     found = advise(
         tmp_path, {"a": {}, "b": {"args": {"--decode-context-parallel-size": 3}}}
@@ -274,6 +308,54 @@ def test_a_configuration_atom_refuses_refuses_its_candidate_with_atom_s_error(
         "points": {},
     }
     assert starts(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("declared", "why"),
+    [
+        (DECLARED, "ATOM's config: SyntaxError: '{' was never closed"),
+        (
+            unpicklable,
+            (
+                "ATOM's config: test_advice_check.Unpicklable: Validation error for "
+                "field 'num_hidden_layers': expected int, got str"
+            ),
+        ),
+        (compass_refusing, REFUSING),
+    ],
+    ids=["atom", "unpicklable", "compass"],
+)
+def test_what_the_child_raises_resolving_refuses_its_candidate_as_its_line(
+    tmp_path, stubbed, monkeypatch, declared, why
+):
+    # A real child; ATOM's own resolution reads DeepSeek-V4-Pro and fails at {bad.
+    monkeypatch.setattr(ops, "_child", CHILD)
+    monkeypatch.setattr(drive_run, "_declared", declared)
+    shutil.copy(V4_PRO, tmp_path / "config.json")
+
+    found = advise(tmp_path, {"a": {"args": {"--kv-transfer-config": "{bad"}}})
+
+    assert found["a"] == {"state": "refused", "why": [why], "made_by": [], "points": {}}
+    assert starts(tmp_path) == []
+
+
+def test_compass_s_own_defect_resolving_fails_compass_advice_with_its_traceback(
+    tmp_path, stubbed, monkeypatch
+):
+    monkeypatch.setattr(ops, "_child", CHILD)
+    monkeypatch.setattr(drive_run, "_declared", compass_failing)
+
+    with pytest.raises(RuntimeError) as failed:
+        advise(tmp_path, {"a": {}})
+
+    said = str(failed.value)
+    assert said.startswith(
+        f"Compass's own code raised resolving ['--model', '{tmp_path}'"
+    )
+    assert "\nTraceback (most recent call last):\n" in said
+    assert ", in side_args\n" in said
+    assert said.endswith("\nKeyError: 'server'\n")
+    assert not (tmp_path / "out" / check.STATES).exists()
 
 
 @pytest.mark.parametrize("lands", ["a law", "readings"])
@@ -313,7 +395,7 @@ def test_rerunning_after_an_input_lands_moves_only_what_it_serves_to_searchable(
 
 
 @pytest.mark.parametrize("given", ["whole", "relative"])
-def test_a_start_takes_out_whole_and_the_store_holding_its_inputs_and_space_s_stack(
+def test_a_start_runs_here_taking_out_whole_the_store_holding_its_inputs_and_stack(
     tmp_path, stubbed, monkeypatch, given
 ):
     # Only the store a calibration of a writes into holds the readings.
@@ -332,6 +414,8 @@ def test_a_start_takes_out_whole_and_the_store_holding_its_inputs_and_space_s_st
     assert found["a"]["state"] == "searchable"
     (call,) = starts(tmp_path)
     argv = call["argv"]
+    # Where the check resolved its arguments, such as a relative model.
+    assert call["cwd"] == os.getcwd()
     assert argv[argv.index("--out") + 1] == str(tmp_path / "out/starts/a-c1")
     assert argv[argv.index("--store") + 1] == str(own)
     assert argv[argv.index("--stack") + 1] == stack
