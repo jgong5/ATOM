@@ -87,7 +87,7 @@ rows is cut. A step of an MTP record without `d_target_ns` is cut as
 
 A step's host labels are its segments: `E` from the previous forward's exit,
 cut as idle after an idle engine (`busy_gaps`); `W_pre` to the launch, less
-the staging gate's wait; `W_launch` from the launch to the token copy wait,
+the staging gate's wait; `W_launch` from the launch to the token read,
 the sampler's launch included, or to the launch's end on a forward with no
 such wait, less the time its line's `blocked_ns` states the launch thread
 spent in HIP's blocking calls, there waiting on the device; a line without
@@ -618,7 +618,7 @@ def _label(
             propose = s.get("b_propose_ns") if view.produces_output else None
         enter, (l0, l1) = s["t_enter_ns"], s["t_launch_ns"]
         g0, g1 = s.get("t_gate_ns", (l0, l0))
-        r0, r1 = s.get("t_recv_ns", (l1, l1))
+        r0, r1 = s.get("t_recv_ns", s.get("t_read_ns", (l1, l1)))
         m0, m1 = s.get("t_mtp_ns", (l0, l0))
         blocked = s.get("blocked_ns")
         host = {"W_pre": g0 - enter + m0 - g1}
