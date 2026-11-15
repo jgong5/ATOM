@@ -12,7 +12,8 @@ on, because until 2026-09-20 it was not — see "Which tree a script acts on" be
 
 New to Compass? [QUICKSTART.md](QUICKSTART.md) takes a model from an empty store
 to a simulation graded against real runs, and `smoke_cell.sh` runs that path in
-about an hour. `calibrate.sh OUT RECORD...` takes its calibration in one command,
+about an hour. [ADVICE.md](ADVICE.md) takes a user from a space file of
+configurations through `compass advice` to the one it recommends. `calibrate.sh OUT RECORD...` takes its calibration in one command,
 from the warm record to the fits, and resumes a stopped run; its variables are in
 its header.
 
