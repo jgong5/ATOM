@@ -391,7 +391,8 @@ def _stop(group: int, kfd=None) -> None:
     """SIGTERM the process group `group`; SIGKILL what is left after
     `STOP_GRACE_S`. Given `kfd`, the processes KFD listed before the server
     started, the group has left only once KFD lists none it did not, as it
-    lists an exited process until it has freed its GPU memory. KFD names a
+    lists an exited process until the driver releases it; its memory can
+    read as used a while longer, while the driver clears it. KFD names a
     process by a PID a container's /proc may not show, so no PID is mapped:
     another tenant's process that opened a GPU since holds the stop as long."""
     for sig in (signal.SIGTERM, signal.SIGKILL):

@@ -17,7 +17,7 @@ import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_backend_step_linear_fit import _steps, _timed_record, platform_arg
 from test_fit_samples import DEVICE, SOURCE, edit, idle_rank
-from test_memory_readings import DOCUMENT, STACK, spec_file
+from test_memory_readings import DOCUMENT, STACK
 from test_parity_served import SAMPLING
 from test_step_linear_moe_column import (
     DP,
@@ -114,10 +114,9 @@ def as_record(directory, key=HOST, stack=STACK, trace="trace"):
 
 
 def fit(tmp_path, command, *args):
-    """`compass <command> <args>` on the run files' machine spec, publishing to
-    `tmp_path/store`."""
+    """`compass <command> <args>`, publishing to `tmp_path/store`."""
     store, out = (str(tmp_path / f) for f in ("store", "out"))
-    tail = ["--machine", spec_file(tmp_path), "--store", store, "--out", out]
+    tail = ["--store", store, "--out", out]
     cli.main([*command.split(), *map(str, args), *tail])
 
 

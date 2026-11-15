@@ -12,9 +12,11 @@ own: each leaf takes the buffers ATOM's own capture passes it
 (`v41_capture_truth.py`).
 """
 
+import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -265,10 +267,9 @@ def test_the_queries_pointer_gather_takes_its_last_layer_s_prefix_table():
 
 
 @pytest.fixture(scope="module")
-def undrafted(model_dir, tmp_path_factory):  # noqa: F811
-    """Cell B's decode B=16 with no drafter, traced; what its capture passes
-    each leaf; and the rehearsal's record of its RoPE leaves alone, no compress
-    leaf beside them, at 8192 tokens a row."""
+def undrafted_cell(model_dir, tmp_path_factory):  # noqa: F811
+    """Cell B's decode B=16 with no drafter, traced, and what its capture passes
+    each leaf, under one root; and ATOM's arguments for that cell."""
     root, cell = tmp_path_factory.mktemp("v41_undrafted"), CELL.replace(DRAFTER, "")
     _trace(root, f"--width 16{cell}", ("--arch", "gfx1250", "--gpu", "0"), READ)
     model, cell = root / "model", cell.split()[1:]
@@ -276,6 +277,14 @@ def undrafted(model_dir, tmp_path_factory):  # noqa: F811
         shutil.copy(model_dir / name, model / name)
     _run(TRUTH, root / "truth.json", model, 4, "--width", "16", "--", *cell)
     atom = ["--model", model, "-tp", "4", "--enforce-eager", "--level", "0", *cell]
+    return root, atom
+
+
+@pytest.fixture(scope="module")
+def undrafted(undrafted_cell):
+    """The rehearsal's record of `undrafted_cell`'s RoPE leaves alone, no
+    compress leaf beside them, at 8192 tokens a row; and its capture's truth."""
+    root, atom = undrafted_cell
     point = ["--width", "16", "--context", "8192", "--only", ROPE, "--llc-mib", "512"]
     _run(HARNESS, root / "got.json", *point, "--store", root / "store", "--", *atom)
     return [json.loads((root / f).read_text()) for f in ("got.json", "truth.json")]
@@ -292,3 +301,32 @@ def test_each_rope_alone_takes_its_positions_at_a_decode_with_no_drafter(undraft
     assert {s: [n] for s, n in taken.items()} == want
     assert {(r["op"], r["verdict"]) for r in got} == {(ROPE, "reaches launch")}
     assert len(set(taken.values())) == len(taken) == 3
+
+
+def test_a_key_rope_stating_no_ratio_refuses_where_both_ratios_plans_hold_its_rows(
+    undrafted_cell,
+):
+    """In a graph traced before V4.1's key RoPE stated its ratio, at a decode
+    with no drafter, both ratios' keys' RoPEs are one leaf, and both ratios'
+    compress plans hold its rows: alone or beside them, it refuses by name, to
+    be traced again, and the query's RoPE takes what ATOM's capture passes it."""
+    root, atom = undrafted_cell
+    store, truth = root / "unstated", json.loads((root / "truth.json").read_text())
+    shutil.copytree(root / "store", store, copy_function=shutil.copyfile)
+    for entry in store.glob("op_graph/*/entry.json"):  # each RoPE stating nothing
+        doc = json.loads(entry.read_text())
+        for name in doc["members"]:
+            data = (entry.parent / name).read_bytes()
+            data = re.sub(rb', "stated": \{"compress_ratio": \d+\}', b"", data)
+            (entry.parent / name).write_bytes(data)
+            doc["members"][name] = f"sha256:{hashlib.sha256(data).hexdigest()}"
+        entry.write_text(json.dumps(doc))
+    for only in (["--only", ROPE], []):
+        point = ["--width", "16", "--context", "8192", *only, "--llc-mib", "512"]
+        _run(HARNESS, root / "unstated.json", *point, "--store", store, "--", *atom)
+        got = json.loads((root / "unstated.json").read_text())
+        ropes = [r for r in got if r["op"] == ROPE]
+        heads = [json.loads(r["leaf"])["args"]["input"]["shape"][-2] for r in ropes]
+        (_, key), (_, query) = sorted(zip(heads, ropes), key=lambda h: h[0])
+        assert key["why"].endswith("holds its 16 rows: trace its shape again")
+        assert [query["identity"].get("positions")] == truth[query["leaf"]]["positions"]
