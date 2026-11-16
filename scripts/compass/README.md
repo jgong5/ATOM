@@ -1460,3 +1460,32 @@ and 5 at concurrency 16 alone, with these changes:
   workload, and refused.
 - The draft vectors hold no held-out error: check 2's `cost` rows of kind `draft` give
   the draft law's error on the real runs' own steps.
+
+### A stage-4 cell graded on MI455
+
+[#2147](https://github.com/jgong5/ATOM/issues/2147) grades cell A on one MI455 A0 node by steps
+4 and 5 at concurrency 1, 4, 16 and 64, every run from one tree, with these changes from the
+smoke above:
+
+- `$ATOM`, its environment and the container are those
+  `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json` states (its
+  paragraph above), and `$M` is `--device mi455x-a0 --ptl disabled`, the store holding the
+  node's readings at that stack.
+- Step 5 prices by the law file, `--step-linear LAW --host-laws LAW`, with the
+  `memory_readings` that `compass measure memory` takes at the same tree and settings.
+- Steps 4 and 5 take `--duration 3600`, one server on the node at a time. Step 4 runs three
+  spaced rounds at c=1, 4, 16 and 64: the first ran c=1, 4 and 64, then 16, as the interim
+  check ordered them; the second and third ran 1, 4, 16, 64.
+- `python -m atom.compass.validate` grades each concurrency's simulated run against its three
+  real runs, with throughput and TPOT targets of 10% and TTFT's of 15%, beside the real spread.
+- A real run has hung when, for 90 s while requests run or wait, its log shows neither a step
+  line nor a load report with nonzero prompt or generation throughput
+  ([#2922](https://github.com/jgong5/ATOM/issues/2922)). Check the node after the GPU reset
+  that follows: one such reset left RCCL's all-reduces above aiter's 64 MiB custom
+  all-reduce cutoff slow until the node was rebooted, every prefill chunk over 6553 tokens
+  37 to 60% slower on the device.
+- `python -m atom.compass.memory.check --tp 4` checks each rank's non-KV memory against the
+  real run's log; a concurrency's memory is graded on the mean of its 12 readings, three runs
+  of four ranks. The `non_torch` term, the driver and collective reserve, moves from start to
+  start: one rank alone read +10.43% against the 10% gate twice, beside its start's 10.3%
+  spread across ranks, while the mean stayed within 2.3%.
