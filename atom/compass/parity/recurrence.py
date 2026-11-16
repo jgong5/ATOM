@@ -19,6 +19,8 @@ host, which starting the draft at the exit already counts, so the draft is
 and a decode's `d_gap_ns` is the work queued ahead of its launch
 (`check`). Each forward is called at the
 exit predicted for the one before, so only the waits and device times move it.
+A record that stamps its read of its own draft ids (`t_draft_read_ns`), its draft copy
+wait, leaves each output forward no earlier than its device end; one stamping none keeps that read in `W_post`.
 A pipeline record is gated step by step, each stage charged with the predicted
 times of the others (`pipeline`), its sends priced on a machine spec's PP
 carriers when one is given:
@@ -176,6 +178,7 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
     waited = step_labels.host_paced_drafts(steps) if mtp else set()
     defer = not any("t_read_ns" in s for s in steps)
     rec = HostDeviceRecurrence({}, (), lambda: now, stage, mtp=mtp, defer=defer)
+    rec.own_draft = any("t_draft_read_ns" in s for s in steps)
     kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
     for n, s in enumerate(steps):
         if "d_busy_ns" not in s:
@@ -183,7 +186,7 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
         (g0, g1), (l0, l1) = s["t_gate_ns"], s["t_launch_ns"]
         r0, r1 = s.get("t_recv_ns", s.get("t_read_ns", (l1, l1)))
         m0, m1 = s.get("t_mtp_ns", (l0, l0))
-        d0, d1 = s.get("t_draft_recv_ns", (0, 0))
+        d0, d1 = s.get("t_draft_recv_ns", s.get("t_draft_read_ns", (0, 0)))
         p0, p1 = s.get("t_pp_recv_ns", (l0, l0))
         last = prev["t_exit_ns"] if prev else s["t_enter_ns"]
         e, called = s["t_enter_ns"] - last, now
@@ -331,6 +334,7 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
         launch=launch,
         defer=defer,
     )
+    rec.own_draft = any("t_draft_read_ns" in s for s in steps)
     kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
     admits = step_labels.admissions(steps)
     for s, kind, admitted in zip(steps, kinds, admits):

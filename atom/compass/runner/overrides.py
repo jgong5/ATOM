@@ -345,6 +345,8 @@ class HostDeviceRecurrence:
     which its caller sets from `predicted`; `launch`, the provider and graph
     sets predicting them, refuses a column naming a feature it lacks; a
     pipeline stage refuses any column.
+    With `own_draft`, true unless it defers, an output forward that waits for its own
+    target leaves no earlier than its device end, as one that reads its own draft ids does.
     """
 
     def __init__(
@@ -380,6 +382,7 @@ class HostDeviceRecurrence:
         self.recv = stage is not None and stage[0] > 0  # a later stage receives
         self.output_end = -math.inf  # target end of the last output forward
         self.mtp = mtp
+        self.own_draft = not defer
 
     def charge(
         self, batch: Any, device_s: float, draft_s: float, refuse: bool = True
@@ -507,7 +510,7 @@ class HostDeviceRecurrence:
         at `end` and its target's at `target_end`: `W_post` after its launch
         and the wait that follows it, an output forward's for the previous
         output forward's target on a single stage that defers or its own on the last or one that does not, or
-        under `sync` for `end`."""
+        under `sync` for `end`; with `own_draft`, one waiting for its own target leaves no earlier than `end`."""
         _, launch_end, output, post = self._held
         released = launch_end
         if self.sync:
@@ -516,6 +519,8 @@ class HostDeviceRecurrence:
             released = max(launch_end, self.output_end)
         elif output and self.last:
             released = max(launch_end, target_end)
+            if self.own_draft:  # its own draft ids, read once its draft ends
+                return max(released + post, end)
         return released + post
 
 

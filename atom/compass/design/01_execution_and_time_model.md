@@ -1567,7 +1567,7 @@ after the real put: the records' `t_put_ns` measure that gap.
 | R4 | every forward, single stage | forward entry | `end[n-2]` | `ModelRunner._gate_staging_reuse` |
 | R6 | every forward, PP | forward entry | this stage's `end[n-pp]` | `ModelRunner._advance_forward_vars`, the `forward_vars` ring |
 | R7 | non-first PP stage | device start, host launch | the upstream stage's `end`, and its host send | `GroupCoordinator.recv_tensor_dict`, from `recv_intermediate_tensors` (`atom/distributed/pp_comm.py`) in `ModelRunner.run_model`: the metadata on gloo holds the host, the tensors the device |
-| R8 | output batch, on the last PP stage or a single stage whose runner does not defer output | after launch | its own `target_end` | `tokenIDProcessor.prepare_sampled_ids`'s `tolist`, on a runner that does not defer output ([#3174](https://github.com/jgong5/ATOM/issues/3174)) |
+| R8 | output batch, on the last PP stage or a single stage whose runner does not defer output | after launch; with a drafter, also before the exit | its own `target_end`; with a drafter, then its own `end`: the forward leaves no earlier than it | `tokenIDProcessor.prepare_sampled_ids`'s `tolist`, on a runner that does not defer output ([#3174](https://github.com/jgong5/ATOM/issues/3174)); with a drafter, then `prepare_draft_ids`'s `cpu` ([#3544](https://github.com/jgong5/ATOM/issues/3544)) |
 
 **The MTP status copy, `L_mtp`** (owner ruling on
 [#2080](https://github.com/jgong5/ATOM/issues/2080), 2026-10-25). With MTP, R1 releases
@@ -1611,7 +1611,7 @@ what-if: never graded, and refused by the graders.
 **Measured, not hooked.** The parity recorder, `RecordingModelRunner`
 (`atom/compass/parity/runner.py`), stamps host time around the staging gate, the launch
 and the R1 wait (with MTP also the draft copy wait; on a non-first PP stage also the R7
-receive, and on the last stage its own token read; on a sending stage an idle
+receive, and on the last stage its own token read, as off a pipeline a runner that does not defer its output stamps it, with a drafter its own draft read as the draft copy wait; on a sending stage an idle
 `flush_pp_send` that settles a send), and records device events at
 `run_model` entry, with MTP at the target's end, on a non-first PP stage where the
 received tensors are in, and at the forward's exit, drained with `query()`, never `synchronize()`
