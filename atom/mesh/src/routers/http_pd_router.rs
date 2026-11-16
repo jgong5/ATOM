@@ -1369,7 +1369,7 @@ impl PDRouter {
         res: WorkerResponse,
         context: PDRequestContext<'_>,
         decode: Arc<dyn Worker>,
-        decode_guard: WorkerLoadGuard,
+        decode_guard: impl Send + Unpin + 'static,
     ) -> Response {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
