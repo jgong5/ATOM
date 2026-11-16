@@ -28,6 +28,7 @@ first, then refused, then calibrate. The requirement a verdict names:
 3. coverage: a decode rung the config schedules with no vector
    (`lacking.uncovered_rungs`), each listed (calibrate);
 4. accuracy: no cost-accuracy figures, on the law or on one of its sources
+   whose vectors price a step, which a source of host laws alone does not
    (calibrate); a figure on totals, holding out the costliest step or per step
    at the median past `GATE`, on some held-out run and kind, refused when the
    law's records ran at the head's ATOM digest (`records_atom`), since a
@@ -232,7 +233,7 @@ def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> di
         )
         return _verdict("calibrate", 3, why, law=where, rungs=rungs)
     past = []
-    for name, held in (law.get("sources") or {"": law}).items():
+    for name, held in _folded(law).items():
         of = f" of source {name}" if name else ""
         if not held.get("figures"):
             why = f"{where} states no cost-accuracy figures{of}"
@@ -252,6 +253,20 @@ def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> di
         return _verdict("refused", 4, why, law=where)
     ran = f"from ATOM digest {ran}" if ran else "stating no ATOM digest"
     return _verdict("calibrate", 4, f"{worst}, on records re-keyed {ran}", law=where)
+
+
+def _folded(law: dict) -> dict:
+    """What of `law` states cost-accuracy figures, by source name: each of its
+    `sources` with a vector that prices a step, the prefill one or a decode one
+    (`step_linear_fit._vector_of`), as ``step_linear_fit figures`` folds no
+    other, such as one of host laws alone; else the law itself, named ``""``."""
+    sources = (law.get("sources") or {}).items()
+    priced = {
+        name: source
+        for name, source in sources
+        if any(v == "prefill" or v.startswith("decode ") for v in source["vectors"])
+    }
+    return priced or {"": law}
 
 
 def _keyed(store: ArtifactStore, kind: Kind, engine: dict, **fields) -> list[Key]:

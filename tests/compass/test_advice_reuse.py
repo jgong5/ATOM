@@ -305,6 +305,42 @@ def test_a_law_with_a_source_stating_no_figures_names_requirement_4(tmp_path, se
     }
 
 
+def host_alone(r) -> dict:
+    """`law` with source shipped holding host laws alone and stating no
+    figures, as the crs005 DPA8 prefill law's does, its prefill vector moved
+    to source refitted."""
+    held = law(r)
+    shipped = held["sources"]["shipped"]
+    shipped["vectors"].remove("prefill")
+    del shipped["figures"]
+    held["sources"]["refitted"]["vectors"].append("prefill")
+    return held
+
+
+def test_a_source_of_host_laws_alone_needs_no_figures(tmp_path, searched):
+    where = law_file(tmp_path, host_alone(searched))
+
+    found = verdicts(advise(tmp_path), "law")
+
+    reused = {"verdict": "reuse", "requirement": None, "reason": where, "law": where}
+    assert found == [reused] * 2
+
+
+def test_a_law_whose_sources_price_no_step_needs_its_own_figures(tmp_path, searched):
+    held = host_alone(searched)
+    held["sources"] = {"shipped": held["sources"]["shipped"]}
+    where = law_file(tmp_path, held)
+
+    found, _ = verdicts(advise(tmp_path), "law")
+
+    assert found == {
+        "verdict": "calibrate",
+        "requirement": 4,
+        "reason": f"{where} states no cost-accuracy figures",
+        "law": where,
+    }
+
+
 @pytest.mark.parametrize("held", ["none", "at another digest"])
 def test_readings_with_no_entry_or_measured_at_another_digest_are_measured(
     tmp_path, searched, held
