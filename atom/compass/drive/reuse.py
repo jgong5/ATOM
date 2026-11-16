@@ -39,7 +39,9 @@ law at the head's ATOM digest names that ``store``, whatever the verdict. A
 refusal the runner makes of the config under the law, as of context
 parallelism, propagates. `readings` gives the config's memory readings in a
 store `reuse`, or `measure` where none is at their key or the one there was
-measured at another ATOM digest (requirement 1). `stores` orders the stores a
+measured at another ATOM digest (requirement 1), or where it lacks the PAGE
+bound a start of the config reads, which `compass run --check` finds stale
+(`lacking.stale_page_bound`, requirement 2). `stores` orders the stores a
 candidate is looked up in.
 """
 
@@ -63,7 +65,7 @@ from atom.compass.artifacts.store import ENTRY_FILE
 from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.step_grid_plan import at_ladder
 from atom.compass.drive import runfile
-from atom.compass.drive.lacking import AXIS, uncovered_rungs
+from atom.compass.drive.lacking import AXIS, stale_page_bound, uncovered_rungs
 from atom.compass.run import STEP_LINEAR, memory
 from atom.compass.run.step_grid import differ, keyed
 
@@ -200,7 +202,7 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
 def readings(store: ArtifactStore, config, machine) -> dict:
     """The verdict on `config`'s memory readings in `store` on `machine`."""
     try:
-        memory.load(str(store.root), config, machine, 0)
+        read = memory.load(str(store.root), config, machine, 0)
     except ArtifactRefusal as refused:
         stale = refused.rule is Rule.INVALIDATED
         if refused.rule is not Rule.RESOLUTION and not (
@@ -208,6 +210,8 @@ def readings(store: ArtifactStore, config, machine) -> dict:
         ):
             raise
         return _verdict("measure", 1, str(refused))
+    if why := stale_page_bound(read, config):
+        return _verdict("measure", 2, why)
     return _verdict("reuse", None, f"at their key in {store.root}")
 
 
