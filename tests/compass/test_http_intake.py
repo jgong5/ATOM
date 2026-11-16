@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -802,16 +803,20 @@ def work():
             mc.MSG_WRITE_REQUEST, mc.MSG_WRITE_DONE
         ]
 """,
-        "entrypoints/openai/api_server.py": """
-import multiprocessing
-from atom.worker import work
+        # Indented: `regen_gpu_gate_triggers.sh` reads a column-0 `from atom.`
+        # line as this file's import, and `atom.worker` exists only here.
+        "entrypoints/openai/api_server.py": textwrap.dedent(
+            """
+            import multiprocessing
+            from atom.worker import work
 
-if __name__ == "__main__":
-    p = multiprocessing.get_context("spawn").Process(target=work)
-    p.start()
-    p.join()
-    assert p.exitcode == 0
-""",
+            if __name__ == "__main__":
+                p = multiprocessing.get_context("spawn").Process(target=work)
+                p.start()
+                p.join()
+                assert p.exitcode == 0
+            """
+        ),
     }
     for name, text in server.items():
         (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)
