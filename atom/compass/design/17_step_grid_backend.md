@@ -622,7 +622,9 @@ a simulated run needs no device, and its host's stack is not the one measured.
 - **Keyed conditions refuse on mismatch**: the key, D43's row, the graph mode, the
   ladder, block size, KV dtype, quantization, TP width, EP, the MoE backend, under
   speculation its method and draft width, the chunk sizes a recipe reads, and the stated
-  scope (D98).
+  scope (D98). A run's ladder that is a non-empty prefix of the bundle's is no mismatch:
+  it reads as the bundle's, in D43's row too, since a batch pads to one rung under every
+  ladder holding it ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)).
 - **Derived values**, such as a chunk width computed from keyed conditions, are not
   stated separately and go into the provenance.
 
@@ -638,7 +640,7 @@ is the logical TP, never the count of local workers launched.
 
 ### At startup
 
-- **Every rung of the target's ladder inside the bundle's measured range was measured**,
+- **Every rung of the run's own ladder inside the bundle's measured range was measured**,
   or the run refuses, listing the rungs.
 - **The run's configured bounds lie within the bounds the grid was planned for** (D98), or
   the run refuses.

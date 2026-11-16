@@ -20,7 +20,7 @@ D80), `16` (D95.1), and the M3-Agentic stage's `03` D13.1, `06` D35.1 and `14` D
 | `13` D80: no command starts the client or takes a workload | `compass advice` does both | D109 |
 | `13` D80: a prefill or decode `run` refuses without `--join` | not under `--check`, which resolves the side as `deploy.sh` does | D109 |
 | `13` D80: what `run --check` lists | a step linear law's scheduled decode rungs with no vector, too | D112 |
-| `13` D80: what `run`, `record` and `deploy.sh` write | each writes its per-request split and `report.html` when its run ends | D114, D115 |
+| `13` D80: what `run`, `record` and `deploy.sh` leave | each run's per-request split and `report.html`, written as it ends by `client.sh --stop` for an instance and by `deploy.sh` for a deployment | D114, D115 |
 | `08` D50: the cell matrix | a MiniMax-M3 showcase set: the recommended configuration and the runner-up | D117 |
 
 ---
@@ -151,7 +151,7 @@ development nodes are crsuse2-m2m-v3-005 and -013.
 ### 7. What each run writes, and the views
 
 ```
- a run stops: compass run, compass record, a deploy.sh deployment (D114, D115)
+ a run stops: client.sh --stop on an instance, a deploy.sh deployment (D114, D115)
    -> its per-request split, a file of its own: queue, prefill, KV transfer,
       decode, LMCache store and load, from dp<r>.jsonl, transfers.jsonl and
       aiperf's per-request export
@@ -393,7 +393,8 @@ and each point's readings one, *reuse*, *measure* or *refused*, naming the requi
 that failed; `compass advice` calls it and judges nothing. A reused input is stated in
 the run's provenance.
 
-1. **Same key**, as `07` D41 keys each kind, at the head's ATOM. The check compares the
+1. **Same key**, as `07` D41 keys each kind, at the head's ATOM, a law's and its host
+   laws' capture ladder one the candidate's is a non-empty prefix of (`09` D54). The check compares the
    ATOM digest of the tree `atom` resolves under
    (`atom/compass/run/__init__.py::atom_digest`, the sha256 of ATOM's Python less
    Compass's own code, which every key reads) with the head's: the digest of the `atom/`
@@ -417,9 +418,9 @@ the run's provenance.
    change that moves memory takes the readings again, as #2861's token buckets moved
    DeepSeek-V4.1's graph pool. A store entry is never re-keyed: it is immutable and keyed
    by the digest its records ran at. A store law reaches a later head as a checked-in law
-   file, as P1's would from M2's store: checked in under `scripts/compass/laws/` re-keyed
-   to the head, its provenance naming the commit its records ran at and saying re-keyed,
-   not re-validated. The commits that re-key the checked-in laws carry it from then on,
+   file: checked in under `scripts/compass/laws/` re-keyed to the head, its provenance
+   naming the commit its records ran at and saying re-keyed, not re-validated. The
+   commits that re-key the checked-in laws carry it from then on,
    `tests/compass/test_platform_keys.py::test_every_checked_in_law_stamps_this_trees_atom_digest`
    holding each to its tree's digest, and a run takes it as `compass run --step-linear
    LAW --host-laws LAW`. A search may mix laws fitted at different commits, each point's
@@ -454,7 +455,7 @@ the run's provenance.
    the records' ATOM digest, `records_atom`, which the fit writes into the law beside its
    host key and re-keying leaves alone, since a re-key moves only the host key's `atom`; a
    law that states none counts as re-keyed. A law fitted before the fit reported the
-   figures, as P1's and P3's are, gains them in a commit to its law file, on the head's
+   figures, as P3's are, gains them in a commit to its law file, on the head's
    fit, CPU only, its provenance saying so: each source its `sources` splits the vectors
    over is folded with that source's own records, form and options, as `sources` and the
    provenance state them, and a law with no `sources` as one fit. A law with no figures is
@@ -548,12 +549,25 @@ has run, and #3355 defers changing either.
 - **The per-request split**: each request's queue, prefill, KV transfer and decode time,
   both 1P1D sides mapped to one request, and its LMCache store and load, read from the
   step record (`dp<r>.jsonl`), a P/D run's `transfers.jsonl` and aiperf's per-request
-  export, which simulated and real runs both have, so one code path serves both. Every
-  run writes it when it ends, into its own file in its run directory, never
-  `summary.json`, changing none of the run's results: `compass run` and `compass record`
-  for an instance, `deploy.sh` for a deployment, both sides joined. A request's segments
-  sum to its end-to-end latency within the clock's resolution; on a real run its TTFT
-  matches aiperf's within a tolerance measured first. Its format is T109's.
+  export, which simulated and real runs both have, so one code path serves both. A real
+  forward's entry and return are its record line's; a simulated one's are on its cost
+  line, the engine's clock at its entry and that plus its charge. Every run writes it
+  when it ends, into its own file in its run directory, never `summary.json`, changing
+  none of the run's results: `client.sh --stop` for an instance, as it stops `compass
+  run` or `compass record`, `deploy.sh` for a deployment, both sides joined. The
+  segments run from the request's send to its first prefill forward's entry, to its
+  final prefill chunk's return, to its decode side's first forward's entry, to its end
+  at the client, so they sum to its end-to-end latency within the clock's resolution. A
+  real deployment's decode node's clock is joined to its client's, the bounds its
+  forwards and first tokens set stated in the file. On a real run its TTFT, from the
+  send to the return of the forward that hands its first token over, matches aiperf's
+  within a tolerance measured first; off a pipeline, the ATOM runner a client's tokens
+  come from hands an output-producing forward's tokens over at the return of its rank's
+  next one. A run the split cannot be made for gets the reason in its file, a
+  pipeline's among them. Its format, `request_split.json`: each request aiperf finished
+  as an `atom-benchmark/v1` request record with its segments, that TTFT, its LMCache
+  tokens loaded and stored and its response id; every other request with why; the
+  clock.
 - **The op-family split**, op level only: the prices per op kind a `compass run
   --op-graph` run holds per step (`op.<kind>` in `dp<r>.cost.jsonl`), summed per step
   phase into MoE, attention, dense GEMM, collectives, norms and elementwise, and other,
@@ -625,7 +639,7 @@ workload, so its grade is not cited.
 | S1 | one node, 8 GPUs | TP8 | MTP3 | off | off | `recipes/DeepSeek-V4-Agentic-InferenceX.md`, TP | calibrated anew (D113) |
 | S2 | one node | DPA8 | MTP3 | on | off | the same, DP attention | calibrated anew (D113) |
 | S5 | one node | DPA8 | MTP3 | on | on | the same, DP attention with LMCache | S2's step and host laws; its own readings, whose key holds the KV offload |
-| P1 | 1P1D, 16 GPUs | TP8 / TP8 | off | off | off | `recipes/mesh/DeepSeek-V4.md`, pure TP; nightly `ds-v4-1p1d-tp8` | M2's TP law from the crsuse2-m2m-v3-005 store, checked in re-keyed, if it passes D112 |
+| P1 | 1P1D, 16 GPUs | TP8 / TP8 | off | off | off | `recipes/mesh/DeepSeek-V4.md`, pure TP; nightly `ds-v4-1p1d-tp8` | calibrated anew (D113): no TP8 step linear law exists to reuse |
 | P3 | 1P1D | DPA8 / DPA8 | off | prefill | off | `recipes/mesh/DeepSeek-V4.md`, DPA | the shipped crs005 and gpu45 pairs under `scripts/compass/laws/`, if they pass D112 |
 
 The configurations cut from it, each one switch alone (S3, S4, P2, P4 to P7), can come
@@ -644,7 +658,9 @@ stated length has the gaps #3355's template lists, ungraded here.
 tool is built while MiniMax-M3's support lands (D117); the template runs every path of the
 tool, a reused law and a new one included, and S1 against S2 puts the agentic workload's
 best-known trade-off on its frontier. **Basis.** The owner on #3355, whose template states
-each departure and cites the #975 and #2683 Rulings it rests on; `16` D95.
+each departure and cites the #975 and #2683 Rulings it rests on; the
+[#3493 Ruling](https://github.com/jgong5/ATOM/pull/3493#issuecomment-6906479025), which
+calibrates P1 anew; `16` D95.
 
 **Rejected.** Developing on MiniMax-M3 from the start: the Compass features it needs were
 still landing under #3256, while DeepSeek-V4-Pro already had a store and laws on the
@@ -674,8 +690,9 @@ development nodes.
 - **The template**: #3256's arms with the submission's arguments as #3256 records them,
   `--max-num-seqs` twice the concurrency, EAGLE3 at `14` D87.1's forced length and the
   `agentx` workload (`06` D35.1), each arm at every concurrency InferenceX ran; a point
-  that cannot be priced is a grey coverage report. How one law serves points whose
-  `--max-num-seqs` differs is #3275's ruling (T113).
+  that cannot be priced is a grey coverage report. A law serves each point whose capture
+  ladder is a prefix of its own, so an arm's law keyed at its top point serves its lower
+  ones (#3275, T113).
 - **Calibration** as `16` D95.1's, after the environment check: a base law each for TP4,
   TP4 with indexer CP and TP2, the last two pooling their LMCache arms' records, with `03`
   D13.1's offload terms, only if those arms come up; a readings entry per point; each step
@@ -753,8 +770,7 @@ settled by the [sixth ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomm
 No spike and no sync issue: no decision waits on a measurement, and none needs an
 interface only the upstream has. Other issues settle what decisions leave to them: #3256's
 grading, which reopens the showcase's pricing if it fails the step linear law where the
-step grid passes on a cell the showcase runs (D117); #3275 how one law serves an arm's
-points (T113); #3054 the indexer-CP key MiniMax-M3's move waits on (D117); #2311 who judges a change that
+step grid passes on a cell the showcase runs (D117); #3054 the indexer-CP key MiniMax-M3's move waits on (D117); #2311 who judges a change that
 moves step costs (D112); #3122 readings re-keyed with a law, and trees other than the
 head (D112); #1498 the op-family split's inputs on DeepSeek-V4-Pro (D114).
 
@@ -782,12 +798,11 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | `atom/compass/backends/step_linear_plan.py` (new), beside `step_grid_plan.py` | the record list | D113 |
 | `atom/compass/backends/step_linear_fit.py` | `08` D47's three figures per kind over each leave-one-run-out fold, as `validate/cost.py` computes them, in the law and its report; the records' ATOM digest, `records_atom` | D112 |
 | `scripts/compass/calibrate.sh` | `STORE`, a GPU list, `status`, per-step timing | D113 |
-| `atom/compass/report/` (new), called where `run`, `record` and `deploy.sh` stop | the per-request split, the op-family split, `report.html` | D114, D115 |
+| `atom/compass/report/` (new), called where `client.sh --stop` and `deploy.sh` stop a run | the per-request split, the op-family split, `report.html` | D114, D115 |
 | `atom/compass/validate/__main__.py`, `validate/curves.py` | `grades.json` in each graded cell, its runs' `report.html` rendered again; a 1P1D point's GPUs over both sides | D115, D111 |
 | `scripts/compass/spaces/` (new) | the DeepSeek-V4-Pro and MiniMax-M3 templates | D110, D116, D117 |
 | `scripts/compass/ADVICE.md` (new), `QUICKSTART.md` | the guide, linked both ways | D108 |
-| `scripts/compass/laws/` | M2's TP law, P1's, checked in re-keyed if it passes D112 | D112, D116 |
-| `scripts/compass/laws/` | P1's and P3's `08` D47 figures, each source folded with its own records, form and options | D112, D116 |
+| `scripts/compass/laws/` | P3's `08` D47 figures, each source folded with its own records, form and options | D112, D116 |
 
 **Acceptance items**, each walked by the scenario named:
 
@@ -835,9 +850,9 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | D111 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. A 1P1D point's GPUs are its prefill side's plus its decode side's, each from its own engine record. | 2026-11-13 (#3355); the GPU count 2026-11-14 ([#3454](https://github.com/jgong5/ATOM/issues/3454)) |
 | D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage (a decode vector for every scheduled rung before the search, each point's extrapolated share reported after it) and `08` D47's three figures on each leave-one-run-out fold within #627's 5% gate, a law at the head past it refused; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose ATOM digest is not the head's, the remote tip's or a frozen commit's, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363; the head by ATOM's digest, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957); coverage in two parts, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216); the accuracy bar, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6869501859)) |
 | D113 | The step linear backend lists a configuration's missing records, for a missing law or decode rung, as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
-| D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355) |
+| D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355); the format 2026-11-14 ([#3458](https://github.com/jgong5/ATOM/issues/3458)) |
 | D115 | Two static views reading files only: the search's dashboard, each point marked by grading state and method shares, and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell, which renders the cell's reports again. | 2026-11-13 (#3355, #3363) |
-| D116 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355) |
+| D116 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355); P1 calibrated anew 2026-11-16 ([#3493](https://github.com/jgong5/ATOM/pull/3493#issuecomment-6906479025)) |
 | D117 | Moved to MiniMax-M3 once its Compass features land and #3265 passes, calibrated on the development nodes from #3256's arms at one frozen commit, where its simulations and validation runs run too, every point priced by the step linear law alone, a step past its records extrapolated and reported, and the pricing reopened if #3256's grading fails the law where the step grid passes ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216)); the showcase validation runs the recommended configuration and the runner-up real, graded by `08` D44, their real order compared with the simulated one, each point's `08` D45.1 verdict beside its grade, not gated. Amends `08` D50. | 2026-11-13 (#3355, #3363) |
 
 ---

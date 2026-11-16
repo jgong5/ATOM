@@ -12,13 +12,14 @@ finished once both exit 0 and its directory holds the run summary, the run
 file and the client export (`HELD`); then ``point.json`` there records what
 ran, the CPU seconds the two commands and the processes they waited for took,
 and the tries. A rerun skips a point whose ``point.json`` records what it
-would run, at the commit the check took as the head; any other directory
-there is removed first. A point that fails is tried again from a fresh
-directory, then listed with each try's reason: the client's last line, the
-server command's, and the first error raised in each log under the point's
-directory. Each command's output is beside the directory, in ``<point>.log``
-and ``<point>.client.log``. With ``HARNESS_PYTHON``, the Python `client.sh`
-runs aiperf under, unset, no point runs, and each is listed with why.
+would run, on the tree that runs it, by the ``HEAD^{tree}`` `git_tree_root`
+reads, with no uncommitted file then or now; any other directory there is
+removed first. A point that fails is tried again from a fresh directory, then
+listed with each try's reason: the client's last line, the server command's,
+and the first error raised in each log under the point's directory. Each
+command's output is beside the directory, in ``<point>.log`` and
+``<point>.client.log``. With ``HARNESS_PYTHON``, the Python `client.sh` runs
+aiperf under, unset, no point runs, and each is listed with why.
 
 Points start in SPACE's order, as many at once as this process's CPUs hold
 the widest point's ranks, each rank one CPU; each server draws its own ports.
@@ -36,6 +37,7 @@ from pathlib import Path
 
 from atom.compass import run as compass_run
 from atom.compass.advice import check
+from atom.compass.artifacts.provenance import git_tree_root
 from atom.compass.drive import serve
 
 #: Each point's run directory, under OUT; and the record of what ran in it.
@@ -61,12 +63,14 @@ def simulate(expansion: dict, judged: dict, found: dict, out: Path) -> dict:
     the `check.check` verdicts `judged` serve it, into `out`; the outcomes,
     written into `out` as `SIMULATED`."""
     candidates = {c["name"]: c for c in expansion["candidates"]}
-    plans = []
+    plans, tree = [], None
     for point in expansion["points"]:
         state = found[point["candidate"]]["points"].get(point["name"], {})
         if state.get("state") == "searchable":
+            # Read once a point runs: a tree the check refused may be unreadable.
+            tree = tree or git_tree_root("atom", str(serve.TREE))
             candidate = candidates[point["candidate"]]
-            plans.append(_plan(expansion, judged, candidate, point, out))
+            plans.append(_plan(expansion, judged, candidate, point, tree, out))
     cpus = len(os.sched_getaffinity(0))
     at_once = max(1, cpus // max((plan["ranks"] for plan in plans), default=1))
     stopping = threading.Event()
@@ -119,11 +123,11 @@ def lines(outcome: dict) -> list[str]:
     return out
 
 
-def _plan(expansion: dict, judged: dict, candidate: dict, point: dict, out: Path):
+def _plan(expansion: dict, judged: dict, candidate: dict, point: dict, tree, out: Path):
     """What `point` of `candidate` runs into `out`'s `RUNS`: its ``at``; as
-    ``ran``, the head's commit, which the tree that runs it is, and its
-    server's and its client's commands and variables; and its ``ranks``, TP
-    times DP over its instances."""
+    ``ran``, the revision of `tree`, the tree that runs it, and its count of
+    uncommitted files, and its server's and its client's commands and
+    variables; and its ``ranks``, TP times DP over its instances."""
     held = judged["candidates"][candidate["name"]]
     at, verdicts = out / RUNS / point["name"], held["points"][point["name"]]
     machine, store = expansion["machine"], held["store"]
@@ -133,7 +137,7 @@ def _plan(expansion: dict, judged: dict, candidate: dict, point: dict, out: Path
     client = [CLIENT, at, *select, "--concurrency", point["concurrency"]]
     client += ["--duration", workload["duration_s"]] if "duration_s" in workload else []
     ran = {
-        "head": judged["head"]["commit"],
+        "tree": {"revision": tree.revision, "dirty": tree.dirty},
         "server": list(map(str, server)),
         "env": env,
         "client": list(map(str, [*client, "--stop"])),
@@ -147,7 +151,10 @@ def _plan(expansion: dict, judged: dict, candidate: dict, point: dict, out: Path
 
 
 def _record(plan: dict) -> dict | None:
-    """The record of `plan`'s point, when it finished running what `plan` runs."""
+    """The record of `plan`'s point, when it finished running what `plan` runs,
+    on a tree with no uncommitted file."""
+    if plan["ran"]["tree"]["dirty"] != 0:
+        return None
     try:
         held = json.loads((plan["at"] / RAN).read_text())
     except (OSError, ValueError):

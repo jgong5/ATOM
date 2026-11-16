@@ -36,6 +36,11 @@ engine's hand-in, `lp-engine-P.json` or `lp-engine-D.json`, at DP width above 1
 each rank's (`lp-engine-P.dp0.json`, a row per rank); `validate.runs` grades its
 schedule per side, its end to end once.
 
+Each cell graded then holds `grades.json`, the rows printed for it and each
+run's results as grading read them, by digest, and grading renders again the
+`report.html` of each of its runs that wrote one when it ended
+(`atom.compass.report.html`), so the report shows them until a run reruns.
+
 `python -m atom.compass.validate --curves OUT ARM...` draws instead each ARM's
 points, a directory each, as InferenceX draws agentic results: real and
 simulated curves as charts in OUT, and a verdict per point and metric, as
@@ -46,6 +51,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import sys
 from pathlib import Path
 from statistics import median
@@ -58,6 +64,7 @@ from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.step_linear_fit import TOKEN_BANDS, token_band
 from atom.compass.backends.step_roofline import StepFallbackBackend, StepRooflineBackend
 from atom.compass.memory.check import MemoryRefusal, parts, place, spread
+from atom.compass.report import html
 from atom.compass.run import (
     CLIENT_DIR,
     ENGINE,
@@ -76,6 +83,8 @@ from atom.compass.run.step_grid import keyed_of, read
 from atom.compass.validate import cost, curves, runs
 
 BANDS = [token_band(edge) for edge in (0, *TOKEN_BANDS)]
+#: A row's columns, as printed after its cell's name and kept in `html.GRADES`.
+COLUMNS = ("result", "metric", "value", "verdict")
 #: Cost rows' verdict per report group: the graded ones carry the gate.
 GATED = {
     "graded": "-",
@@ -368,15 +377,21 @@ def _odd_workloads(cell: Path, run: dict) -> dict:
     return odd
 
 
-def rows(cell) -> list[tuple]:
-    """The cell's rows, (result, metric, value, verdict), its verdict first."""
-    cell = Path(cell)
+def _runs_of(cell: Path) -> tuple[list[Path], list[Path]]:
+    """`cell`'s real runs and its simulated ones, each a directory."""
     real = sorted(r for r in cell.glob("real*") if r.is_dir())
-    if (cell / "law").is_dir():
-        raise ValueError(f"{cell} holds law/, a run directory now named step_linear/")
     simulated = [
         cell / k for k in (STEP_LINEAR, STEP_GRID, OP_GRAPH) if (cell / k).is_dir()
     ]
+    return real, simulated
+
+
+def rows(cell) -> list[tuple]:
+    """The cell's rows, (result, metric, value, verdict), its verdict first."""
+    cell = Path(cell)
+    if (cell / "law").is_dir():
+        raise ValueError(f"{cell} holds law/, a run directory now named step_linear/")
+    real, simulated = _runs_of(cell)
     if len(simulated) != 1:
         raise ValueError(
             f"{cell} holds {[s.name for s in simulated]} of step_linear/, "
@@ -436,10 +451,27 @@ def main(argv=None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--curves"]:
         return curves.main(argv[1:])
-    print("cell | result | metric | value | verdict")
-    for cell in argv:
-        for row in rows(cell):
-            print(" | ".join((Path(cell).name, *row)))
+    print(" | ".join(("cell", *COLUMNS)))
+    for cell in map(Path, argv):
+        # Each run's digest before grading reads it: one that reruns meanwhile differs.
+        real, simulated = _runs_of(cell)
+        ran = {r.name: html.digest(r) for r in (*real, *simulated)}
+        graded = rows(cell)
+        for row in graded:
+            print(" | ".join((cell.name, *row)))
+        _write_grades(cell, ran, graded)
+
+
+def _write_grades(cell: Path, ran: dict, graded: list[tuple]) -> None:
+    """Keep `graded`, `cell`'s rows, in its `html.GRADES` with `ran`, each of
+    its runs' `html.digest`, then render again the report of each of those
+    runs that wrote one, which shows them."""
+    name = Path(os.path.abspath(cell)).name  # a cell given as `.` too
+    grades = {"cell": name, "runs": ran, "columns": COLUMNS, "rows": graded}
+    (cell / html.GRADES).write_text(json.dumps(grades, indent=1) + "\n")
+    for run in ran:
+        if (cell / run / html.FILE).is_file():
+            html.write(cell / run)
 
 
 if __name__ == "__main__":

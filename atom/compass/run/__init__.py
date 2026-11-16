@@ -74,7 +74,8 @@ which the run summary names under ``unmeasured_hops``), one of ``step_stub`` (a
 priced by `StepStubBackend`), ``step_linear`` (a `StepLinearLaw` mapping,
 priced by `StepLinearBackend`; its ``platform``, the platform fields of its key,
 and its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
-any other, and a law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
+any other, a run whose ladder is a prefix of the law's read at the law's, and a
+law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
 holds at its shape and output, traced under this process's torch and ATOM source
@@ -433,9 +434,12 @@ def _differ(*mappings) -> list[str]:
 
 
 def _fitted_here(listed: list, here: dict, engine, what: str) -> dict:
-    """The entry of `listed` whose engine config, read by `engine`, is `here`;
-    a lone entry is checked as a mapping is."""
-    found = [e for e in listed if engine(e) == here]
+    """The entry of `listed` whose engine config, read by `engine`, is `here`
+    at its ladder (`at_ladder`); a lone entry is checked as a mapping is."""
+    from atom.compass.backends.step_grid_plan import at_ladder
+
+    at = [at_ladder(here, engine(e)) for e in listed]
+    found = [e for e, h in zip(listed, at) if engine(e) == h]
     if len(listed) == 1 or len(found) == 1:
         return (found or listed)[0]
     if found:
@@ -444,7 +448,8 @@ def _fitted_here(listed: list, here: dict, engine, what: str) -> dict:
             f"and they differ in {_differ(*found)}"
         )
     named = "; ".join(
-        f"entry {i} in {_differ(engine(e), here)}" for i, e in enumerate(listed)
+        f"entry {i} in {_differ(engine(e), h)}"
+        for i, (e, h) in enumerate(zip(listed, at))
     )
     raise ValueError(f"no {what} entry was fitted under this engine config: {named}")
 
@@ -471,10 +476,12 @@ def pick_fitted(run: dict, name: str, config) -> None:
 
 def refuse_unfitted_law(run: dict, config) -> None:
     """Refuse the run file's step linear law where `config` is not what it was
-    fitted under: its engine config, which states its tensor-parallel width,
+    fitted under: its engine config, at its ladder where this run's is a prefix
+    of it (`at_ladder`), which states its tensor-parallel width,
     context-parallel width 1, a data-parallel group on one node, and its
     platform, which the run file's machine spec must state."""
     from atom.compass.artifacts import Kind, keyed_platform, machine_platform
+    from atom.compass.backends.step_grid_plan import at_ladder
     from atom.compass.run.step_grid import differ, keyed
 
     law = run[STEP_LINEAR]
@@ -483,7 +490,8 @@ def refuse_unfitted_law(run: dict, config) -> None:
             "the step linear law states no engine_config, the engine config "
             "it was fitted under, so no run can check its parallel layout"
         )
-    if named := differ(law["engine_config"], keyed(config), "the law"):
+    fitted = law["engine_config"]
+    if named := differ(fitted, at_ladder(keyed(config), fitted), "the law"):
         raise ValueError(
             "the step linear law was fitted under another engine config: "
             + "; ".join(named)
@@ -534,9 +542,11 @@ def refuse_context_parallel(name: str, config) -> None:
 def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     """Refuse the run file's host laws `host` when fitted under another host
     key than this run's, on `platform` (`machine_platform`), the graph sets
-    their key states taken as this run's, which records none."""
+    their key states taken as this run's, which records none, and its engine
+    config read at their ladder where this run's is a prefix of it."""
     from atom.compass.artifacts import Kind, keyed_platform
     from atom.compass.backends.launch_features import GRAPHS, stated
+    from atom.compass.backends.step_grid_plan import at_ladder
 
     ours = host.get("laws") and {
         **host_key(config),
@@ -544,6 +554,8 @@ def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     }
     theirs = host.get("key") or {}
     launch = stated(theirs)
+    if ours:
+        ours["engine"] = at_ladder(ours["engine"], theirs.get("engine"))
     if ours and launch[1] is not None:
         ours["engine"] = {**ours["engine"], GRAPHS: launch[1]}
     if ours and theirs != ours:
@@ -1933,6 +1945,7 @@ def runner(model_runner, tree) -> None:
         )
         # RapidServe's prefill_forward synchronizes its stream before it returns.
         rapid = getattr(config, "enable_rapidserve", False)
+        processor = getattr(model_runner, "tokenID_processor", None)
         model_runner.compass_host = replay or HostDeviceRecurrence(
             host.get("laws", {}),
             host.get("skip", ()),
@@ -1943,6 +1956,7 @@ def runner(model_runner, tree) -> None:
             admit=host.get("admit", ADMISSION_IN_E),
             columns=host.get("columns"),
             launch=launch,
+            defer=getattr(processor, "is_deferred_out", True),
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])

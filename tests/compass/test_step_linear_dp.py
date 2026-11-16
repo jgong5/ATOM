@@ -262,14 +262,14 @@ def test_a_routed_rung_hulls_each_step_at_the_rank_it_prices(tmp_path):
     assert outside == []
 
 
-@pytest.mark.parametrize("cap, stop", [(20, "settled"), (9, "settled"), (8, "limit")])
+@pytest.mark.parametrize("cap, stop", [(20, "settled"), (11, "settled"), (10, "limit")])
 def test_a_routed_rung_is_fitted_again_under_its_column(
     tmp_path, monkeypatch, cap, stop
 ):
     """The experts column moves some steps' costliest rank off the row the
     rung's features alone pick, so the rung is fitted again under it, from
     every rank's row. Once no step moves, it is solved on the rows it
-    prices: the per-rank law, at the 9th pass. A limit one pass short ends
+    prices: the per-rank law, at the 11th pass. A limit one pass short ends
     the fit there, its vector within a millionth of that law."""
     from atom.compass.backends import step_linear_fit
 
@@ -280,7 +280,7 @@ def test_a_routed_rung_is_fitted_again_under_its_column(
     records += routed._records(tmp_path / "sparse", sparse)
     vector = routed._routed(records)[0]["decode"][str(routed.RUNG)]
     passes = vector["fit"]["passes"]
-    assert (passes["count"], passes["stop"]) == (min(cap, 9), stop)
+    assert (passes["count"], passes["stop"]) == (min(cap, 11), stop)
     assert vector["coefficients"] == pytest.approx(WIDE_OR_TALL, rel=1e-6)
 
 
