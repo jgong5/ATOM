@@ -40,7 +40,9 @@ stages refuses it before its server starts.
 
 The server's environment holds `AUTOTUNE_CACHE` as the command's does, 1 when
 the command's has none, and ``TRITON_CACHE_DIR`` as the command's does, or the
-directory Triton resolves when it has none; run.json's ``env`` states both.
+directory Triton resolves when it has none, and `parity.WRITE_THROUGH` at 0,
+or 1 under `--sweep`, whatever the command's says; run.json's ``env`` states
+all three.
 Naming the directory keeps Inductor from putting its own there mid-run. With
 the switch on, Triton loads an autotuned kernel's choice for a shape an earlier
 server of the same directory tuned; a shape the cache lacks still tunes on its
@@ -61,9 +63,9 @@ it finished compiling (`jit_cache`); without it no library is touched.
 
 With `--sweep` the server also holds the pacing variables a JIT sweep's steps
 need (`sweep.pacing`), which `client.sh --sweep` checks it has, and
-`parity.WRITE_THROUGH`: nothing grades a sweep's record, so each rank writes
-its lines as they finish, and a rank that dies mid-sweep leaves `sweep cover`
-the steps it ran.
+`parity.WRITE_THROUGH` at 1: nothing grades a sweep's record, so each rank
+writes its lines as they finish, and a rank that dies mid-sweep leaves `sweep
+cover` the steps it ran. At 0, a timing record's lines wait for its exit.
 
 `--profile-ops` and `--profile-steps A:B`, the op-level half's profiled pass,
 refuse; so does ATOM's ``--load_dummy``: a record times real weights, and MoE
@@ -113,9 +115,11 @@ def main(argv: list[str]) -> None:
     env = {
         AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1"),
         "TRITON_CACHE_DIR": knobs.cache.dir,
+        # Set either way, so a timing record never inherits the command's 1.
+        WRITE_THROUGH: "1" if args.sweep else "0",
     }
     if args.sweep:
-        env |= pacing(atom_args) | {WRITE_THROUGH: "1"}
+        env |= pacing(atom_args)
     # serve writes server.json when /health first answers, so its mtime is
     # when serving began; a server that never answered served nothing.
     ready = Path(args.out) / serve.READY_FILE

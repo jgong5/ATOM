@@ -20,6 +20,7 @@ from test_parity_device_window import _recorded
 from test_parity_record import _config, _drive
 
 from atom.compass import cli
+from atom.compass.parity import WRITE_THROUGH
 
 HERE = Path(__file__).resolve().parent
 KILLED = """\
@@ -54,13 +55,17 @@ def forward_until_killed():
 
 
 @pytest.mark.skipif(GIT is None, reason="needs git")
-@pytest.mark.parametrize("sweep", [True, False])
+@pytest.mark.parametrize("sweep, exported", [(True, None), (False, None), (False, "1")])
 def test_a_killed_sweep_server_keeps_each_line_its_worker_finished(
-    tmp_path, planted_gpu, monkeypatch, sweep  # noqa: F811
+    tmp_path, planted_gpu, monkeypatch, sweep, exported  # noqa: F811
 ):
     """The named result: a sweep's record holds every line but the last, whose
     window was open at the kill; a timing record is held to an `exit` the
-    worker never reached, and holds none, as before."""
+    worker never reached, and holds none, as before, even when the command's
+    environment exports `WRITE_THROUGH`."""
+    monkeypatch.delenv(WRITE_THROUGH, raising=False)
+    if exported:
+        monkeypatch.setenv(WRITE_THROUGH, exported)
     (tmp_path / "server.py").write_text(KILLED)
     monkeypatch.setenv("PLANTED_PATH", f"{HERE}{os.pathsep}{HERE.parent}")
     monkeypatch.setenv("PLANTED_SIMULATED", str(tmp_path / "simulated"))
