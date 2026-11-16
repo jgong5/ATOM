@@ -201,7 +201,7 @@ def _backfill(promtool: str, files: list, tsdb: Path) -> tuple:
             for line in f:
                 to.write(line)
                 if line[:1] != b"#":
-                    stamps.add(line[line.rindex(b" ") + 1 :])
+                    stamps.add(float(line[line.rindex(b" ") + 1 :]))
         done = subprocess.run(
             [promtool, "tsdb", "create-blocks-from", "openmetrics", text, tsdb],
             capture_output=True,
@@ -211,7 +211,7 @@ def _backfill(promtool: str, files: list, tsdb: Path) -> tuple:
         if done.returncode:
             raise Unmade(f"promtool could not backfill {path.name}: {done.stderr}")
         text.unlink()
-        instants = sorted(map(float, stamps))
+        instants = sorted(stamps)
         if instants:
             first, last = min(first, instants[0]), max(last, instants[-1])
             steps += [b - a for a, b in itertools.pairwise(instants)]
