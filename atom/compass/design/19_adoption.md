@@ -620,17 +620,18 @@ search's or profiling's code.
   split and before `report.html`): ATOM's CI report, `export_report.py` imported unchanged
   from the run's source tree, its panels for the run's deployment kind (`pd` when OUT holds
   `prefill/` and `decode/`, else `standalone`) over the run's series (`11` D74) from their
-  first instant to their last, at CI's 5 s step and `max(60, 4 x interval)` window. Each LP's
-  file is backfilled by promtool into one TSDB that a Prometheus with no scrape serves to
-  `collect_report`; both come from `collect_metrics.py::ensure_prometheus`, which takes a
+  first instant to their last, at CI's 5 s step and `max(60, 4 x interval)` window. Each
+  sampler's file is backfilled by promtool into one TSDB that a Prometheus with no scrape
+  serves to `collect_report`; both come from `collect_metrics.py::ensure_prometheus`, which takes a
   `tool` argument, reads `ATOMESH_PROMTOOL_BIN` beside `ATOMESH_PROMETHEUS_BIN`, and reuses a
   tool it extracted into the directory it is given, here `~/.cache/compass/prometheus-3.5.0`,
   so a node downloads the checksummed 3.5.0 archive once and one that cannot is given both
   binaries beforehand. The page says it is simulated through the data it renders: its title
   ("Simulated agentic PD inference report", "Simulated agentic aggregated inference
   report"), its notes (the simulated clock from the run's start shown from 1970-01-01 00:00
-  UTC, the GPU panels' predicted device time, any LP with no series), and the two GPU
-  panels' label and description, which say predicted (`11` D75). A deployment's Overall
+  UTC, the GPU panels' predicted target device time on TP rank 0, any frontend or engine
+  member with no file), and the two GPU panels' label and description, which say predicted
+  (`11` D75). A deployment's Overall
   TTFT, the router's `mesh_router_ttft_seconds`, stays empty and the notes say why: the
   router times it on the wall clock (`atom/mesh/src/observability/ttft.rs::track_http_ttft`),
   and the client's TTFT is on `report.html`. Its data goes to `prometheus.json`, from which

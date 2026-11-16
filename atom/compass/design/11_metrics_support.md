@@ -111,9 +111,10 @@ alone never keep a run alive.
 **The scrape is not built (2026-11-16, #3584).** The paragraph above predates ATOM's
 histograms. Since they live in multiprocess files (D71), a render of `/metrics` reads every
 engine's and worker's file as well as the snapshot, so under simulation it reads other
-LPs' state off the channels, which `01` D3 rule 3 rules out; the harness refuses aiperf's
-server metrics (`compass_harness/strategy.py::CompassAgenticReplay`), and #522 holds the
-1P1D channels. The report a simulated run writes reads D74's series instead.
+LPs' state off the channels, which `01` D3 rules out (LPs interact only through
+timestamped channels); the harness refuses aiperf's server metrics
+(`compass_harness/strategy.py::CompassAgenticReplay`), and #522 holds the 1P1D channels.
+The report a simulated run writes reads D74's series instead.
 
 ### This revises the first version of this decision
 
@@ -127,8 +128,8 @@ ruling:
 | a virtual `_last_refresh` read against wall time makes a scraper's staleness check nonsense | the scraper reads simulated time too (above) |
 | a redirected clock read in the engine's hot loop virtualizes the push whether or not that was intended | it is intended; the clock-source lint (`01` D1, detector (3)) treats both reads as substituted |
 
-The simulated *timeline* comes from D74's series, which each server LP samples at this
-push or refresh (D74, *Revised 2026-11-16*).
+The simulated *timeline* comes from D74's series, which each engine and frontend LP
+samples at this push or refresh (D74, *Revised 2026-11-16*).
 
 ---
 
@@ -209,6 +210,10 @@ does not create; D75 says what it observes there.
 ---
 
 ## D74. A simulated-time series, without fighting the pull model
+
+The per-step sampling below is this decision's first version; its first build samples at
+ATOM's metrics timer instead, as [*Revised 2026-11-16 (#3584): the first
+build*](#revised-2026-11-16-3584-the-first-build), at this decision's end, states.
 
 ### Why the naive path is blocked
 
@@ -366,16 +371,27 @@ the additions are a sampler and a writer outside the exporter.
 
 **Rule.**
 
-- **Who samples, and when.** Each server LP samples the instruments its own processes
-  hold, on its own LP clock, at ATOM's metrics timer (`ATOM_METRICS_UPDATE_INTERVAL_S`, 1 s
-  by default, CI's scrape interval too): an engine, each DP member alone, when its loop
-  calls `utility_handler.push_metrics`, just before the call, from its own process's and
-  its workers' multiprocess files (`os.getpid()`, `runner_mgr.procs`); a frontend when its
+- **Who samples, and when.** The samplers are the engine and frontend LPs, the LPs that
+  hold ATOM's instruments; each samples the instruments its own processes hold, on its
+  own LP clock, at ATOM's metrics timer (`ATOM_METRICS_UPDATE_INTERVAL_S`, 1 s by default,
+  CI's scrape interval too): an engine, each DP member alone, when its loop calls
+  `utility_handler.push_metrics`, just before the call, from its own process's and its
+  workers' multiprocess files (`os.getpid()`, `runner_mgr.procs`); a frontend when its
   refresh calls `AtomMetricsExporter.update`, just after it, from the families
   `_AtomMetricsCollector` renders and its own process's files. Both are daemon deadlines
   (D72), so through an idle stretch they fire every interval while the essential horizon
   reaches them, as ATOM's own do. No sample reads another LP's process, and sampling makes
-  no clock call.
+  no clock call. LP `lmcache`, the stand-in lmcache server of an `lmcache_mp` run
+  (`atom.compass.kv.lmcache_server.LMCacheLP`), holds no ATOM instrument and samples
+  nothing.
+- **The workers' GPU series.** Of an engine's workers, TP rank 0 alone observes the GPU
+  forward histograms: it is the one `_group_step_seconds` prices on, every other rank
+  returning 0 s, and the one whose `forward` reply the engine waits for
+  (`AsyncIOProcManager.call_func`). It observes step k inside that `forward`, before it
+  replies, so the observation is in its file before the engine's loop goes on, and the
+  sample at a push holds exactly the steps whose `forward` returned before it. The other
+  ranks' histograms keep zero observations, which add nothing to the panels' sums over
+  workers (`export_report.py::query_for`). What it observes is D75's.
 - **What.** The families `export_report.py::panels_for` queries for the run's deployment
   kind and the cache counters its cache queries read, each series at each instant, as a
   1 s scrape holds it; the request-context gauges
@@ -386,14 +402,15 @@ the additions are a sampler and a writer outside the exporter.
   (`collect_metrics.py::scrape_config`): `job="atom"`, `observer="api"`, `role` (`prefill`,
   `decode`, or `standalone` for an instance) and `instance`, the side's frontend LP name
   (`frontend-P`, `frontend-D`, `frontend`) on every LP of the side.
-- **The file.** `metrics-<lp>.om.gz` per server LP, in the run's `out_dir` beside its
-  `lp-<lp>.json` hand-in: OpenMetrics 1.0 from
+- **The file.** `metrics-<lp>.om.gz` per sampler, named as its hand-in (an engine member
+  `engine-D.dp0`, a frontend `frontend-P`), in the run's `out_dir` beside its
+  `lp-<lp>.json`: OpenMetrics 1.0 from
   `prometheus_client.openmetrics.exposition.generate_latest` with `escaping=ALLOWUTF8`, each
   family's series contiguous, each series' points in time order, a histogram point's buckets
   ascending, then `_count`, then `_sum`; gzip. The LP buffers its samples and writes the
   file at its last hand-in: an engine on either of `engine_loop`'s hand-in paths, a frontend
-  in `frontend_done`. A run that ends early keeps every sample its LPs took; an LP killed
-  before it hands in leaves no file, and the report names it.
+  in `frontend_done`. A run that ends early keeps every sample its samplers took; a sampler
+  killed before it hands in leaves no file, and the report names it.
 - **The time axis.** The LP clock, seconds from the run's start, with no epoch: the blocks
   lie in 1970, and the `started_at` labels, which the scheduler takes from the same clock,
   stay consistent with the samples.
@@ -401,25 +418,27 @@ the additions are a sampler and a writer outside the exporter.
   side in place of the overlay above (the owner at #3584's plan review; #3552 measured
   aiperf's scrape slowing a real server's long-prompt encode 10 to 25%).
 
-**Reason.** Each sample holds its LP's state at the instant it carries, so the series obey
-`01` D3 rule 3 and repeat run to run, since a daemon deadline fires under every request
-order or none (`atom/compass/clock/authority.py`). The cadence is CI's, which is what the
-report's 5 s steps and 60 s windows read. On #3498's run (the template's 1P1D DPA8
+**Reason.** Each sample holds its LP's state at the instant it carries, so the series keep
+`01` D3's rule that LPs interact only through timestamped channels (*The move that makes
+this small*, its third rule) and repeat run to run, since a daemon deadline fires under
+every request order or none (`atom/compass/clock/authority.py`), and a worker's
+observations reach its file before the engine reads it. The cadence is CI's, which is what
+the report's 5 s steps and 60 s windows read. On #3498's run (the template's 1P1D DPA8
 configuration at c=256, 2577 simulated s; #3584's named result), a side's panel families hold 1,819 series at an instant (8 engines
 x 167, 8 workers x 44, the frontend 131) plus one per request-context series:
 
 | Cadence and who samples | Samples, both sides | OpenMetrics at 166 bytes a sample |
 |---|---|---|
 | (a) per engine step, as this decision first had it | 312.9 M: 949,560 steps x 211, and 858,888 engine-to-frontend outputs x 131 for TTFT and ITL | 52 GB |
-| (b) each LP at ATOM's timer, this rule | 5.68 M to 9.38 M: 23,728 pushes at steps alone, up to 41,248 with idle pushes, x 211, and 2 x 2,578 refreshes x 131 | 1.56 GB at most, 41 MB in gzip |
+| (b) each engine and frontend LP at ATOM's timer, this rule | 5.68 M to 9.38 M: 23,728 pushes at steps alone, up to 41,248 with idle pushes, x 211, and 2 x 2,578 refreshes x 131 | 1.56 GB at most, 41 MB in gzip |
 | (c) the frontend renders its whole registry each simulated second | 9.38 M: 2 x 2,578 x 1,819 | 1.56 GB |
 | request-context gauges at every instant, on top of (b) or (c) | 4.84 M, against 4,020 written once | 0.8 GB |
 
 An engine samples before `push_metrics` runs because that call sends its workers
 `poll_forward_metrics` without waiting (`EngineUtilityHandler.push_metrics`,
-`atom/compass/runner/overrides.py::RPC_SURFACE`): a pair the poll finishes lands in the next
-sample, as a real worker's unfinished pair does. promtool 3.5.0 backfilled a 200-instant
-file of one side in this layout (365,816 samples) into one 1.1 MB block from 0.5 s,
+`atom/compass/runner/overrides.py::RPC_SURFACE`), so nothing it sets off can reach the
+sample; under the rule above rank 0 has nothing left for it to poll. promtool 3.5.0
+backfilled a 200-instant file of one side in this layout (365,816 samples) into one 1.1 MB block from 0.5 s,
 Prometheus 3.5.0 served it with no scrape configured, and `export_report.collect_report`
 returned its prefill panels. prometheus_client 0.23.1's default escaping writes `atom_..._bucket`
 sample names under `# TYPE atom:...`, series stored under names `panels_for` never
@@ -430,7 +449,7 @@ queries, hence `ALLOWUTF8`.
 - (c), the frontend rendering its whole registry each second: one sampler instead of one
   per LP, but its render reads every engine's and worker's file (D71), so its content is the
   other LPs' state at whatever instant each has reached, up to a lookahead from the sample's
-  (`atom/compass/clock/authority.py`), off the channels `01` D3 rule 3 requires, and it
+  (`atom/compass/clock/authority.py`), off the channels `01` D3 requires, and it
   can differ between two runs of the same inputs; and its render costs 11 ms per instant with no request-context gauges and
   28 ms with 2,016, 28 to 72 s on one side's critical path of #3498's 761 wall seconds,
   where one engine merges its own files in 0.15 to 1.4 ms, the engines in parallel.
@@ -443,6 +462,21 @@ queries, hence `ALLOWUTF8`.
   real time (#3498: 2577 simulated s in 761 wall s) stamped in the wall clock's future.
 - A series only where a value changed: a 60 s window with one sample gives no rate where
   CI's gives 0, and a gauge steady for 5 minutes leaves instant queries.
+- A worker's pair kept until the next poll, as a real worker keeps an unfinished one: the
+  push's poll is not waited for, so after an idle push rank 0's last pair lands in one
+  sample or the next by wall time, and ranks whose replies nobody reads observe at any
+  wall time, so the series would not repeat.
+- Every TP rank observing its group's price: a broadcast of rank 0's price each step, for
+  copies that change no quantile or mean the panels draw from the pooled observations.
+- The API server's `host:port` from `server.json` as `instance`: the launcher writes it
+  once the server answers, so the engines cannot know it, and its port is a wall-clock
+  allocation with no meaning on the simulated timeline.
+- One file per side, merged at the end: a merge across processes that only the backfill
+  needs, which Prometheus 3.5.0 does itself over overlapping blocks, and a dead LP would
+  cost its side's whole file.
+- Appending each instant to the file as it is taken: an OpenMetrics family must be
+  contiguous, so the file would need a second pass to regroup, for the one case, a sampler
+  killed, that hands in nothing either.
 
 ## D75. What is invalid, and is refused rather than reported
 
@@ -458,10 +492,23 @@ mode cost ~**11 ms of TTFT on the 27B (4%)**, and a variant that synchronised ar
 forward made the run **33% slower** (TPOT 3.26 → 4.33 ms).
 
 **The GPU forward histograms are not telemetry (2026-11-16, #3584).** In a simulated run
-`atom:gpu_forward_seconds` and `atom:prefill_request_gpu_forward_seconds` observe each
-priced step's predicted device seconds through ATOM's `GPUForwardMetrics` (#3586), a
-duration on the simulated clock (class D, D77), which the report labels predicted
-(`19` D115); the telemetry row above stands. `compass run` starts a simulated server with
+`atom:gpu_forward_seconds` observes, for each priced step, its `StepCost.target_seconds`:
+the target forward's device seconds as the cost backend prices the rank's batch, with no
+host time, no draft and no DP group maximum, which `_group_step_seconds` folds into the
+step's `predicted_s`. CI's panel reads the same span, a forward that excludes input
+preparation, sampling and drafting (`GPUForwardMetrics.steps`' description).
+`atom:prefill_request_gpu_forward_seconds` sums it over a request's prefill chunks, as
+`GPUForwardMetrics.poll` does. TP rank 0 observes it through ATOM's
+`GPUForwardMetrics.measure` and `poll` inside its `forward`, before it replies (#3586; D74,
+*Revised*); a step the backend refuses observes nothing, and a request with a refused chunk
+publishes no sum, since `GPUForwardMetrics` publishes a request's sum only once it has
+timed every chunk from the first to the final in order. A duration on the simulated clock
+(class D, D77), which the report labels predicted (`19` D115); the telemetry row above
+stands. Rejected: `predicted_s`, a step's whole charge, which holds host time and the draft
+the panel excludes; the DP group's largest `target_seconds`, to stand in for the wait on
+slower ranks a real rank's events include: that wait runs from the rank's own launch to
+the slowest rank's arrival at each collective, which no price states. `compass run` starts
+a simulated server with
 `ATOM_ENABLE_METRICS_DEVICE_TIMER=1` unless its environment sets the variable, as CI's
 `pd_server_atom.sh` starts both sides; no readings or law key holds it
 (`atom/benchmarks/results/metadata.py::PERFORMANCE_KEYS`). The last row's assertion is the
@@ -602,7 +649,9 @@ D74's revision and `19` D115's Prometheus report, walked through the runs that w
 
 ```
  compass run --out OUT ...      ATOM_ENABLE_METRICS_DEVICE_TIMER=1 unless set (D75)
-   engine LP    every push_metrics, 1 s of its clock: sample own + workers' files
+   engine LP    every step: forward -> TP rank 0 prices it, observes its target_seconds
+                  (GPUForwardMetrics.measure, poll), then replies; other ranks observe none
+                every push_metrics, 1 s of its clock: sample own + workers' files
    frontend LP  every refresh,      1 s of its clock: sample snapshot families + own files
                 (labels job=atom observer=api role=standalone instance=frontend)
  client.sh --stop -> server stops -> engine_loop and frontend_done hand in
@@ -622,8 +671,10 @@ D74's revision and `19` D115's Prometheus report, walked through the runs that w
 ```
  prefill side: frontend-P, engine-P.dp0..dp7     role=prefill instance=frontend-P
  decode side:  frontend-D, engine-D.dp0..dp7     role=decode  instance=frontend-D
-   each LP samples itself at its own timer, on its own clock, as in S1
- deploy.sh stops both sides -> every LP hands in -> OUT/metrics-<lp>.om.gz each
+   each of them samples itself at its own timer, on its own clock, as in S1
+   LP lmcache, on an lmcache_mp run: no instrument, no sampler
+ deploy.sh stops both sides -> every LP hands in
+   -> OUT/metrics-<lp>.om.gz for each frontend and engine member
  -> report.prometheus OUT: OUT holds prefill/ and decode/ -> deployment pd
       every file into one TSDB -> collect_report(pd, ...)
       Overall TTFT (mesh_router_ttft_seconds): no series; the notes say the router
@@ -631,13 +682,14 @@ D74's revision and `19` D115's Prometheus report, walked through the runs that w
    -> OUT/prometheus.html: Prefill and Decode panels, KV transfer wait on decode
 ```
 
-**S3. A run that ends early, an LP that dies, a node with no tool.**
+**S3. A run that ends early, a sampler that dies, a node with no tool.**
 
 ```
  an LP hands in before the finish, or a stop ends the run
-   -> every LP that hands in writes what it sampled; the report covers it
- an LP killed before its hand-in -> no file -> the report's notes name it, of the
-   server LPs the run file declares (run/__init__.py: _hand_ins)
+   -> every sampler that hands in writes what it sampled; the report covers it
+ a frontend or engine member killed before its hand-in -> no file
+   -> the report's notes name it, of the run file's hand-ins less LP lmcache
+      (run/__init__.py: _hand_ins)
  no series at all | no prometheus or promtool and no download
    | no .github/scripts/atomesh/observability/ in the tree | backfill or query fails
    -> OUT/prometheus.txt says which; report.prometheus exits 0
@@ -648,11 +700,27 @@ D74's revision and `19` D115's Prometheus report, walked through the runs that w
 *Revised*), so `report.prometheus` finds no series and writes only `prometheus.txt`, which
 names CI's collector (`collect_metrics.py`) as a real run's report.
 
+**S5. Compass off.** ATOM served without `--compass-run`.
+
+```
+ openai_server ... (no --compass-run) -> the run file variable unset -> spec() is None
+   engine_core.py -> compass_run.engine_loop(engine): no run -> push_metrics unwrapped
+   api_server.py  -> compass_run.frontend(config):    no run -> update unwrapped
+   ATOM's ModelRunner: GPUForwardMetrics times real device events, if the user set
+     ATOM_ENABLE_METRICS_DEVICE_TIMER (drive/run.py does not run)
+ -> no sampler, no metrics-<lp>.om.gz, no report
+ -> /metrics: exporter, MultiProcessCollector and instruments untouched, byte-identical
+```
+
+The samplers install only inside Compass's existing hooks, `engine_loop` and `frontend`,
+when `spec()` returns a run file; no ATOM engine or frontend file changes.
+
 ### Simpler alternative
 
 One sampler per side in the frontend, rendering its whole registry at each refresh, as
-CI's Prometheus scrapes it: one hook and one file per side instead of one per LP. It fails
-`01` D3 rule 3, since the render reads the engines' and workers' files off the channels,
+CI's Prometheus scrapes it: one hook and one file per side instead of one per sampler. It
+breaks `01` D3's rule that LPs interact only through timestamped channels, since the render
+reads the engines' and workers' files off the channels,
 so a sample's content is not the state at its instant and differs between two runs of the
 same inputs; and on #3498's run it adds 28 to 72 s to a side's 761 wall seconds (D74,
 *Revised*, Rejected).
@@ -669,9 +737,9 @@ measurement is why real runs keep CI's collector.
 
 ### Summary
 
-**Deliverable.** Every simulated run, an instance or a 1P1D deployment, writes its server
-LPs' Prometheus series on the simulated clock and, when it ends, CI's Prometheus report
-from them beside its `report.html`.
+**Deliverable.** Every simulated run, an instance or a 1P1D deployment, writes its engine
+and frontend LPs' Prometheus series on the simulated clock and, when it ends, CI's
+Prometheus report from them beside its `report.html`.
 
 **Scope and non-goals.** Simulated runs only. Out: a real run's series or report (CI's
 collector), a per-step series, the traffic LP's scrape (#522), the router's TTFT, Grafana,
@@ -683,7 +751,7 @@ and any change to `export_report.py` or the page it renders.
 |---|---|---|
 | `atom/compass/run/metrics.py` (new) | the sampler: an LP's own files merged, the frontend's snapshot families, CI's labels, the buffer; the writer: OpenMetrics with `ALLOWUTF8`, the order above, gzip | #3585 |
 | `atom/compass/run/__init__.py` | `engine_loop` samples before `utility_handler.push_metrics`, `frontend` after `AtomMetricsExporter.update`; each writes its file where it hands in | #3585 |
-| `atom/compass/runner/overrides.py` | `NonAllocatingRunner.forward` through `GPUForwardMetrics.measure`, its pair's elapsed time the step's predicted seconds | #3586 |
+| `atom/compass/runner/overrides.py` | on TP rank 0, `NonAllocatingRunner.forward` through `GPUForwardMetrics.measure`, its pair's elapsed time the step's `StepCost.target_seconds`, and `GPUForwardMetrics.poll` before the reply; a refused step not measured | #3586 |
 | `atom/compass/drive/run.py` | a simulated server started with `ATOM_ENABLE_METRICS_DEVICE_TIMER=1` unless set | #3586 |
 | `.github/scripts/atomesh/observability/collect_metrics.py` | `ensure_prometheus(directory, tool="prometheus")`: `ATOMESH_PROMTOOL_BIN` beside `ATOMESH_PROMETHEUS_BIN`, a tool already extracted into `directory` reused; CI's call unchanged | #3587 |
 | `atom/compass/report/prometheus.py` (new) | `python -m atom.compass.report.prometheus OUT`: backfill, serve, `collect_report`, mark, `write_report`; or `prometheus.txt` | #3587 |
@@ -692,22 +760,24 @@ and any change to `export_report.py` or the page it renders.
 
 **Acceptance items**, each walked by the scenario named:
 
-1. Each server LP of a simulated run writes `metrics-<lp>.om.gz` holding `panels_for`'s
-   families at each push or refresh on its own clock, each request-context series once,
-   with CI's scrape labels; sampling changes no clock; a real run and Compass off write none,
-   and `/metrics` is unchanged (S1, S2, S4).
+1. Each engine member and frontend LP of a simulated run writes `metrics-<lp>.om.gz`
+   holding `panels_for`'s families at each push or refresh on its own clock, each
+   request-context series once, with CI's scrape labels; LP `lmcache` writes none; sampling
+   changes no clock; a real run and Compass off write none, and `/metrics` is unchanged
+   (S1, S2, S4, S5).
 2. Each instant of a file, read back on its own, holds the values the instruments had; the
    whole file backfills with promtool 3.5.0 (S1).
-3. With the timer on, each worker observes its group's predicted step seconds once per
-   priced step, and a prefill request the sum over its chunks; with it off, nothing changes
-   (S1).
+3. With the timer on, TP rank 0 of each engine observes its step's `StepCost.target_seconds`
+   once per priced step before its `forward` replies, and a prefill request the sum over its
+   chunks; the other ranks and a refused step observe nothing; with the timer off, nothing
+   changes (S1).
 4. Every simulated run's end writes `prometheus.html` and `prometheus.json`: `panels_for`'s
    panels for its deployment kind over its first to last instant, titled simulated, the GPU
    panels labelled predicted, a deployment's Overall TTFT empty with its reason; `report.html`
    links it (S1, S2).
 5. With no series, no tool or no `export_report.py`, `prometheus.txt` says why, the stop's
-   exit status is unchanged, and `report.html` quotes it; an LP with no file is named (S3,
-   S4).
+   exit status is unchanged, and `report.html` quotes it; a frontend or engine member with
+   no file is named (S3, S4).
 
 ---
 
@@ -718,8 +788,8 @@ and any change to `export_report.py` or the page it renders.
 | D71 | Scope is ATOM's Prometheus engine metrics only. Harness metrics belong to `06`; simulator observability is run-artifact fields, not a metrics subsystem. | 2026-09-19 |
 | D72 | Counters and gauges are valid by construction. **The metrics push and refresh are timers on simulated time, marked daemon**, so they never keep a run alive (`01` D3, D5); `_last_refresh` stamps simulated time. The traffic LP's scrape is not built: its render would read other LPs' files off the channels. | 2026-09-19; revised 2026-10-02; the scrape 2026-11-16 ([#3584](https://github.com/jgong5/ATOM/issues/3584)) |
 | D73 | Histograms observe durations, so the clock audit extends from clock *reads* to observation *arguments*. Ask for classic histograms and for instrumentation that is handed a duration rather than computing one inline. They landed classic, handed `time_shim` durations. | 2026-09-19; how they landed 2026-11-16 (#3584) |
-| D74 | First: **sample once per engine step**, transport on D72's push cadence, OpenMetrics with virtual timestamps backfilled into a TSDB, the real run treated identically. **Revised:** each server LP samples its own processes' instruments on its own clock at ATOM's metrics push or refresh, the panel families `export_report.py` queries with CI's scrape labels, each request-context series once; it writes `metrics-<lp>.om.gz` (OpenMetrics, `ALLOWUTF8`, gzip) at its last hand-in, on the LP clock from 0 with no epoch; no sampler on a real run. | 2026-09-19; revised 2026-11-16 (#3584) |
-| D75 | Four classes of invalid metric, refused rather than reported. Emission never advances the virtual clock, and that is asserted. A simulated run's GPU forward histograms observe predicted device seconds, a simulated duration, not telemetry. | 2026-09-19; the GPU forward histograms 2026-11-16 (#3584) |
+| D74 | First: **sample once per engine step**, transport on D72's push cadence, OpenMetrics with virtual timestamps backfilled into a TSDB, the real run treated identically. **Revised:** each engine member and frontend LP samples its own processes' instruments on its own clock at ATOM's metrics push or refresh, of an engine's workers TP rank 0 alone observing, inside its `forward`, the panel families `export_report.py` queries with CI's scrape labels, each request-context series once; it writes `metrics-<lp>.om.gz` (OpenMetrics, `ALLOWUTF8`, gzip) at its last hand-in, on the LP clock from 0 with no epoch; no sampler on a real run. | 2026-09-19; revised 2026-11-16 (#3584) |
+| D75 | Four classes of invalid metric, refused rather than reported. Emission never advances the virtual clock, and that is asserted. A simulated run's GPU forward histograms observe each step's `StepCost.target_seconds`, a simulated duration, not telemetry. | 2026-09-19; the GPU forward histograms 2026-11-16 (#3584) |
 | D76 | The gauges supply `08`'s counting invariants for free; a histogram's `_count` is one too, and `_sum/_count` is a mean comparable at the noise floor. | 2026-09-19 |
 | D77 | Classify every metric by the **provenance of its value** (state, event tally, duration, rate, timestamp, external), not by its Prometheus type. Declare the class at construction; an unclassified metric refuses to export under simulation. The backfill writer uses the OpenMetrics serializer and the `timestamp=` argument that `add_metric` already provides. | 2026-09-19 |
 
