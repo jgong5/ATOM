@@ -1527,9 +1527,12 @@ The host queues a forward's drafter passes before it exits (the `propose` pass i
 `postprocess`, just before the draft copy wait), and a pass the device reaches first waits
 for it. So `max(target_end, exit)` bounds the draft's start for every drafter, one graph
 or serial passes alike, adds no host segment, and errs only by the host time after the
-pass. The draft's end reaches the timeline only through the next forward's `start` and
+pass. The draft's end reaches the timeline through the next forward's `start` and
 R4, which a late pass moves only when it outlasts the next forward's `E + W_pre +
-W_inputs`.
+W_inputs`, and on a runner that does not defer its output through R8, which holds the
+forward's exit for it. There the recurrence's own check (below) charges as the draft the
+forward's read of its own draft ids: its host queued the draft before that read, and
+`W_post` holds the host's time up to it, the draft's preparation included.
 
 **After the return: `E_out`** (owner ruling on
 [#1345](https://github.com/jgong5/ATOM/issues/1345), 2026-10-18). `Scheduler.postprocess`,

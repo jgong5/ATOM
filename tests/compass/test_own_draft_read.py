@@ -67,8 +67,8 @@ def own_drafts(stamped=True):
 
 
 def test_the_gate_takes_a_record_s_own_draft_read_as_its_draft_copy_wait():
-    """Stamped, the read leaves `W_post` at 2 ms and the draft is the propose
-    pass: each forward leaves at its draft's end, as it ran. Unstamped, `W_post`
+    """Stamped, the read leaves `W_post` at 2 ms and the draft is that read,
+    3 ms: each forward leaves at its draft's end, as it ran. Unstamped, `W_post`
     holds it, 5 ms, so each forward leaves 5 after its target ends, and its
     draft, 5 ms of busy time past the target, runs after that: exits at 15,
     36, 57 and 78 against the 15, 31, 47 and 63 measured."""
@@ -77,6 +77,21 @@ def test_the_gate_takes_a_record_s_own_draft_read_as_its_draft_copy_wait():
     old = recurrence.check(own_drafts(stamped=False))
     assert old["total"] == pytest.approx(100 * (78 / 63 - 1))
     assert [r[:2] for r in old["failures"]] == [(n, "decode") for n in (1, 2, 3)]
+
+
+@pytest.mark.parametrize("h", [0.25, 0.5, 1])
+def test_the_gate_charges_a_record_s_own_draft_from_its_read(h):
+    """ATOM's recorder starts `d_propose_ns` at `propose_draft_token_ids`'s
+    entry, where the device has idled since the token read: with the host
+    preparing the draft there for `h` ms before it queues it, the pass reads
+    3 + `h`, and `W_post` holds those `h` ms too. Each forward still leaves
+    at its draft's end, as it ran; a record stamping no read reads as before."""
+    steps, old = own_drafts(), own_drafts(stamped=False)
+    for s in steps + old:
+        s["d_propose_ns"] = round((3 + h) * MS)
+    report = recurrence.check(steps)
+    assert report["pass"] and report["total"] == pytest.approx(0, abs=1e-9)
+    assert recurrence.check(old)["total"] == pytest.approx(100 * (78 / 63 - 1))
 
 
 @pytest.mark.parametrize("stamped, post", [(True, 2), (False, 5)])
