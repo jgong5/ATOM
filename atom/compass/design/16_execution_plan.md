@@ -196,7 +196,8 @@ stage is named for the model; it is not the retired milestone M3 of D95.
   A law's key holds the capture ladder (`run/step_grid.py::keyed`), which ATOM clips at
   `--max-num-seqs`; a law, its host laws and a step grid bundle serve each point whose
   ladder is a prefix of their own ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)), so an arm's entry keyed at its
-  top point serves its lower ones. An indexer-CP arm's law
+  top point serves its lower ones. `fit steps` and `fit host` pool the arm's records at
+  every point into it; a bundle's plan and step measurements stay at one point. An indexer-CP arm's law
   waits on #3054's indexer-CP key, without which its runs would read a law fitted
   without indexer CP.
 
@@ -233,7 +234,9 @@ named for the model and the parallelism of its arms.
   key. Every point keeps ATOM's default `--max-num-seqs`; c=64 and c=128 share a capture
   ladder and c=256 adds 256. One step linear law and one `host_laws` entry each for DTP2
   c=64 and for DEP2, keyed at c=256's ladder, which serves c=128 at its prefix
-  ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)), with memory readings per point.
+  ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)), with memory readings per point. `fit host` compares the graph
+  sets V4.1's host key records exactly, so DEP2's two points pool into one `host_laws`
+  entry only where their decoder's graph keys agree.
 - **Two backends**, the step linear law and the step grid, each graded by `08` D45.1, as
   #3256 rules for M3-Agentic: the submission's inputs reach 525k tokens at p95, past a
   law's hull.

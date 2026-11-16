@@ -25,7 +25,7 @@ step table, the run summary and the hand-ins in its ``out_dir``, and grading
 reads them there. `scripts/compass/deploy.sh` builds that file, starts the
 authority and joins each instance to it. A prefill or a decode instance shares a
 clock with its peer, so it refuses without `--join`, but under `--check` with
-its side named.
+its side named; a plain `--check` of its arguments refuses, naming that side's.
 
 `--coverage` names record directories and `shape_population` tokens whose steps
 the backend's coverage check reads before the server starts: the step grid's
@@ -49,9 +49,9 @@ directory a step linear law's printed calibration writes, and it writes none.
 flags and ATOM arguments as `deploy.sh run` takes them, so `--network` names a
 deployment across nodes. Its ATOM arguments gain the `--kv-transfer-config` the
 script adds, the side's KV role on the simulated connector, and it reads the
-environment the script starts the side in, `AITER_LOG_LEVEL` set when unset
-(`compass_env`), so it resolves the config the side's instance runs. A
-`--kv-transfer-config` among them refuses, as the script refuses one. The
+environment the script starts the side in, `AITER_LOG_LEVEL` WARNING when
+unset or empty (`side_env`), so it resolves the config the side's instance
+runs. A `--kv-transfer-config` among them refuses, as the script refuses one. The
 readings command it prints takes Mooncake's connector in the simulated one's
 place, as `deploy.sh record` starts the side: a real start has no clock to
 build the simulated one on. It names `AITER_LOG_LEVEL` when the check set it,
@@ -131,15 +131,20 @@ def main(argv: list[str]) -> None:
         )
     if args.check in ROLES:
         serve._refuse(atom_args)
-        # deploy.sh starts each side under `compass_env` (scripts/compass/_lib.sh).
-        env = {} if "AITER_LOG_LEVEL" in os.environ else {"AITER_LOG_LEVEL": "WARNING"}
+        env = side_env(os.environ)
         os.environ.update(env)
         sides = [side_args(args.check, atom_args, c) for c in (SIMULATED, REAL)]
         raise SystemExit(lacking.report(args, *sides, env))
-    runfile.pd_side(atom_args, refuse=True)
     if args.check:
+        if side := runfile.pd_side(atom_args):
+            name = lacking.SIDES[side]
+            raise ValueError(
+                f"{KV_FLAG} makes this a {name} instance: check it with --check "
+                f"{name}, without its {KV_FLAG}, which the check adds as deploy.sh does"
+            )
         serve._refuse(atom_args)
         raise SystemExit(lacking.report(args, atom_args))
+    runfile.pd_side(atom_args, refuse=True)
     if not args.out:
         parser.error("the following arguments are required: --out")
     run = runfile.build(args, atom_args)
@@ -217,6 +222,13 @@ def side_args(side: str, atom_args, connector: str) -> list[str]:
     return [*atom_args, KV_FLAG, json.dumps(kv)]
 
 
+def side_env(env) -> dict:
+    """The variables deploy.sh's `compass_env` (scripts/compass/_lib.sh) sets
+    over the environment `env` it starts a side in: AITER_LOG_LEVEL WARNING
+    where `env` has it unset or empty."""
+    return {} if env.get("AITER_LOG_LEVEL") else {"AITER_LOG_LEVEL": "WARNING"}
+
+
 def measured(record, atom_args, ranks: int) -> list[float]:
     """The rates the accepted-draft histograms of `record` give over DP ranks
     ``0..ranks-1``: entry ``i`` the share of rows that accepted more than ``i``
@@ -233,8 +245,14 @@ def measured(record, atom_args, ranks: int) -> list[float]:
     files = sorted(
         (Path(record) / serve.STEPS).glob(compass_run.ACCEPTANCE_FILE.format("*"))
     )
+    names = {compass_run.ACCEPTANCE_FILE.format(r) for r in range(ranks)}
+    if files and (missing := sorted(names - {p.name for p in files})):
+        raise ValueError(
+            f"--acceptance-record: {record} holds no {', '.join(missing)}, and "
+            f"ATOM's arguments run {ranks} DP ranks"
+        )
     counts = Counter()
-    for path in files:
+    for path in (p for p in files if p.name in names):
         held = json.loads(path.read_text())
         if held["draft_tokens"] != width:
             raise ValueError(
@@ -247,12 +265,6 @@ def measured(record, atom_args, ranks: int) -> list[float]:
         raise ValueError(
             f"--acceptance-record: {record} holds no accepted-draft histogram; "
             "a speculative record writes one per DP rank in its steps"
-        )
-    names = {compass_run.ACCEPTANCE_FILE.format(r) for r in range(ranks)}
-    if missing := sorted(names - {p.name for p in files}):
-        raise ValueError(
-            f"--acceptance-record: {record} holds no {', '.join(missing)}, and "
-            f"ATOM's arguments run {ranks} DP ranks"
         )
     return [sum(n for a, n in counts.items() if a > i) / rows for i in range(width)]
 
@@ -359,9 +371,9 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
     """The steps of the record directory or `shape_population` token `name`,
     less DP's dummy runs, each named `<name> dp<r> step <n>`; a rank whose
     engine states other `SHAPING` fields than `here` refuses, naming each.
-    Whatever a line states, its `tbo_tokens` is, on a data-parallel step under
-    two-batch overlap (`tbo`, ATOM's `enable_tbo`), the split `bound._split`
-    agrees over every rank's line at that step, else None."""
+    Whatever a line states, its `tbo_tokens` is, under two-batch overlap
+    (`tbo`, ATOM's `enable_tbo`), the split `bound._split` agrees over every
+    rank's line at that step, one rank's included, else None."""
     path = Path(name)
     if (path / serve.RUN_JSON).is_file():
         records = {
@@ -391,9 +403,9 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
         rank: {s["step"]: s for s in map(json.loads, text.splitlines())}
         for rank, (text, _) in sorted(records.items())
     }
-    # One rank is no DP group; dummy runs join the split, and a step some rank
-    # lacks splits none, as `trace ops --population` reads it.
-    every = set.intersection(*map(set, at.values())) if tbo and len(at) > 1 else ()
+    # Dummy runs join the split, and a step some rank lacks splits none, as
+    # `trace ops --population` reads it.
+    every = set.intersection(*map(set, at.values())) if tbo and at else ()
     splits = {n: _split([r[n] for r in at.values()]) for n in every}
     return [
         (f"{name} dp{rank} step {n}", line | {"tbo_tokens": splits.get(n)})

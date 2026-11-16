@@ -12,7 +12,8 @@ on, because until 2026-09-20 it was not — see "Which tree a script acts on" be
 
 New to Compass? [QUICKSTART.md](QUICKSTART.md) takes a model from an empty store
 to a simulation graded against real runs, and `smoke_cell.sh` runs that path in
-about an hour. `calibrate.sh OUT RECORD...` takes its calibration in one command,
+about an hour. [ADVICE.md](ADVICE.md) takes a user from a space file of
+configurations through `compass advice` to the one it recommends. `calibrate.sh OUT RECORD...` takes its calibration in one command,
 from the warm record to the fits, and resumes a stopped run; its variables are in
 its header.
 
@@ -981,9 +982,9 @@ trajectory's first turn at 16, and two 120 s trace runs, the c=16 and c=4 recipe
 which the prefill vector is fitted. `KINETO_CONFIG` named a file holding
 `ROCTRACER_MAX_EVENTS=2000000000`, so no rank's trace dropped rows, and `client.sh` ran under
 `WAIT_S=3600` for their stops. Its host laws fit the tokenizer, the segment tokenizer's own
-work with `chars_per_s`, the HTTP intake and the hops on those calibration records, under
-the labels before `blocked_ns`: the records carry none, and a prefill launch the device held
-gave no `W_launch` label. A warm record came
+work with `chars_per_s`, the HTTP intake and the hops on those calibration records,
+refitted at ATOM ac272852e ([#3291](https://github.com/jgong5/ATOM/issues/3291)): the
+records carry no `blocked_ns`, so each `W_launch` label is its launch's wall time. A warm record came
 first, and a record that built a Triton variant, or held a decode stall near a server change
 on cards 0-3, was taken again.
 
