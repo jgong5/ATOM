@@ -161,12 +161,12 @@ M-f `14`; M-g `01` D3.5.
 
 | # | Item |
 |---|---|
-| T40 | Confirm the new histograms are **classic**, not native |
-| T41 | Audit every `observe()` site; extend the AST test to observation arguments |
-| T42 | Measure `collect_metrics()` per-step cost on the real side; decide decimation |
-| T43 | Verify the backfill end to end — one block, loaded, visible in Grafana |
+| ~~T40~~ | ~~Confirm the new histograms are **classic**, not native~~ — settled 2026-11-16 by [#3584](https://github.com/jgong5/ATOM/issues/3584): classic, prometheus_client `Histogram` and `WeightedHistogram` (`11` D73) |
+| T41 | Audit every `observe()` site; extend the AST test to observation arguments. The sites the Prometheus report reads are audited (`11` D73); the AST test is not extended |
+| ~~T42~~ | ~~Measure `collect_metrics()` per-step cost on the real side; decide decimation~~ — retired 2026-11-16 by [#3584](https://github.com/jgong5/ATOM/issues/3584): no per-step sampler is built, on either side (`11` D74) |
+| ~~T43~~ | ~~Verify the backfill end to end — one block, loaded, visible in Grafana~~ — settled 2026-11-16 by [#3584](https://github.com/jgong5/ATOM/issues/3584): promtool 3.5.0 backfilled one side's series, Prometheus 3.5.0 served it and `export_report.collect_report` read its panels (`11` D74) |
 | T44 | Sanity-check histogram bucket ranges against simulated latencies |
-| T45 | Tag ATOM's existing metrics with their D77 class |
+| T45 | Tag ATOM's existing metrics with their D77 class. The first build's series classify the families they export in the sampler's class table (`11` D77, *The first build*); the tags wait for a reader of `/metrics` under simulation |
 | T46 | Decide the DP-aggregation rule per class; refuse summaries there |
 
 ### Topic 13 — configuration surface
