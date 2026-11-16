@@ -566,3 +566,20 @@ def test_each_leaf_of_a_drafter_s_graphs_reaches_its_launch(rehearsed):
     assert {r["shape"] for r in rehearsed} == {"decode B=4", "prefill T=124 B=1"}
     assert OWN_KERNELS <= {r["op"] for r in rehearsed}
     assert [r for r in rehearsed if r["verdict"] != "reaches launch"] == []
+
+
+def test_the_draft_block_takes_what_its_drafter_builds_from_its_anchors(rehearsed):
+    """Each leaf of the drafter's that takes its block's anchors, or the
+    positions and indices ATOM builds from them, takes that build's item, at
+    both shapes."""
+    taken = {
+        (r["shape"], r["op"], slot, r["bound"].get(slot))
+        for r in rehearsed
+        for (op, slot) in ops.BLOCK
+        if op == r["op"]
+    }
+    assert taken == {
+        (shape, op, slot, f"draft_step.{item}")
+        for shape in ("decode B=4", "prefill T=124 B=1")
+        for (op, slot), item in ops.BLOCK.items()
+    }
