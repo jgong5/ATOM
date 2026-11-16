@@ -1874,14 +1874,8 @@ class ModelRunner:
         return DeviceMemoryReadings(free, total, peak_torch, non_torch)
 
     def _cap_torch_cache(self) -> None:
-        """Hold the torch cache to what the runner's startup leaves it, less
-        the KV budget's safety margin (`cap_torch_cache`).
-
-        Called where this runner's startup allocations end: after graph
-        capture, or after the KV pool when it captures no graph. Nothing else
-        bounds the cache once the pool is sized, and a full card makes ROCr
-        take back the hardware queues' scratch, which a spilling grid-barrier
-        kernel (MoRI's EP combine) then cannot get whole."""
+        """Cap the torch cache where this runner's startup allocations end:
+        after graph capture, or after the KV pool when it captures none."""
         self.torch_cache_cap = cap_torch_cache(
             self.device, KV_SAFETY_MARGIN, self.label
         )

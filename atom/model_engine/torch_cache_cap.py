@@ -2,24 +2,12 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """A ceiling on the torch caching allocator once a runner's startup ends.
 
-KV sizing budgets torch's allocation peak and leaves the rest of the card as
-headroom, but nothing holds the cache to that afterwards: freed blocks stay
-reserved, and steps of many different shapes can grow them until the card is
-full. ROCr meets a device allocation it cannot back by taking every hardware
-queue's scratch back and retrying, so the allocation succeeds and the next
-kernel that spills has to find its scratch on a full card. A kernel that waits
-at a grid-wide barrier for every block it launched, as MoRI's intranode
-combine does, then either gets scratch for fewer waves than its grid and waits
-for blocks that never start, or gets none and its queue aborts with
-HSA_STATUS_ERROR_OUT_OF_RESOURCES.
-
-The cap lets torch reserve what it holds when startup ends plus what is then
-free, less a margin of the card. Past it torch frees its cached blocks and
-retries, as it does at the card's ceiling, without asking the device for
-memory first, so the margin stays free for scratch and for memory allocated
-outside torch. A step whose live tensors do not fit under the cap fails with
-torch's out-of-memory error. ATOM_TORCH_CACHE_CAP=0 leaves the allocator
-uncapped.
+Nothing else bounds the cache after KV sizing, and at the card's ceiling ROCr
+meets a refused allocation by taking back every queue's scratch; a spilling
+grid-barrier kernel (MoRI's intranode combine) then waits for blocks that
+never start, or aborts with HSA_STATUS_ERROR_OUT_OF_RESOURCES. Under the cap
+torch frees its cached blocks and retries before it asks the device, so a
+margin of the card stays free.
 """
 
 import logging
@@ -43,14 +31,9 @@ def torch_cache_limit(reserved: int, free: int, total: int, margin: float) -> in
 
 
 class TorchCacheCap:
-    """One device's cap, and the one line logged the first time torch frees
-    its cached blocks under it.
-
-    torch counts an allocation it retries after freeing every cached block
-    (`num_alloc_retries`); under the cap that is how it stays below it, and it
-    is also what it does when the card itself is full. `poll` reads the count
-    at most every `every_s` seconds, so a forward between two reads costs one
-    clock read."""
+    """One device's cap. `poll` logs once, the first time torch frees its
+    cached blocks to retry an allocation (`num_alloc_retries`), reading the
+    count at most every `every_s` seconds."""
 
     def __init__(
         self,
