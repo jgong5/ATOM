@@ -27,7 +27,8 @@ renders again, to OUT/`DATA`.
 
 When it cannot be made, OUT/`TEXT` says why: a real run, no series, no tool,
 no ``export_report.py`` in this tree, or a backfill or query that failed.
-Either way this exits 0, and leaves none of the three an earlier report wrote.
+Either way it leaves none of the three an earlier report wrote, and exits 0
+unless OUT/`TEXT` itself cannot be written.
 """
 
 import gzip
