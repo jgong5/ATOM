@@ -597,6 +597,41 @@ def test_a_parked_request_is_not_counted_as_admittable_work(pd, seq_factory):
 # -- The blob ------------------------------------------------------------
 
 
+def literal_keys(blob: ast.Dict, source: pathlib.Path) -> frozenset:
+    """The keys of a dict display: string constants, and the keys of a
+    `**helper(...)` whose helper, a function of Mooncake's own package,
+    returns one dict display."""
+    keys = set()
+    for key, value in zip(blob.keys, blob.values):
+        if key is None:
+            assert isinstance(value, ast.Call) and isinstance(value.func, ast.Name), (
+                f"{source.name} unpacks something other than a helper's call"
+            )
+            keys |= helper_keys(value.func.id)
+            continue
+        assert isinstance(key, ast.Constant) and isinstance(key.value, str), (
+            f"{source.name} builds its blob with computed keys"
+        )
+        keys.add(key.value)
+    return frozenset(keys)
+
+
+def helper_keys(name: str) -> frozenset:
+    """The keys of the one dict display function `name` returns, found in a
+    module beside Mooncake's connector."""
+    found = []
+    for source in sorted(MOONCAKE_SOURCE.parent.glob("*.py")):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                returns = [r for r in ast.walk(node) if isinstance(r, ast.Return)]
+                assert len(returns) == 1 and isinstance(returns[0].value, ast.Dict), (
+                    f"{source.name}: {name} does not return one dict display"
+                )
+                found.append(literal_keys(returns[0].value, source))
+    assert len(found) == 1, f"expected one definition of {name}, found {len(found)}"
+    return found[0]
+
+
 def relayed_fields() -> frozenset:
     """The keys of Mooncake's own transfer blob, read from its source.
 
@@ -614,11 +649,7 @@ def relayed_fields() -> frozenset:
             for target in node.targets
         ):
             continue
-        assert all(
-            isinstance(key, ast.Constant) and isinstance(key.value, str)
-            for key in node.value.keys
-        ), f"{MOONCAKE_SOURCE.name} builds its blob with computed keys"
-        found.append(frozenset(key.value for key in node.value.keys))
+        found.append(literal_keys(node.value, MOONCAKE_SOURCE))
     assert len(found) == 1, f"expected one blob assignment, found {len(found)}"
     return found[0]
 
