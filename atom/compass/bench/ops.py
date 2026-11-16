@@ -97,7 +97,9 @@ refuses: it is measured across the layout's ranks, where a DP all-gather's
 `x` holds each rank's own `sizes` entry's rows, the capture's being rank 0's
 (`_own_rows`).
 A collective leaf is one family over its message bytes, decode and prefill
-alike (`exchange`), which the plan ladders, densifies and covers.
+alike (`exchange`), which the plan ladders, densifies and covers. aiter's
+comm-fused MoE (`COMM_FUSED`) refuses by name: its runners are built across
+its ranks by ATOM's loader, and no runner here builds them.
 MORI's dispatch and combine are methods of a handle no graph holds: each is
 called at MORI's entry point on the handle ATOM builds for the model's MoE,
 with the leaf's arguments, and, since neither runs twice in a row, timed
@@ -280,7 +282,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.op_graph import DRAFT, DRAFT_KV, KV, PERMILLE
 from atom.compass.bench.routing import uniform_ids
-from atom.compass.capture.peers import MORI
+from atom.compass.capture.peers import COMM_FUSED, MORI
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.compass.run.modules import LAYER
 from atom.utils.arg_parser import FlexibleArgumentParser
@@ -1812,6 +1814,12 @@ class Stub:
             raise ValueError(
                 f"a collective over the layout's {self.alone} ranks, measured "
                 "across them, not on a runner that runs one alone"
+            )
+        if op["op"] == COMM_FUSED:
+            raise ValueError(
+                f"aiter's comm-fused MoE, which reduces across its {op['args']['tp']} "
+                "ranks on the runners ATOM's loader builds there: no runner here "
+                "builds them"
             )
         if op["args"].get("device") == "cpu":
             raise ValueError(
