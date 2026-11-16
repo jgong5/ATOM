@@ -42,8 +42,11 @@ writes, which a top-k or the pick's block maxima ranks (`PAGE_WIDE`), is
 each copy's own, drawn for a top-k or block maxima as an activation is,
 below each row's bound (`_scores`); its sparse attention's index lists are
 those its index build writes for the leaf's pass, off a selection spread over
-each row's visible rows (`Stub._lists`). A `Stub` calls each leaf from its
-contract: a tensor the capture states on the host is built there on every
+each row's visible rows (`Stub._lists`), and its DSpark drafter's FP8 window
+read takes the addresses and pointers ATOM's window read builds for the
+drafter's stage layers at the step's state slots (`Stub._windows`). A `Stub`
+calls each leaf from its contract: a tensor the capture states on the host is
+built there on every
 copy, as an activation is, pinned (`_host`); an
 activation is random at its shape, dtype and stride, except such
 a table, the placement's, a router's
@@ -114,7 +117,8 @@ first of size above one, each the span of the others, as the batch's rows,
 or its blocks when the model keeps no
 per-request state, or, of a decode attention leaf that states its layer's
 window and compress ratio, the plane rows the batch's blocks hold at that
-ratio, a pointer table's (`_CACHE`) its entries, a view operator's none, a
+ratio, a pointer table's (`_CACHE`) its entries, a DSpark window read's
+(`WINDOWS`) a ring row an address, by state slot, a view operator's none, a
 RoPE table's (`TABLES`), a weight or a tensor of a module it names, a row a
 position its call takes, else a token, a table a leaf gathers by token ids
 (`GATHERED`) as many rows as its ids, V4.1's FP8 index plane (`Stub._plane`)
@@ -628,6 +632,11 @@ LISTS = {
     (_ATTEND, "kv_indptr_extend"): 3,
 }
 LISTS |= {("aiter.mla_sparse_prefill_v41.default", s): i for (_, s), i in LISTS.items()}
+#: DeepSeek-V4.1's DSpark window read over its FP8 pool, by the slots that take
+#: the ring rows' tagged byte addresses and their pointers, which ATOM builds
+#: on the device each step (`PagedAttentionCache.read_windows`, `Stub._windows`).
+_WINDOWS = "atom.model_ops.attentions.deepseek_v41.packed_rows:gather_prefix_rows"
+WINDOWS = {(_WINDOWS, "addresses"), (_WINDOWS, "ptr")}
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
 #: the span, and past an exact buffer kills the process (aiter defect, #1977).
@@ -1155,8 +1164,9 @@ class Stub:
                     ("plane_width", cols * geometry.rows_per_page(r)),
                 )
             }
-        # and the rows a request's window ring holds at a layer
+        # and the rows a request's window ring holds at a layer, and a row's bytes
         self.ring = getattr(geometry, "ring_slots", 0)
+        self.row = getattr(geometry, "window_row_bytes", 0)
         # V4.1's FP8 index plane, whose prefill logits are as wide as the
         # step's KV blocks (`PAGE_WIDE`); the FP4 plane packs them over the
         # whole block table, which no context widens
@@ -1291,7 +1301,8 @@ class Stub:
                     continue
                 act = self.specs and spec["role"] == "activation"
                 listed = LISTS.get((op["op"], path)) if act else None
-                if spec["role"] == "metadata" or index or listed is not None:
+                window = act and (op["op"], path) in WINDOWS
+                if spec["role"] == "metadata" or index or listed is not None or window:
                     token = (op["op"], path) in TOKEN_IDS
                     pool = {"input_ids": input_ids} if token else live
                     what, field = "metadata", path.split(".")[0]
@@ -1336,6 +1347,8 @@ class Stub:
                             step = passes.get(at, passes[None])[0]
                             pool = self._lists(md.cache, step, ratio, listed, live)
                             self.selections[sig] = md.cache, step, ratio, plan
+                        if window:  # as the drafter's window read builds it
+                            pool = self._windows(md.cache, live, op)
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
@@ -1454,6 +1467,28 @@ class Stub:
                 raise ValueError("a pointer table gathered at no replay's queries")
             built = built[rows.long()]
         return {f"attention_indices.{ratio}.{i}": built}
+
+    def _windows(self, cache, live, op) -> dict[str, torch.Tensor]:
+        """What DeepSeek-V4.1's FP8 window read (`WINDOWS`) takes, by name, as
+        `PagedAttentionCache.read_windows` builds it (`_decode_windows`) for
+        the drafter's stage layers at the step's first state slots, as many as
+        `op`'s addresses name a ring of each stage, its gather not launched."""
+        from atom.model_ops.attentions.deepseek_v41 import cache as v41
+
+        model = getattr(getattr(self.runner, "drafter", None), "model", None)
+        slots = live.get("state_slot_out")
+        if not hasattr(model, "_context_layer_ids") or slots is None:
+            raise ValueError("no DSpark drafter here reads its window rings")
+        layers = model._context_layer_ids(slots.device)
+        rows = op["args"]["addresses"]["shape"][0] // (len(layers) * self.ring)
+        got = {}
+
+        def gather(pool, addresses, ptr, *_):
+            got.update({"read_windows.addresses": addresses, "read_windows.ptr": ptr})
+
+        with patch.object(v41, "gather_prefix_rows", gather):
+            cache._decode_windows(layers.long()[:, None, None], slots[:rows])
+        return got
 
     def _selected(self, sig) -> int | None:
         """The pool rows the selection on leaf `sig`'s lists (`_lists`) names
@@ -1738,6 +1773,9 @@ class Stub:
                 entry = _span(*rest) * itemsize
                 if name.startswith(_CACHE.format(ratio="")):
                     unit, history = shape[cut], 0  # a pointer table, at its entries
+                if (op["op"], "addresses") in WINDOWS:  # a ring row an address
+                    entry, slotted = self.row, 1
+                    unit = op["args"]["addresses"]["shape"][0]
                 nbytes, need = entry * (unit + history), None
                 shared[slotted] += entry * unit
                 shared[1] += entry * history
