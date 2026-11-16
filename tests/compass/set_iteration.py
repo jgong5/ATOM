@@ -269,8 +269,8 @@ _KEPT = (
     ("atom/models/kimi_k3/mono/runner.py", "_k1_keys", _REPLACED_RUNNER, 1),
     ("atom/mono/dsa_indexer/bind.py", "_static_refusal", "error text, and " + _ONE, 2),
     ("atom/structured_output/schema.py", "_unevaluated_properties",
-     "a JSON instance's validation errors; its verdict is all-or-nothing, and "
-     "only error text follows the order", 1),
+     ("a JSON instance's validation errors; its verdict is all-or-nothing, and "
+      "only error text follows the order"), 1),
     ("atom/models/mimo_v2_mtp.py", "remap_mtp_weight_name", "any() over the set", 1),
     ("atom/utils/__init__.py", "get_open_ports_list",
      "real ports from the OS; nothing simulated reads which role got which", 1),

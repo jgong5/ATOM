@@ -604,14 +604,14 @@ def literal_keys(blob: ast.Dict, source: pathlib.Path) -> frozenset:
     keys = set()
     for key, value in zip(blob.keys, blob.values):
         if key is None:
-            assert isinstance(value, ast.Call) and isinstance(value.func, ast.Name), (
-                f"{source.name} unpacks something other than a helper's call"
-            )
+            assert isinstance(value, ast.Call) and isinstance(
+                value.func, ast.Name
+            ), f"{source.name} unpacks something other than a helper's call"
             keys |= helper_keys(value.func.id)
             continue
-        assert isinstance(key, ast.Constant) and isinstance(key.value, str), (
-            f"{source.name} builds its blob with computed keys"
-        )
+        assert isinstance(key, ast.Constant) and isinstance(
+            key.value, str
+        ), f"{source.name} builds its blob with computed keys"
         keys.add(key.value)
     return frozenset(keys)
 
@@ -624,9 +624,9 @@ def helper_keys(name: str) -> frozenset:
         for node in ast.walk(ast.parse(source.read_text())):
             if isinstance(node, ast.FunctionDef) and node.name == name:
                 returns = [r for r in ast.walk(node) if isinstance(r, ast.Return)]
-                assert len(returns) == 1 and isinstance(returns[0].value, ast.Dict), (
-                    f"{source.name}: {name} does not return one dict display"
-                )
+                assert len(returns) == 1 and isinstance(
+                    returns[0].value, ast.Dict
+                ), f"{source.name}: {name} does not return one dict display"
                 found.append(literal_keys(returns[0].value, source))
     assert len(found) == 1, f"expected one definition of {name}, found {len(found)}"
     return found[0]

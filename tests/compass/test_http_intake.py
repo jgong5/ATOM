@@ -805,8 +805,7 @@ def work():
 """,
         # Indented: `regen_gpu_gate_triggers.sh` reads a column-0 `from atom.`
         # line as this file's import, and `atom.worker` exists only here.
-        "entrypoints/openai/api_server.py": textwrap.dedent(
-            """
+        "entrypoints/openai/api_server.py": textwrap.dedent("""
             import multiprocessing
             from atom.worker import work
 
@@ -815,8 +814,7 @@ def work():
                 p.start()
                 p.join()
                 assert p.exitcode == 0
-            """
-        ),
+            """),
     }
     for name, text in server.items():
         (tmp_path / "atom" / name).parent.mkdir(parents=True, exist_ok=True)

@@ -2362,9 +2362,7 @@ class MooncakeConnector(KVConnectorBase):
                                     logger.exception(
                                         "[PRODUCER] adopting a landing partition failed"
                                     )
-                            self._send_executor.submit(
-                                self._serve_write, request_data
-                            )
+                            self._send_executor.submit(self._serve_write, request_data)
 
                     elif msg_type == MSG_LANDING_CREDIT:
                         try:
