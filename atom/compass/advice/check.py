@@ -116,8 +116,9 @@ def _judged(store, machine, atom: str, seen: dict, side: str, one: dict) -> tupl
     a spec or the verdict its refusal gives, at the head's ATOM digest `atom`:
     each instance's config resolved once, under its variables, and judged once
     a store, both kept in `seen`. A 1P1D `side` takes the KV transfer config
-    `deploy.sh` adds, on the simulated connector, and runs under the
-    ``AITER_LOG_LEVEL`` the script's `compass_env` sets when unset."""
+    `deploy.sh` adds, on the simulated connector, and runs under the variables
+    the script sets over the instance's and this process's environment
+    (`drive_run.side_env`)."""
     if isinstance(machine, dict):
         return machine, machine
     args, env = one["args"], one["env"]
@@ -125,7 +126,7 @@ def _judged(store, machine, atom: str, seen: dict, side: str, one: dict) -> tupl
         args = _or_refused(drive_run.side_args, side, args, drive_run.SIMULATED)
         if isinstance(args, dict):
             return args, args
-        env = {"AITER_LOG_LEVEL": os.environ.get("AITER_LOG_LEVEL", "WARNING")} | env
+        env = env | drive_run.side_env(os.environ | env)
     instance = (tuple(args), tuple(env.items()))
     if (store.root, *instance) not in seen:
         with _env(env):

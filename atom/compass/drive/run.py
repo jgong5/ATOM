@@ -50,7 +50,7 @@ flags and ATOM arguments as `deploy.sh run` takes them, so `--network` names a
 deployment across nodes. Its ATOM arguments gain the `--kv-transfer-config` the
 script adds, the side's KV role on the simulated connector, and it reads the
 environment the script starts the side in, `AITER_LOG_LEVEL` WARNING when
-unset or empty (`compass_env`), so it resolves the config the side's instance
+unset or empty (`side_env`), so it resolves the config the side's instance
 runs. A `--kv-transfer-config` among them refuses, as the script refuses one. The
 readings command it prints takes Mooncake's connector in the simulated one's
 place, as `deploy.sh record` starts the side: a real start has no clock to
@@ -131,10 +131,7 @@ def main(argv: list[str]) -> None:
         )
     if args.check in ROLES:
         serve._refuse(atom_args)
-        # deploy.sh starts each side under `compass_env` (scripts/compass/_lib.sh),
-        # which sets AITER_LOG_LEVEL when it is unset or empty.
-        level = os.environ.get("AITER_LOG_LEVEL")
-        env = {} if level else {"AITER_LOG_LEVEL": "WARNING"}
+        env = side_env(os.environ)
         os.environ.update(env)
         sides = [side_args(args.check, atom_args, c) for c in (SIMULATED, REAL)]
         raise SystemExit(lacking.report(args, *sides, env))
@@ -223,6 +220,13 @@ def side_args(side: str, atom_args, connector: str) -> list[str]:
             )
     kv = {"kv_role": ROLES[side], "kv_connector": connector}
     return [*atom_args, KV_FLAG, json.dumps(kv)]
+
+
+def side_env(env) -> dict:
+    """The variables deploy.sh's `compass_env` (scripts/compass/_lib.sh) sets
+    over the environment `env` it starts a side in: AITER_LOG_LEVEL WARNING
+    where `env` has it unset or empty."""
+    return {} if env.get("AITER_LOG_LEVEL") else {"AITER_LOG_LEVEL": "WARNING"}
 
 
 def measured(record, atom_args, ranks: int) -> list[float]:
