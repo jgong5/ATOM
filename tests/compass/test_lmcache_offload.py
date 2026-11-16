@@ -323,6 +323,44 @@ def test_a_store_waits_out_each_prefill_forward_it_is_in_flight_for(
     engine.finish()
 
 
+def test_a_store_handed_as_a_prefill_forward_starts_is_in_flight_through_it(
+    tmp_path, monkeypatch
+):
+    """The store starts as the forward does, so the prefill it waits out is
+    copy time, not waiting, as ATOM's worker and `fit_offload` count it."""
+    engine = Engine(tmp_path, monkeypatch)
+    shell, rt = engine.shell, engine.rt
+    prefill = 4 * STEP
+
+    def forward(name, batch, wait_out=False):
+        rt.advance_to(rt.now + prefill)
+        return SimpleNamespace(predicted_s=prefill)
+
+    core = SimpleNamespace(
+        scheduler=SimpleNamespace(kv_connector=shell),
+        runner_mgr=SimpleNamespace(call_func=forward),
+    )
+    watch_forwards(core)
+    a = _seq("a", range(1, 4 * CHUNK + 1))
+    shell.update_state_after_alloc(a)
+    a.num_cached_tokens = len(a.token_ids)
+    sent = rt.now
+    assert [r.req_id for r in shell.build_connector_meta().requests] == ["a"]
+    core.runner_mgr.call_func(
+        "forward", SimpleNamespace(total_seqs_num_prefill=1), wait_out=True
+    )
+    end = sent + prefill + STORE_S[0] + 4 * STORE_S[1]
+    while rt.now < end + 3 * STEP:
+        engine.step()
+    assert shell.offload_statistics()["copies"]["save"] == {
+        "copies": 1,
+        "chunks": 4,
+        "seconds": pytest.approx(end - sent),
+        "waited": 0.0,
+    }
+    engine.finish()
+
+
 def test_a_shell_that_has_done_nothing_reports_every_count_as_zero(
     tmp_path, monkeypatch
 ):

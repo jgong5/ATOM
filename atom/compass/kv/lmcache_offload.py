@@ -511,11 +511,12 @@ class OffloadShell:
         self._prefill_starts.append(start - self._prefilled[-1])
         self._prefilled.append(self._prefilled[-1] + end - start)
 
-    def _on_clock(self, t: float, queued: float, side) -> float:
-        """Store lane time `t` on the LP clock, past each prefill forward that
-        starts before it, or at it on `side` `bisect.bisect_right`, and never
-        before `queued`."""
-        return max(queued, t + self._prefilled[side(self._prefill_starts, t)])
+    def _on_clock(self, t: float, queued: float) -> float:
+        """Store lane time `t` on the LP clock: past each prefill forward that
+        starts before it, so a store begun as a forward begins is in flight
+        through it, and never before `queued`."""
+        i = bisect.bisect_left(self._prefill_starts, t)
+        return max(queued, t + self._prefilled[i])
 
     def _run_due(self) -> None:
         """Run each copy whose priced end the clock has reached, as its rank's
@@ -527,8 +528,8 @@ class OffloadShell:
             while heap and heap[0][0] <= reached:
                 end, order, k, req, queued, start, chunks = heapq.heappop(heap)
                 if kind == "save":
-                    start = self._on_clock(start, queued, bisect.bisect_right)
-                    end = max(start, self._on_clock(end, queued, bisect.bisect_left))
+                    start = self._on_clock(start, queued)
+                    end = max(start, self._on_clock(end, queued))
                 due.append((end, order, k, kind, req, queued, start, chunks))
         for end, _, k, kind, req, queued, start, chunks in sorted(due):
             rank = self._ranks[k]
