@@ -11,6 +11,10 @@ not a sustainable configuration
 `smoke_cell.sh` runs the same path at one concurrency in about an hour, so start
 there (below), then run the full cell.
 
+To search several configurations for the one to deploy, from a space file to a
+recommendation, follow [ADVICE.md](ADVICE.md); it runs in this page's
+Environment, with its Variables.
+
 ## Concepts
 
 Compass replaces only ATOM's forward pass. The scheduler, the KV block manager,
