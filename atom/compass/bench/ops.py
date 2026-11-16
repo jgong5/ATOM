@@ -22,7 +22,7 @@ more as it drafts, and a prefill's rows, split as the capture split them,
 follow `--context` cached tokens each, none when it is not given; there
 the planes of DeepSeek-V4.1's FP8 indexer, which the capture sized to its own
 rows' KV blocks, are as wide as the point's rows' (`PAGE_WIDE`), a top-k on
-aiter's kernel at that width (`_dispatched`). Rows the KV
+aiter's kernel at that width and rows (`_dispatched`). Rows the KV
 pool cannot hold at once are ragged (`point_rows`), and the point records its
 rows; under `--plan` over ragged decode steps a decode point
 the pool cannot hold refuses instead, past the first round (`RAGGED`).
@@ -306,7 +306,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 40
+PROTOCOL = 42
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -613,6 +613,10 @@ PACKED_ROWS = {
 #: precedes it, unless `FLYDSL_OFF`, which no `op_graph` key states, holds
 #: one of the values aiter reads as off.
 ONE_BLOCK = ("gfx1250",)
+#: The arches on which aiter's FlyDSL decode gate precedes it: a call the gate
+#: takes by its width, rows, k and `stable` runs FlyDSL's multi-CTA kernel
+#: (`_MULTI`), as aiter's own gate reads (`_flydsl_topk_decode_shape_supported`).
+GATED = ("gfx950",)
 FLYDSL_OFF = "AITER_DISABLE_FLYDSL_TOPK_DECODE"
 FLYDSL_OFF_VALUES = ("1", "true", "True", "yes", "YES")
 #: DeepSeek-V4.1's index tables an earlier leaf of its forward writes, by
@@ -2543,7 +2547,7 @@ def _widened(op, blocks) -> dict:
     """`op` with the slots and integers `PAGE_WIDE` names for it as wide as
     `blocks[1]` KV blocks rather than the capture's `blocks[0]`: an integer,
     a tensor's columns, and its row stride where that is its columns; the
-    operator aiter dispatches at that width (`_dispatched`)."""
+    operator aiter dispatches at that width and its rows (`_dispatched`)."""
     bound, *wide = PAGE_WIDE.get(op["op"], (None,))
     if blocks[0] == blocks[1] or bound is None or _written(op, bound) == "context":
         return op
@@ -2561,26 +2565,47 @@ def _widened(op, blocks) -> dict:
 
 
 def _dispatched(op) -> dict:
-    """`op`, aiter's HIP decode top-k (`_PICK`) once its logits are k wide, as
-    aiter dispatches it on this device's arch, the one `graph` read its graph
-    at: FlyDSL's one-block kernel on `ONE_BLOCK`'s, called as aiter's decode
-    wrapper calls it, each row bound `seqLens`; else marked refused."""
+    """`op`, a top-k of aiter's decode wrapper (`top_k_per_row_decode`), on
+    the kernel it dispatches to on this device's arch, the one `graph` read
+    its graph at: HIP's (`_PICK`) while the logits are narrower than k, else
+    FlyDSL's multi-CTA one where a `GATED` arch's gate takes its width, rows
+    and k, or its one-block one there and on `ONE_BLOCK`'s; one other than
+    the capture's called as the wrapper calls it, each row bound `seqLens`,
+    or marked refused on another arch or under `FLYDSL_OFF`."""
     from atom.compass.capture.forward import device_arch
 
-    args = op["args"]
-    width = args["logits"]["shape"][1] if op["op"] == _PICK else None
-    if width is None or "k" not in args or args["k"] > width:
+    name, args = op["op"], op["args"]
+    wrapped = not _packed(op) and (name != _TOPK or args.get("is_decode"))
+    width = args["logits"]["shape"][1] if name in (_PICK, _MULTI, _TOPK) else None
+    if width is None or "k" not in args or args["k"] > width or not wrapped:
+        return op
+    if (arch := device_arch()) not in GATED and name != _PICK:
+        return op
+    # the wrapper's call: its HIP kernel's arguments but the scratch
+    taken = {"seq_lens": "seqLens", "row_ends": "seqLens", "num_rows": "numRows"}
+    drop = ("workspace", "row_starts", "is_decode", "plane_width", "packed_rows")
+    args = {taken.get(s, s): v for s, v in args.items() if s not in drop}
+    kernel = _TOPK if arch in ONE_BLOCK + GATED else None
+    if arch in GATED:
+        from aiter.ops.topk import _flydsl_topk_decode_shape_supported as gate
+
+        rows, stable = args["numRows"], bool(args.get("stable", False))
+        kernel = _MULTI if gate(arch, stable, width, rows, args["k"]) else kernel
+    if kernel == name:
         return op
     off = os.environ.get(FLYDSL_OFF) in FLYDSL_OFF_VALUES
-    if (arch := device_arch()) not in ONE_BLOCK or off:
+    if kernel is None or off:
         off = f" under {FLYDSL_OFF}={os.environ[FLYDSL_OFF]}" if off else ""
         why = f"aiter's decode top-k of k {args['k']} on logits {width} wide"
         return op | {"refuses": f"{why}: its kernel on {arch}{off} is not known"}
-    named = {"seqLens": "row_ends", "numRows": "num_rows"}
-    called = {named.get(s, s): v for s, v in args.items() if s != "workspace"}
-    called |= {"row_starts": copy.deepcopy(args["seqLens"]), "is_decode": True}
-    called |= {"values": args.get("values"), "plane_width": None, "packed_rows": False}
-    return op | {"op": _TOPK, "args": called}
+    bound = "seq_lens" if kernel == _MULTI else "row_ends"
+    named = {"seqLens": bound, "numRows": "num_rows"}
+    called = {named.get(s, s): v for s, v in args.items()}
+    if kernel == _TOPK:
+        called |= {"row_starts": copy.deepcopy(args["seqLens"]), "is_decode": True}
+    called |= {"values": args.get("values"), "plane_width": None}
+    called |= {"packed_rows": False} if kernel == _TOPK else {"row_starts": None}
+    return op | {"op": kernel, "args": called}
 
 
 def _summed(op, rows) -> dict:

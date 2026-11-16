@@ -1190,7 +1190,8 @@ def _pick(monkeypatch, arch, k, env=None):
         ("gfx1250", None, 160, ops._TOPK),
         ("gfx1250", "0", 160, ops._TOPK),  # which aiter reads as on
         ("gfx1250", None, 161, ops._PICK),
-        ("gfx950", None, 160, "its kernel on gfx950 is not known"),
+        ("gfx950", None, 160, ops._TOPK),  # no FlyDSL decode gate takes k 160
+        ("gfx942", None, 160, "its kernel on gfx942 is not known"),
         ("gfx1250", "1", 160, "gfx1250 under AITER_DISABLE_FLYDSL_TOPK_DECODE=1 is"),
     ],
 )
@@ -1211,6 +1212,58 @@ def test_a_v41_prefill_pick_widened_to_its_k_runs_the_top_k_aiter_dispatches_the
     assert call["logits"].shape == (256, 160)
     bounds = ("row_starts", "row_ends") if want == ops._TOPK else ("seqLens",)
     assert [call[b].tolist() for b in bounds] == [ends] * len(bounds)
+
+
+def _wrapped(kernel, rows, width, k=512):
+    """A stable top-k of `rows` rows aiter's decode wrapper launched on `kernel`
+    over V4.1's FP8 plane `width` wide, each row's bound the staged one."""
+    I32, plane = "torch.int32", ("logits", _t([rows, width], "metadata"))
+    ends = _t([rows], "metadata", dtype=I32)
+    out = ("indices", _t([rows, k], "activation", dtype=I32))
+    ints = [("stride0", width), ("stride1", 1), ("k", k), ("stable", True)]
+    if kernel == ops._PICK:
+        scratch = ("workspace", _t([1], "activation", dtype="torch.uint8"))
+        args = [("next_n", 1), ("seqLens", ends), out, ("numRows", rows)]
+        return _leaf(kernel, plane, *args, *ints, scratch)
+    if kernel == ops._MULTI:
+        args = [("next_n", 1), ("seq_lens", ends), out, ("num_rows", rows)]
+        return _leaf(kernel, plane, *args, *ints, ("row_starts", None))
+    args = [("row_starts", ends), ("row_ends", ends), out, ("values", None)]
+    args += [("num_rows", rows), *ints, ("is_decode", True), ("next_n", 1)]
+    return _leaf(kernel, plane, *args, ("packed_rows", False))
+
+
+@pytest.mark.parametrize(
+    "kernel, rows, width, want",
+    [
+        (ops._MULTI, 128, 4000, ops._MULTI),  # 20000 columns, the gate's edge
+        (ops._MULTI, 128, 4008, ops._TOPK),
+        (ops._MULTI, 16, 6560, ops._MULTI),  # 32800 columns
+        (ops._MULTI, 17, 6560, ops._TOPK),
+        (ops._PICK, 128, 128, ops._MULTI),  # 640 columns, past k 512
+        (ops._PICK, 256, 128, ops._TOPK),
+        (ops._TOPK, 32, 20480, ops._MULTI),  # 102400 columns
+        (ops._TOPK, 33, 20480, ops._TOPK),
+    ],
+)
+def test_a_widened_gfx950_top_k_runs_the_kernel_aiter_s_gate_picks_by_width_and_rows(
+    monkeypatch, kernel, rows, width, want
+):
+    # a prefill of 256 tokens past 1024 cached ranks 5 times the columns it
+    # traced; aiter's gfx950 gate takes a stable call of k 512 to 20000
+    # columns at 128 rows, 32768 to 65535 at 16, 65536 to 131072 at 32
+    monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: "gfx950")
+    monkeypatch.delenv("AITER_DISABLE_FLYDSL_TOPK_DECODE", raising=False)
+    records, visible = [], list(range(1025, 1281))
+    monkeypatch.setattr(ops, "_journal", lambda path, got: records.extend(got) or got)
+    top_k = _wrapped(kernel, rows, width)
+    [call] = _v41_index(monkeypatch, visible, [top_k], prefill(256, 1), 1024)
+
+    [record] = records
+    assert record.get("timed", kernel) == want
+    assert call["logits"].shape == (rows, 5 * width)
+    bounds = ("row_starts", "row_ends") if want == ops._TOPK else ("seq_lens",)
+    assert [call[b].tolist() for b in bounds] == [visible[:rows]] * len(bounds)
 
 
 def test_a_v41_prefill_pick_s_points_either_side_of_its_k_fit_one_family_by_context(
