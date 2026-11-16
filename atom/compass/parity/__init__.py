@@ -35,7 +35,11 @@ receive of its input is `t_pp_recv_ns`, its device part `d_recv_ns`; an idle
 never waited on, so a line is finished once its exit event has completed. A
 real runner's lines are kept in memory and written at its `exit`, so no file
 call or JSON encoding runs between its forwards; a worker that never reaches
-`exit` (SIGKILL, a native crash) leaves an empty record. A real line also
+`exit` (SIGKILL, a native crash) leaves an empty record. With `WRITE_THROUGH`
+set to 1, as `compass record --sweep` sets it for a record nothing grades, a
+real runner writes and flushes its finished lines at each forward instead,
+never waiting on a window still open, so a worker that dies keeps every line
+finished by its last forward. A real line also
 carries `launch`, where its model's launch provider declares features
 (`backends.launch_features`), and `blocked_ns`, where the worker loaded the
 blocking-call tool (`blocked`): the nanoseconds its thread spent in each HIP
@@ -99,6 +103,8 @@ from atom.compass.backends.launch_features import GRAPHS, architecture, provider
 from atom.compass.backends.step_labels import DRAFT_PASSES, join_stamps
 
 ENV = "ATOM_COMPASS_PARITY_RECORD"
+#: Set to 1, a real runner's record is written as its lines finish, not at `exit`.
+WRITE_THROUGH = "ATOM_COMPASS_PARITY_WRITE_THROUGH"
 #: The file in a real run's record directory holding when its workload was sent
 #: and when the server admitted each request.
 ARRIVALS = "arrivals.json"
@@ -142,9 +148,13 @@ BLOCKED_AT = ("t_launch_ns", "t_recv_ns")
 
 
 class StepRecord:
-    """One DP rank's record: a JSON line per forward call."""
+    """One DP rank's record: a JSON line per forward call. A real runner's
+    line is written at `write`, or with `write_through` at the first forward
+    that finds it finished, as a simulated runner's always is."""
 
-    def __init__(self, directory, dp_rank: int, stage: int = 0) -> None:
+    def __init__(
+        self, directory, dp_rank: int, stage: int = 0, write_through: bool = False
+    ) -> None:
         name = f"pp{stage}.dp{dp_rank}" if stage else f"dp{dp_rank}"
         self.path = pathlib.Path(directory) / f"{name}.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,9 +164,11 @@ class StepRecord:
         self.file = self.path.open("w")
         # Finished lines, not yet written. Built of tuples, not lists, so a
         # full collection untracks them: a million list-built lines held made
-        # each full collection 0.8 s. ponytail: the whole record is held in
-        # the worker's memory until `exit`; bound it if a run outgrows that.
+        # each full collection 0.8 s. ponytail: unless `write_through`, the
+        # whole record is held in the worker's memory until `exit`; bound it if
+        # a run outgrows that.
         self.lines: list[dict] = []
+        self.write_through = write_through
         self.dp_rank = dp_rank
         self.step = 0
         self.keys: dict[int, str] = {}  # request id -> key
@@ -204,7 +216,8 @@ class StepRecord:
         rewrites batch fields in place, and written after it returns, with `t_enter_ns`
         and `t_exit_ns` read off `runner.step_clock_ns()` around it and
         `runner.step_stamps()` added; a line with a device window waits in
-        `pending` until the window closes, then in `lines` until `write`. Returns `forward`'s reply, or
+        `pending` until the window closes, then in `lines` until `write`,
+        which a write-through record runs at each step. Returns `forward`'s reply, or
         without one the mode the view was built from and the view, so a caller
         pricing the step need not run the collective or build the view again.
         """
@@ -311,9 +324,12 @@ class StepRecord:
         if view.group_needs_eager:
             line["group_needs_eager"] = True
         self.pending.append((line, window))
-        self.flush()
-        if forward is None:  # a simulated step: priced, not timed
-            self.write()
+        # A simulated step is priced, not timed, and nothing grades a
+        # write-through record's time: their finished lines are written now.
+        if forward is None or self.write_through:
+            self.write(wait=False)
+        else:
+            self.flush()
         self.step += 1
         return (mode, view) if forward is None else reply
 
@@ -332,10 +348,10 @@ class StepRecord:
             self.lines.append(line)
             self.pending.popleft()
 
-    def write(self) -> None:
-        """Wait for every open window, then append the finished lines to the
-        file, flushed, so a worker killed after this keeps them."""
-        self.flush(wait=True)
+    def write(self, wait: bool = True) -> None:
+        """Append the finished lines to the file, flushed, so a worker killed
+        after this keeps them; with `wait`, first wait for every open window."""
+        self.flush(wait)
         self.file.write("".join(json.dumps(line) + "\n" for line in self.lines))
         self.file.flush()
         self.lines.clear()
@@ -386,7 +402,8 @@ def _record(runner):
             pc = runner.config.parallel_config
             pp = runner.config.pipeline_parallel_size > 1
             stage = pc.pipeline_parallel_rank if pp else 0
-            record = StepRecord(directory, pc.data_parallel_rank, stage)
+            through = os.environ.get(WRITE_THROUGH) == "1"
+            record = StepRecord(directory, pc.data_parallel_rank, stage, through)
             # By its first step the runner has resolved its engine.
             engine = keyed(runner.config) | {
                 name: getattr(runner.config, name) for name in UNKEYED
