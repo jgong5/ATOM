@@ -14,8 +14,17 @@ took, or why the tree is refused, then each candidate with its ATOM basis,
 each departure with its reason, its verdicts and its state. Then each
 searchable point is simulated into its run directory under `simulate.RUNS`, a
 finished one skipped, and `simulate.SIMULATED` gets each point's outcome
-(`simulate.simulate`), printed with the CPU seconds the points took. It reads
-SPACE alone, and writes nothing when SPACE refuses.
+(`simulate.simulate`), printed with the CPU seconds the points took. Last,
+`results.RESULTS` gets the results (`results.results`), printed: the SLO, the
+result table, each command that makes what a point lacks, and the
+recommendation's text. When SPACE differs from the search OUT holds only in its
+SLO, the results alone are made again, from the verdicts, states and outcomes
+OUT holds, and nothing is checked or simulated; a search that did not end holds
+no outcomes, so the next is whole. Beside SPACE and the store and laws the
+check reads, it reads OUT's last search: an SLO-only rerun takes its
+`CANDIDATES`, `check.REUSE`, `check.STATES` and `simulate.SIMULATED` as they
+are, and each point's run directory is read to skip a finished point and for
+its metrics. It writes nothing when SPACE refuses.
 """
 
 import argparse
@@ -23,7 +32,7 @@ import json
 import sys
 from pathlib import Path
 
-from atom.compass.advice import simulate
+from atom.compass.advice import results, simulate
 from atom.compass.advice.check import REUSE, STATES, check, lines, state_lines, states
 from atom.compass.advice.space import expand
 from atom.compass.cli import refusing
@@ -42,10 +51,32 @@ def main(argv: list[str]) -> None:
     args.out = args.out.resolve()
     expansion = expand(args.space)
     args.out.mkdir(parents=True, exist_ok=True)
+    earlier = _only_slo_changed(expansion, args.out)
     written = args.out / CANDIDATES
     written.write_text(json.dumps(expansion, indent=1) + "\n")
-    judged, verdicts = check(expansion, args.out), args.out / REUSE
-    found = states(expansion, judged, args.out)
+    if earlier:
+        print(
+            f"{args.space} differs from the search in {args.out} only in its SLO: "
+            "its results again, nothing checked or simulated"
+        )
+        judged, found, outcome = earlier
+    else:
+        judged, found, outcome = _search(expansion, args.out)
+    held = results.results(expansion, judged, found, outcome, args.out)
+    print("\n".join(results.lines(held)))
+    print(f"the results in {args.out / results.RESULTS}")
+    candidates, points = len(expansion["candidates"]), len(expansion["points"])
+    print(f"{candidates} candidates and {points} points in {written}")
+
+
+def _search(expansion: dict, out: Path) -> tuple[dict, dict, dict]:
+    """Check and simulate `expansion` into `out`, printing each step: its
+    verdicts, states and outcomes."""
+    # A search stopped before its outcomes holds none, so the next is whole.
+    for name in (simulate.SIMULATED, results.RESULTS):
+        (out / name).unlink(missing_ok=True)
+    judged, verdicts = check(expansion, out), out / REUSE
+    found = states(expansion, judged, out)
     if head := judged["head"]:
         print(
             f"the reuse check at {head['commit']} ({head['ref']}), ATOM digest "
@@ -63,12 +94,23 @@ def main(argv: list[str]) -> None:
     searchable = sum(
         v["state"] == "searchable" for s in found.values() for v in s["points"].values()
     )
-    print(f"{searchable} points searchable, each state in {args.out / STATES}")
-    outcome = simulate.simulate(expansion, judged, found, args.out)
-    print(f"each simulated point in {args.out / simulate.SIMULATED}:")
+    print(f"{searchable} points searchable, each state in {out / STATES}")
+    outcome = simulate.simulate(expansion, judged, found, out)
+    print(f"each simulated point in {out / simulate.SIMULATED}:")
     print("\n".join(simulate.lines(outcome)))
-    candidates, points = len(expansion["candidates"]), len(expansion["points"])
-    print(f"{candidates} candidates and {points} points in {written}")
+    return judged, found, outcome
+
+
+def _only_slo_changed(expansion: dict, out: Path) -> tuple | None:
+    """The verdicts, states and outcomes of the search `out` holds, when
+    `expansion` differs from it in its SLO alone; else None."""
+    held = [out / n for n in (CANDIDATES, REUSE, STATES, simulate.SIMULATED)]
+    if not all(path.is_file() for path in held):
+        return None
+    was, now = json.loads(held[0].read_text()), json.loads(json.dumps(expansion))
+    if was.pop("slo") == now.pop("slo") or was != now:
+        return None
+    return tuple(json.loads(path.read_text()) for path in held[1:])
 
 
 if __name__ == "__main__":
