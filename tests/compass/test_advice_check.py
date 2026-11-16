@@ -311,29 +311,41 @@ def test_a_configuration_atom_refuses_refuses_its_candidate_with_atom_s_error(
 
 
 @pytest.mark.parametrize(
-    ("declared", "why"),
+    ("declared", "args", "why"),
     [
-        (DECLARED, "ATOM's config: SyntaxError: '{' was never closed"),
+        (
+            DECLARED,
+            {"--kv-transfer-config": "{bad"},
+            "ATOM's config: SyntaxError: '{' was never closed",
+        ),
+        (
+            DECLARED,
+            {"--tensor-parallel-size": 8, "--decode-context-parallel-size": 3},
+            "ATOM's config: AssertionError: tp_size (8) must be divisible by "
+            "dcp_size (3)",
+        ),
         (
             unpicklable,
+            {},
             (
                 "ATOM's config: test_advice_check.Unpicklable: Validation error for "
                 "field 'num_hidden_layers': expected int, got str"
             ),
         ),
-        (compass_refusing, REFUSING),
+        (compass_refusing, {}, REFUSING),
     ],
-    ids=["atom", "unpicklable", "compass"],
+    ids=["atom-stdlib", "atom-config", "unpicklable", "compass"],
 )
 def test_what_the_child_raises_resolving_refuses_its_candidate_as_its_line(
-    tmp_path, stubbed, monkeypatch, declared, why
+    tmp_path, stubbed, monkeypatch, declared, args, why
 ):
-    # A real child; ATOM's own resolution reads DeepSeek-V4-Pro and fails at {bad.
+    # A real child; ATOM's own resolution reads DeepSeek-V4-Pro and fails in
+    # the standard library at {bad, or in atom/config.py at DCP 3 of TP 8.
     monkeypatch.setattr(ops, "_child", CHILD)
     monkeypatch.setattr(drive_run, "_declared", declared)
     shutil.copy(V4_PRO, tmp_path / "config.json")
 
-    found = advise(tmp_path, {"a": {"args": {"--kv-transfer-config": "{bad"}}})
+    found = advise(tmp_path, {"a": {"args": args}})
 
     assert found["a"] == {"state": "refused", "why": [why], "made_by": [], "points": {}}
     assert starts(tmp_path) == []
