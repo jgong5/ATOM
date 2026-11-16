@@ -13,6 +13,7 @@ import re
 import signal
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.request
 from pathlib import Path
@@ -252,3 +253,41 @@ def test_deploy_sh_writes_it_before_report_html(tmp_path, planted):  # noqa: F81
     why = (d / prometheus.TEXT).read_text()
     assert why.startswith("No Prometheus report: no engine or frontend wrote")
     assert html.escape(why.strip()) in (d / html.FILE).read_text()
+
+
+def test_both_tools_come_from_one_archive_and_each_is_reused_once_extracted(
+    tmp_path, monkeypatch
+):
+    """Neither named nor on PATH, each tool is extracted from the release
+    archive already in the directory, which no call downloads; once
+    extracted, each is reused with the archive gone, and no part is left."""
+    monkeypatch.syspath_prepend(str(prometheus.CI))
+    import collect_metrics
+
+    for name in ("ATOMESH_PROMETHEUS_BIN", "ATOMESH_PROMTOOL_BIN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setattr(collect_metrics.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(collect_metrics.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(collect_metrics, "urlopen", None)  # a download fails
+    stem = f"prometheus-{collect_metrics.PROMETHEUS_VERSION}.linux-amd64"
+    archive = tmp_path / f"{stem}.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        for tool in ("prometheus", "promtool"):
+            body = f"#!/bin/sh\necho {tool}\n".encode()
+            member = tarfile.TarInfo(f"{stem}/{tool}")
+            member.size = len(body)
+            tar.addfile(member, io.BytesIO(body))
+
+    made = {
+        t: collect_metrics.ensure_prometheus(tmp_path, t)
+        for t in ("promtool", "prometheus")
+    }
+    archive.unlink()
+
+    for tool, path in made.items():
+        assert path == str(tmp_path / tool)
+        ran = subprocess.run([path], capture_output=True, text=True, check=True)
+        assert ran.stdout == f"{tool}\n"
+        assert collect_metrics.ensure_prometheus(tmp_path, tool) == path
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["prometheus", "promtool"]
