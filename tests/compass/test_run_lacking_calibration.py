@@ -44,7 +44,7 @@ TEMPLATE |= {"max_num_batched_tokens": 16384, "speculative_config": mtp(3)}
 TP8 = ["-tp", "8", "--max-num-seqs", "512", "--max-num-batched-tokens", "16384"]
 #: A token no store entry has.
 ABSENT = "0123456789ab"
-UNKNOWN = "expected time: unknown, as calibrate.sh records no calibration's time"
+UNKNOWN = "expected time: unknown, as no earlier calibration's status is read for it"
 
 
 @pytest.fixture(autouse=True)
