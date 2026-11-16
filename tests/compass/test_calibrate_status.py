@@ -5,12 +5,14 @@ wall seconds, or failure lands in OUT/status, which a resume appends to; and a
 run that fits both laws prints each step's wall time and the node-hours, and
 ends the status file with them. Under `setsid nohup` a calibration outlives
 the shell that started it and a SIGHUP; a SIGTERM fails its step, which a
-resume takes again, running no finished step twice.
+resume takes again, running no finished step twice; and a second calibrate.sh
+into an OUT one still runs in refuses, removing nothing.
 
 It runs in `test_calibrate`'s stub tree, whose `client.sh` here first waits
 for the file GATE when the record is cal1-c1.
 """
 
+import fcntl
 import os
 import re
 import signal
@@ -202,6 +204,16 @@ def _read(path: Path) -> str:
     return path.read_text() if path.exists() else ""
 
 
+def _unheld(o: Path) -> bool:
+    """Whether OUT's lock is free: no calibrate.sh, nor a step one started, runs."""
+    with open(o / "inputs", "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+
 def test_under_setsid_nohup_it_outlives_its_shell_and_a_sighup(tmp_path, request):
     gate = _gated(tmp_path)
     pid = _started(tmp_path, "o", gate, request)
@@ -211,9 +223,34 @@ def test_under_setsid_nohup_it_outlives_its_shell_and_a_sighup(tmp_path, request
     gate.touch()
 
     o = tmp_path / "o"
-    _until(lambda: "end calibration" in _read(o / "status"), "end of the calibration")
+    _until(lambda: _unheld(o), "end of the calibration")
+    assert _status(o)[-1].startswith("end calibration ")
     assert not any(line.startswith("fail") for line in _status(o))
     assert "calibrate: calibrated in" in (tmp_path / "o.log").read_text()
+
+
+def test_a_second_calibrate_sh_into_a_running_out_refuses_and_removes_nothing(
+    tmp_path, request
+):
+    gate = _gated(tmp_path)
+    _started(tmp_path, "o", gate, request)
+    o = tmp_path / "o"
+    # From its server's start, the first logs nothing until its client passes GATE.
+    _until(lambda: (o / "cal1-c1" / "server.json").exists(), "cal1-c1's server")
+    # Were the second not refused, its own client would not wait, and it would end.
+    opened = tmp_path / "opened"
+    opened.touch()
+
+    r, log = _calibrate(tmp_path, "1", GATE=str(opened))
+
+    assert r.returncode == 2
+    held = f"{o} is held by another calibrate.sh, or a step one started, still running"
+    assert f"calibrate: {held}" in r.stderr
+    assert log == []
+    assert (o / "cal1-c1" / "server.json").exists()
+    gate.touch()
+    _until(lambda: _unheld(o), "end of the first calibration")
+    assert _status(o)[-1].startswith("end calibration ")
 
 
 def test_a_sigterm_fails_its_step_which_a_resume_takes_again_and_nothing_before_it(
@@ -225,9 +262,10 @@ def test_a_sigterm_fails_its_step_which_a_resume_takes_again_and_nothing_before_
 
     os.kill(pid, signal.SIGTERM)
 
-    _until(lambda: "fail" in _read(o / "status"), "failure")
-    # The exit trap stops the step's server, which writes run.json as it stops.
-    _until(lambda: (o / "cal1-c1" / "run.json").exists(), "stopped server")
+    # The exit trap stops the step's server, which writes run.json as it stops;
+    # the lock is free once it and the script have ended.
+    _until(lambda: _unheld(o), "stopped calibration")
+    assert (o / "cal1-c1" / "run.json").exists()
     assert _status(o)[-1] == "fail cal1-c1 N s: stopped by a signal"
     gate.touch()
     r, log = _calibrate(tmp_path, "1", GATE=str(gate))

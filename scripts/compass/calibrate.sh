@@ -60,9 +60,10 @@
 # left to name and its store to hold the platform's readings (`compass fit
 # device`), each step's wall seconds as status last records them, the
 # node-hours, and this run's wall time.
-# It exits 2 on bad arguments or inputs, 90 to 99 as _lib.sh's tree checks
-# refuse, else 1 naming the step that failed, a SIGTERM, SIGINT or SIGHUP
-# included. Under `setsid nohup` it outlives the shell that started it.
+# It exits 2 on bad arguments or inputs, or while another calibrate.sh, or a
+# step one started, runs in OUT; 90 to 99 as _lib.sh's tree checks refuse, else
+# 1 naming the step that failed, a SIGTERM, SIGINT or SIGHUP included. Under
+# `setsid nohup` it outlives the shell that started it.
 # A trace run's directory is trace<k>-c<C>/, done once it holds busy lines,
 # which one refused at its stop lacks.
 set -uo pipefail
@@ -100,6 +101,10 @@ else
     [[ -z $(ls -A "$OUT") ]] || bad "$OUT holds files and no inputs"
     echo "$inputs" >"$OUT/inputs"
 fi
+# One calibrate.sh into OUT at a time: a second would remove the step the first
+# runs. Each step inherits the lock, so one left running holds OUT too.
+exec {lock}>>"$OUT/inputs"
+flock -n "$lock" || bad "$OUT is held by another calibrate.sh, or a step one started, still running"
 # Every path is absolute from here, and nothing resolves `atom` from $PWD.
 cd / || exit 1
 start=$SECONDS
