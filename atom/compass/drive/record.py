@@ -60,7 +60,10 @@ this stack into the container's caches, and its stop writes back each artifact
 it finished compiling (`jit_cache`); without it no library is touched.
 
 With `--sweep` the server also holds the pacing variables a JIT sweep's steps
-need (`sweep.pacing`), which `client.sh --sweep` checks it has.
+need (`sweep.pacing`), which `client.sh --sweep` checks it has, and
+`parity.WRITE_THROUGH`: nothing grades a sweep's record, so each rank writes
+its lines as they finish, and a rank that dies mid-sweep leaves `sweep cover`
+the steps it ran.
 
 `--profile-ops` and `--profile-steps A:B`, the op-level half's profiled pass,
 refuse; so does ATOM's ``--load_dummy``: a record times real weights, and MoE
@@ -81,7 +84,7 @@ from atom.compass.drive import aiter_jit, runfile, serve
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.compass.drive.identity import PTL_CHANGES, ptl_changes
 from atom.compass.drive.sweep import pacing
-from atom.compass.parity import busy
+from atom.compass.parity import WRITE_THROUGH, busy
 from atom.compass.run import _write_whole
 
 PROG = "compass record"
@@ -112,7 +115,7 @@ def main(argv: list[str]) -> None:
         "TRITON_CACHE_DIR": knobs.cache.dir,
     }
     if args.sweep:
-        env |= pacing(atom_args)
+        env |= pacing(atom_args) | {WRITE_THROUGH: "1"}
     # serve writes server.json when /health first answers, so its mtime is
     # when serving began; a server that never answered served nothing.
     ready = Path(args.out) / serve.READY_FILE
@@ -160,7 +163,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--sweep",
         action="store_true",
-        help="start the server with the pacing variables client.sh --sweep needs",
+        help="start the server with the pacing variables client.sh --sweep needs, "
+        "its record written as its lines finish",
     )
     p.add_argument(
         "--out", required=True, help="an empty directory for the record and logs"
