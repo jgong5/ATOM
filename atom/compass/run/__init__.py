@@ -25,8 +25,10 @@ member, the frontend's included, connects to.
   Atomesh entrypoints, and makes a sync utility command on the frontend's
   clock owner refuse. Each image a chat request's media preparation loads
   charges that tokenizer-station job the run file's ``image_preprocess_s``;
-  an image named by a remote URL is refused. On a worker node of a multi-node DP group it only
-  selects the simulated runner.
+  an image named by a remote URL is refused. After each metrics refresh
+  the frontend samples its Prometheus series (`metrics.sample_frontend`).
+  On a worker node of a multi-node DP group it only selects the simulated
+  runner.
 - `engine(config)` wraps the engine's construction in its own process the
   same way, and maps every DP rank to the engine LP for the process-group
   check. The engine ignores SIGTERM from just before it says READY. The
@@ -65,7 +67,10 @@ member, the frontend's included, connects to.
   engine ignores SIGTERM until it has handed in. A
   hand-in before the finish is an early end: the authority's host writes the
   step table and the run summary at once, each LP's clock as it stands, from
-  what has been handed in.
+  what has been handed in. Before each metrics push the engine samples its
+  Prometheus series (`metrics.sample_engine`).
+- An engine or frontend LP's last hand-in first writes the Prometheus series
+  it sampled, `metrics.FILE` beside its hand-in, whole or not at all.
 
 Run file keys: ``clock_endpoint``, ``bound_s`` (finite), the hops `HOPS` (each
 optional, the lookahead of the channels it names, `HOP_FLOOR_S` where absent,
@@ -902,6 +907,13 @@ def _pd_name(config, run: dict) -> str | None:
     return side if n == 1 else f"{side}{k}"
 
 
+def _frontend_lp(config, run: dict) -> LpId:
+    """The LP of this deployment's frontend: ``frontend-<name>`` for
+    `_pd_name`'s name, else ``frontend``."""
+    name = _pd_name(config, run)
+    return FRONTEND if name is None else LpId(f"{FRONTEND.name}-{name}")
+
+
 def _engine_name(config, run: dict) -> str | None:
     """The suffix of this engine's LP: RapidServe's ``P`` or ``D`` engine,
     else `_pd_name`."""
@@ -1469,8 +1481,7 @@ def frontend(config):
         return contextlib.nullcontext()
     _refuse_sync_utility_commands()
     _price_images(run.get(IMAGE_PREPROCESS))
-    name = _pd_name(config, run)
-    lp = FRONTEND if name is None else LpId(f"{FRONTEND.name}-{name}")
+    lp = _frontend_lp(config, run)
     authority = None
     if not standalone:
         _authority = authority = _RecordingAuthority(run)
@@ -1485,6 +1496,10 @@ def frontend(config):
     # A co-hosting frontend reaches the authority in-process, with no socket.
     rt = _runtime(lp, run, cls=_StoppingClock, here=authority is not None)
     rt.client_run_ended = lambda k: _frontend_hand_in(run, rt, k)
+    from atom.compass.run import metrics
+
+    rt.sampler = metrics.Sampler(rt, metrics.ROLES[side], lp.name)
+    metrics.sample_frontend(rt.sampler)
     return _start_on_leaving(rt)
 
 
@@ -1617,6 +1632,7 @@ def engine(config):
             handoff = record / f"dp{rank}.handoff.jsonl"
             clock.stamp_pulls(pulls, handoff, time.monotonic_ns)
         return contextlib.nullcontext()
+    from atom.compass.run import metrics
     from atom.compass.runner import shm_collectives
     from atom.compass.runner.doorbell import sleeping_workers
     from atom.utils.distributed import utils
@@ -1645,6 +1661,9 @@ def engine(config):
     if _member is not None and _offloads(config.kv_transfer_config, "lmcache_mp"):
         _park_before_dispatch()
     rt = _runtime(lp, run, _member, _PublishedClock)
+    rt.sampler = metrics.Sampler(
+        rt, metrics.ROLES[side], _frontend_lp(config, run).name
+    )
     inner = _ignoring_sigterm_from_ready(_named(_start_on_leaving(rt)))
     if _member is not None:
         inner = shm_collectives.attaching_engine_group(inner)
@@ -2928,11 +2947,14 @@ def _hand_in(
 ) -> None:
     """Write `lp`'s refusals, and its other sections, for the summary's writer:
     at the end of client run `client_run`, or None for the finish. When its
-    runtime printed stall diagnostics, ``diagnostics`` counts them."""
+    runtime printed stall diagnostics, ``diagnostics`` counts them. At the
+    finish, first the Prometheus series its runtime sampled, if it did."""
     out = Path(run["out_dir"])
     if client_run is not None:
         out = out / CLIENT_DIR.format(client_run)
         out.mkdir(exist_ok=True)
+    elif (sampler := getattr(clock.installed(), "sampler", None)) is not None:
+        sampler.write(out, lp)
     if diagnostics := getattr(clock.installed(), "diagnostics", 0):
         sections = {"diagnostics": diagnostics, **sections}
     _write_whole(
@@ -3087,7 +3109,9 @@ def engine_loop(engine_core):
     `SystemExit`, so its ``ended:`` reason carries what each worker rank wrote
     it raised. Under ``step_grid`` the workers are asked for the bundle
     before the loop, so a run that ends early still hands it in. In a run the
-    engine hands in ``hit_counters`` too (`_sample_hit_counters`).
+    engine hands in ``hit_counters`` too (`_sample_hit_counters`), and with a
+    utility handler samples its Prometheus series before each metrics push
+    (`metrics.sample_engine`).
 
     In a run the engine ignores SIGTERM until it has handed in: ATOM's handler
     would stop the workers inside a clock call, before they say what their
@@ -3121,6 +3145,11 @@ def engine_loop(engine_core):
         if run is not None:
             if (series := _sample_hit_counters(engine_core)) is not None:
                 sections["hit_counters"] = series
+            sampler = getattr(clock.installed(), "sampler", None)
+            if sampler is not None and hasattr(engine_core, "utility_handler"):
+                from atom.compass.run import metrics
+
+                metrics.sample_engine(sampler, engine_core)
             clock.installed().client_run_ended = lambda k: _engine_hand_in(
                 run, engine_core, sections, k
             )
