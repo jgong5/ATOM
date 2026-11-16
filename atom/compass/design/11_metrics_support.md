@@ -5,8 +5,9 @@ interview and reviewed by jgong5 across two review rounds on PR #3. No code has 
 written against it yet; implementation follows the execution plan in `16`.
 **Amended 2026-11-16** by [#3584](https://github.com/jgong5/ATOM/issues/3584): D71 and D73
 state the metrics ATOM has now, D74 is revised for its first build, the series a
-simulated run writes for CI's Prometheus report (`19` D115), and D72 and D75 say what
-that leaves of the scrape and of the GPU panels. *The first build*, before the decision
+simulated run writes for CI's Prometheus report (`19` D115), D72 and D75 say what that
+leaves of the scrape and of the GPU panels, D76 what it leaves of the GPU counts, and D77
+where the first build declares each family's class. *The first build*, before the decision
 log, walks it.
 
 **Depends on:** `01_execution_and_time_model.md` (what a clock read means),
