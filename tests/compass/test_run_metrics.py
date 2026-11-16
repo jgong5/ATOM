@@ -387,22 +387,26 @@ def _frontend(started, side, stop=None):
     streamed and an unstreamed request's first output and an output interval
     between them, then finishes at 2.5 s, or with `stop` is stopped by it then.
     Returns its runtime and what ``/metrics`` held just after each refresh,
-    checking that it holds what ATOM's own update would."""
+    checking that it renders what an exporter ATOM's own update alone updates
+    does."""
     from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
+    from atom.entrypoints.openai.streaming_dispatch import longest_silence_seconds
 
     own = AtomMetricsExporter.update
     rt = started("frontend", side)
     exporter, requests, streams = create_metrics_exporter()
+    plain = AtomMetricsExporter(stream_silence=longest_silence_seconds)
+    MultiProcessCollector(plain.registry)
     held = {}
 
     def refresh(t: float, snapshot: dict) -> None:
         rt.now, calls = t, rt.calls
         exporter.update(snapshot)
         assert (rt.now, rt.calls) == (t, calls)
-        sampled = exporter.render().decode()
-        held[t] = _held(sampled)
-        own(exporter, snapshot)
-        assert _no_gc(exporter.render().decode()) == _no_gc(sampled)
+        own(plain, snapshot)
+        rendered = exporter.render().decode()
+        assert _no_gc(rendered) == _no_gc(plain.render().decode())
+        held[t] = _held(rendered)
 
     refresh(0.0, _snapshot(0, 0, 0, 0))
     rt.now = 0.5
