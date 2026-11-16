@@ -42,6 +42,7 @@ its header.
 | `gpu_gate_triggers.txt` | — | The source paths that no *running* CPU-gate test names. Generated, not hand-written; matched by `gate_cpu.sh`. A trailing `/` matches a subtree. |
 | `gpu_gate_baselines/<target>/gpu_gate_baseline.env` | — | The GPU gate's baseline for one GPU target (`gfx942`, `gfx950`, `gfx1250`), as the `BASE_*` lines `gate_gpu.sh` reads when torch names that target for the first card: the commit measured, its pass and fail counts, how many tests `gpu_gate_skip.txt` left out of the run (`BASE_LEFT_OUT`), and the torch, HIP and AITER versions it ran under. A target with no pair is refused with 93, naming it. Written by `regen_gpu_gate_baseline.sh`; a change is a reviewed edit. |
 | `gpu_gate_baselines/<target>/gpu_gate_known_failures.txt` | — | The known-failing GPU node-ids at the `BASE_COMMIT` of the `gpu_gate_baseline.env` beside it, verbatim, written by `regen_gpu_gate_baseline.sh`. Its line count and `BASE_FAILED` are two statements of one fact; `gate_gpu.sh` refuses to run if they disagree. |
+| `cpu_gate_aiperf_deps.txt` | — | The packages the CPU gate container installs, without their dependencies, for the `aiperf` wheel `COMPASS_AGENTX_HARNESS` names; "The CPU gate container" below. |
 | `gpu_gate_skip.txt` | — | Hand-written `<target> <test file>` lines, read when torch names that GPU target for the first card: files whose result there the target's pair cannot record, the kinds listed in its header. `gate_gpu.sh` leaves each out, a suite file's collected tests coming off the expected passes and a `tests/compass` file only leaving its run; `regen_gpu_gate_baseline.sh` leaves a suite file out the same way and records the count as `BASE_LEFT_OUT`, which goes back on. A `<target> driver-run` line says that target's nodes hold no driver-run inputs (below). Each line goes when the issue or Ruling above it closes. |
 | `_lib.sh` | — | Tree resolution, `PYTHONPATH`, the `import atom` assertion, commit stamp, and the pytest summary parse `gate_gpu.sh` and `regen_gpu_gate_baseline.sh` count with. |
 
@@ -174,14 +175,17 @@ do not claim green.
 ## The CPU gate container
 
 `gate_cpu.sh` and the two list regenerators run in a container on
-`rocm/atom-dev:vllm-v0.31.0-nightly_20261026`, the image of upstream `e893780f4`,
+`rocm/atom-dev:vllm-v0.31.0-nightly_20261103`, the image of upstream `58ba50180`,
 with no GPU device and the worktree root's parent mounted at its own path:
 
 ```
 docker run -d --init --name <user>_gate --network host -v <parent>:<parent> \
-  rocm/atom-dev:vllm-v0.31.0-nightly_20261026 sleep infinity
+  rocm/atom-dev:vllm-v0.31.0-nightly_20261103 sleep infinity
 docker exec <user>_gate bash -c 'cd /app/ATOM/atom/mesh && cargo fetch --locked'
 docker exec <user>_gate git config --global --add safe.directory '*'
+docker exec <user>_gate bash -c 'cd /opt/venv/lib/python3.12/site-packages/mooncake &&
+  mv engine.cpython-312-x86_64-linux-gnu.so engine.cpython-312-x86_64-linux-gnu.so.not-in-record'
+docker exec <user>_gate python3 -m pip install --no-deps -r <tree>/scripts/compass/cpu_gate_aiperf_deps.txt
 ```
 
 "atomesh's cargo tests run offline" below says why `cargo fetch` runs once. The
@@ -189,6 +193,20 @@ docker exec <user>_gate git config --global --add safe.directory '*'
 user owns; without it `regen_gpu_gate_triggers.sh` records the tree's commit as
 `UNKNOWN`. Run the gate with `COMPASS_AGENTX_HARNESS` naming the wheel the next
 section builds.
+
+The last two lines repair the image. Its `mooncake/engine.cpython-312-x86_64-linux-gnu.so`
+is in no installed package's `RECORD`; Python loads it before the wheel's own
+`mooncake/engine.so`, and it needs an `asio` symbol the `libasio.so` beside it
+does not export, so `import mooncake.engine` fails on
+`undefined symbol: ...reactive_socket_service_base15start_accept_op...`.
+`lmcache.integration.atom` imports it, so `tests/compass/test_lmcache_server.py`
+fails at collection, and neither a Mooncake nor an `lmcache_mp` server starts in
+that image until the file is moved aside. Nightly 20261108's fails the same way;
+nightly 20261111's imports.
+The image also no longer installs `aiperf` in `/opt/venv` (agentx-harness has
+its own `/opt/agentx-venv`, at a version `compass_harness` does not pin), so the
+wheel's dependencies come from `cpu_gate_aiperf_deps.txt`, installed without
+theirs so that no package the image ships changes version.
 
 On a host with GPUs, also mount an empty directory over `/sys/class/kfd`
 (`-v <empty dir>:/sys/class/kfd:ro`). Without `/dev/kfd` the container has no
