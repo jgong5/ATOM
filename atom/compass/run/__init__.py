@@ -3101,9 +3101,7 @@ def engine_loop(engine_core):
     recorded real run's SIGTERM goes through `_stop_recording`, its input
     queue stamps each request frame's handoff (`clock.stamp_input`), and
     however it leaves the loop, the stamps its engine held are written
-    (`clock.write_stamps`), as its workers then write their step lines. A run
-    tells a simulated ``lmcache_offload`` tier the runner's prefill forwards
-    (`atom.compass.kv.lmcache_offload.watch_forwards`)."""
+    (`clock.write_stamps`), as its workers then write their step lines."""
     ignoring = bool(os.environ.get(ENV))  # a run, as `spec` would say, unread
     before = signal.signal(signal.SIGTERM, signal.SIG_IGN) if ignoring else None
     if _sigterm_at_ready:
@@ -3116,10 +3114,6 @@ def engine_loop(engine_core):
             from atom.compass.runner import pp_send
 
             pp_send.install(engine_core, _machine(run))
-        if run is not None:
-            from atom.compass.kv import lmcache_offload
-
-            lmcache_offload.watch_forwards(engine_core)
         if run is not None and STEP_GRID in run:
             workers = engine_core.runner_mgr
             bundle = workers.call_func("step_grid_bundle", wait_out=True)
