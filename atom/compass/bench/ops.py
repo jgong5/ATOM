@@ -46,7 +46,9 @@ sparse attention's index lists are
 those its index build writes for the leaf's pass, off a selection spread over
 each row's visible rows (`Stub._lists`), and its DSpark drafter's FP8 window
 read takes the addresses and pointers ATOM's window read builds for the
-drafter's stage layers at the step's state slots (`Stub._windows`). A `Stub`
+drafter's stage layers at the step's state slots (`Stub._windows`), and its
+draft block its anchors, and its RoPE and attention the positions and
+indices ATOM builds from them, at zero rejections (`Stub._block`). A `Stub`
 calls each leaf from its contract: a tensor the capture states on the host is
 built there on every
 copy, as an activation is, pinned (`_host`); an
@@ -305,7 +307,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 40
+PROTOCOL = 41
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -515,6 +517,7 @@ V41_NAMES = {
     (_TOPK, "row_starts", "packed"): _OFFSETS,
     (_TOPK, "row_starts"): "step.visible.{ratio}",
     (_TOPK, "row_ends"): "step.visible.{ratio}",
+    (_MULTI, "row_starts", "packed"): _OFFSETS,
     (_MULTI, "seq_lens"): "step.visible.{ratio}",
     (_PICK, "seqLens"): "step.visible.{ratio}",
     (_FUSED, "plan_gpu"): _PLAN,
@@ -588,6 +591,7 @@ _V41 = "atom.model_ops.deepseek_v41"
 PAGE_WIDE = {
     _LOGITS: ("context_lens", "out_logits", "kv_indices", "max_model_len"),
     _TOPK: ("row_ends", "logits", "stride0"),
+    _MULTI: ("seq_lens", "logits", "stride0"),
     _PICK: ("seqLens", "logits", "stride0"),
     _MAXIMA: ("visible", "logits", "maxima", "blocks"),
     f"{_V41}.unit_table:unit_table": ("block_tables", "block_tables"),
@@ -600,6 +604,7 @@ PAGE_WIDE = {
 PACKED_ROWS = {
     (_FP4, "out"): ("row_ends", "out_offsets", None),
     (_TOPK, "logits"): ("row_ends", "row_starts", None),
+    (_MULTI, "logits"): ("seq_lens", "row_starts", None),
     (_MAXIMA, "logits"): ("visible", "packed.0", None),
     (_MAXIMA, "maxima"): ("visible", "packed.1", "block_size"),
 }
@@ -629,6 +634,9 @@ _WRITTEN = {
     (_TOPK, "logits"): "maxima",
     (_TOPK, "row_starts"): "context",
     (_TOPK, "row_ends"): "context",
+    (_MULTI, "logits"): "maxima",
+    (_MULTI, "row_starts"): "context",
+    (_MULTI, "seq_lens"): "context",
     (_PICK, "seqLens"): "context",
     (_MAXIMA, "packed.0"): "offsets",
     (_MAXIMA, "packed.1"): "block_offsets",
@@ -658,6 +666,17 @@ WINDOWS = {(_WINDOWS, "addresses"), (_WINDOWS, "ptr")}
 #: A window ring's five scalars, which DeepSeek-V4.1's window writes and index
 #: builds take as its pool places a layer's ring, the capture's pool its own.
 RING = "atom.model_ops.attentions.pool_layout.v4_pool_geometry:WindowParams"
+#: DeepSeek-V4.1's DSpark draft block, by the operator and slot of each leaf
+#: of its drafter's that takes its anchors or what ATOM builds from them on
+#: the device each step (`DSparkProposer.propose`, `DeepseekV41DSpark.
+#: block_backbone`, `Stub._block`): the item of that build it takes.
+BLOCK = {
+    ("atom.spec_decode.dspark_proposer:DSparkProposer._stage_anchors", "rows"): "rows",
+    (f"{_V41}.dspark:draft_step_indices", "positions"): "anchors",
+    (f"{_V41}.rope_window:_launch_rope_window", "positions"): "positions",
+    ("atom.model_ops.sparse_attn_v4:_sparse_attn_triton", "topk_idxs"): "indices",
+    ("aiter._inverse_rope_group_quant_kernel.default", "positions"): "positions",
+}
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
 #: the span, and past an exact buffer kills the process (aiter defect, #1977).
@@ -1323,7 +1342,9 @@ class Stub:
                 act = self.specs and spec["role"] == "activation"
                 listed = LISTS.get((op["op"], path)) if act else None
                 window = act and (op["op"], path) in WINDOWS
-                if spec["role"] == "metadata" or index or listed is not None or window:
+                block = self.specs and drafted and BLOCK.get((op["op"], path))
+                built = listed is not None or window or block
+                if spec["role"] == "metadata" or index or built:
                     token = (op["op"], path) in TOKEN_IDS
                     pool = {"input_ids": input_ids} if token else live
                     what, field = "metadata", path.split(".")[0]
@@ -1371,6 +1392,8 @@ class Stub:
                             self.selections[sig] = md.cache, step, ratio, plan
                         if window:  # as the drafter's window read builds it
                             pool = self._windows(md.cache, live, op)
+                        if block:  # as the drafter builds it for its block
+                            pool = self._block(md.cache, fc.context, block)
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
@@ -1511,6 +1534,32 @@ class Stub:
         with patch.object(v41, "gather_prefix_rows", gather):
             cache._decode_windows(layers.long()[:, None, None], slots[:rows])
         return got
+
+    def _block(self, cache, context, item) -> dict[str, torch.Tensor]:
+        """`item` of what DeepSeek-V4.1's DSpark drafter builds for its block
+        (`BLOCK`), by name, at the step's padded rows, as `propose` and
+        `block_backbone` build it at the runner's zero rejections: each row's
+        last its anchor (`Drafter.prepare_inputs`), at the step's position
+        there, and the block's positions and indices for those anchors
+        (`draft_step_indices`), which allocates its own and writes nothing
+        else."""
+        from atom.model_ops.deepseek_v41.dspark import draft_step_indices
+
+        drafter = getattr(self.runner, "drafter", None)
+        model = getattr(drafter, "model", None)
+        if not hasattr(model, "_context_layer_ids"):
+            raise ValueError("no DSpark drafter here builds its block")
+        rows = drafter.prepare_inputs(context.running_bs)
+        anchors = context.positions[rows]
+        positions, indices, _ = draft_step_indices(
+            anchors,
+            cache.geometry.ring_slots,
+            model.window_size,
+            drafter.draft_tokens_per_seq,
+        )
+        built = {"rows": rows, "anchors": anchors}
+        built |= {"positions": positions, "indices": indices}
+        return {f"draft_step.{item}": built[item]}
 
     def _selected(self, sig) -> int | None:
         """The pool rows the selection on leaf `sig`'s lists (`_lists`) names
@@ -2479,7 +2528,7 @@ def _named(op, path, spec, pool, known=None) -> dict | None:
     role = (op["args"].get("self") or {}).get("role")
     if op["op"] == _ROPE:  # over one head a ratio's index keys, over more a query
         role = "key" if op["args"]["input"]["shape"][-2] == 1 else "query"
-    if op["args"].get("packed_rows"):  # a top-k whose rows start apart
+    if _packed(op):  # a top-k whose rows start apart
         role = "packed"
     wanted = V41_NAMES.get((*key, role), V41_NAMES.get(key, ()))
     wanted = wanted if isinstance(wanted, tuple) else (wanted,)
@@ -2577,8 +2626,9 @@ def _written(op, path) -> str | None:
     for a table or row bound ATOM stages, or another slot."""
     kind, args = _WRITTEN.get((op["op"], path)), op["args"]
     role = {s: v.get("role") for s, v in args.items() if isinstance(v, dict)}
-    listed = (role.get("context_lens") or role.get("row_ends")) == "activation"
-    packed = listed and bool(args.get("packed_rows"))  # FP4's pick's top-k
+    bound = role.get("context_lens") or role.get("row_ends") or role.get("seq_lens")
+    listed = bound == "activation"
+    packed = listed and _packed(op)  # FP4's pick's top-k
     if kind == "tiles":
         return "table" if listed else kind
     if kind in ("table", "starts"):  # FP4's: else its PAGE table, its sequences
@@ -2589,6 +2639,13 @@ def _written(op, path) -> str | None:
         return "block_offsets" if packed else None
     picks = role.get("logits") == "activation" or packed
     return "ends" if kind == "context" and picks else kind
+
+
+def _packed(op) -> bool:
+    """Whether the top-k `op` ranks packed rows, each from a start of its own:
+    the one-block kernel's told so, the multi-CTA one's given their starts."""
+    starts = op["op"] == _MULTI and op["args"].get("row_starts")
+    return bool(op["args"].get("packed_rows") or starts)
 
 
 def _candidates(ends, k) -> torch.Tensor:
