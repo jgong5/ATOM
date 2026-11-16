@@ -63,6 +63,7 @@ from atom.compass.artifacts import (
     machine_platform,
 )
 from atom.compass.artifacts.store import ENTRY_FILE
+from atom.compass.backends.json_file import XZ, read_json
 from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.step_grid_plan import at_ladder
 from atom.compass.drive import runfile
@@ -72,7 +73,7 @@ from atom.compass.run.step_grid import differ, keyed
 
 #: The tree `atom` resolves under, whose repository the head is read from.
 TREE = Path(atom.__file__).resolve().parents[1]
-#: The checked-in law files.
+#: The checked-in law files, stored xz-compressed; a plain JSON one reads too.
 LAWS = TREE / "scripts" / "compass" / "laws"
 #: The integration branch, whose tip at its remote-tracking ref is the head.
 INTEGRATION = "feature/atomcompass_new"
@@ -159,8 +160,8 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
     engine, platform = keyed(config), machine_platform(machine)
     stated = keyed_platform(Kind.STEP_LINEAR_LAW, platform)
     found = []
-    for path in sorted(LAWS.glob("*.json")):
-        held = json.loads(path.read_text())
+    for path in sorted([*LAWS.glob("*.json"), *LAWS.glob(f"*.json{XZ}")]):
+        held = read_json(path)
         host = held.get("host")
         at = host and (held.get("platform"), host["key"].get("model"))
         if at == (stated, model) and _same(held.get("engine_config"), engine):

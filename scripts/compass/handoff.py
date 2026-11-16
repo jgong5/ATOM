@@ -20,7 +20,6 @@ p10 of ``recv`` + ``queue`` and of ``recv`` + ``past pull``, beside the
 """
 
 import bisect
-import json
 import sys
 from collections import defaultdict
 from itertools import pairwise
@@ -28,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from atom.compass.backends.json_file import read_jsonl
+from atom.compass.backends.json_file import read_json, read_jsonl
 
 
 def _bucket(n: int) -> int:
@@ -86,6 +85,6 @@ def report(record, ipc_s: float | None = None) -> list[str]:
 
 
 if __name__ == "__main__":
-    law = json.loads(Path(sys.argv[2]).read_text()) if len(sys.argv) > 2 else {}
+    law = read_json(sys.argv[2]) if len(sys.argv) > 2 else {}
     ipc_s = law.get("host", {}).get("hops", {}).get("ipc_s")
     print("\n".join(report(sys.argv[1], ipc_s)))

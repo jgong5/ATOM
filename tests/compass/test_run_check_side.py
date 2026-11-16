@@ -32,6 +32,7 @@ from test_run_step_grid import deployment
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
+from atom.compass.backends.json_file import read_json
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import runfile
 from atom.model_engine import llm_engine
@@ -39,7 +40,7 @@ from atom.model_engine import llm_engine
 LAWS = Path(__file__).resolve().parents[2] / "scripts/compass/laws"
 #: The crs005 DPA8 pair, prefill then decode.
 PAIR = {
-    side: LAWS / f"deepseek-v4-pro-dpa8-mi355x-crs005-{side}.json"
+    side: LAWS / f"deepseek-v4-pro-dpa8-mi355x-crs005-{side}.json.xz"
     for side in ("prefill", "decode")
 }
 #: The machine of the pair's records: an MI355X at the stack their laws
@@ -107,7 +108,7 @@ def side_args(tmp_path, monkeypatch, side) -> list[str]:
     own, env = SIDES[side]
     for name, value in {**SHARED_ENV, **env}.items():
         monkeypatch.setenv(name, value)
-    cpu = json.loads(PAIR[side].read_text())["host"]["key"]["host_cpu"]
+    cpu = read_json(PAIR[side])["host"]["key"]["host_cpu"]
     monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
     tok = SimpleNamespace(is_fast=True, name_or_path=None)
     monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *args: tok)

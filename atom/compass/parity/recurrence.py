@@ -35,7 +35,7 @@ same way, the steps the law names warm on this record left out, and those
 its host fit names as paying a first-use JIT compile, each with the forward
 after it, reported apart:
 
-    python -m atom.compass.parity.recurrence RECORD_DIR --law LAW_JSON
+    python -m atom.compass.parity.recurrence RECORD_DIR --law LAW
 
 Per kind (decode, output prefill, middle chunk, and idle: after an idle engine,
 `step_labels.busy_gaps`), p10 and p90 of charge over measured exit-to-exit
@@ -64,6 +64,7 @@ from atom.compass.backends import (
     launch_features,
     step_labels,
 )
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.shape import sum_tokens
 from atom.compass.backends.step_linear_fit import WARM_FACTOR
 from atom.compass.parity import ARRIVALS, read
@@ -425,7 +426,7 @@ def main(record: str, machine=None, row_bytes=None, law=None) -> int:
         )
     paths = [Path(record) / f"dp{rank}.jsonl" for rank in stages[0]]
     run = ", ".join(map(step_labels.digest, paths)) if law else None
-    law = law and json.loads(Path(law).read_text())
+    law = law and read_json(law)
     for path, (rank, steps) in zip(paths, stages[0].items()):
         if law:
             samples = step_labels.label(path)[0]

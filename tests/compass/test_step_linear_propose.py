@@ -16,6 +16,7 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
+from atom.compass.backends.json_file import read_json
 
 #: What a longer `propose` pass adds, in seconds.
 EXTRA = 1e-3
@@ -82,7 +83,7 @@ def test_a_law_split_at_a_token_count_prices_the_pass_by_it(law):
 
 
 def test_every_checked_in_law_loads():
-    laws = sorted((Path(__file__).parents[2] / "scripts/compass/laws").glob("*.json"))
+    laws = sorted((Path(__file__).parents[2] / "scripts/compass/laws").glob("*.json.xz"))
     assert laws
     for path in laws:
-        StepLinearLaw(json.loads(path.read_text()))
+        StepLinearLaw(read_json(path))

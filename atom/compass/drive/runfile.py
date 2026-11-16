@@ -62,6 +62,7 @@ from atom.compass.artifacts import (
     machine_platform,
     member_name,
 )
+from atom.compass.backends.json_file import read_json
 from atom.compass.fit.device import compose
 from atom.compass.fit.publish import RANK
 from atom.compass.run.step_grid import readings
@@ -359,10 +360,10 @@ def _member(entry, stem: str):
 
 
 def _law_file(value: str) -> dict | None:
-    """The law file `value` names, read as JSON; None when it names no file,
-    as a token does not."""
+    """The law file `value` names, read as `read_json` reads it; None when it
+    names no file, as a token does not."""
     path = Path(value)
-    return json.loads(path.read_text()) if path.is_file() else None
+    return read_json(path) if path.is_file() else None
 
 
 def _host(store, value: str) -> dict:
