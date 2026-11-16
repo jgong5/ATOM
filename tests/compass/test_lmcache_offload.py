@@ -453,45 +453,71 @@ def _logged_at(ms: int) -> str:
     )[:-3]
 
 
-def test_the_entry_is_fitted_on_the_copies_and_the_lookups_the_logs_state(tmp_path):
-    """Store n moves n chunks in 1 + 2n ms of its own, handed at second n,
-    where an odd line is a 50 ms prefill forward that it waits out, store 3
-    starting 5 ms late; an even line is a decode, which stalls no store."""
-    lines = [
-        f"[atom] LMCache M3 PAGE offload worker rank={r}: page_regions=301 "
-        f"bytes_per_block=5056512 chunk=256 gpu_staging_chunk_bytes=10113024 "
-        "gpu_staging_buffer_chunks=4"
-        for r in (0, 1)
+#: The offload worker lines a TP 2 server logs as it starts.
+WORKERS = [
+    f"[atom] LMCache M3 PAGE offload worker rank={r}: page_regions=301 "
+    "bytes_per_block=5056512 chunk=256 gpu_staging_chunk_bytes=10113024 "
+    "gpu_staging_buffer_chunks=4"
+    for r in (0, 1)
+]
+
+
+def _stores_logged(tmp_path, forwards, stores, more=()) -> list:
+    """Write a server log and its step record into `tmp_path`: each forward
+    ``(enter, ms, prefill, stores it hands)`` a line, each store ``(chunks,
+    start, end)`` in ms logged at its end, its log clock `LOG_AHEAD_MS` ahead,
+    then the lines `more`. Returns the log's lines."""
+    steps = [
+        {
+            "step": i,
+            "rows": [[1024, 1024, False] if prefill else [4, 3000, True]],
+            "kv": [[k, "save", 0, 256 * stores[k][0]] for k in handed],
+            "t_enter_ns": enter * 10**6,
+            "t_exit_ns": (enter + ms) * 10**6,
+        }
+        for i, (enter, ms, prefill, handed) in enumerate(forwards)
     ]
-    steps, prefill_ms = [], 0
+    lines = list(WORKERS)
+    for k, (chunks, start, end) in sorted(stores.items(), key=lambda s: s[1][2]):
+        lines.append(
+            f"\x1b[32;20m[{_logged_at(LOG_AHEAD_MS + end)}] LMCache INFO:\x1b[0m "
+            f"[req_id={k}] Stored {256 * chunks} out of total {256 * chunks} tokens."
+        )
+        lines.append(
+            f"[OFFLOAD-SAVE-PROF] rank=0 req={k} toks={256 * chunks} skip=0 "
+            f"chunks={chunks} groups=1 total_bytes=1 total_ms={end - start:.2f}"
+        )
+    lines += more
+    (tmp_path / "server.log").write_text("\n".join(lines) + "\n")
+    (tmp_path / "steps").mkdir(exist_ok=True)
+    (tmp_path / "steps" / "dp0.jsonl").write_text(
+        "".join(json.dumps(s) + "\n" for s in steps)
+    )
+    return lines
+
+
+def test_the_entry_is_fitted_on_the_copies_and_the_lookups_the_logs_state(tmp_path):
+    """Store n moves n chunks in 1 + 2n ms of its own. Stores 1 to 8 are handed
+    at second n, where an odd line is a 50 ms prefill forward that each waits
+    out, store 3 starting 5 ms late, and an even line a decode, which stalls
+    none. Store 9 waits out two prefill forwards with a decode between; store
+    10 ends 7 ms into a prefill forward."""
+    forwards = [(1000 * n, 50 if n % 2 else 20, n % 2 == 1, [n]) for n in range(1, 9)]
+    forwards += [(9000, 50, True, [9]), (9060, 20, False, []), (9085, 50, True, [])]
+    forwards += [(10000, 3, False, [10]), (10005, 50, True, [])]
+    stores = {}
     for n in range(1, 9):
-        enter, forward_ms = 1000 * n, 50 if n % 2 else 20
-        row = [1024, 1024, False] if n % 2 else [4, 3000, True]
-        steps.append(
-            {
-                "step": n,
-                "rows": [row],
-                "kv": [[n, "save", 0, 256 * n]],
-                "t_enter_ns": enter * 10**6,
-                "t_exit_ns": (enter + forward_ms) * 10**6,
-            }
-        )
-        start = enter + (5 if n == 3 else 0)
-        stalled = max(0, enter + forward_ms - start) if n % 2 else 0
-        prefill_ms += stalled
-        took = stalled + 1 + 2 * n
-        lines.append(
-            f"\x1b[32;20m[{_logged_at(LOG_AHEAD_MS + start + took)}] LMCache INFO:"
-            f"\x1b[0m [req_id={n}] Stored {256 * n} out of total {256 * n} tokens."
-        )
-        lines.append(
-            f"[OFFLOAD-SAVE-PROF] rank=0 req={n} toks={256 * n} skip=0 chunks={n} "
-            f"groups=1 total_bytes=1 total_ms={took:.2f}"
-        )
-        lines.append(
-            f"[OFFLOAD-LOAD-PROF] rank=0 req=r hbm=0 lmc={256 * n} retrieved=1 "
-            f"status=ok chunks={n} groups=1 total_ms={0.5 + 1.5 * n:.2f}"
-        )
+        start = 1000 * n + (5 if n == 3 else 0)
+        stalled = 1000 * n + 50 - start if n % 2 else 0
+        stores[n] = (n, start, start + stalled + 1 + 2 * n)
+    stores[9] = (20, 9000, 9000 + 50 + 35 + 50 + (41 - 35))
+    stores[10] = (2, 10000, 10005 + 7)
+    prefill_ms = 4 * 50 - 5 + 2 * 50 + 7
+    more = [
+        f"[OFFLOAD-LOAD-PROF] rank=0 req=r hbm=0 lmc={256 * n} retrieved=1 "
+        f"status=ok chunks={n} groups=1 total_ms={0.5 + 1.5 * n:.2f}"
+        for n in range(1, 9)
+    ]
     counts = {"lookup_n": 0, "lookup_prompt_tokens": 0, "lookup_us": 0}
     for n in range(1, 7):
         counts = {
@@ -499,13 +525,9 @@ def test_the_entry_is_fitted_on_the_copies_and_the_lookups_the_logs_state(tmp_pa
             "lookup_prompt_tokens": counts["lookup_prompt_tokens"] + 256 * n * n,
             "lookup_us": counts["lookup_us"] + 300 * n + 4 * n * n,
         }
-        lines.append(f"[atom] [OFFLOAD-PERF] {json.dumps(counts)} | {{}}")
+        more.append(f"[atom] [OFFLOAD-PERF] {json.dumps(counts)} | {{}}")
+    lines = _stores_logged(tmp_path, forwards, stores, more)
     log = tmp_path / "server.log"
-    log.write_text("\n".join(lines) + "\n")
-    (tmp_path / "steps").mkdir()
-    (tmp_path / "steps" / "dp0.jsonl").write_text(
-        "".join(json.dumps(s) + "\n" for s in steps)
-    )
 
     entry, report = fit_offload([log])
 
@@ -516,10 +538,9 @@ def test_the_entry_is_fitted_on_the_copies_and_the_lookups_the_logs_state(tmp_pa
     assert entry["load_s"] == pytest.approx([0.5e-3, 1.5e-3], rel=1e-6)
     assert entry["lookup_s"] == pytest.approx([300e-6, 4e-6], rel=1e-6)
     assert entry["fit"]["logs"] == [str(log)]
-    stores = report["store_s"]
-    assert prefill_ms == 4 * 50 - 5
-    assert stores["prefill_s"] == pytest.approx(prefill_ms * 1e-3, abs=1e-9)
-    assert stores["clock_offsets_s"] == {
+    fitted = report["store_s"]
+    assert fitted["prefill_s"] == pytest.approx(prefill_ms * 1e-3, abs=1e-9)
+    assert fitted["clock_offsets_s"] == {
         str(log): pytest.approx(LOG_AHEAD_MS * 1e-3, abs=1e-6)
     }
     other = tmp_path / "other.log"
@@ -533,6 +554,20 @@ def test_the_entry_is_fitted_on_the_copies_and_the_lookups_the_logs_state(tmp_pa
     log.write_text("\n".join(x for x in lines if "Stored" not in x) + "\n")
     with pytest.raises(ValueError, match="request 1 has no LMCache Stored line"):
         fit_offload([log])
+
+
+def test_an_offset_that_starts_stores_before_they_are_handed_is_refused(tmp_path):
+    """Six stores queue on a busy worker, each starting 60 ms after its line
+    is entered; two start as handed. The mode of the starts less the handing
+    lines' enters is the queued 60 ms, which starts those two before the
+    line ahead of theirs exits."""
+    forwards = [(25 * i, 20, False, [i] if i < 6 else []) for i in range(20)]
+    forwards += [(500, 20, False, [6]), (525, 20, False, [7])]
+    stores = {k: (1, 25 * k + 60, 25 * k + 85) for k in range(6)}
+    stores |= {6: (1, 500, 510), 7: (1, 525, 535)}
+    _stores_logged(tmp_path, forwards, stores)
+    with pytest.raises(ValueError, match="starts 2 of 8 stores before the line"):
+        fit_offload([tmp_path / "server.log"])
 
 
 def test_a_client_run_counts_its_own_hits_and_copies(monkeypatch, tmp_path):

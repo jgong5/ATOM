@@ -803,6 +803,10 @@ LMCACHE_STORED = re.compile(
 OFFLOAD_PERF = "[OFFLOAD-PERF] "
 #: The step record a server log's run wrote beside it.
 OFFLOAD_STEPS = Path("steps", "dp0.jsonl")
+#: How far before the exit of the line ahead of its handing line a store may
+#: seem to start: its end is logged to the millisecond, and D's records start
+#: one 3.4 ms early at their offset (#3505).
+STORE_START_SLACK_S = 0.01
 
 
 def fit_offload(logs) -> tuple[dict, dict]:
@@ -915,7 +919,10 @@ def _store_copies(log, copies, chunk: int) -> tuple[float, np.ndarray]:
     ``t_enter_ns`` of the line whose ``kv`` hands it, its tokens skipped taken
     down to a whole chunk and its tokens as handed or down to one: a worker
     free when a store is handed starts it there, a busy one later. Refuses a
-    log with no step record beside it, or none of whose stores a line hands."""
+    log with no step record beside it, none of whose stores a line hands, or
+    whose offset starts a store more than `STORE_START_SLACK_S` before the
+    line ahead of its handing line exits, before it can have been handed: the
+    mode then sits on stores that queued."""
     path = Path(log).parent / OFFLOAD_STEPS
     if not path.is_file():
         raise ValueError(
@@ -927,26 +934,34 @@ def _store_copies(log, copies, chunk: int) -> tuple[float, np.ndarray]:
         for s in json_file.read_jsonl(path)
         if "t_enter_ns" in s and not s.get("is_dummy_run")
     ]
-    handed = {}
-    for s in lines:
+    handed = {}  # store -> (its handing line's enter, the line ahead's exit)
+    for ahead, s in zip([None, *lines], lines):
+        exited = -math.inf if ahead is None else ahead["t_exit_ns"] * 1e-9
         for req, kind, skip, toks in s.get("kv", ()):
             for whole in (toks, toks // chunk * chunk) if kind == "save" else ():
                 key = (str(req), skip // chunk * chunk, whole)
-                handed.setdefault(key, s["t_enter_ns"] * 1e-9)
+                handed.setdefault(key, (s["t_enter_ns"] * 1e-9, exited))
     # On the log's clock from its first end, in seconds a float holds to a
     # nanosecond and more.
     first = copies[0][-1]
     _, _, _, chunks, seconds, ends = map(np.array, zip(*copies))
     ends = (ends - first) * 1e-3
-    gaps = [
-        t - handed[c[:3]] for c, t in zip(copies, ends - seconds) if c[:3] in handed
+    starts = [
+        (t, *handed[c[:3]]) for c, t in zip(copies, ends - seconds) if c[:3] in handed
     ]
-    if not gaps:
+    if not starts:
         raise ValueError(
             f"{log}: no line of {path} hands one of its stores, so its clock "
             "cannot be set against the record's"
         )
-    offset = _half_sample_mode(gaps)
+    offset = _half_sample_mode([t - enter for t, enter, _ in starts])
+    early = sum(t - offset < exited - STORE_START_SLACK_S for t, _, exited in starts)
+    if early:
+        raise ValueError(
+            f"{log}: its clock's offset from {path} starts {early} of "
+            f"{len(starts)} stores before the line ahead of their handing line "
+            "exits: the offset sits on stores that queued"
+        )
     forwards = 1e-9 * np.array(
         sorted(
             (s["t_enter_ns"], s["t_exit_ns"])
