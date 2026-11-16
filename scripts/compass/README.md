@@ -937,26 +937,24 @@ cells fp8; the gap between the two is unmeasured on this pair.
 law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed
 experts sharded across TP and DSpark with 5 speculative tokens, on one MI455 A0 node: the
 `history` form with host laws, keyed by the platform its `platform` states, fitted by `compass fit
-steps` and `compass fit host` on `calibrate.sh` records at ATOM 9653adb6a, taken in the image
-and aiter of that stack ([#2462](https://github.com/jgong5/ATOM/issues/2462)). The records
-are concurrency 1, 4, 16, 64 and 256, then 8, 12 and 56 from each trajectory's first turn
-for rungs 7, 8, 12 and 56: at c=256 every decode step runs at rung 64. The c=256 and
-first-turn c=56 records were taken later, for
-[#2544](https://github.com/jgong5/ATOM/issues/2544), each by `calibrate.sh`'s record step
-alone, and both fits were run again on every record. Each server ran with `ENABLE_CK=0
-GPU_ARCHS=gfx1250 ATOM_ENGRAM_UVA=0 AITER_LOG_LEVEL=WARNING OMP_NUM_THREADS=4
+steps` at ATOM ed5fa7697 and `compass fit host` at a tree that places `L_mtp` on the drifting
+host and device clocks ([#3096](https://github.com/jgong5/ATOM/issues/3096)), on `calibrate.sh`
+records at ed5fa7697, taken in the image and aiter of that stack
+([#2765](https://github.com/jgong5/ATOM/issues/2765)). The records are concurrency 1, 4, 16
+and 64, then 8, 12 and 56 from each trajectory's first turn for rungs 7, 8, 12 and 56. No
+c=256 record is in it: that take stalled the node
+([#2922](https://github.com/jgong5/ATOM/issues/2922)), so decode rungs past 24 rest on the
+first-turn c=56 record. Each server ran with `ENABLE_CK=0
+GPU_ARCHS=gfx1250 ATOM_ENGRAM_UVA=1 ATOM_ENGRAM_UVA_HBM=1 AITER_LOG_LEVEL=WARNING OMP_NUM_THREADS=4
 ATOM_DISABLE_MMAP=true AITER_REUSE_IDENTICAL_COMM_GROUPS=1`, `NCCL_MIN_NCHANNELS` unset, and
 `SERVER_ARGS` of `--trust-remote-code -tp 4 --kv_cache_dtype bf16 --index-cache-dtype fp8
 --method dspark --num-speculative-tokens 5 --gpu-memory-utilization 0.9
 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --block-size 16 --level 0
 --max-num-seqs 64 --cudagraph-capture-sizes [1,2,3,4,5,6,7,8,12,16,24,32,40,48,56,64]
---max-model-len 262144`; the law's engine config holds `AITER_LOG_LEVEL`, `OMP_NUM_THREADS`
-and `ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072`, so a run sets them too. A fresh container compiles Triton variants of
-`_unit_table_kernel`, `_indices`, `_swa_write_kernel` and
-`_gemm_a16w16_bandwidth_bound_kernel` record after record, so unscored records at each
-concurrency, and a call of `atom/model_ops/deepseek_v41/unit_table.py::unit_table` per
-variant on tile buffers as `ScoreWorkspace` sizes them, came first; a record that still
-built one was taken again.
+--max-model-len 262144 --spec-decode-acceptance-length 3`; the law's engine config holds
+`AITER_LOG_LEVEL`, `OMP_NUM_THREADS` and `ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072`, so a
+run sets them and passes the acceptance length too. A record that built a Triton variant was
+taken again; no record of the law built one.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json` is the same law for
 cell A, TP4 with whole-expert EP4: fitted alike on one `calibrate.sh` run's records at ATOM
