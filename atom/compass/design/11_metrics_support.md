@@ -705,7 +705,7 @@ names CI's collector (`collect_metrics.py`) as a real run's report.
 ```
  openai_server ... (no --compass-run) -> the run file variable unset -> spec() is None
    engine_core.py -> compass_run.engine_loop(engine): no run -> push_metrics unwrapped
-   api_server.py  -> compass_run.frontend(config):    no run -> update unwrapped
+   llm_engine.py  -> compass_run.frontend(config):    no run -> update unwrapped
    ATOM's ModelRunner: GPUForwardMetrics times real device events, if the user set
      ATOM_ENABLE_METRICS_DEVICE_TIMER (drive/run.py does not run)
  -> no sampler, no metrics-<lp>.om.gz, no report
@@ -720,9 +720,8 @@ when `spec()` returns a run file; no ATOM engine or frontend file changes.
 One sampler per side in the frontend, rendering its whole registry at each refresh, as
 CI's Prometheus scrapes it: one hook and one file per side instead of one per sampler. It
 breaks `01` D3's rule that LPs interact only through timestamped channels, since the render
-reads the engines' and workers' files off the channels,
-so a sample's content is not the state at its instant and differs between two runs of the
-same inputs; and on #3498's run it adds 28 to 72 s to a side's 761 wall seconds (D74,
+reads the engines' and workers' files off the channels, so a sample's content is not the
+state at its instant and differs between two runs of the same inputs; and on #3498's run it adds 28 to 72 s to a side's 761 wall seconds (D74,
 *Revised*, Rejected).
 
 ### Low confidence
