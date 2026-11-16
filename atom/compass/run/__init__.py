@@ -3293,8 +3293,8 @@ def _write_client_run(run: dict, a: _RecordingAuthority, k: int, hand_ins=None):
         hand_ins = _read_hand_ins(run, here, True)
     since = _read_hand_ins(run, out / CLIENT_DIR.format(k - 1), False) if k else {}
     record = a.ended[k]
-    before = a.wall(k - 1) if k else 0.0
-    summary = _summary(run, a, record, a.wall(k), hand_ins, since, before)
+    since_wall = a.wall(k - 1) if k else 0.0
+    summary = _summary(run, a, record, a.wall(k), hand_ins, since, since_wall)
     summary["client_run"] = {"index": k, "start": record.start, "end": record.end}
     hits = {
         n: _in_force_from(h["hit_counters"], record.start)
@@ -3308,11 +3308,11 @@ def _write_client_run(run: dict, a: _RecordingAuthority, k: int, hand_ins=None):
 
 
 def _summary(
-    run: dict, a, record, wall: float, hand_ins: dict, since: dict, before=0.0
+    run: dict, a, record, wall: float, hand_ins: dict, since: dict, since_wall=0.0
 ) -> dict:
     """The summary of `record`, the authority or one client run, over the steps
-    the hand-ins count beyond those in `since`; `before` is the part of `wall`
-    the client runs `since` counts served."""
+    the hand-ins count beyond those in `since`; `since_wall` is the part of
+    `wall` the client runs `since` counts served."""
     from atom.compass.backends.cost import GROUPS
 
     reasons = Counter(r for h in hand_ins.values() for r in h["refusals"])
@@ -3357,7 +3357,7 @@ def _summary(
         if w := h.get("priced", {}).get("group_waited_seconds"):
             gone = since.get(n, {}).get("priced", {}).get("group_waited_seconds")
             lookups, pricing = (a - b for a, b in zip(w, gone or (0, 0)))
-            rest = wall - before - lookups - pricing
+            rest = wall - since_wall - lookups - pricing
             waited[n] = {"lookups": lookups, "pricing": pricing, "rest": rest}
     if waited:
         summary["cost"]["group_waited_seconds"] = waited
