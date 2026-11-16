@@ -38,6 +38,7 @@ from atom.compass.artifacts import (
     keyed_platform,
     member_name,
 )
+from atom.compass.drive import reuse
 from atom.compass.run import memory
 
 #: A candidate with no readings at its key in the store, and one with them,
@@ -75,14 +76,21 @@ def _readings_at_another_digest(store, config) -> None:
     )
 
 
-@pytest.mark.parametrize("readings", ["none", "at another digest"])
+@pytest.mark.parametrize(
+    "readings", ["none", "at another digest", "without the PAGE bound"]
+)
 def test_a_calibration_publishes_into_the_shared_store_unless_it_holds_its_readings(
-    tmp_path, stubbed, readings  # noqa: F811
+    tmp_path, stubbed, readings, monkeypatch  # noqa: F811
 ):
     store = tmp_path / "store"
+    config = resolved(stubbed.config, ["--max-num-seqs", "12"])
     if readings == "at another digest":
-        config = resolved(stubbed.config, ["--max-num-seqs", "12"])
         _readings_at_another_digest(store, config)
+    if readings == "without the PAGE bound":
+        # Readings at the head's digest that a start of the config finds
+        # stale, as an fp4 DeepSeek-V4.1 start finds readings with no PAGE bound.
+        publish_readings(store, config)
+        monkeypatch.setattr(reuse, "stale_page_bound", lambda read, _: "no PAGE")
 
     found = advise(tmp_path, {"a": READ, "b": UNREAD})
 
