@@ -31,6 +31,7 @@ from atom.compass import run as compass_run
 from atom.compass.run import metrics
 from atom.metrics.exporter import AtomMetricsExporter
 from atom.metrics.gpu import GPUForwardMetrics
+from atom.metrics.request import RequestMetrics, StreamMetrics
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.utils import clock
 from atom.utils.distributed import utils
@@ -177,10 +178,10 @@ def _held(exposition: str) -> dict:
     }
 
 
-def _of_table(held: dict) -> dict:
-    """`held`, by instant, of the sampler's families alone."""
+def _of_table(held: dict, kind: str) -> dict:
+    """`held`, by instant, of the families a `kind` LP's sampler writes alone."""
     return {
-        t: {k: v for k, v in at.items() if k[0] in metrics.FAMILIES}
+        t: {k: v for k, v in at.items() if k[0] in metrics.FAMILIES[kind]}
         for t, at in held.items()
     }
 
@@ -245,7 +246,8 @@ def _engine(files, started, side, loop):
     a decode between metrics pushes at 0, 1 and 2 s, the worker's device times
     landing at the push after them, as ATOM's push polls its workers. Another
     engine's scheduler and an unclassified gauge in the engine's own process
-    observe too. `loop(push, steps)` runs inside `engine_loop`, `steps()` the
+    observe too, and the engine's process holds the API server's latency
+    instruments, as a spawned process importing the server's module does. `loop(push, steps)` runs inside `engine_loop`, `steps()` the
     pushes at 0 and 1 s and the steps around them; returns the engine's runtime
     and what ``/metrics`` held just before each push."""
     worker, another = (values.MultiProcessValue(lambda p=p: p) for p in (WORKER, OTHER))
@@ -255,6 +257,7 @@ def _engine(files, started, side, loop):
         other = SchedulerMetrics(7)
     scheduler = SchedulerMetrics(0)
     unclassified = Gauge("atom:unclassified", "No class.", registry=None)
+    RequestMetrics(None), StreamMetrics(None)
     rt = started("engine", side)
     pushed, held = [], {}
     core = SimpleNamespace(
@@ -323,11 +326,12 @@ def test_an_engine_writes_what_its_processes_held_at_each_push(
     # Another engine's series, which ``/metrics`` holds too, are not this one's.
     ours = {
         t: {k: v for k, v in at.items() if ("dp_rank", "7") not in k[2]}
-        for t, at in _of_table(held).items()
+        for t, at in _of_table(held, "engine").items()
     }
     assert written == _first_holding(ours)
-    assert any(("dp_rank", "7") in k[2] for k in _of_table(held)[2.0])
-    assert any(k[0] == "atom:unclassified" for k in held[2.0])
+    assert any(("dp_rank", "7") in k[2] for k in _of_table(held, "engine")[2.0])
+    for family in ("atom:unclassified", "atom:time_to_first_token_seconds"):
+        assert any(k[0] == family for k in held[2.0])
     # The worker's device time of the prefill landed after the push at 1 s,
     # and the decode's after the one at 2 s.
     count = "atom:gpu_forward_seconds", "atom:gpu_forward_seconds_count"
@@ -436,7 +440,7 @@ def test_a_frontend_writes_what_it_held_at_each_refresh(
     _, lp, role = SIDES[side]
     written = _instants(tmp_path / metrics.FILE.format(lp), role, lp)
     print(f"\n{lp}: {sum(map(len, written.values()))} samples at {list(written)}")
-    assert written == _of_table(held)
+    assert written == _of_table(held, "frontend")
     assert any(k[0] == "atom:requests_running" for k in held[2.0])
     assert {k[0] for k in written[2.0]} == {
         "atom:scheduler_requests",
@@ -456,7 +460,7 @@ def test_a_stopped_frontend_keeps_what_it_sampled(started, files, tmp_path):
     every refresh it took."""
     _, held = _frontend(started, None, stop="SIGTERM")
     written = _instants(tmp_path / "metrics-frontend.om.gz", "standalone", "frontend")
-    assert written == _of_table(held)
+    assert written == _of_table(held, "frontend")
     said = json.loads((tmp_path / "lp-frontend.json").read_text())
     assert said["stopped"] == "SIGTERM"
 

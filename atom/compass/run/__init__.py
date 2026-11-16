@@ -1498,7 +1498,7 @@ def frontend(config):
     rt.client_run_ended = lambda k: _frontend_hand_in(run, rt, k)
     from atom.compass.run import metrics
 
-    rt.sampler = metrics.Sampler(rt, metrics.ROLES[side], lp.name)
+    rt.sampler = metrics.Sampler(rt, "frontend", metrics.ROLES[side], lp.name)
     metrics.sample_frontend(rt.sampler)
     return _start_on_leaving(rt)
 
@@ -1662,7 +1662,7 @@ def engine(config):
         _park_before_dispatch()
     rt = _runtime(lp, run, _member, _PublishedClock)
     rt.sampler = metrics.Sampler(
-        rt, metrics.ROLES[side], _frontend_lp(config, run).name
+        rt, "engine", metrics.ROLES[side], _frontend_lp(config, run).name
     )
     inner = _ignoring_sigterm_from_ready(_named(_start_on_leaving(rt)))
     if _member is not None:

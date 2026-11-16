@@ -11,8 +11,9 @@ A sample reads no other LP's process, and makes no clock call: one that moved
 its LP's clock is refused. Each point carries the LP clock it was taken at,
 seconds from the run's start.
 
-Only `FAMILIES` is written, each series once per sample but those of `ONCE`,
-with the labels CI's scrape gives the side's series (`Sampler`). The LP writes
+Only `FAMILIES` is written, each family by the LP that observes it, each
+series once per sample but those of `ONCE`, with the labels CI's scrape gives
+the side's series (`Sampler`). The LP writes
 its samples when it hands in for the last time, before its hand-in, as
 OpenMetrics 1.0 under gzip, the file whole or not at all (`Sampler.write`).
 """
@@ -32,32 +33,40 @@ from prometheus_client.samples import Sample
 
 from atom.utils import clock
 
-#: Each family a sampler writes, with the class of its value: ``S`` state read
-#: when sampled, ``E`` a tally of events, ``D`` a duration whose observation
-#: takes the simulated clock. A family not here is written by no sampler.
+#: Each family a sampler writes, by the kind of LP whose sampler writes it, with
+#: the class of its value: ``S`` state read when sampled, ``E`` a tally of
+#: events, ``D`` a duration whose observation takes the simulated clock. A
+#: family not here is written by no sampler, and one here by no other kind's:
+#: every engine and worker process also holds the API server's latency
+#: instruments, unobserved, made as the spawned process imports the server's
+#: module.
 FAMILIES = {
-    # The frontend's snapshot of its engines.
-    "atom:scheduler_requests": "S",
-    "atom:scheduler_kv_cache_blocks": "S",
-    "atom:prefix_cache_cached_tokens": "E",
-    "atom:prefix_cache_full_tokens": "E",
-    "atom:prefix_cache_offload_tokens": "E",
-    # The frontend's own.
-    "atom:time_to_first_token_seconds": "D",
-    "atom:inter_token_latency_seconds": "D",
-    # An engine's scheduler.
-    "atom:request_queue_time_seconds": "D",
-    "atom:pd_kv_transfer_seconds": "D",
-    "atom:decode_batch_size": "E",
-    "atom:prefill_request_tokens": "E",
-    "atom:prefill_batch_tokens": "E",
-    "atom:prefill_context_tokens": "E",
-    "atom:decode_context_tokens": "E",
-    "atom:prefill_request_context_tokens": "S",
-    "atom:decode_request_context_tokens": "S",
-    # An engine's workers.
-    "atom:gpu_forward_seconds": "D",
-    "atom:prefill_request_gpu_forward_seconds": "D",
+    "frontend": {
+        # Its snapshot of its engines.
+        "atom:scheduler_requests": "S",
+        "atom:scheduler_kv_cache_blocks": "S",
+        "atom:prefix_cache_cached_tokens": "E",
+        "atom:prefix_cache_full_tokens": "E",
+        "atom:prefix_cache_offload_tokens": "E",
+        # Its own.
+        "atom:time_to_first_token_seconds": "D",
+        "atom:inter_token_latency_seconds": "D",
+    },
+    "engine": {
+        # Its scheduler's.
+        "atom:request_queue_time_seconds": "D",
+        "atom:pd_kv_transfer_seconds": "D",
+        "atom:decode_batch_size": "E",
+        "atom:prefill_request_tokens": "E",
+        "atom:prefill_batch_tokens": "E",
+        "atom:prefill_context_tokens": "E",
+        "atom:decode_context_tokens": "E",
+        "atom:prefill_request_context_tokens": "S",
+        "atom:decode_request_context_tokens": "S",
+        # Its workers'.
+        "atom:gpu_forward_seconds": "D",
+        "atom:prefill_request_gpu_forward_seconds": "D",
+    },
 }
 #: Families whose each series is written once, at the first sample that holds
 #: it: a request's context length, set once per request.
@@ -74,12 +83,13 @@ _ORDER = {"_bucket": 0, "_count": 1, "_sum": 2}
 
 
 class Sampler:
-    """The series of LP runtime `rt`'s processes, labelled as CI's scrape
-    labels its side's: ``job="atom"``, ``observer="api"``, the side's `role`
-    and as ``instance`` the side's frontend LP."""
+    """The series of the `FAMILIES` of `kind`, ``frontend`` or ``engine``, that
+    LP runtime `rt`'s processes hold, labelled as CI's scrape labels its
+    side's: ``job="atom"``, ``observer="api"``, the side's `role` and as
+    ``instance`` the side's frontend LP."""
 
-    def __init__(self, rt, role: str, instance: str) -> None:
-        self.rt = rt
+    def __init__(self, rt, kind: str, role: str, instance: str) -> None:
+        self.rt, self.written = rt, FAMILIES[kind]
         self.labels = {"job": "atom", "observer": "api"}
         self.labels |= {"role": role, "instance": instance}
         # By family: its header, and by series its samples' names and labels
@@ -100,7 +110,7 @@ class Sampler:
             rt.refusals.append(f"clock:{why}")
             raise RuntimeError(f"{rt.me}: {why}")
         for m in metrics:
-            if m.name not in FAMILIES:
+            if m.name not in self.written:
                 continue
             head = m.name, m.documentation, m.type, m.unit
             _, series = self.families.setdefault(m.name, (head, {}))
@@ -191,7 +201,7 @@ def sample_frontend(sampler: Sampler) -> None:
     from atom.metrics.exporter import AtomMetricsExporter
 
     update = AtomMetricsExporter.update
-    names = {f + suffix for f in FAMILIES for suffix in ("", "_total")}
+    names = {f + suffix for f in FAMILIES["frontend"] for suffix in ("", "_total")}
     pid = os.getpid()
 
     @functools.wraps(update)
