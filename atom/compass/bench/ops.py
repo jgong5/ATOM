@@ -2787,7 +2787,7 @@ def _ring(geometry, pages, captured):
     is the one whose ring a pool of some count of pages starts where the
     capture's does, refused where no layer's does, or several layers' do and
     start apart on `pages`."""
-    found = set()
+    found = {}
     for build in (geometry.window, geometry.window_bytes)[: 1 + geometry.window_fp8]:
         first = build(0, 0)
         if dataclasses.replace(first, ring_start=captured.ring_start) != captured:
@@ -2801,13 +2801,14 @@ def _ring(geometry, pages, captured):
                 range(max(start, 0) + 1), start, key=lambda n: build(0, n).ring_start
             )
             if build(layer, p) == captured:
-                found.add(build(layer, pages))
+                found[build(layer, pages)] = layer
     if len(found) != 1:
         raise ValueError(
             f"{len(found) or 'no'} layers' window rings start where the "
             f"capture's {captured} does on some pool"
         )
-    return found.pop()
+    [ring] = found
+    return ring
 
 
 def _held(runner, registry) -> dict[str, torch.Tensor]:
