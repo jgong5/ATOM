@@ -21,6 +21,12 @@ coefficient is not derivable from geometry within 25%
 runs simulated, a CPU tier per rank beside ATOM's real scheduler half and HBM prefix cache
 (D13.1).
 
+**Revised 2026-11-16 by the
+[Ruling on #3505](https://github.com/jgong5/ATOM/issues/3505#issuecomment-6906616314):**
+a store copy makes no progress while a prefill forward runs on its rank, so its end moves
+past the priced seconds of each one it is in flight for, and `store_s` is fitted on each
+copy's seconds less the prefill seconds it overlapped (D13.1).
+
 **Depends on:** `02_model_runner_and_cost_backend.md` (the runner that must answer
 `get_num_blocks` and `allocate_kv_cache`).
 
@@ -216,6 +222,15 @@ are simulated.**
   beside its step law. Each rank runs its saves and its loads on queues as wide as
   `OFFLOAD_COPY_WORKERS` and `OFFLOAD_LOAD_WORKERS`, and a copy completes at its priced
   end.
+- **A store stalls in a prefill forward**
+  ([Ruling on #3505](https://github.com/jgong5/ATOM/issues/3505#issuecomment-6906616314)).
+  A store copy makes no progress while a prefill forward runs on its rank: its end moves
+  past the priced seconds of each prefill forward it is in flight for. `store_s` is
+  fitted on each record copy's seconds less the prefill seconds it overlapped, from the
+  record's stamped forwards, each equation divided by the copy's fitted price, those
+  seconds included (`09` D53). A load overlapped by a prefill slows by a part of it only
+  ([#3505](https://github.com/jgong5/ATOM/issues/3505)), and `load_s` keeps each load's
+  whole seconds.
 
 ### Consequences
 
@@ -225,8 +240,9 @@ are simulated.**
   running arms side by side (#3256).
 - The GPU and CPU hit rates are ATOM's own counters, kept by the real prefix cache and the
   real scheduler half (`08` D45.1).
-- Not modelled: a copy's contention with the forward it overlaps. The arm's law pools
-  records with the tier on and off, so it carries that contention only on average.
+- Not modelled: a forward's contention with the copies it overlaps, or a load's partial
+  slowing in a prefill forward. The arm's law pools records with the tier on and off, so
+  it carries the forward's side only on average.
 - A tier below the CPU's, LMCache's local disk, is refused by name.
 
 ---
@@ -603,7 +619,7 @@ for the model — which is the per-term rule above, not the aggregate.
 | # | Decision | Date |
 |---|---|---|
 | D13 | Do not simulate the KV pool. Stub `allocate_kv_cache`; ATOM's real `BlockManager`, `BlockPool`, prefix index and `plan_pools` run unmodified. | 2026-09-18 |
-| D13.1 | `lmcache_offload`, ruled by the owner: a capacity-bounded CPU tier per rank keyed by 256-token chunks, evicting by ATOM's SLRU policy with its protected share; lookup over every rank takes the minimum hit, synchronous and priced; store and load priced per chunk from measured device-to-host and host-to-device rates; ATOM's scheduler half and HBM's SLRU prefix cache run as real code. | 2026-11-12 (#3257) |
+| D13.1 | `lmcache_offload`, ruled by the owner: a capacity-bounded CPU tier per rank keyed by 256-token chunks, evicting by ATOM's SLRU policy with its protected share; lookup over every rank takes the minimum hit, synchronous and priced; store and load priced per chunk from measured device-to-host and host-to-device rates, a store's end moved past each prefill forward it is in flight for and `store_s` fitted on its seconds less them; ATOM's scheduler half and HBM's SLRU prefix cache run as real code. | 2026-11-12 (#3257); revised 2026-11-16 (a store stalls in a prefill forward, #3505) |
 | D14 | Substitute the five device readings, reuse ATOM's budget arithmetic and `plan_pools`. Compass models a dedicated device; that is a stated scope boundary. | 2026-09-18 |
 | D15 | The device specification is an input artifact authored outside Compass, carrying capacity, compute, bandwidth, interconnect and derate factors. It is echoed into every run artifact. The runtime memory constants, activations included, are `measure memory`'s `memory_readings` entries, per configuration, which a run refuses without; an assumed entry's terms are declared and `run.json` lists its assumption. | 2026-09-18; revised 2026-10-14 (#851); 2026-10-16 (#1226) |
 | D16 | Validate every non-KV memory term individually, never as a sum. Keep ATOM's graph-pool estimator and the measured one as two separate functions. Revised: one source per term. Weights come from a meta build in the simulated runner at the deployment's group widths. Activations come from a coefficient keyed by architecture, `config.json` sha256 and tensor-parallel width, with the scratch inside it and a geometry form as fallback, until the liveness walk lands. The graph pool reserves for the deployment's own capture mode, and the per-term check is wired. Activations from the `memory_readings` entry, with no geometry form. | 2026-09-18; revised 2026-10-10 and 2026-10-16 (#965) |

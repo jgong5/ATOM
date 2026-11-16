@@ -20,6 +20,9 @@ the rank's `Engine` over the rank's `Tier`. Each load and save that
 wide as the worker's `load_workers` or `save_workers`, and the worker runs it
 at its priced end: the entry's ``load_s`` or ``store_s``, ``[fixed, per
 chunk]`` seconds, over the chunks it copies, and nothing for a copy of none.
+A store copy makes no progress while a prefill forward runs: its end moves
+past each one it is in flight for, which `watch_forwards` tells the shell of,
+from the forward's call to its priced seconds later (`OffloadShell.prefilled`).
 `process_completions` reports what the ranks' `get_finished`, aggregated over
 the TP group, gave at the previous call, since the engine's aggregation
 answers one poll behind.
@@ -52,6 +55,7 @@ torch.
 
 from __future__ import annotations
 
+import bisect
 import collections
 import contextlib
 import dataclasses
@@ -116,6 +120,34 @@ def substitute() -> None:
         "scheduler_module": "atom.compass.kv.lmcache_mp",
         "scheduler_class": "MultiShell",
     }
+
+
+def watch_forwards(engine) -> None:
+    """Tell each simulated tier of `engine` the prefill forwards its runner
+    prices: a forward whose batch prefills runs from the clock at its call to
+    the reply's ``predicted_s`` later. A no-op for an engine with none."""
+    from atom.utils import clock
+
+    kv = getattr(getattr(engine, "scheduler", None), "kv_connector", None)
+    shells = [
+        h
+        for h in getattr(kv, "_connectors", None) or [kv]
+        if isinstance(h, OffloadShell)
+    ]
+    if not shells:
+        return
+    call, rt = engine.runner_mgr.call_func, clock.installed()
+
+    def calling(name, *args, **kwargs):
+        start = rt.now
+        reply = call(name, *args, **kwargs)
+        seconds = getattr(reply, "predicted_s", None)
+        if name == "forward" and seconds is not None and args[0].total_seqs_num_prefill:
+            for shell in shells:
+                shell.prefilled(start, start + seconds)
+        return reply
+
+    engine.runner_mgr.call_func = calling
 
 
 def check_entry(entry) -> None:
@@ -428,8 +460,14 @@ class OffloadShell:
             {"load": [0.0] * r.load_workers, "save": [0.0] * r.save_workers}
             for r in self._ranks
         ]
-        self._due: list = []  # (end, order, rank, kind, request)
+        # Per kind: (end, order, rank, request, queued, start, chunks), a store's
+        # end and start on its lanes' clock, which runs only outside prefill.
+        self._due: dict[str, list] = {"load": [], "save": []}
         self._order = itertools.count()
+        # Each prefill forward's start on the store lanes' clock, and the
+        # prefill seconds before each one, then in all.
+        self._prefill_starts: list[float] = []
+        self._prefilled = [0.0]
         self._copied = {
             kind: collections.Counter(copies=0, chunks=0, seconds=0.0, waited=0.0)
             for kind in ("load", "save")
@@ -458,34 +496,59 @@ class OffloadShell:
         now, lanes = self._rt.read_clock(), self._lanes[k][kind]
         chunks = self._chunks(kind, req)
         fixed, per_chunk = self._terms["load_s" if kind == "load" else "store_s"]
-        start = max(now, heapq.heappop(lanes))
+        # A store's lanes run on the clock less the prefill forwards so far.
+        at = now - self._prefilled[-1] if kind == "save" else now
+        start = max(at, heapq.heappop(lanes))
         end = start + (fixed + per_chunk * chunks if chunks else 0.0)
         heapq.heappush(lanes, end)
-        heapq.heappush(self._due, (end, next(self._order), k, kind, req))
-        if k == 0:
-            self._copied[kind].update(copies=1, chunks=chunks)
-            self._copied[kind]["seconds"] += end - start
-            self._copied[kind]["waited"] += start - now
-            logger.info(
-                "compass: lmcache_offload %s of %s, %d chunks: queued at %r, from "
-                "%r to %r",
-                kind,
-                req.req_id,
-                chunks,
-                now,
-                start,
-                end,
-            )
+        heapq.heappush(
+            self._due[kind], (end, next(self._order), k, req, now, start, chunks)
+        )
+
+    def prefilled(self, start: float, end: float) -> None:
+        """A prefill forward ran on every rank from `start` to `end`: each store
+        copy in flight then makes no progress, and ends that much later."""
+        self._prefill_starts.append(start - self._prefilled[-1])
+        self._prefilled.append(self._prefilled[-1] + end - start)
+
+    def _on_clock(self, t: float, queued: float) -> float:
+        """Store lane time `t` on the LP clock: past each prefill forward that
+        starts before it, so a store begun as a forward begins is in flight
+        through it, and never before `queued`."""
+        i = bisect.bisect_left(self._prefill_starts, t)
+        return max(queued, t + self._prefilled[i])
 
     def _run_due(self) -> None:
         """Run each copy whose priced end the clock has reached, as its rank's
-        worker runs it, in end order."""
-        now = self._rt.read_clock()
-        while self._due and self._due[0][0] <= now:
-            _, _, k, kind, req = heapq.heappop(self._due)
+        worker runs it, in end order: a store's end on its lanes' clock,
+        the LP clock less every prefill forward so far."""
+        now, due = self._rt.read_clock(), []
+        for kind, reached in (("load", now), ("save", now - self._prefilled[-1])):
+            heap = self._due[kind]
+            while heap and heap[0][0] <= reached:
+                end, order, k, req, queued, start, chunks = heapq.heappop(heap)
+                if kind == "save":
+                    start = self._on_clock(start, queued)
+                    end = max(start, self._on_clock(end, queued))
+                due.append((end, order, k, kind, req, queued, start, chunks))
+        for end, _, k, kind, req, queued, start, chunks in sorted(due):
             rank = self._ranks[k]
             run = rank._do_load_req if kind == "load" else rank._do_save_req
             rank._guard(kind, run, req)
+            if k == 0:
+                self._copied[kind].update(copies=1, chunks=chunks)
+                self._copied[kind]["seconds"] += end - start
+                self._copied[kind]["waited"] += start - queued
+                logger.info(
+                    "compass: lmcache_offload %s of %s, %d chunks: queued at %r, "
+                    "from %r to %r",
+                    kind,
+                    req.req_id,
+                    chunks,
+                    queued,
+                    start,
+                    end,
+                )
 
     def build_connector_meta(self):
         """ATOM's metadata, each rank's share of it queued as its worker takes
@@ -520,10 +583,11 @@ class OffloadShell:
 
     def has_pending_work(self) -> bool:
         held = self._held is not None and not self._held.is_empty()
-        return bool(self._due) or held or self._inner.has_pending_work()
+        due = self._due["load"] or self._due["save"]
+        return bool(due) or held or self._inner.has_pending_work()
 
     def offload_statistics(self) -> dict:
-        """ATOM's counters, rank 0's priced copies, and the tiers' counts
+        """ATOM's counters, rank 0's copies run, and the tiers' counts
         summed over the ranks, with what rank 0's tier holds."""
         tiers = collections.Counter()
         for tier in self._tiers:
