@@ -67,18 +67,18 @@ def test_a_run_s_runner_waits_as_its_token_processor_defers(
     assert charged == pytest.approx([n * price for n in prices])
 
 
-def test_under_dp_a_runner_that_reads_its_own_ids_leaves_before_its_draft(
+def test_under_dp_a_runner_that_reads_its_own_ids_leaves_after_its_draft(
     dp2,  # noqa: F811
 ):
     """Two DP ranks that do not defer, each a 5 ms target and a 2 ms draft
-    with no host laws: each queues its draft after it reads its ids, so both
-    leave at the group's target end, and the device ends after the draft."""
+    with no host laws: each queues its draft after it reads its ids and reads
+    the draft ids once it ends, so both leave at the group's device end."""
     backend = Drafted(5, 2)
     ranks = [runner(backend, dp_size=2, dp_rank=r) for r in (0, 1)]
     for r in ranks:
         r.compass_host = HostDeviceRecurrence({}, (), lambda: 0.0, defer=False)
     replies = dp2(*(lambda r=r: r.forward(prefill(8)) for r in ranks))
-    assert [x.predicted_s for x in replies] == pytest.approx([5e-3, 5e-3])
+    assert [x.predicted_s for x in replies] == pytest.approx([7e-3, 7e-3])
     assert [r.compass_host.ends[-1] for r in ranks] == pytest.approx([7e-3, 7e-3])
 
 
