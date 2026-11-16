@@ -4,7 +4,8 @@ store lacks is traced on the run's first GPU as that card reads, so its
 stepping and compute units pick the kernels, and `trace ops` holds an
 `--arch` beside `--gpu` to the card's. A point's second placement begins
 over the tentative state DeepSeek-V4.1's verify step left, which no sampler
-commits.
+commits, and each rung's least-mean ragged point under a drafter begins its
+verify step.
 """
 
 import os
@@ -115,3 +116,61 @@ def test_a_point_s_second_placement_begins_over_the_first_s_tentative_state(
     # ATOM's own refusal on the second placement, where no sampler committed
     assert refused.startswith("Commit the accepted prefix")
     assert placed == "placed twice"
+
+
+#: Cell B's decode ladder past one row.
+RUNGS = [2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 40, 48, 56, 64]
+#: Each rung's least-mean ragged point at 2048 tokens under 5 drafts, its rows
+#: as `point_rows` gives them, begun as one verify step on DeepSeek-V4.1's own
+#: cache, on the host of a declared gfx1250.
+VERIFY = """
+import sys
+from dataclasses import replace
+from atom.compass.capture import driverless
+driverless.install(sys.argv[1], "gfx1250")
+from atom.compass.bench import ops
+from atom.compass.capture.forward import decode
+from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+from atom.models.deepseek_v41.config import DeepseekV41TextConfig
+from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step, geometry
+config = DeepseekV41TextConfig(
+    hidden_size=64, head_dim=512, num_attention_heads=8, q_lora_rank=32,
+    o_groups=1, o_lora_rank=32, sliding_window=4, index_n_heads=32,
+    index_head_dim=32, index_topk=4, candidate_block_size=2,
+    candidate_topk_blocks=4, max_position_embeddings=32, num_hidden_layers=5,
+    num_nextn_predict_layers=0, compress_ratios=(0, 2, 2, 1, 1),
+    kv_source_layer_ids=(1, 3), index_source_layer_ids=(1, 3, 4),
+    candidate_source_layer_id=3)
+geo = replace(geometry(config), window_size=32, speculative_tokens=5)
+for rung in map(int, sys.argv[2:]):
+    at = (2048, ops._means(rung)[0])
+    rows = ops.point_rows(decode(rung), at, 1 << 20, 16, drafts=5)
+    spans, offset, block = [], 0, 0
+    for i, (query, context, _) in enumerate(rows):
+        n = -(-context // geo.block_size)
+        ids = tuple(range(block, block + n))
+        spans.append(PagedRequest(i, context - query, offset, query, i, ids))
+        offset, block = offset + query, block + n
+    try:
+        begin_step(PagedAttentionCache(geo, block, rung, "cpu"), spans, tentative=True)
+        print(rung, "begins")
+    except ValueError as refused:
+        print(rung, refused)
+"""
+
+
+def test_each_rung_s_least_mean_rows_under_a_drafter_begin_v41_s_verify(tmp_path):
+    # ATOM verifies a row's drafts only past a prefix, so each row past the
+    # first holds a cached token before the 6 tokens it verifies.
+    env = {**os.environ, "PYTHONPATH": str(TREE)}
+    done = subprocess.run(
+        [sys.executable, "-c", VERIFY, str(tmp_path), *map(str, RUNGS)],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        cwd=TREE,
+        env=env,
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    begun = done.stdout.strip().splitlines()[-len(RUNGS) :]
+    assert begun == [f"{rung} begins" for rung in RUNGS]

@@ -4084,7 +4084,8 @@ def test_each_rung_s_least_mean_point_under_a_drafter_reaches_its_leaves(
     rule, monkeypatch, rung, context  # noqa: F811
 ):
     # The least mean leaves a row past the first fewer tokens than the six it
-    # verifies, or none: it holds its six, so ATOM's rule builds the batch.
+    # verifies, or none: it holds a cached token and its six, so ATOM's rule
+    # builds the batch.
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
     monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
     drafting = rule(blocks=1 << 15, max_model_len=1 << 17, speculative_config=DSPARK5)
@@ -4108,16 +4109,17 @@ def test_each_rung_s_least_mean_point_under_a_drafter_reaches_its_leaves(
     assert "refused" not in record and built
     first, *rest = record["rows"]
     assert first == [6, context + 5, True]
-    assert len(rest) == rung - 1 and all(q == 6 <= c for q, c, _ in rest)
+    assert len(rest) == rung - 1 and all(q == 6 < c for q, c, _ in rest)
 
 
 @pytest.mark.parametrize(
     "spec, context, rows",
     [
         # 62 permille of 65536 over 16 rows leaves the 15 past the first none:
-        # each holds its token, or, under 5 drafts, the 6 it verifies.
+        # each holds its token, or, under 5 drafts, the 6 it verifies past a
+        # cached one.
         (None, (65536, 62), [[1, 65536, True]] + [[1, 1, True]] * 15),
-        (DSPARK5, (65536, 62), [[6, 65541, True]] + [[6, 6, True]] * 15),
+        (DSPARK5, (65536, 62), [[6, 65541, True]] + [[6, 7, True]] * 15),
         # 94 permille leaves them 2202 each, past either query.
         (None, (65536, 94), [[1, 65536, True]] + [[1, 2202, True]] * 15),
         (DSPARK5, (65536, 94), [[6, 65541, True]] + [[6, 2202, True]] * 15),
