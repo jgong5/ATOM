@@ -97,6 +97,14 @@ tests/test_benchmark_catalog.py
 # fails without a driver on nightly 20261026: Triton's arch probe finds `0 active
 # drivers` and aiter's fallback raises `No module named 'jax'`; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
 tests/test_deepseek_v4_wo_a_dequant.py
+# test_the_hook_serves_a_step_with_the_launcher_and_otherwise_the_own_forward
+# fails without a driver on nightly 20261103: `No HIP GPUs are available` in
+# torch.cuda.current_stream; pure upstream 58ba50180 fails the same, 78f682ef4
+tests/test_dsa_indexer_hook.py
+# fails without a driver on nightly 20261103: `torch.finfo() requires a
+# floating point input type`, aiter's fp8 dtype unresolved; pure upstream
+# 58ba50180 errors collecting it on `0 active drivers`, 78f682ef4
+tests/test_e8m0_online_blockscale.py
 # fails without a driver on nightly 20261026: Triton's arch probe finds `0 active
 # drivers` and aiter's fallback raises `No module named 'jax'`; pure upstream
 # e893780f4 + f6a0c132 fails the same, 3d5ad18d6
@@ -120,9 +128,18 @@ tests/test_minimax_m31_shared_fusion.py
 tests/test_mla_flydsl_gather_dispatch.py
 # fails at setup or call in aiter chip_info, `No gfx arch found in rocminfo output.` (no driver); nightly 20261013 CPU container, b5452da1a
 tests/test_mla_kv_shuffled.py
+# test_a_failed_megamoe_close_still_releases_everything fails in one process
+# over the suite on nightly 20261103: its runner stand-in has no
+# `structured_compile_executor`, which ModelRunner.exit reads; it passes alone;
+# pure upstream 58ba50180 fails the same in one process, 78f682ef4
+tests/test_model_runner_exit.py
 # test_batch_one_asks_for_the_ceiling fails without a driver on nightly
 # 20261026: `No HIP GPUs are available`; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
 tests/test_paged_attention_dispatch.py
 # fails at setup or call in aiter chip_info, `No gfx arch found in rocminfo output.` (no driver); new-image CPU container, 12849025b
 tests/test_sparse_indexer_fp4.py
+# 7 tests fail on nightly 20261103, which lacks google-re2 from ATOM's
+# structured-output extra: `No module named 're2'` in a subprocess; pure
+# upstream 58ba50180 fails the same 7, 78f682ef4
+tests/test_structured_schema.py
 # END MANUAL
