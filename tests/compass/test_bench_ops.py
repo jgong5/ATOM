@@ -1262,6 +1262,66 @@ def test_v41_index_leaves_rank_a_logits_plane_drawn_below_each_row_s_bound(
             assert row[:n].ne(0).all() and row[n:].eq(0).all()
 
 
+def test_a_v41_multi_cta_top_k_takes_its_bounds_and_ranks_a_plane_drawn_below_them(
+    monkeypatch,
+):
+    # gfx950's multi-CTA top-k at decode B=2: the page-wide one, a candidate
+    # list's and the pick's, on block maxima; no scorer or pick here
+    def top_k(width, logits, bounds):
+        return _leaf(
+            ops._MULTI,
+            ("logits", _t([2, width], logits)),
+            ("seq_lens", _t([2], bounds, dtype="torch.int32")),
+            ("stride0", width),
+        )
+
+    leaves = top_k(64, "metadata", "metadata"), top_k(32, "metadata", "activation")
+    leaves += (top_k(8, "activation", "activation"),)
+    taken = _v41_index(monkeypatch, [50, 20], leaves, decode(2), 64)
+
+    # rows seeing 50 and 20 compressed rows; the list keeps 26 and 20 of
+    # them, the pick ranks 7 and 3 blocks of 8
+    ends = [[50, 20], [26, 20], [7, 3]]
+    assert [call["seq_lens"].tolist() for call in taken] == ends
+    for call, bounds in zip(taken, ends[:2]):
+        for row, n in zip(call["logits"], bounds):
+            assert row[:n].ne(0).all() and row[n:].eq(0).all()
+    # a prefill of 256 past 1024 cached tokens ranks a plane as wide as its 40
+    # KV blocks, not the 8 it traced; a candidate list's stays as it was sized
+    leaves = top_k(8, "metadata", "metadata"), leaves[1]
+    taken = _v41_index(monkeypatch, [50, 20], leaves, prefill(256, 1), 1024)
+    assert [call["logits"].shape[1] for call in taken] == [40, 32]
+
+
+def test_a_v41_fp4_packed_multi_cta_top_k_takes_its_starts_and_ranks_from_them(
+    monkeypatch,
+):
+    # gfx950's multi-CTA top-k on V4.1's FP4 plane, its rows packed: a whole
+    # context's on its scorer's logits, the pick's on its block maxima
+    I32 = "torch.int32"
+    staged, ends = _t([2], "metadata", dtype=I32), _t([2], "activation", dtype=I32)
+
+    def top_k(width, bounds):  # each row the whole packed buffer
+        return _leaf(
+            ops._MULTI,
+            *[("logits", _t([2, width], "metadata", [0, 1])), ("seq_lens", bounds)],
+            *[("stride0", 0), ("row_starts", staged)],
+        )
+
+    records = []
+    monkeypatch.setattr(ops, "_journal", lambda path, got: records.extend(got) or got)
+    leaves = top_k(128, staged), top_k(16, ends)
+    whole, pick = _v41_index(monkeypatch, [50, 20], leaves, decode(2), 64, fp4=True)
+
+    # rows 64 columns and 8 blocks apart, a whole context's drawn from each start
+    run = whole["logits"][0]
+    assert whole["row_starts"].tolist() == [0, 64]
+    assert run[:50].ne(0).all() and run[64:84].ne(0).all()
+    assert run[50:64].eq(0).all() and run[84:].eq(0).all()
+    assert pick["row_starts"].tolist() == [0, 8] and pick["seq_lens"].tolist() == [7, 3]
+    assert records[1]["metadata"]["logits"] == "workspace._maxima"
+
+
 def test_each_copy_of_a_v41_index_leaf_ranks_a_logits_plane_of_its_own():
     # V4.1's FP8 plane, which ATOM's preparation leaves as it was, at three
     # placements of decode B=2: they share one clone of it

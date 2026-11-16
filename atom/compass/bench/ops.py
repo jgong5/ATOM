@@ -304,7 +304,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 39
+PROTOCOL = 40
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -514,6 +514,7 @@ V41_NAMES = {
     (_TOPK, "row_starts", "packed"): _OFFSETS,
     (_TOPK, "row_starts"): "step.visible.{ratio}",
     (_TOPK, "row_ends"): "step.visible.{ratio}",
+    (_MULTI, "row_starts", "packed"): _OFFSETS,
     (_MULTI, "seq_lens"): "step.visible.{ratio}",
     (_PICK, "seqLens"): "step.visible.{ratio}",
     (_FUSED, "plan_gpu"): _PLAN,
@@ -587,6 +588,7 @@ _V41 = "atom.model_ops.deepseek_v41"
 PAGE_WIDE = {
     _LOGITS: ("context_lens", "out_logits", "kv_indices", "max_model_len"),
     _TOPK: ("row_ends", "logits", "stride0"),
+    _MULTI: ("seq_lens", "logits", "stride0"),
     _PICK: ("seqLens", "logits", "stride0"),
     _MAXIMA: ("visible", "logits", "maxima", "blocks"),
     f"{_V41}.unit_table:unit_table": ("block_tables", "block_tables"),
@@ -599,6 +601,7 @@ PAGE_WIDE = {
 PACKED_ROWS = {
     (_FP4, "out"): ("row_ends", "out_offsets", None),
     (_TOPK, "logits"): ("row_ends", "row_starts", None),
+    (_MULTI, "logits"): ("seq_lens", "row_starts", None),
     (_MAXIMA, "logits"): ("visible", "packed.0", None),
     (_MAXIMA, "maxima"): ("visible", "packed.1", "block_size"),
 }
@@ -628,6 +631,9 @@ _WRITTEN = {
     (_TOPK, "logits"): "maxima",
     (_TOPK, "row_starts"): "context",
     (_TOPK, "row_ends"): "context",
+    (_MULTI, "logits"): "maxima",
+    (_MULTI, "row_starts"): "context",
+    (_MULTI, "seq_lens"): "context",
     (_PICK, "seqLens"): "context",
     (_MAXIMA, "packed.0"): "offsets",
     (_MAXIMA, "packed.1"): "block_offsets",
@@ -2472,7 +2478,7 @@ def _named(op, path, spec, pool, known=None) -> dict | None:
     role = (op["args"].get("self") or {}).get("role")
     if op["op"] == _ROPE:  # over one head a ratio's index keys, over more a query
         role = "key" if op["args"]["input"]["shape"][-2] == 1 else "query"
-    if op["args"].get("packed_rows"):  # a top-k whose rows start apart
+    if _packed(op):  # a top-k whose rows start apart
         role = "packed"
     wanted = V41_NAMES.get((*key, role), V41_NAMES.get(key, ()))
     wanted = wanted if isinstance(wanted, tuple) else (wanted,)
@@ -2570,8 +2576,9 @@ def _written(op, path) -> str | None:
     for a table or row bound ATOM stages, or another slot."""
     kind, args = _WRITTEN.get((op["op"], path)), op["args"]
     role = {s: v.get("role") for s, v in args.items() if isinstance(v, dict)}
-    listed = (role.get("context_lens") or role.get("row_ends")) == "activation"
-    packed = listed and bool(args.get("packed_rows"))  # FP4's pick's top-k
+    bound = role.get("context_lens") or role.get("row_ends") or role.get("seq_lens")
+    listed = bound == "activation"
+    packed = listed and _packed(op)  # FP4's pick's top-k
     if kind == "tiles":
         return "table" if listed else kind
     if kind in ("table", "starts"):  # FP4's: else its PAGE table, its sequences
@@ -2582,6 +2589,13 @@ def _written(op, path) -> str | None:
         return "block_offsets" if packed else None
     picks = role.get("logits") == "activation" or packed
     return "ends" if kind == "context" and picks else kind
+
+
+def _packed(op) -> bool:
+    """Whether the top-k `op` ranks packed rows, each from a start of its own:
+    the one-block kernel's told so, the multi-CTA one's given their starts."""
+    starts = op["op"] == _MULTI and op["args"].get("row_starts")
+    return bool(op["args"].get("packed_rows") or starts)
 
 
 def _candidates(ends, k) -> torch.Tensor:
