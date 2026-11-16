@@ -830,6 +830,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING", "1").lower()
         in ("1", "true")
     ),
+    # --- Device memory ---
+    # Cap the torch cache once the runner's graph capture ends, at what it then
+    # holds plus what is free, less 2% of the card
+    # (`atom/model_engine/torch_cache_cap.py`). 0 leaves it uncapped.
+    "ATOM_TORCH_CACHE_CAP": lambda: (
+        os.getenv("ATOM_TORCH_CACHE_CAP", "1").lower() not in ("0", "false")
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.

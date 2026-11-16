@@ -60,6 +60,7 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
+from atom.model_engine.torch_cache_cap import TorchCacheCap, cap_torch_cache
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
@@ -753,6 +754,10 @@ def _profile_runner_stage(method):
 
 
 class ModelRunner:
+    #: The torch cache cap `capture_cudagraph` set as startup ended; None
+    #: before, without graphs, or when ATOM_TORCH_CACHE_CAP is 0.
+    torch_cache_cap: TorchCacheCap | None = None
+
     def __init__(self, rank: int, config: Config):
         self.config = config
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
@@ -3507,6 +3512,8 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        if self.torch_cache_cap is not None:
+            self.torch_cache_cap.log_first_free()
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
         # otherwise wait out the previous forward's copies.
@@ -4277,6 +4284,8 @@ class ModelRunner:
                 f"{(usage_ratio - self.config.gpu_memory_utilization):.1%}. "
                 f"Consider reducing gpu_memory_utilization."
             )
+        # The graph pools are the last of this runner's startup allocations.
+        self.torch_cache_cap = cap_torch_cache(self.device, self.label)
 
         return time.time() - start_time, self.capture_sizes, _pool_bytes
 
@@ -4582,6 +4591,8 @@ class RapidServeModelRunner(ModelRunner):
     @_profile_runner_stage
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        if self.torch_cache_cap is not None:
+            self.torch_cache_cap.log_first_free()
         # Decode runs the model forward on a dynamically selected (optionally
         # CU-masked) stream so it doesn't contend with prefill on the shared
         # GPU; postprocess (sampling + async CPU copy) stays on the default

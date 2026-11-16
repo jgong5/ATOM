@@ -119,6 +119,12 @@ cannot affect a server that does not use the feature.
 | **ATOM_ONLINE_QUANT_STREAMING_THREADS** | int | `4` | Tail workers for H2D, per-module quantization, and source release. More workers increase overlap and in-flight memory; `0` runs finalization inline. |
 | **ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4** | bool | 0 (false) | Fuse an MXFP8 shared expert into MXFP4 routed experts (the Quark MXFP4 export of MiniMax-M3.1), so the MoE runs as one fused MoE with the shared expert as one more expert (129 experts, top-5). The shared expert is staged in MXFP8 while loading and re-quantized to MXFP4 after it, so it carries MXFP4 rounding error. Not supported with EPLB under all2all EP, with an `--online_quant_config` that re-quantizes the MoE, or across a weight reload. Off keeps the shared expert a separate MXFP8 MLP. Part of the compile cache key. |
 
+## Device memory
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_TORCH_CACHE_CAP** | bool | `1` | Cap each runner's torch cache when its graph capture ends, the last of its startup allocations: it may reserve what it then holds plus what is free on the card, less 2% of the card. Past the cap torch frees its cached blocks and retries instead of growing to the card's ceiling, where ROCr takes back the hardware queues' scratch and a spilling grid-barrier kernel (MoRI's EP combine) can wait for blocks that never start. The runner logs the cap and the first time torch frees its cache under it. A runner that captures no graph (`--enforce-eager`) is not capped. `0` leaves the cache uncapped. |
+
 ## Plugin mode
 
 | Variable | Type | Default | Description |
