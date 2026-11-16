@@ -424,7 +424,8 @@ def recorded_graphs(config) -> dict:
 def carry_response_ids() -> None:
     """Set a one-sequence request's `external_request_id` to its response id,
     the `request_id` of the API server function calling `add_request`, read
-    off its frame. A sequence with an id keeps it; a fan-out's get none.
+    off its frame, or off its caller's when `_submit_engine_requests` makes
+    the call. A sequence with an id keeps it; a fan-out's get none.
 
     A sequence whose `kv_transfer_params` carry a `transfer_id`, a decode
     instance's request, also gets a line ``{response_id, remote_dp_rank,
@@ -438,8 +439,10 @@ def carry_response_ids() -> None:
 
         def add_request(self, seqs, add=cls.add_request):
             if len(seqs) == 1 and seqs[0].external_request_id is None:
-                caller = sys._getframe(1).f_locals
-                seqs[0].external_request_id = caller.get("request_id")
+                caller = sys._getframe(1)
+                if caller.f_code.co_name == "_submit_engine_requests":
+                    caller = caller.f_back
+                seqs[0].external_request_id = caller.f_locals.get("request_id")
             params = (seqs[0].kv_transfer_params or {}) if len(seqs) == 1 else {}
             if params.get("transfer_id") is not None:
                 line = {
