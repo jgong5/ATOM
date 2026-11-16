@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """The machine spec: one document read against the field table, and its readers.
 
-The spec is held as a flat map from dotted path to checked value, so merging,
-validating and explaining are per-field operations.
+The spec is held as a flat map from dotted path to checked value, so composing a
+spec from its layers is a per-field operation.
 
 **The schema is closed.** A key with no row in the field table is refused where
 it sits. The stated version is read first, so a document written to a later
@@ -17,8 +17,7 @@ document.
 document from the checked values and `digest` fingerprints it, so an artifact
 can name the spec that produced it.
 
-`from_mapping` raises the first thing wrong; `_survey` under it yields every
-refusal and keeps walking, for `validate`.
+`from_mapping` raises the first thing wrong.
 """
 
 import hashlib
@@ -42,8 +41,8 @@ def field_origin(values: Mapping[str, Any], label: str, holder: str) -> dict:
         raise SpecRefusal(
             Rule.TOTALITY,
             f"{holder} is `mixed` and records no origin for `{label}`",
-            "rebuild it with `merge`, which writes `provenance.origins`; a "
-            "document of several origins cannot say which one a field has",
+            "record each field's origin in `provenance.origins`; a document "
+            "of several origins cannot say which one a field has",
         )
     return {"origin": stated, **values.get("provenance.subject", {})}
 
@@ -127,42 +126,32 @@ def _version(document: Mapping) -> None:
         )
 
 
-def _survey(node: Mapping, prefix: str, found: dict):
-    """Every key of a document, keeping what the table declares and yielding a
-    refusal for each key that it does not, or that states a field a second time.
+def _walk(node: Mapping, prefix: str, found: dict) -> None:
+    """Every key of a document, keeping what the table declares in `found` and
+    refusing the first key that it does not, or that states a field a second time.
     """
     for key, value in node.items():
         path = f"{prefix}.{key}" if prefix else str(key)
         if path in BY_PATH:
             if path in found:
-                yield SpecRefusal(
+                raise SpecRefusal(
                     Rule.SHAPE,
                     f"`{path}` is stated twice by this document, under two "
                     "spellings that resolve to the same field",
                     "a dotted key resolves to the nested path, so `a.b` and a "
                     "nested `b` under `a` are one field; state it once",
                 )
-                continue
             found[path] = value
         elif path in BLOCKS:
-            if isinstance(value, Mapping):
-                yield from _survey(value, path, found)
-            else:
-                yield SpecRefusal(
+            if not isinstance(value, Mapping):
+                raise SpecRefusal(
                     Rule.SHAPE,
                     f"`{path}` holds {value!r}, where the schema has a block",
                     "write the block's fields there",
                 )
+            _walk(value, path, found)
         else:
-            try:
-                refuse_unknown_key(path)
-            except SpecRefusal as refusal:
-                yield refusal
-
-
-def _walk(node: Mapping, prefix: str, found: dict) -> None:
-    for refusal in _survey(node, prefix, found):
-        raise refusal
+            refuse_unknown_key(path)
 
 
 @dataclass(frozen=True, slots=True)

@@ -40,23 +40,31 @@ COMMANDS = {
         "atom.compass.drive.measure_memory",
         "an engine start's memory readings [GPU]",
     ),
+    "measure device": (
+        "atom.compass.drive.measure_device",
+        "one node's probe record: its cards' attainable rates and floors [GPU]",
+    ),
     "fit steps": ("atom.compass.fit.steps", "a step-level backend's fit"),
     "fit ops": (
         "atom.compass.fit.ops",
         "a price_list from measure ops's measurements",
     ),
     "fit host": ("atom.compass.fit.host", "the host laws, fitted on real runs"),
+    "fit device": (
+        "atom.compass.fit.device",
+        "a platform's readings, from probe records or another device's",
+    ),
     "run": ("atom.compass.drive.run", "a simulated serve"),
     "project": (
         "atom.compass.validate.project",
         "real runs' steps priced analytically on another device, published as a projection",
     ),
+    "advice": (
+        "atom.compass.advice.__main__",
+        "a space file's candidates and their points, written into OUT",
+    ),
 }
 OPS = "the op-level half of the toolchain is not built yet"
-MACHINE = (
-    "machine specs are maintained by developers, one per supported machine; "
-    "pass one with --machine"
-)
 #: Each command that refuses, to why and where its work is.
 REFUSED = {
     "trace": "there is no bare trace: use compass trace steps or compass trace ops",
@@ -69,9 +77,6 @@ REFUSED = {
         "bound check python -m atom.compass.validate.bound, and a projection "
         "compass project"
     ),
-    "explain": "deprecated: " + MACHINE,
-    "probe": "deprecated: " + MACHINE,
-    "spec": "deprecated: " + MACHINE,
     "measure collectives": "deprecated: collectives are priced by compass measure ops",
     "discover": "deprecated: renamed compass trace steps",
 }

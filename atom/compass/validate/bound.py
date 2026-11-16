@@ -2,10 +2,13 @@
 """`python -m atom.compass.validate.bound`: the analytical price, at most the
 measured device time on every measured step, at step and at op level.
 
-    python -m atom.compass.validate.bound --model M [--tp N] --machine SPEC
-        [--ratios-from SPEC] --store S [--ops DIR] RECORD... [-- ATOM args]
+    python -m atom.compass.validate.bound --model M [--tp N] --device DEV
+        --ptl PTL [--stack STACK] [--ratios-from DEVICE] --store S [--ops DIR]
+        RECORD... [-- ATOM args]
 
-A RECORD is a real run's directory, its step record in `steps/`. Each forward
+The spec is DEV's datasheet with the readings S holds for it at PTL
+(`fit.device.compose`). A RECORD is a real run's directory, its step record in
+`steps/`. Each forward
 there that is not a DP dummy run is priced at step level by the step roofline,
 over the modules `run.modules.walk` reads off the meta build ATOM's arguments
 configure and its block drafter's (`run.modules.drafter`), as a simulated run
@@ -19,14 +22,16 @@ Each price is compared with the step's device busy time,
 that samples a block drafter's draft-KV pass, `d_draft_kv_ns`, which runs
 before `forward_done_event`. On an MTP record only the target's price is
 compared, that pass's included; the drafter's is reported apart.
-With `--ratios-from`, the prices are --machine's datasheet peaks at the other
-spec's probed ratios (`project.projected`): run on a device's own records,
-the report is the error of projecting it from the other.
+With `--ratios-from`, the prices are DEV's datasheet peaks at the ratios of
+the readings S holds for DEVICE, a device name a datasheet states, as `compass
+fit device --assume-from` takes them (`fit.device.assumed_entry`): run on a
+device's own records, the report is the error of projecting it from the other.
 
 A data-parallel step (one with `moe_rows`) is read off every rank's line at
 that step: its `moe_tokens` is the group's scheduled tokens, a dummy rank's
-one, and under `--enable-tbo` its two-batch-overlap split is the one ATOM's
-prefill rule agrees over those lines (`_split`).
+one. Under `--enable-tbo` a step's two-batch-overlap split, one rank's
+included, is the one ATOM's prefill rule agrees over its ranks' lines
+(`_split`).
 
 Gate: a step priced above its measured time is a violation, named by its
 costliest term, an op kind (`op.<kind>`) or a module kind (`roofline.<kind>`).
@@ -51,8 +56,8 @@ the plan refused to measure is counted apart.
 
 Refused: a record whose engine block (`dp<r>.engine.json`, else the `engine`
 of `dp<r>.key.json`) states another TP width or KV cache format than ATOM's
-arguments resolve; two-batch overlap of decode steps or on one rank, whose
-split no step line states; a data-parallel step some rank's record lacks; a
+arguments resolve; two-batch overlap of decode steps, whose split no step
+line states; a data-parallel step some rank's record lacks; a
 step of an MTP record without `d_target_ns`, whose `d_busy_ns` holds the
 draft, which the gate does not compare. Refused too: a record, or an `--ops`
 run, whose engine block states another performance environment (`env`) than
@@ -133,7 +138,7 @@ def steps(record, tbo=False, mtp=False):
                 draft_rows=s.get("draft_rows"),
                 target_bs=s.get("target_bs"),
                 produces_output=s["produces_output"],
-                tbo_tokens=split if dp else None,
+                tbo_tokens=split,
                 moe_tokens=group if dp else None,
             )
             measured = s.get("d_target_ns", s["d_busy_ns"])
@@ -437,7 +442,7 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
     as a simulated run's (`run.op_graph`) over the op_graphs `store` holds for
     its arch. Refused: a record, or the `measure ops` run
     `ops`, that ran under another engine or other performance variables than
-    this process's; two-batch overlap no line splits."""
+    this process's; two-batch overlap of decode steps."""
     from atom.compass.backends.step_roofline import StepRooflineBackend
     from atom.compass.run import ep_width, op_graph, step_grid
     from atom.compass.run.modules import drafter, walk
@@ -446,12 +451,10 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
     with tempfile.TemporaryDirectory(prefix="compass-bound-") as tmpdir:
         config, tree = _build(model, tp, atom_args, arch, tmpdir)
         drafted = drafter(config)
-    dp = config.parallel_config.data_parallel_size
-    if config.enable_tbo_decode or config.enable_tbo and dp == 1:
+    if config.enable_tbo_decode:
         raise ValueError(
-            "two-batch overlap of decode steps or on one rank: no step line "
-            "states its split, and only a data-parallel group's prefill split "
-            "is rebuilt from the group's lines"
+            "two-batch overlap of decode steps: no step line states its split, "
+            "and only a prefill split is rebuilt from the step's lines"
         )
     engines = []
     for record in records:
@@ -500,14 +503,18 @@ def main(argv: list[str]) -> None:
     )
     p.add_argument("--model", required=True, help="a model name or directory")
     p.add_argument("--tp", type=int, default=1, help="tensor-parallel width")
-    p.add_argument("--machine", required=True, help="the machine spec")
+    p.add_argument("--device", required=True, help="the datasheet, SKU or path")
+    p.add_argument("--ptl", required=True, choices=("enabled", "disabled"))
+    p.add_argument("--stack", help="the readings' stack and torch, of several")
     p.add_argument(
         "--ratios-from",
-        metavar="SPEC",
-        help="price on --machine's datasheet peaks at this spec's probed ratios",
+        metavar="DEVICE",
+        help="price on --device's datasheet peaks at this device's probed ratios",
     )
     p.add_argument(
-        "--store", required=True, help="the artifact store holding the op_graphs"
+        "--store",
+        required=True,
+        help="the artifact store holding the op_graphs and the readings",
     )
     p.add_argument(
         "--ops",
@@ -517,16 +524,16 @@ def main(argv: list[str]) -> None:
     )
     args = p.parse_args(argv[:cut])
 
-    from atom.compass.spec import MachineSpec
+    from atom.compass.artifacts import ArtifactStore
+    from atom.compass.fit.device import assumed_entry, compose
+    from atom.compass.spec.layers import composed, datasheet
 
-    from .project import projected
-
-    def spec(path):
-        return MachineSpec.from_mapping(json.loads(Path(path).read_text()))
-
-    machine = spec(args.machine)
+    store = ArtifactStore(args.store)
     if args.ratios_from:
-        machine = projected(machine, spec(args.ratios_from))
+        key, entry, _ = assumed_entry(store, args.ratios_from, args.ptl, args.stack)
+        machine = composed(datasheet(args.device), key, entry)
+    else:
+        machine = compose(args.device, store, args.ptl, args.stack)
     config, ep, priced = backends(
         args.model,
         args.tp,

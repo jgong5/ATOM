@@ -35,12 +35,23 @@ each side costed at the law fitted under its engine config and checked against i
 engine's hand-in, `lp-engine-P.json` or `lp-engine-D.json`, at DP width above 1
 each rank's (`lp-engine-P.dp0.json`, a row per rank); `validate.runs` grades its
 schedule per side, its end to end once.
+
+Each cell graded then holds `grades.json`, the rows printed for it and each
+run's results as grading read them, by digest, and grading renders again the
+`report.html` of each of its runs that wrote one when it ended
+(`atom.compass.report.html`), so the report shows them until a run reruns.
+
+`python -m atom.compass.validate --curves OUT ARM...` draws instead each ARM's
+points, a directory each, as InferenceX draws agentic results: real and
+simulated curves as charts in OUT, and a verdict per point and metric, as
+`validate.curves` states.
 """
 
 from __future__ import annotations
 
 import functools
 import json
+import os
 import sys
 from pathlib import Path
 from statistics import median
@@ -53,6 +64,7 @@ from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.step_linear_fit import TOKEN_BANDS, token_band
 from atom.compass.backends.step_roofline import StepFallbackBackend, StepRooflineBackend
 from atom.compass.memory.check import MemoryRefusal, parts, place, spread
+from atom.compass.report import html
 from atom.compass.run import (
     CLIENT_DIR,
     ENGINE,
@@ -68,9 +80,11 @@ from atom.compass.run import (
     refuse_renamed_keys,
 )
 from atom.compass.run.step_grid import keyed_of, read
-from atom.compass.validate import cost, runs
+from atom.compass.validate import cost, curves, runs
 
 BANDS = [token_band(edge) for edge in (0, *TOKEN_BANDS)]
+#: A row's columns, as printed after its cell's name and kept in `html.GRADES`.
+COLUMNS = ("result", "metric", "value", "verdict")
 #: Cost rows' verdict per report group: the graded ones carry the gate.
 GATED = {
     "graded": "-",
@@ -229,16 +243,17 @@ def _law(run_file: dict, real: Path) -> dict:
 def _op_graph(side: Path):
     """The `OpGraphBackend` a `compass run --op-graph` server at `side`
     priced with: its run file under the ATOM arguments its command line served,
-    its graphs read under the performance environment its engine file states,
-    as its server read them, not this process's."""
+    resolved on its machine's device arch, its graphs read under the
+    performance environment its engine file states, as its server read them,
+    not this process's."""
     from atom.compass import run as compass_run
     from atom.compass.drive import run as drive_run
 
     run = read_json(side / "run.json")
     why = "an op graph is read under the ones its server ran"
     atom_args = _atom_args(side, run, why)
-    config = drive_run._config(atom_args)
     machine = compass_run._machine(run["run_file"])
+    config = drive_run._config(atom_args, machine.value("device.arch"))
     ep = drive_run._ep_width(atom_args, machine) if config.enable_expert_parallel else 1
     env = read_json(side / "steps/dp0.engine.json")["env"]
     return compass_run.op_graph(run["run_file"], config, machine, ep, env=env)
@@ -246,16 +261,26 @@ def _op_graph(side: Path):
 
 def _warm_over_cold(run_file: dict):
     """`measure ops`'s warm time over its cold one per op kind, over the
-    points the store holds at the key of the run file's price list."""
+    points the store holds for the run file's price list: of its model,
+    platform and source root, one on a process group at its layout too
+    (`bench.ops.point_key`)."""
+    from atom.compass.artifacts.keys import LAYOUT
+    from atom.compass.bench.ops import point_key
+
     store, fields, by = ArtifactStore(run_file["store"]), run_file.get(PRICE_LIST), {}
     folder = store.root / Kind.OP_MEASUREMENT.value
+    stated = {k: v for k, v in (fields or {}).items() if k not in LAYOUT}
+    layout = {k: v for k, v in (fields or {}).items() if k in LAYOUT}
     for path in sorted(folder.glob(f"[!.]*/{ENTRY_FILE}")) if fields else ():
         key = read_json(path)["key"]
-        if {k: v for k, v in key.items() if k != "point"} == fields:
-            entry = store.read(Key.of(Kind.OP_MEASUREMENT, **key))
+        if {k: v for k, v in key.items() if k != "point"} == stated:
+            entry = store.read(at := Key.of(Kind.OP_MEASUREMENT, **key))
             point = json.loads(
                 entry.read_member("point", entry.topology.ranks()[0], "json")
             )
+            ran = point["shape"], point["context"], point["leaf"]
+            if point_key(stated, layout, *ran, "exchange" in point) != at:
+                continue  # a point on a process group, at another layout
             by.setdefault(point["op"], []).append(point.get("warm_over_cold"))
     for op, ratios in sorted(by.items()):
         r = [x for x in ratios if x is not None]
@@ -352,15 +377,21 @@ def _odd_workloads(cell: Path, run: dict) -> dict:
     return odd
 
 
-def rows(cell) -> list[tuple]:
-    """The cell's rows, (result, metric, value, verdict), its verdict first."""
-    cell = Path(cell)
+def _runs_of(cell: Path) -> tuple[list[Path], list[Path]]:
+    """`cell`'s real runs and its simulated ones, each a directory."""
     real = sorted(r for r in cell.glob("real*") if r.is_dir())
-    if (cell / "law").is_dir():
-        raise ValueError(f"{cell} holds law/, a run directory now named step_linear/")
     simulated = [
         cell / k for k in (STEP_LINEAR, STEP_GRID, OP_GRAPH) if (cell / k).is_dir()
     ]
+    return real, simulated
+
+
+def rows(cell) -> list[tuple]:
+    """The cell's rows, (result, metric, value, verdict), its verdict first."""
+    cell = Path(cell)
+    if (cell / "law").is_dir():
+        raise ValueError(f"{cell} holds law/, a run directory now named step_linear/")
+    real, simulated = _runs_of(cell)
     if len(simulated) != 1:
         raise ValueError(
             f"{cell} holds {[s.name for s in simulated]} of step_linear/, "
@@ -417,10 +448,30 @@ def rows(cell) -> list[tuple]:
 
 
 def main(argv=None) -> None:
-    print("cell | result | metric | value | verdict")
-    for cell in sys.argv[1:] if argv is None else argv:
-        for row in rows(cell):
-            print(" | ".join((Path(cell).name, *row)))
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["--curves"]:
+        return curves.main(argv[1:])
+    print(" | ".join(("cell", *COLUMNS)))
+    for cell in map(Path, argv):
+        # Each run's digest before grading reads it: one that reruns meanwhile differs.
+        real, simulated = _runs_of(cell)
+        ran = {r.name: html.digest(r) for r in (*real, *simulated)}
+        graded = rows(cell)
+        for row in graded:
+            print(" | ".join((cell.name, *row)))
+        _write_grades(cell, ran, graded)
+
+
+def _write_grades(cell: Path, ran: dict, graded: list[tuple]) -> None:
+    """Keep `graded`, `cell`'s rows, in its `html.GRADES` with `ran`, each of
+    its runs' `html.digest`, then render again the report of each of those
+    runs that wrote one, which shows them."""
+    name = Path(os.path.abspath(cell)).name  # a cell given as `.` too
+    grades = {"cell": name, "runs": ran, "columns": COLUMNS, "rows": graded}
+    (cell / html.GRADES).write_text(json.dumps(grades, indent=1) + "\n")
+    for run in ran:
+        if (cell / run / html.FILE).is_file():
+            html.write(cell / run)
 
 
 if __name__ == "__main__":

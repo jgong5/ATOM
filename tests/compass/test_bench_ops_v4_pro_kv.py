@@ -45,6 +45,8 @@ COMPRESS = "aiter.ops.flydsl.kernels.fused_compress_attn:flydsl_fused_compress_a
 FILL = "atom.model_ops.v4_kernels.paged_prefill_indices:write_v4_paged_prefill_indices"
 #: Each layer's write of its window ring.
 SWA = "atom.model_ops.v4_kernels.state_writes:swa_write"
+#: Each CSA layer's translate of its indexer's top-k into its index list.
+PACK = "atom.model_ops.v4_kernels.csa_translate_pack:csa_translate_pack"
 
 
 def _rehearse(root, tokenizer, args, shape="--width 1"):
@@ -148,6 +150,24 @@ def test_the_prefill_index_leaves_take_the_buffers_atom_passes(rehearsed_prefill
             "kv_indptr_prefix": f"md.kv_indptr_prefix_{kind}+0",
             "kv_indices_extend": "md.kv_indices_extend+0",
             "kv_indptr_extend": "md.kv_indptr_extend+0",
+        }
+
+
+def test_the_prefill_top_k_translate_writes_the_csa_list_atom_passes(
+    rehearsed_prefill,
+):
+    """Each CSA layer's top-k translate reaches its launch writing the CSA
+    prefix list ATOM's builder made, at that list's indptr past each token's
+    window prefix: the extend list's indptr ends past it."""
+    packs = [r for r in rehearsed_prefill if r["op"] == PACK]
+    assert packs
+    for r in packs:
+        assert r["verdict"] == "reaches launch", r["why"]
+        slots = ("kv_indptr_csa", "kv_indices_csa", "skip_prefix_len_per_token")
+        assert {s: r["identity"].get(s) for s in slots} == {
+            "kv_indptr_csa": "md.kv_indptr_prefix_csa+0",
+            "kv_indices_csa": "md.kv_indices_prefix_csa+0",
+            "skip_prefix_len_per_token": "md.skip_prefix_len_csa+0",
         }
 
 

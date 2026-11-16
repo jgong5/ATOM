@@ -34,9 +34,10 @@ architecture and config.json digest, `--arch`, the engine config a step law is
 keyed by less its ladder, which holds ATOM's engine arguments and this
 process's performance environment (`run.step_grid.keyed`), the TP width, the DP
 and EP widths when set, the phase, the mode, whether the step produces
-output and whether it is a two-batch-overlap micro-batch) and by shape, which
+output and whether it is a two-batch-overlap micro-batch), by shape, which
 names the rows a DP group's MoE gathers only off its default, every rank at
-this one's tokens (`forward.Shape`):
+this one's tokens (`forward.Shape`), and by the ATOM source and torch it was
+traced under (`graph_key`):
 a prefill shape is published twice, as a middle chunk, which samples nothing,
 and as a final one. ATOM's engine arguments after `--`
 configure the engine as they would a server's; `--arch` names the declared
@@ -50,13 +51,15 @@ card. Its members are
 of a device and the operators it left out of the graph, each with why. A TP
 group's ranks run one graph, so rank 0's is the entry's. The declarations are
 process-global, so a process runs one capture, of every shape it was given.
-Trace in the environment of the run or bench that reads the graphs: a reader in
-another misses them, and its refusal names each field that differs.
+Trace in the environment, ATOM source and torch of the run or bench that reads
+the graphs: a reader under another misses them, and its refusal names each
+field that differs.
 """
 
 import argparse
 import dataclasses
 import datetime
+import functools
 import json
 import pathlib
 import tempfile
@@ -148,11 +151,14 @@ def population_steps(names, tbo=False, drafters=False):
     """Each step the record directories `names` hold, DP's dummy runs aside,
     as its shape, the one the op-level backend prices it at
     (`op_graph.step_shape`), with the rows its DP group's MoE
-    gathered (`moe_rows`), and its step-record line. A decode step verifies
+    gathered (`moe_rows`), and its step-record line, marked with how many of
+    its group's ranks ran the step as a dummy forward (`group_dummies`). A
+    decode step verifies
     as many drafts in each row as its shortest row does. Under two-batch
-    overlap (`tbo`, ATOM's `enable_tbo`) a DP step the group split, by the
-    rule `validate.bound` agrees over every rank's line at that step
-    (`bound._split`), is its two micro-batches (`step_roofline.micro_batches`),
+    overlap (`tbo`, ATOM's `enable_tbo`) a step its ranks split, one rank
+    included, by the rule `validate.bound` agrees over every rank's line at
+    that step (`bound._split`), is its two micro-batches
+    (`step_roofline.micro_batches`),
     each a prefill at its own tokens and the group's rows of it, marked a
     micro-batch (`forward.Shape`), its line holding its own rows. With
     `drafters`, a drafter's shape follows it where they differ: a decode's
@@ -161,6 +167,7 @@ def population_steps(names, tbo=False, drafters=False):
     replays no graph yet pads past its rows takes `target_bs` as its `width`."""
     from atom.compass.backends import BatchView, RequestShape
     from atom.compass.backends.op_graph import step_shape
+    from atom.compass.backends.step_labels import group_dummies
     from atom.compass.backends.step_roofline import micro_batches
     from atom.compass.validate.bound import _split
 
@@ -172,7 +179,7 @@ def population_steps(names, tbo=False, drafters=False):
             raise ValueError(f"{name} is not a record directory: it has no run.json")
         paths = sorted((path / "steps").glob("dp*[0-9].jsonl"))
         ranks = [[json.loads(t) for t in p.read_text().splitlines()] for p in paths]
-        dp, splits = len(ranks), {}
+        dp, splits, dummies = len(ranks), {}, group_dummies(ranks)
         if tbo and ranks:
             at = [{s["step"]: s for s in lines} for lines in ranks]
             for step in set.intersection(*map(set, at)):
@@ -180,9 +187,9 @@ def population_steps(names, tbo=False, drafters=False):
         for rank, line in ((r, s) for r, lines in enumerate(ranks) for s in lines):
             if line["is_dummy_run"]:
                 continue
+            line["group_dummies"] = dummies[line["step"]]
             rows = [(row[0], row[2]) for row in line["rows"]]
-            dp_step = line.get("moe_rows") is not None
-            split = splits.get(line["step"]) if dp_step else None
+            split = splits.get(line["step"])
             try:
                 drafts = min(q for q, _ in rows) - 1
                 phase, tokens, seqs = step_shape(rows, line["rung"], drafts)
@@ -214,10 +221,40 @@ def population_steps(names, tbo=False, drafters=False):
                     yield shape._replace(micro_batch=True), line | own
 
 
-def publish(store, graph, model, declared, tp, atom_args, command):
-    """Publish `graph` of `model` at TP `tp` as one `op_graph` in `store`."""
+@functools.cache
+def traced_under() -> dict:
+    """This process's ATOM source (`run.atom_source`) and torch, by axis: what
+    every `op_graph` it traces is keyed and fingerprinted under, and every one
+    it reads is looked up under. Read once, as a process traces and reads
+    under the code it imported."""
     import torch
 
+    from atom.compass.artifacts import Reading
+    from atom.compass.run import atom_source
+
+    return {"atom_src": atom_source(), "torch": Reading.stated(torch.__version__)}
+
+
+def graph_key(structure: str, shape: str):
+    """The key of the `op_graph` at `structure` and `shape` traced under this
+    process's ATOM source and torch (`traced_under`): a graph traced under
+    another of either is another entry, which a lookup here misses."""
+    from atom.compass import artifacts as a
+    from atom.compass.run import source_root
+
+    under = traced_under()
+    return a.Key.of(
+        a.Kind.OP_GRAPH,
+        structure=structure,
+        shape=shape,
+        source_root=source_root(under["atom_src"].value),
+        torch=under["torch"].value,
+    )
+
+
+def publish(store, graph, model, declared, tp, atom_args, command):
+    """Publish `graph` of `model` at TP `tp` as one `op_graph` in `store`, at
+    its `graph_key`."""
     from atom.compass import artifacts as a
     from atom.compass.artifacts.keys import NO_PTL
     from atom.compass.run import host_cpu
@@ -225,11 +262,7 @@ def publish(store, graph, model, declared, tp, atom_args, command):
     from .graph import to_json
 
     applicability = graph.applicability
-    key = a.Key.of(
-        a.Kind.OP_GRAPH,
-        structure=applicability.structure,
-        shape=applicability.shape,
-    )
+    key = graph_key(applicability.structure, applicability.shape)
     roots = a.roots_for({"atom": "atom", "aiter": "aiter"})
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     rank = next(iter(a.Topology().ranks()))
@@ -239,8 +272,7 @@ def publish(store, graph, model, declared, tp, atom_args, command):
         topology=a.Topology(),
         conditions=a.Conditions.of(
             software_stack=a.Reading.of_source_root(roots[1]),
-            torch=torch.__version__,
-            atom_src=a.Reading.of_source_root(roots[0]),
+            **traced_under(),
             model=model,
             device=declared["arch"],
             ptl=NO_PTL,

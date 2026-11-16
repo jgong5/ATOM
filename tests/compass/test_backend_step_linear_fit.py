@@ -10,11 +10,13 @@ time (`d_busy_ns`) the known law's price. The fitted law is read by
 import json
 import re
 import shutil
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from atom.compass.artifacts import Kind, keyed_platform, machine_platform
 from atom.compass.backends import (
     BatchView,
     CostRefused,
@@ -25,6 +27,7 @@ from atom.compass.backends import (
 )
 from atom.compass.backends.step_labels import BUILDS, label
 from atom.compass.backends.step_linear_fit import (
+    _fit_form,
     _solve,
     fit,
     fit_host,
@@ -33,6 +36,7 @@ from atom.compass.backends.step_linear_fit import (
     main,
     mark_held_out,
 )
+from atom.compass.spec import MachineSpec
 from atom.compass.validate.cost import cost_accuracy
 
 PREFILL = {"step": 0.02, "tokens": 6e-5, "query_square": 2e-10, "query_cached": 3e-10}
@@ -41,7 +45,25 @@ DECODE = {
     "2": {"step": 0.021, "context": 1e-7, "graph_padding": 4e-8},
     "4": {"step": 0.022, "context": 1.2e-7, "graph_padding": 3e-8},
 }
-SPEC = ("--machine-spec", "sha256:" + "0" * 64)
+
+
+def platform_arg(document: dict) -> tuple[str, str]:
+    """`--platform` for the platform the machine spec `document` states."""
+    platform = machine_platform(MachineSpec.from_mapping(document))
+    kinds = (Kind.STEP_LINEAR_LAW, Kind.HOST_LAWS)
+    return "--platform", json.dumps(
+        {k.value: keyed_platform(k, platform) for k in kinds}
+    )
+
+
+#: A committed machine spec's platform, which keys the laws the command writes here.
+SPEC = platform_arg(
+    json.loads(
+        (
+            Path(__file__).parents[2] / "tests/compass/machines/mi308x-hjbog39.json"
+        ).read_text()
+    )
+)
 
 
 def _price(rows, rung, history=0.0):
@@ -271,6 +293,53 @@ def test_a_rung_a_mad_pass_drops_entirely_gets_coefficient_zero():
     assert not solved["keep"][-2:].any()
     assert solved["coef"][2] == 0.0
     assert np.isfinite(solved["coef"]).all()
+
+
+def test_a_fit_at_the_pass_limit_ends_there_with_the_vector_it_reached(monkeypatch):
+    """Each step's label is the max of two ranks' prices under (1, 2, 3), one
+    label doubled. Unlimited, the passes settle at that law at the 11th and a
+    MAD round drops the doubled step. Limited to one pass, the first round
+    ends at the limit: the fit keeps the vector that pass reached, its `F`
+    the one recorded and below the start's, and runs no MAD round."""
+    from scipy.optimize import nnls
+
+    from atom.compass.backends import step_linear_fit
+
+    rng = np.random.default_rng(0)
+    x = np.ones((60, 2, 3))
+    x[..., 1] = rng.uniform(0, 1, (60, 2))
+    x[..., 2] = rng.uniform(0, 1, (60, 2))
+    y = (x @ [1.0, 2.0, 3.0]).max(axis=1)
+    y[7] *= 2.0
+    real = np.ones((60, 2), dtype=bool)
+    names = ["step", "context", "graph_padding"]
+
+    def cost(c):
+        return float((((x @ c).max(axis=1) / y - 1) ** 2).sum())
+
+    settled = _fit_form(x, real, y, names)
+    passes = settled["passes"]
+    assert (passes["start"], passes["count"], passes["stop"]) == (
+        "all_rows",
+        11,
+        "settled",
+    )
+    assert settled["coef"] == pytest.approx([1.0, 2.0, 3.0], rel=1e-9)
+    assert np.flatnonzero(~settled["keep"]).tolist() == [7]
+
+    monkeypatch.setattr(step_linear_fit, "FIT_PASSES", 1)
+    limited = _fit_form(x, real, y, names)
+    passes = limited["passes"]
+    assert (passes["start"], passes["count"], passes["stop"]) == (
+        "all_rows",
+        1,
+        "limit",
+    )
+    assert limited["keep"].all()
+    assert passes["F"] == pytest.approx(cost(limited["coef"]), rel=1e-9)
+    start = nnls((x / y[:, None, None]).reshape(-1, 3), np.ones(120))[0]
+    assert passes["F"] < cost(start)
+    assert limited["coef"] != pytest.approx([1.0, 2.0, 3.0], rel=1e-3)
 
 
 def test_the_command_writes_a_law_a_run_file_can_carry(tmp_path, capsys):
@@ -562,7 +631,8 @@ def test_a_launch_a_first_use_compile_stalls_is_named_and_left_out_with_the_next
     but 106's twice, and the decode after each enters 0.9% late, inside the MAD floor,
     as its period takes up the stall. Decode 251's launch runs 6 times its law,
     decode 151's 3 times: a decode's launch counts as a compile only past
-    `WARM_FACTOR`, a prefill's whenever the fit drops it above its law."""
+    `WARM_FACTOR`, a prefill's whenever the fit drops it above its law.
+    Decode 151's launch stays in its law, which drops no sample."""
     jit = list(range(102, 142, 4))
     scale = {(n, "W_launch"): 20 for n in jit} | {(n + 1, "E"): 1.009 for n in jit}
     scale |= {(106, "W_launch"): 2, (151, "W_launch"): 3, (251, "W_launch"): 6}
@@ -572,8 +642,12 @@ def test_a_launch_a_first_use_compile_stalls_is_named_and_left_out_with_the_next
     assert list(report["jit_steps"].values()) == [sorted(jit + [251])]
     for kind, segments in HOST.items():
         for segment, c in segments.items():
+            if (kind, segment) == ("decode", "W_launch"):
+                continue
             got = host["laws"][kind][segment]
             assert got == pytest.approx(c, rel=1e-4, abs=1e-12), f"{kind}.{segment}"
+    assert report["decode.W_launch"]["dropped"] == 0
+    assert host["laws"]["decode"]["W_launch"][0] > HOST["decode"]["W_launch"][0]
 
 
 def test_records_under_two_host_keys_are_refused(tmp_path):
@@ -804,17 +878,17 @@ def test_a_run_refuses_host_laws_fitted_under_another_key(tmp_path, monkeypatch)
     from test_run_step_grid import deployment, publish, run_file
 
     from atom.compass import run as compass_run
-    from atom.compass.artifacts import machine_spec_digest
+    from atom.compass.artifacts import Kind, keyed_platform, machine_platform
     from atom.compass.spec import MachineSpec
 
     laws = {"decode": {"E": [1e-4, 0.0, 0.0]}}
-    spec = machine_spec_digest(MachineSpec.from_mapping(DOCUMENT))
+    spec = machine_platform(MachineSpec.from_mapping(DOCUMENT))
     cases = (("same", {}), ("other", {"host_cpu": "another cpu"}), ("none", None))
     for name, other in cases:
         (tmp_path / name).mkdir()
         r = deployment(tmp_path / name)
         publish(tmp_path / name, r)
-        key = dict(compass_run.host_key(r.config), machine_spec=spec)
+        key = compass_run.host_key(r.config) | keyed_platform(Kind.HOST_LAWS, spec)
         host = {"laws": laws}
         if other is not None:
             host["key"] = dict(key, **other)

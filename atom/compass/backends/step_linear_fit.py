@@ -3,7 +3,14 @@
 
 """The step linear law fitted from real step records.
 
-    python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K] [--engine FILE]
+    python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --platform JSON [--form FORM] [--moe-routing E,K] [--engine FILE]
+    python -m atom.compass.backends.step_linear_fit offload LOG... --out ENTRY
+    python -m atom.compass.backends.step_linear_fit figures RECORD... --law LAW [--source NAME] [--form FORM] [--moe-routing E,K] [--engine FILE]
+
+The second form fits a run file's ``lmcache_offload`` entry, beside the law of
+an arm whose records ran the connector, on those runs' server logs
+(`fit_offload`). The third writes the held-out figures (below) of the records
+into an existing law fitted on them (`figures_main`).
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
@@ -23,7 +30,8 @@ holds the runs it was fitted on, each vector's fit figures and hull, and, once
 
 The law states the records' `engine_config`, read from the `.engine.json`
 beside each (`engine_config`) or from `--engine FILE` in their place, and a run
-under another engine config refuses it. At its `data_parallel_size` N above 1
+under another engine config refuses it, records whose ladders are prefixes of
+the longest read at it (`step_grid_plan.pooled`). At its `data_parallel_size` N above 1
 (EP off) the records come in runs of
 N, each run's `dp0.jsonl` to `dp<N-1>.jsonl`. A step is its ranks' lines
 joined on step index, labelled with the smallest rank label (the others wait
@@ -38,24 +46,28 @@ is the max over its ranks, so each vector is fitted by max-affine regression
 (`_fit_form`): from the fit on every rank's row and from each feature's axis,
 the lowest after a first round going on, each pass refits on the row
 each step's price picks, a step line-searched until it lowers the squared
-relative error, until no step changes rank or the step's ranks tie; MAD drops
-rerun it. The vector's solve, warm steps and hull read each step's row at the
-rank it prices the step as (`priced_rank`); a decode rung that adopts a
-column (below) is fitted again under it. Each
+relative error, until no step changes rank, the step's ranks tie or the passes
+reach `FIT_PASSES`, reweighted until no price moves; MAD drops rerun it, short of that limit. The vector's solve, warm steps and hull read each step's row at the
+rank it prices the step as (`priced_rank`); so does each form a decode rung
+chooses among, MoE column and `rowmod` (below), and each held-out fold
+that chooses, which prices a step as the max over its ranks. Each
 vector reports, under `fit.all_rows`, the centre and scaled MAD of the fit on
 every rank's row, each step priced as its max over ranks, and under
-`fit.passes` the start, passes, how they stopped, `settled` or `tie`, and the
-squared error `F`; more than `FIT_PASSES` passes refuse the fit. A held-out
+`fit.passes` the start, passes, how they stopped, `settled`, `tie` or `limit`,
+and the squared error `F`; a fit at the limit keeps the vector it reached, the
+lowest `F` its passes found. A held-out
 step is priced and banded as its costliest rank.
 
 Records with a host key (`dp0.key.json`, from the real runner) also give the
 host laws as a run file's `host` entry: `key`, and `laws[kind][segment]`,
 seconds on `(1, tokens, seqs)`, fitted on the samples' host labels. They take
-the step linear law's solver, MAD drops and hulls; `seqs` in a fixed
+the step linear law's solver and hulls, and drop no sample (`_host_law`); `seqs` in a fixed
 proportion to `tokens` on every sample (equal, or a decode under MTP, where
-each row computes its drafts too) gets zero. Two keys refuse. The law and the
-host key state the `--machine-spec` digest, which a run's spec must match, and
-the host key's `engine` is the law's `engine_config`. A segment outside `HOST_SEGMENTS` is
+each row computes its drafts too) gets zero. Two keys refuse, ladders pooled
+first. The law, as
+`platform`, and the host key state the platform fields `--platform` gives for
+their kinds, `step_linear_law` and `host_laws`, which a run's spec must match,
+and the host key's `engine` is the law's `engine_config`. A segment outside `HOST_SEGMENTS` is
 fitted for a kind whose samples carry it: `W_inputs` and `L_mtp`, on an MTP
 record, and `W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
 solve drops above the law paid a first-use JIT compile (`_jit`): it and the
@@ -75,16 +87,19 @@ admits a request rather than charge it nothing, and the report says why under
 
 Under a launch provider that declares features (`launch_features`), a step it
 predicts otherwise than its line observed refuses, naming it; each host law
-adopts features as columns (`_launch_columns`), their coefficients under the
-entry's `columns[kind][segment]`, and `_jit` solves `W_launch` with every one.
+adopts features as columns on their held-out error per launch path
+(`_launch_columns`), their coefficients under the entry's
+`columns[kind][segment]`, and `_jit` solves `W_launch` with every one.
 
 The same solver fits the host entry's ``tokenizer`` term on a recorded
 server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
 HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
-requests, ``fixed_s`` from a burst, and ``bytes`` over every request's body.
+requests, ``fixed_s`` from a burst or else ``idle_s``, and ``bytes`` over every
+request's body.
 
-Each equation is divided by its own label and the coefficients are bound to be
-non-negative. Steps whose relative residual is more than `MAD_K` scaled MADs
+Each equation is divided by its price, from its label until no price moves
+(`_fit_form`), and the coefficients are bound to be
+non-negative. Steps whose relative residual, price less label over price, is more than `MAD_K` scaled MADs
 from the median are dropped and the rest refitted, until the kept set settles.
 The dropped steps that lead a record's steps of one vector, each slower than
 the law, are its warm steps (shape compiles and first touches), and so is a
@@ -103,7 +118,8 @@ out and named under `unfitted`; `StepLinearBackend` refuses its steps.
 
 On an MTP record a step also carries a draft label (`step_labels`). `fit` fits
 the steps that carry one on their draft labels the same way, and writes that law
-under the law's `draft`; it holds no `held_out`. A step with a propose label
+under the law's `draft`; it holds no `held_out` unless its records time a
+EAGLE3 drafter's passes (below). A step with a propose label
 (`step_labels`) is fitted there on its draft label less that label, the
 draft-KV pass a middle chunk runs too, and left out when nothing remains; the
 propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`,
@@ -115,6 +131,15 @@ sets the draft law's `output_prefill_kv`. The target's vectors fit the device
 label less the draft-KV label.
 On an MTP record both prefill vectors, the target's and the draft's, add
 `seqs` and `out` (`StepLinearLaw`).
+Records whose decodes time an EAGLE3 drafter's passes (`passes_s`) fit the
+draft law's `forward` vector instead, each pass a sample at its own features
+(`serial_passes`), with `passes` the count every such step ran, and its
+`propose` vector on what each decode's draft label holds past its passes; the
+draft law's prefill vector then fits the middle chunks alone, whose draft is
+the draft-KV pass, in the `base` form, and it has no decode or `draft_kv`
+vector. `mark_held_out`
+gives each of that draft law's vectors `held_out` as it gives the law's, on
+the steps each is fitted on.
 
 Records whose engine files state the prefill token-graph buckets their runner
 recorded (`PREFILL_BUCKETS`) fit a prefill vector that adds `padding` and
@@ -152,14 +177,25 @@ vector's `held_out`, the convex hull of the rows they were priced by, each
 step's costliest rank's, and their percentiles per band, which `StepLinearLaw`
 reads to mark a term validated. A cheaper rank's row is not hulled: no error was
 measured at it. A vector whose held-out steps span no hull gets none.
+The law and its report also state, under `figures`, per held-out run and kind
+(`prefill`, `decode`, and `draft` for a drafter's draft), `FIGURES` of that run's
+own steps priced by the law fitted on the others, as `validate.cost` grades a
+run, a step that law has no vector for entering none; under `prefill` and
+`decode`, `refused` counts those steps, their drafts refused with them
+(`fold_figures`). The command prints them. A law fitted
+on records with a host key states the ATOM digest they ran at, the key's
+``atom``, as `records_atom`, which re-keying the host key leaves as it is.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import itertools
 import json
 import math
+import re
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -172,7 +208,7 @@ from atom.compass.backends.shape import (
     sum_query_square,
     sum_tokens,
 )
-from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, keyed_of
+from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, keyed_of, pooled
 from atom.compass.backends.step_labels import CUTS, HOST_SEGMENTS, host_kind
 from atom.compass.backends.step_linear import (
     DECODE,
@@ -185,6 +221,7 @@ from atom.compass.backends.step_linear import (
     moe_column,
     moe_tokens,
     rowmod,
+    serial_passes,
     token_padding,
 )
 
@@ -194,9 +231,11 @@ MAD_K = 3.5
 #: A relative residual this small is never an outlier, however tight the rest.
 MAD_FLOOR = 0.01
 MAD_PASSES = 20
-#: Passes after which a max-affine fit whose error still falls refuses. Near a
-#: tie between ranks each line-searched pass gains little, so a fit that ends
-#: at a tie takes far more passes than one that settles.
+#: Passes after which a max-affine fit whose error still falls ends, at stop
+#: `limit`, keeping the vector it reached: every pass lowers the error, so that
+#: is the best it found. Near a tie between ranks each line-searched pass gains
+#: little, so a fit that ends at a tie takes far more passes than one that
+#: settles.
 FIT_PASSES = 10_000
 #: A step that ran this many times its price is a one-off first touch, not scatter.
 WARM_FACTOR = 5.0
@@ -218,6 +257,10 @@ TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
 #: What a forward that admits requests spends once, per prompt token past the
 #: prefix-cache hit and per token within it (`step_labels.admit_x`).
 ADMIT_FEATURES = ("admits", "uncached", "cached")
+#: The figures `validate.cost` grades a kind by that a held-out run's are written
+#: under: the steps graded, the error on their totals, the step that contributes
+#: most to it and the error holding that step out, and the median per step.
+FIGURES = ("steps", "on_totals", "held_out_step", "held_out", "median")
 #: Why a law fitted on records stating their prefill buckets nowhere has no `padding`.
 NO_BUCKETS = "no record states prefill buckets, so the prefill vector adds no padding"
 
@@ -337,6 +380,17 @@ def _admit_rows(samples, host) -> list[tuple]:
     ]
 
 
+def records_atom(samples) -> str | None:
+    """The ATOM digest `samples`' records ran at, their host keys' ``atom``;
+    None when no record has a host key. Records at two refuse."""
+    atoms = sorted(
+        {s.provenance["config"]["atom"] for s in samples if s.provenance["config"]}
+    )
+    if len(atoms) > 1:
+        raise ValueError(f"the records ran at {len(atoms)} ATOM digests: {atoms}")
+    return atoms[0] if atoms else None
+
+
 def label_records(records, dp: int = 1) -> tuple[list, dict]:
     """`records`, runs of `dp` ranks in rank order, as `step_labels` samples, each
     run named by its records' digests; and each record's table rows."""
@@ -365,7 +419,14 @@ def fit_host(samples) -> tuple[dict, dict]:
     """The host laws over `samples`, as a run file's `host` entry, and their report."""
     from scipy.spatial import QhullError
 
-    keys = sorted({json.dumps(s.provenance["config"], sort_keys=True) for s in samples})
+    held = {json.dumps(s.provenance["config"], sort_keys=True) for s in samples}
+    held = {k: json.loads(k) for k in held}
+    at = pooled({k: c["engine"] for k, c in held.items() if c})
+    keys = {
+        json.dumps(c and {**c, "engine": at[k]}, sort_keys=True)
+        for k, c in held.items()
+    }
+    keys = sorted(keys)
     if len(keys) != 1:
         raise ValueError(
             f"the records carry {len(keys)} host keys ({' / '.join(keys)}); "
@@ -511,7 +572,7 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
         else:
             report["unfitted"][kind] = f"{kind}'s calls take no time per token"
             continue
-        error = x @ coef / got[:, 1] - 1
+        error = 1 - got[:, 1] / (x @ coef)
         fitted["records"] = {
             str(p): np.percentile(error[record == i], [10, 50, 90]).tolist()
             for i, p in enumerate(paths)
@@ -644,8 +705,9 @@ def fit_intake(paths) -> tuple[dict, dict]:
     host-law solver on the lone requests' CPU seconds over their body bytes;
     ``bytes`` spans every request's body; ``fixed_s`` the loop's CPU time per
     request between template starts in the longest burst, less ``per_byte_s``
-    times its mean body, each gap the next request's. Raises on too few lone
-    requests or no burst."""
+    times its mean body, each gap the next request's, or ``idle_s`` where that
+    is negative or there is no burst, the report's ``fixed_s_is_idle_s`` saying
+    which. Raises on too few lone requests."""
     lone, bursts, bodies = [], [], []
     for path in paths:
         got = _intakes(path)
@@ -655,21 +717,25 @@ def fit_intake(paths) -> tuple[dict, dict]:
     nbytes, seconds = np.array(lone, dtype=np.float64).reshape(-1, 2).T
     x = np.column_stack([np.ones(len(nbytes)), nbytes])
     (idle, per_byte), report = _host_law(x, seconds, INTAKE_FEATURES)
+    term = {"per_byte_s": per_byte, "idle_s": idle, "bytes": [min(bodies), max(bodies)]}
     if not bursts:
-        raise ValueError(f"no burst among {len(lone)} lone requests")
+        report["fixed_s_is_idle_s"] = f"no burst among {len(lone)} lone requests"
+        return {"fixed_s": idle, **term}, report
     sizes, starts, cpu = np.array(max(bursts, key=len), dtype=np.float64).T
-    fixed = np.diff(cpu).mean() * 1e-9 - per_byte * sizes[1:].mean()
+    gap, body = np.diff(cpu).mean() * 1e-9, sizes[1:].mean()
+    fixed = gap - per_byte * body
+    if fixed < 0:
+        report["fixed_s_is_idle_s"] = (
+            f"the longest burst's {len(sizes) - 1} later requests take {gap:.3g} s "
+            f"of the loop's CPU each, less than per_byte_s {per_byte:.3g} times "
+            f"their mean body of {body:.0f} B, so fixed_s would be {fixed:.3g} s"
+        )
+        return {"fixed_s": idle, **term}, report
     report["burst"] = {
         "requests": len(sizes),
         "span_s": (starts[-1] - starts[0]) * 1e-9,
     }
-    term = {
-        "fixed_s": fixed,
-        "per_byte_s": per_byte,
-        "idle_s": idle,
-        "bytes": [min(bodies), max(bodies)],
-    }
-    return term, report
+    return {"fixed_s": fixed, **term}, report
 
 
 #: The host entry's ``hops`` `fit_hops` fits (`atom.compass.run.HOPS`).
@@ -709,6 +775,80 @@ def fit_hops(intakes, clients) -> tuple[dict, dict]:
         term[hop] = p10
         report[hop] = {"p10_s": p10, "p50_s": p50, "p90_s": p90, "messages": len(s)}
     return term, report
+
+
+#: ATOM's offload worker line naming its rank and a chunk's tokens and bytes.
+OFFLOAD_WORKER = re.compile(
+    r"offload worker rank=(\d+):.*? chunk=(\d+) gpu_staging_chunk_bytes=(\d+)"
+)
+#: ATOM's per-copy line under `OFFLOAD_PROFILE`: the chunks it copied and the
+#: milliseconds the worker thread spent on it.
+OFFLOAD_COPY = re.compile(
+    r"\[OFFLOAD-(SAVE|LOAD)-PROF\] .*? chunks=(\d+) .*? total_ms=([\d.]+)"
+)
+OFFLOAD_PERF = "[OFFLOAD-PERF] "
+
+
+def fit_offload(logs) -> tuple[dict, dict]:
+    """The run file's ``lmcache_offload`` entry, fitted on the server logs of
+    real runs `logs`, each at `OFFLOAD_PROFILE` (`atom.compass.kv.lmcache_offload`),
+    and its report.
+
+    ``chunk_size`` and ``chunk_bytes`` are what each worker logs at its start,
+    and ``tensor_parallel_size`` how many workers logged; logs that differ in
+    any refuse. ``store_s`` and ``load_s`` are fitted by the host-law solver on
+    each copy that moved a chunk: the worker thread's seconds for it on
+    ``(1, chunks)``. ``lookup_s`` is fitted on the scheduler's counters, which
+    it logs a minute apart: per minute with a lookup, the seconds its lookups
+    took on ``(lookups, chunks)``, chunks counted as the prompt tokens they
+    asked over the chunk size. The entry's ``fit`` holds the logs and the
+    report."""
+    workers, copies, lookups = {}, {"SAVE": [], "LOAD": []}, []
+    for log in logs:
+        perf = []
+        for line in Path(log).read_text(errors="replace").splitlines():
+            if m := OFFLOAD_WORKER.search(line):
+                workers.setdefault(log, {})[int(m[1])] = (int(m[2]), int(m[3]))
+            elif (m := OFFLOAD_COPY.search(line)) and int(m[2]):
+                copies[m[1]].append((1, int(m[2]), float(m[3]) * 1e-3))
+            elif OFFLOAD_PERF in line:
+                said = line.partition(OFFLOAD_PERF)[2].partition(" | ")[0]
+                perf.append(json.loads(said))
+        for a, b in itertools.pairwise(perf):
+            d = {k: b.get(k, 0) - a.get(k, 0) for k in b}
+            if d.get("lookup_n", 0) > 0:
+                lookups.append(
+                    (d["lookup_n"], d["lookup_prompt_tokens"], d["lookup_us"])
+                )
+    stated = {
+        (len(ranks), *geometry)
+        for ranks in workers.values()
+        for geometry in ranks.values()
+    }
+    if len(stated) != 1 or len(workers) != len(logs):
+        raise ValueError(
+            f"the logs state (workers, chunk, chunk bytes) {sorted(stated)}, and "
+            f"{len(logs) - len(workers)} state none; an entry is fitted on one"
+        )
+    [(tp, chunk, chunk_bytes)] = sorted(stated)
+    entry = {
+        "chunk_size": chunk,
+        "tensor_parallel_size": tp,
+        "chunk_bytes": chunk_bytes,
+    }
+    report = {}
+    for name, kind in (("store_s", "SAVE"), ("load_s", "LOAD")):
+        rows = np.array(copies[kind], dtype=np.float64).reshape(-1, 3)
+        entry[name], report[name] = _host_law(
+            rows[:, :2], rows[:, 2], ["fixed", "chunks"]
+        )
+    rows = np.array(lookups, dtype=np.float64).reshape(-1, 3)
+    x = np.column_stack([rows[:, 0], rows[:, 1] / chunk])
+    entry["lookup_s"], report["lookup_s"] = _host_law(
+        x, rows[:, 2] * 1e-6, ["lookups", "chunks"]
+    )
+    entry["fit"] = {"logs": [str(log) for log in logs], **report}
+    return entry, report
 
 
 def _alone(sent, got, returned=None) -> tuple[np.ndarray, np.ndarray]:
@@ -809,9 +949,11 @@ def _hop_messages(intake: Path, client) -> dict:
 
 def _host_law(x, y, names, offset=0.0, columns=()) -> tuple[list, dict]:
     """The host law on `names` over the forwards `x` labelled `y`, the part
-    `offset` of each label fixed, and its report. Raises on too few forwards or
-    no hull; with the last of `names` in a fixed proportion to the one before on
-    every forward, it gets zero. Each of `columns`, (feature, values), follows."""
+    `offset` of each label fixed, and its report. Every forward stays in the
+    fit: one slowed by an idle CPU is no outlier, and a MAD test cannot tell it
+    from scatter. Raises on too few forwards or no hull; with the last of
+    `names` in a fixed proportion to the one before on every forward, it gets
+    zero. Each of `columns`, (feature, values), follows."""
     x = np.array(x, dtype=np.float64).reshape(-1, len(names))
     if len(x) <= (k := len(names) + len(columns)):
         raise ValueError(f"{len(x)} forwards for {k} coefficients")
@@ -821,7 +963,7 @@ def _host_law(x, y, names, offset=0.0, columns=()) -> tuple[list, dict]:
         x[:, width] = 0.0
     wide = np.column_stack([x, *(v for _, v in columns)])
     names = [*names, *(f for f, _ in columns)]
-    s = _solve(wide, np.array(y), names, np.array(offset), names[0])
+    s = _solve(wide, np.array(y), names, np.array(offset), names[0], drops=False)
     hull = _hull(x[s["keep"]][:, 1:width], names[1:width])
     return s["coef"].tolist(), {
         "hull": hull,
@@ -853,7 +995,7 @@ def _jit(samples, features=()) -> set[tuple]:
             x[:, 2] = 0.0
         y = np.array([m.host["W_launch"] for m in members])
         solved = _solve(x, y, [*HOST_FEATURES, *features])
-        floor = 1 / WARM_FACTOR - 1 if kind == "decode" else 0.0
+        floor = 1 - WARM_FACTOR if kind == "decode" else 0.0
         jit |= {
             (m.provenance["run"], m.rank, m.step)
             for m, keep, r in zip(members, solved["keep"], solved["residual"])
@@ -865,20 +1007,24 @@ def _jit(samples, features=()) -> set[tuple]:
 def _launch_columns(members, features) -> tuple[list[str], dict]:
     """The `features` host-law `members` (`_host_rows`) adopt as columns, in
     order, and the report's `launch_columns`: each round's held-out error per
-    design tried (`_held_out_error`, each run held out). A round adds the
-    feature of least error while it is below the last design's. Members of one
-    run adopt none."""
+    design tried (`_held_out_error`, each run held out, its p50 taken per
+    launch path, its members of one value of every feature). One p50 over all
+    of a run's members is its commonest path's, which a column a rarer path
+    needs barely moves. A round adds the feature of least error while it is
+    below the last design's. Members of one run adopt none."""
     if not features:
         return [], {}
     x = np.array([r[2] for r in members], dtype=np.float64).reshape(-1, 3)
     if np.linalg.matrix_rank(x[:, 1:]) < 2:
         x[:, 2] = 0.0
     y, cell = np.array([r[3] for r in members]), np.array([r[4] for r in members])
+    paths = [[r[5][f] for f in features] for r in members]
+    path = np.unique(paths, axis=0, return_inverse=True)[1]
 
     def error(names):
         values = [[r[5][f] for r in members] for f in names]
         design = np.column_stack([x, *values])
-        return _held_out_error(_folds(design, y, cell, [*HOST_FEATURES, *names]))
+        return _held_out_error(_folds(design, y, cell, [*HOST_FEATURES, *names], path))
 
     adopted, rounds = [], [{"none": error([])}]
     while rounds[0]["none"] is not None and len(adopted) < len(features):
@@ -891,13 +1037,18 @@ def _launch_columns(members, features) -> tuple[list[str], dict]:
 
 
 def _solve(
-    x: np.ndarray, y: np.ndarray, names: list[str], offset=0.0, kept: str = "step"
+    x: np.ndarray,
+    y: np.ndarray,
+    names: list[str],
+    offset=0.0,
+    kept: str = "step",
+    drops: bool = True,
 ) -> dict:
-    """Non-negative least squares on relative error, MAD-dropped until settled;
-    `offset` is a fixed part of each label's price, outside the coefficients:
-    `_fit_form` on one row per step."""
+    """Non-negative least squares on relative error, MAD-dropped until settled
+    unless `drops` is false; `offset` is a fixed part of each label's price,
+    outside the coefficients: `_fit_form` on one row per step."""
     return _fit_form(
-        x[:, None], np.ones((len(y), 1), dtype=bool), y, names, offset, kept
+        x[:, None], np.ones((len(y), 1), dtype=bool), y, names, offset, kept, drops
     )
 
 
@@ -908,24 +1059,34 @@ def _fit_form(
     names: list[str],
     offset=0.0,
     kept: str = "step",
+    drops: bool = True,
 ) -> dict:
     """One form fitted by max-affine regression: step `i`'s label `y[i]` is the
     max over its ranks' rows `x[i, r]`, those `real[i, r]` holds, of their
     price, plus `offset`, a fixed part of it outside the coefficients.
 
-    `F(c) = sum_i ((max_r x_ir.c + offset_i) / y_i - 1)^2` over the kept steps.
+    `F(c) = sum_i ((max_r x_ir.c + offset_i - y_i) / s_i)^2` over the kept steps,
+    each equation divided by its scale `s_i`, its label in the first round.
     The start is the non-negative least-squares solve of every rank's row, each
     equation divided by its label. Each pass solves on the row each step's
     current price picks, a Gauss-Newton step on `F`, and halves it until `F`
     falls. The passes end settled, the solve picking the rows it was solved
     on, or at a tie between ranks, when no step that moves some price by more
-    than the square root of the float epsilon makes `F` fall; more than
-    `FIT_PASSES` passes in all raise. Each feature that differs between some
-    step's ranks is a start too, its axis scaled to the labels: the first
-    round runs from each start, every step kept, and the lowest `F` goes on.
-    Steps whose residual is more than
+    than the square root of the float epsilon makes `F` fall, or at the
+    limit, `FIT_PASSES` passes in all, keeping the vector they reached. Each
+    feature that differs between some step's ranks is a start too, its axis
+    scaled to the labels: the first round runs from each start, every step
+    kept, and the lowest `F` goes on, a start at the limit included. Each kept
+    step's scale then becomes its price under the vector reached and the passes
+    rerun, until no kept step's price moves by that epsilon of its scale:
+    iteratively reweighted least squares for a Gamma model with identity link,
+    so the law prices its steps' mean. A step's residual is its price less its
+    label, over its price. Steps whose residual is more than
     `MAD_K` scaled MADs from the median are then dropped and the passes rerun
-    from there, until the kept set settles or for `MAD_PASSES` rounds.
+    from there, until the kept set settles, for `MAD_PASSES` rounds, or until
+    the passes reach the limit; with `drops` false none is dropped. A kept step
+    priced at no time, which no equation can be divided by, ends the
+    reweighting, and a MAD round drops it.
 
     Returns the solve's figures: `pick`, each step's rank, at a tie the rank
     of larger features (`priced_rank`, prices folded as a run folds them);
@@ -935,8 +1096,8 @@ def _fit_form(
     from scipy.optimize import nnls
 
     n, width, k = x.shape
-    a, b = x / y[:, None, None], 1.0 - offset / y
-    flat = a.reshape(-1, k)
+    flat = x.reshape(-1, k)
+    scale = np.array(y, dtype=np.float64)
     # An intercept, a column whose name starts with `kept`, is kept whatever
     # its variance; any other constant column is not.
     vary = [
@@ -958,15 +1119,26 @@ def _fit_form(
     def price(c):
         return np.where(real, (flat @ c).reshape(n, width), -np.inf)
 
+    def priced(c):
+        return price(c).max(axis=1) + offset
+
+    def relative(c):
+        with np.errstate(divide="ignore"):
+            return 1.0 - y / priced(c)
+
     def cost(c):
-        return float(((price(c).max(axis=1) - b)[keep] ** 2).sum())
+        return float((((priced(c) - y) / scale)[keep] ** 2).sum())
 
     keep = np.ones(n, dtype=bool)
-    c, cols = solve(a[real], np.broadcast_to(b[:, None], real.shape)[real])
-    start = price(c).max(axis=1) - b
+    c, cols = solve(
+        (x / scale[:, None, None])[real],
+        np.broadcast_to(((y - offset) / scale)[:, None], real.shape)[real],
+    )
+    start = relative(c)
 
     def alternate(c, cols, on, passes):
-        """Passes from `c` over the kept steps until settled or at a tie."""
+        """Passes from `c` over the kept steps until settled, at a tie or at
+        the limit."""
         while True:
             pick = price(c).argmax(axis=1)
             picked = np.zeros_like(real)
@@ -974,21 +1146,33 @@ def _fit_form(
             if on is not None and (on[keep] == picked[keep]).all():
                 return c, cols, on, passes, "settled"
             if passes == FIT_PASSES:
-                raise ValueError(
-                    f"the alternation on {names} still moved after {FIT_PASSES} passes"
-                )
+                return c, cols, on, passes, "limit"
             passes += 1
-            full, solved = solve(a[steps, pick][keep], b[keep])
+            rows = x[steps, pick][keep] / scale[keep, None]
+            full, solved = solve(rows, ((y - offset) / scale)[keep])
             if (price(full).argmax(axis=1)[keep] == pick[keep]).all():
                 c, cols, on = full, solved, picked
             else:
                 d, f, t = full - c, cost(c), 1.0
-                moves = np.abs(price(full - c)[real & keep[:, None]]).max()
+                moved = price(full - c) / scale[:, None]
+                moves = np.abs(moved[real & keep[:, None]]).max()
                 while cost(c + t * d) >= f and t * moves > tol:
                     t /= 2
                 if t * moves <= tol:
                     return c, cols, on, passes, "tie"
                 c, cols, on = c + t * d, solved, picked if t == 1 else None
+
+    def reweight(c, cols, on, passes, stop):
+        """Each kept step's scale set to its price under `c` and the passes
+        rerun, until no kept step's price moves by `tol` of its scale, the
+        passes reach the limit or `c` prices a kept step at no time."""
+        while stop != "limit":
+            got, now = priced(c)[keep], scale[keep]
+            if (got <= 0).any() or (np.abs(got - now) <= tol * now).all():
+                break
+            scale[keep] = got
+            c, cols, on, passes, stop = alternate(c, cols, None, passes)
+        return c, cols, on, passes, stop
 
     # Each feature that differs between some step's ranks starts from its axis,
     # scaled by the median of each step's label over its largest value of it.
@@ -1009,11 +1193,17 @@ def _fit_form(
     for rounds in range(1, MAD_PASSES + 1):
         if rounds > 1:
             c, cols, on, passes, stop = alternate(c, cols, on, passes)
-        residual = price(c).max(axis=1) - b
+        c, cols, on, passes, stop = reweight(c, cols, on, passes, stop)
+        residual = relative(c)
         centre = np.median(residual)
         mad = 1.4826 * np.median(np.abs(residual - centre))
         moved = np.abs(residual - centre) <= max(MAD_K * mad, MAD_FLOOR)
-        if (moved == keep).all() or rounds == MAD_PASSES:
+        if (
+            not drops
+            or stop == "limit"
+            or (moved == keep).all()
+            or rounds == MAD_PASSES
+        ):
             break
         keep, on = moved, None
     pick = np.zeros(n, dtype=int)
@@ -1044,48 +1234,86 @@ def _fit_form(
     }
 
 
-def _folds(design, y, cell, names) -> dict:
+def _fit_vector(steps, vector: dict, routing) -> dict:
+    """`_fit_steps` of `steps` on the features `vector` names under
+    `coefficients`, as `_counts` counts them."""
+    return _fit_steps(
+        steps,
+        list(vector["coefficients"]),
+        lambda r: _counts(vector, routing, r[2], *r[5:]),
+    )
+
+
+def _folds(design, y, cell, names, path=None) -> dict:
     """Per record of `cell` beside which another holds rows, (its rows, the p50
-    error on them of the solve of `design` on the other records' rows)."""
+    error on them of the host-law solve of `design` on the other records'
+    rows, which drops none); given
+    `path`, a value per row, the same per record and value, keyed by both."""
     out = {}
     for c in sorted(set(cell.tolist())):
         other = cell != c
         if other.any():
-            coef = _solve(design[other], y[other], names)["coef"]
+            coef = _solve(design[other], y[other], names, drops=False)["coef"]
             error = design[~other] @ coef / y[~other] - 1.0
-            out[c] = (int((~other).sum()), float(np.median(error)))
+            if path is None:
+                out[c] = (int((~other).sum()), float(np.median(error)))
+                continue
+            held = path[~other]
+            for p in sorted(set(held.tolist())):
+                mine = error[held == p]
+                out[c, p] = (len(mine), float(np.median(mine)))
+    return out
+
+
+def _max_affine_folds(steps, vector: dict, routing) -> dict:
+    """Per record beside which another holds steps, (its steps, the p50 error
+    on them, each priced as the max over its ranks, of `_fit_vector` of
+    `vector` on the other records' steps)."""
+    cell = np.array([s[0][0] for s in steps])
+    out = {}
+    for c in sorted(set(cell.tolist())):
+        other = cell != c
+        if other.any():
+            fold = [s for s, o in zip(steps, other) if o]
+            coef = _fit_vector(fold, vector, routing)["coef"]
+            error = [
+                max(np.dot(coef, _counts(vector, routing, r[2], *r[5:])) for r in s)
+                / s[0][3]
+                - 1.0
+                for s, o in zip(steps, other)
+                if not o
+            ]
+            out[c] = (len(error), float(np.median(error)))
     return out
 
 
 def _held_out_error(folds: dict) -> float | None:
-    """`_folds`' held-out error: the mean of each record's held-out p50 error's
-    magnitude, weighted by its rows; None with no record held out."""
+    """The held-out error of `folds`, `_folds`' or `_max_affine_folds`': the
+    mean of each held-out p50 error's magnitude, a record's or a record's
+    path's, weighted by its rows or steps; None with no record held out."""
     rows = sum(n for n, _ in folds.values())
     return sum(n * abs(p) for n, p in folds.values()) / rows if rows else None
 
 
-def _moe_column(members, x, names, routing) -> tuple:
-    """The MoE column decode rung `members` adopts, or None, and the figures the
-    rule read, as the vector records them under `fit.moe_column`.
+def _moe_column(steps, routing) -> tuple:
+    """The vector decode rung `steps` adopts with a MoE column, or None, the
+    figures the rule read, as the vector records them under `fit.moe_column`,
+    and the held-out folds of the form adopted, a column or none.
 
-    `members` are the rung's `fit` rows, `x` their design over `names`. The
-    forms are no column and each of `MOE_COLUMNS` over the steps' real MoE
-    tokens, `moe_experts` under `routing` and with each step's group dummies
-    as one token (`moe_column`). Each form is solved with each record
-    held out of the rung's rows, its held-out error `_held_out_error`'s. The
-    form of smallest held-out error is picked, no column on a tie, and a
-    picked column is adopted, returned as (feature, column, solve). A rung of
+    `steps` are the rung's steps, each its ranks' `fit` rows. The forms are no
+    column and each of `MOE_COLUMNS` over the steps' real MoE tokens,
+    `moe_experts` under `routing` and with each step's group dummies as one
+    token (`moe_column`). Each form is fitted with each record held out of the
+    rung's steps (`_max_affine_folds`), its held-out error `_held_out_error`'s.
+    The form of smallest held-out error is picked, no column on a tie, and a
+    picked column is adopted, returned as the vector `_counts` reads. A rung of
     one record has no held-out error and adopts none.
     """
-    cell = np.array([r[0] for r in members])
-    y = np.array([r[3] for r in members])
-    forms = {"none": (x, names)}
-    for feature in MOE_COLUMNS:
-        column = [moe_column(feature, r[6], routing, r[7]) for r in members]
-        forms[feature] = (np.column_stack([x, column]), [*names, feature])
+    forms = {"none": {"coefficients": list(DECODE)}}
+    forms |= {f: {"coefficients": [*DECODE, f]} for f in MOE_COLUMNS}
     held, error = {}, {}
-    for form, (design, wide) in forms.items():
-        held[form] = _folds(design, y, cell, wide)
+    for form, vector in forms.items():
+        held[form] = _max_affine_folds(steps, vector, routing)
         error[form] = _held_out_error(held[form])
     picked = min(error, key=error.get) if held["none"] else None
     adopted = None if picked in (None, "none") else picked
@@ -1100,60 +1328,62 @@ def _moe_column(members, x, names, routing) -> tuple:
             for form in forms
         },
     }
-    if adopted is None:
-        return None, figures
-    design, wide = forms[adopted]
-    return (adopted, design[:, -1], _solve(design, y, wide)), figures
+    vector = None if adopted is None else forms[adopted]
+    return vector, figures, held[adopted or "none"]
 
 
-def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None:
+def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing, folds):
     """The `rowmod(k)` column decode rung `rung` adopts, or None.
 
-    `members` are the rung's `fit` rows, `x` their design over `names`, `base`
-    its solve without the column.
+    `steps` are the rung's steps, each its ranks' `fit` rows, `vector` the
+    rung's form without the column, `base` its `_fit_vector` and `folds` its
+    `_max_affine_folds`, fitted here when None.
     `k` runs over the powers of two up to the rung. A `k` qualifies when its
-    solve cuts `base`'s scaled MAD by `ROWMOD_GAIN`, the mean MAD of the same
-    solve over `ROWMOD_SHUFFLES` shuffles of each step's rows, by `seed`, does not,
-    and no record (a cell) priced by a solve on the others has a p50 error
-    further from zero than without the column. Every cell
+    fit cuts `base`'s scaled MAD by `ROWMOD_GAIN`, the mean MAD of the same
+    fit over `ROWMOD_SHUFFLES` shuffles of each rank's rows, by `seed`, does
+    not, and no record (a cell) priced by a fit on the others
+    (`_max_affine_folds`) has a p50 error further from zero than without the
+    column. Every cell
     needs `ROWMOD_CELL_STEPS` steps at the rung, and a rung needs two cells.
-    The qualifying `k` of smallest MAD is adopted: returned with its solve and
+    The qualifying `k` of smallest MAD is adopted: returned with its fit and
     the evidence the law records.
     """
-    cell = np.array([r[0] for r in members])
+    cell = np.array([s[0][0] for s in steps])
     cells = sorted(set(cell.tolist()))
     if len(cells) < 2 or min((cell == c).sum() for c in cells) < ROWMOD_CELL_STEPS:
         return None
-    y = np.array([r[3] for r in members])
-    rng = np.random.default_rng(seed)
-    shuffles = [
-        [rng.permutation(r[5]) for r in members] for _ in range(ROWMOD_SHUFFLES)
-    ]
-    wide = [*names, "rowmod"]
 
-    def mad(rows, k):
-        column = [rowmod(r, k) for r in rows]
-        return _solve(np.column_stack([x, column]), y, wide)["mad"]
+    def wide(k):
+        return {"coefficients": [*vector["coefficients"], "rowmod"], "rowmod": k}
 
-    def p50(design):
-        folds = _folds(design, y, cell, wide[: design.shape[1]])
+    def shuffled_mad(k):
+        # The same shuffles at every `k`.
+        rng, mads = np.random.default_rng(seed), []
+        for _ in range(ROWMOD_SHUFFLES):
+            moved = [
+                [(*r[:5], rng.permutation(r[5]), *r[6:]) for r in s] for s in steps
+            ]
+            mads.append(_fit_vector(moved, wide(k), routing)["mad"])
+        return float(np.mean(mads))
+
+    def p50(folds):
         return [p for _, p in folds.values()]
 
-    without, best, k = p50(x), None, 2
+    if folds is None:
+        folds = _max_affine_folds(steps, vector, routing)
+    without, best, k = p50(folds), None, 2
     target = (1.0 - ROWMOD_GAIN) * base["mad"]
     while k <= rung:
-        column = np.array([rowmod(r[5], k) for r in members], dtype=np.float64)
-        design = np.column_stack([x, column])
-        solved = _solve(design, y, wide)
+        solved = _fit_vector(steps, wide(k), routing)
         if solved["mad"] < min(target, best[1]["mad"] if best else target):
-            shuffled_mad = float(np.mean([mad(s, k) for s in shuffles]))
-            held = p50(design)
-            if shuffled_mad >= target and all(
+            shuffled = shuffled_mad(k)
+            held = p50(_max_affine_folds(steps, wide(k), routing))
+            if shuffled >= target and all(
                 abs(w) <= abs(o) for w, o in zip(held, without)
             ):
                 evidence = {
                     "mad_without": base["mad"],
-                    "shuffled_mad": shuffled_mad,
+                    "shuffled_mad": shuffled,
                     "held_out_p50": {
                         str(c): [o, w] for c, o, w in zip(cells, without, held)
                     },
@@ -1163,11 +1393,13 @@ def _rowmod(members, x, rung: int, base: dict, seed: int, names) -> tuple | None
     return best
 
 
-def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
+def _hull(points: np.ndarray, names: tuple[str, ...], affine: bool = True) -> dict:
     """`StepLinearLaw`'s hull over the non-intercept features of the fitted steps.
     qhull's precision checks depend on the order the points come in: where it
     refuses them, it hulls their distinct points in sorted order, the same hull.
-    A set that spans none still raises."""
+    A set that spans none still raises. A feature affine in an earlier one on
+    the set is held to it by two opposed facets, as a constant one is by
+    `equal`, unless `affine` is false: then qhull refuses that flat set."""
     from scipy.spatial import ConvexHull, QhullError
 
     equal = {
@@ -1183,10 +1415,26 @@ def _hull(points: np.ndarray, names: tuple[str, ...]) -> dict:
     elif vary:
         # Hulled in the unit box, where qhull's tolerances suit every feature.
         unit = (x - lo) / (hi - lo)
-        try:
-            eq = ConvexHull(unit).equations
-        except QhullError:
-            eq = ConvexHull(np.unique(unit, axis=0)).equations
+        mirror = (hi - x) / (hi - lo)  # an affine feature equals another's unit or this
+        tied = {}  # a feature: the earlier one it is held to, and the sign
+        for i, j in itertools.combinations(range(len(vary)), 2) if affine else ():
+            for sign, other in ((1.0, unit), (-1.0, mirror)):
+                if j not in tied and np.array_equal(unit[:, j], other[:, i]):
+                    tied[j] = (i, sign)
+        free = [j for j in range(len(vary)) if j not in tied]
+        if len(free) == 1:
+            hulled = np.array([[-1.0, 0.0], [1.0, -1.0]])
+        else:
+            try:
+                hulled = ConvexHull(unit[:, free]).equations
+            except QhullError:
+                hulled = ConvexHull(np.unique(unit[:, free], axis=0)).equations
+        eq = np.zeros((len(hulled), len(vary) + 1))
+        eq[:, free], eq[:, -1] = hulled[:, :-1], hulled[:, -1]
+        for j, (i, sign) in tied.items():  # u_j = u_i, or u_j = 1 - u_i
+            tie = np.zeros(len(vary) + 1)
+            tie[[j, i, -1]] = np.array([1.0, -sign, min(sign, 0.0)]) / 2**0.5
+            eq = np.vstack([eq, tie, -tie])
         normals = eq[:, :-1] / (hi - lo)
         facets = np.column_stack([normals, eq[:, -1] - normals @ lo]).tolist()
     else:
@@ -1371,33 +1619,20 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             )
         else:
             solved = _fit_steps(steps, names, lambda r: r[2])
-        rowmod_k = figures = None
+        rowmod_k = figures = folds = None
         if key and key.isdigit():
-            # The column and `rowmod` are chosen on the base form's rows.
-            members, base = solved["rows"], solved
-            counts = np.array([r[2] for r in members], dtype=np.float64)
+            vector = {"coefficients": names}
             if routing:
-                chosen, figures = _moe_column(members, counts, names, routing)
+                chosen, figures, folds = _moe_column(steps, routing)
                 if chosen:
-                    feature, column, base = chosen
-                    counts = np.column_stack([counts, column])
-                    names = [*names, feature]
-            chosen = _rowmod(members, counts, int(key), base, seed, names)
+                    vector, solved = chosen, _fit_vector(steps, chosen, routing)
+            chosen = _rowmod(steps, int(key), vector, solved, seed, routing, folds)
             if chosen:
-                rowmod_k, _, evidence = chosen
-                names = [*names, "rowmod"]
-            if len(names) > len(DECODE):
-                adopted = {"coefficients": names}
-                if rowmod_k:
-                    adopted["rowmod"] = rowmod_k
-                solved = _fit_steps(
-                    steps,
-                    names,
-                    lambda r, v=adopted: _counts(v, routing, r[2], *r[5:]),
-                )
+                rowmod_k, solved, evidence = chosen
+            names = [*vector["coefficients"], *["rowmod"] * bool(rowmod_k)]
         members = solved["rows"]
         slow = ~solved["keep"] & (solved["residual"] < 0)
-        once = solved["residual"] < 1 / WARM_FACTOR - 1
+        once = solved["residual"] < 1 - WARM_FACTOR
         warm = np.zeros(len(members), dtype=bool)
         for rec in range(len(runs)):
             leading = True
@@ -1472,20 +1707,20 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         "vectors": {k: {**v["fit"], "hull": v["hull"]} for k, v in vectors if v},
         "held_out": {},
     }
-    drafts = [
-        dataclasses.replace(
-            s,
-            device_s=_draft_kv(s),
-            draft_s=None,
-            propose_s=None,
-            draft_kv_s=None,
-        )
-        for s in samples
-        if s.draft_s is not None and _draft_kv(s) > 0
-    ]
-    if drafts:
-        unrouted = {**(options or {}), "moe_routing": None, "buckets": None}
-        law["draft"] = fit(drafts, unrouted, seed, draft=True)[0]
+    drafts, serial = _draft_samples(samples), [s for s in samples if s.passes_s]
+    if serial and not drafts:
+        law["draft"] = {
+            "provenance": f"step_linear_fit draft passes on {len(runs) * dp} "
+            f"real records ({', '.join(runs)})",
+            "decode": {},
+        }
+    elif drafts:
+        drafted = _draft_options(options, bool(serial))
+        law["draft"] = fit(drafts, drafted, seed, draft=True)[0]
+    if serial:
+        law["draft"]["forward"] = _forward(serial)
+        law["draft"]["propose"] = _propose(_rest(serial))
+    elif drafts:
         if proposes := [
             s if s.draft_kv_s is None else dataclasses.replace(s, propose_s=s.draft_s)
             for s in samples
@@ -1497,6 +1732,59 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         if any(s.view.prefill and s.draft_kv_s is not None for s in samples):
             law["draft"]["output_prefill_kv"] = True
     return law, report
+
+
+def _draft_options(options, serial: bool) -> dict:
+    """`options` for the draft law, which adopts no MoE column and no padding;
+    under an EAGLE3 drafter whose records time its passes, the `base` form: its
+    prefill vector fits the middle chunks alone, each one request's chunk at
+    the step's token budget, whose `history` is its `query_cached` over it."""
+    drafted = {**(options or {}), "moe_routing": None, "buckets": None}
+    return {**drafted, "form": "base"} if serial else drafted
+
+
+def _draft_samples(samples) -> list:
+    """The samples the draft law's prefill and decode vectors are fitted on,
+    each labelled with its draft label (`_draft_kv`). Under an EAGLE3 drafter
+    whose records time its passes, only the middle chunks: its decodes' and
+    output prefills' drafts are its passes and the rest of their draft."""
+    serial = any(s.passes_s for s in samples)
+    return [
+        dataclasses.replace(
+            s,
+            device_s=_draft_kv(s),
+            draft_s=None,
+            propose_s=None,
+            draft_kv_s=None,
+            passes_s=None,
+        )
+        for s in samples
+        if s.draft_s is not None
+        and _draft_kv(s) > 0
+        and not (serial and (s.passes_s or s.view.produces_output))
+    ]
+
+
+def _rest(samples) -> list:
+    """`samples` labelled, as propose labels, with what their draft label
+    holds past their passes; those whose passes hold it all left out."""
+    rest = [
+        dataclasses.replace(s, propose_s=s.draft_s - sum(s.passes_s)) for s in samples
+    ]
+    return [s for s in rest if s.propose_s > 0]
+
+
+def _forward(samples) -> dict:
+    """The draft law's `forward` vector over `samples`' passes, each a sample
+    at its features (`serial_passes`), solved and hulled as a step vector is,
+    with `passes`, how many each holds; samples holding other counts refuse."""
+    passes = sorted({len(s.passes_s) for s in samples})
+    if len(passes) != 1:
+        raise ValueError(f"the records' steps ran {passes} draft passes")
+    (k,) = passes
+    x = [c for s in samples for c in serial_passes(s.view, k)]
+    y = [p for s in samples for p in s.passes_s]
+    return {**_vector(np.array(x, dtype=np.float64), np.array(y), PREFILL), "passes": k}
 
 
 def _draft_kv(s) -> float:
@@ -1511,11 +1799,16 @@ def _propose(samples, label: str = "propose_s") -> dict:
     """The draft law's `propose` vector over `samples`' propose labels, or
     another `label`, on `PROPOSE`, solved and hulled as a step vector is."""
     x = np.array([(1, len(s.view.requests)) for s in samples], dtype=np.float64)
-    s = _solve(x, np.array([getattr(s, label) for s in samples]), list(PROPOSE))
+    return _vector(x, np.array([getattr(s, label) for s in samples]), PROPOSE)
+
+
+def _vector(x, y, names) -> dict:
+    """A vector on `names` over the rows `x` labelled `y`, solved and hulled."""
+    s = _solve(x, y, list(names))
     fitted = {k: s[k] for k in ("condition", "centre", "mad", "zero")}
     return {
-        "coefficients": dict(zip(PROPOSE, map(float, s["coef"]))),
-        "hull": _hull(x[s["keep"]][:, 1:], PROPOSE[1:]),
+        "coefficients": dict(zip(names, map(float, s["coef"]))),
+        "hull": _hull(x[s["keep"]][:, 1:], names[1:]),
         "fit": {
             "samples": int(s["keep"].sum()),
             "dropped": int((~s["keep"]).sum()),
@@ -1544,23 +1837,33 @@ def priced_rank(ranks: dict):
     return max(ranks, key=ranks.get)
 
 
-def _held_out(samples, options, seed, warm=None):
-    """Each step of each run, warm steps left out, priced as its costliest rank
-    by the law fitted on the other runs: (run, vector, band, that rank's (counts,
-    context, tokens, dummies), relative error), the error nan where that law has
-    no vector."""
-    form, dp = _options(options)
+def _fold_laws(samples, options, seed, draft: bool = False):
+    """Each run of `samples`, in the order runs first appear, with its ranks'
+    samples and the law `fit` gives on the other runs, under `draft` as `fit`
+    fits a draft law."""
     options = {**(options or {}), "serial": _serial(samples, options)}
-    runs = _runs(samples, dp)
-    if warm is None:
-        warm = fit(samples, options, seed)[0]["warm_steps"]
-    for i, (run, ranks) in enumerate(runs.items()):
+    for run, ranks in _runs(samples, _options(options)[1]).items():
         others = [s for s in samples if s.provenance["run"] != run]
-        law = fit(others, options, seed)[0]
+        yield run, ranks, fit(others, options, seed, draft)[0]
+
+
+def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None):
+    """Each step of each run, warm steps left out, priced as its costliest rank
+    by the law fitted on the other runs, `folds`' when given, else
+    `_fold_laws`', under `draft` as `fit` fits a draft law: (run, vector,
+    band, that rank's (counts, context, tokens, dummies), relative error), the
+    error nan where that law has no vector."""
+    form = _options(options)[0]
+    options = {**(options or {}), "serial": _serial(samples, options)}
+    if warm is None:
+        warm = fit(samples, options, seed, draft)[0]["warm_steps"]
+    folds = _fold_laws(samples, options, seed, draft) if folds is None else folds
+    for i, (run, ranks, law) in enumerate(folds):
         routing = _law_routing(law)
         for group in _groups(
             ranks,
             form,
+            draft,
             serial=options["serial"],
             routing=_routing(options),
             buckets=_buckets(options),
@@ -1607,17 +1910,62 @@ def _bands(rows) -> dict:
     return bands
 
 
-def mark_held_out(law: dict, report: dict, samples, options=None, seed: int = 0):
+def _vector_of(view) -> str:
+    """The name a law's `sources` gives the vector that prices `view`'s step."""
+    return "prefill" if view.prefill else f"decode {_rung_key(view.capture_rung)}"
+
+
+def _figures(ranks, law: dict, vectors=None) -> dict:
+    """Per kind, `FIGURES` of the steps of `ranks`, one run's ranks' samples,
+    priced by `law` as `validate.cost` grades a run (`accuracy.run_accuracy`),
+    and under `prefill` and `decode`, as `refused`, the steps of the kind `law`
+    refused, a kind with none graded stating 0 steps and no other figure; with
+    `vectors`, only the steps a vector it names prices (`_vector_of`), each
+    with its draft."""
+    from atom.compass.backends.accuracy import run_accuracy
+
+    steps = None
+    if vectors is not None:
+        steps = {s.step for r in ranks for s in r if _vector_of(s.view) in vectors}
+    report = run_accuracy(ranks, law, steps)
+    figures = {k: {f: g[f] for f in FIGURES} for k, g in report["graded"].items()}
+    refused = dict.fromkeys(("prefill", "decode"), 0)
+    # A band names its kind first: "prefill tokens ..." or "decode rung ...".
+    for band, r in report["refused"].items():
+        refused[band.split()[0]] += r["steps"]
+    none = {**dict.fromkeys(FIGURES), "steps": 0}
+    for kind, n in refused.items():
+        if kind in figures or n:
+            figures.setdefault(kind, dict(none))["refused"] = n
+    return figures
+
+
+def fold_figures(folds, vectors=None) -> dict:
+    """Per run of `folds`, `_fold_laws`', `_figures` of its steps priced by the
+    law fitted on the other runs."""
+    return {run: _figures(ranks, law, vectors) for run, ranks, law in folds}
+
+
+def mark_held_out(
+    law: dict, report: dict, samples, options=None, seed: int = 0, draft=False
+):
     """Write the held-out errors: under each of `law`'s vectors, as `held_out`,
     the hull of the rank rows `_held_out` priced its steps by, their errors per
-    band; under `report`'s `held_out`, each run's errors per band."""
+    band; under `report`'s `held_out`, each run's errors per band; and, unless
+    `draft`, under both's `figures`, `fold_figures`' on the same folds. A draft
+    law fitted on an EAGLE3 drafter's passes, its vectors alike, on the steps
+    each is fitted on, their bands named `draft` (`_mark_passes`); `draft`
+    says `law` is a draft law."""
     from scipy.spatial import QhullError
 
+    folds = list(_fold_laws(samples, options, seed, draft))
     rows = [
         r
-        for r in _held_out(samples, options, seed, law["warm_steps"])
+        for r in _held_out(samples, options, seed, law["warm_steps"], draft, folds)
         if not math.isnan(r[4])
     ]
+    if not draft:
+        law["figures"] = report["figures"] = fold_figures(folds)
     for run in dict.fromkeys(r[0] for r in rows):
         report["held_out"][run] = _bands([r for r in rows if r[0] == run])
     routing = _law_routing(law)
@@ -1634,6 +1982,51 @@ def mark_held_out(law: dict, report: dict, samples, options=None, seed: int = 0)
         except (ValueError, QhullError):
             continue
         vector["held_out"] = {"hull": hull, "bands": _bands(mine)}
+    if "forward" not in law.get("draft", {}):
+        return
+    serial = [s for s in samples if s.passes_s]
+    drafts, mine = _draft_samples(samples), {"held_out": {}}
+    if len({s.provenance["run"] for s in drafts}) > 1:
+        drafted = _draft_options(options, True)
+        mark_held_out(law["draft"], mine, drafts, drafted, seed, True)
+    if len({s.provenance["run"] for s in serial}) > 1:
+        _mark_passes(law["draft"], mine, serial)
+    for run, bands in mine["held_out"].items():
+        named = {f"draft {b}": v for b, v in bands.items()}
+        report["held_out"].setdefault(run, {}).update(named)
+
+
+def _mark_passes(law: dict, report: dict, samples) -> None:
+    """`mark_held_out` for a draft law's `forward` and `propose` vectors:
+    each run's passes and propose rests (`_rest`) priced by the vectors fitted
+    on the other runs, banded by pass."""
+    from scipy.spatial import QhullError
+
+    rows = {"forward": [], "propose": []}
+    for run in dict.fromkeys(s.provenance["run"] for s in samples):
+        others = [s for s in samples if s.provenance["run"] != run]
+        mine = [s for s in samples if s.provenance["run"] == run]
+        forward = _forward(others)
+        for s in mine:
+            passes = serial_passes(s.view, forward["passes"])
+            for i, (x, seconds) in enumerate(zip(passes, s.passes_s)):
+                price = np.dot(list(forward["coefficients"].values()), x)
+                rows["forward"].append((run, "", f"pass {i}", x, price / seconds - 1))
+        propose = _propose(_rest(others))
+        for s in _rest(mine):
+            x = (1, len(s.view.requests))
+            price = np.dot(list(propose["coefficients"].values()), x)
+            rows["propose"].append((run, "", "propose", x, price / s.propose_s - 1))
+    for key, got in rows.items():
+        for run in dict.fromkeys(r[0] for r in got):
+            mine = _bands([r for r in got if r[0] == run])
+            report["held_out"].setdefault(run, {}).update(mine)
+        names = tuple(law[key]["coefficients"])[1:]
+        try:
+            hull = _hull(np.array([r[3] for r in got], dtype=np.float64)[:, 1:], names)
+        except (ValueError, QhullError):
+            continue
+        law[key]["held_out"] = {"hull": hull, "bands": _bands(got)}
 
 
 def host_held_out(samples) -> dict:
@@ -1675,8 +2068,8 @@ def _table(errors: dict) -> str:
 
 def engine_config(records) -> dict:
     """The engine config `records` ran under: `keyed_of` the `.engine.json`
-    beside each. A record without one, or records under two, refuse, naming
-    the fields that differ."""
+    beside each, at the longest ladder (`pooled`). A record without one, or
+    records under two, refuse, naming the fields that differ."""
     held = []
     for record in records:
         engine = Path(record).with_suffix(".engine.json")
@@ -1685,6 +2078,7 @@ def engine_config(records) -> dict:
                 f"{record} has no {engine.name}, the engine config it ran under"
             )
         held.append(keyed_of(json.loads(engine.read_text())))
+    held = list(pooled(dict(enumerate(held))).values())
     names = sorted({k for e in held for k in e})
     if differ := [k for k in names if any(e.get(k) != held[0].get(k) for e in held)]:
         raise ValueError(
@@ -1724,6 +2118,13 @@ def recorded_buckets(stated: dict) -> tuple[int, ...] | None:
     return next(iter(held), None)
 
 
+def refuse_contradicting(own, held: dict, stated, engine: dict) -> None:
+    """Refuse `engine`, the engine file `stated`'s keyed fields, where it omits
+    or states otherwise a field `held`, the record's own file `own`'s, holds."""
+    if differ := [k for k, v in held.items() if k not in engine or engine[k] != v]:
+        raise ValueError(f"{own} contradicts {stated} in {differ}")
+
+
 def refuse_context_parallel(engine: dict, where: str) -> None:
     """Refuse an engine config that states a context-parallel width: a step
     linear law states none, so a run at width 1 would price with it."""
@@ -1757,15 +2158,45 @@ def _routing_arg(value: str) -> tuple[int, int]:
     return experts, top_k
 
 
-def main(argv=None) -> None:
+#: The kinds `--platform` states platform fields for: the law's and its host laws'.
+PLATFORM_KINDS = ("step_linear_law", "host_laws")
+
+
+def _platform_arg(value: str) -> dict:
+    """`--platform`'s JSON object, an object of platform fields per kind."""
+    try:
+        given = json.loads(value)
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not JSON") from None
+    if not isinstance(given, dict) or not all(
+        isinstance(given.get(k), dict) for k in PLATFORM_KINDS
+    ):
+        raise argparse.ArgumentTypeError(
+            f"{value!r} states no object for each of {', '.join(PLATFORM_KINDS)}"
+        )
+    return given
+
+
+def offload_main(argv) -> None:
+    """``offload LOG... --out ENTRY``: write `fit_offload`'s entry, and print
+    each term with its fit."""
     parser = argparse.ArgumentParser(
-        prog="python -m atom.compass.backends.step_linear_fit",
-        description=__doc__.split("\n\n")[0],
+        prog="python -m atom.compass.backends.step_linear_fit offload",
+        description=fit_offload.__doc__.split("\n\n")[0],
     )
+    parser.add_argument("logs", nargs="+", help="real server logs at OFFLOAD_PROFILE")
+    parser.add_argument("--out", required=True, help="where the entry is written")
+    args = parser.parse_args(argv)
+    entry, report = fit_offload(args.logs)
+    Path(args.out).write_text(json.dumps(entry) + "\n")
+    for name, fit in report.items():
+        print(f"{name}: {json.dumps(entry[name])} {json.dumps(fit)}")
+
+
+def _records_parser(prog: str, description: str) -> argparse.ArgumentParser:
+    """A parser of the records and the options `_labelled` reads with them."""
+    parser = argparse.ArgumentParser(prog=prog, description=description)
     parser.add_argument("records", nargs="+", help="real step records, steps/dp0.jsonl")
-    parser.add_argument(
-        "--out", required=True, help="where the law is written, as JSON"
-    )
     parser.add_argument("--form", choices=FORMS, default="base")
     parser.add_argument(
         "--moe-routing",
@@ -1775,18 +2206,19 @@ def main(argv=None) -> None:
         "steps' real MoE tokens, or the experts they reach, as a column",
     )
     parser.add_argument(
-        "--machine-spec",
-        required=True,
-        help="the machine_spec_digest of the spec of the platform the records ran "
-        "on, which keys the law and its host laws",
-    )
-    parser.add_argument(
         "--engine",
         help="the engine file the records ran under, stated in place of the "
         ".engine.json beside each, its prefill buckets for a record that states "
         "none; refused where one contradicts it",
     )
-    args = parser.parse_args(argv)
+    return parser
+
+
+def _labelled(args) -> tuple[list, dict, dict, dict]:
+    """`args.records`' samples, each record's table, the options `fit` takes
+    on them and the engine config they ran under. A record whose server built
+    an aiter JIT module refuses, and so does an engine file that contradicts
+    `--engine` at the records' longest ladder."""
     for record in args.records:
         run = Path(record).resolve().parent.parent / "run.json"
         if run.is_file() and (
@@ -1797,12 +2229,10 @@ def main(argv=None) -> None:
     stated = {r: stated_buckets(r) for r in args.records}
     if args.engine:
         engine = keyed_of(json.loads(Path(args.engine).read_text()))
-        for own in owns:
-            raw = json.loads(own.read_text()) if own.exists() else {}
-            held = keyed_of(raw)
+        raw = {own: json.loads(own.read_text()) if own.exists() else {} for own in owns}
+        for own, held in pooled({o: keyed_of(r) for o, r in raw.items()}).items():
             refuse_context_parallel(held, str(own))
-            if differ := [k for k, v in held.items() if engine.get(k, v) != v]:
-                raise ValueError(f"{own} contradicts {args.engine} in {differ}")
+            refuse_contradicting(own, held, args.engine, engine)
         given = json.loads(Path(args.engine).read_text()).get(PREFILL_BUCKETS)
         stated = {args.engine: given} | {
             r: b for r, b in stated.items() if b is not None
@@ -1813,6 +2243,130 @@ def main(argv=None) -> None:
     options = {"form": args.form, "dp": dp, "moe_routing": args.moe_routing}
     options["buckets"] = recorded_buckets(stated)
     samples, tables = label_records(args.records, dp)
+    return samples, tables, options, engine
+
+
+def _figures_table(figures: dict) -> str:
+    """`fold_figures`' figures, a line per held-out run and kind, `-` where a
+    kind states no figure."""
+
+    def show(value, percent=False) -> str:
+        if value is None:
+            return "-"
+        return f"{value:+.2%}" if percent else str(value)
+
+    head = "run | kind | steps | on totals | held-out step | holding it out | median"
+    lines = [f"{head} | refused"]
+    for run, kinds in figures.items():
+        for kind, f in kinds.items():
+            lines.append(
+                f"{run} | {kind} | {f['steps']} | {show(f['on_totals'], True)} | "
+                f"{show(f['held_out_step'])} | {show(f['held_out'], True)} | "
+                f"{show(f['median'], True)} | {show(f.get('refused'))}"
+            )
+    return "\n".join(lines)
+
+
+def figures_main(argv) -> None:
+    """``figures RECORD... --law LAW [--source NAME]``: write `fold_figures`'
+    figures on the records into the law file LAW, and print them.
+
+    The records must be the runs LAW states under `runs`, and are folded under
+    their engine config as the command fits them, and under the `form` and
+    `moe_routing` LAW states, a `--form` or `--moe-routing` that contradicts
+    them refusing. A law whose `sources` splits its vectors takes one source's
+    at a time: `--source` names it, the records must be its `runs`, they are
+    folded under `--form` and `--moe-routing`, as its provenance states them,
+    and the figures, of the steps its `vectors` price, go under it; a source
+    whose vectors price none of the records' steps refuses. Records whose
+    prefill buckets, `--engine`'s included, are not those LAW's prefill
+    vector was fitted under refuse where the figures grade that vector, as
+    do any under a law with no `sources` that names `padding` unfitted."""
+    parser = _records_parser(
+        "python -m atom.compass.backends.step_linear_fit figures",
+        figures_main.__doc__.split("\n\n")[0],
+    )
+    parser.add_argument("--law", required=True, help="the law file written into")
+    parser.add_argument("--source", help="the entry of the law's sources folded")
+    parser.set_defaults(form=None)
+    args = parser.parse_args(argv)
+    law = json.loads(Path(args.law).read_text())
+    into, vectors, runs = law, None, law.get("runs")
+    sources = law.get("sources", {})
+    if args.source is not None or sources:
+        if args.source not in sources:
+            raise ValueError(
+                f"{args.law} splits its vectors over the sources {sorted(sources)}, "
+                f"and --source names {args.source}; each is folded with its own "
+                "records, form and options"
+            )
+        into = sources[args.source]
+        vectors = into["vectors"]
+        runs = runs and [runs[i] for i in into["runs"]]
+        args.form = args.form or "base"
+    else:
+        stated = {"form": law["form"], "moe_routing": _law_routing(law)}
+        for name, value in stated.items():
+            if (flag := getattr(args, name)) not in (None, value):
+                raise ValueError(
+                    f"{args.law} states {name} {value}, and --"
+                    f"{name.replace('_', '-')} gives {flag}: a law with no "
+                    "sources is folded as it was fitted"
+                )
+        args.form, args.moe_routing = stated["form"], stated["moe_routing"]
+    if runs is None:
+        raise ValueError(f"{args.law} states no runs to hold the records to")
+    samples, _, options, _ = _labelled(args)
+    given = {s.provenance["run"] for s in samples}
+    if differ := sorted(given ^ set(runs)):
+        raise ValueError(
+            f"the records' runs are not the {len(runs)} runs {args.law} states "
+            f"for them; these are in one and not the other: {differ}"
+        )
+    prefill = law.get("prefill") if vectors is None or "prefill" in vectors else None
+    if prefill or (vectors is None and "padding" in law.get("unfitted", {})):
+        fitted, stated = tuple((prefill or {}).get("buckets", ())), _buckets(options)
+        if stated != fitted:
+            raise ValueError(
+                f"{args.law} was fitted under the prefill buckets "
+                f"{list(fitted) or 'none'}, and the records"
+                f"{' with ' + args.engine if args.engine else ''} state "
+                f"{list(stated) or 'none'}: its folds are fitted under its own"
+            )
+    if vectors is not None and not any(_vector_of(s.view) in vectors for s in samples):
+        raise ValueError(
+            f"{args.law}'s source {args.source} prices none of the records' "
+            f"steps: its vectors are {vectors}"
+        )
+    into["figures"] = fold_figures(_fold_laws(samples, options, 0), vectors)
+    Path(args.law).write_text(json.dumps(law) + "\n")
+    print(_figures_table(into["figures"]))
+
+
+def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["offload"]:
+        offload_main(argv[1:])
+        return
+    if argv[:1] == ["figures"]:
+        figures_main(argv[1:])
+        return
+    parser = _records_parser(
+        "python -m atom.compass.backends.step_linear_fit", __doc__.split("\n\n")[0]
+    )
+    parser.add_argument(
+        "--out", required=True, help="where the law is written, as JSON"
+    )
+    parser.add_argument(
+        "--platform",
+        required=True,
+        type=_platform_arg,
+        help="the platform the records ran on, as the law's and its host laws' "
+        'keys state it: {"step_linear_law": {...}, "host_laws": {...}}',
+    )
+    args = parser.parse_args(argv)
+    samples, tables, options, engine = _labelled(args)
+    dp = options["dp"]
     for record, table in tables.items():
         step_labels.write_table(record, table)
     law, report = fit(samples, options)
@@ -1820,13 +2374,15 @@ def main(argv=None) -> None:
         law["unfitted"]["padding"] = NO_BUCKETS
     if any(s.provenance["config"] for s in samples):
         law["host"], law["host_fit"] = fit_host(samples)
-    law["machine_spec"] = args.machine_spec
+    law["platform"] = args.platform["step_linear_law"]
     law["engine_config"] = engine
+    if atom := records_atom(samples):
+        law["records_atom"] = atom
     if "host" in law:
         stated = law["host"]["key"]["engine"]  # its graph sets stay
         graphs = {k: v for k, v in stated.items() if k == launch_features.GRAPHS}
         law["host"]["key"] |= {
-            "machine_spec": args.machine_spec,
+            **args.platform["host_laws"],
             "engine": engine | graphs,
         }
     if len(args.records) > dp:
@@ -1839,6 +2395,10 @@ def main(argv=None) -> None:
             print(
                 f"{name}: {json.dumps(vector['coefficients'])} {json.dumps(vector['fit'])}"
             )
+    for name, vector in law.get("draft", {}).items():
+        if isinstance(vector, dict) and "coefficients" in vector:
+            held = vector.get("held_out", {}).get("bands", {})
+            print(f"draft {name}: {json.dumps(vector['coefficients'])} held out {held}")
     if "host" in law:
         print(f"host: {json.dumps(law['host']['laws'])} {json.dumps(law['host_fit'])}")
     if len(args.records) > dp:
@@ -1850,6 +2410,7 @@ def main(argv=None) -> None:
             print(f"\nheld out, form {form}\n{_table(errors)}")
         if "host" in law:
             print(f"\nheld out, host laws\n{_table(host_held_out(samples))}")
+        print(f"\nfigures, form {options['form']}\n{_figures_table(law['figures'])}")
 
 
 if __name__ == "__main__":

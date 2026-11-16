@@ -9,8 +9,6 @@ read back from a real store.
 
 import json
 import os
-import re
-import subprocess
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -28,10 +26,11 @@ from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
 from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 
 from atom.compass import capture, cli, ir
-from atom.compass.artifacts import ArtifactStore, Key, Kind, Topology, member_name
+from atom.compass.artifacts import ArtifactStore, Topology, member_name
 from atom.compass.bench import ops
-from atom.compass.capture import driverless, forward
+from atom.compass.capture import driverless, forward, graph_key
 from atom.compass.capture.forward import decode, prefill, structure
+from atom.compass.capture.graph import Traced, build, to_json
 from atom.compass.fit import ops as fit_ops
 from atom.compass.run import memory, step_grid
 from atom.compass.runner.overrides import schedulable_ladder
@@ -105,13 +104,13 @@ def bench(tmp_path, monkeypatch):
     """A store, the key of a point measured on hjbog-srdc-39, the run, and
     the stand-in bench and graphs in place."""
     spec = MachineSpec.from_mapping(
-        json.loads((TREE / "scripts/compass/machines/mi308x-hjbog39.json").read_text())
+        json.loads((TREE / "tests/compass/machines/mi308x-hjbog39.json").read_text())
     )
     run = {
         "device": [{"index": 6, "name": spec.value("device.name")}],
         "stack": {c: spec.value(f"device.software_pinned_to.{c}") for c in PINNED},
         "ptl": "disabled",
-        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu"},
+        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu", "atom": "a"},
         "source": {"revision_kind": "tree", "revision": "a" * 40},
     }
     run["device"][0]["arch"] = spec.value("device.arch")
@@ -347,6 +346,76 @@ def test_a_plan_ladders_cached_tokens_only_for_a_prefill_kind_that_moves_there(
     assert report["by phase"] == {"prefill": {"steps": 2, "covered": covered}}
 
 
+def test_layers_that_view_one_kv_pool_from_rows_of_their_own_plan_one_point(
+    bench, tmp_path, monkeypatch
+):
+    """DeepSeek-V4's layers each view one KV pool from a base row of their own
+    on, so one layer's attention leaf differs from the next one's only in its
+    view's rows: the plan measures one point for both, over cached tokens too."""
+
+    def graph(store, config, shape, arch=None):
+        rows = shape.tokens if shape.phase == "prefill" else shape.seqs
+        q = ("q", _t([rows, 8], "activation"))
+        layers = [
+            _leaf("aiter.attn", q, ("kv", _t([4096 - base, 8], "kv")))
+            for base in (0, 64)
+        ]
+        traced = Traced(f"x tp=1 {shape.phase} eager", str(shape))
+        return json.loads(to_json(build(list(enumerate(layers)), traced)))
+
+    monkeypatch.setattr(ops, "graph", graph)
+    monkeypatch.setattr(ops, "_child", _moving_bench)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[100, 2100, False]], None),
+        ([[100, 3100, False]], None),
+    )
+
+    records = _plan(bench, tmp_path, plan)
+
+    points = [(r["shape"], json.dumps(r["context"])) for r in records]
+    assert len(points) == len(set(points))
+    assert {r["context"] for r in records if r["shape"].startswith("prefill")} == {
+        None,
+        2000,
+        3000,
+    }
+
+
+@pytest.mark.parametrize(
+    "slot, values, leaves",
+    [
+        ("prefix", ("layers.0.attn.swa_write", "layers.1.attn.swa_write"), 1),
+        ("quant_mode", ("group_fp8", "per_row_fp8"), 2),
+    ],
+)
+def test_layers_whose_calls_differ_only_in_a_string_plan_one_point_per_mode(
+    bench, tmp_path, monkeypatch, slot, values, leaves
+):
+    """DeepSeek-V4 passes each layer's window write the layer's name, which no
+    kernel reads, so one layer's leaf differs from the next one's only there:
+    the plan measures one point for both. A string that picks how a kernel
+    runs, a quantization mode, keeps its calls apart."""
+
+    def graph(store, config, shape, arch=None):
+        rows = shape.tokens if shape.phase == "prefill" else shape.seqs
+        kv = ("kv", _t([rows, 8], "activation"))
+        calls = [_leaf("atom.swa_write", kv, (slot, value)) for value in values]
+        traced = Traced(f"x tp=1 {shape.phase} eager", str(shape))
+        return json.loads(to_json(build(list(enumerate(calls)), traced)))
+
+    monkeypatch.setattr(ops, "graph", graph)
+    plan = _records(
+        tmp_path / "plan", ([[1, 1000, True]], 2), ([[100, 2100, False]], None)
+    )
+
+    records = _plan(bench, tmp_path, plan)
+
+    points = [(r["shape"], json.dumps(r["context"])) for r in records]
+    assert {points.count(p) for p in points} == {leaves}
+
+
 @pytest.mark.parametrize(
     "max_model_len, at_8000", [(8100, {40, 100}), (8150, {40, 100, 150})]
 )
@@ -418,11 +487,11 @@ def test_a_planned_prefill_attention_leaf_holds_a_step_s_rows_either_side_of_its
     "tokens, lo, hi, why",
     [
         (120, 0, 1000, ""),  # fresh to 1000 cached, both of one kernel
-        (120, 1000, 2000, "between two kernels"),  # 1000 and 2000 differ
+        (120, 1000, 2000, "outside the measured range"),  # 100 holds no 2000
         (120, 1000, 1000, ""),
         (200, 0, 0, "outside the measured range"),  # past the token counts
         (120, 1000, 5000, "outside the measured range"),  # past the cached counts
-        (60, 1000, 1000, "outside the measured range"),  # 1000 holds no 60
+        (60, 1000, 1000, "between two kernels"),  # 40 holds 0 and 2000, apart
     ],
 )
 def test_a_cached_bracket_holds_between_counts_and_tokens_of_one_kernel(
@@ -889,11 +958,7 @@ def test_an_integer_activation_indexes_a_dimension_of_one():
 
 def _publish_graph(store, config, arch, shape):
     """A graph of `shape` keyed on `arch`, its one leaf named for the arch."""
-    key = Key.of(
-        Kind.OP_GRAPH,
-        structure=structure(config, shape.phase, device=arch),
-        shape=str(shape),
-    )
+    key = graph_key(structure(config, shape.phase, device=arch), str(shape))
     leaf = _leaf(f"aiter.{arch}", ("x", _t([shape.seqs, 8], "activation")))
     store.publish(
         key,
@@ -950,33 +1015,24 @@ def test_coverage_reads_the_graphs_of_the_plan_s_arch_with_no_gpu(
 
 
 @pytest.fixture(autouse=True)
-def _declared_arch_ends_with_its_test(monkeypatch):
-    """`--coverage` declares the plan's arch to the whole process, in its
-    environment and Triton's driver; each test's declaration ends with it."""
-    import triton
-
-    monkeypatch.setattr(triton.runtime.driver, "_active", triton.runtime.driver._active)
-    with patch.dict(os.environ):
-        yield
+def declared(monkeypatch):
+    """The arches `--coverage` imports aiter on, in turn: a process imports
+    aiter once, and this one is the test run's, so an import is only recorded."""
+    arches = []
+    monkeypatch.setattr(driverless, "import_aiter_on", arches.append)
+    return arches
 
 
 def test_coverage_declares_the_plan_s_arch_to_aiter_before_it_builds_the_config(
-    tmp_path, monkeypatch, model_config  # noqa: F811
+    tmp_path, monkeypatch, model_config, declared  # noqa: F811
 ):
-    """ATOM's config imports aiter, which asks `GPU_ARCHS` and `rocminfo` for
-    the arch; with no driver, `rocminfo` names none."""
+    """ATOM's config holds aiter's fp8 dtype, which aiter resolves at import
+    from the device it finds; with no driver, none."""
     model_config.pipeline_parallel_size = model_config.prefill_context_parallel_size = 1
-    driverless_bin = tmp_path / "bin"
-    driverless_bin.mkdir()
-    (driverless_bin / "rocminfo").write_text("#!/bin/sh\nexit 0\n")
-    (driverless_bin / "rocminfo").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{driverless_bin}:{os.environ['PATH']}")
     asked = []
 
     def atom_config(args):
-        found = subprocess.run(["rocminfo"], capture_output=True, text=True, check=True)
-        listing = found.stdout
-        asked.append((re.findall(r"\bgfx\w+", listing), os.environ.get("GPU_ARCHS")))
+        asked.append(list(declared))
         return model_config
 
     monkeypatch.setattr("atom.compass.bench.measure.atom_config", atom_config)
@@ -991,7 +1047,7 @@ def test_coverage_declares_the_plan_s_arch_to_aiter_before_it_builds_the_config(
     argv = ["--coverage", graded, "--store", str(store.root), "--out", str(out)]
     report = ops._coverage_main(argv, [])
 
-    assert asked == [(["gfx950"], "gfx950")]
+    assert asked == [["gfx950"]]
     assert report["steps"] == 1
 
 
@@ -1129,7 +1185,9 @@ def test_a_child_that_dies_costs_the_plan_only_the_point_it_was_measuring(
         for d in dead
     ]
     assert [r for r in records if "refused" not in r] == [
-        r for r in whole if {k: r[k] for k in r if k != "token"} not in dead
+        r
+        for r in whole
+        if {k: r[k] for k in r if k not in ("token", "layout")} not in dead
     ]
     monkeypatch.setattr(ops, "_child", _bench)
     again = _plan(bench, tmp_path, population)  # the next plan retries them
@@ -1255,7 +1313,7 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
     def publish(store, graph, model, declared, tp, atom_args, command):
         at = graph.applicability
         published.append((at.structure, tp))
-        key = Key.of(Kind.OP_GRAPH, structure=at.structure, shape=str(at.shape))
+        key = graph_key(at.structure, str(at.shape))
         store.publish(
             key,
             provenance=stanza("compass trace ops"),

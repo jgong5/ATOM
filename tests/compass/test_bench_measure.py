@@ -211,34 +211,44 @@ def test_measuring_one_record_twice_publishes_each_view_once_and_then_nothing(ru
     assert Bench.started == [] and by_view(store).keys() == held.keys()
 
 
-def test_a_held_entry_taken_under_other_readings_refuses_naming_it(run):
+@pytest.mark.parametrize(
+    "moved",
+    [
+        lambda identity: identity["stack"].update(aiter="v9.9.9"),
+        lambda identity: identity.update(ptl="enabled"),
+    ],
+    ids=["aiter", "ptl"],
+)
+def test_a_run_on_another_platform_measures_its_batches_again_at_its_own_keys(
+    run, moved
+):
     rec = str(run.record)
     store = run(rec, "--sample", "all", *run.named(rec))
-    run.identity["stack"]["aiter"] = "v9.9.9"
+    held = len(entries(store))
+    moved(run.identity)
+    Bench.started.clear()
+    run(rec, "--sample", "all", *run.named(rec))
+    assert Bench.started and len(entries(store)) == 2 * held
+
+
+def test_a_held_entry_recording_other_readings_refuses_naming_it_and_a_fresh_store(
+    run,
+):
+    rec = str(run.record)
+    store = run(rec, "--sample", "all", *run.named(rec))
+    for place in (store.root / "step_measurement").iterdir():
+        path = place / "entry.json"
+        document = json.loads(path.read_text())
+        cells = document["fingerprints"]["step_measurement"]["cells"]
+        cells["software_stack"]["value"] = "v9.9.9"
+        path.chmod(0o644)
+        path.write_text(json.dumps(document))
     Bench.started.clear()
     tokens = "|".join(key.token() for key, _ in entries(store))
-    with pytest.raises(
-        SystemExit, match=rf"other readings than this run's:\n({tokens}): .*v9\.9\.9"
-    ):
-        run(rec, "--sample", "all", *run.named(rec))
-    assert Bench.started == []
-
-
-def test_a_held_entry_taken_under_other_readings_names_a_fresh_store(run):
-    rec = str(run.record)
-    run(rec, "--sample", "all", *run.named(rec))
-    run.identity["stack"]["aiter"] = "v9.9.9"
-    with pytest.raises(SystemExit, match="measure into a fresh --store"):
-        run(rec, "--sample", "all", *run.named(rec))
-
-
-def test_a_held_entry_measured_on_cards_of_another_ptl_state_refuses(run):
-    rec = str(run.record)
-    run.identity["ptl"] = "enabled"
-    run(rec, "--sample", "all", *run.named(rec))
-    run.identity["ptl"] = "disabled"
-    Bench.started.clear()
-    with pytest.raises(SystemExit, match=r"other readings than this run's:\n.*enabled"):
+    told = (
+        rf"other readings than this run's:\n({tokens}): .*v9\.9\.9(.|\n)*fresh --store"
+    )
+    with pytest.raises(SystemExit, match=told):
         run(rec, "--sample", "all", *run.named(rec))
     assert Bench.started == []
 
@@ -927,4 +937,58 @@ def test_run_and_measure_steps_lay_out_dp_attention_alike(
         pc = config.parallel_config
         assert (config.tensor_parallel_size, pc.data_parallel_size) == (1, 2)
     with pytest.raises(SystemExit):
-        measure.atom_config([*atom_args, "--timeout-keep-alive", "5"])
+        measure.atom_config([*atom_args, "--compass-run", "run.json"])
+
+
+#: The API server's flags `compass record` passes it, as MiniMax-M3's
+#: submission serves with them.
+SERVED = [
+    "--default-chat-template-kwargs",
+    '{"thinking_mode":"enabled"}',
+    "--tool-call-parser",
+    "minimax_m3",
+    "--timeout-keep-alive",
+    "600",
+    "--disable-uvicorn-access-log",
+    "--chat-template",
+    "template.jinja",
+    "--request-log",
+    "requests.jsonl",
+]
+
+
+@pytest.fixture
+def config_of(monkeypatch, model_dir):  # noqa: F811
+    """`measure.atom_config` of `-tp 4` on `model_dir` and the arguments given."""
+
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+
+    def config_of(*argv):
+        return measure.atom_config(["--model", str(model_dir), "-tp", "4", *argv])
+
+    return config_of
+
+
+def test_measure_steps_takes_the_server_flags_record_passes_and_resolves_without_them(
+    config_of,
+):
+    assert vars(config_of(*SERVED)) == vars(config_of())
+
+
+@pytest.mark.parametrize(
+    "argv, error",
+    [
+        (["--max-num-sqes", "8"], "unrecognized arguments: --max-num-sqes 8"),
+        (["--timeout-keep-alive", "soon"], "invalid int value: 'soon'"),
+    ],
+)
+def test_measure_steps_refuses_a_misspelled_engine_flag_and_a_value_the_server_refuses(
+    config_of, argv, error, capsys
+):
+    with pytest.raises(SystemExit):
+        config_of(*SERVED[:2], *argv)
+    assert error in capsys.readouterr().err

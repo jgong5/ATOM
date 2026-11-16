@@ -18,10 +18,10 @@ import re
 import pytest
 from test_backend_step_linear import law
 from test_drive_runfile import LAWS, REPORT, build, install, published, step_linear
-from test_run_step_grid import SPEC_DIGEST, deployment, host_laws_key
+from test_run_step_grid import PLATFORM, deployment, host_laws_key
 
 from atom.compass import run as compass_run
-from atom.compass.artifacts import Kind
+from atom.compass.artifacts import Kind, keyed_platform
 from atom.compass.backends import StepLinearBackend
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import serve
@@ -35,7 +35,10 @@ RECORDS = "829f117e" * 8
 def law_file(tmp_path, r, name="law.json", **written):
     """A law file fitted under `r`'s engine config, its host key re-keyed to
     this tree's `atom` digest; `written` replaces its fields."""
-    host = {**compass_run.host_key(r.config), "machine_spec": SPEC_DIGEST}
+    host = {
+        **compass_run.host_key(r.config),
+        **keyed_platform(Kind.HOST_LAWS, PLATFORM),
+    }
     document = {
         **law(),
         "engine_config": keyed(r.config),

@@ -16,13 +16,14 @@ import numpy as np
 import pytest
 from conftest import MockConfig
 from test_dp_step_max import runner
-from test_fit_steps import DIGEST
+from test_fit_steps import PLATFORM
 from test_memory_readings import META_8B
 from test_parity_recurrence import _labelled, _law, line
 from test_run_step_grid import deployment, publish, run_file
 from test_runner_step_semantics import _drive
 
 from atom.compass import run as compass_run
+from atom.compass.artifacts import Kind, keyed_platform
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_labels import Sample
@@ -168,7 +169,10 @@ def test_a_run_file_s_host_entry_without_admit_charges_admissions_in_e(
     r = deployment(tmp_path)
     publish(tmp_path, r)
     laws = {k: {g: [1e-4, 0, 0] for g in HOST_SEGMENTS} for k in FORWARD_KINDS}
-    key = {**compass_run.host_key(r.config), "machine_spec": DIGEST}
+    key = {
+        **compass_run.host_key(r.config),
+        **keyed_platform(Kind.HOST_LAWS, PLATFORM),
+    }
     for admit in ("absent", None):
         host = {"key": key, "laws": laws} | (
             {} if admit == "absent" else {"admit": None}

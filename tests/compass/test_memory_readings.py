@@ -50,8 +50,8 @@ from atom.compass.artifacts import (
     GateState,
     Key,
     Kind,
-    machine_spec_digest,
-    machine_spec_key,
+    keyed_platform,
+    machine_platform,
     member_name,
 )
 from atom.compass.backends.geometry import dtype_bytes as element_bytes
@@ -146,9 +146,14 @@ DOCUMENT = {
             "link_latency_s": 5.0e-6,
             "derate": 0.80,
         },
-        "router_relay_s": 1.5e-3,
     },
 }
+
+
+def spec_file(tmp_path) -> str:
+    """`DOCUMENT`, written to `tmp_path/spec.json`, as a command names a spec."""
+    (tmp_path / "spec.json").write_text(json.dumps(DOCUMENT))
+    return str(tmp_path / "spec.json")
 
 
 #: One rank's member of the `memory_readings` entry at each width, as
@@ -185,13 +190,12 @@ def publish_readings(store, config, document=DOCUMENT, readings=READINGS[1]):
     # As a run file carries it: JSON.
     machine = MachineSpec.from_mapping(json.loads(json.dumps(document)))
     fields = entry.key_fields(config)
+    platform = machine_platform(machine)
     key = Key.of(
-        Kind.MEMORY_READINGS, machine_spec=machine_spec_digest(machine), **fields
+        Kind.MEMORY_READINGS, **keyed_platform(Kind.MEMORY_READINGS, platform), **fields
     )
     store = ArtifactStore(store)
     if not store.directory_for(key).exists():
-        platform = machine_spec_key(machine).values
-        platform["torch"] = machine.value("device.software_pinned_to.torch")
         store.publish(
             key,
             provenance=STANZA,

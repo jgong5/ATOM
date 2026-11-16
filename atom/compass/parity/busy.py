@@ -7,7 +7,9 @@ request to its stop, and each rank wrote ``OUT/trace/rank_<r>/`` one gzipped
 chrome trace. `reduce` writes ``OUT/steps/dp0.busy.jsonl``: per line of the
 record, its ``step`` and ``b_target_ns``, and on an MTP record ``b_draft_ns``
 and, for each drafter pass `PASSES` names that the line times, its busy time
-under that pass's ``b_`` name. `step_labels` labels a prefill pass by them.
+under that pass's ``b_`` name. `step_labels` labels a prefill pass by them, and
+under a `step_labels.Floor` by `floored`'s: each drafter part's busy time on
+each rank less the terms of its kernels (`drafter`), at its largest rank.
 
 The n-th ``ATOM::forward`` range on each rank is the record's n-th line, its
 ``tokens=`` the line's; the ranks and the record must agree on both. A
@@ -24,11 +26,13 @@ A pass's busy time is the union of its kernels' device intervals plus each gap
 before one of them on the forward's device timeline: whole where that kernel's
 launch call had returned when the gap opened, so the device idled on its own,
 else capped at the rank's median such queued gap, since the device then waited
-for the host's launch. A TP collective's kernel on one rank includes its wait
-for the peers: the n-th collective kernel (`COLLECTIVE`) of a forward, the
-target's or the drafter's, counts on every rank from its latest rank's start,
-and as queued once its latest rank's launch call returned. Each pass's busy
-time is its largest over the ranks.
+for the host's launch. That median leaves out each queued gap of `ROUNDING` or
+less, one timestamp rounding step between two kernels that abut. A TP
+collective's kernel on one rank includes its wait for the peers: the n-th
+collective kernel (`COLLECTIVE`) of a forward, the target's or the drafter's,
+counts on every rank from its latest rank's start, and as queued once its
+latest rank's launch call returned. Each pass's busy time is its largest over
+the ranks.
 
 A trace directory not named ``rank_<r>``, a DP or a pipeline run's, refuses:
 per-rank busy time under DP is not reduced. So does a trace that lacks a
@@ -46,6 +50,7 @@ import json
 import re
 import statistics
 from bisect import bisect_right
+from collections import defaultdict
 from pathlib import Path
 
 from atom.compass.backends.json_file import read_jsonl
@@ -63,8 +68,14 @@ COLLECTIVE = re.compile(
     r"cross_device_reduce|allgather|all_gather|all_?reduce|allReduce|\bar_ll"
     r"|reduce_scatter|nccl|mono_step_begin"
 )
+#: The longest queued gap, in us, the cap's median leaves out: one timestamp
+#: rounding step, which two kernels that abut read as their gap.
+ROUNDING = 2e-3
 #: The drafter passes a busy line times apart, by their record line field.
 PASSES = ("d_propose_ns", "d_draft_kv_ns")
+#: Each drafter part `drafter` times, by the busy line field of its label.
+LABELS = {"draft": "b_draft_ns", "d_propose_ns": "b_propose_ns"}
+LABELS["d_draft_kv_ns"] = "b_draft_kv_ns"
 #: Characters read from a trace at a time.
 CHUNK = 1 << 24
 _SKIP = re.compile(r"[\s,]*")
@@ -98,8 +109,9 @@ def events(path):
 def forwards(path) -> list[dict]:
     """One rank's forwards: each its ``tokens``, its ``kernels``, each
     (start, end, launch return, pass, its drafter pass's line field or None,
-    name), in start order, and ``lost``, its launch calls that name a kernel
-    whose device row the trace does not hold."""
+    name, grid), in start order, the grid None for a copy, a memory set or a
+    kernel replayed from a graph, and ``lost``, its launch calls that name a
+    kernel whose device row the trace does not hold."""
     ranges, runs, marks, launches, kernels, computes = [], [], [], {}, [], set()
     named, rows = [], set()
     for e in events(path):
@@ -119,8 +131,9 @@ def forwards(path) -> list[dict]:
         elif cat in GPU:
             stream = e["args"].get("stream")
             rows.add(e["args"]["correlation"])
+            grid = e["args"].get("grid")
             kernels.append(
-                (ts, ts + e["dur"], e["args"]["correlation"], e["name"], stream)
+                (ts, ts + e["dur"], e["args"]["correlation"], e["name"], stream, grid)
             )
             if cat == "kernel":
                 computes.add(stream)
@@ -141,7 +154,7 @@ def forwards(path) -> list[dict]:
                 "lost": 0,
             }
         )
-    for start, stop, corr, name, stream in kernels:
+    for start, stop, corr, name, stream, grid in kernels:
         if stream not in computes:
             continue
         launch, queued = launches.get(corr, (None, None))
@@ -152,7 +165,7 @@ def forwards(path) -> list[dict]:
         inside = [m[2] for m in f["drafts"] if m[0] <= launch <= m[1]]
         part = "target" if launch < f["end"] and not inside else "draft"
         key = next((m[len(MARK) :] for m in inside), None)
-        f["kernels"].append((launch, start, stop, queued, part, key, name))
+        f["kernels"].append((launch, start, stop, queued, part, key, name, grid))
     for launch, corr in named:
         i = bisect_right(starts, launch) - 1
         if corr not in rows and i >= 0 and out[i]["run"] <= launch <= ranges[i][1]:
@@ -208,7 +221,7 @@ def _walk(kernels):
     """Per kernel in start order: its passes, the union it adds, and the gap
     before it with whether it was queued when the gap opened."""
     end = None
-    for start, stop, queued, part, key, _ in kernels:
+    for start, stop, queued, part, key, *_ in kernels:
         gap = start - end if end is not None and start > end else 0.0
         was = end is not None and queued is not None and queued <= end
         add = stop - max(start, end) if end is not None else stop - start
@@ -218,9 +231,12 @@ def _walk(kernels):
 
 def busy(fs: list[dict]) -> list[dict]:
     """One rank's busy time per forward and pass, in ns."""
-    queued = [g for f in fs for _, _, g, q in _walk(f["kernels"]) if q and g > 0]
+    queued = [g for f in fs for _, _, g, q in _walk(f["kernels"]) if q and g > ROUNDING]
     if not queued:
-        raise ValueError("no kernel was queued at a gap, so no gap measures the cap")
+        raise ValueError(
+            "no kernel was queued at a gap past one rounding step, so no gap "
+            "measures the cap"
+        )
     cap = statistics.median(queued)
     out = []
     for f in fs:
@@ -232,9 +248,9 @@ def busy(fs: list[dict]) -> list[dict]:
     return out
 
 
-def reduce(out) -> Path:
-    """Write the trace run in `out`'s busy lines beside its record; return
-    their path."""
+def _ranks(out) -> tuple[list[dict], list[list[dict]]]:
+    """The trace run in `out`'s record lines and each rank's forwards, whole
+    and with their collectives aligned."""
     out = Path(out)
     dirs = sorted((out / TRACE).iterdir())
     if not dirs or any(not re.fullmatch(r"rank_\d+", d.name) for d in dirs):
@@ -257,6 +273,13 @@ def reduce(out) -> Path:
         )
     _whole(dirs, ranks)
     _align(ranks)
+    return lines, ranks
+
+
+def reduce(out) -> Path:
+    """Write the trace run in `out`'s busy lines beside its record; return
+    their path."""
+    lines, ranks = _ranks(out)
     per_rank = [busy(fs) for fs in ranks]
     rows = []
     for i, s in enumerate(lines):
@@ -271,6 +294,71 @@ def reduce(out) -> Path:
             if key in s:
                 row["b" + key[1:]] = got[key]
         rows.append(row)
-    path = (out / RECORD).with_suffix(".busy.jsonl")
+    path = (Path(out) / RECORD).with_suffix(".busy.jsonl")
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
     return path
+
+
+def drafter(out) -> list[list[tuple[dict, list]]]:
+    """Per line of the trace run in `out`'s record, per rank: the busy ns of
+    each drafter part `reduce` times on it, ``draft`` and each of `PASSES` the
+    line times, and the draft's kernels, each (its pass's line field or None,
+    name, grid, recorded ns), the grid None as `forwards` holds it; a line
+    with no drafter has neither."""
+    lines, ranks = _ranks(out)
+    per_rank = [busy(fs) for fs in ranks]
+    got = []
+    for i, s in enumerate(lines):
+        parts = ["draft", *(p for p in PASSES if p in s)] if "d_target_ns" in s else []
+        got.append(
+            [
+                (
+                    {p: r[i].get(p, 0) for p in parts},
+                    [
+                        (k[4], k[5], k[6], (k[1] - k[0]) * 1e3)
+                        for k in fs[i]["kernels"]
+                        if parts and k[3] == "draft"
+                    ],
+                )
+                for fs, r in zip(ranks, per_rank)
+            ]
+        )
+    return got
+
+
+def floored(record, floor) -> list[dict]:
+    """Per line of the trace run's `record`, each drafter part's busy time
+    less its kernels' known terms under `floor` (`step_labels.Floor.term`) on
+    each rank, at its largest rank, by its busy line field; and under
+    ``floor`` why a term is not known, per field. A kernel's shape is its
+    pass's, as `capture.population_steps` places the step: the draft-KV pass
+    at the step's, the rest of the draft at its drafter's."""
+    from atom.compass.capture import population_steps
+
+    run = Path(record).parent.parent
+    if not (run / TRACE).is_dir():
+        raise ValueError(
+            f"{record} is a trace run's record whose run directory holds no "
+            f"{TRACE}/, from which the profiler's floor reads each drafter kernel"
+        )
+    shapes = defaultdict(list)
+    for shape, line in population_steps([run], drafters=True):
+        shapes[line["step"]].append(str(shape))
+    rows = []
+    for s, ranks in zip(read_jsonl(record), drafter(run)):
+        at, best, why = shapes[s["step"]], {}, defaultdict(set)
+        for parts, kernels in ranks:
+            got = dict(parts)
+            for key, name, grid, ns in kernels:
+                shape = at[0] if key == "d_draft_kv_ns" else at[-1]
+                term = floor.term(name, grid, ns, shape)
+                for part in [p for p in ("draft", key) if p in got]:
+                    if isinstance(term, str):
+                        why[LABELS[part]].add(term)
+                    else:
+                        got[part] -= term
+            for part, ns in got.items():
+                best[LABELS[part]] = max(best.get(LABELS[part], ns), ns)
+        row = {f: round(ns) for f, ns in best.items()}
+        rows.append(row | {"floor": {f: sorted(t) for f, t in why.items()}})
+    return rows

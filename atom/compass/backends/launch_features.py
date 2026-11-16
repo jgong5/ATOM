@@ -2,8 +2,9 @@
 """What a step's launch ran, per model architecture, as host-law columns.
 
 A host law prices ``(1, tokens, seqs)``, so a model whose launch takes another
-path from step to step, a graph replayed or run eagerly, names those paths as
-its provider's `features`, which a host law may adopt as columns
+path from step to step, a graph replayed or run eagerly, a batch split into
+micro-batches or not, names those paths as its provider's `features`, which a
+host law may adopt as columns
 (`step_linear_fit.fit_host`). `REGISTRY` maps an architecture, as ATOM keys its
 models (``hf_config.architectures[0]``), to its provider; any other takes
 `LaunchFeatures`, which declares none and changes no record, key or law. A
@@ -14,6 +15,7 @@ those sets, for a fit to check and a run to price (`HostDeviceRecurrence`).
 """
 
 import collections
+import functools
 
 from atom.compass.backends.shape import sum_tokens
 
@@ -131,7 +133,50 @@ def _v41_model(runner):
     )
 
 
-REGISTRY: dict[str, LaunchFeatures] = {"DeepseekV41ForCausalLM": DeepseekV41()}
+class DeepseekV4(LaunchFeatures):
+    """DeepSeek-V4's launch under two-batch overlap: a step its data-parallel
+    group splits (`BatchView.tbo_tokens`) launches each micro-batch in turn
+    through ATOM's `UBatchWrapper`, unless it is a decode replaying a graph
+    recorded split (`capture_rung`). `install` counts the wrapper's split
+    runs, `_run_ubatches`, found on the class so that a module forwarding
+    unknown names to the wrapper is not taken for it, from the start of each
+    launch (`run_model`): ATOM records its graphs after the runner is built,
+    a bucket that splits through the same path. A model built without
+    two-batch overlap has no wrapper."""
+
+    features = ("split",)
+
+    def install(self, runner) -> None:
+        seen = runner.compass_launch_seen = collections.Counter()
+        for module in runner.model.modules():
+            if callable(getattr(type(module), "_run_ubatches", None)):
+                module._run_ubatches = functools.partial(
+                    _split, seen, module._run_ubatches
+                )
+        runner.run_model = functools.partial(_launch, seen, runner.run_model)
+
+    def observe(self, runner) -> dict[str, float]:
+        return {"split": float(runner.compass_launch_seen["split"] > 0)}
+
+    def predict(self, view, graphs: dict) -> dict[str, float]:
+        split = view.tbo_tokens is not None and view.capture_rung is None
+        return {"split": float(split)}
+
+
+def _split(seen, run, *args, **kwargs):
+    seen["split"] += 1
+    return run(*args, **kwargs)
+
+
+def _launch(seen, run_model, *args, **kwargs):
+    seen.clear()
+    return run_model(*args, **kwargs)
+
+
+REGISTRY: dict[str, LaunchFeatures] = {
+    "DeepseekV41ForCausalLM": DeepseekV41(),
+    "DeepseekV4ForCausalLM": DeepseekV4(),
+}
 
 
 def provider(architecture: str | None) -> LaunchFeatures:

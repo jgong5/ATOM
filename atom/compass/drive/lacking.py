@@ -1,0 +1,379 @@
+# SPDX-License-Identifier: MIT
+"""`compass run --check`: every input a run lacks, listed before any server.
+
+`lacking` resolves the run's inputs as `runfile.build`, the runner and the
+server do, calling per input the function whose refusal the run would meet,
+so one lacking input hides no other: the platform, its datasheet and readings
+(`runfile.spec`); each store key or law
+file a flag names (`runfile.resolve`); a step linear law and host laws held
+against this run's engine config, widths, platform and host key
+(`run.pick_fitted`, `run.refuse_unfitted_law`, `run.refuse_unfitted_host`),
+and the step linear law's decode vectors against the rungs this configuration
+schedules (`uncovered_rungs`); the host laws' tokenizer term against the
+backend of the tokenizer ATOM's server loads (`run.tokenizer_term`); a step
+grid bundle's load; the configuration's memory readings; an op graph's price
+list; and an `--acceptance-record`. An input is missing when nothing resolves
+for it, and stale when the run refuses the entry it holds, naming each artifact
+axis that moved, or refuses steps it would price, as a step linear law's
+coverage is where a rung the run schedules has no vector. A memory readings
+entry holds every rank's member, or the store refuses it, so rank 0's load
+stands for each rank's. Each is held to ATOM's config as a server resolves it
+on the machine spec's device arch, whatever device this host has
+(`run._config`).
+
+Each lacking input is printed with the command that makes it. A step linear
+law's is the `calibrate.sh` command that records and fits one for this
+configuration (`calibration`), into `--out`, or `cal` in the current directory
+without one, naming each client variable it requires that this environment
+does not set, with its expected time, unknown while no calibration records its
+time.
+
+A prefill or decode instance's run reads a network file across nodes, as
+`deploy.sh run` hands it one, and its readings command takes the ATOM
+arguments a real start of it takes, where they are not the run's, and the
+environment the run's check set. Its step linear law and host laws are made
+by `deploy.sh record`, which records both sides together, and a fit of that
+side's records (`SIDE_LAW`); `calibrate.sh` records a lone server.
+
+Printed apart, outside the exit status: the gaps `--coverage`'s check counts;
+an op graph's absent price list, which prices every leaf by its analytical
+law, unless `--coverage` asks for its check, which then refuses; and the
+modules the step roofline leaves unclassified on the model built on the meta
+device, when it prices the steps the backend refuses. No `compass run`
+backend is the step roofline itself.
+"""
+
+import json
+import os
+import re
+import shlex
+from pathlib import Path
+
+from atom.compass import run as compass_run
+from atom.compass.artifacts import (
+    ArtifactRefusal,
+    ArtifactStore,
+    Rule,
+    machine_platform,
+)
+from atom.compass.backends.step_linear_plan import records, scheduled_rungs
+from atom.compass.drive import runfile, serve
+from atom.compass.memory.readings import PAGE_BOUND
+from atom.compass.run import OP_GRAPH, PRICE_LIST, STEP_GRID, STEP_LINEAR
+from atom.compass.runner.overrides import schedulable_bound, schedulable_ladder
+from atom.compass.spec import SpecRefusal
+
+#: Each store input by its run-file key.
+NAMES = {
+    STEP_LINEAR: "step linear law",
+    STEP_GRID: "step grid bundle",
+    "host": "host laws",
+    PRICE_LIST: "price list",
+}
+#: The commands that make each input.
+MADE_BY = {
+    "platform": "compass measure device on each node, then compass fit device",
+    STEP_GRID: "compass trace steps, compass measure steps --grid, then compass "
+    "fit steps --backend step-grid",
+    "host": "compass record, then compass fit host",
+    "memory readings": "compass measure memory --gpu G --out D "
+    "--store {store} -- {atom}",
+    PRICE_LIST: "compass trace ops --population, compass measure ops --plan, then "
+    "compass fit ops",
+    "acceptance record": "compass record of a speculative run",
+    "coverage input": "compass record or compass trace steps under these ATOM "
+    "arguments",
+    "coverage": "compass measure steps --grid, or compass measure ops --plan",
+}
+#: The artifact axis each cell of an invalidation refusal names.
+AXIS = re.compile(r"` x `([^`]+)`")
+#: The script that takes a step linear law's records and fits it.
+CALIBRATE = Path(__file__).resolve().parents[3] / "scripts/compass/calibrate.sh"
+#: Its directory when `--out` names none, in the current one.
+CALIBRATION_OUT = "cal"
+#: The variables `calibrate.sh` requires for its clients, which no configuration
+#: states: its command states each this process's environment sets, and names
+#: each it does not.
+CLIENT_ENV = ("TRACES", "AIPERF_PYTHON")
+#: The command that makes a prefill or decode instance's law, `fit` its
+#: `compass fit` command: each `deploy.sh record` deployment writes the side's
+#: record in OUT/<side>.
+SIDE_LAW = (
+    "deploy.sh OUT record of the deployment, then compass fit {fit} on each OUT/{side}"
+)
+#: Each law a side fits from its own records, by its `compass fit` command.
+FITS = {STEP_LINEAR: "steps --backend step-linear", "host": "host"}
+#: Each side by the letter `runfile.pd_side` gives it.
+SIDES = {"P": "prefill", "D": "decode"}
+
+
+def report(args, atom_args, real=None, env=None) -> int:
+    """Print each input `lacking` finds, with the run's refusal and the command
+    that makes it, then what it prints apart; 1 when one is lacking, else 0."""
+    lacks, apart = lacking(args, atom_args, real, env)
+    for name, state, refusal, made_by in lacks:
+        print(f"lacking {name}: {state}\n  refused: {refusal}\n  made by: {made_by}")
+    if not lacks:
+        print("nothing lacking: every input the run reads resolves and holds")
+    for line in apart:
+        print(f"apart: {line}")
+    return 1 if lacks else 0
+
+
+def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
+    """Each input the run `args`, parsed by `run`, lacks under ATOM's arguments
+    `atom_args`, as ``(name, state, refusal, made by)``; and the lines printed
+    apart. The readings command takes `real`, a real start's ATOM arguments,
+    and runs under `env`, the variables the check set, where given."""
+    from atom.compass.drive import run as drive_run
+    from atom.compass.run import memory, step_grid
+    from atom.model_engine.llm_engine import _load_tokenizer
+
+    lacks, apart = [], []
+
+    def met(name, made_by, check, *given, state=None):
+        """`check(*given)`'s value, True for None, or False when it refuses,
+        its refusal recorded as `name` lacking."""
+        try:
+            return check(*given) or True
+        except (ArtifactRefusal, SpecRefusal, ValueError) as refused:
+            lacks.append((name, state or _state(refused), str(refused), made_by))
+            return False
+
+    store = ArtifactStore(Path(args.store).resolve())
+    side = runfile.pd_side(atom_args)
+    across = bool(args.network) and side is not None
+    try:
+        machine = runfile.spec(args, store, across)
+    except (OSError, ArtifactRefusal, SpecRefusal, ValueError) as refused:
+        return [("platform", "missing", str(refused), MADE_BY["platform"])], []
+    arch, engine = machine.value("device.arch"), runfile._engine_args(atom_args)
+    config = drive_run._config(atom_args, arch)
+    run = {"machine": machine.echo(), "store": str(store.root)}
+    flags = {k: getattr(args, k) for k in runfile.KINDS if getattr(args, k)}
+    made_by = dict(MADE_BY)
+    if side:
+        made_by |= {
+            k: SIDE_LAW.format(fit=f, side=SIDES[side]) for k, f in FITS.items()
+        }
+    elif STEP_LINEAR in flags:
+        out = args.out or CALIBRATION_OUT
+        made_by[STEP_LINEAR] = calibration(out, atom_args, config)
+    for name, tokens in (flags | {"host": args.host_laws or []}).items():
+        tokens, held = [tokens] if isinstance(tokens, str) else tokens, []
+        for token in tokens:
+            made = made_by[name]
+            given = store, name, token, machine, atom_args
+            if found := met(f"{NAMES[name]} {token}", made, runfile.resolve, *given):
+                held.append(found[0])
+        if held and len(held) == len(tokens):
+            run[name] = held if len(held) > 1 else held[0]
+    law, host = NAMES[STEP_LINEAR], NAMES["host"]
+    if STEP_LINEAR in run and met(
+        law, made_by[STEP_LINEAR], compass_run.pick_fitted, run, STEP_LINEAR, config
+    ):
+        met(law, made_by[STEP_LINEAR], compass_run.refuse_unfitted_law, run, config)
+        if rungs := uncovered_rungs(run[STEP_LINEAR], config):
+            whose = (
+                " in the law or its draft law" if "draft" in run[STEP_LINEAR] else ""
+            )
+            refusal = (
+                f"no decode vector{whose} for rung{'s' * (len(rungs) > 1)} "
+                f"{', '.join(map(str, rungs))}, which this configuration "
+                "schedules; the law refuses a decode step at each"
+            )
+            lacks.append((law, "stale (coverage)", refusal, made_by[STEP_LINEAR]))
+    if "host" in run and met(
+        host, made_by["host"], compass_run.pick_fitted, run, "host", config
+    ):
+        given = run["host"], config, machine_platform(machine)
+        met(host, made_by["host"], compass_run.refuse_unfitted_host, *given)
+        tok = _load_tokenizer(engine.model, engine.trust_remote_code)
+        met(host, made_by["host"], compass_run.tokenizer_term, run, tok, config)
+    grid, made = NAMES[STEP_GRID], MADE_BY[STEP_GRID]
+    checked = STEP_GRID in run and (
+        met(grid, made, compass_run.refuse_context_parallel, STEP_GRID, config)
+        and met(grid, made, step_grid.load, run[STEP_GRID], config, machine)
+    )
+    made = MADE_BY["memory readings"].format(
+        store=args.store, atom=shlex.join(real or atom_args)
+    )
+    made = " ".join([*(f"{k}={shlex.quote(v)}" for k, v in (env or {}).items()), made])
+    read = met("memory readings", made, memory.load, run["store"], config, machine, 0)
+    if read and PAGE_BOUND not in read.values and _reads_page_bound(config):
+        why = f"{read.source} states no {PAGE_BOUND}, which an fp4 V4.1 start reads"
+        lacks.append(("memory readings", "stale", why, made))
+
+    if getattr(args, OP_GRAPH):
+        run[OP_GRAPH], key = True, runfile._price_list_key(atom_args, machine)
+        listed, made = NAMES[PRICE_LIST], MADE_BY[PRICE_LIST]
+        if store.directory_for(key).exists():
+            run[PRICE_LIST] = key.values
+            checked = met(listed, made, compass_run._price_list, run, config, machine)
+        elif args.coverage:
+            given = args.coverage, run, atom_args
+            met(listed, made, drive_run.check, *given, state="missing")
+        else:
+            apart.append(
+                f"price list: none at {key}, so the op graph prices every leaf by "
+                f"its analytical law; made by {made}"
+            )
+    if record := args.acceptance_record:
+        steps = Path(record) / serve.STEPS
+        drawn = any(steps.glob(compass_run.ACCEPTANCE_FILE.format("*")))
+        given = record, atom_args, runfile._dp_width(atom_args)
+        made, state = MADE_BY["acceptance record"], None if drawn else "missing"
+        met("acceptance record", made, drive_run.measured, *given, state=state)
+    if args.coverage and checked:
+        made, given = MADE_BY["coverage input"], (args.coverage, run, atom_args)
+        if found := met("coverage input", made, drive_run.check, *given):
+            apart.append(_coverage(found))
+    if args.step_roofline or STEP_GRID in flags:
+        apart += _unclassified(atom_args, arch)
+    return lacks, apart
+
+
+def _reads_page_bound(config) -> bool:
+    """Whether a start of `config` sizes by what `memory_allocated` answers on
+    its device: DeepSeek-V4.1's builder under --index-cache-dtype fp4."""
+    from atom.utils import get_hf_text_config
+    from atom.utils.selector import Family, attn_family
+
+    if getattr(config, "index_cache_dtype", None) != "fp4":
+        return False
+    return attn_family(get_hf_text_config(config.hf_config)) is Family.CSA2
+
+
+def _state(refused) -> str:
+    """``missing`` when nothing resolves for an input, else ``stale``, with each
+    artifact axis that moved."""
+    if isinstance(refused, SpecRefusal) or getattr(refused, "rule", None) is (
+        Rule.RESOLUTION
+    ):
+        return "missing"
+    axes = AXIS.findall(str(refused))
+    return f"stale ({', '.join(axes)})" if axes else "stale"
+
+
+def uncovered_rungs(law: dict, config) -> list:
+    """Each decode rung `config` schedules (`scheduled_rungs`, of its capture
+    ladder, `schedulable_ladder`, and the scheduler's bound) that the step
+    linear `law` has no vector for, or its draft law, whose decode vectors
+    price a decode's draft unless it states a `forward` vector. A step outside
+    a vector's hull is priced, not refused, so no context counts."""
+    rungs = scheduled_rungs(_ladder(config), schedulable_bound(config))
+    draft = law.get("draft")
+    laws = [law] + ([draft] if draft and "forward" not in draft else [])
+    vectors = [{str(rung) for rung in each.get("decode", {})} for each in laws]
+    return [r for r in rungs if any(str(r) not in v for v in vectors)]
+
+
+def _ladder(config) -> list[int]:
+    """The capture sizes the scheduler can produce (`schedulable_ladder`); none
+    on an eager runner, which captures none."""
+    return [] if config.enforce_eager else schedulable_ladder(config)
+
+
+def calibration(out, atom_args, config) -> str:
+    """The `calibrate.sh` command that records and fits a step linear law for
+    `config`, ATOM's arguments `atom_args` resolved, into `out`, then its
+    expected time: the records `step_linear_plan.records` plans, the trace
+    runs only where `compass record --trace` takes one; on as many GPUs as
+    ATOM's ranks use; under this process's environment as a law's key states
+    it (`keyed_env`), and each of `CLIENT_ENV` it sets, then a line naming each
+    it does not, which `calibrate.sh` refuses to run without. Where
+    `calibrate.sh` cannot take ATOM's arguments, why."""
+    from atom.compass.drive.record import refuse_trace
+    from atom.compass.run.step_grid import keyed_env
+
+    try:
+        server = _server_args(atom_args)
+    except ValueError as refused:
+        return f"no calibrate.sh command: {refused}"
+    try:
+        refuse_trace(atom_args)
+        untraced = ""
+    except ValueError as refused:
+        untraced = (
+            f"\n  no trace run, which compass record refuses: {refused}; so the "
+            "law's prefill stays unfitted"
+        )
+    bound, width = schedulable_bound(config), runfile._dp_width(atom_args)
+    planned = records(_ladder(config), bound, width, not untraced)
+    engine = runfile._engine_args(atom_args)
+    gpus = engine.tensor_parallel_size * engine.data_parallel_size
+    gpus *= engine.pipeline_parallel_size * engine.prefill_context_parallel_size
+    # `calibrate.sh` refuses an empty value as it refuses an unset one.
+    clients = {k: os.environ[k] for k in CLIENT_ENV if os.environ.get(k)}
+    unset = [k for k in CLIENT_ENV if k not in clients]
+    unheld = (
+        f"\n  before it runs, set {' and '.join(unset)}, which calibrate.sh "
+        "requires and this environment does not set"
+        if unset
+        else ""
+    )
+    env = keyed_env() | clients
+    env |= {
+        "MODEL": str(Path(engine.model).resolve()),
+        "GPU": ",".join(map(str, range(gpus))),
+        "SERVER_ARGS": " ".join(server),
+    }
+    words = [f"{k}={shlex.quote(v)}" for k, v in env.items()]
+    words += map(shlex.quote, [str(CALIBRATE), str(Path(out).resolve()), *planned])
+    return (
+        " ".join(words)
+        + unheld
+        + untraced
+        + "\n  expected time: unknown, as calibrate.sh records no calibration's time"
+    )
+
+
+def _server_args(atom_args) -> list[str]:
+    """ATOM's arguments `atom_args` less `--model`, which `calibrate.sh` takes
+    apart, as its `SERVER_ARGS` takes them: split on whitespace, and its own
+    default in place of none."""
+    server, given = [], iter(atom_args)
+    for arg in given:
+        if arg == "--model":
+            next(given, None)
+        elif not arg.startswith("--model="):
+            server.append(arg)
+    if not server:
+        raise ValueError(
+            "it serves --max-model-len 262144 when SERVER_ARGS states nothing, and "
+            "ATOM's arguments state nothing but --model"
+        )
+    if spaced := [arg for arg in server if len(arg.split()) != 1]:
+        raise ValueError(
+            "it splits SERVER_ARGS on whitespace, so it cannot pass ATOM's "
+            f"argument{'s' * (len(spaced) > 1)} {', '.join(map(repr, spaced))}"
+        )
+    return server
+
+
+def _coverage(report: dict) -> str:
+    """The coverage check's `report`: its counts, and its gaps as JSON."""
+    gaps = {k: v for k, v in report.items() if k not in ("inputs", "steps", "share")}
+    return (
+        f"coverage of {', '.join(report['inputs'])}: {gaps.pop('covered')} of "
+        f"{report['steps']} steps covered; made by {MADE_BY['coverage']}\n"
+        + json.dumps(gaps, indent=1)
+    )
+
+
+def _unclassified(atom_args, arch: str) -> list[str]:
+    """The line naming each module the step roofline leaves unclassified on the
+    model ATOM's arguments build on the meta device of `arch`, which refuses
+    every step it is asked for; none when it classifies all. The build declares
+    a device process-wide, so it runs in a process of its own."""
+    from atom.compass.backends.step_roofline import UNCLASSIFIED
+    from atom.compass.bench.ops import _child
+    from atom.compass.validate.bound import walked
+
+    modules = _child(walked, atom_args, arch)
+    if names := [m.name for m in modules if m.kind == UNCLASSIFIED]:
+        return [
+            "the step roofline below the backend refuses each step it is asked "
+            "for, leaving these modules unclassified: " + ", ".join(names)
+        ]
+    return []
