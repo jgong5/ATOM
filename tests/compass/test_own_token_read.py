@@ -4,20 +4,27 @@
 ATOM's non-deferred `prepare_sampled_ids` blocks in `tolist` until the
 forward's own sampled ids are on the host, so such a runner's output forward
 leaves no earlier than its own target end, as the last pipeline stage's does;
-one that defers leaves at the previous output forward's.
+one that defers leaves at the previous output forward's. Its record stamps
+that read, which its labels and the launch's blocked time end at, as at a
+token copy wait.
 """
 
+import statistics
 from types import SimpleNamespace
 
 import pytest
+from test_blocked_launch import _planted_tool
 from test_dp_step_max import dp2, prefill, runner  # noqa: F401
 from test_draft_after_exit import Drafted
 from test_memory_readings import META_8B
-from test_parity_recurrence import MS, line
+from test_parity_device_window import BUSY, _Processor, _recorded
+from test_parity_record import _config, _drive
+from test_parity_recurrence import MS, _labelled, _law, line
 from test_run_step_grid import B37, decode, deployment, publish, run_file
 
 from atom.compass import run as compass_run
-from atom.compass.parity import recurrence
+from atom.compass.backends.step_labels import HOST_SEGMENTS, label
+from atom.compass.parity import ENV, read, recurrence
 from atom.compass.runner.overrides import HostDeviceRecurrence
 
 OUTPUT = SimpleNamespace(
@@ -101,3 +108,100 @@ def test_the_gate_releases_a_record_s_own_token_read_at_its_device_end():
     [(step, kind, err, residual, *_)] = late["failures"]
     assert (step, kind, residual) == (3, "decode", pytest.approx(-3))
     assert err == pytest.approx(100 * (13 / 16 - 1))
+
+
+def test_a_record_s_own_token_read_is_in_neither_its_launch_nor_its_post(tmp_path):
+    """Each decode reads its own tokens for 9 ms, from its launch's end, and
+    leaves 1 ms later: `W_launch` ends and `W_post` starts at that read."""
+    samples = _labelled(tmp_path, own_reads())
+    assert [s.host["W_launch"] for s in samples] == pytest.approx([1e-3] * 4)
+    assert [s.host["W_post"] for s in samples] == pytest.approx([1e-3] * 4)
+
+
+def _fitted(samples) -> dict:
+    """`_law` with its decode vector and host laws at `samples`' median labels."""
+    law = _law()
+    device = statistics.median(s.device_s for s in samples)
+    law["decode"]["eager"]["coefficients"]["step"] = device
+    law["host"]["laws"] = {
+        "decode": {
+            g: [statistics.median(s.host[g] for s in samples if g in s.host), 0, 0]
+            for g in HOST_SEGMENTS
+        }
+    }
+    return law
+
+
+@pytest.mark.parametrize("late", [0, 3])
+def test_a_law_fitted_on_a_record_s_own_reads_grades_it_as_the_gate_does(
+    tmp_path, late
+):
+    """Fitted on the on-time reads, the law charges each read once, after the
+    forward's own device end; on the record whose fourth read ends 3 ms past
+    it, that decode fails with the gate's residual."""
+    law = _fitted(_labelled(tmp_path, own_reads()))
+    steps = own_reads(late)
+    gate = recurrence.check(steps)
+    got = recurrence.priced(steps, _labelled(tmp_path, steps), law)
+    assert got["pass"] == gate["pass"] == (not late)
+    assert got["total"] == pytest.approx(gate["total"], abs=1e-9)
+    assert got["kinds"] == pytest.approx(gate["kinds"])
+    assert [r[:4] for r in got["failures"]] == pytest.approx(
+        [r[:4] for r in gate["failures"]]
+    )
+
+
+def test_a_line_s_blocked_time_runs_to_its_own_token_read(tmp_path, monkeypatch):
+    """A runner that reads its own tokens: each launch blocks 300 ns, an output
+    forward's postprocess 50 ns more before its read, and the read itself
+    7000 ns. `blocked_ns` holds the launch's and the postprocess's, as at a
+    token copy wait, and `W_launch` runs to the read less them."""
+    batches = _drive(tmp_path / "simulated", monkeypatch, {0: [0, 1]})[0][0]
+    recorded, device = _recorded(batches[-1])
+    tool, spend = _planted_tool(("hipEventSynchronize", "hipMemcpyWithStream"))
+    late = [0]
+
+    def blocking(call, ns, then=lambda *a: []):
+        def blocked(*args):
+            spend(call, ns)
+            late[0] += ns
+            return then(*args)
+
+        return blocked
+
+    class Blocking(recorded):
+        def step_clock_ns(self):
+            return recorded.step_clock_ns() + late[0]
+
+    launch = recorded.__mro__[2].run_model
+    monkeypatch.setattr(
+        recorded.__mro__[2], "run_model", blocking("hipMemcpyWithStream", 300, launch)
+    )
+    monkeypatch.setattr(_Processor, "is_deferred_out", False, raising=False)
+    monkeypatch.setattr(
+        _Processor,
+        "prepare_sampled_ids",
+        lambda self, batch: blocking("hipMemcpyWithStream", 7000)(),
+    )
+    monkeypatch.setenv(ENV, str(tmp_path / "real"))
+    runner = Blocking(0, _config())
+    runner._blocked = tool
+    read_ids = runner.tokenID_processor.prepare_sampled_ids
+    runner.tokenID_processor.prepare_sampled_ids = blocking(
+        "hipMemcpyWithStream", 50, read_ids
+    )
+    for batch in batches:
+        runner.forward(batch)
+    device.tick = BUSY // 3
+    runner.exit()
+
+    lines = read(tmp_path / "real")[0]
+    outputs = [b.produces_output() for b in batches]
+    assert any(outputs) and not all(outputs)
+    assert [("t_read_ns" in x) for x in lines] == outputs
+    want = [{"hipMemcpyWithStream": 350 if o else 300} for o in outputs]
+    assert [x["blocked_ns"] for x in lines] == want
+    for s, x, w in zip(label(tmp_path / "real" / "dp0.jsonl")[0], lines, want):
+        l0, l1 = x["t_launch_ns"]
+        wall = x.get("t_read_ns", [l1])[0] - l0
+        assert s.host["W_launch"] == pytest.approx((wall - sum(w.values())) * 1e-9)
