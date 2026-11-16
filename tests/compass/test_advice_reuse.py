@@ -47,7 +47,9 @@ from atom.compass.artifacts import (
     keyed_platform,
     member_name,
 )
+from atom.compass.bench import ops
 from atom.compass.drive import reuse
+from atom.compass.drive import run as drive_run
 from atom.compass.fit.publish import RANK
 from atom.compass.run import memory
 from atom.compass.run.step_grid import keyed
@@ -72,9 +74,19 @@ def searched(tmp_path, monkeypatch, at_head):
     whose digest is the tree's, with no law file."""
     r = deployment(tmp_path, **COVERED)
     served(monkeypatch, r.config)
+    resolved_here(monkeypatch, lambda atom_args: r.config)
     monkeypatch.setattr(reuse, "LAWS", tmp_path / "laws")
     (tmp_path / "laws").mkdir()
     return r
+
+
+def resolved_here(monkeypatch, resolve):
+    """Each instance's config `resolve(atom_args)`, resolved in this process
+    rather than in the check's child."""
+    monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(
+        drive_run, "_declared", lambda atom_args, arch: resolve(atom_args)
+    )
 
 
 def advise(tmp_path, document=DOCUMENT, **fields) -> dict:

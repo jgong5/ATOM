@@ -39,11 +39,15 @@ reads at the step's rows, attention's context in `kv`, the run's KV cache
 format, the routed experts over the run's `ep` ranks. A leaf that launches
 no kernel costs nothing. A step prices once the leaves of a kind that agree on
 every part of a leaf the kind's work has read, a leaf whose work reads nothing
-of the step keeps its price, and with no price list a graph keeps its price
-for each set of prices of its leaves that read the step. Regions compose by the
-IR's joins: a `Seq` adds its items in order, a `Repeat` re-emits its body's
-prices once per instance, a `max` `Par` emits its longest branch's prices, and a
-`resource_bound` `Par` one roofline over its branches' summed work. The price
+of the step keeps its price and its work, or that it launches no kernel, and
+with no price list a graph keeps its price for each set of prices of its
+leaves that read the step. A step at the view of one of the last `VIEWED`
+steps, reading the same graphs, prices as it did, as a DP rank's dummy
+forwards do.
+Regions compose by the IR's joins: a `Seq` adds its items in order, a `Repeat`
+re-emits its body's prices once per instance, a `max` `Par` emits its longest
+branch's prices, and a `resource_bound` `Par` one roofline over its branches'
+summed work. The price
 is one rank's device busy time: the runner takes a DP group's max and
 composes host time.
 
@@ -62,9 +66,11 @@ each leaf outside a `resource_bound` `Par` resolves through a `Resolver`: the
 price list, asked ``(leaf, bound, work)`` with `bound` the step's or
 micro-batch's (`_bound`) at the rows the leaf ran (`_ran_at`), or the list of
 each it may have run at where it leads with a padded prefill's T that is also
-a count of its width (`_ran_at_each`), then its roofline. A `resource_bound`
-`Par` prices its branches' summed work, so its leaves take no price of their
-own.
+a count of its width (`_ran_at_each`), then its roofline. `work` gives the
+leaf's work when called, which the roofline alone does: a leaf known to launch
+a kernel whose work reads the step has it worked out only where the list
+declines it. A `resource_bound` `Par` prices its branches' summed work, so its
+leaves take no price of their own.
 
 Terms. One per op kind, ``op.<kind>``, and ``par.resource_bound``, each
 the fold of its prices in run order. A term is `declared`, its note naming
@@ -95,6 +101,7 @@ whose collective leaves the scale-up domain.
 
 from __future__ import annotations
 
+import functools
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
@@ -129,6 +136,10 @@ KEPT = 1 << 16
 #: The prices a graph keeps by its step-reading leaves' prices; past it, it
 #: forgets them.
 COMPOSED = 1 << 12
+#: The steps a backend keeps the prices of by their views and graphs: as many
+#: as a run's graph lookup keeps graphs (`run._op_graphs`), which parses a
+#: graph it dropped anew, so a step kept longer would only hold its graphs.
+VIEWED = 64
 #: A reference argument's keys: a context key or a module path, whose value a
 #: leaf's work does not read.
 REFS = ({"context"}, {"module"})
@@ -199,6 +210,16 @@ def _ref(value):
     return sorted(value) if isinstance(value, dict) and value.keys() in REFS else value
 
 
+def _ridden(leaf: dict, got: tuple) -> tuple:
+    """`leaf`'s price `got` as `_priced` lists it: with whether it rides the
+    comm stream under two-batch overlap, an MoE exchange of activations."""
+    comm = leaf["op"].startswith(MOE_EXCHANGES) and any(
+        isinstance(a, dict) and a.get("role") == "activation"
+        for a in leaf["args"].values()
+    )
+    return (*got[:4], comm, *got[4:])
+
+
 def _run(region: dict):
     """`region`'s leaves in run order, a repeat's body once an instance."""
     if "op" in region:
@@ -223,7 +244,8 @@ class _Watched:
 
 
 class _Roofline(CostSource):
-    """A leaf's roofline, as `OpGraphBackend._unit` prices it."""
+    """A leaf's roofline, as `OpGraphBackend._unit` prices it, over the work
+    its request's call gives."""
 
     name = SOURCE
 
@@ -231,7 +253,8 @@ class _Roofline(CostSource):
         self.backend = backend
 
     def price(self, request: tuple) -> CostTerm:
-        (leaf, _, w), refused = request, []
+        (leaf, _, later), refused = request, []
+        w = later()
         if isinstance(w, tuple):
             raise CostRefused(request, w)
         kind = leaf["op"]
@@ -360,6 +383,9 @@ class OpGraphBackend(CostBackend):
         self._step: dict[tuple, tuple] = {}
         self._reads: dict[str, set] = {}
         self._graphs: dict[tuple, tuple] = {}
+        # By view and graphs' ids: a step's price, and the graphs, which keep
+        # those ids theirs.
+        self._viewed: dict[tuple, tuple] = {}
         self._live: list | None = None
         self._pars = 0
         # By leaf object: the view of the rows its pass runs, for a routed
@@ -374,16 +400,22 @@ class OpGraphBackend(CostBackend):
 
     def price(self, batch_view: BatchView) -> StepCost:
         refused: list[Refusal] = []
-        self._step, self._live, self._pars, graph = {}, None, 0, None
+        self._step, self._live, self._pars, graph, viewed = {}, None, 0, None, None
         self._passes = {}
         if batch_view.tbo_tokens is None or batch_view.image_tokens:
             at, region = self._region(batch_view)
-            bound = self.resolver and self._bound(batch_view)
             drafted_at, drafted = (
                 self._region(batch_view, draft=True) if self.drafts else (None, None)
             )
             samples = batch_view.decode or batch_view.produces_output
             kv = self.block and samples and self._region(batch_view, draft=KV)[1]
+            # A view and graphs priced lately price as they did, a DP rank's
+            # dummy forwards among them.
+            held = (region, drafted, kv)
+            viewed = (batch_view, *map(id, held))
+            if (got := self._viewed.get(viewed)) is not None:
+                return got[0]
+            bound = self.resolver and self._bound(batch_view)
             if drafted and samples and batch_view.moe_rows is None:
                 self._passes = self._pass_views(drafted, batch_view)
             # A price list's bound reads each step's context, so its steps
@@ -462,6 +494,10 @@ class OpGraphBackend(CostBackend):
                 composed.clear()
             composed[_same(live)] = cost
             self._graphs[graph] = ((region, drafted, kv), live, composed)
+        if viewed is not None:
+            if len(self._viewed) >= VIEWED:
+                self._viewed.clear()
+            self._viewed[viewed] = (cost, held)
         return cost
 
     def describe(self) -> str:
@@ -697,19 +733,19 @@ class OpGraphBackend(CostBackend):
         roofline; what refuses goes to `refused`. With a `bound`, a leaf
         resolves through the price list first."""
         if "op" in region:
-            leaf = self._leaf(region, view, refused, bound)
-            comm = region["op"].startswith(MOE_EXCHANGES) and any(
-                isinstance(a, dict) and a.get("role") == "activation"
-                for a in region["args"].values()
-            )
-            return [(*leaf[:4], comm, *leaf[4:])] if leaf else []
+            got = self._leaf(region, view, refused, bound)
+            return [_ridden(region, got)] if got else []
         if "repeat" in region:
             body = self._priced(region["repeat"], view, refused, bound)
             return body * region["count"]
         if "seq" in region:
-            return [
-                p for i in region["seq"] for p in self._priced(i, view, refused, bound)
-            ]
+            priced = []
+            for item in region["seq"]:
+                if "op" not in item:
+                    priced += self._priced(item, view, refused, bound)
+                elif got := self._leaf(item, view, refused, bound):
+                    priced.append(_ridden(item, got))
+            return priced
         pooled = region["join"] == "resource_bound"
         self._pars += 1
         branches = [
@@ -738,25 +774,29 @@ class OpGraphBackend(CostBackend):
         operator, arguments, outputs and stated fields; and once for good for a
         leaf object whose work read nothing of the step and nothing refused. A
         leaf `_pass_views` holds reads its pass's view."""
-        view = self._passes.get(id(leaf), view)
         kept = self._kept.get(id(leaf))
         if kept is None:
             if len(self._kept) >= KEPT:
                 self._kept.clear()
                 self._graphs.clear()
-            kept = self._kept[id(leaf)] = [leaf, None, None]
+            kept = self._kept[id(leaf)] = [leaf, None, None, None]
+        elif kept[3] and kept[3][0] is None:  # it launches no kernel at any step
+            return None
         if kept[2] and kept[2][0] == bound:
             return kept[2][1]
+        if self._passes:
+            view = self._passes.get(id(leaf), view)
         # A step's refusals are named once, so a repeat need not add its own.
         key = (id(view), bound, self._text(kept, bound))
-        if key not in self._step:
+        step = self._step.get(key)
+        if step is None:
             n, watched = len(refused), _Watched(view)
-            got = self._price_leaf(leaf, watched, refused, bound)
-            self._step[key] = (view, got, not (watched.read or refused[n:]))
+            got = self._price_leaf(kept, watched, refused, bound)
+            step = self._step[key] = (view, got, not (watched.read or refused[n:]))
             # Kept too by every path the work has read by now, its own among
             # them, which a path read anew changes.
-            self._step[id(view), bound, self._text(kept, bound)] = self._step[key]
-        _, got, free = self._step[key]
+            self._step[id(view), bound, self._text(kept, bound)] = step
+        _, got, free = step
         if free:
             kept[2] = (bound, got)
         elif self._live is not None:
@@ -774,9 +814,14 @@ class OpGraphBackend(CostBackend):
             kept[1] = (at, json.dumps(what, sort_keys=True, default=repr))
         return kept[1][1]
 
-    def _price_leaf(self, leaf: dict, view, refused: list, bound):
-        """One leaf's ``(term, seconds, stated, work, (origins, declined))`` as
-        `_priced` lists it; None when it launches no kernel or refuses."""
+    def _work(self, kept: list, view):
+        """The work of the leaf `kept` holds at `view`, a `_Watched`, or its
+        refusals; kept for good once it read nothing of the step, and else
+        noted as a leaf that launches a kernel, as one whose work reads the
+        step does at every step."""
+        if kept[3]:
+            return kept[3][0]
+        leaf = kept[0]
         try:
             seen = _Seen(leaf, self._reads.setdefault(leaf["op"], set()))
             w = work(seen, view, self.tp, self.kv, self.ep)
@@ -784,12 +829,30 @@ class OpGraphBackend(CostBackend):
             w = tuple(exc.declined)
         except ValueError as exc:
             w = (Refusal(SOURCE, f"{leaf['op']}: {exc}"),)
-        if w is None:
-            return None
+        if not view.read:
+            kept[3] = (w,)
+        elif w is not None:
+            kept[3] = False
+        return w
+
+    def _price_leaf(self, kept: list, view, refused: list, bound):
+        """The leaf `kept` holds as ``(term, seconds, stated, work, (origins,
+        declined))``, as `_priced` lists it; None when it launches no kernel or
+        refuses. With a `bound`, a leaf known to launch a kernel leaves its
+        work to the roofline, which reads it only where the price list
+        declines."""
+        leaf = kept[0]
+        if not bound or kept[3] is None:
+            w = self._work(kept, view)
+            if w is None:
+                return None
         if bound:
             each = _ran_at_each(leaf, bound)
+            later = functools.partial(self._work, kept, view)
             try:
-                got = self.resolver.resolve((leaf, each if each[1:] else each[0], w))
+                got = self.resolver.resolve(
+                    (leaf, each if each[1:] else each[0], later)
+                )
             except CostRefused as exc:
                 refused.extend(exc.declined)
                 return None
