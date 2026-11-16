@@ -2287,7 +2287,7 @@ def figures_main(argv) -> None:
     at a time: `--source` names it, the records must be its `runs`, they are
     folded under `--form` and `--moe-routing`, as its provenance states them,
     and the figures, of the steps its `vectors` price, go under it; a source
-    whose vectors price none of the records' steps refuses. Records whose
+    whose vectors price none of the records' uncut steps refuses. Records whose
     prefill buckets, `--engine`'s included, are not those LAW's prefill
     vector was fitted under refuse where the figures grade that vector, as
     do any under a law with no `sources` that names `padding` unfitted."""
@@ -2342,10 +2342,13 @@ def figures_main(argv) -> None:
                 f"{' with ' + args.engine if args.engine else ''} state "
                 f"{list(stated) or 'none'}: its folds are fitted under its own"
             )
-    if vectors is not None and not any(_vector_of(s.view) in vectors for s in samples):
+    cuts = [s.cut for s in samples if vectors and _vector_of(s.view) in vectors]
+    if vectors is not None and all(cuts):
+        why = {c: cuts.count(c) for c in sorted(set(cuts))}
         raise ValueError(
             f"{args.law}'s source {args.source} prices none of the records' "
-            f"steps: its vectors are {vectors}"
+            f"uncut steps: its vectors are {vectors}"
+            + (f", and the fit cuts each step they price: {why}" if why else "")
         )
     into["figures"] = fold_figures(_fold_laws(samples, options, 0), vectors)
     Path(args.law).write_text(json.dumps(law) + "\n")

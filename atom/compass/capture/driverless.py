@@ -30,6 +30,13 @@ DEVICES = {
     # Its capability is card 0's of the MI455 A0 node.
     "gfx1250": (256, (12, 5), 432 << 30),
 }
+#: The card's product name, by arch, as rocm-smi's series and the datasheet
+#: in `compass/devices` name it: aiter reads the model it keys its comm-fused
+#: MoE's winners on off the name. An arch without one is named by its arch.
+NAMES = {
+    "gfx942": "AMD Instinct MI308X",
+    "gfx950": "AMD Instinct MI355X",
+}
 #: The rest of a declared device, by arch, where a source states it: warp size,
 #: threads per CU, L2 bytes, registers per CU and shared memory per block.
 PROPERTIES = {
@@ -93,7 +100,7 @@ def _props(arch, read=None):
     return types.SimpleNamespace(
         multi_processor_count=cus,
         gcnArchName=arch,
-        name=arch,
+        name=NAMES.get(arch, arch),
         major=major,
         minor=minor,
         total_memory=memory,
@@ -234,6 +241,8 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
     # No checkpoint is read, so a parameter's fill is arbitrary either way, and
     # the in-place RNG fills ask the device for a generator.
     torch.Tensor.uniform_ = torch.Tensor.normal_ = lambda self, *a, **k: self
+    # The allocator's note that another stream uses a block: none is allocated.
+    torch.Tensor.record_stream = lambda self, stream: None
 
     from torch._subclasses import fake_tensor
 
