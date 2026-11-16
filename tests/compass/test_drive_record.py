@@ -30,6 +30,7 @@ from atom.compass import cli
 from atom.compass.backends.step_labels import TABLE_VERSION, label
 from atom.compass.drive import aiter_jit, gpu, identity, record, serve
 from atom.compass.fit.samples import load
+from atom.compass.parity import WRITE_THROUGH
 
 PLANTED = """\
 import http.server, os, shutil, sys
@@ -312,7 +313,7 @@ def test_a_record_s_server_keeps_triton_s_autotune_choices_unless_the_caller_say
 
     assert (tmp_path / "seen").read_text() == repr(held)
     run = json.loads((out / "run.json").read_text())
-    assert run["env"] == dict(zip(names, held))
+    assert run["env"] == dict(zip(names, held)) | {WRITE_THROUGH: "0"}
     assert [os.environ.get(name) for name in names] == list(caller)
 
 

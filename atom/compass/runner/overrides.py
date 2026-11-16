@@ -105,6 +105,7 @@ import os
 import pickle
 import sys
 from functools import partial, wraps
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -324,9 +325,9 @@ class HostDeviceRecurrence:
     The host runs `HOST_SEGMENTS` from `now`. A forward's entry waits for the
     device work two forwards back, or on a pipeline stage `stage = (rank, pp)`,
     `pp` forwards back; an output forward, after launch, waits for the previous
-    output forward's, or on the last stage for its own, and on any other stage
+    output forward's, or for its own on the last stage or a single stage that does not `defer` its output, and on any other stage
     for nothing. With `mtp`, a forward's device work is its target's and then
-    its draft's, and a single-stage output forward waits before launch, for
+    its draft's, and an output forward on a single stage that defers waits before launch, for
     the previous output forward's target and then `MTP_COPY`; `MTP_SEGMENT`
     runs after that wait, before the launch. A batch's `compass_queued_s`,
     the device work its prepare queued ahead of its launch, runs after
@@ -357,6 +358,7 @@ class HostDeviceRecurrence:
         admit=ADMISSION_IN_E,
         columns=None,
         launch=(None, None),
+        defer=True,
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
         self.admit, self.columns, self.launch = admit, columns or {}, launch
@@ -374,6 +376,7 @@ class HostDeviceRecurrence:
         ring = 2 if stage is None else stage[1]
         self.ends = collections.deque([-math.inf] * ring, maxlen=ring)  # n-ring..n-1
         self.last = None if stage is None else stage[0] == stage[1] - 1
+        self.last = True if stage is None and not defer else self.last
         self.recv = stage is not None and stage[0] > 0  # a later stage receives
         self.output_end = -math.inf  # target end of the last output forward
         self.mtp = mtp
@@ -503,7 +506,7 @@ class HostDeviceRecurrence:
         """The exit of the forward `device_end` priced, its device work ending
         at `end` and its target's at `target_end`: `W_post` after its launch
         and the wait that follows it, an output forward's for the previous
-        output forward's target on a single stage or its own on the last, or
+        output forward's target on a single stage that defers or its own on the last or one that does not, or
         under `sync` for `end`."""
         _, launch_end, output, post = self._held
         released = launch_end
@@ -855,20 +858,83 @@ def gathers_by_shape():
         GroupCoordinator.all_gather = gather
 
 
+_IS_CUDA = torch.Tensor.is_cuda.__get__
+
+
+class _MetaOnDevice(TorchFunctionMode):
+    """A meta tensor says it is on the GPU, as the tensor it stands for is."""
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if func == _IS_CUDA and args[0].is_meta:
+            return True
+        return func(*args, **(kwargs or {}))
+
+
+@contextlib.contextmanager
+def mhc_packed_on_meta():
+    """DeepSeek-V4.1's mHC pack packs a meta weight as it packs one on the GPU.
+
+    A V4.1 block keeps each mHC projection packed in a buffer after load
+    (`pack_mhc_fn`), but only for a weight on a gfx950 GPU, and a meta weight
+    is on none. Inside the pack a meta tensor says it is on the GPU and a meta
+    device's properties name the arch aiter's probe answers (the simulated
+    device's under `simulated_arch`), so ATOM's and aiter's code leave the
+    meta tensor a real start keeps, or nothing where that device keeps none.
+    Without the pack's module loaded nothing is swapped.
+    """
+    name = "pack_mhc_fn"
+    pack = getattr(
+        sys.modules.get("atom.model_ops.deepseek_v41.mhc_pre_delayed"), name, None
+    )
+    if pack is None:
+        yield
+        return
+    properties = torch.cuda.get_device_properties
+
+    def on_device(device=None):
+        if device is None or torch.device(device).type != "meta":
+            return properties(device)
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return SimpleNamespace(gcnArchName=get_gfx())
+
+    @wraps(pack)
+    def packed(fn):
+        if not fn.is_meta:
+            return pack(fn)
+        torch.cuda.get_device_properties = on_device
+        try:
+            with _MetaOnDevice():
+                return pack(fn)
+        finally:
+            torch.cuda.get_device_properties = properties
+
+    loaded = list(sys.modules.values())
+    bound = [m for m in loaded if getattr(m, "__dict__", {}).get(name) is pack]
+    for m in bound:
+        setattr(m, name, packed)
+    try:
+        yield
+    finally:
+        for m in bound:
+            setattr(m, name, pack)
+
+
 def process_weights_after_loading(tree: torch.nn.Module) -> None:
     """Run on a meta tree the post-load hooks `load_model` runs after a load.
 
     The same walk, parent first: each module's own hook, then its quant
     method's. The hooks re-lay weights (an MXFP4 MoE pads its expert scales),
     so the storages they leave are the ones a real start holds; a gather
-    across a process group answers with its shape (`gathers_by_shape`). The
+    across a process group answers with its shape (`gathers_by_shape`), and
+    V4.1's mHC pack packs as on the GPU (`mhc_packed_on_meta`). The
     loader's `init_prepare_finalize` is not run: it sets up an MoE's dispatch
     and holds no weight. A hook that fails on the meta device refuses the
     start by name.
     """
     if not isinstance(tree, torch.nn.Module):
         return
-    with gathers_by_shape():
+    with gathers_by_shape(), mhc_packed_on_meta():
         _run_post_load_hooks(tree)
 
 
@@ -1770,7 +1836,7 @@ def _group_step_seconds(
     `compass_admitted`, set here first (`admitted`, over the requests this
     runner has seen).
     Under DP, a `HostDeviceRecurrence`'s device end, and its output mark
-    (the device end, or under MTP the target end), are first replaced by
+    (the device end, or with MTP or a draft the target end), are replaced by
     the group's latest, an `all_reduce(MAX)` standing in
     for a real forward's cross-rank collectives, and every rank leaves at its
     own charge. With no
@@ -1878,8 +1944,8 @@ def _group_step_seconds(
 
         def charge(batch, device_s, draft_s, refuse=True):
             end = host.device_end(batch, device_s, draft_s, refuse)
-            # The output end: the group's device end, or under MTP its target end.
-            mark = host.target_end if host.mtp else end
+            # The output end: the device end, or with MTP or a draft the target end.
+            mark = host.target_end if host.mtp or draft_s else end
             t = torch.tensor([end, mark], dtype=torch.float64)
             torch.distributed.all_reduce(t, torch.distributed.ReduceOp.MAX, group)
             return host.release(*t.tolist())

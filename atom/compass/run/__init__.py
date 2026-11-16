@@ -1945,6 +1945,7 @@ def runner(model_runner, tree) -> None:
         )
         # RapidServe's prefill_forward synchronizes its stream before it returns.
         rapid = getattr(config, "enable_rapidserve", False)
+        processor = getattr(model_runner, "tokenID_processor", None)
         model_runner.compass_host = replay or HostDeviceRecurrence(
             host.get("laws", {}),
             host.get("skip", ()),
@@ -1955,6 +1956,7 @@ def runner(model_runner, tree) -> None:
             admit=host.get("admit", ADMISSION_IN_E),
             columns=host.get("columns"),
             launch=launch,
+            defer=getattr(processor, "is_deferred_out", True),
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])
