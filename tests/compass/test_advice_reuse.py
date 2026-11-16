@@ -321,6 +321,66 @@ def test_a_law_with_a_source_stating_no_figures_names_requirement_4(tmp_path, se
     }
 
 
+def host_alone(r) -> dict:
+    """`law` with source shipped holding host laws alone and stating no
+    figures, as the crs005 DPA8 prefill law's does, its prefill vector moved
+    to source refitted."""
+    held = law(r)
+    shipped = held["sources"]["shipped"]
+    shipped["vectors"].remove("prefill")
+    del shipped["figures"]
+    held["sources"]["refitted"]["vectors"].append("prefill")
+    return held
+
+
+def test_a_source_of_host_laws_alone_needs_no_figures(tmp_path, searched):
+    where = law_file(tmp_path, host_alone(searched))
+
+    found = verdicts(advise(tmp_path), "law")
+
+    reused = {"verdict": "reuse", "requirement": None, "reason": where, "law": where}
+    assert found == [reused | {"run": [where, where]}] * 2
+
+
+def test_a_law_whose_sources_price_no_step_needs_its_own_figures(tmp_path, searched):
+    held = host_alone(searched)
+    held["sources"] = {"shipped": held["sources"]["shipped"]}
+    where = law_file(tmp_path, held)
+
+    found, _ = verdicts(advise(tmp_path), "law")
+
+    (made_by,) = found.pop("made_by")
+    assert made_by.startswith("no calibrate.sh command: ")
+    assert found == {
+        "verdict": "calibrate",
+        "requirement": 4,
+        "reason": f"{where} states no cost-accuracy figures",
+        "law": where,
+        "run": [where, where],
+    }
+
+
+@pytest.mark.parametrize("vectors", [["prefill"], ["prefill", "host"]])
+def test_a_source_of_the_prefill_vector_needs_figures(tmp_path, searched, vectors):
+    held = law(searched)
+    shipped = held["sources"]["shipped"]
+    shipped["vectors"] = vectors
+    del shipped["figures"]
+    where = law_file(tmp_path, held)
+
+    found, _ = verdicts(advise(tmp_path), "law")
+
+    (made_by,) = found.pop("made_by")
+    assert made_by.startswith("no calibrate.sh command: ")
+    assert found == {
+        "verdict": "calibrate",
+        "requirement": 4,
+        "reason": f"{where} states no cost-accuracy figures of source shipped",
+        "law": where,
+        "run": [where, where],
+    }
+
+
 @pytest.mark.parametrize("held", ["none", "at another digest"])
 def test_readings_with_no_entry_or_measured_at_another_digest_are_measured(
     tmp_path, searched, held
@@ -523,6 +583,47 @@ def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, a
         (reason,) = {v["reason"] for v in verdicts(judged, "readings", side)}
         assert '"index_cache_dtype": "fp8"' in reason
         assert '"AITER_LOG_LEVEL": "WARNING"' in reason
+
+
+@pytest.mark.parametrize(
+    "exported, given, level",
+    [
+        ("", {}, "WARNING"),
+        (None, {"AITER_LOG_LEVEL": ""}, "WARNING"),
+        ("", {"AITER_LOG_LEVEL": "INFO"}, "INFO"),
+    ],
+    ids=["exported empty", "empty in the space", "set in the space"],
+)
+def test_a_1p1d_side_runs_under_the_aiter_log_level_deploy_sh_starts_it_with(
+    tmp_path, monkeypatch, at_head, exported, given, level
+):
+    for name in PERFORMANCE_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    if exported is not None:
+        monkeypatch.setenv("AITER_LOG_LEVEL", exported)
+    model = tmp_path / "DeepSeek-V4-Pro"
+    model.mkdir()
+    shutil.copy(V4_PRO, model / "config.json")
+    cpu = json.loads(PAIR["prefill"].read_text())["host"]["key"]["host_cpu"]
+    monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
+    common = {"basis": "a recipe", "deployment": "1p1d", "env": SHARED_ENV | given}
+    common["args"] = {"--tensor-parallel-size": 8, "--kv-cache-dtype": "fp8"}
+    common["args"]["--enable-dp-attention"] = True
+    common["prefill"] = {"args": {"--enable-tbo": True}, "env": SIDES["prefill"][1]}
+    common["decode"] = {"args": {"--cudagraph-capture-sizes": DECODE_SIZES}}
+
+    judged = advise(tmp_path, MACHINE, model=str(model), common=common)
+
+    # The pair's laws are keyed WARNING: each side finds its own there, else
+    # none at its key.
+    requirement = 3 if level == "WARNING" else 1
+    for side in UNCOVERED:
+        found = verdicts(judged, "law", side)
+        assert [(v["verdict"], v["requirement"]) for v in found] == [
+            ("calibrate", requirement)
+        ] * 2
+        (reason,) = {v["reason"] for v in verdicts(judged, "readings", side)}
+        assert f'"AITER_LOG_LEVEL": "{level}"' in reason
 
 
 def test_a_side_s_own_kv_transfer_config_is_refused_as_deploy_sh_refuses_it(

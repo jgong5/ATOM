@@ -153,6 +153,52 @@ def test_a_run_that_reruns_while_its_cell_is_graded_shows_no_grades(
     ]
 
 
+@pytest.mark.parametrize("rerun", RERUNS)
+def test_a_rerun_s_report_renders_the_reports_its_cell_graded_again(
+    capsys, tmp_path, monkeypatch, rerun
+):
+    cell = _cell(capsys, tmp_path)
+    wrote = ["real0", "real1", "step_linear"]  # real2 ended before reports existed
+    for run in wrote:
+        html.write(cell / run)
+    _graded(capsys, cell)
+    before = {run: _Page(cell / run).parts for run in wrote}
+    _rerun(cell, rerun)
+    monkeypatch.chdir(cell / rerun)
+
+    html.write(".")  # `python -m atom.compass.report.html .` inside the rerun
+
+    graded = ", ".join(RUNS)
+    stale = f"None: {cell / html.GRADES} grades {graded}; {rerun} changed since."
+    for run in wrote:
+        after = _Page(cell / run).parts
+        assert after.pop("Grades") == {"tables": [], "text": [stale]}, run
+        before[run].pop("Grades")
+        if run != rerun:  # its own report shows its new results too
+            assert after == before[run], run
+    assert not (cell / "real2" / html.FILE).exists()
+
+
+def test_a_report_leaves_the_others_while_its_cell_is_ungraded_or_unchanged(
+    capsys, tmp_path
+):
+    cell = _cell(capsys, tmp_path)
+    kept = cell / "real0" / html.FILE
+
+    def written(run):
+        """real0's report, set to "kept", once `run`'s is written."""
+        kept.write_text("kept")
+        html.write(cell / run)
+        return kept.read_text()
+
+    _rerun(cell, "step_linear")
+    assert written("step_linear") == "kept"  # a rerun in an ungraded cell
+    _graded(capsys, cell)
+    assert written("real1") == "kept"  # a run of the graded cell, unchanged
+    shutil.copytree(cell / "real1", cell / "real3")
+    assert written("real3") == "kept"  # a run the cell gained after grading
+
+
 def test_a_cell_and_a_run_given_as_the_working_directory_are_named(
     capsys, tmp_path, monkeypatch
 ):
