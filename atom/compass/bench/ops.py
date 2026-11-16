@@ -128,7 +128,7 @@ a drafter is one a token. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
 copies: N built ones: M, the least count whose bytes pass `COLD` times the
-last-level cache, but for that plane where its copies' buffers pass it twice,
+last-level cache, but for that plane where its copies' buffers pass it 4 times,
 raised for a context key to its I instances (at most K),
 then, up to the leaf's occurrences when it takes a weight other than a
 gathered table (at most K), copy
@@ -1258,6 +1258,7 @@ class Stub:
         zeros = getattr(tokens, "zero_spec_counts", None)
         drafter = {} if zeros is None else {"zero_spec_counts": zeros}
         meta = dict(self.kv)
+        untold = len(set(self.pages.values())) > 1  # V4.1 compressing at several
         for sig, (op, _) in self.leaves.items():
             writes, rows = _writes(op["op"]), _pass_rows(op)
             at = None if rows == running else rows
@@ -1308,15 +1309,19 @@ class Stub:
                         pool = v41
                     try:
                         rope = (op["op"], path, ratio) == (_ROPE, "positions", None)
-                        if (
-                            rope
-                            and self.pages
-                            and op["args"]["input"]["shape"][-2] == 1
-                        ):
+                        if rope and untold and op["args"]["input"]["shape"][-2] == 1:
                             raise ValueError(  # a key's, over one head
-                                "its graph states no compress ratio, and no one "
-                                f"compress plan here holds its {spec['shape'][-1]} "
-                                "rows: trace its shape again"
+                                "its graph states no compress ratio, and this point "
+                                "cannot tell which ratio's compress plan holds its "
+                                f"{spec['shape'][-1]} rows: trace its shape again"
+                            )
+                        bound = path in ("row_starts", "row_ends") and not index
+                        if (op["op"], ratio) == (_TOPK, None) and untold and bound:
+                            raise ValueError(  # a row bound ATOM stages, its ratio's
+                                "its graph states no compress ratio, and this point "
+                                "cannot tell which ratio's scorer writes its "
+                                f"{op['args']['stride0']}-wide logits: trace its "
+                                "shape again"
                             )
                         if index:  # as the forward's first reader writes it
                             step = passes.get(at, passes[None])[0]
@@ -1506,15 +1511,17 @@ class Stub:
             and (op["args"].get("context_lens") or {}).get("role") != "activation"
         }
         # and by the rows each compress plan holds, as many as its keys' RoPE's,
-        # for a key RoPE captured before it stated its ratio: rows that no one
-        # ratio's plan here holds tell none, and `_prepare` refuses that key
+        # for a key RoPE captured before it stated its ratio, where the point
+        # holds every ratio's compressor: rows that no one ratio's plan here
+        # holds tell none, and `_prepare` refuses that key
         ratios = defaultdict(set)
         for op, _ in found.values():
             if op["op"] == _FUSED:
                 ratios[op["args"]["plan_gpu"]["shape"][0]].add(op["args"]["ratio"])
-        self.known |= {
-            ("compressed", n): r.pop() for n, r in ratios.items() if len(r) == 1
-        }
+        if set().union(*ratios.values()) >= set(self.pages.values()):
+            self.known |= {
+                ("compressed", n): r.pop() for n, r in ratios.items() if len(r) == 1
+            }
         # and its last layer's, whose tables a replay's queries take their
         # pointers from (`QueryRows.indices`)
         model = self.runner.model
@@ -1664,9 +1671,9 @@ class Stub:
                     read = torch.Size(op["args"][ids]["shape"]).numel()
                 entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
                 nbytes = entry * min(read, s["shape"][0])
-            if plane := self._plane(op, sig, slot):  # buffers: 2 * COLD * llc
-                reach, _, k, held = plane
-                nbytes, most = reach * itemsize, k * self._cold(held * itemsize // 2)
+            if plane := self._plane(op, sig, slot):  # buffers: 4 * COLD * llc
+                reach, per, *_, held = plane
+                nbytes, most = reach * itemsize, per * self._cold(held * itemsize // 4)
             if s["role"] == "kv":
                 # ponytail: its widest-strided dim taken as blocks or state slots,
                 # or plane rows when the leaf states its layer's attention geometry;
@@ -1771,9 +1778,8 @@ class Stub:
 
     def _plane(self, op, sig, path):
         """V4.1's FP8 index plane at `op`'s `path` (`PAGE_WIDE`), or None: the
-        columns below its rows' bounds, all where none is bound; its copies'
-        starts apart, its widest row's to a `WEIGHT_ALIGN` boundary; k, the
-        copies a buffer holds, none reaching another's columns; its elements."""
+        columns below its rows' bounds, all where none is bound, and its
+        copies' layout (`_stairs`)."""
         bound, plane = PAGE_WIDE.get(op["op"], ("", ""))[:2]
         spec = op["args"][path] if self.paged and path == plane else {}
         if spec.get("role") != "metadata" or not plane.endswith("logits"):
@@ -1781,10 +1787,8 @@ class Stub:
         ends = self.placed[0][1].get((sig, bound), ("", None))[1]
         (rows, width), size = spec["shape"], _dtype(spec["dtype"]).itemsize
         reach = [width] * rows if ends is None else _reached(ends, width)
-        cols = -(-max(reach) * size // WEIGHT_ALIGN) * WEIGHT_ALIGN // size
-        k = spec["stride"][0] // max(cols, 1) or 1
-        held = _span(spec["shape"], spec["stride"]) + (k - 1) * cols
-        return sum(reach), cols, k, held
+        stride, span = spec["stride"][0], _span(spec["shape"], spec["stride"])
+        return sum(reach), *_stairs(tuple(reach), stride, span, size, self.llc)
 
     def _time(self, op, sig, instances, n) -> dict:
         """`op` timed in a graph of K calls, `CALLS` or as many as fill
@@ -1977,11 +1981,12 @@ class Stub:
                 # clone of it, which ATOM's preparation leaves unchanged, so
                 # each copy draws on a plane of its own
                 if plane := self._plane(op, sig, path):  # a scorer's too
-                    _, cols, k, held = plane
-                    if (sig, c // k) not in self.built:
-                        self.built[sig, c // k] = out.new_zeros(held)
-                    whole = self.built[sig, c // k]
-                    out = whole.as_strided(out.shape, out.stride(), c % k * cols)
+                    _, per, k, step, band, held = plane
+                    b, i = divmod(c, per)
+                    if (sig, b) not in self.built:
+                        self.built[sig, b] = out.new_zeros(held)
+                    whole, at = self.built[sig, b], i // k * step + i % k * band
+                    out = whole.as_strided(out.shape, out.stride(), at)
                 if self.paged and path == "logits" and value["role"] == "metadata":
                     bound = PAGE_WIDE.get(op["op"], ("",))[0]
                     if (ends := meta.get((sig, bound), ("", None))[1]) is not None:
@@ -3194,6 +3199,31 @@ def _scores(plane, ends, spec) -> None:
 
 def _reached(ends, width) -> list[int]:  # each row's columns below its bound
     return ends.reshape(-1).clamp(0, width).tolist()
+
+
+@functools.lru_cache(maxsize=CALLS)
+def _stairs(reach, stride, span, itemsize, llc) -> tuple:
+    """`CALLS` copies of a plane whose rows read `reach` columns `stride` apart,
+    a view `span` elements of `itemsize` bytes, none reading another's, in the
+    fewest buffer bytes: copy c in buffer `c div p`, `c mod p div k` steps and
+    `c mod k` bands past its start, each a `WEIGHT_ALIGN` multiple. A step
+    passes the rows up to the last widest and the columns the widest row past
+    them reads, its drift, so a stair of copies a step apart reads each one's
+    widest rows beside the narrower ones of those above; a band is as wide as
+    the widest row and its stair's drifts. A stair's buffer holds at most twice
+    `COLD` times the cache. Returns p, k, step, band and a buffer's elements."""
+    unit, top = max(WEIGHT_ALIGN // itemsize, 1), max(reach)
+    q = len(reach) - reach[::-1].index(top)  # past the widest rows
+    step = -(-(q * stride + max(reach[q:], default=0)) // unit) * unit
+    laid = []
+    for a in range(1, CALLS + 1 if q < len(reach) else 2):  # copies a stair
+        band = -(-((a - 1) * (step - q * stride) + top) // unit) * unit
+        k = stride // max(band, 1) or int(a == 1)
+        held = (a - 1) * step + (k - 1) * band + span
+        if not k or a > 1 and held * itemsize > 2 * COLD * llc:
+            break
+        laid.append((-(-CALLS // (a * k)) * held, a * k, k, step, band, held))
+    return min(laid)[1:]
 
 
 def _clone(t) -> torch.Tensor:
