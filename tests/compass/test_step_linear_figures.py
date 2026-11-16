@@ -91,6 +91,13 @@ def _decodes(path, seed):
     return _record(path, [s for i, s in enumerate(_jittered(seed)) if i in DECODES])
 
 
+def _untrace(record) -> None:
+    """Strip `record`'s busy fields, as a run with no trace writes it."""
+    lines = [json.loads(line) for line in record.read_text().splitlines()]
+    untraced = [{k: v for k, v in x.items() if k[:2] != "b_"} for x in lines]
+    record.write_text("".join(json.dumps(x) + "\n" for x in untraced))
+
+
 def _engine(tmp_path) -> list:
     """The `--engine` flag of an engine file stating `BUCKETS`."""
     engine = tmp_path / "engine.json"
@@ -279,9 +286,7 @@ def test_a_source_whose_steps_the_fit_cuts_refuses_rather_than_grading_none(
     and writes no figures; a decode source of the same records is folded."""
     law, records = _fits(tmp_path, _plain)
     for record in records:
-        lines = [json.loads(line) for line in record.read_text().splitlines()]
-        untraced = [{k: v for k, v in x.items() if k[:2] != "b_"} for x in lines]
-        record.write_text("".join(json.dumps(x) + "\n" for x in untraced))
+        _untrace(record)
     rungs = [f"decode {k}" for k in law["decode"]]
     law["runs"] = list(map(digest, records))
     law["sources"] = {
@@ -301,6 +306,29 @@ def test_a_source_whose_steps_the_fit_cuts_refuses_rather_than_grading_none(
     folded = json.loads(file.read_text())["sources"]["decode"]["figures"]
     assert list(folded) == law["runs"]
     assert all(set(kinds) == {"decode"} for kinds in folded.values())
+
+
+def test_a_source_some_of_whose_steps_the_fit_cuts_folds_the_rest(tmp_path):
+    """The third run ran no trace, so the fit cuts its prefills: a prefill
+    source of all three runs folds, the third stating no prefill figure and
+    the others theirs as the cost check grades them."""
+    law, records = _fits(tmp_path, _plain)
+    _untrace(records[2])
+    law["runs"] = list(map(digest, records))
+    law["sources"] = {"prefill": {"runs": [0, 1, 2], "vectors": ["prefill"]}}
+    del law["figures"]
+    file = tmp_path / "law.json"
+    file.write_text(json.dumps(law))
+
+    main(["figures", *map(str, records), "--law", str(file), "--source", "prefill"])
+    folded = json.loads(file.read_text())["sources"]["prefill"]["figures"]
+    assert list(folded) == law["runs"]
+    assert folded[law["runs"][2]] == {}
+    for record in records[:2]:
+        others = [r for r in records if r != record]
+        prefill = _graded(record.parent, _fit(others), set(range(120)) - DECODES)
+        assert set(prefill) == {"prefill"}
+        _same(folded[digest(record)], prefill)
 
 
 @pytest.mark.parametrize(
