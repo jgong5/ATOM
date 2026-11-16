@@ -3,9 +3,11 @@
 `python -m atom.compass.report.html OUT`
 
 OUT is a run's directory as `split` reads it, once its split is written. The
-page goes to OUT/`FILE`, and no other file changes. Every number on it is read
-from a file in OUT, or in the cell holding OUT for its grades, and a part whose
-file is missing, or holds nothing for it, says so in its place:
+page goes to OUT/`FILE`, and no other file changes but, as grades below
+says, the reports of the other runs its cell's `GRADES` grades. Every number
+on it is read from a file in OUT, or in the cell holding OUT for its grades,
+and a part whose file is missing, or holds nothing for it, says so in its
+place:
 
 - the run: simulated, by which backend, or real; one instance, or a
   deployment's two sides, their KV link and the router's arguments; each
@@ -28,7 +30,9 @@ file is missing, or holds nothing for it, says so in its place:
 - grades, the rows `python -m atom.compass.validate` printed for the cell
   holding OUT, from the cell's `GRADES`, when OUT is a run it graded and every
   run it graded still holds the results it read (`digest`); grading writes
-  that file and then renders the report of each of its runs again;
+  that file and then renders the report of each of its runs again, and a
+  report written once one of them holds other results renders the others
+  again, so none still shows the grades;
 - a real run's split beside a simulated run's, and the op-family split, none
   of which a run's directory holds.
 """
@@ -315,6 +319,12 @@ def digest(run) -> str:
     return sha.hexdigest()
 
 
+def _changed(cell: Path, ran: dict) -> list[str]:
+    """The runs of `cell` its `GRADES` grades, `ran`, each by the `digest`
+    grading read, that hold other results now."""
+    return [n for n, sha in ran.items() if digest(cell / n) != sha]
+
+
 def _grades(run: Path) -> str:
     """The grades of the cell holding `run`, from its `GRADES`, while each run
     they grade holds the results grading read, by its `digest`."""
@@ -326,8 +336,7 @@ def _grades(run: Path) -> str:
     names = ", ".join(graded["runs"])
     if run.name not in graded["runs"]:
         return _none(f"None: {path} grades {names}, not this run.")
-    ran = graded["runs"].items()
-    if changed := [n for n, sha in ran if digest(run.parent / n) != sha]:
+    if changed := _changed(run.parent, graded["runs"]):
         changed = ", ".join(changed)
         return _none(f"None: {path} grades {names}; {changed} changed since.")
     text = f"Cell {graded['cell']}, graded on its runs {names}."
@@ -373,9 +382,20 @@ def page(run) -> str:
 
 
 def write(run) -> Path:
-    """Write `run`'s report to its `FILE`; that file."""
+    """Write `run`'s report to its `FILE`; that file. When a run its cell's
+    `GRADES` grades holds other results now, render again the report of each
+    other run that file grades, so none still shows the grades."""
     path = Path(run) / FILE
     path.write_text(page(run))
+    here = Path(os.path.abspath(run))  # a run given as `.` too
+    cell = here.parent
+    if (cell / GRADES).is_file():
+        ran = read_json(cell / GRADES)["runs"]
+        if _changed(cell, ran):
+            for name in ran:
+                other = cell / name
+                if name != here.name and (other / FILE).is_file():
+                    (other / FILE).write_text(page(other))
     return path
 
 
