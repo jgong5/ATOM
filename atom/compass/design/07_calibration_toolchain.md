@@ -534,12 +534,15 @@ a GIL wait
   ([the exits Ruling](https://github.com/jgong5/ATOM/issues/2751#issuecomment-6686324280)).
   Its `recv` stretches stay in: the transport parses the request's own body as the read
   awaits it, and on a loaded loop serves other streams there too
-  ([#2919](https://github.com/jgong5/ATOM/issues/2919)). `fixed_s` is the loop's CPU time per
-  request in the records' longest burst of served bodies, at that `per_byte_s`. With no
-  burst, or one whose requests take less of the loop than that `per_byte_s` charges their
+  ([#2919](https://github.com/jgong5/ATOM/issues/2919)). `fixed_s` is the mean, over every
+  burst's later requests in the records, of the loop's CPU time from the template start
+  before each to its own, less that `per_byte_s` times its body; none is dropped, so a
+  fresh server's cold gap stays in, and the report gives the values' p10 and p90
+  ([#3020](https://github.com/jgong5/ATOM/issues/3020)). With no
+  burst, or bursts whose requests take less of the loop than that `per_byte_s` charges their
   bodies, which would leave `fixed_s` negative, `fixed_s` is `idle_s` and the report says
   why ([#3368](https://github.com/jgong5/ATOM/issues/3368), [#3384](https://github.com/jgong5/ATOM/issues/3384)). No first-turn cell is recorded: cc-traces sessions
-  begin mid-conversation, so the longest burst is a client run's start. A burst alone would
+  begin mid-conversation, so a burst is a client run's start. A burst alone would
   underprice later turns: on mi355-gpu-40 a V4.1-Flash
   first-turn body takes 5.64 to 5.80 ns a byte to parse and template, and the c=16 cell's
   later turns, with more messages, 7.88
