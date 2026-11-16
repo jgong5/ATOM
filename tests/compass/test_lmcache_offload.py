@@ -40,6 +40,7 @@ from atom.compass.kv.lmcache_offload import (
     OffloadShell,
     Tier,
     chunk_keys,
+    watch_forwards,
 )
 from atom.compass.parity import read
 from atom.compass.runner.overrides import NonAllocatingRunner, RunnerRefusal
@@ -266,6 +267,59 @@ def test_a_saved_prefix_is_looked_up_on_every_rank_and_loaded_at_its_priced_end(
         "waited": 0.0,
     }
     assert LoadOperationId("b", 0) not in shell._inner._impl._load_inflight_tokens
+    engine.finish()
+
+
+def test_a_store_waits_out_each_prefill_forward_it_is_in_flight_for(
+    tmp_path, monkeypatch
+):
+    """Two stores on one save worker, then a decode forward, which each store
+    runs through, and a prefill forward, which each waits out: the first ends
+    the prefill's seconds late, and the second, behind it, as late."""
+    engine = Engine(tmp_path, monkeypatch)
+    shell, rt = engine.shell, engine.rt
+
+    def forward(name, batch, wait_out=False):
+        rt.advance_to(rt.now + batch.seconds)  # as `clock.charge` does
+        return SimpleNamespace(predicted_s=batch.seconds)
+
+    core = SimpleNamespace(
+        scheduler=SimpleNamespace(kv_connector=shell),
+        runner_mgr=SimpleNamespace(call_func=forward),
+    )
+    watch_forwards(core)
+    for seq in (
+        _seq("a", range(1, 4 * CHUNK + 1)),
+        _seq("b", range(99, 99 + 2 * CHUNK)),
+    ):
+        shell.update_state_after_alloc(seq)
+        seq.num_cached_tokens = len(seq.token_ids)  # its prefill has run
+    sent = rt.now
+    assert [r.req_id for r in shell.build_connector_meta().requests] == ["a", "b"]
+    decode, prefill = STORE_S[0], 4 * STEP
+    for prefills, seconds in ((0, decode), (1, prefill)):
+        batch = SimpleNamespace(total_seqs_num_prefill=prefills, seconds=seconds)
+        core.runner_mgr.call_func("forward", batch, wait_out=True)
+    a = sent + prefill + STORE_S[0] + 4 * STORE_S[1]
+    b = a + STORE_S[0] + 2 * STORE_S[1]
+    while rt.now < b + 3 * STEP:
+        engine.step()
+
+    def first_step(t):  # the steps run from where the forwards left the clock
+        return sent + decode + prefill + _at_step(t - sent - decode - prefill)
+
+    # Each store runs at the first step at or after its end, and is reported
+    # at the step after that one.
+    assert engine.reported == [
+        (pytest.approx(first_step(a) + STEP), ["a"]),
+        (pytest.approx(first_step(b) + STEP), ["b"]),
+    ]
+    assert shell.offload_statistics()["copies"]["save"] == {
+        "copies": 2,
+        "chunks": 6,
+        "seconds": pytest.approx(b - sent),
+        "waited": pytest.approx(a - sent),
+    }
     engine.finish()
 
 
