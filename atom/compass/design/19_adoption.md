@@ -420,9 +420,9 @@ the run's provenance.
    change that moves memory takes the readings again, as #2861's token buckets moved
    DeepSeek-V4.1's graph pool. A store entry is never re-keyed: it is immutable and keyed
    by the digest its records ran at. A store law reaches a later head as a checked-in law
-   file, as P1's would from M2's store: checked in under `scripts/compass/laws/` re-keyed
-   to the head, its provenance naming the commit its records ran at and saying re-keyed,
-   not re-validated. The commits that re-key the checked-in laws carry it from then on,
+   file: checked in under `scripts/compass/laws/` re-keyed to the head, its provenance
+   naming the commit its records ran at and saying re-keyed, not re-validated. The
+   commits that re-key the checked-in laws carry it from then on,
    `tests/compass/test_platform_keys.py::test_every_checked_in_law_stamps_this_trees_atom_digest`
    holding each to its tree's digest, and a run takes it as `compass run --step-linear
    LAW --host-laws LAW`. A search may mix laws fitted at different commits, each point's
@@ -457,7 +457,7 @@ the run's provenance.
    the records' ATOM digest, `records_atom`, which the fit writes into the law beside its
    host key and re-keying leaves alone, since a re-key moves only the host key's `atom`; a
    law that states none counts as re-keyed. A law fitted before the fit reported the
-   figures, as P1's and P3's are, gains them in a commit to its law file, on the head's
+   figures, as P3's are, gains them in a commit to its law file, on the head's
    fit, CPU only, its provenance saying so: each source its `sources` splits the vectors
    over is folded with that source's own records, form and options, as `sources` and the
    provenance state them, and a law with no `sources` as one fit. A law with no figures is
@@ -676,7 +676,7 @@ workload, so its grade is not cited.
 | S1 | one node, 8 GPUs | TP8 | MTP3 | off | off | `recipes/DeepSeek-V4-Agentic-InferenceX.md`, TP | calibrated anew (D113) |
 | S2 | one node | DPA8 | MTP3 | on | off | the same, DP attention | calibrated anew (D113) |
 | S5 | one node | DPA8 | MTP3 | on | on | the same, DP attention with LMCache | S2's step and host laws; its own readings, whose key holds the KV offload |
-| P1 | 1P1D, 16 GPUs | TP8 / TP8 | off | off | off | `recipes/mesh/DeepSeek-V4.md`, pure TP; nightly `ds-v4-1p1d-tp8` | M2's TP law from the crsuse2-m2m-v3-005 store, checked in re-keyed, if it passes D112 |
+| P1 | 1P1D, 16 GPUs | TP8 / TP8 | off | off | off | `recipes/mesh/DeepSeek-V4.md`, pure TP; nightly `ds-v4-1p1d-tp8` | calibrated anew (D113): no TP8 step linear law exists to reuse |
 | P3 | 1P1D | DPA8 / DPA8 | off | prefill | off | `recipes/mesh/DeepSeek-V4.md`, DPA | the shipped crs005 and gpu45 pairs under `scripts/compass/laws/`, if they pass D112 |
 
 The configurations cut from it, each one switch alone (S3, S4, P2, P4 to P7), can come
@@ -695,7 +695,9 @@ stated length has the gaps #3355's template lists, ungraded here.
 tool is built while MiniMax-M3's support lands (D117); the template runs every path of the
 tool, a reused law and a new one included, and S1 against S2 puts the agentic workload's
 best-known trade-off on its frontier. **Basis.** The owner on #3355, whose template states
-each departure and cites the #975 and #2683 Rulings it rests on; `16` D95.
+each departure and cites the #975 and #2683 Rulings it rests on; the
+[#3493 Ruling](https://github.com/jgong5/ATOM/pull/3493#issuecomment-6906479025), which
+calibrates P1 anew; `16` D95.
 
 **Rejected.** Developing on MiniMax-M3 from the start: the Compass features it needs were
 still landing under #3256, while DeepSeek-V4-Pro already had a store and laws on the
@@ -838,8 +840,7 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | `atom/compass/validate/__main__.py`, `validate/curves.py` | `grades.json` in each graded cell, its runs' `report.html` rendered again; a 1P1D point's GPUs over both sides | D115, D111 |
 | `scripts/compass/spaces/` (new) | the DeepSeek-V4-Pro and MiniMax-M3 templates | D110, D116, D117 |
 | `scripts/compass/ADVICE.md` (new), `QUICKSTART.md` | the guide, linked both ways | D108 |
-| `scripts/compass/laws/` | M2's TP law, P1's, checked in re-keyed if it passes D112 | D112, D116 |
-| `scripts/compass/laws/` | P1's and P3's `08` D47 figures, each source folded with its own records, form and options | D112, D116 |
+| `scripts/compass/laws/` | P3's `08` D47 figures, each source folded with its own records, form and options | D112, D116 |
 
 **Acceptance items**, each walked by the scenario named:
 
@@ -892,7 +893,7 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | D113 | The step linear backend lists a configuration's missing records, for a missing law or decode rung, as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
 | D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355); the format 2026-11-14 ([#3458](https://github.com/jgong5/ATOM/issues/3458)) |
 | D115 | Two static views reading files only: the search's dashboard, each point marked by grading state and method shares, and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell, which renders the cell's reports again. Beside `report.html`, every simulated run's `prometheus.html`: CI's report, `export_report.py` unchanged, over the run's series (`11` D74), marked simulated, the GPU panels predicted, the router's TTFT empty; or `prometheus.txt` with why, the stop not failing. | 2026-11-13 (#3355, #3363); the Prometheus report 2026-11-16 ([#3584](https://github.com/jgong5/ATOM/issues/3584)) |
-| D116 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355) |
+| D116 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355); P1 calibrated anew 2026-11-16 ([#3493](https://github.com/jgong5/ATOM/pull/3493#issuecomment-6906479025)) |
 | D117 | Moved to MiniMax-M3 once its Compass features land and #3265 passes, calibrated on the development nodes from #3256's arms at one frozen commit, where its simulations and validation runs run too, every point priced by the step linear law alone, a step past its records extrapolated and reported, and the pricing reopened if #3256's grading fails the law where the step grid passes ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216)); the showcase validation runs the recommended configuration and the runner-up real, graded by `08` D44, their real order compared with the simulated one, each point's `08` D45.1 verdict beside its grade, not gated. Amends `08` D50. | 2026-11-13 (#3355, #3363) |
 
 ---
