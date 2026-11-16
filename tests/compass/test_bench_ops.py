@@ -926,6 +926,54 @@ def test_v41_fp4_whole_context_leaves_take_their_ratio_s_bounds_and_packed_start
     ]
 
 
+@pytest.mark.parametrize(
+    "top_k, slot",
+    [
+        ("aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode", "seq_lens"),
+        (ops._PICK, "seqLens"),
+    ],
+)
+def test_a_v41_top_k_s_staged_bounds_are_its_ratio_s_with_and_without_its_scorer(
+    monkeypatch, top_k, slot
+):
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *a: {})
+    runner, rows = _Runner(), _t([2], "metadata", dtype="torch.int32")
+    # V4.1's FP8 index plane at ratios 1 and 2, PAGEs of 32 tokens
+    geometry = SimpleNamespace(layer_ratios=(1, 2), rows_per_page=lambda r: 32 // r)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    visible = {r: torch.tensor([50, 20], dtype=torch.int32) // r for r in (1, 2)}
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        fctx._forward_context.attn_metadata.step = SimpleNamespace(visible=visible)
+        return out
+
+    def stating(op, ratio):
+        said = (("compress_ratio", ratio),) if ratio else ()
+        return dataclasses.replace(op, stated=said)
+
+    def top(width, ratio=None):  # as aiter's decode top-k launches it
+        plane = ("logits", _t([2, width], "metadata"))
+        return stating(_leaf(top_k, plane, (slot, rows), ("stride0", width)), ratio)
+
+    runner.prepare_model = prepare_model
+    # ratio 2's scorer, its logits 32 wide
+    scorer = stating(_leaf(ops._LOGITS, ("out_logits", _t([2, 32], "metadata"))), 2)
+    placed, bound = SimpleNamespace(block_size=32, batch=lambda *a: a[1:]), []
+    # each top-k stating its ratio, alone; ratio 2's stating none beside its
+    # scorer, and alone
+    for leaves in [(top(64, 1), top(32, 2)), (scorer, top(32)), (top(32),)]:
+        found = ops.leaves(_graph(*leaves, layers=1)["region"])
+        got = ops.Stub(runner, 10_000).point(placed, decode(2), 64, found)
+        bound += [r["metadata"][slot] for r in got if r["op"] == top_k]
+
+    assert bound[:3] == ["step.visible.1", "step.visible.2", "step.visible.2"]
+    told = bound[3].rpartition("cannot tell which ratio's ")[-1]
+    assert told == "scorer writes its 32-wide logits: trace its shape again"
+
+
 def test_the_v41_candidate_lift_leaves_its_selection_as_built_past_twice_the_kept(
     monkeypatch,
 ):

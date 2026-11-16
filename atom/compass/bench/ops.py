@@ -304,7 +304,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 37
+PROTOCOL = 38
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -486,6 +486,9 @@ _FP4 = (
 _PLAN = "step.plans.{ratio}.compress_plan_gpu"
 _OFFSETS = "step.planned.v41_score_offsets_{ratio}"
 _TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
+# aiter's other decode top-ks: FlyDSL's multi-CTA one (gfx950's) and HIP's
+_MULTI = "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode"
+_PICK = "aiter._top_k_per_row_decode.default"
 _INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
 _SCAN = f"{_INDPTRS}:_launch_indptr_scan"
 _INDICES = f"{_INDPTRS}:_launch_indices"
@@ -511,6 +514,8 @@ V41_NAMES = {
     (_TOPK, "row_starts", "packed"): _OFFSETS,
     (_TOPK, "row_starts"): "step.visible.{ratio}",
     (_TOPK, "row_ends"): "step.visible.{ratio}",
+    (_MULTI, "seq_lens"): "step.visible.{ratio}",
+    (_PICK, "seqLens"): "step.visible.{ratio}",
     (_FUSED, "plan_gpu"): _PLAN,
     ("atom.model_ops.deepseek_v41.index_write:write_index_rows", "plan"): _PLAN,
     (_INDICES, "pptr"): f"{_CACHE}.0",
@@ -578,7 +583,6 @@ QUERIED = {(op, "batch_ids"): "plan.query_ids" for op in (_SCAN, _INDICES)}
 #: bounds are a candidate list's (`_written`) scores an earlier layer's
 #: candidate blocks, on a plane the checkpoint sizes.
 _MAXIMA = "atom.model_ops.deepseek_v41.indexer:_block_maxima"
-_PICK = "aiter._top_k_per_row_decode.default"
 _V41 = "atom.model_ops.deepseek_v41"
 PAGE_WIDE = {
     _LOGITS: ("context_lens", "out_logits", "kv_indices", "max_model_len"),
@@ -1345,8 +1349,9 @@ class Stub:
                                 "cannot tell which ratio's compress plan holds its "
                                 f"{spec['shape'][-1]} rows: trace its shape again"
                             )
-                        bound = path in ("row_starts", "row_ends") and not index
-                        if (op["op"], ratio) == (_TOPK, None) and untold and bound:
+                        top_k = op["op"] in (_TOPK, _MULTI, _PICK) and not index
+                        bound = V41_NAMES.get(key) == "step.visible.{ratio}"
+                        if top_k and ratio is None and untold and bound:
                             raise ValueError(  # a row bound ATOM stages, its ratio's
                                 "its graph states no compress ratio, and this point "
                                 "cannot tell which ratio's scorer writes its "
