@@ -90,7 +90,7 @@ Where the events sit:
 - `draft_kv`: around `compute_draft_kv`, as `StepRecording._draft_pass` times it today.
 - `propose`: from `propose_draft_token_ids`'s entry to the draft copy wait's entry
   (`recv_draft_token_ids`, `t_draft_recv_ns`). The wait is for the previous forward's
-  draft copy (`tokenIDProcessor.prepare_draft_ids`); this pass's device work is all on
+  draft copy (`tokenIDProcessor.prepare_draft_ids`), or, on a runner that does not defer its output, for its own draft, which that call reads (`t_draft_read_ns`); this pass's device work is all on
   the stream before it, so its end event moves there from the call's return. A forward
   that reaches no such wait ends it at the call's return. `d_propose_ns` keeps the
   whole draft under every flavor; under the serial flavor the `propose` pass ends at
@@ -291,7 +291,7 @@ A record without the pass record keeps every law fitted on it valid:
   event or stream synchronize there stays uncounted, as it would where its query found
   the device done, and G's report gives their count and time per record.
 - **`draft_kv`**: its window `d_draft_kv_ns`, standing with the target's.
-- **`propose`**: multi, `L = t_draft_recv_ns[0]`, `F` the target's end with its draft-KV
+- **`propose`**: multi, `L = t_draft_recv_ns[0]` (`t_draft_read_ns[0]` on a runner that does not defer its output), `F` the target's end with its draft-KV
   pass (`start + d_target_ns + d_draft_kv_ns`). The rule is then `host_paced_drafts`.
 - **`draft_step`**: no host stamps; each stands or falls with its `propose`, as today.
 
@@ -339,9 +339,9 @@ recurrence's.
 | `propose`, serial, to the first step | multi | exit | its `h0` | step 0's `h0` | the same | `max(target_end, exit)` |
 | `draft_step` 0, serial (the draft model, eager, over the target's stream) | multi | exit | its `h0` | step 1's `h0`, or the draft copy wait's entry | the same | the previous pass's end |
 | `draft_step` 1 on, serial | single where `DraftGraph.run` replays, else multi | exit | `g.entry`, else its `h0` | `g.entry`, else the next `h0` or the draft copy wait's entry | by its kind | the previous pass's end |
-| old `target` | single where `rung` is set, else multi | entry | `t_launch_ns[0]` | `E` if single, else `t_recv_ns[0]` or `t_launch_ns[1]` | by its kind, `d1` at the exit event on a plain record | `max(ends[-1], launch)`, no `W_graph` |
+| old `target` | single where `rung` is set, else multi | entry | `t_launch_ns[0]` | `E` if single, else `t_recv_ns[0]`, `t_read_ns[0]` or `t_launch_ns[1]`, the first the line has | by its kind, `d1` at the exit event on a plain record | `max(ends[-1], launch)`, no `W_graph` |
 | old `draft_kv` | — | entry, inside `target` | — | — | `d_draft_kv_ns`, standing with the `target`'s | inside `D_target` |
-| old `propose` | multi | exit | — | `t_draft_recv_ns[0]` | `d_propose_ns` if `F >= L`, `F` the target's end with `draft_kv` | `max(target_end, exit)` |
+| old `propose` | multi | exit | — | `t_draft_recv_ns[0]` (`t_draft_read_ns[0]` on a runner that does not defer its output) | `d_propose_ns` if `F >= L`, `F` the target's end with `draft_kv` | `max(target_end, exit)` |
 | old `draft_step` | — | exit | — | — | standing with the `propose` | the previous pass's end |
 
 ### What D107 replaces
