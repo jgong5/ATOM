@@ -25,7 +25,7 @@ step table, the run summary and the hand-ins in its ``out_dir``, and grading
 reads them there. `scripts/compass/deploy.sh` builds that file, starts the
 authority and joins each instance to it. A prefill or a decode instance shares a
 clock with its peer, so it refuses without `--join`, but under `--check` with
-its side named.
+its side named; a plain `--check` of its arguments refuses, naming that side's.
 
 `--coverage` names record directories and `shape_population` tokens whose steps
 the backend's coverage check reads before the server starts: the step grid's
@@ -49,9 +49,9 @@ directory a step linear law's printed calibration writes, and it writes none.
 flags and ATOM arguments as `deploy.sh run` takes them, so `--network` names a
 deployment across nodes. Its ATOM arguments gain the `--kv-transfer-config` the
 script adds, the side's KV role on the simulated connector, and it reads the
-environment the script starts the side in, `AITER_LOG_LEVEL` set when unset
-(`compass_env`), so it resolves the config the side's instance runs. A
-`--kv-transfer-config` among them refuses, as the script refuses one. The
+environment the script starts the side in, `AITER_LOG_LEVEL` WARNING when
+unset or empty (`compass_env`), so it resolves the config the side's instance
+runs. A `--kv-transfer-config` among them refuses, as the script refuses one. The
 readings command it prints takes Mooncake's connector in the simulated one's
 place, as `deploy.sh record` starts the side: a real start has no clock to
 build the simulated one on. It names `AITER_LOG_LEVEL` when the check set it,
@@ -131,15 +131,23 @@ def main(argv: list[str]) -> None:
         )
     if args.check in ROLES:
         serve._refuse(atom_args)
-        # deploy.sh starts each side under `compass_env` (scripts/compass/_lib.sh).
-        env = {} if "AITER_LOG_LEVEL" in os.environ else {"AITER_LOG_LEVEL": "WARNING"}
+        # deploy.sh starts each side under `compass_env` (scripts/compass/_lib.sh),
+        # which sets AITER_LOG_LEVEL when it is unset or empty.
+        level = os.environ.get("AITER_LOG_LEVEL")
+        env = {} if level else {"AITER_LOG_LEVEL": "WARNING"}
         os.environ.update(env)
         sides = [side_args(args.check, atom_args, c) for c in (SIMULATED, REAL)]
         raise SystemExit(lacking.report(args, *sides, env))
-    runfile.pd_side(atom_args, refuse=True)
     if args.check:
+        if side := runfile.pd_side(atom_args):
+            name = lacking.SIDES[side]
+            raise ValueError(
+                f"{KV_FLAG} makes this a {name} instance: check it with --check "
+                f"{name}, without its {KV_FLAG}, which the check adds as deploy.sh does"
+            )
         serve._refuse(atom_args)
         raise SystemExit(lacking.report(args, atom_args))
+    runfile.pd_side(atom_args, refuse=True)
     if not args.out:
         parser.error("the following arguments are required: --out")
     run = runfile.build(args, atom_args)

@@ -184,7 +184,7 @@ python -m atom.entrypoints.openai_server <ATOM arguments> \
 | `--acceptance-record` | a speculative `compass record` directory: the per-position rates its accepted-draft histograms give over the run's DP ranks go to ATOM as `--spec-decode-acceptance-rates`, and the run file names the record, so the summary states the acceptance input `measured` (`14` D84, input 1). Refuses a record with no histogram or none for one of the run's DP ranks, one drafted at another width than ATOM's arguments, and ATOM's arguments stating an acceptance of their own | none: the acceptance is the one ATOM's arguments state, `declared` |
 | `--out` | a new or empty directory for what the `run` row of the command table below writes; one holding an earlier run's files refuses. Under `--check`, the directory the printed `calibrate.sh` command writes | **none — refuses**, but `--check` writes none, and its `calibrate.sh` command writes `cal` in the current directory |
 | `--join` | tool-only: a deployment's run file, which `scripts/compass/deploy.sh` builds from the flags above and hands every instance; the server joins the authority it names instead of co-hosting one, and every flag above but `--out` is refused beside it (below) | off: the server co-hosts its authority |
-| `--check` | tool-only: resolve the run file and the configuration ATOM's arguments give, start no server or authority and write no `--out`, and print every missing or stale input, a step linear law's decode rung the capture ladder schedules with no vector included (`19` D112), each with the refusal the run meets and the command that makes it, for a step linear law, the `calibrate.sh` command of its record list, with its expected time (`19` D113), exiting 1 if any (the [ruling on #2312](https://github.com/jgong5/ATOM/issues/2312#issuecomment-6462166589)). Coverage gaps, an absent price list and the modules the step roofline leaves unclassified print apart, outside the exit status. Refused beside `--join` | off: the run serves |
+| `--check` | tool-only: resolve the run file and the configuration ATOM's arguments give, start no server or authority and write no `--out`, and print every missing or stale input, a step linear law's decode rung the capture ladder schedules with no vector included (`19` D112), each with the refusal the run meets and the command that makes it, for a step linear law, the `calibrate.sh` command of its record list, with its expected time (`19` D113), exiting 1 if any (the [ruling on #2312](https://github.com/jgong5/ATOM/issues/2312#issuecomment-6462166589)). `--check prefill` or `--check decode` checks that side of a `scripts/compass/deploy.sh` deployment, its arguments and environment resolved as `deploy.sh run` starts it (`19` D109); a plain `--check` of a side's arguments refuses, naming that side's value. Coverage gaps, an absent price list and the modules the step roofline leaves unclassified print apart, outside the exit status. Refused beside `--join` | off: the run serves |
 
 `run` reads the `memory_readings` entry for its configuration (`07` D41) and refuses when
 there is none, naming the configuration. `compass measure memory` takes it; for a device
@@ -248,7 +248,7 @@ compass fit host       RECORD... --client-run RECORD EXPORT... --out D --store S
 compass fit ops        MEASURED... --out D --store S
 compass run            <backend> <platform> --out D --store S -- <ATOM args>
 compass run            --join RUN_FILE        --out D -- <ATOM args>
-compass run            <backend> <platform> --store S --check -- <ATOM args>
+compass run            <backend> <platform> --store S --check [prefill|decode] -- <ATOM args>
 compass project        --model MODEL [--tp N] <platform> --store S RECORD... \
                        [-- RECORD <ATOM args>]...
 compass advice         SPACE OUT
@@ -371,8 +371,8 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
     Its `run.json` takes what grading reads from there, where the authority writes the
     step table and the summaries, its own engine's memory readings included. A prefill
     or decode `run` without `--join` refuses, as it shares a clock with its peer, except
-    under `--check`, which starts no server and resolves the side as the script does
-    (`19` D109).
+    under `--check prefill` or `--check decode`, which starts no server and resolves the
+    side as the script does (`19` D109).
   - *The deployment's `server.json`.* Once the router answers, the deployment
     directory holds a `server.json` as `serve` writes one, naming the router's URL and
     the process id of a child of the script that lives as long as the script, and
