@@ -60,6 +60,7 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
+from atom.model_engine.torch_cache_cap import TorchCacheCap, cap_torch_cache
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
@@ -715,6 +716,11 @@ class tokenIDProcessor:
         return ret
 
 
+#: Share of the card the KV budget holds back as safety, and the torch cache
+#: cap keeps free once startup ends.
+KV_SAFETY_MARGIN = 0.02
+
+
 class DeviceMemoryReadings(NamedTuple):
     """What `get_num_blocks` knows about the device before any arithmetic.
 
@@ -753,6 +759,10 @@ def _profile_runner_stage(method):
 
 
 class ModelRunner:
+    #: The torch cache cap `_cap_torch_cache` set when startup ended; None
+    #: until then, or when ATOM_TORCH_CACHE_CAP is 0.
+    torch_cache_cap: TorchCacheCap | None = None
+
     def __init__(self, rank: int, config: Config):
         self.config = config
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
@@ -1863,6 +1873,19 @@ class ModelRunner:
         non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
         return DeviceMemoryReadings(free, total, peak_torch, non_torch)
 
+    def _cap_torch_cache(self) -> None:
+        """Hold the torch cache to what the runner's startup leaves it, less
+        the KV budget's safety margin (`cap_torch_cache`).
+
+        Called where this runner's startup allocations end: after graph
+        capture, or after the KV pool when it captures no graph. Nothing else
+        bounds the cache once the pool is sized, and a full card makes ROCr
+        take back the hardware queues' scratch, which a spilling grid-barrier
+        kernel (MoRI's EP combine) then cannot get whole."""
+        self.torch_cache_cap = cap_torch_cache(
+            self.device, KV_SAFETY_MARGIN, self.label
+        )
+
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
         config = self.config
@@ -1873,7 +1896,7 @@ class ModelRunner:
         free, total, peak_torch, non_torch = self._read_device_memory()
 
         cudagraph_overhead = self._estimate_cudagraph_overhead()
-        safety_margin = int(total * 0.02)
+        safety_margin = int(total * KV_SAFETY_MARGIN)
 
         budget = int(total * config.gpu_memory_utilization)
         non_kv_overhead = peak_torch + non_torch + cudagraph_overhead + safety_margin
@@ -2352,6 +2375,10 @@ class ModelRunner:
             and torch.distributed.get_world_size() > 1
         ):
             torch.distributed.barrier()
+        # An eager runner captures no graph, so its startup allocations end
+        # with the pool (and the communicator the barrier may have built).
+        if self.config.enforce_eager:
+            self._cap_torch_cache()
         return True
 
     def _maybe_create_tbo_slices(
@@ -3507,6 +3534,8 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        if self.torch_cache_cap is not None:
+            self.torch_cache_cap.poll()
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
         # otherwise wait out the previous forward's copies.
@@ -4277,6 +4306,8 @@ class ModelRunner:
                 f"{(usage_ratio - self.config.gpu_memory_utilization):.1%}. "
                 f"Consider reducing gpu_memory_utilization."
             )
+        # The graph pools are the last of this runner's startup allocations.
+        self._cap_torch_cache()
 
         return time.time() - start_time, self.capture_sizes, _pool_bytes
 
@@ -4553,7 +4584,7 @@ class RapidServeModelRunner(ModelRunner):
     def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
         # Two processes share the GPU in disagg mode; reserve extra headroom so
         # NCCL/system allocs (e.g. the 512MB NCCL barrier buffer) don't OOM.
-        safety_margin = int(total_bytes * 0.02)
+        safety_margin = int(total_bytes * KV_SAFETY_MARGIN)
         return 4 * safety_margin
 
     def get_num_blocks(self) -> dict[str, object]:
@@ -4582,6 +4613,8 @@ class RapidServeModelRunner(ModelRunner):
     @_profile_runner_stage
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        if self.torch_cache_cap is not None:
+            self.torch_cache_cap.poll()
         # Decode runs the model forward on a dynamically selected (optionally
         # CU-masked) stream so it doesn't contend with prefill on the shared
         # GPU; postprocess (sampling + async CPU copy) stays on the default
