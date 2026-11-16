@@ -944,8 +944,6 @@ def _patches(recorder):
     * A host tensor ATOM asks to pin (that host side, `pin_memory=True`, a
       `pin_memory()` copy) is held pinned (`_Recorder.pin`), as `is_pinned`
       answers.
-    * GDN's causal-conv1d metadata is host arithmetic over the staged
-      `cu_seqlens`, and it runs outside the fake mode too.
     * A GDN prefill under ReplaySSM parks the cursors of its live state
       slots, a count of the device's slot indices no fake tensor holds: the
       host-staged indices state it (`_Recorder.counted`).
@@ -1030,7 +1028,7 @@ def _patches(recorder):
         recorder.launch(f"flydsl.{jit.func.__name__}", compiled, jit)
 
     init, zeros, numpy = CpuGpuBuffer.__init__, torch.zeros, torch.Tensor.numpy
-    conv1d, tolist = gdn_attn.compute_causal_conv1d_metadata, torch.Tensor.tolist
+    tolist = torch.Tensor.tolist
     attach = gdn_attn.GDNStateMixin._attach_replayssm
     fake_tolist, sync = FakeTensor.tolist, ubatching.sync_dp_metadata
     dual_stream = module_dispatch_ops._dual_stream_is_active
@@ -1087,10 +1085,6 @@ def _patches(recorder):
         with patch.object(recorder, "stated", stated):
             return moe.moe_forward(hidden_states, router_logits, layer_name)
 
-    def host_conv1d(*args, **kwargs):
-        with unset_fake_temporarily():
-            return conv1d(*args, **kwargs)
-
     def host_sync(**kwargs):
         # Outside every mode: host arithmetic, not the step's device work.
         with _disable_current_modes():
@@ -1117,7 +1111,6 @@ def _patches(recorder):
         (fly, "_compile_impl", compile_impl),
         (fly.CompiledFunction, "__call__", compiled_call),
         (CpuGpuBuffer, "__init__", staged_init),
-        (gdn_attn, "compute_causal_conv1d_metadata", host_conv1d),
         (ubatching, "sync_dp_metadata", host_sync),
         (gdn_attn.GDNStateMixin, "_attach_replayssm", replayssm),
         (torch.Tensor, "tolist", host_tolist),
