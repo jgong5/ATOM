@@ -49,7 +49,7 @@ from atom.compass.spec import MachineSpec
 
 CONFIG = pathlib.Path(__file__).with_name("qwen3_5_35b_a3b_fp8_config.json")
 CONFIG_ARCHITECTURES = json.loads(CONFIG.read_text())["architectures"]
-MACHINE = TREE / "scripts" / "compass" / "machines" / "mi308x-hjbog39.json"
+MACHINE = TREE / "tests" / "compass" / "machines" / "mi308x-hjbog39.json"
 ATTENTION = "aiter.unified_attention_with_output_base.default"
 SAMPLER = "atom.model_ops.rejection_sampler:rejection_sample"
 ARGMAX = "aiter.ops.flydsl.topk.topk_per_row_argmax:topk_per_row_argmax"
@@ -297,7 +297,9 @@ def dp_view(width, rung, dp, counts=None):
     counts = torch.tensor(counts or [2 * width] * dp)
     mode = SimpleNamespace(
         sync=SimpleNamespace(
-            scheduled_tokens_per_dp_rank=counts, ub_tokens_across_dp=None
+            scheduled_tokens_per_dp_rank=counts,
+            ub_tokens_across_dp=None,
+            any_rank_needs_eager=False,
         ),
         running_tokens_are_unified=True,
         running_tokens=2 * rung,
@@ -470,6 +472,7 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
             scheduled_tokens_per_dp_rank=torch.tensor([64, 64]),
             max_bs_across_dp=1,
             ub_tokens_across_dp=None,
+            any_rank_needs_eager=False,
         ),
         running_tokens_are_unified=False,
         running_tokens=64,
@@ -584,7 +587,10 @@ def test_a_decode_padded_to_its_rung_prices_its_drafter_at_its_rows(
     padded, full = backend.price(verify_view(3, 4)), backend.price(verify_view(4, 4))
 
     assert padded.draft_terms[-1].provenance.detail.endswith("decode T=3 B=4")
-    assert padded.target_seconds == full.target_seconds
+    # Its target ran at its rung, its experts on its 6 tokens of the 8 rows.
+    target = [{t.name: t.seconds for t in cost.terms} for cost in (padded, full)]
+    experts = [terms.pop(f"op.{MOE}") for terms in target]
+    assert target[0] == target[1] and experts[0] < experts[1]
     # The rung's drafter, which this step read before, prices more than runs.
     assert 0 < padded.draft_seconds < full.draft_seconds
 

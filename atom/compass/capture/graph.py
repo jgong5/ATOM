@@ -238,6 +238,7 @@ def _arg(value):
     if isinstance(value, ir.Tensor):
         marks = {"is_shuffled": True} if value.shuffled else {}
         marks |= {"device": "cpu"} if value.host else {}  # none: on the device
+        marks |= {"pageable": True} if value.pageable else {}  # none: pinned
         return {
             "shape": _arg(value.shape),
             "dtype": value.dtype,

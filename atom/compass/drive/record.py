@@ -105,14 +105,8 @@ def main(argv: list[str]) -> None:
                 f"{arg} is among ATOM's arguments; a record times real weights, "
                 "and MoE routing follows them"
             )
-    if args.trace and (
-        runfile._dp_width(atom_args) > 1
-        or runfile._engine_args(atom_args).pipeline_parallel_size > 1
-    ):
-        raise ValueError(
-            "--trace reduces each TP rank's busy time, and ATOM's arguments run "
-            "DP ranks or pipeline stages"
-        )
+    if args.trace:
+        refuse_trace(atom_args)
     env = {
         AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1"),
         "TRITON_CACHE_DIR": knobs.cache.dir,
@@ -141,6 +135,19 @@ def main(argv: list[str]) -> None:
     if args.trace:
         busy.reduce(args.out)
     write_engine_and_costs(args.out)
+
+
+def refuse_trace(atom_args) -> None:
+    """Refuse a trace run of ATOM's arguments `atom_args` that runs DP ranks or
+    pipeline stages: its busy time is reduced per TP rank."""
+    if (
+        runfile._dp_width(atom_args) > 1
+        or runfile._engine_args(atom_args).pipeline_parallel_size > 1
+    ):
+        raise ValueError(
+            "--trace reduces each TP rank's busy time, and ATOM's arguments run "
+            "DP ranks or pipeline stages"
+        )
 
 
 def _parser() -> argparse.ArgumentParser:

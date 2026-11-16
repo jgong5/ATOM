@@ -22,9 +22,11 @@ from atom.compass.artifacts import (
     Key,
     Kind,
     Topology,
+    keyed_platform,
     member_name,
 )
 from atom.compass.backends.step_labels import digest, label
+from atom.compass.fit.publish import platform
 from atom.compass.fit.samples import MEMBER, load
 from atom.compass.parity import ARRIVALS
 from atom.compass.parity.served import served
@@ -87,7 +89,8 @@ def measured(store, config, sampling=SAMPLING, origin="replay"):
     """A step measurement keyed by `config`, as `measure steps` publishes one."""
     key = Key.of(
         Kind.STEP_MEASUREMENT,
-        **{f: config[f] for f in ("model", "device", "source_root")},
+        **{f: config[f] for f in ("model", "source_root")},
+        **keyed_platform(Kind.STEP_MEASUREMENT, platform(config)),
         engine_config=json.dumps(config["engine_config"], sort_keys=True),
         sampling=json.dumps(sampling, sort_keys=True),
         step_kind="decode",

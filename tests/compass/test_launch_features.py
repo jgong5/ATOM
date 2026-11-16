@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from test_backend_step_grid import scheduler_of
 from test_backend_step_linear_fit import SPEC, _steps, _timed_record
-from test_fit_steps import DIGEST
+from test_fit_steps import PLATFORM
 from test_memory_readings import META_8B
 from test_parity_device_window import _recorded
 from test_parity_record import _config, _drive
@@ -35,6 +35,7 @@ from test_served_tokenizer import (
 )
 
 from atom.compass import run as compass_run
+from atom.compass.artifacts import Kind, keyed_platform
 from atom.compass.backends.launch_features import (
     GRAPHS,
     REGISTRY,
@@ -251,7 +252,10 @@ def test_a_run_prices_a_column_under_the_sets_its_host_laws_key_states(
 ):
     r = deployment(tmp_path)
     publish(tmp_path, r)
-    key = {**compass_run.host_key(r.config), "machine_spec": DIGEST}
+    key = {
+        **compass_run.host_key(r.config),
+        **keyed_platform(Kind.HOST_LAWS, PLATFORM),
+    }
     key["engine"] = {**key["engine"], GRAPHS: SETS}
     laws = {k: {g: [1e-4, 0, 0] for g in HOST_SEGMENTS} for k in FORWARD_KINDS}
     # An entry fitted under another engine config, which the run passes over.
@@ -297,7 +301,9 @@ def test_the_server_and_the_run_file_take_the_host_entry_the_runner_takes(
         (tmp_path / f"law{i}.json").write_text(json.dumps({"host": host}))
         flags += ["--host-laws", str(tmp_path / f"law{i}.json")]
     # This run's ATOM arguments resolve the second deployment's config.
-    monkeypatch.setattr("atom.compass.drive.run._config", lambda atom_args: r.config)
+    monkeypatch.setattr(
+        "atom.compass.drive.run._config", lambda atom_args, arch: r.config
+    )
     run = runfile.build(parsed(tmp_path, *flags), model(tmp_path))
     _run_file(monkeypatch, tmp_path, run | {"out_dir": str(tmp_path)})
     monkeypatch.setattr(compass_run, "_frontend_host", None)

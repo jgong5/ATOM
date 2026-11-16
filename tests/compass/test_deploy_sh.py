@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_launcher_held_ports import HELD, SQUAT
 from test_memory_readings import DOCUMENT
@@ -121,7 +122,7 @@ ROUTER_LP_ARGS = [*ROUTER_ARGS, "--disable-retries", "--dp-aware"]
 
 @pytest.fixture
 def planted(tmp_path):
-    """The stubbed `python3` and router, the suite's machine and a step stub;
+    """The stubbed `python3` and router, the suite's platform and a step stub;
     returns the environment and the run flags."""
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -138,7 +139,6 @@ def planted(tmp_path):
     (bindir / "atomesh").write_text(f"#!{sys.executable}\n" + ROUTER)
     for tool in ("python3", "atomesh"):
         (bindir / tool).chmod(0o755)
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     (tmp_path / "stub.json").write_text(json.dumps(dataclasses.asdict(Coefficients())))
     # The router stub records every ATOM_COMPASS_* it inherits, so none come
     # from the caller (the GPU gate sets the slice model's).
@@ -151,9 +151,18 @@ def planted(tmp_path):
         "WAIT_S": "60",
     }
     flags = ["--step-stub", str(tmp_path / "stub.json")]
-    flags += ["--machine", str(tmp_path / "machine.json")]
+    flags += platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
     flags += ["--store", str(tmp_path / "store")]
     return env, flags
+
+
+def router_hop(tmp_path) -> list[str]:
+    """`--host-laws` naming a law file whose host entry states the router's hop
+    alone: a router LP splits it around its hop in, which the floor cannot hold."""
+    law = tmp_path / "router_hop.json"
+    host = {"key": {}, "laws": {}, "hops": {"router_s": 1.5e-3}}
+    law.write_text(json.dumps({"host": host}))
+    return ["--host-laws", str(law)]
 
 
 def argv(tmp_path, flags, prefill=PREFILL, router=ROUTER_ARGS):
@@ -277,7 +286,7 @@ def test_a_dp_aware_router_runs_as_the_router_lp_on_the_run_s_clock(tmp_path, pl
     env, flags = planted
     env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
     d = tmp_path / "d"
-    words = argv(tmp_path, flags, router=ROUTER_LP_ARGS)
+    words = argv(tmp_path, flags + router_hop(tmp_path), router=ROUTER_LP_ARGS)
     script = subprocess.Popen(
         words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
     )
@@ -324,7 +333,7 @@ def test_a_router_lp_that_leaves_as_the_traffic_closes_waits_for_the_client_s_st
     env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
     env["PLANTED_LEAVE"] = str(tmp_path / "leave")
     d = tmp_path / "d"
-    words = argv(tmp_path, flags, router=ROUTER_LP_ARGS)
+    words = argv(tmp_path, flags + router_hop(tmp_path), router=ROUTER_LP_ARGS)
     script = subprocess.Popen(
         words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True,

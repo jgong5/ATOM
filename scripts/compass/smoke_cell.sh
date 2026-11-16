@@ -3,8 +3,9 @@
 #
 # QUICKSTART.md's path end to end at concurrency 1 on one GPU, in about an hour:
 # `compass measure memory`; a calibration `compass record` serving cc-traces 353
-# on; `compass fit steps` (step linear, history form) and `compass fit host` on
-# it; two real `compass record` runs and one `compass run`, serving traces 0 on;
+# on; `compass fit steps` (step linear, history form, MODEL's MoE routing) and
+# `compass fit host` on it; two real `compass record` runs and one `compass
+# run`, serving traces 0 on;
 # then the cell graded by `python -m atom.compass.validate`. Each server serves
 # one `client.sh` run, with its warmup, which stops it. The fits run before the
 # real runs, so a failed fit costs no more GPU time.
@@ -21,7 +22,13 @@
 #   OUT             an absent or empty directory, on a disk with room
 #   GPU             the one GPU, as rocm-smi and `--gpu` number it (required);
 #                   each compass command refuses it while a process is on it
-#   MACHINE         the machine spec of this node's GPUs (required)
+#   DEVICE          the GPUs' datasheet, by SKU or path, as `compass run
+#                   --device` takes it (required)
+#   PTL             the GPUs' PTL state, enabled or disabled (required)
+#   READINGS        an artifact store holding this platform's readings, which
+#                   `compass measure device` and `compass fit device` publish;
+#                   its platform_readings entries are copied into OUT/store
+#                   (required)
 #   TRACES          a cc-traces traces.jsonl (required, as client.sh takes it)
 #   HARNESS_PYTHON  the Python with agentx-harness and compass-harness, for the
 #                   simulated run's client (required)
@@ -48,7 +55,8 @@ compass_require_tree "$ROOT" || exit $?
 compass_describe "$ROOT"
 MODEL=$(realpath "${1:?usage: smoke_cell.sh MODEL OUT}")
 OUT=${2:?usage: smoke_cell.sh MODEL OUT}
-MACHINE=$(realpath "${MACHINE:?MACHINE names the machine spec of the GPUs}")
+: "${DEVICE:?DEVICE names the datasheet of the GPUs}" "${PTL:?PTL names their PTL state}"
+READINGS=$(realpath "${READINGS:?READINGS names a store holding the readings of the GPUs}")
 : "${TRACES:?TRACES names a cc-traces traces.jsonl}"
 : "${HARNESS_PYTHON:?HARNESS_PYTHON names the Python with compass-harness}"
 : "${AIPERF_PYTHON:?AIPERF_PYTHON names the Python without compass-harness}"
@@ -104,21 +112,23 @@ serve() {
 # token LOG: the store token a fit's LOG ends with.
 token() { awk '/^published / {t = $NF} END {print t}' "$1"; }
 
-M=(--machine "$MACHINE" --store "$OUT/store")
+M=(--store "$OUT/store")
+mkdir -p "$OUT/store" && cp -r "$READINGS/platform_readings" "$OUT/store/" ||
+    fail readings "$READINGS holds no platform_readings"
 CAL=353-$((352 + N)) CELL=0-$((N - 1))
 step memory python3 -c "$CLI" measure memory --gpu "$GPU" "${M[@]}" --out "$OUT/memory" -- "${ATOM_ARGS[@]}"
 serve warm "$OUT/warm" "$CELL" "$AIPERF_PYTHON" record --gpu "$GPU"
 serve calibration "$OUT/calibration" "$CAL" "$AIPERF_PYTHON" record --gpu "$GPU"
 RUNS=(--client-run "$OUT/calibration" "$OUT/calibration/artifacts/client_run.json")
 step fit_steps python3 -c "$CLI" fit steps --backend step-linear --form history \
-    "$OUT/calibration" "${RUNS[@]}" "${M[@]}" --out "$OUT/fit_steps"
+    --model "$MODEL" "$OUT/calibration" "${RUNS[@]}" "${M[@]}" --out "$OUT/fit_steps"
 step fit_host python3 -c "$CLI" fit host "$OUT/calibration" "${RUNS[@]}" "${M[@]}" --out "$OUT/fit_host"
 LAW=$(token "$OUT/fit_steps.log") HOST=$(token "$OUT/fit_host.log")
 for k in 1 2; do
     serve real$k "$OUT/cell/real$k" "$CELL" "$AIPERF_PYTHON" record --gpu "$GPU"
 done
 serve step_linear "$OUT/cell/step_linear" "$CELL" "$HARNESS_PYTHON" \
-    run --step-linear "$LAW" --host-laws "$HOST" "${M[@]}"
+    run --step-linear "$LAW" --host-laws "$HOST" --device "$DEVICE" --ptl "$PTL" "${M[@]}"
 step grade python3 -m atom.compass.validate "$OUT/cell"
 
 cat "$OUT/grade.log"

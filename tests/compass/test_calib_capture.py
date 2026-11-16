@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: MIT
-"""`calib_capture.sh`: one cell at a time, stopped after its first recorded step,
-never on a GPU that holds a process.
+"""`calib_capture.sh`: one cell at a time, stopped STEPS_S after aiperf's
+profiling phase starts or in a warmup that outlasts STEPS_S, never on a GPU
+that holds a process.
 
 `cctraces_sim.sh` and `rocm-smi` are stubbed, so these run with no GPU: the stub
-cell runs a process named as aiperf's controller is, which writes a step and
-waits; as aiperf does, SIGINT ends it with status 0 and its export, or, with
-IN_WARMUP set, with status 1 and none; SIGTERM ends it with 143. With IN_GRACE
-set its duration has passed: it logs so, and ends 5 s after the cell's log
-reads that its duration ended, with status 0 and its export, or on SIGINT with
-status 1; with no such line within 40 s it exits 2. The cell exits with its
-status, as cctraces_sim.sh exits with aiperf's.
+cell runs a process named as aiperf's controller is, which writes no step, as a
+server writes its record only at its exit. Into aiperf.log, each line led by
+its time, it logs its warmup's start and, WARMUP_S seconds later, its profiling
+phase's, and ends DURATION_S (default 60) seconds after that with status 0 and
+its export. As aiperf does, SIGINT ends it with status 0 and its export, or in
+its warmup with status 1 and none, and it logs the signal; SIGTERM ends it
+with 143. With IN_WARMUP set it exits 1 in
+its warmup, with no export. With IN_GRACE set its duration has passed: it logs
+so, and ends 5 s after the cell's log reads that its duration ended, with
+status 0 and its export, or on SIGINT with status 1; with no such line within
+40 s it exits 2. The cell exits with its status, as cctraces_sim.sh exits with
+aiperf's.
 """
 
 import json
@@ -31,14 +37,19 @@ cell = sys.argv[1]
 def export():
     os.mkdir(cell + "/artifacts")
     open(cell + "/artifacts/client_run.json", "w").write("{}")
+in_warmup = True
 def stop(*_):
-    os.environ.get("IN_WARMUP") and sys.exit(1)
-    export()
-    sys.exit(1 if os.environ.get("IN_GRACE") else 0)
+    print(time.time(), "SIGINT", flush=True)
+    in_warmup or export()
+    sys.exit(1 if in_warmup or os.environ.get("IN_GRACE") else 0)
 signal.signal(signal.SIGINT, stop)
-open(cell + "/steps/dp0.jsonl", "w").write("{}")
+print(time.time(), "Phase warmup (warmup) started", flush=True)
+time.sleep(float(os.environ.get("WARMUP_S", 0)))
+os.environ.get("IN_WARMUP") and sys.exit(1)
+in_warmup = False
+print(time.time(), "Phase profiling (profiling) started", flush=True)
 if os.environ.get("IN_GRACE"):
-    open(cell + "/aiperf.log", "w").write("Phase profiling (profiling) sending complete")
+    print(time.time(), "Phase profiling (profiling) sending complete", flush=True)
     for _ in range(400):
         time.sleep(0.1)
         if "aiperf duration ended" in open(cell + ".log").read():
@@ -46,10 +57,11 @@ if os.environ.get("IN_GRACE"):
             export()
             sys.exit(0)
     sys.exit(2)
-time.sleep(60)"""
+time.sleep(float(os.environ.get("DURATION_S", 60)))
+export()"""
 CELL = f"""#!/bin/bash
 mkdir -p "$2/steps" && echo '{{"workload": 1}}' > "$2/run.json"
-(exec -a "aiperf system_controller" {sys.executable} -c '{AIPERF}' "$2")
+(exec -a "aiperf system_controller" {sys.executable} -c '{AIPERF}' "$2") >"$2/aiperf.log"
 rc=$?
 echo "c=$CONCURRENCY done" >> "$2/../order"
 exit $rc
@@ -90,9 +102,8 @@ def _capture(tmp_path, smi, cells, gpus="6", showhw=SHOWHW, **env):
         os.environ,
         PATH=f"{bindir}:{os.environ['PATH']}",
         CELLS=cells,
-        STEPS_S="0",
         HIP_VISIBLE_DEVICES=gpus,
-        **env,
+        **{"STEPS_S": "0", **env},
     )
     script = "scripts/compass/calib_capture.sh"
     r = subprocess.run(
@@ -117,6 +128,31 @@ def test_each_cell_is_stopped_and_logged_in_turn(tmp_path):
         assert log.startswith(f"cafe\nCONCURRENCY={c} GPU=6 ")
         assert "stopped aiperf" in log and "CELL_RC=0" in log
         assert log.count("uptime:") == 2
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_cell_is_stopped_steps_s_after_its_profiling_phase_starts(tmp_path):
+    r, cap = _capture(tmp_path, FREE, "1", STEPS_S="10", WARMUP_S="3", DURATION_S="30")
+    assert r.returncode == 0, r.stderr
+    log = (cap / "c1.log").read_text()
+    assert "aiperf profiling started" in log and "stopped aiperf" in log, log
+    aiperf = (cap / "c1" / "aiperf.log").read_text().splitlines()
+    at = {event: float(t) for t, event in (line.split(" ", 1) for line in aiperf)}
+    assert at["SIGINT"] - at["Phase profiling (profiling) started"] >= 10, at
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_cell_whose_warmup_outlasts_steps_s_is_stopped_in_it(tmp_path):
+    r, cap = _capture(tmp_path, FREE, "1", STEPS_S="3", WARMUP_S="30")
+    assert r.returncode == 1
+    assert "no client-run export: c1" in r.stderr
+    log = (cap / "c1.log").read_text()
+    assert "aiperf warmup started" in log and "stopped aiperf" in log, log
+    assert "aiperf profiling started" not in log and "CELL_RC=1" in log, log
+    aiperf = (cap / "c1" / "aiperf.log").read_text().splitlines()
+    at = {event: float(t) for t, event in (line.split(" ", 1) for line in aiperf)}
+    assert at.keys() == {"Phase warmup (warmup) started", "SIGINT"}, at
+    assert at["SIGINT"] - at["Phase warmup (warmup) started"] >= 3, at
 
 
 @pytest.mark.skipif(BASH is None, reason="no bash on PATH")

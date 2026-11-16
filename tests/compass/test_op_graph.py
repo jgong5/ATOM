@@ -1243,14 +1243,15 @@ def _published(tmp_path, root=None):
     """The fields of a `price_list` key holding `FLAT`, published under the
     readings a run on the suite's machine document takes from this ATOM
     source, or from the ATOM source `root`."""
-    from atom.compass.artifacts import Key, Kind
+    from atom.compass.artifacts import Key, Kind, keyed_platform, machine_platform
     from atom.compass.fit.publish import publish
     from atom.compass.run import _machine, atom_source
     from atom.compass.run.step_grid import readings
 
     source = atom_source(root)
     machine = _machine({"machine": DOCUMENT})
-    conditions = readings(machine, atom_src=source, model="m", engine_config="{}")
+    platform = machine_platform(machine)
+    conditions = readings(platform, atom_src=source, model="m", engine_config="{}")
     key = Key.of(
         Kind.PRICE_LIST,
         model="sha256:" + "0" * 64,
@@ -1261,7 +1262,7 @@ def _published(tmp_path, root=None):
         decode_context_parallel_size=1,
         enable_expert_parallel=False,
         enable_dp_attention=False,
-        machine_spec="sha256:" + "1" * 64,
+        **keyed_platform(Kind.PRICE_LIST, machine_platform(machine)),
         source_root="tree-" + "a" * 40,
     )
     args = SimpleNamespace(store=str(tmp_path / "store"), out=str(tmp_path), ptl=None)
@@ -1519,7 +1520,7 @@ def test_a_warm_tracer_holds_one_trace_s_worth_whatever_it_traced_before(
 def _alive(pid: int) -> bool:
     try:
         stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # reaped before or mid-read
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 

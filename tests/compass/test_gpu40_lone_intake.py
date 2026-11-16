@@ -7,6 +7,7 @@ import asyncio
 import json
 import queue
 import threading
+from pathlib import Path
 
 import pytest
 from test_compass_event_loop import (
@@ -17,14 +18,13 @@ from test_compass_event_loop import (
     _stamp,
     run,  # noqa: F401  the run fixture
 )
-from test_spec_verbs import SPEC_ROOT
 
 from atom.compass import clock_transport
 from atom.compass import run as compass_run
 from atom.utils.clock import LPRuntime
 from atom.utils.compass_loop import CompassEventLoop, HttpChannel
 
-LAW = SPEC_ROOT / "scripts/compass/laws"
+LAW = Path(__file__).resolve().parents[2] / "scripts/compass/laws"
 GPU40 = LAW / "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-decode.json"
 #: The law's decode-side record at 2d701d657 (cc-traces 256 to 392, c=16), over
 #: its lone requests: the mean body, and the loop's mean CPU time to take one in.

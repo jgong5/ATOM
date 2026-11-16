@@ -40,6 +40,12 @@ TP = 4
 MOE = "aiter.fused_moe_.default"
 #: gfx950's FP8 scorer: aiter's function that launches its compiled kernel.
 COMPILED = "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits"
+#: V4.1's index top-k at a decode of 16 rows, as aiter launches it by arch:
+#: FlyDSL's one-block kernel, and on gfx950 its multi-CTA one.
+TOPKS = {
+    "gfx1250": "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
+    "gfx950": "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode",
+}
 #: A decode V4.1's mono decode serves: gfx950, expert parallelism off.
 MONO = "--width 16" + ARGS
 #: Two such decodes and a prefill, which mono never serves.
@@ -214,6 +220,20 @@ def test_gfx950_s_fp8_scorer_lifts_its_compiled_kernel_launch_to_its_function(
         assert op["args"]["q_fp8"]["shape"][0] == 16
         assert op["args"]["q_fp8"]["dtype"] == "torch.float8_e4m3fn"
         assert {"kv_cache", "weights", "out_logits"} <= set(op["args"])
+
+
+@pytest.mark.parametrize("arch", ["gfx1250", "gfx950"])
+def test_each_decode_layer_s_index_top_k_states_its_layer_s_ratio(
+    arch, tmp_path_factory
+):
+    # gfx950's decode under EP4, which V4.1's mono decode does not serve
+    argv = SHAPES + ARGS if arch == "gfx1250" else "--width 16" + ARGS + EP4
+    graph, _ = capture(tmp_path_factory, argv, arch)["decode B=16"]
+
+    for index, layer in enumerate(_decoder(graph)):
+        stated = [op.get("stated") for op in layer if op["op"] == TOPKS[arch]]
+        assert stated == [{"compress_ratio": RATIOS[index]}] * len(stated), index
+        assert bool(stated) == (index in TEXT["index_source_layer_ids"]), index
 
 
 def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(tmp_path):

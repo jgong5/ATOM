@@ -114,7 +114,9 @@ def view(batch, counts, split=None, unified=False, rung=None):
     r = runner(None, dp_size=DP)
     r.drafter = None
     sync = SimpleNamespace(
-        scheduled_tokens_per_dp_rank=torch.tensor(counts), ub_tokens_across_dp=split
+        scheduled_tokens_per_dp_rank=torch.tensor(counts),
+        ub_tokens_across_dp=split,
+        any_rank_needs_eager=False,
     )
     mode = SimpleNamespace(
         sync=sync,
@@ -256,6 +258,15 @@ def test_a_population_s_micro_batch_is_traced_as_one_forward(
     assert '"enable_tbo":true' in graph["structure"]
 
 
+def test_one_rank_s_tbo_population_names_its_split_step_s_micro_batches(tmp_path):
+    # One rank clears the 8192-token bar; no peer vetoes the split.
+    record = _record(tmp_path, [([[9000, 9000, False]], None)])
+
+    shapes = list(map(str, population_shapes([record], tbo=True)))
+
+    assert shapes == ["prefill T=4500 B=1"] * 2
+
+
 def test_a_tbo_population_splits_a_prefill_and_names_a_decode_s_rows(tmp_path):
     # Step 1 splits as above; at step 2 rank 0 decodes 2 rows, rank 1 3.
     ranks = [([[9000, 9000, False]], 9100), ([[100, 100, False]], 9100)]
@@ -345,11 +356,11 @@ def test_a_mori_exchange_at_gathered_rows_spans_the_ep_width(call):
     assert c.ranks == DP
 
 
-def test_a_gather_s_pad_rows_activate_experts_as_one_token():
+def test_a_gather_s_pad_rows_route_to_no_expert():
     # Sixteen rows gathered over the group, five of them real tokens.
     padded = BatchView(
         (RequestShape(1, 9, True),), capture_rung=2, moe_rows=16, moe_tokens=5
     )
-    hit = activated_experts(16, 2, 6)
+    hit = activated_experts(16, 2, 5)
 
-    close(work(moe(16, 16), padded, 1, "bf16"), experts(16, 32, hit))
+    close(work(moe(16, 16), padded, 1, "bf16"), experts(16, 10, hit))
