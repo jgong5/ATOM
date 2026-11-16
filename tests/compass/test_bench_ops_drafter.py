@@ -570,16 +570,24 @@ def test_each_leaf_of_a_drafter_s_graphs_reaches_its_launch(rehearsed):
 
 def test_the_draft_block_takes_what_its_drafter_builds_from_its_anchors(rehearsed):
     """Each leaf of the drafter's that takes its block's anchors, or the
-    positions and indices ATOM builds from them, takes that build's item, at
-    both shapes."""
+    positions and indices ATOM builds from them, takes that build's, at both
+    shapes."""
+    v41, stage = "atom.model_ops.deepseek_v41", "atom.spec_decode.dspark_proposer"
+    built = {
+        (f"{stage}:DSparkProposer._stage_anchors", "rows"): "rows",
+        (f"{v41}.dspark:draft_step_indices", "positions"): "anchors",
+        (f"{v41}.rope_window:_launch_rope_window", "positions"): "positions",
+        ("atom.model_ops.sparse_attn_v4:_sparse_attn_triton", "topk_idxs"): "indices",
+        ("aiter._inverse_rope_group_quant_kernel.default", "positions"): "positions",
+    }
     taken = {
         (r["shape"], r["op"], slot, r["bound"].get(slot))
         for r in rehearsed
-        for (op, slot) in ops.BLOCK
+        for op, slot in built
         if op == r["op"]
     }
     assert taken == {
         (shape, op, slot, f"draft_step.{item}")
         for shape in ("decode B=4", "prefill T=124 B=1")
-        for (op, slot), item in ops.BLOCK.items()
+        for (op, slot), item in built.items()
     }
