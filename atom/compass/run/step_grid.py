@@ -31,19 +31,23 @@ layer names as the model's runner remaps them (`quantization`), the TP and
 DP widths, DP attention, expert parallelism, TBO, the MoE backend, the
 all-to-all backend, EPLB and DeepSeek-V4.1 decoder SWA bounded replay when
 off ATOM's default, the index cache's dtype where ATOM resolved it apart from
-the KV cache's, whether mori imports where it does not, the performance
-environment, each variable of `READ_OFF_DEFAULT` in it when ATOM reads it off
-its default too, and, under speculation, its
-method and draft width, and the digest of the draft's config.json where it is
-not the target's. Loading refuses, naming what differs:
+the KV cache's, whether mori imports where it does not, MiniMax-M3's
+indexer-only context parallelism when on, the model config's
+``--hf-overrides`` when it states any, the performance environment, each
+variable of `READ_OFF_DEFAULT` in it when ATOM reads it off its default too,
+and, under speculation, its method and draft width, and the digest of the
+draft's config.json where it is not the target's. Loading refuses, naming
+what differs:
 
 - a run at data-parallel width above one, since every bundle is measured at one;
 - a keyed condition, the grid's graph mode, a timing scope other than the
   whole ``ModelRunner.forward``, or a value other than ``measure steps``'
-  bench window (`step_grid_fit.VALUE`), none included;
-- the gates, or any reading, through `ArtifactStore.load`;
-- a rung of the ladder between the grid's lowest and highest measured rungs
-  that was not measured;
+  bench window (`step_grid_fit.VALUE`), none included; a ladder that is a
+  non-empty prefix of the bundle's is read as the bundle's (`at_ladder`);
+- the gates, or any reading, through `ArtifactStore.load`, the engine config
+  read at the bundle's ladder too;
+- a rung of this run's ladder between the grid's lowest and highest measured
+  rungs that was not measured;
 - a configured bound above the one the grid was planned for.
 
 Under expert parallelism the bench routed every MoE layer by a uniform draw
@@ -83,7 +87,12 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.step_grid import StepGrid, StepGridBackend
 from atom.compass.backends.step_grid_fit import VALUE
-from atom.compass.backends.step_grid_plan import BOUNDS, SCOPE, keyed_of  # noqa: F401
+from atom.compass.backends.step_grid_plan import (  # noqa: F401
+    BOUNDS,
+    SCOPE,
+    at_ladder,
+    keyed_of,
+)
 from atom.compass.backends.step_grid_residual import Residual
 from atom.compass.backends.step_linear import UNIFORM_ROUTING
 from atom.compass.runner.overrides import schedulable_ladder
@@ -105,12 +114,15 @@ DERIVED = {"index_cache_dtype": "kv_cache_dtype"}
 #: ATOM's prefill token buckets, an environment variable `keyed` the same way.
 BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
 #: ATOM's environment variables keyed only where ATOM reads them off their
-#: default: `BUCKETS`, and the three that decide, with the all-to-all backend
-#: and whether mori imports (`MORI`), whether a MoE fuses its shared expert
-#: into aiter's top-k table (`model_ops/topK.py`): two under DP attention, and
-#: one for an MXFP8 shared expert beside MXFP4 routed ones.
+#: default: `BUCKETS`, vocabulary-embedding replication (GLM-5.2's and an EAGLE3
+#: draft's whole embedding, with no all-reduce after it), and the three that
+#: decide, with the all-to-all backend and whether mori imports (`MORI`), whether
+#: a MoE fuses its shared expert into aiter's top-k table (`model_ops/topK.py`):
+#: two under DP attention, and one for an MXFP8 shared expert beside MXFP4
+#: routed ones.
 READ_OFF_DEFAULT = (
     BUCKETS,
+    "ATOM_REPLICATE_VOCAB_EMBED",
     "ATOM_FUSE_SHARED_EXPERT",
     "ATOM_DISABLE_MORI_EP",
     "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4",
@@ -131,10 +143,11 @@ DRAFT = "draft_model"
 def keyed(config, ladder: bool = True) -> dict:
     """The conditions a bundle is measured under, as the resolved config holds them,
     `OFF_DEFAULT` only where it is off its default, `MORI` only where mori does
-    not import, and the performance environment of this process less the
-    client's and the device selection (`keyed_env`), and under speculation its
-    method and draft width, and `DRAFT` (`_draft`); the ladder only with
-    `ladder`."""
+    not import, MiniMax-M3's indexer-only context parallelism only when on, the
+    model config's overrides only when it states some, and the performance
+    environment of this process less the client's and the device selection
+    (`keyed_env`), and under speculation its method and draft width, and
+    `DRAFT` (`_draft`); the ladder only with `ladder`."""
     from atom.config import Config
 
     spec = getattr(config, "speculative_config", None)
@@ -150,6 +163,11 @@ def keyed(config, ladder: bool = True) -> dict:
             default = getattr(config, DERIVED[name])
         if (value := getattr(config, name, None)) not in (None, default):
             drafts[name] = value
+    if getattr(getattr(config, "dcp_config", None), "indexer_dcp_only", False):
+        drafts["indexer_dcp_only"] = True
+    # ATOM applies them to the model config after it reads config.json.
+    if overrides := getattr(config, "hf_overrides", None):
+        drafts["hf_overrides"] = overrides
     return drafts | {
         "kv_cache_block_size": config.kv_cache_block_size,
         "kv_cache_dtype": config.kv_cache_dtype,
@@ -262,30 +280,26 @@ def differ(there: dict, here: dict, where: str) -> list[str]:
     return named
 
 
-def conditions(config, machine) -> Conditions:
+def conditions(config, machine, engine: dict | None = None) -> Conditions:
     """This run's readings: `readings` of this process's ATOM source, the
-    served config.json and `keyed`."""
+    served config.json and `keyed`, or `engine` in its place."""
     from atom.compass.run import _file_digest, atom_source
 
     return readings(
-        machine,
+        machine_platform(machine),
         atom_src=atom_source(),
         model=_file_digest(config.model, "config.json"),
-        engine_config=json.dumps(keyed(config), sort_keys=True),
+        engine_config=json.dumps(engine or keyed(config), sort_keys=True),
     )
 
 
-def readings(machine, **inputs) -> Conditions:
-    """The readings a run on `machine` takes: the platform the spec states, and
-    this host's CPU; `inputs` state the ATOM source, the model and the engine
-    config."""
+def readings(platform: Mapping, **inputs) -> Conditions:
+    """The readings a run on `platform` takes, the device, stack, PTL state
+    and torch a spec or a run's inputs state, with this host's CPU; `inputs`
+    state the ATOM source, the model and the engine config."""
     from atom.compass.run import host_cpu
 
-    return Conditions.of(
-        **machine_platform(machine),
-        host_cpu=host_cpu(),
-        **inputs,
-    )
+    return Conditions.of(**platform, host_cpu=host_cpu(), **inputs)
 
 
 def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
@@ -315,11 +329,12 @@ def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
         raise ValueError(
             f"{key} does not load: {type(error).__name__}: {error}"
         ) from error
+    at = at_ladder(ours, recorded)
     pairs = {
         "graph mode": (grid.graph_mode, "eager" if config.enforce_eager else "replay"),
         "timing scope": (grid.scope, SCOPE),
         "value": (member["grid"].get("value"), VALUE),
-        **{name: (recorded.get(name), value) for name, value in ours.items()},
+        **{name: (recorded.get(name), value) for name, value in at.items()},
     }
     differ = [
         f"{name} {theirs!r} in the bundle and {here!r} here"
@@ -330,7 +345,7 @@ def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
         raise ValueError(
             f"{key} was measured under other conditions: " + "; ".join(differ)
         )
-    store.load(key, conditions=conditions(config, machine), gates=GateState.of())
+    store.load(key, conditions=conditions(config, machine, at), gates=GateState.of())
     if grid.graph_mode == "replay":
         measured = sorted(rung for rung, cells in grid.decode.items() if cells.points)
         unmeasured = [

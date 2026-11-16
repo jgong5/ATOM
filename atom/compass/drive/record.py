@@ -40,7 +40,9 @@ stages refuses it before its server starts.
 
 The server's environment holds `AUTOTUNE_CACHE` as the command's does, 1 when
 the command's has none, and ``TRITON_CACHE_DIR`` as the command's does, or the
-directory Triton resolves when it has none; run.json's ``env`` states both.
+directory Triton resolves when it has none, and `parity.WRITE_THROUGH` at 0,
+or 1 under `--sweep`, whatever the command's says; run.json's ``env`` states
+all three.
 Naming the directory keeps Inductor from putting its own there mid-run. With
 the switch on, Triton loads an autotuned kernel's choice for a shape an earlier
 server of the same directory tuned; a shape the cache lacks still tunes on its
@@ -60,7 +62,10 @@ this stack into the container's caches, and its stop writes back each artifact
 it finished compiling (`jit_cache`); without it no library is touched.
 
 With `--sweep` the server also holds the pacing variables a JIT sweep's steps
-need (`sweep.pacing`), which `client.sh --sweep` checks it has.
+need (`sweep.pacing`), which `client.sh --sweep` checks it has, and
+`parity.WRITE_THROUGH` at 1: nothing grades a sweep's record, so each rank
+writes its lines as they finish, and a rank that dies mid-sweep leaves `sweep
+cover` the steps it ran. At 0, a timing record's lines wait for its exit.
 
 `--profile-ops` and `--profile-steps A:B`, the op-level half's profiled pass,
 refuse; so does ATOM's ``--load_dummy``: a record times real weights, and MoE
@@ -81,7 +86,7 @@ from atom.compass.drive import aiter_jit, runfile, serve
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.compass.drive.identity import PTL_CHANGES, ptl_changes
 from atom.compass.drive.sweep import pacing
-from atom.compass.parity import busy
+from atom.compass.parity import WRITE_THROUGH, busy
 from atom.compass.run import _write_whole
 
 PROG = "compass record"
@@ -105,17 +110,13 @@ def main(argv: list[str]) -> None:
                 f"{arg} is among ATOM's arguments; a record times real weights, "
                 "and MoE routing follows them"
             )
-    if args.trace and (
-        runfile._dp_width(atom_args) > 1
-        or runfile._engine_args(atom_args).pipeline_parallel_size > 1
-    ):
-        raise ValueError(
-            "--trace reduces each TP rank's busy time, and ATOM's arguments run "
-            "DP ranks or pipeline stages"
-        )
+    if args.trace:
+        refuse_trace(atom_args)
     env = {
         AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1"),
         "TRITON_CACHE_DIR": knobs.cache.dir,
+        # Set either way, so a timing record never inherits the command's 1.
+        WRITE_THROUGH: "1" if args.sweep else "0",
     }
     if args.sweep:
         env |= pacing(atom_args)
@@ -143,6 +144,19 @@ def main(argv: list[str]) -> None:
     write_engine_and_costs(args.out)
 
 
+def refuse_trace(atom_args) -> None:
+    """Refuse a trace run of ATOM's arguments `atom_args` that runs DP ranks or
+    pipeline stages: its busy time is reduced per TP rank."""
+    if (
+        runfile._dp_width(atom_args) > 1
+        or runfile._engine_args(atom_args).pipeline_parallel_size > 1
+    ):
+        raise ValueError(
+            "--trace reduces each TP rank's busy time, and ATOM's arguments run "
+            "DP ranks or pipeline stages"
+        )
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n\n")[0])
     add_gpu_flag(p)
@@ -153,7 +167,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--sweep",
         action="store_true",
-        help="start the server with the pacing variables client.sh --sweep needs",
+        help="start the server with the pacing variables client.sh --sweep needs, "
+        "its record written as its lines finish",
     )
     p.add_argument(
         "--out", required=True, help="an empty directory for the record and logs"

@@ -12,7 +12,7 @@ is refused by operator and slot.
 Each leaf carries its contract: its arguments by schema slot, a tensor as its
 shape, dtype, stride, role, the `is_shuffled` mark ATOM sets on a
 preshuffled weight, and its device when ATOM holds it on the host (a copy's
-host-staged source). A tensor's role is where its storage came from:
+host-staged source), pinned or not. A tensor's role is where its storage came from:
 the model's parameters, buffers and tensor attributes are weights, what
 `allocate_kv_cache` allocated is KV, what the model's forward and the sampler
 after it allocated is an activation, and anything else (the runner's buffers,
@@ -74,6 +74,7 @@ from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils import _pytree
 from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils.weak import WeakIdKeyDictionary
 
 import atom
 from atom.compass import ir
@@ -129,15 +130,25 @@ V41_OPENED = (
     "v41_end_forward",
     "v41_record_tbo_expert_output",
 )
-#: DeepSeek-V4.1's sparse attention, and its indexer's scorers, gfx1250's
-#: and gfx950's.
+#: DeepSeek-V4.1's sparse attention, over its FP8 pool the second, and its
+#: indexer's scorers, gfx1250's and gfx950's.
 V41_ATTENTION = "aiter.pa_sparse_prefill_opus.default"
+V41_FP8_ATTENTION = "aiter.mla_sparse_prefill_v41.default"
 V41_SCORERS = (
     (
         "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
         "flydsl_fp8_paged_mqa_logits_gfx1250"
     ),
     "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
+)
+#: DeepSeek-V4.1's top-k, as aiter's decode top-k launches it: FlyDSL's
+#: multi-CTA kernel where the arch's gates take the call's width and rows
+#: (gfx950's), else FlyDSL's one-block kernel, else, on logits narrower than
+#: k, its HIP kernel.
+V41_TOPKS = (
+    "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode",
+    "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
+    "aiter._top_k_per_row_decode.default",
 )
 #: DeepSeek-V4.1's RoPE, which its index keys take at their ratio's compress
 #: plan's positions: with no drafter both ratios' plans hold as many rows.
@@ -549,6 +560,7 @@ class _Recorder(TorchDispatchMode):
         self.counted = None  # what a size the step's data sets counts, if stated
         self.lands = False  # whether a device value read on the host reads zeros
         self.declined = []  # the mono refusals this shape's steps met (`_mono`)
+        self.pins, self.twins = {}, WeakIdKeyDictionary()  # ATOM pinned (`pin`)
         self.symbol = None  # G in a symbolic trace, else None
         self.start()
 
@@ -595,6 +607,19 @@ class _Recorder(TorchDispatchMode):
         finally:
             self.on = on
 
+    def pin(self, tensor):
+        """`tensor`, a host tensor ATOM asked to pin, held pinned with its views;
+        a real one's fake twin too, which the fake mode computes on, kept as
+        long as it is."""
+        if not isinstance(tensor, FakeTensor) and self.fake_mode is not None:
+            self.twins[tensor] = self.pin(self._fake(tensor))
+        self.pins[_storage(tensor)] = _storage(tensor)
+        return tensor
+
+    def pinned(self, tensor) -> bool:
+        held = self.pins.get(_storage(tensor))
+        return held is not None and not held.expired()
+
     def _fake(self, tensor):
         if not isinstance(tensor, FakeTensor):  # at its sizes, none symbolic
             return self.fake_mode.from_tensor(tensor, static_shapes=True)
@@ -617,6 +642,8 @@ class _Recorder(TorchDispatchMode):
             for dim in (d for t in outs for d in _concrete(t.shape)):
                 if isinstance(dim, torch.SymInt):
                     torch._check(dim == self.counted)
+        if kwargs.get("pin_memory"):
+            outs = [self.pin(t) for t in outs]
         if self.creating is not None:
             read = set(map(_storage, ins))
             for storage in map(_storage, outs):
@@ -812,7 +839,8 @@ class _Recorder(TorchDispatchMode):
             )
             shuffled = bool(getattr(value, "is_shuffled", False))
             host = value.device.type == "cpu"
-            return ir.Tensor(shape, str(value.dtype), stride, role, shuffled, host)
+            marks = shuffled, host, host and not self.pinned(value)
+            return ir.Tensor(shape, str(value.dtype), stride, role, *marks)
         if isinstance(value, torch.nn.Module) and id(value) in self.modules:
             return ir.ModuleRef(self._layered(self.modules[id(value)]))
         if isinstance(value, str) and value in self.contexts:
@@ -867,6 +895,20 @@ class _Recorder(TorchDispatchMode):
         return re.sub(rf"\blayers\.{self.layer}\b", f"layers.{{{LAYER}}}", path)
 
 
+class _Pinned(TorchDispatchMode):
+    """What ATOM allocates with `pin_memory=True` where the recorder is off, as
+    the runner is built and sizes its pools, held pinned (`_Recorder.pin`);
+    nothing else is touched, a host array headed for the device among it."""
+
+    def __init__(self, recorder):
+        super().__init__()
+        self.pin = recorder.pin
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        return self.pin(out) if (kwargs or {}).get("pin_memory") else out
+
+
 def _coordinator(group_name: str) -> str:
     """The aiter coordinator (`tp:0`) whose device group torch names
     `group_name`, or the name as it is when none is: torch numbers groups in
@@ -899,6 +941,9 @@ def _patches(recorder):
       caches the constructors a default device places at their first call,
       made here before that patch: cached under it, they would leave every
       later `torch.zeros` of ATOM's on the host, not on the runner's device.
+    * A host tensor ATOM asks to pin (that host side, `pin_memory=True`, a
+      `pin_memory()` copy) is held pinned (`_Recorder.pin`), as `is_pinned`
+      answers.
     * GDN's causal-conv1d metadata is host arithmetic over the staged
       `cu_seqlens`, and it runs outside the fake mode too.
     * A GDN prefill under ReplaySSM parks the cursors of its live state
@@ -1009,7 +1054,8 @@ def _patches(recorder):
         if torch.device(kwargs.get("device") or "cpu").type != "cpu":
             return zeros(*size, **kwargs)
         with unset_fake_temporarily():
-            return zeros(*size, **kwargs)
+            out = zeros(*size, **kwargs)
+        return recorder.pin(out) if pin_memory else out
 
     def host_numpy(tensor, *args, **kwargs):
         with unset_fake_temporarily():
@@ -1075,6 +1121,8 @@ def _patches(recorder):
         (ubatching, "sync_dp_metadata", host_sync),
         (gdn_attn.GDNStateMixin, "_attach_replayssm", replayssm),
         (torch.Tensor, "tolist", host_tolist),
+        (torch.Tensor, "pin_memory", lambda t, *a, **k: recorder.pin(t.clone())),
+        (torch.Tensor, "is_pinned", lambda t, *a, **k: recorder.pinned(t)),
         (FakeTensor, "tolist", host_tolist),
         (torch.Tensor, "numpy", lambda t, *a, **k: host_numpy(landed(t), *a, **k)),
         (loader, "safetensors_weights_iterator", lambda *a, **k: iter(())),
@@ -1287,14 +1335,16 @@ def _v41(recorder, hf):
     each request's state is where the scheduler put it has no values to
     judge.
 
-    Its sparse attention (`V41_ATTENTION`) states the layer's `window_size`,
+    Its sparse attention (`V41_ATTENTION`, `V41_FP8_ATTENTION`) states the
+    layer's `window_size`,
     `compress_ratio` and `index_topk` (None where it compresses nothing), and
     its indexer's scorers (`V41_SCORERS`) the `compress_ratio` and
     `index_candidates`, the most entries it scores where an earlier layer
     chose its candidates, else None: read off the layer `layer_name` names
     and the model's config `hf`. Its index keys' RoPE (`V41_ROPE`) states
     their indexer's `compress_ratio`; its query's, on the step's positions
-    at every ratio, states none.
+    at every ratio, states none. Its top-k (`V41_TOPKS`) states the scorers'
+    `compress_ratio`.
     """
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.models.deepseek_v41.attention import Indexer
@@ -1312,7 +1362,9 @@ def _v41(recorder, hf):
         scored = ("compress_ratio", ratio), ("index_candidates", candidates)
         stated = {
             V41_ATTENTION: (*geometry, ("index_topk", top)),
+            V41_FP8_ATTENTION: (*geometry, ("index_topk", top)),
             **dict.fromkeys(V41_SCORERS, scored),
+            **dict.fromkeys(V41_TOPKS, scored[:1]),
         }
         with patch.object(recorder, "stated", stated):
             return attend(hidden, layer_name, *args, **kwargs)
@@ -1662,7 +1714,9 @@ class Tracer:
                 stack.enter_context(patch.object(owner, name, value))
             if config.enable_expert_parallel:
                 peers.install_mori(recorder)
-        runner = _build_runner(config, fake_mode)
+        pinned = _Pinned(recorder)
+        with pinned:
+            runner = _build_runner(config, fake_mode)
         if v4 := sys.modules.get("atom.models.deepseek_v4"):
             stack.enter_context(_v4_attention(v4, recorder))
         if v41 := "atom.models.deepseek_v41.runtime" in sys.modules:
@@ -1693,7 +1747,7 @@ class Tracer:
         recorder.roles = dict.fromkeys(weights, ir.Role.WEIGHT)
         per_req = InputOutputProcessor._per_req_cache_model_types()
         self.stateful = config.hf_config.model_type in per_req
-        with fake_mode, torch.inference_mode():
+        with fake_mode, pinned, torch.inference_mode():
             runner.get_num_blocks()  # sizes the pools, as `EngineCore` does
         # A warmup copy whose bytes nobody reads, like `_maybe_warmup`.
         runner.attn_metadata_builder.warmup_per_req_cache = lambda: None

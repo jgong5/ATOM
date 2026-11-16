@@ -679,11 +679,12 @@ def _picker(k):
     return picker
 
 
-def _v41_index(monkeypatch, visible, leaves, shape, context):
+def _v41_index(monkeypatch, visible, leaves, shape, context, fp4=False):
     """Each of `leaves`' first call at `shape` and `context` on V4.1's FP8
-    plane, a PAGE of 32 tokens 4 index blocks at ratio 1, under a pick of 4
-    candidate blocks, its step's rows seeing `visible` on blocks 3, 1 and 0, 2;
-    ATOM's cache binds its tables by its kernels' torch twins."""
+    plane, or its FP4 one, a PAGE of 32 tokens 4 index blocks at ratio 1,
+    under a pick of 4 candidate blocks, its step's rows seeing `visible` on
+    blocks 3, 1 and 0, 2; ATOM's cache binds its tables by its kernels' torch
+    twins. On FP4 the step packs its rows 64 columns apart."""
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
         V41PoolGeometry,
     )
@@ -702,6 +703,10 @@ def _v41_index(monkeypatch, visible, leaves, shape, context):
     runner = _Runner()
     runner.model.append(_picker(4))
     geometry = V41PoolGeometry(1, ((0, 1),), 32, 4, 512, 32, layer_ratios=(1,))
+    if fp4:  # whole 128-dim K tiles on 8-row pages
+        geometry = dataclasses.replace(
+            geometry, index_dim=128, index_block_rows=8, index_fp4=True
+        )
     runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
     runner.forward_vars["logits"] = torch.zeros(128)
     runner.forward_vars["block_tables"] = torch.zeros(64, dtype=i32)
@@ -719,6 +724,16 @@ def _v41_index(monkeypatch, visible, leaves, shape, context):
         tiles={},
         candidates={},
     )
+    if fp4:  # the scorer workspace's row starts and maxima, 8 blocks a row
+        cache.workspace = SimpleNamespace(
+            row_starts=lambda rows: torch.arange(rows + 1, dtype=i32),
+            packed_maxima=lambda: torch.full((16,), 7.0),
+        )
+        step.planned_host = {"v41_score_bands_1": ((0, len(visible)),)}
+        step.planned = {
+            f"v41_score_{name}_1": torch.arange(len(visible), dtype=i32) * apart
+            for name, apart in (("offsets", 64), ("block_offsets", 8))
+        }
     prepare = runner.prepare_model
 
     def prepare_model(batch):  # and the step V4.1's builder prepares
@@ -778,6 +793,135 @@ def test_v41_index_leaves_take_the_tables_atom_s_forward_writes_for_their_step(
     assert listed["context_lens"].tolist() == [26, 20]
     assert its["row_starts"].tolist() == its["row_ends"].tolist() == [26, 20]
     assert pick["row_starts"].tolist() == pick["row_ends"].tolist() == [7, 3]
+
+
+def test_v41_fp4_candidate_leaves_take_the_tables_atom_s_forward_writes(monkeypatch):
+    I32, fp4 = "torch.int32", "aiter.ops.flydsl.kernels.mqa_logits."
+    fp4 += "pa_mqa_logits_fp4_rowgroup:flydsl_pa_mqa_logits_fp4_rowgroup"
+    ends, staged = _t([2], "activation", dtype=I32), _t([2], "metadata", dtype=I32)
+    table = _t([2, 4], "activation", dtype=I32)
+    starts = ("query_start_loc", _t([3], "metadata", dtype=I32))
+    listed = _leaf(fp4, ("block_tables", table), starts, ("row_ends", ends))
+    # whole contexts: each request's PAGE table and its rows' bounds
+    paged = _leaf(
+        fp4,
+        ("block_tables", _t([2, 2], "metadata", dtype=I32)),
+        ("row_ends", staged),
+    )
+
+    def top_k(logits, starts, packed):
+        return _leaf(
+            ops._TOPK,
+            ("logits", logits),
+            *[("row_starts", starts), ("row_ends", ends), ("packed_rows", packed)],
+        )
+
+    flat = _t([2, 16], "metadata", [0, 1])  # each row the whole packed buffer
+    maxima = _leaf(
+        ops._MAXIMA,
+        *[("logits", _t([128], "metadata")), ("visible", staged)],
+        *[("maxima", _t([16], "metadata")), ("packed", (staged, staged))],
+    )
+    picked = "atom.model_ops.deepseek_v41.candidate_table:candidate_block_table"
+    picked = _leaf(picked, ("candidates", _t([2, 4], "activation", dtype=I32)))
+    # a candidate list's scorer and its top-k; the pick's block maxima and its
+    # top-k, on packed rows; the kept blocks' table build; a whole-context scorer
+    leaves = listed, top_k(_t([2, 32], "metadata"), ends, False), maxima
+    leaves += top_k(flat, staged, True), picked, paged
+    # rows seeing 50 and 20 compressed rows: 7 and 3 blocks of 8
+    listed, its, maxima, pick, kept, paged = _v41_index(
+        monkeypatch, [50, 20], leaves, decode(2), 64, fp4=True
+    )
+
+    assert kept["candidates"].tolist() == [[0, 2, 4, 6], [0, 1, 2, -1]]
+    assert listed["block_tables"].tolist() == [[12, 14, 4, 6], [0, 1, 2, 0]]
+    assert listed["row_ends"].tolist() == [26, 20]
+    assert listed["query_start_loc"].tolist() == [0, 1, 2]
+    assert its["row_starts"].tolist() == its["row_ends"].tolist() == [26, 20]
+    # the pick's rows 64 columns and 8 blocks apart, its maxima the workspace's
+    assert [t.tolist() for t in maxima["packed"]] == [[0, 64], [0, 8]]
+    assert pick["row_starts"].tolist() == [0, 8]
+    assert pick["row_ends"].tolist() == [7, 3]
+    assert pick["logits"].unique().tolist() == [7.0]
+    # a whole context's table is its request's PAGE table
+    assert paged["block_tables"].tolist() == [[3, 1], [0, 2]]
+
+
+def test_v41_fp4_whole_context_leaves_take_their_ratio_s_bounds_and_packed_starts(
+    monkeypatch,
+):
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
+        V41PoolGeometry,
+    )
+
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *a: {})
+    I32, i32 = "torch.int32", torch.int32
+    # PAGEs of 32 tokens, a block table 2 of them: at ratio 1 4 index blocks a
+    # PAGE and planes 64 rows wide, at ratio 2 2 blocks and 32 rows
+    geometry = V41PoolGeometry(
+        2, ((0, 1), (1, 2)), 32, 4, 512, 128, layer_ratios=(1, 2),
+        index_block_rows=8, index_fp4=True,
+    )  # fmt: skip
+    runner = _Runner()
+    runner.attn_metadata_builder = SimpleNamespace(
+        geometry=geometry, block_table_cols=2
+    )
+    # two rows, laid out in the packed logits a plane's width apart
+    step = SimpleNamespace(
+        batch_ids=torch.arange(2, dtype=i32),
+        visible={r: torch.tensor([50, 20], dtype=i32) // r for r in (1, 2)},
+        planned={
+            f"v41_score_offsets_{r}": torch.tensor([0, 64 // r], dtype=i32)
+            for r in (1, 2)
+        },
+    )
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        fctx._forward_context.attn_metadata.step = step
+        fctx._forward_context.attn_metadata.cache = SimpleNamespace()
+        return out
+
+    runner.prepare_model = prepare_model
+    rows = _t([2], "metadata", dtype=I32)
+    plan = "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup:"
+
+    def scorer(blocks):  # its plan's index blocks a PAGE: the ratio's
+        return _leaf(
+            ops._FP4,
+            ("plan", Reduced(f"{plan}Fp4MqaPlan", (("pages_per_block", blocks),))),
+            *[("row_ends", rows), ("out", _t([128], "metadata"))],
+            ("out_offsets", rows),
+        )
+
+    def top_k(width, packed=True):  # its rows standing for a plane that wide
+        return _leaf(
+            ops._TOPK,
+            ("logits", _t([2, 128] if packed else [2, width], "metadata")),
+            *[("row_starts", rows), ("row_ends", rows)],
+            ("stride0", 0 if packed else width),
+            *[("plane_width", width if packed else None), ("packed_rows", packed)],
+        )
+
+    # each ratio's scorer and top-k, packed, and ratio 2's on rows of their own
+    leaves = scorer(2), top_k(32), scorer(4), top_k(64), top_k(32, packed=False)
+    found = ops.leaves(_graph(*leaves, layers=1)["region"])
+    placed = SimpleNamespace(block_size=32, batch=lambda *a: a[1:])
+    got = ops.Stub(runner, 10_000).point(placed, decode(2), 64, found)
+
+    slots = "row_starts", "row_ends", "out_offsets"
+    named = [{s: r["metadata"][s] for s in slots if s in r["metadata"]} for r in got]
+    # each row's logits' start in the packed buffer, as ATOM's step lays it out
+    starts = "step.planned.v41_score_offsets_{}".format
+    assert named == [
+        {"row_ends": "step.visible.2", "out_offsets": starts(2)},
+        {"row_starts": starts(2), "row_ends": "step.visible.2"},
+        {"row_ends": "step.visible.1", "out_offsets": starts(1)},
+        {"row_starts": starts(1), "row_ends": "step.visible.1"},
+        {"row_starts": "step.visible.2", "row_ends": "step.visible.2"},
+    ]
 
 
 def test_the_v41_candidate_lift_leaves_its_selection_as_built_past_twice_the_kept(
@@ -976,7 +1120,7 @@ def test_each_copy_of_a_v41_index_scorer_writes_a_logits_plane_of_its_own():
 
 @pytest.mark.parametrize(
     "bounds, copies, buffers",
-    [([100, 120, 110, 120], 11, 2), ([600] * 4, 3, 3), ([1000, 20, 20, 20], 3, 3)],
+    [([100, 120, 110, 120], 11, 2), ([600] * 4, 3, 3), ([1000, 20, 20, 20], 5, 5)],
     ids=["rows_alike", "rows_past_half", "one_long_row"],
 )
 def test_a_v41_plane_counts_and_copies_the_columns_below_its_rows_bounds(
@@ -985,7 +1129,7 @@ def test_a_v41_plane_counts_and_copies_the_columns_below_its_rows_bounds(
     # a top-k's FP8 plane, [4, 1024] float32, beside its 32-byte bounds, at
     # twice a cache of 20000 bytes: 8 copies of rows alike share a buffer,
     # 128 columns apart; rows past half its width take a buffer a copy, at
-    # most twice that, and read past it, but for ragged rows (#3274)
+    # most four times that, and read past it
     runner = _Runner()
     geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
     runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
@@ -1002,7 +1146,7 @@ def test_a_v41_plane_counts_and_copies_the_columns_below_its_rows_bounds(
     planes = [stub._copy(op, sig, instances, c)[0]["logits"] for c in range(n)]
 
     assert (n, size) == (copies, 4 * sum(bounds) + 32)
-    assert n * size > 20_000 or max(bounds) > 2 * min(bounds)
+    assert n * size > 20_000
     assert len({p.untyped_storage().data_ptr() for p in planes}) == buffers
     reach = list(enumerate(bounds))
     assert all(p[r, :b].ne(0).all() for p in planes for r, b in reach)
@@ -1010,6 +1154,49 @@ def test_a_v41_plane_counts_and_copies_the_columns_below_its_rows_bounds(
         for r, b in reach:
             p[r, :b] = c
     assert all(p[r, :b].eq(c).all() for c, p in enumerate(planes) for r, b in reach)
+
+
+@pytest.mark.parametrize(
+    "llc, copies, buffers, starts",
+    [(10_000, 14, 4, [0, 512, 1152, 1664]), (5_000, 6, 3, [0, 384])],
+    ids=["stairs", "stairs_past_twice_cold"],
+)
+def test_a_v41_plane_s_copies_read_its_widest_row_beside_others_narrow_rows(
+    llc, copies, buffers, starts
+):
+    # a top-k's FP8 plane, [4, 1024] float32, its first row reading 300
+    # columns and the rest 20: a copy a row and 128 columns past another reads
+    # its first row beside the other's second, two such stairs to a buffer 512
+    # columns apart, and 14 copies read past twice the cache, where copies 384
+    # columns apart, two to a buffer, read under it; at half the cache a
+    # stair's buffer, 23040 bytes, would pass twice `COLD` times it
+    bounds = [300, 20, 20, 20]
+    runner = _Runner()
+    geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(4, 1024)
+    runner.forward_vars["ends"] = torch.tensor(bounds)
+    plane, ends = _t([4, 1024], "metadata"), _t([4], "metadata", dtype="torch.int64")
+    top_k = _leaf(ops._TOPK, ("logits", plane), ("row_ends", ends))
+    stub = ops.Stub(runner, llc)
+    stub.leaves = ops.leaves(_graph(top_k, layers=1)["region"])
+    stub._prepare((0, 0))
+    [(sig, (op, instances))] = stub.leaves.items()
+
+    n, size, _, _ = stub._plan(op, instances, {}, 4, 4, sig=sig, decode=True)
+    planes = [stub._copy(op, sig, instances, c)[0]["logits"] for c in range(n)]
+
+    assert (n, size) == (copies, 4 * sum(bounds) + 32)
+    assert (n * size > 2 * llc) == (llc == 10_000)
+    assert len({p.untyped_storage().data_ptr() for p in planes}) == buffers
+    reach = list(enumerate(bounds))
+    for c, p in enumerate(planes):  # no copy reaches another's columns
+        for r, b in reach:
+            p[r, :b] = c
+    assert all(p[r, :b].eq(c).all() for c, p in enumerate(planes) for r, b in reach)
+    first = planes[0].untyped_storage().data_ptr()
+    at = [p.storage_offset() for p in planes if p.untyped_storage().data_ptr() == first]
+    assert at == starts
 
 
 def test_an_embedding_reads_the_token_ids_atom_prepared():
@@ -3950,7 +4137,7 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
     tmp_path, monkeypatch
 ):
     spec = MachineSpec.from_mapping(
-        json.loads((TREE / "scripts/compass/machines/mi308x-hjbog39.json").read_text())
+        json.loads((TREE / "tests/compass/machines/mi308x-hjbog39.json").read_text())
     )
     stack = {c: spec.value(f"device.software_pinned_to.{c}") for c in PINNED}
     name, arch = spec.value("device.name"), spec.value("device.arch")

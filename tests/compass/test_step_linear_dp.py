@@ -262,14 +262,14 @@ def test_a_routed_rung_hulls_each_step_at_the_rank_it_prices(tmp_path):
     assert outside == []
 
 
-@pytest.mark.parametrize("cap, stop", [(20, "settled"), (9, "settled"), (8, "limit")])
+@pytest.mark.parametrize("cap, stop", [(20, "settled"), (11, "settled"), (10, "limit")])
 def test_a_routed_rung_is_fitted_again_under_its_column(
     tmp_path, monkeypatch, cap, stop
 ):
     """The experts column moves some steps' costliest rank off the row the
     rung's features alone pick, so the rung is fitted again under it, from
     every rank's row. Once no step moves, it is solved on the rows it
-    prices: the per-rank law, at the 9th pass. A limit one pass short ends
+    prices: the per-rank law, at the 11th pass. A limit one pass short ends
     the fit there, its vector within a millionth of that law."""
     from atom.compass.backends import step_linear_fit
 
@@ -280,7 +280,7 @@ def test_a_routed_rung_is_fitted_again_under_its_column(
     records += routed._records(tmp_path / "sparse", sparse)
     vector = routed._routed(records)[0]["decode"][str(routed.RUNG)]
     passes = vector["fit"]["passes"]
-    assert (passes["count"], passes["stop"]) == (min(cap, 9), stop)
+    assert (passes["count"], passes["stop"]) == (min(cap, 11), stop)
     assert vector["coefficients"] == pytest.approx(WIDE_OR_TALL, rel=1e-6)
 
 
@@ -436,8 +436,9 @@ def test_a_stated_engine_file_contradicting_the_records_own_refuses(tmp_path):
 
 
 COMPASS = Path(__file__).resolve().parents[2] / "scripts" / "compass"
-GPU45 = json.loads((COMPASS / "machines" / "mi355x-gpu45.json").read_text())
-CRS005 = json.loads((COMPASS / "machines" / "mi355x-crs005.json").read_text())
+MACHINES = Path(__file__).resolve().parent / "machines"
+GPU45 = json.loads((MACHINES / "mi355x-gpu45.json").read_text())
+CRS005 = json.loads((MACHINES / "mi355x-crs005.json").read_text())
 #: Each DeepSeek-V4-Pro EP8 law pair's file stem, the spec it was fitted under and
 #: the index cache dtype it is keyed to: the fp4 gpu-40's lone servers ran, the fp8
 #: a P/D side resolves.
