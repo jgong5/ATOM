@@ -1242,7 +1242,11 @@ pin processes that run at once to cores with `taskset`.
   apart ([Ruling](https://github.com/jgong5/ATOM/pull/3124#issuecomment-6768936508)).
 - **Grading.** Link `OUT` as `op_graph` beside the real runs and run `python -m
   atom.compass.validate` on that directory: it reads each side's graphs under the
-  environment that side's engine file states.
+  environment that side's engine file states. It labels a prefill step only from a
+  trace run's busy time, so on real runs recorded without a profiler, as the cell's are,
+  it leaves every prefill step of the prefill side out as `untraced`, counted per run in
+  that side's `left out` row, and that side's prefill has no cost row until a gated
+  record grades it ([#3028](https://github.com/jgong5/ATOM/issues/3028)).
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
