@@ -1322,6 +1322,50 @@ def test_a_v41_fp4_packed_multi_cta_top_k_takes_its_starts_and_ranks_from_them(
     assert records[1]["metadata"]["logits"] == "workspace._maxima"
 
 
+def test_gfx950_s_v41_fp8_scorer_takes_its_bounds_tables_and_plane_as_gfx1250_s(
+    monkeypatch,
+):
+    # gfx950's FP8 scorer, which ATOM calls as it calls gfx1250's: the
+    # page-wide one and a candidate list's, at ratio 1
+    I32 = "torch.int32"
+    triton = "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits"
+
+    def scorer(bounds, width):
+        leaf = _leaf(
+            triton,
+            ("out_logits", _t([2, width], "metadata")),
+            ("context_lens", _t([2], bounds, dtype=I32)),
+            ("kv_indices", _t([2, width // 8], bounds, dtype=I32)),
+            ("max_model_len", width),
+        )
+        return dataclasses.replace(leaf, stated=(("compress_ratio", 1),))
+
+    records = []
+    monkeypatch.setattr(ops, "_journal", lambda path, got: records.extend(got) or got)
+    leaves = scorer("metadata", 64), scorer("activation", 32)
+    page, listed = _v41_index(monkeypatch, [50, 20], leaves, decode(2), 64)
+
+    # at decode B=2, rows seeing 50 and 20 compressed rows on their 8 tiles;
+    # the list keeps 26 and 20 of them on 4
+    named = records[0]["metadata"]
+    assert named["context_lens"] == "step.visible.1"
+    assert named["kv_indices"] == "workspace._tiles.1"
+    assert page["context_lens"].tolist() == [50, 20]
+    assert page["kv_indices"].tolist() == [
+        [12, 13, 14, 15, 4, 5, 6, 7],
+        [0, 1, 2, 3, 8, 9, 10, 11],
+    ]
+    assert listed["context_lens"].tolist() == [26, 20]
+    assert listed["kv_indices"].tolist() == [[12, 14, 4, 6], [0, 1, 2, 0]]
+    # a prefill of 32 past 32 cached tokens scores on a plane as wide as its 2
+    # KV blocks, not the 1 it traced; a candidate list's stays as it was sized
+    leaves = scorer("metadata", 32), leaves[1]
+    page, listed = _v41_index(monkeypatch, [50, 20], leaves, prefill(32, 1), 32)
+    assert [page["max_model_len"], listed["max_model_len"]] == [64, 32]
+    assert [c["out_logits"].shape[1] for c in (page, listed)] == [64, 32]
+    assert page["kv_indices"].shape == (2, 8)
+
+
 def test_each_copy_of_a_v41_index_leaf_ranks_a_logits_plane_of_its_own():
     # V4.1's FP8 plane, which ATOM's preparation leaves as it was, at three
     # placements of decode B=2: they share one clone of it

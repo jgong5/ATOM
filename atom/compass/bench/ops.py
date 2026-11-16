@@ -306,7 +306,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 40
+PROTOCOL = 42
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -481,6 +481,11 @@ _LOGITS = (
     "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
     "flydsl_fp8_paged_mqa_logits_gfx1250"
 )
+# V4.1's FP8 scorers, gfx1250's and gfx950's, which ATOM calls alike
+_SCORERS = (
+    _LOGITS,
+    "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
+)
 _FP4 = (
     "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup:"
     "flydsl_pa_mqa_logits_fp4_rowgroup"
@@ -506,11 +511,11 @@ V41_NAMES = {
     ("aiter.mla_sparse_prefill_v41.default", "kv_indptr_extend"): f"{_CACHE}.1",
     (_SCAN, "pptrs"): f"{_CACHE}.0",
     (_SCAN, "eptrs"): f"{_CACHE}.1",
-    (_LOGITS, "out_logits"): "workspace._logits",
+    **{(f, "out_logits"): "workspace._logits" for f in _SCORERS},
     (_FP4, "out"): "workspace._logits",
-    (_LOGITS, "context_lens"): "step.visible.{ratio}",
+    **{(f, "context_lens"): "step.visible.{ratio}" for f in _SCORERS},
     (_FP4, "row_ends"): "step.visible.{ratio}",
-    (_LOGITS, "kv_indices"): "workspace._tiles.{ratio}",
+    **{(f, "kv_indices"): "workspace._tiles.{ratio}" for f in _SCORERS},
     # where each row's logits start in the packed buffer (`score_layout`)
     (_FP4, "out_offsets"): _OFFSETS,
     (_TOPK, "row_starts", "packed"): _OFFSETS,
@@ -588,7 +593,9 @@ QUERIED = {(op, "batch_ids"): "plan.query_ids" for op in (_SCAN, _INDICES)}
 _MAXIMA = "atom.model_ops.deepseek_v41.indexer:_block_maxima"
 _V41 = "atom.model_ops.deepseek_v41"
 PAGE_WIDE = {
-    _LOGITS: ("context_lens", "out_logits", "kv_indices", "max_model_len"),
+    **dict.fromkeys(
+        _SCORERS, ("context_lens", "out_logits", "kv_indices", "max_model_len")
+    ),
     _TOPK: ("row_ends", "logits", "stride0"),
     _MULTI: ("seq_lens", "logits", "stride0"),
     _PICK: ("seqLens", "logits", "stride0"),
@@ -625,8 +632,8 @@ FLYDSL_OFF_VALUES = ("1", "true", "True", "yes", "YES")
 #: sequence of its own (`starts`), and the packed maxima (`maxima`) and where
 #: the pick's packed rows start (`block_offsets`, `offsets`).
 _WRITTEN = {
-    (_LOGITS, "kv_indices"): "tiles",
-    (_LOGITS, "context_lens"): "context",
+    **{(f, "kv_indices"): "tiles" for f in _SCORERS},
+    **{(f, "context_lens"): "context" for f in _SCORERS},
     (_FP4, "block_tables"): "table",
     (_FP4, "row_ends"): "context",
     (_FP4, "query_start_loc"): "starts",
