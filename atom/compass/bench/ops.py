@@ -93,7 +93,8 @@ timed, for its pass as its forward's first reader fills it
 (`PagedAttentionCache.indptrs`), the leaf refused by name where its cache
 fills none; an object is rebuilt from its class
 and state as the capture's replay rebuilds one, its tensors built as any other
-argument's, its activations fresh on every copy, a lifted call's sequence a tuple.
+argument's, its activations fresh on every copy, a lifted call's sequence a tuple,
+but a DeepSeek-V4.1 window ring (`RING`) as its layer's of the point's pool (`_ring`).
 A leaf whose operator cannot run, or that copies to the host or with host
 memory ATOM keeps pageable (`_pageable`), refuses by name.
 On one GPU at a DP-attention layout, the runner is one DP rank's own, TP 1 and DP 1, the
@@ -654,6 +655,9 @@ LISTS |= {("aiter.mla_sparse_prefill_v41.default", s): i for (_, s), i in LISTS.
 #: on the device each step (`PagedAttentionCache.read_windows`, `Stub._windows`).
 _WINDOWS = "atom.model_ops.attentions.deepseek_v41.packed_rows:gather_prefix_rows"
 WINDOWS = {(_WINDOWS, "addresses"), (_WINDOWS, "ptr")}
+#: A window ring's five scalars, which DeepSeek-V4.1's window writes and index
+#: builds take as its pool places a layer's ring, the capture's pool its own.
+RING = "atom.model_ops.attentions.pool_layout.v4_pool_geometry:WindowParams"
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
 #: the span, and past an exact buffer kills the process (aiter defect, #1977).
@@ -2036,9 +2040,12 @@ class Stub:
                 count = max(op["occurrences"], self.cold_copies.get(sig, 1))
                 return self._weight(value, c, 1 if path == table else count)
             if isinstance(value, dict) and "object" in value:
-                return rebuild_object(
-                    value["object"], build(path, value["state"], None)
-                )
+                got = rebuild_object(value["object"], build(path, value["state"], None))
+                cache = getattr(snap.attn_metadata, "cache", None)
+                geometry = getattr(cache, "geometry", None)
+                if value["object"] == RING and hasattr(geometry, "window_bytes"):
+                    return _ring(geometry, cache.num_pages, got)
+                return got
             if (
                 isinstance(value, dict)
                 and value.get("role") == "activation"
@@ -2770,6 +2777,37 @@ def _widest(shape, stride) -> int:
     """The dimension of the widest stride, on a tie the first of size above one."""
     dims = [(s, n > 1, -i) for i, (n, s) in enumerate(zip(shape, stride))]
     return -max(dims, default=(0, 0, 0))[2]
+
+
+@functools.cache
+def _ring(geometry, pages, captured):
+    """DeepSeek-V4.1's window ring `captured` (`RING`), as the capture's pool
+    placed it, at its layer of a pool of `pages` pages, as ATOM's forward
+    builds it (`V41PoolGeometry.window`, or `window_bytes` in bytes): its layer
+    is the one whose ring a pool of some count of pages starts where the
+    capture's does, refused where no layer's does, or several layers' do and
+    start apart on `pages`."""
+    found = set()
+    for build in (geometry.window, geometry.window_bytes)[: 1 + geometry.window_fp8]:
+        first = build(0, 0)
+        if dataclasses.replace(first, ring_start=captured.ring_start) != captured:
+            continue  # counted in the other unit
+        # a layer's ring starts this far past the last's, on any pool
+        step = build(min(1, geometry.layers - 1), 0).ring_start - first.ring_start
+        for layer in range(geometry.layers):
+            start = captured.ring_start - layer * step
+            # the fewest pages whose layer 0's ring starts there or past it
+            p = bisect.bisect_left(
+                range(max(start, 0) + 1), start, key=lambda n: build(0, n).ring_start
+            )
+            if build(layer, p) == captured:
+                found.add(build(layer, pages))
+    if len(found) != 1:
+        raise ValueError(
+            f"{len(found) or 'no'} layers' window rings start where the "
+            f"capture's {captured} does on some pool"
+        )
+    return found.pop()
 
 
 def _held(runner, registry) -> dict[str, torch.Tensor]:
