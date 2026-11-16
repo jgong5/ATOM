@@ -308,6 +308,26 @@ def test_a_v41_replay_tail_wider_than_its_forward_reads_no_ring_row(probed):
     assert record["footprint_bytes"] == 7 * 16 * 48 + 7 * placed["read"]
 
 
+@pytest.mark.parametrize("ratio", [2, 0])
+def test_a_v41_fp8_pool_s_values_and_scales_bind_the_columns_atom_passes(
+    probed, ratio
+):
+    """V4.1's FP8 pool, rows of 512 E4M3 values then 16 E8M0 scales, taken as
+    the ring case above takes the BF16 one, each view as its values and its
+    scales: all four bind the bench's pool at the bytes ATOM passes there, the
+    scales past the values, the ring's at its rows, and count a row's 528
+    bytes where the BF16 pool's count its row's."""
+    _, seen = probed
+    placed = seen[f"ops_v41_fp8_{ratio}"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    pool = ["attn_metadata_builder.cache.pool", 0]
+    views = ("pool", "pool_scale", "ring", "ring_scale")
+    assert placed["bound"] == dict.fromkeys(views, pool)
+    ring, pages = placed["ring"], placed["read"] - placed["ring"]
+    assert record["footprint_bytes"] == 7 * 32 + 7 * pages + 4 * ring
+
+
 #: The bench tensor each KV view `v41_state_probe.kv_bound` takes binds.
 BOUND = {
     "pages": "pages.buf.torch.bfloat16",
