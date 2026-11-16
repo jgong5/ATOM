@@ -258,6 +258,15 @@ def test_a_population_s_micro_batch_is_traced_as_one_forward(
     assert '"enable_tbo":true' in graph["structure"]
 
 
+def test_one_rank_s_tbo_population_names_its_split_step_s_micro_batches(tmp_path):
+    # One rank clears the 8192-token bar; no peer vetoes the split.
+    record = _record(tmp_path, [([[9000, 9000, False]], None)])
+
+    shapes = list(map(str, population_shapes([record], tbo=True)))
+
+    assert shapes == ["prefill T=4500 B=1"] * 2
+
+
 def test_a_tbo_population_splits_a_prefill_and_names_a_decode_s_rows(tmp_path):
     # Step 1 splits as above; at step 2 rank 0 decodes 2 rows, rank 1 3.
     ranks = [([[9000, 9000, False]], 9100), ([[100, 100, False]], 9100)]

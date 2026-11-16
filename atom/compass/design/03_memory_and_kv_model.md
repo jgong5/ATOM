@@ -470,10 +470,11 @@ KV gate, a spec that cannot be recovered from the artifact makes an error unattr
   type.
 - Three topologies of one model is interpolation, not a law. The prior work said so
   explicitly and could not get a third model because the box was offline.
-- The spec-authoring tools are doc `05` D26's (probe classes emitting fragments,
-  `merge`/`validate`/`explain`); the memory readings are doc `07`'s Phase 2,
-  `measure memory`. The tools probe a real card where one is available and fall back to
-  datasheet values plus a mandatory derate where one is not.
+- A run's machine spec is composed from a device datasheet, a `platform_readings`
+  entry and, across nodes, a network file (`atom/compass/spec/layers.py`); the memory
+  readings are doc `07`'s Phase 2, `measure memory`. A readings entry is measured on a
+  real card where one is available, and otherwise assumed: a mandatory derate on the
+  datasheet values.
 
 ---
 

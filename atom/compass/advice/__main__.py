@@ -55,7 +55,7 @@ def main(argv: list[str]) -> None:
         help="a reference layer for the dashboard: its source and its curves",
     )
     args = parser.parse_args(argv)
-    # Each start runs in the tree, so it is given OUT whole.
+    # Whole, so each path and command naming OUT holds from any directory.
     args.out = args.out.resolve()
     expansion = expand(args.space)
     layer = dashboard.reference(args.reference) if args.reference else None

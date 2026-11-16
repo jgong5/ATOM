@@ -63,6 +63,8 @@ PLANE_BOUND = {
 }
 #: V4.1's RoPE, over a query's heads or a ratio's index keys, one head.
 ROPE = "aiter.rope_cached_positions_fwd_impl.default"
+#: V4.1's top-k on gfx1250, on a scorer's logits or the candidate pick's maxima.
+TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
 #: V4.1's read of its state cursors back to the host, `.cpu()`, a copy into
 #: pageable memory, which no CUDA graph captures: `measure ops` refuses it.
 HOST_COPY = "aten.to.dtype_layout"
@@ -330,3 +332,58 @@ def test_a_key_rope_stating_no_ratio_refuses_where_both_ratios_plans_hold_its_ro
         (_, key), (_, query) = sorted(zip(heads, ropes), key=lambda h: h[0])
         assert key["why"].endswith("holds its 16 rows: trace its shape again")
         assert [query["identity"].get("positions")] == truth[query["leaf"]]["positions"]
+
+
+def test_each_top_k_alone_takes_its_ratio_s_visible_rows(undrafted_cell):
+    """The row bounds ATOM stages for a top-k are its ratio's visible rows,
+    which the capture states: each such top-k, with no scorer beside it, takes
+    those ATOM's capture passes it, each ratio's apart."""
+    root, atom = undrafted_cell
+    truth = json.loads((root / "truth.json").read_text())
+    point = ["--width", "16", "--context", "8192", "--only", TOPK, "--llc-mib", "512"]
+    _run(HARNESS, root / "topk.json", *point, "--store", root / "store", "--", *atom)
+    got = json.loads((root / "topk.json").read_text())
+    bounds = "row_starts", "row_ends"
+    staged = {
+        r["leaf"]: [r["identity"].get(s) for s in bounds]
+        for r in got
+        if json.loads(r["leaf"])["args"]["row_ends"]["role"] == "metadata"
+    }
+    assert staged == {leaf: [truth[leaf][s][0] for s in bounds] for leaf in staged}
+    assert len({n for n, _ in staged.values()}) == len(staged) == 2
+    assert {r["verdict"] for r in got} == {"reaches launch"}
+
+
+def test_a_top_k_or_key_rope_stating_no_ratio_refuses_where_its_point_cannot_tell(
+    undrafted_cell,
+):
+    """In a graph traced before V4.1's top-k and key RoPE stated their ratio, a
+    top-k whose row bounds ATOM stages, with no scorer beside it, and the key
+    RoPE beside one ratio's compressor alone, both ratios' plans holding its
+    rows, refuse by name, to be traced again; a top-k beside its scorer binds."""
+    root, atom = undrafted_cell
+    store, why = root / "untold", {}
+    shutil.copytree(root / "store", store, copy_function=shutil.copyfile)
+    for entry in store.glob("op_graph/*/entry.json"):  # each stating no ratio alone
+        doc = json.loads(entry.read_text())
+        for name in doc["members"]:
+            data = (entry.parent / name).read_bytes()
+            data = re.sub(rb', "stated": \{"compress_ratio": \d+\}', b"", data)
+            (entry.parent / name).write_bytes(data)
+            doc["members"][name] = f"sha256:{hashlib.sha256(data).hexdigest()}"
+        entry.write_text(json.dumps(doc))
+    for only in (["--only", TOPK], ["--kinds"]):
+        point = ["--width", "16", "--context", "8192", *only, "--llc-mib", "512"]
+        _run(HARNESS, root / "untold.json", *point, "--store", store, "--", *atom)
+        for r in json.loads((root / "untold.json").read_text()):
+            args = json.loads(r["leaf"])["args"]
+            if r["op"] == ROPE or args.get("row_ends", {}).get("role") == "metadata":
+                told = r["why"].rpartition("cannot tell which ratio's ")[-1]
+                why[only[0], args.get("stride0")] = told
+    again = ": trace its shape again"
+    assert why == {
+        ("--only", 131072): f"scorer writes its 131072-wide logits{again}",
+        ("--only", 262144): f"scorer writes its 262144-wide logits{again}",
+        ("--kinds", 131072): "",
+        ("--kinds", None): f"compress plan holds its 16 rows{again}",
+    }

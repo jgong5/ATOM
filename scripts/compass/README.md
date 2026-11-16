@@ -792,7 +792,9 @@ cctraces_sim.sh` runs, each with the `dp0.engine.json` the run wrote beside it,
 whose engine config the law states and whose `data_parallel_size` its ranks
 join at. Records that ran before a run wrote that file, or wrote it without
 `data_parallel_size`, take an engine file stated from their `server.log` as
-`--engine FILE`. `atom/compass/backends/step_labels.py` states the label
+`--engine FILE`; `compass fit steps` and `compass fit host` take it too, the
+host laws then keyed by it with the records' launch graph sets
+(`atom/compass/fit/samples.py`). `atom/compass/backends/step_labels.py` states the label
 and what is cut, and the command writes each record's labels beside it for
 reading, `dp0.cost.jsonl`; the module's docstring states how outliers are
 dropped. A prefill step's label is a trace run's busy time, which `calib_capture.sh`
@@ -980,9 +982,9 @@ trajectory's first turn at 16, and two 120 s trace runs, the c=16 and c=4 recipe
 which the prefill vector is fitted. `KINETO_CONFIG` named a file holding
 `ROCTRACER_MAX_EVENTS=2000000000`, so no rank's trace dropped rows, and `client.sh` ran under
 `WAIT_S=3600` for their stops. Its host laws fit the tokenizer, the segment tokenizer's own
-work with `chars_per_s`, the HTTP intake and the hops on those calibration records, under
-the labels before `blocked_ns`: the records carry none, and a prefill launch the device held
-gave no `W_launch` label. A warm record came
+work with `chars_per_s`, the HTTP intake and the hops on those calibration records,
+refitted at ATOM ac272852e ([#3291](https://github.com/jgong5/ATOM/issues/3291)): the
+records carry no `blocked_ns`, so each `W_launch` label is its launch's wall time. A warm record came
 first, and a record that built a Triton variant, or held a decode stall near a server change
 on cards 0-3, was taken again.
 
