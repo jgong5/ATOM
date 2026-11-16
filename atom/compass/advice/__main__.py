@@ -17,14 +17,17 @@ finished one skipped, and `simulate.SIMULATED` gets each point's outcome
 (`simulate.simulate`), printed with the CPU seconds the points took. Last,
 `results.RESULTS` gets the results (`results.results`), printed: the SLO, the
 result table, each command that makes what a point lacks, and the
-recommendation's text. When SPACE differs from the search OUT holds only in its
-SLO, the results alone are made again, from the verdicts, states and outcomes
-OUT holds, and nothing is checked or simulated; a search that did not end holds
-no outcomes, so the next is whole. Beside SPACE and the store and laws the
-check reads, it reads OUT's last search: an SLO-only rerun takes its
-`CANDIDATES`, `check.REUSE`, `check.STATES` and `simulate.SIMULATED` as they
-are, and each point's run directory is read to skip a finished point and for
-its metrics. It writes nothing when SPACE refuses.
+recommendation's text; and `dashboard.FILE` gets the dashboard
+(`dashboard.write`), with the reference layer in the file ``--reference``
+names, when given (`dashboard.reference`). When SPACE differs from the search
+OUT holds only in its SLO, the results and the dashboard alone are made again,
+from the verdicts, states and outcomes OUT holds, and nothing is checked or
+simulated; a search that did not end holds no outcomes, so the next is whole.
+Beside SPACE and the store and laws the check reads, it reads OUT's last
+search: an SLO-only rerun takes its `CANDIDATES`, `check.REUSE`,
+`check.STATES` and `simulate.SIMULATED` as they are, and each point's run
+directory is read to skip a finished point, for its metrics and for the
+dashboard. It writes nothing when SPACE or the reference layer refuses.
 """
 
 import argparse
@@ -32,7 +35,7 @@ import json
 import sys
 from pathlib import Path
 
-from atom.compass.advice import results, simulate
+from atom.compass.advice import dashboard, results, simulate
 from atom.compass.advice.check import REUSE, STATES, check, lines, state_lines, states
 from atom.compass.advice.space import expand
 from atom.compass.cli import refusing
@@ -46,10 +49,16 @@ def main(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(prog=PROG)
     parser.add_argument("space", type=Path, help="the space file")
     parser.add_argument("out", type=Path, help="the search's directory")
+    parser.add_argument(
+        "--reference",
+        type=Path,
+        help="a reference layer for the dashboard: its source and its curves",
+    )
     args = parser.parse_args(argv)
     # Whole, so each path and command naming OUT holds from any directory.
     args.out = args.out.resolve()
     expansion = expand(args.space)
+    layer = dashboard.reference(args.reference) if args.reference else None
     args.out.mkdir(parents=True, exist_ok=True)
     earlier = _only_slo_changed(expansion, args.out)
     written = args.out / CANDIDATES
@@ -65,6 +74,7 @@ def main(argv: list[str]) -> None:
     held = results.results(expansion, judged, found, outcome, args.out)
     print("\n".join(results.lines(held)))
     print(f"the results in {args.out / results.RESULTS}")
+    print(f"the dashboard in {dashboard.write(args.out, written, layer)}")
     candidates, points = len(expansion["candidates"]), len(expansion["points"])
     print(f"{candidates} candidates and {points} points in {written}")
 
@@ -73,7 +83,7 @@ def _search(expansion: dict, out: Path) -> tuple[dict, dict, dict]:
     """Check and simulate `expansion` into `out`, printing each step: its
     verdicts, states and outcomes."""
     # A search stopped before its outcomes holds none, so the next is whole.
-    for name in (simulate.SIMULATED, results.RESULTS):
+    for name in (simulate.SIMULATED, results.RESULTS, dashboard.FILE):
         (out / name).unlink(missing_ok=True)
     judged, verdicts = check(expansion, out), out / REUSE
     found = states(expansion, judged, out)

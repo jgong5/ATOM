@@ -189,6 +189,15 @@ def profiled(sent: list[dict]) -> list[dict]:
     ]
 
 
+def gpus(run) -> int:
+    """The GPUs of the run directory `run`: each side's engine record's
+    ``tensor_parallel_size`` times ``data_parallel_size``, summed."""
+    return sum(
+        e["tensor_parallel_size"] * (e.get("data_parallel_size") or 1)
+        for e in (read_json(side / ENGINE_RECORD) for side in sides(run))
+    )
+
+
 def metrics(run, simulated: bool = False) -> dict:
     """InferenceX's metrics of the run directory `run`, None where it has none;
     the hit rates from its own counters when `simulated`."""
@@ -212,10 +221,7 @@ def metrics(run, simulated: bool = False) -> dict:
     starts = [int(m["request_start_ns"]) for m in meta if m.get("request_start_ns")]
     ends = [int(m["request_end_ns"]) for m in meta if m.get("request_end_ns")]
     duration = (max(ends) - min(starts)) / 1e9 if starts and ends else 0
-    engines = [read_json(side / ENGINE_RECORD) for side in sides(run)]
-    gpus = sum(
-        e["tensor_parallel_size"] * (e.get("data_parallel_size") or 1) for e in engines
-    )
+    gpu_count = gpus(run)
     if simulated:
         gpu, full, cpu = _hit_counters(run, sent) or (None, None, None)
     else:
@@ -232,7 +238,7 @@ def metrics(run, simulated: bool = False) -> dict:
     return {
         "concurrency": read_json(run / CLIENT_RUN)["arguments"][CONCURRENCY],
         "throughput per GPU": (
-            (tokens[0] + tokens[1]) / duration / gpus if duration > 0 else None
+            (tokens[0] + tokens[1]) / duration / gpu_count if duration > 0 else None
         ),
         "p90 interactivity": _inverse(percentile(itl, 90)),
         "p90 E2E-normalized interactivity": _inverse(percentile(per_token, 90)),
