@@ -1286,10 +1286,11 @@ def test_a_v41_multi_cta_top_k_takes_its_bounds_and_ranks_a_plane_drawn_below_th
     for call, bounds in zip(taken, ends[:2]):
         for row, n in zip(call["logits"], bounds):
             assert row[:n].ne(0).all() and row[n:].eq(0).all()
-    # a prefill of 256 past 1024 cached tokens ranks a plane its 40 KV blocks
-    # wide, not the 8 it traced; a candidate list's stays as the model sizes it
-    taken = _v41_index(monkeypatch, [50, 20], leaves[:2], prefill(256, 1), 1024)
-    assert [call["logits"].shape[1] for call in taken] == [320, 32]
+    # a prefill of 256 past 1024 cached tokens ranks a plane as wide as its 40
+    # KV blocks, not the 8 it traced; a candidate list's stays as it was sized
+    leaves = top_k(8, "metadata", "metadata"), leaves[1]
+    taken = _v41_index(monkeypatch, [50, 20], leaves, prefill(256, 1), 1024)
+    assert [call["logits"].shape[1] for call in taken] == [40, 32]
 
 
 def test_a_v41_fp4_packed_multi_cta_top_k_takes_its_starts_and_ranks_from_them(
