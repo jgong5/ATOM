@@ -591,3 +591,23 @@ def test_the_draft_block_takes_what_its_drafter_builds_from_its_anchors(rehearse
         for shape in ("decode B=4", "prefill T=124 B=1")
         for (op, slot), item in built.items()
     }
+
+
+def test_the_draft_kv_tail_and_the_cursor_commit_take_what_atom_passes_them(
+    rehearsed,
+):
+    """The draft-KV tail of a replayed prefill takes the step's positions at
+    its tail's rows, and a decode's cursor commit its block's anchor rows."""
+    tail = "atom.model_ops.deepseek_v41.dspark:fused_draft_kv_tail"
+    commit = "atom.model_ops.attentions.deepseek_v41.speculative:_launch_commit_cursors"
+    taken = {
+        (r["shape"], r["op"], r["bound"].get(slot))
+        for r in rehearsed
+        for op, slot in ((tail, "positions"), (commit, "anchors"))
+        if r["op"] == op
+    }
+    assert taken == {
+        ("prefill T=124 B=1", tail, "plan.tail_rows.positions"),
+        ("decode B=4", tail, "step.positions"),
+        ("decode B=4", commit, "draft_step.rows"),
+    }
