@@ -3,9 +3,11 @@
 `python -m atom.compass.report.html OUT`
 
 OUT is a run's directory as `split` reads it, once its split is written. The
-page goes to OUT/`FILE`, and no other file changes. Every number on it is read
-from a file in OUT, or in the cell holding OUT for its grades, and a part whose
-file is missing, or holds nothing for it, says so in its place:
+page goes to OUT/`FILE`, and no other file changes but, as grades below
+says, the reports of the other runs its cell's `GRADES` grades. Every number
+on it is read from a file in OUT, or in the cell holding OUT for its grades
+and its real runs' splits, and a part whose file is missing, or holds nothing
+for it, says so in its place:
 
 - the run: simulated, by which backend, or real; one instance, or a
   deployment's two sides, their KV link and the router's arguments; each
@@ -28,9 +30,13 @@ file is missing, or holds nothing for it, says so in its place:
 - grades, the rows `python -m atom.compass.validate` printed for the cell
   holding OUT, from the cell's `GRADES`, when OUT is a run it graded and every
   run it graded still holds the results it read (`digest`); grading writes
-  that file and then renders the report of each of its runs again;
-- a real run's split beside a simulated run's, and the op-family split, none
-  of which a run's directory holds.
+  that file and then renders the report of each of its runs again, and a
+  report written once one of them holds other results renders the others
+  again, so none still shows the grades;
+- a simulated run's split beside the real runs', when the cell's `GRADES`
+  grades it: each segment's percentiles of this run and of each real run
+  graded with it, from their `split.FILE`, and why a run has none;
+- the op-family split, which no run's directory holds.
 """
 
 import collections
@@ -71,6 +77,7 @@ SEGMENTS = {
     "e2el_s": "end to end",
 }
 PERCENTILES = (10, 50, 90)
+PERCENTILE_COLUMNS = tuple(f"p{p} (s)" for p in PERCENTILES)
 #: The phases of the split's requests `curves.metrics` counts: the profiling
 #: phase's, and those aiperf names none for, which `from_aiperf` names unknown.
 PHASES = ("profiling", "unknown")
@@ -272,6 +279,23 @@ def _trust(simulated: bool, summary) -> str:
     return out
 
 
+def _counted(made: dict) -> list[dict]:
+    """The requests of the split `made` that the headline metrics count."""
+    return [r for r in made["requests"] if r["phase"] in PHASES]
+
+
+def _segments(counted: list[dict]) -> dict:
+    """Each segment's requests and `PERCENTILES` over `counted`, by its name;
+    a segment none of them holds is left out."""
+    out = {}
+    for key, name in SEGMENTS.items():
+        values = [r[key] for r in counted if r.get(key) is not None]
+        if values:
+            at = [_number(curves.percentile(values, p)) for p in PERCENTILES]
+            out[name] = (len(values), *at)
+    return out
+
+
 def _split(run: Path) -> str:
     made = read_json(run / split.FILE)
     if "refused" in made:
@@ -284,18 +308,14 @@ def _split(run: Path) -> str:
             f", the decode side's joined to it at {high:.4f} s, its bounds"
             f" {low:.4f} s to {high:.4f} s"
         )
-    counted = [r for r in requests if r["phase"] in PHASES]
+    counted = _counted(made)
     text = (
         f"{len(requests)} requests split, on {clock}; {len(unsplit)} not. Below,"
         f" the {len(counted)} of them the headline metrics count."
     )
-    out, rows = f"<p>{escape(text)}</p>", []
-    for key, name in SEGMENTS.items():
-        values = [r[key] for r in counted if r.get(key) is not None]
-        if values:
-            at = [_number(curves.percentile(values, p)) for p in PERCENTILES]
-            rows.append((name, len(values), *at))
-    out += _table(rows, ("segment", "requests", *(f"p{p} (s)" for p in PERCENTILES)))
+    out = f"<p>{escape(text)}</p>"
+    rows = [(name, *at) for name, at in _segments(counted).items()]
+    out += _table(rows, ("segment", "requests", *PERCENTILE_COLUMNS))
     tokens = [
         sum(r[k] for r in counted)
         for k in ("lmcache_load_tokens", "lmcache_store_tokens")
@@ -315,6 +335,12 @@ def digest(run) -> str:
     return sha.hexdigest()
 
 
+def _changed(cell: Path, ran: dict) -> list[str]:
+    """The runs of `ran`, each name's `digest` as grading read it, that `cell`
+    holds other results for now."""
+    return [n for n, sha in ran.items() if digest(cell / n) != sha]
+
+
 def _grades(run: Path) -> str:
     """The grades of the cell holding `run`, from its `GRADES`, while each run
     they grade holds the results grading read, by its `digest`."""
@@ -326,12 +352,51 @@ def _grades(run: Path) -> str:
     names = ", ".join(graded["runs"])
     if run.name not in graded["runs"]:
         return _none(f"None: {path} grades {names}, not this run.")
-    ran = graded["runs"].items()
-    if changed := [n for n, sha in ran if digest(run.parent / n) != sha]:
+    if changed := _changed(run.parent, graded["runs"]):
         changed = ", ".join(changed)
         return _none(f"None: {path} grades {names}; {changed} changed since.")
     text = f"Cell {graded['cell']}, graded on its runs {names}."
     return f"<p>{escape(text)}</p>{_table(graded['rows'], graded['columns'])}"
+
+
+def _beside(run: Path) -> str:
+    """Each segment's percentiles of `run`, a simulated run, beside those of
+    each real run its cell's `GRADES` grades with it, and why a run has none."""
+    run = Path(os.path.abspath(run))
+    path = run.parent / GRADES
+    graded = read_json(path) if path.is_file() else {"runs": {}}
+    if run.name not in graded["runs"]:
+        return _none("None: a simulated run's directory holds no real run.")
+    # Grading grades one simulated run in a cell, so the others it names are real.
+    real = [n for n in graded["runs"] if n != run.name]
+    shown, why = {}, []
+    for name in (run.name, *real):
+        try:
+            made = read_json(run.parent / name / split.FILE)
+        except (OSError, ValueError) as missing:
+            why.append((name, str(missing)))
+            continue
+        if "refused" in made:
+            why.append((name, made["refused"]))
+        else:
+            shown[name] = _segments(_counted(made))
+    text = (
+        f"Cell {graded['cell']}: {run.name}, this run, beside {', '.join(real)},"
+        " the real runs graded with it, each over the requests its headline"
+        " metrics count."
+    )
+    rows = [
+        (segment, name, *at[segment])
+        for segment in SEGMENTS.values()
+        for name, at in shown.items()
+        if segment in at
+    ]
+    out = f"<p>{escape(text)}</p>"
+    if rows:
+        out += _table(rows, ("segment", "run", "requests", *PERCENTILE_COLUMNS))
+    if why:
+        out += _table(why, ("run", "no split because"))
+    return out
 
 
 def _part(title: str, make, *args) -> str:
@@ -360,8 +425,7 @@ def page(run) -> str:
         _part("Per-request split", _split, run),
     ]
     if simulated:
-        why = "None: a simulated run's directory holds no real run."
-        parts.append(_part("A real run's per-request split", _none, why))
+        parts.append(_part("A real run's per-request split", _beside, run))
     why = "None: no op-family split is recorded for this run."
     parts.append(_part("Op-family split", _none, why))
     return (
@@ -373,9 +437,20 @@ def page(run) -> str:
 
 
 def write(run) -> Path:
-    """Write `run`'s report to its `FILE`; that file."""
+    """Write `run`'s report to its `FILE`; that file. When a run its cell's
+    `GRADES` grades holds other results now, render again the report of each
+    other run that file grades, so none still shows the grades."""
     path = Path(run) / FILE
     path.write_text(page(run))
+    here = Path(os.path.abspath(run))  # a run given as `.` too
+    cell = here.parent
+    if (cell / GRADES).is_file():
+        ran = read_json(cell / GRADES)["runs"]
+        if _changed(cell, ran):
+            for name in ran:
+                other = cell / name
+                if name != here.name and (other / FILE).is_file():
+                    (other / FILE).write_text(page(other))
     return path
 
 
