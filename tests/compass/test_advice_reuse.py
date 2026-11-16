@@ -341,6 +341,23 @@ def test_a_law_whose_sources_price_no_step_needs_its_own_figures(tmp_path, searc
     }
 
 
+def test_a_source_of_the_prefill_vector_alone_needs_figures(tmp_path, searched):
+    held = law(searched)
+    shipped = held["sources"]["shipped"]
+    shipped["vectors"].remove("host")
+    del shipped["figures"]
+    where = law_file(tmp_path, held)
+
+    found, _ = verdicts(advise(tmp_path), "law")
+
+    assert found == {
+        "verdict": "calibrate",
+        "requirement": 4,
+        "reason": f"{where} states no cost-accuracy figures of source shipped",
+        "law": where,
+    }
+
+
 @pytest.mark.parametrize("held", ["none", "at another digest"])
 def test_readings_with_no_entry_or_measured_at_another_digest_are_measured(
     tmp_path, searched, held
