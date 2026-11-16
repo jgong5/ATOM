@@ -28,6 +28,12 @@ ones ATOM passed by that function's parameter names, the group aside; MORI's
 also state the EP width ATOM built their handle for, `num_ep_ranks`, which
 their rows no longer give.
 
+aiter's comm-fused MoE, which ATOM takes where aiter holds winners for the
+card and the layer (`driverless.NAMES`), reduces across its group inside its
+own stage 2: one `declared` op, `COMM_FUSED` (`comm_fused`). Under DP its
+input rows are gathered first by the DP group's `all_gatherv`, the call
+`atom.model_ops.moe:all_gatherv` makes, declared as that one.
+
 A graph that holds G is put at a G by `at`: G's slots take it, and each DP
 exchange that holds G takes the `sizes` the first rule gives each rank there,
 which ATOM keeps in numpy, where no symbol reaches.
@@ -50,6 +56,8 @@ SIZED = ("atom.model_ops.moe:all_gatherv", "atom.model_ops.moe:reduce_scatterv")
 SYMBOL = {"symbol": ir.G.name}
 #: What `slots` marks a path to: G itself, or an exchange's `sizes`.
 _G, _SIZES = "G", "sizes"
+#: aiter's comm-fused MoE call: both expert stages and the group's reduction.
+COMM_FUSED = "aiter.ops.comm_fused_moe_runtime:CommFusedMoeRuntime.run"
 
 
 def split(rows: int, local: int, dp: int) -> list[int]:
@@ -135,11 +143,13 @@ def patches(recorder):
     from torch._subclasses.fake_tensor import unset_fake_temporarily
 
     from atom.model_ops import moe
+    from atom.model_ops.fused_moe.comm_fused_moe import CommFusedMoeBackend
     from atom.utils.forward_context import DPMetadata
     from atom.utils.tbo import ubatching
 
     sync = ubatching.sync_dp_metadata
     dp = get_dp_group().world_size
+    gather_inputs = CommFusedMoeBackend._gather_dpa_inputs
 
     def on_host(fn, *args, **kwargs):
         with unset_fake_temporarily():
@@ -183,13 +193,105 @@ def patches(recorder):
     def reduce_scatter_with_unpadding(x, local_tokens):
         return rows(x, local_tokens)
 
+    def gather_dpa_inputs(backend, rows):
+        # The comm-fused MoE calls the DP group's communicator itself, with
+        # the arguments `moe.all_gatherv` passes it; the capture's group has none.
+        group = get_dp_group()
+        held = group.device_communicator
+        group.device_communicator = types.SimpleNamespace(
+            all_gatherv=lambda x, dim, sizes: moe.all_gatherv(x, sizes, group)
+        )
+        try:
+            return gather_inputs(backend, rows)
+        finally:
+            group.device_communicator = held
+
     gathers = (all_gatherv, reduce_scatterv, reduce_scatter_with_unpadding)
     return [
         (ubatching, "sync_dp_metadata", sync_dp_metadata),
         (DPMetadata, "gather_running_tokens", staticmethod(gather_running_tokens)),
+        (CommFusedMoeBackend, "_gather_dpa_inputs", gather_dpa_inputs),
         *(
             (moe, f.__name__, _declared(recorder, f"{moe.__name__}:{f.__name__}", f))
             for f in gathers
+        ),
+    ]
+
+
+def comm_fused(recorder):
+    """`(owner, name, value)` for each patch that stands in for aiter's
+    comm-fused MoE, which ATOM builds where aiter holds winners for its
+    layer on the declared card.
+
+    Its runners are the winners' configs alone, with no symmetric workspace
+    or communicator built, each taking ragged rows where aiter's runner of
+    its family does. A run is one `declared` op, `COMM_FUSED`: ATOM's
+    arguments, aiter's enums among them by value as `fused_moe_` takes them,
+    less the shared expert's producer, its join and their stream, plus the
+    shape aiter built the runners for, `tp` ranks reducing by `comm`. It
+    gives back the rows aiter's run does, of a ragged reduce-scatter this
+    rank's, the first. The producer and the join run after it, as its stage 2
+    calls them, so the shared expert is traced on its own stream. ATOM's
+    custom op runs its body, as the other MoE wrappers do.
+    """
+    from aiter import ActivationType, QuantType
+    from aiter.ops import comm_fused_moe_runtime as runtime
+    from aiter.ops.flydsl import comm_fused_moe_host as host
+
+    from atom.model_ops.fused_moe import comm_fused_moe
+
+    class Runners(host._LazyRunners):
+        def __init__(self, tp_group, shape, configs):
+            self.tp_group, self.shape, self.configs = tp_group, shape, configs
+
+        def __getitem__(self, tokens):
+            runner = types.SimpleNamespace(config=self.configs[tokens])
+            family = host._RUNNER_TYPES[type(runner.config)]
+            runner.supports_ragged_m = family.supports_ragged_m.fget(runner)
+            return runner
+
+    def run(
+        self,
+        *,
+        shared_partial,
+        before_stage2_for_rows=None,
+        before_shared_add=None,
+        stage2_stream=None,
+        reduce_scatter_sizes=None,
+        **moe_args,
+    ):
+        hidden, sizes = moe_args["hidden_states"], reduce_scatter_sizes
+        bucket = self.bucket_for(max(sizes) * len(sizes) if sizes else len(hidden))
+        if sizes:
+            rows = shared_rows = sizes[0]
+        else:
+            rows = self.runners.output_rows_for(bucket, len(hidden))
+            shared_rows = self.runners.configs[bucket].output_rows
+        with recorder.quiet():
+            out = hidden.new_empty((rows, *hidden.shape[1:]))
+        if recorder.on:
+            shape = self.runners.shape
+            # aiter's enums, which pickle cannot reduce, as `fused_moe_` takes them
+            enums = (ActivationType, QuantType)
+            slots = {
+                k: v.value if isinstance(v, enums) else v for k, v in moe_args.items()
+            }
+            slots |= {"shared_partial": shared_partial, "tp": shape.tp}
+            slots |= {"comm": shape.comm, "reduce_scatter_sizes": sizes}
+            recorder.add(COMM_FUSED, ir.NodeKind.DECLARED, slots, [out], None)
+        if before_stage2_for_rows is not None:
+            before_stage2_for_rows(shared_rows)
+        if before_shared_add is not None:
+            before_shared_add()
+        return out
+
+    return [
+        (host, "_LazyRunners", Runners),
+        (runtime.CommFusedMoeRuntime, "run", run),
+        (
+            torch.ops.aiter,
+            "comm_fused_moe_forward",
+            comm_fused_moe.comm_fused_moe_forward,
         ),
     ]
 
