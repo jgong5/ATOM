@@ -336,6 +336,16 @@ def test_an_engine_writes_what_its_processes_held_at_each_push(
     # and the decode's after the one at 2 s.
     count = "atom:gpu_forward_seconds", "atom:gpu_forward_seconds_count"
     assert [v for k, v in written[2.0].items() if k[:2] == count] == [1.0]
+    # Its point at 2 s, line by line: the buckets, then the count, then the
+    # sum, an order the parser does not check.
+    lines = gzip.decompress((tmp_path / metrics.FILE.format(lp)).read_bytes())
+    point = [
+        line.split("{")[0].removeprefix(count[0])
+        for line in lines.decode().splitlines()
+        if line.startswith(f"{count[0]}_") and line.endswith(" 2.0")
+    ]
+    assert point == ["_bucket"] * (len(point) - 2) + ["_count", "_sum"]
+    assert len(point) > 2
     # Each request's context, at the first push after its dispatch alone.
     for family, at in (("prefill", [1.0]), ("decode", [2.0])):
         name = f"atom:{family}_request_context_tokens"
