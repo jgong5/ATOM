@@ -321,8 +321,10 @@ def test_a_configuration_atom_refuses_refuses_its_candidate_with_atom_s_error(
         (
             DECLARED,
             {"--tensor-parallel-size": 8, "--decode-context-parallel-size": 3},
-            "ATOM's config: AssertionError: tp_size (8) must be divisible by "
-            "dcp_size (3)",
+            (
+                "ATOM's config: AssertionError: tp_size (8) must be divisible by "
+                "dcp_size (3)"
+            ),
         ),
         (
             unpicklable,
