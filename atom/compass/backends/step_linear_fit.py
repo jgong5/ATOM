@@ -94,7 +94,7 @@ adopts features as columns on their held-out error per launch path
 The same solver fits the host entry's ``tokenizer`` term on a recorded
 server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
 HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
-requests, ``fixed_s`` from a burst or else ``idle_s``, and ``bytes`` over every
+requests, ``fixed_s`` from the bursts or else ``idle_s``, and ``bytes`` over every
 request's body.
 
 Each equation is divided by its price, from its label until no price moves
@@ -703,11 +703,13 @@ def fit_intake(paths) -> tuple[dict, dict]:
     """The ``http_intake`` term over the intake stamps each record in `paths`
     holds (`_intakes`), and its report: ``idle_s`` and ``per_byte_s`` by the
     host-law solver on the lone requests' CPU seconds over their body bytes;
-    ``bytes`` spans every request's body; ``fixed_s`` the loop's CPU time per
-    request between template starts in the longest burst, less ``per_byte_s``
-    times its mean body, each gap the next request's, or ``idle_s`` where that
-    is negative or there is no burst, the report's ``fixed_s_is_idle_s`` saying
-    which. Raises on too few lone requests."""
+    ``bytes`` spans every request's body; ``fixed_s`` the mean, over every
+    burst's later requests, of the loop's CPU time from the template start
+    before each to its own, less ``per_byte_s`` times its body, the report's
+    ``burst`` giving the bursts, their requests and those values' p10 and p90;
+    or ``idle_s`` where that mean is negative or there is no burst, the
+    report's ``fixed_s_is_idle_s`` saying which. Raises on too few lone
+    requests."""
     lone, bursts, bodies = [], [], []
     for path in paths:
         got = _intakes(path)
@@ -721,19 +723,26 @@ def fit_intake(paths) -> tuple[dict, dict]:
     if not bursts:
         report["fixed_s_is_idle_s"] = f"no burst among {len(lone)} lone requests"
         return {"fixed_s": idle, **term}, report
-    sizes, starts, cpu = np.array(max(bursts, key=len), dtype=np.float64).T
-    gap, body = np.diff(cpu).mean() * 1e-9, sizes[1:].mean()
-    fixed = gap - per_byte * body
+    # Each burst's (body bytes, template start ns, its CPU ns) per request.
+    runs = [np.array(b, dtype=np.float64).T for b in bursts]
+    gaps = np.concatenate([np.diff(cpu) * 1e-9 for _, _, cpu in runs])
+    sizes = np.concatenate([body[1:] for body, _, _ in runs])
+    values = gaps - per_byte * sizes
+    fixed = values.mean()
     if fixed < 0:
         report["fixed_s_is_idle_s"] = (
-            f"the longest burst's {len(sizes) - 1} later requests take {gap:.3g} s "
+            f"the bursts' {len(gaps)} later requests take {gaps.mean():.3g} s "
             f"of the loop's CPU each, less than per_byte_s {per_byte:.3g} times "
-            f"their mean body of {body:.0f} B, so fixed_s would be {fixed:.3g} s"
+            f"their mean body of {sizes.mean():.0f} B, so fixed_s would be "
+            f"{fixed:.3g} s"
         )
         return {"fixed_s": idle, **term}, report
+    p10, p90 = np.percentile(values, [10, 90]).tolist()
     report["burst"] = {
-        "requests": len(sizes),
-        "span_s": (starts[-1] - starts[0]) * 1e-9,
+        "bursts": len(bursts),
+        "requests": sum(map(len, bursts)),
+        "p10_s": p10,
+        "p90_s": p90,
     }
     return {"fixed_s": fixed, **term}, report
 

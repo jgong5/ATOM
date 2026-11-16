@@ -21,6 +21,7 @@ from test_artifact_invalidation import STANZA, moved
 from test_capture_v4_pro import CONFIG as V4_PRO
 from test_drive_runfile import LAWS as HOST_LAWS
 from test_memory_readings import READINGS, publish_readings
+from test_page_bound_reading import V41
 from test_run_check_side import (
     DECODE_SIZES,
     MACHINE,
@@ -36,7 +37,7 @@ from test_run_step_grid import DOCUMENT, PLATFORM, deployment, host_laws_key, re
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import cli
 from atom.compass import run as compass_run
-from atom.compass.advice.check import REUSE
+from atom.compass.advice.check import REUSE, STATES
 from atom.compass.artifacts import (
     ArtifactStore,
     Axis,
@@ -47,8 +48,11 @@ from atom.compass.artifacts import (
     keyed_platform,
     member_name,
 )
+from atom.compass.bench import ops
 from atom.compass.drive import reuse
+from atom.compass.drive import run as drive_run
 from atom.compass.fit.publish import RANK
+from atom.compass.memory.readings import PAGE_BOUND
 from atom.compass.run import memory
 from atom.compass.run.step_grid import keyed
 
@@ -72,9 +76,19 @@ def searched(tmp_path, monkeypatch, at_head):
     whose digest is the tree's, with no law file."""
     r = deployment(tmp_path, **COVERED)
     served(monkeypatch, r.config)
+    resolved_here(monkeypatch, lambda atom_args: r.config)
     monkeypatch.setattr(reuse, "LAWS", tmp_path / "laws")
     (tmp_path / "laws").mkdir()
     return r
+
+
+def resolved_here(monkeypatch, resolve):
+    """Each instance's config `resolve(atom_args)`, resolved in this process
+    rather than in the check's child."""
+    monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(
+        drive_run, "_declared", lambda atom_args, arch: resolve(atom_args)
+    )
 
 
 def advise(tmp_path, document=DOCUMENT, **fields) -> dict:
@@ -177,11 +191,8 @@ def test_a_law_and_readings_at_the_head_s_key_are_reused_at_every_point(
 
     judged = advise(tmp_path)
 
-    assert (
-        verdicts(judged, "law")
-        == [{"verdict": "reuse", "requirement": None, "reason": where, "law": where}]
-        * 2
-    )
+    reused = {"verdict": "reuse", "requirement": None, "reason": where, "law": where}
+    assert verdicts(judged, "law") == [reused | {"run": [where, where]}] * 2
     assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
     assert judged["candidates"]["a"]["store"] == str(tmp_path / "store")
     out = capsys.readouterr().out
@@ -239,11 +250,13 @@ def test_a_store_law_the_store_refuses_to_load_names_requirement_2(
         assert found["reason"].startswith(f"{where}: ")
         assert f"`{Kind.STEP_LINEAR_LAW}` x `{Axis.ATOM_SRC}`" in found["reason"]
     else:
+        host = Key.of(Kind.HOST_LAWS, **host_laws_key(r)).token()
         assert found == {
             "verdict": "reuse",
             "requirement": None,
             "reason": where,
             "law": where,
+            "run": [where.split()[1], host],
             "store": str(tmp_path / "store"),
         }
 
@@ -297,11 +310,14 @@ def test_a_law_with_a_source_stating_no_figures_names_requirement_4(tmp_path, se
 
     found, _ = verdicts(advise(tmp_path), "law")
 
+    (made_by,) = found.pop("made_by")
+    assert made_by.startswith("no calibrate.sh command: ")
     assert found == {
         "verdict": "calibrate",
         "requirement": 4,
         "reason": f"{where} states no cost-accuracy figures of source lone",
         "law": where,
+        "run": [where, where],
     }
 
 
@@ -389,6 +405,36 @@ def test_readings_with_no_entry_or_measured_at_another_digest_are_measured(
         assert "no entry for memory_readings" in found[0]["reason"]
     else:
         assert f"`{Kind.MEMORY_READINGS}` x `{Axis.ATOM_SRC}`" in found[0]["reason"]
+
+
+@pytest.mark.parametrize(
+    "index, reading, judged, state",
+    [
+        ("fp4", None, ("measure", 2), "missing readings"),
+        ("fp4", 3, ("reuse", None), "searchable"),
+        ("fp8", None, ("reuse", None), "searchable"),
+    ],
+    ids=["fp4-v41-without", "fp4-v41-with", "fp8-v41"],
+)
+def test_an_fp4_v41_entry_without_the_page_bound_reading_is_measured_as_check_finds_it(
+    tmp_path, searched, monkeypatch, index, reading, judged, state
+):
+    # Each start answers: a point the check would start is searchable.
+    monkeypatch.setattr("atom.compass.advice.check._start", lambda *args: None)
+    vars(searched.config).update(index_cache_dtype=index, hf_config=V41)
+    member = READINGS[1] | ({} if reading is None else {PAGE_BOUND: reading})
+    publish_readings(tmp_path / "store", searched.config, readings=member)
+    law_file(tmp_path, law(searched))
+
+    found = verdicts(advise(tmp_path), "readings")
+
+    assert {(v["verdict"], v["requirement"]) for v in found} == {judged}
+    points = json.loads((tmp_path / "out" / STATES).read_text())["a"]["points"]
+    assert {p["state"] for p in points.values()} == {state}
+    if judged[0] == "measure":
+        assert f"states no {PAGE_BOUND}, which an fp4 V4.1 start" in found[0]["reason"]
+        (made,) = {c for p in points.values() for c in p["made_by"]}
+        assert made.startswith("compass measure memory --gpu G --out D --store ")
 
 
 def test_a_candidate_is_looked_up_in_the_latest_calibration_store_holding_all_it_reads(
