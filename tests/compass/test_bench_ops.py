@@ -1258,6 +1258,46 @@ def test_a_v41_fp4_packed_plane_counts_draws_and_copies_its_rows_from_their_star
     assert all(r[158:].eq(0).all() for r in runs)
 
 
+@pytest.mark.parametrize("ranked", [True, False], ids=["top_k", "scorer"])
+def test_a_v41_fp4_unpacked_plane_counts_draws_and_copies_its_rows_as_fp8_s(ranked):
+    # V4.1's FP4 plane left unpacked, [4, 1024] float32, a row a stride apart,
+    # as a candidate list's or a prefill tail's scorer writes it and its top-k
+    # ranks it: rows reading 100 to 120 columns, at twice a cache of 20000
+    # bytes, take 12 copies 128 columns apart, 8 to a buffer, as on FP8
+    runner = _Runner()
+    geometry = SimpleNamespace(
+        layer_ratios=(1,), rows_per_page=lambda r: 32,
+        index_fp4=True, index_blocks_per_page=lambda r: 4,
+    )  # fmt: skip
+    runner.attn_metadata_builder = SimpleNamespace(
+        geometry=geometry, block_table_cols=2
+    )
+    bounds = [100, 120, 110, 120]
+    runner.forward_vars["logits"] = torch.zeros(4, 1024)
+    runner.forward_vars["row_ends"] = torch.tensor(bounds).int()
+    plane, rows = _t([4, 1024], "metadata"), _t([4], "metadata", dtype="torch.int32")
+    leaf = _leaf(ops._FP4, ("out", plane), ("row_ends", rows))
+    if ranked:
+        leaf = _leaf(
+            ops._TOPK, ("logits", plane), ("row_ends", rows), ("packed_rows", False)
+        )
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(leaf, layers=1)["region"])
+    stub._prepare((0, 0))
+    [(sig, (op, instances))] = stub.leaves.items()
+
+    n, size, _, _ = stub._plan(op, instances, {}, 4, 4, sig=sig, decode=True)
+    slot = "logits" if ranked else "out"
+    planes = [stub._copy(op, sig, instances, c)[0][slot] for c in range(n)]
+
+    assert (n, size) == (12, 4 * sum(bounds) + 16)
+    assert len({p.untyped_storage().data_ptr() for p in planes}) == 2
+    assert [p.storage_offset() for p in planes] == [128 * (c % 8) for c in range(n)]
+    reach = list(enumerate(bounds))
+    assert all(p[r, :b].ne(0).all() == ranked for p in planes for r, b in reach)
+    assert all(p[r, b:128].eq(0).all() for p in planes for r, b in reach)
+
+
 def test_v41_fp4_pick_s_block_maxima_and_top_k_count_and_rank_their_packed_rows(
     monkeypatch,
 ):
