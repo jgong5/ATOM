@@ -21,7 +21,10 @@ readings compose with SPACE's machine; a 1P1D side as `deploy.sh run` starts
 it, as `compass run --check` resolves one. The laws are judged at each point,
 since an argument that varies with the concurrency moves their key. A refusal
 of the composition, of an argument by ATOM's parser, of a configuration or of
-the runner under a law is ``refused``, verbatim, naming no requirement. A law
+the runner under a law is ``refused``, verbatim, naming no requirement; so is
+any exception resolving a configuration, by its exception line, but one
+Compass's own code raises other than as a refusal, a defect, which fails
+`compass advice` with its traceback. A law
 verdict ``calibrate``
 names the command that makes the law as `compass run --check` prints it: on
 one node the `calibrate.sh` command of its records into OUT's
@@ -46,9 +49,9 @@ calibration that stopped; either with the status file's last line and how many
 steps it has seen end; else ``searchable``. A searchable candidate's point
 whose readings a verdict sends to measure is ``missing readings``, with its
 command. Each other point starts with no traffic, as the search will run it,
-for what only a start shows:
-`compass run`, or `deploy.sh run` on 1P1D with `ROUTER`'s router arguments, its
-decode side through a local ``--on`` prefix carrying its own variables where
+for what only a start shows, in the directory the check resolved its arguments
+in: `compass run`, or `deploy.sh run` on 1P1D with `ROUTER`'s router arguments,
+its decode side through a local ``--on`` prefix carrying its own variables where
 SPACE names a network. A point answers once the start's ``server.json`` names
 it, and is ``searchable``; a start that leaves first, or does not answer in
 `START_S`, refuses the candidate with the start's last line and each log's
@@ -78,6 +81,8 @@ from atom.compass.spec import SpecRefusal
 REUSE = "reuse.json"
 #: What a refusal of an input raises, recorded as its verdict.
 REFUSALS = (ArtifactRefusal, SpecRefusal, ValueError, OSError)
+#: Compass's own code: anything else raised in it resolving a config is a defect.
+OWN = Path(__file__).resolve().parents[1]
 #: Each candidate's state, in OUT.
 STATES = "states.json"
 #: Where each candidate's calibration writes, and each point starts, in OUT.
@@ -342,10 +347,10 @@ def _started(command: list, env: dict, at: Path) -> str | None:
 
 
 class Command:
-    """A command in a process group of its own, run in the tree under this
-    process's environment and `env`, its output in `log`; once reaped, its
-    exit ``status`` and the CPU seconds it and the processes it waited for
-    took."""
+    """A command in a process group of its own, run in the caller's directory
+    under this process's environment and `env`, its output in `log`; once
+    reaped, its exit ``status`` and the CPU seconds it and the processes it
+    waited for took."""
 
     def __init__(self, command: list, env: dict, log: Path):
         self.log = log
@@ -355,7 +360,6 @@ class Command:
                 stdout=written,
                 stderr=subprocess.STDOUT,
                 env=os.environ | env,
-                cwd=serve.TREE,
                 start_new_session=True,
             )
         self.status, self.cpu_s = None, 0.0
@@ -428,10 +432,10 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     a spec or the verdict its refusal gives, at the head's ATOM digest `atom`:
     each instance's config resolved once, under its variables, and judged once
     a store, both kept in `seen`. A 1P1D `side` takes the KV transfer config
-    `deploy.sh` adds, on the simulated connector, and runs under the
-    ``AITER_LOG_LEVEL`` the script's `compass_env` sets when unset. `made` is
-    the calibration's directory, traces and the shared store a ``calibrate``
-    verdict's command takes."""
+    `deploy.sh` adds, on the simulated connector, and runs under its variables
+    over this process's ``AITER_LOG_LEVEL``, with those the script sets over
+    them (`drive_run.side_env`). `made` is the calibration's directory, traces
+    and the shared store a ``calibrate`` verdict's command takes."""
     if isinstance(machine, dict):
         return machine, machine
     args, env = one["args"], one["env"]
@@ -439,7 +443,8 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
         args = _or_refused(drive_run.side_args, side, args, drive_run.SIMULATED)
         if isinstance(args, dict):
             return args, args
-        env = {"AITER_LOG_LEVEL": os.environ.get("AITER_LOG_LEVEL", "WARNING")} | env
+        env = {"AITER_LOG_LEVEL": os.environ.get("AITER_LOG_LEVEL", "")} | env
+        env |= drive_run.side_env(env)
     instance = (tuple(args), tuple(env.items()))
     if (store.root, *instance) not in seen:
         with _env(env):
@@ -490,11 +495,15 @@ def _publishing(store, made, law: dict, readings: dict) -> str | None:
 
 
 def _resolved(args, arch: str):
-    """`drive_run._config` of ATOM's arguments `args` on a device of `arch`,
-    once `runfile._engine_args` reads them here: a value ATOM's parser rejects
-    raises its error, where the child that resolves them would exit this
-    process. A configuration ATOM refuses with an assertion or a type error,
-    besides a value error, raises its exception line as a value error."""
+    """ATOM's config of its arguments `args` on a device of `arch`, resolved
+    as `drive_run._config` resolves it, in a child that hands back what it
+    raises as text (`_resolving`), once `runfile._engine_args` reads them
+    here: a value ATOM's parser rejects raises its error, where the child
+    would exit. A refusal raises as a value error; Compass's own defect as a
+    runtime error holding the child's traceback, which no verdict records."""
+    from transformers.dynamic_module_utils import init_hf_modules
+
+    from atom.compass.bench import ops
     from atom.utils.arg_parser import FlexibleArgumentParser
 
     class Refusing(FlexibleArgumentParser):
@@ -502,11 +511,32 @@ def _resolved(args, arch: str):
             raise ValueError(f"ATOM's parser: {message}")
 
     runfile._engine_args(args, Refusing)
+    # As `drive_run._config`: the child writes a model's remote code to
+    # transformers' module cache, whose config classes then load here.
+    init_hf_modules()
+    config, raised, said = ops._child(_resolving, drive_run._declared, args, arch)
+    if raised == "defect":
+        raise RuntimeError(f"Compass's own code raised resolving {args}:\n{said}")
+    if raised:
+        raise ValueError(said)
+    return config
+
+
+def _resolving(declared, args, arch: str) -> tuple:
+    """In the child: `declared(args, arch)`, else what it raised as text, which
+    always unpickles: ``refused`` with its exception line, ATOM's, or with its
+    message, a refusal Compass raises; ``defect`` with its traceback, anything
+    else raised in Compass's own code, its innermost frame under `OWN`."""
     try:
-        return drive_run._config(args, arch)
-    except (AssertionError, TypeError) as error:
-        said = traceback.format_exception_only(error)[-1].strip()
-        raise ValueError(f"ATOM's config: {said}") from error
+        return declared(args, arch), None, None
+    except BaseException as error:  # noqa: BLE001 - each handed back as text
+        *_, inner = traceback.extract_tb(error.__traceback__)
+        if not Path(inner.filename).resolve().is_relative_to(OWN):
+            said = traceback.format_exception_only(error)[-1].strip()
+            return None, "refused", f"ATOM's config: {said}"
+        if isinstance(error, REFUSALS):
+            return None, "refused", str(error)
+        return None, "defect", "".join(traceback.format_exception(error))
 
 
 def _or_refused(call, *args):

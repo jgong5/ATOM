@@ -438,6 +438,11 @@ def test_a_json_error_no_reader_names_keeps_its_traceback(
         runpy.run_module(command, run_name="__main__")
 
 
+def _run_dirs(cell) -> list:
+    """`cell`'s runs, without the grades grading keeps beside them."""
+    return sorted(d for d in cell.iterdir() if d.is_dir())
+
+
 def _as_recorded(cell, warmup=()):
     """Lay `cell`'s runs out as `record` and `run` write them: each request
     named at its last prefill row, by key `k<id>` and response id `id-<id>`;
@@ -447,7 +452,7 @@ def _as_recorded(cell, warmup=()):
     client; and run.json's identity,
     with `run`'s grading entries for `step_linear/`, its law and host laws in
     its run file and its refusals its summary's."""
-    for d in sorted(cell.iterdir()):
+    for d in _run_dirs(cell):
         path = d / "steps" / "dp0.jsonl"
         lines = [json.loads(x) for x in path.read_text().splitlines()]
         last = {}
@@ -572,7 +577,7 @@ def test_a_cctraces_sim_run_still_finishing_refuses_naming_it(
     once its server has left."""
     _rows(capsys, tmp_path)
     cell = tmp_path / "c4"
-    stated = {d: (d / "run.json").read_text() for d in cell.iterdir()}
+    stated = {d: (d / "run.json").read_text() for d in _run_dirs(cell)}
     _as_recorded(cell)
     for d, run in stated.items():
         (d / "run.json").write_text(run)
@@ -582,7 +587,7 @@ def test_a_cctraces_sim_run_still_finishing_refuses_naming_it(
     validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
     done = subprocess.run(validate, capture_output=True, text=True, check=False)
 
-    held = sorted(str(d) for d in cell.iterdir() if d.name != finishing)
+    held = sorted(str(d) for d in _run_dirs(cell) if d.name != finishing)
     refusal = (
         f"['{cell / finishing}'] hold no {CLIENT_RUN} and {held} do; "
         "a cctraces_sim.sh run still finishing is not graded\n"
@@ -788,7 +793,7 @@ def _deploy(cell):
     run's engine hand-in as each side's; their requests named as
     `_named_as_deployed` names them."""
     laws = [LAW | {"engine_config": {"enable_tbo": tbo}} for tbo in (True, False)]
-    for d in sorted(cell.iterdir()):
+    for d in _run_dirs(cell):
         for side, tbo in zip(SIDES, (True, False)):
             shutil.copytree(d / "steps", d / side / "steps")
             for name in ("run.json", "server.log"):

@@ -58,6 +58,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.step_linear_plan import records, scheduled_rungs
 from atom.compass.drive import runfile, serve
+from atom.compass.memory.readings import PAGE_BOUND
 from atom.compass.run import OP_GRAPH, PRICE_LIST, STEP_GRID, STEP_LINEAR
 from atom.compass.runner.overrides import schedulable_bound, schedulable_ladder
 from atom.compass.spec import SpecRefusal
@@ -195,7 +196,9 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
         and met(grid, made, step_grid.load, run[STEP_GRID], config, machine)
     )
     made = measure_memory(args.store, real or atom_args, env)
-    met("memory readings", made, memory.load, run["store"], config, machine, 0)
+    read = met("memory readings", made, memory.load, run["store"], config, machine, 0)
+    if read and (why := stale_page_bound(read, config)):
+        lacks.append(("memory readings", "stale", why, made))
 
     if getattr(args, OP_GRAPH):
         run[OP_GRAPH], key = True, runfile._price_list_key(atom_args, machine)
@@ -231,6 +234,26 @@ def measure_memory(store, atom_args, env=None) -> str:
     arguments `atom_args` into `store`, run under the variables `env`."""
     made = MADE_BY["memory readings"].format(store=store, atom=shlex.join(atom_args))
     return " ".join([*(f"{k}={shlex.quote(v)}" for k, v in (env or {}).items()), made])
+
+
+def stale_page_bound(read, config) -> str | None:
+    """Why the memory readings `read` are stale for a start of `config`: it
+    reads the PAGE bound (`_reads_page_bound`), and they state none; else
+    None."""
+    if PAGE_BOUND in read.values or not _reads_page_bound(config):
+        return None
+    return f"{read.source} states no {PAGE_BOUND}, which an fp4 V4.1 start reads"
+
+
+def _reads_page_bound(config) -> bool:
+    """Whether a start of `config` sizes by what `memory_allocated` answers on
+    its device: DeepSeek-V4.1's builder under --index-cache-dtype fp4."""
+    from atom.utils import get_hf_text_config
+    from atom.utils.selector import Family, attn_family
+
+    if getattr(config, "index_cache_dtype", None) != "fp4":
+        return False
+    return attn_family(get_hf_text_config(config.hf_config)) is Family.CSA2
 
 
 def _state(refused) -> str:

@@ -180,6 +180,35 @@ def test_a_dp_record_missing_a_rank_s_histogram_refuses_by_name(monkeypatch, tmp
         )
 
 
+def test_a_record_wider_than_the_run_gives_the_rates_of_the_run_s_ranks_alone(
+    monkeypatch, tmp_path
+):
+    steps = tmp_path / "record" / serve.STEPS
+    steps.mkdir(parents=True)
+    for rank, accepted in ((0, 1), (1, 0)):
+        held = {"draft_tokens": 1, "distribution": {str(accepted): 10}}
+        (steps / compass_run.ACCEPTANCE_FILE.format(rank)).write_text(json.dumps(held))
+
+    atom_args, _ = started(
+        monkeypatch, tmp_path, "--acceptance-record", str(steps.parent), atom=mtp(1)
+    )
+
+    rates = runfile._engine_args(atom_args).spec_decode_acceptance_rates
+    print("rates:", rates)
+    assert rates == [1.0]
+
+
+def test_a_record_of_ranks_the_run_lacks_alone_refuses_naming_its_missing_rank(
+    monkeypatch, tmp_path
+):
+    record, *_ = recorded(monkeypatch, tmp_path, [0.7], rank=1)
+    monkeypatch.setattr(serve, "serve", unstarted)
+    given = ["--step-stub", stub(tmp_path), "--acceptance-record", str(record)]
+
+    with pytest.raises(ValueError, match="holds no dp0.acceptance.json, and ATOM's"):
+        drive_run.main(flags(tmp_path, *given, atom=mtp(1)))
+
+
 def test_a_histogram_write_that_raises_still_hands_sigterm_to_atom(
     monkeypatch, tmp_path
 ):

@@ -155,9 +155,10 @@ def population_steps(names, tbo=False, drafters=False):
     its group's ranks ran the step as a dummy forward (`group_dummies`). A
     decode step verifies
     as many drafts in each row as its shortest row does. Under two-batch
-    overlap (`tbo`, ATOM's `enable_tbo`) a DP step the group split, by the
-    rule `validate.bound` agrees over every rank's line at that step
-    (`bound._split`), is its two micro-batches (`step_roofline.micro_batches`),
+    overlap (`tbo`, ATOM's `enable_tbo`) a step its ranks split, one rank
+    included, by the rule `validate.bound` agrees over every rank's line at
+    that step (`bound._split`), is its two micro-batches
+    (`step_roofline.micro_batches`),
     each a prefill at its own tokens and the group's rows of it, marked a
     micro-batch (`forward.Shape`), its line holding its own rows. With
     `drafters`, a drafter's shape follows it where they differ: a decode's
@@ -188,8 +189,7 @@ def population_steps(names, tbo=False, drafters=False):
                 continue
             line["group_dummies"] = dummies[line["step"]]
             rows = [(row[0], row[2]) for row in line["rows"]]
-            dp_step = line.get("moe_rows") is not None
-            split = splits.get(line["step"]) if dp_step else None
+            split = splits.get(line["step"])
             try:
                 drafts = min(q for q, _ in rows) - 1
                 phase, tokens, seqs = step_shape(rows, line["rung"], drafts)
