@@ -1,0 +1,17 @@
+arm | concurrency | run | metric | value | verdict
+C | 1 | step_linear | throughput per GPU (tok/s/GPU) | simulated 9467; real mean 9403, band 9398 to 9412 (-0.05% to +0.10%); off mean +0.68%, limit 5% | pass: within 5% of mean
+C | 1 | step_linear | p90 interactivity (tok/s/user) | simulated 251; real mean 253.7, band 253.3 to 254.4 (-0.18% to +0.24%); off mean -1.07%, limit 5% | pass: within 5% of mean
+C | 1 | step_linear | p90 TTFT (s) | simulated 0.9052; real mean 1.044, band 1.027 to 1.054 (-1.62% to +1.03%); off mean -13.25%, limit 10% | fail
+C | 1 | step_linear | median TPOT (ms) | simulated 3.722; real mean 3.697, band 3.692 to 3.705 (-0.13% to +0.24%); off mean +0.69%, limit 5% | pass: within 5% of mean
+C | 1 | step_linear | GPU hit rate | simulated 97.49%; real mean 97.48%, band 97.47% to 97.49%; off mean 0.01 points, limit 2 points | pass: in band
+C | 1 | step_linear | CPU hit rate | simulated 0.00%; real mean 0.00%, band 0.00% to 0.00%; off mean 0.00 points, limit 2 points | pass: in band
+C | 1 | step_linear | p90 E2E-normalized interactivity (tok/s/user) | simulated 114.7; real mean 111.2, band 109.1 to 112.3 | not judged
+C | 1 | step_linear | point | 3 real runs | fail: p90 TTFT
+C | 2 | step_linear | throughput per GPU (tok/s/GPU) | simulated 9867; real mean 9992, band 9710 to 1.021e+04 (-2.82% to +2.19%); off mean -1.25%, limit 5% | pass: in band
+C | 2 | step_linear | p90 interactivity (tok/s/user) | simulated 221.5; real mean 224, band 222.4 to 225.5 (-0.72% to +0.67%); off mean -1.12%, limit 5% | pass: within 5% of mean
+C | 2 | step_linear | p90 TTFT (s) | simulated 0.8152; real mean 0.9068, band 0.8705 to 0.9332 (-4.00% to +2.91%); off mean -10.10%, limit 10% | fail
+C | 2 | step_linear | median TPOT (ms) | simulated 3.775; real mean 3.706, band 3.687 to 3.728 (-0.51% to +0.60%); off mean +1.87%, limit 5% | pass: within 5% of mean
+C | 2 | step_linear | GPU hit rate | simulated 96.64%; real mean 96.64%, band 96.59% to 96.67%; off mean 0.01 points, limit 2 points | pass: in band
+C | 2 | step_linear | CPU hit rate | simulated 0.00%; real mean 0.00%, band 0.00% to 0.00%; off mean 0.00 points, limit 2 points | pass: in band
+C | 2 | step_linear | p90 E2E-normalized interactivity (tok/s/user) | simulated 118.5; real mean 116, band 113.7 to 119.1 | not judged
+C | 2 | step_linear | point | 3 real runs | fail: p90 TTFT
