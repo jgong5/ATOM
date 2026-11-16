@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""The torch cache cap a runner sets when its startup ends.
+"""The torch cache cap a runner sets once its graph capture ends.
 
 The cap (`atom/model_engine/torch_cache_cap.py`) is read off a stand-in for
 `torch.cuda` holding planted readings, so these run with no device. Where the
@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from atom.model_engine.torch_cache_cap import (
+    CARD_MARGIN,
     GIB,
     TorchCacheCap,
     cap_torch_cache,
@@ -24,7 +25,6 @@ from atom.model_engine.torch_cache_cap import (
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 ENGINE = REPO / "atom" / "model_engine"
-MARGIN = 0.02
 # DeepSeek-V4.1-Flash DEP2's Post-init memory on MI355X: torch reserved
 # 238.19 GB with 34.54 GB free on a 287.98 GB card.
 CARD = int(287.98 * GIB)
@@ -70,26 +70,26 @@ def test_the_cap_is_what_torch_holds_plus_what_is_free_less_the_margin(
 ):
     monkeypatch.delenv("ATOM_TORCH_CACHE_CAP", raising=False)
     cuda = Cuda()
-    cap = cap_torch_cache("cuda:1", MARGIN, "runner", cuda)
-    want = HELD + FREE - int(CARD * MARGIN)
+    cap = cap_torch_cache("cuda:1", "runner", cuda=cuda)
+    want = HELD + FREE - int(CARD * CARD_MARGIN)
     assert cap.limit == want
     ((fraction, device),) = cuda.fractions
     assert device == "cuda:1"
     # torch multiplies the fraction back by the card's total.
     assert abs(int(fraction * CARD) - want) <= 1
-    # 266.97 GB of torch on this card: the card's 2% stays outside torch.
+    # 266.97 GB of torch on this card: 2% of it stays outside torch.
     assert round(want / GIB, 2) == 266.97
 
 
 def test_a_card_already_inside_the_margin_keeps_what_torch_holds():
-    assert torch_cache_limit(HELD, 1 << 30, CARD, MARGIN) == HELD
+    assert torch_cache_limit(HELD, 1 << 30, CARD, CARD_MARGIN) == HELD
 
 
 @pytest.mark.parametrize("off", ["0", "false", "False"])
 def test_ATOM_TORCH_CACHE_CAP_0_leaves_the_allocator_uncapped(monkeypatch, off):
     monkeypatch.setenv("ATOM_TORCH_CACHE_CAP", off)
     cuda = Cuda()
-    assert cap_torch_cache("cuda:0", MARGIN, "runner", cuda) is None
+    assert cap_torch_cache("cuda:0", "runner", cuda=cuda) is None
     assert cuda.fractions == []
 
 
@@ -101,12 +101,12 @@ def test_the_first_free_under_the_cap_is_logged_once(caplog):
 
     cuda.retries = 1
     clock.now += 9.0
-    cap.poll()
+    cap.log_first_free()
     # Inside the interval a forward reads the clock and nothing else.
     assert cuda.stat_reads == reads and not cap.freed
 
     clock.now += 1.0
-    cap.poll()
+    cap.log_first_free()
     assert cap.freed
     freed = [r for r in caplog.records if "torch freed its cached blocks" in r.message]
     assert len(freed) == 1
@@ -114,22 +114,22 @@ def test_the_first_free_under_the_cap_is_logged_once(caplog):
     cuda.retries = 5
     for _ in range(3):
         clock.now += 10.0
-        cap.poll()
+        cap.log_first_free()
     assert len([r for r in caplog.records if "freed its cached" in r.message]) == 1
 
 
-def test_polling_reads_the_count_and_never_sets_the_cap():
+def test_checking_reads_the_count_and_never_sets_the_cap():
     cuda, clock = Cuda(), Clock()
     cap = TorchCacheCap(cuda, "cuda:0", HELD, "runner", every_s=10.0, clock=clock)
     for _ in range(50):
         clock.now += 11.0
-        cap.poll()
+        cap.log_first_free()
     assert cuda.stat_reads == 51
     assert cuda.fractions == []
 
 
-def _method(path, cls, name):
-    module = ast.parse(path.read_text())
+def _method(cls, name):
+    module = ast.parse((ENGINE / "model_runner.py").read_text())
     owner = next(
         n for n in module.body if isinstance(n, ast.ClassDef) and n.name == cls
     )
@@ -138,66 +138,33 @@ def _method(path, cls, name):
     )
 
 
-def _calls(node, attr):
+def _calls(node, name):
     return [
         n
         for n in ast.walk(node)
         if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == attr
+        and (getattr(n.func, "attr", None) or getattr(n.func, "id", None)) == name
     ]
 
 
-def _last_before_return(method):
-    """The statement of `method`'s body just before its final return."""
-    *body, last = method.body
+def test_the_cap_is_set_once_after_the_graph_pools():
+    capture = _method("ModelRunner", "capture_cudagraph")
+    *body, last = capture.body
     assert isinstance(last, ast.Return)
-    return body[-1]
+    # The statement before the return: nothing the runner allocates follows it.
+    assert _calls(body[-1], "cap_torch_cache")
+    assert ast.unparse(body[-1]).startswith("self.torch_cache_cap = ")
+    assert len(_calls(capture, "cap_torch_cache")) == 1
 
 
-def test_a_graph_runner_caps_after_its_graph_pools():
-    capture = _method(ENGINE / "model_runner.py", "ModelRunner", "capture_cudagraph")
-    last = _last_before_return(capture)
-    assert _calls(last, "_cap_torch_cache") and isinstance(last, ast.Expr)
-    assert len(_calls(capture, "_cap_torch_cache")) == 1
+def test_the_kv_pool_builder_never_caps():
+    """Compass's capture tracer builds a runner's KV pool on a fake device
+    (`atom/compass/capture/forward.py`), so a device call there breaks it."""
+    assert not _calls(_method("ModelRunner", "allocate_kv_cache"), "cap_torch_cache")
 
 
-def test_an_eager_runner_caps_after_its_kv_pool_and_only_eager():
-    allocate = _method(ENGINE / "model_runner.py", "ModelRunner", "allocate_kv_cache")
-    last = _last_before_return(allocate)
-    assert isinstance(last, ast.If) and "enforce_eager" in ast.unparse(last.test)
-    assert not last.orelse and _calls(last, "_cap_torch_cache")
-    assert len(_calls(allocate, "_cap_torch_cache")) == 1
-    pool = _calls(allocate, "_back_paged_pools")
-    assert pool and all(c.lineno < last.lineno for c in pool)
-
-
-def test_the_engine_captures_graphs_only_for_a_runner_that_did_not_cap_at_its_pool():
-    # With the eager guard above, this makes each startup cap exactly once.
-    tree = ast.parse((ENGINE / "engine_core.py").read_text())
-    parents = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
-    sites = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "call_func"
-        and n.args
-        and isinstance(n.args[0], ast.Constant)
-        and n.args[0].value == "capture_cudagraph"
-    ]
-    assert sites
-    for site in sites:
-        guards, node = [], site
-        while node in parents:
-            node = parents[node]
-            if isinstance(node, ast.If):
-                guards.append(ast.unparse(node.test))
-        assert any("not config.enforce_eager" in g for g in guards), site.lineno
-
-
-def test_a_forward_polls_the_cap_and_never_sets_it():
+def test_a_forward_logs_the_first_free_and_never_sets_the_cap():
     for cls in ("ModelRunner", "RapidServeModelRunner"):
-        forward = _method(ENGINE / "model_runner.py", cls, "forward")
-        assert _calls(forward, "poll"), cls
-        assert not _calls(forward, "_cap_torch_cache"), cls
+        forward = _method(cls, "forward")
+        assert _calls(forward, "log_first_free"), cls
+        assert not _calls(forward, "cap_torch_cache"), cls

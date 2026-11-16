@@ -20,8 +20,12 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 GIB = 1 << 30
-#: Seconds between two reads of torch's retry count by `TorchCacheCap.poll`.
-POLL_EVERY_S = 10.0
+#: Share of the card the cap keeps outside torch: room for every hardware
+#: queue's scratch and for memory allocated outside torch.
+CARD_MARGIN = 0.02
+#: Seconds between two reads of torch's retry count by
+#: `TorchCacheCap.log_first_free`.
+CHECK_EVERY_S = 10.0
 
 
 def torch_cache_limit(reserved: int, free: int, total: int, margin: float) -> int:
@@ -31,9 +35,9 @@ def torch_cache_limit(reserved: int, free: int, total: int, margin: float) -> in
 
 
 class TorchCacheCap:
-    """One device's cap. `poll` logs once, the first time torch frees its
-    cached blocks to retry an allocation (`num_alloc_retries`), reading the
-    count at most every `every_s` seconds."""
+    """One device's cap. `log_first_free` logs once, the first time torch
+    frees its cached blocks to retry an allocation (`num_alloc_retries`),
+    reading the count at most every `every_s` seconds."""
 
     def __init__(
         self,
@@ -41,7 +45,7 @@ class TorchCacheCap:
         device,
         limit: int,
         label: str,
-        every_s: float = POLL_EVERY_S,
+        every_s: float = CHECK_EVERY_S,
         clock=time.monotonic,
     ):
         self._cuda, self._device, self._label = cuda, device, label
@@ -54,7 +58,7 @@ class TorchCacheCap:
     def _read_retries(self) -> int:
         return self._cuda.memory_stats(self._device).get("num_alloc_retries", 0)
 
-    def poll(self) -> None:
+    def log_first_free(self) -> None:
         if self.freed:
             return
         now = self._clock()
@@ -75,10 +79,10 @@ class TorchCacheCap:
             )
 
 
-def cap_torch_cache(device, margin: float, label: str, cuda=torch.cuda):
+def cap_torch_cache(device, label: str, margin: float = CARD_MARGIN, cuda=torch.cuda):
     """Cap torch's cache on `device` at what it holds plus what is free now,
     less `margin` of the card (`torch_cache_limit`), and return the
-    `TorchCacheCap` to poll; None when ATOM_TORCH_CACHE_CAP is 0."""
+    `TorchCacheCap`; None when ATOM_TORCH_CACHE_CAP is 0."""
     if not envs.ATOM_TORCH_CACHE_CAP:
         logger.info("%s: torch cache uncapped (ATOM_TORCH_CACHE_CAP=0)", label)
         return None

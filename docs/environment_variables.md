@@ -123,7 +123,7 @@ cannot affect a server that does not use the feature.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_TORCH_CACHE_CAP** | bool | `1` | Cap each runner's torch cache when its startup ends (after the KV pool and graph capture): it may reserve what it then holds plus what is free on the card, less the KV budget's 2% safety margin. Past the cap torch frees its cached blocks and retries instead of growing to the card's ceiling, where ROCr takes back the hardware queues' scratch and a spilling grid-barrier kernel (MoRI's EP combine) can wait for blocks that never start. The runner logs the cap at startup and the first time torch frees its cache under it. `0` leaves the cache uncapped. |
+| **ATOM_TORCH_CACHE_CAP** | bool | `1` | Cap each runner's torch cache when its graph capture ends, the last of its startup allocations: it may reserve what it then holds plus what is free on the card, less 2% of the card. Past the cap torch frees its cached blocks and retries instead of growing to the card's ceiling, where ROCr takes back the hardware queues' scratch and a spilling grid-barrier kernel (MoRI's EP combine) can wait for blocks that never start. The runner logs the cap and the first time torch frees its cache under it. A runner that captures no graph (`--enforce-eager`) is not capped. `0` leaves the cache uncapped. |
 
 ## Plugin mode
 

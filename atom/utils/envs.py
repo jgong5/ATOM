@@ -831,8 +831,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         in ("1", "true")
     ),
     # --- Device memory ---
-    # Cap the torch cache once the runner's startup ends, at what it then holds
-    # plus what is free, less the KV budget's safety margin
+    # Cap the torch cache once the runner's graph capture ends, at what it then
+    # holds plus what is free, less 2% of the card
     # (`atom/model_engine/torch_cache_cap.py`). 0 leaves it uncapped.
     "ATOM_TORCH_CACHE_CAP": lambda: (
         os.getenv("ATOM_TORCH_CACHE_CAP", "1").lower() not in ("0", "false")
