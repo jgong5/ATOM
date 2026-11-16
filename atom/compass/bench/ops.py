@@ -1726,9 +1726,10 @@ class Stub:
                 # ponytail: routed expert ids and an object's activations are
                 # drawn a copy each yet count once a cold copy here; split them
                 # out when a leaf with more instances than cold copies holds one
+                cols = _columns(op["args"])
                 acts = sum(
-                    _span(s["shape"], s["stride"]) * _dtype(s["dtype"]).itemsize
-                    for _, s in _specs(op["args"])
+                    _extent(p, s, cols)
+                    for p, s in _specs(op["args"])
                     if s["role"] == "activation"
                 )
                 record["footprint_bytes"] = (
@@ -1765,9 +1766,10 @@ class Stub:
         pos = op["args"].get("positions")
         pos = pos.get("shape") if isinstance(pos, dict) else None
         rope = pos[-1] if pos else tokens or rows  # a RoPE table's rows
+        cols = _columns(op["args"])
         for slot, s in _specs(op["args"]):
             itemsize = _dtype(s["dtype"]).itemsize
-            nbytes = _span(s["shape"], s["stride"]) * itemsize
+            nbytes = _extent(slot, s, cols)
             if s["role"] == "weight" and (slot in TABLES or slot == table):
                 read = rope
                 if slot == table:  # a row an id
@@ -2048,6 +2050,7 @@ class Stub:
         fresh = c >= len(self.placed) * len(instances)
         table, ids = GATHERED.get(op["op"], (None, None))
         drafted = op.get("drafted", False)
+        cols, buffers = _columns(op["args"]), {}
 
         seq = tuple if ":" in op["op"] else list  # a lifted call's, as ATOM's
 
@@ -2086,6 +2089,17 @@ class Stub:
                 and (sig, path) not in meta  # one the placement wrote
             ):
                 return old
+            if path in cols and (sig, path) not in meta:
+                # the copy's one buffer of rows, its columns drawn as apart
+                (n, width), stride = value["shape"], value["stride"]
+                device = self.runner.device
+                if (n, stride[0]) not in buffers:
+                    buffers[n, stride[0]] = torch.empty(
+                        n * stride[0], dtype=torch.uint8, device=device
+                    )
+                drawn = _random({**value, "stride": [width, 1]}, device)
+                view = buffers[n, stride[0]].as_strided((n, width), stride, cols[path])
+                return view.copy_(drawn.view(torch.uint8)).view(drawn.dtype)
             if path == "workspace" and op["op"] in TOPK_WORKSPACE:
                 if sig in self.unplanned:  # its size query raised at planning
                     raise self.unplanned[sig]
@@ -2766,6 +2780,33 @@ def _whole(shape, stride) -> int:
     rows; past the span of one of some of each row's columns (`_kv`)."""
     cut = _widest(shape, stride)
     return shape[cut] * stride[cut] if len(shape) else 1
+
+
+def _columns(args) -> dict[str, int]:
+    """The column of each of a leaf's two one-byte 2-D activations of the same
+    rows and row stride whose widths fill it: one buffer's rows, the wider
+    from column 0, the other past it, as ATOM passes V4.1's FP8 extend values
+    and scales (`rope_quant_window`)."""
+    rows = defaultdict(list)
+    for path, s in _specs(args):
+        shape, stride = s["shape"], s["stride"]
+        one = s["role"] == "activation" and _dtype(s["dtype"]).itemsize == 1
+        if one and len(shape) == 2 and stride[1] == 1:
+            rows[shape[0], stride[0]].append((shape[1], path))
+    cols = {}
+    for (_, stride), pair in rows.items():
+        if len(pair) == 2 and sum(w for w, _ in pair) == stride:
+            (width, wide), (_, narrow) = sorted(pair, reverse=True)
+            cols |= {wide: 0, narrow: width}
+    return cols
+
+
+def _extent(path, spec, cols) -> int:
+    """Bytes the view at `path` reaches, or, one of `cols` (`_columns`), its
+    rows' own columns: the two count their buffer's rows once."""
+    if path in cols:
+        return spec["shape"][0] * spec["shape"][1]
+    return _span(spec["shape"], spec["stride"]) * _dtype(spec["dtype"]).itemsize
 
 
 def _widest(shape, stride) -> int:

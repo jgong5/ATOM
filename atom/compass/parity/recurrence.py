@@ -21,6 +21,8 @@ and a decode's `d_gap_ns` is the work queued ahead of its launch
 exit predicted for the one before, so only the waits and device times move it.
 A record that stamps its read of its own draft ids (`t_draft_read_ns`), its draft copy
 wait, leaves each output forward no earlier than its device end; one stamping none keeps that read in `W_post`.
+Such a forward's draft is that read: its host queued the draft before it, and `W_post`
+holds the host's time up to it, the draft's preparation included.
 A pipeline record is gated step by step, each stage charged with the predicted
 times of the others (`pipeline`), its sends priced on a machine spec's PP
 carriers when one is given:
@@ -249,7 +251,9 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
             target += s.get("d_draft_kv_ns", 0)  # it precedes forward_done_event
         own = gap + target - s.get("d_recv_ns", 0)  # the receive is a wait, not work
         draft = busy - target
-        if s["step"] in waited:  # the rest holds the device's wait for the host
+        if "t_draft_read_ns" in s:  # the read, after its host queued it in W_post
+            draft = d1 - d0
+        elif s["step"] in waited:  # the rest holds the device's wait for the host
             if "d_propose_ns" not in s:
                 raise ValueError(
                     f"step {s['step']}'s device reached its propose pass before "

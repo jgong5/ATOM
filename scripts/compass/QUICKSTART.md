@@ -315,6 +315,21 @@ Each prints its token last, `published step_linear_law(...) as <token>` and
 there refuses every step it prices. `fit host` takes no trace run: a trace run's
 host segments ran under the profiler.
 
+**Steps 1, 2 and 4 in one command.** `calibrate.sh` takes a warm record, the
+readings, the records and both fits, publishing into `STORE`, and resumes a
+stopped run without taking a finished step again; its variables are in its
+header. In the background, so it outlives the shell:
+
+```bash
+setsid nohup env STORE=$R/store GPU=$G AIPERF_PYTHON=$REAL_PY $T/scripts/compass/calibrate.sh \
+  $R/calibration 1 4 16 'trace 16' 'trace 4' > $R/calibration.log 2>&1 < /dev/null &
+```
+
+`$R/calibration/status` holds each step's start, its end with its wall seconds, or its
+failure with its reason. Its end prints the tokens to take as `LAW` and `HOST`,
+each step's wall seconds and the node-hours. Run it again to resume one that
+failed.
+
 **5. Simulated runs** (CPU, 2 to 4 min per concurrency).
 
 ```bash

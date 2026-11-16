@@ -42,8 +42,9 @@ parallelism, propagates. `readings` gives the config's memory readings in a
 store `reuse`, or `measure` where none is at their key or the one there was
 measured at another ATOM digest (requirement 1), or where it lacks the PAGE
 bound a start of the config reads, which `compass run --check` finds stale
-(`lacking.stale_page_bound`, requirement 2). `stores` orders the stores a
-candidate is looked up in.
+(`lacking.stale_page_bound`, requirement 2), ``held`` saying whether readings
+are at their key, since the store refuses a second publish there. `stores`
+orders the stores a candidate is looked up in.
 """
 
 import json
@@ -210,9 +211,9 @@ def readings(store: ArtifactStore, config, machine) -> dict:
             stale and AXIS.findall(str(refused)) == [str(Axis.ATOM_SRC)]
         ):
             raise
-        return _verdict("measure", 1, str(refused))
+        return _verdict("measure", 1, str(refused), held=stale)
     if why := stale_page_bound(read, config):
-        return _verdict("measure", 2, why)
+        return _verdict("measure", 2, why, held=True)
     return _verdict("reuse", None, f"at their key in {store.root}")
 
 
