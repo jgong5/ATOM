@@ -40,7 +40,7 @@ candidate's point whose readings a verdict sends to measure is ``missing
 readings``, with its command. Each other point starts with no traffic, as the
 search will run it, for what only a start shows, in the directory the check
 resolved its arguments in: `compass run`, or `deploy.sh
-run` on 1P1D with no router arguments, its decode side through a local
+run` on 1P1D with `ROUTER`'s router arguments, its decode side through a local
 ``--on`` prefix carrying its own variables where SPACE names a network. A
 point answers once the start's ``server.json`` names it, and is
 ``searchable``; a start that leaves first, or does not answer in `START_S`,
@@ -51,6 +51,7 @@ measured.
 
 import contextlib
 import functools
+import itertools
 import json
 import os
 import shutil
@@ -83,6 +84,17 @@ COMPASS, DEPLOY = (
 #: Seconds a start has to answer, and its stop to leave: deploy.sh's default
 #: wait for each of its instances and its router.
 START_S = 3 * 600
+#: The router arguments of a 1P1D start: ATOM's adapter, which asks the
+#: prefill side for the KV transfer the decode side takes, where the router's
+#: default is SGLang's; and none of the wall-clock failure detectors, which
+#: `deploy.sh run` leaves its caller to switch off.
+ROUTER = (
+    "--backend",
+    "atom",
+    "--disable-health-check",
+    "--disable-circuit-breaker",
+    "--disable-retries",
+)
 
 
 def check(expansion: dict, out: Path) -> dict:
@@ -212,6 +224,18 @@ def _start(machine, candidate, point, verdicts, store, at: Path) -> str | None:
     """Start `point` of `candidate` with no traffic, on `machine` from `store`
     under the laws its `verdicts` name, into `at`: None once it answers, else
     why not."""
+    try:
+        command, env = serving(machine, candidate, point, verdicts, store, at)
+    except ValueError as refused:
+        return str(refused)
+    return _started(command, env, at)
+
+
+def serving(machine, candidate, point, verdicts, store, at: Path) -> tuple[list, dict]:
+    """The command that serves `point` of `candidate` on `machine` from
+    `store`, under the laws its `verdicts` name, into `at`, and the variables
+    it runs under: `compass run`, or `deploy.sh run` on 1P1D. A ValueError
+    says why `deploy.sh` cannot start a 1P1D point."""
     flags = ["--device", machine["device"], "--ptl", machine["ptl"], "--store", store]
     flags += ["--stack", machine["stack"]] if machine.get("stack") else []
     for flag, i in (("--step-linear", 0), ("--host-laws", 1)):
@@ -220,13 +244,12 @@ def _start(machine, candidate, point, verdicts, store, at: Path) -> str | None:
     sides = point["instances"]
     if candidate["deployment"] == "single":
         (one,) = sides.values()
-        command = [COMPASS, "run", *flags, "--out", at, "--", *one["args"]]
-        return _started(command, one["env"], at)
+        return [COMPASS, "run", *flags, "--out", at, "--", *one["args"]], one["env"]
     prefill, decode = sides["prefill"]["env"], sides["decode"]["env"]
     words = [w for k in prefill if k not in decode for w in ("-u", k)]
     words += [f"{k}={v}" for k, v in decode.items() if prefill.get(k) != v]
     if spaced := [w for w in words if len(w.split()) != 1]:
-        return (
+        raise ValueError(
             "deploy.sh takes the decode side's own variables as one --on prefix "
             f"split on whitespace, and {', '.join(spaced)} holds whitespace"
         )
@@ -235,14 +258,26 @@ def _start(machine, candidate, point, verdicts, store, at: Path) -> str | None:
         # A local prefix starts the decode apart, so the KV link is inter_node.
         flags, on = flags + ["--network", network], ["--on", " ".join(["env", *words])]
     elif words:
-        return (
+        raise ValueError(
             "deploy.sh starts both sides of a deployment on one node under one "
             f"environment, and the decode side's differs from the prefill side's "
             f"by {' '.join(words)}"
         )
     command = [DEPLOY, at, "run", *flags, "--prefill", "--", *sides["prefill"]["args"]]
-    command += ["--decode", *on, "--", *sides["decode"]["args"], "--router", "--"]
-    return _started(command, prefill, at)
+    command += ["--decode", *on, "--", *sides["decode"]["args"]]
+    return command + ["--router", "--", *ROUTER], prefill
+
+
+def launched(command: list, env: dict, at: Path, until) -> "Command":
+    """`command` under `env`, run into `at` afresh, its output beside it in
+    ``<at>.log``, and waited for until it leaves, the ``server.json`` it
+    writes in `at` names its server, or `until()` holds, at most `START_S`."""
+    shutil.rmtree(at, ignore_errors=True)
+    at.parent.mkdir(parents=True, exist_ok=True)
+    server = Command(command, env, at.with_name(at.name + ".log"))
+    ready = at / serve.READY_FILE
+    server.wait(int(START_S / serve.POLL_S), lambda: ready.is_file() or until())
+    return server
 
 
 def _started(command: list, env: dict, at: Path) -> str | None:
@@ -250,34 +285,64 @@ def _started(command: list, env: dict, at: Path) -> str | None:
     names its server, then stop it with SIGTERM, as each is stopped: None.
     When it leaves first or does not answer in `START_S`, its last line and
     the first error raised in each log under `at`."""
-    shutil.rmtree(at, ignore_errors=True)
-    at.parent.mkdir(parents=True, exist_ok=True)
-    log = at.with_name(at.name + ".log")
-    with log.open("w") as written:
-        server = subprocess.Popen(
-            list(map(str, command)),
-            stdout=written,
-            stderr=subprocess.STDOUT,
-            env=os.environ | env,
-            start_new_session=True,
-        )
+    server = launched(command, env, at, lambda: False)
     ready = at / serve.READY_FILE
-    for _ in range(int(START_S / serve.POLL_S)):
-        if server.poll() is not None or ready.is_file():
-            break
-        time.sleep(serve.POLL_S)
-    answered, left = ready.is_file(), server.poll() is not None
-    server.terminate()
-    try:
-        server.wait(START_S)
-    except subprocess.TimeoutExpired:
-        os.killpg(server.pid, signal.SIGKILL)
-        server.wait()
+    answered, left = ready.is_file(), server.left()
+    server.end()
     if answered:
         return None
     said = [] if left else [f"no {ready} in {START_S} s"]
-    said += [_said(log, last=True), *(_said(p) for p in sorted(at.rglob("*.log")))]
+    said += [_said(server.log, last=True)]
+    said += [_said(p) for p in sorted(at.rglob("*.log"))]
     return "; ".join(dict.fromkeys(filter(None, said)))
+
+
+class Command:
+    """A command in a process group of its own, run in the caller's directory
+    under this process's environment and `env`, its output in `log`; once
+    reaped, its exit ``status`` and the CPU seconds it and the processes it
+    waited for took."""
+
+    def __init__(self, command: list, env: dict, log: Path):
+        self.log = log
+        with log.open("w") as written:
+            self.process = subprocess.Popen(
+                list(map(str, command)),
+                stdout=written,
+                stderr=subprocess.STDOUT,
+                env=os.environ | env,
+                start_new_session=True,
+            )
+        self.status, self.cpu_s = None, 0.0
+
+    def left(self) -> bool:
+        """Whether it has exited, reaped here for its status and CPU seconds."""
+        if self.status is None:
+            pid, status, usage = os.wait4(self.process.pid, os.WNOHANG)
+            if pid:
+                self.status = os.waitstatus_to_exitcode(status)
+                self.process.returncode = self.status
+                self.cpu_s = usage.ru_utime + usage.ru_stime
+        return self.status is not None
+
+    def wait(self, polls: int | None, until) -> None:
+        """Until it exits or `until()` holds, for at most `polls` polls, or
+        with no bound when None."""
+        for _ in itertools.count() if polls is None else range(polls):
+            if self.left() or until():
+                return
+            time.sleep(serve.POLL_S)
+
+    def end(self) -> None:
+        """Stop it with SIGTERM; SIGKILL its group after `START_S`; and reap
+        it."""
+        # Not Popen's own signalling: its poll would reap the process first.
+        if not self.left():
+            os.kill(self.process.pid, signal.SIGTERM)
+            self.wait(int(START_S / serve.POLL_S), lambda: False)
+        if not self.left():
+            os.killpg(self.process.pid, signal.SIGKILL)
+            self.wait(None, lambda: False)
 
 
 def _said(log: Path, last: bool = False) -> str | None:
@@ -318,10 +383,10 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     a spec or the verdict its refusal gives, at the head's ATOM digest `atom`:
     each instance's config resolved once, under its variables, and judged once
     a store, both kept in `seen`. A 1P1D `side` takes the KV transfer config
-    `deploy.sh` adds, on the simulated connector, and runs under the
-    ``AITER_LOG_LEVEL`` the script's `compass_env` sets when unset. `made` is
-    the calibration's directory and traces a ``calibrate`` verdict's command
-    takes."""
+    `deploy.sh` adds, on the simulated connector, and runs under its variables
+    over this process's ``AITER_LOG_LEVEL``, with those the script sets over
+    them (`drive_run.side_env`). `made` is the calibration's directory and
+    traces a ``calibrate`` verdict's command takes."""
     if isinstance(machine, dict):
         return machine, machine
     args, env = one["args"], one["env"]
@@ -329,7 +394,8 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
         args = _or_refused(drive_run.side_args, side, args, drive_run.SIMULATED)
         if isinstance(args, dict):
             return args, args
-        env = {"AITER_LOG_LEVEL": os.environ.get("AITER_LOG_LEVEL", "WARNING")} | env
+        env = {"AITER_LOG_LEVEL": os.environ.get("AITER_LOG_LEVEL", "")} | env
+        env |= drive_run.side_env(env)
     instance = (tuple(args), tuple(env.items()))
     if (store.root, *instance) not in seen:
         with _env(env):
