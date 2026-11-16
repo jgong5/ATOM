@@ -932,6 +932,18 @@ rung 2, which the 1P1D prefill side reaches at c=64 ([#2878](https://github.com/
 Host keys and the fp8 indexer key as the crs005 DPA-TP8 pair's, its lone cells fp4 and its 1P1D
 cells fp8; the gap between the two is unmeasured on this pair.
 
+`scripts/compass/laws/deepseek-v4-pro-tp8-mtp3-mi355x-crs005-{prefill,decode}.json` hold host
+laws alone, one per side of [#1499](https://github.com/jgong5/ATOM/issues/1499)'s TP8 MTP3 cell
+on crsuse2-m2m-v3-005 (prefill) and -013 (decode): [#3179](https://github.com/jgong5/ATOM/issues/3179)'s
+TP8 cell with `--method mtp --num-speculative-tokens 3` on both sides, for a run whose step costs
+come from another backend, each side taking its own entry. Each is `compass fit host` on its side
+of three 1P1D `deploy.sh record` cells at c=1, 4 and 16 over traces 256 to 392, 1800 s each, every
+server started with `ROCP_TOOL_LIBRARIES` naming the blocking-call tool
+(`atom/compass/parity/README.md`), and states the `platform` its records ran on. The host key
+states the drafter (`speculative`), so a side started without it, or at another draft width,
+refuses the law. A term a side's records give none of, or that `compass fit host` does not fit,
+is the crs005 DPA8 law's of that side, copied without a refit; `provenance` names each, with why.
+
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json` is DeepSeek-V4.1-Flash's
 law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed
 experts sharded across TP and DSpark with 5 speculative tokens, on one MI455 A0 node: the
