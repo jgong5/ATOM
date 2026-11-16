@@ -11,6 +11,7 @@ fit test fits an entry on log lines written here.
 """
 
 import argparse
+import datetime
 import json
 import math
 from types import SimpleNamespace
@@ -39,6 +40,7 @@ from atom.compass.kv.lmcache_offload import (
     OffloadShell,
     Tier,
     chunk_keys,
+    watch_forwards,
 )
 from atom.compass.parity import read
 from atom.compass.runner.overrides import NonAllocatingRunner, RunnerRefusal
@@ -268,6 +270,59 @@ def test_a_saved_prefix_is_looked_up_on_every_rank_and_loaded_at_its_priced_end(
     engine.finish()
 
 
+def test_a_store_waits_out_each_prefill_forward_it_is_in_flight_for(
+    tmp_path, monkeypatch
+):
+    """Two stores on one save worker, then a decode forward, which each store
+    runs through, and a prefill forward, which each waits out: the first ends
+    the prefill's seconds late, and the second, behind it, as late."""
+    engine = Engine(tmp_path, monkeypatch)
+    shell, rt = engine.shell, engine.rt
+
+    def forward(name, batch, wait_out=False):
+        rt.advance_to(rt.now + batch.seconds)  # as `clock.charge` does
+        return SimpleNamespace(predicted_s=batch.seconds)
+
+    core = SimpleNamespace(
+        scheduler=SimpleNamespace(kv_connector=shell),
+        runner_mgr=SimpleNamespace(call_func=forward),
+    )
+    watch_forwards(core)
+    for seq in (
+        _seq("a", range(1, 4 * CHUNK + 1)),
+        _seq("b", range(99, 99 + 2 * CHUNK)),
+    ):
+        shell.update_state_after_alloc(seq)
+        seq.num_cached_tokens = len(seq.token_ids)  # its prefill has run
+    sent = rt.now
+    assert [r.req_id for r in shell.build_connector_meta().requests] == ["a", "b"]
+    decode, prefill = STORE_S[0], 4 * STEP
+    for prefills, seconds in ((0, decode), (1, prefill)):
+        batch = SimpleNamespace(total_seqs_num_prefill=prefills, seconds=seconds)
+        core.runner_mgr.call_func("forward", batch, wait_out=True)
+    a = sent + prefill + STORE_S[0] + 4 * STORE_S[1]
+    b = a + STORE_S[0] + 2 * STORE_S[1]
+    while rt.now < b + 3 * STEP:
+        engine.step()
+
+    def first_step(t):  # the steps run from where the forwards left the clock
+        return sent + decode + prefill + _at_step(t - sent - decode - prefill)
+
+    # Each store runs at the first step at or after its end, and is reported
+    # at the step after that one.
+    assert engine.reported == [
+        (pytest.approx(first_step(a) + STEP), ["a"]),
+        (pytest.approx(first_step(b) + STEP), ["b"]),
+    ]
+    assert shell.offload_statistics()["copies"]["save"] == {
+        "copies": 2,
+        "chunks": 6,
+        "seconds": pytest.approx(b - sent),
+        "waited": pytest.approx(a - sent),
+    }
+    engine.finish()
+
+
 def test_a_shell_that_has_done_nothing_reports_every_count_as_zero(
     tmp_path, monkeypatch
 ):
@@ -440,17 +495,52 @@ def test_a_chunk_stored_twice_takes_one_slot():
     assert (tier.free, tier.counts["duplicates"]) == (2, 2)
 
 
+#: A log clock this far ahead of the step record's, in ms.
+LOG_AHEAD_MS = 1_763_107_200_105
+
+
+def _logged_at(ms: int) -> str:
+    """The time `ms` after the epoch as LMCache's log stamps it."""
+    when = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    return (when + datetime.timedelta(milliseconds=ms)).strftime(
+        "%Y-%m-%d %H:%M:%S,%f"
+    )[:-3]
+
+
 def test_the_entry_is_fitted_on_the_copies_and_the_lookups_the_logs_state(tmp_path):
+    """Store n moves n chunks in 1 + 2n ms of its own, handed at second n,
+    where an odd line is a 50 ms prefill forward that it waits out, store 3
+    starting 5 ms late; an even line is a decode, which stalls no store."""
     lines = [
         f"[atom] LMCache M3 PAGE offload worker rank={r}: page_regions=301 "
         f"bytes_per_block=5056512 chunk=256 gpu_staging_chunk_bytes=10113024 "
         "gpu_staging_buffer_chunks=4"
         for r in (0, 1)
     ]
+    steps, prefill_ms = [], 0
     for n in range(1, 9):
+        enter, forward_ms = 1000 * n, 50 if n % 2 else 20
+        row = [1024, 1024, False] if n % 2 else [4, 3000, True]
+        steps.append(
+            {
+                "step": n,
+                "rows": [row],
+                "kv": [[n, "save", 0, 256 * n]],
+                "t_enter_ns": enter * 10**6,
+                "t_exit_ns": (enter + forward_ms) * 10**6,
+            }
+        )
+        start = enter + (5 if n == 3 else 0)
+        stalled = max(0, enter + forward_ms - start) if n % 2 else 0
+        prefill_ms += stalled
+        took = stalled + 1 + 2 * n
         lines.append(
-            f"[OFFLOAD-SAVE-PROF] rank=0 req=r toks={256 * n} skip=0 chunks={n} "
-            f"groups=1 total_bytes=1 total_ms={1.0 + 2.0 * n:.2f}"
+            f"\x1b[32;20m[{_logged_at(LOG_AHEAD_MS + start + took)}] LMCache INFO:"
+            f"\x1b[0m [req_id={n}] Stored {256 * n} out of total {256 * n} tokens."
+        )
+        lines.append(
+            f"[OFFLOAD-SAVE-PROF] rank=0 req={n} toks={256 * n} skip=0 chunks={n} "
+            f"groups=1 total_bytes=1 total_ms={took:.2f}"
         )
         lines.append(
             f"[OFFLOAD-LOAD-PROF] rank=0 req=r hbm=0 lmc={256 * n} retrieved=1 "
@@ -464,9 +554,14 @@ def test_the_entry_is_fitted_on_the_copies_and_the_lookups_the_logs_state(tmp_pa
             "lookup_us": counts["lookup_us"] + 300 * n + 4 * n * n,
         }
         lines.append(f"[atom] [OFFLOAD-PERF] {json.dumps(counts)} | {{}}")
-    (tmp_path / "server.log").write_text("\n".join(lines) + "\n")
+    log = tmp_path / "server.log"
+    log.write_text("\n".join(lines) + "\n")
+    (tmp_path / "steps").mkdir()
+    (tmp_path / "steps" / "dp0.jsonl").write_text(
+        "".join(json.dumps(s) + "\n" for s in steps)
+    )
 
-    entry, _ = fit_offload([tmp_path / "server.log"])
+    entry, report = fit_offload([log])
 
     print(json.dumps(entry))
     assert (entry["chunk_size"], entry["tensor_parallel_size"]) == (256, 2)
@@ -474,11 +569,24 @@ def test_the_entry_is_fitted_on_the_copies_and_the_lookups_the_logs_state(tmp_pa
     assert entry["store_s"] == pytest.approx([1e-3, 2e-3], rel=1e-6)
     assert entry["load_s"] == pytest.approx([0.5e-3, 1.5e-3], rel=1e-6)
     assert entry["lookup_s"] == pytest.approx([300e-6, 4e-6], rel=1e-6)
-    assert entry["fit"]["logs"] == [str(tmp_path / "server.log")]
+    assert entry["fit"]["logs"] == [str(log)]
+    stores = report["store_s"]
+    assert prefill_ms == 4 * 50 - 5
+    assert stores["prefill_s"] == pytest.approx(prefill_ms * 1e-3, abs=1e-9)
+    assert stores["clock_offsets_s"] == {
+        str(log): pytest.approx(LOG_AHEAD_MS * 1e-3, abs=1e-6)
+    }
     other = tmp_path / "other.log"
     other.write_text(lines[0].replace("chunk=256", "chunk=128") + "\n")
     with pytest.raises(ValueError, match="an entry is fitted on one"):
-        fit_offload([tmp_path / "server.log", other])
+        fit_offload([log, other])
+    (tmp_path / "bare").mkdir()
+    (tmp_path / "bare" / "server.log").write_text("\n".join(lines) + "\n")
+    with pytest.raises(ValueError, match="no step record at"):
+        fit_offload([tmp_path / "bare" / "server.log"])
+    log.write_text("\n".join(x for x in lines if "Stored" not in x) + "\n")
+    with pytest.raises(ValueError, match="request 1 has no LMCache Stored line"):
+        fit_offload([log])
 
 
 def test_a_client_run_counts_its_own_hits_and_copies(monkeypatch, tmp_path):

@@ -8,9 +8,10 @@
     python -m atom.compass.backends.step_linear_fit figures RECORD... --law LAW [--source NAME] [--form FORM] [--moe-routing E,K] [--engine FILE]
 
 The second form fits a run file's ``lmcache_offload`` entry, beside the law of
-an arm whose records ran the connector, on those runs' server logs
-(`fit_offload`). The third writes the held-out figures (below) of the records
-into an existing law fitted on them (`figures_main`).
+an arm whose records ran the connector, on those runs' server logs and the
+step records beside them (`fit_offload`). The third writes the held-out
+figures (below) of the records into an existing law fitted on them
+(`figures_main`).
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
@@ -190,7 +191,9 @@ on records with a host key states the ATOM digest they ran at, the key's
 from __future__ import annotations
 
 import argparse
+import collections
 import dataclasses
+import datetime
 import itertools
 import json
 import math
@@ -781,36 +784,69 @@ def fit_hops(intakes, clients) -> tuple[dict, dict]:
 OFFLOAD_WORKER = re.compile(
     r"offload worker rank=(\d+):.*? chunk=(\d+) gpu_staging_chunk_bytes=(\d+)"
 )
-#: ATOM's per-copy line under `OFFLOAD_PROFILE`: the chunks it copied and the
+#: ATOM's per-load line under `OFFLOAD_PROFILE`: the chunks it copied and the
 #: milliseconds the worker thread spent on it.
-OFFLOAD_COPY = re.compile(
-    r"\[OFFLOAD-(SAVE|LOAD)-PROF\] .*? chunks=(\d+) .*? total_ms=([\d.]+)"
+OFFLOAD_LOAD = re.compile(
+    r"\[OFFLOAD-LOAD-PROF\] .*? chunks=(\d+) .*? total_ms=([\d.]+)"
+)
+#: Its per-store line: the request, its tokens and the leading ones it skipped,
+#: the chunks it copied and the worker thread's milliseconds on it.
+OFFLOAD_SAVE = re.compile(
+    r"\[OFFLOAD-SAVE-PROF\] rank=\d+ req=(\S+) toks=(\d+) skip=(\d+) "
+    r"chunks=(\d+) .*? total_ms=([\d.]+)"
+)
+#: LMCache's line as a store returns: its wall clock to the millisecond, the
+#: request and the tokens it was asked to store.
+LMCACHE_STORED = re.compile(
+    r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3})\] LMCache INFO:.*?"
+    r"\[req_id=(\S+?)\] Stored \d+ out of total (\d+) tokens"
 )
 OFFLOAD_PERF = "[OFFLOAD-PERF] "
+#: The step record a server log's run wrote beside it.
+OFFLOAD_STEPS = Path("steps", "dp0.jsonl")
 
 
 def fit_offload(logs) -> tuple[dict, dict]:
     """The run file's ``lmcache_offload`` entry, fitted on the server logs of
-    real runs `logs`, each at `OFFLOAD_PROFILE` (`atom.compass.kv.lmcache_offload`),
-    and its report.
+    real runs `logs`, each at `OFFLOAD_PROFILE` (`atom.compass.kv.lmcache_offload`)
+    beside its step record (`OFFLOAD_STEPS`), and its report.
 
     ``chunk_size`` and ``chunk_bytes`` are what each worker logs at its start,
     and ``tensor_parallel_size`` how many workers logged; logs that differ in
     any refuse. ``store_s`` and ``load_s`` are fitted by the host-law solver on
     each copy that moved a chunk: the worker thread's seconds for it on
-    ``(1, chunks)``. ``lookup_s`` is fitted on the scheduler's counters, which
-    it logs a minute apart: per minute with a lookup, the seconds its lookups
-    took on ``(lookups, chunks)``, chunks counted as the prompt tokens they
-    asked over the chunk size. The entry's ``fit`` holds the logs and the
-    report."""
-    workers, copies, lookups = {}, {"SAVE": [], "LOAD": []}, []
+    ``(1, chunks)``, a store's less the prefill forwards it overlapped
+    (`_store_copies`). Those seconds are a fixed part of the store's price, so
+    each equation is divided by the store's whole price. ``lookup_s`` is fitted
+    on the scheduler's counters, which it logs a minute apart: per minute with
+    a lookup, the seconds its lookups took on ``(lookups, chunks)``, chunks
+    counted as the prompt tokens they asked over the chunk size. The entry's
+    ``fit`` holds the logs and the report; the report's ``store_s`` also states
+    the stores' seconds and the prefill seconds among them, and per log the
+    offset of its clock from its step record's (`_store_copies`)."""
+    workers, saves, loads, lookups = {}, {}, [], []
     for log in logs:
-        perf = []
+        perf, stored = [], collections.defaultdict(collections.deque)
+        saves[log] = []
         for line in Path(log).read_text(errors="replace").splitlines():
             if m := OFFLOAD_WORKER.search(line):
                 workers.setdefault(log, {})[int(m[1])] = (int(m[2]), int(m[3]))
-            elif (m := OFFLOAD_COPY.search(line)) and int(m[2]):
-                copies[m[1]].append((1, int(m[2]), float(m[3]) * 1e-3))
+            elif m := LMCACHE_STORED.search(line):
+                stored[m[2], int(m[3])].append(_log_ms(m[1]))
+            elif m := OFFLOAD_SAVE.search(line):
+                req, toks, skip, chunks = m[1], int(m[2]), int(m[3]), int(m[4])
+                if not chunks:
+                    continue
+                if not (ends := stored[req, toks - skip]):
+                    raise ValueError(
+                        f"{log}: a store of request {req} has no LMCache Stored "
+                        "line before it to say when it ended"
+                    )
+                saves[log].append(
+                    (req, skip, toks, chunks, float(m[5]) * 1e-3, ends.popleft())
+                )
+            elif (m := OFFLOAD_LOAD.search(line)) and int(m[1]):
+                loads.append((1, int(m[1]), float(m[2]) * 1e-3))
             elif OFFLOAD_PERF in line:
                 said = line.partition(OFFLOAD_PERF)[2].partition(" | ")[0]
                 perf.append(json.loads(said))
@@ -836,12 +872,26 @@ def fit_offload(logs) -> tuple[dict, dict]:
         "tensor_parallel_size": tp,
         "chunk_bytes": chunk_bytes,
     }
-    report = {}
-    for name, kind in (("store_s", "SAVE"), ("load_s", "LOAD")):
-        rows = np.array(copies[kind], dtype=np.float64).reshape(-1, 3)
-        entry[name], report[name] = _host_law(
-            rows[:, :2], rows[:, 2], ["fixed", "chunks"]
-        )
+    offsets, stores = {}, []
+    for log, copies in saves.items():
+        if copies:
+            offsets[str(log)], placed = _store_copies(log, copies, chunk)
+            stores.append(placed)
+    rows = np.vstack([np.empty((0, 3)), *stores])
+    x = np.column_stack([np.ones(len(rows)), rows[:, 0]])
+    entry["store_s"], fitted = _host_law(x, rows[:, 1], ["fixed", "chunks"], rows[:, 2])
+    report = {
+        "store_s": fitted
+        | {
+            "seconds": float(rows[:, 1].sum()),
+            "prefill_s": float(rows[:, 2].sum()),
+            "clock_offsets_s": offsets,
+        }
+    }
+    rows = np.array(loads, dtype=np.float64).reshape(-1, 3)
+    entry["load_s"], report["load_s"] = _host_law(
+        rows[:, :2], rows[:, 2], ["fixed", "chunks"]
+    )
     rows = np.array(lookups, dtype=np.float64).reshape(-1, 3)
     x = np.column_stack([rows[:, 0], rows[:, 1] / chunk])
     entry["lookup_s"], report["lookup_s"] = _host_law(
@@ -849,6 +899,94 @@ def fit_offload(logs) -> tuple[dict, dict]:
     )
     entry["fit"] = {"logs": [str(log) for log in logs], **report}
     return entry, report
+
+
+def _log_ms(stamp: str) -> int:
+    """A log line's wall clock in whole milliseconds, its zone read as UTC: one
+    log's offset from its step record's clock takes up the zone."""
+    when = datetime.datetime.strptime(f"{stamp} +0000", "%Y-%m-%d %H:%M:%S,%f %z")
+    epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    return (when - epoch) // datetime.timedelta(milliseconds=1)
+
+
+def _store_copies(log, copies, chunk: int) -> tuple[float, np.ndarray]:
+    """The offset of `log`'s clock from its step record's, and each store of
+    `copies`, ``(request, tokens skipped, tokens, chunks, seconds, end)`` with
+    its end in milliseconds on the log's clock (`_log_ms`), as ``(chunks,
+    seconds, prefill seconds)``: the seconds the record's prefill forwards,
+    each a line with a row that is no decode, from its ``t_enter_ns`` to its
+    ``t_exit_ns``, spent inside the store, from its seconds before its end to
+    its end.
+
+    The offset is the half-sample mode of each store's start less the
+    ``t_enter_ns`` of the line whose ``kv`` hands it, its tokens skipped taken
+    down to a whole chunk and its tokens as handed or down to one: a worker
+    free when a store is handed starts it there, a busy one later. Refuses a
+    log with no step record beside it, or none of whose stores a line hands."""
+    path = Path(log).parent / OFFLOAD_STEPS
+    if not path.is_file():
+        raise ValueError(
+            f"{log}: no step record at {path}, so its stores cannot be set "
+            "against its prefill forwards"
+        )
+    lines = [
+        s
+        for s in json_file.read_jsonl(path)
+        if "t_enter_ns" in s and not s.get("is_dummy_run")
+    ]
+    handed = {}
+    for s in lines:
+        for req, kind, skip, toks in s.get("kv", ()):
+            for whole in (toks, toks // chunk * chunk) if kind == "save" else ():
+                key = (str(req), skip // chunk * chunk, whole)
+                handed.setdefault(key, s["t_enter_ns"] * 1e-9)
+    # On the log's clock from its first end, in seconds a float holds to a
+    # nanosecond and more.
+    first = copies[0][-1]
+    _, _, _, chunks, seconds, ends = map(np.array, zip(*copies))
+    ends = (ends - first) * 1e-3
+    gaps = [
+        t - handed[c[:3]] for c, t in zip(copies, ends - seconds) if c[:3] in handed
+    ]
+    if not gaps:
+        raise ValueError(
+            f"{log}: no line of {path} hands one of its stores, so its clock "
+            "cannot be set against the record's"
+        )
+    offset = _half_sample_mode(gaps)
+    forwards = 1e-9 * np.array(
+        sorted(
+            (s["t_enter_ns"], s["t_exit_ns"])
+            for s in lines
+            if any(not decode for *_, decode in s.get("rows", ()))
+        ),
+        dtype=np.float64,
+    ).reshape(-1, 2)
+    ends = ends - offset
+    inside = np.zeros(len(copies))
+    if len(forwards):
+        # The prefill seconds before each enter and exit: forwards follow each other.
+        lengths = forwards[:, 1] - forwards[:, 0]
+        spent = np.cumsum(lengths)
+        knots, before = forwards.reshape(-1), np.column_stack([spent - lengths, spent])
+        inside = np.interp(ends, knots, before.reshape(-1)) - np.interp(
+            ends - seconds, knots, before.reshape(-1)
+        )
+    return first * 1e-3 + offset, np.column_stack([chunks, seconds, inside])
+
+
+def _half_sample_mode(values) -> float:
+    """The half-sample mode of `values` (Bickel and Fruehwirth, 2006): the
+    shortest half of them, halved until at most three remain, then the mean
+    of the two closer, or of all three when evenly spaced."""
+    x = np.sort(np.asarray(values, dtype=np.float64))
+    while len(x) > 3:
+        half = (len(x) + 1) // 2
+        i = int(np.argmin(x[half - 1 :] - x[: len(x) - half + 1]))
+        x = x[i : i + half]
+    if len(x) == 3 and x[1] - x[0] != x[2] - x[1]:
+        x = x[:2] if x[1] - x[0] < x[2] - x[1] else x[1:]
+    return float(x.mean())
 
 
 def _alone(sent, got, returned=None) -> tuple[np.ndarray, np.ndarray]:
@@ -2184,7 +2322,12 @@ def offload_main(argv) -> None:
         prog="python -m atom.compass.backends.step_linear_fit offload",
         description=fit_offload.__doc__.split("\n\n")[0],
     )
-    parser.add_argument("logs", nargs="+", help="real server logs at OFFLOAD_PROFILE")
+    parser.add_argument(
+        "logs",
+        nargs="+",
+        help="real server logs at OFFLOAD_PROFILE, each beside its run's "
+        "steps/dp0.jsonl",
+    )
     parser.add_argument("--out", required=True, help="where the entry is written")
     args = parser.parse_args(argv)
     entry, report = fit_offload(args.logs)
