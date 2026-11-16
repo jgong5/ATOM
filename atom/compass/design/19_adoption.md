@@ -621,7 +621,8 @@ search's or profiling's code.
   from the run's source tree, its panels for the run's deployment kind (`pd` when OUT holds
   `prefill/` and `decode/`, else `standalone`) over the run's series (`11` D74) from their
   first instant to their last, at CI's 5 s step and `max(60, 4 x interval)` window. Each
-  sampler's file is backfilled by promtool into one TSDB that a Prometheus with no scrape
+  sampler's file is decompressed, since promtool reads no gzip, and backfilled by promtool
+  into one TSDB that a Prometheus with no scrape
   serves to `collect_report`; both come from `collect_metrics.py::ensure_prometheus`, which takes a
   `tool` argument, reads `ATOMESH_PROMTOOL_BIN` beside `ATOMESH_PROMETHEUS_BIN`, and reuses a
   tool it extracted into the directory it is given, here `~/.cache/compass/prometheus-3.5.0`,
@@ -630,8 +631,9 @@ search's or profiling's code.
   ("Simulated agentic PD inference report", "Simulated agentic aggregated inference
   report"), its notes (the simulated clock from the run's start shown from 1970-01-01 00:00
   UTC, the GPU panels' predicted target device time on TP rank 0, any frontend or engine
-  member with no file), and the two GPU panels' label and description, which say predicted
-  (`11` D75). A deployment's Overall
+  member with no file, any family it queries that the sampler's class table lacks, `11`
+  D77), and the two GPU panels' label and description, which say predicted (`11` D75). A
+  deployment's Overall
   TTFT, the router's `mesh_router_ttft_seconds`, stays empty and the notes say why: the
   router times it on the wall clock (`atom/mesh/src/observability/ttft.rs::track_http_ttft`),
   and the client's TTFT is on `report.html`. Its data goes to `prometheus.json`, from which
