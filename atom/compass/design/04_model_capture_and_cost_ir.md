@@ -1071,11 +1071,17 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   extended to the bf16 leaf by [#3038](https://github.com/jgong5/ATOM/issues/3038)). The
   bf16 leaf is V4.1's sparse attention's operator, so `bench.ops.V4_SHARED` binds it so
   only on a step holding V4's prefill lists.
-  DeepSeek-V4.1's sparse attention (`capture.forward.V41_ATTENTION`), its index lists
-  sized as V4's, states the same three of its layer, and its indexer's scorers
+  DeepSeek-V4.1's sparse attention (`capture.forward.V41_ATTENTION`, over its FP8 pool
+  `V41_FP8_ATTENTION`), its index lists sized as V4's, states the same three of its
+  layer, and its indexer's scorers
   (`capture.forward.V41_SCORERS`: gfx1250's FlyDSL one and gfx950's Triton one) its
   `compress_ratio` and `index_candidates`, the most entries it scores where an earlier
-  layer chose its candidates, else null (#2344). Its index keys' RoPE
+  layer chose its candidates, else null (#2344), and its top-k
+  (`capture.forward.V41_TOPKS`) its `compress_ratio`: the row bounds ATOM stages for
+  it are that ratio's visible rows, which `bench.ops.V41_NAMES` binds. In a graph
+  captured before, `measure ops` takes such a top-k's ratio from a scorer in its point
+  whose logits are as wide, and refuses it by name where none is
+  ([#3321](https://github.com/jgong5/ATOM/issues/3321)). Its index keys' RoPE
   (`capture.forward.V41_ROPE`, under `Indexer.project_keys`) states their indexer's
   `compress_ratio`: their positions are that ratio's compress plan's, which
   `bench.ops.V41_NAMES` binds, and at a decode with no drafter both ratios' plans hold
@@ -1083,8 +1089,9 @@ Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecommen
   ([#3141](https://github.com/jgong5/ATOM/issues/3141)). The indexer query's RoPE, on
   the step's positions at every ratio, states none. In a graph captured before,
   `measure ops` takes a key's ratio from the one ratio's compress plan in its point
-  that holds as many rows; where none or both do, it refuses the key by name until its
-  shape is traced again ([#3235](https://github.com/jgong5/ATOM/issues/3235)).
+  that holds as many rows, in a point holding every ratio's compressor; elsewhere, or
+  where none or both do, it refuses the key by name until its shape is traced again
+  ([#3235](https://github.com/jgong5/ATOM/issues/3235), #3321).
 
 Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers,
 DeepSeek-V4's attention and V4.1's guarded ops aside, below), so its ambient reads stay

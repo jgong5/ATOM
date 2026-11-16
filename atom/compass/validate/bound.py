@@ -29,8 +29,9 @@ device's own records, the report is the error of projecting it from the other.
 
 A data-parallel step (one with `moe_rows`) is read off every rank's line at
 that step: its `moe_tokens` is the group's scheduled tokens, a dummy rank's
-one, and under `--enable-tbo` its two-batch-overlap split is the one ATOM's
-prefill rule agrees over those lines (`_split`).
+one. Under `--enable-tbo` a step's two-batch-overlap split, one rank's
+included, is the one ATOM's prefill rule agrees over its ranks' lines
+(`_split`).
 
 Gate: a step priced above its measured time is a violation, named by its
 costliest term, an op kind (`op.<kind>`) or a module kind (`roofline.<kind>`).
@@ -55,8 +56,8 @@ the plan refused to measure is counted apart.
 
 Refused: a record whose engine block (`dp<r>.engine.json`, else the `engine`
 of `dp<r>.key.json`) states another TP width or KV cache format than ATOM's
-arguments resolve; two-batch overlap of decode steps or on one rank, whose
-split no step line states; a data-parallel step some rank's record lacks; a
+arguments resolve; two-batch overlap of decode steps, whose split no step
+line states; a data-parallel step some rank's record lacks; a
 step of an MTP record without `d_target_ns`, whose `d_busy_ns` holds the
 draft, which the gate does not compare. Refused too: a record, or an `--ops`
 run, whose engine block states another performance environment (`env`) than
@@ -137,7 +138,7 @@ def steps(record, tbo=False, mtp=False):
                 draft_rows=s.get("draft_rows"),
                 target_bs=s.get("target_bs"),
                 produces_output=s["produces_output"],
-                tbo_tokens=split if dp else None,
+                tbo_tokens=split,
                 moe_tokens=group if dp else None,
             )
             measured = s.get("d_target_ns", s["d_busy_ns"])
@@ -441,7 +442,7 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
     as a simulated run's (`run.op_graph`) over the op_graphs `store` holds for
     its arch. Refused: a record, or the `measure ops` run
     `ops`, that ran under another engine or other performance variables than
-    this process's; two-batch overlap no line splits."""
+    this process's; two-batch overlap of decode steps."""
     from atom.compass.backends.step_roofline import StepRooflineBackend
     from atom.compass.run import ep_width, op_graph, step_grid
     from atom.compass.run.modules import drafter, walk
@@ -450,12 +451,10 @@ def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=N
     with tempfile.TemporaryDirectory(prefix="compass-bound-") as tmpdir:
         config, tree = _build(model, tp, atom_args, arch, tmpdir)
         drafted = drafter(config)
-    dp = config.parallel_config.data_parallel_size
-    if config.enable_tbo_decode or config.enable_tbo and dp == 1:
+    if config.enable_tbo_decode:
         raise ValueError(
-            "two-batch overlap of decode steps or on one rank: no step line "
-            "states its split, and only a data-parallel group's prefill split "
-            "is rebuilt from the group's lines"
+            "two-batch overlap of decode steps: no step line states its split, "
+            "and only a prefill split is rebuilt from the step's lines"
         )
     engines = []
     for record in records:
