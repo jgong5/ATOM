@@ -1110,6 +1110,19 @@
    "mechanism_why": "inside a transfer backend the simulator replaces; the simulated connector reproduces its write requests on the scheduler side"
   },
   {
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._write_listener::self._send_executor.submit(self._serve_write, request_data)::executor_handoff#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
+   "symbol": "MooncakeConnector._write_listener",
+   "call": "self._send_executor.submit",
+   "expr": "self._send_executor.submit(self._serve_write, request_data)",
+   "shape": "executor_handoff",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "transfer backend the simulator replaces with a priced one",
+   "mechanism": "K9",
+   "mechanism_why": ""
+  },
+  {
    "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._execute_block_slot_transfer::torch.cuda.current_stream().synchronize()::device_sync#0",
    "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
    "symbol": "MooncakeConnector._execute_block_slot_transfer",
@@ -5996,6 +6009,79 @@
    "mechanism_why": "passes its caller's collective on unchanged, so the wait is the caller's, classified at the caller's own site; in a simulated run those are the DP groups' collectives, waits inside the data-parallel group's LP"
   },
   {
+   "id": "atom/compass/advice/check.py::_started::subprocess.Popen( list(map(str, command)), stdout=written, stderr=subprocess.STDOUT, env=os.environ | env, start_new_session=True, )::thread_start#0",
+   "file": "atom/compass/advice/check.py",
+   "symbol": "_started",
+   "call": "subprocess.Popen",
+   "expr": "subprocess.Popen( list(map(str, command)), stdout=written, stderr=subprocess.STDOUT, env=os.environ | env, start_new_session=True, )",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "frontend",
+   "why": "compass advice starts one simulated server, or a 1P1D deployment, with no traffic, to see whether it comes up before a search simulates it",
+   "mechanism": "K9",
+   "mechanism_why": "starting a process cannot park; the advice command is no LP: its start serves no request, so no simulated time passes in it"
+  },
+  {
+   "id": "atom/compass/advice/check.py::_started::server.poll()::poll#0",
+   "file": "atom/compass/advice/check.py",
+   "symbol": "_started",
+   "call": "server.poll",
+   "expr": "server.poll()",
+   "shape": "poll",
+   "peer": "process",
+   "why": "compass advice asks whether a start with no traffic has left, while it waits for the start's server.json and once it stops waiting",
+   "mechanism": "K9",
+   "mechanism_why": "a process poll returns at once and cannot park; the advice command is no LP: its start serves no request, so no simulated time passes in it"
+  },
+  {
+   "id": "atom/compass/advice/check.py::_started::time.sleep(serve.POLL_S)::sleep#0",
+   "file": "atom/compass/advice/check.py",
+   "symbol": "_started",
+   "call": "time.sleep",
+   "expr": "time.sleep(serve.POLL_S)",
+   "shape": "sleep",
+   "peer": "process",
+   "why": "compass advice's half-second cadence between its checks on a start with no traffic, up to its wall bound",
+   "mechanism": "K9",
+   "mechanism_why": "the advice command is no LP: its start serves no request, so no simulated time passes in it, and the bound only decides when the start is reported as not answering"
+  },
+  {
+   "id": "atom/compass/advice/check.py::_started::server.poll()::poll#1",
+   "file": "atom/compass/advice/check.py",
+   "symbol": "_started",
+   "call": "server.poll",
+   "expr": "server.poll()",
+   "shape": "poll",
+   "peer": "process",
+   "why": "compass advice asks whether a start with no traffic has left, while it waits for the start's server.json and once it stops waiting",
+   "mechanism": "K9",
+   "mechanism_why": "a process poll returns at once and cannot park; the advice command is no LP: its start serves no request, so no simulated time passes in it"
+  },
+  {
+   "id": "atom/compass/advice/check.py::_started::server.wait(START_S)::event_wait#0",
+   "file": "atom/compass/advice/check.py",
+   "symbol": "_started",
+   "call": "server.wait",
+   "expr": "server.wait(START_S)",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "compass advice reaps a start with no traffic after SIGTERM, up to a wall bound before SIGKILL",
+   "mechanism": "K9",
+   "mechanism_why": "the start is stopping; the advice command is no LP: its start serves no request, so no simulated time passes in it"
+  },
+  {
+   "id": "atom/compass/advice/check.py::_started::server.wait()::event_wait#0",
+   "file": "atom/compass/advice/check.py",
+   "symbol": "_started",
+   "call": "server.wait",
+   "expr": "server.wait()",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "compass advice reaps a start with no traffic after it killed the start's process group",
+   "mechanism": "K9",
+   "mechanism_why": "the start has been killed; the advice command is no LP: its start serves no request, so no simulated time passes in it"
+  },
+  {
    "id": "atom/entrypoints/openai/api_server.py::_submit_engine_requests::asyncio.to_thread(engine.core_mgr.add_request, seqs)::executor_handoff#0",
    "file": "atom/entrypoints/openai/api_server.py",
    "symbol": "_submit_engine_requests",
@@ -6079,19 +6165,6 @@
    "mechanism": "K9",
    "mechanism_why": "inside a transfer backend the simulator replaces; the simulated connector prices the transfer on the scheduler side",
    "why": "a chunked send worker waits for the forward that wrote the blocks it reads"
-  },
-  {
-   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._write_listener::self._send_executor.submit(self._serve_write, request_data)::executor_handoff#0",
-   "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
-   "symbol": "MooncakeConnector._write_listener",
-   "call": "self._send_executor.submit",
-   "expr": "self._send_executor.submit(self._serve_write, request_data)",
-   "shape": "executor_handoff",
-   "category": "ignore",
-   "peer": "thread",
-   "why": "transfer backend the simulator replaces with a priced one",
-   "mechanism": "K9",
-   "mechanism_why": ""
   },
   {
    "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._write_listener::sock.poll(timeout=1000)::poll#0",
