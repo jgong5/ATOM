@@ -1216,8 +1216,8 @@ def test_a_v41_prefill_pick_widened_to_its_k_runs_the_top_k_aiter_dispatches_the
 
 def _wrapped(kernel, rows, width, k=512):
     """A stable top-k of `rows` rows aiter's decode wrapper launched on `kernel`
-    over V4.1's FP8 plane `width` wide, each row's bound the staged one."""
-    I32, plane = "torch.int32", ("logits", _t([rows, width], "metadata"))
+    over logits `width` wide, each row's bound the staged one."""
+    I32, plane = "torch.int32", ("logits", _t([rows, width], "activation"))
     ends = _t([rows], "metadata", dtype=I32)
     out = ("indices", _t([rows, k], "activation", dtype=I32))
     ints = [("stride0", width), ("stride1", 1), ("k", k), ("stable", True)]
