@@ -16,6 +16,7 @@ import signal
 import subprocess
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_deploy_sh import ROUTER_ARGS, SCRIPT, _until, planted  # noqa: F401
 from test_drive_run import stub
@@ -36,13 +37,12 @@ def built(tmp_path, record, prefill, decode) -> dict:
     """The run file `prefill_decode` builds from `deploy.sh run`'s flags with
     `record` as its acceptance record, for a prefill and a decode instance
     started with ATOM's arguments `prefill` and `decode`."""
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     parser = argparse.ArgumentParser()
     runfile.add_arguments(parser)
     parser.add_argument("--acceptance-record")
-    machine = ["--machine", str(tmp_path / "machine.json")]
-    store = ["--store", str(tmp_path / "store")]
-    flags = ["--step-stub", stub(tmp_path), *machine, *store]
+    store = tmp_path / "store"
+    platform = platforms.flags(store, DOCUMENT, tmp_path)
+    flags = ["--step-stub", stub(tmp_path), *platform, "--store", str(store)]
     args = parser.parse_args([*flags, "--acceptance-record", str(record)])
     model = ["--model", str(tmp_path)]
     return runfile.prefill_decode(
@@ -97,7 +97,6 @@ def test_a_1p1d_run_file_with_a_decode_record_gives_the_decode_its_measured_rate
     rates = runfile._engine_args(decode).spec_decode_acceptance_rates
     assert rates == pytest.approx([counts[1] / sum(counts)])
     input_ = said(monkeypatch, decode, run)
-    print("decode input:", input_)
     record_ = {"record": str(record.resolve())}
     assert input_ == {"flag": RATES, "value": rates, "method": "measured"} | record_
     stated = runfile._engine_args(prefilled).spec_decode_acceptance_rates
