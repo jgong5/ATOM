@@ -110,7 +110,7 @@ def side_args(tmp_path, monkeypatch, side) -> list[str]:
     cpu = json.loads(PAIR[side].read_text())["host"]["key"]["host_cpu"]
     monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
     tok = SimpleNamespace(is_fast=True, name_or_path=None)
-    monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *args: tok)
+    monkeypatch.setattr(llm_engine, "load_tokenizer", lambda *args: tok)
     common = ["-tp", "8", "--kv_cache_dtype", "fp8", "--enable-dp-attention"]
     return ["--model", str(model), *common, *own]
 

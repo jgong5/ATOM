@@ -313,7 +313,7 @@ def atom_config(atom_args, server: bool = False):
     from atom.compass.drive.runfile import _engine_args
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
-    from atom.model_engine.llm_engine import _load_tokenizer
+    from atom.model_engine.llm_engine import load_tokenizer
 
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
     for flag, kind in FRONTEND.items():
@@ -327,7 +327,7 @@ def atom_config(atom_args, server: bool = False):
         layout(config)
     if server:
         return config
-    tokenizer = _load_tokenizer(config.model, config.trust_remote_code)
+    tokenizer = load_tokenizer(config.model, config.trust_remote_code)
     config.bos_token_id = tokenizer.bos_token_id
     config.eos_token_id = tokenizer.eos_token_id
     config.stop_token_ids = sorted(set(config.stop_token_ids) - {config.eos_token_id})

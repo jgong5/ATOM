@@ -127,7 +127,7 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     and runs under `env`, the variables the check set, where given."""
     from atom.compass.drive import run as drive_run
     from atom.compass.run import memory, step_grid
-    from atom.model_engine.llm_engine import _load_tokenizer
+    from atom.model_engine.llm_engine import load_tokenizer
 
     lacks, apart = [], []
 
@@ -188,7 +188,7 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     ):
         given = run["host"], config, machine_platform(machine)
         met(host, made_by["host"], compass_run.refuse_unfitted_host, *given)
-        tok = _load_tokenizer(engine.model, engine.trust_remote_code)
+        tok = load_tokenizer(engine.model, engine.trust_remote_code)
         met(host, made_by["host"], compass_run.tokenizer_term, run, tok, config)
     grid, made = NAMES[STEP_GRID], MADE_BY[STEP_GRID]
     checked = STEP_GRID in run and (

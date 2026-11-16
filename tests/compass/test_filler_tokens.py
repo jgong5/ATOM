@@ -6,7 +6,7 @@ stop id; the prefix cache, which hashes generated blocks; and the stream
 detokenizer, which moves its window only past complete characters. Each run
 here drives ATOM's own `Scheduler`, `BlockManager` and
 `IncrementalStreamDetokenizer` against a byte-level BPE tokenizer that
-`_load_tokenizer` reads from a model directory, the way the frontend and the
+`load_tokenizer` reads from a model directory, the way the frontend and the
 runner both load it.
 """
 
@@ -27,7 +27,7 @@ from atom.compass.runner.overrides import (
 )
 from atom.compass.runner.step_output import DeferredTokenStream, filler_token_ids
 from atom.entrypoints.openai.streaming_dispatch import IncrementalStreamDetokenizer
-from atom.model_engine.llm_engine import _load_tokenizer
+from atom.model_engine.llm_engine import load_tokenizer
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
@@ -73,7 +73,7 @@ def model_dir(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def tokenizer(model_dir):
-    return _load_tokenizer(str(model_dir))
+    return load_tokenizer(str(model_dir))
 
 
 # Reporting is under test here, not the price.
