@@ -603,6 +603,25 @@ class HostEvent:
         pass
 
 
+class PredictedEvent:
+    """A timing event of ATOM's `GPUForwardMetrics` on a runner that runs no
+    forward, in place of the `torch.cuda.Event` its factory makes: it records
+    the runner's `timed_s`, the predicted target seconds of the steps it has
+    timed, and is complete once recorded."""
+
+    def __init__(self, runner: Any) -> None:
+        self.runner, self.s = runner, 0.0
+
+    def record(self, stream: Any = None) -> None:
+        self.s = self.runner.timed_s
+
+    def query(self) -> bool:
+        return True
+
+    def elapsed_time(self, end: PredictedEvent) -> float:
+        return (end.s - self.s) * 1000  # milliseconds, as a device event's
+
+
 def _device_memory(read: Any, runner: Any, answer: Any) -> Any:
     """`read`, a `torch.cuda` memory reading, answering about `runner.device`
     with `answer` of the runner's installed readings, and about any other
@@ -1372,6 +1391,10 @@ class NonAllocatingRunner(
 ):
     """Overrides that construct a model runner without touching device memory."""
 
+    #: The predicted target seconds of every step `forward` has timed through
+    #: ATOM's `GPUForwardMetrics`, which its `PredictedEvent`s record.
+    timed_s = 0.0
+
     def _build_and_load_model(self, model_class: Any) -> None:
         """Build the module tree on the meta device and read no checkpoint.
 
@@ -1723,6 +1746,8 @@ class NonAllocatingRunner(
         A runner with no backend refuses the step rather than report one that
         took no time. ATOM's `dummy_execution` answers with this reply too, so
         an idle DP rank's dummy batch is priced and joins the group's targets.
+        Before it replies, the step's target seconds are timed as ATOM's
+        `run_model` is timed on a real run (`_time_target`).
         """
         if not hasattr(batch, "produces_output"):
             # Not reachable from the engine, which only ever passes a scheduled
@@ -1789,6 +1814,7 @@ class NonAllocatingRunner(
             self._token_stream = stream
         tokens = stream.step(batch)
         seconds = _group_step_seconds(self, batch, backend, mode, view)
+        _time_target(self, batch)
         out = ScheduledBatchOutput(
             **tokens,
             predicted_s=seconds,
@@ -1810,6 +1836,27 @@ def _start_cost_table(runner: Any, record: Any) -> None:
     table.write(json.dumps({"version": COST_TABLE_VERSION}) + "\n")
     table.flush()
     vars(runner)["_cost_table"] = table
+
+
+def _time_target(runner: Any, batch: Any) -> None:
+    """Time the step `_group_step_seconds` just priced through the
+    `GPUForwardMetrics` ATOM's `ModelRunner` builds on `runner` with the
+    device timer on: `measure` around the step's `StepCost.target_seconds` on
+    `PredictedEvent`s, then `poll`, so its observations, a prefill request's
+    sum over its chunks included, are in the worker's file before `forward`
+    replies. `measure` skips a DP dummy run and an empty batch, as on a real
+    run. Nothing is timed with the timer off, on a TP rank other than 0, which
+    prices nothing, or for a refused step, so a request with a refused chunk
+    publishes no sum."""
+    metrics = getattr(runner, "gpu_forward_metrics", None)
+    target_s = vars(runner).pop("_target_s", None)
+    if metrics is None or target_s is None:
+        return
+    # In place of ATOM's factory, whose `torch.cuda.Event` times a device.
+    metrics.event_factory = partial(PredictedEvent, runner)
+    with metrics.measure(batch):
+        runner.timed_s += target_s
+    metrics.poll()
 
 
 def _group_step_seconds(
@@ -1845,7 +1892,8 @@ def _group_step_seconds(
     by rank, or None with one rank. `_out_s` is the host's ``out_s`` for this
     step, the seconds from its return to the engine's next input pull, or
     None; `_group_out` holds each rank's target plus its ``out_s``, for the
-    ranks with one, or None.
+    ranks with one, or None. `_target_s` is the step's `target_seconds`, or
+    None for a refused step.
 
     A pipeline stage runs only its own layers, so it is refused unless its
     backend states the `stage_share` it prices; any other backend prices the
@@ -1977,6 +2025,7 @@ def _group_step_seconds(
         group_s = targets[group.rank()]
     vars(runner)["_group_targets"] = targets
     vars(runner)["_out_s"], vars(runner)["_group_out"] = out_s, pulls
+    vars(runner)["_target_s"] = None if refused else device_s
     record = getattr(runner, "_parity_record", None)
     if record is None:
         return group_s

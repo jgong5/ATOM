@@ -15,7 +15,8 @@ reach it until it is stopped, with run.json recording what grading reads.
 `--device`'s datasheet and the readings `--store` holds for it at `--ptl` and
 at the stack the backend's and host laws' entries state, or `--stack` where
 they state none (`runfile.spec`), the backend exactly one with no default, and
-`serve` starts the server simulated from it with the step record on. `--out`
+`serve` starts the server simulated from it with the step record on, and
+ATOM's GPU forward timer unless the environment sets it (`timer_env`). `--out`
 holds what `serve` writes and what the run writes there: each DP rank's step
 record and cost lines, the step table, the run summary and each LP's hand-in.
 
@@ -110,6 +111,9 @@ ROLES = {"prefill": "kv_producer", "decode": "kv_consumer"}
 SIMULATED, REAL = "compass", "mooncake"
 #: The ATOM argument naming a side's connector, which deploy.sh adds.
 KV_FLAG = "--kv-transfer-config"
+#: ATOM's GPU forward timer, which CI's `pd_server_atom.sh` turns on for both
+#: sides unless set, as a simulated server's start does (`timer_env`).
+DEVICE_TIMER = "ATOM_ENABLE_METRICS_DEVICE_TIMER"
 
 
 def main(argv: list[str]) -> None:
@@ -157,20 +161,23 @@ def main(argv: list[str]) -> None:
         ]
         run[compass_run.ACCEPTANCE_RECORD] = str(Path(record).resolve())
     report = check(args.coverage, run, atom_args) if args.coverage else None
-    serve.serve(atom_args, args.out, run=run)
+    serve.serve(atom_args, args.out, run=run, extra_env=timer_env(os.environ))
     write_grading(args.out, report)
 
 
 def join(args, atom_args, side) -> None:
     """Serve one instance of a deployment whose authority already runs, from
-    its run file `args.join`, and record what grading reads for its `side`."""
+    its run file `args.join` and with `timer_env`'s variables, and record what
+    grading reads for its `side`."""
     run = json.loads(Path(args.join).read_text())
     if not {"clock_endpoint", "out_dir"} <= run.keys():
         raise ValueError(
             f"--join {args.join} names no clock_endpoint and out_dir; a "
             "deployment's run file names its authority and its directory"
         )
-    serve.serve(atom_args, args.out, run=run, joined=True)
+    serve.serve(
+        atom_args, args.out, run=run, extra_env=timer_env(os.environ), joined=True
+    )
     write_grading(args.out, None, side)
 
 
@@ -227,6 +234,13 @@ def side_env(env) -> dict:
     over the environment `env` it starts a side in: AITER_LOG_LEVEL WARNING
     where `env` has it unset or empty."""
     return {} if env.get("AITER_LOG_LEVEL") else {"AITER_LOG_LEVEL": "WARNING"}
+
+
+def timer_env(env) -> dict:
+    """The variables a simulated server starts with over the environment
+    `env`: `DEVICE_TIMER` 1 where `env` has it unset or empty, so the server's
+    GPU forward histograms hold each step's predicted device seconds."""
+    return {} if env.get(DEVICE_TIMER) else {DEVICE_TIMER: "1"}
 
 
 def measured(record, atom_args, ranks: int) -> list[float]:
