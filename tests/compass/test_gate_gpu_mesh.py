@@ -33,4 +33,5 @@ def test_tests_compass_runs_under_the_image_lockfile_unless_the_tree_has_one(
     (tmp_path / "Cargo.lock").write_text("image")
     out, verdict = _run(tmp_path, root, COMPASS_CARGO_LOCK=str(tmp_path / "Cargo.lock"))
     assert verdict == "GATE_GPU_RC=0 PASSED", out.stdout[-3000:]
-    assert f"{read} 4,5,6,7 " in (root / "runs.txt").read_text()
+    runs = (root / "runs.txt").read_text().splitlines()
+    assert any(line.startswith(f"{read} 4,5,6,7 ") for line in runs), runs
