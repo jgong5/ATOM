@@ -232,13 +232,16 @@ def comm_fused(recorder):
     gives back the rows aiter's run does, of a ragged reduce-scatter this
     rank's, the first. The producer and the join run after it, as its stage 2
     calls them, so the shared expert is traced on its own stream. ATOM's
-    custom op runs its body, as the other MoE wrappers do.
+    custom op runs its body, as the other MoE wrappers do. No patch where
+    aiter has no comm-fused MoE, as ATOM then builds none.
     """
     from aiter import ActivationType, QuantType
-    from aiter.ops import comm_fused_moe_runtime as runtime
-    from aiter.ops.flydsl import comm_fused_moe_host as host
 
     from atom.model_ops.fused_moe import comm_fused_moe
+
+    if (modules := comm_fused_moe._load_backend()) is None:
+        return []
+    host, runtime = modules
 
     class Runners(host._LazyRunners):
         def __init__(self, tp_group, shape, configs):
