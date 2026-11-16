@@ -40,19 +40,19 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at b9551034698afe8119de284904cfa6599c5a2cf9 over this tree:
-#   tests/       1011 files  = 80 in tests/plugin/ + 57 excluded + 874 CPU gate
-#   CPU gate      811 files collect >=1 test, 63 collect none
+# Measured at d7cf4e872fe78fb107b4c6f72e9666be7f0c4435 over this tree:
+#   tests/       1011 files  = 80 in tests/plugin/ + 61 excluded + 870 CPU gate
+#   CPU gate      807 files collect >=1 test, 63 collect none
 #   imports      1343 indented `import atom.*` lines in non-plugin test files
-#   collected  19202 tests by --collect-only. A run of the same set reports
-#              the same 19202 outcomes. Its "skipped" total is LARGER than any
+#   collected  19116 tests by --collect-only. A run of the same set reports
+#              the same 19116 outcomes. Its "skipped" total is LARGER than any
 #              skip count here, because a module-level skip in one of the 63
 #              files that collect nothing is counted as skipped without ever
 #              becoming a collected test. This file states the set; gate_cpu.sh
 #              prints the run, and is the only source for its outcome counts.
-#   candidates    149 paths named by an excluded test, any indentation
-#   covered       442 paths named at module level by a live CPU-gate file
-#   triggers       87 paths below
+#   candidates    157 paths named by an excluded test, any indentation
+#   covered       439 paths named at module level by a live CPU-gate file
+#   triggers       90 paths below
 atom/distributed/pcp_utils.py
 atom/model_loader/loader.py
 atom/model_ops/attention_gdn.py
@@ -87,6 +87,7 @@ atom/model_ops/engram/device/uva.py
 atom/model_ops/engram/host.py
 atom/model_ops/engram/tables.py
 atom/model_ops/fp4_mqa_ragged_metadata.py
+atom/model_ops/fused_moe/mori_v2_prepare_finalize.py
 atom/model_ops/fused_moe_triton.py
 atom/model_ops/glm5_next/indexer.py
 atom/model_ops/glm5_next/kpool.py
@@ -133,10 +134,12 @@ atom/models/minimax_m3/dspark.py
 atom/models/qwen4_exp.py
 atom/models/qwen4_exp_mtp.py
 atom/mono/device/ops.py
+atom/mono/dsa_indexer/bind.py
 atom/plugin/rtpllm/models/qwen4_exp_mtp_hooks.py
 atom/plugin/vllm/v41_core_overrides.py
 atom/rollout/model_runner_ext.py
 atom/spec_decode/dspark_proposer.py
 atom/spec_decode/eagle_proposer.py
+atom/structured_output/schema.py
 atom/utils/custom_register.py
 atom/utils/decorators.py
