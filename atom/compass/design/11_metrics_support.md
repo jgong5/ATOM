@@ -405,8 +405,7 @@ the additions are a sampler and a writer outside the exporter.
 `01` D3 rule 3 and repeat run to run, since a daemon deadline fires under every request
 order or none (`atom/compass/clock/authority.py`). The cadence is CI's, which is what the
 report's 5 s steps and 60 s windows read. On #3498's run (the template's 1P1D DPA8
-configuration at c=256, 2577 simulated s, measured in a gate container,
-`agent_scratch/3584/`), a side's panel families hold 1,819 series at an instant (8 engines
+configuration at c=256, 2577 simulated s; #3584's named result), a side's panel families hold 1,819 series at an instant (8 engines
 x 167, 8 workers x 44, the frontend 131) plus one per request-context series:
 
 | Cadence and who samples | Samples, both sides | OpenMetrics at 166 bytes a sample |
@@ -637,7 +636,8 @@ D74's revision and `19` D115's Prometheus report, walked through the runs that w
 ```
  an LP hands in before the finish, or a stop ends the run
    -> every LP that hands in writes what it sampled; the report covers it
- an LP killed before its hand-in -> no file -> the report's notes name the LP
+ an LP killed before its hand-in -> no file -> the report's notes name it, of the
+   server LPs the run file declares (run/__init__.py: _hand_ins)
  no series at all | no prometheus or promtool and no download
    | no .github/scripts/atomesh/observability/ in the tree | backfill or query fails
    -> OUT/prometheus.txt says which; report.prometheus exits 0
@@ -663,9 +663,8 @@ None.
 
 ### Dependencies
 
-No spike and no sync issue. The cadence's figures were measured here on #3498's run
-directory, `agent_scratch/3498/run/p3-c256`, and the backfill end to end on a synthetic side
-of the same shape. #522 keeps the 1P1D scrape channels, unneeded by this build; #3552's
+No spike and no sync issue. The cadence's figures were measured on #3498's run, and the backfill
+end to end on a synthetic side of the same shape (#3584's named result). #522 keeps the 1P1D scrape channels, unneeded by this build; #3552's
 measurement is why real runs keep CI's collector.
 
 ### Summary
