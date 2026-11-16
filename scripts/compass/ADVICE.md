@@ -238,7 +238,7 @@ takes up the rest.
 |---|---|---|
 | `searchable` | `N of M points searchable`, each other point with its own state | step 3 simulates it |
 | `missing a law` | `made by:` the command that makes the law; `calibration:` the last line of one that stopped or ended | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
-| `calibrating` | `calibration:` its status file, how many steps have ended and its last line | run the search again later |
+| `calibrating` | `calibration:` its status file, how many steps have ended and its last line; `resumed, once no calibrate.sh runs, by:` its command | run the search again later |
 | `missing readings`, a point of a searchable candidate | `made by:` its `compass measure memory` command | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
 | `refused` | `refused:` ATOM's or Compass's refusal, verbatim | below |
 
@@ -294,12 +294,15 @@ at the head, it publishes the law and the memory readings there, beside the
 platform readings, and the next `compass advice SPACE OUT` reads them. Without
 `STORE`, as printed when the shared store holds one of them, which a second
 publish at its key would meet, it publishes into its own
-`OUT/cal/<candidate>/store`. A search looks each candidate up in those stores,
-the latest published into first, then in the shared store, but passes by a
-store with no platform readings for SPACE's machine, and a calibration's own
-store starts with none. Once such a calibration has ended, take them into its
-store on two idle cards of the target, as QUICKSTART's Environment ("The
-platform") takes them, `<token>` the one the first command prints:
+`OUT/cal/<candidate>/store`. Once a calibration has started, its printed command
+keeps the store it started with, which its `OUT/cal/<candidate>/inputs` names,
+so a resume publishes where the first run did. A search looks each candidate up
+in those stores, the latest published into first, then in the shared store, but
+passes by a store with no platform readings for SPACE's machine, and a
+calibration's own store starts with none. Once such a calibration has ended,
+take them into its store on two idle cards of the target, as QUICKSTART's
+Environment ("The platform") takes them, `<token>` the one the first command
+prints:
 
 ```bash
 compass measure device --gpu <a card>,<another card> --store OUT/cal/S1/store --out OUT/cal/S1.device
@@ -313,7 +316,8 @@ compass fit device <token> --store OUT/cal/S1/store --out OUT/cal/S1.readings
   stamped in UTC: `cat OUT/cal/S1/status`. Each step's own log is in
   `OUT/cal/S1/`, and the script's in `OUT/cal/S1.log`. A status file whose last
   line is a start long past, with no `calibrate.sh` running, is a calibration
-  killed with no chance to record it, as a node's job end kills one: resume it.
+  killed with no chance to record it, as a node's job end kills one: resume it
+  with the command its `resumed, once no calibrate.sh runs, by:` line prints.
 - **Resume a stopped one**: run the same command again, in the background as
   above. A failed calibration's state is `missing a law`, its `calibration:`
   line naming the step that failed and why, and its `made by:` command is the
