@@ -1149,16 +1149,17 @@ def _mono(recorder, unpatched):
     Every rank of a capture is this one: the TP consensus runs on the host,
     outside the fake mode and the recorder, and agrees with this rank, and the
     peer buffer is one of the sizes the runner asks for on the declared device
-    (`driverless.PeerBuffer`). A width's kernels compile for real, compile-only
-    at the declared arch through `unpatched`, so their scratch is read off
-    their binaries. A refusal the deployment makes too, a bind check's
+    (`driverless.PeerBuffer`), as is each uncached scratch a bind or a build
+    takes (`driverless.uncached_bytes`). A width's kernels compile for real,
+    compile-only at the declared arch through `unpatched`, so their scratch is
+    read off their binaries. A refusal the deployment makes too, a bind check's
     `MonoUnsupported` or a kernel that needs scratch, leaves the original path
     to trace and is told to `recorder.declined` by every step it turns away;
     any other bind or build failure is refused by name.
     """
     from torch.utils._python_dispatch import _disable_current_modes
 
-    from atom.mono.runtime import consensus, lifecycle, route, widths
+    from atom.mono.runtime import consensus, lifecycle, route, uncached, widths
     from atom.mono.runtime.compile import compile_kernels, scratch_bytes
 
     agree, init = consensus.tp_agree, route.LazyRunner.__init__
@@ -1169,9 +1170,22 @@ def _mono(recorder, unpatched):
         with _disable_current_modes():
             return agree(ok, group)
 
+    def driverless_scratch():
+        """Each loaded module's `uncached_bytes`, ATOM's ctypes HIP allocation,
+        as `driverless.uncached_bytes`: a runner module binds the name at its
+        import, so the name is replaced where each one holds it."""
+        held, real = contextlib.ExitStack(), uncached.uncached_bytes
+        for module in list(sys.modules.values()):
+            if getattr(module, "__dict__", {}).get("uncached_bytes") is real:
+                held.enter_context(
+                    patch.object(module, "uncached_bytes", driverless.uncached_bytes)
+                )
+        return held
+
     def bound(create, lazy):
         try:
-            return create()
+            with driverless_scratch():
+                return create()
         except consensus.MonoUnsupported as why:
             if why.__cause__ is not None:  # a failure `bind_agreed` converted
                 raise ValueError(
@@ -1232,6 +1246,7 @@ def _mono(recorder, unpatched):
             noting.enter_context(
                 patch.object(widths, "compile_kernels", noted(compiled))
             )
+            noting.enter_context(driverless_scratch())
             held = prepare(self, width)
         if failed or not (held or any(scratch)):
             why = repr(failed[0]) if failed else "no kernel needs scratch"
