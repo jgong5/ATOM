@@ -54,7 +54,9 @@ dimension is their message bytes; one apart along it is one row's bytes
 moves that many bytes per row. Where ranks' row counts can differ (``all_gatherv``,
 ``reduce_scatterv``, MORI's dispatch and combine) it is one byte;
 ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad every
-rank to the same rows and keep one row. Points at one
+rank to the same rows and keep one row. A MORI combine's bytes are read from
+its leaf (`bench.ops.exchange`), the rows it moves: a point stored before
+`exchange` sized it so keeps MORI's whole buffer. Points at one
 coordinate, its other counts or contexts dropped, are one point at their mean
 time. `interpolate` prices a query at a measured point as
 that point; between points, multilinearly over the neighbours that bracket it
@@ -104,6 +106,8 @@ MASK = "#"
 TOKENS = ("T", "T+1")
 #: The largest held-out error a point may read and its gaps interpolate.
 LIMIT = 0.05
+#: The leaves a `PriceList` keeps the signatures of; past it, it forgets them.
+SIGNED = 1 << 14
 
 
 class Declined(ValueError):
@@ -315,6 +319,7 @@ def fit(points) -> dict:
         _dependent,
         _launched,
         _split,
+        exchange,
         routed_rows,
     )
     from atom.compass.capture.peers import MORI
@@ -325,6 +330,8 @@ def fit(points) -> dict:
     for p in points:
         if "exchange" in p:  # a collective: one family over its message bytes
             fam, nbytes = p["exchange"]
+            if p["op"] == f"{MORI}.combine":  # its input's, whatever it stored
+                nbytes = exchange(json.loads(p["leaf"]))[1]
             f = families.setdefault(
                 fam,
                 {"op": p["op"], "dims": ["bytes"], "points": {}, "row_bytes": set()},
@@ -582,11 +589,14 @@ class PriceList(CostSource):
         # step, so only the last steps' answers come back
         self._family = functools.lru_cache(maxsize=1 << 14)(self._family)
         self._lookup = functools.lru_cache(maxsize=1 << 14)(self._lookup)
+        self._term = functools.lru_cache(maxsize=1 << 14)(self._term)
         self._table = functools.cache(self._table)
         self._index = functools.cache(self._index)
+        # By leaf object, which each entry holds so its id names it alone
+        self._signed: dict[int, tuple] = {}
 
     def price(self, request: tuple) -> CostTerm | Refusal:
-        from atom.compass.bench.ops import exchange, routed_rows, signature
+        from atom.compass.bench.ops import routed_rows
 
         if isinstance(request[1], list):  # each bound it may have run at
             leaf, bounds, work = request
@@ -599,14 +609,15 @@ class PriceList(CostSource):
         kind, at = leaf["op"], {"T": t, "B": b, "G": g, "context": context}
         shape = f"{phase} T={t}" if phase == "prefill" else phase  # `_read`'s T
         shape += "" if at["G"] is None else f" G={at['G']}"
-        if ex := exchange(leaf):  # a collective: its family over its message bytes
+        ex, sig = self._sign(leaf)
+        if ex:  # a collective: its family over its message bytes
             name, at["bytes"] = ex
             name = name if name in self.params["families"] else None
         elif phase == "prefill" and "tokens" not in self.params:
             why = "the price list keys prefill families as before; refit it"
             return self.refuse(f"{kind}: {why}")
         else:
-            name = self._family(shape, signature(leaf))
+            name = self._family(shape, sig)
         if name is None:
             return self.refuse(f"{kind}: no point of its signature was measured")
         dims, top = self.params["families"][name]["dims"], None
@@ -620,10 +631,28 @@ class PriceList(CostSource):
         got = self._lookup(name, tuple(at[d] for d in dims), top)
         if isinstance(got, str):
             return self.refuse(f"{kind}: {got}")
-        method = Method.MEASURED if got[1] else Method.ESTIMATED
+        return self._term(kind, *got)
+
+    def _term(self, kind: str, ns: float, measured: bool, validated: bool):
+        """The term of a leaf of `kind` at `ns`, as `_lookup` read it."""
+        method = Method.MEASURED if measured else Method.ESTIMATED
         return CostTerm(
-            f"op.{kind}", got[0] * 1e-9, Provenance(method, validated=got[2])
+            f"op.{kind}", ns * 1e-9, Provenance(method, validated=validated)
         )
+
+    def _sign(self, leaf: dict) -> tuple:
+        """`leaf`'s `bench.ops.exchange`, and its `bench.ops.signature` when it
+        is no collective, kept by leaf object: a run asks each leaf of its
+        graphs every step."""
+        from atom.compass.bench.ops import exchange, signature
+
+        got = self._signed.get(id(leaf))
+        if got is None:
+            if len(self._signed) >= SIGNED:
+                self._signed.clear()
+            ex = exchange(leaf)
+            got = self._signed[id(leaf)] = (leaf, ex, None if ex else signature(leaf))
+        return got[1:]
 
     def _family(self, shape: str, sig: str) -> str | None:
         """The family of a leaf of signature `sig` at `shape`, or None."""

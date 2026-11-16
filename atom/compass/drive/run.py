@@ -43,7 +43,8 @@ micro-batches, and a run file that names no price list refuses. Another backend
 has no check, and refuses `--coverage`.
 
 `--check` starts no server: it lists every input the run lacks and the command
-that makes each, exiting 1 when one is lacking (`lacking`); it takes no `--out`.
+that makes each, exiting 1 when one is lacking (`lacking`); its `--out` is the
+directory a step linear law's printed calibration writes, and it writes none.
 `--check prefill` or `--check decode` checks that side of a deployment, its
 flags and ATOM arguments as `deploy.sh run` takes them, so `--network` names a
 deployment across nodes. Its ATOM arguments gain the `--kv-transfer-config` the
@@ -232,8 +233,14 @@ def measured(record, atom_args, ranks: int) -> list[float]:
     files = sorted(
         (Path(record) / serve.STEPS).glob(compass_run.ACCEPTANCE_FILE.format("*"))
     )
+    names = {compass_run.ACCEPTANCE_FILE.format(r) for r in range(ranks)}
+    if files and (missing := sorted(names - {p.name for p in files})):
+        raise ValueError(
+            f"--acceptance-record: {record} holds no {', '.join(missing)}, and "
+            f"ATOM's arguments run {ranks} DP ranks"
+        )
     counts = Counter()
-    for path in files:
+    for path in (p for p in files if p.name in names):
         held = json.loads(path.read_text())
         if held["draft_tokens"] != width:
             raise ValueError(
@@ -246,12 +253,6 @@ def measured(record, atom_args, ranks: int) -> list[float]:
         raise ValueError(
             f"--acceptance-record: {record} holds no accepted-draft histogram; "
             "a speculative record writes one per DP rank in its steps"
-        )
-    names = {compass_run.ACCEPTANCE_FILE.format(r) for r in range(ranks)}
-    if missing := sorted(names - {p.name for p in files}):
-        raise ValueError(
-            f"--acceptance-record: {record} holds no {', '.join(missing)}, and "
-            f"ATOM's arguments run {ranks} DP ranks"
         )
     return [sum(n for a, n in counts.items() if a > i) / rows for i in range(width)]
 
@@ -358,9 +359,9 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
     """The steps of the record directory or `shape_population` token `name`,
     less DP's dummy runs, each named `<name> dp<r> step <n>`; a rank whose
     engine states other `SHAPING` fields than `here` refuses, naming each.
-    Whatever a line states, its `tbo_tokens` is, on a data-parallel step under
-    two-batch overlap (`tbo`, ATOM's `enable_tbo`), the split `bound._split`
-    agrees over every rank's line at that step, else None."""
+    Whatever a line states, its `tbo_tokens` is, under two-batch overlap
+    (`tbo`, ATOM's `enable_tbo`), the split `bound._split` agrees over every
+    rank's line at that step, one rank's included, else None."""
     path = Path(name)
     if (path / serve.RUN_JSON).is_file():
         records = {
@@ -390,9 +391,9 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
         rank: {s["step"]: s for s in map(json.loads, text.splitlines())}
         for rank, (text, _) in sorted(records.items())
     }
-    # One rank is no DP group; dummy runs join the split, and a step some rank
-    # lacks splits none, as `trace ops --population` reads it.
-    every = set.intersection(*map(set, at.values())) if tbo and len(at) > 1 else ()
+    # Dummy runs join the split, and a step some rank lacks splits none, as
+    # `trace ops --population` reads it.
+    every = set.intersection(*map(set, at.values())) if tbo and at else ()
     splits = {n: _split([r[n] for r in at.values()]) for n in every}
     return [
         (f"{name} dp{rank} step {n}", line | {"tbo_tokens": splits.get(n)})

@@ -10,9 +10,10 @@ and takes the first that holds every input of its points, whatever the verdicts
 on them there: its platform readings compose with SPACE's machine, and no
 verdict names requirement 1, so each point's readings, and each law that is not
 a checked-in file, are at their key at the head's ATOM digest. With none, it
-takes the first whose platform readings compose and where a law is refused, as
-one fitted on another host CPU is, so the refusal is named rather than the
-shared store's calibrate; else the shared store's. There, each instance of
+takes the first whose platform readings compose and that one of its laws is
+read from, the store's own step linear law at the head's ATOM digest, whatever
+the verdict on it, as a readings gap is measured into the store a law is read
+from; else the shared store's. There, each instance of
 each point is resolved as ATOM's server resolves its arguments, under its
 variables, on the device arch of the machine spec that store's platform
 readings compose with SPACE's machine; a 1P1D side as `deploy.sh run` starts
@@ -60,7 +61,7 @@ def check(expansion: dict, out: Path) -> dict:
             }
             judged[candidate["name"]] = {"store": None, "points": verdicts}
             continue
-        refusing = None
+        holding_law = None
         for store in reuse.stores(expansion["store"], out):
             given = (machine["device"], store, machine["ptl"])
             given += (machine.get("stack"), machine.get("network"))
@@ -72,10 +73,11 @@ def check(expansion: dict, out: Path) -> dict:
             if all(v["requirement"] != 1 for v in _each(verdicts)):
                 break
             laws = (v for point in verdicts.values() for v in point["law"].values())
-            if refusing is None and any(v["verdict"] == "refused" for v in laws):
-                refusing = store, verdicts
+            read = any(v.get("store") == str(store.root) for v in laws)
+            if holding_law is None and read:
+                holding_law = store, verdicts
         else:
-            store, verdicts = refusing or (store, verdicts)
+            store, verdicts = holding_law or (store, verdicts)
         judged[candidate["name"]] = {"store": str(store.root), "points": verdicts}
     written = {"head": head, "refused": refused, "candidates": judged}
     (out / REUSE).write_text(json.dumps(written, indent=1) + "\n")

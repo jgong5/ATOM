@@ -35,9 +35,9 @@ head or its sampler runs. Each point reaches the runner as a batch
 first seated at its cached context (`replay.seat_states`), so ATOM builds its
 metadata and forward context; for DeepSeek-V4, the CSA top-k section its
 forward writes is written from ids spread over each token's compressed rows
-(`Stub._top_k`); for DeepSeek-V4.1's FP8 index plane, each table an earlier
+(`Stub._top_k`); for DeepSeek-V4.1's index planes, each table an earlier
 leaf of its forward writes (`_WRITTEN`) is written for the reading leaf's pass
-as that leaf writes it (`Stub._index`), and the logits plane its scorer
+as that leaf writes it (`Stub._index`), and the FP8 logits plane its scorer
 writes, which a top-k or the pick's block maxima ranks (`PAGE_WIDE`), is
 each copy's own, drawn for a top-k or block maxima as an activation is,
 below each row's bound (`_scores`); its sparse attention's index lists are
@@ -128,7 +128,7 @@ a drafter is one a token. One graph runs the leaf K
 times, K `CALLS` or the calls that fill `GRAPH_NS` at the device time of the
 kernels of one eager call of copy 0, the fewer, at least one, cycling over its
 copies: N built ones: M, the least count whose bytes pass `COLD` times the
-last-level cache, but for that plane where its copies' buffers pass it twice,
+last-level cache, but for that plane where its copies' buffers pass it 4 times,
 raised for a context key to its I instances (at most K),
 then, up to the leaf's occurrences when it takes a weight other than a
 gathered table (at most K), copy
@@ -293,7 +293,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 32
+PROTOCOL = 35
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -461,14 +461,19 @@ V4_LISTS = {
 #: them: the paged cache's, the pass's step (`step.`), the decoder plan
 #: (`plan.`), the scorer workspace (`workspace.`), the forward context or the
 #: runner's buffers; or past one, its first row (`.0`) or it widened to int64
-#: (`.long`).
+#: (`.long`). A top-k of packed rows is keyed by the role `packed`.
 _CACHE = "attn_metadata_builder.cache.indptr_buffers.{ratio}"
 _STAGED = "attn_metadata_builder.cache._cursor_staging.gpu"
 _LOGITS = (
     "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
     "flydsl_fp8_paged_mqa_logits_gfx1250"
 )
+_FP4 = (
+    "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup:"
+    "flydsl_pa_mqa_logits_fp4_rowgroup"
+)
 _PLAN = "step.plans.{ratio}.compress_plan_gpu"
+_OFFSETS = "step.planned.v41_score_offsets_{ratio}"
 _TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
 _INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
 _SCAN = f"{_INDPTRS}:_launch_indptr_scan"
@@ -481,11 +486,18 @@ _GATHER = "atom.model_ops.attentions.token_layout.gather:gather_rows"
 V41_NAMES = {
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_prefix"): f"{_CACHE}.0",
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_extend"): f"{_CACHE}.1",
+    ("aiter.mla_sparse_prefill_v41.default", "kv_indptr_prefix"): f"{_CACHE}.0",
+    ("aiter.mla_sparse_prefill_v41.default", "kv_indptr_extend"): f"{_CACHE}.1",
     (_SCAN, "pptrs"): f"{_CACHE}.0",
     (_SCAN, "eptrs"): f"{_CACHE}.1",
     (_LOGITS, "out_logits"): "workspace._logits",
+    (_FP4, "out"): "workspace._logits",
     (_LOGITS, "context_lens"): "step.visible.{ratio}",
+    (_FP4, "row_ends"): "step.visible.{ratio}",
     (_LOGITS, "kv_indices"): "workspace._tiles.{ratio}",
+    # where each row's logits start in the packed buffer (`score_layout`)
+    (_FP4, "out_offsets"): _OFFSETS,
+    (_TOPK, "row_starts", "packed"): _OFFSETS,
     (_TOPK, "row_starts"): "step.visible.{ratio}",
     (_TOPK, "row_ends"): "step.visible.{ratio}",
     (_FUSED, "plan_gpu"): _PLAN,
@@ -572,24 +584,34 @@ PAGE_WIDE = {
 ONE_BLOCK = ("gfx1250",)
 FLYDSL_OFF = "AITER_DISABLE_FLYDSL_TOPK_DECODE"
 FLYDSL_OFF_VALUES = ("1", "true", "True", "yes", "YES")
-#: DeepSeek-V4.1's FP8 index tables an earlier leaf of its forward writes, by
+#: DeepSeek-V4.1's index tables an earlier leaf of its forward writes, by
 #: the operator and slot that read them (`_written`): the page-wide scorer's
 #: tile table (`tiles`); the blocks each row keeps of the candidate pick
 #: (`ids`) and a candidate list's tile table (`table`) and row bounds
 #: (`context`), its scorer's and its top-k's; and the pick's top-k's row
-#: bounds (`ends`), there where its logits, the block maxima, are an activation.
+#: bounds (`ends`), there where its logits, the block maxima, are an activation
+#: or packed rows. On the FP4 plane, also a candidate list's rows, each a
+#: sequence of its own (`starts`), and the packed maxima (`maxima`) and where
+#: the pick's packed rows start (`block_offsets`, `offsets`).
 _WRITTEN = {
     (_LOGITS, "kv_indices"): "tiles",
     (_LOGITS, "context_lens"): "context",
+    (_FP4, "block_tables"): "table",
+    (_FP4, "row_ends"): "context",
+    (_FP4, "query_start_loc"): "starts",
+    (_TOPK, "logits"): "maxima",
     (_TOPK, "row_starts"): "context",
     (_TOPK, "row_ends"): "context",
     (_PICK, "seqLens"): "context",
+    (_MAXIMA, "packed.0"): "offsets",
+    (_MAXIMA, "packed.1"): "block_offsets",
     **{
         (f"{_V41}.candidate_table:{f}", "candidates"): "ids"
         for f in ("candidate_block_table", "lift_candidate_selection")
     },
 }
-#: DeepSeek-V4.1's sparse attention over its BF16 pool, by slot: the item of
+#: DeepSeek-V4.1's sparse attention over its BF16 pool, and over its FP8 one,
+#: by slot: the item of
 #: what its forward's index build returns (`PagedAttentionCache.
 #: attention_indices`, `(prefix, pptr, second, sptr)`) an activation slot
 #: takes, a list or, at a bounded replay's queries, a pointer table.
@@ -600,6 +622,7 @@ LISTS = {
     (_ATTEND, "kv_indices_extend"): 2,
     (_ATTEND, "kv_indptr_extend"): 3,
 }
+LISTS |= {("aiter.mla_sparse_prefill_v41.default", s): i for (_, s), i in LISTS.items()}
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
 #: the span, and past an exact buffer kills the process (aiter defect, #1977).
@@ -953,8 +976,10 @@ def _runner(config, rank: int):
     """ATOM's runner at TP `rank` of `config`'s DP rank, its parameters built on
     the meta device and no warmup run, its KV pool allocated at the fewest
     blocks a rank has room for, sized by ATOM with the parameters' bytes held
-    on the device and then freed for the weights each leaf builds; the runner
-    attributes the allocation set are in its `kv_held`, and by path each
+    on the device and then freed for the weights each leaf builds, and with
+    the MORI exchange ATOM's loader builds before it, MORI's heap with it, in
+    its `mori` (`_prepare_finalize`) where its MoE exchanges through MORI;
+    the runner attributes the allocation set are in its `kv_held`, and by path each
     tensor it bound on a metadata builder (`BUILDERS`, `_bound`) but a view the
     builder cut from one of the runner's (`_cut_from`); and, when
     the runner defers its output, one sampled-id handoff to the host on ATOM's
@@ -995,6 +1020,9 @@ def _runner(config, rank: int):
     runner.store = store
     nbytes = sum(p.nbytes for p in runner.model.parameters())
     held = torch.empty(nbytes, dtype=torch.uint8, device=runner.device)
+    # as ATOM's loader, before the pool is sized: built at the first MORI
+    # leaf instead, the heap took room the pool left the leaves' weights
+    runner.mori = _prepare_finalize(dict(runner.model.named_modules()), mori_only=True)
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     del held
     _release()  # the pool takes the room the hold had
@@ -1021,6 +1049,33 @@ def _runner(config, rank: int):
         ids.send_to_cpu_async(zero, ids.token_ids_cpu, done)
         ids.recv_async_output(ids.token_ids_cpu)
     return runner
+
+
+def _prepare_finalize(modules: dict, mori_only: bool = False):
+    """What ATOM's loader (`init_prepare_finalize`) builds for the exchange of
+    the first MoE layer in `modules`: the layer's name, what it built and the
+    dtype the layer's rows enter in; building MORI's exchange builds MORI's
+    heap. None where `modules` hold no MoE layer (a model holding one has
+    imported ATOM's MoE module), or, with `mori_only`, where that layer's
+    exchange is not MORI's."""
+    base = getattr(sys.modules.get("atom.model_ops.moe"), "FusedMoEMethodBase", ())
+    name, layer = next(
+        (
+            (name, m)
+            for name, m in modules.items()
+            if isinstance(getattr(m, "quant_method", None), base)
+        ),
+        (None, None),
+    )
+    if layer is None or (mori_only and not layer.quant_method.moe.use_mori_kernels):
+        return None
+    method = layer.quant_method
+    made = base._maybe_make_prepare_finalize(
+        method.moe,
+        method.get_fused_moe_quant_config(layer),
+        method.routed_rows_wire,
+    )
+    return name, made, method.moe.in_dtype
 
 
 class Stub:
@@ -1069,16 +1124,31 @@ class Stub:
         self.shared = self.topk.get("topk_ids")
         # a point's real MoE rows, its ranks and the rows its MoE runs (`point`)
         self.loads, self.real = [], None
-        # what ATOM builds for MORI's exchange, once a MORI leaf asks (`_mori`)
-        self.mori = None
+        # what ATOM builds for MORI's exchange: the runner's, built before
+        # its pool was sized (`_runner`), else once a MORI leaf asks (`_mori`)
+        self.mori = getattr(runner, "mori", None)
         # DeepSeek-V4.1's compress ratios by the rows a page holds at each
-        geometry = getattr(runner, "attn_metadata_builder", None)
-        geometry = getattr(geometry, "geometry", None)
+        builder = getattr(runner, "attn_metadata_builder", None)
+        geometry = getattr(builder, "geometry", None)
         self.known = self.pages = {
             ("rows_per_page", geometry.rows_per_page(r)): r
             for r in getattr(geometry, "layer_ratios", ())
             if r and hasattr(geometry, "rows_per_page")
         }
+        # on its FP4 plane, by the index blocks a page holds (a scorer's plan's
+        # `pages_per_block`) and the rows its block table's columns hold (the
+        # plane a whole context's top-k ranks)
+        if getattr(geometry, "index_fp4", False):
+            cols = getattr(builder, "block_table_cols", 0)
+            self.pages |= {
+                key: r
+                for r in geometry.layer_ratios
+                if r
+                for key in (
+                    ("pages_per_block", geometry.index_blocks_per_page(r)),
+                    ("plane_width", cols * geometry.rows_per_page(r)),
+                )
+            }
         # and the rows a request's window ring holds at a layer
         self.ring = getattr(geometry, "ring_slots", 0)
         # V4.1's FP8 index plane, whose prefill logits are as wide as the
@@ -1188,6 +1258,7 @@ class Stub:
         zeros = getattr(tokens, "zero_spec_counts", None)
         drafter = {} if zeros is None else {"zero_spec_counts": zeros}
         meta = dict(self.kv)
+        untold = len(set(self.pages.values())) > 1  # V4.1 compressing at several
         for sig, (op, _) in self.leaves.items():
             writes, rows = _writes(op["op"]), _pass_rows(op)
             at = None if rows == running else rows
@@ -1208,7 +1279,8 @@ class Stub:
                         self.fills[sig] = cache, passes.get(at, passes[None])[0]
                     else:
                         meta[sig, path] = f"no pass here fills {path} {bound}", None
-                index = self.paged and _written(op, path)
+                index = bool(self.pages) and _written(op, path)
+                index = None if index == "tiles" and not self.paged else index
                 if spec.get("device") == "cpu":  # `_copy` builds it on the host
                     continue
                 act = self.specs and spec["role"] == "activation"
@@ -1237,15 +1309,19 @@ class Stub:
                         pool = v41
                     try:
                         rope = (op["op"], path, ratio) == (_ROPE, "positions", None)
-                        if (
-                            rope
-                            and self.pages
-                            and op["args"]["input"]["shape"][-2] == 1
-                        ):
+                        if rope and untold and op["args"]["input"]["shape"][-2] == 1:
                             raise ValueError(  # a key's, over one head
-                                "its graph states no compress ratio, and no one "
-                                f"compress plan here holds its {spec['shape'][-1]} "
-                                "rows: trace its shape again"
+                                "its graph states no compress ratio, and this point "
+                                "cannot tell which ratio's compress plan holds its "
+                                f"{spec['shape'][-1]} rows: trace its shape again"
+                            )
+                        bound = path in ("row_starts", "row_ends") and not index
+                        if (op["op"], ratio) == (_TOPK, None) and untold and bound:
+                            raise ValueError(  # a row bound ATOM stages, its ratio's
+                                "its graph states no compress ratio, and this point "
+                                "cannot tell which ratio's scorer writes its "
+                                f"{op['args']['stride0']}-wide logits: trace its "
+                                "shape again"
                             )
                         if index:  # as the forward's first reader writes it
                             step = passes.get(at, passes[None])[0]
@@ -1315,13 +1391,26 @@ class Stub:
         scorer workspace's (`unit_tiles`); or, off the blocks each row keeps of
         the candidate pick (`_candidates`), those, a candidate list's tile
         table or row bounds (`candidate_blocks`), or each row's visible blocks,
-        the pick's top-k's row bounds (`_block_maxima`'s `ends`)."""
+        the pick's top-k's row bounds (`_block_maxima`'s `ends`); the scorer
+        workspace's row starts (`starts`) or packed block maxima (`maxima`);
+        or where the pick's packed rows start (`score_layout`)."""
+        from atom.model_ops.attentions.deepseek_v41.score_planner import score_layout
+
         if kind == "tiles":  # rewritten: another pass may have written it since
             step.tiles.pop(ratio, None)
             return {f"workspace._tiles.{ratio}": cache.unit_tiles(step, ratio)}
+        if kind == "starts":  # each row a sequence of its own
+            rows = len(step.batch_ids)
+            return {"workspace._row_starts": cache.workspace.row_starts(rows)}
+        if kind == "maxima":
+            return {"workspace._maxima": cache.workspace.packed_maxima()}
         if self.picker is None:
             raise ValueError("no layer of the model picks candidate blocks")
         spec, block = self.picker.spec, self.picker.block_size
+        if kind in ("offsets", "block_offsets"):
+            if (layout := score_layout(step, spec.ratio)) is None:
+                raise ValueError(f"the step packs no rows at ratio {spec.ratio}")
+            return {f"step.planned.{kind}.{spec.ratio}": getattr(layout, kind)}
         ends = (step.visible[spec.ratio] + block - 1) // block
         if kind == "ends":
             return {f"step.visible.{spec.ratio}.blocks": ends}
@@ -1422,15 +1511,17 @@ class Stub:
             and (op["args"].get("context_lens") or {}).get("role") != "activation"
         }
         # and by the rows each compress plan holds, as many as its keys' RoPE's,
-        # for a key RoPE captured before it stated its ratio: rows that no one
-        # ratio's plan here holds tell none, and `_prepare` refuses that key
+        # for a key RoPE captured before it stated its ratio, where the point
+        # holds every ratio's compressor: rows that no one ratio's plan here
+        # holds tell none, and `_prepare` refuses that key
         ratios = defaultdict(set)
         for op, _ in found.values():
             if op["op"] == _FUSED:
                 ratios[op["args"]["plan_gpu"]["shape"][0]].add(op["args"]["ratio"])
-        self.known |= {
-            ("compressed", n): r.pop() for n, r in ratios.items() if len(r) == 1
-        }
+        if set().union(*ratios.values()) >= set(self.pages.values()):
+            self.known |= {
+                ("compressed", n): r.pop() for n, r in ratios.items() if len(r) == 1
+            }
         # and its last layer's, whose tables a replay's queries take their
         # pointers from (`QueryRows.indices`)
         model = self.runner.model
@@ -1580,9 +1671,9 @@ class Stub:
                     read = torch.Size(op["args"][ids]["shape"]).numel()
                 entry = _span(s["shape"][1:], s["stride"][1:]) * itemsize
                 nbytes = entry * min(read, s["shape"][0])
-            if plane := self._plane(op, sig, slot):  # buffers: 2 * COLD * llc
-                reach, _, k, held = plane
-                nbytes, most = reach * itemsize, k * self._cold(held * itemsize // 2)
+            if plane := self._plane(op, sig, slot):  # buffers: 4 * COLD * llc
+                reach, per, *_, held = plane
+                nbytes, most = reach * itemsize, per * self._cold(held * itemsize // 4)
             if s["role"] == "kv":
                 # ponytail: its widest-strided dim taken as blocks or state slots,
                 # or plane rows when the leaf states its layer's attention geometry;
@@ -1687,9 +1778,8 @@ class Stub:
 
     def _plane(self, op, sig, path):
         """V4.1's FP8 index plane at `op`'s `path` (`PAGE_WIDE`), or None: the
-        columns below its rows' bounds, all where none is bound; its copies'
-        starts apart, its widest row's to a `WEIGHT_ALIGN` boundary; k, the
-        copies a buffer holds, none reaching another's columns; its elements."""
+        columns below its rows' bounds, all where none is bound, and its
+        copies' layout (`_stairs`)."""
         bound, plane = PAGE_WIDE.get(op["op"], ("", ""))[:2]
         spec = op["args"][path] if self.paged and path == plane else {}
         if spec.get("role") != "metadata" or not plane.endswith("logits"):
@@ -1697,10 +1787,8 @@ class Stub:
         ends = self.placed[0][1].get((sig, bound), ("", None))[1]
         (rows, width), size = spec["shape"], _dtype(spec["dtype"]).itemsize
         reach = [width] * rows if ends is None else _reached(ends, width)
-        cols = -(-max(reach) * size // WEIGHT_ALIGN) * WEIGHT_ALIGN // size
-        k = spec["stride"][0] // max(cols, 1) or 1
-        held = _span(spec["shape"], spec["stride"]) + (k - 1) * cols
-        return sum(reach), cols, k, held
+        stride, span = spec["stride"][0], _span(spec["shape"], spec["stride"])
+        return sum(reach), *_stairs(tuple(reach), stride, span, size, self.llc)
 
     def _time(self, op, sig, instances, n) -> dict:
         """`op` timed in a graph of K calls, `CALLS` or as many as fill
@@ -1893,11 +1981,12 @@ class Stub:
                 # clone of it, which ATOM's preparation leaves unchanged, so
                 # each copy draws on a plane of its own
                 if plane := self._plane(op, sig, path):  # a scorer's too
-                    _, cols, k, held = plane
-                    if (sig, c // k) not in self.built:
-                        self.built[sig, c // k] = out.new_zeros(held)
-                    whole = self.built[sig, c // k]
-                    out = whole.as_strided(out.shape, out.stride(), c % k * cols)
+                    _, per, k, step, band, held = plane
+                    b, i = divmod(c, per)
+                    if (sig, b) not in self.built:
+                        self.built[sig, b] = out.new_zeros(held)
+                    whole, at = self.built[sig, b], i // k * step + i % k * band
+                    out = whole.as_strided(out.shape, out.stride(), at)
                 if self.paged and path == "logits" and value["role"] == "metadata":
                     bound = PAGE_WIDE.get(op["op"], ("",))[0]
                     if (ends := meta.get((sig, bound), ("", None))[1]) is not None:
@@ -1980,33 +2069,12 @@ class Stub:
         builds it, once; refused by name where ATOM builds none, or one for
         another EP width, hidden size or count of experts a token than the
         leaf states, its hidden size the values a row of its `input` holds."""
-        from atom.model_ops.moe import FusedMoEMethodBase
-
+        self.mori = self.mori or _prepare_finalize(self.modules)
         if self.mori is None:
-            name, layer = next(
-                (
-                    (name, m)
-                    for name, m in self.modules.items()
-                    if isinstance(getattr(m, "quant_method", None), FusedMoEMethodBase)
-                ),
-                (None, None),
-            )
-            if layer is None:
-                raise ValueError(
-                    "the model has no MoE layer to build MORI's handle for"
-                )
-            method = layer.quant_method
-            made = FusedMoEMethodBase._maybe_make_prepare_finalize(
-                method.moe,
-                method.get_fused_moe_quant_config(layer),
-                method.routed_rows_wire,
-            )
-            if not getattr(made, "_mori_ops", None):
-                raise ValueError(
-                    f"ATOM builds {type(made).__name__} for {name}, not MORI"
-                )
-            self.mori = made, method.moe.in_dtype
-        made, dtype = self.mori
+            raise ValueError("the model has no MoE layer to build MORI's handle for")
+        name, made, dtype = self.mori
+        if not getattr(made, "_mori_ops", None):
+            raise ValueError(f"ATOM builds {type(made).__name__} for {name}, not MORI")
         handle, args = made._mori_ops[0], op["args"]
         c, sent = handle.config, args["input"]
         built = c.world_size, c.hidden_dim, c.num_experts_per_token
@@ -2256,11 +2324,14 @@ def _ratio(op, path, known=None):
     argument, else the one it states; a list slot's i-th item the i-th of its
     `ratios` (DeepSeek-V4.1's indptr scan, a table a ratio); else the ratio
     `known` gives the rows a page holds at it (`rows_per_page`, V4.1's index
-    build, 0 when it takes no selection) or the width of the logits it reads
-    (`stride0`, V4.1's top-k, its scorer's), or, in a graph captured before
-    V4.1's key RoPE stated its ratio, a RoPE's positions the rows its compress
-    plan holds (`compressed`), or aten's index its table its model's last
-    layer's (`queries`), where a replay's queries take their pointers."""
+    build, 0 when it takes no selection), the index blocks its plan's page
+    holds (`pages_per_block`, V4.1's FP4 scorer), the plane its rows stand
+    for (an FP4 top-k's: `plane_width` packed, else its logits' `stride0`) or
+    the width of the logits it reads (`stride0`, V4.1's top-k, its scorer's),
+    or, in a graph captured before V4.1's key RoPE stated its ratio, a RoPE's
+    positions the rows its compress plan holds (`compressed`), or aten's index
+    its table its model's last layer's (`queries`), where a replay's queries
+    take their pointers."""
     args, (slot, *rest) = op["args"], path.split(".")
     listed = args.get("ratios")
     if rest and isinstance(args.get(slot), list) and isinstance(listed, list):
@@ -2269,6 +2340,13 @@ def _ratio(op, path, known=None):
     if ratio is None and "rows_per_page" in args and "selected" in args:
         ratio = (known or {}).get(("rows_per_page", args["rows_per_page"]))
         ratio = ratio if args["selected"] else 0
+    plan = args.get("plan") if op["op"] == _FP4 else None
+    if ratio is None and known and isinstance(plan, dict):
+        blocks = dict(plan.get("state") or ()).get("pages_per_block")
+        ratio = known.get(("pages_per_block", blocks))
+    if ratio is None and known and "plane_width" in args:
+        width = args["plane_width"] or args.get("stride0")
+        ratio = known.get(("plane_width", width))
     if ratio is None and known and "stride0" in args:
         ratio = known.get(("stride0", args["stride0"]))
     if ratio is None and known and (op["op"], path) == (_ROPE, "positions"):
@@ -2285,6 +2363,8 @@ def _named(op, path, spec, pool, known=None) -> dict | None:
     role = (op["args"].get("self") or {}).get("role")
     if op["op"] == _ROPE:  # over one head a ratio's index keys, over more a query
         role = "key" if op["args"]["input"]["shape"][-2] == 1 else "query"
+    if op["args"].get("packed_rows"):  # a top-k whose rows start apart
+        role = "packed"
     wanted = V41_NAMES.get((*key, role), V41_NAMES.get(key, ()))
     wanted = wanted if isinstance(wanted, tuple) else (wanted,)
     ratio = _ratio(op, path, known)
@@ -2373,18 +2453,26 @@ def _own_rows(op) -> dict:
 
 
 def _written(op, path) -> str | None:
-    """Which index table of `_WRITTEN` `op`'s `path` takes: a scorer's on a
-    plane its row bounds ATOM stages bound, the page-wide one, its tile table
-    (`tiles`), else a candidate list's (`table`); an activation row bound the
-    pick's (`ends`) under a top-k of activation logits, else a candidate
-    list's (`context`); None for a row bound ATOM stages, or another slot."""
-    kind = _WRITTEN.get((op["op"], path))
-    role = {s: v.get("role") for s, v in op["args"].items() if isinstance(v, dict)}
-    if kind == "tiles" and role.get("context_lens") != "metadata":
-        return "table"
+    """Which index table of `_WRITTEN` `op`'s `path` takes: a scorer's on
+    activation row bounds a candidate list's (`table`, `starts`), else the
+    FP8 page-wide one's (`tiles`); an activation row bound the pick's
+    (`ends`) under a top-k of activation logits or of packed rows, there its
+    maxima and their starts too, else a candidate list's (`context`); None
+    for a table or row bound ATOM stages, or another slot."""
+    kind, args = _WRITTEN.get((op["op"], path)), op["args"]
+    role = {s: v.get("role") for s, v in args.items() if isinstance(v, dict)}
+    listed = (role.get("context_lens") or role.get("row_ends")) == "activation"
+    packed = listed and bool(args.get("packed_rows"))  # FP4's pick's top-k
+    if kind == "tiles":
+        return "table" if listed else kind
+    if kind in ("table", "starts"):  # FP4's: else its PAGE table, its sequences
+        return kind if listed else None
+    if kind == "maxima":
+        return kind if packed else None
     if kind == "context" and role.get(path) != "activation":
-        return None
-    return "ends" if kind == "context" and role.get("logits") == "activation" else kind
+        return "block_offsets" if packed else None
+    picks = role.get("logits") == "activation" or packed
+    return "ends" if kind == "context" and picks else kind
 
 
 def _candidates(ends, k) -> torch.Tensor:
@@ -3110,6 +3198,31 @@ def _scores(plane, ends, spec) -> None:
 
 def _reached(ends, width) -> list[int]:  # each row's columns below its bound
     return ends.reshape(-1).clamp(0, width).tolist()
+
+
+@functools.lru_cache(maxsize=CALLS)
+def _stairs(reach, stride, span, itemsize, llc) -> tuple:
+    """`CALLS` copies of a plane whose rows read `reach` columns `stride` apart,
+    a view `span` elements of `itemsize` bytes, none reading another's, in the
+    fewest buffer bytes: copy c in buffer `c div p`, `c mod p div k` steps and
+    `c mod k` bands past its start, each a `WEIGHT_ALIGN` multiple. A step
+    passes the rows up to the last widest and the columns the widest row past
+    them reads, its drift, so a stair of copies a step apart reads each one's
+    widest rows beside the narrower ones of those above; a band is as wide as
+    the widest row and its stair's drifts. A stair's buffer holds at most twice
+    `COLD` times the cache. Returns p, k, step, band and a buffer's elements."""
+    unit, top = max(WEIGHT_ALIGN // itemsize, 1), max(reach)
+    q = len(reach) - reach[::-1].index(top)  # past the widest rows
+    step = -(-(q * stride + max(reach[q:], default=0)) // unit) * unit
+    laid = []
+    for a in range(1, CALLS + 1 if q < len(reach) else 2):  # copies a stair
+        band = -(-((a - 1) * (step - q * stride) + top) // unit) * unit
+        k = stride // max(band, 1) or int(a == 1)
+        held = (a - 1) * step + (k - 1) * band + span
+        if not k or a > 1 and held * itemsize > 2 * COLD * llc:
+            break
+        laid.append((-(-CALLS // (a * k)) * held, a * k, k, step, band, held))
+    return min(laid)[1:]
 
 
 def _clone(t) -> torch.Tensor:
@@ -3861,16 +3974,21 @@ def exchange(op: dict) -> list | None:
     bytes, the axis it is priced over: the family is its kind, each tensor
     argument's dtype and row width, its output rows' widths and its arguments
     neither tensors nor numbers; the bytes the largest of its tensors and its
-    outputs, at its first tensor's dtype. None for any other leaf."""
+    outputs, at its first tensor's dtype, but a MORI combine's its input's,
+    the rows it moves, since it returns MORI's whole buffer, as many rows at
+    every width. None for any other leaf."""
     import math
 
     if not op["op"].startswith(COLLECTIVES):
         return None
     tensors = [s for _, s in _specs(op["args"])]
     size = _dtype(tensors[0]["dtype"]).itemsize
+    sized, outs = tensors, op["out"]
+    if op["op"] == f"{MORI}.combine":
+        sized, outs = [op["args"]["input"]], []
     nbytes = max(
-        [math.prod(t["shape"]) * _dtype(t["dtype"]).itemsize for t in tensors]
-        + [math.prod(o) * size for o in op["out"]]
+        [math.prod(t["shape"]) * _dtype(t["dtype"]).itemsize for t in sized]
+        + [math.prod(o) * size for o in outs]
     )
     fam = {
         "op": op["op"],
