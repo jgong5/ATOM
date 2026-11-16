@@ -1199,6 +1199,56 @@ def test_a_v41_plane_s_copies_read_its_widest_row_beside_others_narrow_rows(
     assert at == starts
 
 
+@pytest.mark.parametrize(
+    "call_ns, calls",
+    [(1.0, None), (ops.GRAPH_NS / 3.5, 3)],
+    ids=["copies_under_calls", "a_copy_a_call"],
+)
+def test_a_v41_plane_whose_copies_read_under_twice_the_cache_refuses_by_name(
+    monkeypatch, call_ns, calls
+):
+    # a top-k's FP8 plane, [8, 1024] float32, its first row reading 1000
+    # columns and the rest 20: no stair fits beside its widest row, so its
+    # copies stop at 3, where their buffers pass 4 * COLD times a cache of
+    # 10000 bytes, at 4624 bytes a call: 13872 bytes, under the 5 copies
+    # that pass twice the cache. Under 256 calls it refuses; where 3 calls
+    # fill `GRAPH_NS`, each call reads a copy of its own, and it is timed.
+    bounds = [1000] + [20] * 7
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner = _Runner()
+    geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(8, 1024)
+    runner.forward_vars["ends"] = torch.tensor(bounds)
+    plane, ends = _t([8, 1024], "metadata"), _t([8], "metadata", dtype="torch.int64")
+    top_k = _leaf(ops._TOPK, ("logits", plane), ("row_ends", ends))
+    found = ops.leaves(_graph(top_k, layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    timed = []
+
+    def replay(fn, cycle, flush=None):
+        timed.append(len(cycle))
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], call_ns)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        [record] = ops.Stub(runner, 10_000).point(placed, decode(8), 20, found)
+
+    if calls is None:
+        assert record["refused"] == (
+            "ValueError: its 3 copies for 256 calls read 69% of twice the cache: "
+            "no cold layout fits its ragged rows"
+        )
+        assert timed == []
+    else:
+        assert "refused" not in record and timed == [calls]
+        assert (record["copies"], record["calls"]) == (3, calls)
+        assert record["footprint_bytes"] == 3 * (4 * sum(bounds) + 64)
+
+
 def test_an_embedding_reads_the_token_ids_atom_prepared():
     runner = _Runner()
     # An index buffer whose name holds the slot's, which the name rule picks.
