@@ -320,8 +320,8 @@ def digest(run) -> str:
 
 
 def _changed(cell: Path, ran: dict) -> list[str]:
-    """The runs of `cell` its `GRADES` grades, `ran`, each by the `digest`
-    grading read, that hold other results now."""
+    """The runs of `ran`, each name's `digest` as grading read it, that `cell`
+    holds other results for now."""
     return [n for n, sha in ran.items() if digest(cell / n) != sha]
 
 

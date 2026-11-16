@@ -153,7 +153,7 @@ def test_a_run_that_reruns_while_its_cell_is_graded_shows_no_grades(
 
 @pytest.mark.parametrize("rerun", RERUNS)
 def test_a_rerun_s_report_renders_the_reports_its_cell_graded_again(
-    capsys, tmp_path, rerun
+    capsys, tmp_path, monkeypatch, rerun
 ):
     cell = _cell(capsys, tmp_path)
     wrote = ["real0", "real1", "step_linear"]  # real2 ended before reports existed
@@ -162,8 +162,9 @@ def test_a_rerun_s_report_renders_the_reports_its_cell_graded_again(
     _graded(capsys, cell)
     before = {run: _Page(cell / run).parts for run in wrote}
     _rerun(cell, rerun)
+    monkeypatch.chdir(cell / rerun)
 
-    html.write(cell / rerun)
+    html.write(".")  # `python -m atom.compass.report.html .` inside the rerun
 
     graded = ", ".join(RUNS)
     stale = f"None: {cell / html.GRADES} grades {graded}; {rerun} changed since."
