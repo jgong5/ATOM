@@ -1611,7 +1611,7 @@ what-if: never graded, and refused by the graders.
 **Measured, not hooked.** The parity recorder, `RecordingModelRunner`
 (`atom/compass/parity/runner.py`), stamps host time around the staging gate, the launch
 and the R1 wait (with MTP also the draft copy wait; on a non-first PP stage also the R7
-receive, and on the last stage its own token read, as off a pipeline a runner that does not defer its output stamps it, with a drafter its own draft read as the draft copy wait; on a sending stage an idle
+receive, and on the last stage its own token read, which a single stage whose runner does not defer its output stamps too, as `t_read_ns`; with a drafter, either also stamps its own draft read as the draft copy wait, `t_draft_read_ns`; on a sending stage an idle
 `flush_pp_send` that settles a send), and records device events at
 `run_model` entry, with MTP at the target's end, on a non-first PP stage where the
 received tensors are in, and at the forward's exit, drained with `query()`, never `synchronize()`
