@@ -91,6 +91,29 @@ def keyed_of(engine: dict) -> dict:
     return {k: v for k, v in engine.items() if k not in (*UNKEYED, PREFILL_BUCKETS)}
 
 
+def at_ladder(here: dict, there) -> dict:
+    """A run's `run.step_grid.keyed` fields `here`, its ladder read as the one
+    the engine config `there` of a law, host laws or a bundle states where it is
+    a non-empty prefix of it: a batch pads to the same rung under every ladder
+    holding that rung. Otherwise `here` as it is, so a comparison names the
+    ladder."""
+    ours = here.get("ladder")
+    theirs = there.get("ladder") if isinstance(there, dict) else None
+    if ours and isinstance(theirs, list) and theirs[: len(ours)] == ours:
+        return {**here, "ladder": theirs}
+    return here
+
+
+def pooled(engines: dict) -> dict:
+    """`engines`, {input: its engine config}, each read by `at_ladder` at the
+    longest ladder among them, the first of that length: a fit pools records
+    whose ladders are prefixes of it. Any other ladder stays as it is, so a
+    comparison after names `ladder`."""
+    ladders = [e.get("ladder") for e in engines.values()]
+    longest = max((x for x in ladders if isinstance(x, list)), key=len, default=None)
+    return {i: at_ladder(e, {"ladder": longest}) for i, e in engines.items()}
+
+
 def _views(steps) -> list[tuple[str, BatchView]]:
     """Each named step-record line as the view a simulated runner prices."""
     views = [

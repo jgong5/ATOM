@@ -7,7 +7,8 @@
 time, plus `d_gap_ns` on a decode, and its line's host segments: `E` from the previous exit to the entry,
 `W_pre` to the launch less the staging gate's and MTP status waits, `W_launch` to the
 recv wait (the sampler's launch included), and `W_post` from the recv wait to the exit
-less the draft copy wait; with
+less the draft copy wait; a runner that does not defer its output stamps its read of its own tokens
+(`t_read_ns`) as its recv wait, released at its own target end, and a record stamping none defers; with
 `d_target_ns`, under MTP, the target runs to `forward_done_event`, with
 `d_draft_kv_ns` on an output forward, the rest of `d_busy_ns` is draft; where
 the device reached the `propose` pass before the host's draft copy wait
@@ -173,13 +174,14 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
     mtp = any("d_target_ns" in s for s in steps)
     copy = step_labels.mtp_copy(steps) if mtp else {}
     waited = step_labels.host_paced_drafts(steps) if mtp else set()
-    rec = HostDeviceRecurrence({}, (), lambda: now, stage, mtp=mtp)
+    defer = not any("t_read_ns" in s for s in steps)
+    rec = HostDeviceRecurrence({}, (), lambda: now, stage, mtp=mtp, defer=defer)
     kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
     for n, s in enumerate(steps):
         if "d_busy_ns" not in s:
             raise ValueError(f"step {s['step']} has no device window to charge")
         (g0, g1), (l0, l1) = s["t_gate_ns"], s["t_launch_ns"]
-        r0, r1 = s.get("t_recv_ns", (l1, l1))
+        r0, r1 = s.get("t_recv_ns", s.get("t_read_ns", (l1, l1)))
         m0, m1 = s.get("t_mtp_ns", (l0, l0))
         d0, d1 = s.get("t_draft_recv_ns", (0, 0))
         p0, p1 = s.get("t_pp_recv_ns", (l0, l0))

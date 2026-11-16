@@ -16,7 +16,8 @@ outside ATOM's Python passes.
 `law` gives the step linear law and host laws a resolved config runs under one
 verdict, `reuse`, `calibrate` or `refused`, from each law file under `LAWS` and
 each step linear law in a store whose key states the config's model, engine
-config and platform, at any ATOM digest and form; of several, reuse comes
+config and platform, at any ATOM digest and form, the engine config at any
+ladder the config's is a prefix of; of several, reuse comes
 first, then refused, then calibrate. The requirement a verdict names:
 
 1. the same key: none there, a store law, or host laws beside it, at another
@@ -60,6 +61,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.artifacts.store import ENTRY_FILE
 from atom.compass.backends.launch_features import GRAPHS
+from atom.compass.backends.step_grid_plan import at_ladder
 from atom.compass.drive import runfile
 from atom.compass.drive.lacking import AXIS, uncovered_rungs
 from atom.compass.run import STEP_LINEAR, memory
@@ -270,8 +272,9 @@ def _keyed(store: ArtifactStore, kind: Kind, engine: dict, **fields) -> list[Key
 
 
 def _same(there, here: dict) -> bool:
-    """Whether `there` is the engine config `here`, as the runner compares one."""
-    return isinstance(there, dict) and not differ(there, here, "")
+    """Whether `there` is the engine config `here`, as the runner compares one:
+    `here` at `there`'s ladder where its own is a prefix of it (`at_ladder`)."""
+    return isinstance(there, dict) and not differ(there, at_ladder(here, there), "")
 
 
 def _verdict(verdict: str, requirement: int | None, reason: str, **more) -> dict:

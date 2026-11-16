@@ -7,22 +7,18 @@ deployment, and the closed schema refuses any key it does not declare. An
 engine start's memory readings are not the spec's: `compass measure memory`
 publishes them per configuration as a `memory_readings` entry.
 
-The verbs: `merge` combines fragments and refuses ones that describe two
-machines. A run reads the result with `MachineSpec`, which states each field's
-origin. `across_ranks` is `compass measure memory`'s spread check.
+A run reads a spec with `MachineSpec`, which states each field's origin.
+`across_ranks` is `compass measure memory`'s spread check.
 
 Nothing here imports a tensor library, a device runtime or the engine.
 """
 
 from .machine import MachineSpec
-from .merge import Fragment, merge
 from .ranks import across_ranks
 from .rules import SpecRefusal
 
 __all__ = [
-    "Fragment",
     "MachineSpec",
     "SpecRefusal",
     "across_ranks",
-    "merge",
 ]

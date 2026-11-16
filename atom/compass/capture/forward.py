@@ -130,15 +130,25 @@ V41_OPENED = (
     "v41_end_forward",
     "v41_record_tbo_expert_output",
 )
-#: DeepSeek-V4.1's sparse attention, and its indexer's scorers, gfx1250's
-#: and gfx950's.
+#: DeepSeek-V4.1's sparse attention, over its FP8 pool the second, and its
+#: indexer's scorers, gfx1250's and gfx950's.
 V41_ATTENTION = "aiter.pa_sparse_prefill_opus.default"
+V41_FP8_ATTENTION = "aiter.mla_sparse_prefill_v41.default"
 V41_SCORERS = (
     (
         "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
         "flydsl_fp8_paged_mqa_logits_gfx1250"
     ),
     "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
+)
+#: DeepSeek-V4.1's top-k, as aiter's decode top-k launches it: FlyDSL's
+#: multi-CTA kernel where the arch's gates take the call's width and rows
+#: (gfx950's), else FlyDSL's one-block kernel, else, on logits narrower than
+#: k, its HIP kernel.
+V41_TOPKS = (
+    "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode",
+    "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
+    "aiter._top_k_per_row_decode.default",
 )
 #: DeepSeek-V4.1's RoPE, which its index keys take at their ratio's compress
 #: plan's positions: with no drafter both ratios' plans hold as many rows.
@@ -885,6 +895,20 @@ class _Recorder(TorchDispatchMode):
         return re.sub(rf"\blayers\.{self.layer}\b", f"layers.{{{LAYER}}}", path)
 
 
+class _Pinned(TorchDispatchMode):
+    """What ATOM allocates with `pin_memory=True` where the recorder is off, as
+    the runner is built and sizes its pools, held pinned (`_Recorder.pin`);
+    nothing else is touched, a host array headed for the device among it."""
+
+    def __init__(self, recorder):
+        super().__init__()
+        self.pin = recorder.pin
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        return self.pin(out) if (kwargs or {}).get("pin_memory") else out
+
+
 def _coordinator(group_name: str) -> str:
     """The aiter coordinator (`tp:0`) whose device group torch names
     `group_name`, or the name as it is when none is: torch numbers groups in
@@ -1311,14 +1335,16 @@ def _v41(recorder, hf):
     each request's state is where the scheduler put it has no values to
     judge.
 
-    Its sparse attention (`V41_ATTENTION`) states the layer's `window_size`,
+    Its sparse attention (`V41_ATTENTION`, `V41_FP8_ATTENTION`) states the
+    layer's `window_size`,
     `compress_ratio` and `index_topk` (None where it compresses nothing), and
     its indexer's scorers (`V41_SCORERS`) the `compress_ratio` and
     `index_candidates`, the most entries it scores where an earlier layer
     chose its candidates, else None: read off the layer `layer_name` names
     and the model's config `hf`. Its index keys' RoPE (`V41_ROPE`) states
     their indexer's `compress_ratio`; its query's, on the step's positions
-    at every ratio, states none.
+    at every ratio, states none. Its top-k (`V41_TOPKS`) states the scorers'
+    `compress_ratio`.
     """
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.models.deepseek_v41.attention import Indexer
@@ -1336,7 +1362,9 @@ def _v41(recorder, hf):
         scored = ("compress_ratio", ratio), ("index_candidates", candidates)
         stated = {
             V41_ATTENTION: (*geometry, ("index_topk", top)),
+            V41_FP8_ATTENTION: (*geometry, ("index_topk", top)),
             **dict.fromkeys(V41_SCORERS, scored),
+            **dict.fromkeys(V41_TOPKS, scored[:1]),
         }
         with patch.object(recorder, "stated", stated):
             return attend(hidden, layer_name, *args, **kwargs)
@@ -1686,7 +1714,9 @@ class Tracer:
                 stack.enter_context(patch.object(owner, name, value))
             if config.enable_expert_parallel:
                 peers.install_mori(recorder)
-        runner = _build_runner(config, fake_mode)
+        pinned = _Pinned(recorder)
+        with pinned:
+            runner = _build_runner(config, fake_mode)
         if v4 := sys.modules.get("atom.models.deepseek_v4"):
             stack.enter_context(_v4_attention(v4, recorder))
         if v41 := "atom.models.deepseek_v41.runtime" in sys.modules:
@@ -1717,7 +1747,7 @@ class Tracer:
         recorder.roles = dict.fromkeys(weights, ir.Role.WEIGHT)
         per_req = InputOutputProcessor._per_req_cache_model_types()
         self.stateful = config.hf_config.model_type in per_req
-        with fake_mode, torch.inference_mode():
+        with fake_mode, pinned, torch.inference_mode():
             runner.get_num_blocks()  # sizes the pools, as `EngineCore` does
         # A warmup copy whose bytes nobody reads, like `_maybe_warmup`.
         runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
