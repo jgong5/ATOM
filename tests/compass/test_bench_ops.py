@@ -926,6 +926,57 @@ def test_v41_fp4_whole_context_leaves_take_their_ratio_s_bounds_and_packed_start
     ]
 
 
+def test_the_v41_candidate_lift_leaves_its_selection_as_built_past_twice_the_kept(
+    monkeypatch,
+):
+    from atom.model_ops.deepseek_v41.candidate_table import (
+        lift_candidate_selection_reference as lift,
+    )
+
+    I32 = "torch.int32"
+    leaf = _leaf(
+        "atom.model_ops.deepseek_v41.candidate_table:lift_candidate_selection",
+        ("selected", _t([2, 16], "activation", dtype=I32)),
+        ("candidates", _t([2, 4], "activation", dtype=I32)),
+        ("rows_per_block", 8),
+    )
+    # rows seeing 64 and 20 compressed rows: 8 blocks of 8, twice the 4 the
+    # pick keeps, and 3
+    [call] = _v41_index(monkeypatch, [64, 20], (leaf,), decode(2), 64)
+
+    # the lift rewrites its selection in place, and the bench calls a copy
+    # again: each call reads the columns the copy was built with
+    built = call["selected"].clone()
+    lift(call["selected"], call["candidates"], rows_per_block=8)
+    assert torch.equal(call["selected"], built)
+    # 4 of the first row's 8 blocks from block 0, its newest last
+    assert call["candidates"].tolist() == [[0, 3, 5, 7], [0, 1, 2, -1]]
+
+
+def test_a_v41_prefill_past_cached_tokens_picks_candidates_off_its_rows_blocks(
+    monkeypatch,
+):
+    # as a prefill of 256 tokens traced them: 8 PAGEs, 32 index blocks
+    pick = _leaf(
+        "aiter._top_k_per_row_decode.default",
+        ("logits", _t([256, 32], "activation")),
+        ("seqLens", _t([256], "activation", dtype="torch.int32")),
+        ("stride0", 32),
+    )
+    tables = _t([1, 8], "metadata", [64, 1], "torch.int32")
+    units = "atom.model_ops.deepseek_v41.unit_table:unit_table"
+    units = _leaf(units, ("block_tables", tables))
+    visible = list(range(1025, 1281))  # past 1024 cached tokens
+
+    leaves = pick, units
+    pick, units = _v41_index(monkeypatch, visible, leaves, prefill(256, 1), 1024)
+
+    # its rows reach 40 PAGEs: 160 index blocks
+    assert pick["logits"].shape == (256, 160) and pick["stride0"] == 160
+    assert pick["seqLens"].tolist() == [-(-v // 8) for v in visible]
+    assert units["block_tables"].shape == (1, 40)
+
+
 @pytest.mark.parametrize(
     "ranked, llc, copies",
     [(True, 10_000, 47), (False, 10_000, 47), (True, 150, 1)],
@@ -1063,57 +1114,6 @@ def test_v41_fp4_pick_s_block_maxima_and_top_k_count_and_rank_their_packed_rows(
     assert maxima["maxima"].eq(0).all()  # written, not drawn
     assert ranked[:7].ne(0).all() and ranked[8:11].ne(0).all()
     assert ranked[7:8].eq(0).all() and ranked[11:].eq(0).all()
-
-
-def test_the_v41_candidate_lift_leaves_its_selection_as_built_past_twice_the_kept(
-    monkeypatch,
-):
-    from atom.model_ops.deepseek_v41.candidate_table import (
-        lift_candidate_selection_reference as lift,
-    )
-
-    I32 = "torch.int32"
-    leaf = _leaf(
-        "atom.model_ops.deepseek_v41.candidate_table:lift_candidate_selection",
-        ("selected", _t([2, 16], "activation", dtype=I32)),
-        ("candidates", _t([2, 4], "activation", dtype=I32)),
-        ("rows_per_block", 8),
-    )
-    # rows seeing 64 and 20 compressed rows: 8 blocks of 8, twice the 4 the
-    # pick keeps, and 3
-    [call] = _v41_index(monkeypatch, [64, 20], (leaf,), decode(2), 64)
-
-    # the lift rewrites its selection in place, and the bench calls a copy
-    # again: each call reads the columns the copy was built with
-    built = call["selected"].clone()
-    lift(call["selected"], call["candidates"], rows_per_block=8)
-    assert torch.equal(call["selected"], built)
-    # 4 of the first row's 8 blocks from block 0, its newest last
-    assert call["candidates"].tolist() == [[0, 3, 5, 7], [0, 1, 2, -1]]
-
-
-def test_a_v41_prefill_past_cached_tokens_picks_candidates_off_its_rows_blocks(
-    monkeypatch,
-):
-    # as a prefill of 256 tokens traced them: 8 PAGEs, 32 index blocks
-    pick = _leaf(
-        "aiter._top_k_per_row_decode.default",
-        ("logits", _t([256, 32], "activation")),
-        ("seqLens", _t([256], "activation", dtype="torch.int32")),
-        ("stride0", 32),
-    )
-    tables = _t([1, 8], "metadata", [64, 1], "torch.int32")
-    units = "atom.model_ops.deepseek_v41.unit_table:unit_table"
-    units = _leaf(units, ("block_tables", tables))
-    visible = list(range(1025, 1281))  # past 1024 cached tokens
-
-    leaves = pick, units
-    pick, units = _v41_index(monkeypatch, visible, leaves, prefill(256, 1), 1024)
-
-    # its rows reach 40 PAGEs: 160 index blocks
-    assert pick["logits"].shape == (256, 160) and pick["stride0"] == 160
-    assert pick["seqLens"].tolist() == [-(-v // 8) for v in visible]
-    assert units["block_tables"].shape == (1, 40)
 
 
 def _pick(monkeypatch, arch, k, env=None):
