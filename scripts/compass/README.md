@@ -957,11 +957,11 @@ run sets them and passes the acceptance length too. A record that built a Triton
 taken again; no record of the law built one.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json` is the same law for
-cell A, TP4 with whole-expert EP4: fitted alike on one `calibrate.sh` run's records at ATOM
-ed5fa7697 in the same image ([#2744](https://github.com/jgong5/ATOM/issues/2744)), under the
-same environment with `ATOM_ENGRAM_UVA=1 ATOM_ENGRAM_UVA_HBM=1` in place of
-`ATOM_ENGRAM_UVA=0`, so every rank held its Engram shard in HBM, and the same `SERVER_ARGS`
-with `--enable-expert-parallel --spec-decode-acceptance-length 3` added. Its engine config
+cell A, TP4 with whole-expert EP4: `compass fit steps` and `compass fit host` both ran at ATOM
+ed5fa7697 on one `calibrate.sh` run's records at ed5fa7697 in the same image
+([#2744](https://github.com/jgong5/ATOM/issues/2744)), so its host laws place `L_mtp` before
+[#3096](https://github.com/jgong5/ATOM/issues/3096) ([#3273](https://github.com/jgong5/ATOM/issues/3273)),
+under the same environment and the same `SERVER_ARGS` with `--enable-expert-parallel` added. Its engine config
 holds `AITER_LOG_LEVEL`, `OMP_NUM_THREADS` and `ATOM_TOKEN_GRAPH_SIZES` at ed5fa7697's
 default buckets; a run priced by it sets them and passes the acceptance length too. The
 records are concurrency 1, 4, 16, 64 and 256, then 8, 12 and 56 from each trajectory's
