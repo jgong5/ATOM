@@ -134,7 +134,8 @@ def resolved(config, atom_args):
 def stubbed(tmp_path, monkeypatch):
     """The configuration, resolved as `resolved` resolves it for every
     instance, at the head whose digest is the tree's, with no law file; each
-    start the stub's, given `check.START_S` 2 s."""
+    start the stub's, given `check.START_S` 60 s, a bound only a stalling
+    start reaches."""
     r = deployment(tmp_path, **COVERED)
     served(monkeypatch, r.config)
     resolved_here(monkeypatch, lambda atom_args: resolved(r.config, atom_args))
@@ -149,7 +150,7 @@ def stubbed(tmp_path, monkeypatch):
     stub.chmod(0o755)
     monkeypatch.setattr(check, "COMPASS", stub)
     monkeypatch.setattr(check, "DEPLOY", stub)
-    monkeypatch.setattr(check, "START_S", 2)
+    monkeypatch.setattr(check, "START_S", 60)
     monkeypatch.setenv("STUB_CALLS", str(tmp_path / "calls.jsonl"))
     monkeypatch.delenv("STUB_STALL", raising=False)
     return r
@@ -199,7 +200,6 @@ def test_each_candidate_gets_one_state_and_each_point_missing_readings_its_comma
             "a": {"per_concurrency": {"--max-model-len": 512}},
             "b": {"args": {"--max-num-seqs": 12}},
             "c": {"args": {"--enable-dynamic-chunking": True}},
-            "d": {"env": {"STUB_STALL": "1"}},
         },
     )
 
@@ -207,7 +207,6 @@ def test_each_candidate_gets_one_state_and_each_point_missing_readings_its_comma
         "a": "searchable",
         "b": "missing a law",
         "c": "refused",
-        "d": "refused",
     }
     a = found["a"]["points"]
     assert a["a-c4"] == {"state": "searchable", "why": [], "made_by": []}
@@ -225,7 +224,6 @@ def test_each_candidate_gets_one_state_and_each_point_missing_readings_its_comma
     log = out / "starts" / "c-c1" / "server.log"
     left = f"compass run: the server exited 1 before /health answered; see {log}"
     assert found["c"]["why"] == [f"{left}; {REFUSED}"]
-    assert found["d"]["why"] == [f"no {out / 'starts/d-c1/server.json'} in 2 s"]
     assert all(s["points"] == {} for name, s in found.items() if name != "a")
     machine = json.loads((out / "candidates.json").read_text())["machine"]
     ran = [call["argv"] for call in starts(tmp_path)]
@@ -236,7 +234,6 @@ def test_each_candidate_gets_one_state_and_each_point_missing_readings_its_comma
     assert ran == [
         [*each, str(out / "starts/a-c4"), *model, "--max-model-len", "2048"],
         [*each, str(out / "starts/c-c1"), *model, "--enable-dynamic-chunking"],
-        [*each, str(out / "starts/d-c1"), *model],
     ]
     assert (out / "starts/a-c4/stopped").is_file()
     assert not (out / "cal").exists()
@@ -246,6 +243,23 @@ def test_each_candidate_gets_one_state_and_each_point_missing_readings_its_comma
     assert f"    made by: {calibration}\n" in printed
     assert f"    refused: {found['c']['why'][0]}\n" in printed
     assert f"1 points searchable, each state in {out / check.STATES}\n" in printed
+
+
+def test_a_start_that_does_not_answer_in_start_s_refuses_its_candidate(
+    tmp_path, stubbed, monkeypatch
+):
+    monkeypatch.setattr(check, "START_S", 2)
+    law_file(tmp_path, law(stubbed))
+
+    found = advise(tmp_path, {"d": {"env": {"STUB_STALL": "1"}}})
+
+    ready = tmp_path / "out" / "starts" / "d-c1" / "server.json"
+    assert found["d"] == {
+        "state": "refused",
+        "why": [f"no {ready} in 2 s"],
+        "made_by": [],
+        "points": {},
+    }
 
 
 def test_a_refusal_at_one_point_outranks_another_point_s_missing_law(tmp_path, stubbed):
