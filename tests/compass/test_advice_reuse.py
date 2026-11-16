@@ -47,7 +47,9 @@ from atom.compass.artifacts import (
     keyed_platform,
     member_name,
 )
+from atom.compass.bench import ops
 from atom.compass.drive import reuse
+from atom.compass.drive import run as drive_run
 from atom.compass.fit.publish import RANK
 from atom.compass.run import memory
 from atom.compass.run.step_grid import keyed
@@ -72,9 +74,19 @@ def searched(tmp_path, monkeypatch, at_head):
     whose digest is the tree's, with no law file."""
     r = deployment(tmp_path, **COVERED)
     served(monkeypatch, r.config)
+    resolved_here(monkeypatch, lambda atom_args: r.config)
     monkeypatch.setattr(reuse, "LAWS", tmp_path / "laws")
     (tmp_path / "laws").mkdir()
     return r
+
+
+def resolved_here(monkeypatch, resolve):
+    """Each instance's config `resolve(atom_args)`, resolved in this process
+    rather than in the check's child."""
+    monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(
+        drive_run, "_declared", lambda atom_args, arch: resolve(atom_args)
+    )
 
 
 def advise(tmp_path, document=DOCUMENT, **fields) -> dict:
@@ -177,11 +189,8 @@ def test_a_law_and_readings_at_the_head_s_key_are_reused_at_every_point(
 
     judged = advise(tmp_path)
 
-    assert (
-        verdicts(judged, "law")
-        == [{"verdict": "reuse", "requirement": None, "reason": where, "law": where}]
-        * 2
-    )
+    reused = {"verdict": "reuse", "requirement": None, "reason": where, "law": where}
+    assert verdicts(judged, "law") == [reused | {"run": [where, where]}] * 2
     assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
     assert judged["candidates"]["a"]["store"] == str(tmp_path / "store")
     out = capsys.readouterr().out
@@ -239,11 +248,13 @@ def test_a_store_law_the_store_refuses_to_load_names_requirement_2(
         assert found["reason"].startswith(f"{where}: ")
         assert f"`{Kind.STEP_LINEAR_LAW}` x `{Axis.ATOM_SRC}`" in found["reason"]
     else:
+        host = Key.of(Kind.HOST_LAWS, **host_laws_key(r)).token()
         assert found == {
             "verdict": "reuse",
             "requirement": None,
             "reason": where,
             "law": where,
+            "run": [where.split()[1], host],
             "store": str(tmp_path / "store"),
         }
 
@@ -297,11 +308,14 @@ def test_a_law_with_a_source_stating_no_figures_names_requirement_4(tmp_path, se
 
     found, _ = verdicts(advise(tmp_path), "law")
 
+    (made_by,) = found.pop("made_by")
+    assert made_by.startswith("no calibrate.sh command: ")
     assert found == {
         "verdict": "calibrate",
         "requirement": 4,
         "reason": f"{where} states no cost-accuracy figures of source lone",
         "law": where,
+        "run": [where, where],
     }
 
 
