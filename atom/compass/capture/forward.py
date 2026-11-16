@@ -957,7 +957,8 @@ def _patches(recorder):
     * ATOM's MoE wrappers run their bodies, not their fakes: inside are the
       collectives, the streams and the expert kernels. A two-batch-overlap
       micro-batch's MoE runs on one stream, as under overlap, where
-      `tbo_active()` turns the dual-stream MoE off.
+      `tbo_active()` turns the dual-stream MoE off. aiter's comm-fused MoE
+      runs as one leaf (`peers.comm_fused`).
     * The aiter fused-MoE leaves (`FUSED_MOES`) of a layer whose top-k ids
       aiter's table widens with its fused shared experts (`LEGACY_AITER`)
       state the layer's `top_k` and `fused_shared_experts`: the ids' width
@@ -1138,6 +1139,7 @@ def _patches(recorder):
         ),
         (module_dispatch_ops, "_dual_stream_is_active", one_stream_in_micro_batch),
         (rejection_sampler, "_synthetic_generator", lambda device: torch.Generator()),
+        *peers.comm_fused(recorder),
         *_mono(recorder, unpatched),
     ):
         stack.enter_context(patch.object(owner, name, value))

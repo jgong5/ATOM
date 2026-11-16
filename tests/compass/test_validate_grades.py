@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """What grading keeps, `python -m atom.compass.validate CELL...`: the rows it
 prints, in the cell's `grades.json`, and the report of each of the cell's runs
-rendered again to show them while none of its runs ran again. The cells are
+rendered again to show them while none of its runs ran again, its simulated
+run's showing the real runs' per-request splits beside its own. The cells are
 `test_validate_main`'s, laid out as `record` and `run` write them, each run's
 report written as a run writes its own when it ends.
 """
@@ -13,9 +14,10 @@ import pytest
 from test_report_html import _Page
 from test_validate_main import _as_recorded, _rows
 
-from atom.compass.report import html
+from atom.compass.report import html, split
 from atom.compass.run import SUMMARY_FILE
 from atom.compass.validate import __main__ as validate
+from atom.compass.validate import curves
 from atom.compass.validate.__main__ import main
 from atom.compass.validate.runs import EXPORT
 
@@ -211,3 +213,65 @@ def test_a_cell_and_a_run_given_as_the_working_directory_are_named(
     html.write(".")
 
     assert _Page(cell / "real0").parts["Grades"]["text"] == [SHOWN]
+
+
+#: Each split request's segments as shares of its end-to-end latency.
+SHARES = {"queue_s": 0.1, "prefill_s": 0.5, "decode_s": 0.4, "e2el_s": 1.0}
+#: The end-to-end latencies of the requests each run split.
+SPLITS = {"step_linear": [1.0, 2.0, 3.0], "real0": [2.0, 4.0], "real1": [3.0, 5.0, 9.0]}
+BESIDE = "A real run's per-request split"
+
+
+def _requests(e2el: list[float], phase="profiling") -> list[dict]:
+    """A split's requests, as `split` writes them, one per latency in `e2el`."""
+    tokens = {"lmcache_load_tokens": 0, "lmcache_store_tokens": 0}
+    return [
+        {"phase": phase} | tokens | {k: s * e for k, s in SHARES.items()} for e in e2el
+    ]
+
+
+def test_a_graded_simulated_run_s_report_shows_each_real_run_s_split_beside_its_own(
+    capsys, tmp_path
+):
+    cell = _cell(capsys, tmp_path)
+    for run, e2el in SPLITS.items():
+        # A warmup request, which the headline metrics and no percentile count.
+        made = {"requests": _requests(e2el) + _requests([60.0], "warmup")}
+        made |= {"clock": "virtual", "unsplit": {}}
+        (cell / run / split.FILE).write_text(json.dumps(made))
+    (cell / "real2" / split.FILE).write_text(json.dumps({"refused": "no steps"}))
+    before = {run: _Page(html.write(cell / run).parent).parts for run in SPLITS}
+
+    _graded(capsys, cell)
+
+    ungraded = before["step_linear"].pop(BESIDE)["text"]
+    assert ungraded == ["None: a simulated run's directory holds no real run."]
+    page = _Page(cell / "step_linear").parts
+    shown = (
+        "Cell c4: step_linear, this run, beside real0, real1, real2, the real runs"
+        " graded with it, each over the requests its headline metrics count."
+    )
+    assert page[BESIDE]["text"] == [shown]
+    head, *rows = page[BESIDE]["tables"][0]
+    assert head == ["segment", "run", "requests", "p10 (s)", "p50 (s)", "p90 (s)"]
+    assert rows == [
+        [html.SEGMENTS[key], run, str(len(e2el))]
+        + [f"{curves.percentile([s * e for e in e2el], p):.4g}" for p in (10, 50, 90)]
+        for key, s in SHARES.items()
+        for run, e2el in SPLITS.items()
+    ]
+    assert page[BESIDE]["tables"][1] == [
+        ["run", "no split because"],
+        ["real2", "no steps"],
+    ]
+    # A real run's report changes its grades alone.
+    after = _Page(cell / "real0").parts
+    assert after.pop("Grades") != before["real0"].pop("Grades")
+    assert after == before["real0"]
+
+    (cell / "real1" / split.FILE).unlink()
+    page = _Page(html.write(cell / "step_linear").parent).parts
+
+    assert {r[1] for r in page[BESIDE]["tables"][0][1:]} == {"step_linear", "real0"}
+    missing = f"[Errno 2] No such file or directory: '{cell / 'real1' / split.FILE}'"
+    assert page[BESIDE]["tables"][1][1:] == [["real1", missing], ["real2", "no steps"]]

@@ -379,12 +379,13 @@ def _host(store, value: str) -> dict:
     return law["host"]
 
 
-def _engine_args(atom_args):
-    """ATOM's arguments as its own parser reads them."""
+def _engine_args(atom_args, parser_class=None):
+    """ATOM's arguments as its own parser reads them, or as `parser_class`, a
+    subclass of it, does."""
     from atom.model_engine.arg_utils import EngineArgs
     from atom.utils.arg_parser import FlexibleArgumentParser
 
-    parser = FlexibleArgumentParser(add_help=False)
+    parser = (parser_class or FlexibleArgumentParser)(add_help=False)
     EngineArgs.add_cli_args(parser)
     return parser.parse_known_args(atom_args)[0]
 
