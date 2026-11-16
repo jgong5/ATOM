@@ -943,6 +943,9 @@ server started with `ROCP_TOOL_LIBRARIES` naming the blocking-call tool
 states the drafter (`speculative`), so a side started without it, or at another draft width,
 refuses the law. A term a side's records give none of, or that `compass fit host` does not fit,
 is the crs005 DPA8 law's of that side, copied without a refit; `provenance` names each, with why.
+The prefill law's `prefill.L_mtp` is its own `decode.L_mtp`, copied the same way: the status copy
+it prices is the previous output forward's, whatever this forward's kind, and the prefill
+forwards waited on it too rarely to fit one.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json` is DeepSeek-V4.1-Flash's
 law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed

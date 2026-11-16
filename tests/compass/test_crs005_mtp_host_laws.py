@@ -4,7 +4,9 @@ each 1P1D MTP cell `MTP` names. Each side's server, its config as ATOM
 resolves it from the cell's arguments and environment, picks its own entry
 among every crs005 V4-Pro law's (`run.pick_fitted`, as a run file's list is
 read) and passes `run.refuse_unfitted_host` on the crs005 platform; that side
-without its drafter is refused by the law, naming `engine.speculative`.
+without its drafter is refused by the law, naming `engine.speculative`. The
+recurrence a side's runner builds from its law charges one forward of each kind
+that side's records ran.
 
 The host's CPU is crs005's, as the laws' key states it, and the fixture's
 config.json is the checkpoint's; the quantization hash is the DPA8 laws', which
@@ -14,6 +16,7 @@ the same checkpoint keys. No device: aiter's arch probe answers a declared arch.
 import json
 from functools import cache
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from test_capture_v4_pro import CONFIG as V4_PRO
@@ -22,8 +25,10 @@ from test_key_index_cache_dtype import TREE, served
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
 from atom.compass.artifacts import machine_platform
+from atom.compass.backends.launch_features import stated
 from atom.compass.run import step_grid
 from atom.compass.run.step_grid import BUCKETS
+from atom.compass.runner.overrides import ADMISSION_IN_E, HostDeviceRecurrence
 from atom.compass.spec import MachineSpec
 
 LAWS = TREE / "scripts" / "compass" / "laws"
@@ -47,6 +52,16 @@ ENV = {
     "AITER_LOG_LEVEL": "WARNING",
 }
 ENV_PREFILL = {"GPU_MAX_HW_QUEUES": "5", "ATOM_NUMA_BIND": "1"}
+#: The forward kinds each side's records ran: a prefill side's prefill, middle
+#: and decode forwards, a decode side's decodes alone.
+KINDS = {"prefill": ("prefill", "middle", "decode"), "decode": ("decode",)}
+#: One forward of each kind as `forward_shape` reads it: prefill sequences,
+#: tokens, sequences and whether it produces output.
+FORWARD = {
+    "prefill": (1, 16384, 1, True),
+    "middle": (1, 16384, 1, False),
+    "decode": (0, 4, 1, True),
+}
 
 
 @pytest.fixture(autouse=True)
@@ -106,3 +121,36 @@ def test_a_side_without_its_drafter_is_refused_naming_it(
     with pytest.raises(ValueError, match="fitted under another") as e:
         compass_run.refuse_unfitted_host(host, config, platform())
     assert "engine.speculative" in str(e.value)
+
+
+@pytest.mark.parametrize("cell", MTP)
+@pytest.mark.parametrize("side", ["prefill", "decode"])
+def test_each_kind_a_side_runs_is_charged_by_the_recurrence_its_runner_builds(
+    cell, side
+):
+    """Built as `run.runner` builds it for a V4 P/D side, whose drafter defers
+    its output (`tokenIDProcessor`), so each output forward charges `L_mtp`;
+    a kind lacking a law for a segment it runs is refused."""
+    host = law(MTP[cell].format(side))["host"]
+    recurrence = HostDeviceRecurrence(
+        host["laws"],
+        host.get("skip", ()),
+        lambda: 0.0,
+        None,
+        mtp=True,
+        admit=host.get("admit", ADMISSION_IN_E),
+        columns=host.get("columns"),
+        launch=stated(host.get("key")),
+        defer=True,
+    )
+    for kind in KINDS[side]:
+        prefill_seqs, tokens, seqs, output = FORWARD[kind]
+        adopted = (host.get("columns") or {}).get(kind, {})
+        batch = SimpleNamespace(
+            total_seqs_num_prefill=prefill_seqs,
+            total_tokens_num=tokens,
+            total_seqs_num=seqs,
+            produces_output=lambda output=output: output,
+            compass_launch={f: 0.0 for c in adopted.values() for f in c},
+        )
+        recurrence.device_end(batch, 0.01, 0.001 if output else 0.0)
