@@ -19,6 +19,7 @@ from test_dp_step_max import Recording, dp2, prefill, runner  # noqa: F401
 
 from atom.compass import run as compass_run
 from atom.compass.backends import op_graph
+from atom.compass.clock import ClientRun
 from atom.compass.runner.overrides import PricedSteps
 
 
@@ -117,3 +118,27 @@ def test_the_run_summary_states_each_groups_waits_and_the_wall_outside_them(
     cost = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())["cost"]
     waited = {"lookups": 2.5, "pricing": 1.5, "rest": 6.0}
     assert cost["group_waited_seconds"] == {"engine": waited}
+
+
+def test_each_client_runs_summary_splits_its_own_wall(monkeypatch, tmp_path):
+    # Two client runs of 10 wall seconds, 10 s apart, the group waiting 2.5 s
+    # on lookups and 1.5 s on pricing in each; a hand-in counts from the start.
+    run = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+    run.update(bound_s=100.0, client_runs=None, out_dir=str(tmp_path))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    authority = compass_run._RecordingAuthority(run)
+    authority.starts, authority.ends = [0.0, 20.0], [10.0, 30.0]
+    for k, waited in enumerate(([2.5, 1.5], [5.0, 3.0])):
+        end = authority.ends[k]
+        clocks = ((compass_run.ENGINE, end),)
+        authority.ended.append(ClientRun(k, authority.starts[k], end, clocks, {}))
+        priced = PricedSteps.priced_steps(SimpleNamespace(_waited=waited))
+        compass_run._hand_in(run, "engine", [], k, priced=priced)
+        compass_run._hand_in(run, "frontend", [], k)
+
+        compass_run._write_client_run(run, authority, k)
+
+        here = tmp_path / compass_run.CLIENT_DIR.format(k) / compass_run.SUMMARY_FILE
+        cost = json.loads(here.read_text())["cost"]
+        own = {"lookups": 2.5, "pricing": 1.5, "rest": 6.0}
+        assert cost["group_waited_seconds"] == {"engine": own}
