@@ -343,6 +343,18 @@
    "mechanism_why": "a wait inside the data-parallel group's LP: every rank is a member of that one LP, the exchange is never reported to the clock authority and carries no cost; the reduced device end only sets each rank's own release"
   },
   {
+   "id": "atom/compass/runner/overrides.py::_time_target::metrics.poll()::poll#0",
+   "file": "atom/compass/runner/overrides.py",
+   "symbol": "_time_target",
+   "call": "metrics.poll",
+   "expr": "metrics.poll()",
+   "shape": "poll",
+   "peer": "none",
+   "why": "TP rank 0 of a simulated engine observes the step it just timed in ATOM's GPU forward histograms before its forward replies; its events are complete once recorded",
+   "mechanism": "K9",
+   "mechanism_why": "cannot park: it queries events that are complete, inside the simulated runner's forward"
+  },
+  {
    "id": "atom/compass/runner/pp_send.py::StageSends.__call__::self.send(t0 + ready_s, parts)::p2p#0",
    "file": "atom/compass/runner/pp_send.py",
    "symbol": "StageSends.__call__",
@@ -3418,7 +3430,7 @@
    "peer": "none",
    "why": "collects the GPU forward timings whose end events have completed, stopping at the first that has not; it queries, never waits",
    "mechanism": "K9",
-   "mechanism_why": "cannot park, and runs around the real runner's forward, which the simulated runner replaces"
+   "mechanism_why": "cannot park; a simulated runner times its step on events that are complete once recorded"
   },
   {
    "id": "atom/rollout/memory_manager.py::MemoryManagerMixin.clear_kv_cache::torch.cuda.synchronize()::device_sync#0",
@@ -3960,7 +3972,7 @@
    "peer": "none",
    "why": "drains completed GPU forward timings and stops at the first end event that has not completed; it queries and never waits",
    "mechanism": "K9",
-   "mechanism_why": "cannot park: the loop leaves at the first unfinished event, and a simulated run measures no forward, so nothing is pending"
+   "mechanism_why": "cannot park: the loop leaves at the first unfinished event, and a simulated runner's events are complete once recorded"
   },
   {
    "id": "atom/model_engine/async_proc.py::AsyncIOProc.__init__::threading.Thread(target=func, args=(addr, q), daemon=True)::thread_start#0",

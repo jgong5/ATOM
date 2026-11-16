@@ -606,14 +606,14 @@ class HostEvent:
 class PredictedEvent:
     """A timing event of ATOM's `GPUForwardMetrics` on a runner that runs no
     forward, in place of the `torch.cuda.Event` its factory makes: it records
-    the runner's `timed_s`, the predicted target seconds of the steps it has
-    timed, and is complete once recorded."""
+    the runner's `_timed_s`, the predicted target seconds of the steps
+    `_time_target` has timed, and is complete once recorded."""
 
     def __init__(self, runner: Any) -> None:
         self.runner, self.s = runner, 0.0
 
     def record(self, stream: Any = None) -> None:
-        self.s = self.runner.timed_s
+        self.s = self.runner._timed_s
 
     def query(self) -> bool:
         return True
@@ -1391,10 +1391,6 @@ class NonAllocatingRunner(
 ):
     """Overrides that construct a model runner without touching device memory."""
 
-    #: The predicted target seconds of every step `forward` has timed through
-    #: ATOM's `GPUForwardMetrics`, which its `PredictedEvent`s record.
-    timed_s = 0.0
-
     def _build_and_load_model(self, model_class: Any) -> None:
         """Build the module tree on the meta device and read no checkpoint.
 
@@ -1854,8 +1850,9 @@ def _time_target(runner: Any, batch: Any) -> None:
         return
     # In place of ATOM's factory, whose `torch.cuda.Event` times a device.
     metrics.event_factory = partial(PredictedEvent, runner)
+    timed_s = vars(runner).setdefault("_timed_s", 0.0)
     with metrics.measure(batch):
-        runner.timed_s += target_s
+        runner._timed_s = timed_s + target_s
     metrics.poll()
 
 
