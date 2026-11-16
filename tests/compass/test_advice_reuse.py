@@ -339,7 +339,7 @@ def test_a_source_of_host_laws_alone_needs_no_figures(tmp_path, searched):
     found = verdicts(advise(tmp_path), "law")
 
     reused = {"verdict": "reuse", "requirement": None, "reason": where, "law": where}
-    assert found == [reused] * 2
+    assert found == [reused | {"run": [where, where]}] * 2
 
 
 def test_a_law_whose_sources_price_no_step_needs_its_own_figures(tmp_path, searched):
@@ -349,28 +349,35 @@ def test_a_law_whose_sources_price_no_step_needs_its_own_figures(tmp_path, searc
 
     found, _ = verdicts(advise(tmp_path), "law")
 
+    (made_by,) = found.pop("made_by")
+    assert made_by.startswith("no calibrate.sh command: ")
     assert found == {
         "verdict": "calibrate",
         "requirement": 4,
         "reason": f"{where} states no cost-accuracy figures",
         "law": where,
+        "run": [where, where],
     }
 
 
-def test_a_source_of_the_prefill_vector_alone_needs_figures(tmp_path, searched):
+@pytest.mark.parametrize("vectors", [["prefill"], ["prefill", "host"]])
+def test_a_source_of_the_prefill_vector_needs_figures(tmp_path, searched, vectors):
     held = law(searched)
     shipped = held["sources"]["shipped"]
-    shipped["vectors"].remove("host")
+    shipped["vectors"] = vectors
     del shipped["figures"]
     where = law_file(tmp_path, held)
 
     found, _ = verdicts(advise(tmp_path), "law")
 
+    (made_by,) = found.pop("made_by")
+    assert made_by.startswith("no calibrate.sh command: ")
     assert found == {
         "verdict": "calibrate",
         "requirement": 4,
         "reason": f"{where} states no cost-accuracy figures of source shipped",
         "law": where,
+        "run": [where, where],
     }
 
 
