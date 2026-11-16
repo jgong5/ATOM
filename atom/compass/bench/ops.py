@@ -46,7 +46,9 @@ sparse attention's index lists are
 those its index build writes for the leaf's pass, off a selection spread over
 each row's visible rows (`Stub._lists`), and its DSpark drafter's FP8 window
 read takes the addresses and pointers ATOM's window read builds for the
-drafter's stage layers at the step's state slots (`Stub._windows`). A `Stub`
+drafter's stage layers at the step's state slots (`Stub._windows`), and its
+draft block its anchors, and its RoPE and attention the positions and
+indices ATOM builds from them, at zero rejections (`Stub._block`). A `Stub`
 calls each leaf from its contract: a tensor the capture states on the host is
 built there on every
 copy, as an activation is, pinned (`_host`); an
@@ -660,6 +662,17 @@ LISTS |= {("aiter.mla_sparse_prefill_v41.default", s): i for (_, s), i in LISTS.
 #: on the device each step (`PagedAttentionCache.read_windows`, `Stub._windows`).
 _WINDOWS = "atom.model_ops.attentions.deepseek_v41.packed_rows:gather_prefix_rows"
 WINDOWS = {(_WINDOWS, "addresses"), (_WINDOWS, "ptr")}
+#: DeepSeek-V4.1's DSpark draft block, by the operator and slot of each leaf
+#: of its drafter's that takes its anchors or what ATOM builds from them on
+#: the device each step (`DSparkProposer.propose`, `DeepseekV41DSpark.
+#: block_backbone`, `Stub._block`): the item of that build it takes.
+BLOCK = {
+    ("atom.spec_decode.dspark_proposer:DSparkProposer._stage_anchors", "rows"): "rows",
+    (f"{_V41}.dspark:draft_step_indices", "positions"): "anchors",
+    (f"{_V41}.rope_window:_launch_rope_window", "positions"): "positions",
+    ("atom.model_ops.sparse_attn_v4:_sparse_attn_triton", "topk_idxs"): "indices",
+    ("aiter._inverse_rope_group_quant_kernel.default", "positions"): "positions",
+}
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
 #: the span, and past an exact buffer kills the process (aiter defect, #1977).
@@ -1325,7 +1338,9 @@ class Stub:
                 act = self.specs and spec["role"] == "activation"
                 listed = LISTS.get((op["op"], path)) if act else None
                 window = act and (op["op"], path) in WINDOWS
-                if spec["role"] == "metadata" or index or listed is not None or window:
+                block = self.specs and drafted and BLOCK.get((op["op"], path))
+                built = listed is not None or window or block
+                if spec["role"] == "metadata" or index or built:
                     token = (op["op"], path) in TOKEN_IDS
                     pool = {"input_ids": input_ids} if token else live
                     what, field = "metadata", path.split(".")[0]
@@ -1373,6 +1388,8 @@ class Stub:
                             self.selections[sig] = md.cache, step, ratio, plan
                         if window:  # as the drafter's window read builds it
                             pool = self._windows(md.cache, live, op)
+                        if block:  # as the drafter builds it for its block
+                            pool = self._block(md.cache, fc.context, block)
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
@@ -1513,6 +1530,32 @@ class Stub:
         with patch.object(v41, "gather_prefix_rows", gather):
             cache._decode_windows(layers.long()[:, None, None], slots[:rows])
         return got
+
+    def _block(self, cache, context, item) -> dict[str, torch.Tensor]:
+        """`item` of what DeepSeek-V4.1's DSpark drafter builds for its block
+        (`BLOCK`), by name, at the step's padded rows, as `propose` and
+        `block_backbone` build it at the runner's zero rejections: each row's
+        last its anchor (`Drafter.prepare_inputs`), at the step's position
+        there, and the block's positions and indices for those anchors
+        (`draft_step_indices`), which allocates its own and writes nothing
+        else."""
+        from atom.model_ops.deepseek_v41.dspark import draft_step_indices
+
+        drafter = getattr(self.runner, "drafter", None)
+        model = getattr(drafter, "model", None)
+        if not hasattr(model, "_context_layer_ids"):
+            raise ValueError("no DSpark drafter here builds its block")
+        rows = drafter.prepare_inputs(context.running_bs)
+        anchors = context.positions[rows]
+        positions, indices, _ = draft_step_indices(
+            anchors,
+            cache.geometry.ring_slots,
+            model.window_size,
+            drafter.draft_tokens_per_seq,
+        )
+        built = {"rows": rows, "anchors": anchors}
+        built |= {"positions": positions, "indices": indices}
+        return {f"draft_step.{item}": built[item]}
 
     def _selected(self, sig) -> int | None:
         """The pool rows the selection on leaf `sig`'s lists (`_lists`) names
