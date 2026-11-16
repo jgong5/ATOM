@@ -8,10 +8,9 @@
     python -m atom.compass.backends.step_linear_fit figures RECORD... --law LAW [--source NAME] [--form FORM] [--moe-routing E,K] [--engine FILE]
 
 The second form fits a run file's ``lmcache_offload`` entry, beside the law of
-an arm whose records ran the connector, on those runs' server logs and the
-step records beside them (`fit_offload`). The third writes the held-out
-figures (below) of the records into an existing law fitted on them
-(`figures_main`).
+an arm whose records ran the connector, on those runs' server logs and step
+records (`fit_offload`). The third writes the held-out figures (below) of the records
+into an existing law fitted on them (`figures_main`).
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
@@ -822,8 +821,8 @@ def fit_offload(logs) -> tuple[dict, dict]:
     a lookup, the seconds its lookups took on ``(lookups, chunks)``, chunks
     counted as the prompt tokens they asked over the chunk size. The entry's
     ``fit`` holds the logs and the report; the report's ``store_s`` also states
-    the stores' seconds and the prefill seconds among them, and per log the
-    offset of its clock from its step record's (`_store_copies`)."""
+    the prefill seconds inside the stores, and per log the offset of its clock
+    from its step record's (`_store_copies`)."""
     workers, saves, loads, lookups = {}, {}, [], []
     for log in logs:
         perf, stored = [], collections.defaultdict(collections.deque)
@@ -880,14 +879,8 @@ def fit_offload(logs) -> tuple[dict, dict]:
     rows = np.vstack([np.empty((0, 3)), *stores])
     x = np.column_stack([np.ones(len(rows)), rows[:, 0]])
     entry["store_s"], fitted = _host_law(x, rows[:, 1], ["fixed", "chunks"], rows[:, 2])
-    report = {
-        "store_s": fitted
-        | {
-            "seconds": float(rows[:, 1].sum()),
-            "prefill_s": float(rows[:, 2].sum()),
-            "clock_offsets_s": offsets,
-        }
-    }
+    prefill_s = float(rows[:, 2].sum())
+    report = {"store_s": fitted | {"prefill_s": prefill_s, "clock_offsets_s": offsets}}
     rows = np.array(loads, dtype=np.float64).reshape(-1, 3)
     entry["load_s"], report["load_s"] = _host_law(
         rows[:, :2], rows[:, 2], ["fixed", "chunks"]
@@ -2322,12 +2315,7 @@ def offload_main(argv) -> None:
         prog="python -m atom.compass.backends.step_linear_fit offload",
         description=fit_offload.__doc__.split("\n\n")[0],
     )
-    parser.add_argument(
-        "logs",
-        nargs="+",
-        help="real server logs at OFFLOAD_PROFILE, each beside its run's "
-        "steps/dp0.jsonl",
-    )
+    parser.add_argument("logs", nargs="+", help="real server logs at OFFLOAD_PROFILE")
     parser.add_argument("--out", required=True, help="where the entry is written")
     args = parser.parse_args(argv)
     entry, report = fit_offload(args.logs)

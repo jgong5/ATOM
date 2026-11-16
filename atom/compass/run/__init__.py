@@ -3097,13 +3097,13 @@ def engine_loop(engine_core):
     or the bundle's request, and however it leaves puts back the handler set
     aside at READY, or else the one it found.
 
-    A pipeline stage's runner calls go through `pp_send.install`'s sends, and
-    those of an engine with a simulated ``lmcache_offload`` tier through
-    `atom.compass.kv.lmcache_offload.watch_forwards`. A recorded real run's
-    SIGTERM goes through `_stop_recording`, its input queue stamps each request
-    frame's handoff (`clock.stamp_input`), and however it leaves the loop, the
-    stamps its engine held are written (`clock.write_stamps`), as its workers
-    then write their step lines."""
+    A pipeline stage's runner calls go through `pp_send.install`'s sends. A
+    recorded real run's SIGTERM goes through `_stop_recording`, its input
+    queue stamps each request frame's handoff (`clock.stamp_input`), and
+    however it leaves the loop, the stamps its engine held are written
+    (`clock.write_stamps`), as its workers then write their step lines. A run
+    tells a simulated ``lmcache_offload`` tier the runner's prefill forwards
+    (`atom.compass.kv.lmcache_offload.watch_forwards`)."""
     ignoring = bool(os.environ.get(ENV))  # a run, as `spec` would say, unread
     before = signal.signal(signal.SIGTERM, signal.SIG_IGN) if ignoring else None
     if _sigterm_at_ready:
