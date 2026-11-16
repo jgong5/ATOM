@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from types import SimpleNamespace
 
 import pytest
@@ -200,6 +200,15 @@ def _producer_rank():
         _transfer_refcount_lock=threading.Lock(),
         _writes_in_flight={},
         _aborted_transfers={},
+        # Chunked transfer state, which every producer step dispatches from.
+        _chunked_prefills={},
+        _chunked_local_ids={},
+        _retired_chunked_transfers=OrderedDict(),
+        _pending_chunked_requests=[],
+        _chunked_admissions={},
+        _received_handoffs={},
+        _pending_handoffs={},
+        _admission_results=set(),
         _pending_recv_stall_watch={},
         _pending_recv_acks={},
         _held_failures={},
