@@ -2328,17 +2328,24 @@ their accuracy is out of scope here.
 **Sizing** (amended by #3687). LP `lmcache` takes a chunk's bytes and the state image from
 the plan of the deployment it serves, the prefill side's in a P/D run, as the simulated
 P/D connector takes its transfer (`run/__init__.py::_planned_transfer`). At
-`get_num_blocks` each member's TP rank 0 runner publishes in its engine's `.kv_block`
-file (`runner/overrides.py::publish_planned_transfer`) its paged KV block's bytes, the
-block that file carries for a P/D transfer; the block's tokens (`kv_cache_block_size`);
-and its state image, the `image_bytes` of its PAGE-backed checkpoint spec, 0 without one.
-A chunk's bytes are the block's times the server's `--chunk-size` over the block's
-tokens: ATOM's worker registers its PAGE regions per block of those tokens
-(`mp/worker.py::LMCacheMPConnector.register_kv_caches`), and DeepSeek-V4's planned block
-is exactly those regions (`DeepseekV4AttentionMetadataBuilder.get_kv_transfer_tensors`
-refuses any other sum). A pool whose charged entry carries alignment padding is
-overstated here as in the P/D price. The image is the spec the scheduler half binds,
-whose presence makes ATOM's scheduler half native-state
+`get_num_blocks` each member's TP rank 0 runner publishes in its engine's `.kv_block` file
+(`runner/overrides.py::publish_planned_transfer`) its paged KV block's bytes, the block
+that file carries for a P/D transfer, and its state image: the `image_bytes` of its
+PAGE-backed checkpoint spec where native-state saves carry an image
+(`native_state_worker.py::stores_state_images` of `Config.state_replay_tokens`), else 0.
+Under DeepSeek-V4's bounded replay (`ATOM_DSV4_STATE_REPLAY`) saves store the PAGE KV
+alone and `native_state_layout.py::build_native_state_mp_layout` registers no image group,
+so the image is 0 there. A chunk's bytes are the block's times the server's `--chunk-size`
+over the block's tokens, `kv_cache_block_size`, which `Config` fixes before
+`_launch_lmcache` reads it and hands LP `lmcache` at launch. ATOM's workers register their
+PAGE regions per block of those tokens
+(`mp/worker.py::LMCacheMPConnector.register_kv_caches`; for DeepSeek-V4
+`native_state_worker.py::NativeStateLMCacheMPConnector.register_kv_caches` through
+`build_native_state_mp_layout`), and DeepSeek-V4's planned block is exactly those regions
+(`DeepseekV4AttentionMetadataBuilder.get_kv_transfer_tensors` refuses any other sum). A
+pool whose charged entry carries alignment padding is overstated here as in the P/D price.
+The image comes from the spec the scheduler half binds, whose presence makes ATOM's
+scheduler half native-state
 (`mp/connector.py::LMCacheMPConnectorScheduler.bind_block_manager`).
 
 LP `lmcache` reads the plan before it starts its first job, on the first stamped request
@@ -2348,27 +2355,75 @@ lmcache client in it (`engine_core.py::EngineCore.__init__`), and the API server
 request until every DP rank is ready (`CoreManager._wait_for_all_ready_signals`). Until
 then the stand-in answers the unstamped startup frames, which need no bytes, over an
 empty index. It reads every member's file under `_planned_transfer`'s wait and refuses,
-by name, a member that published none within `PLANNED_BLOCK_WAIT_S`, members that plan
-different blocks, tokens or images, and a chunk size that is not a multiple of the
-block's tokens, as ATOM's worker refuses it. The publication's P/D refusals
+by name, a member that published none within `PLANNED_BLOCK_WAIT_S` and members that plan
+different blocks or images. The publication's P/D refusals
 (`_refuse_kda_regions_across_stages`, `_refuse_fp4_indexer_regions`) stay with a P/D side.
 
 No run file states either value or a writer count (*Channels*). `_launch_lmcache` still
 refuses before the start what needs no plan: a deployment and a run file that disagree on
 whether LP `lmcache` runs, the decode side, an entry without `server`, `lookup_s` or
-`request_s`, a server flag the stand-in does not model, and an entry that states
+`request_s`, a server flag the stand-in does not model, a chunk size that is not a
+multiple of `kv_cache_block_size`, as ATOM's workers refuse it, and an entry that states
 `writers` or `state_bytes`, which nothing reads any more. `compass advice` writes the
 entry it writes today, the server's flags and the request loop's declared laws
 (`advice/check.py::_lmcache`); `scripts/compass/parity_one_node.sh` writes the same entry,
 with no image read from the real run's log.
 
-#3641 builds the sizing: the publication and the block file of an `lmcache_mp` deployment,
-the plan read shared with `_planned_transfer`, LP `lmcache` started with no size, and the
+#3641 builds the sizing: the image published where saves carry one and the block file of
+an `lmcache_mp` deployment, the plan read shared with `_planned_transfer`, LP `lmcache`
+started with the block's tokens and no size, the chunk-size check at launch, and the
 shell's image check dropped (`runner/overrides.py`, `run/__init__.py`,
 `kv/lmcache_server.py`, `kv/lmcache_mp.py`). #3674 builds the channels and the retired
 keys: one transfer channel per DP rank, the writer check dropped and both keys refused
 (`clock/channels.py`, `kv/lmcache_mp.py`, `run/__init__.py`,
 `scripts/compass/parity_one_node.sh`).
+
+**Scenarios** (#3687). #3641's exit, an S5 point of `19` D116 starting under a step stub:
+
+```text
+DeepSeek-V4-Pro, DP attention over 8 ranks, --chunk-size 256 --separate-object-groups
+
+frontend                 engine.dp0 ... engine.dp7          LP lmcache
+_launch_lmcache:
+  flags, laws, no
+  writers/state_bytes;
+  256 % block 256 == 0
+  start LP lmcache(256) ----------------------------------> bind the URL, serve
+                         EngineCore.__init__, each member:
+                           get_num_blocks: rank 0 writes
+                           now-engine.dpN.kv_block
+                           {block_bytes, image_bytes}
+                           Scheduler, shell, client
+                           GET_CHUNK_SIZE, unstamped -----> 256, at once
+                         READY from all 8: API server up
+request                  LOOKUP on lookup#dpN ----------> first job: read the 8
+                                                            files, all alike; chunk
+                                                            = block x 256 / 256;
+                                                            build the copy station
+                         STORE on transfer#dpN ---------> copy: KV chunks and image
+                                                            on host_link, ends at t_c
+                         process_completions <----------- reply at t_c + lmcache_ipc_s
+```
+
+#3674's exit, a `compass advice` point at TP8 without DP attention whose pages are
+sharded, so every TP rank writes (an MLA model collapses to one writer):
+
+```text
+compass advice   entry: server flags, lookup_s, request_s
+compass run      run file: data_parallel_size 1 and the entry as written
+channel table    lookup#dp0, transfer#dp0: no writer count
+_launch_lmcache  no writer check; starts LP lmcache
+
+engine, its shell on the step loop               LP lmcache
+build_connector_meta, one step:
+  rank 0 STORE, worker_id 0 --+
+  rank 1 STORE, worker_id 1 --+  transfer#dp0,
+  ...                         +- 8 seqs, one ---> copy queue in (arrival, channel,
+  rank 7 STORE, worker_id 7 --+  DEALER, one       seq) order: ranks 0 to 7;
+                                 instant           objects keyed by worker_id
+process_completions <---------- 8 replies on ---- each at its copy's end, routed
+  finished_saving once all 8    transfer#dp0      to the DEALER's identity
+```
 
 **Fake-model duties.**
 
