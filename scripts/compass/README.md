@@ -933,6 +933,24 @@ rung 2, which the 1P1D prefill side reaches at c=64 ([#2878](https://github.com/
 Host keys and the fp8 indexer key as the crs005 DPA-TP8 pair's, its lone cells fp4 and its 1P1D
 cells fp8; the gap between the two is unmeasured on this pair.
 
+`scripts/compass/laws/deepseek-v4-pro-tp8-mi355x-crs005-{prefill,decode}-host.json.xz` hold host
+laws alone (`host`, `host_fit`, `platform` and `provenance`, no step law), one per side of
+[#3179](https://github.com/jgong5/ATOM/issues/3179)'s TP cell on crsuse2-m2m-v3-005 (prefill) and
+-013 (decode): the crs005 DPA-TP8 cell less `--enable-dp-attention`, the prefill side at
+`--gpu-memory-utilization 0.65` and the decode side at 0.70. They serve a 1P1D run whose steps another
+backend prices, `deploy.sh run ... --host-laws P --host-laws D`, each side picking the entry keyed
+to its own engine config. Each is `compass fit host` on its side of three 1P1D `deploy.sh record`
+cells at ATOM 259bc70f0, at c=1, 4 and 16 over traces 256 to 392 for 1800 s each, every server
+loading the blocking-call tool through `ROCP_TOOL_LIBRARIES`; the c=1 cell's prefill side ran at
+0.70 ([#3194](https://github.com/jgong5/ATOM/issues/3194#issuecomment-6869663548)). `host_fit.held_out`
+holds each band's errors with each record held out in turn. A term a side's records cannot give is
+the crs005 DPA8 law's of that side, as `provenance` names: `admission_s` and `stream_s`, since a
+side's requests and streams pass the router; `kv_write_req_s` and `router_s`, which `compass fit
+host` does not fit; the prefill side's `ipc_out_s`, since no output message ran alone on it; and the
+decode side's `http_intake`, since its requests render no chat template
+([#3229](https://github.com/jgong5/ATOM/issues/3229)). A decode side encodes no prompt and admits no
+request, so its entry states no encode term and `admit` null.
+
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json.xz` is DeepSeek-V4.1-Flash's
 law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed
 experts sharded across TP and DSpark with 5 speculative tokens, on one MI455 A0 node: the

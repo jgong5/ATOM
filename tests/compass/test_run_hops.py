@@ -92,8 +92,12 @@ def model(tmp_path, *more):
 
 
 #: Law files whose ``host.hops`` `compass fit host` fitted on their own records
-#: (#3036), which carry their cell's hops rather than node 18's.
-FITTED_HOPS = {"deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json.xz"}
+#: (#3036, #3194), which carry their cell's hops rather than node 18's.
+FITTED_HOPS = {
+    "deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json.xz",
+    "deepseek-v4-pro-tp8-mi355x-crs005-prefill-host.json.xz",
+    "deepseek-v4-pro-tp8-mi355x-crs005-decode-host.json.xz",
+}
 
 
 @pytest.mark.parametrize(
