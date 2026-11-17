@@ -7,7 +7,8 @@ so one lacking input hides no other: the platform, its datasheet and readings
 (`runfile.spec`); a step stub's file, read as `runfile.build` reads it, and its
 `Coefficients` as the runner builds them; an ``lmcache_offload`` entry's file,
 read as `runfile.build` reads it, or its absence, held to this deployment as
-the engine holds it (`run.refuse_offload_tier`); each store key or law file a flag
+the engine holds it (`run.refuse_offload_tier`, `lmcache_offload.tier_config`);
+each store key or law file a flag
 names (`runfile.resolve`); a step linear law and host laws held against this
 run's engine config, widths, platform and host key
 (`run.pick_fitted`, `run.refuse_unfitted_law`, `run.refuse_unfitted_host`),
@@ -63,6 +64,7 @@ from atom.compass.backends.step_linear_plan import records, scheduled_rungs
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.drive import runfile, serve
 from atom.compass.kv.lmcache_offload import ENTRY as OFFLOAD
+from atom.compass.kv.lmcache_offload import tier_config
 from atom.compass.memory.readings import PAGE_BOUND
 from atom.compass.run import OP_GRAPH, PRICE_LIST, STEP_GRID, STEP_LINEAR, STEP_STUB
 from atom.compass.runner.overrides import schedulable_bound, schedulable_ladder
@@ -179,6 +181,8 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
         if path:
             entry[OFFLOAD] = json.loads(Path(path).read_text())
         compass_run.refuse_offload_tier(config, entry)
+        if OFFLOAD in entry:
+            tier_config(entry[OFFLOAD], config)
     except (OSError, TypeError, ValueError) as refused:
         name = f"{OFFLOAD} entry" + (f" {path}" if path else "")
         state = "stale" if entry else "missing"
