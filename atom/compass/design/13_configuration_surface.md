@@ -214,11 +214,7 @@ nothing committed gave. Both are marked assumed: every term built on them is dec
 `run.json` lists each assumption (`memory_readings_assumed`) and grading refuses the run
 (below). Its run summary states, as every run's does, its seconds by method, declared
 among them, and its refused, extrapolated and fallback steps (`08` D50.1). Such a host's
-platform readings, which `run` composes with the datasheet (`--device`, `--ptl`,
-`--stack`), are the copy committed for a shipped law's platform where its store holds no
-entry there, and keep their own origins (`05` D24). A platform with neither refuses,
-naming the device, PTL state and stack, as do several copies at the device and PTL state
-when neither the entries the run prices with nor `--stack` name a stack.
+platform readings follow `05` D24's rule for a shipped law's platform, as below:
 
 ```
 compass run --device D --ptl P --step-linear LAW --host-laws LAW --store S   (no GPU)
