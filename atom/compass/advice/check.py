@@ -35,6 +35,11 @@ the shared store when the verdicts were judged there and it holds neither a
 step linear law of the configuration at the head's ATOM digest nor readings at
 their key, since it refuses a second publish at a key, else into the
 calibration's own; on a 1P1D side `deploy.sh record` and a fit of that side.
+Where an earlier candidate none of whose verdicts is refused calibrates a law
+at the same key, by model, platform and engine config, a candidate names that
+calibration in place of its own command, which the store would refuse as a
+second law at the key, with the command measuring its readings into the store
+that calibration publishes into, unless they are at their key there.
 A readings verdict ``measure`` names the `compass measure memory` command,
 under the instance's variables, a 1P1D side's on the connector a real start of
 it takes.
@@ -71,10 +76,11 @@ import time
 import traceback
 from pathlib import Path
 
-from atom.compass.artifacts import ArtifactRefusal
+from atom.compass.artifacts import ArtifactRefusal, machine_platform
 from atom.compass.drive import lacking, reuse, runfile, serve
 from atom.compass.drive import run as drive_run
 from atom.compass.fit.device import compose
+from atom.compass.run.step_grid import keyed
 from atom.compass.spec import SpecRefusal
 
 #: The verdicts, in OUT.
@@ -90,6 +96,11 @@ CAL, STARTS = "cal", "starts"
 #: The file a calibration appends each step's start, end or failure to, in its
 #: directory, and ``end calibration`` once it has fitted both laws.
 STATUS = "status"
+#: What makes a law an earlier candidate's calibration makes at its key: that
+#: calibration, named by its candidate, and the store it publishes into.
+BORROWED = (
+    "{}'s calibration, whose law is at this configuration's key, publishing into {}"
+)
 #: The file a calibration writes its inputs to, in its directory: a line
 #: ``store <path>`` names the store it publishes into, when one was named.
 INPUTS = "inputs"
@@ -124,7 +135,7 @@ def check(expansion: dict, out: Path) -> dict:
         refused = None
     except ValueError as error:
         head, refused = None, _refused(error, 1)
-    judged, seen, machine = {}, {}, expansion["machine"]
+    judged, seen, machine, calibrations = {}, {}, expansion["machine"], {}
     for candidate in expansion["candidates"]:
         points = [p for p in expansion["points"] if p["candidate"] == candidate["name"]]
         if refused:
@@ -153,6 +164,7 @@ def check(expansion: dict, out: Path) -> dict:
         else:
             store, verdicts = holding_law or (store, verdicts)
         judged[candidate["name"]] = {"store": str(store.root), "points": verdicts}
+        _borrowing(points, judged[candidate["name"]], calibrations)
     written = {"head": head, "refused": refused, "candidates": judged}
     (out / REUSE).write_text(json.dumps(written, indent=1) + "\n")
     return written
@@ -435,7 +447,11 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     `deploy.sh` adds, on the simulated connector, and runs under its variables
     over this process's ``AITER_LOG_LEVEL``, with those the script sets over
     them (`drive_run.side_env`). `made` is the calibration's directory, traces
-    and the shared store a ``calibrate`` verdict's command takes."""
+    and the shared store a ``calibrate`` verdict's command takes; a
+    `calibrate.sh` command's verdict states, for `_borrowing`, its
+    ``calibration``: the ``key`` its law is published at, by model, platform
+    and engine config, its directory, ``in``, and the store it publishes
+    ``into``."""
     if isinstance(machine, dict):
         return machine, machine
     args, env = one["args"], one["env"]
@@ -466,6 +482,9 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                     with _env({"TRACES": made[1]}):
                         command = lacking.calibration(made[0], args, config, into)
                         law["made_by"] = [command]
+                    key = [config.model, machine_platform(machine), keyed(config)]
+                    into = str(into or made[0] / "store")
+                    law["calibration"] = {"key": key, "in": str(made[0]), "into": into}
                 if readings["verdict"] == "measure":
                     real = args
                     if side in drive_run.ROLES:
@@ -476,6 +495,37 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                 verdicts = law, readings
         seen[(store.root, *instance)] = verdicts
     return seen[(store.root, *instance)]
+
+
+def _borrowing(points: list, held: dict, calibrations: dict) -> None:
+    """Take each ``calibration`` `_judged` states out of the law verdicts in
+    `held`, a candidate's at its `points`, and name, in place of a verdict's own
+    `calibrate.sh` command, the calibration an earlier candidate's in
+    `calibrations` makes at its key, since the store refuses a second law at a
+    key: such a verdict is made by that calibration and by the command
+    measuring this candidate's readings into the store it publishes into,
+    unless they are at their key there. Each other calibration joins
+    `calibrations`, unless a verdict of the candidate is refused, whose state
+    prints no command."""
+    refused = any(v["verdict"] == "refused" for v in _each(held["points"]))
+    for point in points:
+        verdicts = held["points"][point["name"]]
+        for side, law in verdicts["law"].items():
+            law = dict(law)
+            if (mine := law.pop("calibration", None)) is None:
+                continue
+            key = json.dumps(mine["key"], sort_keys=True)
+            made = calibrations.get(key, mine)
+            if made["in"] == mine["in"] and not refused:
+                calibrations[key] = mine
+            elif made["in"] != mine["in"]:
+                one, into = point["instances"][side], made["into"]
+                law["made_by"] = [BORROWED.format(Path(made["in"]).name, into)]
+                there = Path(into) == Path(held["store"])
+                if verdicts["readings"][side]["verdict"] != "reuse" or not there:
+                    measure = lacking.measure_memory(into, one["args"], one["env"])
+                    law["made_by"].append(measure)
+            verdicts["law"][side] = law
 
 
 def _publishing(store, made, law: dict, readings: dict) -> str | None:
