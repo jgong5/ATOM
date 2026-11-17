@@ -551,10 +551,8 @@ def test_a_final_sample_that_raises_is_skipped_and_named(
     written = _instants(tmp_path / "metrics-engine.om.gz", "standalone", "frontend")
     assert list(written) == [0.0, 1.0, 2.0]
     said = json.loads((tmp_path / "lp-engine.json").read_text())
-    assert said["refusals"] == [
-        "metrics:engine final sample at 2.25 raised "
-        "FileNotFoundError(\"a worker's file went\")"
-    ]
+    raised = 'FileNotFoundError("a worker\'s file went")'
+    assert said["refusals"] == [f"metrics:engine final sample at 2.25 raised {raised}"]
 
 
 def test_an_lp_keeps_the_clock_it_reached_before_the_end(started):

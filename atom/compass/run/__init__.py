@@ -2974,7 +2974,7 @@ def _hand_in(
         t = rt.now if rt.now < math.inf else rt.before_inf
         try:
             sampler.final(t)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - skipped, named among its reasons
             reasons = [*reasons, f"metrics:{lp} final sample at {t} raised {e!r}"]
         sampler.write(out, lp)
     if diagnostics := getattr(clock.installed(), "diagnostics", 0):
