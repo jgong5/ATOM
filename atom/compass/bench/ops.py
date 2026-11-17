@@ -104,9 +104,14 @@ refuses: it is measured across the layout's ranks, where a DP all-gather's
 `x` holds each rank's own `sizes` entry's rows, the capture's being rank 0's
 (`_own_rows`).
 A collective leaf is one family over its message bytes, decode and prefill
-alike (`exchange`), which the plan ladders, densifies and covers. aiter's
-comm-fused MoE (`COMM_FUSED`) refuses by name: its runners are built across
-its ranks by ATOM's loader, and no runner here builds them.
+alike (`exchange`), which the plan ladders, densifies and covers.
+aiter's comm-fused MoE (`COMM_FUSED`) runs on a process group, as a collective
+does: it is called on the runtime ATOM builds for the model's first MoE layer
+that takes it, as its loader builds it before the runner's KV pool is sized,
+its runners' peer memory with it (`_comm_fused`), with the leaf's arguments,
+its stated group width and reduction aside, and, where it holds no shared
+expert's output, as under ATOM's dual-stream MoE, zeros at the rows its
+stage 2 asks for, built once (`Stub._comm_fused`).
 MORI's dispatch and combine are methods of a handle no graph holds: each is
 called at MORI's entry point on the handle ATOM builds for the model's MoE,
 with the leaf's arguments, and, since neither runs twice in a row, timed
@@ -1028,7 +1033,8 @@ def _runner(config, rank: int):
     blocks a rank has room for, sized by ATOM with the parameters' bytes held
     on the device and then freed for the weights each leaf builds, and with
     the MORI exchange ATOM's loader builds before it, MORI's heap with it, in
-    its `mori` (`_prepare_finalize`) where its MoE exchanges through MORI;
+    its `mori` (`_prepare_finalize`) where its MoE exchanges through MORI, and
+    the runtime of aiter's comm-fused MoE in its `comm_fused` (`_comm_fused`);
     the runner attributes the allocation set are in its `kv_held`, and by path each
     tensor it bound on a metadata builder (`BUILDERS`, `_bound`) but a view the
     builder cut from one of the runner's (`_cut_from`); and, when
@@ -1072,7 +1078,9 @@ def _runner(config, rank: int):
     held = torch.empty(nbytes, dtype=torch.uint8, device=runner.device)
     # as ATOM's loader, before the pool is sized: built at the first MORI
     # leaf instead, the heap took room the pool left the leaves' weights
-    runner.mori = _prepare_finalize(dict(runner.model.named_modules()), mori_only=True)
+    modules = dict(runner.model.named_modules())
+    runner.mori = _prepare_finalize(modules, mori_only=True)
+    runner.comm_fused = _comm_fused(modules)
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     del held
     _release()  # the pool takes the room the hold had
@@ -1128,6 +1136,20 @@ def _prepare_finalize(modules: dict, mori_only: bool = False):
     return name, made, method.moe.in_dtype
 
 
+def _comm_fused(modules: dict):
+    """The runtime ATOM's loader (`init_prepare_finalize`) builds for aiter's
+    comm-fused MoE on the first layer in `modules` that takes it, the runners
+    every such layer shares with it, their peer memory among them; None where
+    no layer takes it."""
+    layer = next(
+        (m for m in modules.values() if getattr(m, "_comm_fused_moe", None)), None
+    )
+    if layer is None:
+        return None
+    layer._comm_fused_moe.initialize(layer)
+    return layer._comm_fused_moe.runtime
+
+
 class Stub:
     """The leaves of a point timed beside ATOM's runner, on the forward context
     and live metadata ATOM prepared for each placement of its batch. `alone`
@@ -1178,6 +1200,8 @@ class Stub:
         # what ATOM builds for MORI's exchange: the runner's, built before
         # its pool was sized (`_runner`), else once a MORI leaf asks (`_mori`)
         self.mori = getattr(runner, "mori", None)
+        # and for aiter's comm-fused MoE, when the runner's layers take it
+        self.comm_fused = getattr(runner, "comm_fused", None)
         # DeepSeek-V4.1's compress ratios by the rows a page holds at each
         builder = getattr(runner, "attn_metadata_builder", None)
         geometry = getattr(builder, "geometry", None)
@@ -1934,20 +1958,15 @@ class Stub:
         its copies read, where `n` stops under both `m` and K. A MORI leaf is
         timed at MORI's entry point through graphs of its own (`_Mori`), each
         one's median kept (`parts_ns`); a combine's routing is its first
-        copy's."""
+        copy's. aiter's comm-fused MoE is called on ATOM's runtime
+        (`_comm_fused`)."""
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
 
-        if self.alone and exchange(op):
+        if self.alone and (exchange(op) or op["op"] == COMM_FUSED):
             raise ValueError(
                 f"a collective over the layout's {self.alone} ranks, measured "
                 "across them, not on a runner that runs one alone"
-            )
-        if op["op"] == COMM_FUSED:
-            raise ValueError(
-                f"aiter's comm-fused MoE, which reduces across its {op['args']['tp']} "
-                "ranks on the runners ATOM's loader builds there: no runner here "
-                "builds them"
             )
         if op["args"].get("device") == "cpu":
             raise ValueError(
@@ -1962,6 +1981,9 @@ class Stub:
         if op["op"].startswith(MORI):  # a method of a handle no graph holds
             with refused_together():
                 fn = self._mori(op)
+        elif op["op"] == COMM_FUSED:
+            with refused_together():
+                fn = self._comm_fused(op)
         else:
             fn = _function(op["op"])
         m = self.cold_copies.get(sig, n)
@@ -2243,6 +2265,40 @@ class Stub:
                 f"token) {built}, and the leaf states {stated}"
             )
         return _Mori(op, handle, dtype)
+
+    def _comm_fused(self, op):
+        """A call of aiter's comm-fused MoE leaf `op` on the runtime ATOM
+        builds for the model (`_comm_fused`), with the leaf's arguments, the
+        group width and reduction it states aside, and, where it holds no
+        shared expert's output, zeros at the rows its stage 2 asks for, built
+        once, as ATOM's dual-stream MoE hands it that output; refused by name
+        where ATOM builds no runtime, or its runners for another group width
+        or reduction than the leaf states."""
+        runtime, args = self.comm_fused, op["args"]
+        if runtime is None:
+            raise ValueError("ATOM builds no comm-fused MoE for this model and layout")
+        shape, stated = runtime.runners.shape, (args["tp"], args["comm"])
+        if (shape.tp, shape.comm) != stated:
+            raise ValueError(
+                f"ATOM builds aiter's comm-fused runners for (ranks, reduction) "
+                f"{(shape.tp, shape.comm)}, and the leaf states {stated}"
+            )
+        shared = {}
+
+        def output(rows, like):
+            if rows not in shared:
+                shared[rows] = like.new_zeros(rows, like.shape[1])
+            return shared[rows]
+
+        def call(tp, comm, shared_partial, **kwargs):
+            rows = None
+            if shared_partial is None:
+                rows = functools.partial(output, like=kwargs["hidden_states"])
+            return runtime.run(
+                shared_partial=shared_partial, before_stage2_for_rows=rows, **kwargs
+            )
+
+        return call
 
     def _reweigh(self, op, sig, like, c):
         """Copy `like` of `op`'s call with the c-th weight of each weight
@@ -3587,8 +3643,9 @@ def layout_of(config) -> dict:
 #: an argument naming it, as aiter's all-reduces and fused all-reduce norms and
 #: torch's functional collectives each take one; or an operator ATOM runs on
 #: its TP group naming none, its all-reduce under two-batch overlap
-#: (`atom.model_ops.module_dispatch_ops.tbo_all_reduce`).
-ON_GROUP = ('"group_name":', '"op":"aiter.tbo_all_reduce.')
+#: (`atom.model_ops.module_dispatch_ops.tbo_all_reduce`), or aiter's
+#: comm-fused MoE on its TP or DP group, which states the group's width alone.
+ON_GROUP = ('"group_name":', '"op":"aiter.tbo_all_reduce.', f'"op":"{COMM_FUSED}"')
 
 
 def on_group(leaf: str, collective=False) -> bool:
