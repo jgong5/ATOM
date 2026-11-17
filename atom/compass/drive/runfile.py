@@ -48,8 +48,10 @@ which `scripts/compass/deploy.sh` hands its clock authority and both instances.
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -237,7 +239,7 @@ def resolve(store, name: str, token: str, machine, atom_args) -> tuple:
     return law, _backend(entry)
 
 
-def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
+def prefill_decode(args, prefill_args, decode_args, kv_link, decode_env=None) -> dict:
     """The run file `build` builds from `args` for one prefill and one decode
     instance, started with ATOM's arguments `prefill_args` and `decode_args`:
     each side's DP width read from its own, the router's per-request forward
@@ -248,8 +250,11 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     the prefill side's host entry's, its ``decode_hops`` the decode side's,
     each side's config resolved from its arguments as deploy.sh starts its
     instance, with its KV role on the simulated connector
-    (`drive.run.side_args`). A price list the prefill side names that is not
-    the decode side's refuses."""
+    (`drive.run.side_args`), the prefill side's in this process's environment
+    and the decode side's in the environment its instance starts in, which
+    `decode_env()`, when given, returns (`_hops`), else in this process's too.
+    A price list the prefill side names that is not the decode side's
+    refuses."""
     from atom.compass.drive.run import SIMULATED, side_args
 
     prefill_args = side_args("prefill", prefill_args, SIMULATED)
@@ -267,7 +272,7 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     out[run.DP_WIDTHS["D"]] = _dp_width(decode_args)
     if hosts := run.entries(out, "host"):
         arch = run._machine(out).value("device.arch")
-        out[run.DECODE_HOPS] = _hops(hosts, decode_args, arch)
+        out[run.DECODE_HOPS] = _hops(hosts, decode_args, arch, decode_env)
     return out | {
         "router_s": _hops(hosts, prefill_args, arch).get("router_s") if hosts else None,
         "kv_link": kv_link,
@@ -304,19 +309,35 @@ def _model_digest(model: str) -> str:
     return run._file_digest(model, "config.json")
 
 
-def _hops(hosts: list, atom_args, arch: str) -> dict:
+def _hops(hosts: list, atom_args, arch: str, env=None) -> dict:
     """The ``hops`` of the entry of `hosts` fitted under the config ATOM's
-    arguments `atom_args` resolve on a device of `arch`, picked as the runner
-    picks its own (`run.pick_fitted`); the hops every entry states alike as
-    they are, with no config resolved."""
+    arguments `atom_args` resolve on a device of `arch`, in the environment
+    `env()` gives, else this process's, picked as the runner picks its own
+    (`run.pick_fitted`); the hops every entry states alike as they are, with no
+    config resolved and `env` not called."""
     host = hosts[0]
     if any(h.get("hops") != host.get("hops") for h in hosts):
         from atom.compass.drive.run import _config
 
         picked = {"host": hosts}
-        run.pick_fitted(picked, "host", _config(atom_args, arch))
+        with _environ(env()) if env else contextlib.nullcontext():
+            run.pick_fitted(picked, "host", _config(atom_args, arch))
         host = picked["host"]
     return host.get("hops", {})
+
+
+@contextlib.contextmanager
+def _environ(env: dict):
+    """This process's environment replaced by `env`, which a process it starts
+    inherits, until the block ends."""
+    saved = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 
 
 def _dp_width(atom_args) -> int:

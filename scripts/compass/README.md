@@ -1144,7 +1144,9 @@ A simulated deployment, `deploy.sh run`, runs both instances on 005: each
 reaches the clock authority and the write-request block at this node's
 127.0.0.1, which 013 cannot. A local prefix, such as `env -u GPU_MAX_HW_QUEUES
 -u ATOM_NUMA_BIND`, still starts the decode apart and makes the KV link
-`inter_node`, as the real pair spans. Its router arguments switch the router's
+`inter_node`, as the real pair spans. The run file then takes the decode side's
+hops from the host entry fitted under the environment that prefix gives it, as
+the prefill side's under the script's own. Its router arguments switch the router's
 wall-clock detectors off, `--disable-retries` among them, as `deploy.sh`'s
 header requires. The script
 sets `--request-timeout-secs` itself: a stream lasts the wall time the run
