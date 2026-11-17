@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from types import SimpleNamespace
 
 import pytest
@@ -59,6 +59,10 @@ def _build(cls, is_producer, **extra):
     sched = cls.__new__(cls)
     sched.is_producer = is_producer
     sched._awaiting_send = set()
+    sched._pending_chunked_admissions = {}
+    sched._chunked_waiting = {}
+    sched._chunked_ready = set()
+    sched._producer_admission_undo = {}
     for name in ("_reqs_need_save", "_reqs_need_recv", "request_id_to_transfer_id"):
         setattr(sched, name, {})
     sched.transfer_id_to_request_id = {}
@@ -98,6 +102,7 @@ def _seq(seq_id=7, **params):
         output_tokens=[42],
         spec_token_ids=None,
         prefix_cache_hit_tokens=0,
+        state_slot=-1,
     )
 
 
@@ -175,6 +180,139 @@ def test_nothing_is_claimed_when_nothing_will_be_sent(build):
         assert local_only.should_defer_free(seq) is False
 
 
+@pytest.mark.parametrize("previous_claim", [False, True])
+def test_mooncake_withdrawn_admission_drops_only_its_new_producer_state(previous_claim):
+    sched = _mooncake()
+    sched.enable_chunked_transfer = True
+    seq = _seq(chunked_transfer=True, do_remote_decode=True, transfer_id="t")
+    seq.prompt_token_ids = [1, 2, 3]
+    seq.num_prompt_tokens = 3
+    older = (seq, [8, 9], -1)
+    if previous_claim:
+        sched._awaiting_send.add(str(seq.id))
+        sched._reqs_need_save[seq.id] = older
+    sched._chunked_ready.add(seq.id)
+    sched.update_state_after_alloc(seq)
+    assert seq.id in sched._reqs_need_save
+    sched.cancel_preadmission(seq)
+    sched.cancel_preadmission(seq)  # idempotent
+    assert seq.id in sched._chunked_ready  # keep the already-ready D reservation
+    if previous_claim:
+        assert sched._reqs_need_save[seq.id] is older
+        assert sched.should_defer_free(seq)
+    else:
+        assert seq.id not in sched._reqs_need_save
+        assert not sched.should_defer_free(seq)
+
+
+def test_mooncake_preadmission_cancel_cannot_release_a_dispatched_source():
+    sched = _mooncake()
+    sched.enable_chunked_transfer = True
+    seq = _seq(chunked_transfer=True, do_remote_decode=True, transfer_id="t")
+    seq.prompt_token_ids = [1, 2, 3]
+    seq.num_prompt_tokens = 3
+    sched.update_state_after_alloc(seq)
+    sched.build_connector_meta()
+    sched.cancel_preadmission(seq)
+    assert sched.should_defer_free(seq)
+
+
+def test_nonchunked_mooncake_publishes_only_a_completed_prefill():
+    sched = _mooncake()
+    seq = _seq(do_remote_decode=True)
+    seq.output_tokens = []
+    sched.update_state_after_alloc(seq)
+    assert not sched.build_connector_meta().reqs_to_save
+    # A later chunk changes both its final PAGE allocation and STATE slot.
+    seq.block_table = [8, 9, 10, 11]
+    seq.state_slot = 3
+    sched.update_state_after_alloc(seq)
+    assert not sched.build_connector_meta().reqs_to_save
+    seq.output_tokens = [42]
+    seq.leave_reason = "stop_sequence"
+    sched.request_finished(seq)
+    publication = sched.build_connector_meta().reqs_to_save[seq.id]
+    assert publication.local_block_ids == seq.block_table
+    assert publication.local_slot_index == 3
+    assert sched.should_defer_free(seq)
+    assert not sched.build_connector_meta().reqs_to_save
+
+
+def test_nonchunked_mooncake_cancel_after_dispatch_never_advertises_source():
+    sched = _mooncake()
+    seq = _seq(do_remote_decode=True)
+    seq.output_tokens = []
+    sched.update_state_after_alloc(seq)
+    # Store loading dispatches metadata before the P forward. No producer
+    # address can survive cancellation if that prefill never completed.
+    dispatched = sched.build_connector_meta()
+    seq.leave_reason = "aborted"
+    sched.request_finished(seq)
+    assert not dispatched.reqs_to_save
+    assert not sched.build_connector_meta().reqs_to_save
+    assert not sched.should_defer_free(seq)
+    assert seq.kv_transfer_params_output is None
+
+
+def test_nonchunked_decode_waits_for_successful_publication(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    with stubbed_aiter():
+        from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
+            MooncakeConnector,
+        )
+
+    sched = _mooncake()
+    seq = _seq(do_remote_decode=True)
+    seq.output_tokens = []
+    seq.state_slot = 5
+    sched.update_state_after_alloc(seq)
+    worker = MooncakeConnector.__new__(MooncakeConnector)
+    worker.is_producer = True
+    worker._completed_prefills = {}
+    worker._completed_prefills_lock = threading.Lock()
+    worker._completed_prefills_cv = threading.Condition(worker._completed_prefills_lock)
+    # The input contains no chunked requests; isolate its unrelated dispatcher.
+    monkeypatch.setattr(worker, "_dispatch_ready_chunked_requests", lambda: None)
+    worker.start_load_kv(sched.build_connector_meta())
+    entered_wait = threading.Event()
+    wait = worker._completed_prefills_cv.wait
+
+    def observe_wait(timeout=None):
+        entered_wait.set()
+        return wait(timeout)
+
+    monkeypatch.setattr(worker._completed_prefills_cv, "wait", observe_wait)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        reader = executor.submit(worker._wait_for_prefill_data, seq.id)
+        assert entered_wait.wait(timeout=2)
+        assert not reader.done()
+        seq.output_tokens = [42]
+        seq.leave_reason = "stop_sequence"
+        seq.block_table = [10, 11]
+        sched.request_finished(seq)
+        # Last request publication must reach D through the real idle engine.
+        with stubbed_aiter():
+            from atom.model_engine.engine_core import EngineCore
+        core = EngineCore.__new__(EngineCore)
+        core.kv_transfer_enabled = True
+        core.scheduler = SimpleNamespace(
+            kv_connector=sched,
+            _publish_state_loads=lambda: None,
+            _publish_state_stores=lambda: None,
+        )
+        core.runner_mgr = SimpleNamespace(
+            call_func=lambda name, meta: worker.start_load_kv(meta)
+        )
+        core._dispatch_idle_offload_work()
+        assert reader.result(timeout=2) == {
+            "block_ids": [10, 11],
+            "swa_block_ids": [5],
+            "slot_index": 5,
+        }
+
+
 # -- An abort between the prefill's finish and the decode's pull ------------
 
 
@@ -200,6 +338,14 @@ def _producer_rank():
         _pending_recv_stall_watch={},
         _pending_recv_acks={},
         _held_failures={},
+        # Chunked transfer state, empty: these requests are not chunked.
+        _chunked_prefills={},
+        _chunked_local_ids={},
+        _chunked_admissions={},
+        _retired_chunked_transfers=OrderedDict(),
+        _pending_chunked_requests=[],
+        _admission_results=set(),
+        _received_handoffs={},
         done_sending=set(),
         done_recving=set(),
         failed_recving=set(),
@@ -247,6 +393,9 @@ def _engine(rank):
     core.runner_mgr = _Workers(rank)
     core.output_queue = queue.Queue()
     core.stream_output_queue = queue.Queue()
+    core.input_queue = queue.Queue()
+    core.utility_queue = queue.Queue()
+    core._kv_progress_event = threading.Event()
     return core
 
 
@@ -258,7 +407,8 @@ def _step(core):
 
 def _parked(core):
     """A request the router sends on, prefilled and finished by one engine
-    step, and its rank's last."""
+    step, and its rank's last; the idle step after publishes its source to
+    the rank, as a non-chunked source is published only once it finished."""
     seq = Sequence(
         [1, 2, 3, 4],
         4,
@@ -266,6 +416,7 @@ def _parked(core):
         kv_transfer_params={"do_remote_decode": True},
     )
     core.scheduler.add(seq)
+    _step(core)
     _step(core)
     assert seq.id in core.scheduler.deferred_free_blocks
     assert seq.id in core.runner_mgr.rank._completed_prefills

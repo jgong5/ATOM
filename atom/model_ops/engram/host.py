@@ -18,8 +18,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.distributed as dist
 
+from atom.distributed.group_agreement import group_agree
 from atom.model_ops.engram.tables import HostEmbeddingTable
 from atom.utils import CpuGpuBuffer, envs
 
@@ -229,6 +229,16 @@ class EngramPrefetcher:
         self._pool.shutdown(wait=False, cancel_futures=True)
 
 
+def _dp_world_size() -> int:
+    """Ranks in this rank's DP group (1 without DP, or with no group)."""
+    try:
+        from aiter.dist.parallel_state import get_dp_group
+
+        return int(get_dp_group().world_size)
+    except Exception:  # noqa: BLE001 - no aiter, no DP group: not DP
+        return 1
+
+
 class EngramHost:
     """Stage every token of ragged request chunks into a flat device buffer.
 
@@ -260,6 +270,7 @@ class EngramHost:
         # no UVA -- which is also what a CPU-only test wants to say.
         self.uva = False
         self._tp_group = None
+        self._shared_tables = False
         # Every table this rank holds a shard of, for the fallback and the shutdown.
         self._pinned_tables = []
         self.device = device
@@ -386,7 +397,11 @@ class EngramHost:
         range (`host_memory.pin_rows`: copied into page-locked memory by
         default, registered in place with ATOM_ENGRAM_UVA_COPY=0;
         `host_memory.to_device` under ATOM_ENGRAM_UVA_HBM): the full table on
-        every rank is what a TP job cannot afford.
+        every rank is what a TP job cannot afford. Under DP attention every
+        rank does hold the full table; unless ATOM_ENGRAM_UVA_COPY is set (or
+        ATOM_ENGRAM_UVA_HBM puts each rank's copy in its own HBM) it is then
+        registered in place, so the node pins the checkpoint's page cache once
+        instead of one copy per rank.
 
         The answer is the GROUP's. An empty shard and a refused page-lock are
         both per-rank outcomes, and the device lookup ends in an all-gather: a
@@ -409,27 +424,34 @@ class EngramHost:
         self.head_start = group.rank_in_group * per
         self.local_heads = min(per, max(0, num_hash_heads - self.head_start))
         self.total_heads = num_hash_heads
+        # DP attention: a one-GPU TP group per DP rank, each holding every
+        # head. The tables are then the same on every rank of the node, and
+        # registering the shared checkpoint mapping in place pins them once
+        # where a copy per rank would pin them once per rank.
+        self._shared_tables = shards == 1 and _dp_world_size() > 1
         pinned = self._register_shard(prefetcher)
-        if shards > 1:
-            # Gloo, once, at load. MIN: one refusal is the group's answer.
-            vote = torch.tensor([bool(pinned)], dtype=torch.int32)
-            dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group.cpu_group)
-            if not int(vote):
-                if pinned:
-                    logger.info("engram: a peer has no UVA shard")
-                pinned = 0
+        # Gloo, once, at load: one refusal is the group's answer.
+        if shards > 1 and not group_agree(bool(pinned), group.cpu_group):
+            if pinned:
+                logger.info("engram: a peer has no UVA shard")
+            pinned = 0
         if not pinned:
             logger.info("engram: using the host path")
             self._release_shard()
             return False
         logger.info(
             "engram: UVA device lookup active -- heads [%d, %d) of %d, "
-            "%.1f GiB %s on this rank",
+            "%.1f GiB %s on this rank%s",
             self.head_start,
             self.head_start + self.local_heads,
             num_hash_heads,
             pinned / 1024**3,
             "in HBM" if self._in_hbm else "page-locked",
+            (
+                " (whole tables, shared by the DP ranks)"
+                if self._shared_tables and not self._in_hbm
+                else ""
+            ),
         )
         return True
 
@@ -452,7 +474,9 @@ class EngramHost:
             row_start = int(offsets[self.head_start])
             row_end = int(offsets[last]) + int(mapping.head_vocab_sizes[layer_id][last])
             try:
-                ok = table.enable_uva(row_start, row_end, device=device)
+                ok = table.enable_uva(
+                    row_start, row_end, shared=self._shared_tables, device=device
+                )
             except Exception:
                 # Answered as a refusal, not raised: the TP group votes next,
                 # and a rank that left before the vote would leave its peers
