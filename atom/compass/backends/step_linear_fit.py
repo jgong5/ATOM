@@ -2362,18 +2362,22 @@ def pack_main(argv) -> None:
     """``pack PATH...``: store each law file PATH, or each ``*.json`` in a
     directory PATH, xz-compressed beside it under its name and ``.xz``, as
     `json_file.write_json` writes it, and remove it, printing both sizes. A law
-    whose document did not change is stored in the same bytes."""
+    whose document did not change is stored in the same bytes. A PATH whose
+    name does not end in ``.json`` refuses, before any law is stored."""
     parser = argparse.ArgumentParser(
         prog="python -m atom.compass.backends.step_linear_fit pack",
         description=pack_main.__doc__.split("\n\n")[0],
     )
     parser.add_argument("paths", nargs="+", type=Path, help="law files or directories")
-    for path in parser.parse_args(argv).paths:
-        for law in sorted(path.glob("*.json")) if path.is_dir() else [path]:
-            into = law.with_name(law.name + json_file.XZ)
-            json_file.write_json(json_file.read_json(law), into)
-            print(f"{into}: {law.stat().st_size} -> {into.stat().st_size} bytes")
-            law.unlink()
+    paths = parser.parse_args(argv).paths
+    laws = [x for p in paths for x in (sorted(p.glob("*.json")) if p.is_dir() else [p])]
+    if named := [str(law) for law in laws if law.suffix != ".json"]:
+        parser.error(f"a law file packed is named *.json, and these are not: {named}")
+    for law in laws:
+        into = law.with_name(law.name + json_file.XZ)
+        json_file.write_json(json_file.read_json(law), into)
+        print(f"{into}: {law.stat().st_size} -> {into.stat().st_size} bytes")
+        law.unlink()
 
 
 def main(argv=None) -> None:

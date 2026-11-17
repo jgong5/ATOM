@@ -995,9 +995,11 @@ name ending in `.xz` decompressed (`atom/compass/backends/json_file.py`), and
 a fit, re-keyed or merged, or a refit written as `NAME.json`, is stored again by
 `PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit pack scripts/compass/laws`,
 which compresses each `*.json` there into `*.json.xz` and removes it. The same document
-always packs into the same bytes, so a law that did not change shows no diff. `xz -dc
-NAME.json.xz`, or `git show REV:PATH | xz -dc`, gives the law's JSON, one line as the fit
-writes it, for a diff or an edit. A merge that conflicts on a law file is resolved on
+always packs into the same bytes, so a law that did not change shows no diff. A packed
+law holds its top-level values longest first, so a re-key, which edits short ones,
+changes only the compressed stream's end, and git stores it as a small delta. `xz -dc
+NAME.json.xz`, or `git show REV:PATH | xz -dc`, gives the law's JSON on one line, for a
+diff or an edit. A merge that conflicts on a law file is resolved on
 that JSON: the base and both sides, `git show :1:PATH`, `:2:PATH` and `:3:PATH` each
 through `xz -dc`, are merged as JSON into `NAME.json`, which `pack` then stores. A branch
 that changed a law as `NAME.json` merges the same way, the tip's `NAME.json.xz` its other

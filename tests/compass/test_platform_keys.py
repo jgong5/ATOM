@@ -134,7 +134,9 @@ LAW_SPECS = {
 }
 
 
-@pytest.mark.parametrize("name", sorted(p.name for p in (ROOT / "laws").glob("*.json.xz")))
+@pytest.mark.parametrize(
+    "name", sorted(p.name for p in (ROOT / "laws").glob("*.json.xz"))
+)
 def test_every_checked_in_law_states_the_platform_of_its_spec(name):
     law = read_json(ROOT / "laws" / name)
     spec = platform(json.loads((MACHINES / LAW_SPECS[name]).read_text()))

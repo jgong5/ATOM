@@ -83,7 +83,9 @@ def test_a_law_split_at_a_token_count_prices_the_pass_by_it(law):
 
 
 def test_every_checked_in_law_loads():
-    laws = sorted((Path(__file__).parents[2] / "scripts/compass/laws").glob("*.json.xz"))
+    laws = sorted(
+        (Path(__file__).parents[2] / "scripts/compass/laws").glob("*.json.xz")
+    )
     assert laws
     for path in laws:
         StepLinearLaw(read_json(path))

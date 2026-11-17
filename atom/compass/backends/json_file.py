@@ -28,7 +28,13 @@ def read_jsonl(path) -> list:
 def write_json(document, path) -> None:
     """Write `document` to `path` as one line of JSON, xz-compressed when the
     name ends in `XZ`: at preset 9, whose 64 MiB dictionary spans a whole law,
-    and with no timestamp, so the same document always gives the same bytes."""
+    with no timestamp, and its top-level values in order of their JSON's
+    length, longest first, then of key. An edit of the short ones, as a law's
+    re-key makes, then changes only the stream's end, which git stores as a
+    small delta; the same document always gives the same bytes."""
+    if _xz(path):
+        size = {k: len(json.dumps(v)) for k, v in document.items()}
+        document = {k: document[k] for k in sorted(size, key=lambda k: (-size[k], k))}
     text = (json.dumps(document) + "\n").encode()
     Path(path).write_bytes(lzma.compress(text, preset=9) if _xz(path) else text)
 
