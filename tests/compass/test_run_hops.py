@@ -207,14 +207,14 @@ def test_each_side_of_a_v4_pro_pair_picks_its_hops_under_the_kv_role_deploy_sh_a
     # the --kv-transfer-config deploy.sh adds, fp4 without one at gfx950. Here
     # both sides' entries state one environment, the prefill side's, which the
     # build resolves both sides in, and the decode side's hops move.
-    env = json.loads(PAIR["prefill"].read_text())["host"]["key"]["engine"]["env"]
+    env = read_json(PAIR["prefill"])["host"]["key"]["engine"]["env"]
     for name in PERFORMANCE_KEYS:
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     hops, flags = {}, []
     for side, path in PAIR.items():
-        host = json.loads(path.read_text())["host"]
+        host = read_json(path)["host"]
         host["key"]["engine"]["env"] = env
         if side == "decode":
             host["hops"] = {k: 2 * v for k, v in host["hops"].items()}
