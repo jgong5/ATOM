@@ -12,13 +12,18 @@ at p90 interactivity `I` and p90 TTFT `TTFT`; their p90 end-to-end latency is
 """
 
 import json
+import os
 import re
+import shlex
+import subprocess
 import sys
+from pathlib import Path
 
 import platforms
 import pytest
 from test_advice_check import starts
 from test_advice_simulate import simulating, stubbed  # noqa: F401  the fixtures
+from test_calibrate import _tree
 from test_run_step_grid import DOCUMENT
 from test_validate_curves import INFERENCEX, _deployment, _run
 
@@ -469,3 +474,91 @@ def test_a_search_ends_in_its_results_and_a_changed_slo_simulates_nothing(
     assert len(starts(tmp_path)) > ran
     assert "only in its SLO" not in capsys.readouterr().out
     assert "--max-num-seqs 16" in rows(changed)["m-c1"]["made_by"][0]
+
+
+def _calibrated(tmp_path, command: str, **env) -> tuple[int, list[str]]:
+    """The printed calibrate.sh `command` run in `test_calibrate`'s stub tree,
+    under its variables and `env`: its exit status and the commands it ran."""
+    if not (tmp_path / "ATOM").exists():
+        _tree(tmp_path)
+    words = shlex.split(command.split("\n")[0])
+    at = words.index(str(lacking.CALIBRATE))
+    log = tmp_path / "log"
+    log.unlink(missing_ok=True)
+    path = f"{Path(sys.executable).parent}:{os.environ['PATH']}"
+    given = dict(w.split("=", 1) for w in words[:at]) | env
+    r = subprocess.run(
+        ["bash", str(tmp_path / "ATOM" / "scripts" / "compass" / "calibrate.sh")]
+        + words[at + 1 :],
+        cwd=tmp_path,
+        env=os.environ | {"PATH": path, "LOG": str(log)} | given,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    return r.returncode, log.read_text().splitlines() if log.exists() else []
+
+
+def test_a_calibrated_candidate_s_coverage_command_resumes_it_or_says_why_none(
+    tmp_path, simulating, monkeypatch  # noqa: F811
+):
+    """b's one point a coverage report under the suite's law file: its
+    calibrate.sh command, run in the stub tree into the shared store and failed
+    at its last record, is printed again with that store, and takes only that
+    record and the fits; once that calibration has ended, why no command can."""
+    for name, text in (("server", SERVER), ("client", CLIENT)):
+        (tmp_path / name).write_text(text.format(python=sys.executable))
+        (tmp_path / name).chmod(0o755)
+    monkeypatch.setattr(check, "COMPASS", tmp_path / "server")
+    monkeypatch.setattr(simulate, "CLIENT", tmp_path / "client")
+    monkeypatch.setenv("STUB_DIR", str(tmp_path))
+    monkeypatch.setenv("AIPERF_PYTHON", "/real/python")
+    (tmp_path / "summaries.json").write_text(json.dumps({"*": COVERAGE}))
+    (tmp_path / "run_file.json").write_text(json.dumps({"machine": DOCUMENT}))
+    made(tmp_path / "made" / "b-c1", 1, summary=None)
+    flags = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
+    space = {
+        "model": str(tmp_path),
+        "machine": {"device": flags[1], "ptl": flags[3]},
+        "store": str(tmp_path / "store"),
+        "workload": {"traces": str(tmp_path / "traces.jsonl"), "select": "agentx"},
+        "slo": {},
+        "common": {"basis": "a recipe"},
+        "dimensions": {"config": {"b": {"args": {"--max-num-seqs": 8}}}},
+    }
+    space["workload"]["concurrency"] = [1]
+    (tmp_path / "space.json").write_text(json.dumps(space))
+    out, store = tmp_path / "out", str((tmp_path / "store").resolve())
+
+    def coverage() -> list[str]:
+        cli.main(["advice", str(tmp_path / "space.json"), str(out)])
+        return rows(json.loads((out / results.RESULTS).read_text()))["b-c1"]["made_by"]
+
+    (first,) = coverage()
+    words, script = shlex.split(first.split("\n")[0]), f" {lacking.CALIBRATE} "
+    names = [
+        (
+            f"trace{k}-c{r.split()[1]}"
+            if r.startswith("trace ")
+            else f"cal{k}-c{r.split()[0]}"
+        )
+        for k, r in enumerate(words[words.index(script.strip()) + 2 :], 1)
+    ]
+    # The last first-turn record fails; the stub's trace runs end done when stopped.
+    left = names[max(k for k, n in enumerate(names) if n.startswith("cal")) :]
+    assert _calibrated(tmp_path, first, STORE=store, CLIENT_FAIL=left[0])[0] == 1
+
+    (command,) = coverage()
+
+    assert command == first.replace(script, f" STORE={shlex.quote(store)}{script}")
+    status, log = _calibrated(tmp_path, command)
+    assert status == 0
+    served = [line.split(" --out ")[1] for line in log if line.startswith("record ")]
+    assert served == [str(out / "cal" / "b" / n) for n in left]
+    ran = [line.split()[0] for line in log]
+    assert ran == ["record", "client"] * len(left) + ["fit", "fit"]
+    (why,) = coverage()
+    assert why.startswith(
+        f"no calibrate.sh command: the calibration in {out / 'cal' / 'b'} has ended"
+    )

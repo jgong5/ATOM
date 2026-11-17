@@ -35,6 +35,13 @@ the shared store when the verdicts were judged there and it holds neither a
 step linear law of the configuration at the head's ATOM digest nor readings at
 their key, since it refuses a second publish at a key, else into the
 calibration's own; on a 1P1D side `deploy.sh record` and a fit of that side.
+Where an earlier candidate none of whose verdicts is refused calibrates a law
+at the same key, by model, platform and engine config, a candidate names that
+calibration in place of its own command, which the store would refuse as a
+second law at the key, with the command measuring its readings into the store
+that calibration publishes into, unless they are at their key there; into the
+calibration's own store, only once it has started, as a publish there before
+would leave its directory holding files, which `calibrate.sh` refuses.
 A readings verdict ``measure`` names the `compass measure memory` command,
 under the instance's variables, a 1P1D side's on the connector a real start of
 it takes.
@@ -72,11 +79,12 @@ import time
 import traceback
 from pathlib import Path
 
-from atom.compass.artifacts import ArtifactRefusal
+from atom.compass.artifacts import ArtifactRefusal, machine_platform
 from atom.compass.drive import lacking, reuse, runfile, serve
 from atom.compass.drive import run as drive_run
 from atom.compass.fit.device import compose
 from atom.compass.kv.lmcache_server import DECLARED_LAWS
+from atom.compass.run.step_grid import keyed
 from atom.compass.spec import SpecRefusal
 
 #: The verdicts, in OUT.
@@ -92,6 +100,17 @@ CAL, STARTS = "cal", "starts"
 #: The file a calibration appends each step's start, end or failure to, in its
 #: directory, and ``end calibration`` once it has fitted both laws.
 STATUS = "status"
+#: What makes a law an earlier candidate's calibration makes at its key: that
+#: calibration, named by its candidate, and the store it publishes into.
+BORROWED = (
+    "{}'s calibration, whose law is at this configuration's key, publishing into {}"
+)
+#: What stands for a borrower's readings command into the calibration's own
+#: store until that calibration starts.
+PENDING = (
+    "its readings, into {}, once {}'s calibration has started: compass advice "
+    "then prints their command"
+)
 #: The file a calibration writes its inputs to, in its directory: a line
 #: ``store <path>`` names the store it publishes into, when one was named.
 INPUTS = "inputs"
@@ -129,7 +148,7 @@ def check(expansion: dict, out: Path) -> dict:
         refused = None
     except ValueError as error:
         head, refused = None, _refused(error, 1)
-    judged, seen, machine = {}, {}, expansion["machine"]
+    judged, seen, machine, calibrations = {}, {}, expansion["machine"], {}
     for candidate in expansion["candidates"]:
         points = [p for p in expansion["points"] if p["candidate"] == candidate["name"]]
         if refused:
@@ -158,6 +177,7 @@ def check(expansion: dict, out: Path) -> dict:
         else:
             store, verdicts = holding_law or (store, verdicts)
         judged[candidate["name"]] = {"store": str(store.root), "points": verdicts}
+        _borrowing(points, judged[candidate["name"]], calibrations)
     written = {"head": head, "refused": refused, "candidates": judged}
     (out / REUSE).write_text(json.dumps(written, indent=1) + "\n")
     return written
@@ -476,7 +496,11 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     `deploy.sh` adds, on the simulated connector, and runs under its variables
     over this process's ``AITER_LOG_LEVEL``, with those the script sets over
     them (`drive_run.side_env`). `made` is the calibration's directory, traces
-    and the shared store a ``calibrate`` verdict's command takes."""
+    and the shared store a ``calibrate`` verdict's command takes; a
+    `calibrate.sh` command's verdict states, for `_borrowing`, its
+    ``calibration``: the ``key`` its law is published at, by model, platform
+    and engine config, its directory, ``in``, and the store it publishes
+    ``into``."""
     if isinstance(machine, dict):
         return machine, machine
     args, env = one["args"], one["env"]
@@ -507,6 +531,9 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                     with _env({"TRACES": made[1]}):
                         command = lacking.calibration(made[0], args, config, into)
                         law["made_by"] = [command]
+                    key = [config.model, machine_platform(machine), keyed(config)]
+                    into = str(into or made[0] / "store")
+                    law["calibration"] = {"key": key, "in": str(made[0]), "into": into}
                 if readings["verdict"] == "measure":
                     real = args
                     if side in drive_run.ROLES:
@@ -519,6 +546,47 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     return seen[(store.root, *instance)]
 
 
+def _borrowing(points: list, held: dict, calibrations: dict) -> None:
+    """Take each ``calibration`` `_judged` states out of the law verdicts in
+    `held`, a candidate's at its `points`, and name, in place of a verdict's own
+    `calibrate.sh` command, the calibration an earlier candidate's in
+    `calibrations` makes at its key, since the store refuses a second law at a
+    key: such a verdict is made by that calibration and by what measures this
+    candidate's readings into the store it publishes into (`_readings_by`),
+    unless they are at their key there. Each other calibration joins
+    `calibrations`, unless a verdict of the candidate is refused, whose state
+    prints no command."""
+    refused = any(v["verdict"] == "refused" for v in _each(held["points"]))
+    for point in points:
+        verdicts = held["points"][point["name"]]
+        for side, law in verdicts["law"].items():
+            law = dict(law)
+            if (mine := law.pop("calibration", None)) is None:
+                continue
+            key = json.dumps(mine["key"], sort_keys=True)
+            made = calibrations.get(key, mine)
+            if made["in"] == mine["in"] and not refused:
+                calibrations[key] = mine
+            elif made["in"] != mine["in"]:
+                lender, into = Path(made["in"]), made["into"]
+                law["made_by"] = [BORROWED.format(lender.name, into)]
+                there = Path(into) == Path(held["store"])
+                if verdicts["readings"][side]["verdict"] != "reuse" or not there:
+                    one = point["instances"][side]
+                    law["made_by"].append(_readings_by(lender, into, one))
+            verdicts["law"][side] = law
+
+
+def _readings_by(lender: Path, into: str, one: dict) -> str:
+    """The command measuring the instance `one`'s readings into `into`, the
+    store the calibration in `lender` publishes into; while that is its own
+    store and it has not started, `PENDING`: a publish there first leaves the
+    calibration's directory holding files, which `calibrate.sh` refuses."""
+    if Path(into) == lender / "store" and not (lender / INPUTS).is_file():
+        return PENDING.format(into, lender.name)
+    return lacking.measure_memory(into, one["args"], one["env"])
+
+
 def _publishing(store, made, law: dict, readings: dict) -> str | None:
     """The store the calibration into `made`'s directory, whose verdicts `law`
     and `readings` were judged in `store`, publishes into, None its own. Once
@@ -528,11 +596,18 @@ def _publishing(store, made, law: dict, readings: dict) -> str | None:
     `store` and holds neither a step linear law at the head's ATOM digest nor
     readings at their key, since a store refuses a second publish at a key."""
     directory, _, shared = made
-    if (inputs := directory / INPUTS).is_file():
-        given = inputs.read_text().splitlines()
-        return next((s[len("store ") :] for s in given if s.startswith("store ")), None)
+    if (directory / INPUTS).is_file():
+        return started_store(directory)
     held = "store" in law or readings["verdict"] == "reuse" or readings.get("held")
     return shared if store.root == Path(shared) and not held else None
+
+
+def started_store(directory: Path) -> str | None:
+    """The store the `INPUTS` of the calibration started in `directory` name,
+    None when they name none or no calibration started there."""
+    inputs = directory / INPUTS
+    given = inputs.read_text().splitlines() if inputs.is_file() else []
+    return next((s[len("store ") :] for s in given if s.startswith("store ")), None)
 
 
 def _resolved(args, arch: str):

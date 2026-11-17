@@ -38,11 +38,12 @@ from atom.compass.advice.check import REUSE
 from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.json_file import read_json
 from atom.compass.drive.serve import RUN_JSON
+from atom.compass.report.html import FILE as REPORT
 from atom.compass.validate import curves
 from atom.compass.validate.runs import sides
 
-#: The dashboard, in OUT; a run's report, in its directory.
-FILE, REPORT = "dashboard.html", "report.html"
+#: The dashboard, in OUT.
+FILE = "dashboard.html"
 #: Each switched axis: its two definitions, InferenceX's first, each with the
 #: switch's label.
 AXES = {
@@ -143,7 +144,7 @@ def write(out: Path, candidates: Path, layer: dict | None = None) -> Path:
     `candidates`, with the reference `layer` when given: written into `out` as
     `FILE`, its path."""
     held, expansion = read_json(out / results.RESULTS), read_json(candidates)
-    reuse = read_json(out / REUSE) if (out / REUSE).is_file() else {}
+    reuse = read_json(out / REUSE)
     rows = [r | _ran(r, out) for r in held["rows"]]
     rings = {held["recommendation"]: "recommended", held["runner_up"]: "runner-up"}
     rings.pop(None, None)
@@ -218,33 +219,24 @@ def _ran(row: dict, out: Path) -> dict:
 
 
 def _shown(row: dict, column: str) -> str:
-    """`row`'s `column` as the page shows it, ``-`` for no value."""
-    value = row.get(column)
-    if value is None:
-        return "-"
-    if column in results.METRICS:
-        return results.METRICS[column][1].format(value)
-    if column == "total":
+    """`row`'s `column` as the page shows it: the total and the laws its own
+    way, every other column as the result table does (`results._shown`)."""
+    value = row[column]
+    if column == "total" and value is not None:
         return f"{value:.1f}"
-    if column == "method_shares":
-        return ", ".join(f"{g} {s:.1%}" for g, s in value.items() if s) or "none"
-    if column == "extrapolated_share":
-        return f"{value:.1%}"
     if column == "laws":
         laws = (f"{s} {', '.join(dict.fromkeys(r))}" for s, r in value.items())
         return "; ".join(laws) or "-"
-    if isinstance(value, bool):
-        return "yes" if value else "no"
-    return str(value)
+    return results._shown(row, column)
 
 
 def _search(expansion: dict, reuse: dict, slo: dict) -> str:
     """The search's table: what it searched, at which head, under which SLO."""
-    head, refused = reuse.get("head"), reuse.get("refused")
+    head, refused = reuse["head"], reuse["refused"]
     if head:
         at = f"{head['commit']} ({head['ref']}), ATOM digest {head['atom']}"
     else:
-        at = f"refused: {refused['reason']}" if refused else "not stated"
+        at = f"refused: {refused['reason']}"
     load = expansion["workload"]
     workload = f"{load['traces']}, traces {load['select']}, concurrency " + ", ".join(
         map(str, load["concurrency"])

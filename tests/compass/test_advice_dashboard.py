@@ -98,9 +98,16 @@ def labelled(page: str) -> str | None:
 def dashed(tmp_path, slo: dict, layer=None, reports=()) -> tuple[dict, str]:
     """`search` over `POINTS` at `slo`, each run's sides given their
     `SOURCES` and each run in `reports` a report, then the dashboard over its
-    results and expansion: the results and the page."""
+    results, expansion and reuse check: the results and the page."""
     held = search(tmp_path, CONFIGS, [1, 2], POINTS, slo)
     out = tmp_path / "out"
+    head = {
+        "commit": "f" * 40,
+        "ref": "origin/feature/atomcompass_new",
+        "atom": "e" * 64,
+    }
+    verdicts = {"head": head, "refused": None, "candidates": {}}
+    (out / check.REUSE).write_text(json.dumps(verdicts))
     for run in (out / "runs").iterdir():
         for side, (revision, dirty) in zip(
             sides(run), SOURCES.get(run.name, SOURCES["*"])
@@ -241,6 +248,20 @@ def test_each_switch_shows_its_definitions_view_and_the_frontier_joins_its_point
             assert line == " ".join(
                 f"{points[n]['x']},{points[n]['y']}" for n in frontier
             )
+
+
+def test_each_row_shows_the_result_tables_columns_as_compass_advice_prints_them(
+    tmp_path,
+):
+    held, page = dashed(tmp_path, {"max_ttft_p90_s": 1.7})
+
+    table = page.split('<div class="wide">')[1].split("</table>")[0]
+    shown = [re.findall(r"<td>(.*?)</td>", r) for r in table.split("<tr")[2:]]
+    printed = results.lines(held)[2 : 2 + len(held["rows"])]
+    for cells, line in zip(shown, printed, strict=True):
+        cell = dict(zip(dashboard.COLUMNS, cells))
+        for column, value in zip(results.COLUMNS, line.split(" | "), strict=True):
+            assert cell[column] == escape(value), (line, column)
 
 
 def test_the_reference_layer_is_drawn_labelled_with_its_source(tmp_path):

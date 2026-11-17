@@ -363,6 +363,26 @@ choose them are
 [19_adoption.md, D111](../../atom/compass/design/19_adoption.md#d111-results-the-frontier-the-recommendation-the-runner-up).
 No search point is graded, so every point reads `ungraded` or `coverage report`.
 
+**The dashboard.** The same run writes `OUT/dashboard.html` and prints
+`the dashboard in OUT/dashboard.html`: one static page of the search, opened
+from the file in a browser with no server. It draws each point's throughput per
+GPU against its interactivity, each axis switching between its two definitions,
+then the recommendation's text and the table, and a point whose run wrote
+`OUT/runs/<point>/report.html` opens it. What it shows is
+[19_adoption.md, D115](../../atom/compass/design/19_adoption.md#d115-the-dashboard-and-the-per-run-report).
+To draw another source's curves on it, such as InferenceX's for the same model,
+write them into a file and name it:
+
+```bash
+compass advice SPACE OUT --reference REFERENCE
+```
+
+REFERENCE is one JSON object, its fields as `dashboard.reference` in
+`atom/compass/advice/dashboard.py` reads them: `source`, which labels the
+curves on the page, and `curves`, each name to its points. A file of any other
+shape is refused by name, and nothing is written. The page drawn without
+`--reference` has no such curves, an SLO-only rerun's included.
+
 **Another SLO.** Change only `slo` in the space file and run `compass advice
 SPACE OUT` again. It prints `SPACE differs from the search in OUT only in its
 SLO: its results again, nothing checked or simulated`, and the results follow in
