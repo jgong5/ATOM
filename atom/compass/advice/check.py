@@ -487,11 +487,18 @@ def _publishing(store, made, law: dict, readings: dict) -> str | None:
     `store` and holds neither a step linear law at the head's ATOM digest nor
     readings at their key, since a store refuses a second publish at a key."""
     directory, _, shared = made
-    if (inputs := directory / INPUTS).is_file():
-        given = inputs.read_text().splitlines()
-        return next((s[len("store ") :] for s in given if s.startswith("store ")), None)
+    if (directory / INPUTS).is_file():
+        return started_store(directory)
     held = "store" in law or readings["verdict"] == "reuse" or readings.get("held")
     return shared if store.root == Path(shared) and not held else None
+
+
+def started_store(directory: Path) -> str | None:
+    """The store the `INPUTS` of the calibration started in `directory` name,
+    None when they name none or no calibration started there."""
+    inputs = directory / INPUTS
+    given = inputs.read_text().splitlines() if inputs.is_file() else []
+    return next((s[len("store ") :] for s in given if s.startswith("store ")), None)
 
 
 def _resolved(args, arch: str):
