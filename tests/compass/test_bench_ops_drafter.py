@@ -597,17 +597,19 @@ def test_the_draft_kv_tail_and_the_cursor_commit_take_what_atom_passes_them(
     rehearsed,
 ):
     """The draft-KV tail of a replayed prefill takes the step's positions at
-    its tail's rows, and a decode's cursor commit its block's anchor rows."""
+    its tail's rows, and a decode's cursor commit its block's anchor rows and
+    its step's segment starts, each request its own staged rows."""
     tail = "atom.model_ops.deepseek_v41.dspark:fused_draft_kv_tail"
     commit = "atom.model_ops.attentions.deepseek_v41.speculative:_launch_commit_cursors"
     taken = {
-        (r["shape"], r["op"], r["bound"].get(slot))
+        (r["shape"], r["op"], slot, r["bound"].get(slot))
         for r in rehearsed
-        for op, slot in ((tail, "positions"), (commit, "anchors"))
+        for op, slot in ((tail, "positions"), (commit, "anchors"), (commit, "starts"))
         if r["op"] == op
     }
     assert taken == {
-        ("prefill T=124 B=1", tail, "plan.tail_rows.positions"),
-        ("decode B=4", tail, "step.positions"),
-        ("decode B=4", commit, "draft_step.rows"),
+        ("prefill T=124 B=1", tail, "positions", "plan.tail_rows.positions"),
+        ("decode B=4", tail, "positions", "step.positions"),
+        ("decode B=4", commit, "anchors", "draft_step.rows"),
+        ("decode B=4", commit, "starts", "step.cu_seqlens_q"),
     }

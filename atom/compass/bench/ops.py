@@ -501,6 +501,7 @@ _ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 _FROM = ("replay_start", "cached_until")
 _SWA = "atom.model_ops.v4_kernels.state_writes:swa_write"
 _GATHER = "atom.model_ops.attentions.token_layout.gather:gather_rows"
+_COMMIT = "atom.model_ops.attentions.deepseek_v41.speculative:_launch_commit_cursors"
 V41_NAMES = {
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_prefix"): f"{_CACHE}.0",
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_extend"): f"{_CACHE}.1",
@@ -529,6 +530,8 @@ V41_NAMES = {
     (f"{_INDPTRS}:_launch_window_rows", "eptr"): f"{_CACHE.format(ratio=0)}.1",
     (_FUSED, "state_slot_mapping"): "step.slots",
     (_SWA, "state_slot_per_seq"): "step.slots",
+    # the cursor commit's segment starts, `step.cu_seqlens_q[:count]`
+    (_COMMIT, "starts"): "step.cu_seqlens_q",
     (_ROPE, "positions", "query"): "step.positions",
     (_ROPE, "positions", "key"): "step.plans.{ratio}.key_rope_positions_gpu",
     ("aten.index_select.default", "index", "kv"): "step.slots",
@@ -669,7 +672,6 @@ WINDOWS = {(_WINDOWS, "addresses"), (_WINDOWS, "ptr")}
 #: the device each step (`DSparkProposer.propose`, `DeepseekV41DSpark.
 #: block_backbone`, `TentativeState.commit`, `Stub._block`): the item of that
 #: build it takes.
-_COMMIT = "atom.model_ops.attentions.deepseek_v41.speculative:_launch_commit_cursors"
 BLOCK = {
     ("atom.spec_decode.dspark_proposer:DSparkProposer._stage_anchors", "rows"): "rows",
     (_COMMIT, "anchors"): "rows",
