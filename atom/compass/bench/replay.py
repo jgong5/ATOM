@@ -64,7 +64,7 @@ import torch
 from atom.compass.runner.step_output import filler_token_ids
 from atom.model_engine.block_manager import draft_kv_lookahead
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.llm_engine import InputOutputProcessor, _load_tokenizer
+from atom.model_engine.llm_engine import InputOutputProcessor, load_tokenizer
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import (
     Sequence,
@@ -117,7 +117,7 @@ class ReplayRule:
 
     def __init__(self, config, sampling: dict | None = None) -> None:
         self.sampling = SamplingParams(**(sampling or {}))
-        tokenizer = _load_tokenizer(config.model, config.trust_remote_code)
+        tokenizer = load_tokenizer(config.model, config.trust_remote_code)
         self.fillers = filler_token_ids(
             tokenizer, config.eos_token_id, config.stop_token_ids
         )

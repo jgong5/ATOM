@@ -137,7 +137,14 @@ async fn a_cancel_goes_to_prefill_before_the_relay_and_to_decode_after() {
         },
         ..Default::default()
     };
-    let context = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime =
+        mesh::core::prepare_pool::PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap())
+            .unwrap();
+    let context = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     let seen = Seen::default();
     let (gate, later) = (Arc::new(Semaphore::new(0)), Arc::new(Semaphore::new(0)));
     let mut workers = Vec::new();

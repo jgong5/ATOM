@@ -339,7 +339,12 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
     def abort_send(self, req_id) -> None:
         """Mooncake's abort of a claimed request: a write request taken by now,
         as Mooncake's listener takes one on arrival, reports when it would
-        have; with none, the send is done now."""
+        have; with none, the send is done now. A `Sequence` here is a request
+        that finished aborted, which holds no claim: retired at once, as
+        `KVConnectorBase.abort_send` does."""
+        if hasattr(req_id, "id"):
+            self.send_finished(req_id.id)
+            return
         self._take_write_requests()
         self._drop_claim(req_id, self._rt.read_clock())
 

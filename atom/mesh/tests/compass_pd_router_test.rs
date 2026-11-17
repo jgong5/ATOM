@@ -94,7 +94,14 @@ async fn a_pd_request_is_held_and_restamped_at_ingress_relay_and_stream() {
         },
         ..Default::default()
     };
-    let context = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime =
+        mesh::core::prepare_pool::PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap())
+            .unwrap();
+    let context = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     let seen = Seen::default();
     let mut workers = Vec::new();
     for prefill in [true, false] {

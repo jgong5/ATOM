@@ -34,7 +34,7 @@ from atom.compass.bench import ops
 from atom.compass.run.step_grid import keyed
 from atom.model_engine import llm_engine
 
-llm_engine._load_tokenizer = lambda *a: SimpleNamespace(bos_token_id=1, eos_token_id=2)
+llm_engine.load_tokenizer = lambda *a: SimpleNamespace(bos_token_id=1, eos_token_id=2)
 ops.coverage = lambda store, root, config, *a: keyed(config)["quantization"]
 ops.main(sys.argv[1:])
 """

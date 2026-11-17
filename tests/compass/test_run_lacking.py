@@ -56,7 +56,7 @@ def served(monkeypatch, config):
     tokenizer.json; no server starts."""
     monkeypatch.setattr(drive_run, "_config", lambda atom_args, arch=None: config)
     tok = SimpleNamespace(is_fast=True, name_or_path=None)
-    monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *args: tok)
+    monkeypatch.setattr(llm_engine, "load_tokenizer", lambda *args: tok)
     monkeypatch.setattr(serve, "serve", unstarted)
 
 
@@ -140,7 +140,7 @@ def test_check_meets_the_server_s_refusal_of_a_tokenizer_from_another_backend(
     )
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run_file.json"))
     with pytest.raises(ValueError) as refused:
-        compass_run.tokenizer(llm_engine._load_tokenizer(str(tmp_path)), r.config)
+        compass_run.tokenizer(llm_engine.load_tokenizer(str(tmp_path)), r.config)
     monkeypatch.delenv(compass_run.ENV)
 
     assert checked(tmp_path, *flags) == 1

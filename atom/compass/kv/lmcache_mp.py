@@ -91,7 +91,7 @@ class MultiShell(MultiConnectorScheduler):
 def _units_as_named(config) -> SimpleNamespace:
     """A native-state rank's checkpoint layout: the units it is given, as
     named, and an image group exactly when ATOM's worker registers one."""
-    from atom.kv_transfer.offload.mp.native_state_worker import stores_state_images
+    from atom.kv_transfer.offload.mp.native_state_layout import stores_state_images
 
     replay = int(getattr(config, "state_replay_tokens", 0) or 0)
     return SimpleNamespace(validate_unit_ids=tuple, images=stores_state_images(replay))
