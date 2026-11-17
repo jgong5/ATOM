@@ -2333,13 +2333,13 @@ file (`runner/overrides.py::publish_planned_transfer`) its paged KV block's byte
 block that file carries for a P/D transfer; the block's tokens (`kv_cache_block_size`);
 and its state image, the `image_bytes` of its PAGE-backed checkpoint spec, 0 without one.
 A chunk's bytes are the block's times the server's `--chunk-size` over the block's
-tokens: ATOM's worker registers that many PAGE bytes per block of those tokens
+tokens: ATOM's worker registers its PAGE regions per block of those tokens
 (`mp/worker.py::LMCacheMPConnector.register_kv_caches`), and DeepSeek-V4's planned block
-is exactly the PAGE regions it registers
-(`DeepseekV4AttentionMetadataBuilder.get_kv_transfer_tensors` refuses any other sum). The
-image is the spec the scheduler half binds, whose presence makes ATOM's scheduler half
-native-state (`mp/connector.py::LMCacheMPConnectorScheduler.bind_block_manager`). A pool whose
-charged entry carries alignment padding is overstated here as in the P/D price.
+is exactly those regions (`DeepseekV4AttentionMetadataBuilder.get_kv_transfer_tensors`
+refuses any other sum). A pool whose charged entry carries alignment padding is
+overstated here as in the P/D price. The image is the spec the scheduler half binds,
+whose presence makes ATOM's scheduler half native-state
+(`mp/connector.py::LMCacheMPConnectorScheduler.bind_block_manager`).
 
 LP `lmcache` reads the plan before it starts its first job, on the first stamped request
 released to it, and builds the copy station's `TransferModel` then. Every member has
@@ -2362,12 +2362,13 @@ entry it writes today, the server's flags and the request loop's declared laws
 (`advice/check.py::_lmcache`); `scripts/compass/parity_one_node.sh` writes the same entry,
 with no image read from the real run's log.
 
-#3641 builds the sizing: the publication and the block file of an `lmcache_mp`
-deployment, the shared read, LP `lmcache` started with no size, and the shell's image
-check dropped (`runner/overrides.py`, `run/__init__.py`, `kv/lmcache_server.py`,
-`kv/lmcache_mp.py`). #3674 builds the channels and the retired keys: one transfer channel
-per DP rank, the writer check dropped and both keys refused (`clock/channels.py`,
-`kv/lmcache_mp.py`, `run/__init__.py`, `scripts/compass/parity_one_node.sh`).
+#3641 builds the sizing: the publication and the block file of an `lmcache_mp` deployment,
+the plan read shared with `_planned_transfer`, LP `lmcache` started with no size, and the
+shell's image check dropped (`runner/overrides.py`, `run/__init__.py`,
+`kv/lmcache_server.py`, `kv/lmcache_mp.py`). #3674 builds the channels and the retired
+keys: one transfer channel per DP rank, the writer check dropped and both keys refused
+(`clock/channels.py`, `kv/lmcache_mp.py`, `run/__init__.py`,
+`scripts/compass/parity_one_node.sh`).
 
 **Fake-model duties.**
 
