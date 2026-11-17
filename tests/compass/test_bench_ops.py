@@ -926,6 +926,54 @@ def test_v41_fp4_whole_context_leaves_take_their_ratio_s_bounds_and_packed_start
     ]
 
 
+@pytest.mark.parametrize(
+    "top_k, slot",
+    [
+        ("aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode", "seq_lens"),
+        (ops._PICK, "seqLens"),
+    ],
+)
+def test_a_v41_top_k_s_staged_bounds_are_its_ratio_s_with_and_without_its_scorer(
+    monkeypatch, top_k, slot
+):
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *a: {})
+    runner, rows = _Runner(), _t([2], "metadata", dtype="torch.int32")
+    # V4.1's FP8 index plane at ratios 1 and 2, PAGEs of 32 tokens
+    geometry = SimpleNamespace(layer_ratios=(1, 2), rows_per_page=lambda r: 32 // r)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    visible = {r: torch.tensor([50, 20], dtype=torch.int32) // r for r in (1, 2)}
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        fctx._forward_context.attn_metadata.step = SimpleNamespace(visible=visible)
+        return out
+
+    def stating(op, ratio):
+        said = (("compress_ratio", ratio),) if ratio else ()
+        return dataclasses.replace(op, stated=said)
+
+    def top(width, ratio=None):  # as aiter's decode top-k launches it
+        plane = ("logits", _t([2, width], "metadata"))
+        return stating(_leaf(top_k, plane, (slot, rows), ("stride0", width)), ratio)
+
+    runner.prepare_model = prepare_model
+    # ratio 2's scorer, its logits 32 wide
+    scorer = stating(_leaf(ops._LOGITS, ("out_logits", _t([2, 32], "metadata"))), 2)
+    placed, bound = SimpleNamespace(block_size=32, batch=lambda *a: a[1:]), []
+    # each top-k stating its ratio, alone; ratio 2's stating none beside its
+    # scorer, and alone
+    for leaves in [(top(64, 1), top(32, 2)), (scorer, top(32)), (top(32),)]:
+        found = ops.leaves(_graph(*leaves, layers=1)["region"])
+        got = ops.Stub(runner, 10_000).point(placed, decode(2), 64, found)
+        bound += [r["metadata"][slot] for r in got if r["op"] == top_k]
+
+    assert bound[:3] == ["step.visible.1", "step.visible.2", "step.visible.2"]
+    told = bound[3].rpartition("cannot tell which ratio's ")[-1]
+    assert told == "scorer writes its 32-wide logits: trace its shape again"
+
+
 def test_the_v41_candidate_lift_leaves_its_selection_as_built_past_twice_the_kept(
     monkeypatch,
 ):
@@ -1212,6 +1260,66 @@ def test_v41_index_leaves_rank_a_logits_plane_drawn_below_each_row_s_bound(
     for call, bounds in zip(taken, ([50, 20], [50, 20], [26, 20])):
         for row, n in zip(call["logits"], bounds):
             assert row[:n].ne(0).all() and row[n:].eq(0).all()
+
+
+def test_a_v41_multi_cta_top_k_takes_its_bounds_and_ranks_a_plane_drawn_below_them(
+    monkeypatch,
+):
+    # gfx950's multi-CTA top-k at decode B=2: the page-wide one, a candidate
+    # list's and the pick's, on block maxima; no scorer or pick here
+    def top_k(width, logits, bounds):
+        return _leaf(
+            ops._MULTI,
+            ("logits", _t([2, width], logits)),
+            ("seq_lens", _t([2], bounds, dtype="torch.int32")),
+            ("stride0", width),
+        )
+
+    leaves = top_k(64, "metadata", "metadata"), top_k(32, "metadata", "activation")
+    leaves += (top_k(8, "activation", "activation"),)
+    taken = _v41_index(monkeypatch, [50, 20], leaves, decode(2), 64)
+
+    # rows seeing 50 and 20 compressed rows; the list keeps 26 and 20 of
+    # them, the pick ranks 7 and 3 blocks of 8
+    ends = [[50, 20], [26, 20], [7, 3]]
+    assert [call["seq_lens"].tolist() for call in taken] == ends
+    for call, bounds in zip(taken, ends[:2]):
+        for row, n in zip(call["logits"], bounds):
+            assert row[:n].ne(0).all() and row[n:].eq(0).all()
+    # a prefill of 256 past 1024 cached tokens ranks a plane as wide as its 40
+    # KV blocks, not the 8 it traced; a candidate list's stays as it was sized
+    leaves = top_k(8, "metadata", "metadata"), leaves[1]
+    taken = _v41_index(monkeypatch, [50, 20], leaves, prefill(256, 1), 1024)
+    assert [call["logits"].shape[1] for call in taken] == [40, 32]
+
+
+def test_a_v41_fp4_packed_multi_cta_top_k_takes_its_starts_and_ranks_from_them(
+    monkeypatch,
+):
+    # gfx950's multi-CTA top-k on V4.1's FP4 plane, its rows packed: a whole
+    # context's on its scorer's logits, the pick's on its block maxima
+    I32 = "torch.int32"
+    staged, ends = _t([2], "metadata", dtype=I32), _t([2], "activation", dtype=I32)
+
+    def top_k(width, bounds):  # each row the whole packed buffer
+        return _leaf(
+            ops._MULTI,
+            *[("logits", _t([2, width], "metadata", [0, 1])), ("seq_lens", bounds)],
+            *[("stride0", 0), ("row_starts", staged)],
+        )
+
+    records = []
+    monkeypatch.setattr(ops, "_journal", lambda path, got: records.extend(got) or got)
+    leaves = top_k(128, staged), top_k(16, ends)
+    whole, pick = _v41_index(monkeypatch, [50, 20], leaves, decode(2), 64, fp4=True)
+
+    # rows 64 columns and 8 blocks apart, a whole context's drawn from each start
+    run = whole["logits"][0]
+    assert whole["row_starts"].tolist() == [0, 64]
+    assert run[:50].ne(0).all() and run[64:84].ne(0).all()
+    assert run[50:64].eq(0).all() and run[84:].eq(0).all()
+    assert pick["row_starts"].tolist() == [0, 8] and pick["seq_lens"].tolist() == [7, 3]
+    assert records[1]["metadata"]["logits"] == "workspace._maxima"
 
 
 def test_each_copy_of_a_v41_index_leaf_ranks_a_logits_plane_of_its_own():

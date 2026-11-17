@@ -36,7 +36,9 @@ for it, says so in its place:
 - a simulated run's split beside the real runs', when the cell's `GRADES`
   grades it: each segment's percentiles of this run and of each real run
   graded with it, from their `split.FILE`, and why a run has none;
-- the op-family split, which no run's directory holds.
+- the op-family split, which no run's directory holds;
+- the Prometheus report: a link to `prometheus.HTML`, or what
+  `prometheus.TEXT` says of why there is none.
 """
 
 import collections
@@ -48,7 +50,7 @@ from html import escape
 from pathlib import Path
 
 from atom.compass.backends.json_file import read_json
-from atom.compass.report import split
+from atom.compass.report import prometheus, split
 from atom.compass.run import OP_GRAPH, STEP_GRID, STEP_LINEAR, STEP_STUB, SUMMARY_FILE
 from atom.compass.validate import curves
 from atom.compass.validate.runs import CLIENT_RUN, EXPORT, sides
@@ -399,6 +401,13 @@ def _beside(run: Path) -> str:
     return out
 
 
+def _prometheus(run: Path) -> str:
+    if (run / prometheus.HTML).is_file():
+        text = "ATOM's CI report over this run's Prometheus series"
+        return f'<p><a href="{prometheus.HTML}">{escape(text)}</a></p>'
+    return _none(f"None: {(run / prometheus.TEXT).read_text().strip()}")
+
+
 def _part(title: str, make, *args) -> str:
     try:
         body = make(*args)
@@ -428,6 +437,7 @@ def page(run) -> str:
         parts.append(_part("A real run's per-request split", _beside, run))
     why = "None: no op-family split is recorded for this run."
     parts.append(_part("Op-family split", _none, why))
+    parts.append(_part("Prometheus report", _prometheus, run))
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
