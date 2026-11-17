@@ -27,8 +27,6 @@ from test_calibrate import CLIENT, _calibrate, _tree
 
 #: A status line, less its UTC stamp, its seconds read as N.
 STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ ")
-#: The seconds of each step's take that ended or failed.
-TAKE = re.compile(r"^\S+ (?:end|fail) (?!calibration )\S+ (\d+) s", re.MULTILINE)
 
 
 def _status(o: Path) -> list[str]:
@@ -103,6 +101,9 @@ def test_status_holds_each_take_s_start_and_end_or_failure_and_the_end_times_eac
     r, _ = _calibrate(tmp_path, "1", "trace 4", CLIENT_FAIL="cal1-c1")
     assert r.returncode == 1
     o = tmp_path / "o"
+    # The failed take ran half an hour, each stub take 0 or 1 s.
+    said = (o / "status").read_text()
+    (o / "status").write_text(re.sub(r"(fail cal1-c1) \d+ s", r"\1 1800 s", said))
 
     r, _ = _calibrate(tmp_path, "1", "trace 4")
 
@@ -132,8 +133,7 @@ def test_status_holds_each_take_s_start_and_end_or_failure_and_the_end_times_eac
         "start fit_host",
         "end fit_host N s",
     ]
-    held = sum(map(int, TAKE.findall((o / "status").read_text())))
-    hours = f"{held / 3600:.2f} node-hours"
+    hours = "0.50 node-hours"
     assert status[-1] == f"end calibration {hours}"
     steps = ["tool", "warm", "memory", "cal1-c1", "trace2-c4", "fit_steps", "fit_host"]
     table = r.stdout.split("step | wall s\n")[1].splitlines()[: len(steps)]
