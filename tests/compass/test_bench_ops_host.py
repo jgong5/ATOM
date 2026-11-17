@@ -192,23 +192,32 @@ def test_a_tensor_pinned_as_the_runner_is_built_states_no_pageable(request, tmp_
     assert [(s.get("device"), s.get("pageable")) for s in staged] == [("cpu", None)] * 2
 
 
+def _apart(request) -> bool:
+    """Whether this process runs the test's body: the patches import aiter,
+    which needs an arch declared, once per process, so the test runs again in
+    a process of its own, which does."""
+    if "COMPASS_ARCH_DECLARED" in os.environ:
+        return True
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+        + ["--show-capture=no", f"{__file__}::{request.node.name}"],
+        env={**os.environ, "COMPASS_ARCH_DECLARED": "1"},
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+    assert done.returncode == 0, done.stdout[-4000:]
+    return False
+
+
 def test_a_host_tensor_built_over_pinned_bytes_states_no_pageable(request, tmp_path):
     """`torch.from_numpy` of a pinned `CpuGpuBuffer`'s numpy view, and a
     `torch.tensor` or `torch.arange` with `pin_memory=True`, a `torch.tensor`
     built for the device among them, each built and copied in a step, state no
     `pageable`; `torch.from_numpy` of an unpinned buffer's view or of an array
     numpy allocated still does."""
-    if "COMPASS_ARCH_DECLARED" not in os.environ:
-        done = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
-            + ["--show-capture=no", f"{__file__}::{request.node.name}"],
-            env={**os.environ, "COMPASS_ARCH_DECLARED": "1"},
-            capture_output=True,
-            text=True,
-            timeout=900,
-            check=False,
-        )
-        assert done.returncode == 0, done.stdout[-4000:]
+    if not _apart(request):
         return
     driverless.install(str(tmp_path), "gfx942")
     from atom.utils import CpuGpuBuffer
@@ -237,3 +246,47 @@ def test_a_host_tensor_built_over_pinned_bytes_states_no_pageable(request, tmp_p
         if isinstance(spec, dict) and spec.get("device") == "cpu"
     ]
     assert [s.get("pageable", False) for s in held] == [False] * 4 + [True] * 2
+
+
+def test_a_pinned_tensor_or_arange_records_what_torch_records(request, tmp_path):
+    """A `torch.tensor` or `torch.arange` with `pin_memory=True`, built in a
+    step and copied to the device, lands where the same call without it does
+    and records its ops, each host source pinned where torch pins it: a
+    `torch.tensor` for a device by index or for a default device without one,
+    and one that requires grad; not an `arange` for a device, which torch
+    builds there, nor a pageable `out`, beside which torch ignores the pin."""
+    if not _apart(request):
+        return
+    driverless.install(str(tmp_path), "gfx942")
+    capture = forward._Recorder({}, driverless.driverless_mode(ShapeEnv()))
+
+    def defaulted(**pin):
+        with torch.device("cuda"):
+            return torch.tensor([1, 2], **pin)
+
+    def step(build, **pin):
+        capture.start()
+        capture.on = True
+        out = build(**pin)
+        out.to("cuda")
+        capture.on = False
+        ops = [graph._json(op) for _, op in capture.items]
+        marks = [  # each host source's, taken off its op
+            spec.pop("pageable", False)
+            for op in ops
+            for spec in op["args"].values()
+            if isinstance(spec, dict) and spec.get("device") == "cpu"
+        ]
+        return (str(out.device), out.is_leaf, out.requires_grad, ops), marks
+
+    with forward._patches(capture), capture.fake_mode, capture:
+        buf = torch.zeros(2, dtype=torch.int64, device="cpu")
+        builds = (
+            lambda **pin: torch.tensor([1.0], device=0, requires_grad=True, **pin),
+            defaulted,
+            lambda **pin: torch.arange(2, device="cuda", **pin),
+            lambda **pin: torch.arange(2, out=buf, **pin),
+        )
+        steps = [(step(b), step(b, pin_memory=True)) for b in builds]
+    assert [held for (held, _), _ in steps] == [held for _, (held, _) in steps]
+    assert [marks for _, (_, marks) in steps] == [[False], [False], [], [True]]

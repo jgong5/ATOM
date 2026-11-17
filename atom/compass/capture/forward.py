@@ -992,10 +992,11 @@ def _patches(recorder):
     * A host tensor ATOM asks to pin (that host side, `pin_memory=True`, a
       `pin_memory()` copy) is held pinned (`_Recorder.pin`), as `is_pinned`
       answers, and so is `torch.from_numpy` over a numpy view of one, which
-      shares its bytes. `torch.tensor` and `torch.arange` build one on the
-      host unpinned, then move it to its device, as torch stages a pinned
-      `torch.tensor`: torch pins through the driver, and the fake mode
-      refuses to pin an `arange`.
+      shares its bytes. `torch.tensor` and `torch.arange` build one unpinned
+      where torch builds it, a `torch.tensor` for a device on the host and
+      then copied there, as torch stages it: torch pins through the driver,
+      and the fake mode refuses to pin an `arange`. Beside `out`, torch
+      ignores `pin_memory`, and so does the capture.
     * GDN's causal-conv1d metadata is host arithmetic over the staged
       `cu_seqlens`, and it runs outside the fake mode too.
     * A GDN prefill under ReplaySSM parks the cursors of its live state
@@ -1122,13 +1123,20 @@ def _patches(recorder):
         held = isinstance(base, torch.Tensor) and recorder.pinned(base)
         return recorder.pin(out) if held else out
 
-    def staged(build):
-        def call(*args, pin_memory=False, **kwargs):
-            if not pin_memory:
+    def staged(build, moves):
+        def call(*args, **kwargs):
+            if not kwargs.get("pin_memory") or kwargs.get("out") is not None:
                 return build(*args, **kwargs)
-            device = kwargs.pop("device", None) or torch.get_default_device()
-            out = recorder.pin(build(*args, device="cpu", **kwargs))
-            return out.to(device, out.dtype)  # itself, when that is the host
+            del kwargs["pin_memory"]
+            with recorder.quiet():  # the device torch builds it on, index and all
+                device = torch.empty(0, device=kwargs.get("device")).device
+            if device.type == "cpu" or not moves:
+                out = build(*args, **kwargs)
+                return recorder.pin(out) if device.type == "cpu" else out
+            grad = kwargs.pop("requires_grad", False)
+            out = recorder.pin(build(*args, **{**kwargs, "device": "cpu"}))
+            out = torch.ops.aten._to_copy.default(out, device=device)  # as torch's
+            return out.requires_grad_() if grad else out
 
         return call
 
@@ -1195,8 +1203,8 @@ def _patches(recorder):
         (torch.Tensor, "pin_memory", lambda t, *a, **k: recorder.pin(t.clone())),
         (torch.Tensor, "is_pinned", lambda t, *a, **k: recorder.pinned(t)),
         (torch, "from_numpy", host_from_numpy),
-        (torch, "tensor", staged(tensor)),
-        (torch, "arange", staged(arange)),
+        (torch, "tensor", staged(tensor, moves=True)),
+        (torch, "arange", staged(arange, moves=False)),
         (FakeTensor, "tolist", host_tolist),
         (torch.Tensor, "numpy", lambda t, *a, **k: host_numpy(landed(t), *a, **k)),
         (loader, "safetensors_weights_iterator", lambda *a, **k: iter(())),
