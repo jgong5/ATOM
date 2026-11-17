@@ -101,7 +101,11 @@ def dashed(tmp_path, slo: dict, layer=None, reports=()) -> tuple[dict, str]:
     results, expansion and reuse check: the results and the page."""
     held = search(tmp_path, CONFIGS, [1, 2], POINTS, slo)
     out = tmp_path / "out"
-    head = {"commit": "f" * 40, "ref": "origin/feature/atomcompass_new", "atom": "e" * 64}
+    head = {
+        "commit": "f" * 40,
+        "ref": "origin/feature/atomcompass_new",
+        "atom": "e" * 64,
+    }
     verdicts = {"head": head, "refused": None, "candidates": {}}
     (out / check.REUSE).write_text(json.dumps(verdicts))
     for run in (out / "runs").iterdir():
