@@ -2165,7 +2165,7 @@ class Stub:
                 cache = getattr(snap.attn_metadata, "cache", None)
                 geometry = getattr(cache, "geometry", None)
                 if value["object"] == RING and hasattr(geometry, "window_bytes"):
-                    at = _captured(geometry, op.get("rings", frozenset()))
+                    at = _captured(geometry, op.get("rings", ()))
                     return _ring(geometry, cache.num_pages, got, at)
                 return got
             if (
@@ -3001,10 +3001,10 @@ def _layers(geometry, captured) -> dict:
 
 @functools.cache
 def _captured(geometry, rings) -> int | None:
-    """The pages of the capture's pool that placed DeepSeek-V4.1's window rings
-    `rings` (`RING`), every one a graph's leaves take (`leaves`), as the one
-    count on which each is a layer's of `geometry` (`_layers`); None where not
-    one is."""
+    """The pages of the capture's pool that placed the DeepSeek-V4.1 window
+    rings (`RING`) `rings`, a graph's (`leaves`), as the one count on which
+    each is a layer's (`_layers`): one capture's pool placed them all; None
+    where not one is."""
     from atom.compass.capture.forward import rebuild_object
 
     fits = [_layers(geometry, rebuild_object(RING, r)) for r in rings]
