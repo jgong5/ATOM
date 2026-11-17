@@ -1495,6 +1495,6 @@ with two changes:
 
 - Each round runs c=1, 4, 16, 64, after an unscored 600 s warm run at c=64 and one at c=1.
 - Since [#2086](https://github.com/jgong5/ATOM/pull/2086) a prefill step's label is a trace
-  run's busy time, so `validate.cost` leaves a real run's prefill steps out as `untraced`;
-  cell B's prefill cost is read by `validate.cost` at `ed5fa7697`, the step law's fit tree,
-  which labels a prefill step by its device window.
+  run's busy time, so `validate.cost` leaves a plain real run's prefill steps out as
+  `untraced`; cell B's prefill cost is read by `validate.cost` at `ed5fa7697`, the step law's
+  fit tree, which labels a prefill step by its device window.
