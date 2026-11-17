@@ -624,18 +624,23 @@ search's or profiling's code.
   split and before `report.html`): ATOM's CI report, `export_report.py` imported unchanged
   from the run's source tree, its panels for the run's deployment kind (`pd` when OUT holds
   `prefill/` and `decode/`, else `standalone`) over the run's series (`11` D74) from their
-  first instant to their last, at CI's 5 s step and `max(60, 4 x interval)` window. Each
-  sampler's file is decompressed, since promtool reads no gzip, and backfilled by promtool
-  into one TSDB that a Prometheus with no scrape
+  first instant to the first grid point at or past their last, as CI's
+  `wait_for_final_scrape` ends its query, at CI's 5 s step and `max(60, 4 x interval)`
+  window. Each sampler's file is decompressed, since promtool reads no gzip, and
+  backfilled by promtool into one TSDB that a Prometheus with no scrape
   serves to `collect_report`; both come from `collect_metrics.py::ensure_prometheus`, which takes a
   `tool` argument, reads `ATOMESH_PROMTOOL_BIN` beside `ATOMESH_PROMETHEUS_BIN`, and reuses a
   tool it extracted into the directory it is given, here `~/.cache/compass/prometheus-3.5.0`,
   so a node downloads the checksummed 3.5.0 archive once and one that cannot is given both
-  binaries beforehand. The page says it is simulated through the data it renders: its title
-  ("Simulated agentic PD inference report", "Simulated agentic aggregated inference
-  report"), its notes (the simulated clock from the run's start shown from 1970-01-01 00:00
-  UTC, the GPU panels' predicted target device time on TP rank 0, any frontend or engine
-  member with no file, any family it queries that the sampler's class table lacks, `11`
+  binaries beforehand. Each file lands there under its name only once whole, written under
+  a per-process name and renamed, the archive once its checksum holds, so `compass
+  advice`'s parallel points, each stopped by `client.sh --stop`
+  (`atom/compass/advice/simulate.py`), never run another's part-written tool; two racing on
+  a node's first use each download the archive. The page says it is simulated through the
+  data it renders: its title ("Simulated agentic PD inference report", "Simulated agentic
+  aggregated inference report"), its notes (the simulated clock from the run's start shown
+  from 1970-01-01 00:00 UTC, the GPU panels' predicted target device time on TP rank 0,
+  any frontend or engine member with no file, any family it queries that the sampler's class table lacks, `11`
   D77), and the two GPU panels' label and description, which say predicted (`11` D75). A
   deployment's Overall
   TTFT, the router's `mesh_router_ttft_seconds`, stays empty and the notes say why: the
@@ -671,8 +676,11 @@ that imports it in place; reimplementing `rate` and `histogram_quantile` in Pyth
 copy of PromQL that drifts from CI's numbers; a "SIMULATED" badge in CI's page, an edit to
 CI's template for what the title says; a router TTFT built from aiperf's, a client
 measurement under the router's name; CI's `metrics/` layout, a second `report.html` in one
-run directory; and writing it after `report.html`, which could then only link a file it
-cannot know exists.
+run directory; writing it after `report.html`, which could then only link a file it
+cannot know exists; a grid shifted to end on the last instant, which then starts after the
+first, unlike CI's from the benchmark's start; and a lock around the tools' download,
+which a killed report leaves blocking every later one, against a download each node makes
+once (#3611).
 
 ---
 
@@ -906,7 +914,7 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage (a decode vector for every scheduled rung before the search, each point's extrapolated share reported after it) and `08` D47's three figures on each leave-one-run-out fold within #627's 5% gate, a law at the head past it refused; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose ATOM digest is not the head's, the remote tip's or a frozen commit's, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363; the head by ATOM's digest, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957); coverage in two parts, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216); the accuracy bar, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6869501859)) |
 | D113 | The step linear backend lists a configuration's missing records, for a missing law or decode rung, as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
 | D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355); the format 2026-11-14 ([#3458](https://github.com/jgong5/ATOM/issues/3458)) |
-| D115 | Two static views reading files only: the search's dashboard, a page of Compass's own, each point marked by grading state and method shares, with a reference layer from the file `--reference` names; and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell, which renders the cell's reports again. Beside `report.html`, every simulated run's `prometheus.html`: CI's report, `export_report.py` unchanged, over the run's series (`11` D74), marked simulated, the GPU panels predicted, the router's TTFT empty; or `prometheus.txt` with why, the stop not failing. | 2026-11-13 (#3355, #3363); the page Compass's own 2026-11-15 ([#3465](https://github.com/jgong5/ATOM/issues/3465)); the Prometheus report 2026-11-16 ([#3584](https://github.com/jgong5/ATOM/issues/3584)) |
+| D115 | Two static views reading files only: the search's dashboard, a page of Compass's own, each point marked by grading state and method shares, with a reference layer from the file `--reference` names; and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell, which renders the cell's reports again. Beside `report.html`, every simulated run's `prometheus.html`: CI's report, `export_report.py` unchanged, over the run's series (`11` D74), marked simulated, the GPU panels predicted, the router's TTFT empty; or `prometheus.txt` with why, the stop not failing. | 2026-11-13 (#3355, #3363); the page Compass's own 2026-11-15 ([#3465](https://github.com/jgong5/ATOM/issues/3465)); the Prometheus report 2026-11-16 ([#3584](https://github.com/jgong5/ATOM/issues/3584)); its query's end and the tools written whole 2026-11-17 ([#3611](https://github.com/jgong5/ATOM/issues/3611)) |
 | D116 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355); P1 calibrated anew 2026-11-16 ([#3493](https://github.com/jgong5/ATOM/pull/3493#issuecomment-6906479025)) |
 | D117 | Moved to MiniMax-M3 once its Compass features land and #3265 passes, calibrated on the development nodes from #3256's arms at one frozen commit, where its simulations and validation runs run too, every point priced by the step linear law alone, a step past its records extrapolated and reported, and the pricing reopened if #3256's grading fails the law where the step grid passes ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216)); the showcase validation runs the recommended configuration and the runner-up real, graded by `08` D44, their real order compared with the simulated one, each point's `08` D45.1 verdict beside its grade, not gated. Amends `08` D50. | 2026-11-13 (#3355, #3363) |
 
