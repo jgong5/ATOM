@@ -131,9 +131,10 @@ class _ByB(CostSource):
 
 
 def test_a_padded_step_whose_width_moves_at_one_graph_prices_as_new():
-    # A prefill of 4 tokens that samples nothing, on one rank, padded to 8 and
-    # then to its T: the graph is one, and at its T a GEMM that leads with 4
-    # may have run at its rows or at its width.
+    # A prefill of 4 tokens that samples nothing, on one rank, past one more
+    # cached token a step, padded to 8 and then to its T: the graph is one,
+    # and at its T a GEMM that leads with 4 may have run at its rows or at its
+    # width, which the counts that choose a bound alone say.
     region = {
         "seq": [leaf(GEMM, [[4, 64]], A=t([4, 64]), B=t([64, 64], role="weight"))]
     }
@@ -144,8 +145,8 @@ def test_a_padded_step_whose_width_moves_at_one_graph_prices_as_new():
         )
 
     steps = [
-        BatchView((RequestShape(4, 4, False),), target_bs=w, produces_output=False)
-        for w in (8, 8, 4, 8, 4)
+        BatchView((RequestShape(4, 4 + k, False),), target_bs=w, produces_output=False)
+        for k, w in enumerate((8, 8, 4, 8, 4))
     ]
     run = backend()
 
