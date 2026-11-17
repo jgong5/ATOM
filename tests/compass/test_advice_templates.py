@@ -16,12 +16,11 @@ from atom.utils.arg_parser import FlexibleArgumentParser
 
 ROOT = Path(__file__).resolve().parents[2]
 SPACE = ROOT / "scripts/compass/spaces/deepseek-v4-pro-mi355x-crs005.json"
-#: The shipped DPA8 pair whose capture ladders the 1P1D configurations take,
-#: but on the sides in `OWN_LADDER`.
+#: The shipped DPA8 pair whose capture ladders the 1P1D configuration takes.
 LAW = "scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-crs005-{}.json.xz"
-#: The 1P1D sides with a ladder of their own: P1's decode side takes the powers
-#: of two to 256, each size a calibration deployment of its own.
-OWN_LADDER = {("P1", "decode"): [1, 2, 4, 8, 16, 32, 64, 128, 256]}
+#: The single-node configurations' capture ladder: the powers of two to 512,
+#: each size a calibration record of its own.
+POWERS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 CONCURRENCY = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 #: Each instance's ATOM arguments the template states, by the name ATOM's
 #: parser reads each under, but `--model` and the capture sizes, and its
@@ -67,10 +66,6 @@ INSTANCES = {
     "S1": {"server": (ONE_NODE, MOE)},
     "S2": {"server": ({**ONE_NODE, **DPA}, DP)},
     "S5": {"server": ({**ONE_NODE, **DPA}, {**DP, **LMCACHE})},
-    "P1": {
-        "prefill": ({**MESH, "gpu_memory_utilization": 0.75}, MOE),
-        "decode": ({**MESH, "gpu_memory_utilization": 0.75}, MOE),
-    },
     "P3": {
         "prefill": ({**MESH, **DPA, "gpu_memory_utilization": 0.72}, TBO),
         "decode": (
@@ -97,12 +92,10 @@ def law(side: str) -> dict:
     return read_json(ROOT / LAW.format(side))["engine_config"]
 
 
-def test_the_template_expands_into_its_five_configurations_at_1_to_256_clients(
-    expansion,
-):
+def test_the_template_expands_into_its_configurations_at_1_to_256_clients(expansion):
     candidates = expansion["candidates"]
     assert [c["name"] for c in candidates] == list(INSTANCES)
-    assert [c["deployment"] for c in candidates] == ["single"] * 3 + ["1p1d"] * 2
+    assert [c["deployment"] for c in candidates] == ["single"] * 3 + ["1p1d"]
     assert [(p["candidate"], p["concurrency"]) for p in expansion["points"]] == [
         (c, n) for c in INSTANCES for n in CONCURRENCY
     ]
@@ -111,7 +104,6 @@ def test_the_template_expands_into_its_five_configurations_at_1_to_256_clients(
 
 
 def test_atom_reads_each_instance_as_the_template_states_it(expansion):
-    atom_ladder = parse_size_list(parsed([])["cudagraph_capture_sizes"])
     for point in expansion["points"]:
         for side, instance in point["instances"].items():
             args, env = INSTANCES[point["candidate"]][side]
@@ -125,10 +117,8 @@ def test_atom_reads_each_instance_as_the_template_states_it(expansion):
             assert written - {"model", "cudagraph_capture_sizes"} == args.keys()
             assert {name: given[name] for name in args} == args
             assert given["model"] == expansion["model"]
-            # ATOM's own on a single node, the shipped pair's on each 1P1D side
-            # but those with their own.
-            shipped = atom_ladder if side == "server" else law(side)["ladder"]
-            assert sizes == OWN_LADDER.get((point["candidate"], side), shipped)
+            # The powers of two on a single node, the shipped pair's on each 1P1D side.
+            assert sizes == (POWERS if side == "server" else law(side)["ladder"])
             assert instance["env"] == env
 
 

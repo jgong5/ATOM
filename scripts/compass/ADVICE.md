@@ -166,12 +166,13 @@ refused, with the start's error.
 ### Example: S1 from its recipe
 
 The DeepSeek-V4-Pro template's S1 is the TP server of
-`recipes/DeepSeek-V4-Agentic-InferenceX.md`, with one decision of the user's:
+`recipes/DeepSeek-V4-Agentic-InferenceX.md`, with two decisions of the user's:
 `--max-num-seqs` 512, not twice the concurrency, so each configuration takes one
-memory-readings entry. Its two variables, `AITER_BF16_FP8_MOE_BOUND` and
-`ATOM_MOE_GU_ITLV`, and its `-tp 8`, `--kv_cache_dtype fp8` and
-`--enable_prefix_caching` are every configuration's, so they sit in `common` with
-`--max-num-seqs`, and S1's block holds the rest:
+memory-readings entry, and capture sizes the powers of two to 512, not ATOM's
+default, so its calibration takes fewer records. Its two variables,
+`AITER_BF16_FP8_MOE_BOUND` and `ATOM_MOE_GU_ITLV`, and its `-tp 8`,
+`--kv_cache_dtype fp8` and `--enable_prefix_caching` are every configuration's,
+so they sit in `common` with `--max-num-seqs`, and S1's block holds the rest:
 
 ```json
 "S1": {
@@ -180,10 +181,12 @@ memory-readings entry. Its two variables, `AITER_BF16_FP8_MOE_BOUND` and
     "--index_cache_dtype": "fp4", "--method": "mtp", "--num-speculative-tokens": 3,
     "--spec-decode-acceptance-length": 2.49, "--gpu-memory-utilization": 0.9,
     "--max-num-batched-tokens": 16384, "--attn-prefill-chunk-size": 16384,
-    "--state-checkpoint-interval-tokens": 8192, "--level": 3, "--cudagraph-mode": "FULL"
+    "--state-checkpoint-interval-tokens": 8192, "--level": 3, "--cudagraph-mode": "FULL",
+    "--cudagraph-capture-sizes": "[1,2,4,8,16,32,64,128,256,512]"
   },
   "departures": {
     "--served-model-name": "unset: ATOM then serves the model under its --model path, the value the recipe gives",
+    "--cudagraph-capture-sizes": "the powers of two to 512, not ATOM's default the recipe keeps, 1 to 8, 16, 32, 48, 64, 128, 256 and 512: each capture size is a calibration record of its own, and the template is ungraded",
     "--max-num-seqs": "512, not twice the concurrency: one value keeps one memory-readings entry per configuration"
   }
 }
