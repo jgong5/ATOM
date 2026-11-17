@@ -161,15 +161,18 @@ FUSED_MOES = ("aiter.fused_moe_.default", "aiter.rocm_aiter_fused_moe.default")
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
 logger = logging.getLogger(__name__)
-#: The path of each file this process opened to read since its first capture
-#: began (`watch_reads`); None before that.
+#: The path of each data file this process opened to read since its first
+#: capture began (`watch_reads`); None before that.
 _READ: set | None = None
+#: Python's own files, which count as run when imported, not when read: ATOM's
+#: source reading, a traceback or `inspect` reads them without running them.
+_PYTHON = (".py", ".pyc")
 
 
 def watch_reads() -> set:
-    """The absolute path of each file this process opens to read from its first
-    call on, as the `open` audit event names it (`_opened`). An audit hook
-    cannot be removed, so one serves the process."""
+    """The absolute path of each file but Python's own (`_PYTHON`) this process
+    opens to read from its first call on, as the `open` audit event names it
+    (`_opened`). An audit hook cannot be removed, so one serves the process."""
     global _READ
     if _READ is None:
         _READ = set()
@@ -193,7 +196,8 @@ def _opened(event, args):
         or (isinstance(mode, str) and not set(mode) & set("wax+"))
     ):
         try:
-            _READ.add(os.path.abspath(os.fsdecode(path)))
+            if not (path := os.fsdecode(path)).endswith(_PYTHON):
+                _READ.add(os.path.abspath(path))
         except (OSError, ValueError):
             pass
 

@@ -239,8 +239,8 @@ def population_steps(names, tbo=False, drafters=False):
 @functools.cache
 def traced_under() -> dict:
     """This process's ATOM source (`run.atom_source`) and torch, by axis: what
-    every `op_graph` it traces is keyed and fingerprinted under, its ATOM
-    source only where the graph states no files, and every one it reads is
+    every `op_graph` it traces is keyed and fingerprinted under, the ATOM
+    source only for one that states no files, and every one it reads is
     looked up under. Read once, as a process traces and reads under the code
     it imported."""
     import torch

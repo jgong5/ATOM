@@ -197,13 +197,15 @@ def test_a_graph_keyed_by_its_files_answers_under_its_torch_alone(
 def test_a_capture_states_the_files_it_ran_and_read_and_answers_while_they_do(
     tmp_path, monkeypatch
 ):
-    """The 27B traced at one width in a process of its own, as
-    `test_capture_ir` traces it: its graph states ATOM's model runner and a
-    data file of aiter's it read, and no Compass file nor ATOM's server, and
-    answers here until one of its files reads otherwise."""
+    """The 27B traced at two widths in a process of its own, as
+    `test_capture_ir` traces it: its second graph, traced after the first was
+    published, states ATOM's model runner and a data file of aiter's it read,
+    and no Compass file nor ATOM's server, and answers here until one of its
+    files reads otherwise."""
     (tmp_path / "model").mkdir()
     (tmp_path / "model" / "config.json").write_bytes(CONFIG.read_bytes())
-    argv = ["trace", "ops", "--model", str(tmp_path / "model"), "--width", "2"]
+    argv = ["trace", "ops", "--model", str(tmp_path / "model")]
+    argv += ["--width", "2", "--width", "4"]
     done = subprocess.run(
         [sys.executable, "-c", MAIN, *argv, "--store", str(tmp_path / "store")],
         capture_output=True,
@@ -214,9 +216,9 @@ def test_a_capture_states_the_files_it_ran_and_read_and_answers_while_they_do(
         env={**os.environ, "PYTHONPATH": str(TREE)},
     )
     tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
-    assert len(tokens) == 1, f"rc {done.returncode}\n{done.stderr[-4000:]}"
+    assert len(tokens) == 2, f"rc {done.returncode}\n{done.stderr[-4000:]}"
     store = ArtifactStore(tmp_path / "store")
-    entry = store.read(store.key_from_token(Kind.OP_GRAPH, tokens[0]))
+    entry = store.read(store.key_from_token(Kind.OP_GRAPH, tokens[1]))
     files = json.loads(entry.read_member("files", RANK, "json"))
     data = [path for path in files["aiter"] if not path.endswith(".py")]
     at, shape = entry.key.values["structure"], entry.key.values["shape"]
