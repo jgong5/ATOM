@@ -241,7 +241,10 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     `kv_link`, ``intra_node`` for two instances on one node and
     ``inter_node`` across two, which alone reads ``--network``. Its hops are
     the prefill side's host entry's, its ``decode_hops`` the decode side's. A
-    price list the prefill side names that is not the decode side's refuses."""
+    price list the prefill side names that is not the decode side's refuses.
+    With ``args.acceptance_record``, a decode record, it names the record as
+    ``compass run`` does, refusing what either instance would refuse as it
+    joins (`drive.run.joined_atom_args`)."""
     out = build(args, prefill_args, across=kv_link == "inter_node")
     if run.PRICE_LIST in out:
         decode = _price_list_key(decode_args, run._machine(out)).values
@@ -256,6 +259,13 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     if hosts := run.entries(out, "host"):
         arch = run._machine(out).value("device.arch")
         out[run.DECODE_HOPS] = _hops(hosts, decode_args, arch)
+    if record := getattr(args, "acceptance_record", None):
+        # Imported here: that module imports this one.
+        from atom.compass.drive.run import joined_atom_args
+
+        out[run.ACCEPTANCE_RECORD] = str(Path(record).resolve())
+        for side, atom_args in (("D", decode_args), ("P", prefill_args)):
+            joined_atom_args(out, atom_args, side)
     return out | {
         "router_s": _hops(hosts, prefill_args, arch).get("router_s") if hosts else None,
         "kv_link": kv_link,
