@@ -6214,6 +6214,19 @@
    "why": "compass advice hands each point to its thread pool",
    "mechanism": "K9",
    "mechanism_why": "a hand-off onto the executor's queue cannot park; the advice command is no LP: the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
+  },
+  {
+   "id": "atom/compass/report/prometheus.py::_report::subprocess.Popen( [ prometheus, f\"--config.file={work / 'prometheus.yml'}\", f\"--storage.tsdb.path={work / 'data'}\", \"--web.listen-address=127.0.0.1:0\", ], stdou::thread_start#0",
+   "file": "atom/compass/report/prometheus.py",
+   "symbol": "_report",
+   "call": "subprocess.Popen",
+   "expr": "subprocess.Popen( [ prometheus, f\"--config.file={work / 'prometheus.yml'}\", f\"--storage.tsdb.path={work / 'data'}\", \"--web.listen-address=127.0.0.1:0\", ], stdou",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "none",
+   "why": "a run's Prometheus report starts a Prometheus that scrapes nothing, to serve the series the run's LPs wrote to CI's report",
+   "mechanism": "K9",
+   "mechanism_why": "starting a process cannot park; the report runs once the run has stopped, from client.sh or deploy.sh, and is no LP, so no simulated time passes in it"
   }
  ],
  "anchors": [

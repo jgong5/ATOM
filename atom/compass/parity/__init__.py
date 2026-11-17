@@ -16,7 +16,7 @@ gate (`t_gate_ns`), the launch (`t_launch_ns`) and the wait for the previous
 output's token copy (`t_recv_ns`, only on a forward that reaches it; off a
 pipeline, a runner that does not defer its output reads its own tokens under
 `t_read_ns` instead), and with
-a drafter its MTP status (`t_mtp_ns`) and draft copy (`t_draft_recv_ns`). Its device
+a drafter its MTP status (`t_mtp_ns`) and draft copy (`t_draft_recv_ns`; reading its own, `t_draft_read_ns`). Its device
 window is `d_busy_ns`, from an event recorded at the launch's entry to one
 recorded at the forward's exit (`d_target_ns` to one recorded just after
 `postprocess` records `forward_done_event`, less the drafter's `compute_draft_kv`
@@ -124,6 +124,7 @@ TIMESTAMPS = (
     "t_read_ns",
     "t_mtp_ns",
     "t_draft_recv_ns",
+    "t_draft_read_ns",
     "t_pp_recv_ns",
     "t_flush_ns",
     "d_busy_ns",
@@ -543,6 +544,11 @@ class StepRecording:
             processor.prepare_sampled_ids = functools.partial(
                 self._stamped, "t_recv_ns" if pp else "t_read_ns", sampled
             )
+            if hasattr(self, "drafter"):  # and its own draft ids, once its draft ends
+                drafts = processor.prepare_draft_ids
+                processor.prepare_draft_ids = functools.partial(
+                    self._stamped, "t_draft_read_ns", drafts
+                )
         if pp:
             from aiter.dist.parallel_state import get_pp_group
 

@@ -50,7 +50,7 @@ that tightest bound moved since, leaving out any above it at its own launch,
 whose host stalled before stamping it; with no status wait, the largest launch
 bound over the record. A decode's draft label, its `propose`
 pass, is cut where the device reached the pass, placed by that lead, before
-the host's draft copy wait (`t_draft_recv_ns`) began: the host queues the pass
+the host's draft copy wait (`t_draft_recv_ns`, or reading its own, `t_draft_read_ns`) began: the host queues the pass
 just before that wait, so the window may hold the device's wait for it.
 Under an EAGLE3 drafter a decode's line also times each draft forward of that
 pass (`DRAFT_PASSES`), which stand and are cut with its draft label.
@@ -379,10 +379,10 @@ def host_paced_drafts(lines) -> set[int]:
     return {
         s["step"]
         for s, start, lead, _ in _timed(lines)
-        if "t_draft_recv_ns" in s
+        if ("t_draft_recv_ns" in s or "t_draft_read_ns" in s)
         and "d_target_ns" in s
         and start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0) + lead
-        < s["t_draft_recv_ns"][0]
+        < s.get("t_draft_recv_ns", s.get("t_draft_read_ns"))[0]
     }
 
 
@@ -628,7 +628,7 @@ def _label(
         if "t_pp_recv_ns" in s:
             host["W_recv"] = s["t_pp_recv_ns"][0] - l0
         if host_kind(view) != "middle":
-            d0, d1 = s.get("t_draft_recv_ns", (0, 0))
+            d0, d1 = s.get("t_draft_recv_ns", s.get("t_draft_read_ns", (0, 0)))
             host["W_post"] = s["t_exit_ns"] - r1 - (d1 - d0)
         if "t_pull_ns" in s:
             host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
