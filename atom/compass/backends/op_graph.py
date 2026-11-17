@@ -298,13 +298,15 @@ class _Plan:
 
     def __init__(self, held: tuple, at: tuple) -> None:
         self.held, self.at = held, at
-        self.units = [
-            (part, unit)
-            for part, region in enumerate(held)
-            if region
-            for unit in _units(region)
-        ]
-        self.priced: list[list] = [[] for _ in self.units]
+        # Lists of plain values and shared objects: a plan lives across steps,
+        # and the collector walks every object it holds.
+        self.units: list[dict] = []
+        self.parts: list[int] = []
+        for part, region in enumerate(held):
+            if region:
+                self.units += _units(region)
+                self.parts += [part] * (len(self.units) - len(self.parts))
+        self.priced: list = [()] * len(self.units)
         self.reads: list = [None] * len(self.units)
         # Each part's bound laid flat at the last step, None until one priced
         self.flat: list | None = None
@@ -495,8 +497,10 @@ class OpGraphBackend(CostBackend):
         self._plans: dict[tuple, _Plan | tuple] = {}
         # By view and graphs: a step's price, while `_plans` holds the graphs.
         self._viewed: dict[tuple, StepCost] = {}
-        # What the unit being priced has read of its step (`_Plan`).
+        # What the unit being priced has read of its step (`_Plan`), and each
+        # value of what a price or a unit read, one object for all that hold it.
         self._read: set = set()
+        self._interned: dict = {}
         # By leaf object: the view of the rows its pass runs, for a routed
         # leaf of a drafter's pass that does not run the step's tokens, this
         # step (`_pass_views`).
@@ -575,15 +579,15 @@ class OpGraphBackend(CostBackend):
         dirty: set[str] = set()
         plan.flat = None  # until every unit priced again prices
         for u in again:
-            part, unit = plan.units[u]
+            part, unit = plan.parts[u], plan.units[u]
             self._read = set()
             priced = self._priced(unit, view, refused, bounds[part])
             if part:
                 priced = [(PREFIXES[part] + p[0], *p[1:]) for p in priced]
             renamed |= [p[0] for p in priced] != [p[0] for p in plan.priced[u]]
-            reads = (part, frozenset(self._read))
+            reads = self._shared((part, self._shared(frozenset(self._read))))
             regrouped |= reads != plan.reads[u]
-            plan.priced[u], plan.reads[u] = priced, reads
+            plan.priced[u], plan.reads[u] = priced or (), reads
             dirty.update(p[0] for p in priced)
         if refused:
             raise CostRefused(view, list(dict.fromkeys(refused)))
@@ -629,6 +633,10 @@ class OpGraphBackend(CostBackend):
         return _cost(
             {n: _term(n, ps, at[n.startswith(DRAFT)]) for n, ps in names.items()}
         )
+
+    def _shared(self, reads):
+        """`reads`, as the one object of its value the backend holds."""
+        return self._interned.setdefault(reads, reads)
 
     def describe(self) -> str:
         rows = "the rows a graph pads to" if self.padded else "real rows"
@@ -928,7 +936,8 @@ class OpGraphBackend(CostBackend):
             free = not (watched.read or refused[n:])
             if refused[n:] or watched.read and view is not own:
                 reads = {VIEW}
-            step = self._step[key] = (view, got, frozenset(reads | watched.read), free)
+            reads = self._shared(frozenset(reads | watched.read))
+            step = self._step[key] = (view, got, reads, free)
             # Kept too by every path the work has read by now, its own among
             # them, which a path read anew changes.
             self._step[id(view), bound, self._text(kept, bound)] = step
