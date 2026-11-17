@@ -198,7 +198,8 @@ def _at(leaf: dict, path: tuple) -> list:
 class _Read(tuple):
     """A bound a price is asked at, one of a padded step's bounds or the
     step's own, that adds to `reads` the place in its step's bound laid flat
-    (`_flat`) of each item its reader takes, from `start` on."""
+    (`_flat`) of each item its reader takes by index or slice, from `start`
+    on, as `fit.ops.PriceList.price` reads a bound."""
 
     def __new__(cls, bound: tuple, start: int, reads: set):
         read = super().__new__(cls, bound)
@@ -209,10 +210,6 @@ class _Read(tuple):
         at = range(self.start, self.start + len(self))[i]
         self.reads.update(at if isinstance(at, range) else (at,))
         return super().__getitem__(i)
-
-    def __iter__(self):
-        self.reads.update(range(self.start, self.start + len(self)))
-        return super().__iter__()
 
 
 def _flat(bound) -> tuple:

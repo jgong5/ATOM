@@ -16,7 +16,10 @@ from test_op_graph_listed_steps import ATTENTION, GEMM, _attention, _gemm
 from test_op_work import I32, leaf, t
 
 from atom.compass.backends import BatchView, RequestShape, op_graph
-from atom.compass.backends.op_graph import OpGraphBackend
+from atom.compass.backends.cost import CostTerm
+from atom.compass.backends.op_graph import LISTED, OpGraphBackend
+from atom.compass.backends.provenance import Method, Provenance
+from atom.compass.backends.resolver import CostSource
 from atom.compass.fit import ops
 
 DP = 8
@@ -110,3 +113,48 @@ def test_a_later_step_prices_only_what_it_moved_again(monkeypatch):
     assert asked == {GEMM: 2, ATTENTION: len(STEPS) - 1}
     # the experts there too, and at each later step that moves the tokens
     assert works[MOE] == 4
+
+
+class _ByB(CostSource):
+    """A price list that answers a leaf at each bound it may have run at by
+    that bound's B, and declines where two bounds' B differ."""
+
+    name = LISTED
+
+    def price(self, request):
+        leaf, bounds, _ = request
+        each = bounds if isinstance(bounds, list) else [bounds]
+        b = [bound[2] for bound in each]
+        if b != b[:1] * len(b):
+            return self.refuse(f"ran at B {b}")
+        return CostTerm(f"op.{leaf['op']}", b[0] * 1e-6, Provenance(Method.MEASURED))
+
+
+def test_a_padded_step_whose_width_moves_at_one_graph_prices_as_new():
+    # A prefill of 4 tokens that samples nothing, on one rank, padded to 8 and
+    # then to its T: the graph is one, and at its T a GEMM that leads with 4
+    # may have run at its rows or at its width.
+    region = {
+        "seq": [leaf(GEMM, [[4, 64]], A=t([4, 64]), B=t([64, 64], role="weight"))]
+    }
+
+    def backend():
+        return OpGraphBackend(
+            SPEC, lambda *_, **__: region, kv="bf16", price_list=_ByB()
+        )
+
+    steps = [
+        BatchView((RequestShape(4, 4, False),), target_bs=w, produces_output=False)
+        for w in (8, 8, 4, 8, 4)
+    ]
+    run = backend()
+
+    got = [run.price(step).terms for step in steps]
+    assert got == [backend().price(step).terms for step in steps]
+    assert [terms[0].name.endswith(".price_list") for terms in got] == [
+        True,
+        True,
+        False,
+        True,
+        False,
+    ]
