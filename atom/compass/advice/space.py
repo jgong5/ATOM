@@ -9,14 +9,19 @@ order. A candidate is named by its values joined with ``-``, in the
 dimensions' order, and takes ``common``'s block and each of its values'
 blocks; each instance's arguments are ATOM's, ``--model`` first, and a
 point's add each argument that varies with the concurrency, its factor times
-the point's concurrency.
+the point's concurrency. A candidate whose blocks set ``lmcache_server``
+holds those `lmcache server` flags, and each of its points
+``lmcache_port``, its own from `LMCACHE_PORTS` in the points' order, so
+points started at once each reach their own server.
 
 Every refusal is a ValueError naming the file and the field: an unknown field,
-a key given twice in one object, a value of the wrong kind; contradictory
-values, two blocks of one candidate that set an argument, a variable, a
-departure's reason, its basis or its deployment apart, or an argument both
-fixed and varying with the concurrency; a candidate that names no basis; and
-an empty expansion. An excluded combination is never judged.
+a key given twice in one object, a value of the wrong kind, an lmcache server's
+``--host`` or ``--port``; contradictory values, two blocks of one candidate
+that set an argument, a variable, an lmcache server flag, a departure's
+reason, its basis or its deployment apart, or an argument both fixed and
+varying with the concurrency; a candidate that names no basis; an empty
+expansion; and more offloading points than `LMCACHE_PORTS` holds. An excluded
+combination is never judged.
 """
 
 import itertools
@@ -35,7 +40,20 @@ SELECT = re.compile(r"(0|[1-9][0-9]*)-(0|[1-9][0-9]*)|agentx")
 INSTANCES = {"single": ("server",), "1p1d": ("prefill", "decode")}
 #: What a block sets for one instance, and what it sets for the candidate.
 SIDE = ("args", "env", "per_concurrency")
-BLOCK = (*SIDE, "basis", "deployment", "departures", "prefill", "decode")
+BLOCK = (
+    *SIDE,
+    "basis",
+    "deployment",
+    "departures",
+    "lmcache_server",
+    *INSTANCES["1p1d"],
+)
+#: The `lmcache server` flags `compass advice` sets itself: its address.
+LMCACHE_OWNED = ("--host", "--port")
+#: Each offloading point's lmcache server port, by its order among them: from
+#: lmcache's default up, below the ports `compass run` and `deploy.sh` draw a
+#: server's from (`drive.serve.SERVE_PORTS`, `DEPLOY_PORTS`).
+LMCACHE_PORTS = range(5555, 10000)
 
 
 def expand(path) -> dict:
@@ -69,6 +87,16 @@ def expand(path) -> dict:
         for candidate in candidates
         for n in space["workload"]["concurrency"]
     ]
+    named = {candidate["name"]: candidate for candidate in candidates}
+    offloading = [p for p in points if "lmcache_server" in named[p["candidate"]]]
+    if len(offloading) > len(LMCACHE_PORTS):
+        raise ValueError(
+            f"{where}: {len(offloading)} points offload to an lmcache server, each "
+            f"on its own port, and {len(LMCACHE_PORTS)} ports from "
+            f"{LMCACHE_PORTS.start} are compass advice's"
+        )
+    for point, port in zip(offloading, LMCACHE_PORTS):
+        point["lmcache_port"] = port
     given = ("model", "machine", "store", "commit", "workload", "slo")
     return {
         "space": str(Path(path).resolve()),
@@ -110,12 +138,17 @@ def _read(path: Path) -> dict:
 def _candidate(chosen: dict, blocks: list, model: str, where: str) -> dict:
     name = "-".join(chosen.values())
     where = f"{where}: candidate {name}"
-    once, departures = {}, {}
+    once, departures, server = {}, {}, {}
     for source, block in blocks:
         for field in ("basis", "deployment"):
             if field in block:
                 value = block[field]
                 _put(once, field, value, f"{field} {value}", source, where)
+        for flag, value in block.get("lmcache_server", {}).items():
+            # As lmcache's parser reads it: --no-x is the flag --x.
+            words = (flag,) if value is True else (flag, str(value))
+            key = flag[2:].removeprefix("no-")
+            _put(server, key, words, " ".join(words), f"{source}.lmcache_server", where)
         for what, reason in block.get("departures", {}).items():
             key = what  # a variable's name
             if what.startswith("--"):  # an argument, as ATOM's parser reads it
@@ -131,7 +164,7 @@ def _candidate(chosen: dict, blocks: list, model: str, where: str) -> dict:
             raise ValueError(
                 f"{where} is single-node, and {source} gives it a {side} side"
             )
-    return {
+    candidate = {
         "name": name,
         "values": chosen,
         "deployment": deployment,
@@ -142,6 +175,11 @@ def _candidate(chosen: dict, blocks: list, model: str, where: str) -> dict:
             for side in INSTANCES[deployment]
         },
     }
+    if server:
+        candidate["lmcache_server"] = [
+            w for words, *_ in server.values() for w in words
+        ]
+    return candidate
 
 
 def _instance(side: str, blocks: list, model: str, where: str) -> dict:
@@ -255,10 +293,14 @@ def _check(space: dict, where: str) -> None:
 
 def _block(where: str, block, sides: bool = True) -> None:
     block = _object(where, block, (), BLOCK if sides else SIDE)
-    for flag, value in _map(f"{where}.args", block.get("args", {})).items():
-        _is(f"{where}.args: {flag!r}", FLAG.fullmatch(flag), "a long flag, --name")
-        ok = value is True or _number(value) or isinstance(value, str)
-        _is(f"{where}.args.{flag}", ok, "a string, a number, or true for a bare flag")
+    _flags(f"{where}.args", block.get("args", {}))
+    at = f"{where}.lmcache_server"
+    flags = _flags(at, block.get("lmcache_server", {}))
+    if owned := next((flag for flag in flags if flag in LMCACHE_OWNED), None):
+        raise ValueError(
+            f"{at}: {owned} is compass advice's, which gives each point its own "
+            "lmcache server address"
+        )
     for var, value in _map(f"{where}.env", block.get("env", {})).items():
         _is(f"{where}.env: {var!r}", VARIABLE.fullmatch(var), "a variable's name")
         ok = _number(value) or isinstance(value, str)
@@ -280,6 +322,16 @@ def _block(where: str, block, sides: bool = True) -> None:
     for side in ("prefill", "decode"):
         if side in block:
             _block(f"{where}.{side}", block[side], sides=False)
+
+
+def _flags(where: str, given) -> dict:
+    """`given`, each long flag to its value, a string, a number, or true for a
+    bare flag."""
+    for flag, value in _map(where, given).items():
+        _is(f"{where}: {flag!r}", FLAG.fullmatch(flag), "a long flag, --name")
+        ok = value is True or _number(value) or isinstance(value, str)
+        _is(f"{where}.{flag}", ok, "a string, a number, or true for a bare flag")
+    return given
 
 
 def _object(where: str, given, required: tuple, optional: tuple) -> dict:

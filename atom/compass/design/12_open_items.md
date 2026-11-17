@@ -161,12 +161,12 @@ M-f `14`; M-g `01` D3.5.
 
 | # | Item |
 |---|---|
-| T40 | Confirm the new histograms are **classic**, not native |
-| T41 | Audit every `observe()` site; extend the AST test to observation arguments |
-| T42 | Measure `collect_metrics()` per-step cost on the real side; decide decimation |
-| T43 | Verify the backfill end to end — one block, loaded, visible in Grafana |
+| ~~T40~~ | ~~Confirm the new histograms are **classic**, not native~~ — settled 2026-11-16 by [#3584](https://github.com/jgong5/ATOM/issues/3584): classic, prometheus_client `Histogram` and `WeightedHistogram` (`11` D73) |
+| T41 | Audit every `observe()` site; extend the AST test to observation arguments. The sites the Prometheus report reads are audited (`11` D73); the AST test is not extended |
+| ~~T42~~ | ~~Measure `collect_metrics()` per-step cost on the real side; decide decimation~~ — retired 2026-11-16 by [#3584](https://github.com/jgong5/ATOM/issues/3584): no per-step sampler is built, on either side (`11` D74) |
+| ~~T43~~ | ~~Verify the backfill end to end — one block, loaded, visible in Grafana~~ — settled 2026-11-16 by [#3584](https://github.com/jgong5/ATOM/issues/3584): promtool 3.5.0 backfilled one side's series, Prometheus 3.5.0 served it and `export_report.collect_report` read its panels (`11` D74) |
 | T44 | Sanity-check histogram bucket ranges against simulated latencies |
-| T45 | Tag ATOM's existing metrics with their D77 class |
+| T45 | Tag ATOM's existing metrics with their D77 class. The first build's series classify the families they export in the sampler's class table (`11` D77, *The first build*); the tags wait for a reader of `/metrics` under simulation |
 | T46 | Decide the DP-aggregation rule per class; refuse summaries there |
 
 ### Topic 13 — configuration surface
@@ -177,6 +177,7 @@ M-f `14`; M-g `01` D3.5.
 | T58 | Decide whether a per-leaf source override is worth the reproducibility cost |
 | ~~T96~~ | ~~Reconcile `13` D79 and D80 with the run file the code selects a backend by (`--compass-run`, `atom/compass/run/__init__.py::runner`): `13` rejects a Compass config file, the code reads one (`17` D103)~~ — settled 2026-10-13 on #851: `compass run` takes flags only, and the run file is its internal transport (`13` D79, D80) |
 | ~~T99~~ | ~~A simulated server outlives its client (`13` D80): `01` D3 ends a run when no essential work is left, and must end a client run there instead, the clock then waiting for the next client~~ — settled 2026-10-14 on #966: `01` D3, Client runs |
+| T107 | Key shipped laws and their readings for a user on another tree, whose run refuses them (`13` D80); left for after v1 by [#2899](https://github.com/jgong5/ATOM/issues/2899) |
 
 ### Topic 14 — speculative decoding and MTP
 
@@ -216,7 +217,7 @@ M-f `14`; M-g `01` D3.5.
 | ~~T108~~ | ~~The space file's format: every field, its values and its default, the arguments that vary with the concurrency included (`19` D110)~~ — settled 2026-11-14 by [#3448](https://github.com/jgong5/ATOM/issues/3448): `19` D110 states every field, its values and its default, and the expansion |
 | ~~T109~~ | ~~The per-request split's file format; ATOM's `atom-benchmark/v1` request records are a candidate (`19` D114)~~ — settled 2026-11-14 by [#3458](https://github.com/jgong5/ATOM/issues/3458): `19` D114 states the file, `request_split.json`, each finished request an `atom-benchmark/v1` request record with its split |
 | ~~T110~~ | ~~A 1P1D point's GPUs over both sides from #3264's code, which counts TP times DP from one engine record (`19` D111)~~ — settled 2026-11-14 by [#3454](https://github.com/jgong5/ATOM/issues/3454): `19` D111 counts a 1P1D point's GPUs as its prefill side's plus its decode side's, each tensor parallel times data parallel from that side's own engine record |
-| T111 | Whether ATOM's Benchmark Dashboard (`.github/dashboard/index.html`) can show both marks and the recommended point, or the dashboard is a page of Compass's own (`19` D115) |
+| ~~T111~~ | ~~Whether ATOM's Benchmark Dashboard (`.github/dashboard/index.html`) can show both marks and the recommended point, or the dashboard is a page of Compass's own (`19` D115)~~ — settled 2026-11-15 by [#3465](https://github.com/jgong5/ATOM/issues/3465): a page of Compass's own, `atom/compass/advice/dashboard.py` (`19` D115) |
 | T112 | How MiniMax-M3's calibration and grading divide the traces: the `agentx` workload takes all 393 (`06` D35.1), a grader refuses a backend fitted on the traces it grades (`13` D80), and the M3-Agentic stage has stated neither yet (`19` D117) |
 | ~~T113~~ | ~~How one law serves an arm's points whose `--max-num-seqs` differs: [#3275](https://github.com/jgong5/ATOM/issues/3275)'s ruling (`19` D117, `16` D95.1)~~ — settled 2026-11-15 by [#3275's Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114): a law, its host laws and a step grid bundle keep the longest capture ladder among their records and serve a run whose ladder is a non-empty prefix of it (`09` D54, `16` D95.1) |
 | ~~T114~~ | ~~Which of a law's held-out errors `19` D112's requirement 4 bounds, against which acceptance target: a fit reports each band's errors by percentile, while `08` D47 grades totals, the worst held out and the median step under #627's 5% gate; a bar is measured before the reuse check refuses on it~~ — ruled 2026-11-14 on [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6869501859): the fit reports `08` D47's three figures over its leave-one-run-out folds, and a law past #627's 5% gate fails `19` D112's requirement 4 |

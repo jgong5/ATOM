@@ -59,7 +59,9 @@ def started(monkeypatch, tmp_path, *flag, atom=()):
     with, given `flag` beside a step stub."""
     seen = {}
     monkeypatch.setattr(
-        serve, "serve", lambda atom_args, out, run: seen.update(atom=atom_args, run=run)
+        serve,
+        "serve",
+        lambda atom_args, out, run, extra_env: seen.update(atom=atom_args, run=run),
     )
     monkeypatch.setattr(drive_run, "write_grading", lambda out, report: None)
     drive_run.main(flags(tmp_path, "--step-stub", stub(tmp_path), *flag, atom=atom))

@@ -35,6 +35,7 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.shape import sum_context
 from atom.compass.backends.step_linear import UNIFORM_ROUTING
 from atom.compass.backends.step_linear_fit import priced_rank
@@ -458,7 +459,7 @@ EP8_PAIRS = [
 def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off_or_the_other_indexer(
     monkeypatch, tmp_path, stem, spec, index, side
 ):
-    fitted = json.loads((COMPASS / "laws" / f"{stem}-{side}.json").read_text())
+    fitted = read_json(COMPASS / "laws" / f"{stem}-{side}.json.xz")
     engine = fitted["engine_config"]
     for key in PERFORMANCE_KEYS:
         monkeypatch.delenv(key, raising=False)
@@ -520,8 +521,8 @@ def _decode_step(rung: int, context: float, graph_padding: float) -> BatchView:
 
 @pytest.mark.parametrize("side", ["prefill", "decode"])
 def test_each_v4_pro_ep8_law_validates_a_step_at_every_decode_rung_it_fits(side):
-    name = f"deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{side}.json"
-    fitted = json.loads((COMPASS / "laws" / name).read_text())
+    name = f"deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{side}.json.xz"
+    fitted = read_json(COMPASS / "laws" / name)
     backend = StepLinearBackend(StepLinearLaw(fitted))
     for rung, vector in fitted["decode"].items():
         assert "held_out" in vector, f"rung {rung} has no held-out hull"
