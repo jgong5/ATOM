@@ -332,9 +332,6 @@ def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None, warp=None) ->
     cus = DEVICES[arch][0] if cus is None else cus
     revision = REVISIONS.get(arch, 0) if revision is None else revision
     warp = _props(arch).warp_size if warp is None else warp
-    import triton
-    from triton.backends.compiler import GPUTarget
-
     rocminfo = pathlib.Path(tmpdir) / "declared-bin" / "rocminfo"
     rocminfo.parent.mkdir(parents=True, exist_ok=True)
     rocminfo.write_text(
@@ -344,6 +341,18 @@ def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None, warp=None) ->
     rocminfo.chmod(0o755)
     os.environ["PATH"] = f"{rocminfo.parent}:{os.environ.get('PATH', '')}"
     os.environ["GPU_ARCHS"] = arch
+    declare_triton_target(arch, warp)
+
+
+def declare_triton_target(arch: str, warp=None) -> None:
+    """Answer Triton's target query in this process with `arch` and its `warp`
+    size (`_props`'s unless given): `_declare_arch`'s Triton half, for a
+    process that imported aiter before it could declare the rest, whose Triton
+    helpers ask for the target on first use."""
+    import triton
+    from triton.backends.compiler import GPUTarget
+
+    warp = _props(arch).warp_size if warp is None else warp
 
     class _DeclaredTarget:
         def get_current_target(self):

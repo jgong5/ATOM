@@ -5,7 +5,40 @@
 
 from __future__ import annotations
 
-from atom.compass.runner.overrides import (
+import os
+import sys
+
+
+def _declare_arch_off_device() -> None:
+    """Answer the run's machine's arch in a runner process on a host with no
+    device. The server's main process imports aiter so through `on_arch`
+    (`drive.serve`), but a runner is a process of its own, and aiter's Triton
+    helpers now probe the device's arch as ATOM's runner imports them
+    (`ops/triton/utils/types.py`), which on such a host has no driver to ask.
+    A runner process imports aiter already as it unpickles its target (ATOM's
+    `async_proc`), its own probe failed and left to retry on first use; so
+    Triton's target is declared here, and aiter imported as on the arch when
+    nothing has imported it yet. A host with a device answers for itself, and
+    a real run reads no run file."""
+    from atom.compass import run
+
+    if os.path.exists("/dev/kfd"):
+        return
+    spec = run.spec()
+    if spec is None or "machine" not in spec:
+        return
+    from atom.compass.capture import driverless
+
+    arch = run._machine(spec).value("device.arch")
+    if "aiter" in sys.modules:
+        driverless.declare_triton_target(arch)
+    else:
+        driverless.import_aiter_on(arch)
+
+
+_declare_arch_off_device()
+
+from atom.compass.runner.overrides import (  # noqa: E402
     RPC_SURFACE,
     NonAllocatingRunner,
     RapidServeRpcs,
@@ -13,7 +46,10 @@ from atom.compass.runner.overrides import (
     start_on_host,
     unanswered_rpc_names,
 )
-from atom.model_engine.model_runner import ModelRunner, RapidServeModelRunner
+from atom.model_engine.model_runner import (  # noqa: E402
+    ModelRunner,
+    RapidServeModelRunner,
+)
 
 
 class CompassModelRunner(NonAllocatingRunner, ModelRunner):
