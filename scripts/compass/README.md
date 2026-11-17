@@ -1250,7 +1250,8 @@ each side apart: its own ATOM arguments, its environment and its Mooncake
 `--kv-transfer-config` (`kv_producer` on the prefill side, `kv_consumer` on the decode).
 Without the transfer config ATOM builds DeepSeek-V4's FP4 indexer where a transfer side
 runs the FP8 one, so its graphs and points would price kernels the cell never runs. One
-store `S` holds each side's `compass measure memory` readings, taken as the EP8 cell's
+store `S` holds the node's `platform_readings`, which a run's `--device` composes its spec
+from, each side's `compass measure memory` readings, taken as the EP8 cell's
 are, the graphs, the points and one price list: a price list's key holds the model, the
 parallel layout, the machine spec and the ATOM source, and neither `--enable-tbo` nor a
 variable, so both sides' points key one list. Every command runs from one tree, the one
@@ -1287,11 +1288,11 @@ pin processes that run at once to cores with `taskset`.
   its own, and once it ends, kill by PID what the session left before the card serves again.
 - **Price list.** `compass fit ops --store S --out F O...`, naming every `--out` of both
   sides.
-- **Runs.** `deploy.sh OUT run --op-graph --host-laws P --host-laws D --machine
-  scripts/compass/machines/mi355x-crs005.json --store S`, the decode through a local
+- **Runs.** `deploy.sh OUT run --op-graph --host-laws P --host-laws D --device mi355x
+  --ptl disabled --network crs005-013-ionic --store S`, the decode through a local
   prefix as above, `P` and `D` the tree's
-  `laws/deepseek-v4-pro-dpa8-mi355x-crs005-prefill.json` and `-decode.json`, whose host
-  laws the run reads. Each engine traces a shape `S` lacks itself, a model build in a
+  `laws/deepseek-v4-pro-dpa8-mi355x-crs005-prefill.json.xz` and `-decode.json.xz`, whose
+  host laws the run reads. Each engine traces a shape `S` lacks itself, a model build in a
   process of its own, and the run's wall time pays for it. At c=64 and 256 a prefill side
   meets thousands of shapes, so trace the real runs graded into `S` before the run: the
   summary's `cost` counts the graphs it held and those it traced, `held_lookups` and
