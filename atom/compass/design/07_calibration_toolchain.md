@@ -1123,15 +1123,16 @@ error with its cards' PCI buses, which `run.json` records (README, principle 12;
 **A law file's readings.** A law file under `scripts/compass/laws/` carries the
 `memory_readings` members `measure memory` took on its law's platform under its engine
 config, each stating `assumed`: where, and at which tree. `run` reads them when its store
-holds none (`13` D80). They are keyed as an entry is, ATOM's source being the `atom` digest
-of the law's host key, which every kind reads
-([#2310's Ruling](https://github.com/jgong5/ATOM/issues/2310#issuecomment-6497009949)), so
-the commits that re-key the law to a new digest re-key them, and no commit outside ATOM's
-own Python moves either: one engine start serves every tree the law reaches, a reuse the
-README's principle 10 allows where it is stated, here as `assumed`, which makes their terms
-declared. A commit that moves what a start under the law's engine config holds, through
-the code a reading reads (Phase 2), takes them again on that platform. The measured cases
-are DeepSeek-V4.1-Flash's graph pool at TP4 EP4 DSpark5 on MI355X, its KV block count unmoved.
+holds none (`13` D80). They are keyed as a store entry is, by a key that holds no ATOM
+digest (`atom/compass/artifacts/keys.py::OWN_FIELDS`), and checked as one is against
+ATOM's source, their `atom_src` the `atom` digest of the law's host key, which every kind
+reads (rule 2 below), so the commits that re-key the law to a new digest re-key them, and
+no commit outside ATOM's own Python moves either: one engine start serves every tree the
+law reaches, a reuse the README's principle 10 allows where it is stated, here as
+`assumed`, which makes their terms declared. A commit that moves what a start under the
+law's engine config holds, through the code a reading reads (Phase 2), takes them again on
+that platform. The measured cases are DeepSeek-V4.1-Flash's graph pool at TP4 EP4 DSpark5
+on MI355X, its KV block count unmoved.
 [#2861](https://github.com/jgong5/ATOM/pull/2861) raised ATOM's default prefill token
 buckets from 3072 to 7168 tokens, taking a start at the default from 2.94 to 7.78 GB per
 GPU; the key reads the buckets only off their default

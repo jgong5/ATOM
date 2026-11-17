@@ -429,7 +429,9 @@ and output prefill laws adopt the column at 193 and 197 ms, and a split middle c
   any CPU, since the CPU it runs on moves only its wall time, never a predicted second
   (`01` D4). Keyed by the CPU it ran on, a run refused every CPU but the one its laws
   timed: on 2026-11-10, the Intel Xeon Platinum 8480C for the shipped Qwen3.8-27B TP1
-  MI308X law and the AMD EPYC 9575F for the DeepSeek-V4-Pro laws. There is no transfer
+  MI308X law and the AMD EPYC 9575F for the DeepSeek-V4-Pro laws. `compass advice`'s reuse
+  check (`19` D112, requirement 1) takes the host CPU from the laws too, where it refused
+  another (`atom/compass/drive/reuse.py::_judged`, `19` D109). There is no transfer
   mode: a prediction for another host needs that host's records, and the MI455 projection
   prices no host floor (`08` D50.2).
 - **Home:** beside the step linear law; the entry also holds the tokenizer and HTTP
