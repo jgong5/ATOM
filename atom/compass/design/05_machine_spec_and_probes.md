@@ -174,22 +174,21 @@ readings of several for them, or none and the committed copies (below) several, 
 entries it prices with state none, and `--network` for a run across nodes (`13` D80).
 The run composes the datasheet, the readings entry and, across nodes, the network file
 into one machine spec, with the field paths of D25, and echoes it into every run artifact
-(D25 rule 4). A command whose inputs carry their
-platform, a GPU command from its cards and a fit from its records, names none: it keys
-what it read.
+(D25 rule 4). A command whose inputs carry their platform, a GPU command from its cards
+and a fit from its records, names none: it keys what it read.
 
 **A shipped law's platform readings.** A host with no GPU publishes no readings entry, so
 a shipped law that carries memory readings (`07` D41) has its platform's entry committed
 under `scripts/compass/laws/platform_readings/`, as the readable copy `fit device` writes,
 unedited and named by its key's token: one copy per key, the entry `fit device` folds from
 every probe record published at that key, as D26 folds a platform's nodes, kept while
-such a law states its platform. The first is MI308X's at the Qwen3.8-27B TP1 law's platform. Every command
-that reads a readings entry reads the copy where its store holds none at the device, PTL
-state and stack it reads (`atom/compass/fit/device.py::readings`), so a user's own entry
-comes first, and the composed spec names the store or file it read. The copy is the
-entry at the run's own key, which holds no ATOM source (`07` D43): it serves every tree,
-is never re-keyed and keeps its origins, where a law file's memory readings, carried
-across trees, are assumed. Carried in each law file instead, a platform's readings would
+such a law states its platform. The first is MI308X's at the Qwen3.8-27B TP1 law's
+platform. Every command that reads a readings entry reads the copy where its store holds
+none at the device, PTL state and stack it reads (`atom/compass/fit/device.py::readings`),
+so a user's own entry comes first, and the composed spec names the store or file it
+read. The copy is the entry at the run's own key, which holds no ATOM source (`07` D43):
+it serves every tree, is never re-keyed and keeps its origins, where a law file's memory
+readings, carried across trees, are assumed. Carried in each law file instead, a platform's readings would
 be stated once per law, and two laws of one platform could carry two stores' entries,
 which for MI355X at aiter 41d4d8d7e read bf16 0.6399 and 0.6314
 ([#3300](https://github.com/jgong5/ATOM/issues/3300),
