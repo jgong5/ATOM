@@ -1488,3 +1488,13 @@ smoke above:
   of four ranks. The `non_torch` term, the driver and collective reserve, moves from start to
   start: one rank alone read +10.43% against the 10% gate twice, beside its start's 10.3%
   spread across ranks, while the mean stayed within 2.3%.
+
+[#2148](https://github.com/jgong5/ATOM/issues/2148) grades cell B alike, by
+`scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json` (its paragraph above),
+with two changes:
+
+- Each round runs c=1, 4, 16, 64, after an unscored 600 s warm run at c=64 and one at c=1.
+- Since [#2086](https://github.com/jgong5/ATOM/pull/2086) a prefill step's label is a trace
+  run's busy time, so `validate.cost` leaves a real run's prefill steps out as `untraced`;
+  cell B's prefill cost is read by `validate.cost` at `ed5fa7697`, the step law's fit tree,
+  which labels a prefill step by its device window.
