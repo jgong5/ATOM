@@ -96,7 +96,8 @@ def test_the_draft_block_takes_what_atom_builds_from_the_step_s_anchors(
     stub._prepare((0, 0))
 
     [(_, bound)] = stub.placed
-    assert (mine, "positions") not in bound
+    why = "no replayed prefill here gathers its positions"
+    assert bound.pop((mine, "positions")) == (why, None)
     got = {
         (found[sig][0]["op"], path): (name, view.tolist())
         for (sig, path), (name, view) in bound.items()

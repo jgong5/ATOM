@@ -31,7 +31,9 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   and ``backend``'s digest is over every law's in any order, their provenance
   ``entries``.
 - ``--lmcache-offload FILE``, the ``lmcache_offload`` entry
-  `step_linear_fit`'s offload form writes, at that key.
+  `step_linear_fit`'s offload form writes, at that key; ``--lmcache FILE``,
+  the ``lmcache`` entry of a deployment offloading to an lmcache server, as
+  `compass advice` writes it, at that key.
 - ``--device``, ``--ptl``, ``--stack`` and ``--network``, the platform
   flags, whose spec `spec` composes, as ``machine``; ``--store``'s root as
   ``store``; ``--on-refusal``;
@@ -62,6 +64,7 @@ from atom.compass.artifacts import (
     machine_platform,
     member_name,
 )
+from atom.compass.backends.json_file import read_json
 from atom.compass.fit.device import compose
 from atom.compass.fit.publish import RANK
 from atom.compass.run.step_grid import readings
@@ -86,6 +89,7 @@ def add_arguments(parser) -> None:
     parser.add_argument(
         "--host-laws", metavar="KEY", action="append", help="a token or law file"
     )
+    parser.add_argument("--lmcache", metavar="FILE", help="the lmcache entry")
     parser.add_argument(
         "--lmcache-offload", metavar="FILE", help="the lmcache_offload entry"
     )
@@ -206,8 +210,9 @@ def build(args, atom_args, across: bool = False) -> dict:
         out |= {k: v for k, v in hops.items() if k != "router_s"}
     if args.padding:
         out["padding"] = args.padding
-    if entry := getattr(args, "lmcache_offload", None):
-        out["lmcache_offload"] = json.loads(Path(entry).read_text())
+    for name in ("lmcache", "lmcache_offload"):
+        if entry := getattr(args, name, None):
+            out[name] = json.loads(Path(entry).read_text())
     return out
 
 
@@ -366,10 +371,10 @@ def _member(entry, stem: str):
 
 
 def _law_file(value: str) -> dict | None:
-    """The law file `value` names, read as JSON; None when it names no file,
-    as a token does not."""
+    """The law file `value` names, read as `read_json` reads it; None when it
+    names no file, as a token does not."""
     path = Path(value)
-    return json.loads(path.read_text()) if path.is_file() else None
+    return read_json(path) if path.is_file() else None
 
 
 def _host(store, value: str) -> dict:

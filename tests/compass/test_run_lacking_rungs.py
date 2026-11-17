@@ -19,13 +19,14 @@ from test_memory_readings import DOCUMENT
 from test_run_lacking import checked, served
 from test_run_step_grid import deployment
 
+from atom.compass.backends.json_file import read_json
 from atom.model_engine.arg_utils import EngineArgs
 
 LAWS = Path(__file__).resolve().parents[2] / "scripts" / "compass" / "laws"
 #: Decode rungs 1, 2, 4, 8, 12, 16, 20, 24 and 28; no eager vector, no draft law.
-DPA8 = LAWS / "deepseek-v4-pro-dpa8-mi355x-crs005-decode.json"
+DPA8 = LAWS / "deepseek-v4-pro-dpa8-mi355x-crs005-decode.json.xz"
 #: Decode rungs 1 to 8, 12, 16, 24, 32, 40, 48, 56 and 64, its draft law's too.
-DSPARK5 = LAWS / "deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json"
+DSPARK5 = LAWS / "deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json.xz"
 #: The capture sizes ATOM's server declares when its arguments name none.
 DEFAULT_SIZES = json.loads(EngineArgs.cudagraph_capture_sizes)
 
@@ -38,7 +39,7 @@ def named(tmp_path, monkeypatch, capsys, law: Path, **config):
     """The rungs, and the line naming them, `--check` lists as lacking for the
     law file `law` on the deployment with `config`; None when it lists none."""
     served(monkeypatch, deployment(tmp_path, **config).config)
-    at = json.loads(law.read_text())["platform"]
+    at = read_json(law)["platform"]
     platform = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path, at=at)
     checked(tmp_path, "--step-linear", str(law), platform=platform)
     out = capsys.readouterr().out
@@ -100,7 +101,7 @@ def test_the_eager_rung_is_listed_where_the_bound_passes_the_widest_size(
 def test_a_rung_its_draft_law_lacks_is_listed_unless_its_draft_is_serial(
     tmp_path, monkeypatch, capsys, serial
 ):
-    law = json.loads(DSPARK5.read_text())
+    law = read_json(DSPARK5)
     ladder = sorted(map(int, law["engine_config"]["ladder"]))
     config = {"capture_sizes": ladder, "max_num_seqs": ladder[-1]}
     config |= {"speculative_config": mtp(5)}

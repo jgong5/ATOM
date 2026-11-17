@@ -69,8 +69,10 @@ member, the frontend's included, connects to.
   step table and the run summary at once, each LP's clock as it stands, from
   what has been handed in. Before each metrics push the engine samples its
   Prometheus series (`metrics.sample_engine`).
-- An engine or frontend LP's last hand-in first writes the Prometheus series
-  it sampled, `metrics.FILE` beside its hand-in, whole or not at all.
+- An engine or frontend LP's last hand-in first samples its Prometheus
+  series once more at its last finite clock (`metrics.Sampler.final`), then
+  writes the series it sampled, `metrics.FILE` beside its hand-in, whole or
+  not at all.
 
 Run file keys: ``clock_endpoint``, ``bound_s`` (finite), the hops `HOPS` (each
 optional, the lookahead of the channels it names, `HOP_FLOOR_S` where absent,
@@ -1719,9 +1721,19 @@ def _offloads(kv, connector: str) -> bool:
 def _offload_tier(config, run: dict) -> None:
     """Have the connector factory build ``lmcache_offload`` as Compass's
     (`atom.compass.kv.lmcache_offload`) when this deployment offloads through
-    it; refuse a deployment and a run file that disagree on whether it does,
-    an entry the connector cannot read, and a deployment above DP or pipeline
-    width 1, whose ranks' tiers this does not join."""
+    it, once `refuse_offload_tier` holds."""
+    from atom.compass.kv import lmcache_offload
+
+    refuse_offload_tier(config, run)
+    if lmcache_offload.ENTRY in run:
+        lmcache_offload.substitute()
+
+
+def refuse_offload_tier(config, run: dict) -> None:
+    """Refuse a deployment and a run file that disagree on whether it offloads
+    KV through ``lmcache_offload``, an entry the connector cannot read, and a
+    deployment above DP or pipeline width 1, whose ranks' tiers this does not
+    join."""
     from atom.compass.kv import lmcache_offload
 
     offloads = _offloads(config.kv_transfer_config, "lmcache_offload")
@@ -1743,7 +1755,6 @@ def _offload_tier(config, run: dict) -> None:
             f"deployment runs {', '.join(wide)}"
         )
     lmcache_offload.check_entry(run[lmcache_offload.ENTRY])
-    lmcache_offload.substitute()
 
 
 def _park_before_dispatch() -> None:
@@ -2959,12 +2970,21 @@ def _hand_in(
     """Write `lp`'s refusals, and its other sections, for the summary's writer:
     at the end of client run `client_run`, or None for the finish. When its
     runtime printed stall diagnostics, ``diagnostics`` counts them. At the
-    finish, first the Prometheus series its runtime sampled, if it did."""
+    finish, first the Prometheus series its runtime sampled, if it did, with a
+    final sample at the LP's clock, or at the clock it held before its
+    ``+inf`` grant; a final sample that raises is skipped and named among
+    `reasons`."""
     out = Path(run["out_dir"])
     if client_run is not None:
         out = out / CLIENT_DIR.format(client_run)
         out.mkdir(exist_ok=True)
     elif (sampler := getattr(clock.installed(), "sampler", None)) is not None:
+        rt = sampler.rt
+        t = rt.now if rt.now < math.inf else rt.before_inf
+        try:
+            sampler.final(t)
+        except Exception as e:  # noqa: BLE001 - skipped, named among its reasons
+            reasons = [*reasons, f"metrics:{lp} final sample at {t} raised {e!r}"]
         sampler.write(out, lp)
     if diagnostics := getattr(clock.installed(), "diagnostics", 0):
         sections = {"diagnostics": diagnostics, **sections}
