@@ -1132,16 +1132,22 @@ def _transferred_slot(runner: Any) -> tuple[int, bool]:
     planned slot entry, with the blocks; one unit of each of Kimi's KDA state
     regions (`state_slot_regions`), after them, its GDN state entry without the
     kpool tail plus ReplaySSM's int32 cursor; none for any other builder. A
-    Qwen GDN hybrid plans a slot its regions do not carry."""
+    Qwen GDN hybrid plans a slot its regions do not carry. DeepSeek-V4.1's
+    builder is not V4's, but publishes the request's whole STATE slot as one
+    slot-indexed region beside its PAGE units (`get_kv_transfer_tensors`'s
+    ``slot_regions``), so it moves the planned slot entry as V4's does."""
     from atom.model_engine.kv_block import STATE_SLOT_CLASS
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
     )
     from atom.model_ops.attentions.gdn_attn import GDNStateMixin
     from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
 
     builder = runner.attn_metadata_builder
-    if isinstance(builder, DeepseekV4AttentionMetadataBuilder):
+    if isinstance(builder, (DeepseekV4AttentionMetadataBuilder, DeepseekV41MetadataBuilder)):
         return runner.pool_plan.entry_bytes[STATE_SLOT_CLASS], False
     if isinstance(builder, _KimiMLAGDNCommon):
         cursor = torch.int32.itemsize if builder.replayssm else 0
