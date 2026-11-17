@@ -54,6 +54,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from atom.compass import run
 from atom.compass.artifacts import (
@@ -319,25 +320,11 @@ def _hops(hosts: list, atom_args, arch: str, env=None) -> dict:
     if any(h.get("hops") != host.get("hops") for h in hosts):
         from atom.compass.drive.run import _config
 
-        picked = {"host": hosts}
-        with _environ(env()) if env else contextlib.nullcontext():
+        picked, here = {"host": hosts}, contextlib.nullcontext()
+        with patch.dict(os.environ, env(), clear=True) if env else here:
             run.pick_fitted(picked, "host", _config(atom_args, arch))
         host = picked["host"]
     return host.get("hops", {})
-
-
-@contextlib.contextmanager
-def _environ(env: dict):
-    """This process's environment replaced by `env`, which a process it starts
-    inherits, until the block ends."""
-    saved = dict(os.environ)
-    os.environ.clear()
-    os.environ.update(env)
-    try:
-        yield
-    finally:
-        os.environ.clear()
-        os.environ.update(saved)
 
 
 def _dp_width(atom_args) -> int:

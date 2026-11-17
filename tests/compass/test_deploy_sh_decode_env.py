@@ -16,6 +16,7 @@ import signal
 import subprocess
 
 import platforms
+import pytest
 from test_capture_v4_pro import CONFIG as V4_PRO
 from test_deploy_sh import ROUTER_ARGS, SCRIPT, _until, planted  # noqa: F401
 from test_memory_readings import DOCUMENT
@@ -63,10 +64,13 @@ def pair(tmp_path, planted, on):  # noqa: F811
     return words, env, hops
 
 
+# A prefix that unsets AITER_LOG_LEVEL too starts a decode that compass_env
+# sets it WARNING in again, as its entry's key states it.
+@pytest.mark.parametrize("on", [ON, f"{ON} -u AITER_LOG_LEVEL"])
 def test_each_side_of_the_crs005_pair_takes_the_hops_fitted_under_its_own_environment(
-    tmp_path, planted  # noqa: F811
+    tmp_path, planted, on  # noqa: F811
 ):
-    words, env, hops = pair(tmp_path, planted, ON)
+    words, env, hops = pair(tmp_path, planted, on)
     d = tmp_path / "d"
     script = subprocess.Popen(words, env=env, cwd=tmp_path, stdout=subprocess.PIPE)
     _until(d / "server.json", script)
