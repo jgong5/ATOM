@@ -12,18 +12,23 @@ import argparse
 import dataclasses
 import json
 import math
+import shutil
 import time
 from types import SimpleNamespace
 
 import platforms
 import pytest
+from test_capture_v4_pro import CONFIG as V4_PRO
 from test_memory_readings import DOCUMENT
+from test_run_check_side import PAIR, SIDES
 from test_run_step_grid import deployment
 from test_served_tokenizer import REPO, _run_file
 
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
 from atom.compass.backends.json_file import read_json
 from atom.compass.backends.step_stub import Coefficients
+from atom.compass.drive import run as drive_run
 from atom.compass.drive import runfile
 from atom.compass.run.step_grid import keyed
 from atom.utils import clock
@@ -162,9 +167,13 @@ def test_each_side_of_a_prefill_decode_run_takes_the_hops_fitted_under_its_confi
     }
     laws = [entry(tmp_path, "p.json", p, hops_p), entry(tmp_path, "d.json", d, hops_d)]
     sides = {"P": model(tmp_path, "-dp", "1"), "D": model(tmp_path)}
-    # Each side's config as resolved on the machine's arch, the only one stated.
+    # Each side's config as resolved on the machine's arch, the only one stated,
+    # from its arguments as deploy.sh starts its instance.
     gfx = DOCUMENT["device"]["arch"]
-    configs = {(tuple(sides["P"]), gfx): p.config, (tuple(sides["D"]), gfx): d.config}
+    configs = {
+        (tuple(drive_run.side_args(name, sides[s], "compass")), gfx): r.config
+        for s, name, r in (("P", "prefill", p), ("D", "decode", d))
+    }
     monkeypatch.setattr(
         "atom.compass.drive.run._config", lambda a, arch: configs[tuple(a), arch]
     )
@@ -189,6 +198,39 @@ def test_each_side_of_a_prefill_decode_run_takes_the_hops_fitted_under_its_confi
         # Prefill's entry states no stream, decode's no write request, and
         # decode's router hop is not read either.
         assert None not in compass_run.hops(run).values()
+
+
+def test_each_side_of_a_v4_pro_pair_picks_its_hops_under_the_kv_role_deploy_sh_adds(
+    monkeypatch, tmp_path
+):
+    # The crs005 DPA8 pair is keyed to the fp8 index cache each side runs under
+    # the --kv-transfer-config deploy.sh adds, fp4 without one at gfx950. Here
+    # both sides' entries state one environment, the prefill side's, which the
+    # build resolves both sides in, and the decode side's hops move.
+    env = json.loads(PAIR["prefill"].read_text())["host"]["key"]["engine"]["env"]
+    for name in PERFORMANCE_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    hops, flags = {}, []
+    for side, path in PAIR.items():
+        host = json.loads(path.read_text())["host"]
+        host["key"]["engine"]["env"] = env
+        if side == "decode":
+            host["hops"] = {k: 2 * v for k, v in host["hops"].items()}
+        hops[side] = host["hops"]
+        (tmp_path / f"{side}.json").write_text(json.dumps({"host": host}))
+        flags += ["--host-laws", str(tmp_path / f"{side}.json")]
+    v4_pro = tmp_path / "DeepSeek-V4-Pro"
+    v4_pro.mkdir()
+    shutil.copy(V4_PRO, v4_pro / "config.json")
+    common = ["-tp", "8", "--kv_cache_dtype", "fp8", "--enable-dp-attention"]
+    sides = [["--model", str(v4_pro), *common, *SIDES[s][0]] for s in PAIR]
+
+    run = runfile.prefill_decode(parsed(tmp_path, *flags), *sides, "intra_node")
+
+    assert {k: run[k] for k in hops["prefill"]} == hops["prefill"]
+    assert run[compass_run.DECODE_HOPS] == hops["decode"] != hops["prefill"]
 
 
 def test_an_entry_with_no_router_hop_charges_its_floor_and_lists_it(tmp_path):
