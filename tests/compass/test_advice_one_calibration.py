@@ -3,8 +3,9 @@
 DeepSeek-V4-Pro template's S2 and S5, whose LMCache no law key holds: the
 first prints its `calibrate.sh` command, and the other names that calibration
 and the command measuring its readings into the store it publishes into,
-unless they are at their key there. A candidate refused at some point prints
-no command, so the next at its key prints the calibration.
+unless they are at their key there; into the calibration's own store, only
+once it has started. A candidate refused at some point prints no command, so
+the next at its key prints the calibration.
 
 The configuration, its stubbed resolution and starts are `test_advice_check`'s.
 """
@@ -34,27 +35,49 @@ def _calibrations(found: dict) -> list[str]:
     return [c for s in found.values() for c in s["made_by"] if "calibrate.sh " in c]
 
 
-@pytest.mark.parametrize("readings", ["none", "S2's held", "S5's at their key"])
+@pytest.mark.parametrize(
+    "held, at_key, started",
+    [
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, False),
+        (True, True, True),
+    ],
+    ids=[
+        "into the shared store",
+        "S5's readings there",
+        "into S2's own, not started",
+        "into S2's own, not started, S5's readings in the shared",
+        "into S2's own, started, S5's readings in the shared",
+    ],
+)
 def test_two_candidates_at_one_law_key_print_one_calibration(
-    tmp_path, stubbed, capsys, readings  # noqa: F811
+    tmp_path, stubbed, capsys, held, at_key, started  # noqa: F811
 ):
     store, cal = tmp_path / "store", tmp_path / "out" / "cal" / "S2"
-    if readings == "S2's held":
+    if held:
         # The store refuses S2's readings again: it calibrates into its own.
         _readings_at_another_digest(store, resolved(stubbed.config, ARGS2))
-    if readings == "S5's at their key":
+    if at_key:
         publish_readings(store, resolved(stubbed.config, ARGS5))
+    if started:
+        cal.mkdir(parents=True)
+        (cal / "inputs").write_text("tree c0ffee\nrecord 1\n")
 
     found = advise(tmp_path, {"S2": S2, "S5": S5})
 
     assert found["S2"]["state"] == found["S5"]["state"] == "missing a law"
     (calibration,) = _calibrations(found)
     assert f"calibrate.sh {cal} " in calibration
-    into = _env(found, "S2").get("STORE", str(cal / "store"))
+    into = str(cal / "store" if held else store)
+    assert _env(found, "S2").get("STORE", str(cal / "store")) == into
     measure = f"compass measure memory --gpu G --out D --store {into} -- --model "
     measure += " ".join([str(tmp_path), *ARGS5])
     made = [check.BORROWED.format("S2", into)]
-    made += [] if readings == "S5's at their key" else [measure]
+    if held or not at_key:
+        # A measure into S2's own store before it starts makes it refuse.
+        made += [check.PENDING.format(into, "S2") if held and not started else measure]
     assert found["S5"]["made_by"] == made
     printed = capsys.readouterr().out
     # Once in S2's state, once in its rows of the results.

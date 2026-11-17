@@ -39,7 +39,9 @@ Where an earlier candidate none of whose verdicts is refused calibrates a law
 at the same key, by model, platform and engine config, a candidate names that
 calibration in place of its own command, which the store would refuse as a
 second law at the key, with the command measuring its readings into the store
-that calibration publishes into, unless they are at their key there.
+that calibration publishes into, unless they are at their key there; into the
+calibration's own store, only once it has started, as a publish there before
+would leave its directory holding files, which `calibrate.sh` refuses.
 A readings verdict ``measure`` names the `compass measure memory` command,
 under the instance's variables, a 1P1D side's on the connector a real start of
 it takes.
@@ -100,6 +102,12 @@ STATUS = "status"
 #: calibration, named by its candidate, and the store it publishes into.
 BORROWED = (
     "{}'s calibration, whose law is at this configuration's key, publishing into {}"
+)
+#: What stands for a borrower's readings command into the calibration's own
+#: store until that calibration starts.
+PENDING = (
+    "its readings, into {}, once {}'s calibration has started: compass advice "
+    "then prints their command"
 )
 #: The file a calibration writes its inputs to, in its directory: a line
 #: ``store <path>`` names the store it publishes into, when one was named.
@@ -502,8 +510,8 @@ def _borrowing(points: list, held: dict, calibrations: dict) -> None:
     `held`, a candidate's at its `points`, and name, in place of a verdict's own
     `calibrate.sh` command, the calibration an earlier candidate's in
     `calibrations` makes at its key, since the store refuses a second law at a
-    key: such a verdict is made by that calibration and by the command
-    measuring this candidate's readings into the store it publishes into,
+    key: such a verdict is made by that calibration and by what measures this
+    candidate's readings into the store it publishes into (`_readings_by`),
     unless they are at their key there. Each other calibration joins
     `calibrations`, unless a verdict of the candidate is refused, whose state
     prints no command."""
@@ -519,13 +527,23 @@ def _borrowing(points: list, held: dict, calibrations: dict) -> None:
             if made["in"] == mine["in"] and not refused:
                 calibrations[key] = mine
             elif made["in"] != mine["in"]:
-                one, into = point["instances"][side], made["into"]
-                law["made_by"] = [BORROWED.format(Path(made["in"]).name, into)]
+                lender, into = Path(made["in"]), made["into"]
+                law["made_by"] = [BORROWED.format(lender.name, into)]
                 there = Path(into) == Path(held["store"])
                 if verdicts["readings"][side]["verdict"] != "reuse" or not there:
-                    measure = lacking.measure_memory(into, one["args"], one["env"])
-                    law["made_by"].append(measure)
+                    one = point["instances"][side]
+                    law["made_by"].append(_readings_by(lender, into, one))
             verdicts["law"][side] = law
+
+
+def _readings_by(lender: Path, into: str, one: dict) -> str:
+    """The command measuring the instance `one`'s readings into `into`, the
+    store the calibration in `lender` publishes into; while that is its own
+    store and it has not started, `PENDING`: a publish there first leaves the
+    calibration's directory holding files, which `calibrate.sh` refuses."""
+    if Path(into) == lender / "store" and not (lender / INPUTS).is_file():
+        return PENDING.format(into, lender.name)
+    return lacking.measure_memory(into, one["args"], one["env"])
 
 
 def _publishing(store, made, law: dict, readings: dict) -> str | None:
