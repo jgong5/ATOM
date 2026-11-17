@@ -313,7 +313,7 @@ class _Plan:
         self.flat: list | None = None
         self.view: BatchView | None = None
         self.groups: dict[tuple, list[int]] = {}
-        self.attrs: set[str] = set()
+        self.attrs: list[str] = []
         self.names: dict[str, list[int]] = {}
         self.terms: dict[str, CostTerm] = {}
 
@@ -595,7 +595,9 @@ class OpGraphBackend(CostBackend):
             plan.groups = {}
             for u, reads in enumerate(plan.reads):
                 plan.groups.setdefault(reads, []).append(u)
-            plan.attrs = {a for _, rs in plan.groups for a in rs if isinstance(a, str)}
+            plan.attrs = sorted(
+                {a for _, r in plan.groups for a in r if isinstance(a, str)}
+            )
         if renamed:
             plan.names = {}
             for u, priced in enumerate(plan.priced):
@@ -604,7 +606,7 @@ class OpGraphBackend(CostBackend):
                     if units[-1:] != [u]:
                         units.append(u)
             dirty, plan.terms = set(plan.names), dict.fromkeys(plan.names)
-        for name in dirty:
+        for name in sorted(dirty):
             prices = [
                 p for u in plan.names[name] for p in plan.priced[u] if p[0] == name
             ]
