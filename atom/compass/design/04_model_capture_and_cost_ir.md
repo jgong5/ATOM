@@ -1165,10 +1165,11 @@ Owner's [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811), 2026-10-2
 structure, its shape, the torch it was traced under, and the digest of the files its trace ran and read (`07` D41); a DP prefill's graph that holds G (D18) by the shape
 `prefill T=<T> B=<B> G=G`, ` W=<W>` before G where its LM head pads, its hints and guards in its graph member. The structure (`capture.forward.structure`) is the
 model's architecture, the device arch, the config.json digest, the engine config the
-step law is keyed by less its ladder and its compilation level, which a trace does not
-run at (D23: it runs eager at level 0) (`run.step_grid.keyed`, `09` D54), the TP width and
+step law is keyed by less its ladder and its compilation level
+(`capture.forward.graph_engine`, `run.step_grid.keyed`, `09` D54), the TP width and
 the DP and EP widths when set, the phase, the mode, and whether the step produces
-output. That engine config holds the KV block size and dtype, the quantization's hash,
+output. The structure keys no level, by the [ruling on #3052](https://github.com/jgong5/ATOM/issues/3052#issuecomment-6942839264):
+every trace runs eager at level 0 and serves a run at any level (D23). That engine config holds the KV block size and dtype, the quantization's hash,
 the parallel layout, TBO, speculation when it is on, `moe_backend`,
 `moe_all2all_backend`, `eplb_enable` and `enable_decoder_swa_bounded_replay` when
 they are off ATOM's default, the `index_cache_dtype` ATOM resolved where it differs
