@@ -937,11 +937,14 @@ cells fp8; the gap between the two is unmeasured on this pair.
 laws alone (`host`, `host_fit`, `platform` and `provenance`, no step law), one per side of
 [#3179](https://github.com/jgong5/ATOM/issues/3179)'s TP cell on crsuse2-m2m-v3-005 (prefill) and
 -013 (decode): the crs005 DPA-TP8 cell less `--enable-dp-attention`, the prefill side at
-`--gpu-memory-utilization 0.65` and the decode side at 0.70. They serve a 1P1D run whose steps another
-backend prices, `deploy.sh run ... --host-laws P --host-laws D`, each side picking the entry keyed
-to its own engine config. Each is `compass fit host` on its side of three 1P1D `deploy.sh record`
-cells at ATOM 259bc70f0, at c=1, 4 and 16 over traces 256 to 392 for 1800 s each, every server
-loading the blocking-call tool through `ROCP_TOOL_LIBRARIES`; the c=1 cell's prefill side ran at
+`--gpu-memory-utilization 0.65` and the decode side at 0.70. They are for a 1P1D run whose steps
+another backend prices, both entries in its run file, where each server's own start picks the
+entry keyed to its engine config. `deploy.sh run ... --host-laws P --host-laws D` cannot yet build
+that run file ([#3659](https://github.com/jgong5/ATOM/issues/3659)): the two entries' hops differ,
+and it resolves both sides under one environment, in which one side matches neither entry. Each
+law file is `compass fit host` on its side of three 1P1D `deploy.sh record` cells at ATOM
+259bc70f0, at c=1, 4 and 16 over traces 256 to 392 for 1800 s each, every server loading the
+blocking-call tool through `ROCP_TOOL_LIBRARIES`; the c=1 cell's prefill side ran at
 0.70 ([#3194](https://github.com/jgong5/ATOM/issues/3194#issuecomment-6869663548)). `host_fit.held_out`
 holds each band's errors with each record held out in turn. A term a side's records cannot give is
 the crs005 DPA8 law's of that side, as `provenance` names: `admission_s` and `stream_s`, since a
