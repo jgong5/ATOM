@@ -1507,7 +1507,7 @@ smoke above:
   spread across ranks, while the mean stayed within 2.3%.
 
 [#2148](https://github.com/jgong5/ATOM/issues/2148) grades cell B alike, by
-`scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json` (its paragraph above),
+`scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json.xz` (its paragraph above),
 with two changes:
 
 - Each round runs c=1, 4, 16, 64, after an unscored 600 s warm run at c=64 and one at c=1.
