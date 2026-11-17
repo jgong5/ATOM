@@ -328,8 +328,9 @@ combination of values is written in one value of one dimension, as D116's templa
 each configuration as one value of one dimension. Each point of an offloading candidate
 takes its own lmcache server port, from 5555 up in the points' order, so points run at
 once on one host each reach their own server: `compass advice` writes it, with host
-127.0.0.1, into the server's `--host` and `--port` and into each instance's
-`ATOM_KV_OFFLOAD_EXTRA_CONFIG`, a block's value of which names neither, and hands the
+127.0.0.1, into the server's `--host` and `--port` and into the
+`ATOM_KV_OFFLOAD_EXTRA_CONFIG` of each instance offloading through `lmcache_mp`, refusing
+a block's value of it that names either, and hands the
 point's `compass run` or `deploy.sh run` the run file's `lmcache` entry, those flags with
 the request loop's declared laws (`atom/compass/kv/lmcache_server.py::DECLARED_LAWS`,
 `01` D6.1), through `--lmcache FILE` (`13` D80). `compass advice` writes the expansion
