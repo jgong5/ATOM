@@ -279,6 +279,14 @@ def _term(name: str, prices: list, at: str) -> CostTerm:
     return CostTerm(name, seconds, provenance, fold_parts(p[6] for p in prices))
 
 
+def _cost(terms: dict) -> StepCost:
+    """A step's cost of its `terms` by name, its drafter's apart."""
+    split: dict[bool, list[CostTerm]] = {False: [], True: []}
+    for name, term in terms.items():
+        split[name.startswith(DRAFT)].append(term)
+    return StepCost(split[False], draft_terms=split[True])
+
+
 class _Plan:
     """A step's graphs, its target's, its block drafter's draft-KV pass's and
     its drafter's (`PREFIXES`), as a backend prices them step after step:
@@ -288,7 +296,8 @@ class _Plan:
     `VIEW`; the units by what they read, and every attribute they read; the
     last step's view and bounds laid flat; and the terms in run order, each
     with the units that hold its prices. `held` keeps the ids of the step's
-    graphs theirs."""
+    graphs theirs; `at` is its target's shape and its drafter's. A backend
+    plans a graph at its second step."""
 
     def __init__(self, held: tuple, at: tuple) -> None:
         self.held, self.at = held, at
@@ -481,11 +490,12 @@ class OpGraphBackend(CostBackend):
         # its price at a bound, with what it read of the bound, when it read
         # nothing else of the step; by view, bound and that text: one step's
         # prices. By op kind: every path its work has read of a leaf. By the
-        # graphs a step reads: their `_Plan`.
+        # graphs a step reads: their `_Plan`, or after their first step the
+        # graphs alone.
         self._kept: dict[int, list] = {}
         self._step: dict[tuple, tuple] = {}
         self._reads: dict[str, set] = {}
-        self._plans: dict[tuple, _Plan] = {}
+        self._plans: dict[tuple, _Plan | tuple] = {}
         # By view and graphs: a step's price, while `_plans` holds the graphs.
         self._viewed: dict[tuple, StepCost] = {}
         # What the unit being priced has read of its step (`_Plan`).
@@ -515,13 +525,17 @@ class OpGraphBackend(CostBackend):
         samples = batch_view.decode or batch_view.produces_output
         kv = self.block and samples and self._region(batch_view, draft=KV)[1]
         graph = (at, id(region), drafted_at, id(drafted), id(kv))
-        plan = self._plans.get(graph)
-        if plan is None:
+        # A graph's first step keeps only the graphs, whose ids `graph` names,
+        # and prices them whole: a graph a run reads once, as most prefill
+        # shapes are, keeps no plan.
+        held = self._plans.get(graph)
+        if held is None:
             if len(self._plans) >= VIEWED:
                 self._plans.clear()
                 self._viewed.clear()
-            held = (region, kv, drafted)
-            plan = self._plans[graph] = _Plan(held, (at, at, drafted_at))
+            self._plans[graph] = (region, kv, drafted)
+        elif not isinstance(held, _Plan):
+            self._plans[graph] = _Plan(held, (at, drafted_at))
         # A view priced lately at these graphs prices as it did, a DP rank's
         # dummy forwards among them.
         if (cost := self._viewed.get((batch_view, graph))) is not None:
@@ -530,7 +544,11 @@ class OpGraphBackend(CostBackend):
         draft = self.resolver and self.drafts and self._bound(batch_view, draft=True)
         if drafted and samples and batch_view.moe_rows is None:
             self._passes = self._pass_views(drafted, batch_view)
-        cost = self._planned(plan, batch_view, (bound, bound, draft))
+        plan, bounds = self._plans[graph], (bound, bound, draft)
+        if isinstance(plan, _Plan):
+            cost = self._planned(plan, batch_view, bounds)
+        else:
+            cost = self._whole(plan, batch_view, bounds, (at, drafted_at))
         if len(self._viewed) >= VIEWED:
             self._viewed.clear()
         self._viewed[batch_view, graph] = cost
@@ -590,12 +608,28 @@ class OpGraphBackend(CostBackend):
             prices = [
                 p for u in plan.names[name] for p in plan.priced[u] if p[0] == name
             ]
-            at = plan.at[2 if name.startswith(DRAFT) else 0]
-            plan.terms[name] = _term(name, prices, at)
-        terms: dict[bool, list[CostTerm]] = {False: [], True: []}
-        for name, term in plan.terms.items():
-            terms[name.startswith(DRAFT)].append(term)
-        return StepCost(terms[False], draft_terms=terms[True])
+            plan.terms[name] = _term(name, prices, plan.at[name.startswith(DRAFT)])
+        return _cost(plan.terms)
+
+    def _whole(self, held: tuple, view: BatchView, bounds: tuple, at: tuple):
+        """A step at the graphs `held` priced whole, each part at its bound of
+        `bounds`, the target's from the graph at `at[0]`, its drafter's at
+        `at[1]`."""
+        priced, refused = [], []
+        for part, region in enumerate(held):
+            if region:
+                got = self._priced(region, view, refused, bounds[part])
+                priced += (
+                    [(PREFIXES[part] + p[0], *p[1:]) for p in got] if part else got
+                )
+        if refused:
+            raise CostRefused(view, list(dict.fromkeys(refused)))
+        names: dict[str, list] = {}
+        for p in priced:
+            names.setdefault(p[0], []).append(p)
+        return _cost(
+            {n: _term(n, ps, at[n.startswith(DRAFT)]) for n, ps in names.items()}
+        )
 
     def describe(self) -> str:
         rows = "the rows a graph pads to" if self.padded else "real rows"

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 """A backend prices each step of a run at one graph as a backend new to that
-step does, while it prices again only what the step moved: a leaf whose price
-list answer reads nothing a step moves is asked once over the run, attention
-again at each step that moves its rows' context, and a data-parallel step's
-routed experts, whose work reads the group's tokens, only at a step that moves
-them. A step whose attention leaves the list's measured range names its
-roofline term, and the next step back inside it the list's again.
+step does, while from the graph's second step on it prices again only what a
+step moved: a leaf whose price list answer reads nothing a step moves is not
+asked again, attention is at each step that moves its rows' context, and a
+data-parallel step's routed experts, whose work reads the group's tokens, only
+at a step that moves them. A step whose attention leaves the list's measured
+range names its roofline term, and the next step back inside it the list's.
 """
 
 import collections
@@ -105,7 +105,8 @@ def test_a_later_step_prices_only_what_it_moved_again(monkeypatch):
     for s in STEPS:
         run.price(_step(*s))
 
-    # the GEMM once; attention at each step but the last, a view priced before
-    assert asked == {GEMM: 1, ATTENTION: len(STEPS) - 1}
-    # the experts at the first step and at each that moves the group's tokens
-    assert works[MOE] == 3
+    # the GEMM at the graph's first two steps, the second planning it;
+    # attention at each step but the last, a view priced before
+    assert asked == {GEMM: 2, ATTENTION: len(STEPS) - 1}
+    # the experts there too, and at each later step that moves the tokens
+    assert works[MOE] == 4
