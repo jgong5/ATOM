@@ -172,11 +172,12 @@ def _groups(seed, n, others):
     return out
 
 
-def _records(path, groups):
+def _records(path, groups, trace=True):
     """Rank `r`'s record of `groups`, its labels stretched by `1 + 0.01 r`: on
     each step its target to `forward_done_event` less the draft-KV pass, that
     pass, which a dummy forward does not run, and the rest of its device time
-    its draft; on a prefill the draft is its propose pass too."""
+    its draft; on a prefill the draft is its propose pass too. Unless not
+    `trace`, each prefill also carries a trace run's busy time (`traced`)."""
     path.mkdir()
     paths = []
     for r in range(DP):
@@ -213,7 +214,13 @@ def _records(path, groups):
                 line["d_propose_ns"] = p["draft"]
             if v.dp_dummy:
                 line.update(is_dummy_run=True, batch=[])
-        record.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
+        # A plain record holds no trace run's busy time, `_record`'s included.
+        label = (
+            traced
+            if trace
+            else (lambda x: {k: v for k, v in x.items() if k[:2] != "b_"})
+        )
+        record.write_text("".join(json.dumps(label(x)) + "\n" for x in lines))
         paths.append(record)
     return paths
 
@@ -355,3 +362,34 @@ def test_fit_steps_takes_the_drafter_s_routing_from_the_served_model(fitted, tmp
     assert law["moe_routing"] == {"experts": 384, "top_k": 6}
     assert law["draft"]["moe_routing"] == {"experts": 128, "top_k": 3}
     assert law["draft"]["decode"]["4"]["fit"]["moe_column"]["adopted"] == "moe_experts"
+
+
+@pytest.mark.parametrize("label", ["record", None])
+def test_one_plain_dp_record_fits_its_prefill_only_from_its_own_windows(
+    tmp_path, monkeypatch, label
+):
+    """The budget of one real run: a single DP record with no trace run. Under
+    `COMPASS_PREFILL_LABEL=record` each prefill step is labelled from its own
+    device window, so the prefill vector and the draft's prefill passes fit
+    and price the record's own prefills as their per-rank laws do; unset, every
+    prefill is cut as untraced and the prefill vector stays unfitted."""
+    if label:
+        monkeypatch.setenv("COMPASS_PREFILL_LABEL", label)
+    else:
+        monkeypatch.delenv("COMPASS_PREFILL_LABEL", raising=False)
+    groups = _groups(0, 300, FULL)
+    samples = label_records(_records(tmp_path / "plain", groups, trace=False), DP)[0]
+
+    law, _ = fit(samples, OPTIONS)
+
+    if not label:
+        assert "prefill" in law["unfitted"]
+        return
+    assert "prefill" not in law["unfitted"] and not law["draft"]["unfitted"]
+    views = [v for v, _ in groups if any(x.prefill for x in v)]
+    assert views
+    backend = StepLinearBackend(StepLinearLaw(law), DP)
+    for v in views:
+        rank = next(r for r, x in enumerate(v) if x.prefill and not x.dp_dummy)
+        want = _prefill(v[rank], PREFILL) * (1 + 0.01 * rank)
+        assert backend.price(v[rank]).seconds == pytest.approx(want, rel=0.1)
