@@ -32,9 +32,13 @@
 #                    a trace run's (OUT/trace) serve.TRACE_STOP_S more, set
 #                    the export's server_stopped and, for an instance, write
 #                    each request's split, OUT/request_split.json
-#                    (atom/compass/report/split.py), then the run's report,
-#                    OUT/report.html (atom/compass/report/html.py), which
-#                    deploy.sh writes for a deployment as it stops
+#                    (atom/compass/report/split.py), then CI's Prometheus
+#                    report of a simulated run's series, OUT/prometheus.html,
+#                    or why there is none, OUT/prometheus.txt
+#                    (atom/compass/report/prometheus.py), a failure of which
+#                    fails no stop, then the run's report, OUT/report.html
+#                    (atom/compass/report/html.py), all of which deploy.sh
+#                    writes for a deployment as it stops
 #   --sweep          in place of aiperf, send the JIT sweep of the cell the
 #                    server's engine and traces A to B make, then after the
 #                    stop keep the points its record covers in the server's
@@ -278,5 +282,7 @@ EOF
 [[ -d $OUT/prefill ]] && exit 0
 (cd / && python3 -m atom.compass.report.split "$OUT") ||
     fail "split: atom.compass.report.split exited $?"
+(cd / && python3 -m atom.compass.report.prometheus "$OUT") ||
+    echo "client: prometheus: atom.compass.report.prometheus exited $?" >&2
 (cd / && python3 -m atom.compass.report.html "$OUT") ||
     fail "report: atom.compass.report.html exited $?"

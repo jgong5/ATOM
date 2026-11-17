@@ -20,7 +20,7 @@ D80), `16` (D95.1), and the M3-Agentic stage's `03` D13.1, `06` D35.1 and `14` D
 | `13` D80: no command starts the client or takes a workload | `compass advice` does both | D109 |
 | `13` D80: a prefill or decode `run` refuses without `--join` | not under `--check`, which resolves the side as `deploy.sh` does | D109 |
 | `13` D80: what `run --check` lists | a step linear law's scheduled decode rungs with no vector, too | D112 |
-| `13` D80: what `run`, `record` and `deploy.sh` leave | each run's per-request split and `report.html`, written as it ends by `client.sh --stop` for an instance and by `deploy.sh` for a deployment | D114, D115 |
+| `13` D80: what `run`, `record` and `deploy.sh` leave | each run's per-request split and `report.html`, and a simulated run's `prometheus.html`, written as it ends by `client.sh --stop` for an instance and by `deploy.sh` for a deployment | D114, D115 |
 | `08` D50: the cell matrix | a MiniMax-M3 showcase set: the recommended configuration and the runner-up | D117 |
 
 ---
@@ -156,8 +156,10 @@ development nodes are crsuse2-m2m-v3-005 and -013.
       decode, LMCache store and load, from dp<r>.jsonl, transfers.jsonl and
       aiperf's per-request export
    -> on an op-level run, its op-family split: op.<kind> summed per step phase
-   -> report.html: the run, headline metrics, trust, both splits, and its
-      cell's grades.json once the cell is graded
+   -> a simulated run's prometheus.html: CI's Prometheus report over its LPs'
+      series on the simulated clock (`11` D74), or prometheus.txt saying why not
+   -> report.html: the run, headline metrics, trust, both splits, its
+      cell's grades.json once the cell is graded, and a link to prometheus.html
  compass advice ends -> dashboard.html: the frontier, the recommendation, two
    marks per point; a point opens its run's report.html
 ```
@@ -418,9 +420,9 @@ the run's provenance.
    change that moves memory takes the readings again, as #2861's token buckets moved
    DeepSeek-V4.1's graph pool. A store entry is never re-keyed: it is immutable and keyed
    by the digest its records ran at. A store law reaches a later head as a checked-in law
-   file, as P1's would from M2's store: checked in under `scripts/compass/laws/` re-keyed
-   to the head, its provenance naming the commit its records ran at and saying re-keyed,
-   not re-validated. The commits that re-key the checked-in laws carry it from then on,
+   file: checked in under `scripts/compass/laws/` re-keyed to the head, its provenance
+   naming the commit its records ran at and saying re-keyed, not re-validated. The
+   commits that re-key the checked-in laws carry it from then on,
    `tests/compass/test_platform_keys.py::test_every_checked_in_law_stamps_this_trees_atom_digest`
    holding each to its tree's digest, and a run takes it as `compass run --step-linear
    LAW --host-laws LAW`. A search may mix laws fitted at different commits, each point's
@@ -455,7 +457,7 @@ the run's provenance.
    the records' ATOM digest, `records_atom`, which the fit writes into the law beside its
    host key and re-keying leaves alone, since a re-key moves only the host key's `atom`; a
    law that states none counts as re-keyed. A law fitted before the fit reported the
-   figures, as P1's and P3's are, gains them in a commit to its law file, on the head's
+   figures, as P3's are, gains them in a commit to its law file, on the head's
    fit, CPU only, its provenance saying so: each source its `sources` splits the vectors
    over is folded with that source's own records, form and options, as `sources` and the
    provenance state them, and a law with no `sources` as one fit. A law with no figures is
@@ -599,8 +601,12 @@ search's or profiling's code.
   optional reference layer, labelled with its source: InferenceX's DeepSeek-V4-Pro curves,
   frozen since it retired the model on 2026-10-29, as another ATOM version with
   unverified configurations; on MiniMax-M3, the M3-Agentic stage's per-point verdicts on
-  mi355-gpu-40, as another platform; never InferenceX's MiniMax-M3 points. ATOM's
-  Benchmark Dashboard (`.github/dashboard/index.html`) is tried first (T111).
+  mi355-gpu-40, as another platform; never InferenceX's MiniMax-M3 points. The layer is
+  the file `compass advice --reference` names, its source and its curves, each point's
+  metrics under the result table's names, so no code branches on the model. The page is
+  Compass's own (`atom/compass/advice/dashboard.py`), its four views drawn when it is
+  written and switched with no script; ATOM's Benchmark Dashboard was tried first and
+  serves neither mark (T111, below).
 - **The per-run report**, `report.html`, which every run, simulated or real, writes into
   its directory when it ends: the run (configuration, machine, ATOM tree, law sources
   from `run.json`, workload); headline metrics by #3264's code, as the dashboard computes
@@ -612,16 +618,73 @@ search's or profiling's code.
   before grading; the per-request split, beside the real run's when the cell has one; the
   op-family split on op-level runs. Each number comes from a file in the run directory or
   its cell's `grades.json`, a part with no data says so, and the page changes none of the
-  run's results.
+  run's results. It links `prometheus.html`, or quotes `prometheus.txt`.
+- **The Prometheus report**, `prometheus.html`, which every simulated run writes beside
+  `report.html` when it ends (`python -m atom.compass.report.prometheus OUT`, after the
+  split and before `report.html`): ATOM's CI report, `export_report.py` imported unchanged
+  from the run's source tree, its panels for the run's deployment kind (`pd` when OUT holds
+  `prefill/` and `decode/`, else `standalone`) over the run's series (`11` D74) from their
+  first instant to the first grid point at or past their last, as CI's
+  `wait_for_final_scrape` ends its query, at CI's 5 s step and `max(60, 4 x interval)`
+  window, the interval the shortest step between two instants of one file, each file's
+  last step left out, since its final sample lands under one interval after the timer's
+  last (`11` D74). Each sampler's file is decompressed, since promtool reads no gzip, and
+  backfilled by promtool into one TSDB that a Prometheus with no scrape
+  serves to `collect_report`; both come from `collect_metrics.py::ensure_prometheus`, which takes a
+  `tool` argument, reads `ATOMESH_PROMTOOL_BIN` beside `ATOMESH_PROMETHEUS_BIN`, and reuses a
+  tool it extracted into the directory it is given, here `~/.cache/compass/prometheus-3.5.0`,
+  so a node downloads the checksummed 3.5.0 archive once and one that cannot is given both
+  binaries beforehand. Each file lands there under its name only once whole, written under
+  a per-process name and renamed, the archive once its checksum holds, so `compass
+  advice`'s parallel points, each stopped by `client.sh --stop`
+  (`atom/compass/advice/simulate.py`), never run another's part-written tool; two racing on
+  a node's first use each download the archive. The page says it is simulated through the
+  data it renders: its title ("Simulated agentic PD inference report", "Simulated agentic
+  aggregated inference report"), its notes (the simulated clock from the run's start shown
+  from 1970-01-01 00:00 UTC, the GPU panels' predicted target device time on TP rank 0,
+  any frontend or engine member with no file, any family it queries that the sampler's class table lacks, `11`
+  D77), and the two GPU panels' label and description, which say predicted (`11` D75). A
+  deployment's Overall
+  TTFT, the router's `mesh_router_ttft_seconds`, stays empty and the notes say why: the
+  router times it on the wall clock (`atom/mesh/src/observability/ttft.rs::track_http_ttft`),
+  and the client's TTFT is on `report.html`. Its data goes to `prometheus.json`, from which
+  `export_report.py --input-json` rebuilds the page. When none can be made (no series, a
+  real run's included; no tool and no download; no `export_report.py` in the tree; a backfill
+  or query that failed), `prometheus.txt` says why. It exits 0 either way; `client.sh` and
+  `deploy.sh` report a failure and keep their exit status.
 
 **Reason.** A static page travels with its run; reading files keeps the views apart from
 the code they show (D108); two marks keep an ungraded or guessed number from reading as
-measured. **Basis.** The owner on #3355; `08` D50.1; `11`, which owns `/metrics`;
-`atom/compass/validate/__main__.py`, which prints its grades and writes none.
+measured. CI's own report shows a simulated run in the view a real run's is read in,
+from series sampled on the simulated clock. **Basis.** The owner on #3355; `08` D50.1;
+`11`, which owns `/metrics`; `atom/compass/validate/__main__.py`, which prints its grades
+and writes none; for the Prometheus report, the owner's answers at #3584's plan review (no
+Compass report for a real run; predicted GPU panels; the tools fetched or placed, a missing
+one not failing the stop), and `export_report.py`'s public `collect_report` and
+`write_report`.
 
-**Rejected.** ATOM's own report (`.github/scripts/atomesh/observability/export_report.py`):
-it plots Prometheus series, which need `/metrics` sampled on the simulated clock,
-deferred.
+**Rejected.** ATOM's own report in place of `report.html`: it plots Prometheus series and
+holds no run, law source, trust or split, so it sits beside it. ATOM's Benchmark Dashboard
+(`.github/dashboard/index.html`) for the search's dashboard (T111, settled by
+[#3465](https://github.com/jgong5/ATOM/issues/3465)): its points are CI benchmark entries
+from `data.js`, with no field for a grading state, method shares, a refusal or a
+recommendation; its Disaggregated view (`renderAtomeshPerformanceTab`) switches between
+InferenceX's two interactivities, but draws the throughput of the tokens served alone, with
+no computed-token throughput; a point links only an `https://` URL (`safeHref`), never a
+run's `report.html` beside the page; and it loads Chart.js from a CDN, so it draws nothing
+offline. Each would change ATOM's CI page for one Compass view. For the Prometheus report:
+moving `export_report.py` into `atom/`, which moves CI's module and its test for a caller
+that imports it in place; reimplementing `rate` and `histogram_quantile` in Python, a second
+copy of PromQL that drifts from CI's numbers; a "SIMULATED" badge in CI's page, an edit to
+CI's template for what the title says; a router TTFT built from aiperf's, a client
+measurement under the router's name; CI's `metrics/` layout, a second `report.html` in one
+run directory; writing it after `report.html`, which could then only link a file it
+cannot know exists; a grid shifted to end on the last instant, which then starts after the
+first, unlike CI's from the benchmark's start; the interval read from
+`ATOM_METRICS_UPDATE_INTERVAL_S`, which in the report's environment under `client.sh` need
+not be the server's (#3630); and a lock around the tools' download,
+which a killed report leaves blocking every later one, against a download each node makes
+once (#3611).
 
 ---
 
@@ -639,7 +702,7 @@ workload, so its grade is not cited.
 | S1 | one node, 8 GPUs | TP8 | MTP3 | off | off | `recipes/DeepSeek-V4-Agentic-InferenceX.md`, TP | calibrated anew (D113) |
 | S2 | one node | DPA8 | MTP3 | on | off | the same, DP attention | calibrated anew (D113) |
 | S5 | one node | DPA8 | MTP3 | on | on | the same, DP attention with LMCache | S2's step and host laws; its own readings, whose key holds the KV offload |
-| P1 | 1P1D, 16 GPUs | TP8 / TP8 | off | off | off | `recipes/mesh/DeepSeek-V4.md`, pure TP; nightly `ds-v4-1p1d-tp8` | M2's TP law from the crsuse2-m2m-v3-005 store, checked in re-keyed, if it passes D112 |
+| P1 | 1P1D, 16 GPUs | TP8 / TP8 | off | off | off | `recipes/mesh/DeepSeek-V4.md`, pure TP; nightly `ds-v4-1p1d-tp8` | calibrated anew (D113): no TP8 step linear law exists to reuse |
 | P3 | 1P1D | DPA8 / DPA8 | off | prefill | off | `recipes/mesh/DeepSeek-V4.md`, DPA | the shipped crs005 and gpu45 pairs under `scripts/compass/laws/`, if they pass D112 |
 
 The configurations cut from it, each one switch alone (S3, S4, P2, P4 to P7), can come
@@ -658,7 +721,9 @@ stated length has the gaps #3355's template lists, ungraded here.
 tool is built while MiniMax-M3's support lands (D117); the template runs every path of the
 tool, a reused law and a new one included, and S1 against S2 puts the agentic workload's
 best-known trade-off on its frontier. **Basis.** The owner on #3355, whose template states
-each departure and cites the #975 and #2683 Rulings it rests on; `16` D95.
+each departure and cites the #975 and #2683 Rulings it rests on; the
+[#3493 Ruling](https://github.com/jgong5/ATOM/pull/3493#issuecomment-6906479025), which
+calibrates P1 anew; `16` D95.
 
 **Rejected.** Developing on MiniMax-M3 from the start: the Compass features it needs were
 still landing under #3256, while DeepSeek-V4-Pro already had a store and laws on the
@@ -796,12 +861,12 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | `atom/compass/backends/step_linear_plan.py` (new), beside `step_grid_plan.py` | the record list | D113 |
 | `atom/compass/backends/step_linear_fit.py` | `08` D47's three figures per kind over each leave-one-run-out fold, as `validate/cost.py` computes them, in the law and its report; the records' ATOM digest, `records_atom` | D112 |
 | `scripts/compass/calibrate.sh` | `STORE`, a GPU list, `status`, per-step timing | D113 |
-| `atom/compass/report/` (new), called where `client.sh --stop` and `deploy.sh` stop a run | the per-request split, the op-family split, `report.html` | D114, D115 |
+| `atom/compass/report/` (new), called where `client.sh --stop` and `deploy.sh` stop a run | the per-request split, the op-family split, `report.html`, a simulated run's `prometheus.html` | D114, D115 |
+| `atom/compass/run/metrics.py` (new), `run/__init__.py`, `runner/overrides.py`, `drive/run.py`, `.github/scripts/atomesh/observability/collect_metrics.py` | the series the Prometheus report reads, its predicted GPU panels, and its tools (`11`, *The first build*) | D115 |
 | `atom/compass/validate/__main__.py`, `validate/curves.py` | `grades.json` in each graded cell, its runs' `report.html` rendered again; a 1P1D point's GPUs over both sides | D115, D111 |
 | `scripts/compass/spaces/` (new) | the DeepSeek-V4-Pro and MiniMax-M3 templates | D110, D116, D117 |
 | `scripts/compass/ADVICE.md` (new), `QUICKSTART.md` | the guide, linked both ways | D108 |
-| `scripts/compass/laws/` | M2's TP law, P1's, checked in re-keyed if it passes D112 | D112, D116 |
-| `scripts/compass/laws/` | P1's and P3's `08` D47 figures, each source folded with its own records, form and options | D112, D116 |
+| `scripts/compass/laws/` | P3's `08` D47 figures, each source folded with its own records, form and options | D112, D116 |
 
 **Acceptance items**, each walked by the scenario named:
 
@@ -836,6 +901,9 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
     alone, a step past its records extrapolated and its share reported, grades both cells
     by `08` D44 with their order compared, and reports each point's `08` D45.1 verdict
     beside its grade, not gated (8).
+12. Every simulated run's end writes `prometheus.html` beside `report.html`, CI's panels
+    over its series on the simulated clock, or `prometheus.txt` with why, its stop not
+    failing; `report.html` links or quotes it (7; `11`, *The first build*).
 
 ---
 
@@ -850,8 +918,8 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 | D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage (a decode vector for every scheduled rung before the search, each point's extrapolated share reported after it) and `08` D47's three figures on each leave-one-run-out fold within #627's 5% gate, a law at the head past it refused; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose ATOM digest is not the head's, the remote tip's or a frozen commit's, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363; the head by ATOM's digest, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957); coverage in two parts, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216); the accuracy bar, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6869501859)) |
 | D113 | The step linear backend lists a configuration's missing records, for a missing law or decode rung, as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |
 | D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355); the format 2026-11-14 ([#3458](https://github.com/jgong5/ATOM/issues/3458)) |
-| D115 | Two static views reading files only: the search's dashboard, each point marked by grading state and method shares, and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell, which renders the cell's reports again. | 2026-11-13 (#3355, #3363) |
-| D116 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355) |
+| D115 | Two static views reading files only: the search's dashboard, a page of Compass's own, each point marked by grading state and method shares, with a reference layer from the file `--reference` names; and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell, which renders the cell's reports again. Beside `report.html`, every simulated run's `prometheus.html`: CI's report, `export_report.py` unchanged, over the run's series (`11` D74), marked simulated, the GPU panels predicted, the router's TTFT empty; or `prometheus.txt` with why, the stop not failing. | 2026-11-13 (#3355, #3363); the page Compass's own 2026-11-15 ([#3465](https://github.com/jgong5/ATOM/issues/3465)); the Prometheus report 2026-11-16 ([#3584](https://github.com/jgong5/ATOM/issues/3584)); its query's end and the tools written whole 2026-11-17 ([#3611](https://github.com/jgong5/ATOM/issues/3611)) |
+| D116 | Developed on DeepSeek-V4-Pro on MI355X on the development nodes, ungraded and outside `08` D50: S1, S2, S5, P1 and P3 at 1 to 256 clients, each departure from its recipe stated. | 2026-11-13 (#3355); P1 calibrated anew 2026-11-16 ([#3493](https://github.com/jgong5/ATOM/pull/3493#issuecomment-6906479025)) |
 | D117 | Moved to MiniMax-M3 once its Compass features land and #3265 passes, calibrated on the development nodes from #3256's arms at one frozen commit, where its simulations and validation runs run too, every point priced by the step linear law alone, a step past its records extrapolated and reported, and the pricing reopened if #3256's grading fails the law where the step grid passes ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216)); the showcase validation runs the recommended configuration and the runner-up real, graded by `08` D44, their real order compared with the simulated one, each point's `08` D45.1 verdict beside its grade, not gated. Amends `08` D50. | 2026-11-13 (#3355, #3363) |
 
 ---

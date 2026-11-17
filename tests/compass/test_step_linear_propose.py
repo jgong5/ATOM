@@ -17,6 +17,7 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
+from atom.compass.backends.json_file import read_json
 
 #: What a longer `propose` pass adds, in seconds.
 EXTRA = 1e-3
@@ -88,10 +89,12 @@ HOST_ONLY = {"provenance", "platform", "host", "host_fit"}
 
 
 def test_every_checked_in_law_loads():
-    laws = sorted((Path(__file__).parents[2] / "scripts/compass/laws").glob("*.json"))
+    laws = sorted(
+        (Path(__file__).parents[2] / "scripts/compass/laws").glob("*.json.xz")
+    )
     assert laws
     for path in laws:
-        law = json.loads(path.read_text())
+        law = read_json(path)
         if law.keys() <= HOST_ONLY:
             compass_run._check_host(path, law["host"])
         else:

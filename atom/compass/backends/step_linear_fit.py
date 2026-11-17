@@ -6,11 +6,14 @@
     python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --platform JSON [--form FORM] [--moe-routing E,K] [--engine FILE]
     python -m atom.compass.backends.step_linear_fit offload LOG... --out ENTRY
     python -m atom.compass.backends.step_linear_fit figures RECORD... --law LAW [--source NAME] [--form FORM] [--moe-routing E,K] [--engine FILE]
+    python -m atom.compass.backends.step_linear_fit pack PATH...
 
 The second form fits a run file's ``lmcache_offload`` entry, beside the law of
 an arm whose records ran the connector, on those runs' server logs
 (`fit_offload`). The third writes the held-out figures (below) of the records
-into an existing law fitted on them (`figures_main`).
+into an existing law fitted on them (`figures_main`). The fourth stores law
+files xz-compressed, as the checked-in ones are (`pack_main`). A law is read
+and written by `json_file`, xz-compressed when its name ends in ``.xz``.
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
@@ -94,7 +97,7 @@ adopts features as columns on their held-out error per launch path
 The same solver fits the host entry's ``tokenizer`` term on a recorded
 server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
 HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
-requests, ``fixed_s`` from a burst or else ``idle_s``, and ``bytes`` over every
+requests, ``fixed_s`` from the bursts or else ``idle_s``, and ``bytes`` over every
 request's body.
 
 Each equation is divided by its price, from its label until no price moves
@@ -703,11 +706,13 @@ def fit_intake(paths) -> tuple[dict, dict]:
     """The ``http_intake`` term over the intake stamps each record in `paths`
     holds (`_intakes`), and its report: ``idle_s`` and ``per_byte_s`` by the
     host-law solver on the lone requests' CPU seconds over their body bytes;
-    ``bytes`` spans every request's body; ``fixed_s`` the loop's CPU time per
-    request between template starts in the longest burst, less ``per_byte_s``
-    times its mean body, each gap the next request's, or ``idle_s`` where that
-    is negative or there is no burst, the report's ``fixed_s_is_idle_s`` saying
-    which. Raises on too few lone requests."""
+    ``bytes`` spans every request's body; ``fixed_s`` the mean, over every
+    burst's later requests, of the loop's CPU time from the template start
+    before each to its own, less ``per_byte_s`` times its body, the report's
+    ``burst`` giving the bursts, their requests and those values' p10 and p90;
+    or ``idle_s`` where that mean is negative or there is no burst, the
+    report's ``fixed_s_is_idle_s`` saying which. Raises on too few lone
+    requests."""
     lone, bursts, bodies = [], [], []
     for path in paths:
         got = _intakes(path)
@@ -721,19 +726,26 @@ def fit_intake(paths) -> tuple[dict, dict]:
     if not bursts:
         report["fixed_s_is_idle_s"] = f"no burst among {len(lone)} lone requests"
         return {"fixed_s": idle, **term}, report
-    sizes, starts, cpu = np.array(max(bursts, key=len), dtype=np.float64).T
-    gap, body = np.diff(cpu).mean() * 1e-9, sizes[1:].mean()
-    fixed = gap - per_byte * body
+    # Each burst's (body bytes, template start ns, its CPU ns) per request.
+    runs = [np.array(b, dtype=np.float64).T for b in bursts]
+    gaps = np.concatenate([np.diff(cpu) * 1e-9 for _, _, cpu in runs])
+    sizes = np.concatenate([body[1:] for body, _, _ in runs])
+    values = gaps - per_byte * sizes
+    fixed = values.mean()
     if fixed < 0:
         report["fixed_s_is_idle_s"] = (
-            f"the longest burst's {len(sizes) - 1} later requests take {gap:.3g} s "
+            f"the bursts' {len(gaps)} later requests take {gaps.mean():.3g} s "
             f"of the loop's CPU each, less than per_byte_s {per_byte:.3g} times "
-            f"their mean body of {body:.0f} B, so fixed_s would be {fixed:.3g} s"
+            f"their mean body of {sizes.mean():.0f} B, so fixed_s would be "
+            f"{fixed:.3g} s"
         )
         return {"fixed_s": idle, **term}, report
+    p10, p90 = np.percentile(values, [10, 90]).tolist()
     report["burst"] = {
-        "requests": len(sizes),
-        "span_s": (starts[-1] - starts[0]) * 1e-9,
+        "bursts": len(bursts),
+        "requests": sum(map(len, bursts)),
+        "p10_s": p10,
+        "p90_s": p90,
     }
     return {"fixed_s": fixed, **term}, report
 
@@ -2278,7 +2290,7 @@ def figures_main(argv) -> None:
     at a time: `--source` names it, the records must be its `runs`, they are
     folded under `--form` and `--moe-routing`, as its provenance states them,
     and the figures, of the steps its `vectors` price, go under it; a source
-    whose vectors price none of the records' steps refuses. Records whose
+    whose vectors price none of the records' uncut steps refuses. Records whose
     prefill buckets, `--engine`'s included, are not those LAW's prefill
     vector was fitted under refuse where the figures grade that vector, as
     do any under a law with no `sources` that names `padding` unfitted."""
@@ -2290,7 +2302,7 @@ def figures_main(argv) -> None:
     parser.add_argument("--source", help="the entry of the law's sources folded")
     parser.set_defaults(form=None)
     args = parser.parse_args(argv)
-    law = json.loads(Path(args.law).read_text())
+    law = json_file.read_json(args.law)
     into, vectors, runs = law, None, law.get("runs")
     sources = law.get("sources", {})
     if args.source is not None or sources:
@@ -2333,14 +2345,39 @@ def figures_main(argv) -> None:
                 f"{' with ' + args.engine if args.engine else ''} state "
                 f"{list(stated) or 'none'}: its folds are fitted under its own"
             )
-    if vectors is not None and not any(_vector_of(s.view) in vectors for s in samples):
+    cuts = [s.cut for s in samples if vectors and _vector_of(s.view) in vectors]
+    if vectors is not None and all(cuts):
+        why = {c: cuts.count(c) for c in sorted(set(cuts))}
         raise ValueError(
             f"{args.law}'s source {args.source} prices none of the records' "
-            f"steps: its vectors are {vectors}"
+            f"uncut steps: its vectors are {vectors}"
+            + (f", and the fit cuts each step they price: {why}" if why else "")
         )
     into["figures"] = fold_figures(_fold_laws(samples, options, 0), vectors)
-    Path(args.law).write_text(json.dumps(law) + "\n")
+    json_file.write_json(law, args.law)
     print(_figures_table(into["figures"]))
+
+
+def pack_main(argv) -> None:
+    """``pack PATH...``: store each law file PATH, or each ``*.json`` in a
+    directory PATH, xz-compressed beside it under its name and ``.xz``, as
+    `json_file.write_json` writes it, and remove it, printing both sizes. A law
+    whose document did not change is stored in the same bytes. A PATH whose
+    name does not end in ``.json`` refuses, before any law is stored."""
+    parser = argparse.ArgumentParser(
+        prog="python -m atom.compass.backends.step_linear_fit pack",
+        description=pack_main.__doc__.split("\n\n")[0],
+    )
+    parser.add_argument("paths", nargs="+", type=Path, help="law files or directories")
+    paths = parser.parse_args(argv).paths
+    laws = [x for p in paths for x in (sorted(p.glob("*.json")) if p.is_dir() else [p])]
+    if named := [str(law) for law in laws if law.suffix != ".json"]:
+        parser.error(f"a law file packed is named *.json, and these are not: {named}")
+    for law in laws:
+        into = law.with_name(law.name + json_file.XZ)
+        json_file.write_json(json_file.read_json(law), into)
+        print(f"{into}: {law.stat().st_size} -> {into.stat().st_size} bytes")
+        law.unlink()
 
 
 def main(argv=None) -> None:
@@ -2351,11 +2388,16 @@ def main(argv=None) -> None:
     if argv[:1] == ["figures"]:
         figures_main(argv[1:])
         return
+    if argv[:1] == ["pack"]:
+        pack_main(argv[1:])
+        return
     parser = _records_parser(
         "python -m atom.compass.backends.step_linear_fit", __doc__.split("\n\n")[0]
     )
     parser.add_argument(
-        "--out", required=True, help="where the law is written, as JSON"
+        "--out",
+        required=True,
+        help="where the law is written, as JSON, xz-compressed when it ends in .xz",
     )
     parser.add_argument(
         "--platform",
@@ -2387,7 +2429,7 @@ def main(argv=None) -> None:
         }
     if len(args.records) > dp:
         mark_held_out(law, report, samples, options)
-    Path(args.out).write_text(json.dumps(law) + "\n")
+    json_file.write_json(law, args.out)
     print(f"cut: {json.dumps(law['cut'])}")
     print(f"unfitted: {json.dumps(law['unfitted'])}")
     for name, vector in [("prefill", law.get("prefill"))] + list(law["decode"].items()):

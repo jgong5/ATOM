@@ -62,6 +62,7 @@ from atom.compass.artifacts import (
     machine_platform,
     member_name,
 )
+from atom.compass.backends.json_file import read_json
 from atom.compass.fit.device import compose
 from atom.compass.fit.publish import RANK
 from atom.compass.run.step_grid import readings
@@ -240,8 +241,15 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     where it states none, and the KV transfers priced on the spec's
     `kv_link`, ``intra_node`` for two instances on one node and
     ``inter_node`` across two, which alone reads ``--network``. Its hops are
-    the prefill side's host entry's, its ``decode_hops`` the decode side's. A
-    price list the prefill side names that is not the decode side's refuses."""
+    the prefill side's host entry's, its ``decode_hops`` the decode side's,
+    each side's config resolved from its arguments as deploy.sh starts its
+    instance, with its KV role on the simulated connector
+    (`drive.run.side_args`). A price list the prefill side names that is not
+    the decode side's refuses."""
+    from atom.compass.drive.run import SIMULATED, side_args
+
+    prefill_args = side_args("prefill", prefill_args, SIMULATED)
+    decode_args = side_args("decode", decode_args, SIMULATED)
     out = build(args, prefill_args, across=kv_link == "inter_node")
     if run.PRICE_LIST in out:
         decode = _price_list_key(decode_args, run._machine(out)).values
@@ -359,10 +367,10 @@ def _member(entry, stem: str):
 
 
 def _law_file(value: str) -> dict | None:
-    """The law file `value` names, read as JSON; None when it names no file,
-    as a token does not."""
+    """The law file `value` names, read as `read_json` reads it; None when it
+    names no file, as a token does not."""
     path = Path(value)
-    return json.loads(path.read_text()) if path.is_file() else None
+    return read_json(path) if path.is_file() else None
 
 
 def _host(store, value: str) -> dict:
@@ -379,12 +387,13 @@ def _host(store, value: str) -> dict:
     return law["host"]
 
 
-def _engine_args(atom_args):
-    """ATOM's arguments as its own parser reads them."""
+def _engine_args(atom_args, parser_class=None):
+    """ATOM's arguments as its own parser reads them, or as `parser_class`, a
+    subclass of it, does."""
     from atom.model_engine.arg_utils import EngineArgs
     from atom.utils.arg_parser import FlexibleArgumentParser
 
-    parser = FlexibleArgumentParser(add_help=False)
+    parser = (parser_class or FlexibleArgumentParser)(add_help=False)
     EngineArgs.add_cli_args(parser)
     return parser.parse_known_args(atom_args)[0]
 
