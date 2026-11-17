@@ -15,6 +15,10 @@ seconds by method (`seconds_by_method`), each with its step count and share (D3.
 LP of its own; inside a DP group a park request amends D3's member join rules 1, 2 and 5
 (ruling on [#1162](https://github.com/jgong5/ATOM/pull/1162)).
 
+**Revised 2026-11-17 by [#3687](https://github.com/jgong5/ATOM/issues/3687):** D6.1's LP
+`lmcache` sizes a chunk and the state image from the plan its deployment's runners
+publish, and its transfer channels are one per DP rank, so no run file states either.
+
 **Scope of this document.** The execution architecture: what a simulated run *is*,
 which processes exist, how virtual time advances, and what contract the rest of the
 system must honour. It does **not** cover the cost model, the memory model, model
@@ -833,7 +837,7 @@ receives it itself, at its own receive point.
 | PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py::PPStageTransport.send_metadata` / `send_tokens` / `send_kv_status` | the stage loop's own poll and receive (inline) | stated IPC delay: each is one ZMQ message, as on the frontend channels; the head's batch to stage `k` is `meta#pp<k>`. The hidden states between stages are `pp_data` (`15` D91). |
 | `engine-P->engine-D:prefill_done` (RapidServe only, in neither M1 nor M2) | prefill step loop, direct send in `engine_core.py::PrefillEngineCore._process_engine_step` | decode handler thread `DecodeEngineCore._recv_prefill_done`, `sock.recv()` (thread) | stated IPC delay |
 | `engine-D->engine-P:block_assignment` (RapidServe only, in neither M1 nor M2) | decode step loop, direct send in `engine_core.py::DecodeEngineCore._send_block_assignment` | prefill handler thread `PrefillEngineCore._recv_block_assignments`, `sock.recv()` (thread) | stated IPC delay |
-| `engine->lmcache:lookup#dpN`, `engine->lmcache:transfer#dpN.tpK` and their replies (`ATOM_KV_OFFLOAD=lmcache_mp` only) | D6.1 | D6.1 | stated `lmcache_ipc_s` |
+| `engine->lmcache:lookup#dpN`, `engine->lmcache:transfer#dpN` and their replies (`ATOM_KV_OFFLOAD=lmcache_mp` only) | D6.1 | D6.1 | stated `lmcache_ipc_s` |
 
 Each hop's lookahead is the run-file key of its name, which `drive/runfile.py` writes
 from the `hops` of the `host_laws` entry (`09` D54): `admission_s`, `ipc_s`,
@@ -2179,16 +2183,16 @@ lookup read locks, sessions, and the read TTL. A store's chunks become visible a
 store's completion on the server clock. A TTL expiry is a daemon deadline (`t_daemon`,
 #533): it changes later hits but keeps no run alive.
 
-**Channels.** Every one is a real ZMQ path between the real endpoints' identities; the
+**Channels.** Every one is a real ZMQ path to the server's URL; the
 stamp is its own header frame, as on every wrapped socket
-(`clock.py::WrappedSocket`). `N` is the DP rank, `K` the TP rank.
+(`clock.py::WrappedSocket`). `N` is the DP rank.
 
 | Channel | Sender (K-class) | Receiver (mode, K-class) | Lookahead |
 |---|---|---|---|
 | `engine->lmcache:lookup#dpN` | step loop, at `MessageQueueClient.submit_request` (LOOKUP, QUERY_PREFETCH_STATUS, FREE_LOOKUP_LOCKS, END_SESSION); the `ClientPollingLoop` thread sends it as a relay (K4, registered at the put, as the engine output queue is) | stand-in loop (inline, K5) | `lmcache_ipc_s` (below) |
 | `lmcache->engine:lookup#dpN` | stand-in loop, at the job's completion (K4) | the `ClientPollingLoop` thread, which sets the future (thread, K5); TSO delivery resolves it at the reply's arrival | `lmcache_ipc_s` |
-| `engine->lmcache:transfer#dpN.tpK` | STORE or RETRIEVE of TP rank `K`'s connector, one per writer rank (one per group under `lmcache.mp.tp_rank_collapse`) (K4) | stand-in loop (inline, K5) | `lmcache_ipc_s` |
-| `lmcache->engine:transfer#dpN.tpK` | stand-in loop, at the copy's completion (K4) | step loop, in `process_completions` (inline, K5) | `lmcache_ipc_s` |
+| `engine->lmcache:transfer#dpN` | STORE or RETRIEVE of each writer rank's connector in DP rank `N`, in rank order: every TP rank, or one per group under `lmcache.mp.tp_rank_collapse` (K4) | stand-in loop (inline, K5) | `lmcache_ipc_s` |
+| `lmcache->engine:transfer#dpN` | stand-in loop, at the copy's completion (K4) | step loop, in `process_completions` (inline, K5) | `lmcache_ipc_s` |
 
 In a 1P+1D run the engine end is `engine-P`. Every cycle through the server crosses two
 channels, so its lookahead is `2 x lmcache_ipc_s`, positive. `lmcache_ipc_s` is a run-file
@@ -2206,8 +2210,13 @@ CUDA IPC events), and its two contacts with the step loop are a fire-and-forget 
 (`AsyncIOProcManager.call_func_with_aggregation`). Neither lets the owner register the
 worker's send before its next clock call or release a reply at its arrival, so the
 PP pattern (`15` D91: the loop stamps, the worker moves bytes in a call the loop makes)
-would need new ATOM call sites. The shell keeps one DEALER per writer rank, so the
-server sees the clients it sees in a real run.
+would need new ATOM call sites. The shell keeps one DEALER per transfer channel where a
+real run has a client per writer rank: the stand-in keys every object by the worker id
+each request carries and reads the client only to route the reply, and the writer ranks'
+requests of one step leave in rank order at one instant, so the stations still serve
+them in rank order. One channel per DP rank keeps the writer count out of the channel table,
+which every LP and a standalone authority build from the run file before any engine
+exists (`run/__init__.py::channel_table`; amended by #3687).
 
 **A completion is a stamped message.** On the step loop, the Compass shell around the
 scheduler half (below) sends, from `build_connector_meta`, the STORE or RETRIEVE each
@@ -2310,11 +2319,55 @@ per step per member.
 pricing a LOOKUP by a declared law in prompt chunks and the bookkeeping requests at a
 declared constant; and the copy engine, a stated width, pricing a STORE or RETRIEVE as a
 `TransferModel` (`kv/transfer.py`) over the machine spec's host link, `bytes` the
-chunks moved times the chunk's bytes from the KV geometry. The copy engine applies no
+chunks moved times a chunk's bytes (*Sizing*, below). The copy engine applies no
 derate, unlike `TransferModel.from_spec` on a fabric link: the spec states the host link
 as a copy reaches it, not as a peak (`spec/fields.py`, `interconnect.host_link`;
 `run/__init__.py::_lmcache_stations`). Both stations' laws are declared until measured;
 their accuracy is out of scope here.
+
+**Sizing** (amended by #3687). LP `lmcache` takes a chunk's bytes and the state image from
+the plan of the deployment it serves, the prefill side's in a P/D run, as the simulated
+P/D connector takes its transfer (`run/__init__.py::_planned_transfer`). At
+`get_num_blocks` each member's TP rank 0 runner publishes in its engine's `.kv_block`
+file (`runner/overrides.py::publish_planned_transfer`) its paged KV block's bytes, the
+block that file carries for a P/D transfer; the block's tokens (`kv_cache_block_size`);
+and its state image, the `image_bytes` of its PAGE-backed checkpoint spec, 0 without one.
+A chunk's bytes are the block's times the server's `--chunk-size` over the block's
+tokens: ATOM's worker registers that many PAGE bytes per block of those tokens
+(`mp/worker.py::LMCacheMPConnector.register_kv_caches`), and DeepSeek-V4's planned block
+is exactly the PAGE regions it registers
+(`DeepseekV4AttentionMetadataBuilder.get_kv_transfer_tensors` refuses any other sum). The
+image is the spec the scheduler half binds, whose presence makes ATOM's scheduler half
+native-state (`mp/connector.py::LMCacheMPConnectorScheduler.bind_block_manager`). A pool whose
+charged entry carries alignment padding is overstated here as in the P/D price.
+
+LP `lmcache` reads the plan before it starts its first job, on the first stamped request
+released to it, and builds the copy station's `TransferModel` then. Every member has
+published by that time: an engine plans its pool before it builds its scheduler and the
+lmcache client in it (`engine_core.py::EngineCore.__init__`), and the API server sends no
+request until every DP rank is ready (`CoreManager._wait_for_all_ready_signals`). Until
+then the stand-in answers the unstamped startup frames, which need no bytes, over an
+empty index. It reads every member's file under `_planned_transfer`'s wait and refuses,
+by name, a member that published none within `PLANNED_BLOCK_WAIT_S`, members that plan
+different blocks, tokens or images, and a chunk size that is not a multiple of the
+block's tokens, as ATOM's worker refuses it. The publication's P/D refusals
+(`_refuse_kda_regions_across_stages`, `_refuse_fp4_indexer_regions`) stay with a P/D side.
+
+No run file states either value or a writer count (*Channels*). `_launch_lmcache` still
+refuses before the start what needs no plan: a deployment and a run file that disagree on
+whether LP `lmcache` runs, the decode side, an entry without `server`, `lookup_s` or
+`request_s`, a server flag the stand-in does not model, and an entry that states
+`writers` or `state_bytes`, which nothing reads any more. `compass advice` writes the
+entry it writes today, the server's flags and the request loop's declared laws
+(`advice/check.py::_lmcache`); `scripts/compass/parity_one_node.sh` writes the same entry,
+with no image read from the real run's log.
+
+#3641 builds the sizing: the publication and the block file of an `lmcache_mp`
+deployment, the shared read, LP `lmcache` started with no size, and the shell's image
+check dropped (`runner/overrides.py`, `run/__init__.py`, `kv/lmcache_server.py`,
+`kv/lmcache_mp.py`). #3674 builds the channels and the retired keys: one transfer channel
+per DP rank, the writer check dropped and both keys refused (`clock/channels.py`,
+`kv/lmcache_mp.py`, `run/__init__.py`, `scripts/compass/parity_one_node.sh`).
 
 **Fake-model duties.**
 
@@ -2381,6 +2434,14 @@ connector runs only when each sub-connector is simulated (`compass`, `lmcache_mp
 - *The real server under Compass*: README principle 2.
 - *Refusing a blocking lookup above DP width 1* (#1162 option (b)): it refuses the
   recipe, whose prefill runs at DP8.
+- *A `KvGeometry` case per cache layout* (#3641): a second copy of the pool plan's
+  arithmetic, which DeepSeek-V4's compressed and indexer planes would need first.
+- *The run file states the image and the writer count* (#1427, #1281): nothing
+  `compass advice` reads states the image before a start, and the writer count would have
+  every run-file builder resolve ATOM's config to run `_tp_replication_factor`, a value
+  `_launch_lmcache` re-derives to check.
+- *LP `lmcache` takes the writer count `_launch_lmcache` computes* (#3674's plan): the
+  authority and the engines would keep the per-writer table they build from the run file.
 
 ---
 
@@ -2797,7 +2858,7 @@ Ordered by how much they could cost.
 | D5 | Every timer and clock read the CA can reach runs on the LP clock, except the out-of-band control-command reply deadline; only what it cannot reach is configured or left real; metric cadence is virtual time (revising `11` D72); the profiler and RL control commands are refused by the simulated runner with a reply, counted, and make the run a coverage report; a synchronous command from the frontend's clock owner is refused by the frontend | 2026-09-18; revised 2026-09-28, 2026-10-09, 2026-10-14, 2026-10-15 |
 | D5.1 | The simulated run uses stdlib asyncio, not uvloop: only a Python event loop can host virtual time | 2026-09-28 |
 | D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only; a rank pair's writes queue on its link | 2026-09-18; revised 2026-09-28; link sharing 2026-10-16 (#1157); first-write setup 2026-10-16 (#1172); per-pair links kept under RDMA 2026-11-09 (#1179) |
-| D6.1 | The lmcache MP server is LP `lmcache`, a Compass stand-in on the real ZMQ channels with a content index and two stations; a store or load completes as a stamped reply that the step loop takes in timestamp order; a blocking lookup is a request and reply whose wait is an idle point; inside a DP group each member parks before its forward, amending member join rules 1, 2 and 5, and the last park releases every member at the group's time | 2026-10-16 (#1087, #1162) |
+| D6.1 | The lmcache MP server is LP `lmcache`, a Compass stand-in on the real ZMQ channels with a content index and two stations; a store or load completes as a stamped reply that the step loop takes in timestamp order; a blocking lookup is a request and reply whose wait is an idle point; inside a DP group each member parks before its forward, amending member join rules 1, 2 and 5, and the last park releases every member at the group's time; it sizes a chunk and the state image from its deployment's published plan before its first job, and its transfer channels are one per DP rank | 2026-10-16 (#1087, #1162); revised 2026-11-17 (#3687) |
 | D7 | Atomesh gets no virtual clock: mesh-only mode; in 1P1D the router is one segment of a channel, not an LP, and its relay latency is that channel's lookahead; its bounds are configured (health check and circuit breaker off, `--worker-request-timeout-secs` set large); timestamps ride carriers it already relays; under `--dp-aware`, or with several instances per role, the router is LP `router`, handling requests, prefill responses and stream events in timestamp order (#449, #1085) | 2026-09-18; revised 2026-09-30, 2026-10-15, 2026-10-16 |
 | D8 | Arrivals are messages in transit, covered by the send and receive counts for closed and open workloads alike; the arrival timestamp rides the `tracestate` header | 2026-09-18; revised 2026-09-28 |
 | D9 | The ATOM diff is enumerated (~1,980 lines with tests) and completeness enforced by test rather than by review; ATOM's own suite is the gate (`08` D43.1) | 2026-09-18; revised 2026-09-28 |
