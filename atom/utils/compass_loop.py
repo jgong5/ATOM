@@ -162,10 +162,19 @@ class Station:
 
 
 #: Service jobs by function name: a request's tokenization, a chat request's
-#: media preparation (`atom.compass.run` prices its images), and a `/metrics`
-#: scrape's render, which charges nothing.
+#: media preparation (`atom.compass.run` prices its images), a `/metrics`
+#: scrape's render, which charges nothing, and a chat request's template render
+#: (``apply_chat_template``, or ``_prepare_prompt``'s render and tokenize for
+#: ``/v1/messages`` and ``/v1/responses``), which the API server hands to a
+#: thread and which charges what its encode calls charge.
 SERVICE_JOBS = frozenset(
-    {"do_preprocess", "_prepare_multimodal_inputs", "AtomMetricsExporter.render"}
+    {
+        "do_preprocess",
+        "_prepare_multimodal_inputs",
+        "AtomMetricsExporter.render",
+        "apply_chat_template",
+        "_prepare_prompt",
+    }
 )
 #: Service jobs by module and qualified name, for names too common to match
 #: bare: OpenTelemetry's tracer setup and flush, which the API server's lifespan
