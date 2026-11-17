@@ -83,8 +83,9 @@ any other, a run whose ladder is a prefix of the law's read at the law's, and a
 law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
-holds at its shape and output, traced under this process's torch and ATOM source
-and loaded under them and its model (`_op_graphs`), the run's TP and EP widths and KV cache format; capture traces
+holds at its shape and output, traced under this process's torch, each file it
+ran and read reading here as it did (`capture.lookup`), and loaded under them and
+its model (`_op_graphs`), the run's TP and EP widths and KV cache format; capture traces
 eager forwards, so a graph-mode run reads the eager graphs too; with
 ``price_list``, the fields of a `price_list` key ``store`` holds, loaded
 under this run's readings, it prices each leaf from it first; with
@@ -2075,10 +2076,12 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     Each graph read from the store is parsed once and then frozen out of the
     collector's reach with the rest of the live heap (`parsed`).
 
-    A graph is looked up at the ATOM source and torch this process traces
-    under (`capture.graph_key`), so one traced under another of either is a
-    miss like any other. One the store holds, at a shape or holding G, is
+    A graph is looked up under the torch this process traces under, one whose
+    files each read here as they did in its trace (`capture.lookup`), so one
+    traced under another torch, or that ran a file since edited, is a miss
+    like any other. One the store holds, at a shape or holding G, is
     loaded through `ArtifactStore.load` under this process's `graph_readings`,
+    its files' reading here (`capture.source_of`),
     and its engine config as it records it: that cell holds the tracer's own
     ATOM arguments, which no reader restates, and the key's structure names
     the engine config in their place."""
@@ -2090,7 +2093,7 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         Row,
         Topology,
     )
-    from atom.compass.capture import graph_key, peers
+    from atom.compass.capture import graph_key, lookup, peers, source_of
     from atom.compass.capture.forward import (
         PerG,
         Shape,
@@ -2139,7 +2142,8 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         `ATOM_GC_FREEZE`: this lookup's caches keep what it parses alive, and
         every full collection walked all of it."""
         cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
-        conditions = Conditions.of(**here(), engine_config=cells[Axis.ENGINE_CONFIG])
+        readings = here() | {"atom_src": source_of(store, key)}
+        conditions = Conditions.of(**readings, engine_config=cells[Axis.ENGINE_CONFIG])
         entry = store.load(key, conditions=conditions, gates=GateState.of())
         graph = json.loads(entry.read_member("graph", rank, "json"))
         if envs.ATOM_GC_FREEZE:
@@ -2152,10 +2156,8 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         structure `at` and `shape`, as `capture.graph.to_json` writes it."""
         if (at, shape) in unpublished:
             return unpublished[at, shape]
-        key = graph_key(at, shape)
-        if not store.directory_for(key).exists():
-            return None
-        return parsed(key)
+        key = lookup(store, at, shape)
+        return None if key is None else parsed(key)
 
     @functools.lru_cache(maxsize=64)
     def held(at: str, shape) -> dict | None:
@@ -2182,8 +2184,8 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     ) -> dict | str | None:
         shape = Shape(phase, tokens, seqs, gathered, width, micro_batch).at(dp, drafts)
         at = structure(config, phase, True, arch, output, draft, env, micro_batch)
-        key = graph_key(at, str(shape))
-        missing = not store.directory_for(key).exists()
+        key = lookup(store, at, str(shape))
+        missing = key is None
         if missing and dp > 1 and phase == "prefill" and not (draft or drafts):
             g = shape.gathered or dp * tokens
             if found := held(at, shape._replace(gathered=None)):
@@ -2195,11 +2197,12 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         if missing and atom_args is not None and shape not in traced:
             traced.add(shape)
             lazily(shape)
-            missing = not store.directory_for(key).exists()
+            key = lookup(store, at, str(shape))
+            missing = key is None
         if (at, str(shape)) in unpublished:
             return unpublished[at, str(shape)]["region"]
         if missing:
-            return missed(store, key) or None
+            return missed(store, graph_key(at, str(shape))) or None
         return parsed(key)["region"]
 
     if lazy is None:
@@ -2219,8 +2222,10 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
 def graph_readings(model: str) -> dict:
     """This process's readings, by axis, of an `op_graph` of the model `model`
     names, less its engine config, each as `compass trace ops` takes it: its
-    torch and ATOM source (`capture.traced_under`) and the model's config.json;
-    an axis no op_graph depends on is unread, of a kind no entry records."""
+    torch and ATOM source (`capture.traced_under`), which a graph keyed by its
+    files reads as they read here (`capture.source_of`), and the model's
+    config.json; an axis no op_graph depends on is unread, of a kind no entry
+    records."""
     from atom.compass.artifacts import Axis, Row, axes_of
     from atom.compass.capture import traced_under
 
@@ -2884,24 +2889,30 @@ def atom_digest(root: Path | None = None) -> str:
     digest = hashlib.sha256()
     for path in sorted(root.rglob("*.py")):
         relative = path.relative_to(root)
-        if relative == INSTALL_WRITTEN:
-            continue
-        skip = next(
-            (v for k, v in COMPASS_ONLY.items() if relative.is_relative_to(k)), ()
-        )
-        if skip is None:
-            continue
-        lines = path.read_bytes().splitlines(keepends=True)
-        tree = ast.parse(b"".join(lines)) if skip else None
-        doc = tree.body[0] if tree and ast.get_docstring(tree) is not None else None
-        body = tree.body if tree else []
-        for prev, node in reversed(list(zip([None, *body], body))):
-            named = (node, *getattr(node, "targets", ()))
-            names = {getattr(n, "name", getattr(n, "id", None)) for n in named}
-            if node is doc or names & skip:
-                del lines[prev.end_lineno if prev else 0 : node.end_lineno]
-        digest.update(f"{relative}\0".encode() + b"".join(lines))
+        if (text := atom_text(path, relative)) is not None:
+            digest.update(f"{relative}\0".encode() + text)
     return digest.hexdigest()
+
+
+def atom_text(path: Path, relative: Path) -> bytes | None:
+    """The bytes of ATOM's file at `path`, `relative` under its package, as
+    `atom_digest` takes them: less the names `COMPASS_ONLY` leaves out; None
+    for a file it leaves out whole and for `INSTALL_WRITTEN`."""
+    if relative == INSTALL_WRITTEN:
+        return None
+    skip = next((v for k, v in COMPASS_ONLY.items() if relative.is_relative_to(k)), ())
+    if skip is None:
+        return None
+    lines = path.read_bytes().splitlines(keepends=True)
+    tree = ast.parse(b"".join(lines)) if skip else None
+    doc = tree.body[0] if tree and ast.get_docstring(tree) is not None else None
+    body = tree.body if tree else []
+    for prev, node in reversed(list(zip([None, *body], body))):
+        named = (node, *getattr(node, "targets", ()))
+        names = {getattr(n, "name", getattr(n, "id", None)) for n in named}
+        if node is doc or names & skip:
+            del lines[prev.end_lineno if prev else 0 : node.end_lineno]
+    return b"".join(lines)
 
 
 def committed_atom_digest(repo: Path, commit: str) -> str:

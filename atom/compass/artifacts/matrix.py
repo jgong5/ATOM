@@ -120,9 +120,9 @@ INDEPENDENT = Cell(False)
 #: The invalidation matrix, row by row and column by column.
 MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
     Row.OP_GRAPH: {
-        Axis.SOFTWARE_STACK: INDEPENDENT,
+        Axis.SOFTWARE_STACK: Cell(False, "aiter's Python and data: in its files"),
         Axis.TORCH: DEPENDS,
-        Axis.ATOM_SRC: DEPENDS,
+        Axis.ATOM_SRC: Cell(True, "the files its trace ran and read"),
         Axis.MODEL: DEPENDS,
         Axis.DEVICE: INDEPENDENT,
         Axis.PTL: INDEPENDENT,
