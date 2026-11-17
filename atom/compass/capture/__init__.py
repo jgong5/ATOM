@@ -31,8 +31,8 @@ without DP, or under a drafter, it refuses before any trace.
 
 An `op_graph` is keyed by structure (`forward.structure`: the model's
 architecture and config.json digest, `--arch`, the engine config a step law is
-keyed by less its ladder, which holds ATOM's engine arguments and this
-process's performance environment (`run.step_grid.keyed`), the TP width, the DP
+keyed by less its ladder and level (`forward.graph_engine`), which holds ATOM's
+engine arguments and this process's performance environment, the TP width, the DP
 and EP widths when set, the phase, the mode, whether the step produces
 output and whether it is a two-batch-overlap micro-batch), by shape, which
 names the rows a DP group's MoE gathers only off its default, every rank at
