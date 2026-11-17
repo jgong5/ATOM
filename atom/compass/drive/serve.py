@@ -13,7 +13,10 @@ driver assigns the host, 127.0.0.1 unless the command names another, its ports
 and the run file, and
 refuses them, and the clock endpoint flag, among ATOM's arguments; an op graph
 run's file also holds ATOM's arguments, from which its engines trace a shape
-the store lacks (`run.ATOM_ARGS`). Each start
+the store lacks (`run.ATOM_ARGS`). A simulated server whose run file names
+a machine starts under `on_arch`, which imports aiter as on that machine's
+device first, so the server resolves its config, an FP8 quantization's dtype
+among it, as there, whatever device this host has. Each start
 takes a free `ATOM_DP_MASTER_PORT`: the port keys ATOM's compiled-graph cache,
 and the first start that loads that cache autotunes every graph's kernels
 again, whose configs stay loaded and read in `non_torch`. No later start loads
@@ -53,10 +56,12 @@ from atom.compass.backends.step_labels import TRACE
 from atom.compass.drive import jit_cache
 from atom.compass.drive.gpu import KFD, hip_visible, quiet
 from atom.compass.drive.identity import _device, _stack, identity
-from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _write_whole
+from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _machine, _write_whole
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 SERVER = (sys.executable, "-m", "atom.entrypoints.openai.api_server")
+#: What a simulated server runs `SERVER`'s program under, before the arch.
+ON_ARCH = ("-m", "atom.compass.drive.on_arch")
 HOST = "127.0.0.1"
 #: Flags ATOM's arguments may not carry, in either spelling ATOM's parser
 #: accepts or any abbreviation argparse expands: the driver assigns the host,
@@ -80,6 +85,16 @@ TRACE_ENV = {
     "ATOM_PROFILER_PROFILE_MEMORY": "0",
     "ATOM_PROFILER_TIMEOUT": str(TRACE_STOP_S),
 }
+#: The kineto config a trace run's server reads through ``KINETO_CONFIG``,
+#: written in `out`. kineto's ROCm tracer keeps at most ROCTRACER_MAX_EVENTS
+#: rows a process, launch calls and device rows alike, and drops every later
+#: row unmarked; its default of 5,000,000 filled 149 s into a 300 s V4.1-Flash
+#: TP4 trace run (#3106). The largest value the key takes, an int32: a trace
+#: run's rows are held in host memory until its stop. A 120 s V4.1-Flash TP4
+#: trace run then holds about 14.5M rows a rank, and its command leaves about
+#: 11 min after SIGTERM, once it has written and reduced them; `client.sh`
+#: --stop allows a trace run `TRACE_STOP_S` more for that.
+KINETO_FILE, KINETO_CONF = "kineto.conf", "ROCTRACER_MAX_EVENTS=2147483647\n"
 #: As `cctraces_sim.sh` sets it, so a pooling client's idle connection is not
 #: closed under it; before ATOM's arguments, so one there wins.
 KEEP_ALIVE = ("--timeout-keep-alive", "1000000")
@@ -186,7 +201,8 @@ def serve(
     env["ATOM_SHUTDOWN_TIMEOUT_S"] = str(SHUTDOWN_TIMEOUT_S)
     if trace:
         argv += [PROFILER, str(out / TRACE)]
-        env.update(TRACE_ENV)
+        (out / KINETO_FILE).write_text(KINETO_CONF)
+        env.update(TRACE_ENV, KINETO_CONFIG=str((out / KINETO_FILE).absolute()))
     if run is None:
         env["HIP_VISIBLE_DEVICES"] = hip_visible(gpus)
         env |= log_more(atom_args)
@@ -201,6 +217,8 @@ def serve(
             run = {**run, "out_dir": str(out), "clock_endpoint": endpoint}
         run_file.write_text(json.dumps(run))
         argv += ["--compass-run", str(run_file)]
+        if "machine" in run:
+            argv[1:1] = [*ON_ARCH, _machine(run).value("device.arch")]
         ready |= {"clock_endpoint": run["clock_endpoint"], "run_file": str(run_file)}
     with held, _stop_signals() as stopped, quiet(gpus, out) if gpus else nullcontext():
         kfd = _kfd() if gpus else None
@@ -276,18 +294,23 @@ def _model(atom_args) -> str:
     return model
 
 
-def log_more(atom_args) -> dict:
-    """`LOG_MORE` when ATOM's arguments run DP and TP both above 1, else
-    nothing, so any other start logs in the format its environment gives.
-    Under DP attention ATOM makes each TP rank a DP rank and runs TP 1."""
+def widths(atom_args) -> argparse.Namespace:
+    """The TP and DP sizes ATOM's arguments state, and whether they run DP
+    attention, under which ATOM makes each TP rank a DP rank and runs TP 1."""
     parser = FlexibleArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
     parser.add_argument("--data-parallel-size", "-dp", type=int, default=1)
     parser.add_argument("--enable-dp-attention", action="store_true")
-    widths = parser.parse_known_args(atom_args)[0]
-    if widths.enable_dp_attention:
+    return parser.parse_known_args(atom_args)[0]
+
+
+def log_more(atom_args) -> dict:
+    """`LOG_MORE` when ATOM's arguments run DP and TP both above 1, else
+    nothing, so any other start logs in the format its environment gives."""
+    stated = widths(atom_args)
+    if stated.enable_dp_attention:
         return {}
-    if widths.tensor_parallel_size > 1 and widths.data_parallel_size > 1:
+    if stated.tensor_parallel_size > 1 and stated.data_parallel_size > 1:
         return LOG_MORE
     return {}
 
@@ -373,7 +396,8 @@ def _stop(group: int, kfd=None) -> None:
     """SIGTERM the process group `group`; SIGKILL what is left after
     `STOP_GRACE_S`. Given `kfd`, the processes KFD listed before the server
     started, the group has left only once KFD lists none it did not, as it
-    lists an exited process until it has freed its GPU memory. KFD names a
+    lists an exited process until the driver releases it; its memory can
+    read as used a while longer, while the driver clears it. KFD names a
     process by a PID a container's /proc may not show, so no PID is mapped:
     another tenant's process that opened a GPU since holds the stop as long."""
     for sig in (signal.SIGTERM, signal.SIGKILL):

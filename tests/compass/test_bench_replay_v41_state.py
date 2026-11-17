@@ -297,6 +297,37 @@ def test_a_v41_cached_prefill_reads_its_history_through_its_pool_once_a_slot(
     assert record["footprint_bytes"] == 7 * 16 * rows + 7 * pages + 4 * ring
 
 
+def test_a_v41_replay_tail_wider_than_its_forward_reads_no_ring_row(probed):
+    """The same prefill's bounded-replay tail laid out 48 rows wide, as ATOM
+    lays one out a window a request: its leaf, of the tail's 48 rows, past the
+    forward's 32, reads no ring row, each window starting at the tail."""
+    _, seen = probed
+    placed = seen["ops_v41_wide_tail"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    assert record["footprint_bytes"] == 7 * 16 * 48 + 7 * placed["read"]
+
+
+@pytest.mark.parametrize("ratio", [2, 0])
+def test_a_v41_fp8_pool_s_values_and_scales_bind_the_columns_atom_passes(
+    probed, ratio
+):
+    """V4.1's FP8 pool, rows of 512 E4M3 values then 16 E8M0 scales, taken as
+    the ring case above takes the BF16 one, each view as its values and its
+    scales: all four bind the bench's pool at the bytes ATOM passes there, the
+    scales past the values, the ring's at its rows, and count a row's 528
+    bytes where the BF16 pool's count its row's."""
+    _, seen = probed
+    placed = seen[f"ops_v41_fp8_{ratio}"]
+    [record] = placed["got"]
+    assert placed["refused"] is None and record["placements"] == 7
+    pool = ["attn_metadata_builder.cache.pool", 0]
+    views = ("pool", "pool_scale", "ring", "ring_scale")
+    assert placed["bound"] == dict.fromkeys(views, pool)
+    ring, pages = placed["ring"], placed["read"] - placed["ring"]
+    assert record["footprint_bytes"] == 7 * 32 + 7 * pages + 4 * ring
+
+
 #: The bench tensor each KV view `v41_state_probe.kv_bound` takes binds.
 BOUND = {
     "pages": "pages.buf.torch.bfloat16",

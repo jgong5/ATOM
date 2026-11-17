@@ -55,8 +55,10 @@ from atom.compass.artifacts import (
     Kind,
     Row,
     Topology,
-    machine_spec_digest,
+    keyed_platform,
+    machine_platform,
     member_name,
+    platform_of,
 )
 from atom.compass.drive import aiter_jit, gpu, jit_cache, measure_memory, serve
 from atom.compass.drive.gpu import GpuRefusal
@@ -67,6 +69,7 @@ from atom.compass.run import memory
 from atom.compass.spec import MachineSpec, SpecRefusal
 
 MACHINE = MachineSpec.from_mapping(copy.deepcopy(DOCUMENT))
+PLATFORM = machine_platform(MACHINE)
 #: One TP2 rank's readings beside `READINGS[2]`: a rank need not read as another.
 RANK1 = dict(READINGS[2], persistent_forward_buffer_bytes=125_000_000)
 #: GPU 5 as rocm-smi names it on the suite's machine document's device.
@@ -102,7 +105,7 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
     r = tp2(tmp_path)
     record = started(tmp_path / "out", r.config, [READINGS[2], RANK1])
 
-    measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c")
+    measure_memory.publish(tmp_path / "out", PLATFORM, tmp_path / "store", "c")
 
     for rank, held in enumerate([READINGS[2], RANK1]):
         read = memory.load(tmp_path / "store", r.config, MACHINE, rank)
@@ -111,9 +114,8 @@ def test_each_rank_reads_its_own_member_of_the_entry_measure_memory_publishes(tm
             record,
         )
     copy_ = json.loads((tmp_path / "out" / "memory_readings.json").read_text())
-    assert copy_["key"]["tp"] == 2 and copy_["key"]["machine_spec"] == (
-        machine_spec_digest(MACHINE)
-    )
+    assert copy_["key"]["tp"] == 2
+    assert copy_["key"]["software_stack"] == machine_platform(MACHINE)["software_stack"]
     assert len(copy_["members"]) == 2
 
 
@@ -168,9 +170,7 @@ def a_start(tmp_path, monkeypatch, stack):
     monkeypatch.setattr(measure_memory, "hip_visible", {(5,): "2"}.get)
     monkeypatch.setattr(measure_memory, "_stack", lambda: stack)
     monkeypatch.setattr(measure_memory, "identity", lambda *a: {"stack": stack})
-    machine = tmp_path / "machine.json"
-    machine.write_text(json.dumps(DOCUMENT))
-    flags = ["--gpu", "5", "--machine", str(machine), "--store", str(tmp_path / "s")]
+    flags = ["--gpu", "5", "--store", str(tmp_path / "s")]
     return r, [*flags, "--out", str(out), "--", "--model", r.config.model]
 
 
@@ -234,14 +234,14 @@ def test_a_start_at_dp_and_tp_above_1_logs_each_line_s_process(
         runners_logged(tmp_path / "out" / measure_memory.LOG, tmp_path / "cache")
 
 
-def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypatch):
+def test_the_command_publishes_under_the_stack_its_start_runs(tmp_path, monkeypatch):
     r, argv = a_start(tmp_path, monkeypatch, STACK)
 
     measure_memory.main(argv)
 
     key = Key.of(
         Kind.MEMORY_READINGS,
-        machine_spec=machine_spec_digest(MACHINE),
+        **keyed_platform(Kind.MEMORY_READINGS, machine_platform(MACHINE)),
         **memory.key_fields(r.config),
     )
     cells = dict(
@@ -253,25 +253,11 @@ def test_the_command_publishes_under_the_stack_the_spec_pins(tmp_path, monkeypat
     assert json.loads((tmp_path / "out" / "run.json").read_text()) == {"stack": STACK}
 
 
-@pytest.mark.parametrize(
-    "gpus, asked, cards",
-    [
-        ("5", (5,), [dict(MI355X, name="MI308X", arch="gfx942")]),
-        (
-            "4,5",
-            (4, 5),
-            [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")],
-        ),
-    ],
-)
-def test_a_start_on_another_device_than_the_spec_states_refuses_naming_both(
-    tmp_path, monkeypatch, gpus, asked, cards
-):
+def test_a_start_on_cards_of_two_devices_refuses_naming_both(tmp_path, monkeypatch):
     # Only the GPUs `--gpu` names have cards; asking about any others raises.
-    monkeypatch.setattr(measure_memory, "_device", {asked: cards}.__getitem__)
-    machine = tmp_path / "machine.json"
-    machine.write_text(json.dumps(DOCUMENT))
-    flags = ["--gpu", gpus, "--machine", str(machine), "--store", str(tmp_path / "s")]
+    cards = [dict(MI355X, index=4), dict(MI355X, name="MI308X", arch="gfx942")]
+    monkeypatch.setattr(measure_memory, "_device", {(4, 5): cards}.__getitem__)
+    flags = ["--gpu", "4,5", "--store", str(tmp_path / "s")]
 
     with pytest.raises(ValueError) as refused:
         measure_memory.main(
@@ -279,28 +265,29 @@ def test_a_start_on_another_device_than_the_spec_states_refuses_naming_both(
         )
 
     assert str(refused.value) == (
-        f"GPU 5 is MI308X gfx942, and {machine} states MI355X gfx950; "
-        "name the machine spec of the device the start runs on"
+        "the cards are MI308X gfx942 and MI355X gfx950; start on one device"
     )
     assert not (tmp_path / "out").exists() and not (tmp_path / "s").exists()
 
 
-def test_a_start_under_another_stack_than_the_spec_pins_refuses_before_it_starts(
+def test_a_start_publishes_under_the_device_ptl_and_stack_its_cards_read(
     tmp_path, monkeypatch
 ):
     other = dict(STACK, aiter="9205e1059", torch="2.9.1")
-    _, argv = a_start(tmp_path, monkeypatch, other)
+    r, argv = a_start(tmp_path, monkeypatch, other)
+    mi308x = dict(MI355X, name="MI308X", arch="gfx942")
+    monkeypatch.setattr(measure_memory, "_device", lambda gpus: [mi308x])
+    monkeypatch.setattr(measure_memory, "_ptl", lambda gpus: "enabled")
 
-    with pytest.raises(ValueError) as refused:
-        measure_memory.main(argv)
+    measure_memory.main(argv)
 
-    assert str(refused.value) == (
-        "the start runs another stack than the machine spec mi355x-8gpu-2node "
-        "pins: aiter '9205e1059' in the start and 'f4e7c7509' in the spec; "
-        "torch '2.9.1' in the start and '2.10.0' in the spec"
+    platform = platform_of("MI308X gfx942", other, "enabled")
+    key = Key.of(
+        Kind.MEMORY_READINGS,
+        **keyed_platform(Kind.MEMORY_READINGS, platform),
+        **memory.key_fields(r.config),
     )
-    assert not (tmp_path / "hip").exists(), "the engine started"
-    assert not (tmp_path / "out").exists() and not (tmp_path / "s").exists()
+    assert ArtifactStore(tmp_path / "s").directory_for(key).is_dir()
 
 
 def test_the_engine_session_starts_the_command_beside_before_the_engine(
@@ -780,7 +767,7 @@ def test_ranks_whose_reserves_spread_past_the_limit_publish_nothing(tmp_path):
     started(tmp_path / "out", r.config, [READINGS[2], crowded])
 
     with pytest.raises(SpecRefusal, match="spread"):
-        measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c")
+        measure_memory.publish(tmp_path / "out", PLATFORM, tmp_path / "store", "c")
     assert not (tmp_path / "store").exists()
 
 
@@ -793,14 +780,14 @@ def test_ranks_that_read_two_configurations_publish_nothing(tmp_path):
     one.write_text(json.dumps(held))
 
     with pytest.raises(ValueError, match="the ranks read 2 keys"):
-        measure_memory.publish(tmp_path / "out", MACHINE, tmp_path / "store", "c")
+        measure_memory.publish(tmp_path / "out", PLATFORM, tmp_path / "store", "c")
 
 
 def test_a_key_stating_another_layout_than_its_members_publishes_nothing(tmp_path):
     key = Key.of(
         Kind.MEMORY_READINGS,
         model="sha256:" + "a" * 64,
-        machine_spec=machine_spec_digest(MACHINE),
+        **keyed_platform(Kind.MEMORY_READINGS, machine_platform(MACHINE)),
         dp=1,
         pp=1,
         pcp=1,
@@ -829,13 +816,107 @@ def test_a_key_stating_another_layout_than_its_members_publishes_nothing(tmp_pat
     "flag", ["--load_dummy", "--load-dummy=random", "--load_d", "--load-dum"]
 )
 def test_dummy_weights_are_refused(tmp_path, flag, capsys):
-    argv = ["measure", "memory", "--gpu", "0", "--machine", "m", "--store", "s"]
+    argv = ["measure", "memory", "--gpu", "0", "--store", "s"]
     with pytest.raises(SystemExit) as refused:
         cli.main([*argv, "--out", str(tmp_path), "--", "--model", "x", flag])
     assert "dummy weights are not yet shown to read as a real load" in str(
         refused.value
     )
     assert not any(tmp_path.iterdir())
+
+
+#: ATOM's arguments for an engine start, each read by `EngineArgs`.
+ENGINE_ARGV = ["--model", "m", "-tp", "4", "--kv_cache_dtype", "fp8"]
+
+
+def built_from(argv, monkeypatch):
+    """The model and keywords `measure_memory.start` builds its engine from,
+    given ATOM's arguments `argv`; the engine is a stand-in that starts nothing."""
+    from atom.model_engine import llm_engine
+
+    built = []
+
+    class Engine:
+        def __init__(self, model, **kwargs):
+            built.append((model, kwargs))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(llm_engine, "LLMEngine", Engine)
+    measure_memory.start(argv)
+    return built
+
+
+def test_a_start_takes_the_server_flags_record_passes_and_builds_without_them(
+    monkeypatch,
+):
+    from atom.entrypoints.openai import api_server
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    class Parsing(Exception):
+        pass
+
+    def parse_args(parser, *args, **kwargs):
+        raise Parsing(parser)
+
+    with monkeypatch.context() as m, pytest.raises(Parsing) as server:
+        m.setattr(FlexibleArgumentParser, "parse_args", parse_args)
+        api_server.main()
+    engine = EngineArgs.add_cli_args(FlexibleArgumentParser())._actions
+    frontend = [
+        [a.option_strings[0], *(["1"] if a.nargs != 0 else [])]
+        for a in server.value.args[0]._actions
+        if a.dest not in {e.dest for e in engine}
+        and set(a.option_strings).isdisjoint(serve.OWNED)
+    ]
+    assert ["--default-chat-template-kwargs", "1"] in frontend
+    served = ENGINE_ARGV + [arg for flag in frontend for arg in flag]
+    assert built_from(served, monkeypatch) == built_from(ENGINE_ARGV, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "flag", [["--max-num-sqes", "8"], ["--compass-run", "run.json"]]
+)
+def test_a_start_refuses_a_flag_neither_the_engine_nor_record_takes(
+    flag, monkeypatch, capsys
+):
+    with pytest.raises(SystemExit):
+        built_from(ENGINE_ARGV + flag, monkeypatch)
+    assert f"unrecognized arguments: {' '.join(flag)}" in capsys.readouterr().err
+
+
+def test_frontend_is_the_server_flags_record_passes_each_parsed_as_the_server_does(
+    monkeypatch,
+):
+    from atom.entrypoints.openai import api_server
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    class Parsing(Exception):
+        pass
+
+    def parse_args(parser, *args, **kwargs):
+        raise Parsing(parser)
+
+    with monkeypatch.context() as m, pytest.raises(Parsing) as server:
+        m.setattr(FlexibleArgumentParser, "parse_args", parse_args)
+        api_server.main()
+    engine = EngineArgs.add_cli_args(FlexibleArgumentParser())._actions
+    frontend = FlexibleArgumentParser(add_help=False)
+    for flag, kind in measure_memory.FRONTEND.items():
+        frontend.add_argument(flag, **kind)
+
+    def kinds(actions):
+        return {(a.option_strings[0], a.nargs, a.type or str) for a in actions}
+
+    assert kinds(frontend._actions) == kinds(
+        a
+        for a in server.value.args[0]._actions
+        if a.dest not in {e.dest for e in engine}
+        and set(a.option_strings).isdisjoint(serve.OWNED)
+    )
 
 
 # --- a run reading its configuration's entry ---------------------------------
@@ -884,8 +965,7 @@ def test_the_run_takes_its_readings_off_the_entry(tmp_path, monkeypatch):
 
 # --- the named result: an entry gives what the spec gave ---------------------
 
-#: Qwen3.8-27B at TP1 on node 18's MI308X, as one start read it
-#: (`scripts/compass/mi308x_spec.py`), as a rank's member.
+#: Qwen3.8-27B at TP1 on node 18's MI308X, as one start read it, as a rank's member.
 MI308X_READINGS = {
     "capacity_bytes": 206_141_652_992,
     "driver_and_collective_reserve_bytes": 1_249_902_592,
@@ -908,7 +988,7 @@ FROM_THE_SPEC = {
 
 
 def test_the_mi308x_entry_gives_the_readings_its_spec_gave():
-    path = CONFIG_JSON.parents[2] / "scripts/compass/machines/mi308x-hjbog18.json"
+    path = CONFIG_JSON.parents[2] / "tests/compass/machines/mi308x-hjbog18.json"
     spec = MachineSpec.from_mapping(json.loads(path.read_text()))
     entry = MemoryReadings.from_member(MI308X_READINGS, "memory_readings mi308x")
     model = ModelTerms.from_tree(

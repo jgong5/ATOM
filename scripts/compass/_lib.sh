@@ -263,25 +263,48 @@ compass_pytest_counts() {
 }
 
 # compass_gpu_arch CARD: the GPU target of HIP ordinal CARD as torch reads it
-# (gfx942, gfx950), or nothing. The GPU gate keeps one baseline per target.
+# (gfx942, gfx950, gfx1250), or nothing. The GPU gate keeps one baseline per target.
 compass_gpu_arch() {
     HIP_VISIBLE_DEVICES=$1 python -c 'import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])' 2>/dev/null
 }
 
-# compass_gpu_skips DEVICE: sets SKIP_ARGS to an --ignore for each file
-# gpu_gate_skip.txt leaves out on DEVICE, torch's name for the first card, and
+# compass_gpu_skips TARGET: sets SKIP_ARGS to an --ignore for each file
+# gpu_gate_skip.txt leaves out on GPU target TARGET, the first card's, and
 # SKIP_N to the tests those files collect, run from the tree being measured. A
-# file it cannot count fails, SKIP_WHY naming it.
+# file under tests/compass goes to COMPASS_LEFT instead, uncounted: the gate
+# counts what tests/compass passes on the tree. The line `TARGET driver-run`
+# sets NO_DRIVER_RUN. A file it cannot count fails, SKIP_WHY naming it.
 compass_gpu_skips() {
     local gpu file n
-    SKIP_ARGS=() SKIP_N=0
+    SKIP_ARGS=() SKIP_N=0 COMPASS_LEFT=() NO_DRIVER_RUN=
     while read -r gpu file; do
-        [[ -n $1 && $1 == *"$gpu"* && -e $file ]] || continue
+        [ "$gpu" = "$1" ] || continue
+        if [ "$file" = driver-run ]; then
+            printf 'driver-run inputs: none on %s\n' "$gpu"
+            NO_DRIVER_RUN=1
+            continue
+        fi
+        [ -e "$file" ] || continue
+        if [[ $file == tests/compass/* ]]; then
+            printf 'left out on %s: %s\n' "$gpu" "$file"
+            COMPASS_LEFT+=("$file")
+            continue
+        fi
         n=$(python -m pytest "$file" --collect-only -q -p no:cacheprovider 2>&1 | sed -nE 's/^([0-9]+) tests? collected.*/\1/p')
         [ -n "$n" ] || { SKIP_WHY="cannot count the tests of $file, which gpu_gate_skip.txt leaves out on $gpu"; return 1; }
         printf 'left out on %s: %s (%s tests)\n' "$gpu" "$file" "$n"
         SKIP_ARGS+=("--ignore=$file") SKIP_N=$((SKIP_N + n))
     done < <(grep -vE '^[[:space:]]*(#|$)' "$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_skip.txt")
+}
+
+# compass_cargo_lock MESH: copies into atomesh's directory MESH, unless it has
+# one, the lockfile the image built atomesh with (COMPASS_CARGO_LOCK, default
+# /app/ATOM/atom/mesh/Cargo.lock). The tree ignores Cargo.lock, and offline
+# cargo resolves atomesh's crates only under the lockfile the container's crate
+# cache was fetched for. Both gates call it before their cargo runs.
+compass_cargo_lock() {
+    local lock=${COMPASS_CARGO_LOCK:-/app/ATOM/atom/mesh/Cargo.lock}
+    [ -e "$1/Cargo.lock" ] || [ ! -r "$lock" ] || cp "$lock" "$1/Cargo.lock"
 }
 
 # compass_held_port [N]: the first of N ports in a row (default 1), each one
@@ -322,6 +345,17 @@ if not os.fork():
 # the bound to a year.
 COMPASS_SIM_REQUEST_TIMEOUT_S=31536000
 
+# compass_on_arch RUN_FILE: the words ahead of `-m MODULE` that start a simulated
+# server under on_arch on RUN_FILE's machine's arch, as `compass run` starts its
+# own (atom/compass/drive/serve.py); none when RUN_FILE names no machine.
+compass_on_arch() {
+    python3 -c 'import json, sys
+from atom.compass.drive.serve import ON_ARCH
+from atom.compass.run import _machine
+run = json.load(open(sys.argv[1]))
+"machine" in run and print(*ON_ARCH, _machine(run).value("device.arch"))' "$1"
+}
+
 # compass_wait_up WHAT PID URL: return once URL answers; exit 1 if PID exits
 # first or WAIT_S seconds pass.
 compass_wait_up() {
@@ -350,4 +384,21 @@ compass_gpus() {
             }
             print out
         }' || { echo "compass_gpus: rocm-smi --showhw does not map every GPU of $2 to its own KFD node" >&2; return 1; }
+}
+
+# compass_machine FILE: write to FILE the machine spec `compass run --device
+# DEVICE --ptl PTL [--stack STACK]` composes, the platform_readings entry read
+# from the store READINGS, for a run file's `machine` block. Exits when DEVICE,
+# PTL or READINGS is unset.
+compass_machine() {
+    python3 -c 'import json, sys
+from atom.compass.artifacts import ArtifactStore
+from atom.compass.fit.device import compose
+device, ptl, readings, stack, out = sys.argv[1:]
+spec = compose(device, ArtifactStore(readings), ptl, stack or None)
+open(out, "w").write(json.dumps(spec.echo()))' \
+        "${DEVICE:?DEVICE names the datasheet of the GPUs, by SKU or path}" \
+        "${PTL:?PTL names their PTL state, enabled or disabled}" \
+        "${READINGS:?READINGS names a store holding their platform_readings}" \
+        "${STACK:-}" "$1"
 }

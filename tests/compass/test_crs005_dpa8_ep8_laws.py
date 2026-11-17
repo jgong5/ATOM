@@ -7,21 +7,21 @@ the requests it holds. The prefill law prices its side's rung-2 decode, which no
 of its records holds, by the decode law's rung-2 vector, declared.
 """
 
-import json
 from pathlib import Path
 
 import pytest
 from test_crs005_dpa8_laws import decode_step
 
 from atom.compass.backends import Method, StepLinearBackend, StepLinearLaw
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.step_linear import EXTRAPOLATED
 
 LAWS = Path(__file__).resolve().parents[2] / "scripts" / "compass" / "laws"
 
 
 def law(side: str) -> dict:
-    name = f"deepseek-v4-pro-dpa8-ep8-mi355x-crs005-{side}.json"
-    return json.loads((LAWS / name).read_text())
+    name = f"deepseek-v4-pro-dpa8-ep8-mi355x-crs005-{side}.json.xz"
+    return read_json(LAWS / name)
 
 
 #: (rung, the group's MoE tokens, each row's context): per rung, the recorded

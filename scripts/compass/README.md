@@ -12,7 +12,8 @@ on, because until 2026-09-20 it was not — see "Which tree a script acts on" be
 
 New to Compass? [QUICKSTART.md](QUICKSTART.md) takes a model from an empty store
 to a simulation graded against real runs, and `smoke_cell.sh` runs that path in
-about an hour. `calibrate.sh OUT RECORD...` takes its calibration in one command,
+about an hour. [ADVICE.md](ADVICE.md) takes a user from a space file of
+configurations through `compass advice` to the one it recommends. `calibrate.sh OUT RECORD...` takes its calibration in one command,
 from the warm record to the fits, and resumes a stopped run; its variables are in
 its header.
 
@@ -22,8 +23,8 @@ its header.
 | Script | Where | What |
 |---|---|---|
 | `gate_cpu.sh` | CPU container | The CPU gate, run per task: every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, no driver **as a batch**: run alone, a file in it can still reach `rocminfo` (`tests/test_postprocess_width.py` did, through `atom.model_engine.model_runner`'s `from aiter import …`, measured on node 18 at `bdd244c57` while it was in the gate). `tests/compass` runs as `COMPASS_GATE_SHARDS` (default 4) pytest processes beside the rest of `tests/`, each printing its own summary, and shard k writing a caller's `--junitxml` or `--basetemp` path with `.shard<k>` appended; `0` runs one process. **Must be green.** Also exits 98 when the diff is in the blind spot below and the GPU gate has not run on *this* tree. Refuses a caller-supplied `-r`. |
-| `gate_gpu.sh` | GPU container | The GPU gate, run per wave — and per task for a blind-spot diff. Superset (`--ignore=tests/plugin`), less any file `gpu_gate_skip.txt` names for the first card's GPU, judged as a **delta** against the baseline of the first card's GPU target in `gpu_gate_baselines/<target>/gpu_gate_baseline.env`, with torch, HIP, ROCm and AITER recorded and compared. The failing node-ids are on file in `gpu_gate_known_failures.txt` beside it and compared **by name**. Calls `preflight.sh` itself, before and after. Runs the driver-run tests once, with the inputs it sets (see "The driver-run tests and their inputs" below). |
-| `preflight.sh` | GPU container | `rocminfo` reachability, compute use and VRAM use (checks 1–3), plus a D-state census (check 0), and a list of bookable devices. Run **before and after**. The census states its own scope: in a container it can only see this PID namespace, and says so rather than reporting a clear node. Also worth running for a CPU-only task that imports ATOM's model layer: `import aiter` runs `rocminfo`, and so does any module that imports aiter at load time (`atom.model_engine.model_runner`, `atom.model_ops.linear`), so on a wedged node that import hangs. A bare `import atom` and `atom.compass` run no `rocminfo` and load no torch; `atom.config`, `atom.model_engine.llm_engine` and `atom.entrypoints.openai_server` load torch but run no `rocminfo`. Measured on node 18, 2026-09-23. |
+| `gate_gpu.sh` | GPU container | The GPU gate, run per wave — and per task for a blind-spot diff. Superset (`--ignore=tests/plugin`), less any file `gpu_gate_skip.txt` names for the first card's GPU target, judged as a **delta** against the baseline of the first card's GPU target in `gpu_gate_baselines/<target>/gpu_gate_baseline.env`, with torch, HIP, ROCm and AITER recorded and compared. The failing node-ids are on file in `gpu_gate_known_failures.txt` beside it and compared **by name**. Calls `preflight.sh` itself, before and after. Runs the driver-run tests once, with the inputs it sets (see "The driver-run tests and their inputs" below). |
+| `preflight.sh` | GPU container | `rocminfo` reachability, compute use and VRAM use (checks 1–3), plus a D-state census (check 0), and a list of bookable devices. A gfx1250 card (MI455) reads 100% use with no process on it, so there a queue on the card (`rocm-smi --showpidgpus`) stands for compute use. Run **before and after**. The census states its own scope: in a container it can only see this PID namespace, and says so rather than reporting a clear node. Also worth running for a CPU-only task that imports ATOM's model layer: `import aiter` runs `rocminfo`, and so does any module that imports aiter at load time (`atom.model_engine.model_runner`, `atom.model_ops.linear`), so on a wedged node that import hangs. A bare `import atom` and `atom.compass` run no `rocminfo` and load no torch; `atom.config`, `atom.model_engine.llm_engine` and `atom.entrypoints.openai_server` load torch but run no `rocminfo`. Measured on node 18, 2026-09-23. |
 | `regen_cpu_gate_exclude.sh` | CPU container | Regenerate the **GENERATED** section of the exclusion list by iterating `--collect-only` to a fixed point (three passes at `83daf636d`: 37 errors, 1, clean). Preserves the MANUAL section verbatim. |
 | `regen_gpu_gate_triggers.sh` | CPU container | Re-derive `gpu_gate_triggers.txt` from the exclusion list and the tree. Run after **any** change to `cpu_gate_exclude.txt` — the two files are derived from the same tree and are wrong separately. Writes the whole file, **header counts included**; nothing in it is maintained by hand. |
 | `regen_gpu_gate_baseline.sh` | GPU container | Re-measure the GPU gate's baseline when `gate_gpu.sh` warns that the toolchain differs from it (a new image, a torch, HIP or AITER bump, another GPU): `git archive --prefix=ATOM/ -o BASE.tar <commit>` where the repository is, then `HIP_VISIBLE_DEVICES=<gpu> scripts/compass/regen_gpu_gate_baseline.sh BASE.tar`. Runs the suite `gate_gpu.sh` runs on its first card (outside `tests/plugin` and `tests/compass`) twice, each over a fresh extraction of the tarball, and rewrites `gpu_gate_baseline.env` and `gpu_gate_known_failures.txt` in `gpu_gate_baselines/<target>/` for the card's GPU target, leaving out what `gpu_gate_skip.txt` leaves out on it (`BASE_LEFT_OUT`). Writes nothing when the two runs pass different counts or fail different node-ids (exit 97, naming each node-id one run alone failed), when a run errors or does not complete (1), when torch, HIP or AITER reads `UNKNOWN` or torch reads no GPU target for the card (96), when pre-flight fails before or after (91), or when the tarball names no commit (94). |
@@ -33,21 +34,16 @@ its header.
 | `deploy.sh` | GPU container; with `--on`, one per node | A prefill-decode deployment with `atomesh` between its instances: simulated, one `compass run` per instance, joined to the clock authority the script starts, or real, one `compass record` per instance. `--on` starts the decode instance on another node through a command prefix (`ssh <host>`, `srun -w <host> ...`, or `spur exec <job> docker exec ...` as [the 005/013 pair](#a-1p1d-deployment-across-crsuse2-m2m-v3-005-and--013) runs it). Simulated with `--dp-aware` among the router's arguments, the router is the run's router LP, and `ATOMESH` must name an `atomesh` built from the tree being run (`cargo build --release` in `atom/mesh`); one built from other router source, as the containers' `/usr/local/bin/atomesh` is, is refused. A client drives it through `OUT/server.json` as it drives one server. Its usage is in its header. |
 | `parity_one_node.sh` | GPU container, two devices (eight for `CONFIG=dsv4-dpa8`) | The scheduling-parity test: one workload (`python -m atom.compass.parity.traffic`) on a real `-tp 2 --enable-dp-attention` server (`CONFIG=tp2-plain`: `-tp 2` alone; `CONFIG=dsv4-dpa8`: DeepSeek-V4-Pro's nightly `-tp 8 --enable-dp-attention --enable-tbo` server; `CONFIG=pp2`: `-tp 1 -pp 2`, each stage replayed from and compared on its own record) with the step record on, then on a simulated one whose steps each end when the real one's did (`atom/compass/parity/replay.py`; `step_stub` prices their device time into the cost record only), and `python -m atom.compass.parity` over the two records. With `STORE` unset it first runs `compass measure memory` on the real run's GPUs, flags and environment into `OUT_DIR/store`, under `LMCACHE=1` with an lmcache server of its own beside it, and the simulated run reads that store. The last lines are the real run's admission (send to response headers: minimum, median, maximum) and, per DP rank, the steps compared, the steps identical and the first divergence. Its variables are in its header. |
 | `PYTHONPATH=$T python -m atom.compass.detect.scenario` | either | The acceptance checks every simulated deployment's runs are held to, over the out_dirs of one run file run under different `PYTHONHASHSEED`: each run reached its finish with no refusal, the step tables are byte-identical, and each channel's messages were released to their receiver once each and none behind its clock. With `--record LP=DIR`, an engine LP's TAR rows must equal the timeline a constant step stub implies, computed from the parity record in `DIR` (`pd_sim.sh` writes one per side when `ATOM_COMPASS_PARITY_RECORD` is set). Prints each failure and exits 1. The vertical, DP, PD and PD-DP slices in `tests/compass/` hold their runs to it, with the traffic's outputs too. |
-| `mi308x_spec.py` | any container with `atom` | `python3 scripts/compass/mi308x_spec.py`: rebuild `machines/mi308x-hjbog18.json`, the node-18 MI308X machine spec, from the device, capacity and stack of one real engine start, the PP carriers `pp_carriers.py` fitted on two of the host's GPUs (`PP`, which names the fit's commit and its record's sha256) and, on node 18, the attainable peaks `probe_device.py` read (`PEAKS`, which names the probe's commit and its record's sha256), each recorded in the script; with `COMPASS_MACHINE=mi308x-hjbog39`, the same for hjbog-srdc-39 into `machines/mi308x-hjbog39.json`. Prints `validate`'s verdict and `explain`'s fields grouped by origin; on either host a value no probe fills reads `assumed`. |
-| `pp_carriers.py` | GPU container, two devices of one node | `HIP_VISIBLE_DEVICES=a,b torchrun --nproc-per-node 2 scripts/compass/pp_carriers.py OUT`: send one message per size between the two devices over RCCL and gloo, the receive posted first and late, and fit each carrier's eager threshold, overhead, latency, per-byte time and rendezvous fixed part, and how late a gloo sender blocked before the receive is posted goes on (`wake_s`, `wake_rise_s`). Writes OUT, a JSON record of the fit, its error spread, every sample, and the text of the script and of `atom/compass/drive/pp_probe.py`, which holds the probe and the fit. `python3 scripts/compass/pp_carriers.py OUT RECORD...` fits several such records' samples pooled and names each record's sha256 in place of the samples: one probe's wake moves from run to run. `mi308x_spec.py`'s `PP` states a fit and cites its record. Check the two devices are idle before and after. |
-| `probe_device.py` | GPU container, two idle devices of one node | `HIP_VISIBLE_DEVICES=a,b python3 scripts/compass/probe_device.py SPEC OUT`: time the best BF16 and FP8 GEMM rate over a grid of large shapes, and the MXFP4 one through each of hipBLASLt and aiter that runs on the device where SPEC states `fp4_flops` (one that fails is named with its error; with neither it refuses), and each format through a Triton GEMM at the tile that ran fastest at the first shape within 1% of torch's output, read-only, write-only and copy sweeps from 4 KiB to 4 GiB moved, an empty kernel replayed in a graph, a peer copy and a peer ping-pong between the two devices, and print the fragment they make on the machine file SPEC: each format's derate, the bandwidth curve and `memory.derate`, `kernel_floor_s`, the intra-node link's latency and derate, the banded ones with their p10 and p90. Refuses a device that holds VRAM or another process's memory as KFD charges it (a gfx1250 card reads 100% busy with none), or whose `ptl_enable` is not SPEC's `device.ptl`. Writes OUT, the record of the stack it ran on (ROCm, aiter's commit, RCCL and torch), the capacity torch reads, every sample and the text of the script and of `atom/compass/drive/device_probe.py`, which holds its probes; a spec script's `PEAKS` states the readings and cites its sha256. Check the two devices are idle after. |
-| `http_intake.py` | GPU container, one real server | `HTTP_INTAKE=STAMPS REAL=1 CONCURRENCY=256 SESSIONS=256 AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0" scripts/compass/cctraces_sim.sh RUN_FILE OUT`, aiperf stopped once the first turns are in, then `python3 scripts/compass/http_intake.py fit STAMPS`: the real server runs under the probe, which stamps each request body its event loop reads and each chat template it renders, and the fit prints the burst's `fixed_s` and `per_byte_s`, a `host` law entry's `http_intake` terms. While the server runs, the stamps are in a file in its temp directory, which `STAMPS.<pid>.local` names; its stop, its exit or a SIGTERM, appends them to STAMPS, the verbs refuse STAMPS until then, and a temp directory on NFS or CIFS refuses. A server that died first leaves the `.local` file, naming a path inside its container: while that container runs, `podman cp` the file out, append it to STAMPS and delete the `.local` file. A tmpfs `/tmp`, as QUICKSTART's container mounts, goes with the container's stop, and the run is taken again. A first-turn burst's bodies, short on messages, understate the per-byte rate, so gpu-40's law files state the one `python3 scripts/compass/http_intake.py lone STAMPS PASSES` read over a lone run of a served DeepSeek-V4.1-Flash cell's own bodies to a server under the probe ([#2681](https://github.com/jgong5/ATOM/issues/2681)): the bodies sent one at a time, each once the one before has been read to its end, in PASSES passes of as many bodies each, the stamps cut to that phase; it prints the per-byte rate, the median over passes of each pass's Theil-Sen slope, with p10, p90 and the sha256, and `python3 scripts/compass/http_intake.py fit STAMPS 256 PER_BYTE_S` prints a burst's `fixed_s` at that rate, its span kept; those laws' `fixed_s` and `idle_s` are taken at that rate. Check the GPUs are idle before and after. The law files' `host.hops.admission_s` is the transport floor, 0.54 ms on node 18: on one idle GPU, `python3 scripts/compass/http_intake.py serve STAMPS --model /root/models/Qwen3.8-27B --host 127.0.0.1 --server-port PORT -tp 1 --enforce-eager --max-model-len 8192`; once it logs `Uvicorn running`, `python3 -m atom.compass.parity.traffic PORT MODEL RECORD 64 8 0 0 1` (64 requests, one in flight: request 0 read to its end alone, the rest 8 s apart); stop the server, then `python3 scripts/compass/http_intake.py floor STAMPS RECORD/arrivals.json` prints the median it states, with p10, p90 and both inputs' sha256. On the same stamps, `python3 scripts/compass/http_intake.py idle STAMPS PER_BYTE_S`, with the burst's `per_byte_s`, prints the idle intake, the entry's `idle_s`, with p10, p90 and the sha256. With the server started under `ATOM_COMPASS_PARITY_RECORD=RECORD` too, `python3 scripts/compass/http_intake.py hops STAMPS RECORD/dp0.handoff.jsonl RECORD/arrivals.json` prints the ZMQ request hop (from request 1 on) and output hop and the SSE stream hop, each with p10, p90, N and the inputs' sha256; the law files' `host.hops` state the stream median as `stream_s`, and the ZMQ medians as `ipc_s` and `ipc_out_s` from a server started the same way but without `--enforce-eager` and with `--max-model-len 262144`, under `python3 -m atom.compass.parity.traffic PORT MODEL RECORD 64 4 0 0 0 20000`: request 0 asks for 20000 tokens and keeps the engine decoding while the rest are sent 4 s apart. A fresh container's first run spends its first minutes compiling kernels, so its probes find no engine decoding: measure on a later run. `kv_write_req_s` there is the p10 of `by_state.forward` from `python3 scripts/compass/http_intake.py pd STAMPS STEPS`, the KV write request from decode's send call to prefill's receipt for the receipts that found prefill inside a forward, off real 1P1D runs on two idle GPUs: `HTTP_INTAKE=STAMPS MODEL=/root/models/Qwen3.8-27B PREFILL_DP=1 DECODE_DP=1 PREFILL_GPUS=A DECODE_GPUS=B REQUESTS=64 GAP_S=0.3 LONG=20000 SERVER_ARGS="--max-model-len 32768 --no-enable_prefix_caching" scripts/compass/parity_pd.sh OUT`, STEPS being `OUT/real/record/prefill/dp0.jsonl`, where request 0 keeps decode stepping and the rest arrive while prefill steps on the one before; it pooled that run with one at `GAP_S=0.05` (`LONG` unset, `--max-model-len 8192`) and one at `GAP_S=4`. A receipt waits on prefill's worker freeing the GIL, mostly inside its kernel launches, so the median reads that wait, not the hop. |
+| `http_intake.py` | GPU container, one real server | `HTTP_INTAKE=STAMPS REAL=1 CONCURRENCY=256 SESSIONS=256 AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0" scripts/compass/cctraces_sim.sh RUN_FILE OUT`, aiperf stopped once the first turns are in, then `python3 scripts/compass/http_intake.py fit STAMPS`: the real server runs under the probe, which stamps each request body its event loop reads and each chat template it renders, and the fit prints the burst's `fixed_s` and `per_byte_s`, a `host` law entry's `http_intake` terms. While the server runs, the stamps are in a file in its temp directory, which `STAMPS.<pid>.local` names; its stop, its exit or a SIGTERM, appends them to STAMPS, the verbs refuse STAMPS until then, and a temp directory on NFS or CIFS refuses. A server that died first leaves the `.local` file, naming a path inside its container: while that container runs, `podman cp` the file out, append it to STAMPS and delete the `.local` file. A tmpfs `/tmp`, as QUICKSTART's container mounts, goes with the container's stop, and the run is taken again. A first-turn burst's bodies, short on messages, understate the per-byte rate, so gpu-40's law files stated the one `python3 scripts/compass/http_intake.py lone STAMPS PASSES` read over a lone run of a served DeepSeek-V4.1-Flash cell's own bodies to a server under the probe ([#2681](https://github.com/jgong5/ATOM/issues/2681)): the bodies sent one at a time, each once the one before has been read to its end, in PASSES passes of as many bodies each, the stamps cut to that phase; it prints the per-byte rate, the median over passes of each pass's Theil-Sen slope, with p10, p90 and the sha256, and `python3 scripts/compass/http_intake.py fit STAMPS 256 PER_BYTE_S` prints a burst's `fixed_s` at that rate, its span kept; those laws' `fixed_s` and `idle_s` were taken at that rate; they now state `compass fit host`'s, fitted on their own records' lone requests ([#3024](https://github.com/jgong5/ATOM/issues/3024), [#2846](https://github.com/jgong5/ATOM/issues/2846)). Check the GPUs are idle before and after. The law files' `host.hops.admission_s` is the transport floor, 0.54 ms on node 18: on one idle GPU, `python3 scripts/compass/http_intake.py serve STAMPS --model /root/models/Qwen3.8-27B --host 127.0.0.1 --server-port PORT -tp 1 --enforce-eager --max-model-len 8192`; once it logs `Uvicorn running`, `python3 -m atom.compass.parity.traffic PORT MODEL RECORD 64 8 0 0 1` (64 requests, one in flight: request 0 read to its end alone, the rest 8 s apart); stop the server, then `python3 scripts/compass/http_intake.py floor STAMPS RECORD/arrivals.json` prints the median it states, with p10, p90 and both inputs' sha256. On the same stamps, `python3 scripts/compass/http_intake.py idle STAMPS PER_BYTE_S`, with the burst's `per_byte_s`, prints the idle intake, the entry's `idle_s`, with p10, p90 and the sha256. With the server started under `ATOM_COMPASS_PARITY_RECORD=RECORD` too, `python3 scripts/compass/http_intake.py hops STAMPS RECORD/dp0.handoff.jsonl RECORD/arrivals.json` prints the ZMQ request hop (from request 1 on) and output hop and the SSE stream hop, each with p10, p90, N and the inputs' sha256; the law files' `host.hops` state the stream median as `stream_s`, and the ZMQ medians as `ipc_s` and `ipc_out_s` from a server started the same way but without `--enforce-eager` and with `--max-model-len 262144`, under `python3 -m atom.compass.parity.traffic PORT MODEL RECORD 64 4 0 0 0 20000`: request 0 asks for 20000 tokens and keeps the engine decoding while the rest are sent 4 s apart. A fresh container's first run spends its first minutes compiling kernels, so its probes find no engine decoding: measure on a later run. `kv_write_req_s` there is the p10 of `by_state.forward` from `python3 scripts/compass/http_intake.py pd STAMPS STEPS`, the KV write request from decode's send call to prefill's receipt for the receipts that found prefill inside a forward, off real 1P1D runs on two idle GPUs: `HTTP_INTAKE=STAMPS MODEL=/root/models/Qwen3.8-27B PREFILL_DP=1 DECODE_DP=1 PREFILL_GPUS=A DECODE_GPUS=B REQUESTS=64 GAP_S=0.3 LONG=20000 SERVER_ARGS="--max-model-len 32768 --no-enable_prefix_caching" scripts/compass/parity_pd.sh OUT`, STEPS being `OUT/real/record/prefill/dp0.jsonl`, where request 0 keeps decode stepping and the rest arrive while prefill steps on the one before; it pooled that run with one at `GAP_S=0.05` (`LONG` unset, `--max-model-len 8192`) and one at `GAP_S=4`. A receipt waits on prefill's worker freeing the GIL, mostly inside its kernel launches, so the median reads that wait, not the hop. |
 | `handoff.py` | any container with `atom` | `PYTHONPATH=$T python3 scripts/compass/handoff.py RECORD [LAW]`: over a real run's step record (`compass record`'s `steps/`), the engine IO threads' queue handoffs it stamped, input receipt to queue put, put to the busy loop's get, and output put to send, as p50 and p99 per prompt-token or step-batch bucket against the median step, and the input p10, beside the law file `LAW`'s `ipc_s` hop when given. |
 | `ca_grant_cost.py` | any container with `atom`; for the cross-node figure, one on each of two hosts | `python3 scripts/compass/ca_grant_cost.py serve N tcp://0.0.0.0:PORT` on the clock's host, then `python3 scripts/compass/ca_grant_cost.py lps N tcp://HOST:PORT` on the LPs' host: a clock authority over N synthetic LPs, each one channel of `--lookahead` seconds (default 1) from every other, served over the `tcp` carrier, and N LP processes that each ask `TAR` one second past their clock `--rounds` times (default 1000), then `NER(+inf)`. `lps` prints a `TAR`'s round trip, send to grant (p10, p50, p90); `serve` prints the endpoint it bound, then its CPU seconds per request served. At the default lookahead each round is a barrier, every LP granted once the last has asked; at 2 an LP may run one round ahead. The clock authority's sizing in `atom/compass/design/01_execution_and_time_model.md` (D3.1) states its figures. |
-| `mi355x_spec.py` | any container with `atom` | `python3 scripts/compass/mi355x_spec.py`: rebuild `machines/mi355x-gpu45.json`, the mi355-gpu-45 MI355X machine spec, from the device, capacity, datasheet peaks, the attainable peaks `probe_device.py` read on mi355-gpu-45 (`PEAKS`) and assumed values recorded in the script; byte for byte while this script and `mi308x_spec.py` are unchanged. With `COMPASS_MACHINE=mi355x-crs005`, the same for crsuse2-m2m-v3-005 into `machines/mi355x-crs005.json`, which -013 also reads (same cards, VBIOS and driver, no ptl directory); with `COMPASS_MACHINE=mi355x-gpu40`, for mi355-gpu-40 under nightly 20261026's stack with the aiter `aiter_c90842add0.sh` builds into `machines/mi355x-gpu40.json`, whose stack is read from a start in a container it built (`STACK`) and the rest from the device start, which ran the image's aiter. Prints `validate`'s verdict and `explain`'s fields grouped by origin. |
-| `aiter_c90842add0.sh` | every GPU container on mi355-gpu-40, before its first server | `podman exec CONTAINER bash scripts/compass/aiter_c90842add0.sh`: commit upstream aiter `c90842add0`'s csrc (`aiter_c90842add0.patch`) on the image's aiter `41d4d8d7e` as `09d256420`, the aiter commit `machines/mi355x-gpu40.json` pins, rebuild `module_quant` and `module_moe_sorting_opus` for gfx950, and check that a fresh process loads the files it built, by path and sha256. Without it a MoE pass whose `num_local_tokens` is one short of its rows zeroes the row past its stage-2 activations ([#2538](https://github.com/jgong5/ATOM/issues/2538)), and every command that checks the stack refuses against gpu-40's spec. Run again, it rebuilds nothing. |
-| `rdma_link.py` | a GPU container on each of two nodes; `fit` in any container with `atom` | Times Mooncake KV writes between two nodes and fits the inter-node link of crsuse2-m2m-v3-005 and -013 that `atom/compass/networks/crs005-013-ionic.json` holds and `mi355x_spec.py` states: `target` on the decode node, `bench` on the prefill node, `fit BENCH [RECORD]` anywhere; its docstring lists the experiments, and [the 1P1D section](#the-inter-node-link--rdma_linkpy) the commands. |
-| `mi455_spec.py` | any container with `atom` | `python3 scripts/compass/mi455_spec.py a0`: rebuild `machines/mi455-a0.json`, the spec of the node's MI455 A0 sample cards, from MI455X's datasheet peaks (`DATASHEET`), the attainable peaks `probe_device.py` read on two of the node's cards (`PEAKS`), the arch, capacity and stack its record holds (`DEVICE`) and assumed values recorded in the script. `python3 scripts/compass/mi455_spec.py b0`: rebuild `machines/mi455-b0.json`, the spec of the MI455 B0 performance machines, device `MI455X B0`, which no card here reads, from the same datasheet peaks and `machines/mi355x-gpu45.json`, every value taken from that file assumed: its derates, and its bandwidth curve scaled to MI455X's datasheet bandwidth, carry MI355X's probed ratios onto MI455X's peaks, and its own values stand where no datasheet states one; its arch, assumed, is the A0 samples', and no rate, latency or stack A0's probe read reaches it. Each is byte for byte while this script, `mi308x_spec.py` and `mi355x-gpu45.json` are unchanged, and prints `validate`'s verdict and `explain`'s fields grouped by origin. |
+| `aiter_c90842add0.sh` | every GPU container on mi355-gpu-40, before its first server | `podman exec CONTAINER bash scripts/compass/aiter_c90842add0.sh`: commit upstream aiter `c90842add0`'s csrc (`aiter_c90842add0.patch`) on the image's aiter `41d4d8d7e` as `09d256420`, the aiter commit gpu-40's laws state, rebuild `module_quant` and `module_moe_sorting_opus` for gfx950, and check that a fresh process loads the files it built, by path and sha256. Without it a MoE pass whose `num_local_tokens` is one short of its rows zeroes the row past its stage-2 activations ([#2538](https://github.com/jgong5/ATOM/issues/2538)), and a run on gpu-40's laws reads a stack other than theirs and refuses. Run again, it rebuilds nothing. |
+| `rdma_link.py` | a GPU container on each of two nodes; `fit` in any container with `atom` | Times Mooncake KV writes between two nodes and fits the inter-node link of crsuse2-m2m-v3-005 and -013 that `atom/compass/networks/crs005-013-ionic.json` holds: `target` on the decode node, `bench` on the prefill node, `fit BENCH [RECORD]` anywhere; its docstring lists the experiments, and [the 1P1D section](#the-inter-node-link--rdma_linkpy) the commands. |
 | `cpu_gate_exclude.txt` | — | Excluded test files in two marked sections: **GENERATED** (`# BEGIN GENERATED`, driver-dependent at *collection* time; never hand-edit — `regen_cpu_gate_exclude.sh` rewrites it wholesale) and **MANUAL** (`# BEGIN MANUAL`, collects cleanly then fails on a driver call or for want of a `.git`, so the regenerator cannot see it). The MANUAL section **is** hand-edited; every entry must carry its observed failure above it. |
 | `gpu_gate_triggers.txt` | — | The source paths that no *running* CPU-gate test names. Generated, not hand-written; matched by `gate_cpu.sh`. A trailing `/` matches a subtree. |
-| `gpu_gate_baselines/<target>/gpu_gate_baseline.env` | — | The GPU gate's baseline for one GPU target (`gfx942`, `gfx950`), as the `BASE_*` lines `gate_gpu.sh` reads when torch names that target for the first card: the commit measured, its pass and fail counts, how many tests `gpu_gate_skip.txt` left out of the run (`BASE_LEFT_OUT`), and the torch, HIP and AITER versions it ran under. A target with no pair is refused with 93, naming it. Written by `regen_gpu_gate_baseline.sh`; a change is a reviewed edit. |
+| `gpu_gate_baselines/<target>/gpu_gate_baseline.env` | — | The GPU gate's baseline for one GPU target (`gfx942`, `gfx950`, `gfx1250`), as the `BASE_*` lines `gate_gpu.sh` reads when torch names that target for the first card: the commit measured, its pass and fail counts, how many tests `gpu_gate_skip.txt` left out of the run (`BASE_LEFT_OUT`), and the torch, HIP and AITER versions it ran under. A target with no pair is refused with 93, naming it. Written by `regen_gpu_gate_baseline.sh`; a change is a reviewed edit. |
 | `gpu_gate_baselines/<target>/gpu_gate_known_failures.txt` | — | The known-failing GPU node-ids at the `BASE_COMMIT` of the `gpu_gate_baseline.env` beside it, verbatim, written by `regen_gpu_gate_baseline.sh`. Its line count and `BASE_FAILED` are two statements of one fact; `gate_gpu.sh` refuses to run if they disagree. |
-| `gpu_gate_skip.txt` | — | Hand-written `<GPU> <test file>` lines: a file that stalls on that GPU, or passes and fails at random there, which `gate_gpu.sh` leaves out when torch's name for the first card contains `<GPU>`, taking the file's collected tests off the expected passes; `regen_gpu_gate_baseline.sh` leaves it out the same way and records the count as `BASE_LEFT_OUT`, which goes back on. Each line goes when the issue named above it closes. |
+| `gpu_gate_skip.txt` | — | Hand-written `<target> <test file>` lines, read when torch names that GPU target for the first card: files whose result there the target's pair cannot record, the kinds listed in its header. `gate_gpu.sh` leaves each out, a suite file's collected tests coming off the expected passes and a `tests/compass` file only leaving its run; `regen_gpu_gate_baseline.sh` leaves a suite file out the same way and records the count as `BASE_LEFT_OUT`, which goes back on. A `<target> driver-run` line says that target's nodes hold no driver-run inputs (below). Each line goes when the issue or Ruling above it closes. |
 | `_lib.sh` | — | Tree resolution, `PYTHONPATH`, the `import atom` assertion, commit stamp, and the pytest summary parse `gate_gpu.sh` and `regen_gpu_gate_baseline.sh` count with. |
 
 ## Gate a tree with its own `scripts/compass/` — four `test_snapshot_ref.py` failures mean you overlaid
@@ -239,7 +235,7 @@ tests that fail on a loaded host:
 (#515), and `policies::tree::tests::test_tree_structure_integrity_after_stress`, a
 thread race that records a placeholder tenant (#514).
 
-The tree has no `Cargo.lock` (`atom/mesh/.gitignore`). The gate copies one in from
+The tree has no `Cargo.lock` (`atom/mesh/.gitignore`). `gate_cpu.sh` and `gate_gpu.sh` copy one in from
 `COMPASS_CARGO_LOCK`, default `/app/ATOM/atom/mesh/Cargo.lock`, the lockfile the
 gate image built atomesh with, unless the tree already has one. The image's cargo
 cache holds only what its release build downloaded, so a new gate container needs
@@ -258,7 +254,7 @@ probe fail, and so the gate exit 96, until `cargo fetch` runs in that tree's
 The gate image ships no gfx1250 kernels. MI455 work runs under
 `rocm/ufb-private:vllm-dsv4flash-mori-epv2-mi455-20260922-r5`
 (`sha256:1a3ff678e922`) with aiter at `b6a9d0aeb`, the stack
-`machines/mi455-a0.json` pins and `compass measure memory` holds a start to.
+MI455 A0's law states and `compass measure memory` holds a start to.
 Its aiter is a git checkout (`/sgl-workspace/aiter`) and it carries `rocm-smi`,
 the two things that command reads for the stack and the device. Its entrypoint
 launches vLLM, so the container sleeps instead; a tree runs as in the gate,
@@ -294,8 +290,25 @@ Every ATOM process in it runs with these settings:
 |---|---|
 | `ENABLE_CK=0` | aiter's JIT fails `module_activation` and `module_sample` in CK's `amd_tdm_store` |
 | `GPU_ARCHS=gfx1250` | aiter's JIT fails `module_deepgemm_opus`, built for the card's 192 CUs where OPUS registers gfx1250 at 256 |
-| `ATOM_ENGRAM_UVA=0` | a V4.1-Flash start page-locks 189 GiB of Engram tables |
+| `ATOM_ENGRAM_UVA=1` with `ATOM_ENGRAM_UVA_HBM=1` | `ATOM_ENGRAM_UVA=1` alone page-locks 189 GiB of Engram tables, more than the node's host memory; `ATOM_ENGRAM_UVA=0` gathers each forward's Engram rows on the host, 5 to 50 ms on 28% of one-sequence decode steps ([#2797](https://github.com/jgong5/ATOM/issues/2797)) |
 | `NCCL_MIN_NCHANNELS` unset | the image's 112 faults the first RCCL all-reduce |
+
+The GPU gate on MI455 runs in a container of its own from this image, with the
+same aiter and FlyDSL and these settings, `ATOM_ENGRAM_UVA` left unset, so
+`gpu_gate_baselines/gfx1250/` pins this stack; nothing for the gate is installed
+into the container that serves.
+It holds what the gate's runs import that this image lacks: LMCache at
+`f22dec28`, the commit nightly 20261026 carries, built for this image's torch
+(`BUILD_WITH_HIP=1 BUILD_MOONCAKE=0 PYTORCH_ROCM_ARCH=gfx1250 pip wheel
+--no-deps --no-build-isolation`, with `grpcio-tools` 1.83.1) and installed
+`--no-deps` with numba 0.65.0, llvmlite 0.47.0, sortedcontainers, aiofile,
+aiofiles, caio, cryptography 50.0.2, redis, httptools and
+`opentelemetry-exporter-prometheus` 0.65b0, the image's own numpy, protobuf and
+OpenTelemetry kept; and the crates atomesh's cargo tests build from, fetched
+under nightly 20261026's `Cargo.lock`. MI455 nodes run only models verified on them, so
+`gpu_gate_skip.txt` marks gfx1250 `driver-run`: the gate there sets no
+driver-run input (below), needs one card and accepts the driver-run tests'
+skips.
 
 DeepSeek-V4.1-Flash then serves at TP4 with
 [its recipe's](../../recipes/DeepSeek-V4.1-Flash.md#gfx1250-mi455x) gfx1250
@@ -628,7 +641,7 @@ erroring node-ids of both runs are judged together against the known-failures li
 | present, N passing | `BASE_PASSED + N - BASE_COMPASS_TESTS`; a failing Compass test is a failure the baseline does not name |
 
 Both sides of the arithmetic are **pass** counts, so a Compass test that skips or
-xfails is accounted for, with one exception below. A file `gpu_gate_skip.txt` leaves out on the card's GPU subtracts its collected tests from both rows, less the baseline's `BASE_LEFT_OUT`.
+xfails is accounted for, with one exception below. A suite file `gpu_gate_skip.txt` leaves out on the card's GPU target subtracts its collected tests from both rows, less the baseline's `BASE_LEFT_OUT`.
 
 ### The driver-run tests and their inputs
 
@@ -638,7 +651,8 @@ inputs, and a skip is not a failure, so a gate that does not set them passes
 without running them. On a tree whose `tests/compass/` reads
 `ATOM_COMPASS_SLICE_MODEL`, `gate_gpu.sh` sets each input, keeps one the caller
 set, and refuses with **92**, naming every one that is missing, before any test
-runs:
+runs, except on a target `gpu_gate_skip.txt` marks `driver-run`, whose nodes
+hold none: there it sets none, needs one card and accepts a driver-run skip.
 
 | input | default |
 |---|---|
@@ -650,7 +664,6 @@ runs:
 | `ATOM_COMPASS_CCTRACES` | `/root/cells/cc-traces-256k/traces.jsonl` |
 | `COMPASS_HARNESS_PYTHON` | `/root/cells/venv/bin/python`, agentx-harness with compass-harness installed; the smoke runs with this tree's `compass_harness` first on `PYTHONPATH` |
 | `COMPASS_AIPERF_PYTHON` | `/opt/venv/bin/python`, agentx-harness without compass-harness |
-| `ATOM_COMPASS_SLICE_MACHINE` | `machines/mi308x-hjbog18.json` (node 18's cards run with PTL on, which the hjbog39 spec refuses) |
 | `ATOMESH` | `atom/mesh/target/release/atomesh` in the tree; its directory goes first on `PATH` |
 | cards | four in `HIP_VISIBLE_DEVICES` (the multi-node DP test runs two trees of TP2) |
 
@@ -664,7 +677,7 @@ After the run, a `SKIPPED` line under `tests/compass/` whose reason names the sl
 image, MTP or DSpark model, `ATOM_COMPASS_CCTRACES`, `COMPASS_AIPERF_PYTHON` or `atomesh` is a
 finding by its file and line: that test did not run. The tests that cargo-build
 atomesh run offline (`CARGO_NET_OFFLINE=true` unless set), from the container's
-crate cache, as in `gate_cpu.sh`; where cargo cannot resolve its crates they
+crate cache under the image's `Cargo.lock`, as in `gate_cpu.sh`; where cargo cannot resolve its crates they
 skip, and the gate names them.
 
 On node 18 (`xiaobizh_n18_next13`), `tests/attentions/deepseek_v41/test_tbo.py`
@@ -773,17 +786,21 @@ and `buffers` terms of `peak_torch` with the storage bytes the start loaded.
 
 ## The step linear law from real cells — `step_linear_fit`
 
-`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --machine-spec DIGEST [--form FORM] [--moe-routing E,K] [--engine FILE]`
+`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --platform JSON [--form FORM] [--moe-routing E,K] [--engine FILE]`
 fits the law a run file's `step_linear` key holds (`atom/compass/backends/step_linear.py`) from
 the step records of real cells, `OUT_DIR/steps/dp0.jsonl` of `REAL=1
 cctraces_sim.sh` runs, each with the `dp0.engine.json` the run wrote beside it,
 whose engine config the law states and whose `data_parallel_size` its ranks
 join at. Records that ran before a run wrote that file, or wrote it without
 `data_parallel_size`, take an engine file stated from their `server.log` as
-`--engine FILE`. `atom/compass/backends/step_labels.py` states the label
+`--engine FILE`; `compass fit steps` and `compass fit host` take it too, the
+host laws then keyed by it with the records' launch graph sets
+(`atom/compass/fit/samples.py`). `atom/compass/backends/step_labels.py` states the label
 and what is cut, and the command writes each record's labels beside it for
 reading, `dp0.cost.jsonl`; the module's docstring states how outliers are
-dropped. The written law also carries, per vector, its samples, warm and dropped
+dropped. A prefill step's label is a trace run's busy time, which `calib_capture.sh`
+does not take ([below](#the-stage-2-cell-through-the-compass-cli-from-an-empty-store)).
+The written law also carries, per vector, its samples, warm and dropped
 counts and condition number, and names any vector it could not fit under
 `unfitted`. `--moe-routing E,K`, the model's routed experts and top-k, lets each
 decode rung adopt one column over its steps' real MoE tokens, the tokens or the
@@ -791,9 +808,12 @@ experts they reach (`atom/compass/backends/step_linear.py`), by the rule the
 module's docstring states, and records under the vector's `fit.moe_column` what
 the rule read; a law refitted without it adopts none.
 
-`DIGEST` is the `machine_spec_digest` of the capture host's spec in
-`scripts/compass/machines/`, which a run's spec must match, printed by
-`PYTHONPATH=$T python -c 'import json, sys; from atom.compass.artifacts import machine_spec_digest as d; from atom.compass.spec import MachineSpec as M; print(d(M.from_mapping(json.load(open(sys.argv[1])))))' SPEC.json`.
+`JSON` is the capture host's platform, as `compass run --device DEVICE --ptl PTL`
+composes it from the store's `platform_readings`:
+the law, as `platform`, and its host key state its device, software stack, PTL
+state and torch, each as far as its kind's key holds it, and a run's spec must
+match them. The backend package reads no spec, so it is printed by
+`PYTHONPATH=$T python -c 'import json, sys; from atom.compass.artifacts import ArtifactStore, Kind, keyed_platform as k, machine_platform as m; from atom.compass.fit.device import compose; p = m(compose(sys.argv[1], ArtifactStore(sys.argv[3]), sys.argv[2])); print(json.dumps({x.value: k(x, p) for x in (Kind.STEP_LINEAR_LAW, Kind.HOST_LAWS)}))' DEVICE PTL STORE`.
 
 Calibration cells replay traces the graded cells do not: `FIRST_SESSION=256
 SESSIONS=137` against graded traces 0 to 255, by the
@@ -804,7 +824,7 @@ lists its environment.
 Given two or more records, the command also prints each form's error on every
 record under a law fitted on the others, per decode rung and prefill token band.
 
-`scripts/compass/laws/qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json` is the
+`scripts/compass/laws/qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json.xz` is the
 `history` form, labelled by device time, fitted by `compass fit steps` on
 records captured on one card of hjbog-srdc-39 at 731debf47 (ROCm/ATOM 661ef7661)
 in the nightly-20261013 image, in this order, by the cells `calib_capture.sh`'s
@@ -821,12 +841,12 @@ with aiperf's scenario warmup, captured one at a time on one card of
 hjbog-srdc-39 at ae5bab999 in the same image after a warm cell nothing reads.
 Those records stamp the engine's input pulls, so every kind carries `E_out`,
 `E` runs from the pull and `W_launch` ends at the token read. The host key is the one those records carry. The law
-and its host key state `machine_spec`, the digest `machine_spec_digest` gives
-`scripts/compass/machines/mi308x-hjbog39.json`, so it refuses under any other
-spec's device, software stack or PTL state. Its name states that PTL state
+states hjbog-srdc-39's platform, so it
+refuses under any other device, software stack, PTL state or torch; its
+host key states that platform less the PTL state. Its name states that PTL state
 rather than the host it was captured on.
 
-`scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-gpu45-{prefill,decode}.json`
+`scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-gpu45-{prefill,decode}.json.xz`
 are DeepSeek-V4-Pro's DPA-TP8 laws on mi355-gpu-45, one per side of a 1P1D
 deployment: the `base` form with host laws, each fitted alone on its side's
 capture at ATOM 2d4044b15 by `compass fit steps` and `compass fit host`.
@@ -848,9 +868,9 @@ capture tree's. Their engine config, in each law and its host key, states
 for which ATOM resolves the fp4 indexer at gfx950, so a P/D side, which ATOM
 resolves to fp8, refuses them ([#2998](https://github.com/jgong5/ATOM/issues/2998)).
 
-`scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-crs005-{prefill,decode}.json`
+`scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-crs005-{prefill,decode}.json.xz`
 are the same pair for the cell on crsuse2-m2m-v3-005 (prefill) and -013 (decode),
-keyed by `machines/mi355x-crs005.json`, in the image that file pins, at
+keyed by the platform their `platform` states, in the image of that stack, at
 `--gpu-memory-utilization 0.75`: the `base` form with host laws, each written by
 `step_linear_fit` from its side's cells. The cells are the gpu-45 pair's, run by
 `calib_capture.sh`, the prefill side's on 005 and the decode side's on 013, and a
@@ -868,14 +888,18 @@ Its other vectors and its host laws are the ones fitted on the lone cells alone,
 its `sources` names the records each came from. The prefill law's rung-2 vector is the
 decode law's, stating `declared`, since the prefill law's own fit left rung 2 unfitted
 ([#2660](https://github.com/jgong5/ATOM/issues/2660)). Its prefill vector is refitted
-in the `cached_seqs` form on the lone prefill cells and on the prefill side of one 1P1D
-`deploy.sh record` cell, #975's cell at c=1 over traces 256 to 392, seed 20260707
-([#2853](https://github.com/jgong5/ATOM/issues/2853)); its other vectors but rung 2, and its
-host laws, are the lone cells' fit. The pair's lone cells ran the fp4 indexer and its 1P1D
-cells the fp8 one, so neither law states `index_cache_dtype`, and each reads as fp8
-([#2998](https://github.com/jgong5/ATOM/issues/2998)).
+in the `cached_seqs` form on records that ran the fp8 indexer alone: the prefill sides of
+#975's 1P1D cell, at c=1 over traces 256 to 392 and 0 to 255, seed 20260707
+([#2853](https://github.com/jgong5/ATOM/issues/2853)), and of #975's own rounds at c=1 to
+256, and two lone prefill cells at c=64 that ran fp8
+([#3073](https://github.com/jgong5/ATOM/issues/3073), [#3402](https://github.com/jgong5/ATOM/issues/3402));
+its other vectors but rung 2, and its host laws, are the lone cells' fit. The pair's lone
+cells ran the fp4 indexer and its 1P1D cells the fp8 one. Each law is keyed to the fp8 a P/D side resolves, without a refit: it
+states no `index_cache_dtype`, which then reads as `kv_cache_dtype`'s fp8, so a server that
+resolves fp4 refuses it. Its provenance states the gap that interleaved fp8 and fp4 lone cells
+measured ([#3073](https://github.com/jgong5/ATOM/issues/3073#issuecomment-6757202887)).
 
-`scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json`
+`scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json.xz`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by
 `compass fit steps` and `compass fit host` on each side's cells, captured on mi355-gpu-40
 at ATOM 78f8c0adf, which shares `mi355x-gpu45.json`'s device, stack and PTL state:
@@ -886,9 +910,9 @@ the decode side 64 once more at the default ([#1810](https://github.com/jgong5/A
 Each decode rung a law fits has steps in two or more cells, so each carries a held-out
 hull. Host keys and the fp4 indexer as the gpu-45 pair's.
 
-`scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-{prefill,decode}.json`
+`scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-{prefill,decode}.json.xz`
 are the EP8 pair for the cell on crsuse2-m2m-v3-005 (prefill) and -013 (decode), keyed by
-`machines/mi355x-crs005.json`, in the image that file pins: the `base` form with host
+the platform their `platform` states, in the image of that stack: the `base` form with host
 laws, each written by `step_linear_fit` from its side's cells. The cells are the gpu-40 EP8
 pair's, run by `calib_capture.sh` at `--gpu-memory-utilization 0.75` with each side's EP8
 arguments, the prefill side's on 005. -013's page cache served other bytes than its disk while
@@ -906,51 +930,101 @@ vectors, the prefill law's rung-1 vector among them, and its host laws are the o
 lone cells alone, and its `sources` names the records each came from. The prefill law's rung-2
 vector is not: it is the decode law's, stating `declared`, since no prefill-side record decodes at
 rung 2, which the 1P1D prefill side reaches at c=64 ([#2878](https://github.com/jgong5/ATOM/issues/2878)).
-Host keys as above; the indexer as the crs005 DPA-TP8 pair's, its lone cells fp4 and its 1P1D
-cells fp8, so neither law states it.
+Host keys and the fp8 indexer key as the crs005 DPA-TP8 pair's, its lone cells fp4 and its 1P1D
+cells fp8; the gap between the two is unmeasured on this pair.
 
-`scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json` is DeepSeek-V4.1-Flash's
+`scripts/compass/laws/deepseek-v4-pro-tp8-mtp3-mi355x-crs005-{prefill,decode}.json.xz` and
+`deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-{prefill,decode}.json.xz` hold host laws alone, one per
+side of [#1499](https://github.com/jgong5/ATOM/issues/1499)'s two MTP cells on crsuse2-m2m-v3-005
+(prefill) and -013 (decode): [#3179](https://github.com/jgong5/ATOM/issues/3179)'s TP8 cell with
+`--method mtp --num-speculative-tokens 3` on both sides, and [#975](https://github.com/jgong5/ATOM/issues/975)'s
+DPA-TP8 cell with `--method mtp --num-speculative-tokens 1` on both sides, for a run whose step
+costs come from another backend, each side taking its own entry. Each is `compass fit host` on its
+side of three 1P1D `deploy.sh record` cells at c=1, 4 and 16 over traces 256 to 392, 1800 s each,
+every server started with `ROCP_TOOL_LIBRARIES` naming the blocking-call tool
+(`atom/compass/parity/README.md`), and states the `platform` its records ran on. The host key
+states the drafter (`speculative`), so a side started without it, or at another draft width,
+refuses the law. A term a side's records give none of, or that `compass fit host` does not fit,
+is the crs005 DPA8 law's of that side, copied without a refit; `provenance` names each, with why.
+Each prefill law's `prefill.L_mtp` is its own `decode.L_mtp`, copied the same way: the status
+copy it prices is the previous output forward's, whatever this forward's kind, and the prefill
+forwards waited on it too rarely to fit one. Each host key's `atom` is re-keyed without a refit
+from the digest its records ran at; `provenance` says why.
+
+`scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json.xz` is DeepSeek-V4.1-Flash's
 law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed
 experts sharded across TP and DSpark with 5 speculative tokens, on one MI455 A0 node: the
-`history` form with host laws, keyed by `machines/mi455-a0.json`, fitted by `compass fit
-steps` and `compass fit host` on `calibrate.sh` records at ATOM 9653adb6a, taken in the image
-and aiter that spec pins ([#2462](https://github.com/jgong5/ATOM/issues/2462)). The records
-are concurrency 1, 4, 16, 64 and 256, then 8, 12 and 56 from each trajectory's first turn
-for rungs 7, 8, 12 and 56: at c=256 every decode step runs at rung 64. The c=256 and
-first-turn c=56 records were taken later, for
-[#2544](https://github.com/jgong5/ATOM/issues/2544), each by `calibrate.sh`'s record step
-alone, and both fits were run again on every record. Each server ran with `ENABLE_CK=0
-GPU_ARCHS=gfx1250 ATOM_ENGRAM_UVA=0 AITER_LOG_LEVEL=WARNING OMP_NUM_THREADS=4
+`history` form with host laws, keyed by the platform its `platform` states, fitted by `compass fit
+steps` at ATOM ed5fa7697 and `compass fit host` at a tree that places `L_mtp` on the drifting
+host and device clocks ([#3096](https://github.com/jgong5/ATOM/issues/3096)), on `calibrate.sh`
+records at ed5fa7697, taken in the image and aiter of that stack
+([#2765](https://github.com/jgong5/ATOM/issues/2765)). The records are concurrency 1, 4, 16
+and 64, then 8, 12 and 56 from each trajectory's first turn for rungs 7, 8, 12 and 56. No
+c=256 record is in it: that take stalled the node
+([#2922](https://github.com/jgong5/ATOM/issues/2922)), so decode rungs past 24 rest on the
+first-turn c=56 record. Each server ran with `ENABLE_CK=0
+GPU_ARCHS=gfx1250 ATOM_ENGRAM_UVA=1 ATOM_ENGRAM_UVA_HBM=1 AITER_LOG_LEVEL=WARNING OMP_NUM_THREADS=4
 ATOM_DISABLE_MMAP=true AITER_REUSE_IDENTICAL_COMM_GROUPS=1`, `NCCL_MIN_NCHANNELS` unset, and
 `SERVER_ARGS` of `--trust-remote-code -tp 4 --kv_cache_dtype bf16 --index-cache-dtype fp8
 --method dspark --num-speculative-tokens 5 --gpu-memory-utilization 0.9
 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --block-size 16 --level 0
 --max-num-seqs 64 --cudagraph-capture-sizes [1,2,3,4,5,6,7,8,12,16,24,32,40,48,56,64]
---max-model-len 262144`; the law's engine config holds `AITER_LOG_LEVEL`, `OMP_NUM_THREADS`
-and `ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072`, so a run sets them too. A fresh container compiles Triton variants of
-`_unit_table_kernel`, `_indices`, `_swa_write_kernel` and
-`_gemm_a16w16_bandwidth_bound_kernel` record after record, so unscored records at each
-concurrency, and a call of `atom/model_ops/deepseek_v41/unit_table.py::unit_table` per
-variant on tile buffers as `ScoreWorkspace` sizes them, came first; a record that still
-built one was taken again.
+--max-model-len 262144 --spec-decode-acceptance-length 3`; the law's engine config holds
+`AITER_LOG_LEVEL`, `OMP_NUM_THREADS` and `ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072`, so a
+run sets them and passes the acceptance length too. A record that built a Triton variant was
+taken again; no record of the law built one.
 
-`scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json` is the same law for
-cell A, TP4 with whole-expert EP4: fitted alike on `calibrate.sh` records at ATOM bb161b906
-in the same image, under the same environment and `SERVER_ARGS` with
-`--enable-expert-parallel` added. The records are concurrency 1, 4, 16, 64 and 256, then 8,
-12 and 56 from each trajectory's first turn for rungs 7, 8, 12 and 56: at c=256 the decode
-steps run at rung 64 but for a few at rung 1. The c=256 and first-turn c=56 records were
-taken later, for [#2582](https://github.com/jgong5/ATOM/issues/2582), each by
-`calibrate.sh`'s record step alone, and both fits were run again on every record. Its
-first-turn records served under expert parallel here with no
-[#2538](https://github.com/jgong5/ATOM/issues/2538) fault. An unscored record at each of the
-first six concurrencies came first; a record that still built a Triton variant was taken
-again.
+`scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json.xz` is the same law for
+cell A, TP4 with whole-expert EP4: `compass fit steps` and `compass fit host` both ran at ATOM
+ed5fa7697 on one `calibrate.sh` run's records at ed5fa7697 in the same image
+([#2744](https://github.com/jgong5/ATOM/issues/2744)), so its host laws place `L_mtp` before
+[#3096](https://github.com/jgong5/ATOM/issues/3096) ([#3273](https://github.com/jgong5/ATOM/issues/3273)),
+under the same environment and the same `SERVER_ARGS` with `--enable-expert-parallel` added. Its engine config
+holds `AITER_LOG_LEVEL`, `OMP_NUM_THREADS` and `ATOM_TOKEN_GRAPH_SIZES` at ed5fa7697's
+default buckets; a run priced by it sets them and passes the acceptance length too. The
+records are concurrency 1, 4, 16, 64 and 256, then 8, 12 and 56 from each trajectory's
+first turn: at c=256 all but a few hundred decode steps run at rung 64. No record built a
+JIT kernel.
+
+`scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json.xz` is cell A's law
+on mi355-gpu-40, keyed by the platform its `platform` states (aiter `09d256420`,
+`aiter_c90842add0.sh` run in the container): the `history` form with host laws, fitted by
+`compass fit steps` and `compass fit host` on records at ATOM 1227c0f25 in nightly 20261026,
+on cards 4-7, with the [stage-4 smoke](#a-stage-4-cell-smoked-on-mi355x)'s `$ATOM` and
+`--enable-expert-parallel`
+([#2846](https://github.com/jgong5/ATOM/issues/2846)). The records are four 1800 s
+calibration records of traces 256 to 392, at concurrency 1, 4 and 16 and from each
+trajectory's first turn at 16, and two 120 s trace runs, the c=16 and c=4 recipes, from
+which the prefill vector is fitted. `KINETO_CONFIG` named a file holding
+`ROCTRACER_MAX_EVENTS=2000000000`, so no rank's trace dropped rows, and `client.sh` ran under
+`WAIT_S=3600` for their stops. Its host laws fit the tokenizer, the segment tokenizer's own
+work with `chars_per_s`, the HTTP intake and the hops on those calibration records,
+refitted at ATOM ac272852e ([#3291](https://github.com/jgong5/ATOM/issues/3291)): the
+records carry no `blocked_ns`, so each `W_launch` label is its launch's wall time. A warm record came
+first, and a record that built a Triton variant, or held a decode stall near a server change
+on cards 0-3, was taken again.
+
+The law files in `scripts/compass/laws/` are stored xz-compressed, as `NAME.json.xz`, so
+that none nears GitHub's file size limits. Every command that takes a law file reads a
+name ending in `.xz` decompressed (`atom/compass/backends/json_file.py`), and
+`step_linear_fit` writes one so when `--out` or `--law` names one. A law changed outside
+a fit, re-keyed or merged, or a refit written as `NAME.json`, is stored again by
+`PYTHONPATH=$T python -m atom.compass.backends.step_linear_fit pack scripts/compass/laws`,
+which compresses each `*.json` there into `*.json.xz` and removes it. The same document
+always packs into the same bytes, so a law that did not change shows no diff. A packed
+law holds its top-level values longest first, so a re-key, which edits short ones,
+changes only the compressed stream's end, and git stores it as a small delta. `xz -dc
+NAME.json.xz`, or `git show REV:PATH | xz -dc`, gives the law's JSON on one line, for a
+diff or an edit. A merge that conflicts on a law file is resolved on
+that JSON: the base and both sides, `git show :1:PATH`, `:2:PATH` and `:3:PATH` each
+through `xz -dc`, are merged as JSON into `NAME.json`, which `pack` then stores. A branch
+that changed a law as `NAME.json` merges the same way, the tip's `NAME.json.xz` its other
+side.
 
 A simulated run prices by a checked-in law when the law file stands in for both tokens:
 `compass run --step-linear LAW --host-laws LAW $M $S --out D -- $ATOM`, `LAW` a file in
 `scripts/compass/laws/` (or any law file `step_linear_fit` writes), and `$S` the store that
-holds the configuration's `memory_readings`. The run takes the step law at the machine spec
+holds the configuration's `memory_readings` and the platform's readings at the stack the file states. The run takes the step law at the platform
 and engine config the file states, and its `host` at the host key the file states, the
 `atom` digest it was last re-keyed at, so a law re-keyed to this tree runs here though its
 records ran at another; each refuses where a store entry's would. A law file names no fit
@@ -964,7 +1038,8 @@ since calibration replays traces no cell is graded on (the
 cell's record (`OUT_DIR/steps` of a `REAL=1 cctraces_sim.sh` run) with a law
 file as `step_linear_fit` writes it, and prints the error per kind, per decode rung
 and per prefill token band; a record of several DP ranks is joined on step index,
-each step priced and banded as its slowest rank. The module's docstring states what each figure is.
+each step priced and banded as its slowest rank, and the error is also given per rank
+with its cards' PCI buses where `run.json` names them. The module's docstring states what each figure is.
 Grade a law only on cells whose traces its calibration cells do not replay.
 
 ## Schedule and end-to-end grades — `validate.runs`
@@ -987,6 +1062,15 @@ over every DP rank of that side, cost at the law fitted under that side's engine
 memory against that side's hand-in (`lp-engine-P.json`, `lp-engine-D.json`); end to
 end once, from the deployment's export. The export names decode's response ids, so
 prefill's side is split through decode's `transfers.jsonl` (`parity.transfers`).
+
+## Curves and a verdict per point — `python -m atom.compass.validate --curves`
+
+`PYTHONPATH=$T python -m atom.compass.validate --curves OUT ARM...` reads each ARM's
+points, a directory per concurrency holding two or more `real*/` runs and a simulated run
+per backend, computes InferenceX's agentic metrics from each run's client export, draws
+the real and simulated curves on InferenceX's axes as PNG files in OUT, and prints a
+verdict per point and metric. The `validate.curves` docstring states the metrics, the
+limits and the charts.
 
 ## A 1P1D deployment across crsuse2-m2m-v3-005 and -013
 
@@ -1077,21 +1161,44 @@ all-to-all is the default; EPLB, MTP and the decode's low-latency mode stay off.
 A real run is `deploy.sh record ... --store S`, which merges in the
 stack's JIT cache library from `S` and writes it back. A simulated run is
 `deploy.sh run --step-linear P --step-linear D --host-laws P --host-laws D
---machine scripts/compass/machines/mi355x-crs005.json --store S`, which builds the
+--device mi355x --ptl disabled --network crs005-013-ionic --store S`, which builds the
 cell's run file from these flags and both sides' arguments. `P` and `D` are
-`scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json` and
-`-decode.json`, and `S` holds each side's `compass measure memory` readings, taken
+`scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json.xz` and
+`-decode.json.xz`, and `S` holds each side's `compass measure memory` readings, taken
 at the run's own commit on the node where that side's real instance runs (013 for
 the decode): decode readings taken on 005 sized the simulated decode 79 to 80 KV
 blocks per rank above every real decode on 013
 ([ruling](https://github.com/jgong5/ATOM/issues/1111#issuecomment-6659985920)).
+
+### MORI's dispatch and combine at EP8
+
+At EP8 each MoE layer exchanges its rows through two leaves the EP-off graphs lack,
+MORI's dispatch and combine. Like every collective, only a `measure ops` run on all
+eight GPUs measures them, and a one-GPU run refuses them. Each rank calls them at
+MORI's entry point on the handle ATOM builds for the model's first MoE layer, and a
+point records each graph it was timed by under `parts_ns` (`_Mori` in
+`atom/compass/bench/ops.py`). Trace and measure under the EP8 cell's decode
+arguments and environment above, `MORI_SHMEM_HEAP_SIZE=16G` among them, with its
+Mooncake role, here `D` and `KV`:
+
+```
+compass trace ops --model <DeepSeek-V4-Pro> --tp 8 --arch gfx950 --width 1 --width 8 \
+  --width 32 --store S -- D --kv-transfer-config KV
+compass measure ops --width 1 --width 8 --width 32 --context 8192 --llc-mib 256 \
+  --gpu 0,1,2,3,4,5,6,7 --store S --out O -- D --kv-transfer-config KV --enforce-eager --level 0
+```
+
+`measure ops` skips a point its store holds, so each repeat measures into a copy of
+the traced store of its own. `fit ops` prices both leaves over their message bytes,
+as any collective. The EP8 cells' grade is
+[#3409](https://github.com/jgong5/ATOM/issues/3409)'s.
 
 ### The inter-node link — `rdma_link.py`
 
 `rdma_link.py` times Mooncake writes from 005's GPUs into 013's over the
 rails, as the cell's KV moves under matched rails, and `fit` publishes the
 link of the network file `atom/compass/networks/crs005-013-ionic.json`, which
-`mi355x_spec.py` states for the pair: the port rate and latency from the bench, and the derate a recorded deployment's own KV writes
+holds the pair's: the port rate and latency from the bench, and the derate a recorded deployment's own KV writes
 attained (`atom/compass/parity/writes.py`). Both ends run in a node's GPU
 container, created as above, with both nodes' locks and both page caches
 checked before and after, as the Rulings on #2794 have every 1P1D run's:
@@ -1130,9 +1237,9 @@ Run everything from one tree, `$T` below, in the GPU container: host laws are
 keyed by ATOM's source, so records, fits and runs from two trees refuse each other.
 In the image, `compass` is `$T/scripts/compass/compass`, linked anywhere, and `python -m`
 runs with `PYTHONPATH=$T`, both from `/` so every path is absolute. Below, `$ATOM` is
-`--model <Qwen3.8-27B> --max-model-len 262144`, `$M` is `--machine` and this node's spec
+`--model <Qwen3.8-27B> --max-model-len 262144`, `$M` is `--device` and `--ptl`, this node's platform
 ([QUICKSTART.md](QUICKSTART.md#environment) says which), `$R` is a directory under `/data`
-or `/tmp` and `$S` is `--store $R/store`, empty at the start. The raw export keeps
+or `/tmp` and `$S` is `--store $R/store`, holding only the platform's readings at the start. The raw export keeps
 no prompt: aiperf leaves each request's payload out of it, and the client
 gzips it once the client run's export is written.
 
@@ -1187,30 +1294,61 @@ container's caches, replacing no file there, and its stop writes back each artif
 the server finished compiling; `compass measure memory` does the same with its
 store. A record without a store touches no library.
 
-1. `compass measure memory --gpu G $M $S --out $R/mem -- $ATOM`.
+1. `compass measure memory --gpu G $S --out $R/mem -- $ATOM`.
 2. Calibration, alone on the node: per concurrency 1, 4 and 16,
    `compass record --gpu G --out $R/cal/c<C> -- $ATOM` and `client.sh $R/cal/c<C>
    --traces 256-392 --concurrency <C> --stop`, each server started with
    `ROCP_TOOL_LIBRARIES` naming the tool `python -m atom.compass.parity.blocked
    $R/tool` prints, so its launches' `W_launch` labels leave out their time in
    HIP's blocking calls (`atom/compass/parity/README.md`); `compass fit host`
-   names a record taken without it.
-3. `compass fit steps --backend step-linear --form history $R/cal/c* --client-run
-   $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $M $S --out $R/fit` and
-   `compass fit host` on the same inputs; each prints its store token.
-   Steps 1 to 3, after a warm record, are `calibrate.sh $R/cal 1 4 16` with
-   `MODEL`, `GPU`, `MACHINE`, `TRACES` and `AIPERF_PYTHON` set, its store
-   `$R/cal/store`; it prints the tokens, the law's held-out errors per band
-   and the `compass run` line of step 5. A RECORD after its concurrency names
-   the client's scenario, such as `"8 --trajectory-start-min-ratio 0
+   names a record taken without it. Then the trace runs (below), which take no
+   tool: per concurrency 16 and 4, `compass record --trace --gpu G --out
+   $R/trace/c<C> -- $ATOM` and `client.sh $R/trace/c<C> --traces 256-392
+   --concurrency <C> --duration 120 --stop`.
+3. `compass fit steps --backend step-linear --form history --model $MODEL $R/cal/c*
+   $R/trace/c* --client-run $R/cal/c<C> $R/cal/c<C>/artifacts/client_run.json ... $S
+   --out $R/fit`, every record and trace run named before the first `--client-run`,
+   `--model` naming the model directory, whose config gives a MoE model's routing, and
+   `compass fit host` on the calibration records alone; each prints its store token.
+   Steps 1 to 3, after a warm record, are `calibrate.sh $R/cal 1 4 16 "trace 16" "trace 4"` with
+   `MODEL`, `GPU`, `TRACES` and `AIPERF_PYTHON` set, its store the one `STORE`
+   names, else `$R/cal/store`; it reads no platform, so it prints the tokens, the law's held-out
+   errors per band and the `compass run` line of step 5 with `$M` left as `--device
+   DATASHEET --ptl PTL`. `$R/cal/store` holds no `platform_readings` entry, and step 5's
+   `compass run` refuses a store with none: publish one into it with
+   `compass measure device` and `compass fit device`, as the platform's bullet in
+   [QUICKSTART.md](QUICKSTART.md#environment) does, before step 5, or name a
+   store that holds one as `STORE`. A RECORD after its
+   concurrency names the client's scenario, such as `"8 --trajectory-start-min-ratio 0
    --trajectory-start-max-ratio 0"`, the first-turn record that gives the law
-   its decode rung 8.
+   its decode rung 8; `trace` before one makes it a trace run of that recipe.
 4. Real runs: per concurrency, two `compass record --gpu G --out
    $R/cell/c<C>/real<k> -- $ATOM`, each with `client.sh $R/cell/c<C>/real<k>
    --traces 0-255 --concurrency <C> --stop`, at most two GPUs at once.
 5. `compass run --step-linear LAW --host-laws HOST $M $S --out
    $R/cell/c<C>/step_linear -- $ATOM`, with `client.sh $R/cell/c<C>/step_linear
    --traces 0-255 --concurrency <C> --stop`.
+
+**The trace runs.** Only a trace run labels a prefill step: without one, `compass fit
+steps` names `prefill` under the law's `unfitted`, as `no prefill step carries a trace
+run's busy time`, and step 5 refuses every prefill step. The prefill vector needs more
+steps than coefficients, spread across them, or stays unfitted with the reason named
+(`step_linear_fit.fit`); its `fit.samples` is how many it took. Its held-out band needs
+a second trace run, and one of the two to fit the vector alone, since the fit prices
+each run by the law fitted on the others; with one trace run, every prefill term prices
+unvalidated. Leave the trace runs out of `compass fit host`: their host segments ran
+under the profiler. A higher concurrency holds more prefill steps in the same time.
+Under a speculative drafter, `compass fit steps --ops DIR...` takes the profiler's
+floor, the `device.profiler_floor_s` of the store's readings at its points' platform, out of the trace
+runs' drafter labels, each kernel's own length from `compass measure ops --drafter` at
+the trace runs' step shapes, traced first by `compass trace ops`; the fit's report
+names each kernel no point gave its own length.
+`compass record --trace` raises kineto's row cap, 5,000,000 rows a process by default
+([#3106](https://github.com/jgong5/ATOM/issues/3106)), and a run that lost device rows
+all the same is refused at its stop, naming each rank's first forward without them:
+take it again. Its stop writes and reduces every row, within `client.sh`'s `WAIT_S` plus
+serve's `TRACE_STOP_S`, 4200 s by default, so keep a trace run short enough to stop
+inside that.
 
 Developer checks, outside the `compass` path:
 - After step 2: `python -m atom.compass.parity.recurrence $R/cal/c<C>/steps`.
@@ -1267,7 +1405,7 @@ powers of two and no margin:
 8. `compass fit steps --backend step-grid --grid POP... $R/cell/c*/real*
     --grid-definition $G $R/cal/c* RAGGED... --client-run ...`, naming every
     population, real run and record, and as `RAGGED` every view token step 7's
-    `--ragged` run printed, `$M $S --out $R/fit-grid`; it plans the views' cells
+    `--ragged` run printed, `$S --out $R/fit-grid`; it plans the views' cells
     again and refuses naming any not measured. It prints the bundle's
     token, and its report's `alpha` states per rung whether alpha was kept. A
     second fit of one definition into one store is refused as an overwrite:
@@ -1294,7 +1432,9 @@ one: grading in another refuses every real step's graph.
     of step 6 and every real run graded: an `op_graph` per shape their steps hold,
     traced with no device. `run` traces a shape no graph holds itself, a model build
     each, which its wall time pays; `run --coverage` and grading trace none, and
-    leave a real step whose shape no graph holds out of their counts.
+    leave a real step whose shape no graph holds out of their counts. A graph
+    traced from another ATOM source or torch refuses where `run` reads it, and
+    its shape is not traced again, since its key names neither.
 11. `compass measure ops --plan $R/pop/256-392/c<C>... --llc-mib 256 --gpu G $S --out
     $R/ops -- $ATOM --enforce-eager --level 0`: the op bench's planner over the
     calibration traces' populations, in rounds, on one card. The bench runs eager and
@@ -1327,7 +1467,8 @@ and 5 at concurrency 16 alone, with these changes:
 
 - The image is `rocm/atom-dev:vllm-v0.31.0-nightly_20261026`, whose aiter the tree
   serves V4.1-Flash on, with `aiter_c90842add0.sh` run in each container before its
-  first server, and `$M` names `machines/mi355x-gpu40.json`, pinned to that stack.
+  first server, and `$M` is `--device mi355x --ptl disabled`, the store holding
+  gpu-40's readings at that stack.
 - `$ATOM` is `--model <DeepSeek-V4.1-Flash> --max-model-len 262144 -tp 4
   --kv_cache_dtype bf16 --index-cache-dtype fp8 --method dspark
   --num-speculative-tokens 5 --spec-decode-acceptance-length 3 --level 0`, plus
@@ -1341,8 +1482,54 @@ and 5 at concurrency 16 alone, with these changes:
   `AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"`:
   sampled starts leave rung 6 and above too few steps for a vector, and a step at a
   rung with none is refused.
+- The trace runs stay at 120 s for their stop's cost: the EP4 cell's passed the default
+  row cap 41 to 49 s in and logged 14.3M to 14.7M rows a rank, and each stop, SIGTERM
+  to exit, took about 11 min: c=4's 671 s for 121 s traced, about 46 us a row a rank
+  ([#3113](https://github.com/jgong5/ATOM/pull/3113#issuecomment-6759346059),
+  [#3111](https://github.com/jgong5/ATOM/pull/3111)). At c=4's rate the default 4200 s
+  covers about 750 s traced. In their first 120 s, #2789's cell-B calibration records
+  at `aeffa7d63` hold 30 prefill steps at c=4 and 125 at c=16.
 - Steps 4 and 5 take `--duration 3600`, with a calibration record between step 4's
   two real runs. A step 5 at another duration than step 4's is graded as another
   workload, and refused.
 - The draft vectors hold no held-out error: check 2's `cost` rows of kind `draft` give
   the draft law's error on the real runs' own steps.
+
+### A stage-4 cell graded on MI455
+
+[#2147](https://github.com/jgong5/ATOM/issues/2147) grades cell A on one MI455 A0 node by steps
+4 and 5 at concurrency 1, 4, 16 and 64, every run from one tree, with these changes from the
+smoke above:
+
+- `$ATOM`, its environment and the container are those
+  `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json.xz` states (its
+  paragraph above), and `$M` is `--device mi455x-a0 --ptl disabled`, the store holding the
+  node's readings at that stack.
+- Step 5 prices by the law file, `--step-linear LAW --host-laws LAW`, with the
+  `memory_readings` that `compass measure memory` takes at the same tree and settings.
+- Steps 4 and 5 take `--duration 3600`, one server on the node at a time. Step 4 runs three
+  spaced rounds at c=1, 4, 16 and 64: the first ran c=1, 4 and 64, then 16, as the interim
+  check ordered them; the second and third ran 1, 4, 16, 64.
+- `python -m atom.compass.validate` grades each concurrency's simulated run against its three
+  real runs, with throughput and TPOT targets of 10% and TTFT's of 15%, beside the real spread.
+- A real run has hung when, for 90 s while requests run or wait, its log shows neither a step
+  line nor a load report with nonzero prompt or generation throughput
+  ([#2922](https://github.com/jgong5/ATOM/issues/2922)). Check the node after the GPU reset
+  that follows: one such reset left RCCL's all-reduces above aiter's 64 MiB custom
+  all-reduce cutoff slow until the node was rebooted, every prefill chunk over 6553 tokens
+  37 to 60% slower on the device.
+- `python -m atom.compass.memory.check --tp 4` checks each rank's non-KV memory against the
+  real run's log; a concurrency's memory is graded on the mean of its 12 readings, three runs
+  of four ranks. The `non_torch` term, the driver and collective reserve, moves from start to
+  start: one rank alone read +10.43% against the 10% gate twice, beside its start's 10.3%
+  spread across ranks, while the mean stayed within 2.3%.
+
+[#2148](https://github.com/jgong5/ATOM/issues/2148) grades cell B alike, by
+`scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json.xz` (its paragraph above),
+with two changes:
+
+- Each round runs c=1, 4, 16, 64, after an unscored 600 s warm run at c=64 and one at c=1.
+- Since [#2086](https://github.com/jgong5/ATOM/pull/2086) a prefill step's label is a trace
+  run's busy time, so `validate.cost` leaves a plain real run's prefill steps out as
+  `untraced`; cell B's prefill cost is read by `validate.cost` at `ed5fa7697`, the step law's
+  fit tree, which labels a prefill step by its device window.

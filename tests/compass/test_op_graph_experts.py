@@ -17,10 +17,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_artifact_store import CONDITIONS, GATES, stanza
+from test_artifact_store import stanza
 from test_backend_step_linear import view
 from test_drive_runfile import build, install, step_linear
-from test_op_graph_arch import ENGINE
+from test_op_graph_arch import ENGINE, run_readings
 from test_run_step_grid import deployment
 from test_work import SPEC
 
@@ -28,22 +28,22 @@ from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass.artifacts import (
     ArtifactRefusal,
     ArtifactStore,
-    Key,
-    Kind,
+    GateState,
     Topology,
     member_name,
 )
 from atom.compass.backends import CostRefused
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.bench import ops
-from atom.compass.capture import driverless
+from atom.compass.capture import driverless, graph_key
 from atom.compass.capture.forward import decode, structure
 from atom.compass.run import _op_graphs
 from atom.compass.run.step_grid import keyed
 
 RANK = Topology().ranks()[0]
 LAW = pathlib.Path(__file__).parents[2] / "scripts/compass/laws"
-LAW /= "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json"
+LAW /= "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json.xz"
 #: Each graph's config fields and environment off the first's.
 VARIANTS = {
     "bf16": ({}, {}),
@@ -91,11 +91,11 @@ def store(tmp_path, monkeypatch):
                 m.setenv(k, v)
             at = structure(_v4(tmp_path, **fields), "decode")
         store.publish(
-            Key.of(Kind.OP_GRAPH, structure=at, shape="decode B=2"),
+            graph_key(at, "decode B=2"),
             provenance=stanza("compass trace ops"),
             topology=Topology(),
-            conditions=CONDITIONS,
-            gates=GATES,
+            conditions=run_readings(str(tmp_path / "model")),
+            gates=GateState.of(),
             members={
                 member_name("graph", RANK, "json"): json.dumps(
                     {"region": {"op": name}}
@@ -165,7 +165,7 @@ def test_a_step_law_fitted_with_bounded_replay_refuses_a_run_without_it(
 
 
 def test_atom_s_moe_defaults_key_the_fields_an_existing_law_states(tmp_path):
-    law = json.loads(LAW.read_text())["engine_config"]
+    law = read_json(LAW)["engine_config"]
     default = keyed(deployment(tmp_path, moe_backend="standard").config)
     moved = keyed(deployment(tmp_path, moe_backend="mega", eplb_enable=True).config)
 

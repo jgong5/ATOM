@@ -60,7 +60,7 @@ def _timed(stub, op, n):
 
     with (
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
-        patch.object(ops, "_kernels", return_value=(["k"], 1.0)),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
     ):
         record = stub._time(op, "sig", [{}], n)

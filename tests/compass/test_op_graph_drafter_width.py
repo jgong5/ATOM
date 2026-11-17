@@ -25,6 +25,7 @@ from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.work import gemm, price
 from atom.compass.capture import population_shapes
+from atom.compass.capture.forward import Shape
 from atom.compass.runner import projection
 from atom.utils.forward_context import ForwardMode
 from atom.utils.tbo import ubatching
@@ -209,7 +210,7 @@ def test_a_run_traces_a_prefill_s_drafter_no_graph_holds_at_its_width(
         OpGraphBackend(SPEC, lookup, kv="bf16", drafts=1).price(view)
 
     # A shape, not its text: the capture's cut sets `running_bs` from its width.
-    assert traced == [("prefill", 9, 3, None, 4)] and traced[0].width == 4
+    assert traced == [Shape("prefill", 9, 3, None, 4)] and traced[0].width == 4
     assert lazy["lazy_traces"] == 1
 
 

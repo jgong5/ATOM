@@ -8,7 +8,8 @@ client runs its server served (`parity.served`). Its ranks are labelled
 together by `step_labels.label_run` under ATOM's two-batch-overlap split rule
 (`validate.bound._split`), and a sample's provenance gains the
 `traces` its step served and whether run.json says it was `profiled`.
-A DP rank no request reached writes a line per dummy forward it runs, and gives
+Under `floored`, a trace run's drafter labels lose the profiler's floor
+(`parity.busy.floored`). A DP rank no request reached writes a line per dummy forward it runs, and gives
 no sample; its file still counts in the run's digest. An empty
 rank file lost its lines, and refuses.
 A record whose run.json names `aiter_jit_builds` or `ptl_changes` refuses,
@@ -16,9 +17,10 @@ naming them, and so does one whose `source` counts uncommitted files.
 
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
-does (`rows`, `rung`, `produces_output`), its device seconds (`seconds`),
-under a drafter the target's, and the drafter's (`draft_seconds`), its
-`origin` (`replay`, `plan` or `ragged`) and the `traces` the batch came from.
+does (`rows`, `rung`, `produces_output`, and `group_needs_eager` where the
+bench ran it eagerly), its device seconds (`seconds`), under a drafter the
+target's, and the drafter's (`draft_seconds`), its `origin` (`replay`,
+`plan` or `ragged`) and the `traces` the batch came from.
 Its sample's provenance holds its `source`, the origin, its `run`, the entry's
 digest, those `traces`, and `profiled` false: the bench times a
 replay unprofiled.
@@ -27,16 +29,22 @@ Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
 config.json's digest; `device`, each GPU's `<name> <arch>`, as a spec states
 it; `engine_config`, `keyed`'s fields, the parallel layout among them;
-`prefill_buckets`, the prefill token-graph buckets it states, null where it
-states none; `source_root`, `<revision_kind>-<revision>`; `sampling`, the request
-parameters, null for a record serving no client run's request; its host key
+`prefill_buckets`, those `step_linear_fit.stated_buckets` reads, null where it
+states none; `source_root`, its host key's ``atom`` as `source_root` writes
+it; `sampling`, the request parameters, null for a record serving no client
+run's request; its host key
 less its model and engine; its `stack`, the software versions run.json
 names; and its `ptl`, the cards' PTL state, `unrecorded` for a run.json that
 names none. A measurement reads the same fields but the host key, stack and
 prefill buckets from its key, whose `engine_config` and `sampling` are JSON
 objects as text. A field that differs between inputs refuses, naming each
 value and the inputs holding it; so do a profiled record and a record whose
-requests carry two sets of request parameters.
+requests carry two sets of request parameters. Ladders that are non-empty
+prefixes of the longest among the inputs read as it (`step_grid_plan.pooled`).
+
+A stated engine file (`--engine`) stands in for each record's own as
+`step_linear_fit --engine` takes it, in `engine_config`, the host key's
+``engine`` (its graph sets kept) and a record's prefill buckets stating none.
 """
 
 import dataclasses
@@ -45,13 +53,20 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, Topology
+from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.shape import BatchView, RequestShape
-from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS
+from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, pooled
 from atom.compass.backends.step_labels import Sample, digest, label_run
+from atom.compass.backends.step_linear_fit import (
+    recorded_buckets,
+    refuse_contradicting,
+    stated_buckets,
+)
 from atom.compass.drive import aiter_jit
 from atom.compass.drive.identity import PTL_CHANGES
 from atom.compass.parity import ARRIVALS
 from atom.compass.parity.served import served
+from atom.compass.run import source_root
 from atom.compass.run.step_grid import keyed_of
 from atom.compass.validate.bound import _split
 
@@ -66,18 +81,27 @@ UNRECORDED = "unrecorded"
 
 
 def load(
-    records: Mapping, measurements: Sequence = (), store=None
+    records: Mapping, measurements: Sequence = (), store=None, floored=None, engine=None
 ) -> tuple[list[Sample], dict]:
     """The samples of `records`, {record directory: the client runs its server
-    served}, and of the `measurements` keys in the store at `store`, in run
-    digest, DP rank and step order; and the configuration they state."""
-    samples, configs = [], {}
+    served}, labelled under `floored`, and of the `measurements` keys in the
+    store at `store`, in run digest, DP rank and step order; and the
+    configuration they state, the records' under the engine file `engine`, and
+    each engine config at the longest ladder among them (`pooled`)."""
+    samples, configs, held = [], {}, {}
+    if engine is not None:
+        owns = {d: Path(d) / "steps" / "dp0.engine.json" for d in records}
+        held = pooled({d: keyed_of(json.loads(o.read_text())) for d, o in owns.items()})
     for directory, client_runs in records.items():
-        got, configs[str(directory)] = _record(Path(directory), client_runs)
+        got, configs[str(directory)] = _record(
+            Path(directory), client_runs, floored, engine, held.get(directory)
+        )
         samples += got
     for key in measurements:
         got, configs[str(key)] = _measurement(ArtifactStore(store), key)
         samples.append(got)
+    for i, at in pooled({i: c["engine_config"] for i, c in configs.items()}).items():
+        configs[i]["engine_config"] = at
     fields = sorted({f for c in configs.values() for f in c})
     differ = [
         line
@@ -91,7 +115,9 @@ def load(
     return samples, one
 
 
-def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
+def _record(
+    directory: Path, client_runs, floored=None, stated=None, held=None
+) -> tuple[list[Sample], dict]:
     run = json.loads((directory / "run.json").read_text())
     if run["format_version"] != FORMAT_VERSION:
         raise ValueError(
@@ -126,19 +152,25 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
             f"parameters: {' and '.join(sampling)}"
         )
     traces = {(s["dp_rank"], s["step"]): s["traces"] for s in _steps(record)}
+    own, buckets = steps / "dp0.engine.json", stated_buckets(steps / "dp0.jsonl")
+    engine = keyed_of(json.loads(own.read_text()))
+    if stated is not None:
+        engine, buckets = _stated(own, held, buckets, stated)
     files = sorted(steps.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
     name, samples = ", ".join(map(digest, files)), []
-    for got, _ in label_run(files, name, _split):
+    for got, _ in label_run(files, name, _split, floored):
         for s in got:
             at = traces[s.rank, s.step]
             traced = {**s.provenance, "traces": at, "profiled": run["profiled"]}
+            if stated is not None and (key := traced["config"]) is not None:
+                graphs = {k: v for k, v in key["engine"].items() if k == GRAPHS}
+                traced["config"] = {**key, "engine": engine | graphs}
             samples.append(dataclasses.replace(s, provenance=traced))
-    engine = json.loads((steps / "dp0.engine.json").read_text())
     host = run["host_key"]
     return samples, {
         **fields,
-        "engine_config": keyed_of(engine),
-        PREFILL_BUCKETS: engine.get(PREFILL_BUCKETS),
+        "engine_config": engine,
+        PREFILL_BUCKETS: buckets,
         "stack": run["stack"],
         "ptl": run.get("ptl", UNRECORDED),
         "sampling": json.loads(sampling[0]) if sampling else None,
@@ -146,10 +178,23 @@ def _record(directory: Path, client_runs) -> tuple[list[Sample], dict]:
     }
 
 
+def _stated(own: Path, held: dict, buckets, stated) -> tuple[dict, list | None]:
+    """The `keyed` fields of the engine file `stated` and the prefill buckets a
+    record with engine file `own`, `held` its keyed fields at the records'
+    longest ladder, states, else the file's. A field the file omits or states
+    otherwise, or other buckets, refuse."""
+    raw = json.loads(Path(stated).read_text())
+    engine = keyed_of(raw)
+    refuse_contradicting(own, held, stated, engine)
+    held_buckets = {} if buckets is None else {str(own.parent): buckets}
+    stating = recorded_buckets({str(stated): raw.get(PREFILL_BUCKETS)} | held_buckets)
+    return engine, None if stating is None else list(stating)
+
+
 def run_fields(run: dict, record="run.json") -> dict:
     """The `model`, `device` and `source_root` a run.json's identity states.
     A run on a tree with uncommitted files refuses, naming `record`: its
-    source root names the tree's HEAD, which is not the code that ran."""
+    provenance names the tree's HEAD, which is not the code that ran."""
     if dirty := run["source"].get("dirty"):
         raise ValueError(
             f"{record} ran with {dirty} uncommitted files in its source tree; "
@@ -160,7 +205,7 @@ def run_fields(run: dict, record="run.json") -> dict:
         "device": ", ".join(
             sorted({" ".join(str(gpu[f]) for f in CARD) for gpu in run["device"]})
         ),
-        "source_root": f"{run['source']['revision_kind']}-{run['source']['revision']}",
+        "source_root": source_root(run["host_key"]["atom"]),
     }
 
 
@@ -176,6 +221,7 @@ def _measurement(store: ArtifactStore, key) -> tuple[Sample, dict]:
             tuple(RequestShape(q, c, bool(d)) for q, c, d in m["rows"]),
             capture_rung=m["rung"],
             produces_output=m["produces_output"],
+            group_needs_eager=m.get("group_needs_eager", False),
         )
         provenance = {
             "source": m["origin"],

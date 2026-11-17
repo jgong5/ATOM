@@ -257,6 +257,7 @@ class Runner(NonAllocatingRunner):
             max_num_batched_tokens=16384,
             enable_tbo_decode=False,
         )
+        self.attn_metadata_builder = SimpleNamespace(supports_token_graph=False)
 
 
 # --- the surface, derived rather than typed ---------------------------------

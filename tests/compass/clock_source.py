@@ -124,6 +124,10 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
         "when a fit published its entry, for the entry's provenance; a fit runs "
         "offline on recorded steps and never inside a simulated run"
     ),
+    "atom/compass/fit/device.py": (
+        "when fit device published its entry, for the entry's provenance and "
+        "date; it runs offline on probe records and never inside a simulated run"
+    ),
     "atom/compass/drive/identity.py": (
         "a command's phase boundaries in run.json, which are wall and monotonic "
         "time by definition; the tool process reads them, and no simulated time"
@@ -144,6 +148,10 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
     "atom/compass/drive/measure_memory.py": (
         "when measure memory published its entry, for the entry's provenance; it "
         "starts a real engine and never runs inside a simulated run"
+    ),
+    "atom/compass/drive/measure_device.py": (
+        "when measure device published its record, for the entry's provenance; "
+        "it probes real devices and never runs inside a simulated run"
     ),
     "atom/compass/drive/pp_probe.py": (
         "the PP carrier probe's send and receive stamps, on the monotonic clock "

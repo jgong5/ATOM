@@ -7,7 +7,8 @@
 time, plus `d_gap_ns` on a decode, and its line's host segments: `E` from the previous exit to the entry,
 `W_pre` to the launch less the staging gate's and MTP status waits, `W_launch` to the
 recv wait (the sampler's launch included), and `W_post` from the recv wait to the exit
-less the draft copy wait; with
+less the draft copy wait; a runner that does not defer its output stamps its read of its own tokens
+(`t_read_ns`) as its recv wait, released at its own target end, and a record stamping none defers; with
 `d_target_ns`, under MTP, the target runs to `forward_done_event`, with
 `d_draft_kv_ns` on an output forward, the rest of `d_busy_ns` is draft; where
 the device reached the `propose` pass before the host's draft copy wait
@@ -18,6 +19,10 @@ host, which starting the draft at the exit already counts, so the draft is
 and a decode's `d_gap_ns` is the work queued ahead of its launch
 (`check`). Each forward is called at the
 exit predicted for the one before, so only the waits and device times move it.
+A record that stamps its read of its own draft ids (`t_draft_read_ns`), its draft copy
+wait, leaves each output forward no earlier than its device end; one stamping none keeps that read in `W_post`.
+Such a forward's draft is that read: its host queued the draft before it, and `W_post`
+holds the host's time up to it, the draft's preparation included.
 A pipeline record is gated step by step, each stage charged with the predicted
 times of the others (`pipeline`), its sends priced on a machine spec's PP
 carriers when one is given:
@@ -34,7 +39,7 @@ same way, the steps the law names warm on this record left out, and those
 its host fit names as paying a first-use JIT compile, each with the forward
 after it, reported apart:
 
-    python -m atom.compass.parity.recurrence RECORD_DIR --law LAW_JSON
+    python -m atom.compass.parity.recurrence RECORD_DIR --law LAW
 
 Per kind (decode, output prefill, middle chunk, and idle: after an idle engine,
 `step_labels.busy_gaps`), p10 and p90 of charge over measured exit-to-exit
@@ -63,6 +68,7 @@ from atom.compass.backends import (
     launch_features,
     step_labels,
 )
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.shape import sum_tokens
 from atom.compass.backends.step_linear_fit import WARM_FACTOR
 from atom.compass.parity import ARRIVALS, read
@@ -173,15 +179,17 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
     mtp = any("d_target_ns" in s for s in steps)
     copy = step_labels.mtp_copy(steps) if mtp else {}
     waited = step_labels.host_paced_drafts(steps) if mtp else set()
-    rec = HostDeviceRecurrence({}, (), lambda: now, stage, mtp=mtp)
+    defer = not any("t_read_ns" in s for s in steps)
+    rec = HostDeviceRecurrence({}, (), lambda: now, stage, mtp=mtp, defer=defer)
+    rec.own_draft = any("t_draft_read_ns" in s for s in steps)
     kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
     for n, s in enumerate(steps):
         if "d_busy_ns" not in s:
             raise ValueError(f"step {s['step']} has no device window to charge")
         (g0, g1), (l0, l1) = s["t_gate_ns"], s["t_launch_ns"]
-        r0, r1 = s.get("t_recv_ns", (l1, l1))
+        r0, r1 = s.get("t_recv_ns", s.get("t_read_ns", (l1, l1)))
         m0, m1 = s.get("t_mtp_ns", (l0, l0))
-        d0, d1 = s.get("t_draft_recv_ns", (0, 0))
+        d0, d1 = s.get("t_draft_recv_ns", s.get("t_draft_read_ns", (0, 0)))
         p0, p1 = s.get("t_pp_recv_ns", (l0, l0))
         last = prev["t_exit_ns"] if prev else s["t_enter_ns"]
         e, called = s["t_enter_ns"] - last, now
@@ -244,7 +252,9 @@ def _charged(steps, stage, upstream, held, carriers=None, downstream=None):
             target += s.get("d_draft_kv_ns", 0)  # it precedes forward_done_event
         own = gap + target - s.get("d_recv_ns", 0)  # the receive is a wait, not work
         draft = busy - target
-        if s["step"] in waited:  # the rest holds the device's wait for the host
+        if "t_draft_read_ns" in s:  # the read, after its host queued it in W_post
+            draft = d1 - d0
+        elif s["step"] in waited:  # the rest holds the device's wait for the host
             if "d_propose_ns" not in s:
                 raise ValueError(
                     f"step {s['step']}'s device reached its propose pass before "
@@ -318,9 +328,18 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     admit = law["host"].get("admit", ADMISSION_IN_E)
     columns = law["host"].get("columns") or {}
     launch = launch_features.stated(law["host"].get("key"))
+    defer = not any("t_read_ns" in s for s in steps)
     rec = HostDeviceRecurrence(
-        {}, (), lambda: clock[0], mtp=mtp, admit=admit, columns=columns, launch=launch
+        {},
+        (),
+        lambda: clock[0],
+        mtp=mtp,
+        admit=admit,
+        columns=columns,
+        launch=launch,
+        defer=defer,
     )
+    rec.own_draft = any("t_draft_read_ns" in s for s in steps)
     kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
     admits = step_labels.admissions(steps)
     for s, kind, admitted in zip(steps, kinds, admits):
@@ -415,7 +434,7 @@ def main(record: str, machine=None, row_bytes=None, law=None) -> int:
         )
     paths = [Path(record) / f"dp{rank}.jsonl" for rank in stages[0]]
     run = ", ".join(map(step_labels.digest, paths)) if law else None
-    law = law and json.loads(Path(law).read_text())
+    law = law and read_json(law)
     for path, (rank, steps) in zip(paths, stages[0].items()):
         if law:
             samples = step_labels.label(path)[0]

@@ -828,7 +828,7 @@ receives it itself, at its own receive point.
 | `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_request` | engine input thread, `poller.poll()` in `engine_core.py::EngineCore.process_input_sockets` (thread) | `ipc_s` |
 | `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | `ipc_s` |
 | `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | `ipc_out_s` |
-| `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | the router's per-request forward cost (D7) |
+| `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | `router_s`, the router's per-request forward cost (D7) |
 | `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker. For a request that finishes before its write request, aborted while it waits, the scheduler-side `request_finished` (`scheduler.py::Scheduler._cleanup_aborted_load`) sends instead the notice that none will come, which retires prefill's send claim (Mooncake's `MSG_ABORT`) | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline); under prefill PP the head's, `engine-P-pp0` (D6) | `kv_write_req_s`, a stated request latency (D6) |
 | PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py::PPStageTransport.send_metadata` / `send_tokens` / `send_kv_status` | the stage loop's own poll and receive (inline) | stated IPC delay: each is one ZMQ message, as on the frontend channels; the head's batch to stage `k` is `meta#pp<k>`. The hidden states between stages are `pp_data` (`15` D91). |
 | `engine-P->engine-D:prefill_done` (RapidServe only, in neither M1 nor M2) | prefill step loop, direct send in `engine_core.py::PrefillEngineCore._process_engine_step` | decode handler thread `DecodeEngineCore._recv_prefill_done`, `sock.recv()` (thread) | stated IPC delay |
@@ -837,10 +837,11 @@ receives it itself, at its own receive point.
 
 Each hop's lookahead is the run-file key of its name, which `drive/runfile.py` writes
 from the `hops` of the `host_laws` entry (`09` D54): `admission_s`, `ipc_s`,
-`ipc_out_s`, `stream_s` and `kv_write_req_s`. A prefill-decode run takes each side's
-from its own instance's entry, the one fitted under that instance's engine config: the
-top-level keys are prefill's, `decode_hops` holds decode's `ipc_s`, `ipc_out_s` and
-`stream_s`, and the write request, received by prefill, is prefill's. A hop no entry
+`ipc_out_s`, `stream_s`, `kv_write_req_s` and `router_s`. A prefill-decode run takes each
+side's from its own instance's entry, the one fitted under that instance's engine config:
+the top-level keys are prefill's, `decode_hops` holds decode's `ipc_s`, `ipc_out_s` and
+`stream_s`, and the write request, received by prefill, and the router's forward are
+prefill's. A hop no entry
 states takes one floor, 2^-14 s (`run.HOP_FLOOR_S`), and the run summary lists it under
 `unmeasured_hops`. Not 0 s: a zero lookahead puts every serving run on the
 deadlock-recovery path (Invariants). Each hop is one value, the delay it charges.
@@ -1451,6 +1452,13 @@ missed event cost.
 
 ### A forward's charge: host and device, composed per runner
 
+**Replaced in part by [`18`](18_pass_record_and_host_paced_time.md) D107**, which
+starts and ends every pass by one rule: a target that replays one graph starts at its
+graph launch, after a new `W_graph`; one launched otherwise ends no earlier than its
+launch end; and the check no longer feeds an MTP decode's gap as `compass_queued_s`.
+The code applies the recurrence below until the implementation `18`'s *Summary* cuts
+lands, and that implementation rewrites it here.
+
 Owner ruling on [#815](https://github.com/jgong5/ATOM/issues/815), 2026-10-11. It
 supersedes ruling 2 of
 [#627's 2026-10-10 plan](https://github.com/jgong5/ATOM/issues/627#issuecomment-6096543740),
@@ -1519,9 +1527,12 @@ The host queues a forward's drafter passes before it exits (the `propose` pass i
 `postprocess`, just before the draft copy wait), and a pass the device reaches first waits
 for it. So `max(target_end, exit)` bounds the draft's start for every drafter, one graph
 or serial passes alike, adds no host segment, and errs only by the host time after the
-pass. The draft's end reaches the timeline only through the next forward's `start` and
+pass. The draft's end reaches the timeline through the next forward's `start` and
 R4, which a late pass moves only when it outlasts the next forward's `E + W_pre +
-W_inputs`.
+W_inputs`, and on a runner that does not defer its output through R8, which holds the
+forward's exit for it. There the recurrence's own check (below) charges as the draft the
+forward's read of its own draft ids: its host queued the draft before that read, and
+`W_post` holds the host's time up to it, the draft's preparation included.
 
 **After the return: `E_out`** (owner ruling on
 [#1345](https://github.com/jgong5/ATOM/issues/1345), 2026-10-18). `Scheduler.postprocess`,
@@ -1555,11 +1566,11 @@ after the real put: the records' `t_put_ns` measure that gap.
 
 | rule | applies to | where | waits for | ATOM site |
 |---|---|---|---|---|
-| R1 | output forward, single stage | after launch; before launch with MTP | the previous output forward's `target_end`; with MTP, then `L_mtp` | `tokenIDProcessor.recv_async_output`, from `prepare_sampled_ids`; with MTP, `tokenIDProcessor.recv_spec_status`, from `prepare_input_ids` in `ModelRunner.prepare_model` |
+| R1 | output forward, single stage, on a runner that defers output | after launch; before launch with MTP | the previous output forward's `target_end`; with MTP, then `L_mtp` | `tokenIDProcessor.recv_async_output`, from `prepare_sampled_ids`; with MTP, `tokenIDProcessor.recv_spec_status`, from `prepare_input_ids` in `ModelRunner.prepare_model` |
 | R4 | every forward, single stage | forward entry | `end[n-2]` | `ModelRunner._gate_staging_reuse` |
 | R6 | every forward, PP | forward entry | this stage's `end[n-pp]` | `ModelRunner._advance_forward_vars`, the `forward_vars` ring |
 | R7 | non-first PP stage | device start, host launch | the upstream stage's `end`, and its host send | `GroupCoordinator.recv_tensor_dict`, from `recv_intermediate_tensors` (`atom/distributed/pp_comm.py`) in `ModelRunner.run_model`: the metadata on gloo holds the host, the tensors the device |
-| R8 | last PP stage, output batch | after launch | its own `target_end` | `tokenIDProcessor.prepare_sampled_ids`'s `tolist`, on the stage that does not defer output |
+| R8 | output batch, on the last PP stage or a single stage whose runner does not defer output | after launch; with a drafter, also before the exit | its own `target_end`; with a drafter, then its own `end`: the forward leaves no earlier than it | `tokenIDProcessor.prepare_sampled_ids`'s `tolist`, on a runner that does not defer output ([#3174](https://github.com/jgong5/ATOM/issues/3174)); with a drafter, then `prepare_draft_ids`'s `cpu` ([#3544](https://github.com/jgong5/ATOM/issues/3544)) |
 
 **The MTP status copy, `L_mtp`** (owner ruling on
 [#2080](https://github.com/jgong5/ATOM/issues/2080), 2026-10-25). With MTP, R1 releases
@@ -1603,7 +1614,7 @@ what-if: never graded, and refused by the graders.
 **Measured, not hooked.** The parity recorder, `RecordingModelRunner`
 (`atom/compass/parity/runner.py`), stamps host time around the staging gate, the launch
 and the R1 wait (with MTP also the draft copy wait; on a non-first PP stage also the R7
-receive, and on the last stage its own token read; on a sending stage an idle
+receive, and on the last stage its own token read, which a single stage whose runner does not defer its output stamps too, as `t_read_ns`; with a drafter, either also stamps its own draft read as the draft copy wait, `t_draft_read_ns`; on a sending stage an idle
 `flush_pp_send` that settles a send), and records device events at
 `run_model` entry, with MTP at the target's end, on a non-first PP stage where the
 received tensors are in, and at the forward's exit, drained with `query()`, never `synchronize()`
@@ -2338,8 +2349,9 @@ PCP, DP across hosts, `engine_driven`, more than one server) stand as they are. 
 stand-in refuses a server flag or request type it does not model, by name, and the shell
 refuses a server URL that `RequestClientFactory` hands to gRPC (`grpc://`,
 `grpc+unix://`), a carrier with no wrapped socket, by its scheme. A `multi`
-connector runs only when each sub-connector is simulated (`compass` and `lmcache_mp`);
-`ATOM_KV_OFFLOAD=lmcache` (in-process, no server) and `mooncake_store` stay refused.
+connector runs only when each sub-connector is simulated (`compass`, `lmcache_mp`, and
+`lmcache_offload`, which `ATOM_KV_OFFLOAD=lmcache` selects, by `03` D13.1);
+`mooncake_store` stays refused.
 
 **Acceptance**, per #1076's ruling:
 

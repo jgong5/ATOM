@@ -11,9 +11,9 @@ import pytest
 from test_backend_step_labels import pulled
 from test_fit_samples import edit
 from test_fit_steps import (  # noqa: F401
-    DIGEST,
     ENGINE,
     HOST,
+    PLATFORM,
     clients,
     fit,
     member,
@@ -25,7 +25,7 @@ from test_memory_readings import META_8B
 from test_run_step_grid import B37, decode, deployment, publish, run_file
 
 from atom.compass import run as compass_run
-from atom.compass.artifacts import Key, Kind
+from atom.compass.artifacts import Key, Kind, keyed_platform
 from atom.compass.backends.step_labels import digest
 from atom.compass.backends.step_linear_fit import (
     fit_host,
@@ -44,7 +44,7 @@ def host_laws_key(key) -> Key:
         atom_src=key["atom"],
         model=key["model"],
         engine_config=json.dumps(key["engine"], sort_keys=True),
-        machine_spec=DIGEST,
+        **keyed_platform(Kind.HOST_LAWS, PLATFORM),
     )
 
 
@@ -63,7 +63,8 @@ def test_the_host_laws_published_are_fit_hosts_and_a_run_file_carrying_them_runs
     # last bits depend on the order of its samples.
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     laws, report = fit_host(label_records(paths)[0])
-    assert host == {**laws, "key": {**laws["key"], "machine_spec": DIGEST}}
+    platform = keyed_platform(Kind.HOST_LAWS, PLATFORM)
+    assert host == {**laws, "key": {**laws["key"], **platform}}
     # Records with no tokenizer calls or intake stamps give none of these terms.
     report["unfitted"].update(
         tokenizer=f"no record holds steps/{compass_run.INTAKE_RECORD}",
@@ -215,6 +216,7 @@ def stamped(
     burst=(),
     rates=(ENCODE, BATCH, DECODE),
     encodes=ENCODES,
+    fixed=FIXED,
 ):
     """`directory`'s steps with the tokenizer calls and HTTP intake stamps a
     recorded server writes. A lone request per body size in `lone`, its loop
@@ -224,7 +226,7 @@ def stamped(
     `encodes`, an ``encode_batch`` inside a segment tokenizer call (one of
     which another thread's decode overlaps), and a decode after its send, each
     timed at `rates`; then calls that do not run lone, ten times slower, and one
-    burst of `burst`'s body sizes, its templates `FIXED + PER_BYTE x bytes` of
+    burst of `burst`'s body sizes, its templates `fixed + PER_BYTE x bytes` of
     the loop's CPU time apart."""
     calls, lines = [], [_stamp("app", 10**12 + 5, 10**12 + 5)]  # a health probe
 
@@ -287,7 +289,7 @@ def stamped(
     call("encode", 1, 9000, y + 5 * 10**6, slow=10, thread=4)
     call("encode_batch", 4, 30_000, y + 6 * 10**6, slow=10)
     t = y + 10**9
-    gaps = [round((FIXED + PER_BYTE * size) * 1e9) for size in burst]
+    gaps = [round((fixed + PER_BYTE * size) * 1e9) for size in burst]
     cpus = cpu + np.cumsum([0] + gaps[1:])
     starts = t + 10**6 + np.cumsum([0] + [g + WAIT for g in gaps[1:]])
     for k, (size, start, c) in enumerate(zip(burst, starts, cpus)):
@@ -384,12 +386,6 @@ def test_the_intake_hull_spans_bodies_past_the_lone_requests_both_ways(tmp_path)
             },
         ),
         (
-            (30_000, 400_000),
-            (),
-            ENCODES,
-            {"http_intake": "no burst among 8 lone requests"},
-        ),
-        (
             (),
             (40_000, 60_000, 50_000),
             ENCODES,
@@ -406,7 +402,7 @@ def test_the_intake_hull_spans_bodies_past_the_lone_requests_both_ways(tmp_path)
             {"tokenizer.encode_batch": "the records hold no lone encode_batch call"},
         ),
     ],
-    ids=["no-stamps", "no-burst", "no-lone", "no-batch"],
+    ids=["no-stamps", "no-lone", "no-batch"],
 )
 def test_a_term_the_records_cannot_give_is_left_out_and_listed_unfitted(
     tmp_path, lone, burst, encodes, unfitted
@@ -421,6 +417,76 @@ def test_a_term_the_records_cannot_give_is_left_out_and_listed_unfitted(
     assert _unfitted(report) == unfitted
     left = {t.split(".")[-1] for t in unfitted}
     assert not left & (set(host) | set(host.get("tokenizer", {})))
+
+
+@pytest.mark.parametrize(
+    "burst, fixed, why",
+    [
+        ((), FIXED, "no burst among 8 lone requests"),
+        (
+            (900_000, 1_000_000, 1_100_000),
+            -3e-3,
+            (
+                "the bursts' 2 later requests take 0.00624 s of the loop's "
+                "CPU each, less than per_byte_s 8.8e-09 times their mean body of "
+                "1050000 B, so fixed_s would be -0.003 s"
+            ),
+        ),
+    ],
+    ids=["no-burst", "burst-closer-than-per-byte-s"],
+)
+def test_with_no_burst_or_a_negative_one_fixed_s_is_idle_s_and_a_run_charges_it(
+    tmp_path, monkeypatch, burst, fixed, why
+):
+    # No burst, as a c=1 client's records hold, or a burst of megabyte bodies
+    # whose requests run closer together than the lone requests' per_byte_s
+    # prices their bodies, so fixed_s from it would be negative, which a run
+    # refuses at start: fixed_s is the lone requests' idle_s instead.
+    a = record(tmp_path / "a", 19)
+    stamped(a, burst=burst, fixed=fixed)
+    fit(tmp_path, "fit host", a, *clients(a))
+
+    host = member(tmp_path / "store", host_laws_key(HOST), "params")
+    report = member(tmp_path / "store", host_laws_key(HOST), "report")
+    assert host["http_intake"] == pytest.approx(
+        {
+            "fixed_s": IDLE,
+            "per_byte_s": PER_BYTE,
+            "idle_s": IDLE,
+            "bytes": [9000, max((400_000, *burst))],
+        },
+        rel=1e-6,
+    )
+    assert not _unfitted(report) and "burst" not in report["http_intake"]
+    assert report["http_intake"]["fixed_s_is_idle_s"] == why
+    # A run file carrying the entry passes the run's check of its host entry,
+    # and the frontend charges a queued request's intake as a lone one's.
+    run_file(tmp_path, monkeypatch, host=host)
+    assert compass_run.http_intake() == pytest.approx((IDLE, PER_BYTE, IDLE), rel=1e-6)
+
+
+def test_fixed_s_is_the_mean_over_every_burst_of_every_record(tmp_path):
+    # Record a's burst of 3 runs its later requests 2 ms past per_byte_s apart,
+    # b's longer burst of 5 runs them 1 ms apart: fixed_s weighs each later
+    # request once, not the longest burst alone.
+    a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
+    stamped(a, burst=(40_000, 60_000, 50_000), fixed=2e-3)
+    stamped(b, burst=(45_000, 55_000, 65_000, 35_000, 50_000), fixed=1e-3)
+    fit(tmp_path, "fit host", a, b, *clients(a, b))
+
+    host = member(tmp_path / "store", host_laws_key(HOST), "params")
+    report = member(tmp_path / "store", host_laws_key(HOST), "report")
+    values = [2e-3] * 2 + [1e-3] * 4
+    assert host["http_intake"]["fixed_s"] == pytest.approx(np.mean(values), rel=1e-6)
+    assert report["http_intake"]["burst"] == pytest.approx(
+        {
+            "bursts": 2,
+            "requests": 8,
+            "p10_s": np.percentile(values, 10),
+            "p90_s": np.percentile(values, 90),
+        },
+        rel=1e-6,
+    )
 
 
 def _unfitted(report) -> dict:

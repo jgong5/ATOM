@@ -13,7 +13,7 @@ which holds the ladder the runner replays; the scheduler's bounds
 `prefill_context_parallel_size` and `decode_context_parallel_size`, each
 only above 1, so a width-1 engine file is unchanged and a step linear fit
 refuses a context-parallel record by name; and `prefill_buckets`, the prefill
-token-graph buckets the runner recorded, only where it recorded some, which a
+token-graph buckets the runner recorded, empty where it recorded none, which a
 step linear fit pads prefill to.
 A simulated run also writes `dp<r>.cost.jsonl`, a line per step saying what
 its charge was made of (`_group_step_seconds` in

@@ -23,7 +23,7 @@ def _running(pid):
     """A zombie has stopped; only its parent has not reaped it."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # reaped before or mid-read
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 

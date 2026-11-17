@@ -34,15 +34,15 @@ import numpy as np
 BLOCK, DRAFTS = 32, 5
 
 
-def cache_of(drafts=DRAFTS):
-    """ATOM's V4.1 cache on the host: 64 PAGEs, 8 state slots."""
+def cache_of(drafts=DRAFTS, kv="bf16"):
+    """ATOM's V4.1 cache on the host: 64 PAGEs, 8 state slots, `kv` rows."""
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
         V41PoolGeometry,
     )
 
     geometry = V41PoolGeometry(
-        2, ((1, 2),), BLOCK, 8, 512, 32, speculative_tokens=drafts
+        2, ((1, 2),), BLOCK, 8, 512, 32, kv_dtype=kv, speculative_tokens=drafts
     )
     return PagedAttentionCache(geometry, 64, 8, "cpu")
 
@@ -95,6 +95,8 @@ def ops_placements(
     ratio=2,
     reach=0,
     query=None,
+    tail=0,
+    kv="bf16",
 ):
     """The op bench's placements of a V4.1 `point` under `rule`, a two-row
     decode by default, at `context`, over `test_bench_ops`'s state-only leaf
@@ -115,7 +117,11 @@ def ops_placements(
     `ratio` and, past ratio 0, top-k 1, or at `prefix` the pool alone stating
     them. Its activation is a row a token, `query` rows if given, and the
     bytes its ring rows read a call, `reach` rows, are kept too, and each
-    pool view's name and offset from ATOM's on the bench, or refusal and None."""
+    pool view's name and offset from ATOM's on the bench, or refusal and None.
+    With `tail`, the step publishes a bounded replay's tail `tail` rows wide,
+    each request's window starting at its first row (`_publish_decoder`).
+    At `kv` fp8, each pool view is taken as its values and scales, `_scale`,
+    as `fp8_attention._split` passes them."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -127,11 +133,14 @@ def ops_placements(
     from atom.compass.bench import ops, replay
     from atom.compass.capture.forward import decode
     from atom.compass.ir.nodes import Reduced
+    from atom.model_ops.attentions.deepseek_v41.fp8_attention import _split
     from atom.utils import forward_context as fctx
 
     point = point or decode(2)
     tokens = point.tokens * (1 + drafts if point.phase == "decode" else 1)
-    built = assembled(cache_of(drafts), point.seqs, tokens)
+    built = assembled(cache_of(drafts, kv), point.seqs, tokens)
+    split = {"fp8": lambda f, t: zip((f, f"{f}_scale"), _split(t, 512))}
+    split = split.get(kv, lambda f, t: [(f, t)])
 
     class Runner(OpsRunner):
         """The stand-in runner, preparing its input through V4.1's builder."""
@@ -141,6 +150,14 @@ def ops_placements(
         def prepare_model(self, batch):
             self.batches.append(list(batch.state_slots_committed))
             metadata, positions = prepared(built, batch)
+            step = metadata.step
+            if tail:
+                floors = step.request_positions.astype(np.int32)
+                step.decoder = SimpleNamespace(
+                    tail=dataclasses.replace(step, request_floors=floors),
+                    tail_rows=torch.zeros(tail), last=torch.zeros(point.seqs),
+                    query_ids=step.batch_ids, filled_gpu=None, finishing_gpu=None,
+                )  # fmt: skip
             fctx._forward_context = fctx.ForwardContext(
                 attn_metadata=metadata, context=fctx.Context(positions=positions)
             )
@@ -174,6 +191,7 @@ def ops_placements(
             capture = PagedAttentionCache(cache.geometry, 4, slots, "cpu")
             states = [("pool", capture.pool)]
             states += [("ring", capture.ring_view(1))] if pool == "ring" else []
+            states = [v for f, t in states for v in split(f, t)]
         dtyped = [(f, _t(t.shape, "kv", t.stride(), str(t.dtype))) for f, t in states]
         query = query or tokens
         leaf = _leaf("v41.states", ("kv", _t([query, 4], "activation")), *dtyped)
@@ -207,6 +225,7 @@ def ops_placements(
     kept = {"slots": runner.batches, "refused": refused, "got": got}
     if pool:
         atom = {"pool": built.cache.pool, "ring": built.cache.ring_view(1)}
+        atom = dict(v for f, t in atom.items() for v in split(f, t))
         kept["bound"] = {
             p: [n, v if v is None else v.data_ptr() - atom[p].data_ptr()]
             for (_, p), (n, v) in stub.kv.items()
@@ -371,6 +390,10 @@ def main(root: pathlib.Path) -> None:
     seen["ops_v41_ring0_pool_8"] = ops_placements(
         plain, pool="ring", ratio=0, reach=16, **seated
     )
+    for ratio in (2, 0):  # the FP8 pool's values and scales
+        seen[f"ops_v41_fp8_{ratio}"] = ops_placements(
+            plain, pool="ring", ratio=ratio, reach=16, kv="fp8", **seated
+        )
     seen["ops_v41_write_verify"] = ops_placements(
         drafted, point=width(2), drafts=DRAFTS, pool="whole", reach=12, **seated
     )
@@ -384,6 +407,8 @@ def main(root: pathlib.Path) -> None:
         seen[f"ops_v41_{case}"] = ops_placements(
             plain, ratio=ratio, query=query, reach=14 * (query == 32), **cut
         )
+    # nor a tail laid out 48 rows wide, past the forward's 32
+    seen["ops_v41_wide_tail"] = ops_placements(plain, query=48, tail=48, **cut)
     seen["kv_bound"] = {slots: kv_bound(slots) for slots in (8, 2)}
 
     from atom.compass.bench.runner import BenchModelRunner

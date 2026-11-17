@@ -12,16 +12,23 @@ import argparse
 import dataclasses
 import json
 import math
+import shutil
 import time
 from types import SimpleNamespace
 
+import platforms
 import pytest
+from test_capture_v4_pro import CONFIG as V4_PRO
 from test_memory_readings import DOCUMENT
+from test_run_check_side import PAIR, SIDES
 from test_run_step_grid import deployment
 from test_served_tokenizer import REPO, _run_file
 
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.step_stub import Coefficients
+from atom.compass.drive import run as drive_run
 from atom.compass.drive import runfile
 from atom.compass.run.step_grid import keyed
 from atom.utils import clock
@@ -29,12 +36,13 @@ from atom.utils.clock import LPRuntime
 
 LAWS = REPO / "scripts/compass/laws"
 #: The node-18 TP1 law file, which a TP1 1P1D cell runs.
-TP1 = LAWS / "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json"
-ROUTER = DOCUMENT["interconnect"]["router_relay_s"]
+TP1 = LAWS / "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json.xz"
 FLOOR = compass_run.HOP_FLOOR_S
-#: Each channel's lookahead before the hops left the code: the serving path's
-#: HTTP transport, the ZMQ request and output and the SSE stream as node-18
-#: medians, and the write request as a node-18 p10.
+#: Each channel's lookahead before the hops left the code and the spec: the
+#: serving path's HTTP transport, the ZMQ request and output and the SSE stream
+#: as node-18 medians, the write request as a node-18 p10, and the router's
+#: forward, assumed.
+ROUTER = 1.5e-3
 SINGLE = {
     "traffic->frontend:http": 0.54e-3,
     "frontend->traffic:stream": 159e-6,
@@ -64,13 +72,18 @@ def lookaheads(run: dict) -> dict:
 
 
 def parsed(tmp_path, *flags):
-    """`flags` after a step stub, the suite's machine and the store."""
+    """`flags` after a step stub, the suite's machine, at the stack a law file's
+    host laws state, and the store."""
     stub = tmp_path / "stub.json"
     stub.write_text(json.dumps(dataclasses.asdict(Coefficients())))
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     parser = argparse.ArgumentParser()
     runfile.add_arguments(parser)
-    common = ["--step-stub", str(stub), "--machine", str(tmp_path / "machine.json")]
+    common = ["--step-stub", str(stub)]
+    laws = [read_json(f) for f in flags if f.endswith((".json", ".json.xz"))]
+    at = next(
+        (law["host"]["key"] for law in laws if "torch" in law["host"]["key"]), None
+    )
+    common += platforms.flags(tmp_path / "store", DOCUMENT, tmp_path, at)
     return parser.parse_args([*common, "--store", str(tmp_path / "store"), *flags])
 
 
@@ -78,13 +91,47 @@ def model(tmp_path, *more):
     return ["--model", str(tmp_path), *more]
 
 
-@pytest.mark.parametrize("law", sorted(p.name for p in LAWS.glob("*.json")))
+#: Law files whose ``host.hops`` `compass fit host` fitted on their own records,
+#: in whole or in part (#3036), which carry their cell's hops rather than node 18's.
+FITTED_HOPS = {
+    "deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json.xz",
+    "deepseek-v4-pro-tp8-mtp3-mi355x-crs005-prefill.json.xz",
+    "deepseek-v4-pro-tp8-mtp3-mi355x-crs005-decode.json.xz",
+    "deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-prefill.json.xz",
+    "deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-decode.json.xz",
+}
+
+
+@pytest.mark.parametrize(
+    "law", sorted(p.name for p in LAWS.glob("*.json.xz") if p.name not in FITTED_HOPS)
+)
 def test_each_law_file_builds_the_lookaheads_a_run_charged_before(tmp_path, law):
     args = parsed(tmp_path, "--host-laws", str(LAWS / law))
 
     run = runfile.build(args, model(tmp_path))
 
     assert lookaheads(run) == pytest.approx(SINGLE)
+    assert None not in compass_run.hops(run).values()
+    # The entry's router hop would make the run prefill-decode.
+    assert "router_s" not in run
+
+
+@pytest.mark.parametrize("law", sorted(FITTED_HOPS))
+def test_a_law_file_with_fitted_hops_builds_its_own_lookaheads(tmp_path, law):
+    hops = read_json(LAWS / law)["host"]["hops"]
+    args = parsed(tmp_path, "--host-laws", str(LAWS / law))
+
+    run = runfile.build(args, model(tmp_path))
+
+    assert lookaheads(run) == pytest.approx(
+        {
+            "traffic->frontend:http": hops["admission_s"],
+            "frontend->traffic:stream": hops["stream_s"],
+            "frontend->engine:request#dp0": hops["ipc_s"],
+            "frontend->engine:control#dp0": hops["ipc_s"],
+            "engine->frontend:output#dp0": hops["ipc_out_s"],
+        }
+    )
     assert None not in compass_run.hops(run).values()
 
 
@@ -115,12 +162,27 @@ def test_each_side_of_a_prefill_decode_run_takes_the_hops_fitted_under_its_confi
         "ipc_s": 2e-4,
         "ipc_out_s": 3e-4,
         "kv_write_req_s": 4e-4,
+        "router_s": 2e-3,
     }
-    hops_d = {"admission_s": 9e-3, "ipc_s": 5e-4, "ipc_out_s": 6e-4, "stream_s": 7e-4}
+    hops_d = {
+        "admission_s": 9e-3,
+        "ipc_s": 5e-4,
+        "ipc_out_s": 6e-4,
+        "stream_s": 7e-4,
+        "router_s": 8e-3,
+    }
     laws = [entry(tmp_path, "p.json", p, hops_p), entry(tmp_path, "d.json", d, hops_d)]
     sides = {"P": model(tmp_path, "-dp", "1"), "D": model(tmp_path)}
-    configs = {tuple(sides["P"]): p.config, tuple(sides["D"]): d.config}
-    monkeypatch.setattr("atom.compass.drive.run._config", lambda a: configs[tuple(a)])
+    # Each side's config as resolved on the machine's arch, the only one stated,
+    # from its arguments as deploy.sh starts its instance.
+    gfx = DOCUMENT["device"]["arch"]
+    configs = {
+        (tuple(drive_run.side_args(name, sides[s], "compass")), gfx): r.config
+        for s, name, r in (("P", "prefill", p), ("D", "decode", d))
+    }
+    monkeypatch.setattr(
+        "atom.compass.drive.run._config", lambda a, arch: configs[tuple(a), arch]
+    )
 
     for order in (laws, laws[::-1]):
         flags = [f for law in order for f in ("--host-laws", law)]
@@ -131,15 +193,75 @@ def test_each_side_of_a_prefill_decode_run_takes_the_hops_fitted_under_its_confi
 
         assert {k: run[k] for k in hops_p} == hops_p
         assert run[compass_run.DECODE_HOPS] == hops_d
-        assert got["traffic->frontend-P:http"] == pytest.approx(1e-3 + ROUTER)
-        assert got["frontend-D->traffic:stream"] == pytest.approx(7e-4 + ROUTER)
+        assert got["traffic->frontend-P:http"] == pytest.approx(1e-3 + 2e-3)
+        assert got["frontend-D->traffic:stream"] == pytest.approx(7e-4 + 2e-3)
+        assert got["frontend-P->frontend-D:relay"] == 2e-3
         assert got["engine-D->engine-P:kv_write_req"] == 4e-4
         assert got["frontend-P->engine-P:request#dp0"] == 2e-4
         assert got["engine-P->frontend-P:output#dp0"] == 3e-4
         assert got["frontend-D->engine-D:request#dp0"] == 5e-4
         assert got["engine-D->frontend-D:output#dp0"] == 6e-4
-        # Prefill's entry states no stream, decode's no write request: neither is read.
+        # Prefill's entry states no stream, decode's no write request, and
+        # decode's router hop is not read either.
         assert None not in compass_run.hops(run).values()
+
+
+def test_each_side_of_a_v4_pro_pair_picks_its_hops_under_the_kv_role_deploy_sh_adds(
+    monkeypatch, tmp_path
+):
+    # The crs005 DPA8 pair is keyed to the fp8 index cache each side runs under
+    # the --kv-transfer-config deploy.sh adds, fp4 without one at gfx950. Here
+    # both sides' entries state one environment, the prefill side's, which the
+    # build resolves both sides in, and the decode side's hops move.
+    env = read_json(PAIR["prefill"])["host"]["key"]["engine"]["env"]
+    for name in PERFORMANCE_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    hops, flags = {}, []
+    for side, path in PAIR.items():
+        host = read_json(path)["host"]
+        host["key"]["engine"]["env"] = env
+        if side == "decode":
+            host["hops"] = {k: 2 * v for k, v in host["hops"].items()}
+        hops[side] = host["hops"]
+        (tmp_path / f"{side}.json").write_text(json.dumps({"host": host}))
+        flags += ["--host-laws", str(tmp_path / f"{side}.json")]
+    v4_pro = tmp_path / "DeepSeek-V4-Pro"
+    v4_pro.mkdir()
+    shutil.copy(V4_PRO, v4_pro / "config.json")
+    common = ["-tp", "8", "--kv_cache_dtype", "fp8", "--enable-dp-attention"]
+    sides = [["--model", str(v4_pro), *common, *SIDES[s][0]] for s in PAIR]
+
+    run = runfile.prefill_decode(parsed(tmp_path, *flags), *sides, "intra_node")
+
+    assert {k: run[k] for k in hops["prefill"]} == hops["prefill"]
+    assert run[compass_run.DECODE_HOPS] == hops["decode"] != hops["prefill"]
+
+
+def test_an_entry_with_no_router_hop_charges_its_floor_and_lists_it(tmp_path):
+    law = tmp_path / "law.json"
+    law.write_text(
+        json.dumps({"host": {"key": {}, "laws": {}, "hops": {"ipc_s": 1e-4}}})
+    )
+    args = parsed(tmp_path, "--host-laws", str(law))
+
+    run = runfile.prefill_decode(args, model(tmp_path), model(tmp_path), "intra_node")
+
+    assert run["router_s"] is None
+    assert lookaheads(run)["frontend-P->frontend-D:relay"] == FLOOR
+    assert compass_run.hops(run)["router_s"] is None
+    assert compass_run.hops(run)["ipc_s"] == 1e-4
+
+
+def test_a_router_lp_whose_router_hop_is_the_floor_refuses(tmp_path):
+    run = runfile.prefill_decode(
+        parsed(tmp_path), model(tmp_path), model(tmp_path), "intra_node"
+    )
+    run["router_in_s"] = compass_run.hop(run, "ipc_s")
+
+    with pytest.raises(ValueError, match="0 < router_in_s < router_s"):
+        compass_run.channel_table(run)
 
 
 def test_without_host_laws_every_hop_takes_the_floor(tmp_path):
@@ -151,10 +273,9 @@ def test_without_host_laws_every_hop_takes_the_floor(tmp_path):
     assert lookaheads(single) == {name: FLOOR for name in SINGLE}
     assert lookaheads(pd) == pytest.approx(
         {
-            name: FLOOR + ROUTER * (":http" in name or ":stream" in name)
+            name: FLOOR * (1 + (":http" in name or ":stream" in name))
             for name in PREFILL_DECODE
         }
-        | {"frontend-P->frontend-D:relay": ROUTER}
     )
     assert sorted(compass_run.hops(pd)) == [
         "admission_s",
@@ -164,6 +285,7 @@ def test_without_host_laws_every_hop_takes_the_floor(tmp_path):
         "ipc_out_s",
         "ipc_s",
         "kv_write_req_s",
+        "router_s",
     ]
     assert set(compass_run.hops(pd).values()) == {None}
 
@@ -176,7 +298,7 @@ def test_a_run_file_with_an_admission_path_runs_as_one_without(monkeypatch, tmp_
 
 
 @pytest.mark.parametrize(
-    "hops", [{"ipc_s": 0.0}, {"ipc_s": -1e-4}, {"router_s": 1e-3}, {"ipc_s": "1e-4"}]
+    "hops", [{"ipc_s": 0.0}, {"ipc_s": -1e-4}, {"relay_s": 1e-3}, {"ipc_s": "1e-4"}]
 )
 def test_a_host_entry_with_a_hop_a_channel_cannot_take_is_refused(
     monkeypatch, tmp_path, hops

@@ -14,10 +14,12 @@ import json
 import math
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_backend_step_roofline import MACHINE, ROOFLINE, STACK
 from test_op_graph import g
 from test_op_work import leaf, t
+from test_op_work_v4_attention import decode as v4_decode
 from test_work import SPEC
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
@@ -27,6 +29,7 @@ from atom.compass.backends.op_graph import DRAFT_KV, OpGraphBackend
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.step_roofline import CONTEXT, Module, StepRooflineBackend
 from atom.compass.backends.work import Work, price
+from atom.compass.bench.ops import signature
 from atom.compass.run.step_grid import BUCKETS
 from atom.compass.validate import bound
 
@@ -204,7 +207,7 @@ def test_an_mtp_record_is_measured_by_its_target(tmp_path):
     assert refused == Refusal(bound.SOURCE, bound.UNSPLIT)
 
 
-def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1):
+def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1, document=ROOFLINE):
     config = SimpleNamespace(
         tensor_parallel_size=tp,
         kv_cache_dtype="bf16",
@@ -219,9 +222,9 @@ def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1):
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
     monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
     monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: graph)
-    spec = tmp_path / "spec.json"
-    spec.write_text(json.dumps(ROOFLINE))
-    argv = ["--model", "m", "--machine", str(spec), "--store", "s", *more]
+    store = tmp_path / "store"
+    platform = platforms.flags(store, document, tmp_path)
+    argv = ["--model", "m", *platform, "--store", str(store), *more]
     argv += map(str, records)
     bound.main(argv)
 
@@ -308,6 +311,40 @@ def test_each_measured_point_is_its_cold_time_over_its_leafs_price(tmp_path):
         text := bound.ops_text(r)
     )
     assert "2 priced above their measured time" in text
+
+
+FILL = "aten.index_fill_.int_Scalar"
+
+
+def test_a_point_keyed_by_its_signature_prices_as_its_leaf(tmp_path):
+    """A point's leaf is the `signature` `measure ops` keys it by, which sizes
+    no KV view of a kernel's along its pool: a kernel's work reads none, and
+    an aten operator over KV state, whose work reads the whole operand, keeps
+    it whole."""
+    rows = [[1, 300, True], [1, 9, True]]
+    attn = v4_decode(window_size=4, compress_ratio=4, index_topk=16)
+    state, index = t([10, 6], "torch.float32", role="kv"), t([2], "torch.int64")
+    fill = leaf(FILL, [[10, 6]], self=state, dim=0, index=index, value=0)
+
+    def priced(op):
+        view = BatchView(tuple(RequestShape(*r) for r in rows), produces_output=True)
+        return price(op_work.work(op, view, 1, "fp8"), SPEC) * 1e9
+
+    out = plan(
+        tmp_path,
+        [
+            point(op, "decode B=2", rows, 2 * priced(op)) | {"leaf": signature(op)}
+            for op in (attn, fill)
+        ],
+    )
+
+    r = bound.ops(out, SPEC, 1, "fp8")
+
+    assert r["refused"] == {}
+    assert {k: q["median"] for k, q in r["measured_over_analytical"].items()} == {
+        f"{attn['op']} decode": pytest.approx(2),
+        f"{FILL} decode": pytest.approx(2),
+    }
 
 
 def test_main_reports_an_ops_run_and_refuses_one_of_another_engine(
@@ -550,3 +587,24 @@ def test_ep_low_latency_split_under_tbo_refuses_at_both_levels(monkeypatch, tmp_
         r = report[level]
         assert (r["steps"], r["steps_refused"]) == (0, 8), level
         assert all("split send and receive" in k for k in r["refused"]), level
+
+
+def test_one_rank_under_tbo_prices_a_split_prefill_as_two_micro_batches(
+    monkeypatch, tmp_path
+):
+    # 9000 tokens on one rank clear the 8192-token bar; no peer vetoes it.
+    record(tmp_path, [{"rows": [[9000, 9000, False]], "rung": None}])
+    asked = []
+
+    def lookup(*shape, micro_batch=False):
+        asked.append((shape[1], micro_batch))
+        return graph(*shape)
+
+    priced = _backends(monkeypatch, tmp_path, _config(tbo=True), lookup=lookup)
+
+    report = bound.gate([tmp_path], priced, tbo=True)
+
+    [(_, view, _)] = bound.steps(tmp_path, tbo=True)
+    assert view.tbo_tokens == ((4500,), (4500,))
+    assert set(asked) == {(4500, True)}
+    assert [report[k]["steps_refused"] for k in ("step", "op")] == [0, 0]

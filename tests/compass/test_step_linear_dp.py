@@ -35,6 +35,7 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.shape import sum_context
 from atom.compass.backends.step_linear import UNIFORM_ROUTING
 from atom.compass.backends.step_linear_fit import priced_rank
@@ -155,29 +156,29 @@ def test_a_law_stating_key_refuses_by_name():
         StepLinearLaw(dict(law(), key=[8, 1]))
 
 
-@pytest.mark.parametrize("cap", [20, 7, 6])
-def test_the_fit_records_its_passes_and_a_cap_reached_refuses_it(
-    tmp_path, monkeypatch, cap
+@pytest.mark.parametrize(
+    "cap, start, count", [(20, "all_rows", 4), (6, "all_rows", 4), (3, "context", 1)]
+)
+def test_the_fit_records_its_passes_and_a_start_at_the_limit_still_competes(
+    tmp_path, monkeypatch, cap, start, count
 ):
     """Rung 4 settles in 4 passes from every rank's row, the start that goes
-    on; a start from a feature's axis takes 7, and its cap refuses the fit."""
+    on, and in 1 from the `context` axis at the same `F`; another feature's
+    axis takes 7. A start the limit stops competes on the `F` it reached and
+    loses: that axis's below 7 passes, every rank's row's below 4."""
     from atom.compass.backends import step_linear_fit
 
     monkeypatch.setattr(step_linear_fit, "FIT_PASSES", cap)
-    records = _records(tmp_path, _groups(0))
-    if cap < 7:
-        with pytest.raises(ValueError, match="still moved after 6 passes"):
-            _fit(records, dp=DP)
-        return
-    law_ = _fit(records, dp=DP)
+    law_ = _fit(_records(tmp_path, _groups(0)), dp=DP)
     assert law_["prefill"]["fit"]["passes"]["count"] == 1
     passes = law_["decode"]["4"]["fit"]["passes"]
     assert (passes["start"], passes["count"], passes["stop"]) == (
-        "all_rows",
-        4,
+        start,
+        count,
         "settled",
     )
     assert passes["F"] == pytest.approx(0.0, abs=1e-20)
+    assert law_["decode"]["4"]["coefficients"] == pytest.approx(DECODE, rel=1e-6)
 
 
 #: Two ranks' (context, graph_padding) in units of 800 tokens, six steps
@@ -262,12 +263,15 @@ def test_a_routed_rung_hulls_each_step_at_the_rank_it_prices(tmp_path):
     assert outside == []
 
 
-@pytest.mark.parametrize("cap", [20, 9, 8])
-def test_a_routed_rung_is_fitted_again_under_its_column(tmp_path, monkeypatch, cap):
+@pytest.mark.parametrize("cap, stop", [(20, "settled"), (11, "settled"), (10, "limit")])
+def test_a_routed_rung_is_fitted_again_under_its_column(
+    tmp_path, monkeypatch, cap, stop
+):
     """The experts column moves some steps' costliest rank off the row the
     rung's features alone pick, so the rung is fitted again under it, from
     every rank's row. Once no step moves, it is solved on the rows it
-    prices: the per-rank law. A cap reached refuses the fit."""
+    prices: the per-rank law, at the 11th pass. A limit one pass short ends
+    the fit there, its vector within a millionth of that law."""
     from atom.compass.backends import step_linear_fit
 
     monkeypatch.setattr(step_linear_fit, "FIT_PASSES", cap)
@@ -275,13 +279,9 @@ def test_a_routed_rung_is_fitted_again_under_its_column(tmp_path, monkeypatch, c
     sparse = _wide_or_tall(3, routed.SPARSE, (80_000, 100_000))
     records = routed._records(tmp_path / "full", full)
     records += routed._records(tmp_path / "sparse", sparse)
-    if cap < 9:
-        with pytest.raises(ValueError, match="still moved after 8 passes"):
-            routed._routed(records)
-        return
     vector = routed._routed(records)[0]["decode"][str(routed.RUNG)]
     passes = vector["fit"]["passes"]
-    assert (passes["count"], passes["stop"]) == (9, "settled")
+    assert (passes["count"], passes["stop"]) == (min(cap, 11), stop)
     assert vector["coefficients"] == pytest.approx(WIDE_OR_TALL, rel=1e-6)
 
 
@@ -437,23 +437,29 @@ def test_a_stated_engine_file_contradicting_the_records_own_refuses(tmp_path):
 
 
 COMPASS = Path(__file__).resolve().parents[2] / "scripts" / "compass"
-GPU45 = json.loads((COMPASS / "machines" / "mi355x-gpu45.json").read_text())
-CRS005 = json.loads((COMPASS / "machines" / "mi355x-crs005.json").read_text())
-#: Each DeepSeek-V4-Pro EP8 law pair's file stem and the spec it was fitted under.
+MACHINES = Path(__file__).resolve().parent / "machines"
+GPU45 = json.loads((MACHINES / "mi355x-gpu45.json").read_text())
+CRS005 = json.loads((MACHINES / "mi355x-crs005.json").read_text())
+#: Each DeepSeek-V4-Pro EP8 law pair's file stem, the spec it was fitted under and
+#: the index cache dtype it is keyed to: the fp4 gpu-40's lone servers ran, the fp8
+#: a P/D side resolves.
 EP8_PAIRS = [
     pytest.param(
-        "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661", GPU45, id="gpu45"
+        "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661",
+        GPU45,
+        "fp4",
+        id="gpu45",
     ),
-    pytest.param("deepseek-v4-pro-dpa8-ep8-mi355x-crs005", CRS005, id="crs005"),
+    pytest.param("deepseek-v4-pro-dpa8-ep8-mi355x-crs005", CRS005, "fp8", id="crs005"),
 ]
 
 
 @pytest.mark.parametrize("side", ["prefill", "decode"])
-@pytest.mark.parametrize("stem,spec", EP8_PAIRS)
-def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
-    monkeypatch, tmp_path, stem, spec, side
+@pytest.mark.parametrize("stem,spec,index", EP8_PAIRS)
+def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off_or_the_other_indexer(
+    monkeypatch, tmp_path, stem, spec, index, side
 ):
-    fitted = json.loads((COMPASS / "laws" / f"{stem}-{side}.json").read_text())
+    fitted = read_json(COMPASS / "laws" / f"{stem}-{side}.json.xz")
     engine = fitted["engine_config"]
     for key in PERFORMANCE_KEYS:
         monkeypatch.delenv(key, raising=False)
@@ -462,11 +468,11 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
     run = _without_step_stub(tmp_path, step_linear=fitted, machine=spec)
     monkeypatch.setenv(compass_run.ENV, str(run))
 
-    def installed(ep):
+    def installed(ep, index=index):
         r = deployment(
             tmp_path,
             **{k: engine[k] for k in ("kv_cache_block_size", "kv_cache_dtype")},
-            index_cache_dtype=engine.get("index_cache_dtype"),
+            index_cache_dtype=index,
             quant_config=SimpleNamespace(compute_hash=lambda: engine["quantization"]),
             parallel_config=SimpleNamespace(
                 data_parallel_size=8, data_parallel_rank=0, pipeline_parallel_rank=0
@@ -487,6 +493,8 @@ def test_each_v4_pro_ep8_law_installs_at_its_side_and_refuses_ep_off(
         ValueError, match="enable_expert_parallel True in the law and False here"
     ):
         installed(False)
+    with pytest.raises(ValueError, match="another engine config: index_cache_dtype"):
+        installed(True, {"fp4": "fp8", "fp8": "fp4"}[index])
 
 
 def _inside(hull: dict, features: tuple) -> dict:
@@ -513,8 +521,8 @@ def _decode_step(rung: int, context: float, graph_padding: float) -> BatchView:
 
 @pytest.mark.parametrize("side", ["prefill", "decode"])
 def test_each_v4_pro_ep8_law_validates_a_step_at_every_decode_rung_it_fits(side):
-    name = f"deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{side}.json"
-    fitted = json.loads((COMPASS / "laws" / name).read_text())
+    name = f"deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{side}.json.xz"
+    fitted = read_json(COMPASS / "laws" / name)
     backend = StepLinearBackend(StepLinearLaw(fitted))
     for rung, vector in fitted["decode"].items():
         assert "held_out" in vector, f"rung {rung} has no held-out hull"

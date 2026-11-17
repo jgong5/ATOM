@@ -8,7 +8,8 @@
 #
 # Usage: deploy.sh OUT run|record <flags> --prefill [<own>] -- <ATOM args> --decode [<own>] -- <ATOM args> --router -- <router args>
 #   OUT            the deployment's directory, absent or empty
-#   <flags>        run: `compass run`'s run-file flags: the backend, --machine,
+#   <flags>        run: `compass run`'s run-file flags: the backend, --device,
+#                  --ptl, --network across nodes,
 #                  --store, ... (atom/compass/drive/runfile.py); record: the
 #                  `compass record` flags both instances take, e.g. --gpu
 #   <own>          that instance's own `compass record` flags, e.g. --gpu, or
@@ -53,9 +54,15 @@
 # OUT. A client drives the deployment through server.json as it drives one
 # server (client.sh); no client starts here. It serves until SIGTERM or SIGINT,
 # then stops the instances, the router and the authority, writes OUT/run.json,
-# the command line, the KV link, the run file and the router's command, and
-# exits 0, or 1 when something left on its own, a router LP as the traffic
-# closes aside, or failed to stop. Exits 2 on bad arguments.
+# the command line, the KV link, the run file and the router's command, and,
+# once a client's export is complete (OUT/artifacts/client_run.json), each
+# request's split, OUT/request_split.json (atom/compass/report/split.py), CI's
+# Prometheus report of a simulated run's series, OUT/prometheus.html, or why
+# there is none, OUT/prometheus.txt (atom/compass/report/prometheus.py), which
+# fails no stop, then the run's report, OUT/report.html
+# (atom/compass/report/html.py), and exits 0, or 1 when something left on its
+# own, a router LP as the traffic closes aside, failed to stop, or the split or
+# the run's report failed. Exits 2 on bad arguments.
 #
 # Real, there is no run file or authority: each instance is one `compass
 # record --out`, which checks its node's GPUs before and after.
@@ -321,4 +328,12 @@ if os.path.exists(out + "/run_file.json"):
 open(out + "/run.json.part", "w").write(json.dumps(run))' \
     "$OUT" "$KV_LINK" "${#ARGV[@]}" "${ARGV[@]}" "${ROUTER[@]}"
 mv "$OUT/run.json.part" "$OUT/run.json"
+if [[ -s $OUT/artifacts/client_run.json ]]; then
+    (cd / && python3 -m atom.compass.report.split "$OUT") ||
+        { echo "deploy: split: atom.compass.report.split exited $?" >&2; rc=1; }
+    (cd / && python3 -m atom.compass.report.prometheus "$OUT") ||
+        echo "deploy: prometheus: atom.compass.report.prometheus exited $?" >&2
+    (cd / && python3 -m atom.compass.report.html "$OUT") ||
+        { echo "deploy: report: atom.compass.report.html exited $?" >&2; rc=1; }
+fi
 exit $rc

@@ -2,14 +2,15 @@
 """`compass trace steps`: one simulated instance's server, whose steps are
 published as one `shape_population` when it stops.
 
-    compass trace steps <backend> --machine M --store S --out D -- <ATOM args>
+    compass trace steps <backend> --device DEV --ptl PTL [--stack STACK]
+        --store S --out D -- <ATOM args>
 
-`runfile` builds the run file from `run`'s flags, the backend exactly one with
-no default, and `serve` starts the server simulated from it with the step
-record on; it serves whatever client runs reach it until the command is
-stopped, and `--out` holds what `serve` writes. Only shapes are read, so any
-traces may drive it. A prefill or a decode instance refuses: it shares a clock
-with its peer, which one invocation does not start.
+`runfile` builds the run file from `run`'s flags, the platform and the backend,
+exactly one with no default, and `serve` starts the server simulated from it
+with the step record on; it serves whatever client runs reach it until the
+command is stopped, and `--out` holds what `serve` writes. Only shapes are
+read, so any traces may drive it. A prefill or a decode instance refuses: it
+shares a clock with its peer, which one invocation does not start.
 
 At the stop, the store gets one `shape_population` at `Topology(dp=D)`, D the
 run file's ``data_parallel_size``, with these members per DP rank: ``steps``
@@ -20,8 +21,8 @@ model (run.json's host key states its config.json's digest), the workload (the
 digest of every rank's requests), the engine config (`keyed`'s fields, as the
 engine file states them) and the backend's digest, so two backends'
 populations at one (model, workload, engine config) are two entries. Its
-readings are the machine spec's device and stack, and run.json's source,
-model and host CPU with that engine config.
+readings are the composed spec's device and stack, and run.json's host key's
+ATOM source, model and host CPU with that engine config.
 """
 
 import argparse
@@ -39,9 +40,8 @@ from atom.compass.artifacts import (
     Key,
     Kind,
     Provenance,
-    Reading,
     Topology,
-    machine_spec_key,
+    machine_platform,
     member_name,
     roots_for,
 )
@@ -78,7 +78,7 @@ def publish(out, run: dict, command: str) -> Key:
     mapping `run`, as one `shape_population` in the store the run file names."""
     steps = Path(out) / serve.STEPS
     identity = json.loads((Path(out) / serve.RUN_JSON).read_text())
-    host, source = identity["host_key"], identity["source"]
+    host = identity["host_key"]
     topology, members, requests = Topology(dp=run["data_parallel_size"]), {}, []
     for rank in topology.ranks():
         record = steps / f"dp{rank.dp}.jsonl"
@@ -114,9 +114,8 @@ def publish(out, run: dict, command: str) -> Key:
         ),
         topology=topology,
         conditions=Conditions.of(
-            **machine_spec_key(machine).values,
-            torch=machine.value("device.software_pinned_to.torch"),
-            atom_src=Reading(source["revision_kind"], source["revision"]),
+            **machine_platform(machine),
+            atom_src=compass_run.atom_source(host["atom"]),
             model=host["model"],
             host_cpu=host["host_cpu"],
             engine_config=engine_config,
