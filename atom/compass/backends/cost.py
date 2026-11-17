@@ -277,6 +277,28 @@ def eager_beside_peer(view: BatchView, source: str) -> StepCost | None:
     return StepCost([CostTerm(name, 0.0, said)], (treatment,))
 
 
+#: The treatment of a decode-phase DP dummy whose whole group is idle, priced
+#: 0 s where the law holds no vector for its rung.
+IDLE_DP_GROUP = "idle DP group dummy"
+
+
+def idle_group_dummy(view: BatchView, dp: int, source: str) -> StepCost | None:
+    """0 s, under its treatment, for a decode-phase DP dummy forward that every
+    rank of its group of `dp` runs (`group_dummies`), no rank holding a
+    request: a P/D producer's group stepping while its sends finish, whose
+    decodes are all such steps once its requests leave at their first token.
+    A record's dummies give no fit sample, so no law fitted on that side holds
+    a vector for their rung; None for any other step."""
+    if view.prefill or not view.dp_dummy or dp < 2 or view.group_dummies < dp:
+        return None
+    note = (
+        "no rank of the group holds a request; real records time these steps, "
+        "but a fit takes no sample from a dummy, so no rung vector prices them"
+    )
+    said = Provenance(Method.DECLARED, "0 s", source, note=note)
+    return StepCost([CostTerm("idle_dp_group", 0.0, said)], (IDLE_DP_GROUP,))
+
+
 #: How a run summary groups seconds: a method each, estimated seconds split
 #: into validated (`estimated`) and not (`unvalidated`).
 GROUPS = ("analytical", "declared", "measured", "estimated", "unvalidated")

@@ -1953,7 +1953,12 @@ def _group_step_seconds(
             f"layers, but {type(backend).__name__} prices a whole step; charging "
             "each stage the whole model would count it once per stage"
         )
-    from atom.compass.backends.cost import EAGER_DP_DUMMY, ProvenanceMix, fold_seconds
+    from atom.compass.backends.cost import (
+        EAGER_DP_DUMMY,
+        IDLE_DP_GROUP,
+        ProvenanceMix,
+        fold_seconds,
+    )
     from atom.compass.backends.resolver import CostRefused, Refusal
 
     if mode is None:
@@ -1978,7 +1983,8 @@ def _group_step_seconds(
         if isinstance(host, HostDeviceRecurrence):
             batch.compass_launch = host.predicted(view)
         cost = backend.price(view)
-        if spec and not cost.draft_terms and EAGER_DP_DUMMY not in cost.treatments:
+        dummy = {EAGER_DP_DUMMY, IDLE_DP_GROUP} & set(cost.treatments)
+        if spec and not cost.draft_terms and not dummy:
             name = type(backend).__name__
             raise CostRefused(batch, [Refusal(name, "prices no draft")])
     except CostRefused as refusal:

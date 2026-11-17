@@ -59,7 +59,9 @@ A decode step that replays no graph (an eager runner, or a batch wider than
 the widest captured size) is the rung named `eager`, whose padding is zero.
 At that rung, under a law with no `eager` vector, a DP dummy forward and a decode
 while a peer prefills (`BatchView.dp_dummy`, `group_prefills`) cost 0 s, each
-under its treatment (`eager_beside_peer`), not refused.
+under its treatment (`eager_beside_peer`), not refused. So does, at any rung
+the law holds no vector for, a decode-phase dummy every rank of its group runs
+(`idle_group_dummy`): a P/D producer's, whose decodes are all such steps.
 
 Every term is `estimated`, but a vector's stating `declared`, the origin of one
 fitted on another subject: those are `declared`, with that note, never validated.
@@ -139,7 +141,12 @@ import math
 from collections.abc import Mapping
 
 from atom.compass.backends.base import CostBackend, Granularity
-from atom.compass.backends.cost import CostTerm, StepCost, eager_beside_peer
+from atom.compass.backends.cost import (
+    CostTerm,
+    StepCost,
+    eager_beside_peer,
+    idle_group_dummy,
+)
 from atom.compass.backends.hull import Hull
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostRefused
@@ -345,6 +352,7 @@ class StepLinearBackend(CostBackend):
 
     def __init__(self, law: StepLinearLaw, dp: int = 1) -> None:
         self.law = law
+        self.dp = dp
         self.treatments = (UNIFORM_ROUTING,) if dp > 1 else ()
 
     @property
@@ -371,6 +379,9 @@ class StepLinearBackend(CostBackend):
         beside = eager_beside_peer(batch_view, SOURCE)
         if beside is not None and None not in self.law.decode:
             return beside
+        idle = idle_group_dummy(batch_view, self.dp, SOURCE)
+        if idle is not None and batch_view.capture_rung not in self.law.decode:
+            return idle
         terms, kv = self._terms(self.law, batch_view, "")
         drafts = []
         if self.law.draft is not None:
