@@ -856,13 +856,15 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     one that does not (`output`), of its target or of its drafter's part
     (`draft`, as `forward.structure` keys it). A prefill that produces none
     runs its target's leaves less the LM head and the sampler, so the
-    target's points at output cover both. A miss where the store holds the
-    shape under another engine config, or traced under another ATOM source or
-    torch (`capture.graph_key`), refuses naming what differs. A
+    target's points at output cover both. A graph traced under this ATOM
+    source and torch answers (`capture.graph_key`), else one whose files read
+    here as in its trace (`capture.lookup_by_files`). A miss where the store
+    holds the shape under another engine config or torch, or of a file that
+    reads otherwise, refuses naming what differs. A
     two-batch-overlap micro-batch's `shape` reads its own graph, and a shape
     stating its real MoE rows the graph of all of them."""
     from atom.compass.artifacts import ArtifactRefusal, Rule
-    from atom.compass.capture import graph_key
+    from atom.compass.capture import graph_key, lookup_by_files
     from atom.compass.capture.forward import missed, structure
 
     shape = shape._replace(real=None)
@@ -875,6 +877,8 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
         micro_batch=shape.micro_batch,
     )
     key = graph_key(at, str(shape))
+    if not store.directory_for(key).exists():
+        key = lookup_by_files(store, at, str(shape)) or key
     if not store.directory_for(key).exists() and (why := missed(store, key)):
         part = " that produces no output" * (not output)
         part += " as a two-batch-overlap micro-batch" * shape.micro_batch
