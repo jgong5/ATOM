@@ -4,9 +4,10 @@
 `lacking` resolves the run's inputs as `runfile.build`, the runner and the
 server do, calling per input the function whose refusal the run would meet,
 so one lacking input hides no other: the platform, its datasheet and readings
-(`runfile.spec`); a step stub's file, read as `runfile.build` reads it; each
-store key or law file a flag names (`runfile.resolve`); a step linear law and
-host laws held against this run's engine config, widths, platform and host key
+(`runfile.spec`); a step stub's file, read as `runfile.build` reads it, and its
+`Coefficients` as the runner builds them; each store key or law file a flag
+names (`runfile.resolve`); a step linear law and host laws held against this
+run's engine config, widths, platform and host key
 (`run.pick_fitted`, `run.refuse_unfitted_law`, `run.refuse_unfitted_host`),
 and the step linear law's decode vectors against the rungs this configuration
 schedules (`uncovered_rungs`); the host laws' tokenizer term against the
@@ -57,6 +58,7 @@ from atom.compass.artifacts import (
     machine_platform,
 )
 from atom.compass.backends.step_linear_plan import records, scheduled_rungs
+from atom.compass.backends.step_stub import Coefficients
 from atom.compass.drive import runfile, serve
 from atom.compass.memory.readings import PAGE_BOUND
 from atom.compass.run import OP_GRAPH, PRICE_LIST, STEP_GRID, STEP_LINEAR, STEP_STUB
@@ -162,8 +164,8 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
         made_by[STEP_LINEAR] = calibration(out, atom_args, config)
     if stub := getattr(args, STEP_STUB):
         try:
-            json.loads(Path(stub).read_text())
-        except (OSError, ValueError) as unread:
+            Coefficients(**json.loads(Path(stub).read_text()))
+        except (OSError, TypeError, ValueError) as unread:
             lacks.append(
                 (f"step stub {stub}", "missing", str(unread), made_by[STEP_STUB])
             )

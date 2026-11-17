@@ -183,22 +183,26 @@ def test_missing_platform_readings_are_listed_alone(tmp_path, monkeypatch, capsy
     assert lacked(capsys.readouterr().out) == ["platform: missing"]
 
 
-@pytest.mark.parametrize("text", [None, "{"], ids=["absent", "not JSON"])
-def test_a_step_stub_file_the_run_cannot_read_is_listed_missing(
+@pytest.mark.parametrize(
+    "text", [None, "{", '{"prefill_tokens": 1}'], ids=["absent", "not JSON", "field"]
+)
+def test_a_step_stub_the_run_cannot_build_is_listed_missing(
     tmp_path, monkeypatch, capsys, text
 ):
-    served(monkeypatch, deployment(tmp_path).config)
+    r = deployment(tmp_path)
     path = tmp_path / "typo.json"
     if text is not None:
         path.write_text(text)
-    with pytest.raises((OSError, ValueError)) as unread:
-        runfile.build(*_parsed(tmp_path, "--step-stub", str(path)))
+    with pytest.raises((OSError, TypeError, ValueError)) as refused:
+        run = runfile.build(*_parsed(tmp_path, "--step-stub", str(path)))
+        install(tmp_path, monkeypatch, run, r)
+    served(monkeypatch, r.config)
 
     assert checked(tmp_path, "--step-stub", str(path)) == 1
 
     out = capsys.readouterr().out
     assert lacked(out) == [f"step stub {path}: missing"]
-    assert f"  refused: {unread.value}\n" in out
+    assert f"  refused: {refused.value}\n" in out
 
 
 def test_a_stale_bundle_is_listed_and_a_held_one_s_coverage_printed_apart(
