@@ -97,6 +97,8 @@ FITTED_HOPS = {
     "deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json.xz",
     "deepseek-v4-pro-tp8-mtp3-mi355x-crs005-prefill.json.xz",
     "deepseek-v4-pro-tp8-mtp3-mi355x-crs005-decode.json.xz",
+    "deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-prefill.json.xz",
+    "deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-decode.json.xz",
 }
 
 

@@ -25,6 +25,7 @@ from test_key_index_cache_dtype import TREE, served
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
 from atom.compass.artifacts import machine_platform
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.launch_features import stated
 from atom.compass.run import step_grid
 from atom.compass.run.step_grid import BUCKETS
@@ -33,16 +34,22 @@ from atom.compass.spec import MachineSpec
 
 LAWS = TREE / "scripts" / "compass" / "laws"
 MACHINE = Path(__file__).resolve().parent / "machines" / "mi355x-crs005.json"
-MTP = {"tp8-mtp3": "deepseek-v4-pro-tp8-mtp3-mi355x-crs005-{}.json"}
-DPA8 = "deepseek-v4-pro-dpa8-mi355x-crs005-{}.json"
+MTP = {
+    "tp8-mtp3": "deepseek-v4-pro-tp8-mtp3-mi355x-crs005-{}.json.xz",
+    "dpa8-mtp1": "deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-{}.json.xz",
+}
+DPA8 = "deepseek-v4-pro-dpa8-mi355x-crs005-{}.json.xz"
 #: Each cell's ATOM arguments on both sides, its layout's and its drafter's:
 #: the 1P1D cell with the recipe's MTP flags on both sides.
 COMMON = (
     "--trust-remote-code --kv_cache_dtype fp8 --block-size 16 "
     "--no-enable_prefix_caching -tp 8 --max-num-seqs 512"
 )
-LAYOUT = {"tp8-mtp3": ""}
-DRAFTER = {"tp8-mtp3": "--method mtp --num-speculative-tokens 3"}
+LAYOUT = {"tp8-mtp3": "", "dpa8-mtp1": "--enable-dp-attention"}
+DRAFTER = {
+    "tp8-mtp3": "--method mtp --num-speculative-tokens 3",
+    "dpa8-mtp1": "--method mtp --num-speculative-tokens 1",
+}
 CAPTURE = ",".join(map(str, [1, 2, *range(4, 257, 4)]))
 SIDE = {"prefill": "--enable-tbo", "decode": f"--cudagraph-capture-sizes [{CAPTURE}]"}
 ROLE = {"prefill": "kv_producer", "decode": "kv_consumer"}
@@ -72,7 +79,7 @@ def environment(monkeypatch):
 
 @cache
 def law(name: str) -> dict:
-    return json.loads((LAWS / name).read_text())
+    return read_json(LAWS / name)
 
 
 def platform() -> dict:
@@ -102,7 +109,9 @@ def test_each_mtp_side_picks_its_own_host_laws_and_passes_the_host_key_check(
     tmp_path, monkeypatch, cell, side
 ):
     config = side_config(tmp_path, monkeypatch, cell, side)
-    run = {"host": [law(p.name)["host"] for p in sorted(LAWS.glob("*-crs005-*.json"))]}
+    run = {
+        "host": [law(p.name)["host"] for p in sorted(LAWS.glob("*-crs005-*.json.xz"))]
+    }
 
     compass_run.pick_fitted(run, "host", config)
 
