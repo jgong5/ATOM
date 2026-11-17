@@ -355,7 +355,8 @@ def structure(
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the arch of `device`, else
     `device_arch()`, the engine config a step law is keyed by less its ladder
-    (`run.step_grid.keyed`), which names every variable that picks a kernel and
+    and compilation level (`run.step_grid.keyed`; a trace runs eager at level 0),
+    which names every variable that picks a kernel and
     a drafter's method and width, its performance environment `env` when given,
     as an engine file states one, else this process's, the TP width, the DP
     width and the EP group's when they are set, the phase and the mode,
@@ -366,10 +367,11 @@ def structure(
     two-batch-overlap micro-batch (`micro_batch`), which ATOM runs otherwise
     than a whole step of its shape."""
     from atom.compass.run import _file_digest
-    from atom.compass.run.step_grid import keyed
+    from atom.compass.run.step_grid import LEVEL, keyed
 
     digest = _file_digest(config.model, "config.json")
     engine = keyed(config, ladder=False)
+    engine.pop(LEVEL, None)
     if env is not None:
         engine["env"] = env
     engine = json.dumps(engine, sort_keys=True, separators=(",", ":"))
