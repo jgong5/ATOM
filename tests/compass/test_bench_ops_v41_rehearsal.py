@@ -387,3 +387,19 @@ def test_a_top_k_or_key_rope_stating_no_ratio_refuses_where_its_point_cannot_tel
         ("--kinds", 131072): "",
         ("--kinds", None): f"compress plan holds its 16 rows{again}",
     }
+
+
+def test_layer_39_s_queries_rotate_at_the_positions_its_replay_gathers(rehearsed):
+    """At a replayed prefill, layer 39's query RoPE and its output's inverse,
+    over its queries' rows alone, take the positions its decoder plan gathers
+    for them."""
+    got, _ = rehearsed
+    rope = "atom.model_ops.deepseek_v41.rope_window:_launch_rope_window"
+    inverse = "aiter._inverse_rope_group_quant_kernel.default"
+    taken = {
+        (r["op"], r["bound"].get("positions"))
+        for r in got["cached"] + got["fresh"]
+        if r["op"] in (rope, inverse) and r["shape"] == "prefill T=2048 B=1"
+        if json.loads(r["leaf"])["args"]["positions"]["shape"] == [1]
+    }
+    assert taken == {(op, "plan.queries.positions") for op in (rope, inverse)}

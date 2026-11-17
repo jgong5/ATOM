@@ -47,8 +47,10 @@ those its index build writes for the leaf's pass, off a selection spread over
 each row's visible rows (`Stub._lists`), and its DSpark drafter's FP8 window
 read takes the addresses and pointers ATOM's window read builds for the
 drafter's stage layers at the step's state slots (`Stub._windows`), and its
-draft block its anchors, and its RoPE and attention the positions and
-indices ATOM builds from them, at zero rejections (`Stub._block`). A `Stub`
+draft block and cursor commit its anchors, and its RoPE and attention the
+positions and indices ATOM builds from them, at zero rejections
+(`Stub._block`); at a replayed prefill, layer 39's query rotation and the
+draft-KV tail take the positions ATOM gathers there (`_replayed`). A `Stub`
 calls each leaf from its contract: a tensor the capture states on the host is
 built there on every
 copy, as an activation is, pinned (`_host`); an
@@ -510,6 +512,7 @@ _ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 _FROM = ("replay_start", "cached_until")
 _SWA = "atom.model_ops.v4_kernels.state_writes:swa_write"
 _GATHER = "atom.model_ops.attentions.token_layout.gather:gather_rows"
+_COMMIT = "atom.model_ops.attentions.deepseek_v41.speculative:_launch_commit_cursors"
 V41_NAMES = {
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_prefix"): f"{_CACHE}.0",
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_extend"): f"{_CACHE}.1",
@@ -538,6 +541,8 @@ V41_NAMES = {
     (f"{_INDPTRS}:_launch_window_rows", "eptr"): f"{_CACHE.format(ratio=0)}.1",
     (_FUSED, "state_slot_mapping"): "step.slots",
     (_SWA, "state_slot_per_seq"): "step.slots",
+    # the cursor commit's segment starts, `step.cu_seqlens_q[:count]`
+    (_COMMIT, "starts"): "step.cu_seqlens_q",
     (_ROPE, "positions", "query"): "step.positions",
     (_ROPE, "positions", "key"): "step.plans.{ratio}.key_rope_positions_gpu",
     ("aten.index_select.default", "index", "kv"): "step.slots",
@@ -685,13 +690,25 @@ RING = "atom.model_ops.attentions.pool_layout.v4_pool_geometry:WindowParams"
 #: DeepSeek-V4.1's DSpark draft block, by the operator and slot of each leaf
 #: of its drafter's that takes its anchors or what ATOM builds from them on
 #: the device each step (`DSparkProposer.propose`, `DeepseekV41DSpark.
-#: block_backbone`, `Stub._block`): the item of that build it takes.
+#: block_backbone`, `TentativeState.commit`, `Stub._block`): the item of that
+#: build it takes.
 BLOCK = {
     ("atom.spec_decode.dspark_proposer:DSparkProposer._stage_anchors", "rows"): "rows",
+    (_COMMIT, "anchors"): "rows",
     (f"{_V41}.dspark:draft_step_indices", "positions"): "anchors",
     (f"{_V41}.rope_window:_launch_rope_window", "positions"): "positions",
     ("atom.model_ops.sparse_attn_v4:_sparse_attn_triton", "topk_idxs"): "indices",
     ("aiter._inverse_rope_group_quant_kernel.default", "positions"): "positions",
+}
+#: DeepSeek-V4.1's leaves whose positions a replayed prefill gathers on the
+#: device from the step's, by operator and slot, a leaf of the draft block
+#: taking `BLOCK`'s: layer 39's query rotation and its output's inverse at its
+#: queries' (`ReplayPlan.queries`), and its DSpark drafter's draft-KV tail at
+#: its tail's rows (`DeepseekV41DSpark.write_context_kv`, `_replayed`).
+REPLAYED = {
+    (f"{_V41}.rope_window:_launch_rope_window", "positions"): "queries",
+    ("aiter._inverse_rope_group_quant_kernel.default", "positions"): "queries",
+    (f"{_V41}.dspark:fused_draft_kv_tail", "positions"): "tail",
 }
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
@@ -1384,7 +1401,8 @@ class Stub:
                 listed = LISTS.get((op["op"], path)) if act else None
                 window = act and (op["op"], path) in WINDOWS
                 block = self.specs and drafted and BLOCK.get((op["op"], path))
-                built = listed is not None or window or block
+                replayed = act and not block and REPLAYED.get((op["op"], path))
+                built = listed is not None or window or block or replayed
                 if spec["role"] == "metadata" or index or built:
                     token = (op["op"], path) in TOKEN_IDS
                     pool = {"input_ids": input_ids} if token else live
@@ -1435,6 +1453,8 @@ class Stub:
                             pool = self._windows(md.cache, live, op)
                         if block:  # as the drafter builds it for its block
                             pool = self._block(md.cache, fc.context, block)
+                        if replayed:  # as a replayed prefill gathers them
+                            pool = _replayed(plan, fc.context, replayed)
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
@@ -2544,6 +2564,18 @@ def _passes(fc) -> dict:
         passes[plan.last.numel()] = queries, plan.finishing_gpu
     passes[None] = step, getattr(fc.context, "scheduled_tokens_gpu", None)
     return passes
+
+
+def _replayed(plan, context, item) -> dict[str, torch.Tensor]:
+    """The positions a leaf of `REPLAYED` takes, by name, as the replayed
+    prefill of decoder plan `plan` gathers them from `context`'s: layer 39's
+    queries' (`ReplayPlan.queries`), or its draft-KV tail's, at the tail's
+    rows (`write_context_kv`); each a tensor of its own."""
+    if plan is None:
+        raise ValueError("no replayed prefill here gathers its positions")
+    if item == "queries":
+        return {"plan.queries.positions": plan.queries().positions}
+    return {"plan.tail_rows.positions": context.positions[plan.tail_rows]}
 
 
 def _pass_rows(op) -> int | None:
