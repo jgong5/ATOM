@@ -243,6 +243,10 @@ def batch_view(
     shapes = tuple(
         RequestShape(int(q), int(c), i >= prefill) for i, (q, c) in enumerate(rows)
     )
+    if not shapes and group_max_tokens is not None:
+        # An empty dummy reports no token to the DP sync, where the fabricated
+        # one counted its row: the group's peak holds that row, as it did.
+        group_max_tokens = max(group_max_tokens, _dummy_row(batch, mode).query_tokens)
     return BatchView(
         shapes or (_dummy_row(batch, mode),),
         capture_rung=_rung(mode),
