@@ -163,6 +163,10 @@ def _measuring_rank(config, todo, refuse, rank):
     # the other, and the group's connect waits on that timeout.
     store.set(f"up/{me}", "1")
     store.wait(["up/0", "up/1"])
+    # Gloo binds the address the hostname resolves to, one DNS lookup per rank
+    # inside the group's timeout; loopback needs no lookup. The rank's process
+    # ends with its launch, so the variable dies with it.
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
     # a rank left waiting in a call fails, not hangs
     wait = datetime.timedelta(seconds=RUNNER_WAIT if refuse == "runner" else 10)
     dist.init_process_group("gloo", store=store, rank=me, world_size=2, timeout=wait)
