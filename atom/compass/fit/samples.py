@@ -14,6 +14,12 @@ no sample; its file still counts in the run's digest. An empty
 rank file lost its lines, and refuses.
 A record whose run.json names `aiter_jit_builds` or `ptl_changes` refuses,
 naming them, and so does one whose `source` counts uncommitted files.
+With `GRADED_ONLY_ENV` set to ``1``, a record's samples start at its graded
+window: the first step holding a request its client runs name as sent (their
+exports' ``requests``, the warmup's left out), every rank's earlier steps
+dropped after labelling, which still reads them. For a fit on the run it is
+compared against, where the warmup's transients (a page cache filling, the
+first touch of kernels) are not the graded window's.
 
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
@@ -49,6 +55,7 @@ A stated engine file (`--engine`) stands in for each record's own as
 
 import dataclasses
 import json
+import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -72,6 +79,9 @@ from atom.compass.validate.bound import _split
 
 #: The run.json format this reads.
 FORMAT_VERSION = 2
+#: The variable that, set to ``1``, keeps a record's samples from its graded
+#: window on (module docstring); unset, every labelled step is a sample.
+GRADED_ONLY_ENV = "COMPASS_FIT_GRADED_ONLY"
 #: A step measurement's one member: the bench replies for the whole TP group.
 MEMBER = ("measurement", Topology().ranks()[0], "json")
 #: What names a GPU's model in run.json's `device`.
@@ -145,6 +155,15 @@ def _record(
             f"{steps} holds {ARRIVALS}, so its steps are not numbered as its lines"
         )
     record = served(steps, client_runs)
+    graded_from = None
+    if os.environ.get(GRADED_ONLY_ENV) == "1":
+        held = [s["step"] for s in _steps(record) if s["client_run"] is not None]
+        if not held:
+            raise ValueError(
+                f"{GRADED_ONLY_ENV}=1, and no step of {directory} holds a request "
+                "its client runs name as sent"
+            )
+        graded_from = min(held)
     sampling = sorted({p for s in _steps(record) for p in s["sampling"]})
     if len(sampling) > 1:
         raise ValueError(
@@ -160,6 +179,8 @@ def _record(
     name, samples = ", ".join(map(digest, files)), []
     for got, _ in label_run(files, name, _split, floored):
         for s in got:
+            if graded_from is not None and s.step < graded_from:
+                continue
             at = traces[s.rank, s.step]
             traced = {**s.provenance, "traces": at, "profiled": run["profiled"]}
             if stated is not None and (key := traced["config"]) is not None:
