@@ -192,6 +192,25 @@ def test_a_deployment_on_one_node_keeps_one_clock_and_refuses_events_out_of_orde
     }
 
 
+def test_a_one_node_deployment_whose_kv_crossed_the_network_keeps_one_clock(
+    tmp_path,
+):
+    """`deploy.sh --kv-over-network`: the KV link is inter_node, but the decode
+    ran on this node (`across_nodes` false), so its forwards are read on the
+    client's clock, as an intra-node deployment's are, and not joined to it."""
+    run = tmp_path / "run"
+    _deployment(run)
+    meta = json.loads((run / "run.json").read_text())
+    (run / "run.json").write_text(json.dumps(meta | {"across_nodes": False}))
+
+    out = split.write(run)
+
+    assert out == {
+        "refused": "request a's first token is 999.980000000 s before its "
+        "hand-over, so its events are not on one clock"
+    }
+
+
 def test_a_request_no_later_forward_hands_over_is_unsplit(tmp_path):
     """The decode side's record ends at the forward naming B."""
     run = tmp_path / "run"

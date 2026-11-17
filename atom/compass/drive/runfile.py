@@ -239,8 +239,10 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     each side's DP width read from its own, the router's per-request forward
     cost the prefill side's host entry's ``router_s`` hop, None for the floor
     where it states none, and the KV transfers priced on the spec's
-    `kv_link`, ``intra_node`` for two instances on one node and
-    ``inter_node`` across two, which alone reads ``--network``. Its hops are
+    `kv_link`, ``intra_node`` for two instances on one node whose KV moves
+    over the GPUs' own links and ``inter_node`` across two, or on one node
+    whose KV crosses the network (`deploy.sh --kv-over-network`: Mooncake's
+    RDMA through the NICs, or TCP), which alone reads ``--network``. Its hops are
     the prefill side's host entry's, its ``decode_hops`` the decode side's,
     each side's config resolved from its arguments as deploy.sh starts its
     instance, with its KV role on the simulated connector

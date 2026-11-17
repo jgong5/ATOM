@@ -54,7 +54,8 @@
 # OUT. A client drives the deployment through server.json as it drives one
 # server (client.sh); no client starts here. It serves until SIGTERM or SIGINT,
 # then stops the instances, the router and the authority, writes OUT/run.json,
-# the command line, the KV link, the run file and the router's command, and,
+# the command line, the KV link, whether the decode ran on another node
+# (`across_nodes`), the run file and the router's command, and,
 # once a client's export is complete (OUT/artifacts/client_run.json), each
 # request's split, OUT/request_split.json (atom/compass/report/split.py), CI's
 # Prometheus report of a simulated run's series, OUT/prometheus.html, or why
@@ -68,7 +69,16 @@
 # record --out`, which checks its node's GPUs before and after.
 # --on PREFIX, a command prefix, one word split on whitespace, such as `ssh
 # <host>` or `srun -w <host> ...`, starts the decode instance on another node,
-# and the KV link is then inter_node, else intra_node. Each instance runs its
+# and the KV link is then inter_node, else intra_node. --kv-over-network, among
+# <flags>, keeps both instances on this node but makes the KV link inter_node
+# too: Mooncake moves the KV through the NICs (RDMA) or over TCP, never over the
+# GPUs' intra-node links, so an 8-GPU node holding both instances (an MI355X's,
+# 1P1D at DPA4 a side) prices its KV on --network's link, as a measured or
+# assumed network file states it. run.json names where the decode ran,
+# `across_nodes`, apart from `kv_link`. KV_EXTRA, a JSON object, is merged into
+# each real instance's Mooncake kv config, such as '{"protocol": "tcp"}' on a
+# node with no RDMA HCA; a simulated instance's connector takes none.
+# Each instance runs its
 # command, OUT/<side>.sh, which first writes its process id to OUT/<side>.pid;
 # the decode's as `PREFIX bash OUT/decode.sh`, stopped as `PREFIX kill -TERM
 # <pid>`, a second command under the first, so srun inside an allocation takes
@@ -85,7 +95,7 @@ ROOT=$(compass_tree_root) || exit $?
 ARGV=("$0" "$@")
 (($# >= 2)) && [[ $1 != -* ]] || bad "no OUT"
 [[ $2 == run || $2 == record ]] || bad "the command after OUT is run or record"
-OUT=$1 cmd=$2 side=flags seen= head=0
+OUT=$1 cmd=$2 side=flags seen= head=0 KV_OVER_NETWORK=0
 shift 2
 flags=() prefill=() decode=() router=() prefill_own=() decode_own=() on=()
 while (($#)); do
@@ -100,7 +110,7 @@ while (($#)); do
         shift
     else
         case $side$head in
-        flags0) flags+=("$1") ;; prefill0) prefill+=("$1") ;; decode0) decode+=("$1") ;;
+        flags0) [[ $1 == --kv-over-network ]] && KV_OVER_NETWORK=1 || flags+=("$1") ;; prefill0) prefill+=("$1") ;; decode0) decode+=("$1") ;;
         router0) router+=("$1") ;; prefill1) prefill_own+=("$1") ;; decode1) decode_own+=("$1") ;;
         esac
     fi
@@ -126,8 +136,14 @@ mkdir -p "$OUT"
 OUT=$(realpath "$OUT")
 WAIT_S=${WAIT_S:-600}
 PREFIX_S=${PREFIX_S:-60}
-KV_LINK=intra_node
-((${#on[@]} == 0)) || KV_LINK=inter_node
+KV_LINK=intra_node ACROSS_NODES=0
+((${#on[@]} == 0)) || KV_LINK=inter_node ACROSS_NODES=1
+((!KV_OVER_NETWORK)) || KV_LINK=inter_node
+((!ACROSS_NODES || !KV_OVER_NETWORK)) || bad "--kv-over-network keeps the decode on this node, and --on starts it on another"
+if [[ -n ${KV_EXTRA:-} ]]; then
+    python3 -c 'import json, sys; assert isinstance(json.loads(sys.argv[1]), dict)' "$KV_EXTRA" 2>/dev/null ||
+        bad "KV_EXTRA is no JSON object: $KV_EXTRA"
+fi
 
 compass_env "$ROOT"
 compass_require_tree "$ROOT" || exit $?
@@ -235,6 +251,8 @@ instance() { # SIDE KV_ROLE KV_PORT: write the instance's command, OUT/SIDE.sh, 
     if [[ $cmd == record ]]; then
         command=("$cmd" "${flags[@]}")
         kv="{\"kv_role\":\"$2\",\"kv_connector\":\"mooncake\",\"handshake_port\":$3}"
+        [[ -z ${KV_EXTRA:-} ]] || kv=$(python3 -c 'import json, sys
+print(json.dumps({**json.loads(sys.argv[2]), **json.loads(sys.argv[1])}))' "$kv" "$KV_EXTRA")
     fi
     [[ $1 == prefill ]] || prefix=("${on[@]}")
     command+=("${own[@]}" --out "$OUT/$1" -- "${atom[@]}" --kv-transfer-config "$kv")
@@ -321,12 +339,12 @@ for pid in $P $D $authority $R; do
 done
 trap - EXIT
 python3 -c 'import json, os, sys
-out, link, n, *rest = sys.argv[1:]
-run = {"command": rest[: int(n)], "kv_link": link, "router": rest[int(n) :]}
+out, link, across, n, *rest = sys.argv[1:]
+run = {"command": rest[: int(n)], "kv_link": link, "across_nodes": across == "1", "router": rest[int(n) :]}
 if os.path.exists(out + "/run_file.json"):
     run["run_file"] = json.load(open(out + "/run_file.json"))
 open(out + "/run.json.part", "w").write(json.dumps(run))' \
-    "$OUT" "$KV_LINK" "${#ARGV[@]}" "${ARGV[@]}" "${ROUTER[@]}"
+    "$OUT" "$KV_LINK" "$ACROSS_NODES" "${#ARGV[@]}" "${ARGV[@]}" "${ROUTER[@]}"
 mv "$OUT/run.json.part" "$OUT/run.json"
 if [[ -s $OUT/artifacts/client_run.json ]]; then
     (cd / && python3 -m atom.compass.report.split "$OUT") ||

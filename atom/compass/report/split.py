@@ -29,8 +29,10 @@ to OUT/`FILE`, one JSON document, and no other file changes:
 - ``unsplit``: each other request aiperf recorded, by its ``request_id``, and why.
 - ``clock``: ``virtual`` for a simulated run; ``monotonic`` for a real one, the
   host clock its client shares with the server it reaches at 127.0.0.1. A real
-  deployment's decode side on another node (`run.json`'s ``kv_link``
-  ``inter_node``) is joined to it: ``decode_offset_s`` bounds what its times
+  deployment's decode side on another node (`run.json`'s ``across_nodes``, or,
+  where an older one states none, its ``kv_link`` ``inter_node``) is joined to
+  it; one whose KV crossed the network from this node (`deploy.sh
+  --kv-over-network`) shares the clock: ``decode_offset_s`` bounds what its times
   take to land on this clock, at least each request's prefill return less its
   decode entry and at most its first token less its hand-over's return; they
   take the upper bound.
@@ -210,7 +212,7 @@ def split(run) -> dict:
     if not events:
         raise ValueError("no request aiperf finished is named by its step records")
     clock = {"clock": "virtual" if simulated else "monotonic"}
-    if not simulated and meta.get("kv_link") == "inter_node":
+    if not simulated and meta.get("across_nodes", meta.get("kv_link") == "inter_node"):
         low = max(e["prefill return"] - e["decode entry"] for e in events.values())
         high = min(e["first token"] - e["hand-over"] for e in events.values())
         for e in events.values():
