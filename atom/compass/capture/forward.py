@@ -81,7 +81,7 @@ from atom.compass import ir
 from atom.compass.backends.op_graph import KV, gathered_off_default
 from atom.compass.ir.nodes import Reduced
 
-from . import driverless, peers
+from . import driverless, files_of, peers
 from .graph import LAYER, Fork, Join, Traced, _json, build, to_json
 
 #: The fewest KV blocks a capture allocates; a shape that needs more gets more.
@@ -161,6 +161,45 @@ FUSED_MOES = ("aiter.fused_moe_.default", "aiter.rocm_aiter_fused_moe.default")
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
 logger = logging.getLogger(__name__)
+#: The path of each data file this process opened to read since its first
+#: capture began (`watch_reads`); None before that.
+_READ: set | None = None
+#: Python's own files, which count as run when imported, not when read: ATOM's
+#: source reading, a traceback or `inspect` reads them without running them.
+_PYTHON = (".py", ".pyc")
+
+
+def watch_reads() -> set:
+    """The absolute path of each file but Python's own (`_PYTHON`) this process
+    opens to read from its first call on, as the `open` audit event names it
+    (`_opened`). An audit hook cannot be removed, so one serves the process."""
+    global _READ
+    if _READ is None:
+        _READ = set()
+        sys.addaudithook(_opened)
+    return _READ
+
+
+def _opened(event, args):
+    """A file opened to read by name, in an `open` audit event: its path is
+    `watch_reads`'s. A hook that raises fails the open, so an event of another
+    form is passed over."""
+    if event != "open" or len(args) != 3:
+        return
+    path, mode, flags = args
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        return
+    if (
+        mode is None
+        and isinstance(flags, int)
+        and flags & os.O_ACCMODE == os.O_RDONLY
+        or (isinstance(mode, str) and not set(mode) & set("wax+"))
+    ):
+        try:
+            if not (path := os.fsdecode(path)).endswith(_PYTHON):
+                _READ.add(os.path.abspath(path))
+        except (OSError, ValueError):
+            pass
 
 
 class Shape(NamedTuple):
@@ -360,9 +399,12 @@ def _engine(text: str):
 def missed(store, key) -> str:
     """For an `op_graph` `key` `store` holds no entry at, each field in which
     a graph it holds at the key's shape and otherwise the key's structure
-    differs, as text: the ATOM source or torch it was traced under, then each
-    engine field (`step_grid.differ`); "" when it holds none."""
+    differs, as text: the ATOM source or torch it was traced under, or each
+    file of one keyed by its files that reads otherwise here (`changed`), then
+    each engine field (`step_grid.differ`); "" when it holds none."""
+    from atom.compass.artifacts import Key
     from atom.compass.artifacts.store import ENTRY_FILE
+    from atom.compass.capture import FILES, changed
     from atom.compass.run.step_grid import differ
 
     head, here, tail = _engine(key.values["structure"])
@@ -372,11 +414,17 @@ def missed(store, key) -> str:
         if there.get("shape") == key.values["shape"]:
             at = _engine(there.get("structure", ""))
             if at and (at[0], at[2]) == (head, tail):
+                files = str(there.get("source_root")).startswith(f"{FILES}-")
                 fields = [
                     f"{name} {there.get(name)!r} in the graph and {value!r} here"
                     for name, value in key.fields
-                    if name not in ("structure", "shape") and there.get(name) != value
+                    if name not in ("structure", "shape")
+                    and there.get(name) != value
+                    and not (files and name == "source_root")
                 ]
+                if files and (moved := changed(store, Key.of(key.kind, **there))):
+                    more = f" and {len(moved) - 5} more" * (len(moved) > 5)
+                    fields.append(f"files {', '.join(moved[:5])}{more}")
                 if engine := differ(at[1], here, "the graph"):
                     fields.append(f"engine config: {', '.join(engine)}")
                 named.append(", ".join(fields))
@@ -1666,9 +1714,12 @@ class Tracer:
     `atom_args`, on a declared `arch` or the card `read` declares
     (`driverless.card`), stepped at shapes (`trace`). It is built at the first
     `trace`, once, and every later one steps the same runner. The capture's
-    patches hold until `close`; the declared device, for the process."""
+    patches hold until `close`; the declared device, for the process. Each
+    graph states the files its process ran and read up to its step
+    (`capture.files_of`), from the reads watched since this one was made."""
 
     def __init__(self, model, tp, tmpdir, atom_args=(), arch="gfx942", read=None):
+        self.reads = watch_reads()
         self.declared = driverless.install(tmpdir, arch, read)
         self.config = _config(model, tp, atom_args)
         self.stack, self.runner, self.blocks = contextlib.ExitStack(), None, 0
@@ -1933,4 +1984,4 @@ class Tracer:
                 declared.pop("mono", None)
                 if mono := list({id(why): why for why in recorder.declined}.values()):
                     declared["mono"] = mono
-                yield graph, self.digest, dict(declared)
+                yield graph, self.digest, {**declared, "files": files_of(self.reads)}

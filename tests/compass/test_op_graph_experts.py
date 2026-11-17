@@ -33,6 +33,7 @@ from atom.compass.artifacts import (
     member_name,
 )
 from atom.compass.backends import CostRefused
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.bench import ops
 from atom.compass.capture import driverless, graph_key
@@ -42,7 +43,7 @@ from atom.compass.run.step_grid import keyed
 
 RANK = Topology().ranks()[0]
 LAW = pathlib.Path(__file__).parents[2] / "scripts/compass/laws"
-LAW /= "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json"
+LAW /= "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json.xz"
 #: Each graph's config fields and environment off the first's.
 VARIANTS = {
     "bf16": ({}, {}),
@@ -164,7 +165,7 @@ def test_a_step_law_fitted_with_bounded_replay_refuses_a_run_without_it(
 
 
 def test_atom_s_moe_defaults_key_the_fields_an_existing_law_states(tmp_path):
-    law = json.loads(LAW.read_text())["engine_config"]
+    law = read_json(LAW)["engine_config"]
     default = keyed(deployment(tmp_path, moe_backend="standard").config)
     moved = keyed(deployment(tmp_path, moe_backend="mega", eplb_enable=True).config)
 

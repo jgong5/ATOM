@@ -940,6 +940,33 @@ def test_run_and_measure_steps_lay_out_dp_attention_alike(
         measure.atom_config([*atom_args, "--compass-run", "run.json"])
 
 
+@pytest.mark.parametrize("node", [0, 1])
+def test_run_lays_out_one_node_of_a_dp_attention_group_across_nodes_as_its_engines(
+    monkeypatch, model_dir, node  # noqa: F811
+):
+    # Each node of a TP 2 group of two DP ranks on two nodes starts two of its
+    # four engines; a check that read the whole group would pass a step law
+    # the runner refuses. The benches run the whole group on one host.
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    atom_args = ["--model", str(model_dir), "-tp", "2", "--enable-dp-attention"]
+    atom_args += ["--data-parallel-size", "2", "--data-parallel-size-local", "1"]
+    atom_args += ["--data-parallel-rank", str(node)]
+    served = drive_run._config(atom_args)
+    pc = served.parallel_config
+    fields = ("data_parallel_size", "data_parallel_size_local", "data_parallel_rank")
+    got = {"tensor_parallel_size": served.tensor_parallel_size}
+    got |= {name: getattr(pc, name) for name in fields}
+    print(f"\nnode {node}: {got}")
+
+    assert list(got.values()) == [1, 4, 2, 2 * node]
+    measured = measure.atom_config(atom_args).parallel_config
+    assert (measured.data_parallel_size, measured.data_parallel_size_local) == (4, 4)
+
+
 #: The API server's flags `compass record` passes it, as MiniMax-M3's
 #: submission serves with them.
 SERVED = [

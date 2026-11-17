@@ -300,7 +300,9 @@ def _sampling(text: str) -> dict:
 
 def atom_config(atom_args, server: bool = False):
     """ATOM's `Config` for its arguments, as `LLMEngine` resolves one and
-    `CoreManager` rewrites it under DP attention, each TP rank a DP rank of TP 1.
+    `CoreManager` rewrites it under DP attention, each TP rank a DP rank of TP 1:
+    a server's node runs the DP ranks `CoreManager` starts there, and the
+    benches run the whole group on one host.
     With `server`, `atom_args` are a server's, whose own flags pass unread, and
     no tokenizer loads; otherwise the server's flags `compass record` passes it
     (`measure_memory.FRONTEND`) are taken and dropped, any other flag the engine
@@ -313,6 +315,7 @@ def atom_config(atom_args, server: bool = False):
     from atom.compass.drive.runfile import _engine_args
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
+    from atom.model_engine.engine_core_mgr import iter_dp_rank_assignments
     from atom.model_engine.llm_engine import _load_tokenizer
 
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
@@ -324,7 +327,13 @@ def atom_config(atom_args, server: bool = False):
     kwargs = engine_args._get_engine_kwargs().items()
     config = Config(engine_args.model, **{k: v for k, v in kwargs if k in names})
     if config.enable_dp_attention:
+        # The engines `CoreManager` starts on this node, each its (global,
+        # local) DP rank, the first the node's lowest.
+        node = iter_dp_rank_assignments(config)
         layout(config)
+        if server:
+            config.parallel_config.data_parallel_size_local = len(node)
+            config.parallel_config.data_parallel_rank = node[0][0]
     if server:
         return config
     tokenizer = _load_tokenizer(config.model, config.trust_remote_code)

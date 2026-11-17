@@ -22,7 +22,7 @@ more as it drafts, and a prefill's rows, split as the capture split them,
 follow `--context` cached tokens each, none when it is not given; there
 the planes of DeepSeek-V4.1's FP8 indexer, which the capture sized to its own
 rows' KV blocks, are as wide as the point's rows' (`PAGE_WIDE`), a top-k on
-aiter's kernel at that width (`_dispatched`). Rows the KV
+aiter's kernel at that width and rows (`_dispatched`). Rows the KV
 pool cannot hold at once are ragged (`point_rows`), and the point records its
 rows; under `--plan` over ragged decode steps a decode point
 the pool cannot hold refuses instead, past the first round (`RAGGED`).
@@ -47,8 +47,10 @@ those its index build writes for the leaf's pass, off a selection spread over
 each row's visible rows (`Stub._lists`), and its DSpark drafter's FP8 window
 read takes the addresses and pointers ATOM's window read builds for the
 drafter's stage layers at the step's state slots (`Stub._windows`), and its
-draft block its anchors, and its RoPE and attention the positions and
-indices ATOM builds from them, at zero rejections (`Stub._block`). A `Stub`
+draft block and cursor commit its anchors, and its RoPE and attention the
+positions and indices ATOM builds from them, at zero rejections
+(`Stub._block`); at a replayed prefill, layer 39's query rotation and the
+draft-KV tail take the positions ATOM gathers there (`_replayed`). A `Stub`
 calls each leaf from its contract: a tensor the capture states on the host is
 built there on every
 copy, as an activation is, pinned (`_host`); an
@@ -95,7 +97,8 @@ timed, for its pass as its forward's first reader fills it
 (`PagedAttentionCache.indptrs`), the leaf refused by name where its cache
 fills none; an object is rebuilt from its class
 and state as the capture's replay rebuilds one, its tensors built as any other
-argument's, its activations fresh on every copy, a lifted call's sequence a tuple.
+argument's, its activations fresh on every copy, a lifted call's sequence a tuple,
+but a DeepSeek-V4.1 window ring (`RING`) as its layer's of the point's pool (`_ring`).
 A leaf whose operator cannot run, or that copies to the host or with host
 memory ATOM keeps pageable (`_pageable`), refuses by name.
 On one GPU at a DP-attention layout, the runner is one DP rank's own, TP 1 and DP 1, the
@@ -104,9 +107,14 @@ refuses: it is measured across the layout's ranks, where a DP all-gather's
 `x` holds each rank's own `sizes` entry's rows, the capture's being rank 0's
 (`_own_rows`).
 A collective leaf is one family over its message bytes, decode and prefill
-alike (`exchange`), which the plan ladders, densifies and covers. aiter's
-comm-fused MoE (`COMM_FUSED`) refuses by name: its runners are built across
-its ranks by ATOM's loader, and no runner here builds them.
+alike (`exchange`), which the plan ladders, densifies and covers.
+aiter's comm-fused MoE (`COMM_FUSED`) runs on a process group, as a collective
+does: it is called on the runtime ATOM builds for the model's first MoE layer
+that takes it, as its loader builds it before the runner's KV pool is sized,
+its runners' peer memory with it (`_comm_fused`), with the leaf's arguments,
+its stated group width and reduction aside, and, where it holds no shared
+expert's output, as under ATOM's dual-stream MoE, zeros at the rows its
+stage 2 asks for, built once (`Stub._comm_fused`).
 MORI's dispatch and combine are methods of a handle no graph holds: each is
 called at MORI's entry point on the handle ATOM builds for the model's MoE,
 with the leaf's arguments, and, since neither runs twice in a row, timed
@@ -306,7 +314,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 40
+PROTOCOL = 42
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -481,6 +489,11 @@ _LOGITS = (
     "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
     "flydsl_fp8_paged_mqa_logits_gfx1250"
 )
+# V4.1's FP8 scorers, gfx1250's and gfx950's, which ATOM calls alike
+_SCORERS = (
+    _LOGITS,
+    "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
+)
 _FP4 = (
     "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup:"
     "flydsl_pa_mqa_logits_fp4_rowgroup"
@@ -499,6 +512,7 @@ _ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 _FROM = ("replay_start", "cached_until")
 _SWA = "atom.model_ops.v4_kernels.state_writes:swa_write"
 _GATHER = "atom.model_ops.attentions.token_layout.gather:gather_rows"
+_COMMIT = "atom.model_ops.attentions.deepseek_v41.speculative:_launch_commit_cursors"
 V41_NAMES = {
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_prefix"): f"{_CACHE}.0",
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_extend"): f"{_CACHE}.1",
@@ -506,11 +520,11 @@ V41_NAMES = {
     ("aiter.mla_sparse_prefill_v41.default", "kv_indptr_extend"): f"{_CACHE}.1",
     (_SCAN, "pptrs"): f"{_CACHE}.0",
     (_SCAN, "eptrs"): f"{_CACHE}.1",
-    (_LOGITS, "out_logits"): "workspace._logits",
+    **{(f, "out_logits"): "workspace._logits" for f in _SCORERS},
     (_FP4, "out"): "workspace._logits",
-    (_LOGITS, "context_lens"): "step.visible.{ratio}",
+    **{(f, "context_lens"): "step.visible.{ratio}" for f in _SCORERS},
     (_FP4, "row_ends"): "step.visible.{ratio}",
-    (_LOGITS, "kv_indices"): "workspace._tiles.{ratio}",
+    **{(f, "kv_indices"): "workspace._tiles.{ratio}" for f in _SCORERS},
     # where each row's logits start in the packed buffer (`score_layout`)
     (_FP4, "out_offsets"): _OFFSETS,
     (_TOPK, "row_starts", "packed"): _OFFSETS,
@@ -527,6 +541,8 @@ V41_NAMES = {
     (f"{_INDPTRS}:_launch_window_rows", "eptr"): f"{_CACHE.format(ratio=0)}.1",
     (_FUSED, "state_slot_mapping"): "step.slots",
     (_SWA, "state_slot_per_seq"): "step.slots",
+    # the cursor commit's segment starts, `step.cu_seqlens_q[:count]`
+    (_COMMIT, "starts"): "step.cu_seqlens_q",
     (_ROPE, "positions", "query"): "step.positions",
     (_ROPE, "positions", "key"): "step.plans.{ratio}.key_rope_positions_gpu",
     ("aten.index_select.default", "index", "kv"): "step.slots",
@@ -588,7 +604,9 @@ QUERIED = {(op, "batch_ids"): "plan.query_ids" for op in (_SCAN, _INDICES)}
 _MAXIMA = "atom.model_ops.deepseek_v41.indexer:_block_maxima"
 _V41 = "atom.model_ops.deepseek_v41"
 PAGE_WIDE = {
-    _LOGITS: ("context_lens", "out_logits", "kv_indices", "max_model_len"),
+    **dict.fromkeys(
+        _SCORERS, ("context_lens", "out_logits", "kv_indices", "max_model_len")
+    ),
     _TOPK: ("row_ends", "logits", "stride0"),
     _MULTI: ("seq_lens", "logits", "stride0"),
     _PICK: ("seqLens", "logits", "stride0"),
@@ -613,6 +631,10 @@ PACKED_ROWS = {
 #: precedes it, unless `FLYDSL_OFF`, which no `op_graph` key states, holds
 #: one of the values aiter reads as off.
 ONE_BLOCK = ("gfx1250",)
+#: The arches on which aiter's FlyDSL decode gate precedes it: a call the gate
+#: takes by its width, rows, k and `stable` runs FlyDSL's multi-CTA kernel
+#: (`_MULTI`), as aiter's own gate reads (`_flydsl_topk_decode_shape_supported`).
+GATED = ("gfx950",)
 FLYDSL_OFF = "AITER_DISABLE_FLYDSL_TOPK_DECODE"
 FLYDSL_OFF_VALUES = ("1", "true", "True", "yes", "YES")
 #: DeepSeek-V4.1's index tables an earlier leaf of its forward writes, by
@@ -625,8 +647,8 @@ FLYDSL_OFF_VALUES = ("1", "true", "True", "yes", "YES")
 #: sequence of its own (`starts`), and the packed maxima (`maxima`) and where
 #: the pick's packed rows start (`block_offsets`, `offsets`).
 _WRITTEN = {
-    (_LOGITS, "kv_indices"): "tiles",
-    (_LOGITS, "context_lens"): "context",
+    **{(f, "kv_indices"): "tiles" for f in _SCORERS},
+    **{(f, "context_lens"): "context" for f in _SCORERS},
     (_FP4, "block_tables"): "table",
     (_FP4, "row_ends"): "context",
     (_FP4, "query_start_loc"): "starts",
@@ -662,16 +684,31 @@ LISTS |= {("aiter.mla_sparse_prefill_v41.default", s): i for (_, s), i in LISTS.
 #: on the device each step (`PagedAttentionCache.read_windows`, `Stub._windows`).
 _WINDOWS = "atom.model_ops.attentions.deepseek_v41.packed_rows:gather_prefix_rows"
 WINDOWS = {(_WINDOWS, "addresses"), (_WINDOWS, "ptr")}
+#: A window ring's five scalars, which DeepSeek-V4.1's window writes and index
+#: builds take as its pool places a layer's ring, the capture's pool its own.
+RING = "atom.model_ops.attentions.pool_layout.v4_pool_geometry:WindowParams"
 #: DeepSeek-V4.1's DSpark draft block, by the operator and slot of each leaf
 #: of its drafter's that takes its anchors or what ATOM builds from them on
 #: the device each step (`DSparkProposer.propose`, `DeepseekV41DSpark.
-#: block_backbone`, `Stub._block`): the item of that build it takes.
+#: block_backbone`, `TentativeState.commit`, `Stub._block`): the item of that
+#: build it takes.
 BLOCK = {
     ("atom.spec_decode.dspark_proposer:DSparkProposer._stage_anchors", "rows"): "rows",
+    (_COMMIT, "anchors"): "rows",
     (f"{_V41}.dspark:draft_step_indices", "positions"): "anchors",
     (f"{_V41}.rope_window:_launch_rope_window", "positions"): "positions",
     ("atom.model_ops.sparse_attn_v4:_sparse_attn_triton", "topk_idxs"): "indices",
     ("aiter._inverse_rope_group_quant_kernel.default", "positions"): "positions",
+}
+#: DeepSeek-V4.1's leaves whose positions a replayed prefill gathers on the
+#: device from the step's, by operator and slot, a leaf of the draft block
+#: taking `BLOCK`'s: layer 39's query rotation and its output's inverse at its
+#: queries' (`ReplayPlan.queries`), and its DSpark drafter's draft-KV tail at
+#: its tail's rows (`DeepseekV41DSpark.write_context_kv`, `_replayed`).
+REPLAYED = {
+    (f"{_V41}.rope_window:_launch_rope_window", "positions"): "queries",
+    ("aiter._inverse_rope_group_quant_kernel.default", "positions"): "queries",
+    (f"{_V41}.dspark:fused_draft_kv_tail", "positions"): "tail",
 }
 #: The one leaf and slot built past its span: aiter's `mla_decode_fwd_v4_nm`
 #: at one KV split writes its BF16 `output` at the FP32 split stride, twice
@@ -851,13 +888,15 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     one that does not (`output`), of its target or of its drafter's part
     (`draft`, as `forward.structure` keys it). A prefill that produces none
     runs its target's leaves less the LM head and the sampler, so the
-    target's points at output cover both. A miss where the store holds the
-    shape under another engine config, or traced under another ATOM source or
-    torch (`capture.graph_key`), refuses naming what differs. A
+    target's points at output cover both. A graph traced under this ATOM
+    source and torch answers (`capture.graph_key`), else one whose files read
+    here as in its trace (`capture.lookup_by_files`). A miss where the store
+    holds the shape under another engine config or torch, or of a file that
+    reads otherwise, refuses naming what differs. A
     two-batch-overlap micro-batch's `shape` reads its own graph, and a shape
     stating its real MoE rows the graph of all of them."""
     from atom.compass.artifacts import ArtifactRefusal, Rule
-    from atom.compass.capture import graph_key
+    from atom.compass.capture import graph_key, lookup_by_files
     from atom.compass.capture.forward import missed, structure
 
     shape = shape._replace(real=None)
@@ -870,6 +909,8 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
         micro_batch=shape.micro_batch,
     )
     key = graph_key(at, str(shape))
+    if not store.directory_for(key).exists():
+        key = lookup_by_files(store, at, str(shape)) or key
     if not store.directory_for(key).exists() and (why := missed(store, key)):
         part = " that produces no output" * (not output)
         part += " as a two-batch-overlap micro-batch" * shape.micro_batch
@@ -1028,7 +1069,8 @@ def _runner(config, rank: int):
     blocks a rank has room for, sized by ATOM with the parameters' bytes held
     on the device and then freed for the weights each leaf builds, and with
     the MORI exchange ATOM's loader builds before it, MORI's heap with it, in
-    its `mori` (`_prepare_finalize`) where its MoE exchanges through MORI;
+    its `mori` (`_prepare_finalize`) where its MoE exchanges through MORI, and
+    the runtime of aiter's comm-fused MoE in its `comm_fused` (`_comm_fused`);
     the runner attributes the allocation set are in its `kv_held`, and by path each
     tensor it bound on a metadata builder (`BUILDERS`, `_bound`) but a view the
     builder cut from one of the runner's (`_cut_from`); and, when
@@ -1072,7 +1114,9 @@ def _runner(config, rank: int):
     held = torch.empty(nbytes, dtype=torch.uint8, device=runner.device)
     # as ATOM's loader, before the pool is sized: built at the first MORI
     # leaf instead, the heap took room the pool left the leaves' weights
-    runner.mori = _prepare_finalize(dict(runner.model.named_modules()), mori_only=True)
+    modules = dict(runner.model.named_modules())
+    runner.mori = _prepare_finalize(modules, mori_only=True)
+    runner.comm_fused = _comm_fused(modules)
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     del held
     _release()  # the pool takes the room the hold had
@@ -1128,6 +1172,20 @@ def _prepare_finalize(modules: dict, mori_only: bool = False):
     return name, made, method.moe.in_dtype
 
 
+def _comm_fused(modules: dict):
+    """The runtime ATOM's loader (`init_prepare_finalize`) builds for aiter's
+    comm-fused MoE on the first layer in `modules` that takes it, the runners
+    every such layer shares with it, their peer memory among them; None where
+    no layer takes it."""
+    layer = next(
+        (m for m in modules.values() if getattr(m, "_comm_fused_moe", None)), None
+    )
+    if layer is None:
+        return None
+    layer._comm_fused_moe.initialize(layer)
+    return layer._comm_fused_moe.runtime
+
+
 class Stub:
     """The leaves of a point timed beside ATOM's runner, on the forward context
     and live metadata ATOM prepared for each placement of its batch. `alone`
@@ -1178,6 +1236,8 @@ class Stub:
         # what ATOM builds for MORI's exchange: the runner's, built before
         # its pool was sized (`_runner`), else once a MORI leaf asks (`_mori`)
         self.mori = getattr(runner, "mori", None)
+        # and for aiter's comm-fused MoE, when the runner's layers take it
+        self.comm_fused = getattr(runner, "comm_fused", None)
         # DeepSeek-V4.1's compress ratios by the rows a page holds at each
         builder = getattr(runner, "attn_metadata_builder", None)
         geometry = getattr(builder, "geometry", None)
@@ -1253,6 +1313,8 @@ class Stub:
         for owner in (fc.attn_metadata, fc.context):
             live |= {k: v for k, v in vars(owner).items() if torch.is_tensor(v)}
         device, md = self.runner.device, fc.attn_metadata
+        if not self.placed:  # one capture's pool placed the point's window rings
+            self.captured = _captured(getattr(md, "cache", None), self.leaves)
         live = {
             k: v
             for k, v in live.items()
@@ -1339,7 +1401,8 @@ class Stub:
                 listed = LISTS.get((op["op"], path)) if act else None
                 window = act and (op["op"], path) in WINDOWS
                 block = self.specs and drafted and BLOCK.get((op["op"], path))
-                built = listed is not None or window or block
+                replayed = act and not block and REPLAYED.get((op["op"], path))
+                built = listed is not None or window or block or replayed
                 if spec["role"] == "metadata" or index or built:
                     token = (op["op"], path) in TOKEN_IDS
                     pool = {"input_ids": input_ids} if token else live
@@ -1390,6 +1453,8 @@ class Stub:
                             pool = self._windows(md.cache, live, op)
                         if block:  # as the drafter builds it for its block
                             pool = self._block(md.cache, fc.context, block)
+                        if replayed:  # as a replayed prefill gathers them
+                            pool = _replayed(plan, fc.context, replayed)
                         if not pool:
                             raise ValueError(f"ATOM passes {path} {what}: not live")
                         name, view = _meta(spec, path, pool, what)
@@ -1934,20 +1999,15 @@ class Stub:
         its copies read, where `n` stops under both `m` and K. A MORI leaf is
         timed at MORI's entry point through graphs of its own (`_Mori`), each
         one's median kept (`parts_ns`); a combine's routing is its first
-        copy's."""
+        copy's. aiter's comm-fused MoE is called on ATOM's runtime
+        (`_comm_fused`)."""
         from atom.compass.bench.ranks import agreed, cpu_group, refused_together
         from atom.utils import forward_context
 
-        if self.alone and exchange(op):
+        if self.alone and (exchange(op) or op["op"] == COMM_FUSED):
             raise ValueError(
                 f"a collective over the layout's {self.alone} ranks, measured "
                 "across them, not on a runner that runs one alone"
-            )
-        if op["op"] == COMM_FUSED:
-            raise ValueError(
-                f"aiter's comm-fused MoE, which reduces across its {op['args']['tp']} "
-                "ranks on the runners ATOM's loader builds there: no runner here "
-                "builds them"
             )
         if op["args"].get("device") == "cpu":
             raise ValueError(
@@ -1962,6 +2022,9 @@ class Stub:
         if op["op"].startswith(MORI):  # a method of a handle no graph holds
             with refused_together():
                 fn = self._mori(op)
+        elif op["op"] == COMM_FUSED:
+            with refused_together():
+                fn = self._comm_fused(op)
         else:
             fn = _function(op["op"])
         m = self.cold_copies.get(sig, n)
@@ -2085,9 +2148,12 @@ class Stub:
                 count = max(op["occurrences"], self.cold_copies.get(sig, 1))
                 return self._weight(value, c, 1 if path == table else count)
             if isinstance(value, dict) and "object" in value:
-                return rebuild_object(
-                    value["object"], build(path, value["state"], None)
-                )
+                got = rebuild_object(value["object"], build(path, value["state"], None))
+                cache = getattr(snap.attn_metadata, "cache", None)
+                geometry = getattr(cache, "geometry", None)
+                if value["object"] == RING and hasattr(geometry, "window_bytes"):
+                    return _ring(geometry, cache.num_pages, got, self.captured)
+                return got
             if (
                 isinstance(value, dict)
                 and value.get("role") == "activation"
@@ -2243,6 +2309,40 @@ class Stub:
                 f"token) {built}, and the leaf states {stated}"
             )
         return _Mori(op, handle, dtype)
+
+    def _comm_fused(self, op):
+        """A call of aiter's comm-fused MoE leaf `op` on the runtime ATOM
+        builds for the model (`_comm_fused`), with the leaf's arguments, the
+        group width and reduction it states aside, and, where it holds no
+        shared expert's output, zeros at the rows its stage 2 asks for, built
+        once, as ATOM's dual-stream MoE hands it that output; refused by name
+        where ATOM builds no runtime, or its runners for another group width
+        or reduction than the leaf states."""
+        runtime, args = self.comm_fused, op["args"]
+        if runtime is None:
+            raise ValueError("ATOM builds no comm-fused MoE for this model and layout")
+        shape, stated = runtime.runners.shape, (args["tp"], args["comm"])
+        if (shape.tp, shape.comm) != stated:
+            raise ValueError(
+                f"ATOM builds aiter's comm-fused runners for (ranks, reduction) "
+                f"{(shape.tp, shape.comm)}, and the leaf states {stated}"
+            )
+        shared = {}
+
+        def output(rows, like):
+            if rows not in shared:
+                shared[rows] = like.new_zeros(rows, like.shape[1])
+            return shared[rows]
+
+        def call(tp, comm, shared_partial, **kwargs):
+            rows = None
+            if shared_partial is None:
+                rows = functools.partial(output, like=kwargs["hidden_states"])
+            return runtime.run(
+                shared_partial=shared_partial, before_stage2_for_rows=rows, **kwargs
+            )
+
+        return call
 
     def _reweigh(self, op, sig, like, c):
         """Copy `like` of `op`'s call with the c-th weight of each weight
@@ -2466,6 +2566,18 @@ def _passes(fc) -> dict:
     return passes
 
 
+def _replayed(plan, context, item) -> dict[str, torch.Tensor]:
+    """The positions a leaf of `REPLAYED` takes, by name, as the replayed
+    prefill of decoder plan `plan` gathers them from `context`'s: layer 39's
+    queries' (`ReplayPlan.queries`), or its draft-KV tail's, at the tail's
+    rows (`write_context_kv`); each a tensor of its own."""
+    if plan is None:
+        raise ValueError("no replayed prefill here gathers its positions")
+    if item == "queries":
+        return {"plan.queries.positions": plan.queries().positions}
+    return {"plan.tail_rows.positions": context.positions[plan.tail_rows]}
+
+
 def _pass_rows(op) -> int | None:
     """The rows a leaf runs: its positions', its batch ids', its row pointers'
     (`kv_indptr_prefix`) less one, or its first activation's."""
@@ -2543,7 +2655,7 @@ def _widened(op, blocks) -> dict:
     """`op` with the slots and integers `PAGE_WIDE` names for it as wide as
     `blocks[1]` KV blocks rather than the capture's `blocks[0]`: an integer,
     a tensor's columns, and its row stride where that is its columns; the
-    operator aiter dispatches at that width (`_dispatched`)."""
+    operator aiter dispatches at that width and its rows (`_dispatched`)."""
     bound, *wide = PAGE_WIDE.get(op["op"], (None,))
     if blocks[0] == blocks[1] or bound is None or _written(op, bound) == "context":
         return op
@@ -2561,26 +2673,47 @@ def _widened(op, blocks) -> dict:
 
 
 def _dispatched(op) -> dict:
-    """`op`, aiter's HIP decode top-k (`_PICK`) once its logits are k wide, as
-    aiter dispatches it on this device's arch, the one `graph` read its graph
-    at: FlyDSL's one-block kernel on `ONE_BLOCK`'s, called as aiter's decode
-    wrapper calls it, each row bound `seqLens`; else marked refused."""
+    """`op`, a top-k of aiter's decode wrapper (`top_k_per_row_decode`), on
+    the kernel it dispatches to on this device's arch, the one `graph` read
+    its graph at: HIP's (`_PICK`) while the logits are narrower than k, else
+    FlyDSL's multi-CTA one where a `GATED` arch's gate takes its width, rows
+    and k, or its one-block one there and on `ONE_BLOCK`'s; one other than
+    the capture's called as the wrapper calls it, each row bound `seqLens`,
+    or marked refused on another arch or under `FLYDSL_OFF`."""
     from atom.compass.capture.forward import device_arch
 
-    args = op["args"]
-    width = args["logits"]["shape"][1] if op["op"] == _PICK else None
-    if width is None or "k" not in args or args["k"] > width:
+    name, args = op["op"], op["args"]
+    wrapped = not _packed(op) and (name != _TOPK or args.get("is_decode"))
+    width = args["logits"]["shape"][1] if name in (_PICK, _MULTI, _TOPK) else None
+    if width is None or "k" not in args or args["k"] > width or not wrapped:
+        return op
+    if (arch := device_arch()) not in GATED and name != _PICK:
+        return op
+    # the wrapper's call: its HIP kernel's arguments but the scratch
+    taken = {"seq_lens": "seqLens", "row_ends": "seqLens", "num_rows": "numRows"}
+    drop = ("workspace", "row_starts", "is_decode", "plane_width", "packed_rows")
+    args = {taken.get(s, s): v for s, v in args.items() if s not in drop}
+    kernel = _TOPK if arch in ONE_BLOCK + GATED else None
+    if arch in GATED:
+        from aiter.ops.topk import _flydsl_topk_decode_shape_supported as gate
+
+        rows, stable = args["numRows"], bool(args.get("stable", False))
+        kernel = _MULTI if gate(arch, stable, width, rows, args["k"]) else kernel
+    if kernel == name:
         return op
     off = os.environ.get(FLYDSL_OFF) in FLYDSL_OFF_VALUES
-    if (arch := device_arch()) not in ONE_BLOCK or off:
+    if kernel is None or off:
         off = f" under {FLYDSL_OFF}={os.environ[FLYDSL_OFF]}" if off else ""
         why = f"aiter's decode top-k of k {args['k']} on logits {width} wide"
         return op | {"refuses": f"{why}: its kernel on {arch}{off} is not known"}
-    named = {"seqLens": "row_ends", "numRows": "num_rows"}
-    called = {named.get(s, s): v for s, v in args.items() if s != "workspace"}
-    called |= {"row_starts": copy.deepcopy(args["seqLens"]), "is_decode": True}
-    called |= {"values": args.get("values"), "plane_width": None, "packed_rows": False}
-    return op | {"op": _TOPK, "args": called}
+    bound = "seq_lens" if kernel == _MULTI else "row_ends"
+    named = {"seqLens": bound, "numRows": "num_rows"}
+    called = {named.get(s, s): v for s, v in args.items()}
+    if kernel == _TOPK:
+        called |= {"row_starts": copy.deepcopy(args["seqLens"]), "is_decode": True}
+    called |= {"values": args.get("values"), "plane_width": None}
+    called |= {"packed_rows": False} if kernel == _TOPK else {"row_starts": None}
+    return op | {"op": kernel, "args": called}
 
 
 def _summed(op, rows) -> dict:
@@ -2827,6 +2960,66 @@ def _widest(shape, stride) -> int:
     """The dimension of the widest stride, on a tie the first of size above one."""
     dims = [(s, n > 1, -i) for i, (n, s) in enumerate(zip(shape, stride))]
     return -max(dims, default=(0, 0, 0))[2]
+
+
+@functools.cache
+def _layers(geometry, captured) -> dict:
+    """By page count, the layer of DeepSeek-V4.1's pool `geometry` whose window
+    ring a pool of that many pages starts where `captured` (`RING`) does, and
+    its build (`V41PoolGeometry.window`, or `window_bytes` in bytes)."""
+    found = {}
+    for build in (geometry.window, geometry.window_bytes)[: 1 + geometry.window_fp8]:
+        first = build(0, 0)
+        if dataclasses.replace(first, ring_start=captured.ring_start) != captured:
+            continue  # counted in the other unit
+        # a layer's ring starts this far past the last's, on any pool
+        step = build(min(1, geometry.layers - 1), 0).ring_start - first.ring_start
+        for layer in range(geometry.layers):
+            start = captured.ring_start - layer * step
+            # the fewest pages whose layer 0's ring starts there or past it
+            p = bisect.bisect_left(
+                range(max(start, 0) + 1), start, key=lambda n: build(0, n).ring_start
+            )
+            if build(layer, p) == captured:
+                found[p] = build, layer
+    return found
+
+
+def _captured(cache, leaves) -> int | None:
+    """The pages of the capture's pool that placed the DeepSeek-V4.1 window
+    rings (`RING`) `leaves` take, as the one count on which each is a layer's
+    (`_layers`): one capture's pool placed them all; None where not one is."""
+    from atom.compass.capture.forward import rebuild_object
+
+    geometry = getattr(cache, "geometry", None)
+    if not hasattr(geometry, "window_bytes"):
+        return None
+    fits = [
+        _layers(geometry, rebuild_object(RING, v["state"]))
+        for op, _ in leaves.values()
+        for v in op["args"].values()
+        if isinstance(v, dict) and v.get("object") == RING
+    ]
+    common = [p for p in fits[0] if all(p in f for f in fits)] if fits else []
+    return common[0] if len(common) == 1 else None
+
+
+def _ring(geometry, pages, captured, at=None):
+    """DeepSeek-V4.1's window ring `captured` (`RING`) at its layer of a pool of
+    `pages` pages, as ATOM's forward builds it: the layer it is on the
+    capture's pool of `at` pages (`_captured`), else the one whose ring a pool
+    of any count of pages starts there (`_layers`); refused where no layer's
+    does, or several layers' do and start apart on `pages`."""
+    fits = _layers(geometry, captured)
+    fits = {at: fits[at]} if at in fits else fits
+    found = {build(layer, pages): layer for build, layer in fits.values()}
+    if len(found) != 1:
+        raise ValueError(
+            f"{len(found) or 'no'} layers' window rings start where the "
+            f"capture's {captured} does on some pool"
+        )
+    [ring] = found
+    return ring
 
 
 def _held(runner, registry) -> dict[str, torch.Tensor]:
@@ -3587,8 +3780,9 @@ def layout_of(config) -> dict:
 #: an argument naming it, as aiter's all-reduces and fused all-reduce norms and
 #: torch's functional collectives each take one; or an operator ATOM runs on
 #: its TP group naming none, its all-reduce under two-batch overlap
-#: (`atom.model_ops.module_dispatch_ops.tbo_all_reduce`).
-ON_GROUP = ('"group_name":', '"op":"aiter.tbo_all_reduce.')
+#: (`atom.model_ops.module_dispatch_ops.tbo_all_reduce`), or aiter's
+#: comm-fused MoE on its TP or DP group, which states the group's width alone.
+ON_GROUP = ('"group_name":', '"op":"aiter.tbo_all_reduce.', f'"op":"{COMM_FUSED}"')
 
 
 def on_group(leaf: str, collective=False) -> bool:

@@ -42,8 +42,10 @@ from atom.compass.drive import reuse
 from atom.compass.run import memory
 
 #: A candidate with no readings at its key in the store, and one with them,
-#: whose argument the stubbed resolution reads none of.
-UNREAD, READ = {"args": {"--max-num-seqs": 12}}, {"args": {"--block-size": 16}}
+#: whose argument the stubbed resolution reads none of; the first's
+#: --max-num-seqs caps its capture ladder below the other's, so their laws'
+#: keys differ.
+UNREAD, READ = {"args": {"--max-num-seqs": 4}}, {"args": {"--block-size": 16}}
 
 
 def _env(found: dict, name: str) -> dict:
@@ -83,7 +85,7 @@ def test_a_calibration_publishes_into_the_shared_store_unless_it_holds_its_readi
     tmp_path, stubbed, readings, monkeypatch  # noqa: F811
 ):
     store = tmp_path / "store"
-    config = resolved(stubbed.config, ["--max-num-seqs", "12"])
+    config = resolved(stubbed.config, ["--max-num-seqs", "4"])
     if readings == "at another digest":
         _readings_at_another_digest(store, config)
     if readings == "without the PAGE bound":
@@ -116,7 +118,7 @@ def test_a_started_calibration_s_command_keeps_the_store_its_inputs_name(
     given = ["tree c0ffee", "record 1"]
     if started == "into the shared store":
         given.append(f"store {store.resolve()}")
-        config = resolved(stubbed.config, ["--max-num-seqs", "12"])
+        config = resolved(stubbed.config, ["--max-num-seqs", "4"])
         publish_readings(store, config)
     (cal / "inputs").write_text("".join(f"{line}\n" for line in given))
     taken = ["start memory", "end memory 60 s", "start cal1-c1", "fail cal1-c1 9 s: x"]

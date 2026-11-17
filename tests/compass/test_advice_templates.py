@@ -9,6 +9,7 @@ import pytest
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import cli
+from atom.compass.backends.json_file import read_json
 from atom.compass.run.step_grid import READ_OFF_DEFAULT, keyed_env
 from atom.model_engine.arg_utils import EngineArgs, parse_size_list
 from atom.utils.arg_parser import FlexibleArgumentParser
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SPACE = ROOT / "scripts/compass/spaces/deepseek-v4-pro-mi355x-crs005.json"
 #: The shipped DPA8 pair whose capture ladders the 1P1D configurations take,
 #: but on the sides in `OWN_LADDER`.
-LAW = "scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-crs005-{}.json"
+LAW = "scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-crs005-{}.json.xz"
 #: The 1P1D sides with a ladder of their own: P1's decode side takes the powers
 #: of two to 256, each size a calibration deployment of its own.
 OWN_LADDER = {("P1", "decode"): [1, 2, 4, 8, 16, 32, 64, 128, 256]}
@@ -93,7 +94,7 @@ def parsed(args: list[str]) -> dict:
 
 def law(side: str) -> dict:
     """The engine config the shipped pair's `side` law is keyed under."""
-    return json.loads((ROOT / LAW.format(side)).read_text())["engine_config"]
+    return read_json(ROOT / LAW.format(side))["engine_config"]
 
 
 def test_the_template_expands_into_its_five_configurations_at_1_to_256_clients(
