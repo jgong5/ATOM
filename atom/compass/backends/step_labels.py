@@ -131,6 +131,7 @@ import hashlib
 import itertools
 import json
 import os
+import sys
 import statistics
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
@@ -169,10 +170,27 @@ def _prefill_label() -> str:
     return value
 
 
+#: The variable that, set to ``1``, takes a record whose run.json names
+#: `BUILDS` anyway, with a warning naming them: for a one-real-run fit whose
+#: server met kernel shapes no sweep had compiled (Triton specializes per
+#: shape), where the few steps that waited on a compile are a known residual
+#: rather than a reason to discard the run. Unset, such a record refuses.
+ACCEPT_BUILDS_ENV = "COMPASS_ACCEPT_JIT_BUILDS"
+
+
 def refusal(run: dict) -> str | None:
     """Why grading, a fit or `validate.cost` refuses a record whose run.json is
-    `run`, naming the modules of its `BUILDS`; None when it names none."""
+    `run`, naming the modules of its `BUILDS`; None when it names none, or
+    when `ACCEPT_BUILDS_ENV` is ``1`` (then a warning names them)."""
     if builds := run.get(BUILDS):
+        if os.environ.get(ACCEPT_BUILDS_ENV) == "1":
+            print(
+                f"WARNING: {ACCEPT_BUILDS_ENV}=1 takes a record whose server ran "
+                f"a JIT compile of {builds} while it served; a step may have "
+                "waited on it",
+                file=sys.stderr,
+            )
+            return None
         return (
             f"its server ran a JIT compile of {builds} while it served, "
             "so a step may have waited on it"
