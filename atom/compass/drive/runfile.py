@@ -240,8 +240,15 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     where it states none, and the KV transfers priced on the spec's
     `kv_link`, ``intra_node`` for two instances on one node and
     ``inter_node`` across two, which alone reads ``--network``. Its hops are
-    the prefill side's host entry's, its ``decode_hops`` the decode side's. A
-    price list the prefill side names that is not the decode side's refuses."""
+    the prefill side's host entry's, its ``decode_hops`` the decode side's,
+    each side's config resolved from its arguments as deploy.sh starts its
+    instance, with its KV role on the simulated connector
+    (`drive.run.side_args`). A price list the prefill side names that is not
+    the decode side's refuses."""
+    from atom.compass.drive.run import SIMULATED, side_args
+
+    prefill_args = side_args("prefill", prefill_args, SIMULATED)
+    decode_args = side_args("decode", decode_args, SIMULATED)
     out = build(args, prefill_args, across=kv_link == "inter_node")
     if run.PRICE_LIST in out:
         decode = _price_list_key(decode_args, run._machine(out)).values
