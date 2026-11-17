@@ -1018,8 +1018,10 @@ def _kv_unsized(value):
 def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
     """Each leaf of a graph's JSON region by `signature`: one of its ops, its
     times in the step under ``occurrences``, and its instances in run order,
-    each the key or path every reference slot binds."""
-    env, found = env or {}, {} if found is None else found
+    each the key or path every reference slot binds; one that takes a
+    DeepSeek-V4.1 window ring (`RING`) with, under ``rings``, every ring the
+    leaves of `found` take, which the capture's one pool placed (`_captured`)."""
+    top, env, found = env is None, env or {}, {} if found is None else found
     if "op" in region:
         bound = {}
         for slot, value in _values(region["args"]):
@@ -1037,7 +1039,20 @@ def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
     else:
         for item in region.get("seq", region.get("par", ())):
             leaves(item, env, found)
+    if top:  # before any caller cuts `found` to the leaves it measures
+        rings = frozenset(r for op, _ in found.values() for r in _rings(op))
+        for op, _ in found.values():
+            op |= {"rings": rings} if _rings(op) else {}
     return found
+
+
+def _rings(op) -> list[tuple]:
+    """The states of the DeepSeek-V4.1 window rings (`RING`) `op` takes."""
+    return [
+        tuple(map(tuple, v["state"]))
+        for v in op["args"].values()
+        if isinstance(v, dict) and v.get("object") == RING
+    ]
 
 
 def measure(config, todo, llc: int, rank: int = 0) -> list[dict]:
@@ -1313,8 +1328,6 @@ class Stub:
         for owner in (fc.attn_metadata, fc.context):
             live |= {k: v for k, v in vars(owner).items() if torch.is_tensor(v)}
         device, md = self.runner.device, fc.attn_metadata
-        if not self.placed:  # one capture's pool placed the point's window rings
-            self.captured = _captured(getattr(md, "cache", None), self.leaves)
         live = {
             k: v
             for k, v in live.items()
@@ -2152,7 +2165,8 @@ class Stub:
                 cache = getattr(snap.attn_metadata, "cache", None)
                 geometry = getattr(cache, "geometry", None)
                 if value["object"] == RING and hasattr(geometry, "window_bytes"):
-                    return _ring(geometry, cache.num_pages, got, self.captured)
+                    at = _captured(geometry, op.get("rings", frozenset()))
+                    return _ring(geometry, cache.num_pages, got, at)
                 return got
             if (
                 isinstance(value, dict)
@@ -2985,21 +2999,15 @@ def _layers(geometry, captured) -> dict:
     return found
 
 
-def _captured(cache, leaves) -> int | None:
-    """The pages of the capture's pool that placed the DeepSeek-V4.1 window
-    rings (`RING`) `leaves` take, as the one count on which each is a layer's
-    (`_layers`): one capture's pool placed them all; None where not one is."""
+@functools.cache
+def _captured(geometry, rings) -> int | None:
+    """The pages of the capture's pool that placed DeepSeek-V4.1's window rings
+    `rings` (`RING`), every one a graph's leaves take (`leaves`), as the one
+    count on which each is a layer's of `geometry` (`_layers`); None where not
+    one is."""
     from atom.compass.capture.forward import rebuild_object
 
-    geometry = getattr(cache, "geometry", None)
-    if not hasattr(geometry, "window_bytes"):
-        return None
-    fits = [
-        _layers(geometry, rebuild_object(RING, v["state"]))
-        for op, _ in leaves.values()
-        for v in op["args"].values()
-        if isinstance(v, dict) and v.get("object") == RING
-    ]
+    fits = [_layers(geometry, rebuild_object(RING, r)) for r in rings]
     common = [p for p in fits[0] if all(p in f for f in fits)] if fits else []
     return common[0] if len(common) == 1 else None
 

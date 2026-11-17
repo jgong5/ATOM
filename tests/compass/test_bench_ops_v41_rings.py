@@ -37,9 +37,11 @@ def _coinciding():
     return V41PoolGeometry(6, ((0, 1),), 16, 16, 128, 32, kv_dtype="fp8")
 
 
-def _taken(windows, cache):
+def _taken(windows, cache, kept=None):
     """Copy 0's `window` of a window write given each of `windows` as the
-    capture states it, on a point whose forward context holds `cache`."""
+    capture states it, on a point whose forward context holds `cache`: of each
+    leaf of their graph, or of those at `kept` alone, the graph's leaves left
+    to measure."""
     leaves = [
         _leaf(WRITE, ("window", Reduced(RING, tuple(dataclasses.asdict(w).items()))))
         for w in windows
@@ -53,7 +55,8 @@ def _taken(windows, cache):
         return out
 
     runner.prepare_model, stub = prepare_model, ops.Stub(runner, 10_000)
-    stub.leaves = ops.leaves(_graph(*leaves, layers=1)["region"])
+    found = list(ops.leaves(_graph(*leaves, layers=1)["region"]).items())
+    stub.leaves = dict(found[i] for i in kept or range(len(found)))
     stub._prepare((0, 0))
     return [
         stub._copy(op, sig, instances, 0)[0]["window"]
@@ -88,6 +91,20 @@ def test_rings_that_coincide_take_the_one_pool_that_holds_all_the_point_s(form):
     got = _taken([ring(layer, CAPTURED) for layer in range(6)], cache)
 
     assert got == [ring(layer, POINT) for layer in range(6)]
+
+
+@pytest.mark.parametrize("form", ["window_bytes", "window"])
+@pytest.mark.parametrize("kept", [[0], [0, 1], [4, 5]], ids=["0", "0-1", "4-5"])
+def test_a_point_holding_some_of_a_graph_s_rings_takes_the_graph_s_pool(form, kept):
+    # the graph's other leaves measured already: alone, layers 0 and 1's rings
+    # on 2 pages are 4 and 5's on 1, and 4 and 5's are 0 and 1's on 3
+    geometry = _coinciding()
+    ring = getattr(geometry, form)
+    cache = SimpleNamespace(geometry=geometry, num_pages=POINT)
+
+    got = _taken([ring(layer, CAPTURED) for layer in range(6)], cache, kept)
+
+    assert got == [ring(layer, POINT) for layer in kept]
 
 
 def _off(geometry):
