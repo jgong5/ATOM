@@ -444,6 +444,26 @@ def recorded_graphs(config) -> dict:
     return {"architecture": architecture(config), "token": token, "request": request}
 
 
+#: How many frames above `add_request` `_caller_request_id` looks for the API
+#: server function's `request_id`: since the upstream merge its handlers reach
+#: `add_request` through `_submit_engine_requests`, one frame further up.
+CALLER_DEPTH = 4
+
+
+def _caller_request_id():
+    """The `request_id` local of the nearest of `CALLER_DEPTH` frames above
+    the patched `add_request` that has one, or None (a thread's own stack,
+    such as `asyncio.to_thread`'s, holds none)."""
+    frame = sys._getframe(2)
+    for _ in range(CALLER_DEPTH):
+        if frame is None:
+            return None
+        if "request_id" in frame.f_locals:
+            return frame.f_locals["request_id"]
+        frame = frame.f_back
+    return None
+
+
 def carry_response_ids() -> None:
     """Set a one-sequence request's `external_request_id` to its response id,
     the `request_id` of the API server function calling `add_request`, read
@@ -461,8 +481,7 @@ def carry_response_ids() -> None:
 
         def add_request(self, seqs, add=cls.add_request):
             if len(seqs) == 1 and seqs[0].external_request_id is None:
-                caller = sys._getframe(1).f_locals
-                seqs[0].external_request_id = caller.get("request_id")
+                seqs[0].external_request_id = _caller_request_id()
             params = (seqs[0].kv_transfer_params or {}) if len(seqs) == 1 else {}
             if params.get("transfer_id") is not None:
                 line = {
