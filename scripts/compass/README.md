@@ -983,7 +983,11 @@ records at ed5fa7697, taken in the image and aiter of that stack
 and 64, then 8, 12 and 56 from each trajectory's first turn for rungs 7, 8, 12 and 56. No
 c=256 record is in it: that take stalled the node
 ([#2922](https://github.com/jgong5/ATOM/issues/2922)), so decode rungs past 24 rest on the
-first-turn c=56 record. Each server ran with `ENABLE_CK=0
+first-turn c=56 record. The draft's `propose` vector is fitted apart, by `compass fit steps`
+at that later tree on two 120 s trace runs at c=16 and c=4 under the same settings, whose busy
+time labels an output prefill's propose pass; that tree's fit refuses the ed5fa7697 records
+beside them ([#3607](https://github.com/jgong5/ATOM/issues/3607)). Each server ran with
+`ENABLE_CK=0
 GPU_ARCHS=gfx1250 ATOM_ENGRAM_UVA=1 ATOM_ENGRAM_UVA_HBM=1 AITER_LOG_LEVEL=WARNING OMP_NUM_THREADS=4
 ATOM_DISABLE_MMAP=true AITER_REUSE_IDENTICAL_COMM_GROUPS=1`, `NCCL_MIN_NCHANNELS` unset, and
 `SERVER_ARGS` of `--trust-remote-code -tp 4 --kv_cache_dtype bf16 --index-cache-dtype fp8
