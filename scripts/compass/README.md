@@ -12,7 +12,8 @@ on, because until 2026-09-20 it was not — see "Which tree a script acts on" be
 
 New to Compass? [QUICKSTART.md](QUICKSTART.md) takes a model from an empty store
 to a simulation graded against real runs, and `smoke_cell.sh` runs that path in
-about an hour. `calibrate.sh OUT RECORD...` takes its calibration in one command,
+about an hour. [ADVICE.md](ADVICE.md) takes a user from a space file of
+configurations through `compass advice` to the one it recommends. `calibrate.sh OUT RECORD...` takes its calibration in one command,
 from the warm record to the fits, and resumes a stopped run; its variables are in
 its header.
 
@@ -289,7 +290,7 @@ Every ATOM process in it runs with these settings:
 |---|---|
 | `ENABLE_CK=0` | aiter's JIT fails `module_activation` and `module_sample` in CK's `amd_tdm_store` |
 | `GPU_ARCHS=gfx1250` | aiter's JIT fails `module_deepgemm_opus`, built for the card's 192 CUs where OPUS registers gfx1250 at 256 |
-| `ATOM_ENGRAM_UVA=0` | a V4.1-Flash start page-locks 189 GiB of Engram tables |
+| `ATOM_ENGRAM_UVA=1` with `ATOM_ENGRAM_UVA_HBM=1` | `ATOM_ENGRAM_UVA=1` alone page-locks 189 GiB of Engram tables, more than the node's host memory; `ATOM_ENGRAM_UVA=0` gathers each forward's Engram rows on the host, 5 to 50 ms on 28% of one-sequence decode steps ([#2797](https://github.com/jgong5/ATOM/issues/2797)) |
 | `NCCL_MIN_NCHANNELS` unset | the image's 112 faults the first RCCL all-reduce |
 
 The GPU gate on MI455 runs in a container of its own from this image, with the
@@ -958,17 +959,16 @@ variant on tile buffers as `ScoreWorkspace` sizes them, came first; a record tha
 built one was taken again.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json` is the same law for
-cell A, TP4 with whole-expert EP4: fitted alike on `calibrate.sh` records at ATOM bb161b906
-in the same image, under the same environment and `SERVER_ARGS` with
-`--enable-expert-parallel` added. The records are concurrency 1, 4, 16, 64 and 256, then 8,
-12 and 56 from each trajectory's first turn for rungs 7, 8, 12 and 56: at c=256 the decode
-steps run at rung 64 but for a few at rung 1. The c=256 and first-turn c=56 records were
-taken later, for [#2582](https://github.com/jgong5/ATOM/issues/2582), each by
-`calibrate.sh`'s record step alone, and both fits were run again on every record. Its
-first-turn records served under expert parallel here with no
-[#2538](https://github.com/jgong5/ATOM/issues/2538) fault. An unscored record at each of the
-first six concurrencies came first; a record that still built a Triton variant was taken
-again.
+cell A, TP4 with whole-expert EP4: fitted alike on one `calibrate.sh` run's records at ATOM
+ed5fa7697 in the same image ([#2744](https://github.com/jgong5/ATOM/issues/2744)), under the
+same environment with `ATOM_ENGRAM_UVA=1 ATOM_ENGRAM_UVA_HBM=1` in place of
+`ATOM_ENGRAM_UVA=0`, so every rank held its Engram shard in HBM, and the same `SERVER_ARGS`
+with `--enable-expert-parallel --spec-decode-acceptance-length 3` added. Its engine config
+holds `AITER_LOG_LEVEL`, `OMP_NUM_THREADS` and `ATOM_TOKEN_GRAPH_SIZES` at ed5fa7697's
+default buckets; a run priced by it sets them and passes the acceptance length too. The
+records are concurrency 1, 4, 16, 64 and 256, then 8, 12 and 56 from each trajectory's
+first turn: at c=256 all but a few hundred decode steps run at rung 64. No record built a
+JIT kernel.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json` is cell A's law
 on mi355-gpu-40, keyed by the platform its `platform` states (aiter `09d256420`,
@@ -1278,13 +1278,14 @@ store. A record without a store touches no library.
    `--model` naming the model directory, whose config gives a MoE model's routing, and
    `compass fit host` on the calibration records alone; each prints its store token.
    Steps 1 to 3, after a warm record, are `calibrate.sh $R/cal 1 4 16 "trace 16" "trace 4"` with
-   `MODEL`, `GPU`, `TRACES` and `AIPERF_PYTHON` set, its store
-   `$R/cal/store`; it reads no platform, so it prints the tokens, the law's held-out
+   `MODEL`, `GPU`, `TRACES` and `AIPERF_PYTHON` set, its store the one `STORE`
+   names, else `$R/cal/store`; it reads no platform, so it prints the tokens, the law's held-out
    errors per band and the `compass run` line of step 5 with `$M` left as `--device
-   DATASHEET --ptl PTL`. That store holds no `platform_readings` entry, and step 5's
-   `compass run` refuses a store with none: publish one into `$R/cal/store` with
+   DATASHEET --ptl PTL`. `$R/cal/store` holds no `platform_readings` entry, and step 5's
+   `compass run` refuses a store with none: publish one into it with
    `compass measure device` and `compass fit device`, as the platform's bullet in
-   [QUICKSTART.md](QUICKSTART.md#environment) does, before step 5. A RECORD after its
+   [QUICKSTART.md](QUICKSTART.md#environment) does, before step 5, or name a
+   store that holds one as `STORE`. A RECORD after its
    concurrency names the client's scenario, such as `"8 --trajectory-start-min-ratio 0
    --trajectory-start-max-ratio 0"`, the first-turn record that gives the law
    its decode rung 8; `trace` before one makes it a trace run of that recipe.
@@ -1460,3 +1461,32 @@ and 5 at concurrency 16 alone, with these changes:
   workload, and refused.
 - The draft vectors hold no held-out error: check 2's `cost` rows of kind `draft` give
   the draft law's error on the real runs' own steps.
+
+### A stage-4 cell graded on MI455
+
+[#2147](https://github.com/jgong5/ATOM/issues/2147) grades cell A on one MI455 A0 node by steps
+4 and 5 at concurrency 1, 4, 16 and 64, every run from one tree, with these changes from the
+smoke above:
+
+- `$ATOM`, its environment and the container are those
+  `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json` states (its
+  paragraph above), and `$M` is `--device mi455x-a0 --ptl disabled`, the store holding the
+  node's readings at that stack.
+- Step 5 prices by the law file, `--step-linear LAW --host-laws LAW`, with the
+  `memory_readings` that `compass measure memory` takes at the same tree and settings.
+- Steps 4 and 5 take `--duration 3600`, one server on the node at a time. Step 4 runs three
+  spaced rounds at c=1, 4, 16 and 64: the first ran c=1, 4 and 64, then 16, as the interim
+  check ordered them; the second and third ran 1, 4, 16, 64.
+- `python -m atom.compass.validate` grades each concurrency's simulated run against its three
+  real runs, with throughput and TPOT targets of 10% and TTFT's of 15%, beside the real spread.
+- A real run has hung when, for 90 s while requests run or wait, its log shows neither a step
+  line nor a load report with nonzero prompt or generation throughput
+  ([#2922](https://github.com/jgong5/ATOM/issues/2922)). Check the node after the GPU reset
+  that follows: one such reset left RCCL's all-reduces above aiter's 64 MiB custom
+  all-reduce cutoff slow until the node was rebooted, every prefill chunk over 6553 tokens
+  37 to 60% slower on the device.
+- `python -m atom.compass.memory.check --tp 4` checks each rank's non-KV memory against the
+  real run's log; a concurrency's memory is graded on the mean of its 12 readings, three runs
+  of four ranks. The `non_torch` term, the driver and collective reserve, moves from start to
+  start: one rank alone read +10.43% against the 10% gate twice, beside its start's 10.3%
+  spread across ranks, while the mean stayed within 2.3%.

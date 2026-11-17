@@ -135,7 +135,8 @@ def stubbed(tmp_path, monkeypatch):
     """The configuration, resolved as `resolved` resolves it for every
     instance, at the head whose digest is the tree's, with no law file; each
     start the stub's, given `check.START_S` 60 s, a bound only a stalling
-    start reaches."""
+    start reaches; with ``HARNESS_PYTHON`` unset, so no searchable point is
+    simulated."""
     r = deployment(tmp_path, **COVERED)
     served(monkeypatch, r.config)
     resolved_here(monkeypatch, lambda atom_args: resolved(r.config, atom_args))
@@ -153,6 +154,7 @@ def stubbed(tmp_path, monkeypatch):
     monkeypatch.setattr(check, "START_S", 60)
     monkeypatch.setenv("STUB_CALLS", str(tmp_path / "calls.jsonl"))
     monkeypatch.delenv("STUB_STALL", raising=False)
+    monkeypatch.delenv("HARNESS_PYTHON", raising=False)
     return r
 
 
@@ -488,7 +490,7 @@ def test_a_1p1d_start_takes_the_decode_side_s_own_variables_in_a_local_prefix(
         *("--step-linear", where, "--host-laws", where, "--network", NETWORK),
         *("--prefill", "--", *model, "--enable-tbo"),
         *("--decode", "--on", "env -u STUB_PREFILL STUB_SIDE=decode"),
-        *("--", *model, "--router", "--"),
+        *("--", *model, "--router", "--", *check.ROUTER),
     ]
     held = ("STUB_BOTH", "STUB_PREFILL", "STUB_SIDE")
     assert [call["env"].get(k) for k in held] == ["1", "1", None]

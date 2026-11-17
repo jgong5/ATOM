@@ -177,17 +177,33 @@ def _hit_counters(run: Path, sent: list[dict]) -> list | None:
     return change
 
 
-def metrics(run, simulated: bool = False) -> dict:
-    """InferenceX's metrics of the run directory `run`, None where it has none;
-    the hit rates from its own counters when `simulated`."""
-    run = Path(run)
-    sent = read_jsonl(run / RECORDS)
-    rs = [
+def profiled(sent: list[dict]) -> list[dict]:
+    """The records of the client export `sent` that InferenceX's metrics are
+    computed over: those that hold no error and are of the profiling phase or
+    name none."""
+    return [
         r
         for r in sent
         if not r.get("error")
         and r.get("metadata", {}).get("benchmark_phase") in (None, "profiling")
     ]
+
+
+def gpus(run) -> int:
+    """The GPUs of the run directory `run`: each side's engine record's
+    ``tensor_parallel_size`` times ``data_parallel_size``, summed."""
+    return sum(
+        e["tensor_parallel_size"] * (e.get("data_parallel_size") or 1)
+        for e in (read_json(side / ENGINE_RECORD) for side in sides(run))
+    )
+
+
+def metrics(run, simulated: bool = False) -> dict:
+    """InferenceX's metrics of the run directory `run`, None where it has none;
+    the hit rates from its own counters when `simulated`."""
+    run = Path(run)
+    sent = read_jsonl(run / RECORDS)
+    rs = profiled(sent)
     ttft, itl = (
         [v / 1000 for v in _positive(_metric(r, k) for r in rs)]
         for k in ("time_to_first_token", "inter_token_latency")
@@ -205,10 +221,7 @@ def metrics(run, simulated: bool = False) -> dict:
     starts = [int(m["request_start_ns"]) for m in meta if m.get("request_start_ns")]
     ends = [int(m["request_end_ns"]) for m in meta if m.get("request_end_ns")]
     duration = (max(ends) - min(starts)) / 1e9 if starts and ends else 0
-    engines = [read_json(side / ENGINE_RECORD) for side in sides(run)]
-    gpus = sum(
-        e["tensor_parallel_size"] * (e.get("data_parallel_size") or 1) for e in engines
-    )
+    gpu_count = gpus(run)
     if simulated:
         gpu, full, cpu = _hit_counters(run, sent) or (None, None, None)
     else:
@@ -225,7 +238,7 @@ def metrics(run, simulated: bool = False) -> dict:
     return {
         "concurrency": read_json(run / CLIENT_RUN)["arguments"][CONCURRENCY],
         "throughput per GPU": (
-            (tokens[0] + tokens[1]) / duration / gpus if duration > 0 else None
+            (tokens[0] + tokens[1]) / duration / gpu_count if duration > 0 else None
         ),
         "p90 interactivity": _inverse(percentile(itl, 90)),
         "p90 E2E-normalized interactivity": _inverse(percentile(per_token, 90)),
