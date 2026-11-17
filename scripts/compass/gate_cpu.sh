@@ -241,8 +241,7 @@ if [ -r "$MESH/Cargo.toml" ]; then
             finish 96 "flock not found, so cargo in atom/mesh cannot run one process at a time; nothing was run"
     fi
     export CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:-true}
-    LOCK=${COMPASS_CARGO_LOCK:-/app/ATOM/atom/mesh/Cargo.lock}
-    [ -e "$MESH/Cargo.lock" ] || [ ! -r "$LOCK" ] || cp "$LOCK" "$MESH/Cargo.lock"
+    compass_cargo_lock "$MESH"
     if WHY=$(cd "$MESH" && cargo metadata --format-version 1 2>&1 >/dev/null); then
         TARGETS=(--lib)
         for f in "$MESH"/tests/compass_*.rs; do

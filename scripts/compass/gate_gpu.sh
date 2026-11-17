@@ -250,8 +250,10 @@ fi
 # two cards skips there. The surplus over the baseline is what tests/compass
 # passes on this tree; an absent tests/compass contributes none.
 # The tests that cargo-build atomesh skip unless cargo resolves its crates; the
-# gate has no network, so they come from the container's cache.
+# gate has no network, so they come from the container's cache, under the
+# image's lockfile, as in gate_cpu.sh.
 export CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:-true}
+[ ! -r "$ROOT/atom/mesh/Cargo.toml" ] || compass_cargo_lock "$ROOT/atom/mesh"
 ARGS=("$@")
 COUT=$(mktemp)
 COMPASS_N=0 C_FAILED=0 C_ERRORS=0

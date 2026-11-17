@@ -235,7 +235,7 @@ tests that fail on a loaded host:
 (#515), and `policies::tree::tests::test_tree_structure_integrity_after_stress`, a
 thread race that records a placeholder tenant (#514).
 
-The tree has no `Cargo.lock` (`atom/mesh/.gitignore`). The gate copies one in from
+The tree has no `Cargo.lock` (`atom/mesh/.gitignore`). `gate_cpu.sh` and `gate_gpu.sh` copy one in from
 `COMPASS_CARGO_LOCK`, default `/app/ATOM/atom/mesh/Cargo.lock`, the lockfile the
 gate image built atomesh with, unless the tree already has one. The image's cargo
 cache holds only what its release build downloaded, so a new gate container needs
@@ -677,7 +677,7 @@ After the run, a `SKIPPED` line under `tests/compass/` whose reason names the sl
 image, MTP or DSpark model, `ATOM_COMPASS_CCTRACES`, `COMPASS_AIPERF_PYTHON` or `atomesh` is a
 finding by its file and line: that test did not run. The tests that cargo-build
 atomesh run offline (`CARGO_NET_OFFLINE=true` unless set), from the container's
-crate cache, as in `gate_cpu.sh`; where cargo cannot resolve its crates they
+crate cache under the image's `Cargo.lock`, as in `gate_cpu.sh`; where cargo cannot resolve its crates they
 skip, and the gate names them.
 
 On node 18 (`xiaobizh_n18_next13`), `tests/attentions/deepseek_v41/test_tbo.py`
