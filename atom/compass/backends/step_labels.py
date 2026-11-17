@@ -334,6 +334,15 @@ def group_dummies(ranks: Iterable[list[dict]]) -> Counter:
     return Counter(s["step"] for lines in ranks for s in lines if s["is_dummy_run"])
 
 
+def group_tails(ranks: Iterable[list[dict]]) -> frozenset[int]:
+    """The steps at which some rank of `ranks`, one run's rank records as their
+    lines, finishes a prompt's prefill: its line names a request (`named`
+    holds a request whose prompt was digested whole at its final chunk)."""
+    return frozenset(
+        s["step"] for lines in ranks for s in lines if s.get("named") and not s["is_dummy_run"]
+    )
+
+
 def group_peaks(ranks: Iterable[list[dict]]) -> dict[int, int]:
     """Per step, the most tokens any of `ranks`, one run's rank records as their
     lines, runs at it, a dummy rank's its rows': ATOM's largest
@@ -553,18 +562,19 @@ def label_run(
     n = max(map(len, ranks), default=0)
     starts = [max(_pull(x[i]) for x in ranks if i < len(x)) for i in range(n)]
     dummy_ranks, peaks = group_dummies(ranks), group_peaks(ranks)
+    tails = group_tails(ranks)
     return [
         (
             ([], [])
             if x and all(s["is_dummy_run"] for s in x)
-            else _label(r, x, run, starts, split_rule, dummy_ranks, peaks)
+            else _label(r, x, run, starts, split_rule, dummy_ranks, peaks, tails)
         )
         for r, x in zip(records, ranks)
     ]
 
 
 def _label(
-    record, lines, run, starts, split_rule, dummy_ranks, peaks
+    record, lines, run, starts, split_rule, dummy_ranks, peaks, tails=None
 ) -> tuple[list[Sample], list[dict]]:
     """`label` of `record`'s `lines`, each `E` from `starts` at the line before."""
     path = Path(record)
@@ -598,6 +608,7 @@ def _label(
         if dp and dummy_ranks is None:
             peers = [read_jsonl(p) for p in _peers(path)]
             dummy_ranks, peaks = group_dummies(peers), group_peaks(peers)
+            tails = group_tails(peers)
         if dp and tokens is None:
             if ranks is None:
                 ranks = [{t["step"]: t for t in read_jsonl(p)} for p in _peers(path)]
@@ -626,6 +637,7 @@ def _label(
             group_dummies=dummy_ranks.get(s["step"], 0) if dp else 0,
             group_max_tokens=peaks.get(s["step"]) if dp else None,
             group_needs_eager=s.get("group_needs_eager", False),
+            group_tail=dp and s["step"] in (tails or ()),
         )
         cut = None
         # An untraced prefill labelled from its own window (`PREFILL_LABEL_ENV`).

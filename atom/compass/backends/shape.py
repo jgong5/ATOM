@@ -223,7 +223,10 @@ class BatchView:
     and reaches the MoE gate, and every dummy runs the same rows, from token 0
     at position 0, so the group's dummies route alike.
     `group_prefills` says some rank of the data-parallel group
-    prefills at this step; False on one rank. `group_max_tokens` is the most
+    prefills at this step; False on one rank. `group_tail` says some rank of
+    the group finishes a prompt's prefill at this step, which runs the decoder
+    on that tail on every rank of the group, its MoE collectives being the
+    group's (DeepSeek-V4.1); False on one rank. `group_max_tokens` is the most
     tokens any rank of the group scheduled at this step, which ATOM picks the
     step's prefill token-graph bucket by (`ForwardMode._pad_to_token_graph`),
     never fewer than this rank's; None on one rank. `group_needs_eager` says
@@ -256,6 +259,7 @@ class BatchView:
     group_dummies: int = 0
     group_max_tokens: int | None = None
     group_needs_eager: bool = False
+    group_tail: bool = False
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)

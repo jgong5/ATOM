@@ -265,6 +265,11 @@ def batch_view(
         group_prefills=dp_rank is not None and not mode.running_tokens_are_unified,
         group_max_tokens=group_max_tokens,
         group_needs_eager=mode.sync is not None and mode.sync.any_rank_needs_eager,
+        group_tail=(
+            dp_rank is not None
+            and mode.sync is not None
+            and mode.sync.max_final_requests_across_dp > 0
+        ),
     )
 
 
