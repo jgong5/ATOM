@@ -1253,8 +1253,8 @@ runs the FP8 one, so its graphs and points would price kernels the cell never ru
 store `S` holds the node's `platform_readings`, which a run's `--device` composes its spec
 from, each side's `compass measure memory` readings, taken as the EP8 cell's
 are, the graphs, the points and one price list: a price list's key holds the model, the
-parallel layout, the machine spec and the ATOM source, and neither `--enable-tbo` nor a
-variable, so both sides' points key one list. Every command runs from one tree, the one
+parallel layout, the platform the spec names and the ATOM source, and neither
+`--enable-tbo` nor a variable, so both sides' points key one list. Every command runs from one tree, the one
 the readings were taken at, since readings, graphs, points and price lists each refuse
 another ATOM source, under the side's environment and no other performance variable
 (`atom/benchmarks/results/metadata.py::PERFORMANCE_KEYS`): `OMP_NUM_THREADS` is one, so
@@ -1275,9 +1275,10 @@ pin processes that run at once to cores with `taskset`.
   the model without its weights, and a graph keys `config.json`'s digest, not its path: a
   container that does not mount the model, such as a CPU gate container, traces from a
   copy of the model's directory less its weight files.
-- **Points.** `compass measure ops --plan REC --llc-mib 256 --gpu G --store S --out O --
+- **Points.** `compass measure ops --plan REC --llc-mib 256 --gpu C --store S --out O --
   <side's ATOM args> --enforce-eager --level 0 --cudagraph-capture-sizes "[R]"`, over each
-  side's plan record, with that side's Mooncake variables, the node's own `ATOM_HOST_IP`,
+  side's plan record, `C` the cards the run takes and `R` the decode rungs it measures,
+  with that side's Mooncake variables, the node's own `ATOM_HOST_IP`,
   and a `handshake_port` of its own for each bench that runs at once. One GPU runs one DP
   rank and every leaf but the collectives, so one-GPU runs split the decode rungs between
   them, the ladder in no graph's key; one run on all eight GPUs at every rung then
@@ -1286,8 +1287,8 @@ pin processes that run at once to cores with `taskset`.
   points at its own graph. A bench a signal stops can leave its measuring child holding
   the card ([#3224](https://github.com/jgong5/ATOM/issues/3224)): run each in a session of
   its own, and once it ends, kill by PID what the session left before the card serves again.
-- **Price list.** `compass fit ops --store S --out F O...`, naming every `--out` of both
-  sides.
+- **Price list.** `compass fit ops --store S --out F O...`, `F` the fit's own output
+  directory and `O...` every points run's `--out` of both sides.
 - **Runs.** `deploy.sh OUT run --op-graph --host-laws P --host-laws D --device mi355x
   --ptl disabled --network crs005-013-ionic --store S`, the decode through a local
   prefix as above, `P` and `D` the tree's
