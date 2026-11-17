@@ -939,9 +939,9 @@ laws alone (`host`, `host_fit`, `platform` and `provenance`, no step law), one p
 -013 (decode): the crs005 DPA-TP8 cell less `--enable-dp-attention`, the prefill side at
 `--gpu-memory-utilization 0.65` and the decode side at 0.70. They are for a 1P1D run whose steps
 another backend prices, both entries in its run file, where each server's own start picks the
-entry keyed to its engine config. `deploy.sh run ... --host-laws P --host-laws D` cannot yet build
-that run file ([#3659](https://github.com/jgong5/ATOM/issues/3659)): the two entries' hops differ,
-and it resolves both sides under one environment, in which one side matches neither entry. Each
+entry keyed to its engine config. `deploy.sh run ... --host-laws P --host-laws D` builds that run
+file with the decode started through `--on "env -u GPU_MAX_HW_QUEUES -u ATOM_NUMA_BIND"`: the two
+entries' hops differ, and each side's are picked under the environment it starts in. Each
 law file is `compass fit host` on its side of three 1P1D `deploy.sh record` cells at ATOM
 259bc70f0, at c=1, 4 and 16 over traces 256 to 392 for 1800 s each, every server loading the
 blocking-call tool through `ROCP_TOOL_LIBRARIES`; the c=1 cell's prefill side ran at
@@ -1169,7 +1169,9 @@ A simulated deployment, `deploy.sh run`, runs both instances on 005: each
 reaches the clock authority and the write-request block at this node's
 127.0.0.1, which 013 cannot. A local prefix, such as `env -u GPU_MAX_HW_QUEUES
 -u ATOM_NUMA_BIND`, still starts the decode apart and makes the KV link
-`inter_node`, as the real pair spans. Its router arguments switch the router's
+`inter_node`, as the real pair spans. The run file then takes the decode side's
+hops from the host entry fitted under the environment that prefix gives it, as
+the prefill side's under the script's own. Its router arguments switch the router's
 wall-clock detectors off, `--disable-retries` among them, as `deploy.sh`'s
 header requires. The script
 sets `--request-timeout-secs` itself: a stream lasts the wall time the run
