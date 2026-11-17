@@ -194,9 +194,10 @@ def test_a_tensor_pinned_as_the_runner_is_built_states_no_pageable(request, tmp_
 
 def test_a_host_tensor_built_over_pinned_bytes_states_no_pageable(request, tmp_path):
     """`torch.from_numpy` of a pinned `CpuGpuBuffer`'s numpy view, and a
-    `torch.tensor` or `torch.arange` with `pin_memory=True`, each built and
-    copied in a step, state no `pageable`; `torch.from_numpy` of an unpinned
-    buffer's view or of an array numpy allocated still does."""
+    `torch.tensor` or `torch.arange` with `pin_memory=True`, a `torch.tensor`
+    built for the device among them, each built and copied in a step, state no
+    `pageable`; `torch.from_numpy` of an unpinned buffer's view or of an array
+    numpy allocated still does."""
     if "COMPASS_ARCH_DECLARED" not in os.environ:
         done = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
@@ -223,6 +224,7 @@ def test_a_host_tensor_built_over_pinned_bytes_states_no_pageable(request, tmp_p
         for host in (
             torch.from_numpy(pinned.np[:2]),
             torch.tensor([1, 2], pin_memory=True),
+            torch.tensor([1, 2], device="cuda", pin_memory=True),  # copied here
             torch.arange(2, pin_memory=True),
             torch.from_numpy(pageable.np[:2]),
             torch.from_numpy(numpy.arange(2)),
@@ -234,4 +236,4 @@ def test_a_host_tensor_built_over_pinned_bytes_states_no_pageable(request, tmp_p
         for spec in graph._json(op)["args"].values()
         if isinstance(spec, dict) and spec.get("device") == "cpu"
     ]
-    assert [s.get("pageable", False) for s in held] == [False] * 3 + [True] * 2
+    assert [s.get("pageable", False) for s in held] == [False] * 4 + [True] * 2
