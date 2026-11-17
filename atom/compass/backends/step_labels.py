@@ -67,6 +67,16 @@ without busy time is cut as `untraced`. A trace run, a record with its busy
 lines beside it or whose run directory holds `TRACE`, ran under a profiler: its
 decode steps are cut as `traced` and its steps carry no host labels.
 
+With `PREFILL_LABEL_ENV` set to ``record``, an opt-in for a fit that has one
+plain record and no trace run, a prefill step without busy time that carries
+its MTP target end is labelled from its own device window instead, as an MTP
+decode is: the device label `d_target_ns` (plus the draft-KV pass on a step
+that produces output), the draft label the rest of `d_busy_ns`, and the
+propose label `d_propose_ns`. Such a label holds whatever idle the host paced
+inside the window, so it reads the step's device span, not its busy time; its
+sample's provenance says so (`prefill_label`), and a step with busy time keeps
+the trace run's labels.
+
 Given `floored`, a trace run's drafter labels, the draft's and its passes',
 lose what the profiler added to each drafter kernel shorter than the profiler's
 floor (`parity.busy.floored` under a `Floor`): queued behind another, such a
@@ -120,6 +130,7 @@ import bisect
 import hashlib
 import itertools
 import json
+import os
 import statistics
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
@@ -145,6 +156,17 @@ TABLE_VERSION = 1
 #: run.json's entry naming the JIT modules and kernels its server compiled while
 #: it served (`atom.compass.drive.aiter_jit`); a server that compiled none has none.
 BUILDS = "aiter_jit_builds"
+#: The variable that, set to ``record``, labels an untraced prefill step from its
+#: own device window (module docstring); unset, such a step is cut `untraced`.
+PREFILL_LABEL_ENV = "COMPASS_PREFILL_LABEL"
+
+
+def _prefill_label() -> str:
+    """``trace``, the default, or ``record``, as `PREFILL_LABEL_ENV` names it."""
+    value = os.environ.get(PREFILL_LABEL_ENV, "trace")
+    if value not in ("trace", "record"):
+        raise ValueError(f"{PREFILL_LABEL_ENV}={value!r}: name trace or record")
+    return value
 
 
 def refusal(run: dict) -> str | None:
@@ -542,6 +564,7 @@ def _label(
     (exposed, early), traced = _host_cut(lines), _traced(path)
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
+    window_prefill = _prefill_label() == "record" and not traced
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
     tbo = (config or {}).get("engine", {}).get("enable_tbo")
@@ -587,13 +610,20 @@ def _label(
             group_needs_eager=s.get("group_needs_eager", False),
         )
         cut = None
+        # An untraced prefill labelled from its own window (`PREFILL_LABEL_ENV`).
+        windowed = (
+            view.prefill
+            and "b_target_ns" not in s
+            and "d_target_ns" in s
+            and window_prefill
+        )
         if view.prefill and view.decode:
             cut = "mixed"
         elif not view.prefill and s["step"] in exposed:
             cut = "exposed"
         elif not view.prefill and traced:
             cut = "traced"
-        elif view.prefill and "b_target_ns" not in s:
+        elif view.prefill and "b_target_ns" not in s and not windowed:
             cut = "untraced"
         elif mtp and "d_target_ns" not in s:
             cut = "unsplit"
@@ -609,7 +639,9 @@ def _label(
                 target += draft_kv or 0
             device = None if cut else target * 1e-9
             draft = (s["d_busy_ns"] - target) * 1e-9
-        if view.prefill and not cut:  # a trace run's busy time
+        if windowed and not cut:  # its own window, as an MTP decode's above
+            propose = s.get("d_propose_ns") if view.produces_output else None
+        elif view.prefill and not cut:  # a trace run's busy time
             target, draft = s["b_target_ns"], s.get("b_draft_ns")
             draft_kv = s.get("b_draft_kv_ns") if view.produces_output else None
             target += draft_kv or 0
@@ -644,6 +676,8 @@ def _label(
             "requests": [r[0] for r in s["batch"]],
             "config": config,
         }
+        if windowed and not cut:
+            provenance["prefill_label"] = "record"
         samples.append(
             Sample(
                 s["step"],
