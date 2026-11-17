@@ -397,7 +397,8 @@ sampler and a writer outside the exporter.
   deadlines it holds at the finish (`atom/compass/clock/authority.py`), so a timer's last
   sample can fall up to an interval short of that clock, where CI scrapes once more
   (`collect_metrics.py::wait_for_final_scrape`). A final sample at the instant of the LP's
-  last sample replaces it.
+  last sample replaces it; one that raises is skipped and named among the hand-in's
+  reasons, so the hand-in and the file still land.
 - **The workers' GPU series.** Of an engine's workers, TP rank 0 alone observes the GPU
   forward histograms: it is the one `_group_step_seconds` prices on, every other rank
   returning 0 s, and the one whose `forward` reply the engine waits for
@@ -484,8 +485,8 @@ second without error, hence the replacement.
   28 ms with 2,016, 28 to 72 s on one side's critical path of #3498's 761 wall seconds,
   against this rule's 7.3 s on the prefill side and 17.4 s on the decode side of the
   27.5 s it added to 780 wall seconds in #3585's timed run of #3498's configuration on
-  `xingjche_sim6`: an engine's sample takes 3.1 to 3.6 ms (median), and its DP group's
-  iteration waits for the slowest member's.
+  one MI355X of a shared node (#3616's named result): an engine's sample takes 3.1 to
+  3.6 ms (median), and its DP group's iteration waits for the slowest member's.
 - (a), per engine step: 33 times (b)'s samples for a report that reads 5 s steps, and TTFT
   and inter-token latency, observed in the frontend, need a trigger of their own.
 - D72's scrape from the traffic LP: (c)'s read, plus the harness's refusal and #522's
@@ -754,7 +755,8 @@ D74's revision and `19` D115's Prometheus report, walked through the runs that w
       promtool tsdb create-blocks-from openmetrics, each file -> one TSDB
       prometheus on it, no scrape -> export_report.collect_report(standalone,
         first instant .. first + ceil((last - first) / 5) x 5, step 5,
-        window max(60, 4 x interval))
+        window max(60, 4 x interval), interval: the shortest step between
+        a file's instants, its last step, the final sample's, left out)
       -> title, notes, GPU labels marked -> export_report.write_report
    -> OUT/prometheus.html, OUT/prometheus.json
  -> python -m atom.compass.report.html OUT    links prometheus.html
@@ -782,7 +784,8 @@ tool.**
 ```
  an LP hands in before the finish, or a stop ends the run
    -> every sampler that hands in writes what it sampled, a final sample at its
-      last finite clock included (#3611); the report covers it
+      last finite clock included (#3611), or that sample's error among its reasons;
+      the report covers it
  a frontend or engine member killed before its hand-in -> no file
    -> the report's notes name it, of the run file's hand-ins less LP lmcache
       (run/__init__.py: _hand_ins)
@@ -855,8 +858,8 @@ and any change to `export_report.py` or the page it renders.
 | `atom/compass/runner/overrides.py` | on TP rank 0, `NonAllocatingRunner.forward` through `GPUForwardMetrics.measure`, its pair's elapsed time the step's `StepCost.target_seconds`, and `GPUForwardMetrics.poll` before the reply; a refused step not measured, and a dummy run or empty batch not timed, as `measure` skips them | #3586 |
 | `atom/compass/drive/run.py` | a simulated server started with `ATOM_ENABLE_METRICS_DEVICE_TIMER=1` unless set | #3586 |
 | `.github/scripts/atomesh/observability/collect_metrics.py` | `ensure_prometheus(directory, tool="prometheus")`: `ATOMESH_PROMTOOL_BIN` beside `ATOMESH_PROMETHEUS_BIN`, a tool already extracted into `directory` reused; the archive and each tool written under a per-process `.part` name and renamed whole, the archive once its checksum holds, so parallel reports never run another's part-written tool; CI's call unchanged | #3587 |
-| `atom/utils/clock.py`, `atom/compass/run/metrics.py`, `atom/compass/run/__init__.py` | `LPRuntime` keeps the clock it held before a `+inf` grant; `Sampler` keeps its timer's read, and `_hand_in`, where it writes the sampler's file, first takes a final sample with it at the LP's clock while finite, else at that clock, replacing a sample at its instant | cut from #3611 |
-| `atom/compass/report/prometheus.py` | the query's end `first + ceil((last - first) / 5) x 5`, the first grid point at or past the last instant, still at least `first + 1` | cut from #3611 |
+| `atom/utils/clock.py`, `atom/compass/run/metrics.py`, `atom/compass/run/__init__.py` | `LPRuntime` keeps the clock it held before a `+inf` grant; `Sampler` keeps its timer's read, and `_hand_in`, where it writes the sampler's file, first takes a final sample with it at the LP's clock while finite, else at that clock, replacing a sample at its instant; one that raises skipped and named among the hand-in's reasons | cut from #3611 |
+| `atom/compass/report/prometheus.py` | the query's end `first + ceil((last - first) / 5) x 5`, the first grid point at or past the last instant, still at least `first + 1`; the window's interval each file's shortest step but its last, the final sample's, which lands under one interval after the timer's last sample | cut from #3611 |
 | `atom/compass/report/prometheus.py` (new) | `python -m atom.compass.report.prometheus OUT`: each `metrics-<lp>.om.gz` decompressed, since promtool reads no gzip, then backfill, serve, `collect_report`, mark (each family `panels_for` queries that the class table lacks named), `write_report`; or `prometheus.txt` | #3587 |
 | `atom/compass/report/html.py` | a line linking `prometheus.html` or quoting `prometheus.txt` | #3587 |
 | `scripts/compass/client.sh`, `scripts/compass/deploy.sh` | the report after the split and before `report.html`; its failure reported, their exit status kept | #3587 |
@@ -886,7 +889,9 @@ and any change to `export_report.py` or the page it renders.
    no file is named (S3, S4).
 6. Each sampler's file ends with a point at its LP's last finite clock holding what its
    instruments held then, one point per series per instant, at a finish, a stop or an
-   engine's raise, and at no client run's end (S1, S3; #3611).
+   engine's raise, and at no client run's end; a final sample that raises is skipped and
+   named in the hand-in; the report's window stays `max(60, 4 x interval)` at any metrics
+   interval (S1, S3; #3611).
 
 ---
 

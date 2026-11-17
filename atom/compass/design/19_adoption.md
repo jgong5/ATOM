@@ -626,7 +626,9 @@ search's or profiling's code.
   `prefill/` and `decode/`, else `standalone`) over the run's series (`11` D74) from their
   first instant to the first grid point at or past their last, as CI's
   `wait_for_final_scrape` ends its query, at CI's 5 s step and `max(60, 4 x interval)`
-  window. Each sampler's file is decompressed, since promtool reads no gzip, and
+  window, the interval the shortest step between two instants of one file, each file's
+  last step left out, since its final sample lands under one interval after the timer's
+  last (`11` D74). Each sampler's file is decompressed, since promtool reads no gzip, and
   backfilled by promtool into one TSDB that a Prometheus with no scrape
   serves to `collect_report`; both come from `collect_metrics.py::ensure_prometheus`, which takes a
   `tool` argument, reads `ATOMESH_PROMTOOL_BIN` beside `ATOMESH_PROMETHEUS_BIN`, and reuses a
@@ -678,7 +680,9 @@ CI's template for what the title says; a router TTFT built from aiperf's, a clie
 measurement under the router's name; CI's `metrics/` layout, a second `report.html` in one
 run directory; writing it after `report.html`, which could then only link a file it
 cannot know exists; a grid shifted to end on the last instant, which then starts after the
-first, unlike CI's from the benchmark's start; and a lock around the tools' download,
+first, unlike CI's from the benchmark's start; the interval read from
+`ATOM_METRICS_UPDATE_INTERVAL_S`, which in the report's environment under `client.sh` need
+not be the server's (#3630); and a lock around the tools' download,
 which a killed report leaves blocking every later one, against a download each node makes
 once (#3611).
 
