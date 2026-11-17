@@ -15,8 +15,12 @@ from atom.utils.arg_parser import FlexibleArgumentParser
 
 ROOT = Path(__file__).resolve().parents[2]
 SPACE = ROOT / "scripts/compass/spaces/deepseek-v4-pro-mi355x-crs005.json"
-#: The shipped DPA8 pair whose capture ladders the 1P1D configurations take.
+#: The shipped DPA8 pair whose capture ladders the 1P1D configurations take,
+#: but on the sides in `OWN_LADDER`.
 LAW = "scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-crs005-{}.json"
+#: The 1P1D sides with a ladder of their own: P1's decode side takes the powers
+#: of two to 256, each size a calibration deployment of its own.
+OWN_LADDER = {("P1", "decode"): [1, 2, 4, 8, 16, 32, 64, 128, 256]}
 CONCURRENCY = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 #: Each instance's ATOM arguments the template states, by the name ATOM's
 #: parser reads each under, but `--model` and the capture sizes, and its
@@ -120,8 +124,10 @@ def test_atom_reads_each_instance_as_the_template_states_it(expansion):
             assert written - {"model", "cudagraph_capture_sizes"} == args.keys()
             assert {name: given[name] for name in args} == args
             assert given["model"] == expansion["model"]
-            # ATOM's own on a single node, the shipped pair's on each 1P1D side.
-            assert sizes == (atom_ladder if side == "server" else law(side)["ladder"])
+            # ATOM's own on a single node, the shipped pair's on each 1P1D side
+            # but those with their own.
+            shipped = atom_ladder if side == "server" else law(side)["ladder"]
+            assert sizes == OWN_LADDER.get((point["candidate"], side), shipped)
             assert instance["env"] == env
 
 

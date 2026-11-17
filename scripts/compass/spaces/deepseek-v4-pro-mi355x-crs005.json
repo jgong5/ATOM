@@ -123,12 +123,13 @@
         },
         "decode": {
           "args": {
-            "--cudagraph-capture-sizes": "[1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128,132,136,140,144,148,152,156,160,164,168,172,176,180,184,188,192,196,200,204,208,212,216,220,224,228,232,236,240,244,248,252,256]"
+            "--cudagraph-capture-sizes": "[1,2,4,8,16,32,64,128,256]"
           }
         },
         "departures": {
           "--enable_prefix_caching": "on, not off: as the agentic workload and the single-node recipe have it; no law keys on it",
           "--block-size": "unset: ATOM sets 256 on any DeepSeek-V4 checkpoint, so the recipe's 16 has no effect",
+          "--cudagraph-capture-sizes": "the powers of two to 256 on the decode side, not the nightly's 1, 2, 4, then every 4 to 256: each capture size is a calibration deployment of its own, and the template is ungraded",
           "--gpu-memory-utilization": "0.75 on each side, not 0.85: at 0.85 Mooncake's dmabuf registration on crsuse2-m2m-v3-005 and -013 runs DeepSeek-V4-Pro at TP8 out of memory",
           "--kv-transfer-config": "unset: deploy.sh adds each side's and refuses one among ATOM's arguments",
           "HIP_VISIBLE_DEVICES": "unset: a real side's cards are deploy.sh's --gpu, and a simulated side uses none",
