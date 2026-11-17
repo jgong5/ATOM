@@ -34,6 +34,15 @@ from atom.model_engine import llm_engine
 #: Capture sizes whose rungs `step_linear`'s law has decode vectors for: rung 2,
 #: and the eager rung past it.
 COVERED = [2]
+#: An ``lmcache_offload`` entry the connector reads.
+OFFLOAD_ENTRY = {
+    "chunk_size": 256,
+    "tensor_parallel_size": 1,
+    "chunk_bytes": 2**20,
+    **{term: [0.0, 0.0] for term in ("lookup_s", "store_s", "load_s")},
+}
+#: A deployment offloading KV through ATOM's ``lmcache_offload``.
+OFFLOADS = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
 
 
 def checked(tmp_path, *flags, platform=None):
@@ -202,6 +211,57 @@ def test_a_step_stub_the_run_cannot_build_is_listed_missing(
 
     out = capsys.readouterr().out
     assert lacked(out) == [f"step stub {path}: missing"]
+    assert f"  refused: {refused.value}\n" in out
+
+
+@pytest.mark.parametrize("text", [None, "{"], ids=["absent", "not JSON"])
+def test_an_lmcache_offload_file_the_run_cannot_read_is_listed_missing(
+    tmp_path, monkeypatch, capsys, text
+):
+    r = deployment(tmp_path, kv_transfer_config=OFFLOADS)
+    path = tmp_path / "typo.json"
+    if text is not None:
+        path.write_text(text)
+    flags = ["--step-stub", stub(tmp_path), "--lmcache-offload", str(path)]
+    with pytest.raises((OSError, ValueError)) as refused:
+        runfile.build(*_parsed(tmp_path, *flags))
+    served(monkeypatch, r.config)
+
+    assert checked(tmp_path, *flags) == 1
+
+    out = capsys.readouterr().out
+    assert lacked(out) == [f"lmcache_offload entry {path}: missing"]
+    assert f"  refused: {refused.value}\n" in out
+
+
+@pytest.mark.parametrize(
+    "kv, entry, state",
+    [
+        ({}, OFFLOAD_ENTRY, "stale"),
+        (OFFLOADS, None, "missing"),
+        (OFFLOADS, [], "stale"),
+    ],
+    ids=["offloads none", "no entry", "not a mapping"],
+)
+def test_check_meets_the_engine_s_refusal_of_an_lmcache_offload_entry_or_none(
+    tmp_path, monkeypatch, capsys, kv, entry, state
+):
+    r = deployment(tmp_path, kv_transfer_config=kv)
+    flags, name = ["--step-stub", stub(tmp_path)], "lmcache_offload entry"
+    if entry is not None:
+        path = tmp_path / "offload.json"
+        path.write_text(json.dumps(entry))
+        flags += ["--lmcache-offload", str(path)]
+        name += f" {path}"
+    run = runfile.build(*_parsed(tmp_path, *flags))
+    with pytest.raises((TypeError, ValueError)) as refused:
+        compass_run._offload_tier(r.config, run)
+    served(monkeypatch, r.config)
+
+    assert checked(tmp_path, *flags) == 1
+
+    out = capsys.readouterr().out
+    assert lacked(out) == [f"{name}: {state}"]
     assert f"  refused: {refused.value}\n" in out
 
 

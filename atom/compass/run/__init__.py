@@ -1719,9 +1719,19 @@ def _offloads(kv, connector: str) -> bool:
 def _offload_tier(config, run: dict) -> None:
     """Have the connector factory build ``lmcache_offload`` as Compass's
     (`atom.compass.kv.lmcache_offload`) when this deployment offloads through
-    it; refuse a deployment and a run file that disagree on whether it does,
-    an entry the connector cannot read, and a deployment above DP or pipeline
-    width 1, whose ranks' tiers this does not join."""
+    it, once `refuse_offload_tier` holds."""
+    from atom.compass.kv import lmcache_offload
+
+    refuse_offload_tier(config, run)
+    if lmcache_offload.ENTRY in run:
+        lmcache_offload.substitute()
+
+
+def refuse_offload_tier(config, run: dict) -> None:
+    """Refuse a deployment and a run file that disagree on whether it offloads
+    KV through ``lmcache_offload``, an entry the connector cannot read, and a
+    deployment above DP or pipeline width 1, whose ranks' tiers this does not
+    join."""
     from atom.compass.kv import lmcache_offload
 
     offloads = _offloads(config.kv_transfer_config, "lmcache_offload")
@@ -1743,7 +1753,6 @@ def _offload_tier(config, run: dict) -> None:
             f"deployment runs {', '.join(wide)}"
         )
     lmcache_offload.check_entry(run[lmcache_offload.ENTRY])
-    lmcache_offload.substitute()
 
 
 def _park_before_dispatch() -> None:
