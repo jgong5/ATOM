@@ -31,6 +31,12 @@ def _geometry(kv_dtype):
     )
 
 
+def _coinciding():
+    """V4.1's FP8 pool of 6 layers and no drafter, 4 layers' rings a page:
+    layer L's ring on P pages starts where layer L + 4's does on P - 1."""
+    return V41PoolGeometry(6, ((0, 1),), 16, 16, 128, 32, kv_dtype="fp8")
+
+
 def _taken(windows, cache):
     """Copy 0's `window` of a window write given each of `windows` as the
     capture states it, on a point whose forward context holds `cache`."""
@@ -70,14 +76,39 @@ def test_a_v41_window_ring_is_its_layer_s_of_the_point_s_pool(kv_dtype, form):
     assert got == [ring(layer, POINT) for layer in range(3)]
 
 
-def test_a_ring_where_no_layer_s_starts_refuses_its_leaf():
-    geometry = _geometry("fp8")
+@pytest.mark.parametrize("form", ["window_bytes", "window"])
+def test_rings_that_coincide_take_the_one_pool_that_holds_all_the_point_s(form):
+    # layer 0's ring on 2 pages starts where layer 4's does on 1, and layer 5's
+    # on 2 where layer 1's does on 3: only 2 pages hold each of the six
+    geometry = _coinciding()
+    ring = getattr(geometry, form)
     cache = SimpleNamespace(geometry=geometry, num_pages=POINT)
-    ring = geometry.window_bytes(1, CAPTURED)
-    off = dataclasses.replace(ring, ring_start=ring.ring_start + 1)
+    assert ring(0, CAPTURED) == ring(4, CAPTURED - 1)
 
-    with pytest.raises(ValueError, match="no layers' window rings start where"):
-        _taken([off], cache)
+    got = _taken([ring(layer, CAPTURED) for layer in range(6)], cache)
+
+    assert got == [ring(layer, POINT) for layer in range(6)]
+
+
+def _off(geometry):
+    ring = geometry.window_bytes(1, CAPTURED)
+    return dataclasses.replace(ring, ring_start=ring.ring_start + 1)
+
+
+@pytest.mark.parametrize(
+    "geometry, ring, why",
+    [
+        (_geometry("fp8"), _off, "no layers'"),
+        # alone, layer 0's ring on 2 pages is layer 4's on 1
+        (_coinciding(), lambda g: g.window_bytes(0, CAPTURED), "2 layers'"),
+    ],
+    ids=["no-layer", "two-layers"],
+)
+def test_a_ring_not_one_layer_s_refuses_its_leaf(geometry, ring, why):
+    cache = SimpleNamespace(geometry=geometry, num_pages=POINT)
+
+    with pytest.raises(ValueError, match=f"{why} window rings start where"):
+        _taken([ring(geometry)], cache)
 
 
 def test_a_ring_beside_no_v41_cache_is_taken_as_captured():

@@ -1257,6 +1257,8 @@ class Stub:
         for owner in (fc.attn_metadata, fc.context):
             live |= {k: v for k, v in vars(owner).items() if torch.is_tensor(v)}
         device, md = self.runner.device, fc.attn_metadata
+        if not self.placed:  # one capture's pool placed the point's window rings
+            self.captured = _captured(getattr(md, "cache", None), self.leaves)
         live = {
             k: v
             for k, v in live.items()
@@ -2093,7 +2095,7 @@ class Stub:
                 cache = getattr(snap.attn_metadata, "cache", None)
                 geometry = getattr(cache, "geometry", None)
                 if value["object"] == RING and hasattr(geometry, "window_bytes"):
-                    return _ring(geometry, cache.num_pages, got)
+                    return _ring(geometry, cache.num_pages, got, self.captured)
                 return got
             if (
                 isinstance(value, dict)
@@ -2837,13 +2839,10 @@ def _widest(shape, stride) -> int:
 
 
 @functools.cache
-def _ring(geometry, pages, captured):
-    """DeepSeek-V4.1's window ring `captured` (`RING`), as the capture's pool
-    placed it, at its layer of a pool of `pages` pages, as ATOM's forward
-    builds it (`V41PoolGeometry.window`, or `window_bytes` in bytes): its layer
-    is the one whose ring a pool of some count of pages starts where the
-    capture's does, refused where no layer's does, or several layers' do and
-    start apart on `pages`."""
+def _layers(geometry, captured) -> dict:
+    """By page count, the layer of DeepSeek-V4.1's pool `geometry` whose window
+    ring a pool of that many pages starts where `captured` (`RING`) does, and
+    its build (`V41PoolGeometry.window`, or `window_bytes` in bytes)."""
     found = {}
     for build in (geometry.window, geometry.window_bytes)[: 1 + geometry.window_fp8]:
         first = build(0, 0)
@@ -2858,7 +2857,38 @@ def _ring(geometry, pages, captured):
                 range(max(start, 0) + 1), start, key=lambda n: build(0, n).ring_start
             )
             if build(layer, p) == captured:
-                found[build(layer, pages)] = layer
+                found[p] = build, layer
+    return found
+
+
+def _captured(cache, leaves) -> int | None:
+    """The pages of the capture's pool that placed the DeepSeek-V4.1 window
+    rings (`RING`) `leaves` take, as the one count on which each is a layer's
+    (`_layers`): one capture's pool placed them all; None where not one is."""
+    from atom.compass.capture.forward import rebuild_object
+
+    geometry = getattr(cache, "geometry", None)
+    if not hasattr(geometry, "window_bytes"):
+        return None
+    fits = [
+        _layers(geometry, rebuild_object(RING, v["state"]))
+        for op, _ in leaves.values()
+        for v in op["args"].values()
+        if isinstance(v, dict) and v.get("object") == RING
+    ]
+    common = [p for p in fits[0] if all(p in f for f in fits)] if fits else []
+    return common[0] if len(common) == 1 else None
+
+
+def _ring(geometry, pages, captured, at=None):
+    """DeepSeek-V4.1's window ring `captured` (`RING`) at its layer of a pool of
+    `pages` pages, as ATOM's forward builds it: the layer it is on the
+    capture's pool of `at` pages (`_captured`), else the one whose ring a pool
+    of any count of pages starts there (`_layers`); refused where no layer's
+    does, or several layers' do and start apart on `pages`."""
+    fits = _layers(geometry, captured)
+    fits = {at: fits[at]} if at in fits else fits
+    found = {build(layer, pages): layer for build, layer in fits.values()}
     if len(found) != 1:
         raise ValueError(
             f"{len(found) or 'no'} layers' window rings start where the "
