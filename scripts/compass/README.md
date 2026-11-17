@@ -933,6 +933,27 @@ rung 2, which the 1P1D prefill side reaches at c=64 ([#2878](https://github.com/
 Host keys and the fp8 indexer key as the crs005 DPA-TP8 pair's, its lone cells fp4 and its 1P1D
 cells fp8; the gap between the two is unmeasured on this pair.
 
+`scripts/compass/laws/deepseek-v4-pro-tp8-mi355x-crs005-{prefill,decode}-host.json.xz` hold host
+laws alone (`host`, `host_fit`, `platform` and `provenance`, no step law), one per side of
+[#3179](https://github.com/jgong5/ATOM/issues/3179)'s TP cell on crsuse2-m2m-v3-005 (prefill) and
+-013 (decode): the crs005 DPA-TP8 cell less `--enable-dp-attention`, the prefill side at
+`--gpu-memory-utilization 0.65` and the decode side at 0.70. They are for a 1P1D run whose steps
+another backend prices, both entries in its run file, where each server's own start picks the
+entry keyed to its engine config. `deploy.sh run ... --host-laws P --host-laws D` cannot yet build
+that run file ([#3659](https://github.com/jgong5/ATOM/issues/3659)): the two entries' hops differ,
+and it resolves both sides under one environment, in which one side matches neither entry. Each
+law file is `compass fit host` on its side of three 1P1D `deploy.sh record` cells at ATOM
+259bc70f0, at c=1, 4 and 16 over traces 256 to 392 for 1800 s each, every server loading the
+blocking-call tool through `ROCP_TOOL_LIBRARIES`; the c=1 cell's prefill side ran at
+0.70 ([#3194](https://github.com/jgong5/ATOM/issues/3194#issuecomment-6869663548)). `host_fit.held_out`
+holds each band's errors with each record held out in turn. A term a side's records cannot give is
+the crs005 DPA8 law's of that side, as `provenance` names: `admission_s` and `stream_s`, since a
+side's requests and streams pass the router; `kv_write_req_s` and `router_s`, which `compass fit
+host` does not fit; the prefill side's `ipc_out_s`, since no output message ran alone on it; and the
+decode side's `http_intake`, since its requests render no chat template
+([#3229](https://github.com/jgong5/ATOM/issues/3229)). A decode side encodes no prompt and admits no
+request, so its entry states no encode term and `admit` null.
+
 `scripts/compass/laws/deepseek-v4-pro-tp8-mtp3-mi355x-crs005-{prefill,decode}.json.xz` and
 `deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-{prefill,decode}.json.xz` hold host laws alone, one per
 side of [#1499](https://github.com/jgong5/ATOM/issues/1499)'s two MTP cells on crsuse2-m2m-v3-005
@@ -962,7 +983,11 @@ records at ed5fa7697, taken in the image and aiter of that stack
 and 64, then 8, 12 and 56 from each trajectory's first turn for rungs 7, 8, 12 and 56. No
 c=256 record is in it: that take stalled the node
 ([#2922](https://github.com/jgong5/ATOM/issues/2922)), so decode rungs past 24 rest on the
-first-turn c=56 record. Each server ran with `ENABLE_CK=0
+first-turn c=56 record. The draft's `propose` vector is fitted apart, by `compass fit steps`
+at that later tree on two 120 s trace runs at c=16 and c=4 under the same settings, whose busy
+time labels an output prefill's propose pass; that tree's fit refuses the ed5fa7697 records
+beside them ([#3607](https://github.com/jgong5/ATOM/issues/3607)). Each server ran with
+`ENABLE_CK=0
 GPU_ARCHS=gfx1250 ATOM_ENGRAM_UVA=1 ATOM_ENGRAM_UVA_HBM=1 AITER_LOG_LEVEL=WARNING OMP_NUM_THREADS=4
 ATOM_DISABLE_MMAP=true AITER_REUSE_IDENTICAL_COMM_GROUPS=1`, `NCCL_MIN_NCHANNELS` unset, and
 `SERVER_ARGS` of `--trust-remote-code -tp 4 --kv_cache_dtype bf16 --index-cache-dtype fp8

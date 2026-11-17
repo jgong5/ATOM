@@ -128,6 +128,8 @@ LAW_SPECS = {
     "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-decode.json.xz": "mi355x-gpu45.json",
     "deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json.xz": "mi355x-crs005.json",
     "deepseek-v4-pro-dpa8-ep8-mi355x-crs005-decode.json.xz": "mi355x-crs005.json",
+    "deepseek-v4-pro-tp8-mi355x-crs005-prefill-host.json.xz": "mi355x-crs005.json",
+    "deepseek-v4-pro-tp8-mi355x-crs005-decode-host.json.xz": "mi355x-crs005.json",
     "deepseek-v4-pro-tp8-mtp3-mi355x-crs005-prefill.json.xz": "mi355x-crs005.json",
     "deepseek-v4-pro-tp8-mtp3-mi355x-crs005-decode.json.xz": "mi355x-crs005.json",
     "deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-prefill.json.xz": "mi355x-crs005.json",

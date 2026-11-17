@@ -17,10 +17,11 @@ import pytest
 from test_artifact_invalidation import moved
 from test_drive_run import bundle, op_graph_run, recorded, stub, unstarted
 from test_drive_runfile import LAWS, host_laws, install, published, step_linear
-from test_memory_readings import DOCUMENT
+from test_memory_readings import CONFIG_JSON, DOCUMENT
 from test_run_load_invalidation import fitted
 from test_run_step_grid import PLATFORM, deployment, host_laws_key, readings
 from test_step_grid_plan import MIXED, SHORT, located, measured, plan
+from transformers import PretrainedConfig
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import Axis, Kind, keyed_platform
@@ -28,8 +29,10 @@ from atom.compass.backends.step_roofline import UNCLASSIFIED, Module
 from atom.compass.bench import ops
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import runfile, serve
+from atom.compass.kv.lmcache_offload import OffloadShell
 from atom.compass.validate import bound
 from atom.model_engine import llm_engine
+from atom.utils import clock
 
 #: Capture sizes whose rungs `step_linear`'s law has decode vectors for: rung 2,
 #: and the eager rung past it.
@@ -262,6 +265,40 @@ def test_check_meets_the_engine_s_refusal_of_an_lmcache_offload_entry_or_none(
 
     out = capsys.readouterr().out
     assert lacked(out) == [f"{name}: {state}"]
+    assert f"  refused: {refused.value}\n" in out
+
+
+@pytest.mark.parametrize(
+    "model_type, kv, fitted",
+    [
+        ("qwen3_5_text", {}, {}),
+        ("qwen3", {}, {"chunk_size": 16}),
+        ("qwen3", {}, {"tensor_parallel_size": 2}),
+        ("qwen3", {"lmcache.local_cpu": False}, {}),
+        ("qwen3", {"lmcache.save_unfull_chunk": True}, {}),
+    ],
+    ids=["state layout", "chunk size", "TP width", "no CPU tier", "unmodelled"],
+)
+def test_check_meets_the_offload_shell_s_refusal_of_the_deployment_s_lmcache_config(
+    tmp_path, monkeypatch, capsys, model_type, kv, fitted
+):
+    text = json.loads(CONFIG_JSON.read_text())["text_config"]
+    hf = PretrainedConfig.from_dict(text | {"model_type": model_type})
+    kv = OFFLOADS | {"lmcache.chunk_size": OFFLOAD_ENTRY["chunk_size"]} | kv
+    r = deployment(tmp_path, kv_transfer_config=kv, hf_config=hf)
+    entry, path = OFFLOAD_ENTRY | fitted, tmp_path / "offload.json"
+    path.write_text(json.dumps(entry))
+    with monkeypatch.context() as m, pytest.raises(ValueError) as refused:
+        m.setattr(clock, "_installed", object())
+        m.setattr(compass_run, "spec", lambda: {"lmcache_offload": entry})
+        OffloadShell(r.config)
+    served(monkeypatch, r.config)
+
+    flags = ["--step-stub", stub(tmp_path), "--lmcache-offload", str(path)]
+    assert checked(tmp_path, *flags) == 1
+
+    out = capsys.readouterr().out
+    assert lacked(out) == [f"lmcache_offload entry {path}: stale"]
     assert f"  refused: {refused.value}\n" in out
 
 
