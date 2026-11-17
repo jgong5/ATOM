@@ -3,8 +3,9 @@
 
 With ATOM's device timer on, TP rank 0 of the Compass runner times each step
 `forward` prices through ATOM's `GPUForwardMetrics`, built as `ModelRunner`
-builds it, before `forward` replies: the step's `StepCost.target_seconds`, and
-a prefill request's sum over its chunks. Requests run through ATOM's own
+builds it, before `forward` replies: the step's `StepCost.target_seconds`, not
+its charge, which adds the draft, nor its DP group's target, and a prefill
+request's sum over its chunks. Requests run through ATOM's own
 `Scheduler`, whose `prefill_gpu_requests` names each prefill chunk, and the
 runner's own `forward`, with `torch.cuda.Event` refusing, so a device event
 fails the test. `compass run` starts its server with the timer on unless set.
@@ -29,6 +30,7 @@ from test_drive_run import (
 )
 from test_step_grid_plan import SHORT
 
+from atom.compass.backends.cost import CostTerm, StepCost
 from atom.compass.backends.resolver import CostRefused, Refusal
 from atom.compass.backends.step_stub import StepStubBackend
 from atom.compass.drive import run as drive_run
@@ -44,6 +46,9 @@ TIMER = "ATOM_ENABLE_METRICS_DEVICE_TIMER"
 PROMPTS, BUDGET = (40, 70, 20), 32
 #: The price calls refused: the second prompt's middle chunk, and a decode.
 REFUSED = (3, 6)
+#: The draft seconds `Kept` adds to each price it answers, far above the
+#: stub's targets, so a step's charge and its DP group's target are not it.
+DRAFT_S = 1.0
 #: The planted server, which also writes the timer its environment holds to
 #: the file `PLANTED_TIMER` names.
 TIMED = (
@@ -53,17 +58,20 @@ TIMED = (
 
 
 class Kept(StepStubBackend):
-    """The stub, keeping each call's price, None for the calls it refuses."""
+    """The stub with a `draft_s` draft term beside its target terms, keeping
+    each call's price, None for the calls it refuses."""
 
-    def __init__(self, refuse=()):
+    def __init__(self, refuse=(), draft_s=DRAFT_S):
         super().__init__()
-        self.refuse, self.costs = set(refuse), []
+        self.refuse, self.draft_s, self.costs = set(refuse), draft_s, []
 
     def price(self, view):
         if len(self.costs) in self.refuse:
             self.costs.append(None)
             raise CostRefused(view, [Refusal("kept", "refused here")])
-        self.costs.append(super().price(view))
+        cost = super().price(view)
+        draft = CostTerm("draft", self.draft_s, cost.terms[0].provenance)
+        self.costs.append(StepCost(cost.terms, cost.treatments, (draft,)))
         return self.costs[-1]
 
 
@@ -161,6 +169,9 @@ def test_rank_0_times_each_priced_step_and_each_prefill_before_it_replies(
     priced = [c is not None for c in backend.costs]
     assert [n for _, _, n in steps] == [sum(priced[: k + 1]) for k in range(len(steps))]
     targets = [c.target_seconds for c in backend.costs if c is not None]
+    # Each priced step is charged its target plus the draft, as its reply says.
+    charged = [x.predicted_s for (_, x, _), c in zip(steps, backend.costs) if c]
+    assert charged == pytest.approx([t + DRAFT_S for t in targets], rel=1e-9)
     assert r.seen["steps"] == pytest.approx(targets, rel=1e-9)
     sums = published(steps, backend.costs)
     assert len(sums) == len(PROMPTS) - (1 if refuse else 0)
@@ -183,16 +194,18 @@ def test_with_the_timer_off_nothing_is_timed_and_every_reply_is_the_same(
 def test_another_tp_rank_and_a_dp_dummy_are_not_timed(timer, dp2):  # noqa: F811
     tp1 = timed(runner(Kept()))
     tp1.rank = 1
-    backends = [Kept(), Kept()]
+    backends = [Kept(), Kept(draft_s=2 * DRAFT_S)]
     busy, idle = (
         timed(runner(b, dp_size=2, dp_rank=r)) for r, b in enumerate(backends)
     )
 
     drive(tp1)
-    dp2(lambda: busy.forward(prefill(40)), idle.dummy_execution)
+    reply, _ = dp2(lambda: busy.forward(prefill(40)), idle.dummy_execution)
 
     assert tp1.seen == idle.seen == {"steps": [], "prefill_requests": []}
     assert len(backends[1].costs) == 1  # the dummy priced, and not timed
+    # The busy step leaves at its group's target, the idle dummy's charge.
+    assert reply.predicted_s == pytest.approx(backends[1].costs[0].seconds)
     assert busy.seen["steps"] == [backends[0].costs[0].target_seconds]
 
 
