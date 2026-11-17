@@ -295,6 +295,19 @@
    "mechanism_why": "a hand-off onto the executor's queue cannot park; the wait for its result is `done.result()`'s row"
   },
   {
+   "id": "atom/compass/capture/__init__.py::_keyed_by_files::ThreadPoolExecutor(16)::thread_start#0",
+   "file": "atom/compass/capture/__init__.py",
+   "symbol": "_keyed_by_files",
+   "call": "ThreadPoolExecutor",
+   "expr": "ThreadPoolExecutor(16)",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "engine",
+   "why": "an op-graph run's lookup reads the documents of its store's op_graph entries it has not read yet from 16 threads, at its first shape no graph keyed by the whole ATOM source answers and when a publish moves the folder",
+   "mechanism": "K9",
+   "mechanism_why": "the threads only read files and end before the lookup returns; they price nothing and send nothing"
+  },
+  {
    "id": "atom/compass/run/__init__.py::_op_graphs.lazily::done.result()::event_wait#0",
    "file": "atom/compass/run/__init__.py",
    "symbol": "_op_graphs.lazily",

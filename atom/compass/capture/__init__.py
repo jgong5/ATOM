@@ -285,9 +285,9 @@ def files_of(reads) -> dict:
     body ran, and each file of `reads` (`forward.watch_reads`). A module's
     path is read off its own namespace, past any `__getattr__` it defines."""
     modules = [m for m in list(sys.modules.values()) if isinstance(m, ModuleType)]
-    paths = {vars(m).get("__file__") for m in modules}
+    paths = [vars(m).get("__file__") for m in modules]
     held = {}
-    for path in {p for p in paths if isinstance(p, str)} | set(reads):
+    for path in sorted({p for p in paths if isinstance(p, str)} | set(reads)):
         if (place := _place(path)) and (reading := file_reading(*place)):
             held.setdefault(place[0], {})[place[1]] = reading
     return {root: dict(sorted(held[root].items())) for root in sorted(held)}
