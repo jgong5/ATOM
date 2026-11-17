@@ -48,6 +48,7 @@ from atom.compass.artifacts import (
     keyed_platform,
     member_name,
 )
+from atom.compass.backends.json_file import read_json
 from atom.compass.bench import ops
 from atom.compass.drive import reuse
 from atom.compass.drive import run as drive_run
@@ -122,7 +123,7 @@ def law(r, **changed) -> dict:
     """The DPA8 decode law re-keyed to `r`'s config and platform at this
     tree's ATOM digest, each source's figures within the gate, with
     `changed`."""
-    held = json.loads(DPA8.read_text())
+    held = read_json(DPA8)
     held["engine_config"] = keyed(r.config)
     held["platform"] = keyed_platform(Kind.STEP_LINEAR_LAW, PLATFORM)
     held["host"]["key"] = compass_run.host_key(r.config)
@@ -562,7 +563,7 @@ def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, a
     model = tmp_path / "DeepSeek-V4-Pro"
     model.mkdir()
     shutil.copy(V4_PRO, model / "config.json")
-    cpu = json.loads(PAIR["prefill"].read_text())["host"]["key"]["host_cpu"]
+    cpu = read_json(PAIR["prefill"])["host"]["key"]["host_cpu"]
     monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
     common = {"basis": "a recipe", "deployment": "1p1d", "env": SHARED_ENV}
     common["args"] = {"--tensor-parallel-size": 8, "--kv-cache-dtype": "fp8"}
@@ -604,7 +605,7 @@ def test_a_1p1d_side_runs_under_the_aiter_log_level_deploy_sh_starts_it_with(
     model = tmp_path / "DeepSeek-V4-Pro"
     model.mkdir()
     shutil.copy(V4_PRO, model / "config.json")
-    cpu = json.loads(PAIR["prefill"].read_text())["host"]["key"]["host_cpu"]
+    cpu = read_json(PAIR["prefill"])["host"]["key"]["host_cpu"]
     monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
     common = {"basis": "a recipe", "deployment": "1p1d", "env": SHARED_ENV | given}
     common["args"] = {"--tensor-parallel-size": 8, "--kv-cache-dtype": "fp8"}
