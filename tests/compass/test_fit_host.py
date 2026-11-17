@@ -84,6 +84,43 @@ def test_the_host_laws_published_are_fit_hosts_and_a_run_file_carrying_them_runs
     assert r.compass_host.laws == host["laws"]
 
 
+def test_a_stated_hop_is_written_into_the_entry_s_hops_and_named_in_its_report(
+    tmp_path,
+):
+    """`--stated-hop`: a hop no record times, such as the router's forward a
+    `--dp-aware` deployment's router LP needs above the IPC hop it borrows."""
+    r = deployment(tmp_path)
+    publish(tmp_path, r)
+    key = compass_run.host_key(r.config)
+    a = record(tmp_path / "a", 19, key=key, trace="trace-a")
+    stated = ["--stated-hop", "router_s=0.0015", "--stated-hop", "kv_write_req_s=1e-4"]
+    fit(tmp_path, "fit host", a, *clients(a), *stated)
+
+    host = member(tmp_path / "store", host_laws_key(key), "params")
+    assert host["hops"] == {"router_s": 0.0015, "kv_write_req_s": 1e-4}
+    report = member(tmp_path / "store", host_laws_key(key), "report")
+    assert report["stated_hops"] == host["hops"]
+
+
+@pytest.mark.parametrize(
+    "words, refusal",
+    [
+        (["ipc_s=0.0001"], "only router_s, kv_write_req_s"),
+        (["router_s=0.001", "router_s=0.002"], "state router_s already"),
+        (["router_s=-1"], "not a positive number of seconds"),
+        (["router_s=fast"], "not a positive number of seconds"),
+    ],
+    ids=["fitted-hop", "twice", "negative", "no-number"],
+)
+def test_a_stated_hop_refuses_a_fitted_hop_a_repeat_or_no_positive_seconds(
+    words, refusal
+):
+    from atom.compass.fit.host import stated_hops
+
+    with pytest.raises(ValueError, match=refusal):
+        stated_hops(words, {"ipc_s": 1e-4})
+
+
 def test_a_record_without_its_host_key_refuses(tmp_path):
     a = record(tmp_path / "a", 19, keyed=False)
 

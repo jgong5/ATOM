@@ -2,7 +2,7 @@
 """`compass fit host`: the host laws, fitted on real runs' records and published.
 
     compass fit host RECORD... --client-run RECORD EXPORT... --store ROOT
-        --out DIR
+        [--stated-hop NAME=SECONDS...] --out DIR
 
 `host_laws` fits the samples' host labels by `step_linear_fit.fit_host`, under
 the host key the real runner writes beside each record, and its report names
@@ -21,10 +21,18 @@ and its reason listed under the report's ``unfitted``. The host key gains the
 fields of the configuration's platform a `host_laws` key states, which a run's
 spec must match; the entry is keyed by that host key's values and holds the run file's `host` entry as its
 params.
+
+`--stated-hop NAME=SECONDS` writes a hop no record times into the entry's
+``hops``, as a committed law file states it: ``router_s``, the router's
+per-request forward, which a `deploy.sh run` with a `--dp-aware` router needs
+above the IPC hop it borrows for ``router_in_s``, and ``kv_write_req_s``,
+Mooncake's write request (`STATED_HOPS`). The report's ``stated_hops`` names
+each, so the entry says which hops were stated rather than fitted.
 """
 
 import gzip
 import json
+import math
 from pathlib import Path
 
 from atom.compass.artifacts import Key, Kind, keyed_platform
@@ -119,10 +127,55 @@ def _client(record, exports) -> dict:
     return {"sent": sent, "acked": acked}
 
 
+#: The hops no record times, each stated in a law file until now: the router's
+#: per-request forward (#3009's assumed 1.5 ms) and Mooncake's KV write request
+#: (#2603's p10), which need the router stamped and both sides on one clock.
+STATED_HOPS = ("router_s", "kv_write_req_s")
+
+
+def stated_hops(words: list[str], fitted: dict) -> dict:
+    """The hops `--stated-hop NAME=SECONDS` words state, by name: each a hop
+    of `STATED_HOPS`, once, a positive number of seconds; refused for any
+    other hop, which the records fit or name unfitted (`fitted`, the entry's
+    own ``hops``), and so is never stated over them."""
+    out = {}
+    for word in words:
+        name, _, value = word.partition("=")
+        if name not in STATED_HOPS:
+            raise ValueError(
+                f"--stated-hop {word}: only {', '.join(STATED_HOPS)}, which no "
+                "record times, is stated; the others are fitted from the records"
+            )
+        if name in out or name in fitted:
+            raise ValueError(
+                f"--stated-hop {word}: the entry's hops state {name} already"
+            )
+        try:
+            seconds = float(value)
+        except ValueError:
+            seconds = math.nan
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError(f"--stated-hop {word}: not a positive number of seconds")
+        out[name] = seconds
+    return out
+
+
 def main(argv: list[str]) -> None:
-    args = publish.parser(PROG, __doc__.split("\n\n")[0]).parse_args(argv)
+    parser = publish.parser(PROG, __doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--stated-hop",
+        action="append",
+        default=[],
+        metavar="NAME=SECONDS",
+        help=f"a hop no record times, one of {', '.join(STATED_HOPS)}, written "
+        "into the entry's hops and named under the report's stated_hops",
+    )
+    args = parser.parse_args(argv)
     samples, config = publish.inputs(args, ("record",))
     host, report = host_laws(samples, args.inputs, args.client_run)
+    if stated := stated_hops(args.stated_hop, host.get("hops", {})):
+        host["hops"] = {**host.get("hops", {}), **stated}
+        report["stated_hops"] = stated
     k = host["key"]
     k |= keyed_platform(Kind.HOST_LAWS, config["platform"])
     key = Key.of(
