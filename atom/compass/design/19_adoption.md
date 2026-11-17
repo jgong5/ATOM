@@ -17,6 +17,7 @@ D80), `16` (D95.1), and the M3-Agentic stage's `03` D13.1, `06` D35.1 and `14` D
 | Touches | How | Decision |
 |---|---|---|
 | `13` D79: precedence has no level but CLI and artifact, and no Compass config file | not amended: the space file is the search's input, as traces are a client's, not the config file D79 rejects, as the [sixth ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927) settles | D110 |
+| `13` D80: `run`'s flags | `--lmcache FILE`, the run file's `lmcache` entry | D110 |
 | `13` D80: no command starts the client or takes a workload | `compass advice` does both | D109 |
 | `13` D80: a prefill or decode `run` refuses without `--join` | not under `--check`, which resolves the side as `deploy.sh` does | D109 |
 | `13` D80: what `run --check` lists | a step linear law's scheduled decode rungs with no vector, too | D112 |
@@ -232,9 +233,13 @@ calibration #3355 keeps outside the search.
 2. **Simulate.** Each searchable point, a fresh server per point (`13` D80): `compass
    run`, or `deploy.sh run` on 1P1D, driven by one `client.sh` run, points in parallel
    over the host's cores and ports, a failed one retried and then listed with its
-   reason, a finished one skipped. No `--step-roofline`: a refusal means a calibration is
-   missing, and the law is completed, as stages 3 (#975, #2660) and 4 (#2544) completed
-   theirs.
+   reason, a finished one skipped. A 1P1D point's router takes Compass's own flags, the
+   same for every candidate: `--backend atom`, and the health check, circuit breaker and
+   retries off, as `scripts/compass/pd_sim.sh` starts it; the space file states none
+   (the [#3477 Ruling](https://github.com/jgong5/ATOM/issues/3477#issuecomment-6887140315)).
+   An offloading point's lmcache server runs at its own port (D110). No
+   `--step-roofline`: a refusal means a calibration is missing, and the law is completed,
+   as stages 3 (#975, #2660) and 4 (#2544) completed theirs.
 3. **Results.** D111's, with D115's dashboard; a changed SLO reruns this step only.
 
 OUT holds `dashboard.html`, the recommendation, the result table and
@@ -300,9 +305,12 @@ value, a string, a number, or `true` for a bare flag; `env`, each environment va
 its value; `per_concurrency`, each ATOM long flag to a positive integer, its value at a
 point that integer times the point's concurrency, as MiniMax-M3's `--max-num-seqs` is 2;
 `departures`, each argument, by its long flag, or variable that departs from the basis to
-its reason, the flag read as an argument is and written with dashes; and, on a 1P1D
+its reason, the flag read as an argument is and written with dashes; `lmcache_server`, on a
+candidate offloading to an lmcache server (`lmcache_mp`), each `lmcache server` long flag
+to its value as `args` takes one, `--host` and `--port` refused by name; and, on a 1P1D
 candidate, `prefill` and `decode`, each holding one side's `args`, `env` and
-`per_concurrency`.
+`per_concurrency`. Router arguments are no block's: a 1P1D point's router takes
+Compass's own (D109).
 
 **The expansion.** Each combination of the dimensions' values that no exclusion names is a
 candidate, named by its values joined with `-`, the first dimension varying slowest and each
@@ -310,24 +318,37 @@ dimension's values in the file's order. A candidate takes `common`'s block, then
 values' blocks in the dimensions' order; an instance's arguments are `--model`, then each
 block's, a side's after its own block's. It is refused, naming both blocks, when two of
 them set one thing apart: an argument, which ATOM's parser reads with `--a_b` as `--a-b`
-and `--no-x` as `--x`'s negation, a variable, a departure's reason, the basis or the
+and `--no-x` as `--x`'s negation, a variable, an lmcache server flag, which lmcache's
+parser reads with `--no-x` as `--x`'s negation, a departure's reason, the basis or the
 deployment; or an argument both fixed and varying with the concurrency. It is refused when
 no block names its basis, and when a block gives a single-node candidate a side. An
 excluded combination is never judged. A point is a candidate at one concurrency, in the
 workload's order, named `<candidate>-c<concurrency>`. A setting that holds only for some
 combination of values is written in one value of one dimension, as D116's template writes
-each configuration as one value of one dimension. `compass advice` writes the expansion
+each configuration as one value of one dimension. Each point of an offloading candidate
+takes its own lmcache server port, from 5555 up in the points' order, so points run at
+once on one host each reach their own server: `compass advice` writes it, with host
+127.0.0.1, into the server's `--host` and `--port` and into each instance's
+`ATOM_KV_OFFLOAD_EXTRA_CONFIG`, a block's value of which names neither, and hands the
+point's `compass run` or `deploy.sh run` the run file's `lmcache` entry, those flags with
+the request loop's declared laws (`atom/compass/kv/lmcache_server.py::DECLARED_LAWS`,
+`01` D6.1), through `--lmcache FILE` (`13` D80). `compass advice` writes the expansion
 into OUT's `candidates.json`: the space file's path, its model, machine, store, commit,
-workload and SLO; each candidate with its values, deployment, basis, departures and each
-instance's arguments, variables and per-concurrency factors; and each point with each
-instance's arguments and variables.
+workload and SLO; each candidate with its values, deployment, basis, departures, each
+instance's arguments, variables and per-concurrency factors, and an offloading one's
+`lmcache_server` flags; and each point with each instance's arguments and variables, and
+an offloading one's `lmcache_port`.
 
 **Reason.** The user, not Compass, knows what they would deploy; a template shows the
 shape, and an agent saves the user copying arguments by hand; the frozen commit has to be
 stated before the calibration it governs, which precedes the search. A setting given twice
 is refused rather than one overriding the other, so what a candidate runs is what its
-blocks say. **Basis.** The owner
+blocks say. An lmcache server's flags set its hit rate, so a candidate states them, as it
+states ATOM's arguments; its address is the search's, since points run at once on one host.
+**Basis.** The owner
 on #3355 and #3363, the [sixth ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927) settling that the file is no config file;
+the [#3477 Ruling](https://github.com/jgong5/ATOM/issues/3477#issuecomment-6887140315) on
+the lmcache server's flags and the router's;
 `13` D79; `08` D50, whose registration freezes a set before evaluation; `client.sh`'s
 `--traces`, `--agentx` and `--duration`; `atom/utils/arg_parser.py::FlexibleArgumentParser`,
 which reads both spellings of a long flag.
@@ -682,8 +703,9 @@ cannot know exists.
 checkpoint) on MI355X under the agentic cc-traces workload, on the development nodes, from
 their store. The template is a vehicle, not evidence: none of its configurations is graded
 or entered in `08` D50, whose M2 set is unchanged, and every point reads ungraded. #975's
-graded cell differs from P3 only in prefix caching, off there, which matters on an agentic
-workload, so its grade is not cited.
+graded cell differs from P3 in prefix caching, off there, which matters on an agentic
+workload, in its router (`--policy dp_sticky --dp-aware`) and in the prefill side's TBO,
+so its grade is not cited.
 
 | # | Deployment | Parallelism | MTP | TBO | LMCache | ATOM basis | Law |
 |---|---|---|---|---|---|---|---|
@@ -701,8 +723,10 @@ laws, fitted with it off, serve is D112's accuracy requirement.
 
 Each configuration with a law runs at 1, 2, 4, 8, 16, 32, 64, 128 and 256 clients, no
 higher: the held-out traces are 0 to 255, and reusing sessions is T27's. S5 offloads
-through `lmcache_mp`, its two stations declared (`01` D6.1) at the run-file values of
-`scripts/compass/parity_one_node.sh`, so its points show a declared share. A fractional
+through `lmcache_mp` to a server with its recipe's flags, its two stations declared (`01`
+D6.1), the request loop's laws those `atom/compass/kv/lmcache_server.py::DECLARED_LAWS`
+states, which `scripts/compass/parity_one_node.sh` also reads, so its points show a
+declared share. A fractional
 stated length has the gaps #3355's template lists, ungraded here.
 
 **Reason.** DeepSeek-V4-Pro has a store and shipped laws on the development nodes, so the
@@ -901,7 +925,7 @@ any host; and upstream work the search meets, such as DeepSeek-V4's P/D issues a
 |---|---|---|
 | D108 | Fitting apart from searching: a candidate is simulated once its law exists; the halves meet only through the store and a calibration's `status` file, the search owning no calibration, fitting, reuse judgement or version management. A user guide, `scripts/compass/ADVICE.md`, exact enough that an agent following it fills the DeepSeek-V4-Pro template's space file, and no skill; an agent starts a calibration only on the user's yes. | 2026-11-13 ([#3355](https://github.com/jgong5/ATOM/issues/3355), [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6845852318)) |
 | D109 | `compass advice SPACE OUT` checks each candidate (searchable, missing a law, calibrating, refused) and each point's readings (missing readings, with the `measure memory` command `run --check` prints), simulates each searchable point on a fresh server with no step roofline, and writes the results; it never calibrates, and runs at the integration head, on the target machine type, in a GPU container. Amends `13` D80: it starts the client and takes a workload, and `run --check` resolves a prefill or decode side. | 2026-11-13 (#3355, #3363) |
-| D110 | The user provides the space file, by hand or through an agent following the guide from what the user asks for, a recipe or real-run arguments; it names the shared store and, for a frozen search, its commit; it expands deterministically into candidates, each naming its ATOM basis and departures; the templates live in `scripts/compass/spaces/`, no default; it is the search's input, not a level of `13` D79's precedence nor the config file it rejects. Its format: one JSON object, the dimensions' product less the exclusions, each candidate `common`'s block and its values', two blocks setting one thing apart refused. | 2026-11-13 (#3355, #3363); D79 settled 2026-11-14 ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927)); the format 2026-11-14 (#3448) |
+| D110 | The user provides the space file, by hand or through an agent following the guide from what the user asks for, a recipe or real-run arguments; it names the shared store and, for a frozen search, its commit; it expands deterministically into candidates, each naming its ATOM basis and departures; the templates live in `scripts/compass/spaces/`, no default; it is the search's input, not a level of `13` D79's precedence nor the config file it rejects. Its format: one JSON object, the dimensions' product less the exclusions, each candidate `common`'s block and its values', two blocks setting one thing apart refused. | 2026-11-13 (#3355, #3363); D79 settled 2026-11-14 ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927)); the format 2026-11-14 (#3448); the `lmcache_server` field, each offloading point's port and the router's flags 2026-11-15 ([#3477](https://github.com/jgong5/ATOM/issues/3477#issuecomment-6887140315)) |
 | D111 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. A 1P1D point's GPUs are its prefill side's plus its decode side's, each from its own engine record. | 2026-11-13 (#3355); the GPU count 2026-11-14 ([#3454](https://github.com/jgong5/ATOM/issues/3454)) |
 | D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage (a decode vector for every scheduled rung before the search, each point's extrapolated share reported after it) and `08` D47's three figures on each leave-one-run-out fold within #627's 5% gate, a law at the head past it refused; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose ATOM digest is not the head's, the remote tip's or a frozen commit's, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363; the head by ATOM's digest, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957); coverage in two parts, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216); the accuracy bar, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6869501859)) |
 | D113 | The step linear backend lists a configuration's missing records, for a missing law or decode rung, as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step. | 2026-11-13 (#3355, #3363) |

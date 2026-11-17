@@ -31,7 +31,9 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   and ``backend``'s digest is over every law's in any order, their provenance
   ``entries``.
 - ``--lmcache-offload FILE``, the ``lmcache_offload`` entry
-  `step_linear_fit`'s offload form writes, at that key.
+  `step_linear_fit`'s offload form writes, at that key; ``--lmcache FILE``,
+  the ``lmcache`` entry of a deployment offloading to an lmcache server, as
+  `compass advice` writes it, at that key.
 - ``--device``, ``--ptl``, ``--stack`` and ``--network``, the platform
   flags, whose spec `spec` composes, as ``machine``; ``--store``'s root as
   ``store``; ``--on-refusal``;
@@ -86,6 +88,7 @@ def add_arguments(parser) -> None:
     parser.add_argument(
         "--host-laws", metavar="KEY", action="append", help="a token or law file"
     )
+    parser.add_argument("--lmcache", metavar="FILE", help="the lmcache entry")
     parser.add_argument(
         "--lmcache-offload", metavar="FILE", help="the lmcache_offload entry"
     )
@@ -206,8 +209,9 @@ def build(args, atom_args, across: bool = False) -> dict:
         out |= {k: v for k, v in hops.items() if k != "router_s"}
     if args.padding:
         out["padding"] = args.padding
-    if entry := getattr(args, "lmcache_offload", None):
-        out["lmcache_offload"] = json.loads(Path(entry).read_text())
+    for name in ("lmcache", "lmcache_offload"):
+        if entry := getattr(args, name, None):
+            out[name] = json.loads(Path(entry).read_text())
     return out
 
 

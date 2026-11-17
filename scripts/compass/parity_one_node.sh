@@ -58,7 +58,8 @@
 #                    tokens; the real run to a real `lmcache server` started
 #                    beside it with LMCACHE_FLAGS, the simulated one to LP lmcache
 #                    with the same flags, its request loop on the declared laws
-#                    below and its copies on the readings' interconnect.host_link,
+#                    of atom/compass/kv/lmcache_server.py (DECLARED_LAWS) and its
+#                    copies on the readings' interconnect.host_link,
 #                    which they then hold. Every request starts with PREFIX_WORDS
 #                    shared words (default 600). Default 0.
 #   FAMILIES         prefix families: above 1, request k shares PREFIX_WORDS
@@ -240,9 +241,8 @@ spec = {
 if sides != ".":
     spec["rapidserve"] = True
 if lmcache:
-    # Declared, not measured: a LOOKUP 2^-13 s plus 2^-17 s a prompt chunk,
-    # any other request 2^-14 s.
-    laws = {"lookup_s": [2.0**-13, 2.0**-17], "request_s": 2.0**-14}
+    from atom.compass.kv.lmcache_server import DECLARED_LAWS as laws
+
     # Writers per DP rank: one under DP-attention, else every TP rank, which
     # a model whose ranks share one copy refuses by name.
     writers = 1 if width else int(tp)
