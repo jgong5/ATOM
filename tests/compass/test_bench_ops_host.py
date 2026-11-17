@@ -190,3 +190,48 @@ def test_a_tensor_pinned_as_the_runner_is_built_states_no_pageable(request, tmp_
     sources = [graph._json(op)["args"]["src"] for op in copies]
     staged = [s for s in sources if s["dtype"] == "torch.int16"]
     assert [(s.get("device"), s.get("pageable")) for s in staged] == [("cpu", None)] * 2
+
+
+def test_a_host_tensor_built_over_pinned_bytes_states_no_pageable(request, tmp_path):
+    """`torch.from_numpy` of a pinned `CpuGpuBuffer`'s numpy view, and a
+    `torch.tensor` or `torch.arange` with `pin_memory=True`, each built and
+    copied in a step, state no `pageable`; `torch.from_numpy` of an unpinned
+    buffer's view or of an array numpy allocated still does."""
+    if "COMPASS_ARCH_DECLARED" not in os.environ:
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+            + ["--show-capture=no", f"{__file__}::{request.node.name}"],
+            env={**os.environ, "COMPASS_ARCH_DECLARED": "1"},
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        assert done.returncode == 0, done.stdout[-4000:]
+        return
+    driverless.install(str(tmp_path), "gfx942")
+    from atom.utils import CpuGpuBuffer
+
+    capture = forward._Recorder({}, driverless.driverless_mode(ShapeEnv()))
+    with forward._patches(capture), capture.fake_mode, capture:
+        pinned, pageable = (
+            CpuGpuBuffer(4, dtype=torch.int64, device="cuda", pin_memory=pin)
+            for pin in (True, False)
+        )
+        capture.start()
+        capture.on = True
+        for host in (
+            torch.from_numpy(pinned.np[:2]),
+            torch.tensor([1, 2], pin_memory=True),
+            torch.arange(2, pin_memory=True),
+            torch.from_numpy(pageable.np[:2]),
+            torch.from_numpy(numpy.arange(2)),
+        ):
+            host.to("cuda")
+    held = [
+        spec
+        for _, op in capture.items
+        for spec in graph._json(op)["args"].values()
+        if isinstance(spec, dict) and spec.get("device") == "cpu"
+    ]
+    assert [s.get("pageable", False) for s in held] == [False] * 3 + [True] * 2

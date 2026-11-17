@@ -991,7 +991,10 @@ def _patches(recorder):
       later `torch.zeros` of ATOM's on the host, not on the runner's device.
     * A host tensor ATOM asks to pin (that host side, `pin_memory=True`, a
       `pin_memory()` copy) is held pinned (`_Recorder.pin`), as `is_pinned`
-      answers.
+      answers, and so is `torch.from_numpy` over a numpy view of one, which
+      shares its bytes. `torch.tensor` and `torch.arange` build one unpinned:
+      torch pins the first through the driver, and the fake mode refuses to
+      pin the second.
     * GDN's causal-conv1d metadata is host arithmetic over the staged
       `cu_seqlens`, and it runs outside the fake mode too.
     * A GDN prefill under ReplaySSM parks the cursors of its live state
@@ -1079,6 +1082,7 @@ def _patches(recorder):
         recorder.launch(f"flydsl.{jit.func.__name__}", compiled, jit)
 
     init, zeros, numpy = CpuGpuBuffer.__init__, torch.zeros, torch.Tensor.numpy
+    from_numpy, tensor, arange = torch.from_numpy, torch.tensor, torch.arange
     conv1d, tolist = gdn_attn.compute_causal_conv1d_metadata, torch.Tensor.tolist
     attach = gdn_attn.GDNStateMixin._attach_replayssm
     fake_tolist, sync = FakeTensor.tolist, ubatching.sync_dp_metadata
@@ -1109,6 +1113,20 @@ def _patches(recorder):
     def host_numpy(tensor, *args, **kwargs):
         with unset_fake_temporarily():
             return numpy(tensor, *args, **kwargs)
+
+    def host_from_numpy(array):
+        out, base = from_numpy(array), array.base
+        while hasattr(base, "base"):  # past the views, to what holds the bytes
+            base = base.base
+        held = isinstance(base, torch.Tensor) and recorder.pinned(base)
+        return recorder.pin(out) if held else out
+
+    def unpinned(build):
+        def call(*args, pin_memory=False, **kwargs):
+            out = build(*args, **kwargs)
+            return recorder.pin(out) if pin_memory else out
+
+        return call
 
     def staged_init(self, *args, **kwargs):
         with (
@@ -1151,7 +1169,7 @@ def _patches(recorder):
         with patch.object(recorder, "counted", live):
             return attach(builder, md, num_reqs, is_prefill)
 
-    _device._device_constructors()  # cached while `torch.zeros` is torch's
+    _device._device_constructors()  # cached while the constructors are torch's
     unpatched = [
         (fly.JitFunction, "__call__", fly.JitFunction.__call__),
         (fly, "_compile_impl", fly._compile_impl),
@@ -1172,6 +1190,9 @@ def _patches(recorder):
         (torch.Tensor, "tolist", host_tolist),
         (torch.Tensor, "pin_memory", lambda t, *a, **k: recorder.pin(t.clone())),
         (torch.Tensor, "is_pinned", lambda t, *a, **k: recorder.pinned(t)),
+        (torch, "from_numpy", host_from_numpy),
+        (torch, "tensor", unpinned(tensor)),
+        (torch, "arange", unpinned(arange)),
         (FakeTensor, "tolist", host_tolist),
         (torch.Tensor, "numpy", lambda t, *a, **k: host_numpy(landed(t), *a, **k)),
         (loader, "safetensors_weights_iterator", lambda *a, **k: iter(())),
