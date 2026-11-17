@@ -1248,6 +1248,34 @@ pin processes that run at once to cores with `taskset`.
   that side's `left out` row, and that side's prefill has no cost row until a gated
   record grades it ([#3028](https://github.com/jgong5/ATOM/issues/3028)).
 
+### The EP8 cell under the op-level backend
+
+The EP8 cell runs simulated under the op-level backend as the DPA-TP8 cell above does,
+each side under the EP8 cell's arguments and environment, with these differences.
+
+- **Points.** A point's key holds the parallel layout only for a leaf on a process group
+  (`point_key` in `atom/compass/bench/ops.py`), so the DPA-TP8 cell's points serve EP8 at
+  the leaves both cells run. A store measured before that key changed is republished at
+  today's keys by `python3 scripts/compass/migrate_keys.py --machines tests/compass/machines
+  --store OLD NEW`. Over `NEW`, `measure ops --plan` measures only what EP8 adds: on one
+  GPU the routed MoE over one rank's experts, and on all eight the collectives, MORI's
+  dispatch and combine among them.
+- **MORI on the prefill side.** A prefill step's shape under DP-attention states its
+  group's rows, `G=`, and there `measure ops` times MORI's leaves at another exchange than
+  the step's, and a combine can fault the card
+  ([#3688](https://github.com/jgong5/ATOM/issues/3688)). The eight-GPU prefill run then
+  keeps halving the gaps beside those points, so bound it with `timeout`: `fit ops` reads
+  every round a run published and declines the gaps beside a point off its neighbours'
+  line. `measure ops --coverage`, as in step 11 of the stage-2 cell below, names the steps
+  the price list leaves out; its `--out` is a directory holding every run's `plan.jsonl`
+  lines of the side and one run's `run.json`.
+- **Runs.** As the DPA-TP8 cell's, with the EP8 cell's host laws,
+  `laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json` and `-decode.json`, and the
+  platform flags of the EP8 cell's simulated run above.
+- **Ranking.** EP8 is ordered against the DPA-TP8 cell only as both are simulated at one
+  tree, the one the ranking's registration names (the ranking gate of
+  `atom/compass/design/08_validation_protocol.md`).
+
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
 `PYTHONPATH=$T python -m atom.compass.validate.bound ... RECORD...` exits 1 when a real
