@@ -46,6 +46,26 @@ def _rung(mode: ForwardMode) -> int | None:
     return int(mode.running_bs) if mode.use_cudagraph else None
 
 
+def is_dummy(batch: Any) -> bool:
+    """Whether `batch` is an idle DP rank's dummy forward: one flagged
+    `is_dummy_run`, or, as ATOM's `dummy_execution` builds it since ROCm/ATOM
+    main b7b5ec3f2, a batch that schedules no request, every row it runs
+    padding, its phase and width the group's (`ForwardMode.decide`)."""
+    return bool(batch.is_dummy_run) or not batch.total_seqs_num
+
+
+def _dummy_row(batch: Any, mode: ForwardMode) -> RequestShape:
+    """The row an empty dummy is priced and recorded as, as the one fabricated
+    request the dummy ran before: a decode of the step's spec width
+    (``num_spec_step + 1`` tokens over as many) while the group decodes, a
+    one-token prefill row while a peer prefills, the one padding request a
+    group with no request forwards."""
+    if mode.sync is not None and mode.sync.any_rank_has_prefill:
+        return RequestShape(1, 1, False)
+    q = int(getattr(batch, "num_spec_step", 0) or 0) + 1
+    return RequestShape(q, q, True)
+
+
 def dp_group() -> Any:
     """The DP group's CPU group: the one `ModelRunner.prepare_model` hands `decide`."""
     from aiter.dist.parallel_state import get_dp_group
@@ -64,7 +84,7 @@ def dummy_ranks(batch: Any, mode: ForwardMode) -> int:
     """
     if mode.sync is None or len(mode.sync.scheduled_tokens_per_dp_rank) < 2:
         return 0
-    flag = torch.tensor([int(bool(batch.is_dummy_run))], dtype=torch.int32)
+    flag = torch.tensor([int(is_dummy(batch))], dtype=torch.int32)
     torch.distributed.all_reduce(flag, group=dp_group())
     return int(flag.item())
 
@@ -204,7 +224,12 @@ def batch_view(
             draft_moe_rows = gathered
             if draft_bs is None and drafter.mtp_k > 1:
                 draft_rows = (
-                    gathered // int(batch.num_scheduled_tokens[0])
+                    gathered
+                    // (
+                        int(batch.num_scheduled_tokens[0])
+                        if len(batch.num_scheduled_tokens)
+                        else _dummy_row(batch, mode).query_tokens
+                    )
                     if mode.running_tokens_are_unified
                     else mode.sync.max_bs_across_dp + _data_parallel_size(runner) - 1
                 )
@@ -215,10 +240,11 @@ def batch_view(
             "segment has no gathered row count to be priced from"
         )
     rows = zip(batch.num_scheduled_tokens, batch.context_lens)
+    shapes = tuple(
+        RequestShape(int(q), int(c), i >= prefill) for i, (q, c) in enumerate(rows)
+    )
     return BatchView(
-        tuple(
-            RequestShape(int(q), int(c), i >= prefill) for i, (q, c) in enumerate(rows)
-        ),
+        shapes or (_dummy_row(batch, mode),),
         capture_rung=_rung(mode),
         moe_rows=moe_rows,
         draft_moe_rows=draft_moe_rows,
@@ -229,7 +255,7 @@ def batch_view(
         image_tokens=image_tokens(batch, runner),
         moe_tokens=moe_tokens,
         dp_rank=dp_rank,
-        dp_dummy=dp_rank is not None and bool(batch.is_dummy_run),
+        dp_dummy=dp_rank is not None and is_dummy(batch),
         group_dummies=dummies if dp_rank is not None else 0,
         draft_rows=draft_rows,
         group_prefills=dp_rank is not None and not mode.running_tokens_are_unified,
