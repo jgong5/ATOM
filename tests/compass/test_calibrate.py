@@ -12,9 +12,10 @@ held-out band; FAIL, matched against a command's words, makes it refuse.
 and writes its export marked `server_stopped`, or writes it unmarked and exits 1
 without stopping the server when CLIENT_FAIL is in its OUT.
 
-The stub tree's `python3` runs without site imports (`-S`). In an image whose
-site imports torch at start, as the MI455 image's `.pth` does, rocprofiler-sdk
-would load the empty tool `record` gets in ROCP_TOOL_LIBRARIES, and abort.
+The stub tree's `python3` runs without site imports (`-S`), first on the PATH
+`_path` gives every test that runs a script in the tree. In an image whose site
+imports torch at start, as the MI455 image's `.pth` does, rocprofiler-sdk would
+load the empty tool `record` gets in ROCP_TOOL_LIBRARIES, and abort.
 """
 
 import os
@@ -97,16 +98,20 @@ def _tree(tmp_path):
     shim.chmod(0o755)
 
 
+def _path(tmp_path):
+    """PATH for a script in the stub tree: its `python3`, then this Python's."""
+    return f"{tmp_path / 'bin'}:{Path(sys.executable).parent}:{os.environ['PATH']}"
+
+
 def _calibrate(tmp_path, *records, **env):
     """One run of the stub tree's calibrate.sh into `o`, and the commands it ran."""
     if not (tmp_path / "ATOM").exists():
         _tree(tmp_path)
     log = tmp_path / "log"
     log.unlink(missing_ok=True)
-    path = f"{tmp_path / 'bin'}:{Path(sys.executable).parent}:{os.environ['PATH']}"
     env = {
         **os.environ,
-        "PATH": path,
+        "PATH": _path(tmp_path),
         "LOG": str(log),
         "GPU": "7",
         "MODEL": str(tmp_path / "m"),
