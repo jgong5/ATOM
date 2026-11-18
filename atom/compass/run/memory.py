@@ -144,6 +144,21 @@ def carried_by(law: dict, where: str) -> dict | None:
     return {**law[LAW_MEMBER], "atom": atom, "law": where}
 
 
+def _differ(ours: dict, theirs: dict) -> list[str]:
+    """The key fields `theirs` differs from `ours` in, the engine config's by
+    name, as ``engine_config.<name>``."""
+    differ = sorted(
+        f for f in ours.keys() | theirs.keys() if theirs.get(f) != ours.get(f)
+    )
+    if "engine_config" not in differ:
+        return differ
+    mine, held = (json.loads(k.get("engine_config") or "{}") for k in (ours, theirs))
+    names = sorted(n for n in mine.keys() | held.keys() if mine.get(n) != held.get(n))
+    return [f for f in differ if f != "engine_config"] + [
+        f"engine_config.{n}" for n in names
+    ]
+
+
 def _carried(carried, key: Key, at, missed: ArtifactRefusal) -> MemoryReadings:
     """The readings at `key` among the law files' `carried`, rank `at`'s
     member, or a refusal naming the fields the nearest differ in; `missed` is
@@ -152,11 +167,7 @@ def _carried(carried, key: Key, at, missed: ArtifactRefusal) -> MemoryReadings:
 
     ours, nearest = key.values, None
     for law in carried:
-        differ = [
-            f
-            for f in ours.keys() | law["key"].keys()
-            if law["key"].get(f) != ours.get(f)
-        ]
+        differ = _differ(ours, law["key"])
         if not differ:
             if (theirs := law["atom"]) != (here := atom_digest()):
                 raise ArtifactRefusal(
@@ -174,7 +185,7 @@ def _carried(carried, key: Key, at, missed: ArtifactRefusal) -> MemoryReadings:
                 )
             return read
         if nearest is None or len(differ) < len(nearest[1]):
-            nearest = law["law"], sorted(differ)
+            nearest = law["law"], differ
     raise ArtifactRefusal(
         Rule.RESOLUTION,
         f"{missed.what}, and the readings {nearest[0]} carries differ in "

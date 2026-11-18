@@ -8,6 +8,7 @@ predicts the host they timed. ``step_linear_fit readings`` writes a store
 entry's readings into a law file.
 """
 
+import json
 import shutil
 
 import pytest
@@ -88,10 +89,17 @@ def test_a_store_s_readings_come_before_a_law_file_s(tmp_path):
 
 
 def test_readings_at_another_key_refuse_naming_the_field(tmp_path, bare):
-    tp = memory.key_of(bare.config, MACHINE).values["tp"]
+    values = memory.key_of(bare.config, MACHINE).values
+    engine = json.loads(values["engine_config"])
+    engine["max_num_seqs"] += 1
+    moved = json.dumps(engine, sort_keys=True)
 
-    with pytest.raises(ArtifactRefusal, match="law.json carries differ in tp"):
-        load(tmp_path, bare, carried(bare, tp=tp + 1))
+    with pytest.raises(ArtifactRefusal, match=r"law.json carries differ in tp\."):
+        load(tmp_path, bare, carried(bare, tp=values["tp"] + 1))
+    with pytest.raises(
+        ArtifactRefusal, match=r"differ in engine_config\.max_num_seqs\."
+    ):
+        load(tmp_path, bare, carried(bare, engine_config=moved))
 
 
 def test_readings_at_another_atom_digest_refuse_naming_both(tmp_path, bare):
