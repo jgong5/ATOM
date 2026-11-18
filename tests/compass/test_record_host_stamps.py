@@ -331,6 +331,32 @@ def test_a_recorded_server_s_engine_send_keeps_its_caller_s_response_id(record, 
     assert seq.external_request_id == "chatcmpl-1"
 
 
+def test_a_recorded_server_s_engine_send_through_the_submit_helper_keeps_the_handler_s_response_id(
+    record, tok, monkeypatch
+):
+    # Since the upstream merge the handlers reach `add_request` through
+    # `api_server._submit_engine_requests`, whose frame holds no `request_id`:
+    # the intake wrap must not hide the handler's one, two frames further up.
+    parity.carry_response_ids()  # as the engine's construction does, before the wrap
+    compass_run.tokenizer(tok, None)
+    manager = CoreManager.__new__(CoreManager)
+    manager.label, manager.pp_size, manager.local_engine_count = "t", 1, 1
+    manager._seq_id_to_callback = {}
+    manager._send_request = lambda _rank, payload: None
+    monkeypatch.setattr(api_server, "engine", SimpleNamespace(core_mgr=manager))
+    processor = InputOutputProcessor(
+        SimpleNamespace(hf_config=SimpleNamespace(model_type="llama")), tok, 16
+    )
+    seq = processor.preprocess("hi there", SamplingParams())
+
+    async def handler():
+        request_id = "chatcmpl-2"  # noqa: F841 -- the API server's handler holds it
+        await api_server._submit_engine_requests([seq])
+
+    asyncio.run(handler())
+    assert seq.external_request_id == "chatcmpl-2"
+
+
 def test_with_compass_off_nothing_is_wrapped_or_written(patched, tok, tmp_path):
     body = Request.body
     compass_run.tokenizer(tok, None)

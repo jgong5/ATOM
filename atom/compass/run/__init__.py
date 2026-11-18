@@ -2709,6 +2709,7 @@ def _stamp_intake(out: _LineFile) -> None:
     from starlette.applications import Starlette
     from starlette.requests import Request
 
+    from atom.compass import parity
     from atom.entrypoints.openai import chat_encoders
     from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
     from atom.model_engine.llm_engine import InputOutputProcessor
@@ -2784,8 +2785,11 @@ def _stamp_intake(out: _LineFile) -> None:
         def add_request(*args, **kwargs):
             # `parity.carry_response_ids`, installed beneath this as the engine
             # was built, reads the API server's `request_id` off its caller's
-            # frame, which is now this one.
-            request_id = sys._getframe(1).f_locals.get("request_id")  # noqa: F841
+            # frame, which is now this one. Found as it finds it, up to
+            # `parity.CALLER_DEPTH` frames above: since the upstream merge the
+            # caller is `_submit_engine_requests`, which holds none, and a
+            # `request_id = None` here hid the handler's from it.
+            request_id = parity._caller_request_id()  # noqa: F841
             start, cpu = time.monotonic_ns(), time.thread_time_ns()
             got = add(*args, **kwargs)
             stamp("send", start, 0, cpu)
