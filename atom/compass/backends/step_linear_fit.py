@@ -617,11 +617,12 @@ def _stamps(path) -> list[tuple]:
 def _requests(ev) -> tuple[list, np.ndarray]:
     """Each request's app call among the stamps `ev`, in order, and every
     engine send's end, sorted."""
-    apps = [e[0] for e in ev if e[2] == "app"]
+    # An array, searched once per body: a list is converted on every search.
+    apps = np.array([e[0] for e in ev if e[2] == "app"], dtype=np.int64)
     # A request's app call is the last before its body's first read; any
     # other, such as a health probe's, has no body.
     calls = sorted(
-        {apps[np.searchsorted(apps, e[0]) - 1] for e in ev if e[2] == "body"}
+        {int(apps[np.searchsorted(apps, e[0]) - 1]) for e in ev if e[2] == "body"}
     )
     return calls, np.array(sorted(e[1] for e in ev if e[2] == "send"))
 
@@ -679,9 +680,13 @@ def _intakes(path) -> tuple[list, list, list]:
     before the template of the one ahead of it began, the loop taking them in
     one after another."""
     ev = _stamps(path)
-    at = [e[0] for e in ev]
+    # Arrays, searched once per request: np.searchsorted converts a list on
+    # every call, which over a c=128 agentic record's two million stamps (an
+    # `out` per streamed row) made this loop O(requests x stamps).
+    at = np.array([e[0] for e in ev], dtype=np.int64)
     cpu = {e[0]: e[4] for e in ev if e[2] == "app"}
     calls, sends = _requests(ev)
+    called = np.array(calls, dtype=np.int64)
     lone = []
     for i, (call, after) in enumerate(zip(calls, calls[1:] + [math.inf])):
         span = ev[np.searchsorted(at, call, "right") : np.searchsorted(at, after)]
@@ -702,7 +707,7 @@ def _intakes(path) -> tuple[list, list, list]:
     tmpl = [e for e in ev if e[2] == "tmpl"]
     sizes = [e[3] for e in sorted(ev, key=lambda e: e[1]) if e[2] == "body"]
     # A template whose start finds a later request arrived and not yet rendered.
-    queued = [np.searchsorted(calls, t[0]) > k + 1 for k, t in enumerate(tmpl)]
+    queued = [np.searchsorted(called, t[0]) > k + 1 for k, t in enumerate(tmpl)]
     bursts, run = [], []
     for k, t in enumerate(tmpl):
         run.append((sizes[k], t[0], t[4]))
