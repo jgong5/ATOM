@@ -18,10 +18,16 @@ and p90 (aiperf's inter-token latency, per request) and E2E latency p50, in
 milliseconds, and the requests counted. Every run must have been given the
 same client arguments. Below the table it names REAL's stalled forwards over
 its graded window (`atom.compass.validate.stalls`): seconds the real run lost
-to one DP rank's slow launch, which a simulated run does not charge.
+to one DP rank's slow launch, which a simulated run does not charge. Then, per
+SIM, its requests paired with REAL's by conversation and turn (`paired`): a
+percentile of each run is a rank statistic over its own request set, and E2E's
+middle is sparse (#3720 c=8: 3.5% of requests within 5% of the median), so its
+p50 moves with the requests either run finished and with each request's place
+in the schedule, which the paired E2E does not.
 """
 
 import json
+import random
 import sys
 from pathlib import Path
 
@@ -92,8 +98,47 @@ def main(argv: list[str]) -> int:
         errs = "".join(f"{error(values[0], v):>18}" for v in values[1:])
         print(f"{name:34}{shown}{errs}")
     print(stalled(real))
+    for sim in sims:
+        print(paired(real, sim))
     print(json.dumps(rows))
     return 0
+
+
+#: Resamples of REAL's requests for the interval of its E2E p50, and their seed.
+RESAMPLES, SEED = 2000, 0
+
+
+def _latencies(run: Path) -> dict:
+    """E2E latency of each profiled request of `run` by (conversation, turn)."""
+    out = {}
+    for r in profiled(read_jsonl(run / RECORDS)):
+        m, e2e = r.get("metadata", {}), _metric(r, "request_latency")
+        if e2e and "conversation_id" in m and "turn_index" in m:
+            out[m["conversation_id"], m["turn_index"]] = e2e
+    return out
+
+
+def paired(real: Path, sim: Path) -> str:
+    """`sim`'s E2E against `real`'s over the requests both ran: the median of
+    each request's ratio and the ratio on totals, beside the 95% interval of
+    `real`'s own E2E p50 over `RESAMPLES` resamples of its requests."""
+    a, b = _latencies(real), _latencies(sim)
+    both = sorted(set(a) & set(b))
+    if not both:
+        return f"{sim.name}: no request paired with the real run's"
+    mine = list(a.values())
+    rng, p50 = random.Random(SEED), percentile(mine, 50)
+    draws = sorted(
+        percentile(rng.choices(mine, k=len(mine)), 50) for _ in range(RESAMPLES)
+    )
+    lo, hi = (draws[int(q * (RESAMPLES - 1))] / p50 - 1 for q in (0.025, 0.975))
+    ratio = percentile([b[k] / a[k] for k in both], 50)
+    total = sum(b[k] for k in both) / sum(a[k] for k in both)
+    return (
+        f"{sim.name}: E2E paired over the {len(both)} requests both ran: median "
+        f"ratio {ratio - 1:+.1%}, on totals {total - 1:+.1%}; real E2E p50's own "
+        f"95% interval {lo:+.1%}..{hi:+.1%}"
+    )
 
 
 def stalled(real: Path) -> str:
