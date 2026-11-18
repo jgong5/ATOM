@@ -7,7 +7,8 @@ lmcache saves carry (`publish_planned_transfer`); LP lmcache reads every
 member's at its first stamped request (`run._lmcache_plan`), and its launch
 takes only the deployment's KV block tokens (`run._launch_lmcache`). The
 template's S5 point, DeepSeek-V4-Pro at DP attention offloading to an lmcache
-server of its own, launches on them.
+server of its own, launches on them, and its members' shells bind the PAGE
+checkpoints DeepSeek-V4 keeps, whose image no run file states.
 """
 
 import argparse
@@ -26,7 +27,14 @@ from atom.compass import run as compass_run
 from atom.compass.advice import check, space
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.drive import runfile
+from atom.compass.kv.lmcache_mp import LMCacheMPShell
 from atom.compass.runner.overrides import _saved_image_bytes
+from atom.kv_transfer.offload.mp.native_state_scheduler import (
+    NativeStateLMCacheMPConnectorScheduler,
+)
+from atom.kv_transfer.offload.mp.native_state_worker import (
+    NativeStateLMCacheMPConnector,
+)
 from atom.model_engine.arg_utils import kv_offload_connector_config
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 
@@ -35,9 +43,9 @@ BLOCK, IMAGE = 2**20, 2**18
 PD = {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10, "prefill_data_parallel_size": 2}
 
 
-def test_the_template_s5_point_launches_lp_lmcache_on_its_kv_block(
-    tmp_path, monkeypatch
-):
+def _s5(tmp_path, **config) -> tuple[dict, SimpleNamespace]:
+    """The run file `compass run` builds for the template's point S5-c1 under a
+    step stub, and the deployment's config, with `config` over it."""
     command, env = served(space.expand(TEMPLATE), "S5-c1", tmp_path / "S5-c1")
     entry = command[command.index("--lmcache") + 1]
     stub = tmp_path / "stub.json"
@@ -50,13 +58,8 @@ def test_the_template_s5_point_launches_lp_lmcache_on_its_kv_block(
         ["--step-stub", str(stub), *platform, "--store", str(store)]
         + ["--lmcache", str(entry)]
     )
-    run = runfile.build(args, ["--model", str(tmp_path)])
-    started = []
-    monkeypatch.setattr(
-        compass_run.subprocess, "Popen", lambda a, **k: started.append(a)
-    )
     raw = json.loads(CONFIGS["deepseek-v4-pro"].read_text())
-    config = atom_config_double(
+    deployment = atom_config_double(
         kv_transfer_config=kv_offload_connector_config(
             env["ATOM_KV_OFFLOAD"], env[check.EXTRA]
         ),
@@ -66,11 +69,50 @@ def test_the_template_s5_point_launches_lp_lmcache_on_its_kv_block(
         kv_cache_dtype="fp8",
         kv_cache_block_size=256,  # as `Config` fixes it for DeepSeek-V4
     )
+    vars(deployment).update(config)
+    return runfile.build(args, ["--model", str(tmp_path)]), deployment
+
+
+def test_the_template_s5_point_launches_lp_lmcache_on_its_kv_block(
+    tmp_path, monkeypatch
+):
+    run, config = _s5(tmp_path)
+    started = []
+    monkeypatch.setattr(
+        compass_run.subprocess, "Popen", lambda a, **k: started.append(a)
+    )
 
     compass_run._launch_lmcache(config, run, None)
 
     [argv] = started
     assert argv[-1] == "256"
+
+
+def test_a_template_s5_member_s_shell_binds_its_state_checkpoints(
+    tmp_path, monkeypatch
+):
+    # A DP member's engine, at TP 1 under DP attention, on S5's run file.
+    run, config = _s5(tmp_path, tensor_parallel_size=1)
+    (tmp_path / "run.json").write_text(json.dumps(run))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    # ATOM's native-state scheduler half, which a block manager keeping PAGE
+    # checkpoints selects; its own bind is ATOM's and needs a real pool.
+    impl = NativeStateLMCacheMPConnectorScheduler.__new__(
+        NativeStateLMCacheMPConnectorScheduler
+    )
+    impl.chunk_size = 256
+    shell = LMCacheMPShell.__new__(LMCacheMPShell)
+    inner = SimpleNamespace(bind_block_manager=id, _impl=impl)
+    shell.__dict__.update(_inner=inner, _ranks=[], _config=config)
+    # DeepSeek-V4-Pro's planned PAGE entry and checkpoint image at this cell.
+    spec = PagedStateCheckpointSpec(1399040, 7536640, "dsv4", 7536640)
+    checkpoints = SimpleNamespace(store=SimpleNamespace(spec=spec))
+
+    shell.bind_block_manager(SimpleNamespace(paged_state_checkpoints=checkpoints))
+
+    [rank] = shell._ranks
+    assert isinstance(rank, NativeStateLMCacheMPConnector)
+    assert rank.chunk_size == 256
 
 
 def test_lp_lmcache_sizes_a_chunk_and_the_image_every_member_planned(tmp_path):
