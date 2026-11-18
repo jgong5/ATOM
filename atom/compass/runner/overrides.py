@@ -1848,7 +1848,8 @@ def _start_cost_table(runner: Any, record: Any) -> None:
 def _time_target(runner: Any, batch: Any) -> None:
     """Time the step `_group_step_seconds` just priced through the
     `GPUForwardMetrics` ATOM's `ModelRunner` builds on `runner` with the
-    device timer on: `measure` around the step's `StepCost.target_seconds` on
+    device timer on: `measure` around the step's `_target_s` (its
+    `StepCost.target_seconds`, under DP with its lockstep wait) on
     `PredictedEvent`s, then `poll`, so its observations, a prefill request's
     sum over its chunks included, are in the worker's file before `forward`
     replies. `measure` skips a DP dummy run and an empty batch, as on a real
@@ -1933,7 +1934,10 @@ def _group_step_seconds(
     step, the seconds from its return to the engine's next input pull, or
     None; `_group_out` holds each rank's target plus its ``out_s``, for the
     ranks with one, or None. `_target_s` is the step's `target_seconds`, or
-    None for a refused step.
+    None for a refused step; under DP with a `HostDeviceRecurrence`, plus the
+    rank's lockstep wait, from its own target end to the group's latest, which
+    the same `all_reduce(MAX)` gives: a real rank's device events span that
+    wait at its forward's collectives (`GPUForwardMetrics.steps`).
 
     A pipeline stage runs only its own layers, so it is refused unless its
     backend states the `stage_share` it prices; any other backend prices the
@@ -2043,9 +2047,13 @@ def _group_step_seconds(
             end = host.device_end(batch, device_s, draft_s, refuse)
             # The output end: the device end, or with MTP or a draft the target end.
             mark = host.target_end if host.mtp or draft_s else end
-            t = torch.tensor([end, mark], dtype=torch.float64)
+            own = host.target_end
+            t = torch.tensor([end, mark, own], dtype=torch.float64)
             torch.distributed.all_reduce(t, torch.distributed.ReduceOp.MAX, group)
-            return host.release(*t.tolist())
+            end, mark, last = t.tolist()
+            # A real rank's target waits at its collectives for the group's last.
+            vars(runner)["_lockstep_s"] = last - own
+            return host.release(end, mark)
 
     try:
         total = fold_seconds((device_s, draft_s))
@@ -2077,7 +2085,8 @@ def _group_step_seconds(
         group_s = targets[group.rank()]
     vars(runner)["_group_targets"] = targets
     vars(runner)["_out_s"], vars(runner)["_group_out"] = out_s, pulls
-    vars(runner)["_target_s"] = None if refused else device_s
+    lockstep_s = vars(runner).pop("_lockstep_s", 0.0)
+    vars(runner)["_target_s"] = None if refused else device_s + lockstep_s
     record = getattr(runner, "_parity_record", None)
     if record is None:
         return group_s

@@ -4,8 +4,10 @@
 With ATOM's device timer on, TP rank 0 of the Compass runner times each step
 `forward` prices through ATOM's `GPUForwardMetrics`, built as `ModelRunner`
 builds it, before `forward` replies: the step's `StepCost.target_seconds`, not
-its charge, which adds the draft, nor its DP group's target, and a prefill
-request's sum over its chunks. Requests run through ATOM's own
+its charge, which adds the draft, nor its DP group's target; under DP with a
+`HostDeviceRecurrence`, plus its wait from its own target end to the group's
+last, which a real rank's device events span; and a prefill request's sum over
+its chunks. Requests run through ATOM's own
 `Scheduler`, whose `prefill_gpu_requests` names each prefill chunk, and the
 runner's own `forward`, with `torch.cuda.Event` refusing, so a device event
 fails the test. `compass run` starts its server with the timer on unless set.
@@ -233,3 +235,22 @@ def test_compass_run_starts_its_server_with_the_timer_on_unless_set(
     drive_run.main(argv)
 
     assert json.loads((tmp_path / "timer.json").read_text()) == seen
+
+
+def test_under_dp_a_host_paced_rank_times_its_wait_for_the_group_s_last_target(
+    timer, dp2  # noqa: F811
+):
+    from atom.compass.runner.overrides import HostDeviceRecurrence
+
+    backends = [Kept(), Kept()]
+    ranks = [timed(runner(b, dp_size=2, dp_rank=r)) for r, b in enumerate(backends)]
+    for r in ranks:
+        r.compass_host = HostDeviceRecurrence({}, (), lambda: 0.0)
+
+    dp2(lambda: ranks[0].forward(prefill(40)), lambda: ranks[1].forward(prefill(8)))
+
+    big, small = (b.costs[0].target_seconds for b in backends)
+    assert small < big
+    # Both targets start at 0 s: the small rank's events span the big one's end.
+    assert ranks[0].seen["steps"] == pytest.approx([big])
+    assert ranks[1].seen["steps"] == pytest.approx([big])
