@@ -190,12 +190,9 @@ def _stream(stream):
         current[0] = previous
 
 
-def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
-    """Declare the device of `arch`, or the card `read` (`card`); say what."""
-    if read is None and arch not in DEVICES:
-        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
-    props = _props(arch, read)
-    cuda = {
+def _cuda(props) -> dict:
+    """`torch.cuda`'s answers as the one device `props` declares."""
+    return {
         # True: on False ATOM takes paths no deployment runs. The fake mode is
         # told otherwise by `driverless_mode`.
         "is_available": lambda: True,
@@ -231,6 +228,14 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
         "MemPool": lambda *a, **k: None,
         "use_mem_pool": lambda *a, **k: contextlib.nullcontext(),
     }
+
+
+def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
+    """Declare the device of `arch`, or the card `read` (`card`); say what."""
+    if read is None and arch not in DEVICES:
+        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
+    props = _props(arch, read)
+    cuda = _cuda(props)
     for name, value in cuda.items():
         setattr(torch.cuda, name, value)
     # ATOM's H2D publication reads the current stream's id off `torch._C`, and
@@ -270,6 +275,32 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
     return {"cuda": sorted(cuda), "arch": arch, "flags": flags} | (
         {"card": read} if read else {}
     )
+
+
+@contextlib.contextmanager
+def cuda_substitutes(arch: str):
+    """`install`'s `torch.cuda` answers for a device of `arch`, and `torch._C`'s
+    device query, inside the block alone. `is_available` keeps this host's
+    answer, and nothing else `install` declares is declared."""
+    cuda = _cuda(_props(arch))
+    del cuda["is_available"]
+    real = {name: torch.cuda.__dict__.get(name, _ABSENT) for name in cuda}
+    get_device = torch._C._cuda_getDevice
+    for name, value in cuda.items():
+        setattr(torch.cuda, name, value)
+    torch._C._cuda_getDevice = lambda: 0
+    try:
+        yield
+    finally:
+        torch._C._cuda_getDevice = get_device
+        for name, value in real.items():
+            if value is _ABSENT:
+                delattr(torch.cuda, name)
+            else:
+                setattr(torch.cuda, name, value)
+
+
+_ABSENT = object()
 
 
 #: The operators outside torch that the fake mode's dispatch cache takes: each

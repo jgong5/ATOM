@@ -510,7 +510,8 @@ class HostDeviceRecurrence:
         at `end` and its target's at `target_end`: `W_post` after its launch
         and the wait that follows it, an output forward's for the previous
         output forward's target on a single stage that defers or its own on the last or one that does not, or
-        under `sync` for `end`; with `own_draft`, one waiting for its own target leaves no earlier than `end`."""
+        under `sync` for `end`; with `own_draft`, one waiting for its own target leaves no earlier than `end`.
+        """
         _, launch_end, output, post = self._held
         released = launch_end
         if self.sync:
@@ -705,6 +706,28 @@ def simulated_arch():
             for n, probe in real.items():
                 if getattr(module, "__dict__", {}).get(n) is simulated:
                     setattr(module, n, probe)
+
+
+@contextlib.contextmanager
+def simulated_cuda():
+    """`torch.cuda` answers as the run's simulated device, inside the block.
+
+    A model asks it as it builds: DeepSeek-V4's HCA preparation asks the
+    current device and whether its stream captures, which a host with no
+    driver cannot answer (`driverless.cuda_substitutes`). Without a run file
+    nothing is substituted.
+    """
+    from atom.compass import run
+    from atom.compass.capture.driverless import cuda_substitutes
+    from atom.compass.spec.machine import MachineSpec
+
+    spec = run.spec()
+    if spec is None:
+        yield
+        return
+    arch = MachineSpec.from_mapping(spec["machine"]).value("device.arch")
+    with cuda_substitutes(arch):
+        yield
 
 
 def start_on_host(runner: Any, rank: int, config: Any) -> None:
@@ -1424,7 +1447,7 @@ class NonAllocatingRunner(
         device included, because ATOM sizes the KV pool by walking its attention
         modules; the load is skipped, so no checkpoint is read. The tree is
         built for the simulated device's arch (`simulated_arch`), not the
-        host's.
+        host's, and asks `torch.cuda` about that device (`simulated_cuda`).
 
         Under a speculative config the base goes on to build the drafter and
         load it from the checkpoint; `drafts_on_meta` makes that build meta and
@@ -1456,7 +1479,7 @@ class NonAllocatingRunner(
                 )
             drafts_on_meta()
         engram_tables_unread()
-        with FactoriesOnMeta(), simulated_arch():
+        with FactoriesOnMeta(), simulated_arch(), simulated_cuda():
             self.model.tree = model_class(self.config)
             process_weights_after_loading(self.model.tree)
         from atom.compass import run

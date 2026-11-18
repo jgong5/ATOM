@@ -7,12 +7,21 @@ aiter is imported first, as on a device of ARCH (`driverless.import_aiter_on`);
 then MODULE runs as ``python -m MODULE ARGS`` would. `serve` starts a simulated
 server this way, so the server resolves its config, an FP8 quantization's dtype
 among it, as on its machine's device.
+
+Every process the server spawns, and each one those spawn, declares ARCH too,
+before it unpickles anything that imports aiter: this module stays the
+server's ``__main__``, which a spawned process imports first, as
+``__mp_main__``, and the arch is in its environment (`ARCH_ENV`).
 """
 
+import os
 import runpy
 import sys
 
 from atom.compass.capture.driverless import import_aiter_on
+
+#: The arch a process started here declared, which the processes it spawns read.
+ARCH_ENV = "ATOM_COMPASS_ON_ARCH"
 
 
 def main(argv: list[str]) -> None:
@@ -20,9 +29,14 @@ def main(argv: list[str]) -> None:
     if flag != "-m":
         raise SystemExit(f"usage: on_arch ARCH -m MODULE [ARGS...]; got {flag!r}")
     import_aiter_on(arch)
+    os.environ[ARCH_ENV] = arch
     sys.argv = [module, *args]
-    runpy.run_module(module, run_name="__main__", alter_sys=True)
+    # Not `alter_sys`, which would make MODULE the `__main__` a spawned process
+    # imports, and so import aiter there before anything declares the arch.
+    runpy.run_module(module, run_name="__main__")
 
 
 if __name__ == "__main__":
     main(sys.argv[1:])
+elif __name__ == "__mp_main__":
+    import_aiter_on(os.environ[ARCH_ENV])
