@@ -16,7 +16,9 @@ are `validate.curves.metrics`' (InferenceX's agentic ones, over the profiling
 records with no error) and, over the same records, TTFT p50 and p99, TPOT p50
 and p90 (aiperf's inter-token latency, per request) and E2E latency p50, in
 milliseconds, and the requests counted. Every run must have been given the
-same client arguments.
+same client arguments. Below the table it names REAL's stalled forwards over
+its graded window (`atom.compass.validate.stalls`): seconds the real run lost
+to one DP rank's slow launch, which a simulated run does not charge.
 """
 
 import json
@@ -24,6 +26,7 @@ import sys
 from pathlib import Path
 
 from atom.compass.backends.json_file import read_json, read_jsonl
+from atom.compass.validate import stalls
 from atom.compass.validate.curves import (
     CLIENT_RUN,
     RECORDS,
@@ -88,8 +91,18 @@ def main(argv: list[str]) -> int:
         shown = "".join(f"{'-' if v is None else format(v, '.4g'):>16}" for v in values)
         errs = "".join(f"{error(values[0], v):>18}" for v in values[1:])
         print(f"{name:34}{shown}{errs}")
+    print(stalled(real))
     print(json.dumps(rows))
     return 0
+
+
+def stalled(real: Path) -> str:
+    """REAL's stalled forwards (`validate.stalls`), which no simulated run
+    charges, or why they are not counted."""
+    try:
+        return "real " + stalls.text(stalls.report(real))
+    except (OSError, KeyError, ValueError) as e:
+        return f"real: stalled forwards not counted ({type(e).__name__}: {e})"
 
 
 if __name__ == "__main__":
