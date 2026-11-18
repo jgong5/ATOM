@@ -607,6 +607,17 @@ above. A term is `validated` only inside a second hull, the steps `step_linear_f
 priced with a law fitted on the other records, whose errors per band it writes into the
 law beside that hull; a law without one prices every term unvalidated.
 
+**Past six free features the hull is pairwise** (#3720, `step_linear_fit.HULL_EXACT_FREE`).
+qhull's exact hull of a prefill vector's eight features held 430k facets on one c=128
+record; pooled with a c=1 record it failed qhull's precision checks, and hulled joggled
+held 2.9M, a 1.8 GB law whose runs advanced about 3x slower, every prefill step checked
+against every facet. Past six free features the hull is the unit box cut by each pair of
+features' 2-D hull (`_pair_hull`): it holds every point and sees each pair's joint
+distribution, so it still finds a hole like rung 16's above, which two features show, but
+not one only three or more show, where it calls a step inside that the exact hull would
+call outside. Decode, host and propose vectors have at most four free features and keep
+the exact hull. Whether a k-NN distance should replace it is T29's open choice.
+
 A vector fitted on another subject, which the law states under `declared`, prices
 `declared` terms with that note, never validated ([owner ruling on #2660](https://github.com/jgong5/ATOM/issues/2660#issuecomment-6575668068),
 2026-11-02). The prefill side's records, the crs005 prefill law's own and #975's warm pass,
