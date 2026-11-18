@@ -390,7 +390,7 @@ def test_the_eviction_and_session_ticks_land_on_their_grids_as_daemon_deadlines(
     sock = ctx.socket(zmq.ROUTER)
     try:
         LMCacheLP(
-            rt, sock, server, lookup_s=LOOKUP_S, request_s=REQUEST_S, copy=None
+            rt, sock, server, lookup_s=LOOKUP_S, request_s=REQUEST_S, size_copy=None
         ).serve()
     finally:
         sock.close(linger=0)

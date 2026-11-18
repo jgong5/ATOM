@@ -20,8 +20,10 @@ import platforms
 import pytest
 from conftest import atom_config_double
 from test_advice_lmcache import TEMPLATE, served
-from test_lmcache_lp import CHUNK, _config, _run
+from test_drive_runfile import build, install
+from test_lmcache_lp import CHUNK, OFFLOAD, _config, _run
 from test_pd_planned_block import CONFIGS, publish
+from test_run_step_grid import deployment
 
 from atom.compass import run as compass_run
 from atom.compass.advice import check, space
@@ -113,6 +115,20 @@ def test_a_template_s5_member_s_shell_binds_its_state_checkpoints(
     [rank] = shell._ranks
     assert isinstance(rank, NativeStateLMCacheMPConnector)
     assert rank.chunk_size == 256
+
+
+@pytest.mark.parametrize("kv, named", [(OFFLOAD, True), ({}, False)])
+def test_rank_0_of_an_lmcache_mp_deployment_is_given_its_plan_file(
+    monkeypatch, tmp_path, kv, named
+):
+    stub = tmp_path / "stub.json"
+    stub.write_text(json.dumps(dataclasses.asdict(Coefficients())))
+    r = deployment(tmp_path, kv_transfer_config=kv)
+
+    install(tmp_path, monkeypatch, build(tmp_path, "--step-stub", str(stub)), r)
+
+    planned = tmp_path / "now.kv_block"
+    assert getattr(r, "compass_block_file", None) == (planned if named else None)
 
 
 def test_lp_lmcache_sizes_a_chunk_and_the_image_every_member_planned(tmp_path):

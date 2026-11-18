@@ -6,7 +6,8 @@ DeepSeek-V3.2 (`deepseek_v3_2_config.json`, its config.json byte for byte at
 revision a7e62ac04ecb2c0a54d736dc46601c5606cf10a6) is built driverless on the
 simulated connector's config, once per index cache dtype, each in a process of
 its own, and plans its pool with ATOM's `get_num_blocks`, as a simulated run
-does. Its runner then publishes what its connector prices, or refuses; its fake
+does. Its runner then publishes what its connector prices, or refuses, and on
+a config offloading to `lmcache_mp` alone publishes under either dtype; its fake
 KV cache is allocated and ATOM's own `get_kv_transfer_tensors` is asked for the
 regions on Mooncake's config, the backend the simulated connector stands for,
 and on `lmcache_mp`'s. Under fp4 ATOM refuses Mooncake and takes `lmcache_mp`;
@@ -43,6 +44,13 @@ try:
     publish_planned_transfer(runner)
 except RunnerRefusal as e:
     refused["compass"] = str(e)
+# The same runner offloading to an lmcache server alone, no P/D side.
+config.kv_transfer_config = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
+runner.compass_block_file = pathlib.Path(out).with_suffix(".lmcache_mp")
+try:
+    publish_planned_transfer(runner)
+except RunnerRefusal as e:
+    refused["compass, lmcache_mp alone"] = str(e)
 builder = runner.attn_metadata_builder
 with forward._patches(recorder), fake, torch.inference_mode():
     config.kv_transfer_config = {}
@@ -81,3 +89,11 @@ def test_a_transfer_refuses_under_the_fp4_indexer_where_atom_does(built, dtype):
     if "compass" in refused:
         assert refused["compass"].startswith("ATOM's `")
         assert refused["compass"].partition(": ")[2] in refused["mooncake"]
+
+
+@pytest.mark.parametrize("dtype", REFUSED)
+def test_a_runner_offloading_to_lmcache_alone_publishes_under_either_indexer(
+    built, dtype
+):
+    assert "compass, lmcache_mp alone" not in built[dtype]
+    assert built[dtype]["published"].with_suffix(".lmcache_mp").exists()

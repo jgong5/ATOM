@@ -410,8 +410,9 @@ class LMCacheLP:
     Each request released to it joins a station's queue in ``(arrival,
     channel, seq)`` order: the copy engine, `copy_width` servers pricing a
     STORE or RETRIEVE over the chunks it copies as the `TransferModel` that
-    `copy()` builds at the first stamped request released, once the engines
-    it serves have planned what a chunk holds, or the request
+    `size_copy()` returns at the first stamped request released, after it has
+    sized the server's chunk and state image from what the engines it serves
+    planned, or the request
     loop, one server pricing a LOOKUP at ``lookup_s[0] + lookup_s[1]`` per
     prompt chunk and any other request at `request_s`. A job is served
     (`LMCacheServer.handle`) at its start and, at its end, applies its effect
@@ -426,14 +427,16 @@ class LMCacheLP:
     header ``(channel, arrival, seq)`` as every wrapped socket sends it.
     """
 
-    def __init__(self, rt, sock, server, *, lookup_s, request_s, copy, copy_width=1):
+    def __init__(
+        self, rt, sock, server, *, lookup_s, request_s, size_copy, copy_width=1
+    ):
         import zmq
         from lmcache.v1.multiprocess.transport.zmq_impl import wire
 
         self.zmq, self.rt, self.sock, self.server = zmq, rt, sock, server
         self._wire = wire
-        self.lookup_s, self.request_s, self._build_copy = lookup_s, request_s, copy
-        self.copy = None  # built at the first stamped request
+        self.lookup_s, self.request_s, self._size_copy = lookup_s, request_s, size_copy
+        self.copy = None  # the copy engine's model, from the first stamped request
         # ponytail: each copy server moves at the link's whole rate; share it
         # between them if a measured copy engine says they contend.
         self.width = {"copy": copy_width, "request": 1}
@@ -470,7 +473,7 @@ class LMCacheLP:
             if seq in self.rt.released[ch]
         )
         if released and self.copy is None:
-            self.copy = self._build_copy()
+            self.copy = self._size_copy()
         for _, ch, seq in released:
             frames = self.inbox.pop((ch, seq))[1]
             op = self._wire.decode_operation(frames[2])

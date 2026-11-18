@@ -1152,10 +1152,12 @@ def lmcache(block_tokens: int) -> None:
     rt.client_run_ended = lambda k: _hand_in(run, LMCACHE.name, rt.refusals, k)
     stations = _lmcache_stations(run)
     link = stations.pop("link")
-    # Unsized until `copy`: the startup frames before it need no bytes.
+    # Unsized until `size_copy`: the startup frames before it need no bytes.
     server = LMCacheServer(run["lmcache"]["server"], chunk_bytes=0)
 
-    def copy():
+    def size_copy():
+        """Size the server's chunk and state image from the plan, and return
+        the copy engine's model at that chunk."""
         blocks = server.chunk_size // block_tokens
         server.chunk_bytes, server.state_bytes = _lmcache_plan(run, blocks)
         return TransferModel(*link, server.chunk_bytes)
@@ -1164,7 +1166,7 @@ def lmcache(block_tokens: int) -> None:
     sock.bind(server.url)
     ended = []
     try:
-        LMCacheLP(rt, sock, server, copy=copy, **stations).serve()
+        LMCacheLP(rt, sock, server, size_copy=size_copy, **stations).serve()
     except BaseException as e:
         ended = [f"ended:{LMCACHE.name} raised {e!r}"]
         raise
