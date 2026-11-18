@@ -147,18 +147,19 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
             {i: (c.target_seconds, group[i][1]) for i, c in costs.items()}
         )
         extrapolated += any(t.provenance.extrapolated for t in costs[top].terms)
-        # A step is banded by its busiest rank's tokens, a dummy priced highest too.
+        # A step a dummy is priced highest on is banded, and its draft priced, at
+        # its busiest forwarding rank: a dummy's draft is none of its labels.
         busiest = max((i for i in group if step in views[i]), key=lambda i: group[i][1])
-        band = _band(key, group[top if step in views[top] else busiest][1])
-        price = costs[top].target_seconds
+        real = top if step in views[top] else busiest
+        band, price = _band(key, group[real][1]), costs[top].target_seconds
         # Each term of a fallback's answer carries what declined the step.
         if costs[top].refusals:
             _count(fell, band, seconds, dict.fromkeys(costs[top].refusals))
-        labels = [drafts[i][step] for i in group]
+        labels = [drafts[i][step] for i in group if step in drafts[i]]
         draft = None
         if None not in labels:
-            mine = costs[top].draft_terms
-            draft = (min(labels), costs[top].draft_seconds, _group(mine))
+            mine = costs[real].draft_terms
+            draft = (min(labels), costs[real].draft_seconds, _group(mine))
         target = _group(costs[top].terms)
         priced.append((key, band, step, seconds, price, target, draft, costs[top], top))
     leading = set() if grid else _leading_slow(priced, law)

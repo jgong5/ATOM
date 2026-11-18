@@ -26,6 +26,7 @@ from atom.compass.backends import (
     StepLinearLaw,
 )
 from atom.compass.backends.step_labels import BUILDS, label
+from atom.compass.backends.step_linear import EAGER_DUMMY
 from atom.compass.backends.step_linear_fit import (
     _fit_form,
     _solve,
@@ -1263,7 +1264,12 @@ def test_a_dp_step_a_peer_ran_as_a_dummy_is_fitted_on_the_ranks_that_ran_it(tmp_
     assert law_["cut"]["ranks"] == 0
     fitted = [law_["prefill"], law_["decode"]["4"]]
     assert sum(v["fit"]["samples"] for v in fitted) == 120
-    assert fitted[0]["coefficients"] == pytest.approx(dp.PREFILL, rel=1e-6)
+    # The dummies ran eagerly (the record states no buckets) and their steps'
+    # times carry nothing of theirs, so the dummy columns come out nil.
+    prefill = dict(fitted[0]["coefficients"])
+    eager = {f: prefill.pop(f) for f in EAGER_DUMMY}
+    assert eager == pytest.approx(dict.fromkeys(EAGER_DUMMY, 0.0), abs=1e-9)
+    assert prefill == pytest.approx(dp.PREFILL, rel=1e-6)
     assert fitted[1]["coefficients"] == pytest.approx(dp.DECODE, rel=1e-6)
 
 
