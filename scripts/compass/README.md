@@ -1244,6 +1244,72 @@ prefill rank and per rail, each one write at a time or sharing the
 bandwidth, and prints each one's error on every `_rdma_write` call and on
 the contended ones.
 
+### The DPA-TP8 cell under the op-level backend
+
+The DPA-TP8 cell [as registered](https://github.com/jgong5/ATOM/issues/975#issuecomment-6570682669)
+runs simulated under the op-level backend by steps 10 to 13 of the stage-2 cell, below,
+each side apart: its own ATOM arguments, its environment and its Mooncake
+`--kv-transfer-config` (`kv_producer` on the prefill side, `kv_consumer` on the decode).
+Without the transfer config ATOM builds DeepSeek-V4's FP4 indexer where a transfer side
+runs the FP8 one, so its graphs and points would price kernels the cell never runs. One
+store `S` holds the node's `platform_readings`, which a run's `--device` composes its spec
+from, each side's `compass measure memory` readings, taken as the EP8 cell's
+are, the graphs, the points and one price list: a price list's key holds the model, the
+parallel layout, the platform the spec names and the ATOM source, and neither
+`--enable-tbo` nor a variable, so both sides' points key one list. Every command runs from one tree, the one
+the readings were taken at, since readings, graphs, points and price lists each refuse
+another ATOM source, under the side's environment and no other performance variable
+(`atom/benchmarks/results/metadata.py::PERFORMANCE_KEYS`): `OMP_NUM_THREADS` is one, so
+pin processes that run at once to cores with `taskset`.
+
+- **Graphs.** `compass trace ops --model <DeepSeek-V4-Pro> --tp 8 --arch gfx950
+  --population REC --store S -- <side's ATOM args>`, for each plan record and each real run
+  graded. Under DP-attention a graph is keyed by the rows its step's MoE gathers over the
+  group, `G=`, and under `--enable-tbo` a step the group split is its two micro-batches,
+  each traced on one stream and keyed apart from a whole step of its shape, so a real
+  run's prefill side holds far more shapes than its decode side, whose steps pad to the
+  ladder's rungs. A store refuses a second publish of one key, so trace each record into a
+  store of its own, then copy into `S` each entry it lacks, once no other process
+  publishes into `S`. For the same reason a trace cut short cannot be resumed into its
+  store: split a record whose trace would run for hours, a c=64 or 256 prefill side, by
+  step into part records, every rank's line of a step in one part, and trace each part
+  into a store of its own; together the parts hold the record's shapes. A trace builds
+  the model without its weights, and a graph keys `config.json`'s digest, not its path: a
+  container that does not mount the model, such as a CPU gate container, traces from a
+  copy of the model's directory less its weight files.
+- **Points.** `compass measure ops --plan REC --llc-mib 256 --gpu C --store S --out O --
+  <side's ATOM args> --enforce-eager --level 0 --cudagraph-capture-sizes "[R]"`, over each
+  side's plan record, `C` the cards the run takes and `R` the decode rungs it measures,
+  with that side's Mooncake variables, the node's own `ATOM_HOST_IP`,
+  and a `handshake_port` of its own for each bench that runs at once. One GPU runs one DP
+  rank and every leaf but the collectives, so one-GPU runs split the decode rungs between
+  them, the ladder in no graph's key; one run on all eight GPUs at every rung then
+  measures the collectives, the other points already held. The plan reads a split step as
+  its two micro-batches, the shapes `trace ops` publishes, and densifies a micro-batch's
+  points at its own graph. A bench a signal stops can leave its measuring child holding
+  the card ([#3224](https://github.com/jgong5/ATOM/issues/3224)): run each in a session of
+  its own, and once it ends, kill by PID what the session left before the card serves again.
+- **Price list.** `compass fit ops --store S --out F O...`, `F` the fit's own output
+  directory and `O...` every points run's `--out` of both sides.
+- **Runs.** `deploy.sh OUT run --op-graph --host-laws P --host-laws D --device mi355x
+  --ptl disabled --network crs005-013-ionic --store S`, the decode through a local
+  prefix as above, `P` and `D` the tree's
+  `laws/deepseek-v4-pro-dpa8-mi355x-crs005-prefill.json.xz` and `-decode.json.xz`, whose
+  host laws the run reads. Each engine traces a shape `S` lacks itself, a model build in a
+  process of its own, and the run's wall time pays for it. At c=64 and 256 a prefill side
+  meets thousands of shapes, so trace the real runs graded into `S` before the run: the
+  summary's `cost` counts the graphs it held and those it traced, `held_lookups` and
+  `lazy_traces`, and times each, `lookup_wall_seconds` and `lazy_trace_wall_seconds`.
+  Such a run is judged faster than real over a store so warmed, its lazy traces reported
+  apart ([Ruling](https://github.com/jgong5/ATOM/pull/3124#issuecomment-6768936508)).
+- **Grading.** Link `OUT` as `op_graph` beside the real runs and run `python -m
+  atom.compass.validate` on that directory: it reads each side's graphs under the
+  environment that side's engine file states. It labels a prefill step only from a
+  trace run's busy time, so on real runs recorded without a profiler, as the cell's are,
+  it leaves every prefill step of the prefill side out as `untraced`, counted per run in
+  that side's `left out` row, and that side's prefill has no cost row until a gated
+  record grades it ([#3028](https://github.com/jgong5/ATOM/issues/3028)).
+
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
 `PYTHONPATH=$T python -m atom.compass.validate.bound ... RECORD...` exits 1 when a real
