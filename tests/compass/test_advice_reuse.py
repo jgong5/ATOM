@@ -208,7 +208,6 @@ def test_a_law_and_readings_at_the_head_s_key_are_reused_at_every_point(
         ("a law file at another digest", "calibrate", "states ATOM digest 000000"),
         ("a store law at another digest", "calibrate", "never re-keyed"),
         ("no host laws beside a store law", "calibrate", "has no host laws beside"),
-        ("host laws of another CPU", "refused", "fitted on another CPU, and"),
     ],
 )
 def test_a_law_at_another_key_names_requirement_1(
@@ -223,17 +222,23 @@ def test_a_law_at_another_key_names_requirement_1(
         law_file(tmp_path, held)
     elif case == "a store law at another digest":
         stored(tmp_path, r, atom="0" * 64)
-    elif case == "no host laws beside a store law":
-        stored(tmp_path, r, host=False)
     else:
-        held = law(r)
-        held["host"]["key"]["host_cpu"] = "another CPU"
-        law_file(tmp_path, held)
+        stored(tmp_path, r, host=False)
 
     found = verdicts(advise(tmp_path), "law")
 
     assert [(v["verdict"], v["requirement"]) for v in found] == [(verdict, 1)] * 2
     assert named in found[0]["reason"]
+
+
+def test_a_law_file_s_host_laws_fitted_on_another_cpu_are_reused(tmp_path, searched):
+    held = law(searched)
+    held["host"]["key"]["host_cpu"] = "another CPU"
+    where = law_file(tmp_path, held)
+
+    found = verdicts(advise(tmp_path), "law")
+
+    assert [(v["verdict"], v["reason"]) for v in found] == [("reuse", where)] * 2
 
 
 @pytest.mark.parametrize("invalidated", [True, False])
@@ -505,7 +510,7 @@ def test_a_calibration_store_holding_every_input_at_its_key_is_looked_up_whateve
     "case, looked_up, verdict, named, readings_verdict",
     [
         ("a reusable law", "b", ("reuse", None), "", "measure"),
-        ("host laws of another CPU", "b", ("refused", 1), "on another CPU", "reuse"),
+        ("host laws of another CPU", "b", ("reuse", None), "", "reuse"),
         ("past 5%", "b", ("refused", 4), "run at the head", "measure"),
         ("an older store holding every input", "a", ("reuse", None), "", "reuse"),
     ],
@@ -544,16 +549,14 @@ def test_with_no_store_holding_every_input_the_latest_a_law_is_read_from_is_look
 def test_a_store_no_law_is_read_from_is_passed_over_for_the_shared_store(
     tmp_path, searched
 ):
-    held = law(searched)
-    held["host"]["key"]["host_cpu"] = "another CPU"
-    law_file(tmp_path, held)
+    law_file(tmp_path, past(searched)[0])
     platforms.flags(tmp_path / "out/cal/x/store", DOCUMENT, tmp_path)
 
     judged = advise(tmp_path)
 
     assert judged["candidates"]["a"]["store"] == str(tmp_path / "store")
     found = verdicts(judged, "law")
-    assert [(v["verdict"], v["requirement"]) for v in found] == [("refused", 1)] * 2
+    assert [(v["verdict"], v["requirement"]) for v in found] == [("refused", 4)] * 2
     assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
 
 

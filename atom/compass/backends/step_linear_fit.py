@@ -7,12 +7,15 @@
     python -m atom.compass.backends.step_linear_fit offload LOG... --out ENTRY
     python -m atom.compass.backends.step_linear_fit figures RECORD... --law LAW [--source NAME] [--form FORM] [--moe-routing E,K] [--engine FILE]
     python -m atom.compass.backends.step_linear_fit pack PATH...
+    python -m atom.compass.backends.step_linear_fit readings LAW --store S --token T --assumed NOTE
 
 The second form fits a run file's ``lmcache_offload`` entry, beside the law of
 an arm whose records ran the connector, on those runs' server logs
 (`fit_offload`). The third writes the held-out figures (below) of the records
 into an existing law fitted on them (`figures_main`). The fourth stores law
-files xz-compressed, as the checked-in ones are (`pack_main`). A law is read
+files xz-compressed, as the checked-in ones are (`pack_main`). The fifth
+writes into a law file the memory readings a run reads from it, assumed
+(`readings_main`). A law is read
 and written by `json_file`, xz-compressed when its name ends in ``.xz``.
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
@@ -2402,6 +2405,44 @@ def pack_main(argv) -> None:
         law.unlink()
 
 
+def readings_main(argv) -> None:
+    """``readings LAW --store S --token T --assumed NOTE``: write into the law
+    file LAW the members of the `memory_readings` entry the store S holds at
+    token T, each stating `assumed` NOTE, with the entry's key, which a run
+    reads where its store holds none (`run.memory.load`); their ATOM digest is
+    from then on the law's host key's. An entry measured under another engine
+    config than the law's refuses, naming the fields that differ."""
+    from atom.compass.artifacts import ArtifactStore, Kind, member_name
+    from atom.compass.run import memory
+
+    parser = argparse.ArgumentParser(
+        prog="python -m atom.compass.backends.step_linear_fit readings",
+        description=readings_main.__doc__.split("\n\n")[0],
+    )
+    parser.add_argument("law", type=Path, help="the law file written into")
+    parser.add_argument("--store", required=True, help="the artifact store's root")
+    parser.add_argument("--token", required=True, help="the readings entry's token")
+    parser.add_argument("--assumed", required=True, help="where they were taken")
+    args = parser.parse_args(argv)
+    store = ArtifactStore(args.store)
+    entry = store.read(store.key_from_token(Kind.MEMORY_READINGS, args.token))
+    law = json_file.read_json(args.law)
+    measured = json.loads(entry.key.values["engine_config"])
+    engine = law["engine_config"]
+    if differ := sorted(n for n, v in engine.items() if measured.get(n) != v):
+        parser.error(f"{args.token} was measured under another {differ} than the law")
+    members = {
+        member_name(memory.STEM, at, memory.EXTENSION): json.loads(
+            entry.read_member(memory.STEM, at, memory.EXTENSION)
+        )
+        | {"assumed": args.assumed}
+        for at in entry.topology.ranks()
+    }
+    law[memory.LAW_MEMBER] = {"key": entry.key.values, "members": members}
+    json_file.write_json(law, args.law)
+    print(f"{args.law}: {len(members)} members of {entry.key.kind} {args.token}")
+
+
 def main(argv=None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["offload"]:
@@ -2412,6 +2453,9 @@ def main(argv=None) -> None:
         return
     if argv[:1] == ["pack"]:
         pack_main(argv[1:])
+        return
+    if argv[:1] == ["readings"]:
+        readings_main(argv[1:])
         return
     parser = _records_parser(
         "python -m atom.compass.backends.step_linear_fit", __doc__.split("\n\n")[0]

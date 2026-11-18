@@ -70,6 +70,7 @@ from atom.compass.artifacts import (
 from atom.compass.backends.json_file import read_json
 from atom.compass.fit.device import compose
 from atom.compass.fit.publish import RANK
+from atom.compass.run import memory
 from atom.compass.run.step_grid import readings
 from atom.compass.spec.layers import stack_of
 
@@ -77,8 +78,9 @@ from atom.compass.spec.layers import stack_of
 KINDS = {run.STEP_LINEAR: Kind.STEP_LINEAR_LAW, run.STEP_GRID: Kind.STEP_GRID_BUNDLE}
 #: A simulated-time bound past any run's.
 FIXED = {"bound_s": 1e7}
-#: A law file's host laws and their fit report, which are not its step law.
-HOST_MEMBERS = ("host", "host_fit")
+#: A law file's members that are not its step law: its host laws, their fit
+#: report and the memory readings it carries.
+NOT_STEP_LAW = ("host", "host_fit", memory.LAW_MEMBER)
 
 
 def add_arguments(parser) -> None:
@@ -211,12 +213,22 @@ def build(args, atom_args, across: bool = False) -> dict:
         # A run file's router_s makes it prefill-decode: `prefill_decode` writes it.
         hops = _hops(hosts, atom_args, machine.value("device.arch"))
         out |= {k: v for k, v in hops.items() if k != "router_s"}
+    if held := carried(args):
+        out[memory.CARRIED] = held
     if args.padding:
         out["padding"] = args.padding
     for name in ("lmcache", "lmcache_offload"):
         if entry := getattr(args, name, None):
             out[name] = json.loads(Path(entry).read_text())
     return out
+
+
+def carried(args) -> list:
+    """The memory readings the law files `args`' ``--step-linear`` and
+    ``--host-laws`` name carry, as the run file holds them (`memory.CARRIED`)."""
+    named = [*(getattr(args, run.STEP_LINEAR, None) or ()), *(args.host_laws or ())]
+    laws = {t: law for t in named if (law := _law_file(t)) is not None}
+    return [c for t, law in laws.items() if (c := memory.carried_by(law, t))]
 
 
 def resolve(store, name: str, token: str, machine, atom_args) -> tuple:
@@ -228,7 +240,7 @@ def resolve(store, name: str, token: str, machine, atom_args) -> tuple:
     if name == "host":
         return _host(store, token), None
     if name == run.STEP_LINEAR and (law := _law_file(token)) is not None:
-        law = {k: v for k, v in law.items() if k not in HOST_MEMBERS}
+        law = {k: v for k, v in law.items() if k not in NOT_STEP_LAW}
         return law, _stated(law)
     key = store.key_from_token(KINDS[name], token)
     if name == run.STEP_GRID:

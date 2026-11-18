@@ -1,0 +1,156 @@
+# SPDX-License-Identifier: MIT
+"""A law file carries the memory readings its law's engine config was measured
+with, each stating `assumed`, which a run reads where its store holds none:
+keyed as a store entry is, at the ATOM digest of the law's host key. Readings at
+another key refuse, naming the fields they differ in, and readings at another
+ATOM digest name both. Host laws fitted on another host CPU serve a run, which
+predicts the host they timed. ``step_linear_fit readings`` writes a store
+entry's readings into a law file.
+"""
+
+import shutil
+
+import pytest
+from test_drive_run import stub
+from test_drive_runfile import LAWS
+from test_memory_readings import DOCUMENT, READINGS
+from test_run_lacking import checked, served
+from test_run_step_grid import PLATFORM, deployment
+
+from atom.compass import run as compass_run
+from atom.compass.artifacts import (
+    ArtifactRefusal,
+    Kind,
+    keyed_platform,
+    machine_platform,
+    member_name,
+)
+from atom.compass.backends import step_linear_fit
+from atom.compass.backends.json_file import read_json, write_json
+from atom.compass.run import memory
+from atom.compass.run.step_grid import keyed
+from atom.compass.spec import MachineSpec
+
+MACHINE = MachineSpec.from_mapping(DOCUMENT)
+ASSUMED = "measured at another ATOM digest, carried by this law"
+
+
+@pytest.fixture
+def bare(tmp_path):
+    """A deployment whose store holds no memory readings."""
+    r = deployment(tmp_path)
+    shutil.rmtree(tmp_path / "store" / Kind.MEMORY_READINGS.value)
+    return r
+
+
+def law_member(r, **key) -> dict:
+    """A law file's readings of `r`'s, at their key moved by `key`."""
+    at = memory.key_of(r.config, MACHINE).values | key
+    ranks = memory.topology(r.config).ranks()
+    members = {
+        member_name(memory.STEM, rank, memory.EXTENSION): READINGS[1]
+        | {"assumed": ASSUMED}
+        for rank in ranks
+    }
+    return {"key": at, "members": members}
+
+
+def carried(r, atom=None, **key):
+    """The run file's readings of a law file carrying `r`'s, at their key
+    moved by `key`, its host key at ATOM digest `atom` or this tree's."""
+    law = {
+        memory.LAW_MEMBER: law_member(r, **key),
+        "host": {"key": {"atom": atom or compass_run.atom_digest()}},
+    }
+    return [memory.carried_by(law, "law.json")]
+
+
+def load(tmp_path, r, carried):
+    return memory.load(str(tmp_path / "store"), r.config, MACHINE, 0, carried)
+
+
+def test_a_store_with_no_readings_reads_the_law_file_s_assumed(tmp_path, bare):
+    read = load(tmp_path, bare, carried(bare))
+
+    assert read.assumed == ASSUMED
+    assert read.values["activation_bytes"] == READINGS[1]["activation_bytes"]
+
+
+def test_a_store_with_no_readings_and_no_law_file_s_refuses(tmp_path, bare):
+    with pytest.raises(ArtifactRefusal, match="no entry for memory_readings"):
+        load(tmp_path, bare, ())
+
+
+def test_a_store_s_readings_come_before_a_law_file_s(tmp_path):
+    r = deployment(tmp_path)
+
+    assert load(tmp_path, r, carried(r)).assumed is None
+
+
+def test_readings_at_another_key_refuse_naming_the_field(tmp_path, bare):
+    tp = memory.key_of(bare.config, MACHINE).values["tp"]
+
+    with pytest.raises(ArtifactRefusal, match="law.json carries differ in tp"):
+        load(tmp_path, bare, carried(bare, tp=tp + 1))
+
+
+def test_readings_at_another_atom_digest_refuse_naming_both(tmp_path, bare):
+    here = compass_run.atom_digest()
+
+    with pytest.raises(ArtifactRefusal) as refused:
+        load(tmp_path, bare, carried(bare, atom="0" * 64))
+    assert f"ATOM digest {'0' * 64}" in str(refused.value)
+    assert f"this tree's is {here}" in str(refused.value)
+
+
+def test_host_laws_fitted_on_another_cpu_serve_the_run(tmp_path):
+    r = deployment(tmp_path)
+    platform = machine_platform(MACHINE)
+    key = compass_run.host_key(r.config) | keyed_platform(Kind.HOST_LAWS, platform)
+    host = {"laws": {"decode": {"E": [1e-4, 0.0, 0.0]}}}
+
+    compass_run.refuse_unfitted_host(
+        host | {"key": key | {"host_cpu": "another CPU"}}, r.config, platform
+    )
+    with pytest.raises(ValueError, match=r"another \['model'\]"):
+        compass_run.refuse_unfitted_host(
+            host | {"key": key | {"model": "another model"}}, r.config, platform
+        )
+
+
+@pytest.mark.parametrize(
+    "moved", [{}, {"kv_cache_dtype": "fp8"}], ids=["same", "other"]
+)
+def test_the_writer_carries_a_store_s_entry_into_the_law_file(tmp_path, capsys, moved):
+    r = deployment(tmp_path)
+    path, token = tmp_path / "law.json", memory.key_of(r.config, MACHINE).token()
+    atom = {"key": {"atom": compass_run.atom_digest()}}
+    write_json({"engine_config": keyed(r.config) | moved, "host": atom}, path)
+    argv = ["readings", str(path), "--store", str(tmp_path / "store")]
+    argv += ["--token", token, "--assumed", ASSUMED]
+
+    if moved:
+        with pytest.raises(SystemExit):
+            step_linear_fit.main(argv)
+        assert f"measured under another {list(moved)}" in capsys.readouterr().err
+        return
+    step_linear_fit.main(argv)
+    shutil.rmtree(tmp_path / "store" / Kind.MEMORY_READINGS.value)
+
+    given = [memory.carried_by(read_json(path), str(path))]
+    assert load(tmp_path, r, given).assumed == ASSUMED
+
+
+def test_check_lacks_no_readings_a_law_file_of_another_cpu_carries(
+    tmp_path, monkeypatch, capsys, bare
+):
+    served(monkeypatch, bare.config)
+    key = compass_run.host_key(bare.config) | keyed_platform(Kind.HOST_LAWS, PLATFORM)
+    host = {"key": key | {"host_cpu": "another CPU"}, "laws": LAWS}
+    path = tmp_path / "law.json"
+    write_json({"host": host, memory.LAW_MEMBER: law_member(bare)}, path)
+
+    assert (
+        checked(tmp_path, "--step-stub", stub(tmp_path), "--host-laws", str(path)) == 0
+    )
+    assert capsys.readouterr().out.startswith("nothing lacking")
