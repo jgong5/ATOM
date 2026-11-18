@@ -15,9 +15,9 @@
 #                     answer the blind-spot question without .git
 #
 # Both are written from the same rev-parse that selects the archived tree, so
-# neither can name a different commit than the one inside. With
-# COMPASS_GPU_GATE_DONE=<G> set and not HEAD, a third, .compass-gpu-carry, holds
-# G and then the diff from G, so gate_cpu.sh can carry G's GPU gate here.
+# neither can name a different commit than the one inside. The third,
+# .compass-gpu-carry, lets gate_cpu.sh carry the GPU gate of COMPASS_GPU_GATE_DONE=G
+# here: G, HEAD and the diff from G, or empty, so it replaces a stale extraction's.
 #
 # Usage: snapshot.sh [<output-dir>]   (default: the current directory)
 #
@@ -77,23 +77,24 @@ trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/ATOM"
 printf '%s\n' "$SHA" >"$STAGE/ATOM/.compass-commit"
 git -C "$ROOT" diff --name-only "$BASE" HEAD >"$STAGE/ATOM/.compass-changed"
+: >"$STAGE/ATOM/.compass-gpu-carry"
 if [ -n "${COMPASS_GPU_GATE_DONE:-}" ]; then
-    G=$(git -C "$ROOT" rev-parse --verify --quiet "$COMPASS_GPU_GATE_DONE^{commit}") || {
-        printf 'REFUSED: COMPASS_GPU_GATE_DONE=%s names no commit here; fetch it or unset it.\n' "$COMPASS_GPU_GATE_DONE" >&2
+    G=$(git -C "$ROOT" rev-parse --verify --quiet "$COMPASS_GPU_GATE_DONE^{commit}") && [ "$G" = "$COMPASS_GPU_GATE_DONE" ] || {
+        printf 'REFUSED: COMPASS_GPU_GATE_DONE=%s is not the full sha of a commit here.\n' "$COMPASS_GPU_GATE_DONE" >&2
         exit 93
     }
-    [ "$G" = "$SHA" ] || { printf '%s\n' "$G"; git -C "$ROOT" diff --name-only "$G" HEAD; } >"$STAGE/ATOM/.compass-gpu-carry"
+    [ "$G" = "$SHA" ] || { printf '%s\n%s\n' "$G" "$SHA"; git -C "$ROOT" diff --name-only "$G" HEAD; } >"$STAGE/ATOM/.compass-gpu-carry"
 fi
 
 git -C "$ROOT" archive --format=tar --prefix=ATOM/ HEAD >"$TAR"
 tar -rf "$TAR" -C "$STAGE" ATOM/.compass-commit ATOM/.compass-changed
-[ ! -e "$STAGE/ATOM/.compass-gpu-carry" ] || tar -rf "$TAR" -C "$STAGE" ATOM/.compass-gpu-carry
+tar -rf "$TAR" -C "$STAGE" ATOM/.compass-gpu-carry
 
 printf 'wrote %s\n' "$TAR"
 printf '  commit:  %s\n' "$SHA"
 printf '  base:    %s (%s)\n' "${BASE:0:9}" "$REF"
 printf '  changed: %s file(s)\n' "$(grep -c . "$STAGE/ATOM/.compass-changed")"
-[ ! -e "$STAGE/ATOM/.compass-gpu-carry" ] || printf '  carry:   %s\n' "$(head -1 "$STAGE/ATOM/.compass-gpu-carry")"
+[ ! -s "$STAGE/ATOM/.compass-gpu-carry" ] || printf '  carry:   %s\n' "$(head -1 "$STAGE/ATOM/.compass-gpu-carry")"
 printf '\nExtract with:\n'
 printf '  mkdir -p <dir> && tar -x -C <dir> -f %s\n' "$(basename "$TAR")"
 printf 'then run <dir>/ATOM/scripts/compass/gate_cpu.sh\n'

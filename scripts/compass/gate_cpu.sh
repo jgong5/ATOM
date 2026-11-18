@@ -393,16 +393,16 @@ if [ -n "$GPU_NEEDED" ]; then
         printf '  any tree. Rebuild the snapshot with scripts/compass/snapshot.sh.\n' >&2
         finish 98 "COMPASS_GPU_GATE_DONE cannot be checked; this tree has no commit"
     fi
-    # A GPU gate passed on tree G carries here when the diff from G, git's or
-    # snapshot.sh's .compass-gpu-carry stamp (G, then the diff), hits no trigger.
+    # A GPU gate passed on full sha G carries here when the diff from G, git's or
+    # snapshot.sh's .compass-gpu-carry stamp (G, HEAD, the diff), hits no trigger.
     G=$DONE CARRY= WHY= HITS=
     if [ "$DONE" = "$HEAD_SHA" ]; then :
     elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-        { G=$(git -C "$ROOT" rev-parse --verify --quiet "$DONE^{commit}") &&
-            CARRY=$(git -C "$ROOT" diff --name-only "$G" HEAD); } || WHY="$DONE names no commit here"
-    elif [ -r "$ROOT/.compass-gpu-carry" ]; then
-        { read -r G; CARRY=$(cat); } <"$ROOT/.compass-gpu-carry"
-        [ "$G" = "$DONE" ] || WHY="the .compass-gpu-carry stamp is for $G"
+        { [ "$(git -C "$ROOT" rev-parse --verify --quiet "$DONE^{commit}")" = "$DONE" ] &&
+            CARRY=$(git -C "$ROOT" diff --name-only "$G"); } || WHY="$DONE is not the full sha of a commit here"
+    elif [ -s "$ROOT/.compass-gpu-carry" ]; then
+        { read -r G; read -r TO; CARRY=$(cat); } <"$ROOT/.compass-gpu-carry"
+        [ "$G $TO" = "$DONE $HEAD_SHA" ] || WHY="the .compass-gpu-carry stamp carries $G to $TO"
     else
         WHY="the snapshot has no .compass-gpu-carry stamp; stage it with COMPASS_GPU_GATE_DONE set"
     fi

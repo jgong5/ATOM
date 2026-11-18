@@ -182,10 +182,10 @@ suite checks.
    `COMPASS_GPU_GATE_DONE=<sha>` is absent or names a different tree whose diff from this
    one touches a trigger — and also when it cannot determine the diff at all (no git, no
    `COMPASS_CHANGED_FILES`) or cannot name the tree the attestation would apply to. A GPU
-   gate passed on tree G carries to a later tree whose `git diff --name-only G HEAD` touches
-   no trigger: landing G first already allows that tree, so the blind spot does not grow.
-   A snapshot carries that diff in the `.compass-gpu-carry` stamp `snapshot.sh` writes; with
-   no stamp for G it is refused. An unanswerable question is refused, not answered "no".
+   gate passed on tree G carries to a later tree whose diff from G touches no trigger:
+   landing G first already allows that tree, so the blind spot does not grow. G is a full
+   sha; a snapshot carries the diff in the `.compass-gpu-carry` stamp `snapshot.sh` writes,
+   and with no stamp from G to its own HEAD it is refused. An unanswerable question is refused, not answered "no".
    The previous form of this rule was a prose list of areas — "EPLB, DP metadata,
    cudagraph bounds, block tables" — which both missed modules and named two the CPU gate
    does cover.

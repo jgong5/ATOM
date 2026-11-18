@@ -39,13 +39,16 @@ def repo(tmp_path):
     return root, _commit(root, BLIND, "g = 1\n")
 
 
-def _snapshot_gate(root, staged_with, done):
-    out = root.parent / "out"
-    out.mkdir()
-    snap = _run(root, f"COMPASS_GPU_GATE_DONE={staged_with} {SNAPSHOT} {out}")
+def _snapshot_gate(root, staged_with, done, into=None):
+    tars = root.parent / "tars"
+    tars.mkdir(exist_ok=True)
+    snap = _run(root, f"COMPASS_GPU_GATE_DONE={staged_with} {SNAPSHOT} {tars}")
     assert snap.returncode == 0, snap.stdout + snap.stderr
-    subprocess.run(["tar", "-x", "-C", out, "-f", *out.glob("compass-*.tar")], check=True)
-    return _run(out / "ATOM", f"COMPASS_GPU_GATE_DONE={done} {{gate}}")
+    into = into or root.parent / "out"
+    into.mkdir(exist_ok=True)
+    tar = tars / f"compass-{_git(root, 'rev-parse', 'HEAD')[:9]}.tar"
+    subprocess.run(["tar", "-x", "-C", into, "-f", tar], check=True)
+    return _run(into / "ATOM", f"COMPASS_GPU_GATE_DONE={done} {{gate}}")
 
 
 @pytest.mark.parametrize("touch, rc", [("atom/other.py", 0), (BLIND, 98)])
@@ -61,27 +64,49 @@ def test_a_snapshot_carries_the_gate_only_over_a_diff_with_no_trigger(repo, touc
 
 @pytest.mark.parametrize("staged_with, why", [
     ("", "no .compass-gpu-carry stamp"),
-    ("feature/atomcompass_new", "stamp is for "),
+    ("base", "stamp carries "),
 ])
 def test_a_snapshot_without_a_stamp_for_g_does_not_carry(repo, staged_with, why):
     root, g = repo
     _commit(root, "atom/other.py", "h = 2\n")
+    if staged_with:
+        staged_with = _git(root, "rev-parse", "feature/atomcompass_new")
     out = _snapshot_gate(root, staged_with, g)
     assert out.returncode == 98, out.stdout + out.stderr
     assert why in out.stdout.splitlines()[-1], out.stdout
 
 
-@pytest.mark.parametrize("named, rc", [(True, 0), (False, 98)])
-def test_a_checkout_carries_the_gate_by_its_own_diff(repo, named, rc):
+def test_a_stamp_left_by_an_earlier_extraction_does_not_carry(repo, tmp_path):
+    root, g = repo
+    _commit(root, "atom/other.py", "h = 2\n")
+    assert _snapshot_gate(root, g, g, tmp_path / "x").returncode == 0
+    _commit(root, BLIND, "h = 3\n")
+    out = _snapshot_gate(root, "", g, tmp_path / "x")
+    assert out.returncode == 98, out.stdout + out.stderr
+
+
+@pytest.mark.parametrize("done, rc", [("g", 0), ("f" * 40, 98), ("HEAD", 98), ("@", 98), ("short", 98)])
+def test_a_checkout_carries_the_gate_of_a_full_sha_by_its_own_diff(repo, done, rc):
     root, g = repo
     head = _commit(root, "atom/other.py", "h = 2\n")
-    done = g if named else "f" * 40
+    done = {"g": g, "short": g[:9]}.get(done, done)
     out = _run(root, f"COMPASS_GPU_GATE_DONE={done} {{gate}}")
     assert out.returncode == rc, out.stdout + out.stderr
-    assert named == (f"{g[:9]} carried to {head[:9]}" in out.stdout), out.stdout
+    assert (rc == 0) == (f"{g[:9]} carried to {head[:9]}" in out.stdout), out.stdout
 
 
-def test_snapshot_refuses_a_gated_sha_that_names_no_commit(repo):
-    root, _ = repo
-    out = _run(root, f"COMPASS_GPU_GATE_DONE={'f' * 40} {SNAPSHOT} {root.parent}")
+def test_a_checkout_does_not_carry_over_an_uncommitted_trigger_edit(repo):
+    root, g = repo
+    _commit(root, "atom/other.py", "h = 2\n")
+    (root / BLIND).write_text("g = 2\n")
+    out = _run(root, f"COMPASS_GPU_GATE_DONE={g} {{gate}}")
+    assert out.returncode == 98, out.stdout + out.stderr
+    assert f"touches a trigger: {BLIND} -> {BLIND}" in out.stdout
+
+
+@pytest.mark.parametrize("short", [False, True])
+def test_snapshot_refuses_a_gated_value_that_is_not_a_full_sha(repo, short):
+    root, g = repo
+    done = g[:9] if short else "f" * 40
+    out = _run(root, f"COMPASS_GPU_GATE_DONE={done} {SNAPSHOT} {root.parent}")
     assert out.returncode == 93, out.stdout + out.stderr
