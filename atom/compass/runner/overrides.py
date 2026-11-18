@@ -1867,6 +1867,38 @@ def _time_target(runner: Any, batch: Any) -> None:
     metrics.poll()
 
 
+#: A file of a real record's stalled forwards a simulated run replays
+#: (`replayed_stall`), as `python -m atom.compass.validate.stalls RUN OUT` writes it.
+REPLAY_STALLS = "COMPASS_REPLAY_STALLS"
+
+
+def replayed_stall(runner: Any, view: Any, host: Any) -> float:
+    """The seconds of `REPLAY_STALLS`' stalls this rank's prefill step `view`
+    replays: every one of this DP rank's stalls whose time, from the run's
+    first forward, the engine clock (`host.now`) has reached and no earlier
+    step replayed. A what-if that attributes a simulated run's error to the
+    real run's stalls, not a price: 0 s unset, with no clock, or on a step
+    that prefills nothing."""
+    path = os.environ.get(REPLAY_STALLS)
+    now = getattr(host, "now", None)
+    if not path or now is None or view is None:
+        return 0.0
+    state = vars(runner).get("_replay_stalls")
+    if state is None:
+        with open(path) as f:
+            stalls = json.load(f)["stalls"]
+        rank = view.dp_rank or 0
+        mine = sorted((s["t_s"], s["seconds"]) for s in stalls if s["rank"] == rank)
+        state = vars(runner)["_replay_stalls"] = (now(), collections.deque(mine))
+    first, pending = state
+    if all(r.decode for r in view.requests):
+        return 0.0
+    seconds, at = 0.0, now() - first
+    while pending and pending[0][0] <= at:
+        seconds += pending.popleft()[1]
+    return seconds
+
+
 def _group_step_seconds(
     runner: Any,
     batch: Any,
@@ -1927,8 +1959,9 @@ def _group_step_seconds(
     `MTP_SEGMENT` and `PP_RECV_SEGMENT`, the part of `W_launch` before a
     later stage's receive, in seconds, each 0.0 where the law has none, and `skipped`,
     those its `skip` charged as 0; `device_s` and `draft_s`, the backend's
-    target and draft price; `charge_s`, those composed with host time (their
-    sum with no host);
+    target and draft price, the target's with any `replayed_stall`, which
+    ``replayed_stall_s`` then states; `charge_s`, those composed with host
+    time (their sum with no host);
     `group_s`, its DP group target; `terms`, each one's `name`, `seconds`
     and its provenance's `method`, `validated` and `source`; and `refused`,
     the ``cost:`` reason or None. Above them, `forward` starts the file with
@@ -1998,6 +2031,8 @@ def _group_step_seconds(
         mix.record(cost)
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
         terms = (*cost.terms, *cost.draft_terms)
+    stall_s = 0.0 if refused else replayed_stall(runner, view, host)
+    device_s += stall_s
     # `decide` returns the collective's rows for a group of one too.
     many = mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1
     group = dp_group() if many else None
@@ -2058,6 +2093,7 @@ def _group_step_seconds(
         **segments,
         "device_s": device_s,
         "draft_s": draft_s,
+        **({"replayed_stall_s": stall_s} if stall_s else {}),
         "charge_s": charge_s,
         "group_s": group_s,
         "terms": [
