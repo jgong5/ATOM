@@ -61,3 +61,40 @@ def test_a_set_qhull_refuses_in_its_order_is_hulled_whole():
     hull = Hull("the fit's hull", NAMES, _hull(POINTS, NAMES))
 
     assert all(hull.contains(tuple(p)) for p in POINTS)
+
+
+def test_a_set_qhull_refuses_in_both_orders_is_hulled_joggled(monkeypatch):
+    """#3720's pooled prefill points failed qhull's precision checks in both
+    orders; a set that spans every free feature is then hulled joggled, and the
+    hull still holds every point."""
+    import scipy.spatial
+
+    real, options = scipy.spatial.ConvexHull, []
+
+    def strict(points, qhull_options=None):
+        options.append(qhull_options)
+        if qhull_options != "QJ":
+            raise QhullError("QH7086 Qhull precision warning: repartition")
+        return real(points, qhull_options=qhull_options)
+
+    monkeypatch.setattr(scipy.spatial, "ConvexHull", strict)
+    hull = Hull("the fit's hull", NAMES, _hull(POINTS, NAMES))
+
+    assert options == [None, None, "QJ"]
+    assert all(hull.contains(tuple(p)) for p in POINTS)
+
+
+def test_a_flat_set_qhull_refuses_is_not_joggled(monkeypatch):
+    """A set that spans fewer features than it varies in still raises: a joggle
+    would hull a flat set as a full one."""
+    import scipy.spatial
+
+    def refuse(points, qhull_options=None):
+        raise QhullError("QH6154 Qhull precision error: initial simplex is flat")
+
+    monkeypatch.setattr(scipy.spatial, "ConvexHull", refuse)
+    rng = np.random.default_rng(0)
+    a, b = rng.uniform(1, 100, 30), rng.uniform(1, 100, 30)
+    flat = np.column_stack([a, b, a + 2 * b])  # the third a sum of the others
+    with pytest.raises(QhullError):
+        _hull(flat, ("x", "y", "z"))

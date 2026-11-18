@@ -1485,8 +1485,10 @@ def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing, fold
 def _hull(points: np.ndarray, names: tuple[str, ...], affine: bool = True) -> dict:
     """`StepLinearLaw`'s hull over the non-intercept features of the fitted steps.
     qhull's precision checks depend on the order the points come in: where it
-    refuses them, it hulls their distinct points in sorted order, the same hull.
-    A set that spans none still raises. A feature affine in an earlier one on
+    refuses them, it hulls their distinct points in sorted order, the same hull,
+    and where it refuses those too and they span every free feature, it hulls
+    them joggled (`QJ`), each facet then moved out to hold every point. A set
+    that spans none still raises. A feature affine in an earlier one on
     the set is held to it by two opposed facets, as a constant one is by
     `equal`, unless `affine` is false: then qhull refuses that flat set."""
     from scipy.spatial import ConvexHull, QhullError
@@ -1517,7 +1519,20 @@ def _hull(points: np.ndarray, names: tuple[str, ...], affine: bool = True) -> di
             try:
                 hulled = ConvexHull(unit[:, free]).equations
             except QhullError:
-                hulled = ConvexHull(np.unique(unit[:, free], axis=0)).equations
+                distinct = np.unique(unit[:, free], axis=0)
+                try:
+                    hulled = ConvexHull(distinct).equations
+                except QhullError:
+                    # #3720: real_pw_c128 + real_pw_c1's prefill points, 8
+                    # features, failed both orders on a precision check.
+                    spans = distinct - distinct.mean(axis=0)
+                    if np.linalg.matrix_rank(spans) < len(free):
+                        raise
+                    hulled = ConvexHull(distinct, qhull_options="QJ").equations
+                    # A joggled facet may cut a point by the joggle: each moves
+                    # out by its largest cut, so the hull holds every point.
+                    cut = (distinct @ hulled[:, :-1].T + hulled[:, -1]).max(axis=0)
+                    hulled[:, -1] -= np.maximum(cut, 0.0)
         eq = np.zeros((len(hulled), len(vary) + 1))
         eq[:, free], eq[:, -1] = hulled[:, :-1], hulled[:, -1]
         for j, (i, sign) in tied.items():  # u_j = u_i, or u_j = 1 - u_i
