@@ -342,6 +342,18 @@ def device_arch() -> str:
     return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
 
 
+def graph_engine(config) -> dict:
+    """The engine config an `op_graph` of `config` is keyed by: the one a step
+    law is keyed by (`run.step_grid.keyed`) less its ladder and compilation
+    level, since every trace runs eager at level 0 and serves a run at any
+    level."""
+    from atom.compass.run.step_grid import LEVEL, keyed
+
+    engine = keyed(config, ladder=False)
+    engine.pop(LEVEL, None)
+    return engine
+
+
 def structure(
     config,
     phase: str,
@@ -354,11 +366,10 @@ def structure(
 ) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the arch of `device`, else
-    `device_arch()`, the engine config a step law is keyed by less its ladder
-    and compilation level (`run.step_grid.keyed`; a trace runs eager at level 0),
-    which names every variable that picks a kernel and
-    a drafter's method and width, its performance environment `env` when given,
-    as an engine file states one, else this process's, the TP width, the DP
+    `device_arch()`, its engine config (`graph_engine`), which names every
+    variable that picks a kernel and a drafter's method and width, its
+    performance environment `env` when given, as an engine file states one,
+    else this process's, the TP width, the DP
     width and the EP group's when they are set, the phase and the mode,
     `config`'s unless `eager` names it, ``no output`` unless the step produces
     output (`output`), and ``draft`` for the drafter's part of the step
@@ -367,11 +378,9 @@ def structure(
     two-batch-overlap micro-batch (`micro_batch`), which ATOM runs otherwise
     than a whole step of its shape."""
     from atom.compass.run import _file_digest
-    from atom.compass.run.step_grid import LEVEL, keyed
 
     digest = _file_digest(config.model, "config.json")
-    engine = keyed(config, ladder=False)
-    engine.pop(LEVEL, None)
+    engine = graph_engine(config)
     if env is not None:
         engine["env"] = env
     engine = json.dumps(engine, sort_keys=True, separators=(",", ":"))

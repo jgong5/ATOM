@@ -127,7 +127,9 @@ MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
         Axis.DEVICE: INDEPENDENT,
         Axis.PTL: INDEPENDENT,
         Axis.HOST_CPU: INDEPENDENT,
-        Axis.ENGINE_CONFIG: Cell(True, "level, cudagraph mode"),
+        Axis.ENGINE_CONFIG: Cell(
+            True, "a step law's less its ladder and level, and the cudagraph mode"
+        ),
     },
     Row.PRICE_LIST: {
         Axis.SOFTWARE_STACK: DEPENDS,

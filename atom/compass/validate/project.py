@@ -75,10 +75,11 @@ class Reads:
 
 def cell(model: str, tp: int, machine: dict, store: str, record: str, atom_args):
     """One cell priced at both granularities on the spec document `machine`:
-    its report per granularity, the model's and engine's identity, its step
-    records' digest and the spec fields its prices read."""
+    its report per granularity, the model's identity, the engine config its
+    op graphs are keyed by (`capture.forward.graph_engine`), its step records'
+    digest and the spec fields its prices read."""
+    from atom.compass.capture.forward import graph_engine
     from atom.compass.run import _file_digest
-    from atom.compass.run.step_grid import keyed
 
     spec = Reads(MachineSpec.from_mapping(machine))
     config, _, priced = bound.backends(model, tp, atom_args, spec, store, [record])
@@ -95,7 +96,7 @@ def cell(model: str, tp: int, machine: dict, store: str, record: str, atom_args)
         levels[level] = {k: r[k] for k in (*held, "draft_s")} | {"tokens_per_s": rate}
     return {
         "model": _file_digest(config.model, "config.json"),
-        "engine": keyed(config, ladder=False),
+        "engine": graph_engine(config),
         "steps": f"sha256:{steps.hexdigest()}",
         "levels": levels,
         "read": sorted(spec.read),
