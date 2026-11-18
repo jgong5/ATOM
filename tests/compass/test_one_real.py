@@ -47,3 +47,17 @@ def test_runs_given_other_client_arguments_exit_2(tmp_path):
 
     assert done.returncode == 2
     assert "other client arguments" in done.stderr
+
+
+def test_tails_name_each_simulated_error_against_the_real_run_s_block_interval(
+    tmp_path,
+):
+    real = _run(tmp_path / "real1", 4)
+    sim = _run(tmp_path / "step_linear", 4, scale=1.1, server=False)
+
+    done = _one_real(real, sim)
+
+    assert done.returncode == 0, done.stderr
+    (line,) = [x for x in done.stdout.splitlines() if x.startswith("real tails")]
+    assert "TTFT p99 ms" in line and "p90 TTFT" in line and "TPOT p90 ms" in line
+    assert "step_linear +10.0%" in line

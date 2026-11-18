@@ -18,7 +18,10 @@ and p90 (aiperf's inter-token latency, per request) and E2E latency p50, in
 milliseconds, and the requests counted. Every run must have been given the
 same client arguments. Below the table it names REAL's stalled forwards over
 its graded window (`atom.compass.validate.stalls`): seconds the real run lost
-to one DP rank's slow launch, which a simulated run does not charge. Then, per
+to one DP rank's slow launch, which a simulated run does not charge. Then
+REAL's own 95% interval of TTFT p99, p90 TTFT and TPOT p90 over resamples of
+its sends' 60 s blocks, and whether each SIM's error lies inside it
+(`tails`): a tail holds a few bursts' worth of requests. Then, per
 SIM, its requests paired with REAL's by conversation and turn (`paired`): a
 percentile of each run is a rank statistic over its own request set, and E2E's
 middle is sparse (#3720 c=8: 3.5% of requests within 5% of the median), so its
@@ -98,6 +101,7 @@ def main(argv: list[str]) -> int:
         errs = "".join(f"{error(values[0], v):>18}" for v in values[1:])
         print(f"{name:34}{shown}{errs}")
     print(stalled(real))
+    print(tails(real, sims, rows))
     for sim in sims:
         print(paired(real, sim))
     print(json.dumps(rows))
@@ -138,6 +142,55 @@ def paired(real: Path, sim: Path) -> str:
         f"{sim.name}: E2E paired over the {len(both)} requests both ran: median "
         f"ratio {ratio - 1:+.1%}, on totals {total - 1:+.1%}; real E2E p50's own "
         f"95% interval {lo:+.1%}..{hi:+.1%}"
+    )
+
+
+#: The tail percentiles `tails` gives an interval, as `run_metrics` names them,
+#: and the width of the send-time blocks it resamples, in seconds.
+TAILS = {
+    "TTFT p99 ms": ("time_to_first_token", 99),
+    "p90 TTFT": ("time_to_first_token", 90),
+    "TPOT p90 ms": ("inter_token_latency", 90),
+}
+BLOCK_S = 60
+
+
+def tails(real: Path, sims: list[Path], rows: dict) -> str:
+    """The 95% interval of `real`'s own TTFT p99, p90 and TPOT p90 over
+    `RESAMPLES` resamples of `BLOCK_S`-second blocks of its requests' sends,
+    and which of `sims`' errors (one_real's table, `rows`) fall inside it. A
+    tail is set by a few events, each holding requests sent together: a client
+    burst whose follow-ups miss their prefix on the rank the router picks
+    (#3720 c=64: the 41 requests sent 300 s into the window held 2.4M new
+    tokens in the real run, 3.6M and 4.9M in two simulated ones), so the
+    blocks resample the events, where a resample of requests would not."""
+    blocks = {}
+    for r in profiled(read_jsonl(real / RECORDS)):
+        sent = r.get("metadata", {}).get("request_start_ns")
+        if sent is None:
+            return "real: no request_start_ns, no tail interval"
+        blocks.setdefault(int(sent) // int(BLOCK_S * 1e9), []).append(r)
+    keys, rng, out = sorted(blocks), random.Random(SEED), []
+    for name, (field, p) in TAILS.items():
+        values = {k: _positive(_metric(r, field) for r in blocks[k]) for k in keys}
+        mine = percentile([v for k in keys for v in values[k]], p)
+        draws = sorted(
+            percentile(
+                [v for k in rng.choices(keys, k=len(keys)) for v in values[k]], p
+            )
+            for _ in range(RESAMPLES)
+        )
+        lo, hi = (draws[int(q * (RESAMPLES - 1))] / mine - 1 for q in (0.025, 0.975))
+        errs = [
+            f"{s.name} {e:+.1%} {'in' if lo <= e <= hi else 'OUT'}"
+            for s in sims
+            if None not in (rows["real"][name], rows[s.name][name])
+            for e in [rows[s.name][name] / rows["real"][name] - 1]
+        ]
+        out.append(f"{name} {lo:+.1%}..{hi:+.1%} ({', '.join(errs)})")
+    return (
+        f"real tails' own 95% interval over {len(keys)} {BLOCK_S} s send blocks: "
+        + "; ".join(out)
     )
 
 
