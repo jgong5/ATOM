@@ -28,6 +28,7 @@ from atom.compass import run as compass_run
 from atom.compass.artifacts import Key, Kind, keyed_platform
 from atom.compass.backends.step_labels import digest
 from atom.compass.backends.step_linear_fit import (
+    _intakes,
     fit_host,
     fit_intake,
     fit_tokenizer,
@@ -408,6 +409,42 @@ def test_the_intake_hull_spans_bodies_past_the_lone_requests_both_ways(tmp_path)
     stamped(tmp_path, burst=(40_000, 600_000, 50_000))
     term, report = fit_intake([tmp_path / "steps" / compass_run.INTAKE_RECORD])
     assert term["bytes"] == [9000, 600_000] and report["samples"] == 8
+
+
+def test_requests_lone_after_two_that_overlap_fit_with_their_pool_rendered_template(
+    tmp_path,
+):
+    # Two requests whose app calls both come before either body (one app call
+    # then names both), a metrics scrape's app call with no body, then lone
+    # requests whose template a pool thread renders: each lone request's
+    # seconds are its loop CPU time plus that render's wall.
+    t, cpu, lines, expect = 10**12, 0, [], []
+    lines += [_stamp("app", t, t), _stamp("app", t + 10, t + 10)]
+    for k in range(2):
+        s = t + 1000 * (k + 1)
+        lines += [_stamp("body", s, s + 100, 5000)]
+        lines += [_stamp("tmpl", s + 200, s + 300, 5000)]
+        lines += [_stamp("prep", s + 400, s + 500, thread=2)]
+        lines += [_stamp("send", s + 600, s + 700)]
+    for k, size in enumerate(np.linspace(30_000, 400_000, 8).astype(int).tolist()):
+        t += 10**9
+        loop, render = round((IDLE + PER_BYTE * size) * 1e9), 300_000 + 2 * size
+        w, p, e = t + 9000 + render, t + 10_000 + render, t + 60_000 + render
+        lines += [_stamp("app", t - 5000, t - 5000)]  # a scrape
+        lines += [
+            _stamp("app", t, t, cpu=(cpu, cpu)),
+            _stamp("body", t + 1000, t + 2000, size, (cpu + 1000, cpu + 2000)),
+            _stamp("tmpl", t + 3000, t + 3000 + render, size, thread=POOL[0]),
+            _stamp("wait", w, w + 41_000, 0, (cpu + 5000,) * 2),
+            _stamp("prep", p, p + 30_000, thread=POOL[1]),
+            _stamp("send", e, e + 10_000, 0, (cpu, cpu + loop)),
+        ]
+        expect.append((size, (loop + render) * 1e-9))
+        cpu += loop + 10**6
+    path = tmp_path / compass_run.INTAKE_RECORD
+    path.write_text("\n".join(lines) + "\n")
+    lone, bursts, sizes = _intakes(path)
+    assert lone == pytest.approx(expect) and not bursts and len(sizes) == 10
 
 
 @pytest.mark.parametrize(

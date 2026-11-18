@@ -661,11 +661,12 @@ def _span(fitted: dict, name: str) -> list:
 
 def _stamps(path) -> list[tuple]:
     """The HTTP intake stamps `path` holds (`atom.compass.run.INTAKE_RECORD`),
-    each ``(start ns, end ns, kind, size, start cpu ns, end cpu ns)``, in order
-    of start."""
+    each ``(start ns, end ns, kind, size, start cpu ns, end cpu ns, thread)``,
+    in order of start."""
     rows = [line.split() for line in Path(path).read_text().splitlines()]
     return sorted(
-        (int(r[3]), int(r[0]), r[2], int(r[4]), int(r[6]), int(r[5])) for r in rows
+        (int(r[3]), int(r[0]), r[2], int(r[4]), int(r[6]), int(r[5]), int(r[1]))
+        for r in rows
     )
 
 
@@ -727,39 +728,48 @@ def _intakes(path) -> tuple[list, list, list]:
     ns)`` per request, and every request's body bytes.
 
     A request is its app call and the body, template, pool job and engine send
-    that follow it. A lone one found every earlier request sent and its own
-    sent before the next app call, with nothing else stamped between: its
-    seconds are the CPU time the loop's thread spent from the app call to the
-    send's end, less what it spent from its pool job's submit to its resume
-    (``wait``), the job's and other requests' work. A burst is a run of requests each of whose app call came
-    before the template of the one ahead of it began, the loop taking them in
-    one after another."""
+    that follow it. A lone one found every request whose body was read before
+    its app call sent, and its own sent before the next app call, with nothing
+    else stamped between: its seconds are the CPU time the loop's thread spent
+    from the app call to the send's end, less what it spent from its pool job's
+    submit to its resume (``wait``), the job's and other requests' work; and,
+    where its template was rendered on another thread, that render's wall
+    time, which the loop awaits and the template job, charging only its encode
+    calls, does not price. A burst is a run of requests each of whose app call
+    came before the template of the one ahead of it began, the loop taking them
+    in one after another, its templates rendered on the loop's thread, the only
+    one whose CPU clock their gaps read."""
     ev = _stamps(path)
     # Arrays, searched once per request: np.searchsorted converts a list on
     # every call, which over a c=128 agentic record's two million stamps (an
     # `out` per streamed row) made this loop O(requests x stamps).
     at = np.array([e[0] for e in ev], dtype=np.int64)
-    cpu = {e[0]: e[4] for e in ev if e[2] == "app"}
+    cpu = {e[0]: (e[4], e[6]) for e in ev if e[2] == "app"}
     calls, sends = _requests(ev)
     called = np.array(calls, dtype=np.int64)
+    # Requests are counted by their bodies: two whose app calls both precede
+    # either's body share one in `calls`, so a count of `calls` falls behind
+    # the sends for the rest of the record and no later request is lone.
+    read = np.array(sorted(e[0] for e in ev if e[2] == "body"), dtype=np.int64)
     lone = []
-    for i, (call, after) in enumerate(zip(calls, calls[1:] + [math.inf])):
+    for call, after in zip(calls, calls[1:] + [math.inf]):
         span = ev[np.searchsorted(at, call, "right") : np.searchsorted(at, after)]
         # An output taken in or a head sent is the output's or the response's.
         skip = ("app", "recv", "wait", "out", "head")
         between = [e for e in span if e[2] not in skip]
         waits = sum(e[5] - e[4] for e in span if e[2] == "wait")
-        if np.searchsorted(sends, call) != i or [e[2] for e in between] != [
-            "body",
-            "tmpl",
-            "prep",
-            "send",
-        ]:
+        if np.searchsorted(sends, call) != np.searchsorted(read, call) or [
+            e[2] for e in between
+        ] != ["body", "tmpl", "prep", "send"]:
             continue
-        body, *_, send = between
-        lone.append((body[3], (send[5] - cpu[call] - waits) * 1e-9))
-    # The loop renders each request's template as soon as its body is read.
-    tmpl = [e for e in ev if e[2] == "tmpl"]
+        body, tmpl, _, send = between
+        start, loop = cpu[call]
+        seconds = send[5] - start - waits + (tmpl[1] - tmpl[0]) * (tmpl[6] != loop)
+        lone.append((body[3], seconds * 1e-9))
+    # The loop renders each request's template as soon as its body is read;
+    # since the API server hands it to a thread, no gap of theirs is the loop's.
+    loops = {e[6] for e in ev if e[2] == "app"}
+    tmpl = [e for e in ev if e[2] == "tmpl" and e[6] in loops]
     sizes = [e[3] for e in sorted(ev, key=lambda e: e[1]) if e[2] == "body"]
     # A template whose start finds a later request arrived and not yet rendered.
     queued = [np.searchsorted(called, t[0]) > k + 1 for k, t in enumerate(tmpl)]
