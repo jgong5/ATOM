@@ -1690,11 +1690,11 @@ and `fit host` read them unchanged and the leave-one-run-out folds hold the real
    p50 and p90 there, each drawn from those rows within ten percentiles of its level by the
    record's own seed; in a group of r rows a rank, at most 80% of the rank's KV pool over r.
    Prompts are cut from trace messages and sent once, so the prefix cache holds them.
-2. *Sweep.* At each rung `step_linear_plan.py::scheduled_rungs` gives, and on a gap in the
-   ladder also at the smallest batch that replays it, four groups: all rows at each level,
-   and one at the top level over the rest at the bottom. A group's rows are sent at once,
-   each its session's prompt and a few new tokens, `ignore_eos`, `max_tokens` about 40
-   decode steps at the forced acceptance length.
+2. *Sweep.* At each rung `step_linear_plan.py::scheduled_rungs` gives, the eager one at the
+   bound, and on a gap in the ladder also at the smallest batch that replays it, four
+   groups: all rows at each level, and one at the top level over the rest at the bottom.
+   A group's rows are sent at once, each its session's prompt and a few new tokens,
+   `ignore_eos`, `max_tokens` about 40 decode steps at the forced acceptance length.
 3. *DP.* Every request names its rank by `data_parallel_rank`, which the chat route takes
    ahead of session affinity
    (`atom/model_engine/engine_core_mgr.py::CoreManager._select_dp_rank_for_seq_locked`).
