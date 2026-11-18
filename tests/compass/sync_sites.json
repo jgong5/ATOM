@@ -5343,9 +5343,9 @@
    "expr": "sock.recv_multipart(zmq.NOBLOCK)",
    "shape": "socket_recv",
    "peer": "process",
-   "why": "the lmcache_mp shell reads every transfer reply already at a writer rank's DEALER without blocking, and holds each until released",
+   "why": "the lmcache_mp shell reads every transfer reply already at its DP rank's DEALER without blocking, and holds each until released",
    "mechanism": "K5",
-   "mechanism_why": "the engine end of lmcache->engine:transfer#dpN.tpK, received inline by the step loop in process_completions"
+   "mechanism_why": "the engine end of lmcache->engine:transfer#dpN, received inline by the step loop in process_completions"
   },
   {
    "id": "atom/compass/kv/lmcache_mp.py::clocked_adapter.Future.wait::self.query()::event_poll#0",
