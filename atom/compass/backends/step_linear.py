@@ -75,7 +75,7 @@ the law holds no vector for, a decode-phase dummy every rank of its group runs
 Every term is `estimated`, but a vector's stating `declared`, the origin of one
 fitted on another subject: those are `declared`, with that note, never validated.
 Each vector carries the convex hull of the features
-it was fitted on. A step outside it is priced by the same vector, its terms'
+it was fitted on, the `EAGER_DUMMY` indicators left out (`hull_axes`). A step outside it is priced by the same vector, its terms'
 source is `EXTRAPOLATED` and their detail names the hull; it is not refused.
 A vector may also carry, under `held_out`, the hull of the steps
 `step_linear_fit` priced with a law fitted on the other records and their
@@ -216,12 +216,13 @@ class _Vector:
                     "is a non-negative duration"
                 )
         self.coefficients = tuple(float(coefficients[f]) for f in features)
-        # The intercept, first in `features`, is not a hull coordinate.
-        self.hull = Hull(f"the {name} hull", features[1:], spec["hull"])
+        # The intercept, first in `features`, is not a hull coordinate, nor is
+        # an `EAGER_DUMMY` column, an indicator (`hull_axes`).
+        self.axes = hull_axes(features)
+        axes = tuple(features[i] for i in self.axes)
+        self.hull = Hull(f"the {name} hull", axes, spec["hull"])
         held = spec.get("held_out")
-        self.held_out = held and Hull(
-            f"the {name} held-out hull", features[1:], held["hull"]
-        )
+        self.held_out = held and Hull(f"the {name} held-out hull", axes, held["hull"])
         self.features = features
         self.declared = str(spec.get("declared", "")).strip()
         self.rowmod = int(spec["rowmod"]) if "rowmod" in features else None
@@ -274,6 +275,14 @@ def token_padding(view: BatchView, buckets: tuple[int, ...]) -> int | None:
     if peak is None:
         return None
     return next((b - tokens for b in buckets if b >= peak), 0)
+
+
+def hull_axes(features) -> tuple[int, ...]:
+    """The positions in `features` of a vector's hull coordinates: all but the
+    intercept, first, and the `EAGER_DUMMY` indicators, which a hull in their
+    extra dimensions would only split into its 0 and 1 faces, at a cost
+    qhull's facet count grows by."""
+    return tuple(i for i, f in enumerate(features) if i and f not in EAGER_DUMMY)
 
 
 def dummy_view(view: BatchView) -> BatchView:
@@ -544,10 +553,11 @@ class StepLinearBackend(CostBackend):
     def _priced(self, law, vector: _Vector, kind: str, counts: tuple, what: str):
         """`vector`'s terms for a step of features `counts`."""
         detail, source = law.fitted_on, SOURCE
-        if not vector.hull.contains(counts[1:]):
+        point = tuple(counts[i] for i in vector.axes)
+        if not vector.hull.contains(point):
             source = EXTRAPOLATED
             detail = f"{detail}; outside the {what}{vector.name} hull"
-        validated = bool(vector.held_out and vector.held_out.contains(counts[1:]))
+        validated = bool(vector.held_out and vector.held_out.contains(point))
         method = Method.DECLARED if vector.declared else Method.ESTIMATED
         return [
             CostTerm(

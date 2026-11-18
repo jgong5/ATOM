@@ -239,6 +239,7 @@ from atom.compass.backends.step_linear import (
     cached_seqs,
     dummy_view,
     eager_dummy,
+    hull_axes,
     moe_column,
     moe_tokens,
     rowmod,
@@ -1758,8 +1759,10 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     for r, keep in zip(members, kept)
                     if keep
                 ]
+                axes = list(hull_axes(features))
                 hull = _hull(
-                    np.array(points, dtype=np.float64)[:, 1:], tuple(features[1:])
+                    np.array(points, dtype=np.float64)[:, axes],
+                    tuple(features[i] for i in axes),
                 )
             except (ValueError, QhullError) as e:
                 law["unfitted"][k] = str(e).splitlines()[0]
@@ -2144,10 +2147,12 @@ def mark_held_out(
         if vector is None or not mine:
             continue
         points = [_counts(vector, routing, *r[3]) for r in mine]
+        names = tuple(vector["coefficients"])
+        axes = list(hull_axes(names))
         try:
             hull = _hull(
-                np.array(points, dtype=np.float64)[:, 1:],
-                tuple(vector["coefficients"])[1:],
+                np.array(points, dtype=np.float64)[:, axes],
+                tuple(names[i] for i in axes),
             )
         except (ValueError, QhullError):
             continue
