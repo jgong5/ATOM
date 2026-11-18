@@ -26,8 +26,9 @@ torch, every field assumed. None, or several, refuse, listing them.
 its key and token.
 
 A command that prices reads its platform through `compose`: the datasheet
-it names, the one entry S holds for that device (`readings`), and, across
-nodes, a network file, composed by `layers.composed`.
+it names, the one entry S holds for that device (`readings`), else the one
+committed for a shipped law's platform (`COPIES`), and, across nodes, a
+network file, composed by `layers.composed`.
 """
 
 import argparse
@@ -67,6 +68,10 @@ PROG = "compass fit device"
 #: The rank a readings entry's one member is written at.
 RANK = Topology().ranks()[0]
 PP = "interconnect.intra_node.pp"
+#: A shipped law's platform's readings entry, as the readable copy `--out`
+#: gets, one per key and named by its token, read where a store holds none
+#: (`05` D24).
+COPIES = ROOT.parents[1] / "scripts/compass/laws/platform_readings"
 
 
 def fold(records: Mapping[str, dict]) -> tuple[dict, dict]:
@@ -143,23 +148,23 @@ def _records(store: ArtifactStore, tokens: list[str]) -> tuple[dict, dict]:
 
 def readings(
     store: ArtifactStore, device: str, ptl: str, stack: str | None = None
-) -> tuple[Key, dict]:
+) -> tuple[Key, dict, str]:
     """The one `platform_readings` entry `store` holds for `device`, `<name>
-    <arch>`, at PTL state `ptl` and, when given, at `stack` (`stack_of`), and
-    its document; none or several refuse, listing each."""
+    <arch>`, at PTL state `ptl` and, when given, at `stack` (`stack_of`), its
+    document and where it was read; with none in `store`, the one copy
+    `COPIES` holds at them. None or several refuse, listing each."""
     folder = store.root / Kind.PLATFORM_READINGS.value
     keys = [
         Key.of(Kind.PLATFORM_READINGS, **json.loads(p.read_text())["key"])
         for p in sorted(folder.glob("[!.]*/entry.json"))
     ]
-    found = [
-        k
-        for k in keys
-        if (k.values["device"], k.values["ptl"]) == (device, ptl)
-        and stack in (None, stack_of(k.values))
-    ]
+    found = [k for k in keys if _at(k, device, ptl, stack)]
+    held, copies = len(found), {} if found else _copies()
+    if not held:
+        found = [k for k in copies if _at(k, device, ptl, stack)]
     if len(found) != 1:
         at = f" at {stack}" if stack else ""
+        committed = "" if held else f", and {COPIES} {len(found)} committed copies"
         listed = "".join(f"; {stack_of(k.values)} as {k.token()}" for k in found)
         remedy = (
             "--stack names one"
@@ -168,11 +173,32 @@ def readings(
             "publish one"
         )
         raise ValueError(
-            f"{store.root} holds {len(found)} platform_readings entries for "
-            f"{device} at PTL {ptl}{at}{listed}; {remedy}"
+            f"{store.root} holds {held} platform_readings entries for {device} at "
+            f"PTL {ptl}{at}{committed}{listed}; {remedy}"
         )
+    if not held:
+        path, document = copies[found[0]]
+        return found[0], document, str(path)
     body = store.read(found[0]).read_member("readings", RANK, "json")
-    return found[0], json.loads(body)
+    return found[0], json.loads(body), str(store.root)
+
+
+def _copies() -> dict:
+    """Each copy `COPIES` holds, by its key: its path and its entry's document."""
+    copies = {}
+    for path in sorted(COPIES.glob("*.json")):
+        copy = json.loads(path.read_text())
+        key = Key.of(Kind.PLATFORM_READINGS, **copy.pop("key"))
+        del copy["token"]
+        copies[key] = (path, copy)
+    return copies
+
+
+def _at(key: Key, device: str, ptl: str, stack: str | None) -> bool:
+    return (key.values["device"], key.values["ptl"]) == (device, ptl) and stack in (
+        None,
+        stack_of(key.values),
+    )
 
 
 def compose(
@@ -183,12 +209,13 @@ def compose(
     network_file: str | Path | None = None,
 ) -> MachineSpec:
     """The machine spec of the datasheet `device` names, by SKU or path, the
-    one readings entry `store` holds for it at `ptl` and `stack` (`readings`),
-    and the network file `network_file` names, when it names one."""
+    one readings entry `store` holds for it at `ptl` and `stack`, else the one
+    committed (`readings`), and the network file `network_file` names, when it
+    names one."""
     sheet = datasheet(device)
-    key, document = readings(store, _device(sheet), ptl, stack)
+    key, document, source = readings(store, _device(sheet), ptl, stack)
     net = None if network_file is None else network(network_file)
-    return composed(sheet, key, document, net)
+    return composed(sheet, key, document, net, source)
 
 
 def assumed_entry(
@@ -199,7 +226,7 @@ def assumed_entry(
     device never run takes it, `assumed`'s readings every one assumed, and the
     datasheet stating `device`."""
     source = _named(device)
-    found, document = readings(store, _device(source), ptl, stack)
+    found, document, _ = readings(store, _device(source), ptl, stack)
     if document["provenance"]["origin"] != "probed":
         raise ValueError(
             f"{found} as {found.token()} is assumed itself; assume from a "

@@ -1,0 +1,256 @@
+{
+ "key": {
+  "device": "MI355X gfx950",
+  "software_stack": "rocm 7.2.4 / aiter 41d4d8d7e / rccl 2.27.7",
+  "ptl": "disabled",
+  "torch": "2.10.0+rocm7.2.4.git3d3aa833"
+ },
+ "token": "8f44fdb6fc43",
+ "schema_version": 1,
+ "name": "MI355X gfx950 readings",
+ "provenance": {
+  "authored_by": "compass fit device",
+  "date": "2026-11-16",
+  "origin": "probed",
+  "origins": {
+   "device.compute.attainable_flops.bf16": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 1560073615402445.8,
+    "p90": 1637450305008140.0
+   },
+   "device.compute.attainable_flops.fp4": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 5388702422460210.0,
+    "p90": 5654713641770838.0
+   },
+   "device.compute.attainable_flops.fp8": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 3247365551981723.0,
+    "p90": 3393551808525333.0
+   },
+   "device.kernel_floor_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 1.5488379359245299e-06,
+    "p90": 1.569049000740051e-06
+   },
+   "device.memory.bandwidth_curve": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5"
+   },
+   "device.profiler_floor_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 3.918999999999869e-06,
+    "p90": 4.159000000000559e-06
+   },
+   "interconnect.host_link.bandwidth_bytes_per_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 56254772058.75675,
+    "p90": 57089208999.89596
+   },
+   "interconnect.host_link.latency_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 8.3600003272295e-06,
+    "p90": 8.99999961256981e-06
+   },
+   "interconnect.intra_node.attainable_bandwidth_bytes_per_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 60794886311.239174,
+    "p90": 60870583540.787186
+   },
+   "interconnect.intra_node.link_latency_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 7.625665724277497e-07,
+    "p90": 9.153474628925323e-07
+   },
+   "interconnect.intra_node.pp.gloo.eager_threshold_bytes": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 0,
+    "p90": 0
+   },
+   "interconnect.intra_node.pp.gloo.latency_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 4.323164466768503e-05,
+    "p90": 4.323164466768503e-05
+   },
+   "interconnect.intra_node.pp.gloo.overhead_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 1.644689719463162e-05,
+    "p90": 1.644689719463162e-05
+   },
+   "interconnect.intra_node.pp.gloo.per_byte_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 5.826884066599996e-11,
+    "p90": 5.826884066599996e-11
+   },
+   "interconnect.intra_node.pp.gloo.rendezvous_fixed_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 6.0731718905301525e-05,
+    "p90": 6.0731718905301525e-05
+   },
+   "interconnect.intra_node.pp.gloo.wake_rise_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 1.5505354665777167,
+    "p90": 1.5505354665777167
+   },
+   "interconnect.intra_node.pp.gloo.wake_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 8.198243294505482e-05,
+    "p90": 8.198243294505482e-05
+   },
+   "interconnect.intra_node.pp.rccl.eager_threshold_bytes": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 33554432,
+    "p90": 33554432
+   },
+   "interconnect.intra_node.pp.rccl.latency_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 9.906943887472153e-07,
+    "p90": 9.906943887472153e-07
+   },
+   "interconnect.intra_node.pp.rccl.overhead_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 3.5543167501001596e-05,
+    "p90": 3.5543167501001596e-05
+   },
+   "interconnect.intra_node.pp.rccl.per_byte_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 1.7431446415714182e-11,
+    "p90": 1.7431446415714182e-11
+   },
+   "interconnect.intra_node.pp.rccl.rendezvous_fixed_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5",
+    "p10": 4.632741976384374e-05,
+    "p90": 4.632741976384374e-05
+   }
+  },
+  "notes": "folded from the probe records of crsuse2-m2m-v3-005 as fc8520e4b8e5"
+ },
+ "device.compute.attainable_flops.bf16": 1610318385636217.2,
+ "device.compute.attainable_flops.fp4": 5577181123738024.0,
+ "device.compute.attainable_flops.fp8": 3321449138517325.0,
+ "device.kernel_floor_s": 1.5581759810447693e-06,
+ "device.memory.bandwidth_curve": [
+  [
+   4096,
+   2443190925.564872
+  ],
+  [
+   8192,
+   4871412585.312303
+  ],
+  [
+   16384,
+   9738026146.950672
+  ],
+  [
+   32768,
+   19183807771.10862
+  ],
+  [
+   65536,
+   36615432789.60451
+  ],
+  [
+   131072,
+   73224385884.41727
+  ],
+  [
+   262144,
+   146220793376.09595
+  ],
+  [
+   524288,
+   281448827622.03784
+  ],
+  [
+   1048576,
+   558502143586.5511
+  ],
+  [
+   2097152,
+   1070675433554.4302
+  ],
+  [
+   4194304,
+   1904588567596.9478
+  ],
+  [
+   8388608,
+   3037598622727.9395
+  ],
+  [
+   16777216,
+   4083169365318.936
+  ],
+  [
+   33554432,
+   5131937778941.383
+  ],
+  [
+   67108864,
+   5844627971181.23
+  ],
+  [
+   134217728,
+   6063747597362.929
+  ],
+  [
+   268435456,
+   6140426577448.386
+  ],
+  [
+   536870912,
+   6335542868534.516
+  ],
+  [
+   1073741824,
+   6450098311291.031
+  ],
+  [
+   2147483648,
+   6500475707803.461
+  ],
+  [
+   4294967296,
+   6525154135295.33
+  ]
+ ],
+ "device.profiler_floor_s": 4.03899999999976e-06,
+ "interconnect.host_link.bandwidth_bytes_per_s": 57077360429.27361,
+ "interconnect.host_link.latency_s": 8.60000029206276e-06,
+ "interconnect.intra_node.attainable_bandwidth_bytes_per_s": 60858967552.1852,
+ "interconnect.intra_node.link_latency_s": 8.593179881572724e-07,
+ "interconnect.intra_node.pp.gloo.eager_threshold_bytes": 0,
+ "interconnect.intra_node.pp.gloo.latency_s": 4.323164466768503e-05,
+ "interconnect.intra_node.pp.gloo.overhead_s": 1.644689719463162e-05,
+ "interconnect.intra_node.pp.gloo.per_byte_s": 5.826884066599996e-11,
+ "interconnect.intra_node.pp.gloo.rendezvous_fixed_s": 6.0731718905301525e-05,
+ "interconnect.intra_node.pp.gloo.wake_rise_s": 1.5505354665777167,
+ "interconnect.intra_node.pp.gloo.wake_s": 8.198243294505482e-05,
+ "interconnect.intra_node.pp.rccl.eager_threshold_bytes": 33554432,
+ "interconnect.intra_node.pp.rccl.latency_s": 9.906943887472153e-07,
+ "interconnect.intra_node.pp.rccl.overhead_s": 3.5543167501001596e-05,
+ "interconnect.intra_node.pp.rccl.per_byte_s": 1.7431446415714182e-11,
+ "interconnect.intra_node.pp.rccl.rendezvous_fixed_s": 4.632741976384374e-05
+}
