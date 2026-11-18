@@ -3,8 +3,9 @@
 them: each step prices as a backend new to it does, while each leaf's
 signature, and the work of a leaf whose work reads nothing of the step, is
 taken once over the run, the work of a leaf whose work reads the step only
-where the list declines it, and a step at a view priced before asks the list
-nothing; and a backend keeps alive the graphs of no more steps than a run's
+where the list declines it, a leaf whose answer reads nothing the steps move
+is asked at a graph's first two steps alone, and a step at a view priced
+before asks the list nothing; and a backend keeps alive the graphs of no more steps than a run's
 graph lookup keeps graphs.
 """
 
@@ -104,8 +105,9 @@ def test_steps_price_as_new_while_each_leaf_is_signed_and_worked_out_once(
     # attention's work at the first step and where the list declines it
     assert works == {VIEW: 1, GEMM: 1, ATTENTION: 2}
     assert len(signed) == 2
-    # the GEMM and attention once a step, but at the view priced before
-    assert len(asked) == 2 * len(set(CONTEXTS))
+    # the GEMM at the graph's first two steps, its answer reading no row's
+    # context; attention once a step, but at the view priced before
+    assert len(asked) == 2 + len(set(CONTEXTS))
 
 
 class _Region(dict):
