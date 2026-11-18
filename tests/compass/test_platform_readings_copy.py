@@ -3,8 +3,8 @@
 `scripts/compass/laws/platform_readings/` as the readable copy `compass fit
 device` writes, named by its key's token: every command that reads a readings
 entry reads it where its store holds none at the device, PTL state and stack
-it reads, and the spec it composes names the store or file it read (`05`
-D24, `13` D80's `--stack`)."""
+it reads, and the spec it composes names the store or file it read; several
+copies at one device and PTL state take `--stack`."""
 
 import json
 import shutil

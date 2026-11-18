@@ -69,8 +69,7 @@ PROG = "compass fit device"
 RANK = Topology().ranks()[0]
 PP = "interconnect.intra_node.pp"
 #: A shipped law's platform's readings entry, as the readable copy `--out`
-#: gets, one per key and named by its token, read where a store holds none
-#: (`05` D24).
+#: gets, one per key and named by its token, read where a store holds none.
 COPIES = ROOT.parents[1] / "scripts/compass/laws/platform_readings"
 
 
