@@ -2,32 +2,37 @@
 """`compass run`: one simulated instance's server, serving whatever client runs
 reach it until it is stopped, with run.json recording what grading reads.
 
-    compass run <backend> --machine M --store S [--host-laws KEY|LAW]
-        [--coverage INPUT...] [--on-refusal mark|abort] [--step-roofline]
-        [--acceptance-record RECORD] --out D -- <ATOM args>
+    compass run <backend> --device DEV --ptl PTL [--stack STACK] --store S
+        [--host-laws KEY|LAW] [--coverage INPUT...] [--on-refusal mark|abort]
+        [--step-roofline] [--acceptance-record RECORD] --out D -- <ATOM args>
 
     compass run --join RUN_FILE --out D -- <ATOM args>
 
-    compass run <backend> --machine M --store S [--host-laws KEY] ... --check
-        -- <ATOM args>
+    compass run <backend> --device DEV --ptl PTL --store S [--host-laws KEY]
+        ... --check [prefill|decode] -- <ATOM args>
 
-`runfile` builds the run file from the flags, the backend exactly one with no
-default, and `serve` starts the server simulated from it with the step record
-on. `--out` holds what `serve` writes and what the run writes there: each DP
-rank's step record and cost lines, the step table, the run summary and each
-LP's hand-in.
+`runfile` builds the run file from the flags, the platform composed from
+`--device`'s datasheet and the readings `--store` holds for it at `--ptl` and
+at the stack the backend's and host laws' entries state, or `--stack` where
+they state none (`runfile.spec`), the backend exactly one with no default, and
+`serve` starts the server simulated from it with the step record on, and
+ATOM's GPU forward timer unless the environment sets it (`timer_env`). `--out`
+holds what `serve` writes and what the run writes there: each DP rank's step
+record and cost lines, the step table, the run summary and each LP's hand-in.
 
 `--join` names a deployment's run file in place of every flag but `--out`: the
 server joins the clock authority its ``clock_endpoint`` names, which writes the
 step table, the run summary and the hand-ins in its ``out_dir``, and grading
 reads them there. `scripts/compass/deploy.sh` builds that file, starts the
 authority and joins each instance to it. A prefill or a decode instance shares a
-clock with its peer, so it refuses without `--join`.
+clock with its peer, so it refuses without `--join`, but under `--check` with
+its side named; a plain `--check` of its arguments refuses, naming that side's.
 
 `--coverage` names record directories and `shape_population` tokens whose steps
 the backend's coverage check reads before the server starts: the step grid's
 is `step_grid_plan.coverage`, over the bundle `step_grid.load` loads under the
-config ATOM's arguments resolve. An input whose DP rank's engine file (a
+config ATOM's arguments resolve on the machine spec's device arch (`_config`).
+An input whose DP rank's engine file (a
 record's `steps/dp<r>.engine.json`, a population's `engine` member) states
 another `SHAPING` field than that config refuses first, naming each field and
 both values. The check refuses no step: it counts those the grid extrapolates
@@ -39,7 +44,19 @@ micro-batches, and a run file that names no price list refuses. Another backend
 has no check, and refuses `--coverage`.
 
 `--check` starts no server: it lists every input the run lacks and the command
-that makes each, exiting 1 when one is lacking (`lacking`); it takes no `--out`.
+that makes each, exiting 1 when one is lacking (`lacking`); its `--out` is the
+directory a step linear law's printed calibration writes, and it writes none.
+`--check prefill` or `--check decode` checks that side of a deployment, its
+flags and ATOM arguments as `deploy.sh run` takes them, so `--network` names a
+deployment across nodes. Its ATOM arguments gain the `--kv-transfer-config` the
+script adds, the side's KV role on the simulated connector, and it reads the
+environment the script starts the side in, `AITER_LOG_LEVEL` WARNING when
+unset or empty (`side_env`), so it resolves the config the side's instance
+runs. A `--kv-transfer-config` among them refuses, as the script refuses one. The
+readings command it prints takes Mooncake's connector in the simulated one's
+place, as `deploy.sh record` starts the side: a real start has no clock to
+build the simulated one on. It names `AITER_LOG_LEVEL` when the check set it,
+since the readings key holds it.
 
 `--acceptance-record` names a speculative `compass record` directory: its
 histograms' rates (`measured`) go to ATOM as ``--spec-decode-acceptance-rates``,
@@ -58,6 +75,7 @@ member an engine read states, empty when every one was measured.
 
 import argparse
 import json
+import os
 import re
 import tempfile
 from collections import Counter, defaultdict
@@ -86,6 +104,16 @@ SHAPING = (*BOUNDS, "ladder", "tensor_parallel_size")
 #: A number standing alone in a reason, which `op_coverage` masks so one cause
 #: at many steps' counts is one reason; a kernel's name keeps its digits.
 NUMBER = r"(?<![\w.])\d+(?:\.\d+)?"
+#: The KV role `scripts/compass/deploy.sh` gives each side's instance.
+ROLES = {"prefill": "kv_producer", "decode": "kv_consumer"}
+#: The connector a side runs on: `deploy.sh run`'s simulated one, and the one
+#: a real start of it takes, `deploy.sh record`'s.
+SIMULATED, REAL = "compass", "mooncake"
+#: The ATOM argument naming a side's connector, which deploy.sh adds.
+KV_FLAG = "--kv-transfer-config"
+#: ATOM's GPU forward timer, which CI's `pd_server_atom.sh` turns on for both
+#: sides unless set, as a simulated server's start does (`timer_env`).
+DEVICE_TIMER = "ATOM_ENABLE_METRICS_DEVICE_TIMER"
 
 
 def main(argv: list[str]) -> None:
@@ -105,10 +133,22 @@ def main(argv: list[str]) -> None:
             f"--coverage: --{key.replace('_', '-')} has no coverage check; only "
             "--step-grid's and --op-graph's steps are checked"
         )
-    runfile.pd_side(atom_args, refuse=True)
+    if args.check in ROLES:
+        serve._refuse(atom_args)
+        env = side_env(os.environ)
+        os.environ.update(env)
+        sides = [side_args(args.check, atom_args, c) for c in (SIMULATED, REAL)]
+        raise SystemExit(lacking.report(args, *sides, env))
     if args.check:
+        if side := runfile.pd_side(atom_args):
+            name = lacking.SIDES[side]
+            raise ValueError(
+                f"{KV_FLAG} makes this a {name} instance: check it with --check "
+                f"{name}, without its {KV_FLAG}, which the check adds as deploy.sh does"
+            )
         serve._refuse(atom_args)
         raise SystemExit(lacking.report(args, atom_args))
+    runfile.pd_side(atom_args, refuse=True)
     if not args.out:
         parser.error("the following arguments are required: --out")
     run = runfile.build(args, atom_args)
@@ -121,20 +161,23 @@ def main(argv: list[str]) -> None:
         ]
         run[compass_run.ACCEPTANCE_RECORD] = str(Path(record).resolve())
     report = check(args.coverage, run, atom_args) if args.coverage else None
-    serve.serve(atom_args, args.out, run=run)
+    serve.serve(atom_args, args.out, run=run, extra_env=timer_env(os.environ))
     write_grading(args.out, report)
 
 
 def join(args, atom_args, side) -> None:
     """Serve one instance of a deployment whose authority already runs, from
-    its run file `args.join`, and record what grading reads for its `side`."""
+    its run file `args.join` and with `timer_env`'s variables, and record what
+    grading reads for its `side`."""
     run = json.loads(Path(args.join).read_text())
     if not {"clock_endpoint", "out_dir"} <= run.keys():
         raise ValueError(
             f"--join {args.join} names no clock_endpoint and out_dir; a "
             "deployment's run file names its authority and its directory"
         )
-    serve.serve(atom_args, args.out, run=run, joined=True)
+    serve.serve(
+        atom_args, args.out, run=run, extra_env=timer_env(os.environ), joined=True
+    )
     write_grading(args.out, None, side)
 
 
@@ -161,11 +204,43 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--check",
-        action="store_true",
-        help="list every input the run lacks, and start no server",
+        nargs="?",
+        const=True,
+        choices=tuple(ROLES),
+        help="list every input the run lacks, and start no server; of that side "
+        "of a deploy.sh deployment when one is named",
     )
     p.add_argument("--out", help="an empty directory for the run's files and logs")
     return p
+
+
+def side_args(side: str, atom_args, connector: str) -> list[str]:
+    """ATOM's arguments `atom_args` of a deployment's `side`, as deploy.sh takes
+    them, with the `KV_FLAG` it adds: the side's KV role on `connector`. One
+    among them refuses, as the script refuses it; the one added overrides
+    another spelling, as the script's does."""
+    for arg in atom_args:
+        if arg.startswith(KV_FLAG):
+            raise ValueError(
+                f"{arg} is among the {side} side's ATOM arguments; --check {side} "
+                f"adds its {KV_FLAG}, as deploy.sh does"
+            )
+    kv = {"kv_role": ROLES[side], "kv_connector": connector}
+    return [*atom_args, KV_FLAG, json.dumps(kv)]
+
+
+def side_env(env) -> dict:
+    """The variables deploy.sh's `compass_env` (scripts/compass/_lib.sh) sets
+    over the environment `env` it starts a side in: AITER_LOG_LEVEL WARNING
+    where `env` has it unset or empty."""
+    return {} if env.get("AITER_LOG_LEVEL") else {"AITER_LOG_LEVEL": "WARNING"}
+
+
+def timer_env(env) -> dict:
+    """The variables a simulated server starts with over the environment
+    `env`: `DEVICE_TIMER` 1 where `env` has it unset or empty, so the server's
+    GPU forward histograms hold each step's predicted device seconds."""
+    return {} if env.get(DEVICE_TIMER) else {DEVICE_TIMER: "1"}
 
 
 def measured(record, atom_args, ranks: int) -> list[float]:
@@ -184,8 +259,14 @@ def measured(record, atom_args, ranks: int) -> list[float]:
     files = sorted(
         (Path(record) / serve.STEPS).glob(compass_run.ACCEPTANCE_FILE.format("*"))
     )
+    names = {compass_run.ACCEPTANCE_FILE.format(r) for r in range(ranks)}
+    if files and (missing := sorted(names - {p.name for p in files})):
+        raise ValueError(
+            f"--acceptance-record: {record} holds no {', '.join(missing)}, and "
+            f"ATOM's arguments run {ranks} DP ranks"
+        )
     counts = Counter()
-    for path in files:
+    for path in (p for p in files if p.name in names):
         held = json.loads(path.read_text())
         if held["draft_tokens"] != width:
             raise ValueError(
@@ -199,30 +280,25 @@ def measured(record, atom_args, ranks: int) -> list[float]:
             f"--acceptance-record: {record} holds no accepted-draft histogram; "
             "a speculative record writes one per DP rank in its steps"
         )
-    names = {compass_run.ACCEPTANCE_FILE.format(r) for r in range(ranks)}
-    if missing := sorted(names - {p.name for p in files}):
-        raise ValueError(
-            f"--acceptance-record: {record} holds no {', '.join(missing)}, and "
-            f"ATOM's arguments run {ranks} DP ranks"
-        )
     return [sum(n for a, n in counts.items() if a > i) / rows for i in range(width)]
 
 
 def check(inputs, run: dict, atom_args) -> dict:
     """The coverage of the steps `inputs` hold by the step grid or the op
     graph's price list the run file `run` names, loaded under the config
-    `atom_args` resolve; an input that ran under other `SHAPING` fields
-    refuses."""
+    `atom_args` resolve on its machine's device arch; an input that ran under
+    other `SHAPING` fields refuses."""
     if run.get(OP_GRAPH) and PRICE_LIST not in run:
         raise ValueError(
             "--coverage: the store holds no price_list at this run's key, so "
             "the op graph prices every leaf by its roofline and no step is "
             "covered; compass fit ops publishes one"
         )
-    store, config = ArtifactStore(run["store"]), _config(atom_args)
+    machine = compass_run._machine(run)
+    store = ArtifactStore(run["store"])
+    config = _config(atom_args, machine.value("device.arch"))
     here = step_grid.keyed(config) | {name: getattr(config, name) for name in BOUNDS}
     steps = [s for name in inputs for s in _steps(name, store, here, config.enable_tbo)]
-    machine = compass_run._machine(run)
     if run.get(OP_GRAPH):
         # ATOM's MoE shards no experts without expert parallelism.
         ep = _ep_width(atom_args, machine) if config.enable_expert_parallel else 1
@@ -309,9 +385,9 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
     """The steps of the record directory or `shape_population` token `name`,
     less DP's dummy runs, each named `<name> dp<r> step <n>`; a rank whose
     engine states other `SHAPING` fields than `here` refuses, naming each.
-    Whatever a line states, its `tbo_tokens` is, on a data-parallel step under
-    two-batch overlap (`tbo`, ATOM's `enable_tbo`), the split `bound._split`
-    agrees over every rank's line at that step, else None."""
+    Whatever a line states, its `tbo_tokens` is, under two-batch overlap
+    (`tbo`, ATOM's `enable_tbo`), the split `bound._split` agrees over every
+    rank's line at that step, one rank's included, else None."""
     path = Path(name)
     if (path / serve.RUN_JSON).is_file():
         records = {
@@ -341,9 +417,9 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
         rank: {s["step"]: s for s in map(json.loads, text.splitlines())}
         for rank, (text, _) in sorted(records.items())
     }
-    # One rank is no DP group; dummy runs join the split, and a step some rank
-    # lacks splits none, as `trace ops --population` reads it.
-    every = set.intersection(*map(set, at.values())) if tbo and len(at) > 1 else ()
+    # Dummy runs join the split, and a step some rank lacks splits none, as
+    # `trace ops --population` reads it.
+    every = set.intersection(*map(set, at.values())) if tbo and at else ()
     splits = {n: _split([r[n] for r in at.values()]) for n in every}
     return [
         (f"{name} dp{rank} step {n}", line | {"tbo_tokens": splits.get(n)})
@@ -353,11 +429,33 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
     ]
 
 
-def _config(atom_args):
-    """ATOM's `Config` for a server's arguments, as the server runs it."""
+def _config(atom_args, arch: str | None = None):
+    """ATOM's `Config` for a server's arguments, as the server runs it; with
+    `arch`, as it runs on a device of that arch (`_declared`)."""
+    if arch is not None:
+        from transformers.dynamic_module_utils import init_hf_modules
+
+        from atom.compass.bench.ops import _child
+
+        # A model's remote code loads in the child, which writes it to
+        # transformers' module cache; its config classes load here from there.
+        init_hf_modules()
+        return _child(_declared, atom_args, arch)
     from atom.compass.bench.measure import atom_config
 
     return atom_config(atom_args, server=True)
+
+
+def _declared(atom_args, arch: str):
+    """`_config` of `atom_args` in a process that declares a device of `arch`
+    before aiter loads: aiter resolves its fp8 dtype at import from the device
+    it finds, ``uint8`` where it finds none, and ATOM's quantization config
+    holds that dtype, which its hash keys."""
+    from atom.compass.capture import driverless
+
+    with tempfile.TemporaryDirectory(prefix="compass-run-config-") as tmpdir:
+        driverless.install(tmpdir, arch)
+        return _config(atom_args)
 
 
 def write_grading(out, report, side=None) -> None:

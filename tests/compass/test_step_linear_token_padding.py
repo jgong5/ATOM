@@ -153,16 +153,22 @@ def _dp_priced(rows, moe, peak):
 DP = 4
 
 
-def _dp_groups(seed, n=200):
+def _dp_groups(seed, n=200, far=False):
     """Prefill steps of `DP` ranks, each with its group's step, the max over
     its ranks' prices: rank `i % DP` the slowest, at 1000 to 7000 tokens, the
-    others at 30 to 90% of its tokens, padded to its bucket."""
+    others at 30 to 90% of its tokens, padded to its bucket; `far`, the
+    slowest at 2000 to 7000 tokens and the others at 16 to 1000."""
     rng = np.random.default_rng(seed)
     out = []
     for i in range(n):
-        ranks, slow = [], int(rng.integers(1000, 7000))
+        ranks, slow = [], int(rng.integers(2000 if far else 1000, 7000))
         for r in range(DP):
-            q = slow if r == i % DP else int(slow * rng.uniform(0.3, 0.9))
+            if r == i % DP:
+                q = slow
+            elif far:
+                q = int(rng.integers(16, 1000))
+            else:
+                q = int(slow * rng.uniform(0.3, 0.9))
             history = int(rng.integers(0, 2)) * int(rng.integers(0, 9000))
             ranks.append([(q, q + history, False)])
         moe = sum(rows[0][0] for rows in ranks)
@@ -221,6 +227,18 @@ def test_a_data_parallel_step_pads_every_rank_to_its_groups_largest(tmp_path):
     unknown = _view([(100, 100, False)], moe_rows=3100)
     with pytest.raises(CostRefused, match="no group_max_tokens on this data-parallel"):
         backend.price(unknown)
+
+
+def test_a_data_parallel_fit_whose_short_ranks_pad_far_recovers_its_law(tmp_path):
+    # Each short rank pads by over 1000 tokens: solved on every rank's row, each
+    # labelled with its group's step, its `padding` takes up the slowest rank's label.
+    law = _law_of(tmp_path, _dp_records(tmp_path, _dp_groups(0, far=True)))
+
+    prefill = law["prefill"]
+    expected = {k: DP_PADDED[k] for k in prefill["coefficients"]}
+    assert prefill["coefficients"] == pytest.approx(expected, rel=1e-6)
+    assert prefill["fit"]["passes"]["F"] == pytest.approx(0.0, abs=1e-12)
+    assert prefill["fit"]["dropped"] == 0
 
 
 def test_an_mtp_record_s_draft_law_adds_no_padding(tmp_path):

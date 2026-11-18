@@ -25,6 +25,7 @@ import pytest
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
+from atom.compass.backends.json_file import read_json
 from atom.compass.run.step_grid import keyed
 from tests.compass.held_ports import held_ports
 
@@ -33,11 +34,8 @@ TREE = Path(__file__).resolve().parents[2]
 #: cache dtype each is keyed to.
 LAWS = {
     index: [
-        json.loads(
-            (
-                TREE
-                / f"scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-{machine}-{side}.json"
-            ).read_text()
+        read_json(
+            TREE / f"scripts/compass/laws/deepseek-v4-pro-dpa8-mi355x-{machine}-{side}.json.xz"
         )
         for side in ("prefill", "decode")
     ]

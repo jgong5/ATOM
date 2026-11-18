@@ -48,7 +48,9 @@ refuses, naming it. Its member `MEMBER` holds the view, `seconds` (the median
 of the bench's kept repeats, under a drafter of their target's parts, and
 `draft_seconds` that of their drafter's parts), the repeats, the protocol,
 the replay rule, the origin, the inputs it came from (`sources`) and the
-`traces` their lines served. A batch the rule or the bench refuses is not
+`traces` their lines served, and `group_needs_eager`, true, where the bench
+ran the batch eagerly because an attention backend refused it a graph, as a
+step-record line states it. A batch the rule or the bench refuses is not
 published; the command measures the rest, then fails naming each. `<out>`
 also holds run.json, with the warm-up's and the measuring's boundaries, the
 engine file and the GPU checks.
@@ -56,6 +58,9 @@ engine file and the GPU checks.
 The bench holds the largest KV pool its inputs' engines state, whatever this
 device's own budget gives, so every batch they ran, and every point planned
 for that pool, fits it.
+
+The API server's flags `compass record` serves with (`measure_memory.FRONTEND`)
+are taken and dropped; any other flag ATOM's engine lacks refuses.
 """
 
 import argparse
@@ -81,7 +86,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.step_grid_plan import plan
 from atom.compass.backends.step_labels import digest as file_digest
-from atom.compass.backends.step_linear_fit import token_band
+from atom.compass.backends.step_linear_fit import recorded_level, token_band
 from atom.compass.bench import ragged
 from atom.compass.drive.gpu import add_gpu_flag, hip_visible, kfd_pid, quiet
 from atom.compass.drive.identity import identity, phase
@@ -295,27 +300,40 @@ def _sampling(text: str) -> dict:
 
 def atom_config(atom_args, server: bool = False):
     """ATOM's `Config` for its arguments, as `LLMEngine` resolves one and
-    `CoreManager` rewrites it under DP attention, each TP rank a DP rank of TP 1.
+    `CoreManager` rewrites it under DP attention, each TP rank a DP rank of TP 1:
+    a server's node runs the DP ranks `CoreManager` starts there, and the
+    benches run the whole group on one host.
     With `server`, `atom_args` are a server's, whose own flags pass unread, and
-    no tokenizer loads; otherwise any flag the engine does not define refuses,
-    and the config gets the tokenizer's ids and the end-of-sequence id apart
-    from the stop ids."""
+    no tokenizer loads; otherwise the server's flags `compass record` passes it
+    (`measure_memory.FRONTEND`) are taken and dropped, any other flag the engine
+    does not define refuses, and the config gets the tokenizer's ids and the
+    end-of-sequence id apart from the stop ids."""
     import dataclasses
 
     from atom.compass.bench.ranks import layout
+    from atom.compass.drive.measure_memory import FRONTEND
     from atom.compass.drive.runfile import _engine_args
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
+    from atom.model_engine.engine_core_mgr import iter_dp_rank_assignments
     from atom.model_engine.llm_engine import _load_tokenizer
 
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
+    for flag, kind in FRONTEND.items():
+        parser.add_argument(flag, **kind)
     parsed = _engine_args(atom_args) if server else parser.parse_args(atom_args)
     engine_args = EngineArgs.from_cli_args(parsed)
     names = {f.name for f in dataclasses.fields(Config)}
     kwargs = engine_args._get_engine_kwargs().items()
     config = Config(engine_args.model, **{k: v for k, v in kwargs if k in names})
     if config.enable_dp_attention:
+        # The engines `CoreManager` starts on this node, each its (global,
+        # local) DP rank, the first the node's lowest.
+        node = iter_dp_rank_assignments(config)
         layout(config)
+        if server:
+            config.parallel_config.data_parallel_size_local = len(node)
+            config.parallel_config.data_parallel_rank = node[0][0]
     if server:
         return config
     tokenizer = _load_tokenizer(config.model, config.trust_remote_code)
@@ -416,8 +434,9 @@ def grid_plan(args, read: dict, views=()) -> dict:
 
 def _read(name: str, store, client_runs, sessions, engine, sampling, against=AGAINST):
     """The input `name`: what names it as a source, its kept lines, and the
-    engine its rank states. One whose engine or sampling is not `engine` or
-    `sampling` refuses, naming what states those as `against` does."""
+    engine its rank states. One whose engine, a record's over its level
+    (`recorded_level`), or sampling is not `engine` or `sampling` refuses,
+    naming what states those as `against` does."""
     path = Path(name)
     with tempfile.TemporaryDirectory() as unpacked:
         if (path / "run.json").is_file():
@@ -440,7 +459,7 @@ def _read(name: str, store, client_runs, sessions, engine, sampling, against=AGA
             )
         ((rank, lines),) = record.items()
         stated = json.loads((steps / f"dp{rank}.engine.json").read_text())
-    ran = keyed_of(stated)
+    ran = recorded_level(path / "steps" / "dp0.jsonl") | keyed_of(stated)
     differ = [
         k for k in sorted(ran.keys() | engine.keys()) if ran.get(k) != engine.get(k)
     ]
@@ -559,6 +578,8 @@ def _measure(bench, config, sampling, store, command, readings, todo) -> list[st
             "sources": sorted(point["sources"]),
             "traces": sorted(point["traces"]),
         } | ({"plan": point["plan"]} if "plan" in point else {})
+        if got.get("group_needs_eager"):
+            member["group_needs_eager"] = True
         roots = roots or roots_for({"atom": "atom", "aiter": "aiter"})
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         store.publish(

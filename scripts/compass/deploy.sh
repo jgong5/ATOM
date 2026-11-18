@@ -8,7 +8,8 @@
 #
 # Usage: deploy.sh OUT run|record <flags> --prefill [<own>] -- <ATOM args> --decode [<own>] -- <ATOM args> --router -- <router args>
 #   OUT            the deployment's directory, absent or empty
-#   <flags>        run: `compass run`'s run-file flags: the backend, --machine,
+#   <flags>        run: `compass run`'s run-file flags: the backend, --device,
+#                  --ptl, --network across nodes,
 #                  --store, ... (atom/compass/drive/runfile.py); record: the
 #                  `compass record` flags both instances take, e.g. --gpu
 #   <own>          that instance's own `compass record` flags, e.g. --gpu, or
@@ -40,7 +41,7 @@
 #   WAIT_S         seconds each instance and the router have to answer, and
 #                  the deployment to leave once stopped (default 600)
 #   PREFIX_S       seconds --on's prefix has to start the decode's command,
-#                  and to send it a stop (default 60)
+#                  to show its environment, and to send it a stop (default 60)
 #
 # OUT gets run_file.json, the deployment's one run file, built from the run
 # flags and both sides' ATOM arguments (`runfile.prefill_decode`), whose
@@ -53,9 +54,15 @@
 # OUT. A client drives the deployment through server.json as it drives one
 # server (client.sh); no client starts here. It serves until SIGTERM or SIGINT,
 # then stops the instances, the router and the authority, writes OUT/run.json,
-# the command line, the KV link, the run file and the router's command, and
-# exits 0, or 1 when something left on its own, a router LP as the traffic
-# closes aside, or failed to stop. Exits 2 on bad arguments.
+# the command line, the KV link, the run file and the router's command, and,
+# once a client's export is complete (OUT/artifacts/client_run.json), each
+# request's split, OUT/request_split.json (atom/compass/report/split.py), CI's
+# Prometheus report of a simulated run's series, OUT/prometheus.html, or why
+# there is none, OUT/prometheus.txt (atom/compass/report/prometheus.py), which
+# fails no stop, then the run's report, OUT/report.html
+# (atom/compass/report/html.py), and exits 0, or 1 when something left on its
+# own, a router LP as the traffic closes aside, failed to stop, or the split or
+# the run's report failed. Exits 2 on bad arguments.
 #
 # Real, there is no run file or authority: each instance is one `compass
 # record --out`, which checks its node's GPUs before and after.
@@ -67,7 +74,10 @@
 # <pid>`, a second command under the first, so srun inside an allocation takes
 # --overlap. A shell may parse those words again, so OUT, this tree and the
 # caller's directory must be paths `printf %q` leaves as they are. That node
-# sees them at their paths, and, simulated, this node's 127.0.0.1.
+# sees them at their paths, and, simulated, this node's 127.0.0.1. Simulated,
+# where the host entries' hops differ, the decode's are picked under the
+# environment the prefix starts its command in, which `PREFIX env -0` shows,
+# one more command under it, as the prefill's are under this script's.
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -133,15 +143,19 @@ RUN_FILE= CLOCK=
 # listeners take one per rank from its handshake port. The decode's handshake
 # port, the prefill's plus its ranks as the nightly's 1P1D launch gives it, is
 # not held: its listeners bind ports the kernel hands out.
-ports=$(python3 - $$ "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
+ports=$(python3 - $$ "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${on[*]}" "$PREFIX_S" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
 import argparse, json, random, socket, subprocess, sys
 from pathlib import Path
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal
 from atom.compass.drive import runfile, serve
+from atom.compass.drive.run import side_env
 from atom.compass.spec import SpecRefusal
 
-script, run_file, kv_link, router_lp, n, *words = sys.argv[1:]
+# Python names a program read from stdin <stdin>, a file that a process this
+# one spawns to resolve a side's config would run as its main, and not find.
+globals().pop("__file__", None)
+script, run_file, kv_link, router_lp, on, prefix_s, n, *words = sys.argv[1:]
 flags, words = words[: int(n)], words[int(n) :]
 k = int(words[0])
 prefill, decode = words[1 : 1 + k], words[1 + k :]
@@ -172,18 +186,27 @@ if not run_file:
     ranks = engine.data_parallel_size * engine.tensor_parallel_size * engine.pipeline_parallel_size
     base = block(ranks)
     hand(router, prometheus, base, base + ranks)
+def decode_env():
+    """The environment --on's prefix starts the decode's command in, with what
+    compass_env sets over it there."""
+    shown = subprocess.run([*on.split(), "env", "-0"], stdin=subprocess.DEVNULL, capture_output=True, timeout=float(prefix_s))
+    if shown.returncode:
+        said = shown.stderr.decode(errors="replace").strip()
+        raise ValueError(f"--on's prefix exited {shown.returncode} showing the decode's environment: {said}")
+    env = dict(v.split("=", 1) for v in shown.stdout.decode(errors="surrogateescape").split("\0") if v)
+    return env | side_env(env)
 parser = argparse.ArgumentParser(prog="deploy.sh run")
 runfile.add_arguments(parser)
 args = parser.parse_args(flags)
 try:
-    run = runfile.prefill_decode(args, prefill, decode, kv_link)
+    run = runfile.prefill_decode(args, prefill, decode, kv_link, decode_env if on else None)
     lookaheads = "-"
     if router_lp:
         run["router"] = compass_run.router_binary(router_lp)
         run.setdefault("router_in_s", compass_run.hop(run, "ipc_s"))
         table = compass_run.channel_table(run)
         lookaheads = json.dumps({c.name: table.lookahead(c.name) for c in table.channels_from(compass_run.ROUTER)}, separators=(",", ":"))
-except (ValueError, OSError, ArtifactRefusal, SpecRefusal) as refused:
+except (ValueError, OSError, subprocess.TimeoutExpired, ArtifactRefusal, SpecRefusal) as refused:
     sys.exit(f"deploy: {refused}")
 clock = block(1)
 base = block(run["prefill_data_parallel_size"] * run["decode_data_parallel_size"])
@@ -321,4 +344,12 @@ if os.path.exists(out + "/run_file.json"):
 open(out + "/run.json.part", "w").write(json.dumps(run))' \
     "$OUT" "$KV_LINK" "${#ARGV[@]}" "${ARGV[@]}" "${ROUTER[@]}"
 mv "$OUT/run.json.part" "$OUT/run.json"
+if [[ -s $OUT/artifacts/client_run.json ]]; then
+    (cd / && python3 -m atom.compass.report.split "$OUT") ||
+        { echo "deploy: split: atom.compass.report.split exited $?" >&2; rc=1; }
+    (cd / && python3 -m atom.compass.report.prometheus "$OUT") ||
+        echo "deploy: prometheus: atom.compass.report.prometheus exited $?" >&2
+    (cd / && python3 -m atom.compass.report.html "$OUT") ||
+        { echo "deploy: report: atom.compass.report.html exited $?" >&2; rc=1; }
+fi
 exit $rc

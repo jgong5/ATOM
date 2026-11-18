@@ -28,6 +28,7 @@ import pytest
 import test_vertical_slice
 from test_lmcache_lp import (
     BANDWIDTH,
+    BLOCK_BYTES,
     CHUNK,
     IPC,
     LATENCY_S,
@@ -52,7 +53,6 @@ from test_vertical_slice import (
 )
 
 from atom.compass import run as compass_run
-from atom.compass.backends import KvGeometry, Parallelism
 from atom.compass.clock import ClockAuthority, LpId
 from atom.compass.clock_transport import connect, serve
 from atom.compass.kv import WRITE_REQ_KEY, SimulatedKVConnector
@@ -105,10 +105,11 @@ class Engine:
     """An engine process's scheduler half on the step loop, against LP lmcache
     and an authority served here; every other LP idles. With `pd`, the engine
     is the prefill side of a prefill-decode run, its connector a `multi` of
-    `compass` and `lmcache_mp`. `blocks` is the block manager the shell binds."""
+    `compass` and `lmcache_mp`. `blocks` is the block manager the shell binds,
+    and `image` the state image its runner published beside a chunk's block."""
 
     def __init__(
-        self, tmp_path, monkeypatch, tp=1, pd=False, blocks=None, **entry
+        self, tmp_path, monkeypatch, tp=1, pd=False, blocks=None, image=0, **entry
     ) -> None:
         monkeypatch.setattr(clock, "_installed", None)
         monkeypatch.setattr(dist_utils, "LP_OF_RANK", None)
@@ -130,15 +131,19 @@ class Engine:
             lambda *a, **k: started.append((a, real(*a, **k))) or started[-1][1],
         )
         kv = _kv(0)  # the port the server binds, set once it has bound one
+        # Each engine's plan, as its runner publishes it; a chunk is one block.
+        engines = ["engine"]
         if pd:
             write = {WRITE_REQ_KEY: f"inproc://kv-write-req-{os.getpid()}"}
             kv = {"kv_connector": "multi", "connectors": [COMPASS | write, kv]}
-            for engine in ("engine-P", "engine-D"):
-                publish(run["out_dir"], engine, 1)
+            engines = ["engine-P", "engine-D"]
+        for engine in engines:
+            publish(run["out_dir"], engine, BLOCK_BYTES, image=image)
+        self.chunk_bytes = BLOCK_BYTES
         self.config = _config(kv, tensor_parallel_size=tp, kv_cache_block_size=CHUNK)
         compass_run._launch_lmcache(self.config, run, compass_run._pd_side(self.config))
         (argv, *_), self.proc = started[0]
-        self.chunk_bytes = int(argv[-1])
+        assert argv[-1] == str(CHUNK)  # LP lmcache reads the rest from the plan
         lm = kv["connectors"][-1] if pd else kv
         lm["kv_connector_extra_config"]["lmcache.mp.port"] = _bound_port(self.proc)
         me = "engine-P" if pd else "engine"
@@ -292,7 +297,7 @@ def test_a_native_state_rank_saves_on_its_channel_and_loads_with_its_restore(
     tmp_path, monkeypatch, factory, caplog
 ):
     caplog.set_level(logging.INFO, logger="atom")
-    engine = Engine(tmp_path, monkeypatch, blocks=NATIVE_BLOCKS, state_bytes=IMAGE)
+    engine = Engine(tmp_path, monkeypatch, blocks=NATIVE_BLOCKS, image=IMAGE)
     shell, rt = engine.shell, engine.rt
     [rank] = shell._ranks
     assert isinstance(rank, native_state_worker.NativeStateLMCacheMPConnector)
@@ -357,14 +362,6 @@ def test_two_writer_ranks_report_a_save_once_both_copies_end(
 ):
     engine = Engine(tmp_path, monkeypatch, tp=2, copy_width=width)
     rt = engine.rt
-    # Each TP rank of two stores its own shard of a chunk.
-    whole = KvGeometry.from_hf_config(
-        engine.config.hf_config,
-        block_size=CHUNK,
-        parallelism=Parallelism(tp_size=1),
-        kv_dtype=engine.config.kv_cache_dtype,
-    ).bytes_per_block
-    assert engine.chunk_bytes * 2 == whole
     copy = LATENCY_S + CHUNKS * engine.chunk_bytes / BANDWIDTH
 
     engine.build(_save("r0"))
@@ -491,15 +488,9 @@ def test_the_compass_runner_refuses_a_real_backend_beside_lmcache_mp(monkeypatch
 
 # --- a whole run --------------------------------------------------------------
 
-#: The machine the run is priced on and its memory readings measured on: the
-#: spec of the device `ATOM_COMPASS_SLICE_MACHINE` names, with a host link for
-#: the server's copies.
-MACHINE = Path(
-    os.environ.get(
-        "ATOM_COMPASS_SLICE_MACHINE",
-        TREE / "scripts/compass/machines/mi308x-hjbog39.json",
-    )
-)
+#: The machine the runs are priced on: an MI308X spec, which `on_cards` gives
+#: the platform its memory readings are measured on.
+MACHINE = TREE / "tests/compass/machines/mi308x-hjbog39.json"
 PROMPT = " ".join(f"word{k}" for k in range(200))  # a few lmcache chunks
 #: The third client run's request comes this long after its start: the
 #: eviction loop has emptied the server, and the session sweep has run.
@@ -530,8 +521,22 @@ class Delayed(Traffic):
         pass
 
 
-def _machine(out: Path) -> Path:
+def on_cards(gpu: str) -> dict:
+    """`MACHINE` at the device, PTL state and stack `compass measure memory`
+    reads on the GPUs `gpu` names, as rocm-smi numbers them."""
+    from atom.compass.drive.identity import _device, _ptl, _stack
+
+    gpus = tuple(int(g) for g in gpu.split(","))
     machine = json.loads(MACHINE.read_text())
+    [(name, arch)] = {(card["name"], card["arch"]) for card in _device(gpus)}
+    machine["device"] |= {"name": name, "arch": arch, "ptl": _ptl(gpus)}
+    machine["device"]["software_pinned_to"] = _stack()
+    return machine
+
+
+def _machine(out: Path, gpu: str) -> Path:
+    """`on_cards(gpu)` with a host link for the server's copies."""
+    machine = on_cards(gpu)
     machine["interconnect"]["host_link"] = {
         "bandwidth_bytes_per_s": BANDWIDTH,
         "latency_s": LATENCY_S,
@@ -557,7 +562,8 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(
     monkeypatch.setattr(test_vertical_slice, "SCRAPE_S", math.inf)
     # The readings are keyed by the performance environment the server runs in.
     monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
-    machine = _machine(tmp_path)
+    gpu = os.environ.get("HIP_VISIBLE_DEVICES", "0")
+    machine = _machine(tmp_path, gpu)
     server_port = lmcache_port
     flags = ["--host", "127.0.0.1", "--port", str(server_port), "--chunk-size", "256"]
     flags += ["--l1-size-gb", "1", "--eviction-policy", "LRU"]
@@ -567,9 +573,8 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(
     # lmcache server beside the engine.
     monkeypatch.setenv("ATOM_KV_OFFLOAD", "lmcache_mp")
     monkeypatch.setenv("ATOM_KV_OFFLOAD_EXTRA_CONFIG", json.dumps(extra))
-    gpu = os.environ.get("HIP_VISIBLE_DEVICES", "0")
     cli.main(
-        ["measure", "memory", "--gpu", gpu, "--machine", str(machine)]
+        ["measure", "memory", "--gpu", gpu]
         + ["--beside", shlex.join(["lmcache", "server", *flags])]
         + ["--store", str(tmp_path / "store"), "--out", str(tmp_path / "measure")]
         + ["--", *ATOM_ARGS]
@@ -633,19 +638,3 @@ def test_a_one_deployment_run_loads_a_stored_prefix_back(
     table = (tmp_path / compass_run.STEP_TABLE_FILE).read_text()
     ticks = {float(r.split()[2]) for r in table.splitlines()[1:] if r[:8] == "lmcache "}
     assert {1.0, 60.0, 660.0} <= ticks, "the eviction and session ticks ran"
-
-
-def test_a_run_file_that_names_another_state_image_is_refused(tmp_path, monkeypatch):
-    from atom.kv_transfer.offload.mp.native_state_scheduler import (
-        NativeStateLMCacheMPConnectorScheduler as Native,
-    )
-
-    (tmp_path / "run.json").write_text('{"bound_s": 1, "lmcache": {"state_bytes": 79}}')
-    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
-    shell = LMCacheMPShell.__new__(LMCacheMPShell)
-    inner = SimpleNamespace(bind_block_manager=id, _impl=Native.__new__(Native))
-    shell.__dict__.update(_inner=inner, _ranks=[], _config=None)
-    with pytest.raises(
-        ValueError, match=f"state_bytes is 79; .* image of {IMAGE} bytes"
-    ):
-        shell.bind_block_manager(NATIVE_BLOCKS)

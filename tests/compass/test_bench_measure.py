@@ -937,4 +937,85 @@ def test_run_and_measure_steps_lay_out_dp_attention_alike(
         pc = config.parallel_config
         assert (config.tensor_parallel_size, pc.data_parallel_size) == (1, 2)
     with pytest.raises(SystemExit):
-        measure.atom_config([*atom_args, "--timeout-keep-alive", "5"])
+        measure.atom_config([*atom_args, "--compass-run", "run.json"])
+
+
+@pytest.mark.parametrize("node", [0, 1])
+def test_run_lays_out_one_node_of_a_dp_attention_group_across_nodes_as_its_engines(
+    monkeypatch, model_dir, node  # noqa: F811
+):
+    # Each node of a TP 2 group of two DP ranks on two nodes starts two of its
+    # four engines; a check that read the whole group would pass a step law
+    # the runner refuses. The benches run the whole group on one host.
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    atom_args = ["--model", str(model_dir), "-tp", "2", "--enable-dp-attention"]
+    atom_args += ["--data-parallel-size", "2", "--data-parallel-size-local", "1"]
+    atom_args += ["--data-parallel-rank", str(node)]
+    served = drive_run._config(atom_args)
+    pc = served.parallel_config
+    fields = ("data_parallel_size", "data_parallel_size_local", "data_parallel_rank")
+    got = {"tensor_parallel_size": served.tensor_parallel_size}
+    got |= {name: getattr(pc, name) for name in fields}
+    print(f"\nnode {node}: {got}")
+
+    assert list(got.values()) == [1, 4, 2, 2 * node]
+    measured = measure.atom_config(atom_args).parallel_config
+    assert (measured.data_parallel_size, measured.data_parallel_size_local) == (4, 4)
+
+
+#: The API server's flags `compass record` passes it, as MiniMax-M3's
+#: submission serves with them.
+SERVED = [
+    "--default-chat-template-kwargs",
+    '{"thinking_mode":"enabled"}',
+    "--tool-call-parser",
+    "minimax_m3",
+    "--timeout-keep-alive",
+    "600",
+    "--disable-uvicorn-access-log",
+    "--chat-template",
+    "template.jinja",
+    "--request-log",
+    "requests.jsonl",
+]
+
+
+@pytest.fixture
+def config_of(monkeypatch, model_dir):  # noqa: F811
+    """`measure.atom_config` of `-tp 4` on `model_dir` and the arguments given."""
+
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+
+    def config_of(*argv):
+        return measure.atom_config(["--model", str(model_dir), "-tp", "4", *argv])
+
+    return config_of
+
+
+def test_measure_steps_takes_the_server_flags_record_passes_and_resolves_without_them(
+    config_of,
+):
+    assert vars(config_of(*SERVED)) == vars(config_of())
+
+
+@pytest.mark.parametrize(
+    "argv, error",
+    [
+        (["--max-num-sqes", "8"], "unrecognized arguments: --max-num-sqes 8"),
+        (["--timeout-keep-alive", "soon"], "invalid int value: 'soon'"),
+    ],
+)
+def test_measure_steps_refuses_a_misspelled_engine_flag_and_a_value_the_server_refuses(
+    config_of, argv, error, capsys
+):
+    with pytest.raises(SystemExit):
+        config_of(*SERVED[:2], *argv)
+    assert error in capsys.readouterr().err
