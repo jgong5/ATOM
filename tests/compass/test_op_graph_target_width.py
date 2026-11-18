@@ -182,7 +182,8 @@ class Asked(CostSource):
         self.asked = []
 
     def price(self, request):
-        op, (_, tokens, seqs, *_), _ = request
+        op, bound, _ = request
+        tokens, seqs = bound[1], bound[2]
         rows = [*next(iter(op["args"].values()))["shape"], None][0]
         self.asked.append((op["op"], rows, tokens, seqs))
         return self.refuse("asked")
