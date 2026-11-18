@@ -18,11 +18,13 @@ removed first. A point that fails is tried again from a fresh directory, then
 listed with each try's reason: the client's last line, the server command's,
 and the first error raised in each log under the point's directory. Each
 command's output is beside the directory, in ``<point>.log`` and
-``<point>.client.log``. With ``HARNESS_PYTHON``, the Python `client.sh` runs
+``<point>.client.log``, and an offloading point's lmcache entry in
+``<point>.lmcache.json``. With ``HARNESS_PYTHON``, the Python `client.sh` runs
 aiperf under, unset, no point runs, and each is listed with why.
 
 Points start in SPACE's order, as many at once as this process's CPUs hold
-the widest point's ranks, each rank one CPU; each server draws its own ports.
+the widest point's ranks, each rank one CPU; each server draws its own ports,
+and an offloading point's lmcache server takes the point's own.
 SIGINT or SIGTERM stops every point's commands, each as the check stops a
 start, and the search exits naming the signal; a finished point keeps its
 record. Each point's outcome is written into OUT as `SIMULATED`, with the
