@@ -1467,6 +1467,24 @@ class ModelRunner:
 
     def warmup_model(self):
         start_time = time.time()
+        if envs.ATOM_PREWARM_NATIVE_A8:
+            # Before the peak is reset: KV sizing reads the warmup forward's
+            # peak alone, and these GEMMs free what they allocate.
+            from atom.model_ops.prewarm import prewarm_native_a8
+
+            models = [self.model]
+            draft = getattr(getattr(self, "drafter", None), "model", None)
+            if isinstance(draft, torch.nn.Module):
+                models.append(draft)
+            calls = sum(
+                prewarm_native_a8(m, self.warmup_max_tokens()) for m in models
+            )
+            if calls:  # none off a GPU, as in a simulated run
+                torch.cuda.synchronize()
+            logger.info(
+                f"{self.label}: prewarm_native_a8 {calls} GEMM calls in "
+                f"{time.time() - start_time:.2f} seconds"
+            )
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_model_len = self.config.max_model_len

@@ -1135,6 +1135,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1") == "1"
     ),
+    # First-call every native A8 GEMM variant at warmup (prewarm.prewarm_native_a8),
+    # so no FlyDSL first-call trace stalls a serving forward.
+    "ATOM_PREWARM_NATIVE_A8": lambda: os.getenv("ATOM_PREWARM_NATIVE_A8", "1") == "1",
     "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM": lambda: (
         os.getenv("ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM", "0") == "1"
     ),
