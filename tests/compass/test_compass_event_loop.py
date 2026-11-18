@@ -433,6 +433,62 @@ def test_a_request_read_before_its_release_is_held_until_it(run):
     assert run.conn.grants == [arrival, INF] and run.conn.unread == []
 
 
+@pytest.mark.parametrize("done", [True, False], ids=["done", "no-done"])
+def test_the_done_event_ends_the_response_and_the_app_s_later_sends_are_dropped(
+    run, done
+):
+    """The client returns a request at its body's end, which the traffic LP
+    holds its clock for once the ``[DONE]`` is released: the body message that
+    ends in ``[DONE]`` ends the body, whatever the app sends after it. A stream
+    with no ``[DONE]`` ends where the app ends it."""
+    stamps, wire, finished = queue.Queue(), [], []
+
+    def traffic():
+        rt = LPRuntime(TRAFFIC, TABLE, clock_transport.connect(TRAFFIC, run.endpoint))
+        rt.start_run()
+        stamps.put(rt.stamp_send(HTTP))
+        _until(lambda: run.rt.arrived[HTTP])
+        while rt.next_event(INF) < INF:  # the stream's events reach it
+            pass
+        rt.close()
+
+    thread = threading.Thread(target=traffic, name="traffic", daemon=True)
+    thread.start()
+    arrival, seq = stamps.get(timeout=10)
+    last = b"data: [DONE]\n\n" if done else b'data: {"end": 1}\n\n'
+
+    async def app(scope, receive, send):
+        await receive()
+        sse = [(b"content-type", b"text/event-stream")]
+        await send({"type": "http.response.start", "status": 200, "headers": sse})
+        for body, more in ((b"data: {}\n\n", True), (last, True), (b"", False)):
+            await send({"type": "http.response.body", "body": body, "more_body": more})
+        finished.append(True)
+
+    async def send(message):
+        wire.append(message)
+
+    scope = {
+        "type": "http",
+        "headers": [(b"x-test-stamp", f"{arrival!r} {seq}".encode())],
+    }
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(HttpChannel(app, _stamp)(scope, _no_body, send))
+        loop.run_forever()
+    finally:
+        thread.join(10)
+    loop.close()
+    assert finished == [True]
+    bodies = [(m["body"], m["more_body"]) for m in wire[1:]]
+    stamped = [carriers.sse_stamp(b.decode().partition("\n")[0]) for b, _ in bodies]
+    assert all(s is not None for s in stamped[:2])
+    assert [b.partition(b"\n")[2] for b, _ in bodies[:2]] == [b"data: {}\n\n", last]
+    # The app's own end, an empty body, goes out only with no [DONE] before it.
+    ends = [True, False] if done else [True, True, False]
+    assert [more for _, more in bodies] == ends
+
+
 def test_a_body_that_arrives_after_the_next_timer_is_handed_on_at_its_release(run):
     stamps, handled = queue.Queue(), []
     traffic = _traffic(

@@ -880,17 +880,31 @@ async def _read_body(receive):
 
 
 def _stamping_events(send, rt):
-    """`send`, stamping each event of an SSE response body sent during the run."""
-    events = False
+    """`send`, stamping each event of an SSE response body sent during the run.
+
+    The body message that ends in the ``[DONE]`` event ends the response too,
+    and what the app sends after it is dropped. The traffic LP holds its clock
+    until the client has the return of a request whose ``[DONE]`` it was
+    released, and the client returns at the body's end. Left to the app, that
+    end comes loop turns after ``[DONE]`` (Starlette hands each body message
+    between tasks), and in those turns the loop's on-loop decodes advance the
+    LP clock; one that reaches past the traffic LP's horizon waits for a grant
+    the traffic LP only asks for once the return is in, and the run hangs.
+    """
+    events = ended = False
 
     async def stamping(message):
-        nonlocal events
+        nonlocal events, ended
+        if ended:
+            return
         if message["type"] == "http.response.start":
             content_type = dict(message.get("headers", [])).get(b"content-type", b"")
             events = content_type.startswith(b"text/event-stream")
         elif events and rt.in_run:
             text = stamp_events(message.get("body", b"").decode(), rt)
             message = {**message, "body": text.encode()}
+            if text.endswith("\ndata: [DONE]\n\n"):
+                ended, message["more_body"] = True, False
         await send(message)
 
     return stamping
