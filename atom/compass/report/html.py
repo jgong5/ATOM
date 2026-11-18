@@ -36,7 +36,9 @@ for it, says so in its place:
 - a simulated run's split beside the real runs', when the cell's `GRADES`
   grades it: each segment's percentiles of this run and of each real run
   graded with it, from their `split.FILE`, and why a run has none;
-- the op-family split, which no run's directory holds;
+- an op-level run's op-family split, `ops.split`: each side's time per step
+  phase by op family, the terms that hold no one kind and the rest of its
+  predicted time, each with why, and its refused steps; or why there is none;
 - the Prometheus report: a link to `prometheus.HTML`, or what
   `prometheus.TEXT` says of why there is none.
 """
@@ -50,7 +52,7 @@ from html import escape
 from pathlib import Path
 
 from atom.compass.backends.json_file import read_json
-from atom.compass.report import prometheus, split
+from atom.compass.report import ops, prometheus, split
 from atom.compass.run import OP_GRAPH, STEP_GRID, STEP_LINEAR, STEP_STUB, SUMMARY_FILE
 from atom.compass.validate import curves
 from atom.compass.validate.runs import CLIENT_RUN, EXPORT, sides
@@ -401,6 +403,28 @@ def _beside(run: Path) -> str:
     return out
 
 
+def _ops(run: Path) -> str:
+    out = ""
+    for side, ranks, phases in ops.split(run):
+        for name, phase in sorted(phases.items(), key=lambda p: -p[1].predicted):
+            refused = sum(phase.refused.values())
+            text = (
+                f"{f'{side} side, ' if side else ''}{name}: {phase.steps} steps"
+                f" over {ranks} DP ranks, {refused} of them refused, their ops"
+                " unpriced; seconds summed over the ranks."
+            )
+            share = phase.predicted or None
+            rows = [
+                (part, _number(s), _percent(share and s / share), why)
+                for part, s, why in ops.rows(phase)
+            ]
+            head = ("part", "seconds", "share of predicted", "op kinds, or why")
+            out += f"<p>{escape(text)}</p>{_table(rows, head)}"
+            if refused:
+                out += _table(phase.refused.most_common(), ("refused", "steps"))
+    return out
+
+
 def _prometheus(run: Path) -> str:
     if (run / prometheus.HTML).is_file():
         text = "ATOM's CI report over this run's Prometheus series"
@@ -435,8 +459,7 @@ def page(run) -> str:
     ]
     if simulated:
         parts.append(_part("A real run's per-request split", _beside, run))
-    why = "None: no op-family split is recorded for this run."
-    parts.append(_part("Op-family split", _none, why))
+    parts.append(_part("Op-family split", _ops, run))
     parts.append(_part("Prometheus report", _prometheus, run))
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
