@@ -1714,17 +1714,17 @@ and the law's provenance names its design records.
 **Reason.** A level's group moves Sum N_KV with r.max N_KV - Sum N_KV near 0, the one-long
 group the second, so a rung's coefficients separate; four groups of about 40 steps pass
 the 100 steps a rung at which the rowmod rule holds a record out
-(`atom/compass/backends/step_linear_fit.py::ROWMOD_CELL_STEPS`). A fold refuses a rung its
-law has no vector for (`step_linear_fit.py::_held_out`), so two design records give every
-rung a held-out error, and drawn contexts make it a held-out test, not a repeat. Levels
-come from a served record because first-turn calibration rungs ran at 182k to 216k tokens
-where graded c=4 ran 44k to 131k
-([#1840](https://github.com/jgong5/ATOM/issues/1840#issuecomment-6303330856)). The cap keeps
-a group resident, since ATOM's pool preempts a row it cannot hold (`03` D13), with room for
-output and a model's several pools
+(`atom/compass/backends/step_linear_fit.py::ROWMOD_CELL_STEPS`). A fold prices no step at
+a rung its law has no vector for, counting it refused (`step_linear_fit.py::_held_out`,
+`fold_figures`), so two design records give every rung a held-out error, and drawn
+contexts make it a held-out test, not a repeat. Levels come from a served record because
+first-turn calibration rungs ran at 182k to 216k tokens where graded c=4 ran 44k to 131k
+([#1840](https://github.com/jgong5/ATOM/issues/1840#issuecomment-6303330856)). The cap
+keeps a group resident, since ATOM's pool preempts a row it cannot hold (`03` D13), with
+room for output and a model's several pools
 (`atom/model_ops/attentions/pool_layout/sub_pool_spec.py::plan_pools`). The record states
-each row's tokens, which the fit reads, so chat requests need no exact count and feed
-`fit host`'s tokenizer and intake terms (Phase 1c). An explicit rank chooses rows that
+each row's tokens, which the fit reads, so chat requests need no exact count and feed `fit
+host`'s tokenizer and intake terms (Phase 1c). An explicit rank chooses rows that
 load-aware affinity would not, and rotation spreads the card mix a law prices (README
 principle 12). D106's parked decodes would join the very batches a group designs. Sessions
 are made up, so no trajectory count bounds a rung.
@@ -1732,6 +1732,11 @@ are made up, so no trajectory count bounds a rung.
 **Rejected.** Token-id completions, as `drive/sweep.py` sends: no tokenizer or template
 runs, so a design record feeds neither term. Both design records at the percentiles
 exactly: each fold re-prices the other's points.
+
+**D39 is not amended.** Its replay rule binds the step bench's measurements, and a design
+record's steps are a real server's. Its reason still bears: hand-built rows may miss real
+row order and raggedness, which T119 holds until the real record's fold and the S1 and S2
+validation show them.
 
 **Unchanged.** The law's key; `19` D112 and D113's list; prefill from trace runs, which
 `compass record --trace` refuses under DP ([#3010](https://github.com/jgong5/ATOM/issues/3010));
@@ -1741,8 +1746,7 @@ built at its rung in a design record, which the fit then refuses as any other
 
 ### Scenarios
 
-**A calibration**, MiniMax-M3 TP4; under DP the fill and groups go per rank and no trace
-run is taken:
+**A calibration**, MiniMax-M3 TP4:
 
 ```
  DURATION_S=600 calibrate.sh OUT 48 'design 1' 'design 2' 'trace 16' 'trace 4'
@@ -1756,8 +1760,24 @@ run is taken:
    fit steps       folds: the real record, each design record, each trace run
                      -> a vector and a held-out error at every scheduled rung
    fit host        the real record and the design records
+   status          each step's wall time (#3467); beside each design record's
+                   plan, each phase's and group's
    -> a step_linear_law naming its design records; compass advice reuses it as
       any law (D112) and still prints D113's list
+```
+
+**Under DP**, S2's DPA8 for one:
+
+```
+ calibrate.sh OUT C 'design 1' 'design 2'     no trace run: --trace refuses DP
+   real record     its decode rows' contexts, rank by rank
+   design K        fill: each rank's own sessions, data_parallel_rank on each
+                   per rung: the four groups, every rank at its rows; one group
+                     uneven over the ranks; one with an empty rank (dummies)
+                   the costliest rank rotating from group to group
+   fit steps       decode vectors, a MoE column where the fit adopts one, over
+                   each group's real tokens; prefill unfitted, as a DP list's
+                   is today (#3010)
 ```
 
 **Acceptance**, once the planner and driver exist:
@@ -1780,6 +1800,8 @@ The same groups with no fill, each row a fresh prompt: no sessions and no evicti
 It fails the mechanism check's time per group: every group prefills its rows' whole
 contexts, at least 2,908 rows a record on M3 TP4 (its 31 sizes sum to 631 rows, plus the
 eager 96, four groups each), where a fill prefills a session once for every group it fits.
+D113's own list on one server with shorter client runs is no designed load, and leaves the
+widest rung to the one record at the bound, so with no held-out error there.
 
 ### Low confidence
 
