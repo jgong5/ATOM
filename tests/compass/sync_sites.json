@@ -5321,7 +5321,7 @@
    "peer": "process",
    "why": "the lmcache_mp shell sends a TP rank's STORE or RETRIEVE to LP lmcache from the step loop, in build_connector_meta",
    "mechanism": "K4",
-   "mechanism_why": "the engine end of transfer#dpN.tpK: the step loop stamps the request as it sends it"
+   "mechanism_why": "the engine end of transfer#dpN: the step loop stamps the request as it sends it"
   },
   {
    "id": "atom/compass/kv/lmcache_mp.py::LMCacheMPShell._take::sock.poll()::poll#0",

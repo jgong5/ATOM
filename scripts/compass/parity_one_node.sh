@@ -224,11 +224,11 @@ done
 
 RUN=$OUT/sim/run.json CLOCK_PORT=$(compass_held_port)
 python3 - "$RUN" "$OUT" "$OUT/sim/machine.json" "$MODEL" "$STORE" "$CLOCK_PORT" "${DPA:+$((TP * TREES))}" \
-    "$LM_FLAGS" "${IMAGE_S:-0.01}" "$TP" "$SIDES" "$PP" <<'EOF'
-import json, re, sys
+    "$LM_FLAGS" "${IMAGE_S:-0.01}" "$SIDES" "$PP" <<'EOF'
+import json, sys
 from pathlib import Path
 
-run, out, machine, model, store, port, width, lmcache, image_s, tp, sides, pp = sys.argv[1:]
+run, out, machine, model, store, port, width, lmcache, image_s, sides, pp = sys.argv[1:]
 machine = json.loads(Path(machine).read_text())
 spec = {
     "clock_endpoint": f"tcp://127.0.0.1:{port}", "bound_s": 1e7,
@@ -243,14 +243,9 @@ if sides != ".":
 if lmcache:
     from atom.compass.kv.lmcache_server import DECLARED_LAWS as laws
 
-    # Writers per DP rank: one under DP-attention, else every TP rank, which
-    # a model whose ranks share one copy refuses by name.
-    writers = 1 if width else int(tp)
-    spec["lmcache"] = {"server": lmcache.split(), "writers": writers, **laws}
-    # A rank's recurrent-state image, as the real run logged it; the simulated
-    # engine refuses a run file that names another.
-    image = re.findall(r"image_bytes=(\d+)", Path(f"{out}/real/server.log").read_text())
-    spec["lmcache"]["state_bytes"] = int(image[0]) if image else 0
+    # The entry `compass advice` writes; LP lmcache sizes a rank's state
+    # image from the simulated engine's plan.
+    spec["lmcache"] = {"server": lmcache.split(), **laws}
 Path(run).write_text(json.dumps(spec))
 EOF
 CLOCK=()
