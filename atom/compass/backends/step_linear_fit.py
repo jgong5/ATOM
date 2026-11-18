@@ -6,11 +6,14 @@
     python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --platform JSON [--form FORM] [--moe-routing E,K] [--engine FILE]
     python -m atom.compass.backends.step_linear_fit offload LOG... --out ENTRY
     python -m atom.compass.backends.step_linear_fit figures RECORD... --law LAW [--source NAME] [--form FORM] [--moe-routing E,K] [--engine FILE]
+    python -m atom.compass.backends.step_linear_fit pack PATH...
 
 The second form fits a run file's ``lmcache_offload`` entry, beside the law of
 an arm whose records ran the connector, on those runs' server logs
 (`fit_offload`). The third writes the held-out figures (below) of the records
-into an existing law fitted on them (`figures_main`).
+into an existing law fitted on them (`figures_main`). The fourth stores law
+files xz-compressed, as the checked-in ones are (`pack_main`). A law is read
+and written by `json_file`, xz-compressed when its name ends in ``.xz``.
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
@@ -2299,7 +2302,7 @@ def figures_main(argv) -> None:
     parser.add_argument("--source", help="the entry of the law's sources folded")
     parser.set_defaults(form=None)
     args = parser.parse_args(argv)
-    law = json.loads(Path(args.law).read_text())
+    law = json_file.read_json(args.law)
     into, vectors, runs = law, None, law.get("runs")
     sources = law.get("sources", {})
     if args.source is not None or sources:
@@ -2351,8 +2354,30 @@ def figures_main(argv) -> None:
             + (f", and the fit cuts each step they price: {why}" if why else "")
         )
     into["figures"] = fold_figures(_fold_laws(samples, options, 0), vectors)
-    Path(args.law).write_text(json.dumps(law) + "\n")
+    json_file.write_json(law, args.law)
     print(_figures_table(into["figures"]))
+
+
+def pack_main(argv) -> None:
+    """``pack PATH...``: store each law file PATH, or each ``*.json`` in a
+    directory PATH, xz-compressed beside it under its name and ``.xz``, as
+    `json_file.write_json` writes it, and remove it, printing both sizes. A law
+    whose document did not change is stored in the same bytes. A PATH whose
+    name does not end in ``.json`` refuses, before any law is stored."""
+    parser = argparse.ArgumentParser(
+        prog="python -m atom.compass.backends.step_linear_fit pack",
+        description=pack_main.__doc__.split("\n\n")[0],
+    )
+    parser.add_argument("paths", nargs="+", type=Path, help="law files or directories")
+    paths = parser.parse_args(argv).paths
+    laws = [x for p in paths for x in (sorted(p.glob("*.json")) if p.is_dir() else [p])]
+    if named := [str(law) for law in laws if law.suffix != ".json"]:
+        parser.error(f"a law file packed is named *.json, and these are not: {named}")
+    for law in laws:
+        into = law.with_name(law.name + json_file.XZ)
+        json_file.write_json(json_file.read_json(law), into)
+        print(f"{into}: {law.stat().st_size} -> {into.stat().st_size} bytes")
+        law.unlink()
 
 
 def main(argv=None) -> None:
@@ -2363,11 +2388,16 @@ def main(argv=None) -> None:
     if argv[:1] == ["figures"]:
         figures_main(argv[1:])
         return
+    if argv[:1] == ["pack"]:
+        pack_main(argv[1:])
+        return
     parser = _records_parser(
         "python -m atom.compass.backends.step_linear_fit", __doc__.split("\n\n")[0]
     )
     parser.add_argument(
-        "--out", required=True, help="where the law is written, as JSON"
+        "--out",
+        required=True,
+        help="where the law is written, as JSON, xz-compressed when it ends in .xz",
     )
     parser.add_argument(
         "--platform",
@@ -2399,7 +2429,7 @@ def main(argv=None) -> None:
         }
     if len(args.records) > dp:
         mark_held_out(law, report, samples, options)
-    Path(args.out).write_text(json.dumps(law) + "\n")
+    json_file.write_json(law, args.out)
     print(f"cut: {json.dumps(law['cut'])}")
     print(f"unfitted: {json.dumps(law['unfitted'])}")
     for name, vector in [("prefill", law.get("prefill"))] + list(law["decode"].items()):

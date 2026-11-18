@@ -14,7 +14,6 @@ import json
 import math
 import shutil
 import time
-from pathlib import Path
 from types import SimpleNamespace
 
 import platforms
@@ -27,6 +26,7 @@ from test_served_tokenizer import REPO, _run_file
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import runfile
@@ -36,7 +36,7 @@ from atom.utils.clock import LPRuntime
 
 LAWS = REPO / "scripts/compass/laws"
 #: The node-18 TP1 law file, which a TP1 1P1D cell runs.
-TP1 = LAWS / "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json"
+TP1 = LAWS / "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json.xz"
 FLOOR = compass_run.HOP_FLOOR_S
 #: Each channel's lookahead before the hops left the code and the spec: the
 #: serving path's HTTP transport, the ZMQ request and output and the SSE stream
@@ -79,7 +79,7 @@ def parsed(tmp_path, *flags):
     parser = argparse.ArgumentParser()
     runfile.add_arguments(parser)
     common = ["--step-stub", str(stub)]
-    laws = [json.loads(Path(f).read_text()) for f in flags if f.endswith(".json")]
+    laws = [read_json(f) for f in flags if f.endswith((".json", ".json.xz"))]
     at = next(
         (law["host"]["key"] for law in laws if "torch" in law["host"]["key"]), None
     )
@@ -91,13 +91,22 @@ def model(tmp_path, *more):
     return ["--model", str(tmp_path), *more]
 
 
-#: Law files whose ``host.hops`` `compass fit host` fitted on their own records
-#: (#3036), which carry their cell's hops rather than node 18's.
-FITTED_HOPS = {"deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json"}
+#: Law files whose ``host.hops`` `compass fit host` fitted on their own records,
+#: in whole or in part (#3036, #3194), which carry their cell's hops rather
+#: than node 18's.
+FITTED_HOPS = {
+    "deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json.xz",
+    "deepseek-v4-pro-tp8-mtp3-mi355x-crs005-prefill.json.xz",
+    "deepseek-v4-pro-tp8-mtp3-mi355x-crs005-decode.json.xz",
+    "deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-prefill.json.xz",
+    "deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-decode.json.xz",
+    "deepseek-v4-pro-tp8-mi355x-crs005-prefill-host.json.xz",
+    "deepseek-v4-pro-tp8-mi355x-crs005-decode-host.json.xz",
+}
 
 
 @pytest.mark.parametrize(
-    "law", sorted(p.name for p in LAWS.glob("*.json") if p.name not in FITTED_HOPS)
+    "law", sorted(p.name for p in LAWS.glob("*.json.xz") if p.name not in FITTED_HOPS)
 )
 def test_each_law_file_builds_the_lookaheads_a_run_charged_before(tmp_path, law):
     args = parsed(tmp_path, "--host-laws", str(LAWS / law))
@@ -112,7 +121,7 @@ def test_each_law_file_builds_the_lookaheads_a_run_charged_before(tmp_path, law)
 
 @pytest.mark.parametrize("law", sorted(FITTED_HOPS))
 def test_a_law_file_with_fitted_hops_builds_its_own_lookaheads(tmp_path, law):
-    hops = json.loads((LAWS / law).read_text())["host"]["hops"]
+    hops = read_json(LAWS / law)["host"]["hops"]
     args = parsed(tmp_path, "--host-laws", str(LAWS / law))
 
     run = runfile.build(args, model(tmp_path))
@@ -207,14 +216,14 @@ def test_each_side_of_a_v4_pro_pair_picks_its_hops_under_the_kv_role_deploy_sh_a
     # the --kv-transfer-config deploy.sh adds, fp4 without one at gfx950. Here
     # both sides' entries state one environment, the prefill side's, which the
     # build resolves both sides in, and the decode side's hops move.
-    env = json.loads(PAIR["prefill"].read_text())["host"]["key"]["engine"]["env"]
+    env = read_json(PAIR["prefill"])["host"]["key"]["engine"]["env"]
     for name in PERFORMANCE_KEYS:
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     hops, flags = {}, []
     for side, path in PAIR.items():
-        host = json.loads(path.read_text())["host"]
+        host = read_json(path)["host"]
         host["key"]["engine"]["env"] = env
         if side == "decode":
             host["hops"] = {k: 2 * v for k, v in host["hops"].items()}
