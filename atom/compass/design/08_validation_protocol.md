@@ -60,6 +60,11 @@ reported beside its grade (D50, `19` D117).
 [#3423](https://github.com/jgong5/ATOM/issues/3423):** the DSv41-DPEP stage grades its DP
 points by D45.1 too, without the CPU hit rate, a set of their own (D50).
 
+**Revised 2026-11-18 by the owner's
+[ruling on #3590](https://github.com/jgong5/ATOM/issues/3590#issuecomment-6910498913):** a
+passed GPU gate carries to a tree whose diff from the gated tree touches no GPU-gate trigger
+(D43.1, rule 4).
+
 **Scope.** What counts as evidence: which results are reported, how each is measured, what
 tolerance applies and where that tolerance comes from, and what invalidates a run.
 Acceptance is paired simulated and real execution of cc-traces proper, so every rule here
@@ -174,10 +179,14 @@ suite checks.
    imports that provably execute. `regen_gpu_gate_triggers.sh` reproduces it, and a trailing
    `/` matches a subtree.
    `gate_cpu.sh` exits **98** when a changed path matches a trigger and
-   `COMPASS_GPU_GATE_DONE=<sha>` is absent or names a different tree — and also when it
-   cannot determine the diff at all (no git, no `COMPASS_CHANGED_FILES`) or cannot name the
-   tree the attestation would apply to. An unanswerable question is refused, not answered
-   "no". The previous form of this rule was a prose list of areas — "EPLB, DP metadata,
+   `COMPASS_GPU_GATE_DONE=<sha>` is absent or names a different tree whose diff from this
+   one touches a trigger — and also when it cannot determine the diff at all (no git, no
+   `COMPASS_CHANGED_FILES`) or cannot name the tree the attestation would apply to. A GPU
+   gate passed on tree G carries to a later tree whose `git diff --name-only G HEAD` touches
+   no trigger: landing G first already allows that tree, so the blind spot does not grow.
+   A snapshot carries that diff in the `.compass-gpu-carry` stamp `snapshot.sh` writes; with
+   no stamp for G it is refused. An unanswerable question is refused, not answered "no".
+   The previous form of this rule was a prose list of areas — "EPLB, DP metadata,
    cudagraph bounds, block tables" — which both missed modules and named two the CPU gate
    does cover.
 

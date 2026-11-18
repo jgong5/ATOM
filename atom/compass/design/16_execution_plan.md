@@ -446,9 +446,11 @@ covered). The rule it applies: an `atom` module named by an excluded test is a b
 **unless a CPU-gate test that actually runs names it too**. A module both gates import is
 covered when the CPU gate runs, so triggering on it would make the gate cry wolf. A trailing
 `/` matches a subtree. `gate_cpu.sh` matches the diff against that file and **exits 98 unless
-`COMPASS_GPU_GATE_DONE` names this tree's own HEAD**; where it can compute neither a diff nor
-a supplied file list — a `git archive` snapshot with no `.git` — it refuses rather than
-reporting "not required", per principle 6.
+`COMPASS_GPU_GATE_DONE` names this tree's own HEAD, or a tree whose diff from this one touches
+no trigger**, read from git or from a snapshot's `.compass-gpu-carry` stamp (the
+[ruling on #3590](https://github.com/jgong5/ATOM/issues/3590#issuecomment-6910498913)); where
+it can compute neither a diff nor a supplied file list — a `git archive` snapshot with no
+`.git` — it refuses rather than reporting "not required", per principle 6.
 
 The rule has three parts. One was forced by a counter-example measured in this tree, one is
 what kept the headline example at `236abfd9a`, and one changed no path there:
