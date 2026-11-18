@@ -267,6 +267,11 @@ ADMIT_FEATURES = ("admits", "uncached", "cached")
 FIGURES = ("steps", "on_totals", "held_out_step", "held_out", "median")
 #: Why a law fitted on records stating their prefill buckets nowhere has no `padding`.
 NO_BUCKETS = "no record states prefill buckets, so the prefill vector adds no padding"
+#: The engine config's field for the compilation level, and ATOM's ``--level``
+#: default (`EngineArgs.level`), which `run.step_grid.keyed` leaves unnamed;
+#: stated here, as this package imports nothing from the engine.
+LEVEL = "level"
+DEFAULT_LEVEL = 3
 
 
 def _rung_key(rung: int | None) -> str:
@@ -2113,20 +2118,18 @@ def stated_buckets(record) -> list | None:
 
 
 def recorded_level(record) -> dict:
-    """`keyed`'s compilation level of the record `record` (`dp<r>.jsonl`), as ATOM
-    parses the arguments after -- in the run.json beside its `steps`, for engine
-    and host key files, which named none at any level before `keyed` did."""
-    from atom.compass.run.step_grid import LEVEL
-    from atom.model_engine.arg_utils import EngineArgs
-    from atom.utils.arg_parser import FlexibleArgumentParser
-
+    """`keyed`'s compilation level of the record `record` (`dp<r>.jsonl`): the
+    ``--level`` of the ATOM arguments after -- in the run.json beside its
+    `steps`, off `DEFAULT_LEVEL`, for engine and host key files, which named
+    none at any level before `keyed` did."""
     run = Path(record).resolve().parent.parent / "run.json"
     argv = json.loads(run.read_text()).get("argv", []) if run.is_file() else []
     if "--" not in argv:
         return {}
-    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(add_help=False))
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--level", type=int, default=DEFAULT_LEVEL)
     level = parser.parse_known_args(argv[argv.index("--") + 1 :])[0].level
-    return {} if level == EngineArgs.level else {LEVEL: level}
+    return {} if level == DEFAULT_LEVEL else {LEVEL: level}
 
 
 def recorded_buckets(stated: dict) -> tuple[int, ...] | None:

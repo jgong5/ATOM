@@ -2,7 +2,9 @@
 """A record whose engine and host key files name no compilation level, as every
 file did before `keyed` named it, keyed at the `--level` its run.json's ATOM
 arguments name by `compass fit steps`, `compass fit host`, `step_linear_fit`
-and `measure steps`, on `test_fit_steps.py`'s record directories. No device.
+and `measure steps`, on `test_fit_steps.py`'s record directories; and read as
+`keyed` names the level of a server under those arguments. No device: aiter's
+arch probe answers a declared arch.
 """
 
 import json
@@ -24,12 +26,14 @@ from test_fit_steps import (  # noqa: F401
     planted_roots,
     record,
 )
+from test_key_index_cache_dtype import QWEN, served
 from test_memory_readings import DOCUMENT
 from test_parity_served import SAMPLING
 
 from atom.compass.backends import step_linear_fit
 from atom.compass.backends.step_labels import digest
 from atom.compass.bench import measure
+from atom.compass.run.step_grid import LEVEL, keyed
 
 
 def ran_at(directory, *level):
@@ -95,3 +99,18 @@ def test_measure_steps_reads_a_grid_record_at_the_level_it_ran(tmp_path):
     named = f"{a} ran under another engine than ATOM's arguments resolve: level 0 there"
     with pytest.raises(ValueError, match=re.escape(named)):
         read(ENGINE)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [[], ["--level", "3"], ["--level", "0"], ["--level=1"]],
+    ids=["no-level", "level-3", "level-0", "level=1"],
+)
+def test_a_record_reads_the_level_keyed_names_for_its_server(
+    tmp_path, monkeypatch, args
+):
+    config = served(tmp_path, monkeypatch, "gfx950", QWEN, *args)
+    a = ran_at(record(tmp_path / "a", 19), *args)
+
+    named = {k: v for k, v in keyed(config).items() if k == LEVEL}
+    assert step_linear_fit.recorded_level(a / "steps/dp0.jsonl") == named
