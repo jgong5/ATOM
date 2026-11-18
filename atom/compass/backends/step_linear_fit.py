@@ -1342,11 +1342,13 @@ def _folds(design, y, cell, names, path=None) -> dict:
     return out
 
 
-def _max_affine_folds(steps, vector: dict, routing) -> dict:
-    """Per record beside which another holds steps, (its steps, the p50 error
+def _max_affine_folds(steps, vector: dict, routing, cell=None) -> dict:
+    """Per cell beside which another holds steps, (its steps, the p50 error
     on them, each priced as the max over its ranks, of `_fit_vector` of
-    `vector` on the other records' steps)."""
-    cell = np.array([s[0][0] for s in steps])
+    `vector` on the other cells' steps). `cell` is each step's cell, its
+    record when None."""
+    if cell is None:
+        cell = np.array([s[0][0] for s in steps])
     out = {}
     for c in sorted(set(cell.tolist())):
         other = cell != c
@@ -1382,21 +1384,31 @@ def _moe_column(steps, routing) -> tuple:
     `moe_experts` under `routing` and with each step's group dummies as one
     token (`moe_column`). Each form is fitted with each record held out of the
     rung's steps (`_max_affine_folds`), its held-out error `_held_out_error`'s.
-    The form of smallest held-out error is picked, no column on a tie, and a
-    picked column is adopted, returned as the vector `_counts` reads. A rung of
-    one record has no held-out error and adopts none.
+    A rung of one record holds out each group composition instead, the steps
+    with as many dummy forwards beside them (`BatchView.group_dummies`): what a
+    run at another concurrency changes at a rung is how many of its ranks are
+    busy, which the column states and the context column would otherwise take
+    up (#3720 c=1: a c=128 record's rung 1, its steps at 1-4 busy ranks, fitted
+    context at 25x its slope). The form of smallest held-out error is picked,
+    no column on a tie, and a picked column is adopted, returned as the vector
+    `_counts` reads. A rung of one record and one composition has no held-out
+    error and adopts none.
     """
     forms = {"none": {"coefficients": list(DECODE)}}
     forms |= {f: {"coefficients": [*DECODE, f]} for f in MOE_COLUMNS}
+    cell, by = np.array([s[0][0] for s in steps]), "record"
+    if len(set(cell.tolist())) == 1:
+        cell, by = np.array([s[0][7] for s in steps]), "group_dummies"
     held, error = {}, {}
     for form, vector in forms.items():
-        held[form] = _max_affine_folds(steps, vector, routing)
+        held[form] = _max_affine_folds(steps, vector, routing, cell)
         error[form] = _held_out_error(held[form])
     picked = min(error, key=error.get) if held["none"] else None
     adopted = None if picked in (None, "none") else picked
     figures = {
         "picked": picked,
         "adopted": adopted,
+        "held_out_by": by,
         "held_out": {
             form: {
                 "error": error[form],
