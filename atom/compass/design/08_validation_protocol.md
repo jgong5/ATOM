@@ -739,7 +739,7 @@ simulated at another tree is simulated again at that one before it is ranked
 ([ruling on #3179](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6887067640)).
 A configuration simulated at a tree that differs from the named one only in how `deploy.sh`
 builds a run file counts as simulated at the named one when every other configuration's run
-file builds there to its registered hash, so one simulator prices them all
+file builds at the differing tree to its registered hash, so one simulator prices them all
 ([ruling on #3179](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6965210050)).
 
 Stage 2 runs one configuration, so it has no ranking to grade; it is graded by D44's
