@@ -269,6 +269,12 @@ ROWMOD_CELL_STEPS = 100
 ROWMOD_GAIN = 0.1
 #: Seeded shuffles of each step's rows whose mean MAD the `rowmod` column must not beat.
 ROWMOD_SHUFFLES = 8
+#: The free features up to which `_hull` is qhull's exact hull; past them it
+#: is the intersection of each pair's 2-D hull, whose facets the pairs' edges
+#: bound (#3720: real_pw_c128's prefill points, 8 features, hulled exactly to
+#: 430k facets; pooled with real_pw_c1's, joggled, to 2.9M, a 1.8 GB law
+#: whose runs advanced about 3x slower).
+HULL_EXACT_FREE = 6
 HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
 #: What a lone HTTP request's intake costs: per request, and per body byte.
@@ -1488,7 +1494,9 @@ def _hull(points: np.ndarray, names: tuple[str, ...], affine: bool = True) -> di
     refuses them, it hulls their distinct points in sorted order, the same hull,
     and where it refuses those too and they span every free feature, it hulls
     them joggled (`QJ`), each facet then moved out to hold every point. A set
-    that spans none still raises. A feature affine in an earlier one on
+    that spans none still raises. Past `HULL_EXACT_FREE` free features it is
+    no qhull hull of the set but `_pair_hull`'s, bounded in facets, which
+    holds every point and may hold more. A feature affine in an earlier one on
     the set is held to it by two opposed facets, as a constant one is by
     `equal`, unless `affine` is false: then qhull refuses that flat set."""
     from scipy.spatial import ConvexHull, QhullError
@@ -1515,6 +1523,8 @@ def _hull(points: np.ndarray, names: tuple[str, ...], affine: bool = True) -> di
         free = [j for j in range(len(vary)) if j not in tied]
         if len(free) == 1:
             hulled = np.array([[-1.0, 0.0], [1.0, -1.0]])
+        elif len(free) > HULL_EXACT_FREE:
+            hulled = _pair_hull(unit[:, free])
         else:
             try:
                 hulled = ConvexHull(unit[:, free]).equations
@@ -1544,6 +1554,36 @@ def _hull(points: np.ndarray, names: tuple[str, ...], affine: bool = True) -> di
     else:
         facets = []
     return {"equal": equal, "facets": facets}
+
+
+def _pair_hull(unit: np.ndarray) -> np.ndarray:
+    """The facets, as qhull's `equations`, of the intersection of the unit box
+    and each pair of `unit`'s columns' 2-D hull: a convex set that holds every
+    point of `unit`, points in the unit box, and is no smaller than their hull,
+    with at most the box's faces and the pairs' hull edges. A pair whose
+    distinct points qhull refuses (on a line, or one point) adds no facet: the
+    box bounds it. Each facet moves out by its largest cut of a point, so the
+    set holds every point under rounding too."""
+    from scipy.spatial import ConvexHull, QhullError
+
+    d = unit.shape[1]
+    box = np.zeros((2 * d, d + 1))
+    box[np.arange(d), np.arange(d)], box[d + np.arange(d), np.arange(d)] = -1.0, 1.0
+    box[d:, -1] = -1.0
+    rows = [box]
+    for i, j in itertools.combinations(range(d), 2):
+        pair = np.unique(unit[:, [i, j]], axis=0)
+        try:
+            edges = ConvexHull(pair).equations
+        except QhullError:
+            continue
+        eq = np.zeros((len(edges), d + 1))
+        eq[:, [i, j, d]] = edges
+        rows.append(eq)
+    hulled = np.vstack(rows)
+    cut = (unit @ hulled[:, :-1].T + hulled[:, -1]).max(axis=0)
+    hulled[:, -1] -= np.maximum(cut, 0.0)
+    return hulled
 
 
 def _groups(
