@@ -795,7 +795,12 @@ join at. Records that ran before a run wrote that file, or wrote it without
 `data_parallel_size`, take an engine file stated from their `server.log` as
 `--engine FILE`; `compass fit steps` and `compass fit host` take it too, the
 host laws then keyed by it with the records' launch graph sets
-(`atom/compass/fit/samples.py`). `atom/compass/backends/step_labels.py` states the label
+(`atom/compass/fit/samples.py`). Engine and host key files name the compilation level only
+since [#3696](https://github.com/jgong5/ATOM/pull/3696), so these fits and `measure steps`
+read an older record's `--level` from the ATOM arguments after `--` in its `run.json`
+(`step_linear_fit.recorded_level`): a refit on cell A's, cell B's or gpu-40's records keys
+level 0. An older record whose `run.json` names none, as `calib_capture.sh` writes it, keys
+the default, and takes `--engine FILE` naming any other. `atom/compass/backends/step_labels.py` states the label
 and what is cut, and the command writes each record's labels beside it for
 reading, `dp0.cost.jsonl`; the module's docstring states how outliers are
 dropped. A prefill step's label is a trace run's busy time, which `calib_capture.sh`

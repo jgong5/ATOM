@@ -32,7 +32,8 @@ holds the runs it was fitted on, each vector's fit figures and hull, and, once
 `rowmod` shuffles, so the same samples and arguments give the same bytes.
 
 The law states the records' `engine_config`, read from the `.engine.json`
-beside each (`engine_config`) or from `--engine FILE` in their place, and a run
+beside each (`engine_config`) or from `--engine FILE` in their place, a record's
+over the compilation level its run.json names (`recorded_level`), and a run
 under another engine config refuses it, records whose ladders are prefixes of
 the longest read at it (`step_grid_plan.pooled`). At its `data_parallel_size` N above 1
 (EP off) the records come in runs of
@@ -266,6 +267,11 @@ ADMIT_FEATURES = ("admits", "uncached", "cached")
 FIGURES = ("steps", "on_totals", "held_out_step", "held_out", "median")
 #: Why a law fitted on records stating their prefill buckets nowhere has no `padding`.
 NO_BUCKETS = "no record states prefill buckets, so the prefill vector adds no padding"
+#: The engine config's field for the compilation level, and ATOM's ``--level``
+#: default (`EngineArgs.level`), which `run.step_grid.keyed` leaves unnamed;
+#: stated here, as this package imports nothing from the engine.
+LEVEL = "level"
+DEFAULT_LEVEL = 3
 
 
 def _rung_key(rung: int | None) -> str:
@@ -2089,7 +2095,7 @@ def engine_config(records) -> dict:
             raise ValueError(
                 f"{record} has no {engine.name}, the engine config it ran under"
             )
-        held.append(keyed_of(json.loads(engine.read_text())))
+        held.append(recorded_level(record) | keyed_of(json.loads(engine.read_text())))
     held = list(pooled(dict(enumerate(held))).values())
     names = sorted({k for e in held for k in e})
     if differ := [k for k in names if any(e.get(k) != held[0].get(k) for e in held)]:
@@ -2109,6 +2115,21 @@ def stated_buckets(record) -> list | None:
     key = Path(record).with_suffix(".key.json")
     graphs = launch_features.stated(key.exists() and json.loads(key.read_text()))[1]
     return None if graphs is None else graphs["token"]["prefill"]
+
+
+def recorded_level(record) -> dict:
+    """`keyed`'s compilation level of the record `record` (`dp<r>.jsonl`): the
+    ``--level`` of the ATOM arguments after -- in the run.json beside its
+    `steps`, off `DEFAULT_LEVEL`, for engine and host key files, which named
+    none at any level before `keyed` did."""
+    run = Path(record).resolve().parent.parent / "run.json"
+    argv = json.loads(run.read_text()).get("argv", []) if run.is_file() else []
+    if "--" not in argv:
+        return {}
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--level", type=int, default=DEFAULT_LEVEL)
+    level = parser.parse_known_args(argv[argv.index("--") + 1 :])[0].level
+    return {} if level == DEFAULT_LEVEL else {LEVEL: level}
 
 
 def recorded_buckets(stated: dict) -> tuple[int, ...] | None:
@@ -2237,12 +2258,13 @@ def _labelled(args) -> tuple[list, dict, dict, dict]:
             built := step_labels.refusal(json.loads(run.read_text()))
         ):
             raise ValueError(f"{record} is not fitted: {built}")
-    owns = [Path(r).with_suffix(".engine.json") for r in args.records]
+    owns = {Path(r).with_suffix(".engine.json"): r for r in args.records}
     stated = {r: stated_buckets(r) for r in args.records}
     if args.engine:
         engine = keyed_of(json.loads(Path(args.engine).read_text()))
         raw = {own: json.loads(own.read_text()) if own.exists() else {} for own in owns}
-        for own, held in pooled({o: keyed_of(r) for o, r in raw.items()}).items():
+        ran = {o: recorded_level(r) | keyed_of(raw[o]) for o, r in owns.items()}
+        for own, held in pooled(ran).items():
             refuse_context_parallel(held, str(own))
             refuse_contradicting(own, held, args.engine, engine)
         given = json.loads(Path(args.engine).read_text()).get(PREFILL_BUCKETS)
