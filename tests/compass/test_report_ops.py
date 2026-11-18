@@ -8,7 +8,7 @@ import collections
 import json
 
 import pytest
-from test_op_graph import GEMM, g
+from test_op_graph import GATHER, GEMM, g
 from test_op_work import leaf, t
 from test_parity_record import _config, _Runner
 from test_report_html import _Page
@@ -137,15 +137,23 @@ EXTRACTOR = "cost:op-graph: no extractor for the op kind x"
 
 def _deployment(run) -> None:
     """A 1P1D run: two prefill ranks, each step one two-batch-overlap term,
-    rank 1 leaving at rank 0's charge; one decode rank with a drafter, its
-    host returning after its device, a DP dummy and a refused step."""
+    rank 1 leaving at rank 0's charge, and rank 0's next step a decode row
+    beside a prefill row running only the MoE layer's DP gather; one decode
+    rank with a drafter, its host returning after its device, a DP dummy and a
+    refused step."""
     run.mkdir()
     meta = {"kv_link": "inter_node", "run_file": {"op_graph": True}}
     (run / "run.json").write_text(json.dumps(meta))
     _side(
         run / "prefill",
         [
-            [(_step(0, (64, 64, False)), _cost(0, [("op.tbo", 2.0)]))],
+            [
+                (_step(0, (64, 64, False)), _cost(0, [("op.tbo", 2.0)])),
+                (
+                    _step(1, (1, 65, True), (32, 96, False)),
+                    _cost(1, [(f"op.{GATHER}", 0.25)]),
+                ),
+            ],
             [
                 (
                     _step(0, (32, 32, False)),
@@ -179,10 +187,10 @@ def test_a_deployment_s_report_splits_each_side_with_its_whole_terms_and_the_res
     page = _Page(html.write(run).parent)
 
     shown = page.parts["Op-family split"]
-    whom = "steps over {} DP ranks, {} of them refused, their ops unpriced; seconds"
-    whom += " summed over the ranks."
+    whom = "steps over {} DP ranks, {} of them refused; seconds summed over the"
+    whom += " ranks."
     assert shown["text"] == [
-        "prefill side, prefill: 2 " + whom.format(2, 0),
+        "prefill side, prefill: 3 " + whom.format(2, 0),
         "decode side, decode: 2 " + whom.format(1, 1),
         "decode side, DP dummy: 1 " + whom.format(1, 0),
     ]
@@ -190,9 +198,10 @@ def test_a_deployment_s_report_splits_each_side_with_its_whole_terms_and_the_res
     summed = "group_s, summed over the side's DP ranks"
     assert page.rows("Op-family split", 0) == {
         "part": head,
-        "op.tbo": ["3.5", "87.5%", ops.WHOLE["op.tbo"]],
-        "the DP group's slowest rank": ["0.5", "12.5%", ops.GROUP],
-        "predicted": ["4", "100%", summed],
+        "collectives": ["0.25", "5.882%", f"op.{GATHER} 0.25"],
+        "op.tbo": ["3.5", "82.35%", ops.WHOLE["op.tbo"]],
+        "the DP group's slowest rank": ["0.5", "11.76%", ops.GROUP],
+        "predicted": ["4.25", "100%", summed],
     }
     gemm = f"op.{GEMM} 0.5; draft op.{GEMM} 0.125"
     assert page.rows("Op-family split", 1) == {

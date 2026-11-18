@@ -410,8 +410,8 @@ def _ops(run: Path) -> str:
             refused = sum(phase.refused.values())
             text = (
                 f"{f'{side} side, ' if side else ''}{name}: {phase.steps} steps"
-                f" over {ranks} DP ranks, {refused} of them refused, their ops"
-                " unpriced; seconds summed over the ranks."
+                f" over {ranks} DP ranks, {refused} of them refused; seconds summed"
+                " over the ranks."
             )
             share = phase.predicted or None
             rows = [

@@ -16,9 +16,10 @@ whole, each with why.
 
 A phase reconciles with its predicted time, its steps' ``group_s``: each
 step's terms fold to its ``device_s`` and ``draft_s``, or `split` refuses the
-run, and `rows` lists the rest with its cause (`HOST`, `GROUP`). A refused
-step prices no op; its count and reasons are the phase's coverage. A real run
-and a step-level run have no op split, and `split` says so.
+run, and `rows` lists the rest with its cause (`HOST`, `GROUP`). The refused
+steps, by reason, are the phase's coverage: one the cost backend refused holds
+no term, and one the host law refused keeps the terms it was priced at. A real
+run and a step-level run have no op split, and `split` says so.
 """
 
 import collections
