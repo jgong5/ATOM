@@ -274,7 +274,8 @@ def test_compass_run_takes_the_entry_and_lp_lmcache_launches_on_it(
     config = _config(kv, tensor_parallel_size=8, enable_dp_attention=True)
     compass_run._launch_lmcache(config, run, None)
     [argv] = started
-    stations = compass_run._lmcache_stations(run, int(argv[-1]))
+    assert argv[-1] == str(config.kv_cache_block_size)
+    stations = compass_run._lmcache_stations(run)
     assert stations["lookup_s"] == tuple(DECLARED_LAWS["lookup_s"])
     assert stations["request_s"] == DECLARED_LAWS["request_s"]
     lp = parse_server_flags(run["lmcache"]["server"])

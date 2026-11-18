@@ -41,6 +41,8 @@ LOOKUP_S = (2.0**-8, 2.0**-10)  # fixed, per prompt chunk
 REQUEST_S = 2.0**-9
 LATENCY_S, BANDWIDTH = 2.0**-6, 1e9
 CHUNK = 4
+#: The KV block each engine plans, in bytes; a chunk holds whole blocks.
+BLOCK_BYTES = 2**16
 TOKENS = tuple(range(1, 4 * CHUNK + 3))  # four whole chunks and a tail
 LOOK, XFER = "engine->lmcache:lookup#dp0", "engine->lmcache:transfer#dp0.tp0"
 XFER_BACK = "lmcache->engine:transfer#dp0.tp0"
@@ -266,9 +268,13 @@ def test_server_jobs_start_and_end_against_the_station_laws(tmp_path, monkeypatc
         "Popen",
         lambda *a, **k: started.append((a, real(*a, **k))),
     )
-    compass_run._launch_lmcache(_config(), run, None)
+    # The engine's plan, as its runner publishes it: a chunk holds two blocks.
+    now = tmp_path / compass_run.NOW_FILE.format("engine")
+    compass_run.publish_transfer(compass_run._block_file(now), BLOCK_BYTES, 1)
+    compass_run._launch_lmcache(_config(kv_cache_block_size=CHUNK // 2), run, None)
     (argv, *_), proc = started[0]
-    chunk_bytes = int(argv[-1])
+    assert argv[-1] == str(CHUNK // 2)
+    chunk_bytes = 2 * BLOCK_BYTES
     idle = [connect(LpId(lp), served.endpoint) for lp in ("traffic", "frontend")]
     for conn in idle:
         conn.send(("NER", math.inf, [], math.inf))
