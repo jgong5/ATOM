@@ -22,6 +22,7 @@ from atom.compass.backends import (
 )
 from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.cost import group as method_group
+from atom.compass.backends.step_linear import dummy_view
 from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band
 from atom.compass.backends.step_roofline import StepFallbackBackend
 
@@ -132,8 +133,12 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
     warm, priced, extrapolated = [], [], 0
     for group in joined:
         key, _, seconds, step, *_ = next(iter(group.values()))
+        # A rank that ran the prefill step as a dummy forward holds its dummy's
+        # row (`step_linear_fit._groups`), priced at its view as a run prices it.
+        peer = next(views[i][step] for i in group if step in views[i])
+        mine = {i: views[i].get(step) or dummy_view(peer) for i in group}
         try:
-            costs = {i: backend.price(views[i][step]) for i in group}
+            costs = {i: backend.price(mine[i]) for i in group}
         except CostRefused as refused:
             band = _band(key, max((r[1] for r in group.values()), key=lambda c: c[1]))
             _count(declined, band, seconds, refused.declined)
@@ -142,7 +147,10 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
             {i: (c.target_seconds, group[i][1]) for i, c in costs.items()}
         )
         extrapolated += any(t.provenance.extrapolated for t in costs[top].terms)
-        band, price = _band(key, group[top][1]), costs[top].target_seconds
+        # A step is banded by its busiest rank's tokens, a dummy priced highest too.
+        busiest = max((i for i in group if step in views[i]), key=lambda i: group[i][1])
+        band = _band(key, group[top if step in views[top] else busiest][1])
+        price = costs[top].target_seconds
         # Each term of a fallback's answer carries what declined the step.
         if costs[top].refusals:
             _count(fell, band, seconds, dict.fromkeys(costs[top].refusals))

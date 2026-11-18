@@ -41,7 +41,11 @@ joined on step index, labelled with the smallest rank label (the others wait
 for the last rank to enter), and a prefill row adds the line's `moe_rows` and,
 when some prefill step of the samples the group split for two-batch overlap,
 `serial_moe_rows` (`StepLinearLaw`). A
-rank that ran the step as a dummy forward adds no row. A step that some rank
+rank that ran a decode step as a dummy forward adds no row; one that ran a
+prefill step so adds its dummy's row (`step_linear.dummy_view`), labelled as
+the step, which a run prices as a rank of the group the step waits for, and
+when some such dummy ran eagerly, the prefill vector adds `EAGER_DUMMY`
+(`StepLinearLaw`); a draft law takes no dummy row. A step that some rank
 lacks otherwise or cut, or whose ranks' rows fall to different vectors, is
 counted under `ranks` and not fitted. The law reports each step's rank label
 spread, `max / min - 1`, as its p50 and p90 under `spread`. The group's step
@@ -231,7 +235,10 @@ from atom.compass.backends.step_linear import (
     MOE_COLUMNS,
     PREFILL,
     PROPOSE,
+    EAGER_DUMMY,
     cached_seqs,
+    dummy_view,
+    eager_dummy,
     moe_column,
     moe_tokens,
     rowmod,
@@ -283,6 +290,63 @@ def _rung_key(rung: int | None) -> str:
     return EAGER if rung is None else str(rung)
 
 
+def _prefill_counts(
+    view, where: str, form: str, dp: int, serial: bool, out: bool, buckets, eager
+) -> tuple:
+    """The prefill vector's features of `view`'s step, `where` naming it in a
+    refusal, as `_features` states them; under `eager` its `EAGER_DUMMY`."""
+    r = view.prefill
+    counts = (1, sum_tokens(r), sum_query_square(r), sum_query_cached(r))
+    if form == "history":
+        counts += (sum_context(r) - sum_tokens(r),)
+    if form == "cached_seqs":
+        counts += (cached_seqs(r),)
+    if dp > 1:
+        if view.moe_rows is None:
+            raise ValueError(
+                f"{where} has no moe_rows, which a data-parallel law prices "
+                "prefill from"
+            )
+        counts += (view.moe_rows,)
+        if serial:
+            counts += (0 if view.tbo_tokens else view.moe_rows,)
+    if out:
+        output = bool(view.produces_output)
+        counts += (len(r) if output else 0, int(output))
+    if buckets:
+        if (padding := token_padding(view, buckets)) is None:
+            raise ValueError(
+                f"{where} has no group_max_tokens, which its prefill token "
+                "graph's bucket holds"
+            )
+        counts += (padding,)
+    if eager:
+        if (got := eager_dummy(view, buckets)) is None:
+            raise ValueError(
+                f"{where} has no group_max_tokens, which says whether its group "
+                "runs it eagerly"
+            )
+        counts += got
+    return counts
+
+
+def _eager_dummies(samples, options) -> bool:
+    """Whether the prefill vector adds `EAGER_DUMMY`: as `options` states, else
+    above `dp` 1 when some prefill step of `samples` had a dummy peer and ran
+    eagerly (`eager_dummy` of its dummy's view), under `options`' buckets."""
+    if "eager_dummies" in (options or {}):
+        return options["eager_dummies"]
+    buckets = _buckets(options)
+    return _options(options)[1] > 1 and any(
+        s.view.prefill
+        and s.view.group_dummies
+        and s.view.group_max_tokens is not None
+        and eager_dummy(dummy_view(s.view), buckets)[0]
+        for s in samples
+        if not s.cut
+    )
+
+
 def _features(
     samples,
     form: str,
@@ -291,20 +355,23 @@ def _features(
     serial: bool = False,
     routing: tuple[int, int] | None = None,
     buckets: tuple[int, ...] = (),
+    eager: bool = False,
 ) -> tuple[list[tuple], dict]:
     """One rank's fittable samples as (vector, features, seconds, step, context,
-    tokens, dummies), and how many were cut, per reason.
+    tokens, dummies, dummy), and how many were cut, per reason.
 
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
     order, plus `history` or `cached_seqs` in its form, above `dp` 1 `moe_rows` on prefill and
     under `serial` `serial_moe_rows`, and under `draft` or on a step with a draft
-    label `seqs` and `out` on prefill, with `buckets` its `padding`, as
-    `StepLinearBackend` counts them;
+    label `seqs` and `out` on prefill, with `buckets` its `padding`, and under
+    `eager` its `EAGER_DUMMY`, as `StepLinearBackend` counts them;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill;
     `tokens` a decode step's real MoE tokens under `routing`, the model's
     (experts, top-k), which its MoE column reads, else None; `dummies` its
     group's dummy forwards (`BatchView.group_dummies`), which the column's
-    `moe_experts` counts as one token.
+    `moe_experts` counts as one token; `dummy`, on a prefill step above `dp` 1
+    and not under `draft`, the features of a peer's dummy forward at that step
+    (`dummy_view`), as the backend prices that rank, else None.
     """
     cut, rows = dict.fromkeys(CUTS, 0), []
     for s in samples:
@@ -312,35 +379,14 @@ def _features(
         if s.cut:
             cut[s.cut] += 1
         else:
-            tokens = None
+            tokens = dummy = None
             if view.prefill:
-                r = view.prefill
                 key = "prefill"
-                counts = (1, sum_tokens(r), sum_query_square(r), sum_query_cached(r))
-                if form == "history":
-                    counts += (sum_context(r) - sum_tokens(r),)
-                if form == "cached_seqs":
-                    counts += (cached_seqs(r),)
-                if dp > 1:
-                    if view.moe_rows is None:
-                        raise ValueError(
-                            f"{s.provenance['run']} step {s.step} has no moe_rows, which "
-                            "a data-parallel law prices prefill from"
-                        )
-                    counts += (view.moe_rows,)
-                    if serial:
-                        counts += (0 if view.tbo_tokens else view.moe_rows,)
-                if draft or s.draft_s is not None:
-                    output = bool(view.produces_output)
-                    counts += (len(r) if output else 0, int(output))
-                if buckets:
-                    if (padding := token_padding(view, buckets)) is None:
-                        raise ValueError(
-                            f"{s.provenance['run']} step {s.step} has no "
-                            "group_max_tokens, which its prefill token graph's "
-                            "bucket holds"
-                        )
-                    counts += (padding,)
+                where = f"{s.provenance['run']} step {s.step}"
+                shape = (form, dp, serial, draft or s.draft_s is not None, buckets)
+                counts = _prefill_counts(view, where, *shape, eager)
+                if dp > 1 and not draft:
+                    dummy = _prefill_counts(dummy_view(view), where, *shape, eager)
             else:
                 key = _rung_key(view.capture_rung)
                 counts = (1, sum_context(view.decode), view.graph_padding)
@@ -351,7 +397,9 @@ def _features(
                     )
             context = tuple(r.context_tokens for r in view.decode)
             dummies = view.group_dummies
-            rows.append((key, counts, s.device_s, s.step, context, tokens, dummies))
+            rows.append(
+                (key, counts, s.device_s, s.step, context, tokens, dummies, dummy)
+            )
     return rows, cut
 
 
@@ -1479,11 +1527,15 @@ def _groups(
     routing: tuple[int, int] | None = None,
     dummies: list[frozenset] | None = None,
     buckets: tuple[int, ...] = (),
+    eager: bool = False,
 ) -> tuple[list[dict[int, tuple]], dict, list[float]]:
     """One run's steps, each {rank: its `_features` row} labelled with the
-    smallest rank label, a rank that ran the step as a dummy forward holding
-    none; what was cut; and each step's rank label spread. With `steps`, only
-    the steps numbered in it; `serial`, `routing` and `buckets` as
+    smallest rank label; what was cut; and each step's rank label spread. A
+    rank that ran a prefill step as a dummy forward holds the row of its
+    dummy (`_features`' `dummy`), labelled the same, since the backend prices
+    it as a rank of the group and the step waits for it; one that ran a decode
+    step or, under `draft`, any step so holds none. With `steps`, only the
+    steps numbered in it; `serial`, `routing`, `buckets` and `eager` as
     `_features` reads them;
     `dummies`, each rank's steps run as dummy forwards, read from its samples
     when None: a rank that gave no sample needs them given."""
@@ -1491,29 +1543,35 @@ def _groups(
         dummies = [rank[0].dummies for rank in run]
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
     got = [
-        _features(rank, form, len(run), draft, serial, routing, buckets) for rank in run
+        _features(rank, form, len(run), draft, serial, routing, buckets, eager)
+        for rank in run
     ]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
     if len(run) == 1:
-        return [{0: r} for r in got[0][0]], cut, []
+        return [{0: r[:7]} for r in got[0][0]], cut, []
     ranks = [{r[3]: r for r in rows} for rows, _ in got]
     groups, spread, cut["ranks"] = [], [], 0
     for step in sorted(set().union(*ranks)):
         group = {i: rank[step] for i, rank in enumerate(ranks) if step in rank}
-        ran = len(group) + sum(step in d for d in dummies)
-        if ran < len(ranks) or len({r[0] for r in group.values()}) > 1:
+        idle = [i for i, d in enumerate(dummies) if step in d]
+        if len(group) + len(idle) < len(ranks) or len({r[0] for r in group.values()}) > 1:
             cut["ranks"] += 1
             continue
         labels = [r[2] for r in group.values()]
         spread.append(max(labels) / min(labels) - 1.0)
-        groups.append({i: (*r[:2], min(labels), *r[3:]) for i, r in group.items()})
+        rows = {i: (*r[:2], min(labels), *r[3:7]) for i, r in group.items()}
+        peer = next(iter(group.values()))
+        if peer[7] is not None:
+            rows |= {i: (peer[0], peer[7], min(labels), *peer[3:7]) for i in idle}
+        groups.append(dict(sorted(rows.items())))
     return groups, cut, spread
 
 
 def _fit_steps(steps: list[list[tuple]], names: list[str], design) -> dict:
     """`_fit_form` of `steps`, each its ranks' `fit` rows, on `design(row)`, the
     form's features of a row; with `rows`, each step's row at the rank picked.
-    A rank that ran the step as a dummy forward holds no row."""
+    A rank that ran the step as a dummy forward holds its dummy's row, or none
+    (`_groups`)."""
     width = max(map(len, steps))
     x = np.zeros((len(steps), width, len(names)))
     real = np.zeros((len(steps), width), dtype=bool)
@@ -1578,6 +1636,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     routing = _routing(options)
     serial = _serial(samples, options)
     buckets = _buckets(options)
+    eager = not draft and _eager_dummies(samples, options)
     samples = [
         (
             s
@@ -1590,7 +1649,13 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     groups, cut, spread = [], {"warm": 0, "warm_s": 0.0}, []
     for i, run in enumerate(runs.values()):
         got, c, s = _groups(
-            run, form, draft, serial=serial, routing=routing, buckets=buckets
+            run,
+            form,
+            draft,
+            serial=serial,
+            routing=routing,
+            buckets=buckets,
+            eager=eager,
         )
         groups += [[(i, *r) for r in g.values()] for g in got]
         spread += s
@@ -1600,7 +1665,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     prefill += ["cached_seqs"] * (form == "cached_seqs") + ["moe_rows"] * (dp > 1)
     prefill += ["serial_moe_rows"] * serial
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
-    prefill += ["padding"] * bool(buckets)
+    prefill += ["padding"] * bool(buckets) + list(EAGER_DUMMY) * eager
     law = {
         "provenance": f"step_linear_fit {form} on {len(runs) * dp} real records "
         f"({', '.join(runs)})",
@@ -1937,7 +2002,11 @@ def _fold_laws(samples, options, seed, draft: bool = False):
     """Each run of `samples`, in the order runs first appear, with its ranks'
     samples and the law `fit` gives on the other runs, under `draft` as `fit`
     fits a draft law."""
-    options = {**(options or {}), "serial": _serial(samples, options)}
+    options = {
+        **(options or {}),
+        "serial": _serial(samples, options),
+        "eager_dummies": _eager_dummies(samples, options),
+    }
     for run, ranks in _runs(samples, _options(options)[1]).items():
         others = [s for s in samples if s.provenance["run"] != run]
         yield run, ranks, fit(others, options, seed, draft)[0]
@@ -1950,7 +2019,11 @@ def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None
     band, that rank's (counts, context, tokens, dummies), relative error), the
     error nan where that law has no vector."""
     form = _options(options)[0]
-    options = {**(options or {}), "serial": _serial(samples, options)}
+    options = {
+        **(options or {}),
+        "serial": _serial(samples, options),
+        "eager_dummies": _eager_dummies(samples, options),
+    }
     if warm is None:
         warm = fit(samples, options, seed, draft)[0]["warm_steps"]
     folds = _fold_laws(samples, options, seed, draft) if folds is None else folds
@@ -1963,6 +2036,7 @@ def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None
             serial=options["serial"],
             routing=_routing(options),
             buckets=_buckets(options),
+            eager=not draft and options["eager_dummies"],
         )[0]:
             key, _, seconds, step, *_ = next(iter(group.values()))
             if step in warm[i]:

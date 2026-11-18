@@ -26,6 +26,15 @@ scheduled. A data-parallel step stating no `group_max_tokens` is refused unless
 its group split it for two-batch overlap or runs it eagerly for an attention
 backend (`token_padding`), and a vector with a `padding` coefficient states its
 `buckets`.
+After it a prefill vector may add `eager_dummy` and `eager_dummy_tail`
+(`eager_dummy`): 1 on a data-parallel rank's dummy forward in a prefill step
+its group runs eagerly, past the largest of `buckets` (or with none), and the
+second only where the group also runs a finishing prompt's tail, else 0. Such a
+dummy (`dummy_view`, the row a record's dummy line states) is priced by the
+prefill vector like any rank, and the group's step is the max over its ranks:
+on real DPA records it holds its peers for about as long as a full-budget
+prefill, whatever their tokens, which a one-token row's other features do not
+carry.
 
 A law prices one rank's step; the runner takes the group's step as the max
 over its ranks. Its parallel layout is its `engine_config`'s, which a run
@@ -172,7 +181,11 @@ PREFILL_EXTRA = (
     "seqs",
     "out",
     "padding",
+    "eager_dummy",
+    "eager_dummy_tail",
 )
+#: The prefill vector's columns over a DP dummy forward run eagerly (`eager_dummy`).
+EAGER_DUMMY = ("eager_dummy", "eager_dummy_tail")
 DECODE = ("step", "context", "graph_padding")
 #: The MoE columns a decode vector may add, over its step's real MoE tokens.
 MOE_COLUMNS = ("moe_tokens", "moe_experts")
@@ -261,6 +274,43 @@ def token_padding(view: BatchView, buckets: tuple[int, ...]) -> int | None:
     if peak is None:
         return None
     return next((b - tokens for b in buckets if b >= peak), 0)
+
+
+def dummy_view(view: BatchView) -> BatchView:
+    """The view of a data-parallel rank's dummy forward at the prefill step a
+    peer's `view` states: the one-token row at position 0 a record's dummy
+    line holds (`ModelRunner.dummy_execution`), producing output as those
+    lines say, with the group's fields its peer states."""
+    import dataclasses
+
+    return dataclasses.replace(
+        view,
+        requests=(RequestShape(1, 1, False),),
+        capture_rung=None,
+        produces_output=True,
+        dp_dummy=True,
+        group_prefills=True,
+        draft_bs=None,
+        target_bs=None,
+        image_tokens=0,
+    )
+
+
+def eager_dummy(view: BatchView, buckets: tuple[int, ...]) -> tuple[int, int] | None:
+    """`EAGER_DUMMY`'s counts for `view`: (1, 1 where its group runs a
+    finishing prompt's tail, `group_tail`, else 0) on a data-parallel rank's
+    dummy forward in a prefill step whose body runs eagerly, past the largest
+    of `buckets` or with none (`token_padding`), else (0, 0); None on such a
+    dummy whose view states no `group_max_tokens`."""
+    if not (view.dp_dummy and view.prefill):
+        return 0, 0
+    if buckets:
+        padding = token_padding(view, buckets)
+        if padding is None:
+            return None
+        if padding:
+            return 0, 0
+    return 1, int(view.group_tail)
 
 
 def cached_seqs(rows) -> int:
@@ -437,6 +487,15 @@ class StepLinearBackend(CostBackend):
                         "its prefill token graph's bucket holds",
                     )
                 counts += (padding,)
+            if eager := [f for f in EAGER_DUMMY if f in vector.features]:
+                got = eager_dummy(batch_view, vector.buckets or ())
+                if got is None:
+                    raise self._refuse(
+                        batch_view,
+                        "no group_max_tokens on this data-parallel dummy forward, "
+                        "which says whether its group runs the step eagerly",
+                    )
+                counts += tuple(dict(zip(EAGER_DUMMY, got))[f] for f in eager)
         else:
             rung, kind = batch_view.capture_rung, "decode"
             vector = law.decode.get(rung)

@@ -102,9 +102,12 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     smallest rank label and priced, banded and validated as the rank
     `step_linear_fit.priced_rank` picks; a step the law refuses is banded as
     its rank of most tokens. Its draft is measured and priced the same way. A
-    rank that ran the step as a dummy forward is priced 0 s: the step is
-    measured, priced and banded by the ranks that ran a forward, and a rank
-    that ran only dummy forwards adds no step. A step some
+    rank that ran a decode step as a dummy forward is priced 0 s, and one that
+    ran a prefill step so is priced at its dummy's view
+    (`step_linear.dummy_view`), as a run prices it: the step is measured by the
+    ranks that ran a forward and banded by its priced rank, the busiest of
+    them where that is a dummy, and a rank that ran only dummy forwards adds
+    no step. A step some
     rank lacks otherwise or cut, or whose
     ranks fall to different vectors, is counted under `cut.ranks`. Ranks whose
     records differ in length by more than the one step a stopped run leaves on
