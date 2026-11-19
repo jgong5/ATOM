@@ -1337,11 +1337,15 @@ each side under the EP8 cell's arguments and environment, with these differences
   the price list leaves out; its `--out` is a directory holding every run's `plan.jsonl`
   lines of the side and one run's `run.json`.
 - **Runs.** As the DPA-TP8 cell's, with the EP8 cell's host laws,
-  `laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json` and `-decode.json`, and the
-  platform flags of the EP8 cell's simulated run above.
+  `laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json.xz` and `-decode.json.xz`.
 - **Ranking.** EP8 is ordered against the DPA-TP8 cell only as both are simulated at one
   tree, the one the ranking's registration names (the ranking gate of
-  `atom/compass/design/08_validation_protocol.md`).
+  `atom/compass/design/08_validation_protocol.md`). A run at a tree that differs from it
+  only in its pricing counts as run there when every step it priced prices to the same
+  terms through that tree's `OpGraphBackend`
+  ([Ruling](https://github.com/jgong5/ATOM/issues/1499#issuecomment-6970448413)): a side's
+  `steps/dp<r>.cost.jsonl` holds the terms each line of its `steps/dp<r>.jsonl` was priced
+  at, and the run's price list and graphs price those lines again at that tree.
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
