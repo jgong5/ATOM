@@ -103,9 +103,11 @@ A leaf whose operator cannot run, or that copies to the host or with host
 memory ATOM keeps pageable (`_pageable`), refuses by name.
 On one GPU at a DP-attention layout, the runner is one DP rank's own, TP 1 and DP 1, the
 graphs read and the lines written keep the layout, and a collective leaf
-refuses: it is measured across the layout's ranks, where a DP all-gather's
-`x` holds each rank's own `sizes` entry's rows, the capture's being rank 0's
-(`_own_rows`).
+refuses: it is measured across the layout's ranks, each on its own rows
+where the capture's, rank 0's, are not every rank's (`_own_rows`): a DP
+all-gather's `x` its `sizes` entry's, and MORI's dispatch and combine at a G
+its DP group gathers, its share of G as the capture splits it, refused by
+name where no G gives the rows the leaf states a rank receives.
 A collective leaf is one family over its message bytes, decode and prefill
 alike (`exchange`), which the plan ladders, densifies and covers.
 aiter's comm-fused MoE (`COMM_FUSED`) runs on a process group, as a collective
@@ -120,7 +122,8 @@ called at MORI's entry point on the handle ATOM builds for the model's MoE,
 with the leaf's arguments, and, since neither runs twice in a row, timed
 through graphs that keep MORI's order (`_Mori`): a combine alone on one
 dispatch's rows, their count restored before each call, less that restore;
-a dispatch as rounds of it and a combine, less that combine alone. The point
+a dispatch as rounds of it and a combine of the rows its output holds, less
+that combine alone. The point
 records each graph's median (`parts_ns`), and its kernels are the leaf's own.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, a KV
@@ -1993,7 +1996,8 @@ class Stub:
         occurrence where later ones take a `QUERIED` buffer, with no read;
         with its kernels, profiled again on every rank when any rank's named
         none of a call its cold graph timed. Every rank's graph holds the most K
-        any rank's call gives, and a leaf any rank refuses, every rank does; K
+        any rank's call gives, every rank times the warm graph where any rank
+        has several copies, and a leaf any rank refuses, every rank does; K
         past a leaf's occurrences, where later ones take a `QUERIED` buffer, a
         multiple of them. Refused, naming the share of `COLD` times the cache
         its copies read, where `n` stops under both `m` and K. A MORI leaf is
@@ -2076,9 +2080,12 @@ class Stub:
             n = len(calls)
             cycle = [calls[i % n] for i in range(k)]
             cold, parts = _timed(fn, cycle, self.flush)
-            # warm: call i on its cold call's occurrence's first copy (`QUERIED`)
+            # warm: call i on its cold call's occurrence's first copy (`QUERIED`),
+            # on every rank where any has several copies: a collective's ranks,
+            # each on its own rows (`_own_rows`), can build different counts
             warm = [calls[i % n % o] for i in range(k)]
-            warm = _timed(fn, warm)[0] if n > 1 and k == CALLS else None
+            several = agreed(int(n > 1), cpu_group(), most=True)
+            warm = _timed(fn, warm)[0] if several and k == CALLS else None
             # two profiles that named nothing of a call its graph timed missed it
             if agreed(int(not kernels and any(cold)), cpu_group(), most=True):
                 forward_context._forward_context = calls[0][1]
@@ -2726,9 +2733,12 @@ def _summed(op, rows) -> dict:
 
 
 def _own_rows(op) -> dict:
-    """`op`, when it is the DP all-gather (`GATHERV`), with each tensor of its
-    `x` holding this DP rank's `sizes` entry's rows: the capture records rank
-    0's call, and aiter fails a rank whose rows are not its entry."""
+    """`op` with this rank's rows where the capture's, rank 0's, are not every
+    rank's: the DP all-gather (`GATHERV`), each tensor of its `x` holding this
+    DP rank's `sizes` entry's rows, as aiter fails a rank whose rows are not
+    its entry, and MORI's dispatch and combine (`_mori_rows`)."""
+    if op["op"].startswith(MORI):
+        return _mori_rows(op)
     if op["op"] != GATHERV:
         return op
     from aiter.dist.parallel_state import get_dp_group
@@ -2741,6 +2751,40 @@ def _own_rows(op) -> dict:
     x = op["args"]["x"]
     x = [own(t) for t in x] if isinstance(x, list) else own(x)
     return {**op, "args": op["args"] | {"x": x}}
+
+
+def _mori_rows(op) -> dict:
+    """MORI's dispatch or combine `op` on this rank's rows. The capture states
+    rank 0's rows, its ids', and the rows a rank receives at most, a
+    dispatch's output or a combine's input: the DP group's G rows, sent from
+    each of a DP rank's EP ranks (`peers.install_mori`). Where those are rank
+    0's rows from every EP rank, every rank sends rank 0's; else this rank
+    sends its share of G as the capture split it (`peers.split`), in each
+    tensor but a combine's input. Marked refused where no G gives what the
+    leaf states; unchanged on a DP group of one, whose rank is rank 0."""
+    from aiter.dist.parallel_state import get_dp_group
+
+    from atom.compass.capture.peers import split
+
+    args, combines = op["args"], op["op"].endswith(".combine")
+    rows, ep = args["indices"]["shape"][0], args["num_ep_ranks"]
+    most = args["input"]["shape"][0] if combines else op["out"][0][0]
+    group = get_dp_group()
+    dp, rank = group.world_size, group.rank_in_group
+    if most == rows * ep or dp == 1:
+        return op
+    g, left = divmod(most * dp, ep)
+    if left or g < rows:
+        why = f"MORI's {op['op'].rsplit('.', 1)[1]} states {most} rows a rank"
+        why += f" receives from {ep} EP ranks, {rows} of them this rank's"
+        return op | {"refuses": f"{why}: no split of a DP group of {dp} gives that"}
+    own = split(g, rows, dp)[rank]
+    sent = {
+        slot: {**t, "shape": [own, *t["shape"][1:]]}
+        for slot, t in args.items()
+        if isinstance(t, dict) and "shape" in t and not (combines and slot == "input")
+    }
+    return {**op, "args": args | sent}
 
 
 def _written(op, path) -> str | None:
@@ -3196,7 +3240,8 @@ class _Mori:
     `after`):
 
     * a dispatch's call is a round: it, then a combine of its rows from a
-      buffer as ATOM's experts write one, of `dtype`;
+      buffer as ATOM's experts write one, of `dtype`, as many rows as the
+      dispatch's output, every rank's;
     * a combine's call first fills the count of one dispatch back in
       (`_restore`): the first call's, made at once, and again after a round.
       A combine's own dispatch sends zeros at the handle's format, as many
@@ -3215,6 +3260,7 @@ class _Mori:
         if not self.combines:
             self.parts = [("round", 1, self), ("combine", -1, self.alone)]
             self.parts.append(("fill", 1, self.fill))
+            self.most = op["out"][0][0]  # the rows a rank receives at most
 
     def __call__(self, **kwargs):
         self.before(**kwargs)
@@ -3279,9 +3325,10 @@ class _Mori:
         """A combine onto `indices` of the experts' output for every rank's
         rows, the most a rank receives, at the dispatch's launch counts."""
         c, device = self.handle.config, indices.device
-        rows = len(indices) * c.world_size
-        if self.out is None or len(self.out) < rows:
-            self.out = torch.zeros(rows, c.hidden_dim, dtype=self.dtype, device=device)
+        if self.out is None:
+            self.out = torch.zeros(
+                self.most, c.hidden_dim, dtype=self.dtype, device=device
+            )
         launch = {k: kwargs[k] for k in ("block_num", "warp_per_block") if k in kwargs}
         self.handle.combine(self.out, None, indices, **launch)
 
