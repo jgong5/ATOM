@@ -116,7 +116,7 @@ Each lists what its side's run lacks, with the command that makes it, and exits 
 when anything is lacking. Both lack one thing, `step linear law: stale (coverage)`:
 no decode vector for some captured batch sizes this configuration schedules (rungs
 8, 16 and 48 up on the prefill side, 32 up and eager on the decode side), since the
-calibration never decoded that many requests at once. A step at such a rung is
+calibration recorded no decode step at those rungs. A step at such a rung is
 refused, which the run reports; at concurrency 16 none is. Any other line is a
 trap (below).
 
