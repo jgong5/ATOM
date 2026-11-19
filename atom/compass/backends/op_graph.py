@@ -56,7 +56,8 @@ composes host time.
 Two-batch overlap. A step the data-parallel group split (`tbo_tokens`) runs
 this rank's tokens as two micro-batches (`step_roofline.micro_batches`), each
 priced from the graph at its own prefill shape and the group's rows of it
-(`moe_rows`), the second with the step's output and the first with none,
+(`moe_rows`), the most a rank runs of it its `group_max_tokens`, the second
+with the step's output and the first with none,
 each traced as a micro-batch (`forward.structure`).
 Each graph's prices in run order fall into segments that alternate streams: an
 MoE exchange of activations rides the comm stream, everything else the compute
@@ -698,7 +699,10 @@ class OpGraphBackend(CostBackend):
         this rank and gathered over the DP group, and none is its rows', so
         a leaf that leads with its rows alone or beside the target's tokens,
         as its anchors do, is asked at its rows. Last, a decode's target
-        states the real rows its MoE runs (`real_rows`), and any other None."""
+        states the real rows its MoE runs (`real_rows`), and any other None;
+        then a target the most tokens a rank of its DP group scheduled
+        (`group_max_tokens`), which MORI's exchange at a G is priced by, and
+        a drafter None."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
@@ -720,6 +724,7 @@ class OpGraphBackend(CostBackend):
         own = sum(r.query_tokens for r in view.requests)
         real = real_rows(own, view.moe_rows, view.moe_tokens, view.group_dummies)
         bound += (real if phase == "decode" and not draft else None,)
+        bound += (None if draft else view.group_max_tokens,)
         if not width:
             return bound
         if ran == t:
@@ -828,7 +833,9 @@ class OpGraphBackend(CostBackend):
         listed = bool(self.resolver)
         for k, half in enumerate(halves):
             output = k == 1 and view.produces_output
-            half = replace(half, produces_output=output)
+            # the most tokens a rank of the group runs in this micro-batch
+            peak = max(view.tbo_tokens[k])
+            half = replace(half, produces_output=output, group_max_tokens=peak)
             shape, region = self._region(half, micro_batch=True)
             at.append(shape)
             bound = self.resolver and self._bound(half)
