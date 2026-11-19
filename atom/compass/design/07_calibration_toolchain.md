@@ -2271,8 +2271,9 @@ server, DPA4-EP4, DSpark5, a bound of 64 rows a rank), its law keyed by
  calibrate.sh OUT '256 --cache-bust first_turn_suffix' 'design 1' 'design 2'
                                    no trace record: --trace refuses DP (#3010)
    real record     c=256, cell A's top: decode rows' contexts, rank by rank
-   design K        no rung past the cap: one list of 64 sessions a rank,
-                     each filled once; a hit resumes at the start of the
+   design K        no rung past the cap at the draws' mean: one list of 64
+                     sessions a rank, each filled once; a tokenizer cache
+                     holding every prompt; a hit resumes at the start of the
                      last whole block two cuts share (no state checkpoint)
                    per group: each rank's fill, data_parallel_rank on each,
                      waited for on every rank -> the group's rows at once
@@ -2433,10 +2434,10 @@ reads as unrunnable. MiniMax-M3's waits on its pool and contexts.
 
 | Where | Change | Task |
 |---|---|---|
-| `atom/compass/backends/step_linear_plan.py` | the design plans: configuration, memory reading and real record in; levels, sessions and their cuts, groups and prefill points, in the order they run, out; CPU tests | 1 |
+| `atom/compass/backends/step_linear_plan.py` | the design plans: configuration, memory reading and real record in; levels, sessions and their cuts, groups and prefill points, in the order they run, and the tokenizer cache that holds a design record's prompts, out; CPU tests | 1 |
 | beside `atom/compass/drive/sweep.py` | each group's fill and send, stop and cover; the client-run export, its sends and acks beside it; phase and group times | 2 |
 | `atom/compass/drive/sweep.py` | the prefill points sent and covered on its sender, in a trace record, with its export | 3 |
-| `scripts/compass/calibrate.sh` | `design K` and `trace design K`; the law's provenance names them | 4 |
+| `scripts/compass/calibrate.sh` | `design K` and `trace design K`, a design record's server at the planner's tokenizer cache; the law's provenance names them | 4 |
 | one card [GPU] | the mechanism check | 5 |
 | crsuse2-m2m-v3-005 [GPU] | cell A's validation, from `dsv41/dev`; then each configuration the GPU plan runs | 6 |
 
