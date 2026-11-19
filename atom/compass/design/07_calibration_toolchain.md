@@ -1718,7 +1718,7 @@ blocks short of the prompt's last block (`BlockManager._walk_prefix`), and on De
 only at a state checkpoint (`_gated_hit`). A prefill forward keeps one interval
 checkpoint, the last multiple of `--state-checkpoint-interval-tokens` in its chunk
 (`checkpoint_cut`), so one every 16,384 tokens in S1's chunks; a prompt keeps one more, its
-anchor, at its last whole block, a block back when it ends on one
+anchor, at its last whole block, or a block before its end when it ends on a block boundary
 (`_record_checkpoint_end`, `ATOM_STATE_CHECKPOINT_END_MARGIN` unset). So a session's cuts
 fill bottom first: each extends the one below and resumes at that cut's anchor, unless the
 lower cut's generation prompt, which the cut above renders otherwise, starts before it, and
