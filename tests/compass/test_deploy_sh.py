@@ -573,8 +573,8 @@ def test_a_simulated_router_bounds_a_request_by_a_year_of_wall_time(tmp_path, pl
     out, _ = script.communicate(timeout=60)
 
     assert script.returncode == 0, out
-    # So are the prepare pool's wait and preparation, which a request a router
-    # LP holds for its release would otherwise run out on the wall clock.
+    # So are the prepare pool's wait and preparation, which a loaded host
+    # stretches on the wall clock.
     for flag, scale in (
         ("--request-timeout-secs", 1),
         ("--prepare-queue-timeout-ms", 1000),

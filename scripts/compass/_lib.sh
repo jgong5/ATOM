@@ -344,8 +344,10 @@ COMPASS_SIM_REQUEST_TIMEOUT_S=31536000
 # Every wall-clock bound a simulated router gets, each at that year: the one
 # above, and the prepare pool's wait for a thread and its preparation of a
 # request (`--prepare-queue-timeout-ms`, `--prepare-timeout-ms`; atomesh's
-# defaults are 250 ms and 5 s), which run on the wall clock too, so a request a
-# router LP holds for its release would otherwise run them out.
+# defaults are 250 ms and 5 s). Those two start once the router LP releases a
+# request, so its hold runs neither out (atom/mesh/tests/compass_pd_router_test.rs),
+# but a loaded host stretches a preparation's wall time, which the run's clock
+# does not see.
 COMPASS_SIM_ROUTER_BOUNDS=(--request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S"
     --prepare-queue-timeout-ms "${COMPASS_SIM_REQUEST_TIMEOUT_S}000"
     --prepare-timeout-ms "${COMPASS_SIM_REQUEST_TIMEOUT_S}000")
