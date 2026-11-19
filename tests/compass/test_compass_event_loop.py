@@ -1029,9 +1029,10 @@ def _intake_run_file(monkeypatch, tmp_path, intake) -> None:
     monkeypatch.setenv(compass_run.ENV, str(path))
 
 
-def _burst(run, monkeypatch, n, app, sizes=None):
-    """`n` stamped requests at one arrival, through the served app; returns
-    the arrival once the loop has finished."""
+def _burst(run, monkeypatch, n, app, sizes=None, receives=None):
+    """`n` stamped requests at one arrival, through the served app, each with a
+    body of ``sizes[seq]`` bytes, or read from ``receives(seq)``; returns the
+    arrival once the loop has finished."""
     stamps = queue.Queue()
     traffic = _traffic(run, stamps, before_ner=lambda: None, n=n)
     arrival = stamps.get(timeout=10)[0]
@@ -1047,7 +1048,7 @@ def _burst(run, monkeypatch, n, app, sizes=None):
 
         tracestate = carriers.tracestate_with(None, arrival, seq).encode()
         scope = {"type": "http", "headers": [(b"tracestate", tracestate)]}
-        return served(scope, receive, None)
+        return served(scope, receives(seq) if receives else receive, None)
 
     async def go():
         await asyncio.sleep(arrival)
@@ -1078,6 +1079,49 @@ def test_a_burst_reaches_the_app_one_intake_charge_at_a_time(
     first = arrival + fixed + sizes[0] * per_byte
     print(f"\n  app entered at {entered}")
     assert entered == pytest.approx([first, first + fixed + sizes[1] * per_byte])
+
+
+def test_a_burst_s_bodies_leave_the_socket_while_a_tokenizer_job_is_open(
+    run, monkeypatch, tmp_path
+):
+    # Each intake costs 2 ms and each body comes in two socket reads. Request
+    # 0's tokenizer job holds its real thread until request 2's body is read
+    # to its end, for at most 2 wall seconds. Request 2's turn waits on the
+    # wall for job 0, but its body may not: a client whose send stalls on an
+    # unread socket drops the connection at its TCP_USER_TIMEOUT (aiperf's
+    # 30 s), which aborted cell A's c=256 warmup burst. Each request still
+    # reaches the app one intake charge after the one before.
+    _intake_run_file(monkeypatch, tmp_path, (2e-3, 0.0))
+    read_out, seen, entered = threading.Event(), [], []
+
+    async def app(scope, receive, send):
+        loop, seq = asyncio.get_running_loop(), api_server._tracestate_stamp(scope)[1]
+        entered.append((seq, loop.time()))
+
+        def do_preprocess():
+            if seq == 0:
+                seen.append(read_out.wait(2))
+
+        await loop.run_in_executor(None, do_preprocess)
+
+    def receives(seq):
+        parts = [b"a", b"b"]
+
+        async def receive():
+            await asyncio.sleep(0)  # a socket read
+            chunk = parts.pop(0)
+            if seq == 2 and not parts:
+                read_out.set()
+            return {"type": "http.request", "body": chunk, "more_body": bool(parts)}
+
+        return receive
+
+    arrival = _burst(run, monkeypatch, 3, app, receives=receives)
+    assert seen == [True]
+    assert [s for s, _ in entered] == [0, 1, 2]
+    assert [t for _, t in entered] == pytest.approx(
+        [arrival + 2e-3, arrival + 4e-3, arrival + 6e-3]
+    )
 
 
 def test_a_body_outside_the_intake_hull_is_charged_nothing_and_named(

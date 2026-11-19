@@ -705,8 +705,12 @@ class HttpChannel:
     naming it, and is a run-summary reason ``http:unstamped <method> <path>``. A
     stamped request waits until it is released and every released request has
     been read; released requests are handed on in ``(arrival, seq)`` order and
-    count as handled once their body has been received. The app gets the
-    received body messages again from its ``receive``.
+    count as handled once their body has been received. The body is read off
+    the socket as it comes, while the request waits its turn: the turns of a
+    burst pass on the wall one tokenizer job at a time, and a client whose send
+    stalls on an unread socket past its ``TCP_USER_TIMEOUT`` (aiperf's default
+    is 30 s) drops the connection. The app gets the received body messages
+    again from its ``receive``.
 
     A stamped request whose body is a cancel
     (`atom.compass.carriers.cancel_seq`) goes to no app: it is answered 204,
@@ -784,34 +788,39 @@ class HttpChannel:
             rt.check_arrival(ch, arrival, seq)
             wake = loop.create_future()
             loop.held[ch, seq] = (arrival, wake)
-            await wake
-            async with loop.hand_on:
-                # Read the whole body first: a request counts as handled only
-                # once nothing about it still waits on the socket.
-                body = [await receive()]
-                while body[-1].get("more_body"):
-                    body.append(await receive())
-                cancelled = cancel_seq(body[0].get("body", b""))
-                if self.intake is not None and cancelled is None:
-                    # The clock may not pass a station job's completion before
-                    # the job is placed, nor this instant before the requests
-                    # handed on before this one have gone as far as they can.
-                    await loop.executor.placed()
-                    fixed, per_byte, idle = self.intake
-                    if arrival >= self.intake_end:
-                        fixed = idle
-                    nbytes = sum(len(m.get("body", b"")) for m in body)
-                    lo, hi = self.hull or (0, math.inf)
-                    if lo <= nbytes <= hi:
-                        charge(fixed + per_byte * nbytes)
-                    else:
-                        rt.refusals.append(
-                            f"http:intake of a {nbytes}-byte body, outside the "
-                            f"{lo:.0f} to {hi:.0f} bytes its http_intake was fitted on"
-                        )
-                    self.intake_end = loop.time()
-                with rt.lock:
-                    rt.count_done_locked(ch, seq)
+            # Its body leaves the socket as it comes, not at its turn.
+            reading = asyncio.ensure_future(_body_messages(receive))
+            try:
+                await wake
+                async with loop.hand_on:
+                    # A request counts as handled only once nothing about it
+                    # still waits on the socket.
+                    body = await reading
+                    cancelled = cancel_seq(body[0].get("body", b""))
+                    if self.intake is not None and cancelled is None:
+                        # The clock may not pass a station job's completion
+                        # before the job is placed, nor this instant before the
+                        # requests handed on before this one have gone as far
+                        # as they can.
+                        await loop.executor.placed()
+                        fixed, per_byte, idle = self.intake
+                        if arrival >= self.intake_end:
+                            fixed = idle
+                        nbytes = sum(len(m.get("body", b"")) for m in body)
+                        lo, hi = self.hull or (0, math.inf)
+                        if lo <= nbytes <= hi:
+                            charge(fixed + per_byte * nbytes)
+                        else:
+                            rt.refusals.append(
+                                f"http:intake of a {nbytes}-byte body, outside the "
+                                f"{lo:.0f} to {hi:.0f} bytes its http_intake was "
+                                "fitted on"
+                            )
+                        self.intake_end = loop.time()
+                    with rt.lock:
+                        rt.count_done_locked(ch, seq)
+            finally:
+                reading.cancel()  # a request cancelled before its body was read
             if cancelled is not None:
                 if (hangup := self.hangups.get(cancelled)) is not None:
                     hangup.set()
@@ -858,6 +867,14 @@ async def _refuse_unstamped(rt, method: str, path: str, send) -> None:
 
 def _relay(channels) -> str | None:
     return next((c.name for c in channels if c.name.endswith(":relay")), None)
+
+
+async def _body_messages(receive) -> list[dict]:
+    """The request's body messages, read to the last."""
+    body = [await receive()]
+    while body[-1].get("more_body"):
+        body.append(await receive())
+    return body
 
 
 async def _read_body(receive):
