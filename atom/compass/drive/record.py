@@ -50,9 +50,12 @@ first launch, inside the record.
 
 run.json's ``aiter_jit_builds`` names each aiter JIT module or kernel built, or begun,
 since serve wrote ``server.json``, when ``/health`` first answered
-(`aiter_jit`): a step may have waited on its build, so grading, `compass fit
-steps`, `compass fit host`, `step_linear_fit` and `validate.cost` refuse the
-record. A server that built none leaves no entry.
+(`aiter_jit`), ``jit_compiles`` times each compile, and ``clock_ns`` copies
+``server.json``'s pair of clocks, which places them among the steps: a step
+may have waited on a build, so grading, `compass fit steps`, `compass fit
+host`, `step_linear_fit` and `validate.cost` cut each step that overlaps one,
+and refuse the record when they cut too many (`step_labels.refusal`). A
+server that built none leaves no entry.
 Its ``ptl_changes`` names each change of its cards' PTL state from then until
 the stop (`identity.ptl_changes`), which the fits refuse; ``ptl`` is the
 state at the stop.
@@ -80,7 +83,7 @@ from pathlib import Path
 from triton import knobs
 
 from atom.compass.backends.step_grid_plan import TARGET
-from atom.compass.backends.step_labels import label_run, write_table
+from atom.compass.backends.step_labels import CLOCK, label_run, write_table
 from atom.compass.cli import OPS
 from atom.compass.drive import aiter_jit, runfile, serve
 from atom.compass.drive.gpu import add_gpu_flag
@@ -135,6 +138,8 @@ def main(argv: list[str]) -> None:
         )
     run_json = Path(args.out) / serve.RUN_JSON
     builds = aiter_jit.builds_since(ready.stat().st_mtime_ns) if ready.exists() else {}
+    if builds:  # the clocks that place its compiles among its steps
+        builds[CLOCK] = json.loads(ready.read_text())[CLOCK]
     run = {**json.loads(run_json.read_text()), "env": env, **builds}
     if changes:
         run[PTL_CHANGES] = changes

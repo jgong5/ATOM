@@ -383,8 +383,8 @@ def _features(
     cut, rows = dict.fromkeys(CUTS, 0), []
     for s in samples:
         view = s.view
-        if s.cut:
-            cut[s.cut] += 1
+        if s.cut:  # a `JIT` cut is counted only where it cuts a step
+            cut[s.cut] = cut.get(s.cut, 0) + 1
         else:
             tokens = dummy = None
             if view.prefill:
@@ -1624,7 +1624,8 @@ def _groups(
         _features(rank, form, len(run), draft, serial, routing, buckets, eager)
         for rank in run
     ]
-    cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
+    named = dict.fromkeys(k for _, c in got for k in c)
+    cut = {k: sum(c.get(k, 0) for _, c in got) for k in named}
     if len(run) == 1:
         return [{0: r[:7]} for r in got[0][0]], cut, []
     ranks = [{r[3]: r for r in rows} for rows, _ in got]
@@ -2595,7 +2596,9 @@ def _labelled(args) -> tuple[list, dict, dict, dict]:
     for record in args.records:
         run = Path(record).resolve().parent.parent / "run.json"
         if run.is_file() and (
-            built := step_labels.refusal(json.loads(run.read_text()))
+            built := step_labels.refusal(
+                json.loads(run.read_text()), [json_file.read_jsonl(record)]
+            )
         ):
             raise ValueError(f"{record} is not fitted: {built}")
     owns = [Path(r).with_suffix(".engine.json") for r in args.records]

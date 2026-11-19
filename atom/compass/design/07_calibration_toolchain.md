@@ -1381,9 +1381,11 @@ length varies off 64 at a query on 16.
 
 ### Problem
 
-A real record whose `run.json` names `aiter_jit_builds` is refused whole (`08` D52,
+A real record whose `run.json` names `aiter_jit_builds` was refused whole (`08` D52,
 [#1704's ruling](https://github.com/jgong5/ATOM/issues/1704#issuecomment-6405004644)), so
-a graded run must compile nothing its container could have compiled before it. Each JIT
+a graded run had to compile nothing its container could have compiled before it. Since
+[#3739](https://github.com/jgong5/ATOM/issues/3739) the steps that overlap a timed compile
+are cut instead, up to a bound (`08` D52), and a compile still stalls the run it is in. Each JIT
 compiler in play (aiter's JIT modules, `compile_hsaco`, FlyDSL, Triton and Gluon,
 Inductor) caches by its own key, and a key mixes code identity with a runtime
 specialization: shapes, constexprs, argument divisibility by 16, pointer alignment,

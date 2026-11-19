@@ -40,7 +40,8 @@ arguments; when its export lists `unnamed` requests, naming each by its
 `x_request_id`, since no step can be matched to them; and when its run.json
 names `aiter_jit_builds`, the JIT compiles its server ran or began while
 it served, since a step may have waited on a build (`compass record` and a real
-`cctraces_sim.sh` cell write it), or its steps hold `arrivals.json`. A real run is
+`cctraces_sim.sh` cell write it), unless run.json times them and the steps they
+cut are few (`step_labels.refusal`), or its steps hold `arrivals.json`. A real run is
 refused when its run.json holds `run_file`. A simulated run, refused without
 `run_file`, is also refused when it skips host segments, or its run file has no
 host laws and so prices no host time; when the step roofline was on in a run of
@@ -309,7 +310,7 @@ def _client_run(cell, run, client, whole=False, simulated=False) -> tuple:
         why.append("its export names no arguments its client was given")
     if unnamed := [u["x_request_id"] for u in export.get("unnamed") or ()]:
         why.append(f"its export lists requests no step can be matched to: {unnamed}")
-    if built := aiter_jit.refusal(run):
+    if built := aiter_jit.refusal(run, record.values()):
         why.append(built)
     if simulated and "run_file" in run:
         why += _not_graded(run, traces)

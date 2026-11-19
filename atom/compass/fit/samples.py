@@ -12,8 +12,9 @@ Under `floored`, a trace run's drafter labels lose the profiler's floor
 (`parity.busy.floored`). A DP rank no request reached writes a line per dummy forward it runs, and gives
 no sample; its file still counts in the run's digest. An empty
 rank file lost its lines, and refuses.
-A record whose run.json names `aiter_jit_builds` or `ptl_changes` refuses,
-naming them, and so does one whose `source` counts uncommitted files.
+A record whose run.json names `ptl_changes` refuses, naming them, and so does
+one whose `source` counts uncommitted files, or one whose `aiter_jit_builds`
+`step_labels.refusal` refuses; a step that overlaps a timed compile is cut.
 With `GRADED_ONLY_ENV` set to ``1``, a record's samples start at its graded
 window: the first step holding a request its client runs name as sent (their
 exports' ``requests``, the warmup's left out), every rank's earlier steps
@@ -139,8 +140,6 @@ def _record(
             f"{directory} was profiled, and profiling splits the steps it times, "
             "so no fit takes them"
         )
-    if built := aiter_jit.refusal(run):
-        raise ValueError(f"{directory} is not fitted: {built}")
     if changes := run.get(PTL_CHANGES):
         named = ", ".join(f"{c['from']} to {c['to']} at {c['at']}" for c in changes)
         raise ValueError(
@@ -155,6 +154,8 @@ def _record(
             f"{steps} holds {ARRIVALS}, so its steps are not numbered as its lines"
         )
     record = served(steps, client_runs)
+    if built := aiter_jit.refusal(run, record.values()):
+        raise ValueError(f"{directory} is not fitted: {built}")
     graded_from = None
     if os.environ.get(GRADED_ONLY_ENV) == "1":
         held = [s["step"] for s in _steps(record) if s["client_run"] is not None]

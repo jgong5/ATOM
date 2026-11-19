@@ -6,8 +6,11 @@ A record is a real run's step record (`steps/dp<r>.jsonl`, written with
 that is not a dummy run a `Sample`: its batch view, its device label, its host
 labels and its provenance. `step_linear_fit` fits samples and `validate.cost`
 prices them; neither reads a step's stamps. Neither takes a record whose
-run.json names `BUILDS`, the JIT compiles its server ran while it served;
-`refusal` says why.
+run.json names `BUILDS`, the JIT compiles its server ran while it served, unless
+run.json also times each (`COMPILES`) and places them on the step record's
+clock (`CLOCK`): then each rank's steps that overlap a compile are cut whole as
+`JIT`, no device, draft or host label, and the record is taken unless they are
+more than `JIT_BOUND` of a rank's forwards. `refusal` says why one is not.
 
 A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
 `dp_rank`. An older record's lines state neither count: `group_tokens`
@@ -157,6 +160,21 @@ TABLE_VERSION = 1
 #: run.json's entry naming the JIT modules and kernels its server compiled while
 #: it served (`atom.compass.drive.aiter_jit`); a server that compiled none has none.
 BUILDS = "aiter_jit_builds"
+#: run.json's entry timing each of those compiles: its ``compiler``, ``name``,
+#: artifact ``directory`` and the wall clock mtimes of its first and last file
+#: written, ``first_ns`` and ``last_ns``.
+COMPILES = "jit_compiles"
+#: run.json's pair of wall clock and monotonic nanoseconds read together on the
+#: server's host when serving began, which places those mtimes on the step
+#: record's monotonic clock.
+CLOCK = "clock_ns"
+#: Why a whole step is cut: its window, entry to exit, overlaps a compile's span.
+JIT = "jit"
+#: How long before a compile's first file the span starts: a Triton kernel's
+#: front end builds its IR before it writes any file.
+JIT_SLACK_NS = 200_000_000
+#: The most of a rank's forwards the compiles may cut before the record refuses.
+JIT_BOUND = 0.01
 #: The variable that, set to ``record``, labels an untraced prefill step from its
 #: own device window (module docstring); unset, such a step is cut `untraced`.
 PREFILL_LABEL_ENV = "COMPASS_PREFILL_LABEL"
@@ -178,31 +196,81 @@ def _prefill_label() -> str:
 ACCEPT_BUILDS_ENV = "COMPASS_ACCEPT_JIT_BUILDS"
 
 
-def refusal(run: dict) -> str | None:
+def refusal(run: dict, ranks: Iterable[list[dict]]) -> str | None:
     """Why grading, a fit or `validate.cost` refuses a record whose run.json is
-    `run`, naming the modules of its `BUILDS`; None when it names none, or
-    when `ACCEPT_BUILDS_ENV` is ``1`` (then a warning names them)."""
-    if builds := run.get(BUILDS):
-        if os.environ.get(ACCEPT_BUILDS_ENV) == "1":
-            print(
-                f"WARNING: {ACCEPT_BUILDS_ENV}=1 takes a record whose server ran "
-                f"a JIT compile of {builds} while it served; a step may have "
-                "waited on it",
-                file=sys.stderr,
-            )
-            return None
+    `run` and whose rank records' lines are `ranks`, naming the modules of its
+    `BUILDS`: run.json does not time them, or the steps they cut (`jit_steps`)
+    are more than `JIT_BOUND` of a rank's forwards. None when it names none,
+    or when `ACCEPT_BUILDS_ENV` is ``1`` (then a warning names them)."""
+    if not (builds := run.get(BUILDS)):
+        return None
+    if os.environ.get(ACCEPT_BUILDS_ENV) == "1":
+        print(
+            f"WARNING: {ACCEPT_BUILDS_ENV}=1 takes a record whose server ran "
+            f"a JIT compile of {builds} while it served; a step may have "
+            "waited on it",
+            file=sys.stderr,
+        )
+        return None
+    if COMPILES not in run or CLOCK not in run:
         return (
             f"its server ran a JIT compile of {builds} while it served, "
-            "so a step may have waited on it"
+            f"so a step may have waited on it, and its run.json has no {COMPILES} "
+            f"and {CLOCK} to place them among its steps"
         )
+    spans = compile_spans(run)
+    for lines in ranks:
+        forwards = [s for s in lines if not s["is_dummy_run"]]
+        if (n := len(jit_steps(forwards, spans))) > JIT_BOUND * len(forwards):
+            return (
+                f"its server's JIT compiles of {builds} overlap {n} of DP rank "
+                f"{forwards[0]['dp_rank']}'s {len(forwards)} forwards, more than "
+                f"{JIT_BOUND:.0%}"
+            )
     return None
+
+
+def compile_spans(run: dict) -> list[tuple[int, int]]:
+    """Each compile run.json `run` times, as its span on the step record's
+    clock: from `JIT_SLACK_NS` before its first file to its last; none
+    without `CLOCK`."""
+    if CLOCK not in run:
+        return []
+    wall, monotonic = run[CLOCK]
+    return [
+        (
+            c["first_ns"] - wall + monotonic - JIT_SLACK_NS,
+            c["last_ns"] - wall + monotonic,
+        )
+        for c in run.get(COMPILES, ())
+    ]
+
+
+def jit_steps(lines, spans) -> set[int]:
+    """The steps of `lines`, one rank's record, whose window, from entry to
+    exit, overlaps one of `spans`."""
+    return {
+        s["step"]
+        for s in lines
+        if any(lo <= s["t_exit_ns"] and s["t_enter_ns"] <= hi for lo, hi in spans)
+    }
+
+
+def _spans(record: Path) -> list[tuple[int, int]]:
+    """`compile_spans` of the run.json in `record`'s run directory, beside its
+    `steps`; none without one, or when `ACCEPT_BUILDS_ENV` takes it whole."""
+    run = record.parent.parent / "run.json"
+    if os.environ.get(ACCEPT_BUILDS_ENV) == "1" or not run.is_file():
+        return []
+    return compile_spans(read_json(run))
 
 
 @dataclass(frozen=True)
 class Sample:
     """One real forward, labelled.
 
-    `device_s` is its device label, None when cut, and `cut` names why (`CUTS`).
+    `device_s` is its device label, None when cut, and `cut` names why (`CUTS`,
+    or `JIT` for a step cut whole).
     `draft_s` is its draft label, None when cut, on a step with no draft, or
     on a decode whose device reached its `propose` pass before the host's
     draft copy wait.
@@ -211,7 +279,8 @@ class Sample:
     `draft_kv_s` is its draft-KV label, the part of `device_s` that is the
     drafter's draft-KV pass, on a step that produces output; None elsewhere.
     `host` holds the segments it has, in seconds: no `W_post` on a middle chunk,
-    no `E` on the record's first forward or after an idle engine (`idle`).
+    no `E` on the record's first forward or after an idle engine (`idle`), none
+    on a step cut `JIT`.
     `provenance` holds `source`, `run` (the run's digest), `requests` (the
     request ids the step served) and `config` (the host key the record states,
     or None).
@@ -590,6 +659,7 @@ def _label(
             "by its device time"
         )
     (exposed, early), traced = _host_cut(lines), _traced(path)
+    jit = jit_steps(lines, _spans(path))
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     window_prefill = _prefill_label() == "record" and not traced
@@ -647,7 +717,9 @@ def _label(
             and "d_target_ns" in s
             and window_prefill
         )
-        if view.prefill and view.decode:
+        if s["step"] in jit:
+            cut = JIT
+        elif view.prefill and view.decode:
             cut = "mixed"
         elif not view.prefill and s["step"] in exposed:
             cut = "exposed"
@@ -699,7 +771,7 @@ def _label(
         idle = prev is not None and not busy[i]
         if prev is not None and not idle:
             host["E"] = enter - starts[i - 1]
-        host = {} if traced else {k: v * 1e-9 for k, v in host.items()}
+        host = {} if traced or cut == JIT else {k: v * 1e-9 for k, v in host.items()}
         provenance = {
             "source": "record",
             "run": run,

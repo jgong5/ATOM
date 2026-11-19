@@ -18,7 +18,10 @@ and p90 (aiperf's inter-token latency, per request) and E2E latency p50, in
 milliseconds, and the requests counted. Every run must have been given the
 same client arguments. Below the table it names REAL's stalled forwards over
 its graded window (`atom.compass.validate.stalls`): seconds the real run lost
-to one DP rank's slow launch, which a simulated run does not charge. Then
+to one DP rank's slow launch, which a simulated run does not charge. Then the
+JIT compiles REAL's run.json times that fell in that window, and the forwards
+and seconds of its steps they cut there, the most of any rank
+(`step_labels.jit_steps`): the fits leave those steps out. Then
 REAL's own 95% interval of TTFT p99, p90 TTFT and TPOT p90 over resamples of
 its sends' 60 s blocks, and whether each SIM's error lies inside it
 (`tails`): a tail holds a few bursts' worth of requests. Then, per
@@ -34,6 +37,7 @@ import random
 import sys
 from pathlib import Path
 
+from atom.compass.backends import step_labels
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.validate import stalls
 from atom.compass.validate.curves import (
@@ -101,6 +105,7 @@ def main(argv: list[str]) -> int:
         errs = "".join(f"{error(values[0], v):>18}" for v in values[1:])
         print(f"{name:34}{shown}{errs}")
     print(stalled(real))
+    print(compiled(real))
     print(tails(real, sims, rows))
     for sim in sims:
         print(paired(real, sim))
@@ -201,6 +206,31 @@ def stalled(real: Path) -> str:
         return "real " + stalls.text(stalls.report(real))
     except (OSError, KeyError, ValueError) as e:
         return f"real: stalled forwards not counted ({type(e).__name__}: {e})"
+
+
+def compiled(real: Path) -> str:
+    """REAL's JIT compiles in its graded window and the steps they cut there,
+    or why they are not counted."""
+    run = read_json(real / "run.json") if (real / "run.json").is_file() else {}
+    if not (builds := run.get(step_labels.BUILDS)):
+        return "real: no JIT compile while it served"
+    if not (spans := step_labels.compile_spans(run)):
+        return f"real: JIT compiles of {builds}, untimed, not cut"
+    if (window := stalls.window(real)) is None:
+        return "real: no graded window to count JIT compiles in"
+    lo, hi = (int(t * 1e9) for t in window)
+    inside = [(a, b) for a, b in spans if a <= hi and lo <= b]
+    forwards, seconds = 0, 0.0
+    for path in sorted((real / "steps").glob("dp*[0-9].jsonl")):
+        lines = [s for s in read_jsonl(path) if lo <= s["t_enter_ns"] < hi]
+        cut = step_labels.jit_steps(lines, inside)
+        held = [s["t_exit_ns"] - s["t_enter_ns"] for s in lines if s["step"] in cut]
+        forwards, seconds = forwards + len(held), max(seconds, sum(held) * 1e-9)
+    return (
+        f"real: {len(inside)} of {len(spans)} JIT compiles in the graded window; "
+        f"the steps they cut there: {forwards} forwards over its ranks, "
+        f"{seconds:.3f} s on the rank they cut most"
+    )
 
 
 if __name__ == "__main__":
