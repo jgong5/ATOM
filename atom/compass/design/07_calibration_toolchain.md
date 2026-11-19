@@ -1707,12 +1707,12 @@ history levels are the real record's prefill rows' cached history, N_KV - N_Q, a
 and p90 over the rows that have one, scaled the same way over a point's n rows.
 
 **Sessions.** A rank's session i is one conversation of the calibration traces cut at three
-lengths, its draw at each level. Sessions cut from one trace differ from its first user
-turn on, as aiperf's `--cache-bust first_turn_suffix` makes lanes differ, so no two share
-a KV block past the traces' common prompt. A group's rows are distinct sessions, the first
-ones of the rung's. A session's top cut fills first, and a lower cut's prompt starts with
-it, so the lower cut fills at a hit on its blocks and computes only past the last position
-a hit resumes from: on DeepSeek-V4, a state checkpoint, one every
+lengths, its draw at each level. Sessions cut from one trace differ from the end of its
+first turn on, where aiperf's `--cache-bust first_turn_suffix` marks each conversation, so
+no two share a KV block past the traces' common prompt. A group's rows are distinct
+sessions, the first ones of the rung's. A session's top cut fills first, and a lower cut's
+prompt starts with it, so the lower cut fills at a hit on its blocks and computes only
+past the last position a hit resumes from: on DeepSeek-V4, a state checkpoint, one every
 `--state-checkpoint-interval-tokens` and one at each prompt's end
 (`atom/model_engine/block_manager.py`). A cut an earlier group filled fills again at a hit
 while the pool keeps it, and the pool evicts its least recently freed cached block, and a
