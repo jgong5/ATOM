@@ -17,7 +17,10 @@ over those lines, rebuilds `tbo_tokens`; with no rule such a line refuses.
 No line states its group's dummy forwards: a view's `group_dummies` counts the
 run's rank records whose line at its step is a dummy run (`group_dummies`), and
 its `group_max_tokens` is the most tokens their lines at its step run
-(`group_peaks`).
+(`group_peaks`). Its `prefill_duty` is its rank's `shape.PrefillDuty` at its
+line's `t_enter_ns`, over the rank's earlier lines from `t_enter_ns` to
+`t_exit_ns`, each a prefill forward when some rank's line at its step, not a
+dummy run, holds a prefill row (`group_prefills`).
 A view also takes its line's `target_bs`, `draft_bs`, `draft_moe_rows` and
 `draft_rows`, the widths and rows its target and drafter ran at, which an op
 graph reads, and its `group_needs_eager`, which a line states only where it is
@@ -139,7 +142,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from atom.compass.backends.json_file import read_json, read_jsonl
-from atom.compass.backends.shape import BatchView, RequestShape
+from atom.compass.backends.shape import BatchView, PrefillDuty, RequestShape
 
 #: The recent bounds whose tightest places a step on the host clock, of either
 #: window: token copy wait exits for the launch-exposed cut, MTP status-wait
@@ -341,6 +344,32 @@ def group_tails(ranks: Iterable[list[dict]]) -> frozenset[int]:
     return frozenset(
         s["step"] for lines in ranks for s in lines if s.get("named") and not s["is_dummy_run"]
     )
+
+
+def group_prefills(ranks: Iterable[list[dict]]) -> frozenset[int]:
+    """The steps at which some rank of `ranks`, one run's rank records as their
+    lines, prefills: its line, not a dummy run, holds a prefill row."""
+    return frozenset(
+        s["step"]
+        for lines in ranks
+        for s in lines
+        if not s["is_dummy_run"] and any(not d for _, _, d in s["rows"])
+    )
+
+
+def prefill_duties(lines: list[dict], prefills) -> list[float | None]:
+    """Per line of one rank's `lines`, in order, its `shape.PrefillDuty` at
+    its `t_enter_ns` over the lines before it, each from `t_enter_ns` to
+    `t_exit_ns` and a prefill forward when its step is in `prefills`; None for
+    each when some line lacks either stamp."""
+    if any("t_enter_ns" not in s or "t_exit_ns" not in s for s in lines):
+        return [None] * len(lines)
+    duty, out = PrefillDuty(), []
+    for s in lines:
+        enter, exit_ = s["t_enter_ns"] * 1e-9, s["t_exit_ns"] * 1e-9
+        out.append(duty.at(enter))
+        duty.add(enter, exit_, s["step"] in prefills)
+    return out
 
 
 def group_peaks(ranks: Iterable[list[dict]]) -> dict[int, int]:
@@ -562,21 +591,33 @@ def label_run(
     n = max(map(len, ranks), default=0)
     starts = [max(_pull(x[i]) for x in ranks if i < len(x)) for i in range(n)]
     dummy_ranks, peaks = group_dummies(ranks), group_peaks(ranks)
-    tails = group_tails(ranks)
+    tails, prefills = group_tails(ranks), group_prefills(ranks)
     return [
         (
             ([], [])
             if x and all(s["is_dummy_run"] for s in x)
-            else _label(r, x, run, starts, split_rule, dummy_ranks, peaks, tails)
+            else _label(
+                r, x, run, starts, split_rule, dummy_ranks, peaks, tails, prefills
+            )
         )
         for r, x in zip(records, ranks)
     ]
 
 
 def _label(
-    record, lines, run, starts, split_rule, dummy_ranks, peaks, tails=None
+    record,
+    lines,
+    run,
+    starts,
+    split_rule,
+    dummy_ranks,
+    peaks,
+    tails=None,
+    prefills=None,
 ) -> tuple[list[Sample], list[dict]]:
-    """`label` of `record`'s `lines`, each `E` from `starts` at the line before."""
+    """`label` of `record`'s `lines`, each `E` from `starts` at the line before;
+    `prefills` the steps its group prefills at (`group_prefills`), read from
+    the rank records beside it when None."""
     path = Path(record)
     steps = [s for s in lines if not s["is_dummy_run"]]
     dummies = frozenset(s["step"] for s in lines if s["is_dummy_run"])
@@ -599,6 +640,11 @@ def _label(
     run = run or digest(record)
     samples, table, prev, ranks = [], [], None, None
     busy, admits = busy_gaps(lines), admissions(lines)
+    if prefills is None:
+        prefills = group_prefills(
+            [read_jsonl(p) for p in _peers(path)] if "moe_rows" in steps[0] else [lines]
+        )
+    duties = prefill_duties(lines, prefills)
     for i, s in enumerate(lines):
         if s["is_dummy_run"]:
             prev = s
@@ -638,6 +684,7 @@ def _label(
             group_max_tokens=peaks.get(s["step"]) if dp else None,
             group_needs_eager=s.get("group_needs_eager", False),
             group_tail=dp and s["step"] in (tails or ()),
+            prefill_duty=duties[i],
         )
         cut = None
         # An untraced prefill labelled from its own window (`PREFILL_LABEL_ENV`).

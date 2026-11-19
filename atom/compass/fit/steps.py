@@ -19,7 +19,8 @@ counts, per kernel the floor could not place and per label field, the steps
 the fit labels whose label keeps that kernel's recorded length.
 
 `step-linear` takes real runs only and fits `step_linear_fit.FORMS`' `--form`,
-`history` by default, joining each step's ranks at the engine config's
+`history` by default, with `--cold-peer-rows` its prefill vector's
+`cold_peer_rows` (`step_linear_fit._cold`), joining each step's ranks at the engine config's
 `data_parallel_size`, so a record with a
 rank that gave no sample refuses; it pads prefill to the records'
 `prefill_buckets`, naming under `unfitted` records stating none, and holds
@@ -132,6 +133,7 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
         drafter = _model_routing(args.model, config["model"], DRAFT_ROUTING)
         options["draft_moe_routing"] = drafter
     options["buckets"] = config.get("prefill_buckets")
+    options["cold"] = bool(args.cold_peer_rows)
     law, report = step_linear_fit.fit(samples, options, args.seed)
     if options["buckets"] is None:
         law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
@@ -214,6 +216,7 @@ BACKENDS = {
 #: The flags only one backend reads, each to that backend.
 OWN = {
     "form": "step-linear",
+    "cold_peer_rows": "step-linear",
     "moe_routing": "step-linear",
     "model": "step-linear",
     "grid": "step-grid",
@@ -254,6 +257,13 @@ def main(argv: list[str]) -> None:
         type=measure._span,
         metavar="A:B",
         help="the --grid lines measure steps --sessions A:B keeps",
+    )
+    parser.add_argument(
+        "--cold-peer-rows",
+        action="store_const",
+        const=True,
+        help="the prefill vector adds cold_peer_rows: its peers' MoE rows on a "
+        "step outside a stretch of prefill steps (data-parallel records only)",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(

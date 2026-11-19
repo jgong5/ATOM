@@ -1935,7 +1935,12 @@ def _group_step_seconds(
     it; without one it is settled here, which runs the DP collective; `view`,
     the `BatchView` the record built from it, is priced in place of a new one.
     Under DP the group then sums its dummy forwards (`projection.dummy_ranks`),
-    which the view states as its `group_dummies`.
+    which the view states as its `group_dummies`. With a `compass_host` the
+    view also states its `prefill_duty`: the runner's `shape.PrefillDuty`
+    (`_prefill_duty`) at the engine's clock on the forward's entry, over its
+    earlier forwards, each from that entry to its return, `group_s` later, and
+    a prefill forward when its group prefills at its step (on one rank, when
+    it prefills); with none it states no duty, which a law pricing it refuses.
 
     In a run, `compass_host` composes the price, the target's device seconds
     and then the draft's (`StepCost.target_seconds`, `draft_seconds`), with
@@ -2017,6 +2022,7 @@ def _group_step_seconds(
         fold_seconds,
     )
     from atom.compass.backends.resolver import CostRefused, Refusal
+    from atom.compass.backends.shape import PrefillDuty
 
     if mode is None:
         mode = forward_mode(batch, runner)
@@ -2032,11 +2038,16 @@ def _group_step_seconds(
         seen = vars(runner).setdefault("_admitted", set())
         batch.compass_admitted = admitted(batch, seen, entry)
     dummies = dummy_ranks(batch, mode)
+    clock = getattr(host, "now", None)
+    entered = None if clock is None else clock()
+    duty = vars(runner).setdefault("_prefill_duty", PrefillDuty())
     try:
         if view is None:
             view = batch_view(batch, mode, runner, dummies)
         elif view.dp_rank is not None:
             view = dataclasses.replace(view, group_dummies=dummies)
+        if entered is not None:
+            view = dataclasses.replace(view, prefill_duty=duty.at(entered))
         if isinstance(host, HostDeviceRecurrence):
             batch.compass_launch = host.predicted(view)
         cost = backend.price(view)
@@ -2103,6 +2114,13 @@ def _group_step_seconds(
         ends = zip(targets, (o for *_, o in rows))
         pulls = tuple(t + o for t, o in ends if not math.isnan(o)) or None
         group_s = targets[group.rank()]
+    if entered is not None:
+        prefilled = (
+            not mode.running_tokens_are_unified
+            if many
+            else bool(batch.total_seqs_num_prefill)
+        )
+        duty.add(entered, entered + group_s, prefilled)
     vars(runner)["_group_targets"] = targets
     vars(runner)["_out_s"], vars(runner)["_group_out"] = out_s, pulls
     lockstep_s = vars(runner).pop("_lockstep_s", 0.0)
