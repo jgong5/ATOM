@@ -55,6 +55,8 @@ from test_vertical_slice import (
     TREE,
     _retry,
     _run_file,
+    publish_entry,
+    publish_entry_on_arch,
 )
 
 from atom.compass import run as compass_run
@@ -435,10 +437,16 @@ DP2_OFFSETS = OFFSETS | {"PREFILL_DP_PORT": 32, "DECODE_DP_PORT": 40}
 
 
 def run_xpyd(
-    out: Path, seed: str, offsets=OFFSETS, run: dict | None = None, cell=None
+    out: Path,
+    seed: str,
+    offsets=OFFSETS,
+    run: dict | None = None,
+    cell=None,
+    publish=publish_entry,
 ) -> dict:
     """One 2P2D run under `pd_sim.sh`, round robin on each side, or with the
-    run file keys `run` and the environment `cell` over those."""
+    run file keys `run` and the environment `cell` over those, its readings
+    published by `publish`."""
     out.mkdir()
     run, cell = run or {}, cell or {}
     with held_ports(1, lambda q: range(q[0] + 1, q[0] + 72)) as [base]:
@@ -451,18 +459,20 @@ def run_xpyd(
             **PD,
             **run,
         )
-        env = dict(
-            os.environ,
-            PYTHONHASHSEED=seed,
-            PYTHONPATH=str(TREE),
-            AITER_LOG_LEVEL="WARNING",
-            ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
-            MODEL=MODEL,
-            ROUTER_POLICY="round_robin",
-            **cell,
-            **{name: str(port) for name, port in ports.items()},
+        env = (
+            dict(
+                os.environ,
+                PYTHONHASHSEED=seed,
+                PYTHONPATH=str(TREE),
+                AITER_LOG_LEVEL="WARNING",
+                ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
+                MODEL=MODEL,
+                ROUTER_POLICY="round_robin",
+                **{name: str(port) for name, port in ports.items()},
+            )
+            | cell
         )
-        publish_pd_entries(out / "store", run.get("machine", DOCUMENT), env)
+        publish_pd_entries(out / "store", run.get("machine", DOCUMENT), env, publish)
         log = out / "pd_sim.log"
         with open(log, "w") as f:
             sim = subprocess.Popen(
@@ -568,7 +578,10 @@ def recipe_runs(tmp_path_factory):
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(test_dp_slice, "MODEL", DSV41)  # the traffic's model
         return [
-            run_xpyd(root / f"seed{s}", s, DP2_OFFSETS, run, cell) for s in ("1", "2")
+            run_xpyd(
+                root / f"seed{s}", s, DP2_OFFSETS, run, cell, publish_entry_on_arch
+            )
+            for s in ("1", "2")
         ]
 
 

@@ -50,7 +50,7 @@ from test_vertical_slice import (
     WALL_S,
     Traffic,
     _run_file,
-    publish_entry,
+    publish_entry_on_arch,
 )
 
 from atom.compass import parity
@@ -279,7 +279,7 @@ def _p_instance_runs(root: Path, port: int, named: tuple = ()) -> list[dict]:
         pytest.skip("a run needs ATOM_COMPASS_DSPARK_MODEL")
     spec = _priced_machine(root, json.loads(CRS005.read_text()))
     env = dict(os.environ, **_offload(port), AITER_LOG_LEVEL="WARNING")
-    publish_entry(root / "store", spec, P_INSTANCE, env)
+    publish_entry_on_arch(root / "store", spec, P_INSTANCE, env)
     with held_ports(4) as ports, pytest.MonkeyPatch.context() as mp:
         mp.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", str(METRICS_S))
         return [
