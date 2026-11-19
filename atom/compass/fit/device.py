@@ -219,13 +219,13 @@ def compose(
 
 def assumed_entry(
     store: ArtifactStore, device: str, ptl: str, stack: str | None = None
-) -> tuple[Key, dict, object]:
+) -> tuple[Key, dict, object, str]:
     """The one measured `platform_readings` entry `store` holds for the device
-    named `device` at `ptl` and `stack` (`readings`), its document as a
-    device never run takes it, `assumed`'s readings every one assumed, and the
-    datasheet stating `device`."""
+    named `device` at `ptl` and `stack`, else the one committed (`readings`),
+    its document as a device never run takes it, `assumed`'s readings every
+    one assumed, the datasheet stating `device`, and where it was read."""
     source = _named(device)
-    found, document, _ = readings(store, _device(source), ptl, stack)
+    found, document, where = readings(store, _device(source), ptl, stack)
     if document["provenance"]["origin"] != "probed":
         raise ValueError(
             f"{found} as {found.token()} is assumed itself; assume from a "
@@ -238,7 +238,7 @@ def assumed_entry(
         "origins": {p: {"origin": "assumed"} for p in values},
     }
     header = {k: document[k] for k in READINGS_HEADER}
-    return found, header | values | {"provenance": provenance}, source
+    return found, header | values | {"provenance": provenance}, source, where
 
 
 def _named(device: str):
@@ -264,7 +264,7 @@ def main(argv: list[str]) -> None:
     if args.assume_from:
         if args.records or not (args.device and args.ptl):
             raise ValueError("--assume-from takes --device and --ptl and no RECORD")
-        found, document, source = assumed_entry(store, args.assume_from, args.ptl)
+        found, document, source, _ = assumed_entry(store, args.assume_from, args.ptl)
         values = {k: v for k, v in document.items() if k not in READINGS_HEADER}
         target = datasheet(args.device)
         platform = found.values | {"device": _device(target)}

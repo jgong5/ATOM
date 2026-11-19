@@ -13,6 +13,8 @@ import platforms
 import pytest
 from test_memory_readings import DOCUMENT
 from test_platform_compose import law, model, parsed
+from test_validate_bound import LINES, _main
+from test_validate_project import MACHINES, ran
 
 from atom.compass.artifacts import ArtifactStore, Key, Kind
 from atom.compass.backends.json_file import read_json
@@ -20,6 +22,7 @@ from atom.compass.drive import runfile
 from atom.compass.fit import device
 from atom.compass.fit.device import COPIES, compose
 from atom.compass.spec.layers import stack_of
+from atom.compass.validate import bound
 
 #: MI355X gfx950's copy, folded from every probe record at its key.
 COPY = COPIES / "8f44fdb6fc43.json"
@@ -54,6 +57,23 @@ def test_the_stores_own_entry_comes_before_the_copy(tmp_path):
 
     assert spec.value("device.name") == "MI355X"
     assert spec.value("provenance.notes").endswith(f" in {ArtifactStore(store).root}")
+
+
+def test_bound_at_another_devices_ratios_names_the_copy_it_read(monkeypatch, tmp_path):
+    rec = ran(tmp_path / "rec", LINES[:3])
+    priced, machines = bound.backends, []
+    monkeypatch.setattr(
+        bound, "backends", lambda *a: machines.append(a[3]) or priced(*a)
+    )
+    mi308x = json.loads((MACHINES / "mi308x-hjbog39.json").read_text())
+
+    more = ["--ratios-from", "MI355X"]
+    _main(monkeypatch, tmp_path, [rec], more=more, document=mi308x)
+
+    (machine,) = machines
+    token = json.loads(COPY.read_text())["token"]
+    assert machine.value("provenance.notes").endswith(f"as {token} in {COPY}")
+    assert machine.value("device.name") == "MI308X"
 
 
 def test_a_platform_with_neither_an_entry_nor_a_copy_refuses(tmp_path):
