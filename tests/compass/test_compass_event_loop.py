@@ -40,6 +40,7 @@ from atom.utils.clock import LPRuntime
 from atom.utils.compass_loop import (
     CompassEventLoop,
     CompassSelector,
+    READ_SLICE_S,
     HttpChannel,
     Station,
     charge,
@@ -1128,9 +1129,13 @@ def _burst(run, monkeypatch, n, app, sizes=None, receives=None):
 
 
 @pytest.mark.parametrize("intake", [(2e-3, 1e-6), None], ids=["probed", "unstated"])
-def test_a_burst_reaches_the_app_one_intake_charge_at_a_time(
+def test_a_burst_s_bodies_are_read_together_then_each_request_s_own_part_alone(
     run, monkeypatch, tmp_path, intake
 ):
+    # Probed: the 1 ms and 3 ms reads share the loop, so the first ends at 2 ms
+    # and its own 2 ms part at 4 ms; the second's last 2 ms of read then has
+    # the loop alone, to 6 ms, and its own part ends at 8 ms. Unstated: no
+    # charge, each at the arrival.
     _intake_run_file(monkeypatch, tmp_path, intake)
     sizes, entered = {0: 1000, 1: 3000}, []
 
@@ -1138,10 +1143,46 @@ def test_a_burst_reaches_the_app_one_intake_charge_at_a_time(
         entered.append(asyncio.get_running_loop().time())
 
     arrival = _burst(run, monkeypatch, 2, app, sizes)
-    fixed, per_byte = intake or (0.0, 0.0)
-    first = arrival + fixed + sizes[0] * per_byte
     print(f"\n  app entered at {entered}")
-    assert entered == pytest.approx([first, first + fixed + sizes[1] * per_byte])
+    expected = [4e-3, 8e-3] if intake else [0.0, 0.0]
+    assert entered == pytest.approx([arrival + t for t in expected])
+
+
+@pytest.mark.parametrize("parts", [1, 3], ids=["whole", "in-parts"])
+def test_a_burst_reaches_the_app_smallest_body_first(
+    run, monkeypatch, tmp_path, parts
+):
+    # Reads of 3, 1 and 2 ms share the loop, each request's own part 1 ms.
+    # Body 1 is read at 3 ms (3 x 1 ms) and goes on at 4 ms; bodies 2 and 0
+    # then share, body 2 read at 6 ms, on at 7 ms; body 0 read at 8 ms, on at
+    # 9 ms: the loop's 9 ms are the serial intake's, in another order. Bodies
+    # that come in socket reads, each request's after a different number of
+    # loop turns, move nothing.
+    _intake_run_file(monkeypatch, tmp_path, (1e-3, 1e-6))
+    sizes, entered = {0: 3000, 1: 1000, 2: 2000}, []
+
+    async def app(scope, receive, send):
+        seq = api_server._tracestate_stamp(scope)[1]
+        entered.append((seq, asyncio.get_running_loop().time()))
+
+    def receives(seq):
+        k = sizes[seq] // parts
+        chunks = [b"x" * k] * (parts - 1) + [b"x" * (sizes[seq] - k * (parts - 1))]
+
+        async def receive():
+            for _ in range(3 - seq):
+                await asyncio.sleep(0)  # socket reads
+            chunk = chunks.pop(0)
+            return {"type": "http.request", "body": chunk, "more_body": bool(chunks)}
+
+        return receive
+
+    arrival = _burst(run, monkeypatch, 3, app, receives=receives)
+    print(f"\n  app entered at {entered}")
+    assert [s for s, _ in entered] == [1, 2, 0]
+    assert [t for _, t in entered] == pytest.approx(
+        [arrival + 4e-3, arrival + 7e-3, arrival + 9e-3]
+    )
 
 
 def test_a_burst_s_bodies_leave_the_socket_while_a_tokenizer_job_is_open(
@@ -1221,16 +1262,17 @@ def test_a_body_outside_the_intake_hull_is_charged_nothing_and_named(
     path = tmp_path / "run.json"
     path.write_text(json.dumps({"bound_s": 600.0, "host": {"http_intake": intake}}))
     monkeypatch.setenv(compass_run.ENV, str(path))
-    entered, named = [], []
+    entered, named = {}, {}
 
     async def app(scope, receive, send):
-        loop = asyncio.get_running_loop()
-        entered.append(loop.time())
-        named.append(list(loop.rt.refusals))
+        loop, seq = asyncio.get_running_loop(), api_server._tracestate_stamp(scope)[1]
+        entered[seq] = loop.time()
+        named[seq] = list(loop.rt.refusals)
 
     arrival = _burst(run, monkeypatch, 2, app, {0: 1000, 1: 3000})
-    first = arrival + 2e-3 + 1000 * 1e-6
-    assert entered == pytest.approx([first, first])
+    # Body 1 is charged nothing, so it goes on at the arrival; body 0 then has
+    # the loop alone: its 1 ms read and its idle 2 ms part.
+    assert [entered[0], entered[1]] == pytest.approx([arrival + 3e-3, arrival])
     assert named[1] == [
         "http:intake of a 3000-byte body, outside the 500 to 2000 bytes its "
         + "http_intake was fitted on"
@@ -1286,10 +1328,18 @@ def test_a_request_that_finds_no_intake_on_the_loop_is_charged_the_idle_one(
         thread.join(10)
     loop.close()
     assert [stamps.get(timeout=10) for _ in sends] == list(zip(arrivals, range(4)))
-    e0 = arrivals[0] + idle + sizes[0] * per_byte
-    e1 = e0 + fixed + sizes[1] * per_byte
-    e2 = arrivals[2] + idle + sizes[2] * per_byte
-    e3 = e2 + fixed + sizes[3] * per_byte
+    # Reads 0 and 1 (1 and 3 ms) share the loop: read 0 ends at 2 ms and its
+    # idle part at 2.5 ms; read 1's last 2 ms end at 4.5 ms and its fixed part
+    # at 6.5 ms. Read 2 (2 ms) has the loop alone for its first 1 ms stretch;
+    # request 3, released 0.1 ms into it, joins at its end. They then share,
+    # read 2's last 1 ms ending 2 ms later, its idle part 0.5 ms after; read
+    # 3's last 3 ms follow alone, then its fixed part: request 3 is on 8.5 ms
+    # after request 2's arrival, as one at a time.
+    e0 = arrivals[0] + 2 * sizes[0] * per_byte + idle
+    e1 = e0 + (sizes[1] - sizes[0]) * per_byte + fixed
+    left2 = sizes[2] * per_byte - READ_SLICE_S
+    e2 = arrivals[2] + READ_SLICE_S + 2 * left2 + idle
+    e3 = e2 + sizes[3] * per_byte - left2 + fixed
     print(f"\n  app entered at {entered}")
     assert [entered[seq] for seq in range(4)] == pytest.approx([e0, e1, e2, e3])
 

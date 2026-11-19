@@ -734,6 +734,25 @@ class CompassSelector(selectors.DefaultSelector):
         return True
 
 
+#: The longest stretch of the event loop one charge of a burst's body reads
+#: takes before whatever else is due on the loop runs: the reads share the loop
+#: with each other and with its other work, as a real loop interleaves them.
+READ_SLICE_S = 1e-3
+#: Read seconds left at or below which a body counts as read.
+READ_DONE_S = 1e-12
+
+
+class _Intake:
+    """One stamped request's intake: its body read, shared on the loop with the
+    reads in flight beside it, then its own fixed part, the loop's alone."""
+
+    __slots__ = ("arrival", "seq", "read_s", "fixed_s", "done")
+
+    def __init__(self, arrival, seq, read_s, fixed_s, done) -> None:
+        self.arrival, self.seq = arrival, seq
+        self.read_s, self.fixed_s, self.done = read_s, fixed_s, done
+
+
 #: The API server's endpoints that hand a request to the engine.
 GENERATION_PATHS = frozenset(
     ("/v1/completions", "/v1/chat/completions", "/v1/messages", "/v1/responses")
@@ -773,18 +792,33 @@ class HttpChannel:
     app's stream yielded, so it must end in a blank line.
 
     Taking in a stamped request other than a cancel costs the event loop
-    ``fixed_s + body bytes x per_byte_s`` (`atom.compass.run.http_intake`),
-    charged on the loop once its body is read and the loop is idle at that
-    instant, every tokenizer station job placed and all else due by then run
-    (`SimExecutor.placed`), so a burst reaches the app one request at a time.
-    A request waits for that idle loop with no intake charged too: its body no
-    longer paces the turns, and without the wait the burst's tokenizer jobs
-    would reach the station in the wall order their awaits fall in.
-    A request that arrives once the last intake has ended is charged ``idle_s``
-    in place of ``fixed_s``. A ``host`` entry with no ``http_intake`` charges nothing.
-    A body outside the bytes the term was fitted over
+    ``fixed_s + body bytes x per_byte_s`` (`atom.compass.run.http_intake`), in
+    two parts, as a real loop spends it (#3742). Its body read, ``body bytes x
+    per_byte_s``, shares the loop with every other body read in flight: the
+    reads in flight each get an equal share of the loop (processor sharing), so
+    in a burst the smaller bodies are read first, as the real loop reads the
+    bodies of a burst together and their requests reach the router smallest
+    first. A request joins the reads once it is released, every request
+    released with it has been read, and its body has come. The reads are
+    charged in stretches of at most `READ_SLICE_S`, each once the loop is idle
+    at that instant, every tokenizer station job placed and all else due by
+    then run (`SimExecutor.placed`), so what is due on the loop meanwhile runs
+    between them; a request released inside a stretch joins at its end. Where
+    the stretches fall depends on the LP clock alone, never on which requests
+    the wall has brought in ahead of their arrival. Once its read is done the request's own part, ``fixed_s``,
+    is charged on the loop alone, at such an idle instant too, and the request
+    then counts as handled and reaches the app; reads done at one instant go
+    on in ``(arrival, seq)`` order. A request that arrives while no intake is
+    in flight and once the last one has ended is charged ``idle_s`` in place of
+    ``fixed_s``. A body outside the bytes the term was fitted over
     (`atom.compass.run.http_intake_hull`) is charged nothing and is a run-summary
     reason ``http:intake ...`` naming that hull.
+
+    A ``host`` entry with no ``http_intake`` charges nothing, and the released
+    requests are handed on in ``(arrival, seq)`` order, each once its body is
+    read and the loop is idle at that instant: its body no longer paces the
+    turns, and without the wait the burst's tokenizer jobs would reach the
+    station in the wall order their awaits fall in.
     """
 
     def __init__(self, app, stamp) -> None:
@@ -793,6 +827,15 @@ class HttpChannel:
         self.app, self.stamp = app, stamp
         self.intake, self.hull = http_intake(), http_intake_hull()
         self.intake_end = -math.inf  # the LP time the last intake ended
+        # The intakes whose body read is in flight, and those read whose own
+        # part is still to charge, in the order their reads ended.
+        self.reads: list[_Intake] = []
+        self.read: list[_Intake] = []
+        # (channel, seq) -> its wake-up, for each stamped request not yet
+        # joined to the reads: one woken is waited for before any charge.
+        self.joining: dict[tuple[str, int], asyncio.Future] = {}
+        self.joined: asyncio.Event | None = None  # set as one joins or leaves
+        self.driver: asyncio.Task | None = None  # `_drive`, while intakes are open
         # http seq -> its hang-up, for each stamped request the app is serving
         self.hangups: dict[int, asyncio.Event] = {}
 
@@ -835,8 +878,11 @@ class HttpChannel:
             rt.check_arrival(ch, arrival, seq)
             wake = loop.create_future()
             loop.held[ch, seq] = (arrival, wake)
+            if self.intake is not None:
+                self.joining[ch, seq] = wake
             # Its body leaves the socket as it comes, not at its turn.
             reading = asyncio.ensure_future(_body_messages(receive))
+            intake = None
             try:
                 await wake
                 async with loop.hand_on:
@@ -844,7 +890,7 @@ class HttpChannel:
                     # still waits on the socket.
                     body = await reading
                     cancelled = cancel_seq(body[0].get("body", b""))
-                    if cancelled is None:
+                    if self.intake is None and cancelled is None:
                         # The clock may not pass a station job's completion
                         # before the job is placed, nor this instant before the
                         # requests handed on before this one have gone as far
@@ -853,24 +899,20 @@ class HttpChannel:
                         # their awaits fall in.
                         await loop.executor.placed()
                     if self.intake is not None and cancelled is None:
-                        fixed, per_byte, idle = self.intake
-                        if arrival >= self.intake_end:
-                            fixed = idle
-                        nbytes = sum(len(m.get("body", b"")) for m in body)
-                        lo, hi = self.hull or (0, math.inf)
-                        if lo <= nbytes <= hi:
-                            charge(fixed + per_byte * nbytes)
-                        else:
-                            rt.refusals.append(
-                                f"http:intake of a {nbytes}-byte body, outside the "
-                                f"{lo:.0f} to {hi:.0f} bytes its http_intake was "
-                                "fitted on"
-                            )
-                        self.intake_end = loop.time()
+                        intake = self._join(loop, rt, arrival, seq, body)
+                    self._left(ch, seq)
+                    if intake is None:
+                        with rt.lock:
+                            rt.count_done_locked(ch, seq)
+                if intake is not None:
+                    await intake.done
                     with rt.lock:
                         rt.count_done_locked(ch, seq)
             finally:
                 reading.cancel()  # a request cancelled before its body was read
+                self._left(ch, seq)
+                if intake is not None and not intake.done.done():
+                    self._drop(intake)
             if cancelled is not None:
                 if (hangup := self.hangups.get(cancelled)) is not None:
                     hangup.set()
@@ -893,6 +935,75 @@ class HttpChannel:
         finally:
             if hangup is not None:
                 del self.hangups[seq]
+
+
+    def _join(self, loop, rt, arrival: float, seq: int, body: list) -> _Intake:
+        """Join request `seq`'s intake to the reads in flight; returns it."""
+        fixed, per_byte, idle = self.intake
+        if arrival >= self.intake_end and not self.reads and not self.read:
+            fixed = idle
+        nbytes = sum(len(m.get("body", b"")) for m in body)
+        lo, hi = self.hull or (0, math.inf)
+        read = per_byte * nbytes
+        if not lo <= nbytes <= hi:
+            rt.refusals.append(
+                f"http:intake of a {nbytes}-byte body, outside the "
+                f"{lo:.0f} to {hi:.0f} bytes its http_intake was fitted on"
+            )
+            fixed = read = 0.0
+        intake = _Intake(arrival, seq, read, fixed, loop.create_future())
+        self.reads.append(intake)
+        if self.driver is None:
+            self.driver = loop.create_task(self._drive(loop))
+        return intake
+
+    def _left(self, ch: str, seq: int) -> None:
+        """Request (`ch`, `seq`) joined the reads, or will not."""
+        if self.joining.pop((ch, seq), None) is not None and self.joined:
+            self.joined.set()
+
+    def _drop(self, intake: _Intake) -> None:
+        """A request cancelled with its intake open leaves it."""
+        for queue_ in (self.reads, self.read):
+            if intake in queue_:
+                queue_.remove(intake)
+
+    async def _drive(self, loop) -> None:
+        """Charge the open intakes on the loop until none is left: the reads in
+        flight shared, in stretches of at most `READ_SLICE_S`, each read done
+        then its own part alone, each charge at an idle instant with every
+        request woken by then joined."""
+        if self.joined is None:
+            self.joined = asyncio.Event()
+        try:
+            while True:
+                while any(w.done() for w in self.joining.values()):
+                    self.joined.clear()
+                    await self.joined.wait()
+                await loop.executor.placed()
+                if any(w.done() for w in self.joining.values()):
+                    continue  # woken while the loop ran up to idle
+                if self.read:
+                    intake = self.read.pop(0)
+                    if intake.fixed_s > 0:
+                        charge(intake.fixed_s)
+                    self.intake_end = loop.time()
+                    if not intake.done.done():
+                        intake.done.set_result(None)
+                    continue
+                if not self.reads:
+                    return
+                n = len(self.reads)
+                step = min(min(i.read_s for i in self.reads) * n, READ_SLICE_S)
+                if step > 0:
+                    charge(step)
+                    for i in self.reads:
+                        i.read_s -= step / n
+                done = [i for i in self.reads if i.read_s <= READ_DONE_S]
+                self.reads = [i for i in self.reads if i.read_s > READ_DONE_S]
+                self.read += sorted(done, key=lambda i: (i.arrival, i.seq))
+        finally:
+            self.driver = None
 
 
 async def _refuse_unstamped(rt, method: str, path: str, send) -> None:
