@@ -1099,7 +1099,7 @@ def _saved_image_bytes(runner: Any) -> int:
     that of the PAGE-backed checkpoint spec `get_num_blocks` planned, where
     saves carry one at the engine's replay length (`stores_state_images`),
     else 0, as for a runner that planned no checkpoint spec."""
-    from atom.kv_transfer.offload.mp.native_state_worker import stores_state_images
+    from atom.kv_transfer.offload.mp.native_state_layout import stores_state_images
 
     spec = runner.state_runtime.checkpoint_spec
     if spec is None or not stores_state_images(runner.config.state_replay_tokens):
