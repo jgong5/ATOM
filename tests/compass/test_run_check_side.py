@@ -7,9 +7,10 @@ DeepSeek-V4-Pro's DPA8 sides resolve the fp8 index cache under the
 `--kv-transfer-config` the script adds, and fp4 without one at gfx950. The
 shipped crs005 DPA8 pair is keyed to fp8, so each side's check finds its own
 law and host laws there and lacks only the decode rungs its capture ladder
-schedules that its own law has no vector for, and its readings, which the
-command it prints measures; the same arguments checked as a lone server
-resolve fp4, and both laws refuse them, naming it.
+schedules that its own law has no vector for; with the pair less the readings
+it carries, its readings too, which the command it prints measures. The same
+arguments checked as a lone server resolve fp4, and both laws refuse them,
+naming it.
 
 Each check resolves its config where the machine's gfx950 is declared, a
 process of its own (`run._config`). The host laws' CPU is the laws', and ATOM's
@@ -32,14 +33,16 @@ from test_run_step_grid import deployment
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
+from atom.compass.backends.json_file import read_json
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import runfile
+from atom.compass.run import memory
 from atom.model_engine import llm_engine
 
 LAWS = Path(__file__).resolve().parents[2] / "scripts/compass/laws"
 #: The crs005 DPA8 pair, prefill then decode.
 PAIR = {
-    side: LAWS / f"deepseek-v4-pro-dpa8-mi355x-crs005-{side}.json"
+    side: LAWS / f"deepseek-v4-pro-dpa8-mi355x-crs005-{side}.json.xz"
     for side in ("prefill", "decode")
 }
 #: The machine of the pair's records: an MI355X at the stack their laws
@@ -89,12 +92,23 @@ def platform(tmp_path) -> list[str]:
     return [*platforms.flags(store, MACHINE, tmp_path), "--store", str(store)]
 
 
-def pair(tmp_path) -> list[str]:
-    """`deploy.sh run`'s flags for the crs005 pair."""
+def pair(tmp_path, readings=True) -> list[str]:
+    """`deploy.sh run`'s flags for the crs005 pair, or without `readings` for
+    the pair less the memory readings it carries."""
+    files = PAIR if readings else {s: _bare(tmp_path, p) for s, p in PAIR.items()}
     laws = [
-        [flag, str(PAIR[s])] for flag in ("--step-linear", "--host-laws") for s in PAIR
+        [flag, str(files[s])] for flag in ("--step-linear", "--host-laws") for s in PAIR
     ]
     return [word for law in laws for word in law] + platform(tmp_path)
+
+
+def _bare(tmp_path, path: Path) -> Path:
+    """The law file at `path` less its memory readings, written into `tmp_path`."""
+    held = read_json(path)
+    held.pop(memory.LAW_MEMBER)
+    bare = tmp_path / path.name.removesuffix(".xz")
+    bare.write_text(json.dumps(held))
+    return bare
 
 
 def side_args(tmp_path, monkeypatch, side) -> list[str]:
@@ -107,7 +121,7 @@ def side_args(tmp_path, monkeypatch, side) -> list[str]:
     own, env = SIDES[side]
     for name, value in {**SHARED_ENV, **env}.items():
         monkeypatch.setenv(name, value)
-    cpu = json.loads(PAIR[side].read_text())["host"]["key"]["host_cpu"]
+    cpu = read_json(PAIR[side])["host"]["key"]["host_cpu"]
     monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
     tok = SimpleNamespace(is_fast=True, name_or_path=None)
     monkeypatch.setattr(llm_engine, "load_tokenizer", lambda *args: tok)
@@ -130,7 +144,7 @@ def test_each_side_holds_the_fp8_index_cache_its_crs005_laws_state(
 ):
     atom_args = side_args(tmp_path, monkeypatch, side)
 
-    assert checked(pair(tmp_path), side, atom_args) == 1
+    assert checked(pair(tmp_path, readings=False), side, atom_args) == 1
 
     out = capsys.readouterr().out
     assert lacked(out) == [COVERAGE, "memory readings: missing"]
@@ -168,7 +182,7 @@ def test_readings_the_printed_command_measures_complete_the_side_s_check(
     tmp_path, monkeypatch, capsys, side
 ):
     atom_args = side_args(tmp_path, monkeypatch, side)
-    flags = pair(tmp_path)
+    flags = pair(tmp_path, readings=False)
     assert checked(flags, side, atom_args) == 1
     words = shlex.split(capsys.readouterr().out.rsplit("made by: ", 1)[1])
     env, measured = words[: words.index("compass")], words[words.index("--") + 1 :]
@@ -228,3 +242,37 @@ def test_a_side_reads_a_network_file_across_nodes_and_a_lone_server_refuses_one(
     out = capsys.readouterr().out
     assert lacked(out) == ["platform: missing"]
     assert "a run on one node reads no network" in out
+
+
+@pytest.mark.parametrize("side", ["prefill", "decode"])
+def test_an_empty_aiter_log_level_is_unset_to_a_side_as_to_deploy_sh(
+    tmp_path, monkeypatch, capsys, side
+):
+    atom_args = side_args(tmp_path, monkeypatch, side)
+    flags = pair(tmp_path, readings=False)
+    monkeypatch.setenv("AITER_LOG_LEVEL", "")
+
+    assert checked(flags, side, atom_args) == 1
+
+    out = capsys.readouterr().out
+    assert lacked(out) == [COVERAGE, "memory readings: missing"]
+    assert '"AITER_LOG_LEVEL": "WARNING"' in out
+    made = out.rsplit("made by: ", 1)[1]
+    assert made.startswith("AITER_LOG_LEVEL=WARNING compass measure memory ")
+    # The printed command, run in the shell the check ran in, under its prefix.
+    monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
+    words = shlex.split(made)
+    config = drive_run._config(words[words.index("--") + 1 :], "gfx950")
+    publish_readings(tmp_path / "store", config, MACHINE)
+    monkeypatch.setenv("AITER_LOG_LEVEL", "")
+    assert checked(flags, side, atom_args) == 1
+    assert lacked(capsys.readouterr().out) == [COVERAGE]
+
+
+@pytest.mark.parametrize("side", ["prefill", "decode"])
+def test_a_plain_check_of_a_side_s_arguments_names_that_side_s_check(tmp_path, side):
+    kv = json.dumps({"kv_role": ROLES[side], "kv_connector": "compass"})
+    flags = ["--step-stub", stub(tmp_path), *platform(tmp_path), "--check"]
+
+    with pytest.raises(ValueError, match=f"check it with --check {side}, without"):
+        drive_run.main([*flags, "--", "--model", "m", "--kv-transfer-config", kv])

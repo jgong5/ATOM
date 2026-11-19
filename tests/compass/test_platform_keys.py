@@ -54,6 +54,7 @@ from atom.compass.artifacts import (
     rows_for,
 )
 from atom.compass.backends import StepLinearBackend
+from atom.compass.backends.json_file import read_json
 from atom.compass.drive import identity
 from atom.compass.drive.gpu import GpuRefusal
 from atom.compass.run import host_key_of
@@ -61,9 +62,7 @@ from atom.compass.spec import MachineSpec
 
 ROOT = Path(__file__).resolve().parents[2] / "scripts" / "compass"
 MACHINES = Path(__file__).resolve().parent / "machines"
-LAW = json.loads(
-    (ROOT / "laws" / "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json").read_text()
-)
+LAW = read_json(ROOT / "laws" / "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json.xz")
 N18 = json.loads((MACHINES / "mi308x-hjbog18.json").read_text())
 N39 = json.loads((MACHINES / "mi308x-hjbog39.json").read_text())
 #: The law at the test deployment's engine config, which `_installed` states.
@@ -120,24 +119,32 @@ def test_the_hjbog39_law_loads_under_its_own_spec_and_refuses_under_node_18s(
 
 #: The spec each checked-in law was fitted under; a law missing here fails below.
 LAW_SPECS = {
-    "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json": "mi308x-hjbog39.json",
-    "deepseek-v4-pro-dpa8-mi355x-gpu45-prefill.json": "mi355x-gpu45.json",
-    "deepseek-v4-pro-dpa8-mi355x-gpu45-decode.json": "mi355x-gpu45.json",
-    "deepseek-v4-pro-dpa8-mi355x-crs005-prefill.json": "mi355x-crs005.json",
-    "deepseek-v4-pro-dpa8-mi355x-crs005-decode.json": "mi355x-crs005.json",
-    "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-prefill.json": "mi355x-gpu45.json",
-    "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-decode.json": "mi355x-gpu45.json",
-    "deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json": "mi355x-crs005.json",
-    "deepseek-v4-pro-dpa8-ep8-mi355x-crs005-decode.json": "mi355x-crs005.json",
-    "deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json": "mi455-a0.json",
-    "deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json": "mi455-a0.json",
-    "deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json": "mi355x-gpu40.json",
+    "qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json.xz": "mi308x-hjbog39.json",
+    "deepseek-v4-pro-dpa8-mi355x-gpu45-prefill.json.xz": "mi355x-gpu45.json",
+    "deepseek-v4-pro-dpa8-mi355x-gpu45-decode.json.xz": "mi355x-gpu45.json",
+    "deepseek-v4-pro-dpa8-mi355x-crs005-prefill.json.xz": "mi355x-crs005.json",
+    "deepseek-v4-pro-dpa8-mi355x-crs005-decode.json.xz": "mi355x-crs005.json",
+    "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-prefill.json.xz": "mi355x-gpu45.json",
+    "deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-decode.json.xz": "mi355x-gpu45.json",
+    "deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json.xz": "mi355x-crs005.json",
+    "deepseek-v4-pro-dpa8-ep8-mi355x-crs005-decode.json.xz": "mi355x-crs005.json",
+    "deepseek-v4-pro-tp8-mi355x-crs005-prefill-host.json.xz": "mi355x-crs005.json",
+    "deepseek-v4-pro-tp8-mi355x-crs005-decode-host.json.xz": "mi355x-crs005.json",
+    "deepseek-v4-pro-tp8-mtp3-mi355x-crs005-prefill.json.xz": "mi355x-crs005.json",
+    "deepseek-v4-pro-tp8-mtp3-mi355x-crs005-decode.json.xz": "mi355x-crs005.json",
+    "deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-prefill.json.xz": "mi355x-crs005.json",
+    "deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-decode.json.xz": "mi355x-crs005.json",
+    "deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json.xz": "mi455-a0.json",
+    "deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json.xz": "mi455-a0.json",
+    "deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json.xz": "mi355x-gpu40.json",
 }
 
 
-@pytest.mark.parametrize("name", sorted(p.name for p in (ROOT / "laws").glob("*.json")))
+@pytest.mark.parametrize(
+    "name", sorted(p.name for p in (ROOT / "laws").glob("*.json.xz"))
+)
 def test_every_checked_in_law_states_the_platform_of_its_spec(name):
-    law = json.loads((ROOT / "laws" / name).read_text())
+    law = read_json(ROOT / "laws" / name)
     spec = platform(json.loads((MACHINES / LAW_SPECS[name]).read_text()))
     assert law["platform"] == keyed_platform(Kind.STEP_LINEAR_LAW, spec)
     host = {k: v for k, v in law["host"]["key"].items() if k in spec}
@@ -150,7 +157,7 @@ def test_another_nodes_laws_refuse_a_crs005_run_naming_its_aiter(
 ):
     crs005 = json.loads((MACHINES / "mi355x-crs005.json").read_text())
     name = next(n for n, s in LAW_SPECS.items() if s == f"mi355x-{node}.json")
-    law = json.loads((ROOT / "laws" / name).read_text())
+    law = read_json(ROOT / "laws" / name)
     here = {k: v for k, v in law.items() if k != "engine_config"}
     with pytest.raises(ValueError) as refused:
         _installed(monkeypatch, tmp_path, step_linear=here, machine=crs005)
@@ -165,8 +172,8 @@ def test_another_nodes_laws_refuse_a_crs005_run_naming_its_aiter(
 
 def test_every_checked_in_law_stamps_this_trees_atom_digest():
     tree = host_key_of("/nonexistent-model", {})["atom"]
-    laws = sorted((ROOT / "laws").glob("*.json"))
-    stamps = {p.name: json.loads(p.read_text())["host"]["key"]["atom"] for p in laws}
+    laws = sorted((ROOT / "laws").glob("*.json.xz"))
+    stamps = {p.name: read_json(p)["host"]["key"]["atom"] for p in laws}
     assert stamps == dict.fromkeys(stamps, tree)
 
 

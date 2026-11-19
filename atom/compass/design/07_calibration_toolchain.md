@@ -66,12 +66,23 @@ as amended that day:** `record` times the served tokenizer and stamps the HTTP i
 `fit host` fits both into the `host_laws` entry, keyed by model as every host law is
 (D38, Phase 1c; D43).
 
+**Revised 2026-11-10 by [#2899](https://github.com/jgong5/ATOM/issues/2899):** a law file
+carries its memory readings, assumed: the commits that re-key its host key re-key them, and
+one that moves what a start under the law's engine config holds takes them again (D41,
+D43); a run predicts the host its host laws timed (D41).
+
 **Revised 2026-11-14 by the owner's
 [Ruling on #1500](https://github.com/jgong5/ATOM/issues/1500#issuecomment-6870338230)
 ([#3408](https://github.com/jgong5/ATOM/issues/3408)):** an `op_measurement` keys the
 parallel layout only for a collective leaf; any other leaf's point answers at every
 layout, and `fit ops` keys a price list at the layout of the runs that listed its points
 (D41).
+
+**Revised 2026-11-19 by [#2678](https://github.com/jgong5/ATOM/issues/2678):** a change
+that cuts calibration time meets one of three bars (D118); the step bench runs on several
+cards once they agree (D39), the op planner plans the decode rungs its steps replay and one
+more (Phase 1b), and a step grid prediction with no real run iterates on its own simulated
+runs (D37, Phase 0).
 
 **Depends on:** `04_model_capture_and_cost_ir.md` (what is traced and priced),
 `05_machine_spec_and_probes.md` (the machine artifact and its probes).
@@ -161,7 +172,7 @@ two same-kernel neighbours.
 | Case | What runs |
 |---|---|
 | new model, on hardware I have | D39's recommended flow: its steps half for the step-level backends, and its ops half too for the op-level one |
-| new workload, same model and hardware | `trace steps` and the coverage check; a GPU only for steps outside what was measured |
+| new workload, same model and hardware | `trace steps` and the coverage check; a GPU only for steps outside what was measured. A step grid prediction with no real run of the workload runs them round by round, the loop below |
 | new parallel width | `measure memory` and `measure` at that width, since memory readings and collectives are per width (D40); `measure ops` there takes only the collectives and the leaf signatures no layout measured (D41) |
 | software upgrade | each entry whose D43 row the change invalidates refuses at load, naming its key; only those are re-measured |
 | configuration sweep | `measure memory` and `run` per configuration, then rank |
@@ -170,6 +181,30 @@ two same-kernel neighbours.
 The upgrade case is the one the invalidation matrix (D43) exists to make cheap. Day zero
 is why the roofline is designed as a backend and not only as a fallback; today a run
 reaches it only as the fallback its run file composes (`StepFallbackBackend`).
+
+**A step grid prediction plans from its own simulated runs** (revised 2026-11-19 by
+[#2678](https://github.com/jgong5/ATOM/issues/2678), D118, bar 3). A prediction has no real
+run of its target to plan from or to check Phase 0's margin against, only its own
+simulated run, whose schedule moves with the bundle. Round by round,
+`trace steps` simulates the target under the current bundle, the step grid's planner
+(`measure steps --grid`) plans over the simulated steps and measures what the store lacks,
+`fit steps` runs again, and the next round simulates under the new bundle; the loop ends
+when a round's planner places no new point. The last round's run is the prediction. Its
+gate is the coverage check over its own steps: no step falls to the step roofline but
+where no point can be placed, past a limit (`17` D98), which stays counted apart (`17`
+D102). Real runs, where grading has them, stay a planning input, since cost grading prices
+their steps (`08` D47), their labels unchanged: under DP a prefill step has none until
+[#3509](https://github.com/jgong5/ATOM/issues/3509)'s gated records. On #1233's graded
+traces 0 to 255 at c1 to c64 (Qwen3.8-27B TP 1, MI308X), after bundle v2 from the
+populations' 421 and 85 points, the loop placed 17 points under v2 and none under v3, and
+the steps on the roofline at c1/c4/c16/c64 went from 0/2/3/0 to none: about 0.7 GPU hours,
+against about 4.7 to run the workload for real first and plan from its steps
+([#2678](https://github.com/jgong5/ATOM/issues/2678)). The op level keeps the coverage
+check and one top-up: its planner places points at the steps' own contexts and token
+counts (`atom/compass/bench/ops.py::plan`), so a round whose schedule moved places new
+ones, and no stop is shown there (T119). The step linear law has no loop: it fits real
+records only, and its coverage is `19` D112's requirement 3. What the loop has not shown
+is T115 to T117.
 
 ### Preparing a measurement so the empirical model works
 
@@ -243,9 +278,15 @@ one cell and over-counted width **5 seqs vs 4** on another, while landing close 
 aggregate.
 
 **Circularity, and how it is closed.** Phase 0's schedule depends on the cost model Phase 1
-produces. Rather than iterate: **over-cover with a stated margin and verify the hull
-post-hoc.** Cheaper, and it fails closed. The population's key names the backend that
-priced it, so populations from two backends coexist and a planner names the one it read.
+produces. Where real runs of the target exist, as in a calibration or a validation
+campaign, rather than iterate: **over-cover with a stated margin and verify the hull
+post-hoc** against the real runs' steps, topping up what they reach outside it (`17`
+D98's order). Cheaper, and it fails closed. A step grid prediction has no real run to verify
+against, so it iterates on its own simulated runs until a round's planner places no new
+point; an op-level one keeps the margin and one top-up (D37; revised 2026-11-19 by
+[#2678](https://github.com/jgong5/ATOM/issues/2678), D118, bar 3). The population's key
+names the backend that priced it, so populations from
+two backends coexist and a planner names the one it read.
 
 ### Phase 1a — trace capture
 
@@ -278,7 +319,7 @@ run, beside each G it captures concretely as before.
 | | |
 |---|---|
 | **Input** | the decode widths and prefill (T, B) it is given, and the steps of the record directories it is given, from `record` or `trace steps --out`; the model config; the engine config |
-| **Output** | one `op_graph` artifact per shape, keyed by the structure's discrete key, the shape, and the ATOM source and torch it was traced under (`04` D19, D41) |
+| **Output** | one `op_graph` artifact per shape, keyed by the structure's discrete key, the shape, the torch it was traced under and the digest of the files its trace ran and read (`04` D19, D41) |
 | **Cost** | 7.6 s per shape on Qwen3.8-27B TP1, 2.2 s of it the traced forward ([#1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252)'s PoC); a decode shape traces two forwards, one per context its integer arguments are read at (`04` D20) |
 | **Needs a GPU** | **no** — but see the caveat below |
 
@@ -422,7 +463,17 @@ most 3 s (`ops.py::_release`). Each point records the seconds waited since the p
 it and how many waits ended at the cap, which leaves a clear possibly still running while
 it was timed.
 
-**Points, planned from the steps of record directories (D37).** Per leaf: every decode rung; prefill rows on
+**Points, planned from the steps of record directories (D37).** Per leaf: each decode rung
+the steps replay and the ladder's next rung above the widest of them, a stated margin as
+Phase 0's (revised 2026-11-19 by [#2678](https://github.com/jgong5/ATOM/issues/2678),
+D118, bar 3: on #1233's c1, c4 and c16 records, 1,980 of the first plan's 4,884
+context-dependent decode points, 41%, sat on rungs 48 to 512, which no step reached; the
+rung above costs about 66 of them, an even share of those 30 rungs). A decode leaf's family
+is its width (`atom/compass/bench/ops.py::_family`), so a step at a rung the plan left out
+prices its leaves by their analytical laws: `compass run --op-graph --coverage` counts such
+steps per leaf kind before a graded run, which grading requires (`13` D80), and the plan
+extended over that run's records measures only the points the store lacks.
+Prefill rows on
 a ladder of chunk remainders, a kind that depends on context also over the same ladder of
 the rows' cached tokens, once its points at the most cached tokens still differ from its
 fresh ones in kernels or time ([#1706](https://github.com/jgong5/ATOM/issues/1706)): a ladder twice as wide missed a same-kernel attention midpoint by
@@ -607,7 +658,7 @@ state its cards read and torch, the parallel layout and the engine config, its K
 `index_cache_dtype` included (any `kv_transfer_config` resolves DeepSeek-V4's
 indexer to fp8, so a PD start reads a plain fp8-indexer start's entry)
 (`atom/compass/run/memory.py::key_fields`). A run reads its rank's
-member and refuses when there is no entry, so the readings leave the machine spec (doc
+member, or the law file's it prices by (D41), and refuses with neither, so the readings leave the machine spec (doc
 `05` D25). This phase exists because these memory quantities cannot be derived from
 geometry and have no law behind them. It is the cheapest phase in the
 campaign and the one with the tightest acceptance gate behind it — KV block count at
@@ -642,7 +693,7 @@ campaign and the one with the tightest acceptance gate behind it — KV block co
 2. **Reset the allocator high-water mark around the measured step.** Otherwise
    `peak_torch` belongs to the warmup prefill, whose shape is nobody's choice — measured
    at **−14.7%** on one configuration.
-3. **A configuration with no entry refuses rather than defaults.** `run` names it. This
+3. **A configuration with no entry, and no law file's readings (D41), refuses rather than defaults.** `run` names it. This
    is the one place with no fallback, because a silently defaulted memory constant
    produces a plausible KV block count against a 5% gate.
 
@@ -758,6 +809,29 @@ without a scheduler: `model_runner.py::ModelRunner.dummy_execution` and
   tokens, and a row that keeps state the fresh state slots ATOM's block manager gives a
   request: one, or 1 + K under a GDN model's drafter of K drafts without ReplaySSM. Each
   measurement records the rule's version. Whether that reproduces the recorded step's forward context is T18.
+- **Several cards, once they agree** (revised 2026-11-19 by
+  [#2678](https://github.com/jgong5/ATOM/issues/2678), D118, bar 2). `measure steps --gpu`
+  naming k times the TP width's cards runs k benches, each on the next TP width of them,
+  over the invocation's points into one store: each bench takes the next point from one
+  queue, and runs all of that point's repeats (`17` D98). A split first checks its cards:
+  a fixed sample of at least ten of its points, every step kind among them, is measured
+  once on every bench in one pass, and a second time, a pass later, on the first. A bench
+  is named and measures nothing when the median of its differences from the first bench's
+  first pass exceeds the largest difference between the first bench's two passes: its
+  offset from the first card is then past the first card's whole pass-to-pass spread over
+  the same points. A median is set against a largest because a bench agreeing with the
+  first as well as the first agrees with itself draws its differences from the first
+  bench's own distribution, so the same statistic of each exceeds the other's about half
+  the time; such a bench is left out only when half its differences exceed every one of
+  the first bench's, under 2% of the time at ten independent points and less with more.
+  The evidence passes it: two of node 18's cards measured #1233's views 0.23% apart at
+  p50 ([#2678](https://github.com/jgong5/ATOM/issues/2678)), against one card's largest
+  spread of 1.1% over three passes ([#1881](https://github.com/jgong5/ATOM/pull/1881)),
+  while D41 puts PTL-on MI308X cards 3 to 5% apart, which it leaves out; no pair answers
+  for another node. It replaces a split of the inputs over GPUs, each run reading the store
+  once, at its start (`atom/compass/bench/measure.py::_todo`), which spent 13.6 of #1233's
+  27.2 device hours on views another GPU measured. The op bench stays one bench an
+  invocation (T118).
 
 ```
   record, trace steps;              the step bench (GPU): EngineCore's
@@ -833,8 +907,9 @@ each server in steps 2, 3 and 6 serves the client runs a client started apart se
        -> a trace run: the record's prefill passes' busy time (D38, Phase 1c)
  3.  compass trace steps <backend> --device DEV --ptl PTL ... -- <ATOM args>  [CPU, a server]
        -> shape_population, keyed by the backend that priced it
- 4.  compass measure steps <records> --grid <populations> ...       [GPU]
-       -> the step grid's planner over 3 (17 D98); one step_measurement per distinct batch
+ 4.  compass measure steps <records> --grid <populations> ...       [GPU, k benches]
+       -> the step grid's planner over 3 (17 D98); one step_measurement per distinct batch,
+          on every bench the agreement check admits (D39)
  5.  compass fit host <records>; compass fit steps --backend step-linear|step-grid ... [CPU]
        -> host_laws; a step_linear_law or a step grid bundle
  6.  compass run <backend> --device DEV --ptl PTL [--coverage <populations, records>] ...  [CPU, a server]
@@ -1031,13 +1106,13 @@ only, and an `op_graph` is keyed by its shape.
 | `probe_record` | `measure device`, one per node (`05` D26) | (device, software stack, PTL state, torch, host name) |
 | `platform_readings` | `fit device`, from probe records, or `--assume-from` another device's entry for a device never run (`05` D26) | (device, software stack, PTL state, torch) |
 | `shape_population` | Phase 0, `trace steps` | (model, workload, engine config, the pricing backend's digest) |
-| `op_graph` | Phase 1a, `trace ops`; a run's lazy trace | (**structure**, shape, source-root digest, torch): the structure's discrete key; a decode width or a prefill (T, B), with its gathered rows G when they are not `dp x T`, or `G=G` for a DP prefill's graph that holds G as a symbol (`04` D18); and the ATOM source and torch it was traced under, so a graph traced under another of either is a miss, which a run's lazy trace publishes its own beside ([ruling on #3124](https://github.com/jgong5/ATOM/pull/3124#issuecomment-6768936508)) |
+| `op_graph` | Phase 1a, `trace ops`; a run's lazy trace | (**structure**, shape, source-root digest, torch): the structure's discrete key; a decode width or a prefill (T, B), with its gathered rows G when they are not `dp x T`, or `G=G` for a DP prefill's graph that holds G as a symbol (`04` D18); the torch it was traced under; and the digest of its files, each file under ATOM's and aiter's roots its process had run or read when it traced the graph, with its own digest (D43). A graph traced under another torch, or a file of which reads otherwise, is a miss, which a run's lazy trace publishes its own beside ([ruling on #3124](https://github.com/jgong5/ATOM/pull/3124#issuecomment-6768936508), #3156) |
 | `op_measurement` | Phase 1b, `measure ops` | (model, platform, source-root digest, the point's digest): of its shape, context and leaf signature, and of the parallel layout for a collective leaf alone |
 | `price_list` | Phase 1b, `fit ops` | **(model, parallel layout, platform, source-root digest)** — a tuple, never a path |
-| `memory_readings` | Phase 2, `measure memory`; published with every reading assumed for a device never measured | (model, platform, parallel layout, engine config) |
+| `memory_readings` | Phase 2, `measure memory`; published with every reading assumed for a device never measured; or carried by a law file, assumed (below) | (model, platform, parallel layout, engine config) |
 | `step_measurement` | Phase 1c, `measure steps` | (model, platform, engine config, source-root digest, sampling, step kind, the batch's digest) |
 | `step_linear_law` | `fit steps --backend step-linear` | (model, platform, engine config, source-root digest, form) |
-| `host_laws` | `fit host` | (host CPU, ATOM source, model, engine config, device, software stack, torch), as the run reads its host key |
+| `host_laws` | `fit host` | (host CPU, ATOM source, model, engine config, device, software stack, torch), as the run reads its host key, but for the host CPU, which it takes from the laws: the host they timed is the host it predicts (`09` D54) |
 | step grid bundle (`step_grid_bundle`) | `fit steps --backend step-grid` | `17` D101, its `device` field the platform |
 | `projection` | `compass project`, real runs' steps priced on a device none of them ran on | (model, torch, the whole composed machine spec's digest, source-root digest, the cells' step records and engines) |
 
@@ -1114,6 +1189,30 @@ it their contexts' mix ([#3048](https://github.com/jgong5/ATOM/issues/3048)). Ne
 a law prices the card mix of its records, and `validate.cost` states each DP rank's
 error with its cards' PCI buses, which `run.json` records (README, principle 12;
 [#3048 Ruling](https://github.com/jgong5/ATOM/issues/3048#issuecomment-6851366020)).
+
+**A law file's readings.** A law file under `scripts/compass/laws/` carries the
+`memory_readings` members `measure memory` took on its law's platform under its engine
+config, each stating `assumed`: where, and at which tree. `run` reads them when its store
+holds none (`13` D80). They are keyed as a store entry is, by a key that holds no ATOM
+digest (`atom/compass/artifacts/keys.py::OWN_FIELDS`), and checked as one is against
+ATOM's source, their `atom_src` the `atom` digest of the law's host key, which every kind
+reads (rule 2 below), so the commits that re-key the law to a new digest re-key them, and
+no commit outside ATOM's own Python moves either: one engine start serves every tree the
+law reaches, a reuse the README's principle 10 allows where it is stated, here as
+`assumed`, which makes their terms declared. A commit that moves what a start under the
+law's engine config holds, through the code a reading reads (Phase 2), takes them again on
+that platform. The measured cases are DeepSeek-V4.1-Flash's graph pool at TP4 EP4 DSpark5
+on MI355X, its KV block count unmoved.
+[#2861](https://github.com/jgong5/ATOM/pull/2861) raised ATOM's default prefill token
+buckets from 3072 to 7168 tokens, taking a start at the default from 2.94 to 7.78 GB per
+GPU; the key reads the buckets only off their default
+(`atom/compass/run/step_grid.py::keyed`), so that commit stated the old ones in the
+V4.1-Flash laws' engine config, as their readings' key would, and a start under it holds
+what it did. [#2873](https://github.com/jgong5/ATOM/pull/2873)'s recordings, keeping no
+argument their regions take live, took a start at those buckets from 2.94 to 2.08 GB: such
+a commit takes the readings again. The first law to carry them is the Qwen3.8-27B TP1
+MI308X law, its readings taken once on one card of hjbog-srdc-39, whose cards run with PTL
+disabled as the law's records did, under the stack the law is keyed to.
 
 ### Four rules
 
@@ -1273,7 +1372,7 @@ mismatch **refuses** (warn only under an explicit flag).
 | artifact \ invalidated by | ROCm / AITER / RCCL | torch | ATOM src | model | device | PTL | host CPU | engine cfg |
 |---|---|---|---|---|---|---|---|---|
 | `shape_population` | - | - | **X** | **X** | - | - | - | **X** |
-| `op_graph` | - | **X** | **X** | **X** | - | - | - | X (level, cudagraph mode) |
+| `op_graph` | - *(aiter's Python and data: in its files)* | **X** | **X** *(the files its trace ran and read)* | **X** | - | - | - | X (a step law's less its ladder and level, and the cudagraph mode) |
 | `op_measurement`, `price_list` | **X** | **X** | X | - *(shape-parametric)* | **X** | X | - | - |
 | `step_measurement`, `step_linear_law` | X | X | X | X | X | X | - | X |
 | step grid bundle (`17` D101) | X | X | X | X | X | X | - | X |
@@ -1317,6 +1416,20 @@ Consequences worth noting:
   2026-10-29 on [#2310](https://github.com/jgong5/ATOM/issues/2310#issuecomment-6497009949)):
   a doc, a test or Compass's own code moves no cell, and any other Python file under
   `atom/` does.
+- An `op_graph`'s ATOM src cell reads **its files**, not the whole source (#3156): each
+  file under ATOM's and aiter's roots its trace's process had imported, whose body ran,
+  or opened to read by the time it traced the graph, each with its own digest, ATOM's
+  read as the host key reads it. A lookup reads a graph while each of them reads as it
+  did, checked once a process, so an edit to a file no trace ran, another model or the
+  server, misses no graph. A module imported counts whether or not a function of it ran:
+  its body defines what code elsewhere reads, an aiter op's schema among them. What the
+  files cannot hold stays keyed by version: torch's C++ meta and fake registrations, by
+  the torch in the key. aiter registers no op in C++, and no compiled aiter code runs in
+  a capture: a V4-Pro prefill capture made no call into a compiled aiter module, and
+  about 90,000 into torch's (#3156). So the software stack stays `-`. A graph keyed
+  by the whole ATOM source still answers while that source is this one's.
+- ATOM's source invalidates a store entry's readings, which `measure memory` takes again; a
+  law file's are re-keyed or taken again as D41's *A law file's readings* says.
 - The region-term artifact's row is retired with its kind, 2026-10-18 on
   [#1489](https://github.com/jgong5/ATOM/issues/1489). An entry that still records a
   fingerprint for it refuses at load, as any row the matrix no longer names does.
@@ -1610,21 +1723,171 @@ what it leaves.
 
 ---
 
+## D118. Calibration in less time at the same accuracy: three bars
+
+Decided 2026-11-19 by [#2678](https://github.com/jgong5/ATOM/issues/2678). It changes D37,
+D38's Phase 1b, D39, `13` D80 and `17` D98, each in place, naming there the bar the change
+meets.
+
+### Problem
+
+Calibration time goes to views measured twice, to 45 repeats a point where fewer settle, to
+points on decode rungs no step reaches, and to cards left idle: on stage 2's step grid,
+13.6 of 27.2 device hours were repeats of views another GPU had measured, and an op plan at
+TP 1 takes 2.5 to 4.6 hours on one of eight cards
+([#2678](https://github.com/jgong5/ATOM/issues/2678)). Each change below cites its own
+figure.
+
+### Decision
+
+**Three bars.** A change that cuts calibration time meets one of them, which the decision
+making the change names, and the named result of the code task building it shows it:
+
+1. **Same bytes.** Every artifact it publishes is byte-identical, or every point's record
+   is unchanged.
+2. **Within the measurement's own repeatability.** A changed value stays within the same
+   card's pass-to-pass spread, shown on the same points under the old way and the new. The
+   spread is measured there, on the cards and points the change moves, never carried from
+   another platform (README principle 10): the one on record, 1.1% over three passes on one
+   MI308X ([#1881](https://github.com/jgong5/ATOM/pull/1881)), is that card's, and no MI355X
+   step bench has one. It is shown as a median against a largest: the median of the new
+   values' differences from the old within the largest difference between two passes of
+   the old, since one statistic of two samples from one distribution exceeds the other's
+   about half the time (D39, `17` D98).
+3. **No lost coverage.** No step of the workloads a plan was made from loses its measured
+   price, and a step outside them is counted by its backend's coverage check before a
+   graded run, so it is measured, not priced by a fallback.
+
+**An end-to-end delta tests no cut.** Graded against the same real runs, the prediction
+loop's runs on #1233 under bundles v2 and v3 (D37) differed in cost on totals by at most
+0.41 points, while single metrics moved a few points either way as the schedule diverged
+from step 110, c4's TTFT p50 error from 4.5% to 9.1% (README finding 1).
+
+**Not proposed, as no bar holds:** pricing a prefill chunk with output and one without from
+one point, which `17` D98 measures apart since ATOM skips logits and sampling on a chunk
+that samples nothing (`02` D10); and real steps standing in for grid points, which `17`
+D100 keeps out, a real step's time carrying the row order and raggedness the grid cannot
+see.
+
+**The cuts**, each decided where it applies, with its strongest rejected alternative:
+
+| Cut | Where | Bar | Rejected |
+|---|---|---|---|
+| `measure steps` on several cards, each admitted by an agreement check | D39, `13` D80 | 2 | `--part K/N`, N invocations into one store: a new flag and a split made by hand |
+| a step point's repeats: two bursts of five a pass apart, kept when they agree, else 45 | `17` D98 | 2 | repeats until the kept windows sum to 10 s: 10 s is chosen, not measured, and no point checks itself |
+| `measure ops --plan` at the decode rungs its steps replay and the next one up | Phase 1b | 3 | the replayed rungs alone: no margin, where Phase 0 states one, so a workload one rung wider waits on a top-up before it is graded; the rung above costs about 66 points on #1233's plan |
+| an op-level run graded only after its coverage check | `13` D80 | 3 | the analytical share counted (`08` D50.3): a whole rung priced analytically, uncounted before the run |
+| a step grid prediction planned from its own simulated runs | D37, Phase 0, `17` D98 | 3 | real runs dropped as a planning input everywhere: cost grading then declines the steps at the 52 points only #1233's real runs reach |
+| byte-identical speed-ups of `measure ops`, `trace ops` and the fits (Summary) | none | 1 | none |
+
+`measure ops` keeps one bench an invocation: `--gpu` names the layout's ranks, or one card
+at a DP-attention layout (`atom/compass/bench/ops.py::main`), and the ranks take a barrier
+before each replay (`atom/compass/bench/ranks.py`), so eight cards at DPA8 are one bench,
+not eight. A multi-rank plan keeps each rank's cold time beside rank 0's record
+(`atom/compass/bench/ranks.py::merge`), but no one has set an op point's times on two cards
+against one card's two passes (T118).
+
+### Scenarios
+
+A step grid calibration on a node's eight cards, TP 1:
+
+```
+ compass measure steps --grid POP... REAL... --gpu 0,1,...,7 ... -- <ATOM args>
+   the points the store lacks (_todo) -> one queue
+   check: ten or more points, every step kind, on each bench in one pass,
+          and on bench 0 a pass later
+     bench k's median difference from bench 0's first pass
+       <= the largest between bench 0's two passes?  yes: k joins
+                                                     no: k named, idle
+   pass 1: each point's first burst of 5, on the bench that takes it
+   pass 2: its second burst, on the same bench
+     medians within 0.23% -> its value, the median of its 10 repeats
+     otherwise            -> on to 45 on that bench, the median of 45
+   -> one step_measurement per point, protocol 2, in one store
+```
+
+An op plan and the run graded on it:
+
+```
+ compass measure ops --plan PLAN_RECORDS ...
+   decode rungs: those PLAN_RECORDS' steps replay, and the ladder's next above them
+   -> op_measurements; compass fit ops -> price_list
+ compass run --op-graph --coverage GRADED_RECORDS ...
+   steps at a rung no point holds -> counted per leaf kind before the run starts
+     -> measure ops --plan PLAN_RECORDS GRADED_RECORDS: the points the store lacks; refit
+ python -m atom.compass.validate: an op-level run with no coverage check is not graded
+```
+
+A step grid prediction of a new workload W on a calibrated configuration, no real run of W:
+
+```
+ round k: compass trace steps <bundle k> ...; W's client
+            -> W's simulated steps: a shape_population and a record
+          measure steps --grid over them
+            new points -> measured; fit steps -> bundle k+1; next round
+            none       -> stop
+ the prediction: the last round's run; its coverage check sends no step to the roofline
+   but past a limit, counted apart
+ #1233, c1 to c64: v2 from the populations' 421 and 85 points; the loop: 17 under v2,
+   0 under v3; steps on the roofline 0/2/3/0 under v2, none under v3
+```
+
+### Simpler alternative
+
+The same cuts with no agreement check: a split measures on whatever cards `--gpu` names.
+It fails bar 2 wherever two cards differ by more than one card's passes, as D41 states
+PTL-on MI308X cards do, and README principle 6. Simpler still, the repeats and the op
+plan's rungs alone keep #1233's 13.6 device hours of repeated views and leave a prediction
+with no rule for what it measures, both of which #2678 asks for.
+
+### Low confidence
+
+None.
+
+### Dependencies
+
+No spike and no sync issue.
+
+### Summary
+
+**Deliverable.** The three bars and the cuts, each written where it applies. **Not in
+scope:** `19` D113's record list, whose designed-load candidate
+([#3668](https://github.com/jgong5/ATOM/issues/3668)) is held to bar 2; D106's sweep
+([#3738](https://github.com/jgong5/ATOM/issues/3738)); `measure ops` on several cards
+(T118); a prediction loop at the op level (T119); rank-local op measurement above TP 1 and
+a parallel `trace ops`
+([#1849](https://github.com/jgong5/ATOM/issues/1849)), with no evidence yet. The ATOM
+source key's churn ended with [#2517](https://github.com/jgong5/ATOM/pull/2517) (D41 rule
+2).
+
+| Task | Where | Bar, and the named result |
+|---|---|---|
+| 1 | `atom/compass/bench/measure.py`, `atom/compass/bench/engine.py`: k benches from one queue, the agreement check; `scripts/compass/README.md` step 7 | 2: the check's reading, and a plan's hours on k cards against one [GPU] |
+| 2 | `atom/compass/bench/window.py`: the bursts, `PROTOCOL` 2, under [#3287](https://github.com/jgong5/ATOM/issues/3287), whose brief takes the rule | 2: before the rule ships, about 40 prefill points on one card of the platform the task runs on (#3287's: MI355X) under both protocols, the new values within the old protocol's two-pass spread there, as `17` D98 states the test [GPU] |
+| 3 | `atom/compass/bench/ops.py::plan`; `atom/compass/validate/runs.py::_not_graded` | 3: a plan over a record holds no rung past its widest and the next; an op-level run with no coverage check is refused; CPU tests |
+| 4 | `scripts/compass/README.md`: the step grid's prediction loop, its stop and its gate | 3: the recipe, no code |
+| 5 | `measure ops`: no copies or graphs for a leaf that launches no kernel, which times 0 ([#1822](https://github.com/jgong5/ATOM/issues/1822)); `trace ops`: shapes its store holds skipped, not refused; `fit ops`: its tokens resolved from one listing of the store; `fit host`: its JIT cut built once, not per sample; `fit steps --backend step-grid`: nodes found by bisection, each target priced once; every fit: each record parsed once, BLAS on one thread | 1: the same bytes on #2317's cal2 records or the store measured |
+
+**Acceptance.** Each task shows its bar as its row states; T115 to T119 hold what is open.
+
+---
+
 ## Decision log
 
 | # | Decision | Date |
 |---|---|---|
 | D36 | Two granularities, step-level and op-level, and a method per term (analytical, declared, measured, estimated) replace the three-way split of cost models; fallback runs only along method inside one granularity. Compass models a device it has been measured on; an input observed on another subject makes a term declared, and doc 05 D26 has no `transfer` probe. The op-level backend is empirical on a measured device, over a concrete IR graph per decode width and prefill (T, B): each leaf priced from a `price_list`, else by its analytical law, with no residual, so a new engine config, layout or shape needs only its missing leaf signatures measured. | 2026-09-18; probe dropped 2026-10-14 (#937); two granularities 2026-10-14 (#952); op level empirical 2026-10-18 (#1489) |
-| D37 | The tool tells the user what to measure: a backend that needs measurements plans them beside its own code and owns the coverage check that `compass run --coverage` calls before the run starts; the step grid's planner runs inside `measure steps`, over `shape_population` entries and `record` directories, and the op-level backend's inside `measure ops --plan`, over the steps of record directories from `record` or `trace steps --out`; no single command plans the campaign. Coverage checks use a convex hull or k-NN distance, never a bounding box. | 2026-09-18; revised 2026-10-13 and 2026-10-14 (#851); op-level planner 2026-10-18 (#1489); its input, record directories, 2026-10-18 (#1527) |
-| D38 | Phase 0 discovery (shapes only) -> 1a trace -> 1b price -> 1c in-situ (+ one TP2 transfer test) -> Phase 2 memory. Client count and workload are not calibration axes. `13` D80's commands run them: `trace steps`, `trace ops`, `measure ops` and `fit ops`, `record` and `measure steps` then `fit steps\|host`, and `measure memory` for Phase 2, one engine start per configuration whose `memory_readings` a run reads and refuses without; `measure` writes per point, `fit` makes laws, bundles and leaves. Phase 1a captures one concrete graph per decode width and prefill (T, B). Phase 1b times each IR leaf alone from its contract at a point `ModelRunner.prepare_model` prepared, on a runner whose parameters are on the meta device, running no forward, warmup included: activations random by spec, weights random by spec over as many tensors as the leaf has instances, metadata, forward context, KV and module tensors from the runner, a host argument built on the host, pinned, a copy with one ATOM keeps pageable refused, and a referenced module's parameters filled on the device as `--load_dummy xavier` fills them, by CUDA-graph replay over rotating copies, module-attribute tensors included, whose total exceeds the last-level cache, each cold replay after a read of twice the cache outside its timing, at points planned from the steps of record directories from `record` or `trace steps --out`, each point recording the kernels its leaf launched, with the warm-over-cold ratio reported and the card's PTL state keyed; MoE leaves on uniform routing; `fit ops` interpolates only between same-kernel neighbours (`09` D60) and declines any other query, which the leaf's analytical law answers, counted. Phase 1c feeds the op-level backend nothing. Phase 1c's records also time each served tokenizer call and stamp each HTTP request's intake, which `fit host` fits into the `host_laws` entry's `tokenizer` and `http_intake` terms, the intake on its loop thread's CPU time, its `per_byte_s` and `idle_s` from lone requests and its hull over body bytes, the tokenizer on lone calls' wall time, one-item and several-item encodes and decode as three kinds, and the segment tokenizer call's own work over the ids it encodes as a fourth; an unfitted term or kind is listed; every host-law term stays keyed by model. | 2026-09-18; commands 2026-10-13 (#851); Phase 2 2026-10-14 (#851); Phases 1b and 1c 2026-10-18 (#1489); 1b's points planned from record directories 2026-10-18 (#1527); 1b without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)); referenced modules' parameters filled 2026-10-21 ([#1869](https://github.com/jgong5/ATOM/issues/1869#issuecomment-6321134450)); the cache evicted before each cold replay 2026-10-23 ([#2019](https://github.com/jgong5/ATOM/issues/2019)); tokenizer and HTTP intake fitted from records 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)); intake on CPU time 2026-11-04, tokenizer on lone calls by kind 2026-11-05 ([#2751](https://github.com/jgong5/ATOM/issues/2751#issuecomment-6655175759)); the segment tokenizer call 2026-11-09 ([#2618](https://github.com/jgong5/ATOM/issues/2618)); host arguments 2026-11-10 ([#2857](https://github.com/jgong5/ATOM/issues/2857)); pageable host memory refused 2026-11-12 ([#3172](https://github.com/jgong5/ATOM/issues/3172)) |
-| D39 | The step bench is `EngineCore` without its scheduler: every TP rank's `RecordingModelRunner` started through its runner manager in its order, at any TP width, a step charged to its slowest rank, fed **replayed** batches rebuilt from step records by a versioned rule. One window for both step kinds: device time from an event at the forward's entry to one at its exit, with device work queued ahead, a repeat counting only if the entry event is still pending when the forward returns; whatever is fitted on it states that value kind. Step measurements may not use synthetic shapes, the step grid's excepted (`17` D98). The op bench, apart from the step bench, runs no forward: ATOM's runner with its parameters on the meta device and no warmup, `ModelRunner.prepare_model` building each placement's metadata and forward context, and the bench timing each leaf from its contract; on one GPU at a DP-attention layout, the runner at one rank's own width, collectives measured across the layout's ranks. | 2026-09-18; revised 2026-10-13 (#851); op bench 2026-10-18 (#1489); op bench without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)) |
+| D37 | The tool tells the user what to measure: a backend that needs measurements plans them beside its own code and owns the coverage check that `compass run --coverage` calls before the run starts; the step grid's planner runs inside `measure steps`, over `shape_population` entries and `record` directories, and the op-level backend's inside `measure ops --plan`, over the steps of record directories from `record` or `trace steps --out`; no single command plans the campaign. Coverage checks use a convex hull or k-NN distance, never a bounding box. On the step grid, a prediction with no real run of its target plans from its own simulated runs, round by round until the planner places no new point, its last run gated on no step falling to the roofline where a point can be placed; real runs, where grading has them, stay a planning input. The op level keeps the coverage check and one top-up. | 2026-09-18; revised 2026-10-13 and 2026-10-14 (#851); op-level planner 2026-10-18 (#1489); its input, record directories, 2026-10-18 (#1527); a step grid prediction planned from its simulated runs 2026-11-19 ([#2678](https://github.com/jgong5/ATOM/issues/2678)) |
+| D38 | Phase 0 discovery (shapes only) -> 1a trace -> 1b price -> 1c in-situ (+ one TP2 transfer test) -> Phase 2 memory. Client count and workload are not calibration axes. `13` D80's commands run them: `trace steps`, `trace ops`, `measure ops` and `fit ops`, `record` and `measure steps` then `fit steps\|host`, and `measure memory` for Phase 2, one engine start per configuration whose `memory_readings`, or a law file's, a run reads and refuses without; `measure` writes per point, `fit` makes laws, bundles and leaves. Phase 1a captures one concrete graph per decode width and prefill (T, B). Phase 1b times each IR leaf alone from its contract at a point `ModelRunner.prepare_model` prepared, on a runner whose parameters are on the meta device, running no forward, warmup included: activations random by spec, weights random by spec over as many tensors as the leaf has instances, metadata, forward context, KV and module tensors from the runner, a host argument built on the host, pinned, a copy with one ATOM keeps pageable refused, and a referenced module's parameters filled on the device as `--load_dummy xavier` fills them, by CUDA-graph replay over rotating copies, module-attribute tensors included, whose total exceeds the last-level cache, each cold replay after a read of twice the cache outside its timing, at points planned from the steps of record directories from `record` or `trace steps --out`, at the decode rungs they replay and the ladder's next above the widest, each point recording the kernels its leaf launched, with the warm-over-cold ratio reported and the card's PTL state keyed; MoE leaves on uniform routing; `fit ops` interpolates only between same-kernel neighbours (`09` D60) and declines any other query, which the leaf's analytical law answers, counted. Phase 1c feeds the op-level backend nothing. Phase 1c's records also time each served tokenizer call and stamp each HTTP request's intake, which `fit host` fits into the `host_laws` entry's `tokenizer` and `http_intake` terms, the intake on its loop thread's CPU time, its `per_byte_s` and `idle_s` from lone requests and its hull over body bytes, the tokenizer on lone calls' wall time, one-item and several-item encodes and decode as three kinds, and the segment tokenizer call's own work over the ids it encodes as a fourth; an unfitted term or kind is listed; every host-law term stays keyed by model. | 2026-09-18; commands 2026-10-13 (#851); Phase 2 2026-10-14 (#851); Phases 1b and 1c 2026-10-18 (#1489); 1b's points planned from record directories 2026-10-18 (#1527); 1b without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)); referenced modules' parameters filled 2026-10-21 ([#1869](https://github.com/jgong5/ATOM/issues/1869#issuecomment-6321134450)); the cache evicted before each cold replay 2026-10-23 ([#2019](https://github.com/jgong5/ATOM/issues/2019)); tokenizer and HTTP intake fitted from records 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)); intake on CPU time 2026-11-04, tokenizer on lone calls by kind 2026-11-05 ([#2751](https://github.com/jgong5/ATOM/issues/2751#issuecomment-6655175759)); the segment tokenizer call 2026-11-09 ([#2618](https://github.com/jgong5/ATOM/issues/2618)); host arguments 2026-11-10 ([#2857](https://github.com/jgong5/ATOM/issues/2857)); pageable host memory refused 2026-11-12 ([#3172](https://github.com/jgong5/ATOM/issues/3172)); the rungs the steps replay and the next, and Phase 0's margin checked after the fact only against real runs, 2026-11-19 ([#2678](https://github.com/jgong5/ATOM/issues/2678)) |
+| D39 | The step bench is `EngineCore` without its scheduler: every TP rank's `RecordingModelRunner` started through its runner manager in its order, at any TP width, a step charged to its slowest rank, fed **replayed** batches rebuilt from step records by a versioned rule. One window for both step kinds: device time from an event at the forward's entry to one at its exit, with device work queued ahead, a repeat counting only if the entry event is still pending when the forward returns; whatever is fitted on it states that value kind. Step measurements may not use synthetic shapes, the step grid's excepted (`17` D98). The op bench, apart from the step bench, runs no forward: ATOM's runner with its parameters on the meta device and no warmup, `ModelRunner.prepare_model` building each placement's metadata and forward context, and the bench timing each leaf from its contract; on one GPU at a DP-attention layout, the runner at one rank's own width, collectives measured across the layout's ranks. `measure steps --gpu` naming k times the TP width's cards runs k benches over one queue of points into one store, a bench joining unless its median difference from the first bench over a sample of points exceeds the largest between the first bench's two passes over them; the op bench stays one bench an invocation. | 2026-09-18; revised 2026-10-13 (#851); op bench 2026-10-18 (#1489); op bench without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)); several cards for the step bench 2026-11-19 ([#2678](https://github.com/jgong5/ATOM/issues/2678)) |
 | D40 | Four classes of communication, priced separately. Scaling is measured per width, never modelled. A collective's measured duration is an upper bound on device work. Collectives are leaves, interpolated over message bytes, measured on a multi-rank op bench that starts every rank of the layout through ATOM's own group initialisation, takes a barrier before each timed replay and measures the union of all ranks' signatures; the step bench is not reused. | 2026-09-18; collectives as leaves 2026-10-18 (#1489) |
-| D41 | Artifacts, each with key, digest, fingerprint and provenance. Keys are tuples; source roots are `git archive` digests; a source root with uncommitted files does not publish; resolution names its answer; handed-off artifacts are immutable. `step_measurement`, `step_linear_law` and `host_laws` added, and `shape_population` keyed by its pricing backend. `memory_readings` from `measure memory`, keyed as `step_linear_law` is, or published with every reading assumed for a device never measured. `price_list` and `memory_readings` keyed by the parallel layout, not a scalar width. The region-term artifact retired; `op_measurement` added, one per `measure ops` point, keyed as `price_list` is plus the point, the layout only for a collective leaf; `op_graph` keyed by structure and shape, and by the ATOM source and torch it was traced under. | 2026-09-18; kinds 2026-10-13 (#851); `memory_readings` 2026-10-14 (#851); parallel layout 2026-10-15 (#165, #537); region terms retired, `op_measurement`, `op_graph` per shape 2026-10-18 (#1489); a dirty tree publishes nothing 2026-10-25 (#168); ATOM's source read as the host key's `atom` digest, not the git tree, 2026-10-29 ([#2310](https://github.com/jgong5/ATOM/issues/2310#issuecomment-6497009949)); `probe_record` and `platform_readings` replace `machine_spec`, and each kind keys the device, stack, PTL and torch its row marks, read from its records, in place of the machine-spec digest, 2026-11-03 (#2716, [ruling on #2724](https://github.com/jgong5/ATOM/pull/2724#issuecomment-6596632012)); `op_graph` keyed by the ATOM source and torch it was traced under, 2026-11-11 (#3155, [ruling on #3124](https://github.com/jgong5/ATOM/pull/3124#issuecomment-6768936508)); `op_measurement` keys the layout only for a collective leaf, 2026-11-14 ([#3408](https://github.com/jgong5/ATOM/issues/3408), [Ruling on #1500](https://github.com/jgong5/ATOM/issues/1500#issuecomment-6870338230)) |
+| D41 | Artifacts, each with key, digest, fingerprint and provenance. Keys are tuples; source roots are `git archive` digests; a source root with uncommitted files does not publish; resolution names its answer; handed-off artifacts are immutable. `step_measurement`, `step_linear_law` and `host_laws` added, and `shape_population` keyed by its pricing backend. `memory_readings` from `measure memory`, keyed as `step_linear_law` is, or published with every reading assumed for a device never measured. `price_list` and `memory_readings` keyed by the parallel layout, not a scalar width. The region-term artifact retired; `op_measurement` added, one per `measure ops` point, keyed as `price_list` is plus the point, the layout only for a collective leaf; `op_graph` keyed by structure and shape, and by the torch it was traced under and the files its trace ran and read. A law file carries its readings, assumed, which `run` reads when its store holds none, keyed as a store entry is and checked by their `atom_src`, the host key's `atom` digest; a run takes the host CPU of host laws from the laws. | 2026-09-18; kinds 2026-10-13 (#851); `memory_readings` 2026-10-14 (#851); parallel layout 2026-10-15 (#165, #537); region terms retired, `op_measurement`, `op_graph` per shape 2026-10-18 (#1489); a dirty tree publishes nothing 2026-10-25 (#168); ATOM's source read as the host key's `atom` digest, not the git tree, 2026-10-29 ([#2310](https://github.com/jgong5/ATOM/issues/2310#issuecomment-6497009949)); `probe_record` and `platform_readings` replace `machine_spec`, and each kind keys the device, stack, PTL and torch its row marks, read from its records, in place of the machine-spec digest, 2026-11-03 (#2716, [ruling on #2724](https://github.com/jgong5/ATOM/pull/2724#issuecomment-6596632012)); `op_graph` keyed by the ATOM source and torch it was traced under, 2026-11-11 (#3155, [ruling on #3124](https://github.com/jgong5/ATOM/pull/3124#issuecomment-6768936508)), and by the files its trace ran and read in place of the whole source, 2026-11-17 (#3156); `op_measurement` keys the layout only for a collective leaf, 2026-11-14 ([#3408](https://github.com/jgong5/ATOM/issues/3408), [Ruling on #1500](https://github.com/jgong5/ATOM/issues/1500#issuecomment-6870338230)); a law file's readings, and the host CPU from the laws, 2026-11-10 ([#2899](https://github.com/jgong5/ATOM/issues/2899)) |
 | D42 | Trace is JIT and cached; pricing is offline or opt-in `--measure`. A `--measure` run is never an acceptance run. A new shape is captured, and each leaf in it interpolated between same-kernel neighbours; anywhere else, and for a new operator kind, the leaf falls to its analytical law, counted, and refuses without one. | 2026-09-18; same-kernel interpolation 2026-10-18 (#1489) |
-| D43 | Per-artifact invalidation matrix, not a global fingerprint. Every gate's state is written into the artifact and checked there. Rows for `shape_population`, `step_measurement`, `step_linear_law` and `host_laws`, and a host-CPU axis. The region-term row retired; `op_measurement` on `price_list`'s row. The tokenizer terms leave the spec for `host_laws`, whose row the host CPU invalidates. | 2026-09-18; rows 2026-10-13 (#851); region-term row retired, `op_measurement` 2026-10-18 (#1489); `host_laws` row gains the device, stack and PTL its machine-spec digest carries, and torch through its fingerprint, 2026-10-29 (#2484); the ATOM src column reads the host key's `atom` digest 2026-10-29 ([#2310](https://github.com/jgong5/ATOM/issues/2310#issuecomment-6497009949)); PTL back to `-`, carried only because the digest is one hash, and a run does not yet check torch for host laws, 2026-10-30 (#2308, #2475); the `machine_spec` rows give way to `probe_record` and `platform_readings`, and `host_laws` keys no PTL, 2026-11-03 (#2716); torch is keyed wherever its row marks it, 2026-11-03 ([ruling on #2724](https://github.com/jgong5/ATOM/pull/2724#issuecomment-6596632012)); tokenizer terms to `host_laws` 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)) |
+| D43 | Per-artifact invalidation matrix, not a global fingerprint. Every gate's state is written into the artifact and checked there. Rows for `shape_population`, `step_measurement`, `step_linear_law` and `host_laws`, and a host-CPU axis. The region-term row retired; `op_measurement` on `price_list`'s row. The tokenizer terms leave the spec for `host_laws`, whose row the host CPU invalidates. A law file's readings re-key with its host key, and are taken again by a commit that moves what a start under the law's engine config holds. | 2026-09-18; rows 2026-10-13 (#851); region-term row retired, `op_measurement` 2026-10-18 (#1489); `host_laws` row gains the device, stack and PTL its machine-spec digest carries, and torch through its fingerprint, 2026-10-29 (#2484); the ATOM src column reads the host key's `atom` digest 2026-10-29 ([#2310](https://github.com/jgong5/ATOM/issues/2310#issuecomment-6497009949)); PTL back to `-`, carried only because the digest is one hash, and a run does not yet check torch for host laws, 2026-10-30 (#2308, #2475); the `machine_spec` rows give way to `probe_record` and `platform_readings`, and `host_laws` keys no PTL, 2026-11-03 (#2716); torch is keyed wherever its row marks it, 2026-11-03 ([ruling on #2724](https://github.com/jgong5/ATOM/pull/2724#issuecomment-6596632012)); tokenizer terms to `host_laws` 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)); a law file's readings re-keyed, or taken again, 2026-11-10 ([#2899](https://github.com/jgong5/ATOM/issues/2899)); the `op_graph` row's engine config is a step law's less its ladder, as its key has held it since 2026-10-20 ([#1811](https://github.com/jgong5/ATOM/issues/1811)), and less its compilation level 2026-11-17 ([ruling on #3052](https://github.com/jgong5/ATOM/issues/3052#issuecomment-6942839264)) |
 | D38.1 | One recommended flow per half: steps (`measure memory`, `record`, `trace steps`, `measure steps` with the step grid's planner, `fit host` and `fit steps`, `run --coverage`, then grading outside the CLI), each server driven by a client started apart, and ops, after the steps half's `measure memory`, `record`, `trace steps` and `fit host` (`trace ops --population`, `measure ops --plan` over the record directories of `record` or `trace steps --out`, `fit ops` publishing a `price_list` only, then `run` and grading). Phases unchanged; the op bench, ATOM's runner preparing each point and running no forward, hosts 1b and the step bench 1c, Phase 2 is a plain startup `measure memory` runs. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); ops half 2026-10-18 (#1489); `measure ops --plan` reads record directories 2026-10-18 (#1527); op bench without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)) |
 | D40.1 | Classes (a) and p2p ride `measure ops` unchanged. Classes (b) and (c) share one new stated-entry-point benchmark inside the same multi-rank op bench, also run by `measure ops`. KV transfer is never priced. Collective prices are labelled upper bounds. | 2026-09-19; one command 2026-10-13 (#851); the multi-rank op bench 2026-10-18 (#1489) |
 | D106 | A container is warmed for a graded run by a constructed JIT sweep and a per-stack cache library; a compile in a graded run still voids it. A client against the cell's own deployment, no ATOM hook point; only pacing variables that select no kernel or shape differ, set by `compass record --sweep` and checked by `client.sh --sweep`: `ATOM_ENABLE_PREFILL_DELAYER=1`, `ATOM_PREFILL_DELAYER_COST_GATE=0`, `ATOM_PREFILL_DELAYER_TARGET_FILL=1.0`, `ATOM_PREFILL_DELAYER_STALL_TICKS=16`, `ATOM_PREFILL_DECODE_INTERVAL=1` at DP 1 and PP 1, and `ATOM_DP_PREFILL_BALANCE_MIN_TOKENS` at the batched-token budget, so balancing cuts no designed row. The ranks share one walk, each count once per container on a rank the count chooses. A: one single-row request per prefill token count from 1 to the budget, no parked decode, covered by any rank's step of that count TBO did not split. B: lockstep steps, a designed point per rank, the product of the second row's offset mod 16, 1 to 16 parked decodes and TBO on or off, plus chunked rows over the product of query size, its residue mod 16 (and, from the chunk alignment up, each multiple of 16 below it) and context level up to the longest prompt, balancing's aligned cuts below the budget included, a step's rows on as many earlier chunks; TBO points split inside a long first row too, and in split steps other ranks' rows cut into halves of 256 to 511 tokens at every offset mod 16; the costly row last or every rank's first alike; covered by exact rows and split. Parked decodes keep the PrefillDelayer's alignment gate armed, so a step's rows release together; no blocker. Two output tokens a request; axes and ranges from the cell's engine and workload, sampling arguments copied. Missing points resent unchanged, three rounds at most. PP above 1 and rapidserve run A only, not marked swept; a PD cell's decode side and KV connector path are warmed by one unscored run and the library. One library per stack (ROCm, aiter's commit, RCCL, torch, Triton, FlyDSL, gfx arch) at `<store>/jit`, `compass record --store` optional, merged in at a real server's start and written back at its stop, finished artifacts only, per compiler, atomically. Coverage is read from the step record after the stop and kept in the library per stack and cell; a cell is swept only when all its points are covered. Preemption, recompute and error paths are not swept: a build there is recorded, not a defect. Streaming the real record is deferred. | 2026-11-02 ([#2640](https://github.com/jgong5/ATOM/issues/2640#issuecomment-6568381628)); shared walk, delayer coalescing, pacing variables 2026-11-02 ([#2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6579531822)); balancing floor, stall 16 2026-11-02 ([#2687](https://github.com/jgong5/ATOM/issues/2687#issuecomment-6591321600)); chunked grid, split inside a first row 2026-11-03 ([#2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6607750609)); TBO halves 2026-11-04 ([#2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6619270702)); KV residues 2026-11-06 ([#2689](https://github.com/jgong5/ATOM/issues/2689#issuecomment-6686630693)) |
+| D118 | A change that cuts calibration time meets one of three bars, named where it is decided and shown by its code task's named result: the same bytes; within the measurement's own repeatability, the same card's pass-to-pass spread measured on the same points under the old way and the new, no number of it in code, the new values' median difference from the old within the largest between two passes of the old; no lost coverage, every step of the planning workloads keeping its measured price and a step outside counted by its backend's coverage check before a graded run. An end-to-end delta tests no cut. Not proposed, as no bar holds: a prefill chunk with and without output priced from one point, and real steps as grid points. The cuts: the step bench on several cards that agree (D39), a step point's repeats in two bursts a pass apart (`17` D98), the op plan's decode rungs (Phase 1b), an op-level run graded only after its coverage check (`13` D80), a step grid prediction planned from its simulated runs (D37), and byte-identical speed-ups of `measure ops`, `trace ops` and the fits. | 2026-11-19 ([#2678](https://github.com/jgong5/ATOM/issues/2678)) |
 
 ---
 
@@ -1646,3 +1909,7 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T103 | Stream the real record to the JIT sweep's client, so one round reads its own coverage and sends its missing points before the stop (D106) | deferred by #2640's design session; coverage is read after the stop meanwhile, and missing points are resent unchanged in the next round, three rounds at most |
 | T104 | The paths the JIT sweep does not construct: preemption and recompute, error paths, and a PD cell's decode side and KV connector path, which one unscored run and the library warm. A build there is recorded with its batch, not a defect, and the record naming it is refused and taken again (D106) | the client cannot reach the first two without changing the deployment, and designs only the prefill side's steps |
 | T105 | Sweep B on cells the PrefillDelayer does not coalesce: PP above 1 and rapidserve run A only and are not marked swept (D106) | ATOM builds no delayer there, so nothing makes a designed step's rows one batch |
+| T115 | Plan a step grid prediction from its simulated runs (D37) on a new engine configuration | its host laws need a real run, since their key holds the engine config (D41); the loop is shown only on a calibrated configuration ([#2678](https://github.com/jgong5/ATOM/issues/2678)) |
+| T116 | Plan a step grid prediction from its simulated runs (D37) on day zero, where the step roofline alone prices the first round's populations ([#2661](https://github.com/jgong5/ATOM/issues/2661)) | not yet run |
+| T118 | `measure ops` on several cards (D39, D118): the same op points on two cards against one card's two passes, and how a split meets a DP-attention layout, whose cards are one bench, its ranks taking a barrier before each replay (`atom/compass/bench/ops.py::main`, `atom/compass/bench/ranks.py`). Until then one bench an invocation; `scripts/compass/README.md`'s op-level cell splits an op plan's decode rungs over one-card runs with no such check | a multi-rank plan keeps each rank's cold time beside rank 0's record (`atom/compass/bench/ranks.py::merge`), but no one has set them against one card's two passes |
+| T119 | A prediction loop at the op level (D37): a stop rule, since its planner places points at the steps' own contexts and token counts (`atom/compass/bench/ops.py::plan`), so a round whose schedule moved places new ones. Until then the coverage check and one top-up | [#2678](https://github.com/jgong5/ATOM/issues/2678) ran the loop on the step grid only |

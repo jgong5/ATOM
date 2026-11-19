@@ -3,10 +3,11 @@
 `python -m atom.compass.report.html OUT`
 
 OUT is a run's directory as `split` reads it, once its split is written. The
-page goes to OUT/`FILE`, and no other file changes. Every number on it is read
-from a file in OUT, or in the cell holding OUT for its grades and its real
-runs' splits, and a part whose file is missing, or holds nothing for it, says
-so in its place:
+page goes to OUT/`FILE`, and no other file changes but, as grades below
+says, the reports of the other runs its cell's `GRADES` grades. Every number
+on it is read from a file in OUT, or in the cell holding OUT for its grades
+and its real runs' splits, and a part whose file is missing, or holds nothing
+for it, says so in its place:
 
 - the run: simulated, by which backend, or real; one instance, or a
   deployment's two sides, their KV link and the router's arguments; each
@@ -29,11 +30,17 @@ so in its place:
 - grades, the rows `python -m atom.compass.validate` printed for the cell
   holding OUT, from the cell's `GRADES`, when OUT is a run it graded and every
   run it graded still holds the results it read (`digest`); grading writes
-  that file and then renders the report of each of its runs again;
+  that file and then renders the report of each of its runs again, and a
+  report written once one of them holds other results renders the others
+  again, so none still shows the grades;
 - a simulated run's split beside the real runs', when the cell's `GRADES`
   grades it: each segment's percentiles of this run and of each real run
   graded with it, from their `split.FILE`, and why a run has none;
-- the op-family split, which no run's directory holds.
+- an op-level run's op-family split, `ops.split`: each side's time per step
+  phase by op family, the terms that hold no one kind and the rest of its
+  predicted time, each with why, and its refused steps; or why there is none;
+- the Prometheus report: a link to `prometheus.HTML`, or what
+  `prometheus.TEXT` says of why there is none.
 """
 
 import collections
@@ -45,7 +52,7 @@ from html import escape
 from pathlib import Path
 
 from atom.compass.backends.json_file import read_json
-from atom.compass.report import split
+from atom.compass.report import ops, prometheus, split
 from atom.compass.run import OP_GRAPH, STEP_GRID, STEP_LINEAR, STEP_STUB, SUMMARY_FILE
 from atom.compass.validate import curves
 from atom.compass.validate.runs import CLIENT_RUN, EXPORT, sides
@@ -332,6 +339,12 @@ def digest(run) -> str:
     return sha.hexdigest()
 
 
+def _changed(cell: Path, ran: dict) -> list[str]:
+    """The runs of `ran`, each name's `digest` as grading read it, that `cell`
+    holds other results for now."""
+    return [n for n, sha in ran.items() if digest(cell / n) != sha]
+
+
 def _grades(run: Path) -> str:
     """The grades of the cell holding `run`, from its `GRADES`, while each run
     they grade holds the results grading read, by its `digest`."""
@@ -343,8 +356,7 @@ def _grades(run: Path) -> str:
     names = ", ".join(graded["runs"])
     if run.name not in graded["runs"]:
         return _none(f"None: {path} grades {names}, not this run.")
-    ran = graded["runs"].items()
-    if changed := [n for n, sha in ran if digest(run.parent / n) != sha]:
+    if changed := _changed(run.parent, graded["runs"]):
         changed = ", ".join(changed)
         return _none(f"None: {path} grades {names}; {changed} changed since.")
     text = f"Cell {graded['cell']}, graded on its runs {names}."
@@ -391,6 +403,35 @@ def _beside(run: Path) -> str:
     return out
 
 
+def _ops(run: Path) -> str:
+    out = ""
+    for side, ranks, phases in ops.split(run):
+        for name, phase in sorted(phases.items(), key=lambda p: -p[1].predicted):
+            refused = sum(phase.refused.values())
+            text = (
+                f"{f'{side} side, ' if side else ''}{name}: {phase.steps} steps"
+                f" over {ranks} DP ranks, {refused} of them refused; seconds summed"
+                " over the ranks."
+            )
+            share = phase.predicted or None
+            rows = [
+                (part, _number(s), _percent(share and s / share), why)
+                for part, s, why in ops.rows(phase)
+            ]
+            head = ("part", "seconds", "share of predicted", "op kinds, or why")
+            out += f"<p>{escape(text)}</p>{_table(rows, head)}"
+            if refused:
+                out += _table(phase.refused.most_common(), ("refused", "steps"))
+    return out
+
+
+def _prometheus(run: Path) -> str:
+    if (run / prometheus.HTML).is_file():
+        text = "ATOM's CI report over this run's Prometheus series"
+        return f'<p><a href="{prometheus.HTML}">{escape(text)}</a></p>'
+    return _none(f"None: {(run / prometheus.TEXT).read_text().strip()}")
+
+
 def _part(title: str, make, *args) -> str:
     try:
         body = make(*args)
@@ -418,8 +459,8 @@ def page(run) -> str:
     ]
     if simulated:
         parts.append(_part("A real run's per-request split", _beside, run))
-    why = "None: no op-family split is recorded for this run."
-    parts.append(_part("Op-family split", _none, why))
+    parts.append(_part("Op-family split", _ops, run))
+    parts.append(_part("Prometheus report", _prometheus, run))
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
@@ -429,9 +470,20 @@ def page(run) -> str:
 
 
 def write(run) -> Path:
-    """Write `run`'s report to its `FILE`; that file."""
+    """Write `run`'s report to its `FILE`; that file. When a run its cell's
+    `GRADES` grades holds other results now, render again the report of each
+    other run that file grades, so none still shows the grades."""
     path = Path(run) / FILE
     path.write_text(page(run))
+    here = Path(os.path.abspath(run))  # a run given as `.` too
+    cell = here.parent
+    if (cell / GRADES).is_file():
+        ran = read_json(cell / GRADES)["runs"]
+        if _changed(cell, ran):
+            for name in ran:
+                other = cell / name
+                if name != here.name and (other / FILE).is_file():
+                    (other / FILE).write_text(page(other))
     return path
 
 

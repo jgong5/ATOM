@@ -81,7 +81,7 @@ from atom.compass import ir
 from atom.compass.backends.op_graph import KV, gathered_off_default
 from atom.compass.ir.nodes import Reduced
 
-from . import driverless, peers
+from . import driverless, files_of, peers
 from .graph import LAYER, Fork, Join, Traced, _json, build, to_json
 
 #: The fewest KV blocks a capture allocates; a shape that needs more gets more.
@@ -161,6 +161,45 @@ FUSED_MOES = ("aiter.fused_moe_.default", "aiter.rocm_aiter_fused_moe.default")
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
 logger = logging.getLogger(__name__)
+#: The path of each data file this process opened to read since its first
+#: capture began (`watch_reads`); None before that.
+_READ: set | None = None
+#: Python's own files, which count as run when imported, not when read: ATOM's
+#: source reading, a traceback or `inspect` reads them without running them.
+_PYTHON = (".py", ".pyc")
+
+
+def watch_reads() -> set:
+    """The absolute path of each file but Python's own (`_PYTHON`) this process
+    opens to read from its first call on, as the `open` audit event names it
+    (`_opened`). An audit hook cannot be removed, so one serves the process."""
+    global _READ
+    if _READ is None:
+        _READ = set()
+        sys.addaudithook(_opened)
+    return _READ
+
+
+def _opened(event, args):
+    """A file opened to read by name, in an `open` audit event: its path is
+    `watch_reads`'s. A hook that raises fails the open, so an event of another
+    form is passed over."""
+    if event != "open" or len(args) != 3:
+        return
+    path, mode, flags = args
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        return
+    if (
+        mode is None
+        and isinstance(flags, int)
+        and flags & os.O_ACCMODE == os.O_RDONLY
+        or (isinstance(mode, str) and not set(mode) & set("wax+"))
+    ):
+        try:
+            if not (path := os.fsdecode(path)).endswith(_PYTHON):
+                _READ.add(os.path.abspath(path))
+        except (OSError, ValueError):
+            pass
 
 
 class Shape(NamedTuple):
@@ -303,6 +342,18 @@ def device_arch() -> str:
     return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
 
 
+def graph_engine(config) -> dict:
+    """The engine config an `op_graph` of `config` is keyed by: the one a step
+    law is keyed by (`run.step_grid.keyed`) less its ladder and compilation
+    level, since every trace runs eager at level 0 and serves a run at any
+    level."""
+    from atom.compass.run.step_grid import LEVEL, keyed
+
+    engine = keyed(config, ladder=False)
+    engine.pop(LEVEL, None)
+    return engine
+
+
 def structure(
     config,
     phase: str,
@@ -315,10 +366,10 @@ def structure(
 ) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the arch of `device`, else
-    `device_arch()`, the engine config a step law is keyed by less its ladder
-    (`run.step_grid.keyed`), which names every variable that picks a kernel and
-    a drafter's method and width, its performance environment `env` when given,
-    as an engine file states one, else this process's, the TP width, the DP
+    `device_arch()`, its engine config (`graph_engine`), which names every
+    variable that picks a kernel and a drafter's method and width, its
+    performance environment `env` when given, as an engine file states one,
+    else this process's, the TP width, the DP
     width and the EP group's when they are set, the phase and the mode,
     `config`'s unless `eager` names it, ``no output`` unless the step produces
     output (`output`), and ``draft`` for the drafter's part of the step
@@ -327,10 +378,9 @@ def structure(
     two-batch-overlap micro-batch (`micro_batch`), which ATOM runs otherwise
     than a whole step of its shape."""
     from atom.compass.run import _file_digest
-    from atom.compass.run.step_grid import keyed
 
     digest = _file_digest(config.model, "config.json")
-    engine = keyed(config, ladder=False)
+    engine = graph_engine(config)
     if env is not None:
         engine["env"] = env
     engine = json.dumps(engine, sort_keys=True, separators=(",", ":"))
@@ -360,9 +410,12 @@ def _engine(text: str):
 def missed(store, key) -> str:
     """For an `op_graph` `key` `store` holds no entry at, each field in which
     a graph it holds at the key's shape and otherwise the key's structure
-    differs, as text: the ATOM source or torch it was traced under, then each
-    engine field (`step_grid.differ`); "" when it holds none."""
+    differs, as text: the ATOM source or torch it was traced under, or each
+    file of one keyed by its files that reads otherwise here (`changed`), then
+    each engine field (`step_grid.differ`); "" when it holds none."""
+    from atom.compass.artifacts import Key
     from atom.compass.artifacts.store import ENTRY_FILE
+    from atom.compass.capture import FILES, changed
     from atom.compass.run.step_grid import differ
 
     head, here, tail = _engine(key.values["structure"])
@@ -372,11 +425,17 @@ def missed(store, key) -> str:
         if there.get("shape") == key.values["shape"]:
             at = _engine(there.get("structure", ""))
             if at and (at[0], at[2]) == (head, tail):
+                files = str(there.get("source_root")).startswith(f"{FILES}-")
                 fields = [
                     f"{name} {there.get(name)!r} in the graph and {value!r} here"
                     for name, value in key.fields
-                    if name not in ("structure", "shape") and there.get(name) != value
+                    if name not in ("structure", "shape")
+                    and there.get(name) != value
+                    and not (files and name == "source_root")
                 ]
+                if files and (moved := changed(store, Key.of(key.kind, **there))):
+                    more = f" and {len(moved) - 5} more" * (len(moved) > 5)
+                    fields.append(f"files {', '.join(moved[:5])}{more}")
                 if engine := differ(at[1], here, "the graph"):
                     fields.append(f"engine config: {', '.join(engine)}")
                 named.append(", ".join(fields))
@@ -943,7 +1002,12 @@ def _patches(recorder):
       later `torch.zeros` of ATOM's on the host, not on the runner's device.
     * A host tensor ATOM asks to pin (that host side, `pin_memory=True`, a
       `pin_memory()` copy) is held pinned (`_Recorder.pin`), as `is_pinned`
-      answers.
+      answers, and so is `torch.from_numpy` over a numpy view of one, which
+      shares its bytes. `torch.tensor` and `torch.arange` build one unpinned
+      where torch builds it, a `torch.tensor` for a device on the host and
+      then copied there, as torch stages it: torch pins through the driver,
+      and the fake mode refuses to pin an `arange`. Beside `out`, torch
+      ignores `pin_memory`, and so does the capture.
     * A GDN prefill under ReplaySSM parks the cursors of its live state
       slots, a count of the device's slot indices no fake tensor holds: the
       host-staged indices state it (`_Recorder.counted`).
@@ -1029,6 +1093,7 @@ def _patches(recorder):
         recorder.launch(f"flydsl.{jit.func.__name__}", compiled, jit)
 
     init, zeros, numpy = CpuGpuBuffer.__init__, torch.zeros, torch.Tensor.numpy
+    from_numpy, tensor, arange = torch.from_numpy, torch.tensor, torch.arange
     tolist = torch.Tensor.tolist
     attach = gdn_attn.GDNStateMixin._attach_replayssm
     fake_tolist, sync = FakeTensor.tolist, ubatching.sync_dp_metadata
@@ -1059,6 +1124,30 @@ def _patches(recorder):
     def host_numpy(tensor, *args, **kwargs):
         with unset_fake_temporarily():
             return numpy(tensor, *args, **kwargs)
+
+    def host_from_numpy(array):
+        out, base = from_numpy(array), array.base
+        while hasattr(base, "base"):  # past the views, to what holds the bytes
+            base = base.base
+        held = isinstance(base, torch.Tensor) and recorder.pinned(base)
+        return recorder.pin(out) if held else out
+
+    def staged(build, moves):
+        def call(*args, **kwargs):
+            if not kwargs.get("pin_memory") or kwargs.get("out") is not None:
+                return build(*args, **kwargs)
+            del kwargs["pin_memory"]
+            with recorder.quiet():  # the device torch builds it on, index and all
+                device = torch.empty(0, device=kwargs.get("device")).device
+            if device.type == "cpu" or not moves:
+                out = build(*args, **kwargs)
+                return recorder.pin(out) if device.type == "cpu" else out
+            grad = kwargs.pop("requires_grad", False)
+            out = recorder.pin(build(*args, **{**kwargs, "device": "cpu"}))
+            out = torch.ops.aten._to_copy.default(out, device=device)  # as torch's
+            return out.requires_grad_() if grad else out
+
+        return call
 
     def staged_init(self, *args, **kwargs):
         with (
@@ -1097,7 +1186,7 @@ def _patches(recorder):
         with patch.object(recorder, "counted", live):
             return attach(builder, md, num_reqs, is_prefill)
 
-    _device._device_constructors()  # cached while `torch.zeros` is torch's
+    _device._device_constructors()  # cached while the constructors are torch's
     unpatched = [
         (fly.JitFunction, "__call__", fly.JitFunction.__call__),
         (fly, "_compile_impl", fly._compile_impl),
@@ -1117,6 +1206,9 @@ def _patches(recorder):
         (torch.Tensor, "tolist", host_tolist),
         (torch.Tensor, "pin_memory", lambda t, *a, **k: recorder.pin(t.clone())),
         (torch.Tensor, "is_pinned", lambda t, *a, **k: recorder.pinned(t)),
+        (torch, "from_numpy", host_from_numpy),
+        (torch, "tensor", staged(tensor, moves=True)),
+        (torch, "arange", staged(arange, moves=False)),
         (FakeTensor, "tolist", host_tolist),
         (torch.Tensor, "numpy", lambda t, *a, **k: host_numpy(landed(t), *a, **k)),
         (loader, "safetensors_weights_iterator", lambda *a, **k: iter(())),
@@ -1674,9 +1766,12 @@ class Tracer:
     `atom_args`, on a declared `arch` or the card `read` declares
     (`driverless.card`), stepped at shapes (`trace`). It is built at the first
     `trace`, once, and every later one steps the same runner. The capture's
-    patches hold until `close`; the declared device, for the process."""
+    patches hold until `close`; the declared device, for the process. Each
+    graph states the files its process ran and read up to its step
+    (`capture.files_of`), from the reads watched since this one was made."""
 
     def __init__(self, model, tp, tmpdir, atom_args=(), arch="gfx942", read=None):
+        self.reads = watch_reads()
         self.declared = driverless.install(tmpdir, arch, read)
         self.config = _config(model, tp, atom_args)
         self.stack, self.runner, self.blocks = contextlib.ExitStack(), None, 0
@@ -1941,4 +2036,4 @@ class Tracer:
                 declared.pop("mono", None)
                 if mono := list({id(why): why for why in recorder.declined}.values()):
                     declared["mono"] = mono
-                yield graph, self.digest, dict(declared)
+                yield graph, self.digest, {**declared, "files": files_of(self.reads)}

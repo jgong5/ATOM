@@ -7,6 +7,8 @@ page-locked tensors -- copied into `hipHostMalloc` memory of exactly their
 size, or the checkpoint mapping registered in place (`ATOM_ENGRAM_UVA_COPY=0`,
 no HIP runtime, or -- unless `ATOM_ENGRAM_UVA_COPY` is set -- a shard that
 every DP-attention rank of the node holds whole, see `pin_rows`).
+`to_device` copies them into HBM instead (`ATOM_ENGRAM_UVA_HBM`); nothing
+below about page-locking or releasing applies to that.
 
 In-place registrations go through a process-wide, reference-counted set of
 page runs (`_PageRuns`): ranges are widened to page boundaries, so ranges
@@ -107,20 +109,40 @@ def _hip_runtime():
     Not `CDLL("libamdhip64.so")`: that is the system's unversioned dev link,
     which a wheel-only install lacks (the copy would quietly turn into an
     in-place registration) and which can name a second, different runtime
-    than torch's, with its own allocations and last error.
+    than torch's, with its own allocations and last error: memory it
+    page-locks is pageable to torch, whose copies from it faulted on MI455.
+    So a runtime the process maps is bound as it is (`RTLD_NOLOAD`, nothing
+    new mapped), and with several mapped none is, since which is torch's
+    cannot be told: the shard is then registered in place through torch.
     """
     if not torch.version.hip:
         return None
-    candidates = []
+    mapped = []
     try:
         with open("/proc/self/maps") as maps:
             for line in maps:
                 path = line.split(maxsplit=5)[-1].strip()
                 name = os.path.basename(path)
-                if name.startswith("libamdhip64.so") and path not in candidates:
-                    candidates.append(path)
+                if name.startswith("libamdhip64.so") and path not in mapped:
+                    mapped.append(path)
     except OSError:
         pass
+    if len(mapped) > 1:
+        logger.warning(
+            "engram: several HIP runtimes mapped (%s); a UVA shard is "
+            "registered in place instead of copied",
+            ", ".join(mapped),
+        )
+        return None
+    if mapped:
+        try:
+            hip = ctypes.CDLL(mapped[0], mode=os.RTLD_NOLOAD)
+        except OSError:
+            logger.warning("engram: HIP runtime %s not bound", mapped[0], exc_info=True)
+            return None
+        logger.info("engram: HIP runtime for page-locking: %s", mapped[0])
+        return hip
+    candidates = []
     torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
     try:
         candidates += sorted(
@@ -564,6 +586,66 @@ def _read_only(lo: int, hi: int) -> bool:
     except (OSError, ValueError, IndexError):
         pass
     return False
+
+
+def to_device(sources: list[torch.Tensor], device) -> tuple[torch.Tensor, ...] | None:
+    """`sources` (contiguous row ranges) copied into HBM on `device`, as
+    tensors of the same dtype and shape; all-or-nothing, None on any failure
+    (no HBM, no page-locked bounce chunk) so the TP group can fall back as one.
+
+    The host holds one page-locked bounce chunk of at most `_HBM_BOUNCE_BYTES`:
+    each chunk of a source is copied into it (`_copy_into`), then to the
+    device, and its checkpoint pages are dropped (`_source_dropper`).
+    """
+    try:
+        return _to_device(sources, device)
+    except Exception:  # any failure is a fallback
+        logger.warning("engram: copying the UVA shard into HBM failed", exc_info=True)
+        return None
+
+
+# The most page-locked host memory an HBM copy holds at a time.
+_HBM_BOUNCE_BYTES = 1 << 30
+
+
+def _bounce(nbytes: int) -> torch.Tensor:
+    """`nbytes` page-locked by torch's own allocator.
+    `device="cpu"`: under the CUDA default device the model is built with, a
+    bare `pin_memory=True` asks for a CUDA tensor and raises.
+    """
+    return torch.empty(nbytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+
+
+def _to_device(sources, device):
+    largest = max(s.numel() * s.element_size() for s in sources)
+    size = max(1, min(_HBM_BOUNCE_BYTES, largest))
+    bounce = _bounce(size)
+    threads = copy_threads(size)
+    pool = ThreadPoolExecutor(threads) if threads > 1 else None
+    try:
+        out = []
+        for src in sources:
+            flat = _as_bytes(src)
+            dst = torch.empty(flat.numel(), dtype=torch.uint8, device=device)
+            drop = _source_dropper(src)
+            try:
+                for o, n in _chunks(flat.data_ptr(), flat.numel(), size):
+                    _copy_into(bounce[:n], flat[o : o + n], pool)
+                    # Synchronous, so the bounce chunk is free to refill.
+                    dst[o : o + n].copy_(bounce[:n])
+                    if drop is not None:
+                        drop(o, n)
+            finally:
+                if drop is not None:
+                    drop.close()
+            out.append(dst.view(src.dtype).view(src.shape))
+        return tuple(out)
+    finally:
+        if pool is not None:
+            pool.shutdown()
+        del bounce
+        # Free the bounce chunk now, not cache it page-locked for the process.
+        torch._C._host_emptyCache()
 
 
 class _PageRuns:

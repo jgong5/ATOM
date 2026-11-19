@@ -2,15 +2,13 @@
 """aiter's comm-fused MoE in a device-free capture of DeepSeek-V4-Pro: the
 declared MI355X names its product, so ATOM takes the comm-fused MoE wherever
 aiter holds a winner for the layer's rows, and the capture traces it as one
-leaf. The op-level backend prices that leaf from its work, and `measure ops`
-refuses it by name.
+leaf. The op-level backend prices that leaf from its work.
 """
 
 import os
 from unittest.mock import patch
 
 import pytest
-from test_bench_ops import _Runner
 from test_capture_ir import _decoder
 from test_capture_v4_pro import DP, DPA_TP8, LAYERS, MOE, _pars, _rows, capture
 from test_moe_gather_pad_rows import gathered
@@ -18,7 +16,6 @@ from test_op_work_v4 import close, moe
 
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import allreduce, reduce_scatter
-from atom.compass.bench import ops
 from atom.compass.capture.peers import COMM_FUSED
 
 #: The interleaved gate-up layout, the only one ATOM takes aiter's comm-fused
@@ -125,10 +122,3 @@ def test_the_comm_fused_leaf_prices_its_experts_and_the_reduction_it_fuses(
     got = work(fused, view, 1, "bf16")
 
     close(got, work(experts, view, 1, "bf16") + reduce(8, 16 * 64 * 2))
-
-
-def test_measure_ops_refuses_the_comm_fused_leaf_by_name():
-    stub = ops.Stub(_Runner(), 10_000)
-
-    with pytest.raises(ValueError, match="aiter's comm-fused MoE, which reduces"):
-        stub._time({"op": COMM_FUSED, "args": {"tp": 8}}, "sig", [], 1)

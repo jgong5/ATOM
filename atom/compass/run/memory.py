@@ -11,24 +11,46 @@ and RapidServe. `compass measure memory` publishes one member per rank,
 ``readings.<rank>.json``, holding `ENTRY_FIELDS`; each rank reads its own. A configuration with no entry
 refuses, naming its key and the fields the nearest entry differs in, and so
 does an entry `ArtifactStore.load` refuses under `conditions`.
+
+A store with no entry at the key reads the readings a law file carries
+(`carried`, the run file's `CARRIED`): each law file's `LAW_MEMBER` holds
+the key its readings were measured at and their members, every one stating
+`assumed`, and their ATOM source is the `atom` digest of the law's host key,
+so a re-keyed law re-keys them. Readings at another key refuse, naming the
+fields they differ in, and readings at another ATOM digest name both.
+
+    python -m atom.compass.run.memory LAW --store S --token T --assumed NOTE
+
+writes a store's entry into the law file LAW (`main`).
 """
 
+import argparse
 import json
 
 from atom.compass.artifacts import (
+    ArtifactRefusal,
     ArtifactStore,
     Conditions,
     GateState,
     Key,
     Kind,
     RankCoords,
+    Rule,
     Topology,
     keyed_platform,
     machine_platform,
+    member_name,
 )
-from atom.compass.memory.readings import MemoryReadings
+from atom.compass.artifacts.store import ENTRY_FILE
+from atom.compass.memory.readings import ASSUMED, MemoryReadings
 
 STEM, EXTENSION = "readings", "json"
+#: A law file's member holding its readings: ``key``, the `memory_readings`
+#: key they were measured at, and ``members``, each rank's by its member name.
+LAW_MEMBER = "memory_readings"
+#: The run file's list of the readings its law files carry, each a law file's
+#: `LAW_MEMBER` with ``atom``, its host key's ATOM digest, and ``law``, its path.
+CARRIED = "memory_readings"
 
 
 def topology(config) -> Topology:
@@ -96,16 +118,124 @@ def conditions(fields: dict, **platform) -> Conditions:
     )
 
 
-def load(store: str, config, machine, rank: int) -> MemoryReadings:
-    """Rank `rank`'s readings of `config` on the platform `machine` states, or
-    a refusal naming what is missing or differs."""
-    fields = key_fields(config)
-    platform = machine_platform(machine)
-    key = Key.of(
-        Kind.MEMORY_READINGS, **keyed_platform(Kind.MEMORY_READINGS, platform), **fields
-    )
-    entry = ArtifactStore(store).load(
-        key, conditions=conditions(fields, **platform), gates=GateState.of()
-    )
+def key_of(config, machine) -> Key:
+    """The key of `config`'s readings on the platform `machine` states."""
+    stated = keyed_platform(Kind.MEMORY_READINGS, machine_platform(machine))
+    return Key.of(Kind.MEMORY_READINGS, **stated, **key_fields(config))
+
+
+def load(store: str, config, machine, rank: int, carried=()) -> MemoryReadings:
+    """Rank `rank`'s readings of `config` on the platform `machine` states, from
+    `store`, else from the law files' readings `carried` when `store` has no
+    entry at their key, or a refusal naming what is missing or differs: an
+    entry there that does not read refuses, whatever a law file carries."""
+    key, platform = key_of(config, machine), machine_platform(machine)
+    held = ArtifactStore(store)
+    try:
+        entry = held.load(
+            key, conditions=conditions(key.values, **platform), gates=GateState.of()
+        )
+    except ArtifactRefusal as refused:
+        if not carried or (held.directory_for(key) / ENTRY_FILE).is_file():
+            raise
+        return _carried(carried, key, coords(config, rank), refused)
     member = entry.read_member(STEM, coords(config, rank), EXTENSION)
     return MemoryReadings.from_member(json.loads(member), f"{key.kind} {key.token()}")
+
+
+def carried_by(law: dict, where: str) -> dict | None:
+    """The run file's `CARRIED` item for the law file `law` read at `where`,
+    or None when it carries no readings."""
+    if LAW_MEMBER not in law:
+        return None
+    atom = law.get("host", {}).get("key", {}).get("atom")
+    return {**law[LAW_MEMBER], "atom": atom, "law": where}
+
+
+def _differ(ours: dict, theirs: dict) -> list[str]:
+    """The key fields `theirs` differs from `ours` in, the engine config's by
+    name, as ``engine_config.<name>``."""
+    fields = sorted(ours.keys() | theirs.keys())
+    differ = [f for f in fields if theirs.get(f) != ours.get(f)]
+    if "engine_config" not in differ:
+        return differ
+    mine, held = (json.loads(k.get("engine_config") or "{}") for k in (ours, theirs))
+    names = [n for n in sorted(mine.keys() | held.keys()) if mine.get(n) != held.get(n)]
+    return [f for f in differ if f != "engine_config"] + [
+        f"engine_config.{n}" for n in names
+    ]
+
+
+def _carried(carried, key: Key, at, missed: ArtifactRefusal) -> MemoryReadings:
+    """The readings at `key` among the law files' `carried`, rank `at`'s
+    member, or a refusal naming the fields the nearest differ in; `missed` is
+    the store's refusal, which a refusal here names too."""
+    from atom.compass.run import atom_digest
+
+    ours, nearest = key.values, None
+    for law in carried:
+        differ = _differ(ours, law["key"])
+        if not differ:
+            if (theirs := law["atom"]) != (here := atom_digest()):
+                raise ArtifactRefusal(
+                    Rule.RESOLUTION,
+                    f"{missed.what}, and {law['law']}'s readings at it are at ATOM "
+                    f"digest {theirs}, its host key's, and this tree's is {here}",
+                    "a law file loads only at the tree its host key names",
+                )
+            source = f"{law['law']}'s {LAW_MEMBER}"
+            member = law["members"].get(member_name(STEM, at, EXTENSION))
+            read = MemoryReadings.from_member(member, source)
+            if not read.assumed:
+                raise ValueError(
+                    f"{source} states no assumed: it was measured elsewhere"
+                )
+            return read
+        if nearest is None or len(differ) < len(nearest[1]):
+            nearest = law["law"], differ
+    raise ArtifactRefusal(
+        Rule.RESOLUTION,
+        f"{missed.what}, and the readings {nearest[0]} carries differ in "
+        f"{', '.join(nearest[1])}",
+        "compass measure memory takes readings at this key",
+    )
+
+
+def main(argv=None) -> None:
+    """Write into the law file LAW the members of the `memory_readings` entry
+    the store S holds at token T, each stating `assumed` NOTE, with the
+    entry's key, as `LAW_MEMBER`: a run reads them where its store holds none,
+    at the ATOM digest of the law's host key. An entry measured under another
+    engine config than the law's refuses, naming the fields that differ."""
+    from atom.compass.backends.json_file import read_json, write_json
+
+    parser = argparse.ArgumentParser(
+        prog="python -m atom.compass.run.memory",
+        description=main.__doc__.split("\n\n")[0],
+    )
+    parser.add_argument("law", help="the law file written into")
+    parser.add_argument("--store", required=True, help="the artifact store's root")
+    parser.add_argument("--token", required=True, help="the readings entry's token")
+    parser.add_argument("--assumed", required=True, help="where they were taken")
+    args = parser.parse_args(argv)
+    store = ArtifactStore(args.store)
+    entry = store.read(store.key_from_token(Kind.MEMORY_READINGS, args.token))
+    law = read_json(args.law)
+    measured = json.loads(entry.key.values["engine_config"])
+    engine = law["engine_config"]
+    if differ := [n for n, v in engine.items() if measured.get(n) != v]:
+        parser.error(f"{args.token} was measured under another {differ} than the law")
+    members = {
+        member_name(STEM, at, EXTENSION): json.loads(
+            entry.read_member(STEM, at, EXTENSION)
+        )
+        | {ASSUMED: args.assumed}
+        for at in entry.topology.ranks()
+    }
+    law[LAW_MEMBER] = {"key": entry.key.values, "members": members}
+    write_json(law, args.law)
+    print(f"{args.law}: {len(members)} members of {entry.key.kind} {args.token}")
+
+
+if __name__ == "__main__":
+    main()
