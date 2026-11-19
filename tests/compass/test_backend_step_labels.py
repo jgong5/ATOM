@@ -458,16 +458,22 @@ def _dp2_record(directory, monkeypatch):
         record.write()
 
 
+def _views(record) -> list[BatchView]:
+    """`record`'s labelled views, each without the prefill duty its stamps give
+    (`test_prefill_duty.py`)."""
+    return [dataclasses.replace(s.view, prefill_duty=None) for s in label(record)[0]]
+
+
 def test_a_dp2_record_rebuilds_each_step_s_group_counts(tmp_path, monkeypatch):
     _dp2_record(tmp_path, monkeypatch)
     for rank, views in enumerate(GROUP):
-        assert [s.view for s in label(tmp_path / f"dp{rank}.jsonl")[0]] == views
+        assert _views(tmp_path / f"dp{rank}.jsonl") == views
 
     # A new record keeps its counts on a step another rank's record lacks.
     path = tmp_path / "dp1.jsonl"
     full = path.read_text()
     path.write_text(full.splitlines(keepends=True)[0])
-    assert [s.view for s in label(tmp_path / "dp0.jsonl")[0]] == GROUP[0]
+    assert _views(tmp_path / "dp0.jsonl") == GROUP[0]
     path.write_text(full)
 
     # An older record states neither count: `moe_tokens` is rebuilt from every
@@ -479,7 +485,7 @@ def test_a_dp2_record_rebuilds_each_step_s_group_counts(tmp_path, monkeypatch):
             s.pop("tbo_tokens", None)
         path.write_text("".join(json.dumps(s) + "\n" for s in lines))
     for rank, views in enumerate(GROUP):
-        got = [s.view for s in label(tmp_path / f"dp{rank}.jsonl")[0]]
+        got = _views(tmp_path / f"dp{rank}.jsonl")
         assert got == [dataclasses.replace(v, tbo_tokens=None) for v in views]
 
     # A step some rank's record lacks has no group count.
