@@ -283,7 +283,12 @@ def moe_column(
     top-k) of `moe_routing`, counts the dummies' rows as one token, since
     every dummy runs the same row."""
     if feature == "moe_experts":
-        return activated_experts(*routing, tokens - max(dummies - 1, 0))
+        reached = tokens - max(dummies - 1, 0)
+        # An idle rank's dummy is an empty batch that adds no token to `tokens` (#3682), so with three idle ranks
+        # beside a one-token decode the subtraction passes below zero and the column, then its term, went negative
+        # (CostTerm refuses it). The step reaches at least the experts of one token; where `reached` was already
+        # one or more, nothing changes.
+        return activated_experts(*routing, max(reached, 1 if tokens or dummies else 0))
     return float(tokens)
 
 
