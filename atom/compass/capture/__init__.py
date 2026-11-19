@@ -167,7 +167,8 @@ def population_steps(names, tbo=False, drafters=False):
     as its shape, the one the op-level backend prices it at
     (`op_graph.step_shape`), with the rows its DP group's MoE
     gathered (`moe_rows`), and its step-record line, marked with how many of
-    its group's ranks ran the step as a dummy forward (`group_dummies`). A
+    its group's ranks ran the step as a dummy forward (`group_dummies`) and,
+    in a DP group, the most tokens a rank of it ran (`group_max_tokens`). A
     decode step verifies
     as many drafts in each row as its shortest row does. Under two-batch
     overlap (`tbo`, ATOM's `enable_tbo`) a step its ranks split, one rank
@@ -175,14 +176,15 @@ def population_steps(names, tbo=False, drafters=False):
     that step (`bound._split`), is its two micro-batches
     (`step_roofline.micro_batches`),
     each a prefill at its own tokens and the group's rows of it, marked a
-    micro-batch (`forward.Shape`), its line holding its own rows. With
+    micro-batch (`forward.Shape`), its line holding its own rows and the
+    most tokens a rank runs of it. With
     `drafters`, a drafter's shape follows it where they differ: a decode's
     at its rows padded to `draft_bs`, else to its rung, a sampling prefill's
     or a DP middle chunk's with `draft_bs` as its `width`. A target that
     replays no graph yet pads past its rows takes `target_bs` as its `width`."""
     from atom.compass.backends import BatchView, RequestShape
     from atom.compass.backends.op_graph import step_shape
-    from atom.compass.backends.step_labels import group_dummies
+    from atom.compass.backends.step_labels import group_dummies, group_peaks
     from atom.compass.backends.step_roofline import micro_batches
     from atom.compass.validate.bound import _split
 
@@ -195,6 +197,7 @@ def population_steps(names, tbo=False, drafters=False):
         paths = sorted((path / "steps").glob("dp*[0-9].jsonl"))
         ranks = [[json.loads(t) for t in p.read_text().splitlines()] for p in paths]
         dp, splits, dummies = len(ranks), {}, group_dummies(ranks)
+        peaks = group_peaks(ranks)
         if tbo and ranks:
             at = [{s["step"]: s for s in lines} for lines in ranks]
             for step in set.intersection(*map(set, at)):
@@ -203,6 +206,8 @@ def population_steps(names, tbo=False, drafters=False):
             if line["is_dummy_run"]:
                 continue
             line["group_dummies"] = dummies[line["step"]]
+            if dp > 1:
+                line["group_max_tokens"] = peaks[line["step"]]
             rows = [(row[0], row[2]) for row in line["rows"]]
             split = splits.get(line["step"])
             try:
@@ -228,10 +233,11 @@ def population_steps(names, tbo=False, drafters=False):
                 if drafters and (line.get("produces_output") or dp > 1) and draft.width:
                     yield draft.at(dp), line
             else:
-                for half in halves:
+                for half, each in zip(halves, split):
                     rows = [(r.query_tokens, r.decode) for r in half.requests]
                     _, tokens, seqs = step_shape(rows, None)
                     own = {"rows": [dataclasses.astuple(r) for r in half.requests]}
+                    own |= {"group_max_tokens": max(each)} if dp > 1 else {}
                     shape = prefill(tokens, seqs, half.moe_rows).at(dp)
                     yield shape._replace(micro_batch=True), line | own
 

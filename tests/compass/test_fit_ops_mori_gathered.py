@@ -3,9 +3,11 @@
 exchange takes about what its largest sender sends, not G, so its points are a
 family of their own over EP times that sender's rows, which `fit ops` fits,
 `OpGraphBackend` prices a step stating G at by the most tokens a rank of its
-group scheduled, and `measure ops --plan` does not densify."""
+group scheduled, both coverage checks ask it there, and `measure ops --plan`
+does not densify."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from test_op_graph import by_name
@@ -16,6 +18,7 @@ from atom.compass.backends import BatchView, RequestShape
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.bench import ops as bench
 from atom.compass.capture.peers import MORI
+from atom.compass.drive import run as drive_run
 from atom.compass.fit import ops as fit
 
 DP = EP = 8
@@ -60,17 +63,41 @@ POINTS = [
 ]
 
 
-def _listed(region):
+def _listed(graph=lambda *_, **__: _dispatch(1, 4615)):
     params = fit.fit(POINTS)
     fit.held_out(params)
     listed = fit.PriceList(params)
     return params, OpGraphBackend(
-        SPEC, lambda *_, **__: region, kv="bf16", dp=DP, ep=EP, price_list=listed
+        SPEC, graph, kv="bf16", dp=DP, ep=EP, price_list=listed
     )
 
 
+def _record(path):
+    """A record of one prefill step of a DP group of 8 gathering 4615 rows:
+    rank 1 runs 4608 tokens, every other rank one."""
+    (path / "steps").mkdir(parents=True)
+    (path / "run.json").write_text("{}")
+    for rank in range(DP):
+        tokens = 4608 if rank == 1 else 1
+        line = {"step": 0, "dp_rank": rank, "is_dummy_run": False}
+        line |= {"rows": [[tokens, tokens, False]], "rung": None}
+        line |= {"produces_output": True, "moe_rows": 4615}
+        (path / "steps" / f"dp{rank}.jsonl").write_text(json.dumps(line) + "\n")
+        (path / "steps" / f"dp{rank}.engine.json").write_text("{}")
+    return str(path)
+
+
+def test_a_g_point_whose_peers_send_more_sits_at_ep_times_the_largest_peer_s():
+    # the peers split G less this rank's one row evenly, the first a row more
+    point = _point(_dispatch(1, 4615), "prefill T=1 B=1 G=4615", 1e3)
+
+    [f] = fit.fit([point])["families"].values()
+
+    assert [c for c, *_ in f["points"]] == [[EP * 660 * ROW]]
+
+
 def test_a_g_point_sits_at_ep_times_its_largest_rank_s_rows_and_a_g_step_there():
-    params, backend = _listed(_dispatch(1, 4615))
+    params, backend = _listed()
     # rank 0 runs one token; a peer the 4608 rank 0 ran at the G point
     step = BatchView(
         (RequestShape(1, 1, False),),
@@ -93,7 +120,7 @@ def test_a_g_point_sits_at_ep_times_its_largest_rank_s_rows_and_a_g_step_there()
 
 
 def test_each_micro_batch_s_g_exchange_is_priced_at_its_group_s_largest_rank():
-    _, backend = _listed(_dispatch(1, 4615))
+    _, backend = _listed()
     # rank 0 runs a token in each micro-batch; a peer 4608 in each, another
     # peer in each
     split = ((1, 4608, 1, 1, 1, 1, 1, 1), (1, 1, 4608, 1, 1, 1, 1, 1))
@@ -132,3 +159,33 @@ def test_the_plan_densifies_no_mori_family_whose_shapes_state_g():
         "prefill T=250 B=1",
     ]
     assert {json.loads(f)[0] for f in set().union(*want.values())} == {"exchange"}
+
+
+def test_compass_run_s_coverage_asks_each_rank_at_its_group_s_largest_rank(tmp_path):
+    # each rank's dispatch at its own rows, priced from the G point where
+    # its group's largest rank sends 4608 rows, the ranks of one row among them
+    _, backend = _listed(lambda _, t, b, output, g=None, **__: _dispatch(t, g))
+    here = dict.fromkeys(drive_run.SHAPING)
+    steps = drive_run._steps(_record(tmp_path), None, here, tbo=False)
+
+    report = drive_run.op_coverage(backend, steps)
+
+    assert (report["steps"], report["covered"]) == (DP, DP)
+
+
+def test_measure_ops_coverage_asks_each_rank_at_its_group_s_largest_rank(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(bench, "_load", lambda *_, **__: None)
+    monkeypatch.setattr(
+        bench,
+        "graph",
+        lambda store, config, shape, *_: {
+            "region": _dispatch(shape.tokens, shape.gathered)
+        },
+    )
+    config = SimpleNamespace(enable_tbo=False, speculative_config=None)
+
+    report = bench.coverage(None, None, config, [_record(tmp_path)], POINTS, "gfx950")
+
+    assert (report["steps"], report["covered"]) == (DP, DP)

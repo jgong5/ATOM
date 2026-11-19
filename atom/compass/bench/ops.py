@@ -4190,7 +4190,8 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     rows' cached tokens too (`_bracket_cached`); and `fit ops`' price list of
     `records` prices it at the step, as `compass run --coverage` asks it, a
     drafter's leaf under DP at each batch and G a run asks it at
-    (`_drafter_at`). A
+    (`_drafter_at`), a target's MORI leaf at a step stating G at the most
+    tokens a rank of its group ran (`group_max_tokens`). A
     decode leaf is read at the rows it ran, its shape's T: of a drafter's own
     decode shape past its step's, a leaf its width's graphs hold at that
     width, as `--plan` measures it. A prefill leaf is asked at the B it ran,
@@ -4250,11 +4251,18 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                     # whether its shape states one
                     at = moved
                     fam, tokens = _family(at, None, name, signature(op), dependent)
-                bound = (*at[:4], mean, top)
+                # a target at a G: its group's most tokens, after its real rows
+                stated = not part and at.gathered is not None
+                peak = line.get("group_max_tokens") if stated else None
+                tail = () if peak is None else (None, peak)
+                if peak is not None and name.startswith(MORI):  # at its largest rank
+                    sig = signature(op)
+                    fam, tokens = _family(at, None, name, sig, dependent, peak)
+                bound = (*at[:4], mean, top, *tail)
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
                     bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
-                    bound += (None if part else _real(line),)  # a target's real rows
+                    bound += (None if part else _real(line), *tail[1:])
                 elif asked:  # a prefill's drafter's leaf at each bound a run asks
                     each = [(*b, mean, top) for b, _ in asked]
                     bound = each if each[1:] else each[0]
@@ -4516,7 +4524,7 @@ def _exchanged(fam: str) -> bool:
     return json.loads(fam)[0].startswith("exchange")
 
 
-def _family(shape, context, op: str, sig: str, dependent: dict):
+def _family(shape, context, op: str, sig: str, dependent: dict, largest=None):
     """The family a leaf's point belongs to, and where on its axis: a decode
     leaf at its width, and its rows' mean when they are ragged, over context;
     a prefill leaf over its tokens, at its rows unless its kind's prefill
@@ -4524,11 +4532,12 @@ def _family(shape, context, op: str, sig: str, dependent: dict):
     when its kind depends on context, as its prefill points read it, else its
     decode points, else by default, a shape that states G apart from one that
     does not, as `fit ops` keeps them; a collective over its message bytes
-    (`exchange`), MORI's at a G apart (`exchange_at`). A prefill leaf reads as
-    `fit.ops.prefill_leaf` reads it."""
+    (`exchange`), MORI's at a G apart, at its group's `largest` rank where
+    stated (`exchange_at`). A prefill leaf reads as `fit.ops.prefill_leaf`
+    reads it."""
     if op.startswith(COLLECTIVES):
         leaf = json.loads(sig)
-        return tuple(exchange_at(leaf, exchange(leaf), shape.gathered))
+        return tuple(exchange_at(leaf, exchange(leaf), shape.gathered, largest))
     if shape.phase == "decode":
         context, mean = _split(context)
         return json.dumps([str(shape), sig] + ([mean] if mean else [])), context
