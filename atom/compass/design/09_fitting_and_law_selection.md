@@ -138,7 +138,11 @@ TP4 run and is refused at any other width, like any other layout field
   whose ladders are non-empty prefixes of the longest among them and keys the law there
   (`step_grid_plan.py::pooled`): each decode rung's vector takes every record's steps at
   that rung, and a batch a shorter ladder ran eager joins the eager vector. Any other
-  ladder refuses, naming it.
+  ladder refuses, naming it. The engine config
+  states ATOM's prefill token-graph buckets only off ATOM's default, which moves, so a run
+  whose runner records them also refuses a law whose engine config states none and whose
+  prefill vector (D55) states none or others
+  ([#2862 Ruling](https://github.com/jgong5/ATOM/issues/2862#issuecomment-6785244480)).
 - **Features.** The rank's own batch features (D55), plus two the group decides: the
   DP-unified rung every rank shares, settled by `ForwardMode.decide`, and the MoE row
   count, which the MoE terms read alone. That count is `T_moe` (`BatchView.moe_rows`)
